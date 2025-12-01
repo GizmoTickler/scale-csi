@@ -487,6 +487,13 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName string, volu
 		serial = serial[:20]
 	}
 
+	// Wait for zvol to be ready before creating subsystem/namespace
+	// This is critical for cloned volumes which may not be immediately available
+	klog.V(4).Infof("Waiting for zvol %s to be ready before creating NVMe-oF share", datasetName)
+	if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolReadyTimeout); err != nil {
+		klog.Warningf("Zvol readiness check failed (will attempt share creation anyway): %v", err)
+	}
+
 	// Create subsystem
 	subsys, err := d.truenasClient.NVMeoFSubsystemCreate(
 		ctx,

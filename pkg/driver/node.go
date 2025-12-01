@@ -202,13 +202,17 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 				klog.V(4).Infof("Could not get iSCSI info from device %s: %v", devicePath, err)
 			}
 		}
-	} else {
-		// BUG-004 fix: Session leak prevention
-		// When devicePath is empty (mount already gone), attempt cleanup using volumeID
-		// to prevent orphaned iSCSI/NVMe-oF sessions accumulating after node restarts
-		// or force unmounts.
-		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID)
 	}
+
+	// BUG-004 fix (enhanced): Always attempt cleanup by volumeID as a safety net.
+	// This catches sessions that:
+	// 1. Weren't disconnected because devicePath was empty
+	// 2. Weren't disconnected because device info extraction failed
+	// 3. Remain from previous failed unstage attempts
+	// 4. Were "disconnected" but some edge case left a duplicate session
+	// The cleanup function is idempotent - it will simply log "no session found"
+	// if no session remains after the disconnect above.
+	d.cleanupOrphanedSessionByVolumeID(ctx, volumeID)
 
 	klog.Infof("Volume %s unstaged successfully", volumeID)
 	return &csi.NodeUnstageVolumeResponse{}, nil
@@ -536,6 +540,19 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		}
 	}
 
+	// Pre-emptive cleanup: disconnect any existing session for this target
+	// This prevents duplicate sessions when a volume moves between nodes
+	// or when a previous unstage failed to clean up properly.
+	existingIQN, err := util.FindISCSISessionByIQN(iqn)
+	if err == nil && existingIQN != "" {
+		klog.Infof("Found existing iSCSI session for %s, disconnecting before reconnect", iqn)
+		if disconnectErr := util.ISCSIDisconnect(portal, existingIQN); disconnectErr != nil {
+			klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingIQN, disconnectErr)
+		}
+		// Brief pause to allow session cleanup to complete
+		time.Sleep(500 * time.Millisecond)
+	}
+
 	// Connect to iSCSI target with configurable timeout
 	connectOpts := &util.ISCSIConnectOptions{
 		DeviceTimeout: time.Duration(d.config.ISCSI.DeviceWaitTimeout) * time.Second,
@@ -586,6 +603,19 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	}
 	if port == "" {
 		port = "4420"
+	}
+
+	// Pre-emptive cleanup: disconnect any existing session for this NQN
+	// This prevents duplicate sessions when a volume moves between nodes
+	// or when a previous unstage failed to clean up properly.
+	existingNQN, err := util.FindNVMeoFSessionByNQN(nqn)
+	if err == nil && existingNQN != "" {
+		klog.Infof("Found existing NVMe-oF session for %s, disconnecting before reconnect", nqn)
+		if disconnectErr := util.NVMeoFDisconnect(existingNQN); disconnectErr != nil {
+			klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingNQN, disconnectErr)
+		}
+		// Brief pause to allow session cleanup to complete
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	// Connect to NVMe-oF subsystem with configurable timeout (OTHER-001 fix)

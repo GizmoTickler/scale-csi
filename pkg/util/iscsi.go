@@ -109,21 +109,31 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 		timeout = opts.DeviceTimeout
 	}
 
-	// Check if already logged in - skip discovery if session exists
+	// Check if already logged in - validate session before reuse
 	sessions, err := getISCSISessions()
 	if err != nil {
 		klog.V(4).Infof("Failed to get sessions: %v, will proceed with discovery", err)
 	} else {
 		for _, session := range sessions {
 			if session.IQN == iqn {
-				klog.Infof("Session already exists for %s, skipping discovery (elapsed: %v)", iqn, time.Since(start))
-				// Session exists, just wait for device
-				devicePath, err := waitForISCSIDevice(portal, iqn, lun, timeout)
-				if err != nil {
-					return "", fmt.Errorf("device not found after %v: %w", timeout, err)
+				klog.Infof("Found existing session for %s, validating... (elapsed: %v)", iqn, time.Since(start))
+				// Try to get device with a short timeout to validate session is healthy
+				// If device appears quickly, session is valid and can be reused
+				validationTimeout := 5 * time.Second
+				devicePath, err := waitForISCSIDevice(portal, iqn, lun, validationTimeout)
+				if err == nil {
+					klog.Infof("ISCSIConnect completed (session reuse) in %v", time.Since(start))
+					return devicePath, nil
 				}
-				klog.Infof("ISCSIConnect completed (session reuse) in %v", time.Since(start))
-				return devicePath, nil
+				// Session exists but device didn't appear - session is likely stale
+				// Disconnect it and proceed with fresh discovery/login
+				klog.Warningf("Existing session for %s appears stale (device not found in %v), disconnecting", iqn, validationTimeout)
+				if disconnectErr := ISCSIDisconnect(portal, iqn); disconnectErr != nil {
+					klog.Warningf("Failed to disconnect stale session %s: %v (proceeding anyway)", iqn, disconnectErr)
+				}
+				// Brief pause to allow session cleanup to complete
+				time.Sleep(500 * time.Millisecond)
+				break // Exit loop and proceed with fresh discovery
 			}
 		}
 	}
@@ -706,4 +716,22 @@ func FindISCSISessionByTargetName(targetName string) (string, error) {
 // Deprecated: Use FindISCSISessionByTargetName instead, which handles NameSuffix correctly.
 func FindISCSISessionByVolumeID(volumeID string) (string, error) {
 	return FindISCSISessionByTargetName(volumeID)
+}
+
+// FindISCSISessionByIQN searches active iSCSI sessions for one matching the exact IQN.
+// This is used for pre-emptive cleanup before staging a volume.
+func FindISCSISessionByIQN(iqn string) (string, error) {
+	sessions, err := getISCSISessions()
+	if err != nil {
+		return "", fmt.Errorf("failed to get iSCSI sessions: %w", err)
+	}
+
+	for _, session := range sessions {
+		if session.IQN == iqn {
+			klog.V(4).Infof("Found iSCSI session for IQN %s", iqn)
+			return session.IQN, nil
+		}
+	}
+
+	return "", fmt.Errorf("no iSCSI session found for IQN %s", iqn)
 }

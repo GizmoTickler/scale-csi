@@ -505,3 +505,21 @@ func FindNVMeoFSessionBySubsysName(subsysName string) (string, error) {
 func FindNVMeoFSessionByVolumeID(volumeID string) (string, error) {
 	return FindNVMeoFSessionBySubsysName(volumeID)
 }
+
+// FindNVMeoFSessionByNQN searches connected NVMe subsystems for one matching the exact NQN.
+// This is used for pre-emptive cleanup before staging a volume.
+func FindNVMeoFSessionByNQN(nqn string) (string, error) {
+	subsystems, err := listNVMeSubsystems()
+	if err != nil {
+		return "", fmt.Errorf("failed to list NVMe subsystems: %w", err)
+	}
+
+	for _, subsystem := range subsystems {
+		if subsystem.NQN == nqn {
+			klog.V(4).Infof("Found NVMe-oF session for NQN %s", nqn)
+			return subsystem.NQN, nil
+		}
+	}
+
+	return "", fmt.Errorf("no NVMe-oF subsystem found for NQN %s", nqn)
+}
