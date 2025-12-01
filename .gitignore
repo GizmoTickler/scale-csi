@@ -6,3 +6,5 @@ test-values.yaml
 test-smoke-iscsi.yaml
 test-smoke-nfs.yaml
 test-snapshot.yaml
+/debug-api
+/scale-csi

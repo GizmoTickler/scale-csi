@@ -114,6 +114,10 @@ func (c *Client) DatasetDelete(ctx context.Context, name string, recursive bool,
 		if IsNotFoundError(err) {
 			return nil
 		}
+		// TrueNAS returns -32602 "Invalid params" when dataset doesn't exist
+		if apiErr, ok := err.(*APIError); ok && apiErr.Code == -32602 {
+			return nil
+		}
 		return fmt.Errorf("failed to delete dataset: %w", err)
 	}
 

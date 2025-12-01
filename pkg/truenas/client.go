@@ -674,6 +674,12 @@ func (c *Connection) CallWithContext(ctx context.Context, method string, params 
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
+		// Drain the response channel to prevent memory leak if response arrives after timeout.
+		// The channel is buffered (size 1), so this is non-blocking.
+		select {
+		case <-respChan:
+		default:
+		}
 		return nil, fmt.Errorf("request timeout: %s", method)
 	}
 }
@@ -817,17 +823,13 @@ func (c *Client) IsConnected() bool {
 // after creating targets/extents via the API.
 // Common service names: "iscsitarget", "nfs", "cifs", "nvmeof"
 //
-// NOTE: This only attempts reload (not restart) to avoid disrupting existing
-// sessions. If reload fails, we log and continue - the caller should have
-// retry logic to handle propagation delays.
+// Returns an error if the reload fails. Callers should treat this as non-fatal
+// since the service might auto-reload, and node-side retry logic handles propagation delays.
 func (c *Client) ServiceReload(ctx context.Context, service string) error {
 	klog.V(4).Infof("Reloading service: %s", service)
 	_, err := c.Call(ctx, "service.reload", service)
 	if err != nil {
-		// Don't try restart - it could disrupt existing sessions/connections.
-		// Just log and continue; the node-side retry logic will handle propagation delays.
-		klog.V(4).Infof("service.reload failed for %s (this is often normal, target may still propagate): %v", service, err)
-		return nil
+		return fmt.Errorf("failed to reload service %s: %w", service, err)
 	}
 	klog.Infof("Service %s reloaded successfully", service)
 	return nil
