@@ -377,6 +377,9 @@ func (d *Driver) gcISCSISessions(dryRun bool) {
 		return
 	}
 
+	// Update metrics with current session count
+	SetISCSISessions(len(sessions))
+
 	if len(sessions) == 0 {
 		klog.V(5).Info("Session GC: no active iSCSI sessions")
 		return
