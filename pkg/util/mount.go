@@ -242,3 +242,41 @@ func GetDeviceFromMountPoint(mountPath string) (string, error) {
 	}
 	return strings.TrimSpace(string(output)), nil
 }
+
+// GetMountedBlockDevices returns a map of all mounted block devices.
+// The keys are device paths (e.g., "/dev/sda1"), values are mount points.
+// This is used by session GC to determine which iSCSI/NVMe devices are in use.
+func GetMountedBlockDevices() (map[string]string, error) {
+	// Use findmnt to list all block device mounts
+	// -n: no headers, -l: list format, -o: output columns
+	cmd := exec.Command("findmnt", "-n", "-l", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs")
+	output, err := cmd.Output()
+	if err != nil {
+		// Exit code 1 with empty output means no mounts found (not an error)
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return make(map[string]string), nil
+		}
+		return nil, fmt.Errorf("findmnt failed: %v", err)
+	}
+
+	devices := make(map[string]string)
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: SOURCE TARGET (space-separated)
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			device := fields[0]
+			target := fields[1]
+			// Only include actual block devices (skip things like tmpfs, overlay, etc.)
+			if strings.HasPrefix(device, "/dev/") {
+				devices[device] = target
+			}
+		}
+	}
+
+	return devices, nil
+}

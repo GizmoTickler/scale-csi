@@ -311,3 +311,22 @@ logging:
 metrics:
   enabled: false
   port: 9808
+
+# Session garbage collection configuration (node plugin only)
+# Periodically cleans up orphaned iSCSI/NVMe-oF sessions that may leak
+# when pods are deleted, nodes restart, or unstage operations fail
+sessionGC:
+  # Enable periodic garbage collection (default: true via interval > 0)
+  # Set interval to 0 to disable
+  enabled: true
+
+  # Interval between GC runs in seconds (default: 300 = 5 minutes)
+  interval: 300
+
+  # Grace period before cleaning up orphaned sessions in seconds (default: 60)
+  # Sessions must be orphaned for this duration before cleanup
+  gracePeriod: 60
+
+  # Dry run mode - logs orphaned sessions without disconnecting (default: false)
+  # Useful for monitoring without taking action
+  dryRun: false

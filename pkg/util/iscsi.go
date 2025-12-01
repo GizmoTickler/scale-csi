@@ -718,6 +718,34 @@ func FindISCSISessionByVolumeID(volumeID string) (string, error) {
 	return FindISCSISessionByTargetName(volumeID)
 }
 
+// ListISCSISessions returns all active iSCSI sessions.
+// This is a public wrapper around getISCSISessions for use by the session GC.
+func ListISCSISessions() ([]ISCSISessionInfo, error) {
+	sessions, err := getISCSISessions()
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to public struct
+	result := make([]ISCSISessionInfo, len(sessions))
+	for i, s := range sessions {
+		result[i] = ISCSISessionInfo{
+			Portal:    s.TargetPortal,
+			IQN:       s.IQN,
+			SessionID: s.SessionID,
+		}
+	}
+	return result, nil
+}
+
+// ISCSISessionInfo holds information about an active iSCSI session.
+// Used by session GC to identify orphaned sessions.
+type ISCSISessionInfo struct {
+	Portal    string
+	IQN       string
+	SessionID string
+}
+
 // FindISCSISessionByIQN searches active iSCSI sessions for one matching the exact IQN.
 // This is used for pre-emptive cleanup before staging a volume.
 func FindISCSISessionByIQN(iqn string) (string, error) {

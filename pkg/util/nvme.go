@@ -506,6 +506,41 @@ func FindNVMeoFSessionByVolumeID(volumeID string) (string, error) {
 	return FindNVMeoFSessionBySubsysName(volumeID)
 }
 
+// NVMeoFSessionInfo holds information about an active NVMe-oF session.
+// Used by session GC to identify orphaned sessions.
+type NVMeoFSessionInfo struct {
+	NQN       string
+	Address   string
+	Transport string
+}
+
+// ListNVMeoFSessions returns all active NVMe-oF sessions.
+// This is used by the session GC to identify orphaned sessions.
+func ListNVMeoFSessions() ([]NVMeoFSessionInfo, error) {
+	subsystems, err := listNVMeSubsystems()
+	if err != nil {
+		return nil, err
+	}
+
+	var sessions []NVMeoFSessionInfo
+	for _, subsys := range subsystems {
+		// Get the address from the first path (if available)
+		address := ""
+		transport := ""
+		if len(subsys.Paths) > 0 {
+			address = subsys.Paths[0].Address
+			transport = subsys.Paths[0].Transport
+		}
+		sessions = append(sessions, NVMeoFSessionInfo{
+			NQN:       subsys.NQN,
+			Address:   address,
+			Transport: transport,
+		})
+	}
+
+	return sessions, nil
+}
+
 // FindNVMeoFSessionByNQN searches connected NVMe subsystems for one matching the exact NQN.
 // This is used for pre-emptive cleanup before staging a volume.
 func FindNVMeoFSessionByNQN(nqn string) (string, error) {

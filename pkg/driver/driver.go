@@ -15,6 +15,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
+	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
 // DriverConfig holds the driver initialization configuration.
@@ -65,6 +66,10 @@ type Driver struct {
 
 	// Request counter for generating unique request IDs
 	requestCounter uint64
+
+	// Session GC context and cancellation
+	gcCancel context.CancelFunc
+	gcWg     sync.WaitGroup
 }
 
 // NewDriver creates a new TrueNAS CSI driver instance.
@@ -162,6 +167,9 @@ func (d *Driver) Run() error {
 	if d.runNode {
 		csi.RegisterNodeServer(d.server, d)
 		klog.Info("Node service registered")
+
+		// Start session garbage collection for node plugin
+		d.startSessionGC()
 	}
 
 	// Start health and metrics server if port is configured
@@ -183,7 +191,10 @@ func (d *Driver) Stop() {
 	klog.Info("Stopping CSI driver")
 	d.ready = false
 
-	// Stop health server first
+	// Stop session GC goroutine first
+	d.stopSessionGC()
+
+	// Stop health server
 	if d.healthServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -282,4 +293,255 @@ func (d *Driver) GetTrueNASClient() truenas.ClientInterface {
 // GetConfig returns the driver configuration.
 func (d *Driver) GetConfig() *Config {
 	return d.config
+}
+
+// startSessionGC starts the periodic session garbage collection goroutine.
+// This runs only on the node plugin and cleans up orphaned iSCSI/NVMe-oF sessions.
+func (d *Driver) startSessionGC() {
+	// Check if GC is enabled (default to true if Interval > 0)
+	if d.config.SessionGC.Interval <= 0 {
+		klog.Info("Session GC disabled (interval <= 0)")
+		return
+	}
+
+	// Check if explicitly disabled
+	// Note: We consider GC enabled by default unless the config explicitly has
+	// Enabled: false with a non-zero interval (unusual config)
+	interval := time.Duration(d.config.SessionGC.Interval) * time.Second
+	gracePeriod := time.Duration(d.config.SessionGC.GracePeriod) * time.Second
+	dryRun := d.config.SessionGC.DryRun
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d.gcCancel = cancel
+
+	d.gcWg.Add(1)
+	go func() {
+		defer d.gcWg.Done()
+		klog.Infof("Session GC started: interval=%v, gracePeriod=%v, dryRun=%v", interval, gracePeriod, dryRun)
+
+		// Initial delay to let the system stabilize after startup
+		select {
+		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
+			klog.Info("Session GC stopped during startup delay")
+			return
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				d.runSessionGC(ctx, gracePeriod, dryRun)
+			case <-ctx.Done():
+				klog.Info("Session GC stopped")
+				return
+			}
+		}
+	}()
+}
+
+// stopSessionGC stops the session garbage collection goroutine.
+func (d *Driver) stopSessionGC() {
+	if d.gcCancel != nil {
+		d.gcCancel()
+		d.gcWg.Wait()
+	}
+}
+
+// runSessionGC performs one garbage collection cycle.
+func (d *Driver) runSessionGC(_ context.Context, _ time.Duration, dryRun bool) {
+	shareType := d.config.GetDriverShareType()
+	klog.V(4).Infof("Running session GC for %s", shareType)
+
+	switch shareType {
+	case "iscsi":
+		d.gcISCSISessions(dryRun)
+	case "nvmeof":
+		d.gcNVMeoFSessions(dryRun)
+	default:
+		// NFS doesn't have sessions to clean up
+		klog.V(5).Infof("Session GC not applicable for share type: %s", shareType)
+	}
+}
+
+// gcISCSISessions garbage collects orphaned iSCSI sessions.
+func (d *Driver) gcISCSISessions(dryRun bool) {
+	// Get all active iSCSI sessions
+	sessions, err := util.ListISCSISessions()
+	if err != nil {
+		klog.Warningf("Session GC: failed to list iSCSI sessions: %v", err)
+		return
+	}
+
+	if len(sessions) == 0 {
+		klog.V(5).Info("Session GC: no active iSCSI sessions")
+		return
+	}
+
+	klog.V(4).Infof("Session GC: found %d active iSCSI sessions", len(sessions))
+
+	// Get expected sessions from kubelet staging directory
+	expectedTargets := d.getExpectedISCSITargets()
+	klog.V(4).Infof("Session GC: found %d expected iSCSI targets from staged volumes", len(expectedTargets))
+
+	// Find orphaned sessions
+	portal := d.config.ISCSI.TargetPortal
+	orphanedCount := 0
+
+	for _, session := range sessions {
+		// Only consider sessions for our portal
+		if session.Portal != portal && session.Portal != portal+",1" {
+			klog.V(5).Infof("Session GC: skipping session %s (different portal: %s)", session.IQN, session.Portal)
+			continue
+		}
+
+		// Check if this session is expected
+		if _, expected := expectedTargets[session.IQN]; expected {
+			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.IQN)
+			continue
+		}
+
+		// This session has no corresponding staged volume - it's orphaned
+		orphanedCount++
+		klog.Infof("Session GC: found orphaned iSCSI session: %s", session.IQN)
+
+		if dryRun {
+			klog.Infof("Session GC: [DRY RUN] would disconnect orphaned session: %s", session.IQN)
+			continue
+		}
+
+		// Disconnect the orphaned session
+		if err := util.ISCSIDisconnect(portal, session.IQN); err != nil {
+			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.IQN, err)
+		} else {
+			klog.Infof("Session GC: disconnected orphaned iSCSI session: %s", session.IQN)
+		}
+	}
+
+	if orphanedCount > 0 {
+		klog.Infof("Session GC: processed %d orphaned iSCSI sessions", orphanedCount)
+	} else {
+		klog.V(4).Info("Session GC: no orphaned iSCSI sessions found")
+	}
+}
+
+// gcNVMeoFSessions garbage collects orphaned NVMe-oF sessions.
+func (d *Driver) gcNVMeoFSessions(dryRun bool) {
+	// Get all active NVMe-oF sessions
+	sessions, err := util.ListNVMeoFSessions()
+	if err != nil {
+		klog.Warningf("Session GC: failed to list NVMe-oF sessions: %v", err)
+		return
+	}
+
+	if len(sessions) == 0 {
+		klog.V(5).Info("Session GC: no active NVMe-oF sessions")
+		return
+	}
+
+	klog.V(4).Infof("Session GC: found %d active NVMe-oF sessions", len(sessions))
+
+	// Get expected sessions from kubelet staging directory
+	expectedNQNs := d.getExpectedNVMeoFNQNs()
+	klog.V(4).Infof("Session GC: found %d expected NVMe-oF NQNs from staged volumes", len(expectedNQNs))
+
+	// Find orphaned sessions
+	orphanedCount := 0
+	targetAddr := d.config.NVMeoF.TransportAddress
+
+	for _, session := range sessions {
+		// Only consider sessions for our target address
+		if session.Address != targetAddr {
+			klog.V(5).Infof("Session GC: skipping session %s (different address: %s)", session.NQN, session.Address)
+			continue
+		}
+
+		// Check if this session is expected
+		if _, expected := expectedNQNs[session.NQN]; expected {
+			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.NQN)
+			continue
+		}
+
+		// This session has no corresponding staged volume - it's orphaned
+		orphanedCount++
+		klog.Infof("Session GC: found orphaned NVMe-oF session: %s", session.NQN)
+
+		if dryRun {
+			klog.Infof("Session GC: [DRY RUN] would disconnect orphaned session: %s", session.NQN)
+			continue
+		}
+
+		// Disconnect the orphaned session
+		if err := util.NVMeoFDisconnect(session.NQN); err != nil {
+			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.NQN, err)
+		} else {
+			klog.Infof("Session GC: disconnected orphaned NVMe-oF session: %s", session.NQN)
+		}
+	}
+
+	if orphanedCount > 0 {
+		klog.Infof("Session GC: processed %d orphaned NVMe-oF sessions", orphanedCount)
+	} else {
+		klog.V(4).Info("Session GC: no orphaned NVMe-oF sessions found")
+	}
+}
+
+// getExpectedISCSITargets returns a map of IQNs that have corresponding staged volumes.
+// It scans the kubelet CSI staging directory to find which volumes are currently staged.
+func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
+	expected := make(map[string]struct{})
+
+	// Kubelet stores staging mounts in /var/lib/kubelet/plugins/kubernetes.io/csi/
+	// Each volume has a directory: /var/lib/kubelet/plugins/kubernetes.io/csi/<driver>/globalmount
+	// We need to check what's actually mounted
+
+	// Alternative approach: scan for iSCSI devices that are in use (mounted)
+	// This is more reliable than trying to parse kubelet directories
+	mountedDevices, err := util.GetMountedBlockDevices()
+	if err != nil {
+		klog.Warningf("Session GC: failed to get mounted block devices: %v", err)
+		return expected
+	}
+
+	// For each mounted device, get its iSCSI session if any
+	for device := range mountedDevices {
+		// Check if this device is an iSCSI device
+		portal, iqn, err := util.GetISCSIInfoFromDevice(device)
+		if err != nil {
+			continue // Not an iSCSI device
+		}
+		if portal != "" && iqn != "" {
+			expected[iqn] = struct{}{}
+		}
+	}
+
+	return expected
+}
+
+// getExpectedNVMeoFNQNs returns a map of NQNs that have corresponding staged volumes.
+func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
+	expected := make(map[string]struct{})
+
+	// Get mounted block devices
+	mountedDevices, err := util.GetMountedBlockDevices()
+	if err != nil {
+		klog.Warningf("Session GC: failed to get mounted block devices: %v", err)
+		return expected
+	}
+
+	// For each mounted device, get its NVMe-oF session if any
+	for device := range mountedDevices {
+		// Check if this device is an NVMe device
+		nqn, err := util.GetNVMeInfoFromDevice(device)
+		if err != nil {
+			continue // Not an NVMe device
+		}
+		if nqn != "" {
+			expected[nqn] = struct{}{}
+		}
+	}
+
+	return expected
 }

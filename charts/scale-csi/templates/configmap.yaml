@@ -55,3 +55,9 @@ data:
       transportAddress: {{ .Values.nvmeof.address | default .Values.truenas.host | quote }}
       transportServiceId: {{ .Values.nvmeof.port | default 4420 }}
       subsystemAllowAnyHost: true
+
+    # Session garbage collection (node plugin only)
+    sessionGC:
+      interval: {{ if .Values.sessionGC.enabled }}{{ .Values.sessionGC.interval | default 300 }}{{ else }}0{{ end }}
+      gracePeriod: {{ .Values.sessionGC.gracePeriod | default 60 }}
+      dryRun: {{ .Values.sessionGC.dryRun | default false }}

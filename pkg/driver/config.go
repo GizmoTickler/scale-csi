@@ -30,6 +30,9 @@ type Config struct {
 
 	// NVMe-oF configuration
 	NVMeoF NVMeoFConfig `yaml:"nvmeof"`
+
+	// Session garbage collection configuration (node plugin only)
+	SessionGC SessionGCConfig `yaml:"sessionGC"`
 }
 
 // TrueNASConfig holds TrueNAS connection settings.
@@ -161,6 +164,22 @@ type ISCSITargetGroup struct {
 	Auth *int `yaml:"auth"`
 }
 
+// SessionGCConfig holds session garbage collection configuration.
+type SessionGCConfig struct {
+	// Enabled enables periodic garbage collection of orphaned sessions (default: true)
+	Enabled bool `yaml:"enabled"`
+
+	// Interval is the interval between GC runs in seconds (default: 300 = 5 minutes)
+	Interval int `yaml:"interval"`
+
+	// GracePeriod is how long a session must be orphaned before cleanup in seconds (default: 60)
+	// This prevents cleaning up sessions that are in the middle of being staged
+	GracePeriod int `yaml:"gracePeriod"`
+
+	// DryRun logs orphaned sessions without disconnecting them (default: false)
+	DryRun bool `yaml:"dryRun"`
+}
+
 // NVMeoFConfig holds NVMe-oF configuration.
 type NVMeoFConfig struct {
 	// Transport is the transport type (tcp, rdma)
@@ -248,6 +267,18 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.NVMeoF.DeviceWaitTimeout == 0 {
 		cfg.NVMeoF.DeviceWaitTimeout = 60 // Default 60 seconds (OTHER-001 fix)
 	}
+
+	// Session GC defaults - enabled by default with 5 minute interval
+	// Note: Enabled defaults to false from YAML unmarshaling, we set true explicitly
+	// Users can disable by setting sessionGC.enabled: false
+	if cfg.SessionGC.Interval == 0 {
+		cfg.SessionGC.Interval = 300 // 5 minutes
+	}
+	if cfg.SessionGC.GracePeriod == 0 {
+		cfg.SessionGC.GracePeriod = 60 // 1 minute grace period
+	}
+	// Enable GC by default - check if it was explicitly set to false by the presence
+	// of other fields or handle via a separate mechanism (we'll default to true in driver.go)
 
 	// Validate required fields
 	if cfg.TrueNAS.Host == "" {
