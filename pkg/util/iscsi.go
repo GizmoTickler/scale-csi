@@ -359,8 +359,10 @@ func getISCSISessions() ([]ISCSISession, error) {
 
 	var sessions []ISCSISession
 	lines := strings.Split(string(output), "\n")
-	// Format: tcp: [session_id] portal:port,target_portal_group_tag iqn
-	re := regexp.MustCompile(`^tcp:\s+\[(\d+)\]\s+([^,]+),\d+\s+(.+)$`)
+	// Format: tcp: [session_id] portal:port,target_portal_group_tag iqn (mode)
+	// The mode suffix (e.g., "(non-flash)") is NOT part of the IQN
+	// IQN format: iqn.YYYY-MM.reversed.domain:target_name
+	re := regexp.MustCompile(`^tcp:\s+\[(\d+)\]\s+([^,]+),\d+\s+(iqn\.[^\s]+)`)
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
