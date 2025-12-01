@@ -478,3 +478,30 @@ func GetNVMeInfoFromDevice(devicePath string) (string, error) {
 
 	return "", fmt.Errorf("could not find NQN for device %s", devicePath)
 }
+
+// FindNVMeoFSessionBySubsysName searches connected NVMe subsystems for one matching the subsystem name.
+// The subsystem name is the part that should appear in the NQN (with any prefix/suffix already applied).
+// This is used for cleanup when the device path is unavailable (e.g., after node restart).
+func FindNVMeoFSessionBySubsysName(subsysName string) (string, error) {
+	subsystems, err := listNVMeSubsystems()
+	if err != nil {
+		return "", fmt.Errorf("failed to list NVMe subsystems: %w", err)
+	}
+
+	// Search for a subsystem whose NQN contains the subsystem name
+	// NQN format can vary: nqn.2014-08.org.nvmexpress:uuid:xxx or containing the volume name
+	for _, subsystem := range subsystems {
+		if strings.Contains(subsystem.NQN, subsysName) {
+			klog.V(4).Infof("Found NVMe-oF subsystem for name %s: NQN=%s", subsysName, subsystem.NQN)
+			return subsystem.NQN, nil
+		}
+	}
+
+	return "", fmt.Errorf("no NVMe-oF subsystem found for name %s", subsysName)
+}
+
+// FindNVMeoFSessionByVolumeID is a convenience wrapper that searches by volumeID.
+// Deprecated: Use FindNVMeoFSessionBySubsysName instead, which handles NamePrefix/NameSuffix correctly.
+func FindNVMeoFSessionByVolumeID(volumeID string) (string, error) {
+	return FindNVMeoFSessionBySubsysName(volumeID)
+}

@@ -202,10 +202,78 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 				klog.V(4).Infof("Could not get iSCSI info from device %s: %v", devicePath, err)
 			}
 		}
+	} else {
+		// BUG-004 fix: Session leak prevention
+		// When devicePath is empty (mount already gone), attempt cleanup using volumeID
+		// to prevent orphaned iSCSI/NVMe-oF sessions accumulating after node restarts
+		// or force unmounts.
+		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID)
 	}
 
 	klog.Infof("Volume %s unstaged successfully", volumeID)
 	return &csi.NodeUnstageVolumeResponse{}, nil
+}
+
+// cleanupOrphanedSessionByVolumeID attempts to clean up iSCSI/NVMe-oF sessions
+// when the device path is unavailable (e.g., after node restart or force unmount).
+// This prevents session leaks that accumulate over time.
+func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID string) {
+	shareType := d.config.GetDriverShareType()
+
+	switch shareType {
+	case "iscsi":
+		// Try to find and disconnect any iSCSI session for this volume
+		portal := d.config.ISCSI.TargetPortal
+
+		// Construct the expected target name (same logic as createISCSIShare)
+		// Target name = volumeID + optional NameSuffix
+		targetName := volumeID
+		if d.config.ISCSI.NameSuffix != "" {
+			targetName = targetName + d.config.ISCSI.NameSuffix
+		}
+
+		// Check if there's an active session for this target
+		iqn, err := util.FindISCSISessionByTargetName(targetName)
+		if err != nil {
+			klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s): %v", volumeID, targetName, err)
+			return
+		}
+
+		if iqn != "" {
+			klog.Infof("Found orphaned iSCSI session for volume %s: %s", volumeID, iqn)
+			if err := util.ISCSIDisconnect(portal, iqn); err != nil {
+				klog.Warningf("Failed to disconnect orphaned iSCSI session %s: %v", iqn, err)
+			} else {
+				klog.Infof("Successfully cleaned up orphaned iSCSI session %s", iqn)
+			}
+		}
+
+	case "nvmeof":
+		// Construct the expected NQN (same logic as createNVMeoFShare)
+		nqnName := volumeID
+		if d.config.NVMeoF.NamePrefix != "" {
+			nqnName = d.config.NVMeoF.NamePrefix + nqnName
+		}
+		if d.config.NVMeoF.NameSuffix != "" {
+			nqnName = nqnName + d.config.NVMeoF.NameSuffix
+		}
+
+		// Try to find and disconnect any NVMe-oF session for this volume
+		nqn, err := util.FindNVMeoFSessionBySubsysName(nqnName)
+		if err != nil {
+			klog.V(4).Infof("No active NVMe-oF session found for volume %s (nqn: %s): %v", volumeID, nqnName, err)
+			return
+		}
+
+		if nqn != "" {
+			klog.Infof("Found orphaned NVMe-oF session for volume %s: %s", volumeID, nqn)
+			if err := util.NVMeoFDisconnect(nqn); err != nil {
+				klog.Warningf("Failed to disconnect orphaned NVMe-oF session %s: %v", nqn, err)
+			} else {
+				klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
+			}
+		}
+	}
 }
 
 // NodePublishVolume mounts a volume to a target path.

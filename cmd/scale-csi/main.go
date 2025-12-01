@@ -27,6 +27,7 @@ func main() {
 		nodeID      string
 		driverName  string
 		mode        string
+		healthPort  int
 		showVersion bool
 	)
 
@@ -35,6 +36,7 @@ func main() {
 	flag.StringVar(&nodeID, "node-id", "", "Node ID (required for node mode)")
 	flag.StringVar(&driverName, "driver-name", "csi.scale.io", "CSI driver name")
 	flag.StringVar(&mode, "mode", "all", "Driver mode: controller, node, or all")
+	flag.IntVar(&healthPort, "health-port", 9809, "Port for health/metrics HTTP server (0 to disable)")
 	flag.BoolVar(&showVersion, "version", false, "Show version and exit")
 
 	klog.InitFlags(nil)
@@ -95,6 +97,7 @@ func main() {
 		RunController: runController,
 		RunNode:       runNode,
 		Config:        cfg,
+		HealthPort:    healthPort,
 	})
 	if err != nil {
 		klog.Fatalf("Failed to create driver: %v", err)

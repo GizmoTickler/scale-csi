@@ -46,7 +46,12 @@ spec:
             - "-driver-name={{ .Values.csiDriverName }}"
             - "-config=/etc/scale-csi/config.yaml"
             - "-mode=controller"
+            - "-health-port=9809"
             - "-v={{ .Values.logging.verbosity }}"
+          ports:
+            - name: health
+              containerPort: 9809
+              protocol: TCP
           env:
             - name: NODE_ID
               valueFrom:
@@ -82,6 +87,14 @@ spec:
             timeoutSeconds: 3
             periodSeconds: 10
             failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9809
+            initialDelaySeconds: 5
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
 
         # CSI Provisioner
         - name: csi-provisioner

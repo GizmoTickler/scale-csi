@@ -679,3 +679,31 @@ func GetISCSIInfoFromDevice(devicePath string) (string, string, error) {
 
 	return "", "", fmt.Errorf("could not find portal for IQN %s", iqn)
 }
+
+// FindISCSISessionByTargetName searches active iSCSI sessions for one matching the target name.
+// The target name is the part after the colon in the IQN (e.g., "pvc-xxx" in "iqn.2005-10.org.freenas.ctl:pvc-xxx").
+// This is used for cleanup when the device path is unavailable (e.g., after node restart).
+func FindISCSISessionByTargetName(targetName string) (string, error) {
+	sessions, err := getISCSISessions()
+	if err != nil {
+		return "", fmt.Errorf("failed to get iSCSI sessions: %w", err)
+	}
+
+	// Search for a session whose IQN ends with :{targetName}
+	// IQN format: iqn.2005-10.org.freenas.ctl:pvc-xxx[-suffix]
+	expectedSuffix := ":" + targetName
+	for _, session := range sessions {
+		if strings.HasSuffix(session.IQN, expectedSuffix) {
+			klog.V(4).Infof("Found iSCSI session for target %s: IQN=%s", targetName, session.IQN)
+			return session.IQN, nil
+		}
+	}
+
+	return "", fmt.Errorf("no iSCSI session found for target %s", targetName)
+}
+
+// FindISCSISessionByVolumeID is a convenience wrapper that searches by volumeID.
+// Deprecated: Use FindISCSISessionByTargetName instead, which handles NameSuffix correctly.
+func FindISCSISessionByVolumeID(volumeID string) (string, error) {
+	return FindISCSISessionByTargetName(volumeID)
+}

@@ -26,6 +26,7 @@ type DriverConfig struct {
 	RunController bool
 	RunNode       bool
 	Config        *Config
+	HealthPort    int // Port for health/metrics HTTP server (0 to disable)
 }
 
 // Driver is the TrueNAS Scale CSI driver.
@@ -48,6 +49,13 @@ type Driver struct {
 
 	// gRPC server
 	server *grpc.Server
+
+	// Health and metrics server
+	healthServer *HealthServer
+	healthPort   int
+
+	// Kubernetes event recorder
+	eventRecorder *EventRecorder
 
 	// Operation lock to prevent concurrent operations on same volume
 	operationLock sync.Map
@@ -89,6 +97,9 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		return nil, fmt.Errorf("failed to create TrueNAS client: %w", err)
 	}
 
+	// Initialize event recorder (will be nil if not running in k8s)
+	eventRecorder := NewEventRecorder(cfg.Name)
+
 	return &Driver{
 		name:          cfg.Name,
 		version:       cfg.Version,
@@ -98,6 +109,8 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		runNode:       cfg.RunNode,
 		config:        cfg.Config,
 		truenasClient: truenasClient,
+		healthPort:    cfg.HealthPort,
+		eventRecorder: eventRecorder,
 	}, nil
 }
 
@@ -151,6 +164,14 @@ func (d *Driver) Run() error {
 		klog.Info("Node service registered")
 	}
 
+	// Start health and metrics server if port is configured
+	if d.healthPort > 0 {
+		d.healthServer = NewHealthServer(d, d.healthPort)
+		if err := d.healthServer.Start(); err != nil {
+			return fmt.Errorf("failed to start health server: %w", err)
+		}
+	}
+
 	d.ready = true
 	klog.Infof("CSI driver listening on %s", d.endpoint)
 
@@ -161,6 +182,16 @@ func (d *Driver) Run() error {
 func (d *Driver) Stop() {
 	klog.Info("Stopping CSI driver")
 	d.ready = false
+
+	// Stop health server first
+	if d.healthServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.healthServer.Stop(ctx); err != nil {
+			klog.Warningf("Failed to stop health server: %v", err)
+		}
+	}
+
 	if d.server != nil {
 		d.server.GracefulStop()
 	}
@@ -216,6 +247,9 @@ func (d *Driver) logInterceptor(
 
 	// Calculate duration
 	duration := time.Since(startTime)
+
+	// Record metrics
+	RecordCSIOperation(info.FullMethod, duration.Seconds(), err)
 
 	// Log result
 	if err != nil {
