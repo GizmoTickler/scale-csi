@@ -1,0 +1,8 @@
+**~
+dev
+/ci/bin/*dev*
+verification_tool.go
+test-values.yaml
+test-smoke-iscsi.yaml
+test-smoke-nfs.yaml
+test-snapshot.yaml

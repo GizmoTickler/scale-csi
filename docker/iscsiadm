@@ -1,0 +1,51 @@
+#!/bin/bash
+
+: "${ISCSIADM_HOST_STRATEGY:=nsenter}"
+
+# Find iscsiadm binary - check multiple possible locations (varies by OS/distro)
+find_iscsiadm() {
+  for path in /usr/sbin/iscsiadm /usr/local/sbin/iscsiadm /sbin/iscsiadm /usr/bin/iscsiadm; do
+    if [[ -x "/host${path}" ]]; then
+      echo "${path}"
+      return
+    fi
+  done
+  # Fallback to default
+  echo "/usr/sbin/iscsiadm"
+}
+
+: "${ISCSIADM_HOST_PATH:=$(find_iscsiadm)}"
+
+echoerr() { printf "%s\n" "$*" >&2; }
+
+case ${ISCSIADM_HOST_STRATEGY} in
+  chroot)
+    # https://engineering.docker.com/2019/07/road-to-containing-iscsi/
+    # Use direct path instead of env for compatibility with minimal OS like Talos
+    chroot /host ${ISCSIADM_HOST_PATH} "${@:1}"
+    ;;
+
+  nsenter)
+    # https://github.com/siderolabs/extensions/issues/38#issuecomment-1125403043
+    # Preferred method for Talos and other minimal OS
+    # Find iscsid PID by scanning /host/proc (since regular pgrep only sees container processes)
+    iscsid_pid=""
+    for pid_dir in /host/proc/[0-9]*; do
+      pid=$(basename "${pid_dir}")
+      if [[ -f "${pid_dir}/comm" ]] && [[ "$(cat "${pid_dir}/comm" 2>/dev/null)" == "iscsid" ]]; then
+        iscsid_pid="${pid}"
+        break
+      fi
+    done
+    if [[ "${iscsid_pid}x" == "x" ]]; then
+      echoerr "failed to find iscsid pid for nsenter"
+      exit 1
+    fi
+    nsenter --mount="/host/proc/${iscsid_pid}/ns/mnt" --net="/host/proc/${iscsid_pid}/ns/net" -- ${ISCSIADM_HOST_PATH} "${@:1}"
+    ;;
+
+  *)
+    echoerr "invalid ISCSIADM_HOST_STRATEGY: ${ISCSIADM_HOST_STRATEGY}"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,178 @@
+{{- if .Values.node.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      {{- include "scale-csi.nodeSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "scale-csi.nodeSelectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "scale-csi.nodeServiceAccountName" . }}
+      priorityClassName: system-node-critical
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        # CSI Driver
+        - name: scale-csi
+          image: "{{ .Values.image.repository }}:{{ include "scale-csi.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "-endpoint=unix://{{ include "scale-csi.socketPath" . }}"
+            - "-node-id=$(NODE_ID)"
+            - "-driver-name={{ .Values.csiDriverName }}"
+            - "-config=/etc/scale-csi/config.yaml"
+            - "-mode=node"
+            - "-v={{ .Values.logging.verbosity }}"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- if or .Values.truenas.apiKey .Values.truenas.existingSecret }}
+            - name: TRUENAS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "scale-csi.secretName" . }}
+                  key: api-key
+                  optional: true
+            {{- end }}
+            {{- with .Values.node.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ include "scale-csi.socketDir" . }}
+            - name: config
+              mountPath: /etc/scale-csi
+              readOnly: true
+            - name: kubelet-dir
+              mountPath: {{ include "scale-csi.kubeletDir" . }}
+              mountPropagation: Bidirectional
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+            - name: host-dev
+              mountPath: /dev
+            - name: host-sys
+              mountPath: /sys
+            - name: host-run-udev
+              mountPath: /run/udev
+            - name: iscsi-dir
+              mountPath: /etc/iscsi
+            - name: iscsi-lib
+              mountPath: /var/lib/iscsi
+            {{- with .Values.node.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.node.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9808
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
+
+        # Node Driver Registrar
+        - name: csi-node-driver-registrar
+          image: {{ .Values.sidecars.nodeDriverRegistrar.image }}
+          args:
+            - "--csi-address={{ include "scale-csi.socketPath" . }}"
+            - "--kubelet-registration-path={{ include "scale-csi.kubeletDir" . }}/plugins/{{ .Values.csiDriverName }}/csi.sock"
+            - "--v={{ .Values.logging.verbosity }}"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ include "scale-csi.socketDir" . }}
+            - name: registration-dir
+              mountPath: /registration
+          resources:
+            {{- toYaml .Values.sidecars.nodeDriverRegistrar.resources | nindent 12 }}
+
+        # Liveness Probe
+        - name: liveness-probe
+          image: {{ .Values.sidecars.livenessProbe.image }}
+          args:
+            - "--csi-address={{ include "scale-csi.socketPath" . }}"
+            - "--probe-timeout=3s"
+            - "--health-port=9808"
+            - "--v={{ .Values.logging.verbosity }}"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ include "scale-csi.socketDir" . }}
+          resources:
+            {{- toYaml .Values.sidecars.livenessProbe.resources | nindent 12 }}
+
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: {{ include "scale-csi.kubeletDir" . }}/plugins/{{ .Values.csiDriverName }}
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: {{ include "scale-csi.fullname" . }}-config
+        - name: registration-dir
+          hostPath:
+            path: {{ include "scale-csi.kubeletDir" . }}/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: {{ include "scale-csi.kubeletDir" . }}
+            type: Directory
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-run-udev
+          hostPath:
+            path: /run/udev
+            type: Directory
+        - name: iscsi-dir
+          hostPath:
+            path: /etc/iscsi
+            type: DirectoryOrCreate
+        - name: iscsi-lib
+          hostPath:
+            path: /var/lib/iscsi
+            type: DirectoryOrCreate
+        {{- with .Values.node.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

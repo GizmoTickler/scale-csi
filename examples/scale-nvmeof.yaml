@@ -1,0 +1,99 @@
+# TrueNAS SCALE 25.04+ NVMe-oF Driver Configuration
+# Uses WebSocket JSON-RPC 2.0 API (no SSH required)
+
+driver: scale-nvmeof
+instance_id:
+
+# WebSocket connection to TrueNAS SCALE 25.04+
+httpConnection:
+  protocol: https
+  host: truenas.example.com
+  port: 443
+
+  # Use API key for authentication (recommended)
+  # Generate API key in TrueNAS UI: Settings -> API Keys
+  apiKey: 1-xxxxxxxxxxxxxxxxxxxxx
+
+  # OR use username/password (less secure)
+  #username: root
+  #password: your-password
+
+  # Allow self-signed certificates (not recommended for production)
+  allowInsecure: true
+
+# ZFS zvol configuration
+zfs:
+  # Parent dataset for volumes (zvols)
+  datasetParentName: tank/k8s/volumes
+
+  # Parent dataset for detached snapshots
+  # IMPORTANT: Do NOT nest these datasets - they should be siblings
+  detachedSnapshotsDatasetParentName: tank/k8s/snapshots
+
+  # Enable reservations for zvols (recommended for NVMe-oF)
+  zvolEnableReservation: true
+
+  # Compression: "" (inherit), lz4, gzip-9, etc.
+  zvolCompression: lz4
+
+  # Deduplication: "" (inherit), on, off, verify
+  zvolDedup: ""
+
+  # Block size: 512, 1K, 2K, 4K, 8K, 16K, 64K, 128K (default: 16K)
+  zvolBlocksize: 16K
+
+  # Set custom ZFS properties using Handlebars templates
+  #datasetProperties:
+  #  "org.truenas:description": "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}/{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+  #  "org.truenas:pvc-name": "{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+
+# NVMe-oF configuration
+nvmeof:
+  # NVMe-oF target address (TrueNAS NVMe-oF server)
+  targetAddress: truenas.example.com
+
+  # NVMe-oF transport protocol
+  # Supported: tcp, rdma
+  transport: tcp
+
+  # Port for NVMe-oF target (default: 4420 for TCP, 4420 for RDMA)
+  port: 4420
+
+  # NQN (NVMe Qualified Name) prefix
+  # Full NQN format: nqn.2014-08.org.nvmexpress:uuid:<namespace-uuid>
+  nqnPrefix: "nqn.2014-08.com.example"
+
+  # Subsystem naming
+  # Default template is "{{ name }}"
+  #nameTemplate: "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}-{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+  namePrefix: csi-
+  nameSuffix: "-k8s"
+
+  # Subsystem configuration
+  subsystem:
+    # Allow any host to connect (true) or restrict to specific hosts (false)
+    allowAnyHost: true
+
+    # Serial number for the subsystem (auto-generated if not specified)
+    #serialNumber: ""
+
+  # Namespace configuration
+  namespace:
+    # Namespace ID (1-based, auto-assigned if not specified)
+    #nsid: 1
+
+    # UUID for the namespace (auto-generated if not specified)
+    #uuid: ""
+
+    # Enable NGUID (Namespace Globally Unique Identifier)
+    enableNguid: true
+
+  # Host access configuration (only used if allowAnyHost is false)
+  hosts:
+    # List of allowed host NQNs
+    # Example:
+    # - "nqn.2014-08.org.nvmexpress:uuid:12345678-1234-1234-1234-123456789abc"
+    # - "nqn.2014-08.org.nvmexpress:uuid:87654321-4321-4321-4321-cba987654321"
+
+  # Custom comment template for subsystems/namespaces
+  #commentTemplate: "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}/{{ parameters.[csi.storage.k8s.io/pvc/name] }}"

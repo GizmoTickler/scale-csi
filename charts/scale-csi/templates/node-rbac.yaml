@@ -1,0 +1,47 @@
+{{- if .Values.rbac.create }}
+{{- if .Values.node.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "scale-csi.nodeServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-node
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-node
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "scale-csi.nodeServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "scale-csi.fullname" . }}-node
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}

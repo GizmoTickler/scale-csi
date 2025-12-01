@@ -1,0 +1,69 @@
+Scale CSI Driver has been installed!
+
+Chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+{{- if .Values.controller.enabled }}
+Controller: Enabled ({{ .Values.controller.replicas }} replica(s))
+{{- end }}
+{{- if .Values.node.enabled }}
+Node Plugin: Enabled (DaemonSet)
+{{- end }}
+
+CSI Driver Name: {{ .Values.csiDriverName }}
+
+{{- if .Values.storageClass.create }}
+
+StorageClass "{{ .Values.storageClass.name }}" has been created.
+{{- if .Values.storageClass.isDefault }}
+This storage class is set as the default.
+{{- end }}
+{{- end }}
+
+To verify the installation:
+
+  # Check CSI driver registration
+  kubectl get csidrivers {{ .Values.csiDriverName }}
+
+  # Check controller pods
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=controller
+
+  # Check node pods
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=node
+
+To create a PersistentVolumeClaim:
+
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: my-pvc
+  spec:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: {{ .Values.storageClass.name }}
+    resources:
+      requests:
+        storage: 10Gi
+
+{{- if not .Values.truenas.host }}
+
+WARNING: TrueNAS host is not configured!
+Please update the values and upgrade the release:
+
+  helm upgrade {{ .Release.Name }} scale-csi \
+    --set truenas.host=<your-truenas-host> \
+    --set truenas.apiKey=<your-api-key>
+{{- end }}
+
+{{- if not .Values.zfs.parentDataset }}
+
+WARNING: ZFS parent dataset is not configured!
+Please update the values and upgrade the release:
+
+  helm upgrade {{ .Release.Name }} scale-csi \
+    --set zfs.parentDataset=<your-pool/dataset>
+{{- end }}
+
+For more information, visit:
+  https://github.com/GizmoTickler/scale-csi

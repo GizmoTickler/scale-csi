@@ -1,0 +1,27 @@
+# Docker build context ignore patterns
+.git
+.github
+.gitignore
+.dockerignore
+
+# IDE and editor files
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# CI/CD and testing
+ci/
+charts/
+examples/
+contrib/
+
+# Build artifacts
+*.tar.gz
+*.zip

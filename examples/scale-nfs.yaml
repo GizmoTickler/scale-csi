@@ -1,0 +1,65 @@
+# TrueNAS SCALE 25.04+ NFS Driver Configuration
+# Uses WebSocket JSON-RPC 2.0 API (no SSH required)
+
+driver: scale-nfs
+instance_id:
+
+# WebSocket connection to TrueNAS SCALE 25.04+
+httpConnection:
+  protocol: https
+  host: truenas.example.com
+  port: 443
+
+  # Use API key for authentication (recommended)
+  # Generate API key in TrueNAS UI: Settings -> API Keys
+  apiKey: 1-xxxxxxxxxxxxxxxxxxxxx
+
+  # OR use username/password (less secure)
+  #username: root
+  #password: your-password
+
+  # Allow self-signed certificates (not recommended for production)
+  allowInsecure: true
+
+# ZFS dataset configuration
+zfs:
+  # Parent dataset for volumes
+  datasetParentName: tank/k8s/volumes
+
+  # Parent dataset for detached snapshots
+  # IMPORTANT: Do NOT nest these datasets - they should be siblings
+  detachedSnapshotsDatasetParentName: tank/k8s/snapshots
+
+  # Enable quotas on datasets (recommended for NFS)
+  datasetEnableQuotas: true
+
+  # Enable reservations (not recommended - wastes space)
+  datasetEnableReservation: false
+
+  # Default permissions
+  datasetPermissionsMode: "0777"
+  datasetPermissionsUser: 0
+  datasetPermissionsGroup: 0
+
+  # Set custom ZFS properties using Handlebars templates
+  #datasetProperties:
+  #  "org.truenas:description": "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}/{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+  #  "org.truenas:pvc-name": "{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+
+# NFS share configuration
+nfs:
+  # NFS server hostname/IP (should match TrueNAS system)
+  shareHost: truenas.example.com
+
+  # Custom share comment template
+  #shareCommentTemplate: "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}-{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+
+  # NFS export options
+  shareAllowedHosts: []
+  shareAllowedNetworks: []
+
+  # User/group mapping (root squashing)
+  shareMaprootUser: root
+  shareMaprootGroup: wheel
+  shareMapallUser: ""
+  shareMapallGroup: ""

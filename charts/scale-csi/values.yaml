@@ -1,0 +1,313 @@
+# Scale CSI Driver Helm Chart Values
+
+# CSI Driver name (should match the driver name in StorageClass)
+csiDriverName: csi.scale.io
+
+# Image configuration
+image:
+  repository: ghcr.io/gizmotickler/scale-csi
+  tag: ""  # Defaults to appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Controller configuration (runs as Deployment)
+controller:
+  enabled: true
+  replicas: 1
+
+  # Resource limits
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+  # Node selector for controller pod
+  nodeSelector: {}
+
+  # Tolerations for controller pod
+  tolerations:
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+
+  # Affinity rules
+  affinity: {}
+
+  # Additional environment variables
+  extraEnv: []
+
+  # Additional volume mounts
+  extraVolumeMounts: []
+
+  # Additional volumes
+  extraVolumes: []
+
+# Node configuration (runs as DaemonSet)
+node:
+  enabled: true
+
+  # Resource limits
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+  # Node selector for node pods
+  nodeSelector: {}
+
+  # Tolerations for node pods (allow scheduling on all nodes)
+  tolerations:
+    - operator: Exists
+
+  # Affinity rules
+  affinity: {}
+
+  # Additional environment variables
+  extraEnv: []
+
+  # Additional volume mounts
+  extraVolumeMounts: []
+
+  # Additional volumes
+  extraVolumes: []
+
+# TrueNAS connection configuration
+truenas:
+  # TrueNAS host (required)
+  host: ""
+
+  # API port (80 for HTTP, 443 for HTTPS)
+  port: 443
+
+  # Use HTTPS
+  secure: true
+
+  # Skip TLS verification (not recommended for production)
+  skipTLSVerify: false
+
+  # API key authentication (recommended)
+  apiKey: ""
+
+  # Username/password authentication (alternative to API key)
+  username: ""
+  password: ""
+
+  # Use existing secret for credentials
+  # Secret should have keys: api-key OR username and password
+  existingSecret: ""
+
+  # Request timeout in seconds (default: 60)
+  requestTimeout: 60
+
+  # Maximum concurrent API requests to TrueNAS (default: 10)
+  # Lower this if TrueNAS becomes overloaded with many PVC operations
+  maxConcurrentRequests: 10
+
+# ZFS configuration
+zfs:
+  # Parent dataset for volumes (required)
+  parentDataset: ""
+
+  # Enable deduplication
+  dedup: false
+
+  # Enable compression
+  compression: true
+
+  # Compression algorithm (lz4, gzip, zstd, etc.)
+  compressionAlgorithm: lz4
+
+  # Dataset quota enforcement
+  enforceQuota: true
+
+# NFS configuration
+nfs:
+  # Enable NFS support
+  enabled: true
+
+  # NFS server address (defaults to TrueNAS host)
+  server: ""
+
+  # Default NFS mount options
+  mountOptions:
+    - nfsvers=4
+    - noatime
+
+# iSCSI configuration
+iscsi:
+  # Enable iSCSI support
+  enabled: true
+
+  # Target portal address (defaults to TrueNAS host)
+  portal: ""
+
+  # Target portal port
+  portalPort: 3260
+
+  # Default portal group ID
+  portalGroupId: 1
+
+  # Default initiator group ID
+  initiatorGroupId: 1
+
+  # IQN base name
+  basename: "iqn.2005-10.org.freenas.ctl"
+
+  # Timeout in seconds to wait for iSCSI device to appear after login
+  # Increase this for heavily loaded nodes or slow networks
+  deviceWaitTimeout: 60
+
+# NVMe-oF configuration
+nvmeof:
+  # Enable NVMe-oF support
+  enabled: false
+
+  # Transport type (tcp, rdma)
+  transport: tcp
+
+  # Target address (defaults to TrueNAS host)
+  address: ""
+
+  # Target port
+  port: 4420
+
+  # NQN base name
+  basename: "nqn.2014-08.org.nvmexpress"
+
+# Storage class configuration
+storageClass:
+  # Create default storage class
+  create: true
+
+  # Storage class name
+  name: scale-nfs
+
+  # Set as default storage class
+  isDefault: false
+
+  # Reclaim policy (Delete, Retain)
+  reclaimPolicy: Delete
+
+  # Volume binding mode (Immediate, WaitForFirstConsumer)
+  volumeBindingMode: Immediate
+
+  # Allow volume expansion
+  allowVolumeExpansion: true
+
+  # Protocol (nfs, iscsi, nvmeof)
+  protocol: nfs
+
+  # Mount options for NFS
+  mountOptions:
+    - nfsvers=4
+    - noatime
+
+# Sidecar containers versions
+sidecars:
+  provisioner:
+    image: registry.k8s.io/sig-storage/csi-provisioner:v6.1.0
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 10m
+        memory: 32Mi
+
+  attacher:
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.10.0
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 10m
+        memory: 32Mi
+
+  resizer:
+    image: registry.k8s.io/sig-storage/csi-resizer:v2.0.0
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 10m
+        memory: 32Mi
+
+  snapshotter:
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.4.0
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 10m
+        memory: 32Mi
+
+  nodeDriverRegistrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.15.0
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 10m
+        memory: 32Mi
+
+  livenessProbe:
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.17.0
+    resources:
+      limits:
+        cpu: 50m
+        memory: 64Mi
+      requests:
+        cpu: 10m
+        memory: 16Mi
+
+# Service account configuration
+serviceAccount:
+  # Create service accounts
+  create: true
+
+  # Annotations for service accounts
+  annotations: {}
+
+# RBAC configuration
+rbac:
+  # Create RBAC resources
+  create: true
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: false  # Required for mount operations
+  fsGroup: 0
+
+# Container security context (for node plugin)
+securityContext:
+  privileged: true
+  capabilities:
+    add:
+      - SYS_ADMIN
+
+# Logging configuration
+logging:
+  # Verbosity level (0-10, higher is more verbose)
+  verbosity: 2
+
+  # Log format (text, json)
+  format: text
+
+# Metrics configuration
+metrics:
+  enabled: false
+  port: 9808

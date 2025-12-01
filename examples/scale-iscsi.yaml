@@ -1,0 +1,106 @@
+# TrueNAS SCALE 25.04+ iSCSI Driver Configuration
+# Uses WebSocket JSON-RPC 2.0 API (no SSH required)
+
+driver: scale-iscsi
+instance_id:
+
+# WebSocket connection to TrueNAS SCALE 25.04+
+httpConnection:
+  protocol: https
+  host: truenas.example.com
+  port: 443
+
+  # Use API key for authentication (recommended)
+  # Generate API key in TrueNAS UI: Settings -> API Keys
+  apiKey: 1-xxxxxxxxxxxxxxxxxxxxx
+
+  # OR use username/password (less secure)
+  #username: root
+  #password: your-password
+
+  # Allow self-signed certificates (not recommended for production)
+  allowInsecure: true
+
+# ZFS zvol configuration
+zfs:
+  # Parent dataset for volumes (zvols)
+  datasetParentName: tank/k8s/volumes
+
+  # Parent dataset for detached snapshots
+  # IMPORTANT: Do NOT nest these datasets - they should be siblings
+  detachedSnapshotsDatasetParentName: tank/k8s/snapshots
+
+  # Enable reservations for zvols (recommended for iSCSI)
+  zvolEnableReservation: true
+
+  # Compression: "" (inherit), lz4, gzip-9, etc.
+  zvolCompression: lz4
+
+  # Deduplication: "" (inherit), on, off, verify
+  zvolDedup: ""
+
+  # Block size: 512, 1K, 2K, 4K, 8K, 16K, 64K, 128K (default: 16K)
+  zvolBlocksize: 16K
+
+  # Set custom ZFS properties using Handlebars templates
+  #datasetProperties:
+  #  "org.truenas:description": "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}/{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+  #  "org.truenas:pvc-name": "{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+
+# iSCSI configuration
+iscsi:
+  # Target portal (TrueNAS iSCSI server)
+  targetPortal: "truenas.example.com:3260"
+
+  # For multipath support, specify multiple portals
+  targetPortals: []
+  # Example: ["truenas1.example.com:3260", "truenas2.example.com:3260"]
+
+  # iSCSI interface for iscsiadm (leave empty to omit -I flag)
+  interface: ""
+
+  # Target naming
+  # Full IQN limit is 223 bytes, plan accordingly
+  # Default template is "{{ name }}"
+  #nameTemplate: "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}-{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+  namePrefix: csi-
+  nameSuffix: "-k8s"
+
+  # Target groups configuration
+  # Add as many as needed for your storage classes
+  targetGroups:
+    # Portal Group ID from TrueNAS UI: Sharing -> iSCSI -> Portals
+    # NOTE: Use the DB ID, not the UI display value
+    - targetGroupPortalGroup: 1
+
+      # Initiator Group ID from TrueNAS UI: Sharing -> iSCSI -> Initiators
+      targetGroupInitiatorGroup: 1
+
+      # Authentication type: None, CHAP, or CHAP Mutual
+      targetGroupAuthType: None
+
+      # Authorized Access ID (only required if using CHAP)
+      # From TrueNAS UI: Sharing -> iSCSI -> Authorized Access
+      targetGroupAuthGroup:
+
+  # Extent configuration
+  # Custom comment template for extents
+  #extentCommentTemplate: "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}/{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
+
+  # Insecure TPC (Tape Priority Commands)
+  extentInsecureTpc: true
+
+  # Xen compatibility mode
+  extentXenCompat: false
+
+  # Disable physical block size reporting
+  extentDisablePhysicalBlocksize: true
+
+  # Logical block size: 512, 1024, 2048, or 4096
+  extentBlocksize: 512
+
+  # RPM: "" (let TrueNAS decide, defaults to SSD), Unknown, SSD, 5400, 7200, 10000, 15000
+  extentRpm: "SSD"
+
+  # Available space threshold (0-100, 0 = ignore)
+  extentAvailThreshold: 0

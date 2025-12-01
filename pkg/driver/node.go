@@ -1,0 +1,553 @@
+package driver
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/util"
+)
+
+// NodeGetCapabilities returns the capabilities of the node service.
+func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+	klog.V(4).Info("NodeGetCapabilities called")
+
+	caps := []*csi.NodeServiceCapability{
+		{
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{
+					Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+				},
+			},
+		},
+		{
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{
+					Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+				},
+			},
+		},
+		{
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{
+					Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
+				},
+			},
+		},
+		{
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{
+					Type: csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+				},
+			},
+		},
+	}
+
+	return &csi.NodeGetCapabilitiesResponse{
+		Capabilities: caps,
+	}, nil
+}
+
+// NodeGetInfo returns information about the node.
+func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+	klog.V(4).Info("NodeGetInfo called")
+
+	return &csi.NodeGetInfoResponse{
+		NodeId: d.nodeID,
+	}, nil
+}
+
+// NodeStageVolume mounts a volume to a staging path.
+func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	stagingPath := req.GetStagingTargetPath()
+	volumeContext := req.GetVolumeContext()
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+	if stagingPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
+	}
+	if volumeContext == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume context is required")
+	}
+
+	klog.Infof("NodeStageVolume: volumeID=%s, stagingPath=%s", volumeID, stagingPath)
+
+	// Lock on volume ID
+	lockKey := "node-stage:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress")
+	}
+	defer d.releaseOperationLock(lockKey)
+
+	// Get attach driver from volume context
+	attachDriver := volumeContext["node_attach_driver"]
+	if attachDriver == "" {
+		attachDriver = d.config.GetDriverShareType()
+	}
+
+	// Ensure staging directory exists
+	if err := os.MkdirAll(stagingPath, 0750); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create staging directory: %v", err)
+	}
+
+	switch attachDriver {
+	case "nfs":
+		if err := d.stageNFSVolume(ctx, volumeContext, stagingPath); err != nil {
+			return nil, err
+		}
+	case "iscsi":
+		if err := d.stageISCSIVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability()); err != nil {
+			return nil, err
+		}
+	case "nvmeof":
+		if err := d.stageNVMeoFVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability()); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "unsupported attach driver: %s", attachDriver)
+	}
+
+	klog.Infof("Volume %s staged successfully at %s", volumeID, stagingPath)
+	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+// NodeUnstageVolume unmounts a volume from the staging path.
+func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	stagingPath := req.GetStagingTargetPath()
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+	if stagingPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
+	}
+
+	klog.Infof("NodeUnstageVolume: volumeID=%s, stagingPath=%s", volumeID, stagingPath)
+
+	// Lock on volume ID
+	lockKey := "node-unstage:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress")
+	}
+	defer d.releaseOperationLock(lockKey)
+
+	// Get device path before unmounting (for session cleanup)
+	devicePath, err := util.GetDeviceFromMountPoint(stagingPath)
+	if err != nil {
+		// If not mounted, we can't get the device path, so we can't cleanup session
+		// This is expected if already unstaged
+		klog.V(4).Infof("Could not get device from mount point %s: %v", stagingPath, err)
+	}
+
+	// Unmount staging path
+	if err := util.Unmount(stagingPath); err != nil {
+		klog.Warningf("Failed to unmount staging path: %v", err)
+		// BUG-003 fix: Check if still mounted before attempting removal
+		// to prevent data corruption from removing mounted directories
+		mounted, checkErr := util.IsMounted(stagingPath)
+		if checkErr != nil {
+			klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
+			// If we can't verify mount status, don't risk removing a mounted path
+			return nil, status.Errorf(codes.Internal, "failed to unmount staging path and cannot verify mount status: %v", err)
+		}
+		if mounted {
+			return nil, status.Errorf(codes.Internal, "failed to unmount staging path (still mounted): %v", err)
+		}
+		// Not mounted, safe to continue with cleanup
+		klog.Infof("Staging path %s is not mounted, proceeding with cleanup", stagingPath)
+	}
+
+	// Clean up staging directory (only reached if unmount succeeded or path was not mounted)
+	if err := os.RemoveAll(stagingPath); err != nil {
+		klog.Warningf("Failed to remove staging directory: %v", err)
+	}
+
+	// Disconnect session if we found a device
+	if devicePath != "" {
+		if strings.Contains(devicePath, "nvme") {
+			// NVMe-oF cleanup
+			nqn, err := util.GetNVMeInfoFromDevice(devicePath)
+			if err == nil {
+				if err := util.NVMeoFDisconnect(nqn); err != nil {
+					klog.Warningf("Failed to disconnect NVMe-oF session %s: %v", nqn, err)
+				} else {
+					klog.Infof("Disconnected NVMe-oF session %s", nqn)
+				}
+			} else {
+				klog.V(4).Infof("Could not get NVMe info from device %s: %v", devicePath, err)
+			}
+		} else {
+			// Try iSCSI cleanup
+			portal, iqn, err := util.GetISCSIInfoFromDevice(devicePath)
+			if err == nil {
+				if err := util.ISCSIDisconnect(portal, iqn); err != nil {
+					klog.Warningf("Failed to disconnect iSCSI session %s: %v", iqn, err)
+				} else {
+					klog.Infof("Disconnected iSCSI session %s", iqn)
+				}
+			} else {
+				klog.V(4).Infof("Could not get iSCSI info from device %s: %v", devicePath, err)
+			}
+		}
+	}
+
+	klog.Infof("Volume %s unstaged successfully", volumeID)
+	return &csi.NodeUnstageVolumeResponse{}, nil
+}
+
+// NodePublishVolume mounts a volume to a target path.
+func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	targetPath := req.GetTargetPath()
+	stagingPath := req.GetStagingTargetPath()
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+	if targetPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "target path is required")
+	}
+
+	klog.Infof("NodePublishVolume: volumeID=%s, targetPath=%s, stagingPath=%s", volumeID, targetPath, stagingPath)
+
+	// Lock on volume ID
+	lockKey := "node-publish:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress")
+	}
+	defer d.releaseOperationLock(lockKey)
+
+	// Ensure target directory exists
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0750); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create target directory: %v", err)
+	}
+
+	// Check if already mounted
+	mounted, err := util.IsMounted(targetPath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to check mount status: %v", err)
+	}
+	if mounted {
+		klog.Infof("Volume %s already mounted at %s", volumeID, targetPath)
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
+
+	// Determine mount options
+	readonly := req.GetReadonly()
+	mountOptions := []string{}
+	if readonly {
+		mountOptions = append(mountOptions, "ro")
+	}
+
+	// Add volume capability mount flags
+	if req.GetVolumeCapability() != nil {
+		if mount := req.GetVolumeCapability().GetMount(); mount != nil {
+			mountOptions = append(mountOptions, mount.GetMountFlags()...)
+		}
+	}
+
+	// Bind mount from staging path to target path
+	if stagingPath != "" {
+		if err := os.MkdirAll(targetPath, 0750); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to create target path: %v", err)
+		}
+		if err := util.BindMount(stagingPath, targetPath, mountOptions); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to bind mount: %v", err)
+		}
+	} else {
+		// Direct mount (legacy mode without staging)
+		volumeContext := req.GetVolumeContext()
+		attachDriver := volumeContext["node_attach_driver"]
+		if attachDriver == "" {
+			attachDriver = d.config.GetDriverShareType()
+		}
+
+		switch attachDriver {
+		case "nfs":
+			server := volumeContext["server"]
+			share := volumeContext["share"]
+			source := fmt.Sprintf("%s:%s", server, share)
+			if err := util.MountNFS(source, targetPath, mountOptions); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
+			}
+		default:
+			return nil, status.Error(codes.InvalidArgument, "staging path required for block volumes")
+		}
+	}
+
+	klog.Infof("Volume %s published successfully at %s", volumeID, targetPath)
+	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// NodeUnpublishVolume unmounts a volume from the target path.
+func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	targetPath := req.GetTargetPath()
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+	if targetPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "target path is required")
+	}
+
+	klog.Infof("NodeUnpublishVolume: volumeID=%s, targetPath=%s", volumeID, targetPath)
+
+	// Lock on volume ID
+	lockKey := "node-unpublish:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress")
+	}
+	defer d.releaseOperationLock(lockKey)
+
+	// Unmount target path
+	if err := util.Unmount(targetPath); err != nil {
+		klog.Warningf("Failed to unmount target path: %v", err)
+		// BUG-003 fix: Check if still mounted before attempting removal
+		mounted, checkErr := util.IsMounted(targetPath)
+		if checkErr != nil {
+			klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
+			return nil, status.Errorf(codes.Internal, "failed to unmount target path and cannot verify mount status: %v", err)
+		}
+		if mounted {
+			return nil, status.Errorf(codes.Internal, "failed to unmount target path (still mounted): %v", err)
+		}
+		klog.Infof("Target path %s is not mounted, proceeding with cleanup", targetPath)
+	}
+
+	// Remove target path (only reached if unmount succeeded or path was not mounted)
+	if err := os.RemoveAll(targetPath); err != nil {
+		klog.Warningf("Failed to remove target path: %v", err)
+	}
+
+	klog.Infof("Volume %s unpublished successfully", volumeID)
+	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+// NodeGetVolumeStats returns statistics for a volume.
+func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+
+	klog.V(4).Infof("NodeGetVolumeStats: volumeID=%s, volumePath=%s", volumeID, volumePath)
+
+	// Check if path exists
+	if _, err := os.Stat(volumePath); os.IsNotExist(err) {
+		return nil, status.Errorf(codes.NotFound, "volume path not found: %s", volumePath)
+	}
+
+	// Get filesystem stats
+	stats, err := util.GetFilesystemStats(volumePath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get volume stats: %v", err)
+	}
+
+	return &csi.NodeGetVolumeStatsResponse{
+		Usage: []*csi.VolumeUsage{
+			{
+				Available: stats.AvailableBytes,
+				Total:     stats.TotalBytes,
+				Used:      stats.UsedBytes,
+				Unit:      csi.VolumeUsage_BYTES,
+			},
+			{
+				Available: stats.AvailableInodes,
+				Total:     stats.TotalInodes,
+				Used:      stats.UsedInodes,
+				Unit:      csi.VolumeUsage_INODES,
+			},
+		},
+	}, nil
+}
+
+// NodeExpandVolume expands a volume on the node.
+func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+
+	klog.Infof("NodeExpandVolume: volumeID=%s, volumePath=%s", volumeID, volumePath)
+
+	// For block volumes (iSCSI/NVMe-oF), resize the filesystem
+	shareType := d.config.GetDriverShareType()
+	if shareType == "iscsi" || shareType == "nvmeof" {
+		// Find the device and resize filesystem
+		if volumePath != "" {
+			if err := util.ResizeFilesystem(volumePath); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to resize filesystem: %v", err)
+			}
+		}
+	}
+
+	capacityBytes := int64(0)
+	if req.GetCapacityRange() != nil {
+		capacityBytes = req.GetCapacityRange().GetRequiredBytes()
+	}
+
+	klog.Infof("Volume %s expanded successfully", volumeID)
+	return &csi.NodeExpandVolumeResponse{
+		CapacityBytes: capacityBytes,
+	}, nil
+}
+
+// stageNFSVolume mounts an NFS volume to the staging path.
+func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]string, stagingPath string) error {
+	if volumeContext == nil {
+		return status.Error(codes.InvalidArgument, "volume context is required for NFS staging")
+	}
+	server := volumeContext["server"]
+	share := volumeContext["share"]
+
+	if server == "" || share == "" {
+		return status.Error(codes.InvalidArgument, "NFS server and share are required in volume context")
+	}
+
+	source := fmt.Sprintf("%s:%s", server, share)
+
+	// Check if already mounted
+	mounted, err := util.IsMounted(stagingPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to check mount status: %v", err)
+	}
+	if mounted {
+		klog.Infof("NFS already mounted at %s", stagingPath)
+		return nil
+	}
+
+	// Mount NFS
+	if err := util.MountNFS(source, stagingPath, nil); err != nil {
+		return status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
+	}
+
+	return nil
+}
+
+// stageISCSIVolume connects and mounts an iSCSI volume to the staging path.
+func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability) error {
+	if volumeContext == nil {
+		return status.Error(codes.InvalidArgument, "volume context is required for iSCSI staging")
+	}
+	portal := volumeContext["portal"]
+	iqn := volumeContext["iqn"]
+	lunStr := volumeContext["lun"]
+
+	if portal == "" || iqn == "" {
+		return status.Error(codes.InvalidArgument, "iSCSI portal and IQN are required in volume context")
+	}
+
+	// Parse LUN number
+	lun := 0
+	if lunStr != "" {
+		var err error
+		lun, err = strconv.Atoi(lunStr)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "invalid LUN number: %s", lunStr)
+		}
+	}
+
+	// Connect to iSCSI target with configurable timeout
+	connectOpts := &util.ISCSIConnectOptions{
+		DeviceTimeout: time.Duration(d.config.ISCSI.DeviceWaitTimeout) * time.Second,
+	}
+	devicePath, err := util.ISCSIConnectWithOptions(ctx, portal, iqn, lun, connectOpts)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to connect iSCSI: %v", err)
+	}
+
+	// Check if block mode
+	if volCap != nil && volCap.GetBlock() != nil {
+		// For block mode, create a symlink to the device
+		if err := os.Symlink(devicePath, stagingPath); err != nil && !os.IsExist(err) {
+			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
+		}
+		return nil
+	}
+
+	// For filesystem mode, format and mount
+	fsType := "ext4"
+	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
+		fsType = volCap.GetMount().GetFsType()
+	}
+
+	if err := util.FormatAndMount(devicePath, stagingPath, fsType, nil); err != nil {
+		return status.Errorf(codes.Internal, "failed to format and mount: %v", err)
+	}
+
+	return nil
+}
+
+// stageNVMeoFVolume connects and mounts an NVMe-oF volume to the staging path.
+func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability) error {
+	if volumeContext == nil {
+		return status.Error(codes.InvalidArgument, "volume context is required for NVMe-oF staging")
+	}
+	nqn := volumeContext["nqn"]
+	transport := volumeContext["transport"]
+	address := volumeContext["address"]
+	port := volumeContext["port"]
+
+	if nqn == "" || address == "" {
+		return status.Error(codes.InvalidArgument, "NVMe-oF NQN and address are required in volume context")
+	}
+
+	if transport == "" {
+		transport = "tcp"
+	}
+	if port == "" {
+		port = "4420"
+	}
+
+	// Connect to NVMe-oF subsystem with configurable timeout (OTHER-001 fix)
+	transportURI := fmt.Sprintf("%s://%s:%s", transport, address, port)
+	connectOpts := &util.NVMeoFConnectOptions{
+		DeviceTimeout: time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second,
+	}
+	devicePath, err := util.NVMeoFConnectWithOptions(nqn, transportURI, connectOpts)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to connect NVMe-oF: %v", err)
+	}
+
+	// Check if block mode
+	if volCap != nil && volCap.GetBlock() != nil {
+		// For block mode, create a symlink to the device
+		if err := os.Symlink(devicePath, stagingPath); err != nil && !os.IsExist(err) {
+			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
+		}
+		return nil
+	}
+
+	// For filesystem mode, format and mount
+	fsType := "ext4"
+	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
+		fsType = strings.ToLower(volCap.GetMount().GetFsType())
+	}
+
+	if err := util.FormatAndMount(devicePath, stagingPath, fsType, nil); err != nil {
+		return status.Errorf(codes.Internal, "failed to format and mount: %v", err)
+	}
+
+	return nil
+}

@@ -1,0 +1,63 @@
+{{- if .Values.storageClass.create }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+  {{- if .Values.storageClass.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ .Values.csiDriverName }}
+reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
+{{- with .Values.storageClass.mountOptions }}
+mountOptions:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+parameters:
+  # Storage protocol
+  protocol: {{ .Values.storageClass.protocol | quote }}
+
+  # ZFS settings
+  parentDataset: {{ .Values.zfs.parentDataset | quote }}
+  {{- if .Values.zfs.dedup }}
+  dedup: "on"
+  {{- end }}
+  {{- if .Values.zfs.compression }}
+  compression: {{ .Values.zfs.compressionAlgorithm | quote }}
+  {{- end }}
+
+  {{- if eq .Values.storageClass.protocol "nfs" }}
+  # NFS settings
+  nfsServer: {{ .Values.nfs.server | default .Values.truenas.host | quote }}
+  {{- end }}
+
+  {{- if eq .Values.storageClass.protocol "iscsi" }}
+  # iSCSI settings
+  iscsiPortal: {{ .Values.iscsi.portal | default .Values.truenas.host | quote }}
+  iscsiPortalPort: {{ .Values.iscsi.portalPort | quote }}
+  iscsiBasename: {{ .Values.iscsi.basename | quote }}
+  {{- end }}
+
+  {{- if eq .Values.storageClass.protocol "nvmeof" }}
+  # NVMe-oF settings
+  nvmeofTransport: {{ .Values.nvmeof.transport | quote }}
+  nvmeofAddress: {{ .Values.nvmeof.address | default .Values.truenas.host | quote }}
+  nvmeofPort: {{ .Values.nvmeof.port | quote }}
+  {{- end }}
+
+  # CSI parameters
+  csi.storage.k8s.io/provisioner-secret-name: {{ include "scale-csi.secretName" . }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ .Release.Namespace }}
+  csi.storage.k8s.io/controller-publish-secret-name: {{ include "scale-csi.secretName" . }}
+  csi.storage.k8s.io/controller-publish-secret-namespace: {{ .Release.Namespace }}
+  csi.storage.k8s.io/node-stage-secret-name: {{ include "scale-csi.secretName" . }}
+  csi.storage.k8s.io/node-stage-secret-namespace: {{ .Release.Namespace }}
+  csi.storage.k8s.io/node-publish-secret-name: {{ include "scale-csi.secretName" . }}
+  csi.storage.k8s.io/node-publish-secret-namespace: {{ .Release.Namespace }}
+  csi.storage.k8s.io/controller-expand-secret-name: {{ include "scale-csi.secretName" . }}
+  csi.storage.k8s.io/controller-expand-secret-namespace: {{ .Release.Namespace }}
+{{- end }}

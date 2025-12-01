@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    # CSI Driver configuration
+    driver: {{ .Values.csiDriverName }}
+
+    # TrueNAS connection settings
+    truenas:
+      host: {{ .Values.truenas.host | quote }}
+      port: {{ .Values.truenas.port }}
+      protocol: {{ if .Values.truenas.secure }}https{{ else }}http{{ end }}
+      apiKey: $TRUENAS_API_KEY
+      allowInsecure: {{ .Values.truenas.skipTLSVerify }}
+      requestTimeout: {{ .Values.truenas.requestTimeout | default 60 }}
+      connectTimeout: 10
+      maxConcurrentRequests: {{ .Values.truenas.maxConcurrentRequests | default 10 }}
+
+    # ZFS dataset configuration
+    zfs:
+      datasetParentName: {{ .Values.zfs.parentDataset | quote }}
+      datasetEnableQuotas: {{ .Values.zfs.enforceQuota }}
+      datasetEnableReservation: false
+      zvolBlocksize: "16K"
+
+    # NFS configuration
+    nfs:
+      shareHost: {{ .Values.nfs.server | default .Values.truenas.host | quote }}
+      shareAllowedNetworks: []
+      shareAllowedHosts: []
+      shareMaprootUser: "root"
+      shareMaprootGroup: "wheel"
+
+    # iSCSI configuration
+    iscsi:
+      targetPortal: {{ printf "%s:%d" (.Values.iscsi.portal | default .Values.truenas.host) (.Values.iscsi.portalPort | default 3260 | int) | quote }}
+      interface: "default"
+      targetGroups:
+        - portal: {{ .Values.iscsi.portalGroupId | default 1 }}
+          initiator: {{ .Values.iscsi.initiatorGroupId | default 1 }}
+          authMethod: "NONE"
+
+      extentBlocksize: 512
+      extentRpm: "SSD"
+      deviceWaitTimeout: {{ .Values.iscsi.deviceWaitTimeout | default 60 }}
+
+    # NVMe-oF configuration
+    nvmeof:
+      transport: {{ .Values.nvmeof.transport | default "tcp" | quote }}
+      transportAddress: {{ .Values.nvmeof.address | default .Values.truenas.host | quote }}
+      transportServiceId: {{ .Values.nvmeof.port | default 4420 }}
+      subsystemAllowAnyHost: true

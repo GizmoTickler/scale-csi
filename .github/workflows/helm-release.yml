@@ -1,0 +1,84 @@
+# Helm Chart Release Workflow (OCI)
+# Publishes Helm charts to GitHub Container Registry as OCI artifacts
+# Usage: helm pull oci://ghcr.io/gizmotickler/charts/scale-csi --version <version>
+
+name: Helm Chart Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+  CHART_NAME: scale-csi
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # Fetch all history for tags
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4.3.1
+        with:
+          version: v4.0.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get chart version
+        id: chart_version
+        run: |
+          # Convert repository owner to lowercase for OCI registry
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo_owner=${REPO_OWNER}" >> $GITHUB_OUTPUT
+
+          if [ "${{ github.event_name }}" == "release" ]; then
+            # Use release tag version (strip 'v' prefix)
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"
+          else
+            # Use latest git tag for push events (strip 'v' prefix)
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+            VERSION="${VERSION#v}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Chart version: ${VERSION}"
+
+      - name: Update chart version
+        run: |
+          VERSION="${{ steps.chart_version.outputs.version }}"
+
+          # Update version and appVersion in Chart.yaml
+          sed -i "s/^version:.*/version: ${VERSION}/" charts/${{ env.CHART_NAME }}/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/${{ env.CHART_NAME }}/Chart.yaml
+
+          echo "Updated Chart.yaml:"
+          cat charts/${{ env.CHART_NAME }}/Chart.yaml
+
+      - name: Lint chart
+        run: helm lint charts/${{ env.CHART_NAME }}
+
+      - name: Package chart
+        run: |
+          helm package charts/${{ env.CHART_NAME }} --destination .helm-packages
+
+      - name: Push chart to OCI registry
+        run: |
+          helm push .helm-packages/${{ env.CHART_NAME }}-${{ steps.chart_version.outputs.version }}.tgz \
+            oci://${{ env.REGISTRY }}/${{ steps.chart_version.outputs.repo_owner }}/charts
+
+          echo "Chart pushed to: oci://${{ env.REGISTRY }}/${{ steps.chart_version.outputs.repo_owner }}/charts/${{ env.CHART_NAME }}:${{ steps.chart_version.outputs.version }}"

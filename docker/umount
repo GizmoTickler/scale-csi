@@ -1,0 +1,38 @@
+#!/bin/bash
+
+container_supported_filesystems=(
+  "ext2"
+  "ext3"
+  "ext4"
+  "ext4dev"
+  "btrfs"
+  "xfs"
+  "vfat"
+  "nfs"
+  "nfs3"
+  "nfs4"
+  "cifs"
+  "smb"
+  "smb3"
+  "bind"
+)
+
+while getopts "t:" opt; do
+  case "$opt" in
+    t)
+      if [[ "x${USE_HOST_MOUNT_TOOLS}" == "x" ]]; then
+        [[ "${OPTARG,,}" == "zfs" ]] && USE_HOST_MOUNT_TOOLS=1
+        [[ "${OPTARG,,}" == "lustre" ]] && USE_HOST_MOUNT_TOOLS=1
+        [[ "${OPTARG,,}" == "onedata" ]] && USE_HOST_MOUNT_TOOLS=1
+        #(printf '%s\0' "${container_supported_filesystems[@]}" | grep -Fqxz -- "${OPTARG}") || USE_HOST_MOUNT_TOOLS=1
+      fi
+      ;;
+  esac
+done
+
+if [[ ${USE_HOST_MOUNT_TOOLS} -eq 1 ]]; then
+  # Use direct path for compatibility with minimal OS like Talos
+  chroot /host /bin/umount "${@:1}"
+else
+  /bin/umount "${@:1}"
+fi

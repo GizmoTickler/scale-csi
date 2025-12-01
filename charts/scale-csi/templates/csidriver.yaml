@@ -1,0 +1,18 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ .Values.csiDriverName }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+spec:
+  # Indicates the driver requires an attach operation
+  attachRequired: true
+  # Indicates the driver supports volume expansion
+  podInfoOnMount: true
+  # Storage capacity tracking
+  storageCapacity: false
+  # Volume lifecycle modes
+  volumeLifecycleModes:
+    - Persistent
+  # FS group policy
+  fsGroupPolicy: File
