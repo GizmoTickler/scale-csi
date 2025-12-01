@@ -307,10 +307,31 @@ logging:
   # Log format (text, json)
   format: text
 
-# Metrics configuration
+# Metrics and monitoring configuration
 metrics:
-  enabled: false
-  port: 9808
+  # Enable metrics services (creates ClusterIP services for scraping)
+  enabled: true
+
+  # Metrics port (must match health-port in driver args)
+  port: 9809
+
+  # Service annotations (e.g., for prometheus.io/scrape annotations)
+  service:
+    annotations: {}
+
+  # ServiceMonitor for Prometheus Operator
+  serviceMonitor:
+    # Create ServiceMonitor resources
+    enabled: false
+
+    # Additional labels for ServiceMonitor (for Prometheus selector)
+    labels: {}
+
+    # Scrape interval
+    interval: 30s
+
+    # Scrape timeout
+    scrapeTimeout: 10s
 
 # Session garbage collection configuration (node plugin only)
 # Periodically cleans up orphaned iSCSI/NVMe-oF sessions that may leak
