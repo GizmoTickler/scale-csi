@@ -351,18 +351,20 @@ func (d *Driver) stopSessionGC() {
 }
 
 // runSessionGC performs one garbage collection cycle.
+// It runs GC for all configured protocols (iSCSI and/or NVMe-oF), not just
+// the default driver type. This handles multi-protocol deployments where
+// the driver name is generic but multiple StorageClasses use different protocols.
 func (d *Driver) runSessionGC(_ context.Context, _ time.Duration, dryRun bool) {
-	shareType := d.config.GetDriverShareType()
-	klog.V(4).Infof("Running session GC for %s", shareType)
+	klog.V(4).Info("Running session GC")
 
-	switch shareType {
-	case "iscsi":
+	// Run iSCSI GC if iSCSI is configured (has target portal)
+	if d.config.ISCSI.TargetPortal != "" {
 		d.gcISCSISessions(dryRun)
-	case "nvmeof":
+	}
+
+	// Run NVMe-oF GC if NVMe-oF is configured (has transport address)
+	if d.config.NVMeoF.TransportAddress != "" {
 		d.gcNVMeoFSessions(dryRun)
-	default:
-		// NFS doesn't have sessions to clean up
-		klog.V(5).Infof("Session GC not applicable for share type: %s", shareType)
 	}
 }
 
