@@ -94,10 +94,11 @@ func BindMount(source, target string, options []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
 	defer cancel()
 
-	args := []string{"--bind"}
-	if len(options) > 0 {
-		args = append(args, "-o", strings.Join(options, ","))
-	}
+	// Use "-o bind" instead of "--bind" for BusyBox compatibility
+	// BusyBox mount doesn't support GNU-style long options
+	mountOptions := []string{"bind"}
+	mountOptions = append(mountOptions, options...)
+	args := []string{"-o", strings.Join(mountOptions, ",")}
 	args = append(args, source, target)
 
 	cmd := exec.CommandContext(ctx, "mount", args...)
