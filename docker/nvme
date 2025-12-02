@@ -3,7 +3,7 @@
 # NVMe-oF commands need to run on the host system
 # Use nsenter for compatibility with Talos and other minimal OS
 
-: "${NVME_HOST_STRATEGY:=nsenter}"
+: "${NVME_HOST_STRATEGY:=auto}"
 
 # Find nvme binary - check multiple possible locations (varies by OS/distro)
 find_nvme() {
@@ -27,24 +27,19 @@ case ${NVME_HOST_STRATEGY} in
     ;;
 
   nsenter)
-    # Find nvme-related process by scanning /host/proc (since regular pgrep only sees container processes)
-    nvme_pid=""
-    for pid_dir in /host/proc/[0-9]*; do
-      pid=$(basename "${pid_dir}")
-      if [[ -f "${pid_dir}/comm" ]]; then
-        comm=$(cat "${pid_dir}/comm" 2>/dev/null)
-        if [[ "${comm}" == "nvme-cli" ]] || [[ "${comm}" == "nvme" ]]; then
-          nvme_pid="${pid}"
-          break
-        fi
-      fi
-    done
-    if [[ "${nvme_pid}x" == "x" ]]; then
-      # Fallback to chroot if no nvme process found (nvme-cli doesn't have a daemon)
-      chroot /host ${NVME_HOST_PATH} "${@:1}"
-    else
-      nsenter --mount="/host/proc/${nvme_pid}/ns/mnt" --net="/host/proc/${nvme_pid}/ns/net" -- ${NVME_HOST_PATH} "${@:1}"
+    # Unlike iSCSI (which has iscsid daemon), nvme-cli is a one-shot command.
+    # Use nsenter with PID 1 (init) to access the host namespace.
+    # This works on Talos and other minimal OS where chroot may not work.
+    nsenter --mount="/host/proc/1/ns/mnt" --net="/host/proc/1/ns/net" -- ${NVME_HOST_PATH} "${@:1}"
+    ;;
+
+  auto)
+    # Auto mode: try chroot first (works on standard distros),
+    # fallback to nsenter with PID 1 (works on Talos/minimal OS)
+    if chroot /host ${NVME_HOST_PATH} "${@:1}" 2>/dev/null; then
+      exit 0
     fi
+    nsenter --mount="/host/proc/1/ns/mnt" --net="/host/proc/1/ns/net" -- ${NVME_HOST_PATH} "${@:1}"
     ;;
 
   *)
