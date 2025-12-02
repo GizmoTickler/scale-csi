@@ -4,7 +4,20 @@
 # Use nsenter for compatibility with Talos and other minimal OS
 
 : "${NVME_HOST_STRATEGY:=nsenter}"
-: "${NVME_HOST_PATH:=/usr/sbin/nvme}"
+
+# Find nvme binary - check multiple possible locations (varies by OS/distro)
+find_nvme() {
+  for path in /usr/local/sbin/nvme /usr/sbin/nvme /sbin/nvme /usr/bin/nvme /usr/local/bin/nvme; do
+    if [[ -x "/host${path}" ]]; then
+      echo "${path}"
+      return
+    fi
+  done
+  # Fallback to default
+  echo "/usr/sbin/nvme"
+}
+
+: "${NVME_HOST_PATH:=$(find_nvme)}"
 
 echoerr() { printf "%s\n" "$*" >&2; }
 
@@ -27,7 +40,7 @@ case ${NVME_HOST_STRATEGY} in
       fi
     done
     if [[ "${nvme_pid}x" == "x" ]]; then
-      # Fallback to chroot if no nvme process found
+      # Fallback to chroot if no nvme process found (nvme-cli doesn't have a daemon)
       chroot /host ${NVME_HOST_PATH} "${@:1}"
     else
       nsenter --mount="/host/proc/${nvme_pid}/ns/mnt" --net="/host/proc/${nvme_pid}/ns/net" -- ${NVME_HOST_PATH} "${@:1}"
