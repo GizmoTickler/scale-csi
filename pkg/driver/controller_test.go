@@ -17,7 +17,7 @@ func TestCreateVolume(t *testing.T) {
 			ZFS: ZFSConfig{
 				DatasetParentName: "pool/parent",
 			},
-			DriverName: "org.truenas.csi.nfs",
+			DriverName: "org.scale.csi.nfs",
 			NFS: NFSConfig{
 				ShareHost: "1.2.3.4",
 			},
@@ -174,7 +174,7 @@ func TestControllerExpandVolume(t *testing.T) {
 			ZFS: ZFSConfig{
 				DatasetParentName: "pool/parent",
 			},
-			DriverName: "org.truenas.csi.nfs",
+			DriverName: "org.scale.csi.nfs",
 		},
 		truenasClient: mockClient,
 	}

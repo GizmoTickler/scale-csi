@@ -2,14 +2,22 @@
 package util
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 
 	"k8s.io/klog/v2"
 )
+
+// mountCommandTimeout is the default timeout for mount-related commands.
+const mountCommandTimeout = 30 * time.Second
+
+// formatCommandTimeout is a longer timeout for formatting operations which can take time on large devices.
+const formatCommandTimeout = 5 * time.Minute
 
 // FilesystemStats holds filesystem statistics.
 type FilesystemStats struct {
@@ -28,8 +36,11 @@ func IsMounted(path string) (bool, error) {
 		return false, nil
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	defer cancel()
+
 	// Use findmnt to check mount status
-	cmd := exec.Command("findmnt", "--mountpoint", path, "--noheadings")
+	cmd := exec.CommandContext(ctx, "findmnt", "--mountpoint", path, "--noheadings")
 	output, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 means not mounted
@@ -46,6 +57,9 @@ func IsMounted(path string) (bool, error) {
 func Mount(source, target, fsType string, options []string) error {
 	klog.V(4).Infof("Mounting %s to %s (fsType=%s, options=%v)", source, target, fsType, options)
 
+	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	defer cancel()
+
 	args := []string{}
 	if fsType != "" {
 		args = append(args, "-t", fsType)
@@ -55,7 +69,7 @@ func Mount(source, target, fsType string, options []string) error {
 	}
 	args = append(args, source, target)
 
-	cmd := exec.Command("mount", args...)
+	cmd := exec.CommandContext(ctx, "mount", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mount failed: %v, output: %s", err, string(output))
@@ -77,13 +91,16 @@ func MountNFS(source, target string, options []string) error {
 func BindMount(source, target string, options []string) error {
 	klog.V(4).Infof("Bind mounting %s to %s", source, target)
 
+	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	defer cancel()
+
 	args := []string{"--bind"}
 	if len(options) > 0 {
 		args = append(args, "-o", strings.Join(options, ","))
 	}
 	args = append(args, source, target)
 
-	cmd := exec.Command("mount", args...)
+	cmd := exec.CommandContext(ctx, "mount", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("bind mount failed: %v, output: %s", err, string(output))
@@ -92,8 +109,13 @@ func BindMount(source, target string, options []string) error {
 	return nil
 }
 
-// Unmount unmounts a target path.
+// Unmount unmounts a target path with retry for transient failures.
 func Unmount(target string) error {
+	return UnmountWithContext(context.Background(), target)
+}
+
+// UnmountWithContext unmounts a target path with context and retry for transient failures.
+func UnmountWithContext(ctx context.Context, target string) error {
 	klog.V(4).Infof("Unmounting %s", target)
 
 	// Check if mounted
@@ -105,16 +127,32 @@ func Unmount(target string) error {
 		return nil
 	}
 
-	cmd := exec.Command("umount", target)
-	if _, err := cmd.CombinedOutput(); err != nil {
-		// Try lazy unmount
-		cmd = exec.Command("umount", "-l", target)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("unmount failed: %v, output: %s", err, string(output))
-		}
-	}
+	retryCfg := UnmountRetryConfig()
 
-	return nil
+	return RetryWithBackoff(ctx, "unmount "+target, retryCfg, func() error {
+		cmdCtx, cancel := context.WithTimeout(ctx, mountCommandTimeout)
+		defer cancel()
+
+		cmd := exec.CommandContext(cmdCtx, "umount", target)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			return nil
+		}
+
+		// Check if it was a transient "busy" error before trying lazy unmount
+		if !IsRetryableError(err, retryCfg.RetryableErrors) {
+			// Not retryable with regular unmount, try lazy unmount as last resort
+			cmd = exec.CommandContext(cmdCtx, "umount", "-l", target)
+			if lazyOutput, lazyErr := cmd.CombinedOutput(); lazyErr != nil {
+				return fmt.Errorf("unmount failed: %v, output: %s; lazy unmount also failed: %v, output: %s",
+					err, string(output), lazyErr, string(lazyOutput))
+			}
+			return nil // Lazy unmount succeeded
+		}
+
+		// Return the error to trigger retry
+		return fmt.Errorf("unmount failed: %v, output: %s", err, string(output))
+	})
 }
 
 // FormatAndMount formats a device and mounts it.
@@ -144,16 +182,19 @@ func FormatAndMount(devicePath, target, fsType string, options []string) error {
 func FormatDevice(devicePath, fsType string) error {
 	klog.Infof("Formatting device %s with %s", devicePath, fsType)
 
+	ctx, cancel := context.WithTimeout(context.Background(), formatCommandTimeout)
+	defer cancel()
+
 	var cmd *exec.Cmd
 	switch fsType {
 	case "ext4":
-		cmd = exec.Command("mkfs.ext4", "-F", devicePath)
+		cmd = exec.CommandContext(ctx, "mkfs.ext4", "-F", devicePath)
 	case "ext3":
-		cmd = exec.Command("mkfs.ext3", "-F", devicePath)
+		cmd = exec.CommandContext(ctx, "mkfs.ext3", "-F", devicePath)
 	case "xfs":
-		cmd = exec.Command("mkfs.xfs", "-f", devicePath)
+		cmd = exec.CommandContext(ctx, "mkfs.xfs", "-f", devicePath)
 	case "btrfs":
-		cmd = exec.Command("mkfs.btrfs", "-f", devicePath)
+		cmd = exec.CommandContext(ctx, "mkfs.btrfs", "-f", devicePath)
 	default:
 		return fmt.Errorf("unsupported filesystem type: %s", fsType)
 	}
@@ -168,7 +209,10 @@ func FormatDevice(devicePath, fsType string) error {
 
 // GetFilesystemType returns the filesystem type of a device.
 func GetFilesystemType(devicePath string) (string, error) {
-	cmd := exec.Command("blkid", "-o", "value", "-s", "TYPE", devicePath)
+	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "TYPE", devicePath)
 	output, err := cmd.Output()
 	if err != nil {
 		// Device may not be formatted yet
@@ -212,15 +256,18 @@ func ResizeFilesystem(mountPath string) error {
 		return err
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), formatCommandTimeout)
+	defer cancel()
+
 	// Resize based on filesystem type
 	var cmd *exec.Cmd
 	switch fsType {
 	case "ext4", "ext3", "ext2":
-		cmd = exec.Command("resize2fs", devicePath)
+		cmd = exec.CommandContext(ctx, "resize2fs", devicePath)
 	case "xfs":
-		cmd = exec.Command("xfs_growfs", mountPath)
+		cmd = exec.CommandContext(ctx, "xfs_growfs", mountPath)
 	case "btrfs":
-		cmd = exec.Command("btrfs", "filesystem", "resize", "max", mountPath)
+		cmd = exec.CommandContext(ctx, "btrfs", "filesystem", "resize", "max", mountPath)
 	default:
 		return fmt.Errorf("resize not supported for filesystem type: %s", fsType)
 	}
@@ -235,7 +282,10 @@ func ResizeFilesystem(mountPath string) error {
 
 // GetDeviceFromMountPoint returns the device path for a mount point.
 func GetDeviceFromMountPoint(mountPath string) (string, error) {
-	cmd := exec.Command("findmnt", "-n", "-o", "SOURCE", mountPath)
+	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-o", "SOURCE", mountPath)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to find device: %v", err)
@@ -247,9 +297,12 @@ func GetDeviceFromMountPoint(mountPath string) (string, error) {
 // The keys are device paths (e.g., "/dev/sda1"), values are mount points.
 // This is used by session GC to determine which iSCSI/NVMe devices are in use.
 func GetMountedBlockDevices() (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	defer cancel()
+
 	// Use findmnt to list all block device mounts
 	// -n: no headers, -l: list format, -o: output columns
-	cmd := exec.Command("findmnt", "-n", "-l", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs")
+	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-l", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs")
 	output, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 with empty output means no mounts found (not an error)

@@ -214,26 +214,47 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 	return devicePath, nil
 }
 
-// ISCSIDisconnect disconnects from an iSCSI target.
+// ISCSIDisconnect disconnects from an iSCSI target with retry for transient failures.
 func ISCSIDisconnect(portal, iqn string) error {
+	return ISCSIDisconnectWithContext(context.Background(), portal, iqn)
+}
+
+// ISCSIDisconnectWithContext disconnects from an iSCSI target with context and retry.
+func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 	klog.V(4).Infof("ISCSIDisconnect: portal=%s, iqn=%s", portal, iqn)
 
-	// Logout from target
-	cmd := exec.Command("iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--logout")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Check if already logged out
-		if strings.Contains(string(output), "No matching sessions") ||
-			strings.Contains(string(output), "not logged in") {
-			klog.V(4).Infof("Target already logged out: %s", iqn)
-			return nil
+	retryCfg := DisconnectRetryConfig()
+
+	err := RetryWithBackoff(ctx, "iSCSI logout "+iqn, retryCfg, func() error {
+		cmdCtx, cancel := context.WithTimeout(ctx, iscsiCommandTimeout)
+		defer cancel()
+
+		// Logout from target
+		cmd := exec.CommandContext(cmdCtx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--logout")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			// Check if already logged out - treat as success
+			if strings.Contains(string(output), "No matching sessions") ||
+				strings.Contains(string(output), "not logged in") {
+				klog.V(4).Infof("Target already logged out: %s", iqn)
+				return nil
+			}
+			// Return error to potentially trigger retry
+			return fmt.Errorf("logout failed: %v, output: %s", err, string(output))
 		}
-		return fmt.Errorf("logout failed: %v, output: %s", err, string(output))
+		return nil
+	})
+
+	if err != nil {
+		return err
 	}
 
-	// Delete the node record
-	cmd = exec.Command("iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-o", "delete")
-	output, err = cmd.CombinedOutput()
+	// Delete the node record (best effort, no retry needed)
+	cmdCtx, cancel := context.WithTimeout(ctx, iscsiCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-o", "delete")
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// Not critical if delete fails
 		klog.Warningf("Failed to delete node record: %v, output: %s", err, string(output))
@@ -347,7 +368,10 @@ func iscsiLogin(ctx context.Context, portal, iqn string) error {
 
 // getISCSISessions returns the list of active iSCSI sessions.
 func getISCSISessions() ([]ISCSISession, error) {
-	cmd := exec.Command("iscsiadm", "-m", "session")
+	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session")
 	output, err := cmd.Output()
 	if err != nil {
 		// No sessions is not an error
@@ -497,7 +521,10 @@ func GetISCSIDevicePath(iqn string, lun int) (string, error) {
 
 // ISCSIRescanSession rescans an iSCSI session to detect new LUNs.
 func ISCSIRescanSession(portal, iqn string) error {
-	cmd := exec.Command("iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--rescan")
+	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--rescan")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("rescan failed: %v, output: %s", err, string(output))
@@ -507,7 +534,10 @@ func ISCSIRescanSession(portal, iqn string) error {
 
 // ISCSIGetSessionStats returns session statistics for an iSCSI target.
 func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
-	cmd := exec.Command("iscsiadm", "-m", "session", "-s")
+	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session", "-s")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session stats: %v", err)
@@ -543,7 +573,10 @@ func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 
 // SetISCSINodeParam sets a parameter on an iSCSI node.
 func SetISCSINodeParam(portal, iqn, name, value string) error {
-	cmd := exec.Command("iscsiadm", "-m", "node", "-T", iqn, "-p", portal,
+	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal,
 		"-o", "update", "-n", name, "-v", value)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -613,7 +646,10 @@ func GetDeviceSize(devicePath string) (int64, error) {
 
 // FlushDeviceBuffers flushes buffers for a block device.
 func FlushDeviceBuffers(devicePath string) error {
-	cmd := exec.Command("blockdev", "--flushbufs", devicePath)
+	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "blockdev", "--flushbufs", devicePath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to flush buffers: %v, output: %s", err, string(output))

@@ -91,9 +91,9 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 	defer d.releaseOperationLock(lockKey)
 
-	// Get attach driver from volume context
-	attachDriver := volumeContext["node_attach_driver"]
-	if attachDriver == "" {
+	// Get attach driver from volume context and normalize
+	attachDriver := ParseShareType(volumeContext["node_attach_driver"])
+	if volumeContext["node_attach_driver"] == "" {
 		attachDriver = d.config.GetDriverShareType()
 	}
 
@@ -103,20 +103,20 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 
 	switch attachDriver {
-	case "nfs":
+	case ShareTypeNFS:
 		if err := d.stageNFSVolume(ctx, volumeContext, stagingPath); err != nil {
 			return nil, err
 		}
-	case "iscsi":
+	case ShareTypeISCSI:
 		if err := d.stageISCSIVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability()); err != nil {
 			return nil, err
 		}
-	case "nvmeof":
+	case ShareTypeNVMeoF:
 		if err := d.stageNVMeoFVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability()); err != nil {
 			return nil, err
 		}
 	default:
-		return nil, status.Errorf(codes.InvalidArgument, "unsupported attach driver: %s", attachDriver)
+		return nil, status.Errorf(codes.InvalidArgument, "unsupported attach driver: %s (supported: %v)", attachDriver, ValidShareTypeStrings())
 	}
 
 	klog.Infof("Volume %s staged successfully at %s", volumeID, stagingPath)
@@ -155,8 +155,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	// Unmount staging path
 	if err := util.Unmount(stagingPath); err != nil {
 		klog.Warningf("Failed to unmount staging path: %v", err)
-		// BUG-003 fix: Check if still mounted before attempting removal
-		// to prevent data corruption from removing mounted directories
+		// Check if still mounted before attempting removal to prevent data corruption
 		mounted, checkErr := util.IsMounted(stagingPath)
 		if checkErr != nil {
 			klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
@@ -204,12 +203,10 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 	}
 
-	// BUG-004 fix (enhanced): Always attempt cleanup by volumeID as a safety net.
-	// This catches sessions that:
-	// 1. Weren't disconnected because devicePath was empty
-	// 2. Weren't disconnected because device info extraction failed
-	// 3. Remain from previous failed unstage attempts
-	// 4. Were "disconnected" but some edge case left a duplicate session
+	// Always attempt cleanup by volumeID as a safety net.
+	// This catches sessions that weren't disconnected because devicePath was empty,
+	// device info extraction failed, remain from previous failed unstage attempts,
+	// or some edge case left a duplicate session.
 	// The cleanup function is idempotent - it will simply log "no session found"
 	// if no session remains after the disconnect above.
 	d.cleanupOrphanedSessionByVolumeID(ctx, volumeID)
@@ -225,7 +222,7 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 	shareType := d.config.GetDriverShareType()
 
 	switch shareType {
-	case "iscsi":
+	case ShareTypeISCSI:
 		// Try to find and disconnect any iSCSI session for this volume
 		portal := d.config.ISCSI.TargetPortal
 
@@ -252,7 +249,7 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 			}
 		}
 
-	case "nvmeof":
+	case ShareTypeNVMeoF:
 		// Construct the expected NQN (same logic as createNVMeoFShare)
 		nqnName := volumeID
 		if d.config.NVMeoF.NamePrefix != "" {
@@ -342,13 +339,13 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	} else {
 		// Direct mount (legacy mode without staging)
 		volumeContext := req.GetVolumeContext()
-		attachDriver := volumeContext["node_attach_driver"]
-		if attachDriver == "" {
+		attachDriver := ParseShareType(volumeContext["node_attach_driver"])
+		if volumeContext["node_attach_driver"] == "" {
 			attachDriver = d.config.GetDriverShareType()
 		}
 
 		switch attachDriver {
-		case "nfs":
+		case ShareTypeNFS:
 			server := volumeContext["server"]
 			share := volumeContext["share"]
 			source := fmt.Sprintf("%s:%s", server, share)
@@ -388,7 +385,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	// Unmount target path
 	if err := util.Unmount(targetPath); err != nil {
 		klog.Warningf("Failed to unmount target path: %v", err)
-		// BUG-003 fix: Check if still mounted before attempting removal
+		// Check if still mounted before attempting removal
 		mounted, checkErr := util.IsMounted(targetPath)
 		if checkErr != nil {
 			klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
@@ -465,7 +462,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 
 	// For block volumes (iSCSI/NVMe-oF), resize the filesystem
 	shareType := d.config.GetDriverShareType()
-	if shareType == "iscsi" || shareType == "nvmeof" {
+	if shareType.IsBlockProtocol() {
 		// Find the device and resize filesystem
 		if volumePath != "" {
 			if err := util.ResizeFilesystem(volumePath); err != nil {
@@ -618,7 +615,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Connect to NVMe-oF subsystem with configurable timeout (OTHER-001 fix)
+	// Connect to NVMe-oF subsystem with configurable timeout
 	transportURI := fmt.Sprintf("%s://%s:%s", transport, address, port)
 	connectOpts := &util.NVMeoFConnectOptions{
 		DeviceTimeout: time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second,

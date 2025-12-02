@@ -85,6 +85,10 @@ func IsConnectionError(err error) bool {
 		strings.Contains(errStr, "connection lost")
 }
 
+// MetricsRecorder is a callback for recording API request metrics.
+// method is the API method name, duration is in seconds, err is nil on success.
+type MetricsRecorder func(method string, duration float64, err error)
+
 // ClientConfig holds the configuration for the TrueNAS client.
 type ClientConfig struct {
 	Host               string
@@ -94,11 +98,12 @@ type ClientConfig struct {
 	AllowInsecure      bool
 	Timeout            time.Duration
 	ConnectTimeout     time.Duration
-	MaxRetries         int           // Maximum number of connection retries (default: 3)
-	RetryInterval      time.Duration // Initial retry interval (default: 1s, exponential backoff applied)
-	HeartbeatInterval  time.Duration // Interval for WebSocket heartbeat (default: 30s)
-	MaxConnections     int           // Maximum number of concurrent connections (default: 5)
-	MaxConcurrentReqs  int           // Maximum number of concurrent API requests (default: 10)
+	MaxRetries         int             // Maximum number of connection retries (default: 3)
+	RetryInterval      time.Duration   // Initial retry interval (default: 1s, exponential backoff applied)
+	HeartbeatInterval  time.Duration   // Interval for WebSocket heartbeat (default: 30s)
+	MaxConnections     int             // Maximum number of concurrent connections (default: 5)
+	MaxConcurrentReqs  int             // Maximum number of concurrent API requests (default: 10)
+	MetricsRecorder    MetricsRecorder // Optional callback for recording request metrics
 }
 
 // writeRequest represents a request to be written to the WebSocket.
@@ -163,10 +168,11 @@ func NewConnection(id int, cfg *ClientConfig) *Connection {
 
 // Client is a TrueNAS API client using WebSocket JSON-RPC 2.0 with connection pooling.
 type Client struct {
-	config    *ClientConfig
-	pool      []*Connection
-	next      uint64         // For round-robin selection
-	semaphore chan struct{}  // Limits concurrent requests to prevent TrueNAS overload
+	config          *ClientConfig
+	pool            []*Connection
+	next            uint64          // For round-robin selection
+	semaphore       chan struct{}   // Limits concurrent requests to prevent TrueNAS overload
+	metricsRecorder MetricsRecorder // Optional callback for recording request metrics
 }
 
 // rpcRequest is a JSON-RPC 2.0 request.
@@ -233,9 +239,10 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	}
 
 	client := &Client{
-		config:    cfg,
-		pool:      make([]*Connection, cfg.MaxConnections),
-		semaphore: make(chan struct{}, cfg.MaxConcurrentReqs),
+		config:          cfg,
+		pool:            make([]*Connection, cfg.MaxConnections),
+		semaphore:       make(chan struct{}, cfg.MaxConcurrentReqs),
+		metricsRecorder: cfg.MetricsRecorder,
 	}
 
 	// Initialize connection pool
@@ -751,6 +758,8 @@ func (c *Client) Call(ctx context.Context, method string, params ...interface{})
 // Uses a semaphore to limit concurrent requests and prevent overwhelming TrueNAS.
 // Implements automatic retry on connection errors with exponential backoff.
 func (c *Client) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
+	start := time.Now()
+
 	// Acquire semaphore slot (limit concurrent requests)
 	select {
 	case c.semaphore <- struct{}{}:
@@ -770,12 +779,20 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 
 		result, err := conn.CallWithContext(ctx, method, params...)
 		if err == nil {
+			// Record successful request metrics
+			if c.metricsRecorder != nil {
+				c.metricsRecorder(method, time.Since(start).Seconds(), nil)
+			}
 			return result, nil
 		}
 
 		// Check if error is retryable (connection-related)
 		if !IsConnectionError(err) {
 			// Not a connection error - return immediately (API errors, not found, etc.)
+			// Record failed request metrics
+			if c.metricsRecorder != nil {
+				c.metricsRecorder(method, time.Since(start).Seconds(), err)
+			}
 			return nil, err
 		}
 
@@ -791,12 +808,21 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 					retryDelay = 5 * time.Second
 				}
 			case <-ctx.Done():
-				return nil, fmt.Errorf("context cancelled during retry: %w", ctx.Err())
+				finalErr := fmt.Errorf("context cancelled during retry: %w", ctx.Err())
+				if c.metricsRecorder != nil {
+					c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
+				}
+				return nil, finalErr
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("API call %s failed after %d retries: %w", method, maxRetries, lastErr)
+	finalErr := fmt.Errorf("API call %s failed after %d retries: %w", method, maxRetries, lastErr)
+	// Record failed request metrics after all retries exhausted
+	if c.metricsRecorder != nil {
+		c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
+	}
+	return nil, finalErr
 }
 
 // selectConnection selects the best available connection from the pool.

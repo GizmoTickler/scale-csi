@@ -187,6 +187,21 @@ type SessionGCConfig struct {
 
 	// DryRun logs orphaned sessions without disconnecting them (default: false)
 	DryRun bool `yaml:"dryRun"`
+
+	// RunOnStartup runs GC immediately when driver starts (default: true)
+	// This helps clean up stale sessions from previous node crashes
+	// Use pointer to detect explicit false vs unset (which defaults to true)
+	RunOnStartup *bool `yaml:"runOnStartup"`
+
+	// StartupDelay is the delay in seconds before running startup GC (default: 5)
+	// Allows the driver to stabilize before running GC
+	StartupDelay int `yaml:"startupDelay"`
+
+	// ISCSIEnabled enables GC for iSCSI sessions (default: true if iSCSI configured)
+	ISCSIEnabled *bool `yaml:"iscsiEnabled"`
+
+	// NVMeoFEnabled enables GC for NVMe-oF sessions (default: true if NVMe-oF configured)
+	NVMeoFEnabled *bool `yaml:"nvmeofEnabled"`
 }
 
 // NVMeoFConfig holds NVMe-oF configuration.
@@ -216,7 +231,6 @@ type NVMeoFConfig struct {
 	SubsystemHosts []string `yaml:"subsystemHosts"`
 
 	// DeviceWaitTimeout is the timeout for waiting for NVMe-oF devices to appear in seconds (default: 60)
-	// (OTHER-001 fix: make NVMe-oF timeout configurable like iSCSI)
 	DeviceWaitTimeout int `yaml:"deviceWaitTimeout"`
 }
 
@@ -280,7 +294,7 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.NVMeoF.TransportServiceID = 4420
 	}
 	if cfg.NVMeoF.DeviceWaitTimeout == 0 {
-		cfg.NVMeoF.DeviceWaitTimeout = 60 // Default 60 seconds (OTHER-001 fix)
+		cfg.NVMeoF.DeviceWaitTimeout = 60 // Default 60 seconds
 	}
 
 	// Session GC defaults - enabled by default with 5 minute interval
@@ -292,8 +306,14 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.SessionGC.GracePeriod == 0 {
 		cfg.SessionGC.GracePeriod = 60 // 1 minute grace period
 	}
-	// Enable GC by default - check if it was explicitly set to false by the presence
-	// of other fields or handle via a separate mechanism (we'll default to true in driver.go)
+	if cfg.SessionGC.StartupDelay == 0 {
+		cfg.SessionGC.StartupDelay = 5 // 5 seconds delay before startup GC
+	}
+	// RunOnStartup defaults to true (helps clean stale sessions from crashes)
+	if cfg.SessionGC.RunOnStartup == nil {
+		defaultTrue := true
+		cfg.SessionGC.RunOnStartup = &defaultTrue
+	}
 
 	// Validate required fields
 	if cfg.TrueNAS.Host == "" {
@@ -328,35 +348,28 @@ func LoadConfig(path string) (*Config, error) {
 
 // GetDriverShareType returns the share type based on driver name.
 // Deprecated: Use GetShareType with StorageClass parameters instead.
-func (c *Config) GetDriverShareType() string {
+func (c *Config) GetDriverShareType() ShareType {
 	switch c.DriverName {
-	case "org.truenas.csi.nfs", "truenas-nfs":
-		return "nfs"
-	case "org.truenas.csi.iscsi", "truenas-iscsi":
-		return "iscsi"
-	case "org.truenas.csi.nvmeof", "truenas-nvmeof":
-		return "nvmeof"
+	case "org.scale.csi.nfs", "truenas-nfs":
+		return ShareTypeNFS
+	case "org.scale.csi.iscsi", "truenas-iscsi":
+		return ShareTypeISCSI
+	case "org.scale.csi.nvmeof", "truenas-nvmeof":
+		return ShareTypeNVMeoF
 	default:
 		// Default to NFS if not specified
-		return "nfs"
+		return ShareTypeNFS
 	}
 }
 
 // GetShareType returns the share type from StorageClass parameters,
 // falling back to driver name if not specified in parameters.
 // The "protocol" parameter in StorageClass takes precedence.
-func (c *Config) GetShareType(params map[string]string) string {
+func (c *Config) GetShareType(params map[string]string) ShareType {
 	// Check StorageClass parameter first
 	if params != nil {
 		if protocol, ok := params["protocol"]; ok {
-			switch protocol {
-			case "nfs":
-				return "nfs"
-			case "iscsi":
-				return "iscsi"
-			case "nvmeof":
-				return "nvmeof"
-			}
+			return ParseShareType(protocol)
 		}
 	}
 	// Fall back to driver name-based detection
@@ -365,17 +378,10 @@ func (c *Config) GetShareType(params map[string]string) string {
 
 // GetZFSResourceType returns the ZFS resource type for this driver.
 func (c *Config) GetZFSResourceType() string {
-	return c.GetZFSResourceTypeForShare(c.GetDriverShareType())
+	return c.GetDriverShareType().ZFSResourceType()
 }
 
 // GetZFSResourceTypeForShare returns the ZFS resource type for a given share type.
-func (c *Config) GetZFSResourceTypeForShare(shareType string) string {
-	switch shareType {
-	case "nfs":
-		return "filesystem"
-	case "iscsi", "nvmeof":
-		return "volume"
-	default:
-		return "filesystem"
-	}
+func (c *Config) GetZFSResourceTypeForShare(shareType ShareType) string {
+	return shareType.ZFSResourceType()
 }

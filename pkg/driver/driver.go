@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,8 +62,8 @@ type Driver struct {
 	// Operation lock to prevent concurrent operations on same volume
 	operationLock sync.Map
 
-	// Ready flag
-	ready bool
+	// Ready flag (atomic for safe concurrent access)
+	ready atomic.Bool
 
 	// Request counter for generating unique request IDs
 	requestCounter uint64
@@ -70,6 +71,10 @@ type Driver struct {
 	// Session GC context and cancellation
 	gcCancel context.CancelFunc
 	gcWg     sync.WaitGroup
+
+	// Track when orphaned sessions were first seen (for grace period)
+	// Key: session identifier (IQN or NQN), Value: first seen time
+	orphanedSessionsSeen sync.Map
 
 	// Service reload debouncer (prevents reload storms during bulk provisioning)
 	serviceReloadDebouncer *ServiceReloadDebouncer
@@ -100,6 +105,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		Timeout:           time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
 		ConnectTimeout:    time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
 		MaxConcurrentReqs: cfg.Config.TrueNAS.MaxConcurrentRequests,
+		MetricsRecorder:   RecordTrueNASRequest,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TrueNAS client: %w", err)
@@ -190,7 +196,7 @@ func (d *Driver) Run() error {
 		}
 	}
 
-	d.ready = true
+	d.ready.Store(true)
 	klog.Infof("CSI driver listening on %s", d.endpoint)
 
 	return d.server.Serve(listener)
@@ -199,7 +205,7 @@ func (d *Driver) Run() error {
 // Stop gracefully stops the driver.
 func (d *Driver) Stop() {
 	klog.Info("Stopping CSI driver")
-	d.ready = false
+	d.ready.Store(false)
 
 	// Stop session GC goroutine first
 	d.stopSessionGC()
@@ -319,12 +325,20 @@ func (d *Driver) startSessionGC() {
 		return
 	}
 
-	// Check if explicitly disabled
-	// Note: We consider GC enabled by default unless the config explicitly has
-	// Enabled: false with a non-zero interval (unusual config)
 	interval := time.Duration(d.config.SessionGC.Interval) * time.Second
 	gracePeriod := time.Duration(d.config.SessionGC.GracePeriod) * time.Second
 	dryRun := d.config.SessionGC.DryRun
+	startupDelay := time.Duration(d.config.SessionGC.StartupDelay) * time.Second
+
+	// Per-protocol GC settings (default to enabled if protocol is configured)
+	iscsiGCEnabled := d.config.ISCSI.TargetPortal != ""
+	if d.config.SessionGC.ISCSIEnabled != nil {
+		iscsiGCEnabled = *d.config.SessionGC.ISCSIEnabled && d.config.ISCSI.TargetPortal != ""
+	}
+	nvmeofGCEnabled := d.config.NVMeoF.TransportAddress != ""
+	if d.config.SessionGC.NVMeoFEnabled != nil {
+		nvmeofGCEnabled = *d.config.SessionGC.NVMeoFEnabled && d.config.NVMeoF.TransportAddress != ""
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	d.gcCancel = cancel
@@ -332,14 +346,23 @@ func (d *Driver) startSessionGC() {
 	d.gcWg.Add(1)
 	go func() {
 		defer d.gcWg.Done()
-		klog.Infof("Session GC started: interval=%v, gracePeriod=%v, dryRun=%v", interval, gracePeriod, dryRun)
+		klog.Infof("Session GC started: interval=%v, gracePeriod=%v, dryRun=%v, iSCSI=%v, NVMeoF=%v",
+			interval, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
 
-		// Initial delay to let the system stabilize after startup
+		// Short delay to let the system stabilize, then run startup GC
 		select {
-		case <-time.After(30 * time.Second):
+		case <-time.After(startupDelay):
 		case <-ctx.Done():
 			klog.Info("Session GC stopped during startup delay")
 			return
+		}
+
+		// Run GC immediately on startup to clean up stale sessions from node crashes
+		// This is proactive cleanup before the first interval tick
+		// RunOnStartup defaults to true via config loading
+		if d.config.SessionGC.RunOnStartup != nil && *d.config.SessionGC.RunOnStartup {
+			klog.Info("Session GC: running proactive cleanup on startup")
+			d.runSessionGCWithProtocols(ctx, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
 		}
 
 		ticker := time.NewTicker(interval)
@@ -348,7 +371,7 @@ func (d *Driver) startSessionGC() {
 		for {
 			select {
 			case <-ticker.C:
-				d.runSessionGC(ctx, gracePeriod, dryRun)
+				d.runSessionGCWithProtocols(ctx, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
 			case <-ctx.Done():
 				klog.Info("Session GC stopped")
 				return
@@ -365,26 +388,26 @@ func (d *Driver) stopSessionGC() {
 	}
 }
 
-// runSessionGC performs one garbage collection cycle.
-// It runs GC for all configured protocols (iSCSI and/or NVMe-oF), not just
-// the default driver type. This handles multi-protocol deployments where
-// the driver name is generic but multiple StorageClasses use different protocols.
-func (d *Driver) runSessionGC(_ context.Context, _ time.Duration, dryRun bool) {
+// runSessionGC performs one garbage collection cycle with explicit protocol control.
+// It runs GC for the specified protocols, allowing per-protocol enable/disable via config.
+// gracePeriod specifies how long a session must be orphaned before cleanup.
+func (d *Driver) runSessionGCWithProtocols(_ context.Context, gracePeriod time.Duration, dryRun bool, iscsiEnabled, nvmeofEnabled bool) {
 	klog.V(4).Info("Running session GC")
 
-	// Run iSCSI GC if iSCSI is configured (has target portal)
-	if d.config.ISCSI.TargetPortal != "" {
-		d.gcISCSISessions(dryRun)
+	// Run iSCSI GC if enabled
+	if iscsiEnabled {
+		d.gcISCSISessions(gracePeriod, dryRun)
 	}
 
-	// Run NVMe-oF GC if NVMe-oF is configured (has transport address)
-	if d.config.NVMeoF.TransportAddress != "" {
-		d.gcNVMeoFSessions(dryRun)
+	// Run NVMe-oF GC if enabled
+	if nvmeofEnabled {
+		d.gcNVMeoFSessions(gracePeriod, dryRun)
 	}
 }
 
 // gcISCSISessions garbage collects orphaned iSCSI sessions.
-func (d *Driver) gcISCSISessions(dryRun bool) {
+// Sessions must be orphaned for at least gracePeriod before being disconnected.
+func (d *Driver) gcISCSISessions(gracePeriod time.Duration, dryRun bool) {
 	// Get all active iSCSI sessions
 	sessions, err := util.ListISCSISessions()
 	if err != nil {
@@ -414,6 +437,10 @@ func (d *Driver) gcISCSISessions(dryRun bool) {
 	// Find orphaned sessions
 	portal := d.config.ISCSI.TargetPortal
 	orphanedCount := 0
+	now := time.Now()
+
+	// Track which sessions are still active (to clean up stale entries from orphanedSessionsSeen)
+	activeOrphanedSessions := make(map[string]struct{})
 
 	for _, session := range sessions {
 		// Only consider sessions for our portal
@@ -425,12 +452,32 @@ func (d *Driver) gcISCSISessions(dryRun bool) {
 		// Check if this session is expected
 		if _, expected := expectedTargets[session.IQN]; expected {
 			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.IQN)
+			// Remove from orphaned tracking if it was previously orphaned
+			d.orphanedSessionsSeen.Delete(session.IQN)
 			continue
 		}
 
 		// This session has no corresponding staged volume - it's orphaned
+		activeOrphanedSessions[session.IQN] = struct{}{}
+
+		// Check when we first saw this orphaned session
+		firstSeenVal, loaded := d.orphanedSessionsSeen.LoadOrStore(session.IQN, now)
+		firstSeen := firstSeenVal.(time.Time)
+
+		orphanedDuration := now.Sub(firstSeen)
+		if !loaded {
+			klog.Infof("Session GC: found newly orphaned iSCSI session: %s (will disconnect after %v)", session.IQN, gracePeriod)
+			continue
+		}
+
+		// Check if grace period has passed
+		if orphanedDuration < gracePeriod {
+			klog.V(4).Infof("Session GC: orphaned session %s within grace period (%v < %v)", session.IQN, orphanedDuration, gracePeriod)
+			continue
+		}
+
 		orphanedCount++
-		klog.Infof("Session GC: found orphaned iSCSI session: %s", session.IQN)
+		klog.Infof("Session GC: orphaned iSCSI session %s exceeded grace period (%v)", session.IQN, orphanedDuration)
 
 		if dryRun {
 			klog.Infof("Session GC: [DRY RUN] would disconnect orphaned session: %s", session.IQN)
@@ -442,8 +489,18 @@ func (d *Driver) gcISCSISessions(dryRun bool) {
 			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.IQN, err)
 		} else {
 			klog.Infof("Session GC: disconnected orphaned iSCSI session: %s", session.IQN)
+			d.orphanedSessionsSeen.Delete(session.IQN)
 		}
 	}
+
+	// Clean up stale entries from orphanedSessionsSeen (sessions no longer active)
+	d.orphanedSessionsSeen.Range(func(key, _ interface{}) bool {
+		iqn := key.(string)
+		if _, active := activeOrphanedSessions[iqn]; !active {
+			d.orphanedSessionsSeen.Delete(iqn)
+		}
+		return true
+	})
 
 	if orphanedCount > 0 {
 		klog.Infof("Session GC: processed %d orphaned iSCSI sessions", orphanedCount)
@@ -453,7 +510,8 @@ func (d *Driver) gcISCSISessions(dryRun bool) {
 }
 
 // gcNVMeoFSessions garbage collects orphaned NVMe-oF sessions.
-func (d *Driver) gcNVMeoFSessions(dryRun bool) {
+// Sessions must be orphaned for at least gracePeriod before being disconnected.
+func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 	// Get all active NVMe-oF sessions
 	sessions, err := util.ListNVMeoFSessions()
 	if err != nil {
@@ -475,6 +533,10 @@ func (d *Driver) gcNVMeoFSessions(dryRun bool) {
 	// Find orphaned sessions
 	orphanedCount := 0
 	targetAddr := d.config.NVMeoF.TransportAddress
+	now := time.Now()
+
+	// Track which sessions are still active (to clean up stale entries from orphanedSessionsSeen)
+	activeOrphanedSessions := make(map[string]struct{})
 
 	for _, session := range sessions {
 		// Only consider sessions for our target address
@@ -486,12 +548,32 @@ func (d *Driver) gcNVMeoFSessions(dryRun bool) {
 		// Check if this session is expected
 		if _, expected := expectedNQNs[session.NQN]; expected {
 			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.NQN)
+			// Remove from orphaned tracking if it was previously orphaned
+			d.orphanedSessionsSeen.Delete(session.NQN)
 			continue
 		}
 
 		// This session has no corresponding staged volume - it's orphaned
+		activeOrphanedSessions[session.NQN] = struct{}{}
+
+		// Check when we first saw this orphaned session
+		firstSeenVal, loaded := d.orphanedSessionsSeen.LoadOrStore(session.NQN, now)
+		firstSeen := firstSeenVal.(time.Time)
+
+		orphanedDuration := now.Sub(firstSeen)
+		if !loaded {
+			klog.Infof("Session GC: found newly orphaned NVMe-oF session: %s (will disconnect after %v)", session.NQN, gracePeriod)
+			continue
+		}
+
+		// Check if grace period has passed
+		if orphanedDuration < gracePeriod {
+			klog.V(4).Infof("Session GC: orphaned session %s within grace period (%v < %v)", session.NQN, orphanedDuration, gracePeriod)
+			continue
+		}
+
 		orphanedCount++
-		klog.Infof("Session GC: found orphaned NVMe-oF session: %s", session.NQN)
+		klog.Infof("Session GC: orphaned NVMe-oF session %s exceeded grace period (%v)", session.NQN, orphanedDuration)
 
 		if dryRun {
 			klog.Infof("Session GC: [DRY RUN] would disconnect orphaned session: %s", session.NQN)
@@ -503,8 +585,22 @@ func (d *Driver) gcNVMeoFSessions(dryRun bool) {
 			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.NQN, err)
 		} else {
 			klog.Infof("Session GC: disconnected orphaned NVMe-oF session: %s", session.NQN)
+			d.orphanedSessionsSeen.Delete(session.NQN)
 		}
 	}
+
+	// Clean up stale entries from orphanedSessionsSeen for NVMe-oF sessions
+	// Note: We prefix NVMe NQNs differently than iSCSI IQNs, so no collision
+	d.orphanedSessionsSeen.Range(func(key, _ interface{}) bool {
+		nqn := key.(string)
+		// Only clean up NVMe-oF entries (NQNs start with "nqn.")
+		if strings.HasPrefix(nqn, "nqn.") {
+			if _, active := activeOrphanedSessions[nqn]; !active {
+				d.orphanedSessionsSeen.Delete(nqn)
+			}
+		}
+		return true
+	})
 
 	if orphanedCount > 0 {
 		klog.Infof("Session GC: processed %d orphaned NVMe-oF sessions", orphanedCount)

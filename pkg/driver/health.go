@@ -139,7 +139,7 @@ func (h *HealthServer) checkHealth() HealthStatus {
 	}
 
 	status := HealthStatus{
-		Ready:             h.driver.ready,
+		Ready:             h.driver.ready.Load(),
 		ControllerRunning: h.driver.runController,
 		NodeRunning:       h.driver.runNode,
 	}

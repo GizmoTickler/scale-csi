@@ -157,7 +157,23 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	shareType := d.config.GetShareType(params)
 	klog.Infof("CreateVolume: using share type %s for volume %s", shareType, volumeID)
 
-	// Check if volume already exists
+	// Validate access mode against protocol
+	// RWX (ReadWriteMany) is only supported for NFS volumes
+	for _, cap := range req.GetVolumeCapabilities() {
+		if accessMode := cap.GetAccessMode(); accessMode != nil {
+			mode := accessMode.GetMode()
+			if mode == csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER ||
+				mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY ||
+				mode == csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER {
+				if !shareType.SupportsMultiNode() {
+					return nil, status.Errorf(codes.InvalidArgument,
+						"access mode %s requires NFS protocol, but %s was requested",
+						mode.String(), shareType)
+				}
+			}
+		}
+	}
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {
@@ -323,13 +339,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	if ds != nil {
 		switch ds.Type {
 		case "FILESYSTEM":
-			shareType = "nfs"
+			shareType = ShareTypeNFS
 		case "VOLUME":
 			// For zvol, prefer iSCSI unless driver specifically configured for NVMe-oF
-			if d.config.GetDriverShareType() == "nvmeof" {
-				shareType = "nvmeof"
+			if d.config.GetDriverShareType() == ShareTypeNVMeoF {
+				shareType = ShareTypeNVMeoF
 			} else {
-				shareType = "iscsi"
+				shareType = ShareTypeISCSI
 			}
 		}
 	}
@@ -612,7 +628,7 @@ func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReques
 			continue
 		}
 
-		// Extract snapshot name safely (BUG-002 fix)
+		// Extract snapshot name safely
 		snapshotID, ok := extractSnapshotName(snap.ID)
 		if !ok {
 			klog.V(4).Infof("Skipping snapshot with invalid ID format: %s", snap.ID)
@@ -672,7 +688,7 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 
 	klog.Infof("ControllerExpandVolume: volumeID=%s, capacity=%d", volumeID, capacityBytes)
 
-	// Lock on volume ID (OTHER-004 fix: prevent concurrent expansions of same volume)
+	// Lock on volume ID to prevent concurrent expansions of same volume
 	lockKey := "volume:" + volumeID
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
@@ -779,12 +795,12 @@ func (d *Driver) getDatasetCapacity(ds *truenas.Dataset) int64 {
 	return 0
 }
 
-func (d *Driver) createDataset(ctx context.Context, datasetName string, capacityBytes int64, shareType string) error {
+func (d *Driver) createDataset(ctx context.Context, datasetName string, capacityBytes int64, shareType ShareType) error {
 	params := &truenas.DatasetCreateParams{
 		Name: datasetName,
 	}
 
-	if shareType == "nfs" {
+	if shareType == ShareTypeNFS {
 		// Create filesystem for NFS
 		params.Type = "FILESYSTEM"
 		if d.config.ZFS.DatasetEnableQuotas {
@@ -851,7 +867,7 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 			}
 		}
 
-		// Set content source properties in parallel (BUG-004 fix: log errors from Wait)
+		// Set content source properties in parallel
 		g, gCtx := errgroup.WithContext(ctx)
 		g.Go(func() error {
 			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeContentSourceType, "snapshot"); err != nil {
@@ -909,7 +925,7 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 			}
 		}
 
-		// Set content source properties in parallel (BUG-004 fix: log errors from Wait)
+		// Set content source properties in parallel
 		g, gCtx := errgroup.WithContext(ctx)
 		g.Go(func() error {
 			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeContentSourceType, "volume"); err != nil {
@@ -931,9 +947,9 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 	return nil
 }
 
-func (d *Driver) getVolumeContext(ctx context.Context, datasetName string, shareType string) (map[string]string, error) {
+func (d *Driver) getVolumeContext(ctx context.Context, datasetName string, shareType ShareType) (map[string]string, error) {
 	context := map[string]string{
-		"node_attach_driver": shareType,
+		"node_attach_driver": shareType.String(),
 	}
 
 	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
@@ -942,11 +958,11 @@ func (d *Driver) getVolumeContext(ctx context.Context, datasetName string, share
 	}
 
 	switch shareType {
-	case "nfs":
+	case ShareTypeNFS:
 		context["server"] = d.config.NFS.ShareHost
 		context["share"] = ds.Mountpoint
 
-	case "iscsi":
+	case ShareTypeISCSI:
 		// Get target info from dataset properties
 		if prop, ok := ds.UserProperties[PropISCSITargetID]; ok {
 			targetID, err := strconv.Atoi(prop.Value)
@@ -967,7 +983,7 @@ func (d *Driver) getVolumeContext(ctx context.Context, datasetName string, share
 		context["lun"] = "0"
 		context["interface"] = d.config.ISCSI.Interface
 
-	case "nvmeof":
+	case ShareTypeNVMeoF:
 		// Get subsystem info from dataset properties
 		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok {
 			subsysID, err := strconv.Atoi(prop.Value)
@@ -997,7 +1013,6 @@ func timestampProto(unixSeconds int64) *timestamppb.Timestamp {
 // extractSnapshotName safely extracts the snapshot name from a ZFS snapshot ID.
 // ZFS snapshot IDs are in format "dataset@snapshotname".
 // Returns the snapshot name and true if valid, empty string and false if invalid.
-// (BUG-002 fix: prevents panic on invalid snapshot ID format)
 func extractSnapshotName(snapshotID string) (string, bool) {
 	parts := strings.Split(snapshotID, "@")
 	if len(parts) != 2 {

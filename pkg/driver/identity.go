@@ -51,7 +51,7 @@ func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeRe
 	klog.V(4).Info("Probe called")
 
 	// Check if TrueNAS connection is healthy
-	if !d.ready {
+	if !d.ready.Load() {
 		return nil, status.Error(codes.FailedPrecondition, "driver not ready")
 	}
 
@@ -63,7 +63,7 @@ func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeRe
 
 	return &csi.ProbeResponse{
 		Ready: &wrapperspb.BoolValue{
-			Value: d.ready,
+			Value: d.ready.Load(),
 		},
 	}, nil
 }

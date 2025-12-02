@@ -1,6 +1,7 @@
 package util
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -17,7 +18,8 @@ func TestWaitForNVMeDevice(t *testing.T) {
 		findNVMeDevice = func(nqn string) (string, error) {
 			return "/dev/nvme0n1", nil
 		}
-		path, err := waitForNVMeDevice("nqn.test", 1*time.Second)
+		ctx := context.Background()
+		path, err := waitForNVMeDevice(ctx, "nqn.test", 1*time.Second)
 		assert.NoError(t, err)
 		assert.Equal(t, "/dev/nvme0n1", path)
 	})
@@ -31,8 +33,9 @@ func TestWaitForNVMeDevice(t *testing.T) {
 			}
 			return "/dev/nvme0n1", nil
 		}
+		ctx := context.Background()
 		// Should succeed after ~150ms (50ms + 100ms)
-		path, err := waitForNVMeDevice("nqn.test", 1*time.Second)
+		path, err := waitForNVMeDevice(ctx, "nqn.test", 1*time.Second)
 		assert.NoError(t, err)
 		assert.Equal(t, "/dev/nvme0n1", path)
 		assert.Equal(t, 3, attempts)
@@ -42,15 +45,28 @@ func TestWaitForNVMeDevice(t *testing.T) {
 		findNVMeDevice = func(nqn string) (string, error) {
 			return "", fmt.Errorf("not found")
 		}
+		ctx := context.Background()
 		// Short timeout for test
 		start := time.Now()
-		_, err := waitForNVMeDevice("nqn.test", 200*time.Millisecond)
+		_, err := waitForNVMeDevice(ctx, "nqn.test", 200*time.Millisecond)
 		duration := time.Since(start)
 
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "timeout")
 		// Should be at least 200ms
 		assert.True(t, duration >= 200*time.Millisecond)
+	})
+
+	t.Run("Context cancellation", func(t *testing.T) {
+		findNVMeDevice = func(nqn string) (string, error) {
+			return "", fmt.Errorf("not found")
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel immediately
+		cancel()
+		_, err := waitForNVMeDevice(ctx, "nqn.test", 10*time.Second)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context cancelled")
 	})
 }
 
