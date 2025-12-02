@@ -130,6 +130,11 @@ zfs:
   # Dataset quota enforcement
   enforceQuota: true
 
+  # Timeout in seconds for waiting for a zvol to be ready after cloning
+  # Increase this for slow systems, heavily loaded TrueNAS, or large clones
+  # (default: 60 seconds)
+  zvolReadyTimeout: 60
+
 # NFS configuration
 nfs:
   # Enable NFS support
@@ -166,6 +171,11 @@ iscsi:
   # Timeout in seconds to wait for iSCSI device to appear after login
   # Increase this for heavily loaded nodes or slow networks
   deviceWaitTimeout: 60
+
+  # Debounce window in milliseconds for iSCSI service reloads
+  # Multiple volume creations within this window will trigger a single reload
+  # This prevents reload storms during bulk volume provisioning (default: 2000ms)
+  serviceReloadDebounce: 2000
 
 # NVMe-oF configuration
 nvmeof:

@@ -18,8 +18,6 @@ const (
 	defaultShareRetryAttempts = 3
 	// defaultShareRetryDelay is the initial delay between retry attempts
 	defaultShareRetryDelay = 2 * time.Second
-	// zvolReadyTimeout is how long to wait for a zvol to be ready before creating extent
-	zvolReadyTimeout = 30 * time.Second
 )
 
 // ensureShareExists checks if a share exists for the dataset and creates it if missing.
@@ -242,8 +240,9 @@ func (d *Driver) createISCSIShare(ctx context.Context, datasetName string, volum
 
 	// Step 3: Wait for zvol to be ready before creating extent
 	// This is critical for cloned volumes which may not be immediately available
-	klog.V(4).Infof("Waiting for zvol %s to be ready before creating extent", datasetName)
-	if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolReadyTimeout); err != nil {
+	zvolTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
+	klog.V(4).Infof("Waiting for zvol %s to be ready before creating extent (timeout: %v)", datasetName, zvolTimeout)
+	if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolTimeout); err != nil {
 		klog.Warningf("Zvol readiness check failed (will attempt extent creation anyway): %v", err)
 	}
 
@@ -363,11 +362,11 @@ func (d *Driver) createISCSIShare(ctx context.Context, datasetName string, volum
 		klog.Warningf("Failed to store iSCSI target-extent ID: %v", err)
 	}
 
-	// Reload iSCSI service to ensure the new target is immediately discoverable.
-	// This prevents race conditions where the node tries to discover the target
-	// before TrueNAS's iSCSI daemon has picked up the configuration change.
-	klog.V(4).Infof("Reloading iSCSI service to ensure target is discoverable")
-	if err := d.truenasClient.ServiceReload(ctx, "iscsitarget"); err != nil {
+	// Request iSCSI service reload using debouncer to prevent reload storms
+	// during bulk volume provisioning. Multiple requests within the debounce
+	// window will be coalesced into a single reload operation.
+	klog.V(4).Infof("Requesting debounced iSCSI service reload to ensure target is discoverable")
+	if err := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
 		// Non-fatal: the service might auto-reload, and node has retry logic
 		klog.V(4).Infof("iSCSI service reload returned (may be normal): %v", err)
 	}
@@ -489,8 +488,9 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName string, volu
 
 	// Wait for zvol to be ready before creating subsystem/namespace
 	// This is critical for cloned volumes which may not be immediately available
-	klog.V(4).Infof("Waiting for zvol %s to be ready before creating NVMe-oF share", datasetName)
-	if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolReadyTimeout); err != nil {
+	zvolTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
+	klog.V(4).Infof("Waiting for zvol %s to be ready before creating NVMe-oF share (timeout: %v)", datasetName, zvolTimeout)
+	if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolTimeout); err != nil {
 		klog.Warningf("Zvol readiness check failed (will attempt share creation anyway): %v", err)
 	}
 

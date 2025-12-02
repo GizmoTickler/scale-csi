@@ -86,6 +86,9 @@ func (c *Client) ISCSITargetCreate(ctx context.Context, name string, alias strin
 
 	result, err := c.Call(ctx, "iscsi.target.create", params)
 	if err != nil {
+		// Log full error details before fallback logic (helps debug ambiguous "Invalid params")
+		LogAPIError(err, "ISCSITargetCreate error")
+
 		// TrueNAS returns "Invalid params" when target already exists (not a helpful error message)
 		// Check if target exists and return it if so
 		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
@@ -162,6 +165,9 @@ func (c *Client) ISCSIExtentCreate(ctx context.Context, name string, diskPath st
 
 	result, err := c.Call(ctx, "iscsi.extent.create", params)
 	if err != nil {
+		// Log full error details before fallback logic (helps debug ambiguous "Invalid params")
+		LogAPIError(err, "ISCSIExtentCreate error")
+
 		// TrueNAS returns "Invalid params" when extent already exists
 		// Check if extent exists and return it if so
 		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
@@ -233,6 +239,9 @@ func (c *Client) ISCSITargetExtentCreate(ctx context.Context, targetID int, exte
 
 	result, err := c.Call(ctx, "iscsi.targetextent.create", params)
 	if err != nil {
+		// Log full error details before fallback logic (helps debug ambiguous "Invalid params")
+		LogAPIError(err, "ISCSITargetExtentCreate error")
+
 		// TrueNAS returns "Invalid params" when association already exists
 		// Check if association exists and return it if so
 		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {

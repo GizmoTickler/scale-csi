@@ -26,6 +26,28 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("TrueNAS API error [%d]: %s", e.Code, e.Message)
 }
 
+// FullError returns a detailed error string including Data field for debugging.
+// Use this when logging errors before fallback logic to capture full context.
+func (e *APIError) FullError() string {
+	if e.Data == nil {
+		return fmt.Sprintf("TrueNAS API error [%d]: %s", e.Code, e.Message)
+	}
+	return fmt.Sprintf("TrueNAS API error [%d]: %s (data: %+v)", e.Code, e.Message, e.Data)
+}
+
+// LogAPIError logs full error details for debugging. This is useful before
+// fallback logic that may mask the original error.
+func LogAPIError(err error, context string) {
+	if err == nil {
+		return
+	}
+	if apiErr, ok := err.(*APIError); ok {
+		klog.V(4).Infof("%s: %s", context, apiErr.FullError())
+	} else {
+		klog.V(4).Infof("%s: %v", context, err)
+	}
+}
+
 // IsNotFoundError returns true if the error indicates a resource was not found.
 func IsNotFoundError(err error) bool {
 	if err == nil {

@@ -110,6 +110,9 @@ func (c *Client) DatasetDelete(ctx context.Context, name string, recursive bool,
 
 	_, err := c.Call(ctx, "pool.dataset.delete", name, options)
 	if err != nil {
+		// Log full error details before fallback logic (helps debug ambiguous errors)
+		LogAPIError(err, "DatasetDelete error")
+
 		// Handle "not found" errors as success (idempotency)
 		if IsNotFoundError(err) {
 			return nil

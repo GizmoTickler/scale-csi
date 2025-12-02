@@ -27,6 +27,7 @@ data:
       datasetEnableQuotas: {{ .Values.zfs.enforceQuota }}
       datasetEnableReservation: false
       zvolBlocksize: "16K"
+      zvolReadyTimeout: {{ .Values.zfs.zvolReadyTimeout | default 60 }}
 
     # NFS configuration
     nfs:
@@ -48,6 +49,7 @@ data:
       extentBlocksize: 512
       extentRpm: "SSD"
       deviceWaitTimeout: {{ .Values.iscsi.deviceWaitTimeout | default 60 }}
+      serviceReloadDebounce: {{ .Values.iscsi.serviceReloadDebounce | default 2000 }}
 
     # NVMe-oF configuration
     nvmeof:

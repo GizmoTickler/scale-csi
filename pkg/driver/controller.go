@@ -806,8 +806,8 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 }
 
 func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName string, source *csi.VolumeContentSource, capacityBytes int64) error {
-	// Timeout for waiting for cloned dataset to be ready
-	const cloneReadyTimeout = 30 * time.Second
+	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
+	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
 
 	if snapshot := source.GetSnapshot(); snapshot != nil {
 		// Clone from snapshot

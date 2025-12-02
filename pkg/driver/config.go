@@ -81,6 +81,10 @@ type ZFSConfig struct {
 
 	// ZvolBlocksize is the block size for zvols (default: 16K)
 	ZvolBlocksize string `yaml:"zvolBlocksize"`
+
+	// ZvolReadyTimeout is the timeout in seconds for waiting for a zvol to be ready
+	// after cloning operations. Increase for slow systems or large clones (default: 60)
+	ZvolReadyTimeout int `yaml:"zvolReadyTimeout"`
 }
 
 // NFSConfig holds NFS share configuration.
@@ -147,6 +151,11 @@ type ISCSIConfig struct {
 
 	// DeviceWaitTimeout is the timeout for waiting for iSCSI devices to appear in seconds (default: 60)
 	DeviceWaitTimeout int `yaml:"deviceWaitTimeout"`
+
+	// ServiceReloadDebounce is the debounce window in milliseconds for iSCSI service reloads.
+	// Multiple share creations within this window will be coalesced into a single reload.
+	// This prevents reload storms during bulk volume provisioning. (default: 2000ms)
+	ServiceReloadDebounce int `yaml:"serviceReloadDebounce"`
 }
 
 // ISCSITargetGroup represents a portal/initiator group configuration.
@@ -246,6 +255,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.ZFS.ZvolBlocksize == "" {
 		cfg.ZFS.ZvolBlocksize = "16K"
 	}
+	if cfg.ZFS.ZvolReadyTimeout == 0 {
+		cfg.ZFS.ZvolReadyTimeout = 60 // Default 60 seconds for zvol clone readiness
+	}
 	if cfg.ISCSI.Interface == "" {
 		cfg.ISCSI.Interface = "default"
 	}
@@ -257,6 +269,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.ISCSI.DeviceWaitTimeout == 0 {
 		cfg.ISCSI.DeviceWaitTimeout = 60 // Default 60 seconds
+	}
+	if cfg.ISCSI.ServiceReloadDebounce == 0 {
+		cfg.ISCSI.ServiceReloadDebounce = 2000 // Default 2 seconds debounce window
 	}
 	if cfg.NVMeoF.Transport == "" {
 		cfg.NVMeoF.Transport = "tcp"

@@ -97,6 +97,9 @@ func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_ b
 
 	_, err := c.Call(ctx, c.snapshotMethod(ctx, "delete"), snapshotID, options)
 	if err != nil {
+		// Log full error details before fallback logic (helps debug ambiguous errors)
+		LogAPIError(err, "SnapshotDelete error")
+
 		// Ignore "does not exist" errors
 		if strings.Contains(err.Error(), "does not exist") ||
 			strings.Contains(err.Error(), "not found") {
@@ -149,6 +152,9 @@ func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_ b
 func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error) {
 	result, err := c.Call(ctx, c.snapshotMethod(ctx, "get_instance"), snapshotID)
 	if err != nil {
+		// Log full error details before fallback logic (helps debug ambiguous errors)
+		LogAPIError(err, "SnapshotGet error")
+
 		// Check for "Invalid params" which indicates not found for get_instance
 		if apiErr, ok := err.(*APIError); ok && apiErr.Code == -32602 {
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)

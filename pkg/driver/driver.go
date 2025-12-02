@@ -70,6 +70,9 @@ type Driver struct {
 	// Session GC context and cancellation
 	gcCancel context.CancelFunc
 	gcWg     sync.WaitGroup
+
+	// Service reload debouncer (prevents reload storms during bulk provisioning)
+	serviceReloadDebouncer *ServiceReloadDebouncer
 }
 
 // NewDriver creates a new TrueNAS CSI driver instance.
@@ -105,17 +108,24 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 	// Initialize event recorder (will be nil if not running in k8s)
 	eventRecorder := NewEventRecorder(cfg.Name)
 
+	// Initialize service reload debouncer for iSCSI
+	debounceDelay := time.Duration(cfg.Config.ISCSI.ServiceReloadDebounce) * time.Millisecond
+	serviceDebouncer := NewServiceReloadDebouncer(debounceDelay, func(ctx context.Context, service string) error {
+		return truenasClient.ServiceReload(ctx, service)
+	})
+
 	return &Driver{
-		name:          cfg.Name,
-		version:       cfg.Version,
-		nodeID:        cfg.NodeID,
-		endpoint:      cfg.Endpoint,
-		runController: cfg.RunController,
-		runNode:       cfg.RunNode,
-		config:        cfg.Config,
-		truenasClient: truenasClient,
-		healthPort:    cfg.HealthPort,
-		eventRecorder: eventRecorder,
+		name:                   cfg.Name,
+		version:                cfg.Version,
+		nodeID:                 cfg.NodeID,
+		endpoint:               cfg.Endpoint,
+		runController:          cfg.RunController,
+		runNode:                cfg.RunNode,
+		config:                 cfg.Config,
+		truenasClient:          truenasClient,
+		healthPort:             cfg.HealthPort,
+		eventRecorder:          eventRecorder,
+		serviceReloadDebouncer: serviceDebouncer,
 	}, nil
 }
 
@@ -193,6 +203,11 @@ func (d *Driver) Stop() {
 
 	// Stop session GC goroutine first
 	d.stopSessionGC()
+
+	// Stop the service reload debouncer
+	if d.serviceReloadDebouncer != nil {
+		d.serviceReloadDebouncer.Stop()
+	}
 
 	// Stop health server
 	if d.healthServer != nil {
