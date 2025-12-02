@@ -621,6 +621,26 @@ func FlushDeviceBuffers(devicePath string) error {
 	return nil
 }
 
+// IsLikelyISCSIDevice returns true if the device path looks like it could be an iSCSI device.
+// iSCSI devices typically appear as /dev/sd[a-z]+ (SCSI disk devices).
+// This is used by Session GC to distinguish between actual iSCSI lookup failures
+// (which might indicate a race condition) vs non-iSCSI devices (expected to fail).
+func IsLikelyISCSIDevice(devicePath string) bool {
+	deviceName := filepath.Base(devicePath)
+	// iSCSI devices are SCSI disks: sd[a-z]+
+	// Non-iSCSI devices include: nvme*, loop*, nbd*, dm-*, etc.
+	if strings.HasPrefix(deviceName, "sd") && len(deviceName) >= 3 {
+		// Verify the rest is letters (sda, sdb, ..., sdaa, sdab, etc.)
+		for _, c := range deviceName[2:] {
+			if c < 'a' || c > 'z' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // GetISCSIInfoFromDevice returns the portal and IQN for a given device path.
 func GetISCSIInfoFromDevice(devicePath string) (string, string, error) {
 	deviceName := filepath.Base(devicePath)

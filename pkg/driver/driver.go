@@ -388,7 +388,12 @@ func (d *Driver) gcISCSISessions(dryRun bool) {
 	klog.V(4).Infof("Session GC: found %d active iSCSI sessions", len(sessions))
 
 	// Get expected sessions from kubelet staging directory
+	// Returns nil if the lookup was unreliable (e.g., race condition during stage/unstage)
 	expectedTargets := d.getExpectedISCSITargets()
+	if expectedTargets == nil {
+		klog.Info("Session GC: skipping iSCSI GC due to unreliable expected targets lookup")
+		return
+	}
 	klog.V(4).Infof("Session GC: found %d expected iSCSI targets from staged volumes", len(expectedTargets))
 
 	// Find orphaned sessions
@@ -495,6 +500,7 @@ func (d *Driver) gcNVMeoFSessions(dryRun bool) {
 
 // getExpectedISCSITargets returns a map of IQNs that have corresponding staged volumes.
 // It scans the kubelet CSI staging directory to find which volumes are currently staged.
+// Returns nil if the lookup was unreliable (too many failures), signaling GC should be skipped.
 func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 	expected := make(map[string]struct{})
 
@@ -507,19 +513,37 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 	mountedDevices, err := util.GetMountedBlockDevices()
 	if err != nil {
 		klog.Warningf("Session GC: failed to get mounted block devices: %v", err)
-		return expected
+		return nil // Return nil to signal GC should be skipped
 	}
+
+	// Track failed lookups to detect race conditions or transient issues
+	// If we fail to look up too many devices, skip GC entirely to avoid data loss
+	failedLookups := 0
+	const maxFailedLookups = 2 // Allow 1-2 failures for non-iSCSI devices, but more suggests a problem
 
 	// For each mounted device, get its iSCSI session if any
 	for device := range mountedDevices {
 		// Check if this device is an iSCSI device
 		portal, iqn, err := util.GetISCSIInfoFromDevice(device)
 		if err != nil {
-			continue // Not an iSCSI device
+			// Check if this is likely an iSCSI device by looking at the device name pattern
+			// iSCSI devices are typically sd[a-z]+ (not nvme*, loop*, etc)
+			if util.IsLikelyISCSIDevice(device) {
+				failedLookups++
+				klog.V(4).Infof("Session GC: failed to get iSCSI info for %s (may be race condition): %v", device, err)
+			}
+			continue
 		}
 		if portal != "" && iqn != "" {
 			expected[iqn] = struct{}{}
 		}
+	}
+
+	// If too many lookups failed, this might indicate a race condition
+	// (concurrent stage/unstage operations) - skip GC to be safe
+	if failedLookups > maxFailedLookups {
+		klog.Warningf("Session GC: %d iSCSI device lookups failed, skipping GC to avoid race condition", failedLookups)
+		return nil // Return nil to signal GC should be skipped
 	}
 
 	return expected
