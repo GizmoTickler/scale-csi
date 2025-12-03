@@ -317,36 +317,6 @@ var findNVMeDevice = func(nqn string) (string, error) {
 	return findNVMeDeviceFromListSubsys(nqn)
 }
 
-// findNVMeDeviceFromList finds NVMe device using nvme list command.
-func findNVMeDeviceFromList(nqn string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "nvme", "list", "-o", "json")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("nvme list failed: %v", err)
-	}
-
-	var result struct {
-		Devices []struct {
-			DevicePath   string `json:"DevicePath"`
-			SubsystemNQN string `json:"SubsystemNQN"`
-		} `json:"Devices"`
-	}
-	if err := json.Unmarshal(output, &result); err != nil {
-		return "", fmt.Errorf("failed to parse nvme list: %v", err)
-	}
-
-	for _, device := range result.Devices {
-		if device.SubsystemNQN == nqn {
-			return device.DevicePath, nil
-		}
-	}
-
-	return "", fmt.Errorf("device not found for nqn=%s", nqn)
-}
-
 // findNVMeDeviceFromListSubsys finds NVMe device using nvme list-subsys command.
 // This is more reliable for NVMe-oF as it provides the NQN directly.
 func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
