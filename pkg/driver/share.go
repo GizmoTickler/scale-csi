@@ -471,19 +471,13 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName string, volu
 		return nil
 	}
 
-	// Generate NVMe-oF NQN
-	nqn := path.Base(datasetName)
+	// Generate NVMe-oF subsystem name (TrueNAS 25.10+ auto-generates NQN from name)
+	subsysName := path.Base(datasetName)
 	if d.config.NVMeoF.NamePrefix != "" {
-		nqn = d.config.NVMeoF.NamePrefix + nqn
+		subsysName = d.config.NVMeoF.NamePrefix + subsysName
 	}
 	if d.config.NVMeoF.NameSuffix != "" {
-		nqn = nqn + d.config.NVMeoF.NameSuffix
-	}
-
-	// Generate serial (max 20 chars)
-	serial := d.sanitizeVolumeID(volumeName)
-	if len(serial) > 20 {
-		serial = serial[:20]
+		subsysName = subsysName + d.config.NVMeoF.NameSuffix
 	}
 
 	// Wait for zvol to be ready before creating subsystem/namespace
@@ -494,13 +488,13 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName string, volu
 		klog.Warningf("Zvol readiness check failed (will attempt share creation anyway): %v", err)
 	}
 
-	// Create subsystem
+	// Create subsystem (TrueNAS 25.10+: serial is auto-generated, hosts are IDs not NQNs)
+	// Note: SubsystemHosts config is ignored in 25.10+ - use allow_any_host or configure hosts separately
 	subsys, err := d.truenasClient.NVMeoFSubsystemCreate(
 		ctx,
-		nqn,
-		serial,
+		subsysName,
 		d.config.NVMeoF.SubsystemAllowAnyHost,
-		d.config.NVMeoF.SubsystemHosts,
+		nil, // Host IDs - not used when allow_any_host is true
 	)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF subsystem: %v", err)
@@ -509,9 +503,9 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName string, volu
 		return status.Errorf(codes.Internal, "failed to store NVMe-oF subsystem ID: %v", err)
 	}
 
-	// Create namespace
-	devicePath := fmt.Sprintf("/dev/zvol/%s", datasetName)
-	namespace, err := d.truenasClient.NVMeoFNamespaceCreate(ctx, subsys.ID, devicePath)
+	// Create namespace (TrueNAS 25.10+: device_path format is "zvol/pool/vol", device_type is required)
+	devicePath := fmt.Sprintf("zvol/%s", datasetName)
+	namespace, err := d.truenasClient.NVMeoFNamespaceCreate(ctx, subsys.ID, devicePath, "ZVOL")
 	if err != nil {
 		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
 			klog.Warningf("Failed to cleanup NVMe-oF subsystem: %v", delErr)

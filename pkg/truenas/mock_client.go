@@ -523,13 +523,19 @@ func (m *MockClient) ISCSIGlobalConfigGet(ctx context.Context) (*ISCSIGlobalConf
 	return &ISCSIGlobalConfig{Basename: "iqn.2005-10.org.freenas.ctl"}, nil
 }
 
-// NVMe-oF methods
-func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, nqn string, serial string, allowAnyHost bool, hosts []string) (*NVMeoFSubsystem, error) {
+// NVMe-oF methods (updated for TrueNAS SCALE 25.10+)
+func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	id := len(m.NVMeSubsystems) + 1
-	sub := &NVMeoFSubsystem{ID: id, NQN: nqn}
+	sub := &NVMeoFSubsystem{
+		ID:           id,
+		Name:         name,
+		NQN:          fmt.Sprintf("nqn.2011-06.com.truenas:%s", name), // Mock auto-generated NQN
+		AllowAnyHost: allowAnyHost,
+		Hosts:        hostIDs,
+	}
 	m.NVMeSubsystems[id] = sub
 	return sub, nil
 }
@@ -560,12 +566,29 @@ func (m *MockClient) NVMeoFSubsystemFindByNQN(ctx context.Context, nqn string) (
 	}
 	return nil, nil
 }
-func (m *MockClient) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error) {
+func (m *MockClient) NVMeoFSubsystemFindByName(ctx context.Context, name string) (*NVMeoFSubsystem, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, s := range m.NVMeSubsystems {
+		if s.Name == name {
+			return s, nil
+		}
+	}
+	return nil, nil
+}
+func (m *MockClient) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath string, deviceType string) (*NVMeoFNamespace, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	id := len(m.NVMeNamespaces) + 1
-	ns := &NVMeoFNamespace{ID: id, Subsystem: subsystemID, DevicePath: devicePath}
+	ns := &NVMeoFNamespace{
+		ID:          id,
+		SubsystemID: subsystemID,
+		DevicePath:  devicePath,
+		DeviceType:  deviceType,
+		Enabled:     true,
+	}
 	m.NVMeNamespaces[id] = ns
 	return ns, nil
 }
@@ -590,7 +613,7 @@ func (m *MockClient) NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemI
 	defer m.mu.RUnlock()
 
 	for _, n := range m.NVMeNamespaces {
-		if n.Subsystem == subsystemID && n.DevicePath == devicePath {
+		if n.SubsystemID == subsystemID && n.DevicePath == devicePath {
 			return n, nil
 		}
 	}

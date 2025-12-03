@@ -67,12 +67,13 @@ type ClientInterface interface {
 	ISCSITargetExtentFindByExtent(ctx context.Context, extentID int) ([]*ISCSITargetExtent, error)
 	ISCSIGlobalConfigGet(ctx context.Context) (*ISCSIGlobalConfig, error)
 
-	// NVMe-oF methods
-	NVMeoFSubsystemCreate(ctx context.Context, nqn string, serial string, allowAnyHost bool, hosts []string) (*NVMeoFSubsystem, error)
+	// NVMe-oF methods (updated for TrueNAS SCALE 25.10+)
+	NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemDelete(ctx context.Context, id int) error
 	NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemFindByNQN(ctx context.Context, nqn string) (*NVMeoFSubsystem, error)
-	NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error)
+	NVMeoFSubsystemFindByName(ctx context.Context, name string) (*NVMeoFSubsystem, error)
+	NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath string, deviceType string) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceDelete(ctx context.Context, id int) error
 	NVMeoFNamespaceGet(ctx context.Context, id int) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error)
