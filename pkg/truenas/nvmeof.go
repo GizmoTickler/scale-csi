@@ -169,6 +169,25 @@ func (c *Client) NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID in
 	return parseNVMeoFNamespace(namespaces[0])
 }
 
+// NVMeoFNamespaceFindByDevicePath finds an NVMe-oF namespace by device path across all subsystems.
+// This is useful for checking if any namespace references a given zvol.
+func (c *Client) NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*NVMeoFNamespace, error) {
+	filters := [][]interface{}{
+		{"device_path", "=", devicePath},
+	}
+	result, err := c.Call(ctx, "nvmet.namespace.query", filters, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query NVMe-oF namespaces: %w", err)
+	}
+
+	namespaces, ok := result.([]interface{})
+	if !ok || len(namespaces) == 0 {
+		return nil, nil
+	}
+
+	return parseNVMeoFNamespace(namespaces[0])
+}
+
 // NVMeoFPortList lists all NVMe-oF ports.
 func (c *Client) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	result, err := c.Call(ctx, "nvmet.port.query", []interface{}{}, map[string]interface{}{})

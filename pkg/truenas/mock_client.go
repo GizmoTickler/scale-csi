@@ -596,6 +596,17 @@ func (m *MockClient) NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemI
 	}
 	return nil, nil
 }
+func (m *MockClient) NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*NVMeoFNamespace, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, n := range m.NVMeNamespaces {
+		if n.DevicePath == devicePath {
+			return n, nil
+		}
+	}
+	return nil, nil
+}
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	return []*NVMeoFPort{{ID: 1, Transport: "tcp", Address: "0.0.0.0", Port: 4420}}, nil
 }

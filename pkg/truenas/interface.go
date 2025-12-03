@@ -76,6 +76,7 @@ type ClientInterface interface {
 	NVMeoFNamespaceDelete(ctx context.Context, id int) error
 	NVMeoFNamespaceGet(ctx context.Context, id int) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error)
+	NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*NVMeoFNamespace, error)
 	NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error)
 	NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error)
 }

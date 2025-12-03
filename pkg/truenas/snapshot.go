@@ -9,6 +9,17 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// ErrSnapshotHasClones is returned when a snapshot cannot be deleted because it has dependent clones.
+// The caller should inspect the Clones field to determine how to proceed.
+type ErrSnapshotHasClones struct {
+	SnapshotID string
+	Clones     []string
+}
+
+func (e *ErrSnapshotHasClones) Error() string {
+	return fmt.Sprintf("snapshot %s has dependent clones: %v", e.SnapshotID, e.Clones)
+}
+
 // apiMethodPrefix stores the detected API prefix for snapshot methods.
 // TrueNAS 24.x uses "zfs.snapshot.*", while 25.04+ may use "pool.snapshot.*"
 var (
@@ -87,8 +98,9 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset string, name string
 }
 
 // SnapshotDelete deletes a ZFS snapshot.
-// If the snapshot has orphaned clones (from failed volume deletions), it will attempt
-// to delete those clones first before deleting the snapshot.
+// If the snapshot has clones, it returns ErrSnapshotHasClones with the list of clones.
+// The caller is responsible for deciding how to handle clones (e.g., verifying they are
+// orphaned before deletion).
 func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_ bool, recursive bool) error {
 	options := map[string]interface{}{
 		"defer":     defer_,
@@ -117,30 +129,18 @@ func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_ b
 				return nil
 			}
 
-			// Snapshot exists - check if it has clones we can clean up
+			// Snapshot exists - check if it has clones
 			clones := snap.GetClones()
 			if len(clones) > 0 {
-				// Attempt to delete orphaned clones
-				for _, cloneDataset := range clones {
-					// Try to delete the clone dataset - these are likely orphaned
-					// from failed volume deletions during TrueNAS overload
-					if delErr := c.DatasetDelete(ctx, cloneDataset, false, true); delErr != nil {
-						// Log but continue - clone might still be in use
-						continue
-					}
+				// Return structured error with clone list for caller to handle
+				return &ErrSnapshotHasClones{
+					SnapshotID: snapshotID,
+					Clones:     clones,
 				}
-
-				// Retry snapshot deletion after cleaning up clones
-				_, retryErr := c.Call(ctx, c.snapshotMethod(ctx, "delete"), snapshotID, options)
-				if retryErr == nil {
-					return nil
-				}
-				// Still failed - return the original error with context
-				return fmt.Errorf("failed to delete snapshot (has clones: %v): %w", clones, err)
 			}
 
 			// Snapshot exists but can't be deleted for unknown reason
-			return fmt.Errorf("failed to delete snapshot (may have clones): %w", err)
+			return fmt.Errorf("failed to delete snapshot (unknown reason): %w", err)
 		}
 		return fmt.Errorf("failed to delete snapshot: %w", err)
 	}

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strconv"
@@ -588,12 +589,152 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 			klog.Infof("Snapshot %s already deleted", snapshotID)
 			return &csi.DeleteSnapshotResponse{}, nil
 		}
+
+		// Handle snapshot with clones - verify and cleanup orphans only
+		var cloneErr *truenas.ErrSnapshotHasClones
+		if errors.As(err, &cloneErr) {
+			if err := d.handleSnapshotClones(ctx, snap.ID, cloneErr.Clones); err != nil {
+				return nil, err
+			}
+			// Retry snapshot deletion after handling clones
+			if retryErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); retryErr != nil {
+				if truenas.IsNotFoundError(retryErr) {
+					klog.Infof("Snapshot %s already deleted after clone cleanup", snapshotID)
+					return &csi.DeleteSnapshotResponse{}, nil
+				}
+				klog.Errorf("Failed to delete snapshot %s after clone cleanup: %v", snapshotID, retryErr)
+				return nil, status.Errorf(codes.Internal, "failed to delete snapshot after clone cleanup: %v", retryErr)
+			}
+			klog.Infof("Snapshot %s deleted successfully after orphan cleanup", snapshotID)
+			return &csi.DeleteSnapshotResponse{}, nil
+		}
+
 		klog.Errorf("Failed to delete snapshot %s: %v", snapshotID, err)
 		return nil, status.Errorf(codes.Internal, "failed to delete snapshot: %v", err)
 	}
 	klog.Infof("Snapshot %s deleted successfully", snapshotID)
 
 	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+// handleSnapshotClones verifies and handles clones before snapshot deletion.
+// It classifies each clone as:
+// - Non-CSI: Not managed by this driver (never touch)
+// - Active: CSI-managed with an active export (NFS share, iSCSI extent, NVMe namespace)
+// - Orphaned: CSI-managed without any export (safe to delete)
+// Only orphaned clones are deleted. Active and non-CSI clones cause an error.
+func (d *Driver) handleSnapshotClones(ctx context.Context, snapshotID string, clones []string) error {
+	var activeClones []string
+	var orphanedClones []string
+	var nonCSIClones []string
+
+	for _, cloneDataset := range clones {
+		// Get the dataset to check properties
+		ds, err := d.truenasClient.DatasetGet(ctx, cloneDataset)
+		if err != nil {
+			// If we can't get the dataset, treat it as non-CSI to be safe
+			klog.Warningf("Failed to get clone dataset %s: %v, treating as non-CSI", cloneDataset, err)
+			nonCSIClones = append(nonCSIClones, cloneDataset)
+			continue
+		}
+
+		// Check if CSI-managed
+		prop, isCSIManaged := ds.UserProperties[PropManagedResource]
+		if !isCSIManaged || prop.Value != "true" {
+			nonCSIClones = append(nonCSIClones, cloneDataset)
+			continue
+		}
+
+		// CSI-managed - check for active exports
+		hasExport, err := d.cloneHasActiveExport(ctx, cloneDataset, ds.Type)
+		if err != nil {
+			// If we can't determine, assume active to be safe
+			klog.Warningf("Failed to check exports for clone %s: %v, assuming active", cloneDataset, err)
+			activeClones = append(activeClones, cloneDataset)
+			continue
+		}
+
+		if hasExport {
+			activeClones = append(activeClones, cloneDataset)
+		} else {
+			orphanedClones = append(orphanedClones, cloneDataset)
+		}
+	}
+
+	// Fail if there are non-CSI clones
+	if len(nonCSIClones) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot delete snapshot: has non-CSI dependent datasets %v. These must be manually removed.",
+			nonCSIClones)
+	}
+
+	// Fail if there are active clones
+	if len(activeClones) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot delete snapshot: has active volumes %v. Delete these volumes first using 'kubectl delete pvc'.",
+			activeClones)
+	}
+
+	// Delete orphaned clones (safe - no exports means not in use)
+	if len(orphanedClones) > 0 {
+		klog.Warningf("Found %d orphaned clones from failed volume deletions, cleaning up: %v", len(orphanedClones), orphanedClones)
+		for _, orphan := range orphanedClones {
+			klog.Infof("Deleting orphaned clone: %s", orphan)
+			if err := d.truenasClient.DatasetDelete(ctx, orphan, false, true); err != nil {
+				// Log but don't fail - the clone might have been deleted by another operation
+				if !truenas.IsNotFoundError(err) {
+					klog.Warningf("Failed to delete orphaned clone %s: %v", orphan, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// cloneHasActiveExport checks if a clone dataset has an active NFS share, iSCSI extent, or NVMe namespace.
+func (d *Driver) cloneHasActiveExport(ctx context.Context, datasetPath string, datasetType string) (bool, error) {
+	// For filesystem datasets, check NFS shares
+	if datasetType == "FILESYSTEM" {
+		// NFS shares use the mount path which is typically /mnt/{pool}/{dataset}
+		mountPath := "/mnt/" + datasetPath
+		share, err := d.truenasClient.NFSShareFindByPath(ctx, mountPath)
+		if err != nil {
+			return false, fmt.Errorf("failed to check NFS share: %w", err)
+		}
+		if share != nil {
+			return true, nil
+		}
+		return false, nil
+	}
+
+	// For zvols, check iSCSI extents and NVMe namespaces
+	if datasetType == "VOLUME" {
+		// iSCSI extents use zvol path like "zvol/{pool}/{dataset}"
+		zvolPath := "zvol/" + datasetPath
+		extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, zvolPath)
+		if err != nil {
+			return false, fmt.Errorf("failed to check iSCSI extent: %w", err)
+		}
+		if extent != nil {
+			return true, nil
+		}
+
+		// NVMe namespaces also use zvol path
+		namespace, err := d.truenasClient.NVMeoFNamespaceFindByDevicePath(ctx, zvolPath)
+		if err != nil {
+			return false, fmt.Errorf("failed to check NVMe namespace: %w", err)
+		}
+		if namespace != nil {
+			return true, nil
+		}
+
+		return false, nil
+	}
+
+	// Unknown type - assume has export to be safe
+	klog.Warningf("Unknown dataset type %s for %s, assuming has active export", datasetType, datasetPath)
+	return true, nil
 }
 
 // ListSnapshots lists snapshots.
