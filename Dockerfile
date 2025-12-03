@@ -28,8 +28,8 @@ FROM alpine:3.22
 LABEL org.opencontainers.image.source="https://github.com/GizmoTickler/scale-csi"
 LABEL org.opencontainers.image.url="https://github.com/GizmoTickler/scale-csi"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.title="TrueNAS Scale CSI Driver"
-LABEL org.opencontainers.image.description="Kubernetes CSI driver for TrueNAS SCALE"
+LABEL org.opencontainers.image.title="Scale CSI Driver"
+LABEL org.opencontainers.image.description="Kubernetes CSI driver for TrueNAS SCALE Systems"
 
 # Install runtime dependencies
 # - nfs-utils: NFS client for mounting NFS shares
