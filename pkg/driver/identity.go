@@ -33,19 +33,25 @@ func (d *Driver) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCa
 			},
 		},
 		{
-			Type: &csi.PluginCapability_Service_{
-				Service: &csi.PluginCapability_Service{
-					Type: csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS,
-				},
-			},
-		},
-		{
 			Type: &csi.PluginCapability_VolumeExpansion_{
 				VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
 					Type: csi.PluginCapability_VolumeExpansion_ONLINE,
 				},
 			},
 		},
+	}
+
+	// Only advertise topology constraints when topology is explicitly enabled
+	// Without this check, the provisioner requires topology but nodes don't provide it
+	if d.config != nil && d.config.Node.Topology.Enabled {
+		caps = append(caps, &csi.PluginCapability{
+			Type: &csi.PluginCapability_Service_{
+				Service: &csi.PluginCapability_Service{
+					Type: csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS,
+				},
+			},
+		})
+		klog.V(4).Info("Topology enabled: advertising VOLUME_ACCESSIBILITY_CONSTRAINTS capability")
 	}
 
 	return &csi.GetPluginCapabilitiesResponse{
