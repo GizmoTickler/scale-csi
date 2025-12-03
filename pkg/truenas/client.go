@@ -104,6 +104,15 @@ type ClientConfig struct {
 	MaxConnections     int             // Maximum number of concurrent connections (default: 5)
 	MaxConcurrentReqs  int             // Maximum number of concurrent API requests (default: 10)
 	MetricsRecorder    MetricsRecorder // Optional callback for recording request metrics
+
+	// Circuit breaker configuration
+	CircuitBreaker *CircuitBreakerConfig
+
+	// Retry configuration for API calls
+	APIRetryMaxAttempts   int           // Maximum retry attempts for API calls (default: 3)
+	APIRetryInitialDelay  time.Duration // Initial delay between retries (default: 500ms)
+	APIRetryMaxDelay      time.Duration // Maximum delay between retries (default: 5s)
+	APIRetryBackoffFactor float64       // Backoff multiplier (default: 2.0)
 }
 
 // writeRequest represents a request to be written to the WebSocket.
@@ -173,6 +182,7 @@ type Client struct {
 	next            uint64          // For round-robin selection
 	semaphore       chan struct{}   // Limits concurrent requests to prevent TrueNAS overload
 	metricsRecorder MetricsRecorder // Optional callback for recording request metrics
+	circuitBreaker  *CircuitBreaker // Optional circuit breaker for API calls
 }
 
 // rpcRequest is a JSON-RPC 2.0 request.
@@ -238,11 +248,34 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		cfg.MaxConcurrentReqs = 10 // Limit concurrent requests to prevent overwhelming TrueNAS
 	}
 
+	// API retry defaults
+	if cfg.APIRetryMaxAttempts == 0 {
+		cfg.APIRetryMaxAttempts = 3
+	}
+	if cfg.APIRetryInitialDelay == 0 {
+		cfg.APIRetryInitialDelay = 500 * time.Millisecond
+	}
+	if cfg.APIRetryMaxDelay == 0 {
+		cfg.APIRetryMaxDelay = 5 * time.Second
+	}
+	if cfg.APIRetryBackoffFactor == 0 {
+		cfg.APIRetryBackoffFactor = 2.0
+	}
+
+	// Initialize circuit breaker
+	var cb *CircuitBreaker
+	if cfg.CircuitBreaker != nil && cfg.CircuitBreaker.Enabled {
+		cb = NewCircuitBreaker(cfg.CircuitBreaker)
+		klog.Infof("Circuit breaker enabled: failureThreshold=%d, successThreshold=%d, timeout=%v",
+			cfg.CircuitBreaker.FailureThreshold, cfg.CircuitBreaker.SuccessThreshold, cfg.CircuitBreaker.Timeout)
+	}
+
 	client := &Client{
 		config:          cfg,
 		pool:            make([]*Connection, cfg.MaxConnections),
 		semaphore:       make(chan struct{}, cfg.MaxConcurrentReqs),
 		metricsRecorder: cfg.MetricsRecorder,
+		circuitBreaker:  cb,
 	}
 
 	// Initialize connection pool
@@ -756,9 +789,18 @@ func (c *Client) Call(ctx context.Context, method string, params ...interface{})
 
 // CallWithContext makes a JSON-RPC call with a context using the connection pool.
 // Uses a semaphore to limit concurrent requests and prevent overwhelming TrueNAS.
-// Implements automatic retry on connection errors with exponential backoff.
+// Implements circuit breaker pattern and automatic retry on connection errors with exponential backoff.
 func (c *Client) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
 	start := time.Now()
+
+	// Check circuit breaker first
+	if c.circuitBreaker != nil && !c.circuitBreaker.Allow() {
+		err := fmt.Errorf("API call %s blocked: %w", method, ErrCircuitOpen)
+		if c.metricsRecorder != nil {
+			c.metricsRecorder(method, time.Since(start).Seconds(), err)
+		}
+		return nil, err
+	}
 
 	// Acquire semaphore slot (limit concurrent requests)
 	select {
@@ -769,9 +811,9 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 	}
 	defer func() { <-c.semaphore }() // Release slot when done
 
-	const maxRetries = 3
+	maxRetries := c.config.APIRetryMaxAttempts
 	var lastErr error
-	retryDelay := 500 * time.Millisecond
+	retryDelay := c.config.APIRetryInitialDelay
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Select best available connection
@@ -779,6 +821,10 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 
 		result, err := conn.CallWithContext(ctx, method, params...)
 		if err == nil {
+			// Record success with circuit breaker
+			if c.circuitBreaker != nil {
+				c.circuitBreaker.RecordSuccess()
+			}
 			// Record successful request metrics
 			if c.metricsRecorder != nil {
 				c.metricsRecorder(method, time.Since(start).Seconds(), nil)
@@ -789,11 +835,17 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 		// Check if error is retryable (connection-related)
 		if !IsConnectionError(err) {
 			// Not a connection error - return immediately (API errors, not found, etc.)
+			// Don't record with circuit breaker for non-connection errors (e.g., "not found" is not a circuit issue)
 			// Record failed request metrics
 			if c.metricsRecorder != nil {
 				c.metricsRecorder(method, time.Since(start).Seconds(), err)
 			}
 			return nil, err
+		}
+
+		// Record failure with circuit breaker for connection errors
+		if c.circuitBreaker != nil {
+			c.circuitBreaker.RecordFailure()
 		}
 
 		lastErr = err
@@ -803,9 +855,9 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 		if attempt < maxRetries-1 {
 			select {
 			case <-time.After(retryDelay):
-				retryDelay *= 2 // Exponential backoff
-				if retryDelay > 5*time.Second {
-					retryDelay = 5 * time.Second
+				retryDelay = time.Duration(float64(retryDelay) * c.config.APIRetryBackoffFactor)
+				if retryDelay > c.config.APIRetryMaxDelay {
+					retryDelay = c.config.APIRetryMaxDelay
 				}
 			case <-ctx.Done():
 				finalErr := fmt.Errorf("context cancelled during retry: %w", ctx.Err())
@@ -823,6 +875,24 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 		c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
 	}
 	return nil, finalErr
+}
+
+// CircuitBreakerStats returns statistics about the circuit breaker.
+// Returns nil if circuit breaker is not enabled.
+func (c *Client) CircuitBreakerStats() *CircuitBreakerStats {
+	if c.circuitBreaker == nil {
+		return nil
+	}
+	stats := c.circuitBreaker.Stats()
+	return &stats
+}
+
+// ResetCircuitBreaker manually resets the circuit breaker to closed state.
+// This is useful for manual intervention after fixing underlying issues.
+func (c *Client) ResetCircuitBreaker() {
+	if c.circuitBreaker != nil {
+		c.circuitBreaker.Reset()
+	}
 }
 
 // selectConnection selects the best available connection from the pool.

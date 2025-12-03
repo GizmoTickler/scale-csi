@@ -90,7 +90,8 @@ const DefaultISCSIDeviceTimeout = 60 * time.Second
 
 // ISCSIConnectOptions holds options for iSCSI connection.
 type ISCSIConnectOptions struct {
-	DeviceTimeout time.Duration // Timeout for waiting for device to appear (default: 60s)
+	DeviceTimeout       time.Duration // Timeout for waiting for device to appear (default: 60s)
+	SessionCleanupDelay time.Duration // Delay after cleaning up stale session (default: 500ms)
 }
 
 // ISCSIConnect connects to an iSCSI target and returns the device path.
@@ -105,8 +106,14 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 
 	// Apply defaults
 	timeout := DefaultISCSIDeviceTimeout
-	if opts != nil && opts.DeviceTimeout > 0 {
-		timeout = opts.DeviceTimeout
+	sessionCleanupDelay := 500 * time.Millisecond
+	if opts != nil {
+		if opts.DeviceTimeout > 0 {
+			timeout = opts.DeviceTimeout
+		}
+		if opts.SessionCleanupDelay > 0 {
+			sessionCleanupDelay = opts.SessionCleanupDelay
+		}
 	}
 
 	// Check if already logged in - validate session before reuse
@@ -131,8 +138,8 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 				if disconnectErr := ISCSIDisconnect(portal, iqn); disconnectErr != nil {
 					klog.Warningf("Failed to disconnect stale session %s: %v (proceeding anyway)", iqn, disconnectErr)
 				}
-				// Brief pause to allow session cleanup to complete
-				time.Sleep(500 * time.Millisecond)
+				// Brief pause to allow session cleanup to complete (configurable)
+				time.Sleep(sessionCleanupDelay)
 				break // Exit loop and proceed with fresh discovery
 			}
 		}

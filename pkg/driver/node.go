@@ -61,9 +61,36 @@ func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabi
 func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	klog.V(4).Info("NodeGetInfo called")
 
-	return &csi.NodeGetInfoResponse{
+	resp := &csi.NodeGetInfoResponse{
 		NodeId: d.nodeID,
-	}, nil
+	}
+
+	// Add topology information if enabled
+	if d.config.Node.Topology.Enabled {
+		topology := make(map[string]string)
+
+		// Add standard topology keys
+		if d.config.Node.Topology.Zone != "" {
+			topology["topology.kubernetes.io/zone"] = d.config.Node.Topology.Zone
+		}
+		if d.config.Node.Topology.Region != "" {
+			topology["topology.kubernetes.io/region"] = d.config.Node.Topology.Region
+		}
+
+		// Add custom labels
+		for k, v := range d.config.Node.Topology.CustomLabels {
+			topology[k] = v
+		}
+
+		if len(topology) > 0 {
+			resp.AccessibleTopology = &csi.Topology{
+				Segments: topology,
+			}
+			klog.V(4).Infof("NodeGetInfo: returning topology %v", topology)
+		}
+	}
+
+	return resp, nil
 }
 
 // NodeStageVolume mounts a volume to a staging path.
@@ -546,13 +573,14 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		if disconnectErr := util.ISCSIDisconnect(portal, existingIQN); disconnectErr != nil {
 			klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingIQN, disconnectErr)
 		}
-		// Brief pause to allow session cleanup to complete
-		time.Sleep(500 * time.Millisecond)
+		// Brief pause to allow session cleanup to complete (configurable)
+		time.Sleep(time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond)
 	}
 
 	// Connect to iSCSI target with configurable timeout
 	connectOpts := &util.ISCSIConnectOptions{
-		DeviceTimeout: time.Duration(d.config.ISCSI.DeviceWaitTimeout) * time.Second,
+		DeviceTimeout:       time.Duration(d.config.ISCSI.DeviceWaitTimeout) * time.Second,
+		SessionCleanupDelay: time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond,
 	}
 	devicePath, err := util.ISCSIConnectWithOptions(ctx, portal, iqn, lun, connectOpts)
 	if err != nil {
@@ -611,8 +639,8 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 		if disconnectErr := util.NVMeoFDisconnect(existingNQN); disconnectErr != nil {
 			klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingNQN, disconnectErr)
 		}
-		// Brief pause to allow session cleanup to complete
-		time.Sleep(500 * time.Millisecond)
+		// Brief pause to allow session cleanup to complete (configurable)
+		time.Sleep(time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond)
 	}
 
 	// Connect to NVMe-oF subsystem with configurable timeout

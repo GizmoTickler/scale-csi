@@ -33,6 +33,15 @@ type Config struct {
 
 	// Session garbage collection configuration (node plugin only)
 	SessionGC SessionGCConfig `yaml:"sessionGC"`
+
+	// Node configuration (node plugin only)
+	Node NodeConfig `yaml:"node"`
+
+	// Resilience configuration for retry, circuit breaker, and rate limiting
+	Resilience ResilienceConfig `yaml:"resilience"`
+
+	// CommandTimeouts configures timeouts for various command types
+	CommandTimeouts CommandTimeoutConfig `yaml:"commandTimeouts"`
 }
 
 // TrueNASConfig holds TrueNAS connection settings.
@@ -232,6 +241,107 @@ type NVMeoFConfig struct {
 
 	// DeviceWaitTimeout is the timeout for waiting for NVMe-oF devices to appear in seconds (default: 60)
 	DeviceWaitTimeout int `yaml:"deviceWaitTimeout"`
+
+	// CommandTimeout is the timeout for nvme CLI commands in seconds (default: 30)
+	CommandTimeout int `yaml:"commandTimeout"`
+}
+
+// NodeConfig holds node-side configuration options.
+type NodeConfig struct {
+	// Topology configures topology awareness for the CSI driver
+	Topology TopologyConfig `yaml:"topology"`
+
+	// SessionCleanupDelay is the delay in milliseconds before retrying after cleaning up
+	// an existing session during staging (default: 500)
+	SessionCleanupDelay int `yaml:"sessionCleanupDelay"`
+}
+
+// TopologyConfig holds topology awareness configuration.
+type TopologyConfig struct {
+	// Enabled enables topology awareness (default: false)
+	Enabled bool `yaml:"enabled"`
+
+	// Zone is the availability zone for this node (e.g., "zone-a")
+	Zone string `yaml:"zone"`
+
+	// Region is the region for this node (e.g., "us-west-1")
+	Region string `yaml:"region"`
+
+	// CustomLabels are additional topology labels to report
+	// Keys should follow the format "topology.kubernetes.io/custom-key"
+	CustomLabels map[string]string `yaml:"customLabels"`
+}
+
+// ResilienceConfig holds configuration for retry, circuit breaker, and rate limiting.
+type ResilienceConfig struct {
+	// CircuitBreaker configures the circuit breaker for TrueNAS API calls
+	CircuitBreaker CircuitBreakerConfig `yaml:"circuitBreaker"`
+
+	// Retry configures retry behavior for API calls
+	Retry RetryConfig `yaml:"retry"`
+
+	// RateLimiting configures rate limiting for API calls
+	RateLimiting RateLimitConfig `yaml:"rateLimiting"`
+}
+
+// CircuitBreakerConfig holds circuit breaker configuration.
+type CircuitBreakerConfig struct {
+	// Enabled enables the circuit breaker (default: true)
+	Enabled bool `yaml:"enabled"`
+
+	// FailureThreshold is the number of consecutive failures before opening the circuit (default: 5)
+	FailureThreshold int `yaml:"failureThreshold"`
+
+	// SuccessThreshold is the number of consecutive successes to close the circuit (default: 2)
+	SuccessThreshold int `yaml:"successThreshold"`
+
+	// Timeout is the time in seconds the circuit stays open before transitioning to half-open (default: 30)
+	Timeout int `yaml:"timeout"`
+
+	// HalfOpenMaxRequests is the max requests allowed in half-open state (default: 3)
+	HalfOpenMaxRequests int `yaml:"halfOpenMaxRequests"`
+}
+
+// RetryConfig holds retry configuration.
+type RetryConfig struct {
+	// MaxAttempts is the maximum number of retry attempts (default: 3)
+	MaxAttempts int `yaml:"maxAttempts"`
+
+	// InitialDelay is the initial delay in milliseconds between retries (default: 500)
+	InitialDelay int `yaml:"initialDelay"`
+
+	// MaxDelay is the maximum delay in milliseconds between retries (default: 5000)
+	MaxDelay int `yaml:"maxDelay"`
+
+	// BackoffMultiplier is the multiplier for exponential backoff (default: 2.0)
+	BackoffMultiplier float64 `yaml:"backoffMultiplier"`
+}
+
+// RateLimitConfig holds rate limiting configuration.
+type RateLimitConfig struct {
+	// MaxConcurrentRequests limits concurrent API requests (default: 10)
+	MaxConcurrentRequests int `yaml:"maxConcurrentRequests"`
+
+	// MaxConcurrentLogins limits concurrent iSCSI logins per portal (default: 2)
+	MaxConcurrentLogins int `yaml:"maxConcurrentLogins"`
+
+	// DiscoveryCacheDuration is how long discovery results are cached in seconds (default: 30)
+	DiscoveryCacheDuration int `yaml:"discoveryCacheDuration"`
+}
+
+// CommandTimeoutConfig holds timeouts for various command types.
+type CommandTimeoutConfig struct {
+	// Mount is the timeout for mount commands in seconds (default: 30)
+	Mount int `yaml:"mount"`
+
+	// Format is the timeout for format commands in seconds (default: 300)
+	Format int `yaml:"format"`
+
+	// ISCSI is the timeout for iscsiadm commands in seconds (default: 10)
+	ISCSI int `yaml:"iscsi"`
+
+	// NVMe is the timeout for nvme CLI commands in seconds (default: 30)
+	NVMe int `yaml:"nvme"`
 }
 
 // LoadConfig loads configuration from a YAML file.
@@ -313,6 +423,69 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.SessionGC.RunOnStartup == nil {
 		defaultTrue := true
 		cfg.SessionGC.RunOnStartup = &defaultTrue
+	}
+
+	// Node defaults
+	if cfg.Node.SessionCleanupDelay == 0 {
+		cfg.Node.SessionCleanupDelay = 500 // 500ms default
+	}
+
+	// Resilience defaults - Circuit Breaker
+	if cfg.Resilience.CircuitBreaker.FailureThreshold == 0 {
+		cfg.Resilience.CircuitBreaker.FailureThreshold = 5
+	}
+	if cfg.Resilience.CircuitBreaker.SuccessThreshold == 0 {
+		cfg.Resilience.CircuitBreaker.SuccessThreshold = 2
+	}
+	if cfg.Resilience.CircuitBreaker.Timeout == 0 {
+		cfg.Resilience.CircuitBreaker.Timeout = 30 // 30 seconds
+	}
+	if cfg.Resilience.CircuitBreaker.HalfOpenMaxRequests == 0 {
+		cfg.Resilience.CircuitBreaker.HalfOpenMaxRequests = 3
+	}
+
+	// Resilience defaults - Retry
+	if cfg.Resilience.Retry.MaxAttempts == 0 {
+		cfg.Resilience.Retry.MaxAttempts = 3
+	}
+	if cfg.Resilience.Retry.InitialDelay == 0 {
+		cfg.Resilience.Retry.InitialDelay = 500 // 500ms
+	}
+	if cfg.Resilience.Retry.MaxDelay == 0 {
+		cfg.Resilience.Retry.MaxDelay = 5000 // 5 seconds
+	}
+	if cfg.Resilience.Retry.BackoffMultiplier == 0 {
+		cfg.Resilience.Retry.BackoffMultiplier = 2.0
+	}
+
+	// Resilience defaults - Rate Limiting
+	if cfg.Resilience.RateLimiting.MaxConcurrentRequests == 0 {
+		cfg.Resilience.RateLimiting.MaxConcurrentRequests = 10
+	}
+	if cfg.Resilience.RateLimiting.MaxConcurrentLogins == 0 {
+		cfg.Resilience.RateLimiting.MaxConcurrentLogins = 2
+	}
+	if cfg.Resilience.RateLimiting.DiscoveryCacheDuration == 0 {
+		cfg.Resilience.RateLimiting.DiscoveryCacheDuration = 30 // 30 seconds
+	}
+
+	// Command timeout defaults
+	if cfg.CommandTimeouts.Mount == 0 {
+		cfg.CommandTimeouts.Mount = 30 // 30 seconds
+	}
+	if cfg.CommandTimeouts.Format == 0 {
+		cfg.CommandTimeouts.Format = 300 // 5 minutes
+	}
+	if cfg.CommandTimeouts.ISCSI == 0 {
+		cfg.CommandTimeouts.ISCSI = 10 // 10 seconds
+	}
+	if cfg.CommandTimeouts.NVMe == 0 {
+		cfg.CommandTimeouts.NVMe = 30 // 30 seconds
+	}
+
+	// NVMe-oF command timeout default
+	if cfg.NVMeoF.CommandTimeout == 0 {
+		cfg.NVMeoF.CommandTimeout = 30 // 30 seconds
 	}
 
 	// Validate required fields

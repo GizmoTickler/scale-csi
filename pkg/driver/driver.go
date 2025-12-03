@@ -95,7 +95,19 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		return nil, fmt.Errorf("config is required")
 	}
 
-	// Create TrueNAS API client
+	// Build circuit breaker config if enabled
+	var cbConfig *truenas.CircuitBreakerConfig
+	if cfg.Config.Resilience.CircuitBreaker.Enabled {
+		cbConfig = &truenas.CircuitBreakerConfig{
+			Enabled:             true,
+			FailureThreshold:    cfg.Config.Resilience.CircuitBreaker.FailureThreshold,
+			SuccessThreshold:    cfg.Config.Resilience.CircuitBreaker.SuccessThreshold,
+			Timeout:             time.Duration(cfg.Config.Resilience.CircuitBreaker.Timeout) * time.Second,
+			HalfOpenMaxRequests: cfg.Config.Resilience.CircuitBreaker.HalfOpenMaxRequests,
+		}
+	}
+
+	// Create TrueNAS API client with resilience settings
 	truenasClient, err := truenas.NewClient(&truenas.ClientConfig{
 		Host:              cfg.Config.TrueNAS.Host,
 		Port:              cfg.Config.TrueNAS.Port,
@@ -106,6 +118,13 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		ConnectTimeout:    time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
 		MaxConcurrentReqs: cfg.Config.TrueNAS.MaxConcurrentRequests,
 		MetricsRecorder:   RecordTrueNASRequest,
+		// Circuit breaker configuration
+		CircuitBreaker: cbConfig,
+		// Retry configuration
+		APIRetryMaxAttempts:   cfg.Config.Resilience.Retry.MaxAttempts,
+		APIRetryInitialDelay:  time.Duration(cfg.Config.Resilience.Retry.InitialDelay) * time.Millisecond,
+		APIRetryMaxDelay:      time.Duration(cfg.Config.Resilience.Retry.MaxDelay) * time.Millisecond,
+		APIRetryBackoffFactor: cfg.Config.Resilience.Retry.BackoffMultiplier,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TrueNAS client: %w", err)
