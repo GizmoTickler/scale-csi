@@ -9,11 +9,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
 )
+
+// nvmeDeviceRegex matches NVMe namespace device names and captures the controller name.
+// Pattern: nvme<controller_number>n<namespace_number>
+// Examples: nvme0n1 -> captures "nvme0", nvme10n2 -> captures "nvme10"
+var nvmeDeviceRegex = regexp.MustCompile(`^(nvme\d+)n\d+$`)
 
 // Note: getNVMeTimeout() is now configurable via SetConfig().NVMeTimeout
 // Default: 30s
@@ -394,12 +400,10 @@ func NVMeListNamespaces(devicePath string) ([]int, error) {
 
 	// Remove namespace suffix if present (e.g., /dev/nvme0n1 -> /dev/nvme0)
 	ctrlPath := devicePath
-	if strings.Contains(filepath.Base(devicePath), "n") {
-		// Extract controller path
-		parts := strings.Split(filepath.Base(devicePath), "n")
-		if len(parts) >= 2 {
-			ctrlPath = filepath.Join(filepath.Dir(devicePath), parts[0])
-		}
+	deviceName := filepath.Base(devicePath)
+	if matches := nvmeDeviceRegex.FindStringSubmatch(deviceName); len(matches) == 2 {
+		// matches[0] is full match (e.g., "nvme0n1"), matches[1] is controller (e.g., "nvme0")
+		ctrlPath = filepath.Join(filepath.Dir(devicePath), matches[1])
 	}
 
 	cmd := exec.CommandContext(ctx, "nvme", "list-ns", ctrlPath, "-o", "json")
@@ -445,10 +449,9 @@ func IsNVMeFabric(devicePath string) (bool, error) {
 	transportPath := fmt.Sprintf("/sys/block/%s/device/transport", deviceName)
 	transport, err := os.ReadFile(transportPath)
 	if err != nil {
-		// Try alternative path
-		parts := strings.Split(deviceName, "n")
-		if len(parts) >= 2 {
-			ctrlName := parts[0]
+		// Try alternative path using controller name extracted from namespace device
+		if matches := nvmeDeviceRegex.FindStringSubmatch(deviceName); len(matches) == 2 {
+			ctrlName := matches[1]
 			transportPath = fmt.Sprintf("/sys/class/nvme/%s/transport", ctrlName)
 			transport, err = os.ReadFile(transportPath)
 			if err != nil {
@@ -509,13 +512,13 @@ func GetNVMeInfoFromDevice(devicePath string) (string, error) {
 		return "", fmt.Errorf("not an NVMe device: %s", devicePath)
 	}
 
-	// Find subsystem NQN
+	// Find subsystem NQN by extracting controller name from namespace device
 	// nvme0n1 -> nvme0
-	parts := strings.Split(deviceName, "n")
-	if len(parts) < 2 {
+	matches := nvmeDeviceRegex.FindStringSubmatch(deviceName)
+	if len(matches) != 2 {
 		return "", fmt.Errorf("invalid NVMe device name: %s", deviceName)
 	}
-	ctrlName := parts[0]
+	ctrlName := matches[1]
 
 	// Read subsysnqn from controller
 	// /sys/class/nvme/nvme0/subsysnqn

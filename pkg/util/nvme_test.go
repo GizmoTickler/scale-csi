@@ -9,6 +9,167 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestNVMeDeviceRegex tests that the NVMe device regex correctly extracts controller names.
+// This is a regression test for the bug where strings.Split(deviceName, "n") was used,
+// which incorrectly split on the "n" in "nvme" instead of the "n" before the namespace number.
+// The bug would produce an empty string for parts[0] instead of the controller name.
+func TestNVMeDeviceRegex(t *testing.T) {
+	testCases := []struct {
+		name           string
+		deviceName     string
+		wantController string
+		wantMatch      bool
+	}{
+		// Basic cases
+		{
+			name:           "nvme0n1 extracts nvme0",
+			deviceName:     "nvme0n1",
+			wantController: "nvme0",
+			wantMatch:      true,
+		},
+		{
+			name:           "nvme1n2 extracts nvme1",
+			deviceName:     "nvme1n2",
+			wantController: "nvme1",
+			wantMatch:      true,
+		},
+		// Multi-digit controller numbers
+		{
+			name:           "nvme10n1 extracts nvme10",
+			deviceName:     "nvme10n1",
+			wantController: "nvme10",
+			wantMatch:      true,
+		},
+		{
+			name:           "nvme99n5 extracts nvme99",
+			deviceName:     "nvme99n5",
+			wantController: "nvme99",
+			wantMatch:      true,
+		},
+		// Multi-digit namespace numbers
+		{
+			name:           "nvme0n10 extracts nvme0",
+			deviceName:     "nvme0n10",
+			wantController: "nvme0",
+			wantMatch:      true,
+		},
+		{
+			name:           "nvme5n99 extracts nvme5",
+			deviceName:     "nvme5n99",
+			wantController: "nvme5",
+			wantMatch:      true,
+		},
+		// Invalid inputs that should not match
+		{
+			name:           "nvme0 (controller only) does not match",
+			deviceName:     "nvme0",
+			wantController: "",
+			wantMatch:      false,
+		},
+		{
+			name:           "sda does not match",
+			deviceName:     "sda",
+			wantController: "",
+			wantMatch:      false,
+		},
+		{
+			name:           "nvme does not match",
+			deviceName:     "nvme",
+			wantController: "",
+			wantMatch:      false,
+		},
+		{
+			name:           "nvmen1 does not match (missing controller number)",
+			deviceName:     "nvmen1",
+			wantController: "",
+			wantMatch:      false,
+		},
+		{
+			name:           "empty string does not match",
+			deviceName:     "",
+			wantController: "",
+			wantMatch:      false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			matches := nvmeDeviceRegex.FindStringSubmatch(tc.deviceName)
+
+			if tc.wantMatch {
+				// Should match and extract controller name
+				assert.Len(t, matches, 2, "Expected 2 matches (full match + controller capture)")
+				assert.Equal(t, tc.wantController, matches[1], "Controller name mismatch")
+			} else {
+				// Should not match
+				assert.Empty(t, matches, "Expected no match for invalid input")
+			}
+		})
+	}
+}
+
+// TestNVMeDeviceRegexVsBuggyImplementation demonstrates the bug that was fixed.
+// The old implementation used: strings.Split(deviceName, "n")
+// This test shows that the old approach would produce wrong results.
+func TestNVMeDeviceRegexVsBuggyImplementation(t *testing.T) {
+	// Demonstrate what the buggy implementation would have done
+	buggyExtract := func(deviceName string) string {
+		// This was the buggy implementation
+		parts := splitString(deviceName, "n")
+		if len(parts) >= 2 {
+			return parts[0]
+		}
+		return ""
+	}
+
+	testCases := []struct {
+		deviceName     string
+		buggyResult    string // What the buggy code would produce
+		expectedResult string // What we actually want
+	}{
+		{"nvme0n1", "", "nvme0"},       // BUG: splits at first "n", producing empty string
+		{"nvme1n2", "", "nvme1"},       // BUG: same issue
+		{"nvme10n1", "", "nvme10"},     // BUG: same issue
+		{"nvme0n10", "", "nvme0"},      // BUG: same issue
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.deviceName, func(t *testing.T) {
+			// Verify buggy result (showing the bug)
+			actualBuggy := buggyExtract(tc.deviceName)
+			assert.Equal(t, tc.buggyResult, actualBuggy,
+				"Buggy implementation should produce empty string due to incorrect split")
+
+			// Verify fixed result using regex
+			matches := nvmeDeviceRegex.FindStringSubmatch(tc.deviceName)
+			assert.Len(t, matches, 2)
+			assert.Equal(t, tc.expectedResult, matches[1],
+				"Fixed implementation should correctly extract controller name")
+		})
+	}
+}
+
+// splitString is a helper that replicates strings.Split behavior for test demonstration
+func splitString(s, sep string) []string {
+	var result []string
+	for {
+		idx := -1
+		for i := range s {
+			if i+len(sep) <= len(s) && s[i:i+len(sep)] == sep {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			result = append(result, s)
+			break
+		}
+		result = append(result, s[:idx])
+		s = s[idx+len(sep):]
+	}
+	return result
+}
+
 func TestWaitForNVMeDevice(t *testing.T) {
 	// Save original function and restore after test
 	originalFind := findNVMeDevice
