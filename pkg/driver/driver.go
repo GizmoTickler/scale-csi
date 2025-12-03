@@ -130,6 +130,16 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		return nil, fmt.Errorf("failed to create TrueNAS client: %w", err)
 	}
 
+	// Configure utility package timeouts and rate limiting
+	util.SetConfig(&util.UtilConfig{
+		MountTimeout:           time.Duration(cfg.Config.CommandTimeouts.Mount) * time.Second,
+		FormatTimeout:          time.Duration(cfg.Config.CommandTimeouts.Format) * time.Second,
+		ISCSITimeout:           time.Duration(cfg.Config.CommandTimeouts.ISCSI) * time.Second,
+		NVMeTimeout:            time.Duration(cfg.Config.CommandTimeouts.NVMe) * time.Second,
+		DiscoveryCacheDuration: time.Duration(cfg.Config.Resilience.RateLimiting.DiscoveryCacheDuration) * time.Second,
+		MaxConcurrentLogins:    cfg.Config.Resilience.RateLimiting.MaxConcurrentLogins,
+	})
+
 	// Initialize event recorder (will be nil if not running in k8s)
 	eventRecorder := NewEventRecorder(cfg.Name)
 

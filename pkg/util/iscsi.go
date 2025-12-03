@@ -31,8 +31,8 @@ func getPortalMutex(portal string) *sync.Mutex {
 // Key is portal, value is timestamp of last successful discovery.
 var discoveryCache sync.Map // map[portal]time.Time
 
-// discoveryValidDuration is how long a cached discovery is considered valid.
-const discoveryValidDuration = 30 * time.Second
+// Note: getDiscoveryCacheDuration() is now configurable via SetConfig().DiscoveryCacheDuration
+// Default: 30s
 
 // maxDiscoveryRetries is the maximum number of discovery retries when a target is not found.
 // This handles the case where TrueNAS takes time to propagate new targets to the iSCSI daemon.
@@ -45,8 +45,8 @@ const initialDiscoveryRetryDelay = 2 * time.Second
 // maxDiscoveryRetryDelay caps the exponential backoff.
 const maxDiscoveryRetryDelay = 10 * time.Second
 
-// iscsiCommandTimeout is the timeout for iscsiadm commands to prevent hangs.
-const iscsiCommandTimeout = 10 * time.Second
+// Note: getISCSITimeout() is now configurable via SetConfig().ISCSITimeout
+// Default: 10s
 
 // invalidateDiscoveryCache removes the cached discovery for a portal.
 // This should be called when a login fails due to "target not found" to force
@@ -71,9 +71,8 @@ func isTargetNotFoundError(err error) bool {
 		strings.Contains(errStr, "does not exist")
 }
 
-// maxConcurrentLogins limits the number of concurrent iSCSI logins per portal.
-// TrueNAS iSCSI service can handle a few concurrent logins but gets slow with many.
-const maxConcurrentLogins = 2
+// Note: getMaxConcurrentLogins() is now configurable via SetConfig().MaxConcurrentLogins
+// Default: 2
 
 // portalLoginSemaphore limits concurrent logins per portal.
 var portalLoginSemaphore sync.Map // map[portal]chan struct{}
@@ -233,7 +232,7 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 	retryCfg := DisconnectRetryConfig()
 
 	err := RetryWithBackoff(ctx, "iSCSI logout "+iqn, retryCfg, func() error {
-		cmdCtx, cancel := context.WithTimeout(ctx, iscsiCommandTimeout)
+		cmdCtx, cancel := context.WithTimeout(ctx, getISCSITimeout())
 		defer cancel()
 
 		// Logout from target
@@ -257,7 +256,7 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 	}
 
 	// Delete the node record (best effort, no retry needed)
-	cmdCtx, cancel := context.WithTimeout(ctx, iscsiCommandTimeout)
+	cmdCtx, cancel := context.WithTimeout(ctx, getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-o", "delete")
@@ -276,7 +275,7 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 func iscsiDiscoverySerialized(ctx context.Context, portal string) error {
 	// Check cache first (outside of mutex for fast path)
 	if lastDiscovery, ok := discoveryCache.Load(portal); ok {
-		if time.Since(lastDiscovery.(time.Time)) < discoveryValidDuration {
+		if time.Since(lastDiscovery.(time.Time)) < getDiscoveryCacheDuration() {
 			klog.V(4).Infof("Using cached discovery for portal %s (age: %v)", portal, time.Since(lastDiscovery.(time.Time)))
 			return nil
 		}
@@ -289,7 +288,7 @@ func iscsiDiscoverySerialized(ctx context.Context, portal string) error {
 
 	// Check cache again after acquiring lock (another goroutine may have done discovery)
 	if lastDiscovery, ok := discoveryCache.Load(portal); ok {
-		if time.Since(lastDiscovery.(time.Time)) < discoveryValidDuration {
+		if time.Since(lastDiscovery.(time.Time)) < getDiscoveryCacheDuration() {
 			klog.V(4).Infof("Using cached discovery for portal %s after lock (age: %v)", portal, time.Since(lastDiscovery.(time.Time)))
 			return nil
 		}
@@ -309,7 +308,7 @@ func iscsiDiscoverySerialized(ctx context.Context, portal string) error {
 // iscsiDiscovery performs iSCSI discovery on the target portal.
 func iscsiDiscovery(ctx context.Context, portal string) error {
 	// Add timeout to prevent hangs on unreachable portals
-	ctx, cancel := context.WithTimeout(ctx, iscsiCommandTimeout)
+	ctx, cancel := context.WithTimeout(ctx, getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", portal)
@@ -323,15 +322,15 @@ func iscsiDiscovery(ctx context.Context, portal string) error {
 
 // getLoginSemaphore returns a semaphore for the given portal, creating one if needed.
 func getLoginSemaphore(portal string) chan struct{} {
-	sem, _ := portalLoginSemaphore.LoadOrStore(portal, make(chan struct{}, maxConcurrentLogins))
+	sem, _ := portalLoginSemaphore.LoadOrStore(portal, make(chan struct{}, getMaxConcurrentLogins()))
 	return sem.(chan struct{})
 }
 
 // iscsiLoginSerialized performs iSCSI login with limited concurrency.
-// Allows up to maxConcurrentLogins (2) concurrent logins per portal to prevent
+// Allows up to getMaxConcurrentLogins() (2) concurrent logins per portal to prevent
 // overwhelming TrueNAS while still allowing some parallelism.
 func iscsiLoginSerialized(ctx context.Context, portal, iqn string) error {
-	// Acquire semaphore slot (blocks if maxConcurrentLogins already in progress)
+	// Acquire semaphore slot (blocks if getMaxConcurrentLogins() already in progress)
 	sem := getLoginSemaphore(portal)
 	sem <- struct{}{}
 	defer func() { <-sem }()
@@ -356,7 +355,7 @@ func iscsiLogin(ctx context.Context, portal, iqn string) error {
 
 	// Login to target
 	// Add timeout to prevent hangs on unreachable portals
-	ctx, cancel := context.WithTimeout(ctx, iscsiCommandTimeout)
+	ctx, cancel := context.WithTimeout(ctx, getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--login")
@@ -375,7 +374,7 @@ func iscsiLogin(ctx context.Context, portal, iqn string) error {
 
 // getISCSISessions returns the list of active iSCSI sessions.
 func getISCSISessions() ([]ISCSISession, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session")
@@ -528,7 +527,7 @@ func GetISCSIDevicePath(iqn string, lun int) (string, error) {
 
 // ISCSIRescanSession rescans an iSCSI session to detect new LUNs.
 func ISCSIRescanSession(portal, iqn string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--rescan")
@@ -541,7 +540,7 @@ func ISCSIRescanSession(portal, iqn string) error {
 
 // ISCSIGetSessionStats returns session statistics for an iSCSI target.
 func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session", "-s")
@@ -580,7 +579,7 @@ func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 
 // SetISCSINodeParam sets a parameter on an iSCSI node.
 func SetISCSINodeParam(portal, iqn, name, value string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal,
@@ -653,7 +652,7 @@ func GetDeviceSize(devicePath string) (int64, error) {
 
 // FlushDeviceBuffers flushes buffers for a block device.
 func FlushDeviceBuffers(devicePath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), iscsiCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "blockdev", "--flushbufs", devicePath)

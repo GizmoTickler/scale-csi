@@ -8,16 +8,9 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
-	"time"
 
 	"k8s.io/klog/v2"
 )
-
-// mountCommandTimeout is the default timeout for mount-related commands.
-const mountCommandTimeout = 30 * time.Second
-
-// formatCommandTimeout is a longer timeout for formatting operations which can take time on large devices.
-const formatCommandTimeout = 5 * time.Minute
 
 // FilesystemStats holds filesystem statistics.
 type FilesystemStats struct {
@@ -36,7 +29,7 @@ func IsMounted(path string) (bool, error) {
 		return false, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
 	// Use findmnt to check mount status
@@ -57,7 +50,7 @@ func IsMounted(path string) (bool, error) {
 func Mount(source, target, fsType string, options []string) error {
 	klog.V(4).Infof("Mounting %s to %s (fsType=%s, options=%v)", source, target, fsType, options)
 
-	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
 	args := []string{}
@@ -91,7 +84,7 @@ func MountNFS(source, target string, options []string) error {
 func BindMount(source, target string, options []string) error {
 	klog.V(4).Infof("Bind mounting %s to %s", source, target)
 
-	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
 	// Use "-o bind" instead of "--bind" for BusyBox compatibility
@@ -131,7 +124,7 @@ func UnmountWithContext(ctx context.Context, target string) error {
 	retryCfg := UnmountRetryConfig()
 
 	return RetryWithBackoff(ctx, "unmount "+target, retryCfg, func() error {
-		cmdCtx, cancel := context.WithTimeout(ctx, mountCommandTimeout)
+		cmdCtx, cancel := context.WithTimeout(ctx, getMountTimeout())
 		defer cancel()
 
 		cmd := exec.CommandContext(cmdCtx, "umount", target)
@@ -183,7 +176,7 @@ func FormatAndMount(devicePath, target, fsType string, options []string) error {
 func FormatDevice(devicePath, fsType string) error {
 	klog.Infof("Formatting device %s with %s", devicePath, fsType)
 
-	ctx, cancel := context.WithTimeout(context.Background(), formatCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getFormatTimeout())
 	defer cancel()
 
 	var cmd *exec.Cmd
@@ -210,7 +203,7 @@ func FormatDevice(devicePath, fsType string) error {
 
 // GetFilesystemType returns the filesystem type of a device.
 func GetFilesystemType(devicePath string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "TYPE", devicePath)
@@ -257,7 +250,7 @@ func ResizeFilesystem(mountPath string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), formatCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getFormatTimeout())
 	defer cancel()
 
 	// Resize based on filesystem type
@@ -283,7 +276,7 @@ func ResizeFilesystem(mountPath string) error {
 
 // GetDeviceFromMountPoint returns the device path for a mount point.
 func GetDeviceFromMountPoint(mountPath string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-o", "SOURCE", mountPath)
@@ -298,7 +291,7 @@ func GetDeviceFromMountPoint(mountPath string) (string, error) {
 // The keys are device paths (e.g., "/dev/sda1"), values are mount points.
 // This is used by session GC to determine which iSCSI/NVMe devices are in use.
 func GetMountedBlockDevices() (map[string]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), mountCommandTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
 	// Use findmnt to list all block device mounts
