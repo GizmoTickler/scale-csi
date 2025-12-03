@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
 ######################
 # Runtime image
 ######################
-FROM alpine:3.22
+FROM alpine:3.23
 
 LABEL org.opencontainers.image.source="https://github.com/GizmoTickler/scale-csi"
 LABEL org.opencontainers.image.url="https://github.com/GizmoTickler/scale-csi"
