@@ -79,5 +79,10 @@ type ClientInterface interface {
 	NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*NVMeoFNamespace, error)
 	NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error)
+	NVMeoFPortCreate(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error)
+	NVMeoFPortFindByAddress(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error)
+	NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) error
+	NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error)
+	NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error)
 	NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error)
 }

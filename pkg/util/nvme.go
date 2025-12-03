@@ -286,24 +286,35 @@ var findNVMeDevice = func(nqn string) (string, error) {
 		}
 
 		// Found the subsystem, now find the namespace device
-		// Look for nvmeXnY devices
-		nvmeDevices, err := filepath.Glob(filepath.Join(subsysDir, "nvme*/nvme*n*"))
-		if err != nil {
-			continue
+		// First try: Look for nvmeXnY devices directly in the subsystem dir
+		// This handles TCP/RDMA NVMe-oF where devices appear as nvme2n1 directly
+		directDevices, _ := filepath.Glob(filepath.Join(subsysDir, "nvme*n*"))
+		for _, devPath := range directDevices {
+			deviceName := filepath.Base(devPath)
+			// Filter out controllers (nvme0) and only match namespaces (nvme0n1)
+			if nvmeDeviceRegex.MatchString(deviceName) {
+				devicePath := "/dev/" + deviceName
+				if _, err := os.Stat(devicePath); err == nil {
+					return devicePath, nil
+				}
+			}
 		}
 
-		if len(nvmeDevices) > 0 {
-			// Get the device name
-			deviceName := filepath.Base(nvmeDevices[0])
-			devicePath := "/dev/" + deviceName
-			if _, err := os.Stat(devicePath); err == nil {
-				return devicePath, nil
+		// Second try: Look for nvmeXnY devices under controller subdirs (for PCIe NVMe)
+		nvmeDevices, _ := filepath.Glob(filepath.Join(subsysDir, "nvme*/nvme*n*"))
+		for _, devPath := range nvmeDevices {
+			deviceName := filepath.Base(devPath)
+			if nvmeDeviceRegex.MatchString(deviceName) {
+				devicePath := "/dev/" + deviceName
+				if _, err := os.Stat(devicePath); err == nil {
+					return devicePath, nil
+				}
 			}
 		}
 	}
 
-	// Alternative: use nvme list
-	return findNVMeDeviceFromList(nqn)
+	// Alternative: use nvme list-subsys to derive device from controller name
+	return findNVMeDeviceFromListSubsys(nqn)
 }
 
 // findNVMeDeviceFromList finds NVMe device using nvme list command.
@@ -330,6 +341,53 @@ func findNVMeDeviceFromList(nqn string) (string, error) {
 	for _, device := range result.Devices {
 		if device.SubsystemNQN == nqn {
 			return device.DevicePath, nil
+		}
+	}
+
+	return "", fmt.Errorf("device not found for nqn=%s", nqn)
+}
+
+// findNVMeDeviceFromListSubsys finds NVMe device using nvme list-subsys command.
+// This is more reliable for NVMe-oF as it provides the NQN directly.
+func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "nvme", "list-subsys", "-o", "json")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("nvme list-subsys failed: %v", err)
+	}
+
+	// Parse the JSON output - can be array or object with Subsystems
+	var subsystems []NVMeSubsystem
+
+	// Try parsing as array first (nvme-cli 2.x format)
+	var hosts []struct {
+		Subsystems []NVMeSubsystem `json:"Subsystems"`
+	}
+	if err := json.Unmarshal(output, &hosts); err == nil && len(hosts) > 0 {
+		subsystems = hosts[0].Subsystems
+	} else {
+		// Try direct array format
+		if err := json.Unmarshal(output, &subsystems); err != nil {
+			return "", fmt.Errorf("failed to parse nvme list-subsys: %v", err)
+		}
+	}
+
+	for _, subsys := range subsystems {
+		if subsys.NQN == nqn {
+			// Found the subsystem, derive device path from controller name
+			// Paths[].Name gives us the controller (e.g., "nvme2")
+			// The device is controller + "n1" (e.g., "/dev/nvme2n1")
+			for _, path := range subsys.Paths {
+				if path.Name != "" {
+					devicePath := "/dev/" + path.Name + "n1"
+					if _, err := os.Stat(devicePath); err == nil {
+						return devicePath, nil
+					}
+				}
+			}
 		}
 	}
 

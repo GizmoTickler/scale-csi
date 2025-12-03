@@ -267,6 +267,101 @@ func (c *Client) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	return ports, nil
 }
 
+// NVMeoFPortCreate creates a new NVMe-oF port.
+// Updated for TrueNAS SCALE 25.10+: uses addr_trtype, addr_traddr, addr_trsvcid.
+// Note: addr_adrfam is auto-detected by TrueNAS and should not be passed on create.
+func (c *Client) NVMeoFPortCreate(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+	params := map[string]interface{}{
+		"addr_trtype":  strings.ToUpper(transport),
+		"addr_traddr":  address,
+		"addr_trsvcid": port,
+	}
+
+	result, err := c.Call(ctx, "nvmet.port.create", params)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			return c.NVMeoFPortFindByAddress(ctx, transport, address, port)
+		}
+		return nil, fmt.Errorf("failed to create NVMe-oF port: %w", err)
+	}
+
+	return parseNVMeoFPort(result)
+}
+
+// NVMeoFPortFindByAddress finds an NVMe-oF port by transport, address, and port.
+func (c *Client) NVMeoFPortFindByAddress(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+	filters := [][]interface{}{
+		{"addr_trtype", "=", strings.ToUpper(transport)},
+		{"addr_traddr", "=", address},
+		{"addr_trsvcid", "=", port},
+	}
+	result, err := c.Call(ctx, "nvmet.port.query", filters, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query NVMe-oF ports: %w", err)
+	}
+
+	ports, ok := result.([]interface{})
+	if !ok || len(ports) == 0 {
+		return nil, nil
+	}
+
+	return parseNVMeoFPort(ports[0])
+}
+
+// NVMeoFPortSubsysCreate creates an association between a port and a subsystem.
+// This makes the subsystem accessible on that port.
+// Updated for TrueNAS SCALE 25.10+: uses nvmet.port_subsys.create API.
+func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) error {
+	params := map[string]interface{}{
+		"port_id":   portID,
+		"subsys_id": subsysID,
+	}
+
+	_, err := c.Call(ctx, "nvmet.port_subsys.create", params)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			return nil // Association already exists, that's fine
+		}
+		return fmt.Errorf("failed to create port-subsystem association: %w", err)
+	}
+
+	return nil
+}
+
+// NVMeoFPortSubsysFindBySubsystem checks if a subsystem is already associated with any port.
+func (c *Client) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
+	filters := [][]interface{}{
+		{"subsys.id", "=", subsysID},
+	}
+	result, err := c.Call(ctx, "nvmet.port_subsys.query", filters, map[string]interface{}{})
+	if err != nil {
+		return false, fmt.Errorf("failed to query port-subsystem associations: %w", err)
+	}
+
+	assocs, ok := result.([]interface{})
+	if !ok {
+		return false, nil
+	}
+
+	return len(assocs) > 0, nil
+}
+
+// NVMeoFGetOrCreatePort finds an existing port or creates a new one.
+// This is a convenience function for the CSI driver.
+func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+	// Try to find existing port first
+	existingPort, err := c.NVMeoFPortFindByAddress(ctx, transport, address, port)
+	if err != nil {
+		return nil, err
+	}
+	if existingPort != nil {
+		return existingPort, nil
+	}
+
+	// Create new port (addr_adrfam is auto-detected by TrueNAS)
+	return c.NVMeoFPortCreate(ctx, transport, address, port)
+}
+
 // NVMeoFGetTransportAddresses gets available transport addresses for a transport type.
 // Updated for TrueNAS SCALE 25.10+: expects array parameter with uppercase transport type.
 // Returns a map of address -> address (for compatibility, we return just the keys as a slice).

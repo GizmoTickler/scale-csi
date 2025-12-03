@@ -631,7 +631,22 @@ func (m *MockClient) NVMeoFNamespaceFindByDevicePath(ctx context.Context, device
 	return nil, nil
 }
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
-	return []*NVMeoFPort{{ID: 1, Transport: "tcp", Address: "0.0.0.0", Port: 4420}}, nil
+	return []*NVMeoFPort{{ID: 1, Transport: "TCP", Address: "0.0.0.0", Port: 4420}}, nil
+}
+func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
+}
+func (m *MockClient) NVMeoFPortFindByAddress(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
+}
+func (m *MockClient) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) error {
+	return nil
+}
+func (m *MockClient) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
+	return true, nil
+}
+func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
 func (m *MockClient) NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error) {
 	return []string{"0.0.0.0"}, nil

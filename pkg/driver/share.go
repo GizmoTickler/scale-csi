@@ -516,6 +516,25 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName string, volu
 		return status.Errorf(codes.Internal, "failed to store NVMe-oF namespace ID: %v", err)
 	}
 
+	// Get or create the NVMe-oF TCP port and associate subsystem with it
+	// TrueNAS 25.10+: Subsystems must be associated with a port to be accessible over the network
+	port, err := d.truenasClient.NVMeoFGetOrCreatePort(
+		ctx,
+		d.config.NVMeoF.Transport,
+		d.config.NVMeoF.TransportAddress,
+		d.config.NVMeoF.TransportServiceID,
+	)
+	if err != nil {
+		klog.Warningf("Failed to get/create NVMe-oF port (subsystem may not be accessible): %v", err)
+	} else {
+		// Associate subsystem with port
+		if err := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsys.ID); err != nil {
+			klog.Warningf("Failed to associate subsystem with port (subsystem may not be accessible): %v", err)
+		} else {
+			klog.V(4).Infof("Associated NVMe-oF subsystem %d with port %d", subsys.ID, port.ID)
+		}
+	}
+
 	klog.Infof("Created NVMe-oF subsystem=%d, namespace=%d for %s", subsys.ID, namespace.ID, datasetName)
 	return nil
 }
