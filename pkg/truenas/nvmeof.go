@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 )
 
@@ -348,9 +349,17 @@ func (c *Client) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID i
 
 // NVMeoFGetOrCreatePort finds an existing port or creates a new one.
 // This is a convenience function for the CSI driver.
+// If address is a hostname, it will be resolved to an IP address since
+// TrueNAS API requires IP addresses for addr_traddr.
 func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+	// Resolve hostname to IP if needed (TrueNAS API requires IP addresses)
+	resolvedAddr, err := resolveToIP(address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve address %q: %w", address, err)
+	}
+
 	// Try to find existing port first
-	existingPort, err := c.NVMeoFPortFindByAddress(ctx, transport, address, port)
+	existingPort, err := c.NVMeoFPortFindByAddress(ctx, transport, resolvedAddr, port)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +368,35 @@ func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport string, ad
 	}
 
 	// Create new port (addr_adrfam is auto-detected by TrueNAS)
-	return c.NVMeoFPortCreate(ctx, transport, address, port)
+	return c.NVMeoFPortCreate(ctx, transport, resolvedAddr, port)
+}
+
+// resolveToIP resolves a hostname to an IP address.
+// If the input is already an IP address, it is returned as-is.
+func resolveToIP(address string) (string, error) {
+	// Check if it's already an IP address
+	if ip := net.ParseIP(address); ip != nil {
+		return address, nil
+	}
+
+	// Resolve hostname
+	ips, err := net.LookupIP(address)
+	if err != nil {
+		return "", err
+	}
+	if len(ips) == 0 {
+		return "", fmt.Errorf("no IP addresses found for %s", address)
+	}
+
+	// Prefer IPv4 addresses
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String(), nil
+		}
+	}
+
+	// Fall back to first address (IPv6)
+	return ips[0].String(), nil
 }
 
 // NVMeoFGetTransportAddresses gets available transport addresses for a transport type.
