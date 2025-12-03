@@ -83,6 +83,8 @@ func main() {
 		cmdSnapshots(ctx, client)
 	case "test-errors":
 		cmdTestErrors(ctx, client)
+	case "nvmeof-audit":
+		cmdNVMeoFAudit(ctx, client)
 	default:
 		fmt.Printf("Unknown command: %s\n", *command)
 		printHelp()
@@ -472,5 +474,133 @@ func cmdTestErrors(ctx context.Context, client *truenas.Client) {
 			msg = msg[:30] + "..."
 		}
 		fmt.Printf("%-40s %-10s %s\n", r.name, code, msg)
+	}
+}
+
+func cmdNVMeoFAudit(ctx context.Context, client *truenas.Client) {
+	fmt.Println("=== NVMe-oF Audit ===")
+	fmt.Println()
+
+	// Get subsystems
+	fmt.Println("Fetching subsystems...")
+	subsysResult, err := client.Call(ctx, "nvmet.subsys.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		fmt.Printf("Error fetching subsystems: %v\n", err)
+		os.Exit(1)
+	}
+	subsystems, _ := subsysResult.([]interface{})
+	fmt.Printf("  Found %d subsystems\n", len(subsystems))
+
+	// Get namespaces
+	fmt.Println("Fetching namespaces...")
+	nsResult, err := client.Call(ctx, "nvmet.namespace.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		fmt.Printf("Error fetching namespaces: %v\n", err)
+		os.Exit(1)
+	}
+	namespaces, _ := nsResult.([]interface{})
+	fmt.Printf("  Found %d namespaces\n", len(namespaces))
+
+	// Get ports
+	fmt.Println("Fetching ports...")
+	portsResult, err := client.Call(ctx, "nvmet.port.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		fmt.Printf("Error fetching ports: %v\n", err)
+		os.Exit(1)
+	}
+	ports, _ := portsResult.([]interface{})
+	fmt.Printf("  Found %d ports\n", len(ports))
+
+	// Get port-subsystem associations
+	fmt.Println("Fetching port-subsystem associations...")
+	portSubsysResult, err := client.Call(ctx, "nvmet.port_subsys.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		fmt.Printf("Error fetching port-subsystem associations: %v\n", err)
+		os.Exit(1)
+	}
+	portSubsys, _ := portSubsysResult.([]interface{})
+	fmt.Printf("  Found %d port-subsystem associations\n", len(portSubsys))
+
+	fmt.Println()
+
+	// Print ports
+	fmt.Println("=== Ports ===")
+	for _, p := range ports {
+		if m, ok := p.(map[string]interface{}); ok {
+			fmt.Printf("  Port ID: %.0f\n", m["id"])
+			fmt.Printf("    Transport: %v\n", m["addr_trtype"])
+			fmt.Printf("    Address: %v\n", m["addr_traddr"])
+			fmt.Printf("    Port: %v\n", m["addr_trsvcid"])
+			if subs, ok := m["subsystems"].([]interface{}); ok {
+				fmt.Printf("    Subsystems: %v\n", subs)
+			}
+			fmt.Println()
+		}
+	}
+
+	// Print port-subsystem associations
+	fmt.Println("=== Port-Subsystem Associations ===")
+	for _, ps := range portSubsys {
+		if m, ok := ps.(map[string]interface{}); ok {
+			portID := "?"
+			subsysID := "?"
+			subsysNQN := "?"
+			if port, ok := m["port"].(map[string]interface{}); ok {
+				if id, ok := port["id"].(float64); ok {
+					portID = fmt.Sprintf("%.0f", id)
+				}
+			}
+			if subsys, ok := m["subsys"].(map[string]interface{}); ok {
+				if id, ok := subsys["id"].(float64); ok {
+					subsysID = fmt.Sprintf("%.0f", id)
+				}
+				if nqn, ok := subsys["subnqn"].(string); ok {
+					subsysNQN = nqn
+				}
+			}
+			fmt.Printf("  Port %s <-> Subsystem %s (%s)\n", portID, subsysID, subsysNQN)
+		}
+	}
+
+	// Build maps for orphan detection
+	subsysIDs := make(map[float64]string) // id -> nqn
+	subsysHasPort := make(map[float64]bool)
+
+	for _, s := range subsystems {
+		if m, ok := s.(map[string]interface{}); ok {
+			if id, ok := m["id"].(float64); ok {
+				nqn := ""
+				if n, ok := m["subnqn"].(string); ok {
+					nqn = n
+				}
+				subsysIDs[id] = nqn
+			}
+		}
+	}
+
+	for _, ps := range portSubsys {
+		if m, ok := ps.(map[string]interface{}); ok {
+			if subsys, ok := m["subsys"].(map[string]interface{}); ok {
+				if id, ok := subsys["id"].(float64); ok {
+					subsysHasPort[id] = true
+				}
+			}
+		}
+	}
+
+	// Find orphaned subsystems (no port association)
+	fmt.Println()
+	fmt.Println("=== Subsystems Without Port Associations ===")
+	orphanCount := 0
+	for id, nqn := range subsysIDs {
+		if !subsysHasPort[id] {
+			fmt.Printf("  Subsystem %.0f: %s\n", id, nqn)
+			orphanCount++
+		}
+	}
+	if orphanCount == 0 {
+		fmt.Println("  None - all subsystems have port associations")
+	} else {
+		fmt.Printf("\n  WARNING: %d subsystems are not accessible (no port association)\n", orphanCount)
 	}
 }

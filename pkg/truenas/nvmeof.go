@@ -351,6 +351,9 @@ func (c *Client) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID i
 // This is a convenience function for the CSI driver.
 // If address is a hostname, it will be resolved to an IP address since
 // TrueNAS API requires IP addresses for addr_traddr.
+//
+// Important: If a wildcard port (0.0.0.0) exists on the same service port,
+// it will be reused since it binds to all interfaces and catches all traffic.
 func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
 	// Resolve hostname to IP if needed (TrueNAS API requires IP addresses)
 	resolvedAddr, err := resolveToIP(address)
@@ -358,13 +361,26 @@ func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport string, ad
 		return nil, fmt.Errorf("failed to resolve address %q: %w", address, err)
 	}
 
-	// Try to find existing port first
+	// Try to find existing port with exact address first
 	existingPort, err := c.NVMeoFPortFindByAddress(ctx, transport, resolvedAddr, port)
 	if err != nil {
 		return nil, err
 	}
 	if existingPort != nil {
 		return existingPort, nil
+	}
+
+	// Check for a wildcard (0.0.0.0) port on the same service port.
+	// A wildcard port binds to ALL interfaces, so traffic to any IP will hit it.
+	// We must reuse it rather than creating a new specific IP port.
+	if resolvedAddr != "0.0.0.0" {
+		wildcardPort, err := c.NVMeoFPortFindByAddress(ctx, transport, "0.0.0.0", port)
+		if err != nil {
+			return nil, err
+		}
+		if wildcardPort != nil {
+			return wildcardPort, nil
+		}
 	}
 
 	// Create new port (addr_adrfam is auto-detected by TrueNAS)
