@@ -85,3 +85,32 @@ Located in `charts/scale-csi/`. Key templates:
 - `node-daemonset.yaml`: CSI node plugin with privileged access
 - `configmap.yaml`: Driver configuration
 - `secret.yaml`: TrueNAS API key
+
+## GitHub Releases
+
+When creating a new release, always write comprehensive release notes. Never leave a release with just the auto-generated changelog link. Include:
+
+1. **Title**: Version number with brief description (e.g., "v1.0.20: Topology Auto-Detection")
+2. **Summary**: What changed and why it matters
+3. **Problem/Fix** (for bug fixes): Describe the issue and how it was resolved
+4. **Changes**: Specific implementation details
+5. **Upgrade Notes**: Breaking changes or behavior differences users should know
+6. **Full Changelog**: Link to commit comparison at the end
+
+Example format:
+```markdown
+## Summary
+Brief description of the release focus.
+
+## Problem (if bug fix)
+Description of the issue that was occurring.
+
+## Fix/Changes
+- Specific change 1
+- Specific change 2
+
+## Upgrade Notes
+Any important notes for users upgrading to this version.
+
+**Full Changelog**: https://github.com/GizmoTickler/scale-csi/compare/v1.0.x...v1.0.y
+```
