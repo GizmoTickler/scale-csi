@@ -430,6 +430,10 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Node.SessionCleanupDelay = 500 // 500ms default
 	}
 
+	// Note: Topology is auto-detected from Kubernetes node labels during driver initialization
+	// See NewDriver() in driver.go which calls GetNodeTopology()
+	// Manual config via node.topology.zone/region is still supported and takes precedence
+
 	// Resilience defaults - Circuit Breaker
 	if cfg.Resilience.CircuitBreaker.FailureThreshold == 0 {
 		cfg.Resilience.CircuitBreaker.FailureThreshold = 5

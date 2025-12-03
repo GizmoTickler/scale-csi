@@ -143,6 +143,21 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 	// Initialize event recorder (will be nil if not running in k8s)
 	eventRecorder := NewEventRecorder(cfg.Name)
 
+	// Auto-detect topology from node labels when running in node mode
+	// This only runs if topology is not already explicitly configured
+	if cfg.RunNode && !cfg.Config.Node.Topology.Enabled {
+		topology := GetNodeTopology(cfg.NodeID)
+		if topology.Zone != "" {
+			cfg.Config.Node.Topology.Zone = topology.Zone
+		}
+		if topology.Region != "" {
+			cfg.Config.Node.Topology.Region = topology.Region
+		}
+		if topology.Zone != "" || topology.Region != "" {
+			cfg.Config.Node.Topology.Enabled = true
+		}
+	}
+
 	// Initialize service reload debouncer for iSCSI
 	debounceDelay := time.Duration(cfg.Config.ISCSI.ServiceReloadDebounce) * time.Millisecond
 	serviceDebouncer := NewServiceReloadDebouncer(debounceDelay, func(ctx context.Context, service string) error {

@@ -1,9 +1,12 @@
 package driver
 
 import (
+	"context"
 	"os"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -142,4 +145,50 @@ func NodeRef(name string) *corev1.ObjectReference {
 		Name:       name,
 		APIVersion: "v1",
 	}
+}
+
+// NodeTopology holds topology information for a node
+type NodeTopology struct {
+	Zone   string
+	Region string
+}
+
+// GetNodeTopology fetches topology labels from a Kubernetes node
+// Returns empty topology if not running in-cluster or on error
+func GetNodeTopology(nodeName string) *NodeTopology {
+	if nodeName == "" {
+		return &NodeTopology{}
+	}
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		klog.V(4).Infof("Not running in Kubernetes cluster, topology auto-detection disabled: %v", err)
+		return &NodeTopology{}
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		klog.Warningf("Failed to create Kubernetes clientset for topology detection: %v", err)
+		return &NodeTopology{}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		klog.Warningf("Failed to get node %s for topology detection: %v", nodeName, err)
+		return &NodeTopology{}
+	}
+
+	topology := &NodeTopology{
+		Zone:   node.Labels["topology.kubernetes.io/zone"],
+		Region: node.Labels["topology.kubernetes.io/region"],
+	}
+
+	if topology.Zone != "" || topology.Region != "" {
+		klog.Infof("Auto-detected node topology: zone=%q, region=%q", topology.Zone, topology.Region)
+	}
+
+	return topology
 }
