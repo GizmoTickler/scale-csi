@@ -62,6 +62,7 @@ type ClientInterface interface {
 	ISCSIExtentFindByDisk(ctx context.Context, diskPath string) (*ISCSIExtent, error)
 	ISCSITargetExtentCreate(ctx context.Context, targetID int, extentID int, lunID int) (*ISCSITargetExtent, error)
 	ISCSITargetExtentDelete(ctx context.Context, id int, force bool) error
+	ISCSITargetExtentGet(ctx context.Context, id int) (*ISCSITargetExtent, error)
 	ISCSITargetExtentFind(ctx context.Context, targetID int, extentID int) (*ISCSITargetExtent, error)
 	ISCSITargetExtentFindByTarget(ctx context.Context, targetID int) ([]*ISCSITargetExtent, error)
 	ISCSITargetExtentFindByExtent(ctx context.Context, extentID int) ([]*ISCSITargetExtent, error)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -585,7 +586,11 @@ func (c *Connection) heartbeatLoop() {
 }
 
 // readMessages reads incoming WebSocket messages.
+// Uses a read deadline to prevent goroutine leaks when the connection dies without error.
 func (c *Connection) readMessages() {
+	// Read deadline allows us to periodically check if the connection should be closed
+	const readDeadlineInterval = 30 * time.Second
+
 	for {
 		c.mu.RLock()
 		conn := c.conn
@@ -596,8 +601,18 @@ func (c *Connection) readMessages() {
 			return
 		}
 
+		// Set read deadline to prevent blocking forever on a dead connection
+		if err := conn.SetReadDeadline(time.Now().Add(readDeadlineInterval)); err != nil {
+			klog.V(4).Infof("Conn %d: Failed to set read deadline: %v", c.id, err)
+		}
+
 		var resp rpcResponse
 		if err := conn.ReadJSON(&resp); err != nil {
+			// Check if this is a timeout - if so, just loop again to check connection state
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+
 			c.mu.RLock()
 			wasClosed := c.closed
 			c.mu.RUnlock()

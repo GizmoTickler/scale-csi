@@ -571,7 +571,12 @@ func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 	klog.V(4).Infof("Session GC: found %d active NVMe-oF sessions", len(sessions))
 
 	// Get expected sessions from kubelet staging directory
+	// Returns nil if the lookup was unreliable (e.g., race condition during stage/unstage)
 	expectedNQNs := d.getExpectedNVMeoFNQNs()
+	if expectedNQNs == nil {
+		klog.Info("Session GC: skipping NVMe-oF GC due to unreliable expected NQNs lookup")
+		return
+	}
 	klog.V(4).Infof("Session GC: found %d expected NVMe-oF NQNs from staged volumes", len(expectedNQNs))
 
 	// Find orphaned sessions
@@ -705,15 +710,17 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 }
 
 // getExpectedNVMeoFNQNs returns a map of NQNs that have corresponding staged volumes.
+// Returns nil if the lookup was unreliable (e.g., error getting mounted devices),
+// signaling GC should be skipped to prevent false positives.
 func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
-	expected := make(map[string]struct{})
-
 	// Get mounted block devices
 	mountedDevices, err := util.GetMountedBlockDevices()
 	if err != nil {
 		klog.Warningf("Session GC: failed to get mounted block devices: %v", err)
-		return expected
+		return nil // Return nil to signal GC should be skipped
 	}
+
+	expected := make(map[string]struct{})
 
 	// For each mounted device, get its NVMe-oF session if any
 	for device := range mountedDevices {

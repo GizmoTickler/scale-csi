@@ -330,20 +330,13 @@ func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysI
 }
 
 // NVMeoFPortSubsysFindBySubsystem checks if a subsystem is already associated with any port.
+// Note: TrueNAS 25.10+ API doesn't support filtering by nested fields (subsys.id),
+// so we fetch all associations and filter client-side.
 func (c *Client) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
-	filters := [][]interface{}{
-		{"subsys.id", "=", subsysID},
-	}
-	result, err := c.Call(ctx, "nvmet.port_subsys.query", filters, map[string]interface{}{})
+	assocs, err := c.NVMeoFPortSubsysListBySubsystem(ctx, subsysID)
 	if err != nil {
-		return false, fmt.Errorf("failed to query port-subsystem associations: %w", err)
+		return false, err
 	}
-
-	assocs, ok := result.([]interface{})
-	if !ok {
-		return false, nil
-	}
-
 	return len(assocs) > 0, nil
 }
 
@@ -355,11 +348,11 @@ type NVMeoFPortSubsys struct {
 }
 
 // NVMeoFPortSubsysListBySubsystem returns all port-subsystem associations for a given subsystem.
+// Note: TrueNAS 25.10+ API doesn't support filtering by nested fields (subsys.id),
+// so we fetch all associations and filter client-side.
 func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error) {
-	filters := [][]interface{}{
-		{"subsys.id", "=", subsysID},
-	}
-	result, err := c.Call(ctx, "nvmet.port_subsys.query", filters, map[string]interface{}{})
+	// Fetch all port-subsystem associations (no filter - API doesn't support nested field filtering)
+	result, err := c.Call(ctx, "nvmet.port_subsys.query", []interface{}{}, map[string]interface{}{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query port-subsystem associations: %w", err)
 	}
@@ -369,9 +362,22 @@ func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID i
 		return nil, nil
 	}
 
-	assocs := make([]*NVMeoFPortSubsys, 0, len(items))
+	// Filter client-side by subsystem ID
+	assocs := make([]*NVMeoFPortSubsys, 0)
 	for _, item := range items {
 		if m, ok := item.(map[string]interface{}); ok {
+			// Extract subsystem ID from nested structure
+			var itemSubsysID int
+			if subsys, ok := m["subsys"].(map[string]interface{}); ok {
+				if id, ok := subsys["id"].(float64); ok {
+					itemSubsysID = int(id)
+				}
+			}
+			// Only include if it matches the requested subsystem ID
+			if itemSubsysID != subsysID {
+				continue
+			}
+
 			assoc := &NVMeoFPortSubsys{}
 			if id, ok := m["id"].(float64); ok {
 				assoc.ID = int(id)
@@ -381,11 +387,7 @@ func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID i
 					assoc.PortID = int(id)
 				}
 			}
-			if subsys, ok := m["subsys"].(map[string]interface{}); ok {
-				if id, ok := subsys["id"].(float64); ok {
-					assoc.SubsysID = int(id)
-				}
-			}
+			assoc.SubsysID = itemSubsysID
 			assocs = append(assocs, assoc)
 		}
 	}

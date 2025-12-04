@@ -29,6 +29,7 @@ const (
 	PropShareVolumeContext        = "truenas-csi:csi_share_volume_context"
 	PropVolumeContentSourceType   = "truenas-csi:csi_volume_content_source_type"
 	PropVolumeContentSourceID     = "truenas-csi:csi_volume_content_source_id"
+	PropVolumeOriginSnapshot      = "truenas-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
 	PropCSISnapshotName           = "truenas-csi:csi_snapshot_name"
 	PropCSISnapshotSourceVolumeID = "truenas-csi:csi_snapshot_source_volume_id"
 	PropNFSShareID                = "truenas-csi:truenas_nfs_share_id"
@@ -238,11 +239,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
+	isClonedVolume := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
 		if err := d.handleVolumeContentSource(ctx, datasetName, contentSource, capacityBytes); err != nil {
 			return nil, err
 		}
+		isClonedVolume = true // handleVolumeContentSource already called WaitForZvolReady
 	} else {
 		// Create new dataset
 		if err := d.createDataset(ctx, datasetName, capacityBytes, shareType); err != nil {
@@ -251,7 +254,8 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	// Create share (NFS, iSCSI, or NVMe-oF)
-	if err := d.createShare(ctx, datasetName, name, shareType); err != nil {
+	// For cloned volumes, skip zvol wait since handleVolumeContentSource already waited
+	if err := d.createShareWithOptions(ctx, datasetName, name, shareType, isClonedVolume); err != nil {
 		// Cleanup on failure
 		if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, false); delErr != nil {
 			klog.Warningf("Failed to cleanup dataset after share creation failure: %v", delErr)
@@ -366,6 +370,15 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		return nil, status.Errorf(codes.Internal, "failed to delete share: %v", err)
 	}
 
+	// Get origin snapshot property before deletion (for volume-to-volume clones)
+	// This snapshot was created during cloning and should be cleaned up after the clone is deleted
+	var originSnapshotID string
+	if ds != nil {
+		if prop, ok := ds.UserProperties[PropVolumeOriginSnapshot]; ok && prop.Value != "" && prop.Value != "-" {
+			originSnapshotID = prop.Value
+		}
+	}
+
 	// Try to delete dataset without recursive first to preserve snapshots
 	// This follows CSI spec: snapshots should survive after source volume deletion
 	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
@@ -399,6 +412,18 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// No snapshots, but non-recursive delete still failed - just fail
 			klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
+		}
+	}
+
+	// Clean up origin snapshot if this was a volume-to-volume clone
+	// The clone's dependency on the snapshot is now broken, so we can delete it
+	if originSnapshotID != "" {
+		klog.Infof("Cleaning up origin snapshot %s for deleted volume clone %s", originSnapshotID, volumeID)
+		if err := d.truenasClient.SnapshotDelete(ctx, originSnapshotID, false, false); err != nil {
+			// Log but don't fail - the snapshot might have been deleted already or might have other clones
+			if !truenas.IsNotFoundError(err) {
+				klog.Warningf("Failed to delete origin snapshot %s: %v", originSnapshotID, err)
+			}
 		}
 	}
 
@@ -449,6 +474,10 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 }
 
 // ListVolumes lists all volumes.
+// Note: Pagination is based on raw dataset offset, not filtered volume count.
+// This is necessary because TrueNAS API pagination is offset-based, and we filter
+// client-side for CSI-managed volumes. The trade-off is that pages may have fewer
+// entries than requested if there are non-CSI datasets interspersed.
 func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	klog.V(4).Info("ListVolumes called")
 
@@ -463,18 +492,27 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 	}
 
 	// Use max entries as limit (default to 100 if not specified or 0)
-	limit := int(req.GetMaxEntries())
-	if limit == 0 {
-		limit = 100
+	// Request more from API to account for filtered non-CSI datasets
+	requestedLimit := int(req.GetMaxEntries())
+	if requestedLimit == 0 {
+		requestedLimit = 100
+	}
+	// Fetch extra to increase chance of filling the page after filtering
+	fetchLimit := requestedLimit * 2
+	if fetchLimit < 50 {
+		fetchLimit = 50
 	}
 
-	datasets, err := d.truenasClient.DatasetList(ctx, d.config.ZFS.DatasetParentName, limit, offset)
+	datasets, err := d.truenasClient.DatasetList(ctx, d.config.ZFS.DatasetParentName, fetchLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
 
-	entries := make([]*csi.ListVolumesResponse_Entry, 0)
+	entries := make([]*csi.ListVolumesResponse_Entry, 0, requestedLimit)
+	datasetsProcessed := 0
 	for _, ds := range datasets {
+		datasetsProcessed++
+
 		// Skip if not managed by CSI
 		if prop, ok := ds.UserProperties[PropManagedResource]; !ok || prop.Value != "true" {
 			continue
@@ -489,12 +527,21 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 				CapacityBytes: capacity,
 			},
 		})
+
+		// Stop if we have enough entries
+		if len(entries) >= requestedLimit {
+			break
+		}
 	}
 
-	// Generate next token if we got a full page
+	// Generate next token based on datasets actually processed
+	// This ensures we don't skip any datasets on the next page
 	nextToken := ""
-	if len(datasets) == limit {
-		nextToken = strconv.Itoa(offset + limit)
+	if datasetsProcessed > 0 && len(datasets) >= datasetsProcessed {
+		// More datasets may exist if we got a full fetch or filled our requested limit
+		if len(datasets) == fetchLimit || len(entries) == requestedLimit {
+			nextToken = strconv.Itoa(offset + datasetsProcessed)
+		}
 	}
 
 	return &csi.ListVolumesResponse{
@@ -876,15 +923,24 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 
 	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
 
+	// Get dataset to determine type and current state
+	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		if truenas.IsNotFoundError(err) {
+			return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to get volume details: %v", err)
+	}
+
 	// For zvols (iSCSI/NVMe-oF), expand the volsize
-	if d.config.GetZFSResourceType() == "volume" {
+	if ds.Type == "VOLUME" {
 		if err := d.truenasClient.DatasetExpand(ctx, datasetName, capacityBytes); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to expand volume: %v", err)
 		}
 	}
 
 	// For filesystems (NFS), update quota if enabled
-	if d.config.GetZFSResourceType() == "filesystem" && d.config.ZFS.DatasetEnableQuotas {
+	if ds.Type == "FILESYSTEM" && d.config.ZFS.DatasetEnableQuotas {
 		params := &truenas.DatasetUpdateParams{
 			Refquota: capacityBytes,
 		}
@@ -893,8 +949,9 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 		}
 	}
 
-	// Node expansion may be required for filesystems
-	nodeExpansionRequired := d.config.GetZFSResourceType() == "volume"
+	// Node expansion is required for zvols (iSCSI/NVMe-oF) to resize the filesystem
+	// Use the actual dataset type, not the driver's default config
+	nodeExpansionRequired := ds.Type == "VOLUME"
 
 	klog.Infof("Volume %s expanded successfully", volumeID)
 
@@ -1105,6 +1162,7 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		}
 
 		// Set content source properties in parallel
+		// Include origin snapshot so it can be cleaned up when the cloned volume is deleted
 		g, gCtx := errgroup.WithContext(ctx)
 		g.Go(func() error {
 			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeContentSourceType, "volume"); err != nil {
@@ -1118,6 +1176,13 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 			}
 			return nil
 		})
+		g.Go(func() error {
+			// Store the origin snapshot ID for cleanup when the clone is deleted
+			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeOriginSnapshot, snap.ID); err != nil {
+				klog.Warningf("Failed to set volume origin snapshot property: %v", err)
+			}
+			return nil
+		})
 		if err := g.Wait(); err != nil {
 			klog.Warningf("Error setting content source properties for volume clone: %v", err)
 		}
@@ -1127,7 +1192,7 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 }
 
 func (d *Driver) getVolumeContext(ctx context.Context, datasetName string, shareType ShareType) (map[string]string, error) {
-	context := map[string]string{
+	volumeContext := map[string]string{
 		"node_attach_driver": shareType.String(),
 	}
 
@@ -1138,49 +1203,101 @@ func (d *Driver) getVolumeContext(ctx context.Context, datasetName string, share
 
 	switch shareType {
 	case ShareTypeNFS:
-		context["server"] = d.config.NFS.ShareHost
-		context["share"] = ds.Mountpoint
+		volumeContext["server"] = d.config.NFS.ShareHost
+		volumeContext["share"] = ds.Mountpoint
 
 	case ShareTypeISCSI:
-		// Get target info from dataset properties
-		if prop, ok := ds.UserProperties[PropISCSITargetID]; ok {
+		// Get target info from dataset properties or fallback to lookup by name
+		var target *truenas.ISCSITarget
+		var globalCfg *truenas.ISCSIGlobalConfig
+
+		if prop, ok := ds.UserProperties[PropISCSITargetID]; ok && prop.Value != "" && prop.Value != "-" {
 			targetID, err := strconv.Atoi(prop.Value)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "invalid target ID: %v", err)
 			}
-			target, err := d.truenasClient.ISCSITargetGet(ctx, targetID)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to get iSCSI target: %v", err)
+
+			// Fetch target and global config in parallel for better performance
+			g, gCtx := errgroup.WithContext(ctx)
+			g.Go(func() error {
+				var err error
+				target, err = d.truenasClient.ISCSITargetGet(gCtx, targetID)
+				if err != nil {
+					return status.Errorf(codes.Internal, "failed to get iSCSI target: %v", err)
+				}
+				return nil
+			})
+			g.Go(func() error {
+				var err error
+				globalCfg, err = d.truenasClient.ISCSIGlobalConfigGet(gCtx)
+				if err != nil {
+					return status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
+				}
+				return nil
+			})
+			if err := g.Wait(); err != nil {
+				return nil, err
 			}
-			globalCfg, err := d.truenasClient.ISCSIGlobalConfigGet(ctx)
+		} else {
+			// Fallback: lookup target by name (for volumes created before property tracking)
+			iscsiName := path.Base(datasetName)
+			if d.config.ISCSI.NameSuffix != "" {
+				iscsiName = iscsiName + d.config.ISCSI.NameSuffix
+			}
+			klog.V(4).Infof("Target ID property missing for %s, falling back to name lookup: %s", datasetName, iscsiName)
+
+			var err error
+			target, err = d.truenasClient.ISCSITargetFindByName(ctx, iscsiName)
+			if err != nil || target == nil {
+				return nil, status.Errorf(codes.Internal, "failed to find iSCSI target by name %s: %v", iscsiName, err)
+			}
+			globalCfg, err = d.truenasClient.ISCSIGlobalConfigGet(ctx)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
 			}
-			context["iqn"] = fmt.Sprintf("%s:%s", globalCfg.Basename, target.Name)
 		}
-		context["portal"] = d.config.ISCSI.TargetPortal
-		context["lun"] = "0"
-		context["interface"] = d.config.ISCSI.Interface
+		volumeContext["iqn"] = fmt.Sprintf("%s:%s", globalCfg.Basename, target.Name)
+		volumeContext["portal"] = d.config.ISCSI.TargetPortal
+		volumeContext["lun"] = "0"
+		volumeContext["interface"] = d.config.ISCSI.Interface
 
 	case ShareTypeNVMeoF:
-		// Get subsystem info from dataset properties
-		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok {
+		// Get subsystem info from dataset properties or fallback to lookup by name
+		var subsys *truenas.NVMeoFSubsystem
+
+		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok && prop.Value != "" && prop.Value != "-" {
 			subsysID, err := strconv.Atoi(prop.Value)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "invalid subsystem ID: %v", err)
 			}
-			subsys, err := d.truenasClient.NVMeoFSubsystemGet(ctx, subsysID)
+			subsys, err = d.truenasClient.NVMeoFSubsystemGet(ctx, subsysID)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to get NVMe-oF subsystem: %v", err)
 			}
-			context["nqn"] = subsys.NQN
+		} else {
+			// Fallback: lookup subsystem by name (for volumes created before property tracking)
+			subsysName := path.Base(datasetName)
+			if d.config.NVMeoF.NamePrefix != "" {
+				subsysName = d.config.NVMeoF.NamePrefix + subsysName
+			}
+			if d.config.NVMeoF.NameSuffix != "" {
+				subsysName = subsysName + d.config.NVMeoF.NameSuffix
+			}
+			klog.V(4).Infof("Subsystem ID property missing for %s, falling back to name lookup: %s", datasetName, subsysName)
+
+			var err error
+			subsys, err = d.truenasClient.NVMeoFSubsystemFindByName(ctx, subsysName)
+			if err != nil || subsys == nil {
+				return nil, status.Errorf(codes.Internal, "failed to find NVMe-oF subsystem by name %s: %v", subsysName, err)
+			}
 		}
-		context["transport"] = d.config.NVMeoF.Transport
-		context["address"] = d.config.NVMeoF.TransportAddress
-		context["port"] = strconv.Itoa(d.config.NVMeoF.TransportServiceID)
+		volumeContext["nqn"] = subsys.NQN
+		volumeContext["transport"] = d.config.NVMeoF.Transport
+		volumeContext["address"] = d.config.NVMeoF.TransportAddress
+		volumeContext["port"] = strconv.Itoa(d.config.NVMeoF.TransportServiceID)
 	}
 
-	return context, nil
+	return volumeContext, nil
 }
 
 func timestampProto(unixSeconds int64) *timestamppb.Timestamp {

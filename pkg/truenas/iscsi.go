@@ -269,6 +269,24 @@ func (c *Client) ISCSITargetExtentDelete(ctx context.Context, id int, force bool
 	return nil
 }
 
+// ISCSITargetExtentGet retrieves a target-extent association by ID.
+func (c *Client) ISCSITargetExtentGet(ctx context.Context, id int) (*ISCSITargetExtent, error) {
+	filters := [][]interface{}{
+		{"id", "=", id},
+	}
+	result, err := c.Call(ctx, "iscsi.targetextent.query", filters, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query target-extent by ID: %w", err)
+	}
+
+	assocs, ok := result.([]interface{})
+	if !ok || len(assocs) == 0 {
+		return nil, nil
+	}
+
+	return parseISCSITargetExtent(assocs[0])
+}
+
 // ISCSITargetExtentFind finds a target-extent association.
 func (c *Client) ISCSITargetExtentFind(ctx context.Context, targetID int, extentID int) (*ISCSITargetExtent, error) {
 	filters := [][]interface{}{

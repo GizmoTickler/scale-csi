@@ -597,8 +597,25 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 	// Check if block mode
 	if volCap != nil && volCap.GetBlock() != nil {
 		// For block mode, create a symlink to the device
-		if err := os.Symlink(devicePath, stagingPath); err != nil && !os.IsExist(err) {
-			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
+		if err := os.Symlink(devicePath, stagingPath); err != nil {
+			if os.IsExist(err) {
+				// Symlink exists - verify it points to the correct device
+				existingTarget, readErr := os.Readlink(stagingPath)
+				if readErr != nil {
+					return status.Errorf(codes.Internal, "failed to read existing symlink: %v", readErr)
+				}
+				if existingTarget != devicePath {
+					klog.Warningf("Existing symlink %s points to %s, expected %s - recreating", stagingPath, existingTarget, devicePath)
+					if rmErr := os.Remove(stagingPath); rmErr != nil {
+						return status.Errorf(codes.Internal, "failed to remove stale symlink: %v", rmErr)
+					}
+					if linkErr := os.Symlink(devicePath, stagingPath); linkErr != nil {
+						return status.Errorf(codes.Internal, "failed to create device symlink: %v", linkErr)
+					}
+				}
+			} else {
+				return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
+			}
 		}
 		return nil
 	}
@@ -663,8 +680,25 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	// Check if block mode
 	if volCap != nil && volCap.GetBlock() != nil {
 		// For block mode, create a symlink to the device
-		if err := os.Symlink(devicePath, stagingPath); err != nil && !os.IsExist(err) {
-			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
+		if err := os.Symlink(devicePath, stagingPath); err != nil {
+			if os.IsExist(err) {
+				// Symlink exists - verify it points to the correct device
+				existingTarget, readErr := os.Readlink(stagingPath)
+				if readErr != nil {
+					return status.Errorf(codes.Internal, "failed to read existing symlink: %v", readErr)
+				}
+				if existingTarget != devicePath {
+					klog.Warningf("Existing symlink %s points to %s, expected %s - recreating", stagingPath, existingTarget, devicePath)
+					if rmErr := os.Remove(stagingPath); rmErr != nil {
+						return status.Errorf(codes.Internal, "failed to remove stale symlink: %v", rmErr)
+					}
+					if linkErr := os.Symlink(devicePath, stagingPath); linkErr != nil {
+						return status.Errorf(codes.Internal, "failed to create device symlink: %v", linkErr)
+					}
+				}
+			} else {
+				return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
+			}
 		}
 		return nil
 	}

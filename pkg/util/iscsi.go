@@ -24,7 +24,14 @@ var portalDiscoveryMutex sync.Map // map[portal]*sync.Mutex
 // getPortalMutex returns a mutex for the given portal, creating one if needed.
 func getPortalMutex(portal string) *sync.Mutex {
 	mutex, _ := portalDiscoveryMutex.LoadOrStore(portal, &sync.Mutex{})
-	return mutex.(*sync.Mutex)
+	if m, ok := mutex.(*sync.Mutex); ok {
+		return m
+	}
+	// Should never happen, but return new mutex as fallback
+	klog.Warningf("Unexpected type in portalDiscoveryMutex for portal %s, creating new mutex", portal)
+	newMutex := &sync.Mutex{}
+	portalDiscoveryMutex.Store(portal, newMutex)
+	return newMutex
 }
 
 // discoveryCache caches discovery results to avoid repeated calls.
@@ -275,9 +282,11 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 func iscsiDiscoverySerialized(ctx context.Context, portal string) error {
 	// Check cache first (outside of mutex for fast path)
 	if lastDiscovery, ok := discoveryCache.Load(portal); ok {
-		if time.Since(lastDiscovery.(time.Time)) < getDiscoveryCacheDuration() {
-			klog.V(4).Infof("Using cached discovery for portal %s (age: %v)", portal, time.Since(lastDiscovery.(time.Time)))
-			return nil
+		if ts, ok := lastDiscovery.(time.Time); ok {
+			if time.Since(ts) < getDiscoveryCacheDuration() {
+				klog.V(4).Infof("Using cached discovery for portal %s (age: %v)", portal, time.Since(ts))
+				return nil
+			}
 		}
 	}
 
@@ -288,9 +297,11 @@ func iscsiDiscoverySerialized(ctx context.Context, portal string) error {
 
 	// Check cache again after acquiring lock (another goroutine may have done discovery)
 	if lastDiscovery, ok := discoveryCache.Load(portal); ok {
-		if time.Since(lastDiscovery.(time.Time)) < getDiscoveryCacheDuration() {
-			klog.V(4).Infof("Using cached discovery for portal %s after lock (age: %v)", portal, time.Since(lastDiscovery.(time.Time)))
-			return nil
+		if ts, ok := lastDiscovery.(time.Time); ok {
+			if time.Since(ts) < getDiscoveryCacheDuration() {
+				klog.V(4).Infof("Using cached discovery for portal %s after lock (age: %v)", portal, time.Since(ts))
+				return nil
+			}
 		}
 	}
 
@@ -323,7 +334,14 @@ func iscsiDiscovery(ctx context.Context, portal string) error {
 // getLoginSemaphore returns a semaphore for the given portal, creating one if needed.
 func getLoginSemaphore(portal string) chan struct{} {
 	sem, _ := portalLoginSemaphore.LoadOrStore(portal, make(chan struct{}, getMaxConcurrentLogins()))
-	return sem.(chan struct{})
+	if s, ok := sem.(chan struct{}); ok {
+		return s
+	}
+	// Should never happen, but return new semaphore as fallback
+	klog.Warningf("Unexpected type in portalLoginSemaphore for portal %s, creating new semaphore", portal)
+	newSem := make(chan struct{}, getMaxConcurrentLogins())
+	portalLoginSemaphore.Store(portal, newSem)
+	return newSem
 }
 
 // iscsiLoginSerialized performs iSCSI login with limited concurrency.

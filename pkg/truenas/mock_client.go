@@ -484,6 +484,17 @@ func (m *MockClient) ISCSITargetExtentDelete(ctx context.Context, id int, force 
 	delete(m.TargetExtents, id)
 	return nil
 }
+
+func (m *MockClient) ISCSITargetExtentGet(ctx context.Context, id int) (*ISCSITargetExtent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if te, ok := m.TargetExtents[id]; ok {
+		return te, nil
+	}
+	return nil, nil
+}
+
 func (m *MockClient) ISCSITargetExtentFind(ctx context.Context, targetID int, extentID int) (*ISCSITargetExtent, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
