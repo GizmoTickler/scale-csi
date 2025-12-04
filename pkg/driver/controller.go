@@ -357,11 +357,36 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		return nil, status.Errorf(codes.Internal, "failed to delete share: %v", err)
 	}
 
-	// Delete dataset (recursive to handle snapshots, force to ignore busy state)
-	if err := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); err != nil {
+	// Try to delete dataset without recursive first to preserve snapshots
+	// This follows CSI spec: snapshots should survive after source volume deletion
+	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
 		// DatasetDelete already handles "not found" errors, so this is a real error
-		klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
-		return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
+		// Check if failure is due to dependent snapshots
+		if strings.Contains(err.Error(), "has dependent clones") ||
+			strings.Contains(err.Error(), "has children") ||
+			strings.Contains(err.Error(), "dataset is busy") {
+			// Check if there are CSI-managed snapshots on this dataset
+			snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
+			if snapErr == nil && len(snapshots) > 0 {
+				// Found snapshots - check if any are CSI-managed
+				for _, snap := range snapshots {
+					if prop, ok := snap.UserProperties[PropManagedResource]; ok && prop.Value == "true" {
+						klog.Infof("Volume %s has dependent CSI-managed snapshots, cannot delete", volumeID)
+						return nil, status.Errorf(codes.FailedPrecondition,
+							"volume %s has dependent snapshots that must be deleted first", volumeID)
+					}
+				}
+			}
+			// No CSI-managed snapshots, retry with recursive deletion
+			klog.V(4).Infof("Volume %s has non-managed children, deleting recursively", volumeID)
+			if err := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); err != nil {
+				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
+				return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
+			}
+		} else {
+			klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
+			return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
+		}
 	}
 
 	klog.Infof("Volume %s deleted successfully", volumeID)
