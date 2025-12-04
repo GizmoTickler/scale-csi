@@ -597,8 +597,10 @@ func (c *Connection) readMessages() {
 		}
 	}()
 
-	// Read deadline allows us to periodically check if the connection should be closed
-	const readDeadlineInterval = 30 * time.Second
+	// Read deadline allows us to periodically check if the connection should be closed.
+	// Must be longer than HeartbeatInterval (default 30s) to give heartbeat time to fire
+	// and get a response before the read deadline expires.
+	const readDeadlineInterval = 45 * time.Second
 
 	for {
 		c.mu.RLock()
