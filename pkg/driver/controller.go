@@ -361,29 +361,33 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// This follows CSI spec: snapshots should survive after source volume deletion
 	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
 		// DatasetDelete already handles "not found" errors, so this is a real error
-		// Check if failure is due to dependent snapshots
-		if strings.Contains(err.Error(), "has dependent clones") ||
-			strings.Contains(err.Error(), "has children") ||
-			strings.Contains(err.Error(), "dataset is busy") {
-			// Check if there are CSI-managed snapshots on this dataset
-			snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
-			if snapErr == nil && len(snapshots) > 0 {
-				// Found snapshots - check if any are CSI-managed
-				for _, snap := range snapshots {
-					if prop, ok := snap.UserProperties[PropManagedResource]; ok && prop.Value == "true" {
-						klog.Infof("Volume %s has dependent CSI-managed snapshots, cannot delete", volumeID)
-						return nil, status.Errorf(codes.FailedPrecondition,
-							"volume %s has dependent snapshots that must be deleted first", volumeID)
-					}
+		// Check if there are CSI-managed snapshots that are blocking deletion
+		// TrueNAS returns various error messages: "Method call error", "has dependent clones", etc.
+		snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
+		if snapErr == nil && len(snapshots) > 0 {
+			// Found snapshots - check if any are CSI-managed
+			for _, snap := range snapshots {
+				if prop, ok := snap.UserProperties[PropManagedResource]; ok && prop.Value == "true" {
+					klog.Infof("Volume %s has dependent CSI-managed snapshots, cannot delete", volumeID)
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"volume %s has dependent snapshots that must be deleted first", volumeID)
 				}
 			}
-			// No CSI-managed snapshots, retry with recursive deletion
-			klog.V(4).Infof("Volume %s has non-managed children, deleting recursively", volumeID)
+			// Non-CSI-managed snapshots exist, retry with recursive deletion
+			klog.V(4).Infof("Volume %s has non-managed snapshots, deleting recursively", volumeID)
+			if err := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); err != nil {
+				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
+				return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
+			}
+		} else if snapErr != nil {
+			// Could not check snapshots, log and try recursive delete
+			klog.V(4).Infof("Could not list snapshots for %s (%v), trying recursive delete", volumeID, snapErr)
 			if err := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); err != nil {
 				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
 				return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
 			}
 		} else {
+			// No snapshots, but non-recursive delete still failed - just fail
 			klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
 		}
