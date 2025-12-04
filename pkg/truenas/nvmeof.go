@@ -73,8 +73,10 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 func (c *Client) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 	_, err := c.Call(ctx, "nvmet.subsys.delete", id)
 	if err != nil {
+		// TrueNAS returns "Invalid params" when the ID doesn't exist
 		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+			strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "Invalid params") {
 			return nil
 		}
 		return fmt.Errorf("failed to delete NVMe-oF subsystem: %w", err)
@@ -167,8 +169,10 @@ func (c *Client) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, dev
 func (c *Client) NVMeoFNamespaceDelete(ctx context.Context, id int) error {
 	_, err := c.Call(ctx, "nvmet.namespace.delete", id)
 	if err != nil {
+		// TrueNAS returns "Invalid params" when the ID doesn't exist
 		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+			strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "Invalid params") {
 			return nil
 		}
 		return fmt.Errorf("failed to delete NVMe-oF namespace: %w", err)
@@ -399,8 +403,10 @@ func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID i
 func (c *Client) NVMeoFPortSubsysDelete(ctx context.Context, id int) error {
 	_, err := c.Call(ctx, "nvmet.port_subsys.delete", id)
 	if err != nil {
+		// TrueNAS returns "Invalid params" when the ID doesn't exist
 		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+			strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "Invalid params") {
 			return nil
 		}
 		return fmt.Errorf("failed to delete port-subsystem association: %w", err)
