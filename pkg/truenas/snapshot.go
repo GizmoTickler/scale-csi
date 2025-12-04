@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -384,12 +385,25 @@ func (snap *Snapshot) GetSnapshotSize() int64 {
 	return 0
 }
 
-// GetCreationTime returns the creation timestamp of a snapshot.
+// GetCreationTime returns the creation timestamp of a snapshot (unix seconds).
 func (snap *Snapshot) GetCreationTime() int64 {
 	if creation, ok := snap.Properties["creation"]; ok {
 		if creationMap, ok := creation.(map[string]interface{}); ok {
+			// Try parsed as float64 first (some versions may return this)
 			if parsed, ok := creationMap["parsed"].(float64); ok {
 				return int64(parsed)
+			}
+			// TrueNAS returns parsed as {"$date": milliseconds}
+			if parsedMap, ok := creationMap["parsed"].(map[string]interface{}); ok {
+				if dateMs, ok := parsedMap["$date"].(float64); ok {
+					return int64(dateMs / 1000) // Convert ms to seconds
+				}
+			}
+			// Fallback: parse rawvalue as string
+			if rawvalue, ok := creationMap["rawvalue"].(string); ok {
+				if ts, err := strconv.ParseInt(rawvalue, 10, 64); err == nil {
+					return ts
+				}
 			}
 		}
 	}
