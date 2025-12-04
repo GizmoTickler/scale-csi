@@ -179,33 +179,52 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	defer d.releaseOperationLock(lockKey)
 
 	// Get device path before unmounting (for session cleanup)
+	// For block mode volumes, stagingPath is a symlink to the device, not a mount point
 	devicePath, err := util.GetDeviceFromMountPoint(stagingPath)
-	if err != nil {
-		// If not mounted, we can't get the device path, so we can't cleanup session
-		// This is expected if already unstaged
-		klog.V(4).Infof("Could not get device from mount point %s: %v", stagingPath, err)
+	if err != nil || devicePath == "" {
+		// Check if it's a symlink (block mode volumes use symlinks)
+		if target, readErr := os.Readlink(stagingPath); readErr == nil {
+			devicePath = target
+			klog.V(4).Infof("Staging path %s is a symlink to device %s", stagingPath, devicePath)
+		} else {
+			// If not mounted and not a symlink, we can't get the device path
+			// This is expected if already unstaged
+			klog.V(4).Infof("Could not get device from staging path %s: mount err=%v, symlink err=%v", stagingPath, err, readErr)
+		}
 	}
 
-	// Unmount staging path
-	if err := util.Unmount(stagingPath); err != nil {
-		klog.Warningf("Failed to unmount staging path: %v", err)
-		// Check if still mounted before attempting removal to prevent data corruption
-		mounted, checkErr := util.IsMounted(stagingPath)
-		if checkErr != nil {
-			klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
-			// If we can't verify mount status, don't risk removing a mounted path
-			return nil, status.Errorf(codes.Internal, "failed to unmount staging path and cannot verify mount status: %v", err)
-		}
-		if mounted {
-			return nil, status.Errorf(codes.Internal, "failed to unmount staging path (still mounted): %v", err)
-		}
-		// Not mounted, safe to continue with cleanup
-		klog.Infof("Staging path %s is not mounted, proceeding with cleanup", stagingPath)
-	}
+	// Check if staging path is a symlink (block mode) or a mount point (filesystem mode)
+	fileInfo, statErr := os.Lstat(stagingPath)
+	isSymlink := statErr == nil && fileInfo.Mode()&os.ModeSymlink != 0
 
-	// Clean up staging directory (only reached if unmount succeeded or path was not mounted)
-	if err := os.RemoveAll(stagingPath); err != nil {
-		klog.Warningf("Failed to remove staging directory: %v", err)
+	if isSymlink {
+		// For block mode volumes, just remove the symlink
+		klog.V(4).Infof("Staging path %s is a symlink, removing", stagingPath)
+		if err := os.Remove(stagingPath); err != nil && !os.IsNotExist(err) {
+			klog.Warningf("Failed to remove staging symlink: %v", err)
+		}
+	} else {
+		// For filesystem mode, unmount and remove directory
+		if err := util.Unmount(stagingPath); err != nil {
+			klog.Warningf("Failed to unmount staging path: %v", err)
+			// Check if still mounted before attempting removal to prevent data corruption
+			mounted, checkErr := util.IsMounted(stagingPath)
+			if checkErr != nil {
+				klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
+				// If we can't verify mount status, don't risk removing a mounted path
+				return nil, status.Errorf(codes.Internal, "failed to unmount staging path and cannot verify mount status: %v", err)
+			}
+			if mounted {
+				return nil, status.Errorf(codes.Internal, "failed to unmount staging path (still mounted): %v", err)
+			}
+			// Not mounted, safe to continue with cleanup
+			klog.Infof("Staging path %s is not mounted, proceeding with cleanup", stagingPath)
+		}
+
+		// Clean up staging directory (only reached if unmount succeeded or path was not mounted)
+		if err := os.RemoveAll(stagingPath); err != nil {
+			klog.Warningf("Failed to remove staging directory: %v", err)
+		}
 	}
 
 	// Disconnect session if we found a device
@@ -597,25 +616,9 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 	// Check if block mode
 	if volCap != nil && volCap.GetBlock() != nil {
 		// For block mode, create a symlink to the device
-		if err := os.Symlink(devicePath, stagingPath); err != nil {
-			if os.IsExist(err) {
-				// Symlink exists - verify it points to the correct device
-				existingTarget, readErr := os.Readlink(stagingPath)
-				if readErr != nil {
-					return status.Errorf(codes.Internal, "failed to read existing symlink: %v", readErr)
-				}
-				if existingTarget != devicePath {
-					klog.Warningf("Existing symlink %s points to %s, expected %s - recreating", stagingPath, existingTarget, devicePath)
-					if rmErr := os.Remove(stagingPath); rmErr != nil {
-						return status.Errorf(codes.Internal, "failed to remove stale symlink: %v", rmErr)
-					}
-					if linkErr := os.Symlink(devicePath, stagingPath); linkErr != nil {
-						return status.Errorf(codes.Internal, "failed to create device symlink: %v", linkErr)
-					}
-				}
-			} else {
-				return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
-			}
+		// Use atomic rename to avoid race conditions when recreating symlinks
+		if err := createSymlinkAtomic(devicePath, stagingPath); err != nil {
+			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
 		}
 		return nil
 	}
@@ -680,25 +683,9 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	// Check if block mode
 	if volCap != nil && volCap.GetBlock() != nil {
 		// For block mode, create a symlink to the device
-		if err := os.Symlink(devicePath, stagingPath); err != nil {
-			if os.IsExist(err) {
-				// Symlink exists - verify it points to the correct device
-				existingTarget, readErr := os.Readlink(stagingPath)
-				if readErr != nil {
-					return status.Errorf(codes.Internal, "failed to read existing symlink: %v", readErr)
-				}
-				if existingTarget != devicePath {
-					klog.Warningf("Existing symlink %s points to %s, expected %s - recreating", stagingPath, existingTarget, devicePath)
-					if rmErr := os.Remove(stagingPath); rmErr != nil {
-						return status.Errorf(codes.Internal, "failed to remove stale symlink: %v", rmErr)
-					}
-					if linkErr := os.Symlink(devicePath, stagingPath); linkErr != nil {
-						return status.Errorf(codes.Internal, "failed to create device symlink: %v", linkErr)
-					}
-				}
-			} else {
-				return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
-			}
+		// Use atomic rename to avoid race conditions when recreating symlinks
+		if err := createSymlinkAtomic(devicePath, stagingPath); err != nil {
+			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
 		}
 		return nil
 	}
@@ -711,6 +698,48 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 
 	if err := util.FormatAndMount(devicePath, stagingPath, fsType, nil); err != nil {
 		return status.Errorf(codes.Internal, "failed to format and mount: %v", err)
+	}
+
+	return nil
+}
+
+// createSymlinkAtomic creates a symlink atomically using rename to avoid race conditions.
+// If the symlink already exists and points to the correct target, it's left as-is.
+// If it points to a different target, it's atomically replaced.
+func createSymlinkAtomic(target, linkPath string) error {
+	// First try to create the symlink directly
+	if err := os.Symlink(target, linkPath); err == nil {
+		return nil
+	} else if !os.IsExist(err) {
+		return fmt.Errorf("failed to create symlink: %w", err)
+	}
+
+	// Symlink exists - check if it already points to the correct target
+	existingTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		return fmt.Errorf("failed to read existing symlink: %w", err)
+	}
+	if existingTarget == target {
+		// Already correct, nothing to do
+		return nil
+	}
+
+	// Need to replace the symlink - use atomic rename to avoid race conditions
+	klog.Warningf("Existing symlink %s points to %s, expected %s - recreating atomically", linkPath, existingTarget, target)
+
+	// Create a temporary symlink next to the target
+	tempLink := linkPath + ".tmp"
+	// Remove any stale temp link first
+	os.Remove(tempLink)
+
+	if err := os.Symlink(target, tempLink); err != nil {
+		return fmt.Errorf("failed to create temporary symlink: %w", err)
+	}
+
+	// Atomic rename to replace the old symlink
+	if err := os.Rename(tempLink, linkPath); err != nil {
+		os.Remove(tempLink) // Clean up temp link on failure
+		return fmt.Errorf("failed to atomically replace symlink: %w", err)
 	}
 
 	return nil

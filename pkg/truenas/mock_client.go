@@ -650,8 +650,8 @@ func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport string, add
 func (m *MockClient) NVMeoFPortFindByAddress(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
-func (m *MockClient) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) error {
-	return nil
+func (m *MockClient) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) (*NVMeoFPortSubsys, error) {
+	return &NVMeoFPortSubsys{ID: 1, PortID: portID, SubsysID: subsysID}, nil
 }
 func (m *MockClient) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
 	return true, nil

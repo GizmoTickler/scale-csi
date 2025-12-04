@@ -451,11 +451,15 @@ func (d *Driver) deleteISCSIShare(ctx context.Context, datasetName string) error
 		if extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, diskPath); err == nil && extent != nil {
 			klog.V(4).Infof("Found orphaned extent by disk path %s (ID %d), deleting", diskPath, extent.ID)
 			// First delete any target-extent associations for this extent
-			if assocs, err := d.truenasClient.ISCSITargetExtentFindByExtent(ctx, extent.ID); err == nil {
-				for _, assoc := range assocs {
-					if err := d.truenasClient.ISCSITargetExtentDelete(ctx, assoc.ID, true); err != nil {
-						klog.Warningf("Failed to delete orphaned target-extent %d: %v", assoc.ID, err)
-					}
+			assocs, assocErr := d.truenasClient.ISCSITargetExtentFindByExtent(ctx, extent.ID)
+			if assocErr != nil {
+				klog.Warningf("Failed to query target-extent associations for extent %d: %v", extent.ID, assocErr)
+				// Continue anyway - extent deletion with force=true may still work
+			}
+			for _, assoc := range assocs {
+				if err := d.truenasClient.ISCSITargetExtentDelete(ctx, assoc.ID, true); err != nil {
+					klog.Warningf("Failed to delete orphaned target-extent %d: %v", assoc.ID, err)
+					errs = append(errs, fmt.Errorf("orphaned target-extent %d: %w", assoc.ID, err))
 				}
 			}
 			if err := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true); err != nil {
@@ -471,11 +475,15 @@ func (d *Driver) deleteISCSIShare(ctx context.Context, datasetName string) error
 		if target, err := d.truenasClient.ISCSITargetFindByName(ctx, iscsiName); err == nil && target != nil {
 			klog.V(4).Infof("Found orphaned target by name %s (ID %d), deleting", iscsiName, target.ID)
 			// First delete any target-extent associations for this target
-			if assocs, err := d.truenasClient.ISCSITargetExtentFindByTarget(ctx, target.ID); err == nil {
-				for _, assoc := range assocs {
-					if err := d.truenasClient.ISCSITargetExtentDelete(ctx, assoc.ID, true); err != nil {
-						klog.Warningf("Failed to delete orphaned target-extent %d: %v", assoc.ID, err)
-					}
+			assocs, assocErr := d.truenasClient.ISCSITargetExtentFindByTarget(ctx, target.ID)
+			if assocErr != nil {
+				klog.Warningf("Failed to query target-extent associations for target %d: %v", target.ID, assocErr)
+				// Continue anyway - target deletion with force=true may still work
+			}
+			for _, assoc := range assocs {
+				if err := d.truenasClient.ISCSITargetExtentDelete(ctx, assoc.ID, true); err != nil {
+					klog.Warningf("Failed to delete orphaned target-extent %d: %v", assoc.ID, err)
+					errs = append(errs, fmt.Errorf("orphaned target-extent %d: %w", assoc.ID, err))
 				}
 			}
 			if err := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true); err != nil {
@@ -545,10 +553,46 @@ func (d *Driver) createNVMeoFShareWithOptions(ctx context.Context, datasetName s
 		return status.Errorf(codes.Internal, "failed to store NVMe-oF subsystem ID: %v", err)
 	}
 
+	// Get or create the NVMe-oF TCP port BEFORE creating namespace
+	// TrueNAS 25.10+: Subsystems must be associated with a port to be accessible over the network
+	port, err := d.truenasClient.NVMeoFGetOrCreatePort(
+		ctx,
+		d.config.NVMeoF.Transport,
+		d.config.NVMeoF.TransportAddress,
+		d.config.NVMeoF.TransportServiceID,
+	)
+	if err != nil {
+		// Cleanup subsystem on port failure - volume would be unusable without a port
+		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+			klog.Warningf("Failed to cleanup NVMe-oF subsystem after port failure: %v", delErr)
+		}
+		return status.Errorf(codes.Internal, "failed to get/create NVMe-oF port: %v", err)
+	}
+
+	// Associate subsystem with port (required for network accessibility)
+	portSubsys, err := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsys.ID)
+	if err != nil {
+		// Cleanup subsystem on association failure - volume would be unusable
+		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+			klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
+		}
+		return status.Errorf(codes.Internal, "failed to associate subsystem with port: %v", err)
+	}
+	klog.V(4).Infof("Associated NVMe-oF subsystem %d with port %d (association ID %d)", subsys.ID, port.ID, portSubsys.ID)
+
+	// Store port-subsystem association ID for cleanup
+	if err := d.truenasClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFPortSubsysID, strconv.Itoa(portSubsys.ID)); err != nil {
+		klog.Warningf("Failed to store NVMe-oF port-subsystem ID: %v", err)
+	}
+
 	// Create namespace (TrueNAS 25.10+: device_path format is "zvol/pool/vol", device_type is required)
 	devicePath := fmt.Sprintf("zvol/%s", datasetName)
 	namespace, err := d.truenasClient.NVMeoFNamespaceCreate(ctx, subsys.ID, devicePath, "ZVOL")
 	if err != nil {
+		// Cleanup port-subsystem association and subsystem on namespace failure
+		if delErr := d.truenasClient.NVMeoFPortSubsysDelete(ctx, portSubsys.ID); delErr != nil {
+			klog.Warningf("Failed to cleanup NVMe-oF port-subsystem association: %v", delErr)
+		}
 		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
 			klog.Warningf("Failed to cleanup NVMe-oF subsystem: %v", delErr)
 		}
@@ -558,26 +602,7 @@ func (d *Driver) createNVMeoFShareWithOptions(ctx context.Context, datasetName s
 		return status.Errorf(codes.Internal, "failed to store NVMe-oF namespace ID: %v", err)
 	}
 
-	// Get or create the NVMe-oF TCP port and associate subsystem with it
-	// TrueNAS 25.10+: Subsystems must be associated with a port to be accessible over the network
-	port, err := d.truenasClient.NVMeoFGetOrCreatePort(
-		ctx,
-		d.config.NVMeoF.Transport,
-		d.config.NVMeoF.TransportAddress,
-		d.config.NVMeoF.TransportServiceID,
-	)
-	if err != nil {
-		klog.Warningf("Failed to get/create NVMe-oF port (subsystem may not be accessible): %v", err)
-	} else {
-		// Associate subsystem with port
-		if err := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsys.ID); err != nil {
-			klog.Warningf("Failed to associate subsystem with port (subsystem may not be accessible): %v", err)
-		} else {
-			klog.V(4).Infof("Associated NVMe-oF subsystem %d with port %d", subsys.ID, port.ID)
-		}
-	}
-
-	klog.Infof("Created NVMe-oF subsystem=%d, namespace=%d for %s", subsys.ID, namespace.ID, datasetName)
+	klog.Infof("Created NVMe-oF subsystem=%d, namespace=%d, port-assoc=%d for %s", subsys.ID, namespace.ID, portSubsys.ID, datasetName)
 	return nil
 }
 
@@ -599,7 +624,18 @@ func (d *Driver) deleteNVMeoFShare(ctx context.Context, datasetName string) erro
 	var nsDeleted, ssDeleted bool
 	var errs []error
 
-	// Step 1: Try to delete namespace by stored ID
+	// Step 1: Try to delete port-subsystem association by stored ID
+	// (fallback cleanup is handled in subsystem deletion steps below)
+	if psIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFPortSubsysID); psIDStr != "" && psIDStr != "-" {
+		if psID, err := strconv.Atoi(psIDStr); err == nil {
+			if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, psID); err != nil {
+				klog.Warningf("Failed to delete NVMe-oF port-subsystem %d: %v", psID, err)
+				// Don't add to errs - fallback will clean up via subsystem listing
+			}
+		}
+	}
+
+	// Step 2: Try to delete namespace by stored ID
 	if nsIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID); nsIDStr != "" && nsIDStr != "-" {
 		if nsID, err := strconv.Atoi(nsIDStr); err == nil {
 			if err := d.truenasClient.NVMeoFNamespaceDelete(ctx, nsID); err != nil {

@@ -38,6 +38,7 @@ const (
 	PropISCSITargetExtentID       = "truenas-csi:truenas_iscsi_targetextent_id"
 	PropNVMeoFSubsystemID         = "truenas-csi:truenas_nvmeof_subsystem_id"
 	PropNVMeoFNamespaceID         = "truenas-csi:truenas_nvmeof_namespace_id"
+	PropNVMeoFPortSubsysID        = "truenas-csi:truenas_nvmeof_portsubsys_id"
 )
 
 // ControllerGetCapabilities returns the capabilities of the controller.
@@ -141,13 +142,34 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	defer d.releaseOperationLock(lockKey)
 
-	// Calculate capacity
+	// Calculate and validate capacity
 	capacityBytes := int64(0)
 	if req.GetCapacityRange() != nil {
 		capacityBytes = req.GetCapacityRange().GetRequiredBytes()
+		limitBytes := req.GetCapacityRange().GetLimitBytes()
+
+		// Validate limit vs required
+		if limitBytes > 0 && capacityBytes > limitBytes {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"required capacity (%d bytes) exceeds limit (%d bytes)", capacityBytes, limitBytes)
+		}
 	}
 	if capacityBytes == 0 {
 		capacityBytes = 1024 * 1024 * 1024 // Default 1GiB
+	}
+
+	// Minimum capacity validation (at least 1MiB to avoid edge cases)
+	const minCapacity = 1024 * 1024 // 1 MiB
+	if capacityBytes < minCapacity {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"requested capacity (%d bytes) is below minimum (%d bytes)", capacityBytes, minCapacity)
+	}
+
+	// Maximum capacity sanity check (1PiB should be more than enough)
+	const maxCapacity = 1024 * 1024 * 1024 * 1024 * 1024 // 1 PiB
+	if capacityBytes > maxCapacity {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"requested capacity (%d bytes) exceeds maximum (%d bytes)", capacityBytes, maxCapacity)
 	}
 
 	// Get volume ID from name
@@ -285,8 +307,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	})
 	// Wait for all property sets to complete
 	if err := g.Wait(); err != nil {
-		// If property setting fails, return error so it retries
-		klog.Errorf("Failed to set properties for volume %s: %v", volumeID, err)
+		// Property setting failed - clean up the share and dataset to avoid orphaned resources
+		// The next CreateVolume call will start fresh
+		klog.Errorf("Failed to set properties for volume %s: %v - cleaning up orphaned resources", volumeID, err)
+		if delErr := d.deleteShare(ctx, datasetName, shareType); delErr != nil {
+			klog.Warningf("Failed to cleanup share after property failure: %v", delErr)
+		}
+		if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, false); delErr != nil {
+			klog.Warningf("Failed to cleanup dataset after property failure: %v", delErr)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to set volume properties: %v", err)
 	}
 
@@ -335,11 +364,32 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// Dataset is gone but there may be orphaned NVMe-oF/iSCSI resources.
 			// Since we can't check dataset properties, try both protocols using
 			// fallback logic that finds resources by name.
+			var cleanupErrors []string
 			if cleanupErr := d.deleteShare(ctx, datasetName, ShareTypeNVMeoF); cleanupErr != nil {
-				klog.V(4).Infof("No orphaned NVMe-oF resources to cleanup for %s: %v", volumeID, cleanupErr)
+				// Only log as warning if it's not a "not found" type error
+				errStr := cleanupErr.Error()
+				if strings.Contains(errStr, "cleanup errors") {
+					klog.Warningf("Failed to cleanup orphaned NVMe-oF resources for %s: %v", volumeID, cleanupErr)
+					cleanupErrors = append(cleanupErrors, "NVMe-oF: "+errStr)
+				} else {
+					klog.V(4).Infof("No orphaned NVMe-oF resources for %s", volumeID)
+				}
+			} else {
+				klog.Infof("Cleaned up orphaned NVMe-oF resources for %s", volumeID)
 			}
 			if cleanupErr := d.deleteShare(ctx, datasetName, ShareTypeISCSI); cleanupErr != nil {
-				klog.V(4).Infof("No orphaned iSCSI resources to cleanup for %s: %v", volumeID, cleanupErr)
+				errStr := cleanupErr.Error()
+				if strings.Contains(errStr, "cleanup errors") {
+					klog.Warningf("Failed to cleanup orphaned iSCSI resources for %s: %v", volumeID, cleanupErr)
+					cleanupErrors = append(cleanupErrors, "iSCSI: "+errStr)
+				} else {
+					klog.V(4).Infof("No orphaned iSCSI resources for %s", volumeID)
+				}
+			} else {
+				klog.Infof("Cleaned up orphaned iSCSI resources for %s", volumeID)
+			}
+			if len(cleanupErrors) > 0 {
+				klog.Warningf("Some orphaned resources could not be cleaned up for %s: %v", volumeID, cleanupErrors)
 			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
@@ -350,37 +400,65 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// Determine share type from stored ZFS properties (most reliable)
 	// This handles the case where a single driver handles multiple protocols
 	shareType := d.config.GetDriverShareType() // fallback to driver name
+	shareTypeKnown := false
 	if ds != nil {
 		// Check stored properties to determine share type - these were set during CreateVolume
 		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok && prop.Value != "" && prop.Value != "-" {
 			shareType = ShareTypeNVMeoF
+			shareTypeKnown = true
 			klog.V(4).Infof("Detected NVMe-oF volume from stored subsystem ID property")
 		} else if prop, ok := ds.UserProperties[PropISCSITargetID]; ok && prop.Value != "" && prop.Value != "-" {
 			shareType = ShareTypeISCSI
+			shareTypeKnown = true
 			klog.V(4).Infof("Detected iSCSI volume from stored target ID property")
 		} else if prop, ok := ds.UserProperties[PropNFSShareID]; ok && prop.Value != "" && prop.Value != "-" {
 			shareType = ShareTypeNFS
+			shareTypeKnown = true
 			klog.V(4).Infof("Detected NFS volume from stored share ID property")
 		} else {
 			// Fallback to dataset type-based detection
 			switch ds.Type {
 			case "FILESYSTEM":
 				shareType = ShareTypeNFS
+				shareTypeKnown = true
 			case "VOLUME":
-				// For zvol without stored properties, try driver config
-				if d.config.GetDriverShareType() == ShareTypeNVMeoF {
-					shareType = ShareTypeNVMeoF
-				} else {
-					shareType = ShareTypeISCSI
-				}
+				// For zvol without stored properties, we need to try BOTH protocols
+				// to avoid orphaning resources if the driver config doesn't match
+				klog.Warningf("Volume %s has no stored protocol properties, will try cleanup for both iSCSI and NVMe-oF", volumeID)
 			}
 		}
 	}
 
 	// Delete share first (errors are fatal to prevent orphaned targets)
-	if err := d.deleteShare(ctx, datasetName, shareType); err != nil {
-		klog.Errorf("Failed to delete share for volume %s: %v", volumeID, err)
-		return nil, status.Errorf(codes.Internal, "failed to delete share: %v", err)
+	if shareTypeKnown {
+		// We know the share type, delete just that one
+		if err := d.deleteShare(ctx, datasetName, shareType); err != nil {
+			klog.Errorf("Failed to delete share for volume %s: %v", volumeID, err)
+			return nil, status.Errorf(codes.Internal, "failed to delete share: %v", err)
+		}
+	} else if ds != nil && ds.Type == "VOLUME" {
+		// Unknown zvol - try both iSCSI and NVMe-oF to avoid orphaned resources
+		// One will likely return "not found" which is fine
+		var lastErr error
+		if err := d.deleteShare(ctx, datasetName, ShareTypeISCSI); err != nil {
+			klog.V(4).Infof("iSCSI cleanup for %s: %v (may be expected if not iSCSI)", volumeID, err)
+			lastErr = err
+		}
+		if err := d.deleteShare(ctx, datasetName, ShareTypeNVMeoF); err != nil {
+			klog.V(4).Infof("NVMe-oF cleanup for %s: %v (may be expected if not NVMe-oF)", volumeID, err)
+			lastErr = err
+		}
+		// Only fail if BOTH cleanup attempts had unexpected errors
+		// "not found" type errors are expected for the wrong protocol
+		if lastErr != nil && !strings.Contains(lastErr.Error(), "not found") && !strings.Contains(lastErr.Error(), "cleanup errors") {
+			klog.Warningf("Share cleanup had errors for %s: %v", volumeID, lastErr)
+		}
+	} else {
+		// Default fallback for filesystem or unknown types
+		if err := d.deleteShare(ctx, datasetName, shareType); err != nil {
+			klog.Errorf("Failed to delete share for volume %s: %v", volumeID, err)
+			return nil, status.Errorf(codes.Internal, "failed to delete share: %v", err)
+		}
 	}
 
 	// Get origin snapshot property before deletion (for volume-to-volume clones)
@@ -609,7 +687,6 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	}
 
 	// Set snapshot properties in parallel
-	// Set snapshot properties in parallel
 	g, gCtx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		if err := d.truenasClient.SnapshotSetUserProperty(gCtx, snap.ID, PropManagedResource, "true"); err != nil {
@@ -630,7 +707,12 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		return nil
 	})
 	if err := g.Wait(); err != nil {
-		klog.Errorf("Failed to set properties for snapshot %s: %v", snapshotID, err)
+		// Property setting failed - delete the snapshot to avoid orphaned/invisible snapshots
+		// Without PropManagedResource=true, the snapshot won't appear in ListSnapshots
+		klog.Errorf("Failed to set properties for snapshot %s: %v - deleting orphaned snapshot", snapshotID, err)
+		if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
+			klog.Warningf("Failed to cleanup snapshot after property failure: %v", delErr)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to set snapshot properties: %v", err)
 	}
 
@@ -743,7 +825,17 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snapshotID string, cl
 			continue
 		}
 
-		// CSI-managed - check for active exports
+		// Check if provisioning is complete - if not, the clone is still being set up
+		// and we should treat it as active to avoid race conditions with CreateVolume
+		provisionProp, hasProvisionProp := ds.UserProperties[PropProvisionSuccess]
+		if !hasProvisionProp || provisionProp.Value != "true" {
+			// Clone is still being provisioned - treat as active
+			klog.V(4).Infof("Clone %s is still being provisioned (PropProvisionSuccess=%v), treating as active", cloneDataset, provisionProp.Value)
+			activeClones = append(activeClones, cloneDataset)
+			continue
+		}
+
+		// CSI-managed and fully provisioned - check for active exports
 		hasExport, err := d.cloneHasActiveExport(ctx, cloneDataset, ds.Type)
 		if err != nil {
 			// If we can't determine, assume active to be safe
@@ -952,13 +1044,31 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 		}
 	}
 
-	// For filesystems (NFS), update quota if enabled
-	if ds.Type == "FILESYSTEM" && d.config.ZFS.DatasetEnableQuotas {
-		params := &truenas.DatasetUpdateParams{
-			Refquota: capacityBytes,
-		}
-		if _, err := d.truenasClient.DatasetUpdate(ctx, datasetName, params); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to update quota: %v", err)
+	// For filesystems (NFS), update quota
+	if ds.Type == "FILESYSTEM" {
+		if d.config.ZFS.DatasetEnableQuotas {
+			// Quotas are enabled - update the refquota
+			params := &truenas.DatasetUpdateParams{
+				Refquota: capacityBytes,
+			}
+			if _, err := d.truenasClient.DatasetUpdate(ctx, datasetName, params); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to update quota: %v", err)
+			}
+		} else {
+			// Quotas are disabled - check if dataset has a quota set and update it,
+			// otherwise the filesystem already has unlimited space from the pool
+			if parsed, ok := ds.Refquota.Parsed.(float64); ok && parsed > 0 {
+				// Dataset has an existing quota, update it
+				params := &truenas.DatasetUpdateParams{
+					Refquota: capacityBytes,
+				}
+				if _, err := d.truenasClient.DatasetUpdate(ctx, datasetName, params); err != nil {
+					return nil, status.Errorf(codes.Internal, "failed to update quota: %v", err)
+				}
+			}
+			// If no quota exists and quotas are disabled, the filesystem can already
+			// use all available pool space - expansion is a no-op
+			klog.V(4).Infof("NFS volume %s has no quota set, expansion is a no-op", volumeID)
 		}
 	}
 

@@ -316,21 +316,59 @@ func (c *Client) NVMeoFPortFindByAddress(ctx context.Context, transport string, 
 // NVMeoFPortSubsysCreate creates an association between a port and a subsystem.
 // This makes the subsystem accessible on that port.
 // Updated for TrueNAS SCALE 25.10+: uses nvmet.port_subsys.create API.
-func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) error {
+// Returns the created association object for tracking purposes.
+func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) (*NVMeoFPortSubsys, error) {
 	params := map[string]interface{}{
 		"port_id":   portID,
 		"subsys_id": subsysID,
 	}
 
-	_, err := c.Call(ctx, "nvmet.port_subsys.create", params)
+	result, err := c.Call(ctx, "nvmet.port_subsys.create", params)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
-			return nil // Association already exists, that's fine
+			// Find and return the existing association
+			assocs, findErr := c.NVMeoFPortSubsysListBySubsystem(ctx, subsysID)
+			if findErr != nil {
+				return nil, findErr
+			}
+			for _, assoc := range assocs {
+				if assoc.PortID == portID {
+					return assoc, nil
+				}
+			}
+			// Association exists but we couldn't find it - return a minimal object
+			return &NVMeoFPortSubsys{PortID: portID, SubsysID: subsysID}, nil
 		}
-		return fmt.Errorf("failed to create port-subsystem association: %w", err)
+		return nil, fmt.Errorf("failed to create port-subsystem association: %w", err)
 	}
 
-	return nil
+	return parseNVMeoFPortSubsys(result)
+}
+
+// parseNVMeoFPortSubsys converts raw API response to NVMeoFPortSubsys.
+func parseNVMeoFPortSubsys(data interface{}) (*NVMeoFPortSubsys, error) {
+	m, ok := data.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected NVMe-oF port-subsys format")
+	}
+
+	assoc := &NVMeoFPortSubsys{}
+
+	if v, ok := m["id"].(float64); ok {
+		assoc.ID = int(v)
+	}
+	if port, ok := m["port"].(map[string]interface{}); ok {
+		if id, ok := port["id"].(float64); ok {
+			assoc.PortID = int(id)
+		}
+	}
+	if subsys, ok := m["subsys"].(map[string]interface{}); ok {
+		if id, ok := subsys["id"].(float64); ok {
+			assoc.SubsysID = int(id)
+		}
+	}
+
+	return assoc, nil
 }
 
 // NVMeoFPortSubsysFindBySubsystem checks if a subsystem is already associated with any port.
