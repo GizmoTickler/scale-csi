@@ -73,7 +73,7 @@ func TestSnapshotCreate_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -86,7 +86,7 @@ func TestSnapshotCreate_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "snap-test")
@@ -148,7 +148,7 @@ func TestSnapshotCreate_AlreadyExists(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -161,7 +161,7 @@ func TestSnapshotCreate_AlreadyExists(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "existing")
@@ -221,7 +221,7 @@ func TestSnapshotCreate_ZFSAPIPrefix(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -234,7 +234,7 @@ func TestSnapshotCreate_ZFSAPIPrefix(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "zfs-snap")
@@ -283,7 +283,7 @@ func TestSnapshotDelete_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -296,7 +296,7 @@ func TestSnapshotDelete_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.SnapshotDelete(ctx, "tank/k8s/volumes/pvc-123@snap-delete", false, false)
@@ -345,7 +345,7 @@ func TestSnapshotDelete_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -358,7 +358,7 @@ func TestSnapshotDelete_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	// Should succeed - idempotent delete
@@ -413,7 +413,7 @@ func TestSnapshotDelete_InvalidParams_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -426,7 +426,7 @@ func TestSnapshotDelete_InvalidParams_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	// Should succeed - snapshot doesn't exist
@@ -490,7 +490,7 @@ func TestSnapshotDelete_HasClones(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -503,7 +503,7 @@ func TestSnapshotDelete_HasClones(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.SnapshotDelete(ctx, "tank/k8s/volumes/pvc-123@with-clones", false, false)
@@ -577,7 +577,7 @@ func TestSnapshotGet_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -590,7 +590,7 @@ func TestSnapshotGet_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snap, err := client.SnapshotGet(ctx, "tank/k8s/volumes/pvc-123@snap-get")
@@ -644,7 +644,7 @@ func TestSnapshotGet_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -657,7 +657,7 @@ func TestSnapshotGet_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snap, err := client.SnapshotGet(ctx, "tank/k8s/volumes/pvc-123@nonexistent")
@@ -721,7 +721,7 @@ func TestSnapshotList_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -734,7 +734,7 @@ func TestSnapshotList_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snapshots, err := client.SnapshotList(ctx, "tank/k8s/volumes/pvc-123")
@@ -808,7 +808,7 @@ func TestSnapshotListAll_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -821,7 +821,7 @@ func TestSnapshotListAll_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snapshots, err := client.SnapshotListAll(ctx, "tank/k8s/volumes", 0, 0)
@@ -875,7 +875,7 @@ func TestSnapshotFindByName_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -888,7 +888,7 @@ func TestSnapshotFindByName_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snap, err := client.SnapshotFindByName(ctx, "tank/k8s/volumes", "target-snap")
@@ -933,7 +933,7 @@ func TestSnapshotFindByName_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -946,7 +946,7 @@ func TestSnapshotFindByName_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	snap, err := client.SnapshotFindByName(ctx, "tank/k8s/volumes", "nonexistent")
@@ -994,7 +994,7 @@ func TestSnapshotClone_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1007,7 +1007,7 @@ func TestSnapshotClone_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.SnapshotClone(ctx, "tank/k8s/volumes/pvc-source@snap", "tank/k8s/volumes/pvc-clone")
@@ -1056,7 +1056,7 @@ func TestSnapshotClone_AlreadyExists(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1069,7 +1069,7 @@ func TestSnapshotClone_AlreadyExists(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	// Should succeed - idempotent
@@ -1117,7 +1117,7 @@ func TestSnapshotRollback_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1130,7 +1130,7 @@ func TestSnapshotRollback_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.SnapshotRollback(ctx, "tank/k8s/volumes/pvc-123@snap-rollback", true, false, false)
@@ -1184,7 +1184,7 @@ func TestSnapshotSetUserProperty_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1197,7 +1197,7 @@ func TestSnapshotSetUserProperty_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.SnapshotSetUserProperty(ctx, "tank/k8s/volumes/pvc-123@snap-prop", "truenas-csi:test", "test-value")
@@ -1464,7 +1464,7 @@ func TestMockClient_SnapshotOperations(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify deletion
-	snap, err = mock.SnapshotGet(ctx, "tank/test/snap-parent@test-snap")
+	_, err = mock.SnapshotGet(ctx, "tank/test/snap-parent@test-snap")
 	assert.Error(t, err)
 }
 
@@ -1583,7 +1583,7 @@ func TestSnapshotCreate_TableDriven(t *testing.T) {
 			host := parts[0]
 			port := 80
 			if len(parts) > 1 {
-				fmt.Sscanf(parts[1], "%d", &port)
+				_, _ = fmt.Sscanf(parts[1], "%d", &port)
 			}
 
 			client, err := NewClient(&ClientConfig{
@@ -1596,7 +1596,7 @@ func TestSnapshotCreate_TableDriven(t *testing.T) {
 				MaxConnections: 1,
 			})
 			require.NoError(t, err)
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			ctx := context.Background()
 			snap, err := client.SnapshotCreate(ctx, tt.dataset, tt.snapName)

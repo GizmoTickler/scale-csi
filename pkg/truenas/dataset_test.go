@@ -2,12 +2,10 @@ package truenas
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -22,7 +20,6 @@ type mockWSServer struct {
 	handler   func(conn *websocket.Conn)
 	upgrader  websocket.Upgrader
 	responses map[string]interface{}
-	mu        sync.RWMutex
 }
 
 func newMockWSServer() *mockWSServer {
@@ -42,7 +39,7 @@ func (m *mockWSServer) start(handler func(conn *websocket.Conn)) *httptest.Serve
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		m.handler(conn)
 	}))
 	return m.server
@@ -131,7 +128,7 @@ func TestDatasetCreate_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -144,7 +141,7 @@ func TestDatasetCreate_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	params := &DatasetCreateParams{
@@ -213,7 +210,7 @@ func TestDatasetCreate_AlreadyExists(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -226,7 +223,7 @@ func TestDatasetCreate_AlreadyExists(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	params := &DatasetCreateParams{
@@ -295,7 +292,7 @@ func TestDatasetGet_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -308,7 +305,7 @@ func TestDatasetGet_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	ds, err := client.DatasetGet(ctx, "tank/k8s/volumes/pvc-123")
@@ -355,7 +352,7 @@ func TestDatasetGet_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -368,7 +365,7 @@ func TestDatasetGet_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	ds, err := client.DatasetGet(ctx, "tank/nonexistent")
@@ -414,7 +411,7 @@ func TestDatasetDelete_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -427,7 +424,7 @@ func TestDatasetDelete_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.DatasetDelete(ctx, "tank/k8s/volumes/pvc-delete", false, false)
@@ -473,7 +470,7 @@ func TestDatasetDelete_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -486,7 +483,7 @@ func TestDatasetDelete_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	// Should succeed (idempotent delete)
@@ -532,7 +529,7 @@ func TestDatasetDelete_InvalidParams(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -545,7 +542,7 @@ func TestDatasetDelete_InvalidParams(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	// Should succeed (idempotent delete - TrueNAS returns -32602 when dataset doesn't exist)
@@ -600,7 +597,7 @@ func TestDatasetUpdate_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -613,7 +610,7 @@ func TestDatasetUpdate_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	params := &DatasetUpdateParams{
@@ -676,7 +673,7 @@ func TestDatasetList_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -689,7 +686,7 @@ func TestDatasetList_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	datasets, err := client.DatasetList(ctx, "tank/k8s/volumes", 0, 0)
@@ -746,7 +743,7 @@ func TestDatasetExpand_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -759,7 +756,7 @@ func TestDatasetExpand_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.DatasetExpand(ctx, "tank/k8s/volumes/pvc-expand", 53687091200)
@@ -829,7 +826,7 @@ func TestDatasetSetUserProperty_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -842,7 +839,7 @@ func TestDatasetSetUserProperty_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.DatasetSetUserProperty(ctx, "tank/k8s/volumes/pvc-userprop", "truenas-csi:nfs_share_id", "42")
@@ -897,7 +894,7 @@ func TestDatasetGetUserProperty_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -910,7 +907,7 @@ func TestDatasetGetUserProperty_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	value, err := client.DatasetGetUserProperty(ctx, "tank/k8s/volumes/pvc-getprop", "truenas-csi:nfs_share_id")
@@ -961,7 +958,7 @@ func TestDatasetGetUserProperty_Missing(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -974,7 +971,7 @@ func TestDatasetGetUserProperty_Missing(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	value, err := client.DatasetGetUserProperty(ctx, "tank/k8s/volumes/pvc-noprop", "truenas-csi:missing")
@@ -1025,7 +1022,7 @@ func TestDatasetExists_True(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1038,7 +1035,7 @@ func TestDatasetExists_True(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	exists, err := client.DatasetExists(ctx, "tank/k8s/volumes/existing")
@@ -1081,7 +1078,7 @@ func TestDatasetExists_False(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1094,7 +1091,7 @@ func TestDatasetExists_False(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	exists, err := client.DatasetExists(ctx, "tank/k8s/volumes/nonexistent")
@@ -1150,7 +1147,7 @@ func TestGetPoolAvailable_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1163,7 +1160,7 @@ func TestGetPoolAvailable_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	avail, err := client.GetPoolAvailable(ctx, "tank/k8s/volumes")
@@ -1340,7 +1337,7 @@ func TestDatasetCreate_TableDriven(t *testing.T) {
 			host := parts[0]
 			port := 80
 			if len(parts) > 1 {
-				fmt.Sscanf(parts[1], "%d", &port)
+				_, _ = fmt.Sscanf(parts[1], "%d", &port)
 			}
 
 			client, err := NewClient(&ClientConfig{
@@ -1353,7 +1350,7 @@ func TestDatasetCreate_TableDriven(t *testing.T) {
 				MaxConnections: 1,
 			})
 			require.NoError(t, err)
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			ctx := context.Background()
 			ds, err := client.DatasetCreate(ctx, tt.params)
@@ -1413,7 +1410,7 @@ func TestWaitForDatasetReady_ImmediateSuccess(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1426,7 +1423,7 @@ func TestWaitForDatasetReady_ImmediateSuccess(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	ds, err := client.WaitForDatasetReady(ctx, "tank/k8s/volumes/ready", 5*time.Second)
@@ -1471,7 +1468,7 @@ func TestWaitForDatasetReady_Timeout(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1484,7 +1481,7 @@ func TestWaitForDatasetReady_Timeout(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	ds, err := client.WaitForDatasetReady(ctx, "tank/k8s/volumes/never-ready", 500*time.Millisecond)
@@ -1555,7 +1552,7 @@ func TestWaitForZvolReady_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1568,7 +1565,7 @@ func TestWaitForZvolReady_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	ds, err := client.WaitForZvolReady(ctx, "tank/k8s/volumes/zvol", 5*time.Second)
@@ -1699,11 +1696,3 @@ func BenchmarkParseDataset(b *testing.B) {
 	}
 }
 
-// Helper function to marshal JSON for comparison
-func mustMarshalJSON(v interface{}) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return string(b)
-}

@@ -57,7 +57,7 @@ func TestConnection_AtomicConnAccess_ConcurrentReadWrite(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	cfg := &ClientConfig{
@@ -73,7 +73,7 @@ func TestConnection_AtomicConnAccess_ConcurrentReadWrite(t *testing.T) {
 
 	client, err := NewClient(cfg)
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Run concurrent operations that access conn atomically
 	var wg sync.WaitGroup
@@ -159,7 +159,7 @@ func TestConnection_AtomicConnSwap_Reconnect(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	cfg := &ClientConfig{
@@ -174,7 +174,7 @@ func TestConnection_AtomicConnSwap_Reconnect(t *testing.T) {
 
 	client, err := NewClient(cfg)
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var wg sync.WaitGroup
 
@@ -185,7 +185,7 @@ func TestConnection_AtomicConnSwap_Reconnect(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-				client.Call(ctx, "test.method", id, j)
+				_, _ = client.Call(ctx, "test.method", id, j)
 				cancel()
 			}
 		}(i)
@@ -259,7 +259,7 @@ func TestConnection_ChannelDrain_Timeout(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	cfg := &ClientConfig{
@@ -274,7 +274,7 @@ func TestConnection_ChannelDrain_Timeout(t *testing.T) {
 
 	client, err := NewClient(cfg)
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Make calls that will timeout
 	var wg sync.WaitGroup
@@ -345,7 +345,7 @@ func TestConnection_ChannelDrain_ContextCancellation(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	cfg := &ClientConfig{
@@ -360,7 +360,7 @@ func TestConnection_ChannelDrain_ContextCancellation(t *testing.T) {
 
 	client, err := NewClient(cfg)
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Make calls with immediate cancellation
 	var wg sync.WaitGroup
@@ -410,17 +410,17 @@ func TestConnection_PendingMapCleanup(t *testing.T) {
 			switch req.Method {
 			case "auth.login_with_api_key":
 				resp.Result = true
-				conn.WriteJSON(resp)
+				_ = conn.WriteJSON(resp)
 			case "fast.method":
 				resp.Result = "fast"
-				conn.WriteJSON(resp)
+				_ = conn.WriteJSON(resp)
 			case "slow.method":
 				time.Sleep(200 * time.Millisecond)
 				resp.Result = "slow"
-				conn.WriteJSON(resp)
+				_ = conn.WriteJSON(resp)
 			default:
 				resp.Result = "ok"
-				conn.WriteJSON(resp)
+				_ = conn.WriteJSON(resp)
 			}
 		}
 	})
@@ -431,7 +431,7 @@ func TestConnection_PendingMapCleanup(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	cfg := &ClientConfig{
@@ -446,7 +446,7 @@ func TestConnection_PendingMapCleanup(t *testing.T) {
 
 	client, err := NewClient(cfg)
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Make several timeout calls
 	for i := 0; i < 5; i++ {
@@ -505,7 +505,7 @@ func TestClient_ConnectionPool_ConcurrentAccess(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	cfg := &ClientConfig{
@@ -521,7 +521,7 @@ func TestClient_ConnectionPool_ConcurrentAccess(t *testing.T) {
 
 	client, err := NewClient(cfg)
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var wg sync.WaitGroup
 	var successCount int64
@@ -583,7 +583,7 @@ func TestConnection_WriteLoop_SafeShutdown(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	cfg := &ClientConfig{
@@ -607,7 +607,7 @@ func TestConnection_WriteLoop_SafeShutdown(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			client.Call(ctx, "test.method", id)
+			_, _ = client.Call(ctx, "test.method", id)
 		}(i)
 	}
 
@@ -654,7 +654,7 @@ func TestConnectionState_AtomicTransitions(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	cfg := &ClientConfig{
@@ -669,7 +669,7 @@ func TestConnectionState_AtomicTransitions(t *testing.T) {
 
 	client, err := NewClient(cfg)
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	var wg sync.WaitGroup
 
@@ -691,7 +691,7 @@ func TestConnectionState_AtomicTransitions(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-				client.Call(ctx, "test.method", id, j)
+				_, _ = client.Call(ctx, "test.method", id, j)
 				cancel()
 			}
 		}(i)

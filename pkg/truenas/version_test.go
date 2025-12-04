@@ -1,6 +1,7 @@
 package truenas
 
 import (
+	"context"
 	"testing"
 )
 
@@ -148,7 +149,7 @@ func TestCheckNVMeoFSupport(t *testing.T) {
 				versionCache: info,
 			}
 
-			err := client.CheckNVMeoFSupport(nil)
+			err := client.CheckNVMeoFSupport(context.Background())
 			if tt.expectError && err == nil {
 				t.Errorf("CheckNVMeoFSupport() expected error for version %s, got nil", tt.version)
 			}

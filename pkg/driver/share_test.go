@@ -202,9 +202,9 @@ func TestDeleteISCSIShare_PropagatesCleanupErrors(t *testing.T) {
 	require.NoError(t, err)
 
 	// Store iSCSI resource IDs in properties
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetID, "1")
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, "2")
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetExtentID, "3")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetID, "1")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, "2")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetExtentID, "3")
 
 	// Inject error for extent deletion
 	mockClient.InjectISCSIExtentDeleteError = fmt.Errorf("extent still in use")
@@ -234,13 +234,13 @@ func TestDeleteISCSIShare_MultipleErrors(t *testing.T) {
 	// Setup
 	datasetName := "tank/k8s/volumes/test-iscsi-multi-err"
 	ctx := context.Background()
-	mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+	_, _ = mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: datasetName,
 		Type: "VOLUME",
 	})
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetID, "1")
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, "2")
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetExtentID, "3")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetID, "1")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, "2")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetExtentID, "3")
 
 	// Inject multiple errors
 	mockClient.InjectISCSITargetDeleteError = fmt.Errorf("target delete failed")
@@ -276,13 +276,13 @@ func TestDeleteNVMeoFShare_PropagatesCleanupErrors(t *testing.T) {
 	// Setup
 	datasetName := "tank/k8s/volumes/test-nvme-vol"
 	ctx := context.Background()
-	mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+	_, _ = mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: datasetName,
 		Type: "VOLUME",
 	})
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID, "1")
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, "2")
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFPortSubsysID, "3")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID, "1")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, "2")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFPortSubsysID, "3")
 
 	// Inject error for subsystem deletion
 	mockClient.InjectNVMeoFSubsystemDeleteError = fmt.Errorf("subsystem deletion failed")
@@ -319,7 +319,7 @@ func TestCreateNFSShare_PropertyError_ReturnsError(t *testing.T) {
 	// Setup: Create a dataset
 	datasetName := "tank/k8s/volumes/test-nfs-prop-err"
 	ctx := context.Background()
-	mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+	_, _ = mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: datasetName,
 		Type: "FILESYSTEM",
 	})
@@ -364,7 +364,7 @@ func TestCreateISCSIShare_TargetCreation_Success(t *testing.T) {
 	// Setup: Create a zvol
 	datasetName := "tank/k8s/volumes/test-iscsi-create"
 	ctx := context.Background()
-	mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+	_, _ = mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name:    datasetName,
 		Type:    "VOLUME",
 		Volsize: 1024 * 1024 * 1024,
@@ -405,11 +405,11 @@ func TestEnsureShareExists_AlreadyExists(t *testing.T) {
 	// Setup: Create a dataset with existing share ID
 	datasetName := "tank/k8s/volumes/test-existing-share"
 	ctx := context.Background()
-	mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+	_, _ = mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: datasetName,
 		Type: "FILESYSTEM",
 	})
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, "42")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, "42")
 
 	// Get the dataset
 	ds, err := mockClient.DatasetGet(ctx, datasetName)
@@ -439,7 +439,7 @@ func TestEnsureShareExists_MissingShare(t *testing.T) {
 	// Setup: Create a dataset WITHOUT share ID property
 	datasetName := "tank/k8s/volumes/test-missing-share"
 	ctx := context.Background()
-	mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+	_, _ = mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: datasetName,
 		Type: "FILESYSTEM",
 	})
@@ -477,11 +477,11 @@ func TestEnsureShareExists_DashValue(t *testing.T) {
 	// Setup: Create a dataset with "-" value for share ID
 	datasetName := "tank/k8s/volumes/test-dash-share"
 	ctx := context.Background()
-	mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+	_, _ = mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: datasetName,
 		Type: "FILESYSTEM",
 	})
-	mockClient.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, "-")
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, "-")
 
 	// Get the dataset
 	ds, err := mockClient.DatasetGet(ctx, datasetName)

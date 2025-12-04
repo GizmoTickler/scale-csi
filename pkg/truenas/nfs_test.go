@@ -3,8 +3,6 @@ package truenas
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -58,7 +56,7 @@ func TestNFSShareCreate_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -71,7 +69,7 @@ func TestNFSShareCreate_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	params := &NFSShareCreateParams{
@@ -141,7 +139,7 @@ func TestNFSShareCreate_AlreadyExists(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -154,7 +152,7 @@ func TestNFSShareCreate_AlreadyExists(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	params := &NFSShareCreateParams{
@@ -216,7 +214,7 @@ func TestNFSShareCreate_AlreadySharedError(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -229,7 +227,7 @@ func TestNFSShareCreate_AlreadySharedError(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	params := &NFSShareCreateParams{
@@ -280,7 +278,7 @@ func TestNFSShareCreate_Failure(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -293,7 +291,7 @@ func TestNFSShareCreate_Failure(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	params := &NFSShareCreateParams{
@@ -343,7 +341,7 @@ func TestNFSShareDelete_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -356,7 +354,7 @@ func TestNFSShareDelete_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.NFSShareDelete(ctx, 42)
@@ -402,7 +400,7 @@ func TestNFSShareDelete_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -415,7 +413,7 @@ func TestNFSShareDelete_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	// Should succeed - idempotent delete
@@ -461,7 +459,7 @@ func TestNFSShareDelete_NotFoundError(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -474,7 +472,7 @@ func TestNFSShareDelete_NotFoundError(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	// Should succeed - idempotent delete
@@ -531,7 +529,7 @@ func TestNFSShareGet_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -544,7 +542,7 @@ func TestNFSShareGet_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	share, err := client.NFSShareGet(ctx, 42)
@@ -596,7 +594,7 @@ func TestNFSShareGet_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -609,7 +607,7 @@ func TestNFSShareGet_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	share, err := client.NFSShareGet(ctx, 9999)
@@ -661,7 +659,7 @@ func TestNFSShareFindByPath_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -674,7 +672,7 @@ func TestNFSShareFindByPath_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	share, err := client.NFSShareFindByPath(ctx, "/mnt/tank/k8s/volumes/find-by-path")
@@ -718,7 +716,7 @@ func TestNFSShareFindByPath_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -731,7 +729,7 @@ func TestNFSShareFindByPath_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	share, err := client.NFSShareFindByPath(ctx, "/mnt/nonexistent/path")
@@ -789,7 +787,7 @@ func TestNFSShareFindByPath_MultiPath(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -802,7 +800,7 @@ func TestNFSShareFindByPath_MultiPath(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	share, err := client.NFSShareFindByPath(ctx, "/mnt/tank/k8s/volumes/multi-path")
@@ -865,7 +863,7 @@ func TestNFSShareList_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -878,7 +876,7 @@ func TestNFSShareList_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	shares, err := client.NFSShareList(ctx)
@@ -926,7 +924,7 @@ func TestNFSShareList_Empty(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -939,7 +937,7 @@ func TestNFSShareList_Empty(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	shares, err := client.NFSShareList(ctx)
@@ -989,7 +987,7 @@ func TestNFSShareUpdate_Success(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -1002,7 +1000,7 @@ func TestNFSShareUpdate_Success(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	params := map[string]interface{}{
@@ -1186,7 +1184,7 @@ func TestNFSShareCreate_TableDriven(t *testing.T) {
 			host := parts[0]
 			port := 80
 			if len(parts) > 1 {
-				fmt.Sscanf(parts[1], "%d", &port)
+				_, _ = fmt.Sscanf(parts[1], "%d", &port)
 			}
 
 			client, err := NewClient(&ClientConfig{
@@ -1199,7 +1197,7 @@ func TestNFSShareCreate_TableDriven(t *testing.T) {
 				MaxConnections: 1,
 			})
 			require.NoError(t, err)
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			ctx := context.Background()
 			share, err := client.NFSShareCreate(ctx, tt.params)
@@ -1304,39 +1302,3 @@ func BenchmarkParseNFSShare(b *testing.B) {
 	}
 }
 
-// createTestServer is a helper to create a test WebSocket server
-func createTestServer(t *testing.T, handler func(conn *websocket.Conn)) (*httptest.Server, *ClientConfig) {
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Fatalf("Failed to upgrade: %v", err)
-			return
-		}
-		defer conn.Close()
-		handler(conn)
-	}))
-
-	wsURL := strings.Replace(server.URL, "http://", "", 1)
-	parts := strings.Split(wsURL, ":")
-	host := parts[0]
-	port := 80
-	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
-	}
-
-	config := &ClientConfig{
-		Host:           host,
-		Port:           port,
-		Protocol:       "http",
-		APIKey:         "test-api-key",
-		Timeout:        5 * time.Second,
-		ConnectTimeout: 5 * time.Second,
-		MaxConnections: 1,
-	}
-
-	return server, config
-}

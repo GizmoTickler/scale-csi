@@ -77,7 +77,7 @@ func TestISCSITargetCreate_InvalidParams_ExistingTarget(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -90,7 +90,7 @@ func TestISCSITargetCreate_InvalidParams_ExistingTarget(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	target, err := client.ISCSITargetCreate(ctx, "existing-target", "", "ISCSI", nil)
@@ -154,7 +154,7 @@ func TestISCSIExtentCreate_InvalidParams_ExistingExtent(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -167,7 +167,7 @@ func TestISCSIExtentCreate_InvalidParams_ExistingExtent(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	extent, err := client.ISCSIExtentCreate(ctx, "existing-extent", "zvol/tank/vol1", "comment", 512, "SSD")
@@ -228,7 +228,7 @@ func TestISCSITargetExtentCreate_InvalidParams_ExistingAssociation(t *testing.T)
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -241,7 +241,7 @@ func TestISCSITargetExtentCreate_InvalidParams_ExistingAssociation(t *testing.T)
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	te, err := client.ISCSITargetExtentCreate(ctx, 1, 2, 0)
@@ -321,7 +321,7 @@ func TestNVMeoFSubsystemDelete_InvalidParams_StillExists(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -334,7 +334,7 @@ func TestNVMeoFSubsystemDelete_InvalidParams_StillExists(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.NVMeoFSubsystemDelete(ctx, 5)
@@ -393,7 +393,7 @@ func TestNVMeoFSubsystemDelete_InvalidParams_AlreadyDeleted(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -406,7 +406,7 @@ func TestNVMeoFSubsystemDelete_InvalidParams_AlreadyDeleted(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.NVMeoFSubsystemDelete(ctx, 999)
@@ -493,7 +493,7 @@ func TestNVMeoFNamespaceDelete_InvalidParams_Verification(t *testing.T) {
 			host := parts[0]
 			port := 80
 			if len(parts) > 1 {
-				fmt.Sscanf(parts[1], "%d", &port)
+				_, _ = fmt.Sscanf(parts[1], "%d", &port)
 			}
 
 			client, err := NewClient(&ClientConfig{
@@ -506,7 +506,7 @@ func TestNVMeoFNamespaceDelete_InvalidParams_Verification(t *testing.T) {
 				MaxConnections: 1,
 			})
 			require.NoError(t, err)
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			ctx := context.Background()
 			err = client.NVMeoFNamespaceDelete(ctx, 10)
@@ -601,7 +601,7 @@ func TestNVMeoFPortSubsysDelete_InvalidParams_Verification(t *testing.T) {
 			host := parts[0]
 			port := 80
 			if len(parts) > 1 {
-				fmt.Sscanf(parts[1], "%d", &port)
+				_, _ = fmt.Sscanf(parts[1], "%d", &port)
 			}
 
 			client, err := NewClient(&ClientConfig{
@@ -614,7 +614,7 @@ func TestNVMeoFPortSubsysDelete_InvalidParams_Verification(t *testing.T) {
 				MaxConnections: 1,
 			})
 			require.NoError(t, err)
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			ctx := context.Background()
 			err = client.NVMeoFPortSubsysDelete(ctx, 100)
@@ -673,7 +673,7 @@ func TestISCSITargetDelete_DoesNotExist(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -686,7 +686,7 @@ func TestISCSITargetDelete_DoesNotExist(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.ISCSITargetDelete(ctx, 999, false)
@@ -736,7 +736,7 @@ func TestISCSIExtentDelete_NotFound(t *testing.T) {
 	host := parts[0]
 	port := 80
 	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
 	}
 
 	client, err := NewClient(&ClientConfig{
@@ -749,7 +749,7 @@ func TestISCSIExtentDelete_NotFound(t *testing.T) {
 		MaxConnections: 1,
 	})
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	err = client.ISCSIExtentDelete(ctx, 999, false, false)

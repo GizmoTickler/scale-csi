@@ -620,9 +620,9 @@ func TestMockClient_ISCSITargetExtentFindByTarget_Multiple(t *testing.T) {
 	extent2, _ := client.ISCSIExtentCreate(ctx, "extent2", "zvol/tank/vol2", "", 512, "SSD")
 	extent3, _ := client.ISCSIExtentCreate(ctx, "extent3", "zvol/tank/vol3", "", 512, "SSD")
 
-	client.ISCSITargetExtentCreate(ctx, target.ID, extent1.ID, 0)
-	client.ISCSITargetExtentCreate(ctx, target.ID, extent2.ID, 1)
-	client.ISCSITargetExtentCreate(ctx, target.ID, extent3.ID, 2)
+	_, _ = client.ISCSITargetExtentCreate(ctx, target.ID, extent1.ID, 0)
+	_, _ = client.ISCSITargetExtentCreate(ctx, target.ID, extent2.ID, 1)
+	_, _ = client.ISCSITargetExtentCreate(ctx, target.ID, extent3.ID, 2)
 
 	results, err := client.ISCSITargetExtentFindByTarget(ctx, target.ID)
 	require.NoError(t, err)
@@ -637,8 +637,8 @@ func TestMockClient_ISCSITargetExtentFindByExtent_Multiple(t *testing.T) {
 	target2, _ := client.ISCSITargetCreate(ctx, "target2", "", "ISCSI", nil)
 	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, "SSD")
 
-	client.ISCSITargetExtentCreate(ctx, target1.ID, extent.ID, 0)
-	client.ISCSITargetExtentCreate(ctx, target2.ID, extent.ID, 0)
+	_, _ = client.ISCSITargetExtentCreate(ctx, target1.ID, extent.ID, 0)
+	_, _ = client.ISCSITargetExtentCreate(ctx, target2.ID, extent.ID, 0)
 
 	results, err := client.ISCSITargetExtentFindByExtent(ctx, extent.ID)
 	require.NoError(t, err)
@@ -809,7 +809,7 @@ func TestMockClient_ISCSIConcurrentReadWrite(t *testing.T) {
 	// Pre-populate some targets
 	for i := 0; i < 10; i++ {
 		name := fmt.Sprintf("rw-target-%d", i)
-		client.ISCSITargetCreate(ctx, name, "", "ISCSI", nil)
+		_, _ = client.ISCSITargetCreate(ctx, name, "", "ISCSI", nil)
 	}
 
 	var wg sync.WaitGroup
@@ -830,7 +830,7 @@ func TestMockClient_ISCSIConcurrentReadWrite(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			name := fmt.Sprintf("new-rw-target-%d", idx)
-			client.ISCSITargetCreate(ctx, name, "", "ISCSI", nil)
+			_, _ = client.ISCSITargetCreate(ctx, name, "", "ISCSI", nil)
 		}(i)
 	}
 

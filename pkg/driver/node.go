@@ -730,7 +730,7 @@ func createSymlinkAtomic(target, linkPath string) error {
 	// Create a temporary symlink next to the target
 	tempLink := linkPath + ".tmp"
 	// Remove any stale temp link first
-	os.Remove(tempLink)
+	_ = os.Remove(tempLink)
 
 	if err := os.Symlink(target, tempLink); err != nil {
 		return fmt.Errorf("failed to create temporary symlink: %w", err)
@@ -738,7 +738,7 @@ func createSymlinkAtomic(target, linkPath string) error {
 
 	// Atomic rename to replace the old symlink
 	if err := os.Rename(tempLink, linkPath); err != nil {
-		os.Remove(tempLink) // Clean up temp link on failure
+		_ = os.Remove(tempLink) // Clean up temp link on failure
 		return fmt.Errorf("failed to atomically replace symlink: %w", err)
 	}
 

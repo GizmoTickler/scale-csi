@@ -569,7 +569,7 @@ func TestMockClient_NVMeoFSubsystemList(t *testing.T) {
 
 	// Create several subsystems
 	for i := 0; i < 5; i++ {
-		client.NVMeoFSubsystemCreate(ctx, fmt.Sprintf("list-subsys-%d", i), true, nil)
+		_, _ = client.NVMeoFSubsystemCreate(ctx, fmt.Sprintf("list-subsys-%d", i), true, nil)
 	}
 
 	list, err := client.NVMeoFSubsystemList(ctx)
@@ -895,7 +895,7 @@ func TestMockClient_NVMeoFConcurrentReadWrite(t *testing.T) {
 	// Pre-populate
 	for i := 0; i < 10; i++ {
 		name := fmt.Sprintf("rw-subsys-%d", i)
-		client.NVMeoFSubsystemCreate(ctx, name, true, nil)
+		_, _ = client.NVMeoFSubsystemCreate(ctx, name, true, nil)
 	}
 
 	var wg sync.WaitGroup
@@ -916,7 +916,7 @@ func TestMockClient_NVMeoFConcurrentReadWrite(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			name := fmt.Sprintf("new-rw-subsys-%d", idx)
-			client.NVMeoFSubsystemCreate(ctx, name, true, nil)
+			_, _ = client.NVMeoFSubsystemCreate(ctx, name, true, nil)
 		}(i)
 	}
 
