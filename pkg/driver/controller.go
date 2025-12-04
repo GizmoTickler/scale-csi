@@ -332,14 +332,14 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	if err != nil {
 		if truenas.IsNotFoundError(err) {
 			klog.Infof("Volume %s dataset not found, attempting orphaned resource cleanup", volumeID)
-			// Even though the dataset is gone, there may be orphaned NVMe-oF/iSCSI
-			// resources that weren't cleaned up. Use the driver's configured share type
-			// to attempt cleanup using fallback logic (finds resources by name).
-			shareType := d.config.GetDriverShareType()
-			if shareType == ShareTypeNVMeoF || shareType == ShareTypeISCSI {
-				if cleanupErr := d.deleteShare(ctx, datasetName, shareType); cleanupErr != nil {
-					klog.Warningf("Failed to cleanup orphaned %s resources for %s: %v", shareType, volumeID, cleanupErr)
-				}
+			// Dataset is gone but there may be orphaned NVMe-oF/iSCSI resources.
+			// Since we can't check dataset properties, try both protocols using
+			// fallback logic that finds resources by name.
+			if cleanupErr := d.deleteShare(ctx, datasetName, ShareTypeNVMeoF); cleanupErr != nil {
+				klog.V(4).Infof("No orphaned NVMe-oF resources to cleanup for %s: %v", volumeID, cleanupErr)
+			}
+			if cleanupErr := d.deleteShare(ctx, datasetName, ShareTypeISCSI); cleanupErr != nil {
+				klog.V(4).Infof("No orphaned iSCSI resources to cleanup for %s: %v", volumeID, cleanupErr)
 			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
@@ -347,19 +347,32 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		klog.V(4).Infof("Could not verify volume existence: %v", err)
 	}
 
-	// Determine share type from dataset type
-	// Filesystem = NFS, Volume (zvol) = iSCSI or NVMe-oF
+	// Determine share type from stored ZFS properties (most reliable)
+	// This handles the case where a single driver handles multiple protocols
 	shareType := d.config.GetDriverShareType() // fallback to driver name
 	if ds != nil {
-		switch ds.Type {
-		case "FILESYSTEM":
+		// Check stored properties to determine share type - these were set during CreateVolume
+		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok && prop.Value != "" && prop.Value != "-" {
+			shareType = ShareTypeNVMeoF
+			klog.V(4).Infof("Detected NVMe-oF volume from stored subsystem ID property")
+		} else if prop, ok := ds.UserProperties[PropISCSITargetID]; ok && prop.Value != "" && prop.Value != "-" {
+			shareType = ShareTypeISCSI
+			klog.V(4).Infof("Detected iSCSI volume from stored target ID property")
+		} else if prop, ok := ds.UserProperties[PropNFSShareID]; ok && prop.Value != "" && prop.Value != "-" {
 			shareType = ShareTypeNFS
-		case "VOLUME":
-			// For zvol, prefer iSCSI unless driver specifically configured for NVMe-oF
-			if d.config.GetDriverShareType() == ShareTypeNVMeoF {
-				shareType = ShareTypeNVMeoF
-			} else {
-				shareType = ShareTypeISCSI
+			klog.V(4).Infof("Detected NFS volume from stored share ID property")
+		} else {
+			// Fallback to dataset type-based detection
+			switch ds.Type {
+			case "FILESYSTEM":
+				shareType = ShareTypeNFS
+			case "VOLUME":
+				// For zvol without stored properties, try driver config
+				if d.config.GetDriverShareType() == ShareTypeNVMeoF {
+					shareType = ShareTypeNVMeoF
+				} else {
+					shareType = ShareTypeISCSI
+				}
 			}
 		}
 	}
