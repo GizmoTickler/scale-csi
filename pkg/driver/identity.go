@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -69,9 +70,16 @@ func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeRe
 	}
 
 	if !d.truenasClient.IsConnected() {
-		// Try to reconnect
+		// Actually trigger reconnection by making a lightweight API call
 		klog.Warning("TrueNAS client disconnected, attempting reconnection")
-		// The client will auto-reconnect on next call
+		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err := d.truenasClient.Call(pingCtx, "core.ping")
+		cancel()
+		if err != nil {
+			klog.Warningf("TrueNAS reconnection failed: %v", err)
+			return nil, status.Error(codes.Unavailable, "TrueNAS connection lost")
+		}
+		klog.Info("TrueNAS reconnection successful")
 	}
 
 	return &csi.ProbeResponse{
