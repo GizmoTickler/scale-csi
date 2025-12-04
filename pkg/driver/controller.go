@@ -327,7 +327,16 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err != nil {
 		if truenas.IsNotFoundError(err) {
-			klog.Infof("Volume %s already deleted or does not exist", volumeID)
+			klog.Infof("Volume %s dataset not found, attempting orphaned resource cleanup", volumeID)
+			// Even though the dataset is gone, there may be orphaned NVMe-oF/iSCSI
+			// resources that weren't cleaned up. Use the driver's configured share type
+			// to attempt cleanup using fallback logic (finds resources by name).
+			shareType := d.config.GetDriverShareType()
+			if shareType == ShareTypeNVMeoF || shareType == ShareTypeISCSI {
+				if cleanupErr := d.deleteShare(ctx, datasetName, shareType); cleanupErr != nil {
+					klog.Warningf("Failed to cleanup orphaned %s resources for %s: %v", shareType, volumeID, cleanupErr)
+				}
+			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
 		// Log but don't fail - try to proceed with deletion anyway
