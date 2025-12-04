@@ -384,6 +384,23 @@ func (m *MockClient) ServiceReload(ctx context.Context, service string) error {
 	return nil
 }
 
+// System information methods
+func (m *MockClient) GetSystemInfo(ctx context.Context) (*SystemInfo, error) {
+	// Return a mock TrueNAS SCALE 25.10+ version for testing
+	return &SystemInfo{
+		Version:      "TrueNAS-SCALE-25.10.0",
+		VersionMajor: 25,
+		VersionMinor: 10,
+		VersionPatch: 0,
+		Hostname:     "truenas-mock",
+	}, nil
+}
+
+func (m *MockClient) CheckNVMeoFSupport(ctx context.Context) error {
+	// Mock always supports NVMe-oF (returns 25.10+)
+	return nil
+}
+
 // iSCSI methods
 func (m *MockClient) ISCSITargetCreate(ctx context.Context, name string, alias string, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
 	m.mu.Lock()

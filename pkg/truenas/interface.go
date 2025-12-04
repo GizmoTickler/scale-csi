@@ -50,6 +50,10 @@ type ClientInterface interface {
 	// Service methods
 	ServiceReload(ctx context.Context, service string) error
 
+	// System information methods
+	GetSystemInfo(ctx context.Context) (*SystemInfo, error)
+	CheckNVMeoFSupport(ctx context.Context) error
+
 	// iSCSI methods
 	ISCSITargetCreate(ctx context.Context, name string, alias string, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error)
 	ISCSITargetDelete(ctx context.Context, id int, force bool) error

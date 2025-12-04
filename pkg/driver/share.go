@@ -387,8 +387,9 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName st
 	// window will be coalesced into a single reload operation.
 	klog.V(4).Infof("Requesting debounced iSCSI service reload to ensure target is discoverable")
 	if err := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
-		// Non-fatal: the service might auto-reload, and node has retry logic
-		klog.V(4).Infof("iSCSI service reload returned (may be normal): %v", err)
+		// Non-fatal: the service might auto-reload, and node has retry logic.
+		// Log at WARNING level for operator visibility (not V(4) debug level).
+		klog.Warningf("iSCSI service reload failed (non-fatal, will retry on node): %v", err)
 	}
 
 	klog.Infof("iSCSI share setup complete for %s: target=%d, extent=%d, targetextent=%d (took %v)",

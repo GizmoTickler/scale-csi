@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,6 +91,18 @@ func IsConnectionError(err error) bool {
 // method is the API method name, duration is in seconds, err is nil on success.
 type MetricsRecorder func(method string, duration float64, err error)
 
+// SystemInfo represents TrueNAS system information including version.
+type SystemInfo struct {
+	Version        string `json:"version"`         // Full version string (e.g., "TrueNAS-SCALE-25.10.0")
+	VersionMajor   int    // Major version (e.g., 25)
+	VersionMinor   int    // Minor version (e.g., 10)
+	VersionPatch   int    // Patch version (e.g., 0)
+	Hostname       string `json:"hostname"`
+	UptimeSeconds  int64  `json:"uptime_seconds"`
+	SystemProduct  string `json:"system_product"`
+	SystemSerial   string `json:"system_serial"`
+}
+
 // ClientConfig holds the configuration for the TrueNAS client.
 type ClientConfig struct {
 	Host               string
@@ -135,7 +148,7 @@ const (
 type Connection struct {
 	id            int
 	config        *ClientConfig
-	conn          *websocket.Conn
+	conn          atomic.Pointer[websocket.Conn] // atomic for lock-free reads
 	mu            sync.RWMutex
 	messageID     int64
 	pending       map[int64]chan *rpcResponse
@@ -184,6 +197,10 @@ type Client struct {
 	semaphore       chan struct{}   // Limits concurrent requests to prevent TrueNAS overload
 	metricsRecorder MetricsRecorder // Optional callback for recording request metrics
 	circuitBreaker  *CircuitBreaker // Optional circuit breaker for API calls
+
+	// Version detection cache
+	versionMu    sync.RWMutex
+	versionCache *SystemInfo
 }
 
 // rpcRequest is a JSON-RPC 2.0 request.
@@ -323,8 +340,8 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 
 // connect establishes the WebSocket connection and authenticates.
 func (c *Connection) connect() error {
-	// Fast path: already connected
-	if atomic.LoadInt32(&c.connState) == int32(stateConnected) && c.conn != nil {
+	// Fast path: already connected (lock-free check using atomic operations)
+	if atomic.LoadInt32(&c.connState) == int32(stateConnected) && c.conn.Load() != nil {
 		return nil
 	}
 
@@ -336,14 +353,14 @@ func (c *Connection) connect() error {
 
 	switch currentState {
 	case stateConnected:
-		if c.conn != nil {
+		if c.conn.Load() != nil {
 			return nil
 		}
 	case stateConnecting:
 		for atomic.LoadInt32(&c.connState) == int32(stateConnecting) {
 			c.connCond.Wait()
 		}
-		if atomic.LoadInt32(&c.connState) == int32(stateConnected) && c.conn != nil {
+		if atomic.LoadInt32(&c.connState) == int32(stateConnected) && c.conn.Load() != nil {
 			return nil
 		}
 	}
@@ -400,14 +417,14 @@ func (c *Connection) connectWithRetry() error {
 
 		klog.V(2).Infof("Conn %d: Connecting to %s (attempt %d)", c.id, wsURL, attempt+1)
 
-		conn, _, err := dialer.Dial(wsURL, headers)
+		wsConn, _, err := dialer.Dial(wsURL, headers)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to connect: %w", err)
 			continue
 		}
 
 		c.mu.Lock()
-		c.conn = conn
+		c.conn.Store(wsConn)
 		c.closed = false
 		c.writeCh = make(chan writeRequest, 100)
 		c.writeLoopDone = make(chan struct{})
@@ -445,9 +462,9 @@ func (c *Connection) connectWithRetry() error {
 // cleanupConnection closes the connection and stops goroutines.
 func (c *Connection) cleanupConnection() {
 	c.mu.Lock()
-	if c.conn != nil {
-		_ = c.conn.Close()
-		c.conn = nil
+	conn := c.conn.Swap(nil)
+	if conn != nil {
+		_ = conn.Close()
 	}
 	c.authenticated = false
 	c.mu.Unlock()
@@ -469,9 +486,9 @@ func (c *Connection) authenticateDirect() error {
 	c.mu.Lock()
 	c.messageID++
 	id := c.messageID
-	conn := c.conn
 	c.mu.Unlock()
 
+	conn := c.conn.Load()
 	if conn == nil {
 		return fmt.Errorf("no connection")
 	}
@@ -510,6 +527,11 @@ func (c *Connection) authenticateDirect() error {
 		}
 		return nil
 	case <-time.After(c.config.Timeout):
+		// Drain response channel before deleting to prevent orphaned sends
+		select {
+		case <-respChan:
+		default:
+		}
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
@@ -528,9 +550,7 @@ func (c *Connection) writeLoop() {
 				return
 			}
 
-			c.mu.RLock()
-			conn := c.conn
-			c.mu.RUnlock()
+			conn := c.conn.Load()
 
 			var err error
 			if conn == nil {
@@ -558,11 +578,10 @@ func (c *Connection) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			c.mu.RLock()
-			conn := c.conn
 			closed := c.closed
 			c.mu.RUnlock()
 
-			if closed || conn == nil {
+			if closed || c.conn.Load() == nil {
 				return
 			}
 
@@ -604,10 +623,10 @@ func (c *Connection) readMessages() {
 
 	for {
 		c.mu.RLock()
-		conn := c.conn
 		closed := c.closed
 		c.mu.RUnlock()
 
+		conn := c.conn.Load()
 		if closed || conn == nil {
 			return
 		}
@@ -649,10 +668,9 @@ func (c *Connection) handleDisconnect() {
 
 	c.mu.Lock()
 	c.authenticated = false
-	conn := c.conn
-	c.conn = nil
 	c.mu.Unlock()
 
+	conn := c.conn.Swap(nil)
 	if conn != nil {
 		_ = conn.Close()
 	}
@@ -689,11 +707,7 @@ func (c *Connection) handleDisconnect() {
 
 // CallWithContext makes a JSON-RPC call using this connection.
 func (c *Connection) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
-	c.mu.RLock()
-	conn := c.conn
-	c.mu.RUnlock()
-
-	if conn == nil {
+	if c.conn.Load() == nil {
 		if err := c.connect(); err != nil {
 			return nil, err
 		}
@@ -725,6 +739,11 @@ func (c *Connection) CallWithContext(ctx context.Context, method string, params 
 	select {
 	case writeCh <- writeReq:
 	case <-ctx.Done():
+		// Drain response channel before deleting to prevent orphaned sends
+		select {
+		case <-respChan:
+		default:
+		}
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
@@ -740,6 +759,11 @@ func (c *Connection) CallWithContext(ctx context.Context, method string, params 
 			return nil, fmt.Errorf("failed to send request: %w", err)
 		}
 	case <-ctx.Done():
+		// Drain response channel before deleting to prevent orphaned sends
+		select {
+		case <-respChan:
+		default:
+		}
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
@@ -759,15 +783,19 @@ func (c *Connection) CallWithContext(ctx context.Context, method string, params 
 		}
 		return resp.Result, nil
 	case <-ctx.Done():
-		c.pendingMu.Lock()
-		delete(c.pending, id)
-		c.pendingMu.Unlock()
-		// Drain the response channel to prevent memory leak if response arrives after timeout.
+		// Drain the response channel first to catch any response that arrived
+		// between checking ctx.Done() and acquiring the lock.
 		// The channel is buffered (size 1), so this is non-blocking.
 		select {
 		case <-respChan:
 		default:
 		}
+		// Now delete from pending. If a response arrives after this point,
+		// readMessages() won't find the channel in pending, so the send is skipped.
+		// This is safe because we already drained the channel above.
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
 		return nil, fmt.Errorf("request timeout: %s", method)
 	}
 }
@@ -776,9 +804,9 @@ func (c *Connection) CallWithContext(ctx context.Context, method string, params 
 func (c *Connection) Close() error {
 	c.mu.Lock()
 	c.closed = true
-	conn := c.conn
-	c.conn = nil
 	c.mu.Unlock()
+
+	conn := c.conn.Swap(nil)
 
 	atomic.StoreInt32(&c.connState, int32(stateDisconnected))
 
@@ -805,7 +833,7 @@ func (c *Connection) Close() error {
 func (c *Connection) IsConnected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.conn != nil && c.authenticated && atomic.LoadInt32(&c.connState) == int32(stateConnected)
+	return c.conn.Load() != nil && c.authenticated && atomic.LoadInt32(&c.connState) == int32(stateConnected)
 }
 
 // Call makes a JSON-RPC call to the TrueNAS API using the connection pool.
@@ -976,5 +1004,117 @@ func (c *Client) ServiceReload(ctx context.Context, service string) error {
 		return fmt.Errorf("failed to reload service %s: %w", service, err)
 	}
 	klog.Infof("Service %s reloaded successfully", service)
+	return nil
+}
+
+// GetSystemInfo retrieves TrueNAS system information including version.
+// The result is cached to avoid repeated API calls.
+func (c *Client) GetSystemInfo(ctx context.Context) (*SystemInfo, error) {
+	// Check cache first
+	c.versionMu.RLock()
+	if c.versionCache != nil {
+		cached := c.versionCache
+		c.versionMu.RUnlock()
+		return cached, nil
+	}
+	c.versionMu.RUnlock()
+
+	// Not cached, fetch from API
+	c.versionMu.Lock()
+	defer c.versionMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if c.versionCache != nil {
+		return c.versionCache, nil
+	}
+
+	result, err := c.Call(ctx, "system.info")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get system info: %w", err)
+	}
+
+	info, err := parseSystemInfo(result)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the result
+	c.versionCache = info
+	return info, nil
+}
+
+// parseSystemInfo parses the system.info API response.
+func parseSystemInfo(data interface{}) (*SystemInfo, error) {
+	m, ok := data.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected system info format")
+	}
+
+	info := &SystemInfo{}
+
+	if v, ok := m["version"].(string); ok {
+		info.Version = v
+		// Parse version string (e.g., "TrueNAS-SCALE-25.10.0" or "25.10.0")
+		parseTrueNASVersion(v, info)
+	}
+	if v, ok := m["hostname"].(string); ok {
+		info.Hostname = v
+	}
+	if v, ok := m["uptime_seconds"].(float64); ok {
+		info.UptimeSeconds = int64(v)
+	}
+	if v, ok := m["system_product"].(string); ok {
+		info.SystemProduct = v
+	}
+	if v, ok := m["system_serial"].(string); ok {
+		info.SystemSerial = v
+	}
+
+	return info, nil
+}
+
+// parseTrueNASVersion extracts major.minor.patch from TrueNAS version string.
+// Handles formats like "TrueNAS-SCALE-25.10.0", "25.10.0", "25.10", etc.
+func parseTrueNASVersion(version string, info *SystemInfo) {
+	// Strip "TrueNAS-SCALE-" prefix if present
+	version = strings.TrimPrefix(version, "TrueNAS-SCALE-")
+	version = strings.TrimPrefix(version, "TrueNAS-")
+
+	// Split by dots and parse integers
+	parts := strings.Split(version, ".")
+	if len(parts) > 0 {
+		if v, err := strconv.Atoi(parts[0]); err == nil {
+			info.VersionMajor = v
+		}
+	}
+	if len(parts) > 1 {
+		if v, err := strconv.Atoi(parts[1]); err == nil {
+			info.VersionMinor = v
+		}
+	}
+	if len(parts) > 2 {
+		// Handle patch versions with suffixes (e.g., "0-MASTER", "0.1")
+		patchStr := strings.Split(parts[2], "-")[0]
+		if v, err := strconv.Atoi(patchStr); err == nil {
+			info.VersionPatch = v
+		}
+	}
+}
+
+// CheckNVMeoFSupport checks if the TrueNAS version supports NVMe-oF (25.10+).
+// Returns an error if NVMe-oF is not supported.
+func (c *Client) CheckNVMeoFSupport(ctx context.Context) error {
+	info, err := c.GetSystemInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to detect TrueNAS version: %w", err)
+	}
+
+	// NVMe-oF requires TrueNAS SCALE 25.10 or later
+	if info.VersionMajor < 25 || (info.VersionMajor == 25 && info.VersionMinor < 10) {
+		return fmt.Errorf("NVMe-oF is not supported on TrueNAS SCALE %d.%d (requires 25.10 or later)",
+			info.VersionMajor, info.VersionMinor)
+	}
+
+	klog.V(4).Infof("TrueNAS SCALE version %s supports NVMe-oF", info.Version)
 	return nil
 }
