@@ -24,6 +24,7 @@ var (
 	dataset    = flag.String("dataset", "", "Dataset path for dataset commands")
 	service    = flag.String("service", "", "Service name for service commands")
 	verbose    = flag.Bool("v", false, "Verbose output")
+	cleanup    = flag.Bool("cleanup", false, "Cleanup orphaned resources (for audit commands)")
 )
 
 func main() {
@@ -523,84 +524,133 @@ func cmdNVMeoFAudit(ctx context.Context, client *truenas.Client) {
 
 	fmt.Println()
 
-	// Print ports
-	fmt.Println("=== Ports ===")
-	for _, p := range ports {
-		if m, ok := p.(map[string]interface{}); ok {
-			fmt.Printf("  Port ID: %.0f\n", m["id"])
-			fmt.Printf("    Transport: %v\n", m["addr_trtype"])
-			fmt.Printf("    Address: %v\n", m["addr_traddr"])
-			fmt.Printf("    Port: %v\n", m["addr_trsvcid"])
-			if subs, ok := m["subsystems"].([]interface{}); ok {
-				fmt.Printf("    Subsystems: %v\n", subs)
-			}
-			fmt.Println()
-		}
-	}
-
-	// Print port-subsystem associations
-	fmt.Println("=== Port-Subsystem Associations ===")
-	for _, ps := range portSubsys {
-		if m, ok := ps.(map[string]interface{}); ok {
-			portID := "?"
-			subsysID := "?"
-			subsysNQN := "?"
-			if port, ok := m["port"].(map[string]interface{}); ok {
-				if id, ok := port["id"].(float64); ok {
-					portID = fmt.Sprintf("%.0f", id)
-				}
-			}
-			if subsys, ok := m["subsys"].(map[string]interface{}); ok {
-				if id, ok := subsys["id"].(float64); ok {
-					subsysID = fmt.Sprintf("%.0f", id)
-				}
-				if nqn, ok := subsys["subnqn"].(string); ok {
-					subsysNQN = nqn
-				}
-			}
-			fmt.Printf("  Port %s <-> Subsystem %s (%s)\n", portID, subsysID, subsysNQN)
-		}
-	}
-
-	// Build maps for orphan detection
-	subsysIDs := make(map[float64]string) // id -> nqn
-	subsysHasPort := make(map[float64]bool)
+	// Build maps for analysis
+	subsysInfo := make(map[float64]map[string]interface{}) // id -> full subsystem object
+	subsysNamespaces := make(map[float64]int)              // subsys id -> namespace count
+	portSubsysAssocs := make(map[float64][]float64)        // subsys id -> port-subsys association IDs
 
 	for _, s := range subsystems {
 		if m, ok := s.(map[string]interface{}); ok {
 			if id, ok := m["id"].(float64); ok {
-				nqn := ""
-				if n, ok := m["subnqn"].(string); ok {
-					nqn = n
-				}
-				subsysIDs[id] = nqn
+				subsysInfo[id] = m
+				subsysNamespaces[id] = 0
 			}
 		}
 	}
 
+	// Count namespaces per subsystem
+	// Note: subsys can be either a float64 (ID) or an object with an id field
+	for _, ns := range namespaces {
+		if m, ok := ns.(map[string]interface{}); ok {
+			var subsysID float64
+			if id, ok := m["subsys"].(float64); ok {
+				subsysID = id
+			} else if subsysObj, ok := m["subsys"].(map[string]interface{}); ok {
+				if id, ok := subsysObj["id"].(float64); ok {
+					subsysID = id
+				}
+			}
+			if subsysID > 0 {
+				subsysNamespaces[subsysID]++
+			}
+		}
+	}
+
+	// Track port-subsystem associations
 	for _, ps := range portSubsys {
 		if m, ok := ps.(map[string]interface{}); ok {
+			assocID, _ := m["id"].(float64)
 			if subsys, ok := m["subsys"].(map[string]interface{}); ok {
-				if id, ok := subsys["id"].(float64); ok {
-					subsysHasPort[id] = true
+				if subsysID, ok := subsys["id"].(float64); ok {
+					portSubsysAssocs[subsysID] = append(portSubsysAssocs[subsysID], assocID)
 				}
 			}
 		}
 	}
 
-	// Find orphaned subsystems (no port association)
-	fmt.Println()
-	fmt.Println("=== Subsystems Without Port Associations ===")
-	orphanCount := 0
-	for id, nqn := range subsysIDs {
-		if !subsysHasPort[id] {
-			fmt.Printf("  Subsystem %.0f: %s\n", id, nqn)
-			orphanCount++
+	// Find orphaned subsystems (CSI-named with 0 namespaces)
+	type orphan struct {
+		id        float64
+		name      string
+		nsCount   int
+		portCount int
+		assocIDs  []float64
+	}
+	var orphans []orphan
+
+	for id, info := range subsysInfo {
+		name := ""
+		if n, ok := info["name"].(string); ok {
+			name = n
+		}
+		// Check if it looks like a CSI PVC name
+		if strings.HasPrefix(name, "pvc-") {
+			nsCount := subsysNamespaces[id]
+			assocs := portSubsysAssocs[id]
+			// Orphan if no namespaces attached
+			if nsCount == 0 {
+				orphans = append(orphans, orphan{
+					id:        id,
+					name:      name,
+					nsCount:   nsCount,
+					portCount: len(assocs),
+					assocIDs:  assocs,
+				})
+			}
 		}
 	}
-	if orphanCount == 0 {
-		fmt.Println("  None - all subsystems have port associations")
-	} else {
-		fmt.Printf("\n  WARNING: %d subsystems are not accessible (no port association)\n", orphanCount)
+
+	// Sort by name for consistent output
+	sort.Slice(orphans, func(i, j int) bool {
+		return orphans[i].name < orphans[j].name
+	})
+
+	// Print orphans
+	fmt.Println("=== Orphaned CSI Subsystems (pvc-* with 0 namespaces) ===")
+	if len(orphans) == 0 {
+		fmt.Println("  None found!")
+		return
 	}
+
+	fmt.Printf("  Found %d orphaned subsystems:\n\n", len(orphans))
+	for _, o := range orphans {
+		fmt.Printf("  ID: %.0f  Name: %s  Namespaces: %d  Port-Assocs: %d\n",
+			o.id, o.name, o.nsCount, o.portCount)
+	}
+
+	// Cleanup if requested
+	if !*cleanup {
+		fmt.Println()
+		fmt.Println("  To delete these orphans, run with --cleanup flag")
+		return
+	}
+
+	fmt.Println()
+	fmt.Println("=== Cleaning up orphaned subsystems ===")
+
+	deleted := 0
+	failed := 0
+
+	for _, o := range orphans {
+		fmt.Printf("  Deleting subsystem %.0f (%s)...", o.id, o.name)
+
+		// First delete port-subsystem associations
+		for _, assocID := range o.assocIDs {
+			if _, err := client.Call(ctx, "nvmet.port_subsys.delete", int(assocID)); err != nil {
+				fmt.Printf(" [WARN: failed to delete port-assoc %.0f: %v]", assocID, err)
+			}
+		}
+
+		// Then delete the subsystem
+		if _, err := client.Call(ctx, "nvmet.subsys.delete", int(o.id)); err != nil {
+			fmt.Printf(" FAILED: %v\n", err)
+			failed++
+		} else {
+			fmt.Printf(" OK\n")
+			deleted++
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("=== Cleanup complete: %d deleted, %d failed ===\n", deleted, failed)
 }
