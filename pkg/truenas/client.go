@@ -588,6 +588,15 @@ func (c *Connection) heartbeatLoop() {
 // readMessages reads incoming WebSocket messages.
 // Uses a read deadline to prevent goroutine leaks when the connection dies without error.
 func (c *Connection) readMessages() {
+	// Recover from gorilla/websocket panics (e.g., "repeated read on failed websocket connection")
+	// This can happen if the connection fails between timeout checks
+	defer func() {
+		if r := recover(); r != nil {
+			klog.Warningf("Conn %d: Recovered from WebSocket panic: %v", c.id, r)
+			c.handleDisconnect()
+		}
+	}()
+
 	// Read deadline allows us to periodically check if the connection should be closed
 	const readDeadlineInterval = 30 * time.Second
 
