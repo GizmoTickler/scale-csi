@@ -83,6 +83,9 @@ type ClientInterface interface {
 	NVMeoFPortFindByAddress(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error)
 	NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) error
 	NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error)
+	NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error)
+	NVMeoFPortSubsysDelete(ctx context.Context, id int) error
+	NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, error)
 	NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error)
 	NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error)
 }

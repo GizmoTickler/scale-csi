@@ -645,6 +645,23 @@ func (m *MockClient) NVMeoFPortSubsysCreate(ctx context.Context, portID int, sub
 func (m *MockClient) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
 	return true, nil
 }
+func (m *MockClient) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error) {
+	// Return empty list for mock
+	return nil, nil
+}
+func (m *MockClient) NVMeoFPortSubsysDelete(ctx context.Context, id int) error {
+	return nil
+}
+func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var list []*NVMeoFSubsystem
+	for _, s := range m.NVMeSubsystems {
+		list = append(list, s)
+	}
+	return list, nil
+}
 func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }

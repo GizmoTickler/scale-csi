@@ -347,6 +347,89 @@ func (c *Client) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID i
 	return len(assocs) > 0, nil
 }
 
+// NVMeoFPortSubsys represents a port-subsystem association from the TrueNAS API.
+type NVMeoFPortSubsys struct {
+	ID       int `json:"id"`
+	PortID   int
+	SubsysID int
+}
+
+// NVMeoFPortSubsysListBySubsystem returns all port-subsystem associations for a given subsystem.
+func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error) {
+	filters := [][]interface{}{
+		{"subsys.id", "=", subsysID},
+	}
+	result, err := c.Call(ctx, "nvmet.port_subsys.query", filters, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query port-subsystem associations: %w", err)
+	}
+
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, nil
+	}
+
+	assocs := make([]*NVMeoFPortSubsys, 0, len(items))
+	for _, item := range items {
+		if m, ok := item.(map[string]interface{}); ok {
+			assoc := &NVMeoFPortSubsys{}
+			if id, ok := m["id"].(float64); ok {
+				assoc.ID = int(id)
+			}
+			if port, ok := m["port"].(map[string]interface{}); ok {
+				if id, ok := port["id"].(float64); ok {
+					assoc.PortID = int(id)
+				}
+			}
+			if subsys, ok := m["subsys"].(map[string]interface{}); ok {
+				if id, ok := subsys["id"].(float64); ok {
+					assoc.SubsysID = int(id)
+				}
+			}
+			assocs = append(assocs, assoc)
+		}
+	}
+
+	return assocs, nil
+}
+
+// NVMeoFPortSubsysDelete deletes a port-subsystem association by ID.
+func (c *Client) NVMeoFPortSubsysDelete(ctx context.Context, id int) error {
+	_, err := c.Call(ctx, "nvmet.port_subsys.delete", id)
+	if err != nil {
+		if strings.Contains(err.Error(), "does not exist") ||
+			strings.Contains(err.Error(), "not found") {
+			return nil
+		}
+		return fmt.Errorf("failed to delete port-subsystem association: %w", err)
+	}
+	return nil
+}
+
+// NVMeoFSubsystemList lists all NVMe-oF subsystems.
+func (c *Client) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, error) {
+	result, err := c.Call(ctx, "nvmet.subsys.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list NVMe-oF subsystems: %w", err)
+	}
+
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response format")
+	}
+
+	subsystems := make([]*NVMeoFSubsystem, 0, len(items))
+	for _, item := range items {
+		subsys, err := parseNVMeoFSubsystem(item)
+		if err != nil {
+			continue
+		}
+		subsystems = append(subsystems, subsys)
+	}
+
+	return subsystems, nil
+}
+
 // NVMeoFGetOrCreatePort finds an existing port or creates a new one.
 // This is a convenience function for the CSI driver.
 // If address is a hostname, it will be resolved to an IP address since

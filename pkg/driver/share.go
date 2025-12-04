@@ -540,21 +540,78 @@ func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName string, volu
 }
 
 // deleteNVMeoFShare deletes NVMe-oF resources for a dataset.
+// It tries to delete by stored property IDs first, then falls back to lookup by name/path
+// to handle cases where properties were never stored (e.g., failed volume creation).
+// This mirrors the robust cleanup logic used for iSCSI.
 func (d *Driver) deleteNVMeoFShare(ctx context.Context, datasetName string) error {
-	// Delete namespace
+	// Generate the expected NVMe-oF subsystem name (same logic as createNVMeoFShare)
+	subsysName := path.Base(datasetName)
+	if d.config.NVMeoF.NamePrefix != "" {
+		subsysName = d.config.NVMeoF.NamePrefix + subsysName
+	}
+	if d.config.NVMeoF.NameSuffix != "" {
+		subsysName = subsysName + d.config.NVMeoF.NameSuffix
+	}
+	devicePath := fmt.Sprintf("zvol/%s", datasetName)
+
+	var nsDeleted, ssDeleted bool
+
+	// Step 1: Try to delete namespace by stored ID
 	if nsIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID); nsIDStr != "" && nsIDStr != "-" {
 		if nsID, err := strconv.Atoi(nsIDStr); err == nil {
 			if err := d.truenasClient.NVMeoFNamespaceDelete(ctx, nsID); err != nil {
 				klog.Warningf("Failed to delete NVMe-oF namespace %d: %v", nsID, err)
+			} else {
+				nsDeleted = true
 			}
 		}
 	}
 
-	// Delete subsystem
+	// Step 2: Try to delete subsystem by stored ID (including port-subsys associations)
 	if ssIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID); ssIDStr != "" && ssIDStr != "-" {
 		if ssID, err := strconv.Atoi(ssIDStr); err == nil {
+			// First delete any port-subsystem associations for this subsystem
+			if assocs, err := d.truenasClient.NVMeoFPortSubsysListBySubsystem(ctx, ssID); err == nil {
+				for _, assoc := range assocs {
+					if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, assoc.ID); err != nil {
+						klog.Warningf("Failed to delete port-subsystem association %d: %v", assoc.ID, err)
+					}
+				}
+			}
 			if err := d.truenasClient.NVMeoFSubsystemDelete(ctx, ssID); err != nil {
 				klog.Warningf("Failed to delete NVMe-oF subsystem %d: %v", ssID, err)
+			} else {
+				ssDeleted = true
+			}
+		}
+	}
+
+	// Step 3: Fallback - If namespace was not deleted by ID, try to find by device path
+	// This handles cases where the dataset properties were never stored
+	if !nsDeleted {
+		if ns, err := d.truenasClient.NVMeoFNamespaceFindByDevicePath(ctx, devicePath); err == nil && ns != nil {
+			klog.V(4).Infof("Found orphaned namespace by device path %s (ID %d), deleting", devicePath, ns.ID)
+			if err := d.truenasClient.NVMeoFNamespaceDelete(ctx, ns.ID); err != nil {
+				klog.Warningf("Failed to delete orphaned NVMe-oF namespace %d: %v", ns.ID, err)
+			}
+		}
+	}
+
+	// Step 4: Fallback - If subsystem was not deleted by ID, try to find by name
+	// This handles cases where subsystem was created but property was never stored
+	if !ssDeleted {
+		if subsys, err := d.truenasClient.NVMeoFSubsystemFindByName(ctx, subsysName); err == nil && subsys != nil {
+			klog.V(4).Infof("Found orphaned subsystem by name %s (ID %d), deleting", subsysName, subsys.ID)
+			// First delete any port-subsystem associations for this subsystem
+			if assocs, err := d.truenasClient.NVMeoFPortSubsysListBySubsystem(ctx, subsys.ID); err == nil {
+				for _, assoc := range assocs {
+					if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, assoc.ID); err != nil {
+						klog.Warningf("Failed to delete orphaned port-subsystem association %d: %v", assoc.ID, err)
+					}
+				}
+			}
+			if err := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); err != nil {
+				klog.Warningf("Failed to delete orphaned NVMe-oF subsystem %d: %v", subsys.ID, err)
 			}
 		}
 	}
