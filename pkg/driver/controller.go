@@ -135,6 +135,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	klog.Infof("CreateVolume: name=%s, contentSource=%s", name, contentSourceInfo)
 
+	// Log accessibility requirements for debugging (topology awareness)
+	if reqs := req.GetAccessibilityRequirements(); reqs != nil {
+		reqTopologies := make([]string, 0)
+		for _, topo := range reqs.GetRequisite() {
+			reqTopologies = append(reqTopologies, fmt.Sprintf("%v", topo.GetSegments()))
+		}
+		prefTopologies := make([]string, 0)
+		for _, topo := range reqs.GetPreferred() {
+			prefTopologies = append(prefTopologies, fmt.Sprintf("%v", topo.GetSegments()))
+		}
+		klog.V(4).Infof("CreateVolume: accessibility_requirements requisite=%v preferred=%v",
+			reqTopologies, prefTopologies)
+	}
+
 	// Lock on volume name to prevent concurrent creates
 	lockKey := "volume:" + name
 	if !d.acquireOperationLock(lockKey) {
@@ -328,14 +342,23 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	klog.Infof("CreateVolume completed: volume=%s, shareType=%s, contentSource=%s, elapsed=%v",
 		volumeID, shareType, contentSourceInfo, time.Since(start))
 
-	return &csi.CreateVolumeResponse{
-		Volume: &csi.Volume{
-			VolumeId:      volumeID,
-			CapacityBytes: capacityBytes,
-			VolumeContext: volumeContext,
-			ContentSource: contentSource,
-		},
-	}, nil
+	volume := &csi.Volume{
+		VolumeId:      volumeID,
+		CapacityBytes: capacityBytes,
+		VolumeContext: volumeContext,
+		ContentSource: contentSource,
+	}
+
+	// Add accessible topology if topology awareness is enabled
+	// For a single TrueNAS backend, volumes are accessible from nodes in any configured topology
+	if d.config.Node.Topology.Enabled {
+		accessibleTopo := d.getAccessibleTopology()
+		if accessibleTopo != nil {
+			volume.AccessibleTopology = accessibleTopo
+		}
+	}
+
+	return &csi.CreateVolumeResponse{Volume: volume}, nil
 }
 
 // DeleteVolume deletes a volume.
@@ -1452,4 +1475,32 @@ func extractSnapshotName(snapshotID string) (string, bool) {
 		return "", false
 	}
 	return path.Base(parts[1]), true
+}
+
+// getAccessibleTopology returns the topology segments where volumes are accessible.
+// For a single TrueNAS backend, all volumes are accessible from any node that can
+// reach TrueNAS over the network. The topology returned matches the node's configured
+// topology, indicating the volume is accessible from that topology segment.
+func (d *Driver) getAccessibleTopology() []*csi.Topology {
+	if !d.config.Node.Topology.Enabled {
+		return nil
+	}
+
+	segments := make(map[string]string)
+
+	if d.config.Node.Topology.Zone != "" {
+		segments["topology.kubernetes.io/zone"] = d.config.Node.Topology.Zone
+	}
+	if d.config.Node.Topology.Region != "" {
+		segments["topology.kubernetes.io/region"] = d.config.Node.Topology.Region
+	}
+	for k, v := range d.config.Node.Topology.CustomLabels {
+		segments[k] = v
+	}
+
+	if len(segments) == 0 {
+		return nil
+	}
+
+	return []*csi.Topology{{Segments: segments}}
 }

@@ -51,6 +51,10 @@ func (m *MockClient) CallWithContext(ctx context.Context, method string, params 
 	return nil, nil
 }
 
+// Circuit breaker methods (return nil/no-op for mock)
+func (m *MockClient) CircuitBreakerStats() *CircuitBreakerStats { return nil }
+func (m *MockClient) ResetCircuitBreaker()                      {}
+
 // Dataset methods
 func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error) {
 	m.mu.Lock()

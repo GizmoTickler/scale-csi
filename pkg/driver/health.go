@@ -24,12 +24,22 @@ type HealthServer struct {
 
 // HealthStatus represents the current health status of the driver
 type HealthStatus struct {
-	Ready              bool   `json:"ready"`
-	TrueNASConnected   bool   `json:"truenas_connected"`
-	ControllerRunning  bool   `json:"controller_running"`
-	NodeRunning        bool   `json:"node_running"`
-	LastTrueNASCheck   string `json:"last_truenas_check,omitempty"`
-	Error              string `json:"error,omitempty"`
+	Ready              bool                  `json:"ready"`
+	TrueNASConnected   bool                  `json:"truenas_connected"`
+	ControllerRunning  bool                  `json:"controller_running"`
+	NodeRunning        bool                  `json:"node_running"`
+	LastTrueNASCheck   string                `json:"last_truenas_check,omitempty"`
+	Error              string                `json:"error,omitempty"`
+	CircuitBreaker     *CircuitBreakerHealth `json:"circuit_breaker,omitempty"`
+}
+
+// CircuitBreakerHealth represents circuit breaker health information
+type CircuitBreakerHealth struct {
+	State             string `json:"state"`
+	CurrentFailures   int    `json:"current_failures"`
+	TotalFailures     int64  `json:"total_failures"`
+	TotalSuccesses    int64  `json:"total_successes"`
+	TotalCircuitOpens int64  `json:"total_circuit_opens"`
 }
 
 // NewHealthServer creates a new health server
@@ -152,6 +162,18 @@ func (h *HealthServer) checkHealth() HealthStatus {
 
 		// Update metrics
 		SetTrueNASConnectionStatus(connected)
+
+		// Update circuit breaker metrics and health status
+		if cbStats := h.driver.truenasClient.CircuitBreakerStats(); cbStats != nil {
+			UpdateCircuitBreakerMetrics(cbStats)
+			status.CircuitBreaker = &CircuitBreakerHealth{
+				State:             cbStats.State.String(),
+				CurrentFailures:   cbStats.Failures,
+				TotalFailures:     cbStats.TotalFailures,
+				TotalSuccesses:    cbStats.TotalSuccesses,
+				TotalCircuitOpens: cbStats.TotalCircuitOpens,
+			}
+		}
 	}
 
 	h.lastCheck = time.Now()

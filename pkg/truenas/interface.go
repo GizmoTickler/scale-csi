@@ -14,6 +14,10 @@ type ClientInterface interface {
 	Call(ctx context.Context, method string, params ...interface{}) (interface{}, error)
 	CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) // Deprecated: Use Call instead
 
+	// Circuit breaker methods
+	CircuitBreakerStats() *CircuitBreakerStats
+	ResetCircuitBreaker()
+
 	// Dataset methods
 	DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error)
 	DatasetDelete(ctx context.Context, name string, recursive bool, force bool) error

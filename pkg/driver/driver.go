@@ -722,16 +722,33 @@ func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
 
 	expected := make(map[string]struct{})
 
+	// Track failed lookups to detect race conditions or transient issues
+	// If we fail to look up too many devices, skip GC entirely to avoid data loss
+	failedLookups := 0
+	const maxFailedLookups = 2 // Allow 1-2 failures, but more suggests a problem
+
 	// For each mounted device, get its NVMe-oF session if any
 	for device := range mountedDevices {
 		// Check if this device is an NVMe device
 		nqn, err := util.GetNVMeInfoFromDevice(device)
 		if err != nil {
-			continue // Not an NVMe device
+			// Check if this looks like an NVMe device (might be transient state)
+			if util.IsLikelyNVMeDevice(device) {
+				failedLookups++
+				klog.V(4).Infof("Session GC: failed to get NVMe info for %s (may be race condition): %v", device, err)
+			}
+			continue
 		}
 		if nqn != "" {
 			expected[nqn] = struct{}{}
 		}
+	}
+
+	// If too many lookups failed, this might indicate a race condition
+	// (concurrent connect/disconnect operations) - skip GC to be safe
+	if failedLookups > maxFailedLookups {
+		klog.Warningf("Session GC: %d NVMe device lookups failed, skipping GC to avoid race condition", failedLookups)
+		return nil // Return nil to signal GC should be skipped
 	}
 
 	return expected

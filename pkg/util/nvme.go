@@ -567,6 +567,14 @@ func GetNVMeInfoFromDevice(devicePath string) (string, error) {
 	return "", fmt.Errorf("could not find NQN for device %s", devicePath)
 }
 
+// IsLikelyNVMeDevice checks if a device path looks like an NVMe device based on naming.
+// Used for race condition detection in session GC - if GetNVMeInfoFromDevice fails
+// for a device that looks like NVMe, it might indicate a transient state.
+func IsLikelyNVMeDevice(devicePath string) bool {
+	deviceName := filepath.Base(devicePath)
+	return strings.HasPrefix(deviceName, "nvme")
+}
+
 // FindNVMeoFSessionBySubsysName searches connected NVMe subsystems for one matching the subsystem name.
 // The subsystem name is the part that should appear in the NQN (with any prefix/suffix already applied).
 // This is used for cleanup when the device path is unavailable (e.g., after node restart).

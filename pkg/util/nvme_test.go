@@ -264,3 +264,144 @@ func TestNVMeoFConnectWithOptions(t *testing.T) {
 		// The NVMeoFConnectWithOptions mainly passes the timeout.
 	})
 }
+
+// TestIsLikelyNVMeDevice tests the IsLikelyNVMeDevice function which checks
+// if a device path looks like an NVMe device based on naming convention.
+// This is used for race condition detection in session GC.
+func TestIsLikelyNVMeDevice(t *testing.T) {
+	testCases := []struct {
+		name       string
+		devicePath string
+		expected   bool
+	}{
+		// NVMe devices - should return true
+		{
+			name:       "NVMe namespace device",
+			devicePath: "/dev/nvme0n1",
+			expected:   true,
+		},
+		{
+			name:       "NVMe namespace device multi-digit controller",
+			devicePath: "/dev/nvme10n1",
+			expected:   true,
+		},
+		{
+			name:       "NVMe namespace device multi-digit namespace",
+			devicePath: "/dev/nvme0n10",
+			expected:   true,
+		},
+		{
+			name:       "NVMe controller device only",
+			devicePath: "/dev/nvme0",
+			expected:   true,
+		},
+		{
+			name:       "NVMe device with partition",
+			devicePath: "/dev/nvme0n1p1",
+			expected:   true,
+		},
+		// Non-NVMe devices - should return false
+		{
+			name:       "SCSI disk device",
+			devicePath: "/dev/sda",
+			expected:   false,
+		},
+		{
+			name:       "SCSI disk partition",
+			devicePath: "/dev/sda1",
+			expected:   false,
+		},
+		{
+			name:       "Loop device",
+			devicePath: "/dev/loop0",
+			expected:   false,
+		},
+		{
+			name:       "Device mapper device",
+			devicePath: "/dev/dm-0",
+			expected:   false,
+		},
+		{
+			name:       "LVM device",
+			devicePath: "/dev/mapper/vg0-lv0",
+			expected:   false,
+		},
+		{
+			name:       "MD RAID device",
+			devicePath: "/dev/md0",
+			expected:   false,
+		},
+		{
+			name:       "XVD device (Xen)",
+			devicePath: "/dev/xvda",
+			expected:   false,
+		},
+		{
+			name:       "VDA device (virtio)",
+			devicePath: "/dev/vda",
+			expected:   false,
+		},
+		// Edge cases
+		{
+			name:       "Empty path",
+			devicePath: "",
+			expected:   false,
+		},
+		{
+			name:       "Just /dev",
+			devicePath: "/dev/",
+			expected:   false,
+		},
+		{
+			name:       "Device name containing nvme but not starting with it",
+			devicePath: "/dev/sdnvme0",
+			expected:   false,
+		},
+		{
+			name:       "Uppercase NVME",
+			devicePath: "/dev/NVME0n1",
+			expected:   false, // Case-sensitive - uppercase should not match
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := IsLikelyNVMeDevice(tc.devicePath)
+			assert.Equal(t, tc.expected, result, "IsLikelyNVMeDevice(%q) = %v, want %v",
+				tc.devicePath, result, tc.expected)
+		})
+	}
+}
+
+// TestIsLikelyNVMeDevice_ConsistentWithGetNVMeInfoFromDevice verifies that
+// IsLikelyNVMeDevice correctly identifies devices that GetNVMeInfoFromDevice
+// would attempt to process (even if it fails due to missing sysfs).
+func TestIsLikelyNVMeDevice_ConsistentWithGetNVMeInfoFromDevice(t *testing.T) {
+	// Devices that GetNVMeInfoFromDevice will try to process (may fail due to sysfs)
+	nvmeDevices := []string{
+		"/dev/nvme0n1",
+		"/dev/nvme1n2",
+		"/dev/nvme99n99",
+	}
+
+	for _, device := range nvmeDevices {
+		t.Run(device, func(t *testing.T) {
+			assert.True(t, IsLikelyNVMeDevice(device),
+				"IsLikelyNVMeDevice should return true for %s", device)
+		})
+	}
+
+	// Devices that GetNVMeInfoFromDevice will immediately reject
+	nonNvmeDevices := []string{
+		"/dev/sda",
+		"/dev/sdb1",
+		"/dev/loop0",
+	}
+
+	for _, device := range nonNvmeDevices {
+		t.Run(device, func(t *testing.T) {
+			assert.False(t, IsLikelyNVMeDevice(device),
+				"IsLikelyNVMeDevice should return false for %s", device)
+		})
+	}
+}

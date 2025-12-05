@@ -1,8 +1,12 @@
 package driver
 
 import (
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 const (
@@ -94,6 +98,47 @@ var (
 			Help:      "Total number of snapshots",
 		},
 	)
+
+	// Circuit breaker metrics
+	circuitBreakerState = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "circuit_breaker_state",
+			Help:      "Circuit breaker state (0 = closed, 1 = open, 2 = half-open)",
+		},
+	)
+
+	circuitBreakerFailuresTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "circuit_breaker_failures_total",
+			Help:      "Total number of failures recorded by the circuit breaker",
+		},
+	)
+
+	circuitBreakerSuccessesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "circuit_breaker_successes_total",
+			Help:      "Total number of successes recorded by the circuit breaker",
+		},
+	)
+
+	circuitBreakerOpensTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "circuit_breaker_opens_total",
+			Help:      "Total number of times the circuit breaker has opened",
+		},
+	)
+
+	circuitBreakerCurrentFailures = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "circuit_breaker_current_failures",
+			Help:      "Current number of consecutive failures in the circuit breaker",
+		},
+	)
 )
 
 // RecordCSIOperation records metrics for a CSI operation
@@ -143,4 +188,45 @@ func SetVolumesTotal(shareType string, count int) {
 // SetSnapshotsTotal sets the total number of snapshots
 func SetSnapshotsTotal(count int) {
 	snapshotsTotal.Set(float64(count))
+}
+
+// Circuit breaker metrics tracking
+var (
+	cbMetricsMu             sync.Mutex
+	lastCBTotalFailures     int64
+	lastCBTotalSuccesses    int64
+	lastCBTotalCircuitOpens int64
+)
+
+// UpdateCircuitBreakerMetrics updates Prometheus metrics from circuit breaker stats.
+// This should be called periodically (e.g., during health checks).
+func UpdateCircuitBreakerMetrics(stats *truenas.CircuitBreakerStats) {
+	if stats == nil {
+		return
+	}
+
+	cbMetricsMu.Lock()
+	defer cbMetricsMu.Unlock()
+
+	// Update state gauge (0 = closed, 1 = open, 2 = half-open)
+	circuitBreakerState.Set(float64(stats.State))
+
+	// Update current failures gauge
+	circuitBreakerCurrentFailures.Set(float64(stats.Failures))
+
+	// Increment counters by delta (counters can only go up)
+	if stats.TotalFailures > lastCBTotalFailures {
+		circuitBreakerFailuresTotal.Add(float64(stats.TotalFailures - lastCBTotalFailures))
+		lastCBTotalFailures = stats.TotalFailures
+	}
+
+	if stats.TotalSuccesses > lastCBTotalSuccesses {
+		circuitBreakerSuccessesTotal.Add(float64(stats.TotalSuccesses - lastCBTotalSuccesses))
+		lastCBTotalSuccesses = stats.TotalSuccesses
+	}
+
+	if stats.TotalCircuitOpens > lastCBTotalCircuitOpens {
+		circuitBreakerOpensTotal.Add(float64(stats.TotalCircuitOpens - lastCBTotalCircuitOpens))
+		lastCBTotalCircuitOpens = stats.TotalCircuitOpens
+	}
 }
