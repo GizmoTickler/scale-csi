@@ -429,6 +429,20 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 	}
 
+	// IMPORTANT: Check for dependent CSI-managed snapshots BEFORE deleting the share.
+	// If we delete the share first and then discover snapshots exist, the share is already
+	// gone and the volume becomes inaccessible while still existing.
+	snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
+	if snapErr == nil && len(snapshots) > 0 {
+		for _, snap := range snapshots {
+			if prop, ok := snap.UserProperties[PropManagedResource]; ok && prop.Value == "true" {
+				klog.Infof("Volume %s has dependent CSI-managed snapshots, cannot delete", volumeID)
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"volume %s has dependent snapshots that must be deleted first", volumeID)
+			}
+		}
+	}
+
 	// Delete share first (errors are fatal to prevent orphaned targets)
 	if shareTypeKnown {
 		// We know the share type, delete just that one
