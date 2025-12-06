@@ -214,10 +214,27 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset string, name st
 		ID:             id,
 		Name:           name,
 		Dataset:        dataset,
+		Properties:     make(map[string]interface{}),
 		UserProperties: make(map[string]UserProperty),
 	}
 	m.Snapshots[id] = snap
 	return snap, nil
+}
+
+// SetSnapshotUsedBytes is a test helper to set the "used" property on a snapshot.
+// This simulates the size that GetSnapshotSize() would return.
+func (m *MockClient) SetSnapshotUsedBytes(snapshotID string, usedBytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if snap, ok := m.Snapshots[snapshotID]; ok {
+		if snap.Properties == nil {
+			snap.Properties = make(map[string]interface{})
+		}
+		snap.Properties["used"] = map[string]interface{}{
+			"parsed": float64(usedBytes),
+		}
+	}
 }
 
 func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defer_ bool, recursive bool) error {

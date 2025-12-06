@@ -761,7 +761,11 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		klog.Warningf("Failed to get source dataset size, using snapshot used bytes: %v", err)
 		snapshotSize = snap.GetSnapshotSize()
 	} else if volsize, ok := sourceDataset.Volsize.Parsed.(float64); ok && volsize > 0 {
+		// For zvols (iSCSI/NVMe-oF), use volsize
 		snapshotSize = int64(volsize)
+	} else if refquota, ok := sourceDataset.Refquota.Parsed.(float64); ok && refquota > 0 {
+		// For filesystems (NFS), use refquota as the volume size
+		snapshotSize = int64(refquota)
 	} else {
 		// Fallback to snapshot used bytes if volume size not available
 		snapshotSize = snap.GetSnapshotSize()
