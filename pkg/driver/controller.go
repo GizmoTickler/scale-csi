@@ -753,7 +753,19 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		return nil, status.Errorf(codes.Internal, "failed to set snapshot properties: %v", err)
 	}
 
-	snapshotSize := snap.GetSnapshotSize()
+	// Get source volume size for restoreSize (CSI spec requires minimum volume size to restore)
+	// snap.GetSnapshotSize() returns "used" bytes which may be tiny for near-empty volumes
+	var snapshotSize int64
+	sourceDataset, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		klog.Warningf("Failed to get source dataset size, using snapshot used bytes: %v", err)
+		snapshotSize = snap.GetSnapshotSize()
+	} else if volsize, ok := sourceDataset.Volsize.Parsed.(float64); ok && volsize > 0 {
+		snapshotSize = int64(volsize)
+	} else {
+		// Fallback to snapshot used bytes if volume size not available
+		snapshotSize = snap.GetSnapshotSize()
+	}
 	klog.Infof("CreateSnapshot completed: snapshot=%s, sourceVolume=%s, size=%d, elapsed=%v",
 		snapshotID, sourceVolumeID, snapshotSize, time.Since(start))
 
