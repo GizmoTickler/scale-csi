@@ -88,7 +88,13 @@ Located in `charts/scale-csi/`. Key templates:
 
 ## GitHub Releases
 
-When creating a new release, always write comprehensive release notes. Never leave a release with just the auto-generated changelog link. Include:
+**CRITICAL: Release notes are MANDATORY for every release.** After pushing a new tag, you MUST immediately create/update the release notes using `gh release edit`. Never leave a release with just the auto-generated changelog link - this is unacceptable.
+
+### Release Notes Checklist (do this IMMEDIATELY after `git push --tags`):
+1. Run: `gh release edit <version> --title "<version>: Brief Description" --notes "..."`
+2. Verify the release page shows comprehensive notes, not just the changelog link
+
+### Required Release Notes Content:
 
 1. **Title**: Version number with brief description (e.g., "v1.0.20: Topology Auto-Detection")
 2. **Summary**: What changed and why it matters
