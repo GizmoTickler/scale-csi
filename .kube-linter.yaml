@@ -45,6 +45,8 @@ checks:
     - "no-rolling-update-strategy"
     # CSI controllers use 1 replica with leader election for HA
     - "minimum-three-replicas"
+    # Deployments/DaemonSets default to restartPolicy: Always (not explicitly set)
+    - "restart-policy"
 
     # === Optional Best Practices ===
     # NetworkPolicy is optional and depends on cluster setup

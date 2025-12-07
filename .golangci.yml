@@ -34,6 +34,21 @@ linters:
       disabled-checks:
         - whyNoLint
         - hugeParam  # CSI structs can be large
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives
+    rules:
+      # Test files can have longer functions and magic numbers
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+      # Mock client is generated-like code
+      - path: mock_client\.go
+        linters:
+          - errcheck
+          - gocritic
 
 formatters:
   enable:
@@ -42,16 +57,3 @@ formatters:
     goimports:
       local-prefixes:
         - github.com/GizmoTickler/scale-csi
-
-issues:
-  exclude-rules:
-    # Test files can have longer functions and magic numbers
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gocritic
-    # Mock client is generated-like code
-    - path: mock_client\.go
-      linters:
-        - errcheck
-        - gocritic
