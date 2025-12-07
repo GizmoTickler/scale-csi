@@ -1,18 +1,58 @@
 # kube-linter configuration for scale-csi
-# CSI drivers require privileged access - these exclusions are expected
+# CSI drivers require privileged access and have unique requirements
+# that differ from typical application workloads.
 checks:
   addAllBuiltIn: true
   exclude:
-    # CSI node plugin requires root and privileged access
+    # === CSI Security Requirements ===
+    # CSI node plugin requires root and privileged access for device management
     - "run-as-non-root"
     - "no-read-only-root-fs"
     - "privilege-escalation-container"
     - "privileged-container"
-    # CSI requires host mounts for device access
+    # CSI needs NET_RAW for iSCSI/NVMe-oF network operations
+    - "drop-net-raw-capability"
+
+    # === CSI Host Access Requirements ===
+    # CSI requires host mounts for kubelet, device, and mount access
     - "host-mounts"
     - "host-network"
     - "host-pid"
-    # CSI sidecars use default resources
+    - "sensitive-host-mounts"
+    - "writable-host-mount"
+
+    # === CSI Sidecar Containers ===
+    # CSI sidecars (provisioner, attacher, etc.) are standard images
+    # with their own health checks; adding probes is not required
+    - "no-liveness-probe"
+    - "no-readiness-probe"
+    - "liveness-port"
     - "unset-cpu-requirements"
     - "unset-memory-requirements"
+
+    # === CSI RBAC Requirements ===
+    # CSI drivers need access to secrets for API credentials
+    - "access-to-secrets"
+    # CSI RBAC may need broad access for PV/PVC management
+    - "wildcard-in-rules"
+
+    # === Namespace and Deployment ===
+    # Helm charts are installed in user-specified namespaces
+    - "use-namespace"
+    # CSI node DaemonSets must run on all nodes - no affinity needed
+    - "no-node-affinity"
+    # Deployment strategy is optional for CSI controllers
+    - "no-rolling-update-strategy"
+    # CSI controllers use 1 replica with leader election for HA
+    - "minimum-three-replicas"
+
+    # === Optional Best Practices ===
+    # NetworkPolicy is optional and depends on cluster setup
+    - "non-isolated-pod"
+    # DNS config is typically inherited from cluster defaults
+    - "dnsconfig-options"
+    # Annotations/labels are project-specific, not required
+    - "required-annotation-email"
+    - "required-label-owner"
+
 customChecks: []
