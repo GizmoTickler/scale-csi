@@ -67,8 +67,18 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 
 	result, err := c.Call(ctx, "nvmet.subsys.create", params)
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			return c.NVMeoFSubsystemFindByName(ctx, name)
+		// TrueNAS SCALE 25.10+ returns "Invalid params" when a subsystem with the same name exists,
+		// instead of "already exists". Check if the subsystem exists before failing.
+		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+			existing, findErr := c.NVMeoFSubsystemFindByName(ctx, name)
+			if findErr == nil && existing != nil {
+				klog.V(4).Infof("NVMeoFSubsystemCreate: subsystem %q already exists (ID %d), returning existing", name, existing.ID)
+				return existing, nil
+			}
+			// If we got "Invalid params" but the subsystem doesn't exist, it's a genuine parameter error
+			if strings.Contains(err.Error(), "Invalid params") {
+				klog.Errorf("NVMeoFSubsystemCreate: 'Invalid params' error for %q but subsystem not found - genuine parameter error", name)
+			}
 		}
 		return nil, fmt.Errorf("failed to create NVMe-oF subsystem: %w", err)
 	}
@@ -177,8 +187,18 @@ func (c *Client) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, dev
 
 	result, err := c.Call(ctx, "nvmet.namespace.create", params)
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			return c.NVMeoFNamespaceFindByDevice(ctx, subsystemID, normalizedPath)
+		// TrueNAS SCALE 25.10+ may return "Invalid params" when a namespace with the same
+		// device_path already exists, instead of "already exists". Check if it exists before failing.
+		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+			existing, findErr := c.NVMeoFNamespaceFindByDevice(ctx, subsystemID, normalizedPath)
+			if findErr == nil && existing != nil {
+				klog.V(4).Infof("NVMeoFNamespaceCreate: namespace for device %q already exists (ID %d), returning existing", normalizedPath, existing.ID)
+				return existing, nil
+			}
+			// If we got "Invalid params" but the namespace doesn't exist, it's a genuine parameter error
+			if strings.Contains(err.Error(), "Invalid params") {
+				klog.Errorf("NVMeoFNamespaceCreate: 'Invalid params' error for device %q but namespace not found - genuine parameter error", normalizedPath)
+			}
 		}
 		return nil, fmt.Errorf("failed to create NVMe-oF namespace: %w", err)
 	}
@@ -319,8 +339,18 @@ func (c *Client) NVMeoFPortCreate(ctx context.Context, transport, address string
 
 	result, err := c.Call(ctx, "nvmet.port.create", params)
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			return c.NVMeoFPortFindByAddress(ctx, transport, address, port)
+		// TrueNAS SCALE 25.10+ may return "Invalid params" when a port with the same
+		// address already exists, instead of "already exists". Check if it exists before failing.
+		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+			existing, findErr := c.NVMeoFPortFindByAddress(ctx, transport, address, port)
+			if findErr == nil && existing != nil {
+				klog.V(4).Infof("NVMeoFPortCreate: port %s:%s:%d already exists (ID %d), returning existing", transport, address, port, existing.ID)
+				return existing, nil
+			}
+			// If we got "Invalid params" but the port doesn't exist, it's a genuine parameter error
+			if strings.Contains(err.Error(), "Invalid params") {
+				klog.Errorf("NVMeoFPortCreate: 'Invalid params' error for port %s:%s:%d but port not found - genuine parameter error", transport, address, port)
+			}
 		}
 		return nil, fmt.Errorf("failed to create NVMe-oF port: %w", err)
 	}
@@ -365,19 +395,23 @@ func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID in
 
 	result, err := c.Call(ctx, "nvmet.port_subsys.create", params)
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
+		// TrueNAS SCALE 25.10+ may return "Invalid params" when the association already exists,
+		// instead of "already exists". Check if it exists before failing.
+		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
 			// Find and return the existing association
 			assocs, findErr := c.NVMeoFPortSubsysListBySubsystem(ctx, subsysID)
-			if findErr != nil {
-				return nil, findErr
-			}
-			for _, assoc := range assocs {
-				if assoc.PortID == portID {
-					return assoc, nil
+			if findErr == nil {
+				for _, assoc := range assocs {
+					if assoc.PortID == portID {
+						klog.V(4).Infof("NVMeoFPortSubsysCreate: port-subsystem association already exists (port=%d, subsys=%d, assoc=%d)", portID, subsysID, assoc.ID)
+						return assoc, nil
+					}
 				}
 			}
-			// Association exists but we couldn't find it - return a minimal object
-			return &NVMeoFPortSubsys{PortID: portID, SubsysID: subsysID}, nil
+			// If we got "Invalid params" but couldn't find the association, it's a genuine parameter error
+			if strings.Contains(err.Error(), "Invalid params") {
+				klog.Errorf("NVMeoFPortSubsysCreate: 'Invalid params' error for port=%d, subsys=%d but association not found - genuine parameter error", portID, subsysID)
+			}
 		}
 		return nil, fmt.Errorf("failed to create port-subsystem association: %w", err)
 	}
