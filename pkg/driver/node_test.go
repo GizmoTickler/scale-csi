@@ -5,12 +5,13 @@ import (
 	"os"
 	"testing"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // newTestNodeDriver creates a minimal driver configured for node testing.

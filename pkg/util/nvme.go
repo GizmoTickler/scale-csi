@@ -85,8 +85,8 @@ func NVMeoFConnectWithOptions(nqn, transportURI string, opts *NVMeoFConnectOptio
 	}
 
 	// Connect to the subsystem
-	if err := nvmeConnect(ctx, transport, host, port, nqn); err != nil {
-		return "", fmt.Errorf("connect failed: %w", err)
+	if connectErr := nvmeConnect(ctx, transport, host, port, nqn); connectErr != nil {
+		return "", fmt.Errorf("connect failed: %w", connectErr)
 	}
 
 	// Wait for device to appear with configurable timeout
@@ -123,7 +123,7 @@ func NVMeoFDisconnectWithContext(ctx context.Context, nqn string) error {
 				return nil
 			}
 			// Return error to potentially trigger retry
-			return fmt.Errorf("disconnect failed: %v, output: %s", err, string(output))
+			return fmt.Errorf("disconnect failed: %w, output: %s", err, string(output))
 		}
 		return nil
 	})
@@ -198,7 +198,7 @@ func nvmeConnect(ctx context.Context, transport, host, port, nqn string) error {
 			klog.V(4).Infof("Subsystem already connected: %s", nqn)
 			return nil
 		}
-		return fmt.Errorf("connect command failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("connect command failed: %w, output: %s", err, string(output))
 	}
 
 	klog.V(4).Infof("Connect output: %s", string(output))
@@ -210,7 +210,7 @@ func listNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
 	cmd := exec.CommandContext(ctx, "nvme", "list-subsys", "-o", "json")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("list-subsys failed: %v", err)
+		return nil, fmt.Errorf("list-subsys failed: %w", err)
 	}
 
 	// Parse JSON output
@@ -221,7 +221,7 @@ func listNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
 		// Try alternative format
 		var subsystems []NVMeSubsystem
 		if err := json.Unmarshal(output, &subsystems); err != nil {
-			return nil, fmt.Errorf("failed to parse subsystem list: %v", err)
+			return nil, fmt.Errorf("failed to parse subsystem list: %w", err)
 		}
 		return subsystems, nil
 	}
@@ -240,7 +240,7 @@ func waitForNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (
 		// Check context cancellation
 		select {
 		case <-ctx.Done():
-			return "", fmt.Errorf("context cancelled waiting for device (nqn=%s): %w", nqn, ctx.Err())
+			return "", fmt.Errorf("context canceled waiting for device (nqn=%s): %w", nqn, ctx.Err())
 		default:
 		}
 
@@ -301,7 +301,7 @@ var findNVMeDevice = func(nqn string) (string, error) {
 		}
 
 		// Second try: Look for nvmeXnY devices under controller subdirs (for PCIe NVMe)
-		nvmeDevices, _ := filepath.Glob(filepath.Join(subsysDir, "nvme*/nvme*n*"))
+		nvmeDevices, _ := filepath.Glob(filepath.Join(subsysDir, "nvme*/nvme*n*")) //nolint:gocritic // glob pattern with path separator is intentional
 		for _, devPath := range nvmeDevices {
 			deviceName := filepath.Base(devPath)
 			if nvmeDeviceRegex.MatchString(deviceName) {
@@ -326,7 +326,7 @@ func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
 	cmd := exec.CommandContext(ctx, "nvme", "list-subsys", "-o", "json")
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("nvme list-subsys failed: %v", err)
+		return "", fmt.Errorf("nvme list-subsys failed: %w", err)
 	}
 
 	// Parse the JSON output - can be array or object with Subsystems
@@ -341,7 +341,7 @@ func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
 	} else {
 		// Try direct array format
 		if err := json.Unmarshal(output, &subsystems); err != nil {
-			return "", fmt.Errorf("failed to parse nvme list-subsys: %v", err)
+			return "", fmt.Errorf("failed to parse nvme list-subsys: %w", err)
 		}
 	}
 
@@ -391,12 +391,12 @@ func NVMeGetNamespaceInfo(devicePath string) (*NVMeNamespace, error) {
 	cmd := exec.CommandContext(ctx, "nvme", "id-ns", devicePath, "-o", "json")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("id-ns failed: %v", err)
+		return nil, fmt.Errorf("id-ns failed: %w", err)
 	}
 
 	var ns NVMeNamespace
 	if err := json.Unmarshal(output, &ns); err != nil {
-		return nil, fmt.Errorf("failed to parse namespace info: %v", err)
+		return nil, fmt.Errorf("failed to parse namespace info: %w", err)
 	}
 
 	return &ns, nil
@@ -437,7 +437,7 @@ func NVMeListNamespaces(devicePath string) ([]int, error) {
 	cmd := exec.CommandContext(ctx, "nvme", "list-ns", ctrlPath, "-o", "json")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("list-ns failed: %v", err)
+		return nil, fmt.Errorf("list-ns failed: %w", err)
 	}
 
 	var nsids []int
@@ -447,7 +447,7 @@ func NVMeListNamespaces(devicePath string) ([]int, error) {
 			Namespaces []int `json:"namespaces"`
 		}
 		if err := json.Unmarshal(output, &result); err != nil {
-			return nil, fmt.Errorf("failed to parse namespace list: %v", err)
+			return nil, fmt.Errorf("failed to parse namespace list: %w", err)
 		}
 		return result.Namespaces, nil
 	}
@@ -463,7 +463,7 @@ func NVMeFlush(devicePath string, nsid int) error {
 	cmd := exec.CommandContext(ctx, "nvme", "flush", devicePath, "-n", fmt.Sprintf("%d", nsid))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("flush failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("flush failed: %w, output: %s", err, string(output))
 	}
 	return nil
 }
@@ -483,10 +483,10 @@ func IsNVMeFabric(devicePath string) (bool, error) {
 			transportPath = fmt.Sprintf("/sys/class/nvme/%s/transport", ctrlName)
 			transport, err = os.ReadFile(transportPath)
 			if err != nil {
-				return false, fmt.Errorf("failed to read transport: %v", err)
+				return false, fmt.Errorf("failed to read transport: %w", err)
 			}
 		} else {
-			return false, fmt.Errorf("failed to read transport: %v", err)
+			return false, fmt.Errorf("failed to read transport: %w", err)
 		}
 	}
 
@@ -511,7 +511,7 @@ func NVMeDiscovery(transport, host, port string) ([]string, error) {
 	cmd := exec.CommandContext(ctx, "nvme", args...)
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("discovery failed: %v", err)
+		return nil, fmt.Errorf("discovery failed: %w", err)
 	}
 
 	var result struct {
@@ -520,7 +520,7 @@ func NVMeDiscovery(transport, host, port string) ([]string, error) {
 		} `json:"records"`
 	}
 	if err := json.Unmarshal(output, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse discovery response: %v", err)
+		return nil, fmt.Errorf("failed to parse discovery response: %w", err)
 	}
 
 	var nqns []string
@@ -550,7 +550,7 @@ func GetNVMeInfoFromDevice(devicePath string) (string, error) {
 
 	// Read subsysnqn from controller
 	// /sys/class/nvme/nvme0/subsysnqn
-	nqnPath := filepath.Join("/sys/class/nvme", ctrlName, "subsysnqn")
+	nqnPath := filepath.Join("/sys/class/nvme", ctrlName, "subsysnqn") //nolint:gocritic // absolute sysfs path is intentional
 	content, err := os.ReadFile(nqnPath)
 	if err == nil {
 		return strings.TrimSpace(string(content)), nil
@@ -558,7 +558,7 @@ func GetNVMeInfoFromDevice(devicePath string) (string, error) {
 
 	// Try via subsystem link
 	// /sys/class/nvme/nvme0/subsystem/subsysnqn
-	nqnPath = filepath.Join("/sys/class/nvme", ctrlName, "subsystem", "subsysnqn")
+	nqnPath = filepath.Join("/sys/class/nvme", ctrlName, "subsystem", "subsysnqn") //nolint:gocritic // absolute sysfs path is intentional
 	content, err = os.ReadFile(nqnPath)
 	if err == nil {
 		return strings.TrimSpace(string(content)), nil
@@ -600,6 +600,7 @@ func FindNVMeoFSessionBySubsysName(subsysName string) (string, error) {
 }
 
 // FindNVMeoFSessionByVolumeID is a convenience wrapper that searches by volumeID.
+//
 // Deprecated: Use FindNVMeoFSessionBySubsysName instead, which handles NamePrefix/NameSuffix correctly.
 func FindNVMeoFSessionByVolumeID(volumeID string) (string, error) {
 	return FindNVMeoFSessionBySubsysName(volumeID)

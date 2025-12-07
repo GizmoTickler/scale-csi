@@ -132,9 +132,9 @@ func TestISCSIExtentCreate_InvalidParams_ExistingExtent(t *testing.T) {
 				resp.Result = []interface{}{
 					map[string]interface{}{
 						"id":      float64(99),
-						"name":   "existing-extent",
-						"type":   "DISK",
-						"disk":   "zvol/tank/vol1",
+						"name":    "existing-extent",
+						"type":    "DISK",
+						"disk":    "zvol/tank/vol1",
 						"enabled": true,
 					},
 				}
@@ -419,9 +419,9 @@ func TestNVMeoFSubsystemDelete_InvalidParams_AlreadyDeleted(t *testing.T) {
 // with "Invalid params" verification.
 func TestNVMeoFNamespaceDelete_InvalidParams_Verification(t *testing.T) {
 	tests := []struct {
-		name             string
-		namespaceExists  bool
-		expectError      bool
+		name            string
+		namespaceExists bool
+		expectError     bool
 	}{
 		{
 			name:            "namespace still exists - should error",
@@ -524,9 +524,9 @@ func TestNVMeoFNamespaceDelete_InvalidParams_Verification(t *testing.T) {
 // association delete with "Invalid params" verification.
 func TestNVMeoFPortSubsysDelete_InvalidParams_Verification(t *testing.T) {
 	tests := []struct {
-		name            string
-		assocExists     bool
-		expectError     bool
+		name        string
+		assocExists bool
+		expectError bool
 	}{
 		{
 			name:        "association still exists - should error",

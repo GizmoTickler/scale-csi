@@ -851,16 +851,22 @@ func TestISCSITargetGroup_AuthPointer(t *testing.T) {
 		Auth:       &authValue,
 	}
 
+	assert.Equal(t, 1, group.Portal)
+	assert.Equal(t, 1, group.Initiator)
+	assert.Equal(t, "CHAP", group.AuthMethod)
 	assert.NotNil(t, group.Auth)
 	assert.Equal(t, 5, *group.Auth)
 
 	// Test nil auth
 	groupNoAuth := ISCSITargetGroup{
-		Portal:     1,
-		Initiator:  1,
+		Portal:     2,
+		Initiator:  3,
 		AuthMethod: "NONE",
 		Auth:       nil,
 	}
+	assert.Equal(t, 2, groupNoAuth.Portal)
+	assert.Equal(t, 3, groupNoAuth.Initiator)
+	assert.Equal(t, "NONE", groupNoAuth.AuthMethod)
 	assert.Nil(t, groupNoAuth.Auth)
 }
 

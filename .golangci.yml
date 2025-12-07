@@ -1,0 +1,57 @@
+# golangci-lint configuration for scale-csi (v2 format)
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    # Default linters (enabled by default, listed for clarity)
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # Code quality
+    - gocritic
+    - misspell
+    - unconvert
+    # Error handling
+    - errorlint
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # Not critical for this project
+    misspell:
+      locale: US
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - whyNoLint
+        - hugeParam  # CSI structs can be large
+
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/GizmoTickler/scale-csi
+
+issues:
+  exclude-rules:
+    # Test files can have longer functions and magic numbers
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gocritic
+    # Mock client is generated-like code
+    - path: mock_client\.go
+      linters:
+        - errcheck
+        - gocritic

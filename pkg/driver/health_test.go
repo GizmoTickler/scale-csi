@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // MockClientWithCircuitBreaker is a mock client that returns circuit breaker stats.
@@ -60,6 +61,8 @@ func TestHealthStatus_CircuitBreakerField(t *testing.T) {
 			},
 		}
 
+		assert.True(t, status.Ready)
+		assert.True(t, status.TrueNASConnected)
 		assert.NotNil(t, status.CircuitBreaker)
 		assert.Equal(t, "open", status.CircuitBreaker.State)
 		assert.Equal(t, 5, status.CircuitBreaker.CurrentFailures)
@@ -72,6 +75,8 @@ func TestHealthStatus_CircuitBreakerField(t *testing.T) {
 			CircuitBreaker:   nil,
 		}
 
+		assert.True(t, status.Ready)
+		assert.True(t, status.TrueNASConnected)
 		assert.Nil(t, status.CircuitBreaker)
 	})
 }
@@ -280,7 +285,7 @@ func TestHealthEndpoint_WithCircuitBreaker(t *testing.T) {
 	}
 
 	// Create test request
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/health", http.NoBody)
 	w := httptest.NewRecorder()
 
 	// Call handler
@@ -331,7 +336,7 @@ func TestHealthEndpoint_ServiceUnavailable(t *testing.T) {
 		lastCheck: time.Time{}, // Force cache miss
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/health", http.NoBody)
 	w := httptest.NewRecorder()
 
 	h.handleHealth(w, req)

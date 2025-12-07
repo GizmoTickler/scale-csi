@@ -285,9 +285,9 @@ func TestConnection_ChannelDrain_Timeout(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			defer cancel()
 
-			_, err := client.Call(ctx, "slow.method", id)
+			_, callErr := client.Call(ctx, "slow.method", id)
 			// Expect timeout error
-			assert.Error(t, err)
+			assert.Error(t, callErr)
 		}(i)
 	}
 
@@ -305,7 +305,7 @@ func TestConnection_ChannelDrain_Timeout(t *testing.T) {
 }
 
 // TestConnection_ChannelDrain_ContextCancellation tests proper cleanup when
-// context is cancelled during the request/write phase.
+// context is canceled during the request/write phase.
 func TestConnection_ChannelDrain_ContextCancellation(t *testing.T) {
 	mock := newMockWSServer()
 	requestsReceived := int32(0)
@@ -372,9 +372,9 @@ func TestConnection_ChannelDrain_ContextCancellation(t *testing.T) {
 			// Cancel immediately
 			cancel()
 
-			_, err := client.Call(ctx, "test.method", id)
-			// Expect context cancelled error
-			assert.Error(t, err)
+			_, callErr := client.Call(ctx, "test.method", id)
+			// Expect context canceled error
+			assert.Error(t, callErr)
 		}(i)
 	}
 

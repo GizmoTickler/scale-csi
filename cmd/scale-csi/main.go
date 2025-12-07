@@ -8,8 +8,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/GizmoTickler/scale-csi/pkg/driver"
 	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/driver"
 )
 
 var (

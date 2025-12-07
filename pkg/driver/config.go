@@ -524,6 +524,7 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // GetDriverShareType returns the share type based on driver name.
+//
 // Deprecated: Use GetShareType with StorageClass parameters instead.
 func (c *Config) GetDriverShareType() ShareType {
 	switch c.DriverName {

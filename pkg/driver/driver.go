@@ -191,8 +191,8 @@ func (d *Driver) Run() error {
 	if u.Scheme == "unix" {
 		addr = u.Path
 		// Remove existing socket file
-		if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to remove socket file: %w", err)
+		if removeErr := os.Remove(addr); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("failed to remove socket file: %w", removeErr)
 		}
 	} else {
 		addr = u.Host
@@ -206,7 +206,7 @@ func (d *Driver) Run() error {
 
 	// Set socket permissions for unix sockets
 	if u.Scheme == "unix" {
-		if err := os.Chmod(addr, 0660); err != nil {
+		if err := os.Chmod(addr, 0o660); err != nil {
 			return fmt.Errorf("failed to set socket permissions: %w", err)
 		}
 	}
@@ -435,7 +435,7 @@ func (d *Driver) stopSessionGC() {
 // runSessionGC performs one garbage collection cycle with explicit protocol control.
 // It runs GC for the specified protocols, allowing per-protocol enable/disable via config.
 // gracePeriod specifies how long a session must be orphaned before cleanup.
-func (d *Driver) runSessionGCWithProtocols(_ context.Context, gracePeriod time.Duration, dryRun bool, iscsiEnabled, nvmeofEnabled bool) {
+func (d *Driver) runSessionGCWithProtocols(_ context.Context, gracePeriod time.Duration, dryRun, iscsiEnabled, nvmeofEnabled bool) {
 	klog.V(4).Info("Running session GC")
 
 	// Run iSCSI GC if enabled

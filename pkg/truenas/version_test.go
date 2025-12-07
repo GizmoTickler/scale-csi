@@ -7,11 +7,11 @@ import (
 
 func TestParseTrueNASVersion(t *testing.T) {
 	tests := []struct {
-		name          string
-		version       string
-		expectMajor   int
-		expectMinor   int
-		expectPatch   int
+		name        string
+		version     string
+		expectMajor int
+		expectMinor int
+		expectPatch int
 	}{
 		{
 			name:        "Full TrueNAS SCALE version",

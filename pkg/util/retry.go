@@ -65,7 +65,7 @@ func RetryWithBackoff(ctx context.Context, name string, cfg *RetryConfig, fn fun
 		// Check context before each attempt
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%s: context cancelled: %w", name, ctx.Err())
+			return fmt.Errorf("%s: context canceled: %w", name, ctx.Err())
 		default:
 		}
 
@@ -93,7 +93,7 @@ func RetryWithBackoff(ctx context.Context, name string, cfg *RetryConfig, fn fun
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
-				return fmt.Errorf("%s: context cancelled during retry: %w", name, ctx.Err())
+				return fmt.Errorf("%s: context canceled during retry: %w", name, ctx.Err())
 			}
 
 			// Exponential backoff

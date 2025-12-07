@@ -24,13 +24,13 @@ type HealthServer struct {
 
 // HealthStatus represents the current health status of the driver
 type HealthStatus struct {
-	Ready              bool                  `json:"ready"`
-	TrueNASConnected   bool                  `json:"truenas_connected"`
-	ControllerRunning  bool                  `json:"controller_running"`
-	NodeRunning        bool                  `json:"node_running"`
-	LastTrueNASCheck   string                `json:"last_truenas_check,omitempty"`
-	Error              string                `json:"error,omitempty"`
-	CircuitBreaker     *CircuitBreakerHealth `json:"circuit_breaker,omitempty"`
+	Ready             bool                  `json:"ready"`
+	TrueNASConnected  bool                  `json:"truenas_connected"`
+	ControllerRunning bool                  `json:"controller_running"`
+	NodeRunning       bool                  `json:"node_running"`
+	LastTrueNASCheck  string                `json:"last_truenas_check,omitempty"`
+	Error             string                `json:"error,omitempty"`
+	CircuitBreaker    *CircuitBreakerHealth `json:"circuit_breaker,omitempty"`
 }
 
 // CircuitBreakerHealth represents circuit breaker health information

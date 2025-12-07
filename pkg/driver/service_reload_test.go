@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -125,7 +126,7 @@ func TestServiceReloadDebouncer_ContextCancellation(t *testing.T) {
 	defer cancel()
 
 	err := debouncer.RequestReload(ctx, "iscsitarget")
-	if err != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Expected context.DeadlineExceeded, got %v", err)
 	}
 }
@@ -156,7 +157,7 @@ func TestServiceReloadDebouncer_Stop(t *testing.T) {
 	wg.Wait()
 
 	// Should have received a cancellation error
-	if err != context.Canceled {
+	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Expected context.Canceled after Stop, got %v", err)
 	}
 }

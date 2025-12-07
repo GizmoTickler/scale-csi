@@ -306,7 +306,7 @@ func TestFormatDeviceCommand(t *testing.T) {
 
 // getFormatCommand returns the mkfs command and arguments for a filesystem type.
 // This replicates the logic from FormatDevice() for testing.
-func getFormatCommand(devicePath, fsType string) (string, []string, error) {
+func getFormatCommand(devicePath, fsType string) (cmd string, args []string, err error) {
 	switch fsType {
 	case "ext4":
 		return "mkfs.ext4", []string{"-F", devicePath}, nil
@@ -405,7 +405,7 @@ func TestResizeFilesystemCommand(t *testing.T) {
 
 // getResizeCommand returns the resize command and path argument for a filesystem type.
 // This replicates the logic from ResizeFilesystem() for testing.
-func getResizeCommand(fsType, devicePath, mountPath string) (string, string, error) {
+func getResizeCommand(fsType, devicePath, mountPath string) (cmd, path string, err error) {
 	switch fsType {
 	case "ext4", "ext3", "ext2":
 		return "resize2fs", devicePath, nil
@@ -607,10 +607,10 @@ func parseFindmntOutput(output string) map[string]string {
 // Helper functions to avoid import cycles in test
 func trimSpace(s string) string {
 	result := s
-	for len(result) > 0 && (result[0] == ' ' || result[0] == '\t' || result[0] == '\n' || result[0] == '\r') {
+	for result != "" && (result[0] == ' ' || result[0] == '\t' || result[0] == '\n' || result[0] == '\r') {
 		result = result[1:]
 	}
-	for len(result) > 0 && (result[len(result)-1] == ' ' || result[len(result)-1] == '\t' || result[len(result)-1] == '\n' || result[len(result)-1] == '\r') {
+	for result != "" && (result[len(result)-1] == ' ' || result[len(result)-1] == '\t' || result[len(result)-1] == '\n' || result[len(result)-1] == '\r') {
 		result = result[:len(result)-1]
 	}
 	return result
@@ -725,7 +725,7 @@ func TestIsMountedOutputParsing(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Replicate the mount detection logic from IsMounted()
-			result := len(trimSpace(tc.output)) > 0
+			result := trimSpace(tc.output) != ""
 			assert.Equal(t, tc.wantResult, result)
 		})
 	}

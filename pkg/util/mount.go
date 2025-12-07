@@ -3,6 +3,7 @@ package util
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -37,13 +38,14 @@ func IsMounted(path string) (bool, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 means not mounted
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return false, nil
 		}
 		return false, err
 	}
 
-	return len(strings.TrimSpace(string(output))) > 0, nil
+	return strings.TrimSpace(string(output)) != "", nil
 }
 
 // Mount mounts a source to a target with the given filesystem type and options.
@@ -65,7 +67,7 @@ func Mount(source, target, fsType string, options []string) error {
 	cmd := exec.CommandContext(ctx, "mount", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("mount failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("mount failed: %w, output: %s", err, string(output))
 	}
 
 	return nil
@@ -97,7 +99,7 @@ func BindMount(source, target string, options []string) error {
 	cmd := exec.CommandContext(ctx, "mount", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("bind mount failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("bind mount failed: %w, output: %s", err, string(output))
 	}
 
 	return nil
@@ -138,14 +140,16 @@ func UnmountWithContext(ctx context.Context, target string) error {
 			// Not retryable with regular unmount, try lazy unmount as last resort
 			cmd = exec.CommandContext(cmdCtx, "umount", "-l", target)
 			if lazyOutput, lazyErr := cmd.CombinedOutput(); lazyErr != nil {
-				return fmt.Errorf("unmount failed: %v, output: %s; lazy unmount also failed: %v, output: %s",
-					err, string(output), lazyErr, string(lazyOutput))
+				return errors.Join(
+					fmt.Errorf("unmount failed: %w, output: %s", err, string(output)),
+					fmt.Errorf("lazy unmount failed: %w, output: %s", lazyErr, string(lazyOutput)),
+				)
 			}
 			return nil // Lazy unmount succeeded
 		}
 
 		// Return the error to trigger retry
-		return fmt.Errorf("unmount failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("unmount failed: %w, output: %s", err, string(output))
 	})
 }
 
@@ -195,7 +199,7 @@ func FormatDevice(devicePath, fsType string) error {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("format failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("format failed: %w, output: %s", err, string(output))
 	}
 
 	return nil
@@ -219,10 +223,10 @@ func GetFilesystemType(devicePath string) (string, error) {
 func GetFilesystemStats(path string) (*FilesystemStats, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
-		return nil, fmt.Errorf("statfs failed: %v", err)
+		return nil, fmt.Errorf("statfs failed: %w", err)
 	}
 
-	blockSize := int64(stat.Bsize)
+	blockSize := stat.Bsize
 
 	return &FilesystemStats{
 		TotalBytes:      int64(stat.Blocks) * blockSize,
@@ -241,7 +245,7 @@ func ResizeFilesystem(mountPath string) error {
 	// Get the device path
 	devicePath, err := GetDeviceFromMountPoint(mountPath)
 	if err != nil {
-		return fmt.Errorf("failed to get device from mount point: %v", err)
+		return fmt.Errorf("failed to get device from mount point: %w", err)
 	}
 
 	// Get filesystem type
@@ -268,7 +272,7 @@ func ResizeFilesystem(mountPath string) error {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("resize failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("resize failed: %w, output: %s", err, string(output))
 	}
 
 	return nil
@@ -282,7 +286,7 @@ func GetDeviceFromMountPoint(mountPath string) (string, error) {
 	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-o", "SOURCE", mountPath)
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to find device: %v", err)
+		return "", fmt.Errorf("failed to find device: %w", err)
 	}
 	return strings.TrimSpace(string(output)), nil
 }
@@ -300,10 +304,11 @@ func GetMountedBlockDevices() (map[string]string, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 with empty output means no mounts found (not an error)
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return make(map[string]string), nil
 		}
-		return nil, fmt.Errorf("findmnt failed: %v", err)
+		return nil, fmt.Errorf("findmnt failed: %w", err)
 	}
 
 	devices := make(map[string]string)

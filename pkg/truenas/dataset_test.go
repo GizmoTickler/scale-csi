@@ -61,10 +61,10 @@ type rpcTestRequest struct {
 
 // rpcTestResponse mirrors rpcResponse for test JSON generation
 type rpcTestResponse struct {
-	JSONRPC string       `json:"jsonrpc"`
-	ID      int64        `json:"id"`
-	Result  interface{}  `json:"result,omitempty"`
-	Error   *rpcError    `json:"error,omitempty"`
+	JSONRPC string      `json:"jsonrpc"`
+	ID      int64       `json:"id"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   *rpcError   `json:"error,omitempty"`
 }
 
 // TestDatasetCreate tests the DatasetCreate function
@@ -1244,12 +1244,12 @@ func TestParseProperty_NilData(t *testing.T) {
 // TestDatasetCreate_TableDriven uses table-driven tests for various create scenarios
 func TestDatasetCreate_TableDriven(t *testing.T) {
 	tests := []struct {
-		name           string
-		params         *DatasetCreateParams
-		mockResponse   interface{}
-		mockError      *rpcError
-		expectError    bool
-		expectedType   string
+		name         string
+		params       *DatasetCreateParams
+		mockResponse interface{}
+		mockError    *rpcError
+		expectError  bool
+		expectedType string
 	}{
 		{
 			name: "filesystem creation",
@@ -1695,4 +1695,3 @@ func BenchmarkParseDataset(b *testing.B) {
 		_, _ = parseDataset(data)
 	}
 }
-

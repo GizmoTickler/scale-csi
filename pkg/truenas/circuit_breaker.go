@@ -70,16 +70,16 @@ func DefaultCircuitBreakerConfig() *CircuitBreakerConfig {
 type CircuitBreaker struct {
 	config *CircuitBreakerConfig
 
-	mu                  sync.RWMutex
-	state               CircuitState
-	failures            int
-	successes           int
-	lastFailure         time.Time
-	halfOpenRequests    int
-	lastStateChange     time.Time
-	totalFailures       int64 // for metrics
-	totalSuccesses      int64 // for metrics
-	totalCircuitOpens   int64 // for metrics
+	mu                sync.RWMutex
+	state             CircuitState
+	failures          int
+	successes         int
+	lastFailure       time.Time
+	halfOpenRequests  int
+	lastStateChange   time.Time
+	totalFailures     int64 // for metrics
+	totalSuccesses    int64 // for metrics
+	totalCircuitOpens int64 // for metrics
 }
 
 // NewCircuitBreaker creates a new circuit breaker with the given configuration.

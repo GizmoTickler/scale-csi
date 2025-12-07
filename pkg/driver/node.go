@@ -132,7 +132,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 
 	// Ensure staging directory exists
-	if err := os.MkdirAll(stagingPath, 0750); err != nil {
+	if err := os.MkdirAll(stagingPath, 0o750); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create staging directory: %v", err)
 	}
 
@@ -231,27 +231,27 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	if devicePath != "" {
 		if strings.Contains(devicePath, "nvme") {
 			// NVMe-oF cleanup
-			nqn, err := util.GetNVMeInfoFromDevice(devicePath)
-			if err == nil {
-				if err := util.NVMeoFDisconnect(nqn); err != nil {
-					klog.Warningf("Failed to disconnect NVMe-oF session %s: %v", nqn, err)
+			nqn, nvmeErr := util.GetNVMeInfoFromDevice(devicePath)
+			if nvmeErr == nil {
+				if discErr := util.NVMeoFDisconnect(nqn); discErr != nil {
+					klog.Warningf("Failed to disconnect NVMe-oF session %s: %v", nqn, discErr)
 				} else {
 					klog.Infof("Disconnected NVMe-oF session %s", nqn)
 				}
 			} else {
-				klog.V(4).Infof("Could not get NVMe info from device %s: %v", devicePath, err)
+				klog.V(4).Infof("Could not get NVMe info from device %s: %v", devicePath, nvmeErr)
 			}
 		} else {
 			// Try iSCSI cleanup
-			portal, iqn, err := util.GetISCSIInfoFromDevice(devicePath)
-			if err == nil {
-				if err := util.ISCSIDisconnect(portal, iqn); err != nil {
-					klog.Warningf("Failed to disconnect iSCSI session %s: %v", iqn, err)
+			portal, iqn, iscsiErr := util.GetISCSIInfoFromDevice(devicePath)
+			if iscsiErr == nil {
+				if discErr := util.ISCSIDisconnect(portal, iqn); discErr != nil {
+					klog.Warningf("Failed to disconnect iSCSI session %s: %v", iqn, discErr)
 				} else {
 					klog.Infof("Disconnected iSCSI session %s", iqn)
 				}
 			} else {
-				klog.V(4).Infof("Could not get iSCSI info from device %s: %v", devicePath, err)
+				klog.V(4).Infof("Could not get iSCSI info from device %s: %v", devicePath, iscsiErr)
 			}
 		}
 	}
@@ -283,7 +283,7 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 		// Target name = volumeID + optional NameSuffix
 		targetName := volumeID
 		if d.config.ISCSI.NameSuffix != "" {
-			targetName = targetName + d.config.ISCSI.NameSuffix
+			targetName += d.config.ISCSI.NameSuffix
 		}
 
 		// Check if there's an active session for this target
@@ -309,7 +309,7 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 			nqnName = d.config.NVMeoF.NamePrefix + nqnName
 		}
 		if d.config.NVMeoF.NameSuffix != "" {
-			nqnName = nqnName + d.config.NVMeoF.NameSuffix
+			nqnName += d.config.NVMeoF.NameSuffix
 		}
 
 		// Try to find and disconnect any NVMe-oF session for this volume
@@ -353,7 +353,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	defer d.releaseOperationLock(lockKey)
 
 	// Ensure target directory exists
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o750); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create target directory: %v", err)
 	}
 
@@ -383,7 +383,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 
 	// Bind mount from staging path to target path
 	if stagingPath != "" {
-		if err := os.MkdirAll(targetPath, 0750); err != nil {
+		if err := os.MkdirAll(targetPath, 0o750); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to create target path: %v", err)
 		}
 		if err := util.BindMount(stagingPath, targetPath, mountOptions); err != nil {

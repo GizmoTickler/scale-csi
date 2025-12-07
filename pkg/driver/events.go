@@ -18,22 +18,22 @@ import (
 
 const (
 	// Event reasons
-	EventReasonVolumeCreated       = "VolumeCreated"
-	EventReasonVolumeCreateFailed  = "VolumeCreateFailed"
-	EventReasonVolumeDeleted       = "VolumeDeleted"
-	EventReasonVolumeDeleteFailed  = "VolumeDeleteFailed"
-	EventReasonVolumeExpanded      = "VolumeExpanded"
-	EventReasonVolumeExpandFailed  = "VolumeExpandFailed"
-	EventReasonSnapshotCreated     = "SnapshotCreated"
+	EventReasonVolumeCreated        = "VolumeCreated"
+	EventReasonVolumeCreateFailed   = "VolumeCreateFailed"
+	EventReasonVolumeDeleted        = "VolumeDeleted"
+	EventReasonVolumeDeleteFailed   = "VolumeDeleteFailed"
+	EventReasonVolumeExpanded       = "VolumeExpanded"
+	EventReasonVolumeExpandFailed   = "VolumeExpandFailed"
+	EventReasonSnapshotCreated      = "SnapshotCreated"
 	EventReasonSnapshotCreateFailed = "SnapshotCreateFailed"
-	EventReasonSnapshotDeleted     = "SnapshotDeleted"
+	EventReasonSnapshotDeleted      = "SnapshotDeleted"
 	EventReasonSnapshotDeleteFailed = "SnapshotDeleteFailed"
-	EventReasonISCSILoginFailed    = "ISCSILoginFailed"
-	EventReasonISCSILogoutFailed   = "ISCSILogoutFailed"
-	EventReasonNFSMountFailed      = "NFSMountFailed"
-	EventReasonNFSUnmountFailed    = "NFSUnmountFailed"
-	EventReasonTrueNASError        = "TrueNASError"
-	EventReasonTrueNASReconnected  = "TrueNASReconnected"
+	EventReasonISCSILoginFailed     = "ISCSILoginFailed"
+	EventReasonISCSILogoutFailed    = "ISCSILogoutFailed"
+	EventReasonNFSMountFailed       = "NFSMountFailed"
+	EventReasonNFSUnmountFailed     = "NFSUnmountFailed"
+	EventReasonTrueNASError         = "TrueNASError"
+	EventReasonTrueNASReconnected   = "TrueNASReconnected"
 )
 
 // EventRecorder wraps Kubernetes event recording functionality

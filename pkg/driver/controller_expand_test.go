@@ -4,9 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 func TestControllerExpandVolume_MixedProtocolBug(t *testing.T) {

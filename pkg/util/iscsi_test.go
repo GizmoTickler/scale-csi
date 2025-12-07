@@ -703,11 +703,11 @@ func buildNodeParamArgs(portal, iqn, name, value string) []string {
 // TestISCSIGetSessionStatsOutputParsing tests parsing of session stats output.
 func TestISCSIGetSessionStatsOutputParsing(t *testing.T) {
 	testCases := []struct {
-		name       string
-		output     string
-		targetIQN  string
-		wantStats  map[string]string
-		wantInSec  bool
+		name      string
+		output    string
+		targetIQN string
+		wantStats map[string]string
+		wantInSec bool
 	}{
 		{
 			name: "basic stats parsing",

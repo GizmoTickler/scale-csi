@@ -127,10 +127,10 @@ func TestNVMeDeviceRegexVsBuggyImplementation(t *testing.T) {
 		buggyResult    string // What the buggy code would produce
 		expectedResult string // What we actually want
 	}{
-		{"nvme0n1", "", "nvme0"},       // BUG: splits at first "n", producing empty string
-		{"nvme1n2", "", "nvme1"},       // BUG: same issue
-		{"nvme10n1", "", "nvme10"},     // BUG: same issue
-		{"nvme0n10", "", "nvme0"},      // BUG: same issue
+		{"nvme0n1", "", "nvme0"},   // BUG: splits at first "n", producing empty string
+		{"nvme1n2", "", "nvme1"},   // BUG: same issue
+		{"nvme10n1", "", "nvme10"}, // BUG: same issue
+		{"nvme0n10", "", "nvme0"},  // BUG: same issue
 	}
 
 	for _, tc := range testCases {
@@ -227,7 +227,7 @@ func TestWaitForNVMeDevice(t *testing.T) {
 		cancel()
 		_, err := waitForNVMeDevice(ctx, "nqn.test", 10*time.Second)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "context cancelled")
+		assert.Contains(t, err.Error(), "context canceled")
 	})
 }
 

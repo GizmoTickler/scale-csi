@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // =============================================================================
@@ -58,7 +59,7 @@ func (m *ErrorInjectingMockClient) ISCSITargetDelete(ctx context.Context, id int
 	return m.MockClient.ISCSITargetDelete(ctx, id, force)
 }
 
-func (m *ErrorInjectingMockClient) ISCSIExtentDelete(ctx context.Context, id int, remove bool, force bool) error {
+func (m *ErrorInjectingMockClient) ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error {
 	m.CleanupCalls = append(m.CleanupCalls, fmt.Sprintf("ISCSIExtentDelete(%d)", id))
 	if m.InjectISCSIExtentDeleteError != nil {
 		return m.InjectISCSIExtentDeleteError
@@ -98,7 +99,7 @@ func (m *ErrorInjectingMockClient) NVMeoFPortSubsysDelete(ctx context.Context, i
 	return m.MockClient.NVMeoFPortSubsysDelete(ctx, id)
 }
 
-func (m *ErrorInjectingMockClient) DatasetSetUserProperty(ctx context.Context, name string, key string, value string) error {
+func (m *ErrorInjectingMockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	if m.InjectPropertySetError != nil {
 		return m.InjectPropertySetError
 	}
@@ -328,7 +329,7 @@ func TestCreateNFSShare_PropertyError_ReturnsError(t *testing.T) {
 	mockClient.InjectPropertySetError = fmt.Errorf("property storage failed")
 
 	// Call createNFSShare - should return error when property storage fails
-	err := d.createNFSShare(ctx, datasetName, "test-vol")
+	err := d.createNFSShare(ctx, datasetName, "test-vol", "/mnt/tank/k8s/volumes/test-nfs-prop-err")
 
 	// Property storage failure for NFS should return error
 	assert.Error(t, err)
@@ -515,7 +516,7 @@ func TestCreateShareWithOptions_UnsupportedType(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := d.createShareWithOptions(ctx, "tank/k8s/volumes/test", "test-vol", ShareType("unknown"), false)
+	err := d.createShareWithOptions(ctx, "tank/k8s/volumes/test", "test-vol", ShareType("unknown"), false, "")
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported share type")

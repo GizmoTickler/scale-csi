@@ -4,6 +4,7 @@ package truenas
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -39,14 +40,15 @@ func (e *APIError) FullError() string {
 
 // LogAPIError logs full error details for debugging. This is useful before
 // fallback logic that may mask the original error.
-func LogAPIError(err error, context string) {
+func LogAPIError(err error, ctx string) {
 	if err == nil {
 		return
 	}
-	if apiErr, ok := err.(*APIError); ok {
-		klog.V(4).Infof("%s: %s", context, apiErr.FullError())
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		klog.V(4).Infof("%s: %s", ctx, apiErr.FullError())
 	} else {
-		klog.V(4).Infof("%s: %v", context, err)
+		klog.V(4).Infof("%s: %v", ctx, err)
 	}
 }
 
@@ -55,7 +57,8 @@ func IsNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if apiErr, ok := err.(*APIError); ok {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
 		// Common "not found" error codes from TrueNAS
 		return apiErr.Code == -1 || strings.Contains(strings.ToLower(apiErr.Message), "not found") ||
 			strings.Contains(strings.ToLower(apiErr.Message), "does not exist")
@@ -69,7 +72,8 @@ func IsAlreadyExistsError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if apiErr, ok := err.(*APIError); ok {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
 		return strings.Contains(strings.ToLower(apiErr.Message), "already exists")
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
@@ -93,31 +97,31 @@ type MetricsRecorder func(method string, duration float64, err error)
 
 // SystemInfo represents TrueNAS system information including version.
 type SystemInfo struct {
-	Version        string `json:"version"`         // Full version string (e.g., "TrueNAS-SCALE-25.10.0")
-	VersionMajor   int    // Major version (e.g., 25)
-	VersionMinor   int    // Minor version (e.g., 10)
-	VersionPatch   int    // Patch version (e.g., 0)
-	Hostname       string `json:"hostname"`
-	UptimeSeconds  int64  `json:"uptime_seconds"`
-	SystemProduct  string `json:"system_product"`
-	SystemSerial   string `json:"system_serial"`
+	Version       string `json:"version"` // Full version string (e.g., "TrueNAS-SCALE-25.10.0")
+	VersionMajor  int    // Major version (e.g., 25)
+	VersionMinor  int    // Minor version (e.g., 10)
+	VersionPatch  int    // Patch version (e.g., 0)
+	Hostname      string `json:"hostname"`
+	UptimeSeconds int64  `json:"uptime_seconds"`
+	SystemProduct string `json:"system_product"`
+	SystemSerial  string `json:"system_serial"`
 }
 
 // ClientConfig holds the configuration for the TrueNAS client.
 type ClientConfig struct {
-	Host               string
-	Port               int
-	Protocol           string
-	APIKey             string
-	AllowInsecure      bool
-	Timeout            time.Duration
-	ConnectTimeout     time.Duration
-	MaxRetries         int             // Maximum number of connection retries (default: 3)
-	RetryInterval      time.Duration   // Initial retry interval (default: 1s, exponential backoff applied)
-	HeartbeatInterval  time.Duration   // Interval for WebSocket heartbeat (default: 30s)
-	MaxConnections     int             // Maximum number of concurrent connections (default: 5)
-	MaxConcurrentReqs  int             // Maximum number of concurrent API requests (default: 10)
-	MetricsRecorder    MetricsRecorder // Optional callback for recording request metrics
+	Host              string
+	Port              int
+	Protocol          string
+	APIKey            string
+	AllowInsecure     bool
+	Timeout           time.Duration
+	ConnectTimeout    time.Duration
+	MaxRetries        int             // Maximum number of connection retries (default: 3)
+	RetryInterval     time.Duration   // Initial retry interval (default: 1s, exponential backoff applied)
+	HeartbeatInterval time.Duration   // Interval for WebSocket heartbeat (default: 30s)
+	MaxConnections    int             // Maximum number of concurrent connections (default: 5)
+	MaxConcurrentReqs int             // Maximum number of concurrent API requests (default: 10)
+	MetricsRecorder   MetricsRecorder // Optional callback for recording request metrics
 
 	// Circuit breaker configuration
 	CircuitBreaker *CircuitBreakerConfig
@@ -331,7 +335,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	if connected == 0 {
 		// Try one last time synchronously to get the error
 		if err := client.pool[0].connect(); err != nil {
-			return nil, fmt.Errorf("failed to establish any connections (last error: %v): %w", lastErr, err)
+			return nil, fmt.Errorf("failed to establish any connections (previous: %s): %w", lastErr.Error(), err)
 		}
 	}
 
@@ -639,7 +643,8 @@ func (c *Connection) readMessages() {
 		var resp rpcResponse
 		if err := conn.ReadJSON(&resp); err != nil {
 			// Check if this is a timeout - if so, just loop again to check connection state
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
 
@@ -861,7 +866,7 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 	case c.semaphore <- struct{}{}:
 		// Got a slot, continue
 	case <-ctx.Done():
-		return nil, fmt.Errorf("context cancelled while waiting for request slot: %w", ctx.Err())
+		return nil, fmt.Errorf("context canceled while waiting for request slot: %w", ctx.Err())
 	}
 	defer func() { <-c.semaphore }() // Release slot when done
 
@@ -914,7 +919,7 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 					retryDelay = c.config.APIRetryMaxDelay
 				}
 			case <-ctx.Done():
-				finalErr := fmt.Errorf("context cancelled during retry: %w", ctx.Err())
+				finalErr := fmt.Errorf("context canceled during retry: %w", ctx.Err())
 				if c.metricsRecorder != nil {
 					c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
 				}

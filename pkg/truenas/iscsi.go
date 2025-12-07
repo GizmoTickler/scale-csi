@@ -59,7 +59,7 @@ type ISCSIGlobalConfig struct {
 }
 
 // ISCSITargetCreate creates a new iSCSI target.
-func (c *Client) ISCSITargetCreate(ctx context.Context, name string, alias string, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
+func (c *Client) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
 	// Convert groups to maps, omitting auth field when nil (TrueNAS API prefers no field vs null)
 	groupMaps := make([]map[string]interface{}, len(groups))
 	for i, g := range groups {
@@ -149,7 +149,7 @@ func (c *Client) ISCSITargetFindByName(ctx context.Context, name string) (*ISCSI
 }
 
 // ISCSIExtentCreate creates a new iSCSI extent.
-func (c *Client) ISCSIExtentCreate(ctx context.Context, name string, diskPath string, comment string, blocksize int, rpm string) (*ISCSIExtent, error) {
+func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, rpm string) (*ISCSIExtent, error) {
 	params := map[string]interface{}{
 		"name":         name,
 		"type":         "DISK",
@@ -183,7 +183,7 @@ func (c *Client) ISCSIExtentCreate(ctx context.Context, name string, diskPath st
 }
 
 // ISCSIExtentDelete deletes an iSCSI extent.
-func (c *Client) ISCSIExtentDelete(ctx context.Context, id int, remove bool, force bool) error {
+func (c *Client) ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error {
 	_, err := c.Call(ctx, "iscsi.extent.delete", id, remove, force)
 	if err != nil {
 		if strings.Contains(err.Error(), "does not exist") ||
@@ -228,7 +228,7 @@ func (c *Client) ISCSIExtentFindByName(ctx context.Context, name string) (*ISCSI
 }
 
 // ISCSITargetExtentCreate creates a target-to-extent association.
-func (c *Client) ISCSITargetExtentCreate(ctx context.Context, targetID int, extentID int, lunID int) (*ISCSITargetExtent, error) {
+func (c *Client) ISCSITargetExtentCreate(ctx context.Context, targetID, extentID, lunID int) (*ISCSITargetExtent, error) {
 	params := map[string]interface{}{
 		"target": targetID,
 		"extent": extentID,
@@ -288,7 +288,7 @@ func (c *Client) ISCSITargetExtentGet(ctx context.Context, id int) (*ISCSITarget
 }
 
 // ISCSITargetExtentFind finds a target-extent association.
-func (c *Client) ISCSITargetExtentFind(ctx context.Context, targetID int, extentID int) (*ISCSITargetExtent, error) {
+func (c *Client) ISCSITargetExtentFind(ctx context.Context, targetID, extentID int) (*ISCSITargetExtent, error) {
 	filters := [][]interface{}{
 		{"target", "=", targetID},
 		{"extent", "=", extentID},
@@ -340,23 +340,25 @@ func parseISCSITarget(data interface{}) (*ISCSITarget, error) {
 
 	if groups, ok := m["groups"].([]interface{}); ok {
 		for _, g := range groups {
-			if gm, ok := g.(map[string]interface{}); ok {
-				group := ISCSITargetGroup{}
-				if v, ok := gm["portal"].(float64); ok {
-					group.Portal = int(v)
-				}
-				if v, ok := gm["initiator"].(float64); ok {
-					group.Initiator = int(v)
-				}
-				if v, ok := gm["authmethod"].(string); ok {
-					group.AuthMethod = v
-				}
-				if v, ok := gm["auth"].(float64); ok {
-					val := int(v)
-					group.Auth = &val
-				}
-				target.Groups = append(target.Groups, group)
+			gm, ok := g.(map[string]interface{})
+			if !ok {
+				continue
 			}
+			group := ISCSITargetGroup{}
+			if v, ok := gm["portal"].(float64); ok {
+				group.Portal = int(v)
+			}
+			if v, ok := gm["initiator"].(float64); ok {
+				group.Initiator = int(v)
+			}
+			if v, ok := gm["authmethod"].(string); ok {
+				group.AuthMethod = v
+			}
+			if v, ok := gm["auth"].(float64); ok {
+				val := int(v)
+				group.Auth = &val
+			}
+			target.Groups = append(target.Groups, group)
 		}
 	}
 

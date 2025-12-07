@@ -4,9 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 func TestCreateVolume(t *testing.T) {
@@ -175,36 +176,36 @@ func TestDeleteSnapshot(t *testing.T) {
 func TestCreateSnapshot_RestoreSize(t *testing.T) {
 	// Test cases for the restoreSize fix
 	tests := []struct {
-		name            string
-		datasetType     string
-		volsize         int64 // Source volume size (for zvols)
-		refquota        int64 // Source refquota (for filesystems)
-		snapshotUsed    int64 // Snapshot "used" bytes to set on mock
-		expectedSize    int64 // Expected SizeBytes in response
-		description     string
+		name         string
+		datasetType  string
+		volsize      int64 // Source volume size (for zvols)
+		refquota     int64 // Source refquota (for filesystems)
+		snapshotUsed int64 // Snapshot "used" bytes to set on mock
+		expectedSize int64 // Expected SizeBytes in response
+		description  string
 	}{
 		{
 			name:         "zvol_uses_volsize_not_used_bytes",
 			datasetType:  "VOLUME",
 			volsize:      10 * 1024 * 1024 * 1024, // 10 GiB
-			snapshotUsed: 102400,                   // 100 KiB (near-empty volume)
-			expectedSize: 10 * 1024 * 1024 * 1024,  // Should use volsize, NOT used bytes
+			snapshotUsed: 102400,                  // 100 KiB (near-empty volume)
+			expectedSize: 10 * 1024 * 1024 * 1024, // Should use volsize, NOT used bytes
 			description:  "For zvols with valid volsize, SizeBytes should be volsize (not snapshot used bytes)",
 		},
 		{
 			name:         "zvol_empty_volume",
 			datasetType:  "VOLUME",
 			volsize:      5 * 1024 * 1024 * 1024, // 5 GiB
-			snapshotUsed: 0,                       // Completely empty
-			expectedSize: 5 * 1024 * 1024 * 1024,  // Should use volsize
+			snapshotUsed: 0,                      // Completely empty
+			expectedSize: 5 * 1024 * 1024 * 1024, // Should use volsize
 			description:  "Empty zvol should still use volsize for restoreSize",
 		},
 		{
 			name:         "zvol_1gib_volume",
 			datasetType:  "VOLUME",
 			volsize:      1 * 1024 * 1024 * 1024, // 1 GiB
-			snapshotUsed: 512,                     // Tiny used bytes
-			expectedSize: 1 * 1024 * 1024 * 1024,  // Should use volsize
+			snapshotUsed: 512,                    // Tiny used bytes
+			expectedSize: 1 * 1024 * 1024 * 1024, // Should use volsize
 			description:  "1 GiB zvol should return 1 GiB restoreSize even with tiny used bytes",
 		},
 		{
@@ -219,8 +220,8 @@ func TestCreateSnapshot_RestoreSize(t *testing.T) {
 			name:         "filesystem_uses_refquota",
 			datasetType:  "FILESYSTEM",
 			refquota:     20 * 1024 * 1024 * 1024, // 20 GiB refquota
-			snapshotUsed: 51200,                    // 50 KiB used
-			expectedSize: 20 * 1024 * 1024 * 1024,  // For filesystems (NFS), use refquota
+			snapshotUsed: 51200,                   // 50 KiB used
+			expectedSize: 20 * 1024 * 1024 * 1024, // For filesystems (NFS), use refquota
 			description:  "Filesystems use refquota as volume size",
 		},
 	}
@@ -329,7 +330,7 @@ type snapshotWithUsedBytesMock struct {
 	usedBytes int64
 }
 
-func (m *snapshotWithUsedBytesMock) SnapshotCreate(ctx context.Context, dataset string, name string) (*truenas.Snapshot, error) {
+func (m *snapshotWithUsedBytesMock) SnapshotCreate(ctx context.Context, dataset, name string) (*truenas.Snapshot, error) {
 	snap, err := m.MockClient.SnapshotCreate(ctx, dataset, name)
 	if err != nil {
 		return nil, err
@@ -395,7 +396,7 @@ type datasetGetFailMock struct {
 	snapCreated   bool
 }
 
-func (m *datasetGetFailMock) SnapshotCreate(ctx context.Context, dataset string, name string) (*truenas.Snapshot, error) {
+func (m *datasetGetFailMock) SnapshotCreate(ctx context.Context, dataset, name string) (*truenas.Snapshot, error) {
 	snap, err := m.MockClient.SnapshotCreate(ctx, dataset, name)
 	if err == nil {
 		m.snapCreated = true

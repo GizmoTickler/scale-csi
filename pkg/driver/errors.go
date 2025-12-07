@@ -2,9 +2,10 @@
 package driver
 
 import (
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // ToGRPCError converts various error types to appropriate gRPC status errors.

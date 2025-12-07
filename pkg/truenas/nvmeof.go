@@ -13,13 +13,13 @@ import (
 // Updated for TrueNAS SCALE 25.10+ API changes.
 type NVMeoFSubsystem struct {
 	ID           int    `json:"id"`
-	Name         string `json:"name"`          // Human readable name (25.10+)
-	NQN          string `json:"subnqn"`        // NVMe Qualified Name (was "nqn" pre-25.10)
-	Serial       string `json:"serial"`        // Auto-generated in 25.10+
+	Name         string `json:"name"`   // Human readable name (25.10+)
+	NQN          string `json:"subnqn"` // NVMe Qualified Name (was "nqn" pre-25.10)
+	Serial       string `json:"serial"` // Auto-generated in 25.10+
 	AllowAnyHost bool   `json:"allow_any_host"`
-	Hosts        []int  `json:"hosts"`         // Host IDs (changed from []string in 25.10)
+	Hosts        []int  `json:"hosts"` // Host IDs (changed from []string in 25.10)
 	Namespaces   []int  `json:"namespaces"`
-	Ports        []int  `json:"ports"`         // Port IDs (new in 25.10)
+	Ports        []int  `json:"ports"` // Port IDs (new in 25.10)
 }
 
 // NVMeoFNamespace represents an NVMe-oF namespace from the TrueNAS API.
@@ -40,12 +40,12 @@ type NVMeoFNamespace struct {
 // Updated for TrueNAS SCALE 25.10+ API changes.
 type NVMeoFPort struct {
 	ID         int    `json:"id"`
-	Index      int    `json:"index"`         // New in 25.10
-	Transport  string `json:"addr_trtype"`   // Was "transport" pre-25.10
+	Index      int    `json:"index"`       // New in 25.10
+	Transport  string `json:"addr_trtype"` // Was "transport" pre-25.10
 	Address    string `json:"addr_traddr"`
 	Port       int    `json:"addr_trsvcid"`
-	AddrFamily string `json:"addr_adrfam"`   // New in 25.10: "IPV4", "IPV6", "FC"
-	Enabled    bool   `json:"enabled"`       // New in 25.10
+	AddrFamily string `json:"addr_adrfam"` // New in 25.10: "IPV4", "IPV6", "FC"
+	Enabled    bool   `json:"enabled"`     // New in 25.10
 	Subsystems []int  `json:"subsystems"`
 }
 
@@ -152,7 +152,7 @@ func (c *Client) NVMeoFSubsystemFindByName(ctx context.Context, name string) (*N
 // NVMeoFNamespaceCreate creates a new NVMe-oF namespace.
 // Updated for TrueNAS SCALE 25.10+: uses "subsys_id" and requires "device_type".
 // devicePath should be in format "zvol/pool/volume" (without /dev/ prefix).
-func (c *Client) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath string, deviceType string) (*NVMeoFNamespace, error) {
+func (c *Client) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath, deviceType string) (*NVMeoFNamespace, error) {
 	// Check version support
 	if err := c.CheckNVMeoFSupport(ctx); err != nil {
 		return nil, err
@@ -305,7 +305,7 @@ func (c *Client) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 // NVMeoFPortCreate creates a new NVMe-oF port.
 // Updated for TrueNAS SCALE 25.10+: uses addr_trtype, addr_traddr, addr_trsvcid.
 // Note: addr_adrfam is auto-detected by TrueNAS and should not be passed on create.
-func (c *Client) NVMeoFPortCreate(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+func (c *Client) NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
 	// Check version support
 	if err := c.CheckNVMeoFSupport(ctx); err != nil {
 		return nil, err
@@ -329,7 +329,7 @@ func (c *Client) NVMeoFPortCreate(ctx context.Context, transport string, address
 }
 
 // NVMeoFPortFindByAddress finds an NVMe-oF port by transport, address, and port.
-func (c *Client) NVMeoFPortFindByAddress(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+func (c *Client) NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
 	filters := [][]interface{}{
 		{"addr_trtype", "=", strings.ToUpper(transport)},
 		{"addr_traddr", "=", address},
@@ -352,7 +352,7 @@ func (c *Client) NVMeoFPortFindByAddress(ctx context.Context, transport string, 
 // This makes the subsystem accessible on that port.
 // Updated for TrueNAS SCALE 25.10+: uses nvmet.port_subsys.create API.
 // Returns the created association object for tracking purposes.
-func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) (*NVMeoFPortSubsys, error) {
+func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID int) (*NVMeoFPortSubsys, error) {
 	// Check version support
 	if err := c.CheckNVMeoFSupport(ctx); err != nil {
 		return nil, err
@@ -447,31 +447,33 @@ func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID i
 	// Filter client-side by subsystem ID
 	assocs := make([]*NVMeoFPortSubsys, 0)
 	for _, item := range items {
-		if m, ok := item.(map[string]interface{}); ok {
-			// Extract subsystem ID from nested structure
-			var itemSubsysID int
-			if subsys, ok := m["subsys"].(map[string]interface{}); ok {
-				if id, ok := subsys["id"].(float64); ok {
-					itemSubsysID = int(id)
-				}
-			}
-			// Only include if it matches the requested subsystem ID
-			if itemSubsysID != subsysID {
-				continue
-			}
-
-			assoc := &NVMeoFPortSubsys{}
-			if id, ok := m["id"].(float64); ok {
-				assoc.ID = int(id)
-			}
-			if port, ok := m["port"].(map[string]interface{}); ok {
-				if id, ok := port["id"].(float64); ok {
-					assoc.PortID = int(id)
-				}
-			}
-			assoc.SubsysID = itemSubsysID
-			assocs = append(assocs, assoc)
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
 		}
+		// Extract subsystem ID from nested structure
+		var itemSubsysID int
+		if subsys, ok := m["subsys"].(map[string]interface{}); ok {
+			if id, ok := subsys["id"].(float64); ok {
+				itemSubsysID = int(id)
+			}
+		}
+		// Only include if it matches the requested subsystem ID
+		if itemSubsysID != subsysID {
+			continue
+		}
+
+		assoc := &NVMeoFPortSubsys{}
+		if id, ok := m["id"].(float64); ok {
+			assoc.ID = int(id)
+		}
+		if port, ok := m["port"].(map[string]interface{}); ok {
+			if id, ok := port["id"].(float64); ok {
+				assoc.PortID = int(id)
+			}
+		}
+		assoc.SubsysID = itemSubsysID
+		assocs = append(assocs, assoc)
 	}
 
 	return assocs, nil
@@ -538,7 +540,7 @@ func (c *Client) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, e
 //
 // Important: If a wildcard port (0.0.0.0) exists on the same service port,
 // it will be reused since it binds to all interfaces and catches all traffic.
-func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
 	// Resolve hostname to IP if needed (TrueNAS API requires IP addresses)
 	resolvedAddr, err := resolveToIP(address)
 	if err != nil {

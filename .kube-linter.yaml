@@ -1,0 +1,18 @@
+# kube-linter configuration for scale-csi
+# CSI drivers require privileged access - these exclusions are expected
+checks:
+  addAllBuiltIn: true
+  exclude:
+    # CSI node plugin requires root and privileged access
+    - "run-as-non-root"
+    - "no-read-only-root-fs"
+    - "privilege-escalation-container"
+    - "privileged-container"
+    # CSI requires host mounts for device access
+    - "host-mounts"
+    - "host-network"
+    - "host-pid"
+    # CSI sidecars use default resources
+    - "unset-cpu-requirements"
+    - "unset-memory-requirements"
+customChecks: []

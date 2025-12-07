@@ -49,7 +49,7 @@ func NewServiceReloadDebouncer(debounceDelay time.Duration, reloadFunc func(ctx 
 // will be performed. All callers will receive the result of that reload.
 //
 // The context is used for the actual reload operation. If the context is
-// cancelled before the reload happens, this request is removed from the
+// canceled before the reload happens, this request is removed from the
 // pending list (but does not cancel reloads for other callers).
 func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service string) error {
 	resultCh := make(chan error, 1)
@@ -142,7 +142,7 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 		select {
 		case ch <- err:
 		default:
-			// Channel was already closed or full (context cancelled)
+			// Channel was already closed or full (context canceled)
 		}
 	}
 }

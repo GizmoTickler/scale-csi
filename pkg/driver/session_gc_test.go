@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // TestGetExpectedNVMeoFNQNs_FailedLookupsThreshold tests that getExpectedNVMeoFNQNs
@@ -195,6 +196,8 @@ func TestSessionGC_DryRunMode(t *testing.T) {
 			DryRun:      true,
 		}
 
+		assert.Equal(t, 300, cfg.Interval, "Interval should be 300")
+		assert.Equal(t, 60, cfg.GracePeriod, "GracePeriod should be 60")
 		assert.True(t, cfg.DryRun, "DryRun should be enabled")
 
 		cfg.DryRun = false

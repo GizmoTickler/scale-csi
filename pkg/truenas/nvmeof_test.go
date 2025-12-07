@@ -991,10 +991,19 @@ func TestNVMeoFSubsystemStruct_HostIDs(t *testing.T) {
 		Ports:        []int{100},
 	}
 
+	assert.Equal(t, 1, subsys.ID)
+	assert.Equal(t, "test", subsys.Name)
+	assert.Equal(t, "nqn.test", subsys.NQN)
+	assert.Equal(t, "TEST123", subsys.Serial)
+	assert.False(t, subsys.AllowAnyHost)
 	assert.Len(t, subsys.Hosts, 3)
 	assert.Equal(t, 1, subsys.Hosts[0])
 	assert.Equal(t, 2, subsys.Hosts[1])
 	assert.Equal(t, 3, subsys.Hosts[2])
+	assert.Len(t, subsys.Namespaces, 1)
+	assert.Equal(t, 10, subsys.Namespaces[0])
+	assert.Len(t, subsys.Ports, 1)
+	assert.Equal(t, 100, subsys.Ports[0])
 }
 
 func TestNVMeoFNamespaceStruct_DeviceTypes(t *testing.T) {
@@ -1007,7 +1016,12 @@ func TestNVMeoFNamespaceStruct_DeviceTypes(t *testing.T) {
 		DevicePath:  "zvol/tank/vol1",
 		Enabled:     true,
 	}
+	assert.Equal(t, 1, nsZvol.ID)
+	assert.Equal(t, 1, nsZvol.SubsystemID)
+	assert.Equal(t, 1, nsZvol.NSID)
 	assert.Equal(t, "ZVOL", nsZvol.DeviceType)
+	assert.Equal(t, "zvol/tank/vol1", nsZvol.DevicePath)
+	assert.True(t, nsZvol.Enabled)
 
 	// Test FILE device type
 	nsFile := NVMeoFNamespace{
@@ -1018,7 +1032,12 @@ func TestNVMeoFNamespaceStruct_DeviceTypes(t *testing.T) {
 		DevicePath:  "/mnt/tank/file.img",
 		Enabled:     true,
 	}
+	assert.Equal(t, 2, nsFile.ID)
+	assert.Equal(t, 1, nsFile.SubsystemID)
+	assert.Equal(t, 2, nsFile.NSID)
 	assert.Equal(t, "FILE", nsFile.DeviceType)
+	assert.Equal(t, "/mnt/tank/file.img", nsFile.DevicePath)
+	assert.True(t, nsFile.Enabled)
 }
 
 func TestNVMeoFPortStruct_TransportTypes(t *testing.T) {
@@ -1031,8 +1050,13 @@ func TestNVMeoFPortStruct_TransportTypes(t *testing.T) {
 		AddrFamily: "IPV4",
 		Enabled:    true,
 	}
+	assert.Equal(t, 1, tcpPort.ID)
+	assert.Equal(t, 0, tcpPort.Index)
 	assert.Equal(t, "TCP", tcpPort.Transport)
+	assert.Equal(t, "0.0.0.0", tcpPort.Address)
+	assert.Equal(t, 4420, tcpPort.Port)
 	assert.Equal(t, "IPV4", tcpPort.AddrFamily)
+	assert.True(t, tcpPort.Enabled)
 
 	rdmaPort := NVMeoFPort{
 		ID:         2,
@@ -1043,7 +1067,13 @@ func TestNVMeoFPortStruct_TransportTypes(t *testing.T) {
 		AddrFamily: "IPV4",
 		Enabled:    true,
 	}
+	assert.Equal(t, 2, rdmaPort.ID)
+	assert.Equal(t, 1, rdmaPort.Index)
 	assert.Equal(t, "RDMA", rdmaPort.Transport)
+	assert.Equal(t, "192.168.1.100", rdmaPort.Address)
+	assert.Equal(t, 4420, rdmaPort.Port)
+	assert.Equal(t, "IPV4", rdmaPort.AddrFamily)
+	assert.True(t, rdmaPort.Enabled)
 }
 
 func TestNVMeoFPortSubsysStruct(t *testing.T) {

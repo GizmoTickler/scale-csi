@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -14,20 +15,24 @@ import (
 )
 
 var (
-	host       = flag.String("host", "", "TrueNAS host (or set TRUENAS_HOST)")
-	apiKey     = flag.String("api-key", "", "TrueNAS API key (or set TRUENAS_API_KEY)")
-	insecure   = flag.Bool("insecure", true, "Allow insecure TLS connections")
-	timeout    = flag.Duration("timeout", 60*time.Second, "API timeout")
-	command    = flag.String("cmd", "help", "Command to run: help, call, services, service-reload, datasets, iscsi-audit, snapshots")
-	method     = flag.String("method", "", "API method to call (for 'call' command)")
-	params     = flag.String("params", "", "JSON params for API call (for 'call' command)")
-	dataset    = flag.String("dataset", "", "Dataset path for dataset commands")
-	service    = flag.String("service", "", "Service name for service commands")
-	verbose    = flag.Bool("v", false, "Verbose output")
-	cleanup    = flag.Bool("cleanup", false, "Cleanup orphaned resources (for audit commands)")
+	host     = flag.String("host", "", "TrueNAS host (or set TRUENAS_HOST)")
+	apiKey   = flag.String("api-key", "", "TrueNAS API key (or set TRUENAS_API_KEY)")
+	insecure = flag.Bool("insecure", true, "Allow insecure TLS connections")
+	timeout  = flag.Duration("timeout", 60*time.Second, "API timeout")
+	command  = flag.String("cmd", "help", "Command to run: help, call, services, service-reload, datasets, iscsi-audit, snapshots")
+	method   = flag.String("method", "", "API method to call (for 'call' command)")
+	params   = flag.String("params", "", "JSON params for API call (for 'call' command)")
+	dataset  = flag.String("dataset", "", "Dataset path for dataset commands")
+	service  = flag.String("service", "", "Service name for service commands")
+	verbose  = flag.Bool("v", false, "Verbose output")
+	cleanup  = flag.Bool("cleanup", false, "Cleanup orphaned resources (for audit commands)")
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	flag.Parse()
 
 	// Get credentials from flags or environment
@@ -37,7 +42,7 @@ func main() {
 	}
 	if h == "" {
 		fmt.Println("Error: TrueNAS host required. Use -host flag or TRUENAS_HOST env var")
-		os.Exit(1)
+		return 1
 	}
 
 	k := *apiKey
@@ -46,7 +51,7 @@ func main() {
 	}
 	if k == "" {
 		fmt.Println("Error: API key required. Use -api-key flag or TRUENAS_API_KEY env var")
-		os.Exit(1)
+		return 1
 	}
 
 	client, err := truenas.NewClient(&truenas.ClientConfig{
@@ -61,7 +66,7 @@ func main() {
 	})
 	if err != nil {
 		fmt.Printf("Failed to create client: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer func() { _ = client.Close() }()
 
@@ -89,8 +94,9 @@ func main() {
 	default:
 		fmt.Printf("Unknown command: %s\n", *command)
 		printHelp()
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func printHelp() {
@@ -146,7 +152,8 @@ func cmdCall(ctx context.Context, client *truenas.Client) {
 	result, err := client.Call(ctx, *method, callParams...)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
-		if apiErr, ok := err.(*truenas.APIError); ok {
+		var apiErr *truenas.APIError
+		if errors.As(err, &apiErr) {
 			fmt.Printf("  Code: %d\n", apiErr.Code)
 			fmt.Printf("  Message: %s\n", apiErr.Message)
 		}
@@ -198,7 +205,8 @@ func cmdServiceReload(ctx context.Context, client *truenas.Client) {
 	result, err := client.Call(ctx, "service.reload", *service)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
-		if apiErr, ok := err.(*truenas.APIError); ok {
+		var apiErr *truenas.APIError
+		if errors.As(err, &apiErr) {
 			fmt.Printf("  Code: %d\n", apiErr.Code)
 			fmt.Printf("  Message: %s\n", apiErr.Message)
 		}
@@ -233,15 +241,17 @@ func cmdDatasets(ctx context.Context, client *truenas.Client) {
 	fmt.Printf("Found %d datasets:\n\n", len(datasets))
 
 	for _, ds := range datasets {
-		if m, ok := ds.(map[string]interface{}); ok {
-			id := m["id"]
-			dsType := m["type"]
-			used := "?"
-			if usedObj, ok := m["used"].(map[string]interface{}); ok {
-				used = fmt.Sprintf("%v", usedObj["value"])
-			}
-			fmt.Printf("  %v (%v) - used: %s\n", id, dsType, used)
+		m, ok := ds.(map[string]interface{})
+		if !ok {
+			continue
 		}
+		id := m["id"]
+		dsType := m["type"]
+		used := "?"
+		if usedObj, ok := m["used"].(map[string]interface{}); ok {
+			used = fmt.Sprintf("%v", usedObj["value"])
+		}
+		fmt.Printf("  %v (%v) - used: %s\n", id, dsType, used)
 	}
 }
 
@@ -437,7 +447,8 @@ func cmdTestErrors(ctx context.Context, client *truenas.Client) {
 		}{name: test.name, result: result, err: err}
 
 		if err != nil {
-			if apiErr, ok := err.(*truenas.APIError); ok {
+			var apiErr *truenas.APIError
+			if errors.As(err, &apiErr) {
 				r.errCode = apiErr.Code
 				r.errMsg = apiErr.Message
 				fmt.Printf("  Error Code: %d\n", apiErr.Code)
@@ -541,18 +552,21 @@ func cmdNVMeoFAudit(ctx context.Context, client *truenas.Client) {
 	// Count namespaces per subsystem
 	// Note: subsys can be either a float64 (ID) or an object with an id field
 	for _, ns := range namespaces {
-		if m, ok := ns.(map[string]interface{}); ok {
-			var subsysID float64
-			if id, ok := m["subsys"].(float64); ok {
+		m, ok := ns.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		var subsysID float64
+		switch v := m["subsys"].(type) {
+		case float64:
+			subsysID = v
+		case map[string]interface{}:
+			if id, ok := v["id"].(float64); ok {
 				subsysID = id
-			} else if subsysObj, ok := m["subsys"].(map[string]interface{}); ok {
-				if id, ok := subsysObj["id"].(float64); ok {
-					subsysID = id
-				}
 			}
-			if subsysID > 0 {
-				subsysNamespaces[subsysID]++
-			}
+		}
+		if subsysID > 0 {
+			subsysNamespaces[subsysID]++
 		}
 	}
 

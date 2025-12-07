@@ -2,6 +2,7 @@ package truenas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -102,7 +103,7 @@ func (c *Client) DatasetCreate(ctx context.Context, params *DatasetCreateParams)
 }
 
 // DatasetDelete deletes a ZFS dataset.
-func (c *Client) DatasetDelete(ctx context.Context, name string, recursive bool, force bool) error {
+func (c *Client) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
 	options := map[string]interface{}{
 		"recursive": recursive,
 		"force":     force,
@@ -118,7 +119,8 @@ func (c *Client) DatasetDelete(ctx context.Context, name string, recursive bool,
 			return nil
 		}
 		// TrueNAS returns -32602 "Invalid params" when dataset doesn't exist
-		if apiErr, ok := err.(*APIError); ok && apiErr.Code == -32602 {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == -32602 {
 			return nil
 		}
 		return fmt.Errorf("failed to delete dataset: %w", err)
@@ -155,7 +157,7 @@ func (c *Client) DatasetUpdate(ctx context.Context, name string, params *Dataset
 }
 
 // DatasetList lists datasets matching the given filters.
-func (c *Client) DatasetList(ctx context.Context, parentName string, limit int, offset int) ([]*Dataset, error) {
+func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error) {
 	filters := make([][]interface{}, 0)
 	if parentName != "" {
 		filters = append(filters, []interface{}{"id", "^", parentName + "/"})
@@ -197,7 +199,7 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit int, 
 }
 
 // DatasetSetUserProperty sets a user property on a dataset.
-func (c *Client) DatasetSetUserProperty(ctx context.Context, name string, key string, value string) error {
+func (c *Client) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	params := &DatasetUpdateParams{
 		UserPropertiesUpdate: []UserPropertyUpdate{
 			{Key: key, Value: value},
@@ -209,7 +211,7 @@ func (c *Client) DatasetSetUserProperty(ctx context.Context, name string, key st
 }
 
 // DatasetGetUserProperty gets a user property from a dataset.
-func (c *Client) DatasetGetUserProperty(ctx context.Context, name string, key string) (string, error) {
+func (c *Client) DatasetGetUserProperty(ctx context.Context, name, key string) (string, error) {
 	ds, err := c.DatasetGet(ctx, name)
 	if err != nil {
 		return "", err
@@ -386,7 +388,7 @@ func (c *Client) WaitForDatasetReady(ctx context.Context, name string, timeout t
 
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("context cancelled waiting for dataset: %w", ctx.Err())
+			return nil, fmt.Errorf("context canceled waiting for dataset: %w", ctx.Err())
 		case <-time.After(pollInterval):
 		}
 
@@ -437,7 +439,7 @@ func (c *Client) WaitForZvolReady(ctx context.Context, name string, timeout time
 
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("context cancelled waiting for zvol: %w", ctx.Err())
+			return nil, fmt.Errorf("context canceled waiting for zvol: %w", ctx.Err())
 		case <-time.After(pollInterval):
 		}
 

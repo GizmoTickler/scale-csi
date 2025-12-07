@@ -128,22 +128,23 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 		klog.V(4).Infof("Failed to get sessions: %v, will proceed with discovery", err)
 	} else {
 		for _, session := range sessions {
-			if session.IQN == iqn {
-				klog.Infof("Found existing session for %s, validating... (elapsed: %v)", iqn, time.Since(start))
-				// Try to get device with a short timeout to validate session is healthy
-				// If device appears quickly, session is valid and can be reused
-				validationTimeout := 5 * time.Second
-				devicePath, err := waitForISCSIDevice(portal, iqn, lun, validationTimeout)
-				if err == nil {
-					klog.Infof("ISCSIConnect completed (session reuse) in %v", time.Since(start))
-					return devicePath, nil
-				}
-				// Session exists but device didn't appear - session is likely stale
-				// Disconnect it and proceed with fresh discovery/login
-				klog.Warningf("Existing session for %s appears stale (device not found in %v), disconnecting", iqn, validationTimeout)
-				if disconnectErr := ISCSIDisconnect(portal, iqn); disconnectErr != nil {
-					klog.Warningf("Failed to disconnect stale session %s: %v (proceeding anyway)", iqn, disconnectErr)
-				}
+			if session.IQN != iqn {
+				continue
+			}
+			klog.Infof("Found existing session for %s, validating... (elapsed: %v)", iqn, time.Since(start))
+			// Try to get device with a short timeout to validate session is healthy
+			// If device appears quickly, session is valid and can be reused
+			validationTimeout := 5 * time.Second
+			devicePath, waitErr := waitForISCSIDevice(portal, iqn, lun, validationTimeout)
+			if waitErr == nil {
+				klog.Infof("ISCSIConnect completed (session reuse) in %v", time.Since(start))
+				return devicePath, nil
+			}
+			// Session exists but device didn't appear - session is likely stale
+			// Disconnect it and proceed with fresh discovery/login
+			klog.Warningf("Existing session for %s appears stale (device not found in %v), disconnecting", iqn, validationTimeout)
+			if disconnectErr := ISCSIDisconnect(portal, iqn); disconnectErr != nil {
+				klog.Warningf("Failed to disconnect stale session %s: %v (proceeding anyway)", iqn, disconnectErr)
 				// Brief pause to allow session cleanup to complete (configurable)
 				time.Sleep(sessionCleanupDelay)
 				break // Exit loop and proceed with fresh discovery
@@ -154,8 +155,8 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 	// Serialized discovery with caching to prevent TrueNAS overload
 	// when multiple volumes mount simultaneously
 	discoveryStart := time.Now()
-	if err := iscsiDiscoverySerialized(ctx, portal); err != nil {
-		return "", fmt.Errorf("discovery failed: %w", err)
+	if discoveryErr := iscsiDiscoverySerialized(ctx, portal); discoveryErr != nil {
+		return "", fmt.Errorf("discovery failed: %w", discoveryErr)
 	}
 	klog.Infof("iSCSI discovery completed in %v", time.Since(discoveryStart))
 
@@ -253,7 +254,7 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 				return nil
 			}
 			// Return error to potentially trigger retry
-			return fmt.Errorf("logout failed: %v, output: %s", err, string(output))
+			return fmt.Errorf("logout failed: %w, output: %s", err, string(output))
 		}
 		return nil
 	})
@@ -325,7 +326,7 @@ func iscsiDiscovery(ctx context.Context, portal string) error {
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", portal)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("discovery command failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("discovery command failed: %w, output: %s", err, string(output))
 	}
 	klog.V(4).Infof("Discovery output: %s", string(output))
 	return nil
@@ -384,7 +385,7 @@ func iscsiLogin(ctx context.Context, portal, iqn string) error {
 			klog.V(4).Infof("Target already logged in: %s", iqn)
 			return nil
 		}
-		return fmt.Errorf("login command failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("login command failed: %w, output: %s", err, string(output))
 	}
 	klog.V(4).Infof("Login output: %s", string(output))
 	return nil
@@ -410,7 +411,7 @@ func getISCSISessions() ([]ISCSISession, error) {
 	// Format: tcp: [session_id] portal:port,target_portal_group_tag iqn (mode)
 	// The mode suffix (e.g., "(non-flash)") is NOT part of the IQN
 	// IQN format: iqn.YYYY-MM.reversed.domain:target_name
-	re := regexp.MustCompile(`^tcp:\s+\[(\d+)\]\s+([^,]+),\d+\s+(iqn\.[^\s]+)`)
+	re := regexp.MustCompile(`^tcp:\s+\[(\d+)\]\s+([^,]+),\d+\s+(iqn\.\S+)`)
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -513,8 +514,8 @@ func findDeviceForSession(sessionName string, lun int) (string, error) {
 		hostDir := filepath.Dir(filepath.Dir(hostDirs[0]))
 		hostName := filepath.Base(hostDir)
 		var hostNum int
-		if _, err := fmt.Sscanf(hostName, "host%d", &hostNum); err != nil {
-			return "", fmt.Errorf("failed to parse host name: %w", err)
+		if _, scanErr := fmt.Sscanf(hostName, "host%d", &hostNum); scanErr != nil {
+			return "", fmt.Errorf("failed to parse host name: %w", scanErr)
 		}
 
 		// Look for device with this host
@@ -551,7 +552,7 @@ func ISCSIRescanSession(portal, iqn string) error {
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--rescan")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("rescan failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("rescan failed: %w, output: %s", err, string(output))
 	}
 	return nil
 }
@@ -564,7 +565,7 @@ func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session", "-s")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get session stats: %v", err)
+		return nil, fmt.Errorf("failed to get session stats: %w", err)
 	}
 
 	stats := make(map[string]string)
@@ -604,7 +605,7 @@ func SetISCSINodeParam(portal, iqn, name, value string) error {
 		"-o", "update", "-n", name, "-v", value)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to set node param: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to set node param: %w, output: %s", err, string(output))
 	}
 	return nil
 }
@@ -642,7 +643,7 @@ func GetDeviceWWN(devicePath string) (string, error) {
 		wwnPath = fmt.Sprintf("/sys/block/%s/device/vpd_pg83", deviceName)
 		wwn, err = os.ReadFile(wwnPath)
 		if err != nil {
-			return "", fmt.Errorf("failed to read WWN: %v", err)
+			return "", fmt.Errorf("failed to read WWN: %w", err)
 		}
 	}
 
@@ -656,13 +657,13 @@ func GetDeviceSize(devicePath string) (int64, error) {
 
 	sizeBytes, err := os.ReadFile(sizePath)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read device size: %v", err)
+		return 0, fmt.Errorf("failed to read device size: %w", err)
 	}
 
 	// Size is in 512-byte sectors
 	sectors, err := strconv.ParseInt(strings.TrimSpace(string(sizeBytes)), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse device size: %v", err)
+		return 0, fmt.Errorf("failed to parse device size: %w", err)
 	}
 
 	return sectors * 512, nil
@@ -676,7 +677,7 @@ func FlushDeviceBuffers(devicePath string) error {
 	cmd := exec.CommandContext(ctx, "blockdev", "--flushbufs", devicePath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to flush buffers: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to flush buffers: %w, output: %s", err, string(output))
 	}
 	return nil
 }
@@ -702,15 +703,15 @@ func IsLikelyISCSIDevice(devicePath string) bool {
 }
 
 // GetISCSIInfoFromDevice returns the portal and IQN for a given device path.
-func GetISCSIInfoFromDevice(devicePath string) (string, string, error) {
+func GetISCSIInfoFromDevice(devicePath string) (portal, iqn string, err error) {
 	deviceName := filepath.Base(devicePath)
 
 	// Find session directory in sysfs
 	// /sys/block/sdX/device points to the scsi device
-	sysPath := filepath.Join("/sys/block", deviceName, "device")
+	sysPath := filepath.Join("/sys/block", deviceName, "device") //nolint:gocritic // absolute sysfs path is intentional
 	targetPath, err := filepath.EvalSymlinks(sysPath)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to resolve sysfs path: %v", err)
+		return "", "", fmt.Errorf("failed to resolve sysfs path: %w", err)
 	}
 
 	// Walk up until we find "session*"
@@ -733,10 +734,10 @@ func GetISCSIInfoFromDevice(devicePath string) (string, string, error) {
 	}
 
 	// Get IQN
-	iqn := ""
+	iqn = ""
 	// Optimization (PERF-005): Construct path directly using session name instead of walking
 	sessionName := filepath.Base(sessionDir)
-	targetNamePath := filepath.Join("/sys/class/iscsi_session", sessionName, "targetname")
+	targetNamePath := filepath.Join("/sys/class/iscsi_session", sessionName, "targetname") //nolint:gocritic // absolute sysfs path is intentional
 	content, err := os.ReadFile(targetNamePath)
 	if err == nil {
 		iqn = strings.TrimSpace(string(content))
@@ -746,9 +747,9 @@ func GetISCSIInfoFromDevice(devicePath string) (string, string, error) {
 		globPattern := filepath.Join(sessionDir, "iscsi_session", "session*", "targetname")
 		matches, _ := filepath.Glob(globPattern)
 		if len(matches) > 0 {
-			content, err := os.ReadFile(matches[0])
-			if err == nil {
-				iqn = strings.TrimSpace(string(content))
+			fallbackContent, readErr := os.ReadFile(matches[0])
+			if readErr == nil {
+				iqn = strings.TrimSpace(string(fallbackContent))
 			}
 		}
 	}
@@ -760,7 +761,7 @@ func GetISCSIInfoFromDevice(devicePath string) (string, string, error) {
 	// Get Portal using iscsiadm
 	sessions, err := getISCSISessions()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get sessions: %v", err)
+		return "", "", fmt.Errorf("failed to get sessions: %w", err)
 	}
 
 	for _, s := range sessions {
@@ -795,6 +796,7 @@ func FindISCSISessionByTargetName(targetName string) (string, error) {
 }
 
 // FindISCSISessionByVolumeID is a convenience wrapper that searches by volumeID.
+//
 // Deprecated: Use FindISCSISessionByTargetName instead, which handles NameSuffix correctly.
 func FindISCSISessionByVolumeID(volumeID string) (string, error) {
 	return FindISCSISessionByTargetName(volumeID)

@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // MockClientWithPagination extends MockClient to support pagination testing
@@ -15,7 +16,7 @@ type MockClientWithPagination struct {
 	*truenas.MockClient
 }
 
-func (m *MockClientWithPagination) DatasetList(ctx context.Context, parentName string, limit int, offset int) ([]*truenas.Dataset, error) {
+func (m *MockClientWithPagination) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*truenas.Dataset, error) {
 	var allDatasets []*truenas.Dataset
 	for _, ds := range m.Datasets {
 		allDatasets = append(allDatasets, ds)
@@ -37,7 +38,7 @@ func (m *MockClientWithPagination) DatasetList(ctx context.Context, parentName s
 	return allDatasets[start:end], nil
 }
 
-func (m *MockClientWithPagination) SnapshotListAll(ctx context.Context, parentDataset string, limit int, offset int) ([]*truenas.Snapshot, error) {
+func (m *MockClientWithPagination) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*truenas.Snapshot, error) {
 	var allSnapshots []*truenas.Snapshot
 	for _, snap := range m.Snapshots {
 		allSnapshots = append(allSnapshots, snap)
@@ -200,7 +201,7 @@ type PaginatedMockClient struct {
 	*truenas.MockClient
 }
 
-func (m *PaginatedMockClient) DatasetList(ctx context.Context, parentName string, limit int, offset int) ([]*truenas.Dataset, error) {
+func (m *PaginatedMockClient) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*truenas.Dataset, error) {
 	// Access internal map via public field (it is exported)
 	var allDatasets []*truenas.Dataset
 	// Iteration order of map is random, so we must sort or just accept random subset for generic count test.
@@ -227,7 +228,7 @@ func (m *PaginatedMockClient) DatasetList(ctx context.Context, parentName string
 	return allDatasets[start:end], nil
 }
 
-func (m *PaginatedMockClient) SnapshotListAll(ctx context.Context, parentDataset string, limit int, offset int) ([]*truenas.Snapshot, error) {
+func (m *PaginatedMockClient) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*truenas.Snapshot, error) {
 	var allSnapshots []*truenas.Snapshot
 	for _, snap := range m.Snapshots {
 		allSnapshots = append(allSnapshots, snap)

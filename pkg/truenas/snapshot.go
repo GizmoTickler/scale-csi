@@ -2,6 +2,7 @@ package truenas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -80,7 +81,7 @@ type SnapshotCreateParams struct {
 }
 
 // SnapshotCreate creates a new ZFS snapshot.
-func (c *Client) SnapshotCreate(ctx context.Context, dataset string, name string) (*Snapshot, error) {
+func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string) (*Snapshot, error) {
 	params := &SnapshotCreateParams{
 		Dataset: dataset,
 		Name:    name,
@@ -102,7 +103,7 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset string, name string
 // If the snapshot has clones, it returns ErrSnapshotHasClones with the list of clones.
 // The caller is responsible for deciding how to handle clones (e.g., verifying they are
 // orphaned before deletion).
-func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_ bool, recursive bool) error {
+func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
 	options := map[string]interface{}{
 		"defer":     defer_,
 		"recursive": recursive,
@@ -157,7 +158,8 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 		LogAPIError(err, "SnapshotGet error")
 
 		// Check for "Invalid params" which indicates not found for get_instance
-		if apiErr, ok := err.(*APIError); ok && apiErr.Code == -32602 {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == -32602 {
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
 		}
 		// Also check standard IsNotFoundError
@@ -197,7 +199,7 @@ func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot,
 }
 
 // SnapshotListAll lists all snapshots under a parent dataset (recursive).
-func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limit int, offset int) ([]*Snapshot, error) {
+func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error) {
 	filters := [][]interface{}{{"dataset", "^", parentDataset}}
 
 	options := map[string]interface{}{}
@@ -233,7 +235,7 @@ func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limi
 // SnapshotFindByName finds a snapshot by its short name under a parent dataset.
 // This is more efficient than SnapshotListAll + iteration (PERF-001 fix).
 // The name parameter is the snapshot name without the dataset prefix (e.g., "my-snapshot" not "pool/dataset@my-snapshot").
-func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset string, name string) (*Snapshot, error) {
+func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error) {
 	// Build the full snapshot ID pattern to match: any dataset under parentDataset + @ + name
 	// We use "id" filter with regex match to find the snapshot regardless of its parent dataset
 	// The pattern matches any string ending with "@" + name
@@ -260,7 +262,7 @@ func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset string, n
 }
 
 // SnapshotSetUserProperty sets a user property on a snapshot.
-func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID string, key string, value string) error {
+func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error {
 	params := map[string]interface{}{
 		"user_properties_update": []map[string]interface{}{
 			{"key": key, "value": value},
@@ -272,7 +274,7 @@ func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID string,
 }
 
 // SnapshotClone clones a snapshot to create a new dataset.
-func (c *Client) SnapshotClone(ctx context.Context, snapshotID string, newDatasetName string) error {
+func (c *Client) SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error {
 	params := map[string]interface{}{
 		"snapshot":    snapshotID,
 		"dataset_dst": newDatasetName,
@@ -291,7 +293,7 @@ func (c *Client) SnapshotClone(ctx context.Context, snapshotID string, newDatase
 }
 
 // SnapshotRollback rolls back a dataset to a snapshot.
-func (c *Client) SnapshotRollback(ctx context.Context, snapshotID string, force bool, recursive bool, recursiveClones bool) error {
+func (c *Client) SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error {
 	options := map[string]interface{}{
 		"force":            force,
 		"recursive":        recursive,

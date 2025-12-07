@@ -81,7 +81,7 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	return ds, nil
 }
 
-func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive bool, force bool) error {
+func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -124,7 +124,7 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 	return ds, nil
 }
 
-func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit int, offset int) ([]*Dataset, error) {
+func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -135,7 +135,7 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit i
 	return list, nil
 }
 
-func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name string, key string, value string) error {
+func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -150,7 +150,7 @@ func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name string, ke
 	return nil
 }
 
-func (m *MockClient) DatasetGetUserProperty(ctx context.Context, name string, key string) (string, error) {
+func (m *MockClient) DatasetGetUserProperty(ctx context.Context, name, key string) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -202,7 +202,7 @@ func (m *MockClient) WaitForZvolReady(ctx context.Context, name string, timeout 
 }
 
 // Snapshot methods
-func (m *MockClient) SnapshotCreate(ctx context.Context, dataset string, name string) (*Snapshot, error) {
+func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string) (*Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -237,7 +237,7 @@ func (m *MockClient) SetSnapshotUsedBytes(snapshotID string, usedBytes int64) {
 	}
 }
 
-func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defer_ bool, recursive bool) error {
+func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -274,7 +274,7 @@ func (m *MockClient) SnapshotList(ctx context.Context, dataset string) ([]*Snaps
 	return list, nil
 }
 
-func (m *MockClient) SnapshotListAll(ctx context.Context, parentDataset string, limit int, offset int) ([]*Snapshot, error) {
+func (m *MockClient) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -285,7 +285,7 @@ func (m *MockClient) SnapshotListAll(ctx context.Context, parentDataset string, 
 	return list, nil
 }
 
-func (m *MockClient) SnapshotFindByName(ctx context.Context, parentDataset string, name string) (*Snapshot, error) {
+func (m *MockClient) SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -300,7 +300,7 @@ func (m *MockClient) SnapshotFindByName(ctx context.Context, parentDataset strin
 	return nil, nil // Not found, not an error
 }
 
-func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID string, key string, value string) error {
+func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -315,7 +315,7 @@ func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID str
 	return nil
 }
 
-func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID string, newDatasetName string) error {
+func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -331,7 +331,7 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID string, newDa
 	return nil
 }
 
-func (m *MockClient) SnapshotRollback(ctx context.Context, snapshotID string, force bool, recursive bool, recursiveClones bool) error {
+func (m *MockClient) SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error {
 	return nil
 }
 
@@ -423,7 +423,7 @@ func (m *MockClient) CheckNVMeoFSupport(ctx context.Context) error {
 }
 
 // iSCSI methods
-func (m *MockClient) ISCSITargetCreate(ctx context.Context, name string, alias string, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
+func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -459,7 +459,7 @@ func (m *MockClient) ISCSITargetFindByName(ctx context.Context, name string) (*I
 	}
 	return nil, nil
 }
-func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name string, diskPath string, comment string, blocksize int, rpm string) (*ISCSIExtent, error) {
+func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, rpm string) (*ISCSIExtent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -468,7 +468,7 @@ func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name string, diskPat
 	m.ISCSIExtents[id] = ext
 	return ext, nil
 }
-func (m *MockClient) ISCSIExtentDelete(ctx context.Context, id int, remove bool, force bool) error {
+func (m *MockClient) ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -506,7 +506,7 @@ func (m *MockClient) ISCSIExtentFindByDisk(ctx context.Context, diskPath string)
 	}
 	return nil, nil
 }
-func (m *MockClient) ISCSITargetExtentCreate(ctx context.Context, targetID int, extentID int, lunID int) (*ISCSITargetExtent, error) {
+func (m *MockClient) ISCSITargetExtentCreate(ctx context.Context, targetID, extentID, lunID int) (*ISCSITargetExtent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -533,7 +533,7 @@ func (m *MockClient) ISCSITargetExtentGet(ctx context.Context, id int) (*ISCSITa
 	return nil, nil
 }
 
-func (m *MockClient) ISCSITargetExtentFind(ctx context.Context, targetID int, extentID int) (*ISCSITargetExtent, error) {
+func (m *MockClient) ISCSITargetExtentFind(ctx context.Context, targetID, extentID int) (*ISCSITargetExtent, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -626,7 +626,7 @@ func (m *MockClient) NVMeoFSubsystemFindByName(ctx context.Context, name string)
 	}
 	return nil, nil
 }
-func (m *MockClient) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath string, deviceType string) (*NVMeoFNamespace, error) {
+func (m *MockClient) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath, deviceType string) (*NVMeoFNamespace, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -682,13 +682,13 @@ func (m *MockClient) NVMeoFNamespaceFindByDevicePath(ctx context.Context, device
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	return []*NVMeoFPort{{ID: 1, Transport: "TCP", Address: "0.0.0.0", Port: 4420}}, nil
 }
-func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
-func (m *MockClient) NVMeoFPortFindByAddress(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+func (m *MockClient) NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
-func (m *MockClient) NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) (*NVMeoFPortSubsys, error) {
+func (m *MockClient) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID int) (*NVMeoFPortSubsys, error) {
 	return &NVMeoFPortSubsys{ID: 1, PortID: portID, SubsysID: subsysID}, nil
 }
 func (m *MockClient) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
@@ -711,7 +711,7 @@ func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsyste
 	}
 	return list, nil
 }
-func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error) {
+func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
 func (m *MockClient) NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error) {

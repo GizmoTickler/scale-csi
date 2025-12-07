@@ -20,12 +20,12 @@ type ClientInterface interface {
 
 	// Dataset methods
 	DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error)
-	DatasetDelete(ctx context.Context, name string, recursive bool, force bool) error
+	DatasetDelete(ctx context.Context, name string, recursive, force bool) error
 	DatasetGet(ctx context.Context, name string) (*Dataset, error)
 	DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error)
-	DatasetList(ctx context.Context, parentName string, limit int, offset int) ([]*Dataset, error)
-	DatasetSetUserProperty(ctx context.Context, name string, key string, value string) error
-	DatasetGetUserProperty(ctx context.Context, name string, key string) (string, error)
+	DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error)
+	DatasetSetUserProperty(ctx context.Context, name, key, value string) error
+	DatasetGetUserProperty(ctx context.Context, name, key string) (string, error)
 	DatasetExpand(ctx context.Context, name string, newSize int64) error
 	DatasetExists(ctx context.Context, name string) (bool, error)
 	GetPoolAvailable(ctx context.Context, poolName string) (int64, error)
@@ -33,15 +33,15 @@ type ClientInterface interface {
 	WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)
 
 	// Snapshot methods
-	SnapshotCreate(ctx context.Context, dataset string, name string) (*Snapshot, error)
-	SnapshotDelete(ctx context.Context, snapshotID string, defer_ bool, recursive bool) error
+	SnapshotCreate(ctx context.Context, dataset, name string) (*Snapshot, error)
+	SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error
 	SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error)
 	SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error)
-	SnapshotListAll(ctx context.Context, parentDataset string, limit int, offset int) ([]*Snapshot, error)
-	SnapshotFindByName(ctx context.Context, parentDataset string, name string) (*Snapshot, error)
-	SnapshotSetUserProperty(ctx context.Context, snapshotID string, key string, value string) error
-	SnapshotClone(ctx context.Context, snapshotID string, newDatasetName string) error
-	SnapshotRollback(ctx context.Context, snapshotID string, force bool, recursive bool, recursiveClones bool) error
+	SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error)
+	SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error)
+	SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error
+	SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error
+	SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error
 
 	// NFS methods
 	NFSShareCreate(ctx context.Context, params *NFSShareCreateParams) (*NFSShare, error)
@@ -59,19 +59,19 @@ type ClientInterface interface {
 	CheckNVMeoFSupport(ctx context.Context) error
 
 	// iSCSI methods
-	ISCSITargetCreate(ctx context.Context, name string, alias string, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error)
+	ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error)
 	ISCSITargetDelete(ctx context.Context, id int, force bool) error
 	ISCSITargetGet(ctx context.Context, id int) (*ISCSITarget, error)
 	ISCSITargetFindByName(ctx context.Context, name string) (*ISCSITarget, error)
-	ISCSIExtentCreate(ctx context.Context, name string, diskPath string, comment string, blocksize int, rpm string) (*ISCSIExtent, error)
-	ISCSIExtentDelete(ctx context.Context, id int, remove bool, force bool) error
+	ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, rpm string) (*ISCSIExtent, error)
+	ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error
 	ISCSIExtentGet(ctx context.Context, id int) (*ISCSIExtent, error)
 	ISCSIExtentFindByName(ctx context.Context, name string) (*ISCSIExtent, error)
 	ISCSIExtentFindByDisk(ctx context.Context, diskPath string) (*ISCSIExtent, error)
-	ISCSITargetExtentCreate(ctx context.Context, targetID int, extentID int, lunID int) (*ISCSITargetExtent, error)
+	ISCSITargetExtentCreate(ctx context.Context, targetID, extentID, lunID int) (*ISCSITargetExtent, error)
 	ISCSITargetExtentDelete(ctx context.Context, id int, force bool) error
 	ISCSITargetExtentGet(ctx context.Context, id int) (*ISCSITargetExtent, error)
-	ISCSITargetExtentFind(ctx context.Context, targetID int, extentID int) (*ISCSITargetExtent, error)
+	ISCSITargetExtentFind(ctx context.Context, targetID, extentID int) (*ISCSITargetExtent, error)
 	ISCSITargetExtentFindByTarget(ctx context.Context, targetID int) ([]*ISCSITargetExtent, error)
 	ISCSITargetExtentFindByExtent(ctx context.Context, extentID int) ([]*ISCSITargetExtent, error)
 	ISCSIGlobalConfigGet(ctx context.Context) (*ISCSIGlobalConfig, error)
@@ -82,15 +82,15 @@ type ClientInterface interface {
 	NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemFindByNQN(ctx context.Context, nqn string) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemFindByName(ctx context.Context, name string) (*NVMeoFSubsystem, error)
-	NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath string, deviceType string) (*NVMeoFNamespace, error)
+	NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, devicePath, deviceType string) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceDelete(ctx context.Context, id int) error
 	NVMeoFNamespaceGet(ctx context.Context, id int) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*NVMeoFNamespace, error)
 	NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error)
-	NVMeoFPortCreate(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error)
-	NVMeoFPortFindByAddress(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error)
-	NVMeoFPortSubsysCreate(ctx context.Context, portID int, subsysID int) (*NVMeoFPortSubsys, error)
+	NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error)
+	NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error)
+	NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID int) (*NVMeoFPortSubsys, error)
 	NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error)
 	NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error)
 	NVMeoFPortSubsysDelete(ctx context.Context, id int) error

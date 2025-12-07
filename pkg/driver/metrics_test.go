@@ -4,8 +4,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // resetCBMetricsState resets the circuit breaker metrics tracking state

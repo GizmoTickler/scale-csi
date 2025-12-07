@@ -174,9 +174,9 @@ func TestGetAccessibleTopology_AllCombined(t *testing.T) {
 					Zone:    "zone-b",
 					Region:  "eu-central-1",
 					CustomLabels: map[string]string{
-						"topology.kubernetes.io/rack":        "rack-5",
-						"topology.kubernetes.io/datacenter":  "dc-1",
-						"custom.mycompany.io/storage-tier":   "premium",
+						"topology.kubernetes.io/rack":       "rack-5",
+						"topology.kubernetes.io/datacenter": "dc-1",
+						"custom.mycompany.io/storage-tier":  "premium",
 					},
 				},
 			},
