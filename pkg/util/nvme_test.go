@@ -271,104 +271,104 @@ func TestNVMeoFConnectWithOptions(t *testing.T) {
 func TestIsLikelyNVMeDevice(t *testing.T) {
 	testCases := []struct {
 		name       string
-		devicePath string
+		deviceName string
 		expected   bool
 	}{
 		// NVMe devices - should return true
 		{
 			name:       "NVMe namespace device",
-			devicePath: "/dev/nvme0n1",
+			deviceName: "/dev/nvme0n1",
 			expected:   true,
 		},
 		{
 			name:       "NVMe namespace device multi-digit controller",
-			devicePath: "/dev/nvme10n1",
+			deviceName: "/dev/nvme10n1",
 			expected:   true,
 		},
 		{
 			name:       "NVMe namespace device multi-digit namespace",
-			devicePath: "/dev/nvme0n10",
+			deviceName: "/dev/nvme0n10",
 			expected:   true,
 		},
 		{
 			name:       "NVMe controller device only",
-			devicePath: "/dev/nvme0",
+			deviceName: "/dev/nvme0",
 			expected:   true,
 		},
 		{
 			name:       "NVMe device with partition",
-			devicePath: "/dev/nvme0n1p1",
+			deviceName: "/dev/nvme0n1p1",
 			expected:   true,
 		},
 		// Non-NVMe devices - should return false
 		{
 			name:       "SCSI disk device",
-			devicePath: "/dev/sda",
+			deviceName: "/dev/sda",
 			expected:   false,
 		},
 		{
 			name:       "SCSI disk partition",
-			devicePath: "/dev/sda1",
+			deviceName: "/dev/sda1",
 			expected:   false,
 		},
 		{
 			name:       "Loop device",
-			devicePath: "/dev/loop0",
+			deviceName: "/dev/loop0",
 			expected:   false,
 		},
 		{
 			name:       "Device mapper device",
-			devicePath: "/dev/dm-0",
+			deviceName: "/dev/dm-0",
 			expected:   false,
 		},
 		{
 			name:       "LVM device",
-			devicePath: "/dev/mapper/vg0-lv0",
+			deviceName: "/dev/mapper/vg0-lv0",
 			expected:   false,
 		},
 		{
 			name:       "MD RAID device",
-			devicePath: "/dev/md0",
+			deviceName: "/dev/md0",
 			expected:   false,
 		},
 		{
 			name:       "XVD device (Xen)",
-			devicePath: "/dev/xvda",
+			deviceName: "/dev/xvda",
 			expected:   false,
 		},
 		{
 			name:       "VDA device (virtio)",
-			devicePath: "/dev/vda",
+			deviceName: "/dev/vda",
 			expected:   false,
 		},
 		// Edge cases
 		{
 			name:       "Empty path",
-			devicePath: "",
+			deviceName: "",
 			expected:   false,
 		},
 		{
 			name:       "Just /dev",
-			devicePath: "/dev/",
+			deviceName: "/dev/",
 			expected:   false,
 		},
 		{
 			name:       "Device name containing nvme but not starting with it",
-			devicePath: "/dev/sdnvme0",
+			deviceName: "/dev/sdnvme0",
 			expected:   false,
 		},
 		{
 			name:       "Uppercase NVME",
-			devicePath: "/dev/NVME0n1",
+			deviceName: "/dev/NVME0n1",
 			expected:   false, // Case-sensitive - uppercase should not match
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := IsLikelyNVMeDevice(tc.devicePath)
+			result := IsLikelyNVMeDevice(tc.deviceName)
 			assert.Equal(t, tc.expected, result, "IsLikelyNVMeDevice(%q) = %v, want %v",
-				tc.devicePath, result, tc.expected)
+				tc.deviceName, result, tc.expected)
 		})
 	}
 }
@@ -402,6 +402,67 @@ func TestIsLikelyNVMeDevice_ConsistentWithGetNVMeInfoFromDevice(t *testing.T) {
 		t.Run(device, func(t *testing.T) {
 			assert.False(t, IsLikelyNVMeDevice(device),
 				"IsLikelyNVMeDevice should return false for %s", device)
+		})
+	}
+}
+
+// TestFindNVMeoFSessionBySubsysName_StrictMatch tests that
+// FindNVMeoFSessionBySubsysName correctly uses strict suffix matching.
+func TestFindNVMeoFSessionBySubsysName_StrictMatch(t *testing.T) {
+	// Save original function and restore after test
+	originalList := listNVMeSubsystemsFunc
+	defer func() { listNVMeSubsystemsFunc = originalList }()
+
+	// Mock listNVMeSubsystems to return specific mock data
+	listNVMeSubsystemsFunc = func(ctx context.Context) ([]NVMeSubsystem, error) {
+		return []NVMeSubsystem{
+			{NQN: "nqn.2016-06.io.spdk:cnode1:vol-10", Name: "nvme1"},
+			{NQN: "nqn.2016-06.io.spdk:cnode1:vol-1", Name: "nvme2"},
+			{NQN: "nqn.2016-06.io.spdk:cnode1:my-vol-1", Name: "nvme3"},
+		}, nil
+	}
+
+	testCases := []struct {
+		name       string
+		searchName string
+		wantNQN    string
+		wantError  bool
+	}{
+		{
+			name:       "Exact match vol-1 should match vol-1",
+			searchName: "vol-1",
+			wantNQN:    "nqn.2016-06.io.spdk:cnode1:vol-1",
+			wantError:  false,
+		},
+		{
+			name:       "Exact match vol-10 should match vol-10",
+			searchName: "vol-10",
+			wantNQN:    "nqn.2016-06.io.spdk:cnode1:vol-10",
+			wantError:  false,
+		},
+		{
+			name:       "Partial match my-vol-1 should NOT match vol-1",
+			searchName: "my-vol-1",
+			wantNQN:    "nqn.2016-06.io.spdk:cnode1:my-vol-1",
+			wantError:  false,
+		},
+		{
+			name:       "Ghost volume should not be found",
+			searchName: "ghost-vol",
+			wantNQN:    "",
+			wantError:  true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := FindNVMeoFSessionBySubsysName(tc.searchName)
+			if tc.wantError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tc.wantNQN, result)
+			}
 		})
 	}
 }

@@ -205,6 +205,10 @@ func nvmeConnect(ctx context.Context, transport, host, port, nqn string) error {
 	return nil
 }
 
+// listNVMeSubsystemsFunc is the function used to list NVMe subsystems.
+// Variable for testability.
+var listNVMeSubsystemsFunc = listNVMeSubsystems
+
 // listNVMeSubsystems returns the list of connected NVMe subsystems.
 func listNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
 	cmd := exec.CommandContext(ctx, "nvme", "list-subsys", "-o", "json")
@@ -582,15 +586,21 @@ func FindNVMeoFSessionBySubsysName(subsysName string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
 	defer cancel()
 
-	subsystems, err := listNVMeSubsystems(ctx)
+	subsystems, err := listNVMeSubsystemsFunc(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to list NVMe subsystems: %w", err)
 	}
 
-	// Search for a subsystem whose NQN contains the subsystem name
-	// NQN format can vary: nqn.2014-08.org.nvmexpress:uuid:xxx or containing the volume name
+	// Search for a subsystem whose NQN ends with the subsystem name after a colon.
+	// NQN format: nqn.YYYY-MM.reverse.domain:subsystem_name
+	// Example: nqn.2024-01.io.truenas:vol-1
+	//
+	// We use strict suffix matching (":subsysName") to prevent partial matches.
+	// For example, searching for "vol-1" should NOT match "nqn.2024-01.io.truenas:vol-10"
+	// but SHOULD match "nqn.2024-01.io.truenas:vol-1".
+	searchSuffix := ":" + subsysName
 	for _, subsystem := range subsystems {
-		if strings.Contains(subsystem.NQN, subsysName) {
+		if strings.HasSuffix(subsystem.NQN, searchSuffix) {
 			klog.V(4).Infof("Found NVMe-oF subsystem for name %s: NQN=%s", subsysName, subsystem.NQN)
 			return subsystem.NQN, nil
 		}
