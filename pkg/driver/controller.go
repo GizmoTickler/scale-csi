@@ -56,6 +56,13 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+				},
+			},
+		},
+		{
+			Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 				},
 			},
@@ -565,9 +572,56 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
-// ControllerPublishVolume attaches a volume to a node (not used for NFS).
+// ControllerPublishVolume attaches a volume to a node.
+// For iSCSI/NVMe-oF volumes, this ensures the target/subsystem exists on TrueNAS.
+// This is critical for volumes restored from backups (e.g., VolSync) where the
+// underlying zvol exists but the export configuration was not restored.
 func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	// Not implemented - NFS doesn't require controller publish
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+
+	nodeID := req.GetNodeId()
+	if nodeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "node ID is required")
+	}
+
+	// Determine share type from volume context
+	volumeContext := req.GetVolumeContext()
+	shareTypeStr := volumeContext["node_attach_driver"]
+	if shareTypeStr == "" {
+		// NFS volumes don't require controller publish
+		klog.V(4).Infof("ControllerPublishVolume: volume %s has no node_attach_driver, assuming NFS (no-op)", volumeID)
+		return &csi.ControllerPublishVolumeResponse{}, nil
+	}
+
+	shareType := ParseShareType(shareTypeStr)
+	if shareType == ShareTypeNFS {
+		// NFS doesn't require controller publish - shares are always accessible
+		return &csi.ControllerPublishVolumeResponse{}, nil
+	}
+
+	klog.Infof("ControllerPublishVolume: volumeID=%s, nodeID=%s, shareType=%s", volumeID, nodeID, shareType)
+
+	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
+
+	// Get the dataset to verify it exists and check share configuration
+	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		if truenas.IsNotFoundError(err) {
+			return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
+	}
+
+	// Ensure the share exists (critical for restored volumes)
+	// This recreates missing iSCSI targets or NVMe-oF subsystems
+	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType); err != nil {
+		return nil, err
+	}
+
+	klog.Infof("ControllerPublishVolume: volume %s published successfully to node %s", volumeID, nodeID)
 	return &csi.ControllerPublishVolumeResponse{}, nil
 }
 
