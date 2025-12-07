@@ -304,11 +304,18 @@ func GetMountedBlockDevices() (map[string]string, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 with empty output means no mounts found (not an error)
+		// Exit code 1 with non-empty stderr indicates an actual error
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return make(map[string]string), nil
+			// Only treat as "no mounts" if there's no output
+			if len(output) == 0 || strings.TrimSpace(string(output)) == "" {
+				return make(map[string]string), nil
+			}
+			// Non-empty output with exit code 1 is unexpected, log and continue parsing
+			klog.V(4).Infof("findmnt returned exit code 1 with output, continuing: %s", string(output))
+		} else {
+			return nil, fmt.Errorf("findmnt failed: %w", err)
 		}
-		return nil, fmt.Errorf("findmnt failed: %w", err)
 	}
 
 	devices := make(map[string]string)

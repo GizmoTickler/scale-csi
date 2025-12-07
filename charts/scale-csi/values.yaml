@@ -224,6 +224,21 @@ storageClass:
 
 # Sidecar containers versions
 sidecars:
+  # Leader election configuration for sidecar containers
+  # Increase these values if sidecars restart during API server instability
+  # IMPORTANT: These values must satisfy: retryPeriod < renewDeadline < leaseDuration
+  # The difference (leaseDuration - renewDeadline) determines how long after a failed
+  # renewal the leader still holds the lease, giving time for recovery.
+  leaderElection:
+    # How long a leader lease is valid (default: 60s, upstream default: 15s)
+    leaseDuration: 60s
+    # How long a leader waits before renewing (default: 40s, upstream default: 10s)
+    # Must be less than leaseDuration
+    renewDeadline: 40s
+    # How often to retry acquiring the lock (default: 10s, upstream default: 2s)
+    # Must be less than renewDeadline
+    retryPeriod: 10s
+
   provisioner:
     image: registry.k8s.io/sig-storage/csi-provisioner:v6.1.0
     resources:

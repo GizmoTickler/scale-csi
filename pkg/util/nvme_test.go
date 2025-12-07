@@ -293,12 +293,17 @@ func TestIsLikelyNVMeDevice(t *testing.T) {
 		{
 			name:       "NVMe controller device only",
 			deviceName: "/dev/nvme0",
-			expected:   true,
+			expected:   false, // Controller devices don't have NQN info
 		},
 		{
 			name:       "NVMe device with partition",
 			deviceName: "/dev/nvme0n1p1",
-			expected:   true,
+			expected:   false, // Partitions don't have NQN info
+		},
+		{
+			name:       "NVMe device with multi-digit partition",
+			deviceName: "/dev/nvme0n1p10",
+			expected:   false, // Partitions don't have NQN info
 		},
 		// Non-NVMe devices - should return false
 		{

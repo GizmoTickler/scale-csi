@@ -506,7 +506,12 @@ func (d *Driver) gcISCSISessions(gracePeriod time.Duration, dryRun bool) {
 
 		// Check when we first saw this orphaned session
 		firstSeenVal, loaded := d.orphanedSessionsSeen.LoadOrStore(session.IQN, now)
-		firstSeen := firstSeenVal.(time.Time)
+		firstSeen, ok := firstSeenVal.(time.Time)
+		if !ok {
+			klog.Warningf("Session GC: unexpected type in orphanedSessionsSeen for %s, resetting", session.IQN)
+			d.orphanedSessionsSeen.Store(session.IQN, now)
+			continue
+		}
 
 		orphanedDuration := now.Sub(firstSeen)
 		if !loaded {
@@ -589,8 +594,11 @@ func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 
 	for _, session := range sessions {
 		// Only consider sessions for our target address
-		if session.Address != targetAddr {
-			klog.V(5).Infof("Session GC: skipping session %s (different address: %s)", session.NQN, session.Address)
+		// Session address format from nvme list-subsys: "traddr=192.168.120.10,trsvcid=4420,src_addr=192.168.122.10"
+		// Config address format: "192.168.120.10"
+		// Use strings.Contains to match the IP within the traddr= field
+		if !strings.Contains(session.Address, targetAddr) {
+			klog.V(5).Infof("Session GC: skipping session %s (different address: %s, target: %s)", session.NQN, session.Address, targetAddr)
 			continue
 		}
 
@@ -607,7 +615,12 @@ func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 
 		// Check when we first saw this orphaned session
 		firstSeenVal, loaded := d.orphanedSessionsSeen.LoadOrStore(session.NQN, now)
-		firstSeen := firstSeenVal.(time.Time)
+		firstSeen, ok := firstSeenVal.(time.Time)
+		if !ok {
+			klog.Warningf("Session GC: unexpected type in orphanedSessionsSeen for %s, resetting", session.NQN)
+			d.orphanedSessionsSeen.Store(session.NQN, now)
+			continue
+		}
 
 		orphanedDuration := now.Sub(firstSeen)
 		if !loaded {

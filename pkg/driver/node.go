@@ -727,10 +727,8 @@ func createSymlinkAtomic(target, linkPath string) error {
 	// Need to replace the symlink - use atomic rename to avoid race conditions
 	klog.Warningf("Existing symlink %s points to %s, expected %s - recreating atomically", linkPath, existingTarget, target)
 
-	// Create a temporary symlink next to the target
-	tempLink := linkPath + ".tmp"
-	// Remove any stale temp link first
-	_ = os.Remove(tempLink)
+	// Create a temporary symlink with unique name to avoid races from concurrent calls
+	tempLink := fmt.Sprintf("%s.tmp.%d", linkPath, time.Now().UnixNano())
 
 	if err := os.Symlink(target, tempLink); err != nil {
 		return fmt.Errorf("failed to create temporary symlink: %w", err)

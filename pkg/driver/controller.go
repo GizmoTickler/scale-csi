@@ -1070,6 +1070,9 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
 
+	if req.GetCapacityRange() == nil {
+		return nil, status.Error(codes.InvalidArgument, "capacity range is required")
+	}
 	capacityBytes := req.GetCapacityRange().GetRequiredBytes()
 	if capacityBytes == 0 {
 		return nil, status.Error(codes.InvalidArgument, "capacity is required")

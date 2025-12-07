@@ -173,7 +173,13 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 			// Wait before retry to give TrueNAS time to propagate the target
 			klog.Infof("iSCSI retry %d/%d: waiting %v before fresh discovery for %s (elapsed: %v)",
 				attempt, maxDiscoveryRetries, retryDelay, iqn, time.Since(start))
-			time.Sleep(retryDelay)
+			// Use context-aware sleep to allow cancellation during backoff
+			select {
+			case <-time.After(retryDelay):
+				// Continue with retry
+			case <-ctx.Done():
+				return "", fmt.Errorf("context canceled during retry backoff: %w", ctx.Err())
+			}
 
 			// Invalidate cache and perform fresh discovery
 			invalidateDiscoveryCache(portal)
@@ -349,10 +355,15 @@ func getLoginSemaphore(portal string) chan struct{} {
 // Allows up to getMaxConcurrentLogins() (2) concurrent logins per portal to prevent
 // overwhelming TrueNAS while still allowing some parallelism.
 func iscsiLoginSerialized(ctx context.Context, portal, iqn string) error {
-	// Acquire semaphore slot (blocks if getMaxConcurrentLogins() already in progress)
+	// Acquire semaphore slot with context awareness
 	sem := getLoginSemaphore(portal)
-	sem <- struct{}{}
-	defer func() { <-sem }()
+	select {
+	case sem <- struct{}{}:
+		// Got a slot, proceed with login
+		defer func() { <-sem }()
+	case <-ctx.Done():
+		return fmt.Errorf("context canceled waiting for login slot: %w", ctx.Err())
+	}
 
 	return iscsiLogin(ctx, portal, iqn)
 }

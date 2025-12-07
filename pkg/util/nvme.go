@@ -181,13 +181,19 @@ func nvmeConnect(ctx context.Context, transport, host, port, nqn string) error {
 		}
 	}
 
-	// Build connect command
+	// Build connect command with reconnect options for resilience.
+	// --reconnect-delay=10: retry connection every 10 seconds on failure
+	// --ctrl-loss-tmo=-1: never give up on reconnecting (-1 means infinite)
+	// These options ensure NVMe-oF sessions automatically recover from
+	// transient network issues or TrueNAS service restarts.
 	args := []string{
 		"connect",
 		"-t", transport,
 		"-n", nqn,
 		"-a", host,
 		"-s", port,
+		"--reconnect-delay=10",
+		"--ctrl-loss-tmo=-1",
 	}
 
 	cmd := exec.CommandContext(ctx, "nvme", args...)
@@ -571,12 +577,16 @@ func GetNVMeInfoFromDevice(devicePath string) (string, error) {
 	return "", fmt.Errorf("could not find NQN for device %s", devicePath)
 }
 
-// IsLikelyNVMeDevice checks if a device path looks like an NVMe device based on naming.
+// IsLikelyNVMeDevice checks if a device path looks like an NVMe namespace device.
+// Returns true for namespace devices (nvme0n1, nvme10n2) that could have NQN info.
+// Returns false for partitions (nvme0n1p1) and controller devices (nvme0).
 // Used for race condition detection in session GC - if GetNVMeInfoFromDevice fails
-// for a device that looks like NVMe, it might indicate a transient state.
+// for a device that looks like an NVMe namespace, it might indicate a transient state.
 func IsLikelyNVMeDevice(devicePath string) bool {
 	deviceName := filepath.Base(devicePath)
-	return strings.HasPrefix(deviceName, "nvme")
+	// Use the same regex as GetNVMeInfoFromDevice to ensure consistency.
+	// This matches namespace devices (nvme0n1) but NOT partitions (nvme0n1p4).
+	return nvmeDeviceRegex.MatchString(deviceName)
 }
 
 // FindNVMeoFSessionBySubsysName searches connected NVMe subsystems for one matching the subsystem name.

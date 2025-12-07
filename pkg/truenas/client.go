@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"strconv"
@@ -307,21 +308,27 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 
 	// Connect initially (at least one connection)
 	// We'll try to connect all, but only fail if ALL fail
+	// Stagger connection attempts to avoid thundering herd on TrueNAS
 	connected := 0
 	var lastErr error
 	var wg sync.WaitGroup
 
 	var errMu sync.Mutex
-	for _, conn := range client.pool {
+	for i, conn := range client.pool {
 		wg.Add(1)
-		go func(c *Connection) {
+		go func(c *Connection, idx int) {
 			defer wg.Done()
+			// Stagger connections: add 50-150ms jitter per connection to avoid thundering herd
+			if idx > 0 {
+				jitter := time.Duration(50+rand.Intn(100)) * time.Millisecond
+				time.Sleep(time.Duration(idx) * jitter)
+			}
 			if err := c.connect(); err != nil {
 				errMu.Lock()
 				lastErr = err
 				errMu.Unlock()
 			}
-		}(conn)
+		}(conn, i)
 	}
 	wg.Wait()
 

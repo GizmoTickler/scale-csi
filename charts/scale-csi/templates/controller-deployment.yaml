@@ -105,6 +105,9 @@ spec:
             - "--timeout=300s"
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
+            - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
+            - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
+            - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
             - "--extra-create-metadata"
           volumeMounts:
             - name: socket-dir
@@ -121,6 +124,9 @@ spec:
             - "--timeout=300s"
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
+            - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
+            - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
+            - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}
@@ -136,6 +142,9 @@ spec:
             - "--timeout=300s"
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
+            - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
+            - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
+            - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
             - "--handle-volume-inuse-error=false"
           volumeMounts:
             - name: socket-dir
@@ -152,6 +161,9 @@ spec:
             - "--timeout=300s"
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
+            - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
+            - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
+            - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}
