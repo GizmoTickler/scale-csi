@@ -48,6 +48,10 @@ checks:
     # Deployments/DaemonSets default to restartPolicy: Always (not explicitly set)
     - "restart-policy"
 
+    # === Style/Formatting ===
+    # Alphabetical key ordering is not standard practice in Helm charts
+    - "sorted-keys"
+
     # === Optional Best Practices ===
     # NetworkPolicy is optional and depends on cluster setup
     - "non-isolated-pod"
