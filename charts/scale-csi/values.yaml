@@ -16,14 +16,8 @@ controller:
   enabled: true
   replicas: 1
 
-  # Resource limits
-  resources:
-    limits:
-      cpu: 200m
-      memory: 256Mi
-    requests:
-      cpu: 50m
-      memory: 64Mi
+  # Resource requests/limits (none by default - opt-in)
+  resources: {}
 
   # Node selector for controller pod
   nodeSelector: {}
@@ -53,14 +47,8 @@ controller:
 node:
   enabled: true
 
-  # Resource limits
-  resources:
-    limits:
-      cpu: 200m
-      memory: 256Mi
-    requests:
-      cpu: 50m
-      memory: 64Mi
+  # Resource requests/limits (none by default - opt-in)
+  resources: {}
 
   # Node selector for node pods
   nodeSelector: {}
@@ -241,63 +229,27 @@ sidecars:
 
   provisioner:
     image: registry.k8s.io/sig-storage/csi-provisioner:v6.1.0
-    resources:
-      limits:
-        cpu: 100m
-        memory: 128Mi
-      requests:
-        cpu: 10m
-        memory: 32Mi
+    resources: {}
 
   attacher:
     image: registry.k8s.io/sig-storage/csi-attacher:v4.10.0
-    resources:
-      limits:
-        cpu: 100m
-        memory: 128Mi
-      requests:
-        cpu: 10m
-        memory: 32Mi
+    resources: {}
 
   resizer:
     image: registry.k8s.io/sig-storage/csi-resizer:v2.0.0
-    resources:
-      limits:
-        cpu: 100m
-        memory: 128Mi
-      requests:
-        cpu: 10m
-        memory: 32Mi
+    resources: {}
 
   snapshotter:
     image: registry.k8s.io/sig-storage/csi-snapshotter:v8.4.0
-    resources:
-      limits:
-        cpu: 100m
-        memory: 128Mi
-      requests:
-        cpu: 10m
-        memory: 32Mi
+    resources: {}
 
   nodeDriverRegistrar:
     image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.15.0
-    resources:
-      limits:
-        cpu: 100m
-        memory: 128Mi
-      requests:
-        cpu: 10m
-        memory: 32Mi
+    resources: {}
 
   livenessProbe:
     image: registry.k8s.io/sig-storage/livenessprobe:v2.17.0
-    resources:
-      limits:
-        cpu: 50m
-        memory: 64Mi
-      requests:
-        cpu: 10m
-        memory: 16Mi
+    resources: {}
 
 # Service account configuration
 serviceAccount:
