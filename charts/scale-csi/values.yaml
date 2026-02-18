@@ -248,7 +248,7 @@ sidecars:
     resources: {}
 
   livenessProbe:
-    image: registry.k8s.io/sig-storage/livenessprobe:v2.17.0
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.18.0
     resources: {}
 
 # Service account configuration
