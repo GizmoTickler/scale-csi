@@ -228,7 +228,7 @@ sidecars:
     retryPeriod: 10s
 
   provisioner:
-    image: registry.k8s.io/sig-storage/csi-provisioner:v6.1.0
+    image: registry.k8s.io/sig-storage/csi-provisioner:v6.1.1
     resources: {}
 
   attacher:
