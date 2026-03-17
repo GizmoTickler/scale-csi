@@ -2,7 +2,7 @@ module github.com/GizmoTickler/scale-csi
 
 go 1.25.0
 
-toolchain go1.26.0
+toolchain go1.26.1
 
 require (
 	github.com/container-storage-interface/spec v1.12.0
