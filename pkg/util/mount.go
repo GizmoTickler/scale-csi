@@ -226,7 +226,7 @@ func GetFilesystemStats(path string) (*FilesystemStats, error) {
 		return nil, fmt.Errorf("statfs failed: %w", err)
 	}
 
-	blockSize := stat.Bsize
+	blockSize := int64(stat.Bsize)
 
 	return &FilesystemStats{
 		TotalBytes:      int64(stat.Blocks) * blockSize,
