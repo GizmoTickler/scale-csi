@@ -1,11 +1,35 @@
 package util
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFindDeviceForSessionUsesOwningHostOnly(t *testing.T) {
+	sysClassRoot := filepath.Join(t.TempDir(), "class")
+	devRoot := filepath.Join(t.TempDir(), "dev")
+	require.NoError(t, os.MkdirAll(filepath.Join(sysClassRoot, "iscsi_host", "host4", "device", "session12"), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(sysClassRoot, "scsi_device", "4:0:0:0", "device", "block", "sdb"), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(sysClassRoot, "scsi_device", "9:0:0:0", "device", "block", "sdz"), 0o750))
+	require.NoError(t, os.MkdirAll(devRoot, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "sdb"), nil, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "sdz"), nil, 0o600))
+
+	devicePath, err := findDeviceForSessionInPaths("session12", 0, sysClassRoot, devRoot)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(devRoot, "sdb"), devicePath)
+
+	// A device for the same LUN on another host must never be used as fallback.
+	require.NoError(t, os.Remove(filepath.Join(devRoot, "sdb")))
+	devicePath, err = findDeviceForSessionInPaths("session12", 0, sysClassRoot, devRoot)
+	require.Error(t, err)
+	assert.Empty(t, devicePath)
+	assert.Contains(t, err.Error(), "device for session 12 not found")
+}
 
 // TestParseISCSISessions tests parsing of iscsiadm session output.
 // This is the core parsing logic from getISCSISessions().

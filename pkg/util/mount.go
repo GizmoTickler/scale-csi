@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -102,7 +103,30 @@ func BindMount(source, target string, options []string) error {
 		return fmt.Errorf("bind mount failed: %w, output: %s", err, string(output))
 	}
 
+	// A read-only bind mount requires a separate remount on BusyBox and older
+	// util-linux versions. The ro flag on the initial bind is otherwise ignored.
+	if containsMountOption(options, "ro") {
+		cmd = exec.CommandContext(ctx, "mount", "-o", "remount,bind,ro", target)
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			remountErr := fmt.Errorf("read-only bind remount failed: %w, output: %s", err, string(output))
+			if unmountErr := Unmount(target); unmountErr != nil {
+				return errors.Join(remountErr, fmt.Errorf("failed to clean up bind mount: %w", unmountErr))
+			}
+			return remountErr
+		}
+	}
+
 	return nil
+}
+
+func containsMountOption(options []string, wanted string) bool {
+	for _, option := range options {
+		if option == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 // Unmount unmounts a target path with retry for transient failures.
@@ -160,7 +184,7 @@ func FormatAndMount(devicePath, target, fsType string, options []string) error {
 	// Check if already formatted
 	existingFS, err := GetFilesystemType(devicePath)
 	if err != nil {
-		klog.Warningf("Failed to get filesystem type: %v", err)
+		return fmt.Errorf("failed to get filesystem type for %s: %w", devicePath, err)
 	}
 
 	if existingFS == "" {
@@ -210,11 +234,22 @@ func GetFilesystemType(devicePath string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
+	// Keep stdout separate from stderr: the success path returns stdout as the
+	// filesystem type, and exit code 2 only means "no filesystem" when blkid
+	// produced no output at all.
 	cmd := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "TYPE", devicePath)
 	output, err := cmd.Output()
 	if err != nil {
-		// Device may not be formatted yet
-		return "", nil
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 &&
+			strings.TrimSpace(string(output)) == "" && strings.TrimSpace(string(exitErr.Stderr)) == "" {
+			return "", nil
+		}
+		var stderr []byte
+		if exitErr != nil {
+			stderr = exitErr.Stderr
+		}
+		return "", fmt.Errorf("blkid failed for %s: %w, output: %s, stderr: %s", devicePath, err, string(output), string(stderr))
 	}
 	return strings.TrimSpace(string(output)), nil
 }
@@ -335,6 +370,49 @@ func GetMountedBlockDevices() (map[string]string, error) {
 				devices[device] = target
 			}
 		}
+	}
+
+	return devices, nil
+}
+
+// GetStagedBlockDevices returns block devices referenced by symlinks below a
+// kubelet CSI staging directory. Raw block volumes are staged as symlinks, so
+// they do not appear in GetMountedBlockDevices.
+func GetStagedBlockDevices(stagingRoot string) (map[string]string, error) {
+	devices := make(map[string]string)
+
+	// A missing staging root just means no CSI volume was ever staged on this
+	// node; treat it as empty rather than an error so session GC still runs.
+	if _, err := os.Stat(stagingRoot); os.IsNotExist(err) {
+		return devices, nil
+	}
+
+	err := filepath.WalkDir(stagingRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink == 0 {
+			// Filesystem-mode staging targets are mounted directories. Do not
+			// descend into volume data while looking for raw-block symlinks.
+			if entry.IsDir() && path != stagingRoot && filepath.Base(path) == "globalmount" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		devicePath, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return fmt.Errorf("failed to resolve staged block device symlink %s: %w", path, err)
+		}
+		if !strings.HasPrefix(devicePath, "/dev/") {
+			return nil
+		}
+
+		devices[devicePath] = path
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan CSI staging directory %s: %w", stagingRoot, err)
 	}
 
 	return devices, nil

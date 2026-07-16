@@ -19,6 +19,17 @@ import (
 	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
+const kubeletCSIStagingRoot = "/var/lib/kubelet/plugins/kubernetes.io/csi"
+
+var (
+	getMountedBlockDevices = util.GetMountedBlockDevices
+	getStagedBlockDevices  = func() (map[string]string, error) {
+		return util.GetStagedBlockDevices(kubeletCSIStagingRoot)
+	}
+	getISCSIInfoFromDevice = util.GetISCSIInfoFromDevice
+	getNVMeInfoFromDevice  = util.GetNVMeInfoFromDevice
+)
+
 // DriverConfig holds the driver initialization configuration.
 type DriverConfig struct {
 	Name          string
@@ -677,15 +688,9 @@ func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 	expected := make(map[string]struct{})
 
-	// Kubelet stores staging mounts in /var/lib/kubelet/plugins/kubernetes.io/csi/
-	// Each volume has a directory: /var/lib/kubelet/plugins/kubernetes.io/csi/<driver>/globalmount
-	// We need to check what's actually mounted
-
-	// Alternative approach: scan for iSCSI devices that are in use (mounted)
-	// This is more reliable than trying to parse kubelet directories
-	mountedDevices, err := util.GetMountedBlockDevices()
+	inUseDevices, err := getInUseBlockDevices()
 	if err != nil {
-		klog.Warningf("Session GC: failed to get mounted block devices: %v", err)
+		klog.Warningf("Session GC: failed to get in-use block devices: %v", err)
 		return nil // Return nil to signal GC should be skipped
 	}
 
@@ -695,9 +700,9 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 	const maxFailedLookups = 2 // Allow 1-2 failures for non-iSCSI devices, but more suggests a problem
 
 	// For each mounted device, get its iSCSI session if any
-	for device := range mountedDevices {
+	for device := range inUseDevices {
 		// Check if this device is an iSCSI device
-		portal, iqn, err := util.GetISCSIInfoFromDevice(device)
+		portal, iqn, err := getISCSIInfoFromDevice(device)
 		if err != nil {
 			// Check if this is likely an iSCSI device by looking at the device name pattern
 			// iSCSI devices are typically sd[a-z]+ (not nvme*, loop*, etc)
@@ -726,10 +731,9 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 // Returns nil if the lookup was unreliable (e.g., error getting mounted devices),
 // signaling GC should be skipped to prevent false positives.
 func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
-	// Get mounted block devices
-	mountedDevices, err := util.GetMountedBlockDevices()
+	inUseDevices, err := getInUseBlockDevices()
 	if err != nil {
-		klog.Warningf("Session GC: failed to get mounted block devices: %v", err)
+		klog.Warningf("Session GC: failed to get in-use block devices: %v", err)
 		return nil // Return nil to signal GC should be skipped
 	}
 
@@ -741,9 +745,9 @@ func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
 	const maxFailedLookups = 2 // Allow 1-2 failures, but more suggests a problem
 
 	// For each mounted device, get its NVMe-oF session if any
-	for device := range mountedDevices {
+	for device := range inUseDevices {
 		// Check if this device is an NVMe device
-		nqn, err := util.GetNVMeInfoFromDevice(device)
+		nqn, err := getNVMeInfoFromDevice(device)
 		if err != nil {
 			// Check if this looks like an NVMe device (might be transient state)
 			if util.IsLikelyNVMeDevice(device) {
@@ -765,4 +769,24 @@ func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
 	}
 
 	return expected
+}
+
+func getInUseBlockDevices() (map[string]string, error) {
+	mountedDevices, err := getMountedBlockDevices()
+	if err != nil {
+		return nil, fmt.Errorf("get mounted block devices: %w", err)
+	}
+	if mountedDevices == nil {
+		mountedDevices = make(map[string]string)
+	}
+
+	stagedDevices, err := getStagedBlockDevices()
+	if err != nil {
+		return nil, fmt.Errorf("scan staged block devices: %w", err)
+	}
+
+	for device, stagingPath := range stagedDevices {
+		mountedDevices[device] = stagingPath
+	}
+	return mountedDevices, nil
 }

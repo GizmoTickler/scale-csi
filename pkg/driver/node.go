@@ -272,60 +272,34 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 // when the device path is unavailable (e.g., after node restart or force unmount).
 // This prevents session leaks that accumulate over time.
 func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID string) {
-	shareType := d.config.GetDriverShareType()
+	_ = ctx
 
-	switch shareType {
-	case ShareTypeISCSI:
-		// Try to find and disconnect any iSCSI session for this volume
-		portal := d.config.ISCSI.TargetPortal
-
-		// Construct the expected target name (same logic as createISCSIShare)
-		// Target name = volumeID + optional NameSuffix
-		targetName := volumeID
-		if d.config.ISCSI.NameSuffix != "" {
-			targetName += d.config.ISCSI.NameSuffix
+	// Mixed-protocol deployments cannot infer the volume's transport from the
+	// driver's global default. Both lookups are exact and no-op when absent.
+	portal := d.config.ISCSI.TargetPortal
+	targetName := volumeID + d.config.ISCSI.NameSuffix
+	iqn, err := util.FindISCSISessionByTargetName(targetName)
+	if err != nil {
+		klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s): %v", volumeID, targetName, err)
+	} else if iqn != "" {
+		klog.Infof("Found orphaned iSCSI session for volume %s: %s", volumeID, iqn)
+		if disconnectErr := util.ISCSIDisconnect(portal, iqn); disconnectErr != nil {
+			klog.Warningf("Failed to disconnect orphaned iSCSI session %s: %v", iqn, disconnectErr)
+		} else {
+			klog.Infof("Successfully cleaned up orphaned iSCSI session %s", iqn)
 		}
+	}
 
-		// Check if there's an active session for this target
-		iqn, err := util.FindISCSISessionByTargetName(targetName)
-		if err != nil {
-			klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s): %v", volumeID, targetName, err)
-			return
-		}
-
-		if iqn != "" {
-			klog.Infof("Found orphaned iSCSI session for volume %s: %s", volumeID, iqn)
-			if err := util.ISCSIDisconnect(portal, iqn); err != nil {
-				klog.Warningf("Failed to disconnect orphaned iSCSI session %s: %v", iqn, err)
-			} else {
-				klog.Infof("Successfully cleaned up orphaned iSCSI session %s", iqn)
-			}
-		}
-
-	case ShareTypeNVMeoF:
-		// Construct the expected NQN (same logic as createNVMeoFShare)
-		nqnName := volumeID
-		if d.config.NVMeoF.NamePrefix != "" {
-			nqnName = d.config.NVMeoF.NamePrefix + nqnName
-		}
-		if d.config.NVMeoF.NameSuffix != "" {
-			nqnName += d.config.NVMeoF.NameSuffix
-		}
-
-		// Try to find and disconnect any NVMe-oF session for this volume
-		nqn, err := util.FindNVMeoFSessionBySubsysName(nqnName)
-		if err != nil {
-			klog.V(4).Infof("No active NVMe-oF session found for volume %s (nqn: %s): %v", volumeID, nqnName, err)
-			return
-		}
-
-		if nqn != "" {
-			klog.Infof("Found orphaned NVMe-oF session for volume %s: %s", volumeID, nqn)
-			if err := util.NVMeoFDisconnect(nqn); err != nil {
-				klog.Warningf("Failed to disconnect orphaned NVMe-oF session %s: %v", nqn, err)
-			} else {
-				klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
-			}
+	nqnName := d.config.NVMeoF.NamePrefix + volumeID + d.config.NVMeoF.NameSuffix
+	nqn, err := util.FindNVMeoFSessionBySubsysName(nqnName)
+	if err != nil {
+		klog.V(4).Infof("No active NVMe-oF session found for volume %s (nqn: %s): %v", volumeID, nqnName, err)
+	} else if nqn != "" {
+		klog.Infof("Found orphaned NVMe-oF session for volume %s: %s", volumeID, nqn)
+		if err := util.NVMeoFDisconnect(nqn); err != nil {
+			klog.Warningf("Failed to disconnect orphaned NVMe-oF session %s: %v", nqn, err)
+		} else {
+			klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
 		}
 	}
 }
@@ -513,26 +487,126 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 
 	klog.Infof("NodeExpandVolume: volumeID=%s, volumePath=%s", volumeID, volumePath)
 
-	// For block volumes (iSCSI/NVMe-oF), resize the filesystem
-	shareType := d.config.GetDriverShareType()
-	if shareType.IsBlockProtocol() {
-		// Find the device and resize filesystem
-		if volumePath != "" {
-			if err := util.ResizeFilesystem(volumePath); err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to resize filesystem: %v", err)
-			}
-		}
-	}
-
 	capacityBytes := int64(0)
 	if req.GetCapacityRange() != nil {
 		capacityBytes = req.GetCapacityRange().GetRequiredBytes()
+	}
+
+	devicePath, rawBlock, err := resolveNodeExpansionDevice(req)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to resolve expansion device: %v", err)
+	}
+
+	shareType := blockTransportForDevice(devicePath, d.config.GetDriverShareType())
+	if shareType.IsBlockProtocol() {
+		if devicePath == "" {
+			return nil, status.Error(codes.Internal, "failed to resolve block device for expansion")
+		}
+
+		currentFSBytes := int64(0)
+		if !rawBlock && volumePath != "" {
+			if stats, statsErr := util.GetFilesystemStats(volumePath); statsErr != nil {
+				klog.Warningf("Could not read current filesystem size for %s: %v", volumePath, statsErr)
+			} else {
+				currentFSBytes = stats.TotalBytes
+			}
+		}
+
+		beforeBytes, beforeErr := util.GetDeviceSize(devicePath)
+		if beforeErr != nil {
+			klog.Warningf("Could not read device size before rescan for %s: %v", devicePath, beforeErr)
+		} else {
+			klog.Infof("Device %s size before rescan: %d bytes", devicePath, beforeBytes)
+		}
+
+		switch shareType {
+		case ShareTypeISCSI:
+			portal, iqn, infoErr := util.GetISCSIInfoFromDevice(devicePath)
+			if infoErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
+			}
+			if rescanErr := util.ISCSIRescanSession(portal, iqn); rescanErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
+			}
+		case ShareTypeNVMeoF:
+			if rescanErr := util.NVMeRescan(devicePath); rescanErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to rescan NVMe-oF device %s: %v", devicePath, rescanErr)
+			}
+		}
+
+		afterBytes, afterErr := util.GetDeviceSize(devicePath)
+		if afterErr != nil {
+			klog.Warningf("Could not read device size after rescan for %s: %v", devicePath, afterErr)
+		} else {
+			klog.Infof("Device %s size after rescan: %d bytes", devicePath, afterBytes)
+			if beforeErr == nil && afterBytes <= beforeBytes {
+				if rawBlock && capacityBytes > beforeBytes {
+					klog.Warningf("Raw block device %s did not grow after rescan (before=%d, after=%d, requested=%d)", devicePath, beforeBytes, afterBytes, capacityBytes)
+				} else if !rawBlock && capacityBytes > currentFSBytes {
+					klog.Warningf("Device %s did not grow after rescan (before=%d, after=%d, requested=%d, filesystem=%d); attempting filesystem resize", devicePath, beforeBytes, afterBytes, capacityBytes, currentFSBytes)
+				}
+			}
+		}
+
+		// Node expansion for raw block volumes only needs the transport rescan.
+		if rawBlock {
+			klog.Infof("Raw block volume %s rescanned; skipping filesystem resize", volumeID)
+			return &csi.NodeExpandVolumeResponse{CapacityBytes: capacityBytes}, nil
+		}
+
+		if volumePath != "" {
+			if resizeErr := util.ResizeFilesystem(volumePath); resizeErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to resize filesystem: %v", resizeErr)
+			}
+		}
 	}
 
 	klog.Infof("Volume %s expanded successfully", volumeID)
 	return &csi.NodeExpandVolumeResponse{
 		CapacityBytes: capacityBytes,
 	}, nil
+}
+
+func resolveNodeExpansionDevice(req *csi.NodeExpandVolumeRequest) (devicePath string, rawBlock bool, err error) {
+	rawBlock = req.GetVolumeCapability() != nil && req.GetVolumeCapability().GetBlock() != nil
+
+	paths := []string{req.GetStagingTargetPath(), req.GetVolumePath()}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+
+		info, err := os.Lstat(path)
+		if err == nil && info.Mode()&os.ModeSymlink != 0 {
+			resolvedPath, evalErr := filepath.EvalSymlinks(path)
+			if evalErr != nil {
+				return "", rawBlock, evalErr
+			}
+			if strings.HasPrefix(resolvedPath, "/dev/") {
+				return resolvedPath, true, nil
+			}
+		}
+
+		mountedDevice, mountErr := util.GetDeviceFromMountPoint(path)
+		if mountErr == nil && strings.HasPrefix(mountedDevice, "/dev/") {
+			return mountedDevice, rawBlock, nil
+		}
+	}
+
+	return "", rawBlock, nil
+}
+
+func blockTransportForDevice(devicePath string, fallback ShareType) ShareType {
+	if util.IsLikelyNVMeDevice(devicePath) {
+		return ShareTypeNVMeoF
+	}
+	if util.IsLikelyISCSIDevice(devicePath) {
+		return ShareTypeISCSI
+	}
+	if fallback.IsBlockProtocol() {
+		return fallback
+	}
+	return ShareTypeNFS
 }
 
 // stageNFSVolume mounts an NFS volume to the staging path.
@@ -588,6 +662,15 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		if err != nil {
 			return status.Errorf(codes.InvalidArgument, "invalid LUN number: %s", lunStr)
 		}
+	}
+
+	mounted, err := util.IsMounted(stagingPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to check mount status: %v", err)
+	}
+	if mounted {
+		klog.Infof("iSCSI volume already mounted at %s", stagingPath)
+		return nil
 	}
 
 	// Pre-emptive cleanup: disconnect any existing session for this target
@@ -655,6 +738,15 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	}
 	if port == "" {
 		port = "4420"
+	}
+
+	mounted, err := util.IsMounted(stagingPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to check mount status: %v", err)
+	}
+	if mounted {
+		klog.Infof("NVMe-oF volume already mounted at %s", stagingPath)
+		return nil
 	}
 
 	// Pre-emptive cleanup: disconnect any existing session for this NQN

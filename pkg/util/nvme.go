@@ -19,7 +19,10 @@ import (
 // nvmeDeviceRegex matches NVMe namespace device names and captures the controller name.
 // Pattern: nvme<controller_number>n<namespace_number>
 // Examples: nvme0n1 -> captures "nvme0", nvme10n2 -> captures "nvme10"
-var nvmeDeviceRegex = regexp.MustCompile(`^(nvme\d+)n\d+$`)
+var (
+	nvmeControllerRegex = regexp.MustCompile(`^nvme\d+$`)
+	nvmeDeviceRegex     = regexp.MustCompile(`^(nvme\d+)n\d+$`)
+)
 
 // Note: getNVMeTimeout() is now configurable via SetConfig().NVMeTimeout
 // Default: 30s
@@ -357,13 +360,12 @@ func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
 
 	for _, subsys := range subsystems {
 		if subsys.NQN == nqn {
-			// Found the subsystem, derive device path from controller name
-			// Paths[].Name gives us the controller (e.g., "nvme2")
-			// The device is controller + "n1" (e.g., "/dev/nvme2n1")
+			// Paths[].Name identifies the controller. Enumerate its namespaces;
+			// namespace IDs are not guaranteed to start at 1.
 			for _, path := range subsys.Paths {
 				if path.Name != "" {
-					devicePath := "/dev/" + path.Name + "n1"
-					if _, err := os.Stat(devicePath); err == nil {
+					devicePath, findErr := findNVMeNamespaceForController(path.Name, "/sys/class/nvme", "/dev")
+					if findErr == nil {
 						return devicePath, nil
 					}
 				}
@@ -374,21 +376,51 @@ func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
 	return "", fmt.Errorf("device not found for nqn=%s", nqn)
 }
 
+func findNVMeNamespaceForController(controller, nvmeClassRoot, devRoot string) (string, error) {
+	if !nvmeControllerRegex.MatchString(controller) {
+		return "", fmt.Errorf("invalid NVMe controller name: %s", controller)
+	}
+
+	pattern := filepath.Join(nvmeClassRoot, controller, controller+"n*")
+	namespaces, err := filepath.Glob(pattern)
+	if err != nil {
+		return "", err
+	}
+	for _, namespace := range namespaces {
+		deviceName := filepath.Base(namespace)
+		if !nvmeDeviceRegex.MatchString(deviceName) {
+			continue
+		}
+		devicePath := filepath.Join(devRoot, deviceName)
+		if _, statErr := os.Stat(devicePath); statErr == nil {
+			return devicePath, nil
+		}
+	}
+
+	return "", fmt.Errorf("namespace device not found for controller %s", controller)
+}
+
 // GetNVMeDevicePath returns the device path for an NVMe subsystem NQN.
 func GetNVMeDevicePath(nqn string) (string, error) {
 	return findNVMeDevice(nqn)
 }
 
-// NVMeRescan rescans for new NVMe namespaces.
-func NVMeRescan() error {
+// NVMeRescan rescans the controller that owns a namespace device.
+func NVMeRescan(devicePath string) error {
+	deviceName := filepath.Base(devicePath)
+	matches := nvmeDeviceRegex.FindStringSubmatch(deviceName)
+	if len(matches) != 2 {
+		return fmt.Errorf("invalid NVMe namespace device: %s", devicePath)
+	}
+	controllerPath := "/dev/" + matches[1]
+
 	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "nvme", "ns-rescan", "/dev/nvme0")
+	cmd := exec.CommandContext(ctx, "nvme", "ns-rescan", controllerPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		klog.Warningf("NVMe rescan failed: %v, output: %s", err, string(output))
-		// Not critical, continue
+		return fmt.Errorf("NVMe rescan failed: %w, output: %s", err, string(output))
 	}
 	return nil
 }

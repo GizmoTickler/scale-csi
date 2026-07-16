@@ -1,10 +1,64 @@
 package util
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+const fakeMountCommandScript = `#!/bin/sh
+name="$(basename "$0")"
+if [ -n "$FAKE_COMMAND_LOG" ]; then
+	printf '%s %s\n' "$name" "$*" >> "$FAKE_COMMAND_LOG"
+fi
+case "$name" in
+	blkid)
+		if [ -n "$FAKE_BLKID_OUTPUT" ]; then
+			printf '%s' "$FAKE_BLKID_OUTPUT"
+		fi
+		exit "${FAKE_BLKID_EXIT:-0}"
+		;;
+	mount)
+		case "$*" in
+			"-o remount,bind,ro "*) exit "${FAKE_REMOUNT_EXIT:-0}" ;;
+		esac
+		exit 0
+		;;
+	findmnt)
+		if [ -n "$FAKE_FINDMNT_OUTPUT" ]; then
+			printf '%s' "$FAKE_FINDMNT_OUTPUT"
+			exit 0
+		fi
+		exit 1
+		;;
+	*) exit 0 ;;
+esac
+`
+
+func installFakeMountCommands(t *testing.T, commands ...string) string {
+	t.Helper()
+	binDir := t.TempDir()
+	for _, command := range commands {
+		path := filepath.Join(binDir, command)
+		require.NoError(t, os.WriteFile(path, []byte(fakeMountCommandScript), 0o750))
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return binDir
+}
+
+func readCommandLog(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return ""
+	}
+	require.NoError(t, err)
+	return string(content)
+}
 
 // TestBuildMountArgs tests the argument construction logic for mount commands.
 // Since we cannot actually run mount commands in unit tests, we test the
@@ -156,6 +210,34 @@ func TestBuildBindMountArgs(t *testing.T) {
 	}
 }
 
+func TestBindMountReadOnlyRemount(t *testing.T) {
+	installFakeMountCommands(t, "mount")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_COMMAND_LOG", logPath)
+
+	err := BindMount("/source", "/target", []string{"ro", "noexec"})
+	require.NoError(t, err)
+
+	commands := strings.Split(strings.TrimSpace(readCommandLog(t, logPath)), "\n")
+	require.Len(t, commands, 2)
+	assert.Equal(t, "mount -o bind,ro,noexec /source /target", commands[0])
+	assert.Equal(t, "mount -o remount,bind,ro /target", commands[1])
+}
+
+func TestBindMountReadOnlyRemountFailureCleansUp(t *testing.T) {
+	installFakeMountCommands(t, "mount", "findmnt", "umount")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	target := t.TempDir()
+	t.Setenv("FAKE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_REMOUNT_EXIT", "1")
+	t.Setenv("FAKE_FINDMNT_OUTPUT", "/source "+target+"\n")
+
+	err := BindMount("/source", target, []string{"ro"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read-only bind remount failed")
+	assert.Contains(t, readCommandLog(t, logPath), "umount "+target)
+}
+
 // buildBindMountArgs replicates the argument building logic from BindMount() for testing.
 func buildBindMountArgs(source, target string, options []string) []string {
 	mountOptions := []string{"bind"}
@@ -302,6 +384,40 @@ func TestFormatDeviceCommand(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFormatAndMountBlkidExitHandling(t *testing.T) {
+	t.Run("exit 2 with empty output formats unformatted device", func(t *testing.T) {
+		installFakeMountCommands(t, "blkid", "mkfs.ext4", "mount")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_BLKID_EXIT", "2")
+
+		err := FormatAndMount("/dev/test", "/target", "ext4", nil)
+		require.NoError(t, err)
+
+		commands := readCommandLog(t, logPath)
+		assert.Contains(t, commands, "blkid -o value -s TYPE /dev/test")
+		assert.Contains(t, commands, "mkfs.ext4 -F /dev/test")
+		assert.Contains(t, commands, "mount -t ext4 /dev/test /target")
+	})
+
+	t.Run("unexpected blkid failure never formats", func(t *testing.T) {
+		installFakeMountCommands(t, "blkid", "mkfs.ext4", "mount")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_BLKID_EXIT", "4")
+		t.Setenv("FAKE_BLKID_OUTPUT", "I/O error")
+
+		err := FormatAndMount("/dev/test", "/target", "ext4", nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "blkid failed")
+
+		commands := readCommandLog(t, logPath)
+		assert.Contains(t, commands, "blkid -o value -s TYPE /dev/test")
+		assert.NotContains(t, commands, "mkfs.ext4")
+		assert.NotContains(t, commands, "mount -t")
+	})
 }
 
 // getFormatCommand returns the mkfs command and arguments for a filesystem type.
@@ -570,6 +686,39 @@ overlay /var/lib/docker/overlay2/abc123
 			assert.Equal(t, tc.wantDevices, devices)
 		})
 	}
+}
+
+func TestGetStagedBlockDevices(t *testing.T) {
+	t.Run("finds nested raw block symlink", func(t *testing.T) {
+		stagingRoot := t.TempDir()
+		stagingPath := filepath.Join(stagingRoot, "driver", "volume", "globalmount")
+		require.NoError(t, os.MkdirAll(filepath.Dir(stagingPath), 0o750))
+		require.NoError(t, os.Symlink("/dev/null", stagingPath))
+
+		devices, err := GetStagedBlockDevices(stagingRoot)
+		require.NoError(t, err)
+		assert.Equal(t, stagingPath, devices["/dev/null"])
+	})
+
+	t.Run("broken staging symlink fails closed", func(t *testing.T) {
+		stagingRoot := t.TempDir()
+		require.NoError(t, os.Symlink("/dev/scale-csi-missing-device", filepath.Join(stagingRoot, "globalmount")))
+
+		devices, err := GetStagedBlockDevices(stagingRoot)
+		require.Error(t, err)
+		assert.Nil(t, devices)
+	})
+
+	t.Run("does not traverse filesystem staging contents", func(t *testing.T) {
+		stagingRoot := t.TempDir()
+		mountedPath := filepath.Join(stagingRoot, "driver", "volume", "globalmount")
+		require.NoError(t, os.MkdirAll(mountedPath, 0o750))
+		require.NoError(t, os.Symlink("/dev/scale-csi-missing-device", filepath.Join(mountedPath, "user-link")))
+
+		devices, err := GetStagedBlockDevices(stagingRoot)
+		require.NoError(t, err)
+		assert.Empty(t, devices)
+	})
 }
 
 // parseFindmntOutput parses findmnt output to extract block device mappings.

@@ -3,11 +3,26 @@ package util
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestFindNVMeNamespaceForControllerDoesNotAssumeNamespaceOne(t *testing.T) {
+	classRoot := filepath.Join(t.TempDir(), "nvme")
+	devRoot := filepath.Join(t.TempDir(), "dev")
+	require.NoError(t, os.MkdirAll(filepath.Join(classRoot, "nvme7", "nvme7n9"), 0o750))
+	require.NoError(t, os.MkdirAll(devRoot, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "nvme7n9"), nil, 0o600))
+
+	devicePath, err := findNVMeNamespaceForController("nvme7", classRoot, devRoot)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(devRoot, "nvme7n9"), devicePath)
+}
 
 // TestNVMeDeviceRegex tests that the NVMe device regex correctly extracts controller names.
 // This is a regression test for the bug where strings.Split(deviceName, "n") was used,

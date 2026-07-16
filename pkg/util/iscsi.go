@@ -503,26 +503,27 @@ func findISCSIDevice(iqn string, lun int) (string, error) {
 
 // findDeviceForSession finds the block device for a specific session and LUN.
 func findDeviceForSession(sessionName string, lun int) (string, error) {
+	return findDeviceForSessionInPaths(sessionName, lun, "/sys/class", "/dev")
+}
+
+func findDeviceForSessionInPaths(sessionName string, lun int, sysClassRoot, devRoot string) (string, error) {
 	// Extract session number
 	var sessionNum int
 	if _, err := fmt.Sscanf(sessionName, "session%d", &sessionNum); err != nil {
 		return "", fmt.Errorf("failed to parse session name: %w", err)
 	}
 
-	// Look for the device in /sys/class/scsi_device
-	// Format: host:bus:target:lun
-	pattern := fmt.Sprintf("/sys/class/scsi_device/*:0:0:%d/device/block/*", lun)
-	devices, err := filepath.Glob(pattern)
+	// Resolve the SCSI host that owns this session. Never fall back to a
+	// session-agnostic LUN lookup: different targets commonly expose the same
+	// LUN number, and doing so can select another volume's device.
+	hostPattern := filepath.Join(sysClassRoot, "iscsi_host", "host*", "device", fmt.Sprintf("session%d", sessionNum))
+	hostDirs, err := filepath.Glob(hostPattern)
 	if err != nil {
 		return "", err
 	}
-
-	// Also check specific host pattern based on session
-	hostPattern := fmt.Sprintf("/sys/class/iscsi_host/host*/device/session%d", sessionNum)
-	hostDirs, _ := filepath.Glob(hostPattern)
-	if len(hostDirs) > 0 {
+	for _, sessionDir := range hostDirs {
 		// Extract host number
-		hostDir := filepath.Dir(filepath.Dir(hostDirs[0]))
+		hostDir := filepath.Dir(filepath.Dir(sessionDir))
 		hostName := filepath.Base(hostDir)
 		var hostNum int
 		if _, scanErr := fmt.Sscanf(hostName, "host%d", &hostNum); scanErr != nil {
@@ -530,24 +531,20 @@ func findDeviceForSession(sessionName string, lun int) (string, error) {
 		}
 
 		// Look for device with this host
-		pattern = fmt.Sprintf("/sys/class/scsi_device/%d:0:0:%d/device/block/*", hostNum, lun)
-		devices, err = filepath.Glob(pattern)
-		if err == nil && len(devices) > 0 {
-			deviceName := filepath.Base(devices[0])
-			return "/dev/" + deviceName, nil
+		pattern := filepath.Join(sysClassRoot, "scsi_device", fmt.Sprintf("%d:0:0:%d", hostNum, lun), "device", "block", "*")
+		devices, globErr := filepath.Glob(pattern)
+		if globErr != nil {
+			return "", globErr
+		}
+		for _, device := range devices {
+			devicePath := filepath.Join(devRoot, filepath.Base(device))
+			if _, statErr := os.Stat(devicePath); statErr == nil {
+				return devicePath, nil
+			}
 		}
 	}
 
-	// Fallback: look through all scsi devices
-	for _, device := range devices {
-		deviceName := filepath.Base(device)
-		devicePath := "/dev/" + deviceName
-		if _, err := os.Stat(devicePath); err == nil {
-			return devicePath, nil
-		}
-	}
-
-	return "", fmt.Errorf("device not found")
+	return "", fmt.Errorf("device for session %d not found", sessionNum)
 }
 
 // GetISCSIDevicePath returns the device path for an iSCSI target/LUN combination.
@@ -664,7 +661,7 @@ func GetDeviceWWN(devicePath string) (string, error) {
 // GetDeviceSize returns the size of a block device in bytes.
 func GetDeviceSize(devicePath string) (int64, error) {
 	deviceName := filepath.Base(devicePath)
-	sizePath := fmt.Sprintf("/sys/block/%s/size", deviceName)
+	sizePath := fmt.Sprintf("/sys/class/block/%s/size", deviceName)
 
 	sizeBytes, err := os.ReadFile(sizePath)
 	if err != nil {

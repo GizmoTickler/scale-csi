@@ -3,6 +3,8 @@ package driver
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -13,6 +15,53 @@ import (
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+const fakeNodeCommandScript = `#!/bin/sh
+name="$(basename "$0")"
+if [ -n "$FAKE_NODE_COMMAND_LOG" ]; then
+	printf '%s %s\n' "$name" "$*" >> "$FAKE_NODE_COMMAND_LOG"
+fi
+case "$name" in
+	findmnt)
+		if [ -n "$FAKE_NODE_FINDMNT_OUTPUT" ]; then
+			printf '%s' "$FAKE_NODE_FINDMNT_OUTPUT"
+			exit 0
+		fi
+		exit 1
+		;;
+	blkid)
+		if [ -n "$FAKE_NODE_BLKID_OUTPUT" ]; then
+			printf '%s' "$FAKE_NODE_BLKID_OUTPUT"
+			exit 0
+		fi
+		exit 2
+		;;
+	nvme) exit 0 ;;
+	iscsiadm) exit 97 ;;
+	*) exit 0 ;;
+esac
+`
+
+func installFakeNodeCommands(t *testing.T, commands ...string) string {
+	t.Helper()
+	binDir := t.TempDir()
+	for _, command := range commands {
+		path := filepath.Join(binDir, command)
+		require.NoError(t, os.WriteFile(path, []byte(fakeNodeCommandScript), 0o750))
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return binDir
+}
+
+func readNodeCommandLog(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return ""
+	}
+	require.NoError(t, err)
+	return string(content)
+}
 
 // newTestNodeDriver creates a minimal driver configured for node testing.
 func newTestNodeDriver(shareType ShareType) *Driver {
@@ -364,6 +413,62 @@ func TestNodeExpandVolume_Validation(t *testing.T) {
 	})
 }
 
+func TestNodeExpandVolumeRescansBeforeFilesystemResize(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "nvme", "blkid", "resize2fs")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme3n7\n")
+	t.Setenv("FAKE_NODE_BLKID_OUTPUT", "ext4\n")
+
+	d := newTestNodeDriver(ShareTypeNFS) // Device detection must support mixed protocols.
+	volumePath := t.TempDir()
+	stagingPath := t.TempDir()
+	resp, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:          "vol-1",
+		VolumePath:        volumePath,
+		StagingTargetPath: stagingPath,
+		CapacityRange:     &csi.CapacityRange{RequiredBytes: 2 << 30},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(2<<30), resp.CapacityBytes)
+
+	commands := readNodeCommandLog(t, logPath)
+	rescanIndex := strings.Index(commands, "nvme ns-rescan /dev/nvme3")
+	resizeIndex := strings.Index(commands, "resize2fs /dev/nvme3n7")
+	require.GreaterOrEqual(t, rescanIndex, 0)
+	require.Greater(t, resizeIndex, rescanIndex)
+}
+
+func TestNodeExpandVolumeRawBlockRescansWithoutFilesystemResize(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "nvme", "blkid", "resize2fs", "xfs_growfs", "btrfs")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme3n7\n")
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	resp, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:          "block-vol",
+		VolumePath:        t.TempDir(),
+		StagingTargetPath: t.TempDir(),
+		CapacityRange:     &csi.CapacityRange{RequiredBytes: 4 << 30},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(4<<30), resp.CapacityBytes)
+
+	commands := readNodeCommandLog(t, logPath)
+	assert.Contains(t, commands, "nvme ns-rescan /dev/nvme3")
+	assert.NotContains(t, commands, "blkid ")
+	assert.NotContains(t, commands, "resize2fs ")
+	assert.NotContains(t, commands, "xfs_growfs ")
+	assert.NotContains(t, commands, "btrfs ")
+}
+
 func TestStageNFSVolume_Validation(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeNFS)
 
@@ -449,6 +554,44 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, codes.InvalidArgument, st.Code())
 		assert.Contains(t, st.Message(), "LUN")
+	})
+}
+
+func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
+	t.Run("iSCSI", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "iscsiadm")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/sda "+t.TempDir()+"\n")
+
+		stagingPath := t.TempDir()
+		d := newTestNodeDriver(ShareTypeISCSI)
+		err := d.stageISCSIVolume(context.Background(), map[string]string{
+			"portal": "192.168.1.100:3260",
+			"iqn":    "iqn.test:vol1",
+		}, stagingPath, &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+		})
+		require.NoError(t, err)
+		assert.NotContains(t, readNodeCommandLog(t, logPath), "iscsiadm ")
+	})
+
+	t.Run("NVMe-oF", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "nvme")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme2n1 "+t.TempDir()+"\n")
+
+		stagingPath := t.TempDir()
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
+			"nqn":     "nqn.test:vol1",
+			"address": "192.168.1.100",
+		}, stagingPath, &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+		})
+		require.NoError(t, err)
+		assert.NotContains(t, readNodeCommandLog(t, logPath), "nvme ")
 	})
 }
 

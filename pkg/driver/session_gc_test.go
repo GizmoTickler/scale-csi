@@ -1,14 +1,91 @@
 package driver
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+func TestExpectedSessionsIncludeStagedBlockSymlinks(t *testing.T) {
+	originalMounted := getMountedBlockDevices
+	originalStaged := getStagedBlockDevices
+	originalISCSIInfo := getISCSIInfoFromDevice
+	originalNVMeInfo := getNVMeInfoFromDevice
+	t.Cleanup(func() {
+		getMountedBlockDevices = originalMounted
+		getStagedBlockDevices = originalStaged
+		getISCSIInfoFromDevice = originalISCSIInfo
+		getNVMeInfoFromDevice = originalNVMeInfo
+	})
+
+	d := &Driver{}
+
+	t.Run("iSCSI unions mounted and raw block staged devices", func(t *testing.T) {
+		getMountedBlockDevices = func() (map[string]string, error) {
+			return map[string]string{"/dev/sda": "/mounted"}, nil
+		}
+		getStagedBlockDevices = func() (map[string]string, error) {
+			return map[string]string{"/dev/sdb": "/staged/globalmount"}, nil
+		}
+		getISCSIInfoFromDevice = func(device string) (string, string, error) {
+			switch device {
+			case "/dev/sda":
+				return "10.0.0.1:3260", "iqn.test:mounted", nil
+			case "/dev/sdb":
+				return "10.0.0.1:3260", "iqn.test:block", nil
+			default:
+				return "", "", errors.New("not iSCSI")
+			}
+		}
+
+		expected := d.getExpectedISCSITargets()
+		require.NotNil(t, expected)
+		assert.Contains(t, expected, "iqn.test:mounted")
+		assert.Contains(t, expected, "iqn.test:block")
+	})
+
+	t.Run("NVMe-oF unions mounted and raw block staged devices", func(t *testing.T) {
+		getMountedBlockDevices = func() (map[string]string, error) {
+			return map[string]string{"/dev/nvme2n1": "/mounted"}, nil
+		}
+		getStagedBlockDevices = func() (map[string]string, error) {
+			return map[string]string{"/dev/nvme3n7": "/staged/globalmount"}, nil
+		}
+		getNVMeInfoFromDevice = func(device string) (string, error) {
+			switch device {
+			case "/dev/nvme2n1":
+				return "nqn.test:mounted", nil
+			case "/dev/nvme3n7":
+				return "nqn.test:block", nil
+			default:
+				return "", errors.New("not NVMe")
+			}
+		}
+
+		expected := d.getExpectedNVMeoFNQNs()
+		require.NotNil(t, expected)
+		assert.Contains(t, expected, "nqn.test:mounted")
+		assert.Contains(t, expected, "nqn.test:block")
+	})
+
+	t.Run("staging scan error skips garbage collection", func(t *testing.T) {
+		getMountedBlockDevices = func() (map[string]string, error) {
+			return map[string]string{}, nil
+		}
+		getStagedBlockDevices = func() (map[string]string, error) {
+			return nil, errors.New("staging directory unreadable")
+		}
+
+		assert.Nil(t, d.getExpectedISCSITargets())
+		assert.Nil(t, d.getExpectedNVMeoFNQNs())
+	})
+}
 
 // TestGetExpectedNVMeoFNQNs_FailedLookupsThreshold tests that getExpectedNVMeoFNQNs
 // returns nil when too many NVMe device lookups fail, preventing false positive GC.
