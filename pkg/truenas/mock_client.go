@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -120,7 +121,16 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 	if params.Volsize > 0 {
 		ds.Volsize = DatasetProperty{Parsed: float64(params.Volsize)}
 	}
-	// Handle other updates as needed
+	if params.Refquota != nil {
+		switch refquota := params.Refquota.(type) {
+		case int:
+			ds.Refquota = DatasetProperty{Parsed: float64(refquota)}
+		case int64:
+			ds.Refquota = DatasetProperty{Parsed: float64(refquota)}
+		case float64:
+			ds.Refquota = DatasetProperty{Parsed: refquota}
+		}
+	}
 	return ds, nil
 }
 
@@ -293,7 +303,7 @@ func (m *MockClient) SnapshotFindByName(ctx context.Context, parentDataset, name
 		return nil, m.InjectError
 	}
 	for _, snap := range m.Snapshots {
-		if snap.Name == name && snap.Dataset == parentDataset {
+		if snap.Name == name && (snap.Dataset == parentDataset || strings.HasPrefix(snap.Dataset, parentDataset+"/")) {
 			return snap, nil
 		}
 	}
@@ -322,12 +332,23 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetNa
 	if m.InjectError != nil {
 		return m.InjectError
 	}
-	// Create a new dataset as a clone
-	m.Datasets[newDatasetName] = &Dataset{
+	// Create a new dataset as a clone, preserving the source dataset's type and
+	// capacity properties so controller tests observe realistic clone state.
+	clone := &Dataset{
 		ID:             newDatasetName,
 		Name:           newDatasetName,
 		UserProperties: make(map[string]UserProperty),
 	}
+	if snapshot, ok := m.Snapshots[snapshotID]; ok {
+		if source, ok := m.Datasets[snapshot.Dataset]; ok {
+			clone.Type = source.Type
+			clone.Mountpoint = source.Mountpoint
+			clone.Volsize = source.Volsize
+			clone.Refquota = source.Refquota
+			clone.Available = source.Available
+		}
+	}
+	m.Datasets[newDatasetName] = clone
 	return nil
 }
 

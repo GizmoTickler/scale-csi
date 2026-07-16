@@ -165,9 +165,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	// Calculate and validate capacity
 	capacityBytes := int64(0)
+	requiredBytes := int64(0)
+	limitBytes := int64(0)
 	if req.GetCapacityRange() != nil {
-		capacityBytes = req.GetCapacityRange().GetRequiredBytes()
-		limitBytes := req.GetCapacityRange().GetLimitBytes()
+		requiredBytes = req.GetCapacityRange().GetRequiredBytes()
+		limitBytes = req.GetCapacityRange().GetLimitBytes()
+		capacityBytes = requiredBytes
 
 		// Validate limit vs required
 		if limitBytes > 0 && capacityBytes > limitBytes {
@@ -199,24 +202,23 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	// Get share type from StorageClass parameters (with fallback to driver name)
 	params := req.GetParameters()
+	if protocol, ok := params["protocol"]; ok {
+		explicitShareType := ShareType(strings.ToLower(strings.TrimSpace(protocol)))
+		if !explicitShareType.IsValid() {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"invalid protocol %q; valid options are: %s",
+				protocol, strings.Join(ValidShareTypeStrings(), ", "))
+		}
+	}
 	shareType := d.config.GetShareType(params)
 	klog.Infof("CreateVolume: using share type %s for volume %s", shareType, volumeID)
 
 	// Validate access mode against protocol
 	// RWX (ReadWriteMany) is only supported for NFS volumes
-	for _, cap := range req.GetVolumeCapabilities() {
-		if accessMode := cap.GetAccessMode(); accessMode != nil {
-			mode := accessMode.GetMode()
-			if mode == csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER ||
-				mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY ||
-				mode == csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER {
-				if !shareType.SupportsMultiNode() {
-					return nil, status.Errorf(codes.InvalidArgument,
-						"access mode %s requires NFS protocol, but %s was requested",
-						mode.String(), shareType)
-				}
-			}
-		}
+	if mode, ok := multiNodeAccessMode(req.GetVolumeCapabilities()); ok && !shareType.SupportsMultiNode() {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"access mode %s requires NFS protocol, but %s was requested",
+			mode.String(), shareType)
 	}
 
 	// Check if volume already exists
@@ -224,6 +226,31 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if err == nil && existingDS != nil {
 		// Volume exists - check and ensure properties are set
 		klog.Infof("Volume %s already exists", volumeID)
+
+		if shareType.IsBlockProtocol() && existingDS.Type == "FILESYSTEM" {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume %s already exists as a filesystem, incompatible with requested %s protocol",
+				volumeID, shareType)
+		}
+		if shareType == ShareTypeNFS && existingDS.Type == "VOLUME" {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume %s already exists as a block volume, incompatible with requested NFS protocol",
+				volumeID)
+		}
+
+		existingCapacity := d.getDatasetCapacity(existingDS)
+		if existingCapacity > 0 {
+			if existingCapacity < requiredBytes {
+				return nil, status.Errorf(codes.AlreadyExists,
+					"volume %s already exists with capacity %d bytes, less than required capacity %d bytes",
+					volumeID, existingCapacity, requiredBytes)
+			}
+			if limitBytes > 0 && existingCapacity > limitBytes {
+				return nil, status.Errorf(codes.AlreadyExists,
+					"volume %s already exists with capacity %d bytes, greater than capacity limit %d bytes",
+					volumeID, existingCapacity, limitBytes)
+			}
+		}
 
 		// Ensure properties are set (idempotent)
 		g, gCtx := errgroup.WithContext(ctx)
@@ -643,11 +670,20 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
 
-	// Check volume exists
+	// Check volume exists and use its actual type when validating capabilities.
 	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
-	_, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
+		if truenas.IsNotFoundError(err) {
+			return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to get volume details: %v", err)
+	}
+
+	if mode, ok := multiNodeAccessMode(caps); ok && ds.Type == "VOLUME" {
+		return &csi.ValidateVolumeCapabilitiesResponse{
+			Message: fmt.Sprintf("access mode %s requires NFS protocol; volume %s is a block volume", mode.String(), volumeID),
+		}, nil
 	}
 
 	// Validate capabilities
@@ -1043,6 +1079,27 @@ func (d *Driver) cloneHasActiveExport(ctx context.Context, datasetPath, datasetT
 func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
 	klog.V(4).Info("ListSnapshots called")
 
+	// A snapshot ID uniquely identifies at most one snapshot, so bypass the
+	// paginated list API when it is provided.
+	if snapshotID := req.GetSnapshotId(); snapshotID != "" {
+		snap, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+		if err != nil {
+			if truenas.IsNotFoundError(err) {
+				return &csi.ListSnapshotsResponse{}, nil
+			}
+			return nil, status.Errorf(codes.Internal, "failed to find snapshot: %v", err)
+		}
+		if snap == nil {
+			return &csi.ListSnapshotsResponse{}, nil
+		}
+
+		entry := snapshotListEntry(snap, req.GetSourceVolumeId())
+		if entry == nil || entry.Snapshot.GetSnapshotId() != snapshotID {
+			return &csi.ListSnapshotsResponse{}, nil
+		}
+		return &csi.ListSnapshotsResponse{Entries: []*csi.ListSnapshotsResponse_Entry{entry}}, nil
+	}
+
 	// Parse starting token as offset
 	offset := 0
 	if req.GetStartingToken() != "" {
@@ -1066,43 +1123,9 @@ func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReques
 
 	entries := make([]*csi.ListSnapshotsResponse_Entry, 0)
 	for _, snap := range snapshots {
-		// Skip if not managed by CSI
-		if prop, ok := snap.UserProperties[PropManagedResource]; !ok || prop.Value != "true" {
-			continue
+		if entry := snapshotListEntry(snap, req.GetSourceVolumeId()); entry != nil {
+			entries = append(entries, entry)
 		}
-
-		// Extract snapshot name safely
-		snapshotID, ok := extractSnapshotName(snap.ID)
-		if !ok {
-			klog.V(4).Infof("Skipping snapshot with invalid ID format: %s", snap.ID)
-			continue
-		}
-
-		// Filter by snapshot ID if specified
-		if req.GetSnapshotId() != "" {
-			if snapshotID != req.GetSnapshotId() {
-				continue
-			}
-		}
-
-		// Filter by source volume if specified
-		sourceVolumeID := ""
-		if prop, ok := snap.UserProperties[PropCSISnapshotSourceVolumeID]; ok {
-			sourceVolumeID = prop.Value
-		}
-		if req.GetSourceVolumeId() != "" && sourceVolumeID != req.GetSourceVolumeId() {
-			continue
-		}
-
-		entries = append(entries, &csi.ListSnapshotsResponse_Entry{
-			Snapshot: &csi.Snapshot{
-				SnapshotId:     snapshotID,
-				SourceVolumeId: sourceVolumeID,
-				SizeBytes:      snap.GetSnapshotSize(),
-				CreationTime:   timestampProto(snap.GetCreationTime()),
-				ReadyToUse:     true,
-			},
-		})
 	}
 
 	// Generate next token if we got a full page
@@ -1131,6 +1154,11 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	if capacityBytes == 0 {
 		return nil, status.Error(codes.InvalidArgument, "capacity is required")
 	}
+	limitBytes := req.GetCapacityRange().GetLimitBytes()
+	if limitBytes > 0 && capacityBytes > limitBytes {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"required capacity (%d bytes) exceeds limit (%d bytes)", capacityBytes, limitBytes)
+	}
 
 	klog.Infof("ControllerExpandVolume: volumeID=%s, capacity=%d", volumeID, capacityBytes)
 
@@ -1150,6 +1178,17 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 			return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
 		}
 		return nil, status.Errorf(codes.Internal, "failed to get volume details: %v", err)
+	}
+
+	currentCapacity := d.getDatasetCapacity(ds)
+	if capacityBytes <= currentCapacity {
+		// Still request node expansion for zvols: a retry can land here after the
+		// controller-side expand succeeded but before the node resized the filesystem.
+		klog.Infof("Volume %s already has capacity %d bytes; expansion is a no-op", volumeID, currentCapacity)
+		return &csi.ControllerExpandVolumeResponse{
+			CapacityBytes:         currentCapacity,
+			NodeExpansionRequired: ds.Type == "VOLUME",
+		}, nil
 	}
 
 	// For zvols (iSCSI/NVMe-oF), expand the volsize
@@ -1209,7 +1248,10 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
 	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
+		if truenas.IsNotFoundError(err) {
+			return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to get volume details: %v", err)
 	}
 
 	return &csi.ControllerGetVolumeResponse{
@@ -1250,6 +1292,49 @@ func (d *Driver) sanitizeVolumeID(name string) string {
 
 func isAlphanumeric(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+func multiNodeAccessMode(caps []*csi.VolumeCapability) (csi.VolumeCapability_AccessMode_Mode, bool) {
+	for _, capability := range caps {
+		mode := capability.GetAccessMode().GetMode()
+		switch mode {
+		case csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+			csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+			csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER:
+			return mode, true
+		}
+	}
+	return csi.VolumeCapability_AccessMode_UNKNOWN, false
+}
+
+func snapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.ListSnapshotsResponse_Entry {
+	if prop, ok := snap.UserProperties[PropManagedResource]; !ok || prop.Value != "true" {
+		return nil
+	}
+
+	snapshotID, ok := extractSnapshotName(snap.ID)
+	if !ok {
+		klog.V(4).Infof("Skipping snapshot with invalid ID format: %s", snap.ID)
+		return nil
+	}
+
+	sourceVolumeID := ""
+	if prop, ok := snap.UserProperties[PropCSISnapshotSourceVolumeID]; ok {
+		sourceVolumeID = prop.Value
+	}
+	if sourceVolumeFilter != "" && sourceVolumeID != sourceVolumeFilter {
+		return nil
+	}
+
+	return &csi.ListSnapshotsResponse_Entry{
+		Snapshot: &csi.Snapshot{
+			SnapshotId:     snapshotID,
+			SourceVolumeId: sourceVolumeID,
+			SizeBytes:      snap.GetSnapshotSize(),
+			CreationTime:   timestampProto(snap.GetCreationTime()),
+			ReadyToUse:     true,
+		},
+	}
 }
 
 func (d *Driver) getDatasetCapacity(ds *truenas.Dataset) int64 {
@@ -1332,17 +1417,10 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		// This is critical for iSCSI/NVMe-oF where extent creation needs the zvol
 		ds, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
-			klog.Warningf("Clone readiness check failed (will continue): %v", err)
-		} else if ds.Type == "VOLUME" && capacityBytes > 0 {
-			// Check if we need to expand the cloned volume to match requested capacity
-			if currentSize, ok := ds.Volsize.Parsed.(float64); ok {
-				if capacityBytes > int64(currentSize) {
-					klog.Infof("Expanding cloned zvol from %d to %d bytes", int64(currentSize), capacityBytes)
-					if err := d.truenasClient.DatasetExpand(ctx, datasetName, capacityBytes); err != nil {
-						klog.Warningf("Failed to expand cloned zvol (will continue with original size): %v", err)
-					}
-				}
-			}
+			return status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
+		}
+		if err := d.ensureCloneCapacity(ctx, datasetName, ds, capacityBytes); err != nil {
+			return err
 		}
 
 		// Set content source properties in parallel
@@ -1369,6 +1447,13 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		sourceDataset := path.Join(d.config.ZFS.DatasetParentName, sourceVolumeID)
 		klog.Infof("Creating volume from volume: %s -> %s", sourceVolumeID, datasetName)
 
+		if _, err := d.truenasClient.DatasetGet(ctx, sourceDataset); err != nil {
+			if truenas.IsNotFoundError(err) {
+				return status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
+			}
+			return status.Errorf(codes.Internal, "failed to get source volume: %v", err)
+		}
+
 		// Create a snapshot of source volume, then clone it
 		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
 		snap, err := d.truenasClient.SnapshotCreate(ctx, sourceDataset, tempSnapshotName)
@@ -1388,17 +1473,10 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		// Wait for cloned dataset to be ready
 		ds, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
-			klog.Warningf("Clone readiness check failed (will continue): %v", err)
-		} else if ds.Type == "VOLUME" && capacityBytes > 0 {
-			// Check if we need to expand the cloned volume
-			if currentSize, ok := ds.Volsize.Parsed.(float64); ok {
-				if capacityBytes > int64(currentSize) {
-					klog.Infof("Expanding cloned zvol from %d to %d bytes", int64(currentSize), capacityBytes)
-					if err := d.truenasClient.DatasetExpand(ctx, datasetName, capacityBytes); err != nil {
-						klog.Warningf("Failed to expand cloned zvol (will continue with original size): %v", err)
-					}
-				}
-			}
+			return status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
+		}
+		if err := d.ensureCloneCapacity(ctx, datasetName, ds, capacityBytes); err != nil {
+			return err
 		}
 
 		// Set content source properties in parallel
@@ -1425,6 +1503,32 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		})
 		if err := g.Wait(); err != nil {
 			klog.Warningf("Error setting content source properties for volume clone: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (d *Driver) ensureCloneCapacity(ctx context.Context, datasetName string, ds *truenas.Dataset, capacityBytes int64) error {
+	if ds == nil {
+		return status.Error(codes.Internal, "cloned volume became ready without dataset details")
+	}
+
+	switch ds.Type {
+	case "VOLUME":
+		currentSize := d.getDatasetCapacity(ds)
+		if capacityBytes > currentSize {
+			klog.Infof("Expanding cloned zvol from %d to %d bytes", currentSize, capacityBytes)
+			if err := d.truenasClient.DatasetExpand(ctx, datasetName, capacityBytes); err != nil {
+				return status.Errorf(codes.Internal, "failed to expand cloned volume: %v", err)
+			}
+		}
+	case "FILESYSTEM":
+		if d.config.ZFS.DatasetEnableQuotas {
+			params := &truenas.DatasetUpdateParams{Refquota: capacityBytes}
+			if _, err := d.truenasClient.DatasetUpdate(ctx, datasetName, params); err != nil {
+				return status.Errorf(codes.Internal, "failed to set cloned volume quota: %v", err)
+			}
 		}
 	}
 
