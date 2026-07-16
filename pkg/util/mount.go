@@ -261,7 +261,9 @@ func GetFilesystemStats(path string) (*FilesystemStats, error) {
 		return nil, fmt.Errorf("statfs failed: %w", err)
 	}
 
-	blockSize := int64(stat.Bsize)
+	// Bsize is int64 on linux but uint32 on darwin; the conversion is required
+	// for portable builds even though it is a no-op on linux.
+	blockSize := int64(stat.Bsize) //nolint:unconvert
 
 	return &FilesystemStats{
 		TotalBytes:      int64(stat.Blocks) * blockSize,
