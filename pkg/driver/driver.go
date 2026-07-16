@@ -31,6 +31,9 @@ var (
 	getISCSIInfoFromDeviceWithSessions = util.GetISCSIInfoFromDeviceWithSessions
 	iscsiConnectWithSessions           = util.ISCSIConnectWithOptionsAndSessions
 	nvmeConnectWithSubsystems          = util.NVMeoFConnectWithOptionsAndSubsystems
+	resolveNodeStatsDevice             = nodeStatsDevice
+	getNodeDeviceSize                  = nodeStatsDeviceSize
+	getNodeFilesystemStats             = util.GetFilesystemStats
 )
 
 // DriverConfig holds the driver initialization configuration.
@@ -611,8 +614,7 @@ func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 		// Only consider sessions for our target address
 		// Session address format from nvme list-subsys: "traddr=192.168.120.10,trsvcid=4420,src_addr=192.168.122.10"
 		// Config address format: "192.168.120.10"
-		// Use strings.Contains to match the IP within the traddr= field
-		if !strings.Contains(session.Address, targetAddr) {
+		if !nvmeSessionMatchesTransportAddress(session.Address, targetAddr) {
 			klog.V(5).Infof("Session GC: skipping session %s (different address: %s, target: %s)", session.NQN, session.Address, targetAddr)
 			continue
 		}
@@ -684,6 +686,16 @@ func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 	} else {
 		klog.V(4).Info("Session GC: no orphaned NVMe-oF sessions found")
 	}
+}
+
+func nvmeSessionMatchesTransportAddress(sessionAddress, targetAddress string) bool {
+	for _, field := range strings.Split(sessionAddress, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(field), "=")
+		if ok && key == "traddr" && value == targetAddress {
+			return true
+		}
+	}
+	return false
 }
 
 // getExpectedISCSITargets returns a map of IQNs that have corresponding staged volumes.

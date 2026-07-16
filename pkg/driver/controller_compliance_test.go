@@ -241,16 +241,29 @@ func TestCreateVolumeCloneExpansionFailure(t *testing.T) {
 
 type cloneWaitErrorClient struct {
 	*truenas.MockClient
+	datasetDeletes  []string
+	snapshotDeletes []string
 }
 
 func (m *cloneWaitErrorClient) WaitForZvolReady(context.Context, string, time.Duration) (*truenas.Dataset, error) {
 	return nil, errors.New("injected readiness failure")
 }
 
+func (m *cloneWaitErrorClient) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
+	m.datasetDeletes = append(m.datasetDeletes, name)
+	return m.MockClient.DatasetDelete(ctx, name, recursive, force)
+}
+
+func (m *cloneWaitErrorClient) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
+	m.snapshotDeletes = append(m.snapshotDeletes, snapshotID)
+	return m.MockClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
+}
+
 func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 	tests := []struct {
-		name   string
-		source *csi.VolumeContentSource
+		name                string
+		source              *csi.VolumeContentSource
+		wantSnapshotCleanup bool
 	}{
 		{
 			name: "snapshot clone",
@@ -263,6 +276,7 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
 				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "source"},
 			}},
+			wantSnapshotCleanup: true,
 		},
 	}
 
@@ -288,6 +302,13 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 
 			require.Error(t, err)
 			assert.Equal(t, codes.Internal, status.Code(err))
+			assert.Equal(t, []string{"pool/parent/clone-target"}, client.datasetDeletes)
+			if tc.wantSnapshotCleanup {
+				require.Len(t, client.snapshotDeletes, 1)
+				assert.Contains(t, client.snapshotDeletes[0], "pool/parent/source@clone-source-")
+			} else {
+				assert.Empty(t, client.snapshotDeletes, "a user-provided source snapshot must never be deleted")
+			}
 		})
 	}
 }

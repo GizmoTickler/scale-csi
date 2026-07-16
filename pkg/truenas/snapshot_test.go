@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,176 @@ import (
 // resetSnapshotAPIPrefix is retained for existing tests; prefix state is now
 // scoped to each newly-created client.
 func resetSnapshotAPIPrefix() {
+}
+
+func newSnapshotTestClient(t *testing.T, serverURL string) *Client {
+	t.Helper()
+	wsURL := strings.Replace(serverURL, "http://", "", 1)
+	parts := strings.Split(wsURL, ":")
+	port := 80
+	if len(parts) > 1 {
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
+	}
+	client, err := NewClient(&ClientConfig{
+		Host:           parts[0],
+		Port:           port,
+		Protocol:       "http",
+		APIKey:         "test-api-key",
+		Timeout:        5 * time.Second,
+		ConnectTimeout: 5 * time.Second,
+		MaxConnections: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func TestParseSnapshotTrueNAS26WireShape(t *testing.T) {
+	snapshot, err := parseSnapshot(map[string]interface{}{
+		"name":          "tank/k8s/volumes/pvc-123@snap-1",
+		"snapshot_name": "snap-1",
+		"dataset":       "tank/k8s/volumes/pvc-123",
+		"pool":          "tank",
+		"type":          "SNAPSHOT",
+		"createtxg":     "331921",
+		"properties":    map[string]interface{}{},
+		"user_properties": map[string]interface{}{
+			"truenas-csi:managed_resource": "true",
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "tank/k8s/volumes/pvc-123@snap-1", snapshot.ID)
+	assert.Equal(t, "snap-1", snapshot.Name)
+	assert.Equal(t, uint64(331921), snapshot.CreateTXG)
+	assert.Equal(t, "true", snapshot.UserProperties["truenas-csi:managed_resource"].Value)
+}
+
+func TestSnapshotResourceQueryTrueNAS26FlatUserPropertiesAndDetectionCache(t *testing.T) {
+	mock := newMockWSServer()
+	var probeCalls atomic.Int32
+	var queryCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case snapshotResourceQueryMethod:
+				options := req.Params[0].(map[string]interface{})
+				paths := options["paths"].([]interface{})
+				if len(paths) == 0 {
+					probeCalls.Add(1)
+					resp.Result = []interface{}{}
+					break
+				}
+				queryCalls.Add(1)
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"name":          "tank/k8s/volumes/pvc-123@snap-1",
+						"snapshot_name": "snap-1",
+						"dataset":       "tank/k8s/volumes/pvc-123",
+						"pool":          "tank",
+						"type":          "SNAPSHOT",
+						"createtxg":     float64(331921),
+						"properties": map[string]interface{}{
+							"used":     map[string]interface{}{"parsed": float64(4096)},
+							"creation": map[string]interface{}{"rawvalue": "1700000000"},
+						},
+						"user_properties": map[string]interface{}{
+							"truenas-csi:managed_resource": "true",
+						},
+					},
+					map[string]interface{}{
+						"name":            "tank/k8s/volumes/other@wrong-dataset",
+						"snapshot_name":   "wrong-dataset",
+						"dataset":         "tank/k8s/volumes/other",
+						"properties":      map[string]interface{}{},
+						"user_properties": map[string]interface{}{},
+					},
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	for range 2 {
+		snapshots, err := client.SnapshotList(context.Background(), "tank/k8s/volumes/pvc-123")
+		require.NoError(t, err)
+		require.Len(t, snapshots, 1)
+		assert.Equal(t, "tank/k8s/volumes/pvc-123@snap-1", snapshots[0].ID)
+		assert.Equal(t, "snap-1", snapshots[0].Name)
+		assert.Equal(t, uint64(331921), snapshots[0].CreateTXG)
+		assert.Equal(t, "true", snapshots[0].UserProperties["truenas-csi:managed_resource"].Value)
+	}
+	snapshot, err := client.SnapshotGet(context.Background(), "tank/k8s/volumes/pvc-123@snap-1")
+	require.NoError(t, err)
+	assert.Equal(t, int64(4096), snapshot.GetSnapshotSize())
+	assert.Equal(t, int64(1700000000), snapshot.GetCreationTime())
+	assert.Equal(t, int32(1), probeCalls.Load())
+	assert.Equal(t, int32(3), queryCalls.Load())
+}
+
+func TestSnapshotResourceQueryTrueNAS26RecursiveFilteringAndPagination(t *testing.T) {
+	mock := newMockWSServer()
+	optionsSeen := make(chan map[string]interface{}, 2)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case snapshotResourceQueryMethod:
+				options := req.Params[0].(map[string]interface{})
+				if len(options["paths"].([]interface{})) == 0 {
+					resp.Result = []interface{}{}
+					break
+				}
+				optionsSeen <- options
+				resp.Result = []interface{}{
+					map[string]interface{}{"name": "tank/k8s/volumes/pvc-b@snap-b", "snapshot_name": "snap-b", "dataset": "tank/k8s/volumes/pvc-b", "properties": map[string]interface{}{}, "user_properties": map[string]interface{}{}},
+					map[string]interface{}{"name": "tank/k8s/volumes@parent", "snapshot_name": "parent", "dataset": "tank/k8s/volumes", "properties": map[string]interface{}{}, "user_properties": map[string]interface{}{}},
+					map[string]interface{}{"name": "tank/k8s/volumes-other@outside", "snapshot_name": "outside", "dataset": "tank/k8s/volumes-other", "properties": map[string]interface{}{}, "user_properties": map[string]interface{}{}},
+					map[string]interface{}{"name": "tank/k8s/volumes/pvc-a@target-snap", "snapshot_name": "target-snap", "dataset": "tank/k8s/volumes/pvc-a", "properties": map[string]interface{}{}, "user_properties": map[string]interface{}{"truenas-csi:managed_resource": "true"}},
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	snapshots, err := client.SnapshotListAll(context.Background(), "tank/k8s/volumes", 1, 1)
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "tank/k8s/volumes/pvc-b@snap-b", snapshots[0].ID)
+	snapshot, err := client.SnapshotFindByName(context.Background(), "tank/k8s/volumes", "target-snap")
+	require.NoError(t, err)
+	require.NotNil(t, snapshot)
+	assert.Equal(t, "true", snapshot.UserProperties["truenas-csi:managed_resource"].Value)
+
+	for range 2 {
+		options := <-optionsSeen
+		assert.Equal(t, true, options["recursive"])
+		assert.Equal(t, []interface{}{"used", "creation"}, options["properties"])
+	}
 }
 
 // TestSnapshotCreate_Success tests creating a snapshot
@@ -746,6 +917,7 @@ func TestSnapshotList_Success(t *testing.T) {
 func TestSnapshotListAll_Success(t *testing.T) {
 	resetSnapshotAPIPrefix()
 	mock := newMockWSServer()
+	queryParams := make(chan []interface{}, 1)
 	server := mock.start(func(conn *websocket.Conn) {
 		for {
 			var req rpcTestRequest
@@ -761,6 +933,11 @@ func TestSnapshotListAll_Success(t *testing.T) {
 			case "auth.login_with_api_key":
 				resp.Result = true
 			case "pool.snapshot.query":
+				if len(req.Params) > 0 {
+					if filters, ok := req.Params[0].([]interface{}); ok && len(filters) > 0 {
+						queryParams <- req.Params
+					}
+				}
 				resp.Result = []interface{}{
 					map[string]interface{}{
 						"id":              "tank/k8s/volumes/pvc-1@snap",
@@ -825,12 +1002,17 @@ func TestSnapshotListAll_Success(t *testing.T) {
 	snapshots, err := client.SnapshotListAll(ctx, "tank/k8s/volumes", 0, 0)
 	require.NoError(t, err)
 	assert.Len(t, snapshots, 3)
+	params := <-queryParams
+	filters := params[0].([]interface{})
+	datasetFilter := filters[0].([]interface{})
+	assert.Equal(t, []interface{}{"dataset", "^", "tank/k8s/volumes/"}, datasetFilter)
 }
 
 // TestSnapshotFindByName_Success tests finding a snapshot by name
 func TestSnapshotFindByName_Success(t *testing.T) {
 	resetSnapshotAPIPrefix()
 	mock := newMockWSServer()
+	queryParams := make(chan []interface{}, 1)
 	server := mock.start(func(conn *websocket.Conn) {
 		for {
 			var req rpcTestRequest
@@ -846,6 +1028,11 @@ func TestSnapshotFindByName_Success(t *testing.T) {
 			case "auth.login_with_api_key":
 				resp.Result = true
 			case "pool.snapshot.query":
+				if len(req.Params) > 0 {
+					if filters, ok := req.Params[0].([]interface{}); ok && len(filters) > 0 {
+						queryParams <- req.Params
+					}
+				}
 				resp.Result = []interface{}{
 					map[string]interface{}{
 						"id":              "tank/k8s/volumes/pvc-find@target-snap",
@@ -893,6 +1080,10 @@ func TestSnapshotFindByName_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, snap)
 	assert.Equal(t, "target-snap", snap.Name)
+	params := <-queryParams
+	filters := params[0].([]interface{})
+	datasetFilter := filters[0].([]interface{})
+	assert.Equal(t, []interface{}{"dataset", "^", "tank/k8s/volumes/"}, datasetFilter)
 }
 
 // TestSnapshotFindByName_NotFound tests finding a snapshot that doesn't exist
@@ -1287,6 +1478,27 @@ func TestSnapshot_GetSnapshotSize(t *testing.T) {
 			},
 			expected: 0,
 		},
+		{
+			// TrueNAS 26.0 zfs.resource.snapshot.query shape (live-probed)
+			name: "with 26.0 numeric value and raw",
+			properties: map[string]interface{}{
+				"used": map[string]interface{}{
+					"value":  float64(2723840),
+					"raw":    "2723840",
+					"source": nil,
+				},
+			},
+			expected: 2723840,
+		},
+		{
+			name: "with 26.0 raw string only",
+			properties: map[string]interface{}{
+				"used": map[string]interface{}{
+					"raw": "4096",
+				},
+			},
+			expected: 4096,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1337,6 +1549,27 @@ func TestSnapshot_GetCreationTime(t *testing.T) {
 			name:       "without creation property",
 			properties: map[string]interface{}{},
 			expected:   0,
+		},
+		{
+			// TrueNAS 26.0 zfs.resource.snapshot.query shape (live-probed)
+			name: "with 26.0 numeric value and raw",
+			properties: map[string]interface{}{
+				"creation": map[string]interface{}{
+					"value":  float64(1754693322),
+					"raw":    "1754693322",
+					"source": nil,
+				},
+			},
+			expected: 1754693322,
+		},
+		{
+			name: "with 26.0 raw string only",
+			properties: map[string]interface{}{
+				"creation": map[string]interface{}{
+					"raw": "1700000001",
+				},
+			},
+			expected: 1700000001,
 		},
 	}
 

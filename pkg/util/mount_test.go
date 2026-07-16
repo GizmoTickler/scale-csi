@@ -29,11 +29,28 @@ case "$name" in
 		exit 0
 		;;
 	findmnt)
+		case "$*" in
+			"-n -o FSTYPE --mountpoint "*)
+				if [ -n "$FAKE_MOUNT_FSTYPE" ]; then
+					printf '%s' "$FAKE_MOUNT_FSTYPE"
+					exit 0
+				fi
+				exit 1
+				;;
+		esac
 		if [ -n "$FAKE_FINDMNT_OUTPUT" ]; then
 			printf '%s' "$FAKE_FINDMNT_OUTPUT"
 			exit 0
 		fi
 		exit 1
+		;;
+	umount)
+		if [ "$1" = "-l" ]; then
+			printf '%s' "${FAKE_LAZY_UMOUNT_OUTPUT:-}"
+			exit "${FAKE_LAZY_UMOUNT_EXIT:-0}"
+		fi
+		printf '%s' "${FAKE_UMOUNT_OUTPUT:-}"
+		exit "${FAKE_UMOUNT_EXIT:-0}"
 		;;
 	*) exit 0 ;;
 esac
@@ -236,6 +253,71 @@ func TestBindMountReadOnlyRemountFailureCleansUp(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read-only bind remount failed")
 	assert.Contains(t, readCommandLog(t, logPath), "umount "+target)
+}
+
+func TestUnmountDeviceFailureIsSurfaced(t *testing.T) {
+	installFakeMountCommands(t, "findmnt", "umount")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	target := filepath.Join(t.TempDir(), "device-mount")
+	require.NoError(t, os.Mkdir(target, 0o750))
+	t.Setenv("FAKE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_FINDMNT_OUTPUT", "/dev/sda1 "+target+"\n")
+	t.Setenv("FAKE_MOUNT_FSTYPE", "ext4")
+	t.Setenv("FAKE_UMOUNT_EXIT", "1")
+	t.Setenv("FAKE_UMOUNT_OUTPUT", "Input/output error")
+
+	err := Unmount(target)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Input/output error")
+	assert.NotContains(t, readCommandLog(t, logPath), "umount -l ")
+}
+
+func TestUnmountNFSFailureUsesLazyFallback(t *testing.T) {
+	installFakeMountCommands(t, "findmnt", "umount")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	target := filepath.Join(t.TempDir(), "nfs-mount")
+	require.NoError(t, os.Mkdir(target, 0o750))
+	t.Setenv("FAKE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_FINDMNT_OUTPUT", "nas:/export "+target+"\n")
+	t.Setenv("FAKE_MOUNT_FSTYPE", "nfs4")
+	t.Setenv("FAKE_UMOUNT_EXIT", "1")
+	t.Setenv("FAKE_UMOUNT_OUTPUT", "Input/output error")
+
+	err := Unmount(target)
+	require.NoError(t, err)
+	commands := readCommandLog(t, logPath)
+	assert.Contains(t, commands, "umount "+target)
+	assert.Contains(t, commands, "umount -l "+target)
+}
+
+func TestParseProcMounts(t *testing.T) {
+	mounts := strings.Join([]string{
+		"overlay / overlay rw,relatime 0 0",
+		"nas:/exports/team\\040data /var/lib/kubelet/pods/team\\040data nfs4 rw,relatime 0 0",
+		"/dev/sda1 /var/lib/kubelet/pods/local ext4 rw,relatime 0 0",
+	}, "\n")
+
+	t.Run("unescapes spaces and returns nfs4", func(t *testing.T) {
+		entry, err := parseProcMounts(strings.NewReader(mounts), "/var/lib/kubelet/pods/team data")
+		require.NoError(t, err)
+		assert.Equal(t, "nas:/exports/team data", entry.source)
+		assert.Equal(t, "/var/lib/kubelet/pods/team data", entry.target)
+		assert.Equal(t, "nfs4", entry.fsType)
+	})
+
+	t.Run("ignores overlay noise", func(t *testing.T) {
+		entry, err := parseProcMounts(strings.NewReader(mounts), "/var/lib/kubelet/pods/local")
+		require.NoError(t, err)
+		assert.Equal(t, "/dev/sda1", entry.source)
+		assert.Equal(t, "ext4", entry.fsType)
+	})
+}
+
+func TestParseProcMountsPreservesNFSRemnantOnMalformedEntry(t *testing.T) {
+	entry, err := parseProcMounts(strings.NewReader("nas:/export /dead/nfs\n"), "/dead/nfs")
+	require.Error(t, err)
+	assert.Equal(t, "nas:/export", entry.source)
+	assert.True(t, isNFSMountSource(entry.source))
 }
 
 // buildBindMountArgs replicates the argument building logic from BindMount() for testing.

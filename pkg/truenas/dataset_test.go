@@ -52,6 +52,59 @@ func (m *mockWSServer) close() {
 	}
 }
 
+func TestDatasetHasDependentClonesUsesOriginProjection(t *testing.T) {
+	mock := newMockWSServer()
+	var queryCalls atomic.Int32
+	paramsSeen := make(chan []interface{}, 1)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.dataset.query":
+				queryCalls.Add(1)
+				paramsSeen <- req.Params
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"id":   "tank/external/clone",
+						"name": "tank/external/clone",
+						"origin": map[string]interface{}{
+							"value":    "tank/k8s/volumes/source@snap-1",
+							"parsed":   "tank/k8s/volumes/source@snap-1",
+							"rawvalue": "tank/k8s/volumes/source@snap-1",
+							"source":   "LOCAL",
+						},
+					},
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	hasClones, err := client.DatasetHasDependentClones(context.Background(), "tank/k8s/volumes/source")
+	require.NoError(t, err)
+	assert.True(t, hasClones)
+	assert.Equal(t, int32(1), queryCalls.Load())
+
+	params := <-paramsSeen
+	filters := params[0].([]interface{})
+	assert.Equal(t, []interface{}{"name", "^", "tank/"}, filters[0])
+	options := params[1].(map[string]interface{})
+	extra := options["extra"].(map[string]interface{})
+	assert.Equal(t, []interface{}{"origin"}, extra["properties"])
+}
+
 // rpcTestRequest mirrors rpcRequest for test JSON parsing
 type rpcTestRequest struct {
 	JSONRPC string        `json:"jsonrpc"`

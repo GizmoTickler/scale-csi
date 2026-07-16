@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,11 +11,23 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/util"
+)
+
+var (
+	nodeStatsSysfsRoot = "/sys"
+	nodeStatsStat      = func(path string) (uint32, uint64, error) {
+		var stat unix.Stat_t
+		if err := unix.Stat(path, &stat); err != nil {
+			return 0, 0, err
+		}
+		return uint32(stat.Mode), uint64(stat.Rdev), nil
+	}
 )
 
 // NodeGetCapabilities returns the capabilities of the node service.
@@ -119,7 +132,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	klog.Infof("NodeStageVolume: volumeID=%s, stagingPath=%s", volumeID, stagingPath)
 
 	// Lock on volume ID
-	lockKey := "node-stage:" + volumeID
+	lockKey := nodeVolumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress")
 	}
@@ -172,7 +185,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	klog.Infof("NodeUnstageVolume: volumeID=%s, stagingPath=%s", volumeID, stagingPath)
 
 	// Lock on volume ID
-	lockKey := "node-unstage:" + volumeID
+	lockKey := nodeVolumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress")
 	}
@@ -320,7 +333,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	klog.Infof("NodePublishVolume: volumeID=%s, targetPath=%s, stagingPath=%s", volumeID, targetPath, stagingPath)
 
 	// Lock on volume ID
-	lockKey := "node-publish:" + volumeID
+	lockKey := nodeVolumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress")
 	}
@@ -357,6 +370,34 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 
 	// Bind mount from staging path to target path
 	if stagingPath != "" {
+		if req.GetVolumeCapability() != nil && req.GetVolumeCapability().GetBlock() != nil {
+			devicePath, resolveErr := filepath.EvalSymlinks(stagingPath)
+			if resolveErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to resolve staged block device: %v", resolveErr)
+			}
+			if !strings.HasPrefix(devicePath, "/dev/") {
+				return nil, status.Errorf(codes.Internal, "staging path did not resolve to a block device: %s", devicePath)
+			}
+
+			target, openErr := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY, 0o640)
+			if openErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to create block target file: %v", openErr)
+			}
+			if closeErr := target.Close(); closeErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to close block target file: %v", closeErr)
+			}
+
+			blockMountOptions := []string{}
+			if readonly {
+				blockMountOptions = append(blockMountOptions, "ro")
+			}
+			if err := util.BindMount(devicePath, targetPath, blockMountOptions); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to bind mount block device: %v", err)
+			}
+			klog.Infof("Block volume %s published successfully at %s", volumeID, targetPath)
+			return &csi.NodePublishVolumeResponse{}, nil
+		}
+
 		if err := os.MkdirAll(targetPath, 0o750); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to create target path: %v", err)
 		}
@@ -403,7 +444,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	klog.Infof("NodeUnpublishVolume: volumeID=%s, targetPath=%s", volumeID, targetPath)
 
 	// Lock on volume ID
-	lockKey := "node-unpublish:" + volumeID
+	lockKey := nodeVolumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress")
 	}
@@ -447,15 +488,31 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 
 	klog.V(4).Infof("NodeGetVolumeStats: volumeID=%s, volumePath=%s", volumeID, volumePath)
 
-	// Check if path exists
-	if _, err := os.Stat(volumePath); os.IsNotExist(err) {
-		return nil, status.Errorf(codes.NotFound, "volume path not found: %s", volumePath)
+	devicePath, blockMode, err := resolveNodeStatsDevice(volumePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, status.Errorf(codes.NotFound, "volume path %s does not exist", volumePath)
+		}
+		return abnormalVolumeStatsResponse(fmt.Sprintf("failed to inspect volume path %s: %v", volumePath, err)), nil
+	}
+	if blockMode {
+		totalBytes, sizeErr := getNodeDeviceSize(devicePath)
+		if sizeErr != nil {
+			return abnormalVolumeStatsResponse(fmt.Sprintf("failed to get block device size for %s: %v", devicePath, sizeErr)), nil
+		}
+		return &csi.NodeGetVolumeStatsResponse{
+			Usage: []*csi.VolumeUsage{{
+				Total: totalBytes,
+				Unit:  csi.VolumeUsage_BYTES,
+			}},
+			VolumeCondition: &csi.VolumeCondition{Abnormal: false},
+		}, nil
 	}
 
 	// Get filesystem stats
-	stats, err := util.GetFilesystemStats(volumePath)
+	stats, err := getNodeFilesystemStats(volumePath)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get volume stats: %v", err)
+		return abnormalVolumeStatsResponse(fmt.Sprintf("failed to get filesystem stats for %s: %v", volumePath, err)), nil
 	}
 
 	return &csi.NodeGetVolumeStatsResponse{
@@ -473,7 +530,45 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 				Unit:      csi.VolumeUsage_INODES,
 			},
 		},
+		VolumeCondition: &csi.VolumeCondition{Abnormal: false},
 	}, nil
+}
+
+func abnormalVolumeStatsResponse(message string) *csi.NodeGetVolumeStatsResponse {
+	return &csi.NodeGetVolumeStatsResponse{
+		VolumeCondition: &csi.VolumeCondition{
+			Abnormal: true,
+			Message:  message,
+		},
+	}
+}
+
+func nodeStatsDevice(volumePath string) (devicePath string, blockMode bool, err error) {
+	mode, rdev, err := nodeStatsStat(volumePath)
+	if err != nil {
+		return "", false, err
+	}
+	if mode&unix.S_IFMT == unix.S_IFBLK {
+		return fmt.Sprintf("%d:%d", unix.Major(rdev), unix.Minor(rdev)), true, nil
+	}
+
+	return "", false, nil
+}
+
+func nodeStatsDeviceSize(deviceNumber string) (int64, error) {
+	sizePath := filepath.Join(nodeStatsSysfsRoot, "dev", "block", deviceNumber, "size")
+	data, err := os.ReadFile(sizePath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read block device size from %s: %w", sizePath, err)
+	}
+	sectors, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse block device size from %s: %w", sizePath, err)
+	}
+	if sectors < 0 {
+		return 0, fmt.Errorf("block device size from %s is negative", sizePath)
+	}
+	return sectors * 512, nil
 }
 
 // NodeExpandVolume expands a volume on the node.
@@ -486,6 +581,12 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 	}
 
 	klog.Infof("NodeExpandVolume: volumeID=%s, volumePath=%s", volumeID, volumePath)
+
+	lockKey := nodeVolumeLockKey(volumeID)
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress")
+	}
+	defer d.releaseOperationLock(lockKey)
 
 	capacityBytes := int64(0)
 	if req.GetCapacityRange() != nil {
@@ -565,6 +666,10 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 	return &csi.NodeExpandVolumeResponse{
 		CapacityBytes: capacityBytes,
 	}, nil
+}
+
+func nodeVolumeLockKey(volumeID string) string {
+	return "node:" + volumeID
 }
 
 func resolveNodeExpansionDevice(req *csi.NodeExpandVolumeRequest) (devicePath string, rawBlock bool, err error) {
@@ -693,20 +798,24 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 	// or when a previous unstage failed to clean up properly.
 	existingIQN, err := util.FindISCSISessionByIQNFromSessions(iqn, sessions)
 	if err == nil && existingIQN != "" {
-		klog.Infof("Found existing iSCSI session for %s, disconnecting before reconnect", iqn)
-		if disconnectErr := util.ISCSIDisconnect(portal, existingIQN); disconnectErr != nil {
-			klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingIQN, disconnectErr)
-		}
-		cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
-		if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
-			sessions, listErr = util.ListISCSISessions()
-			if listErr != nil {
-				return true, listErr
+		if liveDevicePath, live := stagedDevicePath(stagingPath); live {
+			klog.Infof("Skipping pre-emptive iSCSI disconnect for %s: staged device %s is still live", iqn, liveDevicePath)
+		} else {
+			klog.Infof("Found existing iSCSI session for %s, disconnecting before reconnect", iqn)
+			if disconnectErr := util.ISCSIDisconnect(portal, existingIQN); disconnectErr != nil {
+				klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingIQN, disconnectErr)
 			}
-			_, findErr := util.FindISCSISessionByIQNFromSessions(iqn, sessions)
-			return findErr == nil, nil
-		}); pollErr != nil {
-			klog.V(4).Infof("iSCSI session cleanup poll for %s ended with: %v", iqn, pollErr)
+			cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
+			if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
+				sessions, listErr = util.ListISCSISessions()
+				if listErr != nil {
+					return true, listErr
+				}
+				_, findErr := util.FindISCSISessionByIQNFromSessions(iqn, sessions)
+				return findErr == nil, nil
+			}); pollErr != nil {
+				klog.V(4).Infof("iSCSI session cleanup poll for %s ended with: %v", iqn, pollErr)
+			}
 		}
 	}
 
@@ -794,20 +903,24 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	// or when a previous unstage failed to clean up properly.
 	existingNQN, err := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
 	if err == nil && existingNQN != "" {
-		klog.Infof("Found existing NVMe-oF session for %s, disconnecting before reconnect", nqn)
-		if disconnectErr := util.NVMeoFDisconnect(existingNQN); disconnectErr != nil {
-			klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingNQN, disconnectErr)
-		}
-		cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
-		if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
-			subsystems, listErr = util.ListNVMeSubsystems(ctx)
-			if listErr != nil {
-				return true, listErr
+		if liveDevicePath, live := stagedDevicePath(stagingPath); live {
+			klog.Infof("Skipping pre-emptive NVMe-oF disconnect for %s: staged device %s is still live", nqn, liveDevicePath)
+		} else {
+			klog.Infof("Found existing NVMe-oF session for %s, disconnecting before reconnect", nqn)
+			if disconnectErr := util.NVMeoFDisconnect(existingNQN); disconnectErr != nil {
+				klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingNQN, disconnectErr)
 			}
-			_, findErr := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
-			return findErr == nil, nil
-		}); pollErr != nil {
-			klog.V(4).Infof("NVMe-oF session cleanup poll for %s ended with: %v", nqn, pollErr)
+			cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
+			if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
+				subsystems, listErr = util.ListNVMeSubsystems(ctx)
+				if listErr != nil {
+					return true, listErr
+				}
+				_, findErr := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
+				return findErr == nil, nil
+			}); pollErr != nil {
+				klog.V(4).Infof("NVMe-oF session cleanup poll for %s ended with: %v", nqn, pollErr)
+			}
 		}
 	}
 
@@ -858,6 +971,21 @@ func stagedBlockDevicePath(stagingPath string) (string, bool) {
 		return "", false
 	}
 
+	return devicePath, true
+}
+
+func stagedDevicePath(stagingPath string) (string, bool) {
+	if devicePath, ok := stagedBlockDevicePath(stagingPath); ok {
+		return devicePath, true
+	}
+
+	devicePath, err := util.GetDeviceFromMountPoint(stagingPath)
+	if err != nil || !strings.HasPrefix(devicePath, "/dev/") {
+		return "", false
+	}
+	if _, err := os.Stat(devicePath); err != nil {
+		return "", false
+	}
 	return devicePath, true
 }
 

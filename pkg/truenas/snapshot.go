@@ -4,11 +4,87 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	"k8s.io/klog/v2"
 )
+
+const snapshotResourceQueryMethod = "zfs.resource.snapshot.query"
+
+// hasSnapshotResourceQuery detects the TrueNAS 26.0 snapshot resource API.
+// Successful and method-not-found probes are cached; transient failures are
+// deliberately retried on the next read. Concurrent callers share one probe.
+func (c *Client) hasSnapshotResourceQuery(ctx context.Context) bool {
+	c.snapshotResourceMu.Lock()
+	if c.snapshotResourceDetected {
+		available := c.snapshotResourceAvailable
+		c.snapshotResourceMu.Unlock()
+		return available
+	}
+	if probeDone := c.snapshotResourceProbeDone; probeDone != nil {
+		c.snapshotResourceMu.Unlock()
+		select {
+		case <-probeDone:
+			c.snapshotResourceMu.Lock()
+			available := c.snapshotResourceDetected && c.snapshotResourceAvailable
+			c.snapshotResourceMu.Unlock()
+			return available
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	probeDone := make(chan struct{})
+	c.snapshotResourceProbeDone = probeDone
+	c.snapshotResourceMu.Unlock()
+
+	_, err := c.Call(ctx, snapshotResourceQueryMethod, snapshotResourceQueryOptions(nil, false, nil))
+	detected := err == nil || isMethodNotFoundError(err)
+	available := err == nil
+
+	c.snapshotResourceMu.Lock()
+	if detected && !c.snapshotResourceDetected {
+		c.snapshotResourceDetected = true
+		c.snapshotResourceAvailable = available
+	}
+	c.snapshotResourceProbeDone = nil
+	close(probeDone)
+	available = c.snapshotResourceDetected && c.snapshotResourceAvailable
+	c.snapshotResourceMu.Unlock()
+
+	if available {
+		klog.V(2).Infof("Detected TrueNAS 26.0 snapshot resource API")
+	} else if err != nil && !detected {
+		klog.Warningf("Could not detect snapshot resource API, using legacy snapshot reads: %v", err)
+	}
+	return available
+}
+
+func isMethodNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Code == -32601 {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "method not found") || strings.Contains(message, "method does not exist")
+}
+
+func snapshotResourceQueryOptions(paths []string, recursive bool, properties []string) map[string]interface{} {
+	if paths == nil {
+		paths = []string{}
+	}
+	return map[string]interface{}{
+		"paths":               paths,
+		"recursive":           recursive,
+		"properties":          properties,
+		"get_user_properties": true,
+	}
+}
 
 // ErrSnapshotHasClones is returned when a snapshot cannot be deleted because it has dependent clones.
 // The caller should inspect the Clones field to determine how to proceed.
@@ -91,6 +167,7 @@ func (c *Client) snapshotMethod(ctx context.Context, operation string) string {
 type Snapshot struct {
 	ID             string                  `json:"id"`
 	Name           string                  `json:"name"`
+	CreateTXG      uint64                  `json:"createtxg"`
 	Dataset        string                  `json:"dataset"`
 	Pool           string                  `json:"pool"`
 	Type           string                  `json:"type"`
@@ -177,6 +254,23 @@ func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, 
 
 // SnapshotGet retrieves a snapshot by ID (dataset@snapshot format).
 func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error) {
+	if c.hasSnapshotResourceQuery(ctx) {
+		dataset, _, ok := strings.Cut(snapshotID, "@")
+		if !ok || dataset == "" {
+			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
+		}
+		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, []string{"used", "creation"})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get snapshot: %w", err)
+		}
+		for _, snap := range snapshots {
+			if snap.ID == snapshotID {
+				return snap, nil
+			}
+		}
+		return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
+	}
+
 	result, err := c.Call(ctx, c.snapshotMethod(ctx, "get_instance"), snapshotID)
 	if err != nil {
 		// Log full error details before fallback logic (helps debug ambiguous errors)
@@ -199,6 +293,20 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 
 // SnapshotList lists snapshots for a dataset.
 func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
+	if c.hasSnapshotResourceQuery(ctx) {
+		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list snapshots: %w", err)
+		}
+		filtered := snapshots[:0]
+		for _, snap := range snapshots {
+			if snap.Dataset == dataset {
+				filtered = append(filtered, snap)
+			}
+		}
+		return filtered, nil
+	}
+
 	filters := [][]interface{}{{"dataset", "=", dataset}}
 
 	result, err := c.Call(ctx, c.snapshotMethod(ctx, "query"), filters, map[string]interface{}{})
@@ -225,7 +333,24 @@ func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot,
 
 // SnapshotListAll lists all snapshots under a parent dataset (recursive).
 func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error) {
-	filters := [][]interface{}{{"dataset", "^", parentDataset}}
+	if c.hasSnapshotResourceQuery(ctx) {
+		parentDataset = strings.TrimSuffix(parentDataset, "/")
+		snapshots, err := c.querySnapshotResources(ctx, []string{parentDataset}, true, []string{"used", "creation"})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list snapshots: %w", err)
+		}
+		filtered := snapshots[:0]
+		prefix := parentDataset + "/"
+		for _, snap := range snapshots {
+			if snap.Dataset != parentDataset && strings.HasPrefix(snap.Dataset, prefix) {
+				filtered = append(filtered, snap)
+			}
+		}
+		sort.SliceStable(filtered, func(i, j int) bool { return filtered[i].ID < filtered[j].ID })
+		return paginateSnapshots(filtered, limit, offset), nil
+	}
+
+	filters := [][]interface{}{{"dataset", "^", strings.TrimSuffix(parentDataset, "/") + "/"}}
 
 	options := map[string]interface{}{}
 	if limit > 0 {
@@ -261,11 +386,26 @@ func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limi
 // This is more efficient than SnapshotListAll + iteration (PERF-001 fix).
 // The name parameter is the snapshot name without the dataset prefix (e.g., "my-snapshot" not "pool/dataset@my-snapshot").
 func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error) {
+	if c.hasSnapshotResourceQuery(ctx) {
+		parentDataset = strings.TrimSuffix(parentDataset, "/")
+		snapshots, err := c.querySnapshotResources(ctx, []string{parentDataset}, true, []string{"used", "creation"})
+		if err != nil {
+			return nil, fmt.Errorf("failed to query snapshots: %w", err)
+		}
+		prefix := parentDataset + "/"
+		for _, snap := range snapshots {
+			if snap.Dataset != parentDataset && strings.HasPrefix(snap.Dataset, prefix) && snap.Name == name {
+				return snap, nil
+			}
+		}
+		return nil, nil
+	}
+
 	// Build the full snapshot ID pattern to match: any dataset under parentDataset + @ + name
 	// We use "id" filter with regex match to find the snapshot regardless of its parent dataset
 	// The pattern matches any string ending with "@" + name
 	filters := [][]interface{}{
-		{"dataset", "^", parentDataset},
+		{"dataset", "^", strings.TrimSuffix(parentDataset, "/") + "/"},
 		{"id", "~", fmt.Sprintf(".*@%s$", name)},
 	}
 
@@ -284,6 +424,40 @@ func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name str
 	}
 
 	return parseSnapshot(items[0])
+}
+
+func (c *Client) querySnapshotResources(ctx context.Context, paths []string, recursive bool, properties []string) ([]*Snapshot, error) {
+	result, err := c.Call(ctx, snapshotResourceQueryMethod, snapshotResourceQueryOptions(paths, recursive, properties))
+	if err != nil {
+		return nil, err
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type")
+	}
+	snapshots := make([]*Snapshot, 0, len(items))
+	for _, item := range items {
+		snap, parseErr := parseSnapshot(item)
+		if parseErr != nil {
+			continue
+		}
+		snapshots = append(snapshots, snap)
+	}
+	return snapshots, nil
+}
+
+func paginateSnapshots(snapshots []*Snapshot, limit, offset int) []*Snapshot {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(snapshots) {
+		return []*Snapshot{}
+	}
+	end := len(snapshots)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	return snapshots[offset:end]
 }
 
 // SnapshotSetUserProperty sets a user property on a snapshot.
@@ -350,6 +524,15 @@ func parseSnapshot(data interface{}) (*Snapshot, error) {
 	}
 	if v, ok := m["name"].(string); ok {
 		snap.Name = v
+		if snap.ID == "" && strings.Contains(v, "@") {
+			snap.ID = v
+		}
+	}
+	if v, ok := m["snapshot_name"].(string); ok {
+		snap.Name = v
+	}
+	if v, ok := unsignedInteger(m["createtxg"]); ok {
+		snap.CreateTXG = v
 	}
 	if v, ok := m["dataset"].(string); ok {
 		snap.Dataset = v
@@ -359,6 +542,9 @@ func parseSnapshot(data interface{}) (*Snapshot, error) {
 	}
 	if v, ok := m["type"].(string); ok {
 		snap.Type = v
+	}
+	if snap.ID == "" && snap.Dataset != "" && snap.Name != "" {
+		snap.ID = snap.Dataset + "@" + snap.Name
 	}
 
 	// Parse properties
@@ -384,12 +570,15 @@ func parseSnapshot(data interface{}) (*Snapshot, error) {
 	// Parse user properties (if explicitly returned in separate field)
 	if userProps, ok := m["user_properties"].(map[string]interface{}); ok {
 		for key, val := range userProps {
-			if propMap, ok := val.(map[string]interface{}); ok {
+			switch propValue := val.(type) {
+			case string:
+				snap.UserProperties[key] = UserProperty{Value: propValue}
+			case map[string]interface{}:
 				prop := UserProperty{}
-				if v, ok := propMap["value"].(string); ok {
+				if v, ok := propValue["value"].(string); ok {
 					prop.Value = v
 				}
-				if v, ok := propMap["source"].(string); ok {
+				if v, ok := propValue["source"].(string); ok {
 					prop.Source = v
 				}
 				snap.UserProperties[key] = prop
@@ -400,12 +589,48 @@ func parseSnapshot(data interface{}) (*Snapshot, error) {
 	return snap, nil
 }
 
+func unsignedInteger(value interface{}) (uint64, bool) {
+	switch v := value.(type) {
+	case float64:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	case int:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	case int64:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	case uint64:
+		return v, true
+	case string:
+		parsed, err := strconv.ParseUint(v, 10, 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
 // GetSnapshotSize returns the size of a snapshot in bytes.
 func (snap *Snapshot) GetSnapshotSize() int64 {
 	if used, ok := snap.Properties["used"]; ok {
 		if usedMap, ok := used.(map[string]interface{}); ok {
 			if parsed, ok := usedMap["parsed"].(float64); ok {
 				return int64(parsed)
+			}
+			// TrueNAS 26.0 zfs.resource.snapshot.query shape: {"value": <number>, "raw": "<string>"}
+			if value, ok := usedMap["value"].(float64); ok {
+				return int64(value)
+			}
+			if raw, ok := usedMap["raw"].(string); ok {
+				if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
+					return v
+				}
 			}
 		}
 	}
@@ -432,12 +657,23 @@ func (snap *Snapshot) GetCreationTime() int64 {
 					return ts
 				}
 			}
+			// TrueNAS 26.0 zfs.resource.snapshot.query shape: {"value": <number>, "raw": "<string>"}
+			if value, ok := creationMap["value"].(float64); ok {
+				return int64(value)
+			}
+			if raw, ok := creationMap["raw"].(string); ok {
+				if ts, err := strconv.ParseInt(raw, 10, 64); err == nil {
+					return ts
+				}
+			}
 		}
 	}
 	return 0
 }
 
 // GetClones returns a list of clone dataset names that were created from this snapshot.
+// TrueNAS 26.0 no longer projects clones through either snapshot read API; callers
+// that require an authoritative dependency check must use DatasetHasDependentClones.
 func (snap *Snapshot) GetClones() []string {
 	if clones, ok := snap.Properties["clones"]; ok {
 		if clonesMap, ok := clones.(map[string]interface{}); ok {

@@ -87,6 +87,40 @@ func TestExpectedSessionsIncludeStagedBlockSymlinks(t *testing.T) {
 	})
 }
 
+func TestNVMeSessionMatchesTransportAddress(t *testing.T) {
+	tests := []struct {
+		name           string
+		sessionAddress string
+		targetAddress  string
+		want           bool
+	}{
+		{
+			name:           "exact traddr",
+			sessionAddress: "traddr=192.168.120.10,trsvcid=4420,src_addr=192.168.122.10",
+			targetAddress:  "192.168.120.10",
+			want:           true,
+		},
+		{
+			name:           "prefix overlap",
+			sessionAddress: "traddr=192.168.120.100,trsvcid=4420",
+			targetAddress:  "192.168.120.10",
+			want:           false,
+		},
+		{
+			name:           "source address collision",
+			sessionAddress: "traddr=10.0.0.20,trsvcid=4420,src_addr=192.168.120.10",
+			targetAddress:  "192.168.120.10",
+			want:           false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, nvmeSessionMatchesTransportAddress(tc.sessionAddress, tc.targetAddress))
+		})
+	}
+}
+
 // TestGetExpectedNVMeoFNQNs_FailedLookupsThreshold tests that getExpectedNVMeoFNQNs
 // returns nil when too many NVMe device lookups fail, preventing false positive GC.
 func TestGetExpectedNVMeoFNQNs_FailedLookupsThreshold(t *testing.T) {

@@ -30,6 +30,7 @@ const (
 	PropVolumeContentSourceType   = "truenas-csi:csi_volume_content_source_type"
 	PropVolumeContentSourceID     = "truenas-csi:csi_volume_content_source_id"
 	PropVolumeOriginSnapshot      = "truenas-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
+	PropInternalResource          = "truenas-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
 	PropCSISnapshotName           = "truenas-csi:csi_snapshot_name"
 	PropCSISnapshotSourceVolumeID = "truenas-csi:csi_snapshot_source_volume_id"
 	PropNFSShareID                = "truenas-csi:truenas_nfs_share_id"
@@ -48,6 +49,18 @@ func isDatasetDependencyOrBusyError(err error) bool {
 	message := strings.ToLower(err.Error())
 	for _, marker := range []string{"busy", "dependent", "snapshot", "has children", "method call error"} {
 		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func snapshotBlocksVolumeDeletion(snap *truenas.Snapshot) bool {
+	if snap == nil {
+		return false
+	}
+	for _, key := range []string{PropManagedResource, PropInternalResource} {
+		if prop, ok := snap.UserProperties[key]; ok && prop.Value == "true" {
 			return true
 		}
 	}
@@ -471,20 +484,33 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 	}
 
-	// IMPORTANT: Check for dependent CSI-managed snapshots BEFORE deleting the
+	// IMPORTANT: Check for snapshots that can block dataset deletion BEFORE deleting the
 	// share. The share must be deleted before the dataset (extents block zvol
 	// deletion), so bailing after share deletion would leave a volume that
 	// still exists but is inaccessible, with no path that re-creates its share.
-	// This costs one query on every delete; the dependency-error fallback after
-	// DatasetDelete below stays as a second line of defense.
+	// The snapshot and dataset-origin checks each cost one query on every delete;
+	// the dependency-error fallback after DatasetDelete stays as a second line
+	// of defense.
+	hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
+	if cloneErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"failed to verify clone dependencies for volume %s before share deletion: %v", volumeID, cloneErr)
+	}
+	if hasDependentClones {
+		klog.Infof("Volume %s has a dependent clone, cannot delete", volumeID)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"volume %s has dependent clones that must be deleted first", volumeID)
+	}
 	snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
-	if snapErr == nil {
-		for _, snap := range snapshots {
-			if prop, ok := snap.UserProperties[PropManagedResource]; ok && prop.Value == "true" {
-				klog.Infof("Volume %s has dependent CSI-managed snapshots, cannot delete", volumeID)
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"volume %s has dependent snapshots that must be deleted first", volumeID)
-			}
+	if snapErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"failed to verify snapshot dependencies for volume %s before share deletion: %v", volumeID, snapErr)
+	}
+	for _, snap := range snapshots {
+		if snapshotBlocksVolumeDeletion(snap) {
+			klog.Infof("Volume %s has a snapshot that blocks dataset deletion, cannot delete", volumeID)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"volume %s has dependent snapshots that must be deleted first", volumeID)
 		}
 	}
 
@@ -538,15 +564,28 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
 		}
+		// Re-check dataset origins for a clone created after the up-front guard,
+		// then classify snapshots. This remains authoritative on TrueNAS 26.0,
+		// where snapshot clone projections are empty.
+		hasDependentClones, cloneErr = d.truenasClient.DatasetHasDependentClones(ctx, datasetName)
+		if cloneErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"failed to verify clone dependencies for volume %s: %v", volumeID, cloneErr)
+		}
+		if hasDependentClones {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"volume %s has dependent clones that must be deleted first", volumeID)
+		}
+
 		// Check if there are CSI-managed snapshots that are blocking deletion
 		// TrueNAS returns various error messages: "Method call error", "has dependent clones", etc.
 		snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
 		switch {
 		case snapErr == nil && len(snapshots) > 0:
-			// Found snapshots - check if any are CSI-managed
+			// Found snapshots - check if any are managed or internal.
 			for _, snap := range snapshots {
-				if prop, ok := snap.UserProperties[PropManagedResource]; ok && prop.Value == "true" {
-					klog.Infof("Volume %s has dependent CSI-managed snapshots, cannot delete", volumeID)
+				if snapshotBlocksVolumeDeletion(snap) {
+					klog.Infof("Volume %s has a snapshot that blocks dataset deletion, cannot delete", volumeID)
 					return nil, status.Errorf(codes.FailedPrecondition,
 						"volume %s has dependent snapshots that must be deleted first", volumeID)
 				}
@@ -555,6 +594,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			klog.V(4).Infof("Volume %s has non-managed snapshots, deleting recursively", volumeID)
 			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); delErr != nil {
 				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, delErr)
+				if isDatasetDependencyOrBusyError(delErr) {
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"volume %s has dependent snapshot clones that must be deleted first: %v", volumeID, delErr)
+				}
 				return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", delErr)
 			}
 		case snapErr != nil:
@@ -562,6 +605,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			klog.V(4).Infof("Could not list snapshots for %s (%v), trying recursive delete", volumeID, snapErr)
 			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); delErr != nil {
 				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, delErr)
+				if isDatasetDependencyOrBusyError(delErr) {
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"volume %s has dependent snapshot clones that must be deleted first: %v", volumeID, delErr)
+				}
 				return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", delErr)
 			}
 		default:
@@ -780,15 +827,23 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 
 	klog.Infof("CreateSnapshot: name=%s, sourceVolumeID=%s", name, sourceVolumeID)
 
-	// Lock on snapshot name
-	lockKey := "snapshot:" + name
-	if !d.acquireOperationLock(lockKey) {
+	// Always acquire the source-volume lock before the snapshot lock. This
+	// serializes snapshot creation with DeleteVolume and gives all creators a
+	// fixed lock order.
+	volumeLockKey := "volume:" + sourceVolumeID
+	if !d.acquireOperationLock(volumeLockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
+	}
+	defer d.releaseOperationLock(volumeLockKey)
+
+	snapshotID := d.sanitizeVolumeID(name)
+	snapshotLockKey := "snapshot:" + snapshotID
+	if !d.acquireOperationLock(snapshotLockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this snapshot")
 	}
-	defer d.releaseOperationLock(lockKey)
+	defer d.releaseOperationLock(snapshotLockKey)
 
 	datasetName := path.Join(d.config.ZFS.DatasetParentName, sourceVolumeID)
-	snapshotID := d.sanitizeVolumeID(name)
 
 	// Create snapshot
 	snap, err := d.truenasClient.SnapshotCreate(ctx, datasetName, snapshotID)
@@ -887,6 +942,20 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 	if snap == nil {
 		klog.Infof("Snapshot %s not found, treating as already deleted", snapshotID)
 		return &csi.DeleteSnapshotResponse{}, nil
+	}
+
+	// The source is not encoded in the CSI snapshot ID. Once the snapshot has
+	// been resolved, serialize its deletion with operations on the source
+	// volume. If the dataset is outside the configured CSI parent, its source is
+	// unknown and the snapshot lock remains the only available guard.
+	parentPrefix := strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/") + "/"
+	if strings.HasPrefix(snap.Dataset, parentPrefix) {
+		sourceVolumeID := path.Base(snap.Dataset)
+		volumeLockKey := "volume:" + sourceVolumeID
+		if !d.acquireOperationLock(volumeLockKey) {
+			return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
+		}
+		defer d.releaseOperationLock(volumeLockKey)
 	}
 
 	if err := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); err != nil {
@@ -1394,9 +1463,11 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		// This is critical for iSCSI/NVMe-oF where extent creation needs the zvol
 		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
+			d.cleanupFailedClone(ctx, datasetName, "")
 			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
 		}
 		if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
+			d.cleanupFailedClone(ctx, datasetName, "")
 			return nil, err
 		}
 
@@ -1427,6 +1498,15 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 			return nil, status.Errorf(codes.Internal, "failed to create source snapshot: %v", err)
 		}
 		klog.V(4).Infof("Created temporary snapshot %s for volume clone", snap.ID)
+		// Internal snapshots are deliberately not marked as managed: ListSnapshots
+		// only exposes PropManagedResource=true. The distinct marker still lets
+		// DeleteVolume reject source deletion before its share is touched.
+		if setErr := d.truenasClient.SnapshotSetUserProperty(ctx, snap.ID, PropInternalResource, "true"); setErr != nil {
+			if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
+				klog.Warningf("Failed to cleanup source snapshot after property failure: %v", delErr)
+			}
+			return nil, status.Errorf(codes.Internal, "failed to mark source snapshot as internal: %v", setErr)
+		}
 
 		if cloneErr := d.truenasClient.SnapshotClone(ctx, snap.ID, datasetName); cloneErr != nil {
 			if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
@@ -1439,9 +1519,11 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		// Wait for cloned dataset to be ready
 		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
+			d.cleanupFailedClone(ctx, datasetName, snap.ID)
 			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
 		}
 		if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
+			d.cleanupFailedClone(ctx, datasetName, snap.ID)
 			return nil, err
 		}
 
@@ -1456,6 +1538,17 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 	}
 
 	return createdDS, nil
+}
+
+func (d *Driver) cleanupFailedClone(ctx context.Context, datasetName, tempSnapshotID string) {
+	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
+		klog.Warningf("Failed to cleanup clone dataset %s: %v", datasetName, err)
+	}
+	if tempSnapshotID != "" {
+		if err := d.truenasClient.SnapshotDelete(ctx, tempSnapshotID, false, false); err != nil {
+			klog.Warningf("Failed to cleanup temporary clone-source snapshot %s: %v", tempSnapshotID, err)
+		}
+	}
 }
 
 func (d *Driver) ensureCloneCapacity(ctx context.Context, datasetName string, ds *truenas.Dataset, capacityBytes int64) error {

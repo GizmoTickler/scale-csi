@@ -235,6 +235,15 @@ type Client struct {
 	snapshotPrefixMu        sync.Mutex
 	snapshotAPIPrefix       string
 	snapshotPrefixProbeDone chan struct{}
+
+	// TrueNAS 26.0 introduced zfs.resource.snapshot.query, which is the only
+	// snapshot read API that still exposes user properties. Keep this detection
+	// separate from the mutation API prefix because create/update/delete remain
+	// under pool.snapshot.*.
+	snapshotResourceMu        sync.Mutex
+	snapshotResourceAvailable bool
+	snapshotResourceDetected  bool
+	snapshotResourceProbeDone chan struct{}
 }
 
 // rpcRequest is a JSON-RPC 2.0 request.

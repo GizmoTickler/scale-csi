@@ -168,6 +168,21 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 	return list[offset:end], nil
 }
 
+func (m *MockClient) DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return false, m.InjectError
+	}
+	originPrefix := datasetName + "@"
+	for _, dataset := range m.Datasets {
+		if strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	return m.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
 }
@@ -369,6 +384,7 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetNa
 		UserProperties: make(map[string]UserProperty),
 	}
 	if snapshot, ok := m.Snapshots[snapshotID]; ok {
+		clone.Origin = DatasetProperty{Value: snapshotID, Parsed: snapshotID, Rawvalue: snapshotID, Source: "LOCAL"}
 		if source, ok := m.Datasets[snapshot.Dataset]; ok {
 			clone.Type = source.Type
 			clone.Mountpoint = source.Mountpoint

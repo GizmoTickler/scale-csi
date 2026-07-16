@@ -2,12 +2,15 @@
 package util
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -146,6 +149,12 @@ func UnmountWithContext(ctx context.Context, target string) error {
 	if !mounted {
 		return nil
 	}
+	fsType, fsTypeErr := getMountFilesystemType(target)
+	if fsTypeErr != nil {
+		// Unknown filesystem types are treated conservatively: a failed regular
+		// unmount will be surfaced rather than lazily detaching a device mount.
+		klog.Warningf("Could not determine filesystem type for %s: %v", target, fsTypeErr)
+	}
 
 	retryCfg := UnmountRetryConfig()
 
@@ -158,14 +167,20 @@ func UnmountWithContext(ctx context.Context, target string) error {
 		if err == nil {
 			return nil
 		}
+		unmountErr := fmt.Errorf("unmount failed: %w, output: %s", err, string(output))
 
-		// Check if it was a transient "busy" error before trying lazy unmount
-		if !IsRetryableError(err, retryCfg.RetryableErrors) {
-			// Not retryable with regular unmount, try lazy unmount as last resort
+		// Busy errors are retried by RetryWithBackoff. Lazy unmount is reserved
+		// for unreachable network filesystems; device-backed and unknown mounts
+		// must surface the original error before callers disconnect the session.
+		if !IsRetryableError(unmountErr, retryCfg.RetryableErrors) {
+			if !isNetworkFilesystem(fsType) {
+				return unmountErr
+			}
+			klog.Warningf("Regular unmount of network filesystem %s (%s) failed, trying lazy unmount: %v", target, fsType, unmountErr)
 			cmd = exec.CommandContext(cmdCtx, "umount", "-l", target)
 			if lazyOutput, lazyErr := cmd.CombinedOutput(); lazyErr != nil {
 				return errors.Join(
-					fmt.Errorf("unmount failed: %w, output: %s", err, string(output)),
+					unmountErr,
 					fmt.Errorf("lazy unmount failed: %w, output: %s", lazyErr, string(lazyOutput)),
 				)
 			}
@@ -173,8 +188,100 @@ func UnmountWithContext(ctx context.Context, target string) error {
 		}
 
 		// Return the error to trigger retry
-		return fmt.Errorf("unmount failed: %w, output: %s", err, string(output))
+		return unmountErr
 	})
+}
+
+func getMountFilesystemType(target string) (string, error) {
+	entry, procErr := readProcMountEntry("/proc/self/mounts", target)
+	if procErr == nil {
+		return entry.fsType, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, "findmnt", "-n", "-o", "FSTYPE", "--mountpoint", target).Output()
+	if err != nil {
+		findmntErr := fmt.Errorf("failed to query mount filesystem type with findmnt: %w", err)
+		if isNFSMountSource(entry.source) {
+			return "", fmt.Errorf("cannot safely classify NFS-looking mount source %q: %w", entry.source, errors.Join(procErr, findmntErr))
+		}
+		return "", errors.Join(procErr, findmntErr)
+	}
+	fsType := strings.TrimSpace(string(output))
+	if fsType == "" {
+		return "", errors.Join(procErr, errors.New("findmnt returned an empty filesystem type"))
+	}
+	return fsType, nil
+}
+
+type procMountEntry struct {
+	source string
+	target string
+	fsType string
+}
+
+func readProcMountEntry(path, target string) (procMountEntry, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return procMountEntry{}, fmt.Errorf("failed to open %s: %w", path, err)
+	}
+	defer func() { _ = file.Close() }()
+	return parseProcMounts(file, target)
+}
+
+func parseProcMounts(reader io.Reader, target string) (procMountEntry, error) {
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		entry := procMountEntry{
+			source: unescapeProcMountField(fields[0]),
+			target: unescapeProcMountField(fields[1]),
+		}
+		if entry.target != target {
+			continue
+		}
+		if len(fields) < 3 {
+			return entry, fmt.Errorf("mount entry for %s has no filesystem type", target)
+		}
+		entry.fsType = unescapeProcMountField(fields[2])
+		if entry.fsType == "" {
+			return entry, fmt.Errorf("mount entry for %s has an empty filesystem type", target)
+		}
+		return entry, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return procMountEntry{}, fmt.Errorf("failed to read proc mounts: %w", err)
+	}
+	return procMountEntry{}, fmt.Errorf("mountpoint %s not found in proc mounts", target)
+}
+
+func unescapeProcMountField(value string) string {
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\\' && i+3 < len(value) {
+			if decoded, err := strconv.ParseUint(value[i+1:i+4], 8, 8); err == nil {
+				builder.WriteByte(byte(decoded))
+				i += 3
+				continue
+			}
+		}
+		builder.WriteByte(value[i])
+	}
+	return builder.String()
+}
+
+func isNFSMountSource(source string) bool {
+	return strings.LastIndex(source, ":/") > 0
+}
+
+func isNetworkFilesystem(fsType string) bool {
+	return fsType == "nfs" || fsType == "nfs4"
 }
 
 // FormatAndMount formats a device and mounts it.

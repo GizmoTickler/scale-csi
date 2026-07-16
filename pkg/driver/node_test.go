@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -25,6 +27,10 @@ if [ -n "$FAKE_NODE_COMMAND_LOG" ]; then
 fi
 case "$name" in
 	findmnt)
+		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ] && [ -f "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
+			printf '%s' "${FAKE_NODE_FINDMNT_OUTPUT:-mounted}"
+			exit 0
+		fi
 		if [ -n "$FAKE_NODE_FINDMNT_OUTPUT" ]; then
 			printf '%s' "$FAKE_NODE_FINDMNT_OUTPUT"
 			exit 0
@@ -50,6 +56,18 @@ case "$name" in
 			exit 0
 		fi
 		exit 97
+		;;
+	mount)
+		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
+			: > "$FAKE_NODE_MOUNT_STATE_FILE"
+		fi
+		exit 0
+		;;
+	umount)
+		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
+			rm -f "$FAKE_NODE_MOUNT_STATE_FILE"
+		fi
+		exit 0
 		;;
 	*) exit 0 ;;
 esac
@@ -329,6 +347,50 @@ func TestNodePublishVolume_Validation(t *testing.T) {
 	})
 }
 
+func TestNodePublishUnpublishVolume_BlockRoundTrip(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "mount", "umount")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	mountStatePath := filepath.Join(t.TempDir(), "mounted")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_NODE_MOUNT_STATE_FILE", mountStatePath)
+
+	stagingPath := filepath.Join(t.TempDir(), "staged-device")
+	require.NoError(t, os.Symlink("/dev/null", stagingPath))
+	targetPath := filepath.Join(t.TempDir(), "pod", "volume")
+	d := newTestNodeDriver(ShareTypeISCSI)
+	req := &csi.NodePublishVolumeRequest{
+		VolumeId:          "block-vol",
+		StagingTargetPath: stagingPath,
+		TargetPath:        targetPath,
+		Readonly:          true,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		},
+	}
+
+	_, err := d.NodePublishVolume(context.Background(), req)
+	require.NoError(t, err)
+	info, err := os.Stat(targetPath)
+	require.NoError(t, err)
+	assert.True(t, info.Mode().IsRegular())
+	assert.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+
+	_, err = d.NodePublishVolume(context.Background(), req)
+	require.NoError(t, err)
+	commands := readNodeCommandLog(t, logPath)
+	assert.Equal(t, 1, strings.Count(commands, "mount -o bind,ro /dev/null "+targetPath))
+	assert.Equal(t, 1, strings.Count(commands, "mount -o remount,bind,ro "+targetPath))
+
+	_, err = d.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "block-vol",
+		TargetPath: targetPath,
+	})
+	require.NoError(t, err)
+	_, err = os.Lstat(targetPath)
+	assert.True(t, os.IsNotExist(err))
+	assert.Contains(t, readNodeCommandLog(t, logPath), "umount "+targetPath)
+}
+
 func TestNodeUnpublishVolume_Validation(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeNFS)
 
@@ -398,14 +460,92 @@ func TestNodeGetVolumeStats_Validation(t *testing.T) {
 			VolumePath: "/nonexistent/path/that/should/not/exist",
 		}
 
-		_, err := d.NodeGetVolumeStats(context.Background(), req)
+		resp, err := d.NodeGetVolumeStats(context.Background(), req)
 
 		require.Error(t, err)
-		st, ok := status.FromError(err)
-		require.True(t, ok)
-		assert.Equal(t, codes.NotFound, st.Code())
-		assert.Contains(t, st.Message(), "not found")
+		assert.Nil(t, resp)
+		assert.Equal(t, codes.NotFound, status.Code(err))
 	})
+}
+
+func TestNodeGetVolumeStats_BlockMode(t *testing.T) {
+	originalResolver := resolveNodeStatsDevice
+	originalDeviceSize := getNodeDeviceSize
+	originalStat := nodeStatsStat
+	originalSysfsRoot := nodeStatsSysfsRoot
+	t.Cleanup(func() {
+		resolveNodeStatsDevice = originalResolver
+		getNodeDeviceSize = originalDeviceSize
+		nodeStatsStat = originalStat
+		nodeStatsSysfsRoot = originalSysfsRoot
+	})
+	resolveNodeStatsDevice = nodeStatsDevice
+	getNodeDeviceSize = nodeStatsDeviceSize
+
+	volumePath := filepath.Join(t.TempDir(), "published-block-device")
+	require.NoError(t, os.WriteFile(volumePath, nil, 0o640))
+	nodeStatsStat = func(path string) (uint32, uint64, error) {
+		assert.Equal(t, volumePath, path)
+		return unix.S_IFBLK, unix.Mkdev(8, 1), nil
+	}
+	nodeStatsSysfsRoot = t.TempDir()
+	sizeDir := filepath.Join(nodeStatsSysfsRoot, "dev", "block", "8:1")
+	require.NoError(t, os.MkdirAll(sizeDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(sizeDir, "size"), []byte("16777216\n"), 0o640))
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId: "block-vol", VolumePath: volumePath,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Usage, 1)
+	assert.Equal(t, int64(8<<30), resp.Usage[0].Total)
+	assert.Equal(t, csi.VolumeUsage_BYTES, resp.Usage[0].Unit)
+	require.NotNil(t, resp.VolumeCondition)
+	assert.False(t, resp.VolumeCondition.Abnormal)
+}
+
+func TestNodeGetVolumeStats_FilesystemModeUnchanged(t *testing.T) {
+	originalResolver := resolveNodeStatsDevice
+	originalFilesystemStats := getNodeFilesystemStats
+	t.Cleanup(func() {
+		resolveNodeStatsDevice = originalResolver
+		getNodeFilesystemStats = originalFilesystemStats
+	})
+	resolveNodeStatsDevice = func(string) (string, bool, error) { return "", false, nil }
+	getNodeFilesystemStats = func(string) (*util.FilesystemStats, error) {
+		return &util.FilesystemStats{
+			TotalBytes: 100, AvailableBytes: 40, UsedBytes: 60,
+			TotalInodes: 10, AvailableInodes: 4, UsedInodes: 6,
+		}, nil
+	}
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId: "fs-vol", VolumePath: "/pods/fs-vol",
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Usage, 2)
+	assert.Equal(t, int64(100), resp.Usage[0].Total)
+	assert.Equal(t, int64(10), resp.Usage[1].Total)
+	assert.False(t, resp.VolumeCondition.Abnormal)
+}
+
+func TestNodeGetVolumeStats_StatFailureIsAbnormal(t *testing.T) {
+	originalResolver := resolveNodeStatsDevice
+	t.Cleanup(func() { resolveNodeStatsDevice = originalResolver })
+	resolveNodeStatsDevice = func(string) (string, bool, error) {
+		return "", false, errors.New("injected stat failure")
+	}
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId: "fs-vol", VolumePath: "/pods/fs-vol",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.VolumeCondition)
+	assert.True(t, resp.VolumeCondition.Abnormal)
+	assert.Contains(t, resp.VolumeCondition.Message, "injected stat failure")
 }
 
 func TestNodeExpandVolume_Validation(t *testing.T) {
@@ -720,6 +860,70 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 	})
 }
 
+func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
+	t.Run("iSCSI", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "iscsiadm")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:vol1 (non-flash)\n")
+
+		originalInfo := getISCSIInfoFromDeviceWithSessions
+		originalConnect := iscsiConnectWithSessions
+		t.Cleanup(func() {
+			getISCSIInfoFromDeviceWithSessions = originalInfo
+			iscsiConnectWithSessions = originalConnect
+		})
+		getISCSIInfoFromDeviceWithSessions = func(string, []util.ISCSISessionInfo) (string, string, error) {
+			return "", "", errors.New("transient sysfs miss")
+		}
+		iscsiConnectWithSessions = func(context.Context, string, string, int, *util.ISCSIConnectOptions, []util.ISCSISessionInfo) (string, error) {
+			return "/dev/null", nil
+		}
+
+		stagingPath := filepath.Join(t.TempDir(), "staging")
+		require.NoError(t, os.Symlink("/dev/null", stagingPath))
+		d := newTestNodeDriver(ShareTypeISCSI)
+		err := d.stageISCSIVolume(context.Background(), map[string]string{
+			"portal": "192.168.1.100:3260", "iqn": "iqn.test:vol1",
+		}, stagingPath, &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		})
+		require.NoError(t, err)
+		assert.NotContains(t, readNodeCommandLog(t, logPath), "--logout")
+	})
+
+	t.Run("NVMe-oF", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "nvme")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT", `{"Subsystems":[{"NQN":"nqn.test:vol1","Name":"nvme2","Paths":[{"Name":"nvme2"}]}]}`)
+
+		originalInfo := getNVMeInfoFromDevice
+		originalConnect := nvmeConnectWithSubsystems
+		t.Cleanup(func() {
+			getNVMeInfoFromDevice = originalInfo
+			nvmeConnectWithSubsystems = originalConnect
+		})
+		getNVMeInfoFromDevice = func(string) (string, error) {
+			return "", errors.New("transient sysfs miss")
+		}
+		nvmeConnectWithSubsystems = func(string, string, *util.NVMeoFConnectOptions, []util.NVMeSubsystem) (string, error) {
+			return "/dev/null", nil
+		}
+
+		stagingPath := filepath.Join(t.TempDir(), "staging")
+		require.NoError(t, os.Symlink("/dev/null", stagingPath))
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
+			"nqn": "nqn.test:vol1", "address": "192.168.1.100",
+		}, stagingPath, &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		})
+		require.NoError(t, err)
+		assert.NotContains(t, readNodeCommandLog(t, logPath), "nvme disconnect")
+	})
+}
+
 func TestWaitForSessionCleanupReturnsWhenSessionDisappears(t *testing.T) {
 	calls := 0
 	start := time.Now()
@@ -898,7 +1102,7 @@ func TestNodeStageVolume_ConcurrentProtection(t *testing.T) {
 	volumeID := "concurrent-test-vol"
 
 	// Simulate first operation holding the lock
-	lockKey := "node-stage:" + volumeID
+	lockKey := nodeVolumeLockKey(volumeID)
 	acquired := d.acquireOperationLock(lockKey)
 	require.True(t, acquired)
 	defer d.releaseOperationLock(lockKey)
@@ -924,7 +1128,7 @@ func TestNodePublishVolume_ConcurrentProtection(t *testing.T) {
 	volumeID := "concurrent-publish-vol"
 
 	// Simulate first operation holding the lock
-	lockKey := "node-publish:" + volumeID
+	lockKey := nodeVolumeLockKey(volumeID)
 	acquired := d.acquireOperationLock(lockKey)
 	require.True(t, acquired)
 	defer d.releaseOperationLock(lockKey)
@@ -948,7 +1152,7 @@ func TestNodeUnstageVolume_ConcurrentProtection(t *testing.T) {
 	volumeID := "concurrent-unstage-vol"
 
 	// Simulate first operation holding the lock
-	lockKey := "node-unstage:" + volumeID
+	lockKey := nodeVolumeLockKey(volumeID)
 	acquired := d.acquireOperationLock(lockKey)
 	require.True(t, acquired)
 	defer d.releaseOperationLock(lockKey)
@@ -971,7 +1175,7 @@ func TestNodeUnpublishVolume_ConcurrentProtection(t *testing.T) {
 	volumeID := "concurrent-unpublish-vol"
 
 	// Simulate first operation holding the lock
-	lockKey := "node-unpublish:" + volumeID
+	lockKey := nodeVolumeLockKey(volumeID)
 	acquired := d.acquireOperationLock(lockKey)
 	require.True(t, acquired)
 	defer d.releaseOperationLock(lockKey)
@@ -987,4 +1191,19 @@ func TestNodeUnpublishVolume_ConcurrentProtection(t *testing.T) {
 	st, ok := status.FromError(err)
 	require.True(t, ok)
 	assert.Equal(t, codes.Aborted, st.Code())
+}
+
+func TestNodeExpandVolume_ConcurrentProtection(t *testing.T) {
+	d := newTestNodeDriver(ShareTypeNFS)
+	volumeID := "concurrent-expand-vol"
+
+	lockKey := nodeVolumeLockKey(volumeID)
+	require.True(t, d.acquireOperationLock(lockKey))
+	defer d.releaseOperationLock(lockKey)
+
+	_, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId: volumeID,
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.Aborted, status.Code(err))
 }

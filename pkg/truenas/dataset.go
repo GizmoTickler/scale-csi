@@ -26,6 +26,7 @@ type Dataset struct {
 	Refreservation DatasetProperty         `json:"refreservation"`
 	Volsize        DatasetProperty         `json:"volsize"`
 	Volblocksize   DatasetProperty         `json:"volblocksize"`
+	Origin         DatasetProperty         `json:"origin"`
 	UserProperties map[string]UserProperty `json:"user_properties"`
 }
 
@@ -219,6 +220,51 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offs
 	return datasets, nil
 }
 
+// DatasetHasDependentClones reports whether any dataset in the same pool was
+// cloned from a snapshot of datasetName. Snapshot clone projections are absent
+// on TrueNAS 26.0, but pool.dataset.query still exposes the origin property.
+func (c *Client) DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error) {
+	pool, _, _ := strings.Cut(datasetName, "/")
+	if pool == "" {
+		return false, fmt.Errorf("invalid dataset name %q", datasetName)
+	}
+	filters := [][]interface{}{{"name", "^", pool + "/"}}
+	options := map[string]interface{}{
+		"extra": map[string]interface{}{
+			"properties": []string{"origin"},
+		},
+	}
+	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
+	if err != nil {
+		return false, fmt.Errorf("failed to query dataset origins: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return false, fmt.Errorf("unexpected response type")
+	}
+	originPrefix := datasetName + "@"
+	for _, item := range items {
+		dataset, parseErr := parseDataset(item)
+		if parseErr != nil {
+			continue
+		}
+		if strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func datasetPropertyString(property DatasetProperty) string {
+	if value, ok := property.Value.(string); ok && value != "" {
+		return value
+	}
+	if parsed, ok := property.Parsed.(string); ok {
+		return parsed
+	}
+	return property.Rawvalue
+}
+
 // DatasetSetUserProperty sets a user property on a dataset.
 func (c *Client) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	return c.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
@@ -357,6 +403,7 @@ func parseDataset(data interface{}) (*Dataset, error) {
 	ds.Refreservation = parseProperty(m["refreservation"])
 	ds.Volsize = parseProperty(m["volsize"])
 	ds.Volblocksize = parseProperty(m["volblocksize"])
+	ds.Origin = parseProperty(m["origin"])
 
 	// Parse user properties
 	if userProps, ok := m["user_properties"].(map[string]interface{}); ok {
