@@ -68,6 +68,20 @@ func NVMeoFConnect(nqn, transportURI string) (string, error) {
 
 // NVMeoFConnectWithOptions connects to an NVMe-oF target with configurable options.
 func NVMeoFConnectWithOptions(nqn, transportURI string, opts *NVMeoFConnectOptions) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
+	defer cancel()
+
+	subsystems, err := ListNVMeSubsystems(ctx)
+	if err != nil {
+		klog.Warningf("Failed to list NVMe subsystems: %v", err)
+	}
+
+	return NVMeoFConnectWithOptionsAndSubsystems(nqn, transportURI, opts, subsystems)
+}
+
+// NVMeoFConnectWithOptionsAndSubsystems connects to an NVMe-oF target using a
+// pre-fetched subsystem list.
+func NVMeoFConnectWithOptionsAndSubsystems(nqn, transportURI string, opts *NVMeoFConnectOptions, subsystems []NVMeSubsystem) (string, error) {
 	klog.V(4).Infof("NVMeoFConnect: nqn=%s, transportURI=%s", nqn, transportURI)
 
 	// Apply defaults
@@ -87,13 +101,15 @@ func NVMeoFConnectWithOptions(nqn, transportURI string, opts *NVMeoFConnectOptio
 		return "", fmt.Errorf("invalid transport URI: %w", err)
 	}
 
+	wasConnected := hasNVMeSubsystem(nqn, subsystems)
+
 	// Connect to the subsystem
-	if connectErr := nvmeConnect(ctx, transport, host, port, nqn); connectErr != nil {
+	if connectErr := nvmeConnectWithSubsystems(ctx, transport, host, port, nqn, subsystems); connectErr != nil {
 		return "", fmt.Errorf("connect failed: %w", connectErr)
 	}
 
 	// Wait for device to appear with configurable timeout
-	devicePath, err := waitForNVMeDevice(ctx, nqn, timeout)
+	devicePath, err := waitForNVMeDeviceWithSubsystems(ctx, nqn, timeout, subsystems, !wasConnected)
 	if err != nil {
 		return "", fmt.Errorf("device not found: %w", err)
 	}
@@ -171,17 +187,19 @@ func parseTransportURI(transportURI string) (transport, host, port string, err e
 
 // nvmeConnect connects to an NVMe-oF subsystem.
 func nvmeConnect(ctx context.Context, transport, host, port, nqn string) error {
-	// Check if already connected
-	subsystems, err := listNVMeSubsystems(ctx)
+	subsystems, err := ListNVMeSubsystems(ctx)
 	if err != nil {
 		klog.Warningf("Failed to list NVMe subsystems: %v", err)
-	} else {
-		for _, subsys := range subsystems {
-			if subsys.NQN == nqn {
-				klog.V(4).Infof("Already connected to subsystem: %s", nqn)
-				return nil
-			}
-		}
+	}
+
+	return nvmeConnectWithSubsystems(ctx, transport, host, port, nqn, subsystems)
+}
+
+func nvmeConnectWithSubsystems(ctx context.Context, transport, host, port, nqn string, subsystems []NVMeSubsystem) error {
+	// Check if already connected
+	if hasNVMeSubsystem(nqn, subsystems) {
+		klog.V(4).Infof("Already connected to subsystem: %s", nqn)
+		return nil
 	}
 
 	// Build connect command with reconnect options for resilience.
@@ -214,9 +232,23 @@ func nvmeConnect(ctx context.Context, transport, host, port, nqn string) error {
 	return nil
 }
 
+func hasNVMeSubsystem(nqn string, subsystems []NVMeSubsystem) bool {
+	for _, subsystem := range subsystems {
+		if subsystem.NQN == nqn {
+			return true
+		}
+	}
+	return false
+}
+
 // listNVMeSubsystemsFunc is the function used to list NVMe subsystems.
 // Variable for testability.
 var listNVMeSubsystemsFunc = listNVMeSubsystems
+
+// ListNVMeSubsystems returns the connected NVMe subsystems.
+func ListNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
+	return listNVMeSubsystemsFunc(ctx)
+}
 
 // listNVMeSubsystems returns the list of connected NVMe subsystems.
 func listNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
@@ -276,9 +308,61 @@ func waitForNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (
 	}
 }
 
+func waitForNVMeDeviceWithSubsystems(ctx context.Context, nqn string, timeout time.Duration, subsystems []NVMeSubsystem, refreshAfterConnect bool) (string, error) {
+	start := time.Now()
+	pollInterval := 50 * time.Millisecond
+	maxPollInterval := 500 * time.Millisecond
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("context canceled waiting for device (nqn=%s): %w", nqn, ctx.Err())
+		default:
+		}
+
+		if time.Since(start) > timeout {
+			return "", fmt.Errorf("timeout waiting for device (nqn=%s)", nqn)
+		}
+
+		devicePath, err := findNVMeDeviceFromSysfs(nqn)
+		if err == nil && devicePath != "" {
+			return devicePath, nil
+		}
+		if refreshAfterConnect {
+			refreshed, listErr := ListNVMeSubsystems(ctx)
+			if listErr == nil {
+				subsystems = refreshed
+			}
+			refreshAfterConnect = false
+		}
+		devicePath, err = findNVMeDeviceFromSubsystems(nqn, subsystems)
+		if err == nil && devicePath != "" {
+			return devicePath, nil
+		}
+
+		time.Sleep(pollInterval)
+		pollInterval *= 2
+		if pollInterval > maxPollInterval {
+			pollInterval = maxPollInterval
+		}
+	}
+}
+
 // findNVMeDevice finds the device path for an NVMe subsystem.
 // Variable for testability.
-var findNVMeDevice = func(nqn string) (string, error) {
+var findNVMeDevice = findNVMeDeviceFresh
+
+func findNVMeDeviceFresh(nqn string) (string, error) {
+	devicePath, err := findNVMeDeviceFromSysfs(nqn)
+	if err == nil && devicePath != "" {
+		return devicePath, nil
+	}
+
+	// Alternative: use nvme list-subsys to derive device from controller name
+	return findNVMeDeviceFromListSubsys(nqn)
+}
+
+func findNVMeDeviceFromSysfs(nqn string) (string, error) {
 	// Look in /sys/class/nvme-subsystem
 	subsysDirs, err := filepath.Glob("/sys/class/nvme-subsystem/nvme-subsys*")
 	if err != nil {
@@ -326,8 +410,7 @@ var findNVMeDevice = func(nqn string) (string, error) {
 		}
 	}
 
-	// Alternative: use nvme list-subsys to derive device from controller name
-	return findNVMeDeviceFromListSubsys(nqn)
+	return "", fmt.Errorf("device not found for nqn=%s", nqn)
 }
 
 // findNVMeDeviceFromListSubsys finds NVMe device using nvme list-subsys command.
@@ -358,6 +441,10 @@ func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
 		}
 	}
 
+	return findNVMeDeviceFromSubsystems(nqn, subsystems)
+}
+
+func findNVMeDeviceFromSubsystems(nqn string, subsystems []NVMeSubsystem) (string, error) {
 	for _, subsys := range subsystems {
 		if subsys.NQN == nqn {
 			// Paths[].Name identifies the controller. Enumerate its namespaces;
@@ -702,11 +789,17 @@ func FindNVMeoFSessionByNQN(nqn string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
 	defer cancel()
 
-	subsystems, err := listNVMeSubsystems(ctx)
+	subsystems, err := ListNVMeSubsystems(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to list NVMe subsystems: %w", err)
 	}
 
+	return FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
+}
+
+// FindNVMeoFSessionByNQNFromSubsystems searches a pre-fetched subsystem list
+// for an exact NQN match.
+func FindNVMeoFSessionByNQNFromSubsystems(nqn string, subsystems []NVMeSubsystem) (string, error) {
 	for _, subsystem := range subsystems {
 		if subsystem.NQN == nqn {
 			klog.V(4).Infof("Found NVMe-oF session for NQN %s", nqn)

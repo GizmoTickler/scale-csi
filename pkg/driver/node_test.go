@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
+	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
 const fakeNodeCommandScript = `#!/bin/sh
@@ -36,8 +38,19 @@ case "$name" in
 		fi
 		exit 2
 		;;
-	nvme) exit 0 ;;
-	iscsiadm) exit 97 ;;
+	nvme)
+		if [ "$1 $2" = "list-subsys -o" ] && [ -n "$FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT" ]; then
+			printf '%s' "$FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT"
+		fi
+		exit 0
+		;;
+	iscsiadm)
+		if [ "$1 $2" = "-m session" ] && [ -n "$FAKE_NODE_ISCSI_SESSION_OUTPUT" ]; then
+			printf '%s' "$FAKE_NODE_ISCSI_SESSION_OUTPUT"
+			exit 0
+		fi
+		exit 97
+		;;
 	*) exit 0 ;;
 esac
 `
@@ -593,6 +606,131 @@ func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotContains(t, readNodeCommandLog(t, logPath), "nvme ")
 	})
+}
+
+func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
+	t.Run("iSCSI", func(t *testing.T) {
+		installFakeNodeCommands(t, "iscsiadm")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:other (non-flash)\n")
+
+		originalConnect := iscsiConnectWithSessions
+		iscsiConnectWithSessions = func(_ context.Context, _, _ string, _ int, _ *util.ISCSIConnectOptions, sessions []util.ISCSISessionInfo) (string, error) {
+			require.Len(t, sessions, 1)
+			return "/dev/null", nil
+		}
+		defer func() { iscsiConnectWithSessions = originalConnect }()
+
+		stagingPath := filepath.Join(t.TempDir(), "staging")
+		d := newTestNodeDriver(ShareTypeISCSI)
+		err := d.stageISCSIVolume(context.Background(), map[string]string{
+			"portal": "192.168.1.100:3260",
+			"iqn":    "iqn.test:vol1",
+		}, stagingPath, &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 1, strings.Count(readNodeCommandLog(t, logPath), "iscsiadm -m session"))
+	})
+
+	t.Run("NVMe-oF", func(t *testing.T) {
+		installFakeNodeCommands(t, "nvme")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT", `{"Subsystems":[{"NQN":"nqn.test:other","Name":"nvme2"}]}`)
+
+		originalConnect := nvmeConnectWithSubsystems
+		nvmeConnectWithSubsystems = func(_, _ string, _ *util.NVMeoFConnectOptions, subsystems []util.NVMeSubsystem) (string, error) {
+			require.Len(t, subsystems, 1)
+			return "/dev/null", nil
+		}
+		defer func() { nvmeConnectWithSubsystems = originalConnect }()
+
+		stagingPath := filepath.Join(t.TempDir(), "staging")
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
+			"nqn":     "nqn.test:vol1",
+			"address": "192.168.1.100",
+		}, stagingPath, &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 1, strings.Count(readNodeCommandLog(t, logPath), "nvme list-subsys"))
+	})
+}
+
+func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
+	t.Run("iSCSI", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "iscsiadm")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:vol1 (non-flash)\n")
+
+		originalInfo := getISCSIInfoFromDeviceWithSessions
+		getISCSIInfoFromDeviceWithSessions = func(devicePath string, sessions []util.ISCSISessionInfo) (string, string, error) {
+			return "192.168.1.100:3260", "iqn.test:vol1", nil
+		}
+		defer func() { getISCSIInfoFromDeviceWithSessions = originalInfo }()
+
+		stagingPath := filepath.Join(t.TempDir(), "staging")
+		require.NoError(t, os.Symlink("/dev/null", stagingPath))
+
+		d := newTestNodeDriver(ShareTypeISCSI)
+		err := d.stageISCSIVolume(context.Background(), map[string]string{
+			"portal": "192.168.1.100:3260",
+			"iqn":    "iqn.test:vol1",
+		}, stagingPath, &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		})
+		require.NoError(t, err)
+
+		commands := readNodeCommandLog(t, logPath)
+		assert.Equal(t, 1, strings.Count(commands, "iscsiadm -m session"))
+		assert.NotContains(t, commands, "--logout")
+	})
+
+	t.Run("NVMe-oF", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "nvme")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT", `{"Subsystems":[{"NQN":"nqn.test:vol1","Name":"nvme2","Paths":[{"Name":"nvme2"}]}]}`)
+
+		originalInfo := getNVMeInfoFromDevice
+		getNVMeInfoFromDevice = func(devicePath string) (string, error) {
+			return "nqn.test:vol1", nil
+		}
+		defer func() { getNVMeInfoFromDevice = originalInfo }()
+
+		stagingPath := filepath.Join(t.TempDir(), "staging")
+		require.NoError(t, os.Symlink("/dev/null", stagingPath))
+
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
+			"nqn":     "nqn.test:vol1",
+			"address": "192.168.1.100",
+		}, stagingPath, &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		})
+		require.NoError(t, err)
+
+		commands := readNodeCommandLog(t, logPath)
+		assert.Equal(t, 1, strings.Count(commands, "nvme list-subsys"))
+		assert.NotContains(t, commands, "nvme disconnect")
+	})
+}
+
+func TestWaitForSessionCleanupReturnsWhenSessionDisappears(t *testing.T) {
+	calls := 0
+	start := time.Now()
+	err := waitForSessionCleanup(context.Background(), time.Second, func() (bool, error) {
+		calls++
+		return calls == 1, nil
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+	assert.Less(t, time.Since(start), 500*time.Millisecond)
 }
 
 func TestStageNVMeoFVolume_Validation(t *testing.T) {

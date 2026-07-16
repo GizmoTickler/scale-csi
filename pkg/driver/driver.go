@@ -26,8 +26,11 @@ var (
 	getStagedBlockDevices  = func() (map[string]string, error) {
 		return util.GetStagedBlockDevices(kubeletCSIStagingRoot)
 	}
-	getISCSIInfoFromDevice = util.GetISCSIInfoFromDevice
-	getNVMeInfoFromDevice  = util.GetNVMeInfoFromDevice
+	getISCSIInfoFromDevice             = util.GetISCSIInfoFromDevice
+	getNVMeInfoFromDevice              = util.GetNVMeInfoFromDevice
+	getISCSIInfoFromDeviceWithSessions = util.GetISCSIInfoFromDeviceWithSessions
+	iscsiConnectWithSessions           = util.ISCSIConnectWithOptionsAndSessions
+	nvmeConnectWithSubsystems          = util.NVMeoFConnectWithOptionsAndSubsystems
 )
 
 // DriverConfig holds the driver initialization configuration.

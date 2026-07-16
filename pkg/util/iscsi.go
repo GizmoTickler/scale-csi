@@ -107,6 +107,17 @@ func ISCSIConnect(portal, iqn string, lun int) (string, error) {
 
 // ISCSIConnectWithOptions connects to an iSCSI target with configurable options.
 func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, opts *ISCSIConnectOptions) (string, error) {
+	sessions, err := ListISCSISessions()
+	if err != nil {
+		klog.V(4).Infof("Failed to get sessions: %v, will proceed with discovery", err)
+	}
+
+	return ISCSIConnectWithOptionsAndSessions(ctx, portal, iqn, lun, opts, sessions)
+}
+
+// ISCSIConnectWithOptionsAndSessions connects to an iSCSI target using a
+// pre-fetched session list.
+func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string, lun int, opts *ISCSIConnectOptions, sessions []ISCSISessionInfo) (string, error) {
 	start := time.Now()
 	klog.Infof("ISCSIConnect: portal=%s, iqn=%s, lun=%d", portal, iqn, lun)
 
@@ -123,33 +134,31 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 	}
 
 	// Check if already logged in - validate session before reuse
-	sessions, err := getISCSISessions()
-	if err != nil {
-		klog.V(4).Infof("Failed to get sessions: %v, will proceed with discovery", err)
-	} else {
-		for _, session := range sessions {
-			if session.IQN != iqn {
-				continue
-			}
-			klog.Infof("Found existing session for %s, validating... (elapsed: %v)", iqn, time.Since(start))
-			// Try to get device with a short timeout to validate session is healthy
-			// If device appears quickly, session is valid and can be reused
-			validationTimeout := 5 * time.Second
-			devicePath, waitErr := waitForISCSIDevice(portal, iqn, lun, validationTimeout)
-			if waitErr == nil {
-				klog.Infof("ISCSIConnect completed (session reuse) in %v", time.Since(start))
-				return devicePath, nil
-			}
-			// Session exists but device didn't appear - session is likely stale
-			// Disconnect it and proceed with fresh discovery/login
-			klog.Warningf("Existing session for %s appears stale (device not found in %v), disconnecting", iqn, validationTimeout)
-			if disconnectErr := ISCSIDisconnect(portal, iqn); disconnectErr != nil {
-				klog.Warningf("Failed to disconnect stale session %s: %v (proceeding anyway)", iqn, disconnectErr)
-				// Brief pause to allow session cleanup to complete (configurable)
-				time.Sleep(sessionCleanupDelay)
-				break // Exit loop and proceed with fresh discovery
-			}
+	for _, session := range sessions {
+		if session.IQN != iqn {
+			continue
 		}
+		klog.Infof("Found existing session for %s, validating... (elapsed: %v)", iqn, time.Since(start))
+		// Try to get device with a short timeout to validate session is healthy
+		// If device appears quickly, session is valid and can be reused
+		validationTimeout := 5 * time.Second
+		devicePath, waitErr := waitForISCSIDevice(portal, iqn, lun, validationTimeout)
+		if waitErr == nil {
+			klog.Infof("ISCSIConnect completed (session reuse) in %v", time.Since(start))
+			return devicePath, nil
+		}
+		// Session exists but device didn't appear - session is likely stale
+		// Disconnect it and proceed with fresh discovery/login
+		klog.Warningf("Existing session for %s appears stale (device not found in %v), disconnecting", iqn, validationTimeout)
+		if disconnectErr := ISCSIDisconnect(portal, iqn); disconnectErr != nil {
+			klog.Warningf("Failed to disconnect stale session %s: %v (proceeding anyway)", iqn, disconnectErr)
+		}
+		// Do not let the pre-disconnect snapshot suppress the login below.
+		sessions = removeISCSISessionByIQN(sessions, iqn)
+		if sessionCleanupDelay > 0 {
+			time.Sleep(sessionCleanupDelay)
+		}
+		break
 	}
 
 	// Serialized discovery with caching to prevent TrueNAS overload
@@ -164,7 +173,7 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 	// If login fails due to target not found, retry with exponential backoff.
 	// TrueNAS may take time to propagate newly created targets to the iSCSI daemon.
 	loginStart := time.Now()
-	loginErr := iscsiLoginSerialized(ctx, portal, iqn)
+	loginErr := iscsiLoginSerializedWithSessions(ctx, portal, iqn, sessions)
 	if loginErr != nil && isTargetNotFoundError(loginErr) {
 		klog.Warningf("iSCSI login failed for %s (target not found in discovery), will retry with fresh discovery: %v", iqn, loginErr)
 
@@ -191,7 +200,7 @@ func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, o
 					attempt, maxDiscoveryRetries, portal, iqn)
 
 				// Retry login
-				loginErr = iscsiLoginSerialized(ctx, portal, iqn)
+				loginErr = iscsiLoginSerializedWithSessions(ctx, portal, iqn, sessions)
 				if loginErr == nil {
 					klog.Infof("iSCSI login succeeded for %s after %d discovery retries (total elapsed: %v)",
 						iqn, attempt, time.Since(start))
@@ -355,6 +364,15 @@ func getLoginSemaphore(portal string) chan struct{} {
 // Allows up to getMaxConcurrentLogins() (2) concurrent logins per portal to prevent
 // overwhelming TrueNAS while still allowing some parallelism.
 func iscsiLoginSerialized(ctx context.Context, portal, iqn string) error {
+	sessions, err := ListISCSISessions()
+	if err != nil {
+		klog.Warningf("Failed to get iSCSI sessions: %v", err)
+	}
+
+	return iscsiLoginSerializedWithSessions(ctx, portal, iqn, sessions)
+}
+
+func iscsiLoginSerializedWithSessions(ctx context.Context, portal, iqn string, sessions []ISCSISessionInfo) error {
 	// Acquire semaphore slot with context awareness
 	sem := getLoginSemaphore(portal)
 	select {
@@ -365,21 +383,25 @@ func iscsiLoginSerialized(ctx context.Context, portal, iqn string) error {
 		return fmt.Errorf("context canceled waiting for login slot: %w", ctx.Err())
 	}
 
-	return iscsiLogin(ctx, portal, iqn)
+	return iscsiLoginWithSessions(ctx, portal, iqn, sessions)
 }
 
 // iscsiLogin logs into an iSCSI target.
 func iscsiLogin(ctx context.Context, portal, iqn string) error {
-	// Check if already logged in
-	sessions, err := getISCSISessions()
+	sessions, err := ListISCSISessions()
 	if err != nil {
 		klog.Warningf("Failed to get iSCSI sessions: %v", err)
-	} else {
-		for _, session := range sessions {
-			if session.IQN == iqn {
-				klog.V(4).Infof("Already logged in to target: %s", iqn)
-				return nil
-			}
+	}
+
+	return iscsiLoginWithSessions(ctx, portal, iqn, sessions)
+}
+
+func iscsiLoginWithSessions(ctx context.Context, portal, iqn string, sessions []ISCSISessionInfo) error {
+	// Check if already logged in
+	for _, session := range sessions {
+		if session.IQN == iqn {
+			klog.V(4).Infof("Already logged in to target: %s", iqn)
+			return nil
 		}
 	}
 
@@ -712,6 +734,17 @@ func IsLikelyISCSIDevice(devicePath string) bool {
 
 // GetISCSIInfoFromDevice returns the portal and IQN for a given device path.
 func GetISCSIInfoFromDevice(devicePath string) (portal, iqn string, err error) {
+	sessions, err := ListISCSISessions()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get sessions: %w", err)
+	}
+
+	return GetISCSIInfoFromDeviceWithSessions(devicePath, sessions)
+}
+
+// GetISCSIInfoFromDeviceWithSessions returns the portal and IQN for a device
+// using a pre-fetched session list.
+func GetISCSIInfoFromDeviceWithSessions(devicePath string, sessions []ISCSISessionInfo) (portal, iqn string, err error) {
 	deviceName := filepath.Base(devicePath)
 
 	// Find session directory in sysfs
@@ -766,15 +799,9 @@ func GetISCSIInfoFromDevice(devicePath string) (portal, iqn string, err error) {
 		return "", "", fmt.Errorf("could not find targetname for session %s", sessionDir)
 	}
 
-	// Get Portal using iscsiadm
-	sessions, err := getISCSISessions()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get sessions: %w", err)
-	}
-
 	for _, s := range sessions {
 		if s.IQN == iqn {
-			return s.TargetPortal, s.IQN, nil
+			return s.Portal, s.IQN, nil
 		}
 	}
 
@@ -841,11 +868,17 @@ type ISCSISessionInfo struct {
 // FindISCSISessionByIQN searches active iSCSI sessions for one matching the exact IQN.
 // This is used for pre-emptive cleanup before staging a volume.
 func FindISCSISessionByIQN(iqn string) (string, error) {
-	sessions, err := getISCSISessions()
+	sessions, err := ListISCSISessions()
 	if err != nil {
 		return "", fmt.Errorf("failed to get iSCSI sessions: %w", err)
 	}
 
+	return FindISCSISessionByIQNFromSessions(iqn, sessions)
+}
+
+// FindISCSISessionByIQNFromSessions searches a pre-fetched session list for an
+// exact IQN match.
+func FindISCSISessionByIQNFromSessions(iqn string, sessions []ISCSISessionInfo) (string, error) {
 	for _, session := range sessions {
 		if session.IQN == iqn {
 			klog.V(4).Infof("Found iSCSI session for IQN %s", iqn)
@@ -854,4 +887,14 @@ func FindISCSISessionByIQN(iqn string) (string, error) {
 	}
 
 	return "", fmt.Errorf("no iSCSI session found for IQN %s", iqn)
+}
+
+func removeISCSISessionByIQN(sessions []ISCSISessionInfo, iqn string) []ISCSISessionInfo {
+	filtered := make([]ISCSISessionInfo, 0, len(sessions))
+	for _, session := range sessions {
+		if session.IQN != iqn {
+			filtered = append(filtered, session)
+		}
+	}
+	return filtered
 }

@@ -673,17 +673,41 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		return nil
 	}
 
+	sessions, listErr := util.ListISCSISessions()
+	if listErr != nil {
+		klog.Warningf("Failed to list iSCSI sessions before staging %s: %v", iqn, listErr)
+	}
+
+	if volCap != nil && volCap.GetBlock() != nil {
+		if devicePath, ok := stagedBlockDevicePath(stagingPath); ok {
+			_, stagedIQN, infoErr := getISCSIInfoFromDeviceWithSessions(devicePath, sessions)
+			if infoErr == nil && stagedIQN == iqn {
+				klog.Infof("iSCSI block volume already staged at %s", stagingPath)
+				return nil
+			}
+		}
+	}
+
 	// Pre-emptive cleanup: disconnect any existing session for this target
 	// This prevents duplicate sessions when a volume moves between nodes
 	// or when a previous unstage failed to clean up properly.
-	existingIQN, err := util.FindISCSISessionByIQN(iqn)
+	existingIQN, err := util.FindISCSISessionByIQNFromSessions(iqn, sessions)
 	if err == nil && existingIQN != "" {
 		klog.Infof("Found existing iSCSI session for %s, disconnecting before reconnect", iqn)
 		if disconnectErr := util.ISCSIDisconnect(portal, existingIQN); disconnectErr != nil {
 			klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingIQN, disconnectErr)
 		}
-		// Brief pause to allow session cleanup to complete (configurable)
-		time.Sleep(time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond)
+		cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
+		if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
+			sessions, listErr = util.ListISCSISessions()
+			if listErr != nil {
+				return true, listErr
+			}
+			_, findErr := util.FindISCSISessionByIQNFromSessions(iqn, sessions)
+			return findErr == nil, nil
+		}); pollErr != nil {
+			klog.V(4).Infof("iSCSI session cleanup poll for %s ended with: %v", iqn, pollErr)
+		}
 	}
 
 	// Connect to iSCSI target with configurable timeout
@@ -691,7 +715,7 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		DeviceTimeout:       time.Duration(d.config.ISCSI.DeviceWaitTimeout) * time.Second,
 		SessionCleanupDelay: time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond,
 	}
-	devicePath, err := util.ISCSIConnectWithOptions(ctx, portal, iqn, lun, connectOpts)
+	devicePath, err := iscsiConnectWithSessions(ctx, portal, iqn, lun, connectOpts, sessions)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to connect iSCSI: %v", err)
 	}
@@ -749,17 +773,42 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 		return nil
 	}
 
+	subsystems, listErr := util.ListNVMeSubsystems(ctx)
+	if listErr != nil {
+		klog.Warningf("Failed to list NVMe subsystems before staging %s: %v", nqn, listErr)
+	}
+
+	if volCap != nil && volCap.GetBlock() != nil {
+		if devicePath, ok := stagedBlockDevicePath(stagingPath); ok {
+			stagedNQN, infoErr := getNVMeInfoFromDevice(devicePath)
+			_, findErr := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
+			if infoErr == nil && findErr == nil && stagedNQN == nqn {
+				klog.Infof("NVMe-oF block volume already staged at %s", stagingPath)
+				return nil
+			}
+		}
+	}
+
 	// Pre-emptive cleanup: disconnect any existing session for this NQN
 	// This prevents duplicate sessions when a volume moves between nodes
 	// or when a previous unstage failed to clean up properly.
-	existingNQN, err := util.FindNVMeoFSessionByNQN(nqn)
+	existingNQN, err := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
 	if err == nil && existingNQN != "" {
 		klog.Infof("Found existing NVMe-oF session for %s, disconnecting before reconnect", nqn)
 		if disconnectErr := util.NVMeoFDisconnect(existingNQN); disconnectErr != nil {
 			klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingNQN, disconnectErr)
 		}
-		// Brief pause to allow session cleanup to complete (configurable)
-		time.Sleep(time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond)
+		cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
+		if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
+			subsystems, listErr = util.ListNVMeSubsystems(ctx)
+			if listErr != nil {
+				return true, listErr
+			}
+			_, findErr := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
+			return findErr == nil, nil
+		}); pollErr != nil {
+			klog.V(4).Infof("NVMe-oF session cleanup poll for %s ended with: %v", nqn, pollErr)
+		}
 	}
 
 	// Connect to NVMe-oF subsystem with configurable timeout
@@ -767,7 +816,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	connectOpts := &util.NVMeoFConnectOptions{
 		DeviceTimeout: time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second,
 	}
-	devicePath, err := util.NVMeoFConnectWithOptions(nqn, transportURI, connectOpts)
+	devicePath, err := nvmeConnectWithSubsystems(nqn, transportURI, connectOpts, subsystems)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to connect NVMe-oF: %v", err)
 	}
@@ -793,6 +842,65 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	}
 
 	return nil
+}
+
+func stagedBlockDevicePath(stagingPath string) (string, bool) {
+	info, err := os.Lstat(stagingPath)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return "", false
+	}
+
+	devicePath, err := filepath.EvalSymlinks(stagingPath)
+	if err != nil || !strings.HasPrefix(devicePath, "/dev/") {
+		return "", false
+	}
+	if _, err := os.Stat(devicePath); err != nil {
+		return "", false
+	}
+
+	return devicePath, true
+}
+
+func waitForSessionCleanup(ctx context.Context, timeout time.Duration, sessionExists func() (bool, error)) error {
+	exists, lastErr := sessionExists()
+	if !exists && lastErr == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		return lastErr
+	}
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		wait := 100 * time.Millisecond
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			if lastErr != nil {
+				return lastErr
+			}
+			return fmt.Errorf("session still present after %v", timeout)
+		}
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+			exists, lastErr = sessionExists()
+			if !exists && lastErr == nil {
+				return nil
+			}
+		}
+	}
 }
 
 // createSymlinkAtomic creates a symlink atomically using rename to avoid race conditions.
