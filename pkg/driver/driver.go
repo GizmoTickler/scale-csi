@@ -127,6 +127,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		AllowInsecure:     cfg.Config.TrueNAS.AllowInsecure,
 		Timeout:           time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
 		ConnectTimeout:    time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
+		WriteTimeout:      time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,
 		MaxConcurrentReqs: cfg.Config.TrueNAS.MaxConcurrentRequests,
 		MetricsRecorder:   RecordTrueNASRequest,
 		// Circuit breaker configuration

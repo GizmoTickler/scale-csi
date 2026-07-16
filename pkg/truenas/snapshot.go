@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 
 	"k8s.io/klog/v2"
 )
@@ -22,38 +21,64 @@ func (e *ErrSnapshotHasClones) Error() string {
 	return fmt.Sprintf("snapshot %s has dependent clones: %v", e.SnapshotID, e.Clones)
 }
 
-// apiMethodPrefix stores the detected API prefix for snapshot methods.
-// TrueNAS 24.x uses "zfs.snapshot.*", while 25.04+ may use "pool.snapshot.*"
-var (
-	snapshotAPIPrefix     string
-	snapshotAPIPrefixOnce sync.Once
-)
-
 // detectSnapshotAPIPrefix detects which API prefix to use for snapshot methods.
 // This provides compatibility between TrueNAS 24.x (zfs.snapshot.*) and 25.04+ (pool.snapshot.*).
 func (c *Client) detectSnapshotAPIPrefix(ctx context.Context) string {
-	snapshotAPIPrefixOnce.Do(func() {
-		// Try pool.snapshot.query first (TrueNAS 25.04+)
-		_, err := c.Call(ctx, "pool.snapshot.query", [][]interface{}{}, map[string]interface{}{"limit": 1})
-		if err == nil {
-			snapshotAPIPrefix = "pool.snapshot"
-			klog.V(2).Infof("Detected TrueNAS 25.04+ API (pool.snapshot.*)")
-			return
+	c.snapshotPrefixMu.Lock()
+	if c.snapshotAPIPrefix != "" {
+		prefix := c.snapshotAPIPrefix
+		c.snapshotPrefixMu.Unlock()
+		return prefix
+	}
+	if probeDone := c.snapshotPrefixProbeDone; probeDone != nil {
+		c.snapshotPrefixMu.Unlock()
+		select {
+		case <-probeDone:
+			c.snapshotPrefixMu.Lock()
+			prefix := c.snapshotAPIPrefix
+			c.snapshotPrefixMu.Unlock()
+			if prefix != "" {
+				return prefix
+			}
+		case <-ctx.Done():
 		}
+		return "zfs.snapshot"
+	}
+	probeDone := make(chan struct{})
+	c.snapshotPrefixProbeDone = probeDone
+	c.snapshotPrefixMu.Unlock()
 
+	detectedPrefix := ""
+
+	// Try pool.snapshot.query first (TrueNAS 25.04+)
+	_, err := c.Call(ctx, "pool.snapshot.query", [][]interface{}{}, map[string]interface{}{"limit": 1})
+	if err == nil {
+		detectedPrefix = "pool.snapshot"
+		klog.V(2).Infof("Detected TrueNAS 25.04+ API (pool.snapshot.*)")
+	} else {
 		// Fall back to zfs.snapshot.query (TrueNAS 24.x)
 		_, err = c.Call(ctx, "zfs.snapshot.query", [][]interface{}{}, map[string]interface{}{"limit": 1})
 		if err == nil {
-			snapshotAPIPrefix = "zfs.snapshot"
+			detectedPrefix = "zfs.snapshot"
 			klog.V(2).Infof("Detected TrueNAS 24.x API (zfs.snapshot.*)")
-			return
 		}
+	}
 
-		// Default to zfs.snapshot if both fail (shouldn't happen)
-		snapshotAPIPrefix = "zfs.snapshot"
-		klog.Warningf("Could not detect snapshot API prefix, defaulting to zfs.snapshot.*")
-	})
-	return snapshotAPIPrefix
+	c.snapshotPrefixMu.Lock()
+	if detectedPrefix != "" && c.snapshotAPIPrefix == "" {
+		c.snapshotAPIPrefix = detectedPrefix
+	}
+	prefix := c.snapshotAPIPrefix
+	c.snapshotPrefixProbeDone = nil
+	close(probeDone)
+	c.snapshotPrefixMu.Unlock()
+	if prefix != "" {
+		return prefix
+	}
+
+	// Do not cache the fallback: a transient outage must be re-probed later.
+	klog.Warningf("Could not detect snapshot API prefix, defaulting to zfs.snapshot.*")
+	return "zfs.snapshot"
 }
 
 // snapshotMethod returns the full API method name for a snapshot operation.

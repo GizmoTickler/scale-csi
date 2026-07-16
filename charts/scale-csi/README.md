@@ -65,6 +65,7 @@ helm install scale-csi charts/scale-csi \
 | `truenas.apiKey` | API key | `""` |
 | `truenas.existingSecret` | Use existing secret for credentials | `""` |
 | `truenas.requestTimeout` | API request timeout (seconds) | `60` |
+| `truenas.writeTimeout` | WebSocket write timeout (seconds) | `30` |
 | `truenas.maxConcurrentRequests` | Max concurrent API requests | `10` |
 
 ### ZFS Configuration

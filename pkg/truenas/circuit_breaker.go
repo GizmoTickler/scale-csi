@@ -82,14 +82,29 @@ type CircuitBreaker struct {
 	totalCircuitOpens int64 // for metrics
 }
 
+type circuitBreakerAdmission struct {
+	allowed       bool
+	halfOpenProbe bool
+}
+
 // NewCircuitBreaker creates a new circuit breaker with the given configuration.
 func NewCircuitBreaker(config *CircuitBreakerConfig) *CircuitBreaker {
 	if config == nil {
 		config = DefaultCircuitBreakerConfig()
 	}
+	normalized := *config
+	if normalized.HalfOpenMaxRequests <= 0 {
+		normalized.HalfOpenMaxRequests = 1
+	}
+	if normalized.SuccessThreshold <= 0 {
+		normalized.SuccessThreshold = 1
+	}
+	if normalized.SuccessThreshold > normalized.HalfOpenMaxRequests {
+		normalized.SuccessThreshold = normalized.HalfOpenMaxRequests
+	}
 
 	return &CircuitBreaker{
-		config:          config,
+		config:          &normalized,
 		state:           CircuitClosed,
 		lastStateChange: time.Now(),
 	}
@@ -98,8 +113,15 @@ func NewCircuitBreaker(config *CircuitBreakerConfig) *CircuitBreaker {
 // Allow checks if a request should be allowed through.
 // Returns true if the request should proceed, false if it should be blocked.
 func (cb *CircuitBreaker) Allow() bool {
+	return cb.admit().allowed
+}
+
+// admit atomically reports whether an allowed request consumed a half-open
+// probe slot. Callers use that bit to guarantee an outcome is recorded even
+// when the request exits before reaching the transport.
+func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 	if !cb.config.Enabled {
-		return true
+		return circuitBreakerAdmission{allowed: true}
 	}
 
 	cb.mu.Lock()
@@ -107,27 +129,27 @@ func (cb *CircuitBreaker) Allow() bool {
 
 	switch cb.state {
 	case CircuitClosed:
-		return true
+		return circuitBreakerAdmission{allowed: true}
 
 	case CircuitOpen:
 		// Check if timeout has elapsed to transition to half-open
 		if time.Since(cb.lastFailure) >= cb.config.Timeout {
 			cb.transitionTo(CircuitHalfOpen)
 			cb.halfOpenRequests = 1
-			return true
+			return circuitBreakerAdmission{allowed: true, halfOpenProbe: true}
 		}
-		return false
+		return circuitBreakerAdmission{}
 
 	case CircuitHalfOpen:
 		// Allow limited requests in half-open state
 		if cb.halfOpenRequests < cb.config.HalfOpenMaxRequests {
 			cb.halfOpenRequests++
-			return true
+			return circuitBreakerAdmission{allowed: true, halfOpenProbe: true}
 		}
-		return false
+		return circuitBreakerAdmission{}
 	}
 
-	return true
+	return circuitBreakerAdmission{allowed: true}
 }
 
 // RecordSuccess records a successful request.

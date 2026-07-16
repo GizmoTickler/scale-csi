@@ -19,6 +19,7 @@ data:
       allowInsecure: {{ .Values.truenas.skipTLSVerify }}
       requestTimeout: {{ .Values.truenas.requestTimeout | default 60 }}
       connectTimeout: 10
+      writeTimeout: {{ .Values.truenas.writeTimeout | default 30 }}
       maxConcurrentRequests: {{ .Values.truenas.maxConcurrentRequests | default 10 }}
 
     # ZFS dataset configuration

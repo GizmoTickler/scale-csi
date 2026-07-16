@@ -85,12 +85,22 @@ func IsConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrAmbiguousResult) {
+		return true
+	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "connection") ||
 		strings.Contains(errStr, "timeout") ||
 		strings.Contains(errStr, "refused") ||
 		strings.Contains(errStr, "connection lost")
 }
+
+// ErrAmbiguousResult indicates that a request was written successfully, but the
+// connection was lost before a response arrived. The server may have applied
+// the request, so callers must decide whether it is safe to retry.
+var ErrAmbiguousResult = errors.New("request result is ambiguous")
+
+const defaultWriteTimeout = 30 * time.Second
 
 // MetricsRecorder is a callback for recording API request metrics.
 // method is the API method name, duration is in seconds, err is nil on success.
@@ -117,6 +127,7 @@ type ClientConfig struct {
 	AllowInsecure     bool
 	Timeout           time.Duration
 	ConnectTimeout    time.Duration
+	WriteTimeout      time.Duration   // Timeout for each WebSocket write (default: 30s)
 	MaxRetries        int             // Maximum number of connection retries (default: 3)
 	RetryInterval     time.Duration   // Initial retry interval (default: 1s, exponential backoff applied)
 	HeartbeatInterval time.Duration   // Interval for WebSocket heartbeat (default: 30s)
@@ -136,8 +147,16 @@ type ClientConfig struct {
 
 // writeRequest represents a request to be written to the WebSocket.
 type writeRequest struct {
+	id       int64
 	data     interface{}
 	resultCh chan error
+}
+
+type pendingCall struct {
+	responseCh chan *rpcResponse
+	generation uint64
+	method     string
+	sent       bool
 }
 
 // connectionState represents the current state of the connection.
@@ -156,15 +175,19 @@ type Connection struct {
 	conn          atomic.Pointer[websocket.Conn] // atomic for lock-free reads
 	mu            sync.RWMutex
 	messageID     int64
-	pending       map[int64]chan *rpcResponse
+	pending       map[int64]*pendingCall
 	pendingMu     sync.RWMutex
 	authenticated bool
-	closed        bool
+	generation    uint64
+	stopped       bool
+	generationWG  *sync.WaitGroup
+	sendMu        sync.Mutex
+	shutdown      atomic.Bool
 
 	// Connection state management
-	connState int32 // atomic connectionState
-	connCond  *sync.Cond
-	connMu    sync.Mutex
+	connState   int32 // atomic connectionState
+	connMu      sync.Mutex
+	connectDone chan struct{}
 
 	// Write loop channel
 	writeCh       chan writeRequest
@@ -174,23 +197,16 @@ type Connection struct {
 	heartbeatDone chan struct{}
 	lastPong      int64 // atomic unix timestamp
 
-	// Safe channel closure
-	closeMu             sync.Mutex
-	writeLoopDoneClosed bool
-	heartbeatDoneClosed bool
 }
 
 // NewConnection creates a new connection instance.
 func NewConnection(id int, cfg *ClientConfig) *Connection {
 	c := &Connection{
-		id:            id,
-		config:        cfg,
-		pending:       make(map[int64]chan *rpcResponse),
-		writeCh:       make(chan writeRequest, 100),
-		writeLoopDone: make(chan struct{}),
-		heartbeatDone: make(chan struct{}),
+		id:      id,
+		config:  cfg,
+		pending: make(map[int64]*pendingCall),
+		stopped: true,
 	}
-	c.connCond = sync.NewCond(&c.connMu)
 	return c
 }
 
@@ -206,6 +222,12 @@ type Client struct {
 	// Version detection cache
 	versionMu    sync.RWMutex
 	versionCache *SystemInfo
+
+	// Snapshot API prefix detection cache. This is per-client because different
+	// clients may connect to different TrueNAS versions.
+	snapshotPrefixMu        sync.Mutex
+	snapshotAPIPrefix       string
+	snapshotPrefixProbeDone chan struct{}
 }
 
 // rpcRequest is a JSON-RPC 2.0 request.
@@ -218,10 +240,11 @@ type rpcRequest struct {
 
 // rpcResponse is a JSON-RPC 2.0 response.
 type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int64       `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
+	JSONRPC      string      `json:"jsonrpc"`
+	ID           int64       `json:"id"`
+	Result       interface{} `json:"result,omitempty"`
+	Error        *rpcError   `json:"error,omitempty"`
+	transportErr error
 }
 
 // rpcError is a JSON-RPC 2.0 error.
@@ -244,6 +267,9 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	}
 	if cfg.ConnectTimeout == 0 {
 		cfg.ConnectTimeout = 10 * time.Second
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = defaultWriteTimeout
 	}
 	if cfg.MaxRetries == 0 {
 		cfg.MaxRetries = 3
@@ -290,7 +316,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	if cfg.CircuitBreaker != nil && cfg.CircuitBreaker.Enabled {
 		cb = NewCircuitBreaker(cfg.CircuitBreaker)
 		klog.Infof("Circuit breaker enabled: failureThreshold=%d, successThreshold=%d, timeout=%v",
-			cfg.CircuitBreaker.FailureThreshold, cfg.CircuitBreaker.SuccessThreshold, cfg.CircuitBreaker.Timeout)
+			cb.config.FailureThreshold, cb.config.SuccessThreshold, cb.config.Timeout)
 	}
 
 	client := &Client{
@@ -323,7 +349,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 				jitter := time.Duration(50+rand.Intn(100)) * time.Millisecond
 				time.Sleep(time.Duration(idx) * jitter)
 			}
-			if err := c.connect(); err != nil {
+			if err := c.connect(context.Background()); err != nil {
 				errMu.Lock()
 				lastErr = err
 				errMu.Unlock()
@@ -341,7 +367,10 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 
 	if connected == 0 {
 		// Try one last time synchronously to get the error
-		if err := client.pool[0].connect(); err != nil {
+		if err := client.pool[0].connect(context.Background()); err != nil {
+			if lastErr == nil {
+				return nil, fmt.Errorf("failed to establish any connections: %w", err)
+			}
 			return nil, fmt.Errorf("failed to establish any connections (previous: %s): %w", lastErr.Error(), err)
 		}
 	}
@@ -349,49 +378,72 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	return client, nil
 }
 
-// connect establishes the WebSocket connection and authenticates.
-func (c *Connection) connect() error {
-	// Fast path: already connected (lock-free check using atomic operations)
-	if atomic.LoadInt32(&c.connState) == int32(stateConnected) && c.conn.Load() != nil {
-		return nil
-	}
-
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-
-	// Double-check after acquiring lock
-	currentState := connectionState(atomic.LoadInt32(&c.connState))
-
-	switch currentState {
-	case stateConnected:
-		if c.conn.Load() != nil {
+// connect establishes the WebSocket connection and authenticates. Concurrent
+// callers wait on the in-flight connection attempt without losing cancellation.
+func (c *Connection) connect(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if c.shutdown.Load() {
+			return fmt.Errorf("connection closed")
+		}
+		if atomic.LoadInt32(&c.connState) == int32(stateConnected) && c.hasAuthenticatedConnection() {
 			return nil
 		}
-	case stateConnecting:
-		for atomic.LoadInt32(&c.connState) == int32(stateConnecting) {
-			c.connCond.Wait()
+
+		c.connMu.Lock()
+		switch connectionState(atomic.LoadInt32(&c.connState)) {
+		case stateConnected:
+			if c.hasAuthenticatedConnection() {
+				c.connMu.Unlock()
+				return nil
+			}
+			atomic.StoreInt32(&c.connState, int32(stateDisconnected))
+		case stateConnecting:
+			done := c.connectDone
+			c.connMu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
-		if atomic.LoadInt32(&c.connState) == int32(stateConnected) && c.conn.Load() != nil {
-			return nil
+
+		atomic.StoreInt32(&c.connState, int32(stateConnecting))
+		done := make(chan struct{})
+		c.connectDone = done
+		c.connMu.Unlock()
+
+		err := c.connectWithRetry(ctx)
+		c.connMu.Lock()
+		c.mu.RLock()
+		connected := !c.stopped && c.conn.Load() != nil && c.authenticated
+		if err == nil && !connected {
+			err = fmt.Errorf("connection lost during authentication")
 		}
+		if err != nil {
+			atomic.StoreInt32(&c.connState, int32(stateDisconnected))
+		} else {
+			atomic.StoreInt32(&c.connState, int32(stateConnected))
+		}
+		c.mu.RUnlock()
+		close(done)
+		c.connectDone = nil
+		c.connMu.Unlock()
+		return err
 	}
+}
 
-	atomic.StoreInt32(&c.connState, int32(stateConnecting))
-
-	err := c.connectWithRetry()
-
-	if err != nil {
-		atomic.StoreInt32(&c.connState, int32(stateDisconnected))
-	} else {
-		atomic.StoreInt32(&c.connState, int32(stateConnected))
-	}
-
-	c.connCond.Broadcast()
-	return err
+func (c *Connection) hasAuthenticatedConnection() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !c.stopped && c.conn.Load() != nil && c.authenticated
 }
 
 // connectWithRetry attempts to connect with exponential backoff retry.
-func (c *Connection) connectWithRetry() error {
+func (c *Connection) connectWithRetry(ctx context.Context) error {
 	wsScheme := "ws"
 	if c.config.Protocol == "https" {
 		wsScheme = "wss"
@@ -412,13 +464,22 @@ func (c *Connection) connectWithRetry() error {
 	retryInterval := c.config.RetryInterval
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		if c.shutdown.Load() {
+			return fmt.Errorf("connection closed")
+		}
 		if attempt > 0 {
 			klog.V(2).Infof("Conn %d: Retrying connection (attempt %d/%d) after %v", c.id, attempt, c.config.MaxRetries, retryInterval)
-			c.connMu.Unlock()
-			time.Sleep(retryInterval)
-			c.connMu.Lock()
-			if c.closed {
-				return fmt.Errorf("connection closed during reconnection")
+			timer := time.NewTimer(retryInterval)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return ctx.Err()
 			}
 			retryInterval *= 2
 			if retryInterval > 30*time.Second {
@@ -428,40 +489,50 @@ func (c *Connection) connectWithRetry() error {
 
 		klog.V(2).Infof("Conn %d: Connecting to %s (attempt %d)", c.id, wsURL, attempt+1)
 
-		wsConn, _, err := dialer.Dial(wsURL, headers)
+		wsConn, _, err := dialer.DialContext(ctx, wsURL, headers)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			lastErr = fmt.Errorf("failed to connect: %w", err)
 			continue
 		}
 
-		c.mu.Lock()
-		c.conn.Store(wsConn)
-		c.closed = false
-		c.writeCh = make(chan writeRequest, 100)
-		c.writeLoopDone = make(chan struct{})
-		c.heartbeatDone = make(chan struct{})
-		c.mu.Unlock()
+		generation, writeCh, writeDone, heartbeatDone, generationWG, err := c.startGeneration(wsConn)
+		if err != nil {
+			_ = wsConn.Close()
+			return err
+		}
+		go c.readMessages(generation, wsConn, generationWG)
+		go c.writeLoop(generation, wsConn, writeCh, writeDone, generationWG)
 
-		c.closeMu.Lock()
-		c.writeLoopDoneClosed = false
-		c.heartbeatDoneClosed = false
-		c.closeMu.Unlock()
-
-		go c.readMessages()
-		go c.writeLoop()
-
-		if err := c.authenticateDirect(); err != nil {
-			c.cleanupConnection()
+		authCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+		err = c.authenticate(authCtx, generation)
+		cancel()
+		if err != nil {
+			c.cleanupConnection(generation, err)
+			generationWG.Wait()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			lastErr = fmt.Errorf("authentication failed: %w", err)
 			continue
 		}
 
 		c.mu.Lock()
+		if generation != c.generation || c.stopped {
+			c.mu.Unlock()
+			c.cleanupConnection(generation, fmt.Errorf("connection lost during authentication"))
+			generationWG.Wait()
+			lastErr = fmt.Errorf("connection lost during authentication")
+			continue
+		}
 		c.authenticated = true
-		atomic.StoreInt64(&c.lastPong, time.Now().Unix())
+		generationWG.Add(1)
 		c.mu.Unlock()
+		atomic.StoreInt64(&c.lastPong, time.Now().Unix())
 
-		go c.heartbeatLoop()
+		go c.heartbeatLoop(generation, heartbeatDone, generationWG)
 
 		klog.Infof("Conn %d: Connected and authenticated", c.id)
 		return nil
@@ -470,134 +541,135 @@ func (c *Connection) connectWithRetry() error {
 	return fmt.Errorf("failed to connect after %d attempts: %w", c.config.MaxRetries+1, lastErr)
 }
 
-// cleanupConnection closes the connection and stops goroutines.
-func (c *Connection) cleanupConnection() {
+func (c *Connection) startGeneration(wsConn *websocket.Conn) (uint64, chan writeRequest, chan struct{}, chan struct{}, *sync.WaitGroup, error) {
+	c.mu.RLock()
+	previousWG := c.generationWG
+	c.mu.RUnlock()
+	if previousWG != nil {
+		previousWG.Wait()
+	}
+
 	c.mu.Lock()
+	if c.shutdown.Load() {
+		c.mu.Unlock()
+		return 0, nil, nil, nil, nil, fmt.Errorf("connection closed")
+	}
+	c.generation++
+	generation := c.generation
+	writeCh := make(chan writeRequest, 100)
+	writeDone := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	generationWG := &sync.WaitGroup{}
+	generationWG.Add(2)
+	c.conn.Store(wsConn)
+	c.writeCh = writeCh
+	c.writeLoopDone = writeDone
+	c.heartbeatDone = heartbeatDone
+	c.generationWG = generationWG
+	c.authenticated = false
+	c.stopped = false
+	c.mu.Unlock()
+	return generation, writeCh, writeDone, heartbeatDone, generationWG, nil
+}
+
+// cleanupConnection closes one connection generation and stops its goroutines.
+func (c *Connection) cleanupConnection(generation uint64, cause error) {
+	if !c.stopGeneration(generation) {
+		return
+	}
+	c.failPending(generation, cause)
+}
+
+func (c *Connection) stopGeneration(generation uint64) bool {
+	c.mu.Lock()
+	if generation != c.generation || c.stopped {
+		c.mu.Unlock()
+		return false
+	}
+	c.stopped = true
+	c.authenticated = false
 	conn := c.conn.Swap(nil)
+	close(c.writeLoopDone)
+	close(c.heartbeatDone)
+	c.mu.Unlock()
 	if conn != nil {
 		_ = conn.Close()
 	}
-	c.authenticated = false
-	c.mu.Unlock()
-
-	c.closeMu.Lock()
-	if !c.writeLoopDoneClosed {
-		close(c.writeLoopDone)
-		c.writeLoopDoneClosed = true
-	}
-	if !c.heartbeatDoneClosed {
-		close(c.heartbeatDone)
-		c.heartbeatDoneClosed = true
-	}
-	c.closeMu.Unlock()
+	return true
 }
 
-// authenticateDirect performs API key authentication using direct write.
-func (c *Connection) authenticateDirect() error {
-	c.mu.Lock()
-	c.messageID++
-	id := c.messageID
-	c.mu.Unlock()
-
-	conn := c.conn.Load()
-	if conn == nil {
-		return fmt.Errorf("no connection")
-	}
-
-	req := rpcRequest{
-		JSONRPC: "2.0",
-		ID:      id,
-		Method:  "auth.login_with_api_key",
-		Params:  []interface{}{c.config.APIKey},
-	}
-
-	respChan := make(chan *rpcResponse, 1)
-	c.pendingMu.Lock()
-	c.pending[id] = respChan
-	c.pendingMu.Unlock()
-
-	if err := conn.WriteJSON(req); err != nil {
-		c.pendingMu.Lock()
-		delete(c.pending, id)
-		c.pendingMu.Unlock()
+func (c *Connection) authenticate(ctx context.Context, generation uint64) error {
+	result, err := c.callWithGeneration(ctx, generation, true, "auth.login_with_api_key", c.config.APIKey)
+	if err != nil {
 		return fmt.Errorf("failed to send auth request: %w", err)
 	}
-
-	select {
-	case resp := <-respChan:
-		if resp.Error != nil {
-			return &APIError{
-				Code:    resp.Error.Code,
-				Message: resp.Error.Message,
-				Data:    resp.Error.Data,
-			}
-		}
-		success, ok := resp.Result.(bool)
-		if !ok || !success {
-			return fmt.Errorf("authentication returned unexpected result: %v", resp.Result)
-		}
-		return nil
-	case <-time.After(c.config.Timeout):
-		// Drain response channel before deleting to prevent orphaned sends
-		select {
-		case <-respChan:
-		default:
-		}
-		c.pendingMu.Lock()
-		delete(c.pending, id)
-		c.pendingMu.Unlock()
-		return fmt.Errorf("authentication timeout")
+	success, ok := result.(bool)
+	if !ok || !success {
+		return fmt.Errorf("authentication returned unexpected result: %v", result)
 	}
+	return nil
 }
 
-// writeLoop handles all WebSocket writes.
-func (c *Connection) writeLoop() {
+// writeLoop handles all WebSocket writes. Invariant: this is the only function
+// that calls WriteJSON, including authentication and heartbeat requests.
+func (c *Connection) writeLoop(generation uint64, conn *websocket.Conn, writeCh <-chan writeRequest, done <-chan struct{}, generationWG *sync.WaitGroup) {
+	defer generationWG.Done()
 	for {
 		select {
-		case <-c.writeLoopDone:
+		case <-done:
 			return
-		case req, ok := <-c.writeCh:
+		case req, ok := <-writeCh:
 			if !ok {
 				return
 			}
 
-			conn := c.conn.Load()
-
-			var err error
-			if conn == nil {
-				err = fmt.Errorf("no connection")
-			} else {
+			c.sendMu.Lock()
+			writeTimeout := c.config.WriteTimeout
+			if writeTimeout <= 0 {
+				writeTimeout = defaultWriteTimeout
+			}
+			var err = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err == nil {
 				err = conn.WriteJSON(req.data)
 			}
+			if err == nil {
+				c.pendingMu.Lock()
+				if pending, ok := c.pending[req.id]; ok && pending.generation == generation {
+					pending.sent = true
+				}
+				c.pendingMu.Unlock()
+			}
+			c.sendMu.Unlock()
 
 			select {
 			case req.resultCh <- err:
 			default:
+			}
+			if err != nil {
+				c.handleDisconnect(generation, fmt.Errorf("websocket write failed: %w", err))
+				return
 			}
 		}
 	}
 }
 
 // heartbeatLoop sends periodic pings.
-func (c *Connection) heartbeatLoop() {
+func (c *Connection) heartbeatLoop(generation uint64, done <-chan struct{}, generationWG *sync.WaitGroup) {
+	defer generationWG.Done()
 	ticker := time.NewTicker(c.config.HeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-c.heartbeatDone:
+		case <-done:
 			return
 		case <-ticker.C:
-			c.mu.RLock()
-			closed := c.closed
-			c.mu.RUnlock()
-
-			if closed || c.conn.Load() == nil {
+			if !c.isGenerationActive(generation) {
 				return
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_, err := c.CallWithContext(ctx, "core.ping")
+			_, err := c.callWithGeneration(ctx, generation, false, "core.ping")
 			cancel()
 
 			if err != nil {
@@ -605,7 +677,7 @@ func (c *Connection) heartbeatLoop() {
 				lastPong := atomic.LoadInt64(&c.lastPong)
 				if time.Since(time.Unix(lastPong, 0)) > c.config.HeartbeatInterval*3 {
 					klog.Errorf("Conn %d: Connection appears dead, reconnecting", c.id)
-					c.handleDisconnect()
+					c.handleDisconnect(generation, err)
 					return
 				}
 			} else {
@@ -615,15 +687,22 @@ func (c *Connection) heartbeatLoop() {
 	}
 }
 
+func (c *Connection) isGenerationActive(generation uint64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return generation == c.generation && !c.stopped && c.conn.Load() != nil
+}
+
 // readMessages reads incoming WebSocket messages.
 // Uses a read deadline to prevent goroutine leaks when the connection dies without error.
-func (c *Connection) readMessages() {
+func (c *Connection) readMessages(generation uint64, conn *websocket.Conn, generationWG *sync.WaitGroup) {
+	defer generationWG.Done()
 	// Recover from gorilla/websocket panics (e.g., "repeated read on failed websocket connection")
 	// This can happen if the connection fails between timeout checks
 	defer func() {
 		if r := recover(); r != nil {
 			klog.Warningf("Conn %d: Recovered from WebSocket panic: %v", c.id, r)
-			c.handleDisconnect()
+			c.handleDisconnect(generation, fmt.Errorf("websocket read panic: %v", r))
 		}
 	}()
 
@@ -633,12 +712,7 @@ func (c *Connection) readMessages() {
 	const readDeadlineInterval = 45 * time.Second
 
 	for {
-		c.mu.RLock()
-		closed := c.closed
-		c.mu.RUnlock()
-
-		conn := c.conn.Load()
-		if closed || conn == nil {
+		if !c.isGenerationActive(generation) {
 			return
 		}
 
@@ -655,19 +729,16 @@ func (c *Connection) readMessages() {
 				continue
 			}
 
-			c.mu.RLock()
-			wasClosed := c.closed
-			c.mu.RUnlock()
-			if !wasClosed {
+			if c.isGenerationActive(generation) {
 				klog.Errorf("Conn %d: WebSocket read error: %v", c.id, err)
 			}
-			c.handleDisconnect()
+			c.handleDisconnect(generation, err)
 			return
 		}
 
 		c.pendingMu.Lock()
-		if ch, ok := c.pending[resp.ID]; ok {
-			ch <- &resp
+		if pending, ok := c.pending[resp.ID]; ok && pending.generation == generation {
+			pending.responseCh <- &resp
 			delete(c.pending, resp.ID)
 		}
 		c.pendingMu.Unlock()
@@ -675,168 +746,166 @@ func (c *Connection) readMessages() {
 }
 
 // handleDisconnect handles WebSocket disconnection.
-func (c *Connection) handleDisconnect() {
-	atomic.StoreInt32(&c.connState, int32(stateDisconnected))
-
-	c.mu.Lock()
-	c.authenticated = false
-	c.mu.Unlock()
-
-	conn := c.conn.Swap(nil)
-	if conn != nil {
-		_ = conn.Close()
+func (c *Connection) handleDisconnect(generation uint64, cause error) {
+	if !c.stopGeneration(generation) {
+		return
 	}
+	atomic.CompareAndSwapInt32(&c.connState, int32(stateConnected), int32(stateDisconnected))
+	c.failPending(generation, cause)
+}
 
-	c.closeMu.Lock()
-	if !c.writeLoopDoneClosed {
-		close(c.writeLoopDone)
-		c.writeLoopDoneClosed = true
-	}
-	if !c.heartbeatDoneClosed {
-		close(c.heartbeatDone)
-		c.heartbeatDoneClosed = true
-	}
-	c.closeMu.Unlock()
-
+func (c *Connection) failPending(generation uint64, cause error) {
+	// Wait for an in-progress write to finish so successful writes are marked as
+	// sent before pending requests are classified.
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	c.pendingMu.Lock()
-	for id, ch := range c.pending {
+	defer c.pendingMu.Unlock()
+	for id, pending := range c.pending {
+		if pending.generation != generation {
+			continue
+		}
+		transportErr := fmt.Errorf("connection lost before request was sent: %w", cause)
+		if pending.sent {
+			transportErr = fmt.Errorf("%w: connection lost after %s was sent: %v", ErrAmbiguousResult, pending.method, cause)
+		}
 		select {
-		case ch <- &rpcResponse{
-			ID: id,
-			Error: &rpcError{
-				Code:    -1,
-				Message: "connection lost",
-			},
+		case pending.responseCh <- &rpcResponse{
+			ID:           id,
+			transportErr: transportErr,
 		}:
 		default:
 		}
 		delete(c.pending, id)
 	}
-	c.pendingMu.Unlock()
-
-	c.connCond.Broadcast()
 }
 
 // CallWithContext makes a JSON-RPC call using this connection.
 func (c *Connection) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
-	if c.conn.Load() == nil {
-		if err := c.connect(); err != nil {
-			return nil, err
-		}
+	if err := c.connect(ctx); err != nil {
+		return nil, err
 	}
+	c.mu.RLock()
+	generation := c.generation
+	c.mu.RUnlock()
+	return c.callWithGeneration(ctx, generation, false, method, params...)
+}
 
+func (c *Connection) callWithGeneration(ctx context.Context, generation uint64, allowUnauthenticated bool, method string, params ...interface{}) (interface{}, error) {
 	c.mu.Lock()
+	if generation != c.generation || c.stopped || c.conn.Load() == nil || (!allowUnauthenticated && !c.authenticated) {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("connection lost before request was sent")
+	}
 	c.messageID++
 	id := c.messageID
 	writeCh := c.writeCh
-	c.mu.Unlock()
-
-	req := rpcRequest{
-		JSONRPC: "2.0",
-		ID:      id,
-		Method:  method,
-		Params:  params,
-	}
-
 	respChan := make(chan *rpcResponse, 1)
 	c.pendingMu.Lock()
-	c.pending[id] = respChan
+	c.pending[id] = &pendingCall{
+		responseCh: respChan,
+		generation: generation,
+		method:     method,
+	}
 	c.pendingMu.Unlock()
+	c.mu.Unlock()
 
 	writeReq := writeRequest{
-		data:     req,
+		id: id,
+		data: rpcRequest{
+			JSONRPC: "2.0",
+			ID:      id,
+			Method:  method,
+			Params:  params,
+		},
 		resultCh: make(chan error, 1),
 	}
 
 	select {
 	case writeCh <- writeReq:
+	case resp := <-respChan:
+		return responseResult(resp)
 	case <-ctx.Done():
-		// Drain response channel before deleting to prevent orphaned sends
-		select {
-		case <-respChan:
-		default:
-		}
-		c.pendingMu.Lock()
-		delete(c.pending, id)
-		c.pendingMu.Unlock()
-		return nil, ctx.Err()
+		return c.canceledCallResult(id, method, respChan, ctx.Err())
 	}
 
 	select {
 	case err := <-writeReq.resultCh:
 		if err != nil {
-			c.pendingMu.Lock()
-			delete(c.pending, id)
-			c.pendingMu.Unlock()
+			c.deletePending(id, respChan)
 			return nil, fmt.Errorf("failed to send request: %w", err)
 		}
+	case resp := <-respChan:
+		return responseResult(resp)
 	case <-ctx.Done():
-		// Drain response channel before deleting to prevent orphaned sends
-		select {
-		case <-respChan:
-		default:
-		}
-		c.pendingMu.Lock()
-		delete(c.pending, id)
-		c.pendingMu.Unlock()
-		return nil, ctx.Err()
+		return c.canceledCallResult(id, method, respChan, ctx.Err())
 	}
 
 	klog.V(4).Infof("Conn %d: Call: %s", c.id, method)
 
 	select {
 	case resp := <-respChan:
-		if resp.Error != nil {
-			return nil, &APIError{
-				Code:    resp.Error.Code,
-				Message: resp.Error.Message,
-				Data:    resp.Error.Data,
-			}
-		}
-		return resp.Result, nil
+		return responseResult(resp)
 	case <-ctx.Done():
-		// Drain the response channel first to catch any response that arrived
-		// between checking ctx.Done() and acquiring the lock.
-		// The channel is buffered (size 1), so this is non-blocking.
-		select {
-		case <-respChan:
-		default:
-		}
-		// Now delete from pending. If a response arrives after this point,
-		// readMessages() won't find the channel in pending, so the send is skipped.
-		// This is safe because we already drained the channel above.
-		c.pendingMu.Lock()
+		return c.canceledCallResult(id, method, respChan, ctx.Err())
+	}
+}
+
+func (c *Connection) canceledCallResult(id int64, method string, responseCh <-chan *rpcResponse, ctxErr error) (interface{}, error) {
+	c.pendingMu.Lock()
+	select {
+	case resp := <-responseCh:
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
-		return nil, fmt.Errorf("request timeout: %s", method)
+		return responseResult(resp)
+	default:
 	}
+	pending, ok := c.pending[id]
+	sent := ok && pending.sent
+	delete(c.pending, id)
+	c.pendingMu.Unlock()
+
+	if sent {
+		return nil, fmt.Errorf("%w: %s was sent before the caller context ended: %w", ErrAmbiguousResult, method, ctxErr)
+	}
+	return nil, ctxErr
+}
+
+func (c *Connection) deletePending(id int64, responseCh <-chan *rpcResponse) {
+	select {
+	case <-responseCh:
+	default:
+	}
+	c.pendingMu.Lock()
+	delete(c.pending, id)
+	c.pendingMu.Unlock()
+}
+
+func responseResult(resp *rpcResponse) (interface{}, error) {
+	if resp.transportErr != nil {
+		return nil, resp.transportErr
+	}
+	if resp.Error != nil {
+		return nil, &APIError{
+			Code:    resp.Error.Code,
+			Message: resp.Error.Message,
+			Data:    resp.Error.Data,
+		}
+	}
+	return resp.Result, nil
 }
 
 // Close closes the connection.
 func (c *Connection) Close() error {
-	c.mu.Lock()
-	c.closed = true
-	c.mu.Unlock()
-
-	conn := c.conn.Swap(nil)
-
+	c.shutdown.Store(true)
+	c.mu.RLock()
+	generation := c.generation
+	generationWG := c.generationWG
+	c.mu.RUnlock()
+	c.cleanupConnection(generation, fmt.Errorf("connection closed"))
 	atomic.StoreInt32(&c.connState, int32(stateDisconnected))
-
-	c.closeMu.Lock()
-	if !c.writeLoopDoneClosed {
-		close(c.writeLoopDone)
-		c.writeLoopDoneClosed = true
-	}
-	if !c.heartbeatDoneClosed {
-		close(c.heartbeatDone)
-		c.heartbeatDoneClosed = true
-	}
-	c.closeMu.Unlock()
-
-	c.connCond.Broadcast()
-
-	if conn != nil {
-		return conn.Close()
+	if generationWG != nil {
+		generationWG.Wait()
 	}
 	return nil
 }
@@ -858,14 +927,26 @@ func (c *Client) Call(ctx context.Context, method string, params ...interface{})
 // Implements circuit breaker pattern and automatic retry on connection errors with exponential backoff.
 func (c *Client) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
 	start := time.Now()
+	var halfOpenProbe bool
+	var breakerOutcomeRecorded bool
 
-	// Check circuit breaker first
-	if c.circuitBreaker != nil && !c.circuitBreaker.Allow() {
-		err := fmt.Errorf("API call %s blocked: %w", method, ErrCircuitOpen)
-		if c.metricsRecorder != nil {
-			c.metricsRecorder(method, time.Since(start).Seconds(), err)
+	// Admit the logical call exactly once. Retries below only inspect state and
+	// never consume additional half-open probe slots.
+	if c.circuitBreaker != nil {
+		admission := c.circuitBreaker.admit()
+		if !admission.allowed {
+			err := fmt.Errorf("API call %s blocked: %w", method, ErrCircuitOpen)
+			if c.metricsRecorder != nil {
+				c.metricsRecorder(method, time.Since(start).Seconds(), err)
+			}
+			return nil, err
 		}
-		return nil, err
+		halfOpenProbe = admission.halfOpenProbe
+		defer func() {
+			if halfOpenProbe && !breakerOutcomeRecorded {
+				c.circuitBreaker.RecordFailure()
+			}
+		}()
 	}
 
 	// Acquire semaphore slot (limit concurrent requests)
@@ -882,6 +963,16 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 	retryDelay := c.config.APIRetryInitialDelay
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Abort if another logical call opened the circuit while this call was
+		// backing off. State is non-consuming, unlike admission above.
+		if c.circuitBreaker != nil && c.circuitBreaker.State() == CircuitOpen {
+			err := fmt.Errorf("API call %s blocked: %w", method, ErrCircuitOpen)
+			if c.metricsRecorder != nil {
+				c.metricsRecorder(method, time.Since(start).Seconds(), err)
+			}
+			return nil, err
+		}
+
 		// Select best available connection
 		conn := c.selectConnection()
 
@@ -890,6 +981,7 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 			// Record success with circuit breaker
 			if c.circuitBreaker != nil {
 				c.circuitBreaker.RecordSuccess()
+				breakerOutcomeRecorded = true
 			}
 			// Record successful request metrics
 			if c.metricsRecorder != nil {
@@ -897,11 +989,38 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 			}
 			return result, nil
 		}
+		if errors.Is(err, ErrAmbiguousResult) && !isIdempotentAPIMethod(method) {
+			// Mutations are not retried after a successful write because the server
+			// may already have applied them.
+			if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+				err = errors.Join(err, ctxErr)
+			}
+			if c.circuitBreaker != nil {
+				c.circuitBreaker.RecordFailure()
+				breakerOutcomeRecorded = true
+			}
+			if c.metricsRecorder != nil {
+				c.metricsRecorder(method, time.Since(start).Seconds(), err)
+			}
+			return nil, err
+		}
+		if ctx.Err() != nil {
+			if c.metricsRecorder != nil {
+				c.metricsRecorder(method, time.Since(start).Seconds(), ctx.Err())
+			}
+			return nil, ctx.Err()
+		}
 
 		// Check if error is retryable (connection-related)
 		if !IsConnectionError(err) {
 			// Not a connection error - return immediately (API errors, not found, etc.)
-			// Don't record with circuit breaker for non-connection errors (e.g., "not found" is not a circuit issue)
+			// An API-level error still proves the transport round-trip worked, so a
+			// half-open probe must count it as breaker success — otherwise a benign
+			// "not found" reply would reopen the circuit on a healthy connection.
+			if c.circuitBreaker != nil {
+				c.circuitBreaker.RecordSuccess()
+				breakerOutcomeRecorded = true
+			}
 			// Record failed request metrics
 			if c.metricsRecorder != nil {
 				c.metricsRecorder(method, time.Since(start).Seconds(), err)
@@ -909,23 +1028,25 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 			return nil, err
 		}
 
-		// Record failure with circuit breaker for connection errors
-		if c.circuitBreaker != nil {
-			c.circuitBreaker.RecordFailure()
-		}
-
 		lastErr = err
 		klog.V(2).Infof("API call %s failed on conn %d (attempt %d/%d): %v", method, conn.id, attempt+1, maxRetries, err)
 
 		// Don't retry on last attempt or if context is done
 		if attempt < maxRetries-1 {
+			timer := time.NewTimer(retryDelay)
 			select {
-			case <-time.After(retryDelay):
+			case <-timer.C:
 				retryDelay = time.Duration(float64(retryDelay) * c.config.APIRetryBackoffFactor)
 				if retryDelay > c.config.APIRetryMaxDelay {
 					retryDelay = c.config.APIRetryMaxDelay
 				}
 			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				finalErr := fmt.Errorf("context canceled during retry: %w", ctx.Err())
 				if c.metricsRecorder != nil {
 					c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
@@ -936,11 +1057,30 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 	}
 
 	finalErr := fmt.Errorf("API call %s failed after %d retries: %w", method, maxRetries, lastErr)
+	if c.circuitBreaker != nil {
+		c.circuitBreaker.RecordFailure()
+		breakerOutcomeRecorded = true
+	}
 	// Record failed request metrics after all retries exhausted
 	if c.metricsRecorder != nil {
 		c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
 	}
 	return nil, finalErr
+}
+
+// isIdempotentAPIMethod is deliberately conservative: only known read-only
+// operation names may be retried after an ambiguous post-write disconnect.
+func isIdempotentAPIMethod(method string) bool {
+	operation := method
+	if index := strings.LastIndexByte(method, '.'); index >= 0 {
+		operation = method[index+1:]
+	}
+	switch operation {
+	case "query", "get", "get_instance", "lookup", "config", "info", "ping":
+		return true
+	default:
+		return strings.HasSuffix(operation, "_choices")
+	}
 }
 
 // CircuitBreakerStats returns statistics about the circuit breaker.

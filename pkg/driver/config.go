@@ -67,6 +67,9 @@ type TrueNASConfig struct {
 	// ConnectTimeout is the timeout for establishing connections in seconds (default: 10)
 	ConnectTimeout int `yaml:"connectTimeout"`
 
+	// WriteTimeout is the timeout for each WebSocket write in seconds (default: 30)
+	WriteTimeout int `yaml:"writeTimeout"`
+
 	// MaxConcurrentRequests limits concurrent API requests to prevent overwhelming TrueNAS (default: 10)
 	MaxConcurrentRequests int `yaml:"maxConcurrentRequests"`
 }
@@ -375,6 +378,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.TrueNAS.ConnectTimeout == 0 {
 		cfg.TrueNAS.ConnectTimeout = 10
+	}
+	if cfg.TrueNAS.WriteTimeout == 0 {
+		cfg.TrueNAS.WriteTimeout = 30
 	}
 	if cfg.ZFS.ZvolBlocksize == "" {
 		cfg.ZFS.ZvolBlocksize = "16K"

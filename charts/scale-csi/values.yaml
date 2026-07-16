@@ -97,6 +97,9 @@ truenas:
   # Request timeout in seconds (default: 60)
   requestTimeout: 60
 
+  # WebSocket write timeout in seconds (default: 30)
+  writeTimeout: 30
+
   # Maximum concurrent API requests to TrueNAS (default: 10)
   # Lower this if TrueNAS becomes overloaded with many PVC operations
   maxConcurrentRequests: 10

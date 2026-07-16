@@ -218,3 +218,22 @@ func TestCircuitBreaker_SuccessResetsFailureCount(t *testing.T) {
 	cb.RecordFailure()
 	assert.Equal(t, CircuitOpen, cb.State())
 }
+
+func TestCircuitBreaker_ClampsSuccessThresholdToHalfOpenLimit(t *testing.T) {
+	cb := NewCircuitBreaker(&CircuitBreakerConfig{
+		Enabled:             true,
+		FailureThreshold:    1,
+		SuccessThreshold:    5,
+		Timeout:             time.Millisecond,
+		HalfOpenMaxRequests: 2,
+	})
+
+	cb.RecordFailure()
+	time.Sleep(2 * time.Millisecond)
+	assert.True(t, cb.Allow())
+	cb.RecordSuccess()
+	assert.Equal(t, CircuitHalfOpen, cb.State())
+	assert.True(t, cb.Allow())
+	cb.RecordSuccess()
+	assert.Equal(t, CircuitClosed, cb.State())
+}

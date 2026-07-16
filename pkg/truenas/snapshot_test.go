@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -13,10 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// resetSnapshotAPIPrefix resets the API prefix detection for testing
+// resetSnapshotAPIPrefix is retained for existing tests; prefix state is now
+// scoped to each newly-created client.
 func resetSnapshotAPIPrefix() {
-	snapshotAPIPrefix = ""
-	snapshotAPIPrefixOnce = sync.Once{}
 }
 
 // TestSnapshotCreate_Success tests creating a snapshot
