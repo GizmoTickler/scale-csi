@@ -256,14 +256,14 @@ func TestNVMeoFConnectWithOptions(t *testing.T) {
 		return "/dev/nvme0n1", nil
 	}
 
-	// We can't easily mock nvmeConnect since it calls exec.Command
+	// We can't easily mock nvmeConnectWithSubsystems since it calls exec.Command
 	// But we can test the options handling logic if we mock waitForNVMeDevice failure
 
 	t.Run("Default Timeout", func(t *testing.T) {
 		// This test mainly verifies compilation and basic logic flow
-		// Since we can't mock nvmeConnect easily without more refactoring,
+		// Since we can't mock nvmeConnectWithSubsystems easily without more refactoring,
 		// we'll rely on the fact that waitForNVMeDevice is called.
-		// However, nvmeConnect will likely fail in this environment.
+		// However, nvmeConnectWithSubsystems will likely fail in this environment.
 		// So we might need to skip the actual connect part or mock it too.
 		// For now, let's just test the timeout logic by mocking findNVMeDevice to fail
 		// and seeing if it respects the timeout.
@@ -272,8 +272,8 @@ func TestNVMeoFConnectWithOptions(t *testing.T) {
 			return "", fmt.Errorf("not found")
 		}
 
-		// We need to bypass nvmeConnect failure.
-		// Since we didn't refactor nvmeConnect, this is hard.
+		// We need to bypass nvmeConnectWithSubsystems failure.
+		// Since we didn't refactor nvmeConnectWithSubsystems, this is hard.
 		// Let's assume for this unit test we only care about waitForNVMeDevice logic
 		// which is already tested above.
 		// The NVMeoFConnectWithOptions mainly passes the timeout.

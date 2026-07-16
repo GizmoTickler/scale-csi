@@ -220,12 +220,6 @@ func (d *Driver) createISCSIShare(ctx context.Context, datasetName, volumeName s
 	return d.createISCSIShareForDataset(ctx, nil, datasetName, volumeName, false, false)
 }
 
-// createISCSIShareWithOptions creates iSCSI share with additional options.
-// skipZvolWait skips the WaitForZvolReady call (used when zvol is freshly cloned).
-func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, volumeName string, skipZvolWait bool) error {
-	return d.createISCSIShareForDataset(ctx, nil, datasetName, volumeName, false, skipZvolWait)
-}
-
 func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool) error {
 	start := time.Now()
 	klog.Infof("createISCSIShare: starting for dataset %s", datasetName)
@@ -246,9 +240,9 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	existingTE := datasetUserProperty(ds, PropISCSITargetExtentID)
 	if !freshlyCreated && existingTE != "" && existingTE != "-" {
 		// Verify the target-extent still exists by looking it up by ID
-		teID, err := strconv.Atoi(existingTE)
-		if err == nil {
-			if te, err := d.truenasClient.ISCSITargetExtentGet(ctx, teID); err == nil && te != nil {
+		teID, atoiErr := strconv.Atoi(existingTE)
+		if atoiErr == nil {
+			if te, findErr := d.truenasClient.ISCSITargetExtentGet(ctx, teID); findErr == nil && te != nil {
 				klog.Infof("iSCSI share already fully configured for %s (targetextent=%d)", datasetName, teID)
 				return nil
 			}
@@ -263,8 +257,8 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	// Check if we have a stored target ID
 	existingTargetID := datasetUserProperty(ds, PropISCSITargetID)
 	if !freshlyCreated && existingTargetID != "" && existingTargetID != "-" {
-		if id, err := strconv.Atoi(existingTargetID); err == nil {
-			if t, err := d.truenasClient.ISCSITargetGet(ctx, id); err == nil {
+		if id, atoiErr := strconv.Atoi(existingTargetID); atoiErr == nil {
+			if t, findErr := d.truenasClient.ISCSITargetGet(ctx, id); findErr == nil {
 				target = t
 				targetID = t.ID
 				klog.V(4).Infof("Using existing target ID %d for %s", targetID, datasetName)
@@ -274,7 +268,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 
 	// If no stored target, check by name
 	if !freshlyCreated && target == nil {
-		if t, err := d.truenasClient.ISCSITargetFindByName(ctx, iscsiName); err == nil && t != nil {
+		if t, findErr := d.truenasClient.ISCSITargetFindByName(ctx, iscsiName); findErr == nil && t != nil {
 			target = t
 			targetID = t.ID
 			klog.V(4).Infof("Found existing target by name %s (ID %d)", iscsiName, targetID)
@@ -301,9 +295,6 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 		if err != nil {
 			if freshlyCreated && truenas.IsAlreadyExistsError(err) {
 				target, _ = d.truenasClient.ISCSITargetFindByName(ctx, iscsiName)
-				if target != nil {
-					targetID = target.ID
-				}
 			}
 		}
 		if target == nil {
@@ -319,8 +310,8 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	if !zvolReady {
 		zvolTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
 		klog.V(4).Infof("Waiting for zvol %s to be ready before creating extent (timeout: %v)", datasetName, zvolTimeout)
-		if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolTimeout); err != nil {
-			klog.Warningf("Zvol readiness check failed (will attempt extent creation anyway): %v", err)
+		if _, waitErr := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolTimeout); waitErr != nil {
+			klog.Warningf("Zvol readiness check failed (will attempt extent creation anyway): %v", waitErr)
 		}
 	} else {
 		klog.V(4).Infof("Skipping zvol wait for %s (already verified ready)", datasetName)
@@ -588,17 +579,6 @@ func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	return nil
 }
 
-// createNVMeoFShare creates NVMe-oF subsystem and namespace.
-func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName, volumeName string) error {
-	return d.createNVMeoFShareForDataset(ctx, nil, datasetName, volumeName, false, false)
-}
-
-// createNVMeoFShareWithOptions creates NVMe-oF share with additional options.
-// skipZvolWait skips the WaitForZvolReady call (used when zvol is freshly cloned).
-func (d *Driver) createNVMeoFShareWithOptions(ctx context.Context, datasetName, volumeName string, skipZvolWait bool) error {
-	return d.createNVMeoFShareForDataset(ctx, nil, datasetName, volumeName, false, skipZvolWait)
-}
-
 func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool) error {
 	var err error
 	ds, err = d.datasetForProperties(ctx, ds, datasetName)
@@ -628,8 +608,8 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	if !zvolReady {
 		zvolTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
 		klog.V(4).Infof("Waiting for zvol %s to be ready before creating NVMe-oF share (timeout: %v)", datasetName, zvolTimeout)
-		if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolTimeout); err != nil {
-			klog.Warningf("Zvol readiness check failed (will attempt share creation anyway): %v", err)
+		if _, waitErr := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolTimeout); waitErr != nil {
+			klog.Warningf("Zvol readiness check failed (will attempt share creation anyway): %v", waitErr)
 		}
 	} else {
 		klog.V(4).Infof("Skipping zvol wait for %s (already verified ready)", datasetName)
@@ -715,7 +695,7 @@ func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		ds = fetched
 	}
 
-	// Generate the expected NVMe-oF subsystem name (same logic as createNVMeoFShare)
+	// Generate the expected NVMe-oF subsystem name (same logic as createNVMeoFShareForDataset)
 	subsysName := path.Base(datasetName)
 	if d.config.NVMeoF.NamePrefix != "" {
 		subsysName = d.config.NVMeoF.NamePrefix + subsysName

@@ -158,6 +158,14 @@ type pendingCall struct {
 	sent       bool
 }
 
+type generationHandles struct {
+	generation    uint64
+	writeCh       chan writeRequest
+	writeDone     chan struct{}
+	heartbeatDone chan struct{}
+	waitGroup     *sync.WaitGroup
+}
+
 // connectionState represents the current state of the connection.
 type connectionState int32
 
@@ -497,20 +505,20 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 			continue
 		}
 
-		generation, writeCh, writeDone, heartbeatDone, generationWG, err := c.startGeneration(wsConn)
+		handles, err := c.startGeneration(wsConn)
 		if err != nil {
 			_ = wsConn.Close()
 			return err
 		}
-		go c.readMessages(generation, wsConn, generationWG)
-		go c.writeLoop(generation, wsConn, writeCh, writeDone, generationWG)
+		go c.readMessages(handles.generation, wsConn, handles.waitGroup)
+		go c.writeLoop(handles.generation, wsConn, handles.writeCh, handles.writeDone, handles.waitGroup)
 
 		authCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
-		err = c.authenticate(authCtx, generation)
+		err = c.authenticate(authCtx, handles.generation)
 		cancel()
 		if err != nil {
-			c.cleanupConnection(generation, err)
-			generationWG.Wait()
+			c.cleanupConnection(handles.generation, err)
+			handles.waitGroup.Wait()
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -519,19 +527,19 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 		}
 
 		c.mu.Lock()
-		if generation != c.generation || c.stopped {
+		if handles.generation != c.generation || c.stopped {
 			c.mu.Unlock()
-			c.cleanupConnection(generation, fmt.Errorf("connection lost during authentication"))
-			generationWG.Wait()
+			c.cleanupConnection(handles.generation, fmt.Errorf("connection lost during authentication"))
+			handles.waitGroup.Wait()
 			lastErr = fmt.Errorf("connection lost during authentication")
 			continue
 		}
 		c.authenticated = true
-		generationWG.Add(1)
+		handles.waitGroup.Add(1)
 		c.mu.Unlock()
 		atomic.StoreInt64(&c.lastPong, time.Now().Unix())
 
-		go c.heartbeatLoop(generation, heartbeatDone, generationWG)
+		go c.heartbeatLoop(handles.generation, handles.heartbeatDone, handles.waitGroup)
 
 		klog.Infof("Conn %d: Connected and authenticated", c.id)
 		return nil
@@ -540,7 +548,7 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 	return fmt.Errorf("failed to connect after %d attempts: %w", c.config.MaxRetries+1, lastErr)
 }
 
-func (c *Connection) startGeneration(wsConn *websocket.Conn) (uint64, chan writeRequest, chan struct{}, chan struct{}, *sync.WaitGroup, error) {
+func (c *Connection) startGeneration(wsConn *websocket.Conn) (generationHandles, error) {
 	c.mu.RLock()
 	previousWG := c.generationWG
 	c.mu.RUnlock()
@@ -551,7 +559,7 @@ func (c *Connection) startGeneration(wsConn *websocket.Conn) (uint64, chan write
 	c.mu.Lock()
 	if c.shutdown.Load() {
 		c.mu.Unlock()
-		return 0, nil, nil, nil, nil, fmt.Errorf("connection closed")
+		return generationHandles{}, fmt.Errorf("connection closed")
 	}
 	c.generation++
 	generation := c.generation
@@ -568,7 +576,13 @@ func (c *Connection) startGeneration(wsConn *websocket.Conn) (uint64, chan write
 	c.authenticated = false
 	c.stopped = false
 	c.mu.Unlock()
-	return generation, writeCh, writeDone, heartbeatDone, generationWG, nil
+	return generationHandles{
+		generation:    generation,
+		writeCh:       writeCh,
+		writeDone:     writeDone,
+		heartbeatDone: heartbeatDone,
+		waitGroup:     generationWG,
+	}, nil
 }
 
 // cleanupConnection closes one connection generation and stops its goroutines.
@@ -766,7 +780,7 @@ func (c *Connection) failPending(generation uint64, cause error) {
 		}
 		transportErr := fmt.Errorf("connection lost before request was sent: %w", cause)
 		if pending.sent {
-			transportErr = fmt.Errorf("%w: connection lost after %s was sent: %v", ErrAmbiguousResult, pending.method, cause)
+			transportErr = fmt.Errorf("%w: connection lost after %s was sent: %w", ErrAmbiguousResult, pending.method, cause)
 		}
 		select {
 		case pending.responseCh <- &rpcResponse{

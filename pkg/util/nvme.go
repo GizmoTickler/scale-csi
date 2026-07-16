@@ -185,16 +185,6 @@ func parseTransportURI(transportURI string) (transport, host, port string, err e
 	return transport, host, port, nil
 }
 
-// nvmeConnect connects to an NVMe-oF subsystem.
-func nvmeConnect(ctx context.Context, transport, host, port, nqn string) error {
-	subsystems, err := ListNVMeSubsystems(ctx)
-	if err != nil {
-		klog.Warningf("Failed to list NVMe subsystems: %v", err)
-	}
-
-	return nvmeConnectWithSubsystems(ctx, transport, host, port, nqn, subsystems)
-}
-
 func nvmeConnectWithSubsystems(ctx context.Context, transport, host, port, nqn string, subsystems []NVMeSubsystem) error {
 	// Check if already connected
 	if hasNVMeSubsystem(nqn, subsystems) {

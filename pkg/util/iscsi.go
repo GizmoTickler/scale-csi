@@ -360,18 +360,6 @@ func getLoginSemaphore(portal string) chan struct{} {
 	return newSem
 }
 
-// iscsiLoginSerialized performs iSCSI login with limited concurrency.
-// Allows up to getMaxConcurrentLogins() (2) concurrent logins per portal to prevent
-// overwhelming TrueNAS while still allowing some parallelism.
-func iscsiLoginSerialized(ctx context.Context, portal, iqn string) error {
-	sessions, err := ListISCSISessions()
-	if err != nil {
-		klog.Warningf("Failed to get iSCSI sessions: %v", err)
-	}
-
-	return iscsiLoginSerializedWithSessions(ctx, portal, iqn, sessions)
-}
-
 func iscsiLoginSerializedWithSessions(ctx context.Context, portal, iqn string, sessions []ISCSISessionInfo) error {
 	// Acquire semaphore slot with context awareness
 	sem := getLoginSemaphore(portal)
@@ -381,16 +369,6 @@ func iscsiLoginSerializedWithSessions(ctx context.Context, portal, iqn string, s
 		defer func() { <-sem }()
 	case <-ctx.Done():
 		return fmt.Errorf("context canceled waiting for login slot: %w", ctx.Err())
-	}
-
-	return iscsiLoginWithSessions(ctx, portal, iqn, sessions)
-}
-
-// iscsiLogin logs into an iSCSI target.
-func iscsiLogin(ctx context.Context, portal, iqn string) error {
-	sessions, err := ListISCSISessions()
-	if err != nil {
-		klog.Warningf("Failed to get iSCSI sessions: %v", err)
 	}
 
 	return iscsiLoginWithSessions(ctx, portal, iqn, sessions)
