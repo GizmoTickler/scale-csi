@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -200,10 +201,24 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offs
 
 // DatasetSetUserProperty sets a user property on a dataset.
 func (c *Client) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
+	return c.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
+}
+
+// DatasetSetUserProperties sets multiple user properties on a dataset in one update.
+func (c *Client) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
+	keys := make([]string, 0, len(properties))
+	for key := range properties {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	updates := make([]UserPropertyUpdate, 0, len(keys))
+	for _, key := range keys {
+		updates = append(updates, UserPropertyUpdate{Key: key, Value: properties[key]})
+	}
+
 	params := &DatasetUpdateParams{
-		UserPropertiesUpdate: []UserPropertyUpdate{
-			{Key: key, Value: value},
-		},
+		UserPropertiesUpdate: updates,
 	}
 
 	_, err := c.DatasetUpdate(ctx, name, params)

@@ -6,9 +6,42 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+type controllerCallCountingMock struct {
+	*truenas.MockClient
+	datasetGetCalls   int
+	snapshotListCalls int
+}
+
+type busyDatasetDeleteMock struct {
+	*controllerCallCountingMock
+}
+
+func (m *busyDatasetDeleteMock) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
+	if !recursive {
+		return &truenas.APIError{Code: -1, Message: "dataset is busy"}
+	}
+	return m.MockClient.DatasetDelete(ctx, name, recursive, force)
+}
+
+func newControllerCallCountingMock() *controllerCallCountingMock {
+	return &controllerCallCountingMock{MockClient: truenas.NewMockClient()}
+}
+
+func (m *controllerCallCountingMock) DatasetGet(ctx context.Context, name string) (*truenas.Dataset, error) {
+	m.datasetGetCalls++
+	return m.MockClient.DatasetGet(ctx, name)
+}
+
+func (m *controllerCallCountingMock) SnapshotList(ctx context.Context, dataset string) ([]*truenas.Snapshot, error) {
+	m.snapshotListCalls++
+	return m.MockClient.SnapshotList(ctx, dataset)
+}
 
 func TestCreateVolume(t *testing.T) {
 	// Setup
@@ -91,6 +124,102 @@ func TestDeleteVolume(t *testing.T) {
 	// Test Case 3: Missing ID
 	_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{})
 	assert.Error(t, err)
+}
+
+func TestGetVolumeContextUsesProvidedDatasetWithoutQuery(t *testing.T) {
+	mockClient := newControllerCallCountingMock()
+	d := &Driver{
+		config:        &Config{NFS: NFSConfig{ShareHost: "10.0.0.10"}},
+		truenasClient: mockClient,
+	}
+	ds := &truenas.Dataset{
+		Name:           "pool/parent/vol-context",
+		Type:           "FILESYSTEM",
+		Mountpoint:     "/mnt/pool/parent/vol-context",
+		UserProperties: map[string]truenas.UserProperty{},
+	}
+
+	volumeContext, err := d.getVolumeContext(context.Background(), ds, ds.Name, ShareTypeNFS)
+	assert.NoError(t, err)
+	assert.Equal(t, "/mnt/pool/parent/vol-context", volumeContext["share"])
+	assert.Zero(t, mockClient.datasetGetCalls)
+}
+
+func TestDeleteVolumeHappyPathListsSnapshotsOnce(t *testing.T) {
+	// The up-front dependent-snapshot check is deliberate: the share is deleted
+	// before the dataset, so discovering snapshots only after DatasetDelete
+	// fails would leave an existing volume with no share. One SnapshotList per
+	// delete is the accepted cost.
+	mockClient := newControllerCallCountingMock()
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+		},
+		truenasClient: mockClient,
+	}
+	_, err := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+		Name: "pool/parent/vol-fast-delete", Type: "FILESYSTEM",
+	})
+	assert.NoError(t, err)
+
+	_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "vol-fast-delete"})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, mockClient.datasetGetCalls)
+	assert.Equal(t, 1, mockClient.snapshotListCalls)
+}
+
+func TestDeleteVolumeWithManagedSnapshotFailsBeforeShareDeletion(t *testing.T) {
+	mockClient := newControllerCallCountingMock()
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "1.2.3.4"},
+		},
+		truenasClient: mockClient,
+	}
+	ctx := context.Background()
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/vol-snap-guard", Type: "FILESYSTEM",
+	})
+	assert.NoError(t, err)
+	share, err := mockClient.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: "/mnt/pool/parent/vol-snap-guard"})
+	assert.NoError(t, err)
+	snap, err := mockClient.SnapshotCreate(ctx, "pool/parent/vol-snap-guard", "snap-1")
+	assert.NoError(t, err)
+	assert.NoError(t, mockClient.SnapshotSetUserProperty(ctx, snap.ID, PropManagedResource, "true"))
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "vol-snap-guard"})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	// The guard must fire before share deletion: the share still exists.
+	remaining, listErr := mockClient.NFSShareGet(ctx, share.ID)
+	assert.NoError(t, listErr)
+	assert.NotNil(t, remaining)
+}
+
+func TestDeleteVolumeBusyDatasetChecksManagedSnapshots(t *testing.T) {
+	countingMock := newControllerCallCountingMock()
+	mockClient := &busyDatasetDeleteMock{controllerCallCountingMock: countingMock}
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+		},
+		truenasClient: mockClient,
+	}
+	datasetName := "pool/parent/vol-with-snapshot"
+	_, err := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "FILESYSTEM",
+	})
+	assert.NoError(t, err)
+	snapshot, err := mockClient.SnapshotCreate(context.Background(), datasetName, "managed")
+	assert.NoError(t, err)
+	snapshot.UserProperties[PropManagedResource] = truenas.UserProperty{Value: "true"}
+
+	_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "vol-with-snapshot"})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Equal(t, 1, countingMock.snapshotListCalls)
 }
 
 func TestCreateSnapshot(t *testing.T) {

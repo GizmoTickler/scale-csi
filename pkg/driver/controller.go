@@ -41,6 +41,19 @@ const (
 	PropNVMeoFPortSubsysID        = "truenas-csi:truenas_nvmeof_portsubsys_id"
 )
 
+func isDatasetDependencyOrBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"busy", "dependent", "snapshot", "has children", "method call error"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // ControllerGetCapabilities returns the capabilities of the controller.
 func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	klog.V(4).Info("ControllerGetCapabilities called")
@@ -252,37 +265,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			}
 		}
 
-		// Ensure properties are set (idempotent)
-		g, gCtx := errgroup.WithContext(ctx)
-		g.Go(func() error {
-			if prop, ok := existingDS.UserProperties[PropManagedResource]; ok && prop.Value == "true" {
-				return nil
-			}
-			if setErr := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropManagedResource, "true"); setErr != nil {
-				return fmt.Errorf("failed to set managed resource property: %w", setErr)
-			}
-			return nil
-		})
-		g.Go(func() error {
-			if prop, ok := existingDS.UserProperties[PropProvisionSuccess]; ok && prop.Value == "true" {
-				return nil
-			}
-			if setErr := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropProvisionSuccess, "true"); setErr != nil {
-				return fmt.Errorf("failed to set provision success property: %w", setErr)
-			}
-			return nil
-		})
-		g.Go(func() error {
-			if prop, ok := existingDS.UserProperties[PropCSIVolumeName]; ok && prop.Value == name {
-				return nil
-			}
-			if setErr := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropCSIVolumeName, name); setErr != nil {
-				return fmt.Errorf("failed to set CSI volume name property: %w", setErr)
-			}
-			return nil
-		})
-		// Wait for all property sets to complete
-		if waitErr := g.Wait(); waitErr != nil {
+		// Ensure properties are set (idempotent) in one API update.
+		propertyUpdates := make(map[string]string, 3)
+		if datasetUserProperty(existingDS, PropManagedResource) != "true" {
+			propertyUpdates[PropManagedResource] = "true"
+		}
+		if datasetUserProperty(existingDS, PropProvisionSuccess) != "true" {
+			propertyUpdates[PropProvisionSuccess] = "true"
+		}
+		if datasetUserProperty(existingDS, PropCSIVolumeName) != name {
+			propertyUpdates[PropCSIVolumeName] = name
+		}
+		if waitErr := d.setDatasetUserProperties(ctx, existingDS, datasetName, propertyUpdates); waitErr != nil {
 			klog.Errorf("Failed to ensure properties for existing volume %s: %v", volumeID, waitErr)
 			return nil, status.Errorf(codes.Internal, "failed to ensure volume properties: %v", waitErr)
 		}
@@ -294,7 +288,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			return nil, shareErr
 		}
 
-		volumeContext, ctxErr := d.getVolumeContext(ctx, datasetName, shareType)
+		volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType)
 		if ctxErr != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
 		}
@@ -306,29 +300,33 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			},
 		}, nil
 	}
+	freshlyCreated := truenas.IsNotFoundError(err)
 
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
-	var mountpoint string // For NFS shares, used to avoid extra DatasetGet call
-	isClonedVolume := false
+	var createdDS *truenas.Dataset
+	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
-		if srcErr := d.handleVolumeContentSource(ctx, datasetName, contentSource, capacityBytes); srcErr != nil {
+		var srcErr error
+		createdDS, srcErr = d.handleVolumeContentSource(ctx, datasetName, contentSource, capacityBytes)
+		if srcErr != nil {
 			return nil, srcErr
 		}
-		isClonedVolume = true // handleVolumeContentSource already called WaitForZvolReady
+		zvolReady = true
 	} else {
 		// Create new dataset
 		var createErr error
-		mountpoint, createErr = d.createDataset(ctx, datasetName, capacityBytes, shareType)
+		createdDS, createErr = d.createDataset(ctx, datasetName, capacityBytes, shareType)
 		if createErr != nil {
 			return nil, createErr
 		}
+		zvolReady = freshlyCreated
 	}
 
-	// Create share (NFS, iSCSI, or NVMe-oF)
-	// For cloned volumes, skip zvol wait since handleVolumeContentSource already waited
-	if shareErr := d.createShareWithOptions(ctx, datasetName, name, shareType, isClonedVolume, mountpoint); shareErr != nil {
+	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
+	// result and the clone readiness path do not need another zvol poll.
+	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, freshlyCreated, zvolReady); shareErr != nil {
 		// Cleanup on failure
 		if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, false); delErr != nil {
 			klog.Warningf("Failed to cleanup dataset after share creation failure: %v", delErr)
@@ -336,32 +334,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, shareErr
 	}
 
-	// Mark as managed and successful - run property sets in parallel
-	g, gCtx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		if setErr := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropManagedResource, "true"); setErr != nil {
-			return fmt.Errorf("failed to set managed resource property: %w", setErr)
-		}
-		return nil
-	})
-	g.Go(func() error {
-		if setErr := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropProvisionSuccess, "true"); setErr != nil {
-			return fmt.Errorf("failed to set provision success property: %w", setErr)
-		}
-		return nil
-	})
-	g.Go(func() error {
-		if setErr := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropCSIVolumeName, name); setErr != nil {
-			return fmt.Errorf("failed to set CSI volume name property: %w", setErr)
-		}
-		return nil
-	})
-	// Wait for all property sets to complete
-	if waitErr := g.Wait(); waitErr != nil {
+	// Mark as managed and successful in one API update.
+	if waitErr := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+		PropManagedResource:  "true",
+		PropProvisionSuccess: "true",
+		PropCSIVolumeName:    name,
+	}); waitErr != nil {
 		// Property setting failed - clean up the share and dataset to avoid orphaned resources
 		// The next CreateVolume call will start fresh
 		klog.Errorf("Failed to set properties for volume %s: %v - cleaning up orphaned resources", volumeID, waitErr)
-		if delErr := d.deleteShare(ctx, datasetName, shareType); delErr != nil {
+		if delErr := d.deleteShare(ctx, createdDS, datasetName, shareType); delErr != nil {
 			klog.Warningf("Failed to cleanup share after property failure: %v", delErr)
 		}
 		if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, false); delErr != nil {
@@ -371,7 +353,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	// Get volume context for response
-	volumeContext, err := d.getVolumeContext(ctx, datasetName, shareType)
+	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", err)
 	}
@@ -425,7 +407,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// Since we can't check dataset properties, try both protocols using
 			// fallback logic that finds resources by name.
 			var cleanupErrors []string
-			if cleanupErr := d.deleteShare(ctx, datasetName, ShareTypeNVMeoF); cleanupErr != nil {
+			if cleanupErr := d.deleteShare(ctx, nil, datasetName, ShareTypeNVMeoF); cleanupErr != nil {
 				// Only log as warning if it's not a "not found" type error
 				errStr := cleanupErr.Error()
 				if strings.Contains(errStr, "cleanup errors") {
@@ -437,7 +419,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			} else {
 				klog.Infof("Cleaned up orphaned NVMe-oF resources for %s", volumeID)
 			}
-			if cleanupErr := d.deleteShare(ctx, datasetName, ShareTypeISCSI); cleanupErr != nil {
+			if cleanupErr := d.deleteShare(ctx, nil, datasetName, ShareTypeISCSI); cleanupErr != nil {
 				errStr := cleanupErr.Error()
 				if strings.Contains(errStr, "cleanup errors") {
 					klog.Warningf("Failed to cleanup orphaned iSCSI resources for %s: %v", volumeID, cleanupErr)
@@ -489,11 +471,14 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 	}
 
-	// IMPORTANT: Check for dependent CSI-managed snapshots BEFORE deleting the share.
-	// If we delete the share first and then discover snapshots exist, the share is already
-	// gone and the volume becomes inaccessible while still existing.
+	// IMPORTANT: Check for dependent CSI-managed snapshots BEFORE deleting the
+	// share. The share must be deleted before the dataset (extents block zvol
+	// deletion), so bailing after share deletion would leave a volume that
+	// still exists but is inaccessible, with no path that re-creates its share.
+	// This costs one query on every delete; the dependency-error fallback after
+	// DatasetDelete below stays as a second line of defense.
 	snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
-	if snapErr == nil && len(snapshots) > 0 {
+	if snapErr == nil {
 		for _, snap := range snapshots {
 			if prop, ok := snap.UserProperties[PropManagedResource]; ok && prop.Value == "true" {
 				klog.Infof("Volume %s has dependent CSI-managed snapshots, cannot delete", volumeID)
@@ -507,7 +492,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	switch {
 	case shareTypeKnown:
 		// We know the share type, delete just that one
-		if err := d.deleteShare(ctx, datasetName, shareType); err != nil {
+		if err := d.deleteShare(ctx, ds, datasetName, shareType); err != nil {
 			klog.Errorf("Failed to delete share for volume %s: %v", volumeID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete share: %v", err)
 		}
@@ -515,11 +500,11 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		// Unknown zvol - try both iSCSI and NVMe-oF to avoid orphaned resources
 		// One will likely return "not found" which is fine
 		var lastErr error
-		if err := d.deleteShare(ctx, datasetName, ShareTypeISCSI); err != nil {
+		if err := d.deleteShare(ctx, ds, datasetName, ShareTypeISCSI); err != nil {
 			klog.V(4).Infof("iSCSI cleanup for %s: %v (may be expected if not iSCSI)", volumeID, err)
 			lastErr = err
 		}
-		if err := d.deleteShare(ctx, datasetName, ShareTypeNVMeoF); err != nil {
+		if err := d.deleteShare(ctx, ds, datasetName, ShareTypeNVMeoF); err != nil {
 			klog.V(4).Infof("NVMe-oF cleanup for %s: %v (may be expected if not NVMe-oF)", volumeID, err)
 			lastErr = err
 		}
@@ -530,7 +515,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 	default:
 		// Default fallback for filesystem or unknown types
-		if err := d.deleteShare(ctx, datasetName, shareType); err != nil {
+		if err := d.deleteShare(ctx, ds, datasetName, shareType); err != nil {
 			klog.Errorf("Failed to delete share for volume %s: %v", volumeID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete share: %v", err)
 		}
@@ -549,6 +534,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// This follows CSI spec: snapshots should survive after source volume deletion
 	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
 		// DatasetDelete already handles "not found" errors, so this is a real error
+		if !isDatasetDependencyOrBusyError(err) {
+			klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
+			return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", err)
+		}
 		// Check if there are CSI-managed snapshots that are blocking deletion
 		// TrueNAS returns various error messages: "Method call error", "has dependent clones", etc.
 		snapshots, snapErr := d.truenasClient.SnapshotList(ctx, datasetName)
@@ -1354,9 +1343,8 @@ func (d *Driver) getDatasetCapacity(ds *truenas.Dataset) int64 {
 	return 0
 }
 
-// createDataset creates a new ZFS dataset or zvol.
-// Returns the mountpoint for NFS datasets (empty string for zvols).
-func (d *Driver) createDataset(ctx context.Context, datasetName string, capacityBytes int64, shareType ShareType) (string, error) {
+// createDataset creates a new ZFS dataset or zvol and returns the API result.
+func (d *Driver) createDataset(ctx context.Context, datasetName string, capacityBytes int64, shareType ShareType) (*truenas.Dataset, error) {
 	params := &truenas.DatasetCreateParams{
 		Name: datasetName,
 	}
@@ -1380,15 +1368,15 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 
 	ds, err := d.truenasClient.DatasetCreate(ctx, params)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	// Return mountpoint for NFS shares (avoid extra DatasetGet call in createNFSShare)
-	return ds.Mountpoint, nil
+	return ds, nil
 }
 
-func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName string, source *csi.VolumeContentSource, capacityBytes int64) error {
+func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName string, source *csi.VolumeContentSource, capacityBytes int64) (*truenas.Dataset, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
 	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
+	var createdDS *truenas.Dataset
 
 	if snapshot := source.GetSnapshot(); snapshot != nil {
 		// Clone from snapshot
@@ -1398,47 +1386,36 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		// Find the snapshot using efficient query (PERF-001 fix)
 		snap, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
 		if err != nil {
-			return status.Errorf(codes.Internal, "failed to find snapshot: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to find snapshot: %v", err)
 		}
 
 		if snap == nil {
-			return status.Errorf(codes.NotFound, "snapshot not found: %s", snapshotID)
+			return nil, status.Errorf(codes.NotFound, "snapshot not found: %s", snapshotID)
 		}
 
 		sourceSnapshot := snap.ID
 		klog.V(4).Infof("Found snapshot %s for cloning", sourceSnapshot)
 
 		if cloneErr := d.truenasClient.SnapshotClone(ctx, sourceSnapshot, datasetName); cloneErr != nil {
-			return status.Errorf(codes.Internal, "failed to clone snapshot: %v", cloneErr)
+			return nil, status.Errorf(codes.Internal, "failed to clone snapshot: %v", cloneErr)
 		}
 		klog.Infof("Snapshot clone created: %s -> %s", sourceSnapshot, datasetName)
 
 		// Wait for cloned dataset to be ready before proceeding
 		// This is critical for iSCSI/NVMe-oF where extent creation needs the zvol
-		ds, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
+		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
-			return status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
 		}
-		if err := d.ensureCloneCapacity(ctx, datasetName, ds, capacityBytes); err != nil {
-			return err
+		if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
+			return nil, err
 		}
 
-		// Set content source properties in parallel
-		g, gCtx := errgroup.WithContext(ctx)
-		g.Go(func() error {
-			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeContentSourceType, "snapshot"); err != nil {
-				klog.Warningf("Failed to set volume content source type property: %v", err)
-			}
-			return nil
-		})
-		g.Go(func() error {
-			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeContentSourceID, snapshotID); err != nil {
-				klog.Warningf("Failed to set volume content source ID property: %v", err)
-			}
-			return nil
-		})
-		if err := g.Wait(); err != nil {
-			klog.Warningf("Error setting content source properties for snapshot clone: %v", err)
+		if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+			PropVolumeContentSourceType: "snapshot",
+			PropVolumeContentSourceID:   snapshotID,
+		}); err != nil {
+			klog.Warningf("Failed to set content source properties for snapshot clone: %v", err)
 		}
 
 	} else if volume := source.GetVolume(); volume != nil {
@@ -1449,16 +1426,16 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 
 		if _, err := d.truenasClient.DatasetGet(ctx, sourceDataset); err != nil {
 			if truenas.IsNotFoundError(err) {
-				return status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
+				return nil, status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
 			}
-			return status.Errorf(codes.Internal, "failed to get source volume: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to get source volume: %v", err)
 		}
 
 		// Create a snapshot of source volume, then clone it
 		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
 		snap, err := d.truenasClient.SnapshotCreate(ctx, sourceDataset, tempSnapshotName)
 		if err != nil {
-			return status.Errorf(codes.Internal, "failed to create source snapshot: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to create source snapshot: %v", err)
 		}
 		klog.V(4).Infof("Created temporary snapshot %s for volume clone", snap.ID)
 
@@ -1466,47 +1443,30 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 			if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
 				klog.Warningf("Failed to cleanup snapshot after clone failure: %v", delErr)
 			}
-			return status.Errorf(codes.Internal, "failed to clone volume: %v", cloneErr)
+			return nil, status.Errorf(codes.Internal, "failed to clone volume: %v", cloneErr)
 		}
 		klog.Infof("Volume clone created: %s -> %s", sourceVolumeID, datasetName)
 
 		// Wait for cloned dataset to be ready
-		ds, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
+		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
-			return status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
 		}
-		if err := d.ensureCloneCapacity(ctx, datasetName, ds, capacityBytes); err != nil {
-			return err
+		if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
+			return nil, err
 		}
 
-		// Set content source properties in parallel
-		// Include origin snapshot so it can be cleaned up when the cloned volume is deleted
-		g, gCtx := errgroup.WithContext(ctx)
-		g.Go(func() error {
-			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeContentSourceType, "volume"); err != nil {
-				klog.Warningf("Failed to set volume content source type property: %v", err)
-			}
-			return nil
-		})
-		g.Go(func() error {
-			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeContentSourceID, sourceVolumeID); err != nil {
-				klog.Warningf("Failed to set volume content source ID property: %v", err)
-			}
-			return nil
-		})
-		g.Go(func() error {
-			// Store the origin snapshot ID for cleanup when the clone is deleted
-			if err := d.truenasClient.DatasetSetUserProperty(gCtx, datasetName, PropVolumeOriginSnapshot, snap.ID); err != nil {
-				klog.Warningf("Failed to set volume origin snapshot property: %v", err)
-			}
-			return nil
-		})
-		if err := g.Wait(); err != nil {
-			klog.Warningf("Error setting content source properties for volume clone: %v", err)
+		// Include origin snapshot so it can be cleaned up when the clone is deleted.
+		if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+			PropVolumeContentSourceType: "volume",
+			PropVolumeContentSourceID:   sourceVolumeID,
+			PropVolumeOriginSnapshot:    snap.ID,
+		}); err != nil {
+			klog.Warningf("Failed to set content source properties for volume clone: %v", err)
 		}
 	}
 
-	return nil
+	return createdDS, nil
 }
 
 func (d *Driver) ensureCloneCapacity(ctx context.Context, datasetName string, ds *truenas.Dataset, capacityBytes int64) error {
@@ -1535,14 +1495,17 @@ func (d *Driver) ensureCloneCapacity(ctx context.Context, datasetName string, ds
 	return nil
 }
 
-func (d *Driver) getVolumeContext(ctx context.Context, datasetName string, shareType ShareType) (map[string]string, error) {
+func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) (map[string]string, error) {
 	volumeContext := map[string]string{
 		"node_attach_driver": shareType.String(),
 	}
 
-	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
-	if err != nil {
-		return nil, err
+	if ds == nil {
+		var err error
+		ds, err = d.truenasClient.DatasetGet(ctx, datasetName)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	switch shareType {

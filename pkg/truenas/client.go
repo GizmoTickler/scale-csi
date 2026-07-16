@@ -60,8 +60,7 @@ func IsNotFoundError(err error) bool {
 	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		// Common "not found" error codes from TrueNAS
-		return apiErr.Code == -1 || strings.Contains(strings.ToLower(apiErr.Message), "not found") ||
+		return strings.Contains(strings.ToLower(apiErr.Message), "not found") ||
 			strings.Contains(strings.ToLower(apiErr.Message), "does not exist")
 	}
 	errStr := strings.ToLower(err.Error())

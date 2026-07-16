@@ -25,6 +25,7 @@ type ClientInterface interface {
 	DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error)
 	DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error)
 	DatasetSetUserProperty(ctx context.Context, name, key, value string) error
+	DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error
 	DatasetGetUserProperty(ctx context.Context, name, key string) (string, error)
 	DatasetExpand(ctx context.Context, name string, newSize int64) error
 	DatasetExists(ctx context.Context, name string) (bool, error)

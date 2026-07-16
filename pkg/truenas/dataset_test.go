@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -844,6 +845,84 @@ func TestDatasetSetUserProperty_Success(t *testing.T) {
 	ctx := context.Background()
 	err = client.DatasetSetUserProperty(ctx, "tank/k8s/volumes/pvc-userprop", "truenas-csi:nfs_share_id", "42")
 	assert.NoError(t, err)
+}
+
+func TestDatasetSetUserProperties_BatchesSingleUpdate(t *testing.T) {
+	mock := newMockWSServer()
+	var updateCalls atomic.Int32
+	updatesCh := make(chan []UserPropertyUpdate, 1)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.dataset.update":
+				updateCalls.Add(1)
+				paramsMap := req.Params[1].(map[string]interface{})
+				rawUpdates := paramsMap["user_properties_update"].([]interface{})
+				updates := make([]UserPropertyUpdate, 0, len(rawUpdates))
+				for _, raw := range rawUpdates {
+					updateMap := raw.(map[string]interface{})
+					updates = append(updates, UserPropertyUpdate{
+						Key:   updateMap["key"].(string),
+						Value: updateMap["value"].(string),
+					})
+				}
+				updatesCh <- updates
+				resp.Result = map[string]interface{}{
+					"id":              "tank/k8s/volumes/pvc-batch",
+					"name":            "tank/k8s/volumes/pvc-batch",
+					"pool":            "tank",
+					"type":            "VOLUME",
+					"user_properties": map[string]interface{}{},
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+
+	wsURL := strings.Replace(server.URL, "http://", "", 1)
+	parts := strings.Split(wsURL, ":")
+	host := parts[0]
+	port := 80
+	if len(parts) > 1 {
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
+	}
+	client, err := NewClient(&ClientConfig{
+		Host:           host,
+		Port:           port,
+		Protocol:       "http",
+		APIKey:         "test-api-key",
+		Timeout:        5 * time.Second,
+		ConnectTimeout: 5 * time.Second,
+		MaxConnections: 1,
+	})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	err = client.DatasetSetUserProperties(context.Background(), "tank/k8s/volumes/pvc-batch", map[string]string{
+		"truenas-csi:target_id":        "11",
+		"truenas-csi:extent_id":        "22",
+		"truenas-csi:target_extent_id": "33",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), updateCalls.Load())
+	assert.Equal(t, []UserPropertyUpdate{
+		{Key: "truenas-csi:extent_id", Value: "22"},
+		{Key: "truenas-csi:target_extent_id", Value: "33"},
+		{Key: "truenas-csi:target_id", Value: "11"},
+	}, <-updatesCh)
 }
 
 // TestDatasetGetUserProperty tests getting a user property

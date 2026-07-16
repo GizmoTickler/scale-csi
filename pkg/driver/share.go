@@ -7,13 +7,47 @@ import (
 	"strconv"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+func datasetUserProperty(ds *truenas.Dataset, key string) string {
+	if ds == nil {
+		return ""
+	}
+	if prop, ok := ds.UserProperties[key]; ok {
+		return prop.Value
+	}
+	return ""
+}
+
+func (d *Driver) datasetForProperties(ctx context.Context, ds *truenas.Dataset, datasetName string) (*truenas.Dataset, error) {
+	if ds != nil {
+		return ds, nil
+	}
+	return d.truenasClient.DatasetGet(ctx, datasetName)
+}
+
+func (d *Driver) setDatasetUserProperties(ctx context.Context, ds *truenas.Dataset, datasetName string, properties map[string]string) error {
+	if len(properties) == 0 {
+		return nil
+	}
+	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, properties); err != nil {
+		return err
+	}
+	if ds != nil {
+		if ds.UserProperties == nil {
+			ds.UserProperties = make(map[string]truenas.UserProperty, len(properties))
+		}
+		for key, value := range properties {
+			ds.UserProperties[key] = truenas.UserProperty{Value: value}
+		}
+	}
+	return nil
+}
 
 const (
 	// defaultShareRetryAttempts is the number of times to retry share creation
@@ -33,7 +67,7 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 			return nil
 		}
 		klog.Infof("NFS share missing for existing volume %s, creating...", datasetName)
-		return d.createNFSShare(ctx, datasetName, volumeName, ds.Mountpoint)
+		return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false)
 
 	case ShareTypeISCSI:
 		// Check if iSCSI target-extent association exists (this means full setup is complete)
@@ -42,7 +76,7 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 			return nil
 		}
 		klog.Infof("iSCSI share missing for existing volume %s, creating...", datasetName)
-		return d.createISCSIShare(ctx, datasetName, volumeName)
+		return d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, false, false)
 
 	case ShareTypeNVMeoF:
 		// Check if NVMe-oF namespace ID is stored
@@ -51,7 +85,7 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 			return nil
 		}
 		klog.Infof("NVMe-oF share missing for existing volume %s, creating...", datasetName)
-		return d.createNVMeoFShare(ctx, datasetName, volumeName)
+		return d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, false, false)
 
 	default:
 		return nil
@@ -60,18 +94,18 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 
 // createShareWithOptions creates a share with additional options.
 // shareType should be obtained from config.GetShareType(params) to support StorageClass parameters.
-// skipZvolWait skips the WaitForZvolReady call in iSCSI/NVMe-oF share creation (used after cloning).
-// mountpoint is used for NFS shares to avoid an extra DatasetGet call (empty string triggers lookup).
-func (d *Driver) createShareWithOptions(ctx context.Context, datasetName, volumeName string, shareType ShareType, skipZvolWait bool, mountpoint string) error {
-	klog.Infof("Creating %s share for dataset: %s (skipZvolWait=%v)", shareType, datasetName, skipZvolWait)
+// freshlyCreated skips guaranteed-miss idempotency lookups. zvolReady indicates
+// that DatasetCreate returned the zvol or the clone readiness wait completed.
+func (d *Driver) createShareWithOptions(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, freshlyCreated, zvolReady bool) error {
+	klog.Infof("Creating %s share for dataset: %s (freshlyCreated=%v, zvolReady=%v)", shareType, datasetName, freshlyCreated, zvolReady)
 
 	switch shareType {
 	case ShareTypeNFS:
-		return d.createNFSShare(ctx, datasetName, volumeName, mountpoint)
+		return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated)
 	case ShareTypeISCSI:
-		return d.createISCSIShareWithOptions(ctx, datasetName, volumeName, skipZvolWait)
+		return d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady)
 	case ShareTypeNVMeoF:
-		return d.createNVMeoFShareWithOptions(ctx, datasetName, volumeName, skipZvolWait)
+		return d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady)
 	default:
 		return status.Errorf(codes.InvalidArgument, "unsupported share type: %s", shareType)
 	}
@@ -79,16 +113,16 @@ func (d *Driver) createShareWithOptions(ctx context.Context, datasetName, volume
 
 // deleteShare deletes the share for a dataset.
 // shareType should be obtained from config.GetShareType(params) or stored metadata.
-func (d *Driver) deleteShare(ctx context.Context, datasetName string, shareType ShareType) error {
+func (d *Driver) deleteShare(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) error {
 	klog.Infof("Deleting %s share for dataset: %s", shareType, datasetName)
 
 	switch shareType {
 	case ShareTypeNFS:
-		return d.deleteNFSShare(ctx, datasetName)
+		return d.deleteNFSShareForDataset(ctx, ds, datasetName)
 	case ShareTypeISCSI:
-		return d.deleteISCSIShare(ctx, datasetName)
+		return d.deleteISCSIShareForDataset(ctx, ds, datasetName)
 	case ShareTypeNVMeoF:
-		return d.deleteNVMeoFShare(ctx, datasetName)
+		return d.deleteNVMeoFShareForDataset(ctx, ds, datasetName)
 	default:
 		return nil
 	}
@@ -97,18 +131,25 @@ func (d *Driver) deleteShare(ctx context.Context, datasetName string, shareType 
 // createNFSShare creates an NFS share for a dataset.
 // mountpoint can be provided to avoid an extra DatasetGet call (empty string triggers lookup).
 func (d *Driver) createNFSShare(ctx context.Context, datasetName, volumeName, mountpoint string) error {
-	// Get mountpoint if not provided (e.g., for idempotent share creation on existing volumes)
-	if mountpoint == "" {
-		ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
-		if err != nil {
-			return status.Errorf(codes.Internal, "failed to get dataset: %v", err)
-		}
-		mountpoint = ds.Mountpoint
+	ds, err := d.datasetForProperties(ctx, nil, datasetName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to get dataset: %v", err)
+	}
+	if mountpoint != "" {
+		ds.Mountpoint = mountpoint
+	}
+	return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false)
+}
+
+func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated bool) error {
+	var err error
+	ds, err = d.datasetForProperties(ctx, ds, datasetName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to get dataset: %v", err)
 	}
 
 	// Check if share already exists
-	existingProp, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNFSShareID)
-	if existingProp != "" && existingProp != "-" {
+	if existingProp := datasetUserProperty(ds, PropNFSShareID); !freshlyCreated && existingProp != "" && existingProp != "-" {
 		klog.Infof("NFS share already exists for %s", datasetName)
 		return nil
 	}
@@ -117,7 +158,7 @@ func (d *Driver) createNFSShare(ctx context.Context, datasetName, volumeName, mo
 	comment := fmt.Sprintf("truenas-csi (%s): %s", d.name, datasetName)
 
 	params := &truenas.NFSShareCreateParams{
-		Path:         mountpoint,
+		Path:         ds.Mountpoint,
 		Comment:      comment,
 		Networks:     d.config.NFS.ShareAllowedNetworks,
 		Hosts:        d.config.NFS.ShareAllowedHosts,
@@ -134,7 +175,7 @@ func (d *Driver) createNFSShare(ctx context.Context, datasetName, volumeName, mo
 	}
 
 	// Store share ID in dataset property
-	if err := d.truenasClient.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, strconv.Itoa(share.ID)); err != nil {
+	if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{PropNFSShareID: strconv.Itoa(share.ID)}); err != nil {
 		return status.Errorf(codes.Internal, "failed to store NFS share ID: %v", err)
 	}
 
@@ -144,9 +185,17 @@ func (d *Driver) createNFSShare(ctx context.Context, datasetName, volumeName, mo
 
 // deleteNFSShare deletes the NFS share for a dataset.
 func (d *Driver) deleteNFSShare(ctx context.Context, datasetName string) error {
+	return d.deleteNFSShareForDataset(ctx, nil, datasetName)
+}
+
+func (d *Driver) deleteNFSShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
 	// Get share ID from dataset property
-	shareIDStr, err := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNFSShareID)
-	if err != nil || shareIDStr == "" || shareIDStr == "-" {
+	ds, err := d.datasetForProperties(ctx, ds, datasetName)
+	if err != nil {
+		return nil
+	}
+	shareIDStr := datasetUserProperty(ds, PropNFSShareID)
+	if shareIDStr == "" || shareIDStr == "-" {
 		return nil // No share to delete
 	}
 
@@ -168,14 +217,23 @@ func (d *Driver) deleteNFSShare(ctx context.Context, datasetName string) error {
 // This function is idempotent and includes retry logic for robustness during
 // high-load scenarios (e.g., volsync backup bursts).
 func (d *Driver) createISCSIShare(ctx context.Context, datasetName, volumeName string) error {
-	return d.createISCSIShareWithOptions(ctx, datasetName, volumeName, false)
+	return d.createISCSIShareForDataset(ctx, nil, datasetName, volumeName, false, false)
 }
 
 // createISCSIShareWithOptions creates iSCSI share with additional options.
 // skipZvolWait skips the WaitForZvolReady call (used when zvol is freshly cloned).
 func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, volumeName string, skipZvolWait bool) error {
+	return d.createISCSIShareForDataset(ctx, nil, datasetName, volumeName, false, skipZvolWait)
+}
+
+func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool) error {
 	start := time.Now()
 	klog.Infof("createISCSIShare: starting for dataset %s", datasetName)
+	var err error
+	ds, err = d.datasetForProperties(ctx, ds, datasetName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to get dataset: %v", err)
+	}
 
 	// Generate iSCSI name and disk path upfront
 	iscsiName := path.Base(datasetName)
@@ -185,8 +243,8 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 	diskPath := fmt.Sprintf("zvol/%s", datasetName)
 
 	// Step 1: Check if already fully configured (idempotency fast-path)
-	existingTE, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropISCSITargetExtentID)
-	if existingTE != "" && existingTE != "-" {
+	existingTE := datasetUserProperty(ds, PropISCSITargetExtentID)
+	if !freshlyCreated && existingTE != "" && existingTE != "-" {
 		// Verify the target-extent still exists by looking it up by ID
 		teID, err := strconv.Atoi(existingTE)
 		if err == nil {
@@ -203,8 +261,8 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 	var targetID int
 
 	// Check if we have a stored target ID
-	existingTargetID, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropISCSITargetID)
-	if existingTargetID != "" && existingTargetID != "-" {
+	existingTargetID := datasetUserProperty(ds, PropISCSITargetID)
+	if !freshlyCreated && existingTargetID != "" && existingTargetID != "-" {
 		if id, err := strconv.Atoi(existingTargetID); err == nil {
 			if t, err := d.truenasClient.ISCSITargetGet(ctx, id); err == nil {
 				target = t
@@ -215,7 +273,7 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 	}
 
 	// If no stored target, check by name
-	if target == nil {
+	if !freshlyCreated && target == nil {
 		if t, err := d.truenasClient.ISCSITargetFindByName(ctx, iscsiName); err == nil && t != nil {
 			target = t
 			targetID = t.ID
@@ -239,9 +297,16 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 			})
 		}
 
-		var err error
 		target, err = d.truenasClient.ISCSITargetCreate(ctx, iscsiName, "", "ISCSI", targetGroups)
 		if err != nil {
+			if freshlyCreated && truenas.IsAlreadyExistsError(err) {
+				target, _ = d.truenasClient.ISCSITargetFindByName(ctx, iscsiName)
+				if target != nil {
+					targetID = target.ID
+				}
+			}
+		}
+		if target == nil {
 			return status.Errorf(codes.Internal, "failed to create iSCSI target: %v", err)
 		}
 		targetID = target.ID
@@ -251,7 +316,7 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 	// Step 3: Wait for zvol to be ready before creating extent
 	// This is critical for cloned volumes which may not be immediately available
 	// Skip if caller already verified zvol readiness (e.g., after cloning)
-	if !skipZvolWait {
+	if !zvolReady {
 		zvolTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
 		klog.V(4).Infof("Waiting for zvol %s to be ready before creating extent (timeout: %v)", datasetName, zvolTimeout)
 		if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolTimeout); err != nil {
@@ -266,8 +331,8 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 	var extentID int
 
 	// Check if we have a stored extent ID
-	existingExtentID, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropISCSIExtentID)
-	if existingExtentID != "" && existingExtentID != "-" {
+	existingExtentID := datasetUserProperty(ds, PropISCSIExtentID)
+	if !freshlyCreated && existingExtentID != "" && existingExtentID != "-" {
 		if id, err := strconv.Atoi(existingExtentID); err == nil {
 			if e, err := d.truenasClient.ISCSIExtentGet(ctx, id); err == nil {
 				extent = e
@@ -278,7 +343,7 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 	}
 
 	// If no stored extent, check by disk path (more reliable than name for clones)
-	if extent == nil {
+	if !freshlyCreated && extent == nil {
 		if e, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, diskPath); err == nil && e != nil {
 			extent = e
 			extentID = e.ID
@@ -287,7 +352,7 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 	}
 
 	// If still no extent, check by name
-	if extent == nil {
+	if !freshlyCreated && extent == nil {
 		if e, err := d.truenasClient.ISCSIExtentFindByName(ctx, iscsiName); err == nil && e != nil {
 			extent = e
 			extentID = e.ID
@@ -328,12 +393,16 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 			lastErr = err
 			klog.Warningf("Extent creation attempt %d failed for %s: %v", attempt+1, datasetName, err)
 
-			// Check if extent was actually created despite error
-			if e, findErr := d.truenasClient.ISCSIExtentFindByDisk(ctx, diskPath); findErr == nil && e != nil {
-				extent = e
-				extentID = e.ID
-				klog.Infof("Extent found after error (ID %d), continuing", extentID)
-				break
+			// Fresh creates only fall back on a definite already-exists result.
+			// Existing-volume retries retain the broader ambiguity check.
+			if !freshlyCreated || truenas.IsAlreadyExistsError(err) {
+				e, findErr := d.truenasClient.ISCSIExtentFindByDisk(ctx, diskPath)
+				if findErr == nil && e != nil {
+					extent = e
+					extentID = e.ID
+					klog.Infof("Extent found after error (ID %d), continuing", extentID)
+					break
+				}
 			}
 		}
 
@@ -350,9 +419,11 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 	var targetExtent *truenas.ISCSITargetExtent
 
 	// Check if association already exists
-	if te, err := d.truenasClient.ISCSITargetExtentFind(ctx, targetID, extentID); err == nil && te != nil {
-		targetExtent = te
-		klog.V(4).Infof("Using existing target-extent association (ID %d)", te.ID)
+	if !freshlyCreated {
+		if te, err := d.truenasClient.ISCSITargetExtentFind(ctx, targetID, extentID); err == nil && te != nil {
+			targetExtent = te
+			klog.V(4).Infof("Using existing target-extent association (ID %d)", te.ID)
+		}
 	}
 
 	// Create association if needed
@@ -360,6 +431,11 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 		var err error
 		targetExtent, err = d.truenasClient.ISCSITargetExtentCreate(ctx, targetID, extentID, 0)
 		if err != nil {
+			if freshlyCreated && truenas.IsAlreadyExistsError(err) {
+				targetExtent, _ = d.truenasClient.ISCSITargetExtentFind(ctx, targetID, extentID)
+			}
+		}
+		if targetExtent == nil {
 			// Cleanup orphaned target and extent on association failure
 			// These resources are useless without the association and will block future provisioning
 			klog.Errorf("Failed to create target-extent association, cleaning up orphaned resources: %v", err)
@@ -374,29 +450,15 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 		klog.Infof("Created target-extent association (ID %d)", targetExtent.ID)
 	}
 
-	// Step 6: Store all property IDs in parallel for performance
+	// Step 6: Store all property IDs in one dataset update.
 	// These properties are used for idempotency on retry and cleanup during deletion.
-	// Running in parallel saves ~100ms vs sequential API calls.
-	eg, egCtx := errgroup.WithContext(ctx)
-	eg.Go(func() error {
-		if err := d.truenasClient.DatasetSetUserProperty(egCtx, datasetName, PropISCSITargetID, strconv.Itoa(targetID)); err != nil {
-			klog.Warningf("Failed to store iSCSI target ID: %v", err)
-		}
-		return nil // Non-fatal, don't fail the operation
-	})
-	eg.Go(func() error {
-		if err := d.truenasClient.DatasetSetUserProperty(egCtx, datasetName, PropISCSIExtentID, strconv.Itoa(extentID)); err != nil {
-			klog.Warningf("Failed to store iSCSI extent ID: %v", err)
-		}
-		return nil // Non-fatal, don't fail the operation
-	})
-	eg.Go(func() error {
-		if err := d.truenasClient.DatasetSetUserProperty(egCtx, datasetName, PropISCSITargetExtentID, strconv.Itoa(targetExtent.ID)); err != nil {
-			klog.Warningf("Failed to store iSCSI target-extent ID: %v", err)
-		}
-		return nil // Non-fatal, don't fail the operation
-	})
-	_ = eg.Wait() // Errors are logged but not propagated (properties are for idempotency only)
+	if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+		PropISCSITargetID:       strconv.Itoa(targetID),
+		PropISCSIExtentID:       strconv.Itoa(extentID),
+		PropISCSITargetExtentID: strconv.Itoa(targetExtent.ID),
+	}); err != nil {
+		klog.Warningf("Failed to store iSCSI resource IDs: %v", err)
+	}
 
 	// Request iSCSI service reload using debouncer to prevent reload storms
 	// during bulk volume provisioning. Multiple requests within the debounce
@@ -418,6 +480,14 @@ func (d *Driver) createISCSIShareWithOptions(ctx context.Context, datasetName, v
 // to handle cases where properties were never stored (e.g., failed volume creation).
 // Returns an error if any cleanup fails so the caller can retry.
 func (d *Driver) deleteISCSIShare(ctx context.Context, datasetName string) error {
+	return d.deleteISCSIShareForDataset(ctx, nil, datasetName)
+}
+
+func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
+	if fetched, err := d.datasetForProperties(ctx, ds, datasetName); err == nil {
+		ds = fetched
+	}
+
 	// Generate the expected iSCSI name (same logic as createISCSIShare)
 	iscsiName := path.Base(datasetName)
 	if d.config.ISCSI.NameSuffix != "" {
@@ -429,7 +499,7 @@ func (d *Driver) deleteISCSIShare(ctx context.Context, datasetName string) error
 	var errs []error
 
 	// Try to delete target-extent association by stored ID
-	if teIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropISCSITargetExtentID); teIDStr != "" && teIDStr != "-" {
+	if teIDStr := datasetUserProperty(ds, PropISCSITargetExtentID); teIDStr != "" && teIDStr != "-" {
 		if teID, err := strconv.Atoi(teIDStr); err == nil {
 			if err := d.truenasClient.ISCSITargetExtentDelete(ctx, teID, true); err != nil {
 				klog.Warningf("Failed to delete iSCSI target-extent %d: %v", teID, err)
@@ -439,7 +509,7 @@ func (d *Driver) deleteISCSIShare(ctx context.Context, datasetName string) error
 	}
 
 	// Try to delete extent by stored ID
-	if extIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropISCSIExtentID); extIDStr != "" && extIDStr != "-" {
+	if extIDStr := datasetUserProperty(ds, PropISCSIExtentID); extIDStr != "" && extIDStr != "-" {
 		if extID, err := strconv.Atoi(extIDStr); err == nil {
 			if err := d.truenasClient.ISCSIExtentDelete(ctx, extID, false, true); err != nil {
 				klog.Warningf("Failed to delete iSCSI extent %d: %v", extID, err)
@@ -451,7 +521,7 @@ func (d *Driver) deleteISCSIShare(ctx context.Context, datasetName string) error
 	}
 
 	// Try to delete target by stored ID
-	if tgtIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropISCSITargetID); tgtIDStr != "" && tgtIDStr != "-" {
+	if tgtIDStr := datasetUserProperty(ds, PropISCSITargetID); tgtIDStr != "" && tgtIDStr != "-" {
 		if tgtID, err := strconv.Atoi(tgtIDStr); err == nil {
 			if err := d.truenasClient.ISCSITargetDelete(ctx, tgtID, true); err != nil {
 				klog.Warningf("Failed to delete iSCSI target %d: %v", tgtID, err)
@@ -520,15 +590,25 @@ func (d *Driver) deleteISCSIShare(ctx context.Context, datasetName string) error
 
 // createNVMeoFShare creates NVMe-oF subsystem and namespace.
 func (d *Driver) createNVMeoFShare(ctx context.Context, datasetName, volumeName string) error {
-	return d.createNVMeoFShareWithOptions(ctx, datasetName, volumeName, false)
+	return d.createNVMeoFShareForDataset(ctx, nil, datasetName, volumeName, false, false)
 }
 
 // createNVMeoFShareWithOptions creates NVMe-oF share with additional options.
 // skipZvolWait skips the WaitForZvolReady call (used when zvol is freshly cloned).
 func (d *Driver) createNVMeoFShareWithOptions(ctx context.Context, datasetName, volumeName string, skipZvolWait bool) error {
+	return d.createNVMeoFShareForDataset(ctx, nil, datasetName, volumeName, false, skipZvolWait)
+}
+
+func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool) error {
+	var err error
+	ds, err = d.datasetForProperties(ctx, ds, datasetName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to get dataset: %v", err)
+	}
+
 	// Check if already configured
-	existingProp, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID)
-	if existingProp != "" && existingProp != "-" {
+	existingProp := datasetUserProperty(ds, PropNVMeoFNamespaceID)
+	if !freshlyCreated && existingProp != "" && existingProp != "-" {
 		klog.Infof("NVMe-oF share already exists for %s", datasetName)
 		return nil
 	}
@@ -545,7 +625,7 @@ func (d *Driver) createNVMeoFShareWithOptions(ctx context.Context, datasetName, 
 	// Wait for zvol to be ready before creating subsystem/namespace
 	// This is critical for cloned volumes which may not be immediately available
 	// Skip if caller already verified zvol readiness (e.g., after cloning)
-	if !skipZvolWait {
+	if !zvolReady {
 		zvolTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
 		klog.V(4).Infof("Waiting for zvol %s to be ready before creating NVMe-oF share (timeout: %v)", datasetName, zvolTimeout)
 		if _, err := d.truenasClient.WaitForZvolReady(ctx, datasetName, zvolTimeout); err != nil {
@@ -608,29 +688,15 @@ func (d *Driver) createNVMeoFShareWithOptions(ctx context.Context, datasetName, 
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF namespace: %v", err)
 	}
 
-	// Store all property IDs in parallel for performance
+	// Store all property IDs in one dataset update.
 	// These properties are used for idempotency on retry and cleanup during deletion.
-	// Running in parallel saves ~100ms vs sequential API calls.
-	eg, egCtx := errgroup.WithContext(ctx)
-	eg.Go(func() error {
-		if err := d.truenasClient.DatasetSetUserProperty(egCtx, datasetName, PropNVMeoFSubsystemID, strconv.Itoa(subsys.ID)); err != nil {
-			klog.Warningf("Failed to store NVMe-oF subsystem ID: %v", err)
-		}
-		return nil // Non-fatal, don't fail the operation
-	})
-	eg.Go(func() error {
-		if err := d.truenasClient.DatasetSetUserProperty(egCtx, datasetName, PropNVMeoFPortSubsysID, strconv.Itoa(portSubsys.ID)); err != nil {
-			klog.Warningf("Failed to store NVMe-oF port-subsystem ID: %v", err)
-		}
-		return nil // Non-fatal, don't fail the operation
-	})
-	eg.Go(func() error {
-		if err := d.truenasClient.DatasetSetUserProperty(egCtx, datasetName, PropNVMeoFNamespaceID, strconv.Itoa(namespace.ID)); err != nil {
-			klog.Warningf("Failed to store NVMe-oF namespace ID: %v", err)
-		}
-		return nil // Non-fatal, don't fail the operation
-	})
-	_ = eg.Wait() // Errors are logged but not propagated (properties are for idempotency only)
+	if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+		PropNVMeoFSubsystemID:  strconv.Itoa(subsys.ID),
+		PropNVMeoFPortSubsysID: strconv.Itoa(portSubsys.ID),
+		PropNVMeoFNamespaceID:  strconv.Itoa(namespace.ID),
+	}); err != nil {
+		klog.Warningf("Failed to store NVMe-oF resource IDs: %v", err)
+	}
 
 	klog.Infof("Created NVMe-oF subsystem=%d, namespace=%d, port-assoc=%d for %s", subsys.ID, namespace.ID, portSubsys.ID, datasetName)
 	return nil
@@ -641,6 +707,14 @@ func (d *Driver) createNVMeoFShareWithOptions(ctx context.Context, datasetName, 
 // to handle cases where properties were never stored (e.g., failed volume creation).
 // Returns an error if any cleanup fails so the caller can retry.
 func (d *Driver) deleteNVMeoFShare(ctx context.Context, datasetName string) error {
+	return d.deleteNVMeoFShareForDataset(ctx, nil, datasetName)
+}
+
+func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
+	if fetched, err := d.datasetForProperties(ctx, ds, datasetName); err == nil {
+		ds = fetched
+	}
+
 	// Generate the expected NVMe-oF subsystem name (same logic as createNVMeoFShare)
 	subsysName := path.Base(datasetName)
 	if d.config.NVMeoF.NamePrefix != "" {
@@ -656,7 +730,7 @@ func (d *Driver) deleteNVMeoFShare(ctx context.Context, datasetName string) erro
 
 	// Step 1: Try to delete port-subsystem association by stored ID
 	// (fallback cleanup is handled in subsystem deletion steps below)
-	if psIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFPortSubsysID); psIDStr != "" && psIDStr != "-" {
+	if psIDStr := datasetUserProperty(ds, PropNVMeoFPortSubsysID); psIDStr != "" && psIDStr != "-" {
 		if psID, err := strconv.Atoi(psIDStr); err == nil {
 			if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, psID); err != nil {
 				klog.Warningf("Failed to delete NVMe-oF port-subsystem %d: %v", psID, err)
@@ -666,7 +740,7 @@ func (d *Driver) deleteNVMeoFShare(ctx context.Context, datasetName string) erro
 	}
 
 	// Step 2: Try to delete namespace by stored ID
-	if nsIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID); nsIDStr != "" && nsIDStr != "-" {
+	if nsIDStr := datasetUserProperty(ds, PropNVMeoFNamespaceID); nsIDStr != "" && nsIDStr != "-" {
 		if nsID, err := strconv.Atoi(nsIDStr); err == nil {
 			if err := d.truenasClient.NVMeoFNamespaceDelete(ctx, nsID); err != nil {
 				klog.Warningf("Failed to delete NVMe-oF namespace %d: %v", nsID, err)
@@ -678,7 +752,7 @@ func (d *Driver) deleteNVMeoFShare(ctx context.Context, datasetName string) erro
 	}
 
 	// Step 2: Try to delete subsystem by stored ID (including port-subsys associations)
-	if ssIDStr, _ := d.truenasClient.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID); ssIDStr != "" && ssIDStr != "-" {
+	if ssIDStr := datasetUserProperty(ds, PropNVMeoFSubsystemID); ssIDStr != "" && ssIDStr != "-" {
 		if ssID, err := strconv.Atoi(ssIDStr); err == nil {
 			// First delete any port-subsystem associations for this subsystem
 			if assocs, err := d.truenasClient.NVMeoFPortSubsysListBySubsystem(ctx, ssID); err == nil {

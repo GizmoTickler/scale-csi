@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,6 +35,82 @@ type ErrorInjectingMockClient struct {
 
 	// Track cleanup call order
 	CleanupCalls []string
+}
+
+type shareCallCountingMock struct {
+	*truenas.MockClient
+	datasetGets        int
+	zvolWaits          int
+	idempotencyLookups int
+	propertyUpdates    []map[string]string
+}
+
+func newShareCallCountingMock() *shareCallCountingMock {
+	return &shareCallCountingMock{MockClient: truenas.NewMockClient()}
+}
+
+func (m *shareCallCountingMock) DatasetGet(ctx context.Context, name string) (*truenas.Dataset, error) {
+	m.datasetGets++
+	return m.MockClient.DatasetGet(ctx, name)
+}
+
+func (m *shareCallCountingMock) WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*truenas.Dataset, error) {
+	m.zvolWaits++
+	return m.MockClient.WaitForZvolReady(ctx, name, timeout)
+}
+
+func (m *shareCallCountingMock) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
+	copyOfProperties := make(map[string]string, len(properties))
+	for key, value := range properties {
+		copyOfProperties[key] = value
+	}
+	m.propertyUpdates = append(m.propertyUpdates, copyOfProperties)
+	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
+}
+
+func (m *shareCallCountingMock) ISCSITargetGet(ctx context.Context, id int) (*truenas.ISCSITarget, error) {
+	m.idempotencyLookups++
+	return m.MockClient.ISCSITargetGet(ctx, id)
+}
+
+func (m *shareCallCountingMock) ISCSITargetFindByName(ctx context.Context, name string) (*truenas.ISCSITarget, error) {
+	m.idempotencyLookups++
+	return m.MockClient.ISCSITargetFindByName(ctx, name)
+}
+
+func (m *shareCallCountingMock) ISCSIExtentGet(ctx context.Context, id int) (*truenas.ISCSIExtent, error) {
+	m.idempotencyLookups++
+	return m.MockClient.ISCSIExtentGet(ctx, id)
+}
+
+func (m *shareCallCountingMock) ISCSIExtentFindByName(ctx context.Context, name string) (*truenas.ISCSIExtent, error) {
+	m.idempotencyLookups++
+	return m.MockClient.ISCSIExtentFindByName(ctx, name)
+}
+
+func (m *shareCallCountingMock) ISCSIExtentFindByDisk(ctx context.Context, diskPath string) (*truenas.ISCSIExtent, error) {
+	m.idempotencyLookups++
+	return m.MockClient.ISCSIExtentFindByDisk(ctx, diskPath)
+}
+
+func (m *shareCallCountingMock) ISCSITargetExtentGet(ctx context.Context, id int) (*truenas.ISCSITargetExtent, error) {
+	m.idempotencyLookups++
+	return m.MockClient.ISCSITargetExtentGet(ctx, id)
+}
+
+func (m *shareCallCountingMock) ISCSITargetExtentFind(ctx context.Context, targetID, extentID int) (*truenas.ISCSITargetExtent, error) {
+	m.idempotencyLookups++
+	return m.MockClient.ISCSITargetExtentFind(ctx, targetID, extentID)
+}
+
+func (m *shareCallCountingMock) NVMeoFSubsystemFindByName(ctx context.Context, name string) (*truenas.NVMeoFSubsystem, error) {
+	m.idempotencyLookups++
+	return m.MockClient.NVMeoFSubsystemFindByName(ctx, name)
+}
+
+func (m *shareCallCountingMock) NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*truenas.NVMeoFNamespace, error) {
+	m.idempotencyLookups++
+	return m.MockClient.NVMeoFNamespaceFindByDevice(ctx, subsystemID, devicePath)
 }
 
 func NewErrorInjectingMockClient() *ErrorInjectingMockClient {
@@ -104,6 +181,13 @@ func (m *ErrorInjectingMockClient) DatasetSetUserProperty(ctx context.Context, n
 		return m.InjectPropertySetError
 	}
 	return m.MockClient.DatasetSetUserProperty(ctx, name, key, value)
+}
+
+func (m *ErrorInjectingMockClient) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
+	if m.InjectPropertySetError != nil {
+		return m.InjectPropertySetError
+	}
+	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
 }
 
 // =============================================================================
@@ -383,6 +467,73 @@ func TestCreateISCSIShare_TargetCreation_Success(t *testing.T) {
 	assert.NotNil(t, target)
 }
 
+func TestCreateISCSIShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testing.T) {
+	mockClient := newShareCallCountingMock()
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
+			ISCSI: ISCSIConfig{TargetGroups: []ISCSITargetGroup{
+				{Portal: 1, Initiator: 1, AuthMethod: "NONE"},
+			}},
+		},
+		truenasClient: mockClient,
+		serviceReloadDebouncer: NewServiceReloadDebouncer(time.Nanosecond, func(context.Context, string) error {
+			return nil
+		}),
+	}
+	ctx := context.Background()
+	datasetName := "tank/k8s/volumes/fresh-iscsi"
+	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "VOLUME", Volsize: 1024 * 1024 * 1024,
+	})
+	require.NoError(t, err)
+
+	err = d.createISCSIShareForDataset(ctx, ds, datasetName, "fresh-iscsi", true, true)
+	require.NoError(t, err)
+	assert.Zero(t, mockClient.datasetGets)
+	assert.Zero(t, mockClient.zvolWaits)
+	assert.Zero(t, mockClient.idempotencyLookups)
+	require.Len(t, mockClient.propertyUpdates, 1)
+	assert.Equal(t, map[string]string{
+		PropISCSITargetID:       "1",
+		PropISCSIExtentID:       "1",
+		PropISCSITargetExtentID: "1",
+	}, mockClient.propertyUpdates[0])
+}
+
+func TestCreateNVMeoFShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testing.T) {
+	mockClient := newShareCallCountingMock()
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
+			NVMeoF: NVMeoFConfig{
+				Transport:          "TCP",
+				TransportAddress:   "10.0.0.10",
+				TransportServiceID: 4420,
+			},
+		},
+		truenasClient: mockClient,
+	}
+	ctx := context.Background()
+	datasetName := "tank/k8s/volumes/fresh-nvme"
+	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "VOLUME", Volsize: 1024 * 1024 * 1024,
+	})
+	require.NoError(t, err)
+
+	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "fresh-nvme", true, true)
+	require.NoError(t, err)
+	assert.Zero(t, mockClient.datasetGets)
+	assert.Zero(t, mockClient.zvolWaits)
+	assert.Zero(t, mockClient.idempotencyLookups)
+	require.Len(t, mockClient.propertyUpdates, 1)
+	assert.Equal(t, map[string]string{
+		PropNVMeoFSubsystemID:  "1",
+		PropNVMeoFPortSubsysID: "1",
+		PropNVMeoFNamespaceID:  "1",
+	}, mockClient.propertyUpdates[0])
+}
+
 // =============================================================================
 // Test ensureShareExists idempotency
 // =============================================================================
@@ -516,7 +667,7 @@ func TestCreateShareWithOptions_UnsupportedType(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := d.createShareWithOptions(ctx, "tank/k8s/volumes/test", "test-vol", ShareType("unknown"), false, "")
+	err := d.createShareWithOptions(ctx, nil, "tank/k8s/volumes/test", "test-vol", ShareType("unknown"), false, false)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported share type")
@@ -536,7 +687,7 @@ func TestDeleteShare_UnknownType(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := d.deleteShare(ctx, "tank/k8s/volumes/test", ShareType("unknown"))
+	err := d.deleteShare(ctx, nil, "tank/k8s/volumes/test", ShareType("unknown"))
 
 	// Should succeed (no-op for unknown types)
 	assert.NoError(t, err)

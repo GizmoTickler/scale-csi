@@ -131,6 +131,13 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 			ds.Refquota = DatasetProperty{Parsed: refquota}
 		}
 	}
+	for _, update := range params.UserPropertiesUpdate {
+		if update.Remove {
+			delete(ds.UserProperties, update.Key)
+			continue
+		}
+		ds.UserProperties[update.Key] = UserProperty{Value: update.Value}
+	}
 	return ds, nil
 }
 
@@ -146,6 +153,10 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 }
 
 func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
+	return m.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
+}
+
+func (m *MockClient) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -156,7 +167,9 @@ func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, valu
 	if !ok {
 		return &APIError{Code: -1, Message: "dataset not found"}
 	}
-	ds.UserProperties[key] = UserProperty{Value: value}
+	for key, value := range properties {
+		ds.UserProperties[key] = UserProperty{Value: value}
+	}
 	return nil
 }
 
