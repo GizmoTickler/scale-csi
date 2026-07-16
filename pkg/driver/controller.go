@@ -686,10 +686,8 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 }
 
 // ListVolumes lists all volumes.
-// Note: Pagination is based on raw dataset offset, not filtered volume count.
-// This is necessary because TrueNAS API pagination is offset-based, and we filter
-// client-side for CSI-managed volumes. The trade-off is that pages may have fewer
-// entries than requested if there are non-CSI datasets interspersed.
+// Note: Pagination is based on the offset of server-filtered CSI datasets.
+// The client-side managed-resource check remains as a compatibility safeguard.
 func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	klog.V(4).Info("ListVolumes called")
 
@@ -703,27 +701,26 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 		}
 	}
 
-	// Use max entries as limit (default to 100 if not specified or 0)
-	// Request more from API to account for filtered non-CSI datasets
+	// Use max entries as limit (default to 100 if not specified or 0).
 	requestedLimit := int(req.GetMaxEntries())
 	if requestedLimit == 0 {
 		requestedLimit = 100
 	}
-	// Fetch extra to increase chance of filling the page after filtering
-	fetchLimit := requestedLimit * 2
-	if fetchLimit < 50 {
-		fetchLimit = 50
-	}
+	// Fetch one lookahead row to determine whether another page exists.
+	fetchLimit := requestedLimit + 1
 
 	datasets, err := d.truenasClient.DatasetList(ctx, d.config.ZFS.DatasetParentName, fetchLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
 
-	entries := make([]*csi.ListVolumesResponse_Entry, 0, requestedLimit)
-	datasetsProcessed := 0
-	for _, ds := range datasets {
-		datasetsProcessed++
+	pageSize := len(datasets)
+	if pageSize > requestedLimit {
+		pageSize = requestedLimit
+	}
+
+	entries := make([]*csi.ListVolumesResponse_Entry, 0, pageSize)
+	for _, ds := range datasets[:pageSize] {
 
 		// Skip if not managed by CSI
 		if prop, ok := ds.UserProperties[PropManagedResource]; !ok || prop.Value != "true" {
@@ -739,21 +736,13 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 				CapacityBytes: capacity,
 			},
 		})
-
-		// Stop if we have enough entries
-		if len(entries) >= requestedLimit {
-			break
-		}
 	}
 
-	// Generate next token based on datasets actually processed
-	// This ensures we don't skip any datasets on the next page
+	// Advance by server-filtered rows consumed; compatibility filtering above does
+	// not affect page math.
 	nextToken := ""
-	if datasetsProcessed > 0 && len(datasets) >= datasetsProcessed {
-		// More datasets may exist if we got a full fetch or filled our requested limit
-		if len(datasets) == fetchLimit || len(entries) == requestedLimit {
-			nextToken = strconv.Itoa(offset + datasetsProcessed)
-		}
+	if len(datasets) > requestedLimit {
+		nextToken = strconv.Itoa(offset + pageSize)
 	}
 
 	return &csi.ListVolumesResponse{

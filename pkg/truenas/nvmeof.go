@@ -467,6 +467,15 @@ type NVMeoFPortSubsys struct {
 // Note: TrueNAS 25.10+ API doesn't support filtering by nested fields (subsys.id),
 // so we fetch all associations and filter client-side.
 func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error) {
+	assocs, err := c.NVMeoFPortSubsysList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return NVMeoFPortSubsysFilterBySubsystem(assocs, subsysID), nil
+}
+
+// NVMeoFPortSubsysList returns all port-subsystem associations.
+func (c *Client) NVMeoFPortSubsysList(ctx context.Context) ([]*NVMeoFPortSubsys, error) {
 	// Fetch all port-subsystem associations (no filter - API doesn't support nested field filtering)
 	result, err := c.Call(ctx, "nvmet.port_subsys.query", []interface{}{}, map[string]interface{}{})
 	if err != nil {
@@ -478,39 +487,27 @@ func (c *Client) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID i
 		return nil, nil
 	}
 
-	// Filter client-side by subsystem ID
-	assocs := make([]*NVMeoFPortSubsys, 0)
+	assocs := make([]*NVMeoFPortSubsys, 0, len(items))
 	for _, item := range items {
-		m, ok := item.(map[string]interface{})
-		if !ok {
+		assoc, err := parseNVMeoFPortSubsys(item)
+		if err != nil {
 			continue
 		}
-		// Extract subsystem ID from nested structure
-		var itemSubsysID int
-		if subsys, ok := m["subsys"].(map[string]interface{}); ok {
-			if id, ok := subsys["id"].(float64); ok {
-				itemSubsysID = int(id)
-			}
-		}
-		// Only include if it matches the requested subsystem ID
-		if itemSubsysID != subsysID {
-			continue
-		}
-
-		assoc := &NVMeoFPortSubsys{}
-		if id, ok := m["id"].(float64); ok {
-			assoc.ID = int(id)
-		}
-		if port, ok := m["port"].(map[string]interface{}); ok {
-			if id, ok := port["id"].(float64); ok {
-				assoc.PortID = int(id)
-			}
-		}
-		assoc.SubsysID = itemSubsysID
 		assocs = append(assocs, assoc)
 	}
 
 	return assocs, nil
+}
+
+// NVMeoFPortSubsysFilterBySubsystem filters a pre-fetched association table.
+func NVMeoFPortSubsysFilterBySubsystem(assocs []*NVMeoFPortSubsys, subsysID int) []*NVMeoFPortSubsys {
+	filtered := make([]*NVMeoFPortSubsys, 0)
+	for _, assoc := range assocs {
+		if assoc != nil && assoc.SubsysID == subsysID {
+			filtered = append(filtered, assoc)
+		}
+	}
+	return filtered
 }
 
 // NVMeoFPortSubsysDelete deletes a port-subsystem association by ID.

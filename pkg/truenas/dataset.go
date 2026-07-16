@@ -43,6 +43,19 @@ type UserProperty struct {
 	Source string `json:"source"`
 }
 
+const datasetManagedResourceProperty = "truenas-csi:managed_resource"
+
+var datasetQueryProperties = []string{
+	"used",
+	"available",
+	"quota",
+	"refquota",
+	"reservation",
+	"refreservation",
+	"volsize",
+	"volblocksize",
+}
+
 // DatasetCreateParams holds parameters for creating a dataset.
 type DatasetCreateParams struct {
 	Name            string `json:"name"`
@@ -133,8 +146,13 @@ func (c *Client) DatasetDelete(ctx context.Context, name string, recursive, forc
 // DatasetGet retrieves a dataset by name.
 func (c *Client) DatasetGet(ctx context.Context, name string) (*Dataset, error) {
 	filters := [][]interface{}{{"id", "=", name}}
+	options := map[string]interface{}{
+		"extra": map[string]interface{}{
+			"properties": datasetQueryProperties,
+		},
+	}
 
-	result, err := c.Call(ctx, "pool.dataset.query", filters, map[string]interface{}{})
+	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dataset: %w", err)
 	}
@@ -157,16 +175,18 @@ func (c *Client) DatasetUpdate(ctx context.Context, name string, params *Dataset
 	return parseDataset(result)
 }
 
-// DatasetList lists datasets matching the given filters.
+// DatasetList lists CSI-managed datasets below the given parent.
 func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error) {
 	filters := make([][]interface{}, 0)
 	if parentName != "" {
-		filters = append(filters, []interface{}{"id", "^", parentName + "/"})
+		filters = append(filters, []interface{}{"name", "^", parentName + "/"})
 	}
+	filters = append(filters, []interface{}{"user_properties." + datasetManagedResourceProperty + ".value", "=", "true"})
 
 	options := map[string]interface{}{
 		"extra": map[string]interface{}{
-			"flat": true,
+			"flat":       true,
+			"properties": datasetQueryProperties,
 		},
 	}
 

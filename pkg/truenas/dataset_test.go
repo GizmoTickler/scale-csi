@@ -241,6 +241,7 @@ func TestDatasetCreate_AlreadyExists(t *testing.T) {
 // TestDatasetGet tests retrieving a dataset
 func TestDatasetGet_Success(t *testing.T) {
 	mock := newMockWSServer()
+	queryParams := make(chan []interface{}, 1)
 	server := mock.start(func(conn *websocket.Conn) {
 		for {
 			var req rpcTestRequest
@@ -256,6 +257,7 @@ func TestDatasetGet_Success(t *testing.T) {
 			case "auth.login_with_api_key":
 				resp.Result = true
 			case "pool.dataset.query":
+				queryParams <- req.Params
 				resp.Result = []interface{}{
 					map[string]interface{}{
 						"id":         "tank/k8s/volumes/pvc-123",
@@ -316,6 +318,12 @@ func TestDatasetGet_Success(t *testing.T) {
 	assert.Equal(t, "VOLUME", ds.Type)
 	assert.Equal(t, float64(10737418240), ds.Volsize.Parsed)
 	assert.Equal(t, "true", ds.UserProperties["truenas-csi:managed_resource"].Value)
+
+	params := <-queryParams
+	require.Len(t, params, 2)
+	options := params[1].(map[string]interface{})
+	extra := options["extra"].(map[string]interface{})
+	assert.Equal(t, []interface{}{"used", "available", "quota", "refquota", "reservation", "refreservation", "volsize", "volblocksize"}, extra["properties"])
 }
 
 // TestDatasetGet_NotFound tests retrieving a non-existent dataset
@@ -627,6 +635,7 @@ func TestDatasetUpdate_Success(t *testing.T) {
 // TestDatasetList tests listing datasets
 func TestDatasetList_Success(t *testing.T) {
 	mock := newMockWSServer()
+	queryParams := make(chan []interface{}, 1)
 	server := mock.start(func(conn *websocket.Conn) {
 		for {
 			var req rpcTestRequest
@@ -642,6 +651,7 @@ func TestDatasetList_Success(t *testing.T) {
 			case "auth.login_with_api_key":
 				resp.Result = true
 			case "pool.dataset.query":
+				queryParams <- req.Params
 				resp.Result = []interface{}{
 					map[string]interface{}{
 						"id":              "tank/k8s/volumes/pvc-1",
@@ -695,6 +705,17 @@ func TestDatasetList_Success(t *testing.T) {
 	assert.Len(t, datasets, 2)
 	assert.Equal(t, "tank/k8s/volumes/pvc-1", datasets[0].ID)
 	assert.Equal(t, "tank/k8s/volumes/pvc-2", datasets[1].ID)
+
+	params := <-queryParams
+	require.Len(t, params, 2)
+	assert.Equal(t, []interface{}{
+		[]interface{}{"name", "^", "tank/k8s/volumes/"},
+		[]interface{}{"user_properties.truenas-csi:managed_resource.value", "=", "true"},
+	}, params[0])
+	options := params[1].(map[string]interface{})
+	extra := options["extra"].(map[string]interface{})
+	assert.Equal(t, true, extra["flat"])
+	assert.Equal(t, []interface{}{"used", "available", "quota", "refquota", "reservation", "refreservation", "volsize", "volblocksize"}, extra["properties"])
 }
 
 // TestDatasetExpand tests expanding a zvol
@@ -1247,26 +1268,30 @@ func TestGetPoolAvailable_Success(t *testing.T) {
 	assert.Equal(t, int64(500000000000), avail)
 }
 
-// TestParseDataset tests the parseDataset function
-func TestParseDataset_ValidData(t *testing.T) {
+func TestParseDataset_ProjectedResponse(t *testing.T) {
+	property := func(value string, parsed float64) map[string]interface{} {
+		return map[string]interface{}{
+			"value":    value,
+			"rawvalue": value,
+			"parsed":   parsed,
+			"source":   "LOCAL",
+		}
+	}
+
 	data := map[string]interface{}{
-		"id":         "tank/test",
-		"name":       "tank/test",
-		"pool":       "tank",
-		"type":       "FILESYSTEM",
-		"mountpoint": "/mnt/tank/test",
-		"used": map[string]interface{}{
-			"value":    "1G",
-			"rawvalue": "1073741824",
-			"parsed":   float64(1073741824),
-			"source":   "LOCAL",
-		},
-		"available": map[string]interface{}{
-			"value":    "100G",
-			"rawvalue": "107374182400",
-			"parsed":   float64(107374182400),
-			"source":   "LOCAL",
-		},
+		"id":             "tank/test",
+		"name":           "tank/test",
+		"pool":           "tank",
+		"type":           "FILESYSTEM",
+		"mountpoint":     "/mnt/tank/test",
+		"used":           property("1073741824", 1073741824),
+		"available":      property("107374182400", 107374182400),
+		"quota":          property("2147483648", 2147483648),
+		"refquota":       property("3221225472", 3221225472),
+		"reservation":    property("4294967296", 4294967296),
+		"refreservation": property("5368709120", 5368709120),
+		"volsize":        property("6442450944", 6442450944),
+		"volblocksize":   property("16384", 16384),
 		"user_properties": map[string]interface{}{
 			"custom:prop": map[string]interface{}{
 				"value":  "test-value",
@@ -1284,6 +1309,12 @@ func TestParseDataset_ValidData(t *testing.T) {
 	assert.Equal(t, "/mnt/tank/test", ds.Mountpoint)
 	assert.Equal(t, float64(1073741824), ds.Used.Parsed)
 	assert.Equal(t, float64(107374182400), ds.Available.Parsed)
+	assert.Equal(t, float64(2147483648), ds.Quota.Parsed)
+	assert.Equal(t, float64(3221225472), ds.Refquota.Parsed)
+	assert.Equal(t, float64(4294967296), ds.Reservation.Parsed)
+	assert.Equal(t, float64(5368709120), ds.Refreservation.Parsed)
+	assert.Equal(t, float64(6442450944), ds.Volsize.Parsed)
+	assert.Equal(t, float64(16384), ds.Volblocksize.Parsed)
 	assert.Equal(t, "test-value", ds.UserProperties["custom:prop"].Value)
 }
 

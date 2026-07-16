@@ -727,6 +727,19 @@ func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 
 	var nsDeleted, ssDeleted bool
 	var errs []error
+	var portSubsysAssocs []*truenas.NVMeoFPortSubsys
+	var portSubsysAssocsErr error
+	portSubsysAssocsFetched := false
+	portSubsysAssocsFor := func(subsysID int) ([]*truenas.NVMeoFPortSubsys, error) {
+		if !portSubsysAssocsFetched {
+			portSubsysAssocs, portSubsysAssocsErr = d.truenasClient.NVMeoFPortSubsysList(ctx)
+			portSubsysAssocsFetched = true
+		}
+		if portSubsysAssocsErr != nil {
+			return nil, portSubsysAssocsErr
+		}
+		return truenas.NVMeoFPortSubsysFilterBySubsystem(portSubsysAssocs, subsysID), nil
+	}
 
 	// Step 1: Try to delete port-subsystem association by stored ID
 	// (fallback cleanup is handled in subsystem deletion steps below)
@@ -755,7 +768,7 @@ func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	if ssIDStr := datasetUserProperty(ds, PropNVMeoFSubsystemID); ssIDStr != "" && ssIDStr != "-" {
 		if ssID, err := strconv.Atoi(ssIDStr); err == nil {
 			// First delete any port-subsystem associations for this subsystem
-			if assocs, err := d.truenasClient.NVMeoFPortSubsysListBySubsystem(ctx, ssID); err == nil {
+			if assocs, err := portSubsysAssocsFor(ssID); err == nil {
 				for _, assoc := range assocs {
 					if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, assoc.ID); err != nil {
 						klog.Warningf("Failed to delete port-subsystem association %d: %v", assoc.ID, err)
@@ -789,7 +802,7 @@ func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		if subsys, err := d.truenasClient.NVMeoFSubsystemFindByName(ctx, subsysName); err == nil && subsys != nil {
 			klog.V(4).Infof("Found orphaned subsystem by name %s (ID %d), deleting", subsysName, subsys.ID)
 			// First delete any port-subsystem associations for this subsystem
-			if assocs, err := d.truenasClient.NVMeoFPortSubsysListBySubsystem(ctx, subsys.ID); err == nil {
+			if assocs, err := portSubsysAssocsFor(subsys.ID); err == nil {
 				for _, assoc := range assocs {
 					if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, assoc.ID); err != nil {
 						klog.Warningf("Failed to delete orphaned port-subsystem association %d: %v", assoc.ID, err)

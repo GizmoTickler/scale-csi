@@ -45,6 +45,26 @@ type shareCallCountingMock struct {
 	propertyUpdates    []map[string]string
 }
 
+type nvmeDeleteAssociationCountingMock struct {
+	*truenas.MockClient
+	portSubsysListCalls   int
+	portSubsysDeleteCalls int
+}
+
+func (m *nvmeDeleteAssociationCountingMock) NVMeoFPortSubsysList(ctx context.Context) ([]*truenas.NVMeoFPortSubsys, error) {
+	m.portSubsysListCalls++
+	return []*truenas.NVMeoFPortSubsys{{ID: 11, PortID: 1, SubsysID: 1}}, nil
+}
+
+func (m *nvmeDeleteAssociationCountingMock) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
+	return fmt.Errorf("subsystem deletion failed")
+}
+
+func (m *nvmeDeleteAssociationCountingMock) NVMeoFPortSubsysDelete(ctx context.Context, id int) error {
+	m.portSubsysDeleteCalls++
+	return nil
+}
+
 func newShareCallCountingMock() *shareCallCountingMock {
 	return &shareCallCountingMock{MockClient: truenas.NewMockClient()}
 }
@@ -378,6 +398,30 @@ func TestDeleteNVMeoFShare_PropagatesCleanupErrors(t *testing.T) {
 	// Verify error is propagated
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "NVMe-oF cleanup errors")
+}
+
+func TestDeleteNVMeoFShare_FetchesPortSubsysAssociationsOnce(t *testing.T) {
+	mockClient := &nvmeDeleteAssociationCountingMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes"},
+		},
+		truenasClient: mockClient,
+	}
+
+	datasetName := "tank/k8s/volumes/test-nvme-assoc-cache"
+	ds, err := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+		Name: datasetName,
+		Type: "VOLUME",
+	})
+	require.NoError(t, err)
+	require.NoError(t, mockClient.DatasetSetUserProperty(context.Background(), datasetName, PropNVMeoFSubsystemID, "1"))
+	mockClient.NVMeSubsystems[1] = &truenas.NVMeoFSubsystem{ID: 1, Name: "test-nvme-assoc-cache"}
+
+	err = d.deleteNVMeoFShareForDataset(context.Background(), ds, datasetName)
+	require.Error(t, err)
+	assert.Equal(t, 2, mockClient.portSubsysDeleteCalls)
+	assert.Equal(t, 1, mockClient.portSubsysListCalls)
 }
 
 // =============================================================================

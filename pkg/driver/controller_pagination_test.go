@@ -3,6 +3,8 @@ package driver
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -74,30 +76,19 @@ func TestListVolumes_Pagination(t *testing.T) {
 			},
 		}
 	}
+	mockClient.Datasets["pool/parent/unmanaged"] = &truenas.Dataset{
+		ID:             "pool/parent/unmanaged",
+		Name:           "pool/parent/unmanaged",
+		UserProperties: map[string]truenas.UserProperty{},
+	}
+	mockClient.Datasets["pool/other/managed"] = &truenas.Dataset{
+		ID:   "pool/other/managed",
+		Name: "pool/other/managed",
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource: {Value: "true"},
+		},
+	}
 
-	// We can't easily override methods on the struct without an interface wrapper or embedding.
-	// Since Driver uses the interface, we can pass a wrapper.
-	// However, MockClient methods are defined on *MockClient.
-	// We need to create a wrapper that implements the interface and delegates to MockClient, overriding List methods.
-
-	// Actually, since I modified MockClient in the codebase to accept limit/offset but ignore them,
-	// I can't test pagination logic *inside* the driver unless the client returns paginated results.
-	// The driver logic is:
-	// 1. Parse token to offset
-	// 2. Pass offset/limit to client
-	// 3. Get results
-	// 4. If result count == limit, set next token
-
-	// If MockClient ignores limit/offset and returns EVERYTHING, then:
-	// If I ask for limit=2, offset=0. Mock returns 5 items.
-	// Driver sees 5 items. 5 != 2 (limit). Next token = "".
-	// This is WRONG behavior for the test.
-
-	// So I MUST modify MockClient in the test to behave correctly.
-	// But MockClient is a concrete type in pkg/truenas.
-	// I can't shadow methods of a type defined in another package easily unless I embed it and use the embedded type.
-
-	// Let's create a local struct that embeds *truenas.MockClient and overrides the methods.
 	paginatedClient := &PaginatedMockClient{MockClient: mockClient}
 
 	d := &Driver{
@@ -137,6 +128,8 @@ func TestListVolumes_Pagination(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, resp.Entries, 1)
 	assert.Empty(t, resp.NextToken)
+	assert.Equal(t, []int{3, 3, 3}, paginatedClient.datasetListLimits)
+	assert.Equal(t, []string{"pool/parent", "pool/parent", "pool/parent"}, paginatedClient.datasetListParents)
 }
 
 func TestListSnapshots_Pagination(t *testing.T) {
@@ -199,19 +192,27 @@ func TestListSnapshots_Pagination(t *testing.T) {
 
 type PaginatedMockClient struct {
 	*truenas.MockClient
+	datasetListLimits  []int
+	datasetListParents []string
 }
 
 func (m *PaginatedMockClient) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*truenas.Dataset, error) {
-	// Access internal map via public field (it is exported)
+	m.datasetListLimits = append(m.datasetListLimits, limit)
+	m.datasetListParents = append(m.datasetListParents, parentName)
+
+	// Emulate the TrueNAS name-prefix and managed-resource filters before
+	// applying offset/limit pagination.
 	var allDatasets []*truenas.Dataset
-	// Iteration order of map is random, so we must sort or just accept random subset for generic count test.
-	// For strict pagination test, we need stable order.
-	// Let's just collect all and return a slice.
 	for _, ds := range m.Datasets {
+		if !strings.HasPrefix(ds.Name, parentName+"/") {
+			continue
+		}
+		if prop, ok := ds.UserProperties[PropManagedResource]; !ok || prop.Value != "true" {
+			continue
+		}
 		allDatasets = append(allDatasets, ds)
 	}
-
-	// Since map order is random, let's not rely on specific items, just counts.
+	sort.Slice(allDatasets, func(i, j int) bool { return allDatasets[i].Name < allDatasets[j].Name })
 
 	start := offset
 	if start >= len(allDatasets) {

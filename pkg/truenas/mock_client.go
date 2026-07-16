@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -147,9 +148,24 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 
 	var list []*Dataset
 	for _, ds := range m.Datasets {
+		if parentName != "" && !strings.HasPrefix(ds.Name, parentName+"/") {
+			continue
+		}
+		if prop, ok := ds.UserProperties[datasetManagedResourceProperty]; !ok || prop.Value != "true" {
+			continue
+		}
 		list = append(list, ds)
 	}
-	return list, nil
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+
+	if offset >= len(list) {
+		return []*Dataset{}, nil
+	}
+	end := len(list)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	return list[offset:end], nil
 }
 
 func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
@@ -727,6 +743,9 @@ func (m *MockClient) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysI
 }
 func (m *MockClient) NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error) {
 	return true, nil
+}
+func (m *MockClient) NVMeoFPortSubsysList(ctx context.Context) ([]*NVMeoFPortSubsys, error) {
+	return nil, nil
 }
 func (m *MockClient) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error) {
 	// Return empty list for mock
