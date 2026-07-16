@@ -7,14 +7,14 @@ A Helm chart for deploying the Scale CSI driver for TrueNAS SCALE.
 - Kubernetes 1.25+
 - Helm 3.8+
 - TrueNAS SCALE with API access enabled
-- For iSCSI: `open-iscsi` package installed on nodes
-- For NVMe-oF: `nvme-cli` package installed on nodes
+- The external snapshot CRDs/controller when `snapshotClass.create` is enabled
+- `open-iscsi` on nodes that use iSCSI
+- `nvme-cli` on nodes that use NVMe-oF
 
-## Quick Start
+## Quick start
 
 ```bash
-helm repo add scale-csi oci://ghcr.io/gizmotickler/charts
-helm install scale-csi scale-csi/scale-csi \
+helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
   --namespace scale-csi \
   --create-namespace \
   --set truenas.host=truenas.local \
@@ -22,242 +22,250 @@ helm install scale-csi scale-csi/scale-csi \
   --set zfs.parentDataset=tank/k8s/volumes
 ```
 
-## Installation
-
-### From OCI Registry
-
-```bash
-helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
-  --namespace scale-csi \
-  --create-namespace \
-  -f values.yaml
-```
-
-### From Source
-
-```bash
-git clone https://github.com/GizmoTickler/scale-csi
-cd scale-csi
-helm install scale-csi charts/scale-csi \
-  --namespace scale-csi \
-  --create-namespace \
-  -f my-values.yaml
-```
+The driver supports API-key authentication only. If `truenas.existingSecret` is
+used, that Secret must contain an `api-key` key.
 
 ## Configuration
 
-### Required Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `truenas.host` | TrueNAS SCALE hostname or IP |
-| `truenas.apiKey` | API key for authentication |
-| `zfs.parentDataset` | Parent dataset for volumes (e.g., `tank/k8s/volumes`) |
-
-### TrueNAS Connection
+### TrueNAS connection
 
 | Parameter | Description | Default |
-|-----------|-------------|---------|
-| `truenas.host` | TrueNAS hostname/IP | `""` (required) |
+|---|---|---|
+| `truenas.host` | TrueNAS hostname or IP | `""` (required) |
 | `truenas.port` | API port | `443` |
 | `truenas.secure` | Use HTTPS | `true` |
 | `truenas.skipTLSVerify` | Skip TLS verification | `false` |
-| `truenas.apiKey` | API key | `""` |
-| `truenas.existingSecret` | Use existing secret for credentials | `""` |
-| `truenas.requestTimeout` | API request timeout (seconds) | `60` |
-| `truenas.writeTimeout` | WebSocket write timeout (seconds) | `30` |
-| `truenas.maxConcurrentRequests` | Max concurrent API requests | `10` |
+| `truenas.apiKey` | TrueNAS API key | `""` |
+| `truenas.existingSecret` | Existing Secret containing `api-key` | `""` |
+| `truenas.requestTimeout` | API request timeout in seconds | `60` |
+| `truenas.connectTimeout` | Connection timeout in seconds | `10` |
+| `truenas.writeTimeout` | WebSocket write timeout in seconds | `30` |
+| `truenas.maxConcurrentRequests` | Maximum concurrent API requests | `10` |
 
-### ZFS Configuration
+### ZFS
 
 | Parameter | Description | Default |
-|-----------|-------------|---------|
+|---|---|---|
 | `zfs.parentDataset` | Parent dataset for volumes | `""` (required) |
-| `zfs.dedup` | Enable deduplication | `false` |
-| `zfs.compression` | Enable compression | `true` |
-| `zfs.compressionAlgorithm` | Compression algorithm | `lz4` |
-| `zfs.enforceQuota` | Enforce dataset quotas | `true` |
-| `zfs.zvolReadyTimeout` | Timeout for zvol readiness (seconds) | `60` |
+| `zfs.detachedSnapshotsDatasetParentName` | Parent dataset for detached snapshots | `""` |
+| `zfs.enforceQuota` | Enable dataset quotas | `true` |
+| `zfs.zvolBlocksize` | Block size for zvols | `16K` |
+| `zfs.zvolReadyTimeout` | Zvol readiness timeout in seconds | `60` |
+| `zfs.datasetProperties` | Additional ZFS dataset properties (e.g. `compression`, `dedup`) | `{}` |
 
-### NFS Configuration
+Compression and deduplication are configured through `zfs.datasetProperties`
+(e.g. `{compression: "zstd", dedup: "off"}`). When the map is empty, no
+properties are set and new datasets inherit them from the parent dataset.
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `nfs.enabled` | Enable NFS support | `true` |
-| `nfs.server` | NFS server address | `""` (uses truenas.host) |
-| `nfs.mountOptions` | Default mount options | `["nfsvers=4", "noatime"]` |
+### Protocol configuration
 
-### iSCSI Configuration
+Only enabled protocol blocks are rendered into the driver ConfigMap.
 
 | Parameter | Description | Default |
-|-----------|-------------|---------|
-| `iscsi.enabled` | Enable iSCSI support | `true` |
-| `iscsi.portal` | Target portal address | `""` (uses truenas.host) |
+|---|---|---|
+| `nfs.enabled` | Render NFS configuration | `true` |
+| `nfs.server` | NFS share host; falls back to `truenas.host` | `""` |
+| `nfs.shareAllowedNetworks` | CIDRs allowed to mount created shares | `[]` |
+| `nfs.shareMaprootUser` | NFS maproot user | `root` |
+| `nfs.shareMaprootGroup` | NFS maproot group | `wheel` |
+| `nfs.shareMapallUser` | NFS mapall user | `""` |
+| `nfs.shareMapallGroup` | NFS mapall group | `""` |
+| `nfs.mountOptions` | Default NFS StorageClass mount options | `[nfsvers=4, noatime]` |
+| `iscsi.enabled` | Render iSCSI configuration | `true` |
+| `iscsi.portal` | Target portal host; falls back to `truenas.host` | `""` |
 | `iscsi.portalPort` | Target portal port | `3260` |
-| `iscsi.portalGroupId` | Portal group ID | `1` |
-| `iscsi.initiatorGroupId` | Initiator group ID | `1` |
-| `iscsi.basename` | IQN base name | `iqn.2005-10.org.freenas.ctl` |
-| `iscsi.deviceWaitTimeout` | Device wait timeout (seconds) | `60` |
-| `iscsi.serviceReloadDebounce` | Reload debounce (ms) | `2000` |
+| `iscsi.targetPortals` | Additional multipath portals | `[]` |
+| `iscsi.namePrefix` | Target and extent name prefix | `""` |
+| `iscsi.portalGroupId` | TrueNAS portal group ID | `1` |
+| `iscsi.initiatorGroupId` | TrueNAS initiator group ID | `1` |
+| `iscsi.extentBlocksize` | Extent block size | `512` |
+| `iscsi.extentRpm` | Extent RPM value | `SSD` |
+| `iscsi.extentAvailThreshold` | Extent available-space warning threshold | `0` |
+| `iscsi.deviceWaitTimeout` | Device wait timeout in seconds | `60` |
+| `iscsi.serviceReloadDebounce` | Service reload debounce in milliseconds | `2000` |
+| `nvmeof.enabled` | Render NVMe-oF configuration | `false` |
+| `nvmeof.transport` | Transport (`tcp` or `rdma`) | `tcp` |
+| `nvmeof.address` | Target address; falls back to `truenas.host` | `""` |
+| `nvmeof.port` | Target service ID/port | `4420` |
+| `nvmeof.subsystemHosts` | Allowed host NQNs | `[]` |
+| `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `true` |
+| `nvmeof.commandTimeout` | `nvme` command timeout in seconds | `30` |
 
-### NVMe-oF Configuration
+The iSCSI IQN basename comes from the TrueNAS global iSCSI configuration; it is
+not a chart or driver ConfigMap setting. The removed `iscsi.basename` and
+`nvmeof.basename` values had no effect.
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `nvmeof.enabled` | Enable NVMe-oF support | `false` |
-| `nvmeof.transport` | Transport type (tcp, rdma) | `tcp` |
-| `nvmeof.address` | Target address | `""` (uses truenas.host) |
-| `nvmeof.port` | Target port | `4420` |
-| `nvmeof.basename` | NQN base name | `nqn.2014-08.org.nvmexpress` |
+### StorageClasses
 
-### StorageClass Configuration
+`storageClasses` is a list, so one release can create NFS, iSCSI, and NVMe-oF
+classes. The driver reads only `protocol` from ordinary StorageClass parameters;
+TrueNAS, ZFS, and protocol settings belong in the driver ConfigMap values above.
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `storageClass.create` | Create default StorageClass | `true` |
-| `storageClass.name` | StorageClass name | `scale-nfs` |
-| `storageClass.isDefault` | Set as default StorageClass | `false` |
-| `storageClass.reclaimPolicy` | Reclaim policy | `Delete` |
-| `storageClass.volumeBindingMode` | Volume binding mode | `Immediate` |
-| `storageClass.allowVolumeExpansion` | Allow volume expansion | `true` |
-| `storageClass.protocol` | Storage protocol | `nfs` |
-| `storageClass.mountOptions` | Mount options for NFS | `["nfsvers=4", "noatime"]` |
+| Field | Description | Default in bundled class |
+|---|---|---|
+| `storageClasses[].name` | StorageClass name | `scale-nfs` |
+| `storageClasses[].protocol` | `nfs`, `iscsi`, or `nvmeof` | `nfs` |
+| `storageClasses[].isDefault` | Add the default-class annotation | `false` |
+| `storageClasses[].reclaimPolicy` | `Delete` or `Retain` | `Delete` |
+| `storageClasses[].allowVolumeExpansion` | Allow PVC expansion | `true` |
+| `storageClasses[].volumeBindingMode` | Kubernetes binding mode | `Immediate` |
+| `storageClasses[].mountOptions` | StorageClass mount options | `[nfsvers=4, noatime]` |
+| `storageClasses[].extraParameters` | Additional CSI parameters such as secret references | `{}` |
 
-### Controller Configuration
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `controller.enabled` | Deploy controller | `true` |
-| `controller.replicas` | Number of replicas | `1` |
-| `controller.resources` | Resource limits/requests | See values.yaml |
-| `controller.nodeSelector` | Node selector | `{}` |
-| `controller.tolerations` | Tolerations | Control plane tolerations |
-| `controller.affinity` | Affinity rules | `{}` |
-
-### Node Configuration
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `node.enabled` | Deploy node plugin | `true` |
-| `node.resources` | Resource limits/requests | See values.yaml |
-| `node.nodeSelector` | Node selector | `{}` |
-| `node.tolerations` | Tolerations | All nodes |
-| `node.affinity` | Affinity rules | `{}` |
-
-## Example Configurations
-
-### Basic NFS Setup
+Example:
 
 ```yaml
-truenas:
-  host: truenas.local
-  apiKey: 1-xxxxx
-
-zfs:
-  parentDataset: tank/k8s/volumes
-
-storageClass:
-  name: scale-nfs
-  isDefault: true
+storageClasses:
+  - name: scale-nfs
+    protocol: nfs
+    isDefault: true
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: [nfsvers=4, noatime]
+    extraParameters: {}
+  - name: scale-iscsi
+    protocol: iscsi
+    isDefault: false
+    reclaimPolicy: Retain
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    mountOptions: []
+    extraParameters: {}
 ```
 
-### iSCSI with Custom Portal
+The old `storageClass` map remains supported for compatibility. When it is
+non-empty, it takes precedence over `storageClasses` and renders one class. It
+accepts the former `create`, `name`, `protocol`, `isDefault`, `reclaimPolicy`,
+`allowVolumeExpansion`, `volumeBindingMode`, and `mountOptions` fields plus
+`extraParameters`. Migrate existing values files to `storageClasses` when
+convenient.
 
-```yaml
-truenas:
-  host: truenas.local
-  apiKey: 1-xxxxx
+### Snapshots
 
-zfs:
-  parentDataset: tank/k8s/volumes
+| Parameter | Description | Default |
+|---|---|---|
+| `snapshotClass.create` | Create a VolumeSnapshotClass | `false` |
+| `snapshotClass.name` | VolumeSnapshotClass name | `scale-csi` |
+| `snapshotClass.deletionPolicy` | `Delete` or `Retain` | `Delete` |
+| `snapshotClass.labels` | Additional labels | `{}` |
+| `snapshotClass.annotations` | Additional annotations | `{}` |
 
-iscsi:
-  enabled: true
-  portal: 10.0.0.100
-  portalPort: 3260
+### Workloads, RBAC, and metrics
 
-storageClass:
-  name: scale-iscsi
-  protocol: iscsi
-  volumeBindingMode: WaitForFirstConsumer
-```
+| Parameter | Description | Default |
+|---|---|---|
+| `controller.enabled` | Deploy the controller | `true` |
+| `controller.replicas` | Controller replicas | `1` |
+| `controller.priorityClassName` | Controller priority class | `system-cluster-critical` |
+| `controller.podDisruptionBudget.enabled` | Create a controller PDB | `false` |
+| `controller.podDisruptionBudget.minAvailable` | PDB minimum available | `""` |
+| `controller.podDisruptionBudget.maxUnavailable` | PDB maximum unavailable | `""` |
+| `node.enabled` | Deploy the node DaemonSet | `true` |
+| `node.priorityClassName` | Node priority class | `system-node-critical` |
+| `node.sessionCleanupDelay` | Stale-session retry delay in milliseconds | `500` |
+| `kubeletDir` | Host kubelet directory | `/var/lib/kubelet` |
+| `serviceAccount.create` | Create component ServiceAccounts | `true` |
+| `serviceAccount.controllerName` | Existing/custom controller ServiceAccount | generated or `default` |
+| `serviceAccount.nodeName` | Existing/custom node ServiceAccount | generated or `default` |
+| `serviceAccount.annotations` | ServiceAccount annotations | `{}` |
+| `rbac.create` | Create ClusterRoles and bindings | `true` |
+| `podSecurityContext` | Pod-level security context for both workloads | `{runAsNonRoot: false, fsGroup: 0}` |
+| `securityContext` | Node driver container security context | privileged with `SYS_ADMIN` |
+| `metrics.enabled` | Create metrics Services | `true` |
+| `metrics.port` | Driver health/readiness and metrics port | `9809` |
 
-### Using Existing Secret
+Set one of `controller.podDisruptionBudget.minAvailable` or `maxUnavailable`
+when enabling the PDB. A PDB is useful only when `controller.replicas` is greater
+than one. ConfigMap and chart-managed Secret checksums are added to both pod
+templates so configuration and API-key changes trigger rollouts.
 
-```yaml
-truenas:
-  host: truenas.local
-  existingSecret: truenas-credentials
+### Controller sidecars
 
-zfs:
-  parentDataset: tank/k8s/volumes
-```
+Each controller sidecar exposes `timeout`, `workerThreads`, and `extraArgs`.
+The resizer maps `workerThreads` to its `--workers` CLI flag; the other sidecars
+use `--worker-threads`.
 
-Create the secret:
+| Parameter | Default |
+|---|---|
+| `sidecars.provisioner.timeout` | `300s` |
+| `sidecars.provisioner.workerThreads` | `100` |
+| `sidecars.provisioner.extraArgs` | `[]` |
+| `sidecars.attacher.timeout` | `300s` |
+| `sidecars.attacher.workerThreads` | `10` |
+| `sidecars.attacher.extraArgs` | `[]` |
+| `sidecars.resizer.timeout` | `300s` |
+| `sidecars.resizer.workerThreads` | `10` |
+| `sidecars.resizer.extraArgs` | `[]` |
+| `sidecars.snapshotter.timeout` | `300s` |
+| `sidecars.snapshotter.workerThreads` | `10` |
+| `sidecars.snapshotter.extraArgs` | `[]` |
+
+### Resilience and command timeouts
+
+| Parameter | Description | Default |
+|---|---|---|
+| `resilience.circuitBreaker.enabled` | Enable the API circuit breaker | `false` |
+| `resilience.circuitBreaker.failureThreshold` | Failures before opening | `5` |
+| `resilience.circuitBreaker.timeout` | Open-state timeout in seconds | `30` |
+| `resilience.retry.maxAttempts` | Maximum retry attempts | `3` |
+| `resilience.retry.initialDelay` | Initial retry delay in milliseconds | `500` |
+| `resilience.retry.maxDelay` | Maximum retry delay in milliseconds | `5000` |
+| `resilience.retry.backoffMultiplier` | Exponential backoff multiplier | `2.0` |
+| `resilience.rateLimiting.maxConcurrentRequests` | Concurrent API request limit | `10` |
+| `resilience.rateLimiting.maxConcurrentLogins` | Concurrent login limit per portal | `2` |
+| `commandTimeouts.mount` | Mount timeout in seconds | `30` |
+| `commandTimeouts.format` | Format timeout in seconds | `300` |
+| `commandTimeouts.iscsi` | `iscsiadm` timeout in seconds | `10` |
+| `commandTimeouts.nvme` | `nvme` timeout in seconds | `30` |
+
+### Session garbage collection
+
+| Parameter | Description | Default |
+|---|---|---|
+| `sessionGC.enabled` | Enable periodic session garbage collection | `true` |
+| `sessionGC.interval` | Interval in seconds | `300` |
+| `sessionGC.gracePeriod` | Orphan grace period in seconds | `60` |
+| `sessionGC.dryRun` | Log without disconnecting sessions | `false` |
+| `sessionGC.runOnStartup` | Run once during startup | `true` |
+| `sessionGC.startupDelay` | Startup delay in seconds | `5` |
+| `sessionGC.iscsiEnabled` | Collect iSCSI sessions | `true` |
+| `sessionGC.nvmeofEnabled` | Collect NVMe-oF sessions | `true` |
+
+## Security
+
+- `nfs.shareAllowedNetworks: []` preserves the driver default but permits mounts
+  from any network. Set explicit trusted CIDRs in production.
+- `nvmeof.subsystemAllowAnyHost: true` preserves the driver default but permits
+  any host NQN. Set it to `false` and populate `nvmeof.subsystemHosts` in
+  production.
+- Prefer an externally managed Secret and set `truenas.existingSecret`; the
+  Secret must contain `api-key`.
+
+## Existing Secret example
+
 ```bash
 kubectl create secret generic truenas-credentials \
   --namespace scale-csi \
   --from-literal=api-key=1-xxxxx
 ```
 
-### High Availability Controller
-
 ```yaml
-controller:
-  replicas: 2
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector:
-            matchLabels:
-              app.kubernetes.io/component: controller
-          topologyKey: kubernetes.io/hostname
+truenas:
+  host: truenas.local
+  existingSecret: truenas-credentials
+zfs:
+  parentDataset: tank/k8s/volumes
 ```
 
-## Upgrading
+## Upgrade and uninstall
 
 ```bash
 helm upgrade scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
   --namespace scale-csi \
   -f values.yaml
-```
 
-## Uninstalling
-
-```bash
 helm uninstall scale-csi --namespace scale-csi
 ```
 
-**Note**: PVCs and their data are not deleted when uninstalling the chart.
-
-## Troubleshooting
-
-### Check Controller Logs
-
-```bash
-kubectl logs -n scale-csi deploy/scale-csi-controller -c scale-csi
-```
-
-### Check Node Plugin Logs
-
-```bash
-kubectl logs -n scale-csi ds/scale-csi-node -c scale-csi
-```
-
-### Verify TrueNAS Connectivity
-
-```bash
-kubectl exec -n scale-csi deploy/scale-csi-controller -c scale-csi -- \
-  cat /tmp/truenas-connection-status 2>/dev/null || echo "No status file"
-```
-
-### Check CSI Driver Registration
-
-```bash
-kubectl get csidrivers
-kubectl get csinodes
-```
-
-## License
-
-Apache 2.0
+PVCs and their data are not deleted merely because the chart is uninstalled.

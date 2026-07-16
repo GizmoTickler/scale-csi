@@ -18,49 +18,98 @@ data:
       apiKey: $TRUENAS_API_KEY
       allowInsecure: {{ .Values.truenas.skipTLSVerify }}
       requestTimeout: {{ .Values.truenas.requestTimeout | default 60 }}
-      connectTimeout: 10
+      connectTimeout: {{ .Values.truenas.connectTimeout }}
       writeTimeout: {{ .Values.truenas.writeTimeout | default 30 }}
       maxConcurrentRequests: {{ .Values.truenas.maxConcurrentRequests | default 10 }}
 
     # ZFS dataset configuration
     zfs:
       datasetParentName: {{ .Values.zfs.parentDataset | quote }}
+      detachedSnapshotsDatasetParentName: {{ .Values.zfs.detachedSnapshotsDatasetParentName | quote }}
       datasetEnableQuotas: {{ .Values.zfs.enforceQuota }}
       datasetEnableReservation: false
-      zvolBlocksize: "16K"
+      {{- with .Values.zfs.datasetProperties }}
+      datasetProperties:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      zvolBlocksize: {{ .Values.zfs.zvolBlocksize | quote }}
       zvolReadyTimeout: {{ .Values.zfs.zvolReadyTimeout | default 60 }}
 
+    {{- if .Values.nfs.enabled }}
     # NFS configuration
     nfs:
       shareHost: {{ .Values.nfs.server | default .Values.truenas.host | quote }}
-      shareAllowedNetworks: []
+      shareAllowedNetworks:
+        {{- toYaml .Values.nfs.shareAllowedNetworks | nindent 8 }}
       shareAllowedHosts: []
-      shareMaprootUser: "root"
-      shareMaprootGroup: "wheel"
+      shareMaprootUser: {{ .Values.nfs.shareMaprootUser | quote }}
+      shareMaprootGroup: {{ .Values.nfs.shareMaprootGroup | quote }}
+      shareMapallUser: {{ .Values.nfs.shareMapallUser | quote }}
+      shareMapallGroup: {{ .Values.nfs.shareMapallGroup | quote }}
+    {{- end }}
 
+    {{- if .Values.iscsi.enabled }}
     # iSCSI configuration
     iscsi:
       targetPortal: {{ printf "%s:%d" (.Values.iscsi.portal | default .Values.truenas.host) (.Values.iscsi.portalPort | default 3260 | int) | quote }}
+      targetPortals:
+        {{- toYaml .Values.iscsi.targetPortals | nindent 8 }}
       interface: "default"
+      namePrefix: {{ .Values.iscsi.namePrefix | quote }}
       targetGroups:
         - portal: {{ .Values.iscsi.portalGroupId | default 1 }}
           initiator: {{ .Values.iscsi.initiatorGroupId | default 1 }}
           authMethod: "NONE"
 
-      extentBlocksize: 512
-      extentRpm: "SSD"
+      extentBlocksize: {{ .Values.iscsi.extentBlocksize }}
+      extentRpm: {{ .Values.iscsi.extentRpm | quote }}
+      extentAvailThreshold: {{ .Values.iscsi.extentAvailThreshold }}
       deviceWaitTimeout: {{ .Values.iscsi.deviceWaitTimeout | default 60 }}
       serviceReloadDebounce: {{ .Values.iscsi.serviceReloadDebounce | default 2000 }}
+    {{- end }}
 
+    {{- if .Values.nvmeof.enabled }}
     # NVMe-oF configuration
     nvmeof:
       transport: {{ .Values.nvmeof.transport | default "tcp" | quote }}
       transportAddress: {{ .Values.nvmeof.address | default .Values.truenas.host | quote }}
       transportServiceId: {{ .Values.nvmeof.port | default 4420 }}
-      subsystemAllowAnyHost: true
+      subsystemHosts:
+        {{- toYaml .Values.nvmeof.subsystemHosts | nindent 8 }}
+      subsystemAllowAnyHost: {{ .Values.nvmeof.subsystemAllowAnyHost }}
+      commandTimeout: {{ .Values.nvmeof.commandTimeout }}
+    {{- end }}
 
     # Session garbage collection (node plugin only)
     sessionGC:
-      interval: {{ if .Values.sessionGC.enabled }}{{ .Values.sessionGC.interval | default 300 }}{{ else }}0{{ end }}
+      enabled: {{ .Values.sessionGC.enabled }}
+      interval: {{ .Values.sessionGC.interval }}
       gracePeriod: {{ .Values.sessionGC.gracePeriod | default 60 }}
-      dryRun: {{ .Values.sessionGC.dryRun | default false }}
+      dryRun: {{ .Values.sessionGC.dryRun }}
+      runOnStartup: {{ .Values.sessionGC.runOnStartup }}
+      startupDelay: {{ .Values.sessionGC.startupDelay }}
+      iscsiEnabled: {{ .Values.sessionGC.iscsiEnabled }}
+      nvmeofEnabled: {{ .Values.sessionGC.nvmeofEnabled }}
+
+    node:
+      sessionCleanupDelay: {{ .Values.node.sessionCleanupDelay }}
+
+    resilience:
+      circuitBreaker:
+        enabled: {{ .Values.resilience.circuitBreaker.enabled }}
+        failureThreshold: {{ .Values.resilience.circuitBreaker.failureThreshold }}
+        timeout: {{ .Values.resilience.circuitBreaker.timeout }}
+      retry:
+        maxAttempts: {{ .Values.resilience.retry.maxAttempts }}
+        initialDelay: {{ .Values.resilience.retry.initialDelay }}
+        maxDelay: {{ .Values.resilience.retry.maxDelay }}
+        backoffMultiplier: {{ .Values.resilience.retry.backoffMultiplier }}
+      rateLimiting:
+        maxConcurrentRequests: {{ .Values.resilience.rateLimiting.maxConcurrentRequests }}
+        maxConcurrentLogins: {{ .Values.resilience.rateLimiting.maxConcurrentLogins }}
+
+    commandTimeouts:
+      mount: {{ .Values.commandTimeouts.mount }}
+      format: {{ .Values.commandTimeouts.format }}
+      iscsi: {{ .Values.commandTimeouts.iscsi }}
+      nvme: {{ .Values.commandTimeouts.nvme }}

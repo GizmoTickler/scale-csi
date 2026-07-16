@@ -15,13 +15,22 @@ spec:
     metadata:
       labels:
         {{- include "scale-csi.nodeSelectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.truenas.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ include "scale-csi.nodeServiceAccountName" . }}
-      priorityClassName: system-node-critical
+      priorityClassName: {{ .Values.node.priorityClassName }}
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -48,11 +57,11 @@ spec:
             - "-driver-name={{ .Values.csiDriverName }}"
             - "-config=/etc/scale-csi/config.yaml"
             - "-mode=node"
-            - "-health-port=9809"
+            - "-health-port={{ .Values.metrics.port }}"
             - "-v={{ .Values.logging.verbosity }}"
           ports:
             - name: health
-              containerPort: 9809
+              containerPort: {{ .Values.metrics.port }}
               protocol: TCP
           env:
             - name: NODE_ID
@@ -110,7 +119,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 9809
+              port: {{ .Values.metrics.port }}
             initialDelaySeconds: 5
             timeoutSeconds: 3
             periodSeconds: 10

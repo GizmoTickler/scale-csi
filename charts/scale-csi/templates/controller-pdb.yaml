@@ -1,0 +1,20 @@
+{{- if and .Values.controller.enabled .Values.controller.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  {{- if ne (toString .Values.controller.podDisruptionBudget.minAvailable) "" }}
+  minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  {{- if ne (toString .Values.controller.podDisruptionBudget.maxUnavailable) "" }}
+  maxUnavailable: {{ .Values.controller.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "scale-csi.controllerSelectorLabels" . | nindent 6 }}
+{{- end }}

@@ -105,6 +105,13 @@ Get the image tag
 {{- end }}
 
 {{/*
+Get the CSI driver name
+*/}}
+{{- define "scale-csi.driverName" -}}
+{{- .Values.csiDriverName }}
+{{- end }}
+
+{{/*
 Get the CSI socket path
 */}}
 {{- define "scale-csi.socketPath" -}}
@@ -122,5 +129,5 @@ Get the CSI socket directory
 Get the kubelet directory
 */}}
 {{- define "scale-csi.kubeletDir" -}}
-/var/lib/kubelet
+{{- .Values.kubeletDir }}
 {{- end }}

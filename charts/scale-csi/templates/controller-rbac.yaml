@@ -1,5 +1,4 @@
-{{- if .Values.rbac.create }}
-{{- if .Values.controller.enabled }}
+{{- if and .Values.serviceAccount.create .Values.controller.enabled }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -11,7 +10,11 @@ metadata:
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+{{- end }}
+{{- if and .Values.rbac.create .Values.controller.enabled }}
+{{- if .Values.serviceAccount.create }}
 ---
+{{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -86,5 +89,4 @@ roleRef:
   kind: ClusterRole
   name: {{ include "scale-csi.fullname" . }}-controller
   apiGroup: rbac.authorization.k8s.io
-{{- end }}
 {{- end }}

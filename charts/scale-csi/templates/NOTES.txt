@@ -1,3 +1,12 @@
+{{- $classes := .Values.storageClasses -}}
+{{- if .Values.storageClass -}}
+  {{- $legacy := mergeOverwrite (dict "create" true "name" "scale-nfs" "protocol" "nfs" "isDefault" false) (deepCopy .Values.storageClass) -}}
+  {{- if $legacy.create -}}
+    {{- $classes = list $legacy -}}
+  {{- else -}}
+    {{- $classes = list -}}
+  {{- end -}}
+{{- end -}}
 Scale CSI Driver has been installed!
 
 Chart: {{ .Chart.Name }}-{{ .Chart.Version }}
@@ -13,12 +22,13 @@ Node Plugin: Enabled (DaemonSet)
 
 CSI Driver Name: {{ .Values.csiDriverName }}
 
-{{- if .Values.storageClass.create }}
+{{- range $classes }}
 
-StorageClass "{{ .Values.storageClass.name }}" has been created.
-{{- if .Values.storageClass.isDefault }}
-This storage class is set as the default.
+StorageClass "{{ .name }}" has been created.{{ if .isDefault }} It is the default StorageClass.{{ end }}
 {{- end }}
+{{- if .Values.storageClass }}
+
+WARNING: storageClass is deprecated; migrate to the storageClasses list.
 {{- end }}
 
 To verify the installation:
@@ -32,6 +42,8 @@ To verify the installation:
   # Check node pods
   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/component=node
 
+{{- if gt (len $classes) 0 }}
+
 To create a PersistentVolumeClaim:
 
   apiVersion: v1
@@ -41,10 +53,11 @@ To create a PersistentVolumeClaim:
   spec:
     accessModes:
       - ReadWriteOnce
-    storageClassName: {{ .Values.storageClass.name }}
+    storageClassName: {{ (index $classes 0).name }}
     resources:
       requests:
         storage: 10Gi
+{{- end }}
 
 {{- if not .Values.truenas.host }}
 

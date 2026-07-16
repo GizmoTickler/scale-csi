@@ -16,13 +16,22 @@ spec:
     metadata:
       labels:
         {{- include "scale-csi.controllerSelectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.truenas.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ include "scale-csi.controllerServiceAccountName" . }}
-      priorityClassName: system-cluster-critical
+      priorityClassName: {{ .Values.controller.priorityClassName }}
       {{- with .Values.controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -46,11 +55,11 @@ spec:
             - "-driver-name={{ .Values.csiDriverName }}"
             - "-config=/etc/scale-csi/config.yaml"
             - "-mode=controller"
-            - "-health-port=9809"
+            - "-health-port={{ .Values.metrics.port }}"
             - "-v={{ .Values.logging.verbosity }}"
           ports:
             - name: health
-              containerPort: 9809
+              containerPort: {{ .Values.metrics.port }}
               protocol: TCP
           env:
             - name: NODE_ID
@@ -90,7 +99,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 9809
+              port: {{ .Values.metrics.port }}
             initialDelaySeconds: 5
             timeoutSeconds: 3
             periodSeconds: 10
@@ -102,13 +111,17 @@ spec:
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--v={{ .Values.logging.verbosity }}"
-            - "--timeout=300s"
+            - "--timeout={{ .Values.sidecars.provisioner.timeout }}"
+            - "--worker-threads={{ .Values.sidecars.provisioner.workerThreads }}"
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
             - "--extra-create-metadata"
+            {{- range .Values.sidecars.provisioner.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}
@@ -121,12 +134,16 @@ spec:
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--v={{ .Values.logging.verbosity }}"
-            - "--timeout=300s"
+            - "--timeout={{ .Values.sidecars.attacher.timeout }}"
+            - "--worker-threads={{ .Values.sidecars.attacher.workerThreads }}"
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            {{- range .Values.sidecars.attacher.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}
@@ -139,13 +156,17 @@ spec:
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--v={{ .Values.logging.verbosity }}"
-            - "--timeout=300s"
+            - "--timeout={{ .Values.sidecars.resizer.timeout }}"
+            - "--workers={{ .Values.sidecars.resizer.workerThreads }}"
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
             - "--handle-volume-inuse-error=false"
+            {{- range .Values.sidecars.resizer.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}
@@ -158,12 +179,16 @@ spec:
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--v={{ .Values.logging.verbosity }}"
-            - "--timeout=300s"
+            - "--timeout={{ .Values.sidecars.snapshotter.timeout }}"
+            - "--worker-threads={{ .Values.sidecars.snapshotter.workerThreads }}"
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            {{- range .Values.sidecars.snapshotter.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}

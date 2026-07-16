@@ -1,63 +1,52 @@
-{{- if .Values.storageClass.create }}
+{{- $root := . -}}
+{{- $classes := .Values.storageClasses -}}
+{{- if .Values.storageClass -}}
+  {{- $legacy := mergeOverwrite (dict "create" true "name" "scale-nfs" "protocol" "nfs" "isDefault" false "reclaimPolicy" "Delete" "allowVolumeExpansion" true "volumeBindingMode" "Immediate" "mountOptions" (list "nfsvers=4" "noatime") "extraParameters" (dict)) (deepCopy .Values.storageClass) -}}
+  {{- if $legacy.create -}}
+    {{- $classes = list $legacy -}}
+  {{- else -}}
+    {{- $classes = list -}}
+  {{- end -}}
+{{- end -}}
+{{- range $index, $storageClass := $classes }}
+{{- if $index }}
+---
+{{- end }}
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: {{ .Values.storageClass.name }}
+  name: {{ $storageClass.name }}
   labels:
-    {{- include "scale-csi.labels" . | nindent 4 }}
-  {{- if .Values.storageClass.isDefault }}
+    {{- include "scale-csi.labels" $root | nindent 4 }}
+  {{- if $storageClass.isDefault }}
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
   {{- end }}
-provisioner: {{ .Values.csiDriverName }}
-reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
-volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
-allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
-{{- with .Values.storageClass.mountOptions }}
+provisioner: {{ include "scale-csi.driverName" $root }}
+reclaimPolicy: {{ default "Delete" $storageClass.reclaimPolicy }}
+volumeBindingMode: {{ default "Immediate" $storageClass.volumeBindingMode }}
+allowVolumeExpansion: {{ if hasKey $storageClass "allowVolumeExpansion" }}{{ $storageClass.allowVolumeExpansion }}{{ else }}true{{ end }}
+{{- with $storageClass.mountOptions }}
 mountOptions:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 parameters:
-  # Storage protocol
-  protocol: {{ .Values.storageClass.protocol | quote }}
-
-  # ZFS settings
-  parentDataset: {{ .Values.zfs.parentDataset | quote }}
-  {{- if .Values.zfs.dedup }}
-  dedup: "on"
+  {{- $secretName := include "scale-csi.secretName" $root -}}
+  {{- $parameters := dict
+      "csi.storage.k8s.io/provisioner-secret-name" $secretName
+      "csi.storage.k8s.io/provisioner-secret-namespace" $root.Release.Namespace
+      "csi.storage.k8s.io/controller-publish-secret-name" $secretName
+      "csi.storage.k8s.io/controller-publish-secret-namespace" $root.Release.Namespace
+      "csi.storage.k8s.io/node-stage-secret-name" $secretName
+      "csi.storage.k8s.io/node-stage-secret-namespace" $root.Release.Namespace
+      "csi.storage.k8s.io/node-publish-secret-name" $secretName
+      "csi.storage.k8s.io/node-publish-secret-namespace" $root.Release.Namespace
+      "csi.storage.k8s.io/controller-expand-secret-name" $secretName
+      "csi.storage.k8s.io/controller-expand-secret-namespace" $root.Release.Namespace
+  -}}
+  {{- with $storageClass.extraParameters }}
+    {{- $parameters = mergeOverwrite $parameters (deepCopy .) -}}
   {{- end }}
-  {{- if .Values.zfs.compression }}
-  compression: {{ .Values.zfs.compressionAlgorithm | quote }}
-  {{- end }}
-
-  {{- if eq .Values.storageClass.protocol "nfs" }}
-  # NFS settings
-  nfsServer: {{ .Values.nfs.server | default .Values.truenas.host | quote }}
-  {{- end }}
-
-  {{- if eq .Values.storageClass.protocol "iscsi" }}
-  # iSCSI settings
-  iscsiPortal: {{ .Values.iscsi.portal | default .Values.truenas.host | quote }}
-  iscsiPortalPort: {{ .Values.iscsi.portalPort | quote }}
-  iscsiBasename: {{ .Values.iscsi.basename | quote }}
-  {{- end }}
-
-  {{- if eq .Values.storageClass.protocol "nvmeof" }}
-  # NVMe-oF settings
-  nvmeofTransport: {{ .Values.nvmeof.transport | quote }}
-  nvmeofAddress: {{ .Values.nvmeof.address | default .Values.truenas.host | quote }}
-  nvmeofPort: {{ .Values.nvmeof.port | quote }}
-  {{- end }}
-
-  # CSI parameters
-  csi.storage.k8s.io/provisioner-secret-name: {{ include "scale-csi.secretName" . }}
-  csi.storage.k8s.io/provisioner-secret-namespace: {{ .Release.Namespace }}
-  csi.storage.k8s.io/controller-publish-secret-name: {{ include "scale-csi.secretName" . }}
-  csi.storage.k8s.io/controller-publish-secret-namespace: {{ .Release.Namespace }}
-  csi.storage.k8s.io/node-stage-secret-name: {{ include "scale-csi.secretName" . }}
-  csi.storage.k8s.io/node-stage-secret-namespace: {{ .Release.Namespace }}
-  csi.storage.k8s.io/node-publish-secret-name: {{ include "scale-csi.secretName" . }}
-  csi.storage.k8s.io/node-publish-secret-namespace: {{ .Release.Namespace }}
-  csi.storage.k8s.io/controller-expand-secret-name: {{ include "scale-csi.secretName" . }}
-  csi.storage.k8s.io/controller-expand-secret-namespace: {{ .Release.Namespace }}
+  {{- $_ := set $parameters "protocol" (default "nfs" $storageClass.protocol) -}}
+  {{- toYaml $parameters | nindent 2 }}
 {{- end }}

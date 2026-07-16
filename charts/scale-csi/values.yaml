@@ -16,6 +16,15 @@ controller:
   enabled: true
   replicas: 1
 
+  # Priority class for controller pods
+  priorityClassName: system-cluster-critical
+
+  # PodDisruptionBudget is only useful when replicas is greater than 1
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: ""
+    maxUnavailable: ""
+
   # Resource requests/limits (none by default - opt-in)
   resources: {}
 
@@ -47,6 +56,12 @@ controller:
 node:
   enabled: true
 
+  # Priority class for node pods
+  priorityClassName: system-node-critical
+
+  # Delay in milliseconds before retrying after stale session cleanup
+  sessionCleanupDelay: 500
+
   # Resource requests/limits (none by default - opt-in)
   resources: {}
 
@@ -69,6 +84,9 @@ node:
   # Additional volumes
   extraVolumes: []
 
+# Host kubelet directory used for CSI sockets and registration
+kubeletDir: /var/lib/kubelet
+
 # TrueNAS connection configuration
 truenas:
   # TrueNAS host (required)
@@ -86,16 +104,15 @@ truenas:
   # API key authentication (recommended)
   apiKey: ""
 
-  # Username/password authentication (alternative to API key)
-  username: ""
-  password: ""
-
   # Use existing secret for credentials
-  # Secret should have keys: api-key OR username and password
+  # Secret must contain the key: api-key
   existingSecret: ""
 
   # Request timeout in seconds (default: 60)
   requestTimeout: 60
+
+  # Connection establishment timeout in seconds (default: 10)
+  connectTimeout: 10
 
   # WebSocket write timeout in seconds (default: 30)
   writeTimeout: 30
@@ -109,14 +126,17 @@ zfs:
   # Parent dataset for volumes (required)
   parentDataset: ""
 
-  # Enable deduplication
-  dedup: false
+  # Additional ZFS properties to set on newly created datasets/zvols,
+  # e.g. {compression: "zstd", dedup: "off"}. When empty (the default),
+  # no properties are set and new datasets inherit from the parent
+  # dataset — matching the driver's default behavior.
+  datasetProperties: {}
 
-  # Enable compression
-  compression: true
+  # Parent dataset used for detached snapshots
+  detachedSnapshotsDatasetParentName: ""
 
-  # Compression algorithm (lz4, gzip, zstd, etc.)
-  compressionAlgorithm: lz4
+  # Block size for newly-created zvols
+  zvolBlocksize: 16K
 
   # Dataset quota enforcement
   enforceQuota: true
@@ -134,6 +154,15 @@ nfs:
   # NFS server address (defaults to TrueNAS host)
   server: ""
 
+  # Networks allowed to mount dynamically-created shares. An empty list allows
+  # all networks and should be restricted in production.
+  shareAllowedNetworks: []
+
+  shareMaprootUser: root
+  shareMaprootGroup: wheel
+  shareMapallUser: ""
+  shareMapallGroup: ""
+
   # Default NFS mount options
   mountOptions:
     - nfsvers=4
@@ -150,14 +179,22 @@ iscsi:
   # Target portal port
   portalPort: 3260
 
+  # Additional target portals for multipath
+  targetPortals: []
+
+  # Prefix for target and extent names. The IQN basename is configured globally
+  # on TrueNAS and is not controlled by this chart.
+  namePrefix: ""
+
   # Default portal group ID
   portalGroupId: 1
 
   # Default initiator group ID
   initiatorGroupId: 1
 
-  # IQN base name
-  basename: "iqn.2005-10.org.freenas.ctl"
+  extentBlocksize: 512
+  extentRpm: SSD
+  extentAvailThreshold: 0
 
   # Timeout in seconds to wait for iSCSI device to appear after login
   # Increase this for heavily loaded nodes or slow networks
@@ -182,36 +219,40 @@ nvmeof:
   # Target port
   port: 4420
 
-  # NQN base name
-  basename: "nqn.2014-08.org.nvmexpress"
+  # Allowed host NQNs. Used when subsystemAllowAnyHost is false.
+  subsystemHosts: []
 
-# Storage class configuration
-storageClass:
-  # Create default storage class
-  create: true
+  # Allow any host NQN to connect. Restrict this in production.
+  subsystemAllowAnyHost: true
 
-  # Storage class name
-  name: scale-nfs
+  # Timeout for nvme CLI commands in seconds
+  commandTimeout: 30
 
-  # Set as default storage class
-  isDefault: false
+# Storage classes to create
+storageClasses:
+  - name: scale-nfs
+    protocol: nfs
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions:
+      - nfsvers=4
+      - noatime
+    # Additional CSI parameters, for example secret references
+    extraParameters: {}
 
-  # Reclaim policy (Delete, Retain)
-  reclaimPolicy: Delete
+# Deprecated single-StorageClass configuration. When non-empty, this takes
+# precedence over storageClasses for compatibility with existing values files.
+storageClass: {}
 
-  # Volume binding mode (Immediate, WaitForFirstConsumer)
-  volumeBindingMode: Immediate
-
-  # Allow volume expansion
-  allowVolumeExpansion: true
-
-  # Protocol (nfs, iscsi, nvmeof)
-  protocol: nfs
-
-  # Mount options for NFS
-  mountOptions:
-    - nfsvers=4
-    - noatime
+# Optional VolumeSnapshotClass
+snapshotClass:
+  create: false
+  name: scale-csi
+  deletionPolicy: Delete
+  labels: {}
+  annotations: {}
 
 # Sidecar containers versions
 sidecars:
@@ -232,18 +273,30 @@ sidecars:
 
   provisioner:
     image: registry.k8s.io/sig-storage/csi-provisioner:v6.2.0
+    timeout: 300s
+    workerThreads: 100
+    extraArgs: []
     resources: {}
 
   attacher:
     image: registry.k8s.io/sig-storage/csi-attacher:v4.12.0
+    timeout: 300s
+    workerThreads: 10
+    extraArgs: []
     resources: {}
 
   resizer:
     image: registry.k8s.io/sig-storage/csi-resizer:v2.1.0
+    timeout: 300s
+    workerThreads: 10
+    extraArgs: []
     resources: {}
 
   snapshotter:
     image: registry.k8s.io/sig-storage/csi-snapshotter:v8.5.0
+    timeout: 300s
+    workerThreads: 10
+    extraArgs: []
     resources: {}
 
   nodeDriverRegistrar:
@@ -261,6 +314,10 @@ serviceAccount:
 
   # Annotations for service accounts
   annotations: {}
+
+  # Names to use for created or existing component ServiceAccounts
+  controllerName: ""
+  nodeName: ""
 
 # RBAC configuration
 rbac:
@@ -331,3 +388,36 @@ sessionGC:
   # Dry run mode - logs orphaned sessions without disconnecting (default: false)
   # Useful for monitoring without taking action
   dryRun: false
+
+  # Run garbage collection once during startup
+  runOnStartup: true
+
+  # Delay before startup garbage collection in seconds
+  startupDelay: 5
+
+  # Enable protocol-specific session collection
+  iscsiEnabled: true
+  nvmeofEnabled: true
+
+# API resilience configuration
+resilience:
+  circuitBreaker:
+    # The driver currently defaults to disabled when this key is absent
+    enabled: false
+    failureThreshold: 5
+    timeout: 30
+  retry:
+    maxAttempts: 3
+    initialDelay: 500
+    maxDelay: 5000
+    backoffMultiplier: 2.0
+  rateLimiting:
+    maxConcurrentRequests: 10
+    maxConcurrentLogins: 2
+
+# Host command timeouts in seconds
+commandTimeouts:
+  mount: 30
+  format: 300
+  iscsi: 10
+  nvme: 30
