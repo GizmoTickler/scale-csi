@@ -26,7 +26,7 @@ var (
 		if err := unix.Stat(path, &stat); err != nil {
 			return 0, 0, err
 		}
-		return uint32(stat.Mode), uint64(stat.Rdev), nil
+		return uint32(stat.Mode), uint64(stat.Rdev), nil //nolint:unconvert // Stat_t field widths differ per platform (darwin: Mode uint16, Rdev int32)
 	}
 )
 
