@@ -293,7 +293,7 @@ sidecars:
     resources: {}
 
   snapshotter:
-    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.5.0
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0
     timeout: 300s
     workerThreads: 10
     extraArgs: []
@@ -304,7 +304,7 @@ sidecars:
     resources: {}
 
   livenessProbe:
-    image: registry.k8s.io/sig-storage/livenessprobe:v2.18.0
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
     resources: {}
 
 # Service account configuration
