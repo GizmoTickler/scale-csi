@@ -239,7 +239,7 @@ type Client struct {
 	// TrueNAS 26.0 introduced zfs.resource.snapshot.query, which is the only
 	// snapshot read API that still exposes user properties. Keep this detection
 	// separate from the mutation API prefix because create/update/delete remain
-	// under pool.snapshot.*.
+	// under pool.snapshot.*, while rename also moved to zfs.resource.snapshot.*.
 	snapshotResourceMu        sync.Mutex
 	snapshotResourceAvailable bool
 	snapshotResourceDetected  bool

@@ -203,8 +203,8 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string) (*Sna
 
 // SnapshotDelete deletes a ZFS snapshot.
 // If the snapshot has clones, it returns ErrSnapshotHasClones with the list of clones.
-// The caller is responsible for deciding how to handle clones (e.g., verifying they are
-// orphaned before deletion).
+// The caller can then retry with defer=true to let ZFS reclaim the snapshot after
+// its final clone releases the dependency.
 func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
 	options := map[string]interface{}{
 		"defer":     defer_,
@@ -221,34 +221,68 @@ func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, 
 			strings.Contains(err.Error(), "not found") {
 			return nil
 		}
-		// TrueNAS returns "Invalid params" for multiple conditions:
-		// 1. Snapshot doesn't exist
-		// 2. Snapshot has clones and can't be deleted
-		// Check if snapshot exists to distinguish between these cases
-		if strings.Contains(err.Error(), "Invalid params") {
-			// Try to get the snapshot - if it doesn't exist, treat as success
-			snap, getErr := c.SnapshotGet(ctx, snapshotID)
-			if getErr != nil {
-				// Snapshot doesn't exist, treat delete as successful
+
+		// Any other failure is ambiguous (TrueNAS reports has-clones, races,
+		// and bad ids with varying messages across versions — e.g. bare
+		// "Invalid params"). Distinguish by observation, not message text:
+		// a snapshot that no longer exists means the delete goal is met, and
+		// dependent clones are detected via the dataset origin projection,
+		// which stays authoritative on TrueNAS 26.0 where snapshot queries
+		// no longer expose the ZFS clones property.
+		snap, getErr := c.SnapshotGet(ctx, snapshotID)
+		if getErr != nil {
+			if IsNotFoundError(getErr) {
 				return nil
 			}
-
-			// Snapshot exists - check if it has clones
-			clones := snap.GetClones()
-			if len(clones) > 0 {
-				// Return structured error with clone list for caller to handle
-				return &ErrSnapshotHasClones{
-					SnapshotID: snapshotID,
-					Clones:     clones,
-				}
-			}
-
-			// Snapshot exists but can't be deleted for unknown reason
-			return fmt.Errorf("failed to delete snapshot (unknown reason): %w", err)
+			// Liveness unknown — surface the original delete error.
+			return fmt.Errorf("failed to delete snapshot: %w", err)
 		}
-		return fmt.Errorf("failed to delete snapshot: %w", err)
+
+		// Pre-25.04 fast path: clones projected on the snapshot itself.
+		if clones := snap.GetClones(); len(clones) > 0 {
+			return &ErrSnapshotHasClones{SnapshotID: snapshotID, Clones: clones}
+		}
+		if clones, cloneErr := c.snapshotDependentClones(ctx, snapshotID); cloneErr == nil && len(clones) > 0 {
+			return &ErrSnapshotHasClones{SnapshotID: snapshotID, Clones: clones}
+		}
+
+		// Snapshot exists but can't be deleted for unknown reason
+		return fmt.Errorf("failed to delete snapshot (unknown reason): %w", err)
 	}
 
+	return nil
+}
+
+// SnapshotRename renames a snapshot within its current dataset. TrueNAS 26.0
+// exposes the operation through zfs.resource.snapshot.rename; older releases
+// use the version-detected pool.snapshot.* or zfs.snapshot.* mutation API.
+func (c *Client) SnapshotRename(ctx context.Context, snapshotID, newName string) error {
+	dataset, _, ok := strings.Cut(snapshotID, "@")
+	if !ok || dataset == "" || newName == "" {
+		return fmt.Errorf("invalid snapshot rename %q -> %q", snapshotID, newName)
+	}
+
+	newSnapshotID := dataset + "@" + newName
+	if c.hasSnapshotResourceQuery(ctx) {
+		params := map[string]interface{}{
+			"current_name": snapshotID,
+			"new_name":     newSnapshotID,
+			"recursive":    false,
+		}
+		if _, err := c.Call(ctx, "zfs.resource.snapshot.rename", params); err != nil {
+			return fmt.Errorf("failed to rename snapshot: %w", err)
+		}
+		return nil
+	}
+
+	options := map[string]interface{}{
+		"new_name":  newName,
+		"force":     false,
+		"recursive": false,
+	}
+	if _, err := c.Call(ctx, c.snapshotMethod(ctx, "rename"), snapshotID, options); err != nil {
+		return fmt.Errorf("failed to rename snapshot: %w", err)
+	}
 	return nil
 }
 
@@ -466,6 +500,19 @@ func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, v
 		"user_properties_update": []map[string]interface{}{
 			{"key": key, "value": value},
 		},
+	}
+
+	_, err := c.Call(ctx, c.snapshotMethod(ctx, "update"), snapshotID, params)
+	return err
+}
+
+// SnapshotRemoveUserProperties removes user properties from a snapshot.
+func (c *Client) SnapshotRemoveUserProperties(ctx context.Context, snapshotID string, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	params := map[string]interface{}{
+		"user_properties_remove": keys,
 	}
 
 	_, err := c.Call(ctx, c.snapshotMethod(ctx, "update"), snapshotID, params)

@@ -228,6 +228,44 @@ func (c *Client) DatasetHasDependentClones(ctx context.Context, datasetName stri
 	if pool == "" {
 		return false, fmt.Errorf("invalid dataset name %q", datasetName)
 	}
+	origins, err := c.queryPoolDatasetOrigins(ctx, pool)
+	if err != nil {
+		return false, err
+	}
+	originPrefix := datasetName + "@"
+	for _, origin := range origins {
+		if strings.HasPrefix(origin, originPrefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// snapshotDependentClones returns the datasets cloned from one exact snapshot —
+// the authoritative dependent-clone check on TrueNAS 26.0, where the snapshot
+// query APIs no longer expose the ZFS clones property.
+func (c *Client) snapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
+	datasetName, _, found := strings.Cut(snapshotID, "@")
+	pool, _, _ := strings.Cut(datasetName, "/")
+	if !found || pool == "" {
+		return nil, fmt.Errorf("invalid snapshot id %q", snapshotID)
+	}
+	origins, err := c.queryPoolDatasetOrigins(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	var clones []string
+	for name, origin := range origins {
+		if origin == snapshotID {
+			clones = append(clones, name)
+		}
+	}
+	return clones, nil
+}
+
+// queryPoolDatasetOrigins returns dataset name → origin (empty for non-clones)
+// for every dataset in the pool, using the projected origin property.
+func (c *Client) queryPoolDatasetOrigins(ctx context.Context, pool string) (map[string]string, error) {
 	filters := [][]interface{}{{"name", "^", pool + "/"}}
 	options := map[string]interface{}{
 		"extra": map[string]interface{}{
@@ -236,23 +274,21 @@ func (c *Client) DatasetHasDependentClones(ctx context.Context, datasetName stri
 	}
 	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
 	if err != nil {
-		return false, fmt.Errorf("failed to query dataset origins: %w", err)
+		return nil, fmt.Errorf("failed to query dataset origins: %w", err)
 	}
 	items, ok := result.([]interface{})
 	if !ok {
-		return false, fmt.Errorf("unexpected response type")
+		return nil, fmt.Errorf("unexpected response type")
 	}
-	originPrefix := datasetName + "@"
+	origins := make(map[string]string, len(items))
 	for _, item := range items {
 		dataset, parseErr := parseDataset(item)
 		if parseErr != nil {
 			continue
 		}
-		if strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
-			return true, nil
-		}
+		origins[dataset.Name] = datasetPropertyString(dataset.Origin)
 	}
-	return false, nil
+	return origins, nil
 }
 
 func datasetPropertyString(property DatasetProperty) string {

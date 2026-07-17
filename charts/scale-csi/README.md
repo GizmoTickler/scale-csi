@@ -31,11 +31,11 @@ used, that Secret must contain an `api-key` key.
 
 | Parameter | Description | Default |
 |---|---|---|
-| `truenas.host` | TrueNAS hostname or IP | `""` (required) |
+| `truenas.host` | TrueNAS hostname or IP (required; the driver refuses to start without it) | `""` |
 | `truenas.port` | API port | `443` |
 | `truenas.secure` | Use HTTPS | `true` |
 | `truenas.skipTLSVerify` | Skip TLS verification | `false` |
-| `truenas.apiKey` | TrueNAS API key | `""` |
+| `truenas.apiKey` | TrueNAS API key (required unless `existingSecret` is set) | `""` |
 | `truenas.existingSecret` | Existing Secret containing `api-key` | `""` |
 | `truenas.requestTimeout` | API request timeout in seconds | `60` |
 | `truenas.connectTimeout` | Connection timeout in seconds | `10` |
@@ -46,7 +46,7 @@ used, that Secret must contain an `api-key` key.
 
 | Parameter | Description | Default |
 |---|---|---|
-| `zfs.parentDataset` | Parent dataset for volumes | `""` (required) |
+| `zfs.parentDataset` | Parent dataset for volumes (required; the driver refuses to start without it) | `""` |
 | `zfs.detachedSnapshotsDatasetParentName` | Parent dataset for detached snapshots | `""` |
 | `zfs.enforceQuota` | Enable dataset quotas | `true` |
 | `zfs.zvolBlocksize` | Block size for zvols | `16K` |
@@ -174,6 +174,20 @@ convenient.
 | `securityContext` | Node driver container security context | privileged with `SYS_ADMIN` |
 | `metrics.enabled` | Create metrics Services | `true` |
 | `metrics.port` | Driver health/readiness and metrics port | `9809` |
+| `metrics.serviceMonitor.enabled` | Create controller and node ServiceMonitors | `false` |
+| `metrics.serviceMonitor.labels` | Additional ServiceMonitor labels | `{}` |
+| `metrics.serviceMonitor.interval` | Prometheus scrape interval | `30s` |
+| `metrics.serviceMonitor.scrapeTimeout` | Prometheus scrape timeout | `10s` |
+| `metrics.prometheusRule.enabled` | Create the bundled PrometheusRule | `false` |
+| `metrics.prometheusRule.additionalLabels` | Additional PrometheusRule labels | `{}` |
+| `metrics.prometheusRule.rules` | Replace the bundled alert rules when non-empty | `[]` |
+| `metrics.dashboards.enabled` | Create a Grafana dashboard ConfigMap | `false` |
+| `metrics.dashboards.annotations` | Dashboard ConfigMap annotations (for example, a folder selector) | `{}` |
+
+The bundled PrometheusRule alerts on a missing controller scrape target, an
+open circuit breaker, a high TrueNAS API failure ratio, and sustained CSI
+operation errors. The dashboard ConfigMap is labeled `grafana_dashboard: "1"`
+for Grafana sidecar discovery and uses only metrics exported by the driver.
 
 Set one of `controller.podDisruptionBudget.minAvailable` or `maxUnavailable`
 when enabling the PDB. A PDB is useful only when `controller.replicas` is greater

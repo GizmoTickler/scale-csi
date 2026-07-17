@@ -89,7 +89,7 @@ kubeletDir: /var/lib/kubelet
 
 # TrueNAS connection configuration
 truenas:
-  # TrueNAS host (required)
+  # TrueNAS host (required — the driver refuses to start without it)
   host: ""
 
   # API port (80 for HTTP, 443 for HTTPS)
@@ -101,7 +101,8 @@ truenas:
   # Skip TLS verification (not recommended for production)
   skipTLSVerify: false
 
-  # API key authentication (recommended)
+  # API key authentication (recommended; required unless existingSecret is set —
+  # the driver refuses to start without one)
   apiKey: ""
 
   # Use existing secret for credentials
@@ -123,7 +124,7 @@ truenas:
 
 # ZFS configuration
 zfs:
-  # Parent dataset for volumes (required)
+  # Parent dataset for volumes (required — the driver refuses to start without it)
   parentDataset: ""
 
   # Additional ZFS properties to set on newly created datasets/zvols,
@@ -369,6 +370,19 @@ metrics:
 
     # Scrape timeout
     scrapeTimeout: 10s
+
+  # PrometheusRule for driver health and error-rate alerts
+  prometheusRule:
+    enabled: false
+    additionalLabels: {}
+    # Replaces the bundled rules when non-empty
+    rules: []
+
+  # Grafana sidecar-discoverable dashboard ConfigMap
+  dashboards:
+    enabled: false
+    # ConfigMap annotations such as a Grafana folder selector
+    annotations: {}
 
 # Session garbage collection configuration (node plugin only)
 # Periodically cleans up orphaned iSCSI/NVMe-oF sessions that may leak

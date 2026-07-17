@@ -1,0 +1,52 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "scale-csi.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ include "scale-csi.fullname" . }}.rules
+      rules:
+        {{- if .Values.metrics.prometheusRule.rules }}
+        {{- toYaml .Values.metrics.prometheusRule.rules | nindent 8 }}
+        {{- else }}
+        - alert: ScaleCSIControllerDown
+          expr: absent(up{namespace={{ .Release.Namespace | quote }},service={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}} == 1)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Scale CSI controller metrics target is down
+            description: Prometheus has not observed an up Scale CSI controller target for five minutes.
+        - alert: ScaleCSICircuitBreakerOpen
+          expr: scale_csi_circuit_breaker_state == 1
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI TrueNAS circuit breaker is open
+            description: The driver has stopped TrueNAS API calls while the circuit breaker is open.
+        - alert: ScaleCSIHighTrueNASAPIFailureRate
+          expr: (sum(rate(scale_csi_truenas_requests_total{status="error"}[5m])) / sum(rate(scale_csi_truenas_requests_total[5m]))) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI TrueNAS API failure rate is high
+            description: More than 10% of TrueNAS API requests have failed for ten minutes.
+        - alert: ScaleCSIOperationErrorsSustained
+          expr: sum(rate(scale_csi_operations_total{status="error"}[5m])) > 0.01
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI operations are failing
+            description: CSI operation errors have been sustained for ten minutes.
+        {{- end }}
+{{- end }}

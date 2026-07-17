@@ -686,6 +686,76 @@ func TestSnapshotDelete_HasClones(t *testing.T) {
 	assert.Contains(t, clonesErr.Clones, "tank/k8s/volumes/clone2")
 }
 
+// TestSnapshotDelete_HasClones_TrueNAS26 verifies the has-clones classification
+// on the 26.0 API generation, where snapshot queries never expose the ZFS
+// clones property: dependent clones must be detected via the dataset origin
+// projection or the tombstone/defer flow in DeleteSnapshot is unreachable.
+func TestSnapshotDelete_HasClones_TrueNAS26(t *testing.T) {
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case snapshotResourceQueryMethod:
+				options := req.Params[0].(map[string]interface{})
+				if len(options["paths"].([]interface{})) == 0 {
+					resp.Result = []interface{}{} // detection probe
+					break
+				}
+				// 26.0 shape: no clones property, ever.
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"name":            "tank/k8s/volumes/pvc-123@with-clones",
+						"snapshot_name":   "with-clones",
+						"dataset":         "tank/k8s/volumes/pvc-123",
+						"pool":            "tank",
+						"type":            "SNAPSHOT",
+						"properties":      map[string]interface{}{},
+						"user_properties": map[string]interface{}{},
+					},
+				}
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case "pool.snapshot.delete":
+				resp.Error = &rpcError{Code: -1, Message: "Invalid params"}
+			case "pool.dataset.query":
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"id":   "tank/k8s/volumes/restored-pvc",
+						"name": "tank/k8s/volumes/restored-pvc",
+						"pool": "tank",
+						"type": "VOLUME",
+						"origin": map[string]interface{}{
+							"parsed":   "tank/k8s/volumes/pvc-123@with-clones",
+							"rawvalue": "tank/k8s/volumes/pvc-123@with-clones",
+							"value":    "tank/k8s/volumes/pvc-123@with-clones",
+							"source":   "NONE",
+						},
+					},
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	err := client.SnapshotDelete(context.Background(), "tank/k8s/volumes/pvc-123@with-clones", false, false)
+	var clonesErr *ErrSnapshotHasClones
+	require.ErrorAs(t, err, &clonesErr)
+	assert.Equal(t, []string{"tank/k8s/volumes/restored-pvc"}, clonesErr.Clones)
+}
+
 // TestSnapshotGet_Success tests getting a snapshot
 func TestSnapshotGet_Success(t *testing.T) {
 	resetSnapshotAPIPrefix()
@@ -1690,8 +1760,17 @@ func TestMockClient_SnapshotOperations(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, exists)
 
-	// Test delete snapshot
+	// Non-deferred delete of a snapshot with dependent clones must fail,
+	// mirroring real ZFS semantics.
 	err = mock.SnapshotDelete(ctx, "tank/test/snap-parent@test-snap", false, false)
+	var cloneErr *ErrSnapshotHasClones
+	require.ErrorAs(t, err, &cloneErr)
+
+	// Deferred delete succeeds and the snapshot is reclaimed once the last
+	// dependent clone is removed.
+	err = mock.SnapshotDelete(ctx, "tank/test/snap-parent@test-snap", true, false)
+	require.NoError(t, err)
+	err = mock.DatasetDelete(ctx, "tank/test/snap-clone", false, false)
 	require.NoError(t, err)
 
 	// Verify deletion

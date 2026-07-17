@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMockClient_SnapshotFindByName(t *testing.T) {
@@ -103,4 +104,32 @@ func TestMockClientModelsDatasetAndSnapshotReadShapes(t *testing.T) {
 	if assert.Len(t, page, 1) {
 		assert.Equal(t, "tank/csi/volume-b@snapshot-b", page[0].ID)
 	}
+}
+
+func TestMockClientModelsRenamedDeferredSnapshotLifecycle(t *testing.T) {
+	client := NewMockClient()
+	ctx := context.Background()
+	_, err := client.DatasetCreate(ctx, &DatasetCreateParams{Name: "tank/csi/source", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	snapshot, err := client.SnapshotCreate(ctx, "tank/csi/source", "restore-point")
+	require.NoError(t, err)
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "tank/csi/restored"))
+
+	var cloneErr *ErrSnapshotHasClones
+	err = client.SnapshotDelete(ctx, snapshot.ID, false, false)
+	require.ErrorAs(t, err, &cloneErr)
+	assert.Equal(t, []string{"tank/csi/restored"}, cloneErr.Clones)
+
+	require.NoError(t, client.SnapshotRename(ctx, snapshot.ID, "restore-point-csi-deleted-1"))
+	renamedID := "tank/csi/source@restore-point-csi-deleted-1"
+	found, err := client.SnapshotFindByName(ctx, "tank/csi", "restore-point")
+	require.NoError(t, err)
+	assert.Nil(t, found)
+	require.NoError(t, client.SnapshotDelete(ctx, renamedID, true, false))
+	_, err = client.SnapshotGet(ctx, renamedID)
+	require.NoError(t, err, "deferred snapshot remains until its clone is released")
+
+	require.NoError(t, client.DatasetDelete(ctx, "tank/csi/restored", false, true))
+	_, err = client.SnapshotGet(ctx, renamedID)
+	assert.Error(t, err)
 }

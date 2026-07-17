@@ -1,0 +1,38 @@
+{{- if .Values.metrics.dashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-grafana-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  {{- with .Values.metrics.dashboards.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  scale-csi.json: |-
+    {
+      "annotations":{"list":[]},
+      "editable":true,
+      "graphTooltip":1,
+      "panels":[
+        {"datasource":{"type":"prometheus","uid":"${DS_PROMETHEUS}"},"fieldConfig":{"defaults":{"unit":"ops"},"overrides":[]},"gridPos":{"h":8,"w":6,"x":0,"y":0},"id":1,"options":{"legend":{"displayMode":"list","placement":"bottom"}},"targets":[{"expr":"sum(rate(scale_csi_operations_total{operation=~\".*/CreateVolume\",status=\"success\"}[5m]))","legendFormat":"provision"}],"title":"Volume Provision Rate","type":"timeseries"},
+        {"datasource":{"type":"prometheus","uid":"${DS_PROMETHEUS}"},"fieldConfig":{"defaults":{"unit":"ops"},"overrides":[]},"gridPos":{"h":8,"w":6,"x":6,"y":0},"id":2,"options":{"legend":{"displayMode":"list","placement":"bottom"}},"targets":[{"expr":"sum(rate(scale_csi_operations_total{operation=~\".*/DeleteVolume\",status=\"success\"}[5m]))","legendFormat":"delete"}],"title":"Volume Delete Rate","type":"timeseries"},
+        {"datasource":{"type":"prometheus","uid":"${DS_PROMETHEUS}"},"fieldConfig":{"defaults":{"unit":"s"},"overrides":[]},"gridPos":{"h":8,"w":6,"x":12,"y":0},"id":3,"options":{"legend":{"displayMode":"list","placement":"bottom"}},"targets":[{"expr":"histogram_quantile(0.95, sum by (le, operation) (rate(scale_csi_operations_duration_seconds_bucket{operation=~\".*/(CreateVolume|DeleteVolume)\"}[5m])))","legendFormat":"{{`{{operation}}`}} p95"}],"title":"Provision/Delete Latency","type":"timeseries"},
+        {"datasource":{"type":"prometheus","uid":"${DS_PROMETHEUS}"},"fieldConfig":{"defaults":{"unit":"percentunit"},"overrides":[]},"gridPos":{"h":8,"w":6,"x":18,"y":0},"id":4,"options":{"legend":{"displayMode":"list","placement":"bottom"}},"targets":[{"expr":"sum(rate(scale_csi_truenas_requests_total{status=\"error\"}[5m])) / sum(rate(scale_csi_truenas_requests_total[5m]))","legendFormat":"API errors"}],"title":"TrueNAS API Error Rate","type":"timeseries"},
+        {"datasource":{"type":"prometheus","uid":"${DS_PROMETHEUS}"},"fieldConfig":{"defaults":{"mappings":[{"options":{"0":{"text":"Closed"},"1":{"text":"Open"},"2":{"text":"Half-open"}},"type":"value"}]},"overrides":[]},"gridPos":{"h":6,"w":12,"x":0,"y":8},"id":5,"options":{"colorMode":"value","graphMode":"area","justifyMode":"auto","reduceOptions":{"calcs":["lastNotNull"],"values":false},"textMode":"auto"},"targets":[{"expr":"max(scale_csi_circuit_breaker_state)","legendFormat":"state"}],"title":"Circuit Breaker State","type":"stat"},
+        {"datasource":{"type":"prometheus","uid":"${DS_PROMETHEUS}"},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]},"gridPos":{"h":6,"w":12,"x":12,"y":8},"id":6,"options":{"colorMode":"value","graphMode":"area","justifyMode":"auto","reduceOptions":{"calcs":["lastNotNull"],"values":false},"textMode":"auto"},"targets":[{"expr":"sum(scale_csi_truenas_connections_active)","legendFormat":"connections"}],"title":"Active TrueNAS Connections","type":"stat"}
+      ],
+      "refresh":"30s",
+      "schemaVersion":39,
+      "tags":["scale-csi","csi","truenas"],
+      "templating":{"list":[{"current":{},"hide":0,"includeAll":false,"label":"Prometheus","multi":false,"name":"DS_PROMETHEUS","options":[],"query":"prometheus","refresh":1,"regex":"","type":"datasource"}]},
+      "time":{"from":"now-6h","to":"now"},
+      "timezone":"browser",
+      "title":"Scale CSI Overview",
+      "uid":"scale-csi-overview",
+      "version":1
+    }
+{{- end }}

@@ -14,15 +14,16 @@ type MockClient struct {
 	mu sync.RWMutex
 
 	// Mock data
-	Datasets       map[string]*Dataset
-	Snapshots      map[string]*Snapshot
-	NFSShares      map[int]*NFSShare
-	ISCSITargets   map[int]*ISCSITarget
-	ISCSIExtents   map[int]*ISCSIExtent
-	TargetExtents  map[int]*ISCSITargetExtent
-	NVMeSubsystems map[int]*NVMeoFSubsystem
-	NVMeNamespaces map[int]*NVMeoFNamespace
-	PoolAvailable  int64
+	Datasets          map[string]*Dataset
+	Snapshots         map[string]*Snapshot
+	NFSShares         map[int]*NFSShare
+	ISCSITargets      map[int]*ISCSITarget
+	ISCSIExtents      map[int]*ISCSIExtent
+	TargetExtents     map[int]*ISCSITargetExtent
+	NVMeSubsystems    map[int]*NVMeoFSubsystem
+	NVMeNamespaces    map[int]*NVMeoFNamespace
+	PoolAvailable     int64
+	deferredSnapshots map[string]struct{}
 
 	// Error injection
 	InjectError error
@@ -31,15 +32,16 @@ type MockClient struct {
 // NewMockClient creates a new MockClient.
 func NewMockClient() *MockClient {
 	return &MockClient{
-		Datasets:       make(map[string]*Dataset),
-		Snapshots:      make(map[string]*Snapshot),
-		NFSShares:      make(map[int]*NFSShare),
-		ISCSITargets:   make(map[int]*ISCSITarget),
-		ISCSIExtents:   make(map[int]*ISCSIExtent),
-		TargetExtents:  make(map[int]*ISCSITargetExtent),
-		NVMeSubsystems: make(map[int]*NVMeoFSubsystem),
-		NVMeNamespaces: make(map[int]*NVMeoFNamespace),
-		PoolAvailable:  100 * 1024 * 1024 * 1024, // 100 GiB default
+		Datasets:          make(map[string]*Dataset),
+		Snapshots:         make(map[string]*Snapshot),
+		NFSShares:         make(map[int]*NFSShare),
+		ISCSITargets:      make(map[int]*ISCSITarget),
+		ISCSIExtents:      make(map[int]*ISCSIExtent),
+		TargetExtents:     make(map[int]*ISCSITargetExtent),
+		NVMeSubsystems:    make(map[int]*NVMeoFSubsystem),
+		NVMeNamespaces:    make(map[int]*NVMeoFNamespace),
+		deferredSnapshots: make(map[string]struct{}),
+		PoolAvailable:     100 * 1024 * 1024 * 1024, // 100 GiB default
 	}
 }
 
@@ -93,7 +95,14 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 	if m.InjectError != nil {
 		return m.InjectError
 	}
+	origin := ""
+	if dataset, ok := m.Datasets[name]; ok {
+		origin = datasetPropertyString(dataset.Origin)
+	}
 	delete(m.Datasets, name)
+	if origin != "" {
+		m.reclaimDeferredSnapshotLocked(origin)
+	}
 	return nil
 }
 
@@ -303,7 +312,55 @@ func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defe
 	if m.InjectError != nil {
 		return m.InjectError
 	}
+	if _, ok := m.Snapshots[snapshotID]; !ok {
+		return nil
+	}
+	clones := m.snapshotClonesLocked(snapshotID)
+	if len(clones) > 0 {
+		if !defer_ {
+			return &ErrSnapshotHasClones{SnapshotID: snapshotID, Clones: clones}
+		}
+		m.deferredSnapshots[snapshotID] = struct{}{}
+		return nil
+	}
+	delete(m.deferredSnapshots, snapshotID)
 	delete(m.Snapshots, snapshotID)
+	return nil
+}
+
+func (m *MockClient) SnapshotRename(ctx context.Context, snapshotID, newName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	snap, ok := m.Snapshots[snapshotID]
+	if !ok {
+		return &APIError{Code: -1, Message: "snapshot not found"}
+	}
+	dataset, _, ok := strings.Cut(snapshotID, "@")
+	if !ok || newName == "" {
+		return &APIError{Code: -32602, Message: "invalid snapshot rename"}
+	}
+	newSnapshotID := dataset + "@" + newName
+	if _, exists := m.Snapshots[newSnapshotID]; exists {
+		return &APIError{Code: -1, Message: "snapshot already exists"}
+	}
+
+	delete(m.Snapshots, snapshotID)
+	snap.ID = newSnapshotID
+	snap.Name = newName
+	m.Snapshots[newSnapshotID] = snap
+	if _, deferred := m.deferredSnapshots[snapshotID]; deferred {
+		delete(m.deferredSnapshots, snapshotID)
+		m.deferredSnapshots[newSnapshotID] = struct{}{}
+	}
+	for _, dataset := range m.Datasets {
+		if datasetPropertyString(dataset.Origin) == snapshotID {
+			dataset.Origin = DatasetProperty{Value: newSnapshotID, Parsed: newSnapshotID, Rawvalue: newSnapshotID, Source: "LOCAL"}
+		}
+	}
 	return nil
 }
 
@@ -377,6 +434,45 @@ func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID, ke
 	}
 	snap.UserProperties[key] = UserProperty{Value: value}
 	return nil
+}
+
+func (m *MockClient) SnapshotRemoveUserProperties(ctx context.Context, snapshotID string, keys []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	snap, ok := m.Snapshots[snapshotID]
+	if !ok {
+		return &APIError{Code: -1, Message: "snapshot not found"}
+	}
+	for _, key := range keys {
+		delete(snap.UserProperties, key)
+	}
+	return nil
+}
+
+func (m *MockClient) snapshotClonesLocked(snapshotID string) []string {
+	var clones []string
+	for name, dataset := range m.Datasets {
+		if datasetPropertyString(dataset.Origin) == snapshotID {
+			clones = append(clones, name)
+		}
+	}
+	sort.Strings(clones)
+	return clones
+}
+
+func (m *MockClient) reclaimDeferredSnapshotLocked(snapshotID string) {
+	if _, deferred := m.deferredSnapshots[snapshotID]; !deferred {
+		return
+	}
+	if len(m.snapshotClonesLocked(snapshotID)) != 0 {
+		return
+	}
+	delete(m.deferredSnapshots, snapshotID)
+	delete(m.Snapshots, snapshotID)
 }
 
 func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error {

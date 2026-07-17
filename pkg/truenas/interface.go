@@ -37,11 +37,13 @@ type ClientInterface interface {
 	// Snapshot methods
 	SnapshotCreate(ctx context.Context, dataset, name string) (*Snapshot, error)
 	SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error
+	SnapshotRename(ctx context.Context, snapshotID, newName string) error
 	SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error)
 	SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error)
 	SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error)
 	SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error)
 	SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error
+	SnapshotRemoveUserProperties(ctx context.Context, snapshotID string, keys []string) error
 	SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error
 	SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error
 

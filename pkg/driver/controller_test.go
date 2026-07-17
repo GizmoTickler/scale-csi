@@ -8,6 +8,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -70,7 +71,7 @@ func (m *cloneDependencyMock) DatasetDelete(ctx context.Context, name string, re
 
 func (m *cloneDependencyMock) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
 	snap, err := m.SnapshotGet(ctx, snapshotID)
-	if err == nil && len(snap.GetClones()) > 0 {
+	if !defer_ && err == nil && len(snap.GetClones()) > 0 {
 		return &truenas.ErrSnapshotHasClones{SnapshotID: snapshotID, Clones: snap.GetClones()}
 	}
 	return m.MockClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
@@ -87,6 +88,20 @@ type recursiveCloneDependencyMock struct {
 
 type snapshotListErrorMock struct {
 	*cloneDependencyMock
+}
+
+type snapshotRenameErrorMock struct {
+	*truenas.MockClient
+	deleteDefers []bool
+}
+
+func (m *snapshotRenameErrorMock) SnapshotRename(context.Context, string, string) error {
+	return &truenas.APIError{Code: -32601, Message: "Method not found"}
+}
+
+func (m *snapshotRenameErrorMock) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
+	m.deleteDefers = append(m.deleteDefers, defer_)
+	return m.MockClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
 }
 
 func (m *snapshotListErrorMock) SnapshotList(context.Context, string) ([]*truenas.Snapshot, error) {
@@ -602,10 +617,88 @@ func TestDeleteSnapshot(t *testing.T) {
 	_, err = d.DeleteSnapshot(context.Background(), req)
 	assert.NoError(t, err)
 
-	// Verify snapshot deleted
-	// Note: Mock implementation of DeleteSnapshot deletes by ID, but ListSnapshots iterates map.
-	// The driver implementation lists snapshots to find the one matching the name.
-	// So we need to ensure our mock supports that flow.
+	_, err = mockClient.SnapshotGet(context.Background(), "pool/parent/"+volName+"@"+snapName)
+	assert.Error(t, err)
+}
+
+func TestDeleteSnapshotWithRestoredVolumeDefersAndReleasesSnapshot(t *testing.T) {
+	ctx := context.Background()
+	mockClient := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+		},
+		truenasClient: mockClient,
+	}
+
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	created, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
+		Name: "restore-point", SourceVolumeId: "source",
+	})
+	require.NoError(t, err)
+	originalSnapshotID := "pool/parent/source@" + created.GetSnapshot().GetSnapshotId()
+	require.NoError(t, mockClient.SnapshotClone(ctx, originalSnapshotID, "pool/parent/restored"))
+
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "restore-point"})
+	require.NoError(t, err)
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "restore-point"})
+	require.NoError(t, err, "retry after tombstone rename must be idempotent")
+
+	listed, err := d.ListSnapshots(ctx, &csi.ListSnapshotsRequest{})
+	require.NoError(t, err)
+	assert.Empty(t, listed.GetEntries(), "the tombstone must not be exposed as a CSI snapshot")
+
+	allSnapshots, err := mockClient.SnapshotList(ctx, "pool/parent/source")
+	require.NoError(t, err)
+	var tombstoneID string
+	for _, snap := range allSnapshots {
+		if strings.HasPrefix(snap.Name, "restore-point-csi-deleted-") {
+			tombstoneID = snap.ID
+			assert.NotContains(t, snap.UserProperties, PropManagedResource)
+			assert.NotContains(t, snap.UserProperties, PropCSISnapshotName)
+			assert.NotContains(t, snap.UserProperties, PropCSISnapshotSourceVolumeID)
+		}
+	}
+	require.NotEmpty(t, tombstoneID)
+
+	recreated, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
+		Name: "restore-point", SourceVolumeId: "source",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "restore-point", recreated.GetSnapshot().GetSnapshotId())
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "restored"})
+	require.NoError(t, err)
+	_, err = mockClient.SnapshotGet(ctx, tombstoneID)
+	assert.Error(t, err, "ZFS should reclaim a deferred snapshot after its final clone is deleted")
+}
+
+func TestDeleteSnapshotWithoutRenameStillDefersUnderOriginalName(t *testing.T) {
+	ctx := context.Background()
+	client := &snapshotRenameErrorMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}},
+		truenasClient: client,
+	}
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	snapshot, err := client.SnapshotCreate(ctx, "pool/parent/source", "restore-point")
+	require.NoError(t, err)
+	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, PropManagedResource, "true"))
+	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, PropCSISnapshotName, "restore-point"))
+	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, PropCSISnapshotSourceVolumeID, "source"))
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/restored"))
+
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "restore-point"})
+	require.NoError(t, err)
+	assert.Equal(t, []bool{false, true}, client.deleteDefers)
+	deferred, err := client.SnapshotGet(ctx, snapshot.ID)
+	require.NoError(t, err)
+	assert.Empty(t, deferred.UserProperties)
 }
 
 // TestCreateSnapshot_RestoreSize verifies that CreateSnapshot returns the correct
