@@ -97,7 +97,8 @@ func TestCreateVolumeExistingVolumeCompatibility(t *testing.T) {
 
 			driver := newComplianceTestDriver(mockClient)
 			_, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
-				Name: "existing-volume",
+				Name:               "existing-volume",
+				VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 				CapacityRange: &csi.CapacityRange{
 					RequiredBytes: tc.requiredBytes,
 					LimitBytes:    tc.limitBytes,
@@ -115,14 +116,25 @@ func TestCreateVolumeRejectsUnknownExplicitProtocol(t *testing.T) {
 	driver := newComplianceTestDriver(truenas.NewMockClient())
 
 	_, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
-		Name:       "invalid-protocol",
-		Parameters: map[string]string{"protocol": "smb"},
+		Name:               "invalid-protocol",
+		Parameters:         map[string]string{"protocol": "smb"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 	})
 
 	require.Error(t, err)
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
 	assert.Contains(t, err.Error(), "smb")
 	assert.Contains(t, err.Error(), "nfs, iscsi, nvmeof")
+}
+
+func TestCreateVolumeRequiresCapabilities(t *testing.T) {
+	driver := newComplianceTestDriver(truenas.NewMockClient())
+
+	_, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{Name: "missing-capabilities"})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, err.Error(), "volume capabilities")
 }
 
 func TestValidateVolumeCapabilitiesRejectsMultiNodeForBlockVolume(t *testing.T) {
@@ -229,6 +241,7 @@ func TestCreateVolumeCloneExpansionFailure(t *testing.T) {
 				Name:                "clone-target",
 				CapacityRange:       &csi.CapacityRange{RequiredBytes: 2 * testGiB},
 				Parameters:          map[string]string{"protocol": "iscsi"},
+				VolumeCapabilities:  []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 				VolumeContentSource: source,
 			})
 
@@ -297,6 +310,7 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 				Name:                "clone-target",
 				CapacityRange:       &csi.CapacityRange{RequiredBytes: testGiB},
 				Parameters:          map[string]string{"protocol": "iscsi"},
+				VolumeCapabilities:  []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 				VolumeContentSource: tc.source,
 			})
 
@@ -326,9 +340,10 @@ func TestCreateVolumeNFSCloneSetsRefquota(t *testing.T) {
 	driver.config.ZFS.DatasetEnableQuotas = true
 	requestedCapacity := 20 * testGiB
 	_, err = driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
-		Name:          "nfs-clone-target",
-		CapacityRange: &csi.CapacityRange{RequiredBytes: requestedCapacity},
-		Parameters:    map[string]string{"protocol": "nfs"},
+		Name:               "nfs-clone-target",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: requestedCapacity},
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
 			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "source-snapshot"},
 		}},
@@ -360,9 +375,10 @@ func TestCreateVolumeNFSCloneQuotaFailure(t *testing.T) {
 	driver := newComplianceTestDriver(client)
 	driver.config.ZFS.DatasetEnableQuotas = true
 	_, err = driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
-		Name:          "nfs-clone-target",
-		CapacityRange: &csi.CapacityRange{RequiredBytes: 2 * testGiB},
-		Parameters:    map[string]string{"protocol": "nfs"},
+		Name:               "nfs-clone-target",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 * testGiB},
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
 			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "source-snapshot"},
 		}},
@@ -376,7 +392,8 @@ func TestCreateVolumeCloneMissingSourceVolume(t *testing.T) {
 	driver := newComplianceTestDriver(truenas.NewMockClient())
 
 	_, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
-		Name: "clone-target",
+		Name:               "clone-target",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
 			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "missing-source"},
 		}},

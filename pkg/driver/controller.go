@@ -75,14 +75,14 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
-					Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+					Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 				},
 			},
 		},
 		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
-					Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+					Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 				},
 			},
 		},
@@ -155,6 +155,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	name := req.GetName()
 	if name == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume name is required")
+	}
+	if len(req.GetVolumeCapabilities()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
 
 	// Enhanced logging for debugging volsync and backup scenarios
@@ -649,6 +652,24 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if nodeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node ID is required")
 	}
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
+	// A combined controller+node process has an authoritative local node ID.
+	// Controller-only deployments do not have a cluster node registry and must
+	// accept the CO's non-empty node ID.
+	if d.runNode && nodeID != d.nodeID {
+		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
+	}
+
+	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
+	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		if truenas.IsNotFoundError(err) {
+			return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
+	}
 
 	// Determine share type from volume context
 	volumeContext := req.GetVolumeContext()
@@ -667,17 +688,6 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 
 	klog.Infof("ControllerPublishVolume: volumeID=%s, nodeID=%s, shareType=%s", volumeID, nodeID, shareType)
 
-	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
-
-	// Get the dataset to verify it exists and check share configuration
-	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
-	if err != nil {
-		if truenas.IsNotFoundError(err) {
-			return nil, status.Errorf(codes.NotFound, "volume not found: %s", volumeID)
-		}
-		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
-	}
-
 	// Ensure the share exists (critical for restored volumes)
 	// This recreates missing iSCSI targets or NVMe-oF subsystems
 	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType); err != nil {
@@ -690,6 +700,9 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 
 // ControllerUnpublishVolume detaches a volume from a node (not used for NFS).
 func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
 	// Not implemented - NFS doesn't require controller unpublish
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
@@ -844,6 +857,36 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	defer d.releaseOperationLock(snapshotLockKey)
 
 	datasetName := path.Join(d.config.ZFS.DatasetParentName, sourceVolumeID)
+	sourceDataset, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		if truenas.IsNotFoundError(err) {
+			return nil, status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to get source volume: %v", err)
+	}
+
+	// Snapshot names are global CSI identifiers even though ZFS only requires
+	// uniqueness within a dataset. Resolve the short name before creation so a
+	// request cannot silently create the same CSI snapshot ID for another source.
+	existing, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to find existing snapshot: %v", err)
+	}
+	if existing != nil {
+		managed := existing.UserProperties[PropManagedResource].Value == "true"
+		// Identity properties are only compared when present: snapshots created
+		// before they were introduced lack them, and dataset+name equality
+		// already establishes same-source for those.
+		originalName, hasName := existing.UserProperties[PropCSISnapshotName]
+		originalSource, hasSource := existing.UserProperties[PropCSISnapshotSourceVolumeID]
+		if !managed || existing.Dataset != datasetName ||
+			(hasName && originalName.Value != name) ||
+			(hasSource && originalSource.Value != sourceVolumeID) {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"snapshot name %q is already associated with another snapshot", name)
+		}
+		return d.createSnapshotResponse(existing, sourceDataset, snapshotID, sourceVolumeID, start), nil
+	}
 
 	// Create snapshot
 	snap, err := d.truenasClient.SnapshotCreate(ctx, datasetName, snapshotID)
@@ -881,21 +924,23 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		return nil, status.Errorf(codes.Internal, "failed to set snapshot properties: %v", waitErr)
 	}
 
-	// Get source volume size for restoreSize (CSI spec requires minimum volume size to restore)
-	// snap.GetSnapshotSize() returns "used" bytes which may be tiny for near-empty volumes
+	// The source dataset fetched for the existence check above still reflects
+	// the volume size for restoreSize — no need to re-query it.
+	return d.createSnapshotResponse(snap, sourceDataset, snapshotID, sourceVolumeID, start), nil
+}
+
+func (d *Driver) createSnapshotResponse(
+	snap *truenas.Snapshot,
+	sourceDataset *truenas.Dataset,
+	snapshotID string,
+	sourceVolumeID string,
+	start time.Time,
+) *csi.CreateSnapshotResponse {
 	var snapshotSize int64
-	sourceDataset, err := d.truenasClient.DatasetGet(ctx, datasetName)
-	if err != nil {
-		klog.Warningf("Failed to get source dataset size, using snapshot used bytes: %v", err)
-		snapshotSize = snap.GetSnapshotSize()
-	} else if volsize, ok := sourceDataset.Volsize.Parsed.(float64); ok && volsize > 0 {
-		// For zvols (iSCSI/NVMe-oF), use volsize
-		snapshotSize = int64(volsize)
-	} else if refquota, ok := sourceDataset.Refquota.Parsed.(float64); ok && refquota > 0 {
-		// For filesystems (NFS), use refquota as the volume size
-		snapshotSize = int64(refquota)
-	} else {
-		// Fallback to snapshot used bytes if volume size not available
+	if sourceDataset != nil {
+		snapshotSize = d.getDatasetCapacity(sourceDataset)
+	}
+	if snapshotSize <= 0 {
 		snapshotSize = snap.GetSnapshotSize()
 	}
 	klog.Infof("CreateSnapshot completed: snapshot=%s, sourceVolume=%s, size=%d, elapsed=%v",
@@ -909,7 +954,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 			CreationTime:   timestampProto(snap.GetCreationTime()),
 			ReadyToUse:     true,
 		},
-	}, nil
+	}
 }
 
 // DeleteSnapshot deletes a snapshot.

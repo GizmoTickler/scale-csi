@@ -68,3 +68,39 @@ func TestMockClient_NFSShareFindByPath(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, share)
 }
+
+func TestMockClientModelsDatasetAndSnapshotReadShapes(t *testing.T) {
+	client := NewMockClient()
+	ctx := context.Background()
+
+	dataset, err := client.DatasetCreate(ctx, &DatasetCreateParams{
+		Name: "tank/csi/volume-b", Type: "FILESYSTEM", Refquota: 10 << 30,
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "/mnt/tank/csi/volume-b", dataset.Mountpoint)
+
+	_, err = client.DatasetCreate(ctx, &DatasetCreateParams{Name: "tank/csi/volume-a", Type: "FILESYSTEM"})
+	assert.NoError(t, err)
+	_, err = client.DatasetCreate(ctx, &DatasetCreateParams{Name: "tank/outside", Type: "FILESYSTEM"})
+	assert.NoError(t, err)
+
+	snapshotB, err := client.SnapshotCreate(ctx, "tank/csi/volume-b", "snapshot-b")
+	assert.NoError(t, err)
+	assert.Greater(t, snapshotB.GetCreationTime(), int64(0))
+	_, err = client.SnapshotCreate(ctx, "tank/csi/volume-a", "snapshot-a")
+	assert.NoError(t, err)
+	_, err = client.SnapshotCreate(ctx, "tank/outside", "snapshot-outside")
+	assert.NoError(t, err)
+
+	page, err := client.SnapshotListAll(ctx, "tank/csi", 1, 0)
+	assert.NoError(t, err)
+	if assert.Len(t, page, 1) {
+		assert.Equal(t, "tank/csi/volume-a@snapshot-a", page[0].ID)
+	}
+
+	page, err = client.SnapshotListAll(ctx, "tank/csi", 1, 1)
+	assert.NoError(t, err)
+	if assert.Len(t, page, 1) {
+		assert.Equal(t, "tank/csi/volume-b@snapshot-b", page[0].ID)
+	}
+}

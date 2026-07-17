@@ -247,6 +247,7 @@ func TestNodeStageVolume_Validation(t *testing.T) {
 		req := &csi.NodeStageVolumeRequest{
 			VolumeId:          "vol-1",
 			StagingTargetPath: "/var/lib/kubelet/staging/vol1",
+			VolumeCapability:  testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		}
 
 		_, err := d.NodeStageVolume(context.Background(), req)
@@ -258,12 +259,27 @@ func TestNodeStageVolume_Validation(t *testing.T) {
 		assert.Contains(t, st.Message(), "volume context")
 	})
 
+	t.Run("MissingVolumeCapability", func(t *testing.T) {
+		req := &csi.NodeStageVolumeRequest{
+			VolumeId:          "vol-1",
+			StagingTargetPath: t.TempDir(),
+			VolumeContext:     map[string]string{"server": "nas", "share": "/data"},
+		}
+
+		_, err := d.NodeStageVolume(context.Background(), req)
+
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "volume capability")
+	})
+
 	t.Run("UnknownProtocolDefaultsToNFS", func(t *testing.T) {
 		// Unknown protocols default to NFS (safe default per ParseShareType)
 		// So the error will be NFS-specific validation error
 		req := &csi.NodeStageVolumeRequest{
 			VolumeId:          "vol-1",
 			StagingTargetPath: "/tmp/csi-test-staging",
+			VolumeCapability:  testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 			VolumeContext: map[string]string{
 				"node_attach_driver": "unknown-protocol",
 				// Missing server and share - should fail NFS validation
@@ -563,6 +579,24 @@ func TestNodeExpandVolume_Validation(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, codes.InvalidArgument, st.Code())
 		assert.Contains(t, st.Message(), "volume ID")
+	})
+
+	t.Run("MissingVolumePath", func(t *testing.T) {
+		_, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: "vol-1"})
+
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "volume path")
+	})
+
+	t.Run("MissingPathOnHost", func(t *testing.T) {
+		_, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+			VolumeId:   "vol-1",
+			VolumePath: filepath.Join(t.TempDir(), "missing"),
+		})
+
+		require.Error(t, err)
+		assert.Equal(t, codes.NotFound, status.Code(err))
 	})
 }
 
@@ -1112,6 +1146,7 @@ func TestNodeStageVolume_ConcurrentProtection(t *testing.T) {
 		VolumeId:          volumeID,
 		StagingTargetPath: "/staging",
 		VolumeContext:     map[string]string{"server": "nas", "share": "/data"},
+		VolumeCapability:  testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	}
 
 	_, err := d.NodeStageVolume(context.Background(), req)
@@ -1137,6 +1172,7 @@ func TestNodePublishVolume_ConcurrentProtection(t *testing.T) {
 		VolumeId:          volumeID,
 		TargetPath:        "/target",
 		StagingTargetPath: "/staging",
+		VolumeCapability:  testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	}
 
 	_, err := d.NodePublishVolume(context.Background(), req)
@@ -1202,7 +1238,8 @@ func TestNodeExpandVolume_ConcurrentProtection(t *testing.T) {
 	defer d.releaseOperationLock(lockKey)
 
 	_, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
-		VolumeId: volumeID,
+		VolumeId:   volumeID,
+		VolumePath: t.TempDir(),
 	})
 	require.Error(t, err)
 	assert.Equal(t, codes.Aborted, status.Code(err))

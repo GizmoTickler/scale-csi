@@ -125,6 +125,9 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	if stagingPath == "" {
 		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
 	}
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
 	if volumeContext == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume context is required")
 	}
@@ -328,6 +331,9 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	}
 	if targetPath == "" {
 		return nil, status.Error(codes.InvalidArgument, "target path is required")
+	}
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
 
 	klog.Infof("NodePublishVolume: volumeID=%s, targetPath=%s, stagingPath=%s", volumeID, targetPath, stagingPath)
@@ -578,6 +584,15 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+	if _, err := os.Stat(volumePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.NotFound, "volume path %s does not exist", volumePath)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to inspect volume path %s: %v", volumePath, err)
 	}
 
 	klog.Infof("NodeExpandVolume: volumeID=%s, volumePath=%s", volumeID, volumePath)

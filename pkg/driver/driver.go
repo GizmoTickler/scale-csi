@@ -97,6 +97,12 @@ type Driver struct {
 	serviceReloadDebouncer *ServiceReloadDebouncer
 }
 
+// newTrueNASClient constructs the TrueNAS API client; tests override it to
+// inject the stateful mock before any connection is attempted.
+var newTrueNASClient = func(cfg *truenas.ClientConfig) (truenas.ClientInterface, error) {
+	return truenas.NewClient(cfg)
+}
+
 // NewDriver creates a new TrueNAS CSI driver instance.
 func NewDriver(cfg *DriverConfig) (*Driver, error) {
 	if cfg.Name == "" {
@@ -125,7 +131,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 	}
 
 	// Create TrueNAS API client with resilience settings
-	truenasClient, err := truenas.NewClient(&truenas.ClientConfig{
+	truenasClient, err := newTrueNASClient(&truenas.ClientConfig{
 		Host:              cfg.Config.TrueNAS.Host,
 		Port:              cfg.Config.TrueNAS.Port,
 		Protocol:          cfg.Config.TrueNAS.Protocol,

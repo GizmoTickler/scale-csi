@@ -79,6 +79,9 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 		Volsize:        DatasetProperty{Parsed: float64(params.Volsize)},
 		Refquota:       DatasetProperty{Parsed: float64(params.Refquota)},
 	}
+	if params.Type != "VOLUME" {
+		ds.Mountpoint = "/mnt/" + strings.TrimPrefix(params.Name, "/")
+	}
 	m.Datasets[params.Name] = ds
 	return ds, nil
 }
@@ -265,10 +268,12 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string) (
 	}
 	id := fmt.Sprintf("%s@%s", dataset, name)
 	snap := &Snapshot{
-		ID:             id,
-		Name:           name,
-		Dataset:        dataset,
-		Properties:     make(map[string]interface{}),
+		ID:      id,
+		Name:    name,
+		Dataset: dataset,
+		Properties: map[string]interface{}{
+			"creation": map[string]interface{}{"parsed": float64(time.Now().Unix())},
+		},
 		UserProperties: make(map[string]UserProperty),
 	}
 	m.Snapshots[id] = snap
@@ -332,11 +337,16 @@ func (m *MockClient) SnapshotListAll(ctx context.Context, parentDataset string, 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	parentDataset = strings.TrimSuffix(parentDataset, "/")
+	prefix := parentDataset + "/"
 	var list []*Snapshot
 	for _, snap := range m.Snapshots {
-		list = append(list, snap)
+		if strings.HasPrefix(snap.Dataset, prefix) {
+			list = append(list, snap)
+		}
 	}
-	return list, nil
+	sort.SliceStable(list, func(i, j int) bool { return list[i].ID < list[j].ID })
+	return paginateSnapshots(list, limit, offset), nil
 }
 
 func (m *MockClient) SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error) {

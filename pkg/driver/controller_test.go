@@ -157,7 +157,8 @@ func TestCreateVolume(t *testing.T) {
 
 	// Test Case 1: Success
 	req := &csi.CreateVolumeRequest{
-		Name: "vol-01",
+		Name:               "vol-01",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 		CapacityRange: &csi.CapacityRange{
 			RequiredBytes: 1024 * 1024 * 1024,
 		},
@@ -352,7 +353,8 @@ func TestDeleteVolumeCloneSourceFailsBeforeShareDeletionThenSucceeds(t *testing.
 	assert.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropNFSShareID, fmt.Sprint(share.ID)))
 
 	_, err = d.CreateVolume(ctx, &csi.CreateVolumeRequest{
-		Name: "clone",
+		Name:               "clone",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
 			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "source"},
 		}},
@@ -482,15 +484,65 @@ func TestCreateSnapshot(t *testing.T) {
 	assert.Equal(t, "snap-01", resp.Snapshot.SnapshotId)
 	assert.Equal(t, volName, resp.Snapshot.SourceVolumeId)
 
+	// The same name and source are idempotent.
+	idempotentResp, err := d.CreateSnapshot(context.Background(), req)
+	assert.NoError(t, err)
+	assert.Equal(t, resp.Snapshot.SnapshotId, idempotentResp.Snapshot.SnapshotId)
+
 	// Verify snapshot created
 	snapID := "pool/parent/" + volName + "@snap-01"
 	snap, err := mockClient.SnapshotGet(context.Background(), snapID)
 	assert.NoError(t, err)
 	assert.Equal(t, snapID, snap.ID)
 
+	// The same global CSI snapshot name cannot refer to another source volume.
+	_, err = mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+		Name: "pool/parent/vol-snap-other",
+	})
+	assert.NoError(t, err)
+	_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+		SourceVolumeId: "vol-snap-other",
+		Name:           "snap-01",
+	})
+	assert.Equal(t, codes.AlreadyExists, status.Code(err))
+
 	// Test Case 2: Missing Source
 	_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-02"})
 	assert.Error(t, err)
+}
+
+func TestControllerPublishVolumeValidation(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	d := &Driver{
+		nodeID:  "known-node",
+		runNode: true,
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: mockClient,
+	}
+	capability := testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+
+	_, err := d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId:         "missing-volume",
+		NodeId:           "known-node",
+		VolumeCapability: capability,
+	})
+	assert.Equal(t, codes.NotFound, status.Code(err))
+
+	_, err = d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId:         "missing-volume",
+		NodeId:           "unknown-node",
+		VolumeCapability: capability,
+	})
+	assert.Equal(t, codes.NotFound, status.Code(err))
+	assert.Contains(t, err.Error(), "node not found")
+
+	_, err = d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId: "missing-volume",
+		NodeId:   "known-node",
+	})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
 func TestCreateSnapshotSerializesWithDeleteVolume(t *testing.T) {
@@ -731,13 +783,15 @@ func (m *snapshotWithUsedBytesMock) SnapshotCreate(ctx context.Context, dataset,
 	return snap, nil
 }
 
-// TestCreateSnapshot_RestoreSizeDatasetGetFailure specifically tests the fallback
-// behavior when DatasetGet fails after snapshot creation.
-func TestCreateSnapshot_RestoreSizeDatasetGetFailure(t *testing.T) {
-	// This test uses a custom mock that fails on specific calls
+// TestCreateSnapshot_SourceDatasetGetFailure verifies that a failing source
+// DatasetGet fails the RPC up front — before any snapshot is created — so a
+// retry can succeed cleanly with no orphaned snapshot. (The former post-create
+// size re-query and its used-bytes fallback were removed: the up-front fetch
+// is reused for restoreSize.)
+func TestCreateSnapshot_SourceDatasetGetFailure(t *testing.T) {
 	mockClient := &datasetGetFailMock{
-		MockClient:    truenas.NewMockClient(),
-		failAfterSnap: true,
+		MockClient:     truenas.NewMockClient(),
+		failDatasetGet: true,
 	}
 
 	d := &Driver{
@@ -749,40 +803,24 @@ func TestCreateSnapshot_RestoreSizeDatasetGetFailure(t *testing.T) {
 		truenasClient: mockClient,
 	}
 
-	volName := "vol-fail-test"
-	datasetName := "pool/parent/" + volName
-
-	// Create source volume
-	_, err := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
-		Name:    datasetName,
-		Type:    "VOLUME",
-		Volsize: 10 * 1024 * 1024 * 1024,
-	})
-	assert.NoError(t, err)
-
-	// Set snapshot used bytes (this will be the fallback)
-	// Note: The snapshot doesn't exist yet, so we need to set it after creation
-	// For now, the mock returns 0 for used bytes, which is the expected fallback
-
 	req := &csi.CreateSnapshotRequest{
-		SourceVolumeId: volName,
+		SourceVolumeId: "vol-fail-test",
 		Name:           "snap-fail",
 	}
 
 	resp, err := d.CreateSnapshot(context.Background(), req)
-	assert.NoError(t, err, "CreateSnapshot should succeed even when DatasetGet fails")
-	assert.NotNil(t, resp)
-
-	// When DatasetGet fails, it should fall back to snapshot used bytes (0 in mock)
-	assert.Equal(t, int64(0), resp.Snapshot.SizeBytes,
-		"Should fall back to snapshot used bytes when DatasetGet fails")
+	assert.Error(t, err, "CreateSnapshot must fail when the source dataset cannot be read")
+	assert.Nil(t, resp)
+	assert.Equal(t, codes.NotFound, status.Code(err))
+	assert.False(t, mockClient.snapCreated, "no snapshot may be created when the source lookup fails")
 }
 
-// datasetGetFailMock wraps MockClient to fail DatasetGet after snapshot creation
+// datasetGetFailMock wraps MockClient to fail DatasetGet and record whether a
+// snapshot was ever created.
 type datasetGetFailMock struct {
 	*truenas.MockClient
-	failAfterSnap bool
-	snapCreated   bool
+	failDatasetGet bool
+	snapCreated    bool
 }
 
 func (m *datasetGetFailMock) SnapshotCreate(ctx context.Context, dataset, name string) (*truenas.Snapshot, error) {
@@ -794,7 +832,7 @@ func (m *datasetGetFailMock) SnapshotCreate(ctx context.Context, dataset, name s
 }
 
 func (m *datasetGetFailMock) DatasetGet(ctx context.Context, name string) (*truenas.Dataset, error) {
-	if m.failAfterSnap && m.snapCreated {
+	if m.failDatasetGet {
 		return nil, &truenas.APIError{Code: -1, Message: "dataset not found (simulated)"}
 	}
 	return m.MockClient.DatasetGet(ctx, name)
