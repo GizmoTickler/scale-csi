@@ -186,6 +186,7 @@ kubectl label namespace scale-csi pod-security.kubernetes.io/enforce=privileged
 |-------|-------------|
 | [Architecture](docs/architecture.md) | How the driver works internally |
 | [Deployment](docs/deployment.md) | Helm and Flux installation with full configuration reference |
+| [Production](docs/production.md) | HA, security, monitoring, upgrades, and known limitations |
 
 ## Network Ports
 

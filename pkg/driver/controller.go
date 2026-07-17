@@ -1033,7 +1033,7 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 // handleSnapshotClones tombstones a snapshot and asks ZFS to destroy it once
 // its last clone releases the dependency.
 func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapshot) error {
-	tombstoneName := snapshotTombstoneName(snap.Name, time.Now().UnixNano())
+	tombstoneName := snapshotTombstoneName(snap.Dataset, snap.Name, time.Now().UnixNano())
 	deleteID := snap.ID
 	if err := d.truenasClient.SnapshotRename(ctx, snap.ID, tombstoneName); err != nil {
 		// Some pre-25.04 TrueNAS releases do not expose snapshot rename. Defer
@@ -1057,11 +1057,16 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 	return nil
 }
 
-func snapshotTombstoneName(name string, nonce int64) string {
-	const maxZFSNameLength = 255
+func snapshotTombstoneName(dataset, name string, nonce int64) string {
+	const maxZFSSnapshotNameLength = 255
 	suffix := "-csi-deleted-" + strconv.FormatInt(nonce, 10)
-	if len(name)+len(suffix) > maxZFSNameLength {
-		name = name[:maxZFSNameLength-len(suffix)]
+	maxShortNameLength := maxZFSSnapshotNameLength - len(dataset) - 1
+	maxOriginalNameLength := maxShortNameLength - len(suffix)
+	if maxOriginalNameLength < 0 {
+		maxOriginalNameLength = 0
+	}
+	if len(name) > maxOriginalNameLength {
+		name = name[:maxOriginalNameLength]
 	}
 	return name + suffix
 }

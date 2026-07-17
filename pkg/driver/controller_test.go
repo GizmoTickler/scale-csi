@@ -701,6 +701,20 @@ func TestDeleteSnapshotWithoutRenameStillDefersUnderOriginalName(t *testing.T) {
 	assert.Empty(t, deferred.UserProperties)
 }
 
+func TestSnapshotTombstoneNameCapsFullZFSSnapshotName(t *testing.T) {
+	const maxZFSSnapshotNameLength = 255
+	dataset := "pool/" + strings.Repeat("deeply-nested/", 15)
+	name := strings.Repeat("snapshot-name-", 20)
+	nonce := int64(9223372036854775807)
+
+	tombstone := snapshotTombstoneName(dataset, name, nonce)
+	fullName := dataset + "@" + tombstone
+
+	assert.LessOrEqual(t, len(fullName), maxZFSSnapshotNameLength)
+	assert.True(t, strings.HasSuffix(tombstone, "-csi-deleted-9223372036854775807"), "the unique tombstone nonce must survive truncation")
+	assert.Less(t, len(tombstone), len(name)+len("-csi-deleted-9223372036854775807"))
+}
+
 // TestCreateSnapshot_RestoreSize verifies that CreateSnapshot returns the correct
 // SizeBytes value for restore operations. This is critical for CSI volume restore
 // where the PVC must have a size >= snapshot.restoreSize.
