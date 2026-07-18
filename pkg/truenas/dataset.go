@@ -133,10 +133,20 @@ func (c *Client) DatasetDelete(ctx context.Context, name string, recursive, forc
 		if IsNotFoundError(err) {
 			return nil
 		}
-		// TrueNAS returns -32602 "Invalid params" when dataset doesn't exist
+		// TrueNAS collapses BOTH "dataset does not exist" AND "dataset has
+		// snapshots" (ENOTEMPTY: "Set recursive=True to remove them") to the
+		// same JSON-RPC -32602 "Invalid params" over the WebSocket API
+		// (validated live on 26.0). The old blanket "-32602 => nil" swallowed
+		// the has-snapshots case, making a non-recursive delete falsely report
+		// success and orphan the dataset. Disambiguate by existence: only treat
+		// it as done when the dataset is actually gone; otherwise surface the
+		// error so callers (DeleteVolume) run their snapshot-dependency
+		// handling instead of assuming deletion.
 		var apiErr *APIError
 		if errors.As(err, &apiErr) && apiErr.Code == -32602 {
-			return nil
+			if exists, existErr := c.DatasetExists(ctx, name); existErr == nil && !exists {
+				return nil
+			}
 		}
 		return fmt.Errorf("failed to delete dataset: %w", err)
 	}

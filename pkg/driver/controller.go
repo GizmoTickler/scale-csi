@@ -47,8 +47,16 @@ func isDatasetDependencyOrBusyError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// TrueNAS surfaces the real reason (e.g. ENOTEMPTY "has snapshots") in the
+	// API error's Data field, not its top-level message — over the WebSocket
+	// API a has-snapshots delete arrives as a generic -32602 "Invalid params".
+	// Inspect FullError() so the dependency markers below can match.
 	message := strings.ToLower(err.Error())
-	for _, marker := range []string{"busy", "dependent", "snapshot", "has children", "method call error"} {
+	var apiErr *truenas.APIError
+	if errors.As(err, &apiErr) {
+		message = strings.ToLower(apiErr.FullError())
+	}
+	for _, marker := range []string{"busy", "dependent", "snapshot", "has children", "method call error", "enotempty"} {
 		if strings.Contains(message, marker) {
 			return true
 		}

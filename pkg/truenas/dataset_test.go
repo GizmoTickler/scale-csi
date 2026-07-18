@@ -612,6 +612,77 @@ func TestDatasetDelete_InvalidParams(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// TestDatasetDelete_InvalidParamsDisambiguatedByExistence pins the fix for a
+// data-safety bug: TrueNAS collapses BOTH "dataset does not exist" AND
+// "dataset has snapshots" (ENOTEMPTY) to the same -32602 "Invalid params" over
+// the WebSocket API. A blanket "-32602 => success" made a non-recursive delete
+// of a snapshotted dataset falsely report success and orphan it. DatasetDelete
+// must return the error when the dataset still exists, and only treat -32602 as
+// idempotent success when the dataset is actually gone.
+func TestDatasetDelete_InvalidParamsDisambiguatedByExistence(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stillThere bool
+		wantErr    bool
+	}{
+		{name: "has snapshots (dataset still present)", stillThere: true, wantErr: true},
+		{name: "truly absent (idempotent)", stillThere: false, wantErr: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockWSServer()
+			server := mock.start(func(conn *websocket.Conn) {
+				for {
+					var req rpcTestRequest
+					if err := conn.ReadJSON(&req); err != nil {
+						return
+					}
+					resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+					switch req.Method {
+					case "auth.login_with_api_key":
+						resp.Result = true
+					case "pool.dataset.delete":
+						resp.Error = &rpcError{Code: -32602, Message: "Invalid params"}
+					case "pool.dataset.query":
+						if tc.stillThere {
+							resp.Result = []interface{}{map[string]interface{}{
+								"id": "tank/vol", "name": "tank/vol", "type": "FILESYSTEM",
+							}}
+						} else {
+							resp.Result = []interface{}{}
+						}
+					default:
+						resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+					}
+					if err := conn.WriteJSON(resp); err != nil {
+						return
+					}
+				}
+			})
+			defer mock.close()
+
+			wsURL := strings.Replace(server.URL, "http://", "", 1)
+			parts := strings.Split(wsURL, ":")
+			port := 80
+			if len(parts) > 1 {
+				_, _ = fmt.Sscanf(parts[1], "%d", &port)
+			}
+			client, err := NewClient(&ClientConfig{
+				Host: parts[0], Port: port, Protocol: "http", APIKey: "test-api-key",
+				Timeout: 5 * time.Second, ConnectTimeout: 5 * time.Second, MaxConnections: 1,
+			})
+			require.NoError(t, err)
+			defer func() { _ = client.Close() }()
+
+			err = client.DatasetDelete(context.Background(), "tank/vol", false, true)
+			if tc.wantErr {
+				require.Error(t, err, "delete of a still-present dataset must NOT be swallowed as success")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 // TestDatasetUpdate tests updating a dataset
 func TestDatasetUpdate_Success(t *testing.T) {
 	mock := newMockWSServer()

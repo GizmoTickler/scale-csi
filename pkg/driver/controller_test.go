@@ -1171,3 +1171,24 @@ func TestControllerExpandVolume(t *testing.T) {
 	// For now, basic check is fine.
 	_ = ds
 }
+
+// TestIsDatasetDependencyOrBusyError_InspectsAPIErrorData pins that the
+// has-snapshots (ENOTEMPTY) reason — which TrueNAS puts in the API error's
+// Data field, not the top-level "Invalid params" message — is recognized as a
+// dependency error so DeleteVolume runs its snapshot handling instead of
+// returning Internal.
+func TestIsDatasetDependencyOrBusyError_InspectsAPIErrorData(t *testing.T) {
+	enotempty := fmt.Errorf("failed to delete dataset: %w", &truenas.APIError{
+		Code:    -32602,
+		Message: "Invalid params",
+		Data:    map[string]interface{}{"reason": "[ENOTEMPTY] zfs.resource.destroy: 'tank/vol' has snapshots. Set recursive=True to remove them."},
+	})
+	assert.True(t, isDatasetDependencyOrBusyError(enotempty),
+		"has-snapshots reason in APIError.Data must classify as a dependency error")
+
+	plain := fmt.Errorf("failed to delete dataset: %w", &truenas.APIError{Code: -32602, Message: "Invalid params"})
+	assert.False(t, isDatasetDependencyOrBusyError(plain),
+		"a bare Invalid params with no dependency reason must not classify as a dependency error")
+
+	assert.False(t, isDatasetDependencyOrBusyError(nil))
+}
