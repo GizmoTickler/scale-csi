@@ -123,6 +123,7 @@ func TestSnapshotResourceQueryTrueNAS26FlatUserPropertiesAndDetectionCache(t *te
 		require.NoError(t, err)
 		require.Len(t, snapshots, 1)
 		assert.Equal(t, "tank/k8s/volumes/pvc-123@snap-1", snapshots[0].ID)
+		assert.True(t, snapshots[0].ResourceQuery)
 		assert.Equal(t, "snap-1", snapshots[0].Name)
 		assert.Equal(t, uint64(331921), snapshots[0].CreateTXG)
 		assert.Equal(t, "true", snapshots[0].UserProperties["truenas-csi:managed_resource"].Value)
@@ -258,7 +259,7 @@ func TestSnapshotCreate_Success(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
-	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "snap-test")
+	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "snap-test", nil)
 	require.NoError(t, err)
 	assert.NotNil(t, snap)
 	assert.Equal(t, "tank/k8s/volumes/pvc-123@snap-test", snap.ID)
@@ -333,7 +334,7 @@ func TestSnapshotCreate_AlreadyExists(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
-	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "existing")
+	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "existing", nil)
 	require.NoError(t, err)
 	assert.NotNil(t, snap)
 	assert.Equal(t, "existing", snap.Name)
@@ -406,10 +407,129 @@ func TestSnapshotCreate_ZFSAPIPrefix(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
-	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "zfs-snap")
+	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "zfs-snap", nil)
 	require.NoError(t, err)
 	assert.NotNil(t, snap)
 	assert.Equal(t, "zfs.snapshot.create", usedMethod)
+}
+
+func TestSnapshotCreateSendsPropertiesOnBothAPIGenerations(t *testing.T) {
+	tests := []struct {
+		name         string
+		poolAPI      bool
+		expectedCall string
+	}{
+		{name: "pool snapshot", poolAPI: true, expectedCall: "pool.snapshot.create"},
+		{name: "legacy zfs snapshot", expectedCall: "zfs.snapshot.create"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockWSServer()
+			payloads := make(chan map[string]interface{}, 1)
+			server := mock.start(func(conn *websocket.Conn) {
+				for {
+					var req rpcTestRequest
+					if err := conn.ReadJSON(&req); err != nil {
+						return
+					}
+					resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+					switch req.Method {
+					case "auth.login_with_api_key":
+						resp.Result = true
+					case "pool.snapshot.query":
+						if tc.poolAPI {
+							resp.Result = []interface{}{}
+						} else {
+							resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+						}
+					case "zfs.snapshot.query":
+						resp.Result = []interface{}{}
+					case tc.expectedCall:
+						payloads <- req.Params[0].(map[string]interface{})
+						resp.Result = map[string]interface{}{
+							"id": "tank/csi/source@inline", "name": "inline", "dataset": "tank/csi/source",
+						}
+					default:
+						resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+					}
+					if err := conn.WriteJSON(resp); err != nil {
+						return
+					}
+				}
+			})
+			defer mock.close()
+
+			client := newSnapshotTestClient(t, server.URL)
+			properties := map[string]string{
+				"truenas-csi:managed_resource":  "true",
+				"truenas-csi:csi_snapshot_name": "inline",
+			}
+			_, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "inline", properties)
+			require.NoError(t, err)
+
+			payload := <-payloads
+			assert.Equal(t, "tank/csi/source", payload["dataset"])
+			assert.Equal(t, "inline", payload["name"])
+			assert.Equal(t, map[string]interface{}{
+				"truenas-csi:managed_resource":  "true",
+				"truenas-csi:csi_snapshot_name": "inline",
+			}, payload["properties"])
+		})
+	}
+}
+
+func TestSnapshotCreatePropertiesValidationFallbackIsCached(t *testing.T) {
+	mock := newMockWSServer()
+	var createCalls atomic.Int32
+	var createCallsWithProperties atomic.Int32
+	var updateCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case "pool.snapshot.create":
+				createCalls.Add(1)
+				params := req.Params[0].(map[string]interface{})
+				if _, ok := params["properties"]; ok {
+					createCallsWithProperties.Add(1)
+					resp.Error = &rpcError{Code: -32602, Message: "Invalid params"}
+					break
+				}
+				name := params["name"].(string)
+				resp.Result = map[string]interface{}{
+					"id": "tank/csi/source@" + name, "name": name, "dataset": "tank/csi/source",
+				}
+			case "pool.snapshot.update":
+				updateCalls.Add(1)
+				resp.Result = nil
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+	properties := map[string]string{"truenas-csi:a": "a", "truenas-csi:b": "b"}
+
+	_, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "first", properties)
+	require.NoError(t, err)
+	_, err = client.SnapshotCreate(context.Background(), "tank/csi/source", "second", properties)
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), createCalls.Load(), "only the first call probes the properties payload")
+	assert.Equal(t, int32(1), createCallsWithProperties.Load())
+	assert.Equal(t, int32(4), updateCalls.Load())
 }
 
 // TestSnapshotDelete_Success tests deleting a snapshot
@@ -1726,7 +1846,7 @@ func TestMockClient_SnapshotOperations(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test create snapshot
-	snap, err := mock.SnapshotCreate(ctx, "tank/test/snap-parent", "test-snap")
+	snap, err := mock.SnapshotCreate(ctx, "tank/test/snap-parent", "test-snap", nil)
 	require.NoError(t, err)
 	assert.NotNil(t, snap)
 	assert.Equal(t, "tank/test/snap-parent@test-snap", snap.ID)
@@ -1786,7 +1906,7 @@ func TestMockClient_SnapshotErrorInjection(t *testing.T) {
 	// Inject error
 	mock.InjectError = fmt.Errorf("injected snapshot error")
 
-	_, err := mock.SnapshotCreate(ctx, "tank/test", "snap")
+	_, err := mock.SnapshotCreate(ctx, "tank/test", "snap", nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "injected snapshot error")
 
@@ -1794,7 +1914,7 @@ func TestMockClient_SnapshotErrorInjection(t *testing.T) {
 	mock.InjectError = nil
 
 	// Should succeed now
-	snap, err := mock.SnapshotCreate(ctx, "tank/test", "snap")
+	snap, err := mock.SnapshotCreate(ctx, "tank/test", "snap", nil)
 	require.NoError(t, err)
 	assert.NotNil(t, snap)
 }
@@ -1909,7 +2029,7 @@ func TestSnapshotCreate_TableDriven(t *testing.T) {
 			defer func() { _ = client.Close() }()
 
 			ctx := context.Background()
-			snap, err := client.SnapshotCreate(ctx, tt.dataset, tt.snapName)
+			snap, err := client.SnapshotCreate(ctx, tt.dataset, tt.snapName, nil)
 
 			if tt.expectError {
 				assert.Error(t, err)

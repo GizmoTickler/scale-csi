@@ -15,10 +15,13 @@ SCALE 24.x (`zfs.snapshot.*`), 25.04+ (`pool.snapshot.*`), and 26.0
 client probes and caches the available generation. NVMe-oF is different: the
 driver rejects it before TrueNAS 25.10.
 
-These are code-level compatibility paths, not a live TrueNAS certification
-matrix. In particular, v1.2.0 has not been exercised by this project against a
-real TrueNAS system; validate the exact TrueNAS patch release and protocol in a
-staging cluster before production.
+The controller plane has been validated live against a real TrueNAS 26.0
+system: the official csi-sanity controller suites pass 52/52 for NFS and 52/52
+for iSCSI against real datasets, zvols, shares, targets, and extents (node
+specs excluded — they require real initiator hosts). That validation is what
+surfaced the 26.0 middleware behaviors documented under Known limitations.
+Still validate your exact TrueNAS patch release and protocol in a staging
+cluster before production, and node-path behavior end to end.
 
 Use a user-linked API key over HTTPS. API keys inherit the roles of their user.
 On role-based TrueNAS releases, the built-in `SHARING_ADMIN` plus
@@ -190,8 +193,10 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   iSCSI runs the controller portion of `csi-sanity`; NVMe-oF has unit/controller
   tests but no protocol-specific sanity suite. Neither substitutes for node tests
   with real block devices and a real target.
-- No live end-to-end run against a real TrueNAS appliance has been performed for
-  v1.2.0. Tests named `e2e` in this repository use `MockClient`.
+- Live validation against a real TrueNAS 26.0 appliance covers the controller
+  plane only (csi-sanity controller suites, NFS and iSCSI, 52/52 each). Node
+  stage/publish against real initiators and NVMe-oF live behavior remain
+  unvalidated. Tests named `e2e` in this repository use `MockClient`.
 - `ControllerModifyVolume` returns `Unimplemented`. CSI volume group snapshot
   services are not registered or implemented.
 - CSI volume and snapshot names share `sanitizeVolumeID`: `/` and spaces become
@@ -202,6 +207,14 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 - Deleting a snapshot that still has clones renames it to an internal tombstone
   and requests deferred ZFS destruction. The snapshot disappears from CSI, but
   its referenced space remains charged until the last clone releases it.
+- After upgrading a NAS from TrueNAS 25.x to 26.0, CSI snapshots created by
+  older driver versions without `truenas-csi:csi_snapshot_name` are omitted
+  from `ListSnapshots`. Restore and deletion by snapshot ID continue to work.
+- TrueNAS 26.0 (including beta builds) silently ignores
+  `pool.snapshot.update` requests that use `user_properties_update` or
+  `user_properties_remove`. The driver writes snapshot identity properties at
+  creation for correctness; tombstone names, rather than property removal, hide
+  deferred deletions. This middleware behavior should be reported upstream.
 - Driver-managed NVMe-oF host allowlisting is unavailable, as described in the
   security section.
 

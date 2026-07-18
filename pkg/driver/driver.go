@@ -95,6 +95,11 @@ type Driver struct {
 
 	// Service reload debouncer (prevents reload storms during bulk provisioning)
 	serviceReloadDebouncer *ServiceReloadDebouncer
+
+	// Cached auto-resolved iSCSI target group (portal/initiator) used when
+	// iscsi.targetGroups is not configured; see resolveISCSITargetGroup.
+	iscsiGroupMu       sync.Mutex
+	iscsiResolvedGroup *truenas.ISCSITargetGroup
 }
 
 // newTrueNASClient constructs the TrueNAS API client; tests override it to

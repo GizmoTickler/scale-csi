@@ -22,27 +22,89 @@ type MockClient struct {
 	TargetExtents     map[int]*ISCSITargetExtent
 	NVMeSubsystems    map[int]*NVMeoFSubsystem
 	NVMeNamespaces    map[int]*NVMeoFNamespace
+	ISCSIPortals      map[int]*ISCSIPortal
+	ISCSIInitiators   map[int]*ISCSIInitiator
 	PoolAvailable     int64
 	deferredSnapshots map[string]struct{}
 
 	// Error injection
 	InjectError error
+	// SimulateUpdateNoOp models TrueNAS 26.0 pool.snapshot.update returning
+	// success without applying user-property additions or removals.
+	SimulateUpdateNoOp bool
 }
 
 // NewMockClient creates a new MockClient.
 func NewMockClient() *MockClient {
 	return &MockClient{
-		Datasets:          make(map[string]*Dataset),
-		Snapshots:         make(map[string]*Snapshot),
-		NFSShares:         make(map[int]*NFSShare),
-		ISCSITargets:      make(map[int]*ISCSITarget),
-		ISCSIExtents:      make(map[int]*ISCSIExtent),
-		TargetExtents:     make(map[int]*ISCSITargetExtent),
-		NVMeSubsystems:    make(map[int]*NVMeoFSubsystem),
-		NVMeNamespaces:    make(map[int]*NVMeoFNamespace),
+		Datasets:       make(map[string]*Dataset),
+		Snapshots:      make(map[string]*Snapshot),
+		NFSShares:      make(map[int]*NFSShare),
+		ISCSITargets:   make(map[int]*ISCSITarget),
+		ISCSIExtents:   make(map[int]*ISCSIExtent),
+		TargetExtents:  make(map[int]*ISCSITargetExtent),
+		NVMeSubsystems: make(map[int]*NVMeoFSubsystem),
+		NVMeNamespaces: make(map[int]*NVMeoFNamespace),
+		// Default portal/initiator fixtures cover the portal addresses used
+		// across the test suites so target-group auto-resolution succeeds
+		// without per-test setup. Tests may replace these maps.
+		ISCSIPortals: map[int]*ISCSIPortal{
+			1: {ID: 1, Tag: 1, Listen: []ISCSIPortalListen{
+				{IP: "192.0.2.10", Port: 3260},
+				{IP: "192.168.1.100", Port: 3260},
+				{IP: "127.0.0.1", Port: 3260},
+			}},
+		},
+		ISCSIInitiators: map[int]*ISCSIInitiator{
+			1: {ID: 1, Initiators: nil, Comment: "allow-all (mock)"},
+		},
 		deferredSnapshots: make(map[string]struct{}),
 		PoolAvailable:     100 * 1024 * 1024 * 1024, // 100 GiB default
 	}
+}
+
+// ISCSIPortalList lists mock iSCSI portals.
+func (m *MockClient) ISCSIPortalList(ctx context.Context) ([]*ISCSIPortal, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	portals := make([]*ISCSIPortal, 0, len(m.ISCSIPortals))
+	for _, p := range m.ISCSIPortals {
+		portals = append(portals, p)
+	}
+	return portals, nil
+}
+
+// ISCSIInitiatorList lists mock iSCSI initiator groups.
+func (m *MockClient) ISCSIInitiatorList(ctx context.Context) ([]*ISCSIInitiator, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	groups := make([]*ISCSIInitiator, 0, len(m.ISCSIInitiators))
+	for _, g := range m.ISCSIInitiators {
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+// ISCSIInitiatorCreate creates a mock allow-all initiator group.
+func (m *MockClient) ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISCSIInitiator, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	id := len(m.ISCSIInitiators) + 1
+	for m.ISCSIInitiators[id] != nil {
+		id++
+	}
+	group := &ISCSIInitiator{ID: id, Comment: comment}
+	m.ISCSIInitiators[id] = group
+	return group, nil
 }
 
 // Core methods
@@ -268,7 +330,7 @@ func (m *MockClient) WaitForZvolReady(ctx context.Context, name string, timeout 
 }
 
 // Snapshot methods
-func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string) (*Snapshot, error) {
+func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -283,7 +345,10 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string) (
 		Properties: map[string]interface{}{
 			"creation": map[string]interface{}{"parsed": float64(time.Now().Unix())},
 		},
-		UserProperties: make(map[string]UserProperty),
+		UserProperties: make(map[string]UserProperty, len(userProperties)),
+	}
+	for key, value := range userProperties {
+		snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
 	}
 	m.Snapshots[id] = snap
 	return snap, nil
@@ -334,6 +399,9 @@ func (m *MockClient) SnapshotRename(ctx context.Context, snapshotID, newName str
 
 	if m.InjectError != nil {
 		return m.InjectError
+	}
+	if m.SimulateUpdateNoOp {
+		return nil
 	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
@@ -428,6 +496,9 @@ func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID, ke
 	if m.InjectError != nil {
 		return m.InjectError
 	}
+	if m.SimulateUpdateNoOp {
+		return nil
+	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
 		return &APIError{Code: -1, Message: "snapshot not found"}
@@ -442,6 +513,9 @@ func (m *MockClient) SnapshotRemoveUserProperties(ctx context.Context, snapshotI
 
 	if m.InjectError != nil {
 		return m.InjectError
+	}
+	if m.SimulateUpdateNoOp {
+		return nil
 	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {

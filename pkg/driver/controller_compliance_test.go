@@ -206,7 +206,7 @@ func TestCreateVolumeCloneExpansionFailure(t *testing.T) {
 					Name: "pool/parent/source", Type: "VOLUME", Volsize: testGiB,
 				})
 				require.NoError(t, err)
-				_, err = mockClient.SnapshotCreate(context.Background(), "pool/parent/source", "source-snapshot")
+				_, err = mockClient.SnapshotCreate(context.Background(), "pool/parent/source", "source-snapshot", nil)
 				require.NoError(t, err)
 				return &csi.VolumeContentSource{
 					Type: &csi.VolumeContentSource_Snapshot{
@@ -301,7 +301,7 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 			})
 			require.NoError(t, err)
 			if tc.source.GetSnapshot() != nil {
-				_, err = client.SnapshotCreate(context.Background(), "pool/parent/source", "source-snapshot")
+				_, err = client.SnapshotCreate(context.Background(), "pool/parent/source", "source-snapshot", nil)
 				require.NoError(t, err)
 			}
 
@@ -333,7 +333,7 @@ func TestCreateVolumeNFSCloneSetsRefquota(t *testing.T) {
 		Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB,
 	})
 	require.NoError(t, err)
-	_, err = mockClient.SnapshotCreate(context.Background(), "pool/parent/source", "source-snapshot")
+	_, err = mockClient.SnapshotCreate(context.Background(), "pool/parent/source", "source-snapshot", nil)
 	require.NoError(t, err)
 
 	driver := newComplianceTestDriver(mockClient)
@@ -369,7 +369,7 @@ func TestCreateVolumeNFSCloneQuotaFailure(t *testing.T) {
 		Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB,
 	})
 	require.NoError(t, err)
-	_, err = client.SnapshotCreate(context.Background(), "pool/parent/source", "source-snapshot")
+	_, err = client.SnapshotCreate(context.Background(), "pool/parent/source", "source-snapshot", nil)
 	require.NoError(t, err)
 
 	driver := newComplianceTestDriver(client)

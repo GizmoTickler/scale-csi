@@ -173,32 +173,122 @@ type Snapshot struct {
 	Type           string                  `json:"type"`
 	Properties     map[string]interface{}  `json:"properties"`
 	UserProperties map[string]UserProperty `json:"user_properties"`
+	// ResourceQuery is true when the snapshot came from the TrueNAS 26.0
+	// zfs.resource.snapshot.query read path. That API flattens user properties
+	// and does not expose whether a value is local or inherited.
+	ResourceQuery bool `json:"-"`
 }
 
 // SnapshotCreateParams holds parameters for creating a snapshot.
 type SnapshotCreateParams struct {
-	Dataset   string `json:"dataset"`
-	Name      string `json:"name"`
-	Recursive bool   `json:"recursive,omitempty"`
+	Dataset    string            `json:"dataset"`
+	Name       string            `json:"name"`
+	Recursive  bool              `json:"recursive,omitempty"`
+	Properties map[string]string `json:"properties,omitempty"`
 }
 
-// SnapshotCreate creates a new ZFS snapshot.
-func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string) (*Snapshot, error) {
+// SnapshotCreate creates a new ZFS snapshot with user properties applied
+// atomically by the create operation when the API generation supports it.
+func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*Snapshot, error) {
+	prefix := c.detectSnapshotAPIPrefix(ctx)
 	params := &SnapshotCreateParams{
-		Dataset: dataset,
-		Name:    name,
+		Dataset:    dataset,
+		Name:       name,
+		Properties: userProperties,
 	}
 
-	result, err := c.Call(ctx, c.snapshotMethod(ctx, "create"), params)
+	if len(userProperties) == 0 {
+		return c.snapshotCreateCall(ctx, prefix, params)
+	}
+
+	c.snapshotCreatePropertiesMu.Lock()
+	supported, probed := c.snapshotCreatePropertiesSupport[prefix]
+	if probed {
+		c.snapshotCreatePropertiesMu.Unlock()
+		if supported {
+			return c.snapshotCreateCall(ctx, prefix, params)
+		}
+		return c.snapshotCreateThenSetProperties(ctx, prefix, dataset, name, userProperties)
+	}
+
+	// Keep the first probe single-flight. A successful create proves support;
+	// a field-validation failure is cached and retried without properties.
+	snap, err := c.snapshotCreateCall(ctx, prefix, params)
+	if err == nil {
+		if c.snapshotCreatePropertiesSupport == nil {
+			c.snapshotCreatePropertiesSupport = make(map[string]bool)
+		}
+		c.snapshotCreatePropertiesSupport[prefix] = true
+		c.snapshotCreatePropertiesMu.Unlock()
+		return snap, nil
+	}
+	if !isSnapshotCreatePropertiesValidationError(err) {
+		c.snapshotCreatePropertiesMu.Unlock()
+		return nil, err
+	}
+	if c.snapshotCreatePropertiesSupport == nil {
+		c.snapshotCreatePropertiesSupport = make(map[string]bool)
+	}
+	c.snapshotCreatePropertiesSupport[prefix] = false
+	c.snapshotCreatePropertiesMu.Unlock()
+
+	klog.Warningf("Snapshot create properties are unsupported by %s; falling back to post-create updates", prefix)
+	return c.snapshotCreateThenSetProperties(ctx, prefix, dataset, name, userProperties)
+}
+
+func (c *Client) snapshotCreateCall(ctx context.Context, prefix string, params *SnapshotCreateParams) (*Snapshot, error) {
+	result, err := c.Call(ctx, prefix+".create", params)
 	if err != nil {
 		// Ignore "already exists" errors
 		if strings.Contains(err.Error(), "already exists") {
-			return c.SnapshotGet(ctx, dataset+"@"+name)
+			return c.SnapshotGet(ctx, params.Dataset+"@"+params.Name)
 		}
 		return nil, fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
 	return parseSnapshot(result)
+}
+
+func (c *Client) snapshotCreateThenSetProperties(
+	ctx context.Context,
+	prefix, dataset, name string,
+	userProperties map[string]string,
+) (*Snapshot, error) {
+	snap, err := c.snapshotCreateCall(ctx, prefix, &SnapshotCreateParams{Dataset: dataset, Name: name})
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(userProperties))
+	for key := range userProperties {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, err := c.Call(ctx, prefix+".update", snap.ID, map[string]interface{}{
+			"user_properties_update": []map[string]interface{}{{"key": key, "value": userProperties[key]}},
+		}); err != nil {
+			return nil, fmt.Errorf("failed to set snapshot property %q after create: %w", key, err)
+		}
+		if snap.UserProperties == nil {
+			snap.UserProperties = make(map[string]UserProperty)
+		}
+		snap.UserProperties[key] = UserProperty{Value: userProperties[key], Source: "local"}
+	}
+	return snap, nil
+}
+
+func isSnapshotCreatePropertiesValidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Code == -32602 {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "propert") &&
+		(strings.Contains(message, "validation") || strings.Contains(message, "invalid param") ||
+			strings.Contains(message, "unexpected") || strings.Contains(message, "not permitted"))
 }
 
 // SnapshotDelete deletes a ZFS snapshot.
@@ -475,6 +565,7 @@ func (c *Client) querySnapshotResources(ctx context.Context, paths []string, rec
 		if parseErr != nil {
 			continue
 		}
+		snap.ResourceQuery = true
 		snapshots = append(snapshots, snap)
 	}
 	return snapshots, nil
@@ -495,6 +586,10 @@ func paginateSnapshots(snapshots []*Snapshot, limit, offset int) []*Snapshot {
 }
 
 // SnapshotSetUserProperty sets a user property on a snapshot.
+//
+// TrueNAS 26.0 middleware currently returns success for pool.snapshot.update
+// user_properties_update while silently applying nothing. Keep this method for
+// legacy compatibility, but do not rely on it for correctness on that release.
 func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error {
 	params := map[string]interface{}{
 		"user_properties_update": []map[string]interface{}{
@@ -507,6 +602,8 @@ func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, v
 }
 
 // SnapshotRemoveUserProperties removes user properties from a snapshot.
+// TrueNAS 26.0 has the same silent-no-op middleware bug for property removal;
+// callers must use tombstone identity as the correctness boundary there.
 func (c *Client) SnapshotRemoveUserProperties(ctx context.Context, snapshotID string, keys []string) error {
 	if len(keys) == 0 {
 		return nil

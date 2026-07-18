@@ -244,6 +244,12 @@ type Client struct {
 	snapshotResourceAvailable bool
 	snapshotResourceDetected  bool
 	snapshotResourceProbeDone chan struct{}
+
+	// Snapshot create-property support is probed independently for each mutation
+	// API generation. The mutex also serializes the first probe so concurrent
+	// creates do not all retry a rejected payload shape.
+	snapshotCreatePropertiesMu      sync.Mutex
+	snapshotCreatePropertiesSupport map[string]bool
 }
 
 // rpcRequest is a JSON-RPC 2.0 request.
@@ -1175,6 +1181,16 @@ func (c *Client) ServiceReload(ctx context.Context, service string) error {
 	klog.V(4).Infof("Reloading service: %s", service)
 	_, err := c.Call(ctx, "service.reload", service)
 	if err != nil {
+		// TrueNAS 26.0 removed service.reload in favor of
+		// service.control(verb, service, options) (validated live).
+		if isMethodNotFoundError(err) || strings.Contains(err.Error(), "Method call error") {
+			if _, ctlErr := c.Call(ctx, "service.control", "RELOAD", service, map[string]interface{}{}); ctlErr == nil {
+				klog.Infof("Service %s reloaded successfully (service.control)", service)
+				return nil
+			} else {
+				err = ctlErr
+			}
+		}
 		return fmt.Errorf("failed to reload service %s: %w", service, err)
 	}
 	klog.Infof("Service %s reloaded successfully", service)

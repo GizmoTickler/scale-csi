@@ -154,9 +154,9 @@ func (c *apiCallCountingClient) WaitForZvolReady(ctx context.Context, name strin
 	return c.MockClient.WaitForZvolReady(ctx, name, timeout)
 }
 
-func (c *apiCallCountingClient) SnapshotCreate(ctx context.Context, dataset, name string) (*truenas.Snapshot, error) {
+func (c *apiCallCountingClient) SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*truenas.Snapshot, error) {
 	c.record("SnapshotCreate")
-	return c.MockClient.SnapshotCreate(ctx, dataset, name)
+	return c.MockClient.SnapshotCreate(ctx, dataset, name, userProperties)
 }
 
 func (c *apiCallCountingClient) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
@@ -530,9 +530,9 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi"})
 			require.NoError(t, err)
 		}},
-		// Fresh snapshot creation performs one source lookup, one global-name lookup,
-		// one create, and three identity-property writes.
-		{name: "CreateSnapshot fresh", want: 6, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Fresh snapshot creation performs one source lookup, one global-name
+		// lookup, and one atomic create carrying all identity properties.
+		{name: "CreateSnapshot fresh", want: 3, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent/snapshot-source", Type: "FILESYSTEM", Refquota: testGiB,
 			})
@@ -588,7 +588,7 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 				Name: "pool/parent/clone-source", Type: "FILESYSTEM", Refquota: testGiB,
 			})
 			require.NoError(t, err)
-			_, err = client.MockClient.SnapshotCreate(context.Background(), "pool/parent/clone-source", "clone-point")
+			_, err = client.MockClient.SnapshotCreate(context.Background(), "pool/parent/clone-source", "clone-point", nil)
 			require.NoError(t, err)
 			req := apiCallCountVolumeRequest("restored-from-snapshot", "nfs")
 			req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{

@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -735,4 +736,82 @@ func TestDeleteShare_UnknownType(t *testing.T) {
 
 	// Should succeed (no-op for unknown types)
 	assert.NoError(t, err)
+}
+
+// TestProtocolShareName pins the iSCSI/NVMe name sanitization contract:
+// legal names pass through unchanged (existing deployments keep their target
+// names); illegal names are lowercased/charset-mapped with a deterministic
+// disambiguator so distinct originals cannot collide.
+func TestProtocolShareName(t *testing.T) {
+	legal := []string{"pvc-0a1b2c3d", "vol.1:a-b", "x"}
+	for _, name := range legal {
+		if got := protocolShareName(name); got != name {
+			t.Fatalf("legal name %q changed to %q", name, got)
+		}
+	}
+
+	upper := protocolShareName("Vol-A")
+	lower := protocolShareName("vol-a")
+	if upper == lower {
+		t.Fatalf("sanitized collision: %q == %q", upper, lower)
+	}
+	if upper != strings.ToLower(upper) {
+		t.Fatalf("sanitized name not lowercase: %q", upper)
+	}
+	for _, r := range protocolShareName("has spaces_and_UNDERSCORES!") {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == ':' || r == '-'
+		if !valid {
+			t.Fatalf("illegal rune %q survived sanitization", r)
+		}
+	}
+	if got := protocolShareName("Vol-A"); got != upper {
+		t.Fatalf("sanitization not deterministic: %q vs %q", got, upper)
+	}
+	long := protocolShareName(strings.Repeat("A", 300))
+	if len(long) > 64 {
+		t.Fatalf("sanitized name exceeds the 64-char extent limit: %d", len(long))
+	}
+	longLegal := protocolShareName(strings.Repeat("a", 80))
+	if len(longLegal) > 64 {
+		t.Fatalf("legal-but-long name not capped: %d", len(longLegal))
+	}
+	if longLegal == protocolShareName(strings.Repeat("a", 81)) {
+		t.Fatalf("truncated names must not collide")
+	}
+}
+
+// TestResolveISCSITargetGroup verifies portal/initiator auto-resolution when
+// targetGroups is unset: the portal must match the configured targetPortal and
+// an allow-all initiator group is reused; no portal match fails loudly.
+func TestResolveISCSITargetGroup(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ISCSI: ISCSIConfig{TargetPortal: "192.0.2.10:3260"},
+		},
+		truenasClient: mockClient,
+	}
+
+	group, err := d.resolveISCSITargetGroup(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, group.Portal)
+	assert.Equal(t, 1, group.Initiator)
+	assert.Equal(t, "NONE", group.AuthMethod)
+
+	// Cached on second call even if the mock is emptied.
+	mockClient.ISCSIPortals = map[int]*truenas.ISCSIPortal{}
+	again, err := d.resolveISCSITargetGroup(context.Background())
+	require.NoError(t, err)
+	assert.Same(t, group, again)
+
+	// No matching portal → loud failure, retried (not cached).
+	d2 := &Driver{
+		config: &Config{
+			ISCSI: ISCSIConfig{TargetPortal: "203.0.113.9:3260"},
+		},
+		truenasClient: mockClient,
+	}
+	_, err = d2.resolveISCSITargetGroup(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no TrueNAS iSCSI portal")
 }

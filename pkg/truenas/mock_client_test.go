@@ -14,7 +14,7 @@ func TestMockClient_SnapshotFindByName(t *testing.T) {
 	// Create test data
 	parentDataset := "pool/dataset"
 	snapshotName := "snap1"
-	_, err := client.SnapshotCreate(context.Background(), parentDataset, snapshotName)
+	_, err := client.SnapshotCreate(context.Background(), parentDataset, snapshotName, nil)
 	assert.NoError(t, err)
 
 	// Test Case 1: Found
@@ -32,7 +32,7 @@ func TestMockClient_SnapshotFindByName(t *testing.T) {
 	// Test Case 3: Wrong Dataset
 	// Create another snapshot with same name but different dataset
 	otherDataset := "pool/other"
-	_, err = client.SnapshotCreate(context.Background(), otherDataset, snapshotName)
+	_, err = client.SnapshotCreate(context.Background(), otherDataset, snapshotName, nil)
 	assert.NoError(t, err)
 
 	// Should still find the one in parentDataset (mock implementation of FindByName currently ignores dataset arg in loop, let's check)
@@ -85,12 +85,12 @@ func TestMockClientModelsDatasetAndSnapshotReadShapes(t *testing.T) {
 	_, err = client.DatasetCreate(ctx, &DatasetCreateParams{Name: "tank/outside", Type: "FILESYSTEM"})
 	assert.NoError(t, err)
 
-	snapshotB, err := client.SnapshotCreate(ctx, "tank/csi/volume-b", "snapshot-b")
+	snapshotB, err := client.SnapshotCreate(ctx, "tank/csi/volume-b", "snapshot-b", nil)
 	assert.NoError(t, err)
 	assert.Greater(t, snapshotB.GetCreationTime(), int64(0))
-	_, err = client.SnapshotCreate(ctx, "tank/csi/volume-a", "snapshot-a")
+	_, err = client.SnapshotCreate(ctx, "tank/csi/volume-a", "snapshot-a", nil)
 	assert.NoError(t, err)
-	_, err = client.SnapshotCreate(ctx, "tank/outside", "snapshot-outside")
+	_, err = client.SnapshotCreate(ctx, "tank/outside", "snapshot-outside", nil)
 	assert.NoError(t, err)
 
 	page, err := client.SnapshotListAll(ctx, "tank/csi", 1, 0)
@@ -111,7 +111,7 @@ func TestMockClientModelsRenamedDeferredSnapshotLifecycle(t *testing.T) {
 	ctx := context.Background()
 	_, err := client.DatasetCreate(ctx, &DatasetCreateParams{Name: "tank/csi/source", Type: "FILESYSTEM"})
 	require.NoError(t, err)
-	snapshot, err := client.SnapshotCreate(ctx, "tank/csi/source", "restore-point")
+	snapshot, err := client.SnapshotCreate(ctx, "tank/csi/source", "restore-point", nil)
 	require.NoError(t, err)
 	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "tank/csi/restored"))
 
@@ -132,4 +132,22 @@ func TestMockClientModelsRenamedDeferredSnapshotLifecycle(t *testing.T) {
 	require.NoError(t, client.DatasetDelete(ctx, "tank/csi/restored", false, true))
 	_, err = client.SnapshotGet(ctx, renamedID)
 	assert.Error(t, err)
+}
+
+func TestMockSnapshotCreateAppliesInlinePropertiesWhenUpdatesNoOp(t *testing.T) {
+	client := NewMockClient()
+	client.SimulateUpdateNoOp = true
+	ctx := context.Background()
+
+	snapshot, err := client.SnapshotCreate(ctx, "tank/csi/source", "inline", map[string]string{
+		"truenas-csi:managed_resource": "true",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "true", snapshot.UserProperties["truenas-csi:managed_resource"].Value)
+	assert.Equal(t, "local", snapshot.UserProperties["truenas-csi:managed_resource"].Source)
+
+	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, "truenas-csi:late", "ignored"))
+	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:late")
+	require.NoError(t, client.SnapshotRemoveUserProperties(ctx, snapshot.ID, []string{"truenas-csi:managed_resource"}))
+	assert.Contains(t, snapshot.UserProperties, "truenas-csi:managed_resource")
 }

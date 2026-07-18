@@ -533,3 +533,124 @@ func (c *Client) ISCSITargetExtentFindByExtent(ctx context.Context, extentID int
 
 	return results, nil
 }
+
+// ISCSIPortalListen is one listen address of an iSCSI portal.
+type ISCSIPortalListen struct {
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
+}
+
+// ISCSIPortal represents a TrueNAS iSCSI portal.
+type ISCSIPortal struct {
+	ID     int                 `json:"id"`
+	Tag    int                 `json:"tag"`
+	Listen []ISCSIPortalListen `json:"listen"`
+}
+
+// ISCSIInitiator represents a TrueNAS iSCSI initiator group. An empty
+// Initiators list means "allow all initiators".
+type ISCSIInitiator struct {
+	ID         int      `json:"id"`
+	Initiators []string `json:"initiators"`
+	Comment    string   `json:"comment"`
+}
+
+// ISCSIPortalList lists all iSCSI portals.
+func (c *Client) ISCSIPortalList(ctx context.Context) ([]*ISCSIPortal, error) {
+	result, err := c.Call(ctx, "iscsi.portal.query", [][]interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query iSCSI portals: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type")
+	}
+	portals := make([]*ISCSIPortal, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		portal := &ISCSIPortal{}
+		if v, ok := m["id"].(float64); ok {
+			portal.ID = int(v)
+		}
+		if v, ok := m["tag"].(float64); ok {
+			portal.Tag = int(v)
+		}
+		if listens, ok := m["listen"].([]interface{}); ok {
+			for _, l := range listens {
+				lm, ok := l.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				entry := ISCSIPortalListen{}
+				if ip, ok := lm["ip"].(string); ok {
+					entry.IP = ip
+				}
+				if p, ok := lm["port"].(float64); ok {
+					entry.Port = int(p)
+				}
+				portal.Listen = append(portal.Listen, entry)
+			}
+		}
+		portals = append(portals, portal)
+	}
+	return portals, nil
+}
+
+// ISCSIInitiatorList lists all iSCSI initiator groups.
+func (c *Client) ISCSIInitiatorList(ctx context.Context) ([]*ISCSIInitiator, error) {
+	result, err := c.Call(ctx, "iscsi.initiator.query", [][]interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query iSCSI initiator groups: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type")
+	}
+	groups := make([]*ISCSIInitiator, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		group := &ISCSIInitiator{}
+		if v, ok := m["id"].(float64); ok {
+			group.ID = int(v)
+		}
+		if v, ok := m["comment"].(string); ok {
+			group.Comment = v
+		}
+		if inits, ok := m["initiators"].([]interface{}); ok {
+			for _, in := range inits {
+				if s, ok := in.(string); ok {
+					group.Initiators = append(group.Initiators, s)
+				}
+			}
+		}
+		groups = append(groups, group)
+	}
+	return groups, nil
+}
+
+// ISCSIInitiatorCreate creates an allow-all iSCSI initiator group.
+func (c *Client) ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISCSIInitiator, error) {
+	params := map[string]interface{}{
+		"initiators": []string{},
+		"comment":    comment,
+	}
+	result, err := c.Call(ctx, "iscsi.initiator.create", params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create iSCSI initiator group: %w", err)
+	}
+	m, ok := result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type")
+	}
+	group := &ISCSIInitiator{Comment: comment}
+	if v, ok := m["id"].(float64); ok {
+		group.ID = int(v)
+	}
+	return group, nil
+}

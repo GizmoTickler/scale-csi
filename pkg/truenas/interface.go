@@ -35,7 +35,7 @@ type ClientInterface interface {
 	WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)
 
 	// Snapshot methods
-	SnapshotCreate(ctx context.Context, dataset, name string) (*Snapshot, error)
+	SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*Snapshot, error)
 	SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error
 	SnapshotRename(ctx context.Context, snapshotID, newName string) error
 	SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error)
@@ -63,6 +63,9 @@ type ClientInterface interface {
 	CheckNVMeoFSupport(ctx context.Context) error
 
 	// iSCSI methods
+	ISCSIPortalList(ctx context.Context) ([]*ISCSIPortal, error)
+	ISCSIInitiatorList(ctx context.Context) ([]*ISCSIInitiator, error)
+	ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISCSIInitiator, error)
 	ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error)
 	ISCSITargetDelete(ctx context.Context, id int, force bool) error
 	ISCSITargetGet(ctx context.Context, id int) (*ISCSITarget, error)

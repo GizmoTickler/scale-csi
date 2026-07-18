@@ -33,6 +33,7 @@ const (
 	PropInternalResource          = "truenas-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
 	PropCSISnapshotName           = "truenas-csi:csi_snapshot_name"
 	PropCSISnapshotSourceVolumeID = "truenas-csi:csi_snapshot_source_volume_id"
+	snapshotTombstoneMarker       = "-csi-deleted-"
 	PropNFSShareID                = "truenas-csi:truenas_nfs_share_id"
 	PropISCSITargetID             = "truenas-csi:truenas_iscsi_target_id"
 	PropISCSIExtentID             = "truenas-csi:truenas_iscsi_extent_id"
@@ -56,15 +57,48 @@ func isDatasetDependencyOrBusyError(err error) bool {
 }
 
 func snapshotBlocksVolumeDeletion(snap *truenas.Snapshot) bool {
+	if snap == nil || isSnapshotTombstone(snap) {
+		return false
+	}
+	// Internal-resource is safe to inspect on the 26.0 flat read path: datasets
+	// never carry this snapshot-only property, so it cannot be inherited.
+	if prop, ok := snap.UserProperties[PropInternalResource]; ok && prop.Value == "true" {
+		return true
+	}
+	return isCSISnapshot(snap)
+}
+
+func isCSISnapshot(snap *truenas.Snapshot) bool {
+	if snap == nil || isSnapshotTombstone(snap) {
+		return false
+	}
+	_, hasCSIName := snap.UserProperties[PropCSISnapshotName]
+	if snap.ResourceQuery {
+		// The 26.0 API cannot distinguish local from inherited values.
+		// csi_snapshot_name is snapshot-only, while managed_resource inherits
+		// from CSI volume datasets into manual snapshots.
+		return hasCSIName
+	}
+	managed := snap.UserProperties[PropManagedResource].Value == "true"
+	return managed || hasCSIName
+}
+
+func isSnapshotTombstone(snap *truenas.Snapshot) bool {
 	if snap == nil {
 		return false
 	}
-	for _, key := range []string{PropManagedResource, PropInternalResource} {
-		if prop, ok := snap.UserProperties[key]; ok && prop.Value == "true" {
-			return true
+	name := snap.Name
+	if name == "" {
+		if extracted, ok := extractSnapshotName(snap.ID); ok {
+			name = extracted
 		}
 	}
-	return false
+	marker := strings.LastIndex(name, snapshotTombstoneMarker)
+	if marker <= 0 {
+		return false
+	}
+	_, err := strconv.ParseUint(name[marker+len(snapshotTombstoneMarker):], 10, 64)
+	return err == nil
 }
 
 // ControllerGetCapabilities returns the capabilities of the controller.
@@ -873,13 +907,12 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		return nil, status.Errorf(codes.Internal, "failed to find existing snapshot: %v", err)
 	}
 	if existing != nil {
-		managed := existing.UserProperties[PropManagedResource].Value == "true"
 		// Identity properties are only compared when present: snapshots created
 		// before they were introduced lack them, and dataset+name equality
 		// already establishes same-source for those.
 		originalName, hasName := existing.UserProperties[PropCSISnapshotName]
 		originalSource, hasSource := existing.UserProperties[PropCSISnapshotSourceVolumeID]
-		if !managed || existing.Dataset != datasetName ||
+		if !isCSISnapshot(existing) || existing.Dataset != datasetName ||
 			(hasName && originalName.Value != name) ||
 			(hasSource && originalSource.Value != sourceVolumeID) {
 			return nil, status.Errorf(codes.AlreadyExists,
@@ -888,40 +921,15 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		return d.createSnapshotResponse(existing, sourceDataset, snapshotID, sourceVolumeID, start), nil
 	}
 
-	// Create snapshot
-	snap, err := d.truenasClient.SnapshotCreate(ctx, datasetName, snapshotID)
+	// Create the snapshot and its identity atomically. TrueNAS 26.0 silently
+	// ignores post-create pool.snapshot.update property writes.
+	snap, err := d.truenasClient.SnapshotCreate(ctx, datasetName, snapshotID, map[string]string{
+		PropManagedResource:           "true",
+		PropCSISnapshotName:           name,
+		PropCSISnapshotSourceVolumeID: sourceVolumeID,
+	})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create snapshot: %v", err)
-	}
-
-	// Set snapshot properties in parallel
-	g, gCtx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		if setErr := d.truenasClient.SnapshotSetUserProperty(gCtx, snap.ID, PropManagedResource, "true"); setErr != nil {
-			return fmt.Errorf("failed to set managed resource property on snapshot: %w", setErr)
-		}
-		return nil
-	})
-	g.Go(func() error {
-		if setErr := d.truenasClient.SnapshotSetUserProperty(gCtx, snap.ID, PropCSISnapshotName, name); setErr != nil {
-			return fmt.Errorf("failed to set CSI snapshot name property: %w", setErr)
-		}
-		return nil
-	})
-	g.Go(func() error {
-		if setErr := d.truenasClient.SnapshotSetUserProperty(gCtx, snap.ID, PropCSISnapshotSourceVolumeID, sourceVolumeID); setErr != nil {
-			return fmt.Errorf("failed to set CSI snapshot source volume ID property: %w", setErr)
-		}
-		return nil
-	})
-	if waitErr := g.Wait(); waitErr != nil {
-		// Property setting failed - delete the snapshot to avoid orphaned/invisible snapshots
-		// Without PropManagedResource=true, the snapshot won't appear in ListSnapshots
-		klog.Errorf("Failed to set properties for snapshot %s: %v - deleting orphaned snapshot", snapshotID, waitErr)
-		if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
-			klog.Warningf("Failed to cleanup snapshot after property failure: %v", delErr)
-		}
-		return nil, status.Errorf(codes.Internal, "failed to set snapshot properties: %v", waitErr)
 	}
 
 	// The source dataset fetched for the existence check above still reflects
@@ -1059,7 +1067,7 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 
 func snapshotTombstoneName(dataset, name string, nonce int64) string {
 	const maxZFSSnapshotNameLength = 255
-	suffix := "-csi-deleted-" + strconv.FormatInt(nonce, 10)
+	suffix := snapshotTombstoneMarker + strconv.FormatInt(nonce, 10)
 	maxShortNameLength := maxZFSSnapshotNameLength - len(dataset) - 1
 	maxOriginalNameLength := maxShortNameLength - len(suffix)
 	if maxOriginalNameLength < 0 {
@@ -1304,7 +1312,7 @@ func multiNodeAccessMode(caps []*csi.VolumeCapability) (csi.VolumeCapability_Acc
 }
 
 func snapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.ListSnapshotsResponse_Entry {
-	if prop, ok := snap.UserProperties[PropManagedResource]; !ok || prop.Value != "true" {
+	if !isCSISnapshot(snap) {
 		return nil
 	}
 
@@ -1317,6 +1325,10 @@ func snapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.L
 	sourceVolumeID := ""
 	if prop, ok := snap.UserProperties[PropCSISnapshotSourceVolumeID]; ok {
 		sourceVolumeID = prop.Value
+	} else if snap.Dataset != "" {
+		// Legacy snapshots predate the source property, but the source volume is
+		// still unambiguous from the snapshot dataset.
+		sourceVolumeID = path.Base(snap.Dataset)
 	}
 	if sourceVolumeFilter != "" && sourceVolumeID != sourceVolumeFilter {
 		return nil
@@ -1442,20 +1454,16 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 
 		// Create a snapshot of source volume, then clone it
 		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
-		snap, err := d.truenasClient.SnapshotCreate(ctx, sourceDataset, tempSnapshotName)
+		snap, err := d.truenasClient.SnapshotCreate(ctx, sourceDataset, tempSnapshotName, map[string]string{
+			PropInternalResource: "true",
+		})
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to create source snapshot: %v", err)
 		}
 		klog.V(4).Infof("Created temporary snapshot %s for volume clone", snap.ID)
-		// Internal snapshots are deliberately not marked as managed: ListSnapshots
-		// only exposes PropManagedResource=true. The distinct marker still lets
+		// Internal snapshots are deliberately not marked as CSI-managed. Their
+		// snapshot-only marker is written atomically at creation and lets
 		// DeleteVolume reject source deletion before its share is touched.
-		if setErr := d.truenasClient.SnapshotSetUserProperty(ctx, snap.ID, PropInternalResource, "true"); setErr != nil {
-			if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
-				klog.Warningf("Failed to cleanup source snapshot after property failure: %v", delErr)
-			}
-			return nil, status.Errorf(codes.Internal, "failed to mark source snapshot as internal: %v", setErr)
-		}
 
 		if cloneErr := d.truenasClient.SnapshotClone(ctx, snap.ID, datasetName); cloneErr != nil {
 			if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {

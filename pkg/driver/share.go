@@ -2,9 +2,13 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"net"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -13,6 +17,109 @@ import (
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+// protocolShareName converts a dataset base name into a name legal for iSCSI
+// targets/extents and NVMe-oF subsystems: TrueNAS requires lowercase
+// alphanumerics plus dot, dash, and colon (validated live on 26.0; violations
+// surface as a bare -32602 over the WebSocket API). The 64-char cap is the
+// iSCSI extent limit — the tightest of the objects sharing this name (targets
+// allow 120). When sanitization changes the name, a short hash of the
+// original is appended so distinct originals ("Vol-A" vs "vol-a") cannot
+// collide. Already-legal names pass through unchanged, and no deployment can
+// have a working share >64 chars (extent creation always rejected them).
+func protocolShareName(base string) string {
+	const maxLen = 64
+	var b strings.Builder
+	for _, r := range strings.ToLower(base) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == ':', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	sanitized := b.String()
+	if sanitized == base && len(sanitized) <= maxLen {
+		return sanitized
+	}
+	sum := sha256.Sum256([]byte(base))
+	suffix := "-" + hex.EncodeToString(sum[:4])
+	if len(sanitized) > maxLen-len(suffix) {
+		sanitized = sanitized[:maxLen-len(suffix)]
+	}
+	return sanitized + suffix
+}
+
+// resolveISCSITargetGroup derives a usable portal/initiator group when
+// iscsi.targetGroups is not configured. A target created with no groups is
+// accepted by TrueNAS but can never be discovered by any initiator, so share
+// creation must fail loudly rather than produce one. The result is cached;
+// failures are retried on the next attempt.
+func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITargetGroup, error) {
+	d.iscsiGroupMu.Lock()
+	defer d.iscsiGroupMu.Unlock()
+	if d.iscsiResolvedGroup != nil {
+		return d.iscsiResolvedGroup, nil
+	}
+
+	host, portStr, err := net.SplitHostPort(d.config.ISCSI.TargetPortal)
+	if err != nil {
+		host = d.config.ISCSI.TargetPortal
+		portStr = "3260"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid iscsi.targetPortal %q: %w", d.config.ISCSI.TargetPortal, err)
+	}
+
+	portals, err := d.truenasClient.ISCSIPortalList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list iSCSI portals: %w", err)
+	}
+	portalID := 0
+	for _, p := range portals {
+		for _, l := range p.Listen {
+			if l.IP == host && l.Port == port {
+				portalID = p.ID
+				break
+			}
+		}
+		if portalID != 0 {
+			break
+		}
+	}
+	if portalID == 0 {
+		return nil, fmt.Errorf("no TrueNAS iSCSI portal listens on configured targetPortal %q — create one in TrueNAS or set iscsi.targetGroups explicitly", d.config.ISCSI.TargetPortal)
+	}
+
+	initiators, err := d.truenasClient.ISCSIInitiatorList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list iSCSI initiator groups: %w", err)
+	}
+	initiatorID := 0
+	for _, g := range initiators {
+		if len(g.Initiators) == 0 {
+			initiatorID = g.ID
+			break
+		}
+	}
+	if initiatorID == 0 {
+		created, err := d.truenasClient.ISCSIInitiatorCreate(ctx, "scale-csi allow-all")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create allow-all iSCSI initiator group: %w", err)
+		}
+		initiatorID = created.ID
+	}
+
+	group := &truenas.ISCSITargetGroup{
+		Portal:     portalID,
+		Initiator:  initiatorID,
+		AuthMethod: "NONE",
+	}
+	d.iscsiResolvedGroup = group
+	klog.Infof("Resolved iSCSI target group automatically: portal=%d (matches %s), initiator=%d", portalID, d.config.ISCSI.TargetPortal, initiatorID)
+	return group, nil
+}
 
 func datasetUserProperty(ds *truenas.Dataset, key string) string {
 	if ds == nil {
@@ -230,10 +337,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	}
 
 	// Generate iSCSI name and disk path upfront
-	iscsiName := path.Base(datasetName)
-	if d.config.ISCSI.NameSuffix != "" {
-		iscsiName += d.config.ISCSI.NameSuffix
-	}
+	iscsiName := protocolShareName(path.Base(datasetName) + d.config.ISCSI.NameSuffix)
 	diskPath := fmt.Sprintf("zvol/%s", datasetName)
 
 	// Step 1: Check if already fully configured (idempotency fast-path)
@@ -289,6 +393,13 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				AuthMethod: tg.AuthMethod,
 				Auth:       auth,
 			})
+		}
+		if len(targetGroups) == 0 {
+			resolved, resolveErr := d.resolveISCSITargetGroup(ctx)
+			if resolveErr != nil {
+				return status.Errorf(codes.Internal, "cannot create iSCSI target for %s: %v", datasetName, resolveErr)
+			}
+			targetGroups = append(targetGroups, *resolved)
 		}
 
 		target, err = d.truenasClient.ISCSITargetCreate(ctx, iscsiName, "", "ISCSI", targetGroups)
@@ -480,10 +591,7 @@ func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	}
 
 	// Generate the expected iSCSI name (same logic as createISCSIShare)
-	iscsiName := path.Base(datasetName)
-	if d.config.ISCSI.NameSuffix != "" {
-		iscsiName += d.config.ISCSI.NameSuffix
-	}
+	iscsiName := protocolShareName(path.Base(datasetName) + d.config.ISCSI.NameSuffix)
 	diskPath := fmt.Sprintf("zvol/%s", datasetName)
 
 	var extDeleted, tgtDeleted bool
@@ -594,7 +702,7 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	}
 
 	// Generate NVMe-oF subsystem name (TrueNAS 25.10+ auto-generates NQN from name)
-	subsysName := path.Base(datasetName)
+	subsysName := protocolShareName(path.Base(datasetName))
 	if d.config.NVMeoF.NamePrefix != "" {
 		subsysName = d.config.NVMeoF.NamePrefix + subsysName
 	}
@@ -696,7 +804,7 @@ func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	}
 
 	// Generate the expected NVMe-oF subsystem name (same logic as createNVMeoFShareForDataset)
-	subsysName := path.Base(datasetName)
+	subsysName := protocolShareName(path.Base(datasetName))
 	if d.config.NVMeoF.NamePrefix != "" {
 		subsysName = d.config.NVMeoF.NamePrefix + subsysName
 	}

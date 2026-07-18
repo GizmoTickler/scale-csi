@@ -114,14 +114,14 @@ type blockingSnapshotCreateMock struct {
 	release chan struct{}
 }
 
-func (m *blockingSnapshotCreateMock) SnapshotCreate(ctx context.Context, dataset, name string) (*truenas.Snapshot, error) {
+func (m *blockingSnapshotCreateMock) SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*truenas.Snapshot, error) {
 	close(m.entered)
 	select {
 	case <-m.release:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return m.MockClient.SnapshotCreate(ctx, dataset, name)
+	return m.MockClient.SnapshotCreate(ctx, dataset, name, userProperties)
 }
 
 func (m *recursiveCloneDependencyMock) DatasetDelete(context.Context, string, bool, bool) error {
@@ -299,7 +299,7 @@ func TestDeleteVolumeWithManagedSnapshotFailsBeforeShareDeletion(t *testing.T) {
 	assert.NoError(t, err)
 	share, err := mockClient.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: "/mnt/pool/parent/vol-snap-guard"})
 	assert.NoError(t, err)
-	snap, err := mockClient.SnapshotCreate(ctx, "pool/parent/vol-snap-guard", "snap-1")
+	snap, err := mockClient.SnapshotCreate(ctx, "pool/parent/vol-snap-guard", "snap-1", nil)
 	assert.NoError(t, err)
 	assert.NoError(t, mockClient.SnapshotSetUserProperty(ctx, snap.ID, PropManagedResource, "true"))
 
@@ -412,7 +412,7 @@ func TestDeleteVolumeRecursiveCloneDependencyIsFailedPrecondition(t *testing.T) 
 	ctx := context.Background()
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
 	assert.NoError(t, err)
-	_, err = client.SnapshotCreate(ctx, "pool/parent/source", "external")
+	_, err = client.SnapshotCreate(ctx, "pool/parent/source", "external", nil)
 	assert.NoError(t, err)
 
 	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "source"})
@@ -460,7 +460,7 @@ func TestDeleteVolumeBusyDatasetChecksManagedSnapshots(t *testing.T) {
 		Name: datasetName, Type: "FILESYSTEM",
 	})
 	assert.NoError(t, err)
-	snapshot, err := mockClient.SnapshotCreate(context.Background(), datasetName, "managed")
+	snapshot, err := mockClient.SnapshotCreate(context.Background(), datasetName, "managed", nil)
 	assert.NoError(t, err)
 	snapshot.UserProperties[PropManagedResource] = truenas.UserProperty{Value: "true"}
 
@@ -607,7 +607,7 @@ func TestDeleteSnapshot(t *testing.T) {
 	volName := "vol-snap-del"
 	_, err := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{Name: "pool/parent/" + volName})
 	assert.NoError(t, err)
-	_, err = mockClient.SnapshotCreate(context.Background(), "pool/parent/"+volName, snapName)
+	_, err = mockClient.SnapshotCreate(context.Background(), "pool/parent/"+volName, snapName, nil)
 	assert.NoError(t, err)
 
 	// Test Case 1: Success
@@ -686,7 +686,7 @@ func TestDeleteSnapshotWithoutRenameStillDefersUnderOriginalName(t *testing.T) {
 	}
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
 	require.NoError(t, err)
-	snapshot, err := client.SnapshotCreate(ctx, "pool/parent/source", "restore-point")
+	snapshot, err := client.SnapshotCreate(ctx, "pool/parent/source", "restore-point", nil)
 	require.NoError(t, err)
 	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, PropManagedResource, "true"))
 	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, PropCSISnapshotName, "restore-point"))
@@ -713,6 +713,89 @@ func TestSnapshotTombstoneNameCapsFullZFSSnapshotName(t *testing.T) {
 	assert.LessOrEqual(t, len(fullName), maxZFSSnapshotNameLength)
 	assert.True(t, strings.HasSuffix(tombstone, "-csi-deleted-9223372036854775807"), "the unique tombstone nonce must survive truncation")
 	assert.Less(t, len(tombstone), len(name)+len("-csi-deleted-9223372036854775807"))
+}
+
+func TestSnapshotListEntryClassification(t *testing.T) {
+	tests := []struct {
+		name       string
+		snapshot   *truenas.Snapshot
+		filter     string
+		wantSource string
+		wantEntry  bool
+		wantBlocks bool
+	}{
+		{
+			name: "26.0 inherited managed property is not CSI identity",
+			snapshot: &truenas.Snapshot{
+				ID: "pool/parent/manual-source@manual", Name: "manual", Dataset: "pool/parent/manual-source",
+				ResourceQuery: true,
+				UserProperties: map[string]truenas.UserProperty{
+					PropManagedResource: {Value: "true", Source: "inherited from pool/parent/manual-source"},
+				},
+			},
+		},
+		{
+			name: "legacy managed snapshot derives source from dataset",
+			snapshot: &truenas.Snapshot{
+				ID: "pool/parent/legacy-source@legacy", Name: "legacy", Dataset: "pool/parent/legacy-source",
+				UserProperties: map[string]truenas.UserProperty{
+					PropManagedResource: {Value: "true"},
+				},
+			},
+			wantEntry:  true,
+			wantSource: "legacy-source",
+			filter:     "legacy-source",
+			wantBlocks: true,
+		},
+		{
+			name: "tombstone is excluded even when identity properties survive",
+			snapshot: &truenas.Snapshot{
+				ID: "pool/parent/source@restore-point-csi-deleted-42", Name: "restore-point-csi-deleted-42", Dataset: "pool/parent/source",
+				ResourceQuery: true,
+				UserProperties: map[string]truenas.UserProperty{
+					PropManagedResource:           {Value: "true"},
+					PropCSISnapshotName:           {Value: "restore-point"},
+					PropCSISnapshotSourceVolumeID: {Value: "source"},
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := snapshotListEntry(tc.snapshot, tc.filter)
+			assert.Equal(t, tc.wantBlocks, snapshotBlocksVolumeDeletion(tc.snapshot))
+			if !tc.wantEntry {
+				assert.Nil(t, entry)
+				return
+			}
+			require.NotNil(t, entry)
+			assert.Equal(t, tc.wantSource, entry.GetSnapshot().GetSourceVolumeId())
+		})
+	}
+}
+
+func TestCreateSnapshotSurvivesTrueNAS26UpdateNoOp(t *testing.T) {
+	client := truenas.NewMockClient()
+	client.SimulateUpdateNoOp = true
+	_, err := client.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+		Name: "pool/parent/source", Type: "FILESYSTEM",
+	})
+	require.NoError(t, err)
+	d := &Driver{
+		config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}},
+		truenasClient: client,
+	}
+
+	_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+		Name: "inline-properties", SourceVolumeId: "source",
+	})
+	require.NoError(t, err)
+	snap, err := client.SnapshotGet(context.Background(), "pool/parent/source@inline-properties")
+	require.NoError(t, err)
+	assert.Equal(t, "true", snap.UserProperties[PropManagedResource].Value)
+	assert.Equal(t, "inline-properties", snap.UserProperties[PropCSISnapshotName].Value)
+	assert.Equal(t, "source", snap.UserProperties[PropCSISnapshotSourceVolumeID].Value)
 }
 
 // TestCreateSnapshot_RestoreSize verifies that CreateSnapshot returns the correct
@@ -878,8 +961,8 @@ type snapshotWithUsedBytesMock struct {
 	usedBytes int64
 }
 
-func (m *snapshotWithUsedBytesMock) SnapshotCreate(ctx context.Context, dataset, name string) (*truenas.Snapshot, error) {
-	snap, err := m.MockClient.SnapshotCreate(ctx, dataset, name)
+func (m *snapshotWithUsedBytesMock) SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*truenas.Snapshot, error) {
+	snap, err := m.MockClient.SnapshotCreate(ctx, dataset, name, userProperties)
 	if err != nil {
 		return nil, err
 	}
@@ -930,8 +1013,8 @@ type datasetGetFailMock struct {
 	snapCreated    bool
 }
 
-func (m *datasetGetFailMock) SnapshotCreate(ctx context.Context, dataset, name string) (*truenas.Snapshot, error) {
-	snap, err := m.MockClient.SnapshotCreate(ctx, dataset, name)
+func (m *datasetGetFailMock) SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*truenas.Snapshot, error) {
+	snap, err := m.MockClient.SnapshotCreate(ctx, dataset, name, userProperties)
 	if err == nil {
 		m.snapCreated = true
 	}
