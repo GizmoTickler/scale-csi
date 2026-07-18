@@ -20,6 +20,7 @@ type MockClient struct {
 	ISCSITargets      map[int]*ISCSITarget
 	ISCSIExtents      map[int]*ISCSIExtent
 	TargetExtents     map[int]*ISCSITargetExtent
+	NVMeHosts         map[string]*NVMeoFHost
 	NVMeSubsystems    map[int]*NVMeoFSubsystem
 	NVMeNamespaces    map[int]*NVMeoFNamespace
 	ISCSIPortals      map[int]*ISCSIPortal
@@ -43,6 +44,7 @@ func NewMockClient() *MockClient {
 		ISCSITargets:   make(map[int]*ISCSITarget),
 		ISCSIExtents:   make(map[int]*ISCSIExtent),
 		TargetExtents:  make(map[int]*ISCSITargetExtent),
+		NVMeHosts:      make(map[string]*NVMeoFHost),
 		NVMeSubsystems: make(map[int]*NVMeoFSubsystem),
 		NVMeNamespaces: make(map[int]*NVMeoFNamespace),
 		// Default portal/initiator fixtures cover the portal addresses used
@@ -819,17 +821,67 @@ func (m *MockClient) ISCSIGlobalConfigGet(ctx context.Context) (*ISCSIGlobalConf
 }
 
 // NVMe-oF methods (updated for TrueNAS SCALE 25.10+)
+func (m *MockClient) NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*NVMeoFHost, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	return m.NVMeHosts[nqn], nil
+}
+
+func (m *MockClient) NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFHost, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	if existing := m.NVMeHosts[nqn]; existing != nil {
+		return existing, nil
+	}
+	id := 1
+	for _, host := range m.NVMeHosts {
+		if host.ID >= id {
+			id = host.ID + 1
+		}
+	}
+	host := &NVMeoFHost{ID: id, HostNQN: nqn}
+	m.NVMeHosts[nqn] = host
+	return host, nil
+}
+
 func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	if !allowAnyHost {
+		if len(hostIDs) == 0 {
+			return nil, fmt.Errorf("restricted NVMe-oF subsystem requires at least one host ID")
+		}
+		for _, hostID := range hostIDs {
+			found := false
+			for _, host := range m.NVMeHosts {
+				if host.ID == hostID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("NVMe-oF host ID %d not found", hostID)
+			}
+		}
+	}
 
 	id := len(m.NVMeSubsystems) + 1
+	hosts := append([]int(nil), hostIDs...)
 	sub := &NVMeoFSubsystem{
 		ID:           id,
 		Name:         name,
 		NQN:          fmt.Sprintf("nqn.2011-06.com.truenas:%s", name), // Mock auto-generated NQN
 		AllowAnyHost: allowAnyHost,
-		Hosts:        hostIDs,
+		Hosts:        hosts,
 	}
 	m.NVMeSubsystems[id] = sub
 	return sub, nil

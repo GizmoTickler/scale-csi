@@ -220,7 +220,8 @@ nvmeof:
   # Target port
   port: 4420
 
-  # Allowed host NQNs. Used when subsystemAllowAnyHost is false.
+  # Allowed host NQNs. Used when subsystemAllowAnyHost is false. Include the
+  # contents of /etc/nvme/hostnqn from every Kubernetes node that may connect.
   subsystemHosts: []
 
   # Allow any host NQN to connect. Restrict this in production.

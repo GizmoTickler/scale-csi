@@ -100,6 +100,11 @@ type Driver struct {
 	// iscsi.targetGroups is not configured; see resolveISCSITargetGroup.
 	iscsiGroupMu       sync.Mutex
 	iscsiResolvedGroup *truenas.ISCSITargetGroup
+
+	// Cached TrueNAS NVMe-oF host IDs keyed by initiator NQN. Resolution is
+	// serialized so concurrent volume creates do not race to create one host.
+	nvmeHostMu        sync.Mutex
+	nvmeResolvedHosts map[string]int
 }
 
 // newTrueNASClient constructs the TrueNAS API client; tests override it to
@@ -205,6 +210,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		healthPort:             cfg.HealthPort,
 		eventRecorder:          eventRecorder,
 		serviceReloadDebouncer: serviceDebouncer,
+		nvmeResolvedHosts:      make(map[string]int),
 	}, nil
 }
 

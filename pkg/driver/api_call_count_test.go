@@ -334,6 +334,16 @@ func (c *apiCallCountingClient) ISCSIGlobalConfigGet(ctx context.Context) (*true
 	return c.MockClient.ISCSIGlobalConfigGet(ctx)
 }
 
+func (c *apiCallCountingClient) NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*truenas.NVMeoFHost, error) {
+	c.record("NVMeoFHostFindByNQN")
+	return c.MockClient.NVMeoFHostFindByNQN(ctx, nqn)
+}
+
+func (c *apiCallCountingClient) NVMeoFHostCreate(ctx context.Context, nqn string) (*truenas.NVMeoFHost, error) {
+	c.record("NVMeoFHostCreate")
+	return c.MockClient.NVMeoFHostCreate(ctx, nqn)
+}
+
 func (c *apiCallCountingClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*truenas.NVMeoFSubsystem, error) {
 	c.record("NVMeoFSubsystemCreate")
 	return c.MockClient.NVMeoFSubsystemCreate(ctx, name, allowAnyHost, hostIDs)

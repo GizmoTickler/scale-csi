@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -50,6 +52,36 @@ type nvmeDeleteAssociationCountingMock struct {
 	*truenas.MockClient
 	portSubsysListCalls   int
 	portSubsysDeleteCalls int
+}
+
+type nvmeHostCountingMock struct {
+	*truenas.MockClient
+	hostFindCalls       int
+	hostCreateCalls     int
+	subsystemAllowAny   []bool
+	subsystemHostIDs    [][]int
+	subsystemCreateFail error
+}
+
+func (m *nvmeHostCountingMock) NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*truenas.NVMeoFHost, error) {
+	m.hostFindCalls++
+	return m.MockClient.NVMeoFHostFindByNQN(ctx, nqn)
+}
+
+func (m *nvmeHostCountingMock) NVMeoFHostCreate(ctx context.Context, nqn string) (*truenas.NVMeoFHost, error) {
+	m.hostCreateCalls++
+	return m.MockClient.NVMeoFHostCreate(ctx, nqn)
+}
+
+func (m *nvmeHostCountingMock) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*truenas.NVMeoFSubsystem, error) {
+	m.subsystemAllowAny = append(m.subsystemAllowAny, allowAnyHost)
+	m.subsystemHostIDs = append(m.subsystemHostIDs, append([]int(nil), hostIDs...))
+	if m.subsystemCreateFail != nil {
+		err := m.subsystemCreateFail
+		m.subsystemCreateFail = nil
+		return nil, err
+	}
+	return m.MockClient.NVMeoFSubsystemCreate(ctx, name, allowAnyHost, hostIDs)
 }
 
 func (m *nvmeDeleteAssociationCountingMock) NVMeoFPortSubsysList(ctx context.Context) ([]*truenas.NVMeoFPortSubsys, error) {
@@ -552,9 +584,10 @@ func TestCreateNVMeoFShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testin
 		config: &Config{
 			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
 			NVMeoF: NVMeoFConfig{
-				Transport:          "TCP",
-				TransportAddress:   "10.0.0.10",
-				TransportServiceID: 4420,
+				Transport:             "TCP",
+				TransportAddress:      "10.0.0.10",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: true,
 			},
 		},
 		truenasClient: mockClient,
@@ -577,6 +610,128 @@ func TestCreateNVMeoFShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testin
 		PropNVMeoFPortSubsysID: "1",
 		PropNVMeoFNamespaceID:  "1",
 	}, mockClient.propertyUpdates[0])
+}
+
+func TestCreateNVMeoFShareAllowAnyHostSkipsHostResolution(t *testing.T) {
+	mockClient := &nvmeHostCountingMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
+			NVMeoF: NVMeoFConfig{
+				Transport:             "TCP",
+				TransportAddress:      "10.0.0.10",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: true,
+				SubsystemHosts:        []string{"nqn.ignored.when.allow-any-is-enabled"},
+			},
+		},
+		truenasClient: mockClient,
+	}
+	ctx := context.Background()
+	datasetName := "tank/k8s/volumes/allow-any-nvme"
+	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "VOLUME", Volsize: 1024 * 1024 * 1024,
+	})
+	require.NoError(t, err)
+
+	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "allow-any-nvme", true, true)
+	require.NoError(t, err)
+	assert.Zero(t, mockClient.hostFindCalls)
+	assert.Zero(t, mockClient.hostCreateCalls)
+	require.Equal(t, []bool{true}, mockClient.subsystemAllowAny)
+	require.Len(t, mockClient.subsystemHostIDs, 1)
+	assert.Empty(t, mockClient.subsystemHostIDs[0])
+}
+
+func TestCreateNVMeoFShareRestrictedHostsResolveAndCache(t *testing.T) {
+	baseClient := truenas.NewMockClient()
+	existingNQN := "nqn.2014-08.org.nvmexpress:existing-node"
+	createdNQN := "nqn.2014-08.org.nvmexpress:new-node"
+	existingHost, err := baseClient.NVMeoFHostCreate(context.Background(), existingNQN)
+	require.NoError(t, err)
+	mockClient := &nvmeHostCountingMock{MockClient: baseClient}
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
+			NVMeoF: NVMeoFConfig{
+				Transport:             "TCP",
+				TransportAddress:      "10.0.0.10",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: false,
+				SubsystemHosts:        []string{existingNQN, createdNQN},
+			},
+		},
+		truenasClient: mockClient,
+	}
+	ctx := context.Background()
+
+	for _, volume := range []string{"restricted-nvme-1", "restricted-nvme-2"} {
+		datasetName := "tank/k8s/volumes/" + volume
+		ds, createErr := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: datasetName, Type: "VOLUME", Volsize: 1024 * 1024 * 1024,
+		})
+		require.NoError(t, createErr)
+		require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, volume, true, true))
+	}
+
+	createdHost := baseClient.NVMeHosts[createdNQN]
+	require.NotNil(t, createdHost)
+	assert.Equal(t, 2, mockClient.hostFindCalls)
+	assert.Equal(t, 1, mockClient.hostCreateCalls)
+	assert.Equal(t, []bool{false, false}, mockClient.subsystemAllowAny)
+	require.Len(t, mockClient.subsystemHostIDs, 2)
+	assert.Equal(t, []int{existingHost.ID, createdHost.ID}, mockClient.subsystemHostIDs[0])
+	assert.Equal(t, mockClient.subsystemHostIDs[0], mockClient.subsystemHostIDs[1])
+}
+
+func TestCreateNVMeoFShareRestrictedHostsRequiresNQN(t *testing.T) {
+	d := &Driver{
+		config:        &Config{NVMeoF: NVMeoFConfig{SubsystemAllowAnyHost: false}},
+		truenasClient: truenas.NewMockClient(),
+	}
+
+	err := d.createNVMeoFShareForDataset(context.Background(), nil, "tank/k8s/volumes/restricted-empty", "restricted-empty", true, true)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty")
+	assert.Contains(t, err.Error(), "set allow-any-host or provide at least one host NQN")
+}
+
+func TestCreateNVMeoFShareRestrictedHostsInvalidatesCacheOnSubsystemError(t *testing.T) {
+	nqn := "nqn.2014-08.org.nvmexpress:retry-node"
+	mockClient := &nvmeHostCountingMock{
+		MockClient:          truenas.NewMockClient(),
+		subsystemCreateFail: fmt.Errorf("stale host ID"),
+	}
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
+			NVMeoF: NVMeoFConfig{
+				Transport:             "TCP",
+				TransportAddress:      "10.0.0.10",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: false,
+				SubsystemHosts:        []string{nqn},
+			},
+		},
+		truenasClient: mockClient,
+	}
+	ctx := context.Background()
+
+	firstDataset := "tank/k8s/volumes/restricted-retry-1"
+	first, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: firstDataset, Type: "VOLUME"})
+	require.NoError(t, err)
+	err = d.createNVMeoFShareForDataset(ctx, first, firstDataset, "restricted-retry-1", true, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stale host ID")
+
+	secondDataset := "tank/k8s/volumes/restricted-retry-2"
+	second, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: secondDataset, Type: "VOLUME"})
+	require.NoError(t, err)
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, second, secondDataset, "restricted-retry-2", true, true))
+
+	assert.Equal(t, 2, mockClient.hostFindCalls, "retry must re-query after cache invalidation")
+	assert.Equal(t, 1, mockClient.hostCreateCalls, "existing host record must be reused on retry")
 }
 
 // =============================================================================

@@ -250,8 +250,12 @@ use `--worker-threads`.
 - `nfs.shareAllowedNetworks: []` preserves the driver default but permits mounts
   from any network. Set explicit trusted CIDRs in production.
 - `nvmeof.subsystemAllowAnyHost: true` preserves the driver default but permits
-  any host NQN. Set it to `false` and populate `nvmeof.subsystemHosts` in
-  production.
+  any host NQN. To restrict access, set it to `false` and populate
+  `nvmeof.subsystemHosts` with `/etc/nvme/hostnqn` from every Kubernetes node
+  that may connect. The controller resolves those NQNs to TrueNAS host IDs but
+  does not auto-discover node NQNs. An empty list in restricted mode fails
+  provisioning. Keep network segmentation in place; host allowlisting is an
+  additional control, not a replacement.
 - Prefer an externally managed Secret and set `truenas.existingSecret`; the
   Secret must contain `api-key`.
 

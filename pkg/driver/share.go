@@ -121,6 +121,61 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	return group, nil
 }
 
+// resolveNVMeoFHostIDs resolves configured initiator NQNs to TrueNAS host IDs.
+// The mutex makes resolution single-flight within a driver instance; only
+// successful resolutions are cached so API failures are retried.
+func (d *Driver) resolveNVMeoFHostIDs(ctx context.Context, nqns []string) ([]int, error) {
+	d.nvmeHostMu.Lock()
+	defer d.nvmeHostMu.Unlock()
+	if d.nvmeResolvedHosts == nil {
+		d.nvmeResolvedHosts = make(map[string]int)
+	}
+
+	hostIDs := make([]int, 0, len(nqns))
+	seen := make(map[string]struct{}, len(nqns))
+	for _, nqn := range nqns {
+		if _, duplicate := seen[nqn]; duplicate {
+			continue
+		}
+		seen[nqn] = struct{}{}
+
+		if hostID, ok := d.nvmeResolvedHosts[nqn]; ok {
+			hostIDs = append(hostIDs, hostID)
+			continue
+		}
+
+		host, err := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
+		if err != nil {
+			delete(d.nvmeResolvedHosts, nqn)
+			return nil, fmt.Errorf("failed to find NVMe-oF host %q: %w", nqn, err)
+		}
+		if host == nil {
+			host, err = d.truenasClient.NVMeoFHostCreate(ctx, nqn)
+			if err != nil {
+				delete(d.nvmeResolvedHosts, nqn)
+				return nil, fmt.Errorf("failed to create NVMe-oF host %q: %w", nqn, err)
+			}
+		}
+		if host.ID <= 0 {
+			delete(d.nvmeResolvedHosts, nqn)
+			return nil, fmt.Errorf("resolved NVMe-oF host %q has invalid ID %d", nqn, host.ID)
+		}
+
+		d.nvmeResolvedHosts[nqn] = host.ID
+		hostIDs = append(hostIDs, host.ID)
+	}
+
+	return hostIDs, nil
+}
+
+func (d *Driver) invalidateNVMeoFHostIDs(nqns []string) {
+	d.nvmeHostMu.Lock()
+	defer d.nvmeHostMu.Unlock()
+	for _, nqn := range nqns {
+		delete(d.nvmeResolvedHosts, nqn)
+	}
+}
+
 func datasetUserProperty(ds *truenas.Dataset, key string) string {
 	if ds == nil {
 		return ""
@@ -688,6 +743,10 @@ func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 }
 
 func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool) error {
+	if !d.config.NVMeoF.SubsystemAllowAnyHost && len(d.config.NVMeoF.SubsystemHosts) == 0 {
+		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
+	}
+
 	var err error
 	ds, err = d.datasetForProperties(ctx, ds, datasetName)
 	if err != nil {
@@ -723,15 +782,25 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		klog.V(4).Infof("Skipping zvol wait for %s (already verified ready)", datasetName)
 	}
 
-	// Create subsystem (TrueNAS 25.10+: serial is auto-generated, hosts are IDs not NQNs)
-	// Note: SubsystemHosts config is ignored in 25.10+ - use allow_any_host or configure hosts separately
+	var hostIDs []int
+	if !d.config.NVMeoF.SubsystemAllowAnyHost {
+		hostIDs, err = d.resolveNVMeoFHostIDs(ctx, d.config.NVMeoF.SubsystemHosts)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem hosts: %v", err)
+		}
+	}
+
+	// Create subsystem (TrueNAS 25.10+: serial is auto-generated, hosts are IDs not NQNs).
 	subsys, err := d.truenasClient.NVMeoFSubsystemCreate(
 		ctx,
 		subsysName,
 		d.config.NVMeoF.SubsystemAllowAnyHost,
-		nil, // Host IDs - not used when allow_any_host is true
+		hostIDs,
 	)
 	if err != nil {
+		if len(hostIDs) > 0 {
+			d.invalidateNVMeoFHostIDs(d.config.NVMeoF.SubsystemHosts)
+		}
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF subsystem: %v", err)
 	}
 

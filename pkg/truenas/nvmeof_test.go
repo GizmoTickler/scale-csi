@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -13,6 +14,162 @@ import (
 // =============================================================================
 // Parser Tests - These test the internal parsing logic for NVMe-oF
 // =============================================================================
+
+func TestParseNVMeoFHost(t *testing.T) {
+	host, err := parseNVMeoFHost(map[string]interface{}{
+		"id":      float64(17),
+		"hostnqn": "nqn.2014-08.org.nvmexpress:NVMf:node-1",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 17, host.ID)
+	assert.Equal(t, "nqn.2014-08.org.nvmexpress:NVMf:node-1", host.HostNQN)
+
+	_, err = parseNVMeoFHost("not a host")
+	require.Error(t, err)
+}
+
+func TestNVMeoFHostFindByNQN_UsesExactFilter(t *testing.T) {
+	mock := newMockWSServer()
+	paramsSeen := make(chan []interface{}, 1)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "nvmet.host.query":
+				paramsSeen <- req.Params
+				resp.Result = []interface{}{map[string]interface{}{
+					"id":      float64(17),
+					"hostnqn": "nqn.2014-08.org.nvmexpress:node-1",
+				}}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	host, err := client.NVMeoFHostFindByNQN(context.Background(), "nqn.2014-08.org.nvmexpress:node-1")
+	require.NoError(t, err)
+	require.NotNil(t, host)
+	assert.Equal(t, 17, host.ID)
+	assert.Equal(t, "nqn.2014-08.org.nvmexpress:node-1", host.HostNQN)
+
+	params := <-paramsSeen
+	filters := params[0].([]interface{})
+	assert.Equal(t, []interface{}{"hostnqn", "=", "nqn.2014-08.org.nvmexpress:node-1"}, filters[0])
+}
+
+func TestNVMeoFHostCreate_PassesNQNThrough(t *testing.T) {
+	mock := newMockWSServer()
+	paramsSeen := make(chan []interface{}, 1)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "system.info":
+				resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-26.0.0"}
+			case "nvmet.host.create":
+				paramsSeen <- req.Params
+				resp.Result = map[string]interface{}{
+					"id":      float64(23),
+					"hostnqn": "nqn.2014-08.org.nvmexpress:NVMf:node-2",
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	host, err := client.NVMeoFHostCreate(context.Background(), "nqn.2014-08.org.nvmexpress:NVMf:node-2")
+	require.NoError(t, err)
+	require.NotNil(t, host)
+	assert.Equal(t, 23, host.ID)
+	assert.Equal(t, "nqn.2014-08.org.nvmexpress:NVMf:node-2", host.HostNQN)
+
+	params := <-paramsSeen
+	assert.Equal(t, "nqn.2014-08.org.nvmexpress:NVMf:node-2", params[0].(map[string]interface{})["hostnqn"])
+}
+
+func TestNVMeoFSubsystemCreate_HostPayloads(t *testing.T) {
+	tests := []struct {
+		name         string
+		allowAnyHost bool
+		hostIDs      []int
+		wantHosts    bool
+	}{
+		{name: "restricted hosts", allowAnyHost: false, hostIDs: []int{17, 23}, wantHosts: true},
+		{name: "allow any host unchanged", allowAnyHost: true, hostIDs: nil, wantHosts: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := newMockWSServer()
+			paramsSeen := make(chan []interface{}, 1)
+			server := mock.start(func(conn *websocket.Conn) {
+				for {
+					var req rpcTestRequest
+					if err := conn.ReadJSON(&req); err != nil {
+						return
+					}
+					resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+					switch req.Method {
+					case "auth.login_with_api_key":
+						resp.Result = true
+					case "system.info":
+						resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-26.0.0"}
+					case "nvmet.subsys.create":
+						paramsSeen <- req.Params
+						resp.Result = map[string]interface{}{
+							"id":             float64(31),
+							"name":           "pvc-test",
+							"subnqn":         "nqn.2011-06.com.truenas:pvc-test",
+							"allow_any_host": tt.allowAnyHost,
+							"hosts":          []interface{}{float64(17), float64(23)},
+						}
+					default:
+						resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+					}
+					if err := conn.WriteJSON(resp); err != nil {
+						return
+					}
+				}
+			})
+			defer mock.close()
+			client := newSnapshotTestClient(t, server.URL)
+
+			_, err := client.NVMeoFSubsystemCreate(context.Background(), "pvc-test", tt.allowAnyHost, tt.hostIDs)
+			require.NoError(t, err)
+			params := (<-paramsSeen)[0].(map[string]interface{})
+			assert.Equal(t, tt.allowAnyHost, params["allow_any_host"])
+			_, hasHosts := params["hosts"]
+			assert.Equal(t, tt.wantHosts, hasHosts)
+			if tt.wantHosts {
+				assert.Equal(t, []interface{}{float64(17), float64(23)}, params["hosts"])
+			}
+		})
+	}
+}
 
 func TestParseNVMeoFSubsystem_AllFields(t *testing.T) {
 	tests := []struct {
@@ -453,6 +610,32 @@ func TestMockClient_NVMeoFSubsystemCreate_Success(t *testing.T) {
 	assert.True(t, subsys.AllowAnyHost)
 	// Mock generates NQN
 	assert.Contains(t, subsys.NQN, "pvc-test-subsys")
+}
+
+func TestMockClient_NVMeoFRestrictedSubsystemUsesKnownHosts(t *testing.T) {
+	client := NewMockClient()
+	ctx := context.Background()
+	nqn := "nqn.2014-08.org.nvmexpress:NVMf:restricted-node"
+
+	found, err := client.NVMeoFHostFindByNQN(ctx, nqn)
+	require.NoError(t, err)
+	assert.Nil(t, found)
+
+	host, err := client.NVMeoFHostCreate(ctx, nqn)
+	require.NoError(t, err)
+	found, err = client.NVMeoFHostFindByNQN(ctx, nqn)
+	require.NoError(t, err)
+	assert.Equal(t, host, found)
+
+	subsys, err := client.NVMeoFSubsystemCreate(ctx, "restricted-subsys", false, []int{host.ID})
+	require.NoError(t, err)
+	assert.False(t, subsys.AllowAnyHost)
+	assert.Equal(t, []int{host.ID}, subsys.Hosts)
+
+	_, err = client.NVMeoFSubsystemCreate(ctx, "empty-restricted", false, nil)
+	require.Error(t, err)
+	_, err = client.NVMeoFSubsystemCreate(ctx, "unknown-host", false, []int{999})
+	require.Error(t, err)
 }
 
 func TestMockClient_NVMeoFSubsystemCreate_MultipleSubsystems(t *testing.T) {

@@ -311,7 +311,8 @@ func createTestDriver(t *testing.T, protocol string) (*Driver, *truenas.MockClie
 			TargetPortal: "192.168.1.100:3260",
 		},
 		NVMeoF: NVMeoFConfig{
-			TransportAddress: "192.168.1.100",
+			TransportAddress:      "192.168.1.100",
+			SubsystemAllowAnyHost: true,
 		},
 	}
 

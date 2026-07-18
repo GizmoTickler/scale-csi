@@ -99,12 +99,15 @@ timeouts under `commandTimeouts`.
   `truenas.apiKey`. Rotate the TrueNAS key and Secret together.
 - Set `nfs.shareAllowedNetworks` to the node CIDRs. Its empty default permits all
   networks accepted by TrueNAS for each dynamically created share.
-- NVMe-oF host-NQN allowlisting is not functional in v1.2.0. Although the chart
-  renders `nvmeof.subsystemHosts`, the 25.10+ create path does not resolve those
-  NQNs to TrueNAS host IDs and passes no hosts. The default
-  `nvmeof.subsystemAllowAnyHost: true` permits any host; setting it to `false`
-  without separately managing host associations can create an unusable
-  subsystem. Do not expose driver-managed NVMe-oF to an untrusted network.
+- The default `nvmeof.subsystemAllowAnyHost: true` permits any initiator host
+  NQN. To restrict access, set it to `false` and populate
+  `nvmeof.subsystemHosts` with the contents of `/etc/nvme/hostnqn` from every
+  Kubernetes node that may use the StorageClass. The controller resolves or
+  creates the corresponding TrueNAS host records and associates their IDs with
+  each new subsystem. It does not auto-discover node NQNs; restricted mode with
+  an empty host list fails provisioning rather than creating an unreachable
+  subsystem. Host-NQN controls complement, but do not replace, network
+  segmentation and filtering for the NVMe-oF listener.
 - The chart's controller and node service accounts are separate, but both use
   ClusterRoles. The controller role can list Secrets cluster-wide for CSI
   sidecars. For strict least privilege, supply audited service accounts and
@@ -198,11 +201,11 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   passes for NFS (75/75), iSCSI (real iscsiadm logins, device staging, mkfs,
   mounts), and NVMe-oF (real fabric connects). Tests named `e2e` in this
   repository use `MockClient`.
-- NVMe-oF on TrueNAS 25.10+ REQUIRES `nvmeof.subsystemAllowAnyHost: true`:
-  per-host NQN allowlisting is ignored by the middleware (see above), so
-  subsystems without allow-any-host reject every fabric connect with
-  "failed to write to nvme-fabrics device" (validated live). Use network
-  segmentation (VLANs/SGACLs) as the effective access control for 4420.
+- NVMe-oF host-NQN allowlisting is configured statically at the controller.
+  The driver does not discover `/etc/nvme/hostnqn` from nodes, so operators must
+  keep `nvmeof.subsystemHosts` synchronized with every node that may connect.
+  Continue to use network segmentation (for example VLANs or SGACLs) to protect
+  the NVMe-oF listener; host allowlisting is an additional control.
 - A TrueNAS NVMe-oF listener only materializes on a configured port once at
   least one subsystem is associated with it — a bare port shows no kernel
   listener, which is normal and self-resolves on first volume creation.

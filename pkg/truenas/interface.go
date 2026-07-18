@@ -84,6 +84,8 @@ type ClientInterface interface {
 	ISCSIGlobalConfigGet(ctx context.Context) (*ISCSIGlobalConfig, error)
 
 	// NVMe-oF methods (updated for TrueNAS SCALE 25.10+)
+	NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*NVMeoFHost, error)
+	NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFHost, error)
 	NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemDelete(ctx context.Context, id int) error
 	NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error)

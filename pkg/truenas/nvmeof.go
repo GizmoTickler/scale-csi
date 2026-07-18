@@ -22,6 +22,12 @@ type NVMeoFSubsystem struct {
 	Ports        []int  `json:"ports"` // Port IDs (new in 25.10)
 }
 
+// NVMeoFHost represents an NVMe-oF initiator host from the TrueNAS API.
+type NVMeoFHost struct {
+	ID      int    `json:"id"`
+	HostNQN string `json:"hostnqn"`
+}
+
 // NVMeoFNamespace represents an NVMe-oF namespace from the TrueNAS API.
 // Updated for TrueNAS SCALE 25.10+ API changes.
 type NVMeoFNamespace struct {
@@ -62,8 +68,11 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 		"name":           name,
 		"allow_any_host": allowAnyHost,
 	}
-	// Note: In 25.10+, hosts are referenced by ID, not NQN string
-	// Host IDs must be created first via nvmet.host.create if access control is needed
+	// In 25.10+, hosts are referenced by ID, not NQN string. Preserve the
+	// allow-any-host request shape by only sending hosts when IDs were supplied.
+	if len(hostIDs) > 0 {
+		params["hosts"] = hostIDs
+	}
 
 	result, err := c.Call(ctx, "nvmet.subsys.create", params)
 	if err != nil {
@@ -84,6 +93,36 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 	}
 
 	return parseNVMeoFSubsystem(result)
+}
+
+// NVMeoFHostFindByNQN finds an NVMe-oF host by its exact host NQN.
+func (c *Client) NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*NVMeoFHost, error) {
+	filters := [][]interface{}{{"hostnqn", "=", nqn}}
+	result, err := c.Call(ctx, "nvmet.host.query", filters, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query NVMe-oF hosts: %w", err)
+	}
+
+	hosts, ok := result.([]interface{})
+	if !ok || len(hosts) == 0 {
+		return nil, nil
+	}
+
+	return parseNVMeoFHost(hosts[0])
+}
+
+// NVMeoFHostCreate creates an NVMe-oF initiator host for the supplied NQN.
+func (c *Client) NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFHost, error) {
+	if err := c.CheckNVMeoFSupport(ctx); err != nil {
+		return nil, err
+	}
+
+	result, err := c.Call(ctx, "nvmet.host.create", map[string]interface{}{"hostnqn": nqn})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create NVMe-oF host: %w", err)
+	}
+
+	return parseNVMeoFHost(result)
 }
 
 // NVMeoFSubsystemDelete deletes an NVMe-oF subsystem.
@@ -722,6 +761,24 @@ func parseNVMeoFSubsystem(data interface{}) (*NVMeoFSubsystem, error) {
 	}
 
 	return subsys, nil
+}
+
+// parseNVMeoFHost converts a raw API response to NVMeoFHost.
+func parseNVMeoFHost(data interface{}) (*NVMeoFHost, error) {
+	m, ok := data.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected NVMe-oF host format")
+	}
+
+	host := &NVMeoFHost{}
+	if v, ok := m["id"].(float64); ok {
+		host.ID = int(v)
+	}
+	if v, ok := m["hostnqn"].(string); ok {
+		host.HostNQN = v
+	}
+
+	return host, nil
 }
 
 // parseNVMeoFNamespace converts raw API response to NVMeoFNamespace.
