@@ -292,13 +292,20 @@ func (c *Client) queryPoolDatasetOrigins(ctx context.Context, pool string) (map[
 }
 
 func datasetPropertyString(property DatasetProperty) string {
+	// Prefer parsed/rawvalue: TrueNAS 26.0 UPPERCASES the display-oriented
+	// "value" field for some properties (observed live on origin:
+	// value=FLASHSTOR/...@SNAPSHOT-... while parsed/rawvalue keep true case),
+	// which breaks identity comparisons against real ZFS names.
+	if parsed, ok := property.Parsed.(string); ok && parsed != "" {
+		return parsed
+	}
+	if property.Rawvalue != "" {
+		return property.Rawvalue
+	}
 	if value, ok := property.Value.(string); ok && value != "" {
 		return value
 	}
-	if parsed, ok := property.Parsed.(string); ok {
-		return parsed
-	}
-	return property.Rawvalue
+	return ""
 }
 
 // DatasetSetUserProperty sets a user property on a dataset.

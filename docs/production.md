@@ -193,10 +193,19 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   iSCSI runs the controller portion of `csi-sanity`; NVMe-oF has unit/controller
   tests but no protocol-specific sanity suite. Neither substitutes for node tests
   with real block devices and a real target.
-- Live validation against a real TrueNAS 26.0 appliance covers the controller
-  plane only (csi-sanity controller suites, NFS and iSCSI, 52/52 each). Node
-  stage/publish against real initiators and NVMe-oF live behavior remain
-  unvalidated. Tests named `e2e` in this repository use `MockClient`.
+- Live validation against a real TrueNAS 26.0 appliance now covers the full
+  node plane on a real initiator host: csi-sanity including Node Service specs
+  passes for NFS (75/75), iSCSI (real iscsiadm logins, device staging, mkfs,
+  mounts), and NVMe-oF (real fabric connects). Tests named `e2e` in this
+  repository use `MockClient`.
+- NVMe-oF on TrueNAS 25.10+ REQUIRES `nvmeof.subsystemAllowAnyHost: true`:
+  per-host NQN allowlisting is ignored by the middleware (see above), so
+  subsystems without allow-any-host reject every fabric connect with
+  "failed to write to nvme-fabrics device" (validated live). Use network
+  segmentation (VLANs/SGACLs) as the effective access control for 4420.
+- A TrueNAS NVMe-oF listener only materializes on a configured port once at
+  least one subsystem is associated with it — a bare port shows no kernel
+  listener, which is normal and self-resolves on first volume creation.
 - `ControllerModifyVolume` returns `Unimplemented`. CSI volume group snapshot
   services are not registered or implemented.
 - CSI volume and snapshot names share `sanitizeVolumeID`: `/` and spaces become

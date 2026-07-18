@@ -1858,3 +1858,23 @@ func BenchmarkParseDataset(b *testing.B) {
 		_, _ = parseDataset(data)
 	}
 }
+
+// TestDatasetPropertyStringPrefersTrueCase pins the TrueNAS 26.0 quirk where
+// the display-oriented "value" field is UPPERCASED (observed live on origin),
+// which must never win over parsed/rawvalue for identity comparisons.
+func TestDatasetPropertyStringPrefersTrueCase(t *testing.T) {
+	got := datasetPropertyString(DatasetProperty{
+		Parsed:   "flashstor/csi-e2e/pvc-a@snapshot-b",
+		Rawvalue: "flashstor/csi-e2e/pvc-a@snapshot-b",
+		Value:    "FLASHSTOR/CSI-E2E/PVC-A@SNAPSHOT-B",
+	})
+	if got != "flashstor/csi-e2e/pvc-a@snapshot-b" {
+		t.Fatalf("uppercased display value won identity comparison: %q", got)
+	}
+	if got := datasetPropertyString(DatasetProperty{Value: "only-value"}); got != "only-value" {
+		t.Fatalf("value fallback broken: %q", got)
+	}
+	if got := datasetPropertyString(DatasetProperty{Rawvalue: "raw"}); got != "raw" {
+		t.Fatalf("rawvalue fallback broken: %q", got)
+	}
+}
