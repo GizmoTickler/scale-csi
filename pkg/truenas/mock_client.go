@@ -14,25 +14,33 @@ type MockClient struct {
 	mu sync.RWMutex
 
 	// Mock data
-	Datasets          map[string]*Dataset
-	Snapshots         map[string]*Snapshot
-	NFSShares         map[int]*NFSShare
-	ISCSITargets      map[int]*ISCSITarget
-	ISCSIExtents      map[int]*ISCSIExtent
-	TargetExtents     map[int]*ISCSITargetExtent
-	NVMeHosts         map[string]*NVMeoFHost
-	NVMeSubsystems    map[int]*NVMeoFSubsystem
-	NVMeNamespaces    map[int]*NVMeoFNamespace
-	ISCSIPortals      map[int]*ISCSIPortal
-	ISCSIInitiators   map[int]*ISCSIInitiator
-	PoolAvailable     int64
-	deferredSnapshots map[string]struct{}
+	Datasets           map[string]*Dataset
+	Snapshots          map[string]*Snapshot
+	NFSShares          map[int]*NFSShare
+	ISCSITargets       map[int]*ISCSITarget
+	ISCSIExtents       map[int]*ISCSIExtent
+	TargetExtents      map[int]*ISCSITargetExtent
+	NVMeHosts          map[string]*NVMeoFHost
+	NVMeSubsystems     map[int]*NVMeoFSubsystem
+	NVMeNamespaces     map[int]*NVMeoFNamespace
+	ISCSIPortals       map[int]*ISCSIPortal
+	ISCSIInitiators    map[int]*ISCSIInitiator
+	PoolAvailable      int64
+	deferredSnapshots  map[string]struct{}
+	DatasetDeleteCalls []DatasetDeleteCall
 
 	// Error injection
 	InjectError error
 	// SimulateUpdateNoOp models TrueNAS 26.0 pool.snapshot.update returning
 	// success without applying user-property additions or removals.
 	SimulateUpdateNoOp bool
+}
+
+// DatasetDeleteCall records the deletion mode requested by a test.
+type DatasetDeleteCall struct {
+	Name      string
+	Recursive bool
+	Force     bool
 }
 
 // NewMockClient creates a new MockClient.
@@ -155,15 +163,35 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.DatasetDeleteCalls = append(m.DatasetDeleteCalls, DatasetDeleteCall{
+		Name:      name,
+		Recursive: recursive,
+		Force:     force,
+	})
 
 	if m.InjectError != nil {
 		return m.InjectError
+	}
+	if !recursive {
+		for _, snapshot := range m.Snapshots {
+			if snapshot.Dataset == name {
+				return &APIError{Code: -1, Message: "dataset has snapshots"}
+			}
+		}
 	}
 	origin := ""
 	if dataset, ok := m.Datasets[name]; ok {
 		origin = datasetPropertyString(dataset.Origin)
 	}
 	delete(m.Datasets, name)
+	if recursive {
+		for snapshotID, snapshot := range m.Snapshots {
+			if snapshot.Dataset == name {
+				delete(m.deferredSnapshots, snapshotID)
+				delete(m.Snapshots, snapshotID)
+			}
+		}
+	}
 	if origin != "" {
 		m.reclaimDeferredSnapshotLocked(origin)
 	}

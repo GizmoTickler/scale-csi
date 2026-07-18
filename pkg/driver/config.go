@@ -97,6 +97,10 @@ type ZFSConfig struct {
 	// ZvolReadyTimeout is the timeout in seconds for waiting for a zvol to be ready
 	// after cloning operations. Increase for slow systems or large clones (default: 60)
 	ZvolReadyTimeout int `yaml:"zvolReadyTimeout"`
+
+	// DestroyForeignSnapshotsOnDelete allows recursive dataset deletion to remove
+	// snapshots that were not created by the CSI driver (default: false)
+	DestroyForeignSnapshotsOnDelete bool `yaml:"destroyForeignSnapshotsOnDelete"`
 }
 
 // NFSConfig holds NFS share configuration.
@@ -257,6 +261,10 @@ type NodeConfig struct {
 	// SessionCleanupDelay is the delay in milliseconds before retrying after cleaning up
 	// an existing session during staging (default: 500)
 	SessionCleanupDelay int `yaml:"sessionCleanupDelay"`
+
+	// MaxVolumesPerNode is the maximum number of volumes the node can publish.
+	// Zero means unlimited and is not advertised (default: 0)
+	MaxVolumesPerNode int64 `yaml:"maxVolumesPerNode"`
 }
 
 // TopologyConfig holds topology awareness configuration.
@@ -289,7 +297,7 @@ type ResilienceConfig struct {
 
 // CircuitBreakerConfig holds circuit breaker configuration.
 type CircuitBreakerConfig struct {
-	// Enabled enables the circuit breaker (default: true)
+	// Enabled enables the opt-in circuit breaker (default: false)
 	Enabled bool `yaml:"enabled"`
 
 	// FailureThreshold is the number of consecutive failures before opening the circuit (default: 5)

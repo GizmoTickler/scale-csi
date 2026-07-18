@@ -87,10 +87,11 @@ resilience:
 ```
 
 Retries apply only to connection-class failures; an ambiguous non-idempotent
-mutation is not retried. The chart disables the circuit breaker by default. If
-enabled, five consecutive failures open it for 30 seconds before half-open
-probes are admitted. These controls do not replace protocol-level mount/login
-timeouts under `commandTimeouts`.
+mutation is not retried. The circuit breaker is opt-in and disabled by default;
+connection-only retry, the API concurrency semaphore, and rate limiting provide
+the baseline protection. If enabled, five consecutive failures open it for 30
+seconds before half-open probes are admitted. These controls do not replace
+protocol-level mount/login timeouts under `commandTimeouts`.
 
 ## Security
 
@@ -99,6 +100,15 @@ timeouts under `commandTimeouts`.
   `truenas.apiKey`. Rotate the TrueNAS key and Secret together.
 - Set `nfs.shareAllowedNetworks` to the node CIDRs. Its empty default permits all
   networks accepted by TrueNAS for each dynamically created share.
+- Driver-created iSCSI targets use an allow-all initiator group and no CHAP.
+  Network segmentation (such as a VLAN or SGACL) is therefore the access-control
+  boundary for TCP 3260. The driver does not currently provide per-tenant iSCSI
+  isolation.
+- `DeleteVolume` preserves non-CSI snapshots by default, including snapshots
+  inherited from periodic-snapshot or replication tasks on the parent dataset.
+  It returns `FailedPrecondition` until those snapshots are removed or the task
+  excludes the CSI parent. Setting `zfs.destroyForeignSnapshotsOnDelete: true`
+  explicitly permits recursive deletion of the dataset and those snapshots.
 - The default `nvmeof.subsystemAllowAnyHost: true` permits any initiator host
   NQN. To restrict access, set it to `false` and populate
   `nvmeof.subsystemHosts` with each node's NVMe host NQN — obtained by running `nvme show-hostnqn` on the node (nvme-cli derives a stable NQN from the machine identity even when `/etc/nvme/hostnqn` does not exist, as on Flatcar) — for every
@@ -126,6 +136,11 @@ timeouts under `commandTimeouts`.
 Prometheus Operator users can enable `metrics.serviceMonitor.enabled`; enable
 `metrics.prometheusRule.enabled` for the bundled rules and
 `metrics.dashboards.enabled` for a Grafana sidecar-discoverable ConfigMap.
+
+Controller-side `VolumeCondition` is existence-only: `ControllerGetVolume`
+reports healthy after confirming the dataset exists, without probing protocol
+or data-path health. `NodeGetVolumeStats` supplies the real per-volume health
+condition from the node path.
 
 Watch these series:
 
@@ -192,6 +207,12 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
 ## Known limitations in v1.2.0
 
+- Driver-created iSCSI targets have no CHAP or per-tenant initiator isolation;
+  an allow-all initiator group makes storage-network segmentation the access
+  boundary for TCP 3260.
+- Foreign snapshots block `DeleteVolume` by default. Removing them or excluding
+  the CSI parent from external snapshot tasks is required unless destructive
+  cleanup is explicitly enabled with `zfs.destroyForeignSnapshotsOnDelete`.
 - Fake-command conformance does not cover the iSCSI or NVMe-oF node paths.
   iSCSI runs the controller portion of `csi-sanity`; NVMe-oF has unit/controller
   tests but no protocol-specific sanity suite. Neither substitutes for node tests

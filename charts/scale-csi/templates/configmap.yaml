@@ -34,6 +34,7 @@ data:
       {{- end }}
       zvolBlocksize: {{ .Values.zfs.zvolBlocksize | quote }}
       zvolReadyTimeout: {{ .Values.zfs.zvolReadyTimeout | default 60 }}
+      destroyForeignSnapshotsOnDelete: {{ .Values.zfs.destroyForeignSnapshotsOnDelete }}
 
     {{- if .Values.nfs.enabled }}
     # NFS configuration
@@ -100,6 +101,7 @@ data:
 
     node:
       sessionCleanupDelay: {{ .Values.node.sessionCleanupDelay }}
+      maxVolumesPerNode: {{ .Values.node.maxVolumesPerNode }}
 
     resilience:
       circuitBreaker:

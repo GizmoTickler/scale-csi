@@ -176,6 +176,17 @@ func TestNodeGetInfo(t *testing.T) {
 		require.NotNil(t, resp)
 		assert.Equal(t, "worker-node-1", resp.NodeId)
 		assert.Nil(t, resp.AccessibleTopology, "no topology should be set when disabled")
+		assert.Zero(t, resp.MaxVolumesPerNode, "zero should preserve the unlimited/unset behavior")
+	})
+
+	t.Run("WithMaxVolumesPerNode", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeISCSI)
+		d.config.Node.MaxVolumesPerNode = 32
+
+		resp, err := d.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+
+		require.NoError(t, err)
+		assert.Equal(t, int64(32), resp.MaxVolumesPerNode)
 	})
 
 	t.Run("WithTopology", func(t *testing.T) {

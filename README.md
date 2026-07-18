@@ -182,6 +182,12 @@ kubectl label namespace scale-csi pod-security.kubernetes.io/enforce=privileged
 
 ## Documentation
 
+Deletion is fail-safe by default: if a volume has snapshots that were not
+created by the CSI driver, `DeleteVolume` leaves the dataset intact. Set
+`zfs.destroyForeignSnapshotsOnDelete: true` only when those snapshots are
+deliberately disposable. To advertise a scheduler attach limit, set
+`node.maxVolumesPerNode` to a positive value; its default `0` remains unlimited.
+
 | Guide | Description |
 |-------|-------------|
 | [Architecture](docs/architecture.md) | How the driver works internally |

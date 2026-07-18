@@ -627,7 +627,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 						"volume %s has dependent snapshots that must be deleted first", volumeID)
 				}
 			}
-			// Non-CSI-managed snapshots exist, retry with recursive deletion
+			// Non-CSI-managed snapshots exist. Preserve them by default; recursive
+			// deletion is an explicit operator opt-in because it destroys snapshots
+			// with an independent lifecycle from the CSI volume.
+			if !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
+			}
 			klog.V(4).Infof("Volume %s has non-managed snapshots, deleting recursively", volumeID)
 			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); delErr != nil {
 				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, delErr)
@@ -638,7 +644,12 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 				return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", delErr)
 			}
 		case snapErr != nil:
-			// Could not check snapshots, log and try recursive delete
+			// When snapshot state cannot be verified, fail safe unless the operator
+			// explicitly allowed destructive cleanup of foreign snapshots.
+			if !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot verify snapshots for volume %s; refusing recursive delete: %v", volumeID, snapErr)
+			}
 			klog.V(4).Infof("Could not list snapshots for %s (%v), trying recursive delete", volumeID, snapErr)
 			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); delErr != nil {
 				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, delErr)
@@ -1264,6 +1275,8 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
+			// Controller-side health is existence-only. NodeGetVolumeStats performs
+			// the actual per-volume health check; see docs/production.md.
 			VolumeCondition: &csi.VolumeCondition{
 				Abnormal: false,
 				Message:  "volume is healthy",

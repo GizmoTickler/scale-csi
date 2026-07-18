@@ -52,6 +52,7 @@ used, that Secret must contain an `api-key` key.
 | `zfs.zvolBlocksize` | Block size for zvols | `16K` |
 | `zfs.zvolReadyTimeout` | Zvol readiness timeout in seconds | `60` |
 | `zfs.datasetProperties` | Additional ZFS dataset properties (e.g. `compression`, `dedup`) | `{}` |
+| `zfs.destroyForeignSnapshotsOnDelete` | Allow recursive volume deletion to destroy non-CSI snapshots | `false` |
 
 Compression and deduplication are configured through `zfs.datasetProperties`
 (e.g. `{compression: "zstd", dedup: "off"}`). When the map is empty, no
@@ -163,6 +164,7 @@ convenient.
 | `node.enabled` | Deploy the node DaemonSet | `true` |
 | `node.priorityClassName` | Node priority class | `system-node-critical` |
 | `node.sessionCleanupDelay` | Stale-session retry delay in milliseconds | `500` |
+| `node.maxVolumesPerNode` | Maximum volumes advertised per node; `0` means unlimited/unset | `0` |
 | `kubeletDir` | Host kubelet directory | `/var/lib/kubelet` |
 | `serviceAccount.create` | Create component ServiceAccounts | `true` |
 | `serviceAccount.controllerName` | Existing/custom controller ServiceAccount | generated or `default` |

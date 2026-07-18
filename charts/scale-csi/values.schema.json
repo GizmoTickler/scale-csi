@@ -235,6 +235,10 @@
           "type": "integer",
           "minimum": 0
         },
+        "maxVolumesPerNode": {
+          "type": "integer",
+          "minimum": 0
+        },
         "resources": {
           "$ref": "#/definitions/freeObject"
         },
@@ -354,6 +358,9 @@
         "zvolReadyTimeout": {
           "type": "integer",
           "minimum": 1
+        },
+        "destroyForeignSnapshotsOnDelete": {
+          "type": "boolean"
         },
         "dedup": {
           "type": "boolean",

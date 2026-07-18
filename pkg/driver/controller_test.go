@@ -90,6 +90,11 @@ type snapshotListErrorMock struct {
 	*cloneDependencyMock
 }
 
+type fallbackSnapshotListErrorMock struct {
+	*truenas.MockClient
+	snapshotListCalls int
+}
+
 type snapshotRenameErrorMock struct {
 	*truenas.MockClient
 	deleteDefers []bool
@@ -106,6 +111,14 @@ func (m *snapshotRenameErrorMock) SnapshotDelete(ctx context.Context, snapshotID
 
 func (m *snapshotListErrorMock) SnapshotList(context.Context, string) ([]*truenas.Snapshot, error) {
 	return nil, fmt.Errorf("injected snapshot query failure")
+}
+
+func (m *fallbackSnapshotListErrorMock) SnapshotList(ctx context.Context, dataset string) ([]*truenas.Snapshot, error) {
+	m.snapshotListCalls++
+	if m.snapshotListCalls > 1 {
+		return nil, fmt.Errorf("injected fallback snapshot query failure")
+	}
+	return m.MockClient.SnapshotList(ctx, dataset)
 }
 
 type blockingSnapshotCreateMock struct {
@@ -467,6 +480,92 @@ func TestDeleteVolumeBusyDatasetChecksManagedSnapshots(t *testing.T) {
 	_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "vol-with-snapshot"})
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.Equal(t, 1, countingMock.snapshotListCalls)
+}
+
+func TestDeleteVolumeForeignSnapshotsAreFailSafeByDefault(t *testing.T) {
+	ctx := context.Background()
+	datasetName := "pool/parent/vol-with-foreign-snapshot"
+	mockClient := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+		},
+		truenasClient: mockClient,
+	}
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	_, err = mockClient.SnapshotCreate(ctx, datasetName, "periodic-2026-07-18", nil)
+	require.NoError(t, err)
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "vol-with-foreign-snapshot"})
+
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "zfs.destroyForeignSnapshotsOnDelete=true")
+	_, getErr := mockClient.DatasetGet(ctx, datasetName)
+	assert.NoError(t, getErr, "the dataset must remain when recursive deletion is disabled")
+	require.Len(t, mockClient.DatasetDeleteCalls, 1)
+	assert.False(t, mockClient.DatasetDeleteCalls[0].Recursive,
+		"the fail-safe path must never request recursive deletion")
+}
+
+func TestDeleteVolumeForeignSnapshotsCanBeDestroyedWithExplicitOptIn(t *testing.T) {
+	ctx := context.Background()
+	datasetName := "pool/parent/vol-with-opt-in"
+	mockClient := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{
+				DatasetParentName:               "pool/parent",
+				DestroyForeignSnapshotsOnDelete: true,
+			},
+			DriverName: "org.scale.csi.nfs",
+		},
+		truenasClient: mockClient,
+	}
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	snapshot, err := mockClient.SnapshotCreate(ctx, datasetName, "periodic-2026-07-18", nil)
+	require.NoError(t, err)
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "vol-with-opt-in"})
+
+	require.NoError(t, err)
+	_, getErr := mockClient.DatasetGet(ctx, datasetName)
+	assert.Error(t, getErr)
+	_, getSnapshotErr := mockClient.SnapshotGet(ctx, snapshot.ID)
+	assert.Error(t, getSnapshotErr)
+	require.Len(t, mockClient.DatasetDeleteCalls, 2)
+	assert.False(t, mockClient.DatasetDeleteCalls[0].Recursive)
+	assert.True(t, mockClient.DatasetDeleteCalls[1].Recursive,
+		"the opt-in path must retry with recursive deletion")
+}
+
+func TestDeleteVolumeFallbackSnapshotListErrorRefusesRecursiveDeleteByDefault(t *testing.T) {
+	ctx := context.Background()
+	datasetName := "pool/parent/vol-with-query-error"
+	mockClient := &fallbackSnapshotListErrorMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+		},
+		truenasClient: mockClient,
+	}
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	_, err = mockClient.SnapshotCreate(ctx, datasetName, "periodic-2026-07-18", nil)
+	require.NoError(t, err)
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "vol-with-query-error"})
+
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "cannot verify snapshots")
+	_, getErr := mockClient.DatasetGet(ctx, datasetName)
+	assert.NoError(t, getErr)
+	require.Len(t, mockClient.DatasetDeleteCalls, 1)
+	assert.False(t, mockClient.DatasetDeleteCalls[0].Recursive,
+		"an unverifiable snapshot state must never trigger recursive deletion by default")
 }
 
 func TestCreateSnapshot(t *testing.T) {
