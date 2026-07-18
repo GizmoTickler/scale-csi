@@ -101,7 +101,7 @@ timeouts under `commandTimeouts`.
   networks accepted by TrueNAS for each dynamically created share.
 - The default `nvmeof.subsystemAllowAnyHost: true` permits any initiator host
   NQN. To restrict access, set it to `false` and populate
-  `nvmeof.subsystemHosts` with the contents of `/etc/nvme/hostnqn` from every
+  `nvmeof.subsystemHosts` with each node's NVMe host NQN — obtained by running `nvme show-hostnqn` on the node (nvme-cli derives a stable NQN from the machine identity even when `/etc/nvme/hostnqn` does not exist, as on Flatcar) — for every
   Kubernetes node that may use the StorageClass. The controller resolves or
   creates the corresponding TrueNAS host records and associates their IDs with
   each new subsystem. It does not auto-discover node NQNs; restricted mode with
@@ -202,7 +202,7 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   mounts), and NVMe-oF (real fabric connects). Tests named `e2e` in this
   repository use `MockClient`.
 - NVMe-oF host-NQN allowlisting is configured statically at the controller.
-  The driver does not discover `/etc/nvme/hostnqn` from nodes, so operators must
+  The driver does not discover node host NQNs, so operators must
   keep `nvmeof.subsystemHosts` synchronized with every node that may connect.
   Continue to use network segmentation (for example VLANs or SGACLs) to protect
   the NVMe-oF listener; host allowlisting is an additional control.

@@ -112,20 +112,26 @@ func TestNVMeoFHostCreate_PassesNQNThrough(t *testing.T) {
 }
 
 func TestNVMeoFSubsystemCreate_HostPayloads(t *testing.T) {
+	// nvmet.subsys.create must NEVER carry a hosts field (TrueNAS 26.0 rejects
+	// it with "Extra inputs are not permitted"); restricted hosts are applied
+	// via separate nvmet.host_subsys.create calls afterward. This test pins
+	// both: the create payload omits hosts in every case, and restricted mode
+	// issues one host_subsys.create per host id.
 	tests := []struct {
-		name         string
-		allowAnyHost bool
-		hostIDs      []int
-		wantHosts    bool
+		name           string
+		allowAnyHost   bool
+		hostIDs        []int
+		wantHostSubsys []int // host IDs expected to be associated
 	}{
-		{name: "restricted hosts", allowAnyHost: false, hostIDs: []int{17, 23}, wantHosts: true},
-		{name: "allow any host unchanged", allowAnyHost: true, hostIDs: nil, wantHosts: false},
+		{name: "restricted hosts", allowAnyHost: false, hostIDs: []int{17, 23}, wantHostSubsys: []int{17, 23}},
+		{name: "allow any host unchanged", allowAnyHost: true, hostIDs: nil, wantHostSubsys: nil},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := newMockWSServer()
-			paramsSeen := make(chan []interface{}, 1)
+			createParams := make(chan []interface{}, 1)
+			hostSubsysParams := make(chan []interface{}, 4)
 			server := mock.start(func(conn *websocket.Conn) {
 				for {
 					var req rpcTestRequest
@@ -139,13 +145,20 @@ func TestNVMeoFSubsystemCreate_HostPayloads(t *testing.T) {
 					case "system.info":
 						resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-26.0.0"}
 					case "nvmet.subsys.create":
-						paramsSeen <- req.Params
+						createParams <- req.Params
 						resp.Result = map[string]interface{}{
 							"id":             float64(31),
 							"name":           "pvc-test",
 							"subnqn":         "nqn.2011-06.com.truenas:pvc-test",
 							"allow_any_host": tt.allowAnyHost,
-							"hosts":          []interface{}{float64(17), float64(23)},
+						}
+					case "nvmet.host_subsys.create":
+						hostSubsysParams <- req.Params
+						p := req.Params[0].(map[string]interface{})
+						resp.Result = map[string]interface{}{
+							"id":     float64(1),
+							"host":   map[string]interface{}{"id": p["host_id"]},
+							"subsys": map[string]interface{}{"id": p["subsys_id"]},
 						}
 					default:
 						resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
@@ -160,13 +173,20 @@ func TestNVMeoFSubsystemCreate_HostPayloads(t *testing.T) {
 
 			_, err := client.NVMeoFSubsystemCreate(context.Background(), "pvc-test", tt.allowAnyHost, tt.hostIDs)
 			require.NoError(t, err)
-			params := (<-paramsSeen)[0].(map[string]interface{})
+
+			params := (<-createParams)[0].(map[string]interface{})
 			assert.Equal(t, tt.allowAnyHost, params["allow_any_host"])
 			_, hasHosts := params["hosts"]
-			assert.Equal(t, tt.wantHosts, hasHosts)
-			if tt.wantHosts {
-				assert.Equal(t, []interface{}{float64(17), float64(23)}, params["hosts"])
+			assert.False(t, hasHosts, "subsys.create must not carry a hosts field")
+
+			var associated []int
+			close(hostSubsysParams)
+			for p := range hostSubsysParams {
+				m := p[0].(map[string]interface{})
+				assert.EqualValues(t, 31, m["subsys_id"])
+				associated = append(associated, int(m["host_id"].(float64)))
 			}
+			assert.ElementsMatch(t, tt.wantHostSubsys, associated)
 		})
 	}
 }

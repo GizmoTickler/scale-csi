@@ -64,14 +64,13 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 		return nil, err
 	}
 
+	// nvmet.subsys.create does NOT accept a hosts field (validated live on
+	// TrueNAS 26.0: it returns "Extra inputs are not permitted"). Host access
+	// control is applied AFTER creation via nvmet.host_subsys.create — see
+	// NVMeoFHostSubsysCreate and the caller in createNVMeoFShareForDataset.
 	params := map[string]interface{}{
 		"name":           name,
 		"allow_any_host": allowAnyHost,
-	}
-	// In 25.10+, hosts are referenced by ID, not NQN string. Preserve the
-	// allow-any-host request shape by only sending hosts when IDs were supplied.
-	if len(hostIDs) > 0 {
-		params["hosts"] = hostIDs
 	}
 
 	result, err := c.Call(ctx, "nvmet.subsys.create", params)
@@ -92,7 +91,84 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 		return nil, fmt.Errorf("failed to create NVMe-oF subsystem: %w", err)
 	}
 
-	return parseNVMeoFSubsystem(result)
+	subsys, parseErr := parseNVMeoFSubsystem(result)
+	if parseErr != nil {
+		return nil, parseErr
+	}
+
+	// Associate allowed hosts (restricted mode). Idempotent: an existing
+	// association is treated as success.
+	for _, hostID := range hostIDs {
+		if _, err := c.NVMeoFHostSubsysCreate(ctx, hostID, subsys.ID); err != nil {
+			return nil, fmt.Errorf("failed to associate host %d with subsystem %q: %w", hostID, name, err)
+		}
+	}
+
+	return subsys, nil
+}
+
+// NVMeoFHostSubsysCreate associates an allowed host with a subsystem so that,
+// under allow_any_host=false, only the listed hosts may connect. Idempotent:
+// an already-present association is returned as success.
+func (c *Client) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error) {
+	params := map[string]interface{}{
+		"host_id":   hostID,
+		"subsys_id": subsysID,
+	}
+	result, err := c.Call(ctx, "nvmet.host_subsys.create", params)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			if existing, findErr := c.NVMeoFHostSubsysFind(ctx, hostID, subsysID); findErr == nil && existing != nil {
+				return existing, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to create host_subsys association: %w", err)
+	}
+	return parseNVMeoFHostSubsys(result)
+}
+
+// NVMeoFHostSubsysFind returns the host_subsys association for a host+subsystem
+// pair, or nil if none exists.
+func (c *Client) NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error) {
+	filters := [][]interface{}{{"host.id", "=", hostID}, {"subsys.id", "=", subsysID}}
+	result, err := c.Call(ctx, "nvmet.host_subsys.query", filters, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query host_subsys: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok || len(items) == 0 {
+		return nil, nil
+	}
+	return parseNVMeoFHostSubsys(items[0])
+}
+
+// NVMeoFHostSubsys represents a host↔subsystem access association.
+type NVMeoFHostSubsys struct {
+	ID       int `json:"id"`
+	HostID   int `json:"-"`
+	SubsysID int `json:"-"`
+}
+
+func parseNVMeoFHostSubsys(raw interface{}) (*NVMeoFHostSubsys, error) {
+	m, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected host_subsys response type")
+	}
+	hs := &NVMeoFHostSubsys{}
+	if v, ok := m["id"].(float64); ok {
+		hs.ID = int(v)
+	}
+	if h, ok := m["host"].(map[string]interface{}); ok {
+		if v, ok := h["id"].(float64); ok {
+			hs.HostID = int(v)
+		}
+	}
+	if s, ok := m["subsys"].(map[string]interface{}); ok {
+		if v, ok := s["id"].(float64); ok {
+			hs.SubsysID = int(v)
+		}
+	}
+	return hs, nil
 }
 
 // NVMeoFHostFindByNQN finds an NVMe-oF host by its exact host NQN.

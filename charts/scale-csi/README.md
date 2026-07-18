@@ -251,7 +251,7 @@ use `--worker-threads`.
   from any network. Set explicit trusted CIDRs in production.
 - `nvmeof.subsystemAllowAnyHost: true` preserves the driver default but permits
   any host NQN. To restrict access, set it to `false` and populate
-  `nvmeof.subsystemHosts` with `/etc/nvme/hostnqn` from every Kubernetes node
+  `nvmeof.subsystemHosts` with each node's `nvme show-hostnqn` output from every Kubernetes node
   that may connect. The controller resolves those NQNs to TrueNAS host IDs but
   does not auto-discover node NQNs. An empty list in restricted mode fails
   provisioning. Keep network segmentation in place; host allowlisting is an

@@ -221,7 +221,8 @@ nvmeof:
   port: 4420
 
   # Allowed host NQNs. Used when subsystemAllowAnyHost is false. Include the
-  # contents of /etc/nvme/hostnqn from every Kubernetes node that may connect.
+  # `nvme show-hostnqn` output from every Kubernetes node that may connect
+  # (stable per node even when /etc/nvme/hostnqn is absent, e.g. on Flatcar).
   subsystemHosts: []
 
   # Allow any host NQN to connect. Restrict this in production.
