@@ -43,7 +43,9 @@ RUN apk add --no-cache \
     bash \
     nfs-utils \
     e2fsprogs \
+    e2fsprogs-extra \
     xfsprogs \
+    xfsprogs-extra \
     btrfs-progs \
     util-linux
 

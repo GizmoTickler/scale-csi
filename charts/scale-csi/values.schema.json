@@ -429,14 +429,6 @@
         "namePrefix": {
           "type": "string"
         },
-        "portalGroupId": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "initiatorGroupId": {
-          "type": "integer",
-          "minimum": 1
-        },
         "extentBlocksize": {
           "type": "integer",
           "minimum": 1
@@ -459,6 +451,30 @@
         "serviceReloadDebounce": {
           "type": "integer",
           "minimum": 0
+        },
+        "targetGroups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "portal": {
+                "type": "integer"
+              },
+              "initiator": {
+                "type": "integer"
+              },
+              "authMethod": {
+                "type": "string"
+              },
+              "auth": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "portal",
+              "initiator"
+            ]
+          }
         }
       }
     },

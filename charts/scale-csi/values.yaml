@@ -187,11 +187,11 @@ iscsi:
   # on TrueNAS and is not controlled by this chart.
   namePrefix: ""
 
-  # Default portal group ID
-  portalGroupId: 1
-
-  # Default initiator group ID
-  initiatorGroupId: 1
+  # Explicit TrueNAS portal/initiator group associations for created targets
+  # (install-specific database IDs). Leave empty to let the driver resolve
+  # them automatically: it matches the portal listening on `portal` and picks
+  # or creates an allow-all initiator group.
+  targetGroups: []
 
   extentBlocksize: 512
   extentRpm: SSD

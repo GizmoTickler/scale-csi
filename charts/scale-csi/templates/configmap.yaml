@@ -51,15 +51,22 @@ data:
     {{- if .Values.iscsi.enabled }}
     # iSCSI configuration
     iscsi:
-      targetPortal: {{ printf "%s:%d" (.Values.iscsi.portal | default .Values.truenas.host) (.Values.iscsi.portalPort | default 3260 | int) | quote }}
+      {{- $portal := .Values.iscsi.portal | default .Values.truenas.host }}
+      {{- if not (contains ":" $portal) }}
+      {{- $portal = printf "%s:%d" $portal (.Values.iscsi.portalPort | default 3260 | int) }}
+      {{- end }}
+      targetPortal: {{ $portal | quote }}
       targetPortals:
         {{- toYaml .Values.iscsi.targetPortals | nindent 8 }}
       interface: "default"
       namePrefix: {{ .Values.iscsi.namePrefix | quote }}
+      {{- if .Values.iscsi.targetGroups }}
+      # Explicit portal/initiator group IDs (install-specific TrueNAS database
+      # ids). When omitted, the driver resolves them automatically from
+      # targetPortal and an allow-all initiator group.
       targetGroups:
-        - portal: {{ .Values.iscsi.portalGroupId | default 1 }}
-          initiator: {{ .Values.iscsi.initiatorGroupId | default 1 }}
-          authMethod: "NONE"
+        {{- toYaml .Values.iscsi.targetGroups | nindent 8 }}
+      {{- end }}
 
       extentBlocksize: {{ .Values.iscsi.extentBlocksize }}
       extentRpm: {{ .Values.iscsi.extentRpm | quote }}

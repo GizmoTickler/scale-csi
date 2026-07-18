@@ -76,8 +76,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `iscsi.portalPort` | Target portal port | `3260` |
 | `iscsi.targetPortals` | Additional multipath portals | `[]` |
 | `iscsi.namePrefix` | Target and extent name prefix | `""` |
-| `iscsi.portalGroupId` | TrueNAS portal group ID | `1` |
-| `iscsi.initiatorGroupId` | TrueNAS initiator group ID | `1` |
+| `iscsi.targetGroups` | Explicit portal/initiator group IDs; empty = auto-resolve from `iscsi.portal` | `[]` |
 | `iscsi.extentBlocksize` | Extent block size | `512` |
 | `iscsi.extentRpm` | Extent RPM value | `SSD` |
 | `iscsi.extentAvailThreshold` | Extent available-space warning threshold | `0` |
