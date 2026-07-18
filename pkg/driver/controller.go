@@ -558,6 +558,17 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 				"volume %s has dependent snapshots that must be deleted first", volumeID)
 		}
 	}
+	// Foreign (non-CSI) snapshots — e.g. from a TrueNAS periodic-snapshot or
+	// replication task on the parent dataset — do not "block" in the CSI sense,
+	// but any snapshot still prevents a non-recursive dataset delete. Refuse
+	// BEFORE deleting the share (default policy) so we never strand a shareless
+	// volume; the post-share-delete fallback stays as a second line of defense
+	// for snapshots that appear after this check.
+	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(snapshots) > 0 {
+		klog.Infof("Volume %s has non-CSI snapshots and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion", volumeID)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
+	}
 
 	// Delete share first (errors are fatal to prevent orphaned targets)
 	switch {

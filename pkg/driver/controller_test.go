@@ -92,7 +92,23 @@ type snapshotListErrorMock struct {
 
 type fallbackSnapshotListErrorMock struct {
 	*truenas.MockClient
-	snapshotListCalls int
+	snapshotListCalls  int
+	datasetDeleteCalls int
+}
+
+// DatasetDelete simulates the race the fallback defends against: the non-
+// recursive delete fails with an ENOTEMPTY dependency error (a snapshot that
+// appeared after the up-front guard's clean check).
+func (m *fallbackSnapshotListErrorMock) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
+	m.datasetDeleteCalls++
+	if !recursive {
+		return &truenas.APIError{
+			Code:    -32602,
+			Message: "Invalid params",
+			Data:    map[string]interface{}{"reason": "[ENOTEMPTY] zfs.resource.destroy: has snapshots. Set recursive=True to remove them."},
+		}
+	}
+	return m.MockClient.DatasetDelete(ctx, name, recursive, force)
 }
 
 type snapshotRenameErrorMock struct {
@@ -115,10 +131,12 @@ func (m *snapshotListErrorMock) SnapshotList(context.Context, string) ([]*truena
 
 func (m *fallbackSnapshotListErrorMock) SnapshotList(ctx context.Context, dataset string) ([]*truenas.Snapshot, error) {
 	m.snapshotListCalls++
-	if m.snapshotListCalls > 1 {
-		return nil, fmt.Errorf("injected fallback snapshot query failure")
+	if m.snapshotListCalls == 1 {
+		// Up-front guard sees no snapshots (the race: one appears afterward).
+		return []*truenas.Snapshot{}, nil
 	}
-	return m.MockClient.SnapshotList(ctx, dataset)
+	// Fallback re-check cannot verify snapshot state.
+	return nil, fmt.Errorf("injected fallback snapshot query failure")
 }
 
 type blockingSnapshotCreateMock struct {
@@ -504,9 +522,11 @@ func TestDeleteVolumeForeignSnapshotsAreFailSafeByDefault(t *testing.T) {
 	assert.Contains(t, err.Error(), "zfs.destroyForeignSnapshotsOnDelete=true")
 	_, getErr := mockClient.DatasetGet(ctx, datasetName)
 	assert.NoError(t, getErr, "the dataset must remain when recursive deletion is disabled")
-	require.Len(t, mockClient.DatasetDeleteCalls, 1)
-	assert.False(t, mockClient.DatasetDeleteCalls[0].Recursive,
-		"the fail-safe path must never request recursive deletion")
+	// The refusal must happen in the up-front guard, BEFORE the share is
+	// deleted — so no dataset-delete is even attempted. This prevents stranding
+	// a shareless volume (the invariant guarded since the clone-source rounds).
+	assert.Empty(t, mockClient.DatasetDeleteCalls,
+		"foreign snapshots must be refused before any share/dataset deletion is attempted")
 }
 
 func TestDeleteVolumeForeignSnapshotsCanBeDestroyedWithExplicitOptIn(t *testing.T) {
@@ -563,8 +583,9 @@ func TestDeleteVolumeFallbackSnapshotListErrorRefusesRecursiveDeleteByDefault(t 
 	assert.Contains(t, err.Error(), "cannot verify snapshots")
 	_, getErr := mockClient.DatasetGet(ctx, datasetName)
 	assert.NoError(t, getErr)
-	require.Len(t, mockClient.DatasetDeleteCalls, 1)
-	assert.False(t, mockClient.DatasetDeleteCalls[0].Recursive,
+	// Only the non-recursive first attempt ran; the fallback refused rather
+	// than escalating to a recursive delete when it could not verify state.
+	assert.Equal(t, 1, mockClient.datasetDeleteCalls,
 		"an unverifiable snapshot state must never trigger recursive deletion by default")
 }
 
