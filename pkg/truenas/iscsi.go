@@ -111,6 +111,9 @@ func (c *Client) ISCSITargetDelete(ctx context.Context, id int, force bool) erro
 			strings.Contains(err.Error(), "not found") {
 			return nil
 		}
+		if c.deleteVanishedTolerant(ctx, "iscsi.target.query", id) {
+			return nil
+		}
 		return fmt.Errorf("failed to delete iSCSI target: %w", err)
 	}
 	return nil
@@ -190,6 +193,9 @@ func (c *Client) ISCSIExtentDelete(ctx context.Context, id int, remove, force bo
 			strings.Contains(err.Error(), "not found") {
 			return nil
 		}
+		if c.deleteVanishedTolerant(ctx, "iscsi.extent.query", id) {
+			return nil
+		}
 		return fmt.Errorf("failed to delete iSCSI extent: %w", err)
 	}
 	return nil
@@ -262,6 +268,9 @@ func (c *Client) ISCSITargetExtentDelete(ctx context.Context, id int, force bool
 	if err != nil {
 		if strings.Contains(err.Error(), "does not exist") ||
 			strings.Contains(err.Error(), "not found") {
+			return nil
+		}
+		if c.deleteVanishedTolerant(ctx, "iscsi.targetextent.query", id) {
 			return nil
 		}
 		return fmt.Errorf("failed to delete target-extent association: %w", err)

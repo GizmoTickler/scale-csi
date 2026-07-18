@@ -68,6 +68,9 @@ func (c *Client) NFSShareDelete(ctx context.Context, id int) error {
 			strings.Contains(err.Error(), "not found") {
 			return nil
 		}
+		if c.deleteVanishedTolerant(ctx, "sharing.nfs.query", id) {
+			return nil
+		}
 		return fmt.Errorf("failed to delete NFS share: %w", err)
 	}
 

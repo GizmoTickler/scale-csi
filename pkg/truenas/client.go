@@ -1177,6 +1177,21 @@ func (c *Client) IsConnected() bool {
 //
 // Returns an error if the reload fails. Callers should treat this as non-fatal
 // since the service might auto-reload, and node-side retry logic handles propagation delays.
+
+// deleteVanishedTolerant reports whether a failed delete can be treated as
+// success because the object no longer exists. TrueNAS surfaces deletes of
+// nonexistent ids as a bare "Invalid params" (-32602) over the WebSocket API
+// (validated live on 26.0), so the error text alone cannot distinguish a bad
+// call from an already-deleted object — existence is checked by query.
+func (c *Client) deleteVanishedTolerant(ctx context.Context, method string, id int) bool {
+	result, err := c.Call(ctx, method, [][]interface{}{{"id", "=", id}}, map[string]interface{}{})
+	if err != nil {
+		return false
+	}
+	items, ok := result.([]interface{})
+	return ok && len(items) == 0
+}
+
 func (c *Client) ServiceReload(ctx context.Context, service string) error {
 	klog.V(4).Infof("Reloading service: %s", service)
 	_, err := c.Call(ctx, "service.reload", service)

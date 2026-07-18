@@ -105,6 +105,9 @@ func (c *Client) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 			// Resource still exists - "Invalid params" was genuinely a parameter error
 			klog.V(4).Infof("NVMeoFSubsystemDelete subsystem still exists, 'Invalid params' indicates genuine parameter error: id=%d", id)
 		}
+		if c.deleteVanishedTolerant(ctx, "nvmet.subsys.query", id) {
+			return nil
+		}
 		return fmt.Errorf("failed to delete NVMe-oF subsystem: %w", err)
 	}
 	return nil
@@ -224,6 +227,9 @@ func (c *Client) NVMeoFNamespaceDelete(ctx context.Context, id int) error {
 			}
 			// Resource still exists - "Invalid params" was genuinely a parameter error
 			klog.V(4).Infof("NVMeoFNamespaceDelete namespace still exists, 'Invalid params' indicates genuine parameter error: id=%d", id)
+		}
+		if c.deleteVanishedTolerant(ctx, "nvmet.namespace.query", id) {
+			return nil
 		}
 		return fmt.Errorf("failed to delete NVMe-oF namespace: %w", err)
 	}
