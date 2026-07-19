@@ -51,6 +51,24 @@ func (m *originSnapshotDeleteFailureMock) SnapshotDelete(ctx context.Context, sn
 	return m.MockClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
 }
 
+type transientOriginSnapshotDeleteFailureMock struct {
+	*truenas.MockClient
+	originSnapshotID string
+	failuresLeft     int
+	deleteCalls      int
+}
+
+func (m *transientOriginSnapshotDeleteFailureMock) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
+	if snapshotID == m.originSnapshotID {
+		m.deleteCalls++
+		if m.failuresLeft > 0 {
+			m.failuresLeft--
+			return fmt.Errorf("temporary snapshot delete failure")
+		}
+	}
+	return m.MockClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
+}
+
 type nfsShareCreateFailureMock struct {
 	*truenas.MockClient
 	err error
@@ -692,6 +710,51 @@ func TestDeleteVolumeReturnsOriginSnapshotDeleteFailure(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, codes.Internal, status.Code(err))
 	assert.Contains(t, err.Error(), "temporary snapshot delete failure")
+}
+
+func TestDeleteVolumeRetriesOriginSnapshotDelete(t *testing.T) {
+	ctx := context.Background()
+	base := truenas.NewMockClient()
+	originID := "pool/parent/source@clone-source-clone"
+	client := &transientOriginSnapshotDeleteFailureMock{
+		MockClient:       base,
+		originSnapshotID: originID,
+		failuresLeft:     2,
+	}
+	d := &Driver{
+		config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}, NFS: NFSConfig{ShareHost: "192.0.2.10"}},
+		truenasClient: client,
+	}
+
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	_, err = client.SnapshotCreate(ctx, "pool/parent/source", "clone-source-clone", map[string]string{PropInternalResource: "true"})
+	require.NoError(t, err)
+	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/clone", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, "pool/parent/clone", PropVolumeOriginSnapshot, originID))
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "clone"})
+	require.NoError(t, err)
+	assert.Equal(t, 3, client.deleteCalls)
+	_, err = client.SnapshotGet(ctx, originID)
+	require.Error(t, err)
+	assert.True(t, truenas.IsNotFoundError(err), "origin snapshot must be removed after the transient failures clear")
+}
+
+func TestDeleteCloneOriginSnapshotHonorsContext(t *testing.T) {
+	client := &transientOriginSnapshotDeleteFailureMock{
+		MockClient:       truenas.NewMockClient(),
+		originSnapshotID: "pool/parent/source@clone-source-clone",
+		failuresLeft:     1,
+	}
+	d := &Driver{truenasClient: client}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := d.deleteCloneOriginSnapshot(ctx, client.originSnapshotID)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, client.deleteCalls, "snapshot delete must not run after context cancellation")
 }
 
 func TestDeleteVolumeRecursiveCloneDependencyIsFailedPrecondition(t *testing.T) {

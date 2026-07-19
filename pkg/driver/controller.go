@@ -43,6 +43,12 @@ const (
 	PropNVMeoFPortSubsysID        = "truenas-csi:truenas_nvmeof_portsubsys_id"
 )
 
+const (
+	originSnapshotDeleteAttempts   = 3
+	originSnapshotDeleteBackoff    = 500 * time.Millisecond
+	originSnapshotDeleteMaxBackoff = 2 * time.Second
+)
+
 func isDatasetDependencyOrBusyError(err error) bool {
 	if err == nil {
 		return false
@@ -762,17 +768,56 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// The clone's dependency on the snapshot is now broken, so we can delete it
 	if originSnapshotID != "" {
 		klog.Infof("Cleaning up origin snapshot %s for deleted volume clone %s", originSnapshotID, volumeID)
-		if err := d.truenasClient.SnapshotDelete(ctx, originSnapshotID, true, false); err != nil {
-			if !truenas.IsNotFoundError(err) {
-				klog.Errorf("Failed to delete origin snapshot %s: %v", originSnapshotID, err)
-				return nil, status.Errorf(codes.Internal, "failed to delete clone origin snapshot %s: %v", originSnapshotID, err)
-			}
+		if err := d.deleteCloneOriginSnapshot(ctx, originSnapshotID); err != nil {
+			klog.Errorf("Failed to delete origin snapshot %s: %v", originSnapshotID, err)
+			return nil, status.Errorf(codes.Internal, "failed to delete clone origin snapshot %s: %v", originSnapshotID, err)
 		}
 	}
 
 	klog.Infof("Volume %s deleted successfully", volumeID)
 
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// deleteCloneOriginSnapshot retries the post-clone cleanup within the original
+// DeleteVolume call. A later CO retry cannot recover the snapshot ID after the
+// clone dataset has already disappeared.
+func (d *Driver) deleteCloneOriginSnapshot(ctx context.Context, snapshotID string) error {
+	backoff := originSnapshotDeleteBackoff
+	var lastErr error
+	for attempt := 1; attempt <= originSnapshotDeleteAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lastErr = d.truenasClient.SnapshotDelete(ctx, snapshotID, true, false)
+		if lastErr == nil || truenas.IsNotFoundError(lastErr) {
+			return nil
+		}
+		if attempt == originSnapshotDeleteAttempts {
+			break
+		}
+
+		klog.Warningf("Failed to delete clone origin snapshot %s (attempt %d/%d): %v; retrying in %v",
+			snapshotID, attempt, originSnapshotDeleteAttempts, lastErr, backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+			backoff *= 2
+			if backoff > originSnapshotDeleteMaxBackoff {
+				backoff = originSnapshotDeleteMaxBackoff
+			}
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		}
+	}
+
+	return lastErr
 }
 
 // ControllerPublishVolume attaches a volume to a node.
