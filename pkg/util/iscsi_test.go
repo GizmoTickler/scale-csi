@@ -1,13 +1,51 @@
 package util
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGetISCSISessionsExit21IsEmpty(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nprintf 'iscsiadm: No active sessions.' >&2\nexit 21\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	sessions, err := getISCSISessions()
+	require.NoError(t, err)
+	assert.Empty(t, sessions)
+}
+
+func TestGetISCSISessionsOtherExitIsError(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nprintf 'transport failure' >&2\nexit 22\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := getISCSISessions()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exit status 22")
+	assert.Contains(t, err.Error(), "transport failure")
+}
+
+func TestPollForISCSISessionCleanupReturnsEarly(t *testing.T) {
+	calls := 0
+	start := time.Now()
+	err := pollForISCSISessionCleanup(context.Background(), 500*time.Millisecond, func() (bool, error) {
+		calls++
+		return calls == 1, nil
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+	assert.Less(t, time.Since(start), 400*time.Millisecond)
+}
 
 func TestFindDeviceForSessionUsesOwningHostOnly(t *testing.T) {
 	sysClassRoot := filepath.Join(t.TempDir(), "class")

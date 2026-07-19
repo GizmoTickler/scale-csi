@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,20 @@ type nvmeHostCountingMock struct {
 	subsystemAllowAny   []bool
 	subsystemHostIDs    [][]int
 	subsystemCreateFail error
+}
+
+type iscsiTargetCreateFailMock struct {
+	*truenas.MockClient
+	targetCreateErr error
+}
+
+func (m *iscsiTargetCreateFailMock) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []truenas.ISCSITargetGroup) (*truenas.ISCSITarget, error) {
+	if m.targetCreateErr != nil {
+		err := m.targetCreateErr
+		m.targetCreateErr = nil
+		return nil, err
+	}
+	return m.MockClient.ISCSITargetCreate(ctx, name, alias, mode, groups)
 }
 
 func (m *nvmeHostCountingMock) NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*truenas.NVMeoFHost, error) {
@@ -697,11 +712,11 @@ func TestCreateNVMeoFShareRestrictedHostsRequiresNQN(t *testing.T) {
 	assert.Contains(t, err.Error(), "set allow-any-host or provide at least one host NQN")
 }
 
-func TestCreateNVMeoFShareRestrictedHostsInvalidatesCacheOnSubsystemError(t *testing.T) {
+func TestCreateNVMeoFShareRestrictedHostsReResolvesOnHostNotFound(t *testing.T) {
 	nqn := "nqn.2014-08.org.nvmexpress:retry-node"
 	mockClient := &nvmeHostCountingMock{
 		MockClient:          truenas.NewMockClient(),
-		subsystemCreateFail: fmt.Errorf("stale host ID"),
+		subsystemCreateFail: fmt.Errorf("NVMe-oF host ID 1 not found"),
 	}
 	d := &Driver{
 		config: &Config{
@@ -718,20 +733,14 @@ func TestCreateNVMeoFShareRestrictedHostsInvalidatesCacheOnSubsystemError(t *tes
 	}
 	ctx := context.Background()
 
-	firstDataset := "tank/k8s/volumes/restricted-retry-1"
-	first, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: firstDataset, Type: "VOLUME"})
+	datasetName := "tank/k8s/volumes/restricted-retry"
+	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
 	require.NoError(t, err)
-	err = d.createNVMeoFShareForDataset(ctx, first, firstDataset, "restricted-retry-1", true, true)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "stale host ID")
-
-	secondDataset := "tank/k8s/volumes/restricted-retry-2"
-	second, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: secondDataset, Type: "VOLUME"})
-	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, second, secondDataset, "restricted-retry-2", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "restricted-retry", true, true))
 
 	assert.Equal(t, 2, mockClient.hostFindCalls, "retry must re-query after cache invalidation")
 	assert.Equal(t, 1, mockClient.hostCreateCalls, "existing host record must be reused on retry")
+	assert.Len(t, mockClient.subsystemHostIDs, 2)
 }
 
 // =============================================================================
@@ -847,6 +856,106 @@ func TestEnsureShareExists_DashValue(t *testing.T) {
 	propValue, _ := mockClient.DatasetGetUserProperty(ctx, datasetName, PropNFSShareID)
 	assert.NotEmpty(t, propValue)
 	assert.NotEqual(t, "-", propValue)
+}
+
+func TestEnsureShareExistsNVMeoFReconcilesRestrictedHosts(t *testing.T) {
+	ctx := context.Background()
+	mockClient := truenas.NewMockClient()
+	nqn := "nqn.2014-08.org.nvmexpress:new-node"
+	host, err := mockClient.NVMeoFHostCreate(ctx, nqn)
+	require.NoError(t, err)
+	subsys, err := mockClient.NVMeoFSubsystemCreate(ctx, "existing-subsystem", true, nil)
+	require.NoError(t, err)
+	subsys.AllowAnyHost = false
+	subsys.Hosts = nil
+
+	datasetName := "tank/k8s/volumes/existing-nvme"
+	_, err = mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
+	require.NoError(t, err)
+	require.NoError(t, mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID, strconv.Itoa(subsys.ID)))
+	require.NoError(t, mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, "9"))
+	ds, err := mockClient.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+
+	d := &Driver{
+		config: &Config{NVMeoF: NVMeoFConfig{
+			SubsystemAllowAnyHost: false,
+			SubsystemHosts:        []string{nqn},
+		}},
+		truenasClient: mockClient,
+	}
+	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "existing-nvme", ShareTypeNVMeoF))
+	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "existing-nvme", ShareTypeNVMeoF))
+	assert.Equal(t, []int{host.ID}, subsys.Hosts, "reconciliation must add each host once")
+}
+
+func TestEnsureShareExistsNVMeoFReResolvesStaleHostID(t *testing.T) {
+	ctx := context.Background()
+	baseClient := truenas.NewMockClient()
+	nqn := "nqn.2014-08.org.nvmexpress:moved-node"
+	oldHost, err := baseClient.NVMeoFHostCreate(ctx, nqn)
+	require.NoError(t, err)
+	subsys, err := baseClient.NVMeoFSubsystemCreate(ctx, "stale-host-subsystem", true, nil)
+	require.NoError(t, err)
+	subsys.AllowAnyHost = false
+	subsys.Hosts = nil
+
+	datasetName := "tank/k8s/volumes/stale-host-nvme"
+	_, err = baseClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
+	require.NoError(t, err)
+	require.NoError(t, baseClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID, strconv.Itoa(subsys.ID)))
+	require.NoError(t, baseClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, "10"))
+	ds, err := baseClient.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+
+	mockClient := &nvmeHostCountingMock{MockClient: baseClient}
+	d := &Driver{
+		config: &Config{NVMeoF: NVMeoFConfig{
+			SubsystemAllowAnyHost: false,
+			SubsystemHosts:        []string{nqn},
+		}},
+		truenasClient: mockClient,
+	}
+	_, err = d.resolveNVMeoFHostIDs(ctx, []string{nqn})
+	require.NoError(t, err)
+	delete(baseClient.NVMeHosts, nqn)
+	newHost := &truenas.NVMeoFHost{ID: oldHost.ID + 10, HostNQN: nqn}
+	baseClient.NVMeHosts[nqn] = newHost
+
+	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-host-nvme", ShareTypeNVMeoF))
+	assert.Equal(t, []int{newHost.ID}, subsys.Hosts)
+	assert.Equal(t, 2, mockClient.hostFindCalls, "host-not-found must invalidate and re-resolve once")
+}
+
+func TestISCSITargetCreateFailureInvalidatesResolvedGroup(t *testing.T) {
+	ctx := context.Background()
+	mockClient := &iscsiTargetCreateFailMock{
+		MockClient:      truenas.NewMockClient(),
+		targetCreateErr: fmt.Errorf("stale target group"),
+	}
+	d := &Driver{
+		config: &Config{
+			ZFS:   ZFSConfig{DatasetParentName: "tank/k8s/volumes"},
+			ISCSI: ISCSIConfig{TargetPortal: "192.0.2.10:3260"},
+		},
+		truenasClient: mockClient,
+	}
+	datasetName := "tank/k8s/volumes/iscsi-cache-invalidation"
+	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
+	require.NoError(t, err)
+
+	err = d.createISCSIShareForDataset(ctx, ds, datasetName, "iscsi-cache-invalidation", true, true)
+	require.Error(t, err)
+	d.iscsiGroupMu.Lock()
+	assert.Nil(t, d.iscsiResolvedGroup)
+	d.iscsiGroupMu.Unlock()
+
+	mockClient.ISCSIPortals = map[int]*truenas.ISCSIPortal{
+		7: {ID: 7, Listen: []truenas.ISCSIPortalListen{{IP: "192.0.2.10", Port: 3260}}},
+	}
+	group, err := d.resolveISCSITargetGroup(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 7, group.Portal)
 }
 
 // =============================================================================

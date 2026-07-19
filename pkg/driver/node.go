@@ -20,8 +20,12 @@ import (
 )
 
 var (
-	nodeStatsSysfsRoot = "/sys"
-	nodeStatsStat      = func(path string) (uint32, uint64, error) {
+	nodeStatsSysfsRoot  = "/sys"
+	nodeGetNVMeInfo     = util.GetNVMeInfoFromDevice
+	nodeNVMeDisconnect  = util.NVMeoFDisconnect
+	nodeGetISCSIInfo    = util.GetISCSIInfoFromDevice
+	nodeISCSIDisconnect = util.ISCSIDisconnect
+	nodeStatsStat       = func(path string) (uint32, uint64, error) {
 		var stat unix.Stat_t
 		if err := unix.Stat(path, &stat); err != nil {
 			return 0, 0, err
@@ -144,11 +148,8 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 	defer d.releaseOperationLock(lockKey)
 
-	// Get attach driver from volume context and normalize
-	attachDriver := ParseShareType(volumeContext["node_attach_driver"])
-	if volumeContext["node_attach_driver"] == "" {
-		attachDriver = d.config.GetDriverShareType()
-	}
+	// Get attach driver from volume context and normalize.
+	attachDriver := d.nodeAttachDriver(volumeContext)
 
 	// Ensure staging directory exists
 	if err := os.MkdirAll(stagingPath, 0o750); err != nil {
@@ -246,28 +247,31 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 	}
 
-	// Disconnect session if we found a device
+	// Disconnect session if we found a device.
+	primaryDisconnectSucceeded := false
 	if devicePath != "" {
 		if strings.Contains(devicePath, "nvme") {
 			// NVMe-oF cleanup
-			nqn, nvmeErr := util.GetNVMeInfoFromDevice(devicePath)
+			nqn, nvmeErr := nodeGetNVMeInfo(devicePath)
 			if nvmeErr == nil {
-				if discErr := util.NVMeoFDisconnect(nqn); discErr != nil {
+				if discErr := nodeNVMeDisconnect(nqn); discErr != nil {
 					klog.Warningf("Failed to disconnect NVMe-oF session %s: %v", nqn, discErr)
 				} else {
 					klog.Infof("Disconnected NVMe-oF session %s", nqn)
+					primaryDisconnectSucceeded = true
 				}
 			} else {
 				klog.V(4).Infof("Could not get NVMe info from device %s: %v", devicePath, nvmeErr)
 			}
 		} else {
 			// Try iSCSI cleanup
-			portal, iqn, iscsiErr := util.GetISCSIInfoFromDevice(devicePath)
+			portal, iqn, iscsiErr := nodeGetISCSIInfo(devicePath)
 			if iscsiErr == nil {
-				if discErr := util.ISCSIDisconnect(portal, iqn); discErr != nil {
+				if discErr := nodeISCSIDisconnect(portal, iqn); discErr != nil {
 					klog.Warningf("Failed to disconnect iSCSI session %s: %v", iqn, discErr)
 				} else {
 					klog.Infof("Disconnected iSCSI session %s", iqn)
+					primaryDisconnectSucceeded = true
 				}
 			} else {
 				klog.V(4).Infof("Could not get iSCSI info from device %s: %v", devicePath, iscsiErr)
@@ -275,13 +279,19 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 	}
 
-	// Always attempt cleanup by volumeID as a safety net.
-	// This catches sessions that weren't disconnected because devicePath was empty,
-	// device info extraction failed, remain from previous failed unstage attempts,
-	// or some edge case left a duplicate session.
-	// The cleanup function is idempotent - it will simply log "no session found"
-	// if no session remains after the disconnect above.
-	d.cleanupOrphanedSessionByVolumeID(ctx, volumeID)
+	// The scan is only needed when no device was available or the primary
+	// device-based disconnect could not be completed successfully. A known device
+	// identifies its transport; without one, probe both exact session lookups.
+	if devicePath == "" {
+		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI)
+		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeNVMeoF)
+	} else if !primaryDisconnectSucceeded {
+		attachDriver := ShareTypeISCSI
+		if strings.Contains(devicePath, "nvme") {
+			attachDriver = ShareTypeNVMeoF
+		}
+		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, attachDriver)
+	}
 
 	klog.Infof("Volume %s unstaged successfully", volumeID)
 	return &csi.NodeUnstageVolumeResponse{}, nil
@@ -290,37 +300,46 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 // cleanupOrphanedSessionByVolumeID attempts to clean up iSCSI/NVMe-oF sessions
 // when the device path is unavailable (e.g., after node restart or force unmount).
 // This prevents session leaks that accumulate over time.
-func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID string) {
+func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID string, attachDriver ShareType) {
 	_ = ctx
 
-	// Mixed-protocol deployments cannot infer the volume's transport from the
-	// driver's global default. Both lookups are exact and no-op when absent.
-	portal := d.config.ISCSI.TargetPortal
-	targetName := volumeID + d.config.ISCSI.NameSuffix
-	iqn, err := util.FindISCSISessionByTargetName(targetName)
-	if err != nil {
-		klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s): %v", volumeID, targetName, err)
-	} else if iqn != "" {
-		klog.Infof("Found orphaned iSCSI session for volume %s: %s", volumeID, iqn)
-		if disconnectErr := util.ISCSIDisconnect(portal, iqn); disconnectErr != nil {
-			klog.Warningf("Failed to disconnect orphaned iSCSI session %s: %v", iqn, disconnectErr)
-		} else {
-			klog.Infof("Successfully cleaned up orphaned iSCSI session %s", iqn)
+	switch attachDriver {
+	case ShareTypeISCSI:
+		portal := d.config.ISCSI.TargetPortal
+		targetName := protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
+		iqn, err := util.FindISCSISessionByTargetName(targetName)
+		if err != nil {
+			klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s): %v", volumeID, targetName, err)
+		} else if iqn != "" {
+			klog.Infof("Found orphaned iSCSI session for volume %s: %s", volumeID, iqn)
+			if disconnectErr := util.ISCSIDisconnect(portal, iqn); disconnectErr != nil {
+				klog.Warningf("Failed to disconnect orphaned iSCSI session %s: %v", iqn, disconnectErr)
+			} else {
+				klog.Infof("Successfully cleaned up orphaned iSCSI session %s", iqn)
+			}
 		}
-	}
 
-	nqnName := d.config.NVMeoF.NamePrefix + volumeID + d.config.NVMeoF.NameSuffix
-	nqn, err := util.FindNVMeoFSessionBySubsysName(nqnName)
-	if err != nil {
-		klog.V(4).Infof("No active NVMe-oF session found for volume %s (nqn: %s): %v", volumeID, nqnName, err)
-	} else if nqn != "" {
-		klog.Infof("Found orphaned NVMe-oF session for volume %s: %s", volumeID, nqn)
-		if err := util.NVMeoFDisconnect(nqn); err != nil {
-			klog.Warningf("Failed to disconnect orphaned NVMe-oF session %s: %v", nqn, err)
-		} else {
-			klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
+	case ShareTypeNVMeoF:
+		nqnName := d.config.NVMeoF.NamePrefix + protocolShareName(volumeID) + d.config.NVMeoF.NameSuffix
+		nqn, err := util.FindNVMeoFSessionBySubsysName(nqnName)
+		if err != nil {
+			klog.V(4).Infof("No active NVMe-oF session found for volume %s (nqn: %s): %v", volumeID, nqnName, err)
+		} else if nqn != "" {
+			klog.Infof("Found orphaned NVMe-oF session for volume %s: %s", volumeID, nqn)
+			if err := util.NVMeoFDisconnect(nqn); err != nil {
+				klog.Warningf("Failed to disconnect orphaned NVMe-oF session %s: %v", nqn, err)
+			} else {
+				klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
+			}
 		}
 	}
+}
+
+func (d *Driver) nodeAttachDriver(volumeContext map[string]string) ShareType {
+	if volumeContext != nil && volumeContext["node_attach_driver"] != "" {
+		return ParseShareType(volumeContext["node_attach_driver"])
+	}
+	return d.config.GetDriverShareType()
 }
 
 // NodePublishVolume mounts a volume to a target path.

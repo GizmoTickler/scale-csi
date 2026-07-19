@@ -201,6 +201,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if len(req.GetVolumeCapabilities()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
+	volumeID := d.sanitizeVolumeID(name)
 
 	// Enhanced logging for debugging volsync and backup scenarios
 	contentSourceInfo := "none"
@@ -227,8 +228,8 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			reqTopologies, prefTopologies)
 	}
 
-	// Lock on volume name to prevent concurrent creates
-	lockKey := "volume:" + name
+	// Lock on the sanitized volume ID so all operations use the same key space.
+	lockKey := "volume:" + volumeID
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -267,8 +268,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			"requested capacity (%d bytes) exceeds maximum (%d bytes)", capacityBytes, maxCapacity)
 	}
 
-	// Get volume ID from name
-	volumeID := d.sanitizeVolumeID(name)
 	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
 
 	// Get share type from StorageClass parameters (with fallback to driver name)
@@ -350,11 +349,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if ctxErr != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
 		}
+		contentSource := volumeContentSourceFromDataset(existingDS)
+		if contentSource == nil {
+			contentSource = req.GetVolumeContentSource()
+		}
 		return &csi.CreateVolumeResponse{
 			Volume: &csi.Volume{
 				VolumeId:      volumeID,
 				CapacityBytes: d.getDatasetCapacity(existingDS),
 				VolumeContext: volumeContext,
+				ContentSource: contentSource,
 			},
 		}, nil
 	}
@@ -436,6 +440,26 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	return &csi.CreateVolumeResponse{Volume: volume}, nil
+}
+
+func volumeContentSourceFromDataset(ds *truenas.Dataset) *csi.VolumeContentSource {
+	sourceID := datasetUserProperty(ds, PropVolumeContentSourceID)
+	if sourceID == "" || sourceID == "-" {
+		return nil
+	}
+
+	switch datasetUserProperty(ds, PropVolumeContentSourceType) {
+	case "snapshot":
+		return &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: sourceID},
+		}}
+	case "volume":
+		return &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: sourceID},
+		}}
+	default:
+		return nil
+	}
 }
 
 // DeleteVolume deletes a volume.
