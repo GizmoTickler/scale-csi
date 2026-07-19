@@ -49,6 +49,7 @@ zfs:
 
 # iSCSI configuration
 iscsi:
+  enabled: true
   # Target portal (TrueNAS iSCSI server)
   targetPortal: "truenas.example.com:3260"
 

@@ -39,6 +39,7 @@ data:
     {{- if .Values.nfs.enabled }}
     # NFS configuration
     nfs:
+      enabled: true
       shareHost: {{ .Values.nfs.server | default .Values.truenas.host | quote }}
       shareAllowedNetworks:
         {{- toYaml .Values.nfs.shareAllowedNetworks | nindent 8 }}
@@ -52,6 +53,7 @@ data:
     {{- if .Values.iscsi.enabled }}
     # iSCSI configuration
     iscsi:
+      enabled: true
       {{- $portal := .Values.iscsi.portal | default .Values.truenas.host }}
       {{- if not (contains ":" $portal) }}
       {{- $portal = printf "%s:%d" $portal (.Values.iscsi.portalPort | default 3260 | int) }}
@@ -79,6 +81,7 @@ data:
     {{- if .Values.nvmeof.enabled }}
     # NVMe-oF configuration
     nvmeof:
+      enabled: true
       transport: {{ .Values.nvmeof.transport | default "tcp" | quote }}
       transportAddress: {{ .Values.nvmeof.address | default .Values.truenas.host | quote }}
       transportServiceId: {{ .Values.nvmeof.port | default 4420 }}

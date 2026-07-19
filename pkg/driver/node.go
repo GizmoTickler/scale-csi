@@ -20,12 +20,17 @@ import (
 )
 
 var (
-	nodeStatsSysfsRoot  = "/sys"
-	nodeGetNVMeInfo     = util.GetNVMeInfoFromDevice
-	nodeNVMeDisconnect  = util.NVMeoFDisconnect
-	nodeGetISCSIInfo    = util.GetISCSIInfoFromDevice
-	nodeISCSIDisconnect = util.ISCSIDisconnect
-	nodeStatsStat       = func(path string) (uint32, uint64, error) {
+	nodeStatsSysfsRoot   = "/sys"
+	nodeGetNVMeInfo      = util.GetNVMeInfoFromDevice
+	nodeNVMeDisconnect   = util.NVMeoFDisconnect
+	nodeGetISCSIInfo     = util.GetISCSIInfoFromDevice
+	nodeISCSIDisconnect  = util.ISCSIDisconnect
+	nodeGetDeviceSize    = util.GetDeviceSize
+	nodeResizeFilesystem = util.ResizeFilesystem
+	nodeFormatAndMount   = util.FormatAndMount
+	nodeISCSIRescan      = util.ISCSIRescanSession
+	nodeNVMeRescan       = util.NVMeRescan
+	nodeStatsStat        = func(path string) (uint32, uint64, error) {
 		var stat unix.Stat_t
 		if err := unix.Stat(path, &stat); err != nil {
 			return 0, 0, err
@@ -247,7 +252,21 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 	}
 
-	// Disconnect session if we found a device.
+	// A raw-block staging symlink contains a literal /dev name that can become
+	// stale after reboot. Never derive the session to disconnect from it; use
+	// the volume's expected target name instead.
+	if isSymlink {
+		if strings.Contains(devicePath, "nvme") {
+			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeNVMeoF)
+		} else {
+			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI)
+		}
+		klog.Infof("Volume %s unstaged successfully", volumeID)
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+
+	// Filesystem-mode device paths were read from the live mount before it was
+	// unmounted, so they remain safe for direct session cleanup.
 	primaryDisconnectSucceeded := false
 	if devicePath != "" {
 		if strings.Contains(devicePath, "nvme") {
@@ -650,7 +669,13 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 			}
 		}
 
-		beforeBytes, beforeErr := util.GetDeviceSize(devicePath)
+		if rawBlock {
+			if ownershipErr := d.validateRawBlockExpansionDevice(volumeID, devicePath, shareType); ownershipErr != nil {
+				return nil, ownershipErr
+			}
+		}
+
+		beforeBytes, beforeErr := nodeGetDeviceSize(devicePath)
 		if beforeErr != nil {
 			klog.Warningf("Could not read device size before rescan for %s: %v", devicePath, beforeErr)
 		} else {
@@ -659,22 +684,22 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 
 		switch shareType {
 		case ShareTypeISCSI:
-			portal, iqn, infoErr := util.GetISCSIInfoFromDevice(devicePath)
+			portal, iqn, infoErr := nodeGetISCSIInfo(devicePath)
 			if infoErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
 			}
-			if rescanErr := util.ISCSIRescanSession(portal, iqn); rescanErr != nil {
+			if rescanErr := nodeISCSIRescan(portal, iqn); rescanErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
 			}
 		case ShareTypeNVMeoF:
-			if rescanErr := util.NVMeRescan(devicePath); rescanErr != nil {
+			if rescanErr := nodeNVMeRescan(devicePath); rescanErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to rescan NVMe-oF device %s: %v", devicePath, rescanErr)
 			}
 		}
 
-		afterBytes, afterErr := util.GetDeviceSize(devicePath)
+		afterBytes, afterErr := nodeGetDeviceSize(devicePath)
 		if afterErr != nil {
-			klog.Warningf("Could not read device size after rescan for %s: %v", devicePath, afterErr)
+			return nil, status.Errorf(codes.Internal, "failed to read device size after rescan for %s: %v", devicePath, afterErr)
 		} else {
 			klog.Infof("Device %s size after rescan: %d bytes", devicePath, afterBytes)
 			if beforeErr == nil && afterBytes <= beforeBytes {
@@ -688,21 +713,64 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 
 		// Node expansion for raw block volumes only needs the transport rescan.
 		if rawBlock {
+			if capacityBytes > 0 && afterBytes < capacityBytes {
+				return nil, status.Errorf(codes.Internal,
+					"raw block device %s capacity is %d bytes after rescan, below requested %d bytes",
+					devicePath, afterBytes, capacityBytes)
+			}
 			klog.Infof("Raw block volume %s rescanned; skipping filesystem resize", volumeID)
-			return &csi.NodeExpandVolumeResponse{CapacityBytes: capacityBytes}, nil
+			return &csi.NodeExpandVolumeResponse{CapacityBytes: afterBytes}, nil
 		}
 
 		if volumePath != "" {
-			if resizeErr := util.ResizeFilesystem(volumePath); resizeErr != nil {
+			if resizeErr := nodeResizeFilesystem(volumePath); resizeErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to resize filesystem: %v", resizeErr)
 			}
 		}
+		if capacityBytes > 0 && afterBytes < capacityBytes {
+			return nil, status.Errorf(codes.Internal,
+				"block device %s capacity is %d bytes after resize, below requested %d bytes",
+				devicePath, afterBytes, capacityBytes)
+		}
+		capacityBytes = afterBytes
 	}
 
 	klog.Infof("Volume %s expanded successfully", volumeID)
 	return &csi.NodeExpandVolumeResponse{
 		CapacityBytes: capacityBytes,
 	}, nil
+}
+
+func (d *Driver) validateRawBlockExpansionDevice(volumeID, devicePath string, shareType ShareType) error {
+	switch shareType {
+	case ShareTypeISCSI:
+		_, iqn, err := nodeGetISCSIInfo(devicePath)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to identify iSCSI session for raw block device %s: %v", devicePath, err)
+		}
+		expected := protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
+		if !sessionTargetMatchesExpected(iqn, expected) {
+			return status.Errorf(codes.FailedPrecondition,
+				"raw block staging device %s belongs to iSCSI target %s, expected volume target %s",
+				devicePath, iqn, expected)
+		}
+	case ShareTypeNVMeoF:
+		nqn, err := nodeGetNVMeInfo(devicePath)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to identify NVMe-oF session for raw block device %s: %v", devicePath, err)
+		}
+		expected := d.config.NVMeoF.NamePrefix + protocolShareName(volumeID) + d.config.NVMeoF.NameSuffix
+		if !sessionTargetMatchesExpected(nqn, expected) {
+			return status.Errorf(codes.FailedPrecondition,
+				"raw block staging device %s belongs to NVMe-oF subsystem %s, expected volume subsystem %s",
+				devicePath, nqn, expected)
+		}
+	}
+	return nil
+}
+
+func sessionTargetMatchesExpected(actual, expected string) bool {
+	return actual == expected || strings.HasSuffix(actual, ":"+expected)
 }
 
 func nodeVolumeLockKey(volumeID string) string {
@@ -879,10 +947,11 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 	// For filesystem mode, format and mount
 	fsType := "ext4"
 	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
-		fsType = volCap.GetMount().GetFsType()
+		fsType = strings.ToLower(volCap.GetMount().GetFsType())
 	}
+	mountFlags := volumeMountFlags(volCap)
 
-	if err := util.FormatAndMount(devicePath, stagingPath, fsType, nil); err != nil {
+	if err := nodeFormatAndMount(devicePath, stagingPath, fsType, mountFlags); err != nil {
 		return status.Errorf(codes.Internal, "failed to format and mount: %v", err)
 	}
 
@@ -986,12 +1055,34 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
 		fsType = strings.ToLower(volCap.GetMount().GetFsType())
 	}
+	mountFlags := volumeMountFlags(volCap)
 
-	if err := util.FormatAndMount(devicePath, stagingPath, fsType, nil); err != nil {
+	if err := nodeFormatAndMount(devicePath, stagingPath, fsType, mountFlags); err != nil {
 		return status.Errorf(codes.Internal, "failed to format and mount: %v", err)
 	}
 
 	return nil
+}
+
+func volumeMountFlags(volCap *csi.VolumeCapability) []string {
+	if volCap == nil || volCap.GetMount() == nil {
+		return nil
+	}
+	flags := volCap.GetMount().GetMountFlags()
+	result := make([]string, 0, len(flags))
+	seen := make(map[string]struct{}, len(flags))
+	for _, flag := range flags {
+		flag = strings.TrimSpace(flag)
+		if flag == "" {
+			continue
+		}
+		if _, duplicate := seen[flag]; duplicate {
+			continue
+		}
+		seen[flag] = struct{}{}
+		result = append(result, flag)
+	}
+	return result
 }
 
 func stagedBlockDevicePath(stagingPath string) (string, bool) {

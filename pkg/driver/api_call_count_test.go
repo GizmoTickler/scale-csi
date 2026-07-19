@@ -513,8 +513,9 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
 		}},
-		// A fully provisioned NFS retry should remain a one-query fast path.
-		{name: "CreateVolume idempotent retry", want: 1, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// A fully provisioned NFS retry re-reads the dataset and verifies that the
+		// stored TrueNAS share object still exists.
+		{name: "CreateVolume idempotent retry", want: 2, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			req := apiCallCountVolumeRequest("existing-nfs", "nfs")
 			_, err := d.CreateVolume(context.Background(), req)
 			require.NoError(t, err)

@@ -34,6 +34,10 @@ var (
 	resolveNodeStatsDevice             = nodeStatsDevice
 	getNodeDeviceSize                  = nodeStatsDeviceSize
 	getNodeFilesystemStats             = util.GetFilesystemStats
+	gcListISCSISessions                = util.ListISCSISessions
+	gcDisconnectISCSI                  = util.ISCSIDisconnect
+	gcListNVMeoFSessions               = util.ListNVMeoFSessions
+	gcDisconnectNVMeoF                 = util.NVMeoFDisconnect
 )
 
 // DriverConfig holds the driver initialization configuration.
@@ -470,25 +474,25 @@ func (d *Driver) stopSessionGC() {
 // runSessionGC performs one garbage collection cycle with explicit protocol control.
 // It runs GC for the specified protocols, allowing per-protocol enable/disable via config.
 // gracePeriod specifies how long a session must be orphaned before cleanup.
-func (d *Driver) runSessionGCWithProtocols(_ context.Context, gracePeriod time.Duration, dryRun, iscsiEnabled, nvmeofEnabled bool) {
+func (d *Driver) runSessionGCWithProtocols(ctx context.Context, gracePeriod time.Duration, dryRun, iscsiEnabled, nvmeofEnabled bool) {
 	klog.V(4).Info("Running session GC")
 
 	// Run iSCSI GC if enabled
-	if iscsiEnabled {
-		d.gcISCSISessions(gracePeriod, dryRun)
+	if iscsiEnabled && ctx.Err() == nil {
+		d.gcISCSISessions(ctx, gracePeriod, dryRun)
 	}
 
 	// Run NVMe-oF GC if enabled
-	if nvmeofEnabled {
-		d.gcNVMeoFSessions(gracePeriod, dryRun)
+	if nvmeofEnabled && ctx.Err() == nil {
+		d.gcNVMeoFSessions(ctx, gracePeriod, dryRun)
 	}
 }
 
 // gcISCSISessions garbage collects orphaned iSCSI sessions.
 // Sessions must be orphaned for at least gracePeriod before being disconnected.
-func (d *Driver) gcISCSISessions(gracePeriod time.Duration, dryRun bool) {
+func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
 	// Get all active iSCSI sessions
-	sessions, err := util.ListISCSISessions()
+	sessions, err := gcListISCSISessions()
 	if err != nil {
 		klog.Warningf("Session GC: failed to list iSCSI sessions: %v", err)
 		return
@@ -522,6 +526,10 @@ func (d *Driver) gcISCSISessions(gracePeriod time.Duration, dryRun bool) {
 	activeOrphanedSessions := make(map[string]struct{})
 
 	for _, session := range sessions {
+		if ctx.Err() != nil {
+			klog.V(4).Info("Session GC: stopping iSCSI cleanup after cancellation")
+			return
+		}
 		// Only consider sessions for our portal
 		if session.Portal != portal && session.Portal != portal+",1" {
 			klog.V(5).Infof("Session GC: skipping session %s (different portal: %s)", session.IQN, session.Portal)
@@ -569,7 +577,7 @@ func (d *Driver) gcISCSISessions(gracePeriod time.Duration, dryRun bool) {
 		}
 
 		// Disconnect the orphaned session
-		if err := util.ISCSIDisconnect(portal, session.IQN); err != nil {
+		if err := gcDisconnectISCSI(portal, session.IQN); err != nil {
 			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.IQN, err)
 		} else {
 			klog.Infof("Session GC: disconnected orphaned iSCSI session: %s", session.IQN)
@@ -595,9 +603,9 @@ func (d *Driver) gcISCSISessions(gracePeriod time.Duration, dryRun bool) {
 
 // gcNVMeoFSessions garbage collects orphaned NVMe-oF sessions.
 // Sessions must be orphaned for at least gracePeriod before being disconnected.
-func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
+func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
 	// Get all active NVMe-oF sessions
-	sessions, err := util.ListNVMeoFSessions()
+	sessions, err := gcListNVMeoFSessions()
 	if err != nil {
 		klog.Warningf("Session GC: failed to list NVMe-oF sessions: %v", err)
 		return
@@ -628,6 +636,10 @@ func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 	activeOrphanedSessions := make(map[string]struct{})
 
 	for _, session := range sessions {
+		if ctx.Err() != nil {
+			klog.V(4).Info("Session GC: stopping NVMe-oF cleanup after cancellation")
+			return
+		}
 		// Only consider sessions for our target address
 		// Session address format from nvme list-subsys: "traddr=192.168.120.10,trsvcid=4420,src_addr=192.168.122.10"
 		// Config address format: "192.168.120.10"
@@ -677,7 +689,7 @@ func (d *Driver) gcNVMeoFSessions(gracePeriod time.Duration, dryRun bool) {
 		}
 
 		// Disconnect the orphaned session
-		if err := util.NVMeoFDisconnect(session.NQN); err != nil {
+		if err := gcDisconnectNVMeoF(session.NQN); err != nil {
 			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.NQN, err)
 		} else {
 			klog.Infof("Session GC: disconnected orphaned NVMe-oF session: %s", session.NQN)

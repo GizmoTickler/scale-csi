@@ -48,6 +48,7 @@ zfs:
 
 # NFS share configuration
 nfs:
+  enabled: true
   # NFS server hostname/IP (should match TrueNAS system)
   shareHost: truenas.example.com
 
