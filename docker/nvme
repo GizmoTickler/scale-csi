@@ -30,7 +30,7 @@ case ${NVME_HOST_STRATEGY} in
     # Unlike iSCSI (which has iscsid daemon), nvme-cli is a one-shot command.
     # Use nsenter with PID 1 (init) to access the host namespace.
     # This works on Talos and other minimal OS where chroot may not work.
-    nsenter --mount="/host/proc/1/ns/mnt" --net="/host/proc/1/ns/net" -- ${NVME_HOST_PATH} "${@:1}"
+    nsenter -t 1 --mount --net -- ${NVME_HOST_PATH} "$@"
     ;;
 
   auto)
@@ -39,7 +39,7 @@ case ${NVME_HOST_STRATEGY} in
     if chroot /host ${NVME_HOST_PATH} "${@:1}" 2>/dev/null; then
       exit 0
     fi
-    nsenter --mount="/host/proc/1/ns/mnt" --net="/host/proc/1/ns/net" -- ${NVME_HOST_PATH} "${@:1}"
+    nsenter -t 1 --mount --net -- ${NVME_HOST_PATH} "$@"
     ;;
 
   *)

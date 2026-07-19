@@ -4,13 +4,23 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"syscall"
 
+	"go.uber.org/automaxprocs/maxprocs"
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/driver"
+)
+
+const (
+	cgroupV2MemoryLimitPath = "/sys/fs/cgroup/memory.max"
+	cgroupV1MemoryLimitPath = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 )
 
 var (
@@ -43,9 +53,27 @@ func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
 
+	undoMaxProcs, err := maxprocs.Set(maxprocs.Logger(klog.Infof))
+	if err != nil {
+		klog.Warningf("Unable to configure GOMAXPROCS from cgroups: %v", err)
+	} else {
+		defer undoMaxProcs()
+	}
+
+	if memoryLimit, configured, memoryErr := setMemoryLimitFromCgroup(
+		cgroupV2MemoryLimitPath,
+		cgroupV1MemoryLimitPath,
+		os.LookupEnv,
+		debug.SetMemoryLimit,
+	); memoryErr != nil {
+		klog.Warningf("Unable to configure GOMEMLIMIT from cgroups: %v", memoryErr)
+	} else if configured {
+		klog.Infof("Set GOMEMLIMIT=%d from cgroup memory limit", memoryLimit)
+	}
+
 	if showVersion {
 		fmt.Printf("Scale CSI Driver (for TrueNAS SCALE)\nVersion: %s\nCommit: %s\n", Version, GitCommit)
-		os.Exit(0)
+		return
 	}
 
 	if configFile == "" {
@@ -118,4 +146,77 @@ func main() {
 	if err := drv.Run(); err != nil {
 		klog.Fatalf("Driver failed: %v", err)
 	}
+}
+
+func setMemoryLimitFromCgroup(
+	v2Path string,
+	v1Path string,
+	lookupEnv func(string) (string, bool),
+	setLimit func(int64) int64,
+) (memoryLimit int64, configured bool, err error) {
+	if _, configured := lookupEnv("GOMEMLIMIT"); configured {
+		return 0, false, nil
+	}
+
+	cgroupLimit, finite, err := readCgroupMemoryLimit(v2Path, v1Path)
+	if err != nil || !finite {
+		return 0, false, err
+	}
+
+	// Use 90% of the cgroup limit. Subtracting ceil(10%) avoids overflow near
+	// MaxInt64 while keeping the configured value at or below 90%.
+	reserve := cgroupLimit / 10
+	if cgroupLimit%10 != 0 {
+		reserve++
+	}
+	memoryLimit = cgroupLimit - reserve
+	if memoryLimit <= 0 {
+		return 0, false, nil
+	}
+
+	setLimit(memoryLimit)
+	return memoryLimit, true, nil
+}
+
+func readCgroupMemoryLimit(v2Path, v1Path string) (limit int64, finite bool, err error) {
+	contents, readErr := os.ReadFile(v2Path)
+	if readErr == nil {
+		return parseCgroupMemoryLimit(v2Path, contents, false)
+	}
+	if !os.IsNotExist(readErr) {
+		return 0, false, fmt.Errorf("read cgroup v2 memory limit: %w", readErr)
+	}
+
+	contents, readErr = os.ReadFile(v1Path)
+	if readErr != nil {
+		if os.IsNotExist(readErr) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("read cgroup v1 memory limit: %w", readErr)
+	}
+	return parseCgroupMemoryLimit(v1Path, contents, true)
+}
+
+func parseCgroupMemoryLimit(path string, contents []byte, cgroupV1 bool) (limit int64, finite bool, err error) {
+	value := strings.TrimSpace(string(contents))
+	if value == "" || value == "max" {
+		return 0, false, nil
+	}
+
+	parsedLimit, parseErr := strconv.ParseUint(value, 10, 64)
+	if parseErr != nil {
+		return 0, false, fmt.Errorf("parse cgroup memory limit %q from %s: %w", value, path, parseErr)
+	}
+	if parsedLimit == 0 {
+		return 0, false, nil
+	}
+	// Cgroup v1 represents an unlimited memory controller using a page-aligned
+	// value just below MaxInt64 (or, on some systems, MaxUint64).
+	if cgroupV1 && parsedLimit >= uint64(math.MaxInt64-4095) {
+		return 0, false, nil
+	}
+	if parsedLimit > math.MaxInt64 {
+		return 0, false, fmt.Errorf("cgroup memory limit %q from %s exceeds int64", value, path)
+	}
+	return int64(parsedLimit), true, nil
 }

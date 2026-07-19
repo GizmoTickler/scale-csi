@@ -32,6 +32,14 @@ spec:
           annotations:
             summary: Scale CSI TrueNAS circuit breaker is open
             description: The driver has stopped TrueNAS API calls while the circuit breaker is open.
+        - alert: ScaleCSITrueNASDisconnected
+          expr: scale_csi_truenas_connection_status == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI is disconnected from TrueNAS
+            description: The driver has reported no authenticated TrueNAS connection for two minutes.
         - alert: ScaleCSIHighTrueNASAPIFailureRate
           expr: (sum(rate(scale_csi_truenas_requests_total{status="error"}[5m])) / sum(rate(scale_csi_truenas_requests_total[5m]))) > 0.1
           for: 10m

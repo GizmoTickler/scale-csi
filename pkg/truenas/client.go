@@ -105,6 +105,10 @@ const defaultWriteTimeout = 30 * time.Second
 // method is the API method name, duration is in seconds, err is nil on success.
 type MetricsRecorder func(method string, duration float64, err error)
 
+// ConnectionStatusRecorder is called when aggregate client connectivity changes.
+// connected is true when at least one pooled connection is authenticated.
+type ConnectionStatusRecorder func(connected bool)
+
 // SystemInfo represents TrueNAS system information including version.
 type SystemInfo struct {
 	Version       string `json:"version"` // Full version string (e.g., "TrueNAS-SCALE-25.10.0")
@@ -119,20 +123,21 @@ type SystemInfo struct {
 
 // ClientConfig holds the configuration for the TrueNAS client.
 type ClientConfig struct {
-	Host              string
-	Port              int
-	Protocol          string
-	APIKey            string
-	AllowInsecure     bool
-	Timeout           time.Duration
-	ConnectTimeout    time.Duration
-	WriteTimeout      time.Duration   // Timeout for each WebSocket write (default: 30s)
-	MaxRetries        int             // Maximum number of connection retries (default: 3)
-	RetryInterval     time.Duration   // Initial retry interval (default: 1s, exponential backoff applied)
-	HeartbeatInterval time.Duration   // Interval for WebSocket heartbeat (default: 30s)
-	MaxConnections    int             // Maximum number of concurrent connections (default: 5)
-	MaxConcurrentReqs int             // Maximum number of concurrent API requests (default: 10)
-	MetricsRecorder   MetricsRecorder // Optional callback for recording request metrics
+	Host                     string
+	Port                     int
+	Protocol                 string
+	APIKey                   string
+	AllowInsecure            bool
+	Timeout                  time.Duration
+	ConnectTimeout           time.Duration
+	WriteTimeout             time.Duration            // Timeout for each WebSocket write (default: 30s)
+	MaxRetries               int                      // Maximum number of connection retries (default: 3)
+	RetryInterval            time.Duration            // Initial retry interval (default: 1s, exponential backoff applied)
+	HeartbeatInterval        time.Duration            // Interval for WebSocket heartbeat (default: 30s)
+	MaxConnections           int                      // Maximum number of concurrent connections (default: 5)
+	MaxConcurrentReqs        int                      // Maximum number of concurrent API requests (default: 10)
+	MetricsRecorder          MetricsRecorder          // Optional callback for recording request metrics
+	ConnectionStatusRecorder ConnectionStatusRecorder // Optional callback for aggregate connection changes
 
 	// Circuit breaker configuration
 	CircuitBreaker *CircuitBreakerConfig
@@ -204,6 +209,7 @@ type Connection struct {
 	heartbeatDone chan struct{}
 	lastPong      int64 // atomic unix timestamp
 
+	connectionStateChanged func()
 }
 
 // NewConnection creates a new connection instance.
@@ -219,12 +225,16 @@ func NewConnection(id int, cfg *ClientConfig) *Connection {
 
 // Client is a TrueNAS API client using WebSocket JSON-RPC 2.0 with connection pooling.
 type Client struct {
-	config          *ClientConfig
-	pool            []*Connection
-	next            uint64          // For round-robin selection
-	semaphore       chan struct{}   // Limits concurrent requests to prevent TrueNAS overload
-	metricsRecorder MetricsRecorder // Optional callback for recording request metrics
-	circuitBreaker  *CircuitBreaker // Optional circuit breaker for API calls
+	config                      *ClientConfig
+	pool                        []*Connection
+	next                        uint64          // For round-robin selection
+	semaphore                   chan struct{}   // Limits concurrent requests to prevent TrueNAS overload
+	metricsRecorder             MetricsRecorder // Optional callback for recording request metrics
+	circuitBreaker              *CircuitBreaker // Optional circuit breaker for API calls
+	connectionStatusRecorder    ConnectionStatusRecorder
+	connectionStatusMu          sync.Mutex
+	connectionStatusInitialized bool
+	lastConnectionStatus        bool
 
 	// Version detection cache
 	versionMu    sync.RWMutex
@@ -342,16 +352,18 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	}
 
 	client := &Client{
-		config:          cfg,
-		pool:            make([]*Connection, cfg.MaxConnections),
-		semaphore:       make(chan struct{}, cfg.MaxConcurrentReqs),
-		metricsRecorder: cfg.MetricsRecorder,
-		circuitBreaker:  cb,
+		config:                   cfg,
+		pool:                     make([]*Connection, cfg.MaxConnections),
+		semaphore:                make(chan struct{}, cfg.MaxConcurrentReqs),
+		metricsRecorder:          cfg.MetricsRecorder,
+		circuitBreaker:           cb,
+		connectionStatusRecorder: cfg.ConnectionStatusRecorder,
 	}
 
 	// Initialize connection pool
 	for i := 0; i < cfg.MaxConnections; i++ {
 		client.pool[i] = NewConnection(i, cfg)
+		client.pool[i].connectionStateChanged = client.recordConnectionStatus
 	}
 
 	// Connect initially (at least one connection)
@@ -396,6 +408,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 			return nil, fmt.Errorf("failed to establish any connections (previous: %s): %w", lastErr.Error(), err)
 		}
 	}
+	client.recordConnectionStatus()
 
 	return client, nil
 }
@@ -445,15 +458,18 @@ func (c *Connection) connect(ctx context.Context) error {
 		if err == nil && !connected {
 			err = fmt.Errorf("connection lost during authentication")
 		}
+		newState := stateConnected
 		if err != nil {
-			atomic.StoreInt32(&c.connState, int32(stateDisconnected))
-		} else {
-			atomic.StoreInt32(&c.connState, int32(stateConnected))
+			newState = stateDisconnected
 		}
+		stateChanged := atomic.SwapInt32(&c.connState, int32(newState)) != int32(newState)
 		c.mu.RUnlock()
 		close(done)
 		c.connectDone = nil
 		c.connMu.Unlock()
+		if stateChanged {
+			c.notifyConnectionStateChanged()
+		}
 		return err
 	}
 }
@@ -778,8 +794,17 @@ func (c *Connection) handleDisconnect(generation uint64, cause error) {
 	if !c.stopGeneration(generation) {
 		return
 	}
-	atomic.CompareAndSwapInt32(&c.connState, int32(stateConnected), int32(stateDisconnected))
+	stateChanged := atomic.SwapInt32(&c.connState, int32(stateDisconnected)) != int32(stateDisconnected)
 	c.failPending(generation, cause)
+	if stateChanged {
+		c.notifyConnectionStateChanged()
+	}
+}
+
+func (c *Connection) notifyConnectionStateChanged() {
+	if c.connectionStateChanged != nil {
+		c.connectionStateChanged()
+	}
 }
 
 func (c *Connection) failPending(generation uint64, cause error) {
@@ -931,9 +956,12 @@ func (c *Connection) Close() error {
 	generationWG := c.generationWG
 	c.mu.RUnlock()
 	c.cleanupConnection(generation, fmt.Errorf("connection closed"))
-	atomic.StoreInt32(&c.connState, int32(stateDisconnected))
+	stateChanged := atomic.SwapInt32(&c.connState, int32(stateDisconnected)) != int32(stateDisconnected)
 	if generationWG != nil {
 		generationWG.Wait()
+	}
+	if stateChanged {
+		c.notifyConnectionStateChanged()
 	}
 	return nil
 }
@@ -1168,6 +1196,23 @@ func (c *Client) IsConnected() bool {
 		}
 	}
 	return false
+}
+
+func (c *Client) recordConnectionStatus() {
+	if c.connectionStatusRecorder == nil {
+		return
+	}
+
+	c.connectionStatusMu.Lock()
+	connected := c.IsConnected()
+	if c.connectionStatusInitialized && c.lastConnectionStatus == connected {
+		c.connectionStatusMu.Unlock()
+		return
+	}
+	c.connectionStatusInitialized = true
+	c.lastConnectionStatus = connected
+	c.connectionStatusRecorder(connected)
+	c.connectionStatusMu.Unlock()
 }
 
 // ServiceReload reloads a TrueNAS service configuration.

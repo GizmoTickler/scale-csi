@@ -28,20 +28,7 @@ case ${ISCSIADM_HOST_STRATEGY} in
   nsenter)
     # https://github.com/siderolabs/extensions/issues/38#issuecomment-1125403043
     # Preferred method for Talos and other minimal OS
-    # Find iscsid PID by scanning /host/proc (since regular pgrep only sees container processes)
-    iscsid_pid=""
-    for pid_dir in /host/proc/[0-9]*; do
-      pid=$(basename "${pid_dir}")
-      if [[ -f "${pid_dir}/comm" ]] && [[ "$(cat "${pid_dir}/comm" 2>/dev/null)" == "iscsid" ]]; then
-        iscsid_pid="${pid}"
-        break
-      fi
-    done
-    if [[ "${iscsid_pid}x" == "x" ]]; then
-      echoerr "failed to find iscsid pid for nsenter"
-      exit 1
-    fi
-    nsenter --mount="/host/proc/${iscsid_pid}/ns/mnt" --net="/host/proc/${iscsid_pid}/ns/net" -- ${ISCSIADM_HOST_PATH} "${@:1}"
+    nsenter -t 1 --mount --net -- ${ISCSIADM_HOST_PATH} "$@"
     ;;
 
   *)

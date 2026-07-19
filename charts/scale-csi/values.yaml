@@ -35,8 +35,11 @@ controller:
       drop:
         - ALL
 
-  # Resource requests/limits (none by default - opt-in)
-  resources: {}
+  # Resource requests/limits for the controller driver container
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
 
   # Node selector for controller pod
   nodeSelector: {}
@@ -76,8 +79,11 @@ node:
   # and preserves the CSI field's unset behavior.
   maxVolumesPerNode: 0
 
-  # Resource requests/limits (none by default - opt-in)
-  resources: {}
+  # Resource requests/limits for the node driver container
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
 
   # Node selector for node pods
   nodeSelector: {}
@@ -290,7 +296,7 @@ sidecars:
   provisioner:
     image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
     timeout: 300s
-    workerThreads: 100
+    workerThreads: 10
     extraArgs: []
     resources: {}
 

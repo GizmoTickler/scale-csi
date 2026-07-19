@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -69,22 +68,41 @@ func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeRe
 		return nil, status.Error(codes.FailedPrecondition, "driver not ready")
 	}
 
-	if !d.truenasClient.IsConnected() {
-		// Actually trigger reconnection by making a lightweight API call
-		klog.Warning("TrueNAS client disconnected, attempting reconnection")
-		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err := d.truenasClient.Call(pingCtx, "core.ping")
-		cancel()
-		if err != nil {
-			klog.Warningf("TrueNAS reconnection failed: %v", err)
-			return nil, status.Error(codes.Unavailable, "TrueNAS connection lost")
-		}
-		klog.Info("TrueNAS reconnection successful")
-	}
+	// CSI Probe is used by the liveness sidecar and therefore reports process
+	// health only. Backend connectivity remains visible through /readyz and the
+	// scale_csi_truenas_connection_status metric. The client reconnects on the
+	// next API call; it has no separate non-blocking reconnect entrypoint.
+	d.observeTrueNASConnection()
 
 	return &csi.ProbeResponse{
 		Ready: &wrapperspb.BoolValue{
 			Value: d.ready.Load(),
 		},
 	}, nil
+}
+
+func (d *Driver) observeTrueNASConnection() bool {
+	if d.truenasClient == nil {
+		return false
+	}
+
+	connected := d.truenasClient.IsConnected()
+	SetTrueNASConnectionStatus(connected)
+
+	const (
+		connectionConnected    int32 = 1
+		connectionDisconnected int32 = 2
+	)
+	state := connectionDisconnected
+	if connected {
+		state = connectionConnected
+	}
+	previous := d.truenasConnectionState.Swap(state)
+	if state == connectionDisconnected && previous != connectionDisconnected {
+		klog.Warning("TrueNAS client disconnected; it will reconnect on the next API call")
+	} else if state == connectionConnected && previous == connectionDisconnected {
+		klog.Info("TrueNAS client reconnected")
+	}
+
+	return connected
 }
