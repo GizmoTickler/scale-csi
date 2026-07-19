@@ -302,26 +302,66 @@ const (
 func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType) error {
 	switch shareType {
 	case ShareTypeNFS:
-		// Check if NFS share ID is stored
+		// A replicated dataset can retain the user property while the TrueNAS
+		// configuration database no longer contains the referenced share.
 		if prop, ok := ds.UserProperties[PropNFSShareID]; ok && prop.Value != "" && prop.Value != "-" {
-			klog.V(4).Infof("NFS share already exists for %s (ID: %s)", datasetName, prop.Value)
-			return nil
+			shareID, err := strconv.Atoi(prop.Value)
+			if err != nil || shareID <= 0 {
+				return status.Errorf(codes.Internal, "invalid NFS share ID %q for %s", prop.Value, datasetName)
+			}
+			share, getErr := d.truenasClient.NFSShareGet(ctx, shareID)
+			switch {
+			case getErr == nil && share != nil:
+				klog.V(4).Infof("NFS share already exists for %s (ID: %s)", datasetName, prop.Value)
+				return nil
+			case getErr != nil && !truenas.IsNotFoundError(getErr):
+				return status.Errorf(codes.Internal, "failed to verify NFS share %d for %s: %v", shareID, datasetName, getErr)
+			default:
+				delete(ds.UserProperties, PropNFSShareID)
+			}
 		}
 		klog.Infof("NFS share missing for existing volume %s, creating...", datasetName)
 		return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false)
 
 	case ShareTypeISCSI:
-		// Check if iSCSI target-extent association exists (this means full setup is complete)
+		// The target-extent association is the final object in the iSCSI share.
 		if prop, ok := ds.UserProperties[PropISCSITargetExtentID]; ok && prop.Value != "" && prop.Value != "-" {
-			klog.V(4).Infof("iSCSI share already exists for %s (targetextent: %s)", datasetName, prop.Value)
-			return nil
+			targetExtentID, err := strconv.Atoi(prop.Value)
+			if err != nil || targetExtentID <= 0 {
+				return status.Errorf(codes.Internal, "invalid iSCSI target-extent ID %q for %s", prop.Value, datasetName)
+			}
+			targetExtent, getErr := d.truenasClient.ISCSITargetExtentGet(ctx, targetExtentID)
+			switch {
+			case getErr == nil && targetExtent != nil:
+				klog.V(4).Infof("iSCSI share already exists for %s (targetextent: %s)", datasetName, prop.Value)
+				return nil
+			case getErr != nil && !truenas.IsNotFoundError(getErr):
+				return status.Errorf(codes.Internal, "failed to verify iSCSI target-extent %d for %s: %v", targetExtentID, datasetName, getErr)
+			default:
+				delete(ds.UserProperties, PropISCSITargetExtentID)
+			}
 		}
 		klog.Infof("iSCSI share missing for existing volume %s, creating...", datasetName)
 		return d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, false, false)
 
 	case ShareTypeNVMeoF:
-		// Check if NVMe-oF namespace ID is stored
+		// A namespace is the final object in the NVMe-oF share.
 		if prop, ok := ds.UserProperties[PropNVMeoFNamespaceID]; ok && prop.Value != "" && prop.Value != "-" {
+			namespaceID, err := strconv.Atoi(prop.Value)
+			if err != nil || namespaceID <= 0 {
+				return status.Errorf(codes.Internal, "invalid NVMe-oF namespace ID %q for %s", prop.Value, datasetName)
+			}
+			namespace, getErr := d.truenasClient.NVMeoFNamespaceGet(ctx, namespaceID)
+			switch {
+			case getErr == nil && namespace != nil:
+				// Continue below with host reconciliation for the existing share.
+			case getErr != nil && !truenas.IsNotFoundError(getErr):
+				return status.Errorf(codes.Internal, "failed to verify NVMe-oF namespace %d for %s: %v", namespaceID, datasetName, getErr)
+			default:
+				delete(ds.UserProperties, PropNVMeoFNamespaceID)
+				klog.Infof("NVMe-oF namespace missing for existing volume %s, recreating...", datasetName)
+				return d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, false, false)
+			}
 			if !d.config.NVMeoF.SubsystemAllowAnyHost {
 				subsysID, err := strconv.Atoi(datasetUserProperty(ds, PropNVMeoFSubsystemID))
 				if err != nil || subsysID <= 0 {
@@ -907,6 +947,9 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF subsystem: %v", err)
 	}
 	if err = d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); err != nil {
+		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+			klog.Warningf("Failed to cleanup NVMe-oF subsystem after host reconciliation failure: %v", delErr)
+		}
 		return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", err)
 	}
 

@@ -49,6 +49,10 @@ spec:
         - name: scale-csi
           image: "{{ .Values.image.repository }}:{{ include "scale-csi.imageTag" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.controller.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           args:
             - "-endpoint=unix://{{ include "scale-csi.socketPath" . }}"
             - "-node-id=$(NODE_ID)"

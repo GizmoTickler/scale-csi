@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
+	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
 func TestExpectedSessionsIncludeStagedBlockSymlinks(t *testing.T) {
@@ -119,6 +121,69 @@ func TestNVMeSessionMatchesTransportAddress(t *testing.T) {
 			assert.Equal(t, tc.want, nvmeSessionMatchesTransportAddress(tc.sessionAddress, tc.targetAddress))
 		})
 	}
+}
+
+func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
+	originalMounted := getMountedBlockDevices
+	originalStaged := getStagedBlockDevices
+	originalListISCSI := gcListISCSISessions
+	originalDisconnectISCSI := gcDisconnectISCSI
+	originalListNVMe := gcListNVMeoFSessions
+	originalDisconnectNVMe := gcDisconnectNVMeoF
+	t.Cleanup(func() {
+		getMountedBlockDevices = originalMounted
+		getStagedBlockDevices = originalStaged
+		gcListISCSISessions = originalListISCSI
+		gcDisconnectISCSI = originalDisconnectISCSI
+		gcListNVMeoFSessions = originalListNVMe
+		gcDisconnectNVMeoF = originalDisconnectNVMe
+	})
+	getMountedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+	getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+
+	t.Run("iSCSI", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		d := &Driver{config: &Config{ISCSI: ISCSIConfig{TargetPortal: "192.0.2.10:3260"}}}
+		sessions := []util.ISCSISessionInfo{
+			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.test:one"},
+			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.test:two"},
+		}
+		for _, session := range sessions {
+			d.orphanedSessionsSeen.Store(session.IQN, time.Now().Add(-time.Hour))
+		}
+		gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) { return sessions, nil }
+		disconnects := 0
+		gcDisconnectISCSI = func(string, string) error {
+			disconnects++
+			cancel()
+			return nil
+		}
+
+		d.gcISCSISessions(ctx, 0, false)
+		assert.Equal(t, 1, disconnects)
+	})
+
+	t.Run("NVMeoF", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		d := &Driver{config: &Config{NVMeoF: NVMeoFConfig{TransportAddress: "192.0.2.20"}}}
+		sessions := []util.NVMeoFSessionInfo{
+			{NQN: "nqn.test:one", Address: "traddr=192.0.2.20,trsvcid=4420"},
+			{NQN: "nqn.test:two", Address: "traddr=192.0.2.20,trsvcid=4420"},
+		}
+		for _, session := range sessions {
+			d.orphanedSessionsSeen.Store(session.NQN, time.Now().Add(-time.Hour))
+		}
+		gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) { return sessions, nil }
+		disconnects := 0
+		gcDisconnectNVMeoF = func(string) error {
+			disconnects++
+			cancel()
+			return nil
+		}
+
+		d.gcNVMeoFSessions(ctx, 0, false)
+		assert.Equal(t, 1, disconnects)
+	})
 }
 
 // TestGetExpectedNVMeoFNQNs_FailedLookupsThreshold tests that getExpectedNVMeoFNQNs

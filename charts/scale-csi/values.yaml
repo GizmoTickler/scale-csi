@@ -25,6 +25,16 @@ controller:
     minAvailable: ""
     maxUnavailable: ""
 
+  # Security context for the controller driver container
+  containerSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
   # Resource requests/limits (none by default - opt-in)
   resources: {}
 
@@ -172,11 +182,6 @@ nfs:
   shareMapallUser: ""
   shareMapallGroup: ""
 
-  # Default NFS mount options
-  mountOptions:
-    - nfsvers=4
-    - noatime
-
 # iSCSI configuration
 iscsi:
   # Enable iSCSI support
@@ -233,8 +238,8 @@ nvmeof:
   # (stable per node even when /etc/nvme/hostnqn is absent, e.g. on Flatcar).
   subsystemHosts: []
 
-  # Allow any host NQN to connect. Restrict this in production.
-  subsystemAllowAnyHost: true
+  # Allow any host NQN to connect. Enabling this bypasses subsystemHosts.
+  subsystemAllowAnyHost: false
 
   # Timeout for nvme CLI commands in seconds
   commandTimeout: 30
@@ -351,9 +356,6 @@ securityContext:
 logging:
   # Verbosity level (0-10, higher is more verbose)
   verbosity: 2
-
-  # Log format (text, json)
-  format: text
 
 # Metrics and monitoring configuration
 metrics:

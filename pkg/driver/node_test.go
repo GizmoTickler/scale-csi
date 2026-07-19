@@ -619,6 +619,16 @@ func TestNodeExpandVolumeRescansBeforeFilesystemResize(t *testing.T) {
 	t.Setenv("FAKE_NODE_BLKID_OUTPUT", "ext4\n")
 
 	d := newTestNodeDriver(ShareTypeNFS) // Device detection must support mixed protocols.
+	originalDeviceSize := nodeGetDeviceSize
+	t.Cleanup(func() { nodeGetDeviceSize = originalDeviceSize })
+	sizeReads := 0
+	nodeGetDeviceSize = func(string) (int64, error) {
+		sizeReads++
+		if sizeReads == 1 {
+			return 1 << 30, nil
+		}
+		return 3 << 30, nil
+	}
 	volumePath := t.TempDir()
 	stagingPath := t.TempDir()
 	resp, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
@@ -631,7 +641,7 @@ func TestNodeExpandVolumeRescansBeforeFilesystemResize(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, int64(2<<30), resp.CapacityBytes)
+	assert.Equal(t, int64(3<<30), resp.CapacityBytes, "the response must report the actual device capacity")
 
 	commands := readNodeCommandLog(t, logPath)
 	rescanIndex := strings.Index(commands, "nvme ns-rescan /dev/nvme3")
@@ -647,6 +657,21 @@ func TestNodeExpandVolumeRawBlockRescansWithoutFilesystemResize(t *testing.T) {
 	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme3n7\n")
 
 	d := newTestNodeDriver(ShareTypeNFS)
+	originalDeviceSize := nodeGetDeviceSize
+	originalGetNVMeInfo := nodeGetNVMeInfo
+	t.Cleanup(func() {
+		nodeGetDeviceSize = originalDeviceSize
+		nodeGetNVMeInfo = originalGetNVMeInfo
+	})
+	sizeReads := 0
+	nodeGetDeviceSize = func(string) (int64, error) {
+		sizeReads++
+		if sizeReads == 1 {
+			return 2 << 30, nil
+		}
+		return 4 << 30, nil
+	}
+	nodeGetNVMeInfo = func(string) (string, error) { return "nqn.test:block-vol", nil }
 	resp, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
 		VolumeId:          "block-vol",
 		VolumePath:        t.TempDir(),
@@ -665,6 +690,66 @@ func TestNodeExpandVolumeRawBlockRescansWithoutFilesystemResize(t *testing.T) {
 	assert.NotContains(t, commands, "resize2fs ")
 	assert.NotContains(t, commands, "xfs_growfs ")
 	assert.NotContains(t, commands, "btrfs ")
+}
+
+func TestNodeExpandVolumeReturnsErrorWhenActualSizeIsBelowTarget(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "nvme")
+	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme3n7\n")
+	originalDeviceSize := nodeGetDeviceSize
+	originalGetNVMeInfo := nodeGetNVMeInfo
+	t.Cleanup(func() {
+		nodeGetDeviceSize = originalDeviceSize
+		nodeGetNVMeInfo = originalGetNVMeInfo
+	})
+	nodeGetDeviceSize = func(string) (int64, error) { return 2 << 30, nil }
+	nodeGetNVMeInfo = func(string) (string, error) { return "nqn.test:block-vol", nil }
+
+	d := newTestNodeDriver(ShareTypeNVMeoF)
+	resp, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:          "block-vol",
+		VolumePath:        t.TempDir(),
+		StagingTargetPath: t.TempDir(),
+		CapacityRange:     &csi.CapacityRange{RequiredBytes: 4 << 30},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		},
+	})
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "below requested")
+}
+
+func TestNodeExpandVolumeRejectsRawBlockDeviceOwnedByAnotherVolume(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt")
+	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/sdz\n")
+	originalGetInfo := nodeGetISCSIInfo
+	originalRescan := nodeISCSIRescan
+	t.Cleanup(func() {
+		nodeGetISCSIInfo = originalGetInfo
+		nodeISCSIRescan = originalRescan
+	})
+	nodeGetISCSIInfo = func(string) (string, string, error) {
+		return "192.0.2.10:3260", "iqn.2005-10.org.freenas.ctl:another-volume", nil
+	}
+	rescanCalls := 0
+	nodeISCSIRescan = func(string, string) error {
+		rescanCalls++
+		return nil
+	}
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	_, err := d.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:          "this-volume",
+		VolumePath:        t.TempDir(),
+		StagingTargetPath: t.TempDir(),
+		CapacityRange:     &csi.CapacityRange{RequiredBytes: 4 << 30},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Zero(t, rescanCalls)
 }
 
 func TestStageNFSVolume_Validation(t *testing.T) {
@@ -752,6 +837,58 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, codes.InvalidArgument, st.Code())
 		assert.Contains(t, st.Message(), "LUN")
+	})
+}
+
+func TestBlockBackedFilesystemStagePassesNormalizedMountFlags(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "iscsiadm", "nvme")
+	originalISCSIConnect := iscsiConnectWithSessions
+	originalNVMeConnect := nvmeConnectWithSubsystems
+	originalFormatAndMount := nodeFormatAndMount
+	t.Cleanup(func() {
+		iscsiConnectWithSessions = originalISCSIConnect
+		nvmeConnectWithSubsystems = originalNVMeConnect
+		nodeFormatAndMount = originalFormatAndMount
+	})
+
+	var gotFS string
+	var gotFlags []string
+	nodeFormatAndMount = func(_, _, fsType string, flags []string) error {
+		gotFS = fsType
+		gotFlags = append([]string(nil), flags...)
+		return nil
+	}
+	capability := &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{
+		FsType:     "XFS",
+		MountFlags: []string{" noatime ", "discard", "noatime", ""},
+	}}}
+
+	t.Run("iSCSI", func(t *testing.T) {
+		gotFS, gotFlags = "", nil
+		iscsiConnectWithSessions = func(context.Context, string, string, int, *util.ISCSIConnectOptions, []util.ISCSISessionInfo) (string, error) {
+			return "/dev/sdz", nil
+		}
+		d := newTestNodeDriver(ShareTypeISCSI)
+		err := d.stageISCSIVolume(context.Background(), map[string]string{
+			"portal": "192.0.2.10:3260", "iqn": "iqn.test:volume", "lun": "0",
+		}, filepath.Join(t.TempDir(), "stage"), capability)
+		require.NoError(t, err)
+		assert.Equal(t, "xfs", gotFS)
+		assert.Equal(t, []string{"noatime", "discard"}, gotFlags)
+	})
+
+	t.Run("NVMeoF", func(t *testing.T) {
+		gotFS, gotFlags = "", nil
+		nvmeConnectWithSubsystems = func(string, string, *util.NVMeoFConnectOptions, []util.NVMeSubsystem) (string, error) {
+			return "/dev/nvme9n1", nil
+		}
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
+			"nqn": "nqn.test:volume", "transport": "tcp", "address": "192.0.2.20", "port": "4420",
+		}, filepath.Join(t.TempDir(), "stage"), capability)
+		require.NoError(t, err)
+		assert.Equal(t, "xfs", gotFS)
+		assert.Equal(t, []string{"noatime", "discard"}, gotFlags)
 	})
 }
 
@@ -1160,7 +1297,7 @@ func TestCleanupOrphanedSessionUsesOnlyConfiguredProtocol(t *testing.T) {
 	assert.NotContains(t, log, "iscsiadm -m session")
 }
 
-func TestNodeUnstageSkipsOrphanScanAfterPrimaryDisconnectSuccess(t *testing.T) {
+func TestNodeUnstageBlockSymlinkDoesNotTrustDeviceSession(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt", "iscsiadm", "nvme")
 	logPath := filepath.Join(t.TempDir(), "commands.log")
 	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
@@ -1172,7 +1309,11 @@ func TestNodeUnstageSkipsOrphanScanAfterPrimaryDisconnectSuccess(t *testing.T) {
 		nodeNVMeDisconnect = originalDisconnect
 	}()
 	disconnectCalls := 0
-	nodeGetNVMeInfo = func(string) (string, error) { return "nqn.test:volume", nil }
+	deviceInfoCalls := 0
+	nodeGetNVMeInfo = func(string) (string, error) {
+		deviceInfoCalls++
+		return "nqn.test:another-volume", nil
+	}
 	nodeNVMeDisconnect = func(string) error {
 		disconnectCalls++
 		return nil
@@ -1185,9 +1326,10 @@ func TestNodeUnstageSkipsOrphanScanAfterPrimaryDisconnectSuccess(t *testing.T) {
 		VolumeId: "test-volume", StagingTargetPath: stagingPath,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, 1, disconnectCalls)
+	assert.Zero(t, deviceInfoCalls, "the stale symlink device must not be used to derive a session")
+	assert.Zero(t, disconnectCalls, "a different volume's NVMe session must not be disconnected")
 	log := readNodeCommandLog(t, logPath)
-	assert.NotContains(t, log, "nvme list-subsys")
+	assert.Contains(t, log, "nvme list-subsys")
 	assert.NotContains(t, log, "iscsiadm -m session")
 }
 

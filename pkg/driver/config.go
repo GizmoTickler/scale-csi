@@ -105,6 +105,9 @@ type ZFSConfig struct {
 
 // NFSConfig holds NFS share configuration.
 type NFSConfig struct {
+	// Enabled enables NFS provisioning for StorageClasses that select NFS.
+	Enabled bool `yaml:"enabled"`
+
 	// ShareHost is the NFS server hostname/IP for clients to connect
 	ShareHost string `yaml:"shareHost"`
 
@@ -132,6 +135,9 @@ type NFSConfig struct {
 
 // ISCSIConfig holds iSCSI configuration.
 type ISCSIConfig struct {
+	// Enabled enables iSCSI provisioning for StorageClasses that select iSCSI.
+	Enabled bool `yaml:"enabled"`
+
 	// TargetPortal is the iSCSI target portal (host:port)
 	TargetPortal string `yaml:"targetPortal"`
 
@@ -222,6 +228,9 @@ type SessionGCConfig struct {
 
 // NVMeoFConfig holds NVMe-oF configuration.
 type NVMeoFConfig struct {
+	// Enabled enables NVMe-oF provisioning for StorageClasses that select NVMe-oF.
+	Enabled bool `yaml:"enabled"`
+
 	// Transport is the transport type (tcp, rdma)
 	Transport string `yaml:"transport"`
 
@@ -365,9 +374,37 @@ func LoadConfig(path string) (*Config, error) {
 	// Expand environment variables in the config
 	data = []byte(os.ExpandEnv(string(data)))
 
-	cfg := &Config{}
+	// Defaults must be applied before unmarshalling so an explicit YAML false
+	// still overrides the default.
+	cfg := &Config{ZFS: ZFSConfig{DatasetEnableQuotas: true}}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// Protocol blocks historically did not contain an explicit enabled field.
+	// Preserve those config files while allowing an explicitly disabled block.
+	var protocolPresence struct {
+		NFS *struct {
+			Enabled *bool `yaml:"enabled"`
+		} `yaml:"nfs"`
+		ISCSI *struct {
+			Enabled *bool `yaml:"enabled"`
+		} `yaml:"iscsi"`
+		NVMeoF *struct {
+			Enabled *bool `yaml:"enabled"`
+		} `yaml:"nvmeof"`
+	}
+	if err := yaml.Unmarshal(data, &protocolPresence); err != nil {
+		return nil, fmt.Errorf("failed to parse protocol configuration: %w", err)
+	}
+	if protocolPresence.NFS != nil && protocolPresence.NFS.Enabled == nil {
+		cfg.NFS.Enabled = true
+	}
+	if protocolPresence.ISCSI != nil && protocolPresence.ISCSI.Enabled == nil {
+		cfg.ISCSI.Enabled = true
+	}
+	if protocolPresence.NVMeoF != nil && protocolPresence.NVMeoF.Enabled == nil {
+		cfg.NVMeoF.Enabled = true
 	}
 
 	// Set defaults
@@ -517,20 +554,24 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("zfs.datasetParentName is required")
 	}
 
-	// Validate protocol-specific settings based on driver type
-	shareType := cfg.GetDriverShareType()
-	switch shareType {
-	case "nfs":
-		if cfg.NFS.ShareHost == "" {
-			return nil, fmt.Errorf("nfs.shareHost is required for NFS driver")
-		}
-	case "iscsi":
-		if cfg.ISCSI.TargetPortal == "" {
-			return nil, fmt.Errorf("iscsi.targetPortal is required for iSCSI driver")
-		}
-	case "nvmeof":
+	// The unified driver selects a protocol per StorageClass. Validate only the
+	// protocols that this deployment enabled, never the deprecated driver-name
+	// fallback.
+	if !cfg.NFS.Enabled && !cfg.ISCSI.Enabled && !cfg.NVMeoF.Enabled {
+		return nil, fmt.Errorf("at least one storage protocol must be enabled (nfs, iscsi, or nvmeof)")
+	}
+	if cfg.NFS.Enabled && cfg.NFS.ShareHost == "" {
+		return nil, fmt.Errorf("nfs.shareHost is required when NFS is enabled")
+	}
+	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {
+		return nil, fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
+	}
+	if cfg.NVMeoF.Enabled {
 		if cfg.NVMeoF.TransportAddress == "" {
-			return nil, fmt.Errorf("nvmeof.transportAddress is required for NVMe-oF driver")
+			return nil, fmt.Errorf("nvmeof.transportAddress is required when NVMe-oF is enabled")
+		}
+		if !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
+			return nil, fmt.Errorf("nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty; no host could connect")
 		}
 	}
 

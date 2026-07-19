@@ -2,14 +2,115 @@ package util
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestISCSIConnectUsesStaticNodeRecordFastPath(t *testing.T) {
+	portal := "192.0.2.10:3260"
+	iqn := "iqn.2005-10.org.freenas.ctl:pvc-fast-path"
+	var calls [][]string
+
+	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
+		calls = append(calls, slices.Clone(args))
+		return nil, nil
+	})
+
+	devicePath, err := ISCSIConnectWithOptionsAndSessions(
+		context.Background(), portal, iqn, 0, nil, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "/dev/test-iscsi", devicePath)
+	require.Equal(t, [][]string{
+		{"-m", "node", "-o", "new", "-T", iqn, "-p", portal},
+		{"-m", "node", "-T", iqn, "-p", portal, "--login"},
+	}, calls)
+	assert.False(t, hasISCSIAdmMode(calls, "discovery"), "fast path must not run SendTargets discovery")
+}
+
+func TestISCSIConnectFallsBackToDiscoveryWhenFastPathTargetNotFound(t *testing.T) {
+	portal := "192.0.2.11:3260"
+	iqn := "iqn.2005-10.org.freenas.ctl:pvc-discovery-fallback"
+	var calls [][]string
+	loginAttempts := 0
+
+	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
+		calls = append(calls, slices.Clone(args))
+		if slices.Contains(args, "--login") {
+			loginAttempts++
+			if loginAttempts == 1 {
+				return []byte("iscsiadm: No records found"), errors.New("exit status 21")
+			}
+		}
+		return nil, nil
+	})
+
+	devicePath, err := ISCSIConnectWithOptionsAndSessions(
+		context.Background(), portal, iqn, 0, nil, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "/dev/test-iscsi", devicePath)
+	require.Equal(t, [][]string{
+		{"-m", "node", "-o", "new", "-T", iqn, "-p", portal},
+		{"-m", "node", "-T", iqn, "-p", portal, "--login"},
+		{"-m", "discovery", "-t", "sendtargets", "-p", portal},
+		{"-m", "node", "-T", iqn, "-p", portal, "--login"},
+	}, calls)
+	assert.Equal(t, 2, loginAttempts)
+}
+
+func TestISCSIEnsureNodeRecordAlreadyExistsIsSuccess(t *testing.T) {
+	portal := "192.0.2.12:3260"
+	iqn := "iqn.2005-10.org.freenas.ctl:pvc-existing-record"
+	var calls [][]string
+
+	originalRunner := iscsiAdmCombinedOutput
+	iscsiAdmCombinedOutput = func(_ context.Context, args ...string) ([]byte, error) {
+		calls = append(calls, slices.Clone(args))
+		return []byte("iscsiadm: Could not create new record: record already exists"), errors.New("exit status 15")
+	}
+	t.Cleanup(func() { iscsiAdmCombinedOutput = originalRunner })
+
+	require.NoError(t, iscsiEnsureNodeRecord(context.Background(), portal, iqn))
+	require.Equal(t, [][]string{
+		{"-m", "node", "-o", "new", "-T", iqn, "-p", portal},
+	}, calls)
+}
+
+func stubISCSIConnectDependencies(
+	t *testing.T,
+	runner func(context.Context, ...string) ([]byte, error),
+) {
+	t.Helper()
+	originalRunner := iscsiAdmCombinedOutput
+	originalWait := waitForISCSIDeviceFn
+	iscsiAdmCombinedOutput = runner
+	waitForISCSIDeviceFn = func(string, string, int, time.Duration) (string, error) {
+		return "/dev/test-iscsi", nil
+	}
+	t.Cleanup(func() {
+		iscsiAdmCombinedOutput = originalRunner
+		waitForISCSIDeviceFn = originalWait
+	})
+}
+
+func hasISCSIAdmMode(calls [][]string, mode string) bool {
+	for _, args := range calls {
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "-m" && args[i+1] == mode {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func TestGetISCSISessionsExit21IsEmpty(t *testing.T) {
 	binDir := t.TempDir()
@@ -406,6 +507,11 @@ func TestIsTargetNotFoundError(t *testing.T) {
 		{
 			name:     "does not exist",
 			errMsg:   "iscsiadm: record does not exist in the database",
+			wantTrue: true,
+		},
+		{
+			name:     "no portals found",
+			errMsg:   "iscsiadm: No portals found",
 			wantTrue: true,
 		},
 		{

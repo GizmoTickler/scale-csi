@@ -18,10 +18,19 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// portalDiscoveryMutex serializes iSCSI discovery operations per portal.
-// This prevents TrueNAS from being overwhelmed when multiple volumes
-// try to discover targets simultaneously.
+// portalDiscoveryMutex serializes iSCSI node-record and discovery operations
+// per portal. This prevents concurrent node database updates and keeps
+// SendTargets fallback traffic from overwhelming TrueNAS.
 var portalDiscoveryMutex sync.Map // map[portal]*sync.Mutex
+
+// iscsiAdmCombinedOutput and waitForISCSIDeviceFn provide narrow test seams for
+// the connect path while preserving the production command and device-wait
+// behavior.
+var iscsiAdmCombinedOutput = func(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "iscsiadm", args...).CombinedOutput()
+}
+
+var waitForISCSIDeviceFn = waitForISCSIDevice
 
 // getPortalMutex returns a mutex for the given portal, creating one if needed.
 func getPortalMutex(portal string) *sync.Mutex {
@@ -65,19 +74,19 @@ func invalidateDiscoveryCache(portal string) {
 	klog.V(4).Infof("Invalidated discovery cache for portal %s", portal)
 }
 
-// isTargetNotFoundError checks if the error indicates the target was not found
-// in the iscsiadm node database. This happens when the target was created after
-// the last discovery, and the cached discovery doesn't include it.
+// isTargetNotFoundError checks if the error indicates the target or portal was
+// not found in the iscsiadm node database.
 func isTargetNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
+	errStr := strings.ToLower(err.Error())
 	// iscsiadm returns these messages when the target node record doesn't exist
-	return strings.Contains(errStr, "No records found") ||
-		strings.Contains(errStr, "Could not find records for") ||
+	return strings.Contains(errStr, "no records found") ||
+		strings.Contains(errStr, "could not find records for") ||
 		strings.Contains(errStr, "no record found") ||
-		strings.Contains(errStr, "does not exist")
+		strings.Contains(errStr, "does not exist") ||
+		strings.Contains(errStr, "no portals found")
 }
 
 // Note: getMaxConcurrentLogins() is now configurable via SetConfig().MaxConcurrentLogins
@@ -111,7 +120,7 @@ func ISCSIConnect(portal, iqn string, lun int) (string, error) {
 func ISCSIConnectWithOptions(ctx context.Context, portal, iqn string, lun int, opts *ISCSIConnectOptions) (string, error) {
 	sessions, err := ListISCSISessions()
 	if err != nil {
-		klog.V(4).Infof("Failed to get sessions: %v, will proceed with discovery", err)
+		klog.V(4).Infof("Failed to get sessions: %v, will proceed with connection setup", err)
 	}
 
 	return ISCSIConnectWithOptionsAndSessions(ctx, portal, iqn, lun, opts, sessions)
@@ -165,13 +174,14 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 		break
 	}
 
-	// Serialized discovery with caching to prevent TrueNAS overload
-	// when multiple volumes mount simultaneously
-	discoveryStart := time.Now()
-	if discoveryErr := iscsiDiscoverySerialized(ctx, portal); discoveryErr != nil {
-		return "", fmt.Errorf("discovery failed: %w", discoveryErr)
+	// Create only the node record needed for this target. This avoids network
+	// discovery on the happy path while leaving SendTargets available below as
+	// a fallback for portal configurations the static record cannot satisfy.
+	nodeRecordStart := time.Now()
+	if nodeRecordErr := iscsiEnsureNodeRecord(ctx, portal, iqn); nodeRecordErr != nil {
+		return "", fmt.Errorf("node record creation failed: %w", nodeRecordErr)
 	}
-	klog.Infof("iSCSI discovery completed in %v", time.Since(discoveryStart))
+	klog.Infof("iSCSI fast-path node record ensured for %s in %v", iqn, time.Since(nodeRecordStart))
 
 	// Login to target (also serialized per portal to prevent overload)
 	// If login fails due to target not found, retry with exponential backoff.
@@ -179,7 +189,7 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 	loginStart := time.Now()
 	loginErr := iscsiLoginSerializedWithSessions(ctx, portal, iqn, sessions)
 	if loginErr != nil && isTargetNotFoundError(loginErr) {
-		klog.Warningf("iSCSI login failed for %s (target not found in discovery), will retry with fresh discovery: %v", iqn, loginErr)
+		klog.Warningf("iSCSI fast-path login failed for %s (target not found/no portal record), falling back to SendTargets discovery: %v", iqn, loginErr)
 
 		retryDelay := initialDiscoveryRetryDelay
 		for attempt := 1; attempt <= maxDiscoveryRetries; attempt++ {
@@ -237,7 +247,7 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 
 	// Wait for device to appear
 	deviceStart := time.Now()
-	devicePath, err := waitForISCSIDevice(portal, iqn, lun, timeout)
+	devicePath, err := waitForISCSIDeviceFn(portal, iqn, lun, timeout)
 	if err != nil {
 		return "", fmt.Errorf("device not found after %v: %w", timeout, err)
 	}
@@ -245,6 +255,32 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 
 	klog.Infof("ISCSIConnect completed (full connect) in %v", time.Since(start))
 	return devicePath, nil
+}
+
+// iscsiEnsureNodeRecord creates a static node record for exactly one target.
+// Node database updates are serialized per portal, but intentionally bypass
+// the discovery cache so every fast-path login first ensures its record exists.
+func iscsiEnsureNodeRecord(ctx context.Context, portal, iqn string) error {
+	mutex := getPortalMutex(portal)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	cmdCtx, cancel := context.WithTimeout(ctx, getISCSITimeout())
+	defer cancel()
+
+	args := []string{"-m", "node", "-o", "new", "-T", iqn, "-p", portal}
+	output, err := iscsiAdmCombinedOutput(cmdCtx, args...)
+	if err != nil {
+		detail := strings.ToLower(string(output) + " " + err.Error())
+		if strings.Contains(detail, "already exists") || strings.Contains(detail, "already present") {
+			klog.V(4).Infof("iSCSI node record already exists for %s at %s", iqn, portal)
+			return nil
+		}
+		return fmt.Errorf("node record command failed: %w, output: %s", err, string(output))
+	}
+
+	klog.V(4).Infof("Static iSCSI node record created for %s at %s", iqn, portal)
+	return nil
 }
 
 // ISCSIDisconnect disconnects from an iSCSI target with retry for transient failures.
@@ -342,8 +378,7 @@ func iscsiDiscovery(ctx context.Context, portal string) error {
 	ctx, cancel := context.WithTimeout(ctx, getISCSITimeout())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", portal)
-	output, err := cmd.CombinedOutput()
+	output, err := iscsiAdmCombinedOutput(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal)
 	if err != nil {
 		return fmt.Errorf("discovery command failed: %w, output: %s", err, string(output))
 	}
@@ -392,8 +427,7 @@ func iscsiLoginWithSessions(ctx context.Context, portal, iqn string, sessions []
 	ctx, cancel := context.WithTimeout(ctx, getISCSITimeout())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--login")
-	output, err := cmd.CombinedOutput()
+	output, err := iscsiAdmCombinedOutput(ctx, "-m", "node", "-T", iqn, "-p", portal, "--login")
 	if err != nil {
 		// Check if already logged in
 		if strings.Contains(string(output), "already present") {

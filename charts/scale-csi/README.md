@@ -71,7 +71,6 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nfs.shareMaprootGroup` | NFS maproot group | `wheel` |
 | `nfs.shareMapallUser` | NFS mapall user | `""` |
 | `nfs.shareMapallGroup` | NFS mapall group | `""` |
-| `nfs.mountOptions` | Default NFS StorageClass mount options | `[nfsvers=4, noatime]` |
 | `iscsi.enabled` | Render iSCSI configuration | `true` |
 | `iscsi.portal` | Target portal host; falls back to `truenas.host` | `""` |
 | `iscsi.portalPort` | Target portal port | `3260` |
@@ -88,8 +87,14 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.address` | Target address; falls back to `truenas.host` | `""` |
 | `nvmeof.port` | Target service ID/port | `4420` |
 | `nvmeof.subsystemHosts` | Allowed host NQNs | `[]` |
-| `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `true` |
+| `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `false` |
 | `nvmeof.commandTimeout` | `nvme` command timeout in seconds | `30` |
+
+NVMe-oF requires an explicit `nvmeof.subsystemHosts` allow-list by default.
+Existing installations that relied on allow-any must explicitly set
+`nvmeof.subsystemAllowAnyHost: true` during upgrade. The driver reconciles the
+configured host list on publish and validates that restricted mode has at least
+one host at startup.
 
 The iSCSI IQN basename comes from the TrueNAS global iSCSI configuration; it is
 not a chart or driver ConfigMap setting. The removed `iscsi.basename` and
@@ -161,6 +166,7 @@ convenient.
 | `controller.podDisruptionBudget.enabled` | Create a controller PDB | `false` |
 | `controller.podDisruptionBudget.minAvailable` | PDB minimum available | `""` |
 | `controller.podDisruptionBudget.maxUnavailable` | PDB maximum unavailable | `""` |
+| `controller.containerSecurityContext` | Controller driver container security context | non-root UID 65532, read-only root filesystem, no capabilities |
 | `node.enabled` | Deploy the node DaemonSet | `true` |
 | `node.priorityClassName` | Node priority class | `system-node-critical` |
 | `node.sessionCleanupDelay` | Stale-session retry delay in milliseconds | `500` |
@@ -251,15 +257,17 @@ use `--worker-threads`.
 
 - `nfs.shareAllowedNetworks: []` preserves the driver default but permits mounts
   from any network. Set explicit trusted CIDRs in production.
-- `nvmeof.subsystemAllowAnyHost: true` preserves the driver default but permits
-  any host NQN. To restrict access, set it to `false` and populate
-  `nvmeof.subsystemHosts` with each node's `nvme show-hostnqn` output from every Kubernetes node
-  that may connect. The controller resolves those NQNs to TrueNAS host IDs but
-  does not auto-discover node NQNs. An empty list in restricted mode fails
-  provisioning. Keep network segmentation in place; host allowlisting is an
-  additional control, not a replacement.
+- `nvmeof.subsystemAllowAnyHost: false` requires `nvmeof.subsystemHosts` to
+  contain each connecting node's `nvme show-hostnqn` output. Set allow-any to
+  `true` only when that broader access is intentional. Keep network segmentation
+  in place; host allowlisting is an additional control, not a replacement.
 - Prefer an externally managed Secret and set `truenas.existingSecret`; the
   Secret must contain `api-key`.
+- The node DaemonSet requires a namespace permitted to run at the `privileged`
+  Pod Security level because it uses host networking, the host PID namespace,
+  privileged execution, and host mounts. For Pod Security Admission, label the
+  target namespace with `pod-security.kubernetes.io/enforce: privileged` before
+  installing the chart.
 
 ## Existing Secret example
 

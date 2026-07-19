@@ -196,7 +196,38 @@
                 "string"
               ]
             }
+          },
+          "not": {
+            "allOf": [
+              {
+                "required": [
+                  "minAvailable"
+                ],
+                "properties": {
+                  "minAvailable": {
+                    "not": {
+                      "const": ""
+                    }
+                  }
+                }
+              },
+              {
+                "required": [
+                  "maxUnavailable"
+                ],
+                "properties": {
+                  "maxUnavailable": {
+                    "not": {
+                      "const": ""
+                    }
+                  }
+                }
+              }
+            ]
           }
+        },
+        "containerSecurityContext": {
+          "$ref": "#/definitions/freeObject"
         },
         "resources": {
           "$ref": "#/definitions/freeObject"
@@ -403,12 +434,6 @@
         },
         "shareMapallGroup": {
           "type": "string"
-        },
-        "mountOptions": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
         }
       }
     },
@@ -640,13 +665,6 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 10
-        },
-        "format": {
-          "type": "string",
-          "enum": [
-            "text",
-            "json"
-          ]
         }
       }
     },

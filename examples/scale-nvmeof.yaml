@@ -49,15 +49,21 @@ zfs:
 
 # NVMe-oF configuration
 nvmeof:
+  enabled: true
   # NVMe-oF target address (TrueNAS NVMe-oF server)
-  targetAddress: truenas.example.com
+  transportAddress: truenas.example.com
 
   # NVMe-oF transport protocol
   # Supported: tcp, rdma
   transport: tcp
 
   # Port for NVMe-oF target (default: 4420 for TCP, 4420 for RDMA)
-  port: 4420
+  transportServiceId: 4420
+
+  # Permit all initiator NQNs. Set false only when subsystemHosts contains every
+  # Kubernetes node host NQN that may attach a volume.
+  subsystemAllowAnyHost: true
+  subsystemHosts: []
 
   # NQN (NVMe Qualified Name) prefix
   # Full NQN format: nqn.2014-08.org.nvmexpress:uuid:<namespace-uuid>
