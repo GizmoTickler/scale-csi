@@ -1,4 +1,6 @@
 # Build stage
+# renovate: datasource=docker depName=golang
+# Pin this base image as FROM golang:1.26.4-alpine3.22@sha256:<digest> when Renovate resolves it.
 FROM golang:1.26.4-alpine3.22 AS builder
 
 RUN apk add --no-cache git
@@ -23,6 +25,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
 ######################
 # Runtime image
 ######################
+# renovate: datasource=docker depName=alpine
+# Pin this base image as FROM alpine:3.24@sha256:<digest> when Renovate resolves it.
 FROM alpine:3.24
 
 LABEL org.opencontainers.image.source="https://github.com/GizmoTickler/scale-csi"

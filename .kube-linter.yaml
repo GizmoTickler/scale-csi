@@ -33,8 +33,6 @@ checks:
     # === CSI RBAC Requirements ===
     # CSI drivers need access to secrets for API credentials
     - "access-to-secrets"
-    # CSI RBAC may need broad access for PV/PVC management
-    - "wildcard-in-rules"
 
     # === Namespace and Deployment ===
     # Helm charts are installed in user-specified namespaces
