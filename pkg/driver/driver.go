@@ -150,17 +150,16 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 
 	// Create TrueNAS API client with resilience settings
 	truenasClient, err := newTrueNASClient(&truenas.ClientConfig{
-		Host:                     cfg.Config.TrueNAS.Host,
-		Port:                     cfg.Config.TrueNAS.Port,
-		Protocol:                 cfg.Config.TrueNAS.Protocol,
-		APIKey:                   cfg.Config.TrueNAS.APIKey,
-		AllowInsecure:            cfg.Config.TrueNAS.AllowInsecure,
-		Timeout:                  time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
-		ConnectTimeout:           time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
-		WriteTimeout:             time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,
-		MaxConcurrentReqs:        cfg.Config.TrueNAS.MaxConcurrentRequests,
-		MetricsRecorder:          RecordTrueNASRequest,
-		ConnectionStatusRecorder: SetTrueNASConnectionStatus,
+		Host:              cfg.Config.TrueNAS.Host,
+		Port:              cfg.Config.TrueNAS.Port,
+		Protocol:          cfg.Config.TrueNAS.Protocol,
+		APIKey:            cfg.Config.TrueNAS.APIKey,
+		AllowInsecure:     cfg.Config.TrueNAS.AllowInsecure,
+		Timeout:           time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
+		ConnectTimeout:    time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
+		WriteTimeout:      time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,
+		MaxConcurrentReqs: cfg.Config.TrueNAS.MaxConcurrentRequests,
+		MetricsRecorder:   RecordTrueNASRequest,
 		// Circuit breaker configuration
 		CircuitBreaker: cbConfig,
 		// Retry configuration
