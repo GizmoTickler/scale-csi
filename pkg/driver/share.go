@@ -906,7 +906,7 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF subsystem: %v", err)
 	}
-	if err := d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); err != nil {
+	if err = d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); err != nil {
 		return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", err)
 	}
 
