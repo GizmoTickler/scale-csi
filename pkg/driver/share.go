@@ -121,6 +121,12 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	return group, nil
 }
 
+func (d *Driver) invalidateISCSITargetGroup() {
+	d.iscsiGroupMu.Lock()
+	defer d.iscsiGroupMu.Unlock()
+	d.iscsiResolvedGroup = nil
+}
+
 // resolveNVMeoFHostIDs resolves configured initiator NQNs to TrueNAS host IDs.
 // The mutex makes resolution single-flight within a driver instance; only
 // successful resolutions are cached so API failures are retried.
@@ -174,6 +180,79 @@ func (d *Driver) invalidateNVMeoFHostIDs(nqns []string) {
 	for _, nqn := range nqns {
 		delete(d.nvmeResolvedHosts, nqn)
 	}
+}
+
+func isNVMeoFHostNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "host") &&
+		(strings.Contains(message, "not found") ||
+			strings.Contains(message, "does not exist") ||
+			strings.Contains(message, "no matching"))
+}
+
+func (d *Driver) reconcileNVMeoFHostAssociations(ctx context.Context, subsysID int) error {
+	if d.config.NVMeoF.SubsystemAllowAnyHost {
+		return nil
+	}
+	if len(d.config.NVMeoF.SubsystemHosts) == 0 {
+		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
+	}
+
+	seen := make(map[string]struct{}, len(d.config.NVMeoF.SubsystemHosts))
+	for _, nqn := range d.config.NVMeoF.SubsystemHosts {
+		if _, duplicate := seen[nqn]; duplicate {
+			continue
+		}
+		seen[nqn] = struct{}{}
+		if err := d.ensureNVMeoFHostAssociation(ctx, nqn, subsysID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *Driver) ensureNVMeoFHostAssociation(ctx context.Context, nqn string, subsysID int) error {
+	resolveHostID := func() (int, error) {
+		hostIDs, err := d.resolveNVMeoFHostIDs(ctx, []string{nqn})
+		if err != nil {
+			return 0, err
+		}
+		if len(hostIDs) != 1 {
+			return 0, fmt.Errorf("resolved NVMe-oF host %q to %d IDs", nqn, len(hostIDs))
+		}
+		return hostIDs[0], nil
+	}
+
+	hostID, err := resolveHostID()
+	if err != nil {
+		return fmt.Errorf("failed to resolve NVMe-oF subsystem host %q: %w", nqn, err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		association, findErr := d.truenasClient.NVMeoFHostSubsysFind(ctx, hostID, subsysID)
+		if findErr != nil {
+			return fmt.Errorf("failed to find NVMe-oF host %q association with subsystem %d: %w", nqn, subsysID, findErr)
+		}
+		if association != nil {
+			return nil
+		}
+
+		if _, createErr := d.truenasClient.NVMeoFHostSubsysCreate(ctx, hostID, subsysID); createErr == nil {
+			return nil
+		} else if attempt == 0 && isNVMeoFHostNotFoundError(createErr) {
+			d.invalidateNVMeoFHostIDs([]string{nqn})
+			hostID, err = resolveHostID()
+			if err != nil {
+				return fmt.Errorf("failed to re-resolve NVMe-oF subsystem host %q: %w", nqn, err)
+			}
+			continue
+		} else {
+			return fmt.Errorf("failed to associate NVMe-oF host %q with subsystem %d: %w", nqn, subsysID, createErr)
+		}
+	}
+	return nil
 }
 
 func datasetUserProperty(ds *truenas.Dataset, key string) string {
@@ -243,6 +322,15 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 	case ShareTypeNVMeoF:
 		// Check if NVMe-oF namespace ID is stored
 		if prop, ok := ds.UserProperties[PropNVMeoFNamespaceID]; ok && prop.Value != "" && prop.Value != "-" {
+			if !d.config.NVMeoF.SubsystemAllowAnyHost {
+				subsysID, err := strconv.Atoi(datasetUserProperty(ds, PropNVMeoFSubsystemID))
+				if err != nil || subsysID <= 0 {
+					return status.Errorf(codes.Internal, "invalid NVMe-oF subsystem ID for %s", datasetName)
+				}
+				if err := d.reconcileNVMeoFHostAssociations(ctx, subsysID); err != nil {
+					return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts for %s: %v", datasetName, err)
+				}
+			}
 			klog.V(4).Infof("NVMe-oF share already exists for %s (namespace: %s)", datasetName, prop.Value)
 			return nil
 		}
@@ -437,6 +525,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	// Create target if needed
 	if target == nil {
 		targetGroups := []truenas.ISCSITargetGroup{}
+		usedResolvedGroup := false
 		for _, tg := range d.config.ISCSI.TargetGroups {
 			var auth *int
 			if tg.Auth != nil && *tg.Auth > 0 {
@@ -455,10 +544,14 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				return status.Errorf(codes.Internal, "cannot create iSCSI target for %s: %v", datasetName, resolveErr)
 			}
 			targetGroups = append(targetGroups, *resolved)
+			usedResolvedGroup = true
 		}
 
 		target, err = d.truenasClient.ISCSITargetCreate(ctx, iscsiName, "", "ISCSI", targetGroups)
 		if err != nil {
+			if usedResolvedGroup {
+				d.invalidateISCSITargetGroup()
+			}
 			if freshlyCreated && truenas.IsAlreadyExistsError(err) {
 				target, _ = d.truenasClient.ISCSITargetFindByName(ctx, iscsiName)
 			}
@@ -797,11 +890,24 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		d.config.NVMeoF.SubsystemAllowAnyHost,
 		hostIDs,
 	)
-	if err != nil {
-		if len(hostIDs) > 0 {
-			d.invalidateNVMeoFHostIDs(d.config.NVMeoF.SubsystemHosts)
+	if err != nil && len(hostIDs) > 0 && isNVMeoFHostNotFoundError(err) {
+		d.invalidateNVMeoFHostIDs(d.config.NVMeoF.SubsystemHosts)
+		hostIDs, err = d.resolveNVMeoFHostIDs(ctx, d.config.NVMeoF.SubsystemHosts)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to re-resolve NVMe-oF subsystem hosts: %v", err)
 		}
+		subsys, err = d.truenasClient.NVMeoFSubsystemCreate(
+			ctx,
+			subsysName,
+			d.config.NVMeoF.SubsystemAllowAnyHost,
+			hostIDs,
+		)
+	}
+	if err != nil {
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF subsystem: %v", err)
+	}
+	if err = d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); err != nil {
+		return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", err)
 	}
 
 	// Get or create the NVMe-oF TCP port BEFORE creating namespace

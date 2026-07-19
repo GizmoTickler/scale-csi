@@ -2,7 +2,9 @@
 package util
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -156,7 +158,9 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 		// Do not let the pre-disconnect snapshot suppress the login below.
 		sessions = removeISCSISessionByIQN(sessions, iqn)
 		if sessionCleanupDelay > 0 {
-			time.Sleep(sessionCleanupDelay)
+			if cleanupErr := waitForISCSISessionCleanup(ctx, iqn, sessionCleanupDelay); cleanupErr != nil {
+				klog.V(4).Infof("iSCSI session cleanup poll for %s ended with: %v", iqn, cleanupErr)
+			}
 		}
 		break
 	}
@@ -408,13 +412,15 @@ func getISCSISessions() ([]ISCSISession, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	output, err := cmd.Output()
 	if err != nil {
-		// No sessions is not an error
-		if strings.Contains(string(output), "No active sessions") {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 21 {
 			return nil, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("failed to list iSCSI sessions: %w, stderr: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
 	var sessions []ISCSISession
@@ -443,11 +449,11 @@ func getISCSISessions() ([]ISCSISession, error) {
 }
 
 // waitForISCSIDevice waits for the iSCSI device to appear in /dev.
-// Uses exponential backoff starting at 50ms, maxing at 500ms for faster detection.
+// Uses exponential backoff starting at 50ms, maxing at 100ms for faster detection.
 func waitForISCSIDevice(portal, iqn string, lun int, timeout time.Duration) (string, error) {
 	start := time.Now()
 	pollInterval := 50 * time.Millisecond
-	maxPollInterval := 500 * time.Millisecond
+	maxPollInterval := 100 * time.Millisecond
 
 	for {
 		devicePath, err := findISCSIDevice(iqn, lun)
@@ -460,10 +466,62 @@ func waitForISCSIDevice(portal, iqn string, lun int, timeout time.Duration) (str
 		}
 
 		time.Sleep(pollInterval)
-		// Exponential backoff: 50ms -> 100ms -> 200ms -> 400ms -> 500ms (max)
+		// Exponential backoff: 50ms -> 100ms (max)
 		pollInterval *= 2
 		if pollInterval > maxPollInterval {
 			pollInterval = maxPollInterval
+		}
+	}
+}
+
+func waitForISCSISessionCleanup(ctx context.Context, iqn string, timeout time.Duration) error {
+	return pollForISCSISessionCleanup(ctx, timeout, func() (bool, error) {
+		sessions, err := ListISCSISessions()
+		if err != nil {
+			return true, err
+		}
+		_, err = FindISCSISessionByIQNFromSessions(iqn, sessions)
+		return err == nil, nil
+	})
+}
+
+func pollForISCSISessionCleanup(ctx context.Context, timeout time.Duration, sessionExists func() (bool, error)) error {
+	exists, lastErr := sessionExists()
+	if !exists && lastErr == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		return lastErr
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		wait := 100 * time.Millisecond
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			if lastErr != nil {
+				return lastErr
+			}
+			return fmt.Errorf("session still present after %v", timeout)
+		}
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+			exists, lastErr = sessionExists()
+			if !exists && lastErr == nil {
+				return nil
+			}
 		}
 	}
 }

@@ -230,6 +230,93 @@ func TestCreateVolume(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		storedType string
+		storedID   string
+		request    *csi.VolumeContentSource
+		wantType   string
+		wantID     string
+	}{
+		{
+			name:       "stored snapshot source",
+			storedType: "snapshot",
+			storedID:   "stored-snapshot",
+			request: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "request-snapshot"},
+			}},
+			wantType: "snapshot",
+			wantID:   "stored-snapshot",
+		},
+		{
+			name: "request fallback",
+			request: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "request-volume"},
+			}},
+			wantType: "volume",
+			wantID:   "request-volume",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mockClient := truenas.NewMockClient()
+			d := &Driver{
+				config: &Config{
+					ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+					DriverName: "org.scale.csi.nfs",
+					NFS:        NFSConfig{ShareHost: "1.2.3.4"},
+				},
+				truenasClient: mockClient,
+			}
+			ctx := context.Background()
+			_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+				Name: "pool/parent/existing-source", Type: "FILESYSTEM", Refquota: 1024 * 1024 * 1024,
+			})
+			require.NoError(t, err)
+			require.NoError(t, mockClient.DatasetSetUserProperty(ctx, "pool/parent/existing-source", PropNFSShareID, "1"))
+			if tc.storedType != "" {
+				require.NoError(t, mockClient.DatasetSetUserProperty(ctx, "pool/parent/existing-source", PropVolumeContentSourceType, tc.storedType))
+				require.NoError(t, mockClient.DatasetSetUserProperty(ctx, "pool/parent/existing-source", PropVolumeContentSourceID, tc.storedID))
+			}
+
+			resp, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+				Name:                "existing-source",
+				VolumeCapabilities:  []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+				VolumeContentSource: tc.request,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, resp.GetVolume().GetContentSource())
+			if tc.wantType == "snapshot" {
+				assert.Equal(t, tc.wantID, resp.GetVolume().GetContentSource().GetSnapshot().GetSnapshotId())
+			} else {
+				assert.Equal(t, tc.wantID, resp.GetVolume().GetContentSource().GetVolume().GetVolumeId())
+			}
+		})
+	}
+}
+
+func TestCreateVolumeLocksOnSanitizedVolumeID(t *testing.T) {
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "1.2.3.4"},
+		},
+		truenasClient: truenas.NewMockClient(),
+	}
+	name := "volume/name with spaces"
+	lockKey := "volume:" + d.sanitizeVolumeID(name)
+	require.True(t, d.acquireOperationLock(lockKey))
+	defer d.releaseOperationLock(lockKey)
+
+	_, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               name,
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.Aborted, status.Code(err))
+}
+
 func TestDeleteVolume(t *testing.T) {
 	// Setup
 	mockClient := truenas.NewMockClient()

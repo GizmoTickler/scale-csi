@@ -86,6 +86,8 @@ type ClientInterface interface {
 	// NVMe-oF methods (updated for TrueNAS SCALE 25.10+)
 	NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*NVMeoFHost, error)
 	NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFHost, error)
+	NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error)
+	NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error)
 	NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemDelete(ctx context.Context, id int) error
 	NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error)

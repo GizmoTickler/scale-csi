@@ -265,11 +265,11 @@ func listNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
 }
 
 // waitForNVMeDevice waits for the NVMe device to appear.
-// Uses exponential backoff starting at 50ms, maxing at 500ms for faster detection.
+// Uses exponential backoff starting at 50ms, maxing at 100ms for faster detection.
 func waitForNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (string, error) {
 	start := time.Now()
 	pollInterval := 50 * time.Millisecond
-	maxPollInterval := 500 * time.Millisecond
+	maxPollInterval := 100 * time.Millisecond
 
 	for {
 		// Check context cancellation
@@ -290,7 +290,7 @@ func waitForNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (
 		}
 
 		time.Sleep(pollInterval)
-		// Exponential backoff: 50ms -> 100ms -> 200ms -> 400ms -> 500ms (max)
+		// Exponential backoff: 50ms -> 100ms (max)
 		pollInterval *= 2
 		if pollInterval > maxPollInterval {
 			pollInterval = maxPollInterval
@@ -301,7 +301,7 @@ func waitForNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (
 func waitForNVMeDeviceWithSubsystems(ctx context.Context, nqn string, timeout time.Duration, subsystems []NVMeSubsystem, refreshAfterConnect bool) (string, error) {
 	start := time.Now()
 	pollInterval := 50 * time.Millisecond
-	maxPollInterval := 500 * time.Millisecond
+	maxPollInterval := 100 * time.Millisecond
 
 	for {
 		select {

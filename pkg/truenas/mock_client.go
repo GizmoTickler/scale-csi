@@ -878,6 +878,51 @@ func (m *MockClient) NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFH
 	return host, nil
 }
 
+func (m *MockClient) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	subsys := m.NVMeSubsystems[subsysID]
+	if subsys == nil {
+		return nil, fmt.Errorf("NVMe-oF subsystem ID %d not found", subsysID)
+	}
+	hostFound := false
+	for _, host := range m.NVMeHosts {
+		if host.ID == hostID {
+			hostFound = true
+			break
+		}
+	}
+	if !hostFound {
+		return nil, fmt.Errorf("NVMe-oF host ID %d not found", hostID)
+	}
+	for _, existingHostID := range subsys.Hosts {
+		if existingHostID == hostID {
+			return &NVMeoFHostSubsys{ID: hostID, HostID: hostID, SubsysID: subsysID}, nil
+		}
+	}
+	subsys.Hosts = append(subsys.Hosts, hostID)
+	return &NVMeoFHostSubsys{ID: hostID, HostID: hostID, SubsysID: subsysID}, nil
+}
+
+func (m *MockClient) NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	if subsys := m.NVMeSubsystems[subsysID]; subsys != nil {
+		for _, existingHostID := range subsys.Hosts {
+			if existingHostID == hostID {
+				return &NVMeoFHostSubsys{ID: hostID, HostID: hostID, SubsysID: subsysID}, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
 func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

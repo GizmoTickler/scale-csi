@@ -110,8 +110,9 @@ func RetryWithBackoff(ctx context.Context, name string, cfg *RetryConfig, fn fun
 // UnmountRetryConfig returns retry configuration optimized for unmount operations.
 func UnmountRetryConfig() *RetryConfig {
 	cfg := DefaultRetryConfig()
-	cfg.MaxAttempts = 5
-	cfg.InitialDelay = 500 * time.Millisecond
+	// Six backoffs total 6.3s, below the previous four-backoff 7.5s ceiling.
+	cfg.MaxAttempts = 7
+	cfg.InitialDelay = 100 * time.Millisecond
 	cfg.RetryableErrors = []string{
 		"device or resource busy",
 		"target is busy",

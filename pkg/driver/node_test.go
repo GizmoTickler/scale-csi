@@ -1120,7 +1120,7 @@ func TestCleanupOrphanedSessionByVolumeID(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNFS)
 
 		// Should be a no-op for NFS (no sessions to clean)
-		d.cleanupOrphanedSessionByVolumeID(context.Background(), "test-vol")
+		d.cleanupOrphanedSessionByVolumeID(context.Background(), "test-vol", ShareTypeNFS)
 	})
 
 	t.Run("ISCSIDriver", func(t *testing.T) {
@@ -1129,7 +1129,7 @@ func TestCleanupOrphanedSessionByVolumeID(t *testing.T) {
 
 		// Should attempt to find and clean iSCSI session
 		// Will log "no active session found" since no real sessions exist
-		d.cleanupOrphanedSessionByVolumeID(context.Background(), "test-vol")
+		d.cleanupOrphanedSessionByVolumeID(context.Background(), "test-vol", ShareTypeISCSI)
 	})
 
 	t.Run("NVMeoFDriver", func(t *testing.T) {
@@ -1138,8 +1138,138 @@ func TestCleanupOrphanedSessionByVolumeID(t *testing.T) {
 		d.config.NVMeoF.NameSuffix = "-prod"
 
 		// Should attempt to find and clean NVMe-oF session
-		d.cleanupOrphanedSessionByVolumeID(context.Background(), "test-vol")
+		d.cleanupOrphanedSessionByVolumeID(context.Background(), "test-vol", ShareTypeNVMeoF)
 	})
+}
+
+func TestCleanupOrphanedSessionUsesOnlyConfiguredProtocol(t *testing.T) {
+	installFakeNodeCommands(t, "iscsiadm", "nvme")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	d.cleanupOrphanedSessionByVolumeID(context.Background(), "test-vol", ShareTypeISCSI)
+	log := readNodeCommandLog(t, logPath)
+	assert.Contains(t, log, "iscsiadm -m session")
+	assert.NotContains(t, log, "nvme list-subsys")
+
+	require.NoError(t, os.Remove(logPath))
+	d.cleanupOrphanedSessionByVolumeID(context.Background(), "test-vol", ShareTypeNVMeoF)
+	log = readNodeCommandLog(t, logPath)
+	assert.Contains(t, log, "nvme list-subsys")
+	assert.NotContains(t, log, "iscsiadm -m session")
+}
+
+func TestNodeUnstageSkipsOrphanScanAfterPrimaryDisconnectSuccess(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "iscsiadm", "nvme")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+	originalGetInfo := nodeGetNVMeInfo
+	originalDisconnect := nodeNVMeDisconnect
+	defer func() {
+		nodeGetNVMeInfo = originalGetInfo
+		nodeNVMeDisconnect = originalDisconnect
+	}()
+	disconnectCalls := 0
+	nodeGetNVMeInfo = func(string) (string, error) { return "nqn.test:volume", nil }
+	nodeNVMeDisconnect = func(string) error {
+		disconnectCalls++
+		return nil
+	}
+
+	stagingPath := filepath.Join(t.TempDir(), "staging")
+	require.NoError(t, os.Symlink("/dev/nvme9n1", stagingPath))
+	d := newTestNodeDriver(ShareTypeNVMeoF)
+	_, err := d.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+		VolumeId: "test-volume", StagingTargetPath: stagingPath,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, disconnectCalls)
+	log := readNodeCommandLog(t, logPath)
+	assert.NotContains(t, log, "nvme list-subsys")
+	assert.NotContains(t, log, "iscsiadm -m session")
+}
+
+func TestNodeUnstageOrphanScanProtocolSelection(t *testing.T) {
+	t.Run("KnownISCSIDeviceProbesOnlyISCSI", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "iscsiadm", "nvme")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+		originalGetInfo := nodeGetISCSIInfo
+		defer func() { nodeGetISCSIInfo = originalGetInfo }()
+		nodeGetISCSIInfo = func(string) (string, string, error) {
+			return "", "", errors.New("info lookup failed")
+		}
+
+		stagingPath := filepath.Join(t.TempDir(), "staging")
+		require.NoError(t, os.Symlink("/dev/sdz", stagingPath))
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		_, err := d.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+			VolumeId: "test-volume", StagingTargetPath: stagingPath,
+		})
+		require.NoError(t, err)
+		log := readNodeCommandLog(t, logPath)
+		assert.Contains(t, log, "iscsiadm -m session")
+		assert.NotContains(t, log, "nvme list-subsys")
+	})
+
+	t.Run("KnownNVMeDeviceProbesOnlyNVMe", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "iscsiadm", "nvme")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+		originalGetInfo := nodeGetNVMeInfo
+		defer func() { nodeGetNVMeInfo = originalGetInfo }()
+		nodeGetNVMeInfo = func(string) (string, error) {
+			return "", errors.New("info lookup failed")
+		}
+
+		stagingPath := filepath.Join(t.TempDir(), "staging")
+		require.NoError(t, os.Symlink("/dev/nvme9n1", stagingPath))
+		d := newTestNodeDriver(ShareTypeISCSI)
+		_, err := d.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+			VolumeId: "test-volume", StagingTargetPath: stagingPath,
+		})
+		require.NoError(t, err)
+		log := readNodeCommandLog(t, logPath)
+		assert.Contains(t, log, "nvme list-subsys")
+		assert.NotContains(t, log, "iscsiadm -m session")
+	})
+
+	t.Run("EmptyDeviceProbesBothProtocols", func(t *testing.T) {
+		installFakeNodeCommands(t, "findmnt", "iscsiadm", "nvme")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+		d := newTestNodeDriver(ShareTypeISCSI)
+		_, err := d.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+			VolumeId: "test-volume", StagingTargetPath: filepath.Join(t.TempDir(), "missing"),
+		})
+		require.NoError(t, err)
+		log := readNodeCommandLog(t, logPath)
+		assert.Contains(t, log, "iscsiadm -m session")
+		assert.Contains(t, log, "nvme list-subsys")
+	})
+}
+
+func TestCleanupOrphanedISCSISessionUsesProtocolShareName(t *testing.T) {
+	installFakeNodeCommands(t, "iscsiadm")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	d.config.ISCSI.NameSuffix = "-cluster"
+	volumeID := strings.Repeat("Long_Volume_Name!", 8)
+	targetName := protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
+	iqn := "iqn.2005-10.org.freenas.ctl:" + targetName
+	t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 "+iqn+" (non-flash)\n")
+
+	d.cleanupOrphanedSessionByVolumeID(context.Background(), volumeID, ShareTypeISCSI)
+	log := readNodeCommandLog(t, logPath)
+	assert.Contains(t, log, "-T "+iqn)
+	assert.LessOrEqual(t, len(targetName), 64)
 }
 
 func TestNodeStageVolume_ConcurrentProtection(t *testing.T) {
