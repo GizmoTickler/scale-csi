@@ -1276,6 +1276,12 @@ func TestSnapshotFindByName_Success(t *testing.T) {
 	assert.Equal(t, []interface{}{"dataset", "^", "tank/k8s/volumes/"}, datasetFilter)
 }
 
+func TestSnapshotFindByNameQuotesLegacyRegexName(t *testing.T) {
+	filters := legacySnapshotNameFilters("tank/k8s/volumes", ".*")
+	idFilter := filters[1]
+	assert.Equal(t, []interface{}{"id", "~", `.*@\.\*$`}, idFilter)
+}
+
 // TestSnapshotFindByName_NotFound tests finding a snapshot that doesn't exist
 func TestSnapshotFindByName_NotFound(t *testing.T) {
 	resetSnapshotAPIPrefix()

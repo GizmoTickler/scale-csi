@@ -376,6 +376,11 @@ func TestNodePublishVolume_Validation(t *testing.T) {
 
 func TestNodePublishUnpublishVolume_BlockRoundTrip(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt", "mount", "umount")
+	originalGetInfo := nodeGetISCSIInfo
+	defer func() { nodeGetISCSIInfo = originalGetInfo }()
+	nodeGetISCSIInfo = func(string) (string, string, error) {
+		return "192.0.2.10:3260", "iqn.2026-07.example:block-vol", nil
+	}
 	logPath := filepath.Join(t.TempDir(), "commands.log")
 	mountStatePath := filepath.Join(t.TempDir(), "mounted")
 	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
@@ -416,6 +421,38 @@ func TestNodePublishUnpublishVolume_BlockRoundTrip(t *testing.T) {
 	_, err = os.Lstat(targetPath)
 	assert.True(t, os.IsNotExist(err))
 	assert.Contains(t, readNodeCommandLog(t, logPath), "umount "+targetPath)
+}
+
+func TestNodePublishVolumeRawBlockRejectsWrongDeviceOwner(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "mount")
+	originalGetInfo := nodeGetISCSIInfo
+	defer func() { nodeGetISCSIInfo = originalGetInfo }()
+	nodeGetISCSIInfo = func(string) (string, string, error) {
+		return "192.0.2.10:3260", "iqn.2026-07.example:another-volume", nil
+	}
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+	stagingPath := filepath.Join(t.TempDir(), "staged-device")
+	require.NoError(t, os.Symlink("/dev/null", stagingPath))
+	targetPath := filepath.Join(t.TempDir(), "pod", "volume")
+	d := newTestNodeDriver(ShareTypeISCSI)
+
+	_, err := d.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "block-vol",
+		StagingTargetPath: stagingPath,
+		TargetPath:        targetPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "another-volume")
+	assert.Contains(t, err.Error(), "block-vol")
+	assert.NotContains(t, readNodeCommandLog(t, logPath), "mount -o bind")
+	_, statErr := os.Lstat(targetPath)
+	assert.True(t, os.IsNotExist(statErr), "ownership must be checked before creating the target file")
 }
 
 func TestNodeUnpublishVolume_Validation(t *testing.T) {
@@ -932,7 +969,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
 
 func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 	t.Run("iSCSI", func(t *testing.T) {
-		installFakeNodeCommands(t, "iscsiadm")
+		installFakeNodeCommands(t, "findmnt", "iscsiadm")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
 		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:other (non-flash)\n")
@@ -957,7 +994,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 	})
 
 	t.Run("NVMe-oF", func(t *testing.T) {
-		installFakeNodeCommands(t, "nvme")
+		installFakeNodeCommands(t, "findmnt", "nvme")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
 		t.Setenv("FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT", `{"Subsystems":[{"NQN":"nqn.test:other","Name":"nvme2"}]}`)

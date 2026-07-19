@@ -425,6 +425,10 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			if !strings.HasPrefix(devicePath, "/dev/") {
 				return nil, status.Errorf(codes.Internal, "staging path did not resolve to a block device: %s", devicePath)
 			}
+			shareType := d.nodeAttachDriver(req.GetVolumeContext())
+			if ownershipErr := d.validateRawBlockDeviceOwnership(volumeID, devicePath, shareType); ownershipErr != nil {
+				return nil, ownershipErr
+			}
 
 			target, openErr := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY, 0o640)
 			if openErr != nil {
@@ -670,7 +674,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 		}
 
 		if rawBlock {
-			if ownershipErr := d.validateRawBlockExpansionDevice(volumeID, devicePath, shareType); ownershipErr != nil {
+			if ownershipErr := d.validateRawBlockDeviceOwnership(volumeID, devicePath, shareType); ownershipErr != nil {
 				return nil, ownershipErr
 			}
 		}
@@ -741,7 +745,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 	}, nil
 }
 
-func (d *Driver) validateRawBlockExpansionDevice(volumeID, devicePath string, shareType ShareType) error {
+func (d *Driver) validateRawBlockDeviceOwnership(volumeID, devicePath string, shareType ShareType) error {
 	switch shareType {
 	case ShareTypeISCSI:
 		_, iqn, err := nodeGetISCSIInfo(devicePath)

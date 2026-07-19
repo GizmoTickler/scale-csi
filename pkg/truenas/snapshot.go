@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -528,10 +529,7 @@ func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name str
 	// Build the full snapshot ID pattern to match: any dataset under parentDataset + @ + name
 	// We use "id" filter with regex match to find the snapshot regardless of its parent dataset
 	// The pattern matches any string ending with "@" + name
-	filters := [][]interface{}{
-		{"dataset", "^", strings.TrimSuffix(parentDataset, "/") + "/"},
-		{"id", "~", fmt.Sprintf(".*@%s$", name)},
-	}
+	filters := legacySnapshotNameFilters(parentDataset, name)
 
 	result, err := c.Call(ctx, c.snapshotMethod(ctx, "query"), filters, map[string]interface{}{})
 	if err != nil {
@@ -548,6 +546,13 @@ func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name str
 	}
 
 	return parseSnapshot(items[0])
+}
+
+func legacySnapshotNameFilters(parentDataset, name string) [][]interface{} {
+	return [][]interface{}{
+		{"dataset", "^", strings.TrimSuffix(parentDataset, "/") + "/"},
+		{"id", "~", fmt.Sprintf(".*@%s$", regexp.QuoteMeta(name))},
+	}
 }
 
 func (c *Client) querySnapshotResources(ctx context.Context, paths []string, recursive bool, properties []string) ([]*Snapshot, error) {

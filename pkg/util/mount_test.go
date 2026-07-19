@@ -500,6 +500,63 @@ func TestFormatAndMountBlkidExitHandling(t *testing.T) {
 		assert.NotContains(t, commands, "mkfs.ext4")
 		assert.NotContains(t, commands, "mount -t")
 	})
+
+	t.Run("existing filesystem mismatch fails before mount", func(t *testing.T) {
+		installFakeMountCommands(t, "blkid", "mkfs.ext4", "mount")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_BLKID_OUTPUT", "xfs")
+
+		err := FormatAndMount("/dev/test", "/target", "ext4", nil)
+		require.EqualError(t, err, "device /dev/test has filesystem xfs, requested ext4")
+
+		commands := readCommandLog(t, logPath)
+		assert.Contains(t, commands, "blkid -o value -s TYPE /dev/test")
+		assert.NotContains(t, commands, "mkfs.ext4")
+		assert.NotContains(t, commands, "mount -t")
+	})
+}
+
+func TestMountRejectsUnsupportedFilesystemType(t *testing.T) {
+	installFakeMountCommands(t, "mount", "blkid")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_BLKID_OUTPUT", "ntfs")
+
+	err := FormatAndMount("/dev/test", "/target", "ntfs", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid argument")
+	assert.Contains(t, err.Error(), "unsupported filesystem type")
+	assert.Empty(t, readCommandLog(t, logPath), "unsupported types must not reach blkid or mount")
+
+	err = Mount("/dev/test", "/target", "ntfs", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid argument")
+	assert.Empty(t, readCommandLog(t, logPath), "unsupported types must not reach mount")
+}
+
+func TestIsMountedNonexistentPathUsesFindmnt(t *testing.T) {
+	installFakeMountCommands(t, "findmnt")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_COMMAND_LOG", logPath)
+	missingPath := filepath.Join(t.TempDir(), "does-not-exist")
+
+	mounted, err := IsMounted(missingPath)
+	require.NoError(t, err)
+	assert.False(t, mounted)
+	assert.Contains(t, readCommandLog(t, logPath), "findmnt --mountpoint "+missingPath+" --noheadings")
+}
+
+func TestGetDeviceFromMountPointUsesFirstFindmntResult(t *testing.T) {
+	installFakeMountCommands(t, "findmnt")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_FINDMNT_OUTPUT", "/dev/mapper/upper\n/dev/mapper/lower\n")
+
+	device, err := GetDeviceFromMountPoint("/target")
+	require.NoError(t, err)
+	assert.Equal(t, "/dev/mapper/upper", device)
+	assert.Contains(t, readCommandLog(t, logPath), "findmnt --first-only -n -o SOURCE /target")
 }
 
 // getFormatCommand returns the mkfs command and arguments for a filesystem type.

@@ -4,11 +4,13 @@ package truenas
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,6 +126,8 @@ type ClientConfig struct {
 	Protocol          string
 	APIKey            string
 	AllowInsecure     bool
+	CACert            string
+	CACertFile        string
 	Timeout           time.Duration
 	ConnectTimeout    time.Duration
 	WriteTimeout      time.Duration   // Timeout for each WebSocket write (default: 30s)
@@ -177,19 +181,20 @@ const (
 
 // Connection represents a single WebSocket connection to TrueNAS.
 type Connection struct {
-	id            int
-	config        *ClientConfig
-	conn          atomic.Pointer[websocket.Conn] // atomic for lock-free reads
-	mu            sync.RWMutex
-	messageID     int64
-	pending       map[int64]*pendingCall
-	pendingMu     sync.RWMutex
-	authenticated bool
-	generation    uint64
-	stopped       bool
-	generationWG  *sync.WaitGroup
-	sendMu        sync.Mutex
-	shutdown      atomic.Bool
+	id                  int
+	config              *ClientConfig
+	conn                atomic.Pointer[websocket.Conn] // atomic for lock-free reads
+	mu                  sync.RWMutex
+	messageID           int64
+	pending             map[int64]*pendingCall
+	pendingMu           sync.RWMutex
+	authenticated       bool
+	generation          uint64
+	stopped             bool
+	generationWG        *sync.WaitGroup
+	sendMu              sync.Mutex
+	shutdown            atomic.Bool
+	insecureWarningOnce *sync.Once
 
 	// Connection state management
 	connState   int32 // atomic connectionState
@@ -209,10 +214,11 @@ type Connection struct {
 // NewConnection creates a new connection instance.
 func NewConnection(id int, cfg *ClientConfig) *Connection {
 	c := &Connection{
-		id:      id,
-		config:  cfg,
-		pending: make(map[int64]*pendingCall),
-		stopped: true,
+		id:                  id,
+		config:              cfg,
+		pending:             make(map[int64]*pendingCall),
+		stopped:             true,
+		insecureWarningOnce: &sync.Once{},
 	}
 	return c
 }
@@ -350,8 +356,10 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	}
 
 	// Initialize connection pool
+	insecureWarningOnce := &sync.Once{}
 	for i := 0; i < cfg.MaxConnections; i++ {
 		client.pool[i] = NewConnection(i, cfg)
+		client.pool[i].insecureWarningOnce = insecureWarningOnce
 	}
 
 	// Connect initially (at least one connection)
@@ -475,8 +483,17 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: c.config.ConnectTimeout,
 	}
+	if c.config.Protocol == "https" {
+		tlsConfig, err := buildTLSConfig(c.config)
+		if err != nil {
+			return fmt.Errorf("failed to configure TrueNAS TLS: %w", err)
+		}
+		dialer.TLSClientConfig = tlsConfig
+	}
 	if c.config.AllowInsecure {
-		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		c.insecureWarningOnce.Do(func() {
+			klog.Warningf("TLS verification DISABLED for TrueNAS %s — man-in-the-middle possible; set truenas.caCert for secure verification", c.config.Host)
+		})
 	}
 
 	headers := http.Header{}
@@ -561,6 +578,37 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("failed to connect after %d attempts: %w", c.config.MaxRetries+1, lastErr)
+}
+
+func buildTLSConfig(cfg *ClientConfig) (*tls.Config, error) {
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.AllowInsecure {
+		tlsConfig.InsecureSkipVerify = true //nolint:gosec // Explicit operator opt-out, warned once at connect.
+		return tlsConfig, nil
+	}
+
+	var caPEM []byte
+	if cfg.CACert != "" {
+		caPEM = append(caPEM, cfg.CACert...)
+		caPEM = append(caPEM, '\n')
+	}
+	if cfg.CACertFile != "" {
+		filePEM, err := os.ReadFile(cfg.CACertFile)
+		if err != nil {
+			return nil, fmt.Errorf("read CA certificate file %q: %w", cfg.CACertFile, err)
+		}
+		caPEM = append(caPEM, filePEM...)
+	}
+	if len(caPEM) == 0 {
+		return tlsConfig, nil
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("CA certificate does not contain a valid PEM certificate")
+	}
+	tlsConfig.RootCAs = pool
+	return tlsConfig, nil
 }
 
 func (c *Connection) startGeneration(wsConn *websocket.Conn) (generationHandles, error) {

@@ -17,7 +17,7 @@ import (
 var (
 	host     = flag.String("host", "", "TrueNAS host (or set TRUENAS_HOST)")
 	apiKey   = flag.String("api-key", "", "TrueNAS API key (or set TRUENAS_API_KEY)")
-	insecure = flag.Bool("insecure", true, "Allow insecure TLS connections")
+	insecure = flag.Bool("insecure", false, "Allow insecure TLS connections")
 	timeout  = flag.Duration("timeout", 60*time.Second, "API timeout")
 	command  = flag.String("cmd", "help", "Command to run: help, call, services, service-reload, datasets, iscsi-audit, snapshots")
 	method   = flag.String("method", "", "API method to call (for 'call' command)")

@@ -29,11 +29,6 @@ type FilesystemStats struct {
 
 // IsMounted checks if a path is currently mounted.
 func IsMounted(path string) (bool, error) {
-	// Check if path exists
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return false, nil
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
@@ -55,6 +50,11 @@ func IsMounted(path string) (bool, error) {
 // Mount mounts a source to a target with the given filesystem type and options.
 func Mount(source, target, fsType string, options []string) error {
 	klog.V(4).Infof("Mounting %s to %s (fsType=%s, options=%v)", source, target, fsType, options)
+	if fsType != "" && fsType != "nfs" {
+		if err := validateBlockFilesystemType(fsType); err != nil {
+			return err
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
@@ -287,6 +287,9 @@ func isNetworkFilesystem(fsType string) bool {
 // FormatAndMount formats a device and mounts it.
 func FormatAndMount(devicePath, target, fsType string, options []string) error {
 	klog.V(4).Infof("FormatAndMount: device=%s, target=%s, fsType=%s", devicePath, target, fsType)
+	if err := validateBlockFilesystemType(fsType); err != nil {
+		return err
+	}
 
 	// Check if already formatted
 	existingFS, err := GetFilesystemType(devicePath)
@@ -300,7 +303,7 @@ func FormatAndMount(devicePath, target, fsType string, options []string) error {
 			return err
 		}
 	} else if existingFS != fsType {
-		klog.Warningf("Device %s already formatted with %s, expected %s", devicePath, existingFS, fsType)
+		return fmt.Errorf("device %s has filesystem %s, requested %s", devicePath, existingFS, fsType)
 	}
 
 	// Mount the device
@@ -310,6 +313,9 @@ func FormatAndMount(devicePath, target, fsType string, options []string) error {
 // FormatDevice formats a block device with the given filesystem type.
 func FormatDevice(devicePath, fsType string) error {
 	klog.Infof("Formatting device %s with %s", devicePath, fsType)
+	if err := validateBlockFilesystemType(fsType); err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), getFormatTimeout())
 	defer cancel()
@@ -324,8 +330,6 @@ func FormatDevice(devicePath, fsType string) error {
 		cmd = exec.CommandContext(ctx, "mkfs.xfs", "-f", devicePath)
 	case "btrfs":
 		cmd = exec.CommandContext(ctx, "mkfs.btrfs", "-f", devicePath)
-	default:
-		return fmt.Errorf("unsupported filesystem type: %s", fsType)
 	}
 
 	output, err := cmd.CombinedOutput()
@@ -334,6 +338,15 @@ func FormatDevice(devicePath, fsType string) error {
 	}
 
 	return nil
+}
+
+func validateBlockFilesystemType(fsType string) error {
+	switch fsType {
+	case "ext4", "ext3", "xfs", "btrfs":
+		return nil
+	default:
+		return fmt.Errorf("invalid argument: unsupported filesystem type %q; supported types are ext4, ext3, xfs, btrfs", fsType)
+	}
 }
 
 // GetFilesystemType returns the filesystem type of a device.
@@ -427,12 +440,16 @@ func GetDeviceFromMountPoint(mountPath string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-o", "SOURCE", mountPath)
+	cmd := exec.CommandContext(ctx, "findmnt", "--first-only", "-n", "-o", "SOURCE", mountPath)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to find device: %w", err)
 	}
-	return strings.TrimSpace(string(output)), nil
+	device := strings.TrimSpace(string(output))
+	if line, _, found := strings.Cut(device, "\n"); found {
+		device = strings.TrimSpace(line)
+	}
+	return device, nil
 }
 
 // GetMountedBlockDevices returns a map of all mounted block devices.

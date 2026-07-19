@@ -121,6 +121,13 @@ truenas:
   # Skip TLS verification (not recommended for production)
   skipTLSVerify: false
 
+  # Optional PEM-encoded CA certificate for verifying the TrueNAS API.
+  # When set, this explicit trust bundle is used instead of system roots.
+  caCert: ""
+
+  # Optional path to a mounted PEM-encoded CA certificate file.
+  caCertFile: ""
+
   # API key authentication (recommended; required unless existingSecret is set —
   # the driver refuses to start without one)
   apiKey: ""

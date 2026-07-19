@@ -155,6 +155,8 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		Protocol:          cfg.Config.TrueNAS.Protocol,
 		APIKey:            cfg.Config.TrueNAS.APIKey,
 		AllowInsecure:     cfg.Config.TrueNAS.AllowInsecure,
+		CACert:            cfg.Config.TrueNAS.CACert,
+		CACertFile:        cfg.Config.TrueNAS.CACertFile,
 		Timeout:           time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
 		ConnectTimeout:    time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
 		WriteTimeout:      time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,

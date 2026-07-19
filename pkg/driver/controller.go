@@ -208,6 +208,21 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
 	volumeID := d.sanitizeVolumeID(name)
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	if source := req.GetVolumeContentSource(); source != nil {
+		if snapshot := source.GetSnapshot(); snapshot != nil {
+			if _, validationErr := d.datasetForID(snapshot.GetSnapshotId()); validationErr != nil {
+				return nil, validationErr
+			}
+		} else if volume := source.GetVolume(); volume != nil {
+			if _, validationErr := d.datasetForID(volume.GetVolumeId()); validationErr != nil {
+				return nil, validationErr
+			}
+		}
+	}
 
 	// Enhanced logging for debugging volsync and backup scenarios
 	contentSourceInfo := "none"
@@ -273,8 +288,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, status.Errorf(codes.InvalidArgument,
 			"requested capacity (%d bytes) exceeds maximum (%d bytes)", capacityBytes, maxCapacity)
 	}
-
-	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
 
 	// Get share type from StorageClass parameters (with fallback to driver name)
 	params := req.GetParameters()
@@ -533,7 +546,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	}
 	defer d.releaseOperationLock(lockKey)
 
-	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if volume exists (idempotency - return success if already deleted)
 	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
@@ -844,7 +860,10 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
 	}
 
-	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return nil, err
+	}
 	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err != nil {
 		if truenas.IsNotFoundError(err) {
@@ -902,7 +921,10 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 	}
 
 	// Check volume exists and use its actual type when validating capabilities.
-	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return nil, err
+	}
 	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err != nil {
 		if truenas.IsNotFoundError(err) {
@@ -1032,13 +1054,19 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	defer d.releaseOperationLock(volumeLockKey)
 
 	snapshotID := d.sanitizeVolumeID(name)
+	if _, err := d.datasetForID(snapshotID); err != nil {
+		return nil, err
+	}
 	snapshotLockKey := "snapshot:" + snapshotID
 	if !d.acquireOperationLock(snapshotLockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this snapshot")
 	}
 	defer d.releaseOperationLock(snapshotLockKey)
 
-	datasetName := path.Join(d.config.ZFS.DatasetParentName, sourceVolumeID)
+	datasetName, err := d.datasetForID(sourceVolumeID)
+	if err != nil {
+		return nil, err
+	}
 	sourceDataset, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err != nil {
 		if truenas.IsNotFoundError(err) {
@@ -1332,7 +1360,10 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	}
 	defer d.releaseOperationLock(lockKey)
 
-	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Get dataset to determine type and current state
 	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
@@ -1408,7 +1439,10 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
 
-	datasetName := path.Join(d.config.ZFS.DatasetParentName, volumeID)
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return nil, err
+	}
 	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err != nil {
 		if truenas.IsNotFoundError(err) {
@@ -1453,6 +1487,18 @@ func (d *Driver) sanitizeVolumeID(name string) string {
 		name = name[:128]
 	}
 	return name
+}
+
+func (d *Driver) datasetForID(id string) (string, error) {
+	if id == "" || strings.ContainsAny(id, "/") || id == "." || id == ".." {
+		return "", status.Errorf(codes.InvalidArgument, "invalid volume/snapshot id %q", id)
+	}
+	name := path.Join(d.config.ZFS.DatasetParentName, id)
+	parent := strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/") + "/"
+	if !strings.HasPrefix(name+"/", parent) {
+		return "", status.Errorf(codes.InvalidArgument, "id %q escapes parent dataset", id)
+	}
+	return name, nil
 }
 
 func isAlphanumeric(c byte) bool {
@@ -1579,6 +1625,9 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 	if snapshot := source.GetSnapshot(); snapshot != nil {
 		// Clone from snapshot
 		snapshotID := snapshot.GetSnapshotId()
+		if _, err := d.datasetForID(snapshotID); err != nil {
+			return nil, err
+		}
 		klog.Infof("Creating volume from snapshot: %s -> %s", snapshotID, datasetName)
 
 		// Find the snapshot using efficient query (PERF-001 fix)
@@ -1621,14 +1670,17 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 	} else if volume := source.GetVolume(); volume != nil {
 		// Clone from volume
 		sourceVolumeID := volume.GetVolumeId()
-		sourceDataset := path.Join(d.config.ZFS.DatasetParentName, sourceVolumeID)
+		sourceDataset, err := d.datasetForID(sourceVolumeID)
+		if err != nil {
+			return nil, err
+		}
 		klog.Infof("Creating volume from volume: %s -> %s", sourceVolumeID, datasetName)
 
-		if _, err := d.truenasClient.DatasetGet(ctx, sourceDataset); err != nil {
-			if truenas.IsNotFoundError(err) {
+		if _, getErr := d.truenasClient.DatasetGet(ctx, sourceDataset); getErr != nil {
+			if truenas.IsNotFoundError(getErr) {
 				return nil, status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
 			}
-			return nil, status.Errorf(codes.Internal, "failed to get source volume: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to get source volume: %v", getErr)
 		}
 
 		// Create a snapshot of source volume, then clone it
