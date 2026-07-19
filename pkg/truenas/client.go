@@ -1218,6 +1218,17 @@ func (c *Client) IsConnected() bool {
 	return false
 }
 
+// ActiveConnectionCount returns the number of authenticated connections in the pool.
+func (c *Client) ActiveConnectionCount() int {
+	connected := 0
+	for _, conn := range c.pool {
+		if conn.IsConnected() {
+			connected++
+		}
+	}
+	return connected
+}
+
 // ServiceReload reloads a TrueNAS service configuration.
 // This is useful for forcing services like iSCSI to pick up new configuration
 // after creating targets/extents via the API.

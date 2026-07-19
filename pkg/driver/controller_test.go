@@ -2,15 +2,18 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -280,6 +283,42 @@ func TestCreateVolume(t *testing.T) {
 	// Test Case 3: Missing Name
 	_, err = d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{})
 	assert.Error(t, err)
+}
+
+func TestCreateVolumeFailureRecordsWarningEvent(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	mockClient.InjectError = errors.New("simulated TrueNAS failure")
+	fakeRecorder := record.NewFakeRecorder(1)
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "1.2.3.4"},
+		},
+		truenasClient: mockClient,
+		eventRecorder: &EventRecorder{
+			recorder: fakeRecorder,
+			enabled:  true,
+		},
+	}
+
+	_, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "event-failure-volume",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters: map[string]string{
+			pvcNamespaceKey: "storage",
+			pvcNameKey:      "claim-one",
+		},
+	})
+	require.Error(t, err)
+
+	select {
+	case event := <-fakeRecorder.Events:
+		assert.Contains(t, event, "Warning "+EventReasonVolumeCreateFailed)
+		assert.Contains(t, event, "CreateVolume failed")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CreateVolume failure event")
+	}
 }
 
 func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {

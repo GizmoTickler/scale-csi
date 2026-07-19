@@ -204,6 +204,37 @@ func TestCheckHealth_WithoutCircuitBreakerStats(t *testing.T) {
 	assert.True(t, status.TrueNASConnected)
 }
 
+func TestNodeReadinessIgnoresTrueNASDisconnection(t *testing.T) {
+	d := &Driver{
+		runController: false,
+		runNode:       true,
+		truenasClient: &disconnectedProbeClient{MockClient: truenas.NewMockClient()},
+	}
+	d.ready.Store(true)
+	h := &HealthServer{driver: d}
+
+	recorder := httptest.NewRecorder()
+	h.handleReadiness(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "OK", recorder.Body.String())
+}
+
+func TestControllerReadinessRequiresTrueNASConnection(t *testing.T) {
+	d := &Driver{
+		runController: true,
+		truenasClient: &disconnectedProbeClient{MockClient: truenas.NewMockClient()},
+	}
+	d.ready.Store(true)
+	h := &HealthServer{driver: d}
+
+	recorder := httptest.NewRecorder()
+	h.handleReadiness(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	assert.Equal(t, "TrueNAS disconnected", recorder.Body.String())
+}
+
 // TestCheckHealth_AllCircuitBreakerStates tests all three circuit breaker states.
 func TestCheckHealth_AllCircuitBreakerStates(t *testing.T) {
 	testCases := []struct {

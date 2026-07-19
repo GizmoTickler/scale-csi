@@ -198,7 +198,10 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 }
 
 // CreateVolume creates a new volume.
-func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (_ *csi.CreateVolumeResponse, operationErr error) {
+	defer func() {
+		d.recordOperationFailureEvent(createVolumeEventRef(req), EventReasonVolumeCreateFailed, "CreateVolume", operationErr)
+	}()
 	start := time.Now()
 	name := req.GetName()
 	if name == "" {
@@ -531,8 +534,11 @@ func datasetOriginSnapshotID(ds *truenas.Dataset) string {
 }
 
 // DeleteVolume deletes a volume.
-func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (_ *csi.DeleteVolumeResponse, operationErr error) {
 	volumeID := req.GetVolumeId()
+	defer func() {
+		d.recordOperationFailureEvent(volumeEventRef(volumeID), EventReasonVolumeDeleteFailed, "DeleteVolume", operationErr)
+	}()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
@@ -1030,7 +1036,10 @@ func (d *Driver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (
 }
 
 // CreateSnapshot creates a snapshot.
-func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (_ *csi.CreateSnapshotResponse, operationErr error) {
+	defer func() {
+		d.recordOperationFailureEvent(createSnapshotEventRef(req), EventReasonSnapshotCreateFailed, "CreateSnapshot", operationErr)
+	}()
 	start := time.Now()
 	sourceVolumeID := req.GetSourceVolumeId()
 	if sourceVolumeID == "" {
@@ -1332,8 +1341,11 @@ func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReques
 }
 
 // ControllerExpandVolume expands a volume.
-func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (_ *csi.ControllerExpandVolumeResponse, operationErr error) {
 	volumeID := req.GetVolumeId()
+	defer func() {
+		d.recordOperationFailureEvent(volumeEventRef(volumeID), EventReasonVolumeExpandFailed, "ControllerExpandVolume", operationErr)
+	}()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}

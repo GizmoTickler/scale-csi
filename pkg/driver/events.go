@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,11 +30,23 @@ const (
 	EventReasonSnapshotDeleted      = "SnapshotDeleted"
 	EventReasonSnapshotDeleteFailed = "SnapshotDeleteFailed"
 	EventReasonISCSILoginFailed     = "ISCSILoginFailed"
+	EventReasonNVMeConnectFailed    = "NVMeConnectFailed"
+	EventReasonMountFailed          = "MountFailed"
 	EventReasonISCSILogoutFailed    = "ISCSILogoutFailed"
 	EventReasonNFSMountFailed       = "NFSMountFailed"
 	EventReasonNFSUnmountFailed     = "NFSUnmountFailed"
 	EventReasonTrueNASError         = "TrueNASError"
 	EventReasonTrueNASReconnected   = "TrueNASReconnected"
+)
+
+const (
+	pvcNameKey                 = "csi.storage.k8s.io/pvc/name"
+	pvcNamespaceKey            = "csi.storage.k8s.io/pvc/namespace"
+	pvNameKey                  = "csi.storage.k8s.io/pv/name"
+	podNameKey                 = "csi.storage.k8s.io/pod.name"
+	podNamespaceKey            = "csi.storage.k8s.io/pod.namespace"
+	volumeSnapshotNameKey      = "csi.storage.k8s.io/volumesnapshot/name"
+	volumeSnapshotNamespaceKey = "csi.storage.k8s.io/volumesnapshot/namespace"
 )
 
 // EventRecorder wraps Kubernetes event recording functionality
@@ -109,6 +122,84 @@ func (e *EventRecorder) Eventf(object runtime.Object, eventType, reason, message
 	e.recorder.Eventf(object, eventType, reason, messageFmt, args...)
 }
 
+func (d *Driver) recordOperationFailureEvent(object runtime.Object, reason, operation string, operationErr error) {
+	if operationErr == nil || object == nil || d.eventRecorder == nil {
+		return
+	}
+	d.eventRecorder.Eventf(object, corev1.EventTypeWarning, reason, "%s failed: %v", operation, operationErr)
+}
+
+func (d *Driver) recordWarningEvent(object runtime.Object, reason, message string) {
+	if object == nil || d.eventRecorder == nil {
+		return
+	}
+	d.eventRecorder.Event(object, corev1.EventTypeWarning, reason, message)
+}
+
+func firstEventObject(objects []runtime.Object) runtime.Object {
+	if len(objects) == 0 {
+		return nil
+	}
+	return objects[0]
+}
+
+func createVolumeEventRef(req *csi.CreateVolumeRequest) runtime.Object {
+	if req == nil {
+		return nil
+	}
+	params := req.GetParameters()
+	if namespace, name := params[pvcNamespaceKey], params[pvcNameKey]; namespace != "" && name != "" {
+		return PVCRef(namespace, name)
+	}
+	if name := params[pvNameKey]; name != "" {
+		return PVRef(name)
+	}
+	if name := req.GetName(); name != "" {
+		return PVRef(name)
+	}
+	return nil
+}
+
+func createSnapshotEventRef(req *csi.CreateSnapshotRequest) runtime.Object {
+	if req == nil {
+		return nil
+	}
+	params := req.GetParameters()
+	if namespace, name := params[volumeSnapshotNamespaceKey], params[volumeSnapshotNameKey]; namespace != "" && name != "" {
+		return VolumeSnapshotRef(namespace, name)
+	}
+	if name := req.GetName(); name != "" {
+		return VolumeSnapshotRef("", name)
+	}
+	return nil
+}
+
+func volumeEventRef(volumeID string) runtime.Object {
+	if volumeID == "" {
+		return nil
+	}
+	return PVRef(volumeID)
+}
+
+func nodeVolumeEventRef(volumeContext map[string]string, volumeID, nodeID string) runtime.Object {
+	if namespace, name := volumeContext[podNamespaceKey], volumeContext[podNameKey]; namespace != "" && name != "" {
+		return PodRef(namespace, name)
+	}
+	if namespace, name := volumeContext[pvcNamespaceKey], volumeContext[pvcNameKey]; namespace != "" && name != "" {
+		return PVCRef(namespace, name)
+	}
+	if name := volumeContext[pvNameKey]; name != "" {
+		return PVRef(name)
+	}
+	if volumeID != "" {
+		return PVRef(volumeID)
+	}
+	if nodeID != "" {
+		return NodeRef(nodeID)
+	}
+	return nil
+}
+
 // PVCRef creates an ObjectReference for a PVC
 func PVCRef(namespace, name string) *corev1.ObjectReference {
 	return &corev1.ObjectReference{
@@ -123,6 +214,16 @@ func PVCRef(namespace, name string) *corev1.ObjectReference {
 func PVRef(name string) *corev1.ObjectReference {
 	return &corev1.ObjectReference{
 		Kind:       "PersistentVolume",
+		Name:       name,
+		APIVersion: "v1",
+	}
+}
+
+// PodRef creates an ObjectReference for a Pod.
+func PodRef(namespace, name string) *corev1.ObjectReference {
+	return &corev1.ObjectReference{
+		Kind:       "Pod",
+		Namespace:  namespace,
 		Name:       name,
 		APIVersion: "v1",
 	}

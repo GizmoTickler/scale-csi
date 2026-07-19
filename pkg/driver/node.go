@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/util"
@@ -160,18 +161,19 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	if err := os.MkdirAll(stagingPath, 0o750); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create staging directory: %v", err)
 	}
+	eventObject := nodeVolumeEventRef(volumeContext, volumeID, d.nodeID)
 
 	switch attachDriver {
 	case ShareTypeNFS:
-		if err := d.stageNFSVolume(ctx, volumeContext, stagingPath); err != nil {
+		if err := d.stageNFSVolume(ctx, volumeContext, stagingPath, eventObject); err != nil {
 			return nil, err
 		}
 	case ShareTypeISCSI:
-		if err := d.stageISCSIVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability()); err != nil {
+		if err := d.stageISCSIVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	case ShareTypeNVMeoF:
-		if err := d.stageNVMeoFVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability()); err != nil {
+		if err := d.stageNVMeoFVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	default:
@@ -376,6 +378,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
+	eventObject := nodeVolumeEventRef(req.GetVolumeContext(), volumeID, d.nodeID)
 
 	klog.Infof("NodePublishVolume: volumeID=%s, targetPath=%s, stagingPath=%s", volumeID, targetPath, stagingPath)
 
@@ -443,7 +446,9 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 				blockMountOptions = append(blockMountOptions, "ro")
 			}
 			if err := util.BindMount(devicePath, targetPath, blockMountOptions); err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to bind mount block device: %v", err)
+				operationErr := status.Errorf(codes.Internal, "failed to bind mount block device: %v", err)
+				d.recordWarningEvent(eventObject, EventReasonMountFailed, operationErr.Error())
+				return nil, operationErr
 			}
 			klog.Infof("Block volume %s published successfully at %s", volumeID, targetPath)
 			return &csi.NodePublishVolumeResponse{}, nil
@@ -453,7 +458,9 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			return nil, status.Errorf(codes.Internal, "failed to create target path: %v", err)
 		}
 		if err := util.BindMount(stagingPath, targetPath, mountOptions); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to bind mount: %v", err)
+			operationErr := status.Errorf(codes.Internal, "failed to bind mount: %v", err)
+			d.recordWarningEvent(eventObject, EventReasonMountFailed, operationErr.Error())
+			return nil, operationErr
 		}
 	} else {
 		// Direct mount (legacy mode without staging)
@@ -469,7 +476,9 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			share := volumeContext["share"]
 			source := fmt.Sprintf("%s:%s", server, share)
 			if err := util.MountNFS(source, targetPath, mountOptions); err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
+				operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
+				d.recordWarningEvent(eventObject, EventReasonNFSMountFailed, operationErr.Error())
+				return nil, operationErr
 			}
 		default:
 			return nil, status.Error(codes.InvalidArgument, "staging path required for block volumes")
@@ -824,7 +833,7 @@ func blockTransportForDevice(devicePath string, fallback ShareType) ShareType {
 }
 
 // stageNFSVolume mounts an NFS volume to the staging path.
-func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]string, stagingPath string) error {
+func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for NFS staging")
 	}
@@ -849,14 +858,18 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 
 	// Mount NFS
 	if err := util.MountNFS(source, stagingPath, nil); err != nil {
-		return status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
+		RecordNodeConnect("nfs", "error")
+		operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSMountFailed, operationErr.Error())
+		return operationErr
 	}
+	RecordNodeConnect("nfs", "success")
 
 	return nil
 }
 
 // stageISCSIVolume connects and mounts an iSCSI volume to the staging path.
-func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability) error {
+func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for iSCSI staging")
 	}
@@ -935,8 +948,12 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 	}
 	devicePath, err := iscsiConnectWithSessions(ctx, portal, iqn, lun, connectOpts, sessions)
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to connect iSCSI: %v", err)
+		RecordNodeConnect("iscsi", "error")
+		operationErr := status.Errorf(codes.Internal, "failed to connect iSCSI: %v", err)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSILoginFailed, operationErr.Error())
+		return operationErr
 	}
+	RecordNodeConnect("iscsi", "success")
 
 	// Check if block mode
 	if volCap != nil && volCap.GetBlock() != nil {
@@ -956,14 +973,16 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 	mountFlags := volumeMountFlags(volCap)
 
 	if err := nodeFormatAndMount(devicePath, stagingPath, fsType, mountFlags); err != nil {
-		return status.Errorf(codes.Internal, "failed to format and mount: %v", err)
+		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonMountFailed, operationErr.Error())
+		return operationErr
 	}
 
 	return nil
 }
 
 // stageNVMeoFVolume connects and mounts an NVMe-oF volume to the staging path.
-func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability) error {
+func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for NVMe-oF staging")
 	}
@@ -1041,8 +1060,12 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	}
 	devicePath, err := nvmeConnectWithSubsystems(nqn, transportURI, connectOpts, subsystems)
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to connect NVMe-oF: %v", err)
+		RecordNodeConnect("nvmeof", "error")
+		operationErr := status.Errorf(codes.Internal, "failed to connect NVMe-oF: %v", err)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNVMeConnectFailed, operationErr.Error())
+		return operationErr
 	}
+	RecordNodeConnect("nvmeof", "success")
 
 	// Check if block mode
 	if volCap != nil && volCap.GetBlock() != nil {
@@ -1062,7 +1085,9 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	mountFlags := volumeMountFlags(volCap)
 
 	if err := nodeFormatAndMount(devicePath, stagingPath, fsType, mountFlags); err != nil {
-		return status.Errorf(codes.Internal, "failed to format and mount: %v", err)
+		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonMountFailed, operationErr.Error())
+		return operationErr
 	}
 
 	return nil

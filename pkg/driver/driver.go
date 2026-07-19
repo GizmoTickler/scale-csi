@@ -488,26 +488,46 @@ func (d *Driver) runSessionGCWithProtocols(ctx context.Context, gracePeriod time
 	// Run iSCSI GC if enabled
 	if iscsiEnabled && ctx.Err() == nil {
 		d.gcISCSISessions(ctx, gracePeriod, dryRun)
+	} else if ctx.Err() == nil {
+		_, _ = d.observeISCSISessions()
 	}
 
 	// Run NVMe-oF GC if enabled
 	if nvmeofEnabled && ctx.Err() == nil {
 		d.gcNVMeoFSessions(ctx, gracePeriod, dryRun)
+	} else if ctx.Err() == nil {
+		_, _ = d.observeNVMeoFSessions()
 	}
+}
+
+func (d *Driver) observeISCSISessions() ([]util.ISCSISessionInfo, error) {
+	sessions, err := gcListISCSISessions()
+	if err != nil {
+		klog.Warningf("Session metrics: failed to list iSCSI sessions: %v", err)
+		return nil, err
+	}
+	SetISCSISessions(len(sessions))
+	return sessions, nil
+}
+
+func (d *Driver) observeNVMeoFSessions() ([]util.NVMeoFSessionInfo, error) {
+	sessions, err := gcListNVMeoFSessions()
+	if err != nil {
+		klog.Warningf("Session metrics: failed to list NVMe-oF sessions: %v", err)
+		return nil, err
+	}
+	SetNVMESessions(len(sessions))
+	return sessions, nil
 }
 
 // gcISCSISessions garbage collects orphaned iSCSI sessions.
 // Sessions must be orphaned for at least gracePeriod before being disconnected.
 func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
 	// Get all active iSCSI sessions
-	sessions, err := gcListISCSISessions()
+	sessions, err := d.observeISCSISessions()
 	if err != nil {
-		klog.Warningf("Session GC: failed to list iSCSI sessions: %v", err)
 		return
 	}
-
-	// Update metrics with current session count
-	SetISCSISessions(len(sessions))
 
 	if len(sessions) == 0 {
 		klog.V(5).Info("Session GC: no active iSCSI sessions")
@@ -589,6 +609,7 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.IQN, err)
 		} else {
 			klog.Infof("Session GC: disconnected orphaned iSCSI session: %s", session.IQN)
+			RecordGCSessionDisconnected("iscsi")
 			d.orphanedSessionsSeen.Delete(session.IQN)
 		}
 	}
@@ -613,9 +634,8 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 // Sessions must be orphaned for at least gracePeriod before being disconnected.
 func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
 	// Get all active NVMe-oF sessions
-	sessions, err := gcListNVMeoFSessions()
+	sessions, err := d.observeNVMeoFSessions()
 	if err != nil {
-		klog.Warningf("Session GC: failed to list NVMe-oF sessions: %v", err)
 		return
 	}
 
@@ -701,6 +721,7 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.NQN, err)
 		} else {
 			klog.Infof("Session GC: disconnected orphaned NVMe-oF session: %s", session.NQN)
+			RecordGCSessionDisconnected("nvmeof")
 			d.orphanedSessionsSeen.Delete(session.NQN)
 		}
 	}

@@ -166,12 +166,13 @@ Watch these series:
 - `scale_csi_circuit_breaker_state`,
   `scale_csi_circuit_breaker_current_failures`, and the breaker counters for
   outage protection;
-- `scale_csi_iscsi_sessions_total` for the sessions observed by node session
-  garbage collection.
-
-The registry also exposes `scale_csi_truenas_connections_active`,
-`scale_csi_volumes_total`, and `scale_csi_snapshots_total`, but v1.2.0 does not
-populate those gauges. Do not build production alerts from them.
+- `scale_csi_truenas_connections_active` for authenticated WebSocket pool
+  connections;
+- `scale_csi_iscsi_sessions_total` and `scale_csi_nvme_sessions_total` for the
+  sessions observed by node session garbage collection;
+- `scale_csi_node_connect_total` and
+  `scale_csi_gc_sessions_disconnected_total` for per-transport node connection
+  attempts and orphan cleanup.
 
 The bundled rules alert when the controller target is absent for five minutes,
 TrueNAS is disconnected or the circuit is open for two minutes, TrueNAS API

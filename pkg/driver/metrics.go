@@ -5,6 +5,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -21,7 +23,7 @@ var (
 			Name:      "operations_total",
 			Help:      "Total number of CSI operations",
 		},
-		[]string{"operation", "status"},
+		[]string{"operation", "status", "code"},
 	)
 
 	csiOperationsDuration = promauto.NewHistogramVec(
@@ -54,16 +56,6 @@ var (
 		[]string{"method"},
 	)
 
-	// Volume metrics
-	volumesTotal = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "volumes_total",
-			Help:      "Total number of volumes by type",
-		},
-		[]string{"share_type"},
-	)
-
 	// Connection metrics
 	truenasConnectionStatus = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -90,13 +82,30 @@ var (
 		},
 	)
 
-	// Snapshot metrics
-	snapshotsTotal = promauto.NewGauge(
+	nvmeSessionsTotal = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
-			Name:      "snapshots_total",
-			Help:      "Total number of snapshots",
+			Name:      "nvme_sessions_total",
+			Help:      "Total number of active NVMe-oF sessions on this node",
 		},
+	)
+
+	nodeConnectTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "node_connect_total",
+			Help:      "Total number of node transport connection attempts",
+		},
+		[]string{"transport", "result"},
+	)
+
+	gcSessionsDisconnectedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "gc_sessions_disconnected_total",
+			Help:      "Total number of orphaned sessions disconnected by session garbage collection",
+		},
+		[]string{"transport"},
 	)
 
 	// Circuit breaker metrics
@@ -143,11 +152,18 @@ var (
 
 // RecordCSIOperation records metrics for a CSI operation
 func RecordCSIOperation(operation string, duration float64, err error) {
-	status := "success"
+	operationStatus := "success"
+	code := codes.OK
 	if err != nil {
-		status = "error"
+		code = grpcstatus.Code(err)
+		switch code {
+		case codes.Aborted, codes.NotFound, codes.AlreadyExists:
+			operationStatus = "benign"
+		default:
+			operationStatus = "error"
+		}
 	}
-	csiOperationsTotal.WithLabelValues(operation, status).Inc()
+	csiOperationsTotal.WithLabelValues(operation, operationStatus, code.String()).Inc()
 	csiOperationsDuration.WithLabelValues(operation).Observe(duration)
 }
 
@@ -180,14 +196,19 @@ func SetISCSISessions(count int) {
 	iscsiSessionsTotal.Set(float64(count))
 }
 
-// SetVolumesTotal sets the total number of volumes for a share type
-func SetVolumesTotal(shareType string, count int) {
-	volumesTotal.WithLabelValues(shareType).Set(float64(count))
+// SetNVMESessions sets the number of active NVMe-oF sessions.
+func SetNVMESessions(count int) {
+	nvmeSessionsTotal.Set(float64(count))
 }
 
-// SetSnapshotsTotal sets the total number of snapshots
-func SetSnapshotsTotal(count int) {
-	snapshotsTotal.Set(float64(count))
+// RecordNodeConnect records a node transport connection attempt.
+func RecordNodeConnect(transport, result string) {
+	nodeConnectTotal.WithLabelValues(transport, result).Inc()
+}
+
+// RecordGCSessionDisconnected records a successful orphan session disconnect.
+func RecordGCSessionDisconnected(transport string) {
+	gcSessionsDisconnectedTotal.WithLabelValues(transport).Inc()
 }
 
 // Circuit breaker metrics tracking
