@@ -86,6 +86,10 @@ type Driver struct {
 	// Ready flag (atomic for safe concurrent access)
 	ready atomic.Bool
 
+	// Last observed aggregate TrueNAS connection state. Zero is unknown, one is
+	// connected, and two is disconnected.
+	truenasConnectionState atomic.Int32
+
 	// Request counter for generating unique request IDs
 	requestCounter uint64
 
@@ -202,7 +206,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		return truenasClient.ServiceReload(ctx, service)
 	})
 
-	return &Driver{
+	driver := &Driver{
 		name:                   cfg.Name,
 		version:                cfg.Version,
 		nodeID:                 cfg.NodeID,
@@ -215,7 +219,9 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		eventRecorder:          eventRecorder,
 		serviceReloadDebouncer: serviceDebouncer,
 		nvmeResolvedHosts:      make(map[string]int),
-	}, nil
+	}
+	driver.observeTrueNASConnection()
+	return driver, nil
 }
 
 // Run starts the CSI driver.

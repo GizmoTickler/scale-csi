@@ -188,6 +188,17 @@ created by the CSI driver, `DeleteVolume` leaves the dataset intact. Set
 deliberately disposable. To advertise a scheduler attach limit, set
 `node.maxVolumesPerNode` to a positive value; its default `0` remains unlimited.
 
+### Resource sizing
+
+Steady-state use is approximately 15Mi memory and 1m CPU per driver container.
+The Helm chart defaults the controller and node driver requests to 10m CPU and
+32Mi memory, with no limits. If you configure CPU or memory limits, the Go
+runtime adapts `GOMAXPROCS` and `GOMEMLIMIT` from the container cgroups.
+
+CSI liveness now reports driver-process health rather than TrueNAS reachability,
+so a NAS outage or slow reconnect does not cause a kubelet restart loop. Monitor
+`/readyz` or `scale_csi_truenas_connection_status` for backend availability.
+
 | Guide | Description |
 |-------|-------------|
 | [Architecture](docs/architecture.md) | How the driver works internally |

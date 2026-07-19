@@ -230,7 +230,14 @@
           "$ref": "#/definitions/freeObject"
         },
         "resources": {
-          "$ref": "#/definitions/freeObject"
+          "type": "object",
+          "default": {
+            "requests": {
+              "cpu": "10m",
+              "memory": "32Mi"
+            }
+          },
+          "additionalProperties": true
         },
         "nodeSelector": {
           "$ref": "#/definitions/stringMap"
@@ -271,7 +278,14 @@
           "minimum": 0
         },
         "resources": {
-          "$ref": "#/definitions/freeObject"
+          "type": "object",
+          "default": {
+            "requests": {
+              "cpu": "10m",
+              "memory": "32Mi"
+            }
+          },
+          "additionalProperties": true
         },
         "nodeSelector": {
           "$ref": "#/definitions/stringMap"

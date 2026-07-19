@@ -156,12 +156,9 @@ func (h *HealthServer) checkHealth() HealthStatus {
 
 	// Check TrueNAS connection
 	if h.driver.truenasClient != nil {
-		connected := h.driver.truenasClient.IsConnected()
+		connected := h.driver.observeTrueNASConnection()
 		status.TrueNASConnected = connected
 		status.LastTrueNASCheck = time.Now().Format(time.RFC3339)
-
-		// Update metrics
-		SetTrueNASConnectionStatus(connected)
 
 		// Update circuit breaker metrics and health status
 		if cbStats := h.driver.truenasClient.CircuitBreakerStats(); cbStats != nil {

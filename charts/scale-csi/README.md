@@ -167,10 +167,12 @@ convenient.
 | `controller.podDisruptionBudget.minAvailable` | PDB minimum available | `""` |
 | `controller.podDisruptionBudget.maxUnavailable` | PDB maximum unavailable | `""` |
 | `controller.containerSecurityContext` | Controller driver container security context | non-root UID 65532, read-only root filesystem, no capabilities |
+| `controller.resources` | Controller driver resources | requests `10m` CPU, `32Mi` memory; no limits |
 | `node.enabled` | Deploy the node DaemonSet | `true` |
 | `node.priorityClassName` | Node priority class | `system-node-critical` |
 | `node.sessionCleanupDelay` | Stale-session retry delay in milliseconds | `500` |
 | `node.maxVolumesPerNode` | Maximum volumes advertised per node; `0` means unlimited/unset | `0` |
+| `node.resources` | Node driver resources | requests `10m` CPU, `32Mi` memory; no limits |
 | `kubeletDir` | Host kubelet directory | `/var/lib/kubelet` |
 | `serviceAccount.create` | Create component ServiceAccounts | `true` |
 | `serviceAccount.controllerName` | Existing/custom controller ServiceAccount | generated or `default` |
@@ -191,15 +193,28 @@ convenient.
 | `metrics.dashboards.enabled` | Create a Grafana dashboard ConfigMap | `false` |
 | `metrics.dashboards.annotations` | Dashboard ConfigMap annotations (for example, a folder selector) | `{}` |
 
-The bundled PrometheusRule alerts on a missing controller scrape target, an
-open circuit breaker, a high TrueNAS API failure ratio, and sustained CSI
-operation errors. The dashboard ConfigMap is labeled `grafana_dashboard: "1"`
+The bundled PrometheusRule alerts on a missing controller scrape target,
+TrueNAS disconnection, an open circuit breaker, a high TrueNAS API failure
+ratio, and sustained CSI operation errors. The dashboard ConfigMap is labeled `grafana_dashboard: "1"`
 for Grafana sidecar discovery and uses only metrics exported by the driver.
 
 Set one of `controller.podDisruptionBudget.minAvailable` or `maxUnavailable`
 when enabling the PDB. A PDB is useful only when `controller.replicas` is greater
 than one. ConfigMap and chart-managed Secret checksums are added to both pod
 templates so configuration and API-key changes trigger rollouts.
+
+### Resource sizing
+
+Steady-state measurements are approximately 15Mi memory and 1m CPU per driver
+container. The chart therefore requests 10m CPU and 32Mi memory for the
+controller and node driver containers without setting limits. Both resource
+maps remain fully overridable; CSI sidecar resources remain empty by default.
+
+When CPU or memory limits are configured, the driver adapts `GOMAXPROCS` and
+`GOMEMLIMIT` from its cgroups. CSI liveness reports process health and no longer
+depends on TrueNAS reachability, so a NAS blip or slow reconnect does not turn a
+tight resource limit into a driver crash loop. Use `/readyz` and
+`scale_csi_truenas_connection_status` for backend health.
 
 ### Controller sidecars
 
@@ -210,7 +225,7 @@ use `--worker-threads`.
 | Parameter | Default |
 |---|---|
 | `sidecars.provisioner.timeout` | `300s` |
-| `sidecars.provisioner.workerThreads` | `100` |
+| `sidecars.provisioner.workerThreads` | `10` |
 | `sidecars.provisioner.extraArgs` | `[]` |
 | `sidecars.attacher.timeout` | `300s` |
 | `sidecars.attacher.workerThreads` | `10` |

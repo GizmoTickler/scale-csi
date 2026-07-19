@@ -93,6 +93,20 @@ the baseline protection. If enabled, five consecutive failures open it for 30
 seconds before half-open probes are admitted. These controls do not replace
 protocol-level mount/login timeouts under `commandTimeouts`.
 
+## Resource sizing
+
+Steady-state measurements are approximately 15Mi memory and 1m CPU per driver
+container. The chart requests 10m CPU and 32Mi memory for each controller and
+node driver container by default and sets no limits. Sidecar resources remain
+unset. Override `controller.resources` and `node.resources` for your workload.
+
+When limits are set, `automaxprocs` derives `GOMAXPROCS` from the CPU cgroup and
+the driver sets `GOMEMLIMIT` to 90% of the finite memory cgroup limit unless the
+environment explicitly supplies `GOMEMLIMIT`. CSI liveness reports initialized
+process health, independent of TrueNAS reachability, so a NAS blip or slow
+reconnect does not cause a crash loop. `/readyz` remains backend-aware; alert on
+`scale_csi_truenas_connection_status == 0` for backend loss.
+
 ## Security
 
 - Prefer an externally managed Secret and set `truenas.existingSecret`; it must
@@ -160,8 +174,9 @@ The registry also exposes `scale_csi_truenas_connections_active`,
 populate those gauges. Do not build production alerts from them.
 
 The bundled rules alert when the controller target is absent for five minutes,
-the circuit is open for two minutes, TrueNAS API failures exceed 10% for ten
-minutes, or CSI operation errors exceed 0.01 operations/second for ten minutes.
+TrueNAS is disconnected or the circuit is open for two minutes, TrueNAS API
+failures exceed 10% for ten minutes, or CSI operation errors exceed 0.01
+operations/second for ten minutes.
 Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
 ## Upgrades
