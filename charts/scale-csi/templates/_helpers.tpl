@@ -98,10 +98,13 @@ Create the name of the secret
 {{- end }}
 
 {{/*
-Get the image tag
+Get the image tag.
+The published image is v-prefixed (ci.yml tags v{{version}}), but the release
+workflow strips the "v" from Chart.appVersion. So default to "v<appVersion>" to
+match the real image; an explicitly-set .Values.image.tag is used verbatim.
 */}}
 {{- define "scale-csi.imageTag" -}}
-{{- .Values.image.tag | default .Chart.AppVersion }}
+{{- if .Values.image.tag }}{{ .Values.image.tag }}{{ else }}{{ printf "v%s" .Chart.AppVersion }}{{ end }}
 {{- end }}
 
 {{/*

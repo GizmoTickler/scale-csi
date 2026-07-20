@@ -6,7 +6,7 @@ csiDriverName: csi.scale.io
 # Image configuration
 image:
   repository: ghcr.io/gizmotickler/scale-csi
-  tag: ""  # Defaults to appVersion
+  tag: ""  # Defaults to v<Chart.appVersion> (matches the v-prefixed published image)
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
