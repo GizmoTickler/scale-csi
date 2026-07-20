@@ -318,6 +318,9 @@ func TestNodeStageUnstageVolume_BlockRoundTrip(t *testing.T) {
 
 	d := newTestNodeDriver(ShareTypeISCSI)
 	stagingPath := filepath.Join(t.TempDir(), "staging", "volume-device")
+	// Kubelet pre-creates staging_target_path as a directory before invoking
+	// NodeStageVolume, including for raw-block volumes.
+	require.NoError(t, os.MkdirAll(stagingPath, 0o750))
 	req := &csi.NodeStageVolumeRequest{
 		VolumeId:          "block-volume",
 		StagingTargetPath: stagingPath,
@@ -342,12 +345,57 @@ func TestNodeStageUnstageVolume_BlockRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/dev/null", target)
 
+	// Re-staging an already-correct symlink must be an idempotent no-op.
+	_, err = d.NodeStageVolume(context.Background(), req)
+	require.NoError(t, err)
+	restagedInfo, err := os.Lstat(stagingPath)
+	require.NoError(t, err)
+	assert.True(t, os.SameFile(info, restagedInfo), "correct staging symlink must not be replaced")
+
 	_, err = d.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
 		VolumeId: "block-volume", StagingTargetPath: stagingPath,
 	})
 	require.NoError(t, err)
 	_, err = os.Lstat(stagingPath)
 	assert.True(t, os.IsNotExist(err), "unstage must remove the block staging symlink")
+}
+
+func TestNodeStageVolume_BlockRejectsNonEmptyStagingDirectory(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "iscsiadm")
+	originalConnect := iscsiConnectWithSessions
+	t.Cleanup(func() { iscsiConnectWithSessions = originalConnect })
+	iscsiConnectWithSessions = func(context.Context, string, string, int, *util.ISCSIConnectOptions, []util.ISCSISessionInfo) (string, error) {
+		return "/dev/null", nil
+	}
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	stagingPath := filepath.Join(t.TempDir(), "staging", "volume-device")
+	require.NoError(t, os.MkdirAll(stagingPath, 0o750))
+	sentinelPath := filepath.Join(stagingPath, "kubelet-data")
+	require.NoError(t, os.WriteFile(sentinelPath, []byte("preserve me"), 0o600))
+
+	_, err := d.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "block-volume",
+		StagingTargetPath: stagingPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+		VolumeContext: map[string]string{
+			"node_attach_driver": "iscsi",
+			"portal":             "192.0.2.10:3260",
+			"iqn":                "iqn.test:block-volume",
+			"lun":                "0",
+		},
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "failed to remove existing directory")
+	assert.Contains(t, err.Error(), "directory must be empty")
+	content, readErr := os.ReadFile(sentinelPath)
+	require.NoError(t, readErr)
+	assert.Equal(t, "preserve me", string(content), "non-empty staging directory contents must not be deleted")
 }
 
 func TestNodeUnstageVolume_Validation(t *testing.T) {
@@ -1358,10 +1406,15 @@ func TestCreateSymlinkAtomic(t *testing.T) {
 		// Create initial symlink
 		err := createSymlinkAtomic(target, linkPath)
 		require.NoError(t, err)
+		before, err := os.Lstat(linkPath)
+		require.NoError(t, err)
 
 		// Call again with same target - should succeed
 		err = createSymlinkAtomic(target, linkPath)
 		require.NoError(t, err)
+		after, err := os.Lstat(linkPath)
+		require.NoError(t, err)
+		assert.True(t, os.SameFile(before, after), "correct symlink must be left in place")
 
 		// Verify symlink is still correct
 		actualTarget, err := readSymlink(linkPath)
@@ -1387,6 +1440,23 @@ func TestCreateSymlinkAtomic(t *testing.T) {
 		actualTarget, err := readSymlink(linkPath)
 		require.NoError(t, err)
 		assert.Equal(t, newTarget, actualTarget)
+	})
+
+	t.Run("RegularFileIsReplaced", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		linkPath := filepath.Join(tmpDir, "testlink")
+		target := "/dev/test"
+		require.NoError(t, os.WriteFile(linkPath, []byte("stale"), 0o600))
+
+		err := createSymlinkAtomic(target, linkPath)
+		require.NoError(t, err)
+
+		info, err := os.Lstat(linkPath)
+		require.NoError(t, err)
+		assert.NotZero(t, info.Mode()&os.ModeSymlink)
+		actualTarget, err := os.Readlink(linkPath)
+		require.NoError(t, err)
+		assert.Equal(t, target, actualTarget)
 	})
 }
 

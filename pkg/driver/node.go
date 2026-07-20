@@ -1250,8 +1250,8 @@ func waitForSessionCleanup(ctx context.Context, timeout time.Duration, sessionEx
 }
 
 // createSymlinkAtomic creates a symlink atomically using rename to avoid race conditions.
-// If the symlink already exists and points to the correct target, it's left as-is.
-// If it points to a different target, it's atomically replaced.
+// If the path is already the correct symlink, it's left as-is. Other symlinks,
+// empty directories, and regular files are replaced without recursively deleting data.
 func createSymlinkAtomic(target, linkPath string) error {
 	// First try to create the symlink directly
 	if err := os.Symlink(target, linkPath); err == nil {
@@ -1260,20 +1260,45 @@ func createSymlinkAtomic(target, linkPath string) error {
 		return fmt.Errorf("failed to create symlink: %w", err)
 	}
 
-	// Symlink exists - check if it already points to the correct target
-	existingTarget, err := os.Readlink(linkPath)
+	existingInfo, err := os.Lstat(linkPath)
 	if err != nil {
-		return fmt.Errorf("failed to read existing symlink: %w", err)
-	}
-	if existingTarget == target {
-		// Already correct, nothing to do
-		return nil
+		return fmt.Errorf("failed to inspect existing symlink path: %w", err)
 	}
 
-	// Need to replace the symlink - use atomic rename to avoid race conditions
-	klog.Warningf("Existing symlink %s points to %s, expected %s - recreating atomically", linkPath, existingTarget, target)
+	if existingInfo.Mode()&os.ModeSymlink != 0 {
+		// Symlink exists - check if it already points to the correct target.
+		existingTarget, readErr := os.Readlink(linkPath)
+		if readErr != nil {
+			return fmt.Errorf("failed to read existing symlink: %w", readErr)
+		}
+		if existingTarget == target {
+			// Already correct, nothing to do.
+			return nil
+		}
 
-	// Create a temporary symlink with unique name to avoid races from concurrent calls
+		klog.Warningf("Existing symlink %s points to %s, expected %s - recreating atomically", linkPath, existingTarget, target)
+	} else {
+		switch {
+		case existingInfo.IsDir():
+			// Kubelet pre-creates the raw-block staging path as an empty
+			// directory. Remove only that leaf; never recursively delete it.
+			if removeErr := os.Remove(linkPath); removeErr != nil {
+				return fmt.Errorf("failed to remove existing directory %s before creating symlink (directory must be empty): %w", linkPath, removeErr)
+			}
+			klog.Warningf("Removed existing empty directory %s before creating device symlink", linkPath)
+		case existingInfo.Mode().IsRegular():
+			if removeErr := os.Remove(linkPath); removeErr != nil {
+				return fmt.Errorf("failed to remove existing regular file %s before creating symlink: %w", linkPath, removeErr)
+			}
+			klog.Warningf("Removed existing regular file %s before creating device symlink", linkPath)
+		default:
+			return fmt.Errorf("cannot replace existing path %s with symlink: unsupported file type %s", linkPath, existingInfo.Mode())
+		}
+	}
+
+	// Create a temporary symlink with unique name to avoid races from concurrent calls.
+	// Rename atomically replaces a stale symlink, or installs the link after an
+	// empty directory or regular file was safely removed above.
 	tempLink := fmt.Sprintf("%s.tmp.%d", linkPath, time.Now().UnixNano())
 
 	if err := os.Symlink(target, tempLink); err != nil {
