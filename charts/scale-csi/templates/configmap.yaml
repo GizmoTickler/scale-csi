@@ -29,6 +29,7 @@ data:
       datasetParentName: {{ .Values.zfs.parentDataset | quote }}
       datasetEnableQuotas: {{ .Values.zfs.enforceQuota }}
       datasetEnableReservation: false
+      detachedVolumesFromSnapshots: {{ .Values.zfs.detachedVolumesFromSnapshots }}
       {{- with .Values.zfs.datasetProperties }}
       datasetProperties:
         {{- toYaml . | nindent 8 }}

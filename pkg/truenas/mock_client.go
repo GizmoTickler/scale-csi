@@ -155,6 +155,8 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 		UserProperties: make(map[string]UserProperty),
 		Volsize:        DatasetProperty{Parsed: float64(params.Volsize)},
 		Refquota:       DatasetProperty{Parsed: float64(params.Refquota)},
+		Refreservation: DatasetProperty{Parsed: float64(params.Refreservation)},
+		Volblocksize:   DatasetProperty{Parsed: params.Volblocksize},
 	}
 	for _, property := range params.UserProperties {
 		ds.UserProperties[property.Key] = UserProperty{Value: property.Value, Source: "local"}
@@ -177,6 +179,12 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 
 	if m.InjectError != nil {
 		return m.InjectError
+	}
+	originPrefix := name + "@"
+	for _, dataset := range m.Datasets {
+		if strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
+			return &APIError{Code: -1, Message: "dataset has dependent clones"}
+		}
 	}
 	if !recursive {
 		for _, snapshot := range m.Snapshots {
@@ -240,6 +248,16 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 			ds.Refquota = DatasetProperty{Parsed: float64(refquota)}
 		case float64:
 			ds.Refquota = DatasetProperty{Parsed: refquota}
+		}
+	}
+	if params.Refreservation != nil {
+		switch refreservation := params.Refreservation.(type) {
+		case int:
+			ds.Refreservation = DatasetProperty{Parsed: float64(refreservation)}
+		case int64:
+			ds.Refreservation = DatasetProperty{Parsed: float64(refreservation)}
+		case float64:
+			ds.Refreservation = DatasetProperty{Parsed: refreservation}
 		}
 	}
 	for _, update := range params.UserPropertiesUpdate {
@@ -611,6 +629,56 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetNa
 	}
 	m.Datasets[newDatasetName] = clone
 	return nil
+}
+
+func (m *MockClient) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	if _, exists := m.Datasets[targetDataset]; exists {
+		return nil
+	}
+	snapshotID := sourceDataset + "@" + snapshotShortName
+	if _, exists := m.Snapshots[snapshotID]; !exists {
+		return &APIError{Code: -1, Message: "snapshot not found"}
+	}
+	source, exists := m.Datasets[sourceDataset]
+	if !exists {
+		return &APIError{Code: -1, Message: "source dataset not found"}
+	}
+
+	properties := make(map[string]UserProperty, len(source.UserProperties))
+	for key, value := range source.UserProperties {
+		properties[key] = value
+	}
+	copy := &Dataset{
+		ID:             targetDataset,
+		Name:           targetDataset,
+		Pool:           source.Pool,
+		Type:           source.Type,
+		Mountpoint:     source.Mountpoint,
+		Used:           source.Used,
+		Available:      source.Available,
+		Quota:          source.Quota,
+		Refquota:       source.Refquota,
+		Reservation:    source.Reservation,
+		Refreservation: source.Refreservation,
+		Volsize:        source.Volsize,
+		Volblocksize:   source.Volblocksize,
+		UserProperties: properties,
+	}
+	if copy.Type != "VOLUME" {
+		copy.Mountpoint = "/mnt/" + strings.TrimPrefix(targetDataset, "/")
+	}
+	m.Datasets[targetDataset] = copy
+	return nil
+}
+
+func (m *MockClient) DestroyReplicatedTargetSnapshot(ctx context.Context, targetDataset, snapshotShortName string) error {
+	return m.SnapshotDelete(ctx, targetDataset+"@"+snapshotShortName, false, false)
 }
 
 func (m *MockClient) SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error {

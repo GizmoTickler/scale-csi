@@ -406,6 +406,10 @@
         "enforceQuota": {
           "type": "boolean"
         },
+        "detachedVolumesFromSnapshots": {
+          "type": "boolean",
+          "default": false
+        },
         "zvolReadyTimeout": {
           "type": "integer",
           "minimum": 1

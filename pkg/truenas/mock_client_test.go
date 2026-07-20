@@ -134,6 +134,35 @@ func TestMockClientModelsRenamedDeferredSnapshotLifecycle(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestMockClientCopyDatasetFromSnapshotLocalIsIndependentAndIdempotent(t *testing.T) {
+	client := NewMockClient()
+	ctx := context.Background()
+	source, err := client.DatasetCreate(ctx, &DatasetCreateParams{
+		Name: "tank/csi/source", Type: "VOLUME", Volsize: 2 << 30, Refreservation: 2 << 30,
+		UserProperties: []UserPropertyUpdate{{Key: "truenas-csi:csi_volume_name", Value: "source"}},
+	})
+	require.NoError(t, err)
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "restore-point", nil)
+	require.NoError(t, err)
+
+	require.NoError(t, client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, "tank/csi/target"))
+	target, err := client.DatasetGet(ctx, "tank/csi/target")
+	require.NoError(t, err)
+	assert.Empty(t, datasetPropertyString(target.Origin))
+	assert.Equal(t, source.Volsize, target.Volsize)
+	assert.Equal(t, source.Refreservation, target.Refreservation)
+	assert.Equal(t, "source", target.UserProperties["truenas-csi:csi_volume_name"].Value)
+
+	// A repeated call must preserve the already-created target rather than
+	// replacing its post-copy identity updates with inherited source values.
+	require.NoError(t, client.DatasetSetUserProperty(ctx, target.Name, "truenas-csi:csi_volume_name", "target"))
+	require.NoError(t, client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, target.Name))
+	assert.Equal(t, "target", target.UserProperties["truenas-csi:csi_volume_name"].Value)
+
+	require.NoError(t, client.SnapshotDelete(ctx, snapshot.ID, false, false))
+	require.NoError(t, client.DatasetDelete(ctx, source.Name, false, true))
+}
+
 func TestMockSnapshotCreateAppliesInlinePropertiesWhenUpdatesNoOp(t *testing.T) {
 	client := NewMockClient()
 	client.SimulateUpdateNoOp = true

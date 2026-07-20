@@ -85,6 +85,10 @@ type ZFSConfig struct {
 	// DatasetParentName is the parent dataset for volumes (e.g., "tank/k8s/volumes")
 	DatasetParentName string `yaml:"datasetParentName"`
 
+	// DetachedVolumesFromSnapshots creates independent local send/receive copies
+	// instead of ZFS clones when provisioning a volume from a snapshot.
+	DetachedVolumesFromSnapshots bool `yaml:"detachedVolumesFromSnapshots"`
+
 	// DatasetEnableQuotas enables quota support for NFS volumes
 	DatasetEnableQuotas bool `yaml:"datasetEnableQuotas"`
 

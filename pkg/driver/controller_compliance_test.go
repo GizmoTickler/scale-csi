@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -561,6 +562,253 @@ func TestCreateVolumeNFSCloneSetsRefquota(t *testing.T) {
 	clone, err := mockClient.DatasetGet(context.Background(), "pool/parent/nfs-clone-target")
 	require.NoError(t, err)
 	assert.Equal(t, float64(requestedCapacity), clone.Refquota.Parsed)
+}
+
+func TestCreateVolumeFromSnapshotDetachedGate(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		detached bool
+	}{
+		{name: "legacy clone remains the default", detached: false},
+		{name: "detached copy is independent", detached: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := truenas.NewMockClient()
+			source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+				Name: "pool/parent/restore-intermediate", Type: "FILESYSTEM",
+				UserProperties: []truenas.UserPropertyUpdate{
+					{Key: PropCSIVolumeName, Value: "restore-intermediate"},
+					{Key: PropVolumeContentSourceType, Value: "volume"},
+					{Key: PropVolumeContentSourceID, Value: "stale-source"},
+					{Key: PropVolumeOriginSnapshot, Value: "pool/parent/other@clone-source"},
+					{Key: PropRequestedSizeBytes, Value: "1234"},
+				},
+			})
+			require.NoError(t, err)
+			source.Available = truenas.DatasetProperty{Parsed: float64(100 * testGiB)}
+			snapshot, err := client.SnapshotCreate(ctx, source.Name, "restore-point", nil)
+			require.NoError(t, err)
+
+			driver := newComplianceTestDriver(client)
+			driver.config.ZFS.DetachedVolumesFromSnapshots = test.detached
+			driver.config.ZFS.DatasetEnableQuotas = false
+			request := &csi.CreateVolumeRequest{
+				Name:               "restored-volume",
+				CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 * testGiB},
+				Parameters:         map[string]string{"protocol": "nfs"},
+				VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+				VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+					Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "restore-point"},
+				}},
+			}
+
+			response, err := driver.CreateVolume(ctx, request)
+			require.NoError(t, err)
+			assert.Equal(t, 2*testGiB, response.GetVolume().GetCapacityBytes())
+			target, err := client.DatasetGet(ctx, "pool/parent/restored-volume")
+			require.NoError(t, err)
+
+			if test.detached {
+				assert.Empty(t, datasetOriginSnapshotID(target))
+				assert.Equal(t, "restored-volume", datasetUserProperty(target, PropCSIVolumeName))
+				assert.Equal(t, "snapshot", datasetUserProperty(target, PropVolumeContentSourceType))
+				assert.Equal(t, "restore-point", datasetUserProperty(target, PropVolumeContentSourceID))
+				assert.Equal(t, "-", datasetUserProperty(target, PropVolumeOriginSnapshot))
+				assert.Equal(t, "2147483648", datasetUserProperty(target, PropRequestedSizeBytes))
+
+				// Simulate a retry after inherited identity leaked back onto the target.
+				require.NoError(t, client.DatasetSetUserProperties(ctx, target.Name, map[string]string{
+					PropCSIVolumeName:           "wrong-name",
+					PropVolumeContentSourceType: "volume",
+					PropVolumeContentSourceID:   "wrong-source",
+					PropRequestedSizeBytes:      "1",
+				}))
+				retry, retryErr := driver.CreateVolume(ctx, request)
+				require.NoError(t, retryErr)
+				assert.Equal(t, "restore-point", retry.GetVolume().GetContentSource().GetSnapshot().GetSnapshotId())
+				target, err = client.DatasetGet(ctx, target.Name)
+				require.NoError(t, err)
+				assert.Equal(t, "restored-volume", datasetUserProperty(target, PropCSIVolumeName))
+				assert.Equal(t, "snapshot", datasetUserProperty(target, PropVolumeContentSourceType))
+				assert.Equal(t, "restore-point", datasetUserProperty(target, PropVolumeContentSourceID))
+				assert.Equal(t, "2147483648", datasetUserProperty(target, PropRequestedSizeBytes))
+
+				hasClones, cloneErr := client.DatasetHasDependentClones(ctx, source.Name)
+				require.NoError(t, cloneErr)
+				assert.False(t, hasClones)
+				require.NoError(t, client.SnapshotDelete(ctx, snapshot.ID, false, false))
+				require.NoError(t, client.DatasetDelete(ctx, source.Name, false, true))
+			} else {
+				assert.Equal(t, snapshot.ID, datasetOriginSnapshotID(target))
+				hasClones, cloneErr := client.DatasetHasDependentClones(ctx, source.Name)
+				require.NoError(t, cloneErr)
+				assert.True(t, hasClones)
+				require.Error(t, client.SnapshotDelete(ctx, snapshot.ID, false, false))
+			}
+		})
+	}
+}
+
+func TestCreateVolumeDetachedSnapshotCopyNormalizesZvolCapacityAndIdentity(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/block-intermediate", Type: "VOLUME", Volsize: testGiB, Refreservation: testGiB,
+		UserProperties: []truenas.UserPropertyUpdate{
+			{Key: PropCSIVolumeName, Value: "block-intermediate"},
+			{Key: PropVolumeContentSourceType, Value: "volume"},
+			{Key: PropVolumeContentSourceID, Value: "stale-source"},
+		},
+	})
+	require.NoError(t, err)
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "block-restore", nil)
+	require.NoError(t, err)
+
+	driver := newComplianceTestDriver(client)
+	driver.config.ZFS.DetachedVolumesFromSnapshots = true
+	driver.config.ZFS.ZvolEnableReservation = true
+	driver.config.ZFS.ZvolReadyTimeout = 1
+	driver.config.ISCSI = ISCSIConfig{
+		TargetPortal:      "192.0.2.10:3260",
+		ExtentBlocksize:   512,
+		ExtentRpm:         "SSD",
+		DeviceWaitTimeout: 1,
+	}
+	driver.serviceReloadDebouncer = NewServiceReloadDebouncer(0, client.ServiceReload)
+	t.Cleanup(driver.serviceReloadDebouncer.Stop)
+
+	response, err := driver.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "restored-block-volume",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 * testGiB},
+		Parameters:         map[string]string{"protocol": "iscsi"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "block-restore"},
+		}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2*testGiB, response.GetVolume().GetCapacityBytes())
+
+	target, err := client.DatasetGet(ctx, "pool/parent/restored-block-volume")
+	require.NoError(t, err)
+	assert.Empty(t, datasetOriginSnapshotID(target))
+	assert.Equal(t, float64(2*testGiB), target.Volsize.Parsed)
+	assert.Equal(t, float64(2*testGiB), target.Refreservation.Parsed)
+	assert.Equal(t, "restored-block-volume", datasetUserProperty(target, PropCSIVolumeName))
+	assert.Equal(t, "snapshot", datasetUserProperty(target, PropVolumeContentSourceType))
+	assert.Equal(t, "block-restore", datasetUserProperty(target, PropVolumeContentSourceID))
+
+	require.NoError(t, client.SnapshotDelete(ctx, snapshot.ID, false, false))
+	require.NoError(t, client.DatasetDelete(ctx, source.Name, false, true))
+}
+
+type transferredSnapshotCleanupTrackingClient struct {
+	*truenas.MockClient
+	destroyedSnapshots []string
+}
+
+func (m *transferredSnapshotCleanupTrackingClient) DestroyReplicatedTargetSnapshot(
+	ctx context.Context,
+	targetDataset string,
+	snapshotShortName string,
+) error {
+	m.destroyedSnapshots = append(m.destroyedSnapshots, targetDataset+"@"+snapshotShortName)
+	return m.MockClient.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName)
+}
+
+func TestCreateVolumeDetachedSnapshotExistingCopyClearsInheritedShareIdentity(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/source-with-share", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	sourceShare, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: source.Mountpoint})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropNFSShareID, fmt.Sprint(sourceShare.ID)))
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "existing-copy-snapshot", nil)
+	require.NoError(t, err)
+	require.NoError(t, client.CopyDatasetFromSnapshotLocal(
+		ctx, source.Name, snapshot.Name, "pool/parent/existing-copy",
+	))
+	transferredSnapshot, err := client.SnapshotCreate(ctx, "pool/parent/existing-copy", snapshot.Name, nil)
+	require.NoError(t, err)
+
+	trackingClient := &transferredSnapshotCleanupTrackingClient{MockClient: client}
+	driver := newComplianceTestDriver(trackingClient)
+	driver.config.ZFS.DetachedVolumesFromSnapshots = true
+	driver.config.ZFS.DatasetEnableQuotas = true
+	response, err := driver.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "existing-copy",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snapshot.Name},
+		}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, snapshot.Name, response.GetVolume().GetContentSource().GetSnapshot().GetSnapshotId())
+	assert.Equal(t, []string{transferredSnapshot.ID}, trackingClient.destroyedSnapshots)
+	_, err = client.SnapshotGet(ctx, transferredSnapshot.ID)
+	require.Error(t, err)
+
+	target, err := client.DatasetGet(ctx, "pool/parent/existing-copy")
+	require.NoError(t, err)
+	targetShareID := datasetUserProperty(target, PropNFSShareID)
+	assert.NotEqual(t, fmt.Sprint(sourceShare.ID), targetShareID)
+	assert.NotEqual(t, "-", targetShareID)
+	remainingSourceShare, err := client.NFSShareGet(ctx, sourceShare.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, remainingSourceShare)
+
+	_, err = driver.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "existing-copy"})
+	require.NoError(t, err)
+	_, err = client.DatasetGet(ctx, target.Name)
+	assert.True(t, truenas.IsNotFoundError(err))
+}
+
+type detachedCopyErrorClient struct {
+	*truenas.MockClient
+}
+
+func (m *detachedCopyErrorClient) CopyDatasetFromSnapshotLocal(
+	ctx context.Context,
+	_, _, targetDataset string,
+) error {
+	_, err := m.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: targetDataset, Type: "FILESYSTEM"})
+	if err != nil {
+		return err
+	}
+	return errors.New("injected copy failure after partial receive")
+}
+
+func TestCreateVolumeDetachedSnapshotCopyFailureCleansPartialTarget(t *testing.T) {
+	ctx := context.Background()
+	client := &detachedCopyErrorClient{MockClient: truenas.NewMockClient()}
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/partial-copy-source", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	_, err = client.SnapshotCreate(ctx, source.Name, "partial-copy-snapshot", nil)
+	require.NoError(t, err)
+
+	driver := newComplianceTestDriver(client)
+	driver.config.ZFS.DetachedVolumesFromSnapshots = true
+	_, err = driver.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "partial-copy-target",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "partial-copy-snapshot"},
+		}},
+	})
+	require.Equal(t, codes.Internal, status.Code(err))
+
+	_, err = client.DatasetGet(ctx, "pool/parent/partial-copy-target")
+	assert.True(t, truenas.IsNotFoundError(err))
 }
 
 type quotaUpdateErrorClient struct {

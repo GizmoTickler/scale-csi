@@ -1218,7 +1218,7 @@ func isIdempotentAPIMethod(method string) bool {
 		operation = method[index+1:]
 	}
 	switch operation {
-	case "query", "get", "get_instance", "lookup", "config", "info", "ping":
+	case "query", "get", "get_instance", "get_jobs", "lookup", "config", "info", "ping":
 		return true
 	default:
 		return strings.HasSuffix(operation, "_choices")
