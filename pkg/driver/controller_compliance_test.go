@@ -162,6 +162,49 @@ func TestCreateVolumeRejectsExistingBlockProtocolMismatch(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeExistingBlockProtocolMatchIsIdempotent(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+	}{
+		{name: "iSCSI on iSCSI", protocol: "iscsi"},
+		{name: "NVMe-oF on NVMe-oF", protocol: "nvmeof"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mockClient := truenas.NewMockClient()
+			driver := newComplianceTestDriver(mockClient)
+			driver.config.ISCSI.TargetPortal = "192.0.2.10:3260"
+			driver.config.NVMeoF = NVMeoFConfig{
+				Transport:             "TCP",
+				TransportAddress:      "192.0.2.20",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: true,
+			}
+			driver.serviceReloadDebouncer = NewServiceReloadDebouncer(0, func(context.Context, string) error {
+				return nil
+			})
+			t.Cleanup(driver.serviceReloadDebouncer.Stop)
+
+			request := &csi.CreateVolumeRequest{
+				Name:               "existing-block-volume",
+				Parameters:         map[string]string{"protocol": tc.protocol},
+				VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+				CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			}
+			created, err := driver.CreateVolume(ctx, request)
+			require.NoError(t, err)
+
+			retry, err := driver.CreateVolume(ctx, request)
+			require.NoError(t, err)
+			assert.Equal(t, created.GetVolume().GetVolumeId(), retry.GetVolume().GetVolumeId())
+			assert.Equal(t, testGiB, retry.GetVolume().GetCapacityBytes())
+		})
+	}
+}
+
 func TestCreateVolumeRejectsUnknownExplicitProtocol(t *testing.T) {
 	driver := newComplianceTestDriver(truenas.NewMockClient())
 
@@ -279,6 +322,49 @@ func TestCreateVolumeQuotaLessNFSUsesStoredRequestedCapacity(t *testing.T) {
 	retryResponse, err := driver.CreateVolume(ctx, request)
 	require.NoError(t, err, "pool availability must not violate the original volume capacity limit")
 	assert.Equal(t, requested, retryResponse.GetVolume().GetCapacityBytes())
+}
+
+func TestControllerExpandVolumeQuotaLessNFSUpdatesStoredRequestedCapacity(t *testing.T) {
+	ctx := context.Background()
+	mockClient := truenas.NewMockClient()
+	driver := newComplianceTestDriver(mockClient)
+
+	createRequest := &csi.CreateVolumeRequest{
+		Name:               "quota-less-expand-volume",
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 * testGiB},
+	}
+	_, err := driver.CreateVolume(ctx, createRequest)
+	require.NoError(t, err)
+
+	expandResponse, err := driver.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+		VolumeId:      createRequest.Name,
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 * testGiB},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 5*testGiB, expandResponse.GetCapacityBytes())
+	assert.False(t, expandResponse.GetNodeExpansionRequired())
+
+	getResponse, err := driver.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: createRequest.Name})
+	require.NoError(t, err)
+	assert.Equal(t, 5*testGiB, getResponse.GetVolume().GetCapacityBytes())
+	repeatExpandResponse, err := driver.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+		VolumeId:      createRequest.Name,
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 * testGiB},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 5*testGiB, repeatExpandResponse.GetCapacityBytes())
+	assert.False(t, repeatExpandResponse.GetNodeExpansionRequired())
+
+	dataset, err := mockClient.DatasetGet(ctx, "pool/parent/"+createRequest.Name)
+	require.NoError(t, err)
+	assert.Equal(t, "5368709120", datasetUserProperty(dataset, PropRequestedSizeBytes))
+
+	createRequest.CapacityRange = &csi.CapacityRange{RequiredBytes: 5 * testGiB}
+	retryResponse, err := driver.CreateVolume(ctx, createRequest)
+	require.NoError(t, err)
+	assert.Equal(t, 5*testGiB, retryResponse.GetVolume().GetCapacityBytes())
 }
 
 func TestValidateVolumeCapabilitiesDatasetErrors(t *testing.T) {

@@ -1461,6 +1461,18 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	}
 
 	currentCapacity := d.getDatasetCapacity(ds)
+	hasRefquota := false
+	if parsed, ok := ds.Refquota.Parsed.(float64); ok {
+		hasRefquota = parsed > 0
+	}
+	quotaLessNFS := ds.Type == "FILESYSTEM" && !d.config.ZFS.DatasetEnableQuotas && !hasRefquota
+	if quotaLessNFS && capacityBytes >= currentCapacity {
+		if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+			PropRequestedSizeBytes: strconv.FormatInt(capacityBytes, 10),
+		}); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to record expanded volume capacity: %v", err)
+		}
+	}
 	if capacityBytes <= currentCapacity {
 		// Still request node expansion for zvols: a retry can land here after the
 		// controller-side expand succeeded but before the node resized the filesystem.
