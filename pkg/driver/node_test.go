@@ -308,6 +308,48 @@ func TestNodeStageVolume_Validation(t *testing.T) {
 	})
 }
 
+func TestNodeStageUnstageVolume_BlockRoundTrip(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "iscsiadm")
+	originalConnect := iscsiConnectWithSessions
+	t.Cleanup(func() { iscsiConnectWithSessions = originalConnect })
+	iscsiConnectWithSessions = func(context.Context, string, string, int, *util.ISCSIConnectOptions, []util.ISCSISessionInfo) (string, error) {
+		return "/dev/null", nil
+	}
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	stagingPath := filepath.Join(t.TempDir(), "staging", "volume-device")
+	req := &csi.NodeStageVolumeRequest{
+		VolumeId:          "block-volume",
+		StagingTargetPath: stagingPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+		VolumeContext: map[string]string{
+			"node_attach_driver": "iscsi",
+			"portal":             "192.0.2.10:3260",
+			"iqn":                "iqn.test:block-volume",
+			"lun":                "0",
+		},
+	}
+
+	_, err := d.NodeStageVolume(context.Background(), req)
+	require.NoError(t, err)
+	info, err := os.Lstat(stagingPath)
+	require.NoError(t, err)
+	assert.NotZero(t, info.Mode()&os.ModeSymlink, "block staging path must be a symlink, not a directory")
+	target, err := os.Readlink(stagingPath)
+	require.NoError(t, err)
+	assert.Equal(t, "/dev/null", target)
+
+	_, err = d.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+		VolumeId: "block-volume", StagingTargetPath: stagingPath,
+	})
+	require.NoError(t, err)
+	_, err = os.Lstat(stagingPath)
+	assert.True(t, os.IsNotExist(err), "unstage must remove the block staging symlink")
+}
+
 func TestNodeUnstageVolume_Validation(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeNFS)
 
@@ -710,14 +752,17 @@ func TestNodeExpandVolumeRawBlockRescansWithoutFilesystemResize(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeNFS)
 	originalDeviceSize := nodeGetDeviceSize
 	originalGetNVMeInfo := nodeGetNVMeInfo
+	originalPollInterval := nodeDeviceSizePollInterval
 	t.Cleanup(func() {
 		nodeGetDeviceSize = originalDeviceSize
 		nodeGetNVMeInfo = originalGetNVMeInfo
+		nodeDeviceSizePollInterval = originalPollInterval
 	})
+	nodeDeviceSizePollInterval = time.Millisecond
 	sizeReads := 0
 	nodeGetDeviceSize = func(string) (int64, error) {
 		sizeReads++
-		if sizeReads == 1 {
+		if sizeReads <= 2 {
 			return 2 << 30, nil
 		}
 		return 4 << 30, nil
@@ -734,6 +779,7 @@ func TestNodeExpandVolumeRawBlockRescansWithoutFilesystemResize(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, int64(4<<30), resp.CapacityBytes)
+	assert.Equal(t, 3, sizeReads, "device size must be polled until the asynchronous rescan settles")
 
 	commands := readNodeCommandLog(t, logPath)
 	assert.Contains(t, commands, "nvme ns-rescan /dev/nvme3")
@@ -748,10 +794,16 @@ func TestNodeExpandVolumeReturnsErrorWhenActualSizeIsBelowTarget(t *testing.T) {
 	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme3n7\n")
 	originalDeviceSize := nodeGetDeviceSize
 	originalGetNVMeInfo := nodeGetNVMeInfo
+	originalPollTimeout := nodeDeviceSizePollTimeout
+	originalPollInterval := nodeDeviceSizePollInterval
 	t.Cleanup(func() {
 		nodeGetDeviceSize = originalDeviceSize
 		nodeGetNVMeInfo = originalGetNVMeInfo
+		nodeDeviceSizePollTimeout = originalPollTimeout
+		nodeDeviceSizePollInterval = originalPollInterval
 	})
+	nodeDeviceSizePollTimeout = 5 * time.Millisecond
+	nodeDeviceSizePollInterval = time.Millisecond
 	nodeGetDeviceSize = func(string) (int64, error) { return 2 << 30, nil }
 	nodeGetNVMeInfo = func(string) (string, error) { return "nqn.test:block-vol", nil }
 
@@ -767,7 +819,7 @@ func TestNodeExpandVolumeReturnsErrorWhenActualSizeIsBelowTarget(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Nil(t, resp)
-	assert.Contains(t, err.Error(), "below requested")
+	assert.Contains(t, err.Error(), "did not settle")
 }
 
 func TestNodeExpandVolumeRejectsRawBlockDeviceOwnedByAnotherVolume(t *testing.T) {
@@ -807,7 +859,7 @@ func TestStageNFSVolume_Validation(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeNFS)
 
 	t.Run("NilVolumeContext", func(t *testing.T) {
-		err := d.stageNFSVolume(context.Background(), nil, "/staging")
+		err := d.stageNFSVolume(context.Background(), nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -818,7 +870,7 @@ func TestStageNFSVolume_Validation(t *testing.T) {
 	t.Run("MissingServer", func(t *testing.T) {
 		err := d.stageNFSVolume(context.Background(), map[string]string{
 			"share": "/data",
-		}, "/staging")
+		}, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -830,7 +882,7 @@ func TestStageNFSVolume_Validation(t *testing.T) {
 	t.Run("MissingShare", func(t *testing.T) {
 		err := d.stageNFSVolume(context.Background(), map[string]string{
 			"server": "nas.example.com",
-		}, "/staging")
+		}, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -925,7 +977,7 @@ func TestBlockBackedFilesystemStagePassesNormalizedMountFlags(t *testing.T) {
 		}, filepath.Join(t.TempDir(), "stage"), capability)
 		require.NoError(t, err)
 		assert.Equal(t, "xfs", gotFS)
-		assert.Equal(t, []string{"noatime", "discard"}, gotFlags)
+		assert.Equal(t, []string{"noatime", "discard", "nouuid"}, gotFlags)
 	})
 
 	t.Run("NVMeoF", func(t *testing.T) {
@@ -939,8 +991,81 @@ func TestBlockBackedFilesystemStagePassesNormalizedMountFlags(t *testing.T) {
 		}, filepath.Join(t.TempDir(), "stage"), capability)
 		require.NoError(t, err)
 		assert.Equal(t, "xfs", gotFS)
-		assert.Equal(t, []string{"noatime", "discard"}, gotFlags)
+		assert.Equal(t, []string{"noatime", "discard", "nouuid"}, gotFlags)
 	})
+
+	t.Run("deduplicates operator supplied nouuid", func(t *testing.T) {
+		flags := volumeMountFlagsForFS(&csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{
+			Mount: &csi.VolumeCapability_MountVolume{MountFlags: []string{"NOUUID"}},
+		}}, "XFS")
+		assert.Equal(t, []string{"NOUUID"}, flags)
+	})
+
+	t.Run("ext4 unchanged", func(t *testing.T) {
+		flags := volumeMountFlagsForFS(&csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{
+			Mount: &csi.VolumeCapability_MountVolume{MountFlags: []string{"discard"}},
+		}}, "ext4")
+		assert.Equal(t, []string{"discard"}, flags)
+	})
+}
+
+func TestNodeStageVolumeNFSXFSIncludesNouuid(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "mount")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	_, err := d.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "nfs-xfs-volume",
+		StagingTargetPath: filepath.Join(t.TempDir(), "stage"),
+		VolumeContext: map[string]string{
+			"node_attach_driver": "nfs",
+			"server":             "192.0.2.30",
+			"share":              "/mnt/pool/clone",
+		},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{
+				FsType: "XFS", MountFlags: []string{"noatime"},
+			}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, readNodeCommandLog(t, logPath), "mount -t nfs -o nfsvers=4,noatime,nouuid 192.0.2.30:/mnt/pool/clone")
+}
+
+func TestStageISCSIVolumeRejectsMultipathOwnedDeviceBeforeMount(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "iscsiadm")
+	originalConnect := iscsiConnectWithSessions
+	originalCheck := nodeCheckISCSIMultipath
+	originalFormatAndMount := nodeFormatAndMount
+	t.Cleanup(func() {
+		iscsiConnectWithSessions = originalConnect
+		nodeCheckISCSIMultipath = originalCheck
+		nodeFormatAndMount = originalFormatAndMount
+	})
+	iscsiConnectWithSessions = func(context.Context, string, string, int, *util.ISCSIConnectOptions, []util.ISCSISessionInfo) (string, error) {
+		return "/dev/sdz", nil
+	}
+	nodeCheckISCSIMultipath = func(devicePath string) error {
+		return errors.New("iSCSI device " + devicePath + " is claimed by dm-multipath; iSCSI multipath is unsupported")
+	}
+	formatCalls := 0
+	nodeFormatAndMount = func(string, string, string, []string) error {
+		formatCalls++
+		return nil
+	}
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	err := d.stageISCSIVolume(context.Background(), map[string]string{
+		"portal": "192.0.2.10:3260", "iqn": "iqn.test:volume", "lun": "0",
+	}, filepath.Join(t.TempDir(), "stage"), &csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "claimed by dm-multipath")
+	assert.Zero(t, formatCalls)
 }
 
 func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
@@ -1453,9 +1578,10 @@ func TestCleanupOrphanedISCSISessionUsesProtocolShareName(t *testing.T) {
 	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
 
 	d := newTestNodeDriver(ShareTypeISCSI)
+	d.config.ISCSI.NamePrefix = "cluster-"
 	d.config.ISCSI.NameSuffix = "-cluster"
 	volumeID := strings.Repeat("Long_Volume_Name!", 8)
-	targetName := protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
+	targetName := d.iscsiShareName(volumeID)
 	iqn := "iqn.2005-10.org.freenas.ctl:" + targetName
 	t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 "+iqn+" (non-flash)\n")
 

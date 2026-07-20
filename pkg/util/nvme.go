@@ -4,12 +4,14 @@ package util
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,8 +22,9 @@ import (
 // Pattern: nvme<controller_number>n<namespace_number>
 // Examples: nvme0n1 -> captures "nvme0", nvme10n2 -> captures "nvme10"
 var (
-	nvmeControllerRegex = regexp.MustCompile(`^nvme\d+$`)
-	nvmeDeviceRegex     = regexp.MustCompile(`^(nvme\d+)n\d+$`)
+	nvmeControllerRegex       = regexp.MustCompile(`^nvme\d+$`)
+	nvmeDeviceRegex           = regexp.MustCompile(`^(nvme\d+)n\d+$`)
+	errNVMeNamespaceAmbiguous = errors.New("ambiguous NVMe namespace selection")
 )
 
 // Note: getNVMeTimeout() is now configurable via SetConfig().NVMeTimeout
@@ -383,14 +386,21 @@ func findNVMeDeviceFresh(nqn string) (string, error) {
 	if err == nil && devicePath != "" {
 		return devicePath, nil
 	}
+	if errors.Is(err, errNVMeNamespaceAmbiguous) {
+		return "", err
+	}
 
 	// Alternative: use nvme list-subsys to derive device from controller name
 	return findNVMeDeviceFromListSubsys(nqn)
 }
 
 func findNVMeDeviceFromSysfs(nqn string) (string, error) {
+	return findNVMeDeviceFromSysfsInPaths(nqn, "/sys/class/nvme-subsystem", "/dev")
+}
+
+func findNVMeDeviceFromSysfsInPaths(nqn, subsystemClassRoot, devRoot string) (string, error) {
 	// Look in /sys/class/nvme-subsystem
-	subsysDirs, err := filepath.Glob("/sys/class/nvme-subsystem/nvme-subsys*")
+	subsysDirs, err := filepath.Glob(filepath.Join(subsystemClassRoot, "nvme-subsys*"))
 	if err != nil {
 		return "", err
 	}
@@ -408,30 +418,36 @@ func findNVMeDeviceFromSysfs(nqn string) (string, error) {
 			continue
 		}
 
-		// Found the subsystem, now find the namespace device
-		// First try: Look for nvmeXnY devices directly in the subsystem dir
-		// This handles TCP/RDMA NVMe-oF where devices appear as nvme2n1 directly
-		directDevices, _ := filepath.Glob(filepath.Join(subsysDir, "nvme*n*"))
-		for _, devPath := range directDevices {
-			deviceName := filepath.Base(devPath)
-			// Filter out controllers (nvme0) and only match namespaces (nvme0n1)
-			if nvmeDeviceRegex.MatchString(deviceName) {
-				devicePath := "/dev/" + deviceName
-				if _, err := os.Stat(devicePath); err == nil {
-					return devicePath, nil
+		// A subsystem may expose namespaces directly (common for fabrics) or
+		// below controller directories (common for PCIe). Without an expected
+		// NSID, selecting among multiple namespaces is unsafe.
+		namespaceNames := make(map[string]struct{})
+		patterns := []string{
+			filepath.Join(subsysDir, "nvme*n*"),
+			filepath.Join(subsysDir, "nvme*", "nvme*n*"),
+		}
+		for _, pattern := range patterns {
+			nvmeDevices, _ := filepath.Glob(pattern)
+			for _, devPath := range nvmeDevices {
+				deviceName := filepath.Base(devPath)
+				if nvmeDeviceRegex.MatchString(deviceName) {
+					namespaceNames[deviceName] = struct{}{}
 				}
 			}
 		}
 
-		// Second try: Look for nvmeXnY devices under controller subdirs (for PCIe NVMe)
-		nvmeDevices, _ := filepath.Glob(filepath.Join(subsysDir, "nvme*/nvme*n*")) //nolint:gocritic // glob pattern with path separator is intentional
-		for _, devPath := range nvmeDevices {
-			deviceName := filepath.Base(devPath)
-			if nvmeDeviceRegex.MatchString(deviceName) {
-				devicePath := "/dev/" + deviceName
-				if _, err := os.Stat(devicePath); err == nil {
-					return devicePath, nil
-				}
+		names := make([]string, 0, len(namespaceNames))
+		for name := range namespaceNames {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if len(names) > 1 {
+			return "", fmt.Errorf("%w: NVMe subsystem %s exposes multiple namespaces (%s)", errNVMeNamespaceAmbiguous, nqn, strings.Join(names, ", "))
+		}
+		if len(names) == 1 {
+			devicePath := filepath.Join(devRoot, names[0])
+			if _, err := os.Stat(devicePath); err == nil {
+				return devicePath, nil
 			}
 		}
 	}
@@ -470,6 +486,9 @@ func findNVMeDeviceFromSubsystems(nqn string, subsystems []NVMeSubsystem) (strin
 					if findErr == nil {
 						return devicePath, nil
 					}
+					if errors.Is(findErr, errNVMeNamespaceAmbiguous) {
+						return "", findErr
+					}
 				}
 			}
 		}
@@ -488,12 +507,20 @@ func findNVMeNamespaceForController(controller, nvmeClassRoot, devRoot string) (
 	if err != nil {
 		return "", err
 	}
+	deviceNames := make([]string, 0, len(namespaces))
 	for _, namespace := range namespaces {
 		deviceName := filepath.Base(namespace)
 		if !nvmeDeviceRegex.MatchString(deviceName) {
 			continue
 		}
-		devicePath := filepath.Join(devRoot, deviceName)
+		deviceNames = append(deviceNames, deviceName)
+	}
+	sort.Strings(deviceNames)
+	if len(deviceNames) > 1 {
+		return "", fmt.Errorf("%w: NVMe controller %s exposes multiple namespaces (%s)", errNVMeNamespaceAmbiguous, controller, strings.Join(deviceNames, ", "))
+	}
+	if len(deviceNames) == 1 {
+		devicePath := filepath.Join(devRoot, deviceNames[0])
 		if _, statErr := os.Stat(devicePath); statErr == nil {
 			return devicePath, nil
 		}

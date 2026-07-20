@@ -47,6 +47,7 @@ type shareCallCountingMock struct {
 	zvolWaits          int
 	idempotencyLookups int
 	propertyUpdates    []map[string]string
+	extentPblocksize   []bool
 }
 
 type nvmeDeleteAssociationCountingMock struct {
@@ -204,6 +205,11 @@ func (m *shareCallCountingMock) DatasetSetUserProperties(ctx context.Context, na
 	}
 	m.propertyUpdates = append(m.propertyUpdates, copyOfProperties)
 	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
+}
+
+func (m *shareCallCountingMock) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*truenas.ISCSIExtent, error) {
+	m.extentPblocksize = append(m.extentPblocksize, physicalBlocksize)
+	return m.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, physicalBlocksize, rpm)
 }
 
 func (m *shareCallCountingMock) ISCSITargetGet(ctx context.Context, id int) (*truenas.ISCSITarget, error) {
@@ -599,6 +605,7 @@ func TestCreateISCSIShare_TargetCreation_Success(t *testing.T) {
 				ZvolReadyTimeout:  5,
 			},
 			ISCSI: ISCSIConfig{
+				NamePrefix: "csi-",
 				TargetGroups: []ISCSITargetGroup{
 					{Portal: 1, Initiator: 1, AuthMethod: "NONE"},
 				},
@@ -624,7 +631,7 @@ func TestCreateISCSIShare_TargetCreation_Success(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify resources were created
-	target, err := mockClient.ISCSITargetFindByName(ctx, "test-iscsi-create")
+	target, err := mockClient.ISCSITargetFindByName(ctx, "csi-test-iscsi-create")
 	assert.NoError(t, err)
 	assert.NotNil(t, target)
 }
@@ -634,9 +641,10 @@ func TestCreateISCSIShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testing
 	d := &Driver{
 		config: &Config{
 			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
-			ISCSI: ISCSIConfig{TargetGroups: []ISCSITargetGroup{
-				{Portal: 1, Initiator: 1, AuthMethod: "NONE"},
-			}},
+			ISCSI: ISCSIConfig{
+				ExtentDisablePhysicalBlocksize: true,
+				TargetGroups:                   []ISCSITargetGroup{{Portal: 1, Initiator: 1, AuthMethod: "NONE"}},
+			},
 		},
 		truenasClient: mockClient,
 		serviceReloadDebouncer: NewServiceReloadDebouncer(time.Nanosecond, func(context.Context, string) error {
@@ -655,6 +663,7 @@ func TestCreateISCSIShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testing
 	assert.Zero(t, mockClient.datasetGets)
 	assert.Zero(t, mockClient.zvolWaits)
 	assert.Zero(t, mockClient.idempotencyLookups)
+	assert.Equal(t, []bool{false}, mockClient.extentPblocksize)
 	require.Len(t, mockClient.propertyUpdates, 1)
 	assert.Equal(t, map[string]string{
 		PropISCSITargetID:       "1",

@@ -35,6 +35,18 @@ type clonePropertyFailureMock struct {
 	err error
 }
 
+type datasetCreateCaptureMock struct {
+	*truenas.MockClient
+	params []*truenas.DatasetCreateParams
+}
+
+func (m *datasetCreateCaptureMock) DatasetCreate(ctx context.Context, params *truenas.DatasetCreateParams) (*truenas.Dataset, error) {
+	copyParams := *params
+	copyParams.UserProperties = append([]truenas.UserPropertyUpdate(nil), params.UserProperties...)
+	m.params = append(m.params, &copyParams)
+	return m.MockClient.DatasetCreate(ctx, params)
+}
+
 func (m *clonePropertyFailureMock) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
 	if _, authoritative := properties[PropVolumeOriginSnapshot]; authoritative {
 		return m.err
@@ -383,6 +395,85 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 			} else {
 				assert.Equal(t, tc.wantID, resp.GetVolume().GetContentSource().GetVolume().GetVolumeId())
 			}
+		})
+	}
+}
+
+func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
+	client := &datasetCreateCaptureMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{ZFS: ZFSConfig{
+			DatasetParentName:        "pool/parent",
+			DatasetEnableQuotas:      true,
+			DatasetEnableReservation: true,
+			DatasetProperties: map[string]string{
+				"compression":       "zstd",
+				"sync":              "always",
+				"atime":             "off",
+				"recordsize":        "128k",
+				"logbias":           "throughput",
+				"primarycache":      "metadata",
+				"copies":            "2",
+				"dedup":             "verify",
+				"org.truenas:owner": "storage-team",
+				"unknown":           "ignored",
+			},
+		}},
+		truenasClient: client,
+	}
+
+	_, err := d.createDataset(context.Background(), "pool/parent/volume", 2*testGiB, ShareTypeNFS)
+	require.NoError(t, err)
+	require.Len(t, client.params, 1)
+	params := client.params[0]
+	assert.Equal(t, "ZSTD", params.Compression)
+	assert.Equal(t, "ALWAYS", params.Sync)
+	assert.Equal(t, "OFF", params.Atime)
+	assert.Equal(t, "128K", params.Recordsize)
+	assert.Equal(t, "THROUGHPUT", params.Logbias)
+	assert.Equal(t, "METADATA", params.Primarycache)
+	assert.Equal(t, 2, params.Copies)
+	assert.Equal(t, "VERIFY", params.Deduplication)
+	assert.Equal(t, 2*testGiB, params.Refquota)
+	assert.Equal(t, 2*testGiB, params.Refreservation)
+	assert.Equal(t, []truenas.UserPropertyUpdate{{Key: "org.truenas:owner", Value: "storage-team"}}, params.UserProperties)
+}
+
+func TestCreateDatasetZvolReservation(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		enabled            bool
+		wantSparse         bool
+		wantRefreservation int64
+	}{
+		{name: "thin by default", wantSparse: true},
+		{name: "thick opt in", enabled: true, wantRefreservation: 4 * testGiB},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &datasetCreateCaptureMock{MockClient: truenas.NewMockClient()}
+			d := &Driver{
+				config: &Config{ZFS: ZFSConfig{
+					ZvolBlocksize:         "16K",
+					ZvolEnableReservation: test.enabled,
+					DatasetProperties: map[string]string{
+						"volblocksize": "64K",
+						"sparse":       "false",
+						"refquota":     "1",
+					},
+				}},
+				truenasClient: client,
+			}
+
+			_, err := d.createDataset(context.Background(), "pool/parent/zvol", 4*testGiB, ShareTypeISCSI)
+			require.NoError(t, err)
+			require.Len(t, client.params, 1)
+			params := client.params[0]
+			assert.Equal(t, "VOLUME", params.Type)
+			assert.Equal(t, 4*testGiB, params.Volsize)
+			assert.Equal(t, "16K", params.Volblocksize, "explicit zvol block size must win")
+			assert.Equal(t, test.wantSparse, params.Sparse)
+			assert.Equal(t, test.wantRefreservation, params.Refreservation)
+			assert.Zero(t, params.Refquota, "filesystem-only refquota must not leak into zvol creation")
 		})
 	}
 }

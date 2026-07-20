@@ -170,7 +170,7 @@ func TestISCSIExtentCreate_InvalidParams_ExistingExtent(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
-	extent, err := client.ISCSIExtentCreate(ctx, "existing-extent", "zvol/tank/vol1", "comment", 512, "SSD")
+	extent, err := client.ISCSIExtentCreate(ctx, "existing-extent", "zvol/tank/vol1", "comment", 512, true, "SSD")
 
 	require.NoError(t, err)
 	require.NotNil(t, extent)

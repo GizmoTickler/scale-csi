@@ -274,9 +274,9 @@ func (c *apiCallCountingClient) ISCSITargetFindByName(ctx context.Context, name 
 	return c.MockClient.ISCSITargetFindByName(ctx, name)
 }
 
-func (c *apiCallCountingClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, rpm string) (*truenas.ISCSIExtent, error) {
+func (c *apiCallCountingClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*truenas.ISCSIExtent, error) {
 	c.record("ISCSIExtentCreate")
-	return c.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, rpm)
+	return c.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, physicalBlocksize, rpm)
 }
 
 func (c *apiCallCountingClient) ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error {

@@ -152,19 +152,8 @@ func (c *Client) ISCSITargetFindByName(ctx context.Context, name string) (*ISCSI
 }
 
 // ISCSIExtentCreate creates a new iSCSI extent.
-func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, rpm string) (*ISCSIExtent, error) {
-	params := map[string]interface{}{
-		"name":         name,
-		"type":         "DISK",
-		"disk":         diskPath,
-		"comment":      comment,
-		"blocksize":    blocksize,
-		"pblocksize":   true,
-		"insecure_tpc": true,
-		"rpm":          rpm,
-		"ro":           false,
-		"enabled":      true,
-	}
+func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error) {
+	params := iscsiExtentCreateParams(name, diskPath, comment, blocksize, physicalBlocksize, rpm)
 
 	result, err := c.Call(ctx, "iscsi.extent.create", params)
 	if err != nil {
@@ -183,6 +172,21 @@ func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment 
 	}
 
 	return parseISCSIExtent(result)
+}
+
+func iscsiExtentCreateParams(name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) map[string]interface{} {
+	return map[string]interface{}{
+		"name":         name,
+		"type":         "DISK",
+		"disk":         diskPath,
+		"comment":      comment,
+		"blocksize":    blocksize,
+		"pblocksize":   physicalBlocksize,
+		"insecure_tpc": true,
+		"rpm":          rpm,
+		"ro":           false,
+		"enabled":      true,
+	}
 }
 
 // ISCSIExtentDelete deletes an iSCSI extent.

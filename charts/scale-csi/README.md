@@ -49,9 +49,9 @@ used, that Secret must contain an `api-key` key.
 | Parameter | Description | Default |
 |---|---|---|
 | `zfs.parentDataset` | Parent dataset for volumes (required; the driver refuses to start without it) | `""` |
-| `zfs.detachedSnapshotsDatasetParentName` | Parent dataset for detached snapshots | `""` |
 | `zfs.enforceQuota` | Enable dataset quotas | `true` |
 | `zfs.zvolBlocksize` | Block size for zvols | `16K` |
+| `zfs.zvolEnableReservation` | Thick-provision zvols with a full refreservation | `false` |
 | `zfs.zvolReadyTimeout` | Zvol readiness timeout in seconds | `60` |
 | `zfs.datasetProperties` | Additional ZFS dataset properties (e.g. `compression`, `dedup`) | `{}` |
 | `zfs.destroyForeignSnapshotsOnDelete` | Allow recursive volume deletion to destroy non-CSI snapshots | `false` |
@@ -80,6 +80,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `iscsi.namePrefix` | Target and extent name prefix | `""` |
 | `iscsi.targetGroups` | Explicit portal/initiator group IDs; empty = auto-resolve from `iscsi.portal` | `[]` |
 | `iscsi.extentBlocksize` | Extent block size | `512` |
+| `iscsi.extentDisablePhysicalBlocksize` | Disable extent physical-block-size reporting | `false` |
 | `iscsi.extentRpm` | Extent RPM value | `SSD` |
 | `iscsi.extentAvailThreshold` | Extent available-space warning threshold | `0` |
 | `iscsi.deviceWaitTimeout` | Device wait timeout in seconds | `60` |

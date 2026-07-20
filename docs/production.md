@@ -244,6 +244,9 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 - Driver-created iSCSI targets have no CHAP or per-tenant initiator isolation;
   an allow-all initiator group makes storage-network segmentation the access
   boundary for TCP 3260.
+- Host dm-multipath ownership of TrueNAS iSCSI LUNs is unsupported. The node
+  service refuses to stage an iSCSI device with a `dm-*` sysfs holder instead
+  of formatting or mounting a raw component path.
 - Foreign snapshots block `DeleteVolume` by default. Removing them or excluding
   the CSI parent from external snapshot tasks is required unless destructive
   cleanup is explicitly enabled with `zfs.destroyForeignSnapshotsOnDelete`.
@@ -274,6 +277,8 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 - Deleting a snapshot that still has clones renames it to an internal tombstone
   and requests deferred ZFS destruction. The snapshot disappears from CSI, but
   its referenced space remains charged until the last clone releases it.
+- Restores use ZFS clones: a restored volume pins its source snapshot until the
+  volume is deleted, with deferred destroy handling the snapshot lifecycle.
 - After upgrading a NAS from TrueNAS 25.x to 26.0, CSI snapshots created by
   older driver versions without `truenas-csi:csi_snapshot_name` are omitted
   from `ListSnapshots`. Restore and deletion by snapshot ID continue to work.

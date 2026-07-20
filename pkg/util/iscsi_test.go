@@ -170,6 +170,22 @@ func TestFindDeviceForSessionUsesOwningHostOnly(t *testing.T) {
 	assert.Contains(t, err.Error(), "device for session 12 not found")
 }
 
+func TestCheckISCSIDeviceMultipathOwnership(t *testing.T) {
+	sysBlockRoot := t.TempDir()
+	holders := filepath.Join(sysBlockRoot, "sdb", "holders")
+	require.NoError(t, os.MkdirAll(holders, 0o750))
+	require.NoError(t, os.Mkdir(filepath.Join(holders, "dm-0"), 0o750))
+
+	err := checkISCSIDeviceMultipathOwnership("/dev/sdb", sysBlockRoot)
+	require.Error(t, err)
+	assert.Equal(t, "iSCSI device /dev/sdb is claimed by dm-multipath; iSCSI multipath is unsupported", err.Error())
+
+	require.NoError(t, os.Remove(filepath.Join(holders, "dm-0")))
+	require.NoError(t, os.Mkdir(filepath.Join(holders, "md0"), 0o750))
+	require.NoError(t, checkISCSIDeviceMultipathOwnership("/dev/sdb", sysBlockRoot))
+	require.NoError(t, checkISCSIDeviceMultipathOwnership("/dev/sdc", sysBlockRoot))
+}
+
 // TestParseISCSISessions tests parsing of iscsiadm session output.
 // This is the core parsing logic from getISCSISessions().
 func TestParseISCSISessions(t *testing.T) {

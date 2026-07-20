@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1710,6 +1711,7 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 	params := &truenas.DatasetCreateParams{
 		Name: datasetName,
 	}
+	d.applyDatasetProperties(params)
 
 	if shareType == ShareTypeNFS {
 		// Create filesystem for NFS
@@ -1725,7 +1727,10 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 		params.Type = "VOLUME"
 		params.Volsize = capacityBytes
 		params.Volblocksize = d.config.ZFS.ZvolBlocksize
-		params.Sparse = true
+		params.Sparse = !d.config.ZFS.ZvolEnableReservation
+		if d.config.ZFS.ZvolEnableReservation {
+			params.Refreservation = capacityBytes
+		}
 	}
 
 	ds, err := d.truenasClient.DatasetCreate(ctx, params)
@@ -1733,6 +1738,54 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 		return nil, err
 	}
 	return ds, nil
+}
+
+func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
+	properties := d.config.ZFS.DatasetProperties
+	keys := make([]string, 0, len(properties))
+	for key := range properties {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, rawKey := range keys {
+		key := strings.TrimSpace(rawKey)
+		value := strings.TrimSpace(properties[rawKey])
+		switch strings.ToLower(key) {
+		case "compression":
+			params.Compression = strings.ToUpper(value)
+		case "sync":
+			params.Sync = strings.ToUpper(value)
+		case "atime":
+			params.Atime = strings.ToUpper(value)
+		case "recordsize":
+			params.Recordsize = strings.ToUpper(value)
+		case "logbias":
+			params.Logbias = strings.ToUpper(value)
+		case "primarycache":
+			params.Primarycache = strings.ToUpper(value)
+		case "dedup":
+			params.Deduplication = strings.ToUpper(value)
+		case "copies":
+			copies, err := strconv.Atoi(value)
+			if err != nil || copies < 1 {
+				klog.Warningf("Ignoring invalid zfs.datasetProperties copies value %q", value)
+				continue
+			}
+			params.Copies = copies
+		case "":
+			klog.Warning("Ignoring empty zfs.datasetProperties key")
+			continue
+		default:
+			if strings.Contains(key, ":") {
+				params.UserProperties = append(params.UserProperties, truenas.UserPropertyUpdate{Key: key, Value: value})
+			} else {
+				klog.Warningf("Ignoring unknown zfs.datasetProperties key %q", rawKey)
+				continue
+			}
+		}
+		klog.V(2).Infof("Applying zfs.datasetProperties %s=%q to %s", key, value, params.Name)
+	}
 }
 
 func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName string, source *csi.VolumeContentSource, capacityBytes int64) (*truenas.Dataset, error) {
@@ -1936,10 +1989,7 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 			}
 		} else {
 			// Fallback: lookup target by name (for volumes created before property tracking)
-			iscsiName := path.Base(datasetName)
-			if d.config.ISCSI.NameSuffix != "" {
-				iscsiName += d.config.ISCSI.NameSuffix
-			}
+			iscsiName := d.iscsiShareName(path.Base(datasetName))
 			klog.V(4).Infof("Target ID property missing for %s, falling back to name lookup: %s", datasetName, iscsiName)
 
 			var err error

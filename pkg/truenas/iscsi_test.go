@@ -221,6 +221,11 @@ func TestParseISCSIExtent_AllFields(t *testing.T) {
 	}
 }
 
+func TestISCSIExtentCreateParamsHonorsPhysicalBlocksize(t *testing.T) {
+	params := iscsiExtentCreateParams("extent", "zvol/tank/volume", "comment", 512, false, "SSD")
+	assert.Equal(t, false, params["pblocksize"])
+}
+
 func TestParseISCSIExtent_AllProperties(t *testing.T) {
 	data := map[string]interface{}{
 		"id":           float64(10),
@@ -491,7 +496,7 @@ func TestMockClient_ISCSIExtentCreate_Success(t *testing.T) {
 	client := NewMockClient()
 	ctx := context.Background()
 
-	extent, err := client.ISCSIExtentCreate(ctx, "test-extent", "zvol/tank/vol1", "comment", 512, "SSD")
+	extent, err := client.ISCSIExtentCreate(ctx, "test-extent", "zvol/tank/vol1", "comment", 512, true, "SSD")
 	require.NoError(t, err)
 	require.NotNil(t, extent)
 	assert.Equal(t, 1, extent.ID)
@@ -503,7 +508,7 @@ func TestMockClient_ISCSIExtentFindByName_Success(t *testing.T) {
 	client := NewMockClient()
 	ctx := context.Background()
 
-	_, err := client.ISCSIExtentCreate(ctx, "findme", "zvol/tank/findme", "", 512, "SSD")
+	_, err := client.ISCSIExtentCreate(ctx, "findme", "zvol/tank/findme", "", 512, true, "SSD")
 	require.NoError(t, err)
 
 	found, err := client.ISCSIExtentFindByName(ctx, "findme")
@@ -526,7 +531,7 @@ func TestMockClient_ISCSIExtentFindByDisk_Success(t *testing.T) {
 	ctx := context.Background()
 
 	diskPath := "zvol/tank/disk-test"
-	_, err := client.ISCSIExtentCreate(ctx, "disk-extent", diskPath, "", 512, "SSD")
+	_, err := client.ISCSIExtentCreate(ctx, "disk-extent", diskPath, "", 512, true, "SSD")
 	require.NoError(t, err)
 
 	found, err := client.ISCSIExtentFindByDisk(ctx, diskPath)
@@ -548,7 +553,7 @@ func TestMockClient_ISCSIExtentDelete_Success(t *testing.T) {
 	client := NewMockClient()
 	ctx := context.Background()
 
-	extent, _ := client.ISCSIExtentCreate(ctx, "delete-me", "zvol/tank/delete", "", 512, "SSD")
+	extent, _ := client.ISCSIExtentCreate(ctx, "delete-me", "zvol/tank/delete", "", 512, true, "SSD")
 
 	err := client.ISCSIExtentDelete(ctx, extent.ID, false, false)
 	require.NoError(t, err)
@@ -563,7 +568,7 @@ func TestMockClient_ISCSIExtentGet_Success(t *testing.T) {
 	client := NewMockClient()
 	ctx := context.Background()
 
-	extent, _ := client.ISCSIExtentCreate(ctx, "get-extent", "zvol/tank/get", "", 512, "SSD")
+	extent, _ := client.ISCSIExtentCreate(ctx, "get-extent", "zvol/tank/get", "", 512, true, "SSD")
 
 	got, err := client.ISCSIExtentGet(ctx, extent.ID)
 	require.NoError(t, err)
@@ -576,7 +581,7 @@ func TestMockClient_ISCSITargetExtentCreate_Success(t *testing.T) {
 	ctx := context.Background()
 
 	target, _ := client.ISCSITargetCreate(ctx, "target", "", "ISCSI", nil)
-	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, "SSD")
+	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, true, "SSD")
 
 	te, err := client.ISCSITargetExtentCreate(ctx, target.ID, extent.ID, 0)
 	require.NoError(t, err)
@@ -591,7 +596,7 @@ func TestMockClient_ISCSITargetExtentFind_Success(t *testing.T) {
 	ctx := context.Background()
 
 	target, _ := client.ISCSITargetCreate(ctx, "target", "", "ISCSI", nil)
-	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, "SSD")
+	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, true, "SSD")
 	_, err := client.ISCSITargetExtentCreate(ctx, target.ID, extent.ID, 0)
 	require.NoError(t, err)
 
@@ -616,9 +621,9 @@ func TestMockClient_ISCSITargetExtentFindByTarget_Multiple(t *testing.T) {
 	ctx := context.Background()
 
 	target, _ := client.ISCSITargetCreate(ctx, "target", "", "ISCSI", nil)
-	extent1, _ := client.ISCSIExtentCreate(ctx, "extent1", "zvol/tank/vol1", "", 512, "SSD")
-	extent2, _ := client.ISCSIExtentCreate(ctx, "extent2", "zvol/tank/vol2", "", 512, "SSD")
-	extent3, _ := client.ISCSIExtentCreate(ctx, "extent3", "zvol/tank/vol3", "", 512, "SSD")
+	extent1, _ := client.ISCSIExtentCreate(ctx, "extent1", "zvol/tank/vol1", "", 512, true, "SSD")
+	extent2, _ := client.ISCSIExtentCreate(ctx, "extent2", "zvol/tank/vol2", "", 512, true, "SSD")
+	extent3, _ := client.ISCSIExtentCreate(ctx, "extent3", "zvol/tank/vol3", "", 512, true, "SSD")
 
 	_, _ = client.ISCSITargetExtentCreate(ctx, target.ID, extent1.ID, 0)
 	_, _ = client.ISCSITargetExtentCreate(ctx, target.ID, extent2.ID, 1)
@@ -635,7 +640,7 @@ func TestMockClient_ISCSITargetExtentFindByExtent_Multiple(t *testing.T) {
 
 	target1, _ := client.ISCSITargetCreate(ctx, "target1", "", "ISCSI", nil)
 	target2, _ := client.ISCSITargetCreate(ctx, "target2", "", "ISCSI", nil)
-	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, "SSD")
+	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, true, "SSD")
 
 	_, _ = client.ISCSITargetExtentCreate(ctx, target1.ID, extent.ID, 0)
 	_, _ = client.ISCSITargetExtentCreate(ctx, target2.ID, extent.ID, 0)
@@ -650,7 +655,7 @@ func TestMockClient_ISCSITargetExtentDelete_Success(t *testing.T) {
 	ctx := context.Background()
 
 	target, _ := client.ISCSITargetCreate(ctx, "target", "", "ISCSI", nil)
-	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, "SSD")
+	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, true, "SSD")
 	te, _ := client.ISCSITargetExtentCreate(ctx, target.ID, extent.ID, 0)
 
 	err := client.ISCSITargetExtentDelete(ctx, te.ID, false)
@@ -667,7 +672,7 @@ func TestMockClient_ISCSITargetExtentGet_Success(t *testing.T) {
 	ctx := context.Background()
 
 	target, _ := client.ISCSITargetCreate(ctx, "target", "", "ISCSI", nil)
-	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, "SSD")
+	extent, _ := client.ISCSIExtentCreate(ctx, "extent", "zvol/tank/vol", "", 512, true, "SSD")
 	te, _ := client.ISCSITargetExtentCreate(ctx, target.ID, extent.ID, 0)
 
 	got, err := client.ISCSITargetExtentGet(ctx, te.ID)
@@ -702,7 +707,7 @@ func TestMockClient_ISCSIFullWorkflow(t *testing.T) {
 	require.NotNil(t, target)
 
 	// Step 2: Create iSCSI extent
-	extent, err := client.ISCSIExtentCreate(ctx, "pvc-workflow-extent", "zvol/tank/k8s/volumes/pvc-workflow", "CSI managed", 512, "SSD")
+	extent, err := client.ISCSIExtentCreate(ctx, "pvc-workflow-extent", "zvol/tank/k8s/volumes/pvc-workflow", "CSI managed", 512, true, "SSD")
 	require.NoError(t, err)
 	require.NotNil(t, extent)
 
@@ -787,7 +792,7 @@ func TestMockClient_ISCSIConcurrentExtentCreation(t *testing.T) {
 			defer wg.Done()
 			name := fmt.Sprintf("concurrent-extent-%d", idx)
 			disk := fmt.Sprintf("zvol/tank/concurrent-%d", idx)
-			_, err := client.ISCSIExtentCreate(ctx, name, disk, "", 512, "SSD")
+			_, err := client.ISCSIExtentCreate(ctx, name, disk, "", 512, true, "SSD")
 			assert.NoError(t, err)
 		}(i)
 	}

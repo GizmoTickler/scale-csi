@@ -523,7 +523,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	}
 
 	// Generate iSCSI name and disk path upfront
-	iscsiName := protocolShareName(path.Base(datasetName) + d.config.ISCSI.NameSuffix)
+	iscsiName := d.iscsiShareName(path.Base(datasetName))
 	diskPath := fmt.Sprintf("zvol/%s", datasetName)
 
 	// Step 1: Check if already fully configured (idempotency fast-path)
@@ -676,6 +676,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				diskPath,
 				comment,
 				d.config.ISCSI.ExtentBlocksize,
+				!d.config.ISCSI.ExtentDisablePhysicalBlocksize,
 				d.config.ISCSI.ExtentRpm,
 			)
 			if err == nil {
@@ -782,7 +783,7 @@ func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	}
 
 	// Generate the expected iSCSI name (same logic as createISCSIShare)
-	iscsiName := protocolShareName(path.Base(datasetName) + d.config.ISCSI.NameSuffix)
+	iscsiName := d.iscsiShareName(path.Base(datasetName))
 	diskPath := fmt.Sprintf("zvol/%s", datasetName)
 
 	var extDeleted, tgtDeleted bool

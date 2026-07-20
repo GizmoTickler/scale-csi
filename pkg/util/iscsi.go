@@ -643,6 +643,30 @@ func findDeviceForSessionInPaths(sessionName string, lun int, sysClassRoot, devR
 	return "", fmt.Errorf("device for session %d not found", sessionNum)
 }
 
+// CheckISCSIDeviceMultipathOwnership refuses raw SCSI devices that multipathd
+// already owns. Using a component path directly would bypass the dm-multipath
+// head device and can corrupt the LUN.
+func CheckISCSIDeviceMultipathOwnership(devicePath string) error {
+	return checkISCSIDeviceMultipathOwnership(devicePath, "/sys/block")
+}
+
+func checkISCSIDeviceMultipathOwnership(devicePath, sysBlockRoot string) error {
+	holdersPath := filepath.Join(sysBlockRoot, filepath.Base(devicePath), "holders")
+	holders, err := os.ReadDir(holdersPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to inspect holders for iSCSI device %s: %w", devicePath, err)
+	}
+	for _, holder := range holders {
+		if strings.HasPrefix(holder.Name(), "dm-") {
+			return fmt.Errorf("iSCSI device %s is claimed by dm-multipath; iSCSI multipath is unsupported", devicePath)
+		}
+	}
+	return nil
+}
+
 // GetISCSIDevicePath returns the device path for an iSCSI target/LUN combination.
 func GetISCSIDevicePath(iqn string, lun int) (string, error) {
 	return findISCSIDevice(iqn, lun)

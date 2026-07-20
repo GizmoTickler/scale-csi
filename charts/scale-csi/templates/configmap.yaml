@@ -27,7 +27,6 @@ data:
     # ZFS dataset configuration
     zfs:
       datasetParentName: {{ .Values.zfs.parentDataset | quote }}
-      detachedSnapshotsDatasetParentName: {{ .Values.zfs.detachedSnapshotsDatasetParentName | quote }}
       datasetEnableQuotas: {{ .Values.zfs.enforceQuota }}
       datasetEnableReservation: false
       {{- with .Values.zfs.datasetProperties }}
@@ -35,6 +34,7 @@ data:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       zvolBlocksize: {{ .Values.zfs.zvolBlocksize | quote }}
+      zvolEnableReservation: {{ .Values.zfs.zvolEnableReservation }}
       zvolReadyTimeout: {{ .Values.zfs.zvolReadyTimeout | default 60 }}
       destroyForeignSnapshotsOnDelete: {{ .Values.zfs.destroyForeignSnapshotsOnDelete }}
 
@@ -74,6 +74,7 @@ data:
       {{- end }}
 
       extentBlocksize: {{ .Values.iscsi.extentBlocksize }}
+      extentDisablePhysicalBlocksize: {{ .Values.iscsi.extentDisablePhysicalBlocksize }}
       extentRpm: {{ .Values.iscsi.extentRpm | quote }}
       extentAvailThreshold: {{ .Values.iscsi.extentAvailThreshold }}
       deviceWaitTimeout: {{ .Values.iscsi.deviceWaitTimeout | default 60 }}
