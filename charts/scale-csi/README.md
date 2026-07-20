@@ -199,8 +199,36 @@ convenient.
 
 The bundled PrometheusRule alerts on a missing controller scrape target,
 TrueNAS disconnection, an open circuit breaker, a high TrueNAS API failure
-ratio, and sustained CSI operation errors. The dashboard ConfigMap is labeled `grafana_dashboard: "1"`
+ratio, sustained CSI operation errors, and detected orphan volumes or snapshots.
+The dashboard ConfigMap is labeled `grafana_dashboard: "1"`
 for Grafana sidecar discovery and uses only metrics exported by the driver.
+
+### Orphan reconcile and guarded cleanup
+
+| Parameter | Description | Default |
+|---|---|---|
+| `reconcile.enabled` | Run periodic read-only orphan detection in the controller | `true` |
+| `reconcile.interval` | Detection interval | `1h` |
+| `reconcile.minOrphanAge` | Minimum backend object age before orphan classification | `24h` |
+| `reconcile.alertAfter` | Prometheus alert hold time; keep greater than 2x the interval | `2h5m` |
+| `reconcile.delete.enabled` | Create the opt-in guarded cleanup CronJob | `false` |
+| `reconcile.delete.schedule` | Guarded cleanup CronJob schedule | `0 4 * * *` |
+| `reconcile.delete.maxPerRun` | Maximum successful deletions in one cleanup run | `5` |
+
+Read-only detection is enabled by default and exports
+`scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`,
+`scale_csi_spent_restore_snapshots`, and orphan-byte gauges. Deletion remains
+disabled unless `reconcile.delete.enabled=true`. The CronJob invokes
+`--mode=reconcile`; backend cleanup always calls the driver's guarded CSI
+`DeleteVolume` and `DeleteSnapshot` implementations, so clone, snapshot, and
+foreign-snapshot dependency checks still apply. Spent VolSync restore snapshots
+are eligible only when detached snapshot copies are enabled and their source PVC
+is no longer Bound.
+
+> **DANGER — one parent per cluster:** `zfs.parentDataset` MUST be unique to one
+> Kubernetes cluster. Never point two live clusters at the same parent dataset.
+> A cluster can only see its own PV and VolumeSnapshot handles, so it would
+> classify the other cluster's managed backend objects as orphans.
 
 Set one of `controller.podDisruptionBudget.minAvailable` or `maxUnavailable`
 when enabling the PDB. A PDB is useful only when `controller.replicas` is greater

@@ -110,6 +110,16 @@ data:
       sessionCleanupDelay: {{ .Values.node.sessionCleanupDelay }}
       maxVolumesPerNode: {{ .Values.node.maxVolumesPerNode }}
 
+    # Controller orphan detection and separately gated cleanup.
+    reconcile:
+      enabled: {{ .Values.reconcile.enabled }}
+      interval: {{ .Values.reconcile.interval | quote }}
+      minOrphanAge: {{ .Values.reconcile.minOrphanAge | quote }}
+      delete:
+        enabled: {{ .Values.reconcile.delete.enabled }}
+        schedule: {{ .Values.reconcile.delete.schedule | quote }}
+        maxPerRun: {{ .Values.reconcile.delete.maxPerRun }}
+
     resilience:
       circuitBreaker:
         enabled: {{ .Values.resilience.circuitBreaker.enabled }}

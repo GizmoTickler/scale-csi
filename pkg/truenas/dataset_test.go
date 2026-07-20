@@ -376,7 +376,7 @@ func TestDatasetGet_Success(t *testing.T) {
 	require.Len(t, params, 2)
 	options := params[1].(map[string]interface{})
 	extra := options["extra"].(map[string]interface{})
-	assert.Equal(t, []interface{}{"used", "available", "quota", "refquota", "reservation", "refreservation", "volsize", "volblocksize"}, extra["properties"])
+	assert.Equal(t, []interface{}{"used", "available", "quota", "refquota", "reservation", "refreservation", "volsize", "volblocksize", "creation"}, extra["properties"])
 }
 
 // TestDatasetGet_NotFound tests retrieving a non-existent dataset
@@ -839,7 +839,16 @@ func TestDatasetList_Success(t *testing.T) {
 	options := params[1].(map[string]interface{})
 	extra := options["extra"].(map[string]interface{})
 	assert.Equal(t, true, extra["flat"])
-	assert.Equal(t, []interface{}{"used", "available", "quota", "refquota", "reservation", "refreservation", "volsize", "volblocksize"}, extra["properties"])
+	assert.Equal(t, []interface{}{"used", "available", "quota", "refquota", "reservation", "refreservation", "volsize", "volblocksize", "creation"}, extra["properties"])
+}
+
+func TestDatasetReconcileProperties(t *testing.T) {
+	dataset := &Dataset{
+		Creation: DatasetProperty{Parsed: map[string]interface{}{"$date": float64(1700000000000)}},
+		Used:     DatasetProperty{Rawvalue: "4096"},
+	}
+	assert.Equal(t, int64(1700000000), dataset.GetCreationTime())
+	assert.Equal(t, int64(4096), dataset.GetUsedBytes())
 }
 
 // TestDatasetExpand tests expanding a zvol

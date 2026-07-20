@@ -234,3 +234,83 @@ nfs:
 	require.NoError(t, err)
 	assert.Equal(t, 10, cfg.TrueNAS.MaxConcurrentRequests)
 }
+
+func TestLoadConfigReconcileDefaultsAreSafe(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.True(t, cfg.Reconcile.Enabled)
+	assert.Equal(t, "1h", cfg.Reconcile.Interval)
+	assert.Equal(t, "24h", cfg.Reconcile.MinOrphanAge)
+	assert.False(t, cfg.Reconcile.Delete.Enabled)
+	assert.Equal(t, "0 4 * * *", cfg.Reconcile.Delete.Schedule)
+	assert.Equal(t, 5, cfg.Reconcile.Delete.MaxPerRun)
+}
+
+func TestLoadConfigReconcileExplicitDisableAndDeleteGate(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+reconcile:
+  enabled: false
+  interval: 2h
+  minOrphanAge: 48h
+  delete:
+    enabled: true
+    schedule: "30 3 * * 0"
+    maxPerRun: 11
+`)
+	require.NoError(t, err)
+	assert.False(t, cfg.Reconcile.Enabled)
+	assert.Equal(t, "2h", cfg.Reconcile.Interval)
+	assert.Equal(t, "48h", cfg.Reconcile.MinOrphanAge)
+	assert.True(t, cfg.Reconcile.Delete.Enabled)
+	assert.Equal(t, "30 3 * * 0", cfg.Reconcile.Delete.Schedule)
+	assert.Equal(t, 11, cfg.Reconcile.Delete.MaxPerRun)
+}
+
+func TestLoadConfigRejectsUnsafeReconcileDeleteCap(t *testing.T) {
+	for _, maxPerRun := range []int{-1, 0} {
+		t.Run(fmt.Sprintf("maxPerRun=%d", maxPerRun), func(t *testing.T) {
+			_, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+reconcile:
+  delete:
+    maxPerRun: %d
+`, maxPerRun))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "reconcile.delete.maxPerRun")
+		})
+	}
+}
+
+func TestLoadConfigRejectsUnsafeReconcileDurations(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "invalid interval", field: "interval", value: "hourly"},
+		{name: "zero interval", field: "interval", value: "0s"},
+		{name: "invalid minimum age", field: "minOrphanAge", value: "tomorrow"},
+		{name: "zero minimum age", field: "minOrphanAge", value: "0s"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+reconcile:
+  `+test.field+`: `+test.value+`
+`)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "reconcile.")
+		})
+	}
+}

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"math"
@@ -46,7 +47,7 @@ func main() {
 	flag.StringVar(&endpoint, "endpoint", "unix:///csi/csi.sock", "CSI endpoint")
 	flag.StringVar(&nodeID, "node-id", "", "Node ID (required for node mode)")
 	flag.StringVar(&driverName, "driver-name", "csi.scale.io", "CSI driver name")
-	flag.StringVar(&mode, "mode", "all", "Driver mode: controller, node, or all")
+	flag.StringVar(&mode, "mode", "all", "Driver mode: controller, node, all, or reconcile")
 	flag.IntVar(&healthPort, "health-port", 9809, "Port for health/metrics HTTP server (0 to disable)")
 	flag.BoolVar(&showVersion, "version", false, "Show version and exit")
 
@@ -94,9 +95,15 @@ func main() {
 		cfg.DriverName = driverName
 	}
 
-	// Validate mode
+	// Validate mode.
+	switch mode {
+	case "controller", "node", "all", "reconcile":
+	default:
+		klog.Fatalf("Invalid --mode %q; expected controller, node, all, or reconcile", mode)
+	}
 	runController := mode == "controller" || mode == "all"
 	runNode := mode == "node" || mode == "all"
+	reconcileOnce := mode == "reconcile"
 
 	if runNode && nodeID == "" {
 		// Try to get node ID from environment or hostname
@@ -111,7 +118,7 @@ func main() {
 
 	klog.Infof("Starting Scale CSI Driver version %s", Version)
 	klog.Infof("Driver name: %s", cfg.DriverName)
-	klog.Infof("Mode: %s (controller=%v, node=%v)", mode, runController, runNode)
+	klog.Infof("Mode: %s (controller=%v, node=%v, reconcileOnce=%v)", mode, runController, runNode, reconcileOnce)
 	klog.Infof("Endpoint: %s", endpoint)
 	if runNode {
 		klog.Infof("Node ID: %s", nodeID)
@@ -123,13 +130,43 @@ func main() {
 		Version:       Version,
 		NodeID:        nodeID,
 		Endpoint:      endpoint,
-		RunController: runController,
+		RunController: runController || reconcileOnce,
 		RunNode:       runNode,
 		Config:        cfg,
 		HealthPort:    healthPort,
 	})
 	if err != nil {
 		klog.Fatalf("Failed to create driver: %v", err)
+	}
+
+	if reconcileOnce {
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		minOrphanAge, parseErr := cfg.Reconcile.MinOrphanAgeDuration()
+		if parseErr != nil {
+			cancel()
+			drv.Stop()
+			klog.Fatalf("Invalid reconcile minimum orphan age: %v", parseErr)
+		}
+		report, reconcileErr := drv.ReconcileOrphans(ctx, driver.ReconcileOptions{
+			Delete:       cfg.Reconcile.Delete.Enabled,
+			MinOrphanAge: minOrphanAge,
+		})
+		cancel()
+		drv.Stop()
+		if reconcileErr != nil {
+			klog.Fatalf("Orphan reconcile failed: %v", reconcileErr)
+		}
+		klog.Infof("Orphan reconcile complete: delete=%v orphanVolumes=%d orphanSnapshots=%d spentRestoreSnapshots=%d deletedVolumes=%d deletedSnapshots=%d deletedSpentRestoreSnapshots=%d skippedDeletes=%d",
+			report.DeleteEnabled,
+			report.OrphanVolumeCount,
+			report.OrphanSnapshotCount,
+			report.SpentRestoreSnapshotCount,
+			len(report.DeletedVolumes),
+			len(report.DeletedSnapshots),
+			len(report.DeletedSpentRestoreObjects),
+			len(report.SkippedDeletes),
+		)
+		return
 	}
 
 	// Handle shutdown signals
