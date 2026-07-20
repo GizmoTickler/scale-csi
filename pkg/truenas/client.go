@@ -86,7 +86,7 @@ func IsConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, ErrAmbiguousResult) {
+	if errors.Is(err, ErrTransportFailure) || errors.Is(err, ErrAmbiguousResult) {
 		return true
 	}
 	errStr := strings.ToLower(err.Error())
@@ -100,6 +100,11 @@ func IsConnectionError(err error) bool {
 // connection was lost before a response arrived. The server may have applied
 // the request, so callers must decide whether it is safe to retry.
 var ErrAmbiguousResult = errors.New("request result is ambiguous")
+
+// ErrTransportFailure indicates that a request failed in the WebSocket
+// transport before a response was received. Unlike ErrAmbiguousResult, it does
+// not imply that the server may have applied the request.
+var ErrTransportFailure = errors.New("request transport failed")
 
 const defaultWriteTimeout = 30 * time.Second
 
@@ -136,6 +141,7 @@ type ClientConfig struct {
 	HeartbeatInterval time.Duration   // Interval for WebSocket heartbeat (default: 30s)
 	MaxConnections    int             // Maximum number of concurrent connections (default: 5)
 	MaxConcurrentReqs int             // Maximum number of concurrent API requests (default: 10)
+	LazyConnect       bool            // Skip eager connection; connect on first API use (node-only mode)
 	MetricsRecorder   MetricsRecorder // Optional callback for recording request metrics
 
 	// Circuit breaker configuration
@@ -232,6 +238,11 @@ type Client struct {
 	metricsRecorder MetricsRecorder // Optional callback for recording request metrics
 	circuitBreaker  *CircuitBreaker // Optional circuit breaker for API calls
 
+	// NVMe-oF ports are shared resources. Serialize find-or-create and cache
+	// successful resolutions so concurrent volume creates cannot race.
+	nvmePortMu       sync.Mutex
+	nvmeResolvedPort map[string]*NVMeoFPort
+
 	// Version detection cache
 	versionMu    sync.RWMutex
 	versionCache *SystemInfo
@@ -289,6 +300,19 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	}
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("api key is required")
+	}
+	if cfg.Port < 0 {
+		return nil, fmt.Errorf("port must not be negative")
+	}
+	if cfg.Timeout < 0 || cfg.ConnectTimeout < 0 || cfg.WriteTimeout < 0 || cfg.RetryInterval < 0 || cfg.HeartbeatInterval < 0 ||
+		cfg.APIRetryInitialDelay < 0 || cfg.APIRetryMaxDelay < 0 {
+		return nil, fmt.Errorf("client timeouts and retry delays must not be negative")
+	}
+	if cfg.MaxConnections < 0 || cfg.MaxConcurrentReqs < 0 || cfg.MaxRetries < 0 || cfg.APIRetryMaxAttempts < 0 {
+		return nil, fmt.Errorf("client connection, concurrency, and retry counts must not be negative")
+	}
+	if cfg.APIRetryBackoffFactor < 0 {
+		return nil, fmt.Errorf("API retry backoff factor must not be negative")
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 60 * time.Second
@@ -348,11 +372,12 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	}
 
 	client := &Client{
-		config:          cfg,
-		pool:            make([]*Connection, cfg.MaxConnections),
-		semaphore:       make(chan struct{}, cfg.MaxConcurrentReqs),
-		metricsRecorder: cfg.MetricsRecorder,
-		circuitBreaker:  cb,
+		config:           cfg,
+		pool:             make([]*Connection, cfg.MaxConnections),
+		semaphore:        make(chan struct{}, cfg.MaxConcurrentReqs),
+		metricsRecorder:  cfg.MetricsRecorder,
+		circuitBreaker:   cb,
+		nvmeResolvedPort: make(map[string]*NVMeoFPort),
 	}
 
 	// Initialize connection pool
@@ -360,6 +385,10 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	for i := 0; i < cfg.MaxConnections; i++ {
 		client.pool[i] = NewConnection(i, cfg)
 		client.pool[i].insecureWarningOnce = insecureWarningOnce
+	}
+	if cfg.LazyConnect {
+		klog.Infof("TrueNAS client initialized in lazy-connect mode")
+		return client, nil
 	}
 
 	// Connect initially (at least one connection)
@@ -841,10 +870,7 @@ func (c *Connection) failPending(generation uint64, cause error) {
 		if pending.generation != generation {
 			continue
 		}
-		transportErr := fmt.Errorf("connection lost before request was sent: %w", cause)
-		if pending.sent {
-			transportErr = fmt.Errorf("%w: connection lost after %s was sent: %w", ErrAmbiguousResult, pending.method, cause)
-		}
+		transportErr := requestTransportError(pending.method, pending.sent, cause)
 		select {
 		case pending.responseCh <- &rpcResponse{
 			ID:           id,
@@ -908,8 +934,7 @@ func (c *Connection) callWithGeneration(ctx context.Context, generation uint64, 
 	select {
 	case err := <-writeReq.resultCh:
 		if err != nil {
-			c.deletePending(id, respChan)
-			return nil, fmt.Errorf("failed to send request: %w", err)
+			return c.failedWriteResult(id, method, respChan, err)
 		}
 	case resp := <-respChan:
 		return responseResult(resp)
@@ -925,6 +950,29 @@ func (c *Connection) callWithGeneration(ctx context.Context, generation uint64, 
 	case <-ctx.Done():
 		return c.canceledCallResult(id, method, respChan, ctx.Err())
 	}
+}
+
+func requestTransportError(method string, sent bool, cause error) error {
+	if sent {
+		return fmt.Errorf("%w: connection lost after %s was sent: %w", ErrAmbiguousResult, method, cause)
+	}
+	return fmt.Errorf("%w: failed to send %s request: %w", ErrTransportFailure, method, cause)
+}
+
+func (c *Connection) failedWriteResult(id int64, method string, responseCh <-chan *rpcResponse, cause error) (interface{}, error) {
+	c.pendingMu.Lock()
+	select {
+	case resp := <-responseCh:
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+		return responseResult(resp)
+	default:
+	}
+	pending, ok := c.pending[id]
+	sent := ok && pending.sent
+	delete(c.pending, id)
+	c.pendingMu.Unlock()
+	return nil, requestTransportError(method, sent, cause)
 }
 
 func (c *Connection) canceledCallResult(id int64, method string, responseCh <-chan *rpcResponse, ctxErr error) (interface{}, error) {
@@ -945,16 +993,6 @@ func (c *Connection) canceledCallResult(id int64, method string, responseCh <-ch
 		return nil, fmt.Errorf("%w: %s was sent before the caller context ended: %w", ErrAmbiguousResult, method, ctxErr)
 	}
 	return nil, ctxErr
-}
-
-func (c *Connection) deletePending(id int64, responseCh <-chan *rpcResponse) {
-	select {
-	case <-responseCh:
-	default:
-	}
-	c.pendingMu.Lock()
-	delete(c.pending, id)
-	c.pendingMu.Unlock()
 }
 
 func responseResult(resp *rpcResponse) (interface{}, error) {
@@ -1052,7 +1090,22 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 		// Select best available connection
 		conn := c.selectConnection()
 
-		result, err := conn.CallWithContext(ctx, method, params...)
+		// Bound each attempt so a wedged-but-live request cannot pin a semaphore
+		// slot forever. Only apply the cfg.Timeout cap when the caller supplied NO
+		// deadline (e.g. background session GC using context.Background()). Callers
+		// that already carry a deadline — CSI sidecar RPCs — are bounded by it, and
+		// capping them shorter would wrongly fail a legitimately-long single call
+		// (large clone / recursive snapshot) that the sidecar allowed time for.
+		callCtx := ctx
+		cancel := func() {}
+		if c.config.Timeout > 0 {
+			if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+				callCtx, cancel = context.WithTimeout(ctx, c.config.Timeout)
+			}
+		}
+		result, err := conn.CallWithContext(callCtx, method, params...)
+		attemptTimedOut := err != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+		cancel()
 		if err == nil {
 			// Record success with circuit breaker
 			if c.circuitBreaker != nil {
@@ -1064,6 +1117,19 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 				c.metricsRecorder(method, time.Since(start).Seconds(), nil)
 			}
 			return result, nil
+		}
+		if attemptTimedOut {
+			// A request that consumed its complete per-call budget must release the
+			// semaphore now. Failures that arrive earlier may still be retried, and
+			// each such retry receives a fresh per-attempt timeout above.
+			if c.circuitBreaker != nil {
+				c.circuitBreaker.RecordFailure()
+				breakerOutcomeRecorded = true
+			}
+			if c.metricsRecorder != nil {
+				c.metricsRecorder(method, time.Since(start).Seconds(), err)
+			}
+			return nil, err
 		}
 		if errors.Is(err, ErrAmbiguousResult) && !isIdempotentAPIMethod(method) {
 			// Mutations are not retried after a successful write because the server

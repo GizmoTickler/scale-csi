@@ -1236,6 +1236,15 @@ func TestProtocolShareName(t *testing.T) {
 	if longLegal == protocolShareName(strings.Repeat("a", 81)) {
 		t.Fatalf("truncated names must not collide")
 	}
+	for _, unsafe := range []string{"", "...", "-leading", ":leading", "🔥"} {
+		got := protocolShareName(unsafe)
+		if got == "" || !isLowerAlphanumeric(got[0]) {
+			t.Fatalf("guarded name %q produced invalid result %q", unsafe, got)
+		}
+	}
+	if protocolShareName("...") == protocolShareName("x...") {
+		t.Fatal("all-dot normalization must not collide with an already-legal name")
+	}
 }
 
 // TestResolveISCSITargetGroup verifies portal/initiator auto-resolution when

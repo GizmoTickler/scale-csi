@@ -39,6 +39,9 @@ func protocolShareName(base string) string {
 		}
 	}
 	sanitized := b.String()
+	if sanitized == "" || strings.Trim(sanitized, ".") == "" || !isLowerAlphanumeric(sanitized[0]) {
+		sanitized = "x" + sanitized
+	}
 	if sanitized == base && len(sanitized) <= maxLen {
 		return sanitized
 	}

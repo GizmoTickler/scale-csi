@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"golang.org/x/sync/errgroup"
@@ -1574,16 +1575,28 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 // Helper functions
 
 func (d *Driver) sanitizeVolumeID(name string) string {
-	// Remove invalid characters for ZFS dataset names
-	name = strings.ReplaceAll(name, "/", "-")
-	name = strings.ReplaceAll(name, " ", "-")
-	// Ensure it starts with alphanumeric
-	if name != "" && !isAlphanumeric(name[0]) {
+	return sanitizeVolumeID(name)
+}
+
+func sanitizeVolumeID(name string) string {
+	// Rebuild through a rune range so arbitrary invalid UTF-8 input is repaired
+	// while replacing the path and space characters disallowed by this scheme.
+	var sanitized strings.Builder
+	for _, r := range name {
+		switch r {
+		case '/', ' ':
+			sanitized.WriteByte('-')
+		default:
+			sanitized.WriteRune(r)
+		}
+	}
+	name = sanitized.String()
+	if name != "" && !isLowerAlphanumeric(name[0]) {
 		name = "v" + name
 	}
-	// Limit length (ZFS has a 256 char limit, CSI has 128)
-	if len(name) > 128 {
-		name = name[:128]
+	for len(name) > 128 {
+		_, size := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-size]
 	}
 	return name
 }
@@ -1600,8 +1613,8 @@ func (d *Driver) datasetForID(id string) (string, error) {
 	return name, nil
 }
 
-func isAlphanumeric(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+func isLowerAlphanumeric(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
 }
 
 func multiNodeAccessMode(caps []*csi.VolumeCapability) (csi.VolumeCapability_AccessMode_Mode, bool) {

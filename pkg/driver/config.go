@@ -386,6 +386,9 @@ func LoadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+	if err := validateNonNegativeConfig(cfg); err != nil {
+		return nil, err
+	}
 
 	// Protocol blocks historically did not contain an explicit enabled field.
 	// Preserve those config files while allowing an explicitly disabled block.
@@ -432,6 +435,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.TrueNAS.WriteTimeout == 0 {
 		cfg.TrueNAS.WriteTimeout = 30
+	}
+	if cfg.TrueNAS.MaxConcurrentRequests == 0 {
+		cfg.TrueNAS.MaxConcurrentRequests = 10
 	}
 	if cfg.ZFS.ZvolBlocksize == "" {
 		cfg.ZFS.ZvolBlocksize = "16K"
@@ -582,6 +588,57 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func validateNonNegativeConfig(cfg *Config) error {
+	fields := []struct {
+		name  string
+		value int
+	}{
+		{"truenas.port", cfg.TrueNAS.Port},
+		{"truenas.requestTimeout", cfg.TrueNAS.RequestTimeout},
+		{"truenas.connectTimeout", cfg.TrueNAS.ConnectTimeout},
+		{"truenas.writeTimeout", cfg.TrueNAS.WriteTimeout},
+		{"truenas.maxConcurrentRequests", cfg.TrueNAS.MaxConcurrentRequests},
+		{"zfs.zvolReadyTimeout", cfg.ZFS.ZvolReadyTimeout},
+		{"iscsi.extentBlocksize", cfg.ISCSI.ExtentBlocksize},
+		{"iscsi.extentAvailThreshold", cfg.ISCSI.ExtentAvailThreshold},
+		{"iscsi.deviceWaitTimeout", cfg.ISCSI.DeviceWaitTimeout},
+		{"iscsi.serviceReloadDebounce", cfg.ISCSI.ServiceReloadDebounce},
+		{"nvmeof.transportServiceId", cfg.NVMeoF.TransportServiceID},
+		{"nvmeof.deviceWaitTimeout", cfg.NVMeoF.DeviceWaitTimeout},
+		{"nvmeof.commandTimeout", cfg.NVMeoF.CommandTimeout},
+		{"sessionGC.interval", cfg.SessionGC.Interval},
+		{"sessionGC.gracePeriod", cfg.SessionGC.GracePeriod},
+		{"sessionGC.startupDelay", cfg.SessionGC.StartupDelay},
+		{"node.sessionCleanupDelay", cfg.Node.SessionCleanupDelay},
+		{"resilience.circuitBreaker.failureThreshold", cfg.Resilience.CircuitBreaker.FailureThreshold},
+		{"resilience.circuitBreaker.successThreshold", cfg.Resilience.CircuitBreaker.SuccessThreshold},
+		{"resilience.circuitBreaker.timeout", cfg.Resilience.CircuitBreaker.Timeout},
+		{"resilience.circuitBreaker.halfOpenMaxRequests", cfg.Resilience.CircuitBreaker.HalfOpenMaxRequests},
+		{"resilience.retry.maxAttempts", cfg.Resilience.Retry.MaxAttempts},
+		{"resilience.retry.initialDelay", cfg.Resilience.Retry.InitialDelay},
+		{"resilience.retry.maxDelay", cfg.Resilience.Retry.MaxDelay},
+		{"resilience.rateLimiting.maxConcurrentRequests", cfg.Resilience.RateLimiting.MaxConcurrentRequests},
+		{"resilience.rateLimiting.maxConcurrentLogins", cfg.Resilience.RateLimiting.MaxConcurrentLogins},
+		{"resilience.rateLimiting.discoveryCacheDuration", cfg.Resilience.RateLimiting.DiscoveryCacheDuration},
+		{"commandTimeouts.mount", cfg.CommandTimeouts.Mount},
+		{"commandTimeouts.format", cfg.CommandTimeouts.Format},
+		{"commandTimeouts.iscsi", cfg.CommandTimeouts.ISCSI},
+		{"commandTimeouts.nvme", cfg.CommandTimeouts.NVMe},
+	}
+	for _, field := range fields {
+		if field.value < 0 {
+			return fmt.Errorf("%s must not be negative", field.name)
+		}
+	}
+	if cfg.Node.MaxVolumesPerNode < 0 {
+		return fmt.Errorf("node.maxVolumesPerNode must not be negative")
+	}
+	if cfg.Resilience.Retry.BackoffMultiplier < 0 {
+		return fmt.Errorf("resilience.retry.backoffMultiplier must not be negative")
+	}
+	return nil
 }
 
 // GetDriverShareType returns the share type based on driver name.

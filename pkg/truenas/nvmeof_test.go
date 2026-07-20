@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gorilla/websocket"
@@ -927,6 +928,87 @@ func TestMockClient_NVMeoFGetOrCreatePort(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, port)
 	assert.Equal(t, "10.0.0.1", port.Address)
+}
+
+func TestNVMeoFGetOrCreatePortSingleFlight(t *testing.T) {
+	var created atomic.Bool
+	var createCalls atomic.Int32
+	portResult := map[string]interface{}{
+		"id":           float64(41),
+		"index":        float64(0),
+		"addr_trtype":  "TCP",
+		"addr_traddr":  "192.0.2.50",
+		"addr_trsvcid": float64(4420),
+		"addr_adrfam":  "IPV4",
+		"enabled":      true,
+		"subsystems":   []interface{}{},
+	}
+
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "system.info":
+				resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-26.0.0"}
+			case "nvmet.port.query":
+				if created.Load() {
+					resp.Result = []interface{}{portResult}
+				} else {
+					resp.Result = []interface{}{}
+				}
+			case "nvmet.port.create":
+				createCalls.Add(1)
+				created.Store(true)
+				resp.Result = portResult
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	const callers = 16
+	start := make(chan struct{})
+	results := make(chan *NVMeoFPort, callers)
+	errors := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resolved, err := client.NVMeoFGetOrCreatePort(context.Background(), "tcp", "192.0.2.50", 4420)
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- resolved
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errors)
+
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	for resolved := range results {
+		require.NotNil(t, resolved)
+		assert.Equal(t, 41, resolved.ID)
+	}
+	assert.Equal(t, int32(1), createCalls.Load())
 }
 
 func TestMockClient_NVMeoFPortSubsysCreate(t *testing.T) {

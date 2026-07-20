@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -113,4 +114,77 @@ nfs:
 	require.NoError(t, err)
 	assert.Contains(t, cfg.TrueNAS.CACert, "BEGIN CERTIFICATE")
 	assert.Equal(t, "/etc/scale-csi/truenas-ca.pem", cfg.TrueNAS.CACertFile)
+}
+
+func TestLoadConfigRejectsNegativeNumericSettings(t *testing.T) {
+	config := func(truenasExtra, zfsExtra, rootExtra string) string {
+		return fmt.Sprintf(`
+driver: csi.scale.io
+truenas:
+  host: truenas.example.test
+  apiKey: test-key
+%s
+zfs:
+  datasetParentName: tank/csi
+%s
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+%s
+`, truenasExtra, zfsExtra, rootExtra)
+	}
+	tests := []struct {
+		name      string
+		body      string
+		wantField string
+	}{
+		{
+			name:      "API concurrency",
+			body:      config("  maxConcurrentRequests: -1", "", ""),
+			wantField: "truenas.maxConcurrentRequests",
+		},
+		{
+			name:      "API request timeout",
+			body:      config("  requestTimeout: -1", "", ""),
+			wantField: "truenas.requestTimeout",
+		},
+		{
+			name:      "zvol readiness timeout",
+			body:      config("", "  zvolReadyTimeout: -1", ""),
+			wantField: "zfs.zvolReadyTimeout",
+		},
+		{
+			name:      "command timeout",
+			body:      config("", "", "commandTimeouts:\n  mount: -1"),
+			wantField: "commandTimeouts.mount",
+		},
+		{
+			name:      "retry multiplier",
+			body:      config("", "", "resilience:\n  retry:\n    backoffMultiplier: -1"),
+			wantField: "resilience.retry.backoffMultiplier",
+		},
+		{
+			name:      "max volumes per node",
+			body:      config("", "", "node:\n  maxVolumesPerNode: -1"),
+			wantField: "node.maxVolumesPerNode",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadTestConfig(t, test.body)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.wantField)
+		})
+	}
+}
+
+func TestLoadConfigDefaultsTrueNASConcurrency(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.Equal(t, 10, cfg.TrueNAS.MaxConcurrentRequests)
 }

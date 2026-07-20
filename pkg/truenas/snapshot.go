@@ -777,11 +777,15 @@ func (snap *Snapshot) GetSnapshotSize() int64 {
 	if used, ok := snap.Properties["used"]; ok {
 		if usedMap, ok := used.(map[string]interface{}); ok {
 			if parsed, ok := usedMap["parsed"].(float64); ok {
-				return int64(parsed)
+				if size, valid := nonNegativeInt64FromFloat(parsed); valid {
+					return size
+				}
 			}
 			// TrueNAS 26.0 zfs.resource.snapshot.query shape: {"value": <number>, "raw": "<string>"}
 			if value, ok := usedMap["value"].(float64); ok {
-				return int64(value)
+				if size, valid := nonNegativeInt64FromFloat(value); valid {
+					return size
+				}
 			}
 			if raw, ok := usedMap["raw"].(string); ok {
 				if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
@@ -799,12 +803,16 @@ func (snap *Snapshot) GetCreationTime() int64 {
 		if creationMap, ok := creation.(map[string]interface{}); ok {
 			// Try parsed as float64 first (some versions may return this)
 			if parsed, ok := creationMap["parsed"].(float64); ok {
-				return int64(parsed)
+				if timestamp, valid := nonNegativeInt64FromFloat(parsed); valid {
+					return timestamp
+				}
 			}
 			// TrueNAS returns parsed as {"$date": milliseconds}
 			if parsedMap, ok := creationMap["parsed"].(map[string]interface{}); ok {
 				if dateMs, ok := parsedMap["$date"].(float64); ok {
-					return int64(dateMs / 1000) // Convert ms to seconds
+					if timestamp, valid := nonNegativeInt64FromFloat(dateMs / 1000); valid {
+						return timestamp
+					}
 				}
 			}
 			// Fallback: parse rawvalue as string
@@ -815,7 +823,9 @@ func (snap *Snapshot) GetCreationTime() int64 {
 			}
 			// TrueNAS 26.0 zfs.resource.snapshot.query shape: {"value": <number>, "raw": "<string>"}
 			if value, ok := creationMap["value"].(float64); ok {
-				return int64(value)
+				if timestamp, valid := nonNegativeInt64FromFloat(value); valid {
+					return timestamp
+				}
 			}
 			if raw, ok := creationMap["raw"].(string); ok {
 				if ts, err := strconv.ParseInt(raw, 10, 64); err == nil {

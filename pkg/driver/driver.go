@@ -161,6 +161,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		ConnectTimeout:    time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
 		WriteTimeout:      time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,
 		MaxConcurrentReqs: cfg.Config.TrueNAS.MaxConcurrentRequests,
+		LazyConnect:       !cfg.RunController,
 		MetricsRecorder:   RecordTrueNASRequest,
 		// Circuit breaker configuration
 		CircuitBreaker: cbConfig,

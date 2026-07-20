@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -627,6 +628,9 @@ func nodeStatsDeviceSize(deviceNumber string) (int64, error) {
 	}
 	if sectors < 0 {
 		return 0, fmt.Errorf("block device size from %s is negative", sizePath)
+	}
+	if sectors > math.MaxInt64/512 {
+		return 0, fmt.Errorf("block device size from %s exceeds int64 bytes", sizePath)
 	}
 	return sectors * 512, nil
 }

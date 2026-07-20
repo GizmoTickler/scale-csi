@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
@@ -1531,6 +1532,16 @@ func TestCreateSnapshotSurvivesTrueNAS26UpdateNoOp(t *testing.T) {
 	assert.Equal(t, "true", snap.UserProperties[PropManagedResource].Value)
 	assert.Equal(t, "inline-properties", snap.UserProperties[PropCSISnapshotName].Value)
 	assert.Equal(t, "source", snap.UserProperties[PropCSISnapshotSourceVolumeID].Value)
+}
+
+func TestSanitizeVolumeIDRuneSafe(t *testing.T) {
+	input := strings.Repeat("a", 127) + "é"
+	got := sanitizeVolumeID(input)
+	assert.True(t, utf8.ValidString(got))
+	assert.LessOrEqual(t, len(got), 128)
+	assert.Equal(t, strings.Repeat("a", 127), got)
+	assert.Equal(t, "vUpper", sanitizeVolumeID("Upper"))
+	assert.Equal(t, "v🔥-name", sanitizeVolumeID("🔥/name"))
 }
 
 // TestCreateSnapshot_RestoreSize verifies that CreateSnapshot returns the correct

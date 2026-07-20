@@ -12,6 +12,52 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestParseSubsysJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantNQNs []string
+		wantErr  bool
+	}{
+		{
+			name:     "nvme-cli 1.x object",
+			input:    `{"Subsystems":[{"NQN":"nqn.1","Name":"nvme-subsys1"}]}`,
+			wantNQNs: []string{"nqn.1"},
+		},
+		{
+			name: "nvme-cli 2.x host array",
+			input: `[{"HostNQN":"host-a","Subsystems":[{"NQN":"nqn.2a"}]},` +
+				`{"HostNQN":"host-b","Subsystems":[{"NQN":"nqn.2b"}]}]`,
+			wantNQNs: []string{"nqn.2a", "nqn.2b"},
+		},
+		{
+			name:     "direct subsystem array",
+			input:    `[{"NQN":"nqn.3","Name":"nvme-subsys3"}]`,
+			wantNQNs: []string{"nqn.3"},
+		},
+		{name: "malformed JSON", input: `[{`, wantErr: true},
+		{name: "host-shaped phantom", input: `[{"HostNQN":"host-only"}]`, wantErr: true},
+		{name: "empty NQN is rejected", input: `[{"NQN":""}]`, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			subsystems, err := parseSubsysJSON([]byte(test.input))
+			if test.wantErr {
+				require.Error(t, err)
+				assert.Nil(t, subsystems)
+				return
+			}
+			require.NoError(t, err)
+			got := make([]string, 0, len(subsystems))
+			for _, subsystem := range subsystems {
+				got = append(got, subsystem.NQN)
+			}
+			assert.Equal(t, test.wantNQNs, got)
+		})
+	}
+}
+
 func TestFindNVMeNamespaceForControllerDoesNotAssumeNamespaceOne(t *testing.T) {
 	classRoot := filepath.Join(t.TempDir(), "nvme")
 	devRoot := filepath.Join(t.TempDir(), "dev")

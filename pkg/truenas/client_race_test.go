@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1108,6 +1109,169 @@ func TestClient_AmbiguousMutationWinsOverCanceledContext(t *testing.T) {
 	assert.ErrorIs(t, err, ErrAmbiguousResult)
 	assert.ErrorIs(t, err, context.Canceled)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&mutationCount), "ambiguous mutation must not be retried")
+}
+
+func TestClient_PerAttemptTimeoutReleasesSemaphore(t *testing.T) {
+	var slowCalls atomic.Int32
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.dataset.query":
+				// Keep the live connection open but never answer this request.
+				slowCalls.Add(1)
+				continue
+			case "core.ping":
+				resp.Result = "pong"
+			default:
+				resp.Result = "ok"
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+
+	host, port := testServerAddress(t, server.URL)
+	client, err := NewClient(&ClientConfig{
+		Host:                 host,
+		Port:                 port,
+		Protocol:             "http",
+		APIKey:               "test-api-key",
+		Timeout:              50 * time.Millisecond,
+		ConnectTimeout:       time.Second,
+		MaxConnections:       1,
+		MaxConcurrentReqs:    1,
+		APIRetryMaxAttempts:  3,
+		HeartbeatInterval:    time.Hour,
+		APIRetryInitialDelay: time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	started := time.Now()
+	_, err = client.Call(context.Background(), "pool.dataset.query")
+	require.Error(t, err)
+	assert.GreaterOrEqual(t, time.Since(started), 35*time.Millisecond)
+	assert.Less(t, time.Since(started), 500*time.Millisecond)
+	assert.Equal(t, int32(1), slowCalls.Load(), "a full per-call timeout must not extend the semaphore hold through retries")
+
+	result, err := client.Call(context.Background(), "fast.method")
+	require.NoError(t, err, "the timed-out call must release its semaphore slot")
+	assert.Equal(t, "ok", result)
+}
+
+func TestNewClient_LazyConnectDefersInitialConnection(t *testing.T) {
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := reserved.Addr().String()
+	require.NoError(t, reserved.Close())
+	host, portText, err := net.SplitHostPort(address)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portText)
+	require.NoError(t, err)
+
+	client, err := NewClient(&ClientConfig{
+		Host:                 host,
+		Port:                 port,
+		Protocol:             "http",
+		APIKey:               "test-api-key",
+		LazyConnect:          true,
+		Timeout:              100 * time.Millisecond,
+		ConnectTimeout:       50 * time.Millisecond,
+		RetryInterval:        time.Millisecond,
+		MaxConnections:       1,
+		APIRetryMaxAttempts:  1,
+		APIRetryInitialDelay: time.Millisecond,
+	})
+	require.NoError(t, err, "an unreachable backend must not prevent node startup")
+	defer func() { _ = client.Close() }()
+	assert.False(t, client.IsConnected())
+
+	listener, err := net.Listen("tcp", address)
+	require.NoError(t, err)
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- struct{}{}
+			_ = conn.Close()
+		}
+		_ = listener.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	_, callErr := client.Call(ctx, "system.info")
+	cancel()
+	require.Error(t, callErr)
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("first API call did not attempt a deferred connection")
+	}
+}
+
+func TestClient_WriteFailureIsRetryableTransportFailure(t *testing.T) {
+	cfg := &ClientConfig{
+		Timeout:               time.Second,
+		APIRetryMaxAttempts:   2,
+		APIRetryInitialDelay:  time.Millisecond,
+		APIRetryMaxDelay:      time.Millisecond,
+		APIRetryBackoffFactor: 1,
+	}
+	conn := NewConnection(0, cfg)
+	conn.mu.Lock()
+	conn.generation = 1
+	conn.stopped = false
+	conn.authenticated = true
+	conn.writeCh = make(chan writeRequest)
+	conn.conn.Store(&websocket.Conn{})
+	conn.mu.Unlock()
+	atomic.StoreInt32(&conn.connState, int32(stateConnected))
+
+	breaker := NewCircuitBreaker(&CircuitBreakerConfig{
+		Enabled:             true,
+		FailureThreshold:    1,
+		SuccessThreshold:    1,
+		Timeout:             time.Hour,
+		HalfOpenMaxRequests: 1,
+	})
+	client := &Client{
+		config:         cfg,
+		pool:           []*Connection{conn},
+		semaphore:      make(chan struct{}, 1),
+		circuitBreaker: breaker,
+	}
+
+	var writes atomic.Int32
+	writesDone := make(chan struct{})
+	go func() {
+		defer close(writesDone)
+		for range cfg.APIRetryMaxAttempts {
+			req := <-conn.writeCh
+			writes.Add(1)
+			req.resultCh <- syscall.EPIPE
+		}
+	}()
+
+	_, err := client.Call(context.Background(), "pool.dataset.query")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTransportFailure)
+	assert.True(t, IsConnectionError(err))
+	<-writesDone
+	assert.Equal(t, int32(2), writes.Load(), "the structural transport error must be retried")
+	stats := client.CircuitBreakerStats()
+	require.NotNil(t, stats)
+	assert.Equal(t, int64(1), stats.TotalFailures, "the failed logical call must count as a breaker failure")
+	assert.Equal(t, CircuitOpen, stats.State)
 }
 
 func testServerAddress(t *testing.T, serverURL string) (string, int) {

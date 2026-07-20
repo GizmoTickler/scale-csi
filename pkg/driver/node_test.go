@@ -569,6 +569,20 @@ func TestNodeGetVolumeStats_BlockMode(t *testing.T) {
 	assert.False(t, resp.VolumeCondition.Abnormal)
 }
 
+func TestNodeStatsDeviceSizeRejectsSectorOverflow(t *testing.T) {
+	originalSysfsRoot := nodeStatsSysfsRoot
+	t.Cleanup(func() { nodeStatsSysfsRoot = originalSysfsRoot })
+	nodeStatsSysfsRoot = t.TempDir()
+	sizeDir := filepath.Join(nodeStatsSysfsRoot, "dev", "block", "8:1")
+	require.NoError(t, os.MkdirAll(sizeDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(sizeDir, "size"), []byte("9223372036854775807\n"), 0o640))
+
+	size, err := nodeStatsDeviceSize("8:1")
+	require.Error(t, err)
+	assert.Zero(t, size)
+	assert.Contains(t, err.Error(), "exceeds int64 bytes")
+}
+
 func TestNodeGetVolumeStats_FilesystemModeUnchanged(t *testing.T) {
 	originalResolver := resolveNodeStatsDevice
 	originalFilesystemStats := getNodeFilesystemStats
