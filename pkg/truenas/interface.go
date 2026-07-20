@@ -70,7 +70,7 @@ type ClientInterface interface {
 	ISCSITargetDelete(ctx context.Context, id int, force bool) error
 	ISCSITargetGet(ctx context.Context, id int) (*ISCSITarget, error)
 	ISCSITargetFindByName(ctx context.Context, name string) (*ISCSITarget, error)
-	ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, rpm string) (*ISCSIExtent, error)
+	ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error)
 	ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error
 	ISCSIExtentGet(ctx context.Context, id int) (*ISCSIExtent, error)
 	ISCSIExtentFindByName(ctx context.Context, name string) (*ISCSIExtent, error)

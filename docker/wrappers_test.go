@@ -102,6 +102,18 @@ func TestNVMeAutoExecutesRequestedCommandOnce(t *testing.T) {
 	}
 }
 
+func TestUmountAcceptsLazyFlagWithoutGetoptsError(t *testing.T) {
+	result := runWrapper(t, "umount", []string{"USE_HOST_MOUNT_TOOLS=1"}, "-l", "/var/lib/kubelet/test target")
+
+	wantArgv := []string{"/host", "/bin/umount", "-l", "/var/lib/kubelet/test target"}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("chroot argv = %#v, want %#v", result.argv, wantArgv)
+	}
+	if result.stderr != "host-command-stderr" {
+		t.Fatalf("stderr = %q, want exact host stderr without getopts diagnostics", result.stderr)
+	}
+}
+
 type wrapperResult struct {
 	argv             []string
 	stderr           string

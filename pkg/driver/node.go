@@ -22,17 +22,20 @@ import (
 )
 
 var (
-	nodeStatsSysfsRoot   = "/sys"
-	nodeGetNVMeInfo      = util.GetNVMeInfoFromDevice
-	nodeNVMeDisconnect   = util.NVMeoFDisconnect
-	nodeGetISCSIInfo     = util.GetISCSIInfoFromDevice
-	nodeISCSIDisconnect  = util.ISCSIDisconnect
-	nodeGetDeviceSize    = util.GetDeviceSize
-	nodeResizeFilesystem = util.ResizeFilesystem
-	nodeFormatAndMount   = util.FormatAndMount
-	nodeISCSIRescan      = util.ISCSIRescanSession
-	nodeNVMeRescan       = util.NVMeRescan
-	nodeStatsStat        = func(path string) (uint32, uint64, error) {
+	nodeStatsSysfsRoot         = "/sys"
+	nodeGetNVMeInfo            = util.GetNVMeInfoFromDevice
+	nodeNVMeDisconnect         = util.NVMeoFDisconnect
+	nodeGetISCSIInfo           = util.GetISCSIInfoFromDevice
+	nodeISCSIDisconnect        = util.ISCSIDisconnect
+	nodeGetDeviceSize          = util.GetDeviceSize
+	nodeResizeFilesystem       = util.ResizeFilesystem
+	nodeFormatAndMount         = util.FormatAndMount
+	nodeCheckISCSIMultipath    = util.CheckISCSIDeviceMultipathOwnership
+	nodeISCSIRescan            = util.ISCSIRescanSession
+	nodeNVMeRescan             = util.NVMeRescan
+	nodeDeviceSizePollTimeout  = 5 * time.Second
+	nodeDeviceSizePollInterval = 200 * time.Millisecond
+	nodeStatsStat              = func(path string) (uint32, uint64, error) {
 		var stat unix.Stat_t
 		if err := unix.Stat(path, &stat); err != nil {
 			return 0, 0, err
@@ -158,15 +161,21 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	// Get attach driver from volume context and normalize.
 	attachDriver := d.nodeAttachDriver(volumeContext)
 
-	// Ensure staging directory exists
-	if err := os.MkdirAll(stagingPath, 0o750); err != nil {
+	// Filesystem volumes mount on the staging path, while raw-block volumes
+	// create a symlink at that exact path. Creating the leaf for block mode
+	// makes the later symlink deterministically fail with EEXIST.
+	directoryToCreate := stagingPath
+	if req.GetVolumeCapability().GetBlock() != nil {
+		directoryToCreate = filepath.Dir(stagingPath)
+	}
+	if err := os.MkdirAll(directoryToCreate, 0o750); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create staging directory: %v", err)
 	}
 	eventObject := nodeVolumeEventRef(volumeContext, volumeID, d.nodeID)
 
 	switch attachDriver {
 	case ShareTypeNFS:
-		if err := d.stageNFSVolume(ctx, volumeContext, stagingPath, eventObject); err != nil {
+		if err := d.stageNFSVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	case ShareTypeISCSI:
@@ -328,7 +337,7 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 	switch attachDriver {
 	case ShareTypeISCSI:
 		portal := d.config.ISCSI.TargetPortal
-		targetName := protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
+		targetName := d.iscsiShareName(volumeID)
 		iqn, err := util.FindISCSISessionByTargetName(targetName)
 		if err != nil {
 			klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s): %v", volumeID, targetName, err)
@@ -677,15 +686,6 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 			return nil, status.Error(codes.Internal, "failed to resolve block device for expansion")
 		}
 
-		currentFSBytes := int64(0)
-		if !rawBlock && volumePath != "" {
-			if stats, statsErr := util.GetFilesystemStats(volumePath); statsErr != nil {
-				klog.Warningf("Could not read current filesystem size for %s: %v", volumePath, statsErr)
-			} else {
-				currentFSBytes = stats.TotalBytes
-			}
-		}
-
 		if rawBlock {
 			if ownershipErr := d.validateRawBlockDeviceOwnership(volumeID, devicePath, shareType); ownershipErr != nil {
 				return nil, ownershipErr
@@ -714,19 +714,11 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 			}
 		}
 
-		afterBytes, afterErr := nodeGetDeviceSize(devicePath)
+		afterBytes, afterErr := waitForDeviceSize(ctx, devicePath, beforeBytes, capacityBytes)
 		if afterErr != nil {
-			return nil, status.Errorf(codes.Internal, "failed to read device size after rescan for %s: %v", devicePath, afterErr)
-		} else {
-			klog.Infof("Device %s size after rescan: %d bytes", devicePath, afterBytes)
-			if beforeErr == nil && afterBytes <= beforeBytes {
-				if rawBlock && capacityBytes > beforeBytes {
-					klog.Warningf("Raw block device %s did not grow after rescan (before=%d, after=%d, requested=%d)", devicePath, beforeBytes, afterBytes, capacityBytes)
-				} else if !rawBlock && capacityBytes > currentFSBytes {
-					klog.Warningf("Device %s did not grow after rescan (before=%d, after=%d, requested=%d, filesystem=%d); attempting filesystem resize", devicePath, beforeBytes, afterBytes, capacityBytes, currentFSBytes)
-				}
-			}
+			return nil, status.Errorf(codes.Internal, "device size did not settle after rescan for %s: %v", devicePath, afterErr)
 		}
+		klog.Infof("Device %s size after rescan: %d bytes", devicePath, afterBytes)
 
 		// Node expansion for raw block volumes only needs the transport rescan.
 		if rawBlock {
@@ -765,7 +757,7 @@ func (d *Driver) validateRawBlockDeviceOwnership(volumeID, devicePath string, sh
 		if err != nil {
 			return status.Errorf(codes.Internal, "failed to identify iSCSI session for raw block device %s: %v", devicePath, err)
 		}
-		expected := protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
+		expected := d.iscsiShareName(volumeID)
 		if !sessionTargetMatchesExpected(iqn, expected) {
 			return status.Errorf(codes.FailedPrecondition,
 				"raw block staging device %s belongs to iSCSI target %s, expected volume target %s",
@@ -788,6 +780,55 @@ func (d *Driver) validateRawBlockDeviceOwnership(volumeID, devicePath string, sh
 
 func sessionTargetMatchesExpected(actual, expected string) bool {
 	return actual == expected || strings.HasSuffix(actual, ":"+expected)
+}
+
+func (d *Driver) iscsiShareName(volumeID string) string {
+	return protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
+}
+
+func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capacityBytes int64) (int64, error) {
+	deadline := time.Now().Add(nodeDeviceSizePollTimeout)
+	var lastSize int64
+	var lastErr error
+
+	for {
+		lastSize, lastErr = nodeGetDeviceSize(devicePath)
+		if lastErr == nil {
+			settled := capacityBytes > 0 && lastSize >= capacityBytes
+			if capacityBytes <= 0 {
+				settled = beforeBytes <= 0 || lastSize > beforeBytes
+			}
+			if settled {
+				return lastSize, nil
+			}
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return 0, lastErr
+			}
+			return lastSize, fmt.Errorf("capacity remained at %d bytes (before=%d, requested=%d) for %v",
+				lastSize, beforeBytes, capacityBytes, nodeDeviceSizePollTimeout)
+		}
+
+		wait := nodeDeviceSizePollInterval
+		if remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func nodeVolumeLockKey(volumeID string) string {
@@ -837,7 +878,7 @@ func blockTransportForDevice(devicePath string, fallback ShareType) ShareType {
 }
 
 // stageNFSVolume mounts an NFS volume to the staging path.
-func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, eventObjects ...runtime.Object) error {
+func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for NFS staging")
 	}
@@ -861,7 +902,7 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 	}
 
 	// Mount NFS
-	if err := util.MountNFS(source, stagingPath, nil); err != nil {
+	if err := util.MountNFS(source, stagingPath, volumeMountFlags(volCap)); err != nil {
 		RecordNodeConnect("nfs", "error")
 		operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSMountFailed, operationErr.Error())
@@ -958,6 +999,9 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		return operationErr
 	}
 	RecordNodeConnect("iscsi", "success")
+	if err := nodeCheckISCSIMultipath(devicePath); err != nil {
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
 
 	// Check if block mode
 	if volCap != nil && volCap.GetBlock() != nil {
@@ -974,7 +1018,7 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
 		fsType = strings.ToLower(volCap.GetMount().GetFsType())
 	}
-	mountFlags := volumeMountFlags(volCap)
+	mountFlags := volumeMountFlagsForFS(volCap, fsType)
 
 	if err := nodeFormatAndMount(devicePath, stagingPath, fsType, mountFlags); err != nil {
 		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
@@ -1086,7 +1130,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
 		fsType = strings.ToLower(volCap.GetMount().GetFsType())
 	}
-	mountFlags := volumeMountFlags(volCap)
+	mountFlags := volumeMountFlagsForFS(volCap, fsType)
 
 	if err := nodeFormatAndMount(devicePath, stagingPath, fsType, mountFlags); err != nil {
 		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
@@ -1116,6 +1160,19 @@ func volumeMountFlags(volCap *csi.VolumeCapability) []string {
 		result = append(result, flag)
 	}
 	return result
+}
+
+func volumeMountFlagsForFS(volCap *csi.VolumeCapability, fsType string) []string {
+	flags := volumeMountFlags(volCap)
+	if !strings.EqualFold(fsType, "xfs") {
+		return flags
+	}
+	for _, flag := range flags {
+		if strings.EqualFold(flag, "nouuid") {
+			return flags
+		}
+	}
+	return append(flags, "nouuid")
 }
 
 func stagedBlockDevicePath(stagingPath string) (string, bool) {

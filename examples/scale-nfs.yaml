@@ -26,10 +26,6 @@ zfs:
   # Parent dataset for volumes
   datasetParentName: tank/k8s/volumes
 
-  # Parent dataset for detached snapshots
-  # IMPORTANT: Do NOT nest these datasets - they should be siblings
-  detachedSnapshotsDatasetParentName: tank/k8s/snapshots
-
   # Enable quotas on datasets (recommended for NFS)
   datasetEnableQuotas: true
 

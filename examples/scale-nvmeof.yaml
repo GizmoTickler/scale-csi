@@ -26,10 +26,6 @@ zfs:
   # Parent dataset for volumes (zvols)
   datasetParentName: tank/k8s/volumes
 
-  # Parent dataset for detached snapshots
-  # IMPORTANT: Do NOT nest these datasets - they should be siblings
-  detachedSnapshotsDatasetParentName: tank/k8s/snapshots
-
   # Enable reservations for zvols (recommended for NVMe-oF)
   zvolEnableReservation: true
 

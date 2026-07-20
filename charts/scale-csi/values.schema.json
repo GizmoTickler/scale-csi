@@ -396,12 +396,12 @@
         "datasetProperties": {
           "$ref": "#/definitions/stringMap"
         },
-        "detachedSnapshotsDatasetParentName": {
-          "type": "string"
-        },
         "zvolBlocksize": {
           "type": "string",
           "minLength": 1
+        },
+        "zvolEnableReservation": {
+          "type": "boolean"
         },
         "enforceQuota": {
           "type": "boolean"
@@ -484,6 +484,9 @@
         "extentBlocksize": {
           "type": "integer",
           "minimum": 1
+        },
+        "extentDisablePhysicalBlocksize": {
+          "type": "boolean"
         },
         "extentRpm": {
           "type": [

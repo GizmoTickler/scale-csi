@@ -156,6 +156,9 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 		Volsize:        DatasetProperty{Parsed: float64(params.Volsize)},
 		Refquota:       DatasetProperty{Parsed: float64(params.Refquota)},
 	}
+	for _, property := range params.UserProperties {
+		ds.UserProperties[property.Key] = UserProperty{Value: property.Value, Source: "local"}
+	}
 	if params.Type != "VOLUME" {
 		ds.Mountpoint = "/mnt/" + strings.TrimPrefix(params.Name, "/")
 	}
@@ -738,7 +741,7 @@ func (m *MockClient) ISCSITargetFindByName(ctx context.Context, name string) (*I
 	}
 	return nil, nil
 }
-func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, rpm string) (*ISCSIExtent, error) {
+func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

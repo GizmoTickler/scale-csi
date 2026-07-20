@@ -61,29 +61,32 @@ var datasetQueryProperties = []string{
 
 // DatasetCreateParams holds parameters for creating a dataset.
 type DatasetCreateParams struct {
-	Name            string `json:"name"`
-	Type            string `json:"type,omitempty"`         // FILESYSTEM or VOLUME
-	Volsize         int64  `json:"volsize,omitempty"`      // For volumes
-	Volblocksize    string `json:"volblocksize,omitempty"` // For volumes
-	Sparse          bool   `json:"sparse,omitempty"`       // For volumes
-	Quota           int64  `json:"quota,omitempty"`        // For filesystems
-	Refquota        int64  `json:"refquota,omitempty"`     // For filesystems
-	Reservation     int64  `json:"reservation,omitempty"`
-	Refreservation  int64  `json:"refreservation,omitempty"`
-	Comments        string `json:"comments,omitempty"`
-	Readonly        string `json:"readonly,omitempty"` // ON, OFF, INHERIT
-	Atime           string `json:"atime,omitempty"`
-	Exec            string `json:"exec,omitempty"`
-	Sync            string `json:"sync,omitempty"`
-	Compression     string `json:"compression,omitempty"`
-	Deduplication   string `json:"deduplication,omitempty"`
-	Copies          int    `json:"copies,omitempty"`
-	Recordsize      string `json:"recordsize,omitempty"`
-	Casesensitivity string `json:"casesensitivity,omitempty"`
-	Aclmode         string `json:"aclmode,omitempty"`
-	Acltype         string `json:"acltype,omitempty"`
-	ShareType       string `json:"share_type,omitempty"`
-	Xattr           string `json:"xattr,omitempty"`
+	Name            string               `json:"name"`
+	Type            string               `json:"type,omitempty"`         // FILESYSTEM or VOLUME
+	Volsize         int64                `json:"volsize,omitempty"`      // For volumes
+	Volblocksize    string               `json:"volblocksize,omitempty"` // For volumes
+	Sparse          bool                 `json:"sparse,omitempty"`       // For volumes
+	Quota           int64                `json:"quota,omitempty"`        // For filesystems
+	Refquota        int64                `json:"refquota,omitempty"`     // For filesystems
+	Reservation     int64                `json:"reservation,omitempty"`
+	Refreservation  int64                `json:"refreservation,omitempty"`
+	Comments        string               `json:"comments,omitempty"`
+	Readonly        string               `json:"readonly,omitempty"` // ON, OFF, INHERIT
+	Atime           string               `json:"atime,omitempty"`
+	Exec            string               `json:"exec,omitempty"`
+	Sync            string               `json:"sync,omitempty"`
+	Compression     string               `json:"compression,omitempty"`
+	Deduplication   string               `json:"deduplication,omitempty"`
+	Logbias         string               `json:"logbias,omitempty"`
+	Primarycache    string               `json:"primarycache,omitempty"`
+	Copies          int                  `json:"copies,omitempty"`
+	Recordsize      string               `json:"recordsize,omitempty"`
+	Casesensitivity string               `json:"casesensitivity,omitempty"`
+	Aclmode         string               `json:"aclmode,omitempty"`
+	Acltype         string               `json:"acltype,omitempty"`
+	ShareType       string               `json:"share_type,omitempty"`
+	Xattr           string               `json:"xattr,omitempty"`
+	UserProperties  []UserPropertyUpdate `json:"user_properties,omitempty"`
 }
 
 // DatasetUpdateParams holds parameters for updating a dataset.

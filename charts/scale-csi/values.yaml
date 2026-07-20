@@ -160,11 +160,12 @@ zfs:
   # dataset — matching the driver's default behavior.
   datasetProperties: {}
 
-  # Parent dataset used for detached snapshots
-  detachedSnapshotsDatasetParentName: ""
-
   # Block size for newly-created zvols
   zvolBlocksize: 16K
+
+  # Thick-provision block zvols with a full refreservation. The default keeps
+  # zvols sparse/thin-provisioned.
+  zvolEnableReservation: false
 
   # Dataset quota enforcement
   enforceQuota: true
@@ -220,6 +221,8 @@ iscsi:
   targetGroups: []
 
   extentBlocksize: 512
+  # Disable physical block size reporting on created extents.
+  extentDisablePhysicalBlocksize: false
   extentRpm: SSD
   extentAvailThreshold: 0
 

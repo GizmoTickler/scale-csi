@@ -4,23 +4,6 @@
 # We parse -t (filesystem type) to detect filesystems that require host tools.
 # All other options are passed through to mount unchanged.
 
-container_supported_filesystems=(
-  "ext2"
-  "ext3"
-  "ext4"
-  "ext4dev"
-  "btrfs"
-  "xfs"
-  "vfat"
-  "nfs"
-  "nfs3"
-  "nfs4"
-  "cifs"
-  "smb"
-  "smb3"
-  "bind"
-)
-
 # Parse options we care about, ignore others
 # t: = filesystem type (we check if it needs host tools)
 # o: = mount options (ignored, just need to accept it)

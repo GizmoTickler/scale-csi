@@ -70,6 +70,40 @@ func TestFindNVMeNamespaceForControllerDoesNotAssumeNamespaceOne(t *testing.T) {
 	assert.Equal(t, filepath.Join(devRoot, "nvme7n9"), devicePath)
 }
 
+func TestNVMeNamespaceSelectionRejectsMultipleNamespaces(t *testing.T) {
+	t.Run("controller", func(t *testing.T) {
+		classRoot := filepath.Join(t.TempDir(), "nvme")
+		devRoot := filepath.Join(t.TempDir(), "dev")
+		require.NoError(t, os.MkdirAll(filepath.Join(classRoot, "nvme7", "nvme7n1"), 0o750))
+		require.NoError(t, os.MkdirAll(filepath.Join(classRoot, "nvme7", "nvme7n9"), 0o750))
+		require.NoError(t, os.MkdirAll(devRoot, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(devRoot, "nvme7n1"), nil, 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(devRoot, "nvme7n9"), nil, 0o600))
+
+		devicePath, err := findNVMeNamespaceForController("nvme7", classRoot, devRoot)
+		require.Error(t, err)
+		assert.Empty(t, devicePath)
+		assert.Contains(t, err.Error(), "multiple namespaces")
+	})
+
+	t.Run("subsystem sysfs", func(t *testing.T) {
+		subsystemRoot := t.TempDir()
+		devRoot := filepath.Join(t.TempDir(), "dev")
+		subsystem := filepath.Join(subsystemRoot, "nvme-subsys4")
+		require.NoError(t, os.MkdirAll(filepath.Join(subsystem, "nvme4n1"), 0o750))
+		require.NoError(t, os.MkdirAll(filepath.Join(subsystem, "nvme4n2"), 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(subsystem, "subsysnqn"), []byte("nqn.test:multi\n"), 0o600))
+		require.NoError(t, os.MkdirAll(devRoot, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(devRoot, "nvme4n1"), nil, 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(devRoot, "nvme4n2"), nil, 0o600))
+
+		devicePath, err := findNVMeDeviceFromSysfsInPaths("nqn.test:multi", subsystemRoot, devRoot)
+		require.Error(t, err)
+		assert.Empty(t, devicePath)
+		assert.Contains(t, err.Error(), "multiple namespaces")
+	})
+}
+
 // TestNVMeDeviceRegex tests that the NVMe device regex correctly extracts controller names.
 // This is a regression test for the bug where strings.Split(deviceName, "n") was used,
 // which incorrectly split on the "n" in "nvme" instead of the "n" before the namespace number.

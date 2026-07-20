@@ -116,6 +116,27 @@ nfs:
 	assert.Equal(t, "/etc/scale-csi/truenas-ca.pem", cfg.TrueNAS.CACertFile)
 }
 
+func TestLoadConfigZvolReservationAndISCSIPhysicalBlocksize(t *testing.T) {
+	cfg, err := loadTestConfig(t, `
+driver: csi.scale.io
+truenas:
+  host: truenas.example.test
+  apiKey: test-key
+zfs:
+  datasetParentName: tank/csi
+  zvolEnableReservation: true
+iscsi:
+  enabled: true
+  targetPortal: 192.0.2.10:3260
+  namePrefix: csi-
+  extentDisablePhysicalBlocksize: true
+`)
+	require.NoError(t, err)
+	assert.True(t, cfg.ZFS.ZvolEnableReservation)
+	assert.Equal(t, "csi-", cfg.ISCSI.NamePrefix)
+	assert.True(t, cfg.ISCSI.ExtentDisablePhysicalBlocksize)
+}
+
 func TestLoadConfigRejectsNegativeNumericSettings(t *testing.T) {
 	config := func(truenasExtra, zfsExtra, rootExtra string) string {
 		return fmt.Sprintf(`

@@ -85,9 +85,6 @@ type ZFSConfig struct {
 	// DatasetParentName is the parent dataset for volumes (e.g., "tank/k8s/volumes")
 	DatasetParentName string `yaml:"datasetParentName"`
 
-	// DetachedSnapshotsDatasetParentName is the parent for detached snapshots
-	DetachedSnapshotsDatasetParentName string `yaml:"detachedSnapshotsDatasetParentName"`
-
 	// DatasetEnableQuotas enables quota support for NFS volumes
 	DatasetEnableQuotas bool `yaml:"datasetEnableQuotas"`
 
@@ -99,6 +96,9 @@ type ZFSConfig struct {
 
 	// ZvolBlocksize is the block size for zvols (default: 16K)
 	ZvolBlocksize string `yaml:"zvolBlocksize"`
+
+	// ZvolEnableReservation thick-provisions zvols with a full refreservation.
+	ZvolEnableReservation bool `yaml:"zvolEnableReservation"`
 
 	// ZvolReadyTimeout is the timeout in seconds for waiting for a zvol to be ready
 	// after cloning operations. Increase for slow systems or large clones (default: 60)
@@ -158,9 +158,6 @@ type ISCSIConfig struct {
 
 	// NameSuffix is a suffix for iSCSI target/extent names
 	NameSuffix string `yaml:"nameSuffix"`
-
-	// NameTemplate is a template for generating names
-	NameTemplate string `yaml:"nameTemplate"`
 
 	// TargetGroups is the list of portal/initiator groups
 	TargetGroups []ISCSITargetGroup `yaml:"targetGroups"`
