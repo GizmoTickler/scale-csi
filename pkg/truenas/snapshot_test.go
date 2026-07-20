@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1751,6 +1752,27 @@ func TestSnapshot_GetSnapshotSize(t *testing.T) {
 			},
 			expected: 4096,
 		},
+		{
+			name: "negative numeric size",
+			properties: map[string]interface{}{
+				"used": map[string]interface{}{"parsed": float64(-1)},
+			},
+			expected: 0,
+		},
+		{
+			name: "overflowing numeric size",
+			properties: map[string]interface{}{
+				"used": map[string]interface{}{"parsed": maxInt64FloatExclusive},
+			},
+			expected: 0,
+		},
+		{
+			name: "NaN numeric size",
+			properties: map[string]interface{}{
+				"used": map[string]interface{}{"parsed": math.NaN()},
+			},
+			expected: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1822,6 +1844,29 @@ func TestSnapshot_GetCreationTime(t *testing.T) {
 				},
 			},
 			expected: 1700000001,
+		},
+		{
+			name: "negative creation time",
+			properties: map[string]interface{}{
+				"creation": map[string]interface{}{"value": float64(-1)},
+			},
+			expected: 0,
+		},
+		{
+			name: "overflowing creation time",
+			properties: map[string]interface{}{
+				"creation": map[string]interface{}{"parsed": maxInt64FloatExclusive},
+			},
+			expected: 0,
+		},
+		{
+			name: "overflowing millisecond creation time",
+			properties: map[string]interface{}{
+				"creation": map[string]interface{}{
+					"parsed": map[string]interface{}{"$date": math.Inf(1)},
+				},
+			},
+			expected: 0,
 		},
 	}
 

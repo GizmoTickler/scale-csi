@@ -204,6 +204,9 @@ so a NAS outage or slow reconnect does not cause a kubelet restart loop. Monitor
 | [Architecture](docs/architecture.md) | How the driver works internally |
 | [Deployment](docs/deployment.md) | Helm and Flux installation with full configuration reference |
 | [Production](docs/production.md) | HA, security, monitoring, upgrades, and known limitations |
+| [Disaster recovery](docs/guides/disaster-recovery.md) | ZFS replication + export auto-recreation for cross-site failover |
+| [Topology](docs/guides/topology.md) | Zone/region-aware provisioning (advanced; single-backend usually doesn't need it) |
+| [Snapshots](docs/guides/snapshots.md) | Snapshot and clone/restore workflow |
 
 ## Network Ports
 

@@ -462,14 +462,14 @@ func (c *Client) NVMeoFPortCreate(ctx context.Context, transport, address string
 	if err != nil {
 		// TrueNAS SCALE 25.10+ may return "Invalid params" when a port with the same
 		// address already exists, instead of "already exists". Check if it exists before failing.
-		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+		if IsAlreadyExistsError(err) || strings.Contains(strings.ToLower(err.Error()), "invalid params") {
 			existing, findErr := c.NVMeoFPortFindByAddress(ctx, transport, address, port)
 			if findErr == nil && existing != nil {
 				klog.V(4).Infof("NVMeoFPortCreate: port %s:%s:%d already exists (ID %d), returning existing", transport, address, port, existing.ID)
 				return existing, nil
 			}
 			// If we got "Invalid params" but the port doesn't exist, it's a genuine parameter error
-			if strings.Contains(err.Error(), "Invalid params") {
+			if strings.Contains(strings.ToLower(err.Error()), "invalid params") {
 				klog.Errorf("NVMeoFPortCreate: 'Invalid params' error for port %s:%s:%d but port not found - genuine parameter error", transport, address, port)
 			}
 		}
@@ -693,10 +693,22 @@ func (c *Client) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, e
 // Important: If a wildcard port (0.0.0.0) exists on the same service port,
 // it will be reused since it binds to all interfaces and catches all traffic.
 func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
-	// Resolve hostname to IP if needed (TrueNAS API requires IP addresses)
-	resolvedAddr, err := resolveToIP(address)
+	resolvedAddr, cacheKey, err := nvmePortCacheIdentity(transport, address, port)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve address %q: %w", address, err)
+	}
+
+	c.nvmePortMu.Lock()
+	defer c.nvmePortMu.Unlock()
+	if cached := c.nvmeResolvedPort[cacheKey]; cached != nil {
+		return cached, nil
+	}
+	cache := func(resolved *NVMeoFPort) *NVMeoFPort {
+		if c.nvmeResolvedPort == nil {
+			c.nvmeResolvedPort = make(map[string]*NVMeoFPort)
+		}
+		c.nvmeResolvedPort[cacheKey] = resolved
+		return resolved
 	}
 
 	// Try to find existing port with exact address first
@@ -705,24 +717,56 @@ func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address s
 		return nil, err
 	}
 	if existingPort != nil {
-		return existingPort, nil
+		return cache(existingPort), nil
 	}
 
 	// Check for a wildcard (0.0.0.0) port on the same service port.
 	// A wildcard port binds to ALL interfaces, so traffic to any IP will hit it.
 	// We must reuse it rather than creating a new specific IP port.
 	if resolvedAddr != "0.0.0.0" {
-		wildcardPort, err := c.NVMeoFPortFindByAddress(ctx, transport, "0.0.0.0", port)
-		if err != nil {
-			return nil, err
+		wildcardPort, findErr := c.NVMeoFPortFindByAddress(ctx, transport, "0.0.0.0", port)
+		if findErr != nil {
+			return nil, findErr
 		}
 		if wildcardPort != nil {
-			return wildcardPort, nil
+			return cache(wildcardPort), nil
 		}
 	}
 
 	// Create new port (addr_adrfam is auto-detected by TrueNAS)
-	return c.NVMeoFPortCreate(ctx, transport, resolvedAddr, port)
+	created, err := c.NVMeoFPortCreate(ctx, transport, resolvedAddr, port)
+	if err != nil {
+		return nil, err
+	}
+	return cache(created), nil
+}
+
+// InvalidateNVMeoFPort removes a cached shared-port resolution so a subsequent
+// request re-queries TrueNAS. This is used when a downstream operation proves
+// that the cached port ID is stale.
+func (c *Client) InvalidateNVMeoFPort(transport, address string, port int) {
+	_, cacheKey, err := nvmePortCacheIdentity(transport, address, port)
+	if err != nil {
+		klog.Warningf("Failed to invalidate NVMe-oF port cache for %s:%s:%d: %v", transport, address, port, err)
+		return
+	}
+
+	c.nvmePortMu.Lock()
+	defer c.nvmePortMu.Unlock()
+	delete(c.nvmeResolvedPort, cacheKey)
+}
+
+// nvmePortCacheIdentity normalizes the requested address exactly once for both
+// cache population and invalidation. In particular, 0.0.0.0 remains the
+// wildcard address used by TrueNAS rather than being resolved as a hostname.
+func nvmePortCacheIdentity(transport, address string, port int) (resolvedAddr, cacheKey string, err error) {
+	// Resolve hostname to IP if needed (TrueNAS API requires IP addresses).
+	resolvedAddr, err = resolveToIP(address)
+	if err != nil {
+		return "", "", err
+	}
+	cacheKey = fmt.Sprintf("%s|%s|%d", strings.ToUpper(transport), resolvedAddr, port)
+	return resolvedAddr, cacheKey, nil
 }
 
 // resolveToIP resolves a hostname to an IP address.

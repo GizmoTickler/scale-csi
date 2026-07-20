@@ -52,21 +52,27 @@ not install host packages or load modules.
 
 ## Availability and outage behavior
 
-For controller availability, use at least two `controller.replicas`. The
-provisioner, attacher, resizer, and snapshotter sidecars all enable Lease-based
-leader election, so only the elected sidecars issue CSI controller requests.
-Enable `controller.podDisruptionBudget` only with multiple replicas and choose a
-single non-empty `minAvailable` or `maxUnavailable`. The defaults use
-`system-cluster-critical` for controller pods and `system-node-critical` for the
-node DaemonSet.
+Set `controller.replicas: 1` for operation-lock correctness. The driver's
+cross-volume operation lock is in memory and therefore per process. Although
+the provisioner, attacher, resizer, and snapshotter sidecars each use
+Lease-based leader election, independently elected sidecars can send related
+requests to different controller pods, whose pod-local locks are not mutually
+exclusive. Do not enable `controller.podDisruptionBudget` with one replica.
+The controller is restart-recovered: controller downtime pauses provisioning,
+attachment, resize, and snapshot operations, but does not interrupt workloads
+that are already using their volumes. The defaults use
+`system-cluster-critical` for the controller pod and `system-node-critical` for
+the node DaemonSet.
 
 The node component runs as a DaemonSet on all tolerated nodes. Established node
 pods perform stage, publish, unpublish, and unstage through host NFS/iSCSI/NVMe
 tools rather than through TrueNAS management API calls. During a management API
-outage their readiness endpoint reports unavailable, and controller operations
-fail or retry. A node pod that restarts while TrueNAS is unreachable cannot
-initialize because every driver process establishes at least one API connection
-at startup.
+outage, controller operations fail or retry. Node-only processes start in
+lazy-connect mode, so a node pod that restarts while TrueNAS is unreachable can
+still initialize and report ready; its first operation that actually needs the
+management API attempts the deferred connection. Node stage, publish,
+unpublish, unstage, and local filesystem expansion remain available through the
+host tools when they do not need an API call.
 
 The API retry and circuit-breaker behavior comes from this values block:
 
@@ -93,6 +99,16 @@ the baseline protection. If enabled, five consecutive failures open it for 30
 seconds before half-open probes are admitted. These controls do not replace
 protocol-level mount/login timeouts under `commandTimeouts`.
 
+`requestTimeout` bounds each API call. It is applied as a hard per-call cap **only
+to callers that supply no deadline of their own** (internal background work such as
+session garbage collection), so a wedged-but-live TrueNAS request cannot pin an API
+concurrency slot indefinitely. Calls that already carry a deadline — every CSI RPC,
+which inherits the sidecar's `--timeout` — are bounded by that deadline instead, so a
+legitimately long single operation (e.g. a large clone or recursive snapshot) is never
+cut short at `requestTimeout`. In the worst case all `maxConcurrentRequests` slots can
+be held by deadline-bearing calls for the length of their sidecar timeout; size the
+semaphore and sidecar timeouts accordingly.
+
 ## Resource sizing
 
 Steady-state measurements are approximately 15Mi memory and 1m CPU per driver
@@ -104,8 +120,10 @@ When limits are set, `automaxprocs` derives `GOMAXPROCS` from the CPU cgroup and
 the driver sets `GOMEMLIMIT` to 90% of the finite memory cgroup limit unless the
 environment explicitly supplies `GOMEMLIMIT`. CSI liveness reports initialized
 process health, independent of TrueNAS reachability, so a NAS blip or slow
-reconnect does not cause a crash loop. `/readyz` remains backend-aware; alert on
-`scale_csi_truenas_connection_status == 0` for backend loss.
+reconnect does not cause a crash loop. Controller `/readyz` remains
+backend-aware, while node-only `/readyz` is intentionally independent of
+TrueNAS connectivity. Alert on `scale_csi_truenas_connection_status == 0` for
+backend loss.
 
 ## Security
 
@@ -249,9 +267,9 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 - `ControllerModifyVolume` returns `Unimplemented`. CSI volume group snapshot
   services are not registered or implemented.
 - CSI volume and snapshot names share `sanitizeVolumeID`: `/` and spaces become
-  `-`, a non-alphanumeric first byte is prefixed with `v`, and the result is
-  truncated to 128 bytes. It is a byte-oriented sanitizer, not a general Unicode
-  or arbitrary-ZFS-name normalizer. Snapshot short names are global within the
+  `-`, a first byte outside lowercase ASCII alphanumerics is prefixed with `v`,
+  and the result is truncated to 128 bytes on a UTF-8 rune boundary. It is not a
+  general arbitrary-ZFS-name normalizer. Snapshot short names are global within the
   configured parent from the CSI driver's perspective.
 - Deleting a snapshot that still has clones renames it to an internal tombstone
   and requests deferred ZFS destruction. The snapshot disappears from CSI, but

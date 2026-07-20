@@ -248,20 +248,56 @@ func listNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
 		return nil, fmt.Errorf("list-subsys failed: %w", err)
 	}
 
-	// Parse JSON output
-	var result struct {
+	subsystems, err := parseSubsysJSON(output)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse subsystem list: %w", err)
+	}
+	return subsystems, nil
+}
+
+// parseSubsysJSON accepts the nvme-cli 1.x object, nvme-cli 2.x host array,
+// and direct subsystem-array shapes. A successful decode that produces an
+// empty-NQN entry is a shape mismatch, not a real subsystem.
+func parseSubsysJSON(output []byte) ([]NVMeSubsystem, error) {
+	var hosts []struct {
 		Subsystems []NVMeSubsystem `json:"Subsystems"`
 	}
-	if err := json.Unmarshal(output, &result); err != nil {
-		// Try alternative format
-		var subsystems []NVMeSubsystem
-		if err := json.Unmarshal(output, &subsystems); err != nil {
-			return nil, fmt.Errorf("failed to parse subsystem list: %w", err)
+	if err := json.Unmarshal(output, &hosts); err == nil && hosts != nil {
+		subsystems := make([]NVMeSubsystem, 0)
+		hostShape := len(hosts) == 0
+		for _, host := range hosts {
+			if host.Subsystems != nil {
+				hostShape = true
+				subsystems = append(subsystems, host.Subsystems...)
+			}
 		}
+		if hostShape && nvmeSubsystemsHaveNQN(subsystems) {
+			return subsystems, nil
+		}
+	}
+
+	var object struct {
+		Subsystems []NVMeSubsystem `json:"Subsystems"`
+	}
+	if err := json.Unmarshal(output, &object); err == nil && object.Subsystems != nil && nvmeSubsystemsHaveNQN(object.Subsystems) {
+		return object.Subsystems, nil
+	}
+
+	var subsystems []NVMeSubsystem
+	if err := json.Unmarshal(output, &subsystems); err == nil && subsystems != nil && nvmeSubsystemsHaveNQN(subsystems) {
 		return subsystems, nil
 	}
 
-	return result.Subsystems, nil
+	return nil, fmt.Errorf("unrecognized nvme list-subsys JSON shape")
+}
+
+func nvmeSubsystemsHaveNQN(subsystems []NVMeSubsystem) bool {
+	for _, subsystem := range subsystems {
+		if strings.TrimSpace(subsystem.NQN) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // waitForNVMeDevice waits for the NVMe device to appear.
@@ -415,20 +451,9 @@ func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
 		return "", fmt.Errorf("nvme list-subsys failed: %w", err)
 	}
 
-	// Parse the JSON output - can be array or object with Subsystems
-	var subsystems []NVMeSubsystem
-
-	// Try parsing as array first (nvme-cli 2.x format)
-	var hosts []struct {
-		Subsystems []NVMeSubsystem `json:"Subsystems"`
-	}
-	if err := json.Unmarshal(output, &hosts); err == nil && len(hosts) > 0 {
-		subsystems = hosts[0].Subsystems
-	} else {
-		// Try direct array format
-		if err := json.Unmarshal(output, &subsystems); err != nil {
-			return "", fmt.Errorf("failed to parse nvme list-subsys: %w", err)
-		}
+	subsystems, err := parseSubsysJSON(output)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse nvme list-subsys: %w", err)
 	}
 
 	return findNVMeDeviceFromSubsystems(nqn, subsystems)

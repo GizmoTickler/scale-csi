@@ -69,6 +69,17 @@ type iscsiTargetCreateFailMock struct {
 	targetCreateErr error
 }
 
+type nvmePortAssociationFailMock struct {
+	*truenas.MockClient
+	cachedPort            *truenas.NVMeoFPort
+	portFindCalls         int
+	portInvalidationCalls int
+	invalidatedTransport  string
+	invalidatedAddress    string
+	invalidatedPort       int
+	portSubsysCreateErr   error
+}
+
 type shareVerificationErrorMock struct {
 	*truenas.MockClient
 	err error
@@ -107,6 +118,34 @@ func (m *iscsiTargetCreateFailMock) ISCSITargetCreate(ctx context.Context, name,
 		return nil, err
 	}
 	return m.MockClient.ISCSITargetCreate(ctx, name, alias, mode, groups)
+}
+
+func (m *nvmePortAssociationFailMock) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*truenas.NVMeoFPort, error) {
+	if m.cachedPort != nil {
+		return m.cachedPort, nil
+	}
+	m.portFindCalls++
+	resolved, err := m.NVMeoFPortFindByAddress(ctx, transport, address, port)
+	if err != nil {
+		return nil, err
+	}
+	m.cachedPort = resolved
+	return resolved, nil
+}
+
+func (m *nvmePortAssociationFailMock) InvalidateNVMeoFPort(transport, address string, port int) {
+	m.portInvalidationCalls++
+	m.invalidatedTransport = transport
+	m.invalidatedAddress = address
+	m.invalidatedPort = port
+	m.cachedPort = nil
+}
+
+func (m *nvmePortAssociationFailMock) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID int) (*truenas.NVMeoFPortSubsys, error) {
+	if m.portSubsysCreateErr != nil {
+		return nil, m.portSubsysCreateErr
+	}
+	return m.MockClient.NVMeoFPortSubsysCreate(ctx, portID, subsysID)
 }
 
 func (m *nvmeHostCountingMock) NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*truenas.NVMeoFHost, error) {
@@ -1152,6 +1191,46 @@ func TestISCSITargetCreateFailureInvalidatesResolvedGroup(t *testing.T) {
 	assert.Equal(t, 7, group.Portal)
 }
 
+func TestNVMeoFPortAssociationFailureInvalidatesResolvedPort(t *testing.T) {
+	ctx := context.Background()
+	mockClient := &nvmePortAssociationFailMock{
+		MockClient:          truenas.NewMockClient(),
+		portSubsysCreateErr: fmt.Errorf("stale NVMe-oF port ID"),
+	}
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes"},
+			NVMeoF: NVMeoFConfig{
+				Transport:             "TCP",
+				TransportAddress:      "0.0.0.0",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: true,
+			},
+		},
+		truenasClient: mockClient,
+	}
+
+	_, err := mockClient.NVMeoFGetOrCreatePort(ctx, "TCP", "0.0.0.0", 4420)
+	require.NoError(t, err)
+	assert.Equal(t, 1, mockClient.portFindCalls)
+
+	datasetName := "tank/k8s/volumes/nvme-port-cache-invalidation"
+	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
+	require.NoError(t, err)
+	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "nvme-port-cache-invalidation", true, true)
+	require.Error(t, err)
+	assert.Equal(t, 1, mockClient.portInvalidationCalls)
+	assert.Equal(t, "TCP", mockClient.invalidatedTransport)
+	assert.Equal(t, "0.0.0.0", mockClient.invalidatedAddress)
+	assert.Equal(t, 4420, mockClient.invalidatedPort)
+	assert.Nil(t, mockClient.cachedPort)
+
+	resolved, err := mockClient.NVMeoFGetOrCreatePort(ctx, "TCP", "0.0.0.0", 4420)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, 2, mockClient.portFindCalls, "association failure must invalidate the cached port so the next request re-resolves it")
+}
+
 // =============================================================================
 // Test createShareWithOptions
 // =============================================================================
@@ -1235,6 +1314,15 @@ func TestProtocolShareName(t *testing.T) {
 	}
 	if longLegal == protocolShareName(strings.Repeat("a", 81)) {
 		t.Fatalf("truncated names must not collide")
+	}
+	for _, unsafe := range []string{"", "...", "-leading", ":leading", "🔥"} {
+		got := protocolShareName(unsafe)
+		if got == "" || !isLowerAlphanumeric(got[0]) {
+			t.Fatalf("guarded name %q produced invalid result %q", unsafe, got)
+		}
+	}
+	if protocolShareName("...") == protocolShareName("x...") {
+		t.Fatal("all-dot normalization must not collide with an already-legal name")
 	}
 }
 

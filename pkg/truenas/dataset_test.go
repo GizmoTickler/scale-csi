@@ -71,8 +71,8 @@ func TestDatasetHasDependentClonesUsesOriginProjection(t *testing.T) {
 				paramsSeen <- req.Params
 				resp.Result = []interface{}{
 					map[string]interface{}{
-						"id":   "tank/external/clone",
-						"name": "tank/external/clone",
+						"id":   "tank/k8s/volumes/clone",
+						"name": "tank/k8s/volumes/clone",
 						"origin": map[string]interface{}{
 							"value":    "tank/k8s/volumes/source@snap-1",
 							"parsed":   "tank/k8s/volumes/source@snap-1",
@@ -99,7 +99,7 @@ func TestDatasetHasDependentClonesUsesOriginProjection(t *testing.T) {
 
 	params := <-paramsSeen
 	filters := params[0].([]interface{})
-	assert.Equal(t, []interface{}{"name", "^", "tank/"}, filters[0])
+	assert.Equal(t, []interface{}{"name", "^", "tank/k8s/volumes/"}, filters[0])
 	options := params[1].(map[string]interface{})
 	extra := options["extra"].(map[string]interface{})
 	assert.Equal(t, []interface{}{"origin"}, extra["properties"])
@@ -1390,6 +1390,44 @@ func TestGetPoolAvailable_Success(t *testing.T) {
 	avail, err := client.GetPoolAvailable(ctx, "tank/k8s/volumes")
 	require.NoError(t, err)
 	assert.Equal(t, int64(500000000000), avail)
+}
+
+func TestGetPoolAvailableRejectsOverflowingFloat(t *testing.T) {
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.query":
+				resp.Result = []interface{}{map[string]interface{}{
+					"name": "tank",
+					"topology": map[string]interface{}{
+						"data": []interface{}{map[string]interface{}{
+							"stats": map[string]interface{}{"free": maxInt64FloatExclusive},
+						}},
+					},
+				}}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	available, err := client.GetPoolAvailable(context.Background(), "tank/k8s/volumes")
+	require.Error(t, err)
+	assert.Zero(t, available)
+	assert.Contains(t, err.Error(), "outside the int64 range")
 }
 
 func TestParseDataset_ProjectedResponse(t *testing.T) {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -230,15 +232,15 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offs
 	return datasets, nil
 }
 
-// DatasetHasDependentClones reports whether any dataset in the same pool was
+// DatasetHasDependentClones reports whether any dataset in the same CSI parent was
 // cloned from a snapshot of datasetName. Snapshot clone projections are absent
 // on TrueNAS 26.0, but pool.dataset.query still exposes the origin property.
 func (c *Client) DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error) {
-	pool, _, _ := strings.Cut(datasetName, "/")
-	if pool == "" {
+	parent := path.Dir(datasetName)
+	if parent == "." || parent == "/" {
 		return false, fmt.Errorf("invalid dataset name %q", datasetName)
 	}
-	origins, err := c.queryPoolDatasetOrigins(ctx, pool)
+	origins, err := c.queryDatasetOrigins(ctx, parent)
 	if err != nil {
 		return false, err
 	}
@@ -256,11 +258,11 @@ func (c *Client) DatasetHasDependentClones(ctx context.Context, datasetName stri
 // query APIs no longer expose the ZFS clones property.
 func (c *Client) snapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
 	datasetName, _, found := strings.Cut(snapshotID, "@")
-	pool, _, _ := strings.Cut(datasetName, "/")
-	if !found || pool == "" {
+	parent := path.Dir(datasetName)
+	if !found || parent == "." || parent == "/" {
 		return nil, fmt.Errorf("invalid snapshot id %q", snapshotID)
 	}
-	origins, err := c.queryPoolDatasetOrigins(ctx, pool)
+	origins, err := c.queryDatasetOrigins(ctx, parent)
 	if err != nil {
 		return nil, err
 	}
@@ -273,10 +275,10 @@ func (c *Client) snapshotDependentClones(ctx context.Context, snapshotID string)
 	return clones, nil
 }
 
-// queryPoolDatasetOrigins returns dataset name → origin (empty for non-clones)
-// for every dataset in the pool, using the projected origin property.
-func (c *Client) queryPoolDatasetOrigins(ctx context.Context, pool string) (map[string]string, error) {
-	filters := [][]interface{}{{"name", "^", pool + "/"}}
+// queryDatasetOrigins returns dataset name → origin (empty for non-clones) for
+// datasets below the configured CSI parent, using the projected origin property.
+func (c *Client) queryDatasetOrigins(ctx context.Context, parent string) (map[string]string, error) {
+	filters := [][]interface{}{{"name", "^", strings.TrimSuffix(parent, "/") + "/"}}
 	options := map[string]interface{}{
 		"extra": map[string]interface{}{
 			"properties": []string{"origin"},
@@ -398,7 +400,11 @@ func (c *Client) GetPoolAvailable(ctx context.Context, poolName string) (int64, 
 				if vdevMap, ok := vdev.(map[string]interface{}); ok {
 					if stats, ok := vdevMap["stats"].(map[string]interface{}); ok {
 						if free, ok := stats["free"].(float64); ok {
-							totalAvail += int64(free)
+							freeBytes, valid := nonNegativeInt64FromFloat(free)
+							if !valid || freeBytes > math.MaxInt64-totalAvail {
+								return 0, fmt.Errorf("pool available space is outside the int64 range")
+							}
+							totalAvail += freeBytes
 						}
 					}
 				}
@@ -414,7 +420,10 @@ func (c *Client) GetPoolAvailable(ctx context.Context, poolName string) (int64, 
 	}
 
 	if avail, ok := ds.Available.Parsed.(float64); ok {
-		return int64(avail), nil
+		if availableBytes, valid := nonNegativeInt64FromFloat(avail); valid {
+			return availableBytes, nil
+		}
+		return 0, fmt.Errorf("pool available space is outside the int64 range")
 	}
 
 	return 0, fmt.Errorf("unable to determine pool available space")
