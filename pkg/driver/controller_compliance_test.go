@@ -112,6 +112,99 @@ func TestCreateVolumeExistingVolumeCompatibility(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeRejectsExistingBlockProtocolMismatch(t *testing.T) {
+	tests := []struct {
+		name              string
+		requestedProtocol string
+		storedProperty    string
+		storedProtocol    string
+	}{
+		{
+			name:              "existing iSCSI volume rejects NVMe-oF request",
+			requestedProtocol: "nvmeof",
+			storedProperty:    PropISCSITargetExtentID,
+			storedProtocol:    "iscsi",
+		},
+		{
+			name:              "existing NVMe-oF volume rejects iSCSI request",
+			requestedProtocol: "iscsi",
+			storedProperty:    PropNVMeoFNamespaceID,
+			storedProtocol:    "nvmeof",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockClient := truenas.NewMockClient()
+			mockClient.Datasets["pool/parent/existing-volume"] = &truenas.Dataset{
+				ID:      "pool/parent/existing-volume",
+				Name:    "pool/parent/existing-volume",
+				Type:    "VOLUME",
+				Volsize: truenas.DatasetProperty{Parsed: float64(testGiB)},
+				UserProperties: map[string]truenas.UserProperty{
+					tc.storedProperty: {Value: "42"},
+				},
+			}
+			driver := newComplianceTestDriver(mockClient)
+
+			_, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+				Name:               "existing-volume",
+				Parameters:         map[string]string{"protocol": tc.requestedProtocol},
+				VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+				CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			})
+
+			require.Error(t, err)
+			assert.Equal(t, codes.AlreadyExists, status.Code(err))
+			assert.Contains(t, err.Error(), "protocol "+tc.storedProtocol)
+			assert.Contains(t, err.Error(), "requested "+tc.requestedProtocol)
+		})
+	}
+}
+
+func TestCreateVolumeExistingBlockProtocolMatchIsIdempotent(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+	}{
+		{name: "iSCSI on iSCSI", protocol: "iscsi"},
+		{name: "NVMe-oF on NVMe-oF", protocol: "nvmeof"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mockClient := truenas.NewMockClient()
+			driver := newComplianceTestDriver(mockClient)
+			driver.config.ISCSI.TargetPortal = "192.0.2.10:3260"
+			driver.config.NVMeoF = NVMeoFConfig{
+				Transport:             "TCP",
+				TransportAddress:      "192.0.2.20",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: true,
+			}
+			driver.serviceReloadDebouncer = NewServiceReloadDebouncer(0, func(context.Context, string) error {
+				return nil
+			})
+			t.Cleanup(driver.serviceReloadDebouncer.Stop)
+
+			request := &csi.CreateVolumeRequest{
+				Name:               "existing-block-volume",
+				Parameters:         map[string]string{"protocol": tc.protocol},
+				VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+				CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			}
+			created, err := driver.CreateVolume(ctx, request)
+			require.NoError(t, err)
+
+			retry, err := driver.CreateVolume(ctx, request)
+			require.NoError(t, err)
+			assert.Equal(t, created.GetVolume().GetVolumeId(), retry.GetVolume().GetVolumeId())
+			assert.Equal(t, testGiB, retry.GetVolume().GetCapacityBytes())
+		})
+	}
+}
+
 func TestCreateVolumeRejectsUnknownExplicitProtocol(t *testing.T) {
 	driver := newComplianceTestDriver(truenas.NewMockClient())
 
@@ -157,6 +250,121 @@ func TestValidateVolumeCapabilitiesRejectsMultiNodeForBlockVolume(t *testing.T) 
 	require.NoError(t, err)
 	assert.Nil(t, response.Confirmed)
 	assert.Contains(t, response.Message, "requires NFS")
+}
+
+func TestValidateVolumeCapabilitiesRejectsBlockAccessTypeForFilesystem(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	mockClient.Datasets["pool/parent/nfs-volume"] = &truenas.Dataset{
+		ID:             "pool/parent/nfs-volume",
+		Name:           "pool/parent/nfs-volume",
+		Type:           "FILESYSTEM",
+		UserProperties: make(map[string]truenas.UserProperty),
+	}
+	driver := newComplianceTestDriver(mockClient)
+
+	response, err := driver.ValidateVolumeCapabilities(context.Background(), &csi.ValidateVolumeCapabilitiesRequest{
+		VolumeId: "nfs-volume",
+		VolumeCapabilities: []*csi.VolumeCapability{{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		}},
+	})
+
+	require.NoError(t, err)
+	assert.Nil(t, response.Confirmed)
+	assert.Contains(t, response.Message, "block access type")
+	assert.Contains(t, response.Message, "filesystem")
+}
+
+func TestCreateVolumeExistingResponseIncludesAccessibleTopology(t *testing.T) {
+	ctx := context.Background()
+	mockClient := truenas.NewMockClient()
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/existing-volume", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	driver := newComplianceTestDriver(mockClient)
+	driver.config.ZFS.DatasetEnableQuotas = true
+	driver.config.Node.Topology = TopologyConfig{Enabled: true, Zone: "zone-a", Region: "region-a"}
+
+	response, err := driver.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "existing-volume",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, response.GetVolume().GetAccessibleTopology(), 1)
+	assert.Equal(t, "zone-a", response.GetVolume().GetAccessibleTopology()[0].GetSegments()["topology.kubernetes.io/zone"])
+	assert.Equal(t, "region-a", response.GetVolume().GetAccessibleTopology()[0].GetSegments()["topology.kubernetes.io/region"])
+}
+
+func TestCreateVolumeQuotaLessNFSUsesStoredRequestedCapacity(t *testing.T) {
+	ctx := context.Background()
+	mockClient := truenas.NewMockClient()
+	driver := newComplianceTestDriver(mockClient)
+	requested := 2 * testGiB
+	request := &csi.CreateVolumeRequest{
+		Name:               "quota-less-volume",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: requested, LimitBytes: requested},
+	}
+
+	response, err := driver.CreateVolume(ctx, request)
+	require.NoError(t, err)
+	assert.Equal(t, requested, response.GetVolume().GetCapacityBytes())
+	dataset, err := mockClient.DatasetGet(ctx, "pool/parent/quota-less-volume")
+	require.NoError(t, err)
+	assert.Equal(t, "2147483648", datasetUserProperty(dataset, PropRequestedSizeBytes))
+	dataset.Available = truenas.DatasetProperty{Parsed: float64(100 * testGiB)}
+	assert.Equal(t, requested, driver.getDatasetCapacity(dataset))
+
+	retryResponse, err := driver.CreateVolume(ctx, request)
+	require.NoError(t, err, "pool availability must not violate the original volume capacity limit")
+	assert.Equal(t, requested, retryResponse.GetVolume().GetCapacityBytes())
+}
+
+func TestControllerExpandVolumeQuotaLessNFSUpdatesStoredRequestedCapacity(t *testing.T) {
+	ctx := context.Background()
+	mockClient := truenas.NewMockClient()
+	driver := newComplianceTestDriver(mockClient)
+
+	createRequest := &csi.CreateVolumeRequest{
+		Name:               "quota-less-expand-volume",
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 * testGiB},
+	}
+	_, err := driver.CreateVolume(ctx, createRequest)
+	require.NoError(t, err)
+
+	expandResponse, err := driver.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+		VolumeId:      createRequest.Name,
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 * testGiB},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 5*testGiB, expandResponse.GetCapacityBytes())
+	assert.False(t, expandResponse.GetNodeExpansionRequired())
+
+	getResponse, err := driver.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: createRequest.Name})
+	require.NoError(t, err)
+	assert.Equal(t, 5*testGiB, getResponse.GetVolume().GetCapacityBytes())
+	repeatExpandResponse, err := driver.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+		VolumeId:      createRequest.Name,
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 * testGiB},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 5*testGiB, repeatExpandResponse.GetCapacityBytes())
+	assert.False(t, repeatExpandResponse.GetNodeExpansionRequired())
+
+	dataset, err := mockClient.DatasetGet(ctx, "pool/parent/"+createRequest.Name)
+	require.NoError(t, err)
+	assert.Equal(t, "5368709120", datasetUserProperty(dataset, PropRequestedSizeBytes))
+
+	createRequest.CapacityRange = &csi.CapacityRange{RequiredBytes: 5 * testGiB}
+	retryResponse, err := driver.CreateVolume(ctx, createRequest)
+	require.NoError(t, err)
+	assert.Equal(t, 5*testGiB, retryResponse.GetVolume().GetCapacityBytes())
 }
 
 func TestValidateVolumeCapabilitiesDatasetErrors(t *testing.T) {
@@ -503,4 +711,20 @@ func TestControllerGetVolumeDatasetErrors(t *testing.T) {
 		require.Error(t, err)
 		assert.Equal(t, codes.Internal, status.Code(err))
 	})
+}
+
+func TestControllerGetVolumeOmitsUnadvertisedVolumeCondition(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	mockClient.Datasets["pool/parent/volume"] = &truenas.Dataset{
+		ID:             "pool/parent/volume",
+		Name:           "pool/parent/volume",
+		Type:           "FILESYSTEM",
+		UserProperties: make(map[string]truenas.UserProperty),
+	}
+	driver := newComplianceTestDriver(mockClient)
+
+	response, err := driver.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: "volume"})
+
+	require.NoError(t, err)
+	assert.Nil(t, response.GetStatus())
 }

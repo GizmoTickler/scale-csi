@@ -630,8 +630,15 @@ func (c *Client) SnapshotClone(ctx context.Context, snapshotID, newDatasetName s
 
 	_, err := c.Call(ctx, c.snapshotMethod(ctx, "clone"), params)
 	if err != nil {
-		// Ignore "already exists" errors
 		if strings.Contains(err.Error(), "already exists") {
+			existing, getErr := c.DatasetGet(ctx, newDatasetName)
+			if getErr != nil {
+				return fmt.Errorf("clone destination %s already exists but its origin could not be verified: %w", newDatasetName, getErr)
+			}
+			existingOrigin := datasetPropertyString(existing.Origin)
+			if existingOrigin != snapshotID {
+				return fmt.Errorf("clone destination %s already exists with origin %q, requested origin %q", newDatasetName, existingOrigin, snapshotID)
+			}
 			return nil
 		}
 		return fmt.Errorf("failed to clone snapshot: %w", err)

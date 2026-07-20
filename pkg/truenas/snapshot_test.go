@@ -1425,6 +1425,16 @@ func TestSnapshotClone_AlreadyExists(t *testing.T) {
 					Code:    -1,
 					Message: "dataset already exists",
 				}
+			case "pool.dataset.query":
+				resp.Result = []interface{}{map[string]interface{}{
+					"id":   "tank/k8s/volumes/pvc-existing",
+					"name": "tank/k8s/volumes/pvc-existing",
+					"origin": map[string]interface{}{
+						"value":    "tank/k8s/volumes/pvc-source@snap",
+						"rawvalue": "tank/k8s/volumes/pvc-source@snap",
+						"parsed":   "tank/k8s/volumes/pvc-source@snap",
+					},
+				}}
 			default:
 				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
 			}
@@ -1460,6 +1470,52 @@ func TestSnapshotClone_AlreadyExists(t *testing.T) {
 	// Should succeed - idempotent
 	err = client.SnapshotClone(ctx, "tank/k8s/volumes/pvc-source@snap", "tank/k8s/volumes/pvc-existing")
 	assert.NoError(t, err)
+}
+
+func TestSnapshotCloneAlreadyExistsWithDifferentOriginFails(t *testing.T) {
+	resetSnapshotAPIPrefix()
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case "pool.snapshot.clone":
+				resp.Error = &rpcError{Code: -1, Message: "dataset already exists"}
+			case "pool.dataset.query":
+				resp.Result = []interface{}{map[string]interface{}{
+					"id":   "tank/k8s/volumes/pvc-existing",
+					"name": "tank/k8s/volumes/pvc-existing",
+					"origin": map[string]interface{}{
+						"value":    "tank/k8s/volumes/other-source@other-snap",
+						"rawvalue": "tank/k8s/volumes/other-source@other-snap",
+						"parsed":   "tank/k8s/volumes/other-source@other-snap",
+					},
+				}}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	err := client.SnapshotClone(context.Background(), "tank/k8s/volumes/pvc-source@snap", "tank/k8s/volumes/pvc-existing")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists with origin")
+	assert.Contains(t, err.Error(), "other-source@other-snap")
+	assert.Contains(t, err.Error(), "pvc-source@snap")
 }
 
 // TestSnapshotRollback_Success tests rolling back to a snapshot
