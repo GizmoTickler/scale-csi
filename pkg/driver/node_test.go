@@ -1009,7 +1009,7 @@ func TestBlockBackedFilesystemStagePassesNormalizedMountFlags(t *testing.T) {
 	})
 }
 
-func TestNodeStageVolumeNFSXFSIncludesNouuid(t *testing.T) {
+func TestNodeStageVolumeNFSXFSExcludesNouuid(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt", "mount")
 	logPath := filepath.Join(t.TempDir(), "commands.log")
 	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
@@ -1031,7 +1031,9 @@ func TestNodeStageVolumeNFSXFSIncludesNouuid(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Contains(t, readNodeCommandLog(t, logPath), "mount -t nfs -o nfsvers=4,noatime,nouuid 192.0.2.30:/mnt/pool/clone")
+	log := readNodeCommandLog(t, logPath)
+	assert.Contains(t, log, "mount -t nfs -o nfsvers=4,noatime 192.0.2.30:/mnt/pool/clone")
+	assert.NotContains(t, log, "nouuid")
 }
 
 func TestStageISCSIVolumeRejectsMultipathOwnedDeviceBeforeMount(t *testing.T) {
@@ -1582,6 +1584,8 @@ func TestCleanupOrphanedISCSISessionUsesProtocolShareName(t *testing.T) {
 	d.config.ISCSI.NameSuffix = "-cluster"
 	volumeID := strings.Repeat("Long_Volume_Name!", 8)
 	targetName := d.iscsiShareName(volumeID)
+	assert.Equal(t, protocolShareName(volumeID+d.config.ISCSI.NameSuffix), targetName)
+	assert.NotContains(t, targetName, d.config.ISCSI.NamePrefix)
 	iqn := "iqn.2005-10.org.freenas.ctl:" + targetName
 	t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 "+iqn+" (non-flash)\n")
 

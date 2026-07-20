@@ -415,6 +415,7 @@ func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
 				"primarycache":      "metadata",
 				"copies":            "2",
 				"dedup":             "verify",
+				"readonly":          "off",
 				"org.truenas:owner": "storage-team",
 				"unknown":           "ignored",
 			},
@@ -434,9 +435,37 @@ func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
 	assert.Equal(t, "METADATA", params.Primarycache)
 	assert.Equal(t, 2, params.Copies)
 	assert.Equal(t, "VERIFY", params.Deduplication)
+	assert.Equal(t, "OFF", params.Readonly)
 	assert.Equal(t, 2*testGiB, params.Refquota)
 	assert.Equal(t, 2*testGiB, params.Refreservation)
 	assert.Equal(t, []truenas.UserPropertyUpdate{{Key: "org.truenas:owner", Value: "storage-team"}}, params.UserProperties)
+}
+
+func TestCreateDatasetZvolSkipsFilesystemOnlyProperties(t *testing.T) {
+	client := &datasetCreateCaptureMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{ZFS: ZFSConfig{
+			DatasetProperties: map[string]string{
+				"compression":  "zstd",
+				"recordsize":   "128k",
+				"atime":        "off",
+				"readonly":     "on",
+				"volblocksize": "64k",
+			},
+		}},
+		truenasClient: client,
+	}
+
+	_, err := d.createDataset(context.Background(), "pool/parent/zvol", 2*testGiB, ShareTypeISCSI)
+	require.NoError(t, err)
+	require.Len(t, client.params, 1)
+	params := client.params[0]
+	assert.Equal(t, "VOLUME", params.Type)
+	assert.Equal(t, "ZSTD", params.Compression)
+	assert.Equal(t, "ON", params.Readonly)
+	assert.Equal(t, "64K", params.Volblocksize)
+	assert.Empty(t, params.Recordsize)
+	assert.Empty(t, params.Atime)
 }
 
 func TestCreateDatasetZvolReservation(t *testing.T) {

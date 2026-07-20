@@ -631,9 +631,43 @@ func TestCreateISCSIShare_TargetCreation_Success(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify resources were created
-	target, err := mockClient.ISCSITargetFindByName(ctx, "csi-test-iscsi-create")
+	target, err := mockClient.ISCSITargetFindByName(ctx, "test-iscsi-create")
 	assert.NoError(t, err)
 	assert.NotNil(t, target)
+}
+
+func TestCreateISCSIShareNameCompatibility(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{ZvolReadyTimeout: 5},
+			ISCSI: ISCSIConfig{
+				NamePrefix:   "must-not-be-used-",
+				NameSuffix:   "-cluster",
+				TargetGroups: []ISCSITargetGroup{{Portal: 1, Initiator: 1, AuthMethod: "NONE"}},
+			},
+		},
+		truenasClient: mockClient,
+		serviceReloadDebouncer: NewServiceReloadDebouncer(time.Nanosecond, func(context.Context, string) error {
+			return nil
+		}),
+	}
+	ctx := context.Background()
+	const volumeID = "pvc-12345678-1234-1234-1234-123456789abc"
+	datasetName := "tank/k8s/volumes/" + volumeID
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "VOLUME", Volsize: 1024 * 1024 * 1024,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, d.createISCSIShare(ctx, datasetName, volumeID))
+	const expectedName = "pvc-12345678-1234-1234-1234-123456789abc-cluster"
+	target, err := mockClient.ISCSITargetFindByName(ctx, expectedName)
+	require.NoError(t, err)
+	assert.Equal(t, expectedName, target.Name)
+	extent, err := mockClient.ISCSIExtentFindByName(ctx, expectedName)
+	require.NoError(t, err)
+	assert.Equal(t, expectedName, extent.Name)
 }
 
 func TestCreateISCSIShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testing.T) {

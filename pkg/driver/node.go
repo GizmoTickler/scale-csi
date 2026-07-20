@@ -783,7 +783,7 @@ func sessionTargetMatchesExpected(actual, expected string) bool {
 }
 
 func (d *Driver) iscsiShareName(volumeID string) string {
-	return protocolShareName(d.config.ISCSI.NamePrefix + volumeID + d.config.ISCSI.NameSuffix)
+	return protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
 }
 
 func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capacityBytes int64) (int64, error) {
@@ -902,11 +902,7 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 	}
 
 	// Mount NFS
-	fsType := ""
-	if volCap != nil && volCap.GetMount() != nil {
-		fsType = strings.ToLower(volCap.GetMount().GetFsType())
-	}
-	if err := util.MountNFS(source, stagingPath, volumeMountFlagsForFS(volCap, fsType)); err != nil {
+	if err := util.MountNFS(source, stagingPath, volumeMountFlags(volCap)); err != nil {
 		RecordNodeConnect("nfs", "error")
 		operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSMountFailed, operationErr.Error())

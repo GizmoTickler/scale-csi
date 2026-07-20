@@ -1711,7 +1711,6 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 	params := &truenas.DatasetCreateParams{
 		Name: datasetName,
 	}
-	d.applyDatasetProperties(params)
 
 	if shareType == ShareTypeNFS {
 		// Create filesystem for NFS
@@ -1732,6 +1731,7 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 			params.Refreservation = capacityBytes
 		}
 	}
+	d.applyDatasetProperties(params)
 
 	ds, err := d.truenasClient.DatasetCreate(ctx, params)
 	if err != nil {
@@ -1751,7 +1751,17 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 	for _, rawKey := range keys {
 		key := strings.TrimSpace(rawKey)
 		value := strings.TrimSpace(properties[rawKey])
-		switch strings.ToLower(key) {
+		normalizedKey := strings.ToLower(key)
+		if params.Type == "VOLUME" && (normalizedKey == "atime" || normalizedKey == "recordsize") {
+			klog.Warningf("Ignoring filesystem-only zfs.datasetProperties key %q for VOLUME dataset %s", rawKey, params.Name)
+			continue
+		}
+		if params.Type == "FILESYSTEM" && normalizedKey == "volblocksize" {
+			klog.Warningf("Ignoring volume-only zfs.datasetProperties key %q for FILESYSTEM dataset %s", rawKey, params.Name)
+			continue
+		}
+
+		switch normalizedKey {
 		case "compression":
 			params.Compression = strings.ToUpper(value)
 		case "sync":
@@ -1766,6 +1776,14 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 			params.Primarycache = strings.ToUpper(value)
 		case "dedup":
 			params.Deduplication = strings.ToUpper(value)
+		case "readonly":
+			params.Readonly = strings.ToUpper(value)
+		case "volblocksize":
+			if params.Volblocksize != "" {
+				klog.Warningf("Ignoring zfs.datasetProperties volblocksize value %q for %s because zfs.zvolBlocksize is %q", value, params.Name, params.Volblocksize)
+				continue
+			}
+			params.Volblocksize = strings.ToUpper(value)
 		case "copies":
 			copies, err := strconv.Atoi(value)
 			if err != nil || copies < 1 {
