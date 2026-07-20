@@ -170,6 +170,11 @@ zfs:
   # Dataset quota enforcement
   enforceQuota: true
 
+  # Create independent volumes from snapshots using a local ZFS send/receive.
+  # Keep false to preserve the existing ZFS clone behavior. Volume-source
+  # copies remain clones regardless of this setting.
+  detachedVolumesFromSnapshots: false
+
   # Timeout in seconds for waiting for a zvol to be ready after cloning
   # Increase this for slow systems, heavily loaded TrueNAS, or large clones
   # (default: 60 seconds)

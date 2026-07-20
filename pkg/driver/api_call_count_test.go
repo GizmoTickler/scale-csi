@@ -204,6 +204,16 @@ func (c *apiCallCountingClient) SnapshotClone(ctx context.Context, snapshotID, n
 	return c.MockClient.SnapshotClone(ctx, snapshotID, newDatasetName)
 }
 
+func (c *apiCallCountingClient) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) error {
+	c.record("CopyDatasetFromSnapshotLocal")
+	return c.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
+}
+
+func (c *apiCallCountingClient) DestroyReplicatedTargetSnapshot(ctx context.Context, targetDataset, snapshotShortName string) error {
+	c.record("DestroyReplicatedTargetSnapshot")
+	return c.MockClient.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName)
+}
+
 func (c *apiCallCountingClient) SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error {
 	c.record("SnapshotRollback")
 	return c.MockClient.SnapshotRollback(ctx, snapshotID, force, recursive, recursiveClones)

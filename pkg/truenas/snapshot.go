@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -644,6 +646,141 @@ func (c *Client) SnapshotClone(ctx context.Context, snapshotID, newDatasetName s
 		return fmt.Errorf("failed to clone snapshot: %w", err)
 	}
 
+	return nil
+}
+
+const replicationJobPollInterval = 500 * time.Millisecond
+
+// CopyDatasetFromSnapshotLocal creates an independent dataset with a local ZFS
+// send/receive, then removes the replicated snapshot from the destination.
+func (c *Client) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) error {
+	params := map[string]interface{}{
+		"direction":         "PUSH",
+		"transport":         "LOCAL",
+		"source_datasets":   []string{sourceDataset},
+		"target_dataset":    targetDataset,
+		"recursive":         false,
+		"replicate":         false,
+		"name_regex":        "^" + regexp.QuoteMeta(snapshotShortName) + "$",
+		"retention_policy":  "NONE",
+		"readonly":          "IGNORE",
+		"only_from_scratch": true,
+	}
+
+	result, err := c.Call(ctx, "replication.run_onetime", params)
+	if err != nil {
+		if IsAlreadyExistsError(err) && c.localCopyTargetExists(ctx, targetDataset) {
+			klog.Infof("Local snapshot copy target %s already exists; continuing idempotently", targetDataset)
+			return c.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName)
+		}
+		return fmt.Errorf("failed to start local snapshot copy: %w", err)
+	}
+
+	jobID, err := replicationJobID(result)
+	if err != nil {
+		return fmt.Errorf("failed to start local snapshot copy: %w", err)
+	}
+	if err := c.waitForJob(ctx, jobID); err != nil {
+		// only_from_scratch reports an existing target through the asynchronous
+		// job. A previous successful request may have completed before its caller
+		// observed the response, so existence is the idempotency boundary.
+		var terminalErr *jobTerminalError
+		if errors.As(err, &terminalErr) && IsAlreadyExistsError(err) && c.localCopyTargetExists(ctx, targetDataset) {
+			klog.Infof("Local snapshot copy target %s already exists after job %d; continuing idempotently", targetDataset, jobID)
+			return c.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName)
+		}
+		return fmt.Errorf("local snapshot copy job %d failed: %w", jobID, err)
+	}
+
+	return c.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName)
+}
+
+type jobTerminalError struct {
+	state  string
+	detail string
+}
+
+func (e *jobTerminalError) Error() string {
+	return fmt.Sprintf("job entered state %s: %s", e.state, e.detail)
+}
+
+func replicationJobID(result interface{}) (int64, error) {
+	switch value := result.(type) {
+	case float64:
+		jobID, valid := nonNegativeInt64FromFloat(value)
+		if !valid || math.Trunc(value) != value {
+			return 0, fmt.Errorf("unexpected replication job id %v", value)
+		}
+		return jobID, nil
+	case int:
+		if value < 0 {
+			return 0, fmt.Errorf("unexpected replication job id %d", value)
+		}
+		return int64(value), nil
+	case int64:
+		if value < 0 {
+			return 0, fmt.Errorf("unexpected replication job id %d", value)
+		}
+		return value, nil
+	default:
+		return 0, fmt.Errorf("unexpected replication job id type %T", result)
+	}
+}
+
+func (c *Client) waitForJob(ctx context.Context, jobID int64) error {
+	filters := [][]interface{}{{"id", "=", jobID}}
+	for {
+		result, err := c.Call(ctx, "core.get_jobs", filters)
+		if err != nil {
+			return fmt.Errorf("failed to query job: %w", err)
+		}
+		jobs, ok := result.([]interface{})
+		if !ok {
+			return fmt.Errorf("unexpected core.get_jobs response type %T", result)
+		}
+		if len(jobs) > 0 {
+			job, ok := jobs[0].(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("unexpected job response type %T", jobs[0])
+			}
+			state, _ := job["state"].(string)
+			switch strings.ToUpper(state) {
+			case "SUCCESS":
+				return nil
+			case "FAILED", "ABORTED", "CANCELED":
+				detail := "no error detail"
+				if message, ok := job["error"].(string); ok && message != "" {
+					detail = message
+				} else if exception, ok := job["exception"].(string); ok && exception != "" {
+					detail = exception
+				}
+				return &jobTerminalError{state: state, detail: detail}
+			}
+		}
+
+		timer := time.NewTimer(replicationJobPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("context ended while waiting for job: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Client) localCopyTargetExists(ctx context.Context, targetDataset string) bool {
+	exists, err := c.DatasetExists(ctx, targetDataset)
+	return err == nil && exists
+}
+
+// DestroyReplicatedTargetSnapshot removes the snapshot transferred to the
+// destination by a local replication copy. The operation is idempotent.
+func (c *Client) DestroyReplicatedTargetSnapshot(ctx context.Context, targetDataset, snapshotShortName string) error {
+	targetSnapshot := targetDataset + "@" + snapshotShortName
+	_, err := c.Call(ctx, "zfs.resource.snapshot.destroy", map[string]interface{}{"path": targetSnapshot})
+	if err != nil && !IsNotFoundError(err) {
+		return fmt.Errorf("failed to remove replicated target snapshot %s: %w", targetSnapshot, err)
+	}
 	return nil
 }
 

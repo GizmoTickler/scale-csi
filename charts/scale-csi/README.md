@@ -50,6 +50,7 @@ used, that Secret must contain an `api-key` key.
 |---|---|---|
 | `zfs.parentDataset` | Parent dataset for volumes (required; the driver refuses to start without it) | `""` |
 | `zfs.enforceQuota` | Enable dataset quotas | `true` |
+| `zfs.detachedVolumesFromSnapshots` | Create independent local send/receive copies from snapshots; volume-source copies remain clones | `false` |
 | `zfs.zvolBlocksize` | Block size for zvols | `16K` |
 | `zfs.zvolEnableReservation` | Thick-provision zvols with a full refreservation | `false` |
 | `zfs.zvolReadyTimeout` | Zvol readiness timeout in seconds | `60` |

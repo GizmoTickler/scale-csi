@@ -94,6 +94,31 @@ nfs:
 	assert.False(t, cfg.ZFS.DatasetEnableQuotas, "an explicit false must override the default")
 }
 
+func TestLoadConfigDetachedVolumesFromSnapshotsDefaultsOff(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.False(t, cfg.ZFS.DetachedVolumesFromSnapshots)
+
+	cfg, err = loadTestConfig(t, `
+driver: csi.scale.io
+truenas:
+  host: truenas.example.test
+  apiKey: test-key
+zfs:
+  datasetParentName: tank/csi
+  detachedVolumesFromSnapshots: true
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.True(t, cfg.ZFS.DetachedVolumesFromSnapshots)
+}
+
 func TestLoadConfigCustomCATrust(t *testing.T) {
 	cfg, err := loadTestConfig(t, `
 driver: csi.scale.io

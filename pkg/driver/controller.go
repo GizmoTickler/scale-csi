@@ -366,6 +366,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s exists with protocol %s, requested %s", volumeID, ShareTypeNVMeoF, shareType)
 		}
+		if snapshot := req.GetVolumeContentSource().GetSnapshot(); d.config.ZFS.DetachedVolumesFromSnapshots && snapshot != nil {
+			existingDS, err = d.prepareDetachedSnapshotCopy(
+				ctx, datasetName, existingDS, name, snapshot.GetSnapshotId(), snapshot.GetSnapshotId(), capacityBytes, shareType,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
 
 		existingCapacity := d.getDatasetCapacity(existingDS)
 		if existingCapacity > 0 {
@@ -396,10 +404,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			switch {
 			case contentSource.GetSnapshot() != nil:
 				snapshotID := contentSource.GetSnapshot().GetSnapshotId()
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceType); value == "" || value == "-" {
+				if value := datasetUserProperty(existingDS, PropVolumeContentSourceType); d.config.ZFS.DetachedVolumesFromSnapshots || value == "" || value == "-" {
 					propertyUpdates[PropVolumeContentSourceType] = "snapshot"
 				}
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceID); value == "" || value == "-" {
+				if value := datasetUserProperty(existingDS, PropVolumeContentSourceID); d.config.ZFS.DetachedVolumesFromSnapshots || value == "" || value == "-" {
 					propertyUpdates[PropVolumeContentSourceID] = snapshotID
 				}
 			case contentSource.GetVolume() != nil:
@@ -417,6 +425,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 						propertyUpdates[PropVolumeOriginSnapshot] = originSnapshotID
 					}
 				}
+			}
+		}
+		if d.config.ZFS.DetachedVolumesFromSnapshots &&
+			req.GetVolumeContentSource().GetSnapshot() != nil &&
+			shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
+			requestedSize := strconv.FormatInt(capacityBytes, 10)
+			if datasetUserProperty(existingDS, PropRequestedSizeBytes) != requestedSize {
+				propertyUpdates[PropRequestedSizeBytes] = requestedSize
 			}
 		}
 		if waitErr := d.setDatasetUserProperties(ctx, existingDS, datasetName, propertyUpdates); waitErr != nil {
@@ -457,7 +473,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
 		var srcErr error
-		createdDS, srcErr = d.handleVolumeContentSource(ctx, datasetName, contentSource, capacityBytes)
+		createdDS, srcErr = d.handleVolumeContentSource(ctx, datasetName, name, contentSource, capacityBytes, shareType)
 		if srcErr != nil {
 			return nil, srcErr
 		}
@@ -1806,13 +1822,14 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 	}
 }
 
-func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName string, source *csi.VolumeContentSource, capacityBytes int64) (*truenas.Dataset, error) {
+func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, volumeName string, source *csi.VolumeContentSource, capacityBytes int64, shareType ShareType) (*truenas.Dataset, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
 	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
 	var createdDS *truenas.Dataset
 
 	if snapshot := source.GetSnapshot(); snapshot != nil {
-		// Clone from snapshot
+		// Create from snapshot using either the legacy clone or the gated
+		// independent local send/receive path.
 		snapshotID := snapshot.GetSnapshotId()
 		if _, err := d.datasetForID(snapshotID); err != nil {
 			return nil, err
@@ -1830,30 +1847,52 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName stri
 		}
 
 		sourceSnapshot := snap.ID
-		klog.V(4).Infof("Found snapshot %s for cloning", sourceSnapshot)
+		if d.config.ZFS.DetachedVolumesFromSnapshots {
+			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
+			if copyErr := d.truenasClient.CopyDatasetFromSnapshotLocal(ctx, snap.Dataset, snap.Name, datasetName); copyErr != nil {
+				d.cleanupFailedClone(ctx, datasetName, "")
+				return nil, status.Errorf(codes.Internal, "failed to copy snapshot into an independent volume: %v", copyErr)
+			}
+			klog.Infof("Independent snapshot copy created: %s -> %s", sourceSnapshot, datasetName)
+		} else {
+			klog.V(4).Infof("Found snapshot %s for cloning", sourceSnapshot)
 
-		if cloneErr := d.truenasClient.SnapshotClone(ctx, sourceSnapshot, datasetName); cloneErr != nil {
-			return nil, status.Errorf(codes.Internal, "failed to clone snapshot: %v", cloneErr)
+			if cloneErr := d.truenasClient.SnapshotClone(ctx, sourceSnapshot, datasetName); cloneErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to clone snapshot: %v", cloneErr)
+			}
+			klog.Infof("Snapshot clone created: %s -> %s", sourceSnapshot, datasetName)
 		}
-		klog.Infof("Snapshot clone created: %s -> %s", sourceSnapshot, datasetName)
 
-		// Wait for cloned dataset to be ready before proceeding
+		// Wait for the new dataset to be ready before proceeding.
 		// This is critical for iSCSI/NVMe-oF where extent creation needs the zvol
 		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
 			d.cleanupFailedClone(ctx, datasetName, "")
+			if d.config.ZFS.DetachedVolumesFromSnapshots {
+				return nil, status.Errorf(codes.Internal, "failed waiting for detached snapshot copy to become ready: %v", err)
+			}
 			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
 		}
-		if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
-			d.cleanupFailedClone(ctx, datasetName, "")
-			return nil, err
-		}
+		if d.config.ZFS.DetachedVolumesFromSnapshots {
+			createdDS, err = d.prepareDetachedSnapshotCopy(
+				ctx, datasetName, createdDS, volumeName, snapshotID, snap.Name, capacityBytes, shareType,
+			)
+			if err != nil {
+				d.cleanupFailedClone(ctx, datasetName, "")
+				return nil, err
+			}
+		} else {
+			if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
+				d.cleanupFailedClone(ctx, datasetName, "")
+				return nil, err
+			}
 
-		if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
-			PropVolumeContentSourceType: "snapshot",
-			PropVolumeContentSourceID:   snapshotID,
-		}); err != nil {
-			klog.Warningf("Failed to set content source properties for snapshot clone: %v", err)
+			if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+				PropVolumeContentSourceType: "snapshot",
+				PropVolumeContentSourceID:   snapshotID,
+			}); err != nil {
+				klog.Warningf("Failed to set content source properties for snapshot clone: %v", err)
+			}
 		}
 
 	} else if volume := source.GetVolume(); volume != nil {
@@ -1927,6 +1966,157 @@ func (d *Driver) cleanupFailedClone(ctx context.Context, datasetName, tempSnapsh
 			klog.Warningf("Failed to cleanup temporary clone-source snapshot %s: %v", tempSnapshotID, err)
 		}
 	}
+}
+
+func (d *Driver) prepareDetachedSnapshotCopy(
+	ctx context.Context,
+	datasetName string,
+	ds *truenas.Dataset,
+	volumeName string,
+	snapshotID string,
+	snapshotShortName string,
+	capacityBytes int64,
+	shareType ShareType,
+) (*truenas.Dataset, error) {
+	if err := d.truenasClient.DestroyReplicatedTargetSnapshot(ctx, datasetName, snapshotShortName); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to remove transferred snapshot from detached copy: %v", err)
+	}
+
+	if err := d.ensureCloneCapacity(ctx, datasetName, ds, capacityBytes); err != nil {
+		return nil, err
+	}
+
+	// Refresh after a possible expansion and use the target's actual properties,
+	// not the source values returned by the replication receive.
+	refreshed, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to verify detached snapshot copy: %v", err)
+	}
+
+	updates := &truenas.DatasetUpdateParams{}
+	needsUpdate := false
+	switch refreshed.Type {
+	case "VOLUME":
+		volsize := datasetPropertyBytes(refreshed.Volsize)
+		if volsize < capacityBytes {
+			return nil, status.Errorf(codes.Internal,
+				"detached snapshot copy has volsize %d bytes, less than requested %d bytes",
+				volsize, capacityBytes)
+		}
+		desiredRefreservation := int64(0)
+		if d.config.ZFS.ZvolEnableReservation {
+			desiredRefreservation = volsize
+		}
+		if datasetPropertyBytes(refreshed.Refreservation) != desiredRefreservation {
+			updates.Refreservation = desiredRefreservation
+			needsUpdate = true
+		}
+	case "FILESYSTEM":
+		desiredRefquota := int64(0)
+		if d.config.ZFS.DatasetEnableQuotas {
+			desiredRefquota = capacityBytes
+		}
+		if datasetPropertyBytes(refreshed.Refquota) != desiredRefquota {
+			updates.Refquota = desiredRefquota
+			needsUpdate = true
+		}
+		desiredRefreservation := int64(0)
+		if d.config.ZFS.DatasetEnableReservation {
+			desiredRefreservation = capacityBytes
+		}
+		if datasetPropertyBytes(refreshed.Refreservation) != desiredRefreservation {
+			updates.Refreservation = desiredRefreservation
+			needsUpdate = true
+		}
+	default:
+		return nil, status.Errorf(codes.Internal,
+			"detached snapshot copy %s has unsupported dataset type %q", datasetName, refreshed.Type)
+	}
+
+	if needsUpdate {
+		if _, updateErr := d.truenasClient.DatasetUpdate(ctx, datasetName, updates); updateErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to apply detached snapshot copy capacity properties: %v", updateErr)
+		}
+		refreshed, err = d.truenasClient.DatasetGet(ctx, datasetName)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to verify detached snapshot copy properties: %v", err)
+		}
+	}
+
+	switch refreshed.Type {
+	case "VOLUME":
+		volsize := datasetPropertyBytes(refreshed.Volsize)
+		desiredRefreservation := int64(0)
+		if d.config.ZFS.ZvolEnableReservation {
+			desiredRefreservation = volsize
+		}
+		if datasetPropertyBytes(refreshed.Refreservation) != desiredRefreservation {
+			return nil, status.Errorf(codes.Internal,
+				"detached snapshot copy has refreservation %d bytes, expected %d bytes",
+				datasetPropertyBytes(refreshed.Refreservation), desiredRefreservation)
+		}
+	case "FILESYSTEM":
+		desiredRefquota := int64(0)
+		if d.config.ZFS.DatasetEnableQuotas {
+			desiredRefquota = capacityBytes
+		}
+		desiredRefreservation := int64(0)
+		if d.config.ZFS.DatasetEnableReservation {
+			desiredRefreservation = capacityBytes
+		}
+		if datasetPropertyBytes(refreshed.Refquota) != desiredRefquota ||
+			datasetPropertyBytes(refreshed.Refreservation) != desiredRefreservation {
+			return nil, status.Errorf(codes.Internal,
+				"detached snapshot copy quota properties do not match the requested configuration")
+		}
+	}
+
+	// A replication receive inherits source user properties. Apply configured
+	// user properties first, then overwrite every volume identity field that
+	// belongs to the new CSI volume.
+	identityProperties := make(map[string]string)
+	for rawKey, rawValue := range d.config.ZFS.DatasetProperties {
+		key := strings.TrimSpace(rawKey)
+		if strings.Contains(key, ":") {
+			identityProperties[key] = strings.TrimSpace(rawValue)
+		}
+	}
+	identityProperties[PropCSIVolumeName] = volumeName
+	identityProperties[PropVolumeContentSourceType] = "snapshot"
+	identityProperties[PropVolumeContentSourceID] = snapshotID
+	identityProperties[PropVolumeOriginSnapshot] = "-"
+	// Share identifiers belong to the source dataset's TrueNAS database
+	// objects and must never drive the target's create/retry path.
+	identityProperties[PropNFSShareID] = "-"
+	identityProperties[PropISCSITargetID] = "-"
+	identityProperties[PropISCSIExtentID] = "-"
+	identityProperties[PropISCSITargetExtentID] = "-"
+	identityProperties[PropNVMeoFSubsystemID] = "-"
+	identityProperties[PropNVMeoFNamespaceID] = "-"
+	identityProperties[PropNVMeoFPortSubsysID] = "-"
+	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
+		identityProperties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
+	}
+	if err := d.setDatasetUserProperties(ctx, refreshed, datasetName, identityProperties); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to overwrite detached snapshot copy identity properties: %v", err)
+	}
+	return refreshed, nil
+}
+
+func datasetPropertyBytes(property truenas.DatasetProperty) int64 {
+	switch value := property.Parsed.(type) {
+	case float64:
+		return int64(value)
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	case uint64:
+		if value <= ^uint64(0)>>1 {
+			return int64(value)
+		}
+	}
+	return 0
 }
 
 func (d *Driver) ensureCloneCapacity(ctx context.Context, datasetName string, ds *truenas.Dataset, capacityBytes int64) error {

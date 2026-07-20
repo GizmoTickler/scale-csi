@@ -1519,6 +1519,132 @@ func TestSnapshotCloneAlreadyExistsWithDifferentOriginFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "pvc-source@snap")
 }
 
+func TestCopyDatasetFromSnapshotLocal(t *testing.T) {
+	mock := newMockWSServer()
+	replicationParams := make(chan []interface{}, 1)
+	jobParams := make(chan []interface{}, 1)
+	destroyParams := make(chan []interface{}, 1)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "replication.run_onetime":
+				replicationParams <- req.Params
+				resp.Result = 42
+			case "core.get_jobs":
+				jobParams <- req.Params
+				resp.Result = []interface{}{map[string]interface{}{
+					"id":    42,
+					"state": "SUCCESS",
+				}}
+			case "zfs.resource.snapshot.destroy":
+				destroyParams <- req.Params
+				resp.Result = true
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	err := client.CopyDatasetFromSnapshotLocal(
+		context.Background(),
+		"tank/k8s/volumes/source",
+		"snap.1",
+		"tank/k8s/volumes/target",
+	)
+	require.NoError(t, err)
+
+	params := <-replicationParams
+	require.Len(t, params, 1)
+	payload, ok := params[0].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "PUSH", payload["direction"])
+	assert.Equal(t, "LOCAL", payload["transport"])
+	assert.Equal(t, []interface{}{"tank/k8s/volumes/source"}, payload["source_datasets"])
+	assert.Equal(t, "tank/k8s/volumes/target", payload["target_dataset"])
+	assert.Equal(t, false, payload["recursive"])
+	assert.Equal(t, false, payload["replicate"])
+	assert.Equal(t, `^snap\.1$`, payload["name_regex"])
+	assert.Equal(t, "NONE", payload["retention_policy"])
+	assert.Equal(t, "IGNORE", payload["readonly"])
+	assert.Equal(t, true, payload["only_from_scratch"])
+
+	params = <-jobParams
+	require.Len(t, params, 1)
+	assert.Equal(t, []interface{}{[]interface{}{"id", "=", float64(42)}}, params[0])
+
+	params = <-destroyParams
+	require.Len(t, params, 1)
+	destroy, ok := params[0].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "tank/k8s/volumes/target@snap.1", destroy["path"])
+}
+
+func TestCopyDatasetFromSnapshotLocalExistingTargetIsIdempotent(t *testing.T) {
+	mock := newMockWSServer()
+	datasetQueried := make(chan struct{}, 1)
+	destroyCalled := make(chan struct{}, 1)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "replication.run_onetime":
+				resp.Result = 73
+			case "core.get_jobs":
+				resp.Result = []interface{}{map[string]interface{}{
+					"id":    73,
+					"state": "FAILED",
+					"error": "target dataset already exists",
+				}}
+			case "pool.dataset.query":
+				datasetQueried <- struct{}{}
+				resp.Result = []interface{}{map[string]interface{}{
+					"id":   "tank/k8s/volumes/target",
+					"name": "tank/k8s/volumes/target",
+					"type": "FILESYSTEM",
+				}}
+			case "zfs.resource.snapshot.destroy":
+				destroyCalled <- struct{}{}
+				resp.Error = &rpcError{Code: -1, Message: "snapshot not found"}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	err := client.CopyDatasetFromSnapshotLocal(
+		context.Background(),
+		"tank/k8s/volumes/source",
+		"snap-1",
+		"tank/k8s/volumes/target",
+	)
+	require.NoError(t, err)
+	<-datasetQueried
+	<-destroyCalled
+}
+
 // TestSnapshotRollback_Success tests rolling back to a snapshot
 func TestSnapshotRollback_Success(t *testing.T) {
 	resetSnapshotAPIPrefix()
