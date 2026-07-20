@@ -1088,13 +1088,16 @@ func TestControllerPublishVolumeValidation(t *testing.T) {
 	})
 	assert.Equal(t, codes.NotFound, status.Code(err))
 
+	// In combined/all mode (runNode=true) the process knows its own node ID, so a
+	// request for a different node is NotFound (best-effort check; also required by
+	// the csi-sanity "publish should fail when the node does not exist" conformance case).
 	_, err = d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
 		VolumeId:         "missing-volume",
 		NodeId:           "unknown-node",
 		VolumeCapability: capability,
 	})
 	assert.Equal(t, codes.NotFound, status.Code(err))
-	assert.Contains(t, err.Error(), "volume not found")
+	assert.Contains(t, err.Error(), "node not found")
 
 	_, err = mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 		Name: "pool/parent/existing-volume", Type: "FILESYSTEM",
@@ -1102,10 +1105,10 @@ func TestControllerPublishVolumeValidation(t *testing.T) {
 	require.NoError(t, err)
 	_, err = d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
 		VolumeId:         "existing-volume",
-		NodeId:           "unknown-node",
+		NodeId:           "known-node",
 		VolumeCapability: capability,
 	})
-	assert.NoError(t, err, "the controller must not reject a CO-provided node ID without a node registry")
+	assert.NoError(t, err, "publish must succeed for an existing volume on the known node")
 
 	_, err = d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
 		VolumeId: "missing-volume",

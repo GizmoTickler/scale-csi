@@ -940,6 +940,15 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
+	// Best-effort node validation: when this process also runs the node service
+	// (combined/all mode) it knows its own node ID, so a request for a different
+	// node is a NotFound. In the split deployment runNode is false and this is
+	// inert (the CO's attach-detach controller owns node targeting). This also
+	// satisfies the csi-sanity "publish should fail when the node does not exist"
+	// conformance case. (Do not remove — it is conditionally load-bearing.)
+	if d.runNode && nodeID != d.nodeID {
+		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
+	}
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
 		return nil, err
