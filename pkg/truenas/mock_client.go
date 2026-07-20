@@ -678,7 +678,11 @@ func (m *MockClient) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDat
 }
 
 func (m *MockClient) DestroyReplicatedTargetSnapshot(ctx context.Context, targetDataset, snapshotShortName string) error {
-	return m.SnapshotDelete(ctx, targetDataset+"@"+snapshotShortName, false, false)
+	err := m.SnapshotDelete(ctx, targetDataset+"@"+snapshotShortName, false, false)
+	if IsNotFoundError(err) {
+		return nil
+	}
+	return err
 }
 
 func (m *MockClient) SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error {
