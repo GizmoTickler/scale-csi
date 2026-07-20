@@ -777,8 +777,10 @@ func (c *Client) localCopyTargetExists(ctx context.Context, targetDataset string
 // destination by a local replication copy. The operation is idempotent.
 func (c *Client) DestroyReplicatedTargetSnapshot(ctx context.Context, targetDataset, snapshotShortName string) error {
 	targetSnapshot := targetDataset + "@" + snapshotShortName
-	_, err := c.Call(ctx, "zfs.resource.snapshot.destroy", map[string]interface{}{"path": targetSnapshot})
-	if err != nil && !IsNotFoundError(err) {
+	if err := c.SnapshotDelete(ctx, targetSnapshot, false, false); err != nil {
+		if IsNotFoundError(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to remove replicated target snapshot %s: %w", targetSnapshot, err)
 	}
 	return nil

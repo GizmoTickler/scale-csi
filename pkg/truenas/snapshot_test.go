@@ -1523,7 +1523,7 @@ func TestCopyDatasetFromSnapshotLocal(t *testing.T) {
 	mock := newMockWSServer()
 	replicationParams := make(chan []interface{}, 1)
 	jobParams := make(chan []interface{}, 1)
-	destroyParams := make(chan []interface{}, 1)
+	deleteParams := make(chan []interface{}, 1)
 	server := mock.start(func(conn *websocket.Conn) {
 		for {
 			var req rpcTestRequest
@@ -1543,8 +1543,10 @@ func TestCopyDatasetFromSnapshotLocal(t *testing.T) {
 					"id":    42,
 					"state": "SUCCESS",
 				}}
-			case "zfs.resource.snapshot.destroy":
-				destroyParams <- req.Params
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case "pool.snapshot.delete":
+				deleteParams <- req.Params
 				resp.Result = true
 			default:
 				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
@@ -1584,17 +1586,19 @@ func TestCopyDatasetFromSnapshotLocal(t *testing.T) {
 	require.Len(t, params, 1)
 	assert.Equal(t, []interface{}{[]interface{}{"id", "=", float64(42)}}, params[0])
 
-	params = <-destroyParams
-	require.Len(t, params, 1)
-	destroy, ok := params[0].(map[string]interface{})
+	params = <-deleteParams
+	require.Len(t, params, 2)
+	assert.Equal(t, "tank/k8s/volumes/target@snap.1", params[0])
+	options, ok := params[1].(map[string]interface{})
 	require.True(t, ok)
-	assert.Equal(t, "tank/k8s/volumes/target@snap.1", destroy["path"])
+	assert.Equal(t, false, options["defer"])
+	assert.Equal(t, false, options["recursive"])
 }
 
 func TestCopyDatasetFromSnapshotLocalExistingTargetIsIdempotent(t *testing.T) {
 	mock := newMockWSServer()
 	datasetQueried := make(chan struct{}, 1)
-	destroyCalled := make(chan struct{}, 1)
+	deleteCalled := make(chan []interface{}, 1)
 	server := mock.start(func(conn *websocket.Conn) {
 		for {
 			var req rpcTestRequest
@@ -1620,8 +1624,10 @@ func TestCopyDatasetFromSnapshotLocalExistingTargetIsIdempotent(t *testing.T) {
 					"name": "tank/k8s/volumes/target",
 					"type": "FILESYSTEM",
 				}}
-			case "zfs.resource.snapshot.destroy":
-				destroyCalled <- struct{}{}
+			case "zfs.snapshot.query":
+				resp.Result = []interface{}{}
+			case "zfs.snapshot.delete":
+				deleteCalled <- req.Params
 				resp.Error = &rpcError{Code: -1, Message: "snapshot not found"}
 			default:
 				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
@@ -1642,7 +1648,10 @@ func TestCopyDatasetFromSnapshotLocalExistingTargetIsIdempotent(t *testing.T) {
 	)
 	require.NoError(t, err)
 	<-datasetQueried
-	<-destroyCalled
+	params := <-deleteCalled
+	require.Len(t, params, 2)
+	assert.Equal(t, "tank/k8s/volumes/target@snap-1", params[0])
+	assert.Equal(t, map[string]interface{}{"defer": false, "recursive": false}, params[1])
 }
 
 // TestSnapshotRollback_Success tests rolling back to a snapshot

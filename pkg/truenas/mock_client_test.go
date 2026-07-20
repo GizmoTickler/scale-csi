@@ -163,6 +163,25 @@ func TestMockClientCopyDatasetFromSnapshotLocalIsIndependentAndIdempotent(t *tes
 	require.NoError(t, client.DatasetDelete(ctx, source.Name, false, true))
 }
 
+func TestMockClientDestroyReplicatedTargetSnapshotIsIdempotent(t *testing.T) {
+	client := NewMockClient()
+	ctx := context.Background()
+	target, err := client.DatasetCreate(ctx, &DatasetCreateParams{Name: "tank/csi/target", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	snapshot, err := client.SnapshotCreate(ctx, target.Name, "restore-point", nil)
+	require.NoError(t, err)
+
+	require.NoError(t, client.DestroyReplicatedTargetSnapshot(ctx, target.Name, snapshot.Name))
+	_, err = client.SnapshotGet(ctx, snapshot.ID)
+	assert.True(t, IsNotFoundError(err))
+
+	client.InjectError = &APIError{Code: -1, Message: "snapshot not found"}
+	require.NoError(t, client.DestroyReplicatedTargetSnapshot(ctx, target.Name, snapshot.Name))
+	client.InjectError = nil
+
+	require.NoError(t, client.DestroyReplicatedTargetSnapshot(ctx, target.Name, snapshot.Name))
+}
+
 func TestMockSnapshotCreateAppliesInlinePropertiesWhenUpdatesNoOp(t *testing.T) {
 	client := NewMockClient()
 	client.SimulateUpdateNoOp = true
