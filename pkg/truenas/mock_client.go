@@ -1091,6 +1091,7 @@ func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsyste
 func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
+func (m *MockClient) InvalidateNVMeoFPort(transport, address string, port int) {}
 func (m *MockClient) NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error) {
 	return []string{"0.0.0.0"}, nil
 }

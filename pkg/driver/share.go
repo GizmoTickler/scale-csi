@@ -975,6 +975,11 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	// Associate subsystem with port (required for network accessibility)
 	portSubsys, err := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsys.ID)
 	if err != nil {
+		d.truenasClient.InvalidateNVMeoFPort(
+			d.config.NVMeoF.Transport,
+			d.config.NVMeoF.TransportAddress,
+			d.config.NVMeoF.TransportServiceID,
+		)
 		// Cleanup subsystem on association failure - volume would be unusable
 		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
 			klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)

@@ -1011,6 +1011,20 @@ func TestNVMeoFGetOrCreatePortSingleFlight(t *testing.T) {
 	assert.Equal(t, int32(1), createCalls.Load())
 }
 
+func TestInvalidateNVMeoFPortRemovesNormalizedWildcardCacheEntry(t *testing.T) {
+	client := &Client{nvmeResolvedPort: map[string]*NVMeoFPort{
+		"TCP|0.0.0.0|4420": {ID: 41, Transport: "TCP", Address: "0.0.0.0", Port: 4420},
+		"TCP|0.0.0.0|4421": {ID: 42, Transport: "TCP", Address: "0.0.0.0", Port: 4421},
+	}}
+
+	client.InvalidateNVMeoFPort("TcP", "0.0.0.0", 4420)
+
+	client.nvmePortMu.Lock()
+	defer client.nvmePortMu.Unlock()
+	assert.NotContains(t, client.nvmeResolvedPort, "TCP|0.0.0.0|4420")
+	assert.Contains(t, client.nvmeResolvedPort, "TCP|0.0.0.0|4421", "invalidation must remain scoped to the requested service port")
+}
+
 func TestMockClient_NVMeoFPortSubsysCreate(t *testing.T) {
 	client := NewMockClient()
 	ctx := context.Background()

@@ -693,12 +693,10 @@ func (c *Client) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, e
 // Important: If a wildcard port (0.0.0.0) exists on the same service port,
 // it will be reused since it binds to all interfaces and catches all traffic.
 func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
-	// Resolve hostname to IP if needed (TrueNAS API requires IP addresses)
-	resolvedAddr, err := resolveToIP(address)
+	resolvedAddr, cacheKey, err := nvmePortCacheIdentity(transport, address, port)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve address %q: %w", address, err)
 	}
-	cacheKey := fmt.Sprintf("%s|%s|%d", strings.ToUpper(transport), resolvedAddr, port)
 
 	c.nvmePortMu.Lock()
 	defer c.nvmePortMu.Unlock()
@@ -741,6 +739,34 @@ func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address s
 		return nil, err
 	}
 	return cache(created), nil
+}
+
+// InvalidateNVMeoFPort removes a cached shared-port resolution so a subsequent
+// request re-queries TrueNAS. This is used when a downstream operation proves
+// that the cached port ID is stale.
+func (c *Client) InvalidateNVMeoFPort(transport, address string, port int) {
+	_, cacheKey, err := nvmePortCacheIdentity(transport, address, port)
+	if err != nil {
+		klog.Warningf("Failed to invalidate NVMe-oF port cache for %s:%s:%d: %v", transport, address, port, err)
+		return
+	}
+
+	c.nvmePortMu.Lock()
+	defer c.nvmePortMu.Unlock()
+	delete(c.nvmeResolvedPort, cacheKey)
+}
+
+// nvmePortCacheIdentity normalizes the requested address exactly once for both
+// cache population and invalidation. In particular, 0.0.0.0 remains the
+// wildcard address used by TrueNAS rather than being resolved as a hostname.
+func nvmePortCacheIdentity(transport, address string, port int) (resolvedAddr, cacheKey string, err error) {
+	// Resolve hostname to IP if needed (TrueNAS API requires IP addresses).
+	resolvedAddr, err = resolveToIP(address)
+	if err != nil {
+		return "", "", err
+	}
+	cacheKey = fmt.Sprintf("%s|%s|%d", strings.ToUpper(transport), resolvedAddr, port)
+	return resolvedAddr, cacheKey, nil
 }
 
 // resolveToIP resolves a hostname to an IP address.

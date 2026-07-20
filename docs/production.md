@@ -99,6 +99,16 @@ the baseline protection. If enabled, five consecutive failures open it for 30
 seconds before half-open probes are admitted. These controls do not replace
 protocol-level mount/login timeouts under `commandTimeouts`.
 
+`requestTimeout` bounds each API call. It is applied as a hard per-call cap **only
+to callers that supply no deadline of their own** (internal background work such as
+session garbage collection), so a wedged-but-live TrueNAS request cannot pin an API
+concurrency slot indefinitely. Calls that already carry a deadline — every CSI RPC,
+which inherits the sidecar's `--timeout` — are bounded by that deadline instead, so a
+legitimately long single operation (e.g. a large clone or recursive snapshot) is never
+cut short at `requestTimeout`. In the worst case all `maxConcurrentRequests` slots can
+be held by deadline-bearing calls for the length of their sidecar timeout; size the
+semaphore and sidecar timeouts accordingly.
+
 ## Resource sizing
 
 Steady-state measurements are approximately 15Mi memory and 1m CPU per driver
