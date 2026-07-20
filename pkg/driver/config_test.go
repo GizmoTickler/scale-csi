@@ -92,3 +92,25 @@ nfs:
 	require.NoError(t, err)
 	assert.False(t, cfg.ZFS.DatasetEnableQuotas, "an explicit false must override the default")
 }
+
+func TestLoadConfigCustomCATrust(t *testing.T) {
+	cfg, err := loadTestConfig(t, `
+driver: csi.scale.io
+truenas:
+  host: truenas.example.test
+  apiKey: test-key
+  caCert: |
+    -----BEGIN CERTIFICATE-----
+    test-ca
+    -----END CERTIFICATE-----
+  caCertFile: /etc/scale-csi/truenas-ca.pem
+zfs:
+  datasetParentName: tank/csi
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.Contains(t, cfg.TrueNAS.CACert, "BEGIN CERTIFICATE")
+	assert.Equal(t, "/etc/scale-csi/truenas-ca.pem", cfg.TrueNAS.CACertFile)
+}

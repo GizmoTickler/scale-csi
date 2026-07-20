@@ -35,6 +35,8 @@ used, that Secret must contain an `api-key` key.
 | `truenas.port` | API port | `443` |
 | `truenas.secure` | Use HTTPS | `true` |
 | `truenas.skipTLSVerify` | Skip TLS verification | `false` |
+| `truenas.caCert` | PEM-encoded CA certificate used instead of system roots | `""` |
+| `truenas.caCertFile` | Path to a mounted PEM-encoded CA certificate file | `""` |
 | `truenas.apiKey` | TrueNAS API key (required unless `existingSecret` is set) | `""` |
 | `truenas.existingSecret` | Existing Secret containing `api-key` | `""` |
 | `truenas.requestTimeout` | API request timeout in seconds | `60` |

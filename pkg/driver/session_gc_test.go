@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -159,8 +160,10 @@ func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
 			return nil
 		}
 
+		metricBefore := testutil.ToFloat64(gcSessionsDisconnectedTotal.WithLabelValues("iscsi"))
 		d.gcISCSISessions(ctx, 0, false)
 		assert.Equal(t, 1, disconnects)
+		assert.Equal(t, metricBefore+1, testutil.ToFloat64(gcSessionsDisconnectedTotal.WithLabelValues("iscsi")))
 	})
 
 	t.Run("NVMeoF", func(t *testing.T) {
@@ -181,9 +184,30 @@ func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
 			return nil
 		}
 
+		metricBefore := testutil.ToFloat64(gcSessionsDisconnectedTotal.WithLabelValues("nvmeof"))
 		d.gcNVMeoFSessions(ctx, 0, false)
 		assert.Equal(t, 1, disconnects)
+		assert.Equal(t, metricBefore+1, testutil.ToFloat64(gcSessionsDisconnectedTotal.WithLabelValues("nvmeof")))
 	})
+}
+
+func TestSessionGaugesRefreshWhenCleanupDisabled(t *testing.T) {
+	originalListISCSI := gcListISCSISessions
+	originalListNVMe := gcListNVMeoFSessions
+	t.Cleanup(func() {
+		gcListISCSISessions = originalListISCSI
+		gcListNVMeoFSessions = originalListNVMe
+	})
+	gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) { return nil, nil }
+	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) { return nil, nil }
+	SetISCSISessions(7)
+	SetNVMESessions(9)
+
+	d := &Driver{}
+	d.runSessionGCWithProtocols(context.Background(), 0, false, false, false)
+
+	assert.Zero(t, testutil.ToFloat64(iscsiSessionsTotal))
+	assert.Zero(t, testutil.ToFloat64(nvmeSessionsTotal))
 }
 
 // TestGetExpectedNVMeoFNQNs_FailedLookupsThreshold tests that getExpectedNVMeoFNQNs

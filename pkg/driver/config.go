@@ -61,6 +61,12 @@ type TrueNASConfig struct {
 	// AllowInsecure skips TLS verification
 	AllowInsecure bool `yaml:"allowInsecure"`
 
+	// CACert is an optional PEM-encoded CA certificate used instead of system roots.
+	CACert string `yaml:"caCert"`
+
+	// CACertFile is an optional path to a PEM-encoded CA certificate file.
+	CACertFile string `yaml:"caCertFile"`
+
 	// RequestTimeout is the timeout for API requests in seconds (default: 60)
 	RequestTimeout int `yaml:"requestTimeout"`
 

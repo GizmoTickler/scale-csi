@@ -329,6 +329,12 @@
         "skipTLSVerify": {
           "type": "boolean"
         },
+        "caCert": {
+          "type": "string"
+        },
+        "caCertFile": {
+          "type": "string"
+        },
         "apiKey": {
           "type": "string"
         },

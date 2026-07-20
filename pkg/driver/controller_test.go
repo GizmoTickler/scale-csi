@@ -2,15 +2,18 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -47,6 +50,24 @@ type originSnapshotDeleteFailureMock struct {
 func (m *originSnapshotDeleteFailureMock) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
 	if snapshotID == m.originSnapshotID {
 		return m.err
+	}
+	return m.MockClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
+}
+
+type transientOriginSnapshotDeleteFailureMock struct {
+	*truenas.MockClient
+	originSnapshotID string
+	failuresLeft     int
+	deleteCalls      int
+}
+
+func (m *transientOriginSnapshotDeleteFailureMock) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
+	if snapshotID == m.originSnapshotID {
+		m.deleteCalls++
+		if m.failuresLeft > 0 {
+			m.failuresLeft--
+			return fmt.Errorf("temporary snapshot delete failure")
+		}
 	}
 	return m.MockClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
 }
@@ -262,6 +283,42 @@ func TestCreateVolume(t *testing.T) {
 	// Test Case 3: Missing Name
 	_, err = d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{})
 	assert.Error(t, err)
+}
+
+func TestCreateVolumeFailureRecordsWarningEvent(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	mockClient.InjectError = errors.New("simulated TrueNAS failure")
+	fakeRecorder := record.NewFakeRecorder(1)
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "1.2.3.4"},
+		},
+		truenasClient: mockClient,
+		eventRecorder: &EventRecorder{
+			recorder: fakeRecorder,
+			enabled:  true,
+		},
+	}
+
+	_, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "event-failure-volume",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters: map[string]string{
+			pvcNamespaceKey: "storage",
+			pvcNameKey:      "claim-one",
+		},
+	})
+	require.Error(t, err)
+
+	select {
+	case event := <-fakeRecorder.Events:
+		assert.Contains(t, event, "Warning "+EventReasonVolumeCreateFailed)
+		assert.Contains(t, event, "CreateVolume failed")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CreateVolume failure event")
+	}
 }
 
 func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
@@ -694,6 +751,51 @@ func TestDeleteVolumeReturnsOriginSnapshotDeleteFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "temporary snapshot delete failure")
 }
 
+func TestDeleteVolumeRetriesOriginSnapshotDelete(t *testing.T) {
+	ctx := context.Background()
+	base := truenas.NewMockClient()
+	originID := "pool/parent/source@clone-source-clone"
+	client := &transientOriginSnapshotDeleteFailureMock{
+		MockClient:       base,
+		originSnapshotID: originID,
+		failuresLeft:     2,
+	}
+	d := &Driver{
+		config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}, NFS: NFSConfig{ShareHost: "192.0.2.10"}},
+		truenasClient: client,
+	}
+
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	_, err = client.SnapshotCreate(ctx, "pool/parent/source", "clone-source-clone", map[string]string{PropInternalResource: "true"})
+	require.NoError(t, err)
+	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/clone", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, "pool/parent/clone", PropVolumeOriginSnapshot, originID))
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "clone"})
+	require.NoError(t, err)
+	assert.Equal(t, 3, client.deleteCalls)
+	_, err = client.SnapshotGet(ctx, originID)
+	require.Error(t, err)
+	assert.True(t, truenas.IsNotFoundError(err), "origin snapshot must be removed after the transient failures clear")
+}
+
+func TestDeleteCloneOriginSnapshotHonorsContext(t *testing.T) {
+	client := &transientOriginSnapshotDeleteFailureMock{
+		MockClient:       truenas.NewMockClient(),
+		originSnapshotID: "pool/parent/source@clone-source-clone",
+		failuresLeft:     1,
+	}
+	d := &Driver{truenasClient: client}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := d.deleteCloneOriginSnapshot(ctx, client.originSnapshotID)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, client.deleteCalls, "snapshot delete must not run after context cancellation")
+}
+
 func TestDeleteVolumeRecursiveCloneDependencyIsFailedPrecondition(t *testing.T) {
 	client := &recursiveCloneDependencyMock{MockClient: truenas.NewMockClient()}
 	d := &Driver{
@@ -938,6 +1040,116 @@ func TestControllerPublishVolumeValidation(t *testing.T) {
 		NodeId:   "known-node",
 	})
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestControllerInboundIDsRejectPathTraversalWithoutMutation(t *testing.T) {
+	capability := testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	tests := []struct {
+		name string
+		call func(*Driver, string) error
+	}{
+		{
+			name: "DeleteVolume",
+			call: func(d *Driver, id string) error {
+				_, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: id})
+				return err
+			},
+		},
+		{
+			name: "ControllerPublishVolume",
+			call: func(d *Driver, id string) error {
+				_, err := d.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+					VolumeId: id, NodeId: "node-1", VolumeCapability: capability,
+				})
+				return err
+			},
+		},
+		{
+			name: "ValidateVolumeCapabilities",
+			call: func(d *Driver, id string) error {
+				_, err := d.ValidateVolumeCapabilities(context.Background(), &csi.ValidateVolumeCapabilitiesRequest{
+					VolumeId: id, VolumeCapabilities: []*csi.VolumeCapability{capability},
+				})
+				return err
+			},
+		},
+		{
+			name: "CreateSnapshotSource",
+			call: func(d *Driver, id string) error {
+				_, err := d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+					SourceVolumeId: id, Name: "safe-snapshot",
+				})
+				return err
+			},
+		},
+		{
+			name: "ControllerExpandVolume",
+			call: func(d *Driver, id string) error {
+				_, err := d.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+					VolumeId: id, CapacityRange: &csi.CapacityRange{RequiredBytes: testGiB},
+				})
+				return err
+			},
+		},
+		{
+			name: "ControllerGetVolume",
+			call: func(d *Driver, id string) error {
+				_, err := d.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: id})
+				return err
+			},
+		},
+		{
+			name: "CreateVolumeSnapshotSource",
+			call: func(d *Driver, id string) error {
+				_, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+					Name: "safe-target", VolumeCapabilities: []*csi.VolumeCapability{capability},
+					VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+						Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: id},
+					}},
+				})
+				return err
+			},
+		},
+		{
+			name: "CreateVolumeVolumeSource",
+			call: func(d *Driver, id string) error {
+				_, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+					Name: "safe-target", VolumeCapabilities: []*csi.VolumeCapability{capability},
+					VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+						Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: id},
+					}},
+				})
+				return err
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		for _, id := range []string{"../x", "..", "a/b"} {
+			t.Run(tc.name+"/"+strings.ReplaceAll(id, "/", "_"), func(t *testing.T) {
+				client := newControllerCallCountingMock()
+				d := &Driver{
+					config: &Config{
+						DriverName: "org.scale.csi.nfs",
+						ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+						NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+					},
+					truenasClient: client,
+				}
+
+				err := tc.call(d, id)
+				require.Error(t, err)
+				assert.Equal(t, codes.InvalidArgument, status.Code(err))
+				assert.Zero(t, client.datasetGetCalls, "invalid IDs must be rejected before TrueNAS access")
+				assert.Empty(t, client.Datasets)
+				assert.Empty(t, client.Snapshots)
+				assert.Empty(t, client.NFSShares)
+				assert.Empty(t, client.ISCSITargets)
+				assert.Empty(t, client.NVMeSubsystems)
+				assert.Empty(t, client.DatasetDeleteCalls)
+			})
+		}
+	}
 }
 
 func TestCreateSnapshotSerializesWithDeleteVolume(t *testing.T) {

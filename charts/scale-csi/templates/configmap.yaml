@@ -17,6 +17,8 @@ data:
       protocol: {{ if .Values.truenas.secure }}https{{ else }}http{{ end }}
       apiKey: $TRUENAS_API_KEY
       allowInsecure: {{ .Values.truenas.skipTLSVerify }}
+      caCert: {{ .Values.truenas.caCert | quote }}
+      caCertFile: {{ .Values.truenas.caCertFile | quote }}
       requestTimeout: {{ .Values.truenas.requestTimeout | default 60 }}
       connectTimeout: {{ .Values.truenas.connectTimeout }}
       writeTimeout: {{ .Values.truenas.writeTimeout | default 30 }}

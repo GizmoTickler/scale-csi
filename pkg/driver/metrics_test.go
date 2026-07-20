@@ -4,7 +4,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -202,4 +205,40 @@ func TestUpdateCircuitBreakerMetrics_ZeroValues(t *testing.T) {
 	assert.Equal(t, int64(0), lastCBTotalFailures)
 	assert.Equal(t, int64(0), lastCBTotalSuccesses)
 	assert.Equal(t, int64(0), lastCBTotalCircuitOpens)
+}
+
+func TestRecordCSIOperationClassifiesAbortedAsBenign(t *testing.T) {
+	const operation = "/csi.v1.Controller/CreateVolume-observability-test"
+	benign := csiOperationsTotal.WithLabelValues(operation, "benign", codes.Aborted.String())
+	hardError := csiOperationsTotal.WithLabelValues(operation, "error", codes.Aborted.String())
+	benignBefore := testutil.ToFloat64(benign)
+	hardErrorBefore := testutil.ToFloat64(hardError)
+
+	RecordCSIOperation(operation, 0.01, status.Error(codes.Aborted, "operation already in progress"))
+
+	assert.Equal(t, benignBefore+1, testutil.ToFloat64(benign))
+	assert.Equal(t, hardErrorBefore, testutil.ToFloat64(hardError))
+}
+
+func TestTransportCountersIncrementThroughMetricsRegistry(t *testing.T) {
+	for _, tc := range []struct {
+		transport string
+		result    string
+	}{
+		{transport: "iscsi", result: "success"},
+		{transport: "nvmeof", result: "error"},
+		{transport: "nfs", result: "success"},
+	} {
+		counter := nodeConnectTotal.WithLabelValues(tc.transport, tc.result)
+		before := testutil.ToFloat64(counter)
+		RecordNodeConnect(tc.transport, tc.result)
+		assert.Equal(t, before+1, testutil.ToFloat64(counter))
+	}
+
+	for _, transport := range []string{"iscsi", "nvmeof"} {
+		counter := gcSessionsDisconnectedTotal.WithLabelValues(transport)
+		before := testutil.ToFloat64(counter)
+		RecordGCSessionDisconnected(transport)
+		assert.Equal(t, before+1, testutil.ToFloat64(counter))
+	}
 }

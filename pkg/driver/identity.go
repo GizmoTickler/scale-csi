@@ -83,11 +83,21 @@ func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeRe
 
 func (d *Driver) observeTrueNASConnection() bool {
 	if d.truenasClient == nil {
+		SetTrueNASActiveConnections(0)
 		return false
 	}
 
 	connected := d.truenasClient.IsConnected()
 	SetTrueNASConnectionStatus(connected)
+	activeConnections := 0
+	if counter, ok := d.truenasClient.(interface{ ActiveConnectionCount() int }); ok {
+		activeConnections = counter.ActiveConnectionCount()
+	} else if connected {
+		// Third-party test clients may not expose their pool. Preserve a useful
+		// connected value while the production client reports the exact count.
+		activeConnections = 1
+	}
+	SetTrueNASActiveConnections(activeConnections)
 
 	const (
 		connectionConnected    int32 = 1

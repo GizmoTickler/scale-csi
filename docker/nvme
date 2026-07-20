@@ -34,12 +34,13 @@ case ${NVME_HOST_STRATEGY} in
     ;;
 
   auto)
-    # Auto mode: try chroot first (works on standard distros),
-    # fallback to nsenter with PID 1 (works on Talos/minimal OS)
-    if chroot /host ${NVME_HOST_PATH} "${@:1}" 2>/dev/null; then
-      exit 0
+    # Probe chroot with a harmless command, then execute the requested command
+    # exactly once through the selected host-access strategy.
+    if chroot /host "${NVME_HOST_PATH}" --version >/dev/null 2>&1; then
+      chroot /host "${NVME_HOST_PATH}" "$@"
+    else
+      nsenter -t 1 --mount --net -- "${NVME_HOST_PATH}" "$@"
     fi
-    nsenter -t 1 --mount --net -- ${NVME_HOST_PATH} "$@"
     ;;
 
   *)

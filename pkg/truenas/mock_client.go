@@ -120,6 +120,9 @@ func (m *MockClient) ISCSIInitiatorCreate(ctx context.Context, comment string) (
 // Core methods
 func (m *MockClient) Close() error      { return nil }
 func (m *MockClient) IsConnected() bool { return true }
+func (m *MockClient) ActiveConnectionCount() int {
+	return 1
+}
 func (m *MockClient) Call(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
 	return nil, nil
 }

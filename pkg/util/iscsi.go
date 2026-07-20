@@ -105,6 +105,11 @@ type ISCSISession struct {
 // DefaultISCSIDeviceTimeout is the default timeout for waiting for iSCSI devices to appear.
 const DefaultISCSIDeviceTimeout = 60 * time.Second
 
+// staleSessionValidationTimeout bounds validation of an existing session. A
+// healthy session normally exposes its device in about 50ms, leaving a 40x
+// margin while avoiding a long delay when the session is stale.
+const staleSessionValidationTimeout = 2 * time.Second
+
 // ISCSIConnectOptions holds options for iSCSI connection.
 type ISCSIConnectOptions struct {
 	DeviceTimeout       time.Duration // Timeout for waiting for device to appear (default: 60s)
@@ -152,15 +157,14 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 		klog.Infof("Found existing session for %s, validating... (elapsed: %v)", iqn, time.Since(start))
 		// Try to get device with a short timeout to validate session is healthy
 		// If device appears quickly, session is valid and can be reused
-		validationTimeout := 5 * time.Second
-		devicePath, waitErr := waitForISCSIDevice(portal, iqn, lun, validationTimeout)
+		devicePath, waitErr := waitForISCSIDevice(portal, iqn, lun, staleSessionValidationTimeout)
 		if waitErr == nil {
 			klog.Infof("ISCSIConnect completed (session reuse) in %v", time.Since(start))
 			return devicePath, nil
 		}
 		// Session exists but device didn't appear - session is likely stale
 		// Disconnect it and proceed with fresh discovery/login
-		klog.Warningf("Existing session for %s appears stale (device not found in %v), disconnecting", iqn, validationTimeout)
+		klog.Warningf("Existing session for %s appears stale (device not found in %v), disconnecting", iqn, staleSessionValidationTimeout)
 		if disconnectErr := ISCSIDisconnect(portal, iqn); disconnectErr != nil {
 			klog.Warningf("Failed to disconnect stale session %s: %v (proceeding anyway)", iqn, disconnectErr)
 		}

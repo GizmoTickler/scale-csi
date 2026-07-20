@@ -110,13 +110,13 @@ func (h *HealthServer) handleReadiness(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 
-	if status.Ready && status.TrueNASConnected {
+	if h.isReady(status) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	} else {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		msg := "Not Ready"
-		if !status.TrueNASConnected {
+		if h.driver.runController && !status.TrueNASConnected {
 			msg = "TrueNAS disconnected"
 		}
 		_, _ = w.Write([]byte(msg))
@@ -129,13 +129,19 @@ func (h *HealthServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if status.Ready && status.TrueNASConnected {
+	if h.isReady(status) {
 		w.WriteHeader(http.StatusOK)
 	} else {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+// isReady keeps backend connectivity in the controller readiness contract
+// without making node-only plugins depend on an API they do not use.
+func (h *HealthServer) isReady(status HealthStatus) bool {
+	return status.Ready && (!h.driver.runController || status.TrueNASConnected)
 }
 
 // checkHealth checks the current health status
