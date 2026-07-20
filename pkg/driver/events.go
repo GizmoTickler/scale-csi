@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -51,9 +52,10 @@ const (
 
 // EventRecorder wraps Kubernetes event recording functionality
 type EventRecorder struct {
-	recorder  record.EventRecorder
-	clientset kubernetes.Interface
-	enabled   bool
+	recorder      record.EventRecorder
+	clientset     kubernetes.Interface
+	dynamicClient dynamic.Interface
+	enabled       bool
 }
 
 // NewEventRecorder creates a new event recorder
@@ -71,6 +73,10 @@ func NewEventRecorder(driverName string) *EventRecorder {
 		klog.Warningf("Failed to create Kubernetes clientset, events disabled: %v", err)
 		return &EventRecorder{enabled: false}
 	}
+	dynamicClient, dynamicErr := dynamic.NewForConfig(config)
+	if dynamicErr != nil {
+		klog.Warningf("Failed to create Kubernetes dynamic client; orphan reconcile disabled: %v", dynamicErr)
+	}
 
 	// Create event broadcaster
 	eventBroadcaster := record.NewBroadcaster()
@@ -87,9 +93,10 @@ func NewEventRecorder(driverName string) *EventRecorder {
 	klog.Info("Kubernetes event recorder initialized")
 
 	return &EventRecorder{
-		recorder:  recorder,
-		clientset: clientset,
-		enabled:   true,
+		recorder:      recorder,
+		clientset:     clientset,
+		dynamicClient: dynamicClient,
+		enabled:       true,
 	}
 }
 

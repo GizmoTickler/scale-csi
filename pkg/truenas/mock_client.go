@@ -153,6 +153,7 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 		Name:           params.Name,
 		Type:           params.Type,
 		UserProperties: make(map[string]UserProperty),
+		Creation:       DatasetProperty{Parsed: float64(time.Now().Unix())},
 		Volsize:        DatasetProperty{Parsed: float64(params.Volsize)},
 		Refquota:       DatasetProperty{Parsed: float64(params.Refquota)},
 		Refreservation: DatasetProperty{Parsed: float64(params.Refreservation)},

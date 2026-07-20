@@ -417,6 +417,29 @@ metrics:
     # ConfigMap annotations such as a Grafana folder selector
     annotations: {}
 
+# Controller-side orphan detection and opt-in guarded cleanup.
+reconcile:
+  # Read-only detection is enabled by default and updates Prometheus gauges.
+  enabled: true
+
+  # Interval between read-only detection passes.
+  interval: 1h
+
+  # Managed backend objects must be older than this before they are orphaned.
+  minOrphanAge: 24h
+
+  # Prometheus alert hold time. Keep this strictly greater than 2x interval.
+  alertAfter: 2h5m
+
+  delete:
+    # SAFETY: guarded deletion is opt-in and disabled by default. When enabled,
+    # a CronJob runs --mode=reconcile and backend cleanup still goes through the
+    # driver's existing DeleteVolume/DeleteSnapshot dependency guards.
+    enabled: false
+    schedule: "0 4 * * *"
+    # Maximum successful deletions across all object types in one run.
+    maxPerRun: 5
+
 # Session garbage collection configuration (node plugin only)
 # Periodically cleans up orphaned iSCSI/NVMe-oF sessions that may leak
 # when pods are deleted, nodes restart, or unstage operations fail

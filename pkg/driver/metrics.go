@@ -108,6 +108,47 @@ var (
 		[]string{"transport"},
 	)
 
+	// Controller orphan reconcile metrics.
+	orphanVolumes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "orphan_volumes",
+			Help:      "Number of CSI-managed TrueNAS volumes without a live Kubernetes PV handle",
+		},
+	)
+
+	orphanSnapshots = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "orphan_snapshots",
+			Help:      "Number of CSI-managed TrueNAS snapshots without a live Kubernetes VolumeSnapshotContent handle",
+		},
+	)
+
+	spentRestoreSnapshots = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "spent_restore_snapshots",
+			Help:      "Number of spent VolSync restore-destination snapshots whose source PVC is no longer Bound",
+		},
+	)
+
+	orphanVolumesBytes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "orphan_volumes_bytes",
+			Help:      "Reported used bytes held by detected orphan CSI-managed TrueNAS volumes",
+		},
+	)
+
+	orphanSnapshotsBytes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "orphan_snapshots_bytes",
+			Help:      "Reported used bytes held by detected orphan CSI-managed TrueNAS snapshots",
+		},
+	)
+
 	// Circuit breaker metrics
 	circuitBreakerState = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -209,6 +250,15 @@ func RecordNodeConnect(transport, result string) {
 // RecordGCSessionDisconnected records a successful orphan session disconnect.
 func RecordGCSessionDisconnected(transport string) {
 	gcSessionsDisconnectedTotal.WithLabelValues(transport).Inc()
+}
+
+// SetOrphanReconcileMetrics publishes the latest successful detection report.
+func SetOrphanReconcileMetrics(report ReconcileReport) {
+	orphanVolumes.Set(float64(report.OrphanVolumeCount))
+	orphanSnapshots.Set(float64(report.OrphanSnapshotCount))
+	spentRestoreSnapshots.Set(float64(report.SpentRestoreSnapshotCount))
+	orphanVolumesBytes.Set(float64(report.OrphanVolumeBytes))
+	orphanSnapshotsBytes.Set(float64(report.OrphanSnapshotBytes))
 }
 
 // Circuit breaker metrics tracking

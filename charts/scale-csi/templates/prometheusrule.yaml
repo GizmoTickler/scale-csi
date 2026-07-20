@@ -56,5 +56,23 @@ spec:
           annotations:
             summary: Scale CSI operations are failing
             description: CSI operation errors have been sustained for ten minutes.
+        {{- if .Values.reconcile.enabled }}
+        - alert: ScaleCSIOrphanVolumesDetected
+          expr: scale_csi_orphan_volumes > 0
+          for: {{ .Values.reconcile.alertAfter }}
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI orphan volumes detected
+            description: CSI-managed TrueNAS volumes have had no matching live Kubernetes PV handle for longer than the reconcile alert window.
+        - alert: ScaleCSIOrphanSnapshotsDetected
+          expr: scale_csi_orphan_snapshots > 0
+          for: {{ .Values.reconcile.alertAfter }}
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI orphan snapshots detected
+            description: CSI-managed TrueNAS snapshots have had no matching live VolumeSnapshotContent handle for longer than the reconcile alert window.
+        {{- end }}
         {{- end }}
 {{- end }}

@@ -4,6 +4,7 @@ package driver
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,6 +34,9 @@ type Config struct {
 
 	// Session garbage collection configuration (node plugin only)
 	SessionGC SessionGCConfig `yaml:"sessionGC"`
+
+	// Reconcile configures controller-side orphan detection and gated cleanup.
+	Reconcile ReconcileConfig `yaml:"reconcile"`
 
 	// Node configuration (node plugin only)
 	Node NodeConfig `yaml:"node"`
@@ -233,6 +237,43 @@ type SessionGCConfig struct {
 	NVMeoFEnabled *bool `yaml:"nvmeofEnabled"`
 }
 
+// ReconcileConfig configures periodic orphan detection and the run-once GC mode.
+type ReconcileConfig struct {
+	// Enabled starts read-only orphan detection on the controller (default: true).
+	Enabled bool `yaml:"enabled"`
+
+	// Interval is the duration between read-only detection passes (default: 1h).
+	Interval string `yaml:"interval"`
+
+	// MinOrphanAge is the minimum backend object age before it can be orphaned (default: 24h).
+	MinOrphanAge string `yaml:"minOrphanAge"`
+
+	// Delete configures the separately gated run-once cleanup entrypoint.
+	Delete ReconcileDeleteConfig `yaml:"delete"`
+}
+
+// ReconcileDeleteConfig configures the opt-in orphan cleanup CronJob.
+type ReconcileDeleteConfig struct {
+	// Enabled permits --mode=reconcile to perform guarded deletion (default: false).
+	Enabled bool `yaml:"enabled"`
+
+	// Schedule is the CronJob schedule used by the Helm chart (default: 0 4 * * *).
+	Schedule string `yaml:"schedule"`
+
+	// MaxPerRun limits successful deletions across all object types (default: 5).
+	MaxPerRun int `yaml:"maxPerRun"`
+}
+
+// IntervalDuration parses the configured reconcile interval.
+func (c ReconcileConfig) IntervalDuration() (time.Duration, error) {
+	return time.ParseDuration(c.Interval)
+}
+
+// MinOrphanAgeDuration parses the configured minimum orphan age.
+func (c ReconcileConfig) MinOrphanAgeDuration() (time.Duration, error) {
+	return time.ParseDuration(c.MinOrphanAge)
+}
+
 // NVMeoFConfig holds NVMe-oF configuration.
 type NVMeoFConfig struct {
 	// Enabled enables NVMe-oF provisioning for StorageClasses that select NVMe-oF.
@@ -383,7 +424,18 @@ func LoadConfig(path string) (*Config, error) {
 
 	// Defaults must be applied before unmarshalling so an explicit YAML false
 	// still overrides the default.
-	cfg := &Config{ZFS: ZFSConfig{DatasetEnableQuotas: true}}
+	cfg := &Config{
+		ZFS: ZFSConfig{DatasetEnableQuotas: true},
+		Reconcile: ReconcileConfig{
+			Enabled:      true,
+			Interval:     "1h",
+			MinOrphanAge: "24h",
+			Delete: ReconcileDeleteConfig{
+				Schedule:  "0 4 * * *",
+				MaxPerRun: 5,
+			},
+		},
+	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
@@ -469,6 +521,30 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.NVMeoF.DeviceWaitTimeout == 0 {
 		cfg.NVMeoF.DeviceWaitTimeout = 60 // Default 60 seconds
+	}
+	if cfg.Reconcile.Interval == "" {
+		cfg.Reconcile.Interval = "1h"
+	}
+	if cfg.Reconcile.MinOrphanAge == "" {
+		cfg.Reconcile.MinOrphanAge = "24h"
+	}
+	if cfg.Reconcile.Delete.Schedule == "" {
+		cfg.Reconcile.Delete.Schedule = "0 4 * * *"
+	}
+	if cfg.Reconcile.Delete.MaxPerRun <= 0 {
+		return nil, fmt.Errorf("reconcile.delete.maxPerRun must be positive")
+	}
+	if interval, parseErr := cfg.Reconcile.IntervalDuration(); parseErr != nil || interval <= 0 {
+		if parseErr != nil {
+			return nil, fmt.Errorf("reconcile.interval must be a positive duration: %w", parseErr)
+		}
+		return nil, fmt.Errorf("reconcile.interval must be a positive duration")
+	}
+	if minAge, parseErr := cfg.Reconcile.MinOrphanAgeDuration(); parseErr != nil || minAge <= 0 {
+		if parseErr != nil {
+			return nil, fmt.Errorf("reconcile.minOrphanAge must be a positive duration: %w", parseErr)
+		}
+		return nil, fmt.Errorf("reconcile.minOrphanAge must be a positive duration")
 	}
 
 	// Session GC defaults - enabled by default with 5 minute interval
@@ -612,6 +688,7 @@ func validateNonNegativeConfig(cfg *Config) error {
 		{"sessionGC.interval", cfg.SessionGC.Interval},
 		{"sessionGC.gracePeriod", cfg.SessionGC.GracePeriod},
 		{"sessionGC.startupDelay", cfg.SessionGC.StartupDelay},
+		{"reconcile.delete.maxPerRun", cfg.Reconcile.Delete.MaxPerRun},
 		{"node.sessionCleanupDelay", cfg.Node.SessionCleanupDelay},
 		{"resilience.circuitBreaker.failureThreshold", cfg.Resilience.CircuitBreaker.FailureThreshold},
 		{"resilience.circuitBreaker.successThreshold", cfg.Resilience.CircuitBreaker.SuccessThreshold},

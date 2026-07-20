@@ -769,6 +769,47 @@
         }
       }
     },
+    "reconcile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "interval": {
+          "type": "string",
+          "minLength": 2
+        },
+        "minOrphanAge": {
+          "type": "string",
+          "minLength": 2
+        },
+        "alertAfter": {
+          "type": "string",
+          "minLength": 2
+        },
+        "delete": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "schedule": {
+              "type": "string",
+              "minLength": 1
+            },
+            "maxPerRun": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 5
+            }
+          }
+        }
+      }
+    },
     "sessionGC": {
       "type": "object",
       "additionalProperties": false,

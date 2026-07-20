@@ -142,10 +142,24 @@ truenas:
 | **Node** | | |
 | `node.kubeletHostPath` | Path to kubelet directory (for microk8s/k0s) | `/var/lib/kubelet` |
 | `node.resources` | CPU/Memory limits/requests | (see values.yaml) |
+| **Orphan Reconcile** | | |
+| `reconcile.enabled` | Periodic read-only orphan detection | `true` |
+| `reconcile.interval` | Detection interval | `1h` |
+| `reconcile.minOrphanAge` | Minimum age before a managed backend object is orphaned | `24h` |
+| `reconcile.delete.enabled` | Enable the guarded cleanup CronJob | `false` |
+| `reconcile.delete.schedule` | Guarded cleanup schedule | `0 4 * * *` |
+| `reconcile.delete.maxPerRun` | Maximum successful deletions in one cleanup run | `5` |
 | **StorageClass** | | |
 | `storageClass.create` | Create a default StorageClass | `true` |
 | `storageClass.name` | Name of the StorageClass | `scale-nfs` |
 | `storageClass.protocol` | Protocol for StorageClass (`nfs`, `iscsi`, `nvmeof`) | `nfs` |
+
+> **DANGER — `zfs.parentDataset` MUST be unique per Kubernetes cluster.** Do
+> not share one CSI parent dataset between live clusters. Orphan reconcile sees
+> only the current cluster's PV and VolumeSnapshot handles and would therefore
+> classify another cluster's managed objects as orphans. Detection is read-only
+> and enabled by default; deletion is separately opt-in and always uses the
+> driver's guarded CSI delete paths.
 
 ## StorageClass Parameters
 

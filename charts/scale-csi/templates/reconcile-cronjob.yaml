@@ -1,0 +1,99 @@
+{{- if and .Values.controller.enabled .Values.reconcile.delete.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ printf "%s-reconcile" (include "scale-csi.fullname" .) | trunc 63 | trimSuffix "-" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reconcile
+spec:
+  schedule: {{ .Values.reconcile.delete.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "scale-csi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: reconcile
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "scale-csi.labels" . | nindent 12 }}
+            app.kubernetes.io/component: reconcile
+          annotations:
+            checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+            {{- if not .Values.truenas.existingSecret }}
+            checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+            {{- end }}
+        spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          serviceAccountName: {{ include "scale-csi.controllerServiceAccountName" . }}
+          restartPolicy: OnFailure
+          {{- with .Values.controller.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.controller.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.controller.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: reconcile
+              image: "{{ .Values.image.repository }}:{{ include "scale-csi.imageTag" . }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              {{- with .Values.controller.containerSecurityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              args:
+                - "-driver-name={{ .Values.csiDriverName }}"
+                - "-config=/etc/scale-csi/config.yaml"
+                - "-mode=reconcile"
+                - "-health-port=0"
+                - "-v={{ .Values.logging.verbosity }}"
+              {{- if or .Values.truenas.apiKey .Values.truenas.existingSecret .Values.controller.extraEnv }}
+              env:
+                {{- if or .Values.truenas.apiKey .Values.truenas.existingSecret }}
+                - name: TRUENAS_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "scale-csi.secretName" . }}
+                      key: api-key
+                      optional: true
+                {{- end }}
+                {{- with .Values.controller.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              {{- end }}
+              volumeMounts:
+                - name: config
+                  mountPath: /etc/scale-csi
+                  readOnly: true
+                {{- with .Values.controller.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.controller.resources | nindent 16 }}
+          volumes:
+            - name: config
+              configMap:
+                name: {{ include "scale-csi.fullname" . }}-config
+            {{- with .Values.controller.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

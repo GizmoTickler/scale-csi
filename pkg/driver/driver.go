@@ -97,6 +97,10 @@ type Driver struct {
 	gcCancel context.CancelFunc
 	gcWg     sync.WaitGroup
 
+	// Controller-side orphan reconcile context and cancellation.
+	reconcileCancel context.CancelFunc
+	reconcileWg     sync.WaitGroup
+
 	// Track when orphaned sessions were first seen (for grace period)
 	// Key: session identifier (IQN or NQN), Value: first seen time
 	orphanedSessionsSeen sync.Map
@@ -270,6 +274,7 @@ func (d *Driver) Run() error {
 	if d.runController {
 		csi.RegisterControllerServer(d.server, d)
 		klog.Info("Controller service registered")
+		d.startOrphanReconcile()
 	}
 
 	if d.runNode {
@@ -301,6 +306,7 @@ func (d *Driver) Stop() {
 
 	// Stop session GC goroutine first
 	d.stopSessionGC()
+	d.stopOrphanReconcile()
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {

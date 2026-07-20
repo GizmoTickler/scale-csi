@@ -289,16 +289,30 @@ kubectl rollout restart deployment -n scale-csi scale-csi-controller
 
 ### Clean Up Orphaned TrueNAS Resources
 
-If CSI resources are orphaned on TrueNAS:
+The controller detects old CSI-managed backend resources automatically and
+exports `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`, and byte
+gauges. Detection is read-only and enabled by default:
 
-1. List CSI-managed datasets:
-   ```bash
-   zfs list -o name,truenas-csi:managed_resource -r <pool>
-   ```
+```yaml
+reconcile:
+  enabled: true
+  interval: 1h
+  minOrphanAge: 24h
+  delete:
+    enabled: false
+```
 
-2. Remove orphaned datasets (verify they're not in use first):
-   ```bash
-   zfs destroy <pool>/<dataset>
-   ```
+Inspect the controller logs and metrics first. To opt into cleanup, set
+`reconcile.delete.enabled: true`; the chart then creates a scheduled run-once
+job. The job never issues a raw ZFS destroy. It calls the existing guarded CSI
+delete paths, which refuse resources with live clone or snapshot dependencies.
 
-3. Remove orphaned shares via TrueNAS UI or API
+You can inspect the same managed-resource boundary on TrueNAS with:
+
+```bash
+zfs list -o name,truenas-csi:managed_resource -r <pool>
+```
+
+> **DANGER:** never share one configured `zfs.parentDataset` between Kubernetes
+> clusters. Reconcile cannot see handles owned by the other cluster and would
+> classify its managed objects as orphaned.

@@ -242,3 +242,19 @@ func TestTransportCountersIncrementThroughMetricsRegistry(t *testing.T) {
 		assert.Equal(t, before+1, testutil.ToFloat64(counter))
 	}
 }
+
+func TestSetOrphanReconcileMetrics(t *testing.T) {
+	SetOrphanReconcileMetrics(ReconcileReport{
+		OrphanVolumeCount:         2,
+		OrphanSnapshotCount:       3,
+		SpentRestoreSnapshotCount: 4,
+		OrphanVolumeBytes:         1024,
+		OrphanSnapshotBytes:       2048,
+	})
+
+	assert.Equal(t, float64(2), testutil.ToFloat64(orphanVolumes))
+	assert.Equal(t, float64(3), testutil.ToFloat64(orphanSnapshots))
+	assert.Equal(t, float64(4), testutil.ToFloat64(spentRestoreSnapshots))
+	assert.Equal(t, float64(1024), testutil.ToFloat64(orphanVolumesBytes))
+	assert.Equal(t, float64(2048), testutil.ToFloat64(orphanSnapshotsBytes))
+}

@@ -219,6 +219,9 @@ func sanityDriverConfig(protocol string) *Config {
 		SessionGC: SessionGCConfig{
 			Interval: 0,
 		},
+		// Reconcile requires live Kubernetes objects and is intentionally off in
+		// the isolated csi-sanity harness.
+		Reconcile: ReconcileConfig{Enabled: false},
 		Node: NodeConfig{
 			SessionCleanupDelay: 1,
 		},

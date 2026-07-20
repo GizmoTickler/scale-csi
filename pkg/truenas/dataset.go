@@ -7,6 +7,7 @@ import (
 	"math"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ type Dataset struct {
 	Volsize        DatasetProperty         `json:"volsize"`
 	Volblocksize   DatasetProperty         `json:"volblocksize"`
 	Origin         DatasetProperty         `json:"origin"`
+	Creation       DatasetProperty         `json:"creation"`
 	UserProperties map[string]UserProperty `json:"user_properties"`
 }
 
@@ -57,6 +59,7 @@ var datasetQueryProperties = []string{
 	"refreservation",
 	"volsize",
 	"volblocksize",
+	"creation",
 }
 
 // DatasetCreateParams holds parameters for creating a dataset.
@@ -469,6 +472,7 @@ func parseDataset(data interface{}) (*Dataset, error) {
 	ds.Volsize = parseProperty(m["volsize"])
 	ds.Volblocksize = parseProperty(m["volblocksize"])
 	ds.Origin = parseProperty(m["origin"])
+	ds.Creation = parseProperty(m["creation"])
 
 	// Parse user properties
 	if userProps, ok := m["user_properties"].(map[string]interface{}); ok {
@@ -508,6 +512,61 @@ func parseProperty(data interface{}) DatasetProperty {
 	}
 
 	return prop
+}
+
+// GetCreationTime returns the dataset creation timestamp in Unix seconds.
+func (ds *Dataset) GetCreationTime() int64 {
+	if ds == nil {
+		return 0
+	}
+	if parsedMap, ok := ds.Creation.Parsed.(map[string]interface{}); ok {
+		if dateMs, ok := parsedMap["$date"].(float64); ok {
+			if timestamp, valid := nonNegativeInt64FromFloat(dateMs / 1000); valid {
+				return timestamp
+			}
+		}
+	}
+	for _, value := range []interface{}{ds.Creation.Parsed, ds.Creation.Value, ds.Creation.Rawvalue} {
+		switch typed := value.(type) {
+		case float64:
+			if timestamp, valid := nonNegativeInt64FromFloat(typed); valid {
+				return timestamp
+			}
+		case int64:
+			if typed >= 0 {
+				return typed
+			}
+		case string:
+			if timestamp, err := strconv.ParseInt(typed, 10, 64); err == nil && timestamp >= 0 {
+				return timestamp
+			}
+		}
+	}
+	return 0
+}
+
+// GetUsedBytes returns the dataset's reported used space in bytes.
+func (ds *Dataset) GetUsedBytes() int64 {
+	if ds == nil {
+		return 0
+	}
+	for _, value := range []interface{}{ds.Used.Parsed, ds.Used.Value, ds.Used.Rawvalue} {
+		switch typed := value.(type) {
+		case float64:
+			if used, valid := nonNegativeInt64FromFloat(typed); valid {
+				return used
+			}
+		case int64:
+			if typed >= 0 {
+				return typed
+			}
+		case string:
+			if used, err := strconv.ParseInt(typed, 10, 64); err == nil && used >= 0 {
+				return used
+			}
+		}
+	}
+	return 0
 }
 
 // WaitForDatasetReady waits for a dataset to be available and queryable.
