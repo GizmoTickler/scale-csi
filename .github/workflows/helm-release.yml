@@ -30,7 +30,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5.0.1
         with:
-          version: v4.0.0
+          version: v4.2.3
 
       - name: Log in to Container Registry
         uses: docker/login-action@v4
