@@ -7,14 +7,17 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -86,14 +89,43 @@ func IsConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A structured server response proves the transport round trip completed.
+	// Never replay it based on human-readable API message text.
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return false
+	}
 	if errors.Is(err, ErrTransportFailure) || errors.Is(err, ErrAmbiguousResult) {
 		return true
 	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "connection") ||
-		strings.Contains(errStr, "timeout") ||
-		strings.Contains(errStr, "refused") ||
-		strings.Contains(errStr, "connection lost")
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, websocket.ErrBadHandshake) {
+		return true
+	}
+	for _, errno := range []syscall.Errno{
+		syscall.ECONNABORTED,
+		syscall.ECONNREFUSED,
+		syscall.ECONNRESET,
+		syscall.EHOSTUNREACH,
+		syscall.ENETDOWN,
+		syscall.ENETUNREACH,
+		syscall.EPIPE,
+		syscall.ETIMEDOUT,
+	} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 // ErrAmbiguousResult indicates that a request was written successfully, but the

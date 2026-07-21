@@ -42,6 +42,21 @@ nvmeof:
 	assert.Empty(t, cfg.NFS.ShareHost)
 }
 
+func TestLoadConfigAllowsMissingAPIKeyForNodeMode(t *testing.T) {
+	cfg, err := loadTestConfig(t, `
+driver: csi.scale.io
+truenas:
+  host: truenas.example.test
+zfs:
+  datasetParentName: tank/csi
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.Empty(t, cfg.TrueNAS.APIKey)
+}
+
 func TestLoadConfigRequiresAtLeastOneProtocol(t *testing.T) {
 	_, err := loadTestConfig(t, requiredTestConfig)
 	require.Error(t, err)
@@ -313,4 +328,71 @@ reconcile:
 			assert.Contains(t, err.Error(), "reconcile.")
 		})
 	}
+}
+
+func TestLoadConfigRejectsUnknownKeys(t *testing.T) {
+	_, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+  shareHosst: typo.example.test
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "shareHosst")
+	assert.Contains(t, err.Error(), "field")
+}
+
+func TestLoadConfigSessionGCEnabledNormalization(t *testing.T) {
+	protocol := `
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`
+	t.Run("defaults enabled with default interval", func(t *testing.T) {
+		cfg, err := loadTestConfig(t, requiredTestConfig+protocol)
+		require.NoError(t, err)
+		assert.True(t, cfg.SessionGC.Enabled)
+		assert.Equal(t, 300, cfg.SessionGC.Interval)
+	})
+	t.Run("explicit disable keeps zero interval", func(t *testing.T) {
+		cfg, err := loadTestConfig(t, requiredTestConfig+protocol+`
+sessionGC:
+  enabled: false
+  interval: 0
+`)
+		require.NoError(t, err)
+		assert.False(t, cfg.SessionGC.Enabled)
+		assert.Zero(t, cfg.SessionGC.Interval)
+	})
+	t.Run("enabled zero interval gets default", func(t *testing.T) {
+		cfg, err := loadTestConfig(t, requiredTestConfig+protocol+`
+sessionGC:
+  enabled: true
+  interval: 0
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.SessionGC.Enabled)
+		assert.Equal(t, 300, cfg.SessionGC.Interval)
+	})
+}
+
+func TestLoadConfigWarnsForInertISCSITargetPortals(t *testing.T) {
+	originalWarningf := configWarningf
+	t.Cleanup(func() { configWarningf = originalWarningf })
+	var warning string
+	configWarningf = func(format string, args ...interface{}) {
+		warning = fmt.Sprintf(format, args...)
+	}
+
+	_, err := loadTestConfig(t, requiredTestConfig+`
+iscsi:
+  enabled: true
+  targetPortal: 192.0.2.10:3260
+  namePrefix: csi-
+  targetPortals:
+    - 192.0.2.11:3260
+`)
+	require.NoError(t, err)
+	assert.Contains(t, warning, "iscsi.targetPortals")
+	assert.Contains(t, warning, "does not currently support iSCSI multipath")
 }

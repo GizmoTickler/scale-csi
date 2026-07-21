@@ -31,19 +31,7 @@ mountOptions:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 parameters:
-  {{- $secretName := include "scale-csi.secretName" $root -}}
-  {{- $parameters := dict
-      "csi.storage.k8s.io/provisioner-secret-name" $secretName
-      "csi.storage.k8s.io/provisioner-secret-namespace" $root.Release.Namespace
-      "csi.storage.k8s.io/controller-publish-secret-name" $secretName
-      "csi.storage.k8s.io/controller-publish-secret-namespace" $root.Release.Namespace
-      "csi.storage.k8s.io/node-stage-secret-name" $secretName
-      "csi.storage.k8s.io/node-stage-secret-namespace" $root.Release.Namespace
-      "csi.storage.k8s.io/node-publish-secret-name" $secretName
-      "csi.storage.k8s.io/node-publish-secret-namespace" $root.Release.Namespace
-      "csi.storage.k8s.io/controller-expand-secret-name" $secretName
-      "csi.storage.k8s.io/controller-expand-secret-namespace" $root.Release.Namespace
-  -}}
+  {{- $parameters := dict -}}
   {{- with $storageClass.extraParameters }}
     {{- $parameters = mergeOverwrite $parameters (deepCopy .) -}}
   {{- end }}

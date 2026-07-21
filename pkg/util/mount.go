@@ -27,6 +27,93 @@ type FilesystemStats struct {
 	UsedInodes      int64
 }
 
+// MountInfo is the live kernel view of one mount.
+type MountInfo struct {
+	Source   string
+	Target   string
+	FSType   string
+	Options  []string
+	ReadOnly bool
+}
+
+// GetMountInfo returns the backing source, filesystem type, and effective
+// options for an exact mountpoint.
+func GetMountInfo(target string) (MountInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	defer cancel()
+
+	output, err := exec.CommandContext(
+		ctx,
+		"findmnt",
+		"--first-only",
+		"--noheadings",
+		"--output",
+		"SOURCE,FSTYPE,OPTIONS",
+		"--mountpoint",
+		target,
+	).Output()
+	if err != nil {
+		return MountInfo{}, fmt.Errorf("failed to inspect mountpoint %s: %w", target, err)
+	}
+	fields := strings.Fields(strings.TrimSpace(string(output)))
+	if len(fields) < 3 {
+		return MountInfo{}, fmt.Errorf("unexpected findmnt output for %s: %q", target, strings.TrimSpace(string(output)))
+	}
+	options := strings.Split(fields[2], ",")
+	return MountInfo{
+		Source:   unescapeProcMountField(fields[0]),
+		Target:   target,
+		FSType:   fields[1],
+		Options:  options,
+		ReadOnly: containsMountOption(options, "ro"),
+	}, nil
+}
+
+// ListMountInfo returns the process mount namespace from Linux mountinfo. On
+// non-Linux development hosts where procfs is absent, it returns an empty
+// result so callers can fall back to their in-memory state.
+func ListMountInfo() ([]MountInfo, error) {
+	file, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to open mountinfo: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	return parseMountInfo(file)
+}
+
+func parseMountInfo(reader io.Reader) ([]MountInfo, error) {
+	var mounts []MountInfo
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		separator := -1
+		for i, field := range fields {
+			if field == "-" {
+				separator = i
+				break
+			}
+		}
+		if len(fields) < 6 || separator < 0 || separator+3 >= len(fields) {
+			continue
+		}
+		options := append(strings.Split(fields[5], ","), strings.Split(fields[separator+3], ",")...)
+		mounts = append(mounts, MountInfo{
+			Source:   unescapeProcMountField(fields[separator+2]),
+			Target:   unescapeProcMountField(fields[4]),
+			FSType:   fields[separator+1],
+			Options:  options,
+			ReadOnly: containsMountOption(options, "ro"),
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read mountinfo: %w", err)
+	}
+	return mounts, nil
+}
+
 // IsMounted checks if a path is currently mounted.
 func IsMounted(path string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())

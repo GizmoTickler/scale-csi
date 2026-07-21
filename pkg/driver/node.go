@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,9 @@ var (
 	nodeGetDeviceSize          = util.GetDeviceSize
 	nodeResizeFilesystem       = util.ResizeFilesystem
 	nodeFormatAndMount         = util.FormatAndMount
+	nodeIsMounted              = util.IsMounted
+	nodeGetMountInfo           = util.GetMountInfo
+	nodeListMountInfo          = util.ListMountInfo
 	nodeCheckISCSIMultipath    = util.CheckISCSIDeviceMultipathOwnership
 	nodeISCSIRescan            = util.ISCSIRescanSession
 	nodeNVMeRescan             = util.NVMeRescan
@@ -43,6 +47,419 @@ var (
 		return uint32(stat.Mode), uint64(stat.Rdev), nil //nolint:unconvert // Stat_t field widths differ per platform (darwin: Mode uint16, Rdev int32)
 	}
 )
+
+type nodeAccessType string
+
+const (
+	nodeAccessMount nodeAccessType = "mount"
+	nodeAccessBlock nodeAccessType = "block"
+)
+
+type nodeCapabilitySignature struct {
+	AccessType nodeAccessType
+	AccessMode csi.VolumeCapability_AccessMode_Mode
+	FSType     string
+	MountFlags string
+}
+
+type nodeMountRecord struct {
+	VolumeID       string
+	TargetPath     string
+	ExpectedSource string
+	LiveSource     string
+	Capability     nodeCapabilitySignature
+	Readonly       bool
+}
+
+func nodeCapabilityForRequest(capability *csi.VolumeCapability) (nodeCapabilitySignature, error) {
+	if capability == nil {
+		return nodeCapabilitySignature{}, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
+	var accessType nodeAccessType
+	switch {
+	case capability.GetBlock() != nil:
+		accessType = nodeAccessBlock
+	case capability.GetMount() != nil:
+		accessType = nodeAccessMount
+	default:
+		// Preserve compatibility with older COs and existing tests that omitted
+		// the mount oneof while providing an access mode; the historical driver
+		// treated such capabilities as filesystem mounts.
+		accessType = nodeAccessMount
+	}
+	flags := append([]string(nil), volumeMountFlags(capability)...)
+	sort.Strings(flags)
+	accessMode := csi.VolumeCapability_AccessMode_UNKNOWN
+	if capability.GetAccessMode() != nil {
+		accessMode = capability.GetAccessMode().GetMode()
+	}
+	return nodeCapabilitySignature{
+		AccessType: accessType,
+		AccessMode: accessMode,
+		FSType:     strings.ToLower(capability.GetMount().GetFsType()),
+		MountFlags: strings.Join(flags, ","),
+	}, nil
+}
+
+func normalizeMountSource(source string) string {
+	source = strings.TrimSpace(source)
+	if bracket := strings.IndexByte(source, '['); bracket > 0 && strings.HasSuffix(source, "]") {
+		source = source[:bracket]
+	}
+	if strings.HasPrefix(source, "/") {
+		source = filepath.Clean(source)
+	}
+	return source
+}
+
+func mountSourcesEqual(left, right string) bool {
+	return normalizeMountSource(left) == normalizeMountSource(right)
+}
+
+func accessTypeAtPath(path string) (nodeAccessType, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode().IsRegular() {
+		return nodeAccessBlock, nil
+	}
+	if info.IsDir() {
+		return nodeAccessMount, nil
+	}
+	return "", fmt.Errorf("path %s has unsupported type %s", path, info.Mode())
+}
+
+func (d *Driver) stageRecord(target string) (nodeMountRecord, bool) {
+	d.nodeMountStateMu.Lock()
+	defer d.nodeMountStateMu.Unlock()
+	record, ok := d.stagedTargets[target]
+	return record, ok
+}
+
+func (d *Driver) storeStageRecord(record nodeMountRecord) {
+	d.nodeMountStateMu.Lock()
+	defer d.nodeMountStateMu.Unlock()
+	if d.stagedTargets == nil {
+		d.stagedTargets = make(map[string]nodeMountRecord)
+	}
+	d.stagedTargets[record.TargetPath] = record
+}
+
+func (d *Driver) deleteStageRecord(target string) {
+	d.nodeMountStateMu.Lock()
+	defer d.nodeMountStateMu.Unlock()
+	delete(d.stagedTargets, target)
+}
+
+func (d *Driver) publicationRecord(target string) (nodeMountRecord, bool) {
+	d.nodeMountStateMu.Lock()
+	defer d.nodeMountStateMu.Unlock()
+	record, ok := d.publishedTargets[target]
+	return record, ok
+}
+
+func (d *Driver) publicationRecords() []nodeMountRecord {
+	d.nodeMountStateMu.Lock()
+	defer d.nodeMountStateMu.Unlock()
+	records := make([]nodeMountRecord, 0, len(d.publishedTargets))
+	for target := range d.publishedTargets {
+		records = append(records, d.publishedTargets[target])
+	}
+	return records
+}
+
+func (d *Driver) storePublicationRecord(record nodeMountRecord) {
+	d.nodeMountStateMu.Lock()
+	defer d.nodeMountStateMu.Unlock()
+	if d.publishedTargets == nil {
+		d.publishedTargets = make(map[string]nodeMountRecord)
+	}
+	d.publishedTargets[record.TargetPath] = record
+}
+
+func (d *Driver) deletePublicationRecord(target string) {
+	d.nodeMountStateMu.Lock()
+	defer d.nodeMountStateMu.Unlock()
+	delete(d.publishedTargets, target)
+}
+
+func stageSourceIdentity(shareType ShareType, volumeContext map[string]string) (string, error) {
+	switch shareType {
+	case ShareTypeNFS:
+		server, share := volumeContext["server"], volumeContext["share"]
+		if server == "" || share == "" {
+			return "", status.Error(codes.InvalidArgument, "NFS server and share are required in volume context")
+		}
+		return normalizeMountSource(fmt.Sprintf("%s:%s", server, share)), nil
+	case ShareTypeISCSI:
+		if volumeContext["iqn"] == "" {
+			return "", status.Error(codes.InvalidArgument, "iSCSI IQN is required in volume context")
+		}
+		return "iscsi:" + volumeContext["iqn"], nil
+	case ShareTypeNVMeoF:
+		if volumeContext["nqn"] == "" {
+			return "", status.Error(codes.InvalidArgument, "NVMe-oF NQN is required in volume context")
+		}
+		return "nvmeof:" + volumeContext["nqn"], nil
+	default:
+		return "", status.Errorf(codes.InvalidArgument, "unsupported attach driver: %s", shareType)
+	}
+}
+
+func verifyStageDeviceSource(devicePath string, shareType ShareType, volumeContext map[string]string) error {
+	switch shareType {
+	case ShareTypeNFS:
+		return status.Error(codes.AlreadyExists, "NFS staging target cannot contain a raw block device")
+	case ShareTypeISCSI:
+		_, actualIQN, err := nodeGetISCSIInfo(devicePath)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to identify staged iSCSI device %s: %v", devicePath, err)
+		}
+		if actualIQN != volumeContext["iqn"] {
+			return status.Errorf(codes.AlreadyExists, "staging target is backed by iSCSI target %s, requested %s", actualIQN, volumeContext["iqn"])
+		}
+	case ShareTypeNVMeoF:
+		actualNQN, err := nodeGetNVMeInfo(devicePath)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to identify staged NVMe-oF device %s: %v", devicePath, err)
+		}
+		if actualNQN != volumeContext["nqn"] {
+			return status.Errorf(codes.AlreadyExists, "staging target is backed by NVMe-oF subsystem %s, requested %s", actualNQN, volumeContext["nqn"])
+		}
+	}
+	return nil
+}
+
+func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType ShareType, capability nodeCapabilitySignature, expectedSource string) (bool, error) {
+	stagingPath := req.GetStagingTargetPath()
+	mounted, err := nodeIsMounted(stagingPath)
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "failed to check mount status: %v", err)
+	}
+	info, statErr := os.Lstat(stagingPath)
+	symlink := statErr == nil && info.Mode()&os.ModeSymlink != 0
+	if !mounted && !symlink {
+		d.deleteStageRecord(stagingPath)
+		return false, nil
+	}
+	actualAccess := nodeAccessMount
+	if symlink {
+		actualAccess = nodeAccessBlock
+	}
+	if actualAccess != capability.AccessType {
+		return true, status.Errorf(codes.AlreadyExists, "staging target %s already contains access type %s, requested %s", stagingPath, actualAccess, capability.AccessType)
+	}
+
+	liveSource := ""
+	if symlink {
+		devicePath, resolveErr := filepath.EvalSymlinks(stagingPath)
+		if resolveErr != nil {
+			return true, status.Errorf(codes.Internal, "failed to resolve staged block device: %v", resolveErr)
+		}
+		if sourceErr := verifyStageDeviceSource(devicePath, shareType, req.GetVolumeContext()); sourceErr != nil {
+			return true, sourceErr
+		}
+		liveSource = normalizeMountSource(devicePath)
+	} else {
+		mountInfo, infoErr := nodeGetMountInfo(stagingPath)
+		if infoErr != nil {
+			return true, status.Errorf(codes.Internal, "failed to inspect existing staging mount: %v", infoErr)
+		}
+		liveSource = normalizeMountSource(mountInfo.Source)
+		switch shareType {
+		case ShareTypeNFS:
+			if !mountSourcesEqual(liveSource, expectedSource) {
+				return true, status.Errorf(codes.AlreadyExists, "staging target %s is backed by %s, requested %s", stagingPath, liveSource, expectedSource)
+			}
+			if mountInfo.FSType != "nfs" && mountInfo.FSType != "nfs4" {
+				return true, status.Errorf(codes.AlreadyExists, "staging target %s has filesystem %s, requested NFS", stagingPath, mountInfo.FSType)
+			}
+		default:
+			if sourceErr := verifyStageDeviceSource(liveSource, shareType, req.GetVolumeContext()); sourceErr != nil {
+				return true, sourceErr
+			}
+			if capability.FSType != "" && !strings.EqualFold(mountInfo.FSType, capability.FSType) {
+				return true, status.Errorf(codes.AlreadyExists, "staging target %s has filesystem %s, requested %s", stagingPath, mountInfo.FSType, capability.FSType)
+			}
+		}
+	}
+
+	if record, ok := d.stageRecord(stagingPath); ok {
+		if record.VolumeID != req.GetVolumeId() || record.ExpectedSource != expectedSource || record.Capability != capability || !mountSourcesEqual(record.LiveSource, liveSource) {
+			return true, status.Errorf(codes.AlreadyExists, "staging target %s is already occupied by an incompatible staged volume", stagingPath)
+		}
+	}
+	d.storeStageRecord(nodeMountRecord{
+		VolumeID:       req.GetVolumeId(),
+		TargetPath:     stagingPath,
+		ExpectedSource: expectedSource,
+		LiveSource:     liveSource,
+		Capability:     capability,
+	})
+	return true, nil
+}
+
+func (d *Driver) rememberStage(req *csi.NodeStageVolumeRequest, shareType ShareType, capability nodeCapabilitySignature, expectedSource string) {
+	liveSource := expectedSource
+	if capability.AccessType == nodeAccessBlock {
+		if devicePath, ok := stagedBlockDevicePath(req.GetStagingTargetPath()); ok {
+			liveSource = normalizeMountSource(devicePath)
+		}
+	} else if mountInfo, err := nodeGetMountInfo(req.GetStagingTargetPath()); err == nil {
+		liveSource = normalizeMountSource(mountInfo.Source)
+	}
+	d.storeStageRecord(nodeMountRecord{
+		VolumeID:       req.GetVolumeId(),
+		TargetPath:     req.GetStagingTargetPath(),
+		ExpectedSource: expectedSource,
+		LiveSource:     liveSource,
+		Capability:     capability,
+	})
+}
+
+func (d *Driver) expectedPublicationSource(req *csi.NodePublishVolumeRequest, capability nodeCapabilitySignature) (string, error) {
+	if capability.AccessType == nodeAccessBlock {
+		if req.GetStagingTargetPath() == "" {
+			return "", status.Error(codes.FailedPrecondition, "staging path is required for block volumes")
+		}
+		devicePath, err := filepath.EvalSymlinks(req.GetStagingTargetPath())
+		if err != nil {
+			return "", status.Errorf(codes.FailedPrecondition, "failed to resolve staged block device: %v", err)
+		}
+		if !strings.HasPrefix(devicePath, "/dev/") {
+			return "", status.Errorf(codes.FailedPrecondition, "staging path did not resolve to a block device: %s", devicePath)
+		}
+		return normalizeMountSource(devicePath), nil
+	}
+	if req.GetStagingTargetPath() != "" {
+		mountInfo, err := nodeGetMountInfo(req.GetStagingTargetPath())
+		if err != nil {
+			return "", status.Errorf(codes.FailedPrecondition, "staging target %s is not a readable mount: %v", req.GetStagingTargetPath(), err)
+		}
+		return normalizeMountSource(mountInfo.Source), nil
+	}
+	volumeContext := req.GetVolumeContext()
+	if d.nodeAttachDriver(volumeContext) != ShareTypeNFS {
+		return "", status.Error(codes.FailedPrecondition, "staging path required for block volumes")
+	}
+	server, share := volumeContext["server"], volumeContext["share"]
+	if server == "" || share == "" {
+		return "", status.Error(codes.InvalidArgument, "NFS server and share are required in volume context")
+	}
+	return normalizeMountSource(fmt.Sprintf("%s:%s", server, share)), nil
+}
+
+func (d *Driver) validateExistingPublication(req *csi.NodePublishVolumeRequest, capability nodeCapabilitySignature, expectedSource string) error {
+	actualAccess, err := accessTypeAtPath(req.GetTargetPath())
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to inspect existing target path: %v", err)
+	}
+	if actualAccess != capability.AccessType {
+		return status.Errorf(codes.AlreadyExists, "target path %s already contains access type %s, requested %s", req.GetTargetPath(), actualAccess, capability.AccessType)
+	}
+	mountInfo, err := nodeGetMountInfo(req.GetTargetPath())
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to inspect existing publication mount: %v", err)
+	}
+	actualSource := normalizeMountSource(mountInfo.Source)
+	if mountInfo.ReadOnly != req.GetReadonly() {
+		return status.Errorf(codes.AlreadyExists, "target path %s readonly state is %t, requested %t", req.GetTargetPath(), mountInfo.ReadOnly, req.GetReadonly())
+	}
+	if record, ok := d.publicationRecord(req.GetTargetPath()); ok {
+		if record.VolumeID != req.GetVolumeId() || record.Capability != capability || record.Readonly != req.GetReadonly() || !mountSourcesEqual(record.ExpectedSource, expectedSource) || !mountSourcesEqual(record.LiveSource, actualSource) {
+			return status.Errorf(codes.AlreadyExists, "target path %s already contains an incompatible publication", req.GetTargetPath())
+		}
+	} else if !mountSourcesEqual(actualSource, expectedSource) {
+		return status.Errorf(codes.AlreadyExists, "target path %s is backed by %s, requested %s", req.GetTargetPath(), actualSource, expectedSource)
+	}
+	d.storePublicationRecord(nodeMountRecord{
+		VolumeID:       req.GetVolumeId(),
+		TargetPath:     req.GetTargetPath(),
+		ExpectedSource: expectedSource,
+		LiveSource:     actualSource,
+		Capability:     capability,
+		Readonly:       req.GetReadonly(),
+	})
+	return nil
+}
+
+func allowsMultiplePublicationTargets(mode csi.VolumeCapability_AccessMode_Mode) bool {
+	switch mode {
+	case csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER:
+		return true
+	default:
+		return false
+	}
+}
+
+func likelyCSIPublicationTarget(target string) bool {
+	normalized := filepath.ToSlash(filepath.Clean(target))
+	return strings.Contains(normalized, "/pods/") || strings.Contains(normalized, "/volumeDevices/publish/")
+}
+
+func (d *Driver) isKnownStageTarget(target string) bool {
+	d.nodeMountStateMu.Lock()
+	defer d.nodeMountStateMu.Unlock()
+	_, ok := d.stagedTargets[target]
+	return ok
+}
+
+func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeRequest, capability nodeCapabilitySignature, expectedSource string) error {
+	records := d.publicationRecords()
+	for i := range records {
+		record := &records[i]
+		if record.VolumeID != req.GetVolumeId() || record.TargetPath == req.GetTargetPath() {
+			continue
+		}
+		mounted, err := nodeIsMounted(record.TargetPath)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to verify existing publication at %s: %v", record.TargetPath, err)
+		}
+		if !mounted {
+			d.deletePublicationRecord(record.TargetPath)
+			continue
+		}
+		if record.Capability != capability || record.Readonly != req.GetReadonly() || !mountSourcesEqual(record.ExpectedSource, expectedSource) || !allowsMultiplePublicationTargets(capability.AccessMode) {
+			return status.Errorf(codes.FailedPrecondition, "volume %s is already published at different target path %s", req.GetVolumeId(), record.TargetPath)
+		}
+	}
+	if allowsMultiplePublicationTargets(capability.AccessMode) {
+		return nil
+	}
+
+	mounts, err := nodeListMountInfo()
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to rebuild publication state from mount table: %v", err)
+	}
+	for _, mount := range mounts {
+		if mount.Target == req.GetTargetPath() || mount.Target == req.GetStagingTargetPath() || d.isKnownStageTarget(mount.Target) || !likelyCSIPublicationTarget(mount.Target) {
+			continue
+		}
+		if mountSourcesEqual(mount.Source, expectedSource) {
+			return status.Errorf(codes.FailedPrecondition, "volume %s is already published at different target path %s", req.GetVolumeId(), mount.Target)
+		}
+	}
+	return nil
+}
+
+func (d *Driver) rememberPublication(req *csi.NodePublishVolumeRequest, capability nodeCapabilitySignature, expectedSource string) {
+	liveSource := expectedSource
+	if mountInfo, err := nodeGetMountInfo(req.GetTargetPath()); err == nil {
+		liveSource = normalizeMountSource(mountInfo.Source)
+	}
+	d.storePublicationRecord(nodeMountRecord{
+		VolumeID:       req.GetVolumeId(),
+		TargetPath:     req.GetTargetPath(),
+		ExpectedSource: expectedSource,
+		LiveSource:     liveSource,
+		Capability:     capability,
+		Readonly:       req.GetReadonly(),
+	})
+}
 
 // NodeGetCapabilities returns the capabilities of the node service.
 func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
@@ -160,6 +577,23 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 
 	// Get attach driver from volume context and normalize.
 	attachDriver := d.nodeAttachDriver(volumeContext)
+	capability, err := nodeCapabilityForRequest(req.GetVolumeCapability())
+	if err != nil {
+		return nil, err
+	}
+	expectedSource, err := stageSourceIdentity(attachDriver, volumeContext)
+	if err != nil {
+		return nil, err
+	}
+	if handled, existingErr := d.handleExistingStage(req, attachDriver, capability, expectedSource); handled {
+		if existingErr != nil {
+			return nil, existingErr
+		}
+		klog.Infof("Volume %s is already staged compatibly at %s", volumeID, stagingPath)
+		return &csi.NodeStageVolumeResponse{}, nil
+	} else if existingErr != nil {
+		return nil, existingErr
+	}
 
 	// Filesystem volumes mount on the staging path, while raw-block volumes
 	// create a symlink at that exact path. Creating the leaf for block mode
@@ -190,6 +624,25 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported attach driver: %s (supported: %v)", attachDriver, ValidShareTypeStrings())
 	}
 
+	// Re-read the live target after the transport helper succeeds. Besides
+	// recording the kernel-resolved backing device, this closes the window in
+	// which an external mount could appear after the initial idempotency check;
+	// the protocol helpers' legacy mounted fast paths cannot bypass compatibility
+	// validation.
+	if handled, existingErr := d.handleExistingStage(req, attachDriver, capability, expectedSource); handled {
+		if existingErr != nil {
+			return nil, existingErr
+		}
+		klog.Infof("Volume %s staged successfully at %s", volumeID, stagingPath)
+		return &csi.NodeStageVolumeResponse{}, nil
+	} else if existingErr != nil {
+		return nil, existingErr
+	}
+
+	// Some unit-test transports do not populate a real mount table. Preserve a
+	// best-effort record for those and for unusual mount helpers whose successful
+	// result is not immediately visible to findmnt.
+	d.rememberStage(req, attachDriver, capability, expectedSource)
 	klog.Infof("Volume %s staged successfully at %s", volumeID, stagingPath)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
@@ -273,6 +726,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		} else {
 			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI)
 		}
+		d.deleteStageRecord(stagingPath)
 		klog.Infof("Volume %s unstaged successfully", volumeID)
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
@@ -324,6 +778,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, attachDriver)
 	}
 
+	d.deleteStageRecord(stagingPath)
 	klog.Infof("Volume %s unstaged successfully", volumeID)
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
@@ -388,6 +843,10 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
+	capability, err := nodeCapabilityForRequest(req.GetVolumeCapability())
+	if err != nil {
+		return nil, err
+	}
 	eventObject := nodeVolumeEventRef(req.GetVolumeContext(), volumeID, d.nodeID)
 
 	klog.Infof("NodePublishVolume: volumeID=%s, targetPath=%s, stagingPath=%s", volumeID, targetPath, stagingPath)
@@ -398,20 +857,36 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		return nil, status.Error(codes.Aborted, "operation already in progress")
 	}
 	defer d.releaseOperationLock(lockKey)
+	targetLockKey := nodeTargetLockKey(targetPath)
+	if !d.acquireOperationLock(targetLockKey) {
+		return nil, status.Error(codes.Aborted, "target path operation already in progress")
+	}
+	defer d.releaseOperationLock(targetLockKey)
+
+	expectedSource, err := d.expectedPublicationSource(req, capability)
+	if err != nil {
+		return nil, err
+	}
 
 	// Ensure target directory exists
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o750); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create target directory: %v", err)
+	if mkdirErr := os.MkdirAll(filepath.Dir(targetPath), 0o750); mkdirErr != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create target directory: %v", mkdirErr)
 	}
 
 	// Check if already mounted
-	mounted, err := util.IsMounted(targetPath)
+	mounted, err := nodeIsMounted(targetPath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to check mount status: %v", err)
 	}
 	if mounted {
-		klog.Infof("Volume %s already mounted at %s", volumeID, targetPath)
+		if err := d.validateExistingPublication(req, capability, expectedSource); err != nil {
+			return nil, err
+		}
+		klog.Infof("Volume %s already mounted compatibly at %s", volumeID, targetPath)
 		return &csi.NodePublishVolumeResponse{}, nil
+	}
+	if err := d.ensurePublicationTargetAllowed(req, capability, expectedSource); err != nil {
+		return nil, err
 	}
 
 	// Determine mount options
@@ -460,6 +935,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 				d.recordWarningEvent(eventObject, EventReasonMountFailed, operationErr.Error())
 				return nil, operationErr
 			}
+			d.rememberPublication(req, capability, expectedSource)
 			klog.Infof("Block volume %s published successfully at %s", volumeID, targetPath)
 			return &csi.NodePublishVolumeResponse{}, nil
 		}
@@ -495,6 +971,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		}
 	}
 
+	d.rememberPublication(req, capability, expectedSource)
 	klog.Infof("Volume %s published successfully at %s", volumeID, targetPath)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
@@ -519,6 +996,11 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 		return nil, status.Error(codes.Aborted, "operation already in progress")
 	}
 	defer d.releaseOperationLock(lockKey)
+	targetLockKey := nodeTargetLockKey(targetPath)
+	if !d.acquireOperationLock(targetLockKey) {
+		return nil, status.Error(codes.Aborted, "target path operation already in progress")
+	}
+	defer d.releaseOperationLock(targetLockKey)
 
 	// Unmount target path
 	if err := util.Unmount(targetPath); err != nil {
@@ -539,6 +1021,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	if err := os.RemoveAll(targetPath); err != nil {
 		klog.Warningf("Failed to remove target path: %v", err)
 	}
+	d.deletePublicationRecord(targetPath)
 
 	klog.Infof("Volume %s unpublished successfully", volumeID)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -783,6 +1266,10 @@ func sessionTargetMatchesExpected(actual, expected string) bool {
 }
 
 func (d *Driver) iscsiShareName(volumeID string) string {
+	// NamePrefix was historically accepted by configuration but not applied to
+	// target names. Keep existing target identity stable for installations that
+	// set it, while using the prefix solely as the explicit session-GC ownership
+	// boundary.
 	return protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
 }
 
@@ -833,6 +1320,10 @@ func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capa
 
 func nodeVolumeLockKey(volumeID string) string {
 	return "node:" + volumeID
+}
+
+func nodeTargetLockKey(targetPath string) string {
+	return "node-target:" + filepath.Clean(targetPath)
 }
 
 func resolveNodeExpansionDevice(req *csi.NodeExpandVolumeRequest) (devicePath string, rawBlock bool, err error) {

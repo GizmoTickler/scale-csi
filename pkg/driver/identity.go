@@ -83,6 +83,7 @@ func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeRe
 
 func (d *Driver) observeTrueNASConnection() bool {
 	if d.truenasClient == nil {
+		SetTrueNASConnectionStatus(false)
 		SetTrueNASActiveConnections(0)
 		return false
 	}

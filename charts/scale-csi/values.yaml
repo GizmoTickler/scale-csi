@@ -212,11 +212,14 @@ iscsi:
   # Target portal port
   portalPort: 3260
 
-  # Additional target portals for multipath
+  # Reserved for future multipath support. Currently ignored; configuring
+  # entries produces a startup warning and only portal is used.
   targetPortals: []
 
-  # Prefix for target and extent names. The IQN basename is configured globally
-  # on TrueNAS and is not controlled by this chart.
+  # Existing target-name prefix used to scope node-side iSCSI session GC.
+  # For compatibility this value is not prepended to newly created targets;
+  # set it to a stable prefix already shared by this driver's target names.
+  # The IQN basename is configured globally on TrueNAS.
   namePrefix: ""
 
   # Explicit TrueNAS portal/initiator group associations for created targets
@@ -444,8 +447,8 @@ reconcile:
 # Periodically cleans up orphaned iSCSI/NVMe-oF sessions that may leak
 # when pods are deleted, nodes restart, or unstage operations fail
 sessionGC:
-  # Enable periodic garbage collection (default: true via interval > 0)
-  # Set interval to 0 to disable
+  # Enable periodic garbage collection (default: true). Set this false to
+  # disable GC; an enabled zero/negative interval uses the 300-second default.
   enabled: true
 
   # Interval between GC runs in seconds (default: 300 = 5 minutes)

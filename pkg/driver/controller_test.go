@@ -342,6 +342,7 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 		request    *csi.VolumeContentSource
 		wantType   string
 		wantID     string
+		wantCode   codes.Code
 	}{
 		{
 			name:       "stored snapshot source",
@@ -350,8 +351,26 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 			request: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
 				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "request-snapshot"},
 			}},
+			wantCode: codes.AlreadyExists,
+		},
+		{
+			name:       "matching stored snapshot source",
+			storedType: "snapshot",
+			storedID:   "stored-snapshot",
+			request: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "stored-snapshot"},
+			}},
 			wantType: "snapshot",
 			wantID:   "stored-snapshot",
+		},
+		{
+			name:       "malformed durable source is not inferred",
+			storedType: "unexpected",
+			storedID:   "stored-source",
+			request: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "request-volume"},
+			}},
+			wantCode: codes.AlreadyExists,
 		},
 		{
 			name: "request fallback",
@@ -388,6 +407,12 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 				VolumeCapabilities:  []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 				VolumeContentSource: tc.request,
 			})
+			if tc.wantCode != codes.OK {
+				require.Error(t, err)
+				assert.Equal(t, tc.wantCode, status.Code(err))
+				assert.Nil(t, resp)
+				return
+			}
 			require.NoError(t, err)
 			require.NotNil(t, resp.GetVolume().GetContentSource())
 			if tc.wantType == "snapshot" {
@@ -397,6 +422,33 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateVolumeRejectsNFSRawBlockBeforeMutation(t *testing.T) {
+	client := &datasetCreateCaptureMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS: NFSConfig{Enabled: true, ShareHost: "192.0.2.10"},
+		},
+		truenasClient: client,
+	}
+
+	resp, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:       "nfs-block-must-fail-early",
+		Parameters: map[string]string{"protocol": "nfs"},
+		VolumeCapabilities: []*csi.VolumeCapability{{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER},
+		}},
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Nil(t, resp)
+	assert.Empty(t, client.params, "NFS raw-block rejection must precede dataset creation")
+	_, lookupErr := client.DatasetGet(context.Background(), "pool/parent/nfs-block-must-fail-early")
+	require.Error(t, lookupErr)
 }
 
 func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {

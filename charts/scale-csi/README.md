@@ -77,8 +77,8 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `iscsi.enabled` | Render iSCSI configuration | `true` |
 | `iscsi.portal` | Target portal host; falls back to `truenas.host` | `""` |
 | `iscsi.portalPort` | Target portal port | `3260` |
-| `iscsi.targetPortals` | Additional multipath portals | `[]` |
-| `iscsi.namePrefix` | Target and extent name prefix | `""` |
+| `iscsi.targetPortals` | Reserved and currently ignored (multipath unsupported; setting it emits a startup warning) | `[]` |
+| `iscsi.namePrefix` | Existing target-name prefix used to scope node session GC (not prepended during target creation for compatibility) | `""` |
 | `iscsi.targetGroups` | Explicit portal/initiator group IDs; empty = auto-resolve from `iscsi.portal` | `[]` |
 | `iscsi.extentBlocksize` | Extent block size | `512` |
 | `iscsi.extentDisablePhysicalBlocksize` | Disable extent physical-block-size reporting | `false` |

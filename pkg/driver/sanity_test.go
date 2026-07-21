@@ -255,10 +255,25 @@ done
 
 case "$name" in
 	findmnt)
-		if [ -n "$FAKE_CSI_MOUNT_TABLE" ] && [ -f "$FAKE_CSI_MOUNT_TABLE" ] && grep -F -x -q "$last" "$FAKE_CSI_MOUNT_TABLE"; then
+		target="$last"
+		next_mountpoint=false
+		for arg in "$@"; do
+			if [ "$next_mountpoint" = true ]; then target="$arg"; next_mountpoint=false; continue; fi
+			if [ "$arg" = "--mountpoint" ]; then next_mountpoint=true; fi
+		done
+		line=""
+		if [ -n "$FAKE_CSI_MOUNT_TABLE" ] && [ -f "$FAKE_CSI_MOUNT_TABLE" ]; then
+			line="$(awk -F '\t' -v target="$target" '$1 == target { print; exit }' "$FAKE_CSI_MOUNT_TABLE")"
+		fi
+		if [ -n "$line" ]; then
+			source="$(printf '%s\n' "$line" | cut -f2)"
+			fstype="$(printf '%s\n' "$line" | cut -f3)"
+			options="$(printf '%s\n' "$line" | cut -f4)"
 			case " $* " in
-				*" FSTYPE "*) printf '%s\n' 'nfs4' ;;
-				*" SOURCE "*) printf '%s\n' '192.0.2.10:/mnt/tank/csi-sanity' ;;
+				*" SOURCE,FSTYPE,OPTIONS "*) printf '%s %s %s\n' "$source" "$fstype" "$options" ;;
+				*" FSTYPE "*) printf '%s\n' "$fstype" ;;
+				*" SOURCE "*) printf '%s\n' "$source" ;;
+				*" OPTIONS "*) printf '%s\n' "$options" ;;
 				*) printf '%s\n' 'mounted' ;;
 			esac
 			exit 0
@@ -268,15 +283,39 @@ case "$name" in
 	mount)
 		if [ -n "$FAKE_CSI_MOUNT_TABLE" ]; then
 			touch "$FAKE_CSI_MOUNT_TABLE"
-			if ! grep -F -x -q "$last" "$FAKE_CSI_MOUNT_TABLE"; then
-				printf '%s\n' "$last" >> "$FAKE_CSI_MOUNT_TABLE"
+			previous=""
+			source=""
+			fstype="none"
+			options="rw"
+			next_fstype=false
+			next_options=false
+			mount_options=""
+			for arg in "$@"; do
+				if [ "$next_fstype" = true ]; then fstype="$arg"; next_fstype=false; continue; fi
+				if [ "$next_options" = true ]; then mount_options="$arg"; next_options=false; continue; fi
+				if [ "$arg" = "-t" ]; then next_fstype=true; continue; fi
+				if [ "$arg" = "-o" ]; then next_options=true; continue; fi
+				previous="$source"
+				source="$arg"
+			done
+			case ",$mount_options," in *,ro,*|*,remount,bind,ro,*) options="ro" ;; esac
+			if [ "$source" = "$last" ]; then source="$previous"; fi
+			if printf '%s' "$mount_options" | grep -q 'remount'; then
+				existing="$(awk -F '\t' -v target="$last" '$1 == target { print; exit }' "$FAKE_CSI_MOUNT_TABLE")"
+				if [ -n "$existing" ]; then
+					source="$(printf '%s\n' "$existing" | cut -f2)"
+					fstype="$(printf '%s\n' "$existing" | cut -f3)"
+				fi
 			fi
+			awk -F '\t' -v target="$last" '$1 != target' "$FAKE_CSI_MOUNT_TABLE" > "$FAKE_CSI_MOUNT_TABLE.tmp" || true
+			printf '%s\t%s\t%s\t%s\n' "$last" "$source" "$fstype" "$options" >> "$FAKE_CSI_MOUNT_TABLE.tmp"
+			mv "$FAKE_CSI_MOUNT_TABLE.tmp" "$FAKE_CSI_MOUNT_TABLE"
 		fi
 		exit 0
 		;;
 	umount)
 		if [ -n "$FAKE_CSI_MOUNT_TABLE" ] && [ -f "$FAKE_CSI_MOUNT_TABLE" ]; then
-			grep -F -x -v "$last" "$FAKE_CSI_MOUNT_TABLE" > "$FAKE_CSI_MOUNT_TABLE.tmp" || true
+			awk -F '\t' -v target="$last" '$1 != target' "$FAKE_CSI_MOUNT_TABLE" > "$FAKE_CSI_MOUNT_TABLE.tmp" || true
 			mv "$FAKE_CSI_MOUNT_TABLE.tmp" "$FAKE_CSI_MOUNT_TABLE"
 		fi
 		exit 0

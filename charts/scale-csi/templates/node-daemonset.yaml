@@ -17,9 +17,6 @@ spec:
         {{- include "scale-csi.nodeSelectorLabels" . | nindent 8 }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        {{- if not .Values.truenas.existingSecret }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
-        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -68,14 +65,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            {{- if or .Values.truenas.apiKey .Values.truenas.existingSecret }}
-            - name: TRUENAS_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "scale-csi.secretName" . }}
-                  key: api-key
-                  optional: true
-            {{- end }}
             {{- with .Values.node.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
