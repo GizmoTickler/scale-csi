@@ -65,8 +65,11 @@ func IsNotFoundError(err error) bool {
 	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return strings.Contains(strings.ToLower(apiErr.Message), "not found") ||
-			strings.Contains(strings.ToLower(apiErr.Message), "does not exist")
+		if errno, ok := APIErrno(apiErr); ok {
+			return errno == syscall.ENOENT
+		}
+		message := strings.ToLower(apiErr.FullError())
+		return strings.Contains(message, "not found") || strings.Contains(message, "does not exist")
 	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "not found") || strings.Contains(errStr, "does not exist")
@@ -79,9 +82,111 @@ func IsAlreadyExistsError(err error) bool {
 	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return strings.Contains(strings.ToLower(apiErr.Message), "already exists")
+		if errno, ok := APIErrno(apiErr); ok {
+			return errno == syscall.EEXIST
+		}
+		return strings.Contains(strings.ToLower(apiErr.FullError()), "already exists")
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
+}
+
+// MessageFallbackContains is for APIs whose older releases did not expose a
+// semantic errno. If a structured errno is present it is authoritative, even
+// when the accompanying human-readable text contains a familiar substring.
+func MessageFallbackContains(err error, fragments ...string) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := APIErrno(err); ok {
+		return false
+	}
+	messageText := err.Error()
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		messageText = apiErr.FullError()
+	}
+	message := strings.ToLower(messageText)
+	for _, fragment := range fragments {
+		if strings.Contains(message, strings.ToLower(fragment)) {
+			return true
+		}
+	}
+	return false
+}
+
+// APIErrno extracts a structured errno from an APIError. TrueNAS error Data
+// varies between methods and releases, so the walk accepts nested maps/lists
+// but only values under an explicit errno key. Callers use message matching
+// only when this authoritative signal is absent.
+func APIErrno(err error) (syscall.Errno, bool) {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return 0, false
+	}
+	// JSON-RPC/application codes used by TrueNAS are negative. A positive code
+	// is a native errno and remains authoritative even when it is not one of the
+	// two idempotency values a caller currently recognizes.
+	if apiErr.Code > 0 {
+		return syscall.Errno(apiErr.Code), true
+	}
+	return findErrno(apiErr.Data)
+}
+
+func findErrno(value interface{}) (syscall.Errno, bool) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		for key, child := range typed {
+			if strings.EqualFold(key, "errno") || strings.HasSuffix(strings.ToLower(key), "_errno") {
+				if errno, ok := parseErrnoValue(child); ok {
+					return errno, true
+				}
+			}
+		}
+		for _, child := range typed {
+			if errno, ok := findErrno(child); ok {
+				return errno, true
+			}
+		}
+	case []interface{}:
+		for _, child := range typed {
+			if errno, ok := findErrno(child); ok {
+				return errno, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func parseErrnoValue(value interface{}) (syscall.Errno, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return syscall.Errno(int(typed)), typed >= 0 && typed == float64(int(typed))
+	case int:
+		return syscall.Errno(typed), typed >= 0
+	case string:
+		switch strings.ToUpper(strings.TrimSpace(typed)) {
+		case "ENOENT":
+			return syscall.ENOENT, true
+		case "EEXIST":
+			return syscall.EEXIST, true
+		case "EACCES":
+			return syscall.EACCES, true
+		case "EPERM":
+			return syscall.EPERM, true
+		case "EBUSY":
+			return syscall.EBUSY, true
+		case "EINVAL":
+			return syscall.EINVAL, true
+		case "ENOTEMPTY":
+			return syscall.ENOTEMPTY, true
+		case "EIO":
+			return syscall.EIO, true
+		}
+		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
+		return syscall.Errno(parsed), err == nil && parsed >= 0
+	default:
+		return 0, false
+	}
 }
 
 // IsConnectionError returns true if the error indicates a connection problem.
@@ -1355,7 +1460,7 @@ func (c *Client) ServiceReload(ctx context.Context, service string) error {
 	if err != nil {
 		// TrueNAS 26.0 removed service.reload in favor of
 		// service.control(verb, service, options) (validated live).
-		if isMethodNotFoundError(err) || strings.Contains(err.Error(), "Method call error") {
+		if isMethodNotFoundError(err) || MessageFallbackContains(err, "method call error") {
 			if _, ctlErr := c.Call(ctx, "service.control", "RELOAD", service, map[string]interface{}{}); ctlErr == nil {
 				klog.Infof("Service %s reloaded successfully (service.control)", service)
 				return nil

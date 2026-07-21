@@ -533,18 +533,18 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.CreateVolume(context.Background(), req)
 			require.NoError(t, err)
 		}},
-		// NFS deletion keeps one dependency query apiece before deleting the share
-		// and dataset, preventing a late snapshot failure from orphaning the share.
-		{name: "DeleteVolume NFS", want: 5, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// NFS deletion validates the cached share ID's export-path backreference
+		// before the dependency guards and destructive calls.
+		{name: "DeleteVolume NFS", want: 6, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-nfs", "nfs"))
 			require.NoError(t, err)
 			client.resetCalls()
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-nfs"})
 			require.NoError(t, err)
 		}},
-		// iSCSI deletion pins direct ID-based cleanup plus the two dependency guards,
-		// avoiding fallback resource scans on a healthy managed volume.
-		{name: "DeleteVolume iSCSI", want: 7, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// iSCSI deletion validates target, extent, and association backreferences
+		// before cleanup, then retains the two dataset dependency guards.
+		{name: "DeleteVolume iSCSI", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-iscsi", "iscsi"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -603,8 +603,8 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			require.NoError(t, err)
 		}},
 		// Snapshot cloning pins direct name resolution, one clone and readiness wait,
-		// quota/share setup, and the two batched dataset-property updates.
-		{name: "CreateVolume clone from snapshot", want: 9, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// quota/share setup, ownership stamping, and final identity updates.
+		{name: "CreateVolume clone from snapshot", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent/clone-source", Type: "FILESYSTEM", Refquota: testGiB,
 			})

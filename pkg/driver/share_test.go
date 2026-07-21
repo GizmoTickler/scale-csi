@@ -360,8 +360,10 @@ func TestDeleteNFSShare_PropagatesDeleteError(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Store NFS share ID in properties
-	err = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, "42")
+	share, err := mockClient.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: "/mnt/" + datasetName})
+	require.NoError(t, err)
+	// Store the ID of the relationship-proven share.
+	err = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, strconv.Itoa(share.ID))
 	require.NoError(t, err)
 
 	// Inject error for NFSShareDelete
@@ -373,7 +375,7 @@ func TestDeleteNFSShare_PropagatesDeleteError(t *testing.T) {
 	// Verify error is propagated (not swallowed)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to delete NFS share")
-	assert.Contains(t, err.Error(), "42")
+	assert.Contains(t, err.Error(), strconv.Itoa(share.ID))
 }
 
 // TestDeleteNFSShare_SucceedsForMissingProperty tests idempotent deletion
@@ -430,10 +432,15 @@ func TestDeleteISCSIShare_PropagatesCleanupErrors(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Store iSCSI resource IDs in properties
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetID, "1")
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, "2")
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetExtentID, "3")
+	target, err := mockClient.ISCSITargetCreate(ctx, d.iscsiShareName("test-iscsi-vol"), "", "ISCSI", nil)
+	require.NoError(t, err)
+	extent, err := mockClient.ISCSIExtentCreate(ctx, d.iscsiShareName("test-iscsi-vol"), "zvol/"+datasetName, "", 512, true, "SSD")
+	require.NoError(t, err)
+	association, err := mockClient.ISCSITargetExtentCreate(ctx, target.ID, extent.ID, 0)
+	require.NoError(t, err)
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetID, strconv.Itoa(target.ID))
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, strconv.Itoa(extent.ID))
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetExtentID, strconv.Itoa(association.ID))
 
 	// Inject error for extent deletion
 	mockClient.InjectISCSIExtentDeleteError = fmt.Errorf("extent still in use")
@@ -467,9 +474,15 @@ func TestDeleteISCSIShare_MultipleErrors(t *testing.T) {
 		Name: datasetName,
 		Type: "VOLUME",
 	})
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetID, "1")
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, "2")
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetExtentID, "3")
+	target, err := mockClient.ISCSITargetCreate(ctx, d.iscsiShareName("test-iscsi-multi-err"), "", "ISCSI", nil)
+	require.NoError(t, err)
+	extent, err := mockClient.ISCSIExtentCreate(ctx, d.iscsiShareName("test-iscsi-multi-err"), "zvol/"+datasetName, "", 512, true, "SSD")
+	require.NoError(t, err)
+	association, err := mockClient.ISCSITargetExtentCreate(ctx, target.ID, extent.ID, 0)
+	require.NoError(t, err)
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetID, strconv.Itoa(target.ID))
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, strconv.Itoa(extent.ID))
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropISCSITargetExtentID, strconv.Itoa(association.ID))
 
 	// Inject multiple errors
 	mockClient.InjectISCSITargetDeleteError = fmt.Errorf("target delete failed")
@@ -477,7 +490,7 @@ func TestDeleteISCSIShare_MultipleErrors(t *testing.T) {
 	mockClient.InjectISCSITargetExtentDeleteError = fmt.Errorf("association delete failed")
 
 	// Call deleteISCSIShare
-	err := d.deleteISCSIShare(ctx, datasetName)
+	err = d.deleteISCSIShare(ctx, datasetName)
 
 	// Verify error contains multiple errors
 	assert.Error(t, err)
@@ -509,15 +522,18 @@ func TestDeleteNVMeoFShare_PropagatesCleanupErrors(t *testing.T) {
 		Name: datasetName,
 		Type: "VOLUME",
 	})
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID, "1")
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, "2")
-	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFPortSubsysID, "3")
+	subsystem, err := mockClient.NVMeoFSubsystemCreate(ctx, d.nvmeSubsystemName(datasetName), true, nil)
+	require.NoError(t, err)
+	namespace, err := mockClient.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+datasetName, "ZVOL")
+	require.NoError(t, err)
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID, strconv.Itoa(subsystem.ID))
+	_ = mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, strconv.Itoa(namespace.ID))
 
 	// Inject error for subsystem deletion
 	mockClient.InjectNVMeoFSubsystemDeleteError = fmt.Errorf("subsystem deletion failed")
 
 	// Call deleteNVMeoFShare
-	err := d.deleteNVMeoFShare(ctx, datasetName)
+	err = d.deleteNVMeoFShare(ctx, datasetName)
 
 	// Verify error is propagated
 	assert.Error(t, err)
@@ -544,7 +560,7 @@ func TestDeleteNVMeoFShare_FetchesPortSubsysAssociationsOnce(t *testing.T) {
 
 	err = d.deleteNVMeoFShareForDataset(context.Background(), ds, datasetName)
 	require.Error(t, err)
-	assert.Equal(t, 2, mockClient.portSubsysDeleteCalls)
+	assert.Equal(t, 1, mockClient.portSubsysDeleteCalls)
 	assert.Equal(t, 1, mockClient.portSubsysListCalls)
 }
 
@@ -1037,20 +1053,92 @@ func TestEnsureShareExistsReturnsTransientVerificationErrors(t *testing.T) {
 		t.Run(shareType.String(), func(t *testing.T) {
 			client := &shareVerificationErrorMock{MockClient: truenas.NewMockClient(), err: fmt.Errorf("temporary API outage")}
 			ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{}}
+			config := &Config{}
 			switch shareType {
 			case ShareTypeNFS:
 				ds.UserProperties[PropNFSShareID] = truenas.UserProperty{Value: "1"}
 			case ShareTypeISCSI:
-				ds.UserProperties[PropISCSITargetExtentID] = truenas.UserProperty{Value: "1"}
+				target, createErr := client.ISCSITargetCreate(context.Background(), "vol", "", "ISCSI", nil)
+				require.NoError(t, createErr)
+				extent, createErr := client.ISCSIExtentCreate(context.Background(), "vol", "zvol/tank/csi/vol", "", 512, true, "SSD")
+				require.NoError(t, createErr)
+				association, createErr := client.ISCSITargetExtentCreate(context.Background(), target.ID, extent.ID, 0)
+				require.NoError(t, createErr)
+				ds.UserProperties[PropISCSITargetID] = truenas.UserProperty{Value: strconv.Itoa(target.ID)}
+				ds.UserProperties[PropISCSIExtentID] = truenas.UserProperty{Value: strconv.Itoa(extent.ID)}
+				ds.UserProperties[PropISCSITargetExtentID] = truenas.UserProperty{Value: strconv.Itoa(association.ID)}
 			case ShareTypeNVMeoF:
 				ds.UserProperties[PropNVMeoFNamespaceID] = truenas.UserProperty{Value: "1"}
+				config.NVMeoF.SubsystemAllowAnyHost = true
 			}
-			d := &Driver{config: &Config{}, truenasClient: client}
+			d := &Driver{config: config, truenasClient: client}
 			err := d.ensureShareExists(context.Background(), ds, "tank/csi/vol", "vol", shareType)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "temporary API outage")
 		})
 	}
+}
+
+func TestStoredBackendIDBackreferenceMismatchReResolvesByRelationship(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("NFS share path", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		datasetName := "pool/parent/owned-nfs"
+		ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
+		require.NoError(t, err)
+		foreign, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: "/mnt/pool/parent/foreign"})
+		require.NoError(t, err)
+		expected, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: ds.Mountpoint})
+		require.NoError(t, err)
+		require.NoError(t, client.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, strconv.Itoa(foreign.ID)))
+
+		d := &Driver{config: &Config{}, truenasClient: client}
+		resolved, err := d.resolveNFSShare(ctx, ds, datasetName)
+		require.NoError(t, err)
+		require.NotNil(t, resolved)
+		assert.Equal(t, expected.ID, resolved.ID)
+	})
+
+	t.Run("iSCSI extent disk", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		datasetName := "pool/parent/owned-iscsi"
+		ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
+		require.NoError(t, err)
+		foreign, err := client.ISCSIExtentCreate(ctx, "foreign", "zvol/pool/parent/foreign", "", 512, true, "SSD")
+		require.NoError(t, err)
+		expected, err := client.ISCSIExtentCreate(ctx, "owned-iscsi", "zvol/"+datasetName, "", 512, true, "SSD")
+		require.NoError(t, err)
+		require.NoError(t, client.DatasetSetUserProperty(ctx, datasetName, PropISCSIExtentID, strconv.Itoa(foreign.ID)))
+
+		d := &Driver{config: &Config{}, truenasClient: client}
+		resolved, err := d.resolveISCSIExtent(ctx, ds, datasetName)
+		require.NoError(t, err)
+		require.NotNil(t, resolved)
+		assert.Equal(t, expected.ID, resolved.ID)
+	})
+
+	t.Run("NVMe namespace device", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		datasetName := "pool/parent/owned-nvme"
+		ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
+		require.NoError(t, err)
+		foreignSubsystem, err := client.NVMeoFSubsystemCreate(ctx, "foreign", false, nil)
+		require.NoError(t, err)
+		foreign, err := client.NVMeoFNamespaceCreate(ctx, foreignSubsystem.ID, "zvol/pool/parent/foreign", "ZVOL")
+		require.NoError(t, err)
+		expectedSubsystem, err := client.NVMeoFSubsystemCreate(ctx, "owned-nvme", false, nil)
+		require.NoError(t, err)
+		expected, err := client.NVMeoFNamespaceCreate(ctx, expectedSubsystem.ID, "zvol/"+datasetName, "ZVOL")
+		require.NoError(t, err)
+		require.NoError(t, client.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, strconv.Itoa(foreign.ID)))
+
+		d := &Driver{config: &Config{}, truenasClient: client}
+		resolved, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
+		require.NoError(t, err)
+		require.NotNil(t, resolved)
+		assert.Equal(t, expected.ID, resolved.ID)
+	})
 }
 
 // TestEnsureShareExists_MissingShare tests that ensureShareExists creates
@@ -1136,7 +1224,7 @@ func TestEnsureShareExistsNVMeoFReconcilesRestrictedHosts(t *testing.T) {
 	nqn := "nqn.2014-08.org.nvmexpress:new-node"
 	host, err := mockClient.NVMeoFHostCreate(ctx, nqn)
 	require.NoError(t, err)
-	subsys, err := mockClient.NVMeoFSubsystemCreate(ctx, "existing-subsystem", true, nil)
+	subsys, err := mockClient.NVMeoFSubsystemCreate(ctx, "existing-nvme", true, nil)
 	require.NoError(t, err)
 	subsys.AllowAnyHost = false
 	subsys.Hosts = nil
@@ -1146,7 +1234,7 @@ func TestEnsureShareExistsNVMeoFReconcilesRestrictedHosts(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID, strconv.Itoa(subsys.ID)))
 	require.NoError(t, mockClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, "9"))
-	mockClient.NVMeNamespaces[9] = &truenas.NVMeoFNamespace{ID: 9, SubsystemID: subsys.ID}
+	mockClient.NVMeNamespaces[9] = &truenas.NVMeoFNamespace{ID: 9, SubsystemID: subsys.ID, DevicePath: "zvol/" + datasetName}
 	ds, err := mockClient.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
 
@@ -1168,7 +1256,7 @@ func TestEnsureShareExistsNVMeoFReResolvesStaleHostID(t *testing.T) {
 	nqn := "nqn.2014-08.org.nvmexpress:moved-node"
 	oldHost, err := baseClient.NVMeoFHostCreate(ctx, nqn)
 	require.NoError(t, err)
-	subsys, err := baseClient.NVMeoFSubsystemCreate(ctx, "stale-host-subsystem", true, nil)
+	subsys, err := baseClient.NVMeoFSubsystemCreate(ctx, "stale-host-nvme", true, nil)
 	require.NoError(t, err)
 	subsys.AllowAnyHost = false
 	subsys.Hosts = nil
@@ -1178,7 +1266,7 @@ func TestEnsureShareExistsNVMeoFReResolvesStaleHostID(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, baseClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFSubsystemID, strconv.Itoa(subsys.ID)))
 	require.NoError(t, baseClient.DatasetSetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID, "10"))
-	baseClient.NVMeNamespaces[10] = &truenas.NVMeoFNamespace{ID: 10, SubsystemID: subsys.ID}
+	baseClient.NVMeNamespaces[10] = &truenas.NVMeoFNamespace{ID: 10, SubsystemID: subsys.ID, DevicePath: "zvol/" + datasetName}
 	ds, err := baseClient.DatasetGet(ctx, datasetName)
 	require.NoError(t, err)
 

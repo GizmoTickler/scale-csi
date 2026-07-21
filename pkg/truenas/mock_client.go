@@ -21,6 +21,7 @@ type MockClient struct {
 	ISCSIExtents       map[int]*ISCSIExtent
 	TargetExtents      map[int]*ISCSITargetExtent
 	NVMeHosts          map[string]*NVMeoFHost
+	NVMeHostSubsystems map[int]*NVMeoFHostSubsys
 	NVMeSubsystems     map[int]*NVMeoFSubsystem
 	NVMeNamespaces     map[int]*NVMeoFNamespace
 	ISCSIPortals       map[int]*ISCSIPortal
@@ -46,15 +47,16 @@ type DatasetDeleteCall struct {
 // NewMockClient creates a new MockClient.
 func NewMockClient() *MockClient {
 	return &MockClient{
-		Datasets:       make(map[string]*Dataset),
-		Snapshots:      make(map[string]*Snapshot),
-		NFSShares:      make(map[int]*NFSShare),
-		ISCSITargets:   make(map[int]*ISCSITarget),
-		ISCSIExtents:   make(map[int]*ISCSIExtent),
-		TargetExtents:  make(map[int]*ISCSITargetExtent),
-		NVMeHosts:      make(map[string]*NVMeoFHost),
-		NVMeSubsystems: make(map[int]*NVMeoFSubsystem),
-		NVMeNamespaces: make(map[int]*NVMeoFNamespace),
+		Datasets:           make(map[string]*Dataset),
+		Snapshots:          make(map[string]*Snapshot),
+		NFSShares:          make(map[int]*NFSShare),
+		ISCSITargets:       make(map[int]*ISCSITarget),
+		ISCSIExtents:       make(map[int]*ISCSIExtent),
+		TargetExtents:      make(map[int]*ISCSITargetExtent),
+		NVMeHosts:          make(map[string]*NVMeoFHost),
+		NVMeHostSubsystems: make(map[int]*NVMeoFHostSubsys),
+		NVMeSubsystems:     make(map[int]*NVMeoFSubsystem),
+		NVMeNamespaces:     make(map[int]*NVMeoFNamespace),
 		// Default portal/initiator fixtures cover the portal addresses used
 		// across the test suites so target-group auto-resolution succeeds
 		// without per-test setup. Tests may replace these maps.
@@ -103,6 +105,10 @@ func (m *MockClient) ISCSIInitiatorList(ctx context.Context) ([]*ISCSIInitiator,
 
 // ISCSIInitiatorCreate creates a mock allow-all initiator group.
 func (m *MockClient) ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISCSIInitiator, error) {
+	return m.ISCSIInitiatorCreateWithInitiators(ctx, nil, comment)
+}
+
+func (m *MockClient) ISCSIInitiatorCreateWithInitiators(ctx context.Context, initiators []string, comment string) (*ISCSIInitiator, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.InjectError != nil {
@@ -112,9 +118,36 @@ func (m *MockClient) ISCSIInitiatorCreate(ctx context.Context, comment string) (
 	for m.ISCSIInitiators[id] != nil {
 		id++
 	}
-	group := &ISCSIInitiator{ID: id, Comment: comment}
+	group := &ISCSIInitiator{ID: id, Initiators: append([]string(nil), initiators...), Comment: comment}
 	m.ISCSIInitiators[id] = group
 	return group, nil
+}
+
+func (m *MockClient) ISCSIInitiatorGet(ctx context.Context, id int) (*ISCSIInitiator, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ISCSIInitiators[id], nil
+}
+
+func (m *MockClient) ISCSIInitiatorUpdate(ctx context.Context, id int, initiators []string, comment string) (*ISCSIInitiator, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	group := m.ISCSIInitiators[id]
+	if group == nil {
+		return nil, fmt.Errorf("iSCSI initiator group not found")
+	}
+	group.Initiators = append([]string(nil), initiators...)
+	if comment != "" {
+		group.Comment = comment
+	}
+	return group, nil
+}
+
+func (m *MockClient) ISCSIInitiatorDelete(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.ISCSIInitiators, id)
+	return nil
 }
 
 // Core methods
@@ -329,6 +362,22 @@ func (m *MockClient) DatasetSetUserProperties(ctx context.Context, name string, 
 	}
 	for key, value := range properties {
 		ds.UserProperties[key] = UserProperty{Value: value}
+	}
+	return nil
+}
+
+func (m *MockClient) DatasetRemoveUserProperties(ctx context.Context, name string, keys []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	ds, ok := m.Datasets[name]
+	if !ok {
+		return &APIError{Code: -1, Message: "dataset not found"}
+	}
+	for _, key := range keys {
+		delete(ds.UserProperties, key)
 	}
 	return nil
 }
@@ -700,8 +749,17 @@ func (m *MockClient) NFSShareCreate(ctx context.Context, params *NFSShareCreateP
 	}
 	id := len(m.NFSShares) + 1
 	share := &NFSShare{
-		ID:   id,
-		Path: params.Path,
+		ID:           id,
+		Path:         params.Path,
+		Networks:     append([]string(nil), params.Networks...),
+		Hosts:        append([]string(nil), params.Hosts...),
+		Comment:      params.Comment,
+		Ro:           params.Ro,
+		MaprootUser:  params.MaprootUser,
+		MaprootGroup: params.MaprootGroup,
+		MapallUser:   params.MapallUser,
+		MapallGroup:  params.MapallGroup,
+		Enabled:      params.Enabled,
 	}
 	m.NFSShares[id] = share
 	return share, nil
@@ -749,10 +807,22 @@ func (m *MockClient) NFSShareList(ctx context.Context) ([]*NFSShare, error) {
 }
 
 func (m *MockClient) NFSShareUpdate(ctx context.Context, id int, params map[string]interface{}) (*NFSShare, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.NFSShares[id], nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	share := m.NFSShares[id]
+	if share == nil {
+		return nil, fmt.Errorf("share not found")
+	}
+	if hosts, ok := params["hosts"].([]string); ok {
+		share.Hosts = append([]string(nil), hosts...)
+	}
+	if networks, ok := params["networks"].([]string); ok {
+		share.Networks = append([]string(nil), networks...)
+	}
+	if enabled, ok := params["enabled"].(bool); ok {
+		share.Enabled = enabled
+	}
+	return share, nil
 }
 
 // Service methods
@@ -785,6 +855,16 @@ func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode st
 	id := len(m.ISCSITargets) + 1
 	target := &ISCSITarget{ID: id, Name: name, Alias: alias, Mode: mode, Groups: groups}
 	m.ISCSITargets[id] = target
+	return target, nil
+}
+func (m *MockClient) ISCSITargetUpdate(ctx context.Context, id int, groups []ISCSITargetGroup) (*ISCSITarget, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	target := m.ISCSITargets[id]
+	if target == nil {
+		return nil, fmt.Errorf("iSCSI target not found")
+	}
+	target.Groups = append([]ISCSITargetGroup(nil), groups...)
 	return target, nil
 }
 func (m *MockClient) ISCSITargetDelete(ctx context.Context, id int, force bool) error {
@@ -977,13 +1057,19 @@ func (m *MockClient) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysI
 	if !hostFound {
 		return nil, fmt.Errorf("NVMe-oF host ID %d not found", hostID)
 	}
-	for _, existingHostID := range subsys.Hosts {
-		if existingHostID == hostID {
-			return &NVMeoFHostSubsys{ID: hostID, HostID: hostID, SubsysID: subsysID}, nil
+	for _, association := range m.NVMeHostSubsystems {
+		if association.HostID == hostID && association.SubsysID == subsysID {
+			return association, nil
 		}
 	}
 	subsys.Hosts = append(subsys.Hosts, hostID)
-	return &NVMeoFHostSubsys{ID: hostID, HostID: hostID, SubsysID: subsysID}, nil
+	id := len(m.NVMeHostSubsystems) + 1
+	for m.NVMeHostSubsystems[id] != nil {
+		id++
+	}
+	association := &NVMeoFHostSubsys{ID: id, HostID: hostID, HostNQN: mockNVMeHostNQN(m.NVMeHosts, hostID), SubsysID: subsysID}
+	m.NVMeHostSubsystems[id] = association
+	return association, nil
 }
 
 func (m *MockClient) NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error) {
@@ -992,14 +1078,53 @@ func (m *MockClient) NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID 
 	if m.InjectError != nil {
 		return nil, m.InjectError
 	}
-	if subsys := m.NVMeSubsystems[subsysID]; subsys != nil {
-		for _, existingHostID := range subsys.Hosts {
-			if existingHostID == hostID {
-				return &NVMeoFHostSubsys{ID: hostID, HostID: hostID, SubsysID: subsysID}, nil
-			}
+	for _, association := range m.NVMeHostSubsystems {
+		if association.HostID == hostID && association.SubsysID == subsysID {
+			return association, nil
 		}
 	}
 	return nil, nil
+}
+
+func mockNVMeHostNQN(hosts map[string]*NVMeoFHost, id int) string {
+	for nqn, host := range hosts {
+		if host.ID == id {
+			return nqn
+		}
+	}
+	return ""
+}
+
+func (m *MockClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFHostSubsys, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	associations := make([]*NVMeoFHostSubsys, 0)
+	for _, association := range m.NVMeHostSubsystems {
+		if association.SubsysID == subsysID {
+			associations = append(associations, association)
+		}
+	}
+	return associations, nil
+}
+
+func (m *MockClient) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	association := m.NVMeHostSubsystems[id]
+	if association == nil {
+		return nil
+	}
+	if subsystem := m.NVMeSubsystems[association.SubsysID]; subsystem != nil {
+		hosts := subsystem.Hosts[:0]
+		for _, hostID := range subsystem.Hosts {
+			if hostID != association.HostID {
+				hosts = append(hosts, hostID)
+			}
+		}
+		subsystem.Hosts = hosts
+	}
+	delete(m.NVMeHostSubsystems, id)
+	return nil
 }
 
 func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error) {
@@ -1009,9 +1134,6 @@ func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, all
 		return nil, m.InjectError
 	}
 	if !allowAnyHost {
-		if len(hostIDs) == 0 {
-			return nil, fmt.Errorf("restricted NVMe-oF subsystem requires at least one host ID")
-		}
 		for _, hostID := range hostIDs {
 			found := false
 			for _, host := range m.NVMeHosts {
@@ -1036,13 +1158,36 @@ func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, all
 		Hosts:        hosts,
 	}
 	m.NVMeSubsystems[id] = sub
+	for _, hostID := range hostIDs {
+		associationID := len(m.NVMeHostSubsystems) + 1
+		for m.NVMeHostSubsystems[associationID] != nil {
+			associationID++
+		}
+		m.NVMeHostSubsystems[associationID] = &NVMeoFHostSubsys{ID: associationID, HostID: hostID, HostNQN: mockNVMeHostNQN(m.NVMeHosts, hostID), SubsysID: id}
+	}
 	return sub, nil
+}
+
+func (m *MockClient) NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*NVMeoFSubsystem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	subsystem := m.NVMeSubsystems[id]
+	if subsystem == nil {
+		return nil, fmt.Errorf("not found")
+	}
+	subsystem.AllowAnyHost = allowAnyHost
+	return subsystem, nil
 }
 func (m *MockClient) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	delete(m.NVMeSubsystems, id)
+	for associationID, association := range m.NVMeHostSubsystems {
+		if association.SubsysID == id {
+			delete(m.NVMeHostSubsystems, associationID)
+		}
+	}
 	return nil
 }
 func (m *MockClient) NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error) {

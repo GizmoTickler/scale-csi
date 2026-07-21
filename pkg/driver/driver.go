@@ -60,13 +60,16 @@ type Driver struct {
 	csi.UnimplementedControllerServer
 	csi.UnimplementedNodeServer
 
-	name          string
-	version       string
-	nodeID        string
-	endpoint      string
-	runController bool
-	runNode       bool
-	config        *Config
+	name             string
+	version          string
+	nodeID           string
+	nodeIdentityOnce sync.Once
+	encodedNodeID    string
+	nodeIdentityErr  error
+	endpoint         string
+	runController    bool
+	runNode          bool
+	config           *Config
 
 	// TrueNAS API client
 	truenasClient truenas.ClientInterface
@@ -295,23 +298,41 @@ func (d *Driver) Run() error {
 	if d.runController {
 		csi.RegisterControllerServer(d.server, d)
 		klog.Info("Controller service registered")
-		d.startOrphanReconcile()
 	}
 
 	if d.runNode {
 		csi.RegisterNodeServer(d.server, d)
 		klog.Info("Node service registered")
-
-		// Start session garbage collection for node plugin
-		d.startSessionGC()
 	}
 
-	// Start health and metrics server if port is configured
+	// Bind health/metrics before any reconciliation or background workers. This
+	// makes an occupied port a synchronous startup error with no half-started
+	// controller or node goroutines left behind.
 	if d.healthPort > 0 {
 		d.healthServer = NewHealthServer(d, d.healthPort)
 		if err := d.healthServer.Start(); err != nil {
+			_ = listener.Close()
 			return fmt.Errorf("failed to start health server: %w", err)
 		}
+	}
+
+	if d.runController {
+		if err := d.runStartupAttachmentReconcile(); err != nil {
+			if d.healthServer != nil {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = d.healthServer.Stop(shutdownCtx)
+				cancel()
+			}
+			_ = listener.Close()
+			return fmt.Errorf("startup attachment reconciliation failed: %w", err)
+		}
+		d.startOrphanReconcile()
+	}
+
+	if d.runNode {
+		// Start session garbage collection only after every synchronous startup
+		// check has passed.
+		d.startSessionGC()
 	}
 
 	d.ready.Store(true)

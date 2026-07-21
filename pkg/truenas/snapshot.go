@@ -70,8 +70,15 @@ func isMethodNotFoundError(err error) bool {
 		return false
 	}
 	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.Code == -32601 {
-		return true
+	if errors.As(err, &apiErr) {
+		if apiErr.Code == -32601 {
+			return true
+		}
+		// -1 is TrueNAS's unstructured application-error bucket; known JSON-RPC
+		// codes are authoritative and must not be overridden by message text.
+		if apiErr.Code != -1 {
+			return false
+		}
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "method not found") || strings.Contains(message, "method does not exist")
@@ -243,7 +250,7 @@ func (c *Client) snapshotCreateCall(ctx context.Context, prefix string, params *
 	result, err := c.Call(ctx, prefix+".create", params)
 	if err != nil {
 		// Ignore "already exists" errors
-		if strings.Contains(err.Error(), "already exists") {
+		if IsAlreadyExistsError(err) {
 			return c.SnapshotGet(ctx, params.Dataset+"@"+params.Name)
 		}
 		return nil, fmt.Errorf("failed to create snapshot: %w", err)
@@ -310,8 +317,7 @@ func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, 
 		LogAPIError(err, "SnapshotDelete error")
 
 		// Ignore "does not exist" errors
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+		if IsNotFoundError(err) {
 			return nil
 		}
 
@@ -403,13 +409,17 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 		// Log full error details before fallback logic (helps debug ambiguous errors)
 		LogAPIError(err, "SnapshotGet error")
 
-		// Check for "Invalid params" which indicates not found for get_instance
-		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.Code == -32602 {
+		if IsNotFoundError(err) {
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
 		}
-		// Also check standard IsNotFoundError
-		if IsNotFoundError(err) {
+		// Older middleware reports a missing get_instance as bare -32602. A
+		// structured errno, when present, remains authoritative and must not be
+		// replaced by this compatibility fallback.
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == -32602 {
+			if _, structured := APIErrno(apiErr); structured {
+				return nil, fmt.Errorf("failed to get snapshot: %w", err)
+			}
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
 		}
 		return nil, fmt.Errorf("failed to get snapshot: %w", err)
@@ -632,7 +642,7 @@ func (c *Client) SnapshotClone(ctx context.Context, snapshotID, newDatasetName s
 
 	_, err := c.Call(ctx, c.snapshotMethod(ctx, "clone"), params)
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
+		if IsAlreadyExistsError(err) {
 			existing, getErr := c.DatasetGet(ctx, newDatasetName)
 			if getErr != nil {
 				return fmt.Errorf("clone destination %s already exists but its origin could not be verified: %w", newDatasetName, getErr)

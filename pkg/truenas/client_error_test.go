@@ -27,6 +27,41 @@ func TestIsNotFoundErrorGenericCodeWithNotFoundMessage(t *testing.T) {
 	}
 }
 
+func TestStructuredErrnoIsAuthoritativeOverMessageFallbacks(t *testing.T) {
+	positivePermissionCode := &APIError{Code: int(syscall.EACCES), Message: "dataset not found and already exists"}
+	assert.False(t, IsNotFoundError(positivePermissionCode))
+	assert.False(t, IsAlreadyExistsError(positivePermissionCode))
+
+	permissionWithMisleadingText := &APIError{
+		Code:    -32602,
+		Message: "dataset not found and already exists",
+		Data: map[string]interface{}{
+			"validation": []interface{}{map[string]interface{}{"errno": "EACCES"}},
+		},
+	}
+	assert.False(t, IsNotFoundError(permissionWithMisleadingText))
+	assert.False(t, IsAlreadyExistsError(permissionWithMisleadingText))
+	assert.False(t, MessageFallbackContains(permissionWithMisleadingText, "not found", "already exists"))
+
+	notFoundWithGenericText := &APIError{
+		Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"errno": "ENOENT"},
+	}
+	assert.True(t, IsNotFoundError(notFoundWithGenericText))
+	assert.False(t, IsAlreadyExistsError(notFoundWithGenericText))
+
+	existsWithGenericText := &APIError{
+		Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"errno": float64(syscall.EEXIST)},
+	}
+	assert.True(t, IsAlreadyExistsError(existsWithGenericText))
+	assert.False(t, IsNotFoundError(existsWithGenericText))
+}
+
+func TestMethodNotFoundStructuredCodePrecedesMessageFallback(t *testing.T) {
+	assert.True(t, isMethodNotFoundError(&APIError{Code: -32601, Message: "generic RPC failure"}))
+	assert.False(t, isMethodNotFoundError(&APIError{Code: -32602, Message: "method not found"}))
+	assert.True(t, isMethodNotFoundError(&APIError{Code: -1, Message: "method does not exist"}))
+}
+
 func TestIsConnectionErrorUsesTypedTransportFailures(t *testing.T) {
 	for _, test := range []struct {
 		name string

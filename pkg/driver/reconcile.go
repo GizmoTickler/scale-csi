@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"sort"
@@ -22,6 +23,12 @@ import (
 )
 
 const reconcileListPageSize = 100
+
+const (
+	PropSpentRestoreMarker     = "truenas-csi:spent_restore"
+	spentRestoreMarkerVersion  = 1
+	spentRestoreClassification = "volsync-destination"
+)
 
 var (
 	volumeSnapshotContentGVR = schema.GroupVersionResource{
@@ -47,6 +54,7 @@ type ReconcileOptions struct {
 type ReconcileObject struct {
 	ID             string
 	BackendID      string
+	KubernetesName string
 	PVName         string
 	SourceVolumeID string
 	CreatedAt      time.Time
@@ -65,6 +73,8 @@ type SpentRestoreSnapshot struct {
 	SourcePVCPhase      corev1.PersistentVolumeClaimPhase
 	CreationTime        time.Time
 	Age                 time.Duration
+	BackendSnapshotID   string
+	ClassifiedAt        time.Time
 	SourcePVCWasMissing bool
 }
 
@@ -105,6 +115,13 @@ type kubernetesReconcileState struct {
 	snapshotContentsByName         map[string]snapshotContentState
 	volumeSnapshots                []unstructured.Unstructured
 	pvcs                           map[string]*corev1.PersistentVolumeClaim
+}
+
+type spentRestoreMarker struct {
+	Version        int    `json:"v"`
+	Classification string `json:"classification"`
+	SnapshotID     string `json:"snapshot_id"`
+	ClassifiedAt   string `json:"classified_at"`
 }
 
 // ReconcileOrphans detects managed TrueNAS resources that no longer have a
@@ -195,6 +212,7 @@ func (d *Driver) ReconcileOrphans(ctx context.Context, opts ReconcileOptions) (R
 		item := ReconcileObject{
 			ID:             snapshotHandle,
 			BackendID:      snap.ID,
+			KubernetesName: snap.UserProperties[PropCSISnapshotName].Value,
 			SourceVolumeID: sourceVolumeID,
 			CreatedAt:      createdAt,
 			Age:            age,
@@ -205,7 +223,10 @@ func (d *Driver) ReconcileOrphans(ctx context.Context, opts ReconcileOptions) (R
 	}
 
 	if d.config.ZFS.DetachedVolumesFromSnapshots {
-		report.SpentRestoreSnapshots = detectSpentRestoreSnapshots(now, kubeState)
+		report.SpentRestoreSnapshots, err = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
+		if err != nil {
+			return report, fmt.Errorf("classify spent restore snapshots: %w", err)
+		}
 	}
 	sort.Slice(report.OrphanVolumes, func(i, j int) bool { return report.OrphanVolumes[i].ID < report.OrphanVolumes[j].ID })
 	sort.Slice(report.OrphanSnapshots, func(i, j int) bool { return report.OrphanSnapshots[i].ID < report.OrphanSnapshots[j].ID })
@@ -457,15 +478,15 @@ func (d *Driver) loadKubernetesReconcileState(ctx context.Context) (*kubernetesR
 	return state, nil
 }
 
-func detectSpentRestoreSnapshots(now time.Time, state *kubernetesReconcileState) []SpentRestoreSnapshot {
+func (d *Driver) classifySpentRestoreSnapshots(ctx context.Context, now time.Time, state *kubernetesReconcileState) ([]SpentRestoreSnapshot, error) {
 	if state == nil {
-		return nil
+		return nil, nil
 	}
 	spent := make([]SpentRestoreSnapshot, 0)
 	for i := range state.volumeSnapshots {
 		snapshot := &state.volumeSnapshots[i]
 		matched, matchErr := path.Match("volsync-*-dst-dest*", snapshot.GetName())
-		if matchErr != nil || !matched {
+		if matchErr != nil {
 			continue
 		}
 		content, ok := state.snapshotContentsByRef[namespacedName(snapshot.GetNamespace(), snapshot.GetName())]
@@ -484,15 +505,60 @@ func detectSpentRestoreSnapshots(now time.Time, state *kubernetesReconcileState)
 		if exists && pvc.Status.Phase == corev1.ClaimBound {
 			continue
 		}
+		backendSnapshot, backendErr := d.findBackendSnapshotForHandle(ctx, content.snapshotHandle)
+		if backendErr != nil {
+			return nil, backendErr
+		}
+		if backendSnapshot == nil || !isCSISnapshot(backendSnapshot) {
+			continue
+		}
+		marker, marked, markerErr := spentRestoreMarkerFromSnapshot(backendSnapshot)
+		if markerErr != nil {
+			return nil, fmt.Errorf("snapshot %s: %w", backendSnapshot.ID, markerErr)
+		}
+		if !marked {
+			if !matched {
+				continue
+			}
+			marker = spentRestoreMarker{
+				Version:        spentRestoreMarkerVersion,
+				Classification: spentRestoreClassification,
+				SnapshotID:     backendSnapshot.ID,
+				ClassifiedAt:   now.UTC().Format(time.RFC3339Nano),
+			}
+			encoded, marshalErr := json.Marshal(marker)
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			if setErr := d.truenasClient.SnapshotSetUserProperty(ctx, backendSnapshot.ID, PropSpentRestoreMarker, string(encoded)); setErr != nil {
+				return nil, fmt.Errorf("stamp backend snapshot %s: %w", backendSnapshot.ID, setErr)
+			}
+			// TrueNAS 26.0 has shipped middleware builds that acknowledge
+			// pool.snapshot.update while silently dropping user-property writes.
+			// Re-read and prove the marker before reporting classification; without
+			// that proof this run must fail closed and can never start the age gate.
+			verified, verifyErr := d.truenasClient.SnapshotGet(ctx, backendSnapshot.ID)
+			if verifyErr != nil {
+				return nil, fmt.Errorf("verify backend snapshot marker %s: %w", backendSnapshot.ID, verifyErr)
+			}
+			verifiedMarker, verifiedMarked, verifyMarkerErr := spentRestoreMarkerFromSnapshot(verified)
+			if verifyMarkerErr != nil || !verifiedMarked || verifiedMarker != marker {
+				return nil, fmt.Errorf("backend snapshot %s did not persist spent-restore marker", backendSnapshot.ID)
+			}
+			backendSnapshot = verified
+			klog.Infof("Orphan reconcile: classified spent restore snapshot %s/%s and stamped backend snapshot %s",
+				snapshot.GetNamespace(), snapshot.GetName(), backendSnapshot.ID)
+		}
+		classifiedAt, parseErr := time.Parse(time.RFC3339Nano, marker.ClassifiedAt)
+		if parseErr != nil {
+			return nil, fmt.Errorf("snapshot %s has invalid spent-restore timestamp: %w", backendSnapshot.ID, parseErr)
+		}
 		phase := corev1.PersistentVolumeClaimPhase("")
 		if exists {
 			phase = pvc.Status.Phase
 		}
 		createdAt := snapshot.GetCreationTimestamp().Time
-		age := time.Duration(0)
-		if !createdAt.IsZero() {
-			age = now.Sub(createdAt)
-		}
+		age := now.Sub(classifiedAt)
 		spent = append(spent, SpentRestoreSnapshot{
 			Namespace:           snapshot.GetNamespace(),
 			Name:                snapshot.GetName(),
@@ -502,10 +568,46 @@ func detectSpentRestoreSnapshots(now time.Time, state *kubernetesReconcileState)
 			SourcePVCPhase:      phase,
 			CreationTime:        createdAt,
 			Age:                 age,
+			BackendSnapshotID:   backendSnapshot.ID,
+			ClassifiedAt:        classifiedAt,
 			SourcePVCWasMissing: !exists,
 		})
 	}
-	return spent
+	return spent, nil
+}
+
+func (d *Driver) findBackendSnapshotForHandle(ctx context.Context, handle string) (*truenas.Snapshot, error) {
+	if strings.Contains(handle, "@") {
+		snapshot, err := d.truenasClient.SnapshotGet(ctx, handle)
+		if err != nil {
+			if truenas.IsNotFoundError(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return snapshot, nil
+	}
+	return d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, handle)
+}
+
+func spentRestoreMarkerFromSnapshot(snapshot *truenas.Snapshot) (spentRestoreMarker, bool, error) {
+	if snapshot == nil {
+		return spentRestoreMarker{}, false, nil
+	}
+	property, exists := snapshot.UserProperties[PropSpentRestoreMarker]
+	if !exists || property.Value == "" || property.Value == "-" ||
+		strings.Contains(strings.ToLower(property.Source), "inherit") {
+		return spentRestoreMarker{}, false, nil
+	}
+	var marker spentRestoreMarker
+	if err := json.Unmarshal([]byte(property.Value), &marker); err != nil {
+		return spentRestoreMarker{}, false, fmt.Errorf("invalid spent-restore marker: %w", err)
+	}
+	if marker.Version != spentRestoreMarkerVersion || marker.Classification != spentRestoreClassification ||
+		marker.SnapshotID == "" || marker.SnapshotID != snapshot.ID || marker.ClassifiedAt == "" {
+		return spentRestoreMarker{}, false, fmt.Errorf("invalid spent-restore marker contents")
+	}
+	return marker, true, nil
 }
 
 func (d *Driver) deleteDetectedOrphans(
@@ -551,6 +653,10 @@ func (d *Driver) deleteDetectedOrphans(
 				d.recordReconcileSkip(report, "snapshot", orphan.ID, reason)
 				continue
 			}
+			if safe, reason := d.hardRecheckSnapshotContentAbsent(ctx, orphan); !safe {
+				d.recordReconcileSkip(report, "snapshot", orphan.ID, reason)
+				continue
+			}
 			klog.Infof("Orphan reconcile: deleting managed snapshot %s through guarded DeleteSnapshot", orphan.ID)
 			if _, err := d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: orphan.ID}); err != nil {
 				d.recordReconcileSkip(report, "snapshot", orphan.ID, err.Error())
@@ -573,6 +679,10 @@ func (d *Driver) deleteDetectedOrphans(
 			continue
 		}
 		if safe, reason := d.revalidateOrphanVolume(ctx, orphan, minOrphanAge); !safe {
+			d.recordReconcileSkip(report, "volume", orphan.ID, reason)
+			continue
+		}
+		if safe, reason := d.hardRecheckPersistentVolumeAbsent(ctx, orphan); !safe {
 			d.recordReconcileSkip(report, "volume", orphan.ID, reason)
 			continue
 		}
@@ -618,6 +728,72 @@ func (d *Driver) deleteDetectedOrphans(
 		deletedCount++
 	}
 	return nil
+}
+
+// The broad list used for classification is necessarily a sample. These live
+// GETs occur after backend identity revalidation and immediately before the CSI
+// delete call. Any object returned under the expected name is a veto, without
+// trusting its current fields; a concurrent binder must always win the race.
+func (d *Driver) hardRecheckPersistentVolumeAbsent(ctx context.Context, orphan ReconcileObject) (safe bool, reason string) {
+	clientset, _, err := d.kubernetesReconcileClients()
+	if err != nil {
+		return false, err.Error()
+	}
+	name := orphan.PVName
+	if name == "" {
+		name = orphan.ID
+	}
+	// Also close the legacy-name gap for volumes whose durable csi_volume_name
+	// does not equal the actual PV metadata name.
+	pvs, err := clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Sprintf("final PersistentVolume handle recheck failed: %v", err)
+	}
+	for i := range pvs.Items {
+		pv := &pvs.Items[i]
+		if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == d.name && pv.Spec.CSI.VolumeHandle == orphan.ID {
+			return false, fmt.Sprintf("PersistentVolume %s appeared for handle %s during final live recheck", pv.Name, orphan.ID)
+		}
+	}
+	// Keep the required object-specific GET as the final API operation before
+	// the caller invokes DeleteVolume.
+	if _, err := clientset.CoreV1().PersistentVolumes().Get(ctx, name, metav1.GetOptions{}); err == nil {
+		return false, fmt.Sprintf("PersistentVolume %s appeared during final live recheck", name)
+	} else if !apierrors.IsNotFound(err) {
+		return false, fmt.Sprintf("final PersistentVolume %s recheck failed: %v", name, err)
+	}
+	return true, ""
+}
+
+func (d *Driver) hardRecheckSnapshotContentAbsent(ctx context.Context, orphan ReconcileObject) (safe bool, reason string) {
+	_, dynamicClient, err := d.kubernetesReconcileClients()
+	if err != nil {
+		return false, err.Error()
+	}
+	name := orphan.KubernetesName
+	if name == "" {
+		name = orphan.ID
+	}
+	contents, err := dynamicClient.Resource(volumeSnapshotContentGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Sprintf("final VolumeSnapshotContent handle recheck failed: %v", err)
+	}
+	for i := range contents.Items {
+		content := &contents.Items[i]
+		driverName, _, _ := unstructured.NestedString(content.Object, "spec", "driver")
+		handle, _, _ := unstructured.NestedString(content.Object, "status", "snapshotHandle")
+		if driverName == d.name && handle == orphan.ID {
+			return false, fmt.Sprintf("VolumeSnapshotContent %s appeared for handle %s during final live recheck", content.GetName(), orphan.ID)
+		}
+	}
+	// Keep the required object-specific GET as the final API operation before
+	// the caller invokes DeleteSnapshot.
+	if _, err := dynamicClient.Resource(volumeSnapshotContentGVR).Get(ctx, name, metav1.GetOptions{}); err == nil {
+		return false, fmt.Sprintf("VolumeSnapshotContent %s appeared during final live recheck", name)
+	} else if !apierrors.IsNotFound(err) {
+		return false, fmt.Sprintf("final VolumeSnapshotContent %s recheck failed: %v", name, err)
+	}
+	return true, ""
 }
 
 func (d *Driver) revalidateOrphanVolume(
@@ -675,10 +851,6 @@ func (d *Driver) revalidateSpentRestoreSnapshot(
 	if err != nil {
 		return SpentRestoreSnapshot{}, false, fmt.Sprintf("VolumeSnapshot revalidation failed: %v", err)
 	}
-	matched, matchErr := path.Match("volsync-*-dst-dest*", snapshot.GetName())
-	if matchErr != nil || !matched {
-		return SpentRestoreSnapshot{}, false, "VolumeSnapshot no longer matches the VolSync restore pattern"
-	}
 	sourcePVC, found, nestedErr := unstructured.NestedString(
 		snapshot.Object, "spec", "source", "persistentVolumeClaimName",
 	)
@@ -706,6 +878,10 @@ func (d *Driver) revalidateSpentRestoreSnapshot(
 		referenceNamespace != detected.Namespace || referenceName != detected.Name {
 		return SpentRestoreSnapshot{}, false, "VolumeSnapshotContent is no longer bound to this driver's restore snapshot"
 	}
+	handle, found, handleErr := unstructured.NestedString(content.Object, "status", "snapshotHandle")
+	if handleErr != nil || !found || handle == "" || handle != detected.SnapshotHandle {
+		return SpentRestoreSnapshot{}, false, "VolumeSnapshotContent handle changed"
+	}
 
 	pvc, err := clientset.CoreV1().PersistentVolumeClaims(detected.Namespace).Get(
 		ctx, sourcePVC, metav1.GetOptions{},
@@ -718,12 +894,24 @@ func (d *Driver) revalidateSpentRestoreSnapshot(
 		return SpentRestoreSnapshot{}, false, "source PVC became Bound during revalidation"
 	}
 	createdAt := snapshot.GetCreationTimestamp().Time
-	age := time.Duration(0)
-	if !createdAt.IsZero() {
-		age = time.Since(createdAt)
-	}
-	if createdAt.IsZero() || age <= minOrphanAge || !createdAt.Equal(detected.CreationTime) {
+	if createdAt.IsZero() || !createdAt.Equal(detected.CreationTime) {
 		return SpentRestoreSnapshot{}, false, "snapshot creation identity changed or has not exceeded the minimum orphan age"
+	}
+	backendSnapshot, backendErr := d.findBackendSnapshotForHandle(ctx, handle)
+	if backendErr != nil || backendSnapshot == nil || backendSnapshot.ID != detected.BackendSnapshotID {
+		return SpentRestoreSnapshot{}, false, fmt.Sprintf("backend spent-restore snapshot revalidation failed: %v", backendErr)
+	}
+	marker, marked, markerErr := spentRestoreMarkerFromSnapshot(backendSnapshot)
+	if markerErr != nil || !marked {
+		return SpentRestoreSnapshot{}, false, fmt.Sprintf("backend spent-restore marker is unavailable or invalid: %v", markerErr)
+	}
+	classifiedAt, parseErr := time.Parse(time.RFC3339Nano, marker.ClassifiedAt)
+	if parseErr != nil || !classifiedAt.Equal(detected.ClassifiedAt) {
+		return SpentRestoreSnapshot{}, false, "backend spent-restore classification identity changed"
+	}
+	age := time.Since(classifiedAt)
+	if age <= minOrphanAge {
+		return SpentRestoreSnapshot{}, false, "spent-restore marker has not exceeded the minimum orphan age"
 	}
 	phase := corev1.PersistentVolumeClaimPhase("")
 	if pvc != nil {
@@ -733,10 +921,13 @@ func (d *Driver) revalidateSpentRestoreSnapshot(
 		Namespace:           detected.Namespace,
 		Name:                detected.Name,
 		ContentName:         contentName,
+		SnapshotHandle:      handle,
 		SourcePVC:           sourcePVC,
 		SourcePVCPhase:      phase,
 		CreationTime:        createdAt,
 		Age:                 age,
+		BackendSnapshotID:   backendSnapshot.ID,
+		ClassifiedAt:        classifiedAt,
 		SourcePVCWasMissing: missing,
 	}, true, ""
 }

@@ -118,6 +118,26 @@
       "type": "string",
       "minLength": 1
     },
+    "driverInstanceId": {
+      "type": "string"
+    },
+    "fencing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "additive",
+            "strict"
+          ]
+        }
+      }
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,

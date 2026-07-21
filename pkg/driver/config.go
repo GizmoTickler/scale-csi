@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -20,8 +21,20 @@ type Config struct {
 	// DriverName is the CSI driver name for registration
 	DriverName string `yaml:"driver"`
 
-	// InstanceID is a unique identifier for this driver instance
+	// DriverInstanceID is stamped on every driver-created dataset. It is the
+	// ownership boundary used before adopting a pre-existing dataset whose name
+	// collides with a CreateVolume request. When omitted, LoadConfig derives a
+	// stable value from DriverName and the configured parent dataset.
+	DriverInstanceID string `yaml:"driverInstanceId"`
+
+	// InstanceID is the deprecated pre-v1.2.23 spelling. It was never consumed
+	// by the driver, but accepting it here avoids breaking otherwise valid old
+	// configuration files. driverInstanceId wins when both are present.
 	InstanceID string `yaml:"instance_id"`
+
+	// Fencing controls whether ControllerPublish/Unpublish materialize CSI
+	// publications in the backend transport allowlists.
+	Fencing FencingConfig `yaml:"fencing"`
 
 	// TrueNAS connection settings
 	TrueNAS TrueNASConfig `yaml:"truenas"`
@@ -52,6 +65,29 @@ type Config struct {
 
 	// CommandTimeouts configures timeouts for various command types
 	CommandTimeouts CommandTimeoutConfig `yaml:"commandTimeouts"`
+}
+
+// FencingMode controls backend publication enforcement during rolling upgrades.
+type FencingMode string
+
+const (
+	// FencingModeOff preserves the pre-v1.2.23 static-allowlist behavior.
+	FencingModeOff FencingMode = "off"
+	// FencingModeAdditive adds per-node identities without removing configured
+	// static identities. This is the safe rolling-upgrade default.
+	FencingModeAdditive FencingMode = "additive"
+	// FencingModeStrict makes per-volume publication records the sole allowlist.
+	FencingModeStrict FencingMode = "strict"
+)
+
+// FencingConfig configures backend-enforced ControllerPublish semantics.
+type FencingConfig struct {
+	Mode FencingMode `yaml:"mode"`
+}
+
+// Enabled reports whether backend publication fencing is active.
+func (c FencingConfig) Enabled() bool {
+	return c.Mode == FencingModeAdditive || c.Mode == FencingModeStrict
 }
 
 // TrueNASConfig holds TrueNAS connection settings.
@@ -458,6 +494,7 @@ func LoadConfig(path string) (*Config, error) {
 	// Defaults must be applied before unmarshalling so an explicit YAML false
 	// still overrides the default.
 	cfg := &Config{
+		Fencing:   FencingConfig{Mode: FencingModeAdditive},
 		ZFS:       ZFSConfig{DatasetEnableQuotas: true},
 		SessionGC: SessionGCConfig{Enabled: true},
 		Reconcile: ReconcileConfig{
@@ -503,6 +540,21 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if len(cfg.ISCSI.TargetPortals) > 0 {
 		configWarningf("iscsi.targetPortals is configured with %d additional portal(s), but scale-csi does not currently support iSCSI multipath; only iscsi.targetPortal will be used", len(cfg.ISCSI.TargetPortals))
+	}
+	if strings.TrimSpace(cfg.DriverInstanceID) == "" {
+		cfg.DriverInstanceID = strings.TrimSpace(cfg.InstanceID)
+	}
+	if strings.TrimSpace(cfg.DriverInstanceID) == "" && cfg.DriverName != "" && cfg.ZFS.DatasetParentName != "" {
+		cfg.DriverInstanceID = strings.TrimSpace(cfg.DriverName) + "@" + strings.TrimSuffix(strings.TrimSpace(cfg.ZFS.DatasetParentName), "/")
+	}
+	cfg.DriverInstanceID = strings.TrimSpace(cfg.DriverInstanceID)
+	if cfg.DriverInstanceID == "" {
+		return nil, fmt.Errorf("driverInstanceId must not be empty")
+	}
+	switch cfg.Fencing.Mode {
+	case FencingModeOff, FencingModeAdditive, FencingModeStrict:
+	default:
+		return nil, fmt.Errorf("fencing.mode must be one of off, additive, or strict")
 	}
 
 	// Set defaults
@@ -692,7 +744,7 @@ func LoadConfig(path string) (*Config, error) {
 		if cfg.NVMeoF.TransportAddress == "" {
 			return nil, fmt.Errorf("nvmeof.transportAddress is required when NVMe-oF is enabled")
 		}
-		if !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
+		if !cfg.Fencing.Enabled() && !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
 			return nil, fmt.Errorf("nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty; no host could connect")
 		}
 	}

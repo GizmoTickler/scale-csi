@@ -12,7 +12,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -26,6 +25,7 @@ import (
 // ZFS property names for tracking CSI resources
 const (
 	PropManagedResource           = "truenas-csi:managed_resource"
+	PropDriverInstanceID          = "truenas-csi:driver_instance_id"
 	PropProvisionSuccess          = "truenas-csi:provision_success"
 	PropCSIVolumeName             = "truenas-csi:csi_volume_name"
 	PropShareVolumeContext        = "truenas-csi:csi_share_volume_context"
@@ -41,6 +41,7 @@ const (
 	PropISCSITargetID             = "truenas-csi:truenas_iscsi_target_id"
 	PropISCSIExtentID             = "truenas-csi:truenas_iscsi_extent_id"
 	PropISCSITargetExtentID       = "truenas-csi:truenas_iscsi_targetextent_id"
+	PropISCSIInitiatorID          = "truenas-csi:truenas_iscsi_initiator_id"
 	PropNVMeoFSubsystemID         = "truenas-csi:truenas_nvmeof_subsystem_id"
 	PropNVMeoFNamespaceID         = "truenas-csi:truenas_nvmeof_namespace_id"
 	PropNVMeoFPortSubsysID        = "truenas-csi:truenas_nvmeof_portsubsys_id"
@@ -354,7 +355,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if err == nil && existingDS != nil {
 		// Volume exists - check and ensure properties are set
 		klog.Infof("Volume %s already exists", volumeID)
-
 		if shareType.IsBlockProtocol() && existingDS.Type == "FILESYSTEM" {
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s already exists as a filesystem, incompatible with requested %s protocol",
@@ -382,6 +382,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s already exists with content source %s, incompatible with requested %s",
 				volumeID, describeDatasetContentSource(existingDS), describeVolumeContentSource(requestedContentSource))
+		}
+		// A name match is not ownership proof. Pure compatibility checks above
+		// may return a more specific ALREADY_EXISTS reason, but this proof still
+		// precedes every mutation and backend share lookup. Operators can adopt a
+		// verified legacy dataset explicitly with:
+		// zfs set truenas-csi:driver_instance_id=<expected> <dataset>.
+		if owner := datasetLocalUserProperty(existingDS, PropDriverInstanceID); owner != d.driverInstanceID() {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"dataset %s already exists but ownership property %s is %q, expected %q; explicitly adopt it by setting the property after verifying the dataset is safe",
+				datasetName, PropDriverInstanceID, owner, d.driverInstanceID())
 		}
 		if snapshot := req.GetVolumeContentSource().GetSnapshot(); d.config.ZFS.DetachedVolumesFromSnapshots && snapshot != nil {
 			existingDS, err = d.prepareDetachedSnapshotCopy(
@@ -463,6 +473,17 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if srcErr != nil {
 			return nil, srcErr
 		}
+		// Clone/replication APIs cannot stamp properties atomically. The initial
+		// name-collision check plus the verified clone relationship is the creation
+		// proof; stamp ownership before creating any share object.
+		if datasetLocalUserProperty(createdDS, PropDriverInstanceID) != d.driverInstanceID() {
+			if ownerErr := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+				PropDriverInstanceID: d.driverInstanceID(),
+			}); ownerErr != nil {
+				d.cleanupFailedClone(ctx, datasetName, "")
+				return nil, status.Errorf(codes.Internal, "failed to stamp cloned volume ownership: %v", ownerErr)
+			}
+		}
 		zvolReady = true
 	} else {
 		// Create new dataset
@@ -487,6 +508,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Mark as managed and successful in one API update.
 	volumeProperties := map[string]string{
 		PropManagedResource:  "true",
+		PropDriverInstanceID: d.driverInstanceID(),
 		PropProvisionSuccess: "true",
 		PropCSIVolumeName:    name,
 	}
@@ -556,6 +578,17 @@ func storedBlockProtocol(ds *truenas.Dataset, shareType ShareType) bool {
 		}
 	}
 	return false
+}
+
+func (d *Driver) driverInstanceID() string {
+	if configured := strings.TrimSpace(d.config.DriverInstanceID); configured != "" {
+		return configured
+	}
+	driverName := strings.TrimSpace(d.name)
+	if driverName == "" {
+		driverName = strings.TrimSpace(d.config.DriverName)
+	}
+	return driverName + "@" + strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/")
 }
 
 func volumeContentSourceFromDataset(ds *truenas.Dataset) *csi.VolumeContentSource {
@@ -673,35 +706,23 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// fallback logic that finds resources by name.
 			var cleanupErrors []string
 			if cleanupErr := d.deleteShare(ctx, nil, datasetName, ShareTypeNVMeoF); cleanupErr != nil {
-				// Only log as warning if it's not a "not found" type error
-				errStr := cleanupErr.Error()
-				if strings.Contains(errStr, "cleanup errors") {
-					klog.Warningf("Failed to cleanup orphaned NVMe-oF resources for %s: %v", volumeID, cleanupErr)
-					cleanupErrors = append(cleanupErrors, "NVMe-oF: "+errStr)
-				} else {
-					klog.V(4).Infof("No orphaned NVMe-oF resources for %s", volumeID)
-				}
+				klog.Warningf("Failed to cleanup orphaned NVMe-oF resources for %s: %v", volumeID, cleanupErr)
+				cleanupErrors = append(cleanupErrors, "NVMe-oF: "+cleanupErr.Error())
 			} else {
 				klog.Infof("Cleaned up orphaned NVMe-oF resources for %s", volumeID)
 			}
 			if cleanupErr := d.deleteShare(ctx, nil, datasetName, ShareTypeISCSI); cleanupErr != nil {
-				errStr := cleanupErr.Error()
-				if strings.Contains(errStr, "cleanup errors") {
-					klog.Warningf("Failed to cleanup orphaned iSCSI resources for %s: %v", volumeID, cleanupErr)
-					cleanupErrors = append(cleanupErrors, "iSCSI: "+errStr)
-				} else {
-					klog.V(4).Infof("No orphaned iSCSI resources for %s", volumeID)
-				}
+				klog.Warningf("Failed to cleanup orphaned iSCSI resources for %s: %v", volumeID, cleanupErr)
+				cleanupErrors = append(cleanupErrors, "iSCSI: "+cleanupErr.Error())
 			} else {
 				klog.Infof("Cleaned up orphaned iSCSI resources for %s", volumeID)
 			}
 			if len(cleanupErrors) > 0 {
-				klog.Warningf("Some orphaned resources could not be cleaned up for %s: %v", volumeID, cleanupErrors)
+				return nil, status.Errorf(codes.Internal, "orphaned protocol cleanup failed for %s: %s", volumeID, strings.Join(cleanupErrors, "; "))
 			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
-		// Log but don't fail - try to proceed with deletion anyway
-		klog.V(4).Infof("Could not verify volume existence: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to verify volume %s: %v", volumeID, err)
 	}
 
 	// Determine share type from stored ZFS properties (most reliable)
@@ -791,20 +812,17 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 	case ds != nil && ds.Type == "VOLUME":
 		// Unknown zvol - try both iSCSI and NVMe-oF to avoid orphaned resources
-		// One will likely return "not found" which is fine
-		var lastErr error
+		// One will normally prove absence and return nil. Any other error is a
+		// cleanup failure and must stop dataset deletion.
+		var cleanupErrors []string
 		if err := d.deleteShare(ctx, ds, datasetName, ShareTypeISCSI); err != nil {
-			klog.V(4).Infof("iSCSI cleanup for %s: %v (may be expected if not iSCSI)", volumeID, err)
-			lastErr = err
+			cleanupErrors = append(cleanupErrors, "iSCSI: "+err.Error())
 		}
 		if err := d.deleteShare(ctx, ds, datasetName, ShareTypeNVMeoF); err != nil {
-			klog.V(4).Infof("NVMe-oF cleanup for %s: %v (may be expected if not NVMe-oF)", volumeID, err)
-			lastErr = err
+			cleanupErrors = append(cleanupErrors, "NVMe-oF: "+err.Error())
 		}
-		// Only fail if BOTH cleanup attempts had unexpected errors
-		// "not found" type errors are expected for the wrong protocol
-		if lastErr != nil && !strings.Contains(lastErr.Error(), "not found") && !strings.Contains(lastErr.Error(), "cleanup errors") {
-			klog.Warningf("Share cleanup had errors for %s: %v", volumeID, lastErr)
+		if len(cleanupErrors) > 0 {
+			return nil, status.Errorf(codes.Internal, "protocol cleanup failed for %s: %s", volumeID, strings.Join(cleanupErrors, "; "))
 		}
 	default:
 		// Default fallback for filesystem or unknown types
@@ -989,15 +1007,25 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
+	identity, err := d.resolveControllerNodeIdentity(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
 	// Best-effort node validation: when this process also runs the node service
 	// (combined/all mode) it knows its own node ID, so a request for a different
 	// node is a NotFound. In the split deployment runNode is false and this is
 	// inert (the CO's attach-detach controller owns node targeting). This also
 	// satisfies the csi-sanity "publish should fail when the node does not exist"
 	// conformance case. (Do not remove — it is conditionally load-bearing.)
-	if d.runNode && nodeID != d.nodeID {
+	if d.runNode && identity.Name != d.nodeID {
 		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
 	}
+	lockKey := "volume:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
+	}
+	defer d.releaseOperationLock(lockKey)
+
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
 		return nil, err
@@ -1010,20 +1038,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
 	}
 
-	// Determine share type from volume context
-	volumeContext := req.GetVolumeContext()
-	shareTypeStr := volumeContext["node_attach_driver"]
-	if shareTypeStr == "" {
-		// NFS volumes don't require controller publish
-		klog.V(4).Infof("ControllerPublishVolume: volume %s has no node_attach_driver, assuming NFS (no-op)", volumeID)
-		return &csi.ControllerPublishVolumeResponse{}, nil
-	}
-
-	shareType := ParseShareType(shareTypeStr)
-	if shareType == ShareTypeNFS {
-		// NFS doesn't require controller publish - shares are always accessible
-		return &csi.ControllerPublishVolumeResponse{}, nil
-	}
+	shareType := shareTypeForPublishedVolume(ds, req.GetVolumeContext())
 
 	klog.Infof("ControllerPublishVolume: volumeID=%s, nodeID=%s, shareType=%s", volumeID, nodeID, shareType)
 
@@ -1032,6 +1047,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType); err != nil {
 		return nil, err
 	}
+	if d.config.Fencing.Enabled() {
+		if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly()); err != nil {
+			return nil, err
+		}
+	}
 
 	klog.Infof("ControllerPublishVolume: volume %s published successfully to node %s", volumeID, nodeID)
 	return &csi.ControllerPublishVolumeResponse{}, nil
@@ -1039,10 +1059,36 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 
 // ControllerUnpublishVolume detaches a volume from a node (not used for NFS).
 func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	if req.GetVolumeId() == "" {
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
-	// Not implemented - NFS doesn't require controller unpublish
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node ID is required")
+	}
+	if !d.config.Fencing.Enabled() {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+	lockKey := "volume:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
+	}
+	defer d.releaseOperationLock(lockKey)
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		if truenas.IsNotFoundError(err) {
+			return &csi.ControllerUnpublishVolumeResponse{}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
+	}
+	shareType := shareTypeForPublishedVolume(ds, nil)
+	if err := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, req.GetNodeId()); err != nil {
+		return nil, err
+	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
@@ -1779,12 +1825,40 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 		}
 	}
 	d.applyDatasetProperties(params)
+	setDatasetCreateUserProperty(params, PropDriverInstanceID, d.driverInstanceID())
 
 	ds, err := d.truenasClient.DatasetCreate(ctx, params)
 	if err != nil {
 		return nil, err
 	}
+	// Some TrueNAS releases return a compact create result without projected
+	// user_properties. Re-read before deciding ownership is absent; this still
+	// rejects DatasetCreate's idempotent existing-object fallback because that
+	// object will remain unstamped or carry a different instance identity.
+	if datasetLocalUserProperty(ds, PropDriverInstanceID) != d.driverInstanceID() {
+		verified, getErr := d.truenasClient.DatasetGet(ctx, datasetName)
+		if getErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to verify dataset ownership after creation: %v", getErr)
+		}
+		ds = verified
+	}
+	if owner := datasetLocalUserProperty(ds, PropDriverInstanceID); owner != d.driverInstanceID() {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"dataset %s appeared during creation but ownership property %s is %q, expected %q",
+			datasetName, PropDriverInstanceID, owner, d.driverInstanceID())
+	}
 	return ds, nil
+}
+
+func setDatasetCreateUserProperty(params *truenas.DatasetCreateParams, key, value string) {
+	for index := range params.UserProperties {
+		if params.UserProperties[index].Key == key {
+			params.UserProperties[index].Value = value
+			params.UserProperties[index].Remove = false
+			return
+		}
+	}
+	params.UserProperties = append(params.UserProperties, truenas.UserPropertyUpdate{Key: key, Value: value})
 }
 
 func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
@@ -2113,6 +2187,7 @@ func (d *Driver) prepareDetachedSnapshotCopy(
 		}
 	}
 	identityProperties[PropCSIVolumeName] = volumeName
+	identityProperties[PropDriverInstanceID] = d.driverInstanceID()
 	identityProperties[PropVolumeContentSourceType] = "snapshot"
 	identityProperties[PropVolumeContentSourceID] = snapshotID
 	identityProperties[PropVolumeOriginSnapshot] = "-"
@@ -2195,51 +2270,13 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 		volumeContext["share"] = ds.Mountpoint
 
 	case ShareTypeISCSI:
-		// Get target info from dataset properties or fallback to lookup by name
-		var target *truenas.ISCSITarget
-		var globalCfg *truenas.ISCSIGlobalConfig
-
-		if prop, ok := ds.UserProperties[PropISCSITargetID]; ok && prop.Value != "" && prop.Value != "-" {
-			targetID, err := strconv.Atoi(prop.Value)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "invalid target ID: %v", err)
-			}
-
-			// Fetch target and global config in parallel for better performance
-			g, gCtx := errgroup.WithContext(ctx)
-			g.Go(func() error {
-				var err error
-				target, err = d.truenasClient.ISCSITargetGet(gCtx, targetID)
-				if err != nil {
-					return status.Errorf(codes.Internal, "failed to get iSCSI target: %v", err)
-				}
-				return nil
-			})
-			g.Go(func() error {
-				var err error
-				globalCfg, err = d.truenasClient.ISCSIGlobalConfigGet(gCtx)
-				if err != nil {
-					return status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
-				}
-				return nil
-			})
-			if err := g.Wait(); err != nil {
-				return nil, err
-			}
-		} else {
-			// Fallback: lookup target by name (for volumes created before property tracking)
-			iscsiName := d.iscsiShareName(path.Base(datasetName))
-			klog.V(4).Infof("Target ID property missing for %s, falling back to name lookup: %s", datasetName, iscsiName)
-
-			var err error
-			target, err = d.truenasClient.ISCSITargetFindByName(ctx, iscsiName)
-			if err != nil || target == nil {
-				return nil, status.Errorf(codes.Internal, "failed to find iSCSI target by name %s: %v", iscsiName, err)
-			}
-			globalCfg, err = d.truenasClient.ISCSIGlobalConfigGet(ctx)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
-			}
+		target, err := d.resolveISCSITarget(ctx, ds, datasetName)
+		if err != nil || target == nil {
+			return nil, status.Errorf(codes.Internal, "failed to resolve iSCSI target for %s: %v", datasetName, err)
+		}
+		globalCfg, err := d.truenasClient.ISCSIGlobalConfigGet(ctx)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
 		}
 		volumeContext["iqn"] = fmt.Sprintf("%s:%s", globalCfg.Basename, target.Name)
 		volumeContext["portal"] = d.config.ISCSI.TargetPortal
@@ -2247,34 +2284,16 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 		volumeContext["interface"] = d.config.ISCSI.Interface
 
 	case ShareTypeNVMeoF:
-		// Get subsystem info from dataset properties or fallback to lookup by name
-		var subsys *truenas.NVMeoFSubsystem
-
-		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok && prop.Value != "" && prop.Value != "-" {
-			subsysID, err := strconv.Atoi(prop.Value)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "invalid subsystem ID: %v", err)
-			}
-			subsys, err = d.truenasClient.NVMeoFSubsystemGet(ctx, subsysID)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to get NVMe-oF subsystem: %v", err)
-			}
-		} else {
-			// Fallback: lookup subsystem by name (for volumes created before property tracking)
-			subsysName := path.Base(datasetName)
-			if d.config.NVMeoF.NamePrefix != "" {
-				subsysName = d.config.NVMeoF.NamePrefix + subsysName
-			}
-			if d.config.NVMeoF.NameSuffix != "" {
-				subsysName += d.config.NVMeoF.NameSuffix
-			}
-			klog.V(4).Infof("Subsystem ID property missing for %s, falling back to name lookup: %s", datasetName, subsysName)
-
-			var err error
-			subsys, err = d.truenasClient.NVMeoFSubsystemFindByName(ctx, subsysName)
-			if err != nil || subsys == nil {
-				return nil, status.Errorf(codes.Internal, "failed to find NVMe-oF subsystem by name %s: %v", subsysName, err)
-			}
+		namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to resolve NVMe-oF namespace: %v", err)
+		}
+		subsys, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+		if err != nil || subsys == nil {
+			return nil, status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem for %s: %v", datasetName, err)
+		}
+		if namespace == nil || namespace.SubsystemID != subsys.ID {
+			return nil, status.Errorf(codes.Internal, "NVMe-oF namespace for %s is missing or references a different subsystem", datasetName)
 		}
 		volumeContext["nqn"] = subsys.NQN
 		volumeContext["transport"] = d.config.NVMeoF.Transport

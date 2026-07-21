@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -74,6 +76,58 @@ func TestReconcileOrphansGuardedDeleteRefusesDependentVolume(t *testing.T) {
 	for _, call := range client.DatasetDeleteCalls {
 		assert.NotEqual(t, "pool/parent/a-source", call.Name, "reconcile must never bypass the pre-delete dependency guard")
 	}
+}
+
+func TestReconcileVolumeDeleteFinalLiveGetVetoesNewPV(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false,
+		[]runtime.Object{reconcilePV("live-volume", "csi.scale.io")}, nil,
+	)
+	addReconcileDataset(client, "late-volume", time.Now().Add(-48*time.Hour), true, 100)
+	clientset, _, err := d.kubernetesReconcileClients()
+	require.NoError(t, err)
+	fakeClient := clientset.(*kubernetesfake.Clientset)
+	fakeClient.PrependReactor("get", "persistentvolumes", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		get := action.(clienttesting.GetAction)
+		if get.GetName() != "late-volume" {
+			return false, nil, nil
+		}
+		return true, reconcilePV("late-volume", "csi.scale.io"), nil
+	})
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Empty(t, report.DeletedVolumes)
+	require.Len(t, report.SkippedDeletes, 1)
+	assert.Contains(t, report.SkippedDeletes[0].Reason, "final live recheck")
+	_, err = client.DatasetGet(context.Background(), "pool/parent/late-volume")
+	require.NoError(t, err)
+}
+
+func TestReconcileSnapshotDeleteFinalLiveGetVetoesNewContent(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false, nil, []runtime.Object{
+		reconcileSnapshotContent("live-content", "storage", "live-snapshot", "live-handle", "csi.scale.io"),
+	})
+	addReconcileSnapshot(t, client, "orphan-volume", "late-handle", time.Now().Add(-48*time.Hour), true, 20)
+	backend := client.Snapshots["pool/parent/orphan-volume@late-handle"]
+	backend.UserProperties[PropCSISnapshotName] = truenas.UserProperty{Value: "late-content", Source: "local"}
+	_, dynamicClient, err := d.kubernetesReconcileClients()
+	require.NoError(t, err)
+	fakeDynamic := dynamicClient.(*dynamicfake.FakeDynamicClient)
+	fakeDynamic.PrependReactor("get", "volumesnapshotcontents", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		get := action.(clienttesting.GetAction)
+		if get.GetName() != "late-content" {
+			return false, nil, nil
+		}
+		return true, reconcileSnapshotContent("late-content", "storage", "late-snapshot", "late-handle", "csi.scale.io"), nil
+	})
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Empty(t, report.DeletedSnapshots)
+	require.Len(t, report.SkippedDeletes, 1)
+	assert.Contains(t, report.SkippedDeletes[0].Reason, "final live recheck")
+	_, err = client.SnapshotGet(context.Background(), backend.ID)
+	require.NoError(t, err)
 }
 
 func TestReconcileOrphansDeleteRefusesEmptyLivePVSetAfterDetection(t *testing.T) {
@@ -212,7 +266,10 @@ func TestReconcileSpentRestoreRecognitionRequiresDetachedAndNonBoundPVC(t *testi
 		reconcilePVC("storage", "bound-source", corev1.ClaimBound),
 	}
 
-	detached, _ := newReconcileTestDriver(t, true, coreObjects, dynamicObjects)
+	detached, backend := newReconcileTestDriver(t, true, coreObjects, dynamicObjects)
+	for _, handle := range []string{"released-handle", "missing-handle", "bound-handle", "manual-handle"} {
+		addReconcileSnapshot(t, backend, "restore-source", handle, old.Time, true, 1)
+	}
 	report, err := detached.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
 	require.NoError(t, err)
 	require.Len(t, report.SpentRestoreSnapshots, 2)
@@ -236,8 +293,27 @@ func TestReconcileDeletesSpentRestoreSnapshotOnlyThroughKubernetes(t *testing.T)
 		"spent-content", "storage", "volsync-app-dst-dest", "still-live-handle", "csi.scale.io",
 	)
 	d, client := newReconcileTestDriver(t, true, nil, []runtime.Object{volumeSnapshot, content})
+	addReconcileSnapshot(t, client, "restore-source", "still-live-handle", old.Time, true, 1)
 
 	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{
+		Delete: true, MinOrphanAge: time.Hour,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, report.DeletedSpentRestoreObjects, "first classification must only stamp the durable marker")
+	backendSnapshot, err := client.SnapshotFindByName(context.Background(), "pool/parent", "still-live-handle")
+	require.NoError(t, err)
+	require.NotNil(t, backendSnapshot)
+	marker := spentRestoreMarker{
+		Version:        spentRestoreMarkerVersion,
+		Classification: spentRestoreClassification,
+		SnapshotID:     backendSnapshot.ID,
+		ClassifiedAt:   time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano),
+	}
+	encodedMarker, err := json.Marshal(marker)
+	require.NoError(t, err)
+	require.NoError(t, client.SnapshotSetUserProperty(context.Background(), backendSnapshot.ID, PropSpentRestoreMarker, string(encodedMarker)))
+
+	report, err = d.ReconcileOrphans(context.Background(), ReconcileOptions{
 		Delete: true, MinOrphanAge: time.Hour,
 	})
 	require.NoError(t, err)
@@ -249,6 +325,27 @@ func TestReconcileDeletesSpentRestoreSnapshotOnlyThroughKubernetes(t *testing.T)
 	)
 	assert.True(t, apierrors.IsNotFound(err))
 	assert.Empty(t, client.DatasetDeleteCalls, "spent restore cleanup must not directly destroy a backend dataset")
+}
+
+func TestReconcileSpentRestoreClassificationFailsClosedWhenMarkerWriteIsNotDurable(t *testing.T) {
+	old := metav1.NewTime(time.Now().Add(-48 * time.Hour))
+	volumeSnapshot := reconcileVolumeSnapshot(
+		"storage", "volsync-app-dst-dest", "gone-source", "spent-content", old,
+	)
+	content := reconcileSnapshotContent(
+		"spent-content", "storage", "volsync-app-dst-dest", "spent-handle", "csi.scale.io",
+	)
+	d, client := newReconcileTestDriver(t, true, nil, []runtime.Object{volumeSnapshot, content})
+	addReconcileSnapshot(t, client, "restore-source", "spent-handle", old.Time, true, 1)
+	client.SimulateUpdateNoOp = true
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "did not persist spent-restore marker")
+	assert.Empty(t, report.SpentRestoreSnapshots)
+	backend, getErr := client.SnapshotGet(context.Background(), "pool/parent/restore-source@spent-handle")
+	require.NoError(t, getErr)
+	assert.NotContains(t, backend.UserProperties, PropSpentRestoreMarker)
 }
 
 func newReconcileTestDriver(

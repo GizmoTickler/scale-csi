@@ -2,7 +2,9 @@
 # Uses WebSocket JSON-RPC 2.0 API (no SSH required)
 
 driver: scale-nfs
-instance_id:
+driverInstanceId:
+fencing:
+  mode: additive
 
 # WebSocket connection to TrueNAS SCALE 25.04+
 httpConnection:

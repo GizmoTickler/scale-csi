@@ -74,6 +74,8 @@ nfs:
 
 func TestLoadConfigRejectsRestrictedNVMeWithoutHosts(t *testing.T) {
 	_, err := loadTestConfig(t, requiredTestConfig+`
+fencing:
+  mode: off
 nvmeof:
   enabled: true
   transportAddress: 192.0.2.20
@@ -82,6 +84,43 @@ nvmeof:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "subsystemHosts is empty")
 	assert.Contains(t, err.Error(), "no host could connect")
+}
+
+func TestLoadConfigDefaultsFencingAndOwnershipIdentity(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.Equal(t, FencingModeAdditive, cfg.Fencing.Mode)
+	assert.Equal(t, "csi.scale.io@tank/csi", cfg.DriverInstanceID)
+}
+
+func TestLoadConfigAcceptsAllFencingModesAndRejectsUnknownMode(t *testing.T) {
+	for _, mode := range []FencingMode{FencingModeOff, FencingModeAdditive, FencingModeStrict} {
+		t.Run(string(mode), func(t *testing.T) {
+			cfg, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+fencing:
+  mode: %s
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`, mode))
+			require.NoError(t, err)
+			assert.Equal(t, mode, cfg.Fencing.Mode)
+		})
+	}
+
+	_, err := loadTestConfig(t, requiredTestConfig+`
+fencing:
+  mode: permissive
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fencing.mode")
 }
 
 func TestLoadConfigDefaultsDatasetQuotasToTrue(t *testing.T) {

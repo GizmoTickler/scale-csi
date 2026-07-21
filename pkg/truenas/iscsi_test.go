@@ -117,6 +117,9 @@ func TestParseISCSITarget_Groups(t *testing.T) {
 				"initiator":  float64(2),
 				"authmethod": "CHAP",
 				"auth":       float64(10),
+				"auth_networks": []interface{}{
+					"192.0.2.0/24",
+				},
 			},
 			map[string]interface{}{
 				"portal":     float64(3),
@@ -137,12 +140,32 @@ func TestParseISCSITarget_Groups(t *testing.T) {
 	assert.Equal(t, "CHAP", target.Groups[0].AuthMethod)
 	require.NotNil(t, target.Groups[0].Auth)
 	assert.Equal(t, 10, *target.Groups[0].Auth)
+	assert.Equal(t, []string{"192.0.2.0/24"}, target.Groups[0].AuthNetworks)
 
 	// Second group without auth
 	assert.Equal(t, 3, target.Groups[1].Portal)
 	assert.Equal(t, 4, target.Groups[1].Initiator)
 	assert.Equal(t, "NONE", target.Groups[1].AuthMethod)
 	assert.Nil(t, target.Groups[1].Auth)
+}
+
+func TestISCSITargetGroupMaps_PreservesAllAccessConstraints(t *testing.T) {
+	auth := 5
+	groups := []ISCSITargetGroup{{
+		Portal:       1,
+		Initiator:    2,
+		AuthMethod:   "CHAP",
+		Auth:         &auth,
+		AuthNetworks: []string{"192.0.2.0/24", "2001:db8::/64"},
+	}}
+
+	got := iscsiTargetGroupMaps(groups)
+	require.Len(t, got, 1)
+	assert.Equal(t, 1, got[0]["portal"])
+	assert.Equal(t, 2, got[0]["initiator"])
+	assert.Equal(t, "CHAP", got[0]["authmethod"])
+	assert.Equal(t, 5, got[0]["auth"])
+	assert.Equal(t, []string{"192.0.2.0/24", "2001:db8::/64"}, got[0]["auth_networks"])
 }
 
 func TestParseISCSIExtent_AllFields(t *testing.T) {

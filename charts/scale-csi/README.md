@@ -27,6 +27,50 @@ used, that Secret must contain an `api-key` key.
 
 ## Configuration
 
+### Publication fencing and ownership
+
+| Parameter | Description | Default |
+|---|---|---|
+| `driverInstanceId` | Stable owner stamped on every driver-created dataset/zvol; empty derives `<csiDriverName>@<zfs.parentDataset>` | `""` |
+| `fencing.mode` | Backend publication policy: `off`, `additive`, or `strict` | `additive` |
+
+`ControllerPublishVolume` uses the TrueNAS allowlist as the durable attachment
+record. NVMe-oF authorizes the publishing node's host NQN, iSCSI authorizes its
+initiator IQN, and NFS authorizes its node IP after checking that IP against
+`nfs.shareAllowedNetworks`. `ControllerUnpublishVolume` removes that identity.
+The driver also stores a recovery copy of the identity on the volume dataset so
+unpublish remains possible after the Kubernetes Node has disappeared.
+
+`additive` is the upgrade-safe transition mode. It adds per-node entries while
+retaining configured/static backend entries and never removes an unknown legacy
+entry automatically. `strict` ignores static entries for fenced volumes and
+makes the live CSI publications the exact allowlist. `off` preserves the
+pre-fencing behavior. An iSCSI allow-all initiator group is never carried into a
+fenced volume; if a live attachment still has a legacy node ID, additive startup
+reconciliation records that blocker and defers tightening that volume.
+
+> **Upgrade from v1.2.22 or earlier:** leave `fencing.mode=additive`, upgrade the
+> node DaemonSet, wait for every CSINode to re-register, and restart/roll the
+> controller once more. Its startup reconciliation copies all attached
+> VolumeAttachments into per-volume backend allowlists without removing static
+> entries. Inspect the controller reconciliation log before selecting `strict`.
+> Do not select `strict` while an attached node still advertises a legacy node
+> ID; startup deliberately fails rather than fencing a live workload.
+
+Existing datasets from older versions do not have an ownership stamp. A
+same-name `CreateVolume` request now returns `ALREADY_EXISTS` until an operator
+explicitly adopts the verified dataset. Set the exact derived or configured
+identity manually, for example:
+
+```bash
+zfs set 'truenas-csi:driver_instance_id=csi.scale.io@tank/k8s/volumes' \
+  tank/k8s/volumes/pvc-example
+```
+
+Verify the dataset, its share/target, and cluster ownership before running that
+command. Keep `driverInstanceId` stable across upgrades; changing it creates a
+new ownership boundary.
+
 ### TrueNAS connection
 
 | Parameter | Description | Default |
@@ -78,7 +122,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `iscsi.portal` | Target portal host; falls back to `truenas.host` | `""` |
 | `iscsi.portalPort` | Target portal port | `3260` |
 | `iscsi.targetPortals` | Reserved and currently ignored (multipath unsupported; setting it emits a startup warning) | `[]` |
-| `iscsi.targetGroups` | Explicit portal/initiator group IDs; empty = auto-resolve from `iscsi.portal` | `[]` |
+| `iscsi.targetGroups` | Static portal/initiator groups for `off`/`additive`; when empty, the portal is resolved and fenced modes create a per-volume initiator group | `[]` |
 | `iscsi.extentBlocksize` | Extent block size | `512` |
 | `iscsi.extentDisablePhysicalBlocksize` | Disable extent physical-block-size reporting | `false` |
 | `iscsi.extentRpm` | Extent RPM value | `SSD` |
@@ -93,11 +137,10 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `false` |
 | `nvmeof.commandTimeout` | `nvme` command timeout in seconds | `30` |
 
-NVMe-oF requires an explicit `nvmeof.subsystemHosts` allow-list by default.
-Existing installations that relied on allow-any must explicitly set
-`nvmeof.subsystemAllowAnyHost: true` during upgrade. The driver reconciles the
-configured host list on publish and validates that restricted mode has at least
-one host at startup.
+With `fencing.mode=off`, NVMe-oF requires an explicit
+`nvmeof.subsystemHosts` allow-list unless `subsystemAllowAnyHost=true`. In
+`additive` mode those hosts remain a compatibility allowlist alongside dynamic
+publication entries. In `strict` mode they are ignored for fenced volumes.
 
 The iSCSI IQN basename comes from the TrueNAS global iSCSI configuration; it is
 not a chart or driver ConfigMap setting. The removed `iscsi.basename` and
@@ -221,8 +264,11 @@ disabled unless `reconcile.delete.enabled=true`. The CronJob invokes
 `--mode=reconcile`; backend cleanup always calls the driver's guarded CSI
 `DeleteVolume` and `DeleteSnapshot` implementations, so clone, snapshot, and
 foreign-snapshot dependency checks still apply. Spent VolSync restore snapshots
-are eligible only when detached snapshot copies are enabled and their source PVC
-is no longer Bound.
+are classified only when detached snapshot copies are enabled and their source
+PVC is no longer Bound. The name pattern is only the first-classification hint:
+the controller stamps the backend ZFS snapshot with a classification timestamp,
+and deletion is impossible until that durable marker itself exceeds
+`reconcile.minOrphanAge`.
 
 > **DANGER — one parent per cluster:** `zfs.parentDataset` MUST be unique to one
 > Kubernetes cluster. Never point two live clusters at the same parent dataset.
@@ -301,12 +347,11 @@ use `--worker-threads`.
 
 ## Security
 
-- `nfs.shareAllowedNetworks: []` preserves the driver default but permits mounts
-  from any network. Set explicit trusted CIDRs in production.
-- `nvmeof.subsystemAllowAnyHost: false` requires `nvmeof.subsystemHosts` to
-  contain each connecting node's `nvme show-hostnqn` output. Set allow-any to
-  `true` only when that broader access is intentional. Keep network segmentation
-  in place; host allowlisting is an additional control, not a replacement.
+- `nfs.shareAllowedNetworks` is the upper bound used to accept dynamically
+  reported node IPs. Keep it restricted to trusted node networks.
+- With fencing enabled, NVMe-oF and iSCSI authorization is derived from live CSI
+  publications. Static `nvmeof.subsystemHosts` entries are retained only by
+  additive mode and ignored by strict mode.
 - Prefer an externally managed Secret and set `truenas.existingSecret`; the
   Secret must contain `api-key`.
 - The node DaemonSet requires a namespace permitted to run at the `privileged`

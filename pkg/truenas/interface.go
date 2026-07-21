@@ -26,6 +26,7 @@ type ClientInterface interface {
 	DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error)
 	DatasetSetUserProperty(ctx context.Context, name, key, value string) error
 	DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error
+	DatasetRemoveUserProperties(ctx context.Context, name string, keys []string) error
 	DatasetGetUserProperty(ctx context.Context, name, key string) (string, error)
 	DatasetExpand(ctx context.Context, name string, newSize int64) error
 	DatasetExists(ctx context.Context, name string) (bool, error)
@@ -68,7 +69,12 @@ type ClientInterface interface {
 	ISCSIPortalList(ctx context.Context) ([]*ISCSIPortal, error)
 	ISCSIInitiatorList(ctx context.Context) ([]*ISCSIInitiator, error)
 	ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISCSIInitiator, error)
+	ISCSIInitiatorCreateWithInitiators(ctx context.Context, initiators []string, comment string) (*ISCSIInitiator, error)
+	ISCSIInitiatorGet(ctx context.Context, id int) (*ISCSIInitiator, error)
+	ISCSIInitiatorUpdate(ctx context.Context, id int, initiators []string, comment string) (*ISCSIInitiator, error)
+	ISCSIInitiatorDelete(ctx context.Context, id int) error
 	ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error)
+	ISCSITargetUpdate(ctx context.Context, id int, groups []ISCSITargetGroup) (*ISCSITarget, error)
 	ISCSITargetDelete(ctx context.Context, id int, force bool) error
 	ISCSITargetGet(ctx context.Context, id int) (*ISCSITarget, error)
 	ISCSITargetFindByName(ctx context.Context, name string) (*ISCSITarget, error)
@@ -90,7 +96,10 @@ type ClientInterface interface {
 	NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFHost, error)
 	NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error)
 	NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error)
+	NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFHostSubsys, error)
+	NVMeoFHostSubsysDelete(ctx context.Context, id int) error
 	NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error)
+	NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemDelete(ctx context.Context, id int) error
 	NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemFindByNQN(ctx context.Context, nqn string) (*NVMeoFSubsystem, error)

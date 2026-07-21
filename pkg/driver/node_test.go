@@ -212,7 +212,9 @@ func TestNodeGetInfo(t *testing.T) {
 
 		require.NoError(t, err)
 		require.NotNil(t, resp)
-		assert.Equal(t, "worker-node-1", resp.NodeId)
+		identity, parseErr := parseNodeIdentity(resp.NodeId)
+		require.NoError(t, parseErr)
+		assert.Equal(t, "worker-node-1", identity.Name)
 		assert.Nil(t, resp.AccessibleTopology, "no topology should be set when disabled")
 		assert.Zero(t, resp.MaxVolumesPerNode, "zero should preserve the unlimited/unset behavior")
 	})
@@ -238,7 +240,9 @@ func TestNodeGetInfo(t *testing.T) {
 
 		require.NoError(t, err)
 		require.NotNil(t, resp)
-		assert.Equal(t, "worker-node-2", resp.NodeId)
+		identity, parseErr := parseNodeIdentity(resp.NodeId)
+		require.NoError(t, parseErr)
+		assert.Equal(t, "worker-node-2", identity.Name)
 		require.NotNil(t, resp.AccessibleTopology)
 		assert.Equal(t, "zone-a", resp.AccessibleTopology.Segments["topology.kubernetes.io/zone"])
 		assert.Equal(t, "us-west", resp.AccessibleTopology.Segments["topology.kubernetes.io/region"])

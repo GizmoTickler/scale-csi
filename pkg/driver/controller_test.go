@@ -90,6 +90,18 @@ type nfsShareCreateFailureMock struct {
 	err error
 }
 
+type missingDatasetCleanupFailureMock struct {
+	*truenas.MockClient
+}
+
+func (m *missingDatasetCleanupFailureMock) DatasetGet(context.Context, string) (*truenas.Dataset, error) {
+	return nil, &truenas.APIError{Code: -1, Message: "dataset not found"}
+}
+
+func (m *missingDatasetCleanupFailureMock) NVMeoFNamespaceFindByDevicePath(context.Context, string) (*truenas.NVMeoFNamespace, error) {
+	return nil, fmt.Errorf("backend query unavailable")
+}
+
 func (m *nfsShareCreateFailureMock) NFSShareCreate(context.Context, *truenas.NFSShareCreateParams) (*truenas.NFSShare, error) {
 	return nil, m.err
 }
@@ -401,6 +413,7 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 				Name: "pool/parent/existing-source", Type: "FILESYSTEM", Refquota: 1024 * 1024 * 1024,
 			})
 			require.NoError(t, err)
+			require.NoError(t, mockClient.DatasetSetUserProperty(ctx, "pool/parent/existing-source", PropDriverInstanceID, d.driverInstanceID()))
 			require.NoError(t, mockClient.DatasetSetUserProperty(ctx, "pool/parent/existing-source", PropNFSShareID, "1"))
 			if tc.storedType != "" {
 				require.NoError(t, mockClient.DatasetSetUserProperty(ctx, "pool/parent/existing-source", PropVolumeContentSourceType, tc.storedType))
@@ -456,10 +469,25 @@ func TestCreateVolumeRejectsNFSRawBlockBeforeMutation(t *testing.T) {
 	require.Error(t, lookupErr)
 }
 
+func TestDeleteVolumeMissingDatasetFailsClosedOnProtocolCleanupError(t *testing.T) {
+	client := &missingDatasetCleanupFailureMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}},
+		truenasClient: client,
+	}
+
+	response, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "missing-volume"})
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "orphaned protocol cleanup failed")
+	assert.Contains(t, err.Error(), "backend query unavailable")
+}
+
 func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
 	client := &datasetCreateCaptureMock{MockClient: truenas.NewMockClient()}
 	d := &Driver{
-		config: &Config{ZFS: ZFSConfig{
+		config: &Config{DriverName: "org.scale.csi.test", ZFS: ZFSConfig{
 			DatasetParentName:        "pool/parent",
 			DatasetEnableQuotas:      true,
 			DatasetEnableReservation: true,
@@ -495,7 +523,10 @@ func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
 	assert.Equal(t, "OFF", params.Readonly)
 	assert.Equal(t, 2*testGiB, params.Refquota)
 	assert.Equal(t, 2*testGiB, params.Refreservation)
-	assert.Equal(t, []truenas.UserPropertyUpdate{{Key: "org.truenas:owner", Value: "storage-team"}}, params.UserProperties)
+	assert.Equal(t, []truenas.UserPropertyUpdate{
+		{Key: "org.truenas:owner", Value: "storage-team"},
+		{Key: PropDriverInstanceID, Value: "org.scale.csi.test@pool/parent"},
+	}, params.UserProperties)
 }
 
 func TestCreateDatasetZvolSkipsFilesystemOnlyProperties(t *testing.T) {

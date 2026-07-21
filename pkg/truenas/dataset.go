@@ -352,6 +352,25 @@ func (c *Client) DatasetSetUserProperties(ctx context.Context, name string, prop
 	return err
 }
 
+// DatasetRemoveUserProperties removes local user properties in one update.
+// Publication records use removal rather than an empty value so a retry can
+// distinguish "never published" from an interrupted unpublish tombstone.
+func (c *Client) DatasetRemoveUserProperties(ctx context.Context, name string, keys []string) error {
+	keys = append([]string(nil), keys...)
+	sort.Strings(keys)
+	updates := make([]UserPropertyUpdate, 0, len(keys))
+	for _, key := range keys {
+		if key != "" {
+			updates = append(updates, UserPropertyUpdate{Key: key, Remove: true})
+		}
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	_, err := c.DatasetUpdate(ctx, name, &DatasetUpdateParams{UserPropertiesUpdate: updates})
+	return err
+}
+
 // DatasetGetUserProperty gets a user property from a dataset.
 func (c *Client) DatasetGetUserProperty(ctx context.Context, name, key string) (string, error) {
 	ds, err := c.DatasetGet(ctx, name)
@@ -661,7 +680,7 @@ func (c *Client) WaitForZvolReady(ctx context.Context, name string, timeout time
 func (c *Client) DatasetExists(ctx context.Context, name string) (bool, error) {
 	_, err := c.DatasetGet(ctx, name)
 	if err != nil {
-		if IsNotFoundError(err) || strings.Contains(err.Error(), "not found") {
+		if IsNotFoundError(err) {
 			return false, nil
 		}
 		return false, err

@@ -3,7 +3,6 @@ package truenas
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
 // ISCSITarget represents an iSCSI target from the TrueNAS API.
@@ -17,10 +16,11 @@ type ISCSITarget struct {
 
 // ISCSITargetGroup represents a portal/initiator group for a target.
 type ISCSITargetGroup struct {
-	Portal     int    `json:"portal"`
-	Initiator  int    `json:"initiator"`
-	AuthMethod string `json:"authmethod"`
-	Auth       *int   `json:"auth"`
+	Portal       int      `json:"portal"`
+	Initiator    int      `json:"initiator"`
+	AuthMethod   string   `json:"authmethod"`
+	Auth         *int     `json:"auth"`
+	AuthNetworks []string `json:"auth_networks,omitempty"`
 }
 
 // ISCSIExtent represents an iSCSI extent from the TrueNAS API.
@@ -60,24 +60,10 @@ type ISCSIGlobalConfig struct {
 
 // ISCSITargetCreate creates a new iSCSI target.
 func (c *Client) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
-	// Convert groups to maps, omitting auth field when nil (TrueNAS API prefers no field vs null)
-	groupMaps := make([]map[string]interface{}, len(groups))
-	for i, g := range groups {
-		gm := map[string]interface{}{
-			"portal":     g.Portal,
-			"initiator":  g.Initiator,
-			"authmethod": g.AuthMethod,
-		}
-		if g.Auth != nil {
-			gm["auth"] = *g.Auth
-		}
-		groupMaps[i] = gm
-	}
-
 	params := map[string]interface{}{
 		"name":   name,
 		"mode":   mode,
-		"groups": groupMaps,
+		"groups": iscsiTargetGroupMaps(groups),
 	}
 	// Only include alias if non-empty
 	if alias != "" {
@@ -91,7 +77,7 @@ func (c *Client) ISCSITargetCreate(ctx context.Context, name, alias, mode string
 
 		// TrueNAS returns "Invalid params" when target already exists (not a helpful error message)
 		// Check if target exists and return it if so
-		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
 			existing, findErr := c.ISCSITargetFindByName(ctx, name)
 			if findErr == nil && existing != nil {
 				return existing, nil
@@ -103,12 +89,41 @@ func (c *Client) ISCSITargetCreate(ctx context.Context, name, alias, mode string
 	return parseISCSITarget(result)
 }
 
+func iscsiTargetGroupMaps(groups []ISCSITargetGroup) []map[string]interface{} {
+	groupMaps := make([]map[string]interface{}, len(groups))
+	for i, group := range groups {
+		entry := map[string]interface{}{
+			"portal":     group.Portal,
+			"initiator":  group.Initiator,
+			"authmethod": group.AuthMethod,
+		}
+		if group.Auth != nil {
+			entry["auth"] = *group.Auth
+		}
+		if len(group.AuthNetworks) > 0 {
+			entry["auth_networks"] = append([]string(nil), group.AuthNetworks...)
+		}
+		groupMaps[i] = entry
+	}
+	return groupMaps
+}
+
+// ISCSITargetUpdate atomically replaces a target's portal/initiator groups.
+func (c *Client) ISCSITargetUpdate(ctx context.Context, id int, groups []ISCSITargetGroup) (*ISCSITarget, error) {
+	result, err := c.Call(ctx, "iscsi.target.update", id, map[string]interface{}{
+		"groups": iscsiTargetGroupMaps(groups),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to update iSCSI target: %w", err)
+	}
+	return parseISCSITarget(result)
+}
+
 // ISCSITargetDelete deletes an iSCSI target.
 func (c *Client) ISCSITargetDelete(ctx context.Context, id int, force bool) error {
 	_, err := c.Call(ctx, "iscsi.target.delete", id, force)
 	if err != nil {
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+		if IsNotFoundError(err) {
 			return nil
 		}
 		if c.deleteVanishedTolerant(ctx, "iscsi.target.query", id) {
@@ -162,7 +177,7 @@ func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment 
 
 		// TrueNAS returns "Invalid params" when extent already exists
 		// Check if extent exists and return it if so
-		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
 			existing, findErr := c.ISCSIExtentFindByName(ctx, name)
 			if findErr == nil && existing != nil {
 				return existing, nil
@@ -193,8 +208,7 @@ func iscsiExtentCreateParams(name, diskPath, comment string, blocksize int, phys
 func (c *Client) ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error {
 	_, err := c.Call(ctx, "iscsi.extent.delete", id, remove, force)
 	if err != nil {
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+		if IsNotFoundError(err) {
 			return nil
 		}
 		if c.deleteVanishedTolerant(ctx, "iscsi.extent.query", id) {
@@ -254,7 +268,7 @@ func (c *Client) ISCSITargetExtentCreate(ctx context.Context, targetID, extentID
 
 		// TrueNAS returns "Invalid params" when association already exists
 		// Check if association exists and return it if so
-		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
 			existing, findErr := c.ISCSITargetExtentFind(ctx, targetID, extentID)
 			if findErr == nil && existing != nil {
 				return existing, nil
@@ -270,8 +284,7 @@ func (c *Client) ISCSITargetExtentCreate(ctx context.Context, targetID, extentID
 func (c *Client) ISCSITargetExtentDelete(ctx context.Context, id int, force bool) error {
 	_, err := c.Call(ctx, "iscsi.targetextent.delete", id, force)
 	if err != nil {
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+		if IsNotFoundError(err) {
 			return nil
 		}
 		if c.deleteVanishedTolerant(ctx, "iscsi.targetextent.query", id) {
@@ -370,6 +383,16 @@ func parseISCSITarget(data interface{}) (*ISCSITarget, error) {
 			if v, ok := gm["auth"].(float64); ok {
 				val := int(v)
 				group.Auth = &val
+			}
+			switch values := gm["auth_networks"].(type) {
+			case []interface{}:
+				for _, value := range values {
+					if network, ok := value.(string); ok {
+						group.AuthNetworks = append(group.AuthNetworks, network)
+					}
+				}
+			case []string:
+				group.AuthNetworks = append(group.AuthNetworks, values...)
 			}
 			target.Groups = append(target.Groups, group)
 		}
@@ -649,8 +672,15 @@ func (c *Client) ISCSIInitiatorList(ctx context.Context) ([]*ISCSIInitiator, err
 
 // ISCSIInitiatorCreate creates an allow-all iSCSI initiator group.
 func (c *Client) ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISCSIInitiator, error) {
+	return c.ISCSIInitiatorCreateWithInitiators(ctx, nil, comment)
+}
+
+// ISCSIInitiatorCreateWithInitiators creates an exact initiator allowlist. An
+// empty list has TrueNAS allow-all semantics and is therefore used only by the
+// legacy, fencing-off path.
+func (c *Client) ISCSIInitiatorCreateWithInitiators(ctx context.Context, initiators []string, comment string) (*ISCSIInitiator, error) {
 	params := map[string]interface{}{
-		"initiators": []string{},
+		"initiators": initiators,
 		"comment":    comment,
 	}
 	result, err := c.Call(ctx, "iscsi.initiator.create", params)
@@ -661,9 +691,71 @@ func (c *Client) ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISC
 	if !ok {
 		return nil, fmt.Errorf("unexpected response type")
 	}
-	group := &ISCSIInitiator{Comment: comment}
-	if v, ok := m["id"].(float64); ok {
-		group.ID = int(v)
+	return parseISCSIInitiator(m)
+}
+
+// ISCSIInitiatorGet returns one initiator group by ID.
+func (c *Client) ISCSIInitiatorGet(ctx context.Context, id int) (*ISCSIInitiator, error) {
+	result, err := c.Call(ctx, "iscsi.initiator.query", [][]interface{}{{"id", "=", id}}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query iSCSI initiator group: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok || len(items) == 0 {
+		return nil, nil
+	}
+	return parseISCSIInitiator(items[0])
+}
+
+// ISCSIInitiatorUpdate replaces the exact initiator allowlist.
+func (c *Client) ISCSIInitiatorUpdate(ctx context.Context, id int, initiators []string, comment string) (*ISCSIInitiator, error) {
+	params := map[string]interface{}{"initiators": initiators}
+	if comment != "" {
+		params["comment"] = comment
+	}
+	result, err := c.Call(ctx, "iscsi.initiator.update", id, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update iSCSI initiator group: %w", err)
+	}
+	return parseISCSIInitiator(result)
+}
+
+// ISCSIInitiatorDelete removes an initiator group idempotently.
+func (c *Client) ISCSIInitiatorDelete(ctx context.Context, id int) error {
+	_, err := c.Call(ctx, "iscsi.initiator.delete", id)
+	if err == nil || IsNotFoundError(err) {
+		return nil
+	}
+	if c.deleteVanishedTolerant(ctx, "iscsi.initiator.query", id) {
+		return nil
+	}
+	return fmt.Errorf("failed to delete iSCSI initiator group: %w", err)
+}
+
+func parseISCSIInitiator(raw interface{}) (*ISCSIInitiator, error) {
+	m, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected iSCSI initiator group format")
+	}
+	group := &ISCSIInitiator{}
+	switch id := m["id"].(type) {
+	case float64:
+		group.ID = int(id)
+	case int:
+		group.ID = id
+	}
+	if comment, ok := m["comment"].(string); ok {
+		group.Comment = comment
+	}
+	switch initiators := m["initiators"].(type) {
+	case []interface{}:
+		for _, initiator := range initiators {
+			if value, ok := initiator.(string); ok {
+				group.Initiators = append(group.Initiators, value)
+			}
+		}
+	case []string:
+		group.Initiators = append(group.Initiators, initiators...)
 	}
 	return group, nil
 }

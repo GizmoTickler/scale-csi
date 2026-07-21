@@ -3,6 +3,17 @@
 # CSI Driver name (should match the driver name in StorageClass)
 csiDriverName: csi.scale.io
 
+# Stable ownership identity stamped on newly-created datasets/zvols. Empty
+# derives "<csiDriverName>@<zfs.parentDataset>". Never change this for an
+# existing installation unless the matching datasets are deliberately adopted.
+driverInstanceId: ""
+
+# Backend publication fencing. "additive" is the rolling-upgrade-safe default;
+# use "strict" only after every node has registered transport identities and
+# the controller startup reconciliation has completed.
+fencing:
+  mode: additive
+
 # Image configuration
 image:
   repository: ghcr.io/gizmotickler/scale-csi

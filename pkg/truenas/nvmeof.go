@@ -77,14 +77,14 @@ func (c *Client) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAn
 	if err != nil {
 		// TrueNAS SCALE 25.10+ returns "Invalid params" when a subsystem with the same name exists,
 		// instead of "already exists". Check if the subsystem exists before failing.
-		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
 			existing, findErr := c.NVMeoFSubsystemFindByName(ctx, name)
 			if findErr == nil && existing != nil {
 				klog.V(4).Infof("NVMeoFSubsystemCreate: subsystem %q already exists (ID %d), returning existing", name, existing.ID)
 				return existing, nil
 			}
 			// If we got "Invalid params" but the subsystem doesn't exist, it's a genuine parameter error
-			if strings.Contains(err.Error(), "Invalid params") {
+			if MessageFallbackContains(err, "invalid params") {
 				klog.Errorf("NVMeoFSubsystemCreate: 'Invalid params' error for %q but subsystem not found - genuine parameter error", name)
 			}
 		}
@@ -117,7 +117,7 @@ func (c *Client) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID in
 	}
 	result, err := c.Call(ctx, "nvmet.host_subsys.create", params)
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
+		if IsAlreadyExistsError(err) {
 			if existing, findErr := c.NVMeoFHostSubsysFind(ctx, hostID, subsysID); findErr == nil && existing != nil {
 				return existing, nil
 			}
@@ -144,9 +144,10 @@ func (c *Client) NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int)
 
 // NVMeoFHostSubsys represents a host↔subsystem access association.
 type NVMeoFHostSubsys struct {
-	ID       int `json:"id"`
-	HostID   int `json:"-"`
-	SubsysID int `json:"-"`
+	ID       int    `json:"id"`
+	HostID   int    `json:"-"`
+	HostNQN  string `json:"-"`
+	SubsysID int    `json:"-"`
 }
 
 func parseNVMeoFHostSubsys(raw interface{}) (*NVMeoFHostSubsys, error) {
@@ -162,6 +163,9 @@ func parseNVMeoFHostSubsys(raw interface{}) (*NVMeoFHostSubsys, error) {
 		if v, ok := h["id"].(float64); ok {
 			hs.HostID = int(v)
 		}
+		if v, ok := h["hostnqn"].(string); ok {
+			hs.HostNQN = v
+		}
 	}
 	if s, ok := m["subsys"].(map[string]interface{}); ok {
 		if v, ok := s["id"].(float64); ok {
@@ -169,6 +173,40 @@ func parseNVMeoFHostSubsys(raw interface{}) (*NVMeoFHostSubsys, error) {
 		}
 	}
 	return hs, nil
+}
+
+// NVMeoFHostSubsysListBySubsystem lists the exact allowed-host associations
+// for one subsystem. TrueNAS does not consistently support nested-field
+// filtering across releases, so filtering is performed client-side.
+func (c *Client) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFHostSubsys, error) {
+	result, err := c.Call(ctx, "nvmet.host_subsys.query", []interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list host_subsys associations: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected host_subsys response type")
+	}
+	associations := make([]*NVMeoFHostSubsys, 0)
+	for _, item := range items {
+		association, parseErr := parseNVMeoFHostSubsys(item)
+		if parseErr == nil && association.SubsysID == subsysID {
+			associations = append(associations, association)
+		}
+	}
+	return associations, nil
+}
+
+// NVMeoFHostSubsysDelete removes one allowed-host association idempotently.
+func (c *Client) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
+	_, err := c.Call(ctx, "nvmet.host_subsys.delete", id)
+	if err == nil || IsNotFoundError(err) {
+		return nil
+	}
+	if c.deleteVanishedTolerant(ctx, "nvmet.host_subsys.query", id) {
+		return nil
+	}
+	return fmt.Errorf("failed to delete host_subsys association: %w", err)
 }
 
 // NVMeoFHostFindByNQN finds an NVMe-oF host by its exact host NQN.
@@ -205,27 +243,28 @@ func (c *Client) NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFHost,
 func (c *Client) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
 	_, err := c.Call(ctx, "nvmet.subsys.delete", id)
 	if err != nil {
-		// TrueNAS returns "Invalid params" for multiple conditions (bad params, not found, etc.)
-		// We must verify the actual state before assuming success
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") ||
-			strings.Contains(err.Error(), "Invalid params") {
-			klog.V(4).Infof("NVMeoFSubsystemDelete received ambiguous error, verifying if subsystem exists: id=%d", id)
-			existing, findErr := c.NVMeoFSubsystemGet(ctx, id)
-			if findErr != nil || existing == nil {
-				// Resource doesn't exist - delete succeeded or was already gone
-				klog.V(4).Infof("NVMeoFSubsystemDelete subsystem does not exist, treating as success: id=%d", id)
-				return nil
-			}
-			// Resource still exists - "Invalid params" was genuinely a parameter error
-			klog.V(4).Infof("NVMeoFSubsystemDelete subsystem still exists, 'Invalid params' indicates genuine parameter error: id=%d", id)
+		if IsNotFoundError(err) {
+			return nil
 		}
+		// Bare Invalid params is ambiguous on TrueNAS 26.0. Only an
+		// authoritative empty follow-up query may turn it into success; query
+		// failures remain delete failures.
 		if c.deleteVanishedTolerant(ctx, "nvmet.subsys.query", id) {
 			return nil
 		}
 		return fmt.Errorf("failed to delete NVMe-oF subsystem: %w", err)
 	}
 	return nil
+}
+
+// NVMeoFSubsystemUpdateAllowAnyHost changes the subsystem from the legacy
+// allow-any state to an explicit host association allowlist (or vice versa).
+func (c *Client) NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*NVMeoFSubsystem, error) {
+	result, err := c.Call(ctx, "nvmet.subsys.update", id, map[string]interface{}{"allow_any_host": allowAnyHost})
+	if err != nil {
+		return nil, fmt.Errorf("failed to update NVMe-oF subsystem access policy: %w", err)
+	}
+	return parseNVMeoFSubsystem(result)
 }
 
 // NVMeoFSubsystemGet retrieves an NVMe-oF subsystem by ID.
@@ -307,14 +346,14 @@ func (c *Client) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, dev
 	if err != nil {
 		// TrueNAS SCALE 25.10+ may return "Invalid params" when a namespace with the same
 		// device_path already exists, instead of "already exists". Check if it exists before failing.
-		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
 			existing, findErr := c.NVMeoFNamespaceFindByDevice(ctx, subsystemID, normalizedPath)
 			if findErr == nil && existing != nil {
 				klog.V(4).Infof("NVMeoFNamespaceCreate: namespace for device %q already exists (ID %d), returning existing", normalizedPath, existing.ID)
 				return existing, nil
 			}
 			// If we got "Invalid params" but the namespace doesn't exist, it's a genuine parameter error
-			if strings.Contains(err.Error(), "Invalid params") {
+			if MessageFallbackContains(err, "invalid params") {
 				klog.Errorf("NVMeoFNamespaceCreate: 'Invalid params' error for device %q but namespace not found - genuine parameter error", normalizedPath)
 			}
 		}
@@ -328,20 +367,8 @@ func (c *Client) NVMeoFNamespaceCreate(ctx context.Context, subsystemID int, dev
 func (c *Client) NVMeoFNamespaceDelete(ctx context.Context, id int) error {
 	_, err := c.Call(ctx, "nvmet.namespace.delete", id)
 	if err != nil {
-		// TrueNAS returns "Invalid params" for multiple conditions (bad params, not found, etc.)
-		// We must verify the actual state before assuming success
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") ||
-			strings.Contains(err.Error(), "Invalid params") {
-			klog.V(4).Infof("NVMeoFNamespaceDelete received ambiguous error, verifying if namespace exists: id=%d", id)
-			existing, findErr := c.NVMeoFNamespaceGet(ctx, id)
-			if findErr != nil || existing == nil {
-				// Resource doesn't exist - delete succeeded or was already gone
-				klog.V(4).Infof("NVMeoFNamespaceDelete namespace does not exist, treating as success: id=%d", id)
-				return nil
-			}
-			// Resource still exists - "Invalid params" was genuinely a parameter error
-			klog.V(4).Infof("NVMeoFNamespaceDelete namespace still exists, 'Invalid params' indicates genuine parameter error: id=%d", id)
+		if IsNotFoundError(err) {
+			return nil
 		}
 		if c.deleteVanishedTolerant(ctx, "nvmet.namespace.query", id) {
 			return nil
@@ -462,14 +489,14 @@ func (c *Client) NVMeoFPortCreate(ctx context.Context, transport, address string
 	if err != nil {
 		// TrueNAS SCALE 25.10+ may return "Invalid params" when a port with the same
 		// address already exists, instead of "already exists". Check if it exists before failing.
-		if IsAlreadyExistsError(err) || strings.Contains(strings.ToLower(err.Error()), "invalid params") {
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
 			existing, findErr := c.NVMeoFPortFindByAddress(ctx, transport, address, port)
 			if findErr == nil && existing != nil {
 				klog.V(4).Infof("NVMeoFPortCreate: port %s:%s:%d already exists (ID %d), returning existing", transport, address, port, existing.ID)
 				return existing, nil
 			}
 			// If we got "Invalid params" but the port doesn't exist, it's a genuine parameter error
-			if strings.Contains(strings.ToLower(err.Error()), "invalid params") {
+			if MessageFallbackContains(err, "invalid params") {
 				klog.Errorf("NVMeoFPortCreate: 'Invalid params' error for port %s:%s:%d but port not found - genuine parameter error", transport, address, port)
 			}
 		}
@@ -518,7 +545,7 @@ func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID in
 	if err != nil {
 		// TrueNAS SCALE 25.10+ may return "Invalid params" when the association already exists,
 		// instead of "already exists". Check if it exists before failing.
-		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "Invalid params") {
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
 			// Find and return the existing association
 			assocs, findErr := c.NVMeoFPortSubsysListBySubsystem(ctx, subsysID)
 			if findErr == nil {
@@ -530,7 +557,7 @@ func (c *Client) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID in
 				}
 			}
 			// If we got "Invalid params" but couldn't find the association, it's a genuine parameter error
-			if strings.Contains(err.Error(), "Invalid params") {
+			if MessageFallbackContains(err, "invalid params") {
 				klog.Errorf("NVMeoFPortSubsysCreate: 'Invalid params' error for port=%d, subsys=%d but association not found - genuine parameter error", portID, subsysID)
 			}
 		}
@@ -635,26 +662,23 @@ func NVMeoFPortSubsysFilterBySubsystem(assocs []*NVMeoFPortSubsys, subsysID int)
 func (c *Client) NVMeoFPortSubsysDelete(ctx context.Context, id int) error {
 	_, err := c.Call(ctx, "nvmet.port_subsys.delete", id)
 	if err != nil {
-		// TrueNAS returns "Invalid params" for multiple conditions (bad params, not found, etc.)
-		// We must verify the actual state before assuming success
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") ||
-			strings.Contains(err.Error(), "Invalid params") {
+		if IsNotFoundError(err) {
+			return nil
+		}
+		if MessageFallbackContains(err, "invalid params") {
 			klog.V(4).Infof("NVMeoFPortSubsysDelete received ambiguous error, verifying if association exists: id=%d", id)
-			// Query to check if the association still exists
 			result, findErr := c.Call(ctx, "nvmet.port_subsys.query", [][]interface{}{{"id", "=", id}}, map[string]interface{}{})
 			if findErr != nil {
-				// Query failed - assume resource doesn't exist
-				klog.V(4).Infof("NVMeoFPortSubsysDelete query failed, treating as success: id=%d", id)
-				return nil
+				return fmt.Errorf("failed to verify port-subsystem association after delete error: %w", findErr)
 			}
-			if assocs, ok := result.([]interface{}); !ok || len(assocs) == 0 {
-				// Resource doesn't exist - delete succeeded or was already gone
+			assocs, ok := result.([]interface{})
+			if !ok {
+				return fmt.Errorf("failed to verify port-subsystem association after delete error: unexpected query response")
+			}
+			if len(assocs) == 0 {
 				klog.V(4).Infof("NVMeoFPortSubsysDelete association does not exist, treating as success: id=%d", id)
 				return nil
 			}
-			// Resource still exists - "Invalid params" was genuinely a parameter error
-			klog.V(4).Infof("NVMeoFPortSubsysDelete association still exists, 'Invalid params' indicates genuine parameter error: id=%d", id)
 		}
 		return fmt.Errorf("failed to delete port-subsystem association: %w", err)
 	}

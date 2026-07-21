@@ -9,6 +9,12 @@ data:
   config.yaml: |
     # CSI Driver configuration
     driver: {{ .Values.csiDriverName }}
+    {{ with .Values.driverInstanceId }}
+    driverInstanceId: {{ . | quote }}
+    {{ end }}
+
+    fencing:
+      mode: {{ .Values.fencing.mode | quote }}
 
     # TrueNAS connection settings
     truenas:
@@ -66,9 +72,9 @@ data:
         {{- toYaml .Values.iscsi.targetPortals | nindent 8 }}
       interface: "default"
       {{- if .Values.iscsi.targetGroups }}
-      # Explicit portal/initiator group IDs (install-specific TrueNAS database
-      # ids). When omitted, the driver resolves them automatically from
-      # targetPortal and an allow-all initiator group.
+      # Static portal/initiator groups (install-specific TrueNAS database ids).
+      # Fenced modes resolve the portal and create a per-volume initiator group;
+      # additive mode also preserves these static groups.
       targetGroups:
         {{- toYaml .Values.iscsi.targetGroups | nindent 8 }}
       {{- end }}

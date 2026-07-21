@@ -285,6 +285,7 @@ func TestCreateVolumeExistingResponseIncludesAccessibleTopology(t *testing.T) {
 	})
 	require.NoError(t, err)
 	driver := newComplianceTestDriver(mockClient)
+	require.NoError(t, mockClient.DatasetSetUserProperty(ctx, "pool/parent/existing-volume", PropDriverInstanceID, driver.driverInstanceID()))
 	driver.config.ZFS.DatasetEnableQuotas = true
 	driver.config.Node.Topology = TopologyConfig{Enabled: true, Zone: "zone-a", Region: "region-a"}
 
@@ -759,6 +760,7 @@ func TestCreateVolumeDetachedSnapshotExistingCopyClearsInheritedShareIdentity(t 
 
 	trackingClient := &transferredSnapshotCleanupTrackingClient{MockClient: client}
 	driver := newComplianceTestDriver(trackingClient)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, "pool/parent/existing-copy", PropDriverInstanceID, driver.driverInstanceID()))
 	driver.config.ZFS.DetachedVolumesFromSnapshots = true
 	driver.config.ZFS.DatasetEnableQuotas = true
 	response, err := driver.CreateVolume(ctx, &csi.CreateVolumeRequest{

@@ -653,8 +653,10 @@ func TestMockClient_NVMeoFRestrictedSubsystemUsesKnownHosts(t *testing.T) {
 	assert.False(t, subsys.AllowAnyHost)
 	assert.Equal(t, []int{host.ID}, subsys.Hosts)
 
-	_, err = client.NVMeoFSubsystemCreate(ctx, "empty-restricted", false, nil)
-	require.Error(t, err)
+	empty, err := client.NVMeoFSubsystemCreate(ctx, "empty-restricted", false, nil)
+	require.NoError(t, err)
+	assert.False(t, empty.AllowAnyHost)
+	assert.Empty(t, empty.Hosts, "a fenced subsystem starts closed until ControllerPublishVolume")
 	_, err = client.NVMeoFSubsystemCreate(ctx, "unknown-host", false, []int{999})
 	require.Error(t, err)
 }
