@@ -40,6 +40,14 @@ spec:
           annotations:
             summary: Scale CSI is disconnected from TrueNAS
             description: The driver has reported no authenticated TrueNAS connection for two minutes.
+        - alert: ScaleCSITrueNASConnectionDown
+          expr: max(scale_csi_truenas_connection_status{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Scale CSI controller is disconnected from TrueNAS
+            description: The controller has reported no authenticated TrueNAS connection for five minutes.
         - alert: ScaleCSIHighTrueNASAPIFailureRate
           expr: (sum(rate(scale_csi_truenas_requests_total{status="error"}[5m])) / sum(rate(scale_csi_truenas_requests_total[5m]))) > 0.1
           for: 10m
