@@ -1,11 +1,18 @@
 package driver
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -42,6 +49,61 @@ func TestNewDriverNodeOnlyDoesNotCreateTrueNASClient(t *testing.T) {
 	assert.Nil(t, drv.truenasClient)
 	assert.Nil(t, drv.serviceReloadDebouncer)
 	drv.Stop()
+}
+
+func TestNewDriverPrecomputesProtocolPrioritizedNodeIdentity(t *testing.T) {
+	originalCommand := nodeIdentityCommand
+	originalRead := nodeReadIdentityFile
+	t.Cleanup(func() {
+		nodeIdentityCommand = originalCommand
+		nodeReadIdentityFile = originalRead
+	})
+	nodeIdentityCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("nqn." + strings.Repeat("n", 220)), nil
+	}
+	nodeReadIdentityFile = func(path string) ([]byte, error) {
+		if strings.Contains(path, "initiatorname") {
+			return []byte("InitiatorName=iqn." + strings.Repeat("i", 220)), nil
+		}
+		return nil, fmt.Errorf("not found")
+	}
+	t.Setenv("NODE_IP", "192.0.2.11")
+
+	drv, err := NewDriver(&DriverConfig{
+		Name: "csi.scale.io", Version: "test", NodeID: "worker-a",
+		Endpoint: "unix:///tmp/scale-csi-prioritized-node-test.sock", RunNode: true,
+		Config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "tank/csi"},
+			NFS: NFSConfig{Enabled: true, ShareHost: "192.0.2.10"},
+			// The discovered block identities are deliberately too large together,
+			// but they are irrelevant to this NFS-only node and must be dropped.
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(drv.Stop)
+	identity, err := parseNodeIdentity(drv.encodedNodeID)
+	require.NoError(t, err)
+	assert.Empty(t, identity.NVMeNQN)
+	assert.Empty(t, identity.ISCSIIQN)
+	assert.Equal(t, []net.IP{net.ParseIP("192.0.2.11").To4()}, identity.IPs)
+
+	first, err := drv.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+	require.NoError(t, err)
+	second, err := drv.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, first.NodeId, second.NodeId, "NodeGetInfo returns the startup-validated identity without a fallible sync.Once")
+}
+
+func TestNewDriverFailsStartupWhenMandatoryNodeIdentityCannotFit(t *testing.T) {
+	drv, err := NewDriver(&DriverConfig{
+		Name: "csi.scale.io", Version: "test", NodeID: strings.Repeat("node", 70),
+		Endpoint: "unix:///tmp/scale-csi-oversize-node-test.sock", RunNode: true,
+		Config: &Config{ZFS: ZFSConfig{DatasetParentName: "tank/csi"}},
+	})
+	require.Error(t, err)
+	assert.Nil(t, drv)
+	assert.Contains(t, err.Error(), "node startup identity cannot be encoded")
+	assert.Contains(t, err.Error(), "256-byte node_id limit")
 }
 
 func TestNewDriverControllerCreatesTrueNASClient(t *testing.T) {
@@ -106,4 +168,26 @@ func TestRequestWithoutSecretsClonesAndStripsSecrets(t *testing.T) {
 	assert.NotSame(t, original, redacted)
 	assert.Empty(t, redacted.GetSecrets())
 	assert.Equal(t, "super-secret", original.GetSecrets()["api-key"], "logging redaction must not mutate the handler request")
+}
+
+func TestDeleteVolumeDependentSnapshotLogClassificationIsExactAndRateLimited(t *testing.T) {
+	request := &csi.DeleteVolumeRequest{VolumeId: "released-volume"}
+	expected := status.Error(codes.FailedPrecondition,
+		"volume released-volume has dependent snapshots that must be deleted first")
+	volumeID, ok := expectedDeleteVolumeSnapshotDependency(request, expected)
+	assert.True(t, ok)
+	assert.Equal(t, "released-volume", volumeID)
+
+	_, ok = expectedDeleteVolumeSnapshotDependency(request,
+		status.Error(codes.FailedPrecondition, "volume released-volume has another dependency"))
+	assert.False(t, ok, "unexpected FailedPrecondition errors must retain ERROR logging")
+	_, ok = expectedDeleteVolumeSnapshotDependency(request,
+		status.Error(codes.Internal, "volume released-volume has dependent snapshots that must be deleted first"))
+	assert.False(t, ok)
+
+	d := &Driver{expectedDeleteLogLast: make(map[string]time.Time)}
+	now := time.Now()
+	assert.True(t, d.shouldLogExpectedDeleteSnapshotDependency(volumeID, now))
+	assert.False(t, d.shouldLogExpectedDeleteSnapshotDependency(volumeID, now.Add(time.Second)))
+	assert.True(t, d.shouldLogExpectedDeleteSnapshotDependency(volumeID, now.Add(expectedDeleteSnapshotLogInterval)))
 }

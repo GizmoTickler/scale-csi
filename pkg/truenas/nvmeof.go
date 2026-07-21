@@ -159,6 +159,9 @@ func parseNVMeoFHostSubsys(raw interface{}) (*NVMeoFHostSubsys, error) {
 	if v, ok := m["id"].(float64); ok {
 		hs.ID = int(v)
 	}
+	// TrueNAS 26.0 returns nested expanded objects here:
+	// {id, host:{id,hostnqn,...}, subsys:{id,name,subnqn,...}}. HostNQN is
+	// normally expanded; callers retain HostID matching as defensive fallback.
 	if h, ok := m["host"].(map[string]interface{}); ok {
 		if v, ok := h["id"].(float64); ok {
 			hs.HostID = int(v)

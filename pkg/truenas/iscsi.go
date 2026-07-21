@@ -583,8 +583,8 @@ type ISCSIPortal struct {
 	Listen []ISCSIPortalListen `json:"listen"`
 }
 
-// ISCSIInitiator represents a TrueNAS iSCSI initiator group. An empty
-// Initiators list means "allow all initiators".
+// ISCSIInitiator represents a TrueNAS iSCSI initiator group. A nil Initiators
+// list (JSON null) means allow-all; a non-nil empty list (JSON []) is deny-all.
 type ISCSIInitiator struct {
 	ID         int      `json:"id"`
 	Initiators []string `json:"initiators"`
@@ -647,23 +647,9 @@ func (c *Client) ISCSIInitiatorList(ctx context.Context) ([]*ISCSIInitiator, err
 	}
 	groups := make([]*ISCSIInitiator, 0, len(items))
 	for _, item := range items {
-		m, ok := item.(map[string]interface{})
-		if !ok {
+		group, parseErr := parseISCSIInitiator(item)
+		if parseErr != nil {
 			continue
-		}
-		group := &ISCSIInitiator{}
-		if v, ok := m["id"].(float64); ok {
-			group.ID = int(v)
-		}
-		if v, ok := m["comment"].(string); ok {
-			group.Comment = v
-		}
-		if inits, ok := m["initiators"].([]interface{}); ok {
-			for _, in := range inits {
-				if s, ok := in.(string); ok {
-					group.Initiators = append(group.Initiators, s)
-				}
-			}
 		}
 		groups = append(groups, group)
 	}
@@ -675,9 +661,9 @@ func (c *Client) ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISC
 	return c.ISCSIInitiatorCreateWithInitiators(ctx, nil, comment)
 }
 
-// ISCSIInitiatorCreateWithInitiators creates an exact initiator allowlist. An
-// empty list has TrueNAS allow-all semantics and is therefore used only by the
-// legacy, fencing-off path.
+// ISCSIInitiatorCreateWithInitiators creates an exact initiator allowlist. The
+// legacy allow-all path passes nil; fenced callers pass a non-nil list, where an
+// empty list intentionally authorizes no initiators while retaining portals.
 func (c *Client) ISCSIInitiatorCreateWithInitiators(ctx context.Context, initiators []string, comment string) (*ISCSIInitiator, error) {
 	params := map[string]interface{}{
 		"initiators": initiators,
@@ -749,13 +735,17 @@ func parseISCSIInitiator(raw interface{}) (*ISCSIInitiator, error) {
 	}
 	switch initiators := m["initiators"].(type) {
 	case []interface{}:
+		// Preserve JSON [] as a non-nil empty slice. TrueNAS uses null for the
+		// legacy allow-all group, while [] is the deliberate deny-all shape used
+		// by fencing on last unpublish.
+		group.Initiators = []string{}
 		for _, initiator := range initiators {
 			if value, ok := initiator.(string); ok {
 				group.Initiators = append(group.Initiators, value)
 			}
 		}
 	case []string:
-		group.Initiators = append(group.Initiators, initiators...)
+		group.Initiators = append([]string{}, initiators...)
 	}
 	return group, nil
 }

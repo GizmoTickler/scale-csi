@@ -126,7 +126,7 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	}
 	initiatorID := 0
 	for _, g := range initiators {
-		if len(g.Initiators) == 0 {
+		if g.Initiators == nil && !strings.HasPrefix(strings.TrimSpace(g.Comment), "scale-csi fencing:") {
 			initiatorID = g.ID
 			break
 		}
@@ -225,13 +225,13 @@ func isNVMeoFHostNotFoundError(err error) bool {
 }
 
 func (d *Driver) reconcileNVMeoFHostAssociations(ctx context.Context, subsysID int) error {
-	if !d.config.Fencing.Enabled() && d.config.NVMeoF.SubsystemAllowAnyHost {
+	if d.config.Fencing.Mode != FencingModeStrict && d.config.NVMeoF.SubsystemAllowAnyHost {
 		return nil
 	}
-	if !d.config.Fencing.Enabled() && len(d.config.NVMeoF.SubsystemHosts) == 0 {
+	if d.config.Fencing.Mode != FencingModeStrict && len(d.config.NVMeoF.SubsystemHosts) == 0 {
 		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
 	}
-	if d.config.Fencing.Enabled() {
+	if d.config.Fencing.Mode == FencingModeStrict {
 		if _, err := d.truenasClient.NVMeoFSubsystemUpdateAllowAnyHost(ctx, subsysID, false); err != nil {
 			return err
 		}
@@ -316,18 +316,19 @@ func datasetUserProperty(ds *truenas.Dataset, key string) string {
 	return ""
 }
 
-// datasetLocalUserProperty is intentionally stricter than the general property
-// reader. An ownership value inherited from a parent dataset is not proof that
-// this specific dataset was created or explicitly adopted by this instance.
-func datasetLocalUserProperty(ds *truenas.Dataset, key string) string {
+func datasetUserPropertyProjection(ds *truenas.Dataset, key string) (truenas.UserProperty, bool) {
 	if ds == nil {
-		return ""
+		return truenas.UserProperty{}, false
 	}
 	property, ok := ds.UserProperties[key]
-	if !ok || strings.Contains(strings.ToLower(property.Source), "inherit") {
-		return ""
-	}
-	return property.Value
+	return property, ok
+}
+
+func datasetHasLocalUserProperty(ds *truenas.Dataset, key, expected string) bool {
+	// An inherited value is not proof that this specific dataset was created or
+	// explicitly adopted by this driver instance.
+	property, ok := datasetUserPropertyProjection(ds, key)
+	return ok && property.Value == expected && strings.EqualFold(strings.TrimSpace(property.Source), "local")
 }
 
 func expectedNFSMountpoint(ds *truenas.Dataset, datasetName string) string {
@@ -550,7 +551,9 @@ func (d *Driver) setDatasetUserProperties(ctx context.Context, ds *truenas.Datas
 			ds.UserProperties = make(map[string]truenas.UserProperty, len(properties))
 		}
 		for key, value := range properties {
-			ds.UserProperties[key] = truenas.UserProperty{Value: value}
+			// pool.dataset.update user_properties_update is the TrueNAS 26.0
+			// write path that persists these values with source=local.
+			ds.UserProperties[key] = truenas.UserProperty{Value: value, Source: "local"}
 		}
 	}
 	return nil
@@ -687,12 +690,13 @@ func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Datas
 		MaprootGroup: d.config.NFS.ShareMaprootGroup,
 		MapallUser:   d.config.NFS.ShareMapallUser,
 		MapallGroup:  d.config.NFS.ShareMapallGroup,
-		Enabled:      !d.config.Fencing.Enabled(),
+		Enabled:      d.config.Fencing.Mode != FencingModeStrict,
 	}
-	if d.config.Fencing.Enabled() {
+	if d.config.Fencing.Mode == FencingModeStrict {
 		// An enabled export with both lists empty means allow-all in TrueNAS. New
-		// fenced volumes therefore start disabled until ControllerPublish writes
-		// at least one node identity.
+		// strict volumes therefore start disabled until ControllerPublish writes at
+		// least one node identity. Additive retains the pre-upgrade static policy so
+		// a deferred legacy node remains usable.
 		params.Networks = []string{}
 		params.Hosts = []string{}
 	}
@@ -806,13 +810,44 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				Auth:       auth,
 			})
 		}
-		if len(targetGroups) == 0 && !d.config.Fencing.Enabled() {
+		if len(targetGroups) == 0 && d.config.Fencing.Mode != FencingModeStrict {
 			resolved, resolveErr := d.resolveISCSITargetGroup(ctx)
 			if resolveErr != nil {
 				return status.Errorf(codes.Internal, "cannot create iSCSI target for %s: %v", datasetName, resolveErr)
 			}
 			targetGroups = append(targetGroups, *resolved)
 			usedResolvedGroup = true
+		}
+		if len(targetGroups) == 0 {
+			// TrueNAS may reject a target with no portal groups. Strict mode starts
+			// with a CSI-owned, non-nil-empty initiator allowlist attached to the
+			// resolved portals: the target is valid but authorizes no initiator.
+			dynamicGroup, groupErr := d.resolveFencingInitiatorGroup(ctx, ds, datasetName)
+			if groupErr != nil {
+				return status.Errorf(codes.Internal, "failed to resolve strict iSCSI initiator group: %v", groupErr)
+			}
+			if dynamicGroup == nil {
+				dynamicGroup, groupErr = d.truenasClient.ISCSIInitiatorCreateWithInitiators(
+					ctx, []string{}, "scale-csi fencing: "+datasetName,
+				)
+			}
+			if groupErr != nil {
+				return status.Errorf(codes.Internal, "failed to create strict iSCSI initiator group: %v", groupErr)
+			}
+			if propertyErr := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+				PropISCSIInitiatorID: strconv.Itoa(dynamicGroup.ID),
+			}); propertyErr != nil {
+				return status.Errorf(codes.Internal, "failed to store strict iSCSI initiator group: %v", propertyErr)
+			}
+			portals, portalErr := d.resolveISCSIPortalIDs(ctx)
+			if portalErr != nil {
+				return status.Errorf(codes.Internal, "failed to resolve strict iSCSI portal groups: %v", portalErr)
+			}
+			for _, portalID := range portals {
+				targetGroups = append(targetGroups, truenas.ISCSITargetGroup{
+					Portal: portalID, Initiator: dynamicGroup.ID, AuthMethod: "NONE",
+				})
+			}
 		}
 
 		target, err = d.truenasClient.ISCSITargetCreate(ctx, iscsiName, "", "ISCSI", targetGroups)
@@ -1119,7 +1154,7 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		klog.V(4).Infof("Skipping zvol wait for %s (already verified ready)", datasetName)
 	}
 
-	allowAnyHost := d.config.NVMeoF.SubsystemAllowAnyHost && !d.config.Fencing.Enabled()
+	allowAnyHost := d.config.NVMeoF.SubsystemAllowAnyHost && d.config.Fencing.Mode != FencingModeStrict
 	staticHosts := d.config.NVMeoF.SubsystemHosts
 	if d.config.Fencing.Mode == FencingModeStrict {
 		staticHosts = nil

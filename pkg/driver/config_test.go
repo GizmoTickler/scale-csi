@@ -93,7 +93,9 @@ nfs:
   shareHost: 192.0.2.10
 `)
 	require.NoError(t, err)
-	assert.Equal(t, FencingModeAdditive, cfg.Fencing.Mode)
+	assert.Equal(t, FencingModeOff, cfg.Fencing.Mode)
+	assert.Equal(t, "10m", cfg.Fencing.StartupReconcileTimeout)
+	assert.Equal(t, "10m", cfg.Fencing.StaleRecordGracePeriod)
 	assert.Equal(t, "csi.scale.io@tank/csi", cfg.DriverInstanceID)
 }
 
@@ -121,6 +123,27 @@ nfs:
 `)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "fencing.mode")
+}
+
+func TestLoadConfigRejectsInvalidFencingReconcileDurations(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "startup timeout", field: "startupReconcileTimeout", value: "not-a-duration"},
+		{name: "stale grace", field: "staleRecordGracePeriod", value: "0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+fencing:
+  mode: additive
+  %s: %s
+`, tc.field, tc.value))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "fencing."+tc.field)
+		})
+	}
 }
 
 func TestLoadConfigDefaultsDatasetQuotasToTrue(t *testing.T) {

@@ -1,3 +1,6 @@
+{{- if and .Values.controller.enabled (ne .Values.fencing.mode "off") (ne (int .Values.controller.replicas) 1) -}}
+{{- fail "fencing.mode additive/strict requires controller.replicas=1 because background fencing reconcilers are singleton writers" -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -15,6 +18,8 @@ data:
 
     fencing:
       mode: {{ .Values.fencing.mode | quote }}
+      startupReconcileTimeout: {{ .Values.fencing.startupReconcileTimeout | quote }}
+      staleRecordGracePeriod: {{ .Values.fencing.staleRecordGracePeriod | quote }}
 
     # TrueNAS connection settings
     truenas:

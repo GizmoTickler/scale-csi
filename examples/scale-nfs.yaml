@@ -4,7 +4,9 @@
 driver: scale-nfs
 driverInstanceId:
 fencing:
-  mode: additive
+  mode: "off"
+  startupReconcileTimeout: 10m
+  staleRecordGracePeriod: 10m
 
 # WebSocket connection to TrueNAS SCALE 25.04+
 httpConnection:

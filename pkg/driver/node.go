@@ -517,13 +517,6 @@ func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabi
 // NodeGetInfo returns information about the node.
 func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	klog.V(4).Info("NodeGetInfo called")
-	d.nodeIdentityOnce.Do(func() {
-		identity := discoverNodeIdentity(ctx, d.nodeID)
-		d.encodedNodeID, d.nodeIdentityErr = encodeNodeIdentity(identity)
-	})
-	if d.nodeIdentityErr != nil {
-		return nil, status.Errorf(codes.Internal, "failed to encode node transport identity: %v", d.nodeIdentityErr)
-	}
 
 	resp := &csi.NodeGetInfoResponse{
 		NodeId: d.encodedNodeID,

@@ -2,10 +2,13 @@ package driver
 
 import (
 	"context"
-	"encoding/json"
+	"net"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,6 +24,24 @@ import (
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+type republishOnDatasetGetClient struct {
+	*truenas.MockClient
+	datasetName string
+	propertyKey string
+	replacement publicationRecord
+	armed       bool
+}
+
+func (c *republishOnDatasetGetClient) DatasetGet(ctx context.Context, name string) (*truenas.Dataset, error) {
+	if c.armed && name == c.datasetName {
+		c.armed = false
+		if err := storePublicationRecord(ctx, c.MockClient, c.Datasets[name], name, c.propertyKey, c.replacement); err != nil {
+			return nil, err
+		}
+	}
+	return c.MockClient.DatasetGet(ctx, name)
+}
 
 func TestReconcileOrphansDetectsOnlyOldNonLiveManagedResources(t *testing.T) {
 	d, client := newReconcileTestDriver(t, false,
@@ -299,24 +320,6 @@ func TestReconcileDeletesSpentRestoreSnapshotOnlyThroughKubernetes(t *testing.T)
 		Delete: true, MinOrphanAge: time.Hour,
 	})
 	require.NoError(t, err)
-	assert.Empty(t, report.DeletedSpentRestoreObjects, "first classification must only stamp the durable marker")
-	backendSnapshot, err := client.SnapshotFindByName(context.Background(), "pool/parent", "still-live-handle")
-	require.NoError(t, err)
-	require.NotNil(t, backendSnapshot)
-	marker := spentRestoreMarker{
-		Version:        spentRestoreMarkerVersion,
-		Classification: spentRestoreClassification,
-		SnapshotID:     backendSnapshot.ID,
-		ClassifiedAt:   time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano),
-	}
-	encodedMarker, err := json.Marshal(marker)
-	require.NoError(t, err)
-	require.NoError(t, client.SnapshotSetUserProperty(context.Background(), backendSnapshot.ID, PropSpentRestoreMarker, string(encodedMarker)))
-
-	report, err = d.ReconcileOrphans(context.Background(), ReconcileOptions{
-		Delete: true, MinOrphanAge: time.Hour,
-	})
-	require.NoError(t, err)
 	assert.Equal(t, []string{"storage/volsync-app-dst-dest"}, report.DeletedSpentRestoreObjects)
 	_, dynamicClient, err := d.kubernetesReconcileClients()
 	require.NoError(t, err)
@@ -327,7 +330,7 @@ func TestReconcileDeletesSpentRestoreSnapshotOnlyThroughKubernetes(t *testing.T)
 	assert.Empty(t, client.DatasetDeleteCalls, "spent restore cleanup must not directly destroy a backend dataset")
 }
 
-func TestReconcileSpentRestoreClassificationFailsClosedWhenMarkerWriteIsNotDurable(t *testing.T) {
+func TestReconcileSpentRestoreUsesLaterCreationTimeWithoutSnapshotWrites(t *testing.T) {
 	old := metav1.NewTime(time.Now().Add(-48 * time.Hour))
 	volumeSnapshot := reconcileVolumeSnapshot(
 		"storage", "volsync-app-dst-dest", "gone-source", "spent-content", old,
@@ -336,16 +339,242 @@ func TestReconcileSpentRestoreClassificationFailsClosedWhenMarkerWriteIsNotDurab
 		"spent-content", "storage", "volsync-app-dst-dest", "spent-handle", "csi.scale.io",
 	)
 	d, client := newReconcileTestDriver(t, true, nil, []runtime.Object{volumeSnapshot, content})
-	addReconcileSnapshot(t, client, "restore-source", "spent-handle", old.Time, true, 1)
+	backendCreated := time.Now().Add(-30 * time.Minute)
+	addReconcileSnapshot(t, client, "restore-source", "spent-handle", backendCreated, true, 1)
+	// This models the TrueNAS 26.0 wire behavior: update calls can acknowledge
+	// existing-snapshot properties without persisting them. Reconciliation must
+	// make no such call and must conservatively use the newer backend creation.
 	client.SimulateUpdateNoOp = true
 
 	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "did not persist spent-restore marker")
-	assert.Empty(t, report.SpentRestoreSnapshots)
-	backend, getErr := client.SnapshotGet(context.Background(), "pool/parent/restore-source@spent-handle")
-	require.NoError(t, getErr)
-	assert.NotContains(t, backend.UserProperties, PropSpentRestoreMarker)
+	require.NoError(t, err)
+	require.Len(t, report.SpentRestoreSnapshots, 1,
+		"classification is immediate; only destructive GC is creation-age gated")
+	assert.Less(t, report.SpentRestoreSnapshots[0].Age, time.Hour)
+	assert.Zero(t, client.SnapshotSetCalls)
+	assert.Zero(t, client.SnapshotRemoveCalls)
+
+	backend := client.Snapshots["pool/parent/restore-source@spent-handle"]
+	olderBackendCreated := time.Now().Add(-2 * time.Hour)
+	backend.Properties["creation"] = map[string]interface{}{"parsed": float64(olderBackendCreated.Unix())}
+	report, err = d.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	require.Len(t, report.SpentRestoreSnapshots, 1)
+	assert.Greater(t, report.SpentRestoreSnapshots[0].Age, time.Hour)
+	assert.WithinDuration(t, olderBackendCreated, report.SpentRestoreSnapshots[0].ClassifiedAt, time.Second,
+		"the later of the Kubernetes and backend creation times is the age origin")
+	assert.Zero(t, client.SnapshotSetCalls)
+	assert.Zero(t, client.SnapshotRemoveCalls)
+}
+
+func TestReconcileSpentRestoreMalformedObjectIsIsolatedAndMetricsStillPublish(t *testing.T) {
+	old := metav1.NewTime(time.Now().Add(-48 * time.Hour))
+	malformed := reconcileSnapshotContent("malformed", "storage", "broken", "broken-handle", "csi.scale.io")
+	malformed.Object["spec"].(map[string]interface{})["driver"] = map[string]interface{}{"not": "a string"}
+	validSnapshot := reconcileVolumeSnapshot("storage", "volsync-good-dst-dest", "gone", "good-content", old)
+	validContent := reconcileSnapshotContent("good-content", "storage", "volsync-good-dst-dest", "good-handle", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, true, nil, []runtime.Object{malformed, validSnapshot, validContent})
+	addReconcileSnapshot(t, client, "restore-source", "good-handle", old.Time, true, 1)
+
+	failureMetric := reconcileFailuresTotal.WithLabelValues("snapshot_content_classification")
+	failuresBefore := testutil.ToFloat64(failureMetric)
+	successBefore := testutil.ToFloat64(reconcileLastSuccessTimestamp)
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	require.Len(t, report.SpentRestoreSnapshots, 1)
+	assert.Equal(t, "volsync-good-dst-dest", report.SpentRestoreSnapshots[0].Name)
+	assert.Equal(t, failuresBefore+1, testutil.ToFloat64(failureMetric))
+	assert.GreaterOrEqual(t, testutil.ToFloat64(reconcileLastSuccessTimestamp), successBefore)
+	assert.Equal(t, float64(report.SpentRestoreSnapshotCount), testutil.ToFloat64(spentRestoreSnapshots))
+}
+
+func TestStalePublicationRecordRequiresContinuousAbsenceThenRevokes(t *testing.T) {
+	ctx := context.Background()
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeAdditive, StaleRecordGracePeriod: "10m"}
+	d.config.NFS.ShareAllowedNetworks = []string{"192.0.2.0/24"}
+	dataset := addReconcileDataset(client, "stale-publication", time.Now().Add(-time.Hour), true, 1)
+	dataset.Mountpoint = "/mnt/pool/parent/stale-publication"
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: dataset.Mountpoint, Hosts: []string{"192.0.2.11"}, Networks: []string{"192.0.2.0/24"}, Enabled: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+	record, err := newPublicationRecord(NodeIdentity{Name: "gone-worker", IPs: []net.IP{net.ParseIP("192.0.2.11")}},
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	record.CSIAddedNFSHosts = []string{"192.0.2.11"}
+	key := publicationPropertyKey(record.Node)
+	require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, key, record))
+	state := &kubernetesReconcileState{liveVolumeAttachments: map[string]struct{}{}, volumeAttachmentCount: 0}
+
+	observedAt := time.Now()
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, observedAt)
+	dataset, err = client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	_, present := dataset.UserProperties[key]
+	assert.True(t, present, "the first absence only starts the grace window")
+
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, observedAt.Add(11*time.Minute))
+	dataset, err = client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	_, present = dataset.UserProperties[key]
+	assert.False(t, present)
+	share, err = client.NFSShareGet(ctx, share.ID)
+	require.NoError(t, err)
+	assert.Empty(t, share.Hosts)
+	assert.Equal(t, []string{"192.0.2.0/24"}, share.Networks,
+		"additive cleanup removes only the CSI-added host grant")
+}
+
+func TestStaleLegacyPublicationWithoutProvenancePreservesMatchingNFSHost(t *testing.T) {
+	ctx := context.Background()
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeAdditive, StaleRecordGracePeriod: "1ns"}
+	d.config.NFS.ShareAllowedNetworks = []string{"192.0.2.0/24"}
+	dataset := addReconcileDataset(client, "legacy-static-publication", time.Now().Add(-time.Hour), true, 1)
+	dataset.Mountpoint = "/mnt/pool/parent/legacy-static-publication"
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: dataset.Mountpoint, Hosts: []string{"192.0.2.11"}, Networks: []string{"192.0.2.0/24"}, Enabled: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+	record, err := newPublicationRecord(NodeIdentity{Name: "gone-worker", IPs: []net.IP{net.ParseIP("192.0.2.11")}},
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	key := publicationPropertyKey(record.Node)
+	require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, key, record))
+	state := &kubernetesReconcileState{liveVolumeAttachments: map[string]struct{}{}, volumeAttachmentCount: 0}
+
+	observedAt := time.Now()
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, observedAt)
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, observedAt.Add(time.Second))
+	fresh, err := client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	assert.NotContains(t, fresh.UserProperties, key, "the stale legacy record itself is still retired")
+	share, err = client.NFSShareGet(ctx, share.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts,
+		"an old record without CSI-added provenance cannot authorize static policy removal")
+}
+
+func TestStalePublicationGraceResetsWhenRecordIsRepublished(t *testing.T) {
+	ctx := context.Background()
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeAdditive, StaleRecordGracePeriod: "10m"}
+	d.config.NFS.ShareAllowedNetworks = []string{"192.0.2.0/24"}
+	dataset := addReconcileDataset(client, "republished-record", time.Now().Add(-time.Hour), true, 1)
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: dataset.Mountpoint, Networks: []string{"192.0.2.0/24"}, Enabled: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+	record, err := newPublicationRecord(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.11")}},
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	key := publicationPropertyKey(record.Node)
+	require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, key, record))
+	state := &kubernetesReconcileState{liveVolumeAttachments: map[string]struct{}{}, volumeAttachmentCount: 0}
+	t0 := time.Now()
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, t0)
+
+	// A successful republish of the same (volume,node) is a new generation even
+	// when its transport identity is unchanged. The old absence timer cannot be
+	// applied to it.
+	record.UpdatedAt = t0.Add(time.Minute).UTC().Format(time.RFC3339Nano)
+	require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, key, record))
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, t0.Add(11*time.Minute))
+	fresh, err := client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	_, present := fresh.UserProperties[key]
+	assert.True(t, present, "republish must restart the continuous-absence grace period")
+
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{fresh}, state, t0.Add(22*time.Minute))
+	fresh, err = client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	_, present = fresh.UserProperties[key]
+	assert.False(t, present)
+}
+
+func TestStalePublicationRechecksGenerationAtDestructiveBoundary(t *testing.T) {
+	ctx := context.Background()
+	d, base := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeAdditive, StaleRecordGracePeriod: "1ns"}
+	dataset := addReconcileDataset(base, "boundary-republish", time.Now().Add(-time.Hour), true, 1)
+	record, err := newPublicationRecord(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.11")}},
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	key := publicationPropertyKey(record.Node)
+	require.NoError(t, storePublicationRecord(ctx, base, dataset, dataset.Name, key, record))
+	state := &kubernetesReconcileState{liveVolumeAttachments: map[string]struct{}{}, volumeAttachmentCount: 0}
+	t0 := time.Now()
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, t0)
+
+	replacement := record
+	replacement.UpdatedAt = t0.Add(time.Second).UTC().Format(time.RFC3339Nano)
+	wrapper := &republishOnDatasetGetClient{
+		MockClient: base, datasetName: dataset.Name, propertyKey: key, replacement: replacement, armed: true,
+	}
+	d.truenasClient = wrapper
+	d.reconcileStalePublicationRecords(ctx, []*truenas.Dataset{dataset}, state, t0.Add(time.Second))
+	fresh, err := base.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(fresh)
+	require.NoError(t, err)
+	require.Contains(t, records, key)
+	assert.Equal(t, replacement.UpdatedAt, records[key].UpdatedAt,
+		"a republish racing the final read must veto revocation of the old generation")
+}
+
+func TestRunOnceOrphanReconcileNeverMutatesFencingRecords(t *testing.T) {
+	ctx := context.Background()
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeStrict, StaleRecordGracePeriod: "1ns"}
+	dataset := addReconcileDataset(client, "cronjob-must-not-fence", time.Now().Add(-time.Hour), true, 1)
+	record, err := newPublicationRecord(NodeIdentity{Name: "gone-worker", IPs: []net.IP{net.ParseIP("192.0.2.11")}},
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	key := publicationPropertyKey(record.Node)
+	require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, key, record))
+
+	_, err = d.ReconcileOrphans(ctx, ReconcileOptions{MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	fresh, err := client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	assert.Contains(t, fresh.UserProperties, key)
+	_, observed := d.stalePublicationRecordsSeen.Load(stalePublicationObservationKey(dataset.Name, key))
+	assert.False(t, observed, "the separate --mode=reconcile process must never enter the fencing writer path")
+}
+
+func TestControllerReconcileCadenceDoesNotExceedStaleGrace(t *testing.T) {
+	assert.Equal(t, 10*time.Minute, controllerReconcileCadence(time.Hour, 10*time.Minute))
+	assert.Equal(t, 5*time.Minute, controllerReconcileCadence(5*time.Minute, 10*time.Minute))
+}
+
+func TestStalePublicationMassAbsenceBrakeDefersAllRecords(t *testing.T) {
+	ctx := context.Background()
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeStrict, StaleRecordGracePeriod: "1ns"}
+	datasets := make([]*truenas.Dataset, 0, 2)
+	for index := 0; index < 2; index++ {
+		dataset := addReconcileDataset(client, "brake-"+strconv.Itoa(index), time.Now().Add(-time.Hour), true, 1)
+		record, err := newPublicationRecord(NodeIdentity{Name: "worker-" + strconv.Itoa(index), IPs: []net.IP{net.ParseIP("192.0.2.11")}},
+			csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+		require.NoError(t, err)
+		require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, publicationPropertyKey(record.Node), record))
+		datasets = append(datasets, dataset)
+	}
+	metricBefore := testutil.ToFloat64(fencingStaleDeferredTotal)
+	d.reconcileStalePublicationRecords(ctx, datasets,
+		&kubernetesReconcileState{liveVolumeAttachments: map[string]struct{}{}, volumeAttachmentCount: 0}, time.Now())
+	assert.Equal(t, metricBefore+1, testutil.ToFloat64(fencingStaleDeferredTotal))
+	for _, dataset := range datasets {
+		fresh, err := client.DatasetGet(ctx, dataset.Name)
+		require.NoError(t, err)
+		records, err := publicationRecordsFromDataset(fresh)
+		require.NoError(t, err)
+		assert.Len(t, records, 1)
+	}
 }
 
 func newReconcileTestDriver(

@@ -74,7 +74,8 @@ const (
 	// FencingModeOff preserves the pre-v1.2.23 static-allowlist behavior.
 	FencingModeOff FencingMode = "off"
 	// FencingModeAdditive adds per-node identities without removing configured
-	// static identities. This is the safe rolling-upgrade default.
+	// static identities. It is the explicit rolling-upgrade transition mode;
+	// the default remains off until operators complete the node-first sequence.
 	FencingModeAdditive FencingMode = "additive"
 	// FencingModeStrict makes per-volume publication records the sole allowlist.
 	FencingModeStrict FencingMode = "strict"
@@ -83,11 +84,31 @@ const (
 // FencingConfig configures backend-enforced ControllerPublish semantics.
 type FencingConfig struct {
 	Mode FencingMode `yaml:"mode"`
+	// StartupReconcileTimeout bounds one background convergence attempt. Failed
+	// attempts retry with backoff without taking down the CSI endpoint.
+	StartupReconcileTimeout string `yaml:"startupReconcileTimeout"`
+	// StaleRecordGracePeriod is the continuous absence required before a
+	// publication record with no live VolumeAttachment may be revoked.
+	StaleRecordGracePeriod string `yaml:"staleRecordGracePeriod"`
 }
 
 // Enabled reports whether backend publication fencing is active.
 func (c FencingConfig) Enabled() bool {
 	return c.Mode == FencingModeAdditive || c.Mode == FencingModeStrict
+}
+
+func (c FencingConfig) StartupReconcileTimeoutDuration() (time.Duration, error) {
+	if strings.TrimSpace(c.StartupReconcileTimeout) == "" {
+		return 10 * time.Minute, nil
+	}
+	return time.ParseDuration(c.StartupReconcileTimeout)
+}
+
+func (c FencingConfig) StaleRecordGracePeriodDuration() (time.Duration, error) {
+	if strings.TrimSpace(c.StaleRecordGracePeriod) == "" {
+		return 10 * time.Minute, nil
+	}
+	return time.ParseDuration(c.StaleRecordGracePeriod)
 }
 
 // TrueNASConfig holds TrueNAS connection settings.
@@ -494,7 +515,11 @@ func LoadConfig(path string) (*Config, error) {
 	// Defaults must be applied before unmarshalling so an explicit YAML false
 	// still overrides the default.
 	cfg := &Config{
-		Fencing:   FencingConfig{Mode: FencingModeAdditive},
+		Fencing: FencingConfig{
+			Mode:                    FencingModeOff,
+			StartupReconcileTimeout: "10m",
+			StaleRecordGracePeriod:  "10m",
+		},
 		ZFS:       ZFSConfig{DatasetEnableQuotas: true},
 		SessionGC: SessionGCConfig{Enabled: true},
 		Reconcile: ReconcileConfig{
@@ -555,6 +580,24 @@ func LoadConfig(path string) (*Config, error) {
 	case FencingModeOff, FencingModeAdditive, FencingModeStrict:
 	default:
 		return nil, fmt.Errorf("fencing.mode must be one of off, additive, or strict")
+	}
+	if cfg.Fencing.StartupReconcileTimeout == "" {
+		cfg.Fencing.StartupReconcileTimeout = "10m"
+	}
+	if timeout, parseErr := cfg.Fencing.StartupReconcileTimeoutDuration(); parseErr != nil || timeout <= 0 {
+		if parseErr != nil {
+			return nil, fmt.Errorf("fencing.startupReconcileTimeout must be a positive duration: %w", parseErr)
+		}
+		return nil, fmt.Errorf("fencing.startupReconcileTimeout must be a positive duration")
+	}
+	if cfg.Fencing.StaleRecordGracePeriod == "" {
+		cfg.Fencing.StaleRecordGracePeriod = "10m"
+	}
+	if grace, parseErr := cfg.Fencing.StaleRecordGracePeriodDuration(); parseErr != nil || grace <= 0 {
+		if parseErr != nil {
+			return nil, fmt.Errorf("fencing.staleRecordGracePeriod must be a positive duration: %w", parseErr)
+		}
+		return nil, fmt.Errorf("fencing.staleRecordGracePeriod must be a positive duration")
 	}
 
 	// Set defaults
@@ -744,7 +787,7 @@ func LoadConfig(path string) (*Config, error) {
 		if cfg.NVMeoF.TransportAddress == "" {
 			return nil, fmt.Errorf("nvmeof.transportAddress is required when NVMe-oF is enabled")
 		}
-		if !cfg.Fencing.Enabled() && !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
+		if cfg.Fencing.Mode != FencingModeStrict && !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
 			return nil, fmt.Errorf("nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty; no host could connect")
 		}
 	}

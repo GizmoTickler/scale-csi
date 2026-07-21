@@ -4,8 +4,6 @@ import (
 	"context"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/klog/v2"
 )
@@ -59,14 +57,12 @@ func (d *Driver) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCa
 	}, nil
 }
 
-// Probe checks if the driver is healthy and ready.
+// Probe reports process liveness. Strict fencing convergence is deliberately
+// exposed only through /readyz: the CSI liveness sidecar derives /healthz from
+// this RPC, so returning an error or Ready=false during a retry would restart
+// the controller and prevent the background reconcile from ever converging.
 func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
 	klog.V(4).Info("Probe called")
-
-	// Check if TrueNAS connection is healthy
-	if !d.ready.Load() {
-		return nil, status.Error(codes.FailedPrecondition, "driver not ready")
-	}
 
 	// CSI Probe is used by the liveness sidecar and therefore reports process
 	// health only. Backend connectivity remains visible through /readyz and the
@@ -76,7 +72,7 @@ func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeRe
 
 	return &csi.ProbeResponse{
 		Ready: &wrapperspb.BoolValue{
-			Value: d.ready.Load(),
+			Value: true,
 		},
 	}, nil
 }

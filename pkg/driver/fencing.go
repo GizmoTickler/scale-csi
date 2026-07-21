@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,7 +30,10 @@ const (
 	publicationStateRemoving  = "unpublishing"
 )
 
-var errFenceBackendAbsent = errors.New("fencing backend object is absent")
+var (
+	errFenceBackendAbsent = errors.New("fencing backend object is absent")
+	errFenceDeferred      = errors.New("backend fencing is deferred")
+)
 
 // publicationRecord is recovery metadata, not a second source of publication
 // truth: the transport allowlist is authoritative. Its purpose is to make an
@@ -47,6 +51,12 @@ type publicationRecord struct {
 	AccessMode int32    `json:"access_mode"`
 	Readonly   bool     `json:"readonly,omitempty"`
 	UpdatedAt  string   `json:"updated_at"`
+
+	// Additive mode may revoke only grants that scale-csi can prove it added.
+	// These optional fields make version-1 records backward compatible: an old
+	// record without provenance is treated conservatively as static ownership.
+	CSIAddedNFSHosts []string `json:"csi_added_nfs_hosts,omitempty"`
+	CSIAddedNVMeNQNs []string `json:"csi_added_nvme_nqns,omitempty"`
 }
 
 func publicationPropertyKey(nodeName string) string {
@@ -85,6 +95,16 @@ func (r publicationRecord) identity() NodeIdentity {
 	}
 	identity.IPs = canonicalNodeIPs(identity.IPs)
 	return identity
+}
+
+func samePublicationRecordGeneration(left, right publicationRecord) bool {
+	return left.Version == right.Version && left.Node == right.Node &&
+		left.EncodedID == right.EncodedID && left.NVMeNQN == right.NVMeNQN &&
+		left.ISCSIIQN == right.ISCSIIQN && slices.Equal(left.IPs, right.IPs) &&
+		left.State == right.State && left.AccessMode == right.AccessMode &&
+		left.Readonly == right.Readonly && left.UpdatedAt == right.UpdatedAt &&
+		slices.Equal(left.CSIAddedNFSHosts, right.CSIAddedNFSHosts) &&
+		slices.Equal(left.CSIAddedNVMeNQNs, right.CSIAddedNVMeNQNs)
 }
 
 func publicationRecordsFromDataset(ds *truenas.Dataset) (map[string]publicationRecord, error) {
@@ -240,6 +260,51 @@ func validateIdentityForProtocol(identity NodeIdentity, shareType ShareType) err
 	return nil
 }
 
+func (d *Driver) recordFencingDeferred(identity NodeIdentity, shareType ShareType, reason, detail string) {
+	RecordFencingDeferred(reason, string(shareType))
+	d.requestStartupAttachmentReconcile()
+	key := reason + "\x00" + string(shareType) + "\x00" + identity.Name
+	if _, loaded := d.fencingDeferredLogs.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	klog.Warningf("Fencing deferred for node %s protocol=%s reason=%s: %s",
+		identity.Name, shareType, reason, detail)
+}
+
+// validateOrDeferFencingIdentity keeps additive mode rolling-upgrade safe. A
+// node that has not re-registered its transport identity continues using the
+// static allowlist. The publish still writes a durable ownership record so a
+// second legacy node cannot bypass SINGLE_NODE semantics, but skips only that
+// node's backend grant. Strict mode preserves the fail-closed contract.
+func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType ShareType) (bool, error) {
+	if err := validateIdentityForProtocol(identity, shareType); err != nil {
+		if d.config.Fencing.Mode == FencingModeAdditive {
+			d.recordFencingDeferred(identity, shareType, "missing_identity", err.Error())
+			return true, nil
+		}
+		return false, err
+	}
+	if shareType != ShareTypeNFS {
+		return false, nil
+	}
+	for _, ip := range identity.IPs {
+		allowed, err := ipWithinConfiguredNetworks(ip, d.config.NFS.ShareAllowedNetworks)
+		if err != nil {
+			return false, err
+		}
+		if allowed {
+			return false, nil
+		}
+	}
+	err := status.Errorf(codes.FailedPrecondition,
+		"node %s has no IP inside nfs.shareAllowedNetworks", identity.Name)
+	if d.config.Fencing.Mode == FencingModeAdditive {
+		d.recordFencingDeferred(identity, shareType, "outside_allowed_network", err.Error())
+		return true, nil
+	}
+	return false, err
+}
+
 func validatePublicationCompatibility(records map[string]publicationRecord, requested publicationRecord) error {
 	requestedMode := csi.VolumeCapability_AccessMode_Mode(requested.AccessMode)
 	for key := range records {
@@ -379,7 +444,14 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 		if subsystem == nil {
 			return status.Errorf(codes.Internal, "verify NVMe-oF publication allowlist: %v", errFenceBackendAbsent)
 		}
-		exemptNQNs := stringSet([]string{sameNode.NVMeNQN}, d.config.NVMeoF.SubsystemHosts)
+		sameNodeNQNs := []string{sameNode.NVMeNQN}
+		for key := range records {
+			record := records[key]
+			if record.Node == requested.Name {
+				sameNodeNQNs = append(sameNodeNQNs, record.NVMeNQN)
+			}
+		}
+		exemptNQNs := stringSet(sameNodeNQNs, d.config.NVMeoF.SubsystemHosts)
 		exemptHostIDs := make(map[int]struct{}, len(exemptNQNs))
 		for nqn := range exemptNQNs {
 			host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
@@ -411,8 +483,127 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 	return nil
 }
 
+func normalizedNFSHost(value string) string {
+	value = strings.TrimSpace(value)
+	if ip := net.ParseIP(value); ip != nil {
+		return ip.String()
+	}
+	return value
+}
+
+// populateAdditiveGrantOwnership classifies transport grants before the
+// publication record is stored. The record is therefore durable before the
+// corresponding grant is applied, while retries retain the original ownership
+// decision instead of mistaking a previously added grant for static policy.
+func (d *Driver) populateAdditiveGrantOwnership(
+	ctx context.Context,
+	ds *truenas.Dataset,
+	datasetName string,
+	shareType ShareType,
+	identity NodeIdentity,
+	previous publicationRecord,
+	hasPrevious bool,
+	deferred bool,
+	record *publicationRecord,
+) error {
+	if d.config.Fencing.Mode != FencingModeAdditive || record == nil {
+		return nil
+	}
+	if hasPrevious {
+		record.CSIAddedNFSHosts = append([]string(nil), previous.CSIAddedNFSHosts...)
+		record.CSIAddedNVMeNQNs = append([]string(nil), previous.CSIAddedNVMeNQNs...)
+	}
+	if deferred {
+		return nil
+	}
+
+	switch shareType {
+	case ShareTypeNFS:
+		share, err := d.resolveNFSShare(ctx, ds, datasetName)
+		if err != nil {
+			return err
+		}
+		if share != nil && share.Enabled && len(share.Hosts) == 0 && len(share.Networks) == 0 {
+			// A legacy allow-all share needs no dynamic host grant. Additive mode
+			// deliberately leaves that policy untouched until strict cutover.
+			return nil
+		}
+		existing := make(map[string]struct{})
+		if share != nil {
+			for _, host := range share.Hosts {
+				existing[normalizedNFSHost(host)] = struct{}{}
+			}
+		}
+		configured := make(map[string]struct{}, len(d.config.NFS.ShareAllowedHosts))
+		for _, host := range d.config.NFS.ShareAllowedHosts {
+			configured[normalizedNFSHost(host)] = struct{}{}
+		}
+		owned := append([]string(nil), record.CSIAddedNFSHosts...)
+		for _, ip := range canonicalNodeIPs(identity.IPs) {
+			allowed, boundErr := ipWithinConfiguredNetworks(ip, d.config.NFS.ShareAllowedNetworks)
+			if boundErr != nil {
+				return boundErr
+			}
+			if !allowed {
+				continue
+			}
+			host := ip.String()
+			if _, static := configured[host]; static {
+				continue
+			}
+			if _, alreadyPresent := existing[host]; alreadyPresent {
+				continue
+			}
+			owned = append(owned, host)
+		}
+		record.CSIAddedNFSHosts = uniqueSortedStrings(owned)
+	case ShareTypeNVMeoF:
+		nqn := strings.TrimSpace(identity.NVMeNQN)
+		if nqn == "" {
+			return nil
+		}
+		if _, static := stringSet(d.config.NVMeoF.SubsystemHosts)[nqn]; static {
+			return nil
+		}
+		namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
+		if err != nil {
+			return err
+		}
+		subsystem, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+		if err != nil {
+			return err
+		}
+		associationExists := false
+		if subsystem != nil {
+			host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
+			if findErr != nil {
+				return findErr
+			}
+			if host != nil {
+				associations, listErr := d.truenasClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+				if listErr != nil {
+					return listErr
+				}
+				for _, association := range associations {
+					// TrueNAS 26.0 returns nested host/subsys objects and normally
+					// expands hostnqn. HostID remains the defensive fallback.
+					if association.HostID == host.ID || association.HostNQN == nqn {
+						associationExists = true
+						break
+					}
+				}
+			}
+		}
+		if !associationExists {
+			record.CSIAddedNVMeNQNs = uniqueSortedStrings(append(record.CSIAddedNVMeNQNs, nqn))
+		}
+	}
+	return nil
+}
+
 func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, identity NodeIdentity, capability *csi.VolumeCapability, readonly bool) error {
-	if err := validateIdentityForProtocol(identity, shareType); err != nil {
+	deferred, err := d.validateOrDeferFencingIdentity(identity, shareType)
+	if err != nil {
 		return err
 	}
 	records, err := publicationRecordsFromDataset(ds)
@@ -433,10 +624,23 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 		return err
 	}
 	key := publicationPropertyKey(identity.Name)
+	previous, hasPrevious := records[key]
+	if err := d.populateAdditiveGrantOwnership(
+		ctx, ds, datasetName, shareType, identity, previous, hasPrevious, deferred, &record,
+	); err != nil {
+		return status.Errorf(codes.Internal, "failed to classify additive grant ownership: %v", err)
+	}
 	if err := storePublicationRecord(ctx, d.truenasClient, ds, datasetName, key, record); err != nil {
 		return status.Errorf(codes.Internal, "failed to store publication identity: %v", err)
 	}
+	d.stalePublicationRecordsSeen.Delete(stalePublicationObservationKey(datasetName, key))
 	records[key] = record
+	if deferred {
+		// Persist publication ownership even though the transport-specific grant is
+		// deferred. This prevents two legacy nodes from both receiving a successful
+		// SINGLE_NODE publish, while leaving the static backend policy untouched.
+		return nil
+	}
 	if err := d.applyBackendFence(ctx, ds, datasetName, shareType, records); err != nil {
 		// Keep the durable record. A retry or startup reconciliation will converge
 		// the allowlist without needing the node to report its identity again.
@@ -502,20 +706,52 @@ func activeAndRemovingIdentities(records map[string]publicationRecord) (active, 
 	return active, removing
 }
 
+func additiveGrantOwnership(records map[string]publicationRecord) (nfsHosts, nvmeNQNs []string) {
+	for key := range records {
+		record := records[key]
+		nfsHosts = append(nfsHosts, record.CSIAddedNFSHosts...)
+		nvmeNQNs = append(nvmeNQNs, record.CSIAddedNVMeNQNs...)
+	}
+	return uniqueSortedStrings(nfsHosts), uniqueSortedStrings(nvmeNQNs)
+}
+
 func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, records map[string]publicationRecord) error {
 	active, removing := activeAndRemovingIdentities(records)
+	// Provenance is cumulative across same-node identity rotations. Supplying it
+	// for published as well as removing records lets each convergence remove old
+	// CSI-added grants immediately; current identities and configured static
+	// entries remain protected by each backend's desired set.
+	ownedNFSHosts, ownedNVMeNQNs := additiveGrantOwnership(records)
+	enforceable := make([]NodeIdentity, 0, len(active))
+	protectedNFSHosts := make([]string, 0)
+	protectedNVMeNQNs := make([]string, 0)
 	for _, identity := range active {
-		if err := validateIdentityForProtocol(identity, shareType); err != nil {
+		deferred, err := d.validateOrDeferFencingIdentity(identity, shareType)
+		if err != nil {
 			return fmt.Errorf("publication record for node %s is not enforceable yet: %w", identity.Name, err)
 		}
+		if deferred {
+			// Additive mode keeps a durable ownership record for legacy nodes so
+			// SINGLE_NODE compatibility still works, but leaves their access under
+			// the preserved static policy until they re-register a transport
+			// identity. Preserve any earlier CSI-added grant without recreating it;
+			// enforceable peers must still converge independently.
+			record := records[publicationPropertyKey(identity.Name)]
+			protectedNFSHosts = append(protectedNFSHosts, record.CSIAddedNFSHosts...)
+			protectedNVMeNQNs = append(protectedNVMeNQNs, record.CSIAddedNVMeNQNs...)
+			continue
+		}
+		enforceable = append(enforceable, identity)
 	}
 	switch shareType {
 	case ShareTypeNFS:
-		return d.applyNFSFence(ctx, ds, datasetName, active, removing)
+		return d.applyNFSFence(ctx, ds, datasetName, enforceable, ownedNFSHosts, uniqueSortedStrings(protectedNFSHosts))
 	case ShareTypeISCSI:
-		return d.applyISCSIFence(ctx, ds, datasetName, active)
+		return d.applyISCSIFence(ctx, ds, datasetName, enforceable)
 	case ShareTypeNVMeoF:
-		return d.applyNVMeFence(ctx, ds, datasetName, active, removing)
+		return d.applyNVMeFence(
+			ctx, ds, datasetName, enforceable, removing, ownedNVMeNQNs, uniqueSortedStrings(protectedNVMeNQNs),
+		)
 	default:
 		return fmt.Errorf("unsupported share type %q", shareType)
 	}
@@ -555,13 +791,26 @@ func ipWithinConfiguredNetworks(ip net.IP, networks []string) (bool, error) {
 	return false, nil
 }
 
-func (d *Driver) applyNFSFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active, removing []NodeIdentity) error {
+func (d *Driver) applyNFSFence(
+	ctx context.Context,
+	ds *truenas.Dataset,
+	datasetName string,
+	active []NodeIdentity,
+	additiveRemovingHosts, additiveProtectedHosts []string,
+) error {
 	share, err := d.resolveNFSShare(ctx, ds, datasetName)
 	if err != nil {
 		return err
 	}
 	if share == nil {
 		return fmt.Errorf("%w: NFS share for %s", errFenceBackendAbsent, datasetName)
+	}
+	if d.config.Fencing.Mode == FencingModeAdditive && share.Enabled && len(share.Hosts) == 0 && len(share.Networks) == 0 {
+		// An enabled share with no host/network restrictions is the legacy
+		// allow-all policy. Adding a per-node host would narrow it and could evict
+		// nodes whose identities have not re-registered yet. Additive mode must
+		// preserve that broad static policy; strict mode performs the cutover.
+		return nil
 	}
 	activeHosts := make([]string, 0)
 	for _, identity := range active {
@@ -577,28 +826,33 @@ func (d *Driver) applyNFSFence(ctx context.Context, ds *truenas.Dataset, dataset
 			}
 		}
 		if !accepted {
-			return status.Errorf(codes.FailedPrecondition,
-				"node %s has no IP inside nfs.shareAllowedNetworks", identity.Name)
+			if d.config.Fencing.Mode == FencingModeAdditive {
+				d.recordFencingDeferred(identity, ShareTypeNFS, "outside_allowed_network",
+					"no node IP is inside nfs.shareAllowedNetworks")
+				return fmt.Errorf("%w: node %s has no IP inside nfs.shareAllowedNetworks", errFenceDeferred, identity.Name)
+			}
+			return status.Errorf(codes.FailedPrecondition, "node %s has no IP inside nfs.shareAllowedNetworks", identity.Name)
 		}
 	}
 	hosts := append([]string(nil), activeHosts...)
 	if d.config.Fencing.Mode == FencingModeAdditive {
 		hosts = append(hosts, d.config.NFS.ShareAllowedHosts...)
-		// Preserve unknown pre-upgrade host entries, but remove the identities
-		// named by this unpublish unless another active record still needs them.
-		removeSet := make(map[string]struct{})
-		for _, identity := range removing {
-			for _, ip := range identity.IPs {
-				removeSet[ip.String()] = struct{}{}
-			}
+		// Preserve unknown pre-upgrade host entries. Only durable grants that
+		// scale-csi classified before adding may be removed by additive teardown.
+		removeSet := make(map[string]struct{}, len(additiveRemovingHosts))
+		for _, host := range additiveRemovingHosts {
+			removeSet[normalizedNFSHost(host)] = struct{}{}
 		}
 		activeSet := make(map[string]struct{})
-		for _, host := range append(activeHosts, d.config.NFS.ShareAllowedHosts...) {
-			activeSet[host] = struct{}{}
+		protectedHosts := append(append([]string(nil), activeHosts...), d.config.NFS.ShareAllowedHosts...)
+		protectedHosts = append(protectedHosts, additiveProtectedHosts...)
+		for _, host := range protectedHosts {
+			activeSet[normalizedNFSHost(host)] = struct{}{}
 		}
 		for _, host := range share.Hosts {
-			if _, removingHost := removeSet[host]; removingHost {
-				if _, stillNeeded := activeSet[host]; !stillNeeded {
+			hostKey := normalizedNFSHost(host)
+			if _, removingHost := removeSet[hostKey]; removingHost {
+				if _, stillNeeded := activeSet[hostKey]; !stillNeeded {
 					continue
 				}
 			}
@@ -606,10 +860,16 @@ func (d *Driver) applyNFSFence(ctx context.Context, ds *truenas.Dataset, dataset
 		}
 	}
 	hosts = uniqueSortedStrings(hosts)
+	networks := []string{}
+	if d.config.Fencing.Mode == FencingModeAdditive {
+		// Additive is a migration mode: existing static network grants are
+		// preserved bit-for-bit alongside dynamic host entries.
+		networks = append(networks, share.Networks...)
+	}
 	_, err = d.truenasClient.NFSShareUpdate(ctx, share.ID, map[string]interface{}{
 		"hosts":    hosts,
-		"networks": []string{},
-		"enabled":  len(hosts) > 0,
+		"networks": networks,
+		"enabled":  len(hosts) > 0 || len(networks) > 0,
 	})
 	return err
 }
@@ -689,12 +949,13 @@ func (d *Driver) safeAdditiveISCSIGroups(ctx context.Context, target *truenas.IS
 	}
 	result := make([]truenas.ISCSITargetGroup, 0)
 	for _, group := range target.Groups {
-		if group.Initiator == dynamicID {
+		if dynamicID > 0 && group.Initiator == dynamicID {
 			continue
 		}
 		if group.Initiator <= 0 {
-			// A null initiator on a TrueNAS target group is allow-all. Drop it
-			// before attaching the exact per-volume initiator group.
+			// A null initiator on a TrueNAS target group is a legacy allow-all
+			// relationship. It remains load-bearing throughout additive migration.
+			result = append(result, group)
 			continue
 		}
 		initiator, err := d.truenasClient.ISCSIInitiatorGet(ctx, group.Initiator)
@@ -706,9 +967,15 @@ func (d *Driver) safeAdditiveISCSIGroups(ctx context.Context, target *truenas.IS
 			}
 			return nil, fmt.Errorf("verify static initiator group %d: %w", group.Initiator, err)
 		}
-		if initiator == nil || len(initiator.Initiators) == 0 {
-			// NONE + an empty/missing initiator group is allow-all. Fencing must
-			// never retain that combination, even in additive upgrade mode.
+		if initiator == nil {
+			// A dangling relationship cannot authorize a known static initiator.
+			continue
+		}
+		if initiator.Initiators == nil {
+			// TrueNAS null is the legacy allow-all shape. Preserve it in additive
+			// mode; a non-nil empty list is intentionally different (deny-all) and
+			// is also a valid static relationship.
+			result = append(result, group)
 			continue
 		}
 		result = append(result, group)
@@ -743,19 +1010,22 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 	if err != nil {
 		return err
 	}
+	if dynamicGroup == nil {
+		// A non-nil empty list is an exact deny-all allowlist. Keeping this
+		// CSI-owned group attached to the target preserves portal validity on the
+		// last unpublish without granting an initiator access.
+		dynamicGroup, err = d.truenasClient.ISCSIInitiatorCreateWithInitiators(ctx, iqns, "scale-csi fencing: "+datasetName)
+	} else {
+		dynamicGroup, err = d.truenasClient.ISCSIInitiatorUpdate(ctx, dynamicGroup.ID, iqns, dynamicGroup.Comment)
+	}
+	if err != nil {
+		return err
+	}
+	dynamicID = dynamicGroup.ID
+	if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{PropISCSIInitiatorID: strconv.Itoa(dynamicID)}); err != nil {
+		return err
+	}
 	if len(iqns) > 0 {
-		if dynamicGroup == nil {
-			dynamicGroup, err = d.truenasClient.ISCSIInitiatorCreateWithInitiators(ctx, iqns, "scale-csi fencing: "+datasetName)
-		} else {
-			dynamicGroup, err = d.truenasClient.ISCSIInitiatorUpdate(ctx, dynamicGroup.ID, iqns, dynamicGroup.Comment)
-		}
-		if err != nil {
-			return err
-		}
-		dynamicID = dynamicGroup.ID
-		if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{PropISCSIInitiatorID: strconv.Itoa(dynamicID)}); err != nil {
-			return err
-		}
 		portals, portalErr := d.resolveISCSIPortalIDs(ctx)
 		if portalErr != nil {
 			return portalErr
@@ -763,18 +1033,44 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 		for _, portalID := range portals {
 			groups = append(groups, truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"})
 		}
+	} else {
+		// Retain the exact existing portal relationships on last unpublish. Some
+		// TrueNAS releases reject a target update with zero portal groups; access is
+		// fenced by the now-empty initiator allowlist, not by removing the portal.
+		for _, group := range target.Groups {
+			if group.Initiator == dynamicID {
+				groups = append(groups, group)
+			}
+		}
+		if len(groups) == 0 {
+			// An interrupted publish may have created the CSI initiator group but
+			// never attached it. Reuse the target's actual portal IDs first; config
+			// lookup is only a fallback when the target truly has no relationships.
+			portalSet := make(map[int]struct{})
+			for _, group := range target.Groups {
+				if group.Portal > 0 {
+					portalSet[group.Portal] = struct{}{}
+				}
+			}
+			portals := make([]int, 0, len(portalSet))
+			for portalID := range portalSet {
+				portals = append(portals, portalID)
+			}
+			sort.Ints(portals)
+			if len(portals) == 0 {
+				var portalErr error
+				portals, portalErr = d.resolveISCSIPortalIDs(ctx)
+				if portalErr != nil {
+					return portalErr
+				}
+			}
+			for _, portalID := range portals {
+				groups = append(groups, truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"})
+			}
+		}
 	}
 	if _, err := d.truenasClient.ISCSITargetUpdate(ctx, target.ID, groups); err != nil {
 		return err
-	}
-	if len(iqns) == 0 && dynamicGroup != nil {
-		if err := d.truenasClient.ISCSIInitiatorDelete(ctx, dynamicGroup.ID); err != nil {
-			return err
-		}
-		if err := d.truenasClient.DatasetRemoveUserProperties(ctx, datasetName, []string{PropISCSIInitiatorID}); err != nil {
-			return err
-		}
-		delete(ds.UserProperties, PropISCSIInitiatorID)
 	}
 	if d.serviceReloadDebouncer != nil {
 		if err := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
@@ -784,7 +1080,13 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 	return nil
 }
 
-func (d *Driver) applyNVMeFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active, removing []NodeIdentity) error {
+func (d *Driver) applyNVMeFence(
+	ctx context.Context,
+	ds *truenas.Dataset,
+	datasetName string,
+	active, removing []NodeIdentity,
+	additiveRemovingNQNs, additiveProtectedNQNs []string,
+) error {
 	namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
 	if err != nil {
 		return err
@@ -796,7 +1098,7 @@ func (d *Driver) applyNVMeFence(ctx context.Context, ds *truenas.Dataset, datase
 	if subsystem == nil {
 		return fmt.Errorf("%w: NVMe-oF subsystem for %s", errFenceBackendAbsent, datasetName)
 	}
-	if subsystem.AllowAnyHost {
+	if subsystem.AllowAnyHost && d.config.Fencing.Mode == FencingModeStrict {
 		if _, updateErr := d.truenasClient.NVMeoFSubsystemUpdateAllowAnyHost(ctx, subsystem.ID, false); updateErr != nil {
 			return updateErr
 		}
@@ -826,10 +1128,13 @@ func (d *Driver) applyNVMeFence(ctx context.Context, ds *truenas.Dataset, datase
 	if err != nil {
 		return err
 	}
-	removeNQNs := make([]string, 0, len(removing))
-	for _, identity := range removing {
-		if identity.NVMeNQN != "" {
-			removeNQNs = append(removeNQNs, identity.NVMeNQN)
+	removeNQNs := append([]string(nil), additiveRemovingNQNs...)
+	if d.config.Fencing.Mode == FencingModeStrict {
+		removeNQNs = make([]string, 0, len(removing))
+		for _, identity := range removing {
+			if identity.NVMeNQN != "" {
+				removeNQNs = append(removeNQNs, identity.NVMeNQN)
+			}
 		}
 	}
 	removeIDs := make([]int, 0, len(removeNQNs))
@@ -846,15 +1151,32 @@ func (d *Driver) applyNVMeFence(ctx context.Context, ds *truenas.Dataset, datase
 	for _, hostID := range removeIDs {
 		removeByID[hostID] = struct{}{}
 	}
+	protectedNQNs := stringSet(additiveProtectedNQNs)
+	protectedByID := make(map[int]struct{}, len(protectedNQNs))
+	for nqn := range protectedNQNs {
+		host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
+		if findErr != nil {
+			return fmt.Errorf("resolve deferred NVMe-oF host %q: %w", nqn, findErr)
+		}
+		if host != nil {
+			protectedByID[host.ID] = struct{}{}
+		}
+	}
 	for _, association := range associations {
 		if _, keep := desiredByID[association.HostID]; keep {
 			continue
 		}
+		if _, keep := protectedByID[association.HostID]; keep {
+			continue
+		}
+		if _, keep := protectedNQNs[association.HostNQN]; association.HostNQN != "" && keep {
+			continue
+		}
 		remove := d.config.Fencing.Mode == FencingModeStrict
 		if d.config.Fencing.Mode == FencingModeAdditive {
-			// host_subsys.query does not consistently expand the host NQN on all
-			// supported TrueNAS releases. Resolve the durable tombstone identity
-			// to a host database ID and compare that stable relationship instead.
+			// TrueNAS 26.0 expands hostnqn in the nested host object. Resolve the
+			// durable CSI-added NQN to HostID as a defensive fallback and remove
+			// only associations carrying explicit scale-csi provenance.
 			_, remove = removeByID[association.HostID]
 		}
 		if remove {

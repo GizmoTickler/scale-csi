@@ -439,7 +439,7 @@ func TestDatasetGet_NotFound(t *testing.T) {
 // TestDatasetDelete tests deleting a dataset
 func TestDatasetDelete_Success(t *testing.T) {
 	mock := newMockWSServer()
-	deleteCallCount := 0
+	deleteParams := make(chan []interface{}, 1)
 	server := mock.start(func(conn *websocket.Conn) {
 		for {
 			var req rpcTestRequest
@@ -455,7 +455,7 @@ func TestDatasetDelete_Success(t *testing.T) {
 			case "auth.login_with_api_key":
 				resp.Result = true
 			case "pool.dataset.delete":
-				deleteCallCount++
+				deleteParams <- req.Params
 				resp.Result = true
 			default:
 				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
@@ -491,7 +491,11 @@ func TestDatasetDelete_Success(t *testing.T) {
 	ctx := context.Background()
 	err = client.DatasetDelete(ctx, "tank/k8s/volumes/pvc-delete", false, false)
 	assert.NoError(t, err)
-	assert.Equal(t, 1, deleteCallCount)
+	params := <-deleteParams
+	require.Len(t, params, 2)
+	assert.Equal(t, "tank/k8s/volumes/pvc-delete", params[0],
+		"TrueNAS 26.0 requires the dataset id as a bare positional string")
+	assert.Equal(t, map[string]interface{}{"recursive": false, "force": false}, params[1])
 }
 
 // TestDatasetDelete_NotFound tests deleting a non-existent dataset (idempotent)
@@ -1076,6 +1080,69 @@ func TestDatasetSetUserProperties_BatchesSingleUpdate(t *testing.T) {
 		{Key: "truenas-csi:extent_id", Value: "22"},
 		{Key: "truenas-csi:target_extent_id", Value: "33"},
 		{Key: "truenas-csi:target_id", Value: "11"},
+	}, <-updatesCh)
+}
+
+func TestDatasetRemoveUserProperties_UsesVerifiedRemoveWireShape(t *testing.T) {
+	mock := newMockWSServer()
+	updatesCh := make(chan []UserPropertyUpdate, 1)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.dataset.update":
+				paramsMap := req.Params[1].(map[string]interface{})
+				rawUpdates := paramsMap["user_properties_update"].([]interface{})
+				updates := make([]UserPropertyUpdate, 0, len(rawUpdates))
+				for _, raw := range rawUpdates {
+					updateMap := raw.(map[string]interface{})
+					updates = append(updates, UserPropertyUpdate{
+						Key:    updateMap["key"].(string),
+						Remove: updateMap["remove"].(bool),
+					})
+				}
+				updatesCh <- updates
+				resp.Result = map[string]interface{}{
+					"id": "tank/k8s/volumes/pvc-remove", "name": "tank/k8s/volumes/pvc-remove",
+					"pool": "tank", "type": "FILESYSTEM", "user_properties": map[string]interface{}{},
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+
+	wsURL := strings.Replace(server.URL, "http://", "", 1)
+	parts := strings.Split(wsURL, ":")
+	host := parts[0]
+	port := 80
+	if len(parts) > 1 {
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
+	}
+	client, err := NewClient(&ClientConfig{
+		Host: host, Port: port, Protocol: "http", APIKey: "test-api-key",
+		Timeout: 5 * time.Second, ConnectTimeout: 5 * time.Second, MaxConnections: 1,
+	})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	err = client.DatasetRemoveUserProperties(context.Background(), "tank/k8s/volumes/pvc-remove", []string{
+		"truenas-csi:published:z", "truenas-csi:published:a",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []UserPropertyUpdate{
+		{Key: "truenas-csi:published:a", Remove: true},
+		{Key: "truenas-csi:published:z", Remove: true},
 	}, <-updatesCh)
 }
 

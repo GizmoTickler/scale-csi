@@ -513,13 +513,15 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 	}{
 		// Five calls preserve the fresh NFS path's single lookup, create, share,
 		// share-property update, and final batched ownership-property update.
-		{name: "CreateVolume fresh NFS", want: 5, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// TrueNAS 26.0 requires a post-create user-property update and an
+		// authoritative re-read because inline create properties are silently lost.
+		{name: "CreateVolume fresh NFS", want: 7, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-nfs", "nfs"))
 			require.NoError(t, err)
 		}},
 		// The iSCSI baseline protects the no-lookup fresh path while retaining the
 		// target, extent, association, property, reload, and response queries.
-		{name: "CreateVolume fresh iSCSI", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		{name: "CreateVolume fresh iSCSI", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
 		}},
@@ -603,8 +605,9 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			require.NoError(t, err)
 		}},
 		// Snapshot cloning pins direct name resolution, one clone and readiness wait,
-		// quota/share setup, ownership stamping, and final identity updates.
-		{name: "CreateVolume clone from snapshot", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// quota/share setup, ownership stamping with an authoritative re-read, and
+		// final identity updates.
+		{name: "CreateVolume clone from snapshot", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent/clone-source", Type: "FILESYSTEM", Refquota: testGiB,
 			})

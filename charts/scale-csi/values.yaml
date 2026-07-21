@@ -8,11 +8,16 @@ csiDriverName: csi.scale.io
 # existing installation unless the matching datasets are deliberately adopted.
 driverInstanceId: ""
 
-# Backend publication fencing. "additive" is the rolling-upgrade-safe default;
-# use "strict" only after every node has registered transport identities and
-# the controller startup reconciliation has completed.
+# Backend publication fencing defaults off. For upgrades, roll the node image
+# first, wait for every CSINode to re-register, then select "additive". Select
+# "strict" only after the deferred-fencing metric remains zero.
 fencing:
-  mode: additive
+  mode: "off"
+  # Timeout for one background startup convergence attempt. Failures retry.
+  startupReconcileTimeout: 10m
+  # Continuous VolumeAttachment absence required before a stale publication
+  # record left by a force-removed VA finalizer can be revoked.
+  staleRecordGracePeriod: 10m
 
 # Image configuration
 image:
@@ -25,6 +30,8 @@ imagePullSecrets: []
 # Controller configuration (runs as Deployment)
 controller:
   enabled: true
+  # Additive/strict fencing requires exactly one non-overlapping controller
+  # writer; the chart uses Recreate rollouts in those modes.
   replicas: 1
 
   # Priority class for controller pods

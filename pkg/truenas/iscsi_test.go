@@ -14,6 +14,21 @@ import (
 // Parser Tests - These test the internal parsing logic
 // =============================================================================
 
+func TestParseISCSIInitiatorPreservesAllowAllVersusDenyAll(t *testing.T) {
+	allowAll, err := parseISCSIInitiator(map[string]interface{}{
+		"id": float64(1), "initiators": nil, "comment": "operator allow-all",
+	})
+	require.NoError(t, err)
+	assert.Nil(t, allowAll.Initiators, "JSON null is the legacy allow-all shape")
+
+	denyAll, err := parseISCSIInitiator(map[string]interface{}{
+		"id": float64(2), "initiators": []interface{}{}, "comment": "scale-csi fencing: tank/volume",
+	})
+	require.NoError(t, err)
+	assert.NotNil(t, denyAll.Initiators, "JSON [] must remain distinguishable from null")
+	assert.Empty(t, denyAll.Initiators)
+}
+
 func TestParseISCSITarget_AllFields(t *testing.T) {
 	tests := []struct {
 		name      string

@@ -32,7 +32,9 @@ used, that Secret must contain an `api-key` key.
 | Parameter | Description | Default |
 |---|---|---|
 | `driverInstanceId` | Stable owner stamped on every driver-created dataset/zvol; empty derives `<csiDriverName>@<zfs.parentDataset>` | `""` |
-| `fencing.mode` | Backend publication policy: `off`, `additive`, or `strict` | `additive` |
+| `fencing.mode` | Backend publication policy: `off`, `additive`, or `strict` | `off` |
+| `fencing.startupReconcileTimeout` | Timeout for each background startup convergence attempt | `10m` |
+| `fencing.staleRecordGracePeriod` | Continuous VA absence before a stale publication record is revoked | `10m` |
 
 `ControllerPublishVolume` uses the TrueNAS allowlist as the durable attachment
 record. NVMe-oF authorizes the publishing node's host NQN, iSCSI authorizes its
@@ -40,27 +42,63 @@ initiator IQN, and NFS authorizes its node IP after checking that IP against
 `nfs.shareAllowedNetworks`. `ControllerUnpublishVolume` removes that identity.
 The driver also stores a recovery copy of the identity on the volume dataset so
 unpublish remains possible after the Kubernetes Node has disappeared.
+If an operator force-removes a stuck VolumeAttachment finalizer, the periodic
+controller reconcile revokes the stale backend grant after
+`fencing.staleRecordGracePeriod`. An empty VA list with two or more records
+engages a mass-revocation brake and increments
+`scale_csi_fencing_stale_deferred_total`.
 
-`additive` is the upgrade-safe transition mode. It adds per-node entries while
+`additive` is the upgrade-safe transition mode when it is enabled in the
+required sequence below. It adds per-node entries while
 retaining configured/static backend entries and never removes an unknown legacy
 entry automatically. `strict` ignores static entries for fenced volumes and
 makes the live CSI publications the exact allowlist. `off` preserves the
-pre-fencing behavior. An iSCSI allow-all initiator group is never carried into a
-fenced volume; if a live attachment still has a legacy node ID, additive startup
-reconciliation records that blocker and defers tightening that volume.
+pre-fencing behavior. Additive preserves broad legacy NFS allow-all shares,
+iSCSI allow-all initiator groups, and NVMe allow-any-host policy until strict
+cutover; strict replaces them with exact per-volume authorization. If a live
+attachment still has a legacy node ID, additive startup reconciliation defers
+that per-node fence and increments
+`scale_csi_fencing_deferred_total{reason="missing_identity",protocol="..."}`.
 
-> **Upgrade from v1.2.22 or earlier:** leave `fencing.mode=additive`, upgrade the
-> node DaemonSet, wait for every CSINode to re-register, and restart/roll the
-> controller once more. Its startup reconciliation copies all attached
-> VolumeAttachments into per-volume backend allowlists without removing static
-> entries. Inspect the controller reconciliation log before selecting `strict`.
-> Do not select `strict` while an attached node still advertises a legacy node
-> ID; startup deliberately fails rather than fencing a live workload.
+> **Required upgrade sequence for v1.2.23:** keep `fencing.mode=off`; upgrade the
+> node DaemonSet/image first; wait until every node's CSINode has re-registered;
+> then enable `additive`. Move to `strict` only after
+> `scale_csi_fencing_deferred_total` stays at zero. Strict mode gates controller
+> readiness while background reconciliation retries transient dual-VA states;
+> it does not terminate the CSI process.
+>
+> Roll the ConfigMap and v1.2.23 image together. A ConfigMap containing new
+> fencing keys can make older strict-YAML driver pods fail their config parse.
 
-Existing datasets from older versions do not have an ownership stamp. A
-same-name `CreateVolume` request now returns `ALREADY_EXISTS` until an operator
-explicitly adopts the verified dataset. Set the exact derived or configured
-identity manually, for example:
+Because the chart uses one image value for controller and node, perform the
+node-first step directly before the Helm upgrade (adjust names/namespace if the
+release is not named `scale-csi`):
+
+```bash
+kubectl -n scale-csi set image daemonset/scale-csi-node \
+  scale-csi=ghcr.io/gizmotickler/scale-csi:v1.2.23
+kubectl -n scale-csi rollout status daemonset/scale-csi-node
+kubectl get csinode -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.drivers[?(@.name=="csi.scale.io")]}{.nodeID}{end}{"\n"}{end}'
+```
+
+Every listed driver node ID must begin with `sc1.`. Then update the release
+values with the v1.2.23 image, the two new duration keys, and
+`fencing.mode=additive`, and run the Helm upgrade. That upgrade rolls the
+controller image and ConfigMap as one release operation; do not apply the new
+ConfigMap separately to old controller pods.
+
+Additive and strict modes require `controller.replicas=1`. The chart enforces
+that invariant and uses a `Recreate` controller rollout so old and new
+in-process fencing reconcilers never overlap. Equivalent raw manifests must
+provide the same singleton, non-overlapping controller guarantee.
+
+Existing driver-managed datasets from older versions do not have an ownership
+stamp. On a legitimate same-name `CreateVolume` retry, the driver automatically
+backfills and verifies the stamp only when both local legacy markers
+(`truenas-csi:managed_resource=true` and the matching
+`truenas-csi:csi_volume_name`) are
+present. A present-but-different owner is always rejected. For datasets without
+those local markers, deliberate manual adoption remains available, for example:
 
 ```bash
 zfs set 'truenas-csi:driver_instance_id=csi.scale.io@tank/k8s/volumes' \
@@ -207,7 +245,7 @@ convenient.
 | Parameter | Description | Default |
 |---|---|---|
 | `controller.enabled` | Deploy the controller | `true` |
-| `controller.replicas` | Controller replicas | `1` |
+| `controller.replicas` | Controller replicas; must be `1` for additive/strict fencing | `1` |
 | `controller.priorityClassName` | Controller priority class | `system-cluster-critical` |
 | `controller.podDisruptionBudget.enabled` | Create a controller PDB | `false` |
 | `controller.podDisruptionBudget.minAvailable` | PDB minimum available | `""` |
@@ -259,16 +297,19 @@ for Grafana sidecar discovery and uses only metrics exported by the driver.
 
 Read-only detection is enabled by default and exports
 `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`,
-`scale_csi_spent_restore_snapshots`, and orphan-byte gauges. Deletion remains
+`scale_csi_spent_restore_snapshots`, orphan-byte gauges,
+`scale_csi_reconcile_last_success_timestamp_seconds`, and
+`scale_csi_reconcile_failures_total{phase}`. Deletion remains
 disabled unless `reconcile.delete.enabled=true`. The CronJob invokes
 `--mode=reconcile`; backend cleanup always calls the driver's guarded CSI
 `DeleteVolume` and `DeleteSnapshot` implementations, so clone, snapshot, and
 foreign-snapshot dependency checks still apply. Spent VolSync restore snapshots
 are classified only when detached snapshot copies are enabled and their source
-PVC is no longer Bound. The name pattern is only the first-classification hint:
-the controller stamps the backend ZFS snapshot with a classification timestamp,
-and deletion is impossible until that durable marker itself exceeds
-`reconcile.minOrphanAge`.
+PVC is no longer Bound. TrueNAS 26.0 cannot persist a property update on an
+existing snapshot, so this path performs no backend writes. Deletion requires
+the later of the Kubernetes VolumeSnapshot creation time and backend ZFS
+snapshot creation time to exceed `reconcile.minOrphanAge`; clock skew can only
+delay cleanup.
 
 > **DANGER — one parent per cluster:** `zfs.parentDataset` MUST be unique to one
 > Kubernetes cluster. Never point two live clusters at the same parent dataset.

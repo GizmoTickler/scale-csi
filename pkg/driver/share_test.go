@@ -1460,6 +1460,11 @@ func TestProtocolShareName(t *testing.T) {
 // an allow-all initiator group is reused; no portal match fails loudly.
 func TestResolveISCSITargetGroup(t *testing.T) {
 	mockClient := truenas.NewMockClient()
+	mockClient.ISCSIInitiators = map[int]*truenas.ISCSIInitiator{
+		2: {ID: 2, Initiators: []string{}, Comment: "scale-csi fencing: tank/other-volume"},
+		3: {ID: 3, Initiators: nil, Comment: "scale-csi fencing: interrupted-volume"},
+		4: {ID: 4, Initiators: nil, Comment: "operator allow-all"},
+	}
 	d := &Driver{
 		config: &Config{
 			ISCSI: ISCSIConfig{TargetPortal: "192.0.2.10:3260"},
@@ -1470,7 +1475,8 @@ func TestResolveISCSITargetGroup(t *testing.T) {
 	group, err := d.resolveISCSITargetGroup(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, 1, group.Portal)
-	assert.Equal(t, 1, group.Initiator)
+	assert.Equal(t, 4, group.Initiator,
+		"auto-resolution must not reuse a deny-all or per-volume fencing group")
 	assert.Equal(t, "NONE", group.AuthMethod)
 
 	// Cached on second call even if the mock is emptied.

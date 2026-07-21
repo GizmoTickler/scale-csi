@@ -291,7 +291,9 @@ kubectl rollout restart deployment -n scale-csi scale-csi-controller
 
 The controller detects old CSI-managed backend resources automatically and
 exports `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`, and byte
-gauges. Detection is read-only and enabled by default:
+gauges. Use `scale_csi_reconcile_last_success_timestamp_seconds` to detect a
+stalled loop and `scale_csi_reconcile_failures_total{phase}` to isolate partial
+object failures. Detection is read-only and enabled by default:
 
 ```yaml
 reconcile:

@@ -7,6 +7,46 @@
     "truenas",
     "zfs"
   ],
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "fencing",
+          "controller"
+        ],
+        "properties": {
+          "fencing": {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "additive",
+                  "strict"
+                ]
+              }
+            }
+          },
+          "controller": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "controller": {
+            "properties": {
+              "replicas": {
+                "const": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "definitions": {
     "stringMap": {
       "type": "object",
@@ -125,7 +165,9 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "mode"
+        "mode",
+        "startupReconcileTimeout",
+        "staleRecordGracePeriod"
       ],
       "properties": {
         "mode": {
@@ -135,6 +177,14 @@
             "additive",
             "strict"
           ]
+        },
+        "startupReconcileTimeout": {
+          "type": "string",
+          "minLength": 2
+        },
+        "staleRecordGracePeriod": {
+          "type": "string",
+          "minLength": 2
         }
       }
     },

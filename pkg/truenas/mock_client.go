@@ -14,27 +14,37 @@ type MockClient struct {
 	mu sync.RWMutex
 
 	// Mock data
-	Datasets           map[string]*Dataset
-	Snapshots          map[string]*Snapshot
-	NFSShares          map[int]*NFSShare
-	ISCSITargets       map[int]*ISCSITarget
-	ISCSIExtents       map[int]*ISCSIExtent
-	TargetExtents      map[int]*ISCSITargetExtent
-	NVMeHosts          map[string]*NVMeoFHost
-	NVMeHostSubsystems map[int]*NVMeoFHostSubsys
-	NVMeSubsystems     map[int]*NVMeoFSubsystem
-	NVMeNamespaces     map[int]*NVMeoFNamespace
-	ISCSIPortals       map[int]*ISCSIPortal
-	ISCSIInitiators    map[int]*ISCSIInitiator
-	PoolAvailable      int64
-	deferredSnapshots  map[string]struct{}
-	DatasetDeleteCalls []DatasetDeleteCall
+	Datasets            map[string]*Dataset
+	Snapshots           map[string]*Snapshot
+	NFSShares           map[int]*NFSShare
+	ISCSITargets        map[int]*ISCSITarget
+	ISCSIExtents        map[int]*ISCSIExtent
+	TargetExtents       map[int]*ISCSITargetExtent
+	NVMeHosts           map[string]*NVMeoFHost
+	NVMeHostSubsystems  map[int]*NVMeoFHostSubsys
+	NVMeSubsystems      map[int]*NVMeoFSubsystem
+	NVMeNamespaces      map[int]*NVMeoFNamespace
+	ISCSIPortals        map[int]*ISCSIPortal
+	ISCSIInitiators     map[int]*ISCSIInitiator
+	PoolAvailable       int64
+	deferredSnapshots   map[string]struct{}
+	DatasetDeleteCalls  []DatasetDeleteCall
+	SnapshotSetCalls    int
+	SnapshotRemoveCalls int
 
 	// Error injection
 	InjectError error
 	// SimulateUpdateNoOp models TrueNAS 26.0 pool.snapshot.update returning
 	// success without applying user-property additions or removals.
 	SimulateUpdateNoOp bool
+	// DropDatasetCreateUserProperties models TrueNAS 26.0 accepting inline
+	// pool.dataset.create user_properties while silently writing none of them.
+	DropDatasetCreateUserProperties bool
+	// EmptyNVMeHostNQN models defensive compatibility with backends that omit the
+	// otherwise expanded host.hostnqn field from nvmet.host_subsys.query.
+	EmptyNVMeHostNQN bool
+	// RejectEmptyISCSITargetGroups catches invalid zero-portal target updates.
+	RejectEmptyISCSITargetGroups bool
 }
 
 // DatasetDeleteCall records the deletion mode requested by a test.
@@ -118,7 +128,7 @@ func (m *MockClient) ISCSIInitiatorCreateWithInitiators(ctx context.Context, ini
 	for m.ISCSIInitiators[id] != nil {
 		id++
 	}
-	group := &ISCSIInitiator{ID: id, Initiators: append([]string(nil), initiators...), Comment: comment}
+	group := &ISCSIInitiator{ID: id, Initiators: cloneStringsPreservingNil(initiators), Comment: comment}
 	m.ISCSIInitiators[id] = group
 	return group, nil
 }
@@ -136,11 +146,18 @@ func (m *MockClient) ISCSIInitiatorUpdate(ctx context.Context, id int, initiator
 	if group == nil {
 		return nil, fmt.Errorf("iSCSI initiator group not found")
 	}
-	group.Initiators = append([]string(nil), initiators...)
+	group.Initiators = cloneStringsPreservingNil(initiators)
 	if comment != "" {
 		group.Comment = comment
 	}
 	return group, nil
+}
+
+func cloneStringsPreservingNil(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string{}, values...)
 }
 
 func (m *MockClient) ISCSIInitiatorDelete(ctx context.Context, id int) error {
@@ -175,10 +192,11 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	if m.InjectError != nil {
 		return nil, m.InjectError
 	}
-	if _, exists := m.Datasets[params.Name]; exists {
-		// Simulate "already exists" behavior if needed, or return error
-		// For now, let's just overwrite or return existing
-		return m.Datasets[params.Name], nil
+	if existing, exists := m.Datasets[params.Name]; exists {
+		// Match the real client's idempotent AlreadyExists fallback while
+		// preserving the response-local fact that this call did not create the
+		// object. Never mutate the winner's response through shared mock storage.
+		return mockDatasetResponse(existing, false), nil
 	}
 
 	ds := &Dataset{
@@ -191,15 +209,31 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 		Refquota:       DatasetProperty{Parsed: float64(params.Refquota)},
 		Refreservation: DatasetProperty{Parsed: float64(params.Refreservation)},
 		Volblocksize:   DatasetProperty{Parsed: params.Volblocksize},
+		CreatedByCall:  false,
 	}
-	for _, property := range params.UserProperties {
-		ds.UserProperties[property.Key] = UserProperty{Value: property.Value, Source: "local"}
+	if !m.DropDatasetCreateUserProperties {
+		for _, property := range params.UserProperties {
+			ds.UserProperties[property.Key] = UserProperty{Value: property.Value, Source: "local"}
+		}
 	}
 	if params.Type != "VOLUME" {
 		ds.Mountpoint = "/mnt/" + strings.TrimPrefix(params.Name, "/")
 	}
 	m.Datasets[params.Name] = ds
-	return ds, nil
+	return mockDatasetResponse(ds, true), nil
+}
+
+func mockDatasetResponse(dataset *Dataset, created bool) *Dataset {
+	if dataset == nil {
+		return nil
+	}
+	response := *dataset
+	response.UserProperties = make(map[string]UserProperty, len(dataset.UserProperties))
+	for key, property := range dataset.UserProperties {
+		response.UserProperties[key] = property
+	}
+	response.CreatedByCall = created
+	return &response
 }
 
 func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
@@ -254,7 +288,7 @@ func (m *MockClient) DatasetGet(ctx context.Context, name string) (*Dataset, err
 		return nil, m.InjectError
 	}
 	if ds, ok := m.Datasets[name]; ok {
-		return ds, nil
+		return mockDatasetResponse(ds, false), nil
 	}
 	return nil, &APIError{Code: -1, Message: "dataset not found"}
 }
@@ -299,9 +333,9 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 			delete(ds.UserProperties, update.Key)
 			continue
 		}
-		ds.UserProperties[update.Key] = UserProperty{Value: update.Value}
+		ds.UserProperties[update.Key] = UserProperty{Value: update.Value, Source: "local"}
 	}
-	return ds, nil
+	return mockDatasetResponse(ds, false), nil
 }
 
 func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error) {
@@ -316,7 +350,7 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 		if prop, ok := ds.UserProperties[datasetManagedResourceProperty]; !ok || prop.Value != "true" {
 			continue
 		}
-		list = append(list, ds)
+		list = append(list, mockDatasetResponse(ds, false))
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 
@@ -361,7 +395,7 @@ func (m *MockClient) DatasetSetUserProperties(ctx context.Context, name string, 
 		return &APIError{Code: -1, Message: "dataset not found"}
 	}
 	for key, value := range properties {
-		ds.UserProperties[key] = UserProperty{Value: value}
+		ds.UserProperties[key] = UserProperty{Value: value, Source: "local"}
 	}
 	return nil
 }
@@ -504,9 +538,6 @@ func (m *MockClient) SnapshotRename(ctx context.Context, snapshotID, newName str
 	if m.InjectError != nil {
 		return m.InjectError
 	}
-	if m.SimulateUpdateNoOp {
-		return nil
-	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
 		return &APIError{Code: -1, Message: "snapshot not found"}
@@ -596,6 +627,7 @@ func (m *MockClient) SnapshotFindByName(ctx context.Context, parentDataset, name
 func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.SnapshotSetCalls++
 
 	if m.InjectError != nil {
 		return m.InjectError
@@ -607,13 +639,14 @@ func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID, ke
 	if !ok {
 		return &APIError{Code: -1, Message: "snapshot not found"}
 	}
-	snap.UserProperties[key] = UserProperty{Value: value}
+	snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
 	return nil
 }
 
 func (m *MockClient) SnapshotRemoveUserProperties(ctx context.Context, snapshotID string, keys []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.SnapshotRemoveCalls++
 
 	if m.InjectError != nil {
 		return m.InjectError
@@ -660,6 +693,12 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetNa
 	if m.InjectError != nil {
 		return m.InjectError
 	}
+	if existing, exists := m.Datasets[newDatasetName]; exists {
+		return &ErrDatasetDestinationExists{
+			Destination: newDatasetName, ExpectedOrigin: snapshotID,
+			ActualOrigin: datasetPropertyString(existing.Origin),
+		}
+	}
 	// Create a new dataset as a clone, preserving the source dataset's type and
 	// capacity properties so controller tests observe realistic clone state.
 	clone := &Dataset{
@@ -689,7 +728,7 @@ func (m *MockClient) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDat
 		return m.InjectError
 	}
 	if _, exists := m.Datasets[targetDataset]; exists {
-		return nil
+		return &ErrDatasetDestinationExists{Destination: targetDataset}
 	}
 	snapshotID := sourceDataset + "@" + snapshotShortName
 	if _, exists := m.Snapshots[snapshotID]; !exists {
@@ -851,6 +890,9 @@ func (m *MockClient) CheckNVMeoFSupport(ctx context.Context) error {
 func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.RejectEmptyISCSITargetGroups && len(groups) == 0 {
+		return nil, fmt.Errorf("iSCSI target requires at least one portal group")
+	}
 
 	id := len(m.ISCSITargets) + 1
 	target := &ISCSITarget{ID: id, Name: name, Alias: alias, Mode: mode, Groups: groups}
@@ -860,6 +902,9 @@ func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode st
 func (m *MockClient) ISCSITargetUpdate(ctx context.Context, id int, groups []ISCSITargetGroup) (*ISCSITarget, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.RejectEmptyISCSITargetGroups && len(groups) == 0 {
+		return nil, fmt.Errorf("iSCSI target requires at least one portal group")
+	}
 	target := m.ISCSITargets[id]
 	if target == nil {
 		return nil, fmt.Errorf("iSCSI target not found")
@@ -1101,7 +1146,11 @@ func (m *MockClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsys
 	associations := make([]*NVMeoFHostSubsys, 0)
 	for _, association := range m.NVMeHostSubsystems {
 		if association.SubsysID == subsysID {
-			associations = append(associations, association)
+			copy := *association
+			if m.EmptyNVMeHostNQN {
+				copy.HostNQN = ""
+			}
+			associations = append(associations, &copy)
 		}
 	}
 	return associations, nil

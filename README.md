@@ -30,11 +30,11 @@ helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
   --values values.yaml
 ```
 
-New installations default to `fencing.mode: additive`. The node plugin embeds
-its NFS IP, iSCSI initiator IQN, and NVMe host NQN in a versioned CSI node ID;
-the controller persists those identities and enforces them in TrueNAS. Before
-switching an upgraded installation to `strict`, follow the ownership and
-rolling-upgrade procedure in the [chart documentation](charts/scale-csi/README.md#publication-fencing-and-ownership).
+Fencing defaults to `off`. `additive` is the explicit migration mode: upgrade
+the node DaemonSet first, wait for every CSINode to re-register its versioned
+transport identity, and only then enable `additive`. Enable `strict` only after
+`scale_csi_fencing_deferred_total` remains at zero. Follow the complete
+[rolling-upgrade procedure](charts/scale-csi/README.md#publication-fencing-and-ownership).
 
 ## Requirements
 

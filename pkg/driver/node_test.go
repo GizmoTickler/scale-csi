@@ -170,10 +170,15 @@ func newTestNodeDriver(shareType ShareType) *Driver {
 		cfg.DriverName = "org.scale.csi.nvmeof"
 	}
 
+	encodedNodeID, err := encodeNodeIdentity(NodeIdentity{Name: "test-node-1"})
+	if err != nil {
+		panic(err)
+	}
 	return &Driver{
 		name:          cfg.DriverName,
 		version:       "test",
 		nodeID:        "test-node-1",
+		encodedNodeID: encodedNodeID,
 		config:        cfg,
 		truenasClient: truenas.NewMockClient(),
 	}
@@ -207,6 +212,7 @@ func TestNodeGetInfo(t *testing.T) {
 	t.Run("BasicInfo", func(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNFS)
 		d.nodeID = "worker-node-1"
+		d.encodedNodeID, _ = encodeNodeIdentity(NodeIdentity{Name: d.nodeID})
 
 		resp, err := d.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
 
@@ -232,6 +238,7 @@ func TestNodeGetInfo(t *testing.T) {
 	t.Run("WithTopology", func(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNFS)
 		d.nodeID = "worker-node-2"
+		d.encodedNodeID, _ = encodeNodeIdentity(NodeIdentity{Name: d.nodeID})
 		d.config.Node.Topology.Enabled = true
 		d.config.Node.Topology.Zone = "zone-a"
 		d.config.Node.Topology.Region = "us-west"

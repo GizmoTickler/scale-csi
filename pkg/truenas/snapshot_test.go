@@ -480,7 +480,11 @@ func TestSnapshotCreateSendsPropertiesOnBothAPIGenerations(t *testing.T) {
 	}
 }
 
-func TestSnapshotCreatePropertiesValidationFallbackIsCached(t *testing.T) {
+func TestSnapshotCreatePropertiesValidationFallbackIsCachedOnLegacyBackend(t *testing.T) {
+	// This models an older pool.snapshot backend that rejects inline properties
+	// but persists pool.snapshot.update. It is deliberately not the TrueNAS 26.0
+	// wire shape, where inline create persists and existing-snapshot update does
+	// not.
 	mock := newMockWSServer()
 	var createCalls atomic.Int32
 	var createCallsWithProperties atomic.Int32
@@ -843,7 +847,11 @@ func TestSnapshotDelete_HasClones_TrueNAS26(t *testing.T) {
 				}
 			case "pool.snapshot.query":
 				resp.Result = []interface{}{}
-			case "pool.snapshot.delete":
+			case "zfs.resource.snapshot.destroy":
+				require.Len(t, req.Params, 1)
+				assert.Equal(t, map[string]interface{}{
+					"path": "tank/k8s/volumes/pvc-123@with-clones",
+				}, req.Params[0])
 				resp.Error = &rpcError{Code: -1, Message: "Invalid params"}
 			case "pool.dataset.query":
 				resp.Result = []interface{}{
@@ -1401,7 +1409,8 @@ func TestSnapshotClone_Success(t *testing.T) {
 	assert.True(t, cloneCalled)
 }
 
-// TestSnapshotClone_AlreadyExists tests idempotent clone creation
+// TestSnapshotClone_AlreadyExists reports that this call did not create the
+// destination, even when the existing origin matches.
 func TestSnapshotClone_AlreadyExists(t *testing.T) {
 	resetSnapshotAPIPrefix()
 	mock := newMockWSServer()
@@ -1468,9 +1477,9 @@ func TestSnapshotClone_AlreadyExists(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
-	// Should succeed - idempotent
 	err = client.SnapshotClone(ctx, "tank/k8s/volumes/pvc-source@snap", "tank/k8s/volumes/pvc-existing")
-	assert.NoError(t, err)
+	require.Error(t, err)
+	assert.True(t, IsDatasetDestinationExistsError(err))
 }
 
 func TestSnapshotCloneAlreadyExistsWithDifferentOriginFails(t *testing.T) {
@@ -1514,9 +1523,48 @@ func TestSnapshotCloneAlreadyExistsWithDifferentOriginFails(t *testing.T) {
 	err := client.SnapshotClone(context.Background(), "tank/k8s/volumes/pvc-source@snap", "tank/k8s/volumes/pvc-existing")
 
 	require.Error(t, err)
+	assert.True(t, IsDatasetDestinationExistsError(err))
 	assert.Contains(t, err.Error(), "already exists with origin")
 	assert.Contains(t, err.Error(), "other-source@other-snap")
 	assert.Contains(t, err.Error(), "pvc-source@snap")
+}
+
+func TestSnapshotCloneAlreadyExistsWithTransientOriginReadRemainsTyped(t *testing.T) {
+	resetSnapshotAPIPrefix()
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case "pool.snapshot.clone":
+				resp.Error = &rpcError{Code: -1, Message: "dataset already exists"}
+			case "pool.dataset.query":
+				resp.Error = &rpcError{Code: -1, Message: "temporary origin query failure"}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	err := client.SnapshotClone(context.Background(), "tank/csi/source@snap", "tank/csi/raced")
+
+	require.Error(t, err)
+	assert.True(t, IsDatasetDestinationExistsError(err),
+		"a failed verification read must never downgrade backend AlreadyExists into a cleanup-eligible error")
+	assert.Contains(t, err.Error(), "origin could not be verified")
 }
 
 func TestCopyDatasetFromSnapshotLocal(t *testing.T) {
@@ -1595,9 +1643,9 @@ func TestCopyDatasetFromSnapshotLocal(t *testing.T) {
 	assert.Equal(t, false, options["recursive"])
 }
 
-func TestCopyDatasetFromSnapshotLocalExistingTargetIsIdempotent(t *testing.T) {
+func TestCopyDatasetFromSnapshotLocalExistingTargetRequiresOwnershipRetry(t *testing.T) {
 	mock := newMockWSServer()
-	datasetQueried := make(chan struct{}, 1)
+	var datasetQueries atomic.Int32
 	deleteCalled := make(chan []interface{}, 1)
 	server := mock.start(func(conn *websocket.Conn) {
 		for {
@@ -1618,7 +1666,7 @@ func TestCopyDatasetFromSnapshotLocalExistingTargetIsIdempotent(t *testing.T) {
 					"error": "target dataset already exists",
 				}}
 			case "pool.dataset.query":
-				datasetQueried <- struct{}{}
+				datasetQueries.Add(1)
 				resp.Result = []interface{}{map[string]interface{}{
 					"id":   "tank/k8s/volumes/target",
 					"name": "tank/k8s/volumes/target",
@@ -1646,12 +1694,14 @@ func TestCopyDatasetFromSnapshotLocalExistingTargetIsIdempotent(t *testing.T) {
 		"snap-1",
 		"tank/k8s/volumes/target",
 	)
-	require.NoError(t, err)
-	<-datasetQueried
-	params := <-deleteCalled
-	require.Len(t, params, 2)
-	assert.Equal(t, "tank/k8s/volumes/target@snap-1", params[0])
-	assert.Equal(t, map[string]interface{}{"defer": false, "recursive": false}, params[1])
+	require.Error(t, err)
+	assert.True(t, IsDatasetDestinationExistsError(err))
+	assert.Zero(t, datasetQueries.Load(), "AlreadyExists must remain non-ownership proof without a follow-up read")
+	select {
+	case params := <-deleteCalled:
+		t.Fatalf("raced target must not be mutated through snapshot cleanup: %v", params)
+	default:
+	}
 }
 
 // TestSnapshotRollback_Success tests rolling back to a snapshot
@@ -1715,8 +1765,89 @@ func TestSnapshotRollback_Success(t *testing.T) {
 	assert.True(t, rollbackCalled)
 }
 
-// TestSnapshotSetUserProperty_Success tests setting a user property on a snapshot
-func TestSnapshotSetUserProperty_Success(t *testing.T) {
+func TestSnapshotSetUserPropertyTrueNAS26RejectsUnsupportedExistingSnapshotMutation(t *testing.T) {
+	mock := newMockWSServer()
+	updateCalled := false
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case snapshotResourceQueryMethod:
+				resp.Result = []interface{}{}
+			case "pool.snapshot.update", "zfs.resource.snapshot.update":
+				updateCalled = true
+				resp.Result = true
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	err := client.SnapshotSetUserProperty(context.Background(), "tank/csi/source@snapshot", "test:key", "value")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported")
+	assert.False(t, updateCalled, "TrueNAS 26.0 has no mutation call that can be treated as durable")
+}
+
+func TestSnapshotPropertyMutationFailsClosedWhenResourceProbeIsTransient(t *testing.T) {
+	mock := newMockWSServer()
+	var probeCalls atomic.Int32
+	updateCalled := false
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case snapshotResourceQueryMethod:
+				if probeCalls.Add(1) == 1 {
+					resp.Error = &rpcError{Code: -32000, Message: "middleware temporarily unavailable"}
+				} else {
+					resp.Result = []interface{}{}
+				}
+			case "pool.snapshot.update", "zfs.resource.snapshot.update":
+				updateCalled = true
+				resp.Result = true
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	err := client.SnapshotSetUserProperty(context.Background(), "tank/csi/source@snapshot", "test:key", "value")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "could not be determined")
+	assert.False(t, updateCalled, "an unknown generation must never fall through to pool.snapshot.update")
+
+	err = client.SnapshotRemoveUserProperties(context.Background(), "tank/csi/source@snapshot", []string{"test:key"})
+	require.NoError(t, err, "the next probe proves 26.0 and removal becomes an explicit no-op")
+	assert.Equal(t, int32(2), probeCalls.Load())
+	assert.False(t, updateCalled)
+}
+
+// TestSnapshotSetUserProperty_LegacySuccess covers older backends where the
+// pool.snapshot update path predates the 26.0 resource API.
+func TestSnapshotSetUserProperty_LegacySuccess(t *testing.T) {
 	resetSnapshotAPIPrefix()
 	mock := newMockWSServer()
 	updateCalled := false

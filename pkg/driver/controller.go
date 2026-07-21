@@ -383,15 +383,33 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 				"volume %s already exists with content source %s, incompatible with requested %s",
 				volumeID, describeDatasetContentSource(existingDS), describeVolumeContentSource(requestedContentSource))
 		}
-		// A name match is not ownership proof. Pure compatibility checks above
-		// may return a more specific ALREADY_EXISTS reason, but this proof still
-		// precedes every mutation and backend share lookup. Operators can adopt a
-		// verified legacy dataset explicitly with:
-		// zfs set truenas-csi:driver_instance_id=<expected> <dataset>.
-		if owner := datasetLocalUserProperty(existingDS, PropDriverInstanceID); owner != d.driverInstanceID() {
+		// A present owner is authoritative and must match locally. The v1.2.22
+		// installed base predates this stamp, so an actually absent owner may be
+		// backfilled only when both older local managed markers identify the same
+		// CSI volume. Empty, inherited, or different owner values are present-and-
+		// different and are never auto-adopted.
+		owner, ownerPresent := datasetUserPropertyProjection(existingDS, PropDriverInstanceID)
+		switch {
+		case ownerPresent:
+			if !datasetHasLocalUserProperty(existingDS, PropDriverInstanceID, d.driverInstanceID()) {
+				return nil, status.Errorf(codes.AlreadyExists,
+					"dataset %s already exists but ownership property %s is %q, expected a local value of %q",
+					datasetName, PropDriverInstanceID, owner.Value, d.driverInstanceID())
+			}
+		case datasetHasLocalUserProperty(existingDS, PropManagedResource, "true") &&
+			datasetHasLocalUserProperty(existingDS, PropCSIVolumeName, name):
+			verified, stampErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+				PropDriverInstanceID: d.driverInstanceID(),
+			})
+			if stampErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to backfill legacy volume ownership: %v", stampErr)
+			}
+			existingDS = verified
+			klog.Infof("Backfilled ownership stamp on legacy managed dataset %s", datasetName)
+		default:
 			return nil, status.Errorf(codes.AlreadyExists,
-				"dataset %s already exists but ownership property %s is %q, expected %q; explicitly adopt it by setting the property after verifying the dataset is safe",
-				datasetName, PropDriverInstanceID, owner, d.driverInstanceID())
+				"dataset %s already exists without ownership property %s and does not have matching local legacy CSI markers",
+				datasetName, PropDriverInstanceID)
 		}
 		if snapshot := req.GetVolumeContentSource().GetSnapshot(); d.config.ZFS.DetachedVolumesFromSnapshots && snapshot != nil {
 			existingDS, err = d.prepareDetachedSnapshotCopy(
@@ -460,7 +478,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 		return &csi.CreateVolumeResponse{Volume: volume}, nil
 	}
-	freshlyCreated := truenas.IsNotFoundError(err)
+	if err != nil && !truenas.IsNotFoundError(err) {
+		return nil, status.Errorf(codes.Internal, "failed to check whether volume exists: %v", err)
+	}
+	freshlyCreated := false
 
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
@@ -468,22 +489,21 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
-		var srcErr error
-		createdDS, srcErr = d.handleVolumeContentSource(ctx, datasetName, name, contentSource, capacityBytes, shareType)
+		_, srcErr := d.handleVolumeContentSource(ctx, datasetName, name, contentSource, capacityBytes, shareType)
 		if srcErr != nil {
 			return nil, srcErr
 		}
 		// Clone/replication APIs cannot stamp properties atomically. The initial
-		// name-collision check plus the verified clone relationship is the creation
-		// proof; stamp ownership before creating any share object.
-		if datasetLocalUserProperty(createdDS, PropDriverInstanceID) != d.driverInstanceID() {
-			if ownerErr := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
-				PropDriverInstanceID: d.driverInstanceID(),
-			}); ownerErr != nil {
-				d.cleanupFailedClone(ctx, datasetName, "")
-				return nil, status.Errorf(codes.Internal, "failed to stamp cloned volume ownership: %v", ownerErr)
-			}
+		// absence check plus a successful (not AlreadyExists) clone/copy response is
+		// the creation proof; stamp ownership before creating any share object.
+		verifiedClone, ownerErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+			PropDriverInstanceID: d.driverInstanceID(),
+		})
+		if ownerErr != nil {
+			d.cleanupFailedClone(ctx, datasetName, "")
+			return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
 		}
+		createdDS = verifiedClone
 		zvolReady = true
 	} else {
 		// Create new dataset
@@ -492,6 +512,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if createErr != nil {
 			return nil, createErr
 		}
+		freshlyCreated = createdDS.CreatedByCall
 		zvolReady = freshlyCreated
 	}
 
@@ -785,7 +806,6 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	}
 	for _, snap := range snapshots {
 		if snapshotBlocksVolumeDeletion(snap) {
-			klog.Infof("Volume %s has a snapshot that blocks dataset deletion, cannot delete", volumeID)
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"volume %s has dependent snapshots that must be deleted first", volumeID)
 		}
@@ -877,7 +897,6 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// Found snapshots - check if any are managed or internal.
 			for _, snap := range snapshots {
 				if snapshotBlocksVolumeDeletion(snap) {
-					klog.Infof("Volume %s has a snapshot that blocks dataset deletion, cannot delete", volumeID)
 					return nil, status.Errorf(codes.FailedPrecondition,
 						"volume %s has dependent snapshots that must be deleted first", volumeID)
 				}
@@ -1062,9 +1081,6 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
-	}
-	if req.GetNodeId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "node ID is required")
 	}
 	if !d.config.Fencing.Enabled() {
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
@@ -1825,40 +1841,59 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 		}
 	}
 	d.applyDatasetProperties(params)
-	setDatasetCreateUserProperty(params, PropDriverInstanceID, d.driverInstanceID())
+	postCreateProperties := make(map[string]string, len(params.UserProperties)+1)
+	for _, property := range params.UserProperties {
+		postCreateProperties[property.Key] = property.Value
+	}
+	postCreateProperties[PropDriverInstanceID] = d.driverInstanceID()
+	// Live TrueNAS 26.0 accepts inline pool.dataset.create user_properties but
+	// silently writes none of them. Keep all standard dataset fields on create,
+	// then publish ownership and custom user properties through the proven
+	// pool.dataset.update user_properties_update path.
+	params.UserProperties = nil
 
 	ds, err := d.truenasClient.DatasetCreate(ctx, params)
 	if err != nil {
 		return nil, err
 	}
-	// Some TrueNAS releases return a compact create result without projected
-	// user_properties. Re-read before deciding ownership is absent; this still
-	// rejects DatasetCreate's idempotent existing-object fallback because that
-	// object will remain unstamped or carry a different instance identity.
-	if datasetLocalUserProperty(ds, PropDriverInstanceID) != d.driverInstanceID() {
-		verified, getErr := d.truenasClient.DatasetGet(ctx, datasetName)
-		if getErr != nil {
-			return nil, status.Errorf(codes.Internal, "failed to verify dataset ownership after creation: %v", getErr)
+	if !ds.CreatedByCall {
+		if datasetHasLocalUserProperty(ds, PropDriverInstanceID, d.driverInstanceID()) {
+			// Another controller instance won the create race. Re-enter through the
+			// normal existing-volume path on retry so protocol, source, capacity and
+			// name compatibility are all checked, and so this caller can never clean
+			// up an object it did not create.
+			return nil, status.Errorf(codes.Aborted,
+				"dataset %s was concurrently created by this driver instance; retry CreateVolume", datasetName)
 		}
-		ds = verified
-	}
-	if owner := datasetLocalUserProperty(ds, PropDriverInstanceID); owner != d.driverInstanceID() {
 		return nil, status.Errorf(codes.AlreadyExists,
-			"dataset %s appeared during creation but ownership property %s is %q, expected %q",
-			datasetName, PropDriverInstanceID, owner, d.driverInstanceID())
+			"dataset %s appeared during creation without matching local ownership; refusing to adopt a raced object",
+			datasetName)
 	}
-	return ds, nil
+	verified, stampErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, postCreateProperties)
+	if stampErr != nil {
+		if cleanupErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); cleanupErr != nil {
+			klog.Warningf("Failed to cleanup newly created dataset %s after ownership stamp failure: %v", datasetName, cleanupErr)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to stamp and verify dataset ownership after creation: %v", stampErr)
+	}
+	verified.CreatedByCall = true
+	return verified, nil
 }
 
-func setDatasetCreateUserProperty(params *truenas.DatasetCreateParams, key, value string) {
-	for index := range params.UserProperties {
-		if params.UserProperties[index].Key == key {
-			params.UserProperties[index].Value = value
-			params.UserProperties[index].Remove = false
-			return
+func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetName string, properties map[string]string) (*truenas.Dataset, error) {
+	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, properties); err != nil {
+		return nil, err
+	}
+	verified, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		return nil, fmt.Errorf("re-read dataset after user-property update: %w", err)
+	}
+	for key, expected := range properties {
+		if !datasetHasLocalUserProperty(verified, key, expected) {
+			return nil, fmt.Errorf("dataset user property %s did not persist locally with expected value", key)
 		}
 	}
-	params.UserProperties = append(params.UserProperties, truenas.UserPropertyUpdate{Key: key, Value: value})
+	return verified, nil
 }
 
 func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
@@ -1955,6 +1990,10 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 		if d.config.ZFS.DetachedVolumesFromSnapshots {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
 			if copyErr := d.truenasClient.CopyDatasetFromSnapshotLocal(ctx, snap.Dataset, snap.Name, datasetName); copyErr != nil {
+				if truenas.IsDatasetDestinationExistsError(copyErr) {
+					return nil, status.Errorf(codes.Aborted,
+						"detached snapshot copy destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
+				}
 				d.cleanupFailedClone(ctx, datasetName, "")
 				return nil, status.Errorf(codes.Internal, "failed to copy snapshot into an independent volume: %v", copyErr)
 			}
@@ -1963,6 +2002,10 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 			klog.V(4).Infof("Found snapshot %s for cloning", sourceSnapshot)
 
 			if cloneErr := d.truenasClient.SnapshotClone(ctx, sourceSnapshot, datasetName); cloneErr != nil {
+				if truenas.IsDatasetDestinationExistsError(cloneErr) {
+					return nil, status.Errorf(codes.Aborted,
+						"snapshot clone destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
+				}
 				return nil, status.Errorf(codes.Internal, "failed to clone snapshot: %v", cloneErr)
 			}
 			klog.Infof("Snapshot clone created: %s -> %s", sourceSnapshot, datasetName)
@@ -2030,6 +2073,13 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 		// DeleteVolume reject source deletion before its share is touched.
 
 		if cloneErr := d.truenasClient.SnapshotClone(ctx, snap.ID, datasetName); cloneErr != nil {
+			if truenas.IsDatasetDestinationExistsError(cloneErr) {
+				// The winning clone may depend on the same deterministic temporary
+				// snapshot. Do not delete either object; its CreateVolume path owns
+				// completion and the retry will pass through the full ownership gate.
+				return nil, status.Errorf(codes.Aborted,
+					"volume clone destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
+			}
 			if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
 				klog.Warningf("Failed to cleanup snapshot after clone failure: %v", delErr)
 			}

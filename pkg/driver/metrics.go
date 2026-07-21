@@ -2,6 +2,7 @@ package driver
 
 import (
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -149,6 +150,40 @@ var (
 		},
 	)
 
+	reconcileLastSuccessTimestamp = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "reconcile_last_success_timestamp_seconds",
+			Help:      "Unix timestamp of the most recent completed controller reconcile pass",
+		},
+	)
+
+	reconcileFailuresTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "reconcile_failures_total",
+			Help:      "Total reconcile failures and isolated object skips by phase",
+		},
+		[]string{"phase"},
+	)
+
+	fencingDeferredTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "fencing_deferred_total",
+			Help:      "Total backend fencing operations deferred to preserve upgrade compatibility",
+		},
+		[]string{"reason", "protocol"},
+	)
+
+	fencingStaleDeferredTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "fencing_stale_deferred_total",
+			Help:      "Total stale publication cleanup passes deferred by the empty-VolumeAttachment safety brake",
+		},
+	)
+
 	// Circuit breaker metrics
 	circuitBreakerState = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -190,6 +225,13 @@ var (
 		},
 	)
 )
+
+func init() {
+	for _, protocol := range []string{"nfs", "iscsi", "nvmeof"} {
+		fencingDeferredTotal.WithLabelValues("missing_identity", protocol).Add(0)
+	}
+	fencingDeferredTotal.WithLabelValues("outside_allowed_network", "nfs").Add(0)
+}
 
 // RecordCSIOperation records metrics for a CSI operation
 func RecordCSIOperation(operation string, duration float64, err error) {
@@ -252,13 +294,30 @@ func RecordGCSessionDisconnected(transport string) {
 	gcSessionsDisconnectedTotal.WithLabelValues(transport).Inc()
 }
 
-// SetOrphanReconcileMetrics publishes the latest successful detection report.
+// SetOrphanReconcileMetrics publishes the latest detection report, including a
+// partial report from a failed pass so gauges never silently freeze.
 func SetOrphanReconcileMetrics(report ReconcileReport) {
 	orphanVolumes.Set(float64(report.OrphanVolumeCount))
 	orphanSnapshots.Set(float64(report.OrphanSnapshotCount))
 	spentRestoreSnapshots.Set(float64(report.SpentRestoreSnapshotCount))
 	orphanVolumesBytes.Set(float64(report.OrphanVolumeBytes))
 	orphanSnapshotsBytes.Set(float64(report.OrphanSnapshotBytes))
+}
+
+func RecordReconcileSuccess(at time.Time) {
+	reconcileLastSuccessTimestamp.Set(float64(at.Unix()))
+}
+
+func RecordReconcileFailure(phase string) {
+	reconcileFailuresTotal.WithLabelValues(phase).Inc()
+}
+
+func RecordFencingDeferred(reason, protocol string) {
+	fencingDeferredTotal.WithLabelValues(reason, protocol).Inc()
+}
+
+func RecordFencingStaleDeferred() {
+	fencingStaleDeferredTotal.Inc()
 }
 
 // Circuit breaker metrics tracking

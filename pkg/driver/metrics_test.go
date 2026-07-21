@@ -3,6 +3,7 @@ package driver
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -257,4 +258,24 @@ func TestSetOrphanReconcileMetrics(t *testing.T) {
 	assert.Equal(t, float64(4), testutil.ToFloat64(spentRestoreSnapshots))
 	assert.Equal(t, float64(1024), testutil.ToFloat64(orphanVolumesBytes))
 	assert.Equal(t, float64(2048), testutil.ToFloat64(orphanSnapshotsBytes))
+}
+
+func TestReconcileAndFencingMetrics(t *testing.T) {
+	completedAt := time.Unix(1_800_000_000, 0)
+	RecordReconcileSuccess(completedAt)
+	assert.Equal(t, float64(completedAt.Unix()), testutil.ToFloat64(reconcileLastSuccessTimestamp))
+
+	failure := reconcileFailuresTotal.WithLabelValues("test_phase")
+	failureBefore := testutil.ToFloat64(failure)
+	RecordReconcileFailure("test_phase")
+	assert.Equal(t, failureBefore+1, testutil.ToFloat64(failure))
+
+	deferred := fencingDeferredTotal.WithLabelValues("missing_identity", "iscsi")
+	deferredBefore := testutil.ToFloat64(deferred)
+	RecordFencingDeferred("missing_identity", "iscsi")
+	assert.Equal(t, deferredBefore+1, testutil.ToFloat64(deferred))
+
+	staleBefore := testutil.ToFloat64(fencingStaleDeferredTotal)
+	RecordFencingStaleDeferred()
+	assert.Equal(t, staleBefore+1, testutil.ToFloat64(fencingStaleDeferredTotal))
 }

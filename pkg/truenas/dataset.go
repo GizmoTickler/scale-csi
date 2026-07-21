@@ -32,6 +32,10 @@ type Dataset struct {
 	Origin         DatasetProperty         `json:"origin"`
 	Creation       DatasetProperty         `json:"creation"`
 	UserProperties map[string]UserProperty `json:"user_properties"`
+	// CreatedByCall is true only when pool.dataset.create itself created this
+	// object. The idempotent AlreadyExists fallback leaves it false so callers
+	// never post-stamp a raced foreign dataset.
+	CreatedByCall bool `json:"-"`
 }
 
 // DatasetProperty represents a ZFS property with parsed and raw values.
@@ -122,7 +126,12 @@ func (c *Client) DatasetCreate(ctx context.Context, params *DatasetCreateParams)
 		return nil, fmt.Errorf("failed to create dataset: %w", err)
 	}
 
-	return parseDataset(result)
+	dataset, err := parseDataset(result)
+	if err != nil {
+		return nil, err
+	}
+	dataset.CreatedByCall = true
+	return dataset, nil
 }
 
 // DatasetDelete deletes a ZFS dataset.
@@ -132,6 +141,9 @@ func (c *Client) DatasetDelete(ctx context.Context, name string, recursive, forc
 		"force":     force,
 	}
 
+	// TrueNAS 26.0 takes the dataset id as a bare positional string. This is
+	// deliberately different from zfs.resource.snapshot.destroy, whose sole
+	// argument is an object containing {"path": ...}.
 	_, err := c.Call(ctx, "pool.dataset.delete", name, options)
 	if err != nil {
 		// Log full error details before fallback logic (helps debug ambiguous errors)
@@ -331,7 +343,10 @@ func (c *Client) DatasetSetUserProperty(ctx context.Context, name, key, value st
 	return c.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
 }
 
-// DatasetSetUserProperties sets multiple user properties on a dataset in one update.
+// DatasetSetUserProperties sets multiple user properties on a dataset in one
+// update. Live TrueNAS 26.0 probes confirm pool.dataset.update's
+// user_properties_update persists these values with source=local, unlike the
+// silently dropped inline pool.dataset.create shape.
 func (c *Client) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
 	keys := make([]string, 0, len(properties))
 	for key := range properties {
@@ -353,8 +368,9 @@ func (c *Client) DatasetSetUserProperties(ctx context.Context, name string, prop
 }
 
 // DatasetRemoveUserProperties removes local user properties in one update.
-// Publication records use removal rather than an empty value so a retry can
-// distinguish "never published" from an interrupted unpublish tombstone.
+// Publication records use the live-verified {key, remove:true} update rather
+// than an empty value so a retry can distinguish "never published" from an
+// interrupted unpublish tombstone.
 func (c *Client) DatasetRemoveUserProperties(ctx context.Context, name string, keys []string) error {
 	keys = append([]string(nil), keys...)
 	sort.Strings(keys)

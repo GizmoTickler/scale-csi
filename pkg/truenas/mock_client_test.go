@@ -156,7 +156,11 @@ func TestMockClientCopyDatasetFromSnapshotLocalIsIndependentAndIdempotent(t *tes
 	// A repeated call must preserve the already-created target rather than
 	// replacing its post-copy identity updates with inherited source values.
 	require.NoError(t, client.DatasetSetUserProperty(ctx, target.Name, "truenas-csi:csi_volume_name", "target"))
-	require.NoError(t, client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, target.Name))
+	err = client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, target.Name)
+	require.Error(t, err)
+	assert.True(t, IsDatasetDestinationExistsError(err))
+	target, err = client.DatasetGet(ctx, target.Name)
+	require.NoError(t, err)
 	assert.Equal(t, "target", target.UserProperties["truenas-csi:csi_volume_name"].Value)
 
 	require.NoError(t, client.SnapshotDelete(ctx, snapshot.ID, false, false))
@@ -198,4 +202,48 @@ func TestMockSnapshotCreateAppliesInlinePropertiesWhenUpdatesNoOp(t *testing.T) 
 	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:late")
 	require.NoError(t, client.SnapshotRemoveUserProperties(ctx, snapshot.ID, []string{"truenas-csi:managed_resource"}))
 	assert.Contains(t, snapshot.UserProperties, "truenas-csi:managed_resource")
+
+	oldID := snapshot.ID
+	require.NoError(t, client.SnapshotRename(ctx, oldID, "renamed"))
+	_, err = client.SnapshotGet(ctx, oldID)
+	require.Error(t, err)
+	renamed, err := client.SnapshotGet(ctx, "tank/csi/source@renamed")
+	require.NoError(t, err)
+	assert.Contains(t, renamed.UserProperties, "truenas-csi:managed_resource",
+		"26.0's property-update no-op must not suppress the working rename API")
+}
+
+func TestMockDatasetCreateCanModelTrueNAS26InlinePropertyDrop(t *testing.T) {
+	client := NewMockClient()
+	client.DropDatasetCreateUserProperties = true
+	dataset, err := client.DatasetCreate(context.Background(), &DatasetCreateParams{
+		Name: "tank/csi/inline-drop", Type: "FILESYSTEM",
+		UserProperties: []UserPropertyUpdate{{Key: "truenas-csi:driver_instance_id", Value: "instance-a"}},
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, dataset.UserProperties, "truenas-csi:driver_instance_id")
+
+	require.NoError(t, client.DatasetSetUserProperty(context.Background(), dataset.Name,
+		"truenas-csi:driver_instance_id", "instance-a"))
+	dataset, err = client.DatasetGet(context.Background(), dataset.Name)
+	require.NoError(t, err)
+	assert.Equal(t, UserProperty{Value: "instance-a", Source: "local"},
+		dataset.UserProperties["truenas-csi:driver_instance_id"])
+}
+
+func TestMockDatasetCreatedByCallIsResponseLocal(t *testing.T) {
+	client := NewMockClient()
+	ctx := context.Background()
+	created, err := client.DatasetCreate(ctx, &DatasetCreateParams{Name: "tank/csi/response-local", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	observed, err := client.DatasetGet(ctx, created.Name)
+	require.NoError(t, err)
+	raced, err := client.DatasetCreate(ctx, &DatasetCreateParams{Name: created.Name, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+
+	assert.True(t, created.CreatedByCall)
+	assert.False(t, observed.CreatedByCall)
+	assert.False(t, raced.CreatedByCall)
+	assert.True(t, created.CreatedByCall,
+		"later reads and raced creates must not mutate an earlier response through shared storage")
 }

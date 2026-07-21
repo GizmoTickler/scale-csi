@@ -234,10 +234,20 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
    snapshot CRDs and the common snapshot controller, which this chart does not
    install. Keep their API generation compatible with the snapshotter.
 
-5. The repository does not define or test a controller/node version-skew matrix.
-   Roll controller and node together, and exercise provision, attach, mount,
-   expand, snapshot, restore, unmount, and delete in a staging namespace before
-   production rollout.
+5. For the v1.2.23 fencing migration, keep `fencing.mode=off`, upgrade the node
+   DaemonSet/image first, and wait for every CSINode to re-register its versioned
+   transport identity before enabling `additive`. Enable `strict` only after
+   `scale_csi_fencing_deferred_total` remains at zero. Roll the v1.2.23
+   controller image and its ConfigMap together; applying new fencing keys to an
+   older strict-YAML binary can make that older pod fail configuration parsing.
+   The chart uses a shared image value, so patch and await the node DaemonSet
+   first, verify every driver CSINode node ID has the `sc1.` prefix, and only
+   then run the Helm upgrade that changes the controller image, ConfigMap, and
+   mode. The exact commands are in the chart's publication-fencing runbook.
+   Outside this explicitly tested migration sequence, the repository does not
+   promise arbitrary controller/node version skew. Exercise provision, attach,
+   mount, expand, snapshot, restore, unmount, and delete in a staging namespace
+   before production rollout.
 
 ## Known limitations in v1.2.0
 
@@ -259,11 +269,12 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   passes for NFS (75/75), iSCSI (real iscsiadm logins, device staging, mkfs,
   mounts), and NVMe-oF (real fabric connects). Tests named `e2e` in this
   repository use `MockClient`.
-- NVMe-oF host-NQN allowlisting is configured statically at the controller.
-  The driver does not discover node host NQNs, so operators must
-  keep `nvmeof.subsystemHosts` synchronized with every node that may connect.
-  Continue to use network segmentation (for example VLANs or SGACLs) to protect
-  the NVMe-oF listener; host allowlisting is an additional control.
+- With `fencing.mode=off`, NVMe-oF host-NQN allowlisting is configured
+  statically through `nvmeof.subsystemHosts`. Additive and strict modes consume
+  the host NQN registered by each node plugin and enforce per-volume host
+  associations. Continue to use network segmentation (for example VLANs or
+  SGACLs) to protect the NVMe-oF listener; host allowlisting is an additional
+  control.
 - A TrueNAS NVMe-oF listener only materializes on a configured port once at
   least one subsystem is associated with it — a bare port shows no kernel
   listener, which is normal and self-resolves on first volume creation.
@@ -287,8 +298,6 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   `user_properties_remove`. The driver writes snapshot identity properties at
   creation for correctness; tombstone names, rather than property removal, hide
   deferred deletions. This middleware behavior should be reported upstream.
-- Driver-managed NVMe-oF host allowlisting is unavailable, as described in the
-  security section.
 
 [truenas-rbac]: https://api.truenas.com/v26.0/rbac.html
 [csidriver-api]: https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/csi-driver-v1/

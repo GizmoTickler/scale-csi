@@ -62,6 +62,7 @@ func appendNodeIdentityField(dst []byte, fieldType byte, value []byte) ([]byte, 
 // and appended last, so excess secondary addresses can be dropped without ever
 // dropping the Kubernetes name or a block-transport identity.
 func encodeNodeIdentity(identity NodeIdentity) (string, error) {
+	identity = trimNodeIdentityDescriptionFields(identity)
 	if strings.TrimSpace(identity.Name) == "" {
 		return "", fmt.Errorf("node name is required")
 	}
@@ -99,6 +100,20 @@ func encodeNodeIdentity(identity NodeIdentity) (string, error) {
 	return nodeIdentityPrefix + base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+// trimNodeIdentityDescriptionFields is the final lossless packing stage after
+// secondary IPs and disabled protocol classes have been deprioritized. The
+// current envelope intentionally carries no human-facing description fields;
+// the only description-class bytes discovery can introduce are surrounding
+// file/command formatting whitespace, which is safe to remove. Kubernetes node
+// names, NQNs, and IQNs are exact authorization identities and are never
+// truncated; if those mandatory values still exceed 256 bytes startup fails.
+func trimNodeIdentityDescriptionFields(identity NodeIdentity) NodeIdentity {
+	identity.Name = strings.TrimSpace(identity.Name)
+	identity.NVMeNQN = strings.TrimSpace(identity.NVMeNQN)
+	identity.ISCSIIQN = strings.TrimSpace(identity.ISCSIIQN)
+	return identity
+}
+
 // parseNodeIdentity is intentionally tolerant in both upgrade directions. A
 // value without our prefix is an older node_id and remains usable as its node
 // name. Unknown TLV fields are skipped; malformed envelopes are rejected rather
@@ -114,7 +129,7 @@ func parseNodeIdentity(nodeID string) (NodeIdentity, error) {
 	if err != nil || len(raw) == 0 {
 		return NodeIdentity{}, fmt.Errorf("invalid encoded node ID")
 	}
-	if raw[0] > nodeIdentityVersion {
+	if raw[0] != nodeIdentityVersion {
 		return NodeIdentity{}, fmt.Errorf("unsupported node identity version %d", raw[0])
 	}
 	identity := NodeIdentity{}
@@ -155,6 +170,27 @@ func parseNodeIdentity(nodeID string) (NodeIdentity, error) {
 	}
 	identity.IPs = canonicalNodeIPs(identity.IPs)
 	return identity, nil
+}
+
+// nodeIdentityForEnabledProtocols drops identity classes this deployment
+// cannot consume before enforcing the CSI size limit. Within enabled classes,
+// encodeNodeIdentity packs mandatory name/transport identifiers first, then as
+// many canonical IPs as fit, and finally strips only lossless description
+// formatting before giving up.
+func nodeIdentityForEnabledProtocols(identity NodeIdentity, config *Config) NodeIdentity {
+	if config == nil {
+		return identity
+	}
+	if !config.NFS.Enabled {
+		identity.IPs = nil
+	}
+	if !config.ISCSI.Enabled {
+		identity.ISCSIIQN = ""
+	}
+	if !config.NVMeoF.Enabled {
+		identity.NVMeNQN = ""
+	}
+	return identity
 }
 
 func canonicalNodeIPs(ips []net.IP) []net.IP {

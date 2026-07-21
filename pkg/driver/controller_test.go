@@ -40,6 +40,80 @@ type datasetCreateCaptureMock struct {
 	params []*truenas.DatasetCreateParams
 }
 
+type racedDatasetCreateMock struct {
+	*truenas.MockClient
+	owner string
+}
+
+type racedSnapshotCloneDestinationMock struct {
+	*truenas.MockClient
+}
+
+func (m *racedSnapshotCloneDestinationMock) SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error {
+	// The competing request wins between CreateVolume's initial DatasetGet and
+	// this request's clone call. The second low-level call must report that this
+	// caller did not create the destination, even though the origin matches.
+	if err := m.MockClient.SnapshotClone(ctx, snapshotID, newDatasetName); err != nil {
+		return err
+	}
+	return &truenas.ErrDatasetDestinationExists{
+		Destination: newDatasetName, ExpectedOrigin: snapshotID,
+		VerificationErr: errors.New("transient origin verification failure"),
+	}
+}
+
+type racedDetachedCopyDestinationMock struct {
+	*truenas.MockClient
+}
+
+func (m *racedDetachedCopyDestinationMock) CopyDatasetFromSnapshotLocal(
+	ctx context.Context,
+	sourceDataset, snapshotShortName, targetDataset string,
+) error {
+	if err := m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset); err != nil {
+		return err
+	}
+	return m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
+}
+
+func (m *racedDatasetCreateMock) DatasetCreate(ctx context.Context, params *truenas.DatasetCreateParams) (*truenas.Dataset, error) {
+	// Simulate another controller winning after this caller's initial NotFound
+	// read but before pool.dataset.create. The real client converts EEXIST to an
+	// existing Dataset response with CreatedByCall=false.
+	if _, err := m.MockClient.DatasetCreate(ctx, params); err != nil {
+		return nil, err
+	}
+	if err := m.DatasetSetUserProperties(ctx, params.Name, map[string]string{
+		PropDriverInstanceID: m.owner,
+		PropManagedResource:  "true",
+		PropCSIVolumeName:    strings.TrimPrefix(params.Name, "pool/parent/"),
+	}); err != nil {
+		return nil, err
+	}
+	return m.MockClient.DatasetCreate(ctx, params)
+}
+
+type silentCloneOwnerUpdateMock struct {
+	*truenas.MockClient
+}
+
+func (m *silentCloneOwnerUpdateMock) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
+	if len(properties) == 1 && properties[PropDriverInstanceID] != "" {
+		// Model an acknowledged update that did not persist. Clone ownership is
+		// not safe to trust until the authoritative re-read verifies source=local.
+		return nil
+	}
+	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
+}
+
+type silentDatasetPropertyUpdateMock struct {
+	*truenas.MockClient
+}
+
+func (m *silentDatasetPropertyUpdateMock) DatasetSetUserProperties(context.Context, string, map[string]string) error {
+	return nil
+}
+
 func (m *datasetCreateCaptureMock) DatasetCreate(ctx context.Context, params *truenas.DatasetCreateParams) (*truenas.Dataset, error) {
 	copyParams := *params
 	copyParams.UserProperties = append([]truenas.UserPropertyUpdate(nil), params.UserProperties...)
@@ -523,10 +597,12 @@ func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
 	assert.Equal(t, "OFF", params.Readonly)
 	assert.Equal(t, 2*testGiB, params.Refquota)
 	assert.Equal(t, 2*testGiB, params.Refreservation)
-	assert.Equal(t, []truenas.UserPropertyUpdate{
-		{Key: "org.truenas:owner", Value: "storage-team"},
-		{Key: PropDriverInstanceID, Value: "org.scale.csi.test@pool/parent"},
-	}, params.UserProperties)
+	assert.Empty(t, params.UserProperties,
+		"TrueNAS 26.0 silently drops inline dataset-create user properties")
+	dataset, getErr := client.DatasetGet(context.Background(), "pool/parent/volume")
+	require.NoError(t, getErr)
+	assert.True(t, datasetHasLocalUserProperty(dataset, "org.truenas:owner", "storage-team"))
+	assert.True(t, datasetHasLocalUserProperty(dataset, PropDriverInstanceID, "org.scale.csi.test@pool/parent"))
 }
 
 func TestCreateDatasetZvolSkipsFilesystemOnlyProperties(t *testing.T) {
@@ -717,9 +793,10 @@ func TestDeleteVolumeWithManagedSnapshotFailsBeforeShareDeletion(t *testing.T) {
 	assert.NoError(t, err)
 	share, err := mockClient.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: "/mnt/pool/parent/vol-snap-guard"})
 	assert.NoError(t, err)
-	snap, err := mockClient.SnapshotCreate(ctx, "pool/parent/vol-snap-guard", "snap-1", nil)
+	_, err = mockClient.SnapshotCreate(ctx, "pool/parent/vol-snap-guard", "snap-1", map[string]string{
+		PropManagedResource: "true",
+	})
 	assert.NoError(t, err)
-	assert.NoError(t, mockClient.SnapshotSetUserProperty(ctx, snap.ID, PropManagedResource, "true"))
 
 	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "vol-snap-guard"})
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
@@ -752,7 +829,7 @@ func TestDeleteVolumeWithDatasetOriginCloneFailsBeforeShareDeletion(t *testing.T
 		Name: "pool/external/clone", Type: "FILESYSTEM",
 	})
 	assert.NoError(t, err)
-	clone.Origin = truenas.DatasetProperty{
+	client.Datasets[clone.Name].Origin = truenas.DatasetProperty{
 		Value:  "pool/parent/source-origin@external-snapshot",
 		Parsed: "pool/parent/source-origin@external-snapshot",
 	}
@@ -1627,11 +1704,12 @@ func TestDeleteSnapshotRenameFailureReturnsError(t *testing.T) {
 	}
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
 	require.NoError(t, err)
-	snapshot, err := client.SnapshotCreate(ctx, "pool/parent/source", "restore-point", nil)
+	snapshot, err := client.SnapshotCreate(ctx, "pool/parent/source", "restore-point", map[string]string{
+		PropManagedResource:           "true",
+		PropCSISnapshotName:           "restore-point",
+		PropCSISnapshotSourceVolumeID: "source",
+	})
 	require.NoError(t, err)
-	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, PropManagedResource, "true"))
-	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, PropCSISnapshotName, "restore-point"))
-	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, PropCSISnapshotSourceVolumeID, "source"))
 	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/restored"))
 
 	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "restore-point"})
