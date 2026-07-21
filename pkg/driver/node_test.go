@@ -140,14 +140,14 @@ func newTestNodeDriver(shareType ShareType) *Driver {
 			DatasetParentName: "pool/test",
 		},
 		NFS: NFSConfig{
-			ShareHost: "192.168.1.100",
+			ShareHost: "192.0.2.100",
 		},
 		ISCSI: ISCSIConfig{
-			TargetPortal:      "192.168.1.100:3260",
+			TargetPortal:      "192.0.2.100:3260",
 			DeviceWaitTimeout: 60,
 		},
 		NVMeoF: NVMeoFConfig{
-			TransportAddress:   "192.168.1.100",
+			TransportAddress:   "192.0.2.100",
 			TransportServiceID: 4420,
 			Transport:          "tcp",
 			DeviceWaitTimeout:  60,
@@ -1325,7 +1325,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 
 	t.Run("MissingIQN", func(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 		}, "/staging", nil)
 
 		require.Error(t, err)
@@ -1337,7 +1337,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 
 	t.Run("InvalidLUN", func(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.2005-10.org.freenas.ctl:vol1",
 			"lun":    "invalid",
 		}, "/staging", nil)
@@ -1487,7 +1487,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
 		stagingPath := t.TempDir()
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
@@ -1506,7 +1506,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNVMeoF)
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
 			"nqn":     "nqn.test:vol1",
-			"address": "192.168.1.100",
+			"address": "192.0.2.100",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
 		})
@@ -1520,7 +1520,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		installFakeNodeCommands(t, "findmnt", "iscsiadm")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
-		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:other (non-flash)\n")
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.0.2.100:3260,1 iqn.test:other (non-flash)\n")
 
 		originalConnect := iscsiConnectWithSessions
 		iscsiConnectWithSessions = func(_ context.Context, _, _ string, _ int, _ *util.ISCSIConnectOptions, sessions []util.ISCSISessionInfo) (string, error) {
@@ -1532,7 +1532,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		stagingPath := filepath.Join(t.TempDir(), "staging")
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
@@ -1558,7 +1558,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNVMeoF)
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
 			"nqn":     "nqn.test:vol1",
-			"address": "192.168.1.100",
+			"address": "192.0.2.100",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
@@ -1572,11 +1572,11 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 		installFakeNodeCommands(t, "findmnt", "iscsiadm")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
-		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:vol1 (non-flash)\n")
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.0.2.100:3260,1 iqn.test:vol1 (non-flash)\n")
 
 		originalInfo := getISCSIInfoFromDeviceWithSessions
 		getISCSIInfoFromDeviceWithSessions = func(devicePath string, sessions []util.ISCSISessionInfo) (string, string, error) {
-			return "192.168.1.100:3260", "iqn.test:vol1", nil
+			return "192.0.2.100:3260", "iqn.test:vol1", nil
 		}
 		defer func() { getISCSIInfoFromDeviceWithSessions = originalInfo }()
 
@@ -1585,7 +1585,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
@@ -1615,7 +1615,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNVMeoF)
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
 			"nqn":     "nqn.test:vol1",
-			"address": "192.168.1.100",
+			"address": "192.0.2.100",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
@@ -1632,7 +1632,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		installFakeNodeCommands(t, "findmnt", "iscsiadm")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
-		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:vol1 (non-flash)\n")
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.0.2.100:3260,1 iqn.test:vol1 (non-flash)\n")
 
 		originalInfo := getISCSIInfoFromDeviceWithSessions
 		originalConnect := iscsiConnectWithSessions
@@ -1651,7 +1651,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		require.NoError(t, os.Symlink("/dev/null", stagingPath))
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260", "iqn": "iqn.test:vol1",
+			"portal": "192.0.2.100:3260", "iqn": "iqn.test:vol1",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
@@ -1682,7 +1682,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		require.NoError(t, os.Symlink("/dev/null", stagingPath))
 		d := newTestNodeDriver(ShareTypeNVMeoF)
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
-			"nqn": "nqn.test:vol1", "address": "192.168.1.100",
+			"nqn": "nqn.test:vol1", "address": "192.0.2.100",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
@@ -1718,7 +1718,7 @@ func TestStageNVMeoFVolume_Validation(t *testing.T) {
 
 	t.Run("MissingNQN", func(t *testing.T) {
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
-			"address": "192.168.1.100",
+			"address": "192.0.2.100",
 		}, "/staging", nil)
 
 		require.Error(t, err)
@@ -2009,14 +2009,12 @@ func TestCleanupOrphanedISCSISessionUsesProtocolShareName(t *testing.T) {
 	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
 
 	d := newTestNodeDriver(ShareTypeISCSI)
-	d.config.ISCSI.NamePrefix = "cluster-"
-	d.config.ISCSI.NameSuffix = "-cluster"
-	volumeID := strings.Repeat("Long_Volume_Name!", 8)
+	d.config.ISCSI.NameSuffix = "-Cluster_Name!"
+	volumeID := "pvc-11111111-2222-4333-8444-555555555555"
 	targetName := d.iscsiShareName(volumeID)
 	assert.Equal(t, protocolShareName(volumeID+d.config.ISCSI.NameSuffix), targetName)
-	assert.NotContains(t, targetName, d.config.ISCSI.NamePrefix)
 	iqn := "iqn.2005-10.org.freenas.ctl:" + targetName
-	t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 "+iqn+" (non-flash)\n")
+	t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.0.2.100:3260,1 "+iqn+" (non-flash)\n")
 
 	d.cleanupOrphanedSessionByVolumeID(context.Background(), volumeID, ShareTypeISCSI)
 	log := readNodeCommandLog(t, logPath)

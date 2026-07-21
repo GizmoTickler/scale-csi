@@ -61,7 +61,7 @@ func NewMockClient() *MockClient {
 		ISCSIPortals: map[int]*ISCSIPortal{
 			1: {ID: 1, Tag: 1, Listen: []ISCSIPortalListen{
 				{IP: "192.0.2.10", Port: 3260},
-				{IP: "192.168.1.100", Port: 3260},
+				{IP: "192.0.2.100", Port: 3260},
 				{IP: "127.0.0.1", Port: 3260},
 			}},
 		},

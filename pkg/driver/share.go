@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+var pvcVolumeIDPrefix = regexp.MustCompile(`^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 
 // protocolShareName converts a dataset base name into a name legal for iSCSI
 // targets/extents and NVMe-oF subsystems: TrueNAS requires lowercase
@@ -51,6 +54,28 @@ func protocolShareName(base string) string {
 		sanitized = sanitized[:maxLen-len(suffix)]
 	}
 	return sanitized + suffix
+}
+
+// iscsiShareName is the single target/extent naming path used by provisioning,
+// node cleanup, and session-GC ownership checks.
+func (d *Driver) iscsiShareName(volumeID string) string {
+	return protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
+}
+
+// isDriverISCSITarget reports whether an IQN target identifier is exactly one
+// this driver would create for a Kubernetes pvc-<UUID> volume. Recomputing the
+// full name through iscsiShareName keeps suffix sanitization and truncation in
+// lockstep with provisioning while excluding foreign targets on the same portal.
+func (d *Driver) isDriverISCSITarget(iqn string) bool {
+	if !strings.HasPrefix(strings.ToLower(iqn), "iqn.") {
+		return false
+	}
+	_, target, ok := strings.Cut(iqn, ":")
+	if !ok || target == "" {
+		return false
+	}
+	volumeID := pvcVolumeIDPrefix.FindString(target)
+	return volumeID != "" && target == d.iscsiShareName(volumeID)
 }
 
 // resolveISCSITargetGroup derives a usable portal/initiator group when

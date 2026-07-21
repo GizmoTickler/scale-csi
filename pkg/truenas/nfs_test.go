@@ -504,7 +504,7 @@ func TestNFSShareGet_Success(t *testing.T) {
 						"path":         "/mnt/tank/k8s/volumes/pvc-get",
 						"paths":        []interface{}{"/mnt/tank/k8s/volumes/pvc-get"},
 						"comment":      "Test share",
-						"networks":     []interface{}{"10.0.0.0/8"},
+						"networks":     []interface{}{"198.51.100.0/24"},
 						"hosts":        []interface{}{"node1", "node2"},
 						"ro":           false,
 						"maproot_user": "root",
@@ -551,7 +551,7 @@ func TestNFSShareGet_Success(t *testing.T) {
 	assert.Equal(t, 42, share.ID)
 	assert.Equal(t, "/mnt/tank/k8s/volumes/pvc-get", share.Path)
 	assert.Equal(t, "Test share", share.Comment)
-	assert.Contains(t, share.Networks, "10.0.0.0/8")
+	assert.Contains(t, share.Networks, "198.51.100.0/24")
 	assert.Contains(t, share.Hosts, "node1")
 	assert.Contains(t, share.Hosts, "node2")
 	assert.Equal(t, "root", share.MaprootUser)
@@ -968,7 +968,7 @@ func TestNFSShareUpdate_Success(t *testing.T) {
 					"path":     "/mnt/tank/k8s/volumes/updated",
 					"paths":    []interface{}{"/mnt/tank/k8s/volumes/updated"},
 					"comment":  "Updated comment",
-					"networks": []interface{}{"192.168.1.0/24"},
+					"networks": []interface{}{"192.0.2.0/24"},
 					"enabled":  true,
 				}
 			default:
@@ -1005,14 +1005,14 @@ func TestNFSShareUpdate_Success(t *testing.T) {
 	ctx := context.Background()
 	params := map[string]interface{}{
 		"comment":  "Updated comment",
-		"networks": []string{"192.168.1.0/24"},
+		"networks": []string{"192.0.2.0/24"},
 	}
 
 	share, err := client.NFSShareUpdate(ctx, 42, params)
 	require.NoError(t, err)
 	assert.NotNil(t, share)
 	assert.Equal(t, "Updated comment", share.Comment)
-	assert.Contains(t, share.Networks, "192.168.1.0/24")
+	assert.Contains(t, share.Networks, "192.0.2.0/24")
 }
 
 // TestParseNFSShare tests the parseNFSShare function
@@ -1022,7 +1022,7 @@ func TestParseNFSShare_ValidData(t *testing.T) {
 		"path":         "/mnt/tank/test",
 		"paths":        []interface{}{"/mnt/tank/test", "/mnt/tank/test2"},
 		"comment":      "Test share",
-		"networks":     []interface{}{"10.0.0.0/8", "192.168.0.0/16"},
+		"networks":     []interface{}{"198.51.100.0/24", "203.0.113.0/24"},
 		"hosts":        []interface{}{"host1", "host2"},
 		"ro":           true,
 		"maproot_user": "root",
@@ -1038,7 +1038,7 @@ func TestParseNFSShare_ValidData(t *testing.T) {
 	assert.Len(t, share.Paths, 2)
 	assert.Equal(t, "Test share", share.Comment)
 	assert.Len(t, share.Networks, 2)
-	assert.Contains(t, share.Networks, "10.0.0.0/8")
+	assert.Contains(t, share.Networks, "198.51.100.0/24")
 	assert.Len(t, share.Hosts, 2)
 	assert.True(t, share.Ro)
 	assert.Equal(t, "root", share.MaprootUser)
@@ -1102,12 +1102,12 @@ func TestNFSShareCreate_TableDriven(t *testing.T) {
 			name: "share with networks",
 			params: &NFSShareCreateParams{
 				Path:     "/mnt/tank/networks",
-				Networks: []string{"10.0.0.0/8"},
+				Networks: []string{"198.51.100.0/24"},
 			},
 			mockResponse: map[string]interface{}{
 				"id":       float64(2),
 				"path":     "/mnt/tank/networks",
-				"networks": []interface{}{"10.0.0.0/8"},
+				"networks": []interface{}{"198.51.100.0/24"},
 				"enabled":  true,
 			},
 			expectError: false,
@@ -1287,7 +1287,7 @@ func BenchmarkParseNFSShare(b *testing.B) {
 		"path":         "/mnt/tank/test",
 		"paths":        []interface{}{"/mnt/tank/test", "/mnt/tank/test2"},
 		"comment":      "Test share",
-		"networks":     []interface{}{"10.0.0.0/8", "192.168.0.0/16"},
+		"networks":     []interface{}{"198.51.100.0/24", "203.0.113.0/24"},
 		"hosts":        []interface{}{"host1", "host2", "host3"},
 		"ro":           true,
 		"maproot_user": "root",

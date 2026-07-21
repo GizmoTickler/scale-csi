@@ -168,12 +168,10 @@ zfs:
 iscsi:
   enabled: true
   targetPortal: 192.0.2.10:3260
-  namePrefix: csi-
   extentDisablePhysicalBlocksize: true
 `)
 	require.NoError(t, err)
 	assert.True(t, cfg.ZFS.ZvolEnableReservation)
-	assert.Equal(t, "csi-", cfg.ISCSI.NamePrefix)
 	assert.True(t, cfg.ISCSI.ExtentDisablePhysicalBlocksize)
 }
 
@@ -388,7 +386,6 @@ func TestLoadConfigWarnsForInertISCSITargetPortals(t *testing.T) {
 iscsi:
   enabled: true
   targetPortal: 192.0.2.10:3260
-  namePrefix: csi-
   targetPortals:
     - 192.0.2.11:3260
 `)

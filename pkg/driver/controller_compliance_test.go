@@ -747,6 +747,13 @@ func TestCreateVolumeDetachedSnapshotExistingCopyClearsInheritedShareIdentity(t 
 	require.NoError(t, client.CopyDatasetFromSnapshotLocal(
 		ctx, source.Name, snapshot.Name, "pool/parent/existing-copy",
 	))
+	// A retry may resume only when the existing copy already has the durable
+	// provenance written by the original request. CreateVolume must never infer
+	// these properties from a later source-bearing request.
+	require.NoError(t, client.DatasetSetUserProperties(ctx, "pool/parent/existing-copy", map[string]string{
+		PropVolumeContentSourceType: "snapshot",
+		PropVolumeContentSourceID:   snapshot.Name,
+	}))
 	transferredSnapshot, err := client.SnapshotCreate(ctx, "pool/parent/existing-copy", snapshot.Name, nil)
 	require.NoError(t, err)
 

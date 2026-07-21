@@ -167,11 +167,6 @@ type ISCSIConfig struct {
 	// Interface is the iSCSI interface to use (default: "default")
 	Interface string `yaml:"interface"`
 
-	// NamePrefix scopes iSCSI session GC to target names with this prefix.
-	// For compatibility with existing installations it is not prepended during
-	// target creation; configure a stable prefix already shared by owned targets.
-	NamePrefix string `yaml:"namePrefix"`
-
 	// NameSuffix is a suffix for iSCSI target/extent names
 	NameSuffix string `yaml:"nameSuffix"`
 

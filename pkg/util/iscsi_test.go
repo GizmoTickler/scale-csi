@@ -197,36 +197,36 @@ func TestParseISCSISessions(t *testing.T) {
 	}{
 		{
 			name: "single session",
-			output: `tcp: [1] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-abc123 (non-flash)
+			output: `tcp: [1] 192.0.2.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-abc123 (non-flash)
 `,
 			wantSessions: []ISCSISession{
 				{
 					SessionID:    "1",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-abc123",
 				},
 			},
 		},
 		{
 			name: "multiple sessions",
-			output: `tcp: [1] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-abc123 (non-flash)
-tcp: [2] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-def456 (non-flash)
-tcp: [3] 10.0.0.50:3260,1 iqn.2005-10.org.freenas.ctl:pvc-ghi789 (non-flash)
+			output: `tcp: [1] 192.0.2.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-abc123 (non-flash)
+tcp: [2] 192.0.2.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-def456 (non-flash)
+tcp: [3] 198.51.100.50:3260,1 iqn.2005-10.org.freenas.ctl:pvc-ghi789 (non-flash)
 `,
 			wantSessions: []ISCSISession{
 				{
 					SessionID:    "1",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-abc123",
 				},
 				{
 					SessionID:    "2",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-def456",
 				},
 				{
 					SessionID:    "3",
-					TargetPortal: "10.0.0.50:3260",
+					TargetPortal: "198.51.100.50:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-ghi789",
 				},
 			},
@@ -243,24 +243,24 @@ tcp: [3] 10.0.0.50:3260,1 iqn.2005-10.org.freenas.ctl:pvc-ghi789 (non-flash)
 		},
 		{
 			name: "session without mode suffix",
-			output: `tcp: [5] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-xyz
+			output: `tcp: [5] 192.0.2.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-xyz
 `,
 			wantSessions: []ISCSISession{
 				{
 					SessionID:    "5",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-xyz",
 				},
 			},
 		},
 		{
 			name: "high session ID",
-			output: `tcp: [999] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:vol-test (non-flash)
+			output: `tcp: [999] 192.0.2.100:3260,1 iqn.2005-10.org.freenas.ctl:vol-test (non-flash)
 `,
 			wantSessions: []ISCSISession{
 				{
 					SessionID:    "999",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:vol-test",
 				},
 			},
@@ -279,44 +279,44 @@ tcp: [3] 10.0.0.50:3260,1 iqn.2005-10.org.freenas.ctl:pvc-ghi789 (non-flash)
 		},
 		{
 			name: "mixed output with empty lines",
-			output: `tcp: [1] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-abc (non-flash)
+			output: `tcp: [1] 192.0.2.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-abc (non-flash)
 
-tcp: [2] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-def (non-flash)
+tcp: [2] 192.0.2.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-def (non-flash)
 
 `,
 			wantSessions: []ISCSISession{
 				{
 					SessionID:    "1",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-abc",
 				},
 				{
 					SessionID:    "2",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-def",
 				},
 			},
 		},
 		{
 			name: "target portal group tag variations",
-			output: `tcp: [1] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-tag1 (non-flash)
-tcp: [2] 192.168.1.100:3260,2 iqn.2005-10.org.freenas.ctl:pvc-tag2 (non-flash)
-tcp: [3] 192.168.1.100:3260,100 iqn.2005-10.org.freenas.ctl:pvc-tag100 (non-flash)
+			output: `tcp: [1] 192.0.2.100:3260,1 iqn.2005-10.org.freenas.ctl:pvc-tag1 (non-flash)
+tcp: [2] 192.0.2.100:3260,2 iqn.2005-10.org.freenas.ctl:pvc-tag2 (non-flash)
+tcp: [3] 192.0.2.100:3260,100 iqn.2005-10.org.freenas.ctl:pvc-tag100 (non-flash)
 `,
 			wantSessions: []ISCSISession{
 				{
 					SessionID:    "1",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-tag1",
 				},
 				{
 					SessionID:    "2",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-tag2",
 				},
 				{
 					SessionID:    "3",
-					TargetPortal: "192.168.1.100:3260",
+					TargetPortal: "192.0.2.100:3260",
 					IQN:          "iqn.2005-10.org.freenas.ctl:pvc-tag100",
 				},
 			},
@@ -418,51 +418,51 @@ func TestISCSIConnectArguments(t *testing.T) {
 	}{
 		{
 			name:      "discovery command",
-			portal:    "192.168.1.100:3260",
+			portal:    "192.0.2.100:3260",
 			iqn:       "",
 			operation: "discovery",
 			wantContains: []string{
-				"-m", "discovery", "-t", "sendtargets", "-p", "192.168.1.100:3260",
+				"-m", "discovery", "-t", "sendtargets", "-p", "192.0.2.100:3260",
 			},
 		},
 		{
 			name:      "login command",
-			portal:    "192.168.1.100:3260",
+			portal:    "192.0.2.100:3260",
 			iqn:       "iqn.2005-10.org.freenas.ctl:pvc-abc123",
 			operation: "login",
 			wantContains: []string{
 				"-m", "node", "-T", "iqn.2005-10.org.freenas.ctl:pvc-abc123",
-				"-p", "192.168.1.100:3260", "--login",
+				"-p", "192.0.2.100:3260", "--login",
 			},
 		},
 		{
 			name:      "logout command",
-			portal:    "10.0.0.50:3260",
+			portal:    "198.51.100.50:3260",
 			iqn:       "iqn.2005-10.org.freenas.ctl:pvc-def456",
 			operation: "logout",
 			wantContains: []string{
 				"-m", "node", "-T", "iqn.2005-10.org.freenas.ctl:pvc-def456",
-				"-p", "10.0.0.50:3260", "--logout",
+				"-p", "198.51.100.50:3260", "--logout",
 			},
 		},
 		{
 			name:      "delete node record",
-			portal:    "192.168.1.100:3260",
+			portal:    "192.0.2.100:3260",
 			iqn:       "iqn.2005-10.org.freenas.ctl:vol-xyz",
 			operation: "delete",
 			wantContains: []string{
 				"-m", "node", "-T", "iqn.2005-10.org.freenas.ctl:vol-xyz",
-				"-p", "192.168.1.100:3260", "-o", "delete",
+				"-p", "192.0.2.100:3260", "-o", "delete",
 			},
 		},
 		{
 			name:      "rescan command",
-			portal:    "192.168.1.100:3260",
+			portal:    "192.0.2.100:3260",
 			iqn:       "iqn.2005-10.org.freenas.ctl:rescan-test",
 			operation: "rescan",
 			wantContains: []string{
 				"-m", "node", "-T", "iqn.2005-10.org.freenas.ctl:rescan-test",
-				"-p", "192.168.1.100:3260", "--rescan",
+				"-p", "192.0.2.100:3260", "--rescan",
 			},
 		},
 	}
@@ -793,12 +793,12 @@ func TestListISCSISessionsConversion(t *testing.T) {
 	internalSessions := []ISCSISession{
 		{
 			SessionID:    "1",
-			TargetPortal: "192.168.1.100:3260",
+			TargetPortal: "192.0.2.100:3260",
 			IQN:          "iqn.2005-10.org.freenas.ctl:pvc-abc",
 		},
 		{
 			SessionID:    "2",
-			TargetPortal: "10.0.0.50:3260",
+			TargetPortal: "198.51.100.50:3260",
 			IQN:          "iqn.2005-10.org.freenas.ctl:pvc-def",
 		},
 	}
@@ -814,10 +814,10 @@ func TestListISCSISessionsConversion(t *testing.T) {
 	}
 
 	require.Len(t, publicSessions, 2)
-	assert.Equal(t, "192.168.1.100:3260", publicSessions[0].Portal)
+	assert.Equal(t, "192.0.2.100:3260", publicSessions[0].Portal)
 	assert.Equal(t, "iqn.2005-10.org.freenas.ctl:pvc-abc", publicSessions[0].IQN)
 	assert.Equal(t, "1", publicSessions[0].SessionID)
-	assert.Equal(t, "10.0.0.50:3260", publicSessions[1].Portal)
+	assert.Equal(t, "198.51.100.50:3260", publicSessions[1].Portal)
 	assert.Equal(t, "iqn.2005-10.org.freenas.ctl:pvc-def", publicSessions[1].IQN)
 	assert.Equal(t, "2", publicSessions[1].SessionID)
 }
@@ -834,14 +834,14 @@ func TestISCSINodeParamArguments(t *testing.T) {
 	}{
 		{
 			name:       "auth method",
-			portal:     "192.168.1.100:3260",
+			portal:     "192.0.2.100:3260",
 			iqn:        "iqn.2005-10.org.freenas.ctl:test",
 			paramName:  "node.session.auth.authmethod",
 			paramValue: "CHAP",
 			wantArgs: []string{
 				"-m", "node",
 				"-T", "iqn.2005-10.org.freenas.ctl:test",
-				"-p", "192.168.1.100:3260",
+				"-p", "192.0.2.100:3260",
 				"-o", "update",
 				"-n", "node.session.auth.authmethod",
 				"-v", "CHAP",
@@ -849,14 +849,14 @@ func TestISCSINodeParamArguments(t *testing.T) {
 		},
 		{
 			name:       "username",
-			portal:     "10.0.0.50:3260",
+			portal:     "198.51.100.50:3260",
 			iqn:        "iqn.2005-10.org.freenas.ctl:vol-chap",
 			paramName:  "node.session.auth.username",
 			paramValue: "initiator-user",
 			wantArgs: []string{
 				"-m", "node",
 				"-T", "iqn.2005-10.org.freenas.ctl:vol-chap",
-				"-p", "10.0.0.50:3260",
+				"-p", "198.51.100.50:3260",
 				"-o", "update",
 				"-n", "node.session.auth.username",
 				"-v", "initiator-user",
@@ -896,16 +896,16 @@ func TestISCSIGetSessionStatsOutputParsing(t *testing.T) {
 		{
 			name: "basic stats parsing",
 			output: `Target: iqn.2005-10.org.freenas.ctl:pvc-test
-	Current Portal: 192.168.1.100:3260,1
-	Persistent Portal: 192.168.1.100:3260,1
+	Current Portal: 192.0.2.100:3260,1
+	Persistent Portal: 192.0.2.100:3260,1
 	State: LOGGED_IN
 	Recovery Timeout: 120
 	Target: iqn.2005-10.org.freenas.ctl:other-target
 `,
 			targetIQN: "iqn.2005-10.org.freenas.ctl:pvc-test",
 			wantStats: map[string]string{
-				"Current Portal":    "192.168.1.100:3260,1",
-				"Persistent Portal": "192.168.1.100:3260,1",
+				"Current Portal":    "192.0.2.100:3260,1",
+				"Persistent Portal": "192.0.2.100:3260,1",
 				"State":             "LOGGED_IN",
 				"Recovery Timeout":  "120",
 			},

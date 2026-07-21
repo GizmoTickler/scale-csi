@@ -345,7 +345,7 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 		wantCode   codes.Code
 	}{
 		{
-			name:       "stored snapshot source",
+			name:       "stored source and different requested source are incompatible",
 			storedType: "snapshot",
 			storedID:   "stored-snapshot",
 			request: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
@@ -354,7 +354,7 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 			wantCode: codes.AlreadyExists,
 		},
 		{
-			name:       "matching stored snapshot source",
+			name:       "identical source retry succeeds",
 			storedType: "snapshot",
 			storedID:   "stored-snapshot",
 			request: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
@@ -373,12 +373,17 @@ func TestCreateVolumeExistingReturnsContentSource(t *testing.T) {
 			wantCode: codes.AlreadyExists,
 		},
 		{
-			name: "request fallback",
+			name: "stored none and requested source are incompatible",
 			request: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
 				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "request-volume"},
 			}},
-			wantType: "volume",
-			wantID:   "request-volume",
+			wantCode: codes.AlreadyExists,
+		},
+		{
+			name:       "stored source and request none are incompatible",
+			storedType: "volume",
+			storedID:   "stored-volume",
+			wantCode:   codes.AlreadyExists,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -623,7 +628,7 @@ func TestDeleteVolume(t *testing.T) {
 func TestGetVolumeContextUsesProvidedDatasetWithoutQuery(t *testing.T) {
 	mockClient := newControllerCallCountingMock()
 	d := &Driver{
-		config:        &Config{NFS: NFSConfig{ShareHost: "10.0.0.10"}},
+		config:        &Config{NFS: NFSConfig{ShareHost: "198.51.100.10"}},
 		truenasClient: mockClient,
 	}
 	ds := &truenas.Dataset{
@@ -878,7 +883,7 @@ func TestVolumeClonePropertyWriteFailureRollsBackCloneAndOriginSnapshot(t *testi
 	assert.True(t, client.DatasetDeleteCalls[len(client.DatasetDeleteCalls)-1].Force)
 }
 
-func TestCreateVolumeExistingCloneRepairsMissingContentSourceProperties(t *testing.T) {
+func TestCreateVolumeExistingCloneRejectsMissingContentSourceProperties(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
 	d := &Driver{
@@ -906,11 +911,11 @@ func TestCreateVolumeExistingCloneRepairsMissingContentSourceProperties(t *testi
 			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "source"},
 		}},
 	})
-	require.NoError(t, err)
-	assert.Equal(t, "source", resp.GetVolume().GetContentSource().GetVolume().GetVolumeId())
-	assert.Equal(t, "volume", datasetUserProperty(clone, PropVolumeContentSourceType))
-	assert.Equal(t, "source", datasetUserProperty(clone, PropVolumeContentSourceID))
-	assert.Equal(t, snap.ID, datasetUserProperty(clone, PropVolumeOriginSnapshot))
+	require.Error(t, err)
+	assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	assert.Nil(t, resp)
+	assert.False(t, datasetHasDurableContentSource(clone), "retry must not infer or stamp provenance")
+	assert.Equal(t, snap.ID, datasetOriginSnapshotID(clone))
 }
 
 func TestCreateVolumeCloneReportsInheritedActualCapacity(t *testing.T) {

@@ -65,7 +65,6 @@ data:
       targetPortals:
         {{- toYaml .Values.iscsi.targetPortals | nindent 8 }}
       interface: "default"
-      namePrefix: {{ .Values.iscsi.namePrefix | quote }}
       {{- if .Values.iscsi.targetGroups }}
       # Explicit portal/initiator group IDs (install-specific TrueNAS database
       # ids). When omitted, the driver resolves them automatically from

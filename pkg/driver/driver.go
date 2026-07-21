@@ -452,9 +452,9 @@ func (d *Driver) GetConfig() *Config {
 // startSessionGC starts the periodic session garbage collection goroutine.
 // This runs only on the node plugin and cleans up orphaned iSCSI/NVMe-oF sessions.
 func (d *Driver) startSessionGC() {
-	if !d.config.SessionGC.Enabled {
-		klog.Info("Session GC disabled by configuration")
-		return
+	cleanupEnabled := d.config.SessionGC.Enabled
+	if !cleanupEnabled {
+		klog.Info("Session cleanup disabled by configuration; active-session metrics remain enabled")
 	}
 	intervalSeconds := d.config.SessionGC.Interval
 	if intervalSeconds <= 0 {
@@ -467,13 +467,13 @@ func (d *Driver) startSessionGC() {
 	startupDelay := time.Duration(d.config.SessionGC.StartupDelay) * time.Second
 
 	// Per-protocol GC settings (default to enabled if protocol is configured)
-	iscsiGCEnabled := d.config.ISCSI.TargetPortal != ""
+	iscsiGCEnabled := cleanupEnabled && d.config.ISCSI.TargetPortal != ""
 	if d.config.SessionGC.ISCSIEnabled != nil {
-		iscsiGCEnabled = *d.config.SessionGC.ISCSIEnabled && d.config.ISCSI.TargetPortal != ""
+		iscsiGCEnabled = cleanupEnabled && *d.config.SessionGC.ISCSIEnabled && d.config.ISCSI.TargetPortal != ""
 	}
-	nvmeofGCEnabled := d.config.NVMeoF.TransportAddress != ""
+	nvmeofGCEnabled := cleanupEnabled && d.config.NVMeoF.TransportAddress != ""
 	if d.config.SessionGC.NVMeoFEnabled != nil {
-		nvmeofGCEnabled = *d.config.SessionGC.NVMeoFEnabled && d.config.NVMeoF.TransportAddress != ""
+		nvmeofGCEnabled = cleanupEnabled && *d.config.SessionGC.NVMeoFEnabled && d.config.NVMeoF.TransportAddress != ""
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -482,8 +482,8 @@ func (d *Driver) startSessionGC() {
 	d.gcWg.Add(1)
 	go func() {
 		defer d.gcWg.Done()
-		klog.Infof("Session GC started: interval=%v, gracePeriod=%v, dryRun=%v, iSCSI=%v, NVMeoF=%v",
-			interval, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
+		klog.Infof("Session monitor started: interval=%v, cleanup=%v, gracePeriod=%v, dryRun=%v, iSCSI=%v, NVMeoF=%v",
+			interval, cleanupEnabled, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
 
 		// Short delay to let the system stabilize, then run startup GC
 		select {
@@ -496,9 +496,13 @@ func (d *Driver) startSessionGC() {
 		// Run GC immediately on startup to clean up stale sessions from node crashes
 		// This is proactive cleanup before the first interval tick
 		// RunOnStartup defaults to true via config loading
-		if d.config.SessionGC.RunOnStartup != nil && *d.config.SessionGC.RunOnStartup {
+		if cleanupEnabled && d.config.SessionGC.RunOnStartup != nil && *d.config.SessionGC.RunOnStartup {
 			klog.Info("Session GC: running proactive cleanup on startup")
 			d.runSessionGCWithProtocols(ctx, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
+		} else {
+			// Keep the session-count gauges current even when cleanup or startup
+			// cleanup is disabled. This path only performs read-only enumeration.
+			d.runSessionGCWithProtocols(ctx, gracePeriod, dryRun, false, false)
 		}
 
 		ticker := time.NewTicker(interval)
@@ -592,11 +596,6 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 
 	// Find orphaned sessions
 	portal := d.config.ISCSI.TargetPortal
-	targetPrefix := strings.ToLower(strings.TrimSpace(d.config.ISCSI.NamePrefix))
-	if targetPrefix == "" {
-		klog.Warning("Session GC: skipping iSCSI cleanup because iscsi.namePrefix is empty and session ownership cannot be established safely")
-		return
-	}
 	orphanedCount := 0
 	now := time.Now()
 
@@ -614,8 +613,8 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 			klog.V(5).Infof("Session GC: skipping session %s (different portal: %s)", session.IQN, session.Portal)
 			continue
 		}
-		if !iscsiSessionMatchesTargetPrefix(session.IQN, targetPrefix) {
-			klog.V(5).Infof("Session GC: skipping session %s (target does not match configured prefix %q)", session.IQN, targetPrefix)
+		if !d.isDriverISCSITarget(session.IQN) {
+			klog.V(5).Infof("Session GC: skipping session %s (target is not owned by this driver)", session.IQN)
 			continue
 		}
 
@@ -685,14 +684,6 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 	}
 }
 
-func iscsiSessionMatchesTargetPrefix(iqn, targetPrefix string) bool {
-	_, target, ok := strings.Cut(iqn, ":")
-	if !ok || target == "" || targetPrefix == "" {
-		return false
-	}
-	return strings.HasPrefix(strings.ToLower(target), strings.ToLower(targetPrefix))
-}
-
 // gcNVMeoFSessions garbage collects orphaned NVMe-oF sessions.
 // Sessions must be orphaned for at least gracePeriod before being disconnected.
 func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
@@ -733,8 +724,8 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 			return
 		}
 		// Only consider sessions for our target address
-		// Session address format from nvme list-subsys: "traddr=192.168.120.10,trsvcid=4420,src_addr=192.168.122.10"
-		// Config address format: "192.168.120.10"
+		// Session address format from nvme list-subsys: "traddr=192.0.2.10,trsvcid=4420,src_addr=203.0.113.10"
+		// Config address format: "192.0.2.10"
 		if !nvmeSessionMatchesTransportAddress(session.Address, targetAddr) {
 			klog.V(5).Infof("Session GC: skipping session %s (different address: %s, target: %s)", session.NQN, session.Address, targetAddr)
 			continue

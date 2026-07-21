@@ -39,9 +39,9 @@ func TestExpectedSessionsIncludeStagedBlockSymlinks(t *testing.T) {
 		getISCSIInfoFromDevice = func(device string) (string, string, error) {
 			switch device {
 			case "/dev/sda":
-				return "10.0.0.1:3260", "iqn.test:mounted", nil
+				return "198.51.100.1:3260", "iqn.test:mounted", nil
 			case "/dev/sdb":
-				return "10.0.0.1:3260", "iqn.test:block", nil
+				return "198.51.100.1:3260", "iqn.test:block", nil
 			default:
 				return "", "", errors.New("not iSCSI")
 			}
@@ -99,20 +99,20 @@ func TestNVMeSessionMatchesTransportAddress(t *testing.T) {
 	}{
 		{
 			name:           "exact traddr",
-			sessionAddress: "traddr=192.168.120.10,trsvcid=4420,src_addr=192.168.122.10",
-			targetAddress:  "192.168.120.10",
+			sessionAddress: "traddr=192.0.2.10,trsvcid=4420,src_addr=203.0.113.10",
+			targetAddress:  "192.0.2.10",
 			want:           true,
 		},
 		{
 			name:           "prefix overlap",
-			sessionAddress: "traddr=192.168.120.100,trsvcid=4420",
-			targetAddress:  "192.168.120.10",
+			sessionAddress: "traddr=192.0.2.100,trsvcid=4420",
+			targetAddress:  "192.0.2.10",
 			want:           false,
 		},
 		{
 			name:           "source address collision",
-			sessionAddress: "traddr=10.0.0.20,trsvcid=4420,src_addr=192.168.120.10",
-			targetAddress:  "192.168.120.10",
+			sessionAddress: "traddr=198.51.100.20,trsvcid=4420,src_addr=192.0.2.10",
+			targetAddress:  "192.0.2.10",
 			want:           false,
 		},
 	}
@@ -144,10 +144,14 @@ func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
 
 	t.Run("iSCSI", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		d := &Driver{config: &Config{ISCSI: ISCSIConfig{TargetPortal: "192.0.2.10:3260", NamePrefix: "csi-"}}}
+		d := &Driver{config: &Config{ISCSI: ISCSIConfig{TargetPortal: "192.0.2.10:3260"}}}
+		volumeIDs := []string{
+			"pvc-11111111-2222-4333-8444-555555555555",
+			"pvc-66666666-7777-4888-8999-aaaaaaaaaaaa",
+		}
 		sessions := []util.ISCSISessionInfo{
-			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.test:csi-one"},
-			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.test:csi-two"},
+			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeIDs[0])},
+			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeIDs[1])},
 		}
 		for _, session := range sessions {
 			d.orphanedISCSISessionsSeen.Store(session.IQN, time.Now().Add(-time.Hour))
@@ -226,7 +230,7 @@ func TestISCSIGCPreservesNVMeOrphanFirstSeen(t *testing.T) {
 
 	const orphanNQN = "nqn.2014-08.org.nvmexpress:csi-orphan"
 	d := &Driver{config: &Config{
-		ISCSI:  ISCSIConfig{TargetPortal: "192.0.2.10:3260", NamePrefix: "csi-"},
+		ISCSI:  ISCSIConfig{TargetPortal: "192.0.2.10:3260"},
 		NVMeoF: NVMeoFConfig{TransportAddress: "192.0.2.20"},
 	}}
 	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) {
@@ -238,7 +242,8 @@ func TestISCSIGCPreservesNVMeOrphanFirstSeen(t *testing.T) {
 	firstSeen := firstSeenValue.(time.Time)
 
 	gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) {
-		return []util.ISCSISessionInfo{{IQN: "iqn.2005-10.org.freenas.ctl:csi-other", Portal: "192.0.2.10:3260"}}, nil
+		volumeID := "pvc-11111111-2222-4333-8444-555555555555"
+		return []util.ISCSISessionInfo{{IQN: "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeID), Portal: "192.0.2.10:3260"}}, nil
 	}
 	d.gcISCSISessions(context.Background(), time.Hour, true)
 
@@ -247,7 +252,7 @@ func TestISCSIGCPreservesNVMeOrphanFirstSeen(t *testing.T) {
 	assert.Equal(t, firstSeen, afterISCSIValue.(time.Time))
 }
 
-func TestISCSIGCRestrictsCleanupToConfiguredTargetPrefix(t *testing.T) {
+func TestISCSIGCRestrictsCleanupToDriverTargetShape(t *testing.T) {
 	originalMounted := getMountedBlockDevices
 	originalStaged := getStagedBlockDevices
 	originalListISCSI := gcListISCSISessions
@@ -261,33 +266,76 @@ func TestISCSIGCRestrictsCleanupToConfiguredTargetPrefix(t *testing.T) {
 	getMountedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
 	getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
 	portal := "192.0.2.10:3260"
-	d := &Driver{config: &Config{ISCSI: ISCSIConfig{TargetPortal: portal, NamePrefix: "csi-"}}}
-	owned := "iqn.2005-10.org.freenas.ctl:csi-owned"
-	foreign := "iqn.2005-10.org.freenas.ctl:database"
+
+	for _, tc := range []struct {
+		name       string
+		nameSuffix string
+	}{
+		{name: "default naming"},
+		{name: "configured suffix transformation", nameSuffix: "-Cluster_Name!"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Driver{config: &Config{ISCSI: ISCSIConfig{TargetPortal: portal, NameSuffix: tc.nameSuffix}}}
+			volumeID := "pvc-11111111-2222-4333-8444-555555555555"
+			owned := "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeID)
+			foreign := "iqn.2005-10.org.freenas.ctl:database"
+			gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) {
+				return []util.ISCSISessionInfo{{Portal: portal, IQN: owned}, {Portal: portal, IQN: foreign}}, nil
+			}
+			d.orphanedISCSISessionsSeen.Store(owned, time.Now().Add(-time.Hour))
+			d.orphanedISCSISessionsSeen.Store(foreign, time.Now().Add(-time.Hour))
+			var disconnected []string
+			gcDisconnectISCSI = func(_ string, iqn string) error {
+				disconnected = append(disconnected, iqn)
+				return nil
+			}
+
+			d.gcISCSISessions(context.Background(), 0, false)
+
+			assert.Equal(t, []string{owned}, disconnected)
+			_, foreignTracked := d.orphanedISCSISessionsSeen.Load(foreign)
+			assert.False(t, foreignTracked, "foreign sessions must not remain in this driver's ownership map")
+		})
+	}
+}
+
+func TestStartSessionGCRefreshesMetricsWhenCleanupDisabled(t *testing.T) {
+	originalListISCSI := gcListISCSISessions
+	originalListNVMe := gcListNVMeoFSessions
+	t.Cleanup(func() {
+		gcListISCSISessions = originalListISCSI
+		gcListNVMeoFSessions = originalListNVMe
+	})
+	observed := make(chan string, 2)
 	gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) {
-		return []util.ISCSISessionInfo{{Portal: portal, IQN: owned}, {Portal: portal, IQN: foreign}}, nil
+		observed <- "iscsi"
+		return nil, nil
 	}
-	d.orphanedISCSISessionsSeen.Store(owned, time.Now().Add(-time.Hour))
-	d.orphanedISCSISessionsSeen.Store(foreign, time.Now().Add(-time.Hour))
-	var disconnected []string
-	gcDisconnectISCSI = func(_ string, iqn string) error {
-		disconnected = append(disconnected, iqn)
-		return nil
+	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) {
+		observed <- "nvmeof"
+		return nil, nil
 	}
 
-	d.gcISCSISessions(context.Background(), 0, false)
+	d := &Driver{config: &Config{SessionGC: SessionGCConfig{Enabled: false, Interval: 3600}}}
+	d.startSessionGC()
+	require.NotNil(t, d.gcCancel)
+	t.Cleanup(d.stopSessionGC)
 
-	assert.Equal(t, []string{owned}, disconnected)
-	_, foreignTracked := d.orphanedISCSISessionsSeen.Load(foreign)
-	assert.False(t, foreignTracked, "foreign sessions must not remain in this driver's ownership map")
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case protocol := <-observed:
+			seen[protocol] = true
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for disabled-GC session metrics refresh")
+		}
+	}
+	assert.True(t, seen["iscsi"])
+	assert.True(t, seen["nvmeof"])
 }
 
 func TestStartSessionGCHonorsEnabled(t *testing.T) {
 	falseValue := false
-	disabled := &Driver{config: &Config{SessionGC: SessionGCConfig{Enabled: false, Interval: 1}}}
-	disabled.startSessionGC()
-	assert.Nil(t, disabled.gcCancel)
-
 	enabled := &Driver{config: &Config{SessionGC: SessionGCConfig{
 		Enabled:      true,
 		Interval:     0,
@@ -342,7 +390,7 @@ func TestSessionGC_OrphanedSessionTracking(t *testing.T) {
 				DryRun:      true,
 			},
 			NVMeoF: NVMeoFConfig{
-				TransportAddress: "192.168.1.100",
+				TransportAddress: "192.0.2.100",
 			},
 		},
 		truenasClient: truenas.NewMockClient(),
@@ -499,10 +547,10 @@ func TestSessionGC_ProtocolEnabling(t *testing.T) {
 				NVMeoFEnabled: &falseVal,
 			},
 			ISCSI: ISCSIConfig{
-				TargetPortal: "192.168.1.100:3260",
+				TargetPortal: "192.0.2.100:3260",
 			},
 			NVMeoF: NVMeoFConfig{
-				TransportAddress: "192.168.1.100",
+				TransportAddress: "192.0.2.100",
 			},
 		}
 
@@ -532,7 +580,7 @@ func TestSessionGC_ProtocolEnabling(t *testing.T) {
 				TargetPortal: "", // Not configured
 			},
 			NVMeoF: NVMeoFConfig{
-				TransportAddress: "192.168.1.100", // Configured
+				TransportAddress: "192.0.2.100", // Configured
 			},
 		}
 

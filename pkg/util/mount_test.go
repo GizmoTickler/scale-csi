@@ -347,12 +347,12 @@ func TestMountNFSOptions(t *testing.T) {
 	}{
 		{
 			name:        "NFS with default options only",
-			source:      "192.168.1.100:/exports/data",
+			source:      "192.0.2.100:/exports/data",
 			target:      "/mnt/nfs",
 			userOptions: nil,
 			wantContains: []string{
 				"-t", "nfs", "-o", "nfsvers=4",
-				"192.168.1.100:/exports/data", "/mnt/nfs",
+				"192.0.2.100:/exports/data", "/mnt/nfs",
 			},
 		},
 		{
@@ -367,7 +367,7 @@ func TestMountNFSOptions(t *testing.T) {
 		},
 		{
 			name:        "NFS with noatime option",
-			source:      "10.0.0.50:/volume",
+			source:      "198.51.100.50:/volume",
 			target:      "/data",
 			userOptions: []string{"noatime"},
 			wantContains: []string{
@@ -1033,7 +1033,7 @@ func TestIsMountedOutputParsing(t *testing.T) {
 		},
 		{
 			name:       "mounted NFS",
-			output:     "192.168.1.100:/exports/share /mnt/nfs nfs4 rw,relatime",
+			output:     "192.0.2.100:/exports/share /mnt/nfs nfs4 rw,relatime",
 			wantResult: true,
 		},
 	}

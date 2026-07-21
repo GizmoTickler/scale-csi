@@ -483,10 +483,6 @@
             "type": "string"
           }
         },
-        "namePrefix": {
-          "type": "string",
-          "description": "Existing iSCSI target-name prefix used to scope node session garbage collection"
-        },
         "extentBlocksize": {
           "type": "integer",
           "minimum": 1

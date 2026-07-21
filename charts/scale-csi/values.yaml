@@ -216,12 +216,6 @@ iscsi:
   # entries produces a startup warning and only portal is used.
   targetPortals: []
 
-  # Existing target-name prefix used to scope node-side iSCSI session GC.
-  # For compatibility this value is not prepended to newly created targets;
-  # set it to a stable prefix already shared by this driver's target names.
-  # The IQN basename is configured globally on TrueNAS.
-  namePrefix: ""
-
   # Explicit TrueNAS portal/initiator group associations for created targets
   # (install-specific database IDs). Leave empty to let the driver resolve
   # them automatically: it matches the portal listening on `portal` and picks

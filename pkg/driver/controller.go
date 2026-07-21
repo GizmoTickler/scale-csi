@@ -375,8 +375,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 		storedContentSource := volumeContentSourceFromDataset(existingDS)
 		requestedContentSource := req.GetVolumeContentSource()
-		if datasetHasDurableContentSource(existingDS) &&
-			(storedContentSource == nil || !volumeContentSourcesEqual(storedContentSource, requestedContentSource)) {
+		storedSourceIsDurable := datasetHasDurableContentSource(existingDS)
+		if (storedSourceIsDurable && storedContentSource == nil) ||
+			(storedContentSource == nil) != (requestedContentSource == nil) ||
+			(storedContentSource != nil && !volumeContentSourcesEqual(storedContentSource, requestedContentSource)) {
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s already exists with content source %s, incompatible with requested %s",
 				volumeID, describeDatasetContentSource(existingDS), describeVolumeContentSource(requestedContentSource))
@@ -415,33 +417,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if datasetUserProperty(existingDS, PropCSIVolumeName) != name {
 			propertyUpdates[PropCSIVolumeName] = name
 		}
-		if contentSource := req.GetVolumeContentSource(); contentSource != nil {
-			switch {
-			case contentSource.GetSnapshot() != nil:
-				snapshotID := contentSource.GetSnapshot().GetSnapshotId()
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceType); d.config.ZFS.DetachedVolumesFromSnapshots || value == "" || value == "-" {
-					propertyUpdates[PropVolumeContentSourceType] = "snapshot"
-				}
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceID); d.config.ZFS.DetachedVolumesFromSnapshots || value == "" || value == "-" {
-					propertyUpdates[PropVolumeContentSourceID] = snapshotID
-				}
-			case contentSource.GetVolume() != nil:
-				sourceVolumeID := contentSource.GetVolume().GetVolumeId()
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceType); value == "" || value == "-" {
-					propertyUpdates[PropVolumeContentSourceType] = "volume"
-				}
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceID); value == "" || value == "-" {
-					propertyUpdates[PropVolumeContentSourceID] = sourceVolumeID
-				}
-				if datasetUserProperty(existingDS, PropVolumeOriginSnapshot) == "" ||
-					datasetUserProperty(existingDS, PropVolumeOriginSnapshot) == "-" {
-					originSnapshotID := datasetOriginSnapshotID(existingDS)
-					if originSnapshotID != "" {
-						propertyUpdates[PropVolumeOriginSnapshot] = originSnapshotID
-					}
-				}
-			}
-		}
 		if d.config.ZFS.DetachedVolumesFromSnapshots &&
 			req.GetVolumeContentSource().GetSnapshot() != nil &&
 			shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
@@ -466,15 +441,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if ctxErr != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
 		}
-		contentSource := volumeContentSourceFromDataset(existingDS)
-		if contentSource == nil {
-			contentSource = req.GetVolumeContentSource()
-		}
 		volume := &csi.Volume{
 			VolumeId:           volumeID,
 			CapacityBytes:      d.getDatasetCapacity(existingDS),
 			VolumeContext:      volumeContext,
-			ContentSource:      contentSource,
+			ContentSource:      storedContentSource,
 			AccessibleTopology: d.getAccessibleTopology(),
 		}
 		return &csi.CreateVolumeResponse{Volume: volume}, nil
@@ -616,6 +587,9 @@ func datasetHasDurableContentSource(ds *truenas.Dataset) bool {
 func describeDatasetContentSource(ds *truenas.Dataset) string {
 	if source := volumeContentSourceFromDataset(ds); source != nil {
 		return describeVolumeContentSource(source)
+	}
+	if !datasetHasDurableContentSource(ds) {
+		return "none"
 	}
 	return fmt.Sprintf("invalid(type=%q,id=%q)",
 		datasetUserProperty(ds, PropVolumeContentSourceType),

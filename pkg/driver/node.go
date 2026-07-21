@@ -1265,14 +1265,6 @@ func sessionTargetMatchesExpected(actual, expected string) bool {
 	return actual == expected || strings.HasSuffix(actual, ":"+expected)
 }
 
-func (d *Driver) iscsiShareName(volumeID string) string {
-	// NamePrefix was historically accepted by configuration but not applied to
-	// target names. Keep existing target identity stable for installations that
-	// set it, while using the prefix solely as the explicit session-GC ownership
-	// boundary.
-	return protocolShareName(volumeID + d.config.ISCSI.NameSuffix)
-}
-
 func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capacityBytes int64) (int64, error) {
 	deadline := time.Now().Add(nodeDeviceSizePollTimeout)
 	var lastSize int64

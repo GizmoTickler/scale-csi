@@ -305,13 +305,13 @@ func createTestDriver(t *testing.T, protocol string) (*Driver, *truenas.MockClie
 			DatasetParentName: "tank/k8s/volumes",
 		},
 		NFS: NFSConfig{
-			ShareHost: "192.168.1.100",
+			ShareHost: "192.0.2.100",
 		},
 		ISCSI: ISCSIConfig{
-			TargetPortal: "192.168.1.100:3260",
+			TargetPortal: "192.0.2.100:3260",
 		},
 		NVMeoF: NVMeoFConfig{
-			TransportAddress:      "192.168.1.100",
+			TransportAddress:      "192.0.2.100",
 			SubsystemAllowAnyHost: true,
 		},
 	}
