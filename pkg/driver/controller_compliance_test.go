@@ -617,12 +617,27 @@ func TestCreateVolumeFromSnapshotDetachedGate(t *testing.T) {
 				assert.Equal(t, "-", datasetUserProperty(target, PropVolumeOriginSnapshot))
 				assert.Equal(t, "2147483648", datasetUserProperty(target, PropRequestedSizeBytes))
 
-				// Simulate a retry after inherited identity leaked back onto the target.
+				// A durable content-source mismatch is not safe to repair or infer:
+				// CreateVolume must reject it without mutating the stored identity.
 				require.NoError(t, client.DatasetSetUserProperties(ctx, target.Name, map[string]string{
 					PropCSIVolumeName:           "wrong-name",
 					PropVolumeContentSourceType: "volume",
 					PropVolumeContentSourceID:   "wrong-source",
 					PropRequestedSizeBytes:      "1",
+				}))
+				_, retryErr := driver.CreateVolume(ctx, request)
+				require.Error(t, retryErr)
+				assert.Equal(t, codes.AlreadyExists, status.Code(retryErr))
+				target, err = client.DatasetGet(ctx, target.Name)
+				require.NoError(t, err)
+				assert.Equal(t, "volume", datasetUserProperty(target, PropVolumeContentSourceType))
+				assert.Equal(t, "wrong-source", datasetUserProperty(target, PropVolumeContentSourceID))
+
+				// With a compatible durable source, retry remains idempotent and may
+				// normalize other stale CSI bookkeeping properties.
+				require.NoError(t, client.DatasetSetUserProperties(ctx, target.Name, map[string]string{
+					PropVolumeContentSourceType: "snapshot",
+					PropVolumeContentSourceID:   "restore-point",
 				}))
 				retry, retryErr := driver.CreateVolume(ctx, request)
 				require.NoError(t, retryErr)
@@ -732,6 +747,13 @@ func TestCreateVolumeDetachedSnapshotExistingCopyClearsInheritedShareIdentity(t 
 	require.NoError(t, client.CopyDatasetFromSnapshotLocal(
 		ctx, source.Name, snapshot.Name, "pool/parent/existing-copy",
 	))
+	// A retry may resume only when the existing copy already has the durable
+	// provenance written by the original request. CreateVolume must never infer
+	// these properties from a later source-bearing request.
+	require.NoError(t, client.DatasetSetUserProperties(ctx, "pool/parent/existing-copy", map[string]string{
+		PropVolumeContentSourceType: "snapshot",
+		PropVolumeContentSourceID:   snapshot.Name,
+	}))
 	transferredSnapshot, err := client.SnapshotCreate(ctx, "pool/parent/existing-copy", snapshot.Name, nil)
 	require.NoError(t, err)
 

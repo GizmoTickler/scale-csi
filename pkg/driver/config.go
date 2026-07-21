@@ -2,12 +2,18 @@
 package driver
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
 	"gopkg.in/yaml.v3"
+	"k8s.io/klog/v2"
 )
+
+var configWarningf = klog.Warningf
 
 // Config holds the driver configuration loaded from YAML.
 type Config struct {
@@ -160,9 +166,6 @@ type ISCSIConfig struct {
 
 	// Interface is the iSCSI interface to use (default: "default")
 	Interface string `yaml:"interface"`
-
-	// NamePrefix is a prefix for iSCSI target/extent names
-	NamePrefix string `yaml:"namePrefix"`
 
 	// NameSuffix is a suffix for iSCSI target/extent names
 	NameSuffix string `yaml:"nameSuffix"`
@@ -412,6 +415,36 @@ type CommandTimeoutConfig struct {
 	NVMe int `yaml:"nvme"`
 }
 
+func yamlPathExists(document *yaml.Node, path ...string) bool {
+	if document == nil || len(path) == 0 {
+		return false
+	}
+	node := document
+	if node.Kind == yaml.DocumentNode {
+		if len(node.Content) == 0 {
+			return false
+		}
+		node = node.Content[0]
+	}
+	for _, key := range path {
+		if node.Kind != yaml.MappingNode {
+			return false
+		}
+		var next *yaml.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == key {
+				next = node.Content[i+1]
+				break
+			}
+		}
+		if next == nil {
+			return false
+		}
+		node = next
+	}
+	return true
+}
+
 // LoadConfig loads configuration from a YAML file.
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -425,7 +458,8 @@ func LoadConfig(path string) (*Config, error) {
 	// Defaults must be applied before unmarshalling so an explicit YAML false
 	// still overrides the default.
 	cfg := &Config{
-		ZFS: ZFSConfig{DatasetEnableQuotas: true},
+		ZFS:       ZFSConfig{DatasetEnableQuotas: true},
+		SessionGC: SessionGCConfig{Enabled: true},
 		Reconcile: ReconcileConfig{
 			Enabled:      true,
 			Interval:     "1h",
@@ -436,8 +470,17 @@ func LoadConfig(path string) (*Config, error) {
 			},
 		},
 	}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	var extraDocument yaml.Node
+	if err := decoder.Decode(&extraDocument); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse config file: %w", err)
+		}
+		return nil, fmt.Errorf("failed to parse config file: multiple YAML documents are not supported")
 	}
 	if err := validateNonNegativeConfig(cfg); err != nil {
 		return nil, err
@@ -445,28 +488,21 @@ func LoadConfig(path string) (*Config, error) {
 
 	// Protocol blocks historically did not contain an explicit enabled field.
 	// Preserve those config files while allowing an explicitly disabled block.
-	var protocolPresence struct {
-		NFS *struct {
-			Enabled *bool `yaml:"enabled"`
-		} `yaml:"nfs"`
-		ISCSI *struct {
-			Enabled *bool `yaml:"enabled"`
-		} `yaml:"iscsi"`
-		NVMeoF *struct {
-			Enabled *bool `yaml:"enabled"`
-		} `yaml:"nvmeof"`
+	var configDocument yaml.Node
+	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&configDocument); err != nil {
+		return nil, fmt.Errorf("failed to inspect protocol configuration: %w", err)
 	}
-	if err := yaml.Unmarshal(data, &protocolPresence); err != nil {
-		return nil, fmt.Errorf("failed to parse protocol configuration: %w", err)
-	}
-	if protocolPresence.NFS != nil && protocolPresence.NFS.Enabled == nil {
+	if yamlPathExists(&configDocument, "nfs") && !yamlPathExists(&configDocument, "nfs", "enabled") {
 		cfg.NFS.Enabled = true
 	}
-	if protocolPresence.ISCSI != nil && protocolPresence.ISCSI.Enabled == nil {
+	if yamlPathExists(&configDocument, "iscsi") && !yamlPathExists(&configDocument, "iscsi", "enabled") {
 		cfg.ISCSI.Enabled = true
 	}
-	if protocolPresence.NVMeoF != nil && protocolPresence.NVMeoF.Enabled == nil {
+	if yamlPathExists(&configDocument, "nvmeof") && !yamlPathExists(&configDocument, "nvmeof", "enabled") {
 		cfg.NVMeoF.Enabled = true
+	}
+	if len(cfg.ISCSI.TargetPortals) > 0 {
+		configWarningf("iscsi.targetPortals is configured with %d additional portal(s), but scale-csi does not currently support iSCSI multipath; only iscsi.targetPortal will be used", len(cfg.ISCSI.TargetPortals))
 	}
 
 	// Set defaults
@@ -547,10 +583,10 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("reconcile.minOrphanAge must be a positive duration")
 	}
 
-	// Session GC defaults - enabled by default with 5 minute interval
-	// Note: Enabled defaults to false from YAML unmarshaling, we set true explicitly
-	// Users can disable by setting sessionGC.enabled: false
-	if cfg.SessionGC.Interval == 0 {
+	// Session GC defaults to enabled. An explicit enabled=false remains
+	// authoritative regardless of interval; enabled=true with no interval uses
+	// the five-minute default.
+	if cfg.SessionGC.Enabled && cfg.SessionGC.Interval <= 0 {
 		cfg.SessionGC.Interval = 300 // 5 minutes
 	}
 	if cfg.SessionGC.GracePeriod == 0 {
@@ -635,9 +671,6 @@ func LoadConfig(path string) (*Config, error) {
 	// Validate required fields
 	if cfg.TrueNAS.Host == "" {
 		return nil, fmt.Errorf("truenas.host is required")
-	}
-	if cfg.TrueNAS.APIKey == "" {
-		return nil, fmt.Errorf("truenas.apiKey is required")
 	}
 	if cfg.ZFS.DatasetParentName == "" {
 		return nil, fmt.Errorf("zfs.datasetParentName is required")

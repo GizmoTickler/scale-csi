@@ -39,9 +39,9 @@ func TestExpectedSessionsIncludeStagedBlockSymlinks(t *testing.T) {
 		getISCSIInfoFromDevice = func(device string) (string, string, error) {
 			switch device {
 			case "/dev/sda":
-				return "10.0.0.1:3260", "iqn.test:mounted", nil
+				return "198.51.100.1:3260", "iqn.test:mounted", nil
 			case "/dev/sdb":
-				return "10.0.0.1:3260", "iqn.test:block", nil
+				return "198.51.100.1:3260", "iqn.test:block", nil
 			default:
 				return "", "", errors.New("not iSCSI")
 			}
@@ -99,20 +99,20 @@ func TestNVMeSessionMatchesTransportAddress(t *testing.T) {
 	}{
 		{
 			name:           "exact traddr",
-			sessionAddress: "traddr=192.168.120.10,trsvcid=4420,src_addr=192.168.122.10",
-			targetAddress:  "192.168.120.10",
+			sessionAddress: "traddr=192.0.2.10,trsvcid=4420,src_addr=203.0.113.10",
+			targetAddress:  "192.0.2.10",
 			want:           true,
 		},
 		{
 			name:           "prefix overlap",
-			sessionAddress: "traddr=192.168.120.100,trsvcid=4420",
-			targetAddress:  "192.168.120.10",
+			sessionAddress: "traddr=192.0.2.100,trsvcid=4420",
+			targetAddress:  "192.0.2.10",
 			want:           false,
 		},
 		{
 			name:           "source address collision",
-			sessionAddress: "traddr=10.0.0.20,trsvcid=4420,src_addr=192.168.120.10",
-			targetAddress:  "192.168.120.10",
+			sessionAddress: "traddr=198.51.100.20,trsvcid=4420,src_addr=192.0.2.10",
+			targetAddress:  "192.0.2.10",
 			want:           false,
 		},
 	}
@@ -145,12 +145,16 @@ func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
 	t.Run("iSCSI", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		d := &Driver{config: &Config{ISCSI: ISCSIConfig{TargetPortal: "192.0.2.10:3260"}}}
+		volumeIDs := []string{
+			"pvc-11111111-2222-4333-8444-555555555555",
+			"pvc-66666666-7777-4888-8999-aaaaaaaaaaaa",
+		}
 		sessions := []util.ISCSISessionInfo{
-			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.test:one"},
-			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.test:two"},
+			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeIDs[0])},
+			{Portal: d.config.ISCSI.TargetPortal, IQN: "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeIDs[1])},
 		}
 		for _, session := range sessions {
-			d.orphanedSessionsSeen.Store(session.IQN, time.Now().Add(-time.Hour))
+			d.orphanedISCSISessionsSeen.Store(session.IQN, time.Now().Add(-time.Hour))
 		}
 		gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) { return sessions, nil }
 		disconnects := 0
@@ -174,7 +178,7 @@ func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
 			{NQN: "nqn.test:two", Address: "traddr=192.0.2.20,trsvcid=4420"},
 		}
 		for _, session := range sessions {
-			d.orphanedSessionsSeen.Store(session.NQN, time.Now().Add(-time.Hour))
+			d.orphanedNVMeSessionsSeen.Store(session.NQN, time.Now().Add(-time.Hour))
 		}
 		gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) { return sessions, nil }
 		disconnects := 0
@@ -208,6 +212,138 @@ func TestSessionGaugesRefreshWhenCleanupDisabled(t *testing.T) {
 
 	assert.Zero(t, testutil.ToFloat64(iscsiSessionsTotal))
 	assert.Zero(t, testutil.ToFloat64(nvmeSessionsTotal))
+}
+
+func TestISCSIGCPreservesNVMeOrphanFirstSeen(t *testing.T) {
+	originalMounted := getMountedBlockDevices
+	originalStaged := getStagedBlockDevices
+	originalListISCSI := gcListISCSISessions
+	originalListNVMe := gcListNVMeoFSessions
+	t.Cleanup(func() {
+		getMountedBlockDevices = originalMounted
+		getStagedBlockDevices = originalStaged
+		gcListISCSISessions = originalListISCSI
+		gcListNVMeoFSessions = originalListNVMe
+	})
+	getMountedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+	getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+
+	const orphanNQN = "nqn.2014-08.org.nvmexpress:csi-orphan"
+	d := &Driver{config: &Config{
+		ISCSI:  ISCSIConfig{TargetPortal: "192.0.2.10:3260"},
+		NVMeoF: NVMeoFConfig{TransportAddress: "192.0.2.20"},
+	}}
+	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) {
+		return []util.NVMeoFSessionInfo{{NQN: orphanNQN, Address: "traddr=192.0.2.20,trsvcid=4420"}}, nil
+	}
+	d.gcNVMeoFSessions(context.Background(), time.Hour, true)
+	firstSeenValue, ok := d.orphanedNVMeSessionsSeen.Load(orphanNQN)
+	require.True(t, ok)
+	firstSeen := firstSeenValue.(time.Time)
+
+	gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) {
+		volumeID := "pvc-11111111-2222-4333-8444-555555555555"
+		return []util.ISCSISessionInfo{{IQN: "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeID), Portal: "192.0.2.10:3260"}}, nil
+	}
+	d.gcISCSISessions(context.Background(), time.Hour, true)
+
+	afterISCSIValue, ok := d.orphanedNVMeSessionsSeen.Load(orphanNQN)
+	require.True(t, ok, "iSCSI cleanup must not delete NVMe grace-period state")
+	assert.Equal(t, firstSeen, afterISCSIValue.(time.Time))
+}
+
+func TestISCSIGCRestrictsCleanupToDriverTargetShape(t *testing.T) {
+	originalMounted := getMountedBlockDevices
+	originalStaged := getStagedBlockDevices
+	originalListISCSI := gcListISCSISessions
+	originalDisconnectISCSI := gcDisconnectISCSI
+	t.Cleanup(func() {
+		getMountedBlockDevices = originalMounted
+		getStagedBlockDevices = originalStaged
+		gcListISCSISessions = originalListISCSI
+		gcDisconnectISCSI = originalDisconnectISCSI
+	})
+	getMountedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+	getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+	portal := "192.0.2.10:3260"
+
+	for _, tc := range []struct {
+		name       string
+		nameSuffix string
+	}{
+		{name: "default naming"},
+		{name: "configured suffix transformation", nameSuffix: "-Cluster_Name!"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Driver{config: &Config{ISCSI: ISCSIConfig{TargetPortal: portal, NameSuffix: tc.nameSuffix}}}
+			volumeID := "pvc-11111111-2222-4333-8444-555555555555"
+			owned := "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeID)
+			foreign := "iqn.2005-10.org.freenas.ctl:database"
+			gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) {
+				return []util.ISCSISessionInfo{{Portal: portal, IQN: owned}, {Portal: portal, IQN: foreign}}, nil
+			}
+			d.orphanedISCSISessionsSeen.Store(owned, time.Now().Add(-time.Hour))
+			d.orphanedISCSISessionsSeen.Store(foreign, time.Now().Add(-time.Hour))
+			var disconnected []string
+			gcDisconnectISCSI = func(_ string, iqn string) error {
+				disconnected = append(disconnected, iqn)
+				return nil
+			}
+
+			d.gcISCSISessions(context.Background(), 0, false)
+
+			assert.Equal(t, []string{owned}, disconnected)
+			_, foreignTracked := d.orphanedISCSISessionsSeen.Load(foreign)
+			assert.False(t, foreignTracked, "foreign sessions must not remain in this driver's ownership map")
+		})
+	}
+}
+
+func TestStartSessionGCRefreshesMetricsWhenCleanupDisabled(t *testing.T) {
+	originalListISCSI := gcListISCSISessions
+	originalListNVMe := gcListNVMeoFSessions
+	t.Cleanup(func() {
+		gcListISCSISessions = originalListISCSI
+		gcListNVMeoFSessions = originalListNVMe
+	})
+	observed := make(chan string, 2)
+	gcListISCSISessions = func() ([]util.ISCSISessionInfo, error) {
+		observed <- "iscsi"
+		return nil, nil
+	}
+	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) {
+		observed <- "nvmeof"
+		return nil, nil
+	}
+
+	d := &Driver{config: &Config{SessionGC: SessionGCConfig{Enabled: false, Interval: 3600}}}
+	d.startSessionGC()
+	require.NotNil(t, d.gcCancel)
+	t.Cleanup(d.stopSessionGC)
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case protocol := <-observed:
+			seen[protocol] = true
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for disabled-GC session metrics refresh")
+		}
+	}
+	assert.True(t, seen["iscsi"])
+	assert.True(t, seen["nvmeof"])
+}
+
+func TestStartSessionGCHonorsEnabled(t *testing.T) {
+	falseValue := false
+	enabled := &Driver{config: &Config{SessionGC: SessionGCConfig{
+		Enabled:      true,
+		Interval:     0,
+		RunOnStartup: &falseValue,
+	}}}
+	enabled.startSessionGC()
+	require.NotNil(t, enabled.gcCancel)
+	enabled.stopSessionGC()
 }
 
 // TestGetExpectedNVMeoFNQNs_FailedLookupsThreshold tests that getExpectedNVMeoFNQNs
@@ -246,7 +382,6 @@ func TestGetExpectedNVMeoFNQNs_FailedLookupsThreshold(t *testing.T) {
 // TestSessionGC_OrphanedSessionTracking tests the grace period mechanism
 // for orphaned session tracking.
 func TestSessionGC_OrphanedSessionTracking(t *testing.T) {
-	// Create a driver with orphanedSessionsSeen map
 	d := &Driver{
 		config: &Config{
 			SessionGC: SessionGCConfig{
@@ -255,7 +390,7 @@ func TestSessionGC_OrphanedSessionTracking(t *testing.T) {
 				DryRun:      true,
 			},
 			NVMeoF: NVMeoFConfig{
-				TransportAddress: "192.168.1.100",
+				TransportAddress: "192.0.2.100",
 			},
 		},
 		truenasClient: truenas.NewMockClient(),
@@ -267,15 +402,15 @@ func TestSessionGC_OrphanedSessionTracking(t *testing.T) {
 		nqn := "nqn.2014-08.org.nvmexpress:uuid:test-1"
 
 		// First time seeing an orphaned session
-		_, loaded := d.orphanedSessionsSeen.LoadOrStore(nqn, now)
+		_, loaded := d.orphanedNVMeSessionsSeen.LoadOrStore(nqn, now)
 		assert.False(t, loaded, "First store should not find existing value")
 
 		// Second time seeing the same session
-		_, loaded = d.orphanedSessionsSeen.LoadOrStore(nqn, now)
+		_, loaded = d.orphanedNVMeSessionsSeen.LoadOrStore(nqn, now)
 		assert.True(t, loaded, "Second store should find existing value")
 
 		// Cleanup
-		d.orphanedSessionsSeen.Delete(nqn)
+		d.orphanedNVMeSessionsSeen.Delete(nqn)
 	})
 
 	t.Run("Grace period calculation", func(t *testing.T) {
@@ -283,10 +418,10 @@ func TestSessionGC_OrphanedSessionTracking(t *testing.T) {
 		gracePeriod := 60 * time.Second
 
 		firstSeen := now.Add(-30 * time.Second) // 30 seconds ago
-		d.orphanedSessionsSeen.Store(nqn, firstSeen)
+		d.orphanedNVMeSessionsSeen.Store(nqn, firstSeen)
 
 		// Load the value
-		val, ok := d.orphanedSessionsSeen.Load(nqn)
+		val, ok := d.orphanedNVMeSessionsSeen.Load(nqn)
 		assert.True(t, ok)
 
 		orphanedDuration := now.Sub(val.(time.Time))
@@ -295,38 +430,33 @@ func TestSessionGC_OrphanedSessionTracking(t *testing.T) {
 
 		// Now test with session first seen 90 seconds ago (beyond grace period)
 		firstSeen = now.Add(-90 * time.Second)
-		d.orphanedSessionsSeen.Store(nqn, firstSeen)
+		d.orphanedNVMeSessionsSeen.Store(nqn, firstSeen)
 
-		val, _ = d.orphanedSessionsSeen.Load(nqn)
+		val, _ = d.orphanedNVMeSessionsSeen.Load(nqn)
 		orphanedDuration = now.Sub(val.(time.Time))
 		assert.True(t, orphanedDuration > gracePeriod,
 			"90 seconds ago should exceed 60 second grace period")
 
 		// Cleanup
-		d.orphanedSessionsSeen.Delete(nqn)
+		d.orphanedNVMeSessionsSeen.Delete(nqn)
 	})
 
-	t.Run("NQN-based session identification", func(t *testing.T) {
-		// NVMe-oF sessions are identified by NQN (not IQN like iSCSI)
-		// NQNs start with "nqn." prefix
+	t.Run("protocol maps are independent", func(t *testing.T) {
 		nqn1 := "nqn.2014-08.org.nvmexpress:uuid:vol-1"
 		nqn2 := "nqn.2014-08.org.nvmexpress:uuid:vol-2"
-		iqn := "iqn.2005-10.org.freenas.ctl:target-1" // iSCSI IQN
+		iqn := "iqn.2005-10.org.freenas.ctl:csi-target-1"
 
-		d.orphanedSessionsSeen.Store(nqn1, now)
-		d.orphanedSessionsSeen.Store(nqn2, now)
-		d.orphanedSessionsSeen.Store(iqn, now)
-
-		// Count NVMe-oF sessions (those starting with "nqn.")
+		d.orphanedNVMeSessionsSeen.Store(nqn1, now)
+		d.orphanedNVMeSessionsSeen.Store(nqn2, now)
+		d.orphanedISCSISessionsSeen.Store(iqn, now)
 		nvmeofCount := 0
 		iscsiCount := 0
-		d.orphanedSessionsSeen.Range(func(key, _ interface{}) bool {
-			k := key.(string)
-			if len(k) > 4 && k[:4] == "nqn." {
-				nvmeofCount++
-			} else if len(k) > 4 && k[:4] == "iqn." {
-				iscsiCount++
-			}
+		d.orphanedNVMeSessionsSeen.Range(func(_, _ interface{}) bool {
+			nvmeofCount++
+			return true
+		})
+		d.orphanedISCSISessionsSeen.Range(func(_, _ interface{}) bool {
+			iscsiCount++
 			return true
 		})
 
@@ -334,9 +464,9 @@ func TestSessionGC_OrphanedSessionTracking(t *testing.T) {
 		assert.Equal(t, 1, iscsiCount, "Should have 1 iSCSI session")
 
 		// Cleanup
-		d.orphanedSessionsSeen.Delete(nqn1)
-		d.orphanedSessionsSeen.Delete(nqn2)
-		d.orphanedSessionsSeen.Delete(iqn)
+		d.orphanedNVMeSessionsSeen.Delete(nqn1)
+		d.orphanedNVMeSessionsSeen.Delete(nqn2)
+		d.orphanedISCSISessionsSeen.Delete(iqn)
 	})
 }
 
@@ -357,8 +487,8 @@ func TestSessionGC_CleanupStaleEntries(t *testing.T) {
 	// Simulate adding orphaned session entries
 	nqn1 := "nqn.2014-08.org.nvmexpress:uuid:active-session"
 	nqn2 := "nqn.2014-08.org.nvmexpress:uuid:stale-session"
-	d.orphanedSessionsSeen.Store(nqn1, now)
-	d.orphanedSessionsSeen.Store(nqn2, now)
+	d.orphanedNVMeSessionsSeen.Store(nqn1, now)
+	d.orphanedNVMeSessionsSeen.Store(nqn2, now)
 
 	// Simulate which sessions are still active (only nqn1)
 	activeOrphanedSessions := map[string]struct{}{
@@ -367,22 +497,22 @@ func TestSessionGC_CleanupStaleEntries(t *testing.T) {
 
 	// Simulate cleanup logic from gcNVMeoFSessions
 	// Only clean up entries with "nqn." prefix that are no longer active
-	d.orphanedSessionsSeen.Range(func(key, _ interface{}) bool {
+	d.orphanedNVMeSessionsSeen.Range(func(key, _ interface{}) bool {
 		nqn := key.(string)
 		if len(nqn) > 4 && nqn[:4] == "nqn." {
 			if _, active := activeOrphanedSessions[nqn]; !active {
-				d.orphanedSessionsSeen.Delete(nqn)
+				d.orphanedNVMeSessionsSeen.Delete(nqn)
 			}
 		}
 		return true
 	})
 
 	// Verify nqn1 is still present (active)
-	_, ok := d.orphanedSessionsSeen.Load(nqn1)
+	_, ok := d.orphanedNVMeSessionsSeen.Load(nqn1)
 	assert.True(t, ok, "Active session entry should remain")
 
 	// Verify nqn2 was cleaned up (stale)
-	_, ok = d.orphanedSessionsSeen.Load(nqn2)
+	_, ok = d.orphanedNVMeSessionsSeen.Load(nqn2)
 	assert.False(t, ok, "Stale session entry should be cleaned up")
 }
 
@@ -417,10 +547,10 @@ func TestSessionGC_ProtocolEnabling(t *testing.T) {
 				NVMeoFEnabled: &falseVal,
 			},
 			ISCSI: ISCSIConfig{
-				TargetPortal: "192.168.1.100:3260",
+				TargetPortal: "192.0.2.100:3260",
 			},
 			NVMeoF: NVMeoFConfig{
-				TransportAddress: "192.168.1.100",
+				TransportAddress: "192.0.2.100",
 			},
 		}
 
@@ -450,7 +580,7 @@ func TestSessionGC_ProtocolEnabling(t *testing.T) {
 				TargetPortal: "", // Not configured
 			},
 			NVMeoF: NVMeoFConfig{
-				TransportAddress: "192.168.1.100", // Configured
+				TransportAddress: "192.0.2.100", // Configured
 			},
 		}
 
@@ -462,7 +592,7 @@ func TestSessionGC_ProtocolEnabling(t *testing.T) {
 	})
 }
 
-// TestSessionGC_ConcurrentAccess tests thread safety of orphanedSessionsSeen.
+// TestSessionGC_ConcurrentAccess tests thread safety of protocol tracking.
 func TestSessionGC_ConcurrentAccess(t *testing.T) {
 	d := &Driver{}
 
@@ -480,22 +610,22 @@ func TestSessionGC_ConcurrentAccess(t *testing.T) {
 				nqn := "nqn.test:session-" + string(rune('0'+id))
 
 				// Store
-				d.orphanedSessionsSeen.Store(nqn, now)
+				d.orphanedNVMeSessionsSeen.Store(nqn, now)
 
 				// Load
-				d.orphanedSessionsSeen.Load(nqn)
+				d.orphanedNVMeSessionsSeen.Load(nqn)
 
 				// LoadOrStore
-				d.orphanedSessionsSeen.LoadOrStore(nqn, now)
+				d.orphanedNVMeSessionsSeen.LoadOrStore(nqn, now)
 
 				// Range
-				d.orphanedSessionsSeen.Range(func(key, value interface{}) bool {
+				d.orphanedNVMeSessionsSeen.Range(func(key, value interface{}) bool {
 					return true
 				})
 
 				// Delete
 				if j%2 == 0 {
-					d.orphanedSessionsSeen.Delete(nqn)
+					d.orphanedNVMeSessionsSeen.Delete(nqn)
 				}
 			}
 		}(i)

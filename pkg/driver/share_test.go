@@ -563,7 +563,7 @@ func TestCreateNFSShare_PropertyError_ReturnsError(t *testing.T) {
 				DatasetParentName: "tank/k8s/volumes",
 			},
 			NFS: NFSConfig{
-				ShareHost: "192.168.1.100",
+				ShareHost: "192.0.2.100",
 			},
 		},
 		truenasClient: mockClient,
@@ -605,7 +605,6 @@ func TestCreateISCSIShare_TargetCreation_Success(t *testing.T) {
 				ZvolReadyTimeout:  5,
 			},
 			ISCSI: ISCSIConfig{
-				NamePrefix: "csi-",
 				TargetGroups: []ISCSITargetGroup{
 					{Portal: 1, Initiator: 1, AuthMethod: "NONE"},
 				},
@@ -636,13 +635,12 @@ func TestCreateISCSIShare_TargetCreation_Success(t *testing.T) {
 	assert.NotNil(t, target)
 }
 
-func TestCreateISCSIShareNameCompatibility(t *testing.T) {
+func TestCreateISCSIShareNameSuffixCompatibility(t *testing.T) {
 	mockClient := truenas.NewMockClient()
 	d := &Driver{
 		config: &Config{
 			ZFS: ZFSConfig{ZvolReadyTimeout: 5},
 			ISCSI: ISCSIConfig{
-				NamePrefix:   "must-not-be-used-",
 				NameSuffix:   "-cluster",
 				TargetGroups: []ISCSITargetGroup{{Portal: 1, Initiator: 1, AuthMethod: "NONE"}},
 			},
@@ -713,7 +711,7 @@ func TestCreateNVMeoFShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testin
 			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
 			NVMeoF: NVMeoFConfig{
 				Transport:             "TCP",
-				TransportAddress:      "10.0.0.10",
+				TransportAddress:      "198.51.100.10",
 				TransportServiceID:    4420,
 				SubsystemAllowAnyHost: true,
 			},
@@ -747,7 +745,7 @@ func TestCreateNVMeoFShareAllowAnyHostSkipsHostResolution(t *testing.T) {
 			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
 			NVMeoF: NVMeoFConfig{
 				Transport:             "TCP",
-				TransportAddress:      "10.0.0.10",
+				TransportAddress:      "198.51.100.10",
 				TransportServiceID:    4420,
 				SubsystemAllowAnyHost: true,
 				SubsystemHosts:        []string{"nqn.ignored.when.allow-any-is-enabled"},
@@ -783,7 +781,7 @@ func TestCreateNVMeoFShareRestrictedHostsResolveAndCache(t *testing.T) {
 			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
 			NVMeoF: NVMeoFConfig{
 				Transport:             "TCP",
-				TransportAddress:      "10.0.0.10",
+				TransportAddress:      "198.51.100.10",
 				TransportServiceID:    4420,
 				SubsystemAllowAnyHost: false,
 				SubsystemHosts:        []string{existingNQN, createdNQN},
@@ -836,7 +834,7 @@ func TestCreateNVMeoFShareRestrictedHostsReResolvesOnHostNotFound(t *testing.T) 
 			ZFS: ZFSConfig{DatasetParentName: "tank/k8s/volumes", ZvolReadyTimeout: 5},
 			NVMeoF: NVMeoFConfig{
 				Transport:             "TCP",
-				TransportAddress:      "10.0.0.10",
+				TransportAddress:      "198.51.100.10",
 				TransportServiceID:    4420,
 				SubsystemAllowAnyHost: false,
 				SubsystemHosts:        []string{nqn},
@@ -925,7 +923,7 @@ func TestEnsureShareExists_AlreadyExists(t *testing.T) {
 				DatasetParentName: "tank/k8s/volumes",
 			},
 			NFS: NFSConfig{
-				ShareHost: "192.168.1.100",
+				ShareHost: "192.0.2.100",
 			},
 		},
 		truenasClient: mockClient,
@@ -1065,7 +1063,7 @@ func TestEnsureShareExists_MissingShare(t *testing.T) {
 				DatasetParentName: "tank/k8s/volumes",
 			},
 			NFS: NFSConfig{
-				ShareHost: "192.168.1.100",
+				ShareHost: "192.0.2.100",
 			},
 		},
 		truenasClient: mockClient,
@@ -1103,7 +1101,7 @@ func TestEnsureShareExists_DashValue(t *testing.T) {
 				DatasetParentName: "tank/k8s/volumes",
 			},
 			NFS: NFSConfig{
-				ShareHost: "192.168.1.100",
+				ShareHost: "192.0.2.100",
 			},
 		},
 		truenasClient: mockClient,

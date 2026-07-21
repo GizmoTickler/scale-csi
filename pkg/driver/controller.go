@@ -333,6 +333,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	shareType := d.config.GetShareType(params)
 	klog.Infof("CreateVolume: using share type %s for volume %s", shareType, volumeID)
+	if shareType == ShareTypeNFS {
+		for _, capability := range req.GetVolumeCapabilities() {
+			if capability.GetBlock() != nil {
+				return nil, status.Error(codes.InvalidArgument, "raw block volume capability is incompatible with NFS protocol")
+			}
+		}
+	}
 
 	// Validate access mode against protocol
 	// RWX (ReadWriteMany) is only supported for NFS volumes
@@ -365,6 +372,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if storedBlockProtocol(existingDS, ShareTypeNVMeoF) && shareType != ShareTypeNVMeoF {
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s exists with protocol %s, requested %s", volumeID, ShareTypeNVMeoF, shareType)
+		}
+		storedContentSource := volumeContentSourceFromDataset(existingDS)
+		requestedContentSource := req.GetVolumeContentSource()
+		storedSourceIsDurable := datasetHasDurableContentSource(existingDS)
+		if (storedSourceIsDurable && storedContentSource == nil) ||
+			(storedContentSource == nil) != (requestedContentSource == nil) ||
+			(storedContentSource != nil && !volumeContentSourcesEqual(storedContentSource, requestedContentSource)) {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume %s already exists with content source %s, incompatible with requested %s",
+				volumeID, describeDatasetContentSource(existingDS), describeVolumeContentSource(requestedContentSource))
 		}
 		if snapshot := req.GetVolumeContentSource().GetSnapshot(); d.config.ZFS.DetachedVolumesFromSnapshots && snapshot != nil {
 			existingDS, err = d.prepareDetachedSnapshotCopy(
@@ -400,33 +417,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if datasetUserProperty(existingDS, PropCSIVolumeName) != name {
 			propertyUpdates[PropCSIVolumeName] = name
 		}
-		if contentSource := req.GetVolumeContentSource(); contentSource != nil {
-			switch {
-			case contentSource.GetSnapshot() != nil:
-				snapshotID := contentSource.GetSnapshot().GetSnapshotId()
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceType); d.config.ZFS.DetachedVolumesFromSnapshots || value == "" || value == "-" {
-					propertyUpdates[PropVolumeContentSourceType] = "snapshot"
-				}
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceID); d.config.ZFS.DetachedVolumesFromSnapshots || value == "" || value == "-" {
-					propertyUpdates[PropVolumeContentSourceID] = snapshotID
-				}
-			case contentSource.GetVolume() != nil:
-				sourceVolumeID := contentSource.GetVolume().GetVolumeId()
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceType); value == "" || value == "-" {
-					propertyUpdates[PropVolumeContentSourceType] = "volume"
-				}
-				if value := datasetUserProperty(existingDS, PropVolumeContentSourceID); value == "" || value == "-" {
-					propertyUpdates[PropVolumeContentSourceID] = sourceVolumeID
-				}
-				if datasetUserProperty(existingDS, PropVolumeOriginSnapshot) == "" ||
-					datasetUserProperty(existingDS, PropVolumeOriginSnapshot) == "-" {
-					originSnapshotID := datasetOriginSnapshotID(existingDS)
-					if originSnapshotID != "" {
-						propertyUpdates[PropVolumeOriginSnapshot] = originSnapshotID
-					}
-				}
-			}
-		}
 		if d.config.ZFS.DetachedVolumesFromSnapshots &&
 			req.GetVolumeContentSource().GetSnapshot() != nil &&
 			shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
@@ -451,15 +441,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if ctxErr != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
 		}
-		contentSource := volumeContentSourceFromDataset(existingDS)
-		if contentSource == nil {
-			contentSource = req.GetVolumeContentSource()
-		}
 		volume := &csi.Volume{
 			VolumeId:           volumeID,
 			CapacityBytes:      d.getDatasetCapacity(existingDS),
 			VolumeContext:      volumeContext,
-			ContentSource:      contentSource,
+			ContentSource:      storedContentSource,
 			AccessibleTopology: d.getAccessibleTopology(),
 		}
 		return &csi.CreateVolumeResponse{Volume: volume}, nil
@@ -590,6 +576,51 @@ func volumeContentSourceFromDataset(ds *truenas.Dataset) *csi.VolumeContentSourc
 	default:
 		return nil
 	}
+}
+
+func datasetHasDurableContentSource(ds *truenas.Dataset) bool {
+	sourceType := datasetUserProperty(ds, PropVolumeContentSourceType)
+	sourceID := datasetUserProperty(ds, PropVolumeContentSourceID)
+	return (sourceType != "" && sourceType != "-") || (sourceID != "" && sourceID != "-")
+}
+
+func describeDatasetContentSource(ds *truenas.Dataset) string {
+	if source := volumeContentSourceFromDataset(ds); source != nil {
+		return describeVolumeContentSource(source)
+	}
+	if !datasetHasDurableContentSource(ds) {
+		return "none"
+	}
+	return fmt.Sprintf("invalid(type=%q,id=%q)",
+		datasetUserProperty(ds, PropVolumeContentSourceType),
+		datasetUserProperty(ds, PropVolumeContentSourceID))
+}
+
+func volumeContentSourcesEqual(left, right *csi.VolumeContentSource) bool {
+	leftType, leftID, leftOK := volumeContentSourceIdentity(left)
+	rightType, rightID, rightOK := volumeContentSourceIdentity(right)
+	return leftOK && rightOK && leftType == rightType && leftID == rightID
+}
+
+func volumeContentSourceIdentity(source *csi.VolumeContentSource) (sourceType, sourceID string, valid bool) {
+	if source == nil {
+		return "", "", false
+	}
+	if snapshot := source.GetSnapshot(); snapshot != nil && snapshot.GetSnapshotId() != "" {
+		return "snapshot", snapshot.GetSnapshotId(), true
+	}
+	if volume := source.GetVolume(); volume != nil && volume.GetVolumeId() != "" {
+		return "volume", volume.GetVolumeId(), true
+	}
+	return "", "", false
+}
+
+func describeVolumeContentSource(source *csi.VolumeContentSource) string {
+	sourceType, sourceID, ok := volumeContentSourceIdentity(source)
+	if !ok {
+		return "none"
+	}
+	return sourceType + ":" + sourceID
 }
 
 func datasetOriginSnapshotID(ds *truenas.Dataset) string {

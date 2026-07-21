@@ -478,12 +478,10 @@
         },
         "targetPortals": {
           "type": "array",
+          "description": "Reserved for future iSCSI multipath support; currently ignored with a startup warning",
           "items": {
             "type": "string"
           }
-        },
-        "namePrefix": {
-          "type": "string"
         },
         "extentBlocksize": {
           "type": "integer",

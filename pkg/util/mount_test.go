@@ -347,12 +347,12 @@ func TestMountNFSOptions(t *testing.T) {
 	}{
 		{
 			name:        "NFS with default options only",
-			source:      "192.168.1.100:/exports/data",
+			source:      "192.0.2.100:/exports/data",
 			target:      "/mnt/nfs",
 			userOptions: nil,
 			wantContains: []string{
 				"-t", "nfs", "-o", "nfsvers=4",
-				"192.168.1.100:/exports/data", "/mnt/nfs",
+				"192.0.2.100:/exports/data", "/mnt/nfs",
 			},
 		},
 		{
@@ -367,7 +367,7 @@ func TestMountNFSOptions(t *testing.T) {
 		},
 		{
 			name:        "NFS with noatime option",
-			source:      "10.0.0.50:/volume",
+			source:      "198.51.100.50:/volume",
 			target:      "/data",
 			userOptions: []string{"noatime"},
 			wantContains: []string{
@@ -545,6 +545,34 @@ func TestIsMountedNonexistentPathUsesFindmnt(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, mounted)
 	assert.Contains(t, readCommandLog(t, logPath), "findmnt --mountpoint "+missingPath+" --noheadings")
+}
+
+func TestGetMountInfoParsesSourceTypeAndReadonlyState(t *testing.T) {
+	installFakeMountCommands(t, "findmnt")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	t.Setenv("FAKE_COMMAND_LOG", logPath)
+	t.Setenv("FAKE_FINDMNT_OUTPUT", "server:/share nfs4 ro,relatime,nosuid\n")
+
+	info, err := GetMountInfo("/var/lib/kubelet/staging/pvc")
+	require.NoError(t, err)
+	assert.Equal(t, "server:/share", info.Source)
+	assert.Equal(t, "nfs4", info.FSType)
+	assert.True(t, info.ReadOnly)
+	assert.Contains(t, info.Options, "nosuid")
+	assert.Contains(t, readCommandLog(t, logPath), "SOURCE,FSTYPE,OPTIONS")
+}
+
+func TestParseMountInfoRebuildsKernelMountState(t *testing.T) {
+	mounts, err := parseMountInfo(strings.NewReader(
+		"36 25 0:32 / /var/lib/kubelet/pods/pod\\040id/volumes/csi/pvc/mount ro,relatime - nfs4 server:/share rw,vers=4.2\n" +
+			"malformed mountinfo row\n"))
+	require.NoError(t, err)
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "server:/share", mounts[0].Source)
+	assert.Equal(t, "/var/lib/kubelet/pods/pod id/volumes/csi/pvc/mount", mounts[0].Target)
+	assert.Equal(t, "nfs4", mounts[0].FSType)
+	assert.True(t, mounts[0].ReadOnly)
+	assert.Contains(t, mounts[0].Options, "vers=4.2")
 }
 
 func TestGetDeviceFromMountPointUsesFirstFindmntResult(t *testing.T) {
@@ -1005,7 +1033,7 @@ func TestIsMountedOutputParsing(t *testing.T) {
 		},
 		{
 			name:       "mounted NFS",
-			output:     "192.168.1.100:/exports/share /mnt/nfs nfs4 rw,relatime",
+			output:     "192.0.2.100:/exports/share /mnt/nfs nfs4 rw,relatime",
 			wantResult: true,
 		},
 	}

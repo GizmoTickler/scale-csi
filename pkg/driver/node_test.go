@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/GizmoTickler/scale-csi/pkg/util"
@@ -28,6 +29,18 @@ fi
 case "$name" in
 	findmnt)
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ] && [ -f "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
+			case " $* " in
+				*" SOURCE,FSTYPE,OPTIONS "*)
+					if [ -n "$FAKE_NODE_FINDMNT_INFO" ]; then
+						printf '%s' "$FAKE_NODE_FINDMNT_INFO"
+					elif [ -f "$FAKE_NODE_MOUNT_STATE_FILE.info" ]; then
+						cat "$FAKE_NODE_MOUNT_STATE_FILE.info"
+					else
+						printf '%s' "${FAKE_NODE_FINDMNT_OUTPUT:-/dev/null} ext4 rw"
+					fi
+					exit 0
+					;;
+			esac
 			printf '%s' "${FAKE_NODE_FINDMNT_OUTPUT:-mounted}"
 			exit 0
 		fi
@@ -60,12 +73,37 @@ case "$name" in
 	mount)
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
 			: > "$FAKE_NODE_MOUNT_STATE_FILE"
+			previous=""
+			source=""
+			fstype="none"
+			options="rw"
+			next_fstype=false
+			next_options=false
+			mount_options=""
+			for arg in "$@"; do
+				if [ "$next_fstype" = true ]; then fstype="$arg"; next_fstype=false; continue; fi
+				if [ "$next_options" = true ]; then mount_options="$arg"; next_options=false; continue; fi
+				if [ "$arg" = "-t" ]; then next_fstype=true; continue; fi
+				if [ "$arg" = "-o" ]; then next_options=true; continue; fi
+				previous="$source"
+				source="$arg"
+			done
+			case ",$mount_options," in *,ro,*) options="ro" ;; esac
+			if [ "$source" = "$last" ]; then source="$previous"; fi
+			if printf '%s' "$mount_options" | grep -q 'remount'; then
+				if [ -f "$FAKE_NODE_MOUNT_STATE_FILE.info" ]; then
+					source="$(awk '{print $1}' "$FAKE_NODE_MOUNT_STATE_FILE.info")"
+					fstype="$(awk '{print $2}' "$FAKE_NODE_MOUNT_STATE_FILE.info")"
+				fi
+			fi
+			printf '%s %s %s' "$source" "$fstype" "$options" > "$FAKE_NODE_MOUNT_STATE_FILE.info"
 		fi
 		exit 0
 		;;
 	umount)
 		if [ -n "$FAKE_NODE_MOUNT_STATE_FILE" ]; then
 			rm -f "$FAKE_NODE_MOUNT_STATE_FILE"
+			rm -f "$FAKE_NODE_MOUNT_STATE_FILE.info"
 		fi
 		exit 0
 		;;
@@ -102,14 +140,14 @@ func newTestNodeDriver(shareType ShareType) *Driver {
 			DatasetParentName: "pool/test",
 		},
 		NFS: NFSConfig{
-			ShareHost: "192.168.1.100",
+			ShareHost: "192.0.2.100",
 		},
 		ISCSI: ISCSIConfig{
-			TargetPortal:      "192.168.1.100:3260",
+			TargetPortal:      "192.0.2.100:3260",
 			DeviceWaitTimeout: 60,
 		},
 		NVMeoF: NVMeoFConfig{
-			TransportAddress:   "192.168.1.100",
+			TransportAddress:   "192.0.2.100",
 			TransportServiceID: 4420,
 			Transport:          "tcp",
 			DeviceWaitTimeout:  60,
@@ -311,9 +349,16 @@ func TestNodeStageVolume_Validation(t *testing.T) {
 func TestNodeStageUnstageVolume_BlockRoundTrip(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt", "iscsiadm")
 	originalConnect := iscsiConnectWithSessions
-	t.Cleanup(func() { iscsiConnectWithSessions = originalConnect })
+	originalGetInfo := nodeGetISCSIInfo
+	t.Cleanup(func() {
+		iscsiConnectWithSessions = originalConnect
+		nodeGetISCSIInfo = originalGetInfo
+	})
 	iscsiConnectWithSessions = func(context.Context, string, string, int, *util.ISCSIConnectOptions, []util.ISCSISessionInfo) (string, error) {
 		return "/dev/null", nil
+	}
+	nodeGetISCSIInfo = func(string) (string, string, error) {
+		return "192.0.2.10:3260", "iqn.test:block-volume", nil
 	}
 
 	d := newTestNodeDriver(ShareTypeISCSI)
@@ -461,6 +506,320 @@ func TestNodePublishVolume_Validation(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, codes.InvalidArgument, st.Code())
 		assert.Contains(t, st.Message(), "target path")
+	})
+}
+
+func TestNodePublishVolumeExistingTargetCompatibility(t *testing.T) {
+	originalIsMounted := nodeIsMounted
+	originalGetMountInfo := nodeGetMountInfo
+	originalListMountInfo := nodeListMountInfo
+	t.Cleanup(func() {
+		nodeIsMounted = originalIsMounted
+		nodeGetMountInfo = originalGetMountInfo
+		nodeListMountInfo = originalListMountInfo
+	})
+	nodeIsMounted = func(string) (bool, error) { return true, nil }
+	nodeListMountInfo = func() ([]util.MountInfo, error) { return nil, nil }
+
+	mountCapability := func(mode csi.VolumeCapability_AccessMode_Mode) *csi.VolumeCapability {
+		return &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: mode},
+		}
+	}
+
+	t.Run("CompatibleRepeatedPublishSucceeds", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		targetPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "server:/share", Target: path, FSType: "ext4", ReadOnly: false}, nil
+		}
+		req := &csi.NodePublishVolumeRequest{
+			VolumeId:          "volume-a",
+			StagingTargetPath: stagingPath,
+			TargetPath:        targetPath,
+			VolumeCapability:  mountCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER),
+		}
+
+		_, err := d.NodePublishVolume(context.Background(), req)
+		require.NoError(t, err)
+		_, err = d.NodePublishVolume(context.Background(), req)
+		require.NoError(t, err)
+	})
+
+	t.Run("DifferentBackingSourceReturnsAlreadyExists", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		targetPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			source := "server:/requested"
+			if path == targetPath {
+				source = "server:/existing"
+			}
+			return util.MountInfo{Source: source, Target: path, FSType: "ext4"}, nil
+		}
+
+		_, err := d.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+			VolumeId:          "volume-a",
+			StagingTargetPath: stagingPath,
+			TargetPath:        targetPath,
+			VolumeCapability:  mountCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER),
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	})
+
+	t.Run("DifferentReadonlyStateReturnsAlreadyExists", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		targetPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "server:/share", Target: path, FSType: "ext4", ReadOnly: false}, nil
+		}
+
+		_, err := d.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+			VolumeId:          "volume-a",
+			StagingTargetPath: stagingPath,
+			TargetPath:        targetPath,
+			Readonly:          true,
+			VolumeCapability:  mountCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER),
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	})
+
+	t.Run("DifferentCapabilityReturnsAlreadyExists", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		targetPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "server:/share", Target: path, FSType: "ext4"}, nil
+		}
+		first := &csi.NodePublishVolumeRequest{
+			VolumeId:          "volume-a",
+			StagingTargetPath: stagingPath,
+			TargetPath:        targetPath,
+			VolumeCapability:  mountCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER),
+		}
+		_, err := d.NodePublishVolume(context.Background(), first)
+		require.NoError(t, err)
+
+		second := proto.Clone(first).(*csi.NodePublishVolumeRequest)
+		second.VolumeCapability = mountCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY)
+		_, err = d.NodePublishVolume(context.Background(), second)
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	})
+
+	t.Run("DifferentVolumeReturnsAlreadyExists", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		targetPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "server:/share", Target: path, FSType: "ext4"}, nil
+		}
+		first := &csi.NodePublishVolumeRequest{
+			VolumeId:          "volume-a",
+			StagingTargetPath: stagingPath,
+			TargetPath:        targetPath,
+			VolumeCapability:  mountCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER),
+		}
+		_, err := d.NodePublishVolume(context.Background(), first)
+		require.NoError(t, err)
+
+		second := proto.Clone(first).(*csi.NodePublishVolumeRequest)
+		second.VolumeId = "volume-b"
+		_, err = d.NodePublishVolume(context.Background(), second)
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	})
+
+	t.Run("DifferentAccessTypeReturnsAlreadyExists", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeISCSI)
+		stagingPath := filepath.Join(t.TempDir(), "staged-device")
+		require.NoError(t, os.Symlink("/dev/null", stagingPath))
+		targetPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "/dev/null", Target: path, FSType: "devtmpfs"}, nil
+		}
+
+		_, err := d.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+			VolumeId:          "volume-a",
+			StagingTargetPath: stagingPath,
+			TargetPath:        targetPath,
+			VolumeCapability: &csi.VolumeCapability{
+				AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+				AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER},
+			},
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	})
+}
+
+func TestNodePublishVolumeSingleWriterRejectsDifferentTarget(t *testing.T) {
+	originalIsMounted := nodeIsMounted
+	originalGetMountInfo := nodeGetMountInfo
+	originalListMountInfo := nodeListMountInfo
+	t.Cleanup(func() {
+		nodeIsMounted = originalIsMounted
+		nodeGetMountInfo = originalGetMountInfo
+		nodeListMountInfo = originalListMountInfo
+	})
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	stagingPath := t.TempDir()
+	existingTarget := t.TempDir()
+	newTarget := filepath.Join(t.TempDir(), "new-target")
+	capability := &csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER},
+	}
+	signature, err := nodeCapabilityForRequest(capability)
+	require.NoError(t, err)
+	d.storePublicationRecord(nodeMountRecord{
+		VolumeID:       "volume-a",
+		TargetPath:     existingTarget,
+		ExpectedSource: "server:/share",
+		LiveSource:     "server:/share",
+		Capability:     signature,
+	})
+	nodeIsMounted = func(path string) (bool, error) { return path == existingTarget, nil }
+	nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+		return util.MountInfo{Source: "server:/share", Target: path, FSType: "nfs4"}, nil
+	}
+	nodeListMountInfo = func() ([]util.MountInfo, error) { return nil, nil }
+
+	_, err = d.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "volume-a",
+		StagingTargetPath: stagingPath,
+		TargetPath:        newTarget,
+		VolumeCapability:  capability,
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), existingTarget)
+}
+
+func TestNodePublishVolumeRebuildsSingleWriterStateFromMountTable(t *testing.T) {
+	originalIsMounted := nodeIsMounted
+	originalGetMountInfo := nodeGetMountInfo
+	originalListMountInfo := nodeListMountInfo
+	t.Cleanup(func() {
+		nodeIsMounted = originalIsMounted
+		nodeGetMountInfo = originalGetMountInfo
+		nodeListMountInfo = originalListMountInfo
+	})
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	stagingPath := t.TempDir()
+	newTarget := filepath.Join(t.TempDir(), "new-target")
+	existingTarget := "/var/lib/kubelet/pods/existing/volumes/kubernetes.io~csi/pvc/mount"
+	nodeIsMounted = func(string) (bool, error) { return false, nil }
+	nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+		return util.MountInfo{Source: "server:/share", Target: path, FSType: "nfs4"}, nil
+	}
+	nodeListMountInfo = func() ([]util.MountInfo, error) {
+		return []util.MountInfo{{Source: "server:/share", Target: existingTarget, FSType: "nfs4"}}, nil
+	}
+
+	_, err := d.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "volume-a",
+		StagingTargetPath: stagingPath,
+		TargetPath:        newTarget,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER},
+		},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), existingTarget)
+}
+
+func TestNodeStageVolumeExistingTargetCompatibility(t *testing.T) {
+	originalIsMounted := nodeIsMounted
+	originalGetMountInfo := nodeGetMountInfo
+	t.Cleanup(func() {
+		nodeIsMounted = originalIsMounted
+		nodeGetMountInfo = originalGetMountInfo
+	})
+	nodeIsMounted = func(string) (bool, error) { return true, nil }
+
+	newRequest := func(stagingPath string) *csi.NodeStageVolumeRequest {
+		return &csi.NodeStageVolumeRequest{
+			VolumeId:          "volume-a",
+			StagingTargetPath: stagingPath,
+			VolumeContext: map[string]string{
+				"node_attach_driver": "nfs",
+				"server":             "server",
+				"share":              "/share",
+			},
+			VolumeCapability: &csi.VolumeCapability{
+				AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+				AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER},
+			},
+		}
+	}
+
+	t.Run("CompatibleRepeatedStageSucceeds", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "server:/share", Target: path, FSType: "nfs4"}, nil
+		}
+		req := newRequest(stagingPath)
+
+		_, err := d.NodeStageVolume(context.Background(), req)
+		require.NoError(t, err)
+		_, err = d.NodeStageVolume(context.Background(), req)
+		require.NoError(t, err)
+	})
+
+	t.Run("DifferentBackingSourceReturnsAlreadyExists", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "server:/other", Target: path, FSType: "nfs4"}, nil
+		}
+
+		_, err := d.NodeStageVolume(context.Background(), newRequest(stagingPath))
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	})
+
+	t.Run("DifferentVolumeReturnsAlreadyExists", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "server:/share", Target: path, FSType: "nfs4"}, nil
+		}
+		first := newRequest(stagingPath)
+		_, err := d.NodeStageVolume(context.Background(), first)
+		require.NoError(t, err)
+
+		second := proto.Clone(first).(*csi.NodeStageVolumeRequest)
+		second.VolumeId = "volume-b"
+		_, err = d.NodeStageVolume(context.Background(), second)
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	})
+
+	t.Run("DifferentAccessTypeReturnsAlreadyExists", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNFS)
+		stagingPath := t.TempDir()
+		nodeGetMountInfo = func(path string) (util.MountInfo, error) {
+			return util.MountInfo{Source: "server:/share", Target: path, FSType: "nfs4"}, nil
+		}
+		req := newRequest(stagingPath)
+		req.VolumeCapability.AccessType = &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}}
+
+		_, err := d.NodeStageVolume(context.Background(), req)
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
 	})
 }
 
@@ -966,7 +1325,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 
 	t.Run("MissingIQN", func(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 		}, "/staging", nil)
 
 		require.Error(t, err)
@@ -978,7 +1337,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 
 	t.Run("InvalidLUN", func(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.2005-10.org.freenas.ctl:vol1",
 			"lun":    "invalid",
 		}, "/staging", nil)
@@ -1128,7 +1487,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
 		stagingPath := t.TempDir()
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
@@ -1147,7 +1506,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNVMeoF)
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
 			"nqn":     "nqn.test:vol1",
-			"address": "192.168.1.100",
+			"address": "192.0.2.100",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
 		})
@@ -1161,7 +1520,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		installFakeNodeCommands(t, "findmnt", "iscsiadm")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
-		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:other (non-flash)\n")
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.0.2.100:3260,1 iqn.test:other (non-flash)\n")
 
 		originalConnect := iscsiConnectWithSessions
 		iscsiConnectWithSessions = func(_ context.Context, _, _ string, _ int, _ *util.ISCSIConnectOptions, sessions []util.ISCSISessionInfo) (string, error) {
@@ -1173,7 +1532,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		stagingPath := filepath.Join(t.TempDir(), "staging")
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
@@ -1199,7 +1558,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNVMeoF)
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
 			"nqn":     "nqn.test:vol1",
-			"address": "192.168.1.100",
+			"address": "192.0.2.100",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
@@ -1213,11 +1572,11 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 		installFakeNodeCommands(t, "findmnt", "iscsiadm")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
-		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:vol1 (non-flash)\n")
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.0.2.100:3260,1 iqn.test:vol1 (non-flash)\n")
 
 		originalInfo := getISCSIInfoFromDeviceWithSessions
 		getISCSIInfoFromDeviceWithSessions = func(devicePath string, sessions []util.ISCSISessionInfo) (string, string, error) {
-			return "192.168.1.100:3260", "iqn.test:vol1", nil
+			return "192.0.2.100:3260", "iqn.test:vol1", nil
 		}
 		defer func() { getISCSIInfoFromDeviceWithSessions = originalInfo }()
 
@@ -1226,7 +1585,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260",
+			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
@@ -1256,7 +1615,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNVMeoF)
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
 			"nqn":     "nqn.test:vol1",
-			"address": "192.168.1.100",
+			"address": "192.0.2.100",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
@@ -1273,7 +1632,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		installFakeNodeCommands(t, "findmnt", "iscsiadm")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
-		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 iqn.test:vol1 (non-flash)\n")
+		t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.0.2.100:3260,1 iqn.test:vol1 (non-flash)\n")
 
 		originalInfo := getISCSIInfoFromDeviceWithSessions
 		originalConnect := iscsiConnectWithSessions
@@ -1292,7 +1651,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		require.NoError(t, os.Symlink("/dev/null", stagingPath))
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
-			"portal": "192.168.1.100:3260", "iqn": "iqn.test:vol1",
+			"portal": "192.0.2.100:3260", "iqn": "iqn.test:vol1",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
@@ -1323,7 +1682,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		require.NoError(t, os.Symlink("/dev/null", stagingPath))
 		d := newTestNodeDriver(ShareTypeNVMeoF)
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
-			"nqn": "nqn.test:vol1", "address": "192.168.1.100",
+			"nqn": "nqn.test:vol1", "address": "192.0.2.100",
 		}, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
@@ -1359,7 +1718,7 @@ func TestStageNVMeoFVolume_Validation(t *testing.T) {
 
 	t.Run("MissingNQN", func(t *testing.T) {
 		err := d.stageNVMeoFVolume(context.Background(), map[string]string{
-			"address": "192.168.1.100",
+			"address": "192.0.2.100",
 		}, "/staging", nil)
 
 		require.Error(t, err)
@@ -1650,14 +2009,12 @@ func TestCleanupOrphanedISCSISessionUsesProtocolShareName(t *testing.T) {
 	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
 
 	d := newTestNodeDriver(ShareTypeISCSI)
-	d.config.ISCSI.NamePrefix = "cluster-"
-	d.config.ISCSI.NameSuffix = "-cluster"
-	volumeID := strings.Repeat("Long_Volume_Name!", 8)
+	d.config.ISCSI.NameSuffix = "-Cluster_Name!"
+	volumeID := "pvc-11111111-2222-4333-8444-555555555555"
 	targetName := d.iscsiShareName(volumeID)
 	assert.Equal(t, protocolShareName(volumeID+d.config.ISCSI.NameSuffix), targetName)
-	assert.NotContains(t, targetName, d.config.ISCSI.NamePrefix)
 	iqn := "iqn.2005-10.org.freenas.ctl:" + targetName
-	t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.168.1.100:3260,1 "+iqn+" (non-flash)\n")
+	t.Setenv("FAKE_NODE_ISCSI_SESSION_OUTPUT", "tcp: [1] 192.0.2.100:3260,1 "+iqn+" (non-flash)\n")
 
 	d.cleanupOrphanedSessionByVolumeID(context.Background(), volumeID, ShareTypeISCSI)
 	log := readNodeCommandLog(t, logPath)

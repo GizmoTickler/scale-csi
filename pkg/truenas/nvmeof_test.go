@@ -433,7 +433,7 @@ func TestParseNVMeoFPort_AllFields(t *testing.T) {
 				"id":           float64(2),
 				"index":        float64(1),
 				"addr_trtype":  "RDMA",
-				"addr_traddr":  "192.168.1.100",
+				"addr_traddr":  "192.0.2.100",
 				"addr_trsvcid": float64(4420),
 				"addr_adrfam":  "IPV4",
 				"enabled":      true,
@@ -442,7 +442,7 @@ func TestParseNVMeoFPort_AllFields(t *testing.T) {
 			wantID:        2,
 			wantIndex:     1,
 			wantTransport: "RDMA",
-			wantAddress:   "192.168.1.100",
+			wantAddress:   "192.0.2.100",
 			wantPort:      4420,
 			wantEnabled:   true,
 		},
@@ -569,8 +569,8 @@ func TestResolveToIP_AlreadyIP(t *testing.T) {
 	}{
 		{
 			name:  "IPv4 address",
-			input: "192.168.1.100",
-			want:  "192.168.1.100",
+			input: "192.0.2.100",
+			want:  "192.0.2.100",
 		},
 		{
 			name:  "IPv4 wildcard",
@@ -904,10 +904,10 @@ func TestMockClient_NVMeoFPortCreate(t *testing.T) {
 	client := NewMockClient()
 	ctx := context.Background()
 
-	port, err := client.NVMeoFPortCreate(ctx, "TCP", "192.168.1.100", 4420)
+	port, err := client.NVMeoFPortCreate(ctx, "TCP", "192.0.2.100", 4420)
 	require.NoError(t, err)
 	require.NotNil(t, port)
-	assert.Equal(t, "192.168.1.100", port.Address)
+	assert.Equal(t, "192.0.2.100", port.Address)
 	assert.Equal(t, 4420, port.Port)
 }
 
@@ -924,10 +924,10 @@ func TestMockClient_NVMeoFGetOrCreatePort(t *testing.T) {
 	client := NewMockClient()
 	ctx := context.Background()
 
-	port, err := client.NVMeoFGetOrCreatePort(ctx, "TCP", "10.0.0.1", 4420)
+	port, err := client.NVMeoFGetOrCreatePort(ctx, "TCP", "198.51.100.1", 4420)
 	require.NoError(t, err)
 	require.NotNil(t, port)
-	assert.Equal(t, "10.0.0.1", port.Address)
+	assert.Equal(t, "198.51.100.1", port.Address)
 }
 
 func TestNVMeoFGetOrCreatePortSingleFlight(t *testing.T) {
@@ -1361,7 +1361,7 @@ func TestNVMeoFPortStruct_TransportTypes(t *testing.T) {
 		ID:         2,
 		Index:      1,
 		Transport:  "RDMA",
-		Address:    "192.168.1.100",
+		Address:    "192.0.2.100",
 		Port:       4420,
 		AddrFamily: "IPV4",
 		Enabled:    true,
@@ -1369,7 +1369,7 @@ func TestNVMeoFPortStruct_TransportTypes(t *testing.T) {
 	assert.Equal(t, 2, rdmaPort.ID)
 	assert.Equal(t, 1, rdmaPort.Index)
 	assert.Equal(t, "RDMA", rdmaPort.Transport)
-	assert.Equal(t, "192.168.1.100", rdmaPort.Address)
+	assert.Equal(t, "192.0.2.100", rdmaPort.Address)
 	assert.Equal(t, 4420, rdmaPort.Port)
 	assert.Equal(t, "IPV4", rdmaPort.AddrFamily)
 	assert.True(t, rdmaPort.Enabled)

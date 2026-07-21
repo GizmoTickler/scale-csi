@@ -13,6 +13,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
@@ -83,6 +84,12 @@ type Driver struct {
 	// Operation lock to prevent concurrent operations on same volume
 	operationLock sync.Map
 
+	// Node mount state supplements the live mount table with the CSI identity
+	// and capability that cannot be reconstructed from kernel mount metadata.
+	nodeMountStateMu sync.Mutex
+	stagedTargets    map[string]nodeMountRecord
+	publishedTargets map[string]nodeMountRecord
+
 	// Ready flag (atomic for safe concurrent access)
 	ready atomic.Bool
 
@@ -101,9 +108,11 @@ type Driver struct {
 	reconcileCancel context.CancelFunc
 	reconcileWg     sync.WaitGroup
 
-	// Track when orphaned sessions were first seen (for grace period)
-	// Key: session identifier (IQN or NQN), Value: first seen time
-	orphanedSessionsSeen sync.Map
+	// Track when orphaned sessions were first seen (for grace period). The
+	// protocol maps must remain independent: a cleanup pass may only retire
+	// stale observations from its own enumeration.
+	orphanedISCSISessionsSeen sync.Map // Key: IQN, Value: first seen time
+	orphanedNVMeSessionsSeen  sync.Map // Key: NQN, Value: first seen time
 
 	// Service reload debouncer (prevents reload storms during bulk provisioning)
 	serviceReloadDebouncer *ServiceReloadDebouncer
@@ -152,31 +161,37 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		}
 	}
 
-	// Create TrueNAS API client with resilience settings
-	truenasClient, err := newTrueNASClient(&truenas.ClientConfig{
-		Host:              cfg.Config.TrueNAS.Host,
-		Port:              cfg.Config.TrueNAS.Port,
-		Protocol:          cfg.Config.TrueNAS.Protocol,
-		APIKey:            cfg.Config.TrueNAS.APIKey,
-		AllowInsecure:     cfg.Config.TrueNAS.AllowInsecure,
-		CACert:            cfg.Config.TrueNAS.CACert,
-		CACertFile:        cfg.Config.TrueNAS.CACertFile,
-		Timeout:           time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
-		ConnectTimeout:    time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
-		WriteTimeout:      time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,
-		MaxConcurrentReqs: cfg.Config.TrueNAS.MaxConcurrentRequests,
-		LazyConnect:       !cfg.RunController,
-		MetricsRecorder:   RecordTrueNASRequest,
-		// Circuit breaker configuration
-		CircuitBreaker: cbConfig,
-		// Retry configuration
-		APIRetryMaxAttempts:   cfg.Config.Resilience.Retry.MaxAttempts,
-		APIRetryInitialDelay:  time.Duration(cfg.Config.Resilience.Retry.InitialDelay) * time.Millisecond,
-		APIRetryMaxDelay:      time.Duration(cfg.Config.Resilience.Retry.MaxDelay) * time.Millisecond,
-		APIRetryBackoffFactor: cfg.Config.Resilience.Retry.BackoffMultiplier,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create TrueNAS client: %w", err)
+	// Node RPCs use only local mount and transport tools. Construct the
+	// management client exclusively for controller mode so node pods neither
+	// need nor retain TrueNAS API credentials.
+	var truenasClient truenas.ClientInterface
+	if cfg.RunController {
+		if strings.TrimSpace(cfg.Config.TrueNAS.APIKey) == "" {
+			return nil, fmt.Errorf("truenas.apiKey is required in controller mode")
+		}
+		var err error
+		truenasClient, err = newTrueNASClient(&truenas.ClientConfig{
+			Host:                  cfg.Config.TrueNAS.Host,
+			Port:                  cfg.Config.TrueNAS.Port,
+			Protocol:              cfg.Config.TrueNAS.Protocol,
+			APIKey:                cfg.Config.TrueNAS.APIKey,
+			AllowInsecure:         cfg.Config.TrueNAS.AllowInsecure,
+			CACert:                cfg.Config.TrueNAS.CACert,
+			CACertFile:            cfg.Config.TrueNAS.CACertFile,
+			Timeout:               time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
+			ConnectTimeout:        time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
+			WriteTimeout:          time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,
+			MaxConcurrentReqs:     cfg.Config.TrueNAS.MaxConcurrentRequests,
+			MetricsRecorder:       RecordTrueNASRequest,
+			CircuitBreaker:        cbConfig,
+			APIRetryMaxAttempts:   cfg.Config.Resilience.Retry.MaxAttempts,
+			APIRetryInitialDelay:  time.Duration(cfg.Config.Resilience.Retry.InitialDelay) * time.Millisecond,
+			APIRetryMaxDelay:      time.Duration(cfg.Config.Resilience.Retry.MaxDelay) * time.Millisecond,
+			APIRetryBackoffFactor: cfg.Config.Resilience.Retry.BackoffMultiplier,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TrueNAS client: %w", err)
+		}
 	}
 
 	// Configure utility package timeouts and rate limiting
@@ -207,11 +222,15 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		}
 	}
 
-	// Initialize service reload debouncer for iSCSI
-	debounceDelay := time.Duration(cfg.Config.ISCSI.ServiceReloadDebounce) * time.Millisecond
-	serviceDebouncer := NewServiceReloadDebouncer(debounceDelay, func(ctx context.Context, service string) error {
-		return truenasClient.ServiceReload(ctx, service)
-	})
+	// The debouncer invokes the management API and therefore exists only beside
+	// the controller client.
+	var serviceDebouncer *ServiceReloadDebouncer
+	if truenasClient != nil {
+		debounceDelay := time.Duration(cfg.Config.ISCSI.ServiceReloadDebounce) * time.Millisecond
+		serviceDebouncer = NewServiceReloadDebouncer(debounceDelay, func(ctx context.Context, service string) error {
+			return truenasClient.ServiceReload(ctx, service)
+		})
+	}
 
 	driver := &Driver{
 		name:                   cfg.Name,
@@ -226,6 +245,8 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		eventRecorder:          eventRecorder,
 		serviceReloadDebouncer: serviceDebouncer,
 		nvmeResolvedHosts:      make(map[string]int),
+		stagedTargets:          make(map[string]nodeMountRecord),
+		publishedTargets:       make(map[string]nodeMountRecord),
 	}
 	driver.observeTrueNASConnection()
 	return driver, nil
@@ -369,8 +390,9 @@ func (d *Driver) logInterceptor(
 		klog.V(4).Infof("[req-%d] %s", requestID, info.FullMethod)
 	}
 
-	// Log full request at higher verbosity
-	klog.V(5).Infof("[req-%d] request: %+v", requestID, req)
+	// Log a cloned request with any CSI secrets structurally removed. The
+	// original request is left untouched for the RPC handler.
+	klog.V(5).Infof("[req-%d] request: %+v", requestID, requestWithoutSecrets(req))
 
 	// Handle the request
 	resp, err := handler(ctx, req)
@@ -390,6 +412,19 @@ func (d *Driver) logInterceptor(
 	}
 
 	return resp, err
+}
+
+func requestWithoutSecrets(req interface{}) interface{} {
+	message, ok := req.(proto.Message)
+	if !ok || message == nil {
+		return req
+	}
+	cloned := proto.Clone(message)
+	reflected := cloned.ProtoReflect()
+	if secrets := reflected.Descriptor().Fields().ByName("secrets"); secrets != nil {
+		reflected.Clear(secrets)
+	}
+	return cloned
 }
 
 // acquireOperationLock acquires a lock for the given operation key.
@@ -417,25 +452,28 @@ func (d *Driver) GetConfig() *Config {
 // startSessionGC starts the periodic session garbage collection goroutine.
 // This runs only on the node plugin and cleans up orphaned iSCSI/NVMe-oF sessions.
 func (d *Driver) startSessionGC() {
-	// Check if GC is enabled (default to true if Interval > 0)
-	if d.config.SessionGC.Interval <= 0 {
-		klog.Info("Session GC disabled (interval <= 0)")
-		return
+	cleanupEnabled := d.config.SessionGC.Enabled
+	if !cleanupEnabled {
+		klog.Info("Session cleanup disabled by configuration; active-session metrics remain enabled")
+	}
+	intervalSeconds := d.config.SessionGC.Interval
+	if intervalSeconds <= 0 {
+		intervalSeconds = 300
 	}
 
-	interval := time.Duration(d.config.SessionGC.Interval) * time.Second
+	interval := time.Duration(intervalSeconds) * time.Second
 	gracePeriod := time.Duration(d.config.SessionGC.GracePeriod) * time.Second
 	dryRun := d.config.SessionGC.DryRun
 	startupDelay := time.Duration(d.config.SessionGC.StartupDelay) * time.Second
 
 	// Per-protocol GC settings (default to enabled if protocol is configured)
-	iscsiGCEnabled := d.config.ISCSI.TargetPortal != ""
+	iscsiGCEnabled := cleanupEnabled && d.config.ISCSI.TargetPortal != ""
 	if d.config.SessionGC.ISCSIEnabled != nil {
-		iscsiGCEnabled = *d.config.SessionGC.ISCSIEnabled && d.config.ISCSI.TargetPortal != ""
+		iscsiGCEnabled = cleanupEnabled && *d.config.SessionGC.ISCSIEnabled && d.config.ISCSI.TargetPortal != ""
 	}
-	nvmeofGCEnabled := d.config.NVMeoF.TransportAddress != ""
+	nvmeofGCEnabled := cleanupEnabled && d.config.NVMeoF.TransportAddress != ""
 	if d.config.SessionGC.NVMeoFEnabled != nil {
-		nvmeofGCEnabled = *d.config.SessionGC.NVMeoFEnabled && d.config.NVMeoF.TransportAddress != ""
+		nvmeofGCEnabled = cleanupEnabled && *d.config.SessionGC.NVMeoFEnabled && d.config.NVMeoF.TransportAddress != ""
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -444,8 +482,8 @@ func (d *Driver) startSessionGC() {
 	d.gcWg.Add(1)
 	go func() {
 		defer d.gcWg.Done()
-		klog.Infof("Session GC started: interval=%v, gracePeriod=%v, dryRun=%v, iSCSI=%v, NVMeoF=%v",
-			interval, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
+		klog.Infof("Session monitor started: interval=%v, cleanup=%v, gracePeriod=%v, dryRun=%v, iSCSI=%v, NVMeoF=%v",
+			interval, cleanupEnabled, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
 
 		// Short delay to let the system stabilize, then run startup GC
 		select {
@@ -458,9 +496,13 @@ func (d *Driver) startSessionGC() {
 		// Run GC immediately on startup to clean up stale sessions from node crashes
 		// This is proactive cleanup before the first interval tick
 		// RunOnStartup defaults to true via config loading
-		if d.config.SessionGC.RunOnStartup != nil && *d.config.SessionGC.RunOnStartup {
+		if cleanupEnabled && d.config.SessionGC.RunOnStartup != nil && *d.config.SessionGC.RunOnStartup {
 			klog.Info("Session GC: running proactive cleanup on startup")
 			d.runSessionGCWithProtocols(ctx, gracePeriod, dryRun, iscsiGCEnabled, nvmeofGCEnabled)
+		} else {
+			// Keep the session-count gauges current even when cleanup or startup
+			// cleanup is disabled. This path only performs read-only enumeration.
+			d.runSessionGCWithProtocols(ctx, gracePeriod, dryRun, false, false)
 		}
 
 		ticker := time.NewTicker(interval)
@@ -557,7 +599,8 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 	orphanedCount := 0
 	now := time.Now()
 
-	// Track which sessions are still active (to clean up stale entries from orphanedSessionsSeen)
+	// Track which owned sessions remain active so this protocol's stale
+	// first-seen entries can be retired without touching NVMe state.
 	activeOrphanedSessions := make(map[string]struct{})
 
 	for _, session := range sessions {
@@ -570,12 +613,16 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 			klog.V(5).Infof("Session GC: skipping session %s (different portal: %s)", session.IQN, session.Portal)
 			continue
 		}
+		if !d.isDriverISCSITarget(session.IQN) {
+			klog.V(5).Infof("Session GC: skipping session %s (target is not owned by this driver)", session.IQN)
+			continue
+		}
 
 		// Check if this session is expected
 		if _, expected := expectedTargets[session.IQN]; expected {
 			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.IQN)
 			// Remove from orphaned tracking if it was previously orphaned
-			d.orphanedSessionsSeen.Delete(session.IQN)
+			d.orphanedISCSISessionsSeen.Delete(session.IQN)
 			continue
 		}
 
@@ -583,11 +630,11 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 		activeOrphanedSessions[session.IQN] = struct{}{}
 
 		// Check when we first saw this orphaned session
-		firstSeenVal, loaded := d.orphanedSessionsSeen.LoadOrStore(session.IQN, now)
+		firstSeenVal, loaded := d.orphanedISCSISessionsSeen.LoadOrStore(session.IQN, now)
 		firstSeen, ok := firstSeenVal.(time.Time)
 		if !ok {
-			klog.Warningf("Session GC: unexpected type in orphanedSessionsSeen for %s, resetting", session.IQN)
-			d.orphanedSessionsSeen.Store(session.IQN, now)
+			klog.Warningf("Session GC: unexpected type in iSCSI first-seen state for %s, resetting", session.IQN)
+			d.orphanedISCSISessionsSeen.Store(session.IQN, now)
 			continue
 		}
 
@@ -617,15 +664,15 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 		} else {
 			klog.Infof("Session GC: disconnected orphaned iSCSI session: %s", session.IQN)
 			RecordGCSessionDisconnected("iscsi")
-			d.orphanedSessionsSeen.Delete(session.IQN)
+			d.orphanedISCSISessionsSeen.Delete(session.IQN)
 		}
 	}
 
-	// Clean up stale entries from orphanedSessionsSeen (sessions no longer active)
-	d.orphanedSessionsSeen.Range(func(key, _ interface{}) bool {
+	// Clean up stale iSCSI entries for sessions that are no longer active.
+	d.orphanedISCSISessionsSeen.Range(func(key, _ interface{}) bool {
 		iqn := key.(string)
 		if _, active := activeOrphanedSessions[iqn]; !active {
-			d.orphanedSessionsSeen.Delete(iqn)
+			d.orphanedISCSISessionsSeen.Delete(iqn)
 		}
 		return true
 	})
@@ -667,7 +714,8 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 	targetAddr := d.config.NVMeoF.TransportAddress
 	now := time.Now()
 
-	// Track which sessions are still active (to clean up stale entries from orphanedSessionsSeen)
+	// Track which sessions are still active so stale NVMe first-seen entries can
+	// be retired without touching iSCSI state.
 	activeOrphanedSessions := make(map[string]struct{})
 
 	for _, session := range sessions {
@@ -676,8 +724,8 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 			return
 		}
 		// Only consider sessions for our target address
-		// Session address format from nvme list-subsys: "traddr=192.168.120.10,trsvcid=4420,src_addr=192.168.122.10"
-		// Config address format: "192.168.120.10"
+		// Session address format from nvme list-subsys: "traddr=192.0.2.10,trsvcid=4420,src_addr=203.0.113.10"
+		// Config address format: "192.0.2.10"
 		if !nvmeSessionMatchesTransportAddress(session.Address, targetAddr) {
 			klog.V(5).Infof("Session GC: skipping session %s (different address: %s, target: %s)", session.NQN, session.Address, targetAddr)
 			continue
@@ -687,7 +735,7 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 		if _, expected := expectedNQNs[session.NQN]; expected {
 			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.NQN)
 			// Remove from orphaned tracking if it was previously orphaned
-			d.orphanedSessionsSeen.Delete(session.NQN)
+			d.orphanedNVMeSessionsSeen.Delete(session.NQN)
 			continue
 		}
 
@@ -695,11 +743,11 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 		activeOrphanedSessions[session.NQN] = struct{}{}
 
 		// Check when we first saw this orphaned session
-		firstSeenVal, loaded := d.orphanedSessionsSeen.LoadOrStore(session.NQN, now)
+		firstSeenVal, loaded := d.orphanedNVMeSessionsSeen.LoadOrStore(session.NQN, now)
 		firstSeen, ok := firstSeenVal.(time.Time)
 		if !ok {
-			klog.Warningf("Session GC: unexpected type in orphanedSessionsSeen for %s, resetting", session.NQN)
-			d.orphanedSessionsSeen.Store(session.NQN, now)
+			klog.Warningf("Session GC: unexpected type in NVMe first-seen state for %s, resetting", session.NQN)
+			d.orphanedNVMeSessionsSeen.Store(session.NQN, now)
 			continue
 		}
 
@@ -729,18 +777,17 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 		} else {
 			klog.Infof("Session GC: disconnected orphaned NVMe-oF session: %s", session.NQN)
 			RecordGCSessionDisconnected("nvmeof")
-			d.orphanedSessionsSeen.Delete(session.NQN)
+			d.orphanedNVMeSessionsSeen.Delete(session.NQN)
 		}
 	}
 
-	// Clean up stale entries from orphanedSessionsSeen for NVMe-oF sessions
-	// Note: We prefix NVMe NQNs differently than iSCSI IQNs, so no collision
-	d.orphanedSessionsSeen.Range(func(key, _ interface{}) bool {
+	// Clean up stale entries from the NVMe-oF first-seen map.
+	d.orphanedNVMeSessionsSeen.Range(func(key, _ interface{}) bool {
 		nqn := key.(string)
 		// Only clean up NVMe-oF entries (NQNs start with "nqn.")
 		if strings.HasPrefix(nqn, "nqn.") {
 			if _, active := activeOrphanedSessions[nqn]; !active {
-				d.orphanedSessionsSeen.Delete(nqn)
+				d.orphanedNVMeSessionsSeen.Delete(nqn)
 			}
 		}
 		return true

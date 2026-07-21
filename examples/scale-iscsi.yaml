@@ -56,9 +56,7 @@ iscsi:
   # iSCSI interface for iscsiadm (leave empty to omit -I flag)
   interface: ""
 
-  # Target naming
-  # Full IQN limit is 223 bytes, plan accordingly
-  namePrefix: csi-
+  # Optional target-name suffix
   nameSuffix: "-k8s"
 
   # Target groups configuration
