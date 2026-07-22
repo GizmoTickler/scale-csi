@@ -1,7 +1,11 @@
 {{- $root := . -}}
 {{- $classes := .Values.storageClasses -}}
 {{- if .Values.storageClass -}}
-  {{- $legacy := mergeOverwrite (dict "create" true "name" "scale-nfs" "protocol" "nfs" "isDefault" false "reclaimPolicy" "Delete" "allowVolumeExpansion" true "volumeBindingMode" "Immediate" "mountOptions" (list "nfsvers=4" "noatime") "extraParameters" (dict)) (deepCopy .Values.storageClass) -}}
+  {{- /* The legacy defaults deliberately omit "protocol" so the deprecated path
+       shares the modern omit-when-unset behavior below: a protocol is emitted
+       only when the values entry sets one. Defaulting it to nfs here would
+       silently force nfs on an iscsi/nvmeof class. */}}
+  {{- $legacy := mergeOverwrite (dict "create" true "name" "scale-nfs" "isDefault" false "reclaimPolicy" "Delete" "allowVolumeExpansion" true "volumeBindingMode" "Immediate" "mountOptions" (list "nfsvers=4" "noatime") "extraParameters" (dict)) (deepCopy .Values.storageClass) -}}
   {{- if $legacy.create -}}
     {{- $classes = list $legacy -}}
   {{- else -}}

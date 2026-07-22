@@ -27,12 +27,16 @@ jobs:
   release:
     name: Package and Sign Helm Chart
     # Run the lint pass on main pushes; run the tag publish only when the tag CI
-    # workflow_run completed successfully. workflow_run also fires for main-branch
-    # CI runs, so the head branch must be a v* tag to proceed.
+    # workflow_run completed successfully. workflow_run fires for every CI run —
+    # including pull_request builds — so require the triggering CI run to itself
+    # be a push event with a v* head branch. A PR whose head branch is merely
+    # named "v1.2.3" is a pull_request event and is rejected here; the tag is
+    # then re-verified against head_sha in the step below before any publish.
     if: >-
       github.event_name == 'push' ||
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
     permissions:
@@ -47,6 +51,30 @@ jobs:
           # For a workflow_run trigger GITHUB_SHA points at the default branch;
           # check out the tagged commit that CI actually validated instead.
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Verify tag resolves to the CI-validated commit
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_REF="refs/tags/${RUN_HEAD_BRANCH}"
+          # Dereference to the commit (^{commit}) so lightweight and annotated
+          # tags both compare against the commit SHA CI actually built. Refuse
+          # to publish unless the v* head branch is a real tag pointing exactly
+          # at head_sha — this defeats a branch merely named "vX" and any
+          # tag/commit spoof.
+          if ! TAG_SHA=$(git rev-parse --verify --quiet "${TAG_REF}^{commit}"); then
+            echo "::error::${TAG_REF} does not exist in the checked-out tree; refusing to publish."
+            exit 1
+          fi
+          if [[ "${TAG_SHA}" != "${RUN_HEAD_SHA}" ]]; then
+            echo "::error::${TAG_REF} points at ${TAG_SHA}, not the CI-validated commit ${RUN_HEAD_SHA}; refusing to publish."
+            exit 1
+          fi
+          echo "Verified ${TAG_REF} resolves to ${RUN_HEAD_SHA}."
 
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
