@@ -1,9 +1,9 @@
 # Production deployment
 
-This guide describes the behavior implemented by scale-csi v1.2.0 and the
-bundled Helm chart. Review the [deployment guide](deployment.md) for installation
-examples and the chart's [values reference](../charts/scale-csi/README.md) for
-every setting.
+This guide describes the current scale-csi repository and bundled Helm chart,
+based on the v1.2.23 release line. Review the [deployment guide](deployment.md)
+for installation examples and the chart's
+[values reference](../charts/scale-csi/README.md) for every setting.
 
 ## Prerequisites
 
@@ -52,15 +52,16 @@ not install host packages or load modules.
 
 ## Availability and outage behavior
 
-Set `controller.replicas: 1` for operation-lock correctness. The driver's
-cross-volume operation lock is in memory and therefore per process. Although
-the provisioner, attacher, resizer, and snapshotter sidecars each use
-Lease-based leader election, independently elected sidecars can send related
-requests to different controller pods, whose pod-local locks are not mutually
-exclusive. Do not enable `controller.podDisruptionBudget` with one replica.
-The controller is restart-recovered: controller downtime pauses provisioning,
-attachment, resize, and snapshot operations, but does not interrupt workloads
-that are already using their volumes. The defaults use
+The default is `controller.replicas: 1`. With `fencing.mode=off`, values greater
+than one enable leader election on the provisioner, attacher, resizer, and
+snapshotter; the chart also supplies preferred hostname anti-affinity and, by
+default, a PDB with `maxUnavailable: 1`. This is controller-availability
+groundwork, not a claim that the driver has a distributed operation lock.
+Additive and strict fencing require exactly one controller because their
+background reconcilers are singleton writers; schema and template guards reject
+any other replica count. The controller is restart-recovered: downtime pauses
+provisioning, attachment, resize, and snapshot operations, but does not
+interrupt workloads already using their volumes. The defaults use
 `system-cluster-critical` for the controller pod and `system-node-critical` for
 the node DaemonSet.
 
@@ -69,9 +70,11 @@ the node DaemonSet.
 Cross-process serialization of `CreateVolume` (and the other controller RPCs)
 is a layered contract, not a single mechanism:
 
-- The CO's external-provisioner leader election plus the chart's
-  single-replica controller deployment are the primary guarantee that only one
-  controller process mutates the backend at a time. The chart enforces the
+- The default single-replica controller deployment is the primary guarantee
+  that only one controller process mutates the backend at a time. With
+  `replicas>1`, each CSI sidecar elects its own leader; those independent
+  elections improve failover but can select different pods and do not serialize
+  every controller RPC through one process. The chart enforces the
   `Recreate` deployment strategy only when `fencing.mode` is not `off`; in the
   default `off` mode the Deployment keeps the server-default `RollingUpdate`,
   so a rollout can briefly run an old and a new controller pod side by side.
@@ -85,13 +88,13 @@ is a layered contract, not a single mechanism:
   interleave can each observe their own value and both report success. A
   detected lost race returns retryable `Aborted` instead of double-owning a
   dataset; an undetected one is tolerable only because both writers are the
-  same driver instance writing identical identity values. Correctness
-  therefore rests on the leader election and singleton topology above; this
-  machinery does **not** turn multi-writer operation into a supported
-  topology. Running multiple concurrently active controller processes against
-  the same parent dataset — e.g. two releases, a forced multi-replica
-  deployment, or overlapping old/new controllers held alive outside the tested
-  upgrade sequence — is out of contract.
+  same driver instance writing identical identity values. The strongest
+  concurrency contract therefore remains the singleton topology. Off-mode
+  multi-replica rendering is deliberately HA groundwork and must be validated
+  against the operator's workload; it does not turn these markers into a
+  distributed lock. Two independent releases against the same parent, any
+  multi-replica fenced deployment, and overlapping old/new fenced controllers
+  remain out of contract.
 - Upgrade note: tombstone-ledger entries written by pre-release builds lack
   the recorded creation identity (`created_at`) and are permanently skipped by
   the reaper (fail-closed). No released version ever wrote ledger entries, so
@@ -152,8 +155,9 @@ semaphore and sidecar timeouts accordingly.
 
 Steady-state measurements are approximately 15Mi memory and 1m CPU per driver
 container. The chart requests 10m CPU and 32Mi memory for each controller and
-node driver container by default and sets no limits. Sidecar resources remain
-unset. Override `controller.resources` and `node.resources` for your workload.
+node driver container and sets a 256Mi driver memory limit. Every CSI sidecar
+requests 10m CPU and 32Mi memory with a 128Mi memory limit. Override the
+corresponding resource map for measured workload needs.
 
 When limits are set, `automaxprocs` derives `GOMAXPROCS` from the CPU cgroup and
 the driver sets `GOMEMLIMIT` to 90% of the finite memory cgroup limit unless the
@@ -180,9 +184,11 @@ backend loss.
   It returns `FailedPrecondition` until those snapshots are removed or the task
   excludes the CSI parent. Setting `zfs.destroyForeignSnapshotsOnDelete: true`
   explicitly permits recursive deletion of the dataset and those snapshots.
-- The default `nvmeof.subsystemAllowAnyHost: true` permits any initiator host
-  NQN. To restrict access, set it to `false` and populate
-  `nvmeof.subsystemHosts` with each node's NVMe host NQN — obtained by running `nvme show-hostnqn` on the node (nvme-cli derives a stable NQN from the machine identity even when `/etc/nvme/hostnqn` does not exist, as on Flatcar) — for every
+- The default `nvmeof.subsystemAllowAnyHost: false` denies unlisted initiator
+  NQNs. Populate `nvmeof.subsystemHosts` with each node's NVMe host NQN —
+  obtained by running `nvme show-hostnqn` on the node (nvme-cli derives a
+  stable NQN from the machine identity even when `/etc/nvme/hostnqn` does not
+  exist, as on Flatcar) — for every
   Kubernetes node that may use the StorageClass. The controller resolves or
   creates the corresponding TrueNAS host records and associates their IDs with
   each new subsystem. It does not auto-discover node NQNs; restricted mode with
@@ -266,14 +272,28 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
    `existingSecret` do **not** alter a checksum annotation, so restart both
    workloads explicitly after rotating that Secret.
 
-4. The chart pins provisioner, attacher, resizer, snapshotter,
-   registrar, and liveness images. CSI sidecars have independent Kubernetes and
+4. The chart declares versioned provisioner, attacher, resizer, snapshotter,
+   registrar, and liveness image defaults, all overridable in values and tracked
+   by Renovate. CSI sidecars have independent Kubernetes and
    CSI compatibility matrices; do not upgrade one image in isolation without
    checking its release notes. Snapshot support also requires cluster-installed
    snapshot CRDs and the common snapshot controller, which this chart does not
    install. Keep their API generation compatible with the snapshotter.
 
-5. For the v1.2.23 fencing migration, keep `fencing.mode=off`, upgrade the node
+5. StorageClass parameters are immutable. A multi-protocol deployment now
+   requires `parameters.protocol`; create a replacement StorageClass, update
+   workload manifests, and then retire/recreate the old class deliberately.
+   Existing bound PVs are not reprovisioned by this metadata migration. See the
+   [StorageClass upgrade procedure](reference/storageclass.md#upgrade-add-protocol-safely).
+
+6. The node DaemonSet intentionally receives no `TRUENAS_API_KEY`. Routine
+   stage/publish/unpublish/unstage and local expansion use host tools and start
+   in lazy-connect mode, but a node-side operation that actually requires the
+   management API cannot borrow the controller's Secret and will fail without
+   credentials. Treat this as an explicit security boundary when upgrading
+   from manifests that injected the key into every pod.
+
+7. For the v1.2.23 fencing migration, keep `fencing.mode=off`, upgrade the node
    DaemonSet/image first, and wait for every CSINode to re-register its versioned
    transport identity before enabling `additive`. Enable `strict` only after
    `scale_csi_fencing_deferred_total` remains at zero. Roll the v1.2.23
@@ -288,7 +308,7 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
    mount, expand, snapshot, restore, unmount, and delete in a staging namespace
    before production rollout.
 
-## Known limitations in v1.2.0
+## Current known limitations
 
 - Driver-created iSCSI targets have no CHAP or per-tenant initiator isolation;
   an allow-all initiator group makes storage-network segmentation the access

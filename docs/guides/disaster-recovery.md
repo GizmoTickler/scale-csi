@@ -32,12 +32,13 @@ the first time a pod attaches it — no manual re-export step.
 ## Runbook: fail over to a DR TrueNAS
 
 1. **Replicate the CSI parent dataset.** On the primary TrueNAS, create a replication
-   task for `zfs.datasetParentName` (e.g. `pool/csi`) to the DR TrueNAS. Use
+   task for the dataset configured as chart value `zfs.parentDataset` (driver
+   config key `zfs.datasetParentName`, e.g. `pool/csi`) to the DR TrueNAS. Use
    **recursive** + **include dataset properties** so every child volume and its
    `truenas-csi:*` metadata (and CSI snapshots) are carried over.
 
 2. **Point a scale-csi install at the DR TrueNAS.** Deploy the driver on the DR cluster
-   (or repoint the existing one) with the **same** `zfs.datasetParentName` and the same
+   (or repoint the existing one) with the **same** `zfs.parentDataset` value and the same
    `StorageClass` definitions (same protocols, portals/transport). Keep
    `controller.replicas: 1` (see [Production](../production.md) — the operation lock is
    per-process).

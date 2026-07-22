@@ -26,7 +26,7 @@ kubectl logs -n scale-csi -l app=scale-csi-controller -c scale-csi --tail=100
 # Node plugin logs (on specific node)
 kubectl logs -n scale-csi -l app=scale-csi-node -c scale-csi --tail=100
 
-# Enable verbose logging by setting --v=4 in the container args
+# With Helm, enable verbose logging with: --set logging.verbosity=4
 ```
 
 ## Common Issues
@@ -49,18 +49,22 @@ kubectl get events --field-selector involvedObject.name=<pvc-name>
    - Review controller logs for connection errors
 
    ```bash
-   # Test connectivity from controller pod
-   kubectl exec -n scale-csi <controller-pod> -c scale-csi -- \
-     wget -q --spider https://<truenas-host>/api/v2.0/system/info
+   # Test TCP/TLS reachability from the cluster. An HTTP 400 response is
+   # expected without a WebSocket upgrade and still proves the endpoint is reachable.
+   kubectl run truenas-connectivity --rm -it --restart=Never \
+     --image=curlimages/curl -- \
+     curl -vk https://<truenas-host>/api/current
    ```
 
 2. **Storage Pool Full**
    - Check available space on TrueNAS
    - Review ZFS pool status
 
-3. **Invalid StorageClass Parameters**
-   - Verify `datasetParentName` exists on TrueNAS
-   - Check protocol-specific settings (NFS host, iSCSI portal, etc.)
+3. **Invalid StorageClass or driver configuration**
+   - Verify the chart's `zfs.parentDataset` exists on TrueNAS (it renders as
+     `zfs.datasetParentName` in the strict driver configuration)
+   - Verify the StorageClass has the required `protocol` parameter
+   - Check protocol-specific Helm values (NFS host, iSCSI portal, and so on)
 
 4. **Circuit Breaker Open**
    - If too many API failures occurred, the circuit breaker may be open
@@ -129,13 +133,16 @@ kubectl describe pod <pod-name>
    ```
 
 4. **Device Not Appearing**
-   - Increase `iscsi.deviceWaitTimeout` or `nvmeof.deviceWaitTimeout`
+   - For iSCSI, increase the chart value `iscsi.deviceWaitTimeout`
+   - `nvmeof.deviceWaitTimeout` exists in raw driver configuration but is not
+     exposed by the Helm chart; do not add it to chart values
    - Check for kernel module issues (`iscsi_tcp`, `nvme-tcp`)
-   - Verify multipath configuration if used
+   - Ensure dm-multipath has not claimed an iSCSI component device; scale-csi
+     intentionally rejects iSCSI multipath
 
 #### Symptom: Mount succeeds but filesystem is read-only
 
-- Check volume capability in StorageClass
+- Check the PVC access mode and pod volume-mount `readOnly` setting
 - Verify TrueNAS dataset isn't set to read-only
 - Check for filesystem errors (run fsck if necessary)
 
@@ -179,8 +186,11 @@ The driver includes automatic session garbage collection. If you see duplicate s
    resilience:
      rateLimiting:
        maxConcurrentLogins: 2   # Limit iSCSI login concurrency
-       discoveryCacheDuration: 30  # Cache discovery results
    ```
+
+   The chart exposes only `maxConcurrentRequests` and
+   `maxConcurrentLogins` under `resilience.rateLimiting`;
+   `discoveryCacheDuration` is not a valid chart value.
 
 2. **Tune retry settings:**
    ```yaml
@@ -206,7 +216,8 @@ The driver includes automatic session garbage collection. If you see duplicate s
 
 #### Symptom: Snapshot creation fails
 
-- Verify snapshots are enabled in your StorageClass
+- Verify the snapshot CRDs and external snapshot-controller are installed
+- Verify the `VolumeSnapshotClass` uses driver `csi.scale.io`
 - Check TrueNAS has sufficient snapshot quota
 - Ensure source volume exists and is accessible
 
@@ -230,17 +241,18 @@ The driver includes automatic session garbage collection. If you see duplicate s
 
 ## Health Checks
 
-The driver exposes health endpoints on the configured port (default: 9808):
+The liveness sidecar serves `/healthz` on port 9808. Driver readiness and
+Prometheus metrics use `metrics.port`, which defaults to 9809:
 
 ```bash
 # Liveness check
 curl http://<node-ip>:9808/healthz
 
 # Readiness check
-curl http://<node-ip>:9808/readyz
+curl http://<node-ip>:9809/readyz
 
 # Metrics (if enabled)
-curl http://<node-ip>:9808/metrics
+curl http://<node-ip>:9809/metrics
 ```
 
 ## Collecting Debug Information
@@ -268,7 +280,7 @@ When reporting issues, include:
    kubectl get events -n scale-csi --sort-by='.lastTimestamp'
    ```
 
-5. **TrueNAS version and configuration (if possible)
+5. **TrueNAS version and configuration (if possible)**
 
 ## Recovery Procedures
 
