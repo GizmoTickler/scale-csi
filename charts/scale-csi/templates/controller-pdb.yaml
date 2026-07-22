@@ -1,4 +1,4 @@
-{{- if and .Values.controller.enabled .Values.controller.podDisruptionBudget.enabled }}
+{{- if and .Values.controller.enabled .Values.controller.podDisruptionBudget.enabled (gt (int .Values.controller.replicas) 1) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -12,6 +12,8 @@ spec:
   minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable }}
   {{- else if ne (toString .Values.controller.podDisruptionBudget.maxUnavailable) "" }}
   maxUnavailable: {{ .Values.controller.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  maxUnavailable: 1
   {{- end }}
   selector:
     matchLabels:

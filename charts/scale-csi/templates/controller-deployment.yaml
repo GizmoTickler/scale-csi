@@ -50,14 +50,26 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.controller.affinity }}
+      {{- if .Values.controller.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.controller.affinity | nindent 8 }}
+      {{- else }}
+      {{- if gt (int .Values.controller.replicas) 1 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "scale-csi.controllerSelectorLabels" . | nindent 20 }}
+      {{- end }}
       {{- end }}
       containers:
         # CSI Driver
         - name: scale-csi
-          image: "{{ .Values.image.repository }}:{{ include "scale-csi.imageTag" . }}"
+          image: {{ include "scale-csi.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- with .Values.controller.containerSecurityContext }}
           securityContext:
@@ -127,11 +139,13 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.provisioner.timeout }}"
             - "--worker-threads={{ .Values.sidecars.provisioner.workerThreads }}"
+            {{- if gt (int .Values.controller.replicas) 1 }}
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            {{- end }}
             - "--extra-create-metadata"
             {{- range .Values.sidecars.provisioner.extraArgs }}
             - {{ . | quote }}
@@ -150,11 +164,13 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.attacher.timeout }}"
             - "--worker-threads={{ .Values.sidecars.attacher.workerThreads }}"
+            {{- if gt (int .Values.controller.replicas) 1 }}
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            {{- end }}
             {{- range .Values.sidecars.attacher.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -172,11 +188,13 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.resizer.timeout }}"
             - "--workers={{ .Values.sidecars.resizer.workerThreads }}"
+            {{- if gt (int .Values.controller.replicas) 1 }}
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            {{- end }}
             - "--handle-volume-inuse-error=false"
             {{- range .Values.sidecars.resizer.extraArgs }}
             - {{ . | quote }}
@@ -195,11 +213,13 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.snapshotter.timeout }}"
             - "--worker-threads={{ .Values.sidecars.snapshotter.workerThreads }}"
+            {{- if gt (int .Values.controller.replicas) 1 }}
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            {{- end }}
             {{- range .Values.sidecars.snapshotter.extraArgs }}
             - {{ . | quote }}
             {{- end }}

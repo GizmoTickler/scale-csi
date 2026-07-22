@@ -46,7 +46,7 @@ spec:
       containers:
         # CSI Driver
         - name: scale-csi
-          image: "{{ .Values.image.repository }}:{{ include "scale-csi.imageTag" . }}"
+          image: {{ include "scale-csi.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "-endpoint=unix://{{ include "scale-csi.socketPath" . }}"

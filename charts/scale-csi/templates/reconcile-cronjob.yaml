@@ -54,7 +54,7 @@ spec:
           {{- end }}
           containers:
             - name: reconcile
-              image: "{{ .Values.image.repository }}:{{ include "scale-csi.imageTag" . }}"
+              image: {{ include "scale-csi.image" . | quote }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               {{- with .Values.controller.containerSecurityContext }}
               securityContext:
