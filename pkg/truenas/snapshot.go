@@ -145,70 +145,19 @@ func IsDatasetDestinationExistsError(err error) bool {
 	return errors.As(err, &destinationErr)
 }
 
-// detectSnapshotAPIPrefix detects which API prefix to use for snapshot methods.
-// This provides compatibility between TrueNAS 24.x (zfs.snapshot.*) and 25.04+ (pool.snapshot.*).
-func (c *Client) detectSnapshotAPIPrefix(ctx context.Context) string {
-	c.snapshotPrefixMu.Lock()
-	if c.snapshotAPIPrefix != "" {
-		prefix := c.snapshotAPIPrefix
-		c.snapshotPrefixMu.Unlock()
-		return prefix
-	}
-	if probeDone := c.snapshotPrefixProbeDone; probeDone != nil {
-		c.snapshotPrefixMu.Unlock()
-		select {
-		case <-probeDone:
-			c.snapshotPrefixMu.Lock()
-			prefix := c.snapshotAPIPrefix
-			c.snapshotPrefixMu.Unlock()
-			if prefix != "" {
-				return prefix
-			}
-		case <-ctx.Done():
-		}
-		return "zfs.snapshot"
-	}
-	probeDone := make(chan struct{})
-	c.snapshotPrefixProbeDone = probeDone
-	c.snapshotPrefixMu.Unlock()
-
-	detectedPrefix := ""
-
-	// Try pool.snapshot.query first (TrueNAS 25.04+)
-	_, err := c.Call(ctx, "pool.snapshot.query", [][]interface{}{}, map[string]interface{}{"limit": 1})
-	if err == nil {
-		detectedPrefix = "pool.snapshot"
-		klog.V(2).Infof("Detected TrueNAS 25.04+ API (pool.snapshot.*)")
-	} else {
-		// Fall back to zfs.snapshot.query (TrueNAS 24.x)
-		_, err = c.Call(ctx, "zfs.snapshot.query", [][]interface{}{}, map[string]interface{}{"limit": 1})
-		if err == nil {
-			detectedPrefix = "zfs.snapshot"
-			klog.V(2).Infof("Detected TrueNAS 24.x API (zfs.snapshot.*)")
-		}
-	}
-
-	c.snapshotPrefixMu.Lock()
-	if detectedPrefix != "" && c.snapshotAPIPrefix == "" {
-		c.snapshotAPIPrefix = detectedPrefix
-	}
-	prefix := c.snapshotAPIPrefix
-	c.snapshotPrefixProbeDone = nil
-	close(probeDone)
-	c.snapshotPrefixMu.Unlock()
-	if prefix != "" {
-		return prefix
-	}
-
-	// Do not cache the fallback: a transient outage must be re-probed later.
-	klog.Warningf("Could not detect snapshot API prefix, defaulting to zfs.snapshot.*")
-	return "zfs.snapshot"
-}
+// snapshotAPIPrefix is the unconditional mutation API prefix for snapshots.
+//
+// TrueNAS 25.04 is the documented floor for this driver, and 25.04 moved the
+// snapshot mutation API from zfs.snapshot.* to pool.snapshot.*. The 24.x
+// zfs.snapshot.* leg (and its runtime probe/fallback) is removed: it does not
+// exist on 26.0, so the old default was actively wrong there. Reads needing
+// user properties, plus rename and destroy, still use the separately-detected
+// TrueNAS 26.0 zfs.resource.snapshot.* path (see snapshotResourceQueryStatus).
+const snapshotAPIPrefix = "pool.snapshot"
 
 // snapshotMethod returns the full API method name for a snapshot operation.
-func (c *Client) snapshotMethod(ctx context.Context, operation string) string {
-	prefix := c.detectSnapshotAPIPrefix(ctx)
-	return prefix + "." + operation
+func (c *Client) snapshotMethod(operation string) string {
+	return snapshotAPIPrefix + "." + operation
 }
 
 // Snapshot represents a ZFS snapshot from the TrueNAS API.
@@ -238,7 +187,7 @@ type SnapshotCreateParams struct {
 // SnapshotCreate creates a new ZFS snapshot with user properties applied
 // atomically by the create operation when the API generation supports it.
 func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*Snapshot, error) {
-	prefix := c.detectSnapshotAPIPrefix(ctx)
+	prefix := snapshotAPIPrefix
 	params := &SnapshotCreateParams{
 		Dataset:    dataset,
 		Name:       name,
@@ -357,7 +306,7 @@ func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, 
 			"defer":     defer_,
 			"recursive": recursive,
 		}
-		_, err = c.Call(ctx, c.snapshotMethod(ctx, "delete"), snapshotID, options)
+		_, err = c.Call(ctx, c.snapshotMethod("delete"), snapshotID, options)
 	}
 	if err != nil {
 		// Log full error details before fallback logic (helps debug ambiguous errors)
@@ -401,7 +350,7 @@ func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, 
 
 // SnapshotRename renames a snapshot within its current dataset. TrueNAS 26.0
 // exposes the operation through zfs.resource.snapshot.rename; older releases
-// use the version-detected pool.snapshot.* or zfs.snapshot.* mutation API.
+// use the pool.snapshot.* mutation API.
 func (c *Client) SnapshotRename(ctx context.Context, snapshotID, newName string) error {
 	dataset, _, ok := strings.Cut(snapshotID, "@")
 	if !ok || dataset == "" || newName == "" {
@@ -426,7 +375,7 @@ func (c *Client) SnapshotRename(ctx context.Context, snapshotID, newName string)
 		"force":     false,
 		"recursive": false,
 	}
-	if _, err := c.Call(ctx, c.snapshotMethod(ctx, "rename"), snapshotID, options); err != nil {
+	if _, err := c.Call(ctx, c.snapshotMethod("rename"), snapshotID, options); err != nil {
 		return fmt.Errorf("failed to rename snapshot: %w", err)
 	}
 	return nil
@@ -451,7 +400,7 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 		return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
 	}
 
-	result, err := c.Call(ctx, c.snapshotMethod(ctx, "get_instance"), snapshotID)
+	result, err := c.Call(ctx, c.snapshotMethod("get_instance"), snapshotID)
 	if err != nil {
 		// Log full error details before fallback logic (helps debug ambiguous errors)
 		LogAPIError(err, "SnapshotGet error")
@@ -493,7 +442,7 @@ func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot,
 
 	filters := [][]interface{}{{"dataset", "=", dataset}}
 
-	result, err := c.Call(ctx, c.snapshotMethod(ctx, "query"), filters, map[string]interface{}{})
+	result, err := c.Call(ctx, c.snapshotMethod("query"), filters, map[string]interface{}{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list snapshots: %w", err)
 	}
@@ -544,7 +493,7 @@ func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limi
 		options["offset"] = offset
 	}
 
-	result, err := c.Call(ctx, c.snapshotMethod(ctx, "query"), filters, options)
+	result, err := c.Call(ctx, c.snapshotMethod("query"), filters, options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list snapshots: %w", err)
 	}
@@ -590,7 +539,7 @@ func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name str
 	// The pattern matches any string ending with "@" + name
 	filters := legacySnapshotNameFilters(parentDataset, name)
 
-	result, err := c.Call(ctx, c.snapshotMethod(ctx, "query"), filters, map[string]interface{}{})
+	result, err := c.Call(ctx, c.snapshotMethod("query"), filters, map[string]interface{}{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query snapshots: %w", err)
 	}
@@ -669,7 +618,7 @@ func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, v
 		},
 	}
 
-	_, err := c.Call(ctx, c.snapshotMethod(ctx, "update"), snapshotID, params)
+	_, err := c.Call(ctx, c.snapshotMethod("update"), snapshotID, params)
 	return err
 }
 
@@ -692,7 +641,7 @@ func (c *Client) SnapshotRemoveUserProperties(ctx context.Context, snapshotID st
 		"user_properties_remove": keys,
 	}
 
-	_, err := c.Call(ctx, c.snapshotMethod(ctx, "update"), snapshotID, params)
+	_, err := c.Call(ctx, c.snapshotMethod("update"), snapshotID, params)
 	return err
 }
 
@@ -703,7 +652,7 @@ func (c *Client) SnapshotClone(ctx context.Context, snapshotID, newDatasetName s
 		"dataset_dst": newDatasetName,
 	}
 
-	_, err := c.Call(ctx, c.snapshotMethod(ctx, "clone"), params)
+	_, err := c.Call(ctx, c.snapshotMethod("clone"), params)
 	if err != nil {
 		if IsAlreadyExistsError(err) {
 			existing, getErr := c.DatasetGet(ctx, newDatasetName)
@@ -920,7 +869,7 @@ func (c *Client) SnapshotRollback(ctx context.Context, snapshotID string, force,
 		"recursive_clones": recursiveClones,
 	}
 
-	_, err := c.Call(ctx, c.snapshotMethod(ctx, "rollback"), snapshotID, options)
+	_, err := c.Call(ctx, c.snapshotMethod("rollback"), snapshotID, options)
 	if err != nil {
 		return fmt.Errorf("failed to rollback snapshot: %w", err)
 	}

@@ -387,12 +387,6 @@ type Client struct {
 	versionMu    sync.RWMutex
 	versionCache *SystemInfo
 
-	// Snapshot API prefix detection cache. This is per-client because different
-	// clients may connect to different TrueNAS versions.
-	snapshotPrefixMu        sync.Mutex
-	snapshotAPIPrefix       string
-	snapshotPrefixProbeDone chan struct{}
-
 	// TrueNAS 26.0 introduced zfs.resource.snapshot.query, which is the only
 	// snapshot read API that still exposes user properties. Keep this detection
 	// separate from the mutation API prefix because create/update/delete remain
@@ -407,6 +401,12 @@ type Client struct {
 	// creates do not all retry a rejected payload shape.
 	snapshotCreatePropertiesMu      sync.Mutex
 	snapshotCreatePropertiesSupport map[string]bool
+
+	// TrueNAS 26.0 removed service.reload in favor of service.control. Cache the
+	// resolved reload verb so a 26.0 backend pays the method-not-found fallback
+	// probe once instead of on every debounced reload (2 RTTs -> 1 RTT).
+	serviceReloadResolved   atomic.Bool
+	serviceReloadUseControl atomic.Bool
 }
 
 // rpcRequest is a JSON-RPC 2.0 request.
@@ -1460,21 +1460,35 @@ func (c *Client) deleteVanishedTolerant(ctx context.Context, method string, id i
 
 func (c *Client) ServiceReload(ctx context.Context, service string) error {
 	klog.V(4).Infof("Reloading service: %s", service)
+	if c.serviceReloadResolved.Load() && c.serviceReloadUseControl.Load() {
+		return c.serviceReloadViaControl(ctx, service)
+	}
 	_, err := c.Call(ctx, "service.reload", service)
-	if err != nil {
-		// TrueNAS 26.0 removed service.reload in favor of
-		// service.control(verb, service, options) (validated live).
-		if isMethodNotFoundError(err) || MessageFallbackContains(err, "method call error") {
-			if _, ctlErr := c.Call(ctx, "service.control", "RELOAD", service, map[string]interface{}{}); ctlErr == nil {
-				klog.Infof("Service %s reloaded successfully (service.control)", service)
-				return nil
-			} else {
-				err = ctlErr
-			}
+	if err == nil {
+		// Resolved on service.reload; useControl stays false so future reloads reuse it.
+		c.serviceReloadResolved.Store(true)
+		klog.Infof("Service %s reloaded successfully", service)
+		return nil
+	}
+	// TrueNAS 26.0 removed service.reload in favor of
+	// service.control(verb, service, options) (validated live).
+	if isMethodNotFoundError(err) || MessageFallbackContains(err, "method call error") {
+		if ctlErr := c.serviceReloadViaControl(ctx, service); ctlErr == nil {
+			c.serviceReloadUseControl.Store(true)
+			c.serviceReloadResolved.Store(true)
+			return nil
+		} else {
+			err = ctlErr
 		}
+	}
+	return fmt.Errorf("failed to reload service %s: %w", service, err)
+}
+
+func (c *Client) serviceReloadViaControl(ctx context.Context, service string) error {
+	if _, err := c.Call(ctx, "service.control", "RELOAD", service, map[string]interface{}{}); err != nil {
 		return fmt.Errorf("failed to reload service %s: %w", service, err)
 	}
-	klog.Infof("Service %s reloaded successfully", service)
+	klog.Infof("Service %s reloaded successfully (service.control)", service)
 	return nil
 }
 

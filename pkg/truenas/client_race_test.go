@@ -946,61 +946,6 @@ func TestClient_CircuitBreakerHalfOpenRetryDoesNotWedge(t *testing.T) {
 	assert.Equal(t, int32(7), atomic.LoadInt32(&queryCount))
 }
 
-func TestClient_SnapshotPrefixReprobesAfterTransientFailure(t *testing.T) {
-	var poolProbes int32
-	var zfsProbes int32
-	mock := newMockWSServer()
-	server := mock.start(func(conn *websocket.Conn) {
-		for {
-			var req rpcTestRequest
-			if err := conn.ReadJSON(&req); err != nil {
-				return
-			}
-			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
-			switch req.Method {
-			case "auth.login_with_api_key":
-				resp.Result = true
-			case "pool.snapshot.query":
-				if atomic.AddInt32(&poolProbes, 1) == 1 {
-					resp.Error = &rpcError{Code: -1, Message: "temporary outage"}
-				} else {
-					resp.Result = []interface{}{}
-				}
-			case "zfs.snapshot.query":
-				atomic.AddInt32(&zfsProbes, 1)
-				resp.Error = &rpcError{Code: -1, Message: "temporary outage"}
-			default:
-				resp.Error = &rpcError{Code: -32601, Message: "method not found"}
-			}
-			if err := conn.WriteJSON(resp); err != nil {
-				return
-			}
-		}
-	})
-	defer mock.close()
-
-	host, port := testServerAddress(t, server.URL)
-	client, err := NewClient(&ClientConfig{
-		Host:                host,
-		Port:                port,
-		Protocol:            "http",
-		APIKey:              "test-api-key",
-		Timeout:             time.Second,
-		ConnectTimeout:      time.Second,
-		MaxConnections:      1,
-		APIRetryMaxAttempts: 1,
-	})
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	assert.Equal(t, "zfs.snapshot", client.detectSnapshotAPIPrefix(ctx))
-	assert.Equal(t, "pool.snapshot", client.detectSnapshotAPIPrefix(ctx))
-	assert.Equal(t, int32(2), atomic.LoadInt32(&poolProbes))
-	assert.Equal(t, int32(1), atomic.LoadInt32(&zfsProbes))
-}
-
 func TestClient_DoesNotRetryAmbiguousMutation(t *testing.T) {
 	var mutationCount int32
 	mock := newMockWSServer()
