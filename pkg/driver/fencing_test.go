@@ -267,6 +267,107 @@ func TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend(t *t
 	assert.Zero(t, client.allowlistCalls(), "off mode publish after takeover must not mutate any backend transport allowlist")
 }
 
+// TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls mirrors the NFS
+// off-mode contract for the NVMe-oF transport: with fencing.mode=off the shared
+// publication-record guard still enforces single-node exclusivity (rejecting a
+// second node, idempotent same-node republish, empty-node unpublish-all) while
+// making ZERO nvmet.host_subsys.* / subsystem allowlist mutations across the
+// whole publish→republish→reject→unpublish-all sequence. The guard is the same
+// shared boolean as NFS; this is regression coverage that the NVMe-oF allowlist
+// reconciler is never entered in off mode.
+func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	client := &allowlistCountingClient{MockClient: mock}
+	d := &Driver{
+		name: "org.scale.csi.nvmeof",
+		config: &Config{
+			DriverName: "org.scale.csi.nvmeof",
+			Fencing:    FencingConfig{Mode: FencingModeOff},
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
+			NVMeoF: NVMeoFConfig{
+				Transport:             "TCP",
+				TransportAddress:      "192.0.2.20",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: true,
+			},
+		},
+		truenasClient:     client,
+		nvmeResolvedHosts: make(map[string]int),
+	}
+
+	datasetName := "pool/parent/off-nvme-volume"
+	ds, err := mock.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
+	})
+	require.NoError(t, err)
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "off-nvme-volume", true, true))
+
+	// Baseline: share creation may reconcile the (empty) static host set; the
+	// assertion below is that the PUBLISH flow adds no further allowlist calls.
+	nvmeAllowlist := func() int64 {
+		return client.nvmeHostSubsysCreate.Load() + client.nvmeHostSubsysDelete.Load() + client.nvmeAllowAnyHost.Load()
+	}
+	baselineNVMe := nvmeAllowlist()
+	baselineTotal := client.allowlistCalls()
+
+	nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a"})
+	require.NoError(t, err)
+	nodeB, err := encodeNodeIdentity(NodeIdentity{Name: "worker-b", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-b"})
+	require.NoError(t, err)
+	request := func(nodeID string) *csi.ControllerPublishVolumeRequest {
+		return &csi.ControllerPublishVolumeRequest{
+			VolumeId: "off-nvme-volume",
+			NodeId:   nodeID,
+			VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+			}},
+			VolumeContext: map[string]string{"node_attach_driver": "nvmeof"},
+		}
+	}
+
+	// First publish to node A succeeds and writes a durable record.
+	_, err = d.ControllerPublishVolume(ctx, request(nodeA))
+	require.NoError(t, err)
+	ds, err = mock.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	_, hasRecord := ds.UserProperties[publicationPropertyKey("worker-a")]
+	assert.True(t, hasRecord, "off mode must still write a durable publication record for NVMe-oF")
+	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF publish must not touch nvmet host_subsys/allowlist")
+
+	// Same-node republish is idempotent and still backend-free.
+	_, err = d.ControllerPublishVolume(ctx, request(nodeA))
+	require.NoError(t, err, "same-node republish must be idempotent in off mode")
+	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF republish must not touch nvmet host_subsys/allowlist")
+
+	// A different-node SINGLE_NODE publish must fail FailedPrecondition.
+	_, err = d.ControllerPublishVolume(ctx, request(nodeB))
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "worker-a")
+	ds, err = mock.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	_, hasB := ds.UserProperties[publicationPropertyKey("worker-b")]
+	assert.False(t, hasB, "a rejected publish must not persist a record")
+	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF rejected publish must not touch nvmet host_subsys/allowlist")
+
+	// Empty-node-id unpublish clears all records, still without backend calls.
+	_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-nvme-volume"})
+	require.NoError(t, err)
+	ds, err = mock.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(ds)
+	require.NoError(t, err)
+	assert.Empty(t, records, "unpublish-all must clear the durable records in off mode")
+	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF unpublish must not touch nvmet host_subsys/allowlist")
+
+	// With the record cleared, node B can now publish — still backend-free.
+	_, err = d.ControllerPublishVolume(ctx, request(nodeB))
+	require.NoError(t, err)
+	assert.Equal(t, baselineNVMe, nvmeAllowlist(), "off mode NVMe-oF publish after takeover must not touch nvmet host_subsys/allowlist")
+	assert.Equal(t, baselineTotal, client.allowlistCalls(), "off mode NVMe-oF must not mutate ANY backend transport allowlist across the whole flow")
+}
+
 // TestControllerPublishRejectsUnknownAccessMode covers FIX 4b: an UNKNOWN or
 // unrecognized access mode must be rejected with InvalidArgument rather than
 // silently treated as single-node.

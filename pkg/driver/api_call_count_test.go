@@ -294,6 +294,11 @@ func (c *apiCallCountingClient) ISCSITargetFindByName(ctx context.Context, name 
 	return c.MockClient.ISCSITargetFindByName(ctx, name)
 }
 
+func (c *apiCallCountingClient) ISCSITargetList(ctx context.Context) ([]*truenas.ISCSITarget, error) {
+	c.record("ISCSITargetList")
+	return c.MockClient.ISCSITargetList(ctx)
+}
+
 func (c *apiCallCountingClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*truenas.ISCSIExtent, error) {
 	c.record("ISCSIExtentCreate")
 	return c.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, physicalBlocksize, rpm)
@@ -317,6 +322,11 @@ func (c *apiCallCountingClient) ISCSIExtentFindByName(ctx context.Context, name 
 func (c *apiCallCountingClient) ISCSIExtentFindByDisk(ctx context.Context, diskPath string) (*truenas.ISCSIExtent, error) {
 	c.record("ISCSIExtentFindByDisk")
 	return c.MockClient.ISCSIExtentFindByDisk(ctx, diskPath)
+}
+
+func (c *apiCallCountingClient) ISCSIExtentList(ctx context.Context) ([]*truenas.ISCSIExtent, error) {
+	c.record("ISCSIExtentList")
+	return c.MockClient.ISCSIExtentList(ctx)
 }
 
 func (c *apiCallCountingClient) ISCSITargetExtentCreate(ctx context.Context, targetID, extentID, lunID int) (*truenas.ISCSITargetExtent, error) {
@@ -412,6 +422,11 @@ func (c *apiCallCountingClient) NVMeoFNamespaceFindByDevice(ctx context.Context,
 func (c *apiCallCountingClient) NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*truenas.NVMeoFNamespace, error) {
 	c.record("NVMeoFNamespaceFindByDevicePath")
 	return c.MockClient.NVMeoFNamespaceFindByDevicePath(ctx, devicePath)
+}
+
+func (c *apiCallCountingClient) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFNamespace, error) {
+	c.record("NVMeoFNamespaceListBySubsystem")
+	return c.MockClient.NVMeoFNamespaceListBySubsystem(ctx, subsysID)
 }
 
 func (c *apiCallCountingClient) NVMeoFPortList(ctx context.Context) ([]*truenas.NVMeoFPort, error) {

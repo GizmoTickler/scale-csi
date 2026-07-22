@@ -81,11 +81,13 @@ type ClientInterface interface {
 	ISCSITargetDelete(ctx context.Context, id int, force bool) error
 	ISCSITargetGet(ctx context.Context, id int) (*ISCSITarget, error)
 	ISCSITargetFindByName(ctx context.Context, name string) (*ISCSITarget, error)
+	ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error)
 	ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error)
 	ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error
 	ISCSIExtentGet(ctx context.Context, id int) (*ISCSIExtent, error)
 	ISCSIExtentFindByName(ctx context.Context, name string) (*ISCSIExtent, error)
 	ISCSIExtentFindByDisk(ctx context.Context, diskPath string) (*ISCSIExtent, error)
+	ISCSIExtentList(ctx context.Context) ([]*ISCSIExtent, error)
 	ISCSITargetExtentCreate(ctx context.Context, targetID, extentID, lunID int) (*ISCSITargetExtent, error)
 	ISCSITargetExtentDelete(ctx context.Context, id int, force bool) error
 	ISCSITargetExtentGet(ctx context.Context, id int) (*ISCSITargetExtent, error)
@@ -112,6 +114,7 @@ type ClientInterface interface {
 	NVMeoFNamespaceGet(ctx context.Context, id int) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*NVMeoFNamespace, error)
+	NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFNamespace, error)
 	NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error)
 	NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error)
 	NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error)

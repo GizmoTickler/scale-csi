@@ -1054,12 +1054,22 @@ func (m *MockClient) ISCSITargetFindByName(ctx context.Context, name string) (*I
 	}
 	return nil, nil
 }
+func (m *MockClient) ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var list []*ISCSITarget
+	for _, t := range m.ISCSITargets {
+		list = append(list, t)
+	}
+	return list, nil
+}
 func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	id := len(m.ISCSIExtents) + 1
-	ext := &ISCSIExtent{ID: id, Name: name, Disk: diskPath}
+	ext := &ISCSIExtent{ID: id, Name: name, Disk: diskPath, Comment: comment}
 	m.ISCSIExtents[id] = ext
 	return ext, nil
 }
@@ -1100,6 +1110,16 @@ func (m *MockClient) ISCSIExtentFindByDisk(ctx context.Context, diskPath string)
 		}
 	}
 	return nil, nil
+}
+func (m *MockClient) ISCSIExtentList(ctx context.Context) ([]*ISCSIExtent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var list []*ISCSIExtent
+	for _, e := range m.ISCSIExtents {
+		list = append(list, e)
+	}
+	return list, nil
 }
 func (m *MockClient) ISCSITargetExtentCreate(ctx context.Context, targetID, extentID, lunID int) (*ISCSITargetExtent, error) {
 	m.mu.Lock()
@@ -1437,6 +1457,18 @@ func (m *MockClient) NVMeoFNamespaceFindByDevicePath(ctx context.Context, device
 		}
 	}
 	return nil, nil
+}
+func (m *MockClient) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFNamespace, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var list []*NVMeoFNamespace
+	for _, n := range m.NVMeNamespaces {
+		if n.SubsystemID == subsysID {
+			list = append(list, n)
+		}
+	}
+	return list, nil
 }
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	return []*NVMeoFPort{{ID: 1, Transport: "TCP", Address: "0.0.0.0", Port: 4420}}, nil

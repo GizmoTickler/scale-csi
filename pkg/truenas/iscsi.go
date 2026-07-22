@@ -166,6 +166,32 @@ func (c *Client) ISCSITargetFindByName(ctx context.Context, name string) (*ISCSI
 	return parseISCSITarget(targets[0])
 }
 
+// ISCSITargetList returns every iSCSI target on the backend. It is used by the
+// orphaned-share reconcile sweep, which must inspect all targets regardless of
+// the volume they back.
+func (c *Client) ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error) {
+	result, err := c.Call(ctx, "iscsi.target.query", [][]interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query iSCSI targets: %w", err)
+	}
+
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected iSCSI target response type")
+	}
+
+	targets := make([]*ISCSITarget, 0, len(items))
+	for _, item := range items {
+		target, parseErr := parseISCSITarget(item)
+		if parseErr != nil {
+			continue
+		}
+		targets = append(targets, target)
+	}
+
+	return targets, nil
+}
+
 // ISCSIExtentCreate creates a new iSCSI extent.
 func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error) {
 	params := iscsiExtentCreateParams(name, diskPath, comment, blocksize, physicalBlocksize, rpm)
@@ -518,6 +544,32 @@ func (c *Client) ISCSIExtentFindByDisk(ctx context.Context, diskPath string) (*I
 	}
 
 	return parseISCSIExtent(extents[0])
+}
+
+// ISCSIExtentList returns every iSCSI extent on the backend. The orphaned-share
+// reconcile sweep reads each extent's comment backreference to decide whether its
+// backing dataset is gone.
+func (c *Client) ISCSIExtentList(ctx context.Context) ([]*ISCSIExtent, error) {
+	result, err := c.Call(ctx, "iscsi.extent.query", [][]interface{}{}, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query iSCSI extents: %w", err)
+	}
+
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected iSCSI extent response type")
+	}
+
+	extents := make([]*ISCSIExtent, 0, len(items))
+	for _, item := range items {
+		extent, parseErr := parseISCSIExtent(item)
+		if parseErr != nil {
+			continue
+		}
+		extents = append(extents, extent)
+	}
+
+	return extents, nil
 }
 
 // ISCSITargetExtentFindByTarget finds all target-extent associations for a target.

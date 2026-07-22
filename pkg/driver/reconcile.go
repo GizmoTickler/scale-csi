@@ -63,6 +63,10 @@ type ReconcileObject struct {
 	CreatedAt      time.Time
 	Age            time.Duration
 	Bytes          int64
+	// Protocol identifies the share protocol for share orphans (NFS, iSCSI,
+	// NVMe-oF) so the guarded delete phase can route cleanup to the correct
+	// backend objects. It is only meaningful for entries in OrphanShares.
+	Protocol ShareType
 }
 
 // SpentRestoreSnapshot describes a VolSync restore-destination snapshot whose
@@ -372,19 +376,23 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	if opts.Delete {
 		logAction = "will attempt guarded delete of"
 	}
-	for _, orphan := range report.OrphanSnapshots {
+	for i := range report.OrphanSnapshots {
+		orphan := &report.OrphanSnapshots[i]
 		klog.Infof("Orphan reconcile: %s managed snapshot %s (backend=%s age=%v bytes=%d)",
 			logAction, orphan.ID, orphan.BackendID, orphan.Age, orphan.Bytes)
 	}
-	for _, orphan := range report.OrphanVolumes {
+	for i := range report.OrphanVolumes {
+		orphan := &report.OrphanVolumes[i]
 		klog.Infof("Orphan reconcile: %s managed volume %s (backend=%s pv=%s age=%v bytes=%d)",
 			logAction, orphan.ID, orphan.BackendID, orphan.PVName, orphan.Age, orphan.Bytes)
 	}
-	for _, orphan := range report.OrphanShares {
-		klog.Infof("Orphan reconcile: %s orphaned share %s (backend=%s volume=%s)",
-			logAction, orphan.ID, orphan.BackendID, orphan.SourceVolumeID)
+	for i := range report.OrphanShares {
+		orphan := &report.OrphanShares[i]
+		klog.Infof("Orphan reconcile: %s orphaned share %s (backend=%s volume=%s protocol=%s)",
+			logAction, orphan.ID, orphan.BackendID, orphan.SourceVolumeID, orphan.Protocol)
 	}
-	for _, tombstone := range report.TombstoneSnapshots {
+	for i := range report.TombstoneSnapshots {
+		tombstone := &report.TombstoneSnapshots[i]
 		klog.Infof("Orphan reconcile: %s released deferred-delete tombstone %s (age=%v)",
 			logAction, tombstone.ID, tombstone.Age)
 	}
@@ -471,14 +479,79 @@ func (d *Driver) nfsShareCommentDatasetName(comment string) (string, bool) {
 	return datasetName, true
 }
 
-// detectOrphanedShares finds CSI-managed backend shares whose backing dataset is
-// confirmed absent. DeleteVolume removes the share before the dataset, so a share
-// that outlives its dataset is residue from an interrupted delete; sweeping it
-// keeps that residue from being silently permanent. A share still referenced by a
-// live PersistentVolume is never classified: an absent dataset under a live PV is
-// anomalous and must be surfaced, not "fixed" by deleting the share. Detection is
-// read-only; deletion happens in the guarded delete phase.
+// iscsiExtentCommentDatasetName extracts the backing dataset name from a
+// CSI-managed iSCSI extent comment of the form "truenas-csi: <datasetName>".
+// Unlike the NFS share comment, the iSCSI extent comment does NOT embed the
+// driver instance name, so driver-instance scoping is enforced separately by
+// requiring the derived dataset to live under the configured parent dataset (see
+// datasetUnderParent). The boolean is false when the comment is not a CSI extent
+// comment at all, so foreign extents are never classified or touched.
+func iscsiExtentCommentDatasetName(comment string) (string, bool) {
+	const prefix = "truenas-csi: "
+	if !strings.HasPrefix(comment, prefix) {
+		return "", false
+	}
+	datasetName := strings.TrimSpace(strings.TrimPrefix(comment, prefix))
+	if datasetName == "" {
+		return "", false
+	}
+	return datasetName, true
+}
+
+// zvolReferenceDatasetName extracts the backing dataset name from a zvol device
+// reference of the form "zvol/<datasetName>" (tolerating a leading /dev/ or /).
+// This is the authoritative, non-lossy backreference carried by NVMe-oF
+// namespaces; the lossy subsystem NAME is never used to decide deletion.
+func zvolReferenceDatasetName(devicePath string) (string, bool) {
+	reference := normalizedZvolReference(devicePath)
+	if !strings.HasPrefix(reference, "zvol/") {
+		return "", false
+	}
+	datasetName := strings.TrimPrefix(reference, "zvol/")
+	if datasetName == "" {
+		return "", false
+	}
+	return datasetName, true
+}
+
+// datasetUnderParent reports whether datasetName lives below the configured
+// parent dataset. It is the driver-instance scoping guard for block-protocol
+// share orphans whose backreference (iSCSI extent comment, NVMe-oF namespace
+// device path) does not itself carry the driver instance name: only datasets
+// this driver instance owns may be classified and swept.
+func (d *Driver) datasetUnderParent(datasetName string) bool {
+	return strings.HasPrefix(datasetName, d.parentDatasetName()+"/")
+}
+
+// shareOrphanLivePV reports whether the volume backing a share orphan still has
+// a live PersistentVolume. Such a share is anomalous (absent dataset under a live
+// PV) and must be surfaced, never swept.
+func shareOrphanLivePV(kubeState *kubernetesReconcileState, volumeID string) bool {
+	if kubeState == nil {
+		return false
+	}
+	_, live := kubeState.volumeHandles[volumeID]
+	return live
+}
+
+// detectOrphanedShares finds CSI-managed backend shares (NFS, iSCSI, NVMe-oF)
+// whose backing dataset is confirmed absent. DeleteVolume removes the share
+// before the dataset, so a share that outlives its dataset is residue from an
+// interrupted delete; sweeping it keeps that residue from being silently
+// permanent. A share still referenced by a live PersistentVolume is never
+// classified: an absent dataset under a live PV is anomalous and must be
+// surfaced, not "fixed" by deleting the share. Detection is read-only; deletion
+// happens in the guarded delete phase. Each protocol is detected independently so
+// a listing failure in one cannot leak the others' orphans.
 func (d *Driver) detectOrphanedShares(ctx context.Context, kubeState *kubernetesReconcileState, report *ReconcileReport) {
+	d.detectOrphanedNFSShares(ctx, kubeState, report)
+	d.detectOrphanedISCSIShares(ctx, kubeState, report)
+	d.detectOrphanedNVMeoFShares(ctx, kubeState, report)
+	sort.Slice(report.OrphanShares, func(i, j int) bool { return report.OrphanShares[i].ID < report.OrphanShares[j].ID })
+	report.OrphanShareCount = len(report.OrphanShares)
+}
+
+func (d *Driver) detectOrphanedNFSShares(ctx context.Context, kubeState *kubernetesReconcileState, report *ReconcileReport) {
 	shares, err := d.truenasClient.NFSShareList(ctx)
 	if err != nil {
 		RecordReconcileFailure("list_backend_shares")
@@ -509,36 +582,230 @@ func (d *Driver) detectOrphanedShares(ctx context.Context, kubeState *kubernetes
 			ID:             datasetName,
 			BackendID:      strconv.Itoa(share.ID),
 			SourceVolumeID: volumeID,
+			Protocol:       ShareTypeNFS,
 		})
 	}
-	sort.Slice(report.OrphanShares, func(i, j int) bool { return report.OrphanShares[i].ID < report.OrphanShares[j].ID })
-	report.OrphanShareCount = len(report.OrphanShares)
+}
+
+func (d *Driver) detectOrphanedISCSIShares(ctx context.Context, kubeState *kubernetesReconcileState, report *ReconcileReport) {
+	extents, err := d.truenasClient.ISCSIExtentList(ctx)
+	if err != nil {
+		RecordReconcileFailure("list_backend_shares")
+		klog.Warningf("Orphan reconcile: failed to list iSCSI extents for orphan detection: %v", err)
+		return
+	}
+	for _, extent := range extents {
+		if extent == nil {
+			continue
+		}
+		// The extent comment is the authoritative, non-lossy backreference to the
+		// dataset; the lossy extent NAME is never used for classification.
+		datasetName, ok := iscsiExtentCommentDatasetName(extent.Comment)
+		if !ok {
+			continue
+		}
+		if !d.datasetUnderParent(datasetName) {
+			continue // foreign driver instance or non-CSI dataset
+		}
+		volumeID := path.Base(datasetName)
+		if shareOrphanLivePV(kubeState, volumeID) {
+			continue
+		}
+		if _, getErr := d.truenasClient.DatasetGet(ctx, datasetName); getErr == nil {
+			continue // dataset still present: the share is not orphaned
+		} else if !truenas.IsNotFoundError(getErr) {
+			klog.Warningf("Orphan reconcile: skipping iSCSI extent %d orphan check for %s: dataset lookup failed: %v", extent.ID, datasetName, getErr)
+			continue
+		}
+		report.OrphanShares = append(report.OrphanShares, ReconcileObject{
+			ID:             datasetName,
+			BackendID:      strconv.Itoa(extent.ID),
+			SourceVolumeID: volumeID,
+			Protocol:       ShareTypeISCSI,
+		})
+	}
+}
+
+func (d *Driver) detectOrphanedNVMeoFShares(ctx context.Context, kubeState *kubernetesReconcileState, report *ReconcileReport) {
+	subsystems, err := d.truenasClient.NVMeoFSubsystemList(ctx)
+	if err != nil {
+		RecordReconcileFailure("list_backend_shares")
+		klog.Warningf("Orphan reconcile: failed to list NVMe-oF subsystems for orphan detection: %v", err)
+		return
+	}
+	for _, subsys := range subsystems {
+		if subsys == nil {
+			continue
+		}
+		namespaces, nsErr := d.truenasClient.NVMeoFNamespaceListBySubsystem(ctx, subsys.ID)
+		if nsErr != nil {
+			klog.Warningf("Orphan reconcile: skipping NVMe-oF subsystem %d orphan check: namespace listing failed: %v", subsys.ID, nsErr)
+			continue
+		}
+		// The namespace DevicePath (zvol/<dataset>) is the authoritative
+		// backreference; the subsystem NAME is lossy and never used to decide
+		// deletion. A subsystem with no namespace resolving to a dataset under the
+		// parent is foreign and skipped.
+		for _, namespace := range namespaces {
+			if namespace == nil {
+				continue
+			}
+			datasetName, ok := zvolReferenceDatasetName(namespace.DevicePath)
+			if !ok {
+				continue
+			}
+			if !d.datasetUnderParent(datasetName) {
+				continue
+			}
+			volumeID := path.Base(datasetName)
+			if shareOrphanLivePV(kubeState, volumeID) {
+				continue
+			}
+			if _, getErr := d.truenasClient.DatasetGet(ctx, datasetName); getErr == nil {
+				continue // dataset still present: the share is not orphaned
+			} else if !truenas.IsNotFoundError(getErr) {
+				klog.Warningf("Orphan reconcile: skipping NVMe-oF subsystem %d orphan check for %s: dataset lookup failed: %v", subsys.ID, datasetName, getErr)
+				continue
+			}
+			report.OrphanShares = append(report.OrphanShares, ReconcileObject{
+				ID:             datasetName,
+				BackendID:      strconv.Itoa(subsys.ID),
+				SourceVolumeID: volumeID,
+				Protocol:       ShareTypeNVMeoF,
+			})
+			// A CSI subsystem maps to a single dataset, so classify at most once
+			// per subsystem even if extra namespaces are present.
+			break
+		}
+	}
 }
 
 // deleteOrphanedShares removes shares detected by detectOrphanedShares, bounded
 // by the per-run deletion cap. Each share's dataset absence is re-confirmed
 // immediately before mutation so a dataset recreated after detection is never
-// orphaned out from under a live volume.
+// orphaned out from under a live volume. Cleanup is routed to the correct
+// backend objects by the orphan's Protocol.
 func (d *Driver) deleteOrphanedShares(ctx context.Context, report *ReconcileReport, maxPerRun int) {
-	for _, orphan := range report.OrphanShares {
+	for i := range report.OrphanShares {
+		orphan := &report.OrphanShares[i]
 		if maxPerRun > 0 && len(report.DeletedShares) >= maxPerRun {
 			break
 		}
-		shareID, err := strconv.Atoi(orphan.BackendID)
-		if err != nil || shareID <= 0 {
-			continue
-		}
+		// TOCTOU guard: re-confirm the dataset is still absent immediately before
+		// mutating backend state, regardless of protocol.
 		if _, getErr := d.truenasClient.DatasetGet(ctx, orphan.ID); getErr == nil || !truenas.IsNotFoundError(getErr) {
-			d.recordReconcileSkip(report, "share", orphan.BackendID, "dataset reappeared or lookup failed before delete")
+			d.recordReconcileSkip(report, "share", orphan.ID, "dataset reappeared or lookup failed before delete")
 			continue
 		}
-		if delErr := d.truenasClient.NFSShareDelete(ctx, shareID); delErr != nil && !truenas.IsNotFoundError(delErr) {
-			d.recordReconcileObjectFailure("share", orphan.BackendID, delErr)
-			continue
+		switch orphan.Protocol {
+		case ShareTypeISCSI:
+			d.deleteOrphanedISCSIShare(ctx, report, *orphan)
+		case ShareTypeNVMeoF:
+			d.deleteOrphanedNVMeoFShare(ctx, report, *orphan)
+		default: // ShareTypeNFS (and any unset value) retains the legacy NFS path.
+			d.deleteOrphanedNFSShare(ctx, report, *orphan)
 		}
-		report.DeletedShares = append(report.DeletedShares, orphan.ID)
-		klog.Infof("Orphan reconcile: deleted orphaned NFS share %d (dataset %s absent)", shareID, orphan.ID)
 	}
+}
+
+func (d *Driver) deleteOrphanedNFSShare(ctx context.Context, report *ReconcileReport, orphan ReconcileObject) {
+	shareID, err := strconv.Atoi(orphan.BackendID)
+	if err != nil || shareID <= 0 {
+		return
+	}
+	if delErr := d.truenasClient.NFSShareDelete(ctx, shareID); delErr != nil && !truenas.IsNotFoundError(delErr) {
+		d.recordReconcileObjectFailure("share", orphan.BackendID, delErr)
+		return
+	}
+	report.DeletedShares = append(report.DeletedShares, orphan.ID)
+	klog.Infof("Orphan reconcile: deleted orphaned NFS share %d (dataset %s absent)", shareID, orphan.ID)
+}
+
+func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *ReconcileReport, orphan ReconcileObject) {
+	shareName := d.iscsiShareName(orphan.SourceVolumeID)
+	target, err := d.truenasClient.ISCSITargetFindByName(ctx, shareName)
+	if err != nil && !truenas.IsNotFoundError(err) {
+		d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("find iSCSI target %s: %w", shareName, err))
+		return
+	}
+	extent, err := d.truenasClient.ISCSIExtentFindByName(ctx, shareName)
+	if err != nil && !truenas.IsNotFoundError(err) {
+		d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("find iSCSI extent %s: %w", shareName, err))
+		return
+	}
+	if target == nil && extent == nil {
+		report.DeletedShares = append(report.DeletedShares, orphan.ID)
+		klog.Infof("Orphan reconcile: orphaned iSCSI share for dataset %s already absent", orphan.ID)
+		return
+	}
+	if target != nil && extent != nil {
+		association, findErr := d.truenasClient.ISCSITargetExtentFind(ctx, target.ID, extent.ID)
+		if findErr != nil && !truenas.IsNotFoundError(findErr) {
+			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("find iSCSI target-extent for %s: %w", shareName, findErr))
+			return
+		}
+		if association != nil {
+			if delErr := d.truenasClient.ISCSITargetExtentDelete(ctx, association.ID, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
+				d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI target-extent %d: %w", association.ID, delErr))
+				return
+			}
+		}
+	}
+	if extent != nil {
+		if delErr := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
+			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI extent %d: %w", extent.ID, delErr))
+			return
+		}
+	}
+	if target != nil {
+		if delErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
+			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI target %d: %w", target.ID, delErr))
+			return
+		}
+	}
+	// Best-effort debounced service reload mirrors the share create/delete path so
+	// initiators stop seeing the removed target promptly.
+	if d.serviceReloadDebouncer != nil {
+		if reloadErr := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); reloadErr != nil {
+			klog.Warningf("Orphan reconcile: iSCSI service reload after sweeping %s failed (non-fatal): %v", orphan.ID, reloadErr)
+		}
+	}
+	report.DeletedShares = append(report.DeletedShares, orphan.ID)
+	klog.Infof("Orphan reconcile: deleted orphaned iSCSI share for dataset %s (name %s)", orphan.ID, shareName)
+}
+
+func (d *Driver) deleteOrphanedNVMeoFShare(ctx context.Context, report *ReconcileReport, orphan ReconcileObject) {
+	subsysName := d.nvmeSubsystemName(orphan.ID)
+	subsys, err := d.truenasClient.NVMeoFSubsystemFindByName(ctx, subsysName)
+	if err != nil && !truenas.IsNotFoundError(err) {
+		d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("find NVMe-oF subsystem %s: %w", subsysName, err))
+		return
+	}
+	if subsys == nil {
+		report.DeletedShares = append(report.DeletedShares, orphan.ID)
+		klog.Infof("Orphan reconcile: orphaned NVMe-oF share for dataset %s already absent", orphan.ID)
+		return
+	}
+	namespaces, err := d.truenasClient.NVMeoFNamespaceListBySubsystem(ctx, subsys.ID)
+	if err != nil && !truenas.IsNotFoundError(err) {
+		d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("list NVMe-oF namespaces for subsystem %d: %w", subsys.ID, err))
+		return
+	}
+	for _, namespace := range namespaces {
+		if namespace == nil {
+			continue
+		}
+		if delErr := d.truenasClient.NVMeoFNamespaceDelete(ctx, namespace.ID); delErr != nil && !truenas.IsNotFoundError(delErr) {
+			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete NVMe-oF namespace %d: %w", namespace.ID, delErr))
+			return
+		}
+	}
+	if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil && !truenas.IsNotFoundError(delErr) {
+		d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete NVMe-oF subsystem %d: %w", subsys.ID, delErr))
+		return
+	}
+	report.DeletedShares = append(report.DeletedShares, orphan.ID)
+	klog.Infof("Orphan reconcile: deleted orphaned NVMe-oF share for dataset %s (subsystem %s)", orphan.ID, subsysName)
 }
 
 func snapshotDeletePassBlockReason(state *kubernetesReconcileState, managedBackendSnapshotCount int) string {
@@ -904,11 +1171,12 @@ func (d *Driver) deleteDetectedOrphans(
 
 	if snapshotDeleteBlockReason != "" {
 		klog.Errorf("Orphan reconcile: snapshot deletion pass skipped: %s", snapshotDeleteBlockReason)
-		for _, orphan := range report.OrphanSnapshots {
-			d.recordReconcileSkip(report, "snapshot", orphan.ID, snapshotDeleteBlockReason)
+		for i := range report.OrphanSnapshots {
+			d.recordReconcileSkip(report, "snapshot", report.OrphanSnapshots[i].ID, snapshotDeleteBlockReason)
 		}
 	} else {
-		for _, orphan := range report.OrphanSnapshots {
+		for i := range report.OrphanSnapshots {
+			orphan := &report.OrphanSnapshots[i]
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -919,11 +1187,11 @@ func (d *Driver) deleteDetectedOrphans(
 				d.recordReconcileSkip(report, "snapshot", orphan.ID, "snapshot handle became live during revalidation")
 				continue
 			}
-			if safe, reason := d.revalidateOrphanSnapshot(ctx, orphan, minOrphanAge); !safe {
+			if safe, reason := d.revalidateOrphanSnapshot(ctx, *orphan, minOrphanAge); !safe {
 				d.recordReconcileSkip(report, "snapshot", orphan.ID, reason)
 				continue
 			}
-			if safe, reason := d.hardRecheckSnapshotContentAbsent(ctx, orphan); !safe {
+			if safe, reason := d.hardRecheckSnapshotContentAbsent(ctx, *orphan); !safe {
 				d.recordReconcileSkip(report, "snapshot", orphan.ID, reason)
 				continue
 			}
@@ -937,7 +1205,8 @@ func (d *Driver) deleteDetectedOrphans(
 		}
 	}
 
-	for _, orphan := range report.OrphanVolumes {
+	for i := range report.OrphanVolumes {
+		orphan := &report.OrphanVolumes[i]
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -948,11 +1217,11 @@ func (d *Driver) deleteDetectedOrphans(
 			d.recordReconcileSkip(report, "volume", orphan.ID, "volume handle became live during revalidation")
 			continue
 		}
-		if safe, reason := d.revalidateOrphanVolume(ctx, orphan, minOrphanAge); !safe {
+		if safe, reason := d.revalidateOrphanVolume(ctx, *orphan, minOrphanAge); !safe {
 			d.recordReconcileSkip(report, "volume", orphan.ID, reason)
 			continue
 		}
-		if safe, reason := d.hardRecheckPersistentVolumeAbsent(ctx, orphan); !safe {
+		if safe, reason := d.hardRecheckPersistentVolumeAbsent(ctx, *orphan); !safe {
 			d.recordReconcileSkip(report, "volume", orphan.ID, reason)
 			continue
 		}
@@ -965,14 +1234,15 @@ func (d *Driver) deleteDetectedOrphans(
 		deletedCount++
 	}
 
-	for _, tombstone := range report.TombstoneSnapshots {
+	for i := range report.TombstoneSnapshots {
+		tombstone := &report.TombstoneSnapshots[i]
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if deletionCapReached("tombstone-snapshot", tombstone.ID) {
 			continue
 		}
-		reaped, reason := d.reapTombstoneSnapshot(ctx, tombstone, minOrphanAge)
+		reaped, reason := d.reapTombstoneSnapshot(ctx, *tombstone, minOrphanAge)
 		if !reaped {
 			d.recordReconcileSkip(report, "tombstone-snapshot", tombstone.ID, reason)
 			continue

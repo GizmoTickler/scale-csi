@@ -1213,6 +1213,148 @@ func TestOrphanShareSweepSkipsShareBackedByLivePV(t *testing.T) {
 	assert.Empty(t, report.OrphanShares, "a share backed by a live PV must never be classified as orphaned")
 }
 
+// newOrphanShareSweepDriver builds a driver for the block-protocol orphan-share
+// sweep tests. The iSCSI/NVMe-oF naming configs are left at their zero values so
+// iscsiShareName/nvmeSubsystemName pass a legal base name through unchanged.
+func newOrphanShareSweepDriver(client *truenas.MockClient) *Driver {
+	return &Driver{
+		name: "org.scale.csi.test",
+		config: &Config{
+			DriverName: "org.scale.csi.test",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client,
+	}
+}
+
+// createISCSIShareFixture provisions a target+extent+association triple in the
+// mock the same way createISCSIShareForDataset does: target name == extent name
+// == iscsiShareName(volumeID), and the extent comment carries the authoritative
+// "truenas-csi: <datasetName>" backreference.
+func createISCSIShareFixture(t *testing.T, ctx context.Context, client *truenas.MockClient, d *Driver, volumeID, datasetName string) {
+	t.Helper()
+	shareName := d.iscsiShareName(volumeID)
+	target, err := client.ISCSITargetCreate(ctx, shareName, "", "ISCSI", nil)
+	require.NoError(t, err)
+	extent, err := client.ISCSIExtentCreate(ctx, shareName, "zvol/"+datasetName, "truenas-csi: "+datasetName, 512, true, "SSD")
+	require.NoError(t, err)
+	_, err = client.ISCSITargetExtentCreate(ctx, target.ID, extent.ID, 0)
+	require.NoError(t, err)
+}
+
+// TestOrphanShareSweepDetectsAndDeletesISCSIShareWhoseDatasetIsGone mirrors the
+// NFS sweep for iSCSI: an extent whose authoritative comment backreference points
+// at an absent dataset under the parent is detected and removed (target, extent,
+// and association), while a share backed by a present dataset and a share whose
+// dataset lives outside the parent are left untouched.
+func TestOrphanShareSweepDetectsAndDeletesISCSIShareWhoseDatasetIsGone(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(client)
+
+	// A CSI-managed iSCSI share whose dataset still exists is NOT orphaned.
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/live-volume", Type: "VOLUME"})
+	require.NoError(t, err)
+	createISCSIShareFixture(t, ctx, client, d, "live-volume", "pool/parent/live-volume")
+	// A CSI-managed iSCSI share whose dataset is gone IS orphaned.
+	createISCSIShareFixture(t, ctx, client, d, "gone-volume", "pool/parent/gone-volume")
+	// A share whose dataset lives outside the parent (foreign driver instance) is
+	// never classified.
+	createISCSIShareFixture(t, ctx, client, d, "foreign-volume", "tank/other/foreign-volume")
+
+	kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+
+	require.Len(t, report.OrphanShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
+	assert.Equal(t, ShareTypeISCSI, report.OrphanShares[0].Protocol)
+	assert.Equal(t, 1, report.OrphanShareCount)
+
+	d.deleteOrphanedShares(ctx, &report, 5)
+	require.Len(t, report.DeletedShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
+
+	// The gone share's target, extent, and association are removed; the live and
+	// foreign shares remain.
+	targets, err := client.ISCSITargetList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, targets, 2)
+	extents, err := client.ISCSIExtentList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, extents, 2)
+	goneTarget, err := client.ISCSITargetFindByName(ctx, d.iscsiShareName("gone-volume"))
+	require.NoError(t, err)
+	assert.Nil(t, goneTarget, "the orphaned target must be deleted")
+}
+
+// TestOrphanShareSweepSkipsISCSIShareBackedByLivePV proves the safety guard for
+// iSCSI: a share whose dataset is absent but whose volume still has a live
+// PersistentVolume is anomalous and must NOT be swept.
+func TestOrphanShareSweepSkipsISCSIShareBackedByLivePV(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(client)
+
+	createISCSIShareFixture(t, ctx, client, d, "anomalous-volume", "pool/parent/anomalous-volume")
+
+	kubeState := &kubernetesReconcileState{volumeHandles: map[string]struct{}{"anomalous-volume": {}}}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+
+	assert.Empty(t, report.OrphanShares, "a block share backed by a live PV must never be classified as orphaned")
+}
+
+// TestOrphanShareSweepDetectsAndDeletesNVMeoFShareWhoseDatasetIsGone mirrors the
+// NFS sweep for NVMe-oF: a subsystem whose namespace DevicePath (the authoritative
+// zvol/<dataset> backreference) points at an absent dataset under the parent is
+// detected and removed (namespace then subsystem), while a share backed by a
+// present dataset and a share whose zvol lives outside the parent are untouched.
+func TestOrphanShareSweepDetectsAndDeletesNVMeoFShareWhoseDatasetIsGone(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(client)
+
+	// A CSI-managed NVMe-oF share whose dataset still exists is NOT orphaned.
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/live-volume", Type: "VOLUME"})
+	require.NoError(t, err)
+	liveSubsys, err := client.NVMeoFSubsystemCreate(ctx, d.nvmeSubsystemName("pool/parent/live-volume"), true, nil)
+	require.NoError(t, err)
+	_, err = client.NVMeoFNamespaceCreate(ctx, liveSubsys.ID, "zvol/pool/parent/live-volume", "ZVOL")
+	require.NoError(t, err)
+	// A CSI-managed NVMe-oF share whose dataset is gone IS orphaned.
+	goneSubsys, err := client.NVMeoFSubsystemCreate(ctx, d.nvmeSubsystemName("pool/parent/gone-volume"), true, nil)
+	require.NoError(t, err)
+	_, err = client.NVMeoFNamespaceCreate(ctx, goneSubsys.ID, "zvol/pool/parent/gone-volume", "ZVOL")
+	require.NoError(t, err)
+	// A share whose zvol lives outside the parent (foreign driver instance) is
+	// never classified, regardless of the subsystem name.
+	foreignSubsys, err := client.NVMeoFSubsystemCreate(ctx, "foreign-subsys", true, nil)
+	require.NoError(t, err)
+	_, err = client.NVMeoFNamespaceCreate(ctx, foreignSubsys.ID, "zvol/tank/other/foreign-volume", "ZVOL")
+	require.NoError(t, err)
+
+	kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+
+	require.Len(t, report.OrphanShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
+	assert.Equal(t, ShareTypeNVMeoF, report.OrphanShares[0].Protocol)
+	assert.Equal(t, 1, report.OrphanShareCount)
+
+	d.deleteOrphanedShares(ctx, &report, 5)
+	require.Len(t, report.DeletedShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
+
+	subsystems, err := client.NVMeoFSubsystemList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, subsystems, 2, "only the orphaned subsystem whose dataset is gone may be deleted")
+	goneNamespaces, err := client.NVMeoFNamespaceListBySubsystem(ctx, goneSubsys.ID)
+	require.NoError(t, err)
+	assert.Empty(t, goneNamespaces, "the orphaned subsystem's namespace must be deleted")
+}
+
 // managedDatasetListingClient wraps MockClient to observe which read path
 // listAllManagedDatasets takes (zfs.resource.query vs the pool.dataset.query
 // fallback) and to optionally force the resource path to fail.
