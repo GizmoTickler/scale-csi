@@ -70,18 +70,32 @@ Cross-process serialization of `CreateVolume` (and the other controller RPCs)
 is a layered contract, not a single mechanism:
 
 - The CO's external-provisioner leader election plus the chart's
-  single-replica, `Recreate`-strategy controller deployment are the primary
-  guarantee that only one controller process mutates the backend at a time.
+  single-replica controller deployment are the primary guarantee that only one
+  controller process mutates the backend at a time. The chart enforces the
+  `Recreate` deployment strategy only when `fencing.mode` is not `off`; in the
+  default `off` mode the Deployment keeps the server-default `RollingUpdate`,
+  so a rollout can briefly run an old and a new controller pod side by side.
 - The driver's operation locks are per process. They serialize work inside one
   controller but provide no exclusion between two controller processes.
 - The durable in-flight creation markers, the tombstone ledger, and the
-  recovery nonce compare-and-swap narrow the windows a second concurrent
-  writer could exploit (a lost recovery race returns retryable `Aborted`
-  instead of double-owning a dataset), but they do **not** turn multi-writer
-  operation into a supported topology. Running multiple concurrently active
-  controller processes against the same parent dataset — e.g. two releases,
-  a forced multi-replica deployment, or overlapping old/new controllers held
-  alive outside the tested upgrade sequence — is out of contract.
+  recovery-nonce discipline narrow the windows a second concurrent writer
+  could exploit, but none of them is an atomic compare-and-swap. The nonce is
+  a write-then-verify sequence — an unconditional property write followed by a
+  verifying re-read — so two writers whose write/verify windows do not
+  interleave can each observe their own value and both report success. A
+  detected lost race returns retryable `Aborted` instead of double-owning a
+  dataset; an undetected one is tolerable only because both writers are the
+  same driver instance writing identical identity values. Correctness
+  therefore rests on the leader election and singleton topology above; this
+  machinery does **not** turn multi-writer operation into a supported
+  topology. Running multiple concurrently active controller processes against
+  the same parent dataset — e.g. two releases, a forced multi-replica
+  deployment, or overlapping old/new controllers held alive outside the tested
+  upgrade sequence — is out of contract.
+- Upgrade note: tombstone-ledger entries written by pre-release builds lack
+  the recorded creation identity (`created_at`) and are permanently skipped by
+  the reaper (fail-closed). No released version ever wrote ledger entries, so
+  this affects no real deployment.
 - The configured `zfs.parentDataset` subtree is exclusive driver territory.
   The driver stores its bookkeeping as user properties on the parent dataset
   and treats child datasets as objects it may stamp, adopt, or (with durable
