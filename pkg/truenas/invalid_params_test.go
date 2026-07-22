@@ -421,6 +421,7 @@ func TestNVMeoFNamespaceDelete_InvalidParams_Verification(t *testing.T) {
 	tests := []struct {
 		name            string
 		namespaceExists bool
+		queryFails      bool
 		expectError     bool
 	}{
 		{
@@ -432,6 +433,11 @@ func TestNVMeoFNamespaceDelete_InvalidParams_Verification(t *testing.T) {
 			name:            "namespace already deleted - should succeed",
 			namespaceExists: false,
 			expectError:     false,
+		},
+		{
+			name:        "namespace state cannot be verified - should fail closed",
+			queryFails:  true,
+			expectError: true,
 		},
 	}
 
@@ -465,7 +471,9 @@ func TestNVMeoFNamespaceDelete_InvalidParams_Verification(t *testing.T) {
 							Message: "Invalid params",
 						}
 					case "nvmet.namespace.query":
-						if tt.namespaceExists {
+						if tt.queryFails {
+							resp.Error = &rpcError{Code: -1, Message: "backend query unavailable"}
+						} else if tt.namespaceExists {
 							resp.Result = []interface{}{
 								map[string]interface{}{
 									"id":          float64(10),
@@ -526,6 +534,7 @@ func TestNVMeoFPortSubsysDelete_InvalidParams_Verification(t *testing.T) {
 	tests := []struct {
 		name        string
 		assocExists bool
+		queryFails  bool
 		expectError bool
 	}{
 		{
@@ -537,6 +546,11 @@ func TestNVMeoFPortSubsysDelete_InvalidParams_Verification(t *testing.T) {
 			name:        "association already deleted - should succeed",
 			assocExists: false,
 			expectError: false,
+		},
+		{
+			name:        "association state cannot be verified - should fail closed",
+			queryFails:  true,
+			expectError: true,
 		},
 	}
 
@@ -570,7 +584,9 @@ func TestNVMeoFPortSubsysDelete_InvalidParams_Verification(t *testing.T) {
 							Message: "Invalid params",
 						}
 					case "nvmet.port_subsys.query":
-						if tt.assocExists {
+						if tt.queryFails {
+							resp.Error = &rpcError{Code: -1, Message: "backend query unavailable"}
+						} else if tt.assocExists {
 							resp.Result = []interface{}{
 								map[string]interface{}{
 									"id": float64(100),

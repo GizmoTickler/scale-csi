@@ -119,6 +119,11 @@ func (c *apiCallCountingClient) DatasetSetUserProperties(ctx context.Context, na
 	return c.MockClient.DatasetSetUserProperties(ctx, name, properties)
 }
 
+func (c *apiCallCountingClient) DatasetRemoveUserProperties(ctx context.Context, name string, keys []string) error {
+	c.record("DatasetRemoveUserProperties")
+	return c.MockClient.DatasetRemoveUserProperties(ctx, name, keys)
+}
+
 func (c *apiCallCountingClient) DatasetGetUserProperty(ctx context.Context, name, key string) (string, error) {
 	c.record("DatasetGetUserProperty")
 	return c.MockClient.DatasetGetUserProperty(ctx, name, key)
@@ -513,13 +518,15 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 	}{
 		// Five calls preserve the fresh NFS path's single lookup, create, share,
 		// share-property update, and final batched ownership-property update.
-		{name: "CreateVolume fresh NFS", want: 5, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// TrueNAS 26.0 requires a post-create user-property update and an
+		// authoritative re-read because inline create properties are silently lost.
+		{name: "CreateVolume fresh NFS", want: 7, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-nfs", "nfs"))
 			require.NoError(t, err)
 		}},
 		// The iSCSI baseline protects the no-lookup fresh path while retaining the
 		// target, extent, association, property, reload, and response queries.
-		{name: "CreateVolume fresh iSCSI", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		{name: "CreateVolume fresh iSCSI", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
 		}},
@@ -533,18 +540,18 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.CreateVolume(context.Background(), req)
 			require.NoError(t, err)
 		}},
-		// NFS deletion keeps one dependency query apiece before deleting the share
-		// and dataset, preventing a late snapshot failure from orphaning the share.
-		{name: "DeleteVolume NFS", want: 5, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// NFS deletion validates the cached share ID's export-path backreference
+		// before the dependency guards and destructive calls.
+		{name: "DeleteVolume NFS", want: 6, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-nfs", "nfs"))
 			require.NoError(t, err)
 			client.resetCalls()
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-nfs"})
 			require.NoError(t, err)
 		}},
-		// iSCSI deletion pins direct ID-based cleanup plus the two dependency guards,
-		// avoiding fallback resource scans on a healthy managed volume.
-		{name: "DeleteVolume iSCSI", want: 7, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// iSCSI deletion validates target, extent, and association backreferences
+		// before cleanup, then retains the two dataset dependency guards.
+		{name: "DeleteVolume iSCSI", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-iscsi", "iscsi"))
 			require.NoError(t, err)
 			client.resetCalls()
@@ -587,10 +594,16 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "delete-snapshot"})
 			require.NoError(t, err)
 		}},
-		// Clone-backed deletion adds the tombstone rename, property strip, and
-		// deferred destroy after the initial non-deferred destroy reports clones.
-		{name: "DeleteSnapshot with clones", want: 5, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Clone-backed deletion adds the tombstone-ledger write with its verifying
+		// re-read, the tombstone rename, property strip, deferred destroy after the
+		// initial non-deferred destroy reports clones, and the ledger retirement
+		// once the backend accepts the deferred destroy.
+		{name: "DeleteSnapshot with clones", want: 8, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent", Type: "FILESYSTEM",
+			})
+			require.NoError(t, err)
+			_, err = client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent/tombstone-source", Type: "FILESYSTEM", Refquota: testGiB,
 			})
 			require.NoError(t, err)
@@ -602,10 +615,16 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
 			require.NoError(t, err)
 		}},
-		// Snapshot cloning pins direct name resolution, one clone and readiness wait,
-		// quota/share setup, and the two batched dataset-property updates.
-		{name: "CreateVolume clone from snapshot", want: 9, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Snapshot cloning pins direct name resolution, the durable in-flight
+		// marker write with its verifying re-read, one clone and readiness wait,
+		// quota/share setup, ownership stamping with an authoritative re-read,
+		// final identity updates, and marker retirement after the ownership stamp.
+		{name: "CreateVolume clone from snapshot", want: 15, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent", Type: "FILESYSTEM",
+			})
+			require.NoError(t, err)
+			_, err = client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent/clone-source", Type: "FILESYSTEM", Refquota: testGiB,
 			})
 			require.NoError(t, err)

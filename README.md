@@ -11,6 +11,8 @@ A Kubernetes CSI driver purpose-built for TrueNAS SCALE. Unlike general-purpose 
 - **Single Focus** - Optimized specifically for TrueNAS SCALE, not a multi-backend abstraction
 - **Modern API** - Built for SCALE 25.04+ versioned API from day one
 - **Full Featured** - Snapshots, clones, volume expansion, and raw block volumes
+- **Backend Fencing** - CSI publish state is enforced through per-volume NFS,
+  iSCSI, and NVMe-oF transport allowlists
 
 ## Supported Protocols
 
@@ -27,6 +29,12 @@ helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
   --namespace scale-csi --create-namespace \
   --values values.yaml
 ```
+
+Fencing defaults to `off`. `additive` is the explicit migration mode: upgrade
+the node DaemonSet first, wait for every CSINode to re-register its versioned
+transport identity, and only then enable `additive`. Enable `strict` only after
+`scale_csi_fencing_deferred_total` remains at zero. Follow the complete
+[rolling-upgrade procedure](charts/scale-csi/README.md#publication-fencing-and-ownership).
 
 ## Requirements
 

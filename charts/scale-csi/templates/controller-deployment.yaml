@@ -9,6 +9,16 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   replicas: {{ .Values.controller.replicas }}
+  {{- if ne .Values.fencing.mode "off" }}
+  # Fencing reconcilers are in-process singleton writers. Recreate prevents an
+  # old and new controller pod from overlapping during a rollout.
+  strategy:
+    type: Recreate
+    # Explicit null removes a live Deployment's server-defaulted RollingUpdate
+    # field during the required off -> additive Helm upgrade. Leaving that
+    # three-way-merge residue would make the Recreate strategy invalid.
+    rollingUpdate: null
+  {{- end }}
   selector:
     matchLabels:
       {{- include "scale-csi.controllerSelectorLabels" . | nindent 6 }}

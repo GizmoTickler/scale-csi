@@ -126,7 +126,7 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	}
 	initiatorID := 0
 	for _, g := range initiators {
-		if len(g.Initiators) == 0 {
+		if g.Initiators == nil && !strings.HasPrefix(strings.TrimSpace(g.Comment), "scale-csi fencing:") {
 			initiatorID = g.ID
 			break
 		}
@@ -214,6 +214,9 @@ func isNVMeoFHostNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if _, structured := truenas.APIErrno(err); structured {
+		return truenas.IsNotFoundError(err)
+	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "host") &&
 		(strings.Contains(message, "not found") ||
@@ -222,21 +225,41 @@ func isNVMeoFHostNotFoundError(err error) bool {
 }
 
 func (d *Driver) reconcileNVMeoFHostAssociations(ctx context.Context, subsysID int) error {
-	if d.config.NVMeoF.SubsystemAllowAnyHost {
+	if d.config.Fencing.Mode != FencingModeStrict && d.config.NVMeoF.SubsystemAllowAnyHost {
 		return nil
 	}
-	if len(d.config.NVMeoF.SubsystemHosts) == 0 {
+	if d.config.Fencing.Mode != FencingModeStrict && len(d.config.NVMeoF.SubsystemHosts) == 0 {
 		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
 	}
+	if d.config.Fencing.Mode == FencingModeStrict {
+		if _, err := d.truenasClient.NVMeoFSubsystemUpdateAllowAnyHost(ctx, subsysID, false); err != nil {
+			return err
+		}
+	}
 
-	seen := make(map[string]struct{}, len(d.config.NVMeoF.SubsystemHosts))
-	for _, nqn := range d.config.NVMeoF.SubsystemHosts {
+	staticHosts := d.config.NVMeoF.SubsystemHosts
+	if d.config.Fencing.Mode == FencingModeStrict {
+		staticHosts = nil
+	}
+	seen := make(map[string]struct{}, len(staticHosts))
+	for _, nqn := range staticHosts {
 		if _, duplicate := seen[nqn]; duplicate {
 			continue
 		}
 		seen[nqn] = struct{}{}
 		if err := d.ensureNVMeoFHostAssociation(ctx, nqn, subsysID); err != nil {
 			return err
+		}
+	}
+	if d.config.Fencing.Mode == FencingModeStrict {
+		associations, err := d.truenasClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
+		if err != nil {
+			return err
+		}
+		for _, association := range associations {
+			if err := d.truenasClient.NVMeoFHostSubsysDelete(ctx, association.ID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -293,6 +316,222 @@ func datasetUserProperty(ds *truenas.Dataset, key string) string {
 	return ""
 }
 
+func datasetUserPropertyProjection(ds *truenas.Dataset, key string) (truenas.UserProperty, bool) {
+	if ds == nil {
+		return truenas.UserProperty{}, false
+	}
+	property, ok := ds.UserProperties[key]
+	return property, ok
+}
+
+func datasetHasLocalUserProperty(ds *truenas.Dataset, key, expected string) bool {
+	// An inherited value is not proof that this specific dataset was created or
+	// explicitly adopted by this driver instance.
+	property, ok := datasetUserPropertyProjection(ds, key)
+	return ok && property.Value == expected && strings.EqualFold(strings.TrimSpace(property.Source), "local")
+}
+
+func expectedNFSMountpoint(ds *truenas.Dataset, datasetName string) string {
+	if ds != nil && ds.Mountpoint != "" {
+		return path.Clean(ds.Mountpoint)
+	}
+	return path.Join("/mnt", datasetName)
+}
+
+func nfsShareReferencesPath(share *truenas.NFSShare, expectedPath string) bool {
+	if share == nil {
+		return false
+	}
+	expectedPath = path.Clean(expectedPath)
+	if share.Path != "" && path.Clean(share.Path) == expectedPath {
+		return true
+	}
+	for _, candidate := range share.Paths {
+		if path.Clean(candidate) == expectedPath {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveNFSShare treats a stored database ID as a cache, never as ownership
+// proof. A mismatched ID is ignored and the relationship (export path) is used
+// to resolve the correct object.
+func (d *Driver) resolveNFSShare(ctx context.Context, ds *truenas.Dataset, datasetName string) (*truenas.NFSShare, error) {
+	expectedPath := expectedNFSMountpoint(ds, datasetName)
+	if rawID := datasetUserProperty(ds, PropNFSShareID); rawID != "" && rawID != "-" {
+		id, err := strconv.Atoi(rawID)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid NFS share ID %q", rawID)
+		}
+		share, getErr := d.truenasClient.NFSShareGet(ctx, id)
+		if getErr != nil && !truenas.IsNotFoundError(getErr) {
+			return nil, fmt.Errorf("verify NFS share %d: %w", id, getErr)
+		}
+		if getErr == nil && nfsShareReferencesPath(share, expectedPath) {
+			return share, nil
+		}
+		if share != nil {
+			klog.Warningf("Ignoring stored NFS share ID %d for %s: backend path does not match %s", id, datasetName, expectedPath)
+		}
+	}
+	share, err := d.truenasClient.NFSShareFindByPath(ctx, expectedPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve NFS share by path %s: %w", expectedPath, err)
+	}
+	return share, nil
+}
+
+func normalizedZvolReference(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "/dev/")
+	return strings.TrimPrefix(value, "/")
+}
+
+func (d *Driver) resolveISCSITarget(ctx context.Context, ds *truenas.Dataset, datasetName string) (*truenas.ISCSITarget, error) {
+	expectedName := d.iscsiShareName(path.Base(datasetName))
+	if rawID := datasetUserProperty(ds, PropISCSITargetID); rawID != "" && rawID != "-" {
+		id, err := strconv.Atoi(rawID)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid iSCSI target ID %q", rawID)
+		}
+		target, getErr := d.truenasClient.ISCSITargetGet(ctx, id)
+		if getErr != nil && !truenas.IsNotFoundError(getErr) {
+			return nil, fmt.Errorf("verify iSCSI target %d: %w", id, getErr)
+		}
+		if getErr == nil && target != nil && target.Name == expectedName {
+			return target, nil
+		}
+		if target != nil {
+			klog.Warningf("Ignoring stored iSCSI target ID %d for %s: backend name %q does not match %q", id, datasetName, target.Name, expectedName)
+		}
+	}
+	target, err := d.truenasClient.ISCSITargetFindByName(ctx, expectedName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve iSCSI target by name %s: %w", expectedName, err)
+	}
+	return target, nil
+}
+
+func (d *Driver) resolveISCSIExtent(ctx context.Context, ds *truenas.Dataset, datasetName string) (*truenas.ISCSIExtent, error) {
+	expectedDisk := normalizedZvolReference("zvol/" + datasetName)
+	if rawID := datasetUserProperty(ds, PropISCSIExtentID); rawID != "" && rawID != "-" {
+		id, err := strconv.Atoi(rawID)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid iSCSI extent ID %q", rawID)
+		}
+		extent, getErr := d.truenasClient.ISCSIExtentGet(ctx, id)
+		if getErr != nil && !truenas.IsNotFoundError(getErr) {
+			return nil, fmt.Errorf("verify iSCSI extent %d: %w", id, getErr)
+		}
+		if getErr == nil && extent != nil && normalizedZvolReference(extent.Disk) == expectedDisk {
+			return extent, nil
+		}
+		if extent != nil {
+			klog.Warningf("Ignoring stored iSCSI extent ID %d for %s: backend disk %q does not match %q", id, datasetName, extent.Disk, expectedDisk)
+		}
+	}
+	extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, expectedDisk)
+	if err != nil {
+		return nil, fmt.Errorf("resolve iSCSI extent by disk %s: %w", expectedDisk, err)
+	}
+	return extent, nil
+}
+
+func (d *Driver) resolveISCSITargetExtent(ctx context.Context, ds *truenas.Dataset, targetID, extentID int) (*truenas.ISCSITargetExtent, error) {
+	if targetID <= 0 || extentID <= 0 {
+		return nil, nil
+	}
+	if rawID := datasetUserProperty(ds, PropISCSITargetExtentID); rawID != "" && rawID != "-" {
+		id, err := strconv.Atoi(rawID)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid iSCSI target-extent ID %q", rawID)
+		}
+		association, getErr := d.truenasClient.ISCSITargetExtentGet(ctx, id)
+		if getErr != nil && !truenas.IsNotFoundError(getErr) {
+			return nil, fmt.Errorf("verify iSCSI target-extent %d: %w", id, getErr)
+		}
+		if getErr == nil && association != nil && association.Target == targetID && association.Extent == extentID {
+			return association, nil
+		}
+		if association != nil {
+			klog.Warningf("Ignoring stored iSCSI target-extent ID %d: backend relationship %d/%d does not match %d/%d", id, association.Target, association.Extent, targetID, extentID)
+		}
+	}
+	association, err := d.truenasClient.ISCSITargetExtentFind(ctx, targetID, extentID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve iSCSI target-extent relationship: %w", err)
+	}
+	return association, nil
+}
+
+func (d *Driver) nvmeSubsystemName(datasetName string) string {
+	name := protocolShareName(path.Base(datasetName))
+	if d.config.NVMeoF.NamePrefix != "" {
+		name = d.config.NVMeoF.NamePrefix + name
+	}
+	return name + d.config.NVMeoF.NameSuffix
+}
+
+func (d *Driver) resolveNVMeNamespace(ctx context.Context, ds *truenas.Dataset, datasetName string) (*truenas.NVMeoFNamespace, error) {
+	expectedDevice := normalizedZvolReference("zvol/" + datasetName)
+	if rawID := datasetUserProperty(ds, PropNVMeoFNamespaceID); rawID != "" && rawID != "-" {
+		id, err := strconv.Atoi(rawID)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid NVMe-oF namespace ID %q", rawID)
+		}
+		namespace, getErr := d.truenasClient.NVMeoFNamespaceGet(ctx, id)
+		if getErr != nil && !truenas.IsNotFoundError(getErr) {
+			return nil, fmt.Errorf("verify NVMe-oF namespace %d: %w", id, getErr)
+		}
+		if getErr == nil && namespace != nil && normalizedZvolReference(namespace.DevicePath) == expectedDevice {
+			return namespace, nil
+		}
+		if namespace != nil {
+			klog.Warningf("Ignoring stored NVMe-oF namespace ID %d for %s: backend device %q does not match %q", id, datasetName, namespace.DevicePath, expectedDevice)
+		}
+	}
+	namespace, err := d.truenasClient.NVMeoFNamespaceFindByDevicePath(ctx, expectedDevice)
+	if err != nil {
+		return nil, fmt.Errorf("resolve NVMe-oF namespace by device %s: %w", expectedDevice, err)
+	}
+	return namespace, nil
+}
+
+func (d *Driver) resolveNVMeSubsystem(ctx context.Context, ds *truenas.Dataset, datasetName string, namespace *truenas.NVMeoFNamespace) (*truenas.NVMeoFSubsystem, error) {
+	if namespace != nil && namespace.SubsystemID > 0 {
+		subsystem, err := d.truenasClient.NVMeoFSubsystemGet(ctx, namespace.SubsystemID)
+		if err != nil && !truenas.IsNotFoundError(err) {
+			return nil, fmt.Errorf("resolve namespace subsystem %d: %w", namespace.SubsystemID, err)
+		}
+		if err == nil && subsystem != nil {
+			return subsystem, nil
+		}
+	}
+	expectedName := d.nvmeSubsystemName(datasetName)
+	if rawID := datasetUserProperty(ds, PropNVMeoFSubsystemID); rawID != "" && rawID != "-" {
+		id, err := strconv.Atoi(rawID)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid NVMe-oF subsystem ID %q", rawID)
+		}
+		subsystem, getErr := d.truenasClient.NVMeoFSubsystemGet(ctx, id)
+		if getErr != nil && !truenas.IsNotFoundError(getErr) {
+			return nil, fmt.Errorf("verify NVMe-oF subsystem %d: %w", id, getErr)
+		}
+		if getErr == nil && subsystem != nil && subsystem.Name == expectedName {
+			return subsystem, nil
+		}
+		if subsystem != nil {
+			klog.Warningf("Ignoring stored NVMe-oF subsystem ID %d for %s: backend name %q does not match %q", id, datasetName, subsystem.Name, expectedName)
+		}
+	}
+	subsystem, err := d.truenasClient.NVMeoFSubsystemFindByName(ctx, expectedName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve NVMe-oF subsystem by name %s: %w", expectedName, err)
+	}
+	return subsystem, nil
+}
+
 func (d *Driver) datasetForProperties(ctx context.Context, ds *truenas.Dataset, datasetName string) (*truenas.Dataset, error) {
 	if ds != nil {
 		return ds, nil
@@ -312,7 +551,9 @@ func (d *Driver) setDatasetUserProperties(ctx context.Context, ds *truenas.Datas
 			ds.UserProperties = make(map[string]truenas.UserProperty, len(properties))
 		}
 		for key, value := range properties {
-			ds.UserProperties[key] = truenas.UserProperty{Value: value}
+			// pool.dataset.update user_properties_update is the TrueNAS 26.0
+			// write path that persists these values with source=local.
+			ds.UserProperties[key] = truenas.UserProperty{Value: value, Source: "local"}
 		}
 	}
 	return nil
@@ -339,7 +580,7 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 			}
 			share, getErr := d.truenasClient.NFSShareGet(ctx, shareID)
 			switch {
-			case getErr == nil && share != nil:
+			case getErr == nil && nfsShareReferencesPath(share, expectedNFSMountpoint(ds, datasetName)):
 				klog.V(4).Infof("NFS share already exists for %s (ID: %s)", datasetName, prop.Value)
 				return nil
 			case getErr != nil && !truenas.IsNotFoundError(getErr):
@@ -352,57 +593,13 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 		return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false)
 
 	case ShareTypeISCSI:
-		// The target-extent association is the final object in the iSCSI share.
-		if prop, ok := ds.UserProperties[PropISCSITargetExtentID]; ok && prop.Value != "" && prop.Value != "-" {
-			targetExtentID, err := strconv.Atoi(prop.Value)
-			if err != nil || targetExtentID <= 0 {
-				return status.Errorf(codes.Internal, "invalid iSCSI target-extent ID %q for %s", prop.Value, datasetName)
-			}
-			targetExtent, getErr := d.truenasClient.ISCSITargetExtentGet(ctx, targetExtentID)
-			switch {
-			case getErr == nil && targetExtent != nil:
-				klog.V(4).Infof("iSCSI share already exists for %s (targetextent: %s)", datasetName, prop.Value)
-				return nil
-			case getErr != nil && !truenas.IsNotFoundError(getErr):
-				return status.Errorf(codes.Internal, "failed to verify iSCSI target-extent %d for %s: %v", targetExtentID, datasetName, getErr)
-			default:
-				delete(ds.UserProperties, PropISCSITargetExtentID)
-			}
-		}
-		klog.Infof("iSCSI share missing for existing volume %s, creating...", datasetName)
+		// The create path validates every cached ID against its target/extent
+		// relationship before taking the idempotent fast path.
 		return d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, false, false)
 
 	case ShareTypeNVMeoF:
-		// A namespace is the final object in the NVMe-oF share.
-		if prop, ok := ds.UserProperties[PropNVMeoFNamespaceID]; ok && prop.Value != "" && prop.Value != "-" {
-			namespaceID, err := strconv.Atoi(prop.Value)
-			if err != nil || namespaceID <= 0 {
-				return status.Errorf(codes.Internal, "invalid NVMe-oF namespace ID %q for %s", prop.Value, datasetName)
-			}
-			namespace, getErr := d.truenasClient.NVMeoFNamespaceGet(ctx, namespaceID)
-			switch {
-			case getErr == nil && namespace != nil:
-				// Continue below with host reconciliation for the existing share.
-			case getErr != nil && !truenas.IsNotFoundError(getErr):
-				return status.Errorf(codes.Internal, "failed to verify NVMe-oF namespace %d for %s: %v", namespaceID, datasetName, getErr)
-			default:
-				delete(ds.UserProperties, PropNVMeoFNamespaceID)
-				klog.Infof("NVMe-oF namespace missing for existing volume %s, recreating...", datasetName)
-				return d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, false, false)
-			}
-			if !d.config.NVMeoF.SubsystemAllowAnyHost {
-				subsysID, err := strconv.Atoi(datasetUserProperty(ds, PropNVMeoFSubsystemID))
-				if err != nil || subsysID <= 0 {
-					return status.Errorf(codes.Internal, "invalid NVMe-oF subsystem ID for %s", datasetName)
-				}
-				if err := d.reconcileNVMeoFHostAssociations(ctx, subsysID); err != nil {
-					return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts for %s: %v", datasetName, err)
-				}
-			}
-			klog.V(4).Infof("NVMe-oF share already exists for %s (namespace: %s)", datasetName, prop.Value)
-			return nil
-		}
-		klog.Infof("NVMe-oF share missing for existing volume %s, creating...", datasetName)
+		// The create path validates the namespace's device backreference and
+		// repairs cached IDs before returning an idempotent success.
 		return d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, false, false)
 
 	default:
@@ -466,10 +663,18 @@ func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Datas
 		return status.Errorf(codes.Internal, "failed to get dataset: %v", err)
 	}
 
-	// Check if share already exists
-	if existingProp := datasetUserProperty(ds, PropNFSShareID); !freshlyCreated && existingProp != "" && existingProp != "-" {
-		klog.Infof("NFS share already exists for %s", datasetName)
-		return nil
+	if !freshlyCreated {
+		existing, resolveErr := d.resolveNFSShare(ctx, ds, datasetName)
+		if resolveErr != nil {
+			return status.Errorf(codes.Internal, "failed to resolve NFS share: %v", resolveErr)
+		}
+		if existing != nil {
+			if propertyErr := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{PropNFSShareID: strconv.Itoa(existing.ID)}); propertyErr != nil {
+				return status.Errorf(codes.Internal, "failed to repair NFS share ID: %v", propertyErr)
+			}
+			klog.Infof("NFS share already exists for %s (ID %d)", datasetName, existing.ID)
+			return nil
+		}
 	}
 
 	// Create NFS share
@@ -485,6 +690,15 @@ func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Datas
 		MaprootGroup: d.config.NFS.ShareMaprootGroup,
 		MapallUser:   d.config.NFS.ShareMapallUser,
 		MapallGroup:  d.config.NFS.ShareMapallGroup,
+		Enabled:      d.config.Fencing.Mode != FencingModeStrict,
+	}
+	if d.config.Fencing.Mode == FencingModeStrict {
+		// An enabled export with both lists empty means allow-all in TrueNAS. New
+		// strict volumes therefore start disabled until ControllerPublish writes at
+		// least one node identity. Additive retains the pre-upgrade static policy so
+		// a deferred legacy node remains usable.
+		params.Networks = []string{}
+		params.Hosts = []string{}
 	}
 
 	share, err := d.truenasClient.NFSShareCreate(ctx, params)
@@ -507,27 +721,27 @@ func (d *Driver) deleteNFSShare(ctx context.Context, datasetName string) error {
 }
 
 func (d *Driver) deleteNFSShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
-	// Get share ID from dataset property
-	ds, err := d.datasetForProperties(ctx, ds, datasetName)
+	if fetched, err := d.datasetForProperties(ctx, ds, datasetName); err == nil {
+		ds = fetched
+	} else if !truenas.IsNotFoundError(err) {
+		return fmt.Errorf("failed to read dataset before NFS cleanup: %w", err)
+	}
+	share, err := d.resolveNFSShare(ctx, ds, datasetName)
 	if err != nil {
+		return err
+	}
+	if share == nil {
 		return nil
 	}
-	shareIDStr := datasetUserProperty(ds, PropNFSShareID)
-	if shareIDStr == "" || shareIDStr == "-" {
-		return nil // No share to delete
-	}
-
-	shareID, err := strconv.Atoi(shareIDStr)
-	if err != nil {
-		return nil
-	}
-
-	if err := d.truenasClient.NFSShareDelete(ctx, shareID); err != nil {
+	if err := d.truenasClient.NFSShareDelete(ctx, share.ID); err != nil {
+		if truenas.IsNotFoundError(err) {
+			return nil
+		}
 		// Return error so caller can retry - don't silently swallow
-		return fmt.Errorf("failed to delete NFS share %d: %w", shareID, err)
+		return fmt.Errorf("failed to delete NFS share %d: %w", share.ID, err)
 	}
 
-	klog.Infof("Deleted NFS share ID %d", shareID)
+	klog.Infof("Deleted NFS share ID %d", share.ID)
 	return nil
 }
 
@@ -551,42 +765,18 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	iscsiName := d.iscsiShareName(path.Base(datasetName))
 	diskPath := fmt.Sprintf("zvol/%s", datasetName)
 
-	// Step 1: Check if already fully configured (idempotency fast-path)
-	existingTE := datasetUserProperty(ds, PropISCSITargetExtentID)
-	if !freshlyCreated && existingTE != "" && existingTE != "-" {
-		// Verify the target-extent still exists by looking it up by ID
-		teID, atoiErr := strconv.Atoi(existingTE)
-		if atoiErr == nil {
-			if te, findErr := d.truenasClient.ISCSITargetExtentGet(ctx, teID); findErr == nil && te != nil {
-				klog.Infof("iSCSI share already fully configured for %s (targetextent=%d)", datasetName, teID)
-				return nil
-			}
-		}
-		klog.V(4).Infof("Stored target-extent ID %s invalid or not found, will recreate", existingTE)
-	}
-
 	// Step 2: Find or create target (idempotent)
 	var target *truenas.ISCSITarget
 	var targetID int
 
-	// Check if we have a stored target ID
-	existingTargetID := datasetUserProperty(ds, PropISCSITargetID)
-	if !freshlyCreated && existingTargetID != "" && existingTargetID != "-" {
-		if id, atoiErr := strconv.Atoi(existingTargetID); atoiErr == nil {
-			if t, findErr := d.truenasClient.ISCSITargetGet(ctx, id); findErr == nil {
-				target = t
-				targetID = t.ID
-				klog.V(4).Infof("Using existing target ID %d for %s", targetID, datasetName)
-			}
+	if !freshlyCreated {
+		target, err = d.resolveISCSITarget(ctx, ds, datasetName)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to resolve iSCSI target: %v", err)
 		}
-	}
-
-	// If no stored target, check by name
-	if !freshlyCreated && target == nil {
-		if t, findErr := d.truenasClient.ISCSITargetFindByName(ctx, iscsiName); findErr == nil && t != nil {
-			target = t
-			targetID = t.ID
-			klog.V(4).Infof("Found existing target by name %s (ID %d)", iscsiName, targetID)
+		if target != nil {
+			targetID = target.ID
+			klog.V(4).Infof("Resolved existing target %s (ID %d)", iscsiName, targetID)
 		}
 	}
 
@@ -594,7 +784,21 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	if target == nil {
 		targetGroups := []truenas.ISCSITargetGroup{}
 		usedResolvedGroup := false
-		for _, tg := range d.config.ISCSI.TargetGroups {
+		configuredGroups := d.config.ISCSI.TargetGroups
+		if d.config.Fencing.Mode == FencingModeStrict {
+			configuredGroups = nil
+		}
+		for _, tg := range configuredGroups {
+			if d.config.Fencing.Enabled() {
+				initiator, verifyErr := d.truenasClient.ISCSIInitiatorGet(ctx, tg.Initiator)
+				if verifyErr != nil {
+					return status.Errorf(codes.Internal, "failed to verify configured iSCSI initiator group %d: %v", tg.Initiator, verifyErr)
+				}
+				if initiator == nil || len(initiator.Initiators) == 0 {
+					return status.Errorf(codes.FailedPrecondition,
+						"iscsi.targetGroups initiator %d is missing or allow-all; fenced targets require a non-empty initiator allowlist", tg.Initiator)
+				}
+			}
 			var auth *int
 			if tg.Auth != nil && *tg.Auth > 0 {
 				auth = tg.Auth
@@ -606,13 +810,44 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				Auth:       auth,
 			})
 		}
-		if len(targetGroups) == 0 {
+		if len(targetGroups) == 0 && d.config.Fencing.Mode != FencingModeStrict {
 			resolved, resolveErr := d.resolveISCSITargetGroup(ctx)
 			if resolveErr != nil {
 				return status.Errorf(codes.Internal, "cannot create iSCSI target for %s: %v", datasetName, resolveErr)
 			}
 			targetGroups = append(targetGroups, *resolved)
 			usedResolvedGroup = true
+		}
+		if len(targetGroups) == 0 {
+			// TrueNAS may reject a target with no portal groups. Strict mode starts
+			// with a CSI-owned, non-nil-empty initiator allowlist attached to the
+			// resolved portals: the target is valid but authorizes no initiator.
+			dynamicGroup, groupErr := d.resolveFencingInitiatorGroup(ctx, ds, datasetName)
+			if groupErr != nil {
+				return status.Errorf(codes.Internal, "failed to resolve strict iSCSI initiator group: %v", groupErr)
+			}
+			if dynamicGroup == nil {
+				dynamicGroup, groupErr = d.truenasClient.ISCSIInitiatorCreateWithInitiators(
+					ctx, []string{}, "scale-csi fencing: "+datasetName,
+				)
+			}
+			if groupErr != nil {
+				return status.Errorf(codes.Internal, "failed to create strict iSCSI initiator group: %v", groupErr)
+			}
+			if propertyErr := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+				PropISCSIInitiatorID: strconv.Itoa(dynamicGroup.ID),
+			}); propertyErr != nil {
+				return status.Errorf(codes.Internal, "failed to store strict iSCSI initiator group: %v", propertyErr)
+			}
+			portals, portalErr := d.resolveISCSIPortalIDs(ctx)
+			if portalErr != nil {
+				return status.Errorf(codes.Internal, "failed to resolve strict iSCSI portal groups: %v", portalErr)
+			}
+			for _, portalID := range portals {
+				targetGroups = append(targetGroups, truenas.ISCSITargetGroup{
+					Portal: portalID, Initiator: dynamicGroup.ID, AuthMethod: "NONE",
+				})
+			}
 		}
 
 		target, err = d.truenasClient.ISCSITargetCreate(ctx, iscsiName, "", "ISCSI", targetGroups)
@@ -648,33 +883,14 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	var extent *truenas.ISCSIExtent
 	var extentID int
 
-	// Check if we have a stored extent ID
-	existingExtentID := datasetUserProperty(ds, PropISCSIExtentID)
-	if !freshlyCreated && existingExtentID != "" && existingExtentID != "-" {
-		if id, err := strconv.Atoi(existingExtentID); err == nil {
-			if e, err := d.truenasClient.ISCSIExtentGet(ctx, id); err == nil {
-				extent = e
-				extentID = e.ID
-				klog.V(4).Infof("Using existing extent ID %d for %s", extentID, datasetName)
-			}
+	if !freshlyCreated {
+		extent, err = d.resolveISCSIExtent(ctx, ds, datasetName)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to resolve iSCSI extent: %v", err)
 		}
-	}
-
-	// If no stored extent, check by disk path (more reliable than name for clones)
-	if !freshlyCreated && extent == nil {
-		if e, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, diskPath); err == nil && e != nil {
-			extent = e
-			extentID = e.ID
-			klog.V(4).Infof("Found existing extent by disk path %s (ID %d)", diskPath, extentID)
-		}
-	}
-
-	// If still no extent, check by name
-	if !freshlyCreated && extent == nil {
-		if e, err := d.truenasClient.ISCSIExtentFindByName(ctx, iscsiName); err == nil && e != nil {
-			extent = e
-			extentID = e.ID
-			klog.V(4).Infof("Found existing extent by name %s (ID %d)", iscsiName, extentID)
+		if extent != nil {
+			extentID = extent.ID
+			klog.V(4).Infof("Resolved existing extent by disk path %s (ID %d)", diskPath, extentID)
 		}
 	}
 
@@ -694,8 +910,8 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				}
 			}
 
-			var err error
-			extent, err = d.truenasClient.ISCSIExtentCreate(
+			var createErr error
+			extent, createErr = d.truenasClient.ISCSIExtentCreate(
 				ctx,
 				iscsiName,
 				diskPath,
@@ -704,17 +920,17 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				!d.config.ISCSI.ExtentDisablePhysicalBlocksize,
 				d.config.ISCSI.ExtentRpm,
 			)
-			if err == nil {
+			if createErr == nil {
 				extentID = extent.ID
 				klog.Infof("Created iSCSI extent %s (ID %d) on attempt %d", iscsiName, extentID, attempt+1)
 				break
 			}
-			lastErr = err
-			klog.Warningf("Extent creation attempt %d failed for %s: %v", attempt+1, datasetName, err)
+			lastErr = createErr
+			klog.Warningf("Extent creation attempt %d failed for %s: %v", attempt+1, datasetName, createErr)
 
 			// Fresh creates only fall back on a definite already-exists result.
 			// Existing-volume retries retain the broader ambiguity check.
-			if !freshlyCreated || truenas.IsAlreadyExistsError(err) {
+			if !freshlyCreated || truenas.IsAlreadyExistsError(createErr) {
 				e, findErr := d.truenasClient.ISCSIExtentFindByDisk(ctx, diskPath)
 				if findErr == nil && e != nil {
 					extent = e
@@ -739,9 +955,12 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 
 	// Check if association already exists
 	if !freshlyCreated {
-		if te, err := d.truenasClient.ISCSITargetExtentFind(ctx, targetID, extentID); err == nil && te != nil {
-			targetExtent = te
-			klog.V(4).Infof("Using existing target-extent association (ID %d)", te.ID)
+		targetExtent, err = d.resolveISCSITargetExtent(ctx, ds, targetID, extentID)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to resolve iSCSI target-extent: %v", err)
+		}
+		if targetExtent != nil {
+			klog.V(4).Infof("Using existing target-extent association (ID %d)", targetExtent.ID)
 		}
 	}
 
@@ -783,10 +1002,12 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	// during bulk volume provisioning. Multiple requests within the debounce
 	// window will be coalesced into a single reload operation.
 	klog.V(4).Infof("Requesting debounced iSCSI service reload to ensure target is discoverable")
-	if err := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
-		// Non-fatal: the service might auto-reload, and node has retry logic.
-		// Log at WARNING level for operator visibility (not V(4) debug level).
-		klog.Warningf("iSCSI service reload failed (non-fatal, will retry on node): %v", err)
+	if d.serviceReloadDebouncer != nil {
+		if err := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
+			// Non-fatal: the service might auto-reload, and node has retry logic.
+			// Log at WARNING level for operator visibility (not V(4) debug level).
+			klog.Warningf("iSCSI service reload failed (non-fatal, will retry on node): %v", err)
+		}
 	}
 
 	klog.Infof("iSCSI share setup complete for %s: target=%d, extent=%d, targetextent=%d (took %v)",
@@ -805,94 +1026,64 @@ func (d *Driver) deleteISCSIShare(ctx context.Context, datasetName string) error
 func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
 	if fetched, err := d.datasetForProperties(ctx, ds, datasetName); err == nil {
 		ds = fetched
+	} else if !truenas.IsNotFoundError(err) {
+		return fmt.Errorf("failed to read dataset before iSCSI cleanup: %w", err)
 	}
 
-	// Generate the expected iSCSI name (same logic as createISCSIShare)
-	iscsiName := d.iscsiShareName(path.Base(datasetName))
-	diskPath := fmt.Sprintf("zvol/%s", datasetName)
+	target, err := d.resolveISCSITarget(ctx, ds, datasetName)
+	if err != nil {
+		return err
+	}
+	extent, err := d.resolveISCSIExtent(ctx, ds, datasetName)
+	if err != nil {
+		return err
+	}
+	var initiatorGroup *truenas.ISCSIInitiator
+	if d.config.Fencing.Enabled() || datasetUserProperty(ds, PropISCSIInitiatorID) != "" {
+		initiatorGroup, err = d.resolveFencingInitiatorGroup(ctx, ds, datasetName)
+		if err != nil {
+			return fmt.Errorf("failed to resolve per-volume iSCSI initiator group: %w", err)
+		}
+	}
 
-	var extDeleted, tgtDeleted bool
+	var associations []*truenas.ISCSITargetExtent
+	switch {
+	case target != nil && extent != nil:
+		association, resolveErr := d.resolveISCSITargetExtent(ctx, ds, target.ID, extent.ID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if association != nil {
+			associations = append(associations, association)
+		}
+	case target != nil:
+		associations, err = d.truenasClient.ISCSITargetExtentFindByTarget(ctx, target.ID)
+	case extent != nil:
+		associations, err = d.truenasClient.ISCSITargetExtentFindByExtent(ctx, extent.ID)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to resolve iSCSI target-extent associations: %w", err)
+	}
+
 	var errs []error
-
-	// Try to delete target-extent association by stored ID
-	if teIDStr := datasetUserProperty(ds, PropISCSITargetExtentID); teIDStr != "" && teIDStr != "-" {
-		if teID, err := strconv.Atoi(teIDStr); err == nil {
-			if err := d.truenasClient.ISCSITargetExtentDelete(ctx, teID, true); err != nil {
-				klog.Warningf("Failed to delete iSCSI target-extent %d: %v", teID, err)
-				errs = append(errs, fmt.Errorf("target-extent %d: %w", teID, err))
-			}
+	for _, association := range associations {
+		if deleteErr := d.truenasClient.ISCSITargetExtentDelete(ctx, association.ID, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+			errs = append(errs, fmt.Errorf("target-extent %d: %w", association.ID, deleteErr))
 		}
 	}
-
-	// Try to delete extent by stored ID
-	if extIDStr := datasetUserProperty(ds, PropISCSIExtentID); extIDStr != "" && extIDStr != "-" {
-		if extID, err := strconv.Atoi(extIDStr); err == nil {
-			if err := d.truenasClient.ISCSIExtentDelete(ctx, extID, false, true); err != nil {
-				klog.Warningf("Failed to delete iSCSI extent %d: %v", extID, err)
-				errs = append(errs, fmt.Errorf("extent %d: %w", extID, err))
-			} else {
-				extDeleted = true
-			}
+	if extent != nil {
+		if deleteErr := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+			errs = append(errs, fmt.Errorf("extent %d: %w", extent.ID, deleteErr))
 		}
 	}
-
-	// Try to delete target by stored ID
-	if tgtIDStr := datasetUserProperty(ds, PropISCSITargetID); tgtIDStr != "" && tgtIDStr != "-" {
-		if tgtID, err := strconv.Atoi(tgtIDStr); err == nil {
-			if err := d.truenasClient.ISCSITargetDelete(ctx, tgtID, true); err != nil {
-				klog.Warningf("Failed to delete iSCSI target %d: %v", tgtID, err)
-				errs = append(errs, fmt.Errorf("target %d: %w", tgtID, err))
-			} else {
-				tgtDeleted = true
-			}
+	if target != nil {
+		if deleteErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+			errs = append(errs, fmt.Errorf("target %d: %w", target.ID, deleteErr))
 		}
 	}
-
-	// Fallback: If extent was not deleted by ID, try to find and delete by disk path
-	// This handles cases where the dataset properties were never stored
-	if !extDeleted {
-		if extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, diskPath); err == nil && extent != nil {
-			klog.V(4).Infof("Found orphaned extent by disk path %s (ID %d), deleting", diskPath, extent.ID)
-			// First delete any target-extent associations for this extent
-			assocs, assocErr := d.truenasClient.ISCSITargetExtentFindByExtent(ctx, extent.ID)
-			if assocErr != nil {
-				klog.Warningf("Failed to query target-extent associations for extent %d: %v", extent.ID, assocErr)
-				// Continue anyway - extent deletion with force=true may still work
-			}
-			for _, assoc := range assocs {
-				if err := d.truenasClient.ISCSITargetExtentDelete(ctx, assoc.ID, true); err != nil {
-					klog.Warningf("Failed to delete orphaned target-extent %d: %v", assoc.ID, err)
-					errs = append(errs, fmt.Errorf("orphaned target-extent %d: %w", assoc.ID, err))
-				}
-			}
-			if err := d.truenasClient.ISCSIExtentDelete(ctx, extent.ID, false, true); err != nil {
-				klog.Warningf("Failed to delete orphaned extent %d: %v", extent.ID, err)
-				errs = append(errs, fmt.Errorf("orphaned extent %d: %w", extent.ID, err))
-			}
-		}
-	}
-
-	// Fallback: If target was not deleted by ID, try to find and delete by name
-	// This handles cases where target was created but property was never stored
-	if !tgtDeleted {
-		if target, err := d.truenasClient.ISCSITargetFindByName(ctx, iscsiName); err == nil && target != nil {
-			klog.V(4).Infof("Found orphaned target by name %s (ID %d), deleting", iscsiName, target.ID)
-			// First delete any target-extent associations for this target
-			assocs, assocErr := d.truenasClient.ISCSITargetExtentFindByTarget(ctx, target.ID)
-			if assocErr != nil {
-				klog.Warningf("Failed to query target-extent associations for target %d: %v", target.ID, assocErr)
-				// Continue anyway - target deletion with force=true may still work
-			}
-			for _, assoc := range assocs {
-				if err := d.truenasClient.ISCSITargetExtentDelete(ctx, assoc.ID, true); err != nil {
-					klog.Warningf("Failed to delete orphaned target-extent %d: %v", assoc.ID, err)
-					errs = append(errs, fmt.Errorf("orphaned target-extent %d: %w", assoc.ID, err))
-				}
-			}
-			if err := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true); err != nil {
-				klog.Warningf("Failed to delete orphaned target %d: %v", target.ID, err)
-				errs = append(errs, fmt.Errorf("orphaned target %d: %w", target.ID, err))
-			}
+	if initiatorGroup != nil {
+		if deleteErr := d.truenasClient.ISCSIInitiatorDelete(ctx, initiatorGroup.ID); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+			errs = append(errs, fmt.Errorf("initiator group %d: %w", initiatorGroup.ID, deleteErr))
 		}
 	}
 
@@ -905,7 +1096,7 @@ func (d *Driver) deleteISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 }
 
 func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool) error {
-	if !d.config.NVMeoF.SubsystemAllowAnyHost && len(d.config.NVMeoF.SubsystemHosts) == 0 {
+	if !d.config.Fencing.Enabled() && !d.config.NVMeoF.SubsystemAllowAnyHost && len(d.config.NVMeoF.SubsystemHosts) == 0 {
 		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
 	}
 
@@ -915,20 +1106,39 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		return status.Errorf(codes.Internal, "failed to get dataset: %v", err)
 	}
 
-	// Check if already configured
-	existingProp := datasetUserProperty(ds, PropNVMeoFNamespaceID)
-	if !freshlyCreated && existingProp != "" && existingProp != "-" {
-		klog.Infof("NVMe-oF share already exists for %s", datasetName)
-		return nil
-	}
-
 	// Generate NVMe-oF subsystem name (TrueNAS 25.10+ auto-generates NQN from name)
-	subsysName := protocolShareName(path.Base(datasetName))
-	if d.config.NVMeoF.NamePrefix != "" {
-		subsysName = d.config.NVMeoF.NamePrefix + subsysName
-	}
-	if d.config.NVMeoF.NameSuffix != "" {
-		subsysName += d.config.NVMeoF.NameSuffix
+	subsysName := d.nvmeSubsystemName(datasetName)
+	var subsys *truenas.NVMeoFSubsystem
+	if !freshlyCreated {
+		namespace, resolveErr := d.resolveNVMeNamespace(ctx, ds, datasetName)
+		if resolveErr != nil {
+			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF namespace: %v", resolveErr)
+		}
+		subsys, resolveErr = d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+		if resolveErr != nil {
+			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem: %v", resolveErr)
+		}
+		if namespace != nil {
+			if subsys == nil || namespace.SubsystemID != subsys.ID {
+				return status.Errorf(codes.Internal, "NVMe-oF namespace %d for %s has no matching subsystem", namespace.ID, datasetName)
+			}
+			if propertyErr := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+				PropNVMeoFSubsystemID: strconv.Itoa(subsys.ID),
+				PropNVMeoFNamespaceID: strconv.Itoa(namespace.ID),
+			}); propertyErr != nil {
+				return status.Errorf(codes.Internal, "failed to repair NVMe-oF object IDs: %v", propertyErr)
+			}
+			// Fenced allowlists are changed only after ControllerPublishVolume has
+			// durably stored the requested node identity. CreateVolume retries and
+			// ensure-share checks must not transiently clear a strict subsystem.
+			if !d.config.Fencing.Enabled() {
+				if reconcileErr := d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); reconcileErr != nil {
+					return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", reconcileErr)
+				}
+			}
+			klog.Infof("NVMe-oF share already exists for %s (namespace=%d, subsystem=%d)", datasetName, namespace.ID, subsys.ID)
+			return nil
+		}
 	}
 
 	// Wait for zvol to be ready before creating subsystem/namespace
@@ -944,31 +1154,34 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		klog.V(4).Infof("Skipping zvol wait for %s (already verified ready)", datasetName)
 	}
 
+	allowAnyHost := d.config.NVMeoF.SubsystemAllowAnyHost && d.config.Fencing.Mode != FencingModeStrict
+	staticHosts := d.config.NVMeoF.SubsystemHosts
+	if d.config.Fencing.Mode == FencingModeStrict {
+		staticHosts = nil
+	}
 	var hostIDs []int
-	if !d.config.NVMeoF.SubsystemAllowAnyHost {
-		hostIDs, err = d.resolveNVMeoFHostIDs(ctx, d.config.NVMeoF.SubsystemHosts)
+	if !allowAnyHost && len(staticHosts) > 0 {
+		hostIDs, err = d.resolveNVMeoFHostIDs(ctx, staticHosts)
 		if err != nil {
 			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem hosts: %v", err)
 		}
 	}
 
 	// Create subsystem (TrueNAS 25.10+: serial is auto-generated, hosts are IDs not NQNs).
-	subsys, err := d.truenasClient.NVMeoFSubsystemCreate(
-		ctx,
-		subsysName,
-		d.config.NVMeoF.SubsystemAllowAnyHost,
-		hostIDs,
-	)
+	subsysWasExisting := subsys != nil
+	if subsys == nil {
+		subsys, err = d.truenasClient.NVMeoFSubsystemCreate(ctx, subsysName, allowAnyHost, hostIDs)
+	}
 	if err != nil && len(hostIDs) > 0 && isNVMeoFHostNotFoundError(err) {
-		d.invalidateNVMeoFHostIDs(d.config.NVMeoF.SubsystemHosts)
-		hostIDs, err = d.resolveNVMeoFHostIDs(ctx, d.config.NVMeoF.SubsystemHosts)
+		d.invalidateNVMeoFHostIDs(staticHosts)
+		hostIDs, err = d.resolveNVMeoFHostIDs(ctx, staticHosts)
 		if err != nil {
 			return status.Errorf(codes.Internal, "failed to re-resolve NVMe-oF subsystem hosts: %v", err)
 		}
 		subsys, err = d.truenasClient.NVMeoFSubsystemCreate(
 			ctx,
 			subsysName,
-			d.config.NVMeoF.SubsystemAllowAnyHost,
+			allowAnyHost,
 			hostIDs,
 		)
 	}
@@ -976,8 +1189,10 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF subsystem: %v", err)
 	}
 	if err = d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); err != nil {
-		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-			klog.Warningf("Failed to cleanup NVMe-oF subsystem after host reconciliation failure: %v", delErr)
+		if !subsysWasExisting {
+			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+				klog.Warningf("Failed to cleanup NVMe-oF subsystem after host reconciliation failure: %v", delErr)
+			}
 		}
 		return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", err)
 	}
@@ -992,8 +1207,10 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	)
 	if err != nil {
 		// Cleanup subsystem on port failure - volume would be unusable without a port
-		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-			klog.Warningf("Failed to cleanup NVMe-oF subsystem after port failure: %v", delErr)
+		if !subsysWasExisting {
+			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+				klog.Warningf("Failed to cleanup NVMe-oF subsystem after port failure: %v", delErr)
+			}
 		}
 		return status.Errorf(codes.Internal, "failed to get/create NVMe-oF port: %v", err)
 	}
@@ -1007,8 +1224,10 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 			d.config.NVMeoF.TransportServiceID,
 		)
 		// Cleanup subsystem on association failure - volume would be unusable
-		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-			klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
+		if !subsysWasExisting {
+			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+				klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
+			}
 		}
 		return status.Errorf(codes.Internal, "failed to associate subsystem with port: %v", err)
 	}
@@ -1022,8 +1241,10 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		if delErr := d.truenasClient.NVMeoFPortSubsysDelete(ctx, portSubsys.ID); delErr != nil {
 			klog.Warningf("Failed to cleanup NVMe-oF port-subsystem association: %v", delErr)
 		}
-		if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-			klog.Warningf("Failed to cleanup NVMe-oF subsystem: %v", delErr)
+		if !subsysWasExisting {
+			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+				klog.Warningf("Failed to cleanup NVMe-oF subsystem: %v", delErr)
+			}
 		}
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF namespace: %v", err)
 	}
@@ -1053,106 +1274,40 @@ func (d *Driver) deleteNVMeoFShare(ctx context.Context, datasetName string) erro
 func (d *Driver) deleteNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
 	if fetched, err := d.datasetForProperties(ctx, ds, datasetName); err == nil {
 		ds = fetched
+	} else if !truenas.IsNotFoundError(err) {
+		return fmt.Errorf("failed to read dataset before NVMe-oF cleanup: %w", err)
+	}
+	namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
+	if err != nil {
+		return err
+	}
+	subsystem, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+	if err != nil {
+		return err
+	}
+	var portAssociations []*truenas.NVMeoFPortSubsys
+	if subsystem != nil {
+		allAssociations, listErr := d.truenasClient.NVMeoFPortSubsysList(ctx)
+		if listErr != nil {
+			return fmt.Errorf("failed to list NVMe-oF port-subsystem associations: %w", listErr)
+		}
+		portAssociations = truenas.NVMeoFPortSubsysFilterBySubsystem(allAssociations, subsystem.ID)
 	}
 
-	// Generate the expected NVMe-oF subsystem name (same logic as createNVMeoFShareForDataset)
-	subsysName := protocolShareName(path.Base(datasetName))
-	if d.config.NVMeoF.NamePrefix != "" {
-		subsysName = d.config.NVMeoF.NamePrefix + subsysName
-	}
-	if d.config.NVMeoF.NameSuffix != "" {
-		subsysName += d.config.NVMeoF.NameSuffix
-	}
-	devicePath := fmt.Sprintf("zvol/%s", datasetName)
-
-	var nsDeleted, ssDeleted bool
 	var errs []error
-	var portSubsysAssocs []*truenas.NVMeoFPortSubsys
-	var portSubsysAssocsErr error
-	portSubsysAssocsFetched := false
-	portSubsysAssocsFor := func(subsysID int) ([]*truenas.NVMeoFPortSubsys, error) {
-		if !portSubsysAssocsFetched {
-			portSubsysAssocs, portSubsysAssocsErr = d.truenasClient.NVMeoFPortSubsysList(ctx)
-			portSubsysAssocsFetched = true
-		}
-		if portSubsysAssocsErr != nil {
-			return nil, portSubsysAssocsErr
-		}
-		return truenas.NVMeoFPortSubsysFilterBySubsystem(portSubsysAssocs, subsysID), nil
-	}
-
-	// Step 1: Try to delete port-subsystem association by stored ID
-	// (fallback cleanup is handled in subsystem deletion steps below)
-	if psIDStr := datasetUserProperty(ds, PropNVMeoFPortSubsysID); psIDStr != "" && psIDStr != "-" {
-		if psID, err := strconv.Atoi(psIDStr); err == nil {
-			if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, psID); err != nil {
-				klog.Warningf("Failed to delete NVMe-oF port-subsystem %d: %v", psID, err)
-				// Don't add to errs - fallback will clean up via subsystem listing
-			}
+	if namespace != nil {
+		if deleteErr := d.truenasClient.NVMeoFNamespaceDelete(ctx, namespace.ID); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+			errs = append(errs, fmt.Errorf("namespace %d: %w", namespace.ID, deleteErr))
 		}
 	}
-
-	// Step 2: Try to delete namespace by stored ID
-	if nsIDStr := datasetUserProperty(ds, PropNVMeoFNamespaceID); nsIDStr != "" && nsIDStr != "-" {
-		if nsID, err := strconv.Atoi(nsIDStr); err == nil {
-			if err := d.truenasClient.NVMeoFNamespaceDelete(ctx, nsID); err != nil {
-				klog.Warningf("Failed to delete NVMe-oF namespace %d: %v", nsID, err)
-				errs = append(errs, fmt.Errorf("namespace %d: %w", nsID, err))
-			} else {
-				nsDeleted = true
-			}
+	for _, association := range portAssociations {
+		if deleteErr := d.truenasClient.NVMeoFPortSubsysDelete(ctx, association.ID); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+			errs = append(errs, fmt.Errorf("port-subsystem %d: %w", association.ID, deleteErr))
 		}
 	}
-
-	// Step 2: Try to delete subsystem by stored ID (including port-subsys associations)
-	if ssIDStr := datasetUserProperty(ds, PropNVMeoFSubsystemID); ssIDStr != "" && ssIDStr != "-" {
-		if ssID, err := strconv.Atoi(ssIDStr); err == nil {
-			// First delete any port-subsystem associations for this subsystem
-			if assocs, err := portSubsysAssocsFor(ssID); err == nil {
-				for _, assoc := range assocs {
-					if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, assoc.ID); err != nil {
-						klog.Warningf("Failed to delete port-subsystem association %d: %v", assoc.ID, err)
-					}
-				}
-			}
-			if err := d.truenasClient.NVMeoFSubsystemDelete(ctx, ssID); err != nil {
-				klog.Warningf("Failed to delete NVMe-oF subsystem %d: %v", ssID, err)
-				errs = append(errs, fmt.Errorf("subsystem %d: %w", ssID, err))
-			} else {
-				ssDeleted = true
-			}
-		}
-	}
-
-	// Step 3: Fallback - If namespace was not deleted by ID, try to find by device path
-	// This handles cases where the dataset properties were never stored
-	if !nsDeleted {
-		if ns, err := d.truenasClient.NVMeoFNamespaceFindByDevicePath(ctx, devicePath); err == nil && ns != nil {
-			klog.V(4).Infof("Found orphaned namespace by device path %s (ID %d), deleting", devicePath, ns.ID)
-			if err := d.truenasClient.NVMeoFNamespaceDelete(ctx, ns.ID); err != nil {
-				klog.Warningf("Failed to delete orphaned NVMe-oF namespace %d: %v", ns.ID, err)
-				errs = append(errs, fmt.Errorf("orphaned namespace %d: %w", ns.ID, err))
-			}
-		}
-	}
-
-	// Step 4: Fallback - If subsystem was not deleted by ID, try to find by name
-	// This handles cases where subsystem was created but property was never stored
-	if !ssDeleted {
-		if subsys, err := d.truenasClient.NVMeoFSubsystemFindByName(ctx, subsysName); err == nil && subsys != nil {
-			klog.V(4).Infof("Found orphaned subsystem by name %s (ID %d), deleting", subsysName, subsys.ID)
-			// First delete any port-subsystem associations for this subsystem
-			if assocs, err := portSubsysAssocsFor(subsys.ID); err == nil {
-				for _, assoc := range assocs {
-					if err := d.truenasClient.NVMeoFPortSubsysDelete(ctx, assoc.ID); err != nil {
-						klog.Warningf("Failed to delete orphaned port-subsystem association %d: %v", assoc.ID, err)
-					}
-				}
-			}
-			if err := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); err != nil {
-				klog.Warningf("Failed to delete orphaned NVMe-oF subsystem %d: %v", subsys.ID, err)
-				errs = append(errs, fmt.Errorf("orphaned subsystem %d: %w", subsys.ID, err))
-			}
+	if subsystem != nil {
+		if deleteErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsystem.ID); deleteErr != nil && !truenas.IsNotFoundError(deleteErr) {
+			errs = append(errs, fmt.Errorf("subsystem %d: %w", subsystem.ID, deleteErr))
 		}
 	}
 

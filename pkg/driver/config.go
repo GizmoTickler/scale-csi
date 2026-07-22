@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -20,8 +21,20 @@ type Config struct {
 	// DriverName is the CSI driver name for registration
 	DriverName string `yaml:"driver"`
 
-	// InstanceID is a unique identifier for this driver instance
+	// DriverInstanceID is stamped on every driver-created dataset. It is the
+	// ownership boundary used before adopting a pre-existing dataset whose name
+	// collides with a CreateVolume request. When omitted, LoadConfig derives a
+	// stable value from DriverName and the configured parent dataset.
+	DriverInstanceID string `yaml:"driverInstanceId"`
+
+	// InstanceID is the deprecated pre-v1.2.23 spelling. It was never consumed
+	// by the driver, but accepting it here avoids breaking otherwise valid old
+	// configuration files. driverInstanceId wins when both are present.
 	InstanceID string `yaml:"instance_id"`
+
+	// Fencing controls whether ControllerPublish/Unpublish materialize CSI
+	// publications in the backend transport allowlists.
+	Fencing FencingConfig `yaml:"fencing"`
 
 	// TrueNAS connection settings
 	TrueNAS TrueNASConfig `yaml:"truenas"`
@@ -52,6 +65,50 @@ type Config struct {
 
 	// CommandTimeouts configures timeouts for various command types
 	CommandTimeouts CommandTimeoutConfig `yaml:"commandTimeouts"`
+}
+
+// FencingMode controls backend publication enforcement during rolling upgrades.
+type FencingMode string
+
+const (
+	// FencingModeOff preserves the pre-v1.2.23 static-allowlist behavior.
+	FencingModeOff FencingMode = "off"
+	// FencingModeAdditive adds per-node identities without removing configured
+	// static identities. It is the explicit rolling-upgrade transition mode;
+	// the default remains off until operators complete the node-first sequence.
+	FencingModeAdditive FencingMode = "additive"
+	// FencingModeStrict makes per-volume publication records the sole allowlist.
+	FencingModeStrict FencingMode = "strict"
+)
+
+// FencingConfig configures backend-enforced ControllerPublish semantics.
+type FencingConfig struct {
+	Mode FencingMode `yaml:"mode"`
+	// StartupReconcileTimeout bounds one background convergence attempt. Failed
+	// attempts retry with backoff without taking down the CSI endpoint.
+	StartupReconcileTimeout string `yaml:"startupReconcileTimeout"`
+	// StaleRecordGracePeriod is the continuous absence required before a
+	// publication record with no live VolumeAttachment may be revoked.
+	StaleRecordGracePeriod string `yaml:"staleRecordGracePeriod"`
+}
+
+// Enabled reports whether backend publication fencing is active.
+func (c FencingConfig) Enabled() bool {
+	return c.Mode == FencingModeAdditive || c.Mode == FencingModeStrict
+}
+
+func (c FencingConfig) StartupReconcileTimeoutDuration() (time.Duration, error) {
+	if strings.TrimSpace(c.StartupReconcileTimeout) == "" {
+		return 10 * time.Minute, nil
+	}
+	return time.ParseDuration(c.StartupReconcileTimeout)
+}
+
+func (c FencingConfig) StaleRecordGracePeriodDuration() (time.Duration, error) {
+	if strings.TrimSpace(c.StaleRecordGracePeriod) == "" {
+		return 10 * time.Minute, nil
+	}
+	return time.ParseDuration(c.StaleRecordGracePeriod)
 }
 
 // TrueNASConfig holds TrueNAS connection settings.
@@ -458,6 +515,11 @@ func LoadConfig(path string) (*Config, error) {
 	// Defaults must be applied before unmarshalling so an explicit YAML false
 	// still overrides the default.
 	cfg := &Config{
+		Fencing: FencingConfig{
+			Mode:                    FencingModeOff,
+			StartupReconcileTimeout: "10m",
+			StaleRecordGracePeriod:  "10m",
+		},
 		ZFS:       ZFSConfig{DatasetEnableQuotas: true},
 		SessionGC: SessionGCConfig{Enabled: true},
 		Reconcile: ReconcileConfig{
@@ -503,6 +565,39 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if len(cfg.ISCSI.TargetPortals) > 0 {
 		configWarningf("iscsi.targetPortals is configured with %d additional portal(s), but scale-csi does not currently support iSCSI multipath; only iscsi.targetPortal will be used", len(cfg.ISCSI.TargetPortals))
+	}
+	if strings.TrimSpace(cfg.DriverInstanceID) == "" {
+		cfg.DriverInstanceID = strings.TrimSpace(cfg.InstanceID)
+	}
+	if strings.TrimSpace(cfg.DriverInstanceID) == "" && cfg.DriverName != "" && cfg.ZFS.DatasetParentName != "" {
+		cfg.DriverInstanceID = strings.TrimSpace(cfg.DriverName) + "@" + strings.TrimSuffix(strings.TrimSpace(cfg.ZFS.DatasetParentName), "/")
+	}
+	cfg.DriverInstanceID = strings.TrimSpace(cfg.DriverInstanceID)
+	if cfg.DriverInstanceID == "" {
+		return nil, fmt.Errorf("driverInstanceId must not be empty")
+	}
+	switch cfg.Fencing.Mode {
+	case FencingModeOff, FencingModeAdditive, FencingModeStrict:
+	default:
+		return nil, fmt.Errorf("fencing.mode must be one of off, additive, or strict")
+	}
+	if cfg.Fencing.StartupReconcileTimeout == "" {
+		cfg.Fencing.StartupReconcileTimeout = "10m"
+	}
+	if timeout, parseErr := cfg.Fencing.StartupReconcileTimeoutDuration(); parseErr != nil || timeout <= 0 {
+		if parseErr != nil {
+			return nil, fmt.Errorf("fencing.startupReconcileTimeout must be a positive duration: %w", parseErr)
+		}
+		return nil, fmt.Errorf("fencing.startupReconcileTimeout must be a positive duration")
+	}
+	if cfg.Fencing.StaleRecordGracePeriod == "" {
+		cfg.Fencing.StaleRecordGracePeriod = "10m"
+	}
+	if grace, parseErr := cfg.Fencing.StaleRecordGracePeriodDuration(); parseErr != nil || grace <= 0 {
+		if parseErr != nil {
+			return nil, fmt.Errorf("fencing.staleRecordGracePeriod must be a positive duration: %w", parseErr)
+		}
+		return nil, fmt.Errorf("fencing.staleRecordGracePeriod must be a positive duration")
 	}
 
 	// Set defaults
@@ -692,7 +787,7 @@ func LoadConfig(path string) (*Config, error) {
 		if cfg.NVMeoF.TransportAddress == "" {
 			return nil, fmt.Errorf("nvmeof.transportAddress is required when NVMe-oF is enabled")
 		}
-		if !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
+		if cfg.Fencing.Mode != FencingModeStrict && !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
 			return nil, fmt.Errorf("nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty; no host could connect")
 		}
 	}

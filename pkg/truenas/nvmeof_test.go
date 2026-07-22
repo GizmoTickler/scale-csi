@@ -29,6 +29,26 @@ func TestParseNVMeoFHost(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestParseNVMeoFHostSubsysTrueNAS26NestedExpandedShape(t *testing.T) {
+	association, err := parseNVMeoFHostSubsys(map[string]interface{}{
+		"id": float64(41),
+		"host": map[string]interface{}{
+			"id":      float64(17),
+			"hostnqn": "nqn.2014-08.org.nvmexpress:uuid:worker-a",
+		},
+		"subsys": map[string]interface{}{
+			"id":     float64(23),
+			"name":   "scale-csi-volume-a",
+			"subnqn": "nqn.2005-10.org.freenas.ctl:scale-csi-volume-a",
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 41, association.ID)
+	assert.Equal(t, 17, association.HostID)
+	assert.Equal(t, "nqn.2014-08.org.nvmexpress:uuid:worker-a", association.HostNQN)
+	assert.Equal(t, 23, association.SubsysID)
+}
+
 func TestNVMeoFHostFindByNQN_UsesExactFilter(t *testing.T) {
 	mock := newMockWSServer()
 	paramsSeen := make(chan []interface{}, 1)
@@ -653,8 +673,10 @@ func TestMockClient_NVMeoFRestrictedSubsystemUsesKnownHosts(t *testing.T) {
 	assert.False(t, subsys.AllowAnyHost)
 	assert.Equal(t, []int{host.ID}, subsys.Hosts)
 
-	_, err = client.NVMeoFSubsystemCreate(ctx, "empty-restricted", false, nil)
-	require.Error(t, err)
+	empty, err := client.NVMeoFSubsystemCreate(ctx, "empty-restricted", false, nil)
+	require.NoError(t, err)
+	assert.False(t, empty.AllowAnyHost)
+	assert.Empty(t, empty.Hosts, "a fenced subsystem starts closed until ControllerPublishVolume")
 	_, err = client.NVMeoFSubsystemCreate(ctx, "unknown-host", false, []int{999})
 	require.Error(t, err)
 }

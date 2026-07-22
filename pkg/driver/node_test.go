@@ -170,10 +170,15 @@ func newTestNodeDriver(shareType ShareType) *Driver {
 		cfg.DriverName = "org.scale.csi.nvmeof"
 	}
 
+	encodedNodeID, err := encodeNodeIdentity(NodeIdentity{Name: "test-node-1"})
+	if err != nil {
+		panic(err)
+	}
 	return &Driver{
 		name:          cfg.DriverName,
 		version:       "test",
 		nodeID:        "test-node-1",
+		encodedNodeID: encodedNodeID,
 		config:        cfg,
 		truenasClient: truenas.NewMockClient(),
 	}
@@ -207,12 +212,15 @@ func TestNodeGetInfo(t *testing.T) {
 	t.Run("BasicInfo", func(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNFS)
 		d.nodeID = "worker-node-1"
+		d.encodedNodeID, _ = encodeNodeIdentity(NodeIdentity{Name: d.nodeID})
 
 		resp, err := d.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
 
 		require.NoError(t, err)
 		require.NotNil(t, resp)
-		assert.Equal(t, "worker-node-1", resp.NodeId)
+		identity, parseErr := parseNodeIdentity(resp.NodeId)
+		require.NoError(t, parseErr)
+		assert.Equal(t, "worker-node-1", identity.Name)
 		assert.Nil(t, resp.AccessibleTopology, "no topology should be set when disabled")
 		assert.Zero(t, resp.MaxVolumesPerNode, "zero should preserve the unlimited/unset behavior")
 	})
@@ -230,6 +238,7 @@ func TestNodeGetInfo(t *testing.T) {
 	t.Run("WithTopology", func(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNFS)
 		d.nodeID = "worker-node-2"
+		d.encodedNodeID, _ = encodeNodeIdentity(NodeIdentity{Name: d.nodeID})
 		d.config.Node.Topology.Enabled = true
 		d.config.Node.Topology.Zone = "zone-a"
 		d.config.Node.Topology.Region = "us-west"
@@ -238,7 +247,9 @@ func TestNodeGetInfo(t *testing.T) {
 
 		require.NoError(t, err)
 		require.NotNil(t, resp)
-		assert.Equal(t, "worker-node-2", resp.NodeId)
+		identity, parseErr := parseNodeIdentity(resp.NodeId)
+		require.NoError(t, parseErr)
+		assert.Equal(t, "worker-node-2", identity.Name)
 		require.NotNil(t, resp.AccessibleTopology)
 		assert.Equal(t, "zone-a", resp.AccessibleTopology.Segments["topology.kubernetes.io/zone"])
 		assert.Equal(t, "us-west", resp.AccessibleTopology.Segments["topology.kubernetes.io/region"])

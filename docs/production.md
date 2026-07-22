@@ -64,6 +64,45 @@ that are already using their volumes. The defaults use
 `system-cluster-critical` for the controller pod and `system-node-critical` for
 the node DaemonSet.
 
+### Concurrency contract
+
+Cross-process serialization of `CreateVolume` (and the other controller RPCs)
+is a layered contract, not a single mechanism:
+
+- The CO's external-provisioner leader election plus the chart's
+  single-replica controller deployment are the primary guarantee that only one
+  controller process mutates the backend at a time. The chart enforces the
+  `Recreate` deployment strategy only when `fencing.mode` is not `off`; in the
+  default `off` mode the Deployment keeps the server-default `RollingUpdate`,
+  so a rollout can briefly run an old and a new controller pod side by side.
+- The driver's operation locks are per process. They serialize work inside one
+  controller but provide no exclusion between two controller processes.
+- The durable in-flight creation markers, the tombstone ledger, and the
+  recovery-nonce discipline narrow the windows a second concurrent writer
+  could exploit, but none of them is an atomic compare-and-swap. The nonce is
+  a write-then-verify sequence — an unconditional property write followed by a
+  verifying re-read — so two writers whose write/verify windows do not
+  interleave can each observe their own value and both report success. A
+  detected lost race returns retryable `Aborted` instead of double-owning a
+  dataset; an undetected one is tolerable only because both writers are the
+  same driver instance writing identical identity values. Correctness
+  therefore rests on the leader election and singleton topology above; this
+  machinery does **not** turn multi-writer operation into a supported
+  topology. Running multiple concurrently active controller processes against
+  the same parent dataset — e.g. two releases, a forced multi-replica
+  deployment, or overlapping old/new controllers held alive outside the tested
+  upgrade sequence — is out of contract.
+- Upgrade note: tombstone-ledger entries written by pre-release builds lack
+  the recorded creation identity (`created_at`) and are permanently skipped by
+  the reaper (fail-closed). No released version ever wrote ledger entries, so
+  this affects no real deployment.
+- The configured `zfs.parentDataset` subtree is exclusive driver territory.
+  The driver stores its bookkeeping as user properties on the parent dataset
+  and treats child datasets as objects it may stamp, adopt, or (with durable
+  provenance) destroy. Manually creating datasets or snapshots inside the
+  parent — especially at names a PVC or VolumeSnapshot might use — is out of
+  contract; place operator-managed data outside the parent dataset.
+
 The node component runs as a DaemonSet on all tolerated nodes. Established node
 pods perform stage, publish, unpublish, and unstage through host NFS/iSCSI/NVMe
 tools rather than through TrueNAS management API calls. During a management API
@@ -234,10 +273,20 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
    snapshot CRDs and the common snapshot controller, which this chart does not
    install. Keep their API generation compatible with the snapshotter.
 
-5. The repository does not define or test a controller/node version-skew matrix.
-   Roll controller and node together, and exercise provision, attach, mount,
-   expand, snapshot, restore, unmount, and delete in a staging namespace before
-   production rollout.
+5. For the v1.2.23 fencing migration, keep `fencing.mode=off`, upgrade the node
+   DaemonSet/image first, and wait for every CSINode to re-register its versioned
+   transport identity before enabling `additive`. Enable `strict` only after
+   `scale_csi_fencing_deferred_total` remains at zero. Roll the v1.2.23
+   controller image and its ConfigMap together; applying new fencing keys to an
+   older strict-YAML binary can make that older pod fail configuration parsing.
+   The chart uses a shared image value, so patch and await the node DaemonSet
+   first, verify every driver CSINode node ID has the `sc1.` prefix, and only
+   then run the Helm upgrade that changes the controller image, ConfigMap, and
+   mode. The exact commands are in the chart's publication-fencing runbook.
+   Outside this explicitly tested migration sequence, the repository does not
+   promise arbitrary controller/node version skew. Exercise provision, attach,
+   mount, expand, snapshot, restore, unmount, and delete in a staging namespace
+   before production rollout.
 
 ## Known limitations in v1.2.0
 
@@ -259,11 +308,12 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   passes for NFS (75/75), iSCSI (real iscsiadm logins, device staging, mkfs,
   mounts), and NVMe-oF (real fabric connects). Tests named `e2e` in this
   repository use `MockClient`.
-- NVMe-oF host-NQN allowlisting is configured statically at the controller.
-  The driver does not discover node host NQNs, so operators must
-  keep `nvmeof.subsystemHosts` synchronized with every node that may connect.
-  Continue to use network segmentation (for example VLANs or SGACLs) to protect
-  the NVMe-oF listener; host allowlisting is an additional control.
+- With `fencing.mode=off`, NVMe-oF host-NQN allowlisting is configured
+  statically through `nvmeof.subsystemHosts`. Additive and strict modes consume
+  the host NQN registered by each node plugin and enforce per-volume host
+  associations. Continue to use network segmentation (for example VLANs or
+  SGACLs) to protect the NVMe-oF listener; host allowlisting is an additional
+  control.
 - A TrueNAS NVMe-oF listener only materializes on a configured port once at
   least one subsystem is associated with it — a bare port shows no kernel
   listener, which is normal and self-resolves on first volume creation.
@@ -287,8 +337,6 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   `user_properties_remove`. The driver writes snapshot identity properties at
   creation for correctness; tombstone names, rather than property removal, hide
   deferred deletions. This middleware behavior should be reported upstream.
-- Driver-managed NVMe-oF host allowlisting is unavailable, as described in the
-  security section.
 
 [truenas-rbac]: https://api.truenas.com/v26.0/rbac.html
 [csidriver-api]: https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/csi-driver-v1/

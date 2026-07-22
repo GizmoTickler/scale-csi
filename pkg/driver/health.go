@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -75,9 +76,15 @@ func (h *HealthServer) Start() error {
 	}
 
 	klog.Infof("Starting health server on port %d", h.port)
+	// Bind before returning so a port collision is a startup failure, not an
+	// asynchronous log line after the CSI endpoint has already become ready.
+	listener, err := net.Listen("tcp", h.server.Addr)
+	if err != nil {
+		return fmt.Errorf("bind health listener %s: %w", h.server.Addr, err)
+	}
 
 	go func() {
-		if err := h.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := h.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			klog.Errorf("Health server error: %v", err)
 		}
 	}()

@@ -3,7 +3,6 @@ package truenas
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
 // NFSShare represents an NFS share from the TrueNAS API.
@@ -40,14 +39,10 @@ type NFSShareCreateParams struct {
 
 // NFSShareCreate creates a new NFS share.
 func (c *Client) NFSShareCreate(ctx context.Context, params *NFSShareCreateParams) (*NFSShare, error) {
-	// Set default enabled to true
-	params.Enabled = true
-
 	result, err := c.Call(ctx, "sharing.nfs.create", params)
 	if err != nil {
 		// Handle "already exports" error by finding existing share
-		if strings.Contains(err.Error(), "already exports") ||
-			strings.Contains(err.Error(), "already shared") {
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "already exports", "already shared") {
 			existing, findErr := c.NFSShareFindByPath(ctx, params.Path)
 			if findErr == nil && existing != nil {
 				return existing, nil
@@ -64,8 +59,7 @@ func (c *Client) NFSShareDelete(ctx context.Context, id int) error {
 	_, err := c.Call(ctx, "sharing.nfs.delete", id)
 	if err != nil {
 		// Ignore "does not exist" errors
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+		if IsNotFoundError(err) {
 			return nil
 		}
 		if c.deleteVanishedTolerant(ctx, "sharing.nfs.query", id) {

@@ -2,6 +2,10 @@ package driver
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -12,7 +16,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -26,6 +29,7 @@ import (
 // ZFS property names for tracking CSI resources
 const (
 	PropManagedResource           = "truenas-csi:managed_resource"
+	PropDriverInstanceID          = "truenas-csi:driver_instance_id"
 	PropProvisionSuccess          = "truenas-csi:provision_success"
 	PropCSIVolumeName             = "truenas-csi:csi_volume_name"
 	PropShareVolumeContext        = "truenas-csi:csi_share_volume_context"
@@ -41,9 +45,33 @@ const (
 	PropISCSITargetID             = "truenas-csi:truenas_iscsi_target_id"
 	PropISCSIExtentID             = "truenas-csi:truenas_iscsi_extent_id"
 	PropISCSITargetExtentID       = "truenas-csi:truenas_iscsi_targetextent_id"
+	PropISCSIInitiatorID          = "truenas-csi:truenas_iscsi_initiator_id"
 	PropNVMeoFSubsystemID         = "truenas-csi:truenas_nvmeof_subsystem_id"
 	PropNVMeoFNamespaceID         = "truenas-csi:truenas_nvmeof_namespace_id"
 	PropNVMeoFPortSubsysID        = "truenas-csi:truenas_nvmeof_portsubsys_id"
+
+	// PropInflightMarkerPrefix namespaces per-volume in-flight content-source
+	// creation markers written on the PARENT dataset (the only object proven to
+	// accept durable user-property writes on 26.0 while the destination does not
+	// exist yet). A marker is POSITIVE durable proof that this driver instance
+	// started a clone/copy toward that destination; crash recovery is gated on it.
+	PropInflightMarkerPrefix = "truenas-csi:inflight_"
+	// PropTombstoneLedgerPrefix namespaces the parent-dataset ledger of
+	// deferred-delete tombstone snapshots. Written BEFORE the tombstone rename so
+	// the reaper only ever destroys snapshots this driver provably tombstoned; a
+	// crash between ledger write and rename leaves a ledger entry without a
+	// tombstone, which the reconciler sweeps.
+	PropTombstoneLedgerPrefix = "truenas-csi:tombstone_"
+	// PropRecoveryNonce is a per-attempt compare-and-swap value included in the
+	// remnant recovery ownership stamp. operationLock is per-process, so two
+	// overlapping controllers (upgrade window) can both attempt recovery; the
+	// post-write re-read proves whose stamp won and the loser returns Aborted.
+	PropRecoveryNonce = "truenas-csi:recovery_nonce"
+
+	inflightMarkerVersion  = 1
+	tombstoneLedgerVersion = 1
+	inflightModeClone      = "clone"
+	inflightModeCopy       = "copy"
 )
 
 const (
@@ -126,22 +154,56 @@ func isCSISnapshot(snap *truenas.Snapshot) bool {
 	return managed || hasCSIName
 }
 
+// snapshotShortName returns the snapshot's short name, falling back to the
+// name encoded in its full ID.
+func snapshotShortName(snap *truenas.Snapshot) string {
+	if snap == nil {
+		return ""
+	}
+	if snap.Name != "" {
+		return snap.Name
+	}
+	if extracted, ok := extractSnapshotName(snap.ID); ok {
+		return extracted
+	}
+	return ""
+}
+
+// snapshotCarriesLiveCSIIdentity reports that a snapshot's recorded CSI name
+// sanitizes to its own CURRENT short name — i.e. it is a live CSI snapshot
+// under exactly that name (created as such), not a renamed driver tombstone.
+// Driver tombstones fail this: their retained csi_snapshot_name (the 26.0
+// property strip is a silent no-op) records the PRE-rename name, which no
+// longer matches the tombstone-shaped current name.
+func snapshotCarriesLiveCSIIdentity(snap *truenas.Snapshot) bool {
+	if snap == nil {
+		return false
+	}
+	property, ok := snap.UserProperties[PropCSISnapshotName]
+	if !ok || property.Value == "" || property.Value == "-" {
+		return false
+	}
+	return sanitizeVolumeID(property.Value) == snapshotShortName(snap)
+}
+
 func isSnapshotTombstone(snap *truenas.Snapshot) bool {
 	if snap == nil {
 		return false
 	}
-	name := snap.Name
-	if name == "" {
-		if extracted, ok := extractSnapshotName(snap.ID); ok {
-			name = extracted
-		}
-	}
+	name := snapshotShortName(snap)
 	marker := strings.LastIndex(name, snapshotTombstoneMarker)
 	if marker <= 0 {
 		return false
 	}
-	_, err := strconv.ParseUint(name[marker+len(snapshotTombstoneMarker):], 10, 64)
-	return err == nil
+	if _, err := strconv.ParseUint(name[marker+len(snapshotTombstoneMarker):], 10, 64); err != nil {
+		return false
+	}
+	// Identity beats name shape: a legitimate CSI snapshot whose requested name
+	// merely ends in -csi-deleted-<n> is a CSI snapshot with a full lifecycle
+	// (deletable, listable, blocking), never a tombstone. Real driver tombstones
+	// released their CSI name at rename, so their retained identity (if any) no
+	// longer matches and they still classify as tombstones.
+	return !snapshotCarriesLiveCSIIdentity(snap)
 }
 
 // ControllerGetCapabilities returns the capabilities of the controller.
@@ -354,7 +416,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if err == nil && existingDS != nil {
 		// Volume exists - check and ensure properties are set
 		klog.Infof("Volume %s already exists", volumeID)
-
 		if shareType.IsBlockProtocol() && existingDS.Type == "FILESYSTEM" {
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s already exists as a filesystem, incompatible with requested %s protocol",
@@ -373,6 +434,33 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s exists with protocol %s, requested %s", volumeID, ShareTypeNVMeoF, shareType)
 		}
+		// Crash self-healing for a content-source create that built the destination
+		// (clone or detached copy) but crashed before ownership was stamped. Such a
+		// remnant otherwise wedges the PVC permanently (terminal AlreadyExists below)
+		// and leaks invisibly (no managed_resource for the orphan reconciler). This
+		// runs before the content-source and ownership gates because an unstamped
+		// clone has no local content-source properties yet and would trip those
+		// gates first; recovery itself validates source/protocol/capacity
+		// compatibility against the marker and the remnant before any mutation. It
+		// is a strict no-op for any dataset without a matching in-flight marker.
+		if source := req.GetVolumeContentSource(); source != nil {
+			recovered, action, recoverErr := d.recoverInFlightContentSourceRemnant(
+				ctx, existingDS, datasetName, name, source, capacityBytes, limitBytes, shareType,
+			)
+			if recoverErr != nil {
+				return nil, recoverErr
+			}
+			switch action {
+			case remnantActionResume:
+				// The remnant is now stamped and its content-source flow completed;
+				// fall through so the normal existing-dataset tail (capacity checks,
+				// idempotent share creation, response) finishes the volume.
+				existingDS = recovered
+			case remnantActionDestroy:
+				return nil, status.Errorf(codes.Aborted,
+					"destroyed unstamped interrupted detached-copy remnant %s; retry CreateVolume to recreate it cleanly", datasetName)
+			}
+		}
 		storedContentSource := volumeContentSourceFromDataset(existingDS)
 		requestedContentSource := req.GetVolumeContentSource()
 		storedSourceIsDurable := datasetHasDurableContentSource(existingDS)
@@ -382,6 +470,34 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s already exists with content source %s, incompatible with requested %s",
 				volumeID, describeDatasetContentSource(existingDS), describeVolumeContentSource(requestedContentSource))
+		}
+		// A present owner is authoritative and must match locally. The v1.2.22
+		// installed base predates this stamp, so an actually absent owner may be
+		// backfilled only when both older local managed markers identify the same
+		// CSI volume. Empty, inherited, or different owner values are present-and-
+		// different and are never auto-adopted.
+		owner, ownerPresent := datasetUserPropertyProjection(existingDS, PropDriverInstanceID)
+		switch {
+		case ownerPresent:
+			if !datasetHasLocalUserProperty(existingDS, PropDriverInstanceID, d.driverInstanceID()) {
+				return nil, status.Errorf(codes.AlreadyExists,
+					"dataset %s already exists but ownership property %s is %q, expected a local value of %q",
+					datasetName, PropDriverInstanceID, owner.Value, d.driverInstanceID())
+			}
+		case datasetHasLocalUserProperty(existingDS, PropManagedResource, "true") &&
+			datasetHasLocalUserProperty(existingDS, PropCSIVolumeName, name):
+			verified, stampErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+				PropDriverInstanceID: d.driverInstanceID(),
+			})
+			if stampErr != nil {
+				return nil, status.Errorf(codes.Internal, "failed to backfill legacy volume ownership: %v", stampErr)
+			}
+			existingDS = verified
+			klog.Infof("Backfilled ownership stamp on legacy managed dataset %s", datasetName)
+		default:
+			return nil, status.Errorf(codes.AlreadyExists,
+				"dataset %s already exists without ownership property %s and does not have matching local legacy CSI markers",
+				datasetName, PropDriverInstanceID)
 		}
 		if snapshot := req.GetVolumeContentSource().GetSnapshot(); d.config.ZFS.DetachedVolumesFromSnapshots && snapshot != nil {
 			existingDS, err = d.prepareDetachedSnapshotCopy(
@@ -450,7 +566,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 		return &csi.CreateVolumeResponse{Volume: volume}, nil
 	}
-	freshlyCreated := truenas.IsNotFoundError(err)
+	if err != nil && !truenas.IsNotFoundError(err) {
+		return nil, status.Errorf(codes.Internal, "failed to check whether volume exists: %v", err)
+	}
+	freshlyCreated := false
 
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
@@ -458,11 +577,24 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
-		var srcErr error
-		createdDS, srcErr = d.handleVolumeContentSource(ctx, datasetName, name, contentSource, capacityBytes, shareType)
+		_, srcErr := d.handleVolumeContentSource(ctx, datasetName, name, contentSource, capacityBytes, shareType)
 		if srcErr != nil {
 			return nil, srcErr
 		}
+		// Clone/replication APIs cannot stamp properties atomically. The initial
+		// absence check plus a successful (not AlreadyExists) clone/copy response is
+		// the creation proof; stamp ownership before creating any share object.
+		verifiedClone, ownerErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+			PropDriverInstanceID: d.driverInstanceID(),
+		})
+		if ownerErr != nil {
+			d.cleanupFailedClone(ctx, datasetName, "")
+			return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
+		}
+		// Ownership is durable; the in-flight marker has served its purpose.
+		// Best-effort removal — the reconciler sweep retires leftovers.
+		d.deleteInflightMarker(ctx, volumeID)
+		createdDS = verifiedClone
 		zvolReady = true
 	} else {
 		// Create new dataset
@@ -471,6 +603,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if createErr != nil {
 			return nil, createErr
 		}
+		freshlyCreated = createdDS.CreatedByCall
 		zvolReady = freshlyCreated
 	}
 
@@ -487,6 +620,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Mark as managed and successful in one API update.
 	volumeProperties := map[string]string{
 		PropManagedResource:  "true",
+		PropDriverInstanceID: d.driverInstanceID(),
 		PropProvisionSuccess: "true",
 		PropCSIVolumeName:    name,
 	}
@@ -540,6 +674,338 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	return &csi.CreateVolumeResponse{Volume: volume}, nil
 }
 
+type inFlightRemnantAction int
+
+const (
+	remnantActionNone inFlightRemnantAction = iota
+	remnantActionResume
+	remnantActionDestroy
+)
+
+// inflightMarker is the durable record, written on the PARENT dataset via the
+// proven pool.dataset.update path BEFORE a content-source clone/copy starts,
+// that this driver instance owns an in-flight creation of Dataset from the
+// recorded source. Crash recovery requires it as POSITIVE proof: absence of
+// local properties on a dataset proves nothing (publication records,
+// content-source props, operator or configured custom properties, and the
+// share-created-before-property-stored window all leave datasets that must
+// never be adopted or destroyed).
+type inflightMarker struct {
+	Version    int    `json:"v"`
+	Instance   string `json:"instance"`
+	Dataset    string `json:"dataset"`
+	Mode       string `json:"mode"`        // inflightModeClone | inflightModeCopy
+	SourceType string `json:"source_type"` // "snapshot" | "volume"
+	SourceID   string `json:"source_id"`
+	// Origin is the exact ZFS origin the destination must report in clone mode
+	// (the resolved source snapshot ID, or the deterministic internal
+	// clone-source snapshot for volume sources). Empty for detached copies.
+	Origin    string `json:"origin,omitempty"`
+	Protocol  string `json:"protocol"`
+	Nonce     string `json:"nonce"`
+	StartedAt string `json:"started_at"`
+}
+
+func hashedPropertyKey(prefix, identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return prefix + hex.EncodeToString(sum[:8])
+}
+
+func inflightMarkerKey(volumeID string) string {
+	return hashedPropertyKey(PropInflightMarkerPrefix, volumeID)
+}
+
+func (d *Driver) parentDatasetName() string {
+	return strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/")
+}
+
+func newRecoveryNonce() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// writeInflightMarker persists and verifies the marker before any backend
+// mutation for the destination starts. Failure is fatal to the create by
+// design: without durable provenance a crash would leave an unrecoverable,
+// invisible remnant, so "no marker, no mutation".
+func (d *Driver) writeInflightMarker(ctx context.Context, marker inflightMarker) error {
+	encoded, err := json.Marshal(marker)
+	if err != nil {
+		return status.Errorf(codes.Internal, "encode in-flight creation marker: %v", err)
+	}
+	key := inflightMarkerKey(path.Base(marker.Dataset))
+	if _, err := d.setAndVerifyDatasetUserProperties(ctx, d.parentDatasetName(), map[string]string{key: string(encoded)}); err != nil {
+		return status.Errorf(codes.Internal,
+			"record in-flight creation marker for %s on parent dataset: %v", marker.Dataset, err)
+	}
+	return nil
+}
+
+// readInflightMarker returns this driver's marker for volumeID, or nil when no
+// valid local marker exists. Non-local values and unparseable payloads are
+// treated as absent for recovery (never a license to act) and left for the
+// reconciler sweep.
+func (d *Driver) readInflightMarker(ctx context.Context, volumeID string) (*inflightMarker, error) {
+	parent, err := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
+	if err != nil {
+		return nil, fmt.Errorf("read parent dataset for in-flight markers: %w", err)
+	}
+	property, ok := datasetUserPropertyProjection(parent, inflightMarkerKey(volumeID))
+	if !ok || !isLocalUserPropertySource(property.Source) {
+		return nil, nil
+	}
+	var marker inflightMarker
+	if err := json.Unmarshal([]byte(property.Value), &marker); err != nil {
+		klog.Warningf("Ignoring unparseable in-flight marker for %s: %v", volumeID, err)
+		return nil, nil
+	}
+	if marker.Version != inflightMarkerVersion {
+		return nil, nil
+	}
+	return &marker, nil
+}
+
+// newInflightMarker builds the base marker (clone mode by default; the caller
+// switches to copy mode and/or records the expected origin).
+func (d *Driver) newInflightMarker(datasetName string, source *csi.VolumeContentSource, shareType ShareType) (inflightMarker, error) {
+	sourceType, sourceID, ok := volumeContentSourceIdentity(source)
+	if !ok {
+		return inflightMarker{}, status.Error(codes.InvalidArgument, "volume content source is missing an identity")
+	}
+	nonce, err := newRecoveryNonce()
+	if err != nil {
+		return inflightMarker{}, status.Errorf(codes.Internal, "generate in-flight marker nonce: %v", err)
+	}
+	return inflightMarker{
+		Version:    inflightMarkerVersion,
+		Instance:   d.driverInstanceID(),
+		Dataset:    datasetName,
+		Mode:       inflightModeClone,
+		SourceType: sourceType,
+		SourceID:   sourceID,
+		Protocol:   string(shareType),
+		Nonce:      nonce,
+		StartedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}, nil
+}
+
+// deleteInflightMarker is best-effort: a leftover marker is retired by the
+// reconciler sweep once its dataset is stamped or gone.
+func (d *Driver) deleteInflightMarker(ctx context.Context, volumeID string) {
+	key := inflightMarkerKey(volumeID)
+	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), []string{key}); err != nil {
+		klog.Warningf("Failed to remove in-flight creation marker for %s (reconciler sweep will retire it): %v", volumeID, err)
+	}
+}
+
+// recoverInFlightContentSourceRemnant restores crash self-healing for a
+// content-source CreateVolume whose destination was created but crashed before
+// ownership was stamped. Recovery is gated on POSITIVE durable proof — a
+// matching parent-dataset in-flight marker written by this driver instance
+// before the clone/copy started — never on absence of evidence. Without a
+// matching marker every existing dataset stays on the terminal AlreadyExists
+// path, which protects foreign datasets, operator/DR datasets at colliding
+// names, datasets whose backend share exists but whose share-ID property write
+// failed, and datasets carrying only publication-record or custom local
+// properties.
+//
+// Compatibility with the CURRENT request is validated BEFORE any mutation:
+// source identity (marker source vs the request), protocol (marker protocol vs
+// the requested share type; dataset-type/protocol mismatches were already
+// rejected by the checks that run before this call), and capacity (remnant
+// capacity vs the request's limit). An incompatible request keeps AlreadyExists
+// exactly as CSI requires and never receives a resumed OK.
+//
+//   - CLONE mode: the remnant's ZFS origin must equal the origin recorded in
+//     the marker (double provenance proof) and the remnant must have no
+//     snapshots of its own. RESUME: normalize capacity, then stamp the full
+//     local identity set through the update+verify path with a per-attempt
+//     nonce CAS — two overlapping controller processes can both reach this
+//     point, and only the process whose nonce survives the re-read proceeds;
+//     the loser returns Aborted.
+//   - COPY mode (detached): completeness of an interrupted send/receive cannot
+//     be proven, so DESTROY and return Aborted for a clean recreate. The real
+//     crash shape leaves the transferred replication snapshot on the target
+//     (replication creates target+snapshot; snapshot cleanup runs only after
+//     the job completes), so the destroy is recursive — sanctioned exclusively
+//     by the marker's proof of ownership.
+func (d *Driver) recoverInFlightContentSourceRemnant(
+	ctx context.Context,
+	existingDS *truenas.Dataset,
+	datasetName, name string,
+	source *csi.VolumeContentSource,
+	capacityBytes, limitBytes int64,
+	shareType ShareType,
+) (*truenas.Dataset, inFlightRemnantAction, error) {
+	if source == nil || existingDS == nil || existingDS.Name != datasetName {
+		return existingDS, remnantActionNone, nil
+	}
+	volumeID := path.Base(datasetName)
+	// A dataset with a LOCAL ownership stamp is not an in-flight remnant: ours
+	// continues through the normal existing-volume path (retiring a stale marker
+	// left by a crash between stamp and marker delete); foreign is never touched.
+	if owner, ok := datasetUserPropertyProjection(existingDS, PropDriverInstanceID); ok && isLocalUserPropertySource(owner.Source) {
+		if owner.Value == d.driverInstanceID() {
+			d.deleteInflightMarker(ctx, volumeID)
+		}
+		return existingDS, remnantActionNone, nil
+	}
+	marker, err := d.readInflightMarker(ctx, volumeID)
+	if err != nil {
+		return existingDS, remnantActionNone, status.Errorf(codes.Internal,
+			"inspect in-flight creation marker for %s: %v", datasetName, err)
+	}
+	if marker == nil || marker.Instance != d.driverInstanceID() || marker.Dataset != datasetName {
+		return existingDS, remnantActionNone, nil
+	}
+	// Content-source compatibility: the marker must describe exactly the source
+	// this request asks for. A different source is an incompatible request and
+	// must keep the terminal AlreadyExists outcome.
+	requestType, requestID, ok := volumeContentSourceIdentity(source)
+	if !ok || marker.SourceType != requestType || marker.SourceID != requestID {
+		return existingDS, remnantActionNone, nil
+	}
+
+	switch marker.Mode {
+	case inflightModeCopy:
+		if !d.config.ZFS.DetachedVolumesFromSnapshots || source.GetSnapshot() == nil {
+			return existingDS, remnantActionNone, nil
+		}
+		// The same request-compatibility validation as the clone branch runs
+		// BEFORE the destroy: an incompatible request must keep the terminal
+		// AlreadyExists outcome with the remnant untouched, never trigger a
+		// destroy-and-recreate on behalf of a differently-shaped request.
+		if marker.Protocol != string(shareType) {
+			return existingDS, remnantActionNone, nil
+		}
+		if existingCapacity := d.getDatasetCapacity(existingDS); limitBytes > 0 && existingCapacity > limitBytes {
+			return existingDS, remnantActionNone, status.Errorf(codes.AlreadyExists,
+				"in-flight remnant for volume %s has capacity %d bytes, greater than requested capacity limit %d bytes",
+				volumeID, existingCapacity, limitBytes)
+		}
+		// Marker-proven interrupted copy: the recursive destroy also removes the
+		// transferred replication snapshot the crash left on the target.
+		if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); delErr != nil {
+			return existingDS, remnantActionNone, status.Errorf(codes.Internal,
+				"destroy marker-proven interrupted detached-copy remnant %s: %v", datasetName, delErr)
+		}
+		d.deleteInflightMarker(ctx, volumeID)
+		klog.Warningf("Destroyed marker-proven interrupted detached-copy remnant %s; retry will recreate it cleanly", datasetName)
+		return nil, remnantActionDestroy, nil
+
+	case inflightModeClone:
+		// The current configuration must still take the clone path for this
+		// source; after a config flip the remnant is left for the operator.
+		if d.config.ZFS.DetachedVolumesFromSnapshots && source.GetSnapshot() != nil {
+			return existingDS, remnantActionNone, nil
+		}
+		// Protocol compatibility before any mutation.
+		if marker.Protocol != string(shareType) {
+			return existingDS, remnantActionNone, nil
+		}
+		origin := datasetOriginSnapshotID(existingDS)
+		if origin == "" || marker.Origin == "" || origin != marker.Origin {
+			return existingDS, remnantActionNone, nil
+		}
+		// A just-cloned remnant owns no snapshots; anything else is not a
+		// half-object this recovery understands.
+		snapshots, listErr := d.truenasClient.SnapshotList(ctx, datasetName)
+		if listErr != nil {
+			return existingDS, remnantActionNone, status.Errorf(codes.Internal,
+				"inspect in-flight clone remnant %s for snapshots: %v", datasetName, listErr)
+		}
+		if len(snapshots) > 0 {
+			return existingDS, remnantActionNone, nil
+		}
+		// Capacity compatibility BEFORE any mutation: a request whose limit the
+		// remnant already exceeds is incompatible per CSI.
+		if existingCapacity := d.getDatasetCapacity(existingDS); limitBytes > 0 && existingCapacity > limitBytes {
+			return existingDS, remnantActionNone, status.Errorf(codes.AlreadyExists,
+				"in-flight remnant for volume %s has capacity %d bytes, greater than requested capacity limit %d bytes",
+				volumeID, existingCapacity, limitBytes)
+		}
+		completed, resumeErr := d.completeResumedCloneRemnant(ctx, existingDS, datasetName, name, source, capacityBytes, shareType)
+		if resumeErr != nil {
+			return existingDS, remnantActionNone, resumeErr
+		}
+		d.deleteInflightMarker(ctx, volumeID)
+		klog.Infof("Resumed marker-proven in-flight clone remnant %s (origin %s) after a crash before ownership was stamped", datasetName, origin)
+		return completed, remnantActionResume, nil
+	}
+	return existingDS, remnantActionNone, nil
+}
+
+// completeResumedCloneRemnant finishes a proven clone remnant: it normalizes the
+// clone's capacity and stamps the full local identity set (ownership, managed
+// markers, content source, and for volume clones the origin snapshot) through the
+// proven update+verify path, so the volume no longer depends on any
+// clone-inherited (non-local) value. The stamp carries a per-attempt nonce:
+// operationLock is per-process, so two overlapping controllers can both attempt
+// this stamp; each writes its full payload in a single update and the re-read
+// decides whose write won. The loser maps the verification failure to Aborted —
+// its retry re-enters through the normal existing-volume path, where the
+// winner's identical-instance stamp is simply idempotent. The caller then
+// finishes through the normal existing-dataset tail (idempotent share creation
+// and the response).
+func (d *Driver) completeResumedCloneRemnant(
+	ctx context.Context,
+	existingDS *truenas.Dataset,
+	datasetName, name string,
+	source *csi.VolumeContentSource,
+	capacityBytes int64,
+	shareType ShareType,
+) (*truenas.Dataset, error) {
+	if err := d.ensureCloneCapacity(ctx, datasetName, existingDS, capacityBytes); err != nil {
+		return nil, err
+	}
+	nonce, nonceErr := newRecoveryNonce()
+	if nonceErr != nil {
+		return nil, status.Errorf(codes.Internal, "generate recovery nonce: %v", nonceErr)
+	}
+	properties := map[string]string{
+		PropManagedResource:  "true",
+		PropDriverInstanceID: d.driverInstanceID(),
+		PropProvisionSuccess: "true",
+		PropCSIVolumeName:    name,
+		PropRecoveryNonce:    nonce,
+	}
+	if snapshot := source.GetSnapshot(); snapshot != nil {
+		properties[PropVolumeContentSourceType] = "snapshot"
+		properties[PropVolumeContentSourceID] = snapshot.GetSnapshotId()
+	} else if volume := source.GetVolume(); volume != nil {
+		sourceDataset, err := d.datasetForID(volume.GetVolumeId())
+		if err != nil {
+			return nil, err
+		}
+		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
+		properties[PropVolumeContentSourceType] = "volume"
+		properties[PropVolumeContentSourceID] = volume.GetVolumeId()
+		properties[PropVolumeOriginSnapshot] = sourceDataset + "@" + tempSnapshotName
+	}
+	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
+		properties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
+	}
+	verified, err := d.setAndVerifyDatasetUserProperties(ctx, datasetName, properties)
+	if err != nil {
+		if errors.Is(err, errDatasetPropertyVerification) {
+			// Another controller's recovery stamp overwrote ours between our write
+			// and re-read. Its (same-instance) stamp is authoritative; retry through
+			// the normal existing-volume path.
+			return nil, status.Errorf(codes.Aborted,
+				"lost the in-flight remnant recovery race for %s; retry CreateVolume", datasetName)
+		}
+		return nil, status.Errorf(codes.Internal, "stamp and verify resumed clone remnant ownership: %v", err)
+	}
+	if removeErr := d.truenasClient.DatasetRemoveUserProperties(ctx, datasetName, []string{PropRecoveryNonce}); removeErr != nil {
+		klog.Warningf("Failed to remove recovery nonce from %s (inert leftover): %v", datasetName, removeErr)
+	}
+	delete(verified.UserProperties, PropRecoveryNonce)
+	return verified, nil
+}
+
 func storedBlockProtocol(ds *truenas.Dataset, shareType ShareType) bool {
 	var properties []string
 	switch shareType {
@@ -556,6 +1022,17 @@ func storedBlockProtocol(ds *truenas.Dataset, shareType ShareType) bool {
 		}
 	}
 	return false
+}
+
+func (d *Driver) driverInstanceID() string {
+	if configured := strings.TrimSpace(d.config.DriverInstanceID); configured != "" {
+		return configured
+	}
+	driverName := strings.TrimSpace(d.name)
+	if driverName == "" {
+		driverName = strings.TrimSpace(d.config.DriverName)
+	}
+	return driverName + "@" + strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/")
 }
 
 func volumeContentSourceFromDataset(ds *truenas.Dataset) *csi.VolumeContentSource {
@@ -673,35 +1150,23 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// fallback logic that finds resources by name.
 			var cleanupErrors []string
 			if cleanupErr := d.deleteShare(ctx, nil, datasetName, ShareTypeNVMeoF); cleanupErr != nil {
-				// Only log as warning if it's not a "not found" type error
-				errStr := cleanupErr.Error()
-				if strings.Contains(errStr, "cleanup errors") {
-					klog.Warningf("Failed to cleanup orphaned NVMe-oF resources for %s: %v", volumeID, cleanupErr)
-					cleanupErrors = append(cleanupErrors, "NVMe-oF: "+errStr)
-				} else {
-					klog.V(4).Infof("No orphaned NVMe-oF resources for %s", volumeID)
-				}
+				klog.Warningf("Failed to cleanup orphaned NVMe-oF resources for %s: %v", volumeID, cleanupErr)
+				cleanupErrors = append(cleanupErrors, "NVMe-oF: "+cleanupErr.Error())
 			} else {
 				klog.Infof("Cleaned up orphaned NVMe-oF resources for %s", volumeID)
 			}
 			if cleanupErr := d.deleteShare(ctx, nil, datasetName, ShareTypeISCSI); cleanupErr != nil {
-				errStr := cleanupErr.Error()
-				if strings.Contains(errStr, "cleanup errors") {
-					klog.Warningf("Failed to cleanup orphaned iSCSI resources for %s: %v", volumeID, cleanupErr)
-					cleanupErrors = append(cleanupErrors, "iSCSI: "+errStr)
-				} else {
-					klog.V(4).Infof("No orphaned iSCSI resources for %s", volumeID)
-				}
+				klog.Warningf("Failed to cleanup orphaned iSCSI resources for %s: %v", volumeID, cleanupErr)
+				cleanupErrors = append(cleanupErrors, "iSCSI: "+cleanupErr.Error())
 			} else {
 				klog.Infof("Cleaned up orphaned iSCSI resources for %s", volumeID)
 			}
 			if len(cleanupErrors) > 0 {
-				klog.Warningf("Some orphaned resources could not be cleaned up for %s: %v", volumeID, cleanupErrors)
+				return nil, status.Errorf(codes.Internal, "orphaned protocol cleanup failed for %s: %s", volumeID, strings.Join(cleanupErrors, "; "))
 			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
-		// Log but don't fail - try to proceed with deletion anyway
-		klog.V(4).Infof("Could not verify volume existence: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to verify volume %s: %v", volumeID, err)
 	}
 
 	// Determine share type from stored ZFS properties (most reliable)
@@ -764,7 +1229,6 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	}
 	for _, snap := range snapshots {
 		if snapshotBlocksVolumeDeletion(snap) {
-			klog.Infof("Volume %s has a snapshot that blocks dataset deletion, cannot delete", volumeID)
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"volume %s has dependent snapshots that must be deleted first", volumeID)
 		}
@@ -791,20 +1255,17 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 	case ds != nil && ds.Type == "VOLUME":
 		// Unknown zvol - try both iSCSI and NVMe-oF to avoid orphaned resources
-		// One will likely return "not found" which is fine
-		var lastErr error
+		// One will normally prove absence and return nil. Any other error is a
+		// cleanup failure and must stop dataset deletion.
+		var cleanupErrors []string
 		if err := d.deleteShare(ctx, ds, datasetName, ShareTypeISCSI); err != nil {
-			klog.V(4).Infof("iSCSI cleanup for %s: %v (may be expected if not iSCSI)", volumeID, err)
-			lastErr = err
+			cleanupErrors = append(cleanupErrors, "iSCSI: "+err.Error())
 		}
 		if err := d.deleteShare(ctx, ds, datasetName, ShareTypeNVMeoF); err != nil {
-			klog.V(4).Infof("NVMe-oF cleanup for %s: %v (may be expected if not NVMe-oF)", volumeID, err)
-			lastErr = err
+			cleanupErrors = append(cleanupErrors, "NVMe-oF: "+err.Error())
 		}
-		// Only fail if BOTH cleanup attempts had unexpected errors
-		// "not found" type errors are expected for the wrong protocol
-		if lastErr != nil && !strings.Contains(lastErr.Error(), "not found") && !strings.Contains(lastErr.Error(), "cleanup errors") {
-			klog.Warningf("Share cleanup had errors for %s: %v", volumeID, lastErr)
+		if len(cleanupErrors) > 0 {
+			return nil, status.Errorf(codes.Internal, "protocol cleanup failed for %s: %s", volumeID, strings.Join(cleanupErrors, "; "))
 		}
 	default:
 		// Default fallback for filesystem or unknown types
@@ -859,7 +1320,6 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// Found snapshots - check if any are managed or internal.
 			for _, snap := range snapshots {
 				if snapshotBlocksVolumeDeletion(snap) {
-					klog.Infof("Volume %s has a snapshot that blocks dataset deletion, cannot delete", volumeID)
 					return nil, status.Errorf(codes.FailedPrecondition,
 						"volume %s has dependent snapshots that must be deleted first", volumeID)
 				}
@@ -989,15 +1449,25 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
+	identity, err := d.resolveControllerNodeIdentity(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
 	// Best-effort node validation: when this process also runs the node service
 	// (combined/all mode) it knows its own node ID, so a request for a different
 	// node is a NotFound. In the split deployment runNode is false and this is
 	// inert (the CO's attach-detach controller owns node targeting). This also
 	// satisfies the csi-sanity "publish should fail when the node does not exist"
 	// conformance case. (Do not remove — it is conditionally load-bearing.)
-	if d.runNode && nodeID != d.nodeID {
+	if d.runNode && identity.Name != d.nodeID {
 		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
 	}
+	lockKey := "volume:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
+	}
+	defer d.releaseOperationLock(lockKey)
+
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
 		return nil, err
@@ -1010,20 +1480,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
 	}
 
-	// Determine share type from volume context
-	volumeContext := req.GetVolumeContext()
-	shareTypeStr := volumeContext["node_attach_driver"]
-	if shareTypeStr == "" {
-		// NFS volumes don't require controller publish
-		klog.V(4).Infof("ControllerPublishVolume: volume %s has no node_attach_driver, assuming NFS (no-op)", volumeID)
-		return &csi.ControllerPublishVolumeResponse{}, nil
-	}
-
-	shareType := ParseShareType(shareTypeStr)
-	if shareType == ShareTypeNFS {
-		// NFS doesn't require controller publish - shares are always accessible
-		return &csi.ControllerPublishVolumeResponse{}, nil
-	}
+	shareType := shareTypeForPublishedVolume(ds, req.GetVolumeContext())
 
 	klog.Infof("ControllerPublishVolume: volumeID=%s, nodeID=%s, shareType=%s", volumeID, nodeID, shareType)
 
@@ -1032,6 +1489,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType); err != nil {
 		return nil, err
 	}
+	if d.config.Fencing.Enabled() {
+		if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly()); err != nil {
+			return nil, err
+		}
+	}
 
 	klog.Infof("ControllerPublishVolume: volume %s published successfully to node %s", volumeID, nodeID)
 	return &csi.ControllerPublishVolumeResponse{}, nil
@@ -1039,10 +1501,33 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 
 // ControllerUnpublishVolume detaches a volume from a node (not used for NFS).
 func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	if req.GetVolumeId() == "" {
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
-	// Not implemented - NFS doesn't require controller unpublish
+	if !d.config.Fencing.Enabled() {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+	lockKey := "volume:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
+	}
+	defer d.releaseOperationLock(lockKey)
+	datasetName, err := d.datasetForID(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		if truenas.IsNotFoundError(err) {
+			return &csi.ControllerUnpublishVolumeResponse{}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
+	}
+	shareType := shareTypeForPublishedVolume(ds, nil)
+	if err := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, req.GetNodeId()); err != nil {
+		return nil, err
+	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
@@ -1364,14 +1849,106 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 	return &csi.DeleteSnapshotResponse{}, nil
 }
 
+// tombstoneLedgerEntry is the parent-dataset record proving that THIS driver
+// tombstoned the named snapshot. It is written BEFORE the rename so the orphan
+// reaper only ever destroys snapshots with proven driver provenance; a
+// name-shaped lookalike (e.g. a user snapshot literally named *-csi-deleted-N)
+// has no ledger entry and is never touched. A crash between ledger write and
+// rename leaves an entry without a tombstone, which the reconciler sweeps.
+type tombstoneLedgerEntry struct {
+	Version  int    `json:"v"`
+	Snapshot string `json:"snapshot"` // full tombstone ID: dataset@tombstone-name
+	Dataset  string `json:"dataset"`
+	// CreatedAt is the tombstoned snapshot's immutable ZFS creation time (unix
+	// seconds), captured at ledger-write time. The reaper requires the observed
+	// snapshot's creation time to MATCH, so a stale ledger entry can never
+	// authorize reaping a different snapshot later recreated at the same full ID.
+	CreatedAt int64  `json:"created_at,omitempty"`
+	RenamedAt string `json:"renamed_at"`
+}
+
+func tombstoneLedgerKey(fullSnapshotID string) string {
+	return hashedPropertyKey(PropTombstoneLedgerPrefix, fullSnapshotID)
+}
+
+func (d *Driver) writeTombstoneLedgerEntry(ctx context.Context, entry tombstoneLedgerEntry) error {
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("encode tombstone ledger entry: %w", err)
+	}
+	if _, err := d.setAndVerifyDatasetUserProperties(ctx, d.parentDatasetName(), map[string]string{
+		tombstoneLedgerKey(entry.Snapshot): string(encoded),
+	}); err != nil {
+		return fmt.Errorf("record tombstone ledger entry for %s: %w", entry.Snapshot, err)
+	}
+	return nil
+}
+
+// removeTombstoneLedgerEntry is best-effort; an orphaned entry (its snapshot no
+// longer exists) is retired by the reconciler sweep.
+func (d *Driver) removeTombstoneLedgerEntry(ctx context.Context, fullSnapshotID string) {
+	key := tombstoneLedgerKey(fullSnapshotID)
+	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), []string{key}); err != nil {
+		klog.Warningf("Failed to remove tombstone ledger entry for %s (reconciler sweep will retire it): %v", fullSnapshotID, err)
+	}
+}
+
+// tombstoneLedgerFromDataset extracts the local tombstone ledger entries from
+// the parent dataset, keyed by property key. Non-local and unparseable values
+// are ignored (never grounds to reap anything).
+func tombstoneLedgerFromDataset(parent *truenas.Dataset) map[string]tombstoneLedgerEntry {
+	entries := make(map[string]tombstoneLedgerEntry)
+	if parent == nil {
+		return entries
+	}
+	for key, property := range parent.UserProperties {
+		if !strings.HasPrefix(key, PropTombstoneLedgerPrefix) || !isLocalUserPropertySource(property.Source) {
+			continue
+		}
+		var entry tombstoneLedgerEntry
+		if err := json.Unmarshal([]byte(property.Value), &entry); err != nil {
+			klog.Warningf("Ignoring unparseable tombstone ledger entry %s: %v", key, err)
+			continue
+		}
+		if entry.Version != tombstoneLedgerVersion || entry.Snapshot == "" || key != tombstoneLedgerKey(entry.Snapshot) {
+			continue
+		}
+		entries[key] = entry
+	}
+	return entries
+}
+
 // handleSnapshotClones tombstones a snapshot and asks ZFS to destroy it once
 // its last clone releases the dependency.
 func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapshot) error {
 	tombstoneName := snapshotTombstoneName(snap.Dataset, snap.Name, time.Now().UnixNano())
-	if err := d.truenasClient.SnapshotRename(ctx, snap.ID, tombstoneName); err != nil {
-		return status.Errorf(codes.Internal, "failed to tombstone snapshot %s before deferred deletion: %v", snap.ID, err)
-	}
 	deleteID := snap.Dataset + "@" + tombstoneName
+	// Durable provenance BEFORE the rename: the reaper may only ever destroy
+	// snapshots this ledger proves the driver tombstoned. The immutable creation
+	// time binds the entry to THIS snapshot, not any later object at the same ID.
+	if err := d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+		Version:   tombstoneLedgerVersion,
+		Snapshot:  deleteID,
+		Dataset:   snap.Dataset,
+		CreatedAt: snap.GetCreationTime(),
+		RenamedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		return status.Errorf(codes.Internal, "failed to record tombstone provenance for snapshot %s: %v", snap.ID, err)
+	}
+	if renameErr := d.truenasClient.SnapshotRename(ctx, snap.ID, tombstoneName); renameErr != nil {
+		// The error may be a timeout AFTER the rename actually landed. Retire the
+		// ledger entry ONLY when the original name is observably still present
+		// (the rename provably did not happen); when the tombstone name exists,
+		// the rename succeeded and the entry must survive — it is the reaper's
+		// only provenance for the now-unnamed tombstone. When neither is
+		// observable, keep the entry: the age-gated sweep retires a false one.
+		if _, tombErr := d.truenasClient.SnapshotGet(ctx, deleteID); tombErr == nil {
+			klog.Warningf("Snapshot rename to %s reported %v but the tombstone exists; keeping its ledger entry", deleteID, renameErr)
+		} else if _, origErr := d.truenasClient.SnapshotGet(ctx, snap.ID); origErr == nil {
+			d.removeTombstoneLedgerEntry(ctx, deleteID)
+		}
+		return status.Errorf(codes.Internal, "failed to tombstone snapshot %s before deferred deletion: %v", snap.ID, renameErr)
+	}
 
 	properties := []string{PropManagedResource, PropCSISnapshotName, PropCSISnapshotSourceVolumeID}
 	if err := d.truenasClient.SnapshotRemoveUserProperties(ctx, deleteID, properties); err != nil {
@@ -1379,10 +1956,27 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 	}
 	if err := d.truenasClient.SnapshotDelete(ctx, deleteID, true, false); err != nil {
 		if truenas.IsNotFoundError(err) {
+			d.removeTombstoneLedgerEntry(ctx, deleteID)
+			return nil
+		}
+		// TrueNAS 26.0's zfs.resource.snapshot.destroy has no deferred-destroy
+		// mode, so a tombstone that still has a live restored clone cannot be
+		// removed yet. The tombstone rename already released the CSI snapshot name,
+		// which is DeleteSnapshot's entire contract, so this is a success — leave
+		// the tombstone (and its ledger entry) for the orphan reconciler to reap
+		// once its last clone is gone. Returning an error here would surface a
+		// spurious Internal and (once the CO's retry sees the renamed-away CSI
+		// name as absent) leak the tombstone forever.
+		var cloneErr *truenas.ErrSnapshotHasClones
+		if errors.As(err, &cloneErr) {
+			klog.V(4).Infof("Tombstoned snapshot %s still has dependent clones; deferring reclamation to orphan reconcile", deleteID)
 			return nil
 		}
 		return status.Errorf(codes.Internal, "failed to defer snapshot deletion: %v", err)
 	}
+	// The backend accepted the (deferred or immediate) destroy; the ledger entry
+	// has served its purpose.
+	d.removeTombstoneLedgerEntry(ctx, deleteID)
 	return nil
 }
 
@@ -1779,12 +2373,65 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 		}
 	}
 	d.applyDatasetProperties(params)
+	postCreateProperties := make(map[string]string, len(params.UserProperties)+1)
+	for _, property := range params.UserProperties {
+		postCreateProperties[property.Key] = property.Value
+	}
+	postCreateProperties[PropDriverInstanceID] = d.driverInstanceID()
+	// Live TrueNAS 26.0 accepts inline pool.dataset.create user_properties but
+	// silently writes none of them. Keep all standard dataset fields on create,
+	// then publish ownership and custom user properties through the proven
+	// pool.dataset.update user_properties_update path.
+	params.UserProperties = nil
 
 	ds, err := d.truenasClient.DatasetCreate(ctx, params)
 	if err != nil {
 		return nil, err
 	}
-	return ds, nil
+	if !ds.CreatedByCall {
+		if datasetHasLocalUserProperty(ds, PropDriverInstanceID, d.driverInstanceID()) {
+			// Another controller instance won the create race. Re-enter through the
+			// normal existing-volume path on retry so protocol, source, capacity and
+			// name compatibility are all checked, and so this caller can never clean
+			// up an object it did not create.
+			return nil, status.Errorf(codes.Aborted,
+				"dataset %s was concurrently created by this driver instance; retry CreateVolume", datasetName)
+		}
+		return nil, status.Errorf(codes.AlreadyExists,
+			"dataset %s appeared during creation without matching local ownership; refusing to adopt a raced object",
+			datasetName)
+	}
+	verified, stampErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, postCreateProperties)
+	if stampErr != nil {
+		if cleanupErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); cleanupErr != nil {
+			klog.Warningf("Failed to cleanup newly created dataset %s after ownership stamp failure: %v", datasetName, cleanupErr)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to stamp and verify dataset ownership after creation: %v", stampErr)
+	}
+	verified.CreatedByCall = true
+	return verified, nil
+}
+
+// errDatasetPropertyVerification marks a write that was acknowledged but whose
+// re-read did not show our exact values as local. Callers that race concurrent
+// writers (the recovery nonce CAS) distinguish this lost-race shape from a
+// backend failure.
+var errDatasetPropertyVerification = errors.New("dataset user property verification failed")
+
+func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetName string, properties map[string]string) (*truenas.Dataset, error) {
+	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, properties); err != nil {
+		return nil, err
+	}
+	verified, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		return nil, fmt.Errorf("re-read dataset after user-property update: %w", err)
+	}
+	for key, expected := range properties {
+		if !datasetHasLocalUserProperty(verified, key, expected) {
+			return nil, fmt.Errorf("%w: property %s did not persist locally with the expected value", errDatasetPropertyVerification, key)
+		}
+	}
+	return verified, nil
 }
 
 func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
@@ -1878,9 +2525,34 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 		}
 
 		sourceSnapshot := snap.ID
+		// Durable in-flight provenance BEFORE the first destination mutation. A
+		// crash between clone/copy and the ownership stamp leaves a dataset with
+		// no local identity; only this marker lets a retry prove the remnant is
+		// ours and recover it instead of wedging on terminal AlreadyExists.
+		marker, markerErr := d.newInflightMarker(datasetName, source, shareType)
+		if markerErr != nil {
+			return nil, markerErr
+		}
+		if d.config.ZFS.DetachedVolumesFromSnapshots {
+			marker.Mode = inflightModeCopy
+		} else {
+			marker.Origin = snap.ID
+		}
+		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
+			return nil, markerWriteErr
+		}
 		if d.config.ZFS.DetachedVolumesFromSnapshots {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
 			if copyErr := d.truenasClient.CopyDatasetFromSnapshotLocal(ctx, snap.Dataset, snap.Name, datasetName); copyErr != nil {
+				if truenas.IsDatasetDestinationExistsError(copyErr) {
+					// Deliberately KEEP the shared per-volume marker: the concurrent
+					// winner is the same driver instance mid-flight on the same
+					// name+source, and if it crashes before its ownership stamp the
+					// surviving marker is what lets a retry recover its remnant. The
+					// winner's post-stamp delete and the reconciler sweep retire it.
+					return nil, status.Errorf(codes.Aborted,
+						"detached snapshot copy destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
+				}
 				d.cleanupFailedClone(ctx, datasetName, "")
 				return nil, status.Errorf(codes.Internal, "failed to copy snapshot into an independent volume: %v", copyErr)
 			}
@@ -1889,6 +2561,13 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 			klog.V(4).Infof("Found snapshot %s for cloning", sourceSnapshot)
 
 			if cloneErr := d.truenasClient.SnapshotClone(ctx, sourceSnapshot, datasetName); cloneErr != nil {
+				if truenas.IsDatasetDestinationExistsError(cloneErr) {
+					// KEEP the shared marker: the same-instance winner may still need
+					// it for crash recovery (see the detached branch above).
+					return nil, status.Errorf(codes.Aborted,
+						"snapshot clone destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
+				}
+				d.deleteInflightMarker(ctx, path.Base(datasetName))
 				return nil, status.Errorf(codes.Internal, "failed to clone snapshot: %v", cloneErr)
 			}
 			klog.Infof("Snapshot clone created: %s -> %s", sourceSnapshot, datasetName)
@@ -1944,10 +2623,21 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 
 		// Create a snapshot of source volume, then clone it
 		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
+		// Durable in-flight provenance BEFORE any mutation; the recorded origin is
+		// the deterministic internal snapshot the clone must descend from.
+		marker, markerErr := d.newInflightMarker(datasetName, source, shareType)
+		if markerErr != nil {
+			return nil, markerErr
+		}
+		marker.Origin = sourceDataset + "@" + tempSnapshotName
+		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
+			return nil, markerWriteErr
+		}
 		snap, err := d.truenasClient.SnapshotCreate(ctx, sourceDataset, tempSnapshotName, map[string]string{
 			PropInternalResource: "true",
 		})
 		if err != nil {
+			d.deleteInflightMarker(ctx, path.Base(datasetName))
 			return nil, status.Errorf(codes.Internal, "failed to create source snapshot: %v", err)
 		}
 		klog.V(4).Infof("Created temporary snapshot %s for volume clone", snap.ID)
@@ -1956,6 +2646,16 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 		// DeleteVolume reject source deletion before its share is touched.
 
 		if cloneErr := d.truenasClient.SnapshotClone(ctx, snap.ID, datasetName); cloneErr != nil {
+			if truenas.IsDatasetDestinationExistsError(cloneErr) {
+				// The winning clone may depend on the same deterministic temporary
+				// snapshot. Do not delete either object; its CreateVolume path owns
+				// completion and the retry will pass through the full ownership gate.
+				// KEEP the shared marker too: the same-instance winner may still
+				// need it for crash recovery if it dies before its ownership stamp.
+				return nil, status.Errorf(codes.Aborted,
+					"volume clone destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
+			}
+			d.deleteInflightMarker(ctx, path.Base(datasetName))
 			if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
 				klog.Warningf("Failed to cleanup snapshot after clone failure: %v", delErr)
 			}
@@ -1989,14 +2689,29 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 }
 
 func (d *Driver) cleanupFailedClone(ctx context.Context, datasetName, tempSnapshotID string) {
-	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
-		klog.Warningf("Failed to cleanup clone dataset %s: %v", datasetName, err)
+	destroyErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true)
+	if destroyErr != nil {
+		klog.Warningf("Failed to cleanup clone dataset %s: %v", datasetName, destroyErr)
 	}
 	if tempSnapshotID != "" {
 		if err := d.truenasClient.SnapshotDelete(ctx, tempSnapshotID, false, false); err != nil {
 			klog.Warningf("Failed to cleanup temporary clone-source snapshot %s: %v", tempSnapshotID, err)
 		}
 	}
+	// Retire the in-flight marker ONLY when the destination is verifiably gone.
+	// A failed cleanup destroy (e.g. a partial detached copy still holding its
+	// transferred snapshot blocks the non-recursive delete) must KEEP the marker:
+	// it is the retry's only proof of provenance for recovering the remnant, and
+	// deleting it here would leave an unrecoverable, unmarked leak.
+	if destroyErr == nil {
+		d.deleteInflightMarker(ctx, path.Base(datasetName))
+		return
+	}
+	if _, getErr := d.truenasClient.DatasetGet(ctx, datasetName); truenas.IsNotFoundError(getErr) {
+		d.deleteInflightMarker(ctx, path.Base(datasetName))
+		return
+	}
+	klog.Warningf("Keeping in-flight marker for %s: cleanup destroy failed and the remnant may still exist; a retry will recover it", datasetName)
 }
 
 func (d *Driver) prepareDetachedSnapshotCopy(
@@ -2113,6 +2828,7 @@ func (d *Driver) prepareDetachedSnapshotCopy(
 		}
 	}
 	identityProperties[PropCSIVolumeName] = volumeName
+	identityProperties[PropDriverInstanceID] = d.driverInstanceID()
 	identityProperties[PropVolumeContentSourceType] = "snapshot"
 	identityProperties[PropVolumeContentSourceID] = snapshotID
 	identityProperties[PropVolumeOriginSnapshot] = "-"
@@ -2195,51 +2911,13 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 		volumeContext["share"] = ds.Mountpoint
 
 	case ShareTypeISCSI:
-		// Get target info from dataset properties or fallback to lookup by name
-		var target *truenas.ISCSITarget
-		var globalCfg *truenas.ISCSIGlobalConfig
-
-		if prop, ok := ds.UserProperties[PropISCSITargetID]; ok && prop.Value != "" && prop.Value != "-" {
-			targetID, err := strconv.Atoi(prop.Value)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "invalid target ID: %v", err)
-			}
-
-			// Fetch target and global config in parallel for better performance
-			g, gCtx := errgroup.WithContext(ctx)
-			g.Go(func() error {
-				var err error
-				target, err = d.truenasClient.ISCSITargetGet(gCtx, targetID)
-				if err != nil {
-					return status.Errorf(codes.Internal, "failed to get iSCSI target: %v", err)
-				}
-				return nil
-			})
-			g.Go(func() error {
-				var err error
-				globalCfg, err = d.truenasClient.ISCSIGlobalConfigGet(gCtx)
-				if err != nil {
-					return status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
-				}
-				return nil
-			})
-			if err := g.Wait(); err != nil {
-				return nil, err
-			}
-		} else {
-			// Fallback: lookup target by name (for volumes created before property tracking)
-			iscsiName := d.iscsiShareName(path.Base(datasetName))
-			klog.V(4).Infof("Target ID property missing for %s, falling back to name lookup: %s", datasetName, iscsiName)
-
-			var err error
-			target, err = d.truenasClient.ISCSITargetFindByName(ctx, iscsiName)
-			if err != nil || target == nil {
-				return nil, status.Errorf(codes.Internal, "failed to find iSCSI target by name %s: %v", iscsiName, err)
-			}
-			globalCfg, err = d.truenasClient.ISCSIGlobalConfigGet(ctx)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
-			}
+		target, err := d.resolveISCSITarget(ctx, ds, datasetName)
+		if err != nil || target == nil {
+			return nil, status.Errorf(codes.Internal, "failed to resolve iSCSI target for %s: %v", datasetName, err)
+		}
+		globalCfg, err := d.truenasClient.ISCSIGlobalConfigGet(ctx)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
 		}
 		volumeContext["iqn"] = fmt.Sprintf("%s:%s", globalCfg.Basename, target.Name)
 		volumeContext["portal"] = d.config.ISCSI.TargetPortal
@@ -2247,34 +2925,16 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 		volumeContext["interface"] = d.config.ISCSI.Interface
 
 	case ShareTypeNVMeoF:
-		// Get subsystem info from dataset properties or fallback to lookup by name
-		var subsys *truenas.NVMeoFSubsystem
-
-		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok && prop.Value != "" && prop.Value != "-" {
-			subsysID, err := strconv.Atoi(prop.Value)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "invalid subsystem ID: %v", err)
-			}
-			subsys, err = d.truenasClient.NVMeoFSubsystemGet(ctx, subsysID)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to get NVMe-oF subsystem: %v", err)
-			}
-		} else {
-			// Fallback: lookup subsystem by name (for volumes created before property tracking)
-			subsysName := path.Base(datasetName)
-			if d.config.NVMeoF.NamePrefix != "" {
-				subsysName = d.config.NVMeoF.NamePrefix + subsysName
-			}
-			if d.config.NVMeoF.NameSuffix != "" {
-				subsysName += d.config.NVMeoF.NameSuffix
-			}
-			klog.V(4).Infof("Subsystem ID property missing for %s, falling back to name lookup: %s", datasetName, subsysName)
-
-			var err error
-			subsys, err = d.truenasClient.NVMeoFSubsystemFindByName(ctx, subsysName)
-			if err != nil || subsys == nil {
-				return nil, status.Errorf(codes.Internal, "failed to find NVMe-oF subsystem by name %s: %v", subsysName, err)
-			}
+		namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to resolve NVMe-oF namespace: %v", err)
+		}
+		subsys, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+		if err != nil || subsys == nil {
+			return nil, status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem for %s: %v", datasetName, err)
+		}
+		if namespace == nil || namespace.SubsystemID != subsys.ID {
+			return nil, status.Errorf(codes.Internal, "NVMe-oF namespace for %s is missing or references a different subsystem", datasetName)
 		}
 		volumeContext["nqn"] = subsys.NQN
 		volumeContext["transport"] = d.config.NVMeoF.Transport

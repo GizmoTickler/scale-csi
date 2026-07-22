@@ -424,6 +424,9 @@ func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeReques
 			continue
 		}
 		if record.Capability != capability || record.Readonly != req.GetReadonly() || !mountSourcesEqual(record.ExpectedSource, expectedSource) || !allowsMultiplePublicationTargets(capability.AccessMode) {
+			if capability.AccessMode == csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
+				klog.Infof("NodePublishVolume: single-writer migration for volume %s is blocked by the still-mounted target %s; kubelet may still be tearing down the prior pod", req.GetVolumeId(), record.TargetPath)
+			}
 			return status.Errorf(codes.FailedPrecondition, "volume %s is already published at different target path %s", req.GetVolumeId(), record.TargetPath)
 		}
 	}
@@ -440,6 +443,9 @@ func (d *Driver) ensurePublicationTargetAllowed(req *csi.NodePublishVolumeReques
 			continue
 		}
 		if mountSourcesEqual(mount.Source, expectedSource) {
+			if capability.AccessMode == csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
+				klog.Infof("NodePublishVolume: single-writer migration for volume %s is blocked by the still-mounted target %s; kubelet may still be tearing down the prior pod", req.GetVolumeId(), mount.Target)
+			}
 			return status.Errorf(codes.FailedPrecondition, "volume %s is already published at different target path %s", req.GetVolumeId(), mount.Target)
 		}
 	}
@@ -513,7 +519,7 @@ func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (
 	klog.V(4).Info("NodeGetInfo called")
 
 	resp := &csi.NodeGetInfoResponse{
-		NodeId: d.nodeID,
+		NodeId: d.encodedNodeID,
 	}
 	if d.config.Node.MaxVolumesPerNode > 0 {
 		resp.MaxVolumesPerNode = d.config.Node.MaxVolumesPerNode

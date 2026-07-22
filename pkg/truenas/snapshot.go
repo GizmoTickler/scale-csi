@@ -16,26 +16,30 @@ import (
 
 const snapshotResourceQueryMethod = "zfs.resource.snapshot.query"
 
-// hasSnapshotResourceQuery detects the TrueNAS 26.0 snapshot resource API.
+// snapshotResourceQueryStatus detects the TrueNAS 26.0 snapshot resource API.
 // Successful and method-not-found probes are cached; transient failures are
-// deliberately retried on the next read. Concurrent callers share one probe.
-func (c *Client) hasSnapshotResourceQuery(ctx context.Context) bool {
+// deliberately retried on the next call. The second result distinguishes a
+// proved legacy backend from an unknown/transient probe result so mutation
+// callers never fall through to pool.snapshot.update on 26.0. Concurrent
+// callers share one probe.
+func (c *Client) snapshotResourceQueryStatus(ctx context.Context) (available, detected bool) {
 	c.snapshotResourceMu.Lock()
 	if c.snapshotResourceDetected {
-		available := c.snapshotResourceAvailable
+		cachedAvailable := c.snapshotResourceAvailable
 		c.snapshotResourceMu.Unlock()
-		return available
+		return cachedAvailable, true
 	}
 	if probeDone := c.snapshotResourceProbeDone; probeDone != nil {
 		c.snapshotResourceMu.Unlock()
 		select {
 		case <-probeDone:
 			c.snapshotResourceMu.Lock()
-			available := c.snapshotResourceDetected && c.snapshotResourceAvailable
+			cachedDetected := c.snapshotResourceDetected
+			cachedAvailable := cachedDetected && c.snapshotResourceAvailable
 			c.snapshotResourceMu.Unlock()
-			return available
+			return cachedAvailable, cachedDetected
 		case <-ctx.Done():
-			return false
+			return false, false
 		}
 	}
 
@@ -44,8 +48,8 @@ func (c *Client) hasSnapshotResourceQuery(ctx context.Context) bool {
 	c.snapshotResourceMu.Unlock()
 
 	_, err := c.Call(ctx, snapshotResourceQueryMethod, snapshotResourceQueryOptions(nil, false, nil))
-	detected := err == nil || isMethodNotFoundError(err)
-	available := err == nil
+	detected = err == nil || isMethodNotFoundError(err)
+	available = err == nil
 
 	c.snapshotResourceMu.Lock()
 	if detected && !c.snapshotResourceDetected {
@@ -54,14 +58,20 @@ func (c *Client) hasSnapshotResourceQuery(ctx context.Context) bool {
 	}
 	c.snapshotResourceProbeDone = nil
 	close(probeDone)
-	available = c.snapshotResourceDetected && c.snapshotResourceAvailable
+	detected = c.snapshotResourceDetected
+	available = detected && c.snapshotResourceAvailable
 	c.snapshotResourceMu.Unlock()
 
 	if available {
 		klog.V(2).Infof("Detected TrueNAS 26.0 snapshot resource API")
 	} else if err != nil && !detected {
-		klog.Warningf("Could not detect snapshot resource API, using legacy snapshot reads: %v", err)
+		klog.Warningf("Could not detect snapshot resource API; mutation callers will fail closed and reads may retry through the legacy path: %v", err)
 	}
+	return available, detected
+}
+
+func (c *Client) hasSnapshotResourceQuery(ctx context.Context) bool {
+	available, _ := c.snapshotResourceQueryStatus(ctx)
 	return available
 }
 
@@ -70,8 +80,15 @@ func isMethodNotFoundError(err error) bool {
 		return false
 	}
 	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.Code == -32601 {
-		return true
+	if errors.As(err, &apiErr) {
+		if apiErr.Code == -32601 {
+			return true
+		}
+		// -1 is TrueNAS's unstructured application-error bucket; known JSON-RPC
+		// codes are authoritative and must not be overridden by message text.
+		if apiErr.Code != -1 {
+			return false
+		}
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "method not found") || strings.Contains(message, "method does not exist")
@@ -98,6 +115,34 @@ type ErrSnapshotHasClones struct {
 
 func (e *ErrSnapshotHasClones) Error() string {
 	return fmt.Sprintf("snapshot %s has dependent clones: %v", e.SnapshotID, e.Clones)
+}
+
+// ErrDatasetDestinationExists reports that a clone/copy request lost the race
+// to an already-existing destination. Even a matching origin is not creation
+// proof: callers must retry through their normal ownership/idempotency gate and
+// must not stamp, mutate, or clean up this object.
+type ErrDatasetDestinationExists struct {
+	Destination     string
+	ExpectedOrigin  string
+	ActualOrigin    string
+	VerificationErr error
+}
+
+func (e *ErrDatasetDestinationExists) Error() string {
+	if e.VerificationErr != nil {
+		return fmt.Sprintf("clone destination %s already exists but its origin could not be verified: %v",
+			e.Destination, e.VerificationErr)
+	}
+	if e.ExpectedOrigin != "" || e.ActualOrigin != "" {
+		return fmt.Sprintf("clone destination %s already exists with origin %q, requested origin %q",
+			e.Destination, e.ActualOrigin, e.ExpectedOrigin)
+	}
+	return fmt.Sprintf("dataset destination %s already exists", e.Destination)
+}
+
+func IsDatasetDestinationExistsError(err error) bool {
+	var destinationErr *ErrDatasetDestinationExists
+	return errors.As(err, &destinationErr)
 }
 
 // detectSnapshotAPIPrefix detects which API prefix to use for snapshot methods.
@@ -214,7 +259,9 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userP
 		return c.snapshotCreateThenSetProperties(ctx, prefix, dataset, name, userProperties)
 	}
 
-	// Keep the first probe single-flight. A successful create proves support;
+	// Keep the first probe single-flight. Live TrueNAS 26.0 probes prove that
+	// inline snapshot-create properties persist even though no working API can
+	// add properties to an existing snapshot. A successful create proves support;
 	// a field-validation failure is cached and retried without properties.
 	snap, err := c.snapshotCreateCall(ctx, prefix, params)
 	if err == nil {
@@ -243,7 +290,7 @@ func (c *Client) snapshotCreateCall(ctx context.Context, prefix string, params *
 	result, err := c.Call(ctx, prefix+".create", params)
 	if err != nil {
 		// Ignore "already exists" errors
-		if strings.Contains(err.Error(), "already exists") {
+		if IsAlreadyExistsError(err) {
 			return c.SnapshotGet(ctx, params.Dataset+"@"+params.Name)
 		}
 		return nil, fmt.Errorf("failed to create snapshot: %w", err)
@@ -299,19 +346,25 @@ func isSnapshotCreatePropertiesValidationError(err error) bool {
 // The caller can then retry with defer=true to let ZFS reclaim the snapshot after
 // its final clone releases the dependency.
 func (c *Client) SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error {
-	options := map[string]interface{}{
-		"defer":     defer_,
-		"recursive": recursive,
+	var err error
+	if c.hasSnapshotResourceQuery(ctx) {
+		// TrueNAS 26.0's live wire contract is a single object argument containing
+		// path; zfs.resource.snapshot.destroy does not accept the legacy positional
+		// snapshot id and options pair.
+		_, err = c.Call(ctx, "zfs.resource.snapshot.destroy", map[string]interface{}{"path": snapshotID})
+	} else {
+		options := map[string]interface{}{
+			"defer":     defer_,
+			"recursive": recursive,
+		}
+		_, err = c.Call(ctx, c.snapshotMethod(ctx, "delete"), snapshotID, options)
 	}
-
-	_, err := c.Call(ctx, c.snapshotMethod(ctx, "delete"), snapshotID, options)
 	if err != nil {
 		// Log full error details before fallback logic (helps debug ambiguous errors)
 		LogAPIError(err, "SnapshotDelete error")
 
 		// Ignore "does not exist" errors
-		if strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "not found") {
+		if IsNotFoundError(err) && !isMethodNotFoundError(err) {
 			return nil
 		}
 
@@ -403,13 +456,17 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 		// Log full error details before fallback logic (helps debug ambiguous errors)
 		LogAPIError(err, "SnapshotGet error")
 
-		// Check for "Invalid params" which indicates not found for get_instance
-		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.Code == -32602 {
+		if IsNotFoundError(err) {
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
 		}
-		// Also check standard IsNotFoundError
-		if IsNotFoundError(err) {
+		// Older middleware reports a missing get_instance as bare -32602. A
+		// structured errno, when present, remains authoritative and must not be
+		// replaced by this compatibility fallback.
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == -32602 {
+			if _, structured := APIErrno(apiErr); structured {
+				return nil, fmt.Errorf("failed to get snapshot: %w", err)
+			}
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
 		}
 		return nil, fmt.Errorf("failed to get snapshot: %w", err)
@@ -594,10 +651,18 @@ func paginateSnapshots(snapshots []*Snapshot, limit, offset int) []*Snapshot {
 
 // SnapshotSetUserProperty sets a user property on a snapshot.
 //
-// TrueNAS 26.0 middleware currently returns success for pool.snapshot.update
-// user_properties_update while silently applying nothing. Keep this method for
-// legacy compatibility, but do not rely on it for correctness on that release.
+// TrueNAS 26.0 has no working mutation path for properties on an existing
+// snapshot: zfs.resource.snapshot.update does not exist and pool.snapshot.update
+// acknowledges the request while silently dropping it. Keep this method only
+// for older backends; 26.0 callers get an explicit unsupported error.
 func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error {
+	resourceAPI, detected := c.snapshotResourceQueryStatus(ctx)
+	if !detected {
+		return fmt.Errorf("snapshot API generation could not be determined; refusing a potentially silent existing-snapshot property update")
+	}
+	if resourceAPI {
+		return fmt.Errorf("existing snapshot user-property updates are unsupported by the TrueNAS 26.0 resource API")
+	}
 	params := map[string]interface{}{
 		"user_properties_update": []map[string]interface{}{
 			{"key": key, "value": value},
@@ -609,10 +674,18 @@ func (c *Client) SnapshotSetUserProperty(ctx context.Context, snapshotID, key, v
 }
 
 // SnapshotRemoveUserProperties removes user properties from a snapshot.
-// TrueNAS 26.0 has the same silent-no-op middleware bug for property removal;
-// callers must use tombstone identity as the correctness boundary there.
+// TrueNAS 26.0 has the same silent-no-op behavior for property removal. Removal
+// is best-effort cleanup after a durable rename tombstone, so skip the
+// nonexistent mutation rather than pretending pool.snapshot.update persisted it.
 func (c *Client) SnapshotRemoveUserProperties(ctx context.Context, snapshotID string, keys []string) error {
 	if len(keys) == 0 {
+		return nil
+	}
+	resourceAPI, detected := c.snapshotResourceQueryStatus(ctx)
+	if !detected {
+		return fmt.Errorf("snapshot API generation could not be determined; refusing a potentially silent existing-snapshot property removal")
+	}
+	if resourceAPI {
 		return nil
 	}
 	params := map[string]interface{}{
@@ -632,16 +705,17 @@ func (c *Client) SnapshotClone(ctx context.Context, snapshotID, newDatasetName s
 
 	_, err := c.Call(ctx, c.snapshotMethod(ctx, "clone"), params)
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
+		if IsAlreadyExistsError(err) {
 			existing, getErr := c.DatasetGet(ctx, newDatasetName)
 			if getErr != nil {
-				return fmt.Errorf("clone destination %s already exists but its origin could not be verified: %w", newDatasetName, getErr)
+				return &ErrDatasetDestinationExists{
+					Destination: newDatasetName, ExpectedOrigin: snapshotID, VerificationErr: getErr,
+				}
 			}
 			existingOrigin := datasetPropertyString(existing.Origin)
-			if existingOrigin != snapshotID {
-				return fmt.Errorf("clone destination %s already exists with origin %q, requested origin %q", newDatasetName, existingOrigin, snapshotID)
+			return &ErrDatasetDestinationExists{
+				Destination: newDatasetName, ExpectedOrigin: snapshotID, ActualOrigin: existingOrigin,
 			}
-			return nil
 		}
 		return fmt.Errorf("failed to clone snapshot: %w", err)
 	}
@@ -669,9 +743,8 @@ func (c *Client) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset
 
 	result, err := c.Call(ctx, "replication.run_onetime", params)
 	if err != nil {
-		if IsAlreadyExistsError(err) && c.localCopyTargetExists(ctx, targetDataset) {
-			klog.Infof("Local snapshot copy target %s already exists; continuing idempotently", targetDataset)
-			return c.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName)
+		if IsAlreadyExistsError(err) {
+			return &ErrDatasetDestinationExists{Destination: targetDataset}
 		}
 		return fmt.Errorf("failed to start local snapshot copy: %w", err)
 	}
@@ -682,12 +755,11 @@ func (c *Client) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset
 	}
 	if err := c.waitForJob(ctx, jobID); err != nil {
 		// only_from_scratch reports an existing target through the asynchronous
-		// job. A previous successful request may have completed before its caller
-		// observed the response, so existence is the idempotency boundary.
+		// job. AlreadyExists is itself proof that this caller does not own the
+		// destination; no follow-up read may downgrade that safety decision.
 		var terminalErr *jobTerminalError
-		if errors.As(err, &terminalErr) && IsAlreadyExistsError(err) && c.localCopyTargetExists(ctx, targetDataset) {
-			klog.Infof("Local snapshot copy target %s already exists after job %d; continuing idempotently", targetDataset, jobID)
-			return c.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName)
+		if errors.As(err, &terminalErr) && IsAlreadyExistsError(err) {
+			return &ErrDatasetDestinationExists{Destination: targetDataset}
 		}
 		return fmt.Errorf("local snapshot copy job %d failed: %w", jobID, err)
 	}
@@ -766,11 +838,6 @@ func (c *Client) waitForJob(ctx context.Context, jobID int64) error {
 		case <-timer.C:
 		}
 	}
-}
-
-func (c *Client) localCopyTargetExists(ctx context.Context, targetDataset string) bool {
-	exists, err := c.DatasetExists(ctx, targetDataset)
-	return err == nil && exists
 }
 
 // DestroyReplicatedTargetSnapshot removes the snapshot transferred to the

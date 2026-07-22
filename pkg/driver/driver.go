@@ -13,6 +13,8 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 
@@ -41,6 +43,8 @@ var (
 	gcDisconnectNVMeoF                 = util.NVMeoFDisconnect
 )
 
+const expectedDeleteSnapshotLogInterval = time.Minute
+
 // DriverConfig holds the driver initialization configuration.
 type DriverConfig struct {
 	Name          string
@@ -63,6 +67,7 @@ type Driver struct {
 	name          string
 	version       string
 	nodeID        string
+	encodedNodeID string
 	endpoint      string
 	runController bool
 	runNode       bool
@@ -105,8 +110,18 @@ type Driver struct {
 	gcWg     sync.WaitGroup
 
 	// Controller-side orphan reconcile context and cancellation.
-	reconcileCancel context.CancelFunc
-	reconcileWg     sync.WaitGroup
+	reconcileCancel        context.CancelFunc
+	reconcileWg            sync.WaitGroup
+	startupReconcileCancel context.CancelFunc
+	startupReconcileWg     sync.WaitGroup
+	startupReconcileOnce   sync.Once
+	startupReconcileSignal chan struct{}
+
+	// Background fencing state. Missing-record observations are in-memory on
+	// purpose: a controller restart restarts the full grace period rather than
+	// revoking an old record immediately after a fresh VA disappearance.
+	stalePublicationRecordsSeen sync.Map
+	fencingDeferredLogs         sync.Map
 
 	// Track when orphaned sessions were first seen (for grace period). The
 	// protocol maps must remain independent: a cleanup pass may only retire
@@ -126,6 +141,9 @@ type Driver struct {
 	// serialized so concurrent volume creates do not race to create one host.
 	nvmeHostMu        sync.Mutex
 	nvmeResolvedHosts map[string]int
+
+	expectedDeleteLogMu   sync.Mutex
+	expectedDeleteLogLast map[string]time.Time
 }
 
 // newTrueNASClient constructs the TrueNAS API client; tests override it to
@@ -147,6 +165,18 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 	}
 	if cfg.Config == nil {
 		return nil, fmt.Errorf("config is required")
+	}
+
+	encodedNodeID := ""
+	if cfg.RunNode {
+		identity := discoverNodeIdentity(context.Background(), cfg.NodeID)
+		identity = nodeIdentityForEnabledProtocols(identity, cfg.Config)
+		var identityErr error
+		encodedNodeID, identityErr = encodeNodeIdentity(identity)
+		if identityErr != nil {
+			return nil, fmt.Errorf("node startup identity cannot be encoded within CSI's %d-byte node_id limit: %w",
+				maxCSINodeIDBytes, identityErr)
+		}
 	}
 
 	// Build circuit breaker config if enabled
@@ -236,6 +266,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		name:                   cfg.Name,
 		version:                cfg.Version,
 		nodeID:                 cfg.NodeID,
+		encodedNodeID:          encodedNodeID,
 		endpoint:               cfg.Endpoint,
 		runController:          cfg.RunController,
 		runNode:                cfg.RunNode,
@@ -247,6 +278,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		nvmeResolvedHosts:      make(map[string]int),
 		stagedTargets:          make(map[string]nodeMountRecord),
 		publishedTargets:       make(map[string]nodeMountRecord),
+		expectedDeleteLogLast:  make(map[string]time.Time),
 	}
 	driver.observeTrueNASConnection()
 	return driver, nil
@@ -295,29 +327,43 @@ func (d *Driver) Run() error {
 	if d.runController {
 		csi.RegisterControllerServer(d.server, d)
 		klog.Info("Controller service registered")
-		d.startOrphanReconcile()
 	}
 
 	if d.runNode {
 		csi.RegisterNodeServer(d.server, d)
 		klog.Info("Node service registered")
-
-		// Start session garbage collection for node plugin
-		d.startSessionGC()
 	}
 
-	// Start health and metrics server if port is configured
+	// Bind health/metrics before any reconciliation or background workers. This
+	// makes an occupied port a synchronous startup error with no half-started
+	// controller or node goroutines left behind.
 	if d.healthPort > 0 {
 		d.healthServer = NewHealthServer(d, d.healthPort)
 		if err := d.healthServer.Start(); err != nil {
+			_ = listener.Close()
 			return fmt.Errorf("failed to start health server: %w", err)
 		}
 	}
 
-	d.ready.Store(true)
+	// Serve first. Startup fencing may require hundreds of serialized middleware
+	// calls on a populated cluster and must never make the CSI endpoint crash-loop.
+	// Only strict mode gates readiness until its background retry loop converges.
+	d.ready.Store(!d.runController || d.config == nil || d.config.Fencing.Mode != FencingModeStrict)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- d.server.Serve(listener)
+	}()
 	klog.Infof("CSI driver listening on %s", d.endpoint)
 
-	return d.server.Serve(listener)
+	if d.runController {
+		d.startStartupAttachmentReconcile()
+		d.startOrphanReconcile()
+	}
+	if d.runNode {
+		d.startSessionGC()
+	}
+
+	return <-serveErr
 }
 
 // Stop gracefully stops the driver.
@@ -327,6 +373,7 @@ func (d *Driver) Stop() {
 
 	// Stop session GC goroutine first
 	d.stopSessionGC()
+	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
 
 	// Stop the service reload debouncer
@@ -394,8 +441,18 @@ func (d *Driver) logInterceptor(
 	// original request is left untouched for the RPC handler.
 	klog.V(5).Infof("[req-%d] request: %+v", requestID, requestWithoutSecrets(req))
 
-	// Handle the request
-	resp, err := handler(ctx, req)
+	// Kubernetes Pod readiness does not stop CSI sidecars in the same Pod from
+	// using the Unix socket. During strict startup convergence, enforce the gate
+	// at the RPC boundary as well. Teardown and read-only controller calls remain
+	// available so transient duplicate VolumeAttachments can drain and unblock
+	// the retry loop; grant/provision mutations receive a retryable response.
+	var resp interface{}
+	var err error
+	if d.strictStartupControllerRPCBlocked(info.FullMethod) {
+		err = status.Error(codes.Unavailable, "strict fencing startup reconciliation has not converged; retry this controller operation")
+	} else {
+		resp, err = handler(ctx, req)
+	}
 
 	// Calculate duration
 	duration := time.Since(startTime)
@@ -405,13 +462,65 @@ func (d *Driver) logInterceptor(
 
 	// Log result
 	if err != nil {
-		klog.Errorf("[req-%d] %s failed after %v: %v", requestID, info.FullMethod, duration, err)
+		if volumeID, expected := expectedDeleteVolumeSnapshotDependency(req, err); expected {
+			if d.shouldLogExpectedDeleteSnapshotDependency(volumeID, time.Now()) {
+				klog.V(2).Infof("[DELETE_VOLUME_WAITING_FOR_DEPENDENT_SNAPSHOTS] [req-%d] %s deferred after %v: %v",
+					requestID, info.FullMethod, duration, err)
+			}
+		} else {
+			klog.Errorf("[req-%d] %s failed after %v: %v", requestID, info.FullMethod, duration, err)
+		}
 	} else {
 		klog.V(4).Infof("[req-%d] %s completed in %v", requestID, info.FullMethod, duration)
 		klog.V(5).Infof("[req-%d] response: %+v", requestID, resp)
 	}
 
 	return resp, err
+}
+
+func (d *Driver) strictStartupControllerRPCBlocked(fullMethod string) bool {
+	if d.config == nil || d.config.Fencing.Mode != FencingModeStrict || !d.runController || d.ready.Load() {
+		return false
+	}
+	if !strings.HasPrefix(fullMethod, "/csi.v1.Controller/") {
+		return false
+	}
+	switch fullMethod {
+	case "/csi.v1.Controller/ControllerGetCapabilities",
+		"/csi.v1.Controller/ValidateVolumeCapabilities",
+		"/csi.v1.Controller/GetCapacity",
+		"/csi.v1.Controller/ListVolumes",
+		"/csi.v1.Controller/ControllerGetVolume",
+		"/csi.v1.Controller/ListSnapshots",
+		"/csi.v1.Controller/ControllerUnpublishVolume",
+		"/csi.v1.Controller/DeleteVolume",
+		"/csi.v1.Controller/DeleteSnapshot":
+		return false
+	default:
+		return true
+	}
+}
+
+func expectedDeleteVolumeSnapshotDependency(req interface{}, err error) (string, bool) {
+	request, ok := req.(*csi.DeleteVolumeRequest)
+	if !ok || request.GetVolumeId() == "" || status.Code(err) != codes.FailedPrecondition {
+		return "", false
+	}
+	expected := fmt.Sprintf("volume %s has dependent snapshots that must be deleted first", request.GetVolumeId())
+	return request.GetVolumeId(), status.Convert(err).Message() == expected
+}
+
+func (d *Driver) shouldLogExpectedDeleteSnapshotDependency(volumeID string, now time.Time) bool {
+	d.expectedDeleteLogMu.Lock()
+	defer d.expectedDeleteLogMu.Unlock()
+	if d.expectedDeleteLogLast == nil {
+		d.expectedDeleteLogLast = make(map[string]time.Time)
+	}
+	if last := d.expectedDeleteLogLast[volumeID]; !last.IsZero() && now.Sub(last) < expectedDeleteSnapshotLogInterval {
+		return false
+	}
+	d.expectedDeleteLogLast[volumeID] = now
+	return true
 }
 
 func requestWithoutSecrets(req interface{}) interface{} {

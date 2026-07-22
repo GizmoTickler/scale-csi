@@ -2,6 +2,7 @@ package driver
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,18 @@ import (
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+func TestHealthServerStartReturnsBindFailureSynchronously(t *testing.T) {
+	occupied, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, occupied.Close()) })
+	port := occupied.Addr().(*net.TCPAddr).Port
+
+	health := NewHealthServer(&Driver{}, port)
+	err = health.Start()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bind health listener")
+}
 
 // MockClientWithCircuitBreaker is a mock client that returns circuit breaker stats.
 type MockClientWithCircuitBreaker struct {

@@ -126,6 +126,13 @@ func startSanityDriver(t *testing.T, socketPath, protocol string, runNode bool) 
 	// TrueNAS boundary with the repository's stateful mock via the client
 	// constructor seam, so no real connection is ever attempted.
 	mockClient := truenas.NewMockClient()
+	// The parent dataset always exists on a real backend; it now also carries the
+	// driver's durable bookkeeping (in-flight markers, tombstone ledger).
+	if _, parentErr := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+		Name: config.ZFS.DatasetParentName, Type: "FILESYSTEM",
+	}); parentErr != nil {
+		t.Fatalf("create %s sanity parent dataset: %v", protocol, parentErr)
+	}
 	originalNewClient := newTrueNASClient
 	newTrueNASClient = func(*truenas.ClientConfig) (truenas.ClientInterface, error) {
 		return mockClient, nil

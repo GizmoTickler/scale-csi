@@ -3,6 +3,22 @@
 # CSI Driver name (should match the driver name in StorageClass)
 csiDriverName: csi.scale.io
 
+# Stable ownership identity stamped on newly-created datasets/zvols. Empty
+# derives "<csiDriverName>@<zfs.parentDataset>". Never change this for an
+# existing installation unless the matching datasets are deliberately adopted.
+driverInstanceId: ""
+
+# Backend publication fencing defaults off. For upgrades, roll the node image
+# first, wait for every CSINode to re-register, then select "additive". Select
+# "strict" only after the deferred-fencing metric remains zero.
+fencing:
+  mode: "off"
+  # Timeout for one background startup convergence attempt. Failures retry.
+  startupReconcileTimeout: 10m
+  # Continuous VolumeAttachment absence required before a stale publication
+  # record left by a force-removed VA finalizer can be revoked.
+  staleRecordGracePeriod: 10m
+
 # Image configuration
 image:
   repository: ghcr.io/gizmotickler/scale-csi
@@ -14,6 +30,8 @@ imagePullSecrets: []
 # Controller configuration (runs as Deployment)
 controller:
   enabled: true
+  # Additive/strict fencing requires exactly one non-overlapping controller
+  # writer; the chart uses Recreate rollouts in those modes.
   replicas: 1
 
   # Priority class for controller pods
@@ -416,10 +434,14 @@ metrics:
 
 # Controller-side orphan detection and opt-in guarded cleanup.
 reconcile:
-  # Read-only detection is enabled by default and updates Prometheus gauges.
+  # The default pass performs detection (updating Prometheus gauges) plus
+  # hygiene of the driver's OWN bookkeeping user properties on the parent
+  # dataset: stale in-flight creation markers and orphaned tombstone-ledger
+  # entries are retired with live staleness proof. Backend OBJECT deletion —
+  # volumes, snapshots, tombstone reaping — happens only behind delete.enabled.
   enabled: true
 
-  # Interval between read-only detection passes.
+  # Interval between detection passes.
   interval: 1h
 
   # Managed backend objects must be older than this before they are orphaned.
@@ -432,6 +454,13 @@ reconcile:
     # SAFETY: guarded deletion is opt-in and disabled by default. When enabled,
     # a CronJob runs --mode=reconcile and backend cleanup still goes through the
     # driver's existing DeleteVolume/DeleteSnapshot dependency guards.
+    #
+    # NOTE: on TrueNAS 26.0 (no ZFS deferred destroy) deleting a snapshot that
+    # still has a restored clone leaves a driver-tombstoned snapshot behind by
+    # design. Reaping those released tombstones is part of this guarded delete
+    # pass, so it only happens when delete.enabled is true; with it disabled the
+    # backlog stays visible in the scale_csi_tombstone_snapshots{,_bytes}
+    # gauges (detection is always on).
     enabled: false
     schedule: "0 4 * * *"
     # Maximum successful deletions across all object types in one run.

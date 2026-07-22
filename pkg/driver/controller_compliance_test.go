@@ -285,6 +285,7 @@ func TestCreateVolumeExistingResponseIncludesAccessibleTopology(t *testing.T) {
 	})
 	require.NoError(t, err)
 	driver := newComplianceTestDriver(mockClient)
+	require.NoError(t, mockClient.DatasetSetUserProperty(ctx, "pool/parent/existing-volume", PropDriverInstanceID, driver.driverInstanceID()))
 	driver.config.ZFS.DatasetEnableQuotas = true
 	driver.config.Node.Topology = TopologyConfig{Enabled: true, Zone: "zone-a", Region: "region-a"}
 
@@ -443,6 +444,7 @@ func TestCreateVolumeCloneExpansionFailure(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &cloneExpandErrorClient{MockClient: truenas.NewMockClient()}
+			mustCreateParentDataset(t, client.MockClient)
 			driver := newComplianceTestDriver(client)
 			source := tc.contentSource(client.MockClient)
 
@@ -505,6 +507,7 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &cloneWaitErrorClient{MockClient: truenas.NewMockClient()}
+			mustCreateParentDataset(t, client.MockClient)
 			_, err := client.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent/source", Type: "VOLUME", Volsize: testGiB,
 			})
@@ -538,6 +541,7 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 
 func TestCreateVolumeNFSCloneSetsRefquota(t *testing.T) {
 	mockClient := truenas.NewMockClient()
+	mustCreateParentDataset(t, mockClient)
 	_, err := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 		Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB,
 	})
@@ -575,6 +579,7 @@ func TestCreateVolumeFromSnapshotDetachedGate(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			client := truenas.NewMockClient()
+			mustCreateParentDataset(t, client)
 			source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 				Name: "pool/parent/restore-intermediate", Type: "FILESYSTEM",
 				UserProperties: []truenas.UserPropertyUpdate{
@@ -668,6 +673,7 @@ func TestCreateVolumeFromSnapshotDetachedGate(t *testing.T) {
 func TestCreateVolumeDetachedSnapshotCopyNormalizesZvolCapacityAndIdentity(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
+	mustCreateParentDataset(t, client)
 	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: "pool/parent/block-intermediate", Type: "VOLUME", Volsize: testGiB, Refreservation: testGiB,
 		UserProperties: []truenas.UserPropertyUpdate{
@@ -759,6 +765,7 @@ func TestCreateVolumeDetachedSnapshotExistingCopyClearsInheritedShareIdentity(t 
 
 	trackingClient := &transferredSnapshotCleanupTrackingClient{MockClient: client}
 	driver := newComplianceTestDriver(trackingClient)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, "pool/parent/existing-copy", PropDriverInstanceID, driver.driverInstanceID()))
 	driver.config.ZFS.DetachedVolumesFromSnapshots = true
 	driver.config.ZFS.DatasetEnableQuotas = true
 	response, err := driver.CreateVolume(ctx, &csi.CreateVolumeRequest{
