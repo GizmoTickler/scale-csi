@@ -14,6 +14,12 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// datasetResourceQueryMethod is the TrueNAS 26.0 path-scoped dataset read API.
+// It returns properties + user-properties + source + origin in one call and is
+// scoped to explicit paths, avoiding the full-system user-property
+// materialization that pool.dataset.query forces.
+const datasetResourceQueryMethod = "zfs.resource.query"
+
 // Dataset represents a ZFS dataset from the TrueNAS API.
 type Dataset struct {
 	ID             string                  `json:"id"`
@@ -36,6 +42,9 @@ type Dataset struct {
 	// object. The idempotent AlreadyExists fallback leaves it false so callers
 	// never post-stamp a raced foreign dataset.
 	CreatedByCall bool `json:"-"`
+	// ResourceQuery is true when the dataset came from the TrueNAS 26.0
+	// zfs.resource.query read path rather than pool.dataset.query.
+	ResourceQuery bool `json:"-"`
 }
 
 // DatasetProperty represents a ZFS property with parsed and raw values.
@@ -248,6 +257,207 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offs
 	}
 
 	return datasets, nil
+}
+
+// datasetResourceQueryStatus detects the TrueNAS 26.0 dataset resource API
+// (zfs.resource.query). It mirrors snapshotResourceQueryStatus: successful and
+// method-not-found probes are cached, transient failures are retried on the
+// next call, and concurrent callers share one probe.
+func (c *Client) datasetResourceQueryStatus(ctx context.Context) (available, detected bool) {
+	c.datasetResourceMu.Lock()
+	if c.datasetResourceDetected {
+		cachedAvailable := c.datasetResourceAvailable
+		c.datasetResourceMu.Unlock()
+		return cachedAvailable, true
+	}
+	if probeDone := c.datasetResourceProbeDone; probeDone != nil {
+		c.datasetResourceMu.Unlock()
+		select {
+		case <-probeDone:
+			c.datasetResourceMu.Lock()
+			cachedDetected := c.datasetResourceDetected
+			cachedAvailable := cachedDetected && c.datasetResourceAvailable
+			c.datasetResourceMu.Unlock()
+			return cachedAvailable, cachedDetected
+		case <-ctx.Done():
+			return false, false
+		}
+	}
+
+	probeDone := make(chan struct{})
+	c.datasetResourceProbeDone = probeDone
+	c.datasetResourceMu.Unlock()
+
+	_, err := c.Call(ctx, datasetResourceQueryMethod, datasetResourceQueryOptions(nil, false))
+	detected = err == nil || isMethodNotFoundError(err)
+	available = err == nil
+
+	c.datasetResourceMu.Lock()
+	if detected && !c.datasetResourceDetected {
+		c.datasetResourceDetected = true
+		c.datasetResourceAvailable = available
+	}
+	c.datasetResourceProbeDone = nil
+	close(probeDone)
+	detected = c.datasetResourceDetected
+	available = detected && c.datasetResourceAvailable
+	c.datasetResourceMu.Unlock()
+
+	if available {
+		klog.V(2).Infof("Detected TrueNAS 26.0 dataset resource API")
+	} else if err != nil && !detected {
+		klog.Warningf("Could not detect dataset resource API; managed-dataset listing will retry through pool.dataset.query: %v", err)
+	}
+	return available, detected
+}
+
+func (c *Client) hasDatasetResourceQuery(ctx context.Context) bool {
+	available, _ := c.datasetResourceQueryStatus(ctx)
+	return available
+}
+
+// datasetResourceQueryOptions builds the zfs.resource.query options object.
+// get_children recurses below the given paths; get_user_properties and
+// get_source surface user-property values with their source so the source=='local'
+// discipline survives the read.
+func datasetResourceQueryOptions(paths []string, getChildren bool) map[string]interface{} {
+	if paths == nil {
+		paths = []string{}
+	}
+	return map[string]interface{}{
+		"paths":               paths,
+		"get_children":        getChildren,
+		"properties":          datasetQueryProperties,
+		"get_user_properties": true,
+		"get_source":          true,
+	}
+}
+
+// LIVE-PROBE GATE: The request options and response shape for the dataset
+// zfs.resource.query read below are MODELED on the snapshot resource API
+// (zfs.resource.snapshot.query) and the architecture review — they are NOT yet
+// confirmed by a live TrueNAS 26.0 probe. The safe fallback to pool.dataset.query
+// in listAllManagedDatasets protects reconciliation if this shape is rejected or
+// parses empty. A live probe against TrueNAS 26.0 MUST confirm the shape (field
+// names, user_properties source presence, get_children/get_source behavior) before
+// this path is relied upon in production.
+//
+// DatasetQueryByParent returns every dataset below parentDataset (path-scoped,
+// never a full-system scan) using the TrueNAS 26.0 zfs.resource.query API. It
+// returns ALL datasets under the parent; callers filter for the managed_resource
+// user property. Detection gates the call: if the resource API is not detected
+// available, it returns an error so callers fall back to pool.dataset.query.
+func (c *Client) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*Dataset, error) {
+	if !c.hasDatasetResourceQuery(ctx) {
+		return nil, fmt.Errorf("dataset resource API (zfs.resource.query) is not available")
+	}
+	parent := strings.TrimSuffix(parentDataset, "/")
+	result, err := c.Call(ctx, datasetResourceQueryMethod, datasetResourceQueryOptions([]string{parent}, true))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query datasets by parent: %w", err)
+	}
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type")
+	}
+	datasets := make([]*Dataset, 0, len(items))
+	for _, item := range items {
+		ds, parseErr := parseDatasetResource(item)
+		if parseErr != nil {
+			continue
+		}
+		ds.ResourceQuery = true
+		datasets = append(datasets, ds)
+	}
+	return datasets, nil
+}
+
+// LIVE-PROBE GATE: parseDatasetResource parses the MODELED (not live-verified)
+// zfs.resource.query dataset item shape. See the gate comment on
+// DatasetQueryByParent: a live TrueNAS 26.0 probe must confirm field names,
+// user_properties source presence, and get_children/get_source behavior before
+// this parser is relied upon in production. The parser is deliberately defensive:
+// it reuses parseDataset/parseProperty where the shape matches and degrades flat
+// user-property values to source="" (unknown) so datasetHasLocalUserProperty
+// callers fail safe rather than misreporting local.
+func parseDatasetResource(data interface{}) (*Dataset, error) {
+	m, ok := data.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected dataset resource format")
+	}
+
+	ds := &Dataset{
+		UserProperties: make(map[string]UserProperty),
+	}
+
+	// The resource API may key the dataset by "name" (the dataset path) and/or
+	// "path"; pool.dataset.query uses "id"/"name". Accept both.
+	if v, ok := m["name"].(string); ok {
+		ds.Name = v
+	}
+	if v, ok := m["path"].(string); ok && ds.Name == "" {
+		ds.Name = v
+	}
+	if v, ok := m["id"].(string); ok {
+		ds.ID = v
+	}
+	if ds.ID == "" {
+		ds.ID = ds.Name
+	}
+	if v, ok := m["pool"].(string); ok {
+		ds.Pool = v
+	}
+	if v, ok := m["type"].(string); ok {
+		ds.Type = v
+	}
+	if v, ok := m["mountpoint"].(string); ok {
+		ds.Mountpoint = v
+	}
+
+	// The resource API nests ZFS properties under a "properties" map keyed by
+	// property name, each entry shaped like parseProperty's input
+	// ({value, rawvalue, parsed, source}). Fall back to top-level keys when a
+	// "properties" map is absent so a shape closer to pool.dataset.query still
+	// parses.
+	props := m
+	if nested, ok := m["properties"].(map[string]interface{}); ok {
+		props = nested
+	}
+	ds.Used = parseProperty(props["used"])
+	ds.Available = parseProperty(props["available"])
+	ds.Quota = parseProperty(props["quota"])
+	ds.Refquota = parseProperty(props["refquota"])
+	ds.Reservation = parseProperty(props["reservation"])
+	ds.Refreservation = parseProperty(props["refreservation"])
+	ds.Volsize = parseProperty(props["volsize"])
+	ds.Volblocksize = parseProperty(props["volblocksize"])
+	ds.Origin = parseProperty(props["origin"])
+	ds.Creation = parseProperty(props["creation"])
+
+	// User properties: prefer the nested {value, source} shape (source must
+	// survive so the source=='local' discipline holds). Defensively also accept
+	// a flat key -> "value" string form (as the snapshot resource API flattens);
+	// flat values get source="" (unknown) so datasetHasLocalUserProperty degrades
+	// safely rather than misreporting local.
+	if userProps, ok := m["user_properties"].(map[string]interface{}); ok {
+		for key, val := range userProps {
+			switch typed := val.(type) {
+			case map[string]interface{}:
+				prop := UserProperty{}
+				if v, ok := typed["value"].(string); ok {
+					prop.Value = v
+				}
+				if v, ok := typed["source"].(string); ok {
+					prop.Source = v
+				}
+				ds.UserProperties[key] = prop
+			case string:
+				ds.UserProperties[key] = UserProperty{Value: typed}
+			}
+		}
+	}
+
+	return ds, nil
 }
 
 // DatasetHasDependentClones reports whether any dataset in the same CSI parent was

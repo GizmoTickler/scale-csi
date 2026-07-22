@@ -586,7 +586,33 @@ func reconcileAge(now time.Time, creationUnix int64, minAge time.Duration) (time
 	return createdAt, age, age > minAge
 }
 
+// listAllManagedDatasets returns every CSI-managed dataset below the configured
+// parent. On TrueNAS 26.0 it prefers the path-scoped zfs.resource.query read
+// (DatasetQueryByParent), which avoids pool.dataset.query's full-system
+// user-property materialization, and filters the managed_resource user property
+// client-side. If the resource API is unavailable OR the call errors, it falls
+// back to the paginated pool.dataset.query loop so reconciliation never fails on
+// the migration. See the LIVE-PROBE GATE on DatasetQueryByParent: the resource
+// shape is modeled, not yet live-verified, and this fallback is what makes the
+// migration safe to ship behind detection.
 func (d *Driver) listAllManagedDatasets(ctx context.Context) ([]*truenas.Dataset, error) {
+	resourceDatasets, err := d.truenasClient.DatasetQueryByParent(ctx, d.config.ZFS.DatasetParentName)
+	if err == nil {
+		managed := make([]*truenas.Dataset, 0, len(resourceDatasets))
+		for _, ds := range resourceDatasets {
+			if datasetUserProperty(ds, PropManagedResource) == "true" {
+				managed = append(managed, ds)
+			}
+		}
+		return managed, nil
+	}
+	klog.Warningf("Managed-dataset listing via zfs.resource.query failed; falling back to pool.dataset.query: %v", err)
+	return d.listAllManagedDatasetsPaged(ctx)
+}
+
+// listAllManagedDatasetsPaged is the legacy paginated pool.dataset.query path,
+// retained as the safe fallback for listAllManagedDatasets.
+func (d *Driver) listAllManagedDatasetsPaged(ctx context.Context) ([]*truenas.Dataset, error) {
 	var datasets []*truenas.Dataset
 	for offset := 0; ; offset += reconcileListPageSize {
 		page, err := d.truenasClient.DatasetList(ctx, d.config.ZFS.DatasetParentName, reconcileListPageSize, offset)

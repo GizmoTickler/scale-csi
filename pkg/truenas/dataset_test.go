@@ -2063,3 +2063,153 @@ func TestDatasetPropertyStringPrefersTrueCase(t *testing.T) {
 		t.Fatalf("rawvalue fallback broken: %q", got)
 	}
 }
+
+// TestDatasetResourceQueryTrueNAS26ShapeAndDetectionCache exercises the modeled
+// TrueNAS 26.0 zfs.resource.query dataset read: a path-scoped response carrying
+// properties + user-properties (with source) + origin in one call. It pins the
+// request options, the parsed name/properties/user-property-source/origin, and
+// that the detection probe is cached (called once across repeated queries).
+func TestDatasetResourceQueryTrueNAS26ShapeAndDetectionCache(t *testing.T) {
+	mock := newMockWSServer()
+	var probeCalls atomic.Int32
+	var queryCalls atomic.Int32
+	optionsSeen := make(chan map[string]interface{}, 4)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case datasetResourceQueryMethod:
+				options := req.Params[0].(map[string]interface{})
+				paths := options["paths"].([]interface{})
+				if len(paths) == 0 {
+					probeCalls.Add(1)
+					resp.Result = []interface{}{}
+					break
+				}
+				queryCalls.Add(1)
+				optionsSeen <- options
+				resp.Result = []interface{}{
+					// Managed volume: managed_resource=true source=local, with origin.
+					map[string]interface{}{
+						"name": "tank/k8s/volumes/pvc-managed",
+						"pool": "tank",
+						"type": "VOLUME",
+						"properties": map[string]interface{}{
+							"used":      map[string]interface{}{"parsed": float64(4096), "value": "4K", "rawvalue": "4096", "source": "LOCAL"},
+							"volsize":   map[string]interface{}{"parsed": float64(1073741824), "rawvalue": "1073741824", "source": "LOCAL"},
+							"available": map[string]interface{}{"parsed": float64(999999), "rawvalue": "999999"},
+							"origin": map[string]interface{}{
+								"value":    "tank/k8s/volumes/source@snap-1",
+								"parsed":   "tank/k8s/volumes/source@snap-1",
+								"rawvalue": "tank/k8s/volumes/source@snap-1",
+								"source":   "NONE",
+							},
+						},
+						"user_properties": map[string]interface{}{
+							"truenas-csi:managed_resource": map[string]interface{}{"value": "true", "source": "local"},
+						},
+					},
+					// Plain volume: no managed_resource user property.
+					map[string]interface{}{
+						"name":            "tank/k8s/volumes/pvc-plain",
+						"pool":            "tank",
+						"type":            "VOLUME",
+						"properties":      map[string]interface{}{},
+						"user_properties": map[string]interface{}{},
+					},
+					// Foreign dataset: managed_resource present but inherited (not local).
+					map[string]interface{}{
+						"name":       "tank/k8s/volumes/pvc-foreign",
+						"pool":       "tank",
+						"type":       "FILESYSTEM",
+						"properties": map[string]interface{}{},
+						"user_properties": map[string]interface{}{
+							"truenas-csi:managed_resource": map[string]interface{}{"value": "true", "source": "inherited"},
+						},
+					},
+				}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	var datasets []*Dataset
+	for range 2 {
+		var err error
+		datasets, err = client.DatasetQueryByParent(context.Background(), "tank/k8s/volumes/")
+		require.NoError(t, err)
+		require.Len(t, datasets, 3)
+	}
+
+	byName := make(map[string]*Dataset, len(datasets))
+	for _, ds := range datasets {
+		byName[ds.Name] = ds
+	}
+
+	managed := byName["tank/k8s/volumes/pvc-managed"]
+	require.NotNil(t, managed)
+	assert.True(t, managed.ResourceQuery)
+	assert.Equal(t, "tank/k8s/volumes/pvc-managed", managed.ID)
+	assert.Equal(t, "tank", managed.Pool)
+	assert.Equal(t, "VOLUME", managed.Type)
+	assert.Equal(t, int64(4096), managed.GetUsedBytes())
+	assert.Equal(t, int64(1073741824), int64(managed.Volsize.Parsed.(float64)))
+	// user-property source must survive the read.
+	assert.Equal(t, "true", managed.UserProperties["truenas-csi:managed_resource"].Value)
+	assert.Equal(t, "local", managed.UserProperties["truenas-csi:managed_resource"].Source)
+	// origin parsed from the nested properties map, true-case preserved.
+	assert.Equal(t, "tank/k8s/volumes/source@snap-1", datasetPropertyString(managed.Origin))
+
+	plain := byName["tank/k8s/volumes/pvc-plain"]
+	require.NotNil(t, plain)
+	_, hasManaged := plain.UserProperties["truenas-csi:managed_resource"]
+	assert.False(t, hasManaged)
+
+	foreign := byName["tank/k8s/volumes/pvc-foreign"]
+	require.NotNil(t, foreign)
+	assert.Equal(t, "inherited", foreign.UserProperties["truenas-csi:managed_resource"].Source)
+
+	// Detection probe is cached: one probe across two queries.
+	assert.Equal(t, int32(1), probeCalls.Load())
+	assert.Equal(t, int32(2), queryCalls.Load())
+
+	// Request options are path-scoped with children + user-properties + source.
+	for range 2 {
+		options := <-optionsSeen
+		assert.Equal(t, []interface{}{"tank/k8s/volumes"}, options["paths"])
+		assert.Equal(t, true, options["get_children"])
+		assert.Equal(t, true, options["get_user_properties"])
+		assert.Equal(t, true, options["get_source"])
+	}
+}
+
+// TestParseDatasetResourceFlatUserPropertiesDegradeSource verifies the defensive
+// flat user-property form (key -> "value" string, as the snapshot resource API
+// flattens) parses with an empty source so datasetHasLocalUserProperty callers
+// fail safe rather than misreporting local.
+func TestParseDatasetResourceFlatUserPropertiesDegradeSource(t *testing.T) {
+	ds, err := parseDatasetResource(map[string]interface{}{
+		"name":       "tank/k8s/volumes/pvc-flat",
+		"pool":       "tank",
+		"type":       "VOLUME",
+		"properties": map[string]interface{}{},
+		"user_properties": map[string]interface{}{
+			"truenas-csi:managed_resource": "true",
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "true", ds.UserProperties["truenas-csi:managed_resource"].Value)
+	assert.Equal(t, "", ds.UserProperties["truenas-csi:managed_resource"].Source)
+}

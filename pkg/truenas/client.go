@@ -396,6 +396,17 @@ type Client struct {
 	snapshotResourceDetected  bool
 	snapshotResourceProbeDone chan struct{}
 
+	// TrueNAS 26.0 introduced zfs.resource.query, a path-scoped dataset read API
+	// that returns properties + user-properties + source + origin in one call.
+	// It replaces pool.dataset.query for managed-dataset listing (the scale
+	// lever: pool.dataset.query materializes user-properties for EVERY dataset
+	// on the box). Detection is kept separate from mutations, which remain under
+	// pool.dataset.*.
+	datasetResourceMu        sync.Mutex
+	datasetResourceAvailable bool
+	datasetResourceDetected  bool
+	datasetResourceProbeDone chan struct{}
+
 	// Snapshot create-property support is probed independently for each mutation
 	// API generation. The mutex also serializes the first probe so concurrent
 	// creates do not all retry a rejected payload shape.

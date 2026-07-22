@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strconv"
 	"testing"
@@ -1210,4 +1211,84 @@ func TestOrphanShareSweepSkipsShareBackedByLivePV(t *testing.T) {
 	d.detectOrphanedShares(ctx, kubeState, &report)
 
 	assert.Empty(t, report.OrphanShares, "a share backed by a live PV must never be classified as orphaned")
+}
+
+// managedDatasetListingClient wraps MockClient to observe which read path
+// listAllManagedDatasets takes (zfs.resource.query vs the pool.dataset.query
+// fallback) and to optionally force the resource path to fail.
+type managedDatasetListingClient struct {
+	*truenas.MockClient
+	resourceQueryCalls int
+	datasetListCalls   int
+	failResourceQuery  bool
+}
+
+func (c *managedDatasetListingClient) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*truenas.Dataset, error) {
+	c.resourceQueryCalls++
+	if c.failResourceQuery {
+		return nil, fmt.Errorf("zfs.resource.query unavailable")
+	}
+	return c.MockClient.DatasetQueryByParent(ctx, parentDataset)
+}
+
+func (c *managedDatasetListingClient) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*truenas.Dataset, error) {
+	c.datasetListCalls++
+	return c.MockClient.DatasetList(ctx, parentName, limit, offset)
+}
+
+func seedManagedDatasetListingFixtures(client *truenas.MockClient) {
+	client.Datasets["pool/parent/vol-managed"] = &truenas.Dataset{
+		Name: "pool/parent/vol-managed", Pool: "pool", Type: "VOLUME",
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource: {Value: "true", Source: "local"},
+		},
+	}
+	client.Datasets["pool/parent/vol-plain"] = &truenas.Dataset{
+		Name: "pool/parent/vol-plain", Pool: "pool", Type: "VOLUME",
+		UserProperties: map[string]truenas.UserProperty{},
+	}
+	client.Datasets["pool/parent/vol-disabled"] = &truenas.Dataset{
+		Name: "pool/parent/vol-disabled", Pool: "pool", Type: "VOLUME",
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource: {Value: "false", Source: "local"},
+		},
+	}
+}
+
+func managedDatasetNames(datasets []*truenas.Dataset) []string {
+	names := make([]string, 0, len(datasets))
+	for _, ds := range datasets {
+		names = append(names, ds.Name)
+	}
+	return names
+}
+
+// TestListAllManagedDatasetsUsesResourceQuery proves that when zfs.resource.query
+// is available, listAllManagedDatasets reads through DatasetQueryByParent once
+// (no paginated pool.dataset.query) and filters to managed_resource=="true".
+func TestListAllManagedDatasetsUsesResourceQuery(t *testing.T) {
+	client := &managedDatasetListingClient{MockClient: truenas.NewMockClient()}
+	seedManagedDatasetListingFixtures(client.MockClient)
+	d := newComplianceTestDriver(client)
+
+	datasets, err := d.listAllManagedDatasets(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pool/parent/vol-managed"}, managedDatasetNames(datasets))
+	assert.Equal(t, 1, client.resourceQueryCalls)
+	assert.Equal(t, 0, client.datasetListCalls, "resource path must not page pool.dataset.query")
+}
+
+// TestListAllManagedDatasetsFallsBackToDatasetList proves the safe fallback: when
+// the resource query errors, listAllManagedDatasets still returns the managed
+// datasets via the paginated pool.dataset.query path instead of failing.
+func TestListAllManagedDatasetsFallsBackToDatasetList(t *testing.T) {
+	client := &managedDatasetListingClient{MockClient: truenas.NewMockClient(), failResourceQuery: true}
+	seedManagedDatasetListingFixtures(client.MockClient)
+	d := newComplianceTestDriver(client)
+
+	datasets, err := d.listAllManagedDatasets(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pool/parent/vol-managed"}, managedDatasetNames(datasets))
+	assert.Equal(t, 1, client.resourceQueryCalls)
+	assert.GreaterOrEqual(t, client.datasetListCalls, 1, "fallback must page pool.dataset.query")
 }

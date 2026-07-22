@@ -24,6 +24,7 @@ type ClientInterface interface {
 	DatasetGet(ctx context.Context, name string) (*Dataset, error)
 	DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error)
 	DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error)
+	DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*Dataset, error)
 	DatasetSetUserProperty(ctx context.Context, name, key, value string) error
 	DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error
 	DatasetRemoveUserProperties(ctx context.Context, name string, keys []string) error

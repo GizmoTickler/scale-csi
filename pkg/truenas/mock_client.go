@@ -430,6 +430,30 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 	return list[offset:end], nil
 }
 
+// DatasetQueryByParent mirrors the real zfs.resource.query path: it returns ALL
+// datasets stored under parentDataset (no managed_resource filter), letting the
+// driver apply the same client-side managed_resource filter it uses against the
+// real client.
+func (m *MockClient) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*Dataset, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+
+	parent := strings.TrimSuffix(parentDataset, "/")
+	var list []*Dataset
+	for _, ds := range m.Datasets {
+		if parent != "" && !strings.HasPrefix(ds.Name, parent+"/") {
+			continue
+		}
+		list = append(list, mockDatasetResponse(ds, false))
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	return list, nil
+}
+
 func (m *MockClient) DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

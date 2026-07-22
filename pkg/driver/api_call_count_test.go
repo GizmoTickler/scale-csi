@@ -109,6 +109,11 @@ func (c *apiCallCountingClient) DatasetList(ctx context.Context, parentName stri
 	return c.MockClient.DatasetList(ctx, parentName, limit, offset)
 }
 
+func (c *apiCallCountingClient) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*truenas.Dataset, error) {
+	c.record("DatasetQueryByParent")
+	return c.MockClient.DatasetQueryByParent(ctx, parentDataset)
+}
+
 func (c *apiCallCountingClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	c.record("DatasetSetUserProperty")
 	return c.MockClient.DatasetSetUserProperty(ctx, name, key, value)
