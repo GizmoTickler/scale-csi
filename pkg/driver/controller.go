@@ -2485,41 +2485,10 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 		}
 	}
 
-	switch shareType {
-	case ShareTypeNFS:
-		volumeContext["server"] = d.config.NFS.ShareHost
-		volumeContext["share"] = ds.Mountpoint
-
-	case ShareTypeISCSI:
-		target, err := d.resolveISCSITarget(ctx, ds, datasetName)
-		if err != nil || target == nil {
-			return nil, status.Errorf(codes.Internal, "failed to resolve iSCSI target for %s: %v", datasetName, err)
+	if backend := backendForShareType(d, shareType); backend != nil {
+		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext); err != nil {
+			return nil, err
 		}
-		globalCfg, err := d.truenasClient.ISCSIGlobalConfigGet(ctx)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to get iSCSI global config: %v", err)
-		}
-		volumeContext["iqn"] = fmt.Sprintf("%s:%s", globalCfg.Basename, target.Name)
-		volumeContext["portal"] = d.config.ISCSI.TargetPortal
-		volumeContext["lun"] = "0"
-		volumeContext["interface"] = d.config.ISCSI.Interface
-
-	case ShareTypeNVMeoF:
-		namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to resolve NVMe-oF namespace: %v", err)
-		}
-		subsys, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
-		if err != nil || subsys == nil {
-			return nil, status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem for %s: %v", datasetName, err)
-		}
-		if namespace == nil || namespace.SubsystemID != subsys.ID {
-			return nil, status.Errorf(codes.Internal, "NVMe-oF namespace for %s is missing or references a different subsystem", datasetName)
-		}
-		volumeContext["nqn"] = subsys.NQN
-		volumeContext["transport"] = d.config.NVMeoF.Transport
-		volumeContext["address"] = d.config.NVMeoF.TransportAddress
-		volumeContext["port"] = strconv.Itoa(d.config.NVMeoF.TransportServiceID)
 	}
 
 	return volumeContext, nil

@@ -1063,18 +1063,11 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 		}
 		enforceable = append(enforceable, identity)
 	}
-	switch shareType {
-	case ShareTypeNFS:
-		return d.applyNFSFence(ctx, ds, datasetName, enforceable, ownedNFSHosts, uniqueSortedStrings(protectedNFSHosts))
-	case ShareTypeISCSI:
-		return d.applyISCSIFence(ctx, ds, datasetName, enforceable)
-	case ShareTypeNVMeoF:
-		return d.applyNVMeFence(
-			ctx, ds, datasetName, enforceable, removing, ownedNVMeNQNs, uniqueSortedStrings(protectedNVMeNQNs),
-		)
-	default:
+	backend := backendForShareType(d, shareType)
+	if backend == nil {
 		return fmt.Errorf("unsupported share type %q", shareType)
 	}
+	return backend.ApplyFence(ctx, ds, datasetName, enforceable, removing, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs)
 }
 
 func uniqueSortedStrings(values []string) []string {
