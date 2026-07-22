@@ -12,36 +12,41 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   lint:
+    name: Go Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
           cache: true
       - name: Run go vet
         run: go vet ./...
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.12.2
 
   test:
+    name: Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
           cache: true
       - name: Run tests with coverage
-        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+        run: go test -v -race -short -coverprofile=coverage.out -covermode=atomic ./...
       - name: Check coverage threshold
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
@@ -54,7 +59,7 @@ jobs:
       - name: Generate coverage report
         run: go tool cover -func=coverage.out
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
           files: ./coverage.out
           flags: unittests
@@ -64,79 +69,168 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  build:
+  csi-sanity:
+    name: CSI Sanity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: "go.mod"
+          cache: true
+      - name: Run the official CSI conformance suite
+        run: go test -v -race -count=1 -run '^TestCSISanity$' ./pkg/driver
+
+  govulncheck:
+    name: Go Vulnerability Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
+          cache: true
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  codeql:
+    name: CodeQL (Go)
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: "go.mod"
+          cache: true
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4
+        with:
+          languages: go
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4
+      - name: Analyze
+        uses: github/codeql-action/analyze@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4
+        with:
+          category: /language:go
+
+  build:
+    name: Build Binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: "go.mod"
           cache: true
       - name: Build
-        run: |
-          CGO_ENABLED=0 go build -o scale-csi ./cmd/scale-csi
+        run: CGO_ENABLED=0 go build -o scale-csi ./cmd/scale-csi
       - name: Verify binary
-        run: ./scale-csi --help || true
+        run: ./scale-csi --help
 
   helm-lint:
     name: Helm Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.21.3
       - name: Lint Helm chart
-        run: helm lint charts/scale-csi/
-      - name: Template Helm chart
+        run: helm lint --strict charts/scale-csi/
+      - name: Template every protocol and controller mode
         run: |
           helm template scale-csi charts/scale-csi/ \
             --set truenas.host=test.local \
-            --set truenas.apiKey=test-key \
+            --set truenas.existingSecret=test-secret \
             --set zfs.parentDataset=tank/test \
-            --debug > /dev/null
+            --set nfs.enabled=true \
+            --set iscsi.enabled=false \
+            --set nvmeof.enabled=false >/dev/null
+          helm template scale-csi charts/scale-csi/ \
+            --set truenas.host=test.local \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=tank/test \
+            --set nfs.enabled=false \
+            --set iscsi.enabled=true \
+            --set nvmeof.enabled=false >/dev/null
+          helm template scale-csi charts/scale-csi/ \
+            --set truenas.host=test.local \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=tank/test \
+            --set nfs.enabled=false \
+            --set iscsi.enabled=false \
+            --set nvmeof.enabled=true \
+            --set nvmeof.subsystemAllowAnyHost=true >/dev/null
+          helm template scale-csi charts/scale-csi/ \
+            --set truenas.host=test.local \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=tank/test \
+            --set controller.replicas=2 \
+            --set fencing.mode=off >/dev/null
+          helm template scale-csi charts/scale-csi/ \
+            --set truenas.host=test.local \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=tank/test \
+            --set controller.replicas=1 \
+            --set fencing.mode=strict >/dev/null
       - name: Validate Kubernetes manifests
-        uses: stackrox/kube-linter-action@v1
+        uses: stackrox/kube-linter-action@87802a2f4e01abebb3ee3c67a3002fea71f6eae5 # v1
         with:
           directory: charts/scale-csi/
           config: .kube-linter.yaml
 
   docker-build:
+    name: Container Build
     runs-on: ubuntu-latest
-    needs: [lint, test, build, helm-lint]
+    needs: [lint, test, csi-sanity, govulncheck, build, helm-lint]
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build-image.outputs.digest }}
+      image: ${{ steps.image.outputs.name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata for Docker
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=semver,pattern=v{{version}}
             type=semver,pattern=v{{major}}.{{minor}}
             type=semver,pattern=v{{major}}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v7
+        id: build-image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -151,18 +245,71 @@ jobs:
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
 
-  release:
+  sign-image:
+    name: Sign Release Image
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
-    needs: [docker-build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Sign only after the Trivy gate passes so a scan-rejected image is never
+    # left signed. docker-build is implied through trivy but kept explicit.
+    needs: [docker-build, trivy]
     permissions:
-      contents: write
+      contents: read
+      id-token: write
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - name: Log in to Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Keyless-sign the pushed manifest
+        env:
+          IMAGE: ${{ needs.docker-build.outputs.image }}
+          DIGEST: ${{ needs.docker-build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
+  trivy:
+    name: Trivy Release Image
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Log in to Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Scan the pushed manifest
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ needs.docker-build.outputs.image }}@${{ needs.docker-build.outputs.digest }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: false
+          trivyignores: .trivyignore
+          timeout: 15m
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    # trivy is satisfied transitively through sign-image.
+    needs: [sign-image]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Create Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           generate_release_notes: true
           draft: false

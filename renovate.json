@@ -1,6 +1,32 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^charts\\/scale-csi\\/values\\.yaml$/"
+      ],
+      "matchStrings": [
+        "image:\\s+(?<depName>registry\\.k8s\\.io/sig-storage/[a-z0-9-]+):(?<currentValue>v?[^\\s]+)"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Keep the operator-overridable CSI sidecar defaults current as one reviewed batch",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "groupName": "CSI sidecar images"
+    }
   ]
 }

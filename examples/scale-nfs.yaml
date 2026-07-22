@@ -1,65 +1,39 @@
-# TrueNAS SCALE 25.04+ NFS Driver Configuration
-# Uses WebSocket JSON-RPC 2.0 API (no SSH required)
+# Complete strict driver configuration for an NFS-only instance.
+# Export TRUENAS_API_KEY before starting scale-csi.
+driver: csi.scale.io
+driverInstanceId: csi.scale.io@tank/k8s/nfs
 
-driver: scale-nfs
-driverInstanceId:
 fencing:
   mode: "off"
   startupReconcileTimeout: 10m
   staleRecordGracePeriod: 10m
 
-# WebSocket connection to TrueNAS SCALE 25.04+
-httpConnection:
+truenas:
   protocol: https
   host: truenas.example.com
   port: 443
+  apiKey: $TRUENAS_API_KEY
+  allowInsecure: false
+  requestTimeout: 60
+  connectTimeout: 10
+  writeTimeout: 30
+  maxConcurrentRequests: 10
 
-  # Use API key for authentication (recommended)
-  # Generate API key in TrueNAS UI: Settings -> API Keys
-  apiKey: 1-xxxxxxxxxxxxxxxxxxxxx
-
-  # OR use username/password (less secure)
-  #username: root
-  #password: your-password
-
-  # Allow self-signed certificates (not recommended for production)
-  allowInsecure: true
-
-# ZFS dataset configuration
 zfs:
-  # Parent dataset for volumes
-  datasetParentName: tank/k8s/volumes
-
-  # Enable quotas on datasets (recommended for NFS)
+  datasetParentName: tank/k8s/nfs
   datasetEnableQuotas: true
-
-  # Enable reservations (not recommended - wastes space)
   datasetEnableReservation: false
+  datasetProperties:
+    compression: zstd
+  destroyForeignSnapshotsOnDelete: false
 
-  # Default permissions
-  datasetPermissionsMode: "0777"
-  datasetPermissionsUser: 0
-  datasetPermissionsGroup: 0
-
-  # Set custom ZFS properties using Handlebars templates
-  #datasetProperties:
-  #  "org.truenas:description": "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}/{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
-  #  "org.truenas:pvc-name": "{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
-
-# NFS share configuration
 nfs:
   enabled: true
-  # NFS server hostname/IP (should match TrueNAS system)
   shareHost: truenas.example.com
-
-  # Custom share comment template
-  #shareCommentTemplate: "{{ parameters.[csi.storage.k8s.io/pvc/namespace] }}-{{ parameters.[csi.storage.k8s.io/pvc/name] }}"
-
-  # NFS export options
+  # Restrict this to the Kubernetes node CIDRs in production.
+  shareAllowedNetworks:
+    - 10.42.0.0/16
   shareAllowedHosts: []
-  shareAllowedNetworks: []
-
-  # User/group mapping (root squashing)
   shareMaprootUser: root
   shareMaprootGroup: wheel
   shareMapallUser: ""

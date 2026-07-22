@@ -455,3 +455,18 @@ iscsi:
 	assert.Contains(t, warning, "iscsi.targetPortals")
 	assert.Contains(t, warning, "does not currently support iSCSI multipath")
 }
+
+func TestRepositoryExampleConfigsParseStrictly(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "examples", "*.yaml"))
+	require.NoError(t, err)
+	require.Len(t, paths, 3, "examples must contain only the three complete protocol configs")
+
+	for _, path := range paths {
+		path := path
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg, loadErr := LoadConfig(path)
+			require.NoError(t, loadErr)
+			assert.Equal(t, 1, cfg.enabledShareTypeCount())
+		})
+	}
+}

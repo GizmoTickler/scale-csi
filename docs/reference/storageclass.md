@@ -1,16 +1,33 @@
-# StorageClass Configuration Reference
+# StorageClass reference
 
-This document provides a complete reference for configuring StorageClasses with the Scale CSI driver.
+All protocols use the unified provisioner `csi.scale.io`.
 
-## Quick Reference
+| `protocol` | Access modes | Volume modes |
+|---|---|---|
+| `nfs` | RWO, ROX, RWX | Filesystem |
+| `iscsi` | RWO | Filesystem, Block |
+| `nvmeof` | RWO | Filesystem, Block |
 
-| Protocol | Provisioner | Access Modes | Volume Mode |
-|----------|-------------|--------------|-------------|
-| NFS | `csi.scale.io` | RWO, ROX, RWX | Filesystem |
-| iSCSI | `csi.scale.io` | RWO | Block, Filesystem |
-| NVMe-oF | `csi.scale.io` | RWO | Block, Filesystem |
+## Parameters the driver understands
 
-## Basic StorageClass Structure
+| Parameter | Meaning | Required |
+|---|---|---|
+| `protocol` | `nfs`, `iscsi`, or `nvmeof` | Yes when more than one protocol is enabled |
+| `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
+
+`protocol` is the only scale-csi-specific ordinary parameter. A multi-protocol
+driver returns `InvalidArgument` when it is absent; it no longer silently
+chooses NFS. A single-protocol legacy deployment may omit it and uses its sole
+enabled protocol.
+
+ZFS properties, TrueNAS endpoints, and protocol service settings belong in the
+driver configuration/Helm values. The driver ignores ad-hoc StorageClass
+parameters such as `dataset_recordsize`, `dataset_compression`,
+`zvol_volblocksize`, `zvol_compression`, `mountOptions`, and `fsType`.
+`mountOptions` is a top-level StorageClass list, and the standardized filesystem
+key is `csi.storage.k8s.io/fstype`.
+
+## NFS
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -19,68 +36,35 @@ metadata:
   name: scale-nfs
 provisioner: csi.scale.io
 parameters:
-  # Protocol-specific parameters here
-reclaimPolicy: Delete
-allowVolumeExpansion: true
-volumeBindingMode: Immediate
-```
-
-## Common Parameters
-
-These parameters apply to all storage protocols:
-
-| Parameter | Description | Default | Required |
-|-----------|-------------|---------|----------|
-| `csi.storage.k8s.io/fstype` | Filesystem type for block volumes (ext4, xfs) | ext4 | No |
-
-## NFS Parameters
-
-NFS is the recommended protocol for shared storage workloads.
-
-### StorageClass Example
-
-```yaml
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: scale-nfs
-provisioner: csi.scale.io
-parameters: {}
+  protocol: nfs
 mountOptions:
   - nfsvers=4
   - noatime
-  - rsize=1048576
-  - wsize=1048576
+  - hard
 reclaimPolicy: Delete
 allowVolumeExpansion: true
 volumeBindingMode: Immediate
 ```
 
-### Mount Options
+NFS supports `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`. Use hard
+mount semantics for persistent data; soft mounts can surface application-visible
+I/O errors during a transient server outage.
 
-Common NFS mount options:
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-media
+spec:
+  storageClassName: scale-nfs
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Ti
+```
 
-| Option | Description | Recommendation |
-|--------|-------------|----------------|
-| `nfsvers=4` | Use NFSv4 protocol | Recommended |
-| `noatime` | Don't update access times | Reduces I/O |
-| `rsize=1048576` | Read buffer size (1MB) | Performance |
-| `wsize=1048576` | Write buffer size (1MB) | Performance |
-| `hard` | Retry operations indefinitely | Data safety |
-| `soft` | Fail operations after timeout | Responsive |
-
-### Access Modes
-
-NFS supports all access modes:
-- `ReadWriteOnce` (RWO) - Single node read/write
-- `ReadOnlyMany` (ROX) - Multiple nodes read-only
-- `ReadWriteMany` (RWX) - Multiple nodes read/write
-
-## iSCSI Parameters
-
-iSCSI is recommended for block storage workloads requiring low latency.
-
-### StorageClass Example
+## iSCSI
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -89,37 +73,36 @@ metadata:
   name: scale-iscsi
 provisioner: csi.scale.io
 parameters:
+  protocol: iscsi
   csi.storage.k8s.io/fstype: ext4
 reclaimPolicy: Delete
 allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer
 ```
 
-### Volume Modes
+Filesystem-mode claim:
 
-iSCSI supports both volume modes:
-
-**Filesystem Mode** (default):
 ```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: my-pvc
+  name: database-filesystem
 spec:
   storageClassName: scale-iscsi
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
+      storage: 100Gi
 ```
 
-**Block Mode** (raw device):
+Raw-block claim:
+
 ```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: my-block-pvc
+  name: database-block
 spec:
   storageClassName: scale-iscsi
   volumeMode: Block
@@ -127,19 +110,14 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
+      storage: 100Gi
 ```
 
-### Access Modes
+iSCSI is single-path. CHAP and dm-multipath are unsupported; protect TCP 3260
+with node-only network policy outside Kubernetes (for example a storage VLAN
+and firewall/SGACL rules).
 
-iSCSI supports:
-- `ReadWriteOnce` (RWO) - Single node read/write
-
-## NVMe-oF Parameters
-
-NVMe-oF provides the lowest latency for performance-critical workloads.
-
-### StorageClass Example
+## NVMe-oF
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -148,143 +126,66 @@ metadata:
   name: scale-nvmeof
 provisioner: csi.scale.io
 parameters:
+  protocol: nvmeof
   csi.storage.k8s.io/fstype: xfs
 reclaimPolicy: Delete
 allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer
 ```
 
-### Prerequisites
+NVMe-oF requires TrueNAS SCALE 25.10+, `nvme-cli`, and the selected transport's
+kernel modules on every eligible node. Set `nvmeof.subsystemHosts` or deliberately
+choose `nvmeof.subsystemAllowAnyHost: true` when fencing is off.
 
-- TrueNAS SCALE 25.10+
-- `nvme-cli` package installed on nodes
-- NVMe-oF kernel modules loaded (`nvme-tcp` or `nvme-rdma`)
+## Policies and binding
 
-### Access Modes
+| Field | Options | Notes |
+|---|---|---|
+| `reclaimPolicy` | `Delete`, `Retain` | `Retain` preserves the backend object after PVC/PV release |
+| `allowVolumeExpansion` | `true`, `false` | Online behavior depends on protocol, filesystem, and workload |
+| `volumeBindingMode` | `Immediate`, `WaitForFirstConsumer` | The latter delays provisioning until scheduling |
 
-NVMe-oF supports:
-- `ReadWriteOnce` (RWO) - Single node read/write
+The bundled chart does not expose controller topology configuration. Do not use
+`allowedTopologies` as a scale-csi backend-routing guarantee; see the
+[topology guide](../guides/topology.md).
 
-## Volume Binding Modes
+## Upgrade: add `protocol` safely
 
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `Immediate` | Provision immediately when PVC created | General use |
-| `WaitForFirstConsumer` | Provision when pod scheduled | Topology-aware |
-
-**Recommendation**: Use `WaitForFirstConsumer` for iSCSI/NVMe-oF to ensure volumes are created on accessible storage.
-
-## Reclaim Policies
-
-| Policy | Description | Use Case |
-|--------|-------------|----------|
-| `Delete` | Delete volume when PVC deleted | Non-persistent data |
-| `Retain` | Keep volume after PVC deleted | Critical data |
-
-## Example Configurations
-
-### High-Performance Database
+Kubernetes treats StorageClass `parameters` as immutable. An in-place patch to
+add `protocol` will be rejected. Create a replacement class, update workload
+manifests, and then retire the old name deliberately:
 
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: scale-db-fast
+  name: scale-nfs-v2
 provisioner: csi.scale.io
 parameters:
-  csi.storage.k8s.io/fstype: xfs
-reclaimPolicy: Retain
-allowVolumeExpansion: true
-volumeBindingMode: WaitForFirstConsumer
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: postgres-data
-spec:
-  storageClassName: scale-db-fast
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 100Gi
-```
-
-### Shared Media Storage
-
-```yaml
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: scale-media
-provisioner: csi.scale.io
-parameters: {}
+  protocol: nfs
 mountOptions:
   - nfsvers=4
   - noatime
-reclaimPolicy: Retain
-allowVolumeExpansion: true
-volumeBindingMode: Immediate
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: media-library
-spec:
-  storageClassName: scale-media
-  accessModes:
-    - ReadWriteMany
-  resources:
-    requests:
-      storage: 1Ti
-```
-
-### Ephemeral Build Cache
-
-```yaml
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: scale-cache
-provisioner: csi.scale.io
-parameters: {}
-mountOptions:
-  - nfsvers=4
-  - noatime
-  - soft
-  - timeo=30
 reclaimPolicy: Delete
-allowVolumeExpansion: false
+allowVolumeExpansion: true
 volumeBindingMode: Immediate
 ```
+
+Existing bound PVs are not reprovisioned when application manifests start using
+the new class; only new claims select it. If the original class name must be
+preserved, delete and recreate that StorageClass only after every manifest and
+default-class transition has been planned.
 
 ## Troubleshooting
 
-### PVC Stuck in Pending
+```bash
+kubectl get storageclass
+kubectl describe pvc <claim>
+kubectl -n scale-csi logs deploy/scale-csi-controller -c csi-provisioner
+kubectl -n scale-csi logs deploy/scale-csi-controller -c scale-csi
+kubectl -n scale-csi logs daemonset/scale-csi-node -c scale-csi
+```
 
-1. Check provisioner logs:
-   ```bash
-   kubectl logs -n scale-csi deploy/scale-csi-controller -c csi-provisioner
-   ```
-
-2. Check driver logs:
-   ```bash
-   kubectl logs -n scale-csi deploy/scale-csi-controller -c scale-csi
-   ```
-
-3. Verify TrueNAS connectivity:
-   ```bash
-   kubectl exec -n scale-csi deploy/scale-csi-controller -c scale-csi -- \
-     cat /tmp/truenas-health
-   ```
-
-### Mount Failures
-
-1. Check node plugin logs:
-   ```bash
-   kubectl logs -n scale-csi ds/scale-csi-node -c scale-csi
-   ```
-
-2. Verify NFS/iSCSI services on TrueNAS are running
-
-3. Check network connectivity between node and TrueNAS
+An error saying `StorageClass parameter "protocol" is required` means the
+driver has multiple enabled protocol blocks and the class predates the explicit
+selection requirement. Follow the immutable-class migration above.

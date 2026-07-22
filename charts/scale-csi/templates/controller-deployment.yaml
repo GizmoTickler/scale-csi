@@ -9,7 +9,22 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   replicas: {{ .Values.controller.replicas }}
-  {{- if ne .Values.fencing.mode "off" }}
+  # Render an explicit strategy in BOTH fencing modes so Helm always owns the
+  # field. Off mode previously rendered no strategy block, so the API server
+  # defaulted RollingUpdate and Helm's three-way merge never managed it; the
+  # off -> additive upgrade then failed in production (2026-07-22) because the
+  # server-defaulted rollingUpdate residue made the Recreate strategy invalid.
+  {{- if eq .Values.fencing.mode "off" }}
+  # Off mode allows overlapping controllers during a rollout. RollingUpdate is
+  # the Kubernetes default, declared explicitly (with its default surge and
+  # unavailable) so the field is Helm-owned and the additive upgrade can replace
+  # it cleanly.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  {{- else }}
   # Fencing reconcilers are in-process singleton writers. Recreate prevents an
   # old and new controller pod from overlapping during a rollout.
   strategy:
@@ -50,14 +65,26 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.controller.affinity }}
+      {{- if .Values.controller.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.controller.affinity | nindent 8 }}
+      {{- else }}
+      {{- if gt (int .Values.controller.replicas) 1 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "scale-csi.controllerSelectorLabels" . | nindent 20 }}
+      {{- end }}
       {{- end }}
       containers:
         # CSI Driver
         - name: scale-csi
-          image: "{{ .Values.image.repository }}:{{ include "scale-csi.imageTag" . }}"
+          image: {{ include "scale-csi.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- with .Values.controller.containerSecurityContext }}
           securityContext:
@@ -127,6 +154,9 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.provisioner.timeout }}"
             - "--worker-threads={{ .Values.sidecars.provisioner.workerThreads }}"
+            # Leader election is always enabled, even at a single replica: a
+            # fencing-off RollingUpdate transiently runs two controller pods, and
+            # without LE both sidecars would act as active provisioner/attacher.
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"

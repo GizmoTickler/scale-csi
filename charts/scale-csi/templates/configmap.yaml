@@ -73,8 +73,6 @@ data:
       {{- $portal = printf "%s:%d" $portal (.Values.iscsi.portalPort | default 3260 | int) }}
       {{- end }}
       targetPortal: {{ $portal | quote }}
-      targetPortals:
-        {{- toYaml .Values.iscsi.targetPortals | nindent 8 }}
       interface: "default"
       {{- if .Values.iscsi.targetGroups }}
       # Static portal/initiator groups (install-specific TrueNAS database ids).

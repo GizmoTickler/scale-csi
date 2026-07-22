@@ -1,0 +1,10 @@
+# Trivy release-image vulnerability allowlist.
+#
+# The default is intentionally empty. Add one CVE or GHSA identifier per line
+# only after documenting the affected package, why remediation is not currently
+# possible, the approving maintainer, and an expiry/review date in adjacent
+# comments. Trivy still fails tag builds on every unlisted HIGH or CRITICAL
+# finding.
+#
+# Example (do not copy without a real review):
+# CVE-2099-0001  # package=x reason="no fixed version" owner=@maintainer expires=2099-02-01

@@ -16,11 +16,15 @@ A Kubernetes CSI driver purpose-built for TrueNAS SCALE. Unlike general-purpose 
 
 ## Supported Protocols
 
-| Driver | Protocol | Min Version | Use Case |
-|--------|----------|-------------|----------|
-| `scale-nfs` | NFS | 25.04+ | Shared filesystem access (ReadWriteMany) |
-| `scale-iscsi` | iSCSI | 25.04+ | Block storage with multipath support |
-| `scale-nvmeof` | NVMe-oF | 25.10+ | High-performance block storage |
+| StorageClass `protocol` | TrueNAS version | Use case |
+|---|---|---|
+| `nfs` | 25.04+ | Shared filesystem access (ReadWriteMany) |
+| `iscsi` | 25.04+ | Single-path block storage |
+| `nvmeof` | 25.10+ | High-performance block storage |
+
+All classes use the unified provisioner name `csi.scale.io`. A multi-protocol
+deployment requires the `protocol` StorageClass parameter so an omitted value
+cannot accidentally provision NFS.
 
 ## Quick Start
 
@@ -80,27 +84,20 @@ showmount --version
 <details>
 <summary><strong>iSCSI Client Setup</strong></summary>
 
-Block storage via iSCSI requires the initiator tools and optionally multipath for redundancy.
+Block storage via iSCSI requires the initiator tools. scale-csi currently uses
+one portal and refuses devices claimed by dm-multipath; do not enable multipath
+for its LUNs.
 
 **Debian/Ubuntu:**
 ```bash
 apt-get install -y open-iscsi
 systemctl enable --now iscsid
-
-# Optional: multipath for multiple portals
-apt-get install -y multipath-tools
-systemctl enable --now multipathd
 ```
 
 **RHEL/Fedora:**
 ```bash
 dnf install -y iscsi-initiator-utils
 systemctl enable --now iscsid
-
-# Optional: multipath for multiple portals
-dnf install -y device-mapper-multipath
-mpathconf --enable --with_multipathd y
-systemctl enable --now multipathd
 ```
 
 **Verification:**
@@ -108,6 +105,10 @@ systemctl enable --now multipathd
 iscsiadm --version
 cat /etc/iscsi/initiatorname.iscsi  # Should show iqn.* identifier
 ```
+
+The driver does not implement CHAP. Restrict TCP 3260 to the Kubernetes nodes
+on a dedicated storage network (for example, a storage VLAN plus firewall or
+SGACL policy).
 
 </details>
 
@@ -141,42 +142,20 @@ nvme version
 lsmod | grep nvme_tcp
 ```
 
-**Multipath Note:** NVMe supports native multipath (built into nvme-core) or device-mapper multipath. Check your current setting:
-```bash
-cat /sys/module/nvme_core/parameters/multipath  # Y = native, N = dm-multipath
-```
+The chart configures one NVMe-oF address and service ID. Multi-path NVMe-oF has
+not been validated as a scale-csi deployment mode.
 
 </details>
 
 <details>
 <summary><strong>Talos Linux</strong></summary>
 
-Talos requires system extensions since the base image is immutable.
-
-**For iSCSI**, add the extension to your machine config:
-```yaml
-machine:
-  install:
-    extensions:
-      - image: ghcr.io/siderolabs/iscsi-tools:v0.1.6
-```
-
-Then configure the CSI driver to use nsenter for host access:
-```yaml
-# values.yaml
-node:
-  hostPID: true
-  driver:
-    extraEnv:
-      - name: ISCSIADM_HOST_STRATEGY
-        value: nsenter
-      - name: ISCSIADM_HOST_PATH
-        value: /usr/local/sbin/iscsiadm
-    iscsiDirHostPath: /usr/local/etc/iscsi
-    iscsiDirHostPathType: ""
-```
-
-See [Talos System Extensions](https://www.talos.dev/latest/talos-guides/configuration/system-extensions/) for details.
+Talos is not currently a turnkey chart target. The node pod already sets
+`hostPID: true`, and the only supported environment override path is
+`node.extraEnv`; values such as `node.hostPID`, `node.driver.extraEnv`, and
+`node.iscsiDirHostPath` do not exist. The chart currently mounts the host's
+`/etc/iscsi` and `/var/lib/iscsi` paths directly, so validate tool and state-path
+compatibility on the exact Talos release before treating it as supported.
 
 </details>
 
@@ -199,13 +178,44 @@ deliberately disposable. To advertise a scheduler attach limit, set
 ### Resource sizing
 
 Steady-state use is approximately 15Mi memory and 1m CPU per driver container.
-The Helm chart defaults the controller and node driver requests to 10m CPU and
-32Mi memory, with no limits. If you configure CPU or memory limits, the Go
-runtime adapts `GOMAXPROCS` and `GOMEMLIMIT` from the container cgroups.
+The Helm chart defaults each driver container to requests of 10m CPU and 32Mi
+memory with a 256Mi memory limit. Each CSI sidecar requests 10m CPU and 32Mi
+memory with a 128Mi memory limit. All resource maps are overridable. The Go
+runtime adapts `GOMAXPROCS` and `GOMEMLIMIT` from the driver container cgroups.
 
 CSI liveness now reports driver-process health rather than TrueNAS reachability,
 so a NAS outage or slow reconnect does not cause a kubelet restart loop. Monitor
 `/readyz` or `scale_csi_truenas_connection_status` for backend availability.
+
+### Verify release signatures
+
+Tag builds keyless-sign the multi-architecture image, keyless-sign the OCI Helm
+chart, and attach an SLSA provenance attestation to the chart. Substitute the
+release being installed:
+
+```bash
+VERSION=vX.Y.Z
+IMAGE="ghcr.io/gizmotickler/scale-csi:${VERSION}"
+CHART="ghcr.io/gizmotickler/charts/scale-csi:${VERSION#v}"
+ISSUER="https://token.actions.githubusercontent.com"
+
+cosign verify \
+  --certificate-identity "https://github.com/GizmoTickler/scale-csi/.github/workflows/ci.yml@refs/tags/${VERSION}" \
+  --certificate-oidc-issuer "$ISSUER" \
+  "$IMAGE"
+cosign verify \
+  --certificate-identity "https://github.com/GizmoTickler/scale-csi/.github/workflows/helm-release.yml@refs/tags/${VERSION}" \
+  --certificate-oidc-issuer "$ISSUER" \
+  "$CHART"
+cosign verify-attestation \
+  --type slsaprovenance \
+  --certificate-identity "https://github.com/GizmoTickler/scale-csi/.github/workflows/helm-release.yml@refs/tags/${VERSION}" \
+  --certificate-oidc-issuer "$ISSUER" \
+  "$CHART"
+```
+
+Release-image Trivy scans fail on unallowlisted HIGH or CRITICAL findings. The
+documented exception ledger is [`.trivyignore`](.trivyignore).
 
 | Guide | Description |
 |-------|-------------|
@@ -215,6 +225,7 @@ so a NAS outage or slow reconnect does not cause a kubelet restart loop. Monitor
 | [Disaster recovery](docs/guides/disaster-recovery.md) | ZFS replication + export auto-recreation for cross-site failover |
 | [Topology](docs/guides/topology.md) | Zone/region-aware provisioning (advanced; single-backend usually doesn't need it) |
 | [Snapshots](docs/guides/snapshots.md) | Snapshot and clone/restore workflow |
+| [Next release notes](docs/release-notes-next.md) | Draft breaking changes and upgrade actions after v1.2.23 |
 
 ## Network Ports
 
@@ -223,9 +234,9 @@ Ensure these ports are accessible from your Kubernetes nodes to TrueNAS:
 | Service | Port | Required For |
 |---------|------|--------------|
 | HTTPS | 443 | WebSocket API (always required) |
-| NFS | 2049 | `scale-nfs` driver |
-| iSCSI | 3260 | `scale-iscsi` driver |
-| NVMe-TCP | 4420 | `scale-nvmeof` driver |
+| NFS | 2049 | NFS volumes |
+| iSCSI | 3260 | iSCSI volumes |
+| NVMe-TCP | 4420 | NVMe-oF volumes |
 
 ## License
 

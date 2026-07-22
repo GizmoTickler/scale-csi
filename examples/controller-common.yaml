@@ -1,6 +1,0 @@
-# common options for the controller service
-
-csi:
-  # manual override of the available access modes for the deployment
-  # generally highly uncessary to alter so only use in advanced scenarios
-  #access_modes: []

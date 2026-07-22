@@ -1,173 +1,190 @@
-# Nomad Support
+# Nomad support
 
-While `scale-csi` fully implements the CSI spec, Nomad currently supports the CSI in a limited capability. Nomad can utilize CSI volumes, but it can not automatically create, destroy, or manage them in any capacity. Volumes have to be created externally and then registered with Nomad. Once Nomad supports the full spec, all `scale-csi` features should work out of the box. However, these instructions can be used as a temporary solution.
+Nomad can run scale-csi as separate controller and node plugins. Current Nomad
+releases can dynamically create and register a CSI volume with `nomad volume
+create` when the plugin implements the Controller service; externally created
+volumes can still be added with `nomad volume register`.
 
-These instructions should work with any share type, but they have only been tested with NFS shares.
+This integration is community-level and has been exercised only with NFS. Test
+the exact Nomad, container runtime, protocol, and host-tool combination before
+production use.
 
-## Nomad Jobs
+## Driver contract
 
-`scale-csi` has to be deployed on Nomad as a set of jobs. The controller job runs as a single instance. The node job runs on every node and manages mounting the volume.
+The binary accepts these relevant flags:
 
-The following job files can be used as an example. Make sure to substitute the config from the [examples](/examples). __The example exposes the CSI gRPC interface! Please secure it in a production environment!__
+| Flag | Purpose |
+|---|---|
+| `-config=/path/config.yaml` | Strict driver YAML (required) |
+| `-endpoint=unix:///csi/csi.sock` | CSI gRPC endpoint |
+| `-node-id=<stable-id>` | Node identity (node mode) |
+| `-driver-name=csi.scale.io` | Unified CSI driver name |
+| `-mode=controller` or `-mode=node` | Service set |
+| `-health-port=9809` | Readiness/metrics port; `0` disables HTTP |
+| `-v=2` | klog verbosity |
+| `-version` | Print version and exit |
 
-`storage-controller.nomad`
+There are no `--csi-version`, `--csi-name`, `--driver-config-file`,
+`--log-level`, `--csi-mode`, `--server-address`, or `--server-port` flags. The
+plugin speaks over the Unix socket mounted by Nomad's `csi_plugin` block.
+
+Start from one complete strict config in [`examples/`](../examples). The same
+non-secret configuration must be available to controller and node tasks. Only
+the controller needs `TRUENAS_API_KEY`; inject it through Nomad Variables or
+Vault instead of embedding it in the job file.
+
+## Controller plugin job
+
+This job assumes the complete config is stored on clients at
+`/opt/scale-csi/config.yaml`. Replace the image tag with the release you
+verified.
+
 ```hcl
-job "storage-controller" {
+job "scale-csi-controller" {
   datacenters = ["dc1"]
   type        = "service"
 
   group "controller" {
-    network {
-      mode = "bridge"
+    count = 1
 
-      port "grpc" {
-        static = 9000
-        to     = 9000
-      }
-    }
-
-    task "controller" {
+    task "scale-csi" {
       driver = "docker"
 
       config {
-        image = "ghcr.io/gizmotickler/scale-csi:v2.1.0"
-        ports = ["grpc"]
-
+        image = "ghcr.io/gizmotickler/scale-csi:v1.2.23"
         args = [
-          "--csi-version=1.2.0",
-          "--csi-name=csi.scale.nfs",
-          "--driver-config-file=${NOMAD_TASK_DIR}/driver-config-file.yaml",
-          "--log-level=debug",
-          "--csi-mode=controller",
-          "--server-socket=/csi-data/csi.sock",
-          "--server-address=0.0.0.0",
-          "--server-port=9000",
+          "-config=/etc/scale-csi/config.yaml",
+          "-endpoint=unix:///csi/csi.sock",
+          "-driver-name=csi.scale.io",
+          "-mode=controller",
+          "-health-port=9809",
+          "-v=2",
         ]
+        volumes = [
+          "/opt/scale-csi/config.yaml:/etc/scale-csi/config.yaml:ro",
+        ]
+      }
 
-        privileged = true
+      # Supply this with a template { env = true } block backed by Nomad
+      # Variables or Vault in a real job.
+      env {
+        TRUENAS_API_KEY = "replace-through-a-secret-provider"
       }
 
       csi_plugin {
-        id        = "scale"
-        type      = "controller"
-        mount_dir = "/csi-data"
-      }
-
-      template {
-        destination = "${NOMAD_TASK_DIR}/driver-config-file.yaml"
-
-        data = <<EOH
-config
-EOH
+        id             = "scale-csi"
+        type           = "controller"
+        mount_dir      = "/csi"
+        health_timeout = "30s"
       }
 
       resources {
-        cpu    = 30
-        memory = 50
+        cpu    = 50
+        memory = 256
       }
     }
   }
 }
-
 ```
 
-`storage-node.nomad`
+## Node plugin job
+
+The node plugin must be privileged and able to see the host device, sysfs,
+udev, mount, and protocol state. Paths below match the Helm deployment and may
+need runtime-specific mount-propagation settings.
+
 ```hcl
-job "storage-node" {
+job "scale-csi-node" {
   datacenters = ["dc1"]
   type        = "system"
 
+  constraint {
+    operator = "distinct_hosts"
+    value    = true
+  }
+
   group "node" {
-    task "node" {
+    task "scale-csi" {
       driver = "docker"
 
       config {
-        image = "ghcr.io/gizmotickler/scale-csi:v2.1.0"
-
-        args = [
-          "--csi-version=1.2.0",
-          "--csi-name=csi.scale.nfs",
-          "--driver-config-file=${NOMAD_TASK_DIR}/driver-config-file.yaml",
-          "--log-level=debug",
-          "--csi-mode=node",
-          "--server-socket=/csi-data/csi.sock",
-        ]
-
+        image      = "ghcr.io/gizmotickler/scale-csi:v1.2.23"
         privileged = true
+        args = [
+          "-config=/etc/scale-csi/config.yaml",
+          "-endpoint=unix:///csi/csi.sock",
+          "-node-id=${node.unique.name}",
+          "-driver-name=csi.scale.io",
+          "-mode=node",
+          "-health-port=9809",
+          "-v=2",
+        ]
+        volumes = [
+          "/opt/scale-csi/config.yaml:/etc/scale-csi/config.yaml:ro",
+          "/:/host:ro",
+          "/dev:/dev",
+          "/sys:/sys",
+          "/run/udev:/run/udev",
+          "/etc/iscsi:/etc/iscsi",
+          "/var/lib/iscsi:/var/lib/iscsi",
+        ]
       }
 
       csi_plugin {
-        id        = "scale"
-        type      = "node"
-        mount_dir = "/csi-data"
-      }
-
-      template {
-        destination = "${NOMAD_TASK_DIR}/driver-config-file.yaml"
-
-        data = <<EOH
-config
-EOH
+        id                     = "scale-csi"
+        type                   = "node"
+        mount_dir              = "/csi"
+        stage_publish_base_dir = "/local/csi"
+        health_timeout         = "30s"
       }
 
       resources {
-        cpu    = 30
-        memory = 50
+        cpu    = 50
+        memory = 256
       }
     }
   }
 }
-
 ```
 
-## Creating and registering the volumes
+## Dynamically create a volume
 
-To create the volumes, we are going to use the [csc](https://github.com/rexray/gocsi/tree/master/csc) utility. It can be installed via `go`.
-
-```
-GO111MODULE=off go get -u github.com/rexray/gocsi/csc
-```
-
-To actually volume, use the following command. `csc` can do a lot more, including listing, expanding and deleting volumes, so please take a look at its docs.
-
-```
-csc -e tcp://<host>:<port> controller create-volume --req-bytes <volume size in bytes> <volume name>
-```
-
-Output
-```
-"<volume name>"	<volume size in bytes>	"node_attach_driver"="nfs"	"provisioner_driver"="scale-nfs"	"server"="<server>"	"share"="<share>"
-```
-
-While the volume can be registered using the [Nomad cli](https://www.nomadproject.io/docs/commands/volume/register), it is easier to use Terraform and the [Nomad provider](https://registry.terraform.io/providers/hashicorp/nomad/latest/docs), mapping the output to the following template.
-
-- Access mode can be changed
-- Mount flags can be specified. See the [provider docs](https://registry.terraform.io/providers/hashicorp/nomad/latest/docs/resources/volume#mount_flags)
+`parameters.protocol` is required whenever the driver config enables more than
+one protocol. This NFS volume file is accepted by `nomad volume create`:
 
 ```hcl
-provider "nomad" {
-  address = "<nomad address>"
+id           = "shared-media"
+name         = "shared-media"
+type         = "csi"
+plugin_id    = "scale-csi"
+capacity_min = "100GiB"
+capacity_max = "100GiB"
+
+capability {
+  access_mode     = "multi-node-multi-writer"
+  attachment_mode = "file-system"
 }
 
-resource "nomad_volume" "<volume name>" {
-  type                  = "csi"
-  plugin_id             = "scale"
-  volume_id             = "<volume name>"
-  name                  = "<volume name>"
-  external_id           = "<volume name>"
-  access_mode           = "single-node-writer"
-  attachment_mode       = "file-system"
-  deregister_on_destroy = true
+mount_options {
+  mount_flags = ["nfsvers=4", "noatime"]
+}
 
-  mount_options = {
-    fs_type = "nfs"
-  }
-
-  context = {
-    node_attach_driver = "nfs"
-    provisioner_driver = "scale-nfs"
-    server             = "<server>"
-    share              = "<share>"
-  }
+parameters {
+  protocol = "nfs"
 }
 ```
+
+```bash
+nomad volume create shared-media.hcl
+nomad volume status shared-media
+```
+
+For iSCSI or NVMe-oF use `protocol = "iscsi"` or `"nvmeof"`, a
+single-node access mode, and optionally `fs_type = "ext4"` or `"xfs"` under
+`mount_options`.
+
+The NFS volume context returned by scale-csi contains
+`node_attach_driver`, `server`, and `share`. Block volumes return the matching
+transport fields (`iqn`/`portal`/`lun` or
+`nqn`/`transport`/`address`/`port`). The stale `provisioner_driver` context key
+is not emitted and must not be added to static registrations.

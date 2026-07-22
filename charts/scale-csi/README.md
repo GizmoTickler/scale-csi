@@ -25,6 +25,24 @@ helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
 The driver supports API-key authentication only. If `truenas.existingSecret` is
 used, that Secret must contain an `api-key` key.
 
+### Images and immutable deployment
+
+| Parameter | Description | Default |
+|---|---|---|
+| `image.repository` | Driver image repository | `ghcr.io/gizmotickler/scale-csi` |
+| `image.tag` | Driver tag; empty derives `v<Chart.appVersion>` | `""` |
+| `image.digest` | Optional `sha256:...` manifest digest; overrides tag | `""` |
+| `sidecars.*.image` | Complete, overridable sidecar image reference | versioned upstream tag |
+
+Every chart container reference is values-controlled. Defaults remain
+human-readable tags instead of hard-coded digests so registry mirrors and
+operator-managed multi-architecture overrides do not fight the chart. Renovate
+is explicitly configured to update every sidecar tag and all full-SHA GitHub
+Action pins. For an immutable deployment, set `image.digest` and override each
+`sidecars.*.image` with `repository@sha256:<manifest-digest>` after validating
+the target architectures. Release signatures and chart provenance can be
+verified with the commands in the root README.
+
 ## Configuration
 
 ### Publication fencing and ownership
@@ -159,7 +177,6 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `iscsi.enabled` | Render iSCSI configuration | `true` |
 | `iscsi.portal` | Target portal host; falls back to `truenas.host` | `""` |
 | `iscsi.portalPort` | Target portal port | `3260` |
-| `iscsi.targetPortals` | Reserved and currently ignored (multipath unsupported; setting it emits a startup warning) | `[]` |
 | `iscsi.targetGroups` | Static portal/initiator groups for `off`/`additive`; when empty, the portal is resolved and fenced modes create a per-volume initiator group | `[]` |
 | `iscsi.extentBlocksize` | Extent block size | `512` |
 | `iscsi.extentDisablePhysicalBlocksize` | Disable extent physical-block-size reporting | `false` |
@@ -184,11 +201,17 @@ The iSCSI IQN basename comes from the TrueNAS global iSCSI configuration; it is
 not a chart or driver ConfigMap setting. The removed `iscsi.basename` and
 `nvmeof.basename` values had no effect.
 
+iSCSI uses one `iscsi.portal`; additional portal configuration is not exposed.
+CHAP and dm-multipath are unsupported. Restrict TCP 3260 to Kubernetes nodes
+using a dedicated storage network and firewall or SGACL policy.
+
 ### StorageClasses
 
 `storageClasses` is a list, so one release can create NFS, iSCSI, and NVMe-oF
 classes. The driver reads only `protocol` from ordinary StorageClass parameters;
 TrueNAS, ZFS, and protocol settings belong in the driver ConfigMap values above.
+When multiple protocols are enabled, `protocol` is required and an omitted
+value returns `InvalidArgument` instead of defaulting to NFS.
 
 | Field | Description | Default in bundled class |
 |---|---|---|
@@ -247,16 +270,16 @@ convenient.
 | `controller.enabled` | Deploy the controller | `true` |
 | `controller.replicas` | Controller replicas; must be `1` for additive/strict fencing | `1` |
 | `controller.priorityClassName` | Controller priority class | `system-cluster-critical` |
-| `controller.podDisruptionBudget.enabled` | Create a controller PDB | `false` |
+| `controller.podDisruptionBudget.enabled` | Create a controller PDB when replicas > 1 | `true` |
 | `controller.podDisruptionBudget.minAvailable` | PDB minimum available | `""` |
-| `controller.podDisruptionBudget.maxUnavailable` | PDB maximum unavailable | `""` |
+| `controller.podDisruptionBudget.maxUnavailable` | PDB maximum unavailable | `1` |
 | `controller.containerSecurityContext` | Controller driver container security context | non-root UID 65532, read-only root filesystem, no capabilities |
-| `controller.resources` | Controller driver resources | requests `10m` CPU, `32Mi` memory; no limits |
+| `controller.resources` | Controller driver resources | requests `10m` CPU, `32Mi` memory; memory limit `256Mi` |
 | `node.enabled` | Deploy the node DaemonSet | `true` |
 | `node.priorityClassName` | Node priority class | `system-node-critical` |
 | `node.sessionCleanupDelay` | Stale-session retry delay in milliseconds | `500` |
 | `node.maxVolumesPerNode` | Maximum volumes advertised per node; `0` means unlimited/unset | `0` |
-| `node.resources` | Node driver resources | requests `10m` CPU, `32Mi` memory; no limits |
+| `node.resources` | Node driver resources | requests `10m` CPU, `32Mi` memory; memory limit `256Mi` |
 | `kubeletDir` | Host kubelet directory | `/var/lib/kubelet` |
 | `serviceAccount.create` | Create component ServiceAccounts | `true` |
 | `serviceAccount.controllerName` | Existing/custom controller ServiceAccount | generated or `default` |
@@ -316,17 +339,18 @@ delay cleanup.
 > A cluster can only see its own PV and VolumeSnapshot handles, so it would
 > classify the other cluster's managed backend objects as orphans.
 
-Set one of `controller.podDisruptionBudget.minAvailable` or `maxUnavailable`
-when enabling the PDB. A PDB is useful only when `controller.replicas` is greater
-than one. ConfigMap and chart-managed Secret checksums are added to both pod
+The PDB renders only when `controller.replicas` is greater than one. Set at most
+one of `controller.podDisruptionBudget.minAvailable` or `maxUnavailable`; clear
+the default `maxUnavailable` to `""` when selecting `minAvailable`.
+ConfigMap and chart-managed Secret checksums are added to both pod
 templates so configuration and API-key changes trigger rollouts.
 
 ### Resource sizing
 
 Steady-state measurements are approximately 15Mi memory and 1m CPU per driver
-container. The chart therefore requests 10m CPU and 32Mi memory for the
-controller and node driver containers without setting limits. Both resource
-maps remain fully overridable; CSI sidecar resources remain empty by default.
+container. The chart requests 10m CPU and 32Mi memory with a 256Mi memory limit
+for each driver. Every sidecar requests 10m CPU and 32Mi memory with a 128Mi
+memory limit. All resource maps remain fully overridable.
 
 When CPU or memory limits are configured, the driver adapts `GOMAXPROCS` and
 `GOMEMLIMIT` from its cgroups. CSI liveness reports process health and no longer
@@ -339,6 +363,12 @@ tight resource limit into a driver crash loop. Use `/readyz` and
 Each controller sidecar exposes `timeout`, `workerThreads`, and `extraArgs`.
 The resizer maps `workerThreads` to its `--workers` CLI flag; the other sidecars
 use `--worker-threads`.
+
+When `controller.replicas>1`, the provisioner, attacher, resizer, and snapshotter
+receive leader-election flags and the pod template gets preferred hostname
+anti-affinity. With one replica those flags are omitted. Fencing modes other
+than `off` require exactly one replica because background fencing reconcilers
+are singleton writers.
 
 | Parameter | Default |
 |---|---|

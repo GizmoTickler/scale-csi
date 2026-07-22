@@ -108,6 +108,18 @@ match the real image; an explicitly-set .Values.image.tag is used verbatim.
 {{- end }}
 
 {{/*
+Get the complete driver image reference. An explicit digest is immutable and
+takes precedence over the release tag.
+*/}}
+{{- define "scale-csi.image" -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository (include "scale-csi.imageTag" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Get the CSI driver name
 */}}
 {{- define "scale-csi.driverName" -}}

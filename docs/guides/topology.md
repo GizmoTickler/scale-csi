@@ -1,75 +1,45 @@
-# Topology-aware provisioning
+# Topology behavior
 
-scale-csi implements the CSI `VOLUME_ACCESSIBILITY_CONSTRAINTS` capability. When
-topology is enabled, each node plugin advertises topology segments in `NodeGetInfo`
-and the controller returns a matching `AccessibleTopology` on `CreateVolume`, so the
-scheduler and the external-provisioner can place volumes with zone/region affinity.
+The node service reads its Kubernetes Node object at startup. If the Node has
+`topology.kubernetes.io/zone` or `topology.kubernetes.io/region`, scale-csi
+automatically enables its node topology and returns those per-node segments in
+`NodeGetInfo`. Node RBAC already permits that lookup.
 
-> **Do you need this?** For the common scale-csi deployment — a **single TrueNAS
-> backend serving all nodes equally** — topology is unnecessary: every node is
-> equidistant from the one backend, so there is nothing to constrain. Leave it
-> disabled (the default). Topology matters only when nodes are partitioned into
-> zones/regions that map to *different* storage backends or network locality you want
-> to honor.
+There is no `node.topology` value in the bundled Helm chart. In particular,
+these values are invalid and rejected by `values.schema.json`:
 
-## What gets advertised
-
-Enabling `node.topology` makes each node plugin publish these segments from its config
-(`pkg/driver/config.go` `TopologyConfig`):
-
-| Config key | Advertised topology key |
-|------------|-------------------------|
-| `node.topology.zone` | `topology.kubernetes.io/zone` |
-| `node.topology.region` | `topology.kubernetes.io/region` |
-| `node.topology.customLabels` (map) | each key/value verbatim |
-
-The controller echoes the same segments as the volume's `AccessibleTopology`, which
-external-provisioner records on the `PV` as `nodeAffinity`.
-
-## Enabling it
-
-```yaml
-# values.yaml
+```text
+# Unsupported chart values — do not use.
 node:
   topology:
     enabled: true
-    zone: zone-a          # this DaemonSet's nodes are in zone-a
-    region: us-west-1
-    customLabels: {}
+    zone: zone-a
 ```
 
-Then constrain provisioning in the StorageClass:
+The distinction matters because the chart runs controller and node services in
+separate pods. Node pods can auto-detect their own labels, but the controller
+does not have a single node identity to detect and the chart does not inject a
+static topology into it. Consequently, the chart's controller does not
+advertise CSI `VOLUME_ACCESSIBILITY_CONSTRAINTS`, and it does not promise that a
+StorageClass `allowedTopologies` rule will constrain provisioning.
 
-```yaml
-volumeBindingMode: WaitForFirstConsumer   # delay binding until a pod is scheduled
-allowedTopologies:
-  - matchLabelExpressions:
-      - key: topology.kubernetes.io/zone
-        values: [zone-a]
-```
+The driver configuration type still supports a static `node.topology` block for
+non-chart or monolithic deployments where one configuration correctly
+represents both controller and node scope. A single static zone in the chart's
+cluster-wide DaemonSet would be unsafe: it could label every node as the same
+zone even when Kubernetes says otherwise. That is why this batch removes the
+dead chart recipe instead of exposing it.
 
-`WaitForFirstConsumer` is what makes topology useful: the volume is provisioned only
-after the pod is scheduled, so its `AccessibleTopology` matches the node the pod landed
-on. With the default `Immediate` binding, the volume is provisioned before scheduling
-and topology has no effect on placement.
+For the common deployment—a single TrueNAS backend reachable from every
+eligible node—topology constraints are unnecessary. Use the default
+`Immediate` binding mode, or `WaitForFirstConsumer` for workload scheduling
+reasons unrelated to a scale-csi backend locality guarantee.
 
-## Important limitation: topology values are static per deployment
+If multiple TrueNAS backends must map to distinct failure domains, deploy
+separate driver instances with distinct `csiDriverName`,
+`driverInstanceId`, and `zfs.parentDataset` values and validate the complete
+scheduler/provisioner behavior. Automatic node-label reporting alone is not a
+multi-backend routing policy.
 
-The `zone`/`region` come from the **node plugin's config**, which is a single value for
-the whole DaemonSet. There is no per-node auto-detection. So a genuinely **multi-zone**
-cluster requires one of:
-
-- **Per-zone node pools, one DaemonSet each** — deploy scale-csi once per zone
-  (separate release/values) with each pinned (via `nodeSelector`/affinity) to that
-  zone's nodes and its own `node.topology.zone`. This is the correct pattern for
-  multiple backends.
-- **A single zone label for all nodes** — only meaningful if you also run multiple
-  backends and select them another way.
-
-Because of this, and because the single-backend model makes all nodes equivalent,
-**topology is an advanced/niche feature for scale-csi.** Most deployments should leave
-`node.topology.enabled: false`. Enable it only when you run distinct backends per zone
-and want the scheduler to honor that locality.
-
-See also: [StorageClass reference](../reference/storageclass.md) ·
+See also: [StorageClass reference](../reference/storageclass.md) and
 [Production](../production.md).

@@ -183,16 +183,12 @@ The driver leverages native ZFS capabilities:
 
 ## Volume ID Format
 
-Volume IDs encode the storage protocol and ZFS path:
-
-```
-{driver}:{dataset_path}
-```
-
-Examples:
-- `scale-nfs:tank/k8s/volumes/pvc-abc123`
-- `scale-iscsi:tank/k8s/volumes/pvc-abc123`
-- `scale-nvmeof:tank/k8s/volumes/pvc-abc123`
+The volume ID is the sanitized CSI request name and is also the child dataset
+or zvol basename beneath `zfs.datasetParentName`. It does not encode the
+protocol or full ZFS path. For example, a request named `pvc-abc123` produces
+volume ID `pvc-abc123` and backend object
+`tank/k8s/volumes/pvc-abc123`. Protocol identity is stored in volume context
+and ZFS user properties.
 
 ## ZFS User Properties
 
