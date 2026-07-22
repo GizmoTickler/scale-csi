@@ -2,9 +2,42 @@
 package util
 
 import (
+	"context"
 	"sync"
 	"time"
 )
+
+// minCommandTimeout is the floor applied to a derived per-command timeout. The
+// inbound RPC deadline always still caps the command (context.WithTimeout keeps
+// the parent deadline), so this floor only guarantees a sane minimum when no
+// tight deadline is present. A nearly-expired inbound deadline therefore fails
+// fast through the parent context rather than launching work doomed to outlive
+// its budget.
+const minCommandTimeout = 5 * time.Second
+
+// commandContext derives a per-command context bounded by BOTH the configured
+// timeout and the remaining inbound RPC deadline, so a CO-supplied deadline is
+// honored instead of being dropped on the floor by a fresh context.Background()
+// timer. An already-expired inbound context is returned as an immediate error so
+// a doomed command is never launched. The effective timeout is
+// min(configured, remaining deadline), raised to minCommandTimeout; the parent
+// context always caps the real deadline regardless of that floor.
+func commandContext(ctx context.Context, configured time.Duration) (context.Context, context.CancelFunc, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	timeout := configured
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout < minCommandTimeout {
+		timeout = minCommandTimeout
+	}
+	derived, cancel := context.WithTimeout(ctx, timeout)
+	return derived, cancel, nil
+}
 
 // UtilConfig holds configurable settings for utility functions.
 // All fields have sensible defaults that are used if not explicitly set.

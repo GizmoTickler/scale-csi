@@ -258,6 +258,25 @@ func accessModeFromCapability(capability *csi.VolumeCapability) csi.VolumeCapabi
 	return capability.GetAccessMode().GetMode()
 }
 
+// validateAccessMode rejects access modes the driver does not understand. CSI
+// requires rejecting an UNKNOWN or out-of-range mode with InvalidArgument rather
+// than silently treating it as single-node, which isMultiNodeMode would do for
+// any unrecognized value.
+func validateAccessMode(mode csi.VolumeCapability_AccessMode_Mode) error {
+	switch mode {
+	case csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER:
+		return nil
+	default:
+		return status.Errorf(codes.InvalidArgument, "unsupported or unknown access mode %s", mode.String())
+	}
+}
+
 func shareTypeForPublishedVolume(ds *truenas.Dataset, volumeContext map[string]string) ShareType {
 	if value := volumeContext["node_attach_driver"]; value != "" {
 		if shareType := ParseShareType(value); shareType.IsValid() {
@@ -868,9 +887,22 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 }
 
 func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, identity NodeIdentity, capability *csi.VolumeCapability, readonly bool) error {
-	deferred, err := d.validateOrDeferFencingIdentity(identity, shareType)
-	if err != nil {
-		return err
+	// Publication records are the CSI spec-semantics layer and are maintained in
+	// EVERY fencing mode: same-node idempotency, different-node SINGLE_NODE
+	// FailedPrecondition, stale-record takeover, and empty-node-id unpublish-all
+	// all key off these durable records. Backend enforcement — mutating the
+	// transport allowlist (nvmet hosts, iSCSI initiator groups, NFS host lists) —
+	// is a separate concern governed by fencing.mode and is skipped entirely when
+	// the mode is off. This keeps the default configuration spec-conformant at the
+	// cost of only the publication property writes.
+	backendEnforcement := d.config.Fencing.Enabled()
+	deferred := false
+	if backendEnforcement {
+		var err error
+		deferred, err = d.validateOrDeferFencingIdentity(identity, shareType)
+		if err != nil {
+			return err
+		}
 	}
 	records, err := publicationRecordsFromDataset(ds)
 	if err != nil {
@@ -879,6 +911,9 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	record, err := newPublicationRecord(identity, accessModeFromCapability(capability), readonly)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "failed to persist node identity: %v", err)
+	}
+	if modeErr := validateAccessMode(csi.VolumeCapability_AccessMode_Mode(record.AccessMode)); modeErr != nil {
+		return modeErr
 	}
 	// A SINGLE_NODE request whose durable record still points at another node is
 	// normally a genuine double-mount and fails FailedPrecondition. But when that
@@ -895,33 +930,38 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	if err := validatePublicationCompatibility(records, record); err != nil {
 		return err
 	}
-	if err := d.validateBackendSingleNodeCompatibility(
-		ctx, ds, datasetName, shareType, identity, records,
-		csi.VolumeCapability_AccessMode_Mode(record.AccessMode),
-	); err != nil {
-		return err
+	if backendEnforcement {
+		if err := d.validateBackendSingleNodeCompatibility(
+			ctx, ds, datasetName, shareType, identity, records,
+			csi.VolumeCapability_AccessMode_Mode(record.AccessMode),
+		); err != nil {
+			return err
+		}
 	}
 	key := publicationPropertyKey(identity.Name)
 	previous, hasPrevious := records[key]
-	if err := d.populateAdditiveGrantOwnership(
-		ctx, ds, datasetName, shareType, identity, previous, hasPrevious, deferred, &record,
-	); err != nil {
-		// The provenance-overflow refusal is a deliberate, actionable status;
-		// preserve its code instead of masking it as Internal.
-		if status.Code(err) == codes.ResourceExhausted {
-			return err
+	if backendEnforcement {
+		if err := d.populateAdditiveGrantOwnership(
+			ctx, ds, datasetName, shareType, identity, previous, hasPrevious, deferred, &record,
+		); err != nil {
+			// The provenance-overflow refusal is a deliberate, actionable status;
+			// preserve its code instead of masking it as Internal.
+			if status.Code(err) == codes.ResourceExhausted {
+				return err
+			}
+			return status.Errorf(codes.Internal, "failed to classify additive grant ownership: %v", err)
 		}
-		return status.Errorf(codes.Internal, "failed to classify additive grant ownership: %v", err)
 	}
 	if err := storePublicationRecord(ctx, d.truenasClient, ds, datasetName, key, record); err != nil {
 		return status.Errorf(codes.Internal, "failed to store publication identity: %v", err)
 	}
 	d.stalePublicationRecordsSeen.Delete(stalePublicationObservationKey(datasetName, key))
 	records[key] = record
-	if deferred {
-		// Persist publication ownership even though the transport-specific grant is
-		// deferred. This prevents two legacy nodes from both receiving a successful
-		// SINGLE_NODE publish, while leaving the static backend policy untouched.
+	if deferred || !backendEnforcement {
+		// Off mode keeps publication records as the sole publication truth; there is
+		// no backend allowlist to converge. Additive mode persists ownership for a
+		// deferred legacy identity while preserving the static backend policy. Either
+		// way the durable record is written and the transport grant is left untouched.
 		return nil
 	}
 	if err := d.applyBackendFence(ctx, ds, datasetName, shareType, records); err != nil {
@@ -965,11 +1005,15 @@ func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset,
 		}
 		records[key] = record
 	}
-	if err := d.applyBackendFence(ctx, ds, datasetName, shareType, records); err != nil && !errors.Is(err, errFenceBackendAbsent) {
-		return status.Errorf(codes.Internal, "failed to remove backend publication fence: %v", err)
+	// Backend allowlist revocation is governed by fencing.mode; off mode tracks
+	// publications purely through the durable records and never touches it.
+	if d.config.Fencing.Enabled() {
+		if err := d.applyBackendFence(ctx, ds, datasetName, shareType, records); err != nil && !errors.Is(err, errFenceBackendAbsent) {
+			return status.Errorf(codes.Internal, "failed to remove backend publication fence: %v", err)
+		}
 	}
 	if err := removePublicationRecords(ctx, d.truenasClient, ds, datasetName, keys); err != nil {
-		return status.Errorf(codes.Internal, "backend access was removed but durable publication cleanup failed: %v", err)
+		return status.Errorf(codes.Internal, "failed to remove durable publication records: %v", err)
 	}
 	return nil
 }

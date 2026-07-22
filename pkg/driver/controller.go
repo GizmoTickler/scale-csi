@@ -364,15 +364,17 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		requiredBytes = req.GetCapacityRange().GetRequiredBytes()
 		limitBytes = req.GetCapacityRange().GetLimitBytes()
 		capacityBytes = requiredBytes
-
-		// Validate limit vs required
-		if limitBytes > 0 && capacityBytes > limitBytes {
-			return nil, status.Errorf(codes.InvalidArgument,
-				"required capacity (%d bytes) exceeds limit (%d bytes)", capacityBytes, limitBytes)
-		}
 	}
 	if capacityBytes == 0 {
 		capacityBytes = 1024 * 1024 * 1024 // Default 1GiB
+	}
+	// Validate the applied capacity against the limit. This covers both an
+	// explicit required_bytes that exceeds limit_bytes and the case where
+	// required_bytes is omitted (0): the 1GiB default is then applied and must
+	// itself respect a caller-supplied limit below that default.
+	if limitBytes > 0 && capacityBytes > limitBytes {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"required capacity (%d bytes) exceeds limit (%d bytes)", capacityBytes, limitBytes)
 	}
 
 	// Minimum capacity validation (at least 1MiB to avoid edge cases)
@@ -1186,22 +1188,21 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			klog.Infof("Volume %s dataset not found, attempting orphaned resource cleanup", volumeID)
 			// Dataset is gone but there may be orphaned NVMe-oF/iSCSI resources.
 			// Since we can't check dataset properties, try both protocols using
-			// fallback logic that finds resources by name.
-			var cleanupErrors []string
+			// fallback logic that finds resources by name. CSI DeleteVolume must be
+			// idempotent — a volume whose dataset is already absent is a successful
+			// delete — so a best-effort cleanup failure must not fail the RPC: log
+			// it, emit a metric, and let the orphan reconcile sweep the residue.
 			if cleanupErr := d.deleteShare(ctx, nil, datasetName, ShareTypeNVMeoF); cleanupErr != nil {
-				klog.Warningf("Failed to cleanup orphaned NVMe-oF resources for %s: %v", volumeID, cleanupErr)
-				cleanupErrors = append(cleanupErrors, "NVMe-oF: "+cleanupErr.Error())
+				RecordDeleteVolumeOrphanCleanupFailure(string(ShareTypeNVMeoF))
+				klog.Warningf("Failed to cleanup orphaned NVMe-oF resources for %s (orphan reconcile will retry): %v", volumeID, cleanupErr)
 			} else {
 				klog.Infof("Cleaned up orphaned NVMe-oF resources for %s", volumeID)
 			}
 			if cleanupErr := d.deleteShare(ctx, nil, datasetName, ShareTypeISCSI); cleanupErr != nil {
-				klog.Warningf("Failed to cleanup orphaned iSCSI resources for %s: %v", volumeID, cleanupErr)
-				cleanupErrors = append(cleanupErrors, "iSCSI: "+cleanupErr.Error())
+				RecordDeleteVolumeOrphanCleanupFailure(string(ShareTypeISCSI))
+				klog.Warningf("Failed to cleanup orphaned iSCSI resources for %s (orphan reconcile will retry): %v", volumeID, cleanupErr)
 			} else {
 				klog.Infof("Cleaned up orphaned iSCSI resources for %s", volumeID)
-			}
-			if len(cleanupErrors) > 0 {
-				return nil, status.Errorf(codes.Internal, "orphaned protocol cleanup failed for %s: %s", volumeID, strings.Join(cleanupErrors, "; "))
 			}
 			return &csi.DeleteVolumeResponse{}, nil
 		}
@@ -1528,10 +1529,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType); err != nil {
 		return nil, err
 	}
-	if d.config.Fencing.Enabled() {
-		if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly()); err != nil {
-			return nil, err
-		}
+	// Publication records (CSI single-node exclusivity, idempotency, takeover) are
+	// maintained unconditionally; fencing.mode only governs backend allowlist
+	// enforcement inside publishFencedVolume.
+	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly()); err != nil {
+		return nil, err
 	}
 
 	klog.Infof("ControllerPublishVolume: volume %s published successfully to node %s", volumeID, nodeID)
@@ -1543,9 +1545,6 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
-	}
-	if !d.config.Fencing.Enabled() {
-		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 	lockKey := "volume:" + volumeID
 	if !d.acquireOperationLock(lockKey) {
@@ -1563,6 +1562,9 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 		}
 		return nil, status.Errorf(codes.Internal, "failed to get volume: %v", err)
 	}
+	// Publication records are cleared unconditionally so single-node bookkeeping
+	// stays correct in every fencing mode; backend allowlist revocation inside
+	// unpublishFencedVolume remains governed by fencing.mode.
 	shareType := shareTypeForPublishedVolume(ds, nil)
 	if err := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, req.GetNodeId()); err != nil {
 		return nil, err

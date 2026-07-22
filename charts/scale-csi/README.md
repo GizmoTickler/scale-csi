@@ -50,16 +50,21 @@ verified with the commands in the root README.
 | Parameter | Description | Default |
 |---|---|---|
 | `driverInstanceId` | Stable owner stamped on every driver-created dataset/zvol; empty derives `<csiDriverName>@<zfs.parentDataset>` | `""` |
-| `fencing.mode` | Backend publication policy: `off`, `additive`, or `strict` | `off` |
+| `fencing.mode` | Backend publication **enforcement** policy: `off`, `additive`, or `strict`. Publication tracking is always on regardless of mode | `off` |
 | `fencing.startupReconcileTimeout` | Timeout for each background startup convergence attempt | `10m` |
 | `fencing.staleRecordGracePeriod` | Continuous VA absence before a stale publication record is revoked | `10m` |
 
-`ControllerPublishVolume` uses the TrueNAS allowlist as the durable attachment
-record. NVMe-oF authorizes the publishing node's host NQN, iSCSI authorizes its
-initiator IQN, and NFS authorizes its node IP after checking that IP against
-`nfs.shareAllowedNetworks`. `ControllerUnpublishVolume` removes that identity.
-The driver also stores a recovery copy of the identity on the volume dataset so
-unpublish remains possible after the Kubernetes Node has disappeared.
+`ControllerPublishVolume` always writes a durable publication record on the
+volume dataset; these records are the source of truth for CSI single-node
+exclusivity, same-node idempotency, stale-record takeover, and empty-node-id
+unpublish, and they are maintained in **every** fencing mode (including `off`).
+`fencing.mode` only governs whether the backend transport allowlist is also
+mutated: in `additive`/`strict`, NVMe-oF authorizes the publishing node's host
+NQN, iSCSI authorizes its initiator IQN, and NFS authorizes its node IP after
+checking that IP against `nfs.shareAllowedNetworks`; `ControllerUnpublishVolume`
+removes that identity. In `off` the allowlists are left untouched and the
+publication records alone enforce exclusivity. The durable record also keeps
+unpublish possible after the Kubernetes Node has disappeared.
 If an operator force-removes a stuck VolumeAttachment finalizer, the periodic
 controller reconcile revokes the stale backend grant after
 `fencing.staleRecordGracePeriod`. An empty VA list with two or more records

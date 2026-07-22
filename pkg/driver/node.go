@@ -29,14 +29,14 @@ var (
 	nodeGetISCSIInfo           = util.GetISCSIInfoFromDevice
 	nodeISCSIDisconnect        = util.ISCSIDisconnect
 	nodeGetDeviceSize          = util.GetDeviceSize
-	nodeResizeFilesystem       = util.ResizeFilesystem
-	nodeFormatAndMount         = util.FormatAndMount
+	nodeResizeFilesystem       = util.ResizeFilesystemWithContext
+	nodeFormatAndMount         = util.FormatAndMountWithContext
 	nodeIsMounted              = util.IsMounted
 	nodeGetMountInfo           = util.GetMountInfo
 	nodeListMountInfo          = util.ListMountInfo
 	nodeCheckISCSIMultipath    = util.CheckISCSIDeviceMultipathOwnership
-	nodeISCSIRescan            = util.ISCSIRescanSession
-	nodeNVMeRescan             = util.NVMeRescan
+	nodeISCSIRescan            = util.ISCSIRescanSessionWithContext
+	nodeNVMeRescan             = util.NVMeRescanWithContext
 	nodeDeviceSizePollTimeout  = 5 * time.Second
 	nodeDeviceSizePollInterval = 200 * time.Millisecond
 	nodeStatsStat              = func(path string) (uint32, uint64, error) {
@@ -676,7 +676,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 
 	// Get device path before unmounting (for session cleanup)
 	// For block mode volumes, stagingPath is a symlink to the device, not a mount point
-	devicePath, err := util.GetDeviceFromMountPoint(stagingPath)
+	devicePath, err := util.GetDeviceFromMountPointWithContext(ctx, stagingPath)
 	if err != nil || devicePath == "" {
 		// Check if it's a symlink (block mode volumes use symlinks)
 		if target, readErr := os.Readlink(stagingPath); readErr == nil {
@@ -701,7 +701,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 	} else {
 		// For filesystem mode, unmount and remove directory
-		if err := util.Unmount(stagingPath); err != nil {
+		if err := util.UnmountWithContext(ctx, stagingPath); err != nil {
 			klog.Warningf("Failed to unmount staging path: %v", err)
 			// Check if still mounted before attempting removal to prevent data corruption
 			mounted, checkErr := util.IsMounted(stagingPath)
@@ -936,7 +936,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			if readonly {
 				blockMountOptions = append(blockMountOptions, "ro")
 			}
-			if err := util.BindMount(devicePath, targetPath, blockMountOptions); err != nil {
+			if err := util.BindMountWithContext(ctx, devicePath, targetPath, blockMountOptions); err != nil {
 				operationErr := status.Errorf(codes.Internal, "failed to bind mount block device: %v", err)
 				d.recordWarningEvent(eventObject, EventReasonMountFailed, operationErr.Error())
 				return nil, operationErr
@@ -949,7 +949,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		if err := os.MkdirAll(targetPath, 0o750); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to create target path: %v", err)
 		}
-		if err := util.BindMount(stagingPath, targetPath, mountOptions); err != nil {
+		if err := util.BindMountWithContext(ctx, stagingPath, targetPath, mountOptions); err != nil {
 			operationErr := status.Errorf(codes.Internal, "failed to bind mount: %v", err)
 			d.recordWarningEvent(eventObject, EventReasonMountFailed, operationErr.Error())
 			return nil, operationErr
@@ -967,7 +967,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			server := volumeContext["server"]
 			share := volumeContext["share"]
 			source := fmt.Sprintf("%s:%s", server, share)
-			if err := util.MountNFS(source, targetPath, mountOptions); err != nil {
+			if err := util.MountNFSWithContext(ctx, source, targetPath, mountOptions); err != nil {
 				operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
 				d.recordWarningEvent(eventObject, EventReasonNFSMountFailed, operationErr.Error())
 				return nil, operationErr
@@ -1009,7 +1009,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	defer d.releaseOperationLock(targetLockKey)
 
 	// Unmount target path
-	if err := util.Unmount(targetPath); err != nil {
+	if err := util.UnmountWithContext(ctx, targetPath); err != nil {
 		klog.Warningf("Failed to unmount target path: %v", err)
 		// Check if still mounted before attempting removal
 		mounted, checkErr := util.IsMounted(targetPath)
@@ -1194,11 +1194,11 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 			if infoErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
 			}
-			if rescanErr := nodeISCSIRescan(portal, iqn); rescanErr != nil {
+			if rescanErr := nodeISCSIRescan(ctx, portal, iqn); rescanErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
 			}
 		case ShareTypeNVMeoF:
-			if rescanErr := nodeNVMeRescan(devicePath); rescanErr != nil {
+			if rescanErr := nodeNVMeRescan(ctx, devicePath); rescanErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to rescan NVMe-oF device %s: %v", devicePath, rescanErr)
 			}
 		}
@@ -1221,7 +1221,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 		}
 
 		if volumePath != "" {
-			if resizeErr := nodeResizeFilesystem(volumePath); resizeErr != nil {
+			if resizeErr := nodeResizeFilesystem(ctx, volumePath); resizeErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to resize filesystem: %v", resizeErr)
 			}
 		}
@@ -1391,7 +1391,7 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 	}
 
 	// Mount NFS
-	if err := util.MountNFS(source, stagingPath, volumeMountFlags(volCap)); err != nil {
+	if err := util.MountNFSWithContext(ctx, source, stagingPath, volumeMountFlags(volCap)); err != nil {
 		RecordNodeConnect("nfs", "error")
 		operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSMountFailed, operationErr.Error())
@@ -1509,7 +1509,7 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 	}
 	mountFlags := volumeMountFlagsForFS(volCap, fsType)
 
-	if err := nodeFormatAndMount(devicePath, stagingPath, fsType, mountFlags); err != nil {
+	if err := nodeFormatAndMount(ctx, devicePath, stagingPath, fsType, mountFlags); err != nil {
 		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonMountFailed, operationErr.Error())
 		return operationErr
@@ -1595,7 +1595,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	connectOpts := &util.NVMeoFConnectOptions{
 		DeviceTimeout: time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second,
 	}
-	devicePath, err := nvmeConnectWithSubsystems(nqn, transportURI, connectOpts, subsystems)
+	devicePath, err := nvmeConnectWithSubsystems(ctx, nqn, transportURI, connectOpts, subsystems)
 	if err != nil {
 		RecordNodeConnect("nvmeof", "error")
 		operationErr := status.Errorf(codes.Internal, "failed to connect NVMe-oF: %v", err)
@@ -1621,7 +1621,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	}
 	mountFlags := volumeMountFlagsForFS(volCap, fsType)
 
-	if err := nodeFormatAndMount(devicePath, stagingPath, fsType, mountFlags); err != nil {
+	if err := nodeFormatAndMount(ctx, devicePath, stagingPath, fsType, mountFlags); err != nil {
 		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonMountFailed, operationErr.Error())
 		return operationErr

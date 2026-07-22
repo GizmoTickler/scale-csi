@@ -128,6 +128,194 @@ func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIde
 	assert.False(t, retained, "backend conflict must be detected before persisting a new publication")
 }
 
+// allowlistCountingClient wraps the mock and counts every backend transport
+// allowlist mutation (NFS host lists, iSCSI initiator groups/target groups,
+// NVMe-oF host-subsystem associations). Off-mode publication tracking must keep
+// all of these at zero while still enforcing single-node semantics via records.
+type allowlistCountingClient struct {
+	*truenas.MockClient
+	nfsShareUpdate       atomic.Int64
+	iscsiInitiatorCreate atomic.Int64
+	iscsiInitiatorUpdate atomic.Int64
+	iscsiTargetUpdate    atomic.Int64
+	nvmeHostSubsysCreate atomic.Int64
+	nvmeHostSubsysDelete atomic.Int64
+	nvmeAllowAnyHost     atomic.Int64
+}
+
+func (c *allowlistCountingClient) allowlistCalls() int64 {
+	return c.nfsShareUpdate.Load() + c.iscsiInitiatorCreate.Load() + c.iscsiInitiatorUpdate.Load() +
+		c.iscsiTargetUpdate.Load() + c.nvmeHostSubsysCreate.Load() + c.nvmeHostSubsysDelete.Load() +
+		c.nvmeAllowAnyHost.Load()
+}
+
+func (c *allowlistCountingClient) NFSShareUpdate(ctx context.Context, id int, params map[string]interface{}) (*truenas.NFSShare, error) {
+	c.nfsShareUpdate.Add(1)
+	return c.MockClient.NFSShareUpdate(ctx, id, params)
+}
+
+func (c *allowlistCountingClient) ISCSIInitiatorCreateWithInitiators(ctx context.Context, initiators []string, comment string) (*truenas.ISCSIInitiator, error) {
+	c.iscsiInitiatorCreate.Add(1)
+	return c.MockClient.ISCSIInitiatorCreateWithInitiators(ctx, initiators, comment)
+}
+
+func (c *allowlistCountingClient) ISCSIInitiatorUpdate(ctx context.Context, id int, initiators []string, comment string) (*truenas.ISCSIInitiator, error) {
+	c.iscsiInitiatorUpdate.Add(1)
+	return c.MockClient.ISCSIInitiatorUpdate(ctx, id, initiators, comment)
+}
+
+func (c *allowlistCountingClient) ISCSITargetUpdate(ctx context.Context, id int, groups []truenas.ISCSITargetGroup) (*truenas.ISCSITarget, error) {
+	c.iscsiTargetUpdate.Add(1)
+	return c.MockClient.ISCSITargetUpdate(ctx, id, groups)
+}
+
+func (c *allowlistCountingClient) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID int) (*truenas.NVMeoFHostSubsys, error) {
+	c.nvmeHostSubsysCreate.Add(1)
+	return c.MockClient.NVMeoFHostSubsysCreate(ctx, hostID, subsysID)
+}
+
+func (c *allowlistCountingClient) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
+	c.nvmeHostSubsysDelete.Add(1)
+	return c.MockClient.NVMeoFHostSubsysDelete(ctx, id)
+}
+
+func (c *allowlistCountingClient) NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*truenas.NVMeoFSubsystem, error) {
+	c.nvmeAllowAnyHost.Add(1)
+	return c.MockClient.NVMeoFSubsystemUpdateAllowAnyHost(ctx, id, allowAnyHost)
+}
+
+// TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend proves
+// the FIX 1 contract: with fencing.mode=off (the chart default) publication
+// records are still maintained and validated, so a SINGLE_NODE volume already
+// published to a different node is rejected with FailedPrecondition, same-node
+// republish is idempotent, and empty-node-id unpublish clears everything — all
+// without a single backend transport allowlist mutation.
+func TestControllerPublishOffModeEnforcesSingleNodeViaRecordsWithoutBackend(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	client := &allowlistCountingClient{MockClient: mock}
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			Fencing:    FencingConfig{Mode: FencingModeOff},
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS:        NFSConfig{ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"}},
+		},
+		truenasClient: client,
+	}
+	datasetName := "pool/parent/off-volume"
+	dataset, err := mock.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	share, err := mock.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: dataset.Mountpoint, Enabled: true})
+	require.NoError(t, err)
+	require.NoError(t, mock.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, strconv.Itoa(share.ID)))
+
+	nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.31")}})
+	require.NoError(t, err)
+	nodeB, err := encodeNodeIdentity(NodeIdentity{Name: "worker-b", IPs: []net.IP{net.ParseIP("192.0.2.32")}})
+	require.NoError(t, err)
+	request := func(nodeID string) *csi.ControllerPublishVolumeRequest {
+		return &csi.ControllerPublishVolumeRequest{
+			VolumeId: "off-volume",
+			NodeId:   nodeID,
+			VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+			}},
+			VolumeContext: map[string]string{"node_attach_driver": "nfs"},
+		}
+	}
+
+	// First publish to node A succeeds and writes a durable record.
+	_, err = d.ControllerPublishVolume(ctx, request(nodeA))
+	require.NoError(t, err)
+	dataset, err = mock.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	_, hasRecord := dataset.UserProperties[publicationPropertyKey("worker-a")]
+	assert.True(t, hasRecord, "off mode must still write a durable publication record")
+
+	// Same-node republish is idempotent.
+	_, err = d.ControllerPublishVolume(ctx, request(nodeA))
+	require.NoError(t, err, "same-node republish must be idempotent in off mode")
+
+	// A different-node SINGLE_NODE publish must fail FailedPrecondition.
+	_, err = d.ControllerPublishVolume(ctx, request(nodeB))
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "worker-a")
+	dataset, err = mock.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	_, hasB := dataset.UserProperties[publicationPropertyKey("worker-b")]
+	assert.False(t, hasB, "a rejected publish must not persist a record")
+
+	// No backend allowlist mutation may happen in off mode.
+	assert.Zero(t, client.allowlistCalls(), "off mode must not mutate any backend transport allowlist")
+
+	// Empty-node-id unpublish clears all records, still without backend calls.
+	_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-volume"})
+	require.NoError(t, err)
+	dataset, err = mock.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(dataset)
+	require.NoError(t, err)
+	assert.Empty(t, records, "unpublish-all must clear the durable records in off mode")
+	assert.Zero(t, client.allowlistCalls(), "off mode unpublish must not mutate any backend transport allowlist")
+
+	// With the record cleared, node B can now publish.
+	_, err = d.ControllerPublishVolume(ctx, request(nodeB))
+	require.NoError(t, err)
+	assert.Zero(t, client.allowlistCalls(), "off mode publish after takeover must not mutate any backend transport allowlist")
+}
+
+// TestControllerPublishRejectsUnknownAccessMode covers FIX 4b: an UNKNOWN or
+// unrecognized access mode must be rejected with InvalidArgument rather than
+// silently treated as single-node.
+func TestControllerPublishRejectsUnknownAccessMode(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			Fencing:    FencingConfig{Mode: FencingModeOff},
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS:        NFSConfig{ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"}},
+		},
+		truenasClient: client,
+	}
+	datasetName := "pool/parent/unknown-mode"
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: dataset.Mountpoint, Enabled: true})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, datasetName, PropNFSShareID, strconv.Itoa(share.ID)))
+
+	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.31")}})
+	require.NoError(t, err)
+
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: "unknown-mode",
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_UNKNOWN,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "nfs"},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, err.Error(), "access mode")
+
+	// A nil access mode resolves to UNKNOWN and must be rejected the same way.
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId:         "unknown-mode",
+		NodeId:           nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}}},
+		VolumeContext:    map[string]string{"node_attach_driver": "nfs"},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
 func TestNVMeBackendCompatibilityFallsBackToHostIDWhenHostNQNIsEmpty(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()

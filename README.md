@@ -11,8 +11,10 @@ A Kubernetes CSI driver purpose-built for TrueNAS SCALE. Unlike general-purpose 
 - **Single Focus** - Optimized specifically for TrueNAS SCALE, not a multi-backend abstraction
 - **Modern API** - Built for SCALE 25.04+ versioned API from day one
 - **Full Featured** - Snapshots, clones, volume expansion, and raw block volumes
-- **Backend Fencing** - CSI publish state is enforced through per-volume NFS,
-  iSCSI, and NVMe-oF transport allowlists
+- **Publication Tracking & Backend Fencing** - CSI publish state is always
+  tracked in durable per-volume publication records (single-node exclusivity is
+  enforced in every mode); `fencing.mode` optionally enforces it through
+  per-volume NFS, iSCSI, and NVMe-oF transport allowlists
 
 ## Supported Protocols
 
@@ -34,10 +36,16 @@ helm install scale-csi oci://ghcr.io/gizmotickler/charts/scale-csi \
   --values values.yaml
 ```
 
-Fencing defaults to `off`. `additive` is the explicit migration mode: upgrade
-the node DaemonSet first, wait for every CSINode to re-register its versioned
-transport identity, and only then enable `additive`. Enable `strict` only after
-`scale_csi_fencing_deferred_total` remains at zero. Follow the complete
+Publication tracking is always on: the driver records every publish in durable
+per-volume properties and enforces CSI single-node exclusivity, same-node
+idempotency, stale-record takeover, and empty-node-id unpublish in every mode.
+`fencing.mode` defaults to `off`, which keeps that tracking but leaves the
+transport allowlists untouched; `additive` and `strict` additionally enforce the
+publication state through the backend allowlists. `additive` is the explicit
+migration mode: upgrade the node DaemonSet first, wait for every CSINode to
+re-register its versioned transport identity, and only then enable `additive`.
+Enable `strict` only after `scale_csi_fencing_deferred_total` remains zero.
+Follow the complete
 [rolling-upgrade procedure](charts/scale-csi/README.md#publication-fencing-and-ownership).
 
 ## Requirements

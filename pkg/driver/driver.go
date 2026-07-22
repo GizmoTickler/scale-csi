@@ -33,7 +33,7 @@ var (
 	getNVMeInfoFromDevice              = util.GetNVMeInfoFromDevice
 	getISCSIInfoFromDeviceWithSessions = util.GetISCSIInfoFromDeviceWithSessions
 	iscsiConnectWithSessions           = util.ISCSIConnectWithOptionsAndSessions
-	nvmeConnectWithSubsystems          = util.NVMeoFConnectWithOptionsAndSubsystems
+	nvmeConnectWithSubsystems          = util.NVMeoFConnectWithOptionsAndSubsystemsContext
 	resolveNodeStatsDevice             = nodeStatsDevice
 	getNodeDeviceSize                  = nodeStatsDeviceSize
 	getNodeFilesystemStats             = util.GetFilesystemStats

@@ -1133,3 +1133,81 @@ func TestDeleteSnapshotRenameTimeoutAfterSuccessKeepsLedgerAndConverges(t *testi
 	_, err = client.SnapshotGet(ctx, tombstoneID)
 	assert.True(t, truenas.IsNotFoundError(err))
 }
+
+// TestOrphanShareSweepDetectsAndDeletesShareWhoseDatasetIsGone covers FIX 3's
+// reconcile sweep: a CSI-managed share whose backing dataset is confirmed absent
+// is residue from an interrupted delete and must be detected and (when deletion is
+// enabled) removed, while shares backed by a present dataset and foreign shares
+// are left untouched.
+func TestOrphanShareSweepDetectsAndDeletesShareWhoseDatasetIsGone(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client,
+	}
+
+	// A CSI-managed share whose dataset still exists is NOT orphaned.
+	liveDS, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/live-volume", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	_, err = client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: liveDS.Mountpoint, Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/live-volume", Enabled: true,
+	})
+	require.NoError(t, err)
+	// A CSI-managed share whose dataset is gone IS orphaned.
+	_, err = client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: "/pool/parent/gone-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/gone-volume", Enabled: true,
+	})
+	require.NoError(t, err)
+	// A foreign (non-CSI) share is never classified.
+	_, err = client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: "/tank/manual", Comment: "manual share", Enabled: true,
+	})
+	require.NoError(t, err)
+
+	kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+
+	require.Len(t, report.OrphanShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
+	assert.Equal(t, 1, report.OrphanShareCount)
+
+	d.deleteOrphanedShares(ctx, &report, 5)
+	require.Len(t, report.DeletedShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
+
+	shares, err := client.NFSShareList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, shares, 2, "only the orphaned share whose dataset is gone may be deleted")
+}
+
+// TestOrphanShareSweepSkipsShareBackedByLivePV proves the safety guard: a share
+// whose dataset is absent but whose volume still has a live PersistentVolume is
+// anomalous and must NOT be swept.
+func TestOrphanShareSweepSkipsShareBackedByLivePV(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client,
+	}
+	_, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: "/pool/parent/anomalous-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/anomalous-volume", Enabled: true,
+	})
+	require.NoError(t, err)
+
+	kubeState := &kubernetesReconcileState{volumeHandles: map[string]struct{}{"anomalous-volume": {}}}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+
+	assert.Empty(t, report.OrphanShares, "a share backed by a live PV must never be classified as orphaned")
+}

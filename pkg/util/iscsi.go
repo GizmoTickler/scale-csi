@@ -674,7 +674,16 @@ func GetISCSIDevicePath(iqn string, lun int) (string, error) {
 
 // ISCSIRescanSession rescans an iSCSI session to detect new LUNs.
 func ISCSIRescanSession(portal, iqn string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
+	return ISCSIRescanSessionWithContext(context.Background(), portal, iqn)
+}
+
+// ISCSIRescanSessionWithContext is ISCSIRescanSession bounded by the inbound
+// context's deadline as well as the configured iSCSI timeout.
+func ISCSIRescanSessionWithContext(ctx context.Context, portal, iqn string) error {
+	ctx, cancel, err := commandContext(ctx, getISCSITimeout())
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--rescan")
