@@ -39,6 +39,11 @@ const (
 	// those would permanently orphan a revocable grant — so the publish FAILS
 	// (ResourceExhausted) instead of silently evicting.
 	additiveGrantHardCap = 32
+
+	// fencingTakeoverReasonStaleRecord labels a successful synchronous takeover
+	// that revoked a stale publication record (its node has no live
+	// VolumeAttachment) to grant a different node.
+	fencingTakeoverReasonStaleRecord = "stale_record"
 )
 
 // isLocalUserPropertySource reports whether a ZFS user-property source marks the
@@ -394,12 +399,13 @@ func validatePublicationCompatibility(records map[string]publicationRecord, requ
 			// flip or a same-family access-mode difference does not change the
 			// backend fence (it keys off node identity and multi-node-ness) and is
 			// tolerated. Only a change that crosses the single-node / multi-node
-			// boundary genuinely alters sharing semantics; that is rejected as an
-			// explicit InvalidArgument rather than a silent success. AlreadyExists
-			// and FailedPrecondition are reserved for a DIFFERENT node below.
+			// boundary genuinely alters sharing semantics; that is rejected with
+			// the CSI-canonical AlreadyExists for "already published at this node,
+			// incompatible". FailedPrecondition is reserved for a DIFFERENT node
+			// below.
 			existingMode := csi.VolumeCapability_AccessMode_Mode(existing.AccessMode)
 			if isMultiNodeMode(existingMode) != isMultiNodeMode(requestedMode) {
-				return status.Errorf(codes.InvalidArgument,
+				return status.Errorf(codes.AlreadyExists,
 					"volume is already published to node %s with access mode %s, incompatible with requested access mode %s",
 					requested.Node, existingMode.String(), requestedMode.String())
 			}
@@ -842,8 +848,11 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 			"revoke stale publication for node %s before granting node %s: %v", blocking.Node, requested.Node, revokeErr)
 	}
 	d.stalePublicationRecordsSeen.Delete(stalePublicationObservationKey(datasetName, blockingKey))
+	RecordFencingTakeover(fencingTakeoverReasonStaleRecord)
 	klog.Infof("Fencing takeover: volume=%s revoked stale publication on node %s (no live VolumeAttachment) to grant node %s",
 		volumeID, blocking.Node, requested.Node)
+	d.recordWarningEvent(volumeEventRef(volumeID), EventReasonFencingTakeover,
+		fmt.Sprintf("revoked stale publication on node %s, granted %s", blocking.Node, requested.Node))
 
 	// Re-read the dataset so the caller's compatibility checks and fence
 	// enforcement observe the post-revocation state, not the pre-takeover copy.

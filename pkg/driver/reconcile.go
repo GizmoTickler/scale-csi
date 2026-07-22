@@ -30,7 +30,6 @@ const (
 	defaultControllerReconcileMinOrphanAge   = 24 * time.Hour
 	replicationJobReasonMissingMarker        = "missing_marker"
 	replicationJobReasonMissingSourceDataset = "missing_source_dataset"
-	replicationJobReasonMissingTargetDataset = "missing_target_dataset"
 )
 
 var (
@@ -345,12 +344,16 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		report.TombstoneSnapshotBytes += item.Bytes
 	}
 
-	if d.config.ZFS.DetachedVolumesFromSnapshots {
-		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			RecordReconcileFailure("spent_restore_classification")
-			return report, ctxErr
-		}
+	// Spent-restore classification always runs (read-only detection). It is NOT
+	// gated on the global zfs.detachedVolumesFromSnapshots flag: a StorageClass
+	// may opt into snapshotRestoreMode=detached while that global default stays
+	// clone, and gating on the global flag alone would leak that class's spent
+	// volsync restore snapshots (never reaped). Deletion remains gated by
+	// opts.Delete and the per-object revalidation in deleteDetectedOrphans.
+	report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		RecordReconcileFailure("spent_restore_classification")
+		return report, ctxErr
 	}
 
 	logAction := "[DRY RUN] would delete"
@@ -623,9 +626,8 @@ func (d *Driver) loadKubernetesReconcileState(ctx context.Context) (*kubernetesR
 		}
 	}
 
-	if !d.config.ZFS.DetachedVolumesFromSnapshots {
-		return state, nil
-	}
+	// VolumeSnapshots and PVCs are always loaded so spent-restore classification
+	// can run regardless of the global detached flag (see reconcileOrphans).
 	volumeSnapshots, err := dynamicClient.Resource(volumeSnapshotGVR).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("list VolumeSnapshots: %w", err)
@@ -850,9 +852,10 @@ func (d *Driver) deleteDetectedOrphans(
 		deletedCount++
 	}
 
-	if !d.config.ZFS.DetachedVolumesFromSnapshots {
-		return nil
-	}
+	// Spent-restore deletion is not gated on the global detached flag (a
+	// detached-opt-in StorageClass must be reapable even when the global default
+	// is clone). This pass only runs under opts.Delete, and each object is
+	// revalidated before deletion below.
 	clientset, dynamicClient, err := d.kubernetesReconcileClients()
 	if err != nil {
 		return err
@@ -1116,9 +1119,14 @@ func (d *Driver) sweepStaleInflightMarkers(ctx context.Context, parent *truenas.
 // sweepOrphanedReplicationJobs aborts only active replication.run_onetime jobs
 // whose target is strictly below this driver's configured parent dataset. A
 // matching copy marker protects legitimate in-flight work unless a live backend
-// read proves that its source or target dataset is gone. Marker reads happen
-// after the job list, preserving the marker-before-launch ordering used by
-// CreateVolume and avoiding a stale-parent-read race with a newly launched job.
+// read proves that its source dataset is gone. The target dataset is never used
+// as an abort trigger: a live detached copy (replication.run_onetime with
+// only_from_scratch) deliberately has no target until 'zfs receive' materializes
+// it, so target absence is expected mid-copy. The source, by contrast, is present
+// throughout a legitimate copy, so its absence unambiguously marks an abandoned
+// job. Marker reads happen after the job list, preserving the marker-before-launch
+// ordering used by CreateVolume and avoiding a stale-parent-read race with a newly
+// launched job.
 func (d *Driver) sweepOrphanedReplicationJobs(ctx context.Context) error {
 	if d.config == nil || d.truenasClient == nil {
 		return fmt.Errorf("driver configuration and TrueNAS client are required")
@@ -1150,11 +1158,9 @@ func (d *Driver) sweepOrphanedReplicationJobs(ctx context.Context) error {
 		reason := ""
 		if _, marked := markers[job.TargetDataset]; !marked {
 			reason = replicationJobReasonMissingMarker
-		} else if missing, conclusive := d.replicationJobDatasetMissing(ctx, job.TargetDataset, job.ID, "target"); !conclusive {
-			continue
-		} else if missing {
-			reason = replicationJobReasonMissingTargetDataset
 		} else {
+			// The target dataset is deliberately absent until 'zfs receive'
+			// materializes it, so only a missing SOURCE proves the job is abandoned.
 			for _, sourceDataset := range job.SourceDatasets {
 				missing, conclusive := d.replicationJobDatasetMissing(ctx, sourceDataset, job.ID, "source")
 				if !conclusive {

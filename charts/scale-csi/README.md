@@ -66,6 +66,16 @@ controller reconcile revokes the stale backend grant after
 engages a mass-revocation brake and increments
 `scale_csi_fencing_stale_deferred_total`.
 
+When a `ControllerPublishVolume` for a new node finds a stale publication record
+for another node that has no live VolumeAttachment, the controller takes over
+synchronously: it revokes the stale grant and grants the new node. Each
+successful takeover increments
+`scale_csi_fencing_takeover_total{reason="stale_record"}` and emits a
+`FencingTakeover` warning event on the PersistentVolume. This is the most
+dangerous operation on a live strict cluster, so alert on a non-zero rate of
+this metric to catch unexpected node-identity churn or attachment-controller
+misbehavior.
+
 `additive` is the upgrade-safe transition mode when it is enabled in the
 required sequence below. It adds per-node entries while
 retaining configured/static backend entries and never removes an unknown legacy
@@ -351,9 +361,13 @@ disabled unless `reconcile.delete.enabled=true`. The CronJob invokes
 `--mode=reconcile`; backend cleanup always calls the driver's guarded CSI
 `DeleteVolume` and `DeleteSnapshot` implementations, so clone, snapshot, and
 foreign-snapshot dependency checks still apply. Spent VolSync restore snapshots
-are classified only when detached snapshot copies are enabled and their source
-PVC is no longer Bound. TrueNAS 26.0 cannot persist a property update on an
-existing snapshot, so this path performs no backend writes. Deletion requires
+(matching `volsync-*-dst-dest*`) are classified whenever their source PVC is no
+longer Bound. Classification is read-only and is NOT gated on the global
+`zfs.detachedVolumesFromSnapshots` flag, so a StorageClass that opts into
+`snapshotRestoreMode=detached` while the global default stays `clone` still has
+its spent snapshots detected and reapable. TrueNAS 26.0 cannot persist a
+property update on an existing snapshot, so this path performs no backend
+writes. Deletion requires
 the later of the Kubernetes VolumeSnapshot creation time and backend ZFS
 snapshot creation time to exceed `reconcile.minOrphanAge`; clock skew can only
 delay cleanup.
@@ -362,8 +376,10 @@ The replication-job sweep is always on, even when `reconcile.enabled=false` or
 `reconcile.delete.enabled=false`. It calls `core.job_abort` only for active
 `replication.run_onetime` jobs whose target is strictly below
 `zfs.parentDataset` and which have no matching in-flight marker, or whose source
-or target dataset is provably gone. Jobs outside that dataset tree are never
-touched.
+dataset is provably gone. A missing TARGET dataset is never an abort trigger: a
+live detached copy (`only_from_scratch`) deliberately has no target until
+`zfs receive` materializes it, whereas the source is present throughout a
+legitimate copy. Jobs outside that dataset tree are never touched.
 
 > **DANGER — one parent per cluster:** `zfs.parentDataset` MUST be unique to one
 > Kubernetes cluster. Never point two live clusters at the same parent dataset.

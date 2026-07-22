@@ -213,6 +213,19 @@ var (
 		},
 	)
 
+	// fencingTakeoverTotal counts successful synchronous stale-publication
+	// takeovers — the single most dangerous operation on a live strict cluster
+	// (it revokes one node's grant to hand the volume to another). It is labeled
+	// by reason so alerting can watch the stale_record path specifically.
+	fencingTakeoverTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "fencing_takeover_total",
+			Help:      "Total successful synchronous fencing takeovers, labeled by reason",
+		},
+		[]string{"reason"},
+	)
+
 	// fencingProvenanceOverflowTotal counts publishes refused because a node's
 	// additive CSI-added grant provenance list exceeded the hard cap even after
 	// compaction — i.e. it consists entirely of backend-live entries. Provenance
@@ -276,7 +289,6 @@ func init() {
 		replicationJobReasonCreateVolumeFailed,
 		replicationJobReasonMissingMarker,
 		replicationJobReasonMissingSourceDataset,
-		replicationJobReasonMissingTargetDataset,
 	} {
 		replicationJobsAbortedTotal.WithLabelValues(reason).Add(0)
 	}
@@ -284,6 +296,7 @@ func init() {
 		fencingDeferredTotal.WithLabelValues("missing_identity", protocol).Add(0)
 	}
 	fencingDeferredTotal.WithLabelValues("outside_allowed_network", "nfs").Add(0)
+	fencingTakeoverTotal.WithLabelValues(fencingTakeoverReasonStaleRecord).Add(0)
 	for _, protocol := range []string{"nfs", "nvmeof"} {
 		fencingProvenanceOverflowTotal.WithLabelValues(protocol).Add(0)
 	}
@@ -380,6 +393,10 @@ func RecordFencingDeferred(reason, protocol string) {
 
 func RecordFencingStaleDeferred() {
 	fencingStaleDeferredTotal.Inc()
+}
+
+func RecordFencingTakeover(reason string) {
+	fencingTakeoverTotal.WithLabelValues(reason).Inc()
 }
 
 func RecordFencingProvenanceOverflow(protocol string) {

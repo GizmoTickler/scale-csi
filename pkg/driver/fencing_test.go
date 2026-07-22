@@ -2324,7 +2324,8 @@ func TestAdditiveNVMeHostnqnlessRepublishRetainsProvenanceForUnpublish(t *testin
 // FIX 1 regression: ControllerPublishVolume MUST be idempotent for a repeated
 // (volume, node) publish. A same-node republish re-affirms the grant instead of
 // failing AlreadyExists; only a genuine single-node<->multi-node capability
-// change is rejected, and as InvalidArgument rather than a silent success.
+// change is rejected, with the CSI-canonical AlreadyExists for "already
+// published at this node, incompatible" rather than a silent success.
 func TestControllerPublishSameNodeRepublishIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
@@ -2380,7 +2381,7 @@ func TestControllerPublishSameNodeRepublishIsIdempotent(t *testing.T) {
 	// incompatible and must be rejected explicitly, not silently accepted.
 	err = publish(csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER, false)
 	require.Error(t, err)
-	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Equal(t, codes.AlreadyExists, status.Code(err))
 }
 
 // newTakeoverTestDriver builds a strict NFS fencing driver whose event recorder
@@ -2479,8 +2480,12 @@ func TestControllerPublishTakesOverStaleSingleNodeRecord(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts)
 
+	takeoverBefore := testutil.ToFloat64(fencingTakeoverTotal.WithLabelValues(fencingTakeoverReasonStaleRecord))
 	_, err = d.ControllerPublishVolume(ctx, takeoverPublishRequest("takeover-stale", "worker-b", "192.0.2.12"))
 	require.NoError(t, err)
+	assert.Equal(t, takeoverBefore+1,
+		testutil.ToFloat64(fencingTakeoverTotal.WithLabelValues(fencingTakeoverReasonStaleRecord)),
+		"a successful stale-record takeover must be counted")
 
 	share, err = client.NFSShareGet(ctx, shareID)
 	require.NoError(t, err)

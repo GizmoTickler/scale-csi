@@ -270,7 +270,7 @@ func TestReconcileSnapshotHandleFallsBackToNameOnlyForUnparsableID(t *testing.T)
 	assert.Equal(t, "authoritative-name", handle)
 }
 
-func TestReconcileSpentRestoreRecognitionRequiresDetachedAndNonBoundPVC(t *testing.T) {
+func TestReconcileSpentRestoreRecognitionRequiresVolsyncNamingAndNonBoundPVC(t *testing.T) {
 	old := metav1.NewTime(time.Now().Add(-48 * time.Hour))
 	dynamicObjects := []runtime.Object{
 		reconcileVolumeSnapshot("storage", "volsync-app-dst-dest", "released-source", "released-content", old),
@@ -299,10 +299,21 @@ func TestReconcileSpentRestoreRecognitionRequiresDetachedAndNonBoundPVC(t *testi
 	assert.Equal(t, "volsync-db-dst-dest-final", report.SpentRestoreSnapshots[1].Name)
 	assert.True(t, report.SpentRestoreSnapshots[1].SourcePVCWasMissing)
 
-	attached, _ := newReconcileTestDriver(t, false, coreObjects, dynamicObjects)
-	report, err = attached.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
+	// FINDING 4 regression: classification must NOT be gated on the global
+	// zfs.detachedVolumesFromSnapshots flag. A StorageClass may opt into
+	// snapshotRestoreMode=detached while the global default stays clone; its
+	// spent volsync restore snapshots must still be detected (and, under a
+	// delete pass, reapable). Detection is read-only; only deletion is gated.
+	globalClone, globalBackend := newReconcileTestDriver(t, false, coreObjects, dynamicObjects)
+	for _, handle := range []string{"released-handle", "missing-handle", "bound-handle", "manual-handle"} {
+		addReconcileSnapshot(t, globalBackend, "restore-source", handle, old.Time, true, 1)
+	}
+	report, err = globalClone.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
 	require.NoError(t, err)
-	assert.Empty(t, report.SpentRestoreSnapshots)
+	require.Len(t, report.SpentRestoreSnapshots, 2,
+		"spent-restore classification runs regardless of the global detached flag")
+	assert.Equal(t, "volsync-app-dst-dest", report.SpentRestoreSnapshots[0].Name)
+	assert.Equal(t, "volsync-db-dst-dest-final", report.SpentRestoreSnapshots[1].Name)
 }
 
 func TestReconcileDeletesSpentRestoreSnapshotOnlyThroughKubernetes(t *testing.T) {
@@ -787,38 +798,41 @@ func TestReplicationJobSweepKeepsJobWithLiveMarker(t *testing.T) {
 	assert.Empty(t, reasons)
 }
 
-func TestReplicationJobSweepAbortsMarkedJobWithMissingDataset(t *testing.T) {
-	for _, tc := range []struct {
-		name           string
-		jobID          int64
-		createSource   bool
-		createTarget   bool
-		expectedReason string
-	}{
-		{name: "target", jobID: 204, createSource: true, expectedReason: replicationJobReasonMissingTargetDataset},
-		{name: "source", jobID: 205, createTarget: true, expectedReason: replicationJobReasonMissingSourceDataset},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			d, client := newReconcileTestDriver(t, true, nil, nil)
-			mustCreateParentDataset(t, client)
-			if tc.createSource {
-				createReplicationSweepDataset(t, client, "pool/parent/source")
-			}
-			if tc.createTarget {
-				createReplicationSweepDataset(t, client, "pool/parent/marked-target")
-			}
-			writeReplicationSweepMarker(t, d, "pool/parent/marked-target")
-			client.AddReplicationJob(&truenas.ReplicationJob{
-				ID: tc.jobID, Method: truenas.ReplicationRunOnetimeMethod, State: "RUNNING",
-				SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/marked-target",
-			})
+func TestReplicationJobSweepAbortsMarkedJobWithMissingSource(t *testing.T) {
+	d, client := newReconcileTestDriver(t, true, nil, nil)
+	mustCreateParentDataset(t, client)
+	// Source absent, target present: the source is present throughout a legit
+	// copy, so its absence proves the job is abandoned.
+	createReplicationSweepDataset(t, client, "pool/parent/marked-target")
+	writeReplicationSweepMarker(t, d, "pool/parent/marked-target")
+	client.AddReplicationJob(&truenas.ReplicationJob{
+		ID: 205, Method: truenas.ReplicationRunOnetimeMethod, State: "RUNNING",
+		SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/marked-target",
+	})
 
-			require.NoError(t, d.sweepOrphanedReplicationJobs(context.Background()))
-			aborted, reasons := client.ReplicationJobAbortHistory()
-			assert.Equal(t, []int64{tc.jobID}, aborted)
-			assert.Equal(t, []string{tc.expectedReason}, reasons)
-		})
-	}
+	require.NoError(t, d.sweepOrphanedReplicationJobs(context.Background()))
+	aborted, reasons := client.ReplicationJobAbortHistory()
+	assert.Equal(t, []int64{205}, aborted)
+	assert.Equal(t, []string{replicationJobReasonMissingSourceDataset}, reasons)
+}
+
+func TestReplicationJobSweepKeepsMarkedJobWithMissingTarget(t *testing.T) {
+	d, client := newReconcileTestDriver(t, true, nil, nil)
+	mustCreateParentDataset(t, client)
+	// Source present, target absent: a live detached copy (only_from_scratch)
+	// deliberately has no target until 'zfs receive' materializes it, so a
+	// missing target with a live marker and present source must be kept.
+	createReplicationSweepDataset(t, client, "pool/parent/source")
+	writeReplicationSweepMarker(t, d, "pool/parent/marked-target")
+	client.AddReplicationJob(&truenas.ReplicationJob{
+		ID: 204, Method: truenas.ReplicationRunOnetimeMethod, State: "RUNNING",
+		SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/marked-target",
+	})
+
+	require.NoError(t, d.sweepOrphanedReplicationJobs(context.Background()))
+	aborted, reasons := client.ReplicationJobAbortHistory()
+	assert.Empty(t, aborted)
+	assert.Empty(t, reasons)
 }
 
 func TestReplicationJobSweepRunsAtStartupAndPeriodicallyWhenOrphanDetectionDisabled(t *testing.T) {
