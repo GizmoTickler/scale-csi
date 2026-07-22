@@ -669,8 +669,11 @@ func TestReconcileNeverReapsForeignTombstoneShapedSnapshots(t *testing.T) {
 	})
 	require.NoError(t, err)
 	liveCSI.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+	// Forge the ledger entry with a MATCHING creation time so the live-identity
+	// belt (not the creation-identity check) is the guard this test proves.
 	require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
 		Version: tombstoneLedgerVersion, Snapshot: liveCSI.ID, Dataset: source.Name,
+		CreatedAt: liveCSI.GetCreationTime(),
 		RenamedAt: time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339Nano),
 	}))
 
@@ -892,4 +895,100 @@ func reconcileVolumeSnapshot(
 		},
 		"status": map[string]interface{}{"boundVolumeSnapshotContentName": contentName},
 	}}
+}
+
+// FIX 5a regression: a stale ledger entry must never authorize reaping a
+// DIFFERENT snapshot later recreated at the same full ID — the entry's recorded
+// immutable creation time no longer matches the observed object.
+func TestReconcileRefusesStaleLedgerOverRecreatedLookalike(t *testing.T) {
+	ctx := context.Background()
+	pvSource := reconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pvSource}, nil)
+	mustCreateParentDataset(t, client)
+	source := addReconcileDataset(client, "source", time.Now().Add(-90*24*time.Hour), true, testGiB)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+
+	// The stale entry records a long-gone tombstone (its removal was lost).
+	staleCreation := time.Now().Add(-90 * 24 * time.Hour).Unix()
+	require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+		Version:   tombstoneLedgerVersion,
+		Snapshot:  "pool/parent/source@old-csi-deleted-7",
+		Dataset:   source.Name,
+		CreatedAt: staleCreation,
+		RenamedAt: time.Now().Add(-90 * 24 * time.Hour).UTC().Format(time.RFC3339Nano),
+	}))
+	// A user manually recreates a snapshot at exactly that full ID (no CSI
+	// identity, tombstone-shaped name, aged past the orphan gate).
+	lookalike, err := client.SnapshotCreate(ctx, source.Name, "old-csi-deleted-7", nil)
+	require.NoError(t, err)
+	lookalike.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+	require.NotEqual(t, staleCreation, lookalike.GetCreationTime(), "precondition: creation identities differ")
+
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Zero(t, report.TombstoneSnapshotCount, "a creation-identity mismatch must not classify")
+	assert.Empty(t, report.DeletedTombstones)
+	_, err = client.SnapshotGet(ctx, lookalike.ID)
+	require.NoError(t, err, "the recreated lookalike must survive the stale ledger entry")
+}
+
+// FIX 5b regression: a rename error may be a timeout AFTER the rename landed.
+// The ledger entry must then be KEPT (it is the reaper's only provenance for
+// the now-unnamed tombstone); the CO retry of DeleteSnapshot converges, and the
+// reaper can still reap the tombstone once its clone is gone.
+type renameTimeoutAfterSuccessMock struct {
+	*truenas.MockClient
+	fired bool
+}
+
+func (m *renameTimeoutAfterSuccessMock) SnapshotRename(ctx context.Context, snapshotID, newName string) error {
+	err := m.MockClient.SnapshotRename(ctx, snapshotID, newName)
+	if err == nil && !m.fired {
+		m.fired = true
+		return context.DeadlineExceeded // the rename landed; only the reply was lost
+	}
+	return err
+}
+
+func TestDeleteSnapshotRenameTimeoutAfterSuccessKeepsLedgerAndConverges(t *testing.T) {
+	ctx := context.Background()
+	pvSource := reconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pvSource}, nil)
+	client.NoDeferredSnapshotDestroy = true
+	wrapped := &renameTimeoutAfterSuccessMock{MockClient: client}
+	d.truenasClient = wrapped
+	mustCreateParentDataset(t, client)
+	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropManagedResource:           "true",
+		PropCSISnapshotName:           "snap-1",
+		PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	snapshot.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/restored"))
+
+	// The rename lands but reports a timeout: DeleteSnapshot surfaces the error,
+	// yet the tombstone exists and its ledger entry MUST survive.
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "snap-1"})
+	require.Error(t, err)
+	tombstoneID := findTombstoneID(t, client, source.Name)
+	require.NotEmpty(t, tombstoneID, "the rename actually landed")
+	parent, err := client.DatasetGet(ctx, "pool/parent")
+	require.NoError(t, err)
+	require.Contains(t, tombstoneLedgerFromDataset(parent), tombstoneLedgerKey(tombstoneID),
+		"the ledger entry must be kept when the tombstone exists")
+
+	// The CO retry converges: the CSI name was released by the landed rename.
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "snap-1"})
+	require.NoError(t, err)
+
+	// Once the clone is gone the retained ledger lets the reaper reap.
+	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Contains(t, report.DeletedTombstones, tombstoneID)
+	_, err = client.SnapshotGet(ctx, tombstoneID)
+	assert.True(t, truenas.IsNotFoundError(err))
 }

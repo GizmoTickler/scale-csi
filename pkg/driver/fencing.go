@@ -686,6 +686,13 @@ func (d *Driver) populateAdditiveGrantOwnership(
 					associationExists = true
 				}
 			}
+			if associationExists {
+				// The CURRENT NQN's association is live even when the backend hides
+				// hostnqn (matched by HostID above). It must count as backend-live,
+				// or a republish would compact the live entry out of provenance and
+				// the final unpublish could never revoke the association.
+				backendNQNs = append(backendNQNs, nqn)
+			}
 			// Defensive completeness for backends that omit the expanded hostnqn
 			// field: a provenance entry whose association is live but only visible
 			// by HostID must count as backend-live, or compaction would drop an

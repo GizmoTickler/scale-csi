@@ -2612,3 +2612,301 @@ func TestIsDatasetDependencyOrBusyError_InspectsAPIErrorData(t *testing.T) {
 
 	assert.False(t, isDatasetDependencyOrBusyError(nil))
 }
+
+// FIX 1 regression: when the failure-path cleanup destroy of a partial detached
+// copy FAILS (the transferred snapshot blocks the non-recursive delete), the
+// in-flight marker must be KEPT — it is the retry's only provenance for
+// recovering the remnant. Retiring it would leave an unrecoverable, unmarked
+// leak. The retry then recovers (marker-sanctioned recursive destroy → Aborted)
+// and the next attempt converges.
+type detachedCopyPartialWithSnapshotClient struct {
+	*truenas.MockClient
+	fired bool
+}
+
+func (m *detachedCopyPartialWithSnapshotClient) CopyDatasetFromSnapshotLocal(
+	ctx context.Context,
+	sourceDataset, snapshotShortName, targetDataset string,
+) error {
+	if m.fired {
+		return m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
+	}
+	m.fired = true
+	// The real crash/failure shape: replication created the target AND left the
+	// transferred snapshot on it before the job failed.
+	if err := m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset); err != nil {
+		return err
+	}
+	if _, err := m.SnapshotCreate(ctx, targetDataset, snapshotShortName, nil); err != nil {
+		return err
+	}
+	return errors.New("injected replication job failure after partial receive")
+}
+
+func TestCreateVolumeDetachedCopyCleanupFailureKeepsMarkerForRecovery(t *testing.T) {
+	ctx := context.Background()
+	client := &detachedCopyPartialWithSnapshotClient{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DetachedVolumesFromSnapshots: true, DatasetEnableQuotas: true},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+		},
+		truenasClient: client,
+	}
+	mustCreateParentDataset(t, client.MockClient)
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB})
+	require.NoError(t, err)
+	_, err = client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropManagedResource: "true", PropCSISnapshotName: "snap-1", PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	request := func() *csi.CreateVolumeRequest {
+		return &csi.CreateVolumeRequest{
+			Name:               "restored",
+			Parameters:         map[string]string{"protocol": "nfs"},
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+			}},
+		}
+	}
+
+	// Attempt 1: copy fails; the non-recursive cleanup destroy fails on the
+	// transferred snapshot; the marker MUST survive.
+	_, err = d.CreateVolume(ctx, request())
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	_, getErr := client.DatasetGet(ctx, "pool/parent/restored")
+	require.NoError(t, getErr, "the partial target still exists (cleanup destroy failed)")
+	marker, err := d.readInflightMarker(ctx, "restored")
+	require.NoError(t, err)
+	require.NotNil(t, marker, "the marker must be kept when the cleanup destroy fails")
+
+	// Attempt 2: recovery destroys the marker-proven remnant recursively.
+	_, err = d.CreateVolume(ctx, request())
+	require.Error(t, err)
+	assert.Equal(t, codes.Aborted, status.Code(err))
+	_, getErr = client.DatasetGet(ctx, "pool/parent/restored")
+	assert.True(t, truenas.IsNotFoundError(getErr))
+
+	// Attempt 3 converges.
+	resp, err := d.CreateVolume(ctx, request())
+	require.NoError(t, err)
+	assert.Equal(t, "snap-1", resp.GetVolume().GetContentSource().GetSnapshot().GetSnapshotId())
+	restored, err := client.DatasetGet(ctx, "pool/parent/restored")
+	require.NoError(t, err)
+	assert.True(t, datasetHasLocalUserProperty(restored, PropDriverInstanceID, d.driverInstanceID()))
+}
+
+// FIX 2 regression: a destination-exists loser must NOT delete the shared
+// per-volume marker — the same-instance winner may crash before its ownership
+// stamp, and the surviving marker is what lets the retry recover its remnant.
+type destinationExistsOnceCloneClient struct {
+	*truenas.MockClient
+	fired bool
+}
+
+func (m *destinationExistsOnceCloneClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error {
+	if m.fired {
+		return m.MockClient.SnapshotClone(ctx, snapshotID, newDatasetName)
+	}
+	m.fired = true
+	// The winner's clone lands between the loser's existence check and its clone
+	// call; the loser observes destination-exists.
+	if err := m.MockClient.SnapshotClone(ctx, snapshotID, newDatasetName); err != nil {
+		return err
+	}
+	return &truenas.ErrDatasetDestinationExists{
+		Destination: newDatasetName, ExpectedOrigin: snapshotID, ActualOrigin: snapshotID,
+	}
+}
+
+func TestDestinationExistsLoserPreservesMarkerForWinnersCrashRecovery(t *testing.T) {
+	ctx := context.Background()
+	client := &destinationExistsOnceCloneClient{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DatasetEnableQuotas: true},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+		},
+		truenasClient: client,
+	}
+	mustCreateParentDataset(t, client.MockClient)
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB})
+	require.NoError(t, err)
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropManagedResource: "true", PropCSISnapshotName: "snap-1", PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	request := func() *csi.CreateVolumeRequest {
+		return &csi.CreateVolumeRequest{
+			Name:               "restored",
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+			}},
+		}
+	}
+
+	// The loser: writes the marker, then observes destination-exists (the winner
+	// created the clone and then "crashed" before its ownership stamp).
+	_, err = d.CreateVolume(ctx, request())
+	require.Error(t, err)
+	assert.Equal(t, codes.Aborted, status.Code(err))
+	marker, err := d.readInflightMarker(ctx, "restored")
+	require.NoError(t, err)
+	require.NotNil(t, marker, "the loser must not delete the marker the crashed winner needs")
+	remnant, err := client.DatasetGet(ctx, "pool/parent/restored")
+	require.NoError(t, err)
+	require.False(t, datasetHasLocalUserProperty(remnant, PropDriverInstanceID, d.driverInstanceID()),
+		"precondition: the winner crashed before stamping")
+
+	// The retry recovers the winner's remnant via the surviving marker.
+	resp, err := d.CreateVolume(ctx, request())
+	require.NoError(t, err)
+	assert.Equal(t, "snap-1", resp.GetVolume().GetContentSource().GetSnapshot().GetSnapshotId())
+	restored, err := client.DatasetGet(ctx, "pool/parent/restored")
+	require.NoError(t, err)
+	assert.True(t, datasetHasLocalUserProperty(restored, PropDriverInstanceID, d.driverInstanceID()))
+	assert.Equal(t, snapshot.ID, datasetOriginSnapshotID(restored))
+	consumed, err := d.readInflightMarker(ctx, "restored")
+	require.NoError(t, err)
+	assert.Nil(t, consumed, "the marker is retired after the successful recovery")
+}
+
+// FIX 3 regression: detached-copy recovery must validate protocol and capacity
+// compatibility against the request BEFORE the destructive recursive destroy;
+// a mismatched request keeps terminal AlreadyExists with the remnant untouched.
+func TestCreateVolumeCopyRemnantRecoveryRejectsIncompatibleRequests(t *testing.T) {
+	t.Run("protocol mismatch leaves the remnant untouched", func(t *testing.T) {
+		ctx := context.Background()
+		client := truenas.NewMockClient()
+		d := &Driver{
+			config: &Config{
+				ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DetachedVolumesFromSnapshots: true, ZvolReadyTimeout: 1},
+				DriverName: "org.scale.csi.iscsi",
+			},
+			truenasClient: client,
+		}
+		mustCreateParentDataset(t, client)
+		source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "VOLUME", Volsize: testGiB})
+		require.NoError(t, err)
+		_, err = client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+			PropManagedResource: "true", PropCSISnapshotName: "snap-1", PropCSISnapshotSourceVolumeID: "source",
+		})
+		require.NoError(t, err)
+		contentSource := &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+		}}
+		marker, err := d.newInflightMarker("pool/parent/restored", contentSource, ShareTypeISCSI)
+		require.NoError(t, err)
+		marker.Mode = inflightModeCopy
+		require.NoError(t, d.writeInflightMarker(ctx, marker))
+		client.Datasets["pool/parent/restored"] = &truenas.Dataset{
+			ID: "pool/parent/restored", Name: "pool/parent/restored", Type: "VOLUME",
+			Volsize:        truenas.DatasetProperty{Parsed: float64(testGiB)},
+			Creation:       truenas.DatasetProperty{Parsed: float64(time.Now().Unix())},
+			UserProperties: map[string]truenas.UserProperty{},
+		}
+
+		// The marker records iscsi; the request asks for nvmeof.
+		_, err = d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+			Name:                "restored",
+			Parameters:          map[string]string{"protocol": "nvmeof"},
+			VolumeCapabilities:  []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:       &csi.CapacityRange{RequiredBytes: testGiB},
+			VolumeContentSource: contentSource,
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+		_, getErr := client.DatasetGet(ctx, "pool/parent/restored")
+		require.NoError(t, getErr, "a protocol-incompatible request must not destroy the remnant")
+	})
+
+	t.Run("capacity limit mismatch leaves the remnant untouched", func(t *testing.T) {
+		ctx := context.Background()
+		client := truenas.NewMockClient()
+		d := &Driver{
+			config: &Config{
+				ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DetachedVolumesFromSnapshots: true, DatasetEnableQuotas: true},
+				DriverName: "org.scale.csi.nfs",
+				NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+			},
+			truenasClient: client,
+		}
+		mustCreateParentDataset(t, client)
+		source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: 4 * testGiB})
+		require.NoError(t, err)
+		_, err = client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+			PropManagedResource: "true", PropCSISnapshotName: "snap-1", PropCSISnapshotSourceVolumeID: "source",
+		})
+		require.NoError(t, err)
+		contentSource := &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+		}}
+		marker, err := d.newInflightMarker("pool/parent/restored", contentSource, ShareTypeNFS)
+		require.NoError(t, err)
+		marker.Mode = inflightModeCopy
+		require.NoError(t, d.writeInflightMarker(ctx, marker))
+		client.Datasets["pool/parent/restored"] = &truenas.Dataset{
+			ID: "pool/parent/restored", Name: "pool/parent/restored", Type: "FILESYSTEM",
+			Mountpoint:     "/mnt/pool/parent/restored",
+			Refquota:       truenas.DatasetProperty{Parsed: float64(4 * testGiB)},
+			Creation:       truenas.DatasetProperty{Parsed: float64(time.Now().Unix())},
+			UserProperties: map[string]truenas.UserProperty{},
+		}
+		transferred, err := client.SnapshotCreate(ctx, "pool/parent/restored", "snap-1", nil)
+		require.NoError(t, err)
+
+		// The remnant's 4GiB exceed the request's 2GiB limit.
+		_, err = d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+			Name:                "restored",
+			Parameters:          map[string]string{"protocol": "nfs"},
+			VolumeCapabilities:  []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:       &csi.CapacityRange{RequiredBytes: testGiB, LimitBytes: 2 * testGiB},
+			VolumeContentSource: contentSource,
+		})
+		require.Error(t, err)
+		assert.Equal(t, codes.AlreadyExists, status.Code(err))
+		_, getErr := client.DatasetGet(ctx, "pool/parent/restored")
+		require.NoError(t, getErr, "a capacity-incompatible request must not destroy the remnant")
+		_, snapErr := client.SnapshotGet(ctx, transferred.ID)
+		require.NoError(t, snapErr, "the transferred snapshot survives with the refused remnant")
+	})
+}
+
+// FIX 6 regression: a legitimate CSI snapshot whose requested name happens to
+// look like a tombstone (ends in -csi-deleted-<uint>) has a full CSI lifecycle:
+// it is created, listed, and — critically — actually deleted, not silently
+// no-opped as "non-CSI".
+func TestDeleteSnapshotWithTombstoneShapedNameHasFullLifecycle(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}, DriverName: "org.scale.csi.nfs"},
+		truenasClient: client,
+	}
+	mustCreateParentDataset(t, client)
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB})
+	require.NoError(t, err)
+
+	created, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
+		Name: "backup-csi-deleted-2024", SourceVolumeId: "source",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "backup-csi-deleted-2024", created.GetSnapshot().GetSnapshotId())
+
+	listed, err := d.ListSnapshots(ctx, &csi.ListSnapshotsRequest{SnapshotId: "backup-csi-deleted-2024"})
+	require.NoError(t, err)
+	require.Len(t, listed.GetEntries(), 1, "a live CSI snapshot is listed regardless of its name shape")
+
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "backup-csi-deleted-2024"})
+	require.NoError(t, err)
+	remaining, err := client.SnapshotFindByName(ctx, "pool/parent", "backup-csi-deleted-2024")
+	require.NoError(t, err)
+	assert.Nil(t, remaining, "DeleteSnapshot must actually delete the tombstone-shaped-name CSI snapshot")
+}

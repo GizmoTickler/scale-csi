@@ -306,6 +306,12 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		if !recorded || entry.Snapshot != snap.ID {
 			continue
 		}
+		// The ledger's recorded immutable creation time must match the observed
+		// snapshot: a stale entry never authorizes classifying (or later reaping)
+		// a DIFFERENT object recreated at the same full ID.
+		if entry.CreatedAt <= 0 || entry.CreatedAt != snap.GetCreationTime() {
+			continue
+		}
 		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {
 			klog.Warningf("Orphan reconcile: skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name and ledger entry", snap.ID)
 			continue
@@ -944,7 +950,9 @@ func (d *Driver) hardRecheckSnapshotContentAbsent(ctx context.Context, orphan Re
 // like a tombstone (its recorded CSI name sanitizes to its own current short
 // name), e.g. a snapshot literally created as "backup-csi-deleted-2024". Such an
 // object could only meet the ledger gate through a stale entry at an identical
-// recreated full ID, and must never be reaped.
+// recreated full ID, and must never be reaped. It shares the exact identity
+// predicate the global tombstone classification uses (identity beats name
+// shape), so classification and reaping can never diverge.
 //
 // Deliberately NOT "skip whenever csi_snapshot_name is present": on TrueNAS 26.0
 // the post-rename property strip is a silent no-op (no API mutates properties on
@@ -954,14 +962,7 @@ func (d *Driver) hardRecheckSnapshotContentAbsent(ctx context.Context, orphan Re
 // check would make the reaper permanently inert on the exact backend the leak
 // repair exists for.
 func snapshotIsLiveCSIObjectWithTombstoneShapedName(snap *truenas.Snapshot) bool {
-	if snap == nil {
-		return false
-	}
-	property, ok := snap.UserProperties[PropCSISnapshotName]
-	if !ok || property.Value == "" || property.Value == "-" {
-		return false
-	}
-	return sanitizeVolumeID(property.Value) == snap.Name
+	return snapshotCarriesLiveCSIIdentity(snap)
 }
 
 // reapTombstoneSnapshot removes a driver-created deferred-delete tombstone once
@@ -970,8 +971,9 @@ func snapshotIsLiveCSIObjectWithTombstoneShapedName(snap *truenas.Snapshot) bool
 // tombstone behind whenever a live clone still depends on it; this reaps it
 // exactly when the dependency is finally released. Destruction requires, all
 // re-proven under the source volume lock immediately before the delete:
-//   - a matching parent-dataset ledger entry (driver provenance — the name shape
-//     alone never authorizes a reap);
+//   - a matching parent-dataset ledger entry whose recorded immutable creation
+//     time matches the observed snapshot (driver provenance — neither the name
+//     shape nor a stale entry over a recreated same-ID object authorizes a reap);
 //   - no live CSI snapshot identity (belt against stale-ledger name collisions);
 //   - the source dataset locally stamped by THIS driver instance;
 //   - unchanged creation identity and satisfied age gate.
@@ -1017,6 +1019,9 @@ func (d *Driver) reapTombstoneSnapshot(
 	entry, recorded := tombstoneLedgerFromDataset(parent)[tombstoneLedgerKey(snapshot.ID)]
 	if !recorded || entry.Snapshot != snapshot.ID {
 		return false, "no tombstone ledger entry proves driver provenance"
+	}
+	if entry.CreatedAt <= 0 || entry.CreatedAt != snapshot.GetCreationTime() {
+		return false, "tombstone ledger creation identity does not match the observed snapshot"
 	}
 	// The tombstone must sit on a dataset this driver instance owns.
 	sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, snapshot.Dataset)

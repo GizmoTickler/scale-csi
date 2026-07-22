@@ -154,22 +154,56 @@ func isCSISnapshot(snap *truenas.Snapshot) bool {
 	return managed || hasCSIName
 }
 
+// snapshotShortName returns the snapshot's short name, falling back to the
+// name encoded in its full ID.
+func snapshotShortName(snap *truenas.Snapshot) string {
+	if snap == nil {
+		return ""
+	}
+	if snap.Name != "" {
+		return snap.Name
+	}
+	if extracted, ok := extractSnapshotName(snap.ID); ok {
+		return extracted
+	}
+	return ""
+}
+
+// snapshotCarriesLiveCSIIdentity reports that a snapshot's recorded CSI name
+// sanitizes to its own CURRENT short name — i.e. it is a live CSI snapshot
+// under exactly that name (created as such), not a renamed driver tombstone.
+// Driver tombstones fail this: their retained csi_snapshot_name (the 26.0
+// property strip is a silent no-op) records the PRE-rename name, which no
+// longer matches the tombstone-shaped current name.
+func snapshotCarriesLiveCSIIdentity(snap *truenas.Snapshot) bool {
+	if snap == nil {
+		return false
+	}
+	property, ok := snap.UserProperties[PropCSISnapshotName]
+	if !ok || property.Value == "" || property.Value == "-" {
+		return false
+	}
+	return sanitizeVolumeID(property.Value) == snapshotShortName(snap)
+}
+
 func isSnapshotTombstone(snap *truenas.Snapshot) bool {
 	if snap == nil {
 		return false
 	}
-	name := snap.Name
-	if name == "" {
-		if extracted, ok := extractSnapshotName(snap.ID); ok {
-			name = extracted
-		}
-	}
+	name := snapshotShortName(snap)
 	marker := strings.LastIndex(name, snapshotTombstoneMarker)
 	if marker <= 0 {
 		return false
 	}
-	_, err := strconv.ParseUint(name[marker+len(snapshotTombstoneMarker):], 10, 64)
-	return err == nil
+	if _, err := strconv.ParseUint(name[marker+len(snapshotTombstoneMarker):], 10, 64); err != nil {
+		return false
+	}
+	// Identity beats name shape: a legitimate CSI snapshot whose requested name
+	// merely ends in -csi-deleted-<n> is a CSI snapshot with a full lifecycle
+	// (deletable, listable, blocking), never a tombstone. Real driver tombstones
+	// released their CSI name at rename, so their retained identity (if any) no
+	// longer matches and they still classify as tombstones.
+	return !snapshotCarriesLiveCSIIdentity(snap)
 }
 
 // ControllerGetCapabilities returns the capabilities of the controller.
@@ -839,6 +873,18 @@ func (d *Driver) recoverInFlightContentSourceRemnant(
 	case inflightModeCopy:
 		if !d.config.ZFS.DetachedVolumesFromSnapshots || source.GetSnapshot() == nil {
 			return existingDS, remnantActionNone, nil
+		}
+		// The same request-compatibility validation as the clone branch runs
+		// BEFORE the destroy: an incompatible request must keep the terminal
+		// AlreadyExists outcome with the remnant untouched, never trigger a
+		// destroy-and-recreate on behalf of a differently-shaped request.
+		if marker.Protocol != string(shareType) {
+			return existingDS, remnantActionNone, nil
+		}
+		if existingCapacity := d.getDatasetCapacity(existingDS); limitBytes > 0 && existingCapacity > limitBytes {
+			return existingDS, remnantActionNone, status.Errorf(codes.AlreadyExists,
+				"in-flight remnant for volume %s has capacity %d bytes, greater than requested capacity limit %d bytes",
+				volumeID, existingCapacity, limitBytes)
 		}
 		// Marker-proven interrupted copy: the recursive destroy also removes the
 		// transferred replication snapshot the crash left on the target.
@@ -1810,9 +1856,14 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 // has no ledger entry and is never touched. A crash between ledger write and
 // rename leaves an entry without a tombstone, which the reconciler sweeps.
 type tombstoneLedgerEntry struct {
-	Version   int    `json:"v"`
-	Snapshot  string `json:"snapshot"` // full tombstone ID: dataset@tombstone-name
-	Dataset   string `json:"dataset"`
+	Version  int    `json:"v"`
+	Snapshot string `json:"snapshot"` // full tombstone ID: dataset@tombstone-name
+	Dataset  string `json:"dataset"`
+	// CreatedAt is the tombstoned snapshot's immutable ZFS creation time (unix
+	// seconds), captured at ledger-write time. The reaper requires the observed
+	// snapshot's creation time to MATCH, so a stale ledger entry can never
+	// authorize reaping a different snapshot later recreated at the same full ID.
+	CreatedAt int64  `json:"created_at,omitempty"`
 	RenamedAt string `json:"renamed_at"`
 }
 
@@ -1873,20 +1924,30 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 	tombstoneName := snapshotTombstoneName(snap.Dataset, snap.Name, time.Now().UnixNano())
 	deleteID := snap.Dataset + "@" + tombstoneName
 	// Durable provenance BEFORE the rename: the reaper may only ever destroy
-	// snapshots this ledger proves the driver tombstoned.
+	// snapshots this ledger proves the driver tombstoned. The immutable creation
+	// time binds the entry to THIS snapshot, not any later object at the same ID.
 	if err := d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
 		Version:   tombstoneLedgerVersion,
 		Snapshot:  deleteID,
 		Dataset:   snap.Dataset,
+		CreatedAt: snap.GetCreationTime(),
 		RenamedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
 		return status.Errorf(codes.Internal, "failed to record tombstone provenance for snapshot %s: %v", snap.ID, err)
 	}
-	if err := d.truenasClient.SnapshotRename(ctx, snap.ID, tombstoneName); err != nil {
-		// The tombstone was never created; retire its ledger entry (best-effort —
-		// the sweep also removes aged entries without a matching snapshot).
-		d.removeTombstoneLedgerEntry(ctx, deleteID)
-		return status.Errorf(codes.Internal, "failed to tombstone snapshot %s before deferred deletion: %v", snap.ID, err)
+	if renameErr := d.truenasClient.SnapshotRename(ctx, snap.ID, tombstoneName); renameErr != nil {
+		// The error may be a timeout AFTER the rename actually landed. Retire the
+		// ledger entry ONLY when the original name is observably still present
+		// (the rename provably did not happen); when the tombstone name exists,
+		// the rename succeeded and the entry must survive — it is the reaper's
+		// only provenance for the now-unnamed tombstone. When neither is
+		// observable, keep the entry: the age-gated sweep retires a false one.
+		if _, tombErr := d.truenasClient.SnapshotGet(ctx, deleteID); tombErr == nil {
+			klog.Warningf("Snapshot rename to %s reported %v but the tombstone exists; keeping its ledger entry", deleteID, renameErr)
+		} else if _, origErr := d.truenasClient.SnapshotGet(ctx, snap.ID); origErr == nil {
+			d.removeTombstoneLedgerEntry(ctx, deleteID)
+		}
+		return status.Errorf(codes.Internal, "failed to tombstone snapshot %s before deferred deletion: %v", snap.ID, renameErr)
 	}
 
 	properties := []string{PropManagedResource, PropCSISnapshotName, PropCSISnapshotSourceVolumeID}
@@ -2484,10 +2545,11 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
 			if copyErr := d.truenasClient.CopyDatasetFromSnapshotLocal(ctx, snap.Dataset, snap.Name, datasetName); copyErr != nil {
 				if truenas.IsDatasetDestinationExistsError(copyErr) {
-					// The destination-exists error proves this caller did NOT create
-					// the destination — retire the marker so a retry can never claim
-					// provenance over the concurrent winner's object.
-					d.deleteInflightMarker(ctx, path.Base(datasetName))
+					// Deliberately KEEP the shared per-volume marker: the concurrent
+					// winner is the same driver instance mid-flight on the same
+					// name+source, and if it crashes before its ownership stamp the
+					// surviving marker is what lets a retry recover its remnant. The
+					// winner's post-stamp delete and the reconciler sweep retire it.
 					return nil, status.Errorf(codes.Aborted,
 						"detached snapshot copy destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
 				}
@@ -2500,7 +2562,8 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 
 			if cloneErr := d.truenasClient.SnapshotClone(ctx, sourceSnapshot, datasetName); cloneErr != nil {
 				if truenas.IsDatasetDestinationExistsError(cloneErr) {
-					d.deleteInflightMarker(ctx, path.Base(datasetName))
+					// KEEP the shared marker: the same-instance winner may still need
+					// it for crash recovery (see the detached branch above).
 					return nil, status.Errorf(codes.Aborted,
 						"snapshot clone destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
 				}
@@ -2587,10 +2650,8 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 				// The winning clone may depend on the same deterministic temporary
 				// snapshot. Do not delete either object; its CreateVolume path owns
 				// completion and the retry will pass through the full ownership gate.
-				// The destination-exists error proves this caller did not create the
-				// destination, so retire our marker rather than let it claim the
-				// winner's object.
-				d.deleteInflightMarker(ctx, path.Base(datasetName))
+				// KEEP the shared marker too: the same-instance winner may still
+				// need it for crash recovery if it dies before its ownership stamp.
 				return nil, status.Errorf(codes.Aborted,
 					"volume clone destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
 			}
@@ -2628,17 +2689,29 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 }
 
 func (d *Driver) cleanupFailedClone(ctx context.Context, datasetName, tempSnapshotID string) {
-	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
-		klog.Warningf("Failed to cleanup clone dataset %s: %v", datasetName, err)
+	destroyErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true)
+	if destroyErr != nil {
+		klog.Warningf("Failed to cleanup clone dataset %s: %v", datasetName, destroyErr)
 	}
 	if tempSnapshotID != "" {
 		if err := d.truenasClient.SnapshotDelete(ctx, tempSnapshotID, false, false); err != nil {
 			klog.Warningf("Failed to cleanup temporary clone-source snapshot %s: %v", tempSnapshotID, err)
 		}
 	}
-	// The failed creation is being unwound; retire its in-flight marker so no
-	// later retry can claim provenance over an object this attempt no longer owns.
-	d.deleteInflightMarker(ctx, path.Base(datasetName))
+	// Retire the in-flight marker ONLY when the destination is verifiably gone.
+	// A failed cleanup destroy (e.g. a partial detached copy still holding its
+	// transferred snapshot blocks the non-recursive delete) must KEEP the marker:
+	// it is the retry's only proof of provenance for recovering the remnant, and
+	// deleting it here would leave an unrecoverable, unmarked leak.
+	if destroyErr == nil {
+		d.deleteInflightMarker(ctx, path.Base(datasetName))
+		return
+	}
+	if _, getErr := d.truenasClient.DatasetGet(ctx, datasetName); truenas.IsNotFoundError(getErr) {
+		d.deleteInflightMarker(ctx, path.Base(datasetName))
+		return
+	}
+	klog.Warningf("Keeping in-flight marker for %s: cleanup destroy failed and the remnant may still exist; a retry will recover it", datasetName)
 }
 
 func (d *Driver) prepareDetachedSnapshotCopy(

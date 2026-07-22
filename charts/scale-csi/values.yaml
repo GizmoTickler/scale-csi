@@ -434,10 +434,14 @@ metrics:
 
 # Controller-side orphan detection and opt-in guarded cleanup.
 reconcile:
-  # Read-only detection is enabled by default and updates Prometheus gauges.
+  # The default pass performs detection (updating Prometheus gauges) plus
+  # hygiene of the driver's OWN bookkeeping user properties on the parent
+  # dataset: stale in-flight creation markers and orphaned tombstone-ledger
+  # entries are retired with live staleness proof. Backend OBJECT deletion —
+  # volumes, snapshots, tombstone reaping — happens only behind delete.enabled.
   enabled: true
 
-  # Interval between read-only detection passes.
+  # Interval between detection passes.
   interval: 1h
 
   # Managed backend objects must be older than this before they are orphaned.

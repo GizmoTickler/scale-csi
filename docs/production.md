@@ -64,6 +64,31 @@ that are already using their volumes. The defaults use
 `system-cluster-critical` for the controller pod and `system-node-critical` for
 the node DaemonSet.
 
+### Concurrency contract
+
+Cross-process serialization of `CreateVolume` (and the other controller RPCs)
+is a layered contract, not a single mechanism:
+
+- The CO's external-provisioner leader election plus the chart's
+  single-replica, `Recreate`-strategy controller deployment are the primary
+  guarantee that only one controller process mutates the backend at a time.
+- The driver's operation locks are per process. They serialize work inside one
+  controller but provide no exclusion between two controller processes.
+- The durable in-flight creation markers, the tombstone ledger, and the
+  recovery nonce compare-and-swap narrow the windows a second concurrent
+  writer could exploit (a lost recovery race returns retryable `Aborted`
+  instead of double-owning a dataset), but they do **not** turn multi-writer
+  operation into a supported topology. Running multiple concurrently active
+  controller processes against the same parent dataset — e.g. two releases,
+  a forced multi-replica deployment, or overlapping old/new controllers held
+  alive outside the tested upgrade sequence — is out of contract.
+- The configured `zfs.parentDataset` subtree is exclusive driver territory.
+  The driver stores its bookkeeping as user properties on the parent dataset
+  and treats child datasets as objects it may stamp, adopt, or (with durable
+  provenance) destroy. Manually creating datasets or snapshots inside the
+  parent — especially at names a PVC or VolumeSnapshot might use — is out of
+  contract; place operator-managed data outside the parent dataset.
+
 The node component runs as a DaemonSet on all tolerated nodes. Established node
 pods perform stage, publish, unpublish, and unstage through host NFS/iSCSI/NVMe
 tools rather than through TrueNAS management API calls. During a management API

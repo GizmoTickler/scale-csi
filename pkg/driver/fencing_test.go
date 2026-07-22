@@ -2257,3 +2257,63 @@ func TestStrictStartupGateBlocksGrantRPCButKeepsProbeAndTeardownUsable(t *testin
 	d.ready.Store(true)
 	assert.False(t, d.strictStartupControllerRPCBlocked("/csi.v1.Controller/ControllerPublishVolume"))
 }
+
+// FIX 4 regression: on a backend that omits the expanded hostnqn field, a
+// republish resolves the CURRENT NQN's association by HostID. That association
+// is backend-live and must keep the NQN in provenance — otherwise compaction
+// drops it and the final unpublish can never revoke the association.
+func TestAdditiveNVMeHostnqnlessRepublishRetainsProvenanceForUnpublish(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	client.EmptyNVMeHostNQN = true
+	d := &Driver{
+		name: "org.scale.csi.nvmeof",
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeAdditive},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
+			NVMeoF: NVMeoFConfig{
+				Transport: "TCP", TransportAddress: "192.0.2.20", TransportServiceID: 4420,
+				SubsystemAllowAnyHost: true,
+			},
+		},
+		truenasClient: client, nvmeResolvedHosts: make(map[string]int),
+	}
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/nvme-hostnqnless", Type: "VOLUME", Volsize: testGiB,
+	})
+	require.NoError(t, err)
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "nvme-hostnqnless", true, true))
+	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
+	nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: nqn})
+	require.NoError(t, err)
+	request := &csi.ControllerPublishVolumeRequest{
+		VolumeId: "nvme-hostnqnless", NodeId: nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "nvmeof"},
+	}
+
+	_, err = d.ControllerPublishVolume(ctx, request)
+	require.NoError(t, err)
+	// The republish resolves the live association only by HostID (hostnqn is
+	// hidden); the current NQN must survive compaction as backend-live.
+	_, err = d.ControllerPublishVolume(ctx, request)
+	require.NoError(t, err)
+	fresh, err := client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(fresh)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, []string{nqn}, records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs,
+		"the live NQN must survive a hostnqn-less republish")
+
+	_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: "nvme-hostnqnless", NodeId: nodeID,
+	})
+	require.NoError(t, err)
+	associations, err := client.NVMeoFHostSubsysListBySubsystem(ctx, subsystemID)
+	require.NoError(t, err)
+	assert.Empty(t, associations, "unpublish must revoke the association added by publish")
+}
