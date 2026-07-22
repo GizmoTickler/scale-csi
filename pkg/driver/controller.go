@@ -646,17 +646,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		zvolReady = freshlyCreated
 	}
 
-	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
-	// result and the clone readiness path do not need another zvol poll.
-	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, freshlyCreated, zvolReady); shareErr != nil {
-		// Cleanup on failure
-		if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); delErr != nil {
-			klog.Warningf("Failed to cleanup dataset after share creation failure: %v", delErr)
-		}
-		return nil, shareErr
-	}
-
-	// Mark as managed and successful in one API update.
+	// Mark as managed and successful. NFS folds these stamps into the share-ID
+	// update inside createShareWithOptions (one pool.dataset.update on the same
+	// side of the NFSShareCreate boundary); block protocols stamp them in a
+	// separate update below because their in-share ID write is non-fatal.
 	volumeProperties := map[string]string{
 		PropManagedResource:  "true",
 		PropDriverInstanceID: d.driverInstanceID(),
@@ -666,17 +659,34 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
 		volumeProperties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
 	}
-	if waitErr := d.setDatasetUserProperties(ctx, createdDS, datasetName, volumeProperties); waitErr != nil {
-		// Property setting failed - clean up the share and dataset to avoid orphaned resources
-		// The next CreateVolume call will start fresh
-		klog.Errorf("Failed to set properties for volume %s: %v - cleaning up orphaned resources", volumeID, waitErr)
-		if delErr := d.deleteShare(ctx, createdDS, datasetName, shareType); delErr != nil {
-			klog.Warningf("Failed to cleanup share after property failure: %v", delErr)
-		}
+
+	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
+	// result and the clone readiness path do not need another zvol poll.
+	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, freshlyCreated, zvolReady, volumeProperties); shareErr != nil {
+		// Cleanup on failure
 		if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); delErr != nil {
-			klog.Warningf("Failed to cleanup dataset after property failure: %v", delErr)
+			klog.Warningf("Failed to cleanup dataset after share creation failure: %v", delErr)
 		}
-		return nil, status.Errorf(codes.Internal, "failed to set volume properties: %v", waitErr)
+		return nil, shareErr
+	}
+
+	// Block protocols (iSCSI/NVMe-oF) stamp their resource IDs non-fatally inside
+	// createShareWithOptions, so the managed/ownership/provision/name stamps still
+	// happen here as a separate, fatal update. NFS already stamped them together
+	// with the share ID and skips this round trip.
+	if shareType != ShareTypeNFS {
+		if waitErr := d.setDatasetUserProperties(ctx, createdDS, datasetName, volumeProperties); waitErr != nil {
+			// Property setting failed - clean up the share and dataset to avoid orphaned resources
+			// The next CreateVolume call will start fresh
+			klog.Errorf("Failed to set properties for volume %s: %v - cleaning up orphaned resources", volumeID, waitErr)
+			if delErr := d.deleteShare(ctx, createdDS, datasetName, shareType); delErr != nil {
+				klog.Warningf("Failed to cleanup share after property failure: %v", delErr)
+			}
+			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); delErr != nil {
+				klog.Warningf("Failed to cleanup dataset after property failure: %v", delErr)
+			}
+			return nil, status.Errorf(codes.Internal, "failed to set volume properties: %v", waitErr)
+		}
 	}
 
 	// Get volume context for response
@@ -2460,19 +2470,54 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 var errDatasetPropertyVerification = errors.New("dataset user property verification failed")
 
 func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetName string, properties map[string]string) (*truenas.Dataset, error) {
-	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, properties); err != nil {
+	// Build sorted user-property updates mirroring DatasetSetUserProperties, then
+	// call pool.dataset.update directly. Live TrueNAS 26.0 persists these with
+	// source=local AND reflects the post-write state in the response, so the
+	// returned dataset is authoritative for verification — no fresh re-read on
+	// the hot path.
+	keys := make([]string, 0, len(properties))
+	for key := range properties {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	updates := make([]truenas.UserPropertyUpdate, 0, len(keys))
+	for _, key := range keys {
+		updates = append(updates, truenas.UserPropertyUpdate{Key: key, Value: properties[key]})
+	}
+	updated, err := d.truenasClient.DatasetUpdate(ctx, datasetName, &truenas.DatasetUpdateParams{UserPropertiesUpdate: updates})
+	if err != nil {
 		return nil, err
 	}
-	verified, err := d.truenasClient.DatasetGet(ctx, datasetName)
-	if err != nil {
-		return nil, fmt.Errorf("re-read dataset after user-property update: %w", err)
+	if verifyErr := verifyLocalUserProperties(updated, properties); verifyErr != nil {
+		return nil, verifyErr
 	}
+	// Belt-and-braces: the very first write in this Driver's lifetime also
+	// re-reads the dataset and re-verifies, preserving the paranoia that
+	// originally caught the inline-create property drop. Every later write
+	// trusts the update response alone, amortizing the extra round trip away.
+	if !d.datasetUpdateVerifiedOnce.Load() {
+		reread, getErr := d.truenasClient.DatasetGet(ctx, datasetName)
+		if getErr != nil {
+			return nil, fmt.Errorf("re-read dataset after user-property update: %w", getErr)
+		}
+		if verifyErr := verifyLocalUserProperties(reread, properties); verifyErr != nil {
+			return nil, verifyErr
+		}
+		d.datasetUpdateVerifiedOnce.Store(true)
+	}
+	return updated, nil
+}
+
+// verifyLocalUserProperties returns an errDatasetPropertyVerification-wrapped
+// error unless every property is present on ds with source=local and the exact
+// expected value. Callers that race concurrent writers distinguish this shape.
+func verifyLocalUserProperties(ds *truenas.Dataset, properties map[string]string) error {
 	for key, expected := range properties {
-		if !datasetHasLocalUserProperty(verified, key, expected) {
-			return nil, fmt.Errorf("%w: property %s did not persist locally with the expected value", errDatasetPropertyVerification, key)
+		if !datasetHasLocalUserProperty(ds, key, expected) {
+			return fmt.Errorf("%w: property %s did not persist locally with the expected value", errDatasetPropertyVerification, key)
 		}
 	}
-	return verified, nil
+	return nil
 }
 
 func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {

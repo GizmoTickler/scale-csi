@@ -516,11 +516,19 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		want int
 		run  func(*testing.T, *apiCallCountingClient, *Driver)
 	}{
-		// Five calls preserve the fresh NFS path's single lookup, create, share,
-		// share-property update, and final batched ownership-property update.
-		// TrueNAS 26.0 requires a post-create user-property update and an
-		// authoritative re-read because inline create properties are silently lost.
-		{name: "CreateVolume fresh NFS", want: 7, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Six calls: existence lookup; DatasetCreate; the createDataset ownership
+		// stamp via pool.dataset.update; the one-time post-connect re-read that
+		// verifies that first update against a fresh query (every later update in
+		// this Driver's life trusts the update response alone); NFSShareCreate; and
+		// a single post-share update that folds the share-ID stamp together with the
+		// managed/ownership/provision/name stamps. TrueNAS 26.0 requires a
+		// post-create user-property update because inline create properties are
+		// silently lost; the share-ID and volume-property stamps share one
+		// pool.dataset.update because both sit on the same side of the
+		// NFSShareCreate boundary. Dropping below six would require removing either
+		// the one-time paranoia re-read or the existence lookup, both crash-safety
+		// guards, so 6 is the safe floor.
+		{name: "CreateVolume fresh NFS", want: 6, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-nfs", "nfs"))
 			require.NoError(t, err)
 		}},
@@ -615,11 +623,20 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
 			require.NoError(t, err)
 		}},
-		// Snapshot cloning pins direct name resolution, the durable in-flight
-		// marker write with its verifying re-read, one clone and readiness wait,
-		// quota/share setup, ownership stamping with an authoritative re-read,
-		// final identity updates, and marker retirement after the ownership stamp.
-		{name: "CreateVolume clone from snapshot", want: 15, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Thirteen calls: existence lookup; snapshot name resolution; the durable
+		// in-flight marker write on the parent dataset via pool.dataset.update plus
+		// its one-time post-connect verifying re-read (the marker mechanism stays
+		// intact); one clone and readiness wait; the quota-setting update; the
+		// content-source identity update; the ownership stamp via pool.dataset.update
+		// (now verified against the update response, so no separate re-read — the
+		// one-time re-read was already spent on the marker write); marker retirement
+		// after the durable ownership stamp; NFS share resolution + create; and a
+		// single post-share update that folds the share-ID stamp together with the
+		// managed/ownership/provision/name stamps. The remaining writes are separated
+		// by crash boundaries (content-source vs ownership vs share-ID) or are the
+		// protected marker mechanism, so they are not merged; 13 is the safe floor
+		// short of crossing those boundaries.
+		{name: "CreateVolume clone from snapshot", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})

@@ -102,6 +102,18 @@ type Driver struct {
 	// connected, and two is disconnected.
 	truenasConnectionState atomic.Int32
 
+	// datasetUpdateVerifiedOnce gates the one-time belt-and-braces re-read that
+	// setAndVerifyDatasetUserProperties performs after trusting a
+	// pool.dataset.update response. Live TrueNAS 26.0 reflects user-property
+	// writes in the update response, so the hot path verifies against that
+	// response alone; the very first write in a Driver's lifetime additionally
+	// re-reads the dataset to preserve the paranoia that originally caught the
+	// inline-create property drop. The TrueNAS client reconnects internally on
+	// the same instance (see identity.go: "it will reconnect on the next API
+	// call"), so there is no per-reconnect hook to reset this; a Driver-lifetime
+	// flag is the pragmatic, deterministic choice.
+	datasetUpdateVerifiedOnce atomic.Bool
+
 	// Request counter for generating unique request IDs
 	requestCounter uint64
 
