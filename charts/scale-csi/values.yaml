@@ -303,6 +303,23 @@ storageClasses:
       - noatime
     # Additional CSI parameters, for example secret references
     extraParameters: {}
+  # Opt-in example: a NVMe-oF class that restores snapshots as independent
+  # detached copies instead of cheap ZFS clones, for DR-restore use cases where
+  # the restored volume must not share blocks (and a snapshot's lifecycle) with
+  # its source. Disabled by default so it is never created unless you set
+  # `enabled: true` (and enable nvmeof above). The dominant hourly VolSync
+  # source-backup mounts should keep the default clone behavior (omit
+  # snapshotRestoreMode) to stay cheap.
+  - name: scale-nvmeof-detached
+    enabled: false
+    protocol: nvmeof
+    snapshotRestoreMode: detached
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: []
+    extraParameters: {}
 
 # Deprecated single-StorageClass configuration. When non-empty, this takes
 # precedence over storageClasses for compatibility with existing values files.

@@ -216,13 +216,24 @@ value returns `InvalidArgument` instead of defaulting to NFS.
 | Field | Description | Default in bundled class |
 |---|---|---|
 | `storageClasses[].name` | StorageClass name | `scale-nfs` |
+| `storageClasses[].enabled` | Render this class (`false` ships an opt-in example disabled) | `true` |
 | `storageClasses[].protocol` | `nfs`, `iscsi`, or `nvmeof` | `nfs` |
+| `storageClasses[].snapshotRestoreMode` | `clone` or `detached`: how a snapshot-sourced PVC is provisioned (unset follows `zfs.detachedVolumesFromSnapshots`) | unset |
 | `storageClasses[].isDefault` | Add the default-class annotation | `false` |
 | `storageClasses[].reclaimPolicy` | `Delete` or `Retain` | `Delete` |
 | `storageClasses[].allowVolumeExpansion` | Allow PVC expansion | `true` |
 | `storageClasses[].volumeBindingMode` | Kubernetes binding mode | `Immediate` |
 | `storageClasses[].mountOptions` | StorageClass mount options | `[nfsvers=4, noatime]` |
 | `storageClasses[].extraParameters` | Additional CSI parameters such as secret references | `{}` |
+
+`snapshotRestoreMode` chooses how a volume is provisioned from a snapshot
+content source: `clone` keeps a cheap ZFS clone that shares blocks (and a
+snapshot lifecycle) with its source, while `detached` builds an independent
+local send/receive copy. Leave it unset to follow the global
+`zfs.detachedVolumesFromSnapshots` default. Use `detached` for DR-restore
+classes whose restored volumes must be fully independent; keep the dominant
+hourly VolSync source-backup mounts on the default clone path so they stay
+cheap.
 
 Example:
 
@@ -242,6 +253,16 @@ storageClasses:
     reclaimPolicy: Retain
     allowVolumeExpansion: true
     volumeBindingMode: WaitForFirstConsumer
+    mountOptions: []
+    extraParameters: {}
+  # Opt-in DR-restore class: independent detached copies from snapshots.
+  - name: scale-nvmeof-detached
+    enabled: false
+    protocol: nvmeof
+    snapshotRestoreMode: detached
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
     mountOptions: []
     extraParameters: {}
 ```

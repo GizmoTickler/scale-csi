@@ -113,6 +113,9 @@
         "create": {
           "type": "boolean"
         },
+        "enabled": {
+          "type": "boolean"
+        },
         "name": {
           "type": "string",
           "minLength": 1
@@ -123,6 +126,13 @@
             "nfs",
             "iscsi",
             "nvmeof"
+          ]
+        },
+        "snapshotRestoreMode": {
+          "type": "string",
+          "enum": [
+            "clone",
+            "detached"
           ]
         },
         "isDefault": {

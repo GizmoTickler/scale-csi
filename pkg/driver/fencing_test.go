@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"sync/atomic"
@@ -19,6 +20,8 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 
@@ -2316,4 +2319,249 @@ func TestAdditiveNVMeHostnqnlessRepublishRetainsProvenanceForUnpublish(t *testin
 	associations, err := client.NVMeoFHostSubsysListBySubsystem(ctx, subsystemID)
 	require.NoError(t, err)
 	assert.Empty(t, associations, "unpublish must revoke the association added by publish")
+}
+
+// FIX 1 regression: ControllerPublishVolume MUST be idempotent for a repeated
+// (volume, node) publish. A same-node republish re-affirms the grant instead of
+// failing AlreadyExists; only a genuine single-node<->multi-node capability
+// change is rejected, and as InvalidArgument rather than a silent success.
+func TestControllerPublishSameNodeRepublishIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeStrict},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS:     NFSConfig{ShareAllowedNetworks: []string{"192.0.2.0/24"}},
+		},
+		truenasClient: client,
+	}
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/same-node", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: dataset.Mountpoint, Enabled: true})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+
+	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.11")}})
+	require.NoError(t, err)
+	publish := func(mode csi.VolumeCapability_AccessMode_Mode, readonly bool) error {
+		_, publishErr := d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+			VolumeId: "same-node", NodeId: nodeID, Readonly: readonly,
+			VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{Mode: mode}},
+			VolumeContext:    map[string]string{"node_attach_driver": "nfs"},
+		})
+		return publishErr
+	}
+
+	require.NoError(t, publish(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false))
+
+	// Same (volume, node), identical parameters: idempotent success.
+	require.NoError(t, publish(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false))
+
+	// Same node, readonly flip: tolerated (the backend fence is unchanged).
+	require.NoError(t, publish(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, true))
+
+	// Same node, same-family access-mode change: tolerated.
+	require.NoError(t, publish(csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER, false))
+
+	// The grant is still exactly worker-a's.
+	share, err = client.NFSShareGet(ctx, share.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts)
+	dataset, err = client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(dataset)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Contains(t, records, publicationPropertyKey("worker-a"))
+
+	// A genuine single-node -> multi-node capability change on the same node is
+	// incompatible and must be rejected explicitly, not silently accepted.
+	err = publish(csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER, false)
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+// newTakeoverTestDriver builds a strict NFS fencing driver whose event recorder
+// carries the supplied Kubernetes objects plus a non-nil dynamic client, so the
+// synchronous stale-publication takeover can consult the VolumeAttachment list.
+func newTakeoverTestDriver(client *truenas.MockClient, objects ...runtime.Object) *Driver {
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			volumeSnapshotContentGVR: "VolumeSnapshotContentList",
+			volumeSnapshotGVR:        "VolumeSnapshotList",
+		},
+	)
+	return &Driver{
+		name: "csi.scale.io",
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeStrict},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS:     NFSConfig{ShareAllowedNetworks: []string{"192.0.2.0/24"}},
+		},
+		truenasClient: client,
+		eventRecorder: &EventRecorder{
+			clientset:     kubernetesfake.NewSimpleClientset(objects...),
+			dynamicClient: dynamicClient,
+		},
+	}
+}
+
+func takeoverNFSVolume(t *testing.T, ctx context.Context, client *truenas.MockClient, volumeID string) int {
+	t.Helper()
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/" + volumeID, Type: "FILESYSTEM",
+	})
+	require.NoError(t, err)
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: dataset.Mountpoint, Enabled: true})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+	return share.ID
+}
+
+func takeoverPublishRequest(volumeID, node, ip string) *csi.ControllerPublishVolumeRequest {
+	nodeID, _ := encodeNodeIdentity(NodeIdentity{Name: node, IPs: []net.IP{net.ParseIP(ip)}})
+	return &csi.ControllerPublishVolumeRequest{
+		VolumeId: volumeID, NodeId: nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "nfs"},
+	}
+}
+
+func takeoverPV(volumeID string) *corev1.PersistentVolume {
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-" + volumeID},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{
+				Driver: "csi.scale.io", VolumeHandle: volumeID,
+				VolumeAttributes: map[string]string{"node_attach_driver": "nfs"},
+			}},
+		},
+	}
+}
+
+func takeoverVA(name, volumeID, node string) *storagev1.VolumeAttachment {
+	pvName := "pv-" + volumeID
+	return &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi.scale.io", NodeName: node,
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+}
+
+// FIX 2 regression: a SINGLE_NODE publish for node B whose durable record still
+// points at node A takes over synchronously when A has no live VolumeAttachment
+// (stale record): A's record and backend allowlist entry are revoked and B is
+// granted, instead of stalling on FailedPrecondition until the grace-period
+// reconcile runs.
+func TestControllerPublishTakesOverStaleSingleNodeRecord(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	shareID := takeoverNFSVolume(t, ctx, client, "takeover-stale")
+	// The mover was rescheduled to worker-b: its VolumeAttachment exists, but
+	// worker-a's attachment is gone, leaving a stale publication record.
+	d := newTakeoverTestDriver(client,
+		takeoverPV("takeover-stale"),
+		takeoverVA("va-takeover-b", "takeover-stale", "worker-b"),
+	)
+
+	_, err := d.ControllerPublishVolume(ctx, takeoverPublishRequest("takeover-stale", "worker-a", "192.0.2.11"))
+	require.NoError(t, err)
+	share, err := client.NFSShareGet(ctx, shareID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts)
+
+	_, err = d.ControllerPublishVolume(ctx, takeoverPublishRequest("takeover-stale", "worker-b", "192.0.2.12"))
+	require.NoError(t, err)
+
+	share, err = client.NFSShareGet(ctx, shareID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.0.2.12"}, share.Hosts, "worker-a's allowlist entry must be revoked and worker-b granted")
+	dataset, err := client.DatasetGet(ctx, "pool/parent/takeover-stale")
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(dataset)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Contains(t, records, publicationPropertyKey("worker-b"))
+	assert.NotContains(t, records, publicationPropertyKey("worker-a"))
+}
+
+// FIX 2 safety guard: a LIVE VolumeAttachment on the blocking node is a genuine
+// double-mount and must keep returning FailedPrecondition (no takeover).
+func TestControllerPublishKeepsConflictWhenBlockingNodeStillAttached(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	shareID := takeoverNFSVolume(t, ctx, client, "takeover-live")
+	d := newTakeoverTestDriver(client,
+		takeoverPV("takeover-live"),
+		takeoverVA("va-takeover-live-a", "takeover-live", "worker-a"),
+		takeoverVA("va-takeover-live-b", "takeover-live", "worker-b"),
+	)
+
+	_, err := d.ControllerPublishVolume(ctx, takeoverPublishRequest("takeover-live", "worker-a", "192.0.2.11"))
+	require.NoError(t, err)
+
+	_, err = d.ControllerPublishVolume(ctx, takeoverPublishRequest("takeover-live", "worker-b", "192.0.2.12"))
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "worker-a")
+
+	share, err := client.NFSShareGet(ctx, shareID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts, "a live blocking attachment must not be revoked")
+	dataset, getErr := client.DatasetGet(ctx, "pool/parent/takeover-live")
+	require.NoError(t, getErr)
+	records, recErr := publicationRecordsFromDataset(dataset)
+	require.NoError(t, recErr)
+	require.Len(t, records, 1)
+	assert.Contains(t, records, publicationPropertyKey("worker-a"))
+}
+
+// FIX 2 safety guard: when the VolumeAttachment lister errors (unsynced /
+// unavailable), takeover is refused and the conservative FailedPrecondition is
+// returned (fail safe), leaving the blocking record untouched.
+func TestControllerPublishFailsSafeWhenAttachmentListUnavailable(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	shareID := takeoverNFSVolume(t, ctx, client, "takeover-unsafe")
+	kube := kubernetesfake.NewSimpleClientset(takeoverPV("takeover-unsafe"))
+	kube.PrependReactor("list", "volumeattachments", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("informer cache not synced")
+	})
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			volumeSnapshotContentGVR: "VolumeSnapshotContentList",
+			volumeSnapshotGVR:        "VolumeSnapshotList",
+		},
+	)
+	d := &Driver{
+		name: "csi.scale.io",
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeStrict},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS:     NFSConfig{ShareAllowedNetworks: []string{"192.0.2.0/24"}},
+		},
+		truenasClient: client,
+		eventRecorder: &EventRecorder{clientset: kube, dynamicClient: dynamicClient},
+	}
+
+	_, err := d.ControllerPublishVolume(ctx, takeoverPublishRequest("takeover-unsafe", "worker-a", "192.0.2.11"))
+	require.NoError(t, err)
+
+	_, err = d.ControllerPublishVolume(ctx, takeoverPublishRequest("takeover-unsafe", "worker-b", "192.0.2.12"))
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err), "an unavailable lister must fail safe, not take over")
+
+	share, err := client.NFSShareGet(ctx, shareID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"192.0.2.11"}, share.Hosts, "fail-safe must leave the blocking grant intact")
 }

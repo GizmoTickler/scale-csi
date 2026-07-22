@@ -436,6 +436,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			mode.String(), shareType)
 	}
 
+	// Resolve clone-vs-detached for a snapshot content source. The StorageClass
+	// parameter opts a class in or out; otherwise the global default applies. This
+	// single resolved value drives every content-source decision below (existing
+	// remnant recovery, in-flight marker mode, and the clone/copy branch) so a
+	// retry stays consistent with the class that made the request.
+	detached, err := d.snapshotRestoreDetached(params)
+	if err != nil {
+		return nil, err
+	}
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {
@@ -470,7 +480,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		// is a strict no-op for any dataset without a matching in-flight marker.
 		if source := req.GetVolumeContentSource(); source != nil {
 			recovered, action, recoverErr := d.recoverInFlightContentSourceRemnant(
-				ctx, existingDS, datasetName, name, source, capacityBytes, limitBytes, shareType,
+				ctx, existingDS, datasetName, name, source, capacityBytes, limitBytes, shareType, detached,
 			)
 			if recoverErr != nil {
 				return nil, recoverErr
@@ -524,7 +534,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 				"dataset %s already exists without ownership property %s and does not have matching local legacy CSI markers",
 				datasetName, PropDriverInstanceID)
 		}
-		if snapshot := req.GetVolumeContentSource().GetSnapshot(); d.config.ZFS.DetachedVolumesFromSnapshots && snapshot != nil {
+		if snapshot := req.GetVolumeContentSource().GetSnapshot(); detached && snapshot != nil {
 			existingDS, err = d.prepareDetachedSnapshotCopy(
 				ctx, datasetName, existingDS, name, snapshot.GetSnapshotId(), snapshot.GetSnapshotId(), capacityBytes, shareType,
 			)
@@ -558,7 +568,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if datasetUserProperty(existingDS, PropCSIVolumeName) != name {
 			propertyUpdates[PropCSIVolumeName] = name
 		}
-		if d.config.ZFS.DetachedVolumesFromSnapshots &&
+		if detached &&
 			req.GetVolumeContentSource().GetSnapshot() != nil &&
 			shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
 			requestedSize := strconv.FormatInt(capacityBytes, 10)
@@ -603,7 +613,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
 		_, srcErr := d.handleVolumeContentSource(
-			ctx, datasetName, name, contentSource, capacityBytes, shareType, &detachedCopyJobID,
+			ctx, datasetName, name, contentSource, capacityBytes, shareType, detached, &detachedCopyJobID,
 		)
 		if srcErr != nil {
 			return nil, srcErr
@@ -866,6 +876,7 @@ func (d *Driver) recoverInFlightContentSourceRemnant(
 	source *csi.VolumeContentSource,
 	capacityBytes, limitBytes int64,
 	shareType ShareType,
+	detached bool,
 ) (*truenas.Dataset, inFlightRemnantAction, error) {
 	if source == nil || existingDS == nil || existingDS.Name != datasetName {
 		return existingDS, remnantActionNone, nil
@@ -898,7 +909,7 @@ func (d *Driver) recoverInFlightContentSourceRemnant(
 
 	switch marker.Mode {
 	case inflightModeCopy:
-		if !d.config.ZFS.DetachedVolumesFromSnapshots || source.GetSnapshot() == nil {
+		if !detached || source.GetSnapshot() == nil {
 			return existingDS, remnantActionNone, nil
 		}
 		// The same request-compatibility validation as the clone branch runs
@@ -924,9 +935,10 @@ func (d *Driver) recoverInFlightContentSourceRemnant(
 		return nil, remnantActionDestroy, nil
 
 	case inflightModeClone:
-		// The current configuration must still take the clone path for this
-		// source; after a config flip the remnant is left for the operator.
-		if d.config.ZFS.DetachedVolumesFromSnapshots && source.GetSnapshot() != nil {
+		// The current resolution must still take the clone path for this source;
+		// after a StorageClass/class default flip the remnant is left for the
+		// operator.
+		if detached && source.GetSnapshot() != nil {
 			return existingDS, remnantActionNone, nil
 		}
 		// Protocol compatibility before any mutation.
@@ -2527,12 +2539,43 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 	}
 }
 
+// snapshotRestoreModeParam is the StorageClass parameter that selects how a
+// volume is provisioned from a snapshot content source.
+const snapshotRestoreModeParam = "snapshotRestoreMode"
+
+// snapshotRestoreDetached resolves whether a snapshot-sourced CreateVolume
+// builds an independent detached copy (true) or a cheap ZFS clone (false).
+// Resolution order: the StorageClass `snapshotRestoreMode` parameter when set
+// (`clone`|`detached`, plus legacy boolean spellings), else the global
+// zfs.detachedVolumesFromSnapshots default. An unrecognized value is rejected so
+// a misconfigured StorageClass surfaces instead of silently picking a path. This
+// lets DR-restore classes opt into independent copies while the dominant hourly
+// VolSync source-backup mounts stay cheap clones.
+func (d *Driver) snapshotRestoreDetached(params map[string]string) (bool, error) {
+	if params != nil {
+		if raw, ok := params[snapshotRestoreModeParam]; ok {
+			switch strings.ToLower(strings.TrimSpace(raw)) {
+			case "detached", "copy", "true", "enabled":
+				return true, nil
+			case "clone", "false", "disabled":
+				return false, nil
+			default:
+				return false, status.Errorf(codes.InvalidArgument,
+					"invalid StorageClass parameter %q value %q; valid options are: clone, detached",
+					snapshotRestoreModeParam, raw)
+			}
+		}
+	}
+	return d.config.ZFS.DetachedVolumesFromSnapshots, nil
+}
+
 func (d *Driver) handleVolumeContentSource(
 	ctx context.Context,
 	datasetName, volumeName string,
 	source *csi.VolumeContentSource,
 	capacityBytes int64,
 	shareType ShareType,
+	detached bool,
 	detachedCopyJobID *int64,
 ) (*truenas.Dataset, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
@@ -2567,7 +2610,7 @@ func (d *Driver) handleVolumeContentSource(
 		if markerErr != nil {
 			return nil, markerErr
 		}
-		if d.config.ZFS.DetachedVolumesFromSnapshots {
+		if detached {
 			marker.Mode = inflightModeCopy
 		} else {
 			marker.Origin = snap.ID
@@ -2575,7 +2618,7 @@ func (d *Driver) handleVolumeContentSource(
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
 			return nil, markerWriteErr
 		}
-		if d.config.ZFS.DetachedVolumesFromSnapshots {
+		if detached {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
 			jobID, copyErr := d.truenasClient.CopyDatasetFromSnapshotLocal(ctx, snap.Dataset, snap.Name, datasetName)
 			if copyErr != nil {
@@ -2619,12 +2662,12 @@ func (d *Driver) handleVolumeContentSource(
 		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
 			d.cleanupFailedClone(ctx, datasetName, "")
-			if d.config.ZFS.DetachedVolumesFromSnapshots {
+			if detached {
 				return nil, status.Errorf(codes.Internal, "failed waiting for detached snapshot copy to become ready: %v", err)
 			}
 			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
 		}
-		if d.config.ZFS.DetachedVolumesFromSnapshots {
+		if detached {
 			createdDS, err = d.prepareDetachedSnapshotCopy(
 				ctx, datasetName, createdDS, volumeName, snapshotID, snap.Name, capacityBytes, shareType,
 			)

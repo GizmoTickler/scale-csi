@@ -11,7 +11,16 @@
     {{- $classes = list -}}
   {{- end -}}
 {{- end -}}
-{{- range $index, $storageClass := $classes }}
+{{- /* An entry is rendered unless it explicitly sets enabled: false. This keeps
+     every existing class rendering by default while letting opt-in example
+     classes (e.g. the detached DR-restore class) ship disabled. */}}
+{{- $enabledClasses := list -}}
+{{- range $storageClass := $classes -}}
+  {{- if or (not (hasKey $storageClass "enabled")) $storageClass.enabled -}}
+    {{- $enabledClasses = append $enabledClasses $storageClass -}}
+  {{- end -}}
+{{- end -}}
+{{- range $index, $storageClass := $enabledClasses }}
 {{- if $index }}
 ---
 {{- end }}
@@ -44,6 +53,11 @@ parameters:
        nfs on an iscsi/nvmeof class. */}}
   {{- if $storageClass.protocol }}
   {{- $_ := set $parameters "protocol" $storageClass.protocol -}}
+  {{- end }}
+  {{- /* Emit snapshotRestoreMode only when set, so unset classes follow the
+       driver's global zfs.detachedVolumesFromSnapshots default. */}}
+  {{- if $storageClass.snapshotRestoreMode }}
+  {{- $_ := set $parameters "snapshotRestoreMode" $storageClass.snapshotRestoreMode -}}
   {{- end }}
   {{- toYaml $parameters | nindent 2 }}
 {{- end }}

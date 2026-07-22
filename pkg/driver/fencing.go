@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path"
 	"slices"
 	"sort"
 	"strconv"
@@ -387,9 +388,20 @@ func validatePublicationCompatibility(records map[string]publicationRecord, requ
 			continue
 		}
 		if existing.Node == requested.Node {
-			if existing.AccessMode != requested.AccessMode || existing.Readonly != requested.Readonly {
-				return status.Errorf(codes.AlreadyExists,
-					"volume is already published to node %s with different access parameters", requested.Node)
+			// CSI requires ControllerPublishVolume to be idempotent for a repeated
+			// (volume, node) publish: the node that already holds the publication
+			// re-affirms its grant rather than failing AlreadyExists. A readonly
+			// flip or a same-family access-mode difference does not change the
+			// backend fence (it keys off node identity and multi-node-ness) and is
+			// tolerated. Only a change that crosses the single-node / multi-node
+			// boundary genuinely alters sharing semantics; that is rejected as an
+			// explicit InvalidArgument rather than a silent success. AlreadyExists
+			// and FailedPrecondition are reserved for a DIFFERENT node below.
+			existingMode := csi.VolumeCapability_AccessMode_Mode(existing.AccessMode)
+			if isMultiNodeMode(existingMode) != isMultiNodeMode(requestedMode) {
+				return status.Errorf(codes.InvalidArgument,
+					"volume is already published to node %s with access mode %s, incompatible with requested access mode %s",
+					requested.Node, existingMode.String(), requestedMode.String())
 			}
 			continue
 		}
@@ -740,6 +752,112 @@ func (d *Driver) populateAdditiveGrantOwnership(
 	return nil
 }
 
+// takeOverStaleSingleNodePublication resolves a SINGLE_NODE cross-node conflict
+// synchronously when the blocking node's publication record is provably stale.
+//
+// When the requested node differs from the node holding the durable record, the
+// CSI-correct default is FailedPrecondition (real double-mount protection). This
+// adds a controlled exception: if the Kubernetes VolumeAttachment list shows NO
+// live attachment for the blocking node on this volume, that record is stale (the
+// mover was rescheduled or its VolumeAttachment was force-finalized away) and is
+// revoked here — record plus backend allowlist entry — so the requested node can
+// be granted without waiting for the periodic grace-period reconcile.
+//
+// Safety guards, mirroring the periodic stale-record reconcile:
+//   - It runs under the caller's per-volume operationLock, so the revoke+grant is
+//     atomic with respect to other CSI operations on the volume.
+//   - If the VolumeAttachment lister errors, or returns zero attachments for the
+//     whole driver (the shape of an unsynced informer / API discontinuity, not
+//     proof of absence), takeover is refused and the conservative
+//     FailedPrecondition is returned (fail safe).
+//   - A live attachment for the blocking node is a genuine conflict and keeps the
+//     FailedPrecondition.
+//
+// On a successful takeover it returns a freshly re-read dataset and record map so
+// the caller's subsequent compatibility checks and fence enforcement observe the
+// post-revocation state. When no takeover applies it returns the inputs unchanged.
+func (d *Driver) takeOverStaleSingleNodePublication(
+	ctx context.Context,
+	ds *truenas.Dataset,
+	datasetName string,
+	shareType ShareType,
+	requested publicationRecord,
+	records map[string]publicationRecord,
+) (*truenas.Dataset, map[string]publicationRecord, error) {
+	if isMultiNodeMode(csi.VolumeCapability_AccessMode_Mode(requested.AccessMode)) {
+		// Multi-node publishes never conflict across nodes; nothing to take over.
+		return ds, records, nil
+	}
+	var blocking publicationRecord
+	var blockingKey string
+	for key := range records {
+		existing := records[key]
+		if existing.State != publicationStatePublished || existing.Node == requested.Node {
+			continue
+		}
+		blocking = existing
+		blockingKey = key
+		break
+	}
+	if blockingKey == "" {
+		return ds, records, nil
+	}
+
+	conflict := status.Errorf(codes.FailedPrecondition,
+		"volume is already published to node %s and cannot be published to node %s with access mode %s",
+		blocking.Node, requested.Node, csi.VolumeCapability_AccessMode_Mode(requested.AccessMode).String())
+
+	volumeID := path.Base(datasetName)
+	live, attachmentCount, err := d.liveVolumeAttachmentExists(ctx, volumeID, blocking.Node)
+	if err != nil {
+		// The attachment state cannot be proven; fail safe with the conflict.
+		klog.Warningf("Fencing takeover refused for volume=%s node=%s->%s: VolumeAttachment list unavailable (%v); keeping FailedPrecondition",
+			volumeID, blocking.Node, requested.Node, err)
+		return ds, records, conflict
+	}
+	if live {
+		// The blocking node still has a live attachment: a genuine double-mount.
+		return ds, records, conflict
+	}
+	if attachmentCount == 0 {
+		// A zero-result VA list while a backend record exists is the shape of an
+		// unsynced informer or API discontinuity, not evidence of absence. Refuse
+		// the takeover and let the periodic reconcile (with its mass-absence brake
+		// and grace window) handle it. Fail safe.
+		klog.Warningf("Fencing takeover refused for volume=%s node=%s->%s: VolumeAttachment list is empty; keeping FailedPrecondition",
+			volumeID, blocking.Node, requested.Node)
+		RecordFencingStaleDeferred()
+		return ds, records, conflict
+	}
+
+	// The blocking node's attachment is gone: its record is stale. Revoke it
+	// (record + backend allowlist entry) under the held per-volume lock so the
+	// revoke+grant is atomic.
+	nodeID := blocking.EncodedID
+	if nodeID == "" {
+		nodeID = blocking.Node
+	}
+	if revokeErr := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, nodeID); revokeErr != nil {
+		return ds, records, status.Errorf(codes.Internal,
+			"revoke stale publication for node %s before granting node %s: %v", blocking.Node, requested.Node, revokeErr)
+	}
+	d.stalePublicationRecordsSeen.Delete(stalePublicationObservationKey(datasetName, blockingKey))
+	klog.Infof("Fencing takeover: volume=%s revoked stale publication on node %s (no live VolumeAttachment) to grant node %s",
+		volumeID, blocking.Node, requested.Node)
+
+	// Re-read the dataset so the caller's compatibility checks and fence
+	// enforcement observe the post-revocation state, not the pre-takeover copy.
+	freshDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		return ds, records, status.Errorf(codes.Internal, "re-read dataset after stale publication takeover: %v", err)
+	}
+	freshRecords, err := publicationRecordsFromDataset(freshDS)
+	if err != nil {
+		return ds, records, status.Errorf(codes.Internal, "re-read publication records after stale publication takeover: %v", err)
+	}
+	return freshDS, freshRecords, nil
+}
+
 func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, identity NodeIdentity, capability *csi.VolumeCapability, readonly bool) error {
 	deferred, err := d.validateOrDeferFencingIdentity(identity, shareType)
 	if err != nil {
@@ -752,6 +870,18 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	record, err := newPublicationRecord(identity, accessModeFromCapability(capability), readonly)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "failed to persist node identity: %v", err)
+	}
+	// A SINGLE_NODE request whose durable record still points at another node is
+	// normally a genuine double-mount and fails FailedPrecondition. But when that
+	// node's VolumeAttachment is already gone the record is stale; waiting for the
+	// periodic grace-period reconcile stalls a rescheduled mover for up to 20 min.
+	// Attempt a synchronous takeover first: it revokes the stale node and refreshes
+	// ds/records so the compatibility checks below see only the requested node. A
+	// live attachment, or any doubt about the attachment state, keeps the
+	// conservative FailedPrecondition (fail safe).
+	ds, records, err = d.takeOverStaleSingleNodePublication(ctx, ds, datasetName, shareType, record, records)
+	if err != nil {
+		return err
 	}
 	if err := validatePublicationCompatibility(records, record); err != nil {
 		return err
