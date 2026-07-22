@@ -24,8 +24,12 @@ import (
 )
 
 const (
-	reconcileListPageSize           = 100
-	staleRecordMassAbsenceThreshold = 2
+	reconcileListPageSize                    = 100
+	staleRecordMassAbsenceThreshold          = 2
+	defaultControllerReconcileInterval       = time.Hour
+	defaultControllerReconcileMinOrphanAge   = 24 * time.Hour
+	replicationJobReasonMissingMarker        = "missing_marker"
+	replicationJobReasonMissingSourceDataset = "missing_source_dataset"
 )
 
 var (
@@ -151,6 +155,7 @@ func (d *Driver) ReconcileOrphans(ctx context.Context, opts ReconcileOptions) (R
 	// The exported run-once path is also used by the chart's orphan-GC CronJob.
 	// It must never become a second fencing writer beside the live controller;
 	// stale publication revocation is exclusive to the controller loop below.
+	d.runReplicationJobSweep(ctx)
 	return d.reconcileOrphans(ctx, opts, false)
 }
 
@@ -339,12 +344,16 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		report.TombstoneSnapshotBytes += item.Bytes
 	}
 
-	if d.config.ZFS.DetachedVolumesFromSnapshots {
-		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			RecordReconcileFailure("spent_restore_classification")
-			return report, ctxErr
-		}
+	// Spent-restore classification always runs (read-only detection). It is NOT
+	// gated on the global zfs.detachedVolumesFromSnapshots flag: a StorageClass
+	// may opt into snapshotRestoreMode=detached while that global default stays
+	// clone, and gating on the global flag alone would leak that class's spent
+	// volsync restore snapshots (never reaped). Deletion remains gated by
+	// opts.Delete and the per-object revalidation in deleteDetectedOrphans.
+	report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		RecordReconcileFailure("spent_restore_classification")
+		return report, ctxErr
 	}
 
 	logAction := "[DRY RUN] would delete"
@@ -617,9 +626,8 @@ func (d *Driver) loadKubernetesReconcileState(ctx context.Context) (*kubernetesR
 		}
 	}
 
-	if !d.config.ZFS.DetachedVolumesFromSnapshots {
-		return state, nil
-	}
+	// VolumeSnapshots and PVCs are always loaded so spent-restore classification
+	// can run regardless of the global detached flag (see reconcileOrphans).
 	volumeSnapshots, err := dynamicClient.Resource(volumeSnapshotGVR).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("list VolumeSnapshots: %w", err)
@@ -844,9 +852,10 @@ func (d *Driver) deleteDetectedOrphans(
 		deletedCount++
 	}
 
-	if !d.config.ZFS.DetachedVolumesFromSnapshots {
-		return nil
-	}
+	// Spent-restore deletion is not gated on the global detached flag (a
+	// detached-opt-in StorageClass must be reapable even when the global default
+	// is clone). This pass only runs under opts.Delete, and each object is
+	// revalidated before deletion below.
 	clientset, dynamicClient, err := d.kubernetesReconcileClients()
 	if err != nil {
 		return err
@@ -1105,6 +1114,125 @@ func (d *Driver) sweepStaleInflightMarkers(ctx context.Context, parent *truenas.
 		return
 	}
 	klog.Infof("Orphan reconcile: retired %d stale in-flight creation markers", len(staleKeys))
+}
+
+// sweepOrphanedReplicationJobs aborts only active replication.run_onetime jobs
+// whose target is strictly below this driver's configured parent dataset. A
+// matching copy marker protects legitimate in-flight work unless a live backend
+// read proves that its source dataset is gone. The target dataset is never used
+// as an abort trigger: a live detached copy (replication.run_onetime with
+// only_from_scratch) deliberately has no target until 'zfs receive' materializes
+// it, so target absence is expected mid-copy. The source, by contrast, is present
+// throughout a legitimate copy, so its absence unambiguously marks an abandoned
+// job. Marker reads happen after the job list, preserving the marker-before-launch
+// ordering used by CreateVolume and avoiding a stale-parent-read race with a newly
+// launched job.
+func (d *Driver) sweepOrphanedReplicationJobs(ctx context.Context) error {
+	if d.config == nil || d.truenasClient == nil {
+		return fmt.Errorf("driver configuration and TrueNAS client are required")
+	}
+	jobs, err := d.truenasClient.ReplicationJobList(ctx)
+	if err != nil {
+		return err
+	}
+	parentName := d.parentDatasetName()
+	inScope := make([]*truenas.ReplicationJob, 0, len(jobs))
+	for _, job := range jobs {
+		if job != nil && datasetStrictlyBelowParent(job.TargetDataset, parentName) {
+			inScope = append(inScope, job)
+		}
+	}
+	if len(inScope) == 0 {
+		return nil
+	}
+
+	parent, err := d.truenasClient.DatasetGet(ctx, parentName)
+	if err != nil {
+		// Without the parent read, marker absence is not proven. Fail closed and
+		// leave every job untouched.
+		return fmt.Errorf("read parent dataset before replication job sweep: %w", err)
+	}
+	markers := d.liveCopyMarkers(parent)
+
+	for _, job := range inScope {
+		reason := ""
+		if _, marked := markers[job.TargetDataset]; !marked {
+			reason = replicationJobReasonMissingMarker
+		} else {
+			// The target dataset is deliberately absent until 'zfs receive'
+			// materializes it, so only a missing SOURCE proves the job is abandoned.
+			for _, sourceDataset := range job.SourceDatasets {
+				missing, conclusive := d.replicationJobDatasetMissing(ctx, sourceDataset, job.ID, "source")
+				if !conclusive {
+					reason = ""
+					break
+				}
+				if missing {
+					reason = replicationJobReasonMissingSourceDataset
+					break
+				}
+			}
+		}
+		if reason == "" {
+			continue
+		}
+		if err := d.truenasClient.ReplicationJobAbort(ctx, job.ID, reason); err != nil {
+			d.recordReconcileObjectFailure("replication_job_abort", fmt.Sprint(job.ID), err)
+			continue
+		}
+		klog.Warningf("Replication job sweep aborted driver-owned job id=%d target=%s reason=%s", job.ID, job.TargetDataset, reason)
+	}
+	return nil
+}
+
+func (d *Driver) liveCopyMarkers(parent *truenas.Dataset) map[string]struct{} {
+	markers := make(map[string]struct{})
+	if parent == nil {
+		return markers
+	}
+	for key, property := range parent.UserProperties {
+		if !strings.HasPrefix(key, PropInflightMarkerPrefix) || !isLocalUserPropertySource(property.Source) {
+			continue
+		}
+		var marker inflightMarker
+		if err := json.Unmarshal([]byte(property.Value), &marker); err != nil {
+			continue
+		}
+		if marker.Version != inflightMarkerVersion || marker.Instance != d.driverInstanceID() ||
+			marker.Mode != inflightModeCopy || !datasetStrictlyBelowParent(marker.Dataset, d.parentDatasetName()) ||
+			key != inflightMarkerKey(path.Base(marker.Dataset)) {
+			continue
+		}
+		markers[marker.Dataset] = struct{}{}
+	}
+	return markers
+}
+
+func datasetStrictlyBelowParent(dataset, parent string) bool {
+	dataset = strings.TrimSuffix(strings.TrimSpace(dataset), "/")
+	parent = strings.TrimSuffix(strings.TrimSpace(parent), "/")
+	return dataset != "" && parent != "" && strings.HasPrefix(dataset, parent+"/")
+}
+
+func (d *Driver) replicationJobDatasetMissing(ctx context.Context, dataset string, jobID int64, role string) (missing, conclusive bool) {
+	if strings.TrimSpace(dataset) == "" {
+		return false, false
+	}
+	if _, err := d.truenasClient.DatasetGet(ctx, dataset); err == nil {
+		return false, true
+	} else if truenas.IsNotFoundError(err) {
+		return true, true
+	} else {
+		d.recordReconcileObjectFailure("replication_job_dataset_check", fmt.Sprintf("%d/%s/%s", jobID, role, dataset), err)
+		return false, false
+	}
+}
+
+func (d *Driver) runReplicationJobSweep(ctx context.Context) {
+	if err := d.sweepOrphanedReplicationJobs(ctx); err != nil && ctx.Err() == nil {
+		RecordReconcileFailure("replication_job_sweep")
+		klog.Errorf("Replication job sweep failed: %v", err)
+	}
 }
 
 // sweepOrphanedTombstoneLedger retires ledger entries whose snapshot no longer
@@ -1487,19 +1615,24 @@ func (d *Driver) startOrphanReconcile() {
 		klog.Info("Orphan reconcile detection disabled because configuration is unavailable")
 		return
 	}
-	if !d.config.Reconcile.Enabled && !d.config.Fencing.Enabled() {
-		klog.Info("Orphan and stale fencing record reconciliation disabled")
-		return
-	}
 	interval, err := d.config.Reconcile.IntervalDuration()
+	if strings.TrimSpace(d.config.Reconcile.Interval) == "" {
+		interval, err = defaultControllerReconcileInterval, nil
+	}
 	if err != nil || interval <= 0 {
-		klog.Errorf("Orphan reconcile detection disabled due to invalid interval %q: %v", d.config.Reconcile.Interval, err)
+		klog.Errorf("Controller reconciliation disabled due to invalid interval %q: %v", d.config.Reconcile.Interval, err)
 		return
 	}
-	minAge, err := d.config.Reconcile.MinOrphanAgeDuration()
-	if err != nil || minAge <= 0 {
-		klog.Errorf("Orphan reconcile detection disabled due to invalid minimum orphan age %q: %v", d.config.Reconcile.MinOrphanAge, err)
-		return
+	minAge := defaultControllerReconcileMinOrphanAge
+	if d.config.Reconcile.Enabled || d.config.Fencing.Enabled() {
+		minAge, err = d.config.Reconcile.MinOrphanAgeDuration()
+		if strings.TrimSpace(d.config.Reconcile.MinOrphanAge) == "" {
+			minAge, err = defaultControllerReconcileMinOrphanAge, nil
+		}
+		if err != nil || minAge <= 0 {
+			klog.Errorf("Controller reconciliation disabled due to invalid minimum orphan age %q: %v", d.config.Reconcile.MinOrphanAge, err)
+			return
+		}
 	}
 	cadence := interval
 	if d.config.Fencing.Enabled() {
@@ -1517,9 +1650,13 @@ func (d *Driver) startOrphanReconcile() {
 	d.reconcileWg.Add(1)
 	go func() {
 		defer d.reconcileWg.Done()
-		klog.Infof("Controller reconciliation started: interval=%v cadence=%v minOrphanAge=%v orphanDetection=%t staleFencingRecords=%t delete=false",
+		klog.Infof("Controller reconciliation started: interval=%v cadence=%v minOrphanAge=%v replicationJobSweep=true orphanDetection=%t staleFencingRecords=%t delete=false",
 			interval, cadence, minAge, d.config.Reconcile.Enabled, d.config.Fencing.Enabled())
 		run := func() {
+			d.runReplicationJobSweep(ctx)
+			if !d.config.Reconcile.Enabled && !d.config.Fencing.Enabled() {
+				return
+			}
 			report, reconcileErr := d.reconcileOrphans(ctx, ReconcileOptions{Delete: false, MinOrphanAge: minAge}, true)
 			if reconcileErr != nil && ctx.Err() == nil {
 				klog.Errorf("Orphan reconcile detection failed: %v", reconcileErr)

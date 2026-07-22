@@ -66,6 +66,16 @@ controller reconcile revokes the stale backend grant after
 engages a mass-revocation brake and increments
 `scale_csi_fencing_stale_deferred_total`.
 
+When a `ControllerPublishVolume` for a new node finds a stale publication record
+for another node that has no live VolumeAttachment, the controller takes over
+synchronously: it revokes the stale grant and grants the new node. Each
+successful takeover increments
+`scale_csi_fencing_takeover_total{reason="stale_record"}` and emits a
+`FencingTakeover` warning event on the PersistentVolume. This is the most
+dangerous operation on a live strict cluster, so alert on a non-zero rate of
+this metric to catch unexpected node-identity churn or attachment-controller
+misbehavior.
+
 `additive` is the upgrade-safe transition mode when it is enabled in the
 required sequence below. It adds per-node entries while
 retaining configured/static backend entries and never removes an unknown legacy
@@ -216,13 +226,24 @@ value returns `InvalidArgument` instead of defaulting to NFS.
 | Field | Description | Default in bundled class |
 |---|---|---|
 | `storageClasses[].name` | StorageClass name | `scale-nfs` |
+| `storageClasses[].enabled` | Render this class (`false` ships an opt-in example disabled) | `true` |
 | `storageClasses[].protocol` | `nfs`, `iscsi`, or `nvmeof` | `nfs` |
+| `storageClasses[].snapshotRestoreMode` | `clone` or `detached`: how a snapshot-sourced PVC is provisioned (unset follows `zfs.detachedVolumesFromSnapshots`) | unset |
 | `storageClasses[].isDefault` | Add the default-class annotation | `false` |
 | `storageClasses[].reclaimPolicy` | `Delete` or `Retain` | `Delete` |
 | `storageClasses[].allowVolumeExpansion` | Allow PVC expansion | `true` |
 | `storageClasses[].volumeBindingMode` | Kubernetes binding mode | `Immediate` |
 | `storageClasses[].mountOptions` | StorageClass mount options | `[nfsvers=4, noatime]` |
 | `storageClasses[].extraParameters` | Additional CSI parameters such as secret references | `{}` |
+
+`snapshotRestoreMode` chooses how a volume is provisioned from a snapshot
+content source: `clone` keeps a cheap ZFS clone that shares blocks (and a
+snapshot lifecycle) with its source, while `detached` builds an independent
+local send/receive copy. Leave it unset to follow the global
+`zfs.detachedVolumesFromSnapshots` default. Use `detached` for DR-restore
+classes whose restored volumes must be fully independent; keep the dominant
+hourly VolSync source-backup mounts on the default clone path so they stay
+cheap.
 
 Example:
 
@@ -244,14 +265,25 @@ storageClasses:
     volumeBindingMode: WaitForFirstConsumer
     mountOptions: []
     extraParameters: {}
+  # Opt-in DR-restore class: independent detached copies from snapshots.
+  - name: scale-nvmeof-detached
+    enabled: false
+    protocol: nvmeof
+    snapshotRestoreMode: detached
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: []
+    extraParameters: {}
 ```
 
 The old `storageClass` map remains supported for compatibility. When it is
 non-empty, it takes precedence over `storageClasses` and renders one class. It
 accepts the former `create`, `name`, `protocol`, `isDefault`, `reclaimPolicy`,
 `allowVolumeExpansion`, `volumeBindingMode`, and `mountOptions` fields plus
-`extraParameters`. Migrate existing values files to `storageClasses` when
-convenient.
+`extraParameters`. The deprecated path emits `protocol` and `mountOptions` only
+when they are explicitly set. Migrate existing values files to `storageClasses`
+when convenient.
 
 ### Snapshots
 
@@ -310,8 +342,8 @@ for Grafana sidecar discovery and uses only metrics exported by the driver.
 
 | Parameter | Description | Default |
 |---|---|---|
-| `reconcile.enabled` | Run periodic read-only orphan detection in the controller | `true` |
-| `reconcile.interval` | Detection interval | `1h` |
+| `reconcile.enabled` | Run periodic read-only orphan object detection in the controller | `true` |
+| `reconcile.interval` | Controller reconcile interval, including replication-job hygiene | `1h` |
 | `reconcile.minOrphanAge` | Minimum backend object age before orphan classification | `24h` |
 | `reconcile.alertAfter` | Prometheus alert hold time; keep greater than 2x the interval | `2h5m` |
 | `reconcile.delete.enabled` | Create the opt-in guarded cleanup CronJob | `false` |
@@ -322,17 +354,32 @@ Read-only detection is enabled by default and exports
 `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`,
 `scale_csi_spent_restore_snapshots`, orphan-byte gauges,
 `scale_csi_reconcile_last_success_timestamp_seconds`, and
-`scale_csi_reconcile_failures_total{phase}`. Deletion remains
+`scale_csi_reconcile_failures_total{phase}`. Driver-owned one-time replication
+jobs reaped on request failure, startup, or a periodic pass increment
+`scale_csi_replication_jobs_aborted_total{reason}`. Deletion remains
 disabled unless `reconcile.delete.enabled=true`. The CronJob invokes
 `--mode=reconcile`; backend cleanup always calls the driver's guarded CSI
 `DeleteVolume` and `DeleteSnapshot` implementations, so clone, snapshot, and
 foreign-snapshot dependency checks still apply. Spent VolSync restore snapshots
-are classified only when detached snapshot copies are enabled and their source
-PVC is no longer Bound. TrueNAS 26.0 cannot persist a property update on an
-existing snapshot, so this path performs no backend writes. Deletion requires
+(matching `volsync-*-dst-dest*`) are classified whenever their source PVC is no
+longer Bound. Classification is read-only and is NOT gated on the global
+`zfs.detachedVolumesFromSnapshots` flag, so a StorageClass that opts into
+`snapshotRestoreMode=detached` while the global default stays `clone` still has
+its spent snapshots detected and reapable. TrueNAS 26.0 cannot persist a
+property update on an existing snapshot, so this path performs no backend
+writes. Deletion requires
 the later of the Kubernetes VolumeSnapshot creation time and backend ZFS
 snapshot creation time to exceed `reconcile.minOrphanAge`; clock skew can only
 delay cleanup.
+
+The replication-job sweep is always on, even when `reconcile.enabled=false` or
+`reconcile.delete.enabled=false`. It calls `core.job_abort` only for active
+`replication.run_onetime` jobs whose target is strictly below
+`zfs.parentDataset` and which have no matching in-flight marker, or whose source
+dataset is provably gone. A missing TARGET dataset is never an abort trigger: a
+live detached copy (`only_from_scratch`) deliberately has no target until
+`zfs receive` materializes it, whereas the source is present throughout a
+legitimate copy. Jobs outside that dataset tree are never touched.
 
 > **DANGER — one parent per cluster:** `zfs.parentDataset` MUST be unique to one
 > Kubernetes cluster. Never point two live clusters at the same parent dataset.

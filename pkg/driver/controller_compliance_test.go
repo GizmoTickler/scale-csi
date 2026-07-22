@@ -806,9 +806,10 @@ func TestCreateVolumeDetachedSnapshotExistingCopyClearsInheritedShareIdentity(t 
 	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropNFSShareID, fmt.Sprint(sourceShare.ID)))
 	snapshot, err := client.SnapshotCreate(ctx, source.Name, "existing-copy-snapshot", nil)
 	require.NoError(t, err)
-	require.NoError(t, client.CopyDatasetFromSnapshotLocal(
+	_, err = client.CopyDatasetFromSnapshotLocal(
 		ctx, source.Name, snapshot.Name, "pool/parent/existing-copy",
-	))
+	)
+	require.NoError(t, err)
 	// A retry may resume only when the existing copy already has the durable
 	// provenance written by the original request. CreateVolume must never infer
 	// these properties from a later source-bearing request.
@@ -861,12 +862,12 @@ type detachedCopyErrorClient struct {
 func (m *detachedCopyErrorClient) CopyDatasetFromSnapshotLocal(
 	ctx context.Context,
 	_, _, targetDataset string,
-) error {
+) (int64, error) {
 	_, err := m.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: targetDataset, Type: "FILESYSTEM"})
 	if err != nil {
-		return err
+		return truenas.UnknownReplicationJobID, err
 	}
-	return errors.New("injected copy failure after partial receive")
+	return 91, errors.New("injected copy failure after partial receive")
 }
 
 func TestCreateVolumeDetachedSnapshotCopyFailureCleansPartialTarget(t *testing.T) {
@@ -1060,4 +1061,94 @@ func TestControllerGetVolumeOmitsUnadvertisedVolumeCondition(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Nil(t, response.GetStatus())
+}
+
+// FIX 3 regression: a snapshot-sourced CreateVolume chooses clone vs detached
+// copy per StorageClass `snapshotRestoreMode`, falling back to the global
+// zfs.detachedVolumesFromSnapshots default when the parameter is unset. A clone
+// keeps a ZFS origin; an independent detached copy has none.
+func TestCreateVolumeSnapshotRestoreModePerStorageClass(t *testing.T) {
+	ctx := context.Background()
+
+	newSource := func(t *testing.T, client *truenas.MockClient, volumeID, snapName string) {
+		t.Helper()
+		mustCreateParentDataset(t, client)
+		source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/" + volumeID, Type: "FILESYSTEM", Refquota: testGiB,
+		})
+		require.NoError(t, err)
+		_, err = client.SnapshotCreate(ctx, source.Name, snapName, nil)
+		require.NoError(t, err)
+	}
+	create := func(driver *Driver, name, snapName string, params map[string]string) error {
+		t.Helper()
+		if params == nil {
+			params = map[string]string{}
+		}
+		params["protocol"] = "nfs"
+		_, err := driver.CreateVolume(ctx, &csi.CreateVolumeRequest{
+			Name:               name,
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			Parameters:         params,
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snapName},
+			}},
+		})
+		return err
+	}
+	origin := func(t *testing.T, client *truenas.MockClient, name string) string {
+		t.Helper()
+		ds, err := client.DatasetGet(ctx, "pool/parent/"+name)
+		require.NoError(t, err)
+		return datasetOriginSnapshotID(ds)
+	}
+
+	t.Run("param clone overrides detached global default", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		newSource(t, client, "src-clone", "snap-clone")
+		driver := newComplianceTestDriver(client)
+		driver.config.ZFS.DetachedVolumesFromSnapshots = true
+		require.NoError(t, create(driver, "restore-clone", "snap-clone",
+			map[string]string{"snapshotRestoreMode": "clone"}))
+		assert.NotEmpty(t, origin(t, client, "restore-clone"),
+			"snapshotRestoreMode=clone must take the ZFS clone path")
+	})
+
+	t.Run("param detached overrides clone global default", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		newSource(t, client, "src-detached", "snap-detached")
+		driver := newComplianceTestDriver(client)
+		driver.config.ZFS.DetachedVolumesFromSnapshots = false
+		require.NoError(t, create(driver, "restore-detached", "snap-detached",
+			map[string]string{"snapshotRestoreMode": "detached"}))
+		assert.Empty(t, origin(t, client, "restore-detached"),
+			"snapshotRestoreMode=detached must take the independent copy path")
+	})
+
+	t.Run("unset follows global default", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		newSource(t, client, "src-default-clone", "snap-default-clone")
+		newSource(t, client, "src-default-detached", "snap-default-detached")
+
+		cloneDriver := newComplianceTestDriver(client)
+		cloneDriver.config.ZFS.DetachedVolumesFromSnapshots = false
+		require.NoError(t, create(cloneDriver, "restore-default-clone", "snap-default-clone", nil))
+		assert.NotEmpty(t, origin(t, client, "restore-default-clone"))
+
+		detachedDriver := newComplianceTestDriver(client)
+		detachedDriver.config.ZFS.DetachedVolumesFromSnapshots = true
+		require.NoError(t, create(detachedDriver, "restore-default-detached", "snap-default-detached", nil))
+		assert.Empty(t, origin(t, client, "restore-default-detached"))
+	})
+
+	t.Run("invalid value is rejected", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		newSource(t, client, "src-invalid", "snap-invalid")
+		driver := newComplianceTestDriver(client)
+		err := create(driver, "restore-invalid", "snap-invalid",
+			map[string]string{"snapshotRestoreMode": "bogus"})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	})
 }

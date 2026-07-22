@@ -187,6 +187,15 @@ var (
 		[]string{"phase"},
 	)
 
+	replicationJobsAbortedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "replication_jobs_aborted_total",
+			Help:      "Total driver-owned one-time replication jobs successfully aborted",
+		},
+		[]string{"reason"},
+	)
+
 	fencingDeferredTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -202,6 +211,19 @@ var (
 			Name:      "fencing_stale_deferred_total",
 			Help:      "Total stale publication cleanup passes deferred by the empty-VolumeAttachment safety brake",
 		},
+	)
+
+	// fencingTakeoverTotal counts successful synchronous stale-publication
+	// takeovers — the single most dangerous operation on a live strict cluster
+	// (it revokes one node's grant to hand the volume to another). It is labeled
+	// by reason so alerting can watch the stale_record path specifically.
+	fencingTakeoverTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "fencing_takeover_total",
+			Help:      "Total successful synchronous fencing takeovers, labeled by reason",
+		},
+		[]string{"reason"},
 	)
 
 	// fencingProvenanceOverflowTotal counts publishes refused because a node's
@@ -261,10 +283,20 @@ var (
 )
 
 func init() {
+	for _, reason := range []string{
+		truenas.ReplicationJobAbortReasonContextEnded,
+		truenas.ReplicationJobAbortReasonCopyFailed,
+		replicationJobReasonCreateVolumeFailed,
+		replicationJobReasonMissingMarker,
+		replicationJobReasonMissingSourceDataset,
+	} {
+		replicationJobsAbortedTotal.WithLabelValues(reason).Add(0)
+	}
 	for _, protocol := range []string{"nfs", "iscsi", "nvmeof"} {
 		fencingDeferredTotal.WithLabelValues("missing_identity", protocol).Add(0)
 	}
 	fencingDeferredTotal.WithLabelValues("outside_allowed_network", "nfs").Add(0)
+	fencingTakeoverTotal.WithLabelValues(fencingTakeoverReasonStaleRecord).Add(0)
 	for _, protocol := range []string{"nfs", "nvmeof"} {
 		fencingProvenanceOverflowTotal.WithLabelValues(protocol).Add(0)
 	}
@@ -351,12 +383,20 @@ func RecordReconcileFailure(phase string) {
 	reconcileFailuresTotal.WithLabelValues(phase).Inc()
 }
 
+func RecordReplicationJobAborted(reason string) {
+	replicationJobsAbortedTotal.WithLabelValues(reason).Inc()
+}
+
 func RecordFencingDeferred(reason, protocol string) {
 	fencingDeferredTotal.WithLabelValues(reason, protocol).Inc()
 }
 
 func RecordFencingStaleDeferred() {
 	fencingStaleDeferredTotal.Inc()
+}
+
+func RecordFencingTakeover(reason string) {
+	fencingTakeoverTotal.WithLabelValues(reason).Inc()
 }
 
 func RecordFencingProvenanceOverflow(protocol string) {

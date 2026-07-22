@@ -38,6 +38,7 @@ const (
 	EventReasonNFSUnmountFailed     = "NFSUnmountFailed"
 	EventReasonTrueNASError         = "TrueNASError"
 	EventReasonTrueNASReconnected   = "TrueNASReconnected"
+	EventReasonFencingTakeover      = "FencingTakeover"
 )
 
 const (

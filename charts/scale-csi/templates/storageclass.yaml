@@ -1,18 +1,26 @@
 {{- $root := . -}}
 {{- $classes := .Values.storageClasses -}}
 {{- if .Values.storageClass -}}
-  {{- /* The legacy defaults deliberately omit "protocol" so the deprecated path
-       shares the modern omit-when-unset behavior below: a protocol is emitted
-       only when the values entry sets one. Defaulting it to nfs here would
-       silently force nfs on an iscsi/nvmeof class. */}}
-  {{- $legacy := mergeOverwrite (dict "create" true "name" "scale-nfs" "isDefault" false "reclaimPolicy" "Delete" "allowVolumeExpansion" true "volumeBindingMode" "Immediate" "mountOptions" (list "nfsvers=4" "noatime") "extraParameters" (dict)) (deepCopy .Values.storageClass) -}}
+  {{- /* The legacy defaults deliberately omit "protocol" and "mountOptions" so
+       the deprecated path shares the modern omit-when-unset behavior below.
+       Defaulting either to NFS values would corrupt an iscsi/nvmeof class. */}}
+  {{- $legacy := mergeOverwrite (dict "create" true "name" "scale-nfs" "isDefault" false "reclaimPolicy" "Delete" "allowVolumeExpansion" true "volumeBindingMode" "Immediate" "extraParameters" (dict)) (deepCopy .Values.storageClass) -}}
   {{- if $legacy.create -}}
     {{- $classes = list $legacy -}}
   {{- else -}}
     {{- $classes = list -}}
   {{- end -}}
 {{- end -}}
-{{- range $index, $storageClass := $classes }}
+{{- /* An entry is rendered unless it explicitly sets enabled: false. This keeps
+     every existing class rendering by default while letting opt-in example
+     classes (e.g. the detached DR-restore class) ship disabled. */}}
+{{- $enabledClasses := list -}}
+{{- range $storageClass := $classes -}}
+  {{- if or (not (hasKey $storageClass "enabled")) $storageClass.enabled -}}
+    {{- $enabledClasses = append $enabledClasses $storageClass -}}
+  {{- end -}}
+{{- end -}}
+{{- range $index, $storageClass := $enabledClasses }}
 {{- if $index }}
 ---
 {{- end }}
@@ -45,6 +53,11 @@ parameters:
        nfs on an iscsi/nvmeof class. */}}
   {{- if $storageClass.protocol }}
   {{- $_ := set $parameters "protocol" $storageClass.protocol -}}
+  {{- end }}
+  {{- /* Emit snapshotRestoreMode only when set, so unset classes follow the
+       driver's global zfs.detachedVolumesFromSnapshots default. */}}
+  {{- if $storageClass.snapshotRestoreMode }}
+  {{- $_ := set $parameters "snapshotRestoreMode" $storageClass.snapshotRestoreMode -}}
   {{- end }}
   {{- toYaml $parameters | nindent 2 }}
 {{- end }}

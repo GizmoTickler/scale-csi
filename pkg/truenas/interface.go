@@ -46,9 +46,11 @@ type ClientInterface interface {
 	SnapshotSetUserProperty(ctx context.Context, snapshotID, key, value string) error
 	SnapshotRemoveUserProperties(ctx context.Context, snapshotID string, keys []string) error
 	SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error
-	CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) error
+	CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) (int64, error)
 	DestroyReplicatedTargetSnapshot(ctx context.Context, targetDataset, snapshotShortName string) error
 	SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error
+	ReplicationJobList(ctx context.Context) ([]*ReplicationJob, error)
+	ReplicationJobAbort(ctx context.Context, jobID int64, reason string) error
 
 	// NFS methods
 	NFSShareCreate(ctx context.Context, params *NFSShareCreateParams) (*NFSShare, error)

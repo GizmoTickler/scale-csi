@@ -145,7 +145,9 @@ func TestMockClientCopyDatasetFromSnapshotLocalIsIndependentAndIdempotent(t *tes
 	snapshot, err := client.SnapshotCreate(ctx, source.Name, "restore-point", nil)
 	require.NoError(t, err)
 
-	require.NoError(t, client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, "tank/csi/target"))
+	jobID, err := client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, "tank/csi/target")
+	require.NoError(t, err)
+	assert.NotEqual(t, UnknownReplicationJobID, jobID)
 	target, err := client.DatasetGet(ctx, "tank/csi/target")
 	require.NoError(t, err)
 	assert.Empty(t, datasetPropertyString(target.Origin))
@@ -156,7 +158,7 @@ func TestMockClientCopyDatasetFromSnapshotLocalIsIndependentAndIdempotent(t *tes
 	// A repeated call must preserve the already-created target rather than
 	// replacing its post-copy identity updates with inherited source values.
 	require.NoError(t, client.DatasetSetUserProperty(ctx, target.Name, "truenas-csi:csi_volume_name", "target"))
-	err = client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, target.Name)
+	_, err = client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, target.Name)
 	require.Error(t, err)
 	assert.True(t, IsDatasetDestinationExistsError(err))
 	target, err = client.DatasetGet(ctx, target.Name)

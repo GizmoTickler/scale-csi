@@ -110,8 +110,10 @@ func TestNewDriverControllerCreatesTrueNASClient(t *testing.T) {
 	original := newTrueNASClient
 	t.Cleanup(func() { newTrueNASClient = original })
 	clientCreated := false
-	newTrueNASClient = func(*truenas.ClientConfig) (truenas.ClientInterface, error) {
+	var capturedConfig *truenas.ClientConfig
+	newTrueNASClient = func(cfg *truenas.ClientConfig) (truenas.ClientInterface, error) {
 		clientCreated = true
+		capturedConfig = cfg
 		return truenas.NewMockClient(), nil
 	}
 
@@ -127,6 +129,8 @@ func TestNewDriverControllerCreatesTrueNASClient(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.True(t, clientCreated)
+	require.NotNil(t, capturedConfig)
+	assert.NotNil(t, capturedConfig.ReplicationJobAbortRecorder)
 	assert.NotNil(t, drv.truenasClient)
 	assert.NotNil(t, drv.serviceReloadDebouncer)
 	drv.Stop()

@@ -303,9 +303,27 @@ storageClasses:
       - noatime
     # Additional CSI parameters, for example secret references
     extraParameters: {}
+  # Opt-in example: a NVMe-oF class that restores snapshots as independent
+  # detached copies instead of cheap ZFS clones, for DR-restore use cases where
+  # the restored volume must not share blocks (and a snapshot's lifecycle) with
+  # its source. Disabled by default so it is never created unless you set
+  # `enabled: true` (and enable nvmeof above). The dominant hourly VolSync
+  # source-backup mounts should keep the default clone behavior (omit
+  # snapshotRestoreMode) to stay cheap.
+  - name: scale-nvmeof-detached
+    enabled: false
+    protocol: nvmeof
+    snapshotRestoreMode: detached
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: []
+    extraParameters: {}
 
 # Deprecated single-StorageClass configuration. When non-empty, this takes
 # precedence over storageClasses for compatibility with existing values files.
+# mountOptions and protocol are emitted only when explicitly set here.
 storageClass: {}
 
 # Optional VolumeSnapshotClass
@@ -474,14 +492,16 @@ metrics:
 
 # Controller-side orphan detection and opt-in guarded cleanup.
 reconcile:
-  # The default pass performs detection (updating Prometheus gauges) plus
+  # Driver-owned replication.run_onetime zombie-job cleanup runs on controller
+  # startup and every interval regardless of enabled or delete.enabled. The
+  # default pass additionally performs detection (updating Prometheus gauges) plus
   # hygiene of the driver's OWN bookkeeping user properties on the parent
   # dataset: stale in-flight creation markers and orphaned tombstone-ledger
   # entries are retired with live staleness proof. Backend OBJECT deletion —
   # volumes, snapshots, tombstone reaping — happens only behind delete.enabled.
   enabled: true
 
-  # Interval between detection passes.
+  # Interval between controller reconcile passes (including the job sweep).
   interval: 1h
 
   # Managed backend objects must be older than this before they are orphaned.

@@ -1,7 +1,7 @@
 # Build stage
 # renovate: datasource=docker depName=golang
-# Pin this base image as FROM golang:1.26.4-alpine3.22@sha256:<digest> when Renovate resolves it.
-FROM golang:1.26.4-alpine3.22 AS builder
+# Pin this base image as FROM golang:1.26.5-alpine3.22@sha256:<digest> when Renovate resolves it.
+FROM golang:1.26.5-alpine3.22 AS builder
 
 RUN apk add --no-cache git
 

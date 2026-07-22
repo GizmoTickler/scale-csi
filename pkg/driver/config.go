@@ -299,10 +299,12 @@ type SessionGCConfig struct {
 
 // ReconcileConfig configures periodic orphan detection and the run-once GC mode.
 type ReconcileConfig struct {
-	// Enabled starts read-only orphan detection on the controller (default: true).
+	// Enabled starts read-only orphan object detection on the controller (default:
+	// true). Driver-owned replication-job hygiene always runs independently.
 	Enabled bool `yaml:"enabled"`
 
-	// Interval is the duration between read-only detection passes (default: 1h).
+	// Interval is the duration between controller reconcile passes, including the
+	// always-on replication-job sweep (default: 1h).
 	Interval string `yaml:"interval"`
 
 	// MinOrphanAge is the minimum backend object age before it can be orphaned (default: 24h).

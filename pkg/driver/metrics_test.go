@@ -278,4 +278,14 @@ func TestReconcileAndFencingMetrics(t *testing.T) {
 	staleBefore := testutil.ToFloat64(fencingStaleDeferredTotal)
 	RecordFencingStaleDeferred()
 	assert.Equal(t, staleBefore+1, testutil.ToFloat64(fencingStaleDeferredTotal))
+
+	takeover := fencingTakeoverTotal.WithLabelValues(fencingTakeoverReasonStaleRecord)
+	takeoverBefore := testutil.ToFloat64(takeover)
+	RecordFencingTakeover(fencingTakeoverReasonStaleRecord)
+	assert.Equal(t, takeoverBefore+1, testutil.ToFloat64(takeover))
+
+	replicationAborts := replicationJobsAbortedTotal.WithLabelValues("missing_marker")
+	replicationAbortsBefore := testutil.ToFloat64(replicationAborts)
+	RecordReplicationJobAborted("missing_marker")
+	assert.Equal(t, replicationAbortsBefore+1, testutil.ToFloat64(replicationAborts))
 }

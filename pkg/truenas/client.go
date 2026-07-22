@@ -280,6 +280,8 @@ type ClientConfig struct {
 	MaxConcurrentReqs int             // Maximum number of concurrent API requests (default: 10)
 	LazyConnect       bool            // Skip eager connection; connect on first API use (node-only mode)
 	MetricsRecorder   MetricsRecorder // Optional callback for recording request metrics
+	// ReplicationJobAbortRecorder is called after core.job_abort succeeds.
+	ReplicationJobAbortRecorder ReplicationJobAbortRecorder
 
 	// Circuit breaker configuration
 	CircuitBreaker *CircuitBreakerConfig
@@ -368,12 +370,13 @@ func NewConnection(id int, cfg *ClientConfig) *Connection {
 
 // Client is a TrueNAS API client using WebSocket JSON-RPC 2.0 with connection pooling.
 type Client struct {
-	config          *ClientConfig
-	pool            []*Connection
-	next            uint64          // For round-robin selection
-	semaphore       chan struct{}   // Limits concurrent requests to prevent TrueNAS overload
-	metricsRecorder MetricsRecorder // Optional callback for recording request metrics
-	circuitBreaker  *CircuitBreaker // Optional circuit breaker for API calls
+	config                      *ClientConfig
+	pool                        []*Connection
+	next                        uint64                      // For round-robin selection
+	semaphore                   chan struct{}               // Limits concurrent requests to prevent TrueNAS overload
+	metricsRecorder             MetricsRecorder             // Optional callback for recording request metrics
+	replicationJobAbortRecorder ReplicationJobAbortRecorder // Optional callback for successful job aborts
+	circuitBreaker              *CircuitBreaker             // Optional circuit breaker for API calls
 
 	// NVMe-oF ports are shared resources. Serialize find-or-create and cache
 	// successful resolutions so concurrent volume creates cannot race.
@@ -509,12 +512,13 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	}
 
 	client := &Client{
-		config:           cfg,
-		pool:             make([]*Connection, cfg.MaxConnections),
-		semaphore:        make(chan struct{}, cfg.MaxConcurrentReqs),
-		metricsRecorder:  cfg.MetricsRecorder,
-		circuitBreaker:   cb,
-		nvmeResolvedPort: make(map[string]*NVMeoFPort),
+		config:                      cfg,
+		pool:                        make([]*Connection, cfg.MaxConnections),
+		semaphore:                   make(chan struct{}, cfg.MaxConcurrentReqs),
+		metricsRecorder:             cfg.MetricsRecorder,
+		replicationJobAbortRecorder: cfg.ReplicationJobAbortRecorder,
+		circuitBreaker:              cb,
+		nvmeResolvedPort:            make(map[string]*NVMeoFPort),
 	}
 
 	// Initialize connection pool

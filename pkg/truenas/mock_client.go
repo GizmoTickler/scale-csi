@@ -14,23 +14,27 @@ type MockClient struct {
 	mu sync.RWMutex
 
 	// Mock data
-	Datasets            map[string]*Dataset
-	Snapshots           map[string]*Snapshot
-	NFSShares           map[int]*NFSShare
-	ISCSITargets        map[int]*ISCSITarget
-	ISCSIExtents        map[int]*ISCSIExtent
-	TargetExtents       map[int]*ISCSITargetExtent
-	NVMeHosts           map[string]*NVMeoFHost
-	NVMeHostSubsystems  map[int]*NVMeoFHostSubsys
-	NVMeSubsystems      map[int]*NVMeoFSubsystem
-	NVMeNamespaces      map[int]*NVMeoFNamespace
-	ISCSIPortals        map[int]*ISCSIPortal
-	ISCSIInitiators     map[int]*ISCSIInitiator
-	PoolAvailable       int64
-	deferredSnapshots   map[string]struct{}
-	DatasetDeleteCalls  []DatasetDeleteCall
-	SnapshotSetCalls    int
-	SnapshotRemoveCalls int
+	Datasets                   map[string]*Dataset
+	Snapshots                  map[string]*Snapshot
+	NFSShares                  map[int]*NFSShare
+	ISCSITargets               map[int]*ISCSITarget
+	ISCSIExtents               map[int]*ISCSIExtent
+	TargetExtents              map[int]*ISCSITargetExtent
+	NVMeHosts                  map[string]*NVMeoFHost
+	NVMeHostSubsystems         map[int]*NVMeoFHostSubsys
+	NVMeSubsystems             map[int]*NVMeoFSubsystem
+	NVMeNamespaces             map[int]*NVMeoFNamespace
+	ISCSIPortals               map[int]*ISCSIPortal
+	ISCSIInitiators            map[int]*ISCSIInitiator
+	PoolAvailable              int64
+	ReplicationJobs            map[int64]*ReplicationJob
+	deferredSnapshots          map[string]struct{}
+	DatasetDeleteCalls         []DatasetDeleteCall
+	ReplicationJobAbortCalls   []int64
+	ReplicationJobAbortReasons []string
+	SnapshotSetCalls           int
+	SnapshotRemoveCalls        int
+	nextReplicationJobID       int64
 
 	// Error injection
 	InjectError error
@@ -72,6 +76,7 @@ func NewMockClient() *MockClient {
 		NVMeHostSubsystems: make(map[int]*NVMeoFHostSubsys),
 		NVMeSubsystems:     make(map[int]*NVMeoFSubsystem),
 		NVMeNamespaces:     make(map[int]*NVMeoFNamespace),
+		ReplicationJobs:    make(map[int64]*ReplicationJob),
 		// Default portal/initiator fixtures cover the portal addresses used
 		// across the test suites so target-group auto-resolution succeeds
 		// without per-test setup. Tests may replace these maps.
@@ -85,8 +90,9 @@ func NewMockClient() *MockClient {
 		ISCSIInitiators: map[int]*ISCSIInitiator{
 			1: {ID: 1, Initiators: nil, Comment: "allow-all (mock)"},
 		},
-		deferredSnapshots: make(map[string]struct{}),
-		PoolAvailable:     100 * 1024 * 1024 * 1024, // 100 GiB default
+		deferredSnapshots:    make(map[string]struct{}),
+		PoolAvailable:        100 * 1024 * 1024 * 1024, // 100 GiB default
+		nextReplicationJobID: 1,
 	}
 }
 
@@ -183,6 +189,61 @@ func (m *MockClient) Call(ctx context.Context, method string, params ...interfac
 }
 func (m *MockClient) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
 	return nil, nil
+}
+
+func (m *MockClient) ReplicationJobList(ctx context.Context) ([]*ReplicationJob, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	jobs := make([]*ReplicationJob, 0, len(m.ReplicationJobs))
+	for _, job := range m.ReplicationJobs {
+		if job == nil || job.Method != ReplicationRunOnetimeMethod || !isActiveReplicationJobState(job.State) {
+			continue
+		}
+		copy := *job
+		copy.SourceDatasets = append([]string(nil), job.SourceDatasets...)
+		jobs = append(jobs, &copy)
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].ID < jobs[j].ID })
+	return jobs, nil
+}
+
+func (m *MockClient) ReplicationJobAbort(ctx context.Context, jobID int64, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReplicationJobAbortCalls = append(m.ReplicationJobAbortCalls, jobID)
+	m.ReplicationJobAbortReasons = append(m.ReplicationJobAbortReasons, reason)
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	if job := m.ReplicationJobs[jobID]; job != nil {
+		job.State = "ABORTED"
+	}
+	return nil
+}
+
+// AddReplicationJob and ReplicationJobAbortHistory provide race-safe setup and
+// inspection for controller-loop tests.
+func (m *MockClient) AddReplicationJob(job *ReplicationJob) {
+	if job == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	copy := *job
+	copy.SourceDatasets = append([]string(nil), job.SourceDatasets...)
+	m.ReplicationJobs[job.ID] = &copy
+	if job.ID >= m.nextReplicationJobID {
+		m.nextReplicationJobID = job.ID + 1
+	}
+}
+
+func (m *MockClient) ReplicationJobAbortHistory() ([]int64, []string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]int64(nil), m.ReplicationJobAbortCalls...), append([]string(nil), m.ReplicationJobAbortReasons...)
 }
 
 // Circuit breaker methods (return nil/no-op for mock)
@@ -738,24 +799,29 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetNa
 	return nil
 }
 
-func (m *MockClient) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) error {
+func (m *MockClient) CopyDatasetFromSnapshotLocal(
+	ctx context.Context,
+	sourceDataset, snapshotShortName, targetDataset string,
+) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.InjectError != nil {
-		return m.InjectError
+		return UnknownReplicationJobID, m.InjectError
 	}
 	if _, exists := m.Datasets[targetDataset]; exists {
-		return &ErrDatasetDestinationExists{Destination: targetDataset}
+		return UnknownReplicationJobID, &ErrDatasetDestinationExists{Destination: targetDataset}
 	}
 	snapshotID := sourceDataset + "@" + snapshotShortName
 	if _, exists := m.Snapshots[snapshotID]; !exists {
-		return &APIError{Code: -1, Message: "snapshot not found"}
+		return UnknownReplicationJobID, &APIError{Code: -1, Message: "snapshot not found"}
 	}
 	source, exists := m.Datasets[sourceDataset]
 	if !exists {
-		return &APIError{Code: -1, Message: "source dataset not found"}
+		return UnknownReplicationJobID, &APIError{Code: -1, Message: "source dataset not found"}
 	}
+	jobID := m.nextReplicationJobID
+	m.nextReplicationJobID++
 
 	properties := make(map[string]UserProperty, len(source.UserProperties))
 	for key, value := range source.UserProperties {
@@ -781,7 +847,14 @@ func (m *MockClient) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDat
 		copy.Mountpoint = "/mnt/" + strings.TrimPrefix(targetDataset, "/")
 	}
 	m.Datasets[targetDataset] = copy
-	return nil
+	m.ReplicationJobs[jobID] = &ReplicationJob{
+		ID:             jobID,
+		Method:         ReplicationRunOnetimeMethod,
+		State:          "SUCCESS",
+		SourceDatasets: []string{sourceDataset},
+		TargetDataset:  targetDataset,
+	}
+	return jobID, nil
 }
 
 func (m *MockClient) DestroyReplicatedTargetSnapshot(ctx context.Context, targetDataset, snapshotShortName string) error {

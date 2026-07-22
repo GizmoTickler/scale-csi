@@ -80,11 +80,13 @@ type racedDetachedCopyDestinationMock struct {
 func (m *racedDetachedCopyDestinationMock) CopyDatasetFromSnapshotLocal(
 	ctx context.Context,
 	sourceDataset, snapshotShortName, targetDataset string,
-) error {
-	if err := m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset); err != nil {
-		return err
+) (int64, error) {
+	jobID, err := m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
+	if err != nil {
+		return jobID, err
 	}
-	return m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
+	_, err = m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
+	return jobID, err
 }
 
 func (m *racedDatasetCreateMock) DatasetCreate(ctx context.Context, params *truenas.DatasetCreateParams) (*truenas.Dataset, error) {
@@ -2627,20 +2629,21 @@ type detachedCopyPartialWithSnapshotClient struct {
 func (m *detachedCopyPartialWithSnapshotClient) CopyDatasetFromSnapshotLocal(
 	ctx context.Context,
 	sourceDataset, snapshotShortName, targetDataset string,
-) error {
+) (int64, error) {
 	if m.fired {
 		return m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
 	}
 	m.fired = true
 	// The real crash/failure shape: replication created the target AND left the
 	// transferred snapshot on it before the job failed.
-	if err := m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset); err != nil {
-		return err
+	jobID, err := m.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
+	if err != nil {
+		return jobID, err
 	}
 	if _, err := m.SnapshotCreate(ctx, targetDataset, snapshotShortName, nil); err != nil {
-		return err
+		return jobID, err
 	}
-	return errors.New("injected replication job failure after partial receive")
+	return jobID, errors.New("injected replication job failure after partial receive")
 }
 
 func TestCreateVolumeDetachedCopyCleanupFailureKeepsMarkerForRecovery(t *testing.T) {
@@ -2698,6 +2701,54 @@ func TestCreateVolumeDetachedCopyCleanupFailureKeepsMarkerForRecovery(t *testing
 	restored, err := client.DatasetGet(ctx, "pool/parent/restored")
 	require.NoError(t, err)
 	assert.True(t, datasetHasLocalUserProperty(restored, PropDriverInstanceID, d.driverInstanceID()))
+}
+
+type detachedCopyReadyFailureClient struct {
+	*truenas.MockClient
+}
+
+func (m *detachedCopyReadyFailureClient) WaitForZvolReady(
+	context.Context,
+	string,
+	time.Duration,
+) (*truenas.Dataset, error) {
+	return nil, errors.New("injected readiness failure after replication completed")
+}
+
+func TestCreateVolumeFailureAfterDetachedCopyAttemptsJobAbort(t *testing.T) {
+	ctx := context.Background()
+	client := &detachedCopyReadyFailureClient{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DetachedVolumesFromSnapshots: true, DatasetEnableQuotas: true},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+		},
+		truenasClient: client,
+	}
+	mustCreateParentDataset(t, client.MockClient)
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	_, err = client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropManagedResource: "true", PropCSISnapshotName: "snap-1", PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+
+	_, err = d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "restored",
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+		}},
+	})
+	require.Error(t, err)
+	aborted, reasons := client.ReplicationJobAbortHistory()
+	assert.Equal(t, []int64{1}, aborted)
+	assert.Equal(t, []string{replicationJobReasonCreateVolumeFailed}, reasons)
 }
 
 // FIX 2 regression: a destination-exists loser must NOT delete the shared

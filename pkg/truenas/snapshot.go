@@ -723,11 +723,18 @@ func (c *Client) SnapshotClone(ctx context.Context, snapshotID, newDatasetName s
 	return nil
 }
 
-const replicationJobPollInterval = 500 * time.Millisecond
+const (
+	replicationJobPollInterval = 500 * time.Millisecond
+	replicationJobAbortTimeout = 10 * time.Second
+)
 
 // CopyDatasetFromSnapshotLocal creates an independent dataset with a local ZFS
 // send/receive, then removes the replicated snapshot from the destination.
-func (c *Client) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) error {
+func (c *Client) CopyDatasetFromSnapshotLocal(
+	ctx context.Context,
+	sourceDataset, snapshotShortName, targetDataset string,
+) (jobID int64, retErr error) {
+	jobID = UnknownReplicationJobID
 	params := map[string]interface{}{
 		"direction":         "PUSH",
 		"transport":         "LOCAL",
@@ -740,18 +747,60 @@ func (c *Client) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset
 		"readonly":          "IGNORE",
 		"only_from_scratch": true,
 	}
-
-	result, err := c.Call(ctx, "replication.run_onetime", params)
-	if err != nil {
-		if IsAlreadyExistsError(err) {
-			return &ErrDatasetDestinationExists{Destination: targetDataset}
+	// Every error after a proven launch attempts to abort the middleware job. The
+	// cleanup context deliberately survives a canceled/deadline-exceeded CSI
+	// request; using ctx here is the original leak.
+	defer func() {
+		if retErr == nil || jobID == UnknownReplicationJobID {
+			return
 		}
-		return fmt.Errorf("failed to start local snapshot copy: %w", err)
+		reason := ReplicationJobAbortReasonCopyFailed
+		if errors.Is(retErr, context.Canceled) || errors.Is(retErr, context.DeadlineExceeded) {
+			reason = ReplicationJobAbortReasonContextEnded
+		}
+		abortCtx, cancel := replicationJobCleanupContext(ctx)
+		defer cancel()
+		if abortErr := c.ReplicationJobAbort(abortCtx, jobID, reason); abortErr != nil {
+			klog.Warningf("Failed to abort one-time replication job %d after detached-copy failure: %v", jobID, abortErr)
+			return
+		}
+		klog.Infof("Aborted one-time replication job %d after detached-copy failure", jobID)
+	}()
+
+	result, err := c.Call(ctx, ReplicationRunOnetimeMethod, params)
+	if err != nil {
+		// Cancellation may arrive after middleware accepted the mutation but before
+		// its response reached us. Recover only by the complete method+arguments
+		// signature, never by a broad dataset prefix.
+		if ctx.Err() != nil || errors.Is(err, ErrAmbiguousResult) {
+			recoveryCtx, cancel := replicationJobCleanupContext(ctx)
+			recoveredID, recoveryErr := c.recoverReplicationJobID(recoveryCtx, params)
+			cancel()
+			if recoveryErr != nil {
+				klog.Warningf("Could not recover an ambiguously launched one-time replication job for target %s: %v", targetDataset, recoveryErr)
+			} else {
+				jobID = recoveredID
+			}
+		}
+		if IsAlreadyExistsError(err) {
+			return jobID, &ErrDatasetDestinationExists{Destination: targetDataset}
+		}
+		return jobID, fmt.Errorf("failed to start local snapshot copy: %w", err)
 	}
 
-	jobID, err := replicationJobID(result)
+	// Capture the job ID immediately after the launch returns. There is no
+	// cancellation point between the response and this parse.
+	jobID, err = replicationJobID(result)
 	if err != nil {
-		return fmt.Errorf("failed to start local snapshot copy: %w", err)
+		recoveryCtx, cancel := replicationJobCleanupContext(ctx)
+		recoveredID, recoveryErr := c.recoverReplicationJobID(recoveryCtx, params)
+		cancel()
+		if recoveryErr != nil {
+			klog.Warningf("Could not recover one-time replication job after an invalid launch response for target %s: %v", targetDataset, recoveryErr)
+		} else {
+			jobID = recoveredID
+		}
+		return jobID, fmt.Errorf("failed to start local snapshot copy: %w", err)
 	}
 	if err := c.waitForJob(ctx, jobID); err != nil {
 		// only_from_scratch reports an existing target through the asynchronous
@@ -759,12 +808,22 @@ func (c *Client) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset
 		// destination; no follow-up read may downgrade that safety decision.
 		var terminalErr *jobTerminalError
 		if errors.As(err, &terminalErr) && IsAlreadyExistsError(err) {
-			return &ErrDatasetDestinationExists{Destination: targetDataset}
+			return jobID, &ErrDatasetDestinationExists{Destination: targetDataset}
 		}
-		return fmt.Errorf("local snapshot copy job %d failed: %w", jobID, err)
+		return jobID, fmt.Errorf("local snapshot copy job %d failed: %w", jobID, err)
 	}
 
-	return c.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName)
+	if err := c.DestroyReplicatedTargetSnapshot(ctx, targetDataset, snapshotShortName); err != nil {
+		return jobID, err
+	}
+	return jobID, nil
+}
+
+func replicationJobCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), replicationJobAbortTimeout)
 }
 
 type jobTerminalError struct {
