@@ -1814,15 +1814,42 @@ func stalePublicationObservationKey(datasetName, propertyKey string) string {
 	return datasetName + "\x00" + propertyKey
 }
 
+// datasetHasPublicationRecordKeys reports whether the dataset carries at least one
+// publication_* user-property KEY. The TrueNAS 26.0 zfs.resource.query listing
+// exposes these keys but NOT their source (user_properties come back as a flat
+// string map), so key presence is the cheap, source-independent pre-filter used to
+// decide which datasets need a source-bearing re-fetch before their records can be
+// classified. It is deliberately over-inclusive — a clone inherits the source
+// volume's publication_* keys — but the source-authoritative parse that follows the
+// re-fetch narrows back to only this dataset's own (local) records.
+func datasetHasPublicationRecordKeys(dataset *truenas.Dataset) bool {
+	if dataset == nil {
+		return false
+	}
+	for key := range dataset.UserProperties {
+		if strings.HasPrefix(key, publicationPropertyPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// publicationPropertyCount counts publication_* user-property KEYS across the
+// listing. It deliberately ignores property source: the zfs.resource.query listing
+// is flat/sourceless on TrueNAS 26.0, so source is unavailable here. The count only
+// feeds the mass-absence brake — a heuristic that defers all revocation when the
+// VolumeAttachment list looks empty while several records exist — where counting
+// clone-inherited keys as well is safe: it biases the brake toward deferral
+// (inaction) rather than mass revocation. Source-authoritative classification
+// happens later, per candidate dataset, after a source-bearing re-fetch.
 func publicationPropertyCount(datasets []*truenas.Dataset) int {
 	count := 0
 	for _, dataset := range datasets {
 		if dataset == nil {
 			continue
 		}
-		for key, property := range dataset.UserProperties {
-			if strings.HasPrefix(key, publicationPropertyPrefix) &&
-				isLocalUserPropertySource(property.Source) {
+		for key := range dataset.UserProperties {
+			if strings.HasPrefix(key, publicationPropertyPrefix) {
 				count++
 			}
 		}
@@ -1867,7 +1894,28 @@ func (d *Driver) reconcileStalePublicationRecords(
 		if dataset == nil {
 			continue
 		}
-		records, parseErr := publicationRecordsFromDataset(dataset)
+		// The zfs.resource.query listing returns user_properties as a flat,
+		// SOURCELESS map on TrueNAS 26.0, but publicationRecordsFromDataset must
+		// distinguish a dataset's own (source=="local") records from clone-inherited
+		// ones by source: run against the listing directly, it would skip every
+		// record and silently disable this repair. Pre-filter cheaply on
+		// publication_* KEY presence (the flat read still exposes keys) and, for the
+		// few candidates whose listing came from the sourceless resource path,
+		// re-fetch through the source-bearing pool.dataset.query read (DatasetGet)
+		// before classifying. A source-bearing listing — the pool.dataset.query
+		// fallback — is already authoritative and is used as-is. This costs a
+		// handful of DatasetGets (one per sourceless dataset that carries a
+		// publication record), not one per managed dataset.
+		recordSource := dataset
+		if dataset.ResourceQuery && datasetHasPublicationRecordKeys(dataset) {
+			sourceBearing, getErr := d.truenasClient.DatasetGet(ctx, dataset.Name)
+			if getErr != nil {
+				d.recordReconcileObjectFailure("stale_publication_classification", dataset.Name, getErr)
+				continue
+			}
+			recordSource = sourceBearing
+		}
+		records, parseErr := publicationRecordsFromDataset(recordSource)
 		if parseErr != nil {
 			d.recordReconcileObjectFailure("stale_publication_classification", dataset.Name, parseErr)
 			continue

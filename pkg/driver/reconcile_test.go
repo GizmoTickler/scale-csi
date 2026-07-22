@@ -439,6 +439,63 @@ func TestStalePublicationRecordRequiresContinuousAbsenceThenRevokes(t *testing.T
 		"additive cleanup removes only the CSI-added host grant")
 }
 
+// TestStalePublicationRecordDetectedThroughSourcelessResourceListing is the
+// regression test for the zfs.resource.query migration defect. On TrueNAS 26.0 the
+// path-scoped listing returns user_properties as a FLAT, SOURCELESS map, so running
+// publicationRecordsFromDataset — which must tell a dataset's own source=="local"
+// records apart from clone-inherited ones by source — directly on the listing skips
+// every record and silently disables the stale-record repair: the escape hatch that
+// unblocks a SINGLE_NODE/RWO volume after an operator force-removes a
+// VolumeAttachment finalizer. reconcileStalePublicationRecords must pre-filter the
+// flat listing for publication_* KEYS and re-fetch only those candidates through the
+// source-bearing pool.dataset.query read (DatasetGet) before classifying. Without
+// that re-fetch this test fails (the sourceless record is never even classified, so
+// it is never revoked); with it, the stale record is detected and retired exactly as
+// on the legacy source-bearing path.
+func TestStalePublicationRecordDetectedThroughSourcelessResourceListing(t *testing.T) {
+	ctx := context.Background()
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeAdditive, StaleRecordGracePeriod: "1ns"}
+	d.config.NFS.ShareAllowedNetworks = []string{"192.0.2.0/24"}
+	dataset := addReconcileDataset(client, "sourceless-listing", time.Now().Add(-time.Hour), true, 1)
+	dataset.Mountpoint = "/mnt/pool/parent/sourceless-listing"
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: dataset.Mountpoint, Hosts: []string{"192.0.2.11"}, Networks: []string{"192.0.2.0/24"}, Enabled: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+	record, err := newPublicationRecord(NodeIdentity{Name: "gone-worker", IPs: []net.IP{net.ParseIP("192.0.2.11")}},
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	record.CSIAddedNFSHosts = []string{"192.0.2.11"}
+	key := publicationPropertyKey(record.Node)
+	require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, key, record))
+
+	// List through the production path. The mock now models live 26.0, so the
+	// zfs.resource.query listing is sourceless; assert that precondition so this
+	// test genuinely exercises the regression rather than a source-bearing listing.
+	listed, err := d.listAllManagedDatasets(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	require.Contains(t, listed[0].UserProperties, key,
+		"the flat listing must still expose the publication_* key")
+	require.Empty(t, listed[0].UserProperties[key].Source,
+		"zfs.resource.query user_properties are sourceless on TrueNAS 26.0")
+
+	state := &kubernetesReconcileState{liveVolumeAttachments: map[string]struct{}{}, volumeAttachmentCount: 0}
+	t0 := time.Now()
+	d.reconcileStalePublicationRecords(ctx, listed, state, t0)
+	d.reconcileStalePublicationRecords(ctx, listed, state, t0.Add(time.Second))
+
+	fresh, err := client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	assert.NotContains(t, fresh.UserProperties, key,
+		"the stale record must still be detected and revoked through the sourceless listing")
+	share, err = client.NFSShareGet(ctx, share.ID)
+	require.NoError(t, err)
+	assert.Empty(t, share.Hosts, "the CSI-added host grant must be revoked with the record")
+}
+
 func TestStaleLegacyPublicationWithoutProvenancePreservesMatchingNFSHost(t *testing.T) {
 	ctx := context.Background()
 	d, client := newReconcileTestDriver(t, false, nil, nil)

@@ -434,6 +434,15 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 // datasets stored under parentDataset (no managed_resource filter), letting the
 // driver apply the same client-side managed_resource filter it uses against the
 // real client.
+//
+// Fidelity with live TrueNAS 26.0 (probe-confirmed): zfs.resource.query returns
+// per-dataset user_properties as a FLAT string map with NO per-property source —
+// native properties carry source, user_properties do not. The mock therefore
+// strips Source to "" on every returned user property and marks the dataset
+// ResourceQuery, so source-sensitive callers (publicationRecordsFromDataset)
+// exercise the same sourceless path they hit in production instead of being
+// masked by a source-bearing mock. DatasetGet (pool.dataset.query) stays
+// source-bearing, exactly as the real split behaves.
 func (m *MockClient) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*Dataset, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -448,7 +457,13 @@ func (m *MockClient) DatasetQueryByParent(ctx context.Context, parentDataset str
 		if parent != "" && !strings.HasPrefix(ds.Name, parent+"/") {
 			continue
 		}
-		list = append(list, mockDatasetResponse(ds, false))
+		response := mockDatasetResponse(ds, false)
+		for key, property := range response.UserProperties {
+			property.Source = ""
+			response.UserProperties[key] = property
+		}
+		response.ResourceQuery = true
+		list = append(list, response)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	return list, nil
