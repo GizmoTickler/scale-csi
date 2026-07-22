@@ -184,6 +184,20 @@ var (
 		},
 	)
 
+	// fencingProvenanceEvictedTotal counts additive-mode CSI-added grant
+	// provenance entries dropped by the per-node hard cap. A non-zero value warns
+	// that a single node's identity churn (per-boot NQNs, DHCP IPs) exceeded the
+	// bounded provenance list and the oldest tracked grants can no longer be
+	// auto-revoked by scale-csi.
+	fencingProvenanceEvictedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "fencing_provenance_evicted_total",
+			Help:      "Total additive fencing provenance entries evicted by the per-node hard cap",
+		},
+		[]string{"protocol"},
+	)
+
 	// Circuit breaker metrics
 	circuitBreakerState = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -231,6 +245,9 @@ func init() {
 		fencingDeferredTotal.WithLabelValues("missing_identity", protocol).Add(0)
 	}
 	fencingDeferredTotal.WithLabelValues("outside_allowed_network", "nfs").Add(0)
+	for _, protocol := range []string{"nfs", "nvmeof"} {
+		fencingProvenanceEvictedTotal.WithLabelValues(protocol).Add(0)
+	}
 }
 
 // RecordCSIOperation records metrics for a CSI operation
@@ -318,6 +335,10 @@ func RecordFencingDeferred(reason, protocol string) {
 
 func RecordFencingStaleDeferred() {
 	fencingStaleDeferredTotal.Inc()
+}
+
+func RecordFencingProvenanceEvicted(protocol string) {
+	fencingProvenanceEvictedTotal.WithLabelValues(protocol).Inc()
 }
 
 // Circuit breaker metrics tracking

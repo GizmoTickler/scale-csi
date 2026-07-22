@@ -577,6 +577,66 @@ func TestStalePublicationMassAbsenceBrakeDefersAllRecords(t *testing.T) {
 	}
 }
 
+// On TrueNAS 26.0 (no ZFS deferred destroy) DeleteSnapshot of a snapshot with a
+// live restored clone must return success after the tombstone rename releases the
+// CSI name, retain the tombstone, and let the orphan reconciler reap it once the
+// clone is gone. Without the fix the delete surfaces a spurious Internal and the
+// tombstone leaks forever.
+func TestReconcileReapsReleasedTombstoneWithoutDeferredDestroy(t *testing.T) {
+	ctx := context.Background()
+	pvSource := reconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pvSource}, nil)
+	client.NoDeferredSnapshotDestroy = true
+
+	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+	source.Mountpoint = "/mnt/pool/parent/source"
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropManagedResource:           "true",
+		PropCSISnapshotName:           "snap-1",
+		PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	// Age the snapshot (and the tombstone that inherits its creation time) past the
+	// minimum orphan age.
+	snapshot.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/restored"))
+
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "snap-1"})
+	require.NoError(t, err, "DeleteSnapshot must not surface a spurious Internal on 26.0")
+	released, err := client.SnapshotFindByName(ctx, "pool/parent", "snap-1")
+	require.NoError(t, err)
+	assert.Nil(t, released, "the CSI snapshot name is released by the tombstone rename")
+	tombstoneID := findTombstoneID(t, client, "pool/parent/source")
+	require.NotEmpty(t, tombstoneID, "the tombstone is retained while its clone is live")
+
+	// While the clone is live the reconciler must keep the tombstone.
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Empty(t, report.DeletedTombstones)
+	_, err = client.SnapshotGet(ctx, tombstoneID)
+	require.NoError(t, err, "tombstone retained while its clone still depends on it")
+
+	// Once the clone is gone the reconciler reaps the released tombstone.
+	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
+	report, err = d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Contains(t, report.DeletedTombstones, tombstoneID)
+	_, err = client.SnapshotGet(ctx, tombstoneID)
+	assert.True(t, truenas.IsNotFoundError(err), "the released tombstone is reaped")
+}
+
+func findTombstoneID(t *testing.T, client *truenas.MockClient, sourceDataset string) string {
+	t.Helper()
+	snaps, err := client.SnapshotList(context.Background(), sourceDataset)
+	require.NoError(t, err)
+	for _, snap := range snaps {
+		if isSnapshotTombstone(snap) {
+			return snap.ID
+		}
+	}
+	return ""
+}
+
 func newReconcileTestDriver(
 	t *testing.T,
 	detached bool,

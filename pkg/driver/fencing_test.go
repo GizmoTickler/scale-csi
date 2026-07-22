@@ -438,6 +438,38 @@ func TestAdditiveNFSUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 	}
 }
 
+func TestCompactAdditiveGrantsBoundsListAndEvictsOldestFirst(t *testing.T) {
+	// Stale entries (neither current nor still on the backend) are dropped; the
+	// remaining entries keep first-seen order.
+	got, evicted := compactAdditiveGrants(
+		[]string{"stale", "still-on-backend", "current"},
+		[]string{"current"},
+		[]string{"still-on-backend"},
+	)
+	assert.False(t, evicted)
+	assert.Equal(t, []string{"still-on-backend", "current"}, got)
+
+	// A pathological pile of entries still present on the backend is capped at the
+	// hard limit, evicting oldest-first and flagging the eviction.
+	previous := make([]string, 0, additiveGrantHardCap+5)
+	backend := make([]string, 0, additiveGrantHardCap+5)
+	for i := 0; i < additiveGrantHardCap+5; i++ {
+		host := "10.0.0." + strconv.Itoa(i)
+		previous = append(previous, host)
+		backend = append(backend, host)
+	}
+	capped, capEvicted := compactAdditiveGrants(previous, nil, backend)
+	assert.True(t, capEvicted)
+	assert.Len(t, capped, additiveGrantHardCap)
+	assert.Equal(t, "10.0.0.5", capped[0], "the five oldest entries are evicted")
+	assert.Equal(t, "10.0.0."+strconv.Itoa(additiveGrantHardCap+4), capped[len(capped)-1])
+
+	// The node's current grant always survives the cap as the newest entry.
+	withCurrent, _ := compactAdditiveGrants(previous, []string{"current-grant"}, append(backend, "current-grant"))
+	assert.Len(t, withCurrent, additiveGrantHardCap)
+	assert.Equal(t, "current-grant", withCurrent[len(withCurrent)-1])
+}
+
 func TestAdditiveNFSIdentityRotationRemovesOldCSIAddedGrant(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
@@ -478,7 +510,11 @@ func TestAdditiveNFSIdentityRotationRemovesOldCSIAddedGrant(t *testing.T) {
 
 	publish("192.0.2.11")
 	currentNodeID := publish("192.0.2.12")
-	publish("192.0.2.12") // an idempotent retry must retain both ownership facts
+	// The second publish already revoked 192.0.2.11 from the backend share, so the
+	// idempotent retry compacts that now-stale provenance entry away (it can no
+	// longer be re-revoked, and there is nothing left to revoke) while retaining
+	// the live grant. Bounding the list this way is the fix for unbounded churn.
+	publish("192.0.2.12")
 	share, err = client.NFSShareGet(ctx, share.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.12"}, share.Hosts)
@@ -486,7 +522,7 @@ func TestAdditiveNFSIdentityRotationRemovesOldCSIAddedGrant(t *testing.T) {
 	require.NoError(t, err)
 	records, err := publicationRecordsFromDataset(fresh)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"192.0.2.11", "192.0.2.12"},
+	assert.Equal(t, []string{"192.0.2.12"},
 		records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
 
 	_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
@@ -637,6 +673,73 @@ func TestAdditiveNVMePublishAndUnpublishPreserveAllowAnyHost(t *testing.T) {
 	assert.True(t, subsystem.AllowAnyHost, "additive teardown must not tighten a legacy allow-any subsystem")
 }
 
+// A ZFS clone inherits the source volume's publication_* user property with the
+// origin snapshot name as its source (not "local"). The exact-"local" filter must
+// exclude it so a freshly cloned volume owns zero publication records and can be
+// published without being seen as "published elsewhere".
+func TestClonedVolumeInheritsNoPublicationRecordsAndPublishesCleanly(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeAdditive},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS:     NFSConfig{ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"}},
+		},
+		truenasClient: client,
+	}
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	sourceShare, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: source.Mountpoint, Hosts: []string{"192.0.2.11"}, Enabled: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropNFSShareID, strconv.Itoa(sourceShare.ID)))
+	sourceRecord, err := newPublicationRecord(NodeIdentity{
+		Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.11")},
+	}, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	require.NoError(t, storePublicationRecord(ctx, client, source, source.Name, publicationPropertyKey("worker-a"), sourceRecord))
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{PropManagedResource: "true"})
+	require.NoError(t, err)
+
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/clone"))
+	clone, err := client.DatasetGet(ctx, "pool/parent/clone")
+	require.NoError(t, err)
+	inherited, ok := clone.UserProperties[publicationPropertyKey("worker-a")]
+	require.True(t, ok, "precondition: the clone inherited the source's publication property")
+	require.NotEqual(t, "local", inherited.Source, "precondition: inheritance is reported with an origin-name source")
+	records, err := publicationRecordsFromDataset(clone)
+	require.NoError(t, err)
+	assert.Empty(t, records, "a freshly cloned volume must own zero publication records")
+
+	// Give the clone its own CSI identity + NFS share, then publish it to a
+	// different node. The inherited source record must not make this look like the
+	// clone is already published elsewhere.
+	require.NoError(t, client.DatasetSetUserProperty(ctx, clone.Name, PropCSIVolumeName, "clone"))
+	cloneShare, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: clone.Mountpoint, Enabled: false})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, clone.Name, PropNFSShareID, strconv.Itoa(cloneShare.ID)))
+	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-b", IPs: []net.IP{net.ParseIP("192.0.2.12")}})
+	require.NoError(t, err)
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: "clone", NodeId: nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "nfs"},
+	})
+	require.NoError(t, err)
+	fresh, err := client.DatasetGet(ctx, clone.Name)
+	require.NoError(t, err)
+	cloneRecords, err := publicationRecordsFromDataset(fresh)
+	require.NoError(t, err)
+	require.Len(t, cloneRecords, 1)
+	_, published := cloneRecords[publicationPropertyKey("worker-b")]
+	assert.True(t, published, "the clone publishes cleanly under its own node record")
+}
+
 func TestAdditiveNVMeUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 	for _, test := range []struct {
 		name                 string
@@ -748,7 +851,10 @@ func TestAdditiveNVMeIdentityRotationRemovesOldCSIAddedAssociation(t *testing.T)
 	newNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a-new"
 	publish(oldNQN)
 	currentNodeID := publish(newNQN)
-	publish(newNQN) // an idempotent retry must retain both ownership facts
+	// The second publish already detached oldNQN from the subsystem, so the
+	// idempotent retry compacts that now-stale provenance entry away while
+	// retaining the live association. This bounds the list against NQN churn.
+	publish(newNQN)
 	associations, err := client.NVMeoFHostSubsysListBySubsystem(ctx, subsystemID)
 	require.NoError(t, err)
 	require.Len(t, associations, 1)
@@ -757,7 +863,7 @@ func TestAdditiveNVMeIdentityRotationRemovesOldCSIAddedAssociation(t *testing.T)
 	require.NoError(t, err)
 	records, err := publicationRecordsFromDataset(fresh)
 	require.NoError(t, err)
-	assert.Equal(t, []string{newNQN, oldNQN},
+	assert.Equal(t, []string{newNQN},
 		records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs)
 
 	_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{
@@ -1241,7 +1347,10 @@ func TestStartupReconcileAdditivePreservesNVMeGrantDuringIdentityGapThenRotates(
 	require.NoError(t, err)
 	records, err := publicationRecordsFromDataset(fresh)
 	require.NoError(t, err)
-	assert.Equal(t, []string{newNQN, oldNQN},
+	// oldNQN is still associated on the subsystem when the rotation publish reads
+	// the backend, so both are retained; provenance now preserves first-seen order
+	// (oldest first) so the hard cap can evict oldest-first.
+	assert.Equal(t, []string{oldNQN, newNQN},
 		records[publicationPropertyKey("worker-a")].CSIAddedNVMeNQNs)
 }
 

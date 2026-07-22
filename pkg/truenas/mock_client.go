@@ -45,6 +45,11 @@ type MockClient struct {
 	EmptyNVMeHostNQN bool
 	// RejectEmptyISCSITargetGroups catches invalid zero-portal target updates.
 	RejectEmptyISCSITargetGroups bool
+	// NoDeferredSnapshotDestroy models TrueNAS 26.0, whose
+	// zfs.resource.snapshot.destroy has no deferred-destroy mode: a snapshot with
+	// live clones always fails with ErrSnapshotHasClones regardless of the defer
+	// flag, so the driver's tombstone is retained until its last clone is gone.
+	NoDeferredSnapshotDestroy bool
 }
 
 // DatasetDeleteCall records the deletion mode requested by a test.
@@ -520,7 +525,9 @@ func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defe
 	}
 	clones := m.snapshotClonesLocked(snapshotID)
 	if len(clones) > 0 {
-		if !defer_ {
+		// TrueNAS 26.0 has no deferred destroy: the request fails with has-clones
+		// no matter what defer_ says, and nothing is marked for later reclamation.
+		if !defer_ || m.NoDeferredSnapshotDestroy {
 			return &ErrSnapshotHasClones{SnapshotID: snapshotID, Clones: clones}
 		}
 		m.deferredSnapshots[snapshotID] = struct{}{}
@@ -710,10 +717,21 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetNa
 		clone.Origin = DatasetProperty{Value: snapshotID, Parsed: snapshotID, Rawvalue: snapshotID, Source: "LOCAL"}
 		if source, ok := m.Datasets[snapshot.Dataset]; ok {
 			clone.Type = source.Type
-			clone.Mountpoint = source.Mountpoint
 			clone.Volsize = source.Volsize
 			clone.Refquota = source.Refquota
 			clone.Available = source.Available
+			// A ZFS clone gets its own mountpoint, not the source's.
+			if source.Type != "VOLUME" {
+				clone.Mountpoint = "/mnt/" + strings.TrimPrefix(newDatasetName, "/")
+			}
+			// Model ZFS clone inheritance: the clone inherits the source dataset's
+			// user properties, but their source is the ORIGIN SNAPSHOT NAME rather
+			// than "local". Live TrueNAS 26.0 reports clone-inherited user
+			// properties this way, which is exactly why local-vs-inherited checks
+			// must compare source == "local" and must not adopt these values.
+			for key, property := range source.UserProperties {
+				clone.UserProperties[key] = UserProperty{Value: property.Value, Source: snapshotID}
+			}
 		}
 	}
 	m.Datasets[newDatasetName] = clone

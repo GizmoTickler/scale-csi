@@ -373,6 +373,32 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s exists with protocol %s, requested %s", volumeID, ShareTypeNVMeoF, shareType)
 		}
+		// Crash self-healing for a content-source create that built the destination
+		// (clone or detached copy) but crashed before ownership was stamped. Such a
+		// remnant otherwise wedges the PVC permanently (terminal AlreadyExists below)
+		// and leaks invisibly (no managed_resource for the orphan reconciler). This
+		// runs before the content-source and ownership gates because an unstamped
+		// clone has no local content-source properties yet and would trip those
+		// gates first. It is a strict no-op for any dataset that carries a local
+		// ownership/share marker.
+		if source := req.GetVolumeContentSource(); source != nil {
+			recovered, action, recoverErr := d.recoverInFlightContentSourceRemnant(
+				ctx, existingDS, datasetName, name, source, capacityBytes, shareType,
+			)
+			if recoverErr != nil {
+				return nil, recoverErr
+			}
+			switch action {
+			case remnantActionResume:
+				// The remnant is now stamped and its content-source flow completed;
+				// fall through so the normal existing-dataset tail (capacity checks,
+				// idempotent share creation, response) finishes the volume.
+				existingDS = recovered
+			case remnantActionDestroy:
+				return nil, status.Errorf(codes.Aborted,
+					"destroyed unstamped interrupted detached-copy remnant %s; retry CreateVolume to recreate it cleanly", datasetName)
+			}
+		}
 		storedContentSource := volumeContentSourceFromDataset(existingDS)
 		requestedContentSource := req.GetVolumeContentSource()
 		storedSourceIsDurable := datasetHasDurableContentSource(existingDS)
@@ -581,6 +607,207 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	return &csi.CreateVolumeResponse{Volume: volume}, nil
+}
+
+type inFlightRemnantAction int
+
+const (
+	remnantActionNone inFlightRemnantAction = iota
+	remnantActionResume
+	remnantActionDestroy
+)
+
+// remnantDisqualifyingLocalProps are the local user properties whose presence
+// proves that some driver instance already took ownership of, or exported, a
+// dataset. A crash remnant of an in-flight content-source create carries none of
+// them locally: the fresh CreateVolume flow stamps ownership (driver_instance_id)
+// plus the managed markers and only then creates the share, strictly AFTER the
+// clone/copy body. So the absence of every one of these as a LOCAL value proves
+// no instance progressed past creation here — the dataset is either untouched or
+// carries only clone-inherited (non-local) values, and (because share creation
+// follows the ownership stamp) has no share.
+var remnantDisqualifyingLocalProps = []string{
+	PropDriverInstanceID,
+	PropManagedResource,
+	PropCSIVolumeName,
+	PropNFSShareID,
+	PropISCSITargetID,
+	PropISCSIExtentID,
+	PropISCSITargetExtentID,
+	PropISCSIInitiatorID,
+	PropNVMeoFSubsystemID,
+	PropNVMeoFNamespaceID,
+	PropNVMeoFPortSubsysID,
+}
+
+func datasetHasOwnershipOrShareLocalProperty(ds *truenas.Dataset) bool {
+	for _, key := range remnantDisqualifyingLocalProps {
+		if prop, ok := datasetUserPropertyProjection(ds, key); ok && isLocalUserPropertySource(prop.Source) {
+			return true
+		}
+	}
+	return false
+}
+
+// recoverInFlightContentSourceRemnant restores crash self-healing (regressed by
+// the clone-race fix) for a content-source CreateVolume whose destination dataset
+// was created but crashed before ownership was stamped. It is deliberately
+// conservative and acts ONLY when EVERY guard below holds, so it can never adopt
+// or destroy a dataset belonging to another instance or to a healthy volume:
+//   - the request carries a volume_content_source (we are mid clone/copy);
+//   - the dataset sits directly under our parent with exactly the requested name;
+//   - it carries NO local ownership/share property (no instance took ownership;
+//     this also proves no share exists);
+//   - it has no snapshots of its own;
+//   - CLONE path (origin present, clone mode): its origin matches the requested
+//     source snapshot, which proves ZFS created it as OUR clone -> RESUME (stamp
+//     ownership through the proven update+verify path, complete the content-source
+//     flow idempotently, and let the caller finish through the normal tail);
+//   - DETACHED-COPY path (origin absent, detached mode + snapshot source): an
+//     interrupted send/receive leaves an independent dataset whose completeness
+//     cannot be proven -> DESTROY and return Aborted so the retry recreates it.
+//
+// The clone-race fix is NOT reopened: a genuinely concurrent create leaves the
+// winner's local ownership marker (or is a same-instance stamp with the same
+// value), and setAndVerifyDatasetUserProperties re-reads to confirm source=local.
+func (d *Driver) recoverInFlightContentSourceRemnant(
+	ctx context.Context,
+	existingDS *truenas.Dataset,
+	datasetName, name string,
+	source *csi.VolumeContentSource,
+	capacityBytes int64,
+	shareType ShareType,
+) (*truenas.Dataset, inFlightRemnantAction, error) {
+	if source == nil || existingDS == nil {
+		return existingDS, remnantActionNone, nil
+	}
+	// Any local ownership/share marker (from this or another instance) keeps the
+	// dataset on the terminal AlreadyExists path — never touch it.
+	if existingDS.Name != datasetName || datasetHasOwnershipOrShareLocalProperty(existingDS) {
+		return existingDS, remnantActionNone, nil
+	}
+	// A clean just-created remnant owns no snapshots. Any snapshot is an
+	// independent dependency (and would block a non-recursive destroy), so a
+	// dataset with snapshots is not a resumable/destroyable half-object.
+	snapshots, err := d.truenasClient.SnapshotList(ctx, datasetName)
+	if err != nil {
+		return existingDS, remnantActionNone, status.Errorf(codes.Internal,
+			"inspect potential in-flight remnant %s for snapshots: %v", datasetName, err)
+	}
+	if len(snapshots) > 0 {
+		return existingDS, remnantActionNone, nil
+	}
+
+	origin := datasetOriginSnapshotID(existingDS)
+	if origin == "" {
+		// No origin: an originless remnant at our name can only come from an
+		// interrupted detached send/receive copy. Its completeness cannot be
+		// proven, so destroy it and force a clean recreate. Guard on the exact
+		// config+source shape that produces originless remnants so a clone-mode
+		// driver never destroys an anomalous originless dataset.
+		if d.config.ZFS.DetachedVolumesFromSnapshots && source.GetSnapshot() != nil {
+			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); delErr != nil {
+				return existingDS, remnantActionNone, status.Errorf(codes.Internal,
+					"destroy interrupted detached-copy remnant %s: %v", datasetName, delErr)
+			}
+			klog.Warningf("Destroyed unstamped interrupted detached-copy remnant %s; retry will recreate it cleanly", datasetName)
+			return nil, remnantActionDestroy, nil
+		}
+		return existingDS, remnantActionNone, nil
+	}
+
+	// Origin present: only resume when it proves this dataset is our clone of the
+	// exact requested source, and only in clone mode. A detached copy never has an
+	// origin, so an origin in detached mode is anomalous — leave it terminal.
+	if d.config.ZFS.DetachedVolumesFromSnapshots && source.GetSnapshot() != nil {
+		return existingDS, remnantActionNone, nil
+	}
+	expectedOrigin, resolveErr := d.expectedCloneRemnantOrigin(ctx, datasetName, source)
+	if resolveErr != nil {
+		return existingDS, remnantActionNone, resolveErr
+	}
+	if expectedOrigin == "" || origin != expectedOrigin {
+		return existingDS, remnantActionNone, nil
+	}
+	completed, resumeErr := d.completeResumedCloneRemnant(ctx, existingDS, datasetName, name, source, capacityBytes, shareType)
+	if resumeErr != nil {
+		return existingDS, remnantActionNone, resumeErr
+	}
+	klog.Infof("Resumed unstamped in-flight clone remnant %s (origin %s) after a crash before ownership was stamped", datasetName, origin)
+	return completed, remnantActionResume, nil
+}
+
+// expectedCloneRemnantOrigin returns the ZFS origin an unstamped remnant must
+// carry to prove it is our clone of the requested source, or "" when provenance
+// cannot be established (e.g. the source snapshot no longer exists).
+func (d *Driver) expectedCloneRemnantOrigin(ctx context.Context, datasetName string, source *csi.VolumeContentSource) (string, error) {
+	if snapshot := source.GetSnapshot(); snapshot != nil {
+		snap, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshot.GetSnapshotId())
+		if err != nil {
+			return "", status.Errorf(codes.Internal, "resolve source snapshot for in-flight remnant: %v", err)
+		}
+		if snap == nil {
+			return "", nil
+		}
+		return snap.ID, nil
+	}
+	if volume := source.GetVolume(); volume != nil {
+		sourceDataset, err := d.datasetForID(volume.GetVolumeId())
+		if err != nil {
+			return "", err
+		}
+		// The clone-from-volume path clones a deterministically named internal
+		// snapshot of the source volume; the remnant's origin must equal it.
+		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
+		return sourceDataset + "@" + tempSnapshotName, nil
+	}
+	return "", nil
+}
+
+// completeResumedCloneRemnant finishes a proven clone remnant: it normalizes the
+// clone's capacity and stamps the full local identity set (ownership, managed
+// markers, content source, and for volume clones the origin snapshot) through the
+// proven update+verify path, so the volume no longer depends on any
+// clone-inherited (non-local) value. The caller then finishes through the normal
+// existing-dataset tail (idempotent share creation and the response).
+func (d *Driver) completeResumedCloneRemnant(
+	ctx context.Context,
+	existingDS *truenas.Dataset,
+	datasetName, name string,
+	source *csi.VolumeContentSource,
+	capacityBytes int64,
+	shareType ShareType,
+) (*truenas.Dataset, error) {
+	if err := d.ensureCloneCapacity(ctx, datasetName, existingDS, capacityBytes); err != nil {
+		return nil, err
+	}
+	properties := map[string]string{
+		PropManagedResource:  "true",
+		PropDriverInstanceID: d.driverInstanceID(),
+		PropProvisionSuccess: "true",
+		PropCSIVolumeName:    name,
+	}
+	if snapshot := source.GetSnapshot(); snapshot != nil {
+		properties[PropVolumeContentSourceType] = "snapshot"
+		properties[PropVolumeContentSourceID] = snapshot.GetSnapshotId()
+	} else if volume := source.GetVolume(); volume != nil {
+		sourceDataset, err := d.datasetForID(volume.GetVolumeId())
+		if err != nil {
+			return nil, err
+		}
+		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
+		properties[PropVolumeContentSourceType] = "volume"
+		properties[PropVolumeContentSourceID] = volume.GetVolumeId()
+		properties[PropVolumeOriginSnapshot] = sourceDataset + "@" + tempSnapshotName
+	}
+	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
+		properties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
+	}
+	verified, err := d.setAndVerifyDatasetUserProperties(ctx, datasetName, properties)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "stamp and verify resumed clone remnant ownership: %v", err)
+	}
+	return verified, nil
 }
 
 func storedBlockProtocol(ds *truenas.Dataset, shareType ShareType) bool {
@@ -1441,6 +1668,19 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 	}
 	if err := d.truenasClient.SnapshotDelete(ctx, deleteID, true, false); err != nil {
 		if truenas.IsNotFoundError(err) {
+			return nil
+		}
+		// TrueNAS 26.0's zfs.resource.snapshot.destroy has no deferred-destroy
+		// mode, so a tombstone that still has a live restored clone cannot be
+		// removed yet. The tombstone rename already released the CSI snapshot name,
+		// which is DeleteSnapshot's entire contract, so this is a success — leave
+		// the tombstone for the orphan reconciler to reap once its last clone is
+		// gone. Returning an error here would surface a spurious Internal and (once
+		// the CO's retry sees the renamed-away CSI name as absent) leak the
+		// tombstone forever.
+		var cloneErr *truenas.ErrSnapshotHasClones
+		if errors.As(err, &cloneErr) {
+			klog.V(4).Infof("Tombstoned snapshot %s still has dependent clones; deferring reclamation to orphan reconcile", deleteID)
 			return nil
 		}
 		return status.Errorf(codes.Internal, "failed to defer snapshot deletion: %v", err)

@@ -991,13 +991,20 @@ func TestVolumeClonePropertyWriteFailureRollsBackCloneAndOriginSnapshot(t *testi
 	assert.True(t, client.DatasetDeleteCalls[len(client.DatasetDeleteCalls)-1].Force)
 }
 
-func TestCreateVolumeExistingCloneRejectsMissingContentSourceProperties(t *testing.T) {
+// A crash between the volume-source clone and its ownership stamp leaves an
+// unstamped remnant whose ZFS origin is the requested source's deterministic
+// internal snapshot. Because that origin PROVES the remnant is our clone of the
+// requested source, the retry resumes it into a healthy, correctly-stamped
+// volume instead of wedging on terminal AlreadyExists. Provenance is proven from
+// the ZFS origin, never inferred from the request.
+func TestCreateVolumeResumesProvenInFlightVolumeCloneRemnant(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
 	d := &Driver{
 		config: &Config{
-			ZFS: ZFSConfig{DatasetParentName: "pool/parent", DatasetEnableQuotas: true},
-			NFS: NFSConfig{ShareHost: "192.0.2.10"},
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DatasetEnableQuotas: true},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
 		},
 		truenasClient: client,
 	}
@@ -1007,9 +1014,52 @@ func TestCreateVolumeExistingCloneRejectsMissingContentSourceProperties(t *testi
 	snap, err := client.SnapshotCreate(ctx, source.Name, "clone-source-clone", map[string]string{PropInternalResource: "true"})
 	require.NoError(t, err)
 	require.NoError(t, client.SnapshotClone(ctx, snap.ID, "pool/parent/clone"))
+
+	resp, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "clone",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 * testGiB},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "source"},
+		}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "source", resp.GetVolume().GetContentSource().GetVolume().GetVolumeId())
+
 	clone, err := client.DatasetGet(ctx, "pool/parent/clone")
 	require.NoError(t, err)
-	clone.Mountpoint = "/mnt/pool/parent/clone"
+	assert.True(t, datasetHasLocalUserProperty(clone, PropManagedResource, "true"))
+	assert.True(t, datasetHasLocalUserProperty(clone, PropDriverInstanceID, d.driverInstanceID()))
+	assert.True(t, datasetHasLocalUserProperty(clone, PropCSIVolumeName, "clone"))
+	assert.Equal(t, "volume", datasetUserProperty(clone, PropVolumeContentSourceType))
+	assert.Equal(t, "source", datasetUserProperty(clone, PropVolumeContentSourceID))
+	assert.Equal(t, snap.ID, datasetUserProperty(clone, PropVolumeOriginSnapshot))
+	assert.Equal(t, snap.ID, datasetOriginSnapshotID(clone))
+}
+
+// A remnant carrying ANY local ownership property from another driver instance is
+// never adopted: it stays on the terminal AlreadyExists path so a genuine
+// concurrent creator is never double-owned (the clone-race guarantee).
+func TestCreateVolumeRejectsForeignOwnedCloneRemnant(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DatasetEnableQuotas: true},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+		},
+		truenasClient: client,
+	}
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: 4 * testGiB})
+	require.NoError(t, err)
+	source.Mountpoint = "/mnt/pool/parent/source"
+	snap, err := client.SnapshotCreate(ctx, source.Name, "clone-source-clone", map[string]string{PropInternalResource: "true"})
+	require.NoError(t, err)
+	require.NoError(t, client.SnapshotClone(ctx, snap.ID, "pool/parent/clone"))
+	// A different driver instance's LOCAL ownership marker must veto adoption.
+	require.NoError(t, client.DatasetSetUserProperty(ctx, "pool/parent/clone", PropDriverInstanceID, "org.other.csi@pool/parent"))
 
 	resp, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
 		Name:               "clone",
@@ -1022,8 +1072,147 @@ func TestCreateVolumeExistingCloneRejectsMissingContentSourceProperties(t *testi
 	require.Error(t, err)
 	assert.Equal(t, codes.AlreadyExists, status.Code(err))
 	assert.Nil(t, resp)
-	assert.False(t, datasetHasDurableContentSource(clone), "retry must not infer or stamp provenance")
-	assert.Equal(t, snap.ID, datasetOriginSnapshotID(clone))
+	clone, err := client.DatasetGet(ctx, "pool/parent/clone")
+	require.NoError(t, err)
+	assert.False(t, datasetHasLocalUserProperty(clone, PropDriverInstanceID, d.driverInstanceID()),
+		"a foreign-owned remnant must never be re-stamped by this instance")
+}
+
+// A crash between the snapshot clone and its ownership stamp (the narrow ZFS
+// clone window) leaves an unstamped remnant whose ZFS origin is the requested
+// source snapshot. The retry resumes it into a healthy, correctly-stamped volume
+// and round-trips through delete with no leaked dataset.
+func TestCreateVolumeResumesProvenInFlightSnapshotCloneRemnant(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DatasetEnableQuotas: true},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+		},
+		truenasClient: client,
+	}
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: 4 * testGiB})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperties(ctx, source.Name, map[string]string{
+		PropManagedResource:  "true",
+		PropDriverInstanceID: d.driverInstanceID(),
+		PropCSIVolumeName:    "source",
+	}))
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropManagedResource:           "true",
+		PropCSISnapshotName:           "snap-1",
+		PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	// Simulate the crash: the clone exists (origin = source snapshot) and inherits
+	// the source's identity markers as NON-local (origin-name source), but carries
+	// none of its own — the ownership stamp never ran.
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/restored"))
+	remnant, err := client.DatasetGet(ctx, "pool/parent/restored")
+	require.NoError(t, err)
+	require.False(t, datasetHasLocalUserProperty(remnant, PropDriverInstanceID, d.driverInstanceID()),
+		"precondition: the crash remnant carries no local ownership")
+
+	resp, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "restored",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 * testGiB},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+		}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "snap-1", resp.GetVolume().GetContentSource().GetSnapshot().GetSnapshotId())
+
+	restored, err := client.DatasetGet(ctx, "pool/parent/restored")
+	require.NoError(t, err)
+	assert.True(t, datasetHasLocalUserProperty(restored, PropManagedResource, "true"))
+	assert.True(t, datasetHasLocalUserProperty(restored, PropDriverInstanceID, d.driverInstanceID()))
+	assert.True(t, datasetHasLocalUserProperty(restored, PropCSIVolumeName, "restored"))
+	assert.Equal(t, "snapshot", datasetUserProperty(restored, PropVolumeContentSourceType))
+	assert.Equal(t, "snap-1", datasetUserProperty(restored, PropVolumeContentSourceID))
+	// No leaked dataset: only the source and the resumed volume exist.
+	assert.Len(t, client.Datasets, 2)
+
+	// The resumed volume deletes cleanly, leaving the independent CSI snapshot.
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "restored"})
+	require.NoError(t, err)
+	_, err = client.DatasetGet(ctx, "pool/parent/restored")
+	assert.True(t, truenas.IsNotFoundError(err))
+	remainingSnap, err := client.SnapshotFindByName(ctx, "pool/parent", "snap-1")
+	require.NoError(t, err)
+	require.NotNil(t, remainingSnap)
+}
+
+// An interrupted detached send/receive copy leaves an unstamped, originless
+// remnant whose completeness cannot be proven. The retry destroys it and returns
+// Aborted; the next retry recreates the copy cleanly and converges.
+func TestCreateVolumeDestroysInterruptedDetachedCopyRemnantThenConverges(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DetachedVolumesFromSnapshots: true, DatasetEnableQuotas: true},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+		},
+		truenasClient: client,
+	}
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: 4 * testGiB})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperties(ctx, source.Name, map[string]string{
+		PropManagedResource:  "true",
+		PropDriverInstanceID: d.driverInstanceID(),
+		PropCSIVolumeName:    "source",
+	}))
+	_, err = client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropManagedResource:           "true",
+		PropCSISnapshotName:           "snap-1",
+		PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	// Simulate an interrupted local send/receive: an independent target dataset
+	// (no ZFS origin) whose received user properties are NOT local, never stamped
+	// with ownership because the copy crashed before that step.
+	client.Datasets["pool/parent/restored"] = &truenas.Dataset{
+		ID: "pool/parent/restored", Name: "pool/parent/restored", Type: "FILESYSTEM",
+		Mountpoint: "/mnt/pool/parent/restored",
+		Refquota:   truenas.DatasetProperty{Parsed: float64(4 * testGiB)},
+		Creation:   truenas.DatasetProperty{Parsed: float64(time.Now().Unix())},
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource: {Value: "true", Source: "received"},
+			PropCSIVolumeName:   {Value: "source", Source: "received"},
+		},
+	}
+
+	restoreRequest := func() *csi.CreateVolumeRequest {
+		return &csi.CreateVolumeRequest{
+			Name:               "restored",
+			Parameters:         map[string]string{"protocol": "nfs"},
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 * testGiB},
+			VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+			}},
+		}
+	}
+
+	_, err = d.CreateVolume(ctx, restoreRequest())
+	require.Error(t, err)
+	assert.Equal(t, codes.Aborted, status.Code(err))
+	_, getErr := client.DatasetGet(ctx, "pool/parent/restored")
+	assert.True(t, truenas.IsNotFoundError(getErr), "the unstamped detached-copy remnant must be destroyed")
+
+	resp, err := d.CreateVolume(ctx, restoreRequest())
+	require.NoError(t, err)
+	assert.Equal(t, "snap-1", resp.GetVolume().GetContentSource().GetSnapshot().GetSnapshotId())
+	restored, err := client.DatasetGet(ctx, "pool/parent/restored")
+	require.NoError(t, err)
+	assert.True(t, datasetHasLocalUserProperty(restored, PropDriverInstanceID, d.driverInstanceID()))
+	assert.True(t, datasetHasLocalUserProperty(restored, PropCSIVolumeName, "restored"))
+	assert.Equal(t, "snap-1", datasetUserProperty(restored, PropVolumeContentSourceID))
 }
 
 func TestCreateVolumeCloneReportsInheritedActualCapacity(t *testing.T) {

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"sort"
@@ -86,14 +87,17 @@ type ReconcileReport struct {
 	OrphanVolumeCount          int
 	OrphanSnapshotCount        int
 	SpentRestoreSnapshotCount  int
+	TombstoneSnapshotCount     int
 	OrphanVolumeBytes          int64
 	OrphanSnapshotBytes        int64
 	OrphanVolumes              []ReconcileObject
 	OrphanSnapshots            []ReconcileObject
 	SpentRestoreSnapshots      []SpentRestoreSnapshot
+	TombstoneSnapshots         []ReconcileObject
 	DeletedVolumes             []string
 	DeletedSnapshots           []string
 	DeletedSpentRestoreObjects []string
+	DeletedTombstones          []string
 	SkippedDeletes             []ReconcileActionFailure
 	DeleteEnabled              bool
 }
@@ -158,9 +162,11 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 			right := report.SpentRestoreSnapshots[j].Namespace + "/" + report.SpentRestoreSnapshots[j].Name
 			return left < right
 		})
+		sort.Slice(report.TombstoneSnapshots, func(i, j int) bool { return report.TombstoneSnapshots[i].ID < report.TombstoneSnapshots[j].ID })
 		report.OrphanVolumeCount = len(report.OrphanVolumes)
 		report.OrphanSnapshotCount = len(report.OrphanSnapshots)
 		report.SpentRestoreSnapshotCount = len(report.SpentRestoreSnapshots)
+		report.TombstoneSnapshotCount = len(report.TombstoneSnapshots)
 		// Publish even a partial pass so a single malformed object cannot freeze
 		// the last visible inventory indefinitely.
 		SetOrphanReconcileMetrics(report)
@@ -183,7 +189,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		RecordReconcileFailure("list_backend_volumes")
 		return report, fmt.Errorf("list managed backend volumes: %w", err)
 	}
-	snapshots, err := d.listAllManagedSnapshots(ctx)
+	snapshots, tombstones, err := d.listAllManagedSnapshots(ctx)
 	if err != nil {
 		RecordReconcileFailure("list_backend_snapshots")
 		return report, fmt.Errorf("list managed backend snapshots: %w", err)
@@ -269,6 +275,33 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		report.OrphanSnapshotBytes += item.Bytes
 	}
 
+	// Tombstone-named snapshots are the driver's own deferred-delete markers. On
+	// backends without ZFS deferred destroy (TrueNAS 26.0) they cannot be removed
+	// until their last restored clone is gone, and they carry no CSI identity, so
+	// the CSI-snapshot orphan pass above never sees them. Classify age-eligible
+	// ones so guarded GC can reap them once their clones disappear.
+	for _, snap := range tombstones {
+		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
+		if !eligible {
+			if snap.GetCreationTime() <= 0 {
+				klog.Warningf("Orphan reconcile: skipping tombstone snapshot %s because its creation time is unavailable", snap.ID)
+			}
+			continue
+		}
+		sourceVolumeID := ""
+		if snap.Dataset != "" {
+			sourceVolumeID = path.Base(snap.Dataset)
+		}
+		report.TombstoneSnapshots = append(report.TombstoneSnapshots, ReconcileObject{
+			ID:             snap.ID,
+			BackendID:      snap.ID,
+			SourceVolumeID: sourceVolumeID,
+			CreatedAt:      createdAt,
+			Age:            age,
+			Bytes:          snap.GetSnapshotSize(),
+		})
+	}
+
 	if d.config.ZFS.DetachedVolumesFromSnapshots {
 		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -288,6 +321,10 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	for _, orphan := range report.OrphanVolumes {
 		klog.Infof("Orphan reconcile: %s managed volume %s (backend=%s pv=%s age=%v bytes=%d)",
 			logAction, orphan.ID, orphan.BackendID, orphan.PVName, orphan.Age, orphan.Bytes)
+	}
+	for _, tombstone := range report.TombstoneSnapshots {
+		klog.Infof("Orphan reconcile: %s released deferred-delete tombstone %s (age=%v)",
+			logAction, tombstone.ID, tombstone.Age)
 	}
 	for i := range report.SpentRestoreSnapshots {
 		spent := &report.SpentRestoreSnapshots[i]
@@ -414,20 +451,26 @@ func (d *Driver) listAllManagedDatasets(ctx context.Context) ([]*truenas.Dataset
 	}
 }
 
-func (d *Driver) listAllManagedSnapshots(ctx context.Context) ([]*truenas.Snapshot, error) {
-	var snapshots []*truenas.Snapshot
+// listAllManagedSnapshots pages the backend once and partitions the parent's
+// snapshots into live CSI-managed snapshots and the driver's own tombstone-named
+// deferred-delete markers. Tombstones are never CSI snapshots (their identity is
+// stripped at rename), so they must be gathered separately for GC.
+func (d *Driver) listAllManagedSnapshots(ctx context.Context) (managed, tombstones []*truenas.Snapshot, err error) {
 	for offset := 0; ; offset += reconcileListPageSize {
 		page, err := d.truenasClient.SnapshotListAll(ctx, d.config.ZFS.DatasetParentName, reconcileListPageSize, offset)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, snap := range page {
-			if isCSISnapshot(snap) {
-				snapshots = append(snapshots, snap)
+			switch {
+			case isCSISnapshot(snap):
+				managed = append(managed, snap)
+			case isSnapshotTombstone(snap):
+				tombstones = append(tombstones, snap)
 			}
 		}
 		if len(page) < reconcileListPageSize {
-			return snapshots, nil
+			return managed, tombstones, nil
 		}
 	}
 }
@@ -748,6 +791,22 @@ func (d *Driver) deleteDetectedOrphans(
 		deletedCount++
 	}
 
+	for _, tombstone := range report.TombstoneSnapshots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if deletionCapReached("tombstone-snapshot", tombstone.ID) {
+			continue
+		}
+		reaped, reason := d.reapTombstoneSnapshot(ctx, tombstone, minOrphanAge)
+		if !reaped {
+			d.recordReconcileSkip(report, "tombstone-snapshot", tombstone.ID, reason)
+			continue
+		}
+		report.DeletedTombstones = append(report.DeletedTombstones, tombstone.ID)
+		deletedCount++
+	}
+
 	if !d.config.ZFS.DetachedVolumesFromSnapshots {
 		return nil
 	}
@@ -846,6 +905,58 @@ func (d *Driver) hardRecheckSnapshotContentAbsent(ctx context.Context, orphan Re
 	} else if !apierrors.IsNotFound(err) {
 		return false, fmt.Sprintf("final VolumeSnapshotContent %s recheck failed: %v", name, err)
 	}
+	return true, ""
+}
+
+// reapTombstoneSnapshot removes a driver-created deferred-delete tombstone once
+// its last restored clone is gone. On TrueNAS 26.0 zfs.resource.snapshot.destroy
+// has no defer semantics, so DeleteSnapshot's post-tombstone destroy leaves the
+// tombstone behind whenever a live clone still depends on it; this reaps it
+// exactly when the dependency is finally released. It re-reads under the source
+// volume lock and revalidates identity+age so a concurrent CreateSnapshot or a
+// changed object can never be reaped on a stale detection snapshot. A snapshot
+// that still has clones is treated as a benign skip, not a failure.
+func (d *Driver) reapTombstoneSnapshot(
+	ctx context.Context,
+	tombstone ReconcileObject,
+	minOrphanAge time.Duration,
+) (reaped bool, reason string) {
+	if tombstone.SourceVolumeID == "" {
+		return false, "tombstone snapshot has no resolvable source volume"
+	}
+	lockKey := "volume:" + tombstone.SourceVolumeID
+	if !d.acquireOperationLock(lockKey) {
+		return false, "source volume operation is in progress"
+	}
+	defer d.releaseOperationLock(lockKey)
+
+	snapshot, err := d.truenasClient.SnapshotGet(ctx, tombstone.BackendID)
+	if err != nil {
+		if truenas.IsNotFoundError(err) {
+			// Already gone (ZFS reclaimed it, or a peer reaped it): the operation's
+			// goal is met, so treat it as reaped for reporting.
+			return true, ""
+		}
+		return false, fmt.Sprintf("tombstone snapshot revalidation failed: %v", err)
+	}
+	if !isSnapshotTombstone(snapshot) {
+		return false, "backend snapshot is no longer the detected tombstone"
+	}
+	createdAt, _, eligible := reconcileAge(time.Now(), snapshot.GetCreationTime(), minOrphanAge)
+	if !eligible || !createdAt.Equal(tombstone.CreatedAt) {
+		return false, "tombstone creation identity or age changed"
+	}
+	if err := d.truenasClient.SnapshotDelete(ctx, snapshot.ID, false, false); err != nil {
+		if truenas.IsNotFoundError(err) {
+			return true, ""
+		}
+		var cloneErr *truenas.ErrSnapshotHasClones
+		if errors.As(err, &cloneErr) {
+			return false, "tombstone snapshot still has dependent clones"
+		}
+		return false, fmt.Sprintf("failed to reap tombstone snapshot: %v", err)
+	}
+	klog.Infof("Orphan reconcile: reaped released deferred-delete tombstone %s", snapshot.ID)
 	return true, ""
 }
 
@@ -1003,7 +1114,7 @@ func publicationPropertyCount(datasets []*truenas.Dataset) int {
 		}
 		for key, property := range dataset.UserProperties {
 			if strings.HasPrefix(key, publicationPropertyPrefix) &&
-				!strings.Contains(strings.ToLower(property.Source), "inherit") {
+				isLocalUserPropertySource(property.Source) {
 				count++
 			}
 		}
@@ -1234,8 +1345,8 @@ func (d *Driver) startOrphanReconcile() {
 				return
 			}
 			if reconcileErr == nil {
-				klog.Infof("Orphan reconcile detection complete: volumes=%d snapshots=%d spentRestoreSnapshots=%d",
-					report.OrphanVolumeCount, report.OrphanSnapshotCount, report.SpentRestoreSnapshotCount)
+				klog.Infof("Orphan reconcile detection complete: volumes=%d snapshots=%d spentRestoreSnapshots=%d tombstones=%d",
+					report.OrphanVolumeCount, report.OrphanSnapshotCount, report.SpentRestoreSnapshotCount, report.TombstoneSnapshotCount)
 			}
 		}
 

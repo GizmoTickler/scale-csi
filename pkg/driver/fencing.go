@@ -28,7 +28,71 @@ const (
 	publicationRecordVersion  = 1
 	publicationStatePublished = "published"
 	publicationStateRemoving  = "unpublishing"
+
+	// additiveGrantHardCap bounds a single node's CSI-added grant provenance list
+	// so identity churn (per-boot NQNs, DHCP-rotated IPs) can never grow one ZFS
+	// user property past the backend's value limit and break every publish for the
+	// volume. Compaction keeps it far below this in practice; the cap is a
+	// last-resort backstop that evicts oldest-first.
+	additiveGrantHardCap = 32
 )
+
+// isLocalUserPropertySource reports whether a ZFS user-property source marks the
+// value as set directly on this dataset. This must be an exact "local" match:
+// ZFS clone-inherited user properties do NOT report "inherited"; their source is
+// the ORIGIN SNAPSHOT NAME (e.g. "tank/src@snap"), so a substring "inherit"
+// filter lets a clone parse the source volume's publication records as its own.
+func isLocalUserPropertySource(source string) bool {
+	return strings.EqualFold(strings.TrimSpace(source), "local")
+}
+
+// compactAdditiveGrants bounds a per-node additive provenance list against
+// unbounded growth. It keeps only entries that are still meaningful — the node's
+// current-identity grants (currentGrants) or entries still present on the backend
+// allowlist read at write time (backendAllowlist) — and drops stale entries a
+// prior convergence already removed from the backend. Current grants are always
+// retained; first-seen order is preserved so the hard cap evicts oldest-first. It
+// returns the compacted list and whether the hard cap evicted any entry.
+func compactAdditiveGrants(previous, currentGrants, backendAllowlist []string) ([]string, bool) {
+	keep := make(map[string]struct{}, len(currentGrants)+len(backendAllowlist))
+	for _, group := range [][]string{currentGrants, backendAllowlist} {
+		for _, value := range group {
+			if value = strings.TrimSpace(value); value != "" {
+				keep[value] = struct{}{}
+			}
+		}
+	}
+	ordered := make([]string, 0, len(previous)+len(currentGrants))
+	seen := make(map[string]struct{}, len(previous)+len(currentGrants))
+	add := func(value string, force bool) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, dup := seen[value]; dup {
+			return
+		}
+		if !force {
+			if _, ok := keep[value]; !ok {
+				return
+			}
+		}
+		seen[value] = struct{}{}
+		ordered = append(ordered, value)
+	}
+	for _, value := range previous {
+		add(value, false)
+	}
+	for _, value := range currentGrants {
+		add(value, true)
+	}
+	evicted := false
+	if len(ordered) > additiveGrantHardCap {
+		evicted = true
+		ordered = append([]string(nil), ordered[len(ordered)-additiveGrantHardCap:]...)
+	}
+	return ordered, evicted
+}
 
 var (
 	errFenceBackendAbsent = errors.New("fencing backend object is absent")
@@ -116,7 +180,12 @@ func publicationRecordsFromDataset(ds *truenas.Dataset) (map[string]publicationR
 		if !strings.HasPrefix(key, publicationPropertyPrefix) {
 			continue
 		}
-		if strings.Contains(strings.ToLower(property.Source), "inherit") {
+		// Only a value set locally on THIS dataset is one of its own publication
+		// records. A ZFS clone inherits the source volume's publication_* user
+		// properties with the origin snapshot name as their source, so a substring
+		// "inherit" test would misclassify them as local and make a freshly cloned
+		// volume look "published elsewhere" on its first publish.
+		if !isLocalUserPropertySource(property.Source) {
 			continue
 		}
 		var record publicationRecord
@@ -529,16 +598,19 @@ func (d *Driver) populateAdditiveGrantOwnership(
 			return nil
 		}
 		existing := make(map[string]struct{})
+		backendHosts := make([]string, 0)
 		if share != nil {
 			for _, host := range share.Hosts {
-				existing[normalizedNFSHost(host)] = struct{}{}
+				normalized := normalizedNFSHost(host)
+				existing[normalized] = struct{}{}
+				backendHosts = append(backendHosts, normalized)
 			}
 		}
 		configured := make(map[string]struct{}, len(d.config.NFS.ShareAllowedHosts))
 		for _, host := range d.config.NFS.ShareAllowedHosts {
 			configured[normalizedNFSHost(host)] = struct{}{}
 		}
-		owned := append([]string(nil), record.CSIAddedNFSHosts...)
+		newlyAdded := make([]string, 0)
 		for _, ip := range canonicalNodeIPs(identity.IPs) {
 			allowed, boundErr := ipWithinConfiguredNetworks(ip, d.config.NFS.ShareAllowedNetworks)
 			if boundErr != nil {
@@ -554,9 +626,17 @@ func (d *Driver) populateAdditiveGrantOwnership(
 			if _, alreadyPresent := existing[host]; alreadyPresent {
 				continue
 			}
-			owned = append(owned, host)
+			newlyAdded = append(newlyAdded, host)
 		}
-		record.CSIAddedNFSHosts = uniqueSortedStrings(owned)
+		// Compact against the backend allowlist read here so entries a prior fence
+		// already removed from the share drop off, bounding the list under churn.
+		compacted, evicted := compactAdditiveGrants(record.CSIAddedNFSHosts, newlyAdded, backendHosts)
+		if evicted {
+			klog.Warningf("Additive NFS grant provenance for %s hit the %d-entry cap; evicting oldest entries",
+				datasetName, additiveGrantHardCap)
+			RecordFencingProvenanceEvicted("nfs")
+		}
+		record.CSIAddedNFSHosts = compacted
 	case ShareTypeNVMeoF:
 		nqn := strings.TrimSpace(identity.NVMeNQN)
 		if nqn == "" {
@@ -574,29 +654,40 @@ func (d *Driver) populateAdditiveGrantOwnership(
 			return err
 		}
 		associationExists := false
+		backendNQNs := make([]string, 0)
 		if subsystem != nil {
 			host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
 			if findErr != nil {
 				return findErr
 			}
-			if host != nil {
-				associations, listErr := d.truenasClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
-				if listErr != nil {
-					return listErr
+			associations, listErr := d.truenasClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+			if listErr != nil {
+				return listErr
+			}
+			for _, association := range associations {
+				if association.HostNQN != "" {
+					backendNQNs = append(backendNQNs, association.HostNQN)
 				}
-				for _, association := range associations {
-					// TrueNAS 26.0 returns nested host/subsys objects and normally
-					// expands hostnqn. HostID remains the defensive fallback.
-					if association.HostID == host.ID || association.HostNQN == nqn {
-						associationExists = true
-						break
-					}
+				// TrueNAS 26.0 returns nested host/subsys objects and normally
+				// expands hostnqn. HostID remains the defensive fallback.
+				if (host != nil && association.HostID == host.ID) || association.HostNQN == nqn {
+					associationExists = true
 				}
 			}
 		}
+		var newlyAdded []string
 		if !associationExists {
-			record.CSIAddedNVMeNQNs = uniqueSortedStrings(append(record.CSIAddedNVMeNQNs, nqn))
+			newlyAdded = []string{nqn}
 		}
+		// Compact against the subsystem's live associations so NQNs a prior fence
+		// already detached drop off, bounding the list under per-boot NQN churn.
+		compacted, evicted := compactAdditiveGrants(record.CSIAddedNVMeNQNs, newlyAdded, backendNQNs)
+		if evicted {
+			klog.Warningf("Additive NVMe-oF grant provenance for %s hit the %d-entry cap; evicting oldest entries",
+				datasetName, additiveGrantHardCap)
+			RecordFencingProvenanceEvicted("nvmeof")
+		}
+		record.CSIAddedNVMeNQNs = compacted
 	}
 	return nil
 }
