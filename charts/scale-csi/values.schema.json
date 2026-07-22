@@ -880,6 +880,16 @@
           "type": "string",
           "minLength": 2
         },
+        "spentRestore": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        },
         "delete": {
           "type": "object",
           "additionalProperties": false,
