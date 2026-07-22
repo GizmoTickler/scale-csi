@@ -220,14 +220,7 @@ func storePublicationRecord(ctx context.Context, client truenas.ClientInterface,
 	if err != nil {
 		return err
 	}
-	if err := client.DatasetSetUserProperty(ctx, datasetName, key, string(encoded)); err != nil {
-		return err
-	}
-	if ds.UserProperties == nil {
-		ds.UserProperties = make(map[string]truenas.UserProperty)
-	}
-	ds.UserProperties[key] = truenas.UserProperty{Value: string(encoded), Source: "local"}
-	return nil
+	return stampAndMirror(ctx, client, ds, datasetName, map[string]string{key: string(encoded)})
 }
 
 func removePublicationRecords(ctx context.Context, client truenas.ClientInterface, ds *truenas.Dataset, datasetName string, keys []string) error {
@@ -1070,18 +1063,11 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 		}
 		enforceable = append(enforceable, identity)
 	}
-	switch shareType {
-	case ShareTypeNFS:
-		return d.applyNFSFence(ctx, ds, datasetName, enforceable, ownedNFSHosts, uniqueSortedStrings(protectedNFSHosts))
-	case ShareTypeISCSI:
-		return d.applyISCSIFence(ctx, ds, datasetName, enforceable)
-	case ShareTypeNVMeoF:
-		return d.applyNVMeFence(
-			ctx, ds, datasetName, enforceable, removing, ownedNVMeNQNs, uniqueSortedStrings(protectedNVMeNQNs),
-		)
-	default:
+	backend := backendForShareType(d, shareType)
+	if backend == nil {
 		return fmt.Errorf("unsupported share type %q", shareType)
 	}
+	return backend.ApplyFence(ctx, ds, datasetName, enforceable, removing, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs)
 }
 
 func uniqueSortedStrings(values []string) []string {

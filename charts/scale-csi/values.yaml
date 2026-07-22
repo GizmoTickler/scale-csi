@@ -519,6 +519,15 @@ reconcile:
   # Prometheus alert hold time. Keep this strictly greater than 2x interval.
   alertAfter: 2h5m
 
+  spentRestore:
+    # Classify and (under delete.enabled) reap spent VolSync restore
+    # VolumeSnapshots — the volsync-*-dst-dest* objects whose source PVC is
+    # Released or gone. This is VolSync application policy; deployments that do
+    # not run VolSync can set this false to skip the classification entirely.
+    # Orphan volume/snapshot detection, orphaned-share detection, and tombstone
+    # sweeping are unaffected and still run. Default: true.
+    enabled: true
+
   delete:
     # SAFETY: guarded deletion is opt-in and disabled by default. When enabled,
     # a CronJob runs --mode=reconcile and backend cleanup still goes through the

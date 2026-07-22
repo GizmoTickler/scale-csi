@@ -312,6 +312,28 @@ type ReconcileConfig struct {
 
 	// Delete configures the separately gated run-once cleanup entrypoint.
 	Delete ReconcileDeleteConfig `yaml:"delete"`
+
+	// SpentRestore gates the VolSync-specific spent-restore VolumeSnapshot
+	// classification (the volsync-*-dst-dest* reaper).
+	SpentRestore ReconcileSpentRestoreConfig `yaml:"spentRestore"`
+}
+
+// ReconcileSpentRestoreConfig gates the spent-restore VolumeSnapshot reaper.
+// This classification is VolSync application policy (it keys off the
+// volsync-*-dst-dest* naming convention); deployments that do not run VolSync
+// can disable it while keeping every other reconcile phase.
+type ReconcileSpentRestoreConfig struct {
+	// Enabled runs spent-restore VolumeSnapshot classification (default: true).
+	// When false, classification is skipped entirely; orphan volume/snapshot
+	// detection, orphaned-share detection, and tombstone sweeping still run.
+	Enabled *bool `yaml:"enabled"`
+}
+
+// EnabledOrDefault reports whether spent-restore classification is enabled.
+// An unset (nil) value defaults to true, preserving the historical always-on
+// behavior for config files and tests that predate the flag.
+func (c ReconcileSpentRestoreConfig) EnabledOrDefault() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 // ReconcileDeleteConfig configures the opt-in orphan cleanup CronJob.
@@ -678,6 +700,12 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("reconcile.minOrphanAge must be a positive duration: %w", parseErr)
 		}
 		return nil, fmt.Errorf("reconcile.minOrphanAge must be a positive duration")
+	}
+	// Spent-restore classification defaults to enabled (preserves the historical
+	// always-on behavior); an explicit enabled=false remains authoritative.
+	if cfg.Reconcile.SpentRestore.Enabled == nil {
+		defaultTrue := true
+		cfg.Reconcile.SpentRestore.Enabled = &defaultTrue
 	}
 
 	// Session GC defaults to enabled. An explicit enabled=false remains

@@ -352,16 +352,21 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		report.TombstoneSnapshotBytes += item.Bytes
 	}
 
-	// Spent-restore classification always runs (read-only detection). It is NOT
-	// gated on the global zfs.detachedVolumesFromSnapshots flag: a StorageClass
-	// may opt into snapshotRestoreMode=detached while that global default stays
-	// clone, and gating on the global flag alone would leak that class's spent
-	// volsync restore snapshots (never reaped). Deletion remains gated by
-	// opts.Delete and the per-object revalidation in deleteDetectedOrphans.
-	report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		RecordReconcileFailure("spent_restore_classification")
-		return report, ctxErr
+	// Spent-restore classification is read-only detection, gated on the
+	// VolSync-specific reconcile.spentRestore.enabled flag (default true). It is
+	// NOT gated on the global zfs.detachedVolumesFromSnapshots flag: a
+	// StorageClass may opt into snapshotRestoreMode=detached while that global
+	// default stays clone, and gating on the global flag alone would leak that
+	// class's spent volsync restore snapshots (never reaped). When disabled,
+	// orphan volume/snapshot detection, orphaned-share detection, and tombstone
+	// sweeping still run. Deletion remains gated by opts.Delete and the
+	// per-object revalidation in deleteDetachedOrphans.
+	if d.config.Reconcile.SpentRestore.EnabledOrDefault() {
+		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			RecordReconcileFailure("spent_restore_classification")
+			return report, ctxErr
+		}
 	}
 
 	// Orphaned-share detection (a share whose dataset is gone) always runs so the

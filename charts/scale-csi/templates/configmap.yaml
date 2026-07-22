@@ -123,6 +123,8 @@ data:
       enabled: {{ .Values.reconcile.enabled }}
       interval: {{ .Values.reconcile.interval | quote }}
       minOrphanAge: {{ .Values.reconcile.minOrphanAge | quote }}
+      spentRestore:
+        enabled: {{ .Values.reconcile.spentRestore.enabled }}
       delete:
         enabled: {{ .Values.reconcile.delete.enabled }}
         schedule: {{ .Values.reconcile.delete.schedule | quote }}

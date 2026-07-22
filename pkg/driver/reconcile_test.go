@@ -317,6 +317,50 @@ func TestReconcileSpentRestoreRecognitionRequiresVolsyncNamingAndNonBoundPVC(t *
 	assert.Equal(t, "volsync-db-dst-dest-final", report.SpentRestoreSnapshots[1].Name)
 }
 
+func TestReconcileSpentRestoreClassificationGatedByConfigFlag(t *testing.T) {
+	old := metav1.NewTime(time.Now().Add(-48 * time.Hour))
+	dynamicObjects := []runtime.Object{
+		reconcileVolumeSnapshot("storage", "volsync-app-dst-dest", "released-source", "released-content", old),
+		reconcileSnapshotContent("released-content", "storage", "volsync-app-dst-dest", "released-handle", "csi.scale.io"),
+	}
+	coreObjects := []runtime.Object{
+		reconcilePVC("storage", "released-source", corev1.PersistentVolumeClaimPhase("Released")),
+	}
+
+	run := func(enabled *bool) ReconcileReport {
+		d, backend := newReconcileTestDriver(t, true, coreObjects, dynamicObjects)
+		d.config.Reconcile.SpentRestore.Enabled = enabled
+		// A managed dataset with no PV is an orphan volume regardless of the
+		// spent-restore flag, proving the other reconcile phases still run when
+		// spent-restore classification is disabled.
+		addReconcileDataset(backend, "orphan-volume", old.Time, true, 200)
+		addReconcileSnapshot(t, backend, "restore-source", "released-handle", old.Time, true, 1)
+		report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
+		require.NoError(t, err)
+		return report
+	}
+
+	// Default (unset) and explicit true: classification runs.
+	enabledTrue := true
+	for name, enabled := range map[string]*bool{"default-nil": nil, "explicit-true": &enabledTrue} {
+		report := run(enabled)
+		require.Len(t, report.SpentRestoreSnapshots, 1, "%s: spent-restore classification must run", name)
+		assert.Equal(t, "volsync-app-dst-dest", report.SpentRestoreSnapshots[0].Name)
+	}
+
+	// Explicit false: classification skipped entirely, other phases intact.
+	enabledFalse := false
+	report := run(&enabledFalse)
+	assert.Empty(t, report.SpentRestoreSnapshots, "disabled: spent-restore classification must be skipped")
+	foundOrphanVolume := false
+	for _, orphan := range report.OrphanVolumes {
+		if orphan.ID == "orphan-volume" {
+			foundOrphanVolume = true
+		}
+	}
+	assert.True(t, foundOrphanVolume, "disabled: orphan volume detection must still run")
+}
+
 func TestReconcileDeletesSpentRestoreSnapshotOnlyThroughKubernetes(t *testing.T) {
 	old := metav1.NewTime(time.Now().Add(-48 * time.Hour))
 	volumeSnapshot := reconcileVolumeSnapshot(

@@ -351,6 +351,7 @@ for Grafana sidecar discovery and uses only metrics exported by the driver.
 | `reconcile.interval` | Controller reconcile interval, including replication-job hygiene | `1h` |
 | `reconcile.minOrphanAge` | Minimum backend object age before orphan classification | `24h` |
 | `reconcile.alertAfter` | Prometheus alert hold time; keep greater than 2x the interval | `2h5m` |
+| `reconcile.spentRestore.enabled` | Classify/reap spent VolSync restore VolumeSnapshots (`volsync-*-dst-dest*`); set false to skip this VolSync-specific classification while other reconcile phases still run | `true` |
 | `reconcile.delete.enabled` | Create the opt-in guarded cleanup CronJob | `false` |
 | `reconcile.delete.schedule` | Guarded cleanup CronJob schedule | `0 4 * * *` |
 | `reconcile.delete.maxPerRun` | Maximum successful deletions in one cleanup run | `5` |
