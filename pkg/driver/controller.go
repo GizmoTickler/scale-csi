@@ -1990,6 +1990,54 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 // backend failure.
 var errDatasetPropertyVerification = errors.New("dataset user property verification failed")
 
+// mirrorUserProperties records the written properties on the local dataset
+// mirror as source=local, matching what pool.dataset.update's
+// user_properties_update persists on TrueNAS 26.0. It mirrors the values we
+// wrote (which the update response reflects) without a re-read. It is the single
+// canonical mirror shared by every property-writing path so the local cache
+// cannot drift between them.
+func mirrorUserProperties(ds *truenas.Dataset, properties map[string]string) {
+	if ds == nil || len(properties) == 0 {
+		return
+	}
+	if ds.UserProperties == nil {
+		ds.UserProperties = make(map[string]truenas.UserProperty, len(properties))
+	}
+	for key, value := range properties {
+		ds.UserProperties[key] = truenas.UserProperty{Value: value, Source: "local"}
+	}
+}
+
+// stampAndMirror is the canonical write-and-cache path for the non-verifying
+// property stamps. It persists properties through pool.dataset.update's
+// user_properties_update (the batch user-property setter, which the TrueNAS
+// 26.0 write path persists with source=local) and mirrors the written keys into
+// ds.UserProperties via mirrorUserProperties — trusting the write without a
+// re-read. It takes the client explicitly so both Driver methods and the
+// package-level publication-record helper share one implementation.
+//
+// The response-verifying stamps (recovery nonce CAS, ownership stamps) do NOT
+// use this helper: they go through setAndVerifyDatasetUserProperties, which
+// needs pool.dataset.update's returned dataset to verify against the response
+// plus the one-time post-connect paranoia re-read.
+func stampAndMirror(ctx context.Context, client truenas.ClientInterface, ds *truenas.Dataset, datasetName string, properties map[string]string) error {
+	if err := client.DatasetSetUserProperties(ctx, datasetName, properties); err != nil {
+		return err
+	}
+	mirrorUserProperties(ds, properties)
+	return nil
+}
+
+// setAndVerifyDatasetUserProperties writes properties through
+// pool.dataset.update and verifies they persisted with source=local. Unlike
+// stampAndMirror it calls pool.dataset.update directly (not the batch setter)
+// because it needs the authoritative post-write dataset the update response
+// reflects: Live TrueNAS 26.0 returns the post-write state in the response, so
+// the returned dataset is authoritative for verification — no fresh re-read on
+// the hot path (the batch-12 consolidation). It is kept separate from
+// stampAndMirror deliberately: the error-injecting test seam distinguishes
+// DatasetUpdate from the batch setter, and the verification path requires the
+// returned dataset.
 func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetName string, properties map[string]string) (*truenas.Dataset, error) {
 	// Build sorted user-property updates mirroring DatasetSetUserProperties, then
 	// call pool.dataset.update directly. Live TrueNAS 26.0 persists these with

@@ -543,20 +543,7 @@ func (d *Driver) setDatasetUserProperties(ctx context.Context, ds *truenas.Datas
 	if len(properties) == 0 {
 		return nil
 	}
-	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, properties); err != nil {
-		return err
-	}
-	if ds != nil {
-		if ds.UserProperties == nil {
-			ds.UserProperties = make(map[string]truenas.UserProperty, len(properties))
-		}
-		for key, value := range properties {
-			// pool.dataset.update user_properties_update is the TrueNAS 26.0
-			// write path that persists these values with source=local.
-			ds.UserProperties[key] = truenas.UserProperty{Value: value, Source: "local"}
-		}
-	}
-	return nil
+	return stampAndMirror(ctx, d.truenasClient, ds, datasetName, properties)
 }
 
 const (

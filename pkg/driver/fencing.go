@@ -220,14 +220,7 @@ func storePublicationRecord(ctx context.Context, client truenas.ClientInterface,
 	if err != nil {
 		return err
 	}
-	if err := client.DatasetSetUserProperty(ctx, datasetName, key, string(encoded)); err != nil {
-		return err
-	}
-	if ds.UserProperties == nil {
-		ds.UserProperties = make(map[string]truenas.UserProperty)
-	}
-	ds.UserProperties[key] = truenas.UserProperty{Value: string(encoded), Source: "local"}
-	return nil
+	return stampAndMirror(ctx, client, ds, datasetName, map[string]string{key: string(encoded)})
 }
 
 func removePublicationRecords(ctx context.Context, client truenas.ClientInterface, ds *truenas.Dataset, datasetName string, keys []string) error {
