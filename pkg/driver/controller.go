@@ -383,9 +383,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			"requested capacity (%d bytes) exceeds maximum (%d bytes)", capacityBytes, maxCapacity)
 	}
 
-	// Get share type from StorageClass parameters (with fallback to driver name)
+	// A unified multi-protocol deployment cannot infer whether an omitted
+	// StorageClass parameter meant NFS, iSCSI, or NVMe-oF. Keep the historical
+	// driver-name fallback only for instances that serve at most one protocol.
 	params := req.GetParameters()
-	if protocol, ok := params["protocol"]; ok {
+	protocol, hasProtocol := params["protocol"]
+	if !hasProtocol {
+		if d.config.enabledShareTypeCount() > 1 {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"StorageClass parameter %q is required when multiple storage protocols are enabled; valid options are: %s",
+				"protocol", strings.Join(ValidShareTypeStrings(), ", "))
+		}
+	} else {
 		explicitShareType := ShareType(strings.ToLower(strings.TrimSpace(protocol)))
 		if !explicitShareType.IsValid() {
 			return nil, status.Errorf(codes.InvalidArgument,

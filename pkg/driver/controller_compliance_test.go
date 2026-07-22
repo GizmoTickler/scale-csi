@@ -221,6 +221,43 @@ func TestCreateVolumeRejectsUnknownExplicitProtocol(t *testing.T) {
 	assert.Contains(t, err.Error(), "nfs, iscsi, nvmeof")
 }
 
+func TestCreateVolumeRequiresProtocolForMultiProtocolDriver(t *testing.T) {
+	driver := newComplianceTestDriver(truenas.NewMockClient())
+	driver.config.NFS.Enabled = true
+	driver.config.ISCSI.Enabled = true
+
+	_, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "ambiguous-protocol",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, err.Error(), `StorageClass parameter "protocol" is required`)
+	assert.Contains(t, err.Error(), "nfs, iscsi, nvmeof")
+}
+
+func TestCreateVolumeKeepsSingleProtocolFallback(t *testing.T) {
+	driver := newComplianceTestDriver(truenas.NewMockClient())
+	driver.config.NFS.Enabled = true
+
+	response, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "single-protocol",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "single-protocol", response.GetVolume().GetVolumeId())
+}
+
+func TestGetShareTypeUsesSoleEnabledProtocol(t *testing.T) {
+	cfg := &Config{
+		DriverName: "csi.scale.io",
+		ISCSI:      ISCSIConfig{Enabled: true},
+	}
+	assert.Equal(t, ShareTypeISCSI, cfg.GetShareType(nil))
+}
+
 func TestCreateVolumeRequiresCapabilities(t *testing.T) {
 	driver := newComplianceTestDriver(truenas.NewMockClient())
 

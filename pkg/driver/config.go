@@ -864,8 +864,9 @@ func (c *Config) GetDriverShareType() ShareType {
 	}
 }
 
-// GetShareType returns the share type from StorageClass parameters,
-// falling back to driver name if not specified in parameters.
+// GetShareType returns the share type from StorageClass parameters. A
+// single-protocol instance falls back to its sole enabled protocol; legacy
+// configurations without enabled markers fall back to the driver name.
 // The "protocol" parameter in StorageClass takes precedence.
 func (c *Config) GetShareType(params map[string]string) ShareType {
 	// Check StorageClass parameter first
@@ -874,8 +875,34 @@ func (c *Config) GetShareType(params map[string]string) ShareType {
 			return ParseShareType(protocol)
 		}
 	}
-	// Fall back to driver name-based detection
+	if c.enabledShareTypeCount() == 1 {
+		switch {
+		case c.NFS.Enabled:
+			return ShareTypeNFS
+		case c.ISCSI.Enabled:
+			return ShareTypeISCSI
+		case c.NVMeoF.Enabled:
+			return ShareTypeNVMeoF
+		}
+	}
+	// Fall back to driver-name detection for old configs without enabled fields.
 	return c.GetDriverShareType()
+}
+
+// enabledShareTypeCount reports how many protocols this driver instance serves.
+// A unified, multi-protocol instance cannot safely infer a StorageClass's intent.
+func (c *Config) enabledShareTypeCount() int {
+	count := 0
+	if c.NFS.Enabled {
+		count++
+	}
+	if c.ISCSI.Enabled {
+		count++
+	}
+	if c.NVMeoF.Enabled {
+		count++
+	}
+	return count
 }
 
 // GetZFSResourceType returns the ZFS resource type for this driver.
