@@ -449,6 +449,37 @@ func (c *Client) NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath
 	return parseNVMeoFNamespace(namespaces[0])
 }
 
+// NVMeoFNamespaceListBySubsystem returns every namespace attached to one
+// subsystem. The orphaned-share reconcile sweep reads each namespace's
+// DevicePath (zvol/<dataset>) — the authoritative, non-lossy backreference — to
+// decide whether the subsystem's backing dataset is gone. It mirrors the
+// "subsys.id" filter used by NVMeoFNamespaceFindByDevice.
+func (c *Client) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFNamespace, error) {
+	filters := [][]interface{}{
+		{"subsys.id", "=", subsysID},
+	}
+	result, err := c.Call(ctx, "nvmet.namespace.query", filters, map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query NVMe-oF namespaces: %w", err)
+	}
+
+	items, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected NVMe-oF namespace response type")
+	}
+
+	namespaces := make([]*NVMeoFNamespace, 0, len(items))
+	for _, item := range items {
+		namespace, parseErr := parseNVMeoFNamespace(item)
+		if parseErr != nil {
+			continue
+		}
+		namespaces = append(namespaces, namespace)
+	}
+
+	return namespaces, nil
+}
+
 // NVMeoFPortList lists all NVMe-oF ports.
 func (c *Client) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	result, err := c.Call(ctx, "nvmet.port.query", []interface{}{}, map[string]interface{}{})

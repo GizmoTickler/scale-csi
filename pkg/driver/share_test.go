@@ -1378,7 +1378,7 @@ func TestCreateShareWithOptions_UnsupportedType(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := d.createShareWithOptions(ctx, nil, "tank/k8s/volumes/test", "test-vol", ShareType("unknown"), false, false)
+	err := d.createShareWithOptions(ctx, nil, "tank/k8s/volumes/test", "test-vol", ShareType("unknown"), false, false, nil)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported share type")

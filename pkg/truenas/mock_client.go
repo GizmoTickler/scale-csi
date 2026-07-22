@@ -430,6 +430,45 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 	return list[offset:end], nil
 }
 
+// DatasetQueryByParent mirrors the real zfs.resource.query path: it returns ALL
+// datasets stored under parentDataset (no managed_resource filter), letting the
+// driver apply the same client-side managed_resource filter it uses against the
+// real client.
+//
+// Fidelity with live TrueNAS 26.0 (probe-confirmed): zfs.resource.query returns
+// per-dataset user_properties as a FLAT string map with NO per-property source —
+// native properties carry source, user_properties do not. The mock therefore
+// strips Source to "" on every returned user property and marks the dataset
+// ResourceQuery, so source-sensitive callers (publicationRecordsFromDataset)
+// exercise the same sourceless path they hit in production instead of being
+// masked by a source-bearing mock. DatasetGet (pool.dataset.query) stays
+// source-bearing, exactly as the real split behaves.
+func (m *MockClient) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*Dataset, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+
+	parent := strings.TrimSuffix(parentDataset, "/")
+	var list []*Dataset
+	for _, ds := range m.Datasets {
+		if parent != "" && !strings.HasPrefix(ds.Name, parent+"/") {
+			continue
+		}
+		response := mockDatasetResponse(ds, false)
+		for key, property := range response.UserProperties {
+			property.Source = ""
+			response.UserProperties[key] = property
+		}
+		response.ResourceQuery = true
+		list = append(list, response)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	return list, nil
+}
+
 func (m *MockClient) DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1030,12 +1069,22 @@ func (m *MockClient) ISCSITargetFindByName(ctx context.Context, name string) (*I
 	}
 	return nil, nil
 }
+func (m *MockClient) ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var list []*ISCSITarget
+	for _, t := range m.ISCSITargets {
+		list = append(list, t)
+	}
+	return list, nil
+}
 func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	id := len(m.ISCSIExtents) + 1
-	ext := &ISCSIExtent{ID: id, Name: name, Disk: diskPath}
+	ext := &ISCSIExtent{ID: id, Name: name, Disk: diskPath, Comment: comment}
 	m.ISCSIExtents[id] = ext
 	return ext, nil
 }
@@ -1076,6 +1125,16 @@ func (m *MockClient) ISCSIExtentFindByDisk(ctx context.Context, diskPath string)
 		}
 	}
 	return nil, nil
+}
+func (m *MockClient) ISCSIExtentList(ctx context.Context) ([]*ISCSIExtent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var list []*ISCSIExtent
+	for _, e := range m.ISCSIExtents {
+		list = append(list, e)
+	}
+	return list, nil
 }
 func (m *MockClient) ISCSITargetExtentCreate(ctx context.Context, targetID, extentID, lunID int) (*ISCSITargetExtent, error) {
 	m.mu.Lock()
@@ -1413,6 +1472,18 @@ func (m *MockClient) NVMeoFNamespaceFindByDevicePath(ctx context.Context, device
 		}
 	}
 	return nil, nil
+}
+func (m *MockClient) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFNamespace, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var list []*NVMeoFNamespace
+	for _, n := range m.NVMeNamespaces {
+		if n.SubsystemID == subsysID {
+			list = append(list, n)
+		}
+	}
+	return list, nil
 }
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	return []*NVMeoFPort{{ID: 1, Transport: "TCP", Address: "0.0.0.0", Port: 4420}}, nil

@@ -111,21 +111,33 @@ type silentCloneOwnerUpdateMock struct {
 	*truenas.MockClient
 }
 
-func (m *silentCloneOwnerUpdateMock) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
-	if len(properties) == 1 && properties[PropDriverInstanceID] != "" {
-		// Model an acknowledged update that did not persist. Clone ownership is
-		// not safe to trust until the authoritative re-read verifies source=local.
-		return nil
+func (m *silentCloneOwnerUpdateMock) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
+	if len(params.UserPropertiesUpdate) == 1 &&
+		params.UserPropertiesUpdate[0].Key == PropDriverInstanceID &&
+		params.UserPropertiesUpdate[0].Value != "" &&
+		!params.UserPropertiesUpdate[0].Remove {
+		// Model an acknowledged pool.dataset.update whose ownership write did not
+		// persist: strip it so the update response — which
+		// setAndVerifyDatasetUserProperties now trusts — lacks source=local
+		// ownership and verification fails before any share is created.
+		stripped := *params
+		stripped.UserPropertiesUpdate = nil
+		return m.MockClient.DatasetUpdate(ctx, name, &stripped)
 	}
-	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
+	return m.MockClient.DatasetUpdate(ctx, name, params)
 }
 
 type silentDatasetPropertyUpdateMock struct {
 	*truenas.MockClient
 }
 
-func (m *silentDatasetPropertyUpdateMock) DatasetSetUserProperties(context.Context, string, map[string]string) error {
-	return nil
+func (m *silentDatasetPropertyUpdateMock) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
+	// Model a backend that acknowledges pool.dataset.update but persists none of
+	// the user-property writes: strip them so the trusted update response lacks
+	// every written property and verification fails.
+	stripped := *params
+	stripped.UserPropertiesUpdate = nil
+	return m.MockClient.DatasetUpdate(ctx, name, &stripped)
 }
 
 func (m *datasetCreateCaptureMock) DatasetCreate(ctx context.Context, params *truenas.DatasetCreateParams) (*truenas.Dataset, error) {
@@ -1260,26 +1272,38 @@ func TestCreateVolumeRemnantRecoveryNonceLoserAborts(t *testing.T) {
 // recoveryRaceLoserMock simulates a concurrent controller process winning the
 // recovery stamp race: the first stamp carrying a recovery nonce is immediately
 // overwritten by a competing same-instance payload with a different nonce, so
-// the caller's verifying re-read must fail on its nonce.
+// the caller's verification against the pool.dataset.update response must fail
+// on its nonce.
 type recoveryRaceLoserMock struct {
 	*truenas.MockClient
 	raced bool
 }
 
-func (m *recoveryRaceLoserMock) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
-	if _, hasNonce := properties[PropRecoveryNonce]; hasNonce && !m.raced {
-		m.raced = true
-		if err := m.MockClient.DatasetSetUserProperties(ctx, name, properties); err != nil {
-			return err
+func (m *recoveryRaceLoserMock) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
+	nonceIdx := -1
+	for i, update := range params.UserPropertiesUpdate {
+		if update.Key == PropRecoveryNonce {
+			nonceIdx = i
+			break
 		}
-		competing := make(map[string]string, len(properties))
-		for key, value := range properties {
-			competing[key] = value
-		}
-		competing[PropRecoveryNonce] = "competing-controller-nonce"
-		return m.MockClient.DatasetSetUserProperties(ctx, name, competing)
 	}
-	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
+	if nonceIdx >= 0 && !m.raced {
+		m.raced = true
+		// Apply the caller's stamp, then overwrite the nonce with a competing
+		// same-instance payload. setAndVerifyDatasetUserProperties now trusts the
+		// pool.dataset.update response, so returning the dataset that carries the
+		// competing nonce makes the caller's verifying comparison fail its CAS.
+		if _, err := m.MockClient.DatasetUpdate(ctx, name, params); err != nil {
+			return nil, err
+		}
+		competing := make([]truenas.UserPropertyUpdate, len(params.UserPropertiesUpdate))
+		copy(competing, params.UserPropertiesUpdate)
+		competing[nonceIdx].Value = "competing-controller-nonce"
+		competingParams := *params
+		competingParams.UserPropertiesUpdate = competing
+		return m.MockClient.DatasetUpdate(ctx, name, &competingParams)
+	}
+	return m.MockClient.DatasetUpdate(ctx, name, params)
 }
 
 // A remnant carrying a LOCAL ownership stamp from another driver instance is

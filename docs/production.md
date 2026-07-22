@@ -9,11 +9,13 @@ for installation examples and the chart's
 
 ### TrueNAS and API access
 
-The NFS and iSCSI clients support the snapshot API generations used by TrueNAS
-SCALE 24.x (`zfs.snapshot.*`), 25.04+ (`pool.snapshot.*`), and 26.0
-(`zfs.resource.snapshot.*` for the reads and rename operations that moved). The
-client probes and caches the available generation. NVMe-oF is different: the
-driver rejects it before TrueNAS 25.10.
+The NFS and iSCSI clients target the snapshot API generations used by TrueNAS
+SCALE 25.04+ (`pool.snapshot.*` for mutations) and 26.0 (which adds
+`zfs.resource.snapshot.*` for the user-property reads, rename, and destroy
+operations that moved). TrueNAS 25.04 is the documented floor; the 24.x
+`zfs.snapshot.*` generation is no longer supported. The client detects and
+caches the 26.0 resource API separately. NVMe-oF is different: the driver
+rejects it before TrueNAS 25.10.
 
 The controller plane has been validated live against a real TrueNAS 26.0
 system: the official csi-sanity controller suites pass 52/52 for NFS and 52/52

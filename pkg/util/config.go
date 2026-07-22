@@ -7,12 +7,14 @@ import (
 	"time"
 )
 
-// minCommandTimeout is the floor applied to a derived per-command timeout. The
-// inbound RPC deadline always still caps the command (context.WithTimeout keeps
-// the parent deadline), so this floor only guarantees a sane minimum when no
-// tight deadline is present. A nearly-expired inbound deadline therefore fails
-// fast through the parent context rather than launching work doomed to outlive
-// its budget.
+// minCommandTimeout is the floor applied to a derived per-command timeout. It
+// only guarantees a sane minimum when no tight inbound deadline is present.
+// context.WithTimeout always re-caps the derived context at the sooner parent
+// deadline, so when the inbound deadline is tight the floor does NOT extend the
+// real deadline: a small positive remaining still launches the command, which is
+// then canceled at the parent deadline rather than running for the full floored
+// timeout. Only an already-expired inbound context fails fast (via the ctx.Err()
+// check in commandContext); a merely tight one does not.
 const minCommandTimeout = 5 * time.Second
 
 // commandContext derives a per-command context bounded by BOTH the configured

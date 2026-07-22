@@ -341,87 +341,12 @@ func TestSnapshotCreate_AlreadyExists(t *testing.T) {
 	assert.Equal(t, "existing", snap.Name)
 }
 
-// TestSnapshotCreate_ZFSAPIPrefix tests that zfs.snapshot.* API is used for TrueNAS 24.x
-func TestSnapshotCreate_ZFSAPIPrefix(t *testing.T) {
-	resetSnapshotAPIPrefix()
-	mock := newMockWSServer()
-	usedMethod := ""
-	server := mock.start(func(conn *websocket.Conn) {
-		for {
-			var req rpcTestRequest
-			if err := conn.ReadJSON(&req); err != nil {
-				return
-			}
-
-			var resp rpcTestResponse
-			resp.JSONRPC = "2.0"
-			resp.ID = req.ID
-
-			switch req.Method {
-			case "auth.login_with_api_key":
-				resp.Result = true
-			case "pool.snapshot.query":
-				// Fail to trigger fallback to zfs.snapshot
-				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
-			case "zfs.snapshot.query":
-				resp.Result = []interface{}{}
-			case "zfs.snapshot.create":
-				usedMethod = req.Method
-				resp.Result = map[string]interface{}{
-					"id":              "tank/k8s/volumes/pvc-123@zfs-snap",
-					"name":            "zfs-snap",
-					"dataset":         "tank/k8s/volumes/pvc-123",
-					"pool":            "tank",
-					"type":            "SNAPSHOT",
-					"properties":      map[string]interface{}{},
-					"user_properties": map[string]interface{}{},
-				}
-			default:
-				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
-			}
-
-			if err := conn.WriteJSON(resp); err != nil {
-				return
-			}
-		}
-	})
-	defer mock.close()
-
-	wsURL := strings.Replace(server.URL, "http://", "", 1)
-	parts := strings.Split(wsURL, ":")
-	host := parts[0]
-	port := 80
-	if len(parts) > 1 {
-		_, _ = fmt.Sscanf(parts[1], "%d", &port)
-	}
-
-	client, err := NewClient(&ClientConfig{
-		Host:           host,
-		Port:           port,
-		Protocol:       "http",
-		APIKey:         "test-api-key",
-		Timeout:        5 * time.Second,
-		ConnectTimeout: 5 * time.Second,
-		MaxConnections: 1,
-	})
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	ctx := context.Background()
-	snap, err := client.SnapshotCreate(ctx, "tank/k8s/volumes/pvc-123", "zfs-snap", nil)
-	require.NoError(t, err)
-	assert.NotNil(t, snap)
-	assert.Equal(t, "zfs.snapshot.create", usedMethod)
-}
-
 func TestSnapshotCreateSendsPropertiesOnBothAPIGenerations(t *testing.T) {
 	tests := []struct {
 		name         string
-		poolAPI      bool
 		expectedCall string
 	}{
-		{name: "pool snapshot", poolAPI: true, expectedCall: "pool.snapshot.create"},
-		{name: "legacy zfs snapshot", expectedCall: "zfs.snapshot.create"},
+		{name: "pool snapshot", expectedCall: "pool.snapshot.create"},
 	}
 
 	for _, tc := range tests {
@@ -439,12 +364,6 @@ func TestSnapshotCreateSendsPropertiesOnBothAPIGenerations(t *testing.T) {
 					case "auth.login_with_api_key":
 						resp.Result = true
 					case "pool.snapshot.query":
-						if tc.poolAPI {
-							resp.Result = []interface{}{}
-						} else {
-							resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
-						}
-					case "zfs.snapshot.query":
 						resp.Result = []interface{}{}
 					case tc.expectedCall:
 						payloads <- req.Params[0].(map[string]interface{})
@@ -1673,9 +1592,9 @@ func TestCopyDatasetFromSnapshotLocalExistingTargetRequiresOwnershipRetry(t *tes
 					"name": "tank/k8s/volumes/target",
 					"type": "FILESYSTEM",
 				}}
-			case "zfs.snapshot.query":
+			case "pool.snapshot.query":
 				resp.Result = []interface{}{}
-			case "zfs.snapshot.delete":
+			case "pool.snapshot.delete":
 				deleteCalled <- req.Params
 				resp.Error = &rpcError{Code: -1, Message: "snapshot not found"}
 			default:

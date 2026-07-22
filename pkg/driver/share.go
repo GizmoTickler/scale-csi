@@ -590,7 +590,7 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 			}
 		}
 		klog.Infof("NFS share missing for existing volume %s, creating...", datasetName)
-		return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false)
+		return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false, nil)
 
 	case ShareTypeISCSI:
 		// The create path validates every cached ID against its target/extent
@@ -611,12 +611,19 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 // shareType should be obtained from config.GetShareType(params) to support StorageClass parameters.
 // freshlyCreated skips guaranteed-miss idempotency lookups. zvolReady indicates
 // that DatasetCreate returned the zvol or the clone readiness wait completed.
-func (d *Driver) createShareWithOptions(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, freshlyCreated, zvolReady bool) error {
+// finalProperties carries the managed/ownership/provision/name stamps that
+// CreateVolume would otherwise write in a separate post-share update. NFS folds
+// them into the share-ID stamp (one pool.dataset.update on the same side of the
+// NFSShareCreate boundary); callers that must not change the idempotent-retry
+// path (ensureShareExists) pass nil. Block protocols ignore them and let
+// CreateVolume stamp them separately, because their in-share ID stamp is a
+// non-fatal best-effort write.
+func (d *Driver) createShareWithOptions(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
 	klog.Infof("Creating %s share for dataset: %s (freshlyCreated=%v, zvolReady=%v)", shareType, datasetName, freshlyCreated, zvolReady)
 
 	switch shareType {
 	case ShareTypeNFS:
-		return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated)
+		return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, finalProperties)
 	case ShareTypeISCSI:
 		return d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady)
 	case ShareTypeNVMeoF:
@@ -653,10 +660,10 @@ func (d *Driver) createNFSShare(ctx context.Context, datasetName, volumeName, mo
 	if mountpoint != "" {
 		ds.Mountpoint = mountpoint
 	}
-	return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false)
+	return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false, nil)
 }
 
-func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated bool) error {
+func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated bool, finalProperties map[string]string) error {
 	var err error
 	ds, err = d.datasetForProperties(ctx, ds, datasetName)
 	if err != nil {
@@ -706,8 +713,19 @@ func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Datas
 		return status.Errorf(codes.Internal, "failed to create NFS share: %v", err)
 	}
 
-	// Store share ID in dataset property
-	if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{PropNFSShareID: strconv.Itoa(share.ID)}); err != nil {
+	// Store the share ID together with CreateVolume's final managed/ownership/
+	// provision/name stamps in ONE pool.dataset.update. Both writes are on the
+	// same side of the NFSShareCreate boundary, so folding them together removes
+	// a round trip without crossing a crash boundary: the share ID is still
+	// stamped immediately after the share object exists (so ensureShareExists can
+	// find the share by ID), and finalProperties is empty on the idempotent
+	// ensureShareExists/createNFSShare paths so re-stamping there is unchanged.
+	shareProperties := make(map[string]string, len(finalProperties)+1)
+	for key, value := range finalProperties {
+		shareProperties[key] = value
+	}
+	shareProperties[PropNFSShareID] = strconv.Itoa(share.ID)
+	if err := d.setDatasetUserProperties(ctx, ds, datasetName, shareProperties); err != nil {
 		return status.Errorf(codes.Internal, "failed to store NFS share ID: %v", err)
 	}
 

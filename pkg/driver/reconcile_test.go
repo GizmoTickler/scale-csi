@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strconv"
 	"testing"
@@ -436,6 +437,63 @@ func TestStalePublicationRecordRequiresContinuousAbsenceThenRevokes(t *testing.T
 	assert.Empty(t, share.Hosts)
 	assert.Equal(t, []string{"192.0.2.0/24"}, share.Networks,
 		"additive cleanup removes only the CSI-added host grant")
+}
+
+// TestStalePublicationRecordDetectedThroughSourcelessResourceListing is the
+// regression test for the zfs.resource.query migration defect. On TrueNAS 26.0 the
+// path-scoped listing returns user_properties as a FLAT, SOURCELESS map, so running
+// publicationRecordsFromDataset — which must tell a dataset's own source=="local"
+// records apart from clone-inherited ones by source — directly on the listing skips
+// every record and silently disables the stale-record repair: the escape hatch that
+// unblocks a SINGLE_NODE/RWO volume after an operator force-removes a
+// VolumeAttachment finalizer. reconcileStalePublicationRecords must pre-filter the
+// flat listing for publication_* KEYS and re-fetch only those candidates through the
+// source-bearing pool.dataset.query read (DatasetGet) before classifying. Without
+// that re-fetch this test fails (the sourceless record is never even classified, so
+// it is never revoked); with it, the stale record is detected and retired exactly as
+// on the legacy source-bearing path.
+func TestStalePublicationRecordDetectedThroughSourcelessResourceListing(t *testing.T) {
+	ctx := context.Background()
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeAdditive, StaleRecordGracePeriod: "1ns"}
+	d.config.NFS.ShareAllowedNetworks = []string{"192.0.2.0/24"}
+	dataset := addReconcileDataset(client, "sourceless-listing", time.Now().Add(-time.Hour), true, 1)
+	dataset.Mountpoint = "/mnt/pool/parent/sourceless-listing"
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: dataset.Mountpoint, Hosts: []string{"192.0.2.11"}, Networks: []string{"192.0.2.0/24"}, Enabled: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+	record, err := newPublicationRecord(NodeIdentity{Name: "gone-worker", IPs: []net.IP{net.ParseIP("192.0.2.11")}},
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	record.CSIAddedNFSHosts = []string{"192.0.2.11"}
+	key := publicationPropertyKey(record.Node)
+	require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, key, record))
+
+	// List through the production path. The mock now models live 26.0, so the
+	// zfs.resource.query listing is sourceless; assert that precondition so this
+	// test genuinely exercises the regression rather than a source-bearing listing.
+	listed, err := d.listAllManagedDatasets(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	require.Contains(t, listed[0].UserProperties, key,
+		"the flat listing must still expose the publication_* key")
+	require.Empty(t, listed[0].UserProperties[key].Source,
+		"zfs.resource.query user_properties are sourceless on TrueNAS 26.0")
+
+	state := &kubernetesReconcileState{liveVolumeAttachments: map[string]struct{}{}, volumeAttachmentCount: 0}
+	t0 := time.Now()
+	d.reconcileStalePublicationRecords(ctx, listed, state, t0)
+	d.reconcileStalePublicationRecords(ctx, listed, state, t0.Add(time.Second))
+
+	fresh, err := client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	assert.NotContains(t, fresh.UserProperties, key,
+		"the stale record must still be detected and revoked through the sourceless listing")
+	share, err = client.NFSShareGet(ctx, share.ID)
+	require.NoError(t, err)
+	assert.Empty(t, share.Hosts, "the CSI-added host grant must be revoked with the record")
 }
 
 func TestStaleLegacyPublicationWithoutProvenancePreservesMatchingNFSHost(t *testing.T) {
@@ -1210,4 +1268,226 @@ func TestOrphanShareSweepSkipsShareBackedByLivePV(t *testing.T) {
 	d.detectOrphanedShares(ctx, kubeState, &report)
 
 	assert.Empty(t, report.OrphanShares, "a share backed by a live PV must never be classified as orphaned")
+}
+
+// newOrphanShareSweepDriver builds a driver for the block-protocol orphan-share
+// sweep tests. The iSCSI/NVMe-oF naming configs are left at their zero values so
+// iscsiShareName/nvmeSubsystemName pass a legal base name through unchanged.
+func newOrphanShareSweepDriver(client *truenas.MockClient) *Driver {
+	return &Driver{
+		name: "org.scale.csi.test",
+		config: &Config{
+			DriverName: "org.scale.csi.test",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client,
+	}
+}
+
+// createISCSIShareFixture provisions a target+extent+association triple in the
+// mock the same way createISCSIShareForDataset does: target name == extent name
+// == iscsiShareName(volumeID), and the extent comment carries the authoritative
+// "truenas-csi: <datasetName>" backreference.
+func createISCSIShareFixture(t *testing.T, ctx context.Context, client *truenas.MockClient, d *Driver, volumeID, datasetName string) {
+	t.Helper()
+	shareName := d.iscsiShareName(volumeID)
+	target, err := client.ISCSITargetCreate(ctx, shareName, "", "ISCSI", nil)
+	require.NoError(t, err)
+	extent, err := client.ISCSIExtentCreate(ctx, shareName, "zvol/"+datasetName, "truenas-csi: "+datasetName, 512, true, "SSD")
+	require.NoError(t, err)
+	_, err = client.ISCSITargetExtentCreate(ctx, target.ID, extent.ID, 0)
+	require.NoError(t, err)
+}
+
+// TestOrphanShareSweepDetectsAndDeletesISCSIShareWhoseDatasetIsGone mirrors the
+// NFS sweep for iSCSI: an extent whose authoritative comment backreference points
+// at an absent dataset under the parent is detected and removed (target, extent,
+// and association), while a share backed by a present dataset and a share whose
+// dataset lives outside the parent are left untouched.
+func TestOrphanShareSweepDetectsAndDeletesISCSIShareWhoseDatasetIsGone(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(client)
+
+	// A CSI-managed iSCSI share whose dataset still exists is NOT orphaned.
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/live-volume", Type: "VOLUME"})
+	require.NoError(t, err)
+	createISCSIShareFixture(t, ctx, client, d, "live-volume", "pool/parent/live-volume")
+	// A CSI-managed iSCSI share whose dataset is gone IS orphaned.
+	createISCSIShareFixture(t, ctx, client, d, "gone-volume", "pool/parent/gone-volume")
+	// A share whose dataset lives outside the parent (foreign driver instance) is
+	// never classified.
+	createISCSIShareFixture(t, ctx, client, d, "foreign-volume", "tank/other/foreign-volume")
+
+	kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+
+	require.Len(t, report.OrphanShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
+	assert.Equal(t, ShareTypeISCSI, report.OrphanShares[0].Protocol)
+	assert.Equal(t, 1, report.OrphanShareCount)
+
+	d.deleteOrphanedShares(ctx, &report, 5)
+	require.Len(t, report.DeletedShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
+
+	// The gone share's target, extent, and association are removed; the live and
+	// foreign shares remain.
+	targets, err := client.ISCSITargetList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, targets, 2)
+	extents, err := client.ISCSIExtentList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, extents, 2)
+	goneTarget, err := client.ISCSITargetFindByName(ctx, d.iscsiShareName("gone-volume"))
+	require.NoError(t, err)
+	assert.Nil(t, goneTarget, "the orphaned target must be deleted")
+}
+
+// TestOrphanShareSweepSkipsISCSIShareBackedByLivePV proves the safety guard for
+// iSCSI: a share whose dataset is absent but whose volume still has a live
+// PersistentVolume is anomalous and must NOT be swept.
+func TestOrphanShareSweepSkipsISCSIShareBackedByLivePV(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(client)
+
+	createISCSIShareFixture(t, ctx, client, d, "anomalous-volume", "pool/parent/anomalous-volume")
+
+	kubeState := &kubernetesReconcileState{volumeHandles: map[string]struct{}{"anomalous-volume": {}}}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+
+	assert.Empty(t, report.OrphanShares, "a block share backed by a live PV must never be classified as orphaned")
+}
+
+// TestOrphanShareSweepDetectsAndDeletesNVMeoFShareWhoseDatasetIsGone mirrors the
+// NFS sweep for NVMe-oF: a subsystem whose namespace DevicePath (the authoritative
+// zvol/<dataset> backreference) points at an absent dataset under the parent is
+// detected and removed (namespace then subsystem), while a share backed by a
+// present dataset and a share whose zvol lives outside the parent are untouched.
+func TestOrphanShareSweepDetectsAndDeletesNVMeoFShareWhoseDatasetIsGone(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(client)
+
+	// A CSI-managed NVMe-oF share whose dataset still exists is NOT orphaned.
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/live-volume", Type: "VOLUME"})
+	require.NoError(t, err)
+	liveSubsys, err := client.NVMeoFSubsystemCreate(ctx, d.nvmeSubsystemName("pool/parent/live-volume"), true, nil)
+	require.NoError(t, err)
+	_, err = client.NVMeoFNamespaceCreate(ctx, liveSubsys.ID, "zvol/pool/parent/live-volume", "ZVOL")
+	require.NoError(t, err)
+	// A CSI-managed NVMe-oF share whose dataset is gone IS orphaned.
+	goneSubsys, err := client.NVMeoFSubsystemCreate(ctx, d.nvmeSubsystemName("pool/parent/gone-volume"), true, nil)
+	require.NoError(t, err)
+	_, err = client.NVMeoFNamespaceCreate(ctx, goneSubsys.ID, "zvol/pool/parent/gone-volume", "ZVOL")
+	require.NoError(t, err)
+	// A share whose zvol lives outside the parent (foreign driver instance) is
+	// never classified, regardless of the subsystem name.
+	foreignSubsys, err := client.NVMeoFSubsystemCreate(ctx, "foreign-subsys", true, nil)
+	require.NoError(t, err)
+	_, err = client.NVMeoFNamespaceCreate(ctx, foreignSubsys.ID, "zvol/tank/other/foreign-volume", "ZVOL")
+	require.NoError(t, err)
+
+	kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+
+	require.Len(t, report.OrphanShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
+	assert.Equal(t, ShareTypeNVMeoF, report.OrphanShares[0].Protocol)
+	assert.Equal(t, 1, report.OrphanShareCount)
+
+	d.deleteOrphanedShares(ctx, &report, 5)
+	require.Len(t, report.DeletedShares, 1)
+	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
+
+	subsystems, err := client.NVMeoFSubsystemList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, subsystems, 2, "only the orphaned subsystem whose dataset is gone may be deleted")
+	goneNamespaces, err := client.NVMeoFNamespaceListBySubsystem(ctx, goneSubsys.ID)
+	require.NoError(t, err)
+	assert.Empty(t, goneNamespaces, "the orphaned subsystem's namespace must be deleted")
+}
+
+// managedDatasetListingClient wraps MockClient to observe which read path
+// listAllManagedDatasets takes (zfs.resource.query vs the pool.dataset.query
+// fallback) and to optionally force the resource path to fail.
+type managedDatasetListingClient struct {
+	*truenas.MockClient
+	resourceQueryCalls int
+	datasetListCalls   int
+	failResourceQuery  bool
+}
+
+func (c *managedDatasetListingClient) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*truenas.Dataset, error) {
+	c.resourceQueryCalls++
+	if c.failResourceQuery {
+		return nil, fmt.Errorf("zfs.resource.query unavailable")
+	}
+	return c.MockClient.DatasetQueryByParent(ctx, parentDataset)
+}
+
+func (c *managedDatasetListingClient) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*truenas.Dataset, error) {
+	c.datasetListCalls++
+	return c.MockClient.DatasetList(ctx, parentName, limit, offset)
+}
+
+func seedManagedDatasetListingFixtures(client *truenas.MockClient) {
+	client.Datasets["pool/parent/vol-managed"] = &truenas.Dataset{
+		Name: "pool/parent/vol-managed", Pool: "pool", Type: "VOLUME",
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource: {Value: "true", Source: "local"},
+		},
+	}
+	client.Datasets["pool/parent/vol-plain"] = &truenas.Dataset{
+		Name: "pool/parent/vol-plain", Pool: "pool", Type: "VOLUME",
+		UserProperties: map[string]truenas.UserProperty{},
+	}
+	client.Datasets["pool/parent/vol-disabled"] = &truenas.Dataset{
+		Name: "pool/parent/vol-disabled", Pool: "pool", Type: "VOLUME",
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource: {Value: "false", Source: "local"},
+		},
+	}
+}
+
+func managedDatasetNames(datasets []*truenas.Dataset) []string {
+	names := make([]string, 0, len(datasets))
+	for _, ds := range datasets {
+		names = append(names, ds.Name)
+	}
+	return names
+}
+
+// TestListAllManagedDatasetsUsesResourceQuery proves that when zfs.resource.query
+// is available, listAllManagedDatasets reads through DatasetQueryByParent once
+// (no paginated pool.dataset.query) and filters to managed_resource=="true".
+func TestListAllManagedDatasetsUsesResourceQuery(t *testing.T) {
+	client := &managedDatasetListingClient{MockClient: truenas.NewMockClient()}
+	seedManagedDatasetListingFixtures(client.MockClient)
+	d := newComplianceTestDriver(client)
+
+	datasets, err := d.listAllManagedDatasets(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pool/parent/vol-managed"}, managedDatasetNames(datasets))
+	assert.Equal(t, 1, client.resourceQueryCalls)
+	assert.Equal(t, 0, client.datasetListCalls, "resource path must not page pool.dataset.query")
+}
+
+// TestListAllManagedDatasetsFallsBackToDatasetList proves the safe fallback: when
+// the resource query errors, listAllManagedDatasets still returns the managed
+// datasets via the paginated pool.dataset.query path instead of failing.
+func TestListAllManagedDatasetsFallsBackToDatasetList(t *testing.T) {
+	client := &managedDatasetListingClient{MockClient: truenas.NewMockClient(), failResourceQuery: true}
+	seedManagedDatasetListingFixtures(client.MockClient)
+	d := newComplianceTestDriver(client)
+
+	datasets, err := d.listAllManagedDatasets(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pool/parent/vol-managed"}, managedDatasetNames(datasets))
+	assert.Equal(t, 1, client.resourceQueryCalls)
+	assert.GreaterOrEqual(t, client.datasetListCalls, 1, "fallback must page pool.dataset.query")
 }
