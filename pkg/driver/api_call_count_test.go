@@ -119,6 +119,11 @@ func (c *apiCallCountingClient) DatasetSetUserProperties(ctx context.Context, na
 	return c.MockClient.DatasetSetUserProperties(ctx, name, properties)
 }
 
+func (c *apiCallCountingClient) DatasetRemoveUserProperties(ctx context.Context, name string, keys []string) error {
+	c.record("DatasetRemoveUserProperties")
+	return c.MockClient.DatasetRemoveUserProperties(ctx, name, keys)
+}
+
 func (c *apiCallCountingClient) DatasetGetUserProperty(ctx context.Context, name, key string) (string, error) {
 	c.record("DatasetGetUserProperty")
 	return c.MockClient.DatasetGetUserProperty(ctx, name, key)
@@ -589,10 +594,16 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "delete-snapshot"})
 			require.NoError(t, err)
 		}},
-		// Clone-backed deletion adds the tombstone rename, property strip, and
-		// deferred destroy after the initial non-deferred destroy reports clones.
-		{name: "DeleteSnapshot with clones", want: 5, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Clone-backed deletion adds the tombstone-ledger write with its verifying
+		// re-read, the tombstone rename, property strip, deferred destroy after the
+		// initial non-deferred destroy reports clones, and the ledger retirement
+		// once the backend accepts the deferred destroy.
+		{name: "DeleteSnapshot with clones", want: 8, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent", Type: "FILESYSTEM",
+			})
+			require.NoError(t, err)
+			_, err = client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent/tombstone-source", Type: "FILESYSTEM", Refquota: testGiB,
 			})
 			require.NoError(t, err)
@@ -604,11 +615,16 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
 			require.NoError(t, err)
 		}},
-		// Snapshot cloning pins direct name resolution, one clone and readiness wait,
-		// quota/share setup, ownership stamping with an authoritative re-read, and
-		// final identity updates.
-		{name: "CreateVolume clone from snapshot", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Snapshot cloning pins direct name resolution, the durable in-flight
+		// marker write with its verifying re-read, one clone and readiness wait,
+		// quota/share setup, ownership stamping with an authoritative re-read,
+		// final identity updates, and marker retirement after the ownership stamp.
+		{name: "CreateVolume clone from snapshot", want: 15, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent", Type: "FILESYSTEM",
+			})
+			require.NoError(t, err)
+			_, err = client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent/clone-source", Type: "FILESYSTEM", Refquota: testGiB,
 			})
 			require.NoError(t, err)

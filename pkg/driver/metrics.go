@@ -150,6 +150,26 @@ var (
 		},
 	)
 
+	// Deferred-delete tombstones are retained by design on backends without ZFS
+	// deferred destroy until their last restored clone disappears. Detection is
+	// always on; guarded reaping only runs where reconcile deletion is enabled,
+	// so these gauges are how default installs see the reapable backlog.
+	tombstoneSnapshots = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_snapshots",
+			Help:      "Number of driver-tombstoned deferred-delete snapshots awaiting reap (ledger-proven, age-eligible)",
+		},
+	)
+
+	tombstoneSnapshotsBytes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_snapshots_bytes",
+			Help:      "Reported used bytes held by driver-tombstoned deferred-delete snapshots awaiting reap",
+		},
+	)
+
 	reconcileLastSuccessTimestamp = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -184,16 +204,16 @@ var (
 		},
 	)
 
-	// fencingProvenanceEvictedTotal counts additive-mode CSI-added grant
-	// provenance entries dropped by the per-node hard cap. A non-zero value warns
-	// that a single node's identity churn (per-boot NQNs, DHCP IPs) exceeded the
-	// bounded provenance list and the oldest tracked grants can no longer be
-	// auto-revoked by scale-csi.
-	fencingProvenanceEvictedTotal = promauto.NewCounterVec(
+	// fencingProvenanceOverflowTotal counts publishes refused because a node's
+	// additive CSI-added grant provenance list exceeded the hard cap even after
+	// compaction — i.e. it consists entirely of backend-live entries. Provenance
+	// is never silently evicted (that would turn revocable grants into permanent
+	// static policy); the publish fails closed with ResourceExhausted instead.
+	fencingProvenanceOverflowTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
-			Name:      "fencing_provenance_evicted_total",
-			Help:      "Total additive fencing provenance entries evicted by the per-node hard cap",
+			Name:      "fencing_provenance_overflow_total",
+			Help:      "Total publishes refused because backend-live additive fencing provenance exceeded the per-node cap",
 		},
 		[]string{"protocol"},
 	)
@@ -246,7 +266,7 @@ func init() {
 	}
 	fencingDeferredTotal.WithLabelValues("outside_allowed_network", "nfs").Add(0)
 	for _, protocol := range []string{"nfs", "nvmeof"} {
-		fencingProvenanceEvictedTotal.WithLabelValues(protocol).Add(0)
+		fencingProvenanceOverflowTotal.WithLabelValues(protocol).Add(0)
 	}
 }
 
@@ -319,6 +339,8 @@ func SetOrphanReconcileMetrics(report ReconcileReport) {
 	spentRestoreSnapshots.Set(float64(report.SpentRestoreSnapshotCount))
 	orphanVolumesBytes.Set(float64(report.OrphanVolumeBytes))
 	orphanSnapshotsBytes.Set(float64(report.OrphanSnapshotBytes))
+	tombstoneSnapshots.Set(float64(report.TombstoneSnapshotCount))
+	tombstoneSnapshotsBytes.Set(float64(report.TombstoneSnapshotBytes))
 }
 
 func RecordReconcileSuccess(at time.Time) {
@@ -337,8 +359,8 @@ func RecordFencingStaleDeferred() {
 	fencingStaleDeferredTotal.Inc()
 }
 
-func RecordFencingProvenanceEvicted(protocol string) {
-	fencingProvenanceEvictedTotal.WithLabelValues(protocol).Inc()
+func RecordFencingProvenanceOverflow(protocol string) {
+	fencingProvenanceOverflowTotal.WithLabelValues(protocol).Inc()
 }
 
 // Circuit breaker metrics tracking

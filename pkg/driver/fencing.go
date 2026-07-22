@@ -31,9 +31,12 @@ const (
 
 	// additiveGrantHardCap bounds a single node's CSI-added grant provenance list
 	// so identity churn (per-boot NQNs, DHCP-rotated IPs) can never grow one ZFS
-	// user property past the backend's value limit and break every publish for the
-	// volume. Compaction keeps it far below this in practice; the cap is a
-	// last-resort backstop that evicts oldest-first.
+	// user property past the backend's value limit and break every publish for
+	// the volume. Compaction (dropping entries no longer on the backend) keeps
+	// the list small in practice; a list that still exceeds the cap after
+	// compaction consists entirely of backend-live grants, and dropping any of
+	// those would permanently orphan a revocable grant — so the publish FAILS
+	// (ResourceExhausted) instead of silently evicting.
 	additiveGrantHardCap = 32
 )
 
@@ -47,13 +50,17 @@ func isLocalUserPropertySource(source string) bool {
 }
 
 // compactAdditiveGrants bounds a per-node additive provenance list against
-// unbounded growth. It keeps only entries that are still meaningful — the node's
-// current-identity grants (currentGrants) or entries still present on the backend
-// allowlist read at write time (backendAllowlist) — and drops stale entries a
-// prior convergence already removed from the backend. Current grants are always
-// retained; first-seen order is preserved so the hard cap evicts oldest-first. It
-// returns the compacted list and whether the hard cap evicted any entry.
-func compactAdditiveGrants(previous, currentGrants, backendAllowlist []string) ([]string, bool) {
+// unbounded growth. It keeps exactly the entries that are still meaningful — the
+// node's current-identity grants (currentGrants) or entries still present on the
+// backend allowlist read at write time (backendAllowlist) — and drops stale
+// entries a prior convergence already removed from the backend. It NEVER drops a
+// backend-live entry: every retained entry is a grant scale-csi may still need
+// to revoke, and evicting one would turn it into unrevocable "static policy".
+// Entries keep stable first-seen order (previous list order first, then new
+// current grants); dedup is uniform across both inputs. overCap reports that
+// even the fully compacted list exceeds additiveGrantHardCap — the caller must
+// fail the operation rather than lose provenance.
+func compactAdditiveGrants(previous, currentGrants, backendAllowlist []string) (compacted []string, overCap bool) {
 	keep := make(map[string]struct{}, len(currentGrants)+len(backendAllowlist))
 	for _, group := range [][]string{currentGrants, backendAllowlist} {
 		for _, value := range group {
@@ -64,34 +71,32 @@ func compactAdditiveGrants(previous, currentGrants, backendAllowlist []string) (
 	}
 	ordered := make([]string, 0, len(previous)+len(currentGrants))
 	seen := make(map[string]struct{}, len(previous)+len(currentGrants))
-	add := func(value string, force bool) {
+	for _, value := range previous {
 		value = strings.TrimSpace(value)
 		if value == "" {
-			return
+			continue
 		}
 		if _, dup := seen[value]; dup {
-			return
+			continue
 		}
-		if !force {
-			if _, ok := keep[value]; !ok {
-				return
-			}
+		if _, live := keep[value]; !live {
+			continue
 		}
 		seen[value] = struct{}{}
 		ordered = append(ordered, value)
 	}
-	for _, value := range previous {
-		add(value, false)
-	}
 	for _, value := range currentGrants {
-		add(value, true)
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, dup := seen[value]; dup {
+			continue
+		}
+		seen[value] = struct{}{}
+		ordered = append(ordered, value)
 	}
-	evicted := false
-	if len(ordered) > additiveGrantHardCap {
-		evicted = true
-		ordered = append([]string(nil), ordered[len(ordered)-additiveGrantHardCap:]...)
-	}
-	return ordered, evicted
+	return ordered, len(ordered) > additiveGrantHardCap
 }
 
 var (
@@ -630,11 +635,16 @@ func (d *Driver) populateAdditiveGrantOwnership(
 		}
 		// Compact against the backend allowlist read here so entries a prior fence
 		// already removed from the share drop off, bounding the list under churn.
-		compacted, evicted := compactAdditiveGrants(record.CSIAddedNFSHosts, newlyAdded, backendHosts)
-		if evicted {
-			klog.Warningf("Additive NFS grant provenance for %s hit the %d-entry cap; evicting oldest entries",
-				datasetName, additiveGrantHardCap)
-			RecordFencingProvenanceEvicted("nfs")
+		// A list still over the cap after compaction is all backend-live; dropping
+		// any entry would orphan a revocable grant, so the publish fails instead.
+		compacted, overCap := compactAdditiveGrants(record.CSIAddedNFSHosts, newlyAdded, backendHosts)
+		if overCap {
+			RecordFencingProvenanceOverflow("nfs")
+			klog.Errorf("Additive NFS grant provenance for %s holds %d backend-live entries (cap %d); refusing to publish rather than dropping revocation provenance",
+				datasetName, len(compacted), additiveGrantHardCap)
+			return status.Errorf(codes.ResourceExhausted,
+				"additive NFS grant provenance for %s holds %d backend-live entries, exceeding the %d-entry cap; investigate node identity churn or clean stale hosts from the share allowlist",
+				datasetName, len(compacted), additiveGrantHardCap)
 		}
 		record.CSIAddedNFSHosts = compacted
 	case ShareTypeNVMeoF:
@@ -655,6 +665,7 @@ func (d *Driver) populateAdditiveGrantOwnership(
 		}
 		associationExists := false
 		backendNQNs := make([]string, 0)
+		associationHostIDs := make(map[int]struct{})
 		if subsystem != nil {
 			host, findErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, nqn)
 			if findErr != nil {
@@ -665,6 +676,7 @@ func (d *Driver) populateAdditiveGrantOwnership(
 				return listErr
 			}
 			for _, association := range associations {
+				associationHostIDs[association.HostID] = struct{}{}
 				if association.HostNQN != "" {
 					backendNQNs = append(backendNQNs, association.HostNQN)
 				}
@@ -674,6 +686,30 @@ func (d *Driver) populateAdditiveGrantOwnership(
 					associationExists = true
 				}
 			}
+			// Defensive completeness for backends that omit the expanded hostnqn
+			// field: a provenance entry whose association is live but only visible
+			// by HostID must count as backend-live, or compaction would drop an
+			// entry that additive teardown still needs for revocation.
+			backendVisible := stringSet(backendNQNs)
+			for _, previousNQN := range record.CSIAddedNVMeNQNs {
+				previousNQN = strings.TrimSpace(previousNQN)
+				if previousNQN == "" || previousNQN == nqn {
+					continue
+				}
+				if _, visible := backendVisible[previousNQN]; visible {
+					continue
+				}
+				previousHost, resolveErr := d.truenasClient.NVMeoFHostFindByNQN(ctx, previousNQN)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				if previousHost == nil {
+					continue
+				}
+				if _, associated := associationHostIDs[previousHost.ID]; associated {
+					backendNQNs = append(backendNQNs, previousNQN)
+				}
+			}
 		}
 		var newlyAdded []string
 		if !associationExists {
@@ -681,11 +717,16 @@ func (d *Driver) populateAdditiveGrantOwnership(
 		}
 		// Compact against the subsystem's live associations so NQNs a prior fence
 		// already detached drop off, bounding the list under per-boot NQN churn.
-		compacted, evicted := compactAdditiveGrants(record.CSIAddedNVMeNQNs, newlyAdded, backendNQNs)
-		if evicted {
-			klog.Warningf("Additive NVMe-oF grant provenance for %s hit the %d-entry cap; evicting oldest entries",
-				datasetName, additiveGrantHardCap)
-			RecordFencingProvenanceEvicted("nvmeof")
+		// A list still over the cap after compaction is all backend-live; dropping
+		// any entry would orphan a revocable grant, so the publish fails instead.
+		compacted, overCap := compactAdditiveGrants(record.CSIAddedNVMeNQNs, newlyAdded, backendNQNs)
+		if overCap {
+			RecordFencingProvenanceOverflow("nvmeof")
+			klog.Errorf("Additive NVMe-oF grant provenance for %s holds %d backend-live entries (cap %d); refusing to publish rather than dropping revocation provenance",
+				datasetName, len(compacted), additiveGrantHardCap)
+			return status.Errorf(codes.ResourceExhausted,
+				"additive NVMe-oF grant provenance for %s holds %d backend-live entries, exceeding the %d-entry cap; investigate node identity churn or clean stale hosts from the subsystem",
+				datasetName, len(compacted), additiveGrantHardCap)
 		}
 		record.CSIAddedNVMeNQNs = compacted
 	}
@@ -719,6 +760,11 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	if err := d.populateAdditiveGrantOwnership(
 		ctx, ds, datasetName, shareType, identity, previous, hasPrevious, deferred, &record,
 	); err != nil {
+		// The provenance-overflow refusal is a deliberate, actionable status;
+		// preserve its code instead of masking it as Internal.
+		if status.Code(err) == codes.ResourceExhausted {
+			return err
+		}
 		return status.Errorf(codes.Internal, "failed to classify additive grant ownership: %v", err)
 	}
 	if err := storePublicationRecord(ctx, d.truenasClient, ds, datasetName, key, record); err != nil {

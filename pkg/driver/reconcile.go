@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -90,6 +91,7 @@ type ReconcileReport struct {
 	TombstoneSnapshotCount     int
 	OrphanVolumeBytes          int64
 	OrphanSnapshotBytes        int64
+	TombstoneSnapshotBytes     int64
 	OrphanVolumes              []ReconcileObject
 	OrphanSnapshots            []ReconcileObject
 	SpentRestoreSnapshots      []SpentRestoreSnapshot
@@ -203,6 +205,23 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		d.reconcileStalePublicationRecords(ctx, datasets, kubeState, time.Now())
 	}
 
+	// The parent dataset carries the driver's durable bookkeeping: in-flight
+	// creation markers and the tombstone ledger. Reading it can fail without
+	// aborting the pass — tombstone reaping then simply stays empty (fail-safe;
+	// no ledger, no reaping) and the sweeps are skipped.
+	var ledger map[string]tombstoneLedgerEntry
+	parentDataset, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
+	if parentErr != nil {
+		d.recordReconcileObjectFailure("parent_bookkeeping", d.parentDatasetName(), parentErr)
+	} else {
+		ledger = tombstoneLedgerFromDataset(parentDataset)
+		// Bookkeeping hygiene runs on every pass regardless of opts.Delete: these
+		// properties are driver-internal provenance records, not user data, and
+		// each removal requires proof of staleness gathered live below.
+		d.sweepStaleInflightMarkers(ctx, parentDataset, time.Now(), minOrphanAge)
+		d.sweepOrphanedTombstoneLedger(ctx, ledger, time.Now(), minOrphanAge)
+	}
+
 	now := time.Now()
 	managedBackendVolumeCount := 0
 	for _, ds := range datasets {
@@ -277,10 +296,20 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 
 	// Tombstone-named snapshots are the driver's own deferred-delete markers. On
 	// backends without ZFS deferred destroy (TrueNAS 26.0) they cannot be removed
-	// until their last restored clone is gone, and they carry no CSI identity, so
-	// the CSI-snapshot orphan pass above never sees them. Classify age-eligible
-	// ones so guarded GC can reap them once their clones disappear.
+	// until their last restored clone is gone, and the tombstone rename released
+	// their CSI identity, so the CSI-snapshot orphan pass above never sees them.
+	// Classification requires a matching parent-dataset ledger entry: the name
+	// shape alone is NOT provenance — a user snapshot may legitimately be named
+	// *-csi-deleted-<n> and must never be counted, reaped, or even reported.
 	for _, snap := range tombstones {
+		entry, recorded := ledger[tombstoneLedgerKey(snap.ID)]
+		if !recorded || entry.Snapshot != snap.ID {
+			continue
+		}
+		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {
+			klog.Warningf("Orphan reconcile: skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name and ledger entry", snap.ID)
+			continue
+		}
 		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
 		if !eligible {
 			if snap.GetCreationTime() <= 0 {
@@ -292,14 +321,16 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		if snap.Dataset != "" {
 			sourceVolumeID = path.Base(snap.Dataset)
 		}
-		report.TombstoneSnapshots = append(report.TombstoneSnapshots, ReconcileObject{
+		item := ReconcileObject{
 			ID:             snap.ID,
 			BackendID:      snap.ID,
 			SourceVolumeID: sourceVolumeID,
 			CreatedAt:      createdAt,
 			Age:            age,
 			Bytes:          snap.GetSnapshotSize(),
-		})
+		}
+		report.TombstoneSnapshots = append(report.TombstoneSnapshots, item)
+		report.TombstoneSnapshotBytes += item.Bytes
 	}
 
 	if d.config.ZFS.DetachedVolumesFromSnapshots {
@@ -908,14 +939,46 @@ func (d *Driver) hardRecheckSnapshotContentAbsent(ctx context.Context, orphan Re
 	return true, ""
 }
 
+// snapshotIsLiveCSIObjectWithTombstoneShapedName is the identity belt on top of
+// the ledger: it detects a LIVE CSI snapshot whose user-chosen name merely looks
+// like a tombstone (its recorded CSI name sanitizes to its own current short
+// name), e.g. a snapshot literally created as "backup-csi-deleted-2024". Such an
+// object could only meet the ledger gate through a stale entry at an identical
+// recreated full ID, and must never be reaped.
+//
+// Deliberately NOT "skip whenever csi_snapshot_name is present": on TrueNAS 26.0
+// the post-rename property strip is a silent no-op (no API mutates properties on
+// an existing snapshot), so the driver's OWN tombstones still carry their
+// original identity properties — their recorded name is the pre-tombstone CSI
+// name and does not match the tombstone-shaped current name. A bare presence
+// check would make the reaper permanently inert on the exact backend the leak
+// repair exists for.
+func snapshotIsLiveCSIObjectWithTombstoneShapedName(snap *truenas.Snapshot) bool {
+	if snap == nil {
+		return false
+	}
+	property, ok := snap.UserProperties[PropCSISnapshotName]
+	if !ok || property.Value == "" || property.Value == "-" {
+		return false
+	}
+	return sanitizeVolumeID(property.Value) == snap.Name
+}
+
 // reapTombstoneSnapshot removes a driver-created deferred-delete tombstone once
 // its last restored clone is gone. On TrueNAS 26.0 zfs.resource.snapshot.destroy
 // has no defer semantics, so DeleteSnapshot's post-tombstone destroy leaves the
 // tombstone behind whenever a live clone still depends on it; this reaps it
-// exactly when the dependency is finally released. It re-reads under the source
-// volume lock and revalidates identity+age so a concurrent CreateSnapshot or a
-// changed object can never be reaped on a stale detection snapshot. A snapshot
-// that still has clones is treated as a benign skip, not a failure.
+// exactly when the dependency is finally released. Destruction requires, all
+// re-proven under the source volume lock immediately before the delete:
+//   - a matching parent-dataset ledger entry (driver provenance — the name shape
+//     alone never authorizes a reap);
+//   - no live CSI snapshot identity (belt against stale-ledger name collisions);
+//   - the source dataset locally stamped by THIS driver instance;
+//   - unchanged creation identity and satisfied age gate.
+//
+// A snapshot that still has clones is a benign skip, not a failure. After a
+// successful reap the ledger entry is removed (best-effort; the sweep retires
+// leftovers).
 func (d *Driver) reapTombstoneSnapshot(
 	ctx context.Context,
 	tombstone ReconcileObject,
@@ -934,13 +997,34 @@ func (d *Driver) reapTombstoneSnapshot(
 	if err != nil {
 		if truenas.IsNotFoundError(err) {
 			// Already gone (ZFS reclaimed it, or a peer reaped it): the operation's
-			// goal is met, so treat it as reaped for reporting.
+			// goal is met, so treat it as reaped for reporting and retire the entry.
+			d.removeTombstoneLedgerEntry(ctx, tombstone.BackendID)
 			return true, ""
 		}
 		return false, fmt.Sprintf("tombstone snapshot revalidation failed: %v", err)
 	}
-	if !isSnapshotTombstone(snapshot) {
+	if !isSnapshotTombstone(snapshot) || snapshot.ID != tombstone.BackendID {
 		return false, "backend snapshot is no longer the detected tombstone"
+	}
+	if snapshotIsLiveCSIObjectWithTombstoneShapedName(snapshot) {
+		return false, "snapshot carries live CSI identity; refusing to reap"
+	}
+	// Re-prove driver provenance from a fresh parent read under the lock.
+	parent, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
+	if parentErr != nil {
+		return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", parentErr)
+	}
+	entry, recorded := tombstoneLedgerFromDataset(parent)[tombstoneLedgerKey(snapshot.ID)]
+	if !recorded || entry.Snapshot != snapshot.ID {
+		return false, "no tombstone ledger entry proves driver provenance"
+	}
+	// The tombstone must sit on a dataset this driver instance owns.
+	sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, snapshot.Dataset)
+	if dsErr != nil {
+		return false, fmt.Sprintf("tombstone source dataset revalidation failed: %v", dsErr)
+	}
+	if !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()) {
+		return false, "tombstone source dataset does not carry this driver instance's ownership stamp"
 	}
 	createdAt, _, eligible := reconcileAge(time.Now(), snapshot.GetCreationTime(), minOrphanAge)
 	if !eligible || !createdAt.Equal(tombstone.CreatedAt) {
@@ -948,6 +1032,7 @@ func (d *Driver) reapTombstoneSnapshot(
 	}
 	if err := d.truenasClient.SnapshotDelete(ctx, snapshot.ID, false, false); err != nil {
 		if truenas.IsNotFoundError(err) {
+			d.removeTombstoneLedgerEntry(ctx, snapshot.ID)
 			return true, ""
 		}
 		var cloneErr *truenas.ErrSnapshotHasClones
@@ -956,8 +1041,99 @@ func (d *Driver) reapTombstoneSnapshot(
 		}
 		return false, fmt.Sprintf("failed to reap tombstone snapshot: %v", err)
 	}
+	d.removeTombstoneLedgerEntry(ctx, snapshot.ID)
 	klog.Infof("Orphan reconcile: reaped released deferred-delete tombstone %s", snapshot.ID)
 	return true, ""
+}
+
+// sweepStaleInflightMarkers retires in-flight creation markers that can no
+// longer gate a recovery: their dataset is gone, or it now carries a local
+// ownership stamp (creation completed; only the marker delete was lost). Both
+// conditions are proven live and only after a generous age bound so an active
+// multi-minute detached copy is never raced. Markers from other driver
+// instances, other versions, or with unusable timestamps are left alone;
+// corrupt (unparseable) payloads in our namespace are retired because nothing
+// can ever act on them.
+func (d *Driver) sweepStaleInflightMarkers(ctx context.Context, parent *truenas.Dataset, now time.Time, minAge time.Duration) {
+	if parent == nil {
+		return
+	}
+	staleKeys := make([]string, 0)
+	for key, property := range parent.UserProperties {
+		if !strings.HasPrefix(key, PropInflightMarkerPrefix) || !isLocalUserPropertySource(property.Source) {
+			continue
+		}
+		var marker inflightMarker
+		if err := json.Unmarshal([]byte(property.Value), &marker); err != nil {
+			klog.Warningf("Retiring corrupt in-flight marker %s: %v", key, err)
+			staleKeys = append(staleKeys, key)
+			continue
+		}
+		if marker.Version != inflightMarkerVersion || marker.Instance != d.driverInstanceID() || marker.Dataset == "" {
+			continue
+		}
+		startedAt, parseErr := time.Parse(time.RFC3339Nano, marker.StartedAt)
+		if parseErr != nil || now.Sub(startedAt) <= minAge {
+			continue
+		}
+		dataset, err := d.truenasClient.DatasetGet(ctx, marker.Dataset)
+		if err != nil {
+			if truenas.IsNotFoundError(err) {
+				staleKeys = append(staleKeys, key)
+			} else {
+				d.recordReconcileObjectFailure("inflight_marker_sweep", marker.Dataset, err)
+			}
+			continue
+		}
+		if owner, ok := datasetUserPropertyProjection(dataset, PropDriverInstanceID); ok && isLocalUserPropertySource(owner.Source) {
+			staleKeys = append(staleKeys, key)
+		}
+		// Dataset exists but is still unstamped: the marker remains the only proof
+		// that lets a retry recover the remnant — keep it.
+	}
+	if len(staleKeys) == 0 {
+		return
+	}
+	sort.Strings(staleKeys)
+	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), staleKeys); err != nil {
+		d.recordReconcileObjectFailure("inflight_marker_sweep", d.parentDatasetName(), err)
+		return
+	}
+	klog.Infof("Orphan reconcile: retired %d stale in-flight creation markers", len(staleKeys))
+}
+
+// sweepOrphanedTombstoneLedger retires ledger entries whose snapshot no longer
+// exists — either the crash window between ledger write and rename (the
+// tombstone was never created) or a reap/reclaim whose entry removal was lost.
+// Age-gated on the recorded rename time so an in-progress DeleteSnapshot is
+// never raced. Swept entries are also dropped from the in-memory map so the
+// same pass cannot classify against them.
+func (d *Driver) sweepOrphanedTombstoneLedger(ctx context.Context, ledger map[string]tombstoneLedgerEntry, now time.Time, minAge time.Duration) {
+	staleKeys := make([]string, 0)
+	for key, entry := range ledger {
+		if _, err := d.truenasClient.SnapshotGet(ctx, entry.Snapshot); err == nil {
+			continue
+		} else if !truenas.IsNotFoundError(err) {
+			d.recordReconcileObjectFailure("tombstone_ledger_sweep", entry.Snapshot, err)
+			continue
+		}
+		if renamedAt, parseErr := time.Parse(time.RFC3339Nano, entry.RenamedAt); parseErr == nil && now.Sub(renamedAt) <= minAge {
+			continue
+		}
+		staleKeys = append(staleKeys, key)
+	}
+	if len(staleKeys) == 0 {
+		return
+	}
+	sort.Strings(staleKeys)
+	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), staleKeys); err != nil {
+		d.recordReconcileObjectFailure("tombstone_ledger_sweep", d.parentDatasetName(), err)
+		return
+	}
+	for _, key := range staleKeys {
+		delete(ledger, key)
+	}
+	klog.Infof("Orphan reconcile: retired %d orphaned tombstone ledger entries", len(staleKeys))
 }
 
 func (d *Driver) revalidateOrphanVolume(

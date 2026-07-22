@@ -450,6 +450,13 @@ reconcile:
     # SAFETY: guarded deletion is opt-in and disabled by default. When enabled,
     # a CronJob runs --mode=reconcile and backend cleanup still goes through the
     # driver's existing DeleteVolume/DeleteSnapshot dependency guards.
+    #
+    # NOTE: on TrueNAS 26.0 (no ZFS deferred destroy) deleting a snapshot that
+    # still has a restored clone leaves a driver-tombstoned snapshot behind by
+    # design. Reaping those released tombstones is part of this guarded delete
+    # pass, so it only happens when delete.enabled is true; with it disabled the
+    # backlog stays visible in the scale_csi_tombstone_snapshots{,_bytes}
+    # gauges (detection is always on).
     enabled: false
     schedule: "0 4 * * *"
     # Maximum successful deletions across all object types in one run.

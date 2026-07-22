@@ -587,9 +587,13 @@ func TestReconcileReapsReleasedTombstoneWithoutDeferredDestroy(t *testing.T) {
 	pvSource := reconcilePV("source", "csi.scale.io")
 	d, client := newReconcileTestDriver(t, false, []runtime.Object{pvSource}, nil)
 	client.NoDeferredSnapshotDestroy = true
+	mustCreateParentDataset(t, client)
 
 	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
 	source.Mountpoint = "/mnt/pool/parent/source"
+	// The reaper requires the tombstone's dataset to carry this driver
+	// instance's local ownership stamp.
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
 	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           "snap-1",
@@ -608,21 +612,129 @@ func TestReconcileReapsReleasedTombstoneWithoutDeferredDestroy(t *testing.T) {
 	assert.Nil(t, released, "the CSI snapshot name is released by the tombstone rename")
 	tombstoneID := findTombstoneID(t, client, "pool/parent/source")
 	require.NotEmpty(t, tombstoneID, "the tombstone is retained while its clone is live")
+	parent, err := client.DatasetGet(ctx, "pool/parent")
+	require.NoError(t, err)
+	require.Contains(t, tombstoneLedgerFromDataset(parent), tombstoneLedgerKey(tombstoneID),
+		"the tombstone must have driver provenance in the parent ledger")
 
-	// While the clone is live the reconciler must keep the tombstone.
+	// While the clone is live the reconciler must keep the tombstone (visible in
+	// the detection report as reapable backlog).
 	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
 	require.NoError(t, err)
 	assert.Empty(t, report.DeletedTombstones)
+	assert.Equal(t, 1, report.TombstoneSnapshotCount)
 	_, err = client.SnapshotGet(ctx, tombstoneID)
 	require.NoError(t, err, "tombstone retained while its clone still depends on it")
 
-	// Once the clone is gone the reconciler reaps the released tombstone.
+	// Once the clone is gone the reconciler reaps the released tombstone and
+	// retires its ledger entry.
 	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
 	report, err = d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
 	require.NoError(t, err)
 	assert.Contains(t, report.DeletedTombstones, tombstoneID)
 	_, err = client.SnapshotGet(ctx, tombstoneID)
 	assert.True(t, truenas.IsNotFoundError(err), "the released tombstone is reaped")
+	parent, err = client.DatasetGet(ctx, "pool/parent")
+	require.NoError(t, err)
+	assert.NotContains(t, tombstoneLedgerFromDataset(parent), tombstoneLedgerKey(tombstoneID),
+		"the ledger entry is retired with the reaped tombstone")
+}
+
+// A snapshot whose NAME merely looks like a tombstone must never be reaped: the
+// reaper requires ledger provenance, and a live CSI snapshot that (through a
+// hypothetical stale ledger entry) still matches is additionally protected by
+// the live-identity belt.
+func TestReconcileNeverReapsForeignTombstoneShapedSnapshots(t *testing.T) {
+	ctx := context.Background()
+	pvSource := reconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pvSource}, nil)
+	client.NoDeferredSnapshotDestroy = true
+	mustCreateParentDataset(t, client)
+	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+
+	// A manual (non-CSI) user snapshot with a tombstone-shaped name: no ledger
+	// entry -> never classified, never reaped.
+	manual, err := client.SnapshotCreate(ctx, source.Name, "backup-csi-deleted-2024", nil)
+	require.NoError(t, err)
+	manual.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+
+	// A LIVE CSI snapshot whose user-chosen name is tombstone-shaped, with a
+	// forged/stale ledger entry at its exact ID: the live-identity belt (its
+	// csi_snapshot_name sanitizes to its own name) must still protect it.
+	liveCSI, err := client.SnapshotCreate(ctx, source.Name, "keep-csi-deleted-2025", map[string]string{
+		PropManagedResource:           "true",
+		PropCSISnapshotName:           "keep-csi-deleted-2025",
+		PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	liveCSI.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+	require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+		Version: tombstoneLedgerVersion, Snapshot: liveCSI.ID, Dataset: source.Name,
+		RenamedAt: time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339Nano),
+	}))
+
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Empty(t, report.DeletedTombstones)
+	assert.Zero(t, report.TombstoneSnapshotCount, "lookalike snapshots must not even be classified")
+	_, err = client.SnapshotGet(ctx, manual.ID)
+	require.NoError(t, err, "the manual lookalike snapshot must survive")
+	_, err = client.SnapshotGet(ctx, liveCSI.ID)
+	require.NoError(t, err, "the live CSI lookalike snapshot must survive despite the stale ledger entry")
+}
+
+// Crash window between ledger write and tombstone rename: the ledger entry has
+// no matching snapshot and must be swept once aged; bookkeeping sweep also
+// retires stale in-flight markers whose dataset completed (stamped) or is gone.
+func TestReconcileSweepsOrphanedLedgerEntriesAndStaleMarkers(t *testing.T) {
+	ctx := context.Background()
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	mustCreateParentDataset(t, client)
+	aged := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339Nano)
+
+	// Ledger entry whose tombstone was never created (rename crashed).
+	require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+		Version: tombstoneLedgerVersion, Snapshot: "pool/parent/gone@x-csi-deleted-1", Dataset: "pool/parent/gone",
+		RenamedAt: aged,
+	}))
+	// Marker whose dataset is gone (creation failed and cleanup removed it, but
+	// the marker delete was lost).
+	goneMarker := inflightMarker{
+		Version: inflightMarkerVersion, Instance: d.driverInstanceID(),
+		Dataset: "pool/parent/vanished", Mode: inflightModeClone,
+		SourceType: "snapshot", SourceID: "snap-x", Protocol: "nfs",
+		Nonce: "n1", StartedAt: aged,
+	}
+	require.NoError(t, d.writeInflightMarker(ctx, goneMarker))
+	// Marker whose dataset completed (locally stamped) but the marker delete was
+	// lost after the crash-free path finished.
+	stamped := addReconcileDataset(client, "completed", time.Now().Add(-72*time.Hour), true, testGiB)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, stamped.Name, PropDriverInstanceID, d.driverInstanceID()))
+	completedMarker := goneMarker
+	completedMarker.Dataset = stamped.Name
+	require.NoError(t, d.writeInflightMarker(ctx, completedMarker))
+	// Marker for a live UNSTAMPED remnant: still recovery-relevant, must be kept.
+	remnant := addReconcileDataset(client, "unstamped-remnant", time.Now().Add(-72*time.Hour), false, testGiB)
+	remnantMarker := goneMarker
+	remnantMarker.Dataset = remnant.Name
+	require.NoError(t, d.writeInflightMarker(ctx, remnantMarker))
+
+	_, err := d.ReconcileOrphans(ctx, ReconcileOptions{MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+
+	parent, err := client.DatasetGet(ctx, "pool/parent")
+	require.NoError(t, err)
+	assert.Empty(t, tombstoneLedgerFromDataset(parent), "the orphaned ledger entry is swept")
+	vanishedMarker, err := d.readInflightMarker(ctx, "vanished")
+	require.NoError(t, err)
+	assert.Nil(t, vanishedMarker, "the dataset-gone marker is swept")
+	doneMarker, err := d.readInflightMarker(ctx, "completed")
+	require.NoError(t, err)
+	assert.Nil(t, doneMarker, "the stamped-dataset marker is swept")
+	keptMarker, err := d.readInflightMarker(ctx, "unstamped-remnant")
+	require.NoError(t, err)
+	assert.NotNil(t, keptMarker, "the marker guarding a live unstamped remnant is kept")
 }
 
 func findTombstoneID(t *testing.T, client *truenas.MockClient, sourceDataset string) string {

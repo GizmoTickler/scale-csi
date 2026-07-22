@@ -438,19 +438,20 @@ func TestAdditiveNFSUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 	}
 }
 
-func TestCompactAdditiveGrantsBoundsListAndEvictsOldestFirst(t *testing.T) {
+func TestCompactAdditiveGrantsNeverDropsBackendLiveEntries(t *testing.T) {
 	// Stale entries (neither current nor still on the backend) are dropped; the
-	// remaining entries keep first-seen order.
-	got, evicted := compactAdditiveGrants(
-		[]string{"stale", "still-on-backend", "current"},
-		[]string{"current"},
+	// remaining entries keep first-seen order; duplicates dedup uniformly.
+	got, overCap := compactAdditiveGrants(
+		[]string{"stale", "still-on-backend", "current", "still-on-backend"},
+		[]string{"current", "current"},
 		[]string{"still-on-backend"},
 	)
-	assert.False(t, evicted)
+	assert.False(t, overCap)
 	assert.Equal(t, []string{"still-on-backend", "current"}, got)
 
-	// A pathological pile of entries still present on the backend is capped at the
-	// hard limit, evicting oldest-first and flagging the eviction.
+	// A pathological pile of entries that are ALL still present on the backend is
+	// never evicted — every one is a grant that may still need revoking. The
+	// function reports over-cap and the caller must fail the publish instead.
 	previous := make([]string, 0, additiveGrantHardCap+5)
 	backend := make([]string, 0, additiveGrantHardCap+5)
 	for i := 0; i < additiveGrantHardCap+5; i++ {
@@ -458,16 +459,110 @@ func TestCompactAdditiveGrantsBoundsListAndEvictsOldestFirst(t *testing.T) {
 		previous = append(previous, host)
 		backend = append(backend, host)
 	}
-	capped, capEvicted := compactAdditiveGrants(previous, nil, backend)
-	assert.True(t, capEvicted)
-	assert.Len(t, capped, additiveGrantHardCap)
-	assert.Equal(t, "10.0.0.5", capped[0], "the five oldest entries are evicted")
-	assert.Equal(t, "10.0.0."+strconv.Itoa(additiveGrantHardCap+4), capped[len(capped)-1])
+	kept, capExceeded := compactAdditiveGrants(previous, nil, backend)
+	assert.True(t, capExceeded)
+	assert.Equal(t, previous, kept, "backend-live entries must never be evicted")
 
-	// The node's current grant always survives the cap as the newest entry.
-	withCurrent, _ := compactAdditiveGrants(previous, []string{"current-grant"}, append(backend, "current-grant"))
-	assert.Len(t, withCurrent, additiveGrantHardCap)
-	assert.Equal(t, "current-grant", withCurrent[len(withCurrent)-1])
+	// Over-cap input with mostly-dead entries resolves through compaction alone.
+	resolved, stillOver := compactAdditiveGrants(previous, []string{"current"}, []string{"10.0.0.1"})
+	assert.False(t, stillOver)
+	assert.Equal(t, []string{"10.0.0.1", "current"}, resolved)
+}
+
+// Over-cap backend-live provenance must FAIL the publish (fail-closed, bounded)
+// instead of silently evicting entries that additive teardown still needs; the
+// same shape with dead entries self-heals through compaction and publishes.
+func TestAdditiveNFSPublishFailsWhenBackendLiveProvenanceExceedsCap(t *testing.T) {
+	ctx := context.Background()
+	buildVolume := func(t *testing.T, client *truenas.MockClient, volumeID string, liveHostCount int) []string {
+		t.Helper()
+		dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/" + volumeID, Type: "FILESYSTEM",
+		})
+		require.NoError(t, err)
+		hosts := make([]string, 0, liveHostCount)
+		for i := 0; i < liveHostCount; i++ {
+			hosts = append(hosts, "192.0.2."+strconv.Itoa(i+1))
+		}
+		share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+			Path: dataset.Mountpoint, Hosts: hosts, Enabled: true,
+		})
+		require.NoError(t, err)
+		require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+		record, err := newPublicationRecord(NodeIdentity{
+			Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.1")},
+		}, csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER, false)
+		require.NoError(t, err)
+		record.CSIAddedNFSHosts = append([]string(nil), hosts...)
+		require.NoError(t, storePublicationRecord(
+			ctx, client, dataset, dataset.Name, publicationPropertyKey("worker-a"), record,
+		))
+		return hosts
+	}
+	newNFSDriver := func(client *truenas.MockClient) *Driver {
+		return &Driver{
+			name: "org.scale.csi.nfs",
+			config: &Config{
+				Fencing: FencingConfig{Mode: FencingModeAdditive},
+				ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+				NFS:     NFSConfig{ShareAllowedNetworks: []string{"192.0.2.0/24"}},
+			},
+			truenasClient: client,
+		}
+	}
+	publish := func(d *Driver, volumeID string) error {
+		nodeID, err := encodeNodeIdentity(NodeIdentity{
+			Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.1")},
+		})
+		require.NoError(t, err)
+		_, publishErr := d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+			VolumeId: volumeID, NodeId: nodeID,
+			VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+			}},
+			VolumeContext: map[string]string{"node_attach_driver": "nfs"},
+		})
+		return publishErr
+	}
+
+	t.Run("all backend-live over cap fails closed", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		d := newNFSDriver(client)
+		liveHosts := buildVolume(t, client, "nfs-provenance-overflow", additiveGrantHardCap+3)
+
+		err := publish(d, "nfs-provenance-overflow")
+		require.Error(t, err)
+		assert.Equal(t, codes.ResourceExhausted, status.Code(err))
+		// The refused publish must not have rewritten the record: every
+		// backend-live provenance entry survives for future revocation.
+		fresh, err := client.DatasetGet(ctx, "pool/parent/nfs-provenance-overflow")
+		require.NoError(t, err)
+		records, err := publicationRecordsFromDataset(fresh)
+		require.NoError(t, err)
+		assert.Equal(t, liveHosts, records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts,
+			"backend-live provenance must be fully preserved by a refused publish")
+	})
+
+	t.Run("over cap with dead entries resolves through compaction", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		d := newNFSDriver(client)
+		buildVolume(t, client, "nfs-provenance-compacts", additiveGrantHardCap+3)
+		// A prior convergence already removed all but one host from the backend:
+		// those provenance entries are dead and compaction may retire them.
+		share, err := client.NFSShareFindByPath(ctx, "/mnt/pool/parent/nfs-provenance-compacts")
+		require.NoError(t, err)
+		require.NotNil(t, share)
+		_, err = client.NFSShareUpdate(ctx, share.ID, map[string]interface{}{"hosts": []string{"192.0.2.1"}})
+		require.NoError(t, err)
+
+		require.NoError(t, publish(d, "nfs-provenance-compacts"))
+		fresh, err := client.DatasetGet(ctx, "pool/parent/nfs-provenance-compacts")
+		require.NoError(t, err)
+		records, err := publicationRecordsFromDataset(fresh)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"192.0.2.1"},
+			records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts)
+	})
 }
 
 func TestAdditiveNFSIdentityRotationRemovesOldCSIAddedGrant(t *testing.T) {
@@ -1849,6 +1944,7 @@ func TestCreateVolumeCloneRacesNeverAdoptOrDeleteWinner(t *testing.T) {
 
 	t.Run("snapshot clone", func(t *testing.T) {
 		client := &racedSnapshotCloneDestinationMock{MockClient: truenas.NewMockClient()}
+		mustCreateParentDataset(t, client.MockClient)
 		d := newComplianceTestDriver(client)
 		source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 			Name: "pool/parent/snapshot-race-source", Type: "FILESYSTEM", Refquota: testGiB,
@@ -1876,6 +1972,7 @@ func TestCreateVolumeCloneRacesNeverAdoptOrDeleteWinner(t *testing.T) {
 
 	t.Run("volume clone", func(t *testing.T) {
 		client := &racedSnapshotCloneDestinationMock{MockClient: truenas.NewMockClient()}
+		mustCreateParentDataset(t, client.MockClient)
 		d := newComplianceTestDriver(client)
 		source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 			Name: "pool/parent/volume-race-source", Type: "FILESYSTEM", Refquota: testGiB,
@@ -1905,6 +2002,7 @@ func TestCreateVolumeCloneRacesNeverAdoptOrDeleteWinner(t *testing.T) {
 func TestCreateVolumeDetachedCopyRaceNeverMutatesWinner(t *testing.T) {
 	ctx := context.Background()
 	client := &racedDetachedCopyDestinationMock{MockClient: truenas.NewMockClient()}
+	mustCreateParentDataset(t, client.MockClient)
 	d := newComplianceTestDriver(client)
 	d.config.ZFS.DetachedVolumesFromSnapshots = true
 	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
@@ -1934,6 +2032,7 @@ func TestCreateVolumeDetachedCopyRaceNeverMutatesWinner(t *testing.T) {
 func TestCreateVolumeCloneOwnershipUpdateMustPersistBeforeShareCreation(t *testing.T) {
 	ctx := context.Background()
 	client := &silentCloneOwnerUpdateMock{MockClient: truenas.NewMockClient()}
+	mustCreateParentDataset(t, client.MockClient)
 	d := newComplianceTestDriver(client)
 	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: "pool/parent/clone-source", Type: "FILESYSTEM", Refquota: testGiB,
