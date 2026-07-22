@@ -1253,7 +1253,7 @@ func TestNodeExpandVolumeRejectsRawBlockDeviceOwnedByAnotherVolume(t *testing.T)
 		return "192.0.2.10:3260", "iqn.2005-10.org.freenas.ctl:another-volume", nil
 	}
 	rescanCalls := 0
-	nodeISCSIRescan = func(string, string) error {
+	nodeISCSIRescan = func(context.Context, string, string) error {
 		rescanCalls++
 		return nil
 	}
@@ -1374,7 +1374,7 @@ func TestBlockBackedFilesystemStagePassesNormalizedMountFlags(t *testing.T) {
 
 	var gotFS string
 	var gotFlags []string
-	nodeFormatAndMount = func(_, _, fsType string, flags []string) error {
+	nodeFormatAndMount = func(_ context.Context, _, _, fsType string, flags []string) error {
 		gotFS = fsType
 		gotFlags = append([]string(nil), flags...)
 		return nil
@@ -1400,7 +1400,7 @@ func TestBlockBackedFilesystemStagePassesNormalizedMountFlags(t *testing.T) {
 
 	t.Run("NVMeoF", func(t *testing.T) {
 		gotFS, gotFlags = "", nil
-		nvmeConnectWithSubsystems = func(string, string, *util.NVMeoFConnectOptions, []util.NVMeSubsystem) (string, error) {
+		nvmeConnectWithSubsystems = func(context.Context, string, string, *util.NVMeoFConnectOptions, []util.NVMeSubsystem) (string, error) {
 			return "/dev/nvme9n1", nil
 		}
 		d := newTestNodeDriver(ShareTypeNVMeoF)
@@ -1471,7 +1471,7 @@ func TestStageISCSIVolumeRejectsMultipathOwnedDeviceBeforeMount(t *testing.T) {
 		return errors.New("iSCSI device " + devicePath + " is claimed by dm-multipath; iSCSI multipath is unsupported")
 	}
 	formatCalls := 0
-	nodeFormatAndMount = func(string, string, string, []string) error {
+	nodeFormatAndMount = func(context.Context, string, string, string, []string) error {
 		formatCalls++
 		return nil
 	}
@@ -1559,7 +1559,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		t.Setenv("FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT", `{"Subsystems":[{"NQN":"nqn.test:other","Name":"nvme2"}]}`)
 
 		originalConnect := nvmeConnectWithSubsystems
-		nvmeConnectWithSubsystems = func(_, _ string, _ *util.NVMeoFConnectOptions, subsystems []util.NVMeSubsystem) (string, error) {
+		nvmeConnectWithSubsystems = func(_ context.Context, _, _ string, _ *util.NVMeoFConnectOptions, subsystems []util.NVMeSubsystem) (string, error) {
 			require.Len(t, subsystems, 1)
 			return "/dev/null", nil
 		}
@@ -1685,7 +1685,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		getNVMeInfoFromDevice = func(string) (string, error) {
 			return "", errors.New("transient sysfs miss")
 		}
-		nvmeConnectWithSubsystems = func(string, string, *util.NVMeoFConnectOptions, []util.NVMeSubsystem) (string, error) {
+		nvmeConnectWithSubsystems = func(context.Context, string, string, *util.NVMeoFConnectOptions, []util.NVMeSubsystem) (string, error) {
 			return "/dev/null", nil
 		}
 

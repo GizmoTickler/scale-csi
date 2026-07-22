@@ -240,6 +240,20 @@ var (
 		[]string{"protocol"},
 	)
 
+	// deleteVolumeOrphanCleanupFailuresTotal counts DeleteVolume calls whose
+	// dataset was already gone but whose best-effort residual share cleanup failed.
+	// The delete still succeeds (CSI DeleteVolume is idempotent: volume-not-found is
+	// success) and the orphan reconcile sweeps the residue, so this is observable
+	// rather than fatal. Labeled by protocol so a stuck backend is identifiable.
+	deleteVolumeOrphanCleanupFailuresTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "delete_volume_orphan_cleanup_failures_total",
+			Help:      "Total DeleteVolume calls with an absent dataset whose residual share cleanup failed best-effort",
+		},
+		[]string{"protocol"},
+	)
+
 	// Circuit breaker metrics
 	circuitBreakerState = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -401,6 +415,10 @@ func RecordFencingTakeover(reason string) {
 
 func RecordFencingProvenanceOverflow(protocol string) {
 	fencingProvenanceOverflowTotal.WithLabelValues(protocol).Inc()
+}
+
+func RecordDeleteVolumeOrphanCleanupFailure(protocol string) {
+	deleteVolumeOrphanCleanupFailuresTotal.WithLabelValues(protocol).Inc()
 }
 
 // Circuit breaker metrics tracking

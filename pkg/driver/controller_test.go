@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -397,6 +398,80 @@ func TestCreateVolume(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestCreateVolumeLimitBelowAppliedDefaultIsRejected covers FIX 4a: when
+// required_bytes is omitted the 1GiB default is applied, and a limit_bytes below
+// that default must be rejected rather than silently provisioning over the limit.
+func TestCreateVolumeLimitBelowAppliedDefaultIsRejected(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "1.2.3.4"},
+		},
+		truenasClient: mockClient,
+	}
+	_, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "vol-limit-below-default",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{LimitBytes: 512 * 1024 * 1024},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, err.Error(), "exceeds limit")
+}
+
+// goneDatasetFailCleanupClient models a volume whose dataset is already absent
+// while backend share cleanup fails transiently: DatasetGet reports NotFound for
+// the target dataset, and the name/device fallbacks used by the best-effort
+// share cleanup return errors.
+type goneDatasetFailCleanupClient struct {
+	*truenas.MockClient
+	goneDataset string
+}
+
+func (c *goneDatasetFailCleanupClient) DatasetGet(ctx context.Context, name string) (*truenas.Dataset, error) {
+	if name == c.goneDataset {
+		return nil, &truenas.APIError{Code: -1, Message: "dataset not found"}
+	}
+	return c.MockClient.DatasetGet(ctx, name)
+}
+
+func (c *goneDatasetFailCleanupClient) NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*truenas.NVMeoFNamespace, error) {
+	return nil, errors.New("simulated backend failure resolving NVMe-oF namespace")
+}
+
+func (c *goneDatasetFailCleanupClient) ISCSITargetFindByName(ctx context.Context, name string) (*truenas.ISCSITarget, error) {
+	return nil, errors.New("simulated backend failure resolving iSCSI target")
+}
+
+// TestDeleteVolumeAbsentDatasetBestEffortCleanupFailureIsIdempotent covers FIX 3:
+// when the dataset is confirmed gone but residual share cleanup fails, DeleteVolume
+// must still succeed (CSI delete is idempotent — volume-not-found is success) and
+// surface the failure via a metric instead of returning Internal.
+func TestDeleteVolumeAbsentDatasetBestEffortCleanupFailureIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	client := &goneDatasetFailCleanupClient{MockClient: mock, goneDataset: "pool/parent/gone-volume"}
+	d := &Driver{
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client,
+	}
+	nvmeMetric := deleteVolumeOrphanCleanupFailuresTotal.WithLabelValues(string(ShareTypeNVMeoF))
+	iscsiMetric := deleteVolumeOrphanCleanupFailuresTotal.WithLabelValues(string(ShareTypeISCSI))
+	nvmeBefore := testutil.ToFloat64(nvmeMetric)
+	iscsiBefore := testutil.ToFloat64(iscsiMetric)
+
+	resp, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "gone-volume"})
+	require.NoError(t, err, "DeleteVolume must be idempotent when the dataset is already gone")
+	require.NotNil(t, resp)
+	assert.Equal(t, nvmeBefore+1, testutil.ToFloat64(nvmeMetric), "failed NVMe-oF cleanup must be observable")
+	assert.Equal(t, iscsiBefore+1, testutil.ToFloat64(iscsiMetric), "failed iSCSI cleanup must be observable")
+}
+
 func TestCreateVolumeFailureRecordsWarningEvent(t *testing.T) {
 	mockClient := truenas.NewMockClient()
 	mockClient.InjectError = errors.New("simulated TrueNAS failure")
@@ -556,19 +631,25 @@ func TestCreateVolumeRejectsNFSRawBlockBeforeMutation(t *testing.T) {
 	require.Error(t, lookupErr)
 }
 
-func TestDeleteVolumeMissingDatasetFailsClosedOnProtocolCleanupError(t *testing.T) {
+// TestDeleteVolumeMissingDatasetIsIdempotentOnProtocolCleanupError covers FIX 3:
+// CSI DeleteVolume is idempotent — a volume whose dataset is already gone is a
+// successful delete. A best-effort residual share cleanup failure must therefore
+// be surfaced via a metric (and left to the orphan reconcile) rather than failing
+// the RPC with Internal.
+func TestDeleteVolumeMissingDatasetIsIdempotentOnProtocolCleanupError(t *testing.T) {
 	client := &missingDatasetCleanupFailureMock{MockClient: truenas.NewMockClient()}
 	d := &Driver{
 		config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}},
 		truenasClient: client,
 	}
 
+	nvmeMetric := deleteVolumeOrphanCleanupFailuresTotal.WithLabelValues(string(ShareTypeNVMeoF))
+	before := testutil.ToFloat64(nvmeMetric)
+
 	response, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "missing-volume"})
-	require.Error(t, err)
-	assert.Nil(t, response)
-	assert.Equal(t, codes.Internal, status.Code(err))
-	assert.Contains(t, err.Error(), "orphaned protocol cleanup failed")
-	assert.Contains(t, err.Error(), "backend query unavailable")
+	require.NoError(t, err, "DeleteVolume must be idempotent: a gone dataset is a successful delete even if residual cleanup fails")
+	require.NotNil(t, response)
+	assert.Equal(t, before+1, testutil.ToFloat64(nvmeMetric), "the failed NVMe-oF cleanup must be surfaced via metric, not an error")
 }
 
 func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -91,6 +92,7 @@ type ReconcileActionFailure struct {
 type ReconcileReport struct {
 	OrphanVolumeCount          int
 	OrphanSnapshotCount        int
+	OrphanShareCount           int
 	SpentRestoreSnapshotCount  int
 	TombstoneSnapshotCount     int
 	OrphanVolumeBytes          int64
@@ -98,10 +100,12 @@ type ReconcileReport struct {
 	TombstoneSnapshotBytes     int64
 	OrphanVolumes              []ReconcileObject
 	OrphanSnapshots            []ReconcileObject
+	OrphanShares               []ReconcileObject
 	SpentRestoreSnapshots      []SpentRestoreSnapshot
 	TombstoneSnapshots         []ReconcileObject
 	DeletedVolumes             []string
 	DeletedSnapshots           []string
+	DeletedShares              []string
 	DeletedSpentRestoreObjects []string
 	DeletedTombstones          []string
 	SkippedDeletes             []ReconcileActionFailure
@@ -356,6 +360,14 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		return report, ctxErr
 	}
 
+	// Orphaned-share detection (a share whose dataset is gone) always runs so the
+	// residue is visible even in dry-run; deletion stays gated by opts.Delete.
+	d.detectOrphanedShares(ctx, kubeState, &report)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		RecordReconcileFailure("orphan_share_detection")
+		return report, ctxErr
+	}
+
 	logAction := "[DRY RUN] would delete"
 	if opts.Delete {
 		logAction = "will attempt guarded delete of"
@@ -367,6 +379,10 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	for _, orphan := range report.OrphanVolumes {
 		klog.Infof("Orphan reconcile: %s managed volume %s (backend=%s pv=%s age=%v bytes=%d)",
 			logAction, orphan.ID, orphan.BackendID, orphan.PVName, orphan.Age, orphan.Bytes)
+	}
+	for _, orphan := range report.OrphanShares {
+		klog.Infof("Orphan reconcile: %s orphaned share %s (backend=%s volume=%s)",
+			logAction, orphan.ID, orphan.BackendID, orphan.SourceVolumeID)
 	}
 	for _, tombstone := range report.TombstoneSnapshots {
 		klog.Infof("Orphan reconcile: %s released deferred-delete tombstone %s (age=%v)",
@@ -422,6 +438,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		RecordReconcileFailure("delete")
 		return report, err
 	}
+	d.deleteOrphanedShares(ctx, &report, d.config.Reconcile.Delete.MaxPerRun)
 	return report, nil
 }
 
@@ -436,6 +453,92 @@ func reconcileSnapshotHandle(snapshot *truenas.Snapshot) (string, bool) {
 		return snapshot.Name, true
 	}
 	return "", false
+}
+
+// nfsShareCommentDatasetName extracts the backing dataset name from a CSI-managed
+// NFS share comment of the form "truenas-csi (<driverName>): <datasetName>". The
+// boolean is false when the comment is not a CSI share comment for THIS driver
+// instance, so foreign shares are never classified or touched.
+func (d *Driver) nfsShareCommentDatasetName(comment string) (string, bool) {
+	prefix := "truenas-csi (" + d.name + "): "
+	if !strings.HasPrefix(comment, prefix) {
+		return "", false
+	}
+	datasetName := strings.TrimSpace(strings.TrimPrefix(comment, prefix))
+	if datasetName == "" {
+		return "", false
+	}
+	return datasetName, true
+}
+
+// detectOrphanedShares finds CSI-managed backend shares whose backing dataset is
+// confirmed absent. DeleteVolume removes the share before the dataset, so a share
+// that outlives its dataset is residue from an interrupted delete; sweeping it
+// keeps that residue from being silently permanent. A share still referenced by a
+// live PersistentVolume is never classified: an absent dataset under a live PV is
+// anomalous and must be surfaced, not "fixed" by deleting the share. Detection is
+// read-only; deletion happens in the guarded delete phase.
+func (d *Driver) detectOrphanedShares(ctx context.Context, kubeState *kubernetesReconcileState, report *ReconcileReport) {
+	shares, err := d.truenasClient.NFSShareList(ctx)
+	if err != nil {
+		RecordReconcileFailure("list_backend_shares")
+		klog.Warningf("Orphan reconcile: failed to list NFS shares for orphan detection: %v", err)
+		return
+	}
+	for _, share := range shares {
+		if share == nil {
+			continue
+		}
+		datasetName, ok := d.nfsShareCommentDatasetName(share.Comment)
+		if !ok {
+			continue
+		}
+		volumeID := path.Base(datasetName)
+		if kubeState != nil {
+			if _, live := kubeState.volumeHandles[volumeID]; live {
+				continue
+			}
+		}
+		if _, getErr := d.truenasClient.DatasetGet(ctx, datasetName); getErr == nil {
+			continue // dataset still present: the share is not orphaned
+		} else if !truenas.IsNotFoundError(getErr) {
+			klog.Warningf("Orphan reconcile: skipping NFS share %d orphan check for %s: dataset lookup failed: %v", share.ID, datasetName, getErr)
+			continue
+		}
+		report.OrphanShares = append(report.OrphanShares, ReconcileObject{
+			ID:             datasetName,
+			BackendID:      strconv.Itoa(share.ID),
+			SourceVolumeID: volumeID,
+		})
+	}
+	sort.Slice(report.OrphanShares, func(i, j int) bool { return report.OrphanShares[i].ID < report.OrphanShares[j].ID })
+	report.OrphanShareCount = len(report.OrphanShares)
+}
+
+// deleteOrphanedShares removes shares detected by detectOrphanedShares, bounded
+// by the per-run deletion cap. Each share's dataset absence is re-confirmed
+// immediately before mutation so a dataset recreated after detection is never
+// orphaned out from under a live volume.
+func (d *Driver) deleteOrphanedShares(ctx context.Context, report *ReconcileReport, maxPerRun int) {
+	for _, orphan := range report.OrphanShares {
+		if maxPerRun > 0 && len(report.DeletedShares) >= maxPerRun {
+			break
+		}
+		shareID, err := strconv.Atoi(orphan.BackendID)
+		if err != nil || shareID <= 0 {
+			continue
+		}
+		if _, getErr := d.truenasClient.DatasetGet(ctx, orphan.ID); getErr == nil || !truenas.IsNotFoundError(getErr) {
+			d.recordReconcileSkip(report, "share", orphan.BackendID, "dataset reappeared or lookup failed before delete")
+			continue
+		}
+		if delErr := d.truenasClient.NFSShareDelete(ctx, shareID); delErr != nil && !truenas.IsNotFoundError(delErr) {
+			d.recordReconcileObjectFailure("share", orphan.BackendID, delErr)
+			continue
+		}
+		report.DeletedShares = append(report.DeletedShares, orphan.ID)
+		klog.Infof("Orphan reconcile: deleted orphaned NFS share %d (dataset %s absent)", shareID, orphan.ID)
+	}
 }
 
 func snapshotDeletePassBlockReason(state *kubernetesReconcileState, managedBackendSnapshotCount int) string {

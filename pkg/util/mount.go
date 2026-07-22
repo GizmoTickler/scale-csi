@@ -39,7 +39,16 @@ type MountInfo struct {
 // GetMountInfo returns the backing source, filesystem type, and effective
 // options for an exact mountpoint.
 func GetMountInfo(target string) (MountInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	return GetMountInfoWithContext(context.Background(), target)
+}
+
+// GetMountInfoWithContext is GetMountInfo bounded by the inbound context's
+// deadline as well as the configured mount timeout.
+func GetMountInfoWithContext(ctx context.Context, target string) (MountInfo, error) {
+	ctx, cancel, err := commandContext(ctx, getMountTimeout())
+	if err != nil {
+		return MountInfo{}, err
+	}
 	defer cancel()
 
 	output, err := exec.CommandContext(
@@ -116,7 +125,16 @@ func parseMountInfo(reader io.Reader) ([]MountInfo, error) {
 
 // IsMounted checks if a path is currently mounted.
 func IsMounted(path string) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	return IsMountedWithContext(context.Background(), path)
+}
+
+// IsMountedWithContext is IsMounted bounded by the inbound context's deadline as
+// well as the configured mount timeout.
+func IsMountedWithContext(ctx context.Context, path string) (bool, error) {
+	ctx, cancel, err := commandContext(ctx, getMountTimeout())
+	if err != nil {
+		return false, err
+	}
 	defer cancel()
 
 	// Use findmnt to check mount status
@@ -136,6 +154,12 @@ func IsMounted(path string) (bool, error) {
 
 // Mount mounts a source to a target with the given filesystem type and options.
 func Mount(source, target, fsType string, options []string) error {
+	return MountWithContext(context.Background(), source, target, fsType, options)
+}
+
+// MountWithContext is Mount bounded by the inbound context's deadline as well as
+// the configured mount timeout.
+func MountWithContext(ctx context.Context, source, target, fsType string, options []string) error {
 	klog.V(4).Infof("Mounting %s to %s (fsType=%s, options=%v)", source, target, fsType, options)
 	if fsType != "" && fsType != "nfs" {
 		if err := validateBlockFilesystemType(fsType); err != nil {
@@ -143,7 +167,10 @@ func Mount(source, target, fsType string, options []string) error {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	ctx, cancel, err := commandContext(ctx, getMountTimeout())
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	args := []string{}
@@ -166,18 +193,32 @@ func Mount(source, target, fsType string, options []string) error {
 
 // MountNFS mounts an NFS share.
 func MountNFS(source, target string, options []string) error {
+	return MountNFSWithContext(context.Background(), source, target, options)
+}
+
+// MountNFSWithContext is MountNFS bounded by the inbound context's deadline.
+func MountNFSWithContext(ctx context.Context, source, target string, options []string) error {
 	// Add NFS-specific default options
 	nfsOptions := []string{"nfsvers=4"}
 	nfsOptions = append(nfsOptions, options...)
 
-	return Mount(source, target, "nfs", nfsOptions)
+	return MountWithContext(ctx, source, target, "nfs", nfsOptions)
 }
 
 // BindMount creates a bind mount.
 func BindMount(source, target string, options []string) error {
+	return BindMountWithContext(context.Background(), source, target, options)
+}
+
+// BindMountWithContext is BindMount bounded by the inbound context's deadline as
+// well as the configured mount timeout.
+func BindMountWithContext(ctx context.Context, source, target string, options []string) error {
 	klog.V(4).Infof("Bind mounting %s to %s", source, target)
 
-	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	ctx, cancel, err := commandContext(ctx, getMountTimeout())
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	// Use "-o bind" instead of "--bind" for BusyBox compatibility
@@ -373,20 +414,26 @@ func isNetworkFilesystem(fsType string) bool {
 
 // FormatAndMount formats a device and mounts it.
 func FormatAndMount(devicePath, target, fsType string, options []string) error {
+	return FormatAndMountWithContext(context.Background(), devicePath, target, fsType, options)
+}
+
+// FormatAndMountWithContext is FormatAndMount bounded by the inbound context's
+// deadline as well as the configured format/mount timeouts.
+func FormatAndMountWithContext(ctx context.Context, devicePath, target, fsType string, options []string) error {
 	klog.V(4).Infof("FormatAndMount: device=%s, target=%s, fsType=%s", devicePath, target, fsType)
 	if err := validateBlockFilesystemType(fsType); err != nil {
 		return err
 	}
 
 	// Check if already formatted
-	existingFS, err := GetFilesystemType(devicePath)
+	existingFS, err := GetFilesystemTypeWithContext(ctx, devicePath)
 	if err != nil {
 		return fmt.Errorf("failed to get filesystem type for %s: %w", devicePath, err)
 	}
 
 	if existingFS == "" {
 		// Format the device
-		if err := FormatDevice(devicePath, fsType); err != nil {
+		if err := FormatDeviceWithContext(ctx, devicePath, fsType); err != nil {
 			return err
 		}
 	} else if existingFS != fsType {
@@ -394,17 +441,26 @@ func FormatAndMount(devicePath, target, fsType string, options []string) error {
 	}
 
 	// Mount the device
-	return Mount(devicePath, target, fsType, options)
+	return MountWithContext(ctx, devicePath, target, fsType, options)
 }
 
 // FormatDevice formats a block device with the given filesystem type.
 func FormatDevice(devicePath, fsType string) error {
+	return FormatDeviceWithContext(context.Background(), devicePath, fsType)
+}
+
+// FormatDeviceWithContext is FormatDevice bounded by the inbound context's
+// deadline as well as the configured format timeout.
+func FormatDeviceWithContext(ctx context.Context, devicePath, fsType string) error {
 	klog.Infof("Formatting device %s with %s", devicePath, fsType)
 	if err := validateBlockFilesystemType(fsType); err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), getFormatTimeout())
+	ctx, cancel, err := commandContext(ctx, getFormatTimeout())
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	var cmd *exec.Cmd
@@ -438,7 +494,16 @@ func validateBlockFilesystemType(fsType string) error {
 
 // GetFilesystemType returns the filesystem type of a device.
 func GetFilesystemType(devicePath string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	return GetFilesystemTypeWithContext(context.Background(), devicePath)
+}
+
+// GetFilesystemTypeWithContext is GetFilesystemType bounded by the inbound
+// context's deadline as well as the configured mount timeout.
+func GetFilesystemTypeWithContext(ctx context.Context, devicePath string) (string, error) {
+	ctx, cancel, err := commandContext(ctx, getMountTimeout())
+	if err != nil {
+		return "", err
+	}
 	defer cancel()
 
 	// Keep stdout separate from stderr: the success path returns stdout as the
@@ -484,21 +549,30 @@ func GetFilesystemStats(path string) (*FilesystemStats, error) {
 
 // ResizeFilesystem resizes the filesystem on a mounted path.
 func ResizeFilesystem(mountPath string) error {
+	return ResizeFilesystemWithContext(context.Background(), mountPath)
+}
+
+// ResizeFilesystemWithContext is ResizeFilesystem bounded by the inbound
+// context's deadline as well as the configured format timeout.
+func ResizeFilesystemWithContext(ctx context.Context, mountPath string) error {
 	klog.Infof("Resizing filesystem at %s", mountPath)
 
 	// Get the device path
-	devicePath, err := GetDeviceFromMountPoint(mountPath)
+	devicePath, err := GetDeviceFromMountPointWithContext(ctx, mountPath)
 	if err != nil {
 		return fmt.Errorf("failed to get device from mount point: %w", err)
 	}
 
 	// Get filesystem type
-	fsType, err := GetFilesystemType(devicePath)
+	fsType, err := GetFilesystemTypeWithContext(ctx, devicePath)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), getFormatTimeout())
+	ctx, cancel, err := commandContext(ctx, getFormatTimeout())
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	// Resize based on filesystem type
@@ -524,7 +598,16 @@ func ResizeFilesystem(mountPath string) error {
 
 // GetDeviceFromMountPoint returns the device path for a mount point.
 func GetDeviceFromMountPoint(mountPath string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	return GetDeviceFromMountPointWithContext(context.Background(), mountPath)
+}
+
+// GetDeviceFromMountPointWithContext is GetDeviceFromMountPoint bounded by the
+// inbound context's deadline as well as the configured mount timeout.
+func GetDeviceFromMountPointWithContext(ctx context.Context, mountPath string) (string, error) {
+	ctx, cancel, err := commandContext(ctx, getMountTimeout())
+	if err != nil {
+		return "", err
+	}
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "findmnt", "--first-only", "-n", "-o", "SOURCE", mountPath)

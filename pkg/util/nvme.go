@@ -71,20 +71,35 @@ func NVMeoFConnect(nqn, transportURI string) (string, error) {
 
 // NVMeoFConnectWithOptions connects to an NVMe-oF target with configurable options.
 func NVMeoFConnectWithOptions(nqn, transportURI string, opts *NVMeoFConnectOptions) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
-	defer cancel()
+	return NVMeoFConnectWithOptionsContext(context.Background(), nqn, transportURI, opts)
+}
 
-	subsystems, err := ListNVMeSubsystems(ctx)
+// NVMeoFConnectWithOptionsContext is NVMeoFConnectWithOptions bounded by the
+// inbound context's deadline as well as the configured NVMe timeout.
+func NVMeoFConnectWithOptionsContext(ctx context.Context, nqn, transportURI string, opts *NVMeoFConnectOptions) (string, error) {
+	listCtx, cancel, err := commandContext(ctx, getNVMeTimeout())
 	if err != nil {
-		klog.Warningf("Failed to list NVMe subsystems: %v", err)
+		return "", err
+	}
+	subsystems, listErr := ListNVMeSubsystems(listCtx)
+	cancel()
+	if listErr != nil {
+		klog.Warningf("Failed to list NVMe subsystems: %v", listErr)
 	}
 
-	return NVMeoFConnectWithOptionsAndSubsystems(nqn, transportURI, opts, subsystems)
+	return NVMeoFConnectWithOptionsAndSubsystemsContext(ctx, nqn, transportURI, opts, subsystems)
 }
 
 // NVMeoFConnectWithOptionsAndSubsystems connects to an NVMe-oF target using a
 // pre-fetched subsystem list.
 func NVMeoFConnectWithOptionsAndSubsystems(nqn, transportURI string, opts *NVMeoFConnectOptions, subsystems []NVMeSubsystem) (string, error) {
+	return NVMeoFConnectWithOptionsAndSubsystemsContext(context.Background(), nqn, transportURI, opts, subsystems)
+}
+
+// NVMeoFConnectWithOptionsAndSubsystemsContext connects to an NVMe-oF target
+// using a pre-fetched subsystem list, bounded by the inbound context's deadline
+// as well as the overall connect timeout.
+func NVMeoFConnectWithOptionsAndSubsystemsContext(ctx context.Context, nqn, transportURI string, opts *NVMeoFConnectOptions, subsystems []NVMeSubsystem) (string, error) {
 	klog.V(4).Infof("NVMeoFConnect: nqn=%s, transportURI=%s", nqn, transportURI)
 
 	// Apply defaults
@@ -94,7 +109,10 @@ func NVMeoFConnectWithOptionsAndSubsystems(nqn, transportURI string, opts *NVMeo
 	}
 
 	// Create a context with overall timeout for the connect operation
-	ctx, cancel := context.WithTimeout(context.Background(), timeout+getNVMeTimeout())
+	ctx, cancel, err := commandContext(ctx, timeout+getNVMeTimeout())
+	if err != nil {
+		return "", err
+	}
 	defer cancel()
 
 	// Parse the transport URI
@@ -536,6 +554,12 @@ func GetNVMeDevicePath(nqn string) (string, error) {
 
 // NVMeRescan rescans the controller that owns a namespace device.
 func NVMeRescan(devicePath string) error {
+	return NVMeRescanWithContext(context.Background(), devicePath)
+}
+
+// NVMeRescanWithContext is NVMeRescan bounded by the inbound context's deadline
+// as well as the configured NVMe timeout.
+func NVMeRescanWithContext(ctx context.Context, devicePath string) error {
 	deviceName := filepath.Base(devicePath)
 	matches := nvmeDeviceRegex.FindStringSubmatch(deviceName)
 	if len(matches) != 2 {
@@ -543,7 +567,10 @@ func NVMeRescan(devicePath string) error {
 	}
 	controllerPath := "/dev/" + matches[1]
 
-	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
+	ctx, cancel, err := commandContext(ctx, getNVMeTimeout())
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nvme", "ns-rescan", controllerPath)

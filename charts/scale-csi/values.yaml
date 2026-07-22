@@ -8,9 +8,18 @@ csiDriverName: csi.scale.io
 # existing installation unless the matching datasets are deliberately adopted.
 driverInstanceId: ""
 
-# Backend publication fencing defaults off. For upgrades, roll the node image
-# first, wait for every CSINode to re-register, then select "additive". Select
-# "strict" only after the deferred-fencing metric remains zero.
+# fencing.mode selects BACKEND publication enforcement only. CSI publication
+# tracking (the durable per-volume publication records that enforce single-node
+# exclusivity, same-node idempotency, stale-record takeover, and empty-node-id
+# unpublish) is ALWAYS on in every mode, so the default is spec-conformant.
+#   off      - records only; the transport allowlists are left untouched
+#              (pre-v1.2.23 static-allowlist behavior, plus publication tracking).
+#   additive - records + per-node identities added to the allowlists without
+#              removing configured static identities (rolling-upgrade migration).
+#   strict   - records are the sole allowlist.
+# For upgrades, roll the node image first, wait for every CSINode to re-register,
+# then select "additive". Select "strict" only after the deferred-fencing metric
+# remains zero.
 fencing:
   mode: "off"
   # Timeout for one background startup convergence attempt. Failures retry.
