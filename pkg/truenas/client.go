@@ -632,7 +632,7 @@ func (c *Connection) connect(ctx context.Context) error {
 		c.mu.RLock()
 		connected := !c.stopped && c.conn.Load() != nil && c.authenticated
 		if err == nil && !connected {
-			err = fmt.Errorf("connection lost during authentication")
+			err = fmt.Errorf("%w: connection lost during authentication", ErrTransportFailure)
 		}
 		if err != nil {
 			atomic.StoreInt32(&c.connState, int32(stateDisconnected))
@@ -744,7 +744,7 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 			c.mu.Unlock()
 			c.cleanupConnection(handles.generation, fmt.Errorf("connection lost during authentication"))
 			handles.waitGroup.Wait()
-			lastErr = fmt.Errorf("connection lost during authentication")
+			lastErr = fmt.Errorf("%w: connection lost during authentication", ErrTransportFailure)
 			continue
 		}
 		c.authenticated = true
@@ -1049,7 +1049,10 @@ func (c *Connection) callWithGeneration(ctx context.Context, generation uint64, 
 	c.mu.Lock()
 	if generation != c.generation || c.stopped || c.conn.Load() == nil || (!allowUnauthenticated && !c.authenticated) {
 		c.mu.Unlock()
-		return nil, fmt.Errorf("connection lost before request was sent")
+		// Pre-send failure: the request never reached the wire, so the server
+		// cannot have applied it. Wrap so IsConnectionError classifies it as a
+		// transport failure and the Call loop retries / records breaker failure.
+		return nil, fmt.Errorf("%w: connection lost before request was sent", ErrTransportFailure)
 	}
 	c.messageID++
 	id := c.messageID

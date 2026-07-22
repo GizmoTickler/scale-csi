@@ -316,6 +316,40 @@ type ReconcileConfig struct {
 	// SpentRestore gates the VolSync-specific spent-restore VolumeSnapshot
 	// classification (the volsync-*-dst-dest* reaper).
 	SpentRestore ReconcileSpentRestoreConfig `yaml:"spentRestore"`
+
+	// Bookkeeping relocates the driver's durable bookkeeping (tombstone ledger
+	// and in-flight creation markers) off the inheritable CSI parent dataset onto
+	// a dedicated child dataset, so its local properties no longer bloat every
+	// descendant snapshot (Batch 14, Fix 4b).
+	Bookkeeping ReconcileBookkeepingConfig `yaml:"bookkeeping"`
+}
+
+// ReconcileBookkeepingConfig gates the bookkeeping-dataset relocation (Fix 4b).
+// The relocation moves the tombstone ledger and in-flight markers from the CSI
+// parent dataset — whose user properties ZFS inherits into EVERY child dataset
+// and snapshot — onto a dedicated child dataset that is never used as a volume
+// parent, so its properties inherit to nothing. This is data-safety bookkeeping,
+// so the relocation defaults to OFF (behavior identical to v1.2.28) and reads
+// consult BOTH locations while any parent-side entries remain.
+type ReconcileBookkeepingConfig struct {
+	// Enabled writes new bookkeeping to the dedicated child dataset and reads
+	// from both it and the parent (default: false). When false, all bookkeeping
+	// stays on the parent dataset exactly as before.
+	Enabled *bool `yaml:"enabled"`
+
+	// CleanupParent permits removing bookkeeping entries from the parent dataset
+	// once they have been confirmed copied to the child (default: false). Until
+	// this is enabled the migration is strictly additive and lossless: parent
+	// entries are copied but never deleted, so a mixed-version rollout (an older
+	// controller still reading the parent) keeps working.
+	CleanupParent bool `yaml:"cleanupParent"`
+}
+
+// EnabledOrDefault reports whether the bookkeeping-dataset relocation is active.
+// An unset (nil) value defaults to false, preserving the v1.2.28 on-parent
+// behavior for config files and tests that predate the flag.
+func (c ReconcileBookkeepingConfig) EnabledOrDefault() bool {
+	return c.Enabled != nil && *c.Enabled
 }
 
 // ReconcileSpentRestoreConfig gates the spent-restore VolumeSnapshot reaper.

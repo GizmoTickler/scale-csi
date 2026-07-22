@@ -218,21 +218,48 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		d.reconcileStalePublicationRecords(ctx, datasets, kubeState, time.Now())
 	}
 
-	// The parent dataset carries the driver's durable bookkeeping: in-flight
-	// creation markers and the tombstone ledger. Reading it can fail without
+	// The driver's durable bookkeeping — in-flight creation markers and the
+	// tombstone ledger — lives on the parent dataset, and (Fix 4b, when enabled)
+	// also on a dedicated bookkeeping child dataset. Reading can fail without
 	// aborting the pass — tombstone reaping then simply stays empty (fail-safe;
 	// no ledger, no reaping) and the sweeps are skipped.
 	var ledger map[string]tombstoneLedgerEntry
+	bookkeepingReadable := false
 	parentDataset, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
 	if parentErr != nil {
 		d.recordReconcileObjectFailure("parent_bookkeeping", d.parentDatasetName(), parentErr)
 	} else {
+		bookkeepingReadable = true
 		ledger = tombstoneLedgerFromDataset(parentDataset)
 		// Bookkeeping hygiene runs on every pass regardless of opts.Delete: these
 		// properties are driver-internal provenance records, not user data, and
 		// each removal requires proof of staleness gathered live below.
 		d.sweepStaleInflightMarkers(ctx, parentDataset, time.Now(), minOrphanAge)
-		d.sweepOrphanedTombstoneLedger(ctx, ledger, time.Now(), minOrphanAge)
+	}
+	if d.bookkeepingEnabled() {
+		// Migrate any parent-side bookkeeping toward the dedicated child dataset
+		// (idempotent; parent removal is gated by CleanupParent). Runs before the
+		// dual-read merge so a freshly migrated entry is visible from the child.
+		d.migrateParentBookkeeping(ctx, parentDataset)
+		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+		if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
+			d.recordReconcileObjectFailure("bookkeeping", d.bookkeepingDatasetName(), bkErr)
+		} else {
+			bookkeepingReadable = true
+			// Dual-read: merge the child's ledger entries over the parent's. Keys
+			// are content-hashed snapshot IDs, so a migrated entry is identical in
+			// both locations and the merge is a lossless union.
+			for key, entry := range tombstoneLedgerFromDataset(bookkeeping) {
+				if ledger == nil {
+					ledger = make(map[string]tombstoneLedgerEntry)
+				}
+				ledger[key] = entry
+			}
+			d.sweepStaleInflightMarkers(ctx, bookkeeping, time.Now(), minOrphanAge)
+		}
+	}
+	if bookkeepingReadable {
+		d.sweepOrphanedTombstoneLedger(ctx, ledger, listedSnapshotIDs(snapshots, tombstones), time.Now(), minOrphanAge)
 	}
 
 	now := time.Now()
@@ -251,6 +278,21 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 			if ds.GetCreationTime() <= 0 {
 				klog.Warningf("Orphan reconcile: skipping managed volume %s because its creation time is unavailable", ds.Name)
 			}
+			continue
+		}
+		// The listing strips property source, so an inherited managed_resource — a
+		// user dataset nested under a live CSI volume — is indistinguishable from a
+		// local stamp here. Re-fetch the candidate with source and require a LOCAL
+		// managed_resource: only then did this driver create the dataset. The
+		// candidate set is small (already filtered to non-live, age-eligible
+		// datasets), which bounds the extra API cost.
+		localManaged, getErr := d.datasetHasLocalManagedResource(ctx, ds.Name)
+		if getErr != nil {
+			d.recordReconcileObjectFailure("orphan_volume_classify", ds.Name, getErr)
+			continue
+		}
+		if !localManaged {
+			klog.V(4).Infof("Orphan reconcile: skipping %s because managed_resource is inherited, not local", ds.Name)
 			continue
 		}
 		pvName := ds.UserProperties[PropCSIVolumeName].Value
@@ -362,7 +404,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	// sweeping still run. Deletion remains gated by opts.Delete and the
 	// per-object revalidation in deleteDetachedOrphans.
 	if d.config.Reconcile.SpentRestore.EnabledOrDefault() {
-		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState)
+		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState, &report)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			RecordReconcileFailure("spent_restore_classification")
 			return report, ctxErr
@@ -738,7 +780,19 @@ func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *Reconcile
 		d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("find iSCSI extent %s: %w", shareName, err))
 		return
 	}
-	if target == nil && extent == nil {
+	// Canonical teardown also removes the per-volume fencing initiator group. The
+	// dataset is gone, so resolve it by its ownership comment rather than a stored
+	// property ID; sweeping must delete the same object set or one initiator group
+	// leaks per swept volume.
+	var initiatorGroup *truenas.ISCSIInitiator
+	if d.config.Fencing.Enabled() {
+		initiatorGroup, err = d.resolveFencingInitiatorGroup(ctx, nil, orphan.ID)
+		if err != nil {
+			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("find iSCSI initiator group for %s: %w", orphan.ID, err))
+			return
+		}
+	}
+	if target == nil && extent == nil && initiatorGroup == nil {
 		report.DeletedShares = append(report.DeletedShares, orphan.ID)
 		klog.Infof("Orphan reconcile: orphaned iSCSI share for dataset %s already absent", orphan.ID)
 		return
@@ -765,6 +819,12 @@ func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *Reconcile
 	if target != nil {
 		if delErr := d.truenasClient.ISCSITargetDelete(ctx, target.ID, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
 			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI target %d: %w", target.ID, delErr))
+			return
+		}
+	}
+	if initiatorGroup != nil {
+		if delErr := d.truenasClient.ISCSIInitiatorDelete(ctx, initiatorGroup.ID); delErr != nil && !truenas.IsNotFoundError(delErr) {
+			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI initiator group %d: %w", initiatorGroup.ID, delErr))
 			return
 		}
 	}
@@ -802,6 +862,23 @@ func (d *Driver) deleteOrphanedNVMeoFShare(ctx context.Context, report *Reconcil
 		}
 		if delErr := d.truenasClient.NVMeoFNamespaceDelete(ctx, namespace.ID); delErr != nil && !truenas.IsNotFoundError(delErr) {
 			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete NVMe-oF namespace %d: %w", namespace.ID, delErr))
+			return
+		}
+	}
+	// Canonical teardown removes the port-subsystem associations before the
+	// subsystem; sweeping must do the same or the subsystem delete can fail every
+	// pass (or dangle) while the association remains.
+	associations, assocErr := d.truenasClient.NVMeoFPortSubsysList(ctx)
+	if assocErr != nil && !truenas.IsNotFoundError(assocErr) {
+		d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("list NVMe-oF port-subsystem associations for subsystem %d: %w", subsys.ID, assocErr))
+		return
+	}
+	for _, association := range truenas.NVMeoFPortSubsysFilterBySubsystem(associations, subsys.ID) {
+		if association == nil {
+			continue
+		}
+		if delErr := d.truenasClient.NVMeoFPortSubsysDelete(ctx, association.ID); delErr != nil && !truenas.IsNotFoundError(delErr) {
+			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete NVMe-oF port-subsystem %d: %w", association.ID, delErr))
 			return
 		}
 	}
@@ -898,28 +975,32 @@ func (d *Driver) listAllManagedDatasetsPaged(ctx context.Context) ([]*truenas.Da
 	}
 }
 
-// listAllManagedSnapshots pages the backend once and partitions the parent's
-// snapshots into live CSI-managed snapshots and the driver's own tombstone-named
-// deferred-delete markers. Tombstones are never CSI snapshots (their identity is
-// stripped at rename), so they must be gathered separately for GC.
+// listAllManagedSnapshots fetches the parent's snapshots in a SINGLE round trip
+// and partitions them in memory into live CSI-managed snapshots and the driver's
+// own tombstone-named deferred-delete markers. Tombstones are never CSI snapshots
+// (their identity is stripped at rename), so they must be gathered separately for
+// GC.
+//
+// The previous implementation re-called SnapshotListAll once per page. On TrueNAS
+// 26.0 the zfs.resource.snapshot.query backend offers no server-side filter or
+// pagination, so every call transferred (and re-sorted) the ENTIRE snapshot set
+// just to slice one page out — O(N²) wire volume per reconcile pass. Fetching the
+// full set once (limit=0) and partitioning in memory collapses that to a single
+// transfer; sorting/paging is then pure memory work.
 func (d *Driver) listAllManagedSnapshots(ctx context.Context) (managed, tombstones []*truenas.Snapshot, err error) {
-	for offset := 0; ; offset += reconcileListPageSize {
-		page, err := d.truenasClient.SnapshotListAll(ctx, d.config.ZFS.DatasetParentName, reconcileListPageSize, offset)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, snap := range page {
-			switch {
-			case isCSISnapshot(snap):
-				managed = append(managed, snap)
-			case isSnapshotTombstone(snap):
-				tombstones = append(tombstones, snap)
-			}
-		}
-		if len(page) < reconcileListPageSize {
-			return managed, tombstones, nil
+	all, err := d.truenasClient.SnapshotListAll(ctx, d.config.ZFS.DatasetParentName, 0, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, snap := range all {
+		switch {
+		case isCSISnapshot(snap):
+			managed = append(managed, snap)
+		case isSnapshotTombstone(snap):
+			tombstones = append(tombstones, snap)
 		}
 	}
+	return managed, tombstones, nil
 }
 
 func (d *Driver) kubernetesReconcileClients() (
@@ -1045,10 +1126,32 @@ func (d *Driver) loadKubernetesReconcileState(ctx context.Context) (*kubernetesR
 	return state, nil
 }
 
+// spentRestoreDeferredPVCPhase reports whether a source PVC that EXISTS in the
+// given phase indicates an incomplete or stalled restore whose backend snapshot
+// must NOT be reaped. Pending and Lost (and any unknown/empty phase) defer
+// conservatively; Bound does not (the restore completed) and neither does
+// "Released" (the restore's PV was already let go — torn down), so in both those
+// cases the snapshot is genuinely spent. A missing PVC is handled by the caller.
+func spentRestoreDeferredPVCPhase(phase corev1.PersistentVolumeClaimPhase) bool {
+	switch phase {
+	case corev1.ClaimBound:
+		return false
+	case corev1.ClaimPending, corev1.ClaimLost:
+		return true
+	}
+	// "Released" is a PV phase sometimes observed on a lingering PVC after its PV
+	// was released; it means the restore is torn down, so the snapshot is spent.
+	if phase == corev1.PersistentVolumeClaimPhase("Released") {
+		return false
+	}
+	return true
+}
+
 func (d *Driver) classifySpentRestoreSnapshots(
 	ctx context.Context,
 	now time.Time,
 	state *kubernetesReconcileState,
+	report *ReconcileReport,
 ) []SpentRestoreSnapshot {
 	if state == nil {
 		return nil
@@ -1084,8 +1187,23 @@ func (d *Driver) classifySpentRestoreSnapshots(
 			continue
 		}
 		pvc, exists := state.pvcs[namespacedName(snapshot.GetNamespace(), sourcePVC)]
-		if exists && pvc.Status.Phase == corev1.ClaimBound {
-			continue
+		if exists {
+			if pvc.Status.Phase == corev1.ClaimBound {
+				// Restore completed: the backend snapshot is spent and reclaimable.
+				continue
+			}
+			if spentRestoreDeferredPVCPhase(pvc.Status.Phase) {
+				// A PVC that exists in Pending, Lost, or an unknown phase means the
+				// restore is incomplete or stalled. The backend snapshot still backs
+				// it, so classifying it as spent could destroy an in-flight restore.
+				// Defer with an operator-visible reason. (A Released PVC means the
+				// restore's PV was already released — torn down — so it stays spent.)
+				klog.V(2).Infof("Orphan reconcile: deferring spent-restore snapshot %s/%s: source PVC %s is %s",
+					snapshot.GetNamespace(), snapshot.GetName(), sourcePVC, pvc.Status.Phase)
+				d.recordReconcileSkip(report, "spent-restore-snapshot", namespacedName(snapshot.GetNamespace(), snapshot.GetName()),
+					fmt.Sprintf("source PVC %s is %s (restore incomplete)", sourcePVC, pvc.Status.Phase))
+				continue
+			}
 		}
 		backendSnapshot, backendErr := d.findBackendSnapshotForHandle(ctx, content.snapshotHandle)
 		if backendErr != nil {
@@ -1513,7 +1631,7 @@ func (d *Driver) sweepStaleInflightMarkers(ctx context.Context, parent *truenas.
 		return
 	}
 	sort.Strings(staleKeys)
-	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), staleKeys); err != nil {
+	if err := d.removeBookkeepingProperties(ctx, staleKeys); err != nil {
 		d.recordReconcileObjectFailure("inflight_marker_sweep", d.parentDatasetName(), err)
 		return
 	}
@@ -1557,6 +1675,17 @@ func (d *Driver) sweepOrphanedReplicationJobs(ctx context.Context) error {
 		return fmt.Errorf("read parent dataset before replication job sweep: %w", err)
 	}
 	markers := d.liveCopyMarkers(parent)
+	if d.bookkeepingEnabled() {
+		// Dual-read: copy markers may live on the dedicated bookkeeping dataset.
+		// A marker in either location protects its in-flight job from being aborted.
+		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+		if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
+			return fmt.Errorf("read bookkeeping dataset before replication job sweep: %w", bkErr)
+		}
+		for dataset := range d.liveCopyMarkers(bookkeeping) {
+			markers[dataset] = struct{}{}
+		}
+	}
 
 	for _, job := range inScope {
 		reason := ""
@@ -1645,15 +1774,31 @@ func (d *Driver) runReplicationJobSweep(ctx context.Context) {
 // Age-gated on the recorded rename time so an in-progress DeleteSnapshot is
 // never raced. Swept entries are also dropped from the in-memory map so the
 // same pass cannot classify against them.
-func (d *Driver) sweepOrphanedTombstoneLedger(ctx context.Context, ledger map[string]tombstoneLedgerEntry, now time.Time, minAge time.Duration) {
+//
+// listedIDs is the set of snapshot IDs observed in THIS pass's single snapshot
+// listing. Existence is resolved against it first so the sweep no longer issues
+// a full SnapshotGet per ledger entry (each of which re-transferred the entire
+// parent snapshot payload on TrueNAS 26.0). A live SnapshotGet confirms only the
+// rare entry absent from the listing, preserving the exact not-found-vs-error
+// semantics without the per-entry payload cost.
+func (d *Driver) sweepOrphanedTombstoneLedger(ctx context.Context, ledger map[string]tombstoneLedgerEntry, listedIDs map[string]struct{}, now time.Time, minAge time.Duration) {
 	staleKeys := make([]string, 0)
 	for key, entry := range ledger {
+		if _, listed := listedIDs[entry.Snapshot]; listed {
+			// Tombstone present in this pass's listing: its provenance must stay so
+			// the reaper can still reclaim it. Never age out a live tombstone's entry.
+			continue
+		}
+		// Absent from the listing: confirm with a live lookup so a transient
+		// listing gap can never retire a live tombstone's provenance.
 		if _, err := d.truenasClient.SnapshotGet(ctx, entry.Snapshot); err == nil {
 			continue
 		} else if !truenas.IsNotFoundError(err) {
 			d.recordReconcileObjectFailure("tombstone_ledger_sweep", entry.Snapshot, err)
 			continue
 		}
+		// The snapshot is genuinely gone: age-gate so an in-progress DeleteSnapshot
+		// (crash window between ledger write and rename) is never raced.
 		if renamedAt, parseErr := time.Parse(time.RFC3339Nano, entry.RenamedAt); parseErr == nil && now.Sub(renamedAt) <= minAge {
 			continue
 		}
@@ -1663,7 +1808,7 @@ func (d *Driver) sweepOrphanedTombstoneLedger(ctx context.Context, ledger map[st
 		return
 	}
 	sort.Strings(staleKeys)
-	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), staleKeys); err != nil {
+	if err := d.removeBookkeepingProperties(ctx, staleKeys); err != nil {
 		d.recordReconcileObjectFailure("tombstone_ledger_sweep", d.parentDatasetName(), err)
 		return
 	}
@@ -1671,6 +1816,36 @@ func (d *Driver) sweepOrphanedTombstoneLedger(ctx context.Context, ledger map[st
 		delete(ledger, key)
 	}
 	klog.Infof("Orphan reconcile: retired %d orphaned tombstone ledger entries", len(staleKeys))
+}
+
+// listedSnapshotIDs builds the set of full snapshot IDs present in a reconcile
+// pass's snapshot listing (CSI-managed snapshots plus tombstone markers).
+func listedSnapshotIDs(snapshots, tombstones []*truenas.Snapshot) map[string]struct{} {
+	ids := make(map[string]struct{}, len(snapshots)+len(tombstones))
+	for _, snap := range snapshots {
+		if snap != nil {
+			ids[snap.ID] = struct{}{}
+		}
+	}
+	for _, snap := range tombstones {
+		if snap != nil {
+			ids[snap.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+// datasetHasLocalManagedResource re-fetches datasetName with property source and
+// reports whether managed_resource="true" is stamped LOCALLY on it. The reconcile
+// listing does not carry property source, so a dataset that merely inherits
+// managed_resource from a CSI-managed ancestor (e.g. a user dataset nested under
+// a live volume) must be re-fetched to avoid classifying it as a managed orphan.
+func (d *Driver) datasetHasLocalManagedResource(ctx context.Context, datasetName string) (bool, error) {
+	dataset, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		return false, err
+	}
+	return datasetHasLocalUserProperty(dataset, PropManagedResource, "true"), nil
 }
 
 func (d *Driver) revalidateOrphanVolume(
@@ -1684,6 +1859,11 @@ func (d *Driver) revalidateOrphanVolume(
 	}
 	if dataset == nil || dataset.UserProperties[PropManagedResource].Value != "true" {
 		return false, "backend volume is no longer CSI-managed"
+	}
+	// A dataset that only inherits managed_resource (source != "local") was never
+	// created by this driver; revalidation must not bless it for deletion.
+	if !datasetHasLocalUserProperty(dataset, PropManagedResource, "true") {
+		return false, "backend volume managed_resource is inherited, not local"
 	}
 	if path.Base(dataset.Name) != orphan.ID {
 		return false, "backend volume identity changed"
@@ -1767,8 +1947,16 @@ func (d *Driver) revalidateSpentRestoreSnapshot(
 	if err != nil && !missing {
 		return SpentRestoreSnapshot{}, false, fmt.Sprintf("source PVC revalidation failed: %v", err)
 	}
-	if err == nil && pvc.Status.Phase == corev1.ClaimBound {
-		return SpentRestoreSnapshot{}, false, "source PVC became Bound during revalidation"
+	if err == nil {
+		if pvc.Status.Phase == corev1.ClaimBound {
+			return SpentRestoreSnapshot{}, false, "source PVC became Bound during revalidation"
+		}
+		if spentRestoreDeferredPVCPhase(pvc.Status.Phase) {
+			// A PVC that exists in Pending, Lost, or an unknown phase means the
+			// restore is incomplete or stalled; the backend snapshot still backs it
+			// and must not be reaped. (Released stays spent: the PV was let go.)
+			return SpentRestoreSnapshot{}, false, fmt.Sprintf("source PVC %s is %s (restore incomplete)", sourcePVC, pvc.Status.Phase)
+		}
 	}
 	createdAt := snapshot.GetCreationTimestamp().Time
 	if createdAt.IsZero() || !createdAt.Equal(detected.CreationTime) {

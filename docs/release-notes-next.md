@@ -3,6 +3,73 @@
 This draft describes changes after v1.2.23. It is intentionally not a tag or a
 final version announcement.
 
+## Batch 14 (v1.2.29) — adversarial-verification fixes
+
+Six fixes from the 2026-07-22 dual-reviewer adversarial verification. All are
+behavior-preserving outside the scoped defects; every fix ships with regression
+tests that fail on v1.2.28 and pass after.
+
+- **Resilience — connection-loss errors now retry correctly.** Pre-send and
+  pre-authentication connection losses ("connection lost before request was
+  sent" / "connection lost during authentication") previously escaped the retry
+  classifier and were recorded as circuit-breaker *successes*, so a flapping
+  TrueNAS backend could fail to open the circuit and surface spurious hard
+  failures. These errors now wrap the transport-failure sentinel: the call loop
+  retries them and records a breaker failure.
+- **Availability — service-reload debouncer no longer starves.** The reload
+  debouncer used pure trailing-edge batching: a sustained request stream faster
+  than the window (e.g. an attach storm) reset the timer on every request and
+  postponed the iSCSI reload — and every caller blocked on it — indefinitely. It
+  now uses leading-window batching: the first request of a batch arms the timer
+  and later requests coalesce onto the same deadline, bounding worst-case reload
+  latency to one window.
+- **Correctness — orphan classifier ignores inherited `managed_resource`.** A
+  user dataset nested under a live CSI volume inherits `managed_resource=true`
+  and was misclassified as a CSI orphan (phantom report/metric entries and, under
+  delete mode, a burned `maxPerRun` slot every pass). The classifier and
+  revalidator now re-fetch candidates with property source and require a *local*
+  `managed_resource` stamp, matching the codebase's existing source discipline.
+- **Hygiene — orphan-share sweeps match canonical teardown.** The iSCSI sweep now
+  also deletes the per-volume fencing initiator group, and the NVMe-oF sweep
+  deletes port-subsystem associations before the subsystem, so sweeps no longer
+  leak one initiator group per swept volume or fail forever on a dangling
+  association.
+- **Data safety — spent-restore reaper defers incomplete restores.** A source PVC
+  that *exists* in Pending, Lost, or an unknown phase no longer counts as spent;
+  only a Bound PVC (restore completed) or an absent PVC (restore torn down) may
+  classify. Deferred snapshots log a line and record an operator-visible skip
+  reason. A Released PVC still classifies as spent (its PV was let go), so
+  existing VolSync teardown behavior is unchanged.
+- **Efficiency — snapshot query amplification (TrueNAS 26.0).** The reconcile
+  pass previously re-transferred the entire parent snapshot set once per 100-item
+  page (O(N²) wire volume — >1 GB/hour measured at 16 volumes), and the tombstone
+  sweep re-fetched that payload per ledger entry. The pass now fetches the
+  snapshot set once and partitions in memory, and the sweep resolves tombstone
+  existence from that in-pass listing. As a further (gated) step, the driver's
+  bookkeeping (tombstone ledger and in-flight markers) can be relocated off the
+  inheritable parent dataset onto a dedicated child dataset so its properties no
+  longer bloat every descendant snapshot — see the configuration note below.
+
+### Bookkeeping-dataset relocation (Fix 4b) is opt-in
+
+The bookkeeping relocation is **disabled by default** because it touches
+data-safety bookkeeping (crash-recovery provenance). Enable it with:
+
+```yaml
+reconcile:
+  bookkeeping:
+    enabled: true        # write new bookkeeping to <parent>/.csi-bookkeeping; read both locations
+    cleanupParent: false # set true only after rollout to remove migrated entries from the parent
+```
+
+With `enabled: true`, new bookkeeping is written to a dedicated
+`<parent>/.csi-bookkeeping` child dataset and reads consult both it and the
+parent (lossless dual-read). The migration copies parent entries to the child;
+those copies are removed from the parent only when `cleanupParent: true`, and
+only after a confirmed copy. Until `cleanupParent` is enabled the migration is
+strictly additive, so a mixed-version rollout (an older controller still reading
+the parent) keeps working.
+
 ## Breaking change: explicit StorageClass protocol
 
 `CreateVolume` now requires `parameters.protocol` when the running driver has

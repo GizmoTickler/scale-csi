@@ -70,6 +70,57 @@ func TestServiceReloadDebouncer_CoalescesRequests(t *testing.T) {
 	mu.Unlock()
 }
 
+// TestServiceReloadDebouncer_SustainedStreamDoesNotStarve mirrors the starvation
+// proof: a request stream faster than the debounce window must still fire
+// reloads at ~window cadence (leading-window batching). Under the old pure
+// trailing-edge debouncer every request reset the timer, so a 20ms-interval
+// stream with a 50ms window fired ZERO reloads until the stream stopped.
+func TestServiceReloadDebouncer_SustainedStreamDoesNotStarve(t *testing.T) {
+	var reloadCount int32
+	debouncer := NewServiceReloadDebouncer(50*time.Millisecond, func(ctx context.Context, service string) error {
+		atomic.AddInt32(&reloadCount, 1)
+		return nil
+	})
+	defer debouncer.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	send := func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = debouncer.RequestReload(ctx, "iscsitarget")
+		}()
+	}
+
+	// Sustained stream: a request every 20ms for 600ms.
+	send() // arm the leading window immediately
+	deadline := time.NewTimer(600 * time.Millisecond)
+	defer deadline.Stop()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+stream:
+	for {
+		select {
+		case <-deadline.C:
+			break stream
+		case <-ticker.C:
+			send()
+		}
+	}
+
+	wg.Wait()
+
+	// ~600ms / 50ms window => ~12 reloads; assert a slack-tolerant floor that a
+	// starving (trailing-edge) debouncer cannot reach (it would fire exactly once,
+	// after the stream stops).
+	if count := atomic.LoadInt32(&reloadCount); count < 5 {
+		t.Errorf("Expected sustained stream to fire >=5 reloads at ~window cadence, got %d", count)
+	}
+}
+
 func TestServiceReloadDebouncer_SeparateServices(t *testing.T) {
 	var reloadCount int32
 	services := make(map[string]int)
@@ -159,5 +210,46 @@ func TestServiceReloadDebouncer_Stop(t *testing.T) {
 	// Should have received a cancellation error
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Expected context.Canceled after Stop, got %v", err)
+	}
+}
+
+// Regression: a batch whose callers ALL cancel before the window fires must not
+// leave a stale timer behind. With the leading-window arm-only-if-nil rule, a
+// dead non-nil timer would prevent every future request from arming, starving
+// reloads for that service permanently (callers block until their own context
+// deadline).
+func TestServiceReloadDebouncer_FullyCancelledBatchDoesNotStarveNextBatch(t *testing.T) {
+	var reloadCount atomic.Int64
+	debouncer := NewServiceReloadDebouncer(50*time.Millisecond, func(ctx context.Context, service string) error {
+		reloadCount.Add(1)
+		return nil
+	})
+	defer debouncer.Stop()
+
+	// Batch 1: sole caller cancels before the window fires.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- debouncer.RequestReload(cancelCtx, "iscsitarget") }()
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled for cancelled caller, got %v", err)
+	}
+	// Let the orphaned timer fire against the empty batch.
+	time.Sleep(100 * time.Millisecond)
+
+	// Batch 2: a fresh request must complete within roughly one window, not
+	// hang until its context deadline.
+	ctx, ctxCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer ctxCancel()
+	start := time.Now()
+	if err := debouncer.RequestReload(ctx, "iscsitarget"); err != nil {
+		t.Fatalf("post-cancellation batch failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("post-cancellation batch took %v; stale timer starvation", elapsed)
+	}
+	if got := reloadCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 reload for batch 2, got %d", got)
 	}
 }
