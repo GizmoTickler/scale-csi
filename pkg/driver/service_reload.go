@@ -12,11 +12,16 @@ import (
 // reload operation. This prevents "reload storms" when many volumes are created
 // simultaneously (e.g., restoring a statefulset or scaling up a deployment).
 //
-// How it works:
-// - When a reload is requested, a timer starts (debounce window)
-// - If another request arrives before the timer expires, the timer resets
-// - When the timer finally expires, a single reload is performed
-// - All pending callers receive the result of that single reload
+// How it works (leading-window batching):
+//   - The FIRST request in an idle period arms a timer for the debounce window
+//   - Requests that arrive before the timer fires coalesce onto the same deadline
+//     (they do NOT reset the timer)
+//   - When the timer fires, a single reload is performed for the whole batch
+//   - All pending callers receive the result of that single reload
+//   - The next request after a fire starts a new batch
+//
+// Unlike pure trailing-edge debouncing, a sustained request stream cannot starve
+// the reload: the worst-case latency for any batch is one debounce window.
 type ServiceReloadDebouncer struct {
 	mu            sync.Mutex
 	debounceDelay time.Duration
@@ -68,15 +73,18 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 	state.count++
 	state.lastCall = time.Now()
 
-	// If timer already exists, stop it and we'll restart it
-	if state.timer != nil {
-		state.timer.Stop()
+	// Leading-window batching: arm the timer only for the FIRST request of a
+	// batch. Requests that arrive while the timer is already running coalesce
+	// onto the existing deadline instead of pushing it back. This bounds the
+	// worst-case reload latency to one window and guarantees a sustained request
+	// stream still fires reloads at ~window cadence rather than starving the
+	// reload (and every caller blocked on resultCh) indefinitely. Once the timer
+	// fires, executeReload clears it so the next request starts a fresh batch.
+	if state.timer == nil {
+		state.timer = time.AfterFunc(d.debounceDelay, func() {
+			d.executeReload(service)
+		})
 	}
-
-	// Start/restart the debounce timer
-	state.timer = time.AfterFunc(d.debounceDelay, func() {
-		d.executeReload(service)
-	})
 
 	klog.V(4).Infof("Service reload debouncer: queued reload for %s (pending: %d)", service, state.count)
 
@@ -107,6 +115,14 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 	d.mu.Lock()
 	state, exists := d.services[service]
 	if !exists || len(state.pending) == 0 {
+		if exists {
+			// The batch fully drained (every caller cancelled) before the window
+			// fired. Clear the timer so the next request arms a fresh batch — a
+			// stale non-nil timer would block arming forever and starve every
+			// future reload for this service.
+			state.timer = nil
+			state.count = 0
+		}
 		d.mu.Unlock()
 		return
 	}

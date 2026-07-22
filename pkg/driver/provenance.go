@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +59,73 @@ func hashedPropertyKey(prefix, identity string) string {
 	return prefix + hex.EncodeToString(sum[:8])
 }
 
+// bookkeepingDatasetSuffix names the dedicated child dataset that holds the
+// driver's bookkeeping (tombstone ledger + in-flight markers) when the Fix 4b
+// relocation is enabled. It is a child of the CSI parent but is NEVER used as a
+// volume parent, so its local user properties inherit to nothing — unlike the
+// parent, whose properties ZFS copies into every descendant dataset and snapshot
+// (the payload bloat measured at 29 MB per snapshot query on production 26.0).
+const bookkeepingDatasetSuffix = "/.csi-bookkeeping"
+
+func (d *Driver) bookkeepingDatasetName() string {
+	return d.parentDatasetName() + bookkeepingDatasetSuffix
+}
+
+func (d *Driver) bookkeepingEnabled() bool {
+	return d.config != nil && d.config.Reconcile.Bookkeeping.EnabledOrDefault()
+}
+
+// ensureBookkeepingDataset lazily and idempotently creates the dedicated
+// bookkeeping child dataset on first write.
+func (d *Driver) ensureBookkeepingDataset(ctx context.Context) error {
+	name := d.bookkeepingDatasetName()
+	if _, err := d.truenasClient.DatasetGet(ctx, name); err == nil {
+		return nil
+	} else if !truenas.IsNotFoundError(err) {
+		return err
+	}
+	if _, err := d.truenasClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: name, Type: "FILESYSTEM"}); err != nil && !truenas.IsAlreadyExistsError(err) {
+		return err
+	}
+	return nil
+}
+
+// bookkeepingWriteTarget returns the dataset new bookkeeping entries are written
+// to: the dedicated child dataset when the relocation is enabled (created
+// lazily), otherwise the parent dataset (v1.2.28 behavior).
+func (d *Driver) bookkeepingWriteTarget(ctx context.Context) (string, error) {
+	if !d.bookkeepingEnabled() {
+		return d.parentDatasetName(), nil
+	}
+	if err := d.ensureBookkeepingDataset(ctx); err != nil {
+		return "", err
+	}
+	return d.bookkeepingDatasetName(), nil
+}
+
+// removeBookkeepingProperties removes bookkeeping property keys from every
+// location they may live (parent and, when the relocation is enabled, the
+// dedicated child). Removal is idempotent and tolerant of an absent bookkeeping
+// dataset, so deleting an entry never fails merely because it predates the
+// relocation. The parent is always cleaned so a stale entry cannot linger in a
+// location a later read still consults. It returns the first backend error so
+// the reconciler sweeps can preserve their confirm-before-forget semantics.
+func (d *Driver) removeBookkeepingProperties(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	var firstErr error
+	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), keys); err != nil {
+		firstErr = err
+	}
+	if d.bookkeepingEnabled() {
+		if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.bookkeepingDatasetName(), keys); err != nil && !truenas.IsNotFoundError(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 func inflightMarkerKey(volumeID string) string {
 	return hashedPropertyKey(PropInflightMarkerPrefix, volumeID)
 }
@@ -80,9 +148,13 @@ func (d *Driver) writeInflightMarker(ctx context.Context, marker inflightMarker)
 		return status.Errorf(codes.Internal, "encode in-flight creation marker: %v", err)
 	}
 	key := inflightMarkerKey(path.Base(marker.Dataset))
-	if _, err := d.setAndVerifyDatasetUserProperties(ctx, d.parentDatasetName(), map[string]string{key: string(encoded)}); err != nil {
+	target, err := d.bookkeepingWriteTarget(ctx)
+	if err != nil {
+		return status.Errorf(codes.Internal, "resolve bookkeeping dataset for in-flight marker: %v", err)
+	}
+	if _, err := d.setAndVerifyDatasetUserProperties(ctx, target, map[string]string{key: string(encoded)}); err != nil {
 		return status.Errorf(codes.Internal,
-			"record in-flight creation marker for %s on parent dataset: %v", marker.Dataset, err)
+			"record in-flight creation marker for %s on %s: %v", marker.Dataset, target, err)
 	}
 	return nil
 }
@@ -92,23 +164,43 @@ func (d *Driver) writeInflightMarker(ctx context.Context, marker inflightMarker)
 // treated as absent for recovery (never a license to act) and left for the
 // reconciler sweep.
 func (d *Driver) readInflightMarker(ctx context.Context, volumeID string) (*inflightMarker, error) {
+	key := inflightMarkerKey(volumeID)
+	// Dual-read: new markers live on the dedicated bookkeeping dataset; legacy
+	// markers remain on the parent until cleaned up. Consult the bookkeeping
+	// dataset first, then fall back to the parent so a marker written before (or
+	// during) the relocation is found regardless of location.
+	if d.bookkeepingEnabled() {
+		bookkeeping, err := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+		if err != nil && !truenas.IsNotFoundError(err) {
+			return nil, fmt.Errorf("read bookkeeping dataset for in-flight markers: %w", err)
+		}
+		if marker := parseInflightMarker(bookkeeping, key, volumeID); marker != nil {
+			return marker, nil
+		}
+	}
 	parent, err := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
 	if err != nil {
 		return nil, fmt.Errorf("read parent dataset for in-flight markers: %w", err)
 	}
-	property, ok := datasetUserPropertyProjection(parent, inflightMarkerKey(volumeID))
+	return parseInflightMarker(parent, key, volumeID), nil
+}
+
+// parseInflightMarker extracts a valid local in-flight marker for key from a
+// dataset, or nil when absent, non-local, unparseable, or the wrong version.
+func parseInflightMarker(ds *truenas.Dataset, key, volumeID string) *inflightMarker {
+	property, ok := datasetUserPropertyProjection(ds, key)
 	if !ok || !isLocalUserPropertySource(property.Source) {
-		return nil, nil
+		return nil
 	}
 	var marker inflightMarker
 	if err := json.Unmarshal([]byte(property.Value), &marker); err != nil {
 		klog.Warningf("Ignoring unparseable in-flight marker for %s: %v", volumeID, err)
-		return nil, nil
+		return nil
 	}
 	if marker.Version != inflightMarkerVersion {
-		return nil, nil
+		return nil
 	}
-	return &marker, nil
+	return &marker
 }
 
 // newInflightMarker builds the base marker (clone mode by default; the caller
@@ -138,8 +230,7 @@ func (d *Driver) newInflightMarker(datasetName string, source *csi.VolumeContent
 // deleteInflightMarker is best-effort: a leftover marker is retired by the
 // reconciler sweep once its dataset is stamped or gone.
 func (d *Driver) deleteInflightMarker(ctx context.Context, volumeID string) {
-	key := inflightMarkerKey(volumeID)
-	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), []string{key}); err != nil {
+	if err := d.removeBookkeepingProperties(ctx, []string{inflightMarkerKey(volumeID)}); err != nil {
 		klog.Warningf("Failed to remove in-flight creation marker for %s (reconciler sweep will retire it): %v", volumeID, err)
 	}
 }
@@ -378,10 +469,14 @@ func (d *Driver) writeTombstoneLedgerEntry(ctx context.Context, entry tombstoneL
 	if err != nil {
 		return fmt.Errorf("encode tombstone ledger entry: %w", err)
 	}
-	if _, err := d.setAndVerifyDatasetUserProperties(ctx, d.parentDatasetName(), map[string]string{
+	target, err := d.bookkeepingWriteTarget(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve bookkeeping dataset for tombstone ledger: %w", err)
+	}
+	if _, err := d.setAndVerifyDatasetUserProperties(ctx, target, map[string]string{
 		tombstoneLedgerKey(entry.Snapshot): string(encoded),
 	}); err != nil {
-		return fmt.Errorf("record tombstone ledger entry for %s: %w", entry.Snapshot, err)
+		return fmt.Errorf("record tombstone ledger entry for %s on %s: %w", entry.Snapshot, target, err)
 	}
 	return nil
 }
@@ -389,10 +484,57 @@ func (d *Driver) writeTombstoneLedgerEntry(ctx context.Context, entry tombstoneL
 // removeTombstoneLedgerEntry is best-effort; an orphaned entry (its snapshot no
 // longer exists) is retired by the reconciler sweep.
 func (d *Driver) removeTombstoneLedgerEntry(ctx context.Context, fullSnapshotID string) {
-	key := tombstoneLedgerKey(fullSnapshotID)
-	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), []string{key}); err != nil {
+	if err := d.removeBookkeepingProperties(ctx, []string{tombstoneLedgerKey(fullSnapshotID)}); err != nil {
 		klog.Warningf("Failed to remove tombstone ledger entry for %s (reconciler sweep will retire it): %v", fullSnapshotID, err)
 	}
+}
+
+// migrateParentBookkeeping copies the parent dataset's local bookkeeping
+// properties (tombstone ledger + in-flight markers) to the dedicated bookkeeping
+// child dataset. It is idempotent and re-runnable: a copy that already landed is
+// simply overwritten with an identical value. When CleanupParent is enabled it
+// then removes the just-copied entries from the parent — strictly AFTER a
+// confirmed copy, so the migration is lossless (a parent entry is never deleted
+// unless its copy succeeded). Until CleanupParent is enabled the parent entries
+// stay in place and the dual-read serves them from there, so enabling the
+// relocation is safe even mid-rollout with older controllers reading the parent.
+func (d *Driver) migrateParentBookkeeping(ctx context.Context, parent *truenas.Dataset) {
+	if parent == nil || !d.bookkeepingEnabled() {
+		return
+	}
+	toCopy := make(map[string]string)
+	for key, property := range parent.UserProperties {
+		if !isLocalUserPropertySource(property.Source) {
+			continue
+		}
+		if strings.HasPrefix(key, PropTombstoneLedgerPrefix) || strings.HasPrefix(key, PropInflightMarkerPrefix) {
+			toCopy[key] = property.Value
+		}
+	}
+	if len(toCopy) == 0 {
+		return
+	}
+	if err := d.ensureBookkeepingDataset(ctx); err != nil {
+		d.recordReconcileObjectFailure("bookkeeping_migration", d.bookkeepingDatasetName(), err)
+		return
+	}
+	if err := d.truenasClient.DatasetSetUserProperties(ctx, d.bookkeepingDatasetName(), toCopy); err != nil {
+		d.recordReconcileObjectFailure("bookkeeping_migration", d.bookkeepingDatasetName(), err)
+		return
+	}
+	if !d.config.Reconcile.Bookkeeping.CleanupParent {
+		return
+	}
+	keys := make([]string, 0, len(toCopy))
+	for key := range toCopy {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), keys); err != nil {
+		d.recordReconcileObjectFailure("bookkeeping_migration", d.parentDatasetName(), err)
+		return
+	}
+	klog.Infof("Orphan reconcile: migrated %d bookkeeping entries off the parent dataset", len(keys))
 }
 
 // tombstoneLedgerFromDataset extracts the local tombstone ledger entries from
