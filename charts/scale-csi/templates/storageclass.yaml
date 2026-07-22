@@ -35,6 +35,12 @@ parameters:
   {{- with $storageClass.extraParameters }}
     {{- $parameters = mergeOverwrite $parameters (deepCopy .) -}}
   {{- end }}
-  {{- $_ := set $parameters "protocol" (default "nfs" $storageClass.protocol) -}}
+  {{- /* Emit protocol only when the storageClass entry sets it explicitly.
+       Omitting it lets the driver apply its sole-enabled-protocol fallback or
+       return its missing-parameter error, instead of the chart silently forcing
+       nfs on an iscsi/nvmeof class. */}}
+  {{- if $storageClass.protocol }}
+  {{- $_ := set $parameters "protocol" $storageClass.protocol -}}
+  {{- end }}
   {{- toYaml $parameters | nindent 2 }}
 {{- end }}

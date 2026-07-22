@@ -9,7 +9,22 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   replicas: {{ .Values.controller.replicas }}
-  {{- if ne .Values.fencing.mode "off" }}
+  # Render an explicit strategy in BOTH fencing modes so Helm always owns the
+  # field. Off mode previously rendered no strategy block, so the API server
+  # defaulted RollingUpdate and Helm's three-way merge never managed it; the
+  # off -> additive upgrade then failed in production (2026-07-22) because the
+  # server-defaulted rollingUpdate residue made the Recreate strategy invalid.
+  {{- if eq .Values.fencing.mode "off" }}
+  # Off mode allows overlapping controllers during a rollout. RollingUpdate is
+  # the Kubernetes default, declared explicitly (with its default surge and
+  # unavailable) so the field is Helm-owned and the additive upgrade can replace
+  # it cleanly.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  {{- else }}
   # Fencing reconcilers are in-process singleton writers. Recreate prevents an
   # old and new controller pod from overlapping during a rollout.
   strategy:
@@ -139,13 +154,14 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.provisioner.timeout }}"
             - "--worker-threads={{ .Values.sidecars.provisioner.workerThreads }}"
-            {{- if gt (int .Values.controller.replicas) 1 }}
+            # Leader election is always enabled, even at a single replica: a
+            # fencing-off RollingUpdate transiently runs two controller pods, and
+            # without LE both sidecars would act as active provisioner/attacher.
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
-            {{- end }}
             - "--extra-create-metadata"
             {{- range .Values.sidecars.provisioner.extraArgs }}
             - {{ . | quote }}
@@ -164,13 +180,11 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.attacher.timeout }}"
             - "--worker-threads={{ .Values.sidecars.attacher.workerThreads }}"
-            {{- if gt (int .Values.controller.replicas) 1 }}
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
-            {{- end }}
             {{- range .Values.sidecars.attacher.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -188,13 +202,11 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.resizer.timeout }}"
             - "--workers={{ .Values.sidecars.resizer.workerThreads }}"
-            {{- if gt (int .Values.controller.replicas) 1 }}
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
-            {{- end }}
             - "--handle-volume-inuse-error=false"
             {{- range .Values.sidecars.resizer.extraArgs }}
             - {{ . | quote }}
@@ -213,13 +225,11 @@ spec:
             - "--v={{ .Values.logging.verbosity }}"
             - "--timeout={{ .Values.sidecars.snapshotter.timeout }}"
             - "--worker-threads={{ .Values.sidecars.snapshotter.workerThreads }}"
-            {{- if gt (int .Values.controller.replicas) 1 }}
             - "--leader-election"
             - "--leader-election-namespace={{ .Release.Namespace }}"
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
-            {{- end }}
             {{- range .Values.sidecars.snapshotter.extraArgs }}
             - {{ . | quote }}
             {{- end }}

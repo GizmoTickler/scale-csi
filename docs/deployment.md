@@ -134,9 +134,11 @@ settings are:
 
 NFS mount options belong on each StorageClass's top-level `mountOptions` list.
 ZFS compression, dedup, record size, and zvol block size are driver values, not
-ordinary StorageClass parameters. The removed `zfs.dedup`, `zfs.compression`,
-`zfs.compressionAlgorithm`, `nfs.mountOptions`, `iscsi.basename`, and
-`node.kubeletHostPath` names are not valid chart values.
+ordinary StorageClass parameters. The legacy `zfs.dedup`, `zfs.compression`, and
+`zfs.compressionAlgorithm` chart values are still accepted for compatibility but
+are deprecated and ignored; configure these through `zfs.datasetProperties`. The
+`nfs.mountOptions`, `iscsi.basename`, and `node.kubeletHostPath` names are not
+valid chart values.
 
 > **One parent per cluster:** never point two live clusters at the same
 > `zfs.parentDataset`. Reconcile can see only its own cluster objects and would

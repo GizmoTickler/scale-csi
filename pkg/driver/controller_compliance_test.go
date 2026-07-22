@@ -237,6 +237,25 @@ func TestCreateVolumeRequiresProtocolForMultiProtocolDriver(t *testing.T) {
 	assert.Contains(t, err.Error(), "nfs, iscsi, nvmeof")
 }
 
+func TestCreateVolumeRejectsDisabledExplicitProtocol(t *testing.T) {
+	driver := newComplianceTestDriver(truenas.NewMockClient())
+	driver.config.NFS.Enabled = true
+	driver.config.ISCSI.Enabled = true
+
+	_, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "disabled-protocol",
+		Parameters:         map[string]string{"protocol": "nvmeof"},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, err.Error(), `StorageClass parameter "protocol"`)
+	assert.Contains(t, err.Error(), "nvmeof")
+	assert.Contains(t, err.Error(), "enabled options are: nfs, iscsi")
+	assert.NotContains(t, err.Error(), "nfs, iscsi, nvmeof")
+}
+
 func TestCreateVolumeKeepsSingleProtocolFallback(t *testing.T) {
 	driver := newComplianceTestDriver(truenas.NewMockClient())
 	driver.config.NFS.Enabled = true

@@ -905,6 +905,38 @@ func (c *Config) enabledShareTypeCount() int {
 	return count
 }
 
+// isShareTypeEnabled reports whether the given protocol is enabled on this
+// driver instance.
+func (c *Config) isShareTypeEnabled(shareType ShareType) bool {
+	switch shareType {
+	case ShareTypeNFS:
+		return c.NFS.Enabled
+	case ShareTypeISCSI:
+		return c.ISCSI.Enabled
+	case ShareTypeNVMeoF:
+		return c.NVMeoF.Enabled
+	default:
+		return false
+	}
+}
+
+// enabledShareTypeStrings returns the enabled protocol names in stable order.
+// An empty result means the configuration carries no enabled markers (legacy),
+// so callers must not treat it as "nothing is allowed".
+func (c *Config) enabledShareTypeStrings() []string {
+	enabled := make([]string, 0, 3)
+	if c.NFS.Enabled {
+		enabled = append(enabled, string(ShareTypeNFS))
+	}
+	if c.ISCSI.Enabled {
+		enabled = append(enabled, string(ShareTypeISCSI))
+	}
+	if c.NVMeoF.Enabled {
+		enabled = append(enabled, string(ShareTypeNVMeoF))
+	}
+	return enabled
+}
+
 // GetZFSResourceType returns the ZFS resource type for this driver.
 func (c *Config) GetZFSResourceType() string {
 	return c.GetDriverShareType().ZFSResourceType()

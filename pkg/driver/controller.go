@@ -401,6 +401,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 				"invalid protocol %q; valid options are: %s",
 				protocol, strings.Join(ValidShareTypeStrings(), ", "))
 		}
+		// Reject a syntactically valid protocol that this instance does not
+		// serve. Without this, an nfs+iscsi install accepts nvmeof here and
+		// only fails deep in the share-creation path. Legacy configs with no
+		// enabled markers (enabledShareTypeStrings empty) keep the historical
+		// driver-name fallback and are not gated here.
+		if enabled := d.config.enabledShareTypeStrings(); len(enabled) > 0 && !d.config.isShareTypeEnabled(explicitShareType) {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"StorageClass parameter %q value %q is not enabled on this driver; enabled options are: %s",
+				"protocol", protocol, strings.Join(enabled, ", "))
+		}
 	}
 	shareType := d.config.GetShareType(params)
 	klog.Infof("CreateVolume: using share type %s for volume %s", shareType, volumeID)

@@ -284,7 +284,13 @@ nvmeof:
   # Timeout for nvme CLI commands in seconds
   commandTimeout: 30
 
-# Storage classes to create
+# Storage classes to create.
+#
+# `protocol` is emitted into the StorageClass parameters ONLY when set on an
+# entry. Leave it unset to let the driver apply its sole-enabled-protocol
+# fallback (single-protocol installs) or return its missing-parameter error
+# (multi-protocol installs) instead of the chart silently forcing nfs. The
+# bundled default class sets it explicitly.
 storageClasses:
   - name: scale-nfs
     protocol: nfs
@@ -323,7 +329,7 @@ sidecars:
     # How long a leader waits before renewing (default: 40s, upstream default: 10s)
     # Must be less than leaseDuration
     renewDeadline: 40s
-    # How often to retry acquiring the lock (default: 10s, upstream default: 2s)
+    # How often to retry acquiring the lock (default: 10s, upstream default: 5s)
     # Must be less than renewDeadline
     retryPeriod: 10s
 

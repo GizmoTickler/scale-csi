@@ -249,7 +249,9 @@ jobs:
     name: Sign Release Image
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
-    needs: [docker-build]
+    # Sign only after the Trivy gate passes so a scan-rejected image is never
+    # left signed. docker-build is implied through trivy but kept explicit.
+    needs: [docker-build, trivy]
     permissions:
       contents: read
       id-token: write
@@ -299,7 +301,8 @@ jobs:
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
-    needs: [sign-image, trivy]
+    # trivy is satisfied transitively through sign-image.
+    needs: [sign-image]
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
