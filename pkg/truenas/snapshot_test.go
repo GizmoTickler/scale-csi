@@ -1607,13 +1607,14 @@ func TestCopyDatasetFromSnapshotLocal(t *testing.T) {
 	defer mock.close()
 	client := newSnapshotTestClient(t, server.URL)
 
-	err := client.CopyDatasetFromSnapshotLocal(
+	jobID, err := client.CopyDatasetFromSnapshotLocal(
 		context.Background(),
 		"tank/k8s/volumes/source",
 		"snap.1",
 		"tank/k8s/volumes/target",
 	)
 	require.NoError(t, err)
+	assert.Equal(t, int64(42), jobID)
 
 	params := <-replicationParams
 	require.Len(t, params, 1)
@@ -1688,19 +1689,195 @@ func TestCopyDatasetFromSnapshotLocalExistingTargetRequiresOwnershipRetry(t *tes
 	defer mock.close()
 	client := newSnapshotTestClient(t, server.URL)
 
-	err := client.CopyDatasetFromSnapshotLocal(
+	jobID, err := client.CopyDatasetFromSnapshotLocal(
 		context.Background(),
 		"tank/k8s/volumes/source",
 		"snap-1",
 		"tank/k8s/volumes/target",
 	)
 	require.Error(t, err)
+	assert.Equal(t, int64(73), jobID)
 	assert.True(t, IsDatasetDestinationExistsError(err))
 	assert.Zero(t, datasetQueries.Load(), "AlreadyExists must remain non-ownership proof without a follow-up read")
 	select {
 	case params := <-deleteCalled:
 		t.Fatalf("raced target must not be mutated through snapshot cleanup: %v", params)
 	default:
+	}
+}
+
+func TestCopyDatasetFromSnapshotLocalContextCancelAbortsRunningJob(t *testing.T) {
+	mock := newMockWSServer()
+	jobPolled := make(chan struct{}, 1)
+	abortParams := make(chan []interface{}, 1)
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case ReplicationRunOnetimeMethod:
+				resp.Result = 142
+			case "core.get_jobs":
+				select {
+				case jobPolled <- struct{}{}:
+				default:
+				}
+				resp.Result = []interface{}{map[string]interface{}{
+					"id": 142, "method": ReplicationRunOnetimeMethod, "state": "RUNNING",
+				}}
+			case "core.job_abort":
+				abortParams <- req.Params
+				resp.Result = true
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type copyResult struct {
+		jobID int64
+		err   error
+	}
+	result := make(chan copyResult, 1)
+	go func() {
+		jobID, err := client.CopyDatasetFromSnapshotLocal(
+			ctx, "tank/k8s/volumes/source", "snap-1", "tank/k8s/volumes/target",
+		)
+		result <- copyResult{jobID: jobID, err: err}
+	}()
+
+	select {
+	case <-jobPolled:
+		cancel()
+	case <-time.After(5 * time.Second):
+		t.Fatal("replication job was not polled")
+	}
+
+	select {
+	case completed := <-result:
+		require.Error(t, completed.err)
+		assert.ErrorIs(t, completed.err, context.Canceled)
+		assert.Equal(t, int64(142), completed.jobID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled detached copy did not return")
+	}
+	select {
+	case params := <-abortParams:
+		require.Len(t, params, 1)
+		assert.Equal(t, float64(142), params[0])
+	case <-time.After(5 * time.Second):
+		t.Fatal("core.job_abort was not called for the canceled job")
+	}
+}
+
+func TestCopyDatasetFromSnapshotLocalRecoversCanceledLaunchByArgumentsAndAborts(t *testing.T) {
+	mock := newMockWSServer()
+	launchSeen := make(chan struct{}, 1)
+	abortParams := make(chan []interface{}, 1)
+	jobQueryParams := make(chan []interface{}, 1)
+	var launchParams []interface{}
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case ReplicationRunOnetimeMethod:
+				launchParams = req.Params
+				launchSeen <- struct{}{}
+				// Middleware accepted the launch, but its response is lost until the
+				// caller context ends. Continue reading so recovery can use this socket.
+				continue
+			case "core.get_jobs":
+				jobQueryParams <- req.Params
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"id": 999, "method": ReplicationRunOnetimeMethod, "state": "RUNNING",
+						"arguments": []interface{}{map[string]interface{}{
+							"direction": "PUSH", "transport": "LOCAL",
+							"source_datasets": []interface{}{"tank/k8s/volumes/source"},
+							"target_dataset":  "tank/k8s/volumes/different-target",
+						}},
+					},
+					map[string]interface{}{
+						"id": 177, "method": ReplicationRunOnetimeMethod, "state": "WAITING",
+						"arguments": launchParams,
+					},
+				}
+			case "core.job_abort":
+				abortParams <- req.Params
+				resp.Result = true
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type copyResult struct {
+		jobID int64
+		err   error
+	}
+	result := make(chan copyResult, 1)
+	go func() {
+		jobID, err := client.CopyDatasetFromSnapshotLocal(
+			ctx, "tank/k8s/volumes/source", "snap-1", "tank/k8s/volumes/target",
+		)
+		result <- copyResult{jobID: jobID, err: err}
+	}()
+
+	select {
+	case <-launchSeen:
+		cancel()
+	case <-time.After(5 * time.Second):
+		t.Fatal("replication launch was not observed")
+	}
+
+	select {
+	case params := <-jobQueryParams:
+		require.Len(t, params, 1)
+		filters, ok := params[0].([]interface{})
+		require.True(t, ok)
+		assert.Len(t, filters, 2)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ambiguous launch was not recovered through core.get_jobs")
+	}
+	select {
+	case params := <-abortParams:
+		require.Len(t, params, 1)
+		assert.Equal(t, float64(177), params[0], "the full arguments match must beat the higher-ID decoy")
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovered replication job was not aborted")
+	}
+	select {
+	case completed := <-result:
+		require.Error(t, completed.err)
+		assert.ErrorIs(t, completed.err, context.Canceled)
+		assert.Equal(t, int64(177), completed.jobID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled launch recovery did not return")
 	}
 }
 

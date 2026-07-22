@@ -250,8 +250,9 @@ The old `storageClass` map remains supported for compatibility. When it is
 non-empty, it takes precedence over `storageClasses` and renders one class. It
 accepts the former `create`, `name`, `protocol`, `isDefault`, `reclaimPolicy`,
 `allowVolumeExpansion`, `volumeBindingMode`, and `mountOptions` fields plus
-`extraParameters`. Migrate existing values files to `storageClasses` when
-convenient.
+`extraParameters`. The deprecated path emits `protocol` and `mountOptions` only
+when they are explicitly set. Migrate existing values files to `storageClasses`
+when convenient.
 
 ### Snapshots
 
@@ -310,8 +311,8 @@ for Grafana sidecar discovery and uses only metrics exported by the driver.
 
 | Parameter | Description | Default |
 |---|---|---|
-| `reconcile.enabled` | Run periodic read-only orphan detection in the controller | `true` |
-| `reconcile.interval` | Detection interval | `1h` |
+| `reconcile.enabled` | Run periodic read-only orphan object detection in the controller | `true` |
+| `reconcile.interval` | Controller reconcile interval, including replication-job hygiene | `1h` |
 | `reconcile.minOrphanAge` | Minimum backend object age before orphan classification | `24h` |
 | `reconcile.alertAfter` | Prometheus alert hold time; keep greater than 2x the interval | `2h5m` |
 | `reconcile.delete.enabled` | Create the opt-in guarded cleanup CronJob | `false` |
@@ -322,7 +323,9 @@ Read-only detection is enabled by default and exports
 `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`,
 `scale_csi_spent_restore_snapshots`, orphan-byte gauges,
 `scale_csi_reconcile_last_success_timestamp_seconds`, and
-`scale_csi_reconcile_failures_total{phase}`. Deletion remains
+`scale_csi_reconcile_failures_total{phase}`. Driver-owned one-time replication
+jobs reaped on request failure, startup, or a periodic pass increment
+`scale_csi_replication_jobs_aborted_total{reason}`. Deletion remains
 disabled unless `reconcile.delete.enabled=true`. The CronJob invokes
 `--mode=reconcile`; backend cleanup always calls the driver's guarded CSI
 `DeleteVolume` and `DeleteSnapshot` implementations, so clone, snapshot, and
@@ -333,6 +336,13 @@ existing snapshot, so this path performs no backend writes. Deletion requires
 the later of the Kubernetes VolumeSnapshot creation time and backend ZFS
 snapshot creation time to exceed `reconcile.minOrphanAge`; clock skew can only
 delay cleanup.
+
+The replication-job sweep is always on, even when `reconcile.enabled=false` or
+`reconcile.delete.enabled=false`. It calls `core.job_abort` only for active
+`replication.run_onetime` jobs whose target is strictly below
+`zfs.parentDataset` and which have no matching in-flight marker, or whose source
+or target dataset is provably gone. Jobs outside that dataset tree are never
+touched.
 
 > **DANGER — one parent per cluster:** `zfs.parentDataset` MUST be unique to one
 > Kubernetes cluster. Never point two live clusters at the same parent dataset.

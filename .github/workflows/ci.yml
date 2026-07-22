@@ -180,6 +180,20 @@ jobs:
             --set zfs.parentDataset=tank/test \
             --set controller.replicas=1 \
             --set fencing.mode=strict >/dev/null
+          deprecated_render="$(helm template deprecated-iscsi-only charts/scale-csi/ \
+            --show-only templates/storageclass.yaml \
+            --set truenas.host=test.local \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=tank/test \
+            --set nfs.enabled=false \
+            --set iscsi.enabled=true \
+            --set nvmeof.enabled=false \
+            --set storageClass.name=scale-iscsi)"
+          if grep -Eq '^(mountOptions:|  protocol:)' <<<"${deprecated_render}"; then
+            echo "deprecated iSCSI-only StorageClass unexpectedly emitted mountOptions or protocol"
+            echo "${deprecated_render}"
+            exit 1
+          fi
       - name: Validate Kubernetes manifests
         uses: stackrox/kube-linter-action@87802a2f4e01abebb3ee3c67a3002fea71f6eae5 # v1
         with:

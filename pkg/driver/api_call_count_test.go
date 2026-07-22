@@ -209,7 +209,7 @@ func (c *apiCallCountingClient) SnapshotClone(ctx context.Context, snapshotID, n
 	return c.MockClient.SnapshotClone(ctx, snapshotID, newDatasetName)
 }
 
-func (c *apiCallCountingClient) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) error {
+func (c *apiCallCountingClient) CopyDatasetFromSnapshotLocal(ctx context.Context, sourceDataset, snapshotShortName, targetDataset string) (int64, error) {
 	c.record("CopyDatasetFromSnapshotLocal")
 	return c.MockClient.CopyDatasetFromSnapshotLocal(ctx, sourceDataset, snapshotShortName, targetDataset)
 }

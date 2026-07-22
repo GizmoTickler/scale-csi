@@ -187,6 +187,15 @@ var (
 		[]string{"phase"},
 	)
 
+	replicationJobsAbortedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "replication_jobs_aborted_total",
+			Help:      "Total driver-owned one-time replication jobs successfully aborted",
+		},
+		[]string{"reason"},
+	)
+
 	fencingDeferredTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -261,6 +270,16 @@ var (
 )
 
 func init() {
+	for _, reason := range []string{
+		truenas.ReplicationJobAbortReasonContextEnded,
+		truenas.ReplicationJobAbortReasonCopyFailed,
+		replicationJobReasonCreateVolumeFailed,
+		replicationJobReasonMissingMarker,
+		replicationJobReasonMissingSourceDataset,
+		replicationJobReasonMissingTargetDataset,
+	} {
+		replicationJobsAbortedTotal.WithLabelValues(reason).Add(0)
+	}
 	for _, protocol := range []string{"nfs", "iscsi", "nvmeof"} {
 		fencingDeferredTotal.WithLabelValues("missing_identity", protocol).Add(0)
 	}
@@ -349,6 +368,10 @@ func RecordReconcileSuccess(at time.Time) {
 
 func RecordReconcileFailure(phase string) {
 	reconcileFailuresTotal.WithLabelValues(phase).Inc()
+}
+
+func RecordReplicationJobAborted(reason string) {
+	replicationJobsAbortedTotal.WithLabelValues(reason).Inc()
 }
 
 func RecordFencingDeferred(reason, protocol string) {

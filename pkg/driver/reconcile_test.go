@@ -740,6 +740,133 @@ func TestReconcileSweepsOrphanedLedgerEntriesAndStaleMarkers(t *testing.T) {
 	assert.NotNil(t, keptMarker, "the marker guarding a live unstamped remnant is kept")
 }
 
+func TestReplicationJobSweepAbortsZombieWithoutMarker(t *testing.T) {
+	d, client := newReconcileTestDriver(t, true, nil, nil)
+	mustCreateParentDataset(t, client)
+	createReplicationSweepDataset(t, client, "pool/parent/source")
+	createReplicationSweepDataset(t, client, "pool/parent/zombie-target")
+	client.AddReplicationJob(&truenas.ReplicationJob{
+		ID: 201, Method: truenas.ReplicationRunOnetimeMethod, State: "RUNNING",
+		SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/zombie-target",
+	})
+
+	require.NoError(t, d.sweepOrphanedReplicationJobs(context.Background()))
+	aborted, reasons := client.ReplicationJobAbortHistory()
+	assert.Equal(t, []int64{201}, aborted)
+	assert.Equal(t, []string{replicationJobReasonMissingMarker}, reasons)
+}
+
+func TestReplicationJobSweepNeverTouchesForeignDataset(t *testing.T) {
+	d, client := newReconcileTestDriver(t, true, nil, nil)
+	mustCreateParentDataset(t, client)
+	client.AddReplicationJob(&truenas.ReplicationJob{
+		ID: 202, Method: truenas.ReplicationRunOnetimeMethod, State: "WAITING",
+		SourceDatasets: []string{"foreign/source"}, TargetDataset: "pool/parent-foreign/target",
+	})
+
+	require.NoError(t, d.sweepOrphanedReplicationJobs(context.Background()))
+	aborted, reasons := client.ReplicationJobAbortHistory()
+	assert.Empty(t, aborted)
+	assert.Empty(t, reasons)
+}
+
+func TestReplicationJobSweepKeepsJobWithLiveMarker(t *testing.T) {
+	d, client := newReconcileTestDriver(t, true, nil, nil)
+	mustCreateParentDataset(t, client)
+	createReplicationSweepDataset(t, client, "pool/parent/source")
+	createReplicationSweepDataset(t, client, "pool/parent/live-target")
+	writeReplicationSweepMarker(t, d, "pool/parent/live-target")
+	client.AddReplicationJob(&truenas.ReplicationJob{
+		ID: 203, Method: truenas.ReplicationRunOnetimeMethod, State: "RUNNING",
+		SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/live-target",
+	})
+
+	require.NoError(t, d.sweepOrphanedReplicationJobs(context.Background()))
+	aborted, reasons := client.ReplicationJobAbortHistory()
+	assert.Empty(t, aborted)
+	assert.Empty(t, reasons)
+}
+
+func TestReplicationJobSweepAbortsMarkedJobWithMissingDataset(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		jobID          int64
+		createSource   bool
+		createTarget   bool
+		expectedReason string
+	}{
+		{name: "target", jobID: 204, createSource: true, expectedReason: replicationJobReasonMissingTargetDataset},
+		{name: "source", jobID: 205, createTarget: true, expectedReason: replicationJobReasonMissingSourceDataset},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, client := newReconcileTestDriver(t, true, nil, nil)
+			mustCreateParentDataset(t, client)
+			if tc.createSource {
+				createReplicationSweepDataset(t, client, "pool/parent/source")
+			}
+			if tc.createTarget {
+				createReplicationSweepDataset(t, client, "pool/parent/marked-target")
+			}
+			writeReplicationSweepMarker(t, d, "pool/parent/marked-target")
+			client.AddReplicationJob(&truenas.ReplicationJob{
+				ID: tc.jobID, Method: truenas.ReplicationRunOnetimeMethod, State: "RUNNING",
+				SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/marked-target",
+			})
+
+			require.NoError(t, d.sweepOrphanedReplicationJobs(context.Background()))
+			aborted, reasons := client.ReplicationJobAbortHistory()
+			assert.Equal(t, []int64{tc.jobID}, aborted)
+			assert.Equal(t, []string{tc.expectedReason}, reasons)
+		})
+	}
+}
+
+func TestReplicationJobSweepRunsAtStartupAndPeriodicallyWhenOrphanDetectionDisabled(t *testing.T) {
+	d, client := newReconcileTestDriver(t, true, nil, nil)
+	d.config.Reconcile = ReconcileConfig{Enabled: false, Interval: "20ms", MinOrphanAge: "24h"}
+	mustCreateParentDataset(t, client)
+	createReplicationSweepDataset(t, client, "pool/parent/source")
+	createReplicationSweepDataset(t, client, "pool/parent/startup-target")
+	createReplicationSweepDataset(t, client, "pool/parent/periodic-target")
+	client.AddReplicationJob(&truenas.ReplicationJob{
+		ID: 206, Method: truenas.ReplicationRunOnetimeMethod, State: "RUNNING",
+		SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/startup-target",
+	})
+
+	d.startOrphanReconcile()
+	t.Cleanup(d.stopOrphanReconcile)
+	require.Eventually(t, func() bool {
+		aborted, _ := client.ReplicationJobAbortHistory()
+		return len(aborted) == 1 && aborted[0] == 206
+	}, 2*time.Second, 10*time.Millisecond)
+
+	client.AddReplicationJob(&truenas.ReplicationJob{
+		ID: 207, Method: truenas.ReplicationRunOnetimeMethod, State: "WAITING",
+		SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/periodic-target",
+	})
+	require.Eventually(t, func() bool {
+		aborted, _ := client.ReplicationJobAbortHistory()
+		return len(aborted) == 2 && aborted[1] == 207
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+func createReplicationSweepDataset(t *testing.T, client *truenas.MockClient, name string) {
+	t.Helper()
+	_, err := client.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{Name: name, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+}
+
+func writeReplicationSweepMarker(t *testing.T, d *Driver, targetDataset string) {
+	t.Helper()
+	source := &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+		Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+	}}
+	marker, err := d.newInflightMarker(targetDataset, source, ShareTypeNFS)
+	require.NoError(t, err)
+	marker.Mode = inflightModeCopy
+	require.NoError(t, d.writeInflightMarker(context.Background(), marker))
+}
+
 func findTombstoneID(t *testing.T, client *truenas.MockClient, sourceDataset string) string {
 	t.Helper()
 	snaps, err := client.SnapshotList(context.Background(), sourceDataset)

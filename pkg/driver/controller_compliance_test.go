@@ -806,9 +806,10 @@ func TestCreateVolumeDetachedSnapshotExistingCopyClearsInheritedShareIdentity(t 
 	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropNFSShareID, fmt.Sprint(sourceShare.ID)))
 	snapshot, err := client.SnapshotCreate(ctx, source.Name, "existing-copy-snapshot", nil)
 	require.NoError(t, err)
-	require.NoError(t, client.CopyDatasetFromSnapshotLocal(
+	_, err = client.CopyDatasetFromSnapshotLocal(
 		ctx, source.Name, snapshot.Name, "pool/parent/existing-copy",
-	))
+	)
+	require.NoError(t, err)
 	// A retry may resume only when the existing copy already has the durable
 	// provenance written by the original request. CreateVolume must never infer
 	// these properties from a later source-bearing request.
@@ -861,12 +862,12 @@ type detachedCopyErrorClient struct {
 func (m *detachedCopyErrorClient) CopyDatasetFromSnapshotLocal(
 	ctx context.Context,
 	_, _, targetDataset string,
-) error {
+) (int64, error) {
 	_, err := m.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: targetDataset, Type: "FILESYSTEM"})
 	if err != nil {
-		return err
+		return truenas.UnknownReplicationJobID, err
 	}
-	return errors.New("injected copy failure after partial receive")
+	return 91, errors.New("injected copy failure after partial receive")
 }
 
 func TestCreateVolumeDetachedSnapshotCopyFailureCleansPartialTarget(t *testing.T) {

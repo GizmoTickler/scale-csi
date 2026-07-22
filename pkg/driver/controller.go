@@ -75,9 +75,11 @@ const (
 )
 
 const (
-	originSnapshotDeleteAttempts   = 3
-	originSnapshotDeleteBackoff    = 500 * time.Millisecond
-	originSnapshotDeleteMaxBackoff = 2 * time.Second
+	originSnapshotDeleteAttempts           = 3
+	originSnapshotDeleteBackoff            = 500 * time.Millisecond
+	originSnapshotDeleteMaxBackoff         = 2 * time.Second
+	detachedCopyJobAbortTimeout            = 10 * time.Second
+	replicationJobReasonCreateVolumeFailed = "create_volume_failed"
 )
 
 func isDatasetDependencyOrBusyError(err error) bool {
@@ -290,7 +292,11 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 
 // CreateVolume creates a new volume.
 func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (_ *csi.CreateVolumeResponse, operationErr error) {
+	detachedCopyJobID := truenas.UnknownReplicationJobID
 	defer func() {
+		if operationErr != nil && detachedCopyJobID != truenas.UnknownReplicationJobID {
+			d.abortReplicationJobBestEffort(ctx, detachedCopyJobID, replicationJobReasonCreateVolumeFailed)
+		}
 		d.recordOperationFailureEvent(createVolumeEventRef(req), EventReasonVolumeCreateFailed, "CreateVolume", operationErr)
 	}()
 	start := time.Now()
@@ -596,7 +602,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
-		_, srcErr := d.handleVolumeContentSource(ctx, datasetName, name, contentSource, capacityBytes, shareType)
+		_, srcErr := d.handleVolumeContentSource(
+			ctx, datasetName, name, contentSource, capacityBytes, shareType, &detachedCopyJobID,
+		)
 		if srcErr != nil {
 			return nil, srcErr
 		}
@@ -2519,7 +2527,14 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 	}
 }
 
-func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, volumeName string, source *csi.VolumeContentSource, capacityBytes int64, shareType ShareType) (*truenas.Dataset, error) {
+func (d *Driver) handleVolumeContentSource(
+	ctx context.Context,
+	datasetName, volumeName string,
+	source *csi.VolumeContentSource,
+	capacityBytes int64,
+	shareType ShareType,
+	detachedCopyJobID *int64,
+) (*truenas.Dataset, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
 	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
 	var createdDS *truenas.Dataset
@@ -2562,7 +2577,8 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 		}
 		if d.config.ZFS.DetachedVolumesFromSnapshots {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
-			if copyErr := d.truenasClient.CopyDatasetFromSnapshotLocal(ctx, snap.Dataset, snap.Name, datasetName); copyErr != nil {
+			jobID, copyErr := d.truenasClient.CopyDatasetFromSnapshotLocal(ctx, snap.Dataset, snap.Name, datasetName)
+			if copyErr != nil {
 				if truenas.IsDatasetDestinationExistsError(copyErr) {
 					// Deliberately KEEP the shared per-volume marker: the concurrent
 					// winner is the same driver instance mid-flight on the same
@@ -2574,6 +2590,12 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 				}
 				d.cleanupFailedClone(ctx, datasetName, "")
 				return nil, status.Errorf(codes.Internal, "failed to copy snapshot into an independent volume: %v", copyErr)
+			}
+			// The low-level copy owns abort-on-error while it runs. Once it
+			// succeeds, publish the ID immediately so CreateVolume's fail-path
+			// defer covers every subsequent readiness/share/property failure.
+			if detachedCopyJobID != nil {
+				*detachedCopyJobID = jobID
 			}
 			klog.Infof("Independent snapshot copy created: %s -> %s", sourceSnapshot, datasetName)
 		} else {
@@ -2705,6 +2727,22 @@ func (d *Driver) handleVolumeContentSource(ctx context.Context, datasetName, vol
 	}
 
 	return createdDS, nil
+}
+
+func (d *Driver) abortReplicationJobBestEffort(ctx context.Context, jobID int64, reason string) {
+	if d.truenasClient == nil || jobID == truenas.UnknownReplicationJobID {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedCopyJobAbortTimeout)
+	defer cancel()
+	if err := d.truenasClient.ReplicationJobAbort(abortCtx, jobID, reason); err != nil {
+		klog.Warningf("Failed to abort one-time replication job %d after CreateVolume failure: %v", jobID, err)
+		return
+	}
+	klog.Infof("Aborted one-time replication job %d after CreateVolume failure", jobID)
 }
 
 func (d *Driver) cleanupFailedClone(ctx context.Context, datasetName, tempSnapshotID string) {
