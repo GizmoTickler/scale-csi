@@ -518,9 +518,33 @@ func (d *Driver) migrateParentBookkeeping(ctx context.Context, parent *truenas.D
 		d.recordReconcileObjectFailure("bookkeeping_migration", d.bookkeepingDatasetName(), err)
 		return
 	}
-	if err := d.truenasClient.DatasetSetUserProperties(ctx, d.bookkeepingDatasetName(), toCopy); err != nil {
+	// Skip entries whose identical copy already landed on the bookkeeping
+	// dataset (a prior pass, possibly one that ended ambiguous). Without this
+	// the steady-state cleanupParent=false configuration would re-copy the
+	// whole backlog every pass.
+	bookkeeping, err := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+	if err != nil && !truenas.IsNotFoundError(err) {
 		d.recordReconcileObjectFailure("bookkeeping_migration", d.bookkeepingDatasetName(), err)
 		return
+	}
+	pending := make(map[string]string, len(toCopy))
+	for key, value := range toCopy {
+		if bookkeeping != nil {
+			if property, ok := bookkeeping.UserProperties[key]; ok &&
+				isLocalUserPropertySource(property.Source) && property.Value == value {
+				continue
+			}
+		}
+		pending[key] = value
+	}
+	// Copy in batches bounded well under TrueNAS's 64 kB WebSocket inbound
+	// message limit (server closes 1009 on oversized requests — observed live
+	// on 26.0 with a ~300-entry single-call migration).
+	for _, batch := range chunkUserProperties(pending, bookkeepingMigrationBatchBudget) {
+		if err := d.truenasClient.DatasetSetUserProperties(ctx, d.bookkeepingDatasetName(), batch); err != nil {
+			d.recordReconcileObjectFailure("bookkeeping_migration", d.bookkeepingDatasetName(), err)
+			return
+		}
 	}
 	if !d.config.Reconcile.Bookkeeping.CleanupParent {
 		return
@@ -772,4 +796,42 @@ func (d *Driver) prepareDetachedSnapshotCopy(
 		return nil, status.Errorf(codes.Internal, "failed to overwrite detached snapshot copy identity properties: %v", err)
 	}
 	return refreshed, nil
+}
+
+// bookkeepingMigrationBatchBudget bounds the approximate JSON payload of a
+// single migration DatasetSetUserProperties call. TrueNAS's WebSocket server
+// rejects inbound messages over 64 kB (close 1009); half that leaves headroom
+// for the RPC envelope and dataset name.
+const bookkeepingMigrationBatchBudget = 32 * 1024
+
+// chunkUserProperties splits properties into deterministic (sorted-key)
+// batches whose approximate encoded size stays within budget. A single
+// oversized entry still gets its own batch — the caller surfaces the backend
+// error rather than silently dropping the entry.
+func chunkUserProperties(properties map[string]string, budget int) []map[string]string {
+	if len(properties) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(properties))
+	for key := range properties {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var batches []map[string]string
+	current := make(map[string]string)
+	size := 0
+	for _, key := range keys {
+		entrySize := len(key) + len(properties[key]) + 64
+		if len(current) > 0 && size+entrySize > budget {
+			batches = append(batches, current)
+			current = make(map[string]string)
+			size = 0
+		}
+		current[key] = properties[key]
+		size += entrySize
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	return batches
 }
