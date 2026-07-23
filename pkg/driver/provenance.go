@@ -59,13 +59,18 @@ func hashedPropertyKey(prefix, identity string) string {
 	return prefix + hex.EncodeToString(sum[:8])
 }
 
+// bookkeepingDatasetLeaf is the path leaf of the dedicated bookkeeping child
+// dataset. datasetForID rejects it as an inbound volume/snapshot ID so a crafted
+// volumeHandle can never target the bookkeeping dataset for delete/expand/clone.
+const bookkeepingDatasetLeaf = ".csi-bookkeeping"
+
 // bookkeepingDatasetSuffix names the dedicated child dataset that holds the
 // driver's bookkeeping (tombstone ledger + in-flight markers) when the Fix 4b
 // relocation is enabled. It is a child of the CSI parent but is NEVER used as a
 // volume parent, so its local user properties inherit to nothing — unlike the
 // parent, whose properties ZFS copies into every descendant dataset and snapshot
 // (the payload bloat measured at 29 MB per snapshot query on production 26.0).
-const bookkeepingDatasetSuffix = "/.csi-bookkeeping"
+const bookkeepingDatasetSuffix = "/" + bookkeepingDatasetLeaf
 
 func (d *Driver) bookkeepingDatasetName() string {
 	return d.parentDatasetName() + bookkeepingDatasetSuffix

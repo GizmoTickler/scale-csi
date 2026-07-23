@@ -67,6 +67,12 @@ type ReconcileObject struct {
 	// NVMe-oF) so the guarded delete phase can route cleanup to the correct
 	// backend objects. It is only meaningful for entries in OrphanShares.
 	Protocol ShareType
+	// remnantNonce carries the in-flight marker nonce observed when a remnant
+	// orphan was classified. The guarded destroy re-fetches the marker live and
+	// refuses to act unless the nonce is identical, so a fresh create attempt
+	// that rewrites the marker between detection and deletion is never raced.
+	// Only meaningful for entries in RemnantVolumes.
+	remnantNonce string
 }
 
 // SpentRestoreSnapshot describes a VolSync restore-destination snapshot whose
@@ -99,6 +105,7 @@ type ReconcileReport struct {
 	OrphanShareCount           int
 	SpentRestoreSnapshotCount  int
 	TombstoneSnapshotCount     int
+	RemnantVolumeCount         int
 	OrphanVolumeBytes          int64
 	OrphanSnapshotBytes        int64
 	TombstoneSnapshotBytes     int64
@@ -107,11 +114,13 @@ type ReconcileReport struct {
 	OrphanShares               []ReconcileObject
 	SpentRestoreSnapshots      []SpentRestoreSnapshot
 	TombstoneSnapshots         []ReconcileObject
+	RemnantVolumes             []ReconcileObject
 	DeletedVolumes             []string
 	DeletedSnapshots           []string
 	DeletedShares              []string
 	DeletedSpentRestoreObjects []string
 	DeletedTombstones          []string
+	DeletedRemnants            []string
 	SkippedDeletes             []ReconcileActionFailure
 	DeleteEnabled              bool
 }
@@ -178,10 +187,12 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 			return left < right
 		})
 		sort.Slice(report.TombstoneSnapshots, func(i, j int) bool { return report.TombstoneSnapshots[i].ID < report.TombstoneSnapshots[j].ID })
+		sort.Slice(report.RemnantVolumes, func(i, j int) bool { return report.RemnantVolumes[i].ID < report.RemnantVolumes[j].ID })
 		report.OrphanVolumeCount = len(report.OrphanVolumes)
 		report.OrphanSnapshotCount = len(report.OrphanSnapshots)
 		report.SpentRestoreSnapshotCount = len(report.SpentRestoreSnapshots)
 		report.TombstoneSnapshotCount = len(report.TombstoneSnapshots)
+		report.RemnantVolumeCount = len(report.RemnantVolumes)
 		// Publish even a partial pass so a single malformed object cannot freeze
 		// the last visible inventory indefinitely.
 		SetOrphanReconcileMetrics(report)
@@ -260,6 +271,19 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	}
 	if bookkeepingReadable {
 		d.sweepOrphanedTombstoneLedger(ctx, ledger, listedSnapshotIDs(snapshots, tombstones), time.Now(), minOrphanAge)
+	}
+
+	// Remnant-orphan detection (always-on; deletion stays gated by opts.Delete).
+	// A remnant is an unstamped dataset whose in-flight creation marker survived
+	// a controller crash and whose same-name CreateVolume retry is never coming
+	// (VolSync mints a new PVC UID on failure). It runs after the stale-marker
+	// sweep so a marker the sweep just retired is re-read from the backend, and
+	// every gate below re-validates live state, so the pass-snapshot the markers
+	// came from can never authorize a destroy on its own.
+	d.classifyRemnantOrphans(ctx, time.Now(), minOrphanAge, &report)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		RecordReconcileFailure("remnant_orphan_classification")
+		return report, ctxErr
 	}
 
 	now := time.Now()
@@ -442,6 +466,11 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		tombstone := &report.TombstoneSnapshots[i]
 		klog.Infof("Orphan reconcile: %s released deferred-delete tombstone %s (age=%v)",
 			logAction, tombstone.ID, tombstone.Age)
+	}
+	for i := range report.RemnantVolumes {
+		remnant := &report.RemnantVolumes[i]
+		klog.Infof("Orphan reconcile: %s remnant orphan volume %s (backend=%s age=%v bytes=%d)",
+			logAction, remnant.ID, remnant.BackendID, remnant.Age, remnant.Bytes)
 	}
 	for i := range report.SpentRestoreSnapshots {
 		spent := &report.SpentRestoreSnapshots[i]
@@ -1407,6 +1436,27 @@ func (d *Driver) deleteDetectedOrphans(
 		report.DeletedSpentRestoreObjects = append(report.DeletedSpentRestoreObjects, key)
 		deletedCount++
 	}
+
+	// Remnant-orphan destroy shares the per-run deletion cap with every other
+	// guarded delete above. Each remnant re-proves its marker nonce, unstamped
+	// dataset, origin binding, and Kubernetes absence live immediately before the
+	// non-recursive destroy.
+	for i := range report.RemnantVolumes {
+		remnant := &report.RemnantVolumes[i]
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if deletionCapReached("remnant-volume", remnant.ID) {
+			continue
+		}
+		destroyed, reason := d.destroyRemnantOrphan(ctx, *remnant)
+		if !destroyed {
+			d.recordReconcileSkip(report, "remnant-volume", remnant.ID, reason)
+			continue
+		}
+		report.DeletedRemnants = append(report.DeletedRemnants, remnant.ID)
+		deletedCount++
+	}
 	return nil
 }
 
@@ -1636,6 +1686,254 @@ func (d *Driver) sweepStaleInflightMarkers(ctx context.Context, parent *truenas.
 		return
 	}
 	klog.Infof("Orphan reconcile: retired %d stale in-flight creation markers", len(staleKeys))
+}
+
+// localInflightMarkers extracts every parseable LOCAL in-flight creation marker
+// from a dataset, keyed by property key. Version and instance filtering is left
+// to the caller (matching sweepStaleInflightMarkers), so foreign or newer-version
+// markers are visible to the same guards that ignore them.
+func localInflightMarkers(ds *truenas.Dataset) map[string]*inflightMarker {
+	markers := make(map[string]*inflightMarker)
+	if ds == nil {
+		return markers
+	}
+	for key, property := range ds.UserProperties {
+		if !strings.HasPrefix(key, PropInflightMarkerPrefix) || !isLocalUserPropertySource(property.Source) {
+			continue
+		}
+		var marker inflightMarker
+		if err := json.Unmarshal([]byte(property.Value), &marker); err != nil {
+			klog.Warningf("Ignoring unparseable in-flight marker %s: %v", key, err)
+			continue
+		}
+		markers[key] = &marker
+	}
+	return markers
+}
+
+// validVolumeIDLeaf mirrors datasetForID's identity rules for a single path
+// leaf: it must be non-empty, not a path traversal component, and contain no
+// path separator. It guards the marker-derived volume ID before it is used to
+// build dataset paths or property keys.
+func validVolumeIDLeaf(id string) bool {
+	return id != "" && !strings.ContainsAny(id, "/") && id != "." && id != ".."
+}
+
+// datasetHasLocalOwnershipStamp reports whether a dataset carries a LOCAL
+// driver-instance or managed_resource ownership property. A dataset with either
+// stamp is owned (creation completed or explicitly adopted) and is therefore NOT
+// an unstamped in-flight remnant. Inherited values are not proof of ownership.
+func datasetHasLocalOwnershipStamp(ds *truenas.Dataset) bool {
+	if ds == nil {
+		return false
+	}
+	if owner, ok := datasetUserPropertyProjection(ds, PropDriverInstanceID); ok && isLocalUserPropertySource(owner.Source) {
+		return true
+	}
+	return datasetHasLocalUserProperty(ds, PropManagedResource, "true")
+}
+
+// remnantHasNoKubernetesReference live-lists PersistentVolumes and
+// VolumeAttachments (NOT informer caches) and reports whether any object owned
+// by this driver references volumeID. It is the classification and pre-destroy
+// hard-recheck for remnant orphans, mirroring liveVolumeAttachmentExists.
+func (d *Driver) remnantHasNoKubernetesReference(ctx context.Context, volumeID string) (safe bool, reason string) {
+	clientset, _, err := d.kubernetesReconcileClients()
+	if err != nil {
+		return false, err.Error()
+	}
+	pvs, err := clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Sprintf("live PersistentVolume list for remnant recheck: %v", err)
+	}
+	handlesByPV := make(map[string]string)
+	for i := range pvs.Items {
+		pv := &pvs.Items[i]
+		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != d.name {
+			continue
+		}
+		handlesByPV[pv.Name] = pv.Spec.CSI.VolumeHandle
+		if pv.Spec.CSI.VolumeHandle == volumeID {
+			return false, fmt.Sprintf("PersistentVolume %s references remnant volume %s", pv.Name, volumeID)
+		}
+	}
+	// Volume names derive from the PVC UID (the CreateVolume name), and a PV's
+	// spec.csi.volumeHandle equals that name. A remnant has no PV because
+	// provisioning never completed, and a Pending PVC that would retry this exact
+	// volume re-enters CreateVolume and recovers the remnant through its marker
+	// (recoverInFlightContentSourceRemnant) rather than binding a competing PV —
+	// so a missing PV is sufficient proof no claim references the remnant, and no
+	// separate PVC scan is needed. A VolumeAttachment, by contrast, can outlive a
+	// deleted PV (operator force-finalizer), so it is rechecked live as well.
+	attachments, err := clientset.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Sprintf("live VolumeAttachment list for remnant recheck: %v", err)
+	}
+	for i := range attachments.Items {
+		attachment := &attachments.Items[i]
+		if attachment.Spec.Attacher != d.name || attachment.Spec.Source.PersistentVolumeName == nil {
+			continue
+		}
+		pvName := *attachment.Spec.Source.PersistentVolumeName
+		if handlesByPV[pvName] == volumeID || pvName == volumeID {
+			return false, fmt.Sprintf("VolumeAttachment %s references remnant volume %s", attachment.Name, volumeID)
+		}
+	}
+	return true, ""
+}
+
+// classifyRemnantOrphans detects remnant orphans: unstamped datasets whose
+// in-flight creation marker survived a controller crash and whose same-name
+// CreateVolume retry is never coming (VolSync mints a NEW PVC UID on failure, so
+// the marker — not a retry — is the only thing that can ever act on the remnant).
+// Each candidate must satisfy, all proven live: a valid local marker for THIS
+// instance whose dataset sits strictly under the CSI parent (datasetForID-style
+// validation), marker age beyond minOrphanAge, an existing UNSTAMPED dataset, and
+// no referencing Kubernetes object. Detection is read-only; the guarded destroy
+// runs in deleteDetectedOrphans under opts.Delete. A stamped dataset is left to
+// the stale-marker sweep (marker retirement) and the orphan-volume pass (dataset
+// reclamation) — this phase never touches it.
+func (d *Driver) classifyRemnantOrphans(ctx context.Context, now time.Time, minOrphanAge time.Duration, report *ReconcileReport) {
+	parentDataset, err := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
+	if err != nil {
+		d.recordReconcileObjectFailure("remnant_orphan_classify", d.parentDatasetName(), err)
+		return
+	}
+	markers := localInflightMarkers(parentDataset)
+	if d.bookkeepingEnabled() {
+		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+		if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
+			d.recordReconcileObjectFailure("remnant_orphan_classify", d.bookkeepingDatasetName(), bkErr)
+			return
+		}
+		// Dual-read merge: the same marker carries the same content-hashed key in
+		// both locations, so the union is lossless and a migrated marker is seen
+		// regardless of which dataset still holds it.
+		for key, marker := range localInflightMarkers(bookkeeping) {
+			markers[key] = marker
+		}
+	}
+	parentName := d.parentDatasetName()
+	for key, marker := range markers {
+		if marker.Version != inflightMarkerVersion || marker.Instance != d.driverInstanceID() || marker.Dataset == "" {
+			continue
+		}
+		volumeID := path.Base(marker.Dataset)
+		if !datasetStrictlyBelowParent(marker.Dataset, parentName) || !validVolumeIDLeaf(volumeID) || key != inflightMarkerKey(volumeID) {
+			continue
+		}
+		if volumeID == bookkeepingDatasetLeaf {
+			// Belt-and-suspenders: the bookkeeping dataset is never a volume and
+			// must never be classified, whatever properties it carries.
+			continue
+		}
+		startedAt, parseErr := time.Parse(time.RFC3339Nano, marker.StartedAt)
+		if parseErr != nil || now.Sub(startedAt) <= minOrphanAge {
+			continue
+		}
+		dataset, getErr := d.truenasClient.DatasetGet(ctx, marker.Dataset)
+		if getErr != nil {
+			if truenas.IsNotFoundError(getErr) {
+				// Dataset gone: nothing to destroy; the stale-marker sweep retires
+				// the marker. Not a remnant orphan.
+				continue
+			}
+			d.recordReconcileObjectFailure("remnant_orphan_classify", marker.Dataset, getErr)
+			continue
+		}
+		if datasetHasLocalOwnershipStamp(dataset) {
+			klog.V(4).Infof("Orphan reconcile: skipping remnant candidate %s because it carries a local ownership stamp", marker.Dataset)
+			continue
+		}
+		if safe, k8sReason := d.remnantHasNoKubernetesReference(ctx, volumeID); !safe {
+			klog.V(2).Infof("Orphan reconcile: skipping remnant candidate %s: %s", marker.Dataset, k8sReason)
+			continue
+		}
+		report.RemnantVolumes = append(report.RemnantVolumes, ReconcileObject{
+			ID:           volumeID,
+			BackendID:    marker.Dataset,
+			PVName:       volumeID,
+			CreatedAt:    startedAt,
+			Age:          now.Sub(startedAt),
+			Bytes:        dataset.GetUsedBytes(),
+			remnantNonce: marker.Nonce,
+		})
+	}
+}
+
+// destroyRemnantOrphan removes a classified remnant orphan under opts.Delete.
+// Immediately before the non-recursive destroy it re-proves, live: the marker is
+// still present with an identical nonce (a rewritten marker means a fresh create
+// owns the dataset now), the dataset still exists and is unstamped, the dataset's
+// actual ZFS origin matches the marker (clone mode) or is empty (detached copy),
+// and no Kubernetes object references the volume. The destroy is NON-recursive
+// with force=false so any child dataset or snapshot under the remnant FAILS the
+// delete (fail-safe) and is surfaced as a skip reason rather than destroyed
+// silently. On success the marker is retired from both bookkeeping locations and
+// a Warning event is recorded so operators see the reap.
+func (d *Driver) destroyRemnantOrphan(ctx context.Context, remnant ReconcileObject) (destroyed bool, reason string) {
+	volumeID := remnant.ID
+	// Serialize against any concurrent CSI operation on the same volume name —
+	// in particular a same-name CreateVolume RESUME, whose marker keeps the
+	// original StartedAt (aged past the gate) and nonce, defeating the age and
+	// nonce guards; the per-volume lock is the discriminator the sibling
+	// reconcile delete paths rely on.
+	lockKey := "volume:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return false, "volume operation is in progress"
+	}
+	defer d.releaseOperationLock(lockKey)
+	marker, err := d.readInflightMarker(ctx, volumeID)
+	if err != nil {
+		return false, fmt.Sprintf("remnant marker revalidation failed: %v", err)
+	}
+	if marker == nil || marker.Instance != d.driverInstanceID() || marker.Dataset != remnant.BackendID {
+		return false, "in-flight marker is no longer present for this remnant"
+	}
+	if marker.Nonce != remnant.remnantNonce {
+		return false, "in-flight marker nonce changed (a new create attempt owns the remnant)"
+	}
+	dataset, err := d.truenasClient.DatasetGet(ctx, marker.Dataset)
+	if err != nil {
+		if truenas.IsNotFoundError(err) {
+			// Already gone: the goal is met; retire the marker and report success.
+			d.deleteInflightMarker(ctx, volumeID)
+			return true, ""
+		}
+		return false, fmt.Sprintf("remnant dataset revalidation failed: %v", err)
+	}
+	if datasetHasLocalOwnershipStamp(dataset) {
+		return false, "remnant dataset became stamped (creation completed)"
+	}
+	actualOrigin := datasetOriginSnapshotID(dataset)
+	switch marker.Mode {
+	case inflightModeClone:
+		if marker.Origin == "" || actualOrigin != marker.Origin {
+			return false, fmt.Sprintf("remnant origin %q does not match marker origin %q", actualOrigin, marker.Origin)
+		}
+	case inflightModeCopy:
+		if actualOrigin != "" {
+			return false, fmt.Sprintf("detached-copy remnant has unexpected origin %q", actualOrigin)
+		}
+	default:
+		return false, fmt.Sprintf("remnant marker has unrecognized mode %q", marker.Mode)
+	}
+	if safe, k8sReason := d.remnantHasNoKubernetesReference(ctx, volumeID); !safe {
+		return false, k8sReason
+	}
+	if delErr := d.truenasClient.DatasetDelete(ctx, marker.Dataset, false, false); delErr != nil {
+		if truenas.IsNotFoundError(delErr) {
+			d.deleteInflightMarker(ctx, volumeID)
+			return true, ""
+		}
+		return false, fmt.Sprintf("guarded remnant destroy refused: %v", delErr)
+	}
+	d.deleteInflightMarker(ctx, volumeID)
+	d.recordWarningEvent(volumeEventRef(volumeID), EventReasonRemnantOrphanReaped,
+		fmt.Sprintf("Reaped remnant orphan dataset %s (origin %q, mode %s) left unstamped after a crashed create",
+			marker.Dataset, actualOrigin, marker.Mode))
+	klog.Infof("Orphan reconcile: destroyed remnant orphan volume %s (backend=%s origin=%q)", volumeID, marker.Dataset, actualOrigin)
+	return true, ""
 }
 
 // sweepOrphanedReplicationJobs aborts only active replication.run_onetime jobs
@@ -2303,8 +2601,8 @@ func (d *Driver) startOrphanReconcile() {
 				return
 			}
 			if reconcileErr == nil {
-				klog.Infof("Orphan reconcile detection complete: volumes=%d snapshots=%d spentRestoreSnapshots=%d tombstones=%d",
-					report.OrphanVolumeCount, report.OrphanSnapshotCount, report.SpentRestoreSnapshotCount, report.TombstoneSnapshotCount)
+				klog.Infof("Orphan reconcile detection complete: volumes=%d snapshots=%d spentRestoreSnapshots=%d tombstones=%d remnants=%d",
+					report.OrphanVolumeCount, report.OrphanSnapshotCount, report.SpentRestoreSnapshotCount, report.TombstoneSnapshotCount, report.RemnantVolumeCount)
 			}
 		}
 
