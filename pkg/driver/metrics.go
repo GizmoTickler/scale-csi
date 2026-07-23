@@ -170,6 +170,14 @@ var (
 		},
 	)
 
+	remnantVolumes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "remnant_volumes",
+			Help:      "Number of marker-proven unstamped remnant datasets awaiting guarded reap (interrupted creates with no possible retry)",
+		},
+	)
+
 	reconcileLastSuccessTimestamp = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -387,6 +395,7 @@ func SetOrphanReconcileMetrics(report ReconcileReport) {
 	orphanSnapshotsBytes.Set(float64(report.OrphanSnapshotBytes))
 	tombstoneSnapshots.Set(float64(report.TombstoneSnapshotCount))
 	tombstoneSnapshotsBytes.Set(float64(report.TombstoneSnapshotBytes))
+	remnantVolumes.Set(float64(report.RemnantVolumeCount))
 }
 
 func RecordReconcileSuccess(at time.Time) {

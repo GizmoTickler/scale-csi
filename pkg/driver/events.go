@@ -39,6 +39,7 @@ const (
 	EventReasonTrueNASError         = "TrueNASError"
 	EventReasonTrueNASReconnected   = "TrueNASReconnected"
 	EventReasonFencingTakeover      = "FencingTakeover"
+	EventReasonRemnantOrphanReaped  = "RemnantOrphanReaped"
 )
 
 const (

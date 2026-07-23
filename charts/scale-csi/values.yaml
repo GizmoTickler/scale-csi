@@ -535,7 +535,15 @@ reconcile:
   # entries from being inherited by every snapshot, which inflates
   # zfs.resource.snapshot.query payloads. cleanupParent additionally permits
   # removing parent-side entries after a confirmed copy (keep false for the
-  # first soak; do not disable enabled after entries exist only on the child).
+  # first soak).
+  #
+  # DOWNGRADE WARNING: once enabled has been true and entries live on the child,
+  # do NOT flip it back to false. Reads consult the child only while enabled, so
+  # disabling orphans any child-side markers/ledger entries from crash recovery
+  # and GC — they become invisible and can no longer be acted on. The supported
+  # way to drain bookkeeping off the parent is the cleanupParent flow (copy to
+  # the child, then remove confirmed copies from the parent), not disabling the
+  # relocation.
   bookkeeping:
     enabled: false
     cleanupParent: false

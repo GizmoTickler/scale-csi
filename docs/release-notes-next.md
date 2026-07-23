@@ -3,6 +3,44 @@
 This draft describes changes after v1.2.23. It is intentionally not a tag or a
 final version announcement.
 
+## Batch 15 (v1.2.33) — remnant-orphan GC + bookkeeping hardening
+
+Three changes from the 2026-07-23 live incident, in which a controller OOM crash
+loop manufactured unstamped clone datasets in the window between `zfs clone` and
+the ownership stamp. Each was invisible to the orphan-volume classifier (no stamp
+= no ownership proof), deliberately kept by the in-flight-marker sweep (the marker
+was the only thing a retry could recover from), and never reclaimed because the
+assumed same-name `CreateVolume` retry never comes under VolSync (it mints a new
+PVC UID on failure). Each empty clone pinned a `-csi-deleted-` tombstone origin
+and blocked ledger drain; cleanup was manual. This batch automates it safely.
+
+- **Data safety — marker-based remnant-orphan GC.** A new reconcile phase
+  detects a *remnant orphan*: a dataset that carries a valid local in-flight
+  marker for this driver instance (parent or bookkeeping child, dual-read), is
+  older than `minOrphanAge` (no new knob), still EXISTS and is UNSTAMPED (no
+  local driver-instance/`managed_resource` ownership), and is referenced by no
+  Kubernetes object (live PV/VolumeAttachment hard-recheck, not informer caches).
+  Detection is always on; guarded destruction runs only under `delete.enabled`
+  and counts against the shared `maxPerRun` cap. Immediately before the
+  non-recursive, `force=false` destroy the phase re-fetches the marker (identical
+  nonce) and the dataset (still unstamped), re-proves the ZFS origin binding
+  (clone origin must equal the marker's recorded origin; a detached copy must
+  have none), and re-checks Kubernetes absence — any change skips with an
+  operator-visible reason. Children or snapshots under the remnant fail the
+  delete (fail-safe). On success the marker is retired from both bookkeeping
+  locations and a Warning event is recorded. A stamped dataset is left to the
+  existing stale-marker sweep and orphan-volume pass, unchanged.
+- **Security — inbound IDs can no longer target the bookkeeping dataset.**
+  `datasetForID` now rejects any volume/snapshot ID equal to the bookkeeping
+  child dataset's leaf (`.csi-bookkeeping`) with `InvalidArgument` before any
+  TrueNAS access, so a crafted `volumeHandle` can never delete/expand/clone the
+  driver's bookkeeping dataset. Guarded across every RPC entry class that
+  resolves an inbound ID.
+- **Docs — bookkeeping downgrade warning.** `docs/production.md` and the chart
+  `values.yaml` now warn that once `reconcile.bookkeeping.enabled` has been true
+  and entries live on the child, disabling it orphans child-side entries from
+  reads; the `cleanupParent` flow is the supported path.
+
 ## Batch 14 (v1.2.29) — adversarial-verification fixes
 
 Six fixes from the 2026-07-22 dual-reviewer adversarial verification. All are

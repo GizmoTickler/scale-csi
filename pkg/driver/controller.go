@@ -1819,6 +1819,13 @@ func (d *Driver) datasetForID(id string) (string, error) {
 	if id == "" || strings.ContainsAny(id, "/") || id == "." || id == ".." {
 		return "", status.Errorf(codes.InvalidArgument, "invalid volume/snapshot id %q", id)
 	}
+	// The bookkeeping child dataset holds the driver's tombstone ledger and
+	// in-flight markers; a crafted volumeHandle must never be able to target it
+	// for delete/expand/clone. Its leaf is the only ID that resolves to it
+	// (datasetForID rejects any ID containing a path separator).
+	if id == bookkeepingDatasetLeaf {
+		return "", status.Errorf(codes.InvalidArgument, "invalid volume/snapshot id %q: reserved bookkeeping dataset", id)
+	}
 	name := path.Join(d.config.ZFS.DatasetParentName, id)
 	parent := strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/") + "/"
 	if !strings.HasPrefix(name+"/", parent) {

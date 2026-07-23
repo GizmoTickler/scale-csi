@@ -107,6 +107,17 @@ is a layered contract, not a single mechanism:
   provenance) destroy. Manually creating datasets or snapshots inside the
   parent — especially at names a PVC or VolumeSnapshot might use — is out of
   contract; place operator-managed data outside the parent dataset.
+- Bookkeeping-relocation downgrade caveat: the optional
+  `reconcile.bookkeeping.enabled` flag relocates the driver's durable
+  bookkeeping (tombstone ledger + in-flight markers) to a dedicated
+  `<parent>/.csi-bookkeeping` child dataset, reading from both locations while
+  it is on. Once it has been true and entries live on the child, **do not flip
+  it back off**: reads consult the child only while the flag is enabled, so
+  disabling it orphans any child-side entries from crash recovery and garbage
+  collection — they become invisible and can no longer be acted on. The
+  supported way to drain bookkeeping off the parent is the
+  `reconcile.bookkeeping.cleanupParent` flow (copy entries to the child, then
+  remove the confirmed copies from the parent), not disabling the relocation.
 
 The node component runs as a DaemonSet on all tolerated nodes. Established node
 pods perform stage, publish, unpublish, and unstage through host NFS/iSCSI/NVMe
