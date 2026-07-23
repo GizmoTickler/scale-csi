@@ -233,7 +233,7 @@ func TestServiceReloadDebouncer_FullyCancelledBatchDoesNotStarveNextBatch(t *tes
 	time.Sleep(10 * time.Millisecond)
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled for cancelled caller, got %v", err)
+		t.Fatalf("expected context.Canceled for canceled caller, got %v", err)
 	}
 	// Let the orphaned timer fire against the empty batch.
 	time.Sleep(100 * time.Millisecond)

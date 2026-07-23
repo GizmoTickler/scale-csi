@@ -116,7 +116,7 @@ func (d *ServiceReloadDebouncer) executeReload(service string) {
 	state, exists := d.services[service]
 	if !exists || len(state.pending) == 0 {
 		if exists {
-			// The batch fully drained (every caller cancelled) before the window
+			// The batch fully drained (every caller canceled) before the window
 			// fired. Clear the timer so the next request arms a fresh batch — a
 			// stale non-nil timer would block arming forever and starve every
 			// future reload for this service.
