@@ -11,7 +11,8 @@ import (
 
 // MockClient is a mock implementation of ClientInterface for testing.
 type MockClient struct {
-	mu sync.RWMutex
+	mu                     sync.RWMutex
+	setUserPropertiesCalls int
 
 	// Mock data
 	Datasets                   map[string]*Dataset
@@ -488,10 +489,19 @@ func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, valu
 	return m.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
 }
 
+// SetUserPropertiesCallCount reports how many DatasetSetUserProperties calls
+// the mock has served (including single-property delegations).
+func (m *MockClient) SetUserPropertiesCallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.setUserPropertiesCalls
+}
+
 func (m *MockClient) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.setUserPropertiesCalls++
 	if m.InjectError != nil {
 		return m.InjectError
 	}

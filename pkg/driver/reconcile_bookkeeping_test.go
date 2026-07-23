@@ -2,6 +2,8 @@ package driver
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,4 +173,81 @@ func TestBookkeepingMigration(t *testing.T) {
 	ledger := tombstoneLedgerFromDataset(child)
 	require.Len(t, ledger, 1)
 	assert.Equal(t, entry.Snapshot, ledger[key].Snapshot)
+}
+
+// Regression (live 2026-07-23): the migration copied ~300 backlog entries in a
+// single DatasetSetUserProperties call, exceeding TrueNAS's 64 kB WebSocket
+// inbound limit (server close 1009). It must (a) chunk copies under the batch
+// budget and (b) skip entries whose identical copy already landed, so the
+// steady-state cleanupParent=false configuration is a per-pass no-op.
+func TestBookkeepingMigrationChunksAndSkipsAlreadyCopied(t *testing.T) {
+	entries := map[string]string{}
+	value := strings.Repeat("x", 400)
+	for i := 0; i < 300; i++ {
+		entries[fmt.Sprintf("%sentry%03d", PropTombstoneLedgerPrefix, i)] = value
+	}
+
+	batches := chunkUserProperties(entries, bookkeepingMigrationBatchBudget)
+	if len(batches) < 2 {
+		t.Fatalf("expected multiple batches for %d oversized entries, got %d", len(entries), len(batches))
+	}
+	seen := map[string]string{}
+	for _, batch := range batches {
+		size := 0
+		for key, v := range batch {
+			size += len(key) + len(v) + 64
+			seen[key] = v
+		}
+		if size > bookkeepingMigrationBatchBudget {
+			t.Fatalf("batch size %d exceeds budget %d", size, bookkeepingMigrationBatchBudget)
+		}
+	}
+	if len(seen) != len(entries) {
+		t.Fatalf("chunking lost entries: got %d want %d", len(seen), len(entries))
+	}
+
+	// Deterministic order across runs.
+	again := chunkUserProperties(entries, bookkeepingMigrationBatchBudget)
+	if len(again) != len(batches) {
+		t.Fatalf("chunking not deterministic: %d vs %d batches", len(again), len(batches))
+	}
+
+	// Empty and single-entry inputs.
+	if got := chunkUserProperties(nil, bookkeepingMigrationBatchBudget); got != nil {
+		t.Fatalf("expected nil batches for empty input, got %v", got)
+	}
+	huge := map[string]string{PropTombstoneLedgerPrefix + "big": strings.Repeat("y", 2*bookkeepingMigrationBatchBudget)}
+	if got := chunkUserProperties(huge, bookkeepingMigrationBatchBudget); len(got) != 1 || len(got[0]) != 1 {
+		t.Fatalf("oversized single entry must get its own batch, got %v", got)
+	}
+}
+
+// The steady-state pass (cleanupParent=false, backlog already copied) must not
+// re-copy anything: identical child-local values are skipped entirely.
+func TestBookkeepingMigrationSkipsIdenticalCopies(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(client)
+	createParentDataset(t, client)
+
+	entry := tombstoneLedgerEntry{
+		Version:   tombstoneLedgerVersion,
+		Snapshot:  "pool/parent/vol@snap-csi-deleted-2",
+		Dataset:   "pool/parent/vol",
+		RenamedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	require.NoError(t, d.writeTombstoneLedgerEntry(ctx, entry))
+	enableBookkeeping(d)
+
+	parent, err := client.DatasetGet(ctx, d.parentDatasetName())
+	require.NoError(t, err)
+	d.migrateParentBookkeeping(ctx, parent)
+
+	// Second pass: identical copy already on the child → zero property writes.
+	before := client.SetUserPropertiesCallCount()
+	parent, err = client.DatasetGet(ctx, d.parentDatasetName())
+	require.NoError(t, err)
+	d.migrateParentBookkeeping(ctx, parent)
+	assert.Equal(t, before, client.SetUserPropertiesCallCount(),
+		"steady-state migration pass must be a no-op when copies already landed")
 }
