@@ -121,8 +121,10 @@ type ReconcileReport struct {
 	DeletedSpentRestoreObjects []string
 	DeletedTombstones          []string
 	DeletedRemnants            []string
+	AdoptedStamps              []string
 	SkippedDeletes             []ReconcileActionFailure
 	DeleteEnabled              bool
+	AdoptedStampCount          int
 }
 
 type snapshotContentState struct {
@@ -188,11 +190,13 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		})
 		sort.Slice(report.TombstoneSnapshots, func(i, j int) bool { return report.TombstoneSnapshots[i].ID < report.TombstoneSnapshots[j].ID })
 		sort.Slice(report.RemnantVolumes, func(i, j int) bool { return report.RemnantVolumes[i].ID < report.RemnantVolumes[j].ID })
+		sort.Strings(report.AdoptedStamps)
 		report.OrphanVolumeCount = len(report.OrphanVolumes)
 		report.OrphanSnapshotCount = len(report.OrphanSnapshots)
 		report.SpentRestoreSnapshotCount = len(report.SpentRestoreSnapshots)
 		report.TombstoneSnapshotCount = len(report.TombstoneSnapshots)
 		report.RemnantVolumeCount = len(report.RemnantVolumes)
+		report.AdoptedStampCount = len(report.AdoptedStamps)
 		// Publish even a partial pass so a single malformed object cannot freeze
 		// the last visible inventory indefinitely.
 		SetOrphanReconcileMetrics(report)
@@ -426,7 +430,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	// class's spent volsync restore snapshots (never reaped). When disabled,
 	// orphan volume/snapshot detection, orphaned-share detection, and tombstone
 	// sweeping still run. Deletion remains gated by opts.Delete and the
-	// per-object revalidation in deleteDetachedOrphans.
+	// per-object revalidation in deleteDetectedOrphans.
 	if d.config.Reconcile.SpentRestore.EnabledOrDefault() {
 		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState, &report)
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -440,6 +444,18 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	d.detectOrphanedShares(ctx, kubeState, &report)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		RecordReconcileFailure("orphan_share_detection")
+		return report, ctxErr
+	}
+
+	// Legacy stamp adoption (always-on; NOT gated by opts.Delete). Stamps
+	// driver_instance_id onto migration-era datasets that predate the v1.2.21
+	// ownership stamp so the delete-mode tombstone reaper — which refuses any
+	// source dataset lacking this instance's stamp — can finally act on their
+	// tombstones. It runs before tombstone sweeping so a freshly adopted source
+	// unblocks reaping in the SAME pass.
+	d.adoptLegacyOwnershipStamps(ctx, datasets, &report, d.config.Reconcile.Delete.MaxPerRun)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		RecordReconcileFailure("stamp_adoption")
 		return report, ctxErr
 	}
 
@@ -2146,6 +2162,156 @@ func (d *Driver) datasetHasLocalManagedResource(ctx context.Context, datasetName
 	return datasetHasLocalUserProperty(dataset, PropManagedResource, "true"), nil
 }
 
+// adoptLegacyOwnershipStamps stamps driver_instance_id onto legacy managed
+// datasets that provably belong to this cluster's Bound volumes but predate the
+// v1.2.21 ownership stamp (the 2026-07-23 04:00Z incident: the reaper refused
+// every age-eligible migration-era tombstone because its source dataset carried
+// LOCAL managed_resource + csi_volume_name but NO instance stamp, so the ledger
+// entries and -csi-deleted- snapshots accumulated forever).
+//
+// This is a WRITE that runs in detection mode (it is NOT gated by opts.Delete).
+// That is safe and deliberate: it only adds provenance to datasets that are
+// provably this cluster's Bound volumes (a live Bound PV of THIS driver
+// references them, and they carry this driver's own LOCAL managed_resource +
+// csi_volume_name); it deletes nothing; and it is required for the delete-mode
+// reaper to ever act on legacy tombstones. Adoptions are capped at maxPerRun
+// per pass as a blast-radius bound.
+//
+// Absolute rule: an existing driver_instance_id of ANY source (local,
+// inherited, or foreign) is NEVER overwritten — a dataset stamped by another
+// driver instance sharing the pool must not be hijacked.
+//
+// Residual: a legacy dataset that is NOT currently Bound is never adopted, so
+// its tombstones stay refused (fail-safe); operators can bind it or clean it up
+// manually.
+func (d *Driver) adoptLegacyOwnershipStamps(ctx context.Context, datasets []*truenas.Dataset, report *ReconcileReport, maxPerRun int) {
+	boundHandles, ok := d.liveBoundVolumeHandles(ctx)
+	if !ok {
+		// Fail-safe: a PV-list error or an empty view of this driver's PVs is an
+		// API discontinuity, not evidence that adoption is safe — adopt nothing.
+		return
+	}
+	parentName := d.parentDatasetName()
+	for _, ds := range datasets {
+		if maxPerRun > 0 && len(report.AdoptedStamps) >= maxPerRun {
+			break
+		}
+		if ds == nil {
+			continue
+		}
+		volumeID := path.Base(ds.Name)
+		if !datasetStrictlyBelowParent(ds.Name, parentName) || !validVolumeIDLeaf(volumeID) || volumeID == bookkeepingDatasetLeaf {
+			continue
+		}
+		// Source-bearing re-read (batch-12 DatasetGet pattern): the listing strips
+		// property source, so it is never trusted for the ownership/source checks.
+		candidate, err := d.truenasClient.DatasetGet(ctx, ds.Name)
+		if err != nil {
+			if !truenas.IsNotFoundError(err) {
+				d.recordReconcileObjectFailure("stamp_adoption", ds.Name, err)
+			}
+			continue
+		}
+		// LOCAL managed_resource AND LOCAL csi_volume_name matching the dataset
+		// leaf prove this driver created the dataset (a same-name CreateVolume
+		// derives the leaf from the PVC UID, which is also the PV volumeHandle).
+		if !datasetHasLocalUserProperty(candidate, PropManagedResource, "true") {
+			continue
+		}
+		if !datasetHasLocalUserProperty(candidate, PropCSIVolumeName, volumeID) {
+			continue
+		}
+		// Absolute rule: never overwrite an existing instance stamp of any source.
+		if _, present := datasetUserPropertyProjection(candidate, PropDriverInstanceID); present {
+			continue
+		}
+		// A live Bound PV of THIS driver must reference the volume.
+		if _, bound := boundHandles[volumeID]; !bound {
+			continue
+		}
+		adopted, adoptErr := d.writeAndVerifyAdoptionStamp(ctx, ds.Name, volumeID)
+		if adoptErr != nil {
+			d.recordReconcileObjectFailure("stamp_adoption", ds.Name, adoptErr)
+			continue
+		}
+		if !adopted {
+			continue
+		}
+		report.AdoptedStamps = append(report.AdoptedStamps, volumeID)
+		klog.Infof("Orphan reconcile: adopted ownership stamp on legacy volume %s", volumeID)
+	}
+}
+
+// liveBoundVolumeHandles live-lists PersistentVolumes (clientset List, NOT
+// informer caches) and returns the volume handles referenced by a Bound PV of
+// THIS driver. The boolean is false when the list fails or when NO PV references
+// this driver at all — the standard fail-safe shared with the remnant classifier:
+// an API discontinuity (or an empty view of the driver's PVs) is not evidence
+// that adoption is safe, so the caller adopts nothing this pass.
+func (d *Driver) liveBoundVolumeHandles(ctx context.Context) (map[string]struct{}, bool) {
+	clientset, _, err := d.kubernetesReconcileClients()
+	if err != nil {
+		return nil, false
+	}
+	pvs, err := clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		d.recordReconcileObjectFailure("stamp_adoption_pv_list", d.name, err)
+		return nil, false
+	}
+	handles := make(map[string]struct{})
+	driverPVCount := 0
+	for i := range pvs.Items {
+		pv := &pvs.Items[i]
+		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != d.name {
+			continue
+		}
+		driverPVCount++
+		if pv.Status.Phase == corev1.VolumeBound {
+			handles[pv.Spec.CSI.VolumeHandle] = struct{}{}
+		}
+	}
+	if driverPVCount == 0 {
+		return nil, false
+	}
+	return handles, true
+}
+
+// writeAndVerifyAdoptionStamp persists driver_instance_id through the proven
+// stampAndMirror user-property write path used at create time, then verifies the
+// write with a source-bearing re-read before reporting it adopted. It serializes
+// on the per-volume lock and re-proves the stamp is still absent immediately
+// before writing, so a concurrent create or peer that stamped the dataset between
+// the detection read and the write is never overwritten (the absolute rule). It
+// returns adopted=false (no error) when the dataset is already stamped — a
+// write-free no-op.
+func (d *Driver) writeAndVerifyAdoptionStamp(ctx context.Context, datasetName, volumeID string) (bool, error) {
+	lockKey := "volume:" + volumeID
+	if !d.acquireOperationLock(lockKey) {
+		return false, fmt.Errorf("volume operation in progress for %s", volumeID)
+	}
+	defer d.releaseOperationLock(lockKey)
+	fresh, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		return false, fmt.Errorf("adoption stamp revalidation failed: %w", err)
+	}
+	if _, present := datasetUserPropertyProjection(fresh, PropDriverInstanceID); present {
+		return false, nil
+	}
+	if stampErr := stampAndMirror(ctx, d.truenasClient, fresh, datasetName, map[string]string{
+		PropDriverInstanceID: d.driverInstanceID(),
+	}); stampErr != nil {
+		return false, stampErr
+	}
+	reread, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		return false, fmt.Errorf("re-read dataset after adoption stamp: %w", err)
+	}
+	if !datasetHasLocalUserProperty(reread, PropDriverInstanceID, d.driverInstanceID()) {
+		return false, fmt.Errorf("adoption stamp did not persist with a local source on %s", datasetName)
+	}
+	return true, nil
+}
+
 func (d *Driver) revalidateOrphanVolume(
 	ctx context.Context,
 	orphan ReconcileObject,
@@ -2601,8 +2767,8 @@ func (d *Driver) startOrphanReconcile() {
 				return
 			}
 			if reconcileErr == nil {
-				klog.Infof("Orphan reconcile detection complete: volumes=%d snapshots=%d spentRestoreSnapshots=%d tombstones=%d remnants=%d",
-					report.OrphanVolumeCount, report.OrphanSnapshotCount, report.SpentRestoreSnapshotCount, report.TombstoneSnapshotCount, report.RemnantVolumeCount)
+				klog.Infof("Orphan reconcile detection complete: volumes=%d snapshots=%d spentRestoreSnapshots=%d tombstones=%d remnants=%d adoptedStamps=%d",
+					report.OrphanVolumeCount, report.OrphanSnapshotCount, report.SpentRestoreSnapshotCount, report.TombstoneSnapshotCount, report.RemnantVolumeCount, report.AdoptedStampCount)
 			}
 		}
 
