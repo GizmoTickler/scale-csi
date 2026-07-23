@@ -528,6 +528,17 @@ reconcile:
     # sweeping are unaffected and still run. Default: true.
     enabled: true
 
+
+  # Relocate the driver's durable bookkeeping (tombstone ledger + in-flight
+  # markers) from the inheritable parent dataset to a dedicated non-inheriting
+  # .csi-bookkeeping child (lossless dual-read migration). Prevents ledger
+  # entries from being inherited by every snapshot, which inflates
+  # zfs.resource.snapshot.query payloads. cleanupParent additionally permits
+  # removing parent-side entries after a confirmed copy (keep false for the
+  # first soak; do not disable enabled after entries exist only on the child).
+  bookkeeping:
+    enabled: false
+    cleanupParent: false
   delete:
     # SAFETY: guarded deletion is opt-in and disabled by default. When enabled,
     # a CronJob runs --mode=reconcile and backend cleanup still goes through the

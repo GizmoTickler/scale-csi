@@ -125,6 +125,9 @@ data:
       minOrphanAge: {{ .Values.reconcile.minOrphanAge | quote }}
       spentRestore:
         enabled: {{ .Values.reconcile.spentRestore.enabled }}
+      bookkeeping:
+        enabled: {{ .Values.reconcile.bookkeeping.enabled }}
+        cleanupParent: {{ .Values.reconcile.bookkeeping.cleanupParent }}
       delete:
         enabled: {{ .Values.reconcile.delete.enabled }}
         schedule: {{ .Values.reconcile.delete.schedule | quote }}

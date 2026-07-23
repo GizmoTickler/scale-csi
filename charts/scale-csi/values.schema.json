@@ -908,6 +908,18 @@
               "default": 5
             }
           }
+        },
+        "bookkeeping": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "cleanupParent": {
+              "type": "boolean"
+            }
+          }
         }
       }
     },
