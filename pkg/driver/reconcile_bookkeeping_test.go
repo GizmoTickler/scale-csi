@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"k8s.io/apimachinery/pkg/runtime"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -250,4 +253,91 @@ func TestBookkeepingMigrationSkipsIdenticalCopies(t *testing.T) {
 	d.migrateParentBookkeeping(ctx, parent)
 	assert.Equal(t, before, client.SetUserPropertiesCallCount(),
 		"steady-state migration pass must be a no-op when copies already landed")
+}
+
+// bookkeepingTombstone builds a stamped source with an aged deferred-delete
+// tombstone (clone left in place; callers release it before reaping). The
+// ledger entry lands wherever the driver's CURRENT bookkeeping config routes it.
+func bookkeepingTombstone(t *testing.T, d *Driver, client *truenas.MockClient) string {
+	t.Helper()
+	ctx := context.Background()
+	client.NoDeferredSnapshotDestroy = true
+	mustCreateParentDataset(t, client)
+	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropManagedResource:           "true",
+		PropCSISnapshotName:           "snap-1",
+		PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	snapshot.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/restored"))
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "snap-1"})
+	require.NoError(t, err)
+	tombstoneID := findTombstoneID(t, client, source.Name)
+	require.NotEmpty(t, tombstoneID, "the tombstone is retained while its clone is live")
+	return tombstoneID
+}
+
+// Regression (live 2026-07-24 04:00Z GC run): reapTombstoneSnapshot revalidated
+// provenance from a PARENT-ONLY ledger read while the relocation writes new
+// entries to the bookkeeping child, so freshly tombstoned snapshots were
+// refused with "no tombstone ledger entry proves driver provenance". The
+// revalidation must dual-read exactly like the detection pass.
+func TestReapTombstoneWithChildOnlyLedgerEntry(t *testing.T) {
+	ctx := context.Background()
+	pv := boundReconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	enableBookkeeping(d)
+	tombstoneID := bookkeepingTombstone(t, d, client)
+
+	parent, err := client.DatasetGet(ctx, d.parentDatasetName())
+	require.NoError(t, err)
+	require.NotContains(t, tombstoneLedgerFromDataset(parent), tombstoneLedgerKey(tombstoneID),
+		"precondition: the relocated entry must not be on the parent")
+	child, err := client.DatasetGet(ctx, d.bookkeepingDatasetName())
+	require.NoError(t, err)
+	require.Contains(t, tombstoneLedgerFromDataset(child), tombstoneLedgerKey(tombstoneID),
+		"precondition: the fresh entry lives on the child only")
+
+	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
+	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour)
+	assert.True(t, reaped, "child-only provenance must authorize the reap, got refusal: %s", reason)
+	_, err = client.SnapshotGet(ctx, tombstoneID)
+	assert.True(t, truenas.IsNotFoundError(err), "the released tombstone is destroyed")
+	child, err = client.DatasetGet(ctx, d.bookkeepingDatasetName())
+	require.NoError(t, err)
+	assert.NotContains(t, tombstoneLedgerFromDataset(child), tombstoneLedgerKey(tombstoneID),
+		"the child ledger entry is retired with the reap")
+}
+
+// The exact production sequence of the cleanupParent flip: an entry written to
+// the parent BEFORE the relocation is copied to the child, cleanupParent
+// removes the parent copy, and the tombstone must still reap from child-side
+// provenance afterwards.
+func TestReapSurvivesCleanupParentMigration(t *testing.T) {
+	ctx := context.Background()
+	pv := boundReconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	tombstoneID := bookkeepingTombstone(t, d, client)
+
+	parent, err := client.DatasetGet(ctx, d.parentDatasetName())
+	require.NoError(t, err)
+	require.Contains(t, tombstoneLedgerFromDataset(parent), tombstoneLedgerKey(tombstoneID),
+		"precondition: relocation off, the entry starts on the parent")
+
+	enableBookkeeping(d)
+	d.config.Reconcile.Bookkeeping.CleanupParent = true
+	d.migrateParentBookkeeping(ctx, parent)
+	parent, err = client.DatasetGet(ctx, d.parentDatasetName())
+	require.NoError(t, err)
+	require.NotContains(t, tombstoneLedgerFromDataset(parent), tombstoneLedgerKey(tombstoneID),
+		"cleanupParent must remove the confirmed-copied parent entry")
+
+	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
+	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour)
+	assert.True(t, reaped, "the migrated child entry must still authorize the reap, got refusal: %s", reason)
+	_, err = client.SnapshotGet(ctx, tombstoneID)
+	assert.True(t, truenas.IsNotFoundError(err), "the released tombstone is destroyed after the parent cleanup")
 }

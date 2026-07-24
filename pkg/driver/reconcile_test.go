@@ -246,6 +246,101 @@ func TestReconcileOrphansDeleteSkipsSnapshotsForHandlelessDriverVSC(t *testing.T
 	require.NoError(t, getErr)
 }
 
+// reconcileUnpopulatedSnapshotContent models a VolumeSnapshotContent whose
+// status the external-snapshotter has not populated: a dynamic content
+// mid-creation (sourceHandle empty) or a pre-provisioned content whose backend
+// handle lives in spec.source.snapshotHandle.
+func reconcileUnpopulatedSnapshotContent(
+	name, driverName string, created time.Time, sourceHandle string,
+) *unstructured.Unstructured {
+	source := map[string]interface{}{"volumeHandle": "some-volume"}
+	if sourceHandle != "" {
+		source = map[string]interface{}{"snapshotHandle": sourceHandle}
+	}
+	metadata := map[string]interface{}{"name": name}
+	if !created.IsZero() {
+		metadata["creationTimestamp"] = created.UTC().Format(time.RFC3339)
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "snapshot.storage.k8s.io/v1",
+		"kind":       "VolumeSnapshotContent",
+		"metadata":   metadata,
+		"spec": map[string]interface{}{
+			"driver": driverName,
+			"source": source,
+			"volumeSnapshotRef": map[string]interface{}{
+				"namespace": "storage",
+				"name":      name,
+			},
+		},
+	}}
+}
+
+// Regression (live 2026-07-24 04:00Z GC run): the nightly delete pass raced
+// VolSync's hourly snapshot schedule and found nine driver contents mid-creation
+// with no status.snapshotHandle, which failed the ENTIRE snapshot deletion pass
+// closed every night. A dynamic content younger than the orphan age gate cannot
+// own a delete-eligible backend snapshot (its snapshot is strictly younger than
+// the content object and guarded deletion re-proves age before destroy), so it
+// must not block the pass.
+func TestReconcileOrphansDeleteToleratesYoungInflightVSC(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false, nil, []runtime.Object{
+		reconcileSnapshotContent("live-content", "storage", "live-snapshot", "live-snapshot", "csi.scale.io"),
+		reconcileUnpopulatedSnapshotContent("inflight-content", "csi.scale.io", time.Now().Add(-30*time.Second), ""),
+	})
+	addReconcileSnapshot(t, client, "orphan-volume", "orphan-snapshot", time.Now().Add(-48*time.Hour), true, 20)
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{
+		Delete: true, MinOrphanAge: time.Hour,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orphan-snapshot"}, report.DeletedSnapshots,
+		"an in-flight content younger than the age gate must not fail the snapshot pass closed")
+	assert.Empty(t, report.SkippedDeletes)
+}
+
+// A handle-less dynamic content OLDER than the orphan age gate is a stuck
+// creation, not an in-flight race: it could own an age-eligible backend
+// snapshot, so the snapshot deletion pass must still fail closed.
+func TestReconcileOrphansDeleteStillBlocksOnOldHandlelessVSC(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false, nil, []runtime.Object{
+		reconcileSnapshotContent("live-content", "storage", "live-snapshot", "live-snapshot", "csi.scale.io"),
+		reconcileUnpopulatedSnapshotContent("stuck-content", "csi.scale.io", time.Now().Add(-48*time.Hour), ""),
+	})
+	addReconcileSnapshot(t, client, "orphan-volume", "orphan-snapshot", time.Now().Add(-48*time.Hour), true, 20)
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{
+		Delete: true, MinOrphanAge: time.Hour,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, report.DeletedSnapshots)
+	require.NotEmpty(t, report.SkippedDeletes)
+	assert.Contains(t, report.SkippedDeletes[0].Reason, "no readable status.snapshotHandle")
+	_, getErr := client.SnapshotGet(context.Background(), "pool/parent/orphan-volume@orphan-snapshot")
+	require.NoError(t, getErr)
+}
+
+// A pre-provisioned content declares its backend handle in spec.source before
+// status is ever populated; that handle is a live grant, so the backend
+// snapshot it references is neither classified as an orphan nor does the
+// content block the deletion pass.
+func TestReconcileOrphansPreProvisionedVSCUsesSpecSourceHandle(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false, nil, []runtime.Object{
+		reconcileUnpopulatedSnapshotContent("preprov-content", "csi.scale.io", time.Now().Add(-72*time.Hour), "preprov-snapshot"),
+	})
+	addReconcileSnapshot(t, client, "orphan-volume", "preprov-snapshot", time.Now().Add(-48*time.Hour), true, 20)
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{
+		Delete: true, MinOrphanAge: time.Hour,
+	})
+	require.NoError(t, err)
+	assert.Zero(t, report.OrphanSnapshotCount,
+		"a snapshot referenced by a pre-provisioned content's spec.source handle is live, not orphaned")
+	assert.Empty(t, report.DeletedSnapshots)
+	_, getErr := client.SnapshotGet(context.Background(), "pool/parent/orphan-volume@preprov-snapshot")
+	require.NoError(t, getErr)
+}
+
 func TestReconcileOrphansUsesSnapshotIDBeforeSnapshotName(t *testing.T) {
 	d, client := newReconcileTestDriver(t, false, nil, []runtime.Object{
 		reconcileSnapshotContent("live-content", "storage", "live-snapshot", "live-snapshot", "csi.scale.io"),
