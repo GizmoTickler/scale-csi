@@ -31,6 +31,9 @@ const (
 	defaultControllerReconcileMinOrphanAge   = 24 * time.Hour
 	replicationJobReasonMissingMarker        = "missing_marker"
 	replicationJobReasonMissingSourceDataset = "missing_source_dataset"
+	// deletionCapReasonPrefix marks skips caused purely by the per-run deletion
+	// cap so reporting can separate backlog pressure from real guard refusals.
+	deletionCapReasonPrefix = "deletion cap reached"
 )
 
 var (
@@ -125,6 +128,19 @@ type ReconcileReport struct {
 	SkippedDeletes             []ReconcileActionFailure
 	DeleteEnabled              bool
 	AdoptedStampCount          int
+}
+
+// CapSkippedDeletes counts guarded deletes that were skipped only because the
+// per-run deletion cap was already spent. The remainder of SkippedDeletes are
+// guard refusals that need operator attention.
+func (r *ReconcileReport) CapSkippedDeletes() int {
+	count := 0
+	for i := range r.SkippedDeletes {
+		if strings.HasPrefix(r.SkippedDeletes[i].Reason, deletionCapReasonPrefix) {
+			count++
+		}
+	}
+	return count
 }
 
 type snapshotContentState struct {
@@ -224,7 +240,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		RecordReconcileFailure("list_backend_snapshots")
 		return report, fmt.Errorf("list managed backend snapshots: %w", err)
 	}
-	kubeState, err := d.loadKubernetesReconcileState(ctx)
+	kubeState, err := d.loadKubernetesReconcileState(ctx, minOrphanAge)
 	if err != nil {
 		RecordReconcileFailure("load_kubernetes_state")
 		return report, err
@@ -512,7 +528,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 
 	// Re-list Kubernetes state immediately before mutation so a newly created PV
 	// or snapshot binding cannot be deleted using a stale detection snapshot.
-	currentState, err := d.loadKubernetesReconcileState(ctx)
+	currentState, err := d.loadKubernetesReconcileState(ctx, minOrphanAge)
 	if err != nil {
 		RecordReconcileFailure("revalidate_kubernetes_state")
 		return report, fmt.Errorf("revalidate Kubernetes state before delete: %w", err)
@@ -1059,7 +1075,7 @@ func (d *Driver) kubernetesReconcileClients() (
 	return d.eventRecorder.clientset, d.eventRecorder.dynamicClient, nil
 }
 
-func (d *Driver) loadKubernetesReconcileState(ctx context.Context) (*kubernetesReconcileState, error) {
+func (d *Driver) loadKubernetesReconcileState(ctx context.Context, minOrphanAge time.Duration) (*kubernetesReconcileState, error) {
 	clientset, dynamicClient, err := d.kubernetesReconcileClients()
 	if err != nil {
 		return nil, err
@@ -1126,12 +1142,40 @@ func (d *Driver) loadKubernetesReconcileState(ctx context.Context) (*kubernetesR
 		}
 		handle, found, nestedErr := unstructured.NestedString(content.Object, "status", "snapshotHandle")
 		if nestedErr != nil || !found || handle == "" {
-			klog.Warningf(
-				"Orphan reconcile: skipping driver VolumeSnapshotContent %s because status.snapshotHandle is unavailable",
-				content.GetName(),
+			// Pre-provisioned contents declare their backend handle in
+			// spec.source before the snapshotter ever populates status; that
+			// handle is authoritative and keeps the content a live grant.
+			sourceHandle, sourceFound, sourceErr := unstructured.NestedString(
+				content.Object, "spec", "source", "snapshotHandle",
 			)
-			state.handlelessSnapshotContentNames = append(state.handlelessSnapshotContentNames, content.GetName())
-			continue
+			switch {
+			case sourceErr == nil && sourceFound && sourceHandle != "":
+				handle = sourceHandle
+			case !content.GetCreationTimestamp().Time.IsZero() &&
+				time.Since(content.GetCreationTimestamp().Time) < minOrphanAge:
+				// Dynamic content mid-creation (e.g. the nightly GC run racing
+				// VolSync's hourly snapshot schedule). Its backend snapshot
+				// cannot be older than the content object, and every guarded
+				// snapshot delete re-proves age >= minOrphanAge immediately
+				// before destroy, so content younger than the gate cannot own
+				// a delete-eligible backend snapshot. Skip it without failing
+				// the whole snapshot deletion pass closed. The safety margin
+				// of this carve-out is minOrphanAge minus TrueNAS<->kube-API
+				// clock skew: it is enormous at the 24h default but shrinks if
+				// an operator tunes minOrphanAge down to minutes.
+				klog.V(2).Infof(
+					"Orphan reconcile: ignoring in-flight driver VolumeSnapshotContent %s (age %v < min orphan age %v, status.snapshotHandle not yet populated)",
+					content.GetName(), time.Since(content.GetCreationTimestamp().Time).Round(time.Second), minOrphanAge,
+				)
+				continue
+			default:
+				klog.Warningf(
+					"Orphan reconcile: skipping driver VolumeSnapshotContent %s because status.snapshotHandle is unavailable",
+					content.GetName(),
+				)
+				state.handlelessSnapshotContentNames = append(state.handlelessSnapshotContentNames, content.GetName())
+				continue
+			}
 		}
 		state.snapshotHandles[handle] = struct{}{}
 		namespace, _, namespaceErr := unstructured.NestedString(content.Object, "spec", "volumeSnapshotRef", "namespace")
@@ -1332,7 +1376,7 @@ func (d *Driver) deleteDetectedOrphans(
 			report,
 			kind,
 			id,
-			fmt.Sprintf("deletion cap reached (maxPerRun=%d)", maxPerRun),
+			fmt.Sprintf("%s (maxPerRun=%d)", deletionCapReasonPrefix, maxPerRun),
 		)
 		return true
 	}
@@ -1608,12 +1652,33 @@ func (d *Driver) reapTombstoneSnapshot(
 	if snapshotIsLiveCSIObjectWithTombstoneShapedName(snapshot) {
 		return false, "snapshot carries live CSI identity; refusing to reap"
 	}
-	// Re-prove driver provenance from a fresh parent read under the lock.
+	// Re-prove driver provenance from a fresh dual-location read under the lock.
+	// Relocation (bookkeeping.enabled) writes new ledger entries to the dedicated
+	// child dataset and cleanupParent removes migrated ones from the parent, so a
+	// valid entry may live in either location. A parent-only read here would
+	// permanently refuse to reap any tombstone whose entry exists only on the
+	// child (and, once cleanupParent runs, every tombstone).
 	parent, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
 	if parentErr != nil {
 		return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", parentErr)
 	}
-	entry, recorded := tombstoneLedgerFromDataset(parent)[tombstoneLedgerKey(snapshot.ID)]
+	ledger := tombstoneLedgerFromDataset(parent)
+	if d.bookkeepingEnabled() {
+		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+		if bkErr != nil {
+			// An absent child is legitimate (no entry migrated or written yet);
+			// any other read failure must fail closed, not silently downgrade to
+			// a parent-only decision.
+			if !truenas.IsNotFoundError(bkErr) {
+				return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", bkErr)
+			}
+		} else {
+			for key, childEntry := range tombstoneLedgerFromDataset(bookkeeping) {
+				ledger[key] = childEntry
+			}
+		}
+	}
+	entry, recorded := ledger[tombstoneLedgerKey(snapshot.ID)]
 	if !recorded || entry.Snapshot != snapshot.ID {
 		return false, "no tombstone ledger entry proves driver provenance"
 	}
