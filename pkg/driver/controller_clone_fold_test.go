@@ -121,7 +121,7 @@ func (m *recoveryWinsCloneCleanupRaceClient) DatasetUpdate(
 	if err != nil {
 		return nil, err
 	}
-	if err := m.MockClient.DatasetSetUserProperty(ctx, name, PropDriverInstanceID, m.owner); err != nil {
+	if err := m.DatasetSetUserProperty(ctx, name, PropDriverInstanceID, m.owner); err != nil {
 		return nil, err
 	}
 	// Return the partial response from our failed update. The peer's ownership
@@ -202,7 +202,7 @@ func TestSnapshotCloneFoldCrashStatesRecoverThroughExistingArm(t *testing.T) {
 			require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, marker.Dataset))
 
 			if tc.applyFolded {
-				_, err = d.setAndVerifyDatasetProps(ctx, marker.Dataset, int64(2*testGiB), map[string]string{
+				_, err = d.setAndVerifyDatasetProps(ctx, marker.Dataset, 2*testGiB, map[string]string{
 					PropVolumeContentSourceType: "snapshot",
 					PropVolumeContentSourceID:   "snap-1",
 				})
@@ -341,8 +341,8 @@ func TestSnapshotCloneFoldQuotaAndZvolPaths(t *testing.T) {
 			require.Len(t, client.foldUpdates, 1, "quota and content source must share exactly one update")
 			fold := client.foldUpdates[0]
 			if tc.wantRefquota {
-				assert.Equal(t, int64(2*testGiB), fold.Refquota)
-				assert.Equal(t, int64(2*testGiB), datasetPropertyBytes(created.Refquota))
+				assert.Equal(t, 2*testGiB, fold.Refquota)
+				assert.Equal(t, 2*testGiB, datasetPropertyBytes(created.Refquota))
 				assert.True(t, isLocalUserPropertySource(created.Refquota.Source))
 			} else {
 				assert.Nil(t, fold.Refquota)
@@ -359,7 +359,7 @@ func TestSnapshotCloneFoldQuotaAndZvolPaths(t *testing.T) {
 			assert.NotContains(t, properties, PropDriverInstanceID,
 				"ownership must stay outside the merged content-source update")
 			if tc.datasetType == "VOLUME" {
-				assert.Equal(t, int64(2*testGiB), datasetPropertyBytes(created.Volsize))
+				assert.Equal(t, 2*testGiB, datasetPropertyBytes(created.Volsize))
 			}
 		})
 	}
