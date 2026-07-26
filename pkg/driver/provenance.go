@@ -81,10 +81,18 @@ func (d *Driver) bookkeepingEnabled() bool {
 }
 
 // ensureBookkeepingDataset lazily and idempotently creates the dedicated
-// bookkeeping child dataset on first write.
+// bookkeeping child dataset on first write. Once the dataset is known to exist
+// the existence check is short-circuited by bookkeepingExists, removing one
+// pool.dataset.query per marker / tombstone-ledger write; the flag is re-armed
+// on any bookkeeping write failure (see noteBookkeepingWriteFailure) so a
+// deleted-out-from-under dataset is re-checked and recreated on the next write.
 func (d *Driver) ensureBookkeepingDataset(ctx context.Context) error {
+	if d.bookkeepingExists.Load() {
+		return nil
+	}
 	name := d.bookkeepingDatasetName()
 	if _, err := d.truenasClient.DatasetGet(ctx, name); err == nil {
+		d.bookkeepingExists.Store(true)
 		return nil
 	} else if !truenas.IsNotFoundError(err) {
 		return err
@@ -92,7 +100,19 @@ func (d *Driver) ensureBookkeepingDataset(ctx context.Context) error {
 	if _, err := d.truenasClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: name, Type: "FILESYSTEM"}); err != nil && !truenas.IsAlreadyExistsError(err) {
 		return err
 	}
+	d.bookkeepingExists.Store(true)
 	return nil
+}
+
+// noteBookkeepingWriteFailure re-arms the bookkeeping-existence fast path when a
+// write that targeted the dedicated bookkeeping dataset fails. A failure there
+// means the cached "exists" assumption may be stale (e.g. the dataset was deleted
+// out from under the driver), so the next ensure re-checks and recreates it.
+// Writes to the parent dataset never touch the flag.
+func (d *Driver) noteBookkeepingWriteFailure(target string, err error) {
+	if err != nil && d.bookkeepingEnabled() && target == d.bookkeepingDatasetName() {
+		d.bookkeepingExists.Store(false)
+	}
 }
 
 // bookkeepingWriteTarget returns the dataset new bookkeeping entries are written
@@ -158,6 +178,7 @@ func (d *Driver) writeInflightMarker(ctx context.Context, marker inflightMarker)
 		return status.Errorf(codes.Internal, "resolve bookkeeping dataset for in-flight marker: %v", err)
 	}
 	if _, err := d.setAndVerifyDatasetUserProperties(ctx, target, map[string]string{key: string(encoded)}); err != nil {
+		d.noteBookkeepingWriteFailure(target, err)
 		return status.Errorf(codes.Internal,
 			"record in-flight creation marker for %s on %s: %v", marker.Dataset, target, err)
 	}
@@ -481,6 +502,7 @@ func (d *Driver) writeTombstoneLedgerEntry(ctx context.Context, entry tombstoneL
 	if _, err := d.setAndVerifyDatasetUserProperties(ctx, target, map[string]string{
 		tombstoneLedgerKey(entry.Snapshot): string(encoded),
 	}); err != nil {
+		d.noteBookkeepingWriteFailure(target, err)
 		return fmt.Errorf("record tombstone ledger entry for %s on %s: %w", entry.Snapshot, target, err)
 	}
 	return nil
@@ -547,6 +569,7 @@ func (d *Driver) migrateParentBookkeeping(ctx context.Context, parent *truenas.D
 	// on 26.0 with a ~300-entry single-call migration).
 	for _, batch := range chunkUserProperties(pending, bookkeepingMigrationBatchBudget) {
 		if err := d.truenasClient.DatasetSetUserProperties(ctx, d.bookkeepingDatasetName(), batch); err != nil {
+			d.noteBookkeepingWriteFailure(d.bookkeepingDatasetName(), err)
 			d.recordReconcileObjectFailure("bookkeeping_migration", d.bookkeepingDatasetName(), err)
 			return
 		}

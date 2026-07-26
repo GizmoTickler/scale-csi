@@ -114,6 +114,14 @@ type Driver struct {
 	// flag is the pragmatic, deterministic choice.
 	datasetUpdateVerifiedOnce atomic.Bool
 
+	// bookkeepingExists caches that the dedicated bookkeeping child dataset is
+	// present so ensureBookkeepingDataset does not issue a pool.dataset.query
+	// existence check on EVERY marker / tombstone-ledger write (~400/day live).
+	// It is set after the first successful ensure and re-armed (cleared) on any
+	// bookkeeping write failure, so a dataset deleted out from under the driver
+	// self-heals on the next write instead of failing behind a stale flag.
+	bookkeepingExists atomic.Bool
+
 	// Request counter for generating unique request IDs
 	requestCounter uint64
 
