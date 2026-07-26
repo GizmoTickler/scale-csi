@@ -1,7 +1,93 @@
-# Next release notes (draft)
+# Release notes — v1.3.0
 
-This draft describes changes after v1.2.23. It is intentionally not a tag or a
-final version announcement.
+This document is the accumulated changelog from the v1.2.23 documentation
+baseline through the **v1.3.0** tag. Entries are newest-first. v1.3.0 bundles the
+v1.2.24–v1.2.35 fixes plus the batch 17–20 performance, resilience, and
+maintainability work.
+
+## v1.3.0 — publish/reconcile performance, subscribe job-wait, clone fold, ledger v2
+
+Batches 17–20, plus an adversarial-review maintainability round.
+
+### Performance
+
+- **Publish/unpublish path resolution threading.** Intra-request re-resolution
+  on the publish/unpublish path was eliminated and the round-trip cost is now
+  pinned by golden tests. The strict-mode NVMe-oF steady-state republish is
+  **9 TrueNAS round trips** (down from ~13); records-only `off`+NFS is 3 and
+  `additive`+NFS is 5.
+- **Reconcile N+1 elimination.** A reconcile pass dropped from ~90–95 round
+  trips to ~15 by fetching the parent snapshot/dataset sets once and partitioning
+  in memory, caching bookkeeping-dataset existence behind an atomic flag, and
+  batching post-destroy tombstone-ledger removals to the end of the pass.
+- **Hybrid `core.subscribe` job-wait + typed decode.** List-heavy and
+  job-bearing paths wait on `core.subscribe` job completion events with a polling
+  fallback, and decode responses through typed JSON decoders instead of
+  `map[string]interface{}` reflection.
+- **Response-verified quota + content-source fold.** `CreateVolume` from a
+  snapshot trusts the mutation response to verify quota and content-source
+  instead of re-reading, folding the clone hot path to **12 round trips**.
+- **Attacher/resizer timeout.** The external-attacher and external-resizer
+  sidecar `--timeout` is **120s** (was 300s), so a stuck TrueNAS publish or
+  expand cannot pin the sidecar for five minutes. Provisioner and snapshotter
+  remain 300s.
+
+### Resilience and data safety
+
+- **Scan-fallback tombstone reaper.** New opt-in
+  `reconcile.tombstoneReaper.scanFallback.enabled` (default **off**). When a pass
+  finds zero ledger-proven tombstones, it performs one bounded
+  `zfs.resource.snapshot.query` scan (limit 500, no recursion) and reaps only
+  tombstone-shaped snapshots whose provenance is proven by **either** a ledger
+  entry **or** (tombstone shape + source-dataset ownership stamp + age gate). It
+  never widens what counts as this driver's object. Tombstones no belt can prove
+  are surfaced as `manualRecoveryTombstones` and never auto-destroyed.
+- **Tombstone ledger v2 (`CreateTXG`).** Ledger entries now key on the snapshot's
+  ZFS `CreateTXG` so a delete/recreate at the same name cannot be confused; v1
+  entries remain readable.
+- **Clone-property scrub.** After stamping a clone, source-proven
+  protocol-foreign inherited backreference properties are scrubbed so a clone
+  never carries another protocol's stale share IDs.
+- **Dangling staging-symlink self-heal.** A dangling node staging symlink is
+  repaired in place instead of wedging the stage.
+- **`IsNotFoundError` tightened.** Not-found detection matches the error
+  `Message` (26.0 errno shape) rather than the full error string, avoiding
+  false positives.
+
+### Maintainability
+
+- The monolithic `reconcile.go` was split along its test seams into per-concern
+  files (`reconcile_kubestate.go`, `reconcile_publications.go`,
+  `reconcile_shares.go`, `reconcile_tombstones.go`, `reconcile_remnants.go`,
+  `reconcile_spent_restore.go`, `reconcile_adoption.go`) — pure moves, no
+  behavior change. `LoadConfig` was split into
+  `applyConfigDefaults`/`validateConfig`/sniffing helpers, and a shared dual-read
+  bookkeeping helper was extracted. No configuration keys changed in this round.
+
+No new chart keys are introduced by the maintainability round;
+`reconcile.tombstoneReaper.scanFallback` is the one new configuration surface
+(exposed in `values.yaml`, `values.schema.json`, and the ConfigMap).
+
+## v1.2.35 — dual-read reap provenance + honest counters
+
+From the 2026-07-24 live GC run:
+
+- **`cleanupParent`-safe dual-read reap provenance.** The tombstone reaper proves
+  provenance by reading *both* bookkeeping locations, so a reap stays correct
+  mid-migration even after `cleanupParent` has removed the parent-side copy.
+- **In-flight `VolumeSnapshotContent` tolerance.** A snapshot whose
+  `VolumeSnapshotContent` is still being created is no longer misclassified.
+- **Honest summary counters.** The reconcile summary line reports what was
+  actually acted on (including `manualRecoveryTombstones`), not optimistic
+  totals.
+
+## v1.2.30–v1.2.32 — bookkeeping migration chunking
+
+The bookkeeping-dataset migration copies parent entries to the
+`<parent>/.csi-bookkeeping` child in batches bounded well under TrueNAS's 64 kB
+WebSocket inbound limit (close 1009), and skips entries already present on the
+child so a re-run is idempotent. This made the batch-14 relocation safe on real
+appliances with many entries.
 
 ## Batch 16 (v1.2.34) — legacy stamp adoption
 
@@ -229,7 +315,11 @@ PVs are not reprovisioned merely because new claims use the replacement class.
 
 ## Documentation compatibility
 
-All shipped direct-driver examples now pass strict YAML parsing. The deployment,
-Nomad, topology, StorageClass, production, troubleshooting, architecture, and
-disaster-recovery guides now describe only implemented flags, values, and
-runtime behavior.
+All shipped direct-driver examples pass strict YAML parsing. The README and the
+deployment, Nomad, topology, StorageClass, production, troubleshooting,
+architecture, snapshots, and disaster-recovery guides were re-audited against the
+v1.3.0 code and describe only implemented flags, values, metrics, and runtime
+behavior. This pass corrected stale chart keys in troubleshooting
+(`nfs.server`/`iscsi.portal`/`nvmeof.address`), documented the
+`snapshotRestoreMode` StorageClass parameter, and recorded the always-on leader
+election and the WebSocket pool/resilience internals.
