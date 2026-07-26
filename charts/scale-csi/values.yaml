@@ -547,6 +547,19 @@ reconcile:
   bookkeeping:
     enabled: false
     cleanupParent: false
+
+  # Tombstone reaper tuning.
+  tombstoneReaper:
+    # Bounded-scan fallback for the deferred-delete tombstone reaper. When a
+    # reconcile pass finds ZERO tombstones through the ledger-driven path (the
+    # production failure mode where lost/missing tombstone-ledger entries strand
+    # tombstone-shaped snapshots forever), do ONE bounded snapshot scan of the
+    # parent (limit 500) and reap tombstone-shaped snapshots proven by either a
+    # ledger entry OR (tombstone shape + source-dataset ownership stamp + age
+    # gate). The ledger-driven reaper is unchanged when it finds tombstones.
+    # Default: false.
+    scanFallback:
+      enabled: false
   delete:
     # SAFETY: guarded deletion is opt-in and disabled by default. When enabled,
     # a CronJob runs --mode=reconcile and backend cleanup still goes through the

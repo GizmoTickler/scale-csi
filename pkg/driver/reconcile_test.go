@@ -895,6 +895,53 @@ func TestReconcileNeverReapsForeignTombstoneShapedSnapshots(t *testing.T) {
 	require.NoError(t, err, "the live CSI lookalike snapshot must survive despite the stale ledger entry")
 }
 
+// TestReconcileTombstoneScanFallbackRecoversStrandedTombstone proves the
+// reconcile.tombstoneReaper.scanFallback recovery path. A tombstone-shaped
+// snapshot whose ledger entry is missing (the production failure mode) is stranded
+// forever by the ledger-only reaper; with the scan fallback enabled it is
+// classified and reaped via relaxed provenance (tombstone shape + source-dataset
+// ownership stamp + age gate). The fallback defaults to off, preserving the strict
+// ledger-only behavior.
+func TestReconcileTombstoneScanFallbackRecoversStrandedTombstone(t *testing.T) {
+	setup := func(t *testing.T) (*Driver, *truenas.MockClient, string) {
+		t.Helper()
+		ctx := context.Background()
+		pv := reconcilePV("source", "csi.scale.io")
+		d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+		client.NoDeferredSnapshotDestroy = true
+		mustCreateParentDataset(t, client)
+		source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+		require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+		// A tombstone-shaped snapshot with NO ledger entry (lost/missing provenance).
+		stranded, err := client.SnapshotCreate(ctx, source.Name, "snap-csi-deleted-1", nil)
+		require.NoError(t, err)
+		stranded.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+		return d, client, stranded.ID
+	}
+
+	t.Run("disabled leaves it stranded", func(t *testing.T) {
+		ctx := context.Background()
+		d, client, tombstoneID := setup(t)
+		report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+		require.NoError(t, err)
+		assert.Empty(t, report.DeletedTombstones, "scan fallback off: the ledger-less tombstone stays stranded")
+		_, err = client.SnapshotGet(ctx, tombstoneID)
+		require.NoError(t, err, "the stranded tombstone must survive when the fallback is off")
+	})
+
+	t.Run("enabled recovers it", func(t *testing.T) {
+		ctx := context.Background()
+		d, client, tombstoneID := setup(t)
+		enabled := true
+		d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
+		report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+		require.NoError(t, err)
+		assert.Contains(t, report.DeletedTombstones, tombstoneID, "scan fallback on: the stranded tombstone is reaped via relaxed provenance")
+		_, err = client.SnapshotGet(ctx, tombstoneID)
+		require.True(t, truenas.IsNotFoundError(err), "the stranded tombstone is destroyed")
+	})
+}
+
 // Crash window between ledger write and tombstone rename: the ledger entry has
 // no matching snapshot and must be swept once aged; bookkeeping sweep also
 // retires stale in-flight markers whose dataset completed (stamped) or is gone.

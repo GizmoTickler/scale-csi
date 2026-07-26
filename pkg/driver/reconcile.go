@@ -76,6 +76,12 @@ type ReconcileObject struct {
 	// that rewrites the marker between detection and deletion is never raced.
 	// Only meaningful for entries in RemnantVolumes.
 	remnantNonce string
+	// tombstoneScanFallback marks a tombstone discovered by the bounded scan
+	// fallback (reconcile.tombstoneReaper.scanFallback) rather than the
+	// ledger-driven path. The reaper relaxes its provenance check for these:
+	// a ledger entry OR (tombstone shape + source-dataset ownership stamp + age
+	// gate). Only meaningful for entries in TombstoneSnapshots.
+	tombstoneScanFallback bool
 }
 
 // SpentRestoreSnapshot describes a VolSync restore-destination snapshot whose
@@ -444,6 +450,16 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		}
 		report.TombstoneSnapshots = append(report.TombstoneSnapshots, item)
 		report.TombstoneSnapshotBytes += item.Bytes
+	}
+
+	// Scan fallback (reconcile.tombstoneReaper.scanFallback, default off): when the
+	// ledger-driven detection above found ZERO tombstones — the production failure
+	// mode where lost/missing ledger entries strand tombstone-shaped snapshots
+	// forever — do one bounded scan and reap tombstone-shaped snapshots proven by
+	// either a ledger entry or (tombstone shape + source-dataset ownership stamp +
+	// age gate). The ledger-driven reaper is unchanged when it finds tombstones.
+	if len(report.TombstoneSnapshots) == 0 && d.config.Reconcile.TombstoneReaper.ScanFallback.EnabledOrDefault() {
+		d.detectTombstonesByScanFallback(ctx, now, ledger, minOrphanAge, &report)
 	}
 
 	// Spent-restore classification is read-only detection, gated on the
@@ -1084,6 +1100,68 @@ func (d *Driver) listAllManagedSnapshots(ctx context.Context) (managed, tombston
 		}
 	}
 	return managed, tombstones, nil
+}
+
+// tombstoneScanFallbackLimit bounds the scan-fallback snapshot query so a single
+// reconcile pass never transfers an unbounded snapshot set just to recover stranded
+// tombstones. It is a best-effort recovery scan, not the primary detection path.
+const tombstoneScanFallbackLimit = 500
+
+// detectTombstonesByScanFallback is the bounded-scan fallback for the tombstone
+// reaper (reconcile.tombstoneReaper.scanFallback). It runs only when a pass found
+// zero ledger-proven tombstones — the production failure mode where lost or missing
+// ledger entries strand tombstone-shaped snapshots forever. It performs ONE bounded
+// snapshot scan of the parent and classifies tombstone-shaped snapshots whose
+// provenance is proven by EITHER a matching ledger entry OR the relaxed fallback
+// (tombstone shape + source-dataset ownership stamp by THIS instance + age gate).
+// Each fallback candidate is flagged so reapTombstoneSnapshot applies the matching
+// relaxed provenance check; the strict ledger path is unchanged for ledger-proven
+// tombstones. Classification stays read-only; deletion is still gated by opts.Delete
+// and the per-object live revalidation in reapTombstoneSnapshot.
+func (d *Driver) detectTombstonesByScanFallback(ctx context.Context, now time.Time, ledger map[string]tombstoneLedgerEntry, minOrphanAge time.Duration, report *ReconcileReport) {
+	scanned, err := d.truenasClient.SnapshotListAll(ctx, d.config.ZFS.DatasetParentName, tombstoneScanFallbackLimit, 0)
+	if err != nil {
+		d.recordReconcileObjectFailure("tombstone_scan_fallback", d.config.ZFS.DatasetParentName, err)
+		return
+	}
+	for _, snap := range scanned {
+		if snap == nil || !isSnapshotTombstone(snap) {
+			continue
+		}
+		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {
+			klog.Warningf("Orphan reconcile: scan fallback skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name", snap.ID)
+			continue
+		}
+		entry, recorded := ledger[tombstoneLedgerKey(snap.ID)]
+		ledgerProvenance := recorded && entry.Snapshot == snap.ID && entry.CreatedAt > 0 && entry.CreatedAt == snap.GetCreationTime()
+		if !ledgerProvenance {
+			// Relaxed provenance: the source dataset must be locally owned by THIS
+			// driver instance. The tombstone shape was checked above; the age gate is
+			// checked below and re-proven live in reapTombstoneSnapshot.
+			sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, snap.Dataset)
+			if dsErr != nil || !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()) {
+				continue
+			}
+		}
+		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
+		if !eligible {
+			continue
+		}
+		sourceVolumeID := ""
+		if snap.Dataset != "" {
+			sourceVolumeID = path.Base(snap.Dataset)
+		}
+		report.TombstoneSnapshots = append(report.TombstoneSnapshots, ReconcileObject{
+			ID:                    snap.ID,
+			BackendID:             snap.ID,
+			SourceVolumeID:        sourceVolumeID,
+			CreatedAt:             createdAt,
+			Age:                   age,
+			Bytes:                 snap.GetSnapshotSize(),
+			tombstoneScanFallback: !ledgerProvenance,
+		})
+		report.TombstoneSnapshotBytes += snap.GetSnapshotSize()
+	}
 }
 
 func (d *Driver) kubernetesReconcileClients() (
@@ -1732,13 +1810,24 @@ func (d *Driver) reapTombstoneSnapshot(
 		}
 	}
 	entry, recorded := ledger[tombstoneLedgerKey(snapshot.ID)]
-	if !recorded || entry.Snapshot != snapshot.ID {
-		return false, "no tombstone ledger entry proves driver provenance"
+	ledgerProvenance := recorded && entry.Snapshot == snapshot.ID && entry.CreatedAt > 0 && entry.CreatedAt == snapshot.GetCreationTime()
+	if !ledgerProvenance {
+		if !tombstone.tombstoneScanFallback {
+			// Strict path (unchanged): a matching ledger entry is the only
+			// provenance for a ledger-driven tombstone.
+			if !recorded || entry.Snapshot != snapshot.ID {
+				return false, "no tombstone ledger entry proves driver provenance"
+			}
+			return false, "tombstone ledger creation identity does not match the observed snapshot"
+		}
+		// Scan-fallback path: provenance is relaxed to the source-dataset ownership
+		// stamp (verified just below) plus the tombstone shape (verified above) and
+		// the age gate (verified below). No ledger entry is required — this is the
+		// recovery path for tombstones stranded by lost/missing ledger entries.
 	}
-	if entry.CreatedAt <= 0 || entry.CreatedAt != snapshot.GetCreationTime() {
-		return false, "tombstone ledger creation identity does not match the observed snapshot"
-	}
-	// The tombstone must sit on a dataset this driver instance owns.
+	// The tombstone must sit on a dataset this driver instance owns. For
+	// scan-fallback tombstones without a ledger entry this ownership stamp is the
+	// positive provenance that authorizes the reap.
 	sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, snapshot.Dataset)
 	if dsErr != nil {
 		return false, fmt.Sprintf("tombstone source dataset revalidation failed: %v", dsErr)

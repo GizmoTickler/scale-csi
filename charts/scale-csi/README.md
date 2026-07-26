@@ -352,6 +352,7 @@ for Grafana sidecar discovery and uses only metrics exported by the driver.
 | `reconcile.minOrphanAge` | Minimum backend object age before orphan classification | `24h` |
 | `reconcile.alertAfter` | Prometheus alert hold time; keep greater than 2x the interval | `2h5m` |
 | `reconcile.spentRestore.enabled` | Classify/reap spent VolSync restore VolumeSnapshots (`volsync-*-dst-dest*`); set false to skip this VolSync-specific classification while other reconcile phases still run | `true` |
+| `reconcile.tombstoneReaper.scanFallback.enabled` | Bounded-scan fallback for the tombstone reaper: when a pass finds zero ledger-proven tombstones, do one bounded snapshot scan and reap tombstone-shaped snapshots proven by a ledger entry OR (tombstone shape + source-dataset ownership stamp + age gate). Recovers tombstones stranded by lost ledger entries | `false` |
 | `reconcile.delete.enabled` | Create the opt-in guarded cleanup CronJob | `false` |
 | `reconcile.delete.schedule` | Guarded cleanup CronJob schedule | `0 4 * * *` |
 | `reconcile.delete.maxPerRun` | Maximum successful deletions in one cleanup run | `5` |

@@ -920,6 +920,22 @@
               "type": "boolean"
             }
           }
+        },
+        "tombstoneReaper": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "scanFallback": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": false
+                }
+              }
+            }
+          }
         }
       }
     },

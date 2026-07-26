@@ -322,6 +322,35 @@ type ReconcileConfig struct {
 	// a dedicated child dataset, so its local properties no longer bloat every
 	// descendant snapshot (Batch 14, Fix 4b).
 	Bookkeeping ReconcileBookkeepingConfig `yaml:"bookkeeping"`
+
+	// TombstoneReaper configures the deferred-delete tombstone reaper's fallbacks.
+	TombstoneReaper ReconcileTombstoneReaperConfig `yaml:"tombstoneReaper"`
+}
+
+// ReconcileTombstoneReaperConfig configures the tombstone reaper.
+type ReconcileTombstoneReaperConfig struct {
+	// ScanFallback enables a bounded snapshot scan when a reconcile pass finds
+	// zero tombstones through the ledger-driven path (the production failure mode
+	// where lost/missing ledger entries strand tombstone-shaped snapshots
+	// forever). Default: false.
+	ScanFallback ReconcileTombstoneScanFallbackConfig `yaml:"scanFallback"`
+}
+
+// ReconcileTombstoneScanFallbackConfig gates the bounded scan fallback for the
+// tombstone reaper.
+type ReconcileTombstoneScanFallbackConfig struct {
+	// Enabled, when a pass finds zero ledger-proven tombstones, performs ONE
+	// bounded zfs.resource.snapshot.query scan of the parent (limit 500, no
+	// recursion) and reaps tombstone-shaped snapshots whose provenance is proven
+	// by EITHER a ledger entry OR (tombstone shape + source-dataset ownership
+	// stamp + age gate). Default: false (the ledger-driven reaper is unchanged).
+	Enabled *bool `yaml:"enabled"`
+}
+
+// EnabledOrDefault reports whether the tombstone scan fallback is active. An
+// unset (nil) value defaults to false, preserving the ledger-only reaper.
+func (c ReconcileTombstoneScanFallbackConfig) EnabledOrDefault() bool {
+	return c.Enabled != nil && *c.Enabled
 }
 
 // ReconcileBookkeepingConfig gates the bookkeeping-dataset relocation (Fix 4b).
