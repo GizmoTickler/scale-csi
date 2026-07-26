@@ -631,6 +631,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		d.deleteInflightMarker(ctx, volumeID)
 		createdDS = verifiedClone
 		zvolReady = true
+		// Scrub backend share-object IDs the clone inherited from its source dataset
+		// (ZFS copies the source's user properties into the clone). A stale inherited
+		// ID would make ensureShareExists validate the clone against the SOURCE
+		// volume's share objects. Best-effort and a SEPARATE pool.dataset.update from
+		// the authoritative ownership stamp above (cleanup, not provenance).
+		d.scrubInheritedProtocolProperties(ctx, createdDS, datasetName)
 	} else {
 		// Create new dataset
 		var createErr error
@@ -2193,6 +2199,53 @@ func (d *Driver) snapshotRestoreDetached(params map[string]string) (bool, error)
 		}
 	}
 	return d.config.ZFS.DetachedVolumesFromSnapshots, nil
+}
+
+// inheritedProtocolPropertyKeys are the per-volume backend share-object IDs that
+// ZFS inherits from a clone's source dataset. A clone must start with NONE of
+// them: a stale inherited ID makes ensureShareExists validate the clone against
+// the SOURCE volume's share objects (wrong backreference → spurious share
+// recreation or false orphan detection). They are scrubbed best-effort right
+// after the authoritative ownership stamp; the scrub is a separate
+// pool.dataset.update because it is cleanup, not provenance.
+var inheritedProtocolPropertyKeys = []string{
+	PropNFSShareID,
+	PropISCSITargetID,
+	PropISCSIExtentID,
+	PropISCSITargetExtentID,
+	PropISCSIInitiatorID,
+	PropNVMeoFSubsystemID,
+	PropNVMeoFNamespaceID,
+	PropNVMeoFPortSubsysID,
+}
+
+// scrubInheritedProtocolProperties removes any backend share-object IDs the clone
+// inherited from its source dataset (see inheritedProtocolPropertyKeys). It is
+// idempotent and best-effort: a failure leaves the stale IDs for the reconcile
+// pass's backreference validation to reconcile and never fails the create — the
+// authoritative ownership stamp has already landed. The removal is mirrored into
+// the in-memory dataset so the subsequent share create does not read a stale
+// inherited ID from the cached object.
+func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truenas.Dataset, datasetName string) {
+	if ds == nil {
+		return
+	}
+	present := make([]string, 0, len(inheritedProtocolPropertyKeys))
+	for _, key := range inheritedProtocolPropertyKeys {
+		if _, ok := ds.UserProperties[key]; ok {
+			present = append(present, key)
+		}
+	}
+	if len(present) == 0 {
+		return
+	}
+	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, datasetName, present); err != nil {
+		klog.Warningf("Failed to scrub inherited protocol properties from clone %s (reconcile will reconcile the backreference): %v", datasetName, err)
+		return
+	}
+	for _, key := range present {
+		delete(ds.UserProperties, key)
+	}
 }
 
 func (d *Driver) handleVolumeContentSource(

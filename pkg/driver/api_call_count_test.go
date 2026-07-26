@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
@@ -999,4 +1000,48 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		// 8. DatasetRemoveUserProperties     — removePublicationRecords.
 		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 8)
 	})
+}
+
+// TestCreateVolumeCloneScrubInheritedProtocolProperties proves the P7 scrub: a
+// clone inherits its source dataset's backend share-object IDs (ZFS copies user
+// properties into the clone), and CreateVolume scrubs them right after the
+// ownership stamp so ensureShareExists never validates the clone against the
+// SOURCE volume's share objects. Foreign protocol IDs are removed entirely; the
+// clone's own protocol gets a fresh share ID.
+func TestCreateVolumeCloneScrubInheritedProtocolProperties(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newAPICallCountDriver(t, client, "nfs")
+
+	_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	// Source volume dataset carrying backend share-object IDs (as a live, shared
+	// volume would). The clone inherits these with a non-local source.
+	source, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/clone-src", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.MockClient.DatasetSetUserProperties(ctx, source.Name, map[string]string{
+		PropNFSShareID:        "999",
+		PropISCSITargetID:     "888",
+		PropNVMeoFSubsystemID: "777",
+	}))
+	_, err = client.MockClient.SnapshotCreate(ctx, source.Name, "clone-point", nil)
+	require.NoError(t, err)
+
+	req := apiCallCountVolumeRequest("restored-clone", "nfs")
+	req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+		Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "clone-point"},
+	}}
+	_, err = d.CreateVolume(ctx, req)
+	require.NoError(t, err)
+
+	clone, err := client.MockClient.DatasetGet(ctx, "pool/parent/restored-clone")
+	require.NoError(t, err)
+	_, hasISCSI := clone.UserProperties[PropISCSITargetID]
+	assert.False(t, hasISCSI, "the inherited iSCSI target ID must be scrubbed from the NFS clone")
+	_, hasNVMe := clone.UserProperties[PropNVMeoFSubsystemID]
+	assert.False(t, hasNVMe, "the inherited NVMe-oF subsystem ID must be scrubbed from the NFS clone")
+	assert.NotEqual(t, "999", clone.UserProperties[PropNFSShareID].Value,
+		"the clone must stamp its own NFS share ID, not the inherited stale one")
 }
