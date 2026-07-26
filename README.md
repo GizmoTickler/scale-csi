@@ -10,7 +10,8 @@ A Kubernetes CSI driver purpose-built for TrueNAS SCALE. Unlike general-purpose 
 - **Zero SSH** - Communicates entirely via WebSocket JSON-RPC 2.0 (`wss://host/api/current`)
 - **Single Focus** - Optimized specifically for TrueNAS SCALE, not a multi-backend abstraction
 - **Modern API** - Built for SCALE 25.04+ versioned API from day one
-- **Full Featured** - Snapshots, clones, volume expansion, and raw block volumes
+- **Full Featured** - Snapshots, clones, volume expansion, and raw block
+  volumes; snapshot restores are per-StorageClass `clone` or `detached`
 - **Publication Tracking & Backend Fencing** - CSI publish state is always
   tracked in durable per-volume publication records (single-node exclusivity is
   enforced in every mode); `fencing.mode` optionally enforces it through
@@ -233,7 +234,7 @@ documented exception ledger is [`.trivyignore`](.trivyignore).
 | [Disaster recovery](docs/guides/disaster-recovery.md) | ZFS replication + export auto-recreation for cross-site failover |
 | [Topology](docs/guides/topology.md) | Zone/region-aware provisioning (advanced; single-backend usually doesn't need it) |
 | [Snapshots](docs/guides/snapshots.md) | Snapshot and clone/restore workflow |
-| [Next release notes](docs/release-notes-next.md) | Draft breaking changes and upgrade actions after v1.2.23 |
+| [Release notes](docs/release-notes-next.md) | v1.3.0 changelog and upgrade actions |
 
 ## Network Ports
 
