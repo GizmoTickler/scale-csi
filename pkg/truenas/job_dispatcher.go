@@ -188,13 +188,23 @@ func (c *Connection) jobsSubscribed() bool {
 	return live && state>>1 == generation && state&1 == 1
 }
 
-func (c *Connection) subscribeJobs(generation uint64, wg *sync.WaitGroup) {
+func (c *Connection) subscribeJobs(generation uint64, done <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	if c.client == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.config.Timeout)
 	defer cancel()
+	// Tie the subscribe RPC to connection teardown so Close never waits out
+	// the full config timeout on a mid-flight subscribe. The helper exits when
+	// either the generation ends or subscribeJobs returns (defer cancel).
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	// Documented control-plane bypass: the subscription must land on this exact
 	// connection. It intentionally bypasses Client.callRaw and takes no

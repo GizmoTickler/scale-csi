@@ -90,6 +90,13 @@ func TestTypedDecodeGoldenDeepEquality(t *testing.T) {
 		payload := readTypedFixture(t, "dataset-origins-26.0.json")
 		require.Equal(t, interfaceDatasets(t, payload, false), typedDatasets(t, payload, false))
 	})
+	// Full top-level property set (used/quota/refquota/volsize/creation with
+	// value+rawvalue+parsed+source, string-or-number parsed, nested user
+	// properties) — pins the pool.dataset.query path used by DatasetList.
+	t.Run("dataset_list", func(t *testing.T) {
+		payload := readTypedFixture(t, "dataset-list-26.0.json")
+		require.Equal(t, interfaceDatasets(t, payload, false), typedDatasets(t, payload, false))
+	})
 }
 
 func TestTypedSnapshotPreservesGenericPropertyShapeAndPrecedence(t *testing.T) {
@@ -262,6 +269,7 @@ func FuzzTypedSnapshotDecodeMatchesInterface(f *testing.F) {
 func FuzzTypedDatasetDecodeMatchesInterface(f *testing.F) {
 	f.Add(readTypedFixture(f, "dataset-resource-26.0.json"))
 	f.Add(readTypedFixture(f, "dataset-origins-26.0.json"))
+	f.Add(readTypedFixture(f, "dataset-list-26.0.json"))
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		var generic []interface{}
 		if err := json.Unmarshal(payload, &generic); err != nil {

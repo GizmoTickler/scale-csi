@@ -118,20 +118,21 @@ func (snapshot *rawSnapshot) toSnapshot() *Snapshot {
 	}
 
 	for key, property := range result.Properties {
-		if strings.Contains(key, ":") {
-			propertyMap, ok := property.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			userProperty := UserProperty{}
-			if value, ok := propertyMap["value"].(string); ok {
-				userProperty.Value = value
-			}
-			if source, ok := propertyMap["source"].(string); ok {
-				userProperty.Source = source
-			}
-			result.UserProperties[key] = userProperty
+		if !strings.Contains(key, ":") {
+			continue
 		}
+		propertyMap, ok := property.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		userProperty := UserProperty{}
+		if value, ok := propertyMap["value"].(string); ok {
+			userProperty.Value = value
+		}
+		if source, ok := propertyMap["source"].(string); ok {
+			userProperty.Source = source
+		}
+		result.UserProperties[key] = userProperty
 	}
 	for key, property := range snapshot.RawUserProperties {
 		switch value := property.(type) {

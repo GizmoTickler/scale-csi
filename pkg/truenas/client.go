@@ -782,7 +782,7 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 		c.mu.Unlock()
 		atomic.StoreInt64(&c.lastPong, time.Now().Unix())
 
-		go c.subscribeJobs(handles.generation, handles.waitGroup)
+		go c.subscribeJobs(handles.generation, handles.heartbeatDone, handles.waitGroup)
 		go c.heartbeatLoop(handles.generation, handles.heartbeatDone, handles.waitGroup)
 
 		klog.Infof("Conn %d: Connected and authenticated", c.id)
