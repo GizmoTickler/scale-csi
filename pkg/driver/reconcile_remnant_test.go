@@ -320,7 +320,7 @@ func TestReconcileRemnantOrphanSkipsWhileVolumeOperationInProgress(t *testing.T)
 		time.Now().Add(-48*time.Hour))
 
 	// Simulate a same-name CreateVolume resume holding the per-volume lock.
-	lockKey := "volume:locked-vol"
+	lockKey := volumeLockKey("locked-vol")
 	require.True(t, d.acquireOperationLock(lockKey))
 	defer d.releaseOperationLock(lockKey)
 

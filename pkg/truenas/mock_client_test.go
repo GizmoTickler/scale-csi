@@ -181,7 +181,7 @@ func TestMockClientDestroyReplicatedTargetSnapshotIsIdempotent(t *testing.T) {
 	_, err = client.SnapshotGet(ctx, snapshot.ID)
 	assert.True(t, IsNotFoundError(err))
 
-	client.InjectError = &APIError{Code: -1, Message: "snapshot not found"}
+	client.InjectError = notFoundAPIError("snapshot not found")
 	require.NoError(t, client.DestroyReplicatedTargetSnapshot(ctx, target.Name, snapshot.Name))
 	client.InjectError = nil
 

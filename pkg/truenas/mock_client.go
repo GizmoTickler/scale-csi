@@ -165,7 +165,7 @@ func (m *MockClient) ISCSIInitiatorUpdate(ctx context.Context, id int, initiator
 	defer m.mu.Unlock()
 	group := m.ISCSIInitiators[id]
 	if group == nil {
-		return nil, fmt.Errorf("iSCSI initiator group not found")
+		return nil, notFoundAPIError("iSCSI initiator group not found")
 	}
 	group.Initiators = cloneStringsPreservingNil(initiators)
 	if comment != "" {
@@ -984,7 +984,7 @@ func (m *MockClient) NFSShareGet(ctx context.Context, id int) (*NFSShare, error)
 	if share, ok := m.NFSShares[id]; ok {
 		return share, nil
 	}
-	return nil, fmt.Errorf("share not found")
+	return nil, notFoundAPIError("share not found")
 }
 
 func (m *MockClient) NFSShareFindByPath(ctx context.Context, path string) (*NFSShare, error) {
@@ -1015,7 +1015,7 @@ func (m *MockClient) NFSShareUpdate(ctx context.Context, id int, params map[stri
 	defer m.mu.Unlock()
 	share := m.NFSShares[id]
 	if share == nil {
-		return nil, fmt.Errorf("share not found")
+		return nil, notFoundAPIError("share not found")
 	}
 	if hosts, ok := params["hosts"].([]string); ok {
 		share.Hosts = append([]string(nil), hosts...)
@@ -1072,7 +1072,7 @@ func (m *MockClient) ISCSITargetUpdate(ctx context.Context, id int, groups []ISC
 	}
 	target := m.ISCSITargets[id]
 	if target == nil {
-		return nil, fmt.Errorf("iSCSI target not found")
+		return nil, notFoundAPIError("iSCSI target not found")
 	}
 	target.Groups = append([]ISCSITargetGroup(nil), groups...)
 	return target, nil
@@ -1091,7 +1091,7 @@ func (m *MockClient) ISCSITargetGet(ctx context.Context, id int) (*ISCSITarget, 
 	if t, ok := m.ISCSITargets[id]; ok {
 		return t, nil
 	}
-	return nil, fmt.Errorf("not found")
+	return nil, notFoundAPIError("not found")
 }
 func (m *MockClient) ISCSITargetFindByName(ctx context.Context, name string) (*ISCSITarget, error) {
 	m.mu.RLock()
@@ -1137,7 +1137,7 @@ func (m *MockClient) ISCSIExtentGet(ctx context.Context, id int) (*ISCSIExtent, 
 	if e, ok := m.ISCSIExtents[id]; ok {
 		return e, nil
 	}
-	return nil, fmt.Errorf("not found")
+	return nil, notFoundAPIError("not found")
 }
 func (m *MockClient) ISCSIExtentFindByName(ctx context.Context, name string) (*ISCSIExtent, error) {
 	m.mu.RLock()
@@ -1275,7 +1275,7 @@ func (m *MockClient) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysI
 	}
 	subsys := m.NVMeSubsystems[subsysID]
 	if subsys == nil {
-		return nil, fmt.Errorf("NVMe-oF subsystem ID %d not found", subsysID)
+		return nil, notFoundAPIError(fmt.Sprintf("NVMe-oF subsystem ID %d not found", subsysID))
 	}
 	hostFound := false
 	for _, host := range m.NVMeHosts {
@@ -1285,7 +1285,7 @@ func (m *MockClient) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysI
 		}
 	}
 	if !hostFound {
-		return nil, fmt.Errorf("NVMe-oF host ID %d not found", hostID)
+		return nil, notFoundAPIError(fmt.Sprintf("NVMe-oF host ID %d not found", hostID))
 	}
 	for _, association := range m.NVMeHostSubsystems {
 		if association.HostID == hostID && association.SubsysID == subsysID {
@@ -1377,7 +1377,7 @@ func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, all
 				}
 			}
 			if !found {
-				return nil, fmt.Errorf("NVMe-oF host ID %d not found", hostID)
+				return nil, notFoundAPIError(fmt.Sprintf("NVMe-oF host ID %d not found", hostID))
 			}
 		}
 	}
@@ -1407,7 +1407,7 @@ func (m *MockClient) NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id i
 	defer m.mu.Unlock()
 	subsystem := m.NVMeSubsystems[id]
 	if subsystem == nil {
-		return nil, fmt.Errorf("not found")
+		return nil, notFoundAPIError("not found")
 	}
 	subsystem.AllowAnyHost = allowAnyHost
 	return subsystem, nil
@@ -1431,7 +1431,7 @@ func (m *MockClient) NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSub
 	if s, ok := m.NVMeSubsystems[id]; ok {
 		return s, nil
 	}
-	return nil, fmt.Errorf("not found")
+	return nil, notFoundAPIError("not found")
 }
 func (m *MockClient) NVMeoFSubsystemFindByNQN(ctx context.Context, nqn string) (*NVMeoFSubsystem, error) {
 	m.mu.RLock()
@@ -1484,7 +1484,7 @@ func (m *MockClient) NVMeoFNamespaceGet(ctx context.Context, id int) (*NVMeoFNam
 	if n, ok := m.NVMeNamespaces[id]; ok {
 		return n, nil
 	}
-	return nil, fmt.Errorf("not found")
+	return nil, notFoundAPIError("not found")
 }
 func (m *MockClient) NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error) {
 	m.mu.RLock()

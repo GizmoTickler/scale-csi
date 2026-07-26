@@ -1735,8 +1735,6 @@ func TestNodeStageVolumeSelfHealsDanglingStagingSymlink(t *testing.T) {
 	stagingPath := filepath.Join(stagingDir, "volume-device")
 	// A dangling symlink: its target no longer exists.
 	require.NoError(t, os.Symlink(filepath.Join(stagingDir, "gone-device"), stagingPath))
-	// A stale stage record persists from before the device vanished.
-	d.storeStageRecord(nodeMountRecord{VolumeID: "block-volume", TargetPath: stagingPath})
 
 	req := &csi.NodeStageVolumeRequest{
 		VolumeId:          "block-volume",
@@ -1752,11 +1750,69 @@ func TestNodeStageVolumeSelfHealsDanglingStagingSymlink(t *testing.T) {
 			"lun":                "0",
 		},
 	}
-	_, err := d.NodeStageVolume(context.Background(), req)
+	// A COMPATIBLE stale stage record for this same volume persists from before
+	// the device vanished (matching VolumeID/ExpectedSource/Capability), so the
+	// self-heal guard clears it and reconnects rather than rejecting.
+	capability, err := nodeCapabilityForRequest(req.GetVolumeCapability())
+	require.NoError(t, err)
+	d.storeStageRecord(nodeMountRecord{
+		VolumeID:       "block-volume",
+		TargetPath:     stagingPath,
+		ExpectedSource: "iscsi:iqn.test:block-volume",
+		Capability:     capability,
+	})
+
+	_, err = d.NodeStageVolume(context.Background(), req)
 	require.NoError(t, err, "a dangling staging symlink must self-heal, not wedge forever")
 	target, err := os.Readlink(stagingPath)
 	require.NoError(t, err)
 	assert.Equal(t, "/dev/null", target, "the stale symlink must be replaced with the reconnected device")
+}
+
+// TestHandleExistingStageDanglingSymlinkRejectsIncompatibleRecord proves the
+// R9-fix guard: the dangling-symlink self-heal must not blindly erase a stage
+// record. When the persisted record belongs to a DIFFERENT volume (a malformed
+// request / kubelet path confusion — distinct volume IDs take distinct node
+// locks, so nothing else serializes the collision), the stage must fail closed
+// with AlreadyExists and leave the occupant's record and link intact.
+func TestHandleExistingStageDanglingSymlinkRejectsIncompatibleRecord(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt")
+	d := newTestNodeDriver(ShareTypeISCSI)
+	stagingDir := t.TempDir()
+	stagingPath := filepath.Join(stagingDir, "volume-device")
+	// Dangling symlink: the backing device is gone.
+	require.NoError(t, os.Symlink(filepath.Join(stagingDir, "gone-device"), stagingPath))
+	// A record for a DIFFERENT volume already owns this staging path.
+	occupant := nodeMountRecord{
+		VolumeID:       "other-volume",
+		TargetPath:     stagingPath,
+		ExpectedSource: "iqn.test:other-volume",
+		Capability:     nodeCapabilitySignature{AccessType: nodeAccessBlock},
+	}
+	d.storeStageRecord(occupant)
+
+	req := &csi.NodeStageVolumeRequest{
+		VolumeId:          "block-volume",
+		StagingTargetPath: stagingPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+		VolumeContext: map[string]string{"node_attach_driver": "iscsi", "portal": "192.0.2.10:3260", "iqn": "iqn.test:block-volume", "lun": "0"},
+	}
+	capability, err := nodeCapabilityForRequest(req.GetVolumeCapability())
+	require.NoError(t, err)
+
+	handled, stageErr := d.handleExistingStage(req, ShareTypeISCSI, capability, "iqn.test:block-volume")
+	assert.True(t, handled, "an incompatible occupant must be handled (fail-closed)")
+	require.Error(t, stageErr)
+	assert.Equal(t, codes.AlreadyExists, status.Code(stageErr))
+	surviving, ok := d.stageRecord(stagingPath)
+	require.True(t, ok, "the incompatible occupant's record must survive the rejected stage")
+	assert.Equal(t, "other-volume", surviving.VolumeID)
+	target, err := os.Readlink(stagingPath)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(stagingDir, "gone-device"), target, "the occupant's symlink must not be replaced")
 }
 
 // TestHandleExistingStageFailsClosedOnResolvableIdentityError proves the R9 fix

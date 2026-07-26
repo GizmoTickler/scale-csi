@@ -265,6 +265,19 @@ func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType 
 			// the link. A resolvable device that fails for any other reason stays
 			// fail-closed with Internal.
 			if errors.Is(resolveErr, os.ErrNotExist) {
+				// The live device is gone so its identity cannot be re-derived; guard
+				// the self-heal with the persisted stage record. If a record exists and
+				// belongs to a DIFFERENT volume/source/capability (a malformed request
+				// or kubelet path confusion — and distinct volume IDs take distinct node
+				// locks, so nothing else serializes this collision), fail closed with
+				// AlreadyExists and leave volume A's record and link intact rather than
+				// erasing them. Only an absent or compatible record is cleared to let the
+				// requesting volume reconnect. LiveSource is intentionally not compared:
+				// the device vanished, so the record's last-known source cannot match.
+				if record, ok := d.stageRecord(stagingPath); ok &&
+					(record.VolumeID != req.GetVolumeId() || record.ExpectedSource != expectedSource || record.Capability != capability) {
+					return true, status.Errorf(codes.AlreadyExists, "staging target %s is already occupied by an incompatible staged volume", stagingPath)
+				}
 				d.deleteStageRecord(stagingPath)
 				return false, nil
 			}
