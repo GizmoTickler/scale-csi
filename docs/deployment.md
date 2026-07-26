@@ -1,8 +1,9 @@
 # Deployment and configuration
 
 This guide covers the bundled OCI Helm chart. The chart and image use the same
-release number: chart `1.2.23` deploys image `v1.2.23` unless `image.tag` or
-`image.digest` is overridden.
+release number: chart `1.3.0` deploys image `v1.3.0` unless `image.tag` or
+`image.digest` is overridden. (The in-tree `Chart.yaml` carries a `0.0.0-dev`
+placeholder that CI stamps with the tag at release time.)
 
 ## Supported deployment matrix
 
@@ -63,13 +64,13 @@ helm install scale-csi \
 
 The example deliberately avoids a soon-stale version literal. For a controlled
 production rollout, verify the release signature and add the exact reviewed
-version, for example `--version 1.2.23`. See the root README for image, chart,
+version, for example `--version 1.3.0`. See the root README for image, chart,
 and provenance verification commands.
 
 ## Flux
 
 The current Flux OCI source shape uses `OCIRepository` plus `HelmRelease`. Pin
-the exact release you reviewed; this example uses the v1.2.23 baseline:
+the exact release you reviewed; this example uses the v1.3.0 baseline:
 
 ```yaml
 apiVersion: source.toolkit.fluxcd.io/v1
@@ -84,7 +85,7 @@ spec:
     mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
     operation: copy
   ref:
-    semver: "1.2.23"
+    semver: "1.3.0"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -183,6 +184,12 @@ When more than one protocol is enabled, `protocol` is required and omission
 returns `InvalidArgument`; it never silently provisions NFS. A single-protocol
 legacy instance may omit it and uses its sole enabled protocol.
 
+A StorageClass may also set `snapshotRestoreMode: clone` or `detached` to choose
+how snapshot restores are materialized (clone pins the source snapshot; detached
+is an independent copy). Chart `storageClasses[]` entries expose it as a
+first-class field; it is only emitted when set. See the
+[StorageClass reference](reference/storageclass.md#restore-mode).
+
 ## Availability and topology
 
 With `fencing.mode=off`, `controller.replicas>1` enables leader election on the
@@ -212,5 +219,5 @@ is no `node.topology` chart value. See the [topology guide](guides/topology.md).
   managed Secret does not change the pod-template checksum, so restart both
   workloads explicitly after rotation.
 
-For fencing's node-first v1.2.23 migration and the full production contract,
+For fencing's node-first migration and the full production contract,
 read [Production deployment](production.md).
