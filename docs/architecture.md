@@ -83,8 +83,43 @@ sequenceDiagram
 ```
 
 1. **Authentication**: The driver connects to `wss://<host>/api/current` using an API Key.
-2. **Persistence**: The WebSocket connection is persistent and auto-reconnects.
+2. **Persistence**: The WebSocket connections are persistent and auto-reconnect.
 3. **No SSH**: Unlike legacy drivers, this driver **does not** use SSH. All operations, including filesystem formatting (handled by the node), are done via API or local node tools.
+
+### WebSocket connection pool and resilience pipeline
+
+The controller does not use a single socket. It maintains a **pool of 5
+WebSocket connections** (default `truenas.maxConnections`) and multiplexes
+requests across them round-robin, so concurrent RPCs are not serialized behind
+one connection. On top of that, a **10-slot semaphore** (default
+`truenas.maxConcurrentRequests`) caps how many API calls are in flight at once,
+protecting TrueNAS from overload.
+
+Every backend call funnels through one resilience pipeline (`callRaw`):
+
+- **Circuit breaker** (opt-in, `resilience.circuitBreaker.enabled`, default off):
+  after N consecutive failures it opens for a timeout, then admits half-open
+  probes.
+- **Connection-class retry** with exponential backoff: only connection/transport
+  failures are retried. An ambiguous non-idempotent mutation is **not** retried.
+- **Per-call deadline**: `requestTimeout` bounds only calls that carry no
+  deadline of their own (background work); CSI RPCs are bounded by the sidecar
+  `--timeout` they inherit.
+
+**Ambiguity taxonomy.** Two sentinel errors classify transport outcomes so the
+retry logic never double-applies a non-idempotent write:
+
+- `ErrTransportFailure` — the request failed before it could have been applied
+  (e.g. "connection lost before request was sent" / "during authentication"). It
+  is safe to retry and is recorded as a breaker failure.
+- `ErrAmbiguousResult` — the request was written but no response was observed, so
+  whether it took effect is unknown. It is not blindly retried; callers reconcile
+  by re-reading state.
+
+Because the WebSocket read limit on TrueNAS rejects inbound frames over ~64 kB
+(close 1009), the driver chunks large property writes (for example the
+bookkeeping migration and batched ledger removals) to stay well under that
+limit.
 
 ## Storage Workflows
 
@@ -192,16 +227,48 @@ and ZFS user properties.
 
 ## ZFS User Properties
 
-The driver tracks CSI metadata using ZFS user properties prefixed with `truenas-csi:`:
+The driver stores **all** durable state as ZFS user properties prefixed with
+`truenas-csi:` — there is no external database, which is what makes the driver
+restart-recoverable and ZFS-replication-friendly (see the
+[disaster-recovery guide](guides/disaster-recovery.md)).
+
+**Ownership and identity**
 
 | Property | Description |
 |----------|-------------|
-| `truenas-csi:managed_resource` | Marks CSI-managed datasets |
-| `truenas-csi:csi_volume_name` | Original PVC name |
+| `truenas-csi:managed_resource` | Marks CSI-managed datasets (read with property source; a *local* value is required — an inherited one does not prove ownership) |
+| `truenas-csi:driver_instance_id` | Stamps which driver instance owns the dataset; never overwritten once set (local, inherited, or foreign) |
+| `truenas-csi:csi_volume_name` | Original PVC/request name |
+| `truenas-csi:provision_success` | Marks provisioning as completed |
+| `truenas-csi:requested_size_bytes` | Requested capacity |
+
+**Content source (clones/restores)**
+
+| Property | Description |
+|----------|-------------|
+| `truenas-csi:csi_volume_content_source_type` / `_id` | Records the snapshot or volume a restore/clone was created from |
+| `truenas-csi:csi_volume_origin_snapshot` | The origin snapshot pinned by a clone-mode restore |
+
+**Crash-consistency bookkeeping**
+
+| Property | Description |
+|----------|-------------|
+| `truenas-csi:inflight_*` | In-flight creation markers — written before a mutation, cleared on success; the only handle a crash-recovery sweep can act on |
+| `truenas-csi:recovery_nonce` | Write-then-verify identity token for lost-race detection |
+| `truenas-csi:tombstone_*` | Deferred-delete tombstone ledger (v2 keys the entry by `CreateTXG`; v1 entries remain compatible) |
+| `truenas-csi:publication_*` | Durable per-volume publication records (see fencing, below) |
+| `truenas-csi:internal_resource` | Marks the `.csi-bookkeeping` child dataset when bookkeeping relocation is enabled |
+
+**Backend share-object backreferences**
+
+| Property | Description |
+|----------|-------------|
 | `truenas-csi:truenas_nfs_share_id` | Associated NFS share ID |
-| `truenas-csi:truenas_iscsi_target_id` | Associated iSCSI target ID |
-| `truenas-csi:truenas_iscsi_extent_id` | Associated iSCSI extent ID |
-| `truenas-csi:truenas_nvmeof_subsystem_id` | Associated NVMe-oF subsystem ID |
+| `truenas-csi:truenas_iscsi_target_id` / `_extent_id` / `_targetextent_id` / `_initiator_id` | iSCSI object IDs |
+| `truenas-csi:truenas_nvmeof_subsystem_id` / `_namespace_id` / `_portsubsys_id` | NVMe-oF object IDs |
+
+Snapshots carry their own identity properties (`truenas-csi:csi_snapshot_name`,
+`truenas-csi:csi_snapshot_source_volume_id`, `truenas-csi:csi_share_volume_context`).
 
 ## VolSync Integration
 
@@ -210,3 +277,105 @@ The driver fully supports the `Snapshot` copy method in VolSync:
 2. **Restore**: VolSync requests a PVC from Snapshot -> Driver creates ZFS Clone from Snapshot.
 
 See [Snapshots and Clones Guide](guides/snapshots.md) for detailed usage instructions.
+
+## Controller topology, node mode, and leader election
+
+- **Controller** runs as a Deployment, default **1 replica**. This singleton
+  topology is the primary cross-process serialization guarantee — the driver's
+  operation locks are per-process and provide no exclusion between two controller
+  processes.
+- **Leader election** is enabled on every capable controller sidecar
+  (provisioner, attacher, resizer, snapshotter) **unconditionally**, even at a
+  single replica, so a `fencing.mode=off` RollingUpdate that briefly runs two
+  controller pods never has both acting as the active provisioner/attacher.
+- **Node** runs as a DaemonSet and is **credential-free**: it receives no
+  `TRUENAS_API_KEY`. Stage/publish/unpublish/unstage and local filesystem
+  expansion use host tools (`mount`, `iscsiadm`, `nvme`, `resize2fs`), so node
+  pods start in lazy-connect mode and stay available during a management-API
+  outage. A node operation that genuinely needs the management API fails without
+  credentials by design.
+- `additive`/`strict` fencing require **exactly one** controller replica because
+  their background reconcilers are singleton writers; chart schema and template
+  guards enforce that.
+
+## Publication records and backend fencing
+
+CSI publish state is always tracked in durable per-volume **publication records**
+(`truenas-csi:publication_*`). Single-node exclusivity, same-node republish
+idempotency, synchronous stale-record takeover, and empty-node-id unpublish are
+enforced in **every** mode. `fencing.mode` governs only whether that state is
+*also* pushed into the backend transport allowlists:
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | Records-only. No NFS/iSCSI/NVMe allowlist mutation. |
+| `additive` | Adds the publishing node's identity to the backend allowlist without removing statically configured entries. The explicit migration mode. |
+| `strict` | Per-volume publication records become the sole allowlist. |
+
+Node identity is a stable base64url encoding (name + block-transport identity)
+carried on the CSINode registration with an `sc1.` prefix. The node-first
+migration (upgrade the DaemonSet, wait for every CSINode to re-register, watch
+`scale_csi_fencing_deferred_total`) is described in
+[Production](production.md#upgrades).
+
+## Crash-consistency model
+
+The driver has no external database, so it makes each mutation crash-recoverable
+through ordered ZFS user-property writes:
+
+- **In-flight markers** (`truenas-csi:inflight_*`) are written *before* a
+  create/clone mutation and cleared on success. After a crash, a marked-but-
+  unstamped dataset is the only thing a recovery sweep can act on.
+- **Ownership stamps** (`managed_resource` + `driver_instance_id`, read with
+  property *source* so inherited values never count) prove the object is this
+  instance's. A `driver_instance_id` is never overwritten once present.
+- **Content-source vs. ownership boundary**: a restored/cloned dataset records
+  where it came from (`csi_volume_content_source_*`) separately from who owns it.
+  A clone can inherit its source's protocol-foreign backreference properties, so
+  the driver scrubs source-proven foreign IDs after stamping.
+- **Recovery nonce** (`recovery_nonce`) is a write-then-verify token: a detected
+  lost race returns retryable `Aborted` rather than double-owning a dataset. It
+  is not an atomic compare-and-swap — the strongest concurrency contract remains
+  the singleton controller (see [Production → Concurrency contract](production.md)).
+- **Tombstone ledger** records deferred-destroy snapshots. v2 entries key on the
+  snapshot's `CreateTXG`; v1 entries stay compatible. The reaper acts only on
+  provenance it can prove.
+
+## Reconcile loop and source layout
+
+A controller-side reconcile pass (`ReconcileOrphans`, default hourly; also
+runnable once via `--mode=reconcile`) detects and — only under
+`reconcile.delete.enabled` — cleans CSI-managed backend objects with no live
+Kubernetes reference. Detection is read-only; a shared `reconcile.delete.maxPerRun`
+caps destructive actions per pass. The v1.3.0 refactor split the former
+monolithic `reconcile.go` along its test seams into per-concern files:
+
+| File | Concern |
+|------|---------|
+| `reconcile.go` | Pass orchestration + orphan volume/snapshot/tombstone classification |
+| `reconcile_kubestate.go` | Live PV / VolumeAttachment / VolumeSnapshotContent hard-rechecks (not informer caches) |
+| `reconcile_publications.go` | Stale publication-record repair |
+| `reconcile_shares.go` | Orphaned NFS/iSCSI/NVMe-oF share detection and teardown |
+| `reconcile_tombstones.go` | Tombstone reaper, scan-fallback, ledger sweep |
+| `reconcile_remnants.go` | Stale in-flight marker sweep, remnant-orphan GC, orphaned replication-job sweep |
+| `reconcile_spent_restore.go` | VolSync spent-restore snapshot classification |
+| `reconcile_adoption.go` | Legacy ownership-stamp adoption |
+| `provenance.go` | Ownership stamping, in-flight markers, tombstone ledger, bookkeeping relocation/chunking |
+| `fencing.go` / `fence_resolution.go` | Publication records and backend allowlist enforcement |
+| `share_backend.go` | `ShareBackend` interface + per-protocol selector |
+
+## API-call cost (golden round-trip counts)
+
+Hot paths are pinned by golden tests (`api_call_count_test.go`) so a regression
+that adds a wasted round trip fails loudly. Representative controller costs:
+
+| Operation | TrueNAS round trips |
+|-----------|--------------------:|
+| CreateVolume (fresh NFS) | 6 |
+| CreateVolume (fresh iSCSI) | 14 |
+| CreateVolume (clone from snapshot) | 12 |
+| CreateVolume / CreateSnapshot (idempotent retry) | 2 |
+| DeleteVolume (NFS / iSCSI) | 6 / 10 |
+| ControllerPublish/Unpublish (fencing `off`, NFS) | 3 |
+| ControllerPublish/Unpublish (`additive`, NFS) | 5 |
+| ControllerPublish/Unpublish (`strict`, NVMe-oF, steady-state) | 9 |
