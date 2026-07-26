@@ -286,10 +286,8 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 // always-on bookkeeping hygiene sweeps and returns the merged ledger plus the
 // parent/bookkeeping datasets threaded into the remnant classifier. Extracted
 // verbatim from reconcileOrphans (Batch 18 R2).
-func (d *Driver) readBookkeepingState(ctx context.Context, minOrphanAge time.Duration, snapshots, tombstones []*truenas.Snapshot) (map[string]tombstoneLedgerEntry, *truenas.Dataset, *truenas.Dataset) {
-	var ledger map[string]tombstoneLedgerEntry
+func (d *Driver) readBookkeepingState(ctx context.Context, minOrphanAge time.Duration, snapshots, tombstones []*truenas.Snapshot) (ledger map[string]tombstoneLedgerEntry, parentDataset, remnantBookkeeping *truenas.Dataset) {
 	bookkeepingReadable := false
-	var remnantBookkeeping *truenas.Dataset
 	parentDataset, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
 	if parentErr != nil {
 		d.recordReconcileObjectFailure("parent_bookkeeping", d.parentDatasetName(), parentErr)

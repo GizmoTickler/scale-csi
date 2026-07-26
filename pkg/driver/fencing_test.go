@@ -39,20 +39,12 @@ type fencingHarness struct {
 }
 
 type fencingHarnessOptions struct {
-	driverClient       truenas.ClientInterface
 	nvmeAllowAnyHost   bool
 	nfsShareHost       string
 	nfsAllowedNetworks []string
 }
 
 type fencingHarnessOption func(*fencingHarnessOptions)
-
-// withDriverClient wraps the driver's client (e.g. an allowlist-counting or
-// interleaving decorator) while the harness still returns the underlying mock
-// for direct backend assertions.
-func withDriverClient(c truenas.ClientInterface) fencingHarnessOption {
-	return func(o *fencingHarnessOptions) { o.driverClient = c }
-}
 
 func withNVMeAllowAnyHost() fencingHarnessOption {
 	return func(o *fencingHarnessOptions) { o.nvmeAllowAnyHost = true }
@@ -102,15 +94,11 @@ func newFencingTestHarness(t *testing.T, mode FencingMode, proto ShareType, opts
 	case ShareTypeNFS:
 		cfg.NFS = NFSConfig{ShareHost: o.nfsShareHost, ShareAllowedNetworks: o.nfsAllowedNetworks}
 	}
-	var driverClient truenas.ClientInterface = client
-	if o.driverClient != nil {
-		driverClient = o.driverClient
-	}
 	return fencingHarness{
 		d: &Driver{
 			name:              name,
 			config:            cfg,
-			truenasClient:     driverClient,
+			truenasClient:     client,
 			nvmeResolvedHosts: make(map[string]int),
 		},
 		client: client,

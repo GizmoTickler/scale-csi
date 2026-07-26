@@ -68,12 +68,13 @@ func (d *Driver) detectTombstonesByScanFallback(
 		provenanceSafe := !ledgerPresent && snapshotMatchesRetainedTombstoneIdentity(snap, d.driverInstanceID())
 		if provenanceSafe {
 			sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, snap.Dataset)
-			if dsErr != nil {
+			switch {
+			case dsErr != nil:
 				d.recordReconcileObjectFailure("tombstone_scan_fallback", snap.ID, dsErr)
 				provenanceSafe = false
-			} else if !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()) {
+			case !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()):
 				provenanceSafe = false
-			} else if sourceDatasetMasksTombstoneInheritance(sourceDataset) {
+			case sourceDatasetMasksTombstoneInheritance(sourceDataset):
 				// The source dataset itself carries csi_snapshot_name, so on TrueNAS
 				// 26.0 the snapshot's retained identity may be INHERITED from the
 				// dataset rather than written at CreateSnapshot — not proof of a
