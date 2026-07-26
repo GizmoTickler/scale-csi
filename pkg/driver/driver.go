@@ -719,9 +719,6 @@ type sessionGCProtocol struct {
 	list        func() ([]gcSession, error)
 	expected    func() map[string]struct{}
 	disconnect  func(id string) error
-	// retirable, when non-nil, gates whether a stale first-seen entry is eligible
-	// for retirement (a legacy per-protocol guard); nil retires unconditionally.
-	retirable func(id string) bool
 }
 
 // gcSessions runs one garbage collection cycle for a single protocol. Orphaned
@@ -817,9 +814,6 @@ func (d *Driver) gcSessions(ctx context.Context, gracePeriod time.Duration, dryR
 	// Clean up stale entries for sessions that are no longer active.
 	p.seen.Range(func(key, _ interface{}) bool {
 		id := key.(string)
-		if p.retirable != nil && !p.retirable(id) {
-			return true
-		}
 		if _, active := activeOrphanedSessions[id]; !active {
 			p.seen.Delete(id)
 		}
@@ -895,8 +889,6 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 		},
 		expected:   d.getExpectedNVMeoFNQNs,
 		disconnect: gcDisconnectNVMeoF,
-		// Only clean up NVMe-oF entries (NQNs start with "nqn.").
-		retirable: func(nqn string) bool { return strings.HasPrefix(nqn, "nqn.") },
 	})
 }
 
