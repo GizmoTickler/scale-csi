@@ -289,21 +289,20 @@ func (d *Driver) sweepOrphanedReplicationJobs(ctx context.Context) error {
 		return nil
 	}
 
-	parent, err := d.truenasClient.DatasetGet(ctx, parentName)
-	if err != nil {
+	reads := d.readBookkeepingDatasets(ctx, d.bookkeepingEnabled())
+	if reads.parentErr != nil {
 		// Without the parent read, marker absence is not proven. Fail closed and
 		// leave every job untouched.
-		return fmt.Errorf("read parent dataset before replication job sweep: %w", err)
+		return fmt.Errorf("read parent dataset before replication job sweep: %w", reads.parentErr)
 	}
-	markers := d.liveCopyMarkers(parent)
+	markers := d.liveCopyMarkers(reads.parent)
 	if d.bookkeepingEnabled() {
 		// Dual-read: copy markers may live on the dedicated bookkeeping dataset.
 		// A marker in either location protects its in-flight job from being aborted.
-		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
-		if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
-			return fmt.Errorf("read bookkeeping dataset before replication job sweep: %w", bkErr)
+		if reads.childErr != nil && !truenas.IsNotFoundError(reads.childErr) {
+			return fmt.Errorf("read bookkeeping dataset before replication job sweep: %w", reads.childErr)
 		}
-		for dataset := range d.liveCopyMarkers(bookkeeping) {
+		for dataset := range d.liveCopyMarkers(reads.child) {
 			markers[dataset] = struct{}{}
 		}
 	}

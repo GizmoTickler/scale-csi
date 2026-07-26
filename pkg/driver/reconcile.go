@@ -943,6 +943,34 @@ func datasetHasUserProperty(dataset *truenas.Dataset, key string) bool {
 	return present
 }
 
+// bookkeepingDatasetReads holds the raw results of the parent-GET and (optional)
+// bookkeeping-child-GET that the dual-read bookkeeping sites share. It carries
+// BOTH datasets and BOTH raw errors so each caller keeps its own explicit
+// fail-open/fail-closed policy and its own parse/merge: this helper makes no
+// policy decision and performs no IsNotFoundError classification itself.
+type bookkeepingDatasetReads struct {
+	parent    *truenas.Dataset
+	parentErr error
+	child     *truenas.Dataset
+	childErr  error
+}
+
+// readBookkeepingDatasets issues the parent-dataset GET and, when readChild is
+// true, the bookkeeping-child GET, parent-first (matching the callers' historical
+// order). readChild lets each caller keep its exact child-read gate — e.g.
+// bookkeepingEnabled(), or that OR a scan-fallback path — so no extra API call is
+// issued when the child read was previously skipped. A skipped child read leaves
+// child nil and childErr nil, which callers distinguish from a successful read via
+// the child != nil check.
+func (d *Driver) readBookkeepingDatasets(ctx context.Context, readChild bool) bookkeepingDatasetReads {
+	var reads bookkeepingDatasetReads
+	reads.parent, reads.parentErr = d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
+	if readChild {
+		reads.child, reads.childErr = d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+	}
+	return reads
+}
+
 // datasetHasLocalManagedResource re-fetches datasetName with property source and
 // reports whether managed_resource="true" is stamped LOCALLY on it. The reconcile
 // listing does not carry property source, so a dataset that merely inherits

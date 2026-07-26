@@ -227,28 +227,25 @@ func (d *Driver) reapTombstoneSnapshot(
 	// permanently refuse to reap any tombstone whose entry exists only on the
 	// child (and, once cleanupParent runs, every tombstone).
 	ledgerKey := tombstoneLedgerKey(snapshot.ID)
-	parent, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
-	if parentErr != nil {
-		return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", parentErr)
+	reads := d.readBookkeepingDatasets(ctx, d.bookkeepingEnabled() || tombstone.tombstoneScanFallback)
+	if reads.parentErr != nil {
+		return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", reads.parentErr)
 	}
-	parentLedger := tombstoneLedgerFromDataset(parent)
+	parentLedger := tombstoneLedgerFromDataset(reads.parent)
 	parentEntry, parentRecorded := parentLedger[ledgerKey]
-	parentPropertyPresent := datasetHasUserProperty(parent, ledgerKey)
+	parentPropertyPresent := datasetHasUserProperty(reads.parent, ledgerKey)
 	var childEntry tombstoneLedgerEntry
 	var childRecorded, childPropertyPresent bool
-	if d.bookkeepingEnabled() || tombstone.tombstoneScanFallback {
-		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
-		if bkErr != nil {
-			// An absent child is legitimate (no entry migrated or written yet);
-			// any other read failure must fail closed, not silently downgrade to
-			// a parent-only decision.
-			if !truenas.IsNotFoundError(bkErr) {
-				return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", bkErr)
-			}
-		} else {
-			childEntry, childRecorded = tombstoneLedgerFromDataset(bookkeeping)[ledgerKey]
-			childPropertyPresent = datasetHasUserProperty(bookkeeping, ledgerKey)
+	if reads.childErr != nil {
+		// An absent child is legitimate (no entry migrated or written yet);
+		// any other read failure must fail closed, not silently downgrade to
+		// a parent-only decision.
+		if !truenas.IsNotFoundError(reads.childErr) {
+			return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", reads.childErr)
 		}
+	} else if reads.child != nil {
+		childEntry, childRecorded = tombstoneLedgerFromDataset(reads.child)[ledgerKey]
+		childPropertyPresent = datasetHasUserProperty(reads.child, ledgerKey)
 	}
 	if tombstone.tombstoneScanFallback {
 		// Fallback is exclusively for a genuinely absent ledger. A raw property
