@@ -19,14 +19,15 @@ The binary accepts these relevant flags:
 | `-endpoint=unix:///csi/csi.sock` | CSI gRPC endpoint |
 | `-node-id=<stable-id>` | Node identity (node mode) |
 | `-driver-name=csi.scale.io` | Unified CSI driver name |
-| `-mode=controller` or `-mode=node` | Service set |
+| `-mode=controller` or `-mode=node` | Service set (also accepts `all` and a run-once `reconcile`; Nomad uses `controller`/`node`) |
 | `-health-port=9809` | Readiness/metrics port; `0` disables HTTP |
 | `-v=2` | klog verbosity |
 | `-version` | Print version and exit |
 
 There are no `--csi-version`, `--csi-name`, `--driver-config-file`,
-`--log-level`, `--csi-mode`, `--server-address`, or `--server-port` flags. The
-plugin speaks over the Unix socket mounted by Nomad's `csi_plugin` block.
+`--log-level`, `--csi-mode`, `--server-address`, or `--server-port` flags. Flags
+use single-dash form as shown (Go `flag`), and the plugin speaks over the Unix
+socket mounted by Nomad's `csi_plugin` block.
 
 Start from one complete strict config in [`examples/`](../examples). The same
 non-secret configuration must be available to controller and node tasks. Only
@@ -51,7 +52,7 @@ job "scale-csi-controller" {
       driver = "docker"
 
       config {
-        image = "ghcr.io/gizmotickler/scale-csi:v1.2.23"
+        image = "ghcr.io/gizmotickler/scale-csi:v1.3.0"
         args = [
           "-config=/etc/scale-csi/config.yaml",
           "-endpoint=unix:///csi/csi.sock",
@@ -108,7 +109,7 @@ job "scale-csi-node" {
       driver = "docker"
 
       config {
-        image      = "ghcr.io/gizmotickler/scale-csi:v1.2.23"
+        image      = "ghcr.io/gizmotickler/scale-csi:v1.3.0"
         privileged = true
         args = [
           "-config=/etc/scale-csi/config.yaml",
