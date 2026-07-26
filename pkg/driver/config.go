@@ -635,20 +635,8 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
-	// Protocol blocks historically did not contain an explicit enabled field.
-	// Preserve those config files while allowing an explicitly disabled block.
-	var configDocument yaml.Node
-	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&configDocument); err != nil {
-		return nil, fmt.Errorf("failed to inspect protocol configuration: %w", err)
-	}
-	if yamlPathExists(&configDocument, "nfs") && !yamlPathExists(&configDocument, "nfs", "enabled") {
-		cfg.NFS.Enabled = true
-	}
-	if yamlPathExists(&configDocument, "iscsi") && !yamlPathExists(&configDocument, "iscsi", "enabled") {
-		cfg.ISCSI.Enabled = true
-	}
-	if yamlPathExists(&configDocument, "nvmeof") && !yamlPathExists(&configDocument, "nvmeof", "enabled") {
-		cfg.NVMeoF.Enabled = true
+	if err := applyProtocolEnabledBackCompat(cfg, data); err != nil {
+		return nil, err
 	}
 	if len(cfg.ISCSI.TargetPortals) > 0 {
 		configWarningf("iscsi.targetPortals is configured with %d additional portal(s), but scale-csi does not currently support iSCSI multipath; only iscsi.targetPortal will be used", len(cfg.ISCSI.TargetPortals))
@@ -687,6 +675,40 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("fencing.staleRecordGracePeriod must be a positive duration")
 	}
 
+	applyConfigDefaults(cfg)
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+// applyProtocolEnabledBackCompat preserves config files whose protocol blocks
+// historically had no explicit `enabled` field: a present block with no explicit
+// enabled defaults to enabled, while an explicitly-set enabled remains
+// authoritative. It re-decodes the raw document to distinguish an absent key from
+// a false value. Extracted from LoadConfig (Batch 18 R7).
+func applyProtocolEnabledBackCompat(cfg *Config, data []byte) error {
+	var configDocument yaml.Node
+	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&configDocument); err != nil {
+		return fmt.Errorf("failed to inspect protocol configuration: %w", err)
+	}
+	if yamlPathExists(&configDocument, "nfs") && !yamlPathExists(&configDocument, "nfs", "enabled") {
+		cfg.NFS.Enabled = true
+	}
+	if yamlPathExists(&configDocument, "iscsi") && !yamlPathExists(&configDocument, "iscsi", "enabled") {
+		cfg.ISCSI.Enabled = true
+	}
+	if yamlPathExists(&configDocument, "nvmeof") && !yamlPathExists(&configDocument, "nvmeof", "enabled") {
+		cfg.NVMeoF.Enabled = true
+	}
+	return nil
+}
+
+// applyConfigDefaults fills in the post-decode default values for every optional
+// field. It performs pure field assignment only — no validation — so it is safe
+// to run before validateConfig. Extracted from LoadConfig (Batch 18 R7).
+func applyConfigDefaults(cfg *Config) {
 	// Set defaults
 	if cfg.TrueNAS.Protocol == "" {
 		cfg.TrueNAS.Protocol = "https"
@@ -748,21 +770,6 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Reconcile.Delete.Schedule == "" {
 		cfg.Reconcile.Delete.Schedule = "0 4 * * *"
-	}
-	if cfg.Reconcile.Delete.MaxPerRun <= 0 {
-		return nil, fmt.Errorf("reconcile.delete.maxPerRun must be positive")
-	}
-	if interval, parseErr := cfg.Reconcile.IntervalDuration(); parseErr != nil || interval <= 0 {
-		if parseErr != nil {
-			return nil, fmt.Errorf("reconcile.interval must be a positive duration: %w", parseErr)
-		}
-		return nil, fmt.Errorf("reconcile.interval must be a positive duration")
-	}
-	if minAge, parseErr := cfg.Reconcile.MinOrphanAgeDuration(); parseErr != nil || minAge <= 0 {
-		if parseErr != nil {
-			return nil, fmt.Errorf("reconcile.minOrphanAge must be a positive duration: %w", parseErr)
-		}
-		return nil, fmt.Errorf("reconcile.minOrphanAge must be a positive duration")
 	}
 	// Spent-restore classification defaults to enabled (preserves the historical
 	// always-on behavior); an explicit enabled=false remains authoritative.
@@ -855,37 +862,57 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.NVMeoF.CommandTimeout == 0 {
 		cfg.NVMeoF.CommandTimeout = 30 // 30 seconds
 	}
+}
+
+// validateConfig enforces the config invariants that must hold after defaults are
+// applied: the reconcile delete cap and durations, and the required-field/enabled-
+// protocol constraints. Extracted from LoadConfig (Batch 18 R7).
+func validateConfig(cfg *Config) error {
+	if cfg.Reconcile.Delete.MaxPerRun <= 0 {
+		return fmt.Errorf("reconcile.delete.maxPerRun must be positive")
+	}
+	if interval, parseErr := cfg.Reconcile.IntervalDuration(); parseErr != nil || interval <= 0 {
+		if parseErr != nil {
+			return fmt.Errorf("reconcile.interval must be a positive duration: %w", parseErr)
+		}
+		return fmt.Errorf("reconcile.interval must be a positive duration")
+	}
+	if minAge, parseErr := cfg.Reconcile.MinOrphanAgeDuration(); parseErr != nil || minAge <= 0 {
+		if parseErr != nil {
+			return fmt.Errorf("reconcile.minOrphanAge must be a positive duration: %w", parseErr)
+		}
+		return fmt.Errorf("reconcile.minOrphanAge must be a positive duration")
+	}
 
 	// Validate required fields
 	if cfg.TrueNAS.Host == "" {
-		return nil, fmt.Errorf("truenas.host is required")
+		return fmt.Errorf("truenas.host is required")
 	}
 	if cfg.ZFS.DatasetParentName == "" {
-		return nil, fmt.Errorf("zfs.datasetParentName is required")
+		return fmt.Errorf("zfs.datasetParentName is required")
 	}
 
 	// The unified driver selects a protocol per StorageClass. Validate only the
 	// protocols that this deployment enabled, never the deprecated driver-name
 	// fallback.
 	if !cfg.NFS.Enabled && !cfg.ISCSI.Enabled && !cfg.NVMeoF.Enabled {
-		return nil, fmt.Errorf("at least one storage protocol must be enabled (nfs, iscsi, or nvmeof)")
+		return fmt.Errorf("at least one storage protocol must be enabled (nfs, iscsi, or nvmeof)")
 	}
 	if cfg.NFS.Enabled && cfg.NFS.ShareHost == "" {
-		return nil, fmt.Errorf("nfs.shareHost is required when NFS is enabled")
+		return fmt.Errorf("nfs.shareHost is required when NFS is enabled")
 	}
 	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {
-		return nil, fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
+		return fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
 	}
 	if cfg.NVMeoF.Enabled {
 		if cfg.NVMeoF.TransportAddress == "" {
-			return nil, fmt.Errorf("nvmeof.transportAddress is required when NVMe-oF is enabled")
+			return fmt.Errorf("nvmeof.transportAddress is required when NVMe-oF is enabled")
 		}
 		if cfg.Fencing.Mode != FencingModeStrict && !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
-			return nil, fmt.Errorf("nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty; no host could connect")
+			return fmt.Errorf("nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty; no host could connect")
 		}
 	}
-
-	return cfg, nil
+	return nil
 }
 
 func validateNonNegativeConfig(cfg *Config) error {
