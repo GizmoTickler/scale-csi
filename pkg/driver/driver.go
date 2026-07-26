@@ -658,7 +658,7 @@ func (d *Driver) stopSessionGC() {
 	}
 }
 
-// runSessionGC performs one garbage collection cycle with explicit protocol control.
+// runSessionGCWithProtocols performs one garbage collection cycle with explicit protocol control.
 // It runs GC for the specified protocols, allowing per-protocol enable/disable via config.
 // gracePeriod specifies how long a session must be orphaned before cleanup.
 func (d *Driver) runSessionGCWithProtocols(ctx context.Context, gracePeriod time.Duration, dryRun, iscsiEnabled, nvmeofEnabled bool) {
@@ -699,235 +699,205 @@ func (d *Driver) observeNVMeoFSessions() ([]util.NVMeoFSessionInfo, error) {
 	return sessions, nil
 }
 
-// gcISCSISessions garbage collects orphaned iSCSI sessions.
-// Sessions must be orphaned for at least gracePeriod before being disconnected.
-func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
-	// Get all active iSCSI sessions
-	sessions, err := d.observeISCSISessions()
+// gcSession is a protocol-normalized view of one active session for the shared
+// session-GC core: id is the session's transport identity (IQN or NQN) and
+// inScope reports whether it belongs to this driver's configured portal/target
+// address (out-of-scope sessions are logged and skipped by the per-protocol
+// lister, but still counted in the "active sessions" total).
+type gcSession struct {
+	id      string
+	inScope bool
+}
+
+// sessionGCProtocol supplies the protocol-specific pieces the shared gcSessions
+// core needs. The two first-seen sync.Maps stay separate (one per protocol) so
+// retiring stale entries for one transport never touches the other.
+type sessionGCProtocol struct {
+	name        string    // human label, e.g. "iSCSI" / "NVMe-oF"
+	metricLabel string    // RecordGCSessionDisconnected label, e.g. "iscsi"
+	seen        *sync.Map // this protocol's orphaned-session first-seen map
+	list        func() ([]gcSession, error)
+	expected    func() map[string]struct{}
+	disconnect  func(id string) error
+	// retirable, when non-nil, gates whether a stale first-seen entry is eligible
+	// for retirement (a legacy per-protocol guard); nil retires unconditionally.
+	retirable func(id string) bool
+}
+
+// gcSessions runs one garbage collection cycle for a single protocol. Orphaned
+// sessions (active but with no corresponding staged volume) must remain orphaned
+// for at least gracePeriod before being disconnected.
+func (d *Driver) gcSessions(ctx context.Context, gracePeriod time.Duration, dryRun bool, p sessionGCProtocol) {
+	sessions, err := p.list()
 	if err != nil {
 		return
 	}
-
 	if len(sessions) == 0 {
-		klog.V(5).Info("Session GC: no active iSCSI sessions")
+		klog.V(5).Infof("Session GC: no active %s sessions", p.name)
 		return
 	}
+	klog.V(4).Infof("Session GC: found %d active %s sessions", len(sessions), p.name)
 
-	klog.V(4).Infof("Session GC: found %d active iSCSI sessions", len(sessions))
-
-	// Get expected sessions from kubelet staging directory
-	// Returns nil if the lookup was unreliable (e.g., race condition during stage/unstage)
-	expectedTargets := d.getExpectedISCSITargets()
-	if expectedTargets == nil {
-		klog.Info("Session GC: skipping iSCSI GC due to unreliable expected targets lookup")
+	// Get expected sessions from kubelet staging directory.
+	// Returns nil if the lookup was unreliable (e.g., race condition during stage/unstage).
+	expected := p.expected()
+	if expected == nil {
+		klog.Infof("Session GC: skipping %s GC due to unreliable expected-session lookup", p.name)
 		return
 	}
-	klog.V(4).Infof("Session GC: found %d expected iSCSI targets from staged volumes", len(expectedTargets))
+	klog.V(4).Infof("Session GC: found %d expected %s sessions from staged volumes", len(expected), p.name)
 
-	// Find orphaned sessions
-	portal := d.config.ISCSI.TargetPortal
 	orphanedCount := 0
 	now := time.Now()
 
-	// Track which owned sessions remain active so this protocol's stale
-	// first-seen entries can be retired without touching NVMe state.
+	// Track which owned sessions remain active so this protocol's stale first-seen
+	// entries can be retired without touching the other protocol's state.
 	activeOrphanedSessions := make(map[string]struct{})
 
 	for _, session := range sessions {
 		if ctx.Err() != nil {
-			klog.V(4).Info("Session GC: stopping iSCSI cleanup after cancellation")
+			klog.V(4).Infof("Session GC: stopping %s cleanup after cancellation", p.name)
 			return
 		}
-		// Only consider sessions for our portal
-		if session.Portal != portal && session.Portal != portal+",1" {
-			klog.V(5).Infof("Session GC: skipping session %s (different portal: %s)", session.IQN, session.Portal)
-			continue
-		}
-		if !d.isDriverISCSITarget(session.IQN) {
-			klog.V(5).Infof("Session GC: skipping session %s (target is not owned by this driver)", session.IQN)
+		// Only consider sessions for our portal/target address.
+		if !session.inScope {
 			continue
 		}
 
 		// Check if this session is expected
-		if _, expected := expectedTargets[session.IQN]; expected {
-			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.IQN)
+		if _, expectedSession := expected[session.id]; expectedSession {
+			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.id)
 			// Remove from orphaned tracking if it was previously orphaned
-			d.orphanedISCSISessionsSeen.Delete(session.IQN)
+			p.seen.Delete(session.id)
 			continue
 		}
 
 		// This session has no corresponding staged volume - it's orphaned
-		activeOrphanedSessions[session.IQN] = struct{}{}
+		activeOrphanedSessions[session.id] = struct{}{}
 
 		// Check when we first saw this orphaned session
-		firstSeenVal, loaded := d.orphanedISCSISessionsSeen.LoadOrStore(session.IQN, now)
+		firstSeenVal, loaded := p.seen.LoadOrStore(session.id, now)
 		firstSeen, ok := firstSeenVal.(time.Time)
 		if !ok {
-			klog.Warningf("Session GC: unexpected type in iSCSI first-seen state for %s, resetting", session.IQN)
-			d.orphanedISCSISessionsSeen.Store(session.IQN, now)
+			klog.Warningf("Session GC: unexpected type in %s first-seen state for %s, resetting", p.name, session.id)
+			p.seen.Store(session.id, now)
 			continue
 		}
 
 		orphanedDuration := now.Sub(firstSeen)
 		if !loaded {
-			klog.Infof("Session GC: found newly orphaned iSCSI session: %s (will disconnect after %v)", session.IQN, gracePeriod)
+			klog.Infof("Session GC: found newly orphaned %s session: %s (will disconnect after %v)", p.name, session.id, gracePeriod)
 			continue
 		}
 
 		// Check if grace period has passed
 		if orphanedDuration < gracePeriod {
-			klog.V(4).Infof("Session GC: orphaned session %s within grace period (%v < %v)", session.IQN, orphanedDuration, gracePeriod)
+			klog.V(4).Infof("Session GC: orphaned session %s within grace period (%v < %v)", session.id, orphanedDuration, gracePeriod)
 			continue
 		}
 
 		orphanedCount++
-		klog.Infof("Session GC: orphaned iSCSI session %s exceeded grace period (%v)", session.IQN, orphanedDuration)
+		klog.Infof("Session GC: orphaned %s session %s exceeded grace period (%v)", p.name, session.id, orphanedDuration)
 
 		if dryRun {
-			klog.Infof("Session GC: [DRY RUN] would disconnect orphaned session: %s", session.IQN)
+			klog.Infof("Session GC: [DRY RUN] would disconnect orphaned session: %s", session.id)
 			continue
 		}
 
 		// Disconnect the orphaned session
-		if err := gcDisconnectISCSI(portal, session.IQN); err != nil {
-			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.IQN, err)
+		if err := p.disconnect(session.id); err != nil {
+			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.id, err)
 		} else {
-			klog.Infof("Session GC: disconnected orphaned iSCSI session: %s", session.IQN)
-			RecordGCSessionDisconnected("iscsi")
-			d.orphanedISCSISessionsSeen.Delete(session.IQN)
+			klog.Infof("Session GC: disconnected orphaned %s session: %s", p.name, session.id)
+			RecordGCSessionDisconnected(p.metricLabel)
+			p.seen.Delete(session.id)
 		}
 	}
 
-	// Clean up stale iSCSI entries for sessions that are no longer active.
-	d.orphanedISCSISessionsSeen.Range(func(key, _ interface{}) bool {
-		iqn := key.(string)
-		if _, active := activeOrphanedSessions[iqn]; !active {
-			d.orphanedISCSISessionsSeen.Delete(iqn)
+	// Clean up stale entries for sessions that are no longer active.
+	p.seen.Range(func(key, _ interface{}) bool {
+		id := key.(string)
+		if p.retirable != nil && !p.retirable(id) {
+			return true
+		}
+		if _, active := activeOrphanedSessions[id]; !active {
+			p.seen.Delete(id)
 		}
 		return true
 	})
 
 	if orphanedCount > 0 {
-		klog.Infof("Session GC: processed %d orphaned iSCSI sessions", orphanedCount)
+		klog.Infof("Session GC: processed %d orphaned %s sessions", orphanedCount, p.name)
 	} else {
-		klog.V(4).Info("Session GC: no orphaned iSCSI sessions found")
+		klog.V(4).Infof("Session GC: no orphaned %s sessions found", p.name)
 	}
+}
+
+// gcISCSISessions garbage collects orphaned iSCSI sessions.
+// Sessions must be orphaned for at least gracePeriod before being disconnected.
+func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
+	portal := d.config.ISCSI.TargetPortal
+	d.gcSessions(ctx, gracePeriod, dryRun, sessionGCProtocol{
+		name:        "iSCSI",
+		metricLabel: "iscsi",
+		seen:        &d.orphanedISCSISessionsSeen,
+		list: func() ([]gcSession, error) {
+			sessions, err := d.observeISCSISessions()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]gcSession, 0, len(sessions))
+			for _, session := range sessions {
+				inScope := true
+				switch {
+				case session.Portal != portal && session.Portal != portal+",1":
+					klog.V(5).Infof("Session GC: skipping session %s (different portal: %s)", session.IQN, session.Portal)
+					inScope = false
+				case !d.isDriverISCSITarget(session.IQN):
+					klog.V(5).Infof("Session GC: skipping session %s (target is not owned by this driver)", session.IQN)
+					inScope = false
+				}
+				out = append(out, gcSession{id: session.IQN, inScope: inScope})
+			}
+			return out, nil
+		},
+		expected:   d.getExpectedISCSITargets,
+		disconnect: func(id string) error { return gcDisconnectISCSI(portal, id) },
+	})
 }
 
 // gcNVMeoFSessions garbage collects orphaned NVMe-oF sessions.
 // Sessions must be orphaned for at least gracePeriod before being disconnected.
 func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
-	// Get all active NVMe-oF sessions
-	sessions, err := d.observeNVMeoFSessions()
-	if err != nil {
-		return
-	}
-
-	if len(sessions) == 0 {
-		klog.V(5).Info("Session GC: no active NVMe-oF sessions")
-		return
-	}
-
-	klog.V(4).Infof("Session GC: found %d active NVMe-oF sessions", len(sessions))
-
-	// Get expected sessions from kubelet staging directory
-	// Returns nil if the lookup was unreliable (e.g., race condition during stage/unstage)
-	expectedNQNs := d.getExpectedNVMeoFNQNs()
-	if expectedNQNs == nil {
-		klog.Info("Session GC: skipping NVMe-oF GC due to unreliable expected NQNs lookup")
-		return
-	}
-	klog.V(4).Infof("Session GC: found %d expected NVMe-oF NQNs from staged volumes", len(expectedNQNs))
-
-	// Find orphaned sessions
-	orphanedCount := 0
 	targetAddr := d.config.NVMeoF.TransportAddress
-	now := time.Now()
-
-	// Track which sessions are still active so stale NVMe first-seen entries can
-	// be retired without touching iSCSI state.
-	activeOrphanedSessions := make(map[string]struct{})
-
-	for _, session := range sessions {
-		if ctx.Err() != nil {
-			klog.V(4).Info("Session GC: stopping NVMe-oF cleanup after cancellation")
-			return
-		}
-		// Only consider sessions for our target address
-		// Session address format from nvme list-subsys: "traddr=192.0.2.10,trsvcid=4420,src_addr=203.0.113.10"
-		// Config address format: "192.0.2.10"
-		if !nvmeSessionMatchesTransportAddress(session.Address, targetAddr) {
-			klog.V(5).Infof("Session GC: skipping session %s (different address: %s, target: %s)", session.NQN, session.Address, targetAddr)
-			continue
-		}
-
-		// Check if this session is expected
-		if _, expected := expectedNQNs[session.NQN]; expected {
-			klog.V(5).Infof("Session GC: session %s is expected (has staged volume)", session.NQN)
-			// Remove from orphaned tracking if it was previously orphaned
-			d.orphanedNVMeSessionsSeen.Delete(session.NQN)
-			continue
-		}
-
-		// This session has no corresponding staged volume - it's orphaned
-		activeOrphanedSessions[session.NQN] = struct{}{}
-
-		// Check when we first saw this orphaned session
-		firstSeenVal, loaded := d.orphanedNVMeSessionsSeen.LoadOrStore(session.NQN, now)
-		firstSeen, ok := firstSeenVal.(time.Time)
-		if !ok {
-			klog.Warningf("Session GC: unexpected type in NVMe first-seen state for %s, resetting", session.NQN)
-			d.orphanedNVMeSessionsSeen.Store(session.NQN, now)
-			continue
-		}
-
-		orphanedDuration := now.Sub(firstSeen)
-		if !loaded {
-			klog.Infof("Session GC: found newly orphaned NVMe-oF session: %s (will disconnect after %v)", session.NQN, gracePeriod)
-			continue
-		}
-
-		// Check if grace period has passed
-		if orphanedDuration < gracePeriod {
-			klog.V(4).Infof("Session GC: orphaned session %s within grace period (%v < %v)", session.NQN, orphanedDuration, gracePeriod)
-			continue
-		}
-
-		orphanedCount++
-		klog.Infof("Session GC: orphaned NVMe-oF session %s exceeded grace period (%v)", session.NQN, orphanedDuration)
-
-		if dryRun {
-			klog.Infof("Session GC: [DRY RUN] would disconnect orphaned session: %s", session.NQN)
-			continue
-		}
-
-		// Disconnect the orphaned session
-		if err := gcDisconnectNVMeoF(session.NQN); err != nil {
-			klog.Warningf("Session GC: failed to disconnect orphaned session %s: %v", session.NQN, err)
-		} else {
-			klog.Infof("Session GC: disconnected orphaned NVMe-oF session: %s", session.NQN)
-			RecordGCSessionDisconnected("nvmeof")
-			d.orphanedNVMeSessionsSeen.Delete(session.NQN)
-		}
-	}
-
-	// Clean up stale entries from the NVMe-oF first-seen map.
-	d.orphanedNVMeSessionsSeen.Range(func(key, _ interface{}) bool {
-		nqn := key.(string)
-		// Only clean up NVMe-oF entries (NQNs start with "nqn.")
-		if strings.HasPrefix(nqn, "nqn.") {
-			if _, active := activeOrphanedSessions[nqn]; !active {
-				d.orphanedNVMeSessionsSeen.Delete(nqn)
+	d.gcSessions(ctx, gracePeriod, dryRun, sessionGCProtocol{
+		name:        "NVMe-oF",
+		metricLabel: "nvmeof",
+		seen:        &d.orphanedNVMeSessionsSeen,
+		list: func() ([]gcSession, error) {
+			sessions, err := d.observeNVMeoFSessions()
+			if err != nil {
+				return nil, err
 			}
-		}
-		return true
+			out := make([]gcSession, 0, len(sessions))
+			for _, session := range sessions {
+				// Session address format from nvme list-subsys:
+				// "traddr=192.0.2.10,trsvcid=4420,src_addr=203.0.113.10"; config
+				// address format: "192.0.2.10".
+				inScope := true
+				if !nvmeSessionMatchesTransportAddress(session.Address, targetAddr) {
+					klog.V(5).Infof("Session GC: skipping session %s (different address: %s, target: %s)", session.NQN, session.Address, targetAddr)
+					inScope = false
+				}
+				out = append(out, gcSession{id: session.NQN, inScope: inScope})
+			}
+			return out, nil
+		},
+		expected:   d.getExpectedNVMeoFNQNs,
+		disconnect: gcDisconnectNVMeoF,
+		// Only clean up NVMe-oF entries (NQNs start with "nqn.").
+		retirable: func(nqn string) bool { return strings.HasPrefix(nqn, "nqn.") },
 	})
-
-	if orphanedCount > 0 {
-		klog.Infof("Session GC: processed %d orphaned NVMe-oF sessions", orphanedCount)
-	} else {
-		klog.V(4).Info("Session GC: no orphaned NVMe-oF sessions found")
-	}
 }
 
 func nvmeSessionMatchesTransportAddress(sessionAddress, targetAddress string) bool {
@@ -940,93 +910,95 @@ func nvmeSessionMatchesTransportAddress(sessionAddress, targetAddress string) bo
 	return false
 }
 
-// getExpectedISCSITargets returns a map of IQNs that have corresponding staged volumes.
-// It scans the kubelet CSI staging directory to find which volumes are currently staged.
-// Returns nil if the lookup was unreliable (too many failures), signaling GC should be skipped.
-func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
-	expected := make(map[string]struct{})
-
+// expectedStagedSessions scans the kubelet CSI staging directory's in-use block
+// devices and returns the set of transport identities (IQNs or NQNs) that have a
+// corresponding staged volume. It returns nil — signaling the caller's GC pass to
+// skip — when the in-use device scan fails, or when too many per-device lookups
+// fail (a likely stage/unstage race), so a transient error can never orphan a
+// live session. deviceID resolves one device to its transport identity; its
+// second return reports whether a FAILED lookup is for a device that likely
+// belongs to this protocol (only those count toward the failure threshold), and
+// its third return reports lookup success. deviceLabel names the protocol in the
+// threshold-exceeded warning.
+func (d *Driver) expectedStagedSessions(deviceLabel string, deviceID func(device string) (id string, likely bool, ok bool)) map[string]struct{} {
 	inUseDevices, err := getInUseBlockDevices()
 	if err != nil {
 		klog.Warningf("Session GC: failed to get in-use block devices: %v", err)
 		return nil // Return nil to signal GC should be skipped
 	}
 
-	// Track failed lookups to detect race conditions or transient issues
-	// If we fail to look up too many devices, skip GC entirely to avoid data loss
-	failedLookups := 0
-	const maxFailedLookups = 2 // Allow 1-2 failures for non-iSCSI devices, but more suggests a problem
+	expected := make(map[string]struct{})
 
-	// For each mounted device, get its iSCSI session if any
+	// Track failed lookups to detect race conditions or transient issues.
+	// If we fail to look up too many devices, skip GC entirely to avoid data loss.
+	failedLookups := 0
+	const maxFailedLookups = 2 // Allow 1-2 failures, but more suggests a problem
+
 	for device := range inUseDevices {
-		// Check if this device is an iSCSI device
-		portal, iqn, err := getISCSIInfoFromDevice(device)
-		if err != nil {
-			// Check if this is likely an iSCSI device by looking at the device name pattern
-			// iSCSI devices are typically sd[a-z]+ (not nvme*, loop*, etc)
-			if util.IsLikelyISCSIDevice(device) {
+		id, likely, ok := deviceID(device)
+		if !ok {
+			if likely {
 				failedLookups++
-				klog.V(4).Infof("Session GC: failed to get iSCSI info for %s (may be race condition): %v", device, err)
 			}
 			continue
 		}
-		if portal != "" && iqn != "" {
-			expected[iqn] = struct{}{}
+		if id != "" {
+			expected[id] = struct{}{}
 		}
 	}
 
 	// If too many lookups failed, this might indicate a race condition
-	// (concurrent stage/unstage operations) - skip GC to be safe
+	// (concurrent stage/unstage operations) - skip GC to be safe.
 	if failedLookups > maxFailedLookups {
-		klog.Warningf("Session GC: %d iSCSI device lookups failed, skipping GC to avoid race condition", failedLookups)
+		klog.Warningf("Session GC: %d %s device lookups failed, skipping GC to avoid race condition", failedLookups, deviceLabel)
 		return nil // Return nil to signal GC should be skipped
 	}
 
 	return expected
 }
 
+// getExpectedISCSITargets returns a map of IQNs that have corresponding staged volumes.
+// It scans the kubelet CSI staging directory to find which volumes are currently staged.
+// Returns nil if the lookup was unreliable (too many failures), signaling GC should be skipped.
+func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
+	return d.expectedStagedSessions("iSCSI", func(device string) (string, bool, bool) {
+		// Check if this device is an iSCSI device.
+		portal, iqn, err := getISCSIInfoFromDevice(device)
+		if err != nil {
+			// iSCSI devices are typically sd[a-z]+ (not nvme*, loop*, etc); only a
+			// likely-iSCSI device's failed lookup should count toward the threshold.
+			likely := util.IsLikelyISCSIDevice(device)
+			if likely {
+				klog.V(4).Infof("Session GC: failed to get iSCSI info for %s (may be race condition): %v", device, err)
+			}
+			return "", likely, false
+		}
+		if portal != "" && iqn != "" {
+			return iqn, false, true
+		}
+		return "", false, true
+	})
+}
+
 // getExpectedNVMeoFNQNs returns a map of NQNs that have corresponding staged volumes.
 // Returns nil if the lookup was unreliable (e.g., error getting mounted devices),
 // signaling GC should be skipped to prevent false positives.
 func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
-	inUseDevices, err := getInUseBlockDevices()
-	if err != nil {
-		klog.Warningf("Session GC: failed to get in-use block devices: %v", err)
-		return nil // Return nil to signal GC should be skipped
-	}
-
-	expected := make(map[string]struct{})
-
-	// Track failed lookups to detect race conditions or transient issues
-	// If we fail to look up too many devices, skip GC entirely to avoid data loss
-	failedLookups := 0
-	const maxFailedLookups = 2 // Allow 1-2 failures, but more suggests a problem
-
-	// For each mounted device, get its NVMe-oF session if any
-	for device := range inUseDevices {
-		// Check if this device is an NVMe device
+	return d.expectedStagedSessions("NVMe", func(device string) (string, bool, bool) {
+		// Check if this device is an NVMe device.
 		nqn, err := getNVMeInfoFromDevice(device)
 		if err != nil {
-			// Check if this looks like an NVMe device (might be transient state)
-			if util.IsLikelyNVMeDevice(device) {
-				failedLookups++
+			likely := util.IsLikelyNVMeDevice(device)
+			if likely {
 				klog.V(4).Infof("Session GC: failed to get NVMe info for %s (may be race condition): %v", device, err)
 			}
-			continue
+			return "", likely, false
 		}
 		if nqn != "" {
-			expected[nqn] = struct{}{}
+			return nqn, false, true
 		}
-	}
-
-	// If too many lookups failed, this might indicate a race condition
-	// (concurrent connect/disconnect operations) - skip GC to be safe
-	if failedLookups > maxFailedLookups {
-		klog.Warningf("Session GC: %d NVMe device lookups failed, skipping GC to avoid race condition", failedLookups)
-		return nil // Return nil to signal GC should be skipped
-	}
-
-	return expected
+		return "", false, true
+	})
 }
 
 func getInUseBlockDevices() (map[string]string, error) {
