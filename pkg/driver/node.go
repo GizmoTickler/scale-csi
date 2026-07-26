@@ -255,6 +255,19 @@ func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType 
 	if symlink {
 		devicePath, resolveErr := filepath.EvalSymlinks(stagingPath)
 		if resolveErr != nil {
+			// A DANGLING staging symlink — the backing device vanished (node reboot
+			// with a persisted staging dir, a dropped iSCSI/NVMe-oF session) — makes
+			// EvalSymlinks fail with a not-exist-class error. Returning Internal here
+			// wedges the volume forever: every kubelet retry fails identically and the
+			// stage never reaches the reconnect path built to repair exactly this.
+			// Drop the stale stage record and report "not staged" so the normal stage
+			// path disconnects the stale session, reconnects, and atomically replaces
+			// the link. A resolvable device that fails for any other reason stays
+			// fail-closed with Internal.
+			if errors.Is(resolveErr, os.ErrNotExist) {
+				d.deleteStageRecord(stagingPath)
+				return false, nil
+			}
 			return true, status.Errorf(codes.Internal, "failed to resolve staged block device: %v", resolveErr)
 		}
 		if sourceErr := verifyStageDeviceSource(devicePath, shareType, req.GetVolumeContext()); sourceErr != nil {

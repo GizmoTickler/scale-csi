@@ -1702,6 +1702,100 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 	})
 }
 
+// TestNodeStageVolumeSelfHealsDanglingStagingSymlink is the Batch 18 R9
+// regression: a DANGLING staging symlink (device vanished — node reboot with a
+// persisted staging dir, a dropped session) made EvalSymlinks fail and
+// handleExistingStage return codes.Internal, so every kubelet retry failed
+// identically forever and the stage never reached the reconnect repair path.
+// The stage must now self-heal by dropping the stale record and reconnecting.
+func TestNodeStageVolumeSelfHealsDanglingStagingSymlink(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "iscsiadm")
+	originalConnect := iscsiConnectWithSessions
+	originalGetInfo := nodeGetISCSIInfo
+	originalGetInfoSessions := getISCSIInfoFromDeviceWithSessions
+	t.Cleanup(func() {
+		iscsiConnectWithSessions = originalConnect
+		nodeGetISCSIInfo = originalGetInfo
+		getISCSIInfoFromDeviceWithSessions = originalGetInfoSessions
+	})
+	iscsiConnectWithSessions = func(context.Context, string, string, int, *util.ISCSIConnectOptions, []util.ISCSISessionInfo) (string, error) {
+		return "/dev/null", nil
+	}
+	nodeGetISCSIInfo = func(string) (string, string, error) {
+		return "192.0.2.10:3260", "iqn.test:block-volume", nil
+	}
+	// Force the block-already-staged shortcut to miss on the dangling target so
+	// the reconnect path runs.
+	getISCSIInfoFromDeviceWithSessions = func(string, []util.ISCSISessionInfo) (string, string, error) {
+		return "", "", errors.New("no device")
+	}
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	stagingDir := t.TempDir()
+	stagingPath := filepath.Join(stagingDir, "volume-device")
+	// A dangling symlink: its target no longer exists.
+	require.NoError(t, os.Symlink(filepath.Join(stagingDir, "gone-device"), stagingPath))
+	// A stale stage record persists from before the device vanished.
+	d.storeStageRecord(nodeMountRecord{VolumeID: "block-volume", TargetPath: stagingPath})
+
+	req := &csi.NodeStageVolumeRequest{
+		VolumeId:          "block-volume",
+		StagingTargetPath: stagingPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+		VolumeContext: map[string]string{
+			"node_attach_driver": "iscsi",
+			"portal":             "192.0.2.10:3260",
+			"iqn":                "iqn.test:block-volume",
+			"lun":                "0",
+		},
+	}
+	_, err := d.NodeStageVolume(context.Background(), req)
+	require.NoError(t, err, "a dangling staging symlink must self-heal, not wedge forever")
+	target, err := os.Readlink(stagingPath)
+	require.NoError(t, err)
+	assert.Equal(t, "/dev/null", target, "the stale symlink must be replaced with the reconnected device")
+}
+
+// TestHandleExistingStageFailsClosedOnResolvableIdentityError proves the R9 fix
+// did NOT loosen the resolvable-device path: a symlink that RESOLVES to a live
+// device whose identity cannot be verified still fails closed with Internal
+// (only the not-exist/dangling case self-heals).
+func TestHandleExistingStageFailsClosedOnResolvableIdentityError(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt")
+	original := nodeGetISCSIInfo
+	t.Cleanup(func() { nodeGetISCSIInfo = original })
+	nodeGetISCSIInfo = func(string) (string, string, error) {
+		return "", "", errors.New("transient sysfs miss")
+	}
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	stagingDir := t.TempDir()
+	realDevice := filepath.Join(stagingDir, "real-device")
+	require.NoError(t, os.WriteFile(realDevice, []byte{}, 0o600))
+	stagingPath := filepath.Join(stagingDir, "volume-device")
+	require.NoError(t, os.Symlink(realDevice, stagingPath)) // resolvable
+
+	req := &csi.NodeStageVolumeRequest{
+		VolumeId:          "block-volume",
+		StagingTargetPath: stagingPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+		VolumeContext: map[string]string{"node_attach_driver": "iscsi", "portal": "192.0.2.10:3260", "iqn": "iqn.test:block-volume", "lun": "0"},
+	}
+	capability, err := nodeCapabilityForRequest(req.GetVolumeCapability())
+	require.NoError(t, err)
+
+	handled, stageErr := d.handleExistingStage(req, ShareTypeISCSI, capability, "iqn.test:block-volume")
+	assert.True(t, handled, "a resolvable device with an identity error must stay handled (fail-closed)")
+	require.Error(t, stageErr)
+	assert.Equal(t, codes.Internal, status.Code(stageErr))
+}
+
 func TestWaitForSessionCleanupReturnsWhenSessionDisappears(t *testing.T) {
 	calls := 0
 	start := time.Now()
