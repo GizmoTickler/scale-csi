@@ -57,12 +57,13 @@ func (d *Driver) detectTombstonesByScanFallback(
 		}
 		sourceVolumeID := path.Base(snap.Dataset)
 		item := ReconcileObject{
-			ID:             snap.ID,
-			BackendID:      snap.ID,
-			SourceVolumeID: sourceVolumeID,
-			CreatedAt:      createdAt,
-			Age:            age,
-			Bytes:          snap.GetSnapshotSize(),
+			ID:                 snap.ID,
+			BackendID:          snap.ID,
+			SourceVolumeID:     sourceVolumeID,
+			CreatedAt:          createdAt,
+			Age:                age,
+			Bytes:              snap.GetSnapshotSize(),
+			tombstoneCreateTXG: snap.CreateTXG,
 		}
 		_, ledgerPresent := ledger[tombstoneLedgerKey(snap.ID)]
 		provenanceSafe := !ledgerPresent && snapshotMatchesRetainedTombstoneIdentity(snap, d.driverInstanceID())
@@ -138,6 +139,22 @@ func snapshotMatchesRetainedTombstoneIdentity(snap *truenas.Snapshot, instanceID
 		return false
 	}
 	return currentName == snapshotTombstoneName(snap.Dataset, sanitizeVolumeID(original.Value), nonce)
+}
+
+// tombstoneLedgerEntryMatchesSnapshot applies the versioned ledger identity
+// predicate. Existing v1 entries retain their full-ID-plus-creation-seconds
+// semantics. New v2 entries additionally require CreateTXG when it was
+// available at write time; v2 CreateTXG==0 is the documented seconds-only
+// degradation for backends/read paths that do not expose it.
+func tombstoneLedgerEntryMatchesSnapshot(entry tombstoneLedgerEntry, snap *truenas.Snapshot) bool {
+	if snap == nil || entry.Snapshot != snap.ID || entry.CreatedAt <= 0 ||
+		entry.CreatedAt != snap.GetCreationTime() {
+		return false
+	}
+	if entry.Version >= 2 && entry.CreateTXG != 0 {
+		return snap.CreateTXG != 0 && entry.CreateTXG == snap.CreateTXG
+	}
+	return true
 }
 
 // sourceDatasetMasksTombstoneInheritance reports whether the tombstone's source
@@ -258,10 +275,13 @@ func (d *Driver) reapTombstoneSnapshot(
 		if !snapshotMatchesRetainedTombstoneIdentity(snapshot, d.driverInstanceID()) {
 			return false, "retained snapshot identity does not prove the driver tombstone rename"
 		}
+		if tombstone.tombstoneCreateTXG != 0 &&
+			snapshot.CreateTXG != tombstone.tombstoneCreateTXG {
+			return false, "retained snapshot CreateTXG identity changed"
+		}
 	} else {
 		ledgerProvenance := func(entry tombstoneLedgerEntry, recorded bool) bool {
-			return recorded && entry.Snapshot == snapshot.ID && entry.CreatedAt > 0 &&
-				entry.CreatedAt == snapshot.GetCreationTime()
+			return recorded && tombstoneLedgerEntryMatchesSnapshot(entry, snapshot)
 		}
 		if !ledgerProvenance(parentEntry, parentRecorded) && !ledgerProvenance(childEntry, childRecorded) {
 			if !parentRecorded && !childRecorded {

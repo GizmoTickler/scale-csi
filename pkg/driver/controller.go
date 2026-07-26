@@ -65,7 +65,7 @@ const (
 	PropRecoveryNonce = "truenas-csi:recovery_nonce"
 
 	inflightMarkerVersion  = 1
-	tombstoneLedgerVersion = 1
+	tombstoneLedgerVersion = 2
 	inflightModeClone      = "clone"
 	inflightModeCopy       = "copy"
 )
@@ -372,11 +372,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
 	var createdDS *truenas.Dataset
+	var snapshotCloneMarker *inflightMarker
 	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
 		_, srcErr := d.handleVolumeContentSource(
 			ctx, datasetName, name, contentSource, capacityBytes, shareType, detached, &detachedCopyJobID,
+			&snapshotCloneMarker,
 		)
 		if srcErr != nil {
 			return nil, srcErr
@@ -388,6 +390,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			PropDriverInstanceID: d.driverInstanceID(),
 		})
 		if ownerErr != nil {
+			if snapshotCloneMarker != nil {
+				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, snapshotCloneMarker, ownerErr)
+			}
 			d.cleanupFailedClone(ctx, datasetName, "")
 			return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
 		}
@@ -2086,17 +2091,18 @@ func stampAndMirror(ctx context.Context, client truenas.ClientInterface, ds *tru
 	return nil
 }
 
-// setAndVerifyDatasetUserProperties writes properties through
-// pool.dataset.update and verifies they persisted with source=local. Unlike
-// stampAndMirror it calls pool.dataset.update directly (not the batch setter)
-// because it needs the authoritative post-write dataset the update response
-// reflects: Live TrueNAS 26.0 returns the post-write state in the response, so
-// the returned dataset is authoritative for verification — no fresh re-read on
-// the hot path (the batch-12 consolidation). It is kept separate from
-// stampAndMirror deliberately: the error-injecting test seam distinguishes
-// DatasetUpdate from the batch setter, and the verification path requires the
-// returned dataset.
-func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetName string, properties map[string]string) (*truenas.Dataset, error) {
+// setAndVerifyDatasetProps writes an optional filesystem refquota together with
+// user properties through one pool.dataset.update and verifies that every
+// requested value persisted with source=local. The widened shape is used by the
+// snapshot-clone fold: content-source identity and quota become durable in one
+// response-verifying update, while ownership remains a later, separate crash
+// boundary.
+func (d *Driver) setAndVerifyDatasetProps(
+	ctx context.Context,
+	datasetName string,
+	refquota interface{},
+	properties map[string]string,
+) (*truenas.Dataset, error) {
 	// Build sorted user-property updates mirroring DatasetSetUserProperties, then
 	// call pool.dataset.update directly. Live TrueNAS 26.0 persists these with
 	// source=local AND reflects the post-write state in the response, so the
@@ -2111,11 +2117,17 @@ func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetN
 	for _, key := range keys {
 		updates = append(updates, truenas.UserPropertyUpdate{Key: key, Value: properties[key]})
 	}
-	updated, err := d.truenasClient.DatasetUpdate(ctx, datasetName, &truenas.DatasetUpdateParams{UserPropertiesUpdate: updates})
+	updated, err := d.truenasClient.DatasetUpdate(ctx, datasetName, &truenas.DatasetUpdateParams{
+		Refquota:             refquota,
+		UserPropertiesUpdate: updates,
+	})
 	if err != nil {
 		return nil, err
 	}
 	if verifyErr := verifyLocalUserProperties(updated, properties); verifyErr != nil {
+		return nil, verifyErr
+	}
+	if verifyErr := verifyLocalRefquota(updated, refquota); verifyErr != nil {
 		return nil, verifyErr
 	}
 	// Belt-and-braces: the very first write in this Driver's lifetime also
@@ -2130,9 +2142,18 @@ func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetN
 		if verifyErr := verifyLocalUserProperties(reread, properties); verifyErr != nil {
 			return nil, verifyErr
 		}
+		if verifyErr := verifyLocalRefquota(reread, refquota); verifyErr != nil {
+			return nil, verifyErr
+		}
 		d.datasetUpdateVerifiedOnce.Store(true)
 	}
 	return updated, nil
+}
+
+// setAndVerifyDatasetUserProperties preserves the property-only call surface
+// for ownership, bookkeeping, and recovery stamps.
+func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetName string, properties map[string]string) (*truenas.Dataset, error) {
+	return d.setAndVerifyDatasetProps(ctx, datasetName, nil, properties)
 }
 
 // verifyLocalUserProperties returns an errDatasetPropertyVerification-wrapped
@@ -2143,6 +2164,21 @@ func verifyLocalUserProperties(ds *truenas.Dataset, properties map[string]string
 		if !datasetHasLocalUserProperty(ds, key, expected) {
 			return fmt.Errorf("%w: property %s did not persist locally with the expected value", errDatasetPropertyVerification, key)
 		}
+	}
+	return nil
+}
+
+func verifyLocalRefquota(ds *truenas.Dataset, expected interface{}) error {
+	if expected == nil {
+		return nil
+	}
+	expectedBytes, ok := expected.(int64)
+	if !ok {
+		return fmt.Errorf("%w: unsupported refquota verification type %T", errDatasetPropertyVerification, expected)
+	}
+	if ds == nil || !isLocalUserPropertySource(ds.Refquota.Source) ||
+		datasetPropertyBytes(ds.Refquota) != expectedBytes {
+		return fmt.Errorf("%w: refquota did not persist locally with the expected value", errDatasetPropertyVerification)
 	}
 	return nil
 }
@@ -2318,6 +2354,7 @@ func (d *Driver) handleVolumeContentSource(
 	shareType ShareType,
 	detached bool,
 	detachedCopyJobID *int64,
+	snapshotCloneMarker **inflightMarker,
 ) (*truenas.Dataset, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
 	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
@@ -2358,6 +2395,10 @@ func (d *Driver) handleVolumeContentSource(
 		}
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
 			return nil, markerWriteErr
+		}
+		if !detached && snapshotCloneMarker != nil {
+			markerCopy := marker
+			*snapshotCloneMarker = &markerCopy
 		}
 		if detached {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
@@ -2402,11 +2443,12 @@ func (d *Driver) handleVolumeContentSource(
 		// This is critical for iSCSI/NVMe-oF where extent creation needs the zvol
 		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
-			d.cleanupFailedClone(ctx, datasetName, "")
 			if detached {
+				d.cleanupFailedClone(ctx, datasetName, "")
 				return nil, status.Errorf(codes.Internal, "failed waiting for detached snapshot copy to become ready: %v", err)
 			}
-			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
+			return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
+				status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err))
 		}
 		if detached {
 			createdDS, err = d.prepareDetachedSnapshotCopy(
@@ -2417,17 +2459,23 @@ func (d *Driver) handleVolumeContentSource(
 				return nil, err
 			}
 		} else {
-			if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
-				d.cleanupFailedClone(ctx, datasetName, "")
-				return nil, err
+			var refquota interface{}
+			if createdDS.Type == "FILESYSTEM" && d.config.ZFS.DatasetEnableQuotas && capacityBytes > 0 {
+				refquota = capacityBytes
 			}
-
-			if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+			if createdDS.Type == "VOLUME" {
+				if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
+					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, err)
+				}
+			}
+			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, map[string]string{
 				PropVolumeContentSourceType: "snapshot",
 				PropVolumeContentSourceID:   snapshotID,
-			}); err != nil {
-				klog.Warningf("Failed to set content source properties for snapshot clone: %v", err)
+			})
+			if updateErr != nil {
+				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, updateErr)
 			}
+			createdDS = verified
 		}
 
 	} else if volume := source.GetVolume(); volume != nil {
@@ -2553,6 +2601,56 @@ func (d *Driver) cleanupFailedClone(ctx context.Context, datasetName, tempSnapsh
 		return
 	}
 	klog.Warningf("Keeping in-flight marker for %s: cleanup destroy failed and the remnant may still exist; a retry will recover it", datasetName)
+}
+
+// guardedCleanupFailedSnapshotClone destroys a failed snapshot-clone attempt
+// only while the destination and its durable marker still prove they belong to
+// this exact attempt. operationLock is process-local, so a peer controller may
+// have recovered and stamped the clone while this process was handling an
+// error. Any local ownership stamp, missing marker, changed nonce/identity, or
+// failed guard read is a lost race: refuse deletion and return retryable
+// Aborted. Ownership is intentionally checked before marker identity because a
+// peer removes the marker only after its ownership stamp is durable.
+func (d *Driver) guardedCleanupFailedSnapshotClone(
+	ctx context.Context,
+	datasetName string,
+	expected *inflightMarker,
+	cause error,
+) error {
+	dataset, getErr := d.truenasClient.DatasetGet(ctx, datasetName)
+	if getErr != nil {
+		if truenas.IsNotFoundError(getErr) {
+			d.cleanupFailedClone(ctx, datasetName, "")
+			return status.Errorf(codes.Internal, "failed snapshot clone %s: %v", datasetName, cause)
+		}
+		return status.Errorf(codes.Aborted,
+			"cannot verify failed snapshot clone %s before cleanup; refusing delete and retry CreateVolume: %v",
+			datasetName, cause)
+	}
+	if datasetHasLocalOwnershipStamp(dataset) {
+		return status.Errorf(codes.Aborted,
+			"lost snapshot-clone cleanup race for %s (now owned); refusing delete and retry CreateVolume: %v",
+			datasetName, cause)
+	}
+	marker, markerErr := d.readInflightMarker(ctx, path.Base(datasetName))
+	if markerErr != nil || marker == nil || expected == nil ||
+		marker.Version != expected.Version ||
+		marker.Instance != expected.Instance ||
+		marker.Dataset != expected.Dataset ||
+		marker.Mode != expected.Mode ||
+		marker.SourceType != expected.SourceType ||
+		marker.SourceID != expected.SourceID ||
+		marker.Origin != expected.Origin ||
+		marker.Protocol != expected.Protocol ||
+		marker.Nonce != expected.Nonce ||
+		dataset.Name != expected.Dataset ||
+		datasetOriginSnapshotID(dataset) != expected.Origin {
+		return status.Errorf(codes.Aborted,
+			"snapshot-clone cleanup identity changed for %s; refusing delete and retry CreateVolume: %v",
+			datasetName, cause)
+	}
+	d.cleanupFailedClone(ctx, datasetName, "")
+	return status.Errorf(codes.Internal, "failed snapshot clone %s: %v", datasetName, cause)
 }
 
 func datasetPropertyBytes(property truenas.DatasetProperty) int64 {

@@ -478,14 +478,15 @@ func (d *Driver) completeResumedCloneRemnant(
 // has no ledger entry and is never touched. A crash between ledger write and
 // rename leaves an entry without a tombstone, which the reconciler sweeps.
 type tombstoneLedgerEntry struct {
-	Version  int    `json:"v"`
-	Snapshot string `json:"snapshot"` // full tombstone ID: dataset@tombstone-name
-	Dataset  string `json:"dataset"`
-	// CreatedAt is the tombstoned snapshot's immutable ZFS creation time (unix
-	// seconds), captured at ledger-write time. The reaper requires the observed
-	// snapshot's creation time to MATCH, so a stale ledger entry can never
-	// authorize reaping a different snapshot later recreated at the same full ID.
+	Version   int    `json:"v"`
+	Snapshot  string `json:"snapshot"` // full tombstone ID: dataset@tombstone-name
+	Dataset   string `json:"dataset"`
 	CreatedAt int64  `json:"created_at,omitempty"`
+	// CreateTXG strengthens v2 identity with ZFS's monotonic, non-reusable
+	// creation transaction group. A zero value records that the backend did not
+	// expose TXG, in which case v2 deliberately degrades to the v1
+	// full-ID-plus-creation-seconds predicate.
+	CreateTXG uint64 `json:"createtxg,omitempty"`
 	RenamedAt string `json:"renamed_at"`
 }
 
@@ -609,7 +610,8 @@ func tombstoneLedgerFromDataset(parent *truenas.Dataset) map[string]tombstoneLed
 			klog.Warningf("Ignoring unparseable tombstone ledger entry %s: %v", key, err)
 			continue
 		}
-		if entry.Version != tombstoneLedgerVersion || entry.Snapshot == "" || key != tombstoneLedgerKey(entry.Snapshot) {
+		if (entry.Version != 1 && entry.Version != tombstoneLedgerVersion) ||
+			entry.Snapshot == "" || key != tombstoneLedgerKey(entry.Snapshot) {
 			continue
 		}
 		entries[key] = entry
@@ -630,6 +632,7 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 		Snapshot:  deleteID,
 		Dataset:   snap.Dataset,
 		CreatedAt: snap.GetCreationTime(),
+		CreateTXG: snap.CreateTXG,
 		RenamedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
 		return status.Errorf(codes.Internal, "failed to record tombstone provenance for snapshot %s: %v", snap.ID, err)

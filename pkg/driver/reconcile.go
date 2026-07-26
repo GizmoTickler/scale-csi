@@ -78,6 +78,11 @@ type ReconcileObject struct {
 	// exact driver rename-algorithm match, and fresh absence from BOTH ledgers
 	// before deleting it. Only meaningful for entries in TombstoneSnapshots.
 	tombstoneScanFallback bool
+	// tombstoneCreateTXG carries the CreateTXG observed during scan-fallback
+	// classification. When non-zero, the guarded reaper requires the freshly
+	// read snapshot to carry the same TXG, closing the same-second full-ID reuse
+	// window for ledger-less retained-identity recovery.
+	tombstoneCreateTXG uint64
 }
 
 // ReconcileActionFailure records a guarded cleanup that was skipped or refused.
@@ -447,10 +452,9 @@ func (d *Driver) classifyTombstones(now time.Time, tombstones []*truenas.Snapsho
 		if !recorded || entry.Snapshot != snap.ID {
 			continue
 		}
-		// The ledger's recorded immutable creation time must match the observed
-		// snapshot: a stale entry never authorizes classifying (or later reaping)
-		// a DIFFERENT object recreated at the same full ID.
-		if entry.CreatedAt <= 0 || entry.CreatedAt != snap.GetCreationTime() {
+		// v1 binds full ID + creation seconds. v2 additionally binds CreateTXG
+		// when the backend exposed it, closing same-second full-ID reuse.
+		if !tombstoneLedgerEntryMatchesSnapshot(entry, snap) {
 			continue
 		}
 		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {

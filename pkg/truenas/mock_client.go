@@ -403,11 +403,11 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 	if params.Refquota != nil {
 		switch refquota := params.Refquota.(type) {
 		case int:
-			ds.Refquota = DatasetProperty{Parsed: float64(refquota)}
+			ds.Refquota = DatasetProperty{Parsed: float64(refquota), Source: "LOCAL"}
 		case int64:
-			ds.Refquota = DatasetProperty{Parsed: float64(refquota)}
+			ds.Refquota = DatasetProperty{Parsed: float64(refquota), Source: "LOCAL"}
 		case float64:
-			ds.Refquota = DatasetProperty{Parsed: refquota}
+			ds.Refquota = DatasetProperty{Parsed: refquota, Source: "LOCAL"}
 		}
 	}
 	if params.Refreservation != nil {

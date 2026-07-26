@@ -787,20 +787,19 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
 			require.NoError(t, err)
 		}},
-		// Thirteen calls: existence lookup; snapshot name resolution; the durable
+		// Twelve calls: existence lookup; snapshot name resolution; the durable
 		// in-flight marker write on the parent dataset via pool.dataset.update plus
 		// its one-time post-connect verifying re-read (the marker mechanism stays
-		// intact); one clone and readiness wait; the quota-setting update; the
-		// content-source identity update; the ownership stamp via pool.dataset.update
-		// (now verified against the update response, so no separate re-read — the
-		// one-time re-read was already spent on the marker write); marker retirement
-		// after the durable ownership stamp; NFS share resolution + create; and a
-		// single post-share update that folds the share-ID stamp together with the
-		// managed/ownership/provision/name stamps. The remaining writes are separated
-		// by crash boundaries (content-source vs ownership vs share-ID) or are the
-		// protected marker mechanism, so they are not merged; 13 is the safe floor
-		// short of crossing those boundaries.
-		{name: "CreateVolume clone from snapshot", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// intact); one clone and readiness wait; one response-verified update that
+		// folds filesystem refquota together with both content-source keys; the
+		// ownership stamp via a separate pool.dataset.update (the inviolable
+		// content-source-vs-ownership crash boundary); marker retirement after the
+		// durable ownership stamp; NFS share resolution + create; and a single
+		// post-share update that folds the share-ID stamp together with the
+		// managed/ownership/provision/name stamps. The remaining writes are
+		// separated by crash boundaries or are the protected marker mechanism, so
+		// 12 is the safe floor without weakening crash consistency.
+		{name: "CreateVolume clone from snapshot", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})
