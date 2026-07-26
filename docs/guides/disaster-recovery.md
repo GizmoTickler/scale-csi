@@ -73,6 +73,13 @@ the first time a pod attaches it — no manual re-export step.
   volume on both sites simultaneously; the driver provides no cross-site fencing
   (this is the standard CSI shared-responsibility model — see
   [Production → Known limitations](../production.md)).
+- **Publication records replicate too.** The durable per-volume publication
+  records are `truenas-csi:publication_*` user-properties, so a replicated
+  dataset can arrive on the DR side still carrying a record naming a primary-side
+  node. This is safe: the driver performs synchronous stale-record takeover on
+  publish, so the first attach on the DR cluster reconciles the record to the new
+  node. It is another reason not to run both sites against the same volume at
+  once.
 - **App-level consistency.** ZFS/CSI snapshots are crash-consistent. For databases,
   prefer the application's own backup/replication (e.g. CloudNativePG) for
   transaction-consistent DR rather than relying on volume snapshots alone.
