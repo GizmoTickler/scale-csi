@@ -303,7 +303,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if len(req.GetVolumeCapabilities()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
-	volumeID := d.sanitizeVolumeID(name)
+	volumeID := sanitizeVolumeID(name)
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
 		return nil, err
@@ -1457,7 +1457,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	}
 	defer d.releaseOperationLock(sourceVolumeLockKey)
 
-	snapshotID := d.sanitizeVolumeID(name)
+	snapshotID := sanitizeVolumeID(name)
 	if _, err := d.datasetForID(snapshotID); err != nil {
 		return nil, err
 	}
@@ -1843,10 +1843,6 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 
 // Helper functions
 
-func (d *Driver) sanitizeVolumeID(name string) string {
-	return sanitizeVolumeID(name)
-}
-
 func sanitizeVolumeID(name string) string {
 	// Rebuild through a rune range so arbitrary invalid UTF-8 input is repaired
 	// while replacing the path and space characters disallowed by this scheme.
@@ -1906,7 +1902,7 @@ func multiNodeAccessMode(caps []*csi.VolumeCapability) (csi.VolumeCapability_Acc
 	return csi.VolumeCapability_AccessMode_UNKNOWN, false
 }
 
-func snapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.ListSnapshotsResponse_Entry {
+func buildSnapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.ListSnapshotsResponse_Entry {
 	if !isCSISnapshot(snap) {
 		return nil
 	}
@@ -1941,7 +1937,7 @@ func snapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.L
 }
 
 func (d *Driver) snapshotListEntry(ctx context.Context, snap *truenas.Snapshot, sourceVolumeFilter string) (*csi.ListSnapshotsResponse_Entry, error) {
-	entry := snapshotListEntry(snap, sourceVolumeFilter)
+	entry := buildSnapshotListEntry(snap, sourceVolumeFilter)
 	if entry == nil {
 		return nil, nil
 	}
@@ -2451,7 +2447,7 @@ func (d *Driver) handleVolumeContentSource(
 		}
 
 		// Create a snapshot of source volume, then clone it
-		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
+		tempSnapshotName := fmt.Sprintf("clone-source-%s", sanitizeVolumeID(path.Base(datasetName)))
 		// Durable in-flight provenance BEFORE any mutation; the recorded origin is
 		// the deterministic internal snapshot the clone must descend from.
 		marker, markerErr := d.newInflightMarker(datasetName, source, shareType)

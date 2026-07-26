@@ -787,7 +787,7 @@ func TestCreateVolumeLocksOnSanitizedVolumeID(t *testing.T) {
 		truenasClient: truenas.NewMockClient(),
 	}
 	name := "volume/name with spaces"
-	lockKey := "volume:" + d.sanitizeVolumeID(name)
+	lockKey := "volume:" + sanitizeVolumeID(name)
 	require.True(t, d.acquireOperationLock(lockKey))
 	defer d.releaseOperationLock(lockKey)
 
@@ -2379,7 +2379,7 @@ func TestSnapshotListEntryClassification(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			entry := snapshotListEntry(tc.snapshot, tc.filter)
+			entry := buildSnapshotListEntry(tc.snapshot, tc.filter)
 			assert.Equal(t, tc.wantBlocks, snapshotBlocksVolumeDeletion(tc.snapshot))
 			if !tc.wantEntry {
 				assert.Nil(t, entry)

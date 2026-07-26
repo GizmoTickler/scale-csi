@@ -1110,9 +1110,14 @@ func (d *Driver) startOrphanReconcile() {
 		klog.Info("Orphan reconcile detection disabled because configuration is unavailable")
 		return
 	}
-	interval, err := d.config.Reconcile.IntervalDuration()
-	if strings.TrimSpace(d.config.Reconcile.Interval) == "" {
-		interval, err = defaultControllerReconcileInterval, nil
+	// Hoist the empty-string check ahead of the parse: an empty raw value means
+	// "use the default", so parsing it (only to discard the result) is wasted. A
+	// non-empty value is parsed and validated. Behavior is unchanged because the
+	// defaults are positive.
+	var err error
+	interval := defaultControllerReconcileInterval
+	if strings.TrimSpace(d.config.Reconcile.Interval) != "" {
+		interval, err = d.config.Reconcile.IntervalDuration()
 	}
 	if err != nil || interval <= 0 {
 		klog.Errorf("Controller reconciliation disabled due to invalid interval %q: %v", d.config.Reconcile.Interval, err)
@@ -1120,9 +1125,8 @@ func (d *Driver) startOrphanReconcile() {
 	}
 	minAge := defaultControllerReconcileMinOrphanAge
 	if d.config.Reconcile.Enabled || d.config.Fencing.Enabled() {
-		minAge, err = d.config.Reconcile.MinOrphanAgeDuration()
-		if strings.TrimSpace(d.config.Reconcile.MinOrphanAge) == "" {
-			minAge, err = defaultControllerReconcileMinOrphanAge, nil
+		if strings.TrimSpace(d.config.Reconcile.MinOrphanAge) != "" {
+			minAge, err = d.config.Reconcile.MinOrphanAgeDuration()
 		}
 		if err != nil || minAge <= 0 {
 			klog.Errorf("Controller reconciliation disabled due to invalid minimum orphan age %q: %v", d.config.Reconcile.MinOrphanAge, err)
