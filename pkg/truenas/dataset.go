@@ -275,26 +275,11 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offs
 		options["offset"] = offset
 	}
 
-	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
-	if err != nil {
+	var raw []*rawDataset
+	if err := callTyped(ctx, c, &raw, "pool.dataset.query", filters, options); err != nil {
 		return nil, fmt.Errorf("failed to list datasets: %w", err)
 	}
-
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-
-	datasets := make([]*Dataset, 0, len(items))
-	for _, item := range items {
-		ds, err := parseDataset(item)
-		if err != nil {
-			continue
-		}
-		datasets = append(datasets, ds)
-	}
-
-	return datasets, nil
+	return rawDatasetsToDatasets(raw, false), nil
 }
 
 // datasetResourceQueryStatus detects the TrueNAS 26.0 dataset resource API
@@ -390,24 +375,11 @@ func (c *Client) DatasetQueryByParent(ctx context.Context, parentDataset string)
 		return nil, fmt.Errorf("dataset resource API (zfs.resource.query) is not available")
 	}
 	parent := strings.TrimSuffix(parentDataset, "/")
-	result, err := c.Call(ctx, datasetResourceQueryMethod, datasetResourceQueryOptions([]string{parent}, true))
-	if err != nil {
+	var raw []*rawDataset
+	if err := callTyped(ctx, c, &raw, datasetResourceQueryMethod, datasetResourceQueryOptions([]string{parent}, true)); err != nil {
 		return nil, fmt.Errorf("failed to query datasets by parent: %w", err)
 	}
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-	datasets := make([]*Dataset, 0, len(items))
-	for _, item := range items {
-		ds, parseErr := parseDatasetResource(item)
-		if parseErr != nil {
-			continue
-		}
-		ds.ResourceQuery = true
-		datasets = append(datasets, ds)
-	}
-	return datasets, nil
+	return rawDatasetsToDatasets(raw, true), nil
 }
 
 // LIVE-PROBE GATE: parseDatasetResource parses the MODELED (not live-verified)
@@ -550,20 +522,13 @@ func (c *Client) queryDatasetOrigins(ctx context.Context, parent string) (map[st
 			"properties": []string{"origin"},
 		},
 	}
-	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
-	if err != nil {
+	var raw []*rawDataset
+	if err := callTyped(ctx, c, &raw, "pool.dataset.query", filters, options); err != nil {
 		return nil, fmt.Errorf("failed to query dataset origins: %w", err)
 	}
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-	origins := make(map[string]string, len(items))
-	for _, item := range items {
-		dataset, parseErr := parseDataset(item)
-		if parseErr != nil {
-			continue
-		}
+	origins := make(map[string]string, len(raw))
+	for _, item := range raw {
+		dataset := item.toDataset(false)
 		origins[dataset.Name] = datasetPropertyString(dataset.Origin)
 	}
 	return origins, nil

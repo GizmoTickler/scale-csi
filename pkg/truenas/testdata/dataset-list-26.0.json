@@ -1,0 +1,117 @@
+[
+  {
+    "id": "flashstor/csi/volumes/pvc-full",
+    "name": "flashstor/csi/volumes/pvc-full",
+    "pool": "flashstor",
+    "type": "FILESYSTEM",
+    "mountpoint": "/mnt/flashstor/csi/volumes/pvc-full",
+    "used": {
+      "value": "2.60M",
+      "rawvalue": "2723840",
+      "parsed": 2723840,
+      "source": "NONE"
+    },
+    "available": {
+      "value": "1.75T",
+      "rawvalue": "1924145348608",
+      "parsed": 1924145348608,
+      "source": "NONE"
+    },
+    "quota": {
+      "value": "10G",
+      "rawvalue": "10737418240",
+      "parsed": 10737418240,
+      "source": "LOCAL"
+    },
+    "refquota": {
+      "value": "10G",
+      "rawvalue": "10737418240",
+      "parsed": 10737418240,
+      "source": "LOCAL"
+    },
+    "reservation": {
+      "value": null,
+      "rawvalue": "0",
+      "parsed": null,
+      "source": "DEFAULT"
+    },
+    "refreservation": {
+      "value": null,
+      "rawvalue": "0",
+      "parsed": null,
+      "source": "DEFAULT"
+    },
+    "origin": {
+      "value": "",
+      "rawvalue": "",
+      "parsed": "",
+      "source": "NONE"
+    },
+    "creation": {
+      "value": "Wed Jul 23 14:02 2026",
+      "rawvalue": "1784988120",
+      "parsed": {
+        "$date": 1784988120000
+      },
+      "source": "NONE"
+    },
+    "user_properties": {
+      "truenas-csi:csi_volume_name": {
+        "value": "pvc-full",
+        "rawvalue": "pvc-full",
+        "parsed": "pvc-full",
+        "source": "LOCAL"
+      },
+      "truenas-csi:managed_resource": {
+        "value": "true",
+        "rawvalue": "true",
+        "parsed": "true",
+        "source": "LOCAL"
+      }
+    }
+  },
+  {
+    "id": "flashstor/csi/volumes/pvc-zvol",
+    "name": "flashstor/csi/volumes/pvc-zvol",
+    "pool": "flashstor",
+    "type": "VOLUME",
+    "mountpoint": "",
+    "used": {
+      "value": "1.02G",
+      "rawvalue": "1092616192",
+      "parsed": "1092616192",
+      "source": "NONE"
+    },
+    "available": {
+      "value": "1.75T",
+      "rawvalue": "1924145348608",
+      "parsed": 1924145348608,
+      "source": "NONE"
+    },
+    "volsize": {
+      "value": "2G",
+      "rawvalue": "2147483648",
+      "parsed": 2147483648,
+      "source": "LOCAL"
+    },
+    "volblocksize": {
+      "value": "16K",
+      "rawvalue": "16384",
+      "parsed": 16384,
+      "source": "DEFAULT"
+    },
+    "origin": {
+      "value": "FLASHSTOR/CSI/VOLUMES/PVC-SRC@SNAP-1",
+      "rawvalue": "flashstor/csi/volumes/pvc-src@snap-1",
+      "parsed": "flashstor/csi/volumes/pvc-src@snap-1",
+      "source": "LOCAL"
+    },
+    "creation": {
+      "value": "1784990000",
+      "rawvalue": "1784990000",
+      "parsed": 1784990000,
+      "source": "NONE"
+    },
+    "user_properties": {}
+  }
+]
