@@ -2721,7 +2721,7 @@ func (d *Driver) revokeStalePublicationRecord(
 		nodeID = current.Node
 	}
 	shareType := shareTypeForPublishedVolume(dataset, nil)
-	if err := d.unpublishFencedVolume(ctx, dataset, datasetName, shareType, nodeID); err != nil {
+	if err := d.unpublishFencedVolume(ctx, dataset, datasetName, shareType, nodeID, nil); err != nil {
 		return false, fmt.Errorf("revoke backend grant and publication record: %w", err)
 	}
 	return true, nil

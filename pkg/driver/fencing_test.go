@@ -52,7 +52,7 @@ func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIde
 		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
 	})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "fenced-volume", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "fenced-volume", true, true, nil))
 
 	nodeA, err := encodeNodeIdentity(NodeIdentity{
 		Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a",
@@ -301,7 +301,7 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
 	})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "off-nvme-volume", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "off-nvme-volume", true, true, nil))
 
 	// Baseline: share creation may reconcile the (empty) static host set; the
 	// assertion below is that the PUBLISH flow adds no further allowlist calls.
@@ -431,7 +431,7 @@ func TestNVMeBackendCompatibilityFallsBackToHostIDWhenHostNQNIsEmpty(t *testing.
 	datasetName := "pool/parent/host-id-fallback"
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, datasetName, "host-id-fallback", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, datasetName, "host-id-fallback", true, true, nil))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
 	host, err := client.NVMeoFHostCreate(ctx, nqn)
@@ -442,12 +442,12 @@ func TestNVMeBackendCompatibilityFallsBackToHostIDWhenHostNQNIsEmpty(t *testing.
 
 	err = d.validateBackendSingleNodeCompatibility(ctx, dataset, datasetName, ShareTypeNVMeoF,
 		NodeIdentity{Name: "worker-a", NVMeNQN: nqn}, map[string]publicationRecord{},
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, nil)
 	require.NoError(t, err, "the nested association HostID remains authoritative when host.hostnqn is omitted")
 
 	err = d.validateBackendSingleNodeCompatibility(ctx, dataset, datasetName, ShareTypeNVMeoF,
 		NodeIdentity{Name: "worker-b", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-b"},
-		map[string]publicationRecord{}, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+		map[string]publicationRecord{}, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "host ID")
 }
@@ -1037,7 +1037,7 @@ func TestAdditiveNVMePublishAndUnpublishPreserveAllowAnyHost(t *testing.T) {
 	}
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/broad-nvme", Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "broad-nvme", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "broad-nvme", true, true, nil))
 	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a"})
 	require.NoError(t, err)
 	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
@@ -1157,7 +1157,7 @@ func TestAdditiveNVMeUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 				Name: "pool/parent/" + volumeID, Type: "VOLUME", Volsize: testGiB,
 			})
 			require.NoError(t, err)
-			require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, volumeID, true, true))
+			require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, volumeID, true, true, nil))
 			subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 			nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
 			if test.preassociate {
@@ -1217,7 +1217,7 @@ func TestAdditiveNVMeIdentityRotationRemovesOldCSIAddedAssociation(t *testing.T)
 	})
 	require.NoError(t, err)
 	require.NoError(t, d.createNVMeoFShareForDataset(
-		ctx, dataset, dataset.Name, "nvme-identity-rotation", true, true,
+		ctx, dataset, dataset.Name, "nvme-identity-rotation", true, true, nil,
 	))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	publish := func(nqn string) string {
@@ -1282,7 +1282,7 @@ func TestAdditiveNVMeDeferredIdentityProtectsEarlierCSIAddedAssociation(t *testi
 	})
 	require.NoError(t, err)
 	require.NoError(t, d.createNVMeoFShareForDataset(
-		ctx, dataset, dataset.Name, "nvme-deferred-provenance", true, true,
+		ctx, dataset, dataset.Name, "nvme-deferred-provenance", true, true, nil,
 	))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	publish := func(nodeID string) {
@@ -1669,7 +1669,7 @@ func TestStartupReconcileAdditivePreservesNVMeGrantDuringIdentityGapThenRotates(
 	})
 	require.NoError(t, err)
 	require.NoError(t, d.createNVMeoFShareForDataset(
-		ctx, dataset, dataset.Name, "startup-nvme-identity-gap", true, true,
+		ctx, dataset, dataset.Name, "startup-nvme-identity-gap", true, true, nil,
 	))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	oldNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a-old"
@@ -1989,7 +1989,7 @@ func TestISCSILastUnpublishReattachesDenyGroupToExistingTargetPortals(t *testing
 		truenasClient: client,
 	}
 
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, nil))
 	target, err = client.ISCSITargetGet(ctx, target.ID)
 	require.NoError(t, err)
 	require.Equal(t, []truenas.ISCSITargetGroup{{Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE"}}, target.Groups,
@@ -2574,7 +2574,7 @@ func TestAdditiveNVMeHostnqnlessRepublishRetainsProvenanceForUnpublish(t *testin
 		Name: "pool/parent/nvme-hostnqnless", Type: "VOLUME", Volsize: testGiB,
 	})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "nvme-hostnqnless", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "nvme-hostnqnless", true, true, nil))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
 	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: nqn})

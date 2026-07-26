@@ -15,7 +15,7 @@ import (
 // nfsShareBackend implements ShareBackend for NFS.
 type nfsShareBackend struct{ d *Driver }
 
-func (b nfsShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string) error {
+func (b nfsShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, res *fenceResolution) error {
 	return b.d.ensureNFSShareExists(ctx, ds, datasetName, volumeName)
 }
 
@@ -27,8 +27,8 @@ func (b nfsShareBackend) DeleteShare(ctx context.Context, ds *truenas.Dataset, d
 	return b.d.deleteNFSShareForDataset(ctx, ds, datasetName)
 }
 
-func (b nfsShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string) error {
-	return b.d.applyNFSFence(ctx, ds, datasetName, enforceable, ownedNFSHosts, uniqueSortedStrings(protectedNFSHosts))
+func (b nfsShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, res *fenceResolution) error {
+	return b.d.applyNFSFence(ctx, ds, datasetName, enforceable, ownedNFSHosts, uniqueSortedStrings(protectedNFSHosts), res)
 }
 
 func (b nfsShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error {

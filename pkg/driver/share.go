@@ -555,12 +555,14 @@ const (
 
 // ensureShareExists checks if a share exists for the dataset and creates it if missing.
 // This is critical for idempotency when a volume was created but share creation failed.
-func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType) error {
+// res, when non-nil, receives the backend objects the ensure resolved so the
+// subsequent fence phases reuse them instead of re-resolving (see fenceResolution).
+func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, res *fenceResolution) error {
 	backend := backendForShareType(d, shareType)
 	if backend == nil {
 		return nil
 	}
-	return backend.EnsureShare(ctx, ds, datasetName, volumeName)
+	return backend.EnsureShare(ctx, ds, datasetName, volumeName, res)
 }
 
 // createShareWithOptions creates a share with additional options.

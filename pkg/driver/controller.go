@@ -582,7 +582,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
 		// This handles the case where a previous CreateVolume created the dataset but failed
 		// to create the share (e.g., due to timeout, TrueNAS API error, etc.)
-		if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType); shareErr != nil {
+		if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, nil); shareErr != nil {
 			return nil, shareErr
 		}
 
@@ -1200,15 +1200,18 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 
 	klog.Infof("ControllerPublishVolume: volumeID=%s, nodeID=%s, shareType=%s", volumeID, nodeID, shareType)
 
+	// Per-request memo so the ensure-share step and the fence phases resolve the
+	// backend share objects once and reuse them (see fenceResolution).
+	res := &fenceResolution{}
 	// Ensure the share exists (critical for restored volumes)
 	// This recreates missing iSCSI targets or NVMe-oF subsystems
-	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType); err != nil {
+	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType, res); err != nil {
 		return nil, err
 	}
 	// Publication records (CSI single-node exclusivity, idempotency, takeover) are
 	// maintained unconditionally; fencing.mode only governs backend allowlist
 	// enforcement inside publishFencedVolume.
-	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly()); err != nil {
+	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly(), res); err != nil {
 		return nil, err
 	}
 
@@ -1242,7 +1245,7 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	// stays correct in every fencing mode; backend allowlist revocation inside
 	// unpublishFencedVolume remains governed by fencing.mode.
 	shareType := shareTypeForPublishedVolume(ds, nil)
-	if err := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, req.GetNodeId()); err != nil {
+	if err := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, req.GetNodeId(), &fenceResolution{}); err != nil {
 		return nil, err
 	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
