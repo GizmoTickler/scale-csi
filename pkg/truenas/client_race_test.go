@@ -978,6 +978,13 @@ func TestClient_DoesNotRetryAmbiguousMutation(t *testing.T) {
 				_ = conn.WriteJSON(rpcTestResponse{JSONRPC: "2.0", ID: req.ID, Result: true})
 				continue
 			}
+			if req.Method == "core.subscribe" {
+				// Every connection generation issues a core.get_jobs subscribe
+				// frame (job-event dispatcher); it must not be mistaken for the
+				// mutation this test injects the failure on.
+				_ = conn.WriteJSON(rpcTestResponse{JSONRPC: "2.0", ID: req.ID, Result: true})
+				continue
+			}
 			atomic.AddInt32(&mutationCount, 1)
 			_ = conn.UnderlyingConn().Close()
 			return
@@ -1023,6 +1030,16 @@ func TestClient_AmbiguousMutationWinsOverCanceledContext(t *testing.T) {
 				if err := conn.WriteJSON(rpcTestResponse{JSONRPC: "2.0", ID: req.ID, Result: true}); err != nil {
 					return
 				}
+				continue
+			}
+			if req.Method == "core.subscribe" {
+				// Every connection generation issues a core.get_jobs subscribe
+				// frame (job-event dispatcher). Without this filter it arrives
+				// FIRST and is mistaken for the mutation: the test then cancels
+				// the context before pool.dataset.create is ever dispatched and
+				// the client correctly returns a bare context error (nothing
+				// sent) instead of the ambiguous wrap this test pins.
+				_ = conn.WriteJSON(rpcTestResponse{JSONRPC: "2.0", ID: req.ID, Result: true})
 				continue
 			}
 			atomic.AddInt32(&mutationCount, 1)
