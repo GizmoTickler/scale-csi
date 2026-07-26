@@ -201,56 +201,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		d.reconcileStalePublicationRecords(ctx, datasets, kubeState, time.Now())
 	}
 
-	// The driver's durable bookkeeping — in-flight creation markers and the
-	// tombstone ledger — lives on the parent dataset, and (Fix 4b, when enabled)
-	// also on a dedicated bookkeeping child dataset. Reading can fail without
-	// aborting the pass — tombstone reaping then simply stays empty (fail-safe;
-	// no ledger, no reaping) and the sweeps are skipped.
-	var ledger map[string]tombstoneLedgerEntry
-	bookkeepingReadable := false
-	var remnantBookkeeping *truenas.Dataset
-	parentDataset, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
-	if parentErr != nil {
-		d.recordReconcileObjectFailure("parent_bookkeeping", d.parentDatasetName(), parentErr)
-	} else {
-		bookkeepingReadable = true
-		ledger = tombstoneLedgerFromDataset(parentDataset)
-		// Bookkeeping hygiene runs on every pass regardless of opts.Delete: these
-		// properties are driver-internal provenance records, not user data, and
-		// each removal requires proof of staleness gathered live below.
-		d.sweepStaleInflightMarkers(ctx, parentDataset, time.Now(), minOrphanAge)
-	}
-	if d.bookkeepingEnabled() {
-		// Migrate any parent-side bookkeeping toward the dedicated child dataset
-		// (idempotent; parent removal is gated by CleanupParent). Runs before the
-		// dual-read merge so a freshly migrated entry is visible from the child.
-		d.migrateParentBookkeeping(ctx, parentDataset)
-		bookkeepingDataset, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
-		if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
-			d.recordReconcileObjectFailure("bookkeeping", d.bookkeepingDatasetName(), bkErr)
-		} else {
-			bookkeepingReadable = true
-			// Dual-read: merge the child's ledger entries over the parent's. Keys
-			// are content-hashed snapshot IDs, so a migrated entry is identical in
-			// both locations and the merge is a lossless union.
-			for key, entry := range tombstoneLedgerFromDataset(bookkeepingDataset) {
-				if ledger == nil {
-					ledger = make(map[string]tombstoneLedgerEntry)
-				}
-				ledger[key] = entry
-			}
-			d.sweepStaleInflightMarkers(ctx, bookkeepingDataset, time.Now(), minOrphanAge)
-		}
-		// Thread the datasets this pass already read into the remnant classifier so
-		// it does not re-fetch them (see classifyRemnantOrphans). parentDataset is
-		// non-nil when its read above succeeded; bookkeepingDataset is non-nil when
-		// the bookkeeping read succeeded (nil for NotFound/error → the classifier
-		// re-reads to tell those apart, preserving its historical behavior).
-		remnantBookkeeping = bookkeepingDataset
-	}
-	if bookkeepingReadable {
-		d.sweepOrphanedTombstoneLedger(ctx, ledger, listedSnapshotIDs(snapshots, tombstones), time.Now(), minOrphanAge)
-	}
+	ledger, parentDataset, remnantBookkeeping := d.readBookkeepingState(ctx, minOrphanAge, snapshots, tombstones)
 
 	// Remnant-orphan detection (always-on; deletion stays gated by opts.Delete).
 	// A remnant is an unstamped dataset whose in-flight creation marker survived
@@ -267,136 +218,9 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	}
 
 	now := time.Now()
-	managedBackendVolumeCount := 0
-	for _, ds := range datasets {
-		if ds == nil || ds.UserProperties[PropManagedResource].Value != "true" {
-			continue
-		}
-		managedBackendVolumeCount++
-		volumeID := path.Base(ds.Name)
-		if _, live := kubeState.volumeHandles[volumeID]; live {
-			continue
-		}
-		createdAt, age, eligible := reconcileAge(now, ds.GetCreationTime(), minOrphanAge)
-		if !eligible {
-			if ds.GetCreationTime() <= 0 {
-				klog.Warningf("Orphan reconcile: skipping managed volume %s because its creation time is unavailable", ds.Name)
-			}
-			continue
-		}
-		// The listing strips property source, so an inherited managed_resource — a
-		// user dataset nested under a live CSI volume — is indistinguishable from a
-		// local stamp here. Re-fetch the candidate with source and require a LOCAL
-		// managed_resource: only then did this driver create the dataset. The
-		// candidate set is small (already filtered to non-live, age-eligible
-		// datasets), which bounds the extra API cost.
-		localManaged, getErr := d.datasetHasLocalManagedResource(ctx, ds.Name)
-		if getErr != nil {
-			d.recordReconcileObjectFailure("orphan_volume_classify", ds.Name, getErr)
-			continue
-		}
-		if !localManaged {
-			klog.V(4).Infof("Orphan reconcile: skipping %s because managed_resource is inherited, not local", ds.Name)
-			continue
-		}
-		pvName := ds.UserProperties[PropCSIVolumeName].Value
-		if pvName == "" || pvName == "-" {
-			pvName = volumeID
-		}
-		item := ReconcileObject{
-			ID:        volumeID,
-			BackendID: ds.Name,
-			PVName:    pvName,
-			CreatedAt: createdAt,
-			Age:       age,
-			Bytes:     ds.GetUsedBytes(),
-		}
-		report.OrphanVolumes = append(report.OrphanVolumes, item)
-		report.OrphanVolumeBytes += item.Bytes
-	}
-
-	managedBackendSnapshotCount := 0
-	for _, snap := range snapshots {
-		if !isCSISnapshot(snap) {
-			continue
-		}
-		managedBackendSnapshotCount++
-		snapshotHandle, ok := reconcileSnapshotHandle(snap)
-		if !ok {
-			klog.Warningf("Orphan reconcile: skipping managed snapshot %s because its CSI handle cannot be derived", snap.ID)
-			continue
-		}
-		if _, live := kubeState.snapshotHandles[snapshotHandle]; live {
-			continue
-		}
-		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
-		if !eligible {
-			if snap.GetCreationTime() <= 0 {
-				klog.Warningf("Orphan reconcile: skipping managed snapshot %s because its creation time is unavailable", snap.ID)
-			}
-			continue
-		}
-		sourceVolumeID := snap.UserProperties[PropCSISnapshotSourceVolumeID].Value
-		if sourceVolumeID == "" || sourceVolumeID == "-" {
-			sourceVolumeID = path.Base(snap.Dataset)
-		}
-		item := ReconcileObject{
-			ID:             snapshotHandle,
-			BackendID:      snap.ID,
-			KubernetesName: snap.UserProperties[PropCSISnapshotName].Value,
-			SourceVolumeID: sourceVolumeID,
-			CreatedAt:      createdAt,
-			Age:            age,
-			Bytes:          snap.GetSnapshotSize(),
-		}
-		report.OrphanSnapshots = append(report.OrphanSnapshots, item)
-		report.OrphanSnapshotBytes += item.Bytes
-	}
-
-	// Tombstone-named snapshots are the driver's own deferred-delete markers. On
-	// backends without ZFS deferred destroy (TrueNAS 26.0) they cannot be removed
-	// until their last restored clone is gone, and the tombstone rename released
-	// their CSI identity, so the CSI-snapshot orphan pass above never sees them.
-	// Classification requires a matching parent-dataset ledger entry: the name
-	// shape alone is NOT provenance — a user snapshot may legitimately be named
-	// *-csi-deleted-<n> and must never be counted, reaped, or even reported.
-	for _, snap := range tombstones {
-		entry, recorded := ledger[tombstoneLedgerKey(snap.ID)]
-		if !recorded || entry.Snapshot != snap.ID {
-			continue
-		}
-		// The ledger's recorded immutable creation time must match the observed
-		// snapshot: a stale entry never authorizes classifying (or later reaping)
-		// a DIFFERENT object recreated at the same full ID.
-		if entry.CreatedAt <= 0 || entry.CreatedAt != snap.GetCreationTime() {
-			continue
-		}
-		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {
-			klog.Warningf("Orphan reconcile: skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name and ledger entry", snap.ID)
-			continue
-		}
-		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
-		if !eligible {
-			if snap.GetCreationTime() <= 0 {
-				klog.Warningf("Orphan reconcile: skipping tombstone snapshot %s because its creation time is unavailable", snap.ID)
-			}
-			continue
-		}
-		sourceVolumeID := ""
-		if snap.Dataset != "" {
-			sourceVolumeID = path.Base(snap.Dataset)
-		}
-		item := ReconcileObject{
-			ID:             snap.ID,
-			BackendID:      snap.ID,
-			SourceVolumeID: sourceVolumeID,
-			CreatedAt:      createdAt,
-			Age:            age,
-			Bytes:          snap.GetSnapshotSize(),
-		}
-		report.TombstoneSnapshots = append(report.TombstoneSnapshots, item)
-		report.TombstoneSnapshotBytes += item.Bytes
-	}
+	managedBackendVolumeCount := d.classifyOrphanVolumes(ctx, now, datasets, kubeState, minOrphanAge, &report)
+	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, kubeState, minOrphanAge, &report)
+	d.classifyTombstones(now, tombstones, ledger, minOrphanAge, &report)
 
 	// Scan fallback (reconcile.tombstoneReaper.scanFallback, default off) runs
 	// independently of the strict ledger backlog. It reuses this pass's already
@@ -445,8 +269,226 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		return report, ctxErr
 	}
 
+	logReconcilePlan(&report, opts.Delete, minOrphanAge)
+
+	if err := d.runReconcileDeletePhase(ctx, opts, &report, kubeState, minOrphanAge, parentDataset, managedBackendVolumeCount, managedBackendSnapshotCount); err != nil {
+		return report, err
+	}
+	return report, nil
+}
+
+// readBookkeepingState performs the dual-read bookkeeping prologue: it reads the
+// parent dataset's durable bookkeeping — in-flight creation markers and the
+// tombstone ledger — and, when the dedicated bookkeeping child dataset is
+// enabled (Fix 4b), merges the child's ledger over the parent's. Reading can
+// fail without aborting the pass — tombstone reaping then simply stays empty
+// (fail-safe; no ledger, no reaping) and the sweeps are skipped. It runs the
+// always-on bookkeeping hygiene sweeps and returns the merged ledger plus the
+// parent/bookkeeping datasets threaded into the remnant classifier. Extracted
+// verbatim from reconcileOrphans (Batch 18 R2).
+func (d *Driver) readBookkeepingState(ctx context.Context, minOrphanAge time.Duration, snapshots, tombstones []*truenas.Snapshot) (map[string]tombstoneLedgerEntry, *truenas.Dataset, *truenas.Dataset) {
+	var ledger map[string]tombstoneLedgerEntry
+	bookkeepingReadable := false
+	var remnantBookkeeping *truenas.Dataset
+	parentDataset, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
+	if parentErr != nil {
+		d.recordReconcileObjectFailure("parent_bookkeeping", d.parentDatasetName(), parentErr)
+	} else {
+		bookkeepingReadable = true
+		ledger = tombstoneLedgerFromDataset(parentDataset)
+		// Bookkeeping hygiene runs on every pass regardless of opts.Delete: these
+		// properties are driver-internal provenance records, not user data, and
+		// each removal requires proof of staleness gathered live below.
+		d.sweepStaleInflightMarkers(ctx, parentDataset, time.Now(), minOrphanAge)
+	}
+	if d.bookkeepingEnabled() {
+		// Migrate any parent-side bookkeeping toward the dedicated child dataset
+		// (idempotent; parent removal is gated by CleanupParent). Runs before the
+		// dual-read merge so a freshly migrated entry is visible from the child.
+		d.migrateParentBookkeeping(ctx, parentDataset)
+		bookkeepingDataset, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+		if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
+			d.recordReconcileObjectFailure("bookkeeping", d.bookkeepingDatasetName(), bkErr)
+		} else {
+			bookkeepingReadable = true
+			// Dual-read: merge the child's ledger entries over the parent's. Keys
+			// are content-hashed snapshot IDs, so a migrated entry is identical in
+			// both locations and the merge is a lossless union.
+			for key, entry := range tombstoneLedgerFromDataset(bookkeepingDataset) {
+				if ledger == nil {
+					ledger = make(map[string]tombstoneLedgerEntry)
+				}
+				ledger[key] = entry
+			}
+			d.sweepStaleInflightMarkers(ctx, bookkeepingDataset, time.Now(), minOrphanAge)
+		}
+		// Thread the datasets this pass already read into the remnant classifier so
+		// it does not re-fetch them (see classifyRemnantOrphans). parentDataset is
+		// non-nil when its read above succeeded; bookkeepingDataset is non-nil when
+		// the bookkeeping read succeeded (nil for NotFound/error → the classifier
+		// re-reads to tell those apart, preserving its historical behavior).
+		remnantBookkeeping = bookkeepingDataset
+	}
+	if bookkeepingReadable {
+		d.sweepOrphanedTombstoneLedger(ctx, ledger, listedSnapshotIDs(snapshots, tombstones), time.Now(), minOrphanAge)
+	}
+	return ledger, parentDataset, remnantBookkeeping
+}
+
+// classifyOrphanVolumes appends age-eligible, non-live managed datasets whose
+// managed_resource stamp is local to report.OrphanVolumes and returns the count
+// of managed backend volumes observed. Extracted verbatim from reconcileOrphans
+// (Batch 18 R2).
+func (d *Driver) classifyOrphanVolumes(ctx context.Context, now time.Time, datasets []*truenas.Dataset, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, report *ReconcileReport) int {
+	managedBackendVolumeCount := 0
+	for _, ds := range datasets {
+		if ds == nil || ds.UserProperties[PropManagedResource].Value != "true" {
+			continue
+		}
+		managedBackendVolumeCount++
+		volumeID := path.Base(ds.Name)
+		if _, live := kubeState.volumeHandles[volumeID]; live {
+			continue
+		}
+		createdAt, age, eligible := reconcileAge(now, ds.GetCreationTime(), minOrphanAge)
+		if !eligible {
+			if ds.GetCreationTime() <= 0 {
+				klog.Warningf("Orphan reconcile: skipping managed volume %s because its creation time is unavailable", ds.Name)
+			}
+			continue
+		}
+		// The listing strips property source, so an inherited managed_resource — a
+		// user dataset nested under a live CSI volume — is indistinguishable from a
+		// local stamp here. Re-fetch the candidate with source and require a LOCAL
+		// managed_resource: only then did this driver create the dataset. The
+		// candidate set is small (already filtered to non-live, age-eligible
+		// datasets), which bounds the extra API cost.
+		localManaged, getErr := d.datasetHasLocalManagedResource(ctx, ds.Name)
+		if getErr != nil {
+			d.recordReconcileObjectFailure("orphan_volume_classify", ds.Name, getErr)
+			continue
+		}
+		if !localManaged {
+			klog.V(4).Infof("Orphan reconcile: skipping %s because managed_resource is inherited, not local", ds.Name)
+			continue
+		}
+		pvName := ds.UserProperties[PropCSIVolumeName].Value
+		if pvName == "" || pvName == "-" {
+			pvName = volumeID
+		}
+		item := ReconcileObject{
+			ID:        volumeID,
+			BackendID: ds.Name,
+			PVName:    pvName,
+			CreatedAt: createdAt,
+			Age:       age,
+			Bytes:     ds.GetUsedBytes(),
+		}
+		report.OrphanVolumes = append(report.OrphanVolumes, item)
+		report.OrphanVolumeBytes += item.Bytes
+	}
+	return managedBackendVolumeCount
+}
+
+// classifyOrphanSnapshots appends age-eligible, non-live CSI snapshots to
+// report.OrphanSnapshots and returns the count of managed backend snapshots
+// observed. Extracted verbatim from reconcileOrphans (Batch 18 R2).
+func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Snapshot, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, report *ReconcileReport) int {
+	managedBackendSnapshotCount := 0
+	for _, snap := range snapshots {
+		if !isCSISnapshot(snap) {
+			continue
+		}
+		managedBackendSnapshotCount++
+		snapshotHandle, ok := reconcileSnapshotHandle(snap)
+		if !ok {
+			klog.Warningf("Orphan reconcile: skipping managed snapshot %s because its CSI handle cannot be derived", snap.ID)
+			continue
+		}
+		if _, live := kubeState.snapshotHandles[snapshotHandle]; live {
+			continue
+		}
+		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
+		if !eligible {
+			if snap.GetCreationTime() <= 0 {
+				klog.Warningf("Orphan reconcile: skipping managed snapshot %s because its creation time is unavailable", snap.ID)
+			}
+			continue
+		}
+		sourceVolumeID := snap.UserProperties[PropCSISnapshotSourceVolumeID].Value
+		if sourceVolumeID == "" || sourceVolumeID == "-" {
+			sourceVolumeID = path.Base(snap.Dataset)
+		}
+		item := ReconcileObject{
+			ID:             snapshotHandle,
+			BackendID:      snap.ID,
+			KubernetesName: snap.UserProperties[PropCSISnapshotName].Value,
+			SourceVolumeID: sourceVolumeID,
+			CreatedAt:      createdAt,
+			Age:            age,
+			Bytes:          snap.GetSnapshotSize(),
+		}
+		report.OrphanSnapshots = append(report.OrphanSnapshots, item)
+		report.OrphanSnapshotBytes += item.Bytes
+	}
+	return managedBackendSnapshotCount
+}
+
+// classifyTombstones appends ledger-proven, age-eligible tombstone snapshots to
+// report.TombstoneSnapshots. Tombstone-named snapshots are the driver's own
+// deferred-delete markers. On backends without ZFS deferred destroy (TrueNAS
+// 26.0) they cannot be removed until their last restored clone is gone, and the
+// tombstone rename released their CSI identity, so the CSI-snapshot orphan pass
+// never sees them. Classification requires a matching parent-dataset ledger
+// entry: the name shape alone is NOT provenance — a user snapshot may
+// legitimately be named *-csi-deleted-<n> and must never be counted, reaped, or
+// even reported. Extracted verbatim from reconcileOrphans (Batch 18 R2).
+func (d *Driver) classifyTombstones(now time.Time, tombstones []*truenas.Snapshot, ledger map[string]tombstoneLedgerEntry, minOrphanAge time.Duration, report *ReconcileReport) {
+	for _, snap := range tombstones {
+		entry, recorded := ledger[tombstoneLedgerKey(snap.ID)]
+		if !recorded || entry.Snapshot != snap.ID {
+			continue
+		}
+		// The ledger's recorded immutable creation time must match the observed
+		// snapshot: a stale entry never authorizes classifying (or later reaping)
+		// a DIFFERENT object recreated at the same full ID.
+		if entry.CreatedAt <= 0 || entry.CreatedAt != snap.GetCreationTime() {
+			continue
+		}
+		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {
+			klog.Warningf("Orphan reconcile: skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name and ledger entry", snap.ID)
+			continue
+		}
+		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
+		if !eligible {
+			if snap.GetCreationTime() <= 0 {
+				klog.Warningf("Orphan reconcile: skipping tombstone snapshot %s because its creation time is unavailable", snap.ID)
+			}
+			continue
+		}
+		sourceVolumeID := ""
+		if snap.Dataset != "" {
+			sourceVolumeID = path.Base(snap.Dataset)
+		}
+		item := ReconcileObject{
+			ID:             snap.ID,
+			BackendID:      snap.ID,
+			SourceVolumeID: sourceVolumeID,
+			CreatedAt:      createdAt,
+			Age:            age,
+			Bytes:          snap.GetSnapshotSize(),
+		}
+		report.TombstoneSnapshots = append(report.TombstoneSnapshots, item)
+		report.TombstoneSnapshotBytes += item.Bytes
+	}
+}
+
+// logReconcilePlan emits the per-object dry-run/delete-intent log lines for a
+// completed classification pass. Extracted verbatim from reconcileOrphans
+// (Batch 18 R2).
+func logReconcilePlan(report *ReconcileReport, deleteEnabled bool, minOrphanAge time.Duration) {
 	logAction := "[DRY RUN] would delete"
-	if opts.Delete {
+	if deleteEnabled {
 		logAction = "will attempt guarded delete of"
 	}
 	for i := range report.OrphanSnapshots {
@@ -488,13 +530,20 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		klog.Infof("Orphan reconcile: %s spent restore VolumeSnapshot %s/%s (content=%s sourcePVC=%s phase=%s)",
 			spentAction, spent.Namespace, spent.Name, spent.ContentName, spent.SourcePVC, spent.SourcePVCPhase)
 	}
+}
 
+// runReconcileDeletePhase is the delete-gate tail of reconcileOrphans. It is a
+// no-op returning nil when opts.Delete is false; otherwise it re-validates the
+// safety brakes, re-lists Kubernetes state immediately before mutation, and
+// invokes the guarded deleters. Extracted verbatim from reconcileOrphans
+// (Batch 18 R2).
+func (d *Driver) runReconcileDeletePhase(ctx context.Context, opts ReconcileOptions, report *ReconcileReport, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, parentDataset *truenas.Dataset, managedBackendVolumeCount, managedBackendSnapshotCount int) error {
 	if !opts.Delete {
-		return report, nil
+		return nil
 	}
 	if len(kubeState.volumeHandles) == 0 && managedBackendVolumeCount > 0 {
 		RecordReconcileFailure("safety_brake")
-		return report, fmt.Errorf(
+		return fmt.Errorf(
 			"refusing to GC: zero live PVs for driver but %d managed backend volumes exist — cluster rebuild in progress?",
 			managedBackendVolumeCount,
 		)
@@ -506,11 +555,11 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	currentState, err := d.loadKubernetesReconcileState(ctx, minOrphanAge)
 	if err != nil {
 		RecordReconcileFailure("revalidate_kubernetes_state")
-		return report, fmt.Errorf("revalidate Kubernetes state before delete: %w", err)
+		return fmt.Errorf("revalidate Kubernetes state before delete: %w", err)
 	}
 	if len(currentState.volumeHandles) == 0 && managedBackendVolumeCount > 0 {
 		RecordReconcileFailure("safety_brake")
-		return report, fmt.Errorf(
+		return fmt.Errorf(
 			"refusing to GC: zero live PVs for driver but %d managed backend volumes exist — cluster rebuild in progress?",
 			managedBackendVolumeCount,
 		)
@@ -520,7 +569,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	}
 	if err := d.deleteDetectedOrphans(
 		ctx,
-		&report,
+		report,
 		currentState,
 		minOrphanAge,
 		d.config.Reconcile.Delete.MaxPerRun,
@@ -528,10 +577,10 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		parentDataset,
 	); err != nil {
 		RecordReconcileFailure("delete")
-		return report, err
+		return err
 	}
-	d.deleteOrphanedShares(ctx, &report, d.config.Reconcile.Delete.MaxPerRun)
-	return report, nil
+	d.deleteOrphanedShares(ctx, report, d.config.Reconcile.Delete.MaxPerRun)
+	return nil
 }
 
 func reconcileSnapshotHandle(snapshot *truenas.Snapshot) (string, bool) {
