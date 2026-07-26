@@ -429,10 +429,10 @@ are singleton writers.
 | `sidecars.provisioner.timeout` | `300s` |
 | `sidecars.provisioner.workerThreads` | `10` |
 | `sidecars.provisioner.extraArgs` | `[]` |
-| `sidecars.attacher.timeout` | `300s` |
+| `sidecars.attacher.timeout` | `120s` |
 | `sidecars.attacher.workerThreads` | `10` |
 | `sidecars.attacher.extraArgs` | `[]` |
-| `sidecars.resizer.timeout` | `300s` |
+| `sidecars.resizer.timeout` | `120s` |
 | `sidecars.resizer.workerThreads` | `10` |
 | `sidecars.resizer.extraArgs` | `[]` |
 | `sidecars.snapshotter.timeout` | `300s` |

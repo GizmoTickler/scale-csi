@@ -374,7 +374,10 @@ sidecars:
 
   attacher:
     image: registry.k8s.io/sig-storage/csi-attacher:v4.12.0
-    timeout: 300s
+    # Bounds the ControllerPublish/Unpublish (attach/detach) deadline. 120s keeps
+    # a stuck TrueNAS publish from holding the external-attacher's --timeout for
+    # 300s; the driver's own publish path is far faster after the P1 RTT cuts.
+    timeout: 120s
     workerThreads: 10
     extraArgs: []
     resources:
@@ -386,7 +389,8 @@ sidecars:
 
   resizer:
     image: registry.k8s.io/sig-storage/csi-resizer:v2.2.1
-    timeout: 300s
+    # Bounds the ControllerExpandVolume deadline (see attacher note).
+    timeout: 120s
     workerThreads: 10
     extraArgs: []
     resources:

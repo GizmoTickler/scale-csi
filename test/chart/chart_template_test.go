@@ -50,3 +50,17 @@ func TestChartTombstoneReaperScanFallbackPlumbing(t *testing.T) {
 		t.Errorf("--set scanFallback.enabled=true did not propagate into the rendered configmap")
 	}
 }
+
+// TestChartSidecarTimeouts pins the CSI sidecar --timeout flags: the attacher and
+// resizer run with a 120s deadline (bounding publish/unpublish/expand), while the
+// provisioner and snapshotter keep 300s. A regression that reverts the
+// attacher/resizer timeout fails here.
+func TestChartSidecarTimeouts(t *testing.T) {
+	out := helmTemplate(t)
+	if got := strings.Count(out, `"--timeout=120s"`); got != 2 {
+		t.Errorf("expected exactly 2 sidecars (attacher, resizer) with --timeout=120s, got %d", got)
+	}
+	if got := strings.Count(out, `"--timeout=300s"`); got != 2 {
+		t.Errorf("expected exactly 2 sidecars (provisioner, snapshotter) with --timeout=300s, got %d", got)
+	}
+}
