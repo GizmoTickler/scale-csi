@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+// notFoundAPIError builds the not-found error shape TrueNAS 26.0 emits: a
+// negative JSON-RPC code plus an AUTHORITATIVE ENOENT errno carried in Data. The
+// human-readable message is preserved. Before this, the mock returned a bare
+// message-only APIError, so IsNotFoundError tests only ever exercised the
+// substring fallback and never the errno path production actually emits.
+func notFoundAPIError(message string) *APIError {
+	return &APIError{Code: -1, Message: message, Data: map[string]interface{}{"errno": "ENOENT"}}
+}
+
 // MockClient is a mock implementation of ClientInterface for testing.
 type MockClient struct {
 	mu                     sync.RWMutex
@@ -357,7 +366,7 @@ func (m *MockClient) DatasetGet(ctx context.Context, name string) (*Dataset, err
 	if ds, ok := m.Datasets[name]; ok {
 		return mockDatasetResponse(ds, false), nil
 	}
-	return nil, &APIError{Code: -1, Message: "dataset not found"}
+	return nil, notFoundAPIError("dataset not found")
 }
 
 func (m *MockClient) DatasetGetByNames(ctx context.Context, names []string) (map[string]*Dataset, error) {
@@ -385,7 +394,7 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return nil, &APIError{Code: -1, Message: "dataset not found"}
+		return nil, notFoundAPIError("dataset not found")
 	}
 
 	if params.Volsize > 0 {
@@ -523,7 +532,7 @@ func (m *MockClient) DatasetSetUserProperties(ctx context.Context, name string, 
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return &APIError{Code: -1, Message: "dataset not found"}
+		return notFoundAPIError("dataset not found")
 	}
 	for key, value := range properties {
 		ds.UserProperties[key] = UserProperty{Value: value, Source: "local"}
@@ -539,7 +548,7 @@ func (m *MockClient) DatasetRemoveUserProperties(ctx context.Context, name strin
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return &APIError{Code: -1, Message: "dataset not found"}
+		return notFoundAPIError("dataset not found")
 	}
 	for _, key := range keys {
 		delete(ds.UserProperties, key)
@@ -553,7 +562,7 @@ func (m *MockClient) DatasetGetUserProperty(ctx context.Context, name, key strin
 
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return "", &APIError{Code: -1, Message: "dataset not found"}
+		return "", notFoundAPIError("dataset not found")
 	}
 	if prop, ok := ds.UserProperties[key]; ok {
 		return prop.Value, nil
@@ -570,7 +579,7 @@ func (m *MockClient) DatasetExpand(ctx context.Context, name string, newSize int
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return &APIError{Code: -1, Message: "dataset not found"}
+		return notFoundAPIError("dataset not found")
 	}
 	ds.Volsize = DatasetProperty{Parsed: float64(newSize)}
 	return nil
@@ -673,7 +682,7 @@ func (m *MockClient) SnapshotRename(ctx context.Context, snapshotID, newName str
 	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
-		return &APIError{Code: -1, Message: "snapshot not found"}
+		return notFoundAPIError("snapshot not found")
 	}
 	dataset, _, ok := strings.Cut(snapshotID, "@")
 	if !ok || newName == "" {
@@ -710,7 +719,7 @@ func (m *MockClient) SnapshotGet(ctx context.Context, snapshotID string) (*Snaps
 	if snap, ok := m.Snapshots[snapshotID]; ok {
 		return snap, nil
 	}
-	return nil, &APIError{Code: -1, Message: "snapshot not found"}
+	return nil, notFoundAPIError("snapshot not found")
 }
 
 func (m *MockClient) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
@@ -770,7 +779,7 @@ func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID, ke
 	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
-		return &APIError{Code: -1, Message: "snapshot not found"}
+		return notFoundAPIError("snapshot not found")
 	}
 	snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
 	return nil
@@ -789,7 +798,7 @@ func (m *MockClient) SnapshotRemoveUserProperties(ctx context.Context, snapshotI
 	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
-		return &APIError{Code: -1, Message: "snapshot not found"}
+		return notFoundAPIError("snapshot not found")
 	}
 	for _, key := range keys {
 		delete(snap.UserProperties, key)
@@ -879,11 +888,11 @@ func (m *MockClient) CopyDatasetFromSnapshotLocal(
 	}
 	snapshotID := sourceDataset + "@" + snapshotShortName
 	if _, exists := m.Snapshots[snapshotID]; !exists {
-		return UnknownReplicationJobID, &APIError{Code: -1, Message: "snapshot not found"}
+		return UnknownReplicationJobID, notFoundAPIError("snapshot not found")
 	}
 	source, exists := m.Datasets[sourceDataset]
 	if !exists {
-		return UnknownReplicationJobID, &APIError{Code: -1, Message: "source dataset not found"}
+		return UnknownReplicationJobID, notFoundAPIError("source dataset not found")
 	}
 	jobID := m.nextReplicationJobID
 	m.nextReplicationJobID++
