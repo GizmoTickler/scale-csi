@@ -316,6 +316,16 @@ func datasetUserProperty(ds *truenas.Dataset, key string) string {
 	return ""
 }
 
+// datasetUserPropertyHasValue reports whether a dataset carries key with a
+// meaningful stored value — present and neither empty nor the ZFS sentinel "-".
+// It is the shared primitive behind the stored-protocol-property sniffs
+// (storedBlockProtocol's per-protocol pair check and DeleteVolume's share-type
+// detection), replacing the predicate each hand-rolled.
+func datasetUserPropertyHasValue(ds *truenas.Dataset, key string) bool {
+	value := datasetUserProperty(ds, key)
+	return value != "" && value != "-"
+}
+
 func datasetUserPropertyProjection(ds *truenas.Dataset, key string) (truenas.UserProperty, bool) {
 	if ds == nil {
 		return truenas.UserProperty{}, false

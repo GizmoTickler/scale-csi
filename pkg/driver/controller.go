@@ -784,7 +784,7 @@ func storedBlockProtocol(ds *truenas.Dataset, shareType ShareType) bool {
 		return false
 	}
 	for _, property := range properties {
-		if value := datasetUserProperty(ds, property); value != "" && value != "-" {
+		if datasetUserPropertyHasValue(ds, property) {
 			return true
 		}
 	}
@@ -941,19 +941,20 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	shareTypeKnown := false
 	if ds != nil {
 		// Check stored properties to determine share type - these were set during CreateVolume
-		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok && prop.Value != "" && prop.Value != "-" {
+		switch {
+		case datasetUserPropertyHasValue(ds, PropNVMeoFSubsystemID):
 			shareType = ShareTypeNVMeoF
 			shareTypeKnown = true
 			klog.V(4).Infof("Detected NVMe-oF volume from stored subsystem ID property")
-		} else if prop, ok := ds.UserProperties[PropISCSITargetID]; ok && prop.Value != "" && prop.Value != "-" {
+		case datasetUserPropertyHasValue(ds, PropISCSITargetID):
 			shareType = ShareTypeISCSI
 			shareTypeKnown = true
 			klog.V(4).Infof("Detected iSCSI volume from stored target ID property")
-		} else if prop, ok := ds.UserProperties[PropNFSShareID]; ok && prop.Value != "" && prop.Value != "-" {
+		case datasetUserPropertyHasValue(ds, PropNFSShareID):
 			shareType = ShareTypeNFS
 			shareTypeKnown = true
 			klog.V(4).Infof("Detected NFS volume from stored share ID property")
-		} else {
+		default:
 			// Fallback to dataset type-based detection
 			switch ds.Type {
 			case "FILESYSTEM":
