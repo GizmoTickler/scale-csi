@@ -392,6 +392,16 @@ func TestBookkeepingExistenceFlagShortCircuitsAndReArms(t *testing.T) {
 	d.bookkeepingExists.Store(true)
 	d.noteBookkeepingWriteFailure(d.parentDatasetName(), fmt.Errorf("parent write failure"))
 	assert.True(t, d.bookkeepingExists.Load(), "a parent-targeted failure must not clear the bookkeeping flag")
+
+	// A child removal returning NotFound is operationally tolerated, but it still
+	// proves the cached existence assumption stale and must re-arm the next write.
+	require.NoError(t, client.MockClient.DatasetDelete(ctx, d.bookkeepingDatasetName(), false, true))
+	d.bookkeepingExists.Store(true)
+	require.NoError(t, d.removeBookkeepingProperties(ctx, []string{"truenas-csi:test_key"}))
+	assert.False(t, d.bookkeepingExists.Load(),
+		"a tolerated NotFound child removal must re-arm bookkeeping existence")
+	require.NoError(t, d.ensureBookkeepingDataset(ctx))
+	assert.True(t, d.bookkeepingExists.Load())
 }
 
 // TestTombstoneRetirementBatchFlushProves the P5 batched post-destroy ledger

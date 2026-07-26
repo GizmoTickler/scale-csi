@@ -31,6 +31,8 @@ const (
 	defaultControllerReconcileMinOrphanAge   = 24 * time.Hour
 	replicationJobReasonMissingMarker        = "missing_marker"
 	replicationJobReasonMissingSourceDataset = "missing_source_dataset"
+	datasetGetByNamesBatchBudget             = 32 * 1024
+	datasetGetByNamesEnvelopeHeadroom        = 1024
 	// deletionCapReasonPrefix marks skips caused purely by the per-run deletion
 	// cap so reporting can separate backlog pressure from real guard refusals.
 	deletionCapReasonPrefix = "deletion cap reached"
@@ -76,11 +78,11 @@ type ReconcileObject struct {
 	// that rewrites the marker between detection and deletion is never raced.
 	// Only meaningful for entries in RemnantVolumes.
 	remnantNonce string
-	// tombstoneScanFallback marks a tombstone discovered by the bounded scan
-	// fallback (reconcile.tombstoneReaper.scanFallback) rather than the
-	// ledger-driven path. The reaper relaxes its provenance check for these:
-	// a ledger entry OR (tombstone shape + source-dataset ownership stamp + age
-	// gate). Only meaningful for entries in TombstoneSnapshots.
+	// tombstoneScanFallback marks a tombstone discovered by the scan fallback
+	// (reconcile.tombstoneReaper.scanFallback) rather than the ledger-driven
+	// path. The reaper requires retained creation-time snapshot identity, an
+	// exact driver rename-algorithm match, and fresh absence from BOTH ledgers
+	// before deleting it. Only meaningful for entries in TombstoneSnapshots.
 	tombstoneScanFallback bool
 }
 
@@ -109,31 +111,33 @@ type ReconcileActionFailure struct {
 
 // ReconcileReport is the complete detection and optional cleanup result.
 type ReconcileReport struct {
-	OrphanVolumeCount          int
-	OrphanSnapshotCount        int
-	OrphanShareCount           int
-	SpentRestoreSnapshotCount  int
-	TombstoneSnapshotCount     int
-	RemnantVolumeCount         int
-	OrphanVolumeBytes          int64
-	OrphanSnapshotBytes        int64
-	TombstoneSnapshotBytes     int64
-	OrphanVolumes              []ReconcileObject
-	OrphanSnapshots            []ReconcileObject
-	OrphanShares               []ReconcileObject
-	SpentRestoreSnapshots      []SpentRestoreSnapshot
-	TombstoneSnapshots         []ReconcileObject
-	RemnantVolumes             []ReconcileObject
-	DeletedVolumes             []string
-	DeletedSnapshots           []string
-	DeletedShares              []string
-	DeletedSpentRestoreObjects []string
-	DeletedTombstones          []string
-	DeletedRemnants            []string
-	AdoptedStamps              []string
-	SkippedDeletes             []ReconcileActionFailure
-	DeleteEnabled              bool
-	AdoptedStampCount          int
+	OrphanVolumeCount            int
+	OrphanSnapshotCount          int
+	OrphanShareCount             int
+	SpentRestoreSnapshotCount    int
+	TombstoneSnapshotCount       int
+	ManualRecoveryTombstoneCount int
+	RemnantVolumeCount           int
+	OrphanVolumeBytes            int64
+	OrphanSnapshotBytes          int64
+	TombstoneSnapshotBytes       int64
+	OrphanVolumes                []ReconcileObject
+	OrphanSnapshots              []ReconcileObject
+	OrphanShares                 []ReconcileObject
+	SpentRestoreSnapshots        []SpentRestoreSnapshot
+	TombstoneSnapshots           []ReconcileObject
+	ManualRecoveryTombstones     []ReconcileObject
+	RemnantVolumes               []ReconcileObject
+	DeletedVolumes               []string
+	DeletedSnapshots             []string
+	DeletedShares                []string
+	DeletedSpentRestoreObjects   []string
+	DeletedTombstones            []string
+	DeletedRemnants              []string
+	AdoptedStamps                []string
+	SkippedDeletes               []ReconcileActionFailure
+	DeleteEnabled                bool
+	AdoptedStampCount            int
 }
 
 // CapSkippedDeletes counts guarded deletes that were skipped only because the
@@ -211,12 +215,16 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 			return left < right
 		})
 		sort.Slice(report.TombstoneSnapshots, func(i, j int) bool { return report.TombstoneSnapshots[i].ID < report.TombstoneSnapshots[j].ID })
+		sort.Slice(report.ManualRecoveryTombstones, func(i, j int) bool {
+			return report.ManualRecoveryTombstones[i].ID < report.ManualRecoveryTombstones[j].ID
+		})
 		sort.Slice(report.RemnantVolumes, func(i, j int) bool { return report.RemnantVolumes[i].ID < report.RemnantVolumes[j].ID })
 		sort.Strings(report.AdoptedStamps)
 		report.OrphanVolumeCount = len(report.OrphanVolumes)
 		report.OrphanSnapshotCount = len(report.OrphanSnapshots)
 		report.SpentRestoreSnapshotCount = len(report.SpentRestoreSnapshots)
 		report.TombstoneSnapshotCount = len(report.TombstoneSnapshots)
+		report.ManualRecoveryTombstoneCount = len(report.ManualRecoveryTombstones)
 		report.RemnantVolumeCount = len(report.RemnantVolumes)
 		report.AdoptedStampCount = len(report.AdoptedStamps)
 		// Publish even a partial pass so a single malformed object cannot freeze
@@ -452,14 +460,14 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		report.TombstoneSnapshotBytes += item.Bytes
 	}
 
-	// Scan fallback (reconcile.tombstoneReaper.scanFallback, default off): when the
-	// ledger-driven detection above found ZERO tombstones — the production failure
-	// mode where lost/missing ledger entries strand tombstone-shaped snapshots
-	// forever — do one bounded scan and reap tombstone-shaped snapshots proven by
-	// either a ledger entry or (tombstone shape + source-dataset ownership stamp +
-	// age gate). The ledger-driven reaper is unchanged when it finds tombstones.
-	if len(report.TombstoneSnapshots) == 0 && d.config.Reconcile.TombstoneReaper.ScanFallback.EnabledOrDefault() {
-		d.detectTombstonesByScanFallback(ctx, now, ledger, minOrphanAge, &report)
+	// Scan fallback (reconcile.tombstoneReaper.scanFallback, default off) runs
+	// independently of the strict ledger backlog. It reuses this pass's already
+	// fetched tombstone slice, deduplicates strict candidates, and authorizes only
+	// snapshots carrying retained creation-time identity that exactly proves the
+	// driver's rename output. Unprovable lookalikes are manual-recovery inventory,
+	// never delete candidates.
+	if d.config.Reconcile.TombstoneReaper.ScanFallback.EnabledOrDefault() {
+		d.detectTombstonesByScanFallback(ctx, now, tombstones, ledger, minOrphanAge, &report)
 	}
 
 	// Spent-restore classification is read-only detection, gated on the
@@ -522,6 +530,11 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		tombstone := &report.TombstoneSnapshots[i]
 		klog.Infof("Orphan reconcile: %s released deferred-delete tombstone %s (age=%v)",
 			logAction, tombstone.ID, tombstone.Age)
+	}
+	for i := range report.ManualRecoveryTombstones {
+		tombstone := &report.ManualRecoveryTombstones[i]
+		klog.Warningf("Orphan reconcile: manual recovery required for unproven tombstone-shaped snapshot %s (age=%v); it will not be deleted",
+			tombstone.ID, tombstone.Age)
 	}
 	for i := range report.RemnantVolumes {
 		remnant := &report.RemnantVolumes[i]
@@ -1102,66 +1115,106 @@ func (d *Driver) listAllManagedSnapshots(ctx context.Context) (managed, tombston
 	return managed, tombstones, nil
 }
 
-// tombstoneScanFallbackLimit bounds the scan-fallback snapshot query so a single
-// reconcile pass never transfers an unbounded snapshot set just to recover stranded
-// tombstones. It is a best-effort recovery scan, not the primary detection path.
+// tombstoneScanFallbackLimit bounds the number of provenance-proven fallback
+// candidates processed in one pass. The snapshot transfer itself is shared with
+// listAllManagedSnapshots; this is deliberately not a fixed first-page slice,
+// which could permanently starve candidates later in the listing.
 const tombstoneScanFallbackLimit = 500
 
-// detectTombstonesByScanFallback is the bounded-scan fallback for the tombstone
-// reaper (reconcile.tombstoneReaper.scanFallback). It runs only when a pass found
-// zero ledger-proven tombstones — the production failure mode where lost or missing
-// ledger entries strand tombstone-shaped snapshots forever. It performs ONE bounded
-// snapshot scan of the parent and classifies tombstone-shaped snapshots whose
-// provenance is proven by EITHER a matching ledger entry OR the relaxed fallback
-// (tombstone shape + source-dataset ownership stamp by THIS instance + age gate).
-// Each fallback candidate is flagged so reapTombstoneSnapshot applies the matching
-// relaxed provenance check; the strict ledger path is unchanged for ledger-proven
-// tombstones. Classification stays read-only; deletion is still gated by opts.Delete
-// and the per-object live revalidation in reapTombstoneSnapshot.
-func (d *Driver) detectTombstonesByScanFallback(ctx context.Context, now time.Time, ledger map[string]tombstoneLedgerEntry, minOrphanAge time.Duration, report *ReconcileReport) {
-	scanned, err := d.truenasClient.SnapshotListAll(ctx, d.config.ZFS.DatasetParentName, tombstoneScanFallbackLimit, 0)
-	if err != nil {
-		d.recordReconcileObjectFailure("tombstone_scan_fallback", d.config.ZFS.DatasetParentName, err)
-		return
+// detectTombstonesByScanFallback classifies ledger-less tombstones from the
+// pass's existing snapshot slice. Name shape and source-volume ownership are
+// insufficient provenance: a delete candidate must retain both the original CSI
+// snapshot name and this driver's instance identity, and its current short name
+// must exactly equal snapshotTombstoneName(dataset, sanitizedOriginal, nonce).
+// A ledger entry of any shape excludes the fallback path; mismatches fail closed.
+func (d *Driver) detectTombstonesByScanFallback(
+	ctx context.Context,
+	now time.Time,
+	scanned []*truenas.Snapshot,
+	ledger map[string]tombstoneLedgerEntry,
+	minOrphanAge time.Duration,
+	report *ReconcileReport,
+) {
+	strictIDs := make(map[string]struct{}, len(report.TombstoneSnapshots))
+	for i := range report.TombstoneSnapshots {
+		strictIDs[report.TombstoneSnapshots[i].BackendID] = struct{}{}
 	}
+	processed := 0
 	for _, snap := range scanned {
 		if snap == nil || !isSnapshotTombstone(snap) {
+			continue
+		}
+		if _, strict := strictIDs[snap.ID]; strict {
 			continue
 		}
 		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {
 			klog.Warningf("Orphan reconcile: scan fallback skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name", snap.ID)
 			continue
 		}
-		entry, recorded := ledger[tombstoneLedgerKey(snap.ID)]
-		ledgerProvenance := recorded && entry.Snapshot == snap.ID && entry.CreatedAt > 0 && entry.CreatedAt == snap.GetCreationTime()
-		if !ledgerProvenance {
-			// Relaxed provenance: the source dataset must be locally owned by THIS
-			// driver instance. The tombstone shape was checked above; the age gate is
-			// checked below and re-proven live in reapTombstoneSnapshot.
-			sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, snap.Dataset)
-			if dsErr != nil || !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()) {
-				continue
-			}
-		}
 		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
 		if !eligible {
 			continue
 		}
-		sourceVolumeID := ""
-		if snap.Dataset != "" {
-			sourceVolumeID = path.Base(snap.Dataset)
+		sourceVolumeID := path.Base(snap.Dataset)
+		item := ReconcileObject{
+			ID:             snap.ID,
+			BackendID:      snap.ID,
+			SourceVolumeID: sourceVolumeID,
+			CreatedAt:      createdAt,
+			Age:            age,
+			Bytes:          snap.GetSnapshotSize(),
 		}
-		report.TombstoneSnapshots = append(report.TombstoneSnapshots, ReconcileObject{
-			ID:                    snap.ID,
-			BackendID:             snap.ID,
-			SourceVolumeID:        sourceVolumeID,
-			CreatedAt:             createdAt,
-			Age:                   age,
-			Bytes:                 snap.GetSnapshotSize(),
-			tombstoneScanFallback: !ledgerProvenance,
-		})
-		report.TombstoneSnapshotBytes += snap.GetSnapshotSize()
+		_, ledgerPresent := ledger[tombstoneLedgerKey(snap.ID)]
+		provenanceSafe := !ledgerPresent && snapshotMatchesRetainedTombstoneIdentity(snap, d.driverInstanceID())
+		if provenanceSafe {
+			sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, snap.Dataset)
+			if dsErr != nil {
+				d.recordReconcileObjectFailure("tombstone_scan_fallback", snap.ID, dsErr)
+				provenanceSafe = false
+			} else if !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()) {
+				provenanceSafe = false
+			}
+		}
+		if !provenanceSafe {
+			report.ManualRecoveryTombstones = append(report.ManualRecoveryTombstones, item)
+			klog.Warningf("Orphan reconcile: tombstone-shaped snapshot %s lacks safe scan-fallback provenance; manual recovery required", snap.ID)
+			continue
+		}
+		if processed >= tombstoneScanFallbackLimit {
+			continue
+		}
+		processed++
+		item.tombstoneScanFallback = true
+		report.TombstoneSnapshots = append(report.TombstoneSnapshots, item)
+		report.TombstoneSnapshotBytes += item.Bytes
 	}
+}
+
+// snapshotMatchesRetainedTombstoneIdentity proves that a renamed snapshot is
+// exactly one this driver could have produced from the identity properties
+// written atomically at CreateSnapshot time. The suffix nonce is parsed and fed
+// back through the production rename algorithm; accepting a mere name prefix
+// would make manual lookalikes destructive.
+func snapshotMatchesRetainedTombstoneIdentity(snap *truenas.Snapshot, instanceID string) bool {
+	if snap == nil || instanceID == "" {
+		return false
+	}
+	original, hasOriginal := snap.UserProperties[PropCSISnapshotName]
+	instance, hasInstance := snap.UserProperties[PropDriverInstanceID]
+	if !hasOriginal || original.Value == "" || original.Value == "-" ||
+		!hasInstance || instance.Value != instanceID {
+		return false
+	}
+	currentName := snapshotShortName(snap)
+	marker := strings.LastIndex(currentName, snapshotTombstoneMarker)
+	if marker <= 0 {
+		return false
+	}
+	nonce, err := strconv.ParseInt(currentName[marker+len(snapshotTombstoneMarker):], 10, 64)
+	if err != nil || nonce <= 0 {
+		return false
+	}
+	return currentName == snapshotTombstoneName(snap.Dataset, sanitizeVolumeID(original.Value), nonce)
 }
 
 func (d *Driver) kubernetesReconcileClients() (
@@ -1789,12 +1842,17 @@ func (d *Driver) reapTombstoneSnapshot(
 	// valid entry may live in either location. A parent-only read here would
 	// permanently refuse to reap any tombstone whose entry exists only on the
 	// child (and, once cleanupParent runs, every tombstone).
+	ledgerKey := tombstoneLedgerKey(snapshot.ID)
 	parent, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
 	if parentErr != nil {
 		return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", parentErr)
 	}
-	ledger := tombstoneLedgerFromDataset(parent)
-	if d.bookkeepingEnabled() {
+	parentLedger := tombstoneLedgerFromDataset(parent)
+	parentEntry, parentRecorded := parentLedger[ledgerKey]
+	parentPropertyPresent := datasetHasUserProperty(parent, ledgerKey)
+	var childEntry tombstoneLedgerEntry
+	var childRecorded, childPropertyPresent bool
+	if d.bookkeepingEnabled() || tombstone.tombstoneScanFallback {
 		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
 		if bkErr != nil {
 			// An absent child is legitimate (no entry migrated or written yet);
@@ -1804,26 +1862,31 @@ func (d *Driver) reapTombstoneSnapshot(
 				return false, fmt.Sprintf("tombstone ledger revalidation failed: %v", bkErr)
 			}
 		} else {
-			for key, childEntry := range tombstoneLedgerFromDataset(bookkeeping) {
-				ledger[key] = childEntry
-			}
+			childEntry, childRecorded = tombstoneLedgerFromDataset(bookkeeping)[ledgerKey]
+			childPropertyPresent = datasetHasUserProperty(bookkeeping, ledgerKey)
 		}
 	}
-	entry, recorded := ledger[tombstoneLedgerKey(snapshot.ID)]
-	ledgerProvenance := recorded && entry.Snapshot == snapshot.ID && entry.CreatedAt > 0 && entry.CreatedAt == snapshot.GetCreationTime()
-	if !ledgerProvenance {
-		if !tombstone.tombstoneScanFallback {
-			// Strict path (unchanged): a matching ledger entry is the only
-			// provenance for a ledger-driven tombstone.
-			if !recorded || entry.Snapshot != snapshot.ID {
+	if tombstone.tombstoneScanFallback {
+		// Fallback is exclusively for a genuinely absent ledger. A raw property
+		// at either location — including an unparseable or creation-mismatched
+		// entry — fails closed and can never be downgraded to relaxed provenance.
+		if parentPropertyPresent || childPropertyPresent {
+			return false, "tombstone ledger entry is present; scan fallback requires fresh absence from parent and child"
+		}
+		if !snapshotMatchesRetainedTombstoneIdentity(snapshot, d.driverInstanceID()) {
+			return false, "retained snapshot identity does not prove the driver tombstone rename"
+		}
+	} else {
+		ledgerProvenance := func(entry tombstoneLedgerEntry, recorded bool) bool {
+			return recorded && entry.Snapshot == snapshot.ID && entry.CreatedAt > 0 &&
+				entry.CreatedAt == snapshot.GetCreationTime()
+		}
+		if !ledgerProvenance(parentEntry, parentRecorded) && !ledgerProvenance(childEntry, childRecorded) {
+			if !parentRecorded && !childRecorded {
 				return false, "no tombstone ledger entry proves driver provenance"
 			}
 			return false, "tombstone ledger creation identity does not match the observed snapshot"
 		}
-		// Scan-fallback path: provenance is relaxed to the source-dataset ownership
-		// stamp (verified just below) plus the tombstone shape (verified above) and
-		// the age gate (verified below). No ledger entry is required — this is the
-		// recovery path for tombstones stranded by lost/missing ledger entries.
 	}
 	// The tombstone must sit on a dataset this driver instance owns. For
 	// scan-fallback tombstones without a ledger entry this ownership stamp is the
@@ -1838,6 +1901,13 @@ func (d *Driver) reapTombstoneSnapshot(
 	createdAt, _, eligible := reconcileAge(time.Now(), snapshot.GetCreationTime(), minOrphanAge)
 	if !eligible || !createdAt.Equal(tombstone.CreatedAt) {
 		return false, "tombstone creation identity or age changed"
+	}
+	hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, snapshot.Dataset)
+	if cloneErr != nil {
+		return false, fmt.Sprintf("tombstone dependent-clone preflight failed: %v", cloneErr)
+	}
+	if hasDependentClones {
+		return false, "tombstone snapshot still has dependent clones"
 	}
 	if err := d.truenasClient.SnapshotDelete(ctx, snapshot.ID, false, false); err != nil {
 		if truenas.IsNotFoundError(err) {
@@ -1910,8 +1980,11 @@ func (b *tombstoneRetirementBatch) flush(ctx context.Context, d *Driver, parent 
 	}
 	if d.bookkeepingEnabled() {
 		for _, chunk := range chunkKeyList(keys, bookkeepingMigrationBatchBudget) {
-			if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.bookkeepingDatasetName(), chunk); err != nil && !truenas.IsNotFoundError(err) {
-				klog.Warningf("Failed to batch-remove %d tombstone ledger entries from bookkeeping dataset (sweep will retire them): %v", len(chunk), err)
+			if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.bookkeepingDatasetName(), chunk); err != nil {
+				d.noteBookkeepingWriteFailure(d.bookkeepingDatasetName(), err)
+				if !truenas.IsNotFoundError(err) {
+					klog.Warningf("Failed to batch-remove %d tombstone ledger entries from bookkeeping dataset (sweep will retire them): %v", len(chunk), err)
+				}
 			}
 		}
 	}
@@ -2430,6 +2503,14 @@ func listedSnapshotIDs(snapshots, tombstones []*truenas.Snapshot) map[string]str
 	return ids
 }
 
+func datasetHasUserProperty(dataset *truenas.Dataset, key string) bool {
+	if dataset == nil {
+		return false
+	}
+	_, present := dataset.UserProperties[key]
+	return present
+}
+
 // datasetHasLocalManagedResource re-fetches datasetName with property source and
 // reports whether managed_resource="true" is stamped LOCALLY on it. The reconcile
 // listing does not carry property source, so a dataset that merely inherits
@@ -2861,13 +2942,9 @@ func (d *Driver) reconcileStalePublicationRecords(
 		}
 	}
 	var sourceBearing map[string]*truenas.Dataset
+	var failedSourceBearing map[string]struct{}
 	if len(sourcelessNames) > 0 {
-		sourceBearingByNames, getErr := d.truenasClient.DatasetGetByNames(ctx, sourcelessNames)
-		if getErr != nil {
-			d.recordReconcileObjectFailure("stale_publication_classification", "batch", getErr)
-		} else {
-			sourceBearing = sourceBearingByNames
-		}
+		sourceBearing, failedSourceBearing = d.datasetGetByNamesChunked(ctx, sourcelessNames)
 	}
 	for _, dataset := range datasets {
 		if dataset == nil {
@@ -2877,10 +2954,10 @@ func (d *Driver) reconcileStalePublicationRecords(
 		if dataset.ResourceQuery && datasetHasPublicationRecordKeys(dataset) {
 			sourceBearingDataset, ok := sourceBearing[dataset.Name]
 			if !ok {
-				// The batch failed (sourceBearing nil, recorded once above) or this
-				// dataset vanished between the listing and the re-read. Either way,
-				// skip it — the former per-dataset GET failure path did the same.
-				if sourceBearing != nil {
+				// A failed chunk is already recorded once and affects only its own
+				// names. A successful chunk that omitted this dataset means it
+				// vanished between listing and re-read; record that separately.
+				if _, failed := failedSourceBearing[dataset.Name]; !failed {
 					d.recordReconcileObjectFailure("stale_publication_classification", dataset.Name,
 						fmt.Errorf("source-bearing re-read returned no dataset"))
 				}
@@ -2928,6 +3005,63 @@ func (d *Driver) reconcileStalePublicationRecords(
 				volumeID, record.Node, firstMissing.UTC().Format(time.RFC3339))
 		}
 	}
+}
+
+// chunkDatasetNames splits names so the typed ["id","in",names] filter remains
+// below the 32 KiB request budget, leaving fixed headroom for the JSON-RPC
+// envelope and query options. Dataset names are bounded by ZFS, so a single
+// entry cannot consume the budget by itself.
+func chunkDatasetNames(names []string, budget int) [][]string {
+	if len(names) == 0 || budget <= datasetGetByNamesEnvelopeHeadroom {
+		return nil
+	}
+	var chunks [][]string
+	var current []string
+	for _, name := range names {
+		candidate := append(append([]string(nil), current...), name)
+		encoded, err := json.Marshal(candidate)
+		if err != nil {
+			continue
+		}
+		if len(current) > 0 && len(encoded)+datasetGetByNamesEnvelopeHeadroom > budget {
+			chunks = append(chunks, current)
+			current = []string{name}
+			continue
+		}
+		current = candidate
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks
+}
+
+// datasetGetByNamesChunked merges successful source-bearing reads and marks only
+// the names in failed chunks unavailable. One oversized/transient request can
+// no longer disable stale-publication classification for the entire pass.
+func (d *Driver) datasetGetByNamesChunked(
+	ctx context.Context,
+	names []string,
+) (result map[string]*truenas.Dataset, failed map[string]struct{}) {
+	result = make(map[string]*truenas.Dataset, len(names))
+	failed = make(map[string]struct{})
+	for i, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
+		datasets, err := d.truenasClient.DatasetGetByNames(ctx, chunk)
+		if err != nil {
+			d.recordReconcileObjectFailure("stale_publication_classification", fmt.Sprintf("batch-%d", i+1), err)
+			for _, name := range chunk {
+				failed[name] = struct{}{}
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		for name, dataset := range datasets {
+			result[name] = dataset
+		}
+	}
+	return result, failed
 }
 
 func (d *Driver) revokeStalePublicationRecord(
@@ -3083,8 +3217,9 @@ func (d *Driver) startOrphanReconcile() {
 				return
 			}
 			if reconcileErr == nil {
-				klog.Infof("Orphan reconcile detection complete: volumes=%d snapshots=%d spentRestoreSnapshots=%d tombstones=%d remnants=%d adoptedStamps=%d",
-					report.OrphanVolumeCount, report.OrphanSnapshotCount, report.SpentRestoreSnapshotCount, report.TombstoneSnapshotCount, report.RemnantVolumeCount, report.AdoptedStampCount)
+				klog.Infof("Orphan reconcile detection complete: volumes=%d snapshots=%d spentRestoreSnapshots=%d tombstones=%d manualRecoveryTombstones=%d remnants=%d adoptedStamps=%d",
+					report.OrphanVolumeCount, report.OrphanSnapshotCount, report.SpentRestoreSnapshotCount, report.TombstoneSnapshotCount,
+					report.ManualRecoveryTombstoneCount, report.RemnantVolumeCount, report.AdoptedStampCount)
 			}
 		}
 

@@ -228,6 +228,11 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		klog.Warningf("Failed to store NVMe-oF resource IDs: %v", err)
 	}
 
+	// ensureShareExists may have memoized a complete miss before recreating this
+	// share. Replace that stale (nil, nil) resolution with the objects just
+	// created and clear associations after all share/association mutations so
+	// the fenced publish classifies and enforces against current backend state.
+	res.storeNVMeObjects(namespace, subsys)
 	klog.Infof("Created NVMe-oF subsystem=%d, namespace=%d, port-assoc=%d for %s", subsys.ID, namespace.ID, portSubsys.ID, datasetName)
 	return nil
 }

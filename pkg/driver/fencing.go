@@ -1408,18 +1408,11 @@ func (d *Driver) applyNVMeFence(
 			return updateErr
 		}
 	}
-	// Read the association list once (memoized across this request's phases) and
-	// reuse it both to skip redundant creates below and as the removal loop's
-	// starting snapshot. The list is a fence-phase starting state: associations
-	// this call creates are desired hosts and are never removal candidates, so
-	// iterating the pre-create snapshot for removals is correct.
-	associations, err := d.resolvedNVMeAssociations(ctx, res, subsystem.ID)
-	if err != nil {
-		return err
-	}
-	associatedByID := make(map[int]struct{}, len(associations))
-	for _, association := range associations {
-		associatedByID[association.HostID] = struct{}{}
+	// Compatibility/classification reads are not enforcement evidence: an
+	// operator, peer controller, or backend action can change the allowlist
+	// outside this process-local volume lock. Fresh-list at the mutation boundary.
+	if _, refreshErr := d.refreshNVMeAssociations(ctx, res, subsystem.ID); refreshErr != nil {
+		return refreshErr
 	}
 	desiredNQNs := make([]string, 0, len(active)+len(d.config.NVMeoF.SubsystemHosts))
 	for _, identity := range active {
@@ -1438,17 +1431,21 @@ func (d *Driver) applyNVMeFence(
 	desiredByID := make(map[int]struct{}, len(desiredIDs))
 	for _, hostID := range desiredIDs {
 		desiredByID[hostID] = struct{}{}
-		if _, already := associatedByID[hostID]; already {
-			// The association list read at the start of this fenced request already
-			// shows this host attached. Re-creating it only exercises the backend's
-			// AlreadyExists tolerance — the live nvmet.host_subsys.create error
-			// source. Skip it; NVMeoFHostSubsysCreate keeps its AlreadyExists
-			// tolerance as a safety net for a genuinely concurrent attach.
-			continue
-		}
-		if _, createErr := d.truenasClient.NVMeoFHostSubsysCreate(ctx, hostID, subsystem.ID); createErr != nil {
+		// Issue the desired association unconditionally. The client keeps its
+		// AlreadyExists tolerance, and this closes the race where an association
+		// observed during compatibility disappears before enforcement.
+		_, createErr := d.truenasClient.NVMeoFHostSubsysCreate(ctx, hostID, subsystem.ID)
+		res.invalidateNVMeAssociations()
+		if createErr != nil {
 			return createErr
 		}
+	}
+	// Removals must use a fresh POST-create list. A foreign association can
+	// appear after the boundary read, and strict fencing must revoke it before
+	// reporting success.
+	associations, err := d.refreshNVMeAssociations(ctx, res, subsystem.ID)
+	if err != nil {
+		return err
 	}
 	removeNQNs := append([]string(nil), additiveRemovingNQNs...)
 	if d.config.Fencing.Mode == FencingModeStrict {
@@ -1502,8 +1499,10 @@ func (d *Driver) applyNVMeFence(
 			_, remove = removeByID[association.HostID]
 		}
 		if remove {
-			if err := d.truenasClient.NVMeoFHostSubsysDelete(ctx, association.ID); err != nil {
-				return err
+			deleteErr := d.truenasClient.NVMeoFHostSubsysDelete(ctx, association.ID)
+			res.invalidateNVMeAssociations()
+			if deleteErr != nil {
+				return deleteErr
 			}
 		}
 	}

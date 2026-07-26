@@ -144,8 +144,11 @@ func (d *Driver) removeBookkeepingProperties(ctx context.Context, keys []string)
 		firstErr = err
 	}
 	if d.bookkeepingEnabled() {
-		if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.bookkeepingDatasetName(), keys); err != nil && !truenas.IsNotFoundError(err) && firstErr == nil {
-			firstErr = err
+		if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.bookkeepingDatasetName(), keys); err != nil {
+			d.noteBookkeepingWriteFailure(d.bookkeepingDatasetName(), err)
+			if !truenas.IsNotFoundError(err) && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr

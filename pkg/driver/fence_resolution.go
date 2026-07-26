@@ -84,6 +84,39 @@ func (d *Driver) resolvedNVMeAssociations(ctx context.Context, res *fenceResolut
 	return associations, nil
 }
 
+// refreshNVMeAssociations always reads the backend and replaces the memo. Fence
+// enforcement uses this at mutation boundaries because compatibility reads are
+// classification evidence, not a lock against another controller or operator.
+func (d *Driver) refreshNVMeAssociations(ctx context.Context, res *fenceResolution, subsysID int) ([]*truenas.NVMeoFHostSubsys, error) {
+	associations, err := d.truenasClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
+	if err != nil {
+		return nil, err
+	}
+	if res != nil {
+		res.nvmeAssociations = associations
+		res.nvmeAssocLoaded = true
+	}
+	return associations, nil
+}
+
+func (res *fenceResolution) invalidateNVMeAssociations() {
+	if res == nil {
+		return
+	}
+	res.nvmeAssociations = nil
+	res.nvmeAssocLoaded = false
+}
+
+func (res *fenceResolution) storeNVMeObjects(namespace *truenas.NVMeoFNamespace, subsystem *truenas.NVMeoFSubsystem) {
+	if res == nil {
+		return
+	}
+	res.nvmeNamespace = namespace
+	res.nvmeSubsystem = subsystem
+	res.nvmeNSLoaded = true
+	res.invalidateNVMeAssociations()
+}
+
 // resolvedNFSShare returns the volume's NFS share, resolving it once per request
 // and memoizing it.
 func (d *Driver) resolvedNFSShare(ctx context.Context, res *fenceResolution, ds *truenas.Dataset, datasetName string) (*truenas.NFSShare, error) {

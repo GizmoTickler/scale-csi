@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -491,6 +492,11 @@ func (c *apiCallCountingClient) NVMeoFGetOrCreatePort(ctx context.Context, trans
 	return c.MockClient.NVMeoFGetOrCreatePort(ctx, transport, address, port)
 }
 
+func (c *apiCallCountingClient) InvalidateNVMeoFPort(transport, address string, port int) {
+	c.record("InvalidateNVMeoFPort")
+	c.MockClient.InvalidateNVMeoFPort(transport, address, port)
+}
+
 func (c *apiCallCountingClient) NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error) {
 	c.record("NVMeoFGetTransportAddresses")
 	return c.MockClient.NVMeoFGetTransportAddresses(ctx, transport)
@@ -572,6 +578,50 @@ func (c *apiCallCountingClient) ReplicationJobAbort(ctx context.Context, jobID i
 }
 
 var _ truenas.ClientInterface = (*apiCallCountingClient)(nil)
+
+func TestAPICallCountingClientWrapsEveryClientInterfaceMethod(t *testing.T) {
+	interfaceType := reflect.TypeOf((*truenas.ClientInterface)(nil)).Elem()
+	contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	for i := 0; i < interfaceType.NumMethod(); i++ {
+		interfaceMethod := interfaceType.Method(i)
+		t.Run(interfaceMethod.Name, func(t *testing.T) {
+			client := newAPICallCountingClient()
+			method := reflect.ValueOf(client).MethodByName(interfaceMethod.Name)
+			require.True(t, method.IsValid())
+			cancelledContext, cancel := context.WithCancel(context.Background())
+			cancel()
+			args := make([]reflect.Value, method.Type().NumIn())
+			for argIndex := range args {
+				argType := method.Type().In(argIndex)
+				switch {
+				case argType.Implements(contextType):
+					args[argIndex] = reflect.ValueOf(cancelledContext)
+				case argType.Kind() == reflect.Pointer:
+					args[argIndex] = reflect.New(argType.Elem())
+				case argType.Kind() == reflect.Slice:
+					args[argIndex] = reflect.MakeSlice(argType, 0, 0)
+				case argType.Kind() == reflect.Map:
+					args[argIndex] = reflect.MakeMap(argType)
+				default:
+					args[argIndex] = reflect.Zero(argType)
+				}
+			}
+			func() {
+				defer func() {
+					_ = recover()
+				}()
+				if method.Type().IsVariadic() {
+					method.CallSlice(args)
+				} else {
+					method.Call(args)
+				}
+			}()
+			_, calls := client.callSnapshot()
+			assert.Equal(t, 1, calls[interfaceMethod.Name],
+				"ClientInterface method %s is silently promoted instead of explicitly recorded", interfaceMethod.Name)
+		})
+	}
+}
 
 func newAPICallCountDriver(t *testing.T, client *apiCallCountingClient, protocol string) *Driver {
 	t.Helper()
@@ -942,9 +992,11 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 
 	// (c) strict + NVMe-oF single node — the live hot path P1 optimizes. The
 	// measured publish is a steady-state republish: the setup publish associates
-	// the node and warms the per-driver host-ID cache, so the republish reuses
-	// the memoized namespace/subsystem/associations and skips the redundant
-	// host_subsys.create. The unpublish revokes the association.
+	// the node and warms the per-driver host-ID cache. Namespace/subsystem
+	// identity remains memoized within the request, but enforcement deliberately
+	// fresh-lists at its mutation boundary, unconditionally asserts the desired
+	// association, and fresh-lists again before removals. The unpublish uses the
+	// same enforcement-boundary freshness before revoking the association.
 	t.Run("strict NVMe-oF publish", func(t *testing.T) {
 		client := newAPICallCountingClient()
 		d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
@@ -959,7 +1011,7 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("strict-nvme", nodeA))
 		require.NoError(t, err)
-		// Six calls (steady-state republish; ~13 before P1):
+		// Nine calls (steady-state republish; ~13 before P1):
 		// 1. DatasetGet                      — ControllerPublishVolume volume read.
 		// 2. NVMeoFNamespaceGet              — ensureShare resolves the namespace
 		//                                      (memoized for the rest of the request).
@@ -968,13 +1020,14 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		// 4. NVMeoFHostFindByNQN             — validateBackend resolves the exempt
 		//                                      node NQN to a host ID.
 		// 5. NVMeoFHostSubsysListBySubsystem — validateBackend reads the allowlist
-		//                                      (memoized; applyNVMeFence reuses it).
+		//                                      for compatibility/classification.
 		// 6. DatasetSetUserProperties        — storePublicationRecord.
-		//    applyNVMeFence adds ZERO calls: namespace/subsystem/associations are
-		//    memoized, the host-ID resolution is cached from the setup publish, and
-		//    the host_subsys.create is SKIPPED because the memoized association list
-		//    already shows worker-a attached.
-		assertAPICallCount(t, "strict NVMe-oF publish", client, 6)
+		// 7. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read;
+		//                                      compatibility state is not reused.
+		// 8. NVMeoFHostSubsysCreate          — unconditional idempotent assertion
+		//                                      of the desired association.
+		// 9. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view.
+		assertAPICallCount(t, "strict NVMe-oF publish", client, 9)
 	})
 	t.Run("strict NVMe-oF unpublish", func(t *testing.T) {
 		client := newAPICallCountingClient()
@@ -988,17 +1041,19 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "strict-nvme-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Eight calls:
+		// Nine calls:
 		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
 		// 2. DatasetSetUserProperties        — flip the record to "unpublishing".
 		// 3. NVMeoFNamespaceGet              — applyNVMeFence resolves the namespace
 		//                                      (fresh memo for this request).
 		// 4. NVMeoFSubsystemGet              — applyNVMeFence resolves the subsystem.
-		// 5. NVMeoFHostSubsysListBySubsystem — applyNVMeFence reads the allowlist.
+		// 5. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read.
 		// 6. NVMeoFHostFindByNQN             — resolve the removing NQN to a host ID.
-		// 7. NVMeoFHostSubsysDelete          — revoke worker-a's association.
-		// 8. DatasetRemoveUserProperties     — removePublicationRecords.
-		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 8)
+		// 7. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view
+		//                                      (there are no desired creates here).
+		// 8. NVMeoFHostSubsysDelete          — revoke worker-a's association.
+		// 9. DatasetRemoveUserProperties     — removePublicationRecords.
+		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 9)
 	})
 }
 
@@ -1044,4 +1099,40 @@ func TestCreateVolumeCloneScrubInheritedProtocolProperties(t *testing.T) {
 	assert.False(t, hasNVMe, "the inherited NVMe-oF subsystem ID must be scrubbed from the NFS clone")
 	assert.NotEqual(t, "999", clone.UserProperties[PropNFSShareID].Value,
 		"the clone must stamp its own NFS share ID, not the inherited stale one")
+
+	// Source-aware/current-protocol belt: a local foreign-protocol property and
+	// an inherited property belonging to the target protocol both survive. Only
+	// the provably inherited foreign-protocol property is removed.
+	scrubTarget, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/source-aware-scrub", Type: "FILESYSTEM",
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.MockClient.DatasetSetUserProperties(ctx, scrubTarget.Name, map[string]string{
+		PropNFSShareID:         "current-protocol",
+		PropISCSITargetID:      "local-foreign",
+		PropNVMeoFSubsystemID:  "inherited-foreign",
+		PropNVMeoFPortSubsysID: "unknown-source",
+	}))
+	scrubTarget, err = client.MockClient.DatasetGet(ctx, scrubTarget.Name)
+	require.NoError(t, err)
+	scrubTarget.UserProperties[PropNFSShareID] = truenas.UserProperty{
+		Value: "current-protocol", Source: "pool/parent/source@snap",
+	}
+	scrubTarget.UserProperties[PropNVMeoFSubsystemID] = truenas.UserProperty{
+		Value: "inherited-foreign", Source: "pool/parent/source@snap",
+	}
+	scrubTarget.UserProperties[PropNVMeoFPortSubsysID] = truenas.UserProperty{
+		Value: "unknown-source", Source: "",
+	}
+	d.scrubInheritedProtocolProperties(ctx, scrubTarget, scrubTarget.Name, ShareTypeNFS)
+	scrubbed, err := client.MockClient.DatasetGet(ctx, scrubTarget.Name)
+	require.NoError(t, err)
+	assert.Equal(t, "current-protocol", scrubbed.UserProperties[PropNFSShareID].Value,
+		"all properties of the volume's current protocol survive regardless of source")
+	assert.Equal(t, "local-foreign", scrubbed.UserProperties[PropISCSITargetID].Value,
+		"local properties survive even when they belong to another protocol")
+	_, hasInheritedForeign := scrubbed.UserProperties[PropNVMeoFSubsystemID]
+	assert.False(t, hasInheritedForeign, "only provably inherited foreign-protocol properties are scrubbed")
+	assert.Equal(t, "unknown-source", scrubbed.UserProperties[PropNVMeoFPortSubsysID].Value,
+		"sourceless properties are not provably inherited and must survive")
 }

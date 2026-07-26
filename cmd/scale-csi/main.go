@@ -157,12 +157,13 @@ func main() {
 			klog.Fatalf("Orphan reconcile failed: %v", reconcileErr)
 		}
 		capSkips := report.CapSkippedDeletes()
-		klog.Infof("Orphan reconcile complete: delete=%v orphanVolumes=%d orphanSnapshots=%d spentRestoreSnapshots=%d tombstoneSnapshots=%d remnantVolumes=%d deletedVolumes=%d deletedSnapshots=%d deletedSpentRestoreSnapshots=%d reapedTombstones=%d deletedRemnants=%d adoptedStamps=%d skippedOnCap=%d skippedRefused=%d",
+		klog.Infof("Orphan reconcile complete: delete=%v orphanVolumes=%d orphanSnapshots=%d spentRestoreSnapshots=%d tombstoneSnapshots=%d manualRecoveryTombstones=%d remnantVolumes=%d deletedVolumes=%d deletedSnapshots=%d deletedSpentRestoreSnapshots=%d reapedTombstones=%d deletedRemnants=%d adoptedStamps=%d skippedOnCap=%d skippedRefused=%d",
 			report.DeleteEnabled,
 			report.OrphanVolumeCount,
 			report.OrphanSnapshotCount,
 			report.SpentRestoreSnapshotCount,
 			report.TombstoneSnapshotCount,
+			report.ManualRecoveryTombstoneCount,
 			report.RemnantVolumeCount,
 			len(report.DeletedVolumes),
 			len(report.DeletedSnapshots),

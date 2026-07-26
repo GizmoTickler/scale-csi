@@ -128,6 +128,54 @@ func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIde
 	assert.False(t, retained, "backend conflict must be detected before persisting a new publication")
 }
 
+func TestControllerPublishRepairsCompletelyMissingNVMeShareBeforeFencing(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nvmeof",
+		config: &Config{
+			DriverName: "org.scale.csi.nvmeof",
+			Fencing:    FencingConfig{Mode: FencingModeStrict},
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
+			NVMeoF: NVMeoFConfig{
+				Transport: "TCP", TransportAddress: "192.0.2.20", TransportServiceID: 4420,
+			},
+		},
+		truenasClient:     client,
+		nvmeResolvedHosts: make(map[string]int),
+	}
+	datasetName := "pool/parent/restored-without-share"
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
+	})
+	require.NoError(t, err)
+
+	nodeID, err := encodeNodeIdentity(NodeIdentity{
+		Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a",
+	})
+	require.NoError(t, err)
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: "restored-without-share",
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "nvmeof"},
+	})
+	require.NoError(t, err,
+		"ensureShareExists must replace its memoized miss with the newly created namespace/subsystem")
+
+	dataset, err := client.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
+	namespaceID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFNamespaceID))
+	assert.Positive(t, namespaceID)
+	associations, err := client.NVMeoFHostSubsysListBySubsystem(ctx, subsystemID)
+	require.NoError(t, err)
+	require.Len(t, associations, 1)
+	assert.Equal(t, "nqn.2014-08.org.nvmexpress:uuid:worker-a", associations[0].HostNQN)
+}
+
 // allowlistCountingClient wraps the mock and counts every backend transport
 // allowlist mutation (NFS host lists, iSCSI initiator groups/target groups,
 // NVMe-oF host-subsystem associations). Off-mode publication tracking must keep
@@ -141,6 +189,103 @@ type allowlistCountingClient struct {
 	nvmeHostSubsysCreate atomic.Int64
 	nvmeHostSubsysDelete atomic.Int64
 	nvmeAllowAnyHost     atomic.Int64
+}
+
+type nvmeAssociationInterleavingClient struct {
+	*truenas.MockClient
+	listCalls  int
+	afterFirst func()
+}
+
+func (c *nvmeAssociationInterleavingClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFHostSubsys, error) {
+	associations, err := c.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
+	c.listCalls++
+	if c.listCalls == 1 && c.afterFirst != nil {
+		c.afterFirst()
+	}
+	return associations, err
+}
+
+func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T) {
+	t.Run("desired association removed after compatibility is recreated", func(t *testing.T) {
+		ctx := context.Background()
+		client := truenas.NewMockClient()
+		d := &Driver{
+			config: &Config{
+				Fencing: FencingConfig{Mode: FencingModeStrict},
+				ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			},
+			truenasClient: client, nvmeResolvedHosts: make(map[string]int),
+		}
+		dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/fresh-create", Type: "VOLUME", Volsize: testGiB,
+		})
+		require.NoError(t, err)
+		subsystem, err := client.NVMeoFSubsystemCreate(ctx, "fresh-create", false, nil)
+		require.NoError(t, err)
+		namespace, err := client.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+dataset.Name, "ZVOL")
+		require.NoError(t, err)
+		nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+		host, err := client.NVMeoFHostCreate(ctx, nqn)
+		require.NoError(t, err)
+		association, err := client.NVMeoFHostSubsysCreate(ctx, host.ID, subsystem.ID)
+		require.NoError(t, err)
+		res := &fenceResolution{
+			nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true,
+			nvmeAssociations: []*truenas.NVMeoFHostSubsys{association}, nvmeAssocLoaded: true,
+		}
+		require.NoError(t, client.NVMeoFHostSubsysDelete(ctx, association.ID),
+			"external removal lands after compatibility cached the association")
+
+		require.NoError(t, d.applyNVMeFence(ctx, dataset, dataset.Name,
+			[]NodeIdentity{{Name: "worker-a", NVMeNQN: nqn}}, nil, nil, nil, res))
+		associations, err := client.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+		require.NoError(t, err)
+		require.Len(t, associations, 1)
+		assert.Equal(t, nqn, associations[0].HostNQN)
+	})
+
+	t.Run("foreign association created after boundary read is removed", func(t *testing.T) {
+		ctx := context.Background()
+		base := truenas.NewMockClient()
+		client := &nvmeAssociationInterleavingClient{MockClient: base}
+		d := &Driver{
+			config: &Config{
+				Fencing: FencingConfig{Mode: FencingModeStrict},
+				ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			},
+			truenasClient: client, nvmeResolvedHosts: make(map[string]int),
+		}
+		dataset, err := base.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/fresh-remove", Type: "VOLUME", Volsize: testGiB,
+		})
+		require.NoError(t, err)
+		subsystem, err := base.NVMeoFSubsystemCreate(ctx, "fresh-remove", false, nil)
+		require.NoError(t, err)
+		namespace, err := base.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+dataset.Name, "ZVOL")
+		require.NoError(t, err)
+		desiredNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+		desired, err := base.NVMeoFHostCreate(ctx, desiredNQN)
+		require.NoError(t, err)
+		_, err = base.NVMeoFHostSubsysCreate(ctx, desired.ID, subsystem.ID)
+		require.NoError(t, err)
+		foreign, err := base.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:foreign")
+		require.NoError(t, err)
+		client.afterFirst = func() {
+			_, createErr := base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
+			require.NoError(t, createErr)
+		}
+		res := &fenceResolution{
+			nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true,
+		}
+
+		require.NoError(t, d.applyNVMeFence(ctx, dataset, dataset.Name,
+			[]NodeIdentity{{Name: "worker-a", NVMeNQN: desiredNQN}}, nil, nil, nil, res))
+		associations, err := base.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+		require.NoError(t, err)
+		require.Len(t, associations, 1)
+		assert.Equal(t, desiredNQN, associations[0].HostNQN)
+	})
 }
 
 func (c *allowlistCountingClient) allowlistCalls() int64 {

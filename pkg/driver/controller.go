@@ -636,7 +636,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		// ID would make ensureShareExists validate the clone against the SOURCE
 		// volume's share objects. Best-effort and a SEPARATE pool.dataset.update from
 		// the authoritative ownership stamp above (cleanup, not provenance).
-		d.scrubInheritedProtocolProperties(ctx, createdDS, datasetName)
+		d.scrubInheritedProtocolProperties(ctx, createdDS, datasetName, shareType)
 	} else {
 		// Create new dataset
 		var createErr error
@@ -1460,6 +1460,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	// ignores post-create pool.snapshot.update property writes.
 	snap, err := d.truenasClient.SnapshotCreate(ctx, datasetName, snapshotID, map[string]string{
 		PropManagedResource:           "true",
+		PropDriverInstanceID:          d.driverInstanceID(),
 		PropCSISnapshotName:           name,
 		PropCSISnapshotSourceVolumeID: sourceVolumeID,
 	})
@@ -2202,12 +2203,10 @@ func (d *Driver) snapshotRestoreDetached(params map[string]string) (bool, error)
 }
 
 // inheritedProtocolPropertyKeys are the per-volume backend share-object IDs that
-// ZFS inherits from a clone's source dataset. A clone must start with NONE of
-// them: a stale inherited ID makes ensureShareExists validate the clone against
-// the SOURCE volume's share objects (wrong backreference → spurious share
-// recreation or false orphan detection). They are scrubbed best-effort right
-// after the authoritative ownership stamp; the scrub is a separate
-// pool.dataset.update because it is cleanup, not provenance.
+// ZFS may inherit from a clone's source dataset. The scrub removes only
+// source-proven inherited IDs belonging to OTHER protocols: local values are
+// authoritative, and the selected protocol's resolver owns repair of its own
+// stale backreferences. The scrub runs best-effort after the ownership stamp.
 var inheritedProtocolPropertyKeys = []string{
 	PropNFSShareID,
 	PropISCSITargetID,
@@ -2219,22 +2218,44 @@ var inheritedProtocolPropertyKeys = []string{
 	PropNVMeoFPortSubsysID,
 }
 
-// scrubInheritedProtocolProperties removes any backend share-object IDs the clone
-// inherited from its source dataset (see inheritedProtocolPropertyKeys). It is
-// idempotent and best-effort: a failure leaves the stale IDs for the reconcile
-// pass's backreference validation to reconcile and never fails the create — the
-// authoritative ownership stamp has already landed. The removal is mirrored into
-// the in-memory dataset so the subsequent share create does not read a stale
-// inherited ID from the cached object.
-func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truenas.Dataset, datasetName string) {
+// scrubInheritedProtocolProperties removes only provably inherited backend
+// share-object IDs from protocols foreign to shareType. Local properties and all
+// current-protocol properties survive; the protocol-specific backreference
+// resolver repairs same-protocol stale IDs. It is idempotent and best-effort.
+func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) {
 	if ds == nil {
+		return
+	}
+	currentProtocol := map[string]struct{}{}
+	switch shareType {
+	case ShareTypeNFS:
+		currentProtocol[PropNFSShareID] = struct{}{}
+	case ShareTypeISCSI:
+		currentProtocol[PropISCSITargetID] = struct{}{}
+		currentProtocol[PropISCSIExtentID] = struct{}{}
+		currentProtocol[PropISCSITargetExtentID] = struct{}{}
+		currentProtocol[PropISCSIInitiatorID] = struct{}{}
+	case ShareTypeNVMeoF:
+		currentProtocol[PropNVMeoFSubsystemID] = struct{}{}
+		currentProtocol[PropNVMeoFNamespaceID] = struct{}{}
+		currentProtocol[PropNVMeoFPortSubsysID] = struct{}{}
+	default:
 		return
 	}
 	present := make([]string, 0, len(inheritedProtocolPropertyKeys))
 	for _, key := range inheritedProtocolPropertyKeys {
-		if _, ok := ds.UserProperties[key]; ok {
-			present = append(present, key)
+		property, ok := ds.UserProperties[key]
+		if !ok {
+			continue
 		}
+		if _, ownProtocol := currentProtocol[key]; ownProtocol {
+			continue
+		}
+		source := strings.TrimSpace(property.Source)
+		if source == "" || isLocalUserPropertySource(source) {
+			continue
+		}
+		present = append(present, key)
 	}
 	if len(present) == 0 {
 		return
