@@ -73,6 +73,12 @@ func (d *Driver) detectTombstonesByScanFallback(
 				provenanceSafe = false
 			} else if !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()) {
 				provenanceSafe = false
+			} else if sourceDatasetMasksTombstoneInheritance(sourceDataset) {
+				// The source dataset itself carries csi_snapshot_name, so on TrueNAS
+				// 26.0 the snapshot's retained identity may be INHERITED from the
+				// dataset rather than written at CreateSnapshot — not proof of a
+				// driver tombstone. Route to manual recovery; never reap.
+				provenanceSafe = false
 			}
 		}
 		if !provenanceSafe {
@@ -95,6 +101,16 @@ func (d *Driver) detectTombstonesByScanFallback(
 // written atomically at CreateSnapshot time. The suffix nonce is parsed and fed
 // back through the production rename algorithm; accepting a mere name prefix
 // would make manual lookalikes destructive.
+//
+// This proves identity from the snapshot's own retained property VALUES. On
+// TrueNAS 26.0 the snapshot resource path returns user_properties as a flat,
+// SOURCELESS string map, so a source=="local" requirement here would break every
+// real reap and must NOT be imposed; the dataset-side inheritance guard
+// (sourceDatasetMasksTombstoneInheritance) covers the sourceless-26.0 vector
+// where these values could be inherited from the source dataset rather than
+// written on the snapshot. Where the snapshot's UserProperty.Source IS populated
+// (legacy path), an inherited/foreign source proves the value was not written on
+// this snapshot at CreateSnapshot, so reject it.
 func snapshotMatchesRetainedTombstoneIdentity(snap *truenas.Snapshot, instanceID string) bool {
 	if snap == nil || instanceID == "" {
 		return false
@@ -103,6 +119,12 @@ func snapshotMatchesRetainedTombstoneIdentity(snap *truenas.Snapshot, instanceID
 	instance, hasInstance := snap.UserProperties[PropDriverInstanceID]
 	if !hasOriginal || original.Value == "" || original.Value == "-" ||
 		!hasInstance || instance.Value != instanceID {
+		return false
+	}
+	if original.Source != "" && !isLocalUserPropertySource(original.Source) {
+		return false
+	}
+	if instance.Source != "" && !isLocalUserPropertySource(instance.Source) {
 		return false
 	}
 	currentName := snapshotShortName(snap)
@@ -115,6 +137,20 @@ func snapshotMatchesRetainedTombstoneIdentity(snap *truenas.Snapshot, instanceID
 		return false
 	}
 	return currentName == snapshotTombstoneName(snap.Dataset, sanitizeVolumeID(original.Value), nonce)
+}
+
+// sourceDatasetMasksTombstoneInheritance reports whether the tombstone's source
+// dataset itself carries the csi_snapshot_name identity property. The driver
+// never stamps csi_snapshot_name on a dataset — it is a snapshot-level property
+// written at CreateSnapshot — so its presence on the source dataset means a
+// snapshot under it can INHERIT that identity. On TrueNAS 26.0, where the
+// snapshot resource path returns sourceless user_properties, an inherited
+// csi_snapshot_name is indistinguishable by value from a driver-written one, so
+// retained snapshot identity is no longer proof of a driver tombstone. Callers
+// on the identity-only (scan-fallback) reap path must route such candidates to
+// manual recovery instead of reaping them.
+func sourceDatasetMasksTombstoneInheritance(sourceDataset *truenas.Dataset) bool {
+	return datasetHasUserProperty(sourceDataset, PropCSISnapshotName)
 }
 
 // snapshotIsLiveCSIObjectWithTombstoneShapedName is the identity belt on top of
@@ -245,6 +281,15 @@ func (d *Driver) reapTombstoneSnapshot(
 	}
 	if !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()) {
 		return false, "tombstone source dataset does not carry this driver instance's ownership stamp"
+	}
+	if tombstone.tombstoneScanFallback && sourceDatasetMasksTombstoneInheritance(sourceDataset) {
+		// Scan-fallback provenance rests on the snapshot's retained identity values
+		// alone. On TrueNAS 26.0 (sourceless snapshot properties) a source dataset
+		// that carries csi_snapshot_name could have that identity inherited rather
+		// than driver-written, so refuse the reap. The ledger-proven path is
+		// unaffected: a matching ledger entry with creation-time identity is
+		// authoritative provenance that inheritance cannot forge.
+		return false, "tombstone source dataset carries csi_snapshot_name; retained identity may be inherited, not driver-written"
 	}
 	createdAt, _, eligible := reconcileAge(time.Now(), snapshot.GetCreationTime(), minOrphanAge)
 	if !eligible || !createdAt.Equal(tombstone.CreatedAt) {
