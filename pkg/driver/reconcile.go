@@ -558,6 +558,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		minOrphanAge,
 		d.config.Reconcile.Delete.MaxPerRun,
 		snapshotDeleteBlockReason,
+		parentDataset,
 	); err != nil {
 		RecordReconcileFailure("delete")
 		return report, err
@@ -1410,6 +1411,7 @@ func (d *Driver) deleteDetectedOrphans(
 	minOrphanAge time.Duration,
 	maxPerRun int,
 	snapshotDeleteBlockReason string,
+	parent *truenas.Dataset,
 ) error {
 	deletedCount := 0
 	deletionCapReached := func(kind, id string) bool {
@@ -1490,15 +1492,17 @@ func (d *Driver) deleteDetectedOrphans(
 		deletedCount++
 	}
 
+	retire := &tombstoneRetirementBatch{}
 	for i := range report.TombstoneSnapshots {
 		tombstone := &report.TombstoneSnapshots[i]
 		if err := ctx.Err(); err != nil {
+			retire.flush(ctx, d, parent)
 			return err
 		}
 		if deletionCapReached("tombstone-snapshot", tombstone.ID) {
 			continue
 		}
-		reaped, reason := d.reapTombstoneSnapshot(ctx, *tombstone, minOrphanAge)
+		reaped, reason := d.reapTombstoneSnapshot(ctx, *tombstone, minOrphanAge, retire)
 		if !reaped {
 			d.recordReconcileSkip(report, "tombstone-snapshot", tombstone.ID, reason)
 			continue
@@ -1506,6 +1510,10 @@ func (d *Driver) deleteDetectedOrphans(
 		report.DeletedTombstones = append(report.DeletedTombstones, tombstone.ID)
 		deletedCount++
 	}
+	// Batch-remove the retired tombstone ledger entries now (one size-bounded
+	// remove per location) instead of per-reap. Best-effort; the orphan-ledger
+	// sweep retires anything this fails to remove.
+	retire.flush(ctx, d, parent)
 
 	// Spent-restore deletion is not gated on the global detached flag (a
 	// detached-opt-in StorageClass must be reapable even when the global default
@@ -1664,12 +1672,13 @@ func snapshotIsLiveCSIObjectWithTombstoneShapedName(snap *truenas.Snapshot) bool
 //   - unchanged creation identity and satisfied age gate.
 //
 // A snapshot that still has clones is a benign skip, not a failure. After a
-// successful reap the ledger entry is removed (best-effort; the sweep retires
-// leftovers).
+// successful reap the ledger entry is retired into the pass-level batch (flushed
+// at pass end; best-effort — the sweep retires leftovers).
 func (d *Driver) reapTombstoneSnapshot(
 	ctx context.Context,
 	tombstone ReconcileObject,
 	minOrphanAge time.Duration,
+	retire *tombstoneRetirementBatch,
 ) (reaped bool, reason string) {
 	if tombstone.SourceVolumeID == "" {
 		return false, "tombstone snapshot has no resolvable source volume"
@@ -1685,7 +1694,7 @@ func (d *Driver) reapTombstoneSnapshot(
 		if truenas.IsNotFoundError(err) {
 			// Already gone (ZFS reclaimed it, or a peer reaped it): the operation's
 			// goal is met, so treat it as reaped for reporting and retire the entry.
-			d.removeTombstoneLedgerEntry(ctx, tombstone.BackendID)
+			retire.add(tombstone.BackendID)
 			return true, ""
 		}
 		return false, fmt.Sprintf("tombstone snapshot revalidation failed: %v", err)
@@ -1743,7 +1752,7 @@ func (d *Driver) reapTombstoneSnapshot(
 	}
 	if err := d.truenasClient.SnapshotDelete(ctx, snapshot.ID, false, false); err != nil {
 		if truenas.IsNotFoundError(err) {
-			d.removeTombstoneLedgerEntry(ctx, snapshot.ID)
+			retire.add(snapshot.ID)
 			return true, ""
 		}
 		var cloneErr *truenas.ErrSnapshotHasClones
@@ -1752,9 +1761,71 @@ func (d *Driver) reapTombstoneSnapshot(
 		}
 		return false, fmt.Sprintf("failed to reap tombstone snapshot: %v", err)
 	}
-	d.removeTombstoneLedgerEntry(ctx, snapshot.ID)
+	retire.add(snapshot.ID)
 	klog.Infof("Orphan reconcile: reaped released deferred-delete tombstone %s", snapshot.ID)
 	return true, ""
+}
+
+// tombstoneRetirementBatch accumulates the full snapshot IDs whose tombstone
+// ledger entries a reconcile pass retired, so their bookkeeping property removals
+// are batched into one size-bounded user_properties_update remove per location at
+// pass end instead of one removeBookkeepingProperties (parent + child = 2 RTTs)
+// per reaped tombstone (~384/night). The snapshot destroys themselves still happen
+// per-reap, in order, under the source-volume lock; only the post-destroy property
+// removal is deferred. A failed batch removal leaves its entries for the
+// orphan-ledger sweep to retire later — the same failure mode as today.
+type tombstoneRetirementBatch struct {
+	snapshotIDs []string
+}
+
+func (b *tombstoneRetirementBatch) add(fullSnapshotID string) {
+	if b == nil {
+		return
+	}
+	b.snapshotIDs = append(b.snapshotIDs, fullSnapshotID)
+}
+
+// flush removes the accumulated ledger entries. parent is the pass's parent
+// dataset read (may be nil if that read failed): when non-nil, the parent removal
+// is restricted to the retired keys the parent actually carries and skipped
+// entirely when it carries none (the fully-migrated steady state where the parent
+// is drained), saving one wasted RTT per retirement; when nil, all keys are
+// removed from the parent conservatively (the historical behavior). Removals are
+// chunked under the TrueNAS 26.0 64 kB WebSocket inbound limit and are
+// best-effort per chunk.
+func (b *tombstoneRetirementBatch) flush(ctx context.Context, d *Driver, parent *truenas.Dataset) {
+	if b == nil || len(b.snapshotIDs) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(b.snapshotIDs))
+	for _, snapshotID := range b.snapshotIDs {
+		keys = append(keys, tombstoneLedgerKey(snapshotID))
+	}
+	// Parent removal first (preserving the historical parent-before-child order),
+	// restricted to keys the pass's parent read carried when that read succeeded.
+	parentKeys := keys
+	if parent != nil {
+		parentKeys = nil
+		for _, key := range keys {
+			if property, ok := parent.UserProperties[key]; ok && isLocalUserPropertySource(property.Source) {
+				parentKeys = append(parentKeys, key)
+			}
+		}
+	}
+	if len(parentKeys) > 0 {
+		for _, chunk := range chunkKeyList(parentKeys, bookkeepingMigrationBatchBudget) {
+			if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.parentDatasetName(), chunk); err != nil {
+				klog.Warningf("Failed to batch-remove %d tombstone ledger entries from parent (sweep will retire them): %v", len(chunk), err)
+			}
+		}
+	}
+	if d.bookkeepingEnabled() {
+		for _, chunk := range chunkKeyList(keys, bookkeepingMigrationBatchBudget) {
+			if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.bookkeepingDatasetName(), chunk); err != nil && !truenas.IsNotFoundError(err) {
+				klog.Warningf("Failed to batch-remove %d tombstone ledger entries from bookkeeping dataset (sweep will retire them): %v", len(chunk), err)
+			}
+		}
+	}
 }
 
 // sweepStaleInflightMarkers retires in-flight creation markers that can no

@@ -88,7 +88,7 @@ func TestReconcileAdoptsLegacyStampAndReapsRefusedTombstone(t *testing.T) {
 	// tombstone with the exact ownership-stamp reason (and would refuse it
 	// forever, leaking the ledger entry and snapshot).
 	tombstone := tombstoneReconcileObject(t, client, tombstoneID)
-	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstone, time.Hour)
+	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstone, time.Hour, &tombstoneRetirementBatch{})
 	assert.False(t, reaped)
 	assert.Equal(t, "tombstone source dataset does not carry this driver instance's ownership stamp", reason)
 	_, err := client.SnapshotGet(ctx, tombstoneID)

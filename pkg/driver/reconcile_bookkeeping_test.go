@@ -302,8 +302,10 @@ func TestReapTombstoneWithChildOnlyLedgerEntry(t *testing.T) {
 		"precondition: the fresh entry lives on the child only")
 
 	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
-	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour)
+	retire := &tombstoneRetirementBatch{}
+	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour, retire)
 	assert.True(t, reaped, "child-only provenance must authorize the reap, got refusal: %s", reason)
+	retire.flush(ctx, d, nil)
 	_, err = client.SnapshotGet(ctx, tombstoneID)
 	assert.True(t, truenas.IsNotFoundError(err), "the released tombstone is destroyed")
 	child, err = client.DatasetGet(ctx, d.bookkeepingDatasetName())
@@ -336,8 +338,10 @@ func TestReapSurvivesCleanupParentMigration(t *testing.T) {
 		"cleanupParent must remove the confirmed-copied parent entry")
 
 	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
-	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour)
+	retire := &tombstoneRetirementBatch{}
+	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour, retire)
 	assert.True(t, reaped, "the migrated child entry must still authorize the reap, got refusal: %s", reason)
+	retire.flush(ctx, d, parent)
 	_, err = client.SnapshotGet(ctx, tombstoneID)
 	assert.True(t, truenas.IsNotFoundError(err), "the released tombstone is destroyed after the parent cleanup")
 }
@@ -388,4 +392,61 @@ func TestBookkeepingExistenceFlagShortCircuitsAndReArms(t *testing.T) {
 	d.bookkeepingExists.Store(true)
 	d.noteBookkeepingWriteFailure(d.parentDatasetName(), fmt.Errorf("parent write failure"))
 	assert.True(t, d.bookkeepingExists.Load(), "a parent-targeted failure must not clear the bookkeeping flag")
+}
+
+// TestTombstoneRetirementBatchFlushProves the P5 batched post-destroy ledger
+// removal: retired entries are removed in batched, size-bounded calls at pass
+// end, and the parent removal is skipped entirely when the pass's parent read
+// carries none of the retired keys (the fully-migrated steady state).
+func TestTombstoneRetirementBatchFlush(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	d := &Driver{
+		name:          "org.scale.csi.test",
+		config:        &Config{DriverName: "org.scale.csi.nfs", ZFS: ZFSConfig{DatasetParentName: "pool/parent"}},
+		truenasClient: client,
+	}
+	enableBookkeeping(d)
+	require.NoError(t, d.ensureBookkeepingDataset(ctx))
+
+	// Seed the child bookkeeping dataset with three ledger entries.
+	ids := []string{"pool/parent/vol@snap-a", "pool/parent/vol@snap-b", "pool/parent/vol@snap-c"}
+	for _, id := range ids {
+		require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+			Version: tombstoneLedgerVersion, Snapshot: id, Dataset: "pool/parent/vol", CreatedAt: 1,
+		}))
+	}
+
+	// Flush with a parent read that carries NONE of the retired keys: the parent
+	// removal is skipped (zero parent calls), the child removal happens once.
+	batch := &tombstoneRetirementBatch{}
+	for _, id := range ids {
+		batch.add(id)
+	}
+	parent := &truenas.Dataset{Name: "pool/parent", UserProperties: map[string]truenas.UserProperty{}}
+	client.resetCalls()
+	batch.flush(ctx, d, parent)
+	_, methods := client.callSnapshot()
+	assert.Equal(t, 1, methods["DatasetRemoveUserProperties"], "one batched child removal, parent skipped when it carries no retired keys")
+	child, err := client.DatasetGet(ctx, d.bookkeepingDatasetName())
+	require.NoError(t, err)
+	assert.Empty(t, tombstoneLedgerFromDataset(child), "all retired child entries are removed")
+
+	// A nil parent (read failed) falls back to the conservative parent+child
+	// removal: two calls.
+	for _, id := range ids {
+		require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+			Version: tombstoneLedgerVersion, Snapshot: id, Dataset: "pool/parent/vol", CreatedAt: 1,
+		}))
+	}
+	batch2 := &tombstoneRetirementBatch{}
+	for _, id := range ids {
+		batch2.add(id)
+	}
+	client.resetCalls()
+	batch2.flush(ctx, d, nil)
+	_, methods = client.callSnapshot()
+	assert.Equal(t, 2, methods["DatasetRemoveUserProperties"], "nil parent falls back to parent+child removal")
 }

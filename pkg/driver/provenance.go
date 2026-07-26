@@ -863,3 +863,33 @@ func chunkUserProperties(properties map[string]string, budget int) []map[string]
 	}
 	return batches
 }
+
+// chunkKeyList splits a list of property keys into deterministic batches whose
+// approximate encoded size stays within budget, mirroring chunkUserProperties for
+// the removal path (a user_properties_update remove carries keys but no values).
+// The same 64 kB WebSocket inbound limit applies, so batched bookkeeping removals
+// use this to stay well under it.
+func chunkKeyList(keys []string, budget int) [][]string {
+	if len(keys) == 0 {
+		return nil
+	}
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
+	var batches [][]string
+	var current []string
+	size := 0
+	for _, key := range sorted {
+		entrySize := len(key) + 64
+		if len(current) > 0 && size+entrySize > budget {
+			batches = append(batches, current)
+			current = nil
+			size = 0
+		}
+		current = append(current, key)
+		size += entrySize
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	return batches
+}
