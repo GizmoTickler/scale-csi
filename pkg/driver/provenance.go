@@ -445,7 +445,7 @@ func (d *Driver) completeResumedCloneRemnant(
 		if err != nil {
 			return nil, err
 		}
-		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
+		tempSnapshotName := fmt.Sprintf("clone-source-%s", sanitizeVolumeID(path.Base(datasetName)))
 		properties[PropVolumeContentSourceType] = "volume"
 		properties[PropVolumeContentSourceID] = volume.GetVolumeId()
 		properties[PropVolumeOriginSnapshot] = sourceDataset + "@" + tempSnapshotName
