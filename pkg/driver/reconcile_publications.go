@@ -205,7 +205,7 @@ func (d *Driver) revokeStalePublicationRecord(
 	detected publicationRecord,
 	recordCount int,
 ) (bool, error) {
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return false, fmt.Errorf("volume operation is in progress")
 	}

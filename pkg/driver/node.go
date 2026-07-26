@@ -1316,6 +1316,14 @@ func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capa
 	}
 }
 
+// volumeLockKey is the controller-plane per-volume operation-lock key. It is
+// deliberately in a different keyspace from nodeVolumeLockKey ("node:") so a
+// node-plane stage/unstage and a controller-plane create/delete/expand for the
+// same volume ID never contend on the same lock.
+func volumeLockKey(volumeID string) string {
+	return "volume:" + volumeID
+}
+
 func nodeVolumeLockKey(volumeID string) string {
 	return "node:" + volumeID
 }

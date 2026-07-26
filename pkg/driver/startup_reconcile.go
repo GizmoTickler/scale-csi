@@ -193,7 +193,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	lockKey := "volume:" + volume.volumeID
+	lockKey := volumeLockKey(volume.volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return fmt.Errorf("startup reconcile volume %s: live CSI operation is in progress", volume.volumeID)
 	}

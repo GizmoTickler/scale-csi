@@ -112,7 +112,7 @@ func (d *Driver) adoptLegacyOwnershipStamps(ctx context.Context, datasets []*tru
 // returns adopted=false (no error) when the dataset is already stamped — a
 // write-free no-op.
 func (d *Driver) writeAndVerifyAdoptionStamp(ctx context.Context, datasetName, volumeID string) (bool, error) {
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return false, fmt.Errorf("volume operation in progress for %s", volumeID)
 	}

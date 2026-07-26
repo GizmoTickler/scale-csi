@@ -198,7 +198,7 @@ func (d *Driver) reapTombstoneSnapshot(
 	if tombstone.SourceVolumeID == "" {
 		return false, "tombstone snapshot has no resolvable source volume"
 	}
-	lockKey := "volume:" + tombstone.SourceVolumeID
+	lockKey := volumeLockKey(tombstone.SourceVolumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return false, "source volume operation is in progress"
 	}

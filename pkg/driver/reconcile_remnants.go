@@ -201,7 +201,7 @@ func (d *Driver) destroyRemnantOrphan(ctx context.Context, remnant ReconcileObje
 	// original StartedAt (aged past the gate) and nonce, defeating the age and
 	// nonce guards; the per-volume lock is the discriminator the sibling
 	// reconcile delete paths rely on.
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return false, "volume operation is in progress"
 	}

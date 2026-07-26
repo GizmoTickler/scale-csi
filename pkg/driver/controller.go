@@ -346,7 +346,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	// Lock on the sanitized volume ID so all operations use the same key space.
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -852,7 +852,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	klog.Infof("DeleteVolume: volumeID=%s", volumeID)
 
 	// Lock on volume ID
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -1184,7 +1184,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if d.runNode && identity.Name != d.nodeID {
 		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
 	}
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -1231,7 +1231,7 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -1406,11 +1406,11 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	// Always acquire the source-volume lock before the snapshot lock. This
 	// serializes snapshot creation with DeleteVolume and gives all creators a
 	// fixed lock order.
-	volumeLockKey := "volume:" + sourceVolumeID
-	if !d.acquireOperationLock(volumeLockKey) {
+	sourceVolumeLockKey := volumeLockKey(sourceVolumeID)
+	if !d.acquireOperationLock(sourceVolumeLockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 	}
-	defer d.releaseOperationLock(volumeLockKey)
+	defer d.releaseOperationLock(sourceVolumeLockKey)
 
 	snapshotID := d.sanitizeVolumeID(name)
 	if _, err := d.datasetForID(snapshotID); err != nil {
@@ -1537,11 +1537,11 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 	parentPrefix := strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/") + "/"
 	if strings.HasPrefix(snap.Dataset, parentPrefix) {
 		sourceVolumeID := path.Base(snap.Dataset)
-		volumeLockKey := "volume:" + sourceVolumeID
-		if !d.acquireOperationLock(volumeLockKey) {
+		sourceVolumeLockKey := volumeLockKey(sourceVolumeID)
+		if !d.acquireOperationLock(sourceVolumeLockKey) {
 			return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 		}
-		defer d.releaseOperationLock(volumeLockKey)
+		defer d.releaseOperationLock(sourceVolumeLockKey)
 	}
 	snapshotLockKey := "snapshot:" + snapshotID
 	if !d.acquireOperationLock(snapshotLockKey) {
@@ -1674,7 +1674,7 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	klog.Infof("ControllerExpandVolume: volumeID=%s, capacity=%d", volumeID, capacityBytes)
 
 	// Lock on volume ID to prevent concurrent expansions of same volume
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
