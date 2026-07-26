@@ -192,12 +192,12 @@ first-class field; it is only emitted when set. See the
 
 ## Availability and topology
 
-With `fencing.mode=off`, `controller.replicas>1` enables leader election on the
-provisioner, attacher, resizer, and snapshotter. The chart supplies preferred
-hostname anti-affinity and, by default, a PDB with `maxUnavailable: 1`.
-`additive` and `strict` fencing require exactly one controller because their
-background reconcilers are singleton writers; chart schema and template guards
-enforce that invariant.
+Leader election is enabled on the provisioner, attacher, resizer, and
+snapshotter unconditionally, even at the default single replica.
+`controller.replicas>1` additionally supplies preferred hostname anti-affinity
+and, by default, a PDB with `maxUnavailable: 1`. `additive` and `strict`
+fencing require exactly one controller because their background reconcilers are
+singleton writers; chart schema and template guards enforce that invariant.
 
 Topology is auto-detected per node from the standard
 `topology.kubernetes.io/zone` and `topology.kubernetes.io/region` labels. There

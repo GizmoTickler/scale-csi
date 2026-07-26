@@ -1,7 +1,7 @@
 # Production deployment
 
 This guide describes the current scale-csi repository and bundled Helm chart,
-based on the v1.2.23 release line. Review the [deployment guide](deployment.md)
+based on the v1.3.0 release line. Review the [deployment guide](deployment.md)
 for installation examples and the chart's
 [values reference](../charts/scale-csi/README.md) for every setting.
 
@@ -17,13 +17,18 @@ operations that moved). TrueNAS 25.04 is the documented floor; the 24.x
 caches the 26.0 resource API separately. NVMe-oF is different: the driver
 rejects it before TrueNAS 25.10.
 
-The controller plane has been validated live against a real TrueNAS 26.0
-system: the official csi-sanity controller suites pass 52/52 for NFS and 52/52
-for iSCSI against real datasets, zvols, shares, targets, and extents (node
-specs excluded — they require real initiator hosts). That validation is what
-surfaced the 26.0 middleware behaviors documented under Known limitations.
-Still validate your exact TrueNAS patch release and protocol in a staging
-cluster before production, and node-path behavior end to end.
+The repository's automated conformance is the `TestCSISanity` suite, which runs
+the official kubernetes-csi `csi-sanity` specs against the driver over a real
+gRPC socket with a `MockClient` backend and PATH-faked node commands: the NFS
+full surface (controller plus node specs) and the iSCSI controller surface (its
+Node Service specs are skipped because they need a real block device and root
+privileges). NVMe-oF has unit and controller-level tests but no protocol-specific
+sanity suite. Tests named `e2e` in this repository also use `MockClient`; they
+exercise driver logic, not a live appliance. Fake-command conformance is not a
+substitute for validating your exact TrueNAS patch release, protocol, and the
+node data path end to end on a real initiator host in a staging cluster before
+production. The 26.0 middleware behaviors documented under Known limitations were
+surfaced against a real TrueNAS 26.0 appliance.
 
 Use a user-linked API key over HTTPS. API keys inherit the roles of their user.
 On role-based TrueNAS releases, the built-in `SHARING_ADMIN` plus
@@ -34,6 +39,16 @@ read/create/update/clone/rename/delete, service read/reload, and `system.info`
 operations. Role names and method assignments differ between TrueNAS API
 generations, so confirm a custom privilege against the API documentation served
 by the target appliance. See the TrueNAS [role reference][truenas-rbac].
+
+> **Exclude the CSI parent from periodic-snapshot and replication tasks.** The
+> configured `zfs.parentDataset` subtree is exclusive driver territory. A
+> TrueNAS periodic-snapshot task (or a replication task's snapshots) that covers
+> the CSI parent will create snapshots the driver did not make. Those snapshots
+> are *foreign* to the driver: by default `DeleteVolume` refuses to remove a
+> dataset that carries them and returns `FailedPrecondition`, so PVC deletion
+> stalls until the snapshots are gone or the task excludes the parent. Scope any
+> such task to datasets *outside* `zfs.parentDataset`, or accept destructive
+> cleanup by setting `zfs.destroyForeignSnapshotsOnDelete: true`.
 
 ### Network and nodes
 
@@ -54,11 +69,14 @@ not install host packages or load modules.
 
 ## Availability and outage behavior
 
-The default is `controller.replicas: 1`. With `fencing.mode=off`, values greater
-than one enable leader election on the provisioner, attacher, resizer, and
-snapshotter; the chart also supplies preferred hostname anti-affinity and, by
-default, a PDB with `maxUnavailable: 1`. This is controller-availability
-groundwork, not a claim that the driver has a distributed operation lock.
+The default is `controller.replicas: 1`. Leader election is enabled on every
+capable controller sidecar (provisioner, attacher, resizer, snapshotter)
+unconditionally — even at a single replica — so a `fencing.mode=off`
+RollingUpdate that transiently runs two controller pods never has both acting as
+the active provisioner/attacher. Replica counts greater than one additionally
+add preferred hostname anti-affinity and, by default, a PDB with
+`maxUnavailable: 1`. This is controller-availability groundwork, not a claim
+that the driver has a distributed operation lock.
 Additive and strict fencing require exactly one controller because their
 background reconcilers are singleton writers; schema and template guards reject
 any other replica count. The controller is restart-recovered: downtime pauses
@@ -256,6 +274,13 @@ failures exceed 10% for ten minutes, or CSI operation errors exceed 0.01
 operations/second for ten minutes.
 Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
+> **Benign `already exists` on the NVMe-oF path.** The driver treats an
+> `AlreadyExists` response to `nvmet.host_subsys.create` as success (the
+> host/subsystem association it wanted already exists). A small, non-growing
+> count of failed `nvmet.host_subsys.create` samples in
+> `scale_csi_truenas_requests_total{status="error"}` is therefore expected by
+> design during NVMe-oF provisioning and is not an operational fault.
+
 ## Upgrades
 
 1. Render and validate the release before applying it:
@@ -306,10 +331,10 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
    credentials. Treat this as an explicit security boundary when upgrading
    from manifests that injected the key into every pod.
 
-7. For the v1.2.23 fencing migration, keep `fencing.mode=off`, upgrade the node
+7. For the fencing migration, keep `fencing.mode=off`, upgrade the node
    DaemonSet/image first, and wait for every CSINode to re-register its versioned
    transport identity before enabling `additive`. Enable `strict` only after
-   `scale_csi_fencing_deferred_total` remains at zero. Roll the v1.2.23
+   `scale_csi_fencing_deferred_total` remains at zero. Roll the
    controller image and its ConfigMap together; applying new fencing keys to an
    older strict-YAML binary can make that older pod fail configuration parsing.
    The chart uses a shared image value, so patch and await the node DaemonSet
@@ -332,15 +357,12 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 - Foreign snapshots block `DeleteVolume` by default. Removing them or excluding
   the CSI parent from external snapshot tasks is required unless destructive
   cleanup is explicitly enabled with `zfs.destroyForeignSnapshotsOnDelete`.
-- Fake-command conformance does not cover the iSCSI or NVMe-oF node paths.
-  iSCSI runs the controller portion of `csi-sanity`; NVMe-oF has unit/controller
-  tests but no protocol-specific sanity suite. Neither substitutes for node tests
-  with real block devices and a real target.
-- Live validation against a real TrueNAS 26.0 appliance now covers the full
-  node plane on a real initiator host: csi-sanity including Node Service specs
-  passes for NFS (75/75), iSCSI (real iscsiadm logins, device staging, mkfs,
-  mounts), and NVMe-oF (real fabric connects). Tests named `e2e` in this
-  repository use `MockClient`.
+- Automated conformance does not cover the iSCSI or NVMe-oF node paths. The
+  `csi-sanity` suite runs the NFS full surface and the iSCSI *controller* surface
+  against a `MockClient` backend with PATH-faked node commands; the iSCSI Node
+  Service specs are skipped and NVMe-oF has no protocol-specific sanity suite.
+  None of this substitutes for node tests with real block devices and a real
+  target. Validate the node data path on a real initiator host in staging.
 - With `fencing.mode=off`, NVMe-oF host-NQN allowlisting is configured
   statically through `nvmeof.subsystemHosts`. Additive and strict modes consume
   the host NQN registered by each node plugin and enforce per-volume host
@@ -359,7 +381,23 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   configured parent from the CSI driver's perspective.
 - Deleting a snapshot that still has clones renames it to an internal tombstone
   and requests deferred ZFS destruction. The snapshot disappears from CSI, but
-  its referenced space remains charged until the last clone releases it.
+  its referenced space remains charged until the last clone releases it. The
+  reaper acts on tombstones through a durable ledger. Tombstones whose provenance
+  no belt can prove (no ledger entry, no adoptable ownership stamp) are never
+  destroyed automatically; they are surfaced as `manualRecoveryTombstones` in the
+  reconcile summary for operator inspection. The
+  `reconcile.tombstoneReaper.scanFallback.enabled` flag (default **off**) adds a
+  bounded provenance-gated scan for tombstones stranded by lost ledger entries —
+  it reaps only snapshots proven by a ledger entry *or* by tombstone shape plus a
+  source-dataset ownership stamp plus the age gate, and it never widens what
+  counts as this driver's own object.
+- The durable bookkeeping (tombstone ledger + in-flight markers) can be
+  relocated off the inheritable parent onto a `<parent>/.csi-bookkeeping` child
+  via `reconcile.bookkeeping.enabled`, so its user properties no longer inherit
+  into every descendant snapshot. This is a one-way migration: once entries live
+  on the child, do not disable the flag (see the concurrency contract's
+  downgrade caveat). Inbound volume/snapshot IDs equal to the `.csi-bookkeeping`
+  leaf are rejected with `InvalidArgument` before any TrueNAS access.
 - Restores use ZFS clones: a restored volume pins its source snapshot until the
   volume is deleted, with deferred destroy handling the snapshot lifecycle.
 - After upgrading a NAS from TrueNAS 25.x to 26.0, CSI snapshots created by
