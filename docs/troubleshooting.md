@@ -75,18 +75,18 @@ kubectl get events --field-selector involvedObject.name=<pvc-name>
 
 **For NFS:**
 - Verify NFS service is enabled on TrueNAS
-- Check that `nfs.shareHost` is correct and resolvable
+- Check that `nfs.server` is correct and resolvable (defaults to the TrueNAS host)
 - Verify `nfs.shareAllowedNetworks` includes your node IPs
 
 **For iSCSI:**
 - Verify iSCSI service is enabled on TrueNAS
 - Check that portal groups and initiator groups are configured
-- Verify `iscsi.targetPortal` is correct
+- Verify `iscsi.portal` is correct (defaults to the TrueNAS host)
 
 **For NVMe-oF:**
 - Verify NVMe-oF service is enabled on TrueNAS
-- Check that `nvmeof.transportAddress` is correct
-- Verify subsystem hosts configuration
+- Check that `nvmeof.address` is correct (defaults to the TrueNAS host)
+- Verify subsystem hosts configuration (`nvmeof.subsystemHosts`)
 
 ### Volume Mount Failures
 
@@ -302,10 +302,12 @@ kubectl rollout restart deployment -n scale-csi scale-csi-controller
 ### Clean Up Orphaned TrueNAS Resources
 
 The controller detects old CSI-managed backend resources automatically and
-exports `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`, and byte
-gauges. Use `scale_csi_reconcile_last_success_timestamp_seconds` to detect a
-stalled loop and `scale_csi_reconcile_failures_total{phase}` to isolate partial
-object failures. Detection is read-only and enabled by default:
+exports `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`,
+`scale_csi_remnant_volumes`, `scale_csi_tombstone_snapshots`,
+`scale_csi_spent_restore_snapshots`, and matching byte gauges. Use
+`scale_csi_reconcile_last_success_timestamp_seconds` to detect a stalled loop
+and `scale_csi_reconcile_failures_total{phase}` to isolate partial object
+failures. Detection is read-only and enabled by default:
 
 ```yaml
 reconcile:
@@ -320,6 +322,31 @@ Inspect the controller logs and metrics first. To opt into cleanup, set
 `reconcile.delete.enabled: true`; the chart then creates a scheduled run-once
 job. The job never issues a raw ZFS destroy. It calls the existing guarded CSI
 delete paths, which refuse resources with live clone or snapshot dependencies.
+Guarded deletions are capped per pass by `reconcile.delete.maxPerRun`
+(default 5), which is shared across orphan volumes, remnant volumes, and
+tombstone reaping.
+
+#### Tombstones that never drain
+
+A snapshot deleted while it still had dependent clones is renamed to an internal
+tombstone (`truenas-csi:tombstone_*`) and destroyed deferred once the last clone
+releases it. The reaper normally acts on tombstones through its durable ledger.
+If ledger entries were lost (for example a pre-v1.2.30 controller that never
+recorded them), the tombstone-shaped snapshots can strand. Two provenance belts
+recover them:
+
+- **Legacy stamp adoption** re-stamps `driver_instance_id` onto pre-v1.2.21
+  managed datasets that a live Bound PV references, which unblocks reaping of
+  their tombstones. This always-on step deletes nothing.
+- **Scan fallback** is opt-in and off by default. When a pass finds zero
+  ledger-proven tombstones, `reconcile.tombstoneReaper.scanFallback.enabled: true`
+  performs one bounded snapshot scan (limit 500, no recursion) and reaps only
+  tombstone-shaped snapshots whose provenance is proven by *either* a ledger
+  entry *or* (tombstone shape + source-dataset ownership stamp + age gate).
+
+Tombstones the reaper refuses because no belt can prove provenance are counted
+as `manualRecoveryTombstones` in the reconcile summary line — they require
+operator inspection and are never destroyed automatically.
 
 You can inspect the same managed-resource boundary on TrueNAS with:
 
