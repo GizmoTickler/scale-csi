@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -484,6 +485,81 @@ func (c *apiCallCountingClient) NVMeoFGetTransportAddresses(ctx context.Context,
 	return c.MockClient.NVMeoFGetTransportAddresses(ctx, transport)
 }
 
+func (c *apiCallCountingClient) ISCSIPortalList(ctx context.Context) ([]*truenas.ISCSIPortal, error) {
+	c.record("ISCSIPortalList")
+	return c.MockClient.ISCSIPortalList(ctx)
+}
+
+func (c *apiCallCountingClient) ISCSIInitiatorList(ctx context.Context) ([]*truenas.ISCSIInitiator, error) {
+	c.record("ISCSIInitiatorList")
+	return c.MockClient.ISCSIInitiatorList(ctx)
+}
+
+func (c *apiCallCountingClient) ISCSIInitiatorCreate(ctx context.Context, comment string) (*truenas.ISCSIInitiator, error) {
+	c.record("ISCSIInitiatorCreate")
+	return c.MockClient.ISCSIInitiatorCreate(ctx, comment)
+}
+
+func (c *apiCallCountingClient) ISCSIInitiatorCreateWithInitiators(ctx context.Context, initiators []string, comment string) (*truenas.ISCSIInitiator, error) {
+	c.record("ISCSIInitiatorCreateWithInitiators")
+	return c.MockClient.ISCSIInitiatorCreateWithInitiators(ctx, initiators, comment)
+}
+
+func (c *apiCallCountingClient) ISCSIInitiatorGet(ctx context.Context, id int) (*truenas.ISCSIInitiator, error) {
+	c.record("ISCSIInitiatorGet")
+	return c.MockClient.ISCSIInitiatorGet(ctx, id)
+}
+
+func (c *apiCallCountingClient) ISCSIInitiatorUpdate(ctx context.Context, id int, initiators []string, comment string) (*truenas.ISCSIInitiator, error) {
+	c.record("ISCSIInitiatorUpdate")
+	return c.MockClient.ISCSIInitiatorUpdate(ctx, id, initiators, comment)
+}
+
+func (c *apiCallCountingClient) ISCSIInitiatorDelete(ctx context.Context, id int) error {
+	c.record("ISCSIInitiatorDelete")
+	return c.MockClient.ISCSIInitiatorDelete(ctx, id)
+}
+
+func (c *apiCallCountingClient) ISCSITargetUpdate(ctx context.Context, id int, groups []truenas.ISCSITargetGroup) (*truenas.ISCSITarget, error) {
+	c.record("ISCSITargetUpdate")
+	return c.MockClient.ISCSITargetUpdate(ctx, id, groups)
+}
+
+func (c *apiCallCountingClient) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID int) (*truenas.NVMeoFHostSubsys, error) {
+	c.record("NVMeoFHostSubsysCreate")
+	return c.MockClient.NVMeoFHostSubsysCreate(ctx, hostID, subsysID)
+}
+
+func (c *apiCallCountingClient) NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*truenas.NVMeoFHostSubsys, error) {
+	c.record("NVMeoFHostSubsysFind")
+	return c.MockClient.NVMeoFHostSubsysFind(ctx, hostID, subsysID)
+}
+
+func (c *apiCallCountingClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFHostSubsys, error) {
+	c.record("NVMeoFHostSubsysListBySubsystem")
+	return c.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
+}
+
+func (c *apiCallCountingClient) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
+	c.record("NVMeoFHostSubsysDelete")
+	return c.MockClient.NVMeoFHostSubsysDelete(ctx, id)
+}
+
+func (c *apiCallCountingClient) NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*truenas.NVMeoFSubsystem, error) {
+	c.record("NVMeoFSubsystemUpdateAllowAnyHost")
+	return c.MockClient.NVMeoFSubsystemUpdateAllowAnyHost(ctx, id, allowAnyHost)
+}
+
+func (c *apiCallCountingClient) ReplicationJobList(ctx context.Context) ([]*truenas.ReplicationJob, error) {
+	c.record("ReplicationJobList")
+	return c.MockClient.ReplicationJobList(ctx)
+}
+
+func (c *apiCallCountingClient) ReplicationJobAbort(ctx context.Context, jobID int64, reason string) error {
+	c.record("ReplicationJobAbort")
+	return c.MockClient.ReplicationJobAbort(ctx, jobID, reason)
+}
+
 var _ truenas.ClientInterface = (*apiCallCountingClient)(nil)
 
 func newAPICallCountDriver(t *testing.T, client *apiCallCountingClient, protocol string) *Driver {
@@ -552,9 +628,16 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-nfs", "nfs"))
 			require.NoError(t, err)
 		}},
-		// The iSCSI baseline protects the no-lookup fresh path while retaining the
-		// target, extent, association, property, reload, and response queries.
-		{name: "CreateVolume fresh iSCSI", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Fourteen calls: existence DatasetGet; DatasetCreate (zvol); the
+		// createDataset ownership stamp via pool.dataset.update (DatasetUpdate) plus
+		// the one-time post-connect verifying re-read (DatasetGet); the automatic
+		// iSCSI target-group resolution (ISCSIPortalList + ISCSIInitiatorList — these
+		// two were invisible until the counting client wrapped the full surface);
+		// ISCSITargetCreate; ISCSIExtentCreate; ISCSITargetExtentCreate; the in-share
+		// resource-ID stamp (DatasetSetUserProperties); the debounced ServiceReload;
+		// getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and the final
+		// managed/ownership/provision/name stamp (DatasetSetUserProperties).
+		{name: "CreateVolume fresh iSCSI", want: 14, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
 		}},
@@ -688,4 +771,222 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			assertAPICallCount(t, tc.name, client, tc.want)
 		})
 	}
+}
+
+// newFencedAPICallCountDriver builds a Driver for the publish/unpublish golden
+// counts. Unlike newAPICallCountDriver it configures a fencing mode and every
+// protocol's backend settings (plus the NVMe-oF host-ID cache) so the same
+// builder serves the NFS off/additive and NVMe-oF strict cases.
+func newFencedAPICallCountDriver(t *testing.T, client *apiCallCountingClient, protocol string, mode FencingMode) *Driver {
+	t.Helper()
+	d := &Driver{
+		name: "org.scale.csi.test",
+		config: &Config{
+			DriverName: "org.scale.csi." + protocol,
+			Fencing:    FencingConfig{Mode: mode},
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DatasetEnableQuotas: true, ZvolReadyTimeout: 1},
+			NFS:        NFSConfig{ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"}},
+			ISCSI:      ISCSIConfig{TargetPortal: "192.0.2.10:3260", ExtentBlocksize: 512, ExtentRpm: "SSD"},
+			NVMeoF: NVMeoFConfig{
+				Transport:          "TCP",
+				TransportAddress:   "192.0.2.20",
+				TransportServiceID: 4420,
+			},
+		},
+		truenasClient:     client,
+		nvmeResolvedHosts: make(map[string]int),
+	}
+	d.serviceReloadDebouncer = NewServiceReloadDebouncer(0, func(ctx context.Context, service string) error {
+		return client.ServiceReload(ctx, service)
+	})
+	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	return d
+}
+
+func nfsPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest {
+	return &csi.ControllerPublishVolumeRequest{
+		VolumeId: volumeID,
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "nfs"},
+	}
+}
+
+func nvmeoFPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest {
+	return &csi.ControllerPublishVolumeRequest{
+		VolumeId: volumeID,
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "nvmeof"},
+	}
+}
+
+// TestControllerPublishUnpublishGoldenAPICallCounts pins the round-trip cost of
+// the publish/unpublish path (the P1 optimization target). Each case documents
+// every driver-to-TrueNAS call so a regression that re-introduces a duplicate
+// resolution or a wasted write fails with an explicit per-method delta.
+func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
+	ctx := context.Background()
+
+	// (a) fencing OFF + NFS — the records-only floor. Backend allowlist
+	// enforcement is disabled, so the publish maintains ONLY the durable
+	// publication record and the unpublish clears it; no share mutation occurs.
+	t.Run("off NFS publish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "nfs", FencingModeOff)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("off-nfs", "nfs"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.31")}})
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, nfsPublishRequest("off-nfs", nodeA))
+		require.NoError(t, err)
+		// Three calls:
+		// 1. DatasetGet                      — ControllerPublishVolume volume read.
+		// 2. NFSShareGet                     — ensureShareExists verifies the stored
+		//                                      share ID's export-path backreference.
+		// 3. DatasetSetUserProperties        — storePublicationRecord writes the
+		//                                      durable publication record (off mode
+		//                                      skips validateBackend/applyBackendFence
+		//                                      entirely, so this is the floor).
+		assertAPICallCount(t, "off NFS publish", client, 3)
+	})
+	t.Run("off NFS unpublish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "nfs", FencingModeOff)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("off-nfs-unpub", "nfs"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.31")}})
+		require.NoError(t, err)
+		_, err = d.ControllerPublishVolume(ctx, nfsPublishRequest("off-nfs-unpub", nodeA))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-nfs-unpub", NodeId: nodeA})
+		require.NoError(t, err)
+		// Three calls:
+		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
+		// 2. DatasetSetUserProperties        — flip the record to "unpublishing"
+		//                                      BEFORE access is removed (crash-safe
+		//                                      tombstone; a restart can never re-add).
+		// 3. DatasetRemoveUserProperties     — removePublicationRecords clears the
+		//                                      durable record (off mode never touches
+		//                                      a backend allowlist).
+		assertAPICallCount(t, "off NFS unpublish", client, 3)
+	})
+
+	// (b) additive + NFS — backend enforcement on, static policy preserved. The
+	// publish resolves the share once for the compatibility check and reuses it
+	// (memoized) for the fence, then converges the host list; the unpublish
+	// revokes the CSI-added host.
+	t.Run("additive NFS publish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "nfs", FencingModeAdditive)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("additive-nfs", "nfs"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.31")}})
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, nfsPublishRequest("additive-nfs", nodeA))
+		require.NoError(t, err)
+		// Five calls:
+		// 1. DatasetGet                      — ControllerPublishVolume volume read.
+		// 2. NFSShareGet                     — ensureShareExists backreference check.
+		// 3. NFSShareGet                     — validateBackendSingleNodeCompatibility
+		//                                      reads the allowlist (the ensure path
+		//                                      does not memoize the NFS share, so this
+		//                                      is a fresh read; applyNFSFence then
+		//                                      reuses THIS one via the request memo).
+		// 4. DatasetSetUserProperties        — storePublicationRecord (carries the
+		//                                      additive CSI-added-host provenance).
+		// 5. NFSShareUpdate                  — applyNFSFence converges the host list.
+		assertAPICallCount(t, "additive NFS publish", client, 5)
+	})
+	t.Run("additive NFS unpublish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "nfs", FencingModeAdditive)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("additive-nfs-unpub", "nfs"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.31")}})
+		require.NoError(t, err)
+		_, err = d.ControllerPublishVolume(ctx, nfsPublishRequest("additive-nfs-unpub", nodeA))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "additive-nfs-unpub", NodeId: nodeA})
+		require.NoError(t, err)
+		// Five calls:
+		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
+		// 2. DatasetSetUserProperties        — flip the record to "unpublishing".
+		// 3. NFSShareGet                     — applyNFSFence resolves the share (fresh
+		//                                      memo for this request).
+		// 4. NFSShareUpdate                  — applyNFSFence revokes the CSI-added
+		//                                      host (only durable scale-csi grants are
+		//                                      removable in additive mode).
+		// 5. DatasetRemoveUserProperties     — removePublicationRecords.
+		assertAPICallCount(t, "additive NFS unpublish", client, 5)
+	})
+
+	// (c) strict + NVMe-oF single node — the live hot path P1 optimizes. The
+	// measured publish is a steady-state republish: the setup publish associates
+	// the node and warms the per-driver host-ID cache, so the republish reuses
+	// the memoized namespace/subsystem/associations and skips the redundant
+	// host_subsys.create. The unpublish revokes the association.
+	t.Run("strict NVMe-oF publish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("strict-nvme", "nvmeof"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a"})
+		require.NoError(t, err)
+		// Setup publish: associates worker-a and warms the host-ID cache so the
+		// measured republish reflects the cached steady state (not measured).
+		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("strict-nvme", nodeA))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("strict-nvme", nodeA))
+		require.NoError(t, err)
+		// Six calls (steady-state republish; ~13 before P1):
+		// 1. DatasetGet                      — ControllerPublishVolume volume read.
+		// 2. NVMeoFNamespaceGet              — ensureShare resolves the namespace
+		//                                      (memoized for the rest of the request).
+		// 3. NVMeoFSubsystemGet              — ensureShare resolves the subsystem.
+		//    (repair-stamp write SKIPPED: the dataset already carries both IDs.)
+		// 4. NVMeoFHostFindByNQN             — validateBackend resolves the exempt
+		//                                      node NQN to a host ID.
+		// 5. NVMeoFHostSubsysListBySubsystem — validateBackend reads the allowlist
+		//                                      (memoized; applyNVMeFence reuses it).
+		// 6. DatasetSetUserProperties        — storePublicationRecord.
+		//    applyNVMeFence adds ZERO calls: namespace/subsystem/associations are
+		//    memoized, the host-ID resolution is cached from the setup publish, and
+		//    the host_subsys.create is SKIPPED because the memoized association list
+		//    already shows worker-a attached.
+		assertAPICallCount(t, "strict NVMe-oF publish", client, 6)
+	})
+	t.Run("strict NVMe-oF unpublish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "nvmeof", FencingModeStrict)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("strict-nvme-unpub", "nvmeof"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a"})
+		require.NoError(t, err)
+		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("strict-nvme-unpub", nodeA))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "strict-nvme-unpub", NodeId: nodeA})
+		require.NoError(t, err)
+		// Eight calls:
+		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
+		// 2. DatasetSetUserProperties        — flip the record to "unpublishing".
+		// 3. NVMeoFNamespaceGet              — applyNVMeFence resolves the namespace
+		//                                      (fresh memo for this request).
+		// 4. NVMeoFSubsystemGet              — applyNVMeFence resolves the subsystem.
+		// 5. NVMeoFHostSubsysListBySubsystem — applyNVMeFence reads the allowlist.
+		// 6. NVMeoFHostFindByNQN             — resolve the removing NQN to a host ID.
+		// 7. NVMeoFHostSubsysDelete          — revoke worker-a's association.
+		// 8. DatasetRemoveUserProperties     — removePublicationRecords.
+		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 8)
+	})
 }
