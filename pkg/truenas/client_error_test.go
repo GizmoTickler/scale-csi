@@ -27,6 +27,28 @@ func TestIsNotFoundErrorGenericCodeWithNotFoundMessage(t *testing.T) {
 	}
 }
 
+// TestIsNotFoundErrorIgnoresNotFoundMentionsInDataBlob is the Batch 18 R8b
+// regression: a -1 error whose Message is benign but whose Data blob merely
+// MENTIONS "not found" about some nested object must NOT be classified as this
+// object's authoritative absence. The fallback matches Message only, not
+// FullError() (which embeds Data via %+v).
+func TestIsNotFoundErrorIgnoresNotFoundMentionsInDataBlob(t *testing.T) {
+	err := &APIError{
+		Code:    -1,
+		Message: "dataset is busy",
+		Data: map[string]interface{}{
+			"validation": []interface{}{
+				map[string]interface{}{"detail": "referenced child dataset not found"},
+			},
+		},
+	}
+	// FullError() would contain "not found"; Message does not.
+	assert.Contains(t, err.FullError(), "not found")
+	assert.NotContains(t, err.Message, "not found")
+	assert.False(t, IsNotFoundError(err),
+		"a not-found mention buried in the Data blob must not be treated as this object's absence")
+}
+
 func TestStructuredErrnoIsAuthoritativeOverMessageFallbacks(t *testing.T) {
 	positivePermissionCode := &APIError{Code: int(syscall.EACCES), Message: "dataset not found and already exists"}
 	assert.False(t, IsNotFoundError(positivePermissionCode))

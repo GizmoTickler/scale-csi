@@ -68,7 +68,14 @@ func IsNotFoundError(err error) bool {
 		if errno, ok := APIErrno(apiErr); ok {
 			return errno == syscall.ENOENT
 		}
-		message := strings.ToLower(apiErr.FullError())
+		// Match the human-readable Message only, NOT FullError(): FullError embeds
+		// the whole Data blob via %+v, so a -1 error that merely MENTIONS "not
+		// found" about some nested object (e.g. a validation entry referencing a
+		// missing sibling) would be misclassified as this object's authoritative
+		// absence — and callers like the share-orphan TOCTOU guard and
+		// replicationJobDatasetMissing act destructively on that. FullError() is
+		// still used for logging (LogAPIError) where the extra context helps.
+		message := strings.ToLower(apiErr.Message)
 		return strings.Contains(message, "not found") || strings.Contains(message, "does not exist")
 	}
 	errStr := strings.ToLower(err.Error())
