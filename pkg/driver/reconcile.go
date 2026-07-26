@@ -256,6 +256,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	// no ledger, no reaping) and the sweeps are skipped.
 	var ledger map[string]tombstoneLedgerEntry
 	bookkeepingReadable := false
+	var remnantBookkeeping *truenas.Dataset
 	parentDataset, parentErr := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
 	if parentErr != nil {
 		d.recordReconcileObjectFailure("parent_bookkeeping", d.parentDatasetName(), parentErr)
@@ -272,7 +273,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		// (idempotent; parent removal is gated by CleanupParent). Runs before the
 		// dual-read merge so a freshly migrated entry is visible from the child.
 		d.migrateParentBookkeeping(ctx, parentDataset)
-		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+		bookkeepingDataset, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
 		if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
 			d.recordReconcileObjectFailure("bookkeeping", d.bookkeepingDatasetName(), bkErr)
 		} else {
@@ -280,14 +281,20 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 			// Dual-read: merge the child's ledger entries over the parent's. Keys
 			// are content-hashed snapshot IDs, so a migrated entry is identical in
 			// both locations and the merge is a lossless union.
-			for key, entry := range tombstoneLedgerFromDataset(bookkeeping) {
+			for key, entry := range tombstoneLedgerFromDataset(bookkeepingDataset) {
 				if ledger == nil {
 					ledger = make(map[string]tombstoneLedgerEntry)
 				}
 				ledger[key] = entry
 			}
-			d.sweepStaleInflightMarkers(ctx, bookkeeping, time.Now(), minOrphanAge)
+			d.sweepStaleInflightMarkers(ctx, bookkeepingDataset, time.Now(), minOrphanAge)
 		}
+		// Thread the datasets this pass already read into the remnant classifier so
+		// it does not re-fetch them (see classifyRemnantOrphans). parentDataset is
+		// non-nil when its read above succeeded; bookkeepingDataset is non-nil when
+		// the bookkeeping read succeeded (nil for NotFound/error → the classifier
+		// re-reads to tell those apart, preserving its historical behavior).
+		remnantBookkeeping = bookkeepingDataset
 	}
 	if bookkeepingReadable {
 		d.sweepOrphanedTombstoneLedger(ctx, ledger, listedSnapshotIDs(snapshots, tombstones), time.Now(), minOrphanAge)
@@ -297,10 +304,11 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	// A remnant is an unstamped dataset whose in-flight creation marker survived
 	// a controller crash and whose same-name CreateVolume retry is never coming
 	// (VolSync mints a new PVC UID on failure). It runs after the stale-marker
-	// sweep so a marker the sweep just retired is re-read from the backend, and
-	// every gate below re-validates live state, so the pass-snapshot the markers
-	// came from can never authorize a destroy on its own.
-	d.classifyRemnantOrphans(ctx, time.Now(), minOrphanAge, &report)
+	// sweep; safety does NOT depend on the classifier seeing the post-sweep parent
+	// read — every per-marker gate below re-validates live state, and
+	// destroyRemnantOrphan re-reads the marker under the per-volume lock before any
+	// destroy — so reusing the pass's parent/bookkeeping reads is safe.
+	d.classifyRemnantOrphans(ctx, time.Now(), minOrphanAge, parentDataset, remnantBookkeeping, &report)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		RecordReconcileFailure("remnant_orphan_classification")
 		return report, ctxErr
@@ -448,7 +456,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	// sweeping still run. Deletion remains gated by opts.Delete and the
 	// per-object revalidation in deleteDetectedOrphans.
 	if d.config.Reconcile.SpentRestore.EnabledOrDefault() {
-		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState, &report)
+		report.SpentRestoreSnapshots = d.classifySpentRestoreSnapshots(ctx, now, kubeState, snapshots, &report)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			RecordReconcileFailure("spent_restore_classification")
 			return report, ctxErr
@@ -741,19 +749,32 @@ func (d *Driver) detectOrphanedNVMeoFShares(ctx context.Context, kubeState *kube
 		klog.Warningf("Orphan reconcile: failed to list NVMe-oF subsystems for orphan detection: %v", err)
 		return
 	}
-	for _, subsys := range subsystems {
-		if subsys == nil {
+	// Fetch every namespace in ONE query and group client-side by subsystem
+	// instead of issuing NVMeoFNamespaceListBySubsystem per subsystem (~N round
+	// trips per pass). Each namespace carries its SubsystemID, so the grouping is
+	// lossless; the DevicePath backreference logic below is unchanged.
+	allNamespaces, err := d.truenasClient.NVMeoFNamespaceList(ctx)
+	if err != nil {
+		RecordReconcileFailure("list_backend_shares")
+		klog.Warningf("Orphan reconcile: failed to list NVMe-oF namespaces for orphan detection: %v", err)
+		return
+	}
+	namespacesBySubsystem := make(map[int][]*truenas.NVMeoFNamespace, len(allNamespaces))
+	for _, namespace := range allNamespaces {
+		if namespace == nil {
 			continue
 		}
-		namespaces, nsErr := d.truenasClient.NVMeoFNamespaceListBySubsystem(ctx, subsys.ID)
-		if nsErr != nil {
-			klog.Warningf("Orphan reconcile: skipping NVMe-oF subsystem %d orphan check: namespace listing failed: %v", subsys.ID, nsErr)
+		namespacesBySubsystem[namespace.SubsystemID] = append(namespacesBySubsystem[namespace.SubsystemID], namespace)
+	}
+	for _, subsys := range subsystems {
+		if subsys == nil {
 			continue
 		}
 		// The namespace DevicePath (zvol/<dataset>) is the authoritative
 		// backreference; the subsystem NAME is lossy and never used to decide
 		// deletion. A subsystem with no namespace resolving to a dataset under the
 		// parent is foreign and skipped.
+		namespaces := namespacesBySubsystem[subsys.ID]
 		for _, namespace := range namespaces {
 			if namespace == nil {
 				continue
@@ -1240,10 +1261,31 @@ func (d *Driver) classifySpentRestoreSnapshots(
 	ctx context.Context,
 	now time.Time,
 	state *kubernetesReconcileState,
+	snapshots []*truenas.Snapshot,
 	report *ReconcileReport,
 ) []SpentRestoreSnapshot {
 	if state == nil {
 		return nil
+	}
+	// Resolve backend snapshots against the pass's already-fetched managed-snapshot
+	// slice instead of issuing one SnapshotFindByName/SnapshotGet per candidate —
+	// the short-name path previously did a FULL recursive snapshot-set transfer per
+	// candidate. Classification is read-only detection; the pre-delete guard
+	// (revalidateSpentRestoreSnapshot) still re-fetches the backend snapshot live,
+	// so a snapshot absent from this pass's listing is simply reconsidered next pass
+	// rather than mis-reaped. Index by full ID (dataset@snap) and by short name.
+	byID := make(map[string]*truenas.Snapshot, len(snapshots))
+	byShortName := make(map[string]*truenas.Snapshot, len(snapshots))
+	for _, snap := range snapshots {
+		if snap == nil {
+			continue
+		}
+		byID[snap.ID] = snap
+		if shortName := snapshotShortName(snap); shortName != "" {
+			if _, exists := byShortName[shortName]; !exists {
+				byShortName[shortName] = snap
+			}
+		}
 	}
 	spent := make([]SpentRestoreSnapshot, 0)
 	for i := range state.volumeSnapshots {
@@ -1294,10 +1336,12 @@ func (d *Driver) classifySpentRestoreSnapshots(
 				continue
 			}
 		}
-		backendSnapshot, backendErr := d.findBackendSnapshotForHandle(ctx, content.snapshotHandle)
-		if backendErr != nil {
-			d.recordReconcileObjectFailure("spent_restore_classification", content.snapshotHandle, backendErr)
-			continue
+		// Resolve against the pass's in-memory snapshot index — no per-candidate
+		// backend round trip (see the maps built above). A "@" handle matches a full
+		// snapshot ID; a bare short name matches byShortName.
+		backendSnapshot := byID[content.snapshotHandle]
+		if backendSnapshot == nil {
+			backendSnapshot = byShortName[content.snapshotHandle]
 		}
 		if backendSnapshot == nil || !isCSISnapshot(backendSnapshot) {
 			continue
@@ -1874,23 +1918,35 @@ func (d *Driver) remnantHasNoKubernetesReference(ctx context.Context, volumeID s
 // runs in deleteDetectedOrphans under opts.Delete. A stamped dataset is left to
 // the stale-marker sweep (marker retirement) and the orphan-volume pass (dataset
 // reclamation) — this phase never touches it.
-func (d *Driver) classifyRemnantOrphans(ctx context.Context, now time.Time, minOrphanAge time.Duration, report *ReconcileReport) {
-	parentDataset, err := d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
-	if err != nil {
-		d.recordReconcileObjectFailure("remnant_orphan_classify", d.parentDatasetName(), err)
-		return
+func (d *Driver) classifyRemnantOrphans(ctx context.Context, now time.Time, minOrphanAge time.Duration, parentDataset, bookkeeping *truenas.Dataset, report *ReconcileReport) {
+	// Reuse the parent/bookkeeping datasets the reconcile pass already read instead
+	// of re-fetching them here (N+1 elimination). A nil argument means the pass did
+	// not have a successful read (e.g. bookkeeping disabled, NotFound, or a transient
+	// error), so fall back to a direct read to preserve the historical behavior —
+	// including distinguishing NotFound from a real error for the bookkeeping dataset.
+	if parentDataset == nil {
+		var err error
+		parentDataset, err = d.truenasClient.DatasetGet(ctx, d.parentDatasetName())
+		if err != nil {
+			d.recordReconcileObjectFailure("remnant_orphan_classify", d.parentDatasetName(), err)
+			return
+		}
 	}
 	markers := localInflightMarkers(parentDataset)
 	if d.bookkeepingEnabled() {
-		bookkeeping, bkErr := d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
-		if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
-			d.recordReconcileObjectFailure("remnant_orphan_classify", d.bookkeepingDatasetName(), bkErr)
-			return
+		bookkeepingDataset := bookkeeping
+		if bookkeepingDataset == nil {
+			var bkErr error
+			bookkeepingDataset, bkErr = d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
+			if bkErr != nil && !truenas.IsNotFoundError(bkErr) {
+				d.recordReconcileObjectFailure("remnant_orphan_classify", d.bookkeepingDatasetName(), bkErr)
+				return
+			}
 		}
 		// Dual-read merge: the same marker carries the same content-hashed key in
 		// both locations, so the union is lossless and a migrated marker is seen
 		// regardless of which dataset still holds it.
-		for key, marker := range localInflightMarkers(bookkeeping) {
+		for key, marker := range localInflightMarkers(bookkeepingDataset) {
 			markers[key] = marker
 		}
 	}
@@ -2268,6 +2324,19 @@ func (d *Driver) adoptLegacyOwnershipStamps(ctx context.Context, datasets []*tru
 		if !datasetStrictlyBelowParent(ds.Name, parentName) || !validVolumeIDLeaf(volumeID) || volumeID == bookkeepingDatasetLeaf {
 			continue
 		}
+		// Presence (does the key exist at all, of ANY source) is decidable from the
+		// sourceless listing's flat user_properties, so a dataset that already carries
+		// an instance stamp is skipped WITHOUT the source-bearing re-read. In a
+		// fully-migrated steady state every volume is stamped, so this drops the
+		// adoption pass from N source-bearing GETs to zero. Only the source checks
+		// below (LOCAL managed_resource / csi_volume_name) genuinely need source. The
+		// overwrite-protection contract is unchanged: the source-bearing GET still
+		// runs for actual candidates, the candidate-level presence check still runs
+		// after it, and writeAndVerifyAdoptionStamp still re-reads under the
+		// per-volume lock and re-proves absence immediately before any write.
+		if _, present := datasetUserPropertyProjection(ds, PropDriverInstanceID); present {
+			continue
+		}
 		// Source-bearing re-read (batch-12 DatasetGet pattern): the listing strips
 		// property source, so it is never trusted for the ownership/source checks.
 		candidate, err := d.truenasClient.DatasetGet(ctx, ds.Name)
@@ -2612,30 +2681,52 @@ func (d *Driver) reconcileStalePublicationRecords(
 		d.recordReconcileObjectFailure("stale_publication_configuration", "fencing.staleRecordGracePeriod", err)
 		return
 	}
+	// The zfs.resource.query listing returns user_properties as a flat, SOURCELESS
+	// map on TrueNAS 26.0, but publicationRecordsFromDataset must distinguish a
+	// dataset's own (source=="local") records from clone-inherited ones by source:
+	// run against the listing directly, it would skip every record and silently
+	// disable this repair. Pre-filter cheaply on publication_* KEY presence (the
+	// flat read still exposes keys) and re-fetch ONLY those candidates through a
+	// source-bearing pool.dataset.query read. The re-fetches are batched into ONE
+	// DatasetGetByNames (["id","in",names]) instead of one DatasetGet per dataset
+	// — with fencing on, every attached volume carries a record, so this collapses
+	// ~N source-bearing GETs per pass into a single round trip. A source-bearing
+	// listing (the pool.dataset.query fallback) is already authoritative and is
+	// used as-is. The read stays source-bearing (same DatasetGet projection);
+	// zfs.resource.query is never used here because it loses user-property source.
+	sourcelessNames := make([]string, 0)
+	for _, dataset := range datasets {
+		if dataset != nil && dataset.ResourceQuery && datasetHasPublicationRecordKeys(dataset) {
+			sourcelessNames = append(sourcelessNames, dataset.Name)
+		}
+	}
+	var sourceBearing map[string]*truenas.Dataset
+	if len(sourcelessNames) > 0 {
+		sourceBearingByNames, getErr := d.truenasClient.DatasetGetByNames(ctx, sourcelessNames)
+		if getErr != nil {
+			d.recordReconcileObjectFailure("stale_publication_classification", "batch", getErr)
+		} else {
+			sourceBearing = sourceBearingByNames
+		}
+	}
 	for _, dataset := range datasets {
 		if dataset == nil {
 			continue
 		}
-		// The zfs.resource.query listing returns user_properties as a flat,
-		// SOURCELESS map on TrueNAS 26.0, but publicationRecordsFromDataset must
-		// distinguish a dataset's own (source=="local") records from clone-inherited
-		// ones by source: run against the listing directly, it would skip every
-		// record and silently disable this repair. Pre-filter cheaply on
-		// publication_* KEY presence (the flat read still exposes keys) and, for the
-		// few candidates whose listing came from the sourceless resource path,
-		// re-fetch through the source-bearing pool.dataset.query read (DatasetGet)
-		// before classifying. A source-bearing listing — the pool.dataset.query
-		// fallback — is already authoritative and is used as-is. This costs a
-		// handful of DatasetGets (one per sourceless dataset that carries a
-		// publication record), not one per managed dataset.
 		recordSource := dataset
 		if dataset.ResourceQuery && datasetHasPublicationRecordKeys(dataset) {
-			sourceBearing, getErr := d.truenasClient.DatasetGet(ctx, dataset.Name)
-			if getErr != nil {
-				d.recordReconcileObjectFailure("stale_publication_classification", dataset.Name, getErr)
+			sourceBearingDataset, ok := sourceBearing[dataset.Name]
+			if !ok {
+				// The batch failed (sourceBearing nil, recorded once above) or this
+				// dataset vanished between the listing and the re-read. Either way,
+				// skip it — the former per-dataset GET failure path did the same.
+				if sourceBearing != nil {
+					d.recordReconcileObjectFailure("stale_publication_classification", dataset.Name,
+						fmt.Errorf("source-bearing re-read returned no dataset"))
+				}
 				continue
 			}
-			recordSource = sourceBearing
+			recordSource = sourceBearingDataset
 		}
 		records, parseErr := publicationRecordsFromDataset(recordSource)
 		if parseErr != nil {

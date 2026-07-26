@@ -100,6 +100,11 @@ func (c *apiCallCountingClient) DatasetGet(ctx context.Context, name string) (*t
 	return c.MockClient.DatasetGet(ctx, name)
 }
 
+func (c *apiCallCountingClient) DatasetGetByNames(ctx context.Context, names []string) (map[string]*truenas.Dataset, error) {
+	c.record("DatasetGetByNames")
+	return c.MockClient.DatasetGetByNames(ctx, names)
+}
+
 func (c *apiCallCountingClient) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
 	c.record("DatasetUpdate")
 	return c.MockClient.DatasetUpdate(ctx, name, params)
@@ -428,6 +433,11 @@ func (c *apiCallCountingClient) NVMeoFNamespaceFindByDevicePath(ctx context.Cont
 func (c *apiCallCountingClient) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFNamespace, error) {
 	c.record("NVMeoFNamespaceListBySubsystem")
 	return c.MockClient.NVMeoFNamespaceListBySubsystem(ctx, subsysID)
+}
+
+func (c *apiCallCountingClient) NVMeoFNamespaceList(ctx context.Context) ([]*truenas.NVMeoFNamespace, error) {
+	c.record("NVMeoFNamespaceList")
+	return c.MockClient.NVMeoFNamespaceList(ctx)
 }
 
 func (c *apiCallCountingClient) NVMeoFPortList(ctx context.Context) ([]*truenas.NVMeoFPort, error) {

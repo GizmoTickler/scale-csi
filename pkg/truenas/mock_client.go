@@ -360,6 +360,22 @@ func (m *MockClient) DatasetGet(ctx context.Context, name string) (*Dataset, err
 	return nil, &APIError{Code: -1, Message: "dataset not found"}
 }
 
+func (m *MockClient) DatasetGetByNames(ctx context.Context, names []string) (map[string]*Dataset, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	result := make(map[string]*Dataset, len(names))
+	for _, name := range names {
+		if ds, ok := m.Datasets[name]; ok {
+			result[name] = mockDatasetResponse(ds, false)
+		}
+	}
+	return result, nil
+}
+
 func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1492,6 +1508,16 @@ func (m *MockClient) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysI
 		if n.SubsystemID == subsysID {
 			list = append(list, n)
 		}
+	}
+	return list, nil
+}
+func (m *MockClient) NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespace, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	list := make([]*NVMeoFNamespace, 0, len(m.NVMeNamespaces))
+	for _, n := range m.NVMeNamespaces {
+		list = append(list, n)
 	}
 	return list, nil
 }
