@@ -101,6 +101,33 @@ spec:
 
 **Important**: The restored PVC size must be greater than or equal to the original volume size.
 
+### Restore mode: clone vs detached
+
+By default a restore is a ZFS **clone**: it is instant and space-efficient, but
+the restored volume pins its source snapshot until the restored volume is
+deleted. To get a fully independent volume with no lingering snapshot
+dependency, use a StorageClass whose `snapshotRestoreMode` parameter is
+`detached` (an independent local send/receive copy — more time and space up
+front, no source-snapshot pin afterward):
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: scale-nfs-detached-restore
+provisioner: csi.scale.io
+parameters:
+  protocol: nfs
+  snapshotRestoreMode: detached
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+```
+
+The value is resolved per StorageClass; when unset it follows the driver's
+`zfs.detachedVolumesFromSnapshots` default (`false` = clone). See the
+[StorageClass reference](../reference/storageclass.md#restore-mode).
+
 ## Cloning a Volume
 
 You can create a clone directly from an existing PVC without creating a snapshot first:
@@ -235,7 +262,15 @@ kubectl get volumesnapshot -l app=myapp \
 1. **Snapshot Size**: Snapshots are point-in-time; they grow as source changes
 2. **Cross-Pool**: Snapshots cannot span ZFS pools
 3. **Clone Size**: Clone must be >= source volume size
-4. **Deletion Order**: Cannot delete a volume with dependent snapshots
+4. **Foreign snapshots block volume delete**: `DeleteVolume` refuses (returns
+   `FailedPrecondition`) when the dataset carries non-CSI snapshots — for
+   example those made by a TrueNAS periodic-snapshot task covering the CSI
+   parent. Remove them, exclude the parent from the task, or opt into
+   `zfs.destroyForeignSnapshotsOnDelete`.
+5. **Deleting a snapshot that still has clones**: the driver renames it to an
+   internal tombstone and requests deferred ZFS destruction. The snapshot
+   disappears from CSI immediately, but its referenced space stays charged until
+   the last dependent clone (for example a `clone`-mode restore) is deleted.
 
 ## Troubleshooting
 
