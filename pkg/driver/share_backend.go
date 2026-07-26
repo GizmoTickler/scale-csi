@@ -18,8 +18,10 @@ import (
 // while giving callers one polymorphic entry point per operation.
 type ShareBackend interface {
 	// EnsureShare makes the share exist for an already-provisioned dataset
-	// (idempotent create used on the retry path).
-	EnsureShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string) error
+	// (idempotent create used on the retry path). res, when non-nil, receives the
+	// backend objects the ensure resolved so the subsequent fence phases reuse
+	// them instead of re-resolving (see fenceResolution).
+	EnsureShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, res *fenceResolution) error
 	// CreateShare creates the share for a dataset. freshlyCreated skips
 	// guaranteed-miss idempotency lookups; zvolReady indicates the zvol was
 	// returned by DatasetCreate or the clone readiness wait completed;
@@ -32,8 +34,9 @@ type ShareBackend interface {
 	// applyBackendFence computes the shared inputs (enforceable/removing
 	// identities and the additive-ownership/protected grant sets) and each
 	// backend applies the subset its protocol uses, preserving the former
-	// per-protocol switch exactly.
-	ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string) error
+	// per-protocol switch exactly. res carries the request's memoized backend
+	// objects (see fenceResolution); backends reuse them instead of re-resolving.
+	ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, res *fenceResolution) error
 	// VolumeContext populates the protocol-specific publish context keys onto
 	// volumeContext (which already carries node_attach_driver).
 	VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error

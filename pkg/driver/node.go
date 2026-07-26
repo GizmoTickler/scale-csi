@@ -255,6 +255,32 @@ func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType 
 	if symlink {
 		devicePath, resolveErr := filepath.EvalSymlinks(stagingPath)
 		if resolveErr != nil {
+			// A DANGLING staging symlink — the backing device vanished (node reboot
+			// with a persisted staging dir, a dropped iSCSI/NVMe-oF session) — makes
+			// EvalSymlinks fail with a not-exist-class error. Returning Internal here
+			// wedges the volume forever: every kubelet retry fails identically and the
+			// stage never reaches the reconnect path built to repair exactly this.
+			// Drop the stale stage record and report "not staged" so the normal stage
+			// path disconnects the stale session, reconnects, and atomically replaces
+			// the link. A resolvable device that fails for any other reason stays
+			// fail-closed with Internal.
+			if errors.Is(resolveErr, os.ErrNotExist) {
+				// The live device is gone so its identity cannot be re-derived; guard
+				// the self-heal with the persisted stage record. If a record exists and
+				// belongs to a DIFFERENT volume/source/capability (a malformed request
+				// or kubelet path confusion — and distinct volume IDs take distinct node
+				// locks, so nothing else serializes this collision), fail closed with
+				// AlreadyExists and leave volume A's record and link intact rather than
+				// erasing them. Only an absent or compatible record is cleared to let the
+				// requesting volume reconnect. LiveSource is intentionally not compared:
+				// the device vanished, so the record's last-known source cannot match.
+				if record, ok := d.stageRecord(stagingPath); ok &&
+					(record.VolumeID != req.GetVolumeId() || record.ExpectedSource != expectedSource || record.Capability != capability) {
+					return true, status.Errorf(codes.AlreadyExists, "staging target %s is already occupied by an incompatible staged volume", stagingPath)
+				}
+				d.deleteStageRecord(stagingPath)
+				return false, nil
+			}
 			return true, status.Errorf(codes.Internal, "failed to resolve staged block device: %v", resolveErr)
 		}
 		if sourceErr := verifyStageDeviceSource(devicePath, shareType, req.GetVolumeContext()); sourceErr != nil {
@@ -1316,6 +1342,14 @@ func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capa
 	}
 }
 
+// volumeLockKey is the controller-plane per-volume operation-lock key. It is
+// deliberately in a different keyspace from nodeVolumeLockKey ("node:") so a
+// node-plane stage/unstage and a controller-plane create/delete/expand for the
+// same volume ID never contend on the same lock.
+func volumeLockKey(volumeID string) string {
+	return "volume:" + volumeID
+}
+
 func nodeVolumeLockKey(volumeID string) string {
 	return "node:" + volumeID
 }
@@ -1402,6 +1436,82 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 	return nil
 }
 
+// nodeStageTransport abstracts the protocol-specific session operations the
+// shared pre-emptive-disconnect helper needs. S is the transport's session-list
+// type (iSCSI []util.ISCSISessionInfo / NVMe-oF []util.NVMeSubsystem).
+type nodeStageTransport[S any] struct {
+	name        string                           // human label, "iSCSI" / "NVMe-oF"
+	findSession func(sessions S) (string, error) // existing session id ("" if none)
+	disconnect  func(existing string) error
+	relist      func() (S, error)
+}
+
+// preemptiveSessionDisconnect disconnects any pre-existing session for a target
+// before staging, preventing duplicate sessions when a volume moves between
+// nodes or a previous unstage failed to clean up. It is skipped when the staged
+// device is still live. After disconnecting it polls until the session clears,
+// re-listing sessions each iteration; the refreshed list is returned so the
+// caller feeds the post-cleanup state into connect (the original inline blocks
+// re-assigned the captured `sessions`/`subsystems` variable — preserved here by
+// returning it, including the assign-before-error-check ordering).
+func preemptiveSessionDisconnect[S any](ctx context.Context, d *Driver, t nodeStageTransport[S], id, stagingPath string, sessions S) S {
+	existing, err := t.findSession(sessions)
+	if err != nil || existing == "" {
+		return sessions
+	}
+	if liveDevicePath, live := stagedDevicePath(stagingPath); live {
+		klog.Infof("Skipping pre-emptive %s disconnect for %s: staged device %s is still live", t.name, id, liveDevicePath)
+		return sessions
+	}
+	klog.Infof("Found existing %s session for %s, disconnecting before reconnect", t.name, id)
+	if disconnectErr := t.disconnect(existing); disconnectErr != nil {
+		klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existing, disconnectErr)
+	}
+	cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
+	if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
+		refreshed, listErr := t.relist()
+		sessions = refreshed
+		if listErr != nil {
+			return true, listErr
+		}
+		_, findErr := t.findSession(sessions)
+		return findErr == nil, nil
+	}); pollErr != nil {
+		klog.V(4).Infof("%s session cleanup poll for %s ended with: %v", t.name, id, pollErr)
+	}
+	return sessions
+}
+
+// finalizeStagedDevice completes a stage once the backing device is connected:
+// for block volumes it atomically (re)creates the staging symlink; for
+// filesystem volumes it formats and mounts. This tail is identical across the
+// iSCSI and NVMe-oF stage paths.
+func (d *Driver) finalizeStagedDevice(ctx context.Context, devicePath, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
+	// For block mode, create a symlink to the device. Use atomic rename to avoid
+	// race conditions when recreating symlinks.
+	if volCap != nil && volCap.GetBlock() != nil {
+		if err := createSymlinkAtomic(devicePath, stagingPath); err != nil {
+			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
+		}
+		return nil
+	}
+
+	// For filesystem mode, format and mount.
+	fsType := "ext4"
+	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
+		fsType = strings.ToLower(volCap.GetMount().GetFsType())
+	}
+	mountFlags := volumeMountFlagsForFS(volCap, fsType)
+
+	if err := nodeFormatAndMount(ctx, devicePath, stagingPath, fsType, mountFlags); err != nil {
+		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonMountFailed, operationErr.Error())
+		return operationErr
+	}
+
+	return nil
+}
+
 // stageISCSIVolume connects and mounts an iSCSI volume to the staging path.
 func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
@@ -1449,31 +1559,13 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		}
 	}
 
-	// Pre-emptive cleanup: disconnect any existing session for this target
-	// This prevents duplicate sessions when a volume moves between nodes
-	// or when a previous unstage failed to clean up properly.
-	existingIQN, err := util.FindISCSISessionByIQNFromSessions(iqn, sessions)
-	if err == nil && existingIQN != "" {
-		if liveDevicePath, live := stagedDevicePath(stagingPath); live {
-			klog.Infof("Skipping pre-emptive iSCSI disconnect for %s: staged device %s is still live", iqn, liveDevicePath)
-		} else {
-			klog.Infof("Found existing iSCSI session for %s, disconnecting before reconnect", iqn)
-			if disconnectErr := util.ISCSIDisconnect(portal, existingIQN); disconnectErr != nil {
-				klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingIQN, disconnectErr)
-			}
-			cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
-			if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
-				sessions, listErr = util.ListISCSISessions()
-				if listErr != nil {
-					return true, listErr
-				}
-				_, findErr := util.FindISCSISessionByIQNFromSessions(iqn, sessions)
-				return findErr == nil, nil
-			}); pollErr != nil {
-				klog.V(4).Infof("iSCSI session cleanup poll for %s ended with: %v", iqn, pollErr)
-			}
-		}
-	}
+	// Pre-emptive cleanup: disconnect any existing session for this target.
+	sessions = preemptiveSessionDisconnect(ctx, d, nodeStageTransport[[]util.ISCSISessionInfo]{
+		name:        "iSCSI",
+		findSession: func(s []util.ISCSISessionInfo) (string, error) { return util.FindISCSISessionByIQNFromSessions(iqn, s) },
+		disconnect:  func(existing string) error { return util.ISCSIDisconnect(portal, existing) },
+		relist:      util.ListISCSISessions,
+	}, iqn, stagingPath, sessions)
 
 	// Connect to iSCSI target with configurable timeout
 	connectOpts := &util.ISCSIConnectOptions{
@@ -1488,34 +1580,12 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		return operationErr
 	}
 	RecordNodeConnect("iscsi", "success")
+	// iSCSI-specific post-connect hook: reject an unexpected multipath topology.
 	if err := nodeCheckISCSIMultipath(devicePath); err != nil {
 		return status.Error(codes.FailedPrecondition, err.Error())
 	}
 
-	// Check if block mode
-	if volCap != nil && volCap.GetBlock() != nil {
-		// For block mode, create a symlink to the device
-		// Use atomic rename to avoid race conditions when recreating symlinks
-		if err := createSymlinkAtomic(devicePath, stagingPath); err != nil {
-			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
-		}
-		return nil
-	}
-
-	// For filesystem mode, format and mount
-	fsType := "ext4"
-	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
-		fsType = strings.ToLower(volCap.GetMount().GetFsType())
-	}
-	mountFlags := volumeMountFlagsForFS(volCap, fsType)
-
-	if err := nodeFormatAndMount(ctx, devicePath, stagingPath, fsType, mountFlags); err != nil {
-		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
-		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonMountFailed, operationErr.Error())
-		return operationErr
-	}
-
-	return nil
+	return d.finalizeStagedDevice(ctx, devicePath, stagingPath, volCap, eventObjects...)
 }
 
 // stageNVMeoFVolume connects and mounts an NVMe-oF volume to the staging path.
@@ -1564,31 +1634,13 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 		}
 	}
 
-	// Pre-emptive cleanup: disconnect any existing session for this NQN
-	// This prevents duplicate sessions when a volume moves between nodes
-	// or when a previous unstage failed to clean up properly.
-	existingNQN, err := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
-	if err == nil && existingNQN != "" {
-		if liveDevicePath, live := stagedDevicePath(stagingPath); live {
-			klog.Infof("Skipping pre-emptive NVMe-oF disconnect for %s: staged device %s is still live", nqn, liveDevicePath)
-		} else {
-			klog.Infof("Found existing NVMe-oF session for %s, disconnecting before reconnect", nqn)
-			if disconnectErr := util.NVMeoFDisconnect(existingNQN); disconnectErr != nil {
-				klog.Warningf("Failed to disconnect existing session %s: %v (proceeding anyway)", existingNQN, disconnectErr)
-			}
-			cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
-			if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
-				subsystems, listErr = util.ListNVMeSubsystems(ctx)
-				if listErr != nil {
-					return true, listErr
-				}
-				_, findErr := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
-				return findErr == nil, nil
-			}); pollErr != nil {
-				klog.V(4).Infof("NVMe-oF session cleanup poll for %s ended with: %v", nqn, pollErr)
-			}
-		}
-	}
+	// Pre-emptive cleanup: disconnect any existing session for this NQN.
+	subsystems = preemptiveSessionDisconnect(ctx, d, nodeStageTransport[[]util.NVMeSubsystem]{
+		name:        "NVMe-oF",
+		findSession: func(s []util.NVMeSubsystem) (string, error) { return util.FindNVMeoFSessionByNQNFromSubsystems(nqn, s) },
+		disconnect:  util.NVMeoFDisconnect,
+		relist:      func() ([]util.NVMeSubsystem, error) { return util.ListNVMeSubsystems(ctx) },
+	}, nqn, stagingPath, subsystems)
 
 	// Connect to NVMe-oF subsystem with configurable timeout
 	transportURI := fmt.Sprintf("%s://%s:%s", transport, address, port)
@@ -1604,30 +1656,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	}
 	RecordNodeConnect("nvmeof", "success")
 
-	// Check if block mode
-	if volCap != nil && volCap.GetBlock() != nil {
-		// For block mode, create a symlink to the device
-		// Use atomic rename to avoid race conditions when recreating symlinks
-		if err := createSymlinkAtomic(devicePath, stagingPath); err != nil {
-			return status.Errorf(codes.Internal, "failed to create device symlink: %v", err)
-		}
-		return nil
-	}
-
-	// For filesystem mode, format and mount
-	fsType := "ext4"
-	if volCap != nil && volCap.GetMount() != nil && volCap.GetMount().GetFsType() != "" {
-		fsType = strings.ToLower(volCap.GetMount().GetFsType())
-	}
-	mountFlags := volumeMountFlagsForFS(volCap, fsType)
-
-	if err := nodeFormatAndMount(ctx, devicePath, stagingPath, fsType, mountFlags); err != nil {
-		operationErr := status.Errorf(codes.Internal, "failed to format and mount: %v", err)
-		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonMountFailed, operationErr.Error())
-		return operationErr
-	}
-
-	return nil
+	return d.finalizeStagedDevice(ctx, devicePath, stagingPath, volCap, eventObjects...)
 }
 
 func volumeMountFlags(volCap *csi.VolumeCapability) []string {

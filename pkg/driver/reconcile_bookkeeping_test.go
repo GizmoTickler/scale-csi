@@ -302,8 +302,10 @@ func TestReapTombstoneWithChildOnlyLedgerEntry(t *testing.T) {
 		"precondition: the fresh entry lives on the child only")
 
 	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
-	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour)
+	retire := &tombstoneRetirementBatch{}
+	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour, retire)
 	assert.True(t, reaped, "child-only provenance must authorize the reap, got refusal: %s", reason)
+	retire.flush(ctx, d, nil)
 	_, err = client.SnapshotGet(ctx, tombstoneID)
 	assert.True(t, truenas.IsNotFoundError(err), "the released tombstone is destroyed")
 	child, err = client.DatasetGet(ctx, d.bookkeepingDatasetName())
@@ -336,8 +338,125 @@ func TestReapSurvivesCleanupParentMigration(t *testing.T) {
 		"cleanupParent must remove the confirmed-copied parent entry")
 
 	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
-	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour)
+	retire := &tombstoneRetirementBatch{}
+	reaped, reason := d.reapTombstoneSnapshot(ctx, tombstoneReconcileObject(t, client, tombstoneID), time.Hour, retire)
 	assert.True(t, reaped, "the migrated child entry must still authorize the reap, got refusal: %s", reason)
+	retire.flush(ctx, d, parent)
 	_, err = client.SnapshotGet(ctx, tombstoneID)
 	assert.True(t, truenas.IsNotFoundError(err), "the released tombstone is destroyed after the parent cleanup")
+}
+
+// TestBookkeepingExistenceFlagShortCircuitsAndReArms proves the P4 optimization:
+// ensureBookkeepingDataset checks the bookkeeping dataset's existence once and
+// then short-circuits on a per-Driver flag (removing one pool.dataset.query per
+// marker / ledger write), and the flag re-arms on a bookkeeping write failure so
+// a dataset deleted out from under the driver self-heals on the next ensure.
+func TestBookkeepingExistenceFlagShortCircuitsAndReArms(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	d := &Driver{
+		name:          "org.scale.csi.test",
+		config:        &Config{DriverName: "org.scale.csi.nfs", ZFS: ZFSConfig{DatasetParentName: "pool/parent"}},
+		truenasClient: client,
+	}
+	enableBookkeeping(d)
+
+	// First ensure: one existence DatasetGet (not found) + one DatasetCreate.
+	require.NoError(t, d.ensureBookkeepingDataset(ctx))
+	_, methods := client.callSnapshot()
+	assert.Equal(t, 1, methods["DatasetGet"], "first ensure reads the dataset once")
+	assert.Equal(t, 1, methods["DatasetCreate"], "first ensure creates the missing dataset")
+
+	// Subsequent ensures are short-circuited by the flag: zero backend calls.
+	client.resetCalls()
+	require.NoError(t, d.ensureBookkeepingDataset(ctx))
+	require.NoError(t, d.ensureBookkeepingDataset(ctx))
+	_, methods = client.callSnapshot()
+	assert.Equal(t, 0, methods["DatasetGet"], "the existence flag must short-circuit the re-read")
+	assert.Equal(t, 0, methods["DatasetCreate"], "the existence flag must short-circuit recreation")
+
+	// Delete the dataset out from under the driver and re-arm the flag exactly as
+	// a failed bookkeeping write would. The next ensure re-checks and recreates.
+	require.NoError(t, client.MockClient.DatasetDelete(ctx, d.bookkeepingDatasetName(), false, true))
+	d.noteBookkeepingWriteFailure(d.bookkeepingDatasetName(), fmt.Errorf("simulated bookkeeping write failure"))
+	client.resetCalls()
+	require.NoError(t, d.ensureBookkeepingDataset(ctx))
+	_, methods = client.callSnapshot()
+	assert.Equal(t, 1, methods["DatasetGet"], "a re-armed flag re-checks existence")
+	assert.Equal(t, 1, methods["DatasetCreate"], "a deleted bookkeeping dataset self-heals on the next ensure")
+
+	// A write failure targeting the PARENT (bookkeeping disabled path) must NOT
+	// re-arm the flag.
+	d.bookkeepingExists.Store(true)
+	d.noteBookkeepingWriteFailure(d.parentDatasetName(), fmt.Errorf("parent write failure"))
+	assert.True(t, d.bookkeepingExists.Load(), "a parent-targeted failure must not clear the bookkeeping flag")
+
+	// A child removal returning NotFound is operationally tolerated, but it still
+	// proves the cached existence assumption stale and must re-arm the next write.
+	require.NoError(t, client.MockClient.DatasetDelete(ctx, d.bookkeepingDatasetName(), false, true))
+	d.bookkeepingExists.Store(true)
+	require.NoError(t, d.removeBookkeepingProperties(ctx, []string{"truenas-csi:test_key"}))
+	assert.False(t, d.bookkeepingExists.Load(),
+		"a tolerated NotFound child removal must re-arm bookkeeping existence")
+	require.NoError(t, d.ensureBookkeepingDataset(ctx))
+	assert.True(t, d.bookkeepingExists.Load())
+}
+
+// TestTombstoneRetirementBatchFlushProves the P5 batched post-destroy ledger
+// removal: retired entries are removed in batched, size-bounded calls at pass
+// end, and the parent removal is skipped entirely when the pass's parent read
+// carries none of the retired keys (the fully-migrated steady state).
+func TestTombstoneRetirementBatchFlush(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	d := &Driver{
+		name:          "org.scale.csi.test",
+		config:        &Config{DriverName: "org.scale.csi.nfs", ZFS: ZFSConfig{DatasetParentName: "pool/parent"}},
+		truenasClient: client,
+	}
+	enableBookkeeping(d)
+	require.NoError(t, d.ensureBookkeepingDataset(ctx))
+
+	// Seed the child bookkeeping dataset with three ledger entries.
+	ids := []string{"pool/parent/vol@snap-a", "pool/parent/vol@snap-b", "pool/parent/vol@snap-c"}
+	for _, id := range ids {
+		require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+			Version: tombstoneLedgerVersion, Snapshot: id, Dataset: "pool/parent/vol", CreatedAt: 1,
+		}))
+	}
+
+	// Flush with a parent read that carries NONE of the retired keys: the parent
+	// removal is skipped (zero parent calls), the child removal happens once.
+	batch := &tombstoneRetirementBatch{}
+	for _, id := range ids {
+		batch.add(id)
+	}
+	parent := &truenas.Dataset{Name: "pool/parent", UserProperties: map[string]truenas.UserProperty{}}
+	client.resetCalls()
+	batch.flush(ctx, d, parent)
+	_, methods := client.callSnapshot()
+	assert.Equal(t, 1, methods["DatasetRemoveUserProperties"], "one batched child removal, parent skipped when it carries no retired keys")
+	child, err := client.DatasetGet(ctx, d.bookkeepingDatasetName())
+	require.NoError(t, err)
+	assert.Empty(t, tombstoneLedgerFromDataset(child), "all retired child entries are removed")
+
+	// A nil parent (read failed) falls back to the conservative parent+child
+	// removal: two calls.
+	for _, id := range ids {
+		require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+			Version: tombstoneLedgerVersion, Snapshot: id, Dataset: "pool/parent/vol", CreatedAt: 1,
+		}))
+	}
+	batch2 := &tombstoneRetirementBatch{}
+	for _, id := range ids {
+		batch2.add(id)
+	}
+	client.resetCalls()
+	batch2.flush(ctx, d, nil)
+	_, methods = client.callSnapshot()
+	assert.Equal(t, 2, methods["DatasetRemoveUserProperties"], "nil parent falls back to parent+child removal")
 }

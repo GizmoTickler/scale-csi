@@ -857,6 +857,8 @@ func TestReconcileNeverReapsForeignTombstoneShapedSnapshots(t *testing.T) {
 	pvSource := reconcilePV("source", "csi.scale.io")
 	d, client := newReconcileTestDriver(t, false, []runtime.Object{pvSource}, nil)
 	client.NoDeferredSnapshotDestroy = true
+	enabled := true
+	d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
 	mustCreateParentDataset(t, client)
 	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
 	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
@@ -889,10 +891,172 @@ func TestReconcileNeverReapsForeignTombstoneShapedSnapshots(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, report.DeletedTombstones)
 	assert.Zero(t, report.TombstoneSnapshotCount, "lookalike snapshots must not even be classified")
+	assert.Equal(t, 1, report.ManualRecoveryTombstoneCount,
+		"fallback-enabled manual lookalikes must be counted for manual recovery, never deletion")
+	require.Len(t, report.ManualRecoveryTombstones, 1)
+	assert.Equal(t, manual.ID, report.ManualRecoveryTombstones[0].ID)
 	_, err = client.SnapshotGet(ctx, manual.ID)
 	require.NoError(t, err, "the manual lookalike snapshot must survive")
 	_, err = client.SnapshotGet(ctx, liveCSI.ID)
 	require.NoError(t, err, "the live CSI lookalike snapshot must survive despite the stale ledger entry")
+}
+
+// TestReconcileTombstoneScanFallbackRecoversStrandedTombstone proves the
+// reconcile.tombstoneReaper.scanFallback recovery path. A tombstone-shaped
+// snapshot whose ledger entry is missing (the production failure mode) is stranded
+// forever by the ledger-only reaper; with the scan fallback enabled it is
+// classified and reaped only when its retained creation-time snapshot identity
+// exactly proves the driver's rename output. The fallback defaults to off,
+// preserving the strict ledger-only behavior.
+func TestReconcileTombstoneScanFallbackRecoversStrandedTombstone(t *testing.T) {
+	setup := func(t *testing.T) (*Driver, *truenas.MockClient, string) {
+		t.Helper()
+		ctx := context.Background()
+		pv := reconcilePV("source", "csi.scale.io")
+		d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+		client.NoDeferredSnapshotDestroy = true
+		mustCreateParentDataset(t, client)
+		source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+		require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+		// Model a TrueNAS 26.0 renamed tombstone: creation-time identity properties
+		// survive the rename, but its ledger entry was lost.
+		originalName := "snap"
+		stranded, err := client.SnapshotCreate(ctx, source.Name, sanitizeVolumeID(originalName), map[string]string{
+			PropManagedResource:           "true",
+			PropDriverInstanceID:          d.driverInstanceID(),
+			PropCSISnapshotName:           originalName,
+			PropCSISnapshotSourceVolumeID: "source",
+		})
+		require.NoError(t, err)
+		tombstoneName := snapshotTombstoneName(source.Name, sanitizeVolumeID(originalName), 1)
+		require.NoError(t, client.SnapshotRename(ctx, stranded.ID, tombstoneName))
+		stranded, err = client.SnapshotGet(ctx, source.Name+"@"+tombstoneName)
+		require.NoError(t, err)
+		stranded.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+		return d, client, stranded.ID
+	}
+
+	t.Run("disabled leaves it stranded", func(t *testing.T) {
+		ctx := context.Background()
+		d, client, tombstoneID := setup(t)
+		report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+		require.NoError(t, err)
+		assert.Empty(t, report.DeletedTombstones, "scan fallback off: the ledger-less tombstone stays stranded")
+		_, err = client.SnapshotGet(ctx, tombstoneID)
+		require.NoError(t, err, "the stranded tombstone must survive when the fallback is off")
+	})
+
+	t.Run("enabled recovers it", func(t *testing.T) {
+		ctx := context.Background()
+		d, client, tombstoneID := setup(t)
+		enabled := true
+		d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
+		report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+		require.NoError(t, err)
+		assert.Contains(t, report.DeletedTombstones, tombstoneID, "scan fallback on: retained identity proves and reaps the stranded tombstone")
+		_, err = client.SnapshotGet(ctx, tombstoneID)
+		require.True(t, truenas.IsNotFoundError(err), "the stranded tombstone is destroyed")
+	})
+}
+
+func TestReconcileTombstoneScanFallbackRunsAlongsideStrictBacklog(t *testing.T) {
+	ctx := context.Background()
+	pvs := []runtime.Object{
+		reconcilePV("strict-source", "csi.scale.io"),
+		reconcilePV("fallback-source", "csi.scale.io"),
+	}
+	d, client := newReconcileTestDriver(t, false, pvs, nil)
+	client.NoDeferredSnapshotDestroy = true
+	enabled := true
+	d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
+	mustCreateParentDataset(t, client)
+
+	createRenamed := func(sourceID, original string, nonce int64) *truenas.Snapshot {
+		source := addReconcileDataset(client, sourceID, time.Now().Add(-72*time.Hour), true, testGiB)
+		require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+		snapshot, err := client.SnapshotCreate(ctx, source.Name, sanitizeVolumeID(original), map[string]string{
+			PropManagedResource:           "true",
+			PropDriverInstanceID:          d.driverInstanceID(),
+			PropCSISnapshotName:           original,
+			PropCSISnapshotSourceVolumeID: sourceID,
+		})
+		require.NoError(t, err)
+		snapshot.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+		tombstoneName := snapshotTombstoneName(source.Name, sanitizeVolumeID(original), nonce)
+		require.NoError(t, client.SnapshotRename(ctx, snapshot.ID, tombstoneName))
+		renamed, err := client.SnapshotGet(ctx, source.Name+"@"+tombstoneName)
+		require.NoError(t, err)
+		return renamed
+	}
+
+	strict := createRenamed("strict-source", "strict-snap", 1)
+	require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+		Version: tombstoneLedgerVersion, Snapshot: strict.ID, Dataset: strict.Dataset,
+		CreatedAt: strict.GetCreationTime(), RenamedAt: time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339Nano),
+	}))
+	require.NoError(t, client.SnapshotClone(ctx, strict.ID, "pool/parent/strict-clone"))
+	fallback := createRenamed("fallback-source", "fallback-snap", 2)
+
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Contains(t, report.DeletedTombstones, fallback.ID,
+		"fallback candidates must be processed even while strict backlog exists")
+	assert.NotContains(t, report.DeletedTombstones, strict.ID)
+	_, err = client.SnapshotGet(ctx, strict.ID)
+	require.NoError(t, err, "clone-blocked strict backlog remains")
+	_, err = client.SnapshotGet(ctx, fallback.ID)
+	assert.True(t, truenas.IsNotFoundError(err), "independent fallback candidate is reaped")
+}
+
+// TestReconcileScanFallbackRefusesInheritedTombstoneIdentity is the Batch 18 R0
+// regression: on TrueNAS 26.0 the snapshot resource path returns SOURCELESS
+// user_properties, so a tombstone-shaped snapshot could carry csi_snapshot_name
+// and driver_instance_id INHERITED from its source dataset rather than written at
+// CreateSnapshot. Retained snapshot identity alone would then falsely prove a
+// driver tombstone and reap a user snapshot. When the source dataset itself
+// carries csi_snapshot_name, the identity-only scan-fallback path must route the
+// candidate to manual recovery and never delete it.
+func TestReconcileScanFallbackRefusesInheritedTombstoneIdentity(t *testing.T) {
+	ctx := context.Background()
+	pv := reconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	client.NoDeferredSnapshotDestroy = true
+	enabled := true
+	d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
+	mustCreateParentDataset(t, client)
+
+	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+	// The inheritance vector: the SOURCE DATASET carries csi_snapshot_name, so a
+	// tombstone-shaped snapshot under it could inherit that identity rather than
+	// have the driver write it at CreateSnapshot.
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropCSISnapshotName, "inherited-name"))
+
+	// A tombstone-shaped snapshot whose retained identity values would otherwise
+	// pass snapshotMatchesRetainedTombstoneIdentity (as in the stranded-tombstone
+	// recovery test) — the only difference is the masking source-dataset property.
+	originalName := "snap"
+	stranded, err := client.SnapshotCreate(ctx, source.Name, sanitizeVolumeID(originalName), map[string]string{
+		PropManagedResource:           "true",
+		PropDriverInstanceID:          d.driverInstanceID(),
+		PropCSISnapshotName:           originalName,
+		PropCSISnapshotSourceVolumeID: "source",
+	})
+	require.NoError(t, err)
+	tombstoneName := snapshotTombstoneName(source.Name, sanitizeVolumeID(originalName), 1)
+	require.NoError(t, client.SnapshotRename(ctx, stranded.ID, tombstoneName))
+	stranded, err = client.SnapshotGet(ctx, source.Name+"@"+tombstoneName)
+	require.NoError(t, err)
+	stranded.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Empty(t, report.DeletedTombstones, "an inheritance-masked candidate must never be reaped")
+	assert.Zero(t, report.TombstoneSnapshotCount, "it must not be classified as a delete candidate")
+	require.Len(t, report.ManualRecoveryTombstones, 1, "it must be surfaced for manual recovery")
+	assert.Equal(t, stranded.ID, report.ManualRecoveryTombstones[0].ID)
+	_, err = client.SnapshotGet(ctx, stranded.ID)
+	require.NoError(t, err, "the snapshot with inherited identity must survive")
 }
 
 // Crash window between ledger write and tombstone rename: the ledger entry has
@@ -1242,6 +1406,8 @@ func TestReconcileRefusesStaleLedgerOverRecreatedLookalike(t *testing.T) {
 	ctx := context.Background()
 	pvSource := reconcilePV("source", "csi.scale.io")
 	d, client := newReconcileTestDriver(t, false, []runtime.Object{pvSource}, nil)
+	enabled := true
+	d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
 	mustCreateParentDataset(t, client)
 	source := addReconcileDataset(client, "source", time.Now().Add(-90*24*time.Hour), true, testGiB)
 	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
@@ -1265,6 +1431,8 @@ func TestReconcileRefusesStaleLedgerOverRecreatedLookalike(t *testing.T) {
 	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
 	require.NoError(t, err)
 	assert.Zero(t, report.TombstoneSnapshotCount, "a creation-identity mismatch must not classify")
+	assert.Equal(t, 1, report.ManualRecoveryTombstoneCount,
+		"a present-but-mismatched ledger must fail closed instead of downgrading to fallback")
 	assert.Empty(t, report.DeletedTombstones)
 	_, err = client.SnapshotGet(ctx, lookalike.ID)
 	require.NoError(t, err, "the recreated lookalike must survive the stale ledger entry")

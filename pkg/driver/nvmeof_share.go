@@ -16,22 +16,22 @@ import (
 // nvmeoFShareBackend implements ShareBackend for NVMe-oF.
 type nvmeoFShareBackend struct{ d *Driver }
 
-func (b nvmeoFShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string) error {
+func (b nvmeoFShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, res *fenceResolution) error {
 	// The create path validates the namespace's device backreference and
 	// repairs cached IDs before returning an idempotent success.
-	return b.d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, false, false)
+	return b.d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, false, false, res)
 }
 
 func (b nvmeoFShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
-	return b.d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady)
+	return b.d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, nil)
 }
 
 func (b nvmeoFShareBackend) DeleteShare(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
 	return b.d.deleteNVMeoFShareForDataset(ctx, ds, datasetName)
 }
 
-func (b nvmeoFShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string) error {
-	return b.d.applyNVMeFence(ctx, ds, datasetName, enforceable, removing, ownedNVMeNQNs, uniqueSortedStrings(protectedNVMeNQNs))
+func (b nvmeoFShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, res *fenceResolution) error {
+	return b.d.applyNVMeFence(ctx, ds, datasetName, enforceable, removing, ownedNVMeNQNs, uniqueSortedStrings(protectedNVMeNQNs), res)
 }
 
 func (b nvmeoFShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error {
@@ -59,7 +59,7 @@ func (d *Driver) nvmeofVolumeContext(ctx context.Context, ds *truenas.Dataset, d
 	return nil
 }
 
-func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool) error {
+func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution) error {
 	if !d.config.Fencing.Enabled() && !d.config.NVMeoF.SubsystemAllowAnyHost && len(d.config.NVMeoF.SubsystemHosts) == 0 {
 		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
 	}
@@ -74,23 +74,28 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	subsysName := d.nvmeSubsystemName(datasetName)
 	var subsys *truenas.NVMeoFSubsystem
 	if !freshlyCreated {
-		namespace, resolveErr := d.resolveNVMeNamespace(ctx, ds, datasetName)
+		namespace, resolvedSubsys, resolveErr := d.resolvedNVMeObjects(ctx, res, ds, datasetName)
 		if resolveErr != nil {
-			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF namespace: %v", resolveErr)
+			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF namespace/subsystem: %v", resolveErr)
 		}
-		subsys, resolveErr = d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
-		if resolveErr != nil {
-			return status.Errorf(codes.Internal, "failed to resolve NVMe-oF subsystem: %v", resolveErr)
-		}
+		subsys = resolvedSubsys
 		if namespace != nil {
 			if subsys == nil || namespace.SubsystemID != subsys.ID {
 				return status.Errorf(codes.Internal, "NVMe-oF namespace %d for %s has no matching subsystem", namespace.ID, datasetName)
 			}
-			if propertyErr := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
-				PropNVMeoFSubsystemID: strconv.Itoa(subsys.ID),
-				PropNVMeoFNamespaceID: strconv.Itoa(namespace.ID),
-			}); propertyErr != nil {
-				return status.Errorf(codes.Internal, "failed to repair NVMe-oF object IDs: %v", propertyErr)
+			// The repair-stamp write heals missing/stale cached object IDs. When the
+			// dataset already carries the resolved IDs it is a no-op, so re-issuing
+			// it on every publish is a wasted pool.dataset.update — skip it. The
+			// write still runs (with the same values) whenever the props are absent
+			// or diverge, so the self-healing contract is unchanged.
+			if datasetUserProperty(ds, PropNVMeoFSubsystemID) != strconv.Itoa(subsys.ID) ||
+				datasetUserProperty(ds, PropNVMeoFNamespaceID) != strconv.Itoa(namespace.ID) {
+				if propertyErr := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+					PropNVMeoFSubsystemID: strconv.Itoa(subsys.ID),
+					PropNVMeoFNamespaceID: strconv.Itoa(namespace.ID),
+				}); propertyErr != nil {
+					return status.Errorf(codes.Internal, "failed to repair NVMe-oF object IDs: %v", propertyErr)
+				}
 			}
 			// Fenced allowlists are changed only after ControllerPublishVolume has
 			// durably stored the requested node identity. CreateVolume retries and
@@ -223,6 +228,11 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		klog.Warningf("Failed to store NVMe-oF resource IDs: %v", err)
 	}
 
+	// ensureShareExists may have memoized a complete miss before recreating this
+	// share. Replace that stale (nil, nil) resolution with the objects just
+	// created and clear associations after all share/association mutations so
+	// the fenced publish classifies and enforces against current backend state.
+	res.storeNVMeObjects(namespace, subsys)
 	klog.Infof("Created NVMe-oF subsystem=%d, namespace=%d, port-assoc=%d for %s", subsys.ID, namespace.ID, portSubsys.ID, datasetName)
 	return nil
 }

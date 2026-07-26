@@ -741,7 +741,7 @@ func TestCreateNVMeoFShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testin
 	})
 	require.NoError(t, err)
 
-	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "fresh-nvme", true, true)
+	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "fresh-nvme", true, true, nil)
 	require.NoError(t, err)
 	assert.Zero(t, mockClient.datasetGets)
 	assert.Zero(t, mockClient.zvolWaits)
@@ -776,7 +776,7 @@ func TestCreateNVMeoFShareAllowAnyHostSkipsHostResolution(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "allow-any-nvme", true, true)
+	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "allow-any-nvme", true, true, nil)
 	require.NoError(t, err)
 	assert.Zero(t, mockClient.hostFindCalls)
 	assert.Zero(t, mockClient.hostCreateCalls)
@@ -813,7 +813,7 @@ func TestCreateNVMeoFShareRestrictedHostsResolveAndCache(t *testing.T) {
 			Name: datasetName, Type: "VOLUME", Volsize: 1024 * 1024 * 1024,
 		})
 		require.NoError(t, createErr)
-		require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, volume, true, true))
+		require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, volume, true, true, nil))
 	}
 
 	createdHost := baseClient.NVMeHosts[createdNQN]
@@ -832,7 +832,7 @@ func TestCreateNVMeoFShareRestrictedHostsRequiresNQN(t *testing.T) {
 		truenasClient: truenas.NewMockClient(),
 	}
 
-	err := d.createNVMeoFShareForDataset(context.Background(), nil, "tank/k8s/volumes/restricted-empty", "restricted-empty", true, true)
+	err := d.createNVMeoFShareForDataset(context.Background(), nil, "tank/k8s/volumes/restricted-empty", "restricted-empty", true, true, nil)
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.Contains(t, err.Error(), "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty")
@@ -863,7 +863,7 @@ func TestCreateNVMeoFShareRestrictedHostsReResolvesOnHostNotFound(t *testing.T) 
 	datasetName := "tank/k8s/volumes/restricted-retry"
 	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "restricted-retry", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "restricted-retry", true, true, nil))
 
 	assert.Equal(t, 2, mockClient.hostFindCalls, "retry must re-query after cache invalidation")
 	assert.Equal(t, 1, mockClient.hostCreateCalls, "existing host record must be reused on retry")
@@ -891,7 +891,7 @@ func TestCreateNVMeoFShareDeletesNewSubsystemOnHostReconcileFailure(t *testing.T
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
 
-	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "reconcile-failure", true, true)
+	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "reconcile-failure", true, true, nil)
 	require.Error(t, err)
 	require.Len(t, client.deletedSubsystemIDs, 1)
 	_, err = client.NVMeoFSubsystemGet(ctx, client.deletedSubsystemIDs[0])
@@ -918,7 +918,7 @@ func TestEnsureShareExistsDoesNotDeletePreexistingSubsystemOnHostReconcileFailur
 		SubsystemHosts: []string{nqn},
 	}}, truenasClient: client, nvmeResolvedHosts: map[string]int{nqn: host.ID}}
 
-	err = d.ensureShareExists(ctx, ds, "tank/csi/preexisting", "preexisting", ShareTypeNVMeoF)
+	err = d.ensureShareExists(ctx, ds, "tank/csi/preexisting", "preexisting", ShareTypeNVMeoF, nil)
 	require.Error(t, err)
 	assert.Empty(t, client.deletedSubsystemIDs)
 	_, err = client.NVMeoFSubsystemGet(ctx, subsys.ID)
@@ -961,7 +961,7 @@ func TestEnsureShareExists_AlreadyExists(t *testing.T) {
 	require.NoError(t, err)
 
 	// Call ensureShareExists - should return immediately
-	err = d.ensureShareExists(ctx, ds, datasetName, "test-vol", ShareTypeNFS)
+	err = d.ensureShareExists(ctx, ds, datasetName, "test-vol", ShareTypeNFS, nil)
 	assert.NoError(t, err)
 }
 
@@ -979,7 +979,7 @@ func TestEnsureShareExistsRecreatesStaleStoredObjects(t *testing.T) {
 		require.NoError(t, client.NFSShareDelete(ctx, share.ID))
 
 		d := &Driver{config: &Config{NFS: NFSConfig{ShareHost: "192.0.2.10"}}, truenasClient: client}
-		require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-nfs", ShareTypeNFS))
+		require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-nfs", ShareTypeNFS, nil))
 		newID, err := client.DatasetGetUserProperty(ctx, datasetName, PropNFSShareID)
 		require.NoError(t, err)
 		assert.NotEmpty(t, newID)
@@ -1011,7 +1011,7 @@ func TestEnsureShareExistsRecreatesStaleStoredObjects(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, client.ISCSITargetExtentDelete(ctx, oldIDInt, true))
 
-		require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-iscsi", ShareTypeISCSI))
+		require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-iscsi", ShareTypeISCSI, nil))
 		newID, err := client.DatasetGetUserProperty(ctx, datasetName, PropISCSITargetExtentID)
 		require.NoError(t, err)
 		assert.NotEmpty(t, newID)
@@ -1028,12 +1028,12 @@ func TestEnsureShareExistsRecreatesStaleStoredObjects(t *testing.T) {
 		datasetName := "tank/k8s/volumes/stale-nvme"
 		ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 		require.NoError(t, err)
-		require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "stale-nvme", true, true))
+		require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "stale-nvme", true, true, nil))
 		oldID, err := client.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID)
 		require.NoError(t, err)
 		require.NoError(t, client.NVMeoFNamespaceDelete(ctx, mustAtoi(t, oldID)))
 
-		require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-nvme", ShareTypeNVMeoF))
+		require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-nvme", ShareTypeNVMeoF, nil))
 		newID, err := client.DatasetGetUserProperty(ctx, datasetName, PropNVMeoFNamespaceID)
 		require.NoError(t, err)
 		_, err = client.NVMeoFNamespaceGet(ctx, mustAtoi(t, newID))
@@ -1072,7 +1072,7 @@ func TestEnsureShareExistsReturnsTransientVerificationErrors(t *testing.T) {
 				config.NVMeoF.SubsystemAllowAnyHost = true
 			}
 			d := &Driver{config: config, truenasClient: client}
-			err := d.ensureShareExists(context.Background(), ds, "tank/csi/vol", "vol", shareType)
+			err := d.ensureShareExists(context.Background(), ds, "tank/csi/vol", "vol", shareType, nil)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "temporary API outage")
 		})
@@ -1170,7 +1170,7 @@ func TestEnsureShareExists_MissingShare(t *testing.T) {
 	require.NoError(t, err)
 
 	// Call ensureShareExists - should create the share
-	err = d.ensureShareExists(ctx, ds, datasetName, "test-vol", ShareTypeNFS)
+	err = d.ensureShareExists(ctx, ds, datasetName, "test-vol", ShareTypeNFS, nil)
 	assert.NoError(t, err)
 
 	// Verify share was created by checking property was set
@@ -1209,7 +1209,7 @@ func TestEnsureShareExists_DashValue(t *testing.T) {
 	require.NoError(t, err)
 
 	// Call ensureShareExists - should create share since "-" means unset
-	err = d.ensureShareExists(ctx, ds, datasetName, "test-vol", ShareTypeNFS)
+	err = d.ensureShareExists(ctx, ds, datasetName, "test-vol", ShareTypeNFS, nil)
 	assert.NoError(t, err)
 
 	// Verify share was created
@@ -1245,8 +1245,8 @@ func TestEnsureShareExistsNVMeoFReconcilesRestrictedHosts(t *testing.T) {
 		}},
 		truenasClient: mockClient,
 	}
-	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "existing-nvme", ShareTypeNVMeoF))
-	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "existing-nvme", ShareTypeNVMeoF))
+	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "existing-nvme", ShareTypeNVMeoF, nil))
+	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "existing-nvme", ShareTypeNVMeoF, nil))
 	assert.Equal(t, []int{host.ID}, subsys.Hosts, "reconciliation must add each host once")
 }
 
@@ -1284,7 +1284,7 @@ func TestEnsureShareExistsNVMeoFReResolvesStaleHostID(t *testing.T) {
 	newHost := &truenas.NVMeoFHost{ID: oldHost.ID + 10, HostNQN: nqn}
 	baseClient.NVMeHosts[nqn] = newHost
 
-	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-host-nvme", ShareTypeNVMeoF))
+	require.NoError(t, d.ensureShareExists(ctx, ds, datasetName, "stale-host-nvme", ShareTypeNVMeoF, nil))
 	assert.Equal(t, []int{newHost.ID}, subsys.Hosts)
 	assert.Equal(t, 2, mockClient.hostFindCalls, "host-not-found must invalidate and re-resolve once")
 }
@@ -1346,7 +1346,7 @@ func TestNVMeoFPortAssociationFailureInvalidatesResolvedPort(t *testing.T) {
 	datasetName := "tank/k8s/volumes/nvme-port-cache-invalidation"
 	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
 	require.NoError(t, err)
-	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "nvme-port-cache-invalidation", true, true)
+	err = d.createNVMeoFShareForDataset(ctx, ds, datasetName, "nvme-port-cache-invalidation", true, true, nil)
 	require.Error(t, err)
 	assert.Equal(t, 1, mockClient.portInvalidationCalls)
 	assert.Equal(t, "TCP", mockClient.invalidatedTransport)

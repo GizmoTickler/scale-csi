@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+// notFoundAPIError builds the not-found error shape TrueNAS 26.0 emits: a
+// negative JSON-RPC code plus an AUTHORITATIVE ENOENT errno carried in Data. The
+// human-readable message is preserved. Before this, the mock returned a bare
+// message-only APIError, so IsNotFoundError tests only ever exercised the
+// substring fallback and never the errno path production actually emits.
+func notFoundAPIError(message string) *APIError {
+	return &APIError{Code: -1, Message: message, Data: map[string]interface{}{"errno": "ENOENT"}}
+}
+
 // MockClient is a mock implementation of ClientInterface for testing.
 type MockClient struct {
 	mu                     sync.RWMutex
@@ -156,7 +165,7 @@ func (m *MockClient) ISCSIInitiatorUpdate(ctx context.Context, id int, initiator
 	defer m.mu.Unlock()
 	group := m.ISCSIInitiators[id]
 	if group == nil {
-		return nil, fmt.Errorf("iSCSI initiator group not found")
+		return nil, notFoundAPIError("iSCSI initiator group not found")
 	}
 	group.Initiators = cloneStringsPreservingNil(initiators)
 	if comment != "" {
@@ -357,7 +366,23 @@ func (m *MockClient) DatasetGet(ctx context.Context, name string) (*Dataset, err
 	if ds, ok := m.Datasets[name]; ok {
 		return mockDatasetResponse(ds, false), nil
 	}
-	return nil, &APIError{Code: -1, Message: "dataset not found"}
+	return nil, notFoundAPIError("dataset not found")
+}
+
+func (m *MockClient) DatasetGetByNames(ctx context.Context, names []string) (map[string]*Dataset, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	result := make(map[string]*Dataset, len(names))
+	for _, name := range names {
+		if ds, ok := m.Datasets[name]; ok {
+			result[name] = mockDatasetResponse(ds, false)
+		}
+	}
+	return result, nil
 }
 
 func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error) {
@@ -369,7 +394,7 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return nil, &APIError{Code: -1, Message: "dataset not found"}
+		return nil, notFoundAPIError("dataset not found")
 	}
 
 	if params.Volsize > 0 {
@@ -378,11 +403,11 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 	if params.Refquota != nil {
 		switch refquota := params.Refquota.(type) {
 		case int:
-			ds.Refquota = DatasetProperty{Parsed: float64(refquota)}
+			ds.Refquota = DatasetProperty{Parsed: float64(refquota), Source: "LOCAL"}
 		case int64:
-			ds.Refquota = DatasetProperty{Parsed: float64(refquota)}
+			ds.Refquota = DatasetProperty{Parsed: float64(refquota), Source: "LOCAL"}
 		case float64:
-			ds.Refquota = DatasetProperty{Parsed: refquota}
+			ds.Refquota = DatasetProperty{Parsed: refquota, Source: "LOCAL"}
 		}
 	}
 	if params.Refreservation != nil {
@@ -507,7 +532,7 @@ func (m *MockClient) DatasetSetUserProperties(ctx context.Context, name string, 
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return &APIError{Code: -1, Message: "dataset not found"}
+		return notFoundAPIError("dataset not found")
 	}
 	for key, value := range properties {
 		ds.UserProperties[key] = UserProperty{Value: value, Source: "local"}
@@ -523,7 +548,7 @@ func (m *MockClient) DatasetRemoveUserProperties(ctx context.Context, name strin
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return &APIError{Code: -1, Message: "dataset not found"}
+		return notFoundAPIError("dataset not found")
 	}
 	for _, key := range keys {
 		delete(ds.UserProperties, key)
@@ -537,7 +562,7 @@ func (m *MockClient) DatasetGetUserProperty(ctx context.Context, name, key strin
 
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return "", &APIError{Code: -1, Message: "dataset not found"}
+		return "", notFoundAPIError("dataset not found")
 	}
 	if prop, ok := ds.UserProperties[key]; ok {
 		return prop.Value, nil
@@ -554,7 +579,7 @@ func (m *MockClient) DatasetExpand(ctx context.Context, name string, newSize int
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
-		return &APIError{Code: -1, Message: "dataset not found"}
+		return notFoundAPIError("dataset not found")
 	}
 	ds.Volsize = DatasetProperty{Parsed: float64(newSize)}
 	return nil
@@ -657,7 +682,7 @@ func (m *MockClient) SnapshotRename(ctx context.Context, snapshotID, newName str
 	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
-		return &APIError{Code: -1, Message: "snapshot not found"}
+		return notFoundAPIError("snapshot not found")
 	}
 	dataset, _, ok := strings.Cut(snapshotID, "@")
 	if !ok || newName == "" {
@@ -694,7 +719,7 @@ func (m *MockClient) SnapshotGet(ctx context.Context, snapshotID string) (*Snaps
 	if snap, ok := m.Snapshots[snapshotID]; ok {
 		return snap, nil
 	}
-	return nil, &APIError{Code: -1, Message: "snapshot not found"}
+	return nil, notFoundAPIError("snapshot not found")
 }
 
 func (m *MockClient) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
@@ -754,7 +779,7 @@ func (m *MockClient) SnapshotSetUserProperty(ctx context.Context, snapshotID, ke
 	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
-		return &APIError{Code: -1, Message: "snapshot not found"}
+		return notFoundAPIError("snapshot not found")
 	}
 	snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
 	return nil
@@ -773,7 +798,7 @@ func (m *MockClient) SnapshotRemoveUserProperties(ctx context.Context, snapshotI
 	}
 	snap, ok := m.Snapshots[snapshotID]
 	if !ok {
-		return &APIError{Code: -1, Message: "snapshot not found"}
+		return notFoundAPIError("snapshot not found")
 	}
 	for _, key := range keys {
 		delete(snap.UserProperties, key)
@@ -863,11 +888,11 @@ func (m *MockClient) CopyDatasetFromSnapshotLocal(
 	}
 	snapshotID := sourceDataset + "@" + snapshotShortName
 	if _, exists := m.Snapshots[snapshotID]; !exists {
-		return UnknownReplicationJobID, &APIError{Code: -1, Message: "snapshot not found"}
+		return UnknownReplicationJobID, notFoundAPIError("snapshot not found")
 	}
 	source, exists := m.Datasets[sourceDataset]
 	if !exists {
-		return UnknownReplicationJobID, &APIError{Code: -1, Message: "source dataset not found"}
+		return UnknownReplicationJobID, notFoundAPIError("source dataset not found")
 	}
 	jobID := m.nextReplicationJobID
 	m.nextReplicationJobID++
@@ -959,7 +984,7 @@ func (m *MockClient) NFSShareGet(ctx context.Context, id int) (*NFSShare, error)
 	if share, ok := m.NFSShares[id]; ok {
 		return share, nil
 	}
-	return nil, fmt.Errorf("share not found")
+	return nil, notFoundAPIError("share not found")
 }
 
 func (m *MockClient) NFSShareFindByPath(ctx context.Context, path string) (*NFSShare, error) {
@@ -990,7 +1015,7 @@ func (m *MockClient) NFSShareUpdate(ctx context.Context, id int, params map[stri
 	defer m.mu.Unlock()
 	share := m.NFSShares[id]
 	if share == nil {
-		return nil, fmt.Errorf("share not found")
+		return nil, notFoundAPIError("share not found")
 	}
 	if hosts, ok := params["hosts"].([]string); ok {
 		share.Hosts = append([]string(nil), hosts...)
@@ -1047,7 +1072,7 @@ func (m *MockClient) ISCSITargetUpdate(ctx context.Context, id int, groups []ISC
 	}
 	target := m.ISCSITargets[id]
 	if target == nil {
-		return nil, fmt.Errorf("iSCSI target not found")
+		return nil, notFoundAPIError("iSCSI target not found")
 	}
 	target.Groups = append([]ISCSITargetGroup(nil), groups...)
 	return target, nil
@@ -1066,7 +1091,7 @@ func (m *MockClient) ISCSITargetGet(ctx context.Context, id int) (*ISCSITarget, 
 	if t, ok := m.ISCSITargets[id]; ok {
 		return t, nil
 	}
-	return nil, fmt.Errorf("not found")
+	return nil, notFoundAPIError("not found")
 }
 func (m *MockClient) ISCSITargetFindByName(ctx context.Context, name string) (*ISCSITarget, error) {
 	m.mu.RLock()
@@ -1112,7 +1137,7 @@ func (m *MockClient) ISCSIExtentGet(ctx context.Context, id int) (*ISCSIExtent, 
 	if e, ok := m.ISCSIExtents[id]; ok {
 		return e, nil
 	}
-	return nil, fmt.Errorf("not found")
+	return nil, notFoundAPIError("not found")
 }
 func (m *MockClient) ISCSIExtentFindByName(ctx context.Context, name string) (*ISCSIExtent, error) {
 	m.mu.RLock()
@@ -1250,7 +1275,7 @@ func (m *MockClient) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysI
 	}
 	subsys := m.NVMeSubsystems[subsysID]
 	if subsys == nil {
-		return nil, fmt.Errorf("NVMe-oF subsystem ID %d not found", subsysID)
+		return nil, notFoundAPIError(fmt.Sprintf("NVMe-oF subsystem ID %d not found", subsysID))
 	}
 	hostFound := false
 	for _, host := range m.NVMeHosts {
@@ -1260,7 +1285,7 @@ func (m *MockClient) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysI
 		}
 	}
 	if !hostFound {
-		return nil, fmt.Errorf("NVMe-oF host ID %d not found", hostID)
+		return nil, notFoundAPIError(fmt.Sprintf("NVMe-oF host ID %d not found", hostID))
 	}
 	for _, association := range m.NVMeHostSubsystems {
 		if association.HostID == hostID && association.SubsysID == subsysID {
@@ -1352,7 +1377,7 @@ func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, all
 				}
 			}
 			if !found {
-				return nil, fmt.Errorf("NVMe-oF host ID %d not found", hostID)
+				return nil, notFoundAPIError(fmt.Sprintf("NVMe-oF host ID %d not found", hostID))
 			}
 		}
 	}
@@ -1382,7 +1407,7 @@ func (m *MockClient) NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id i
 	defer m.mu.Unlock()
 	subsystem := m.NVMeSubsystems[id]
 	if subsystem == nil {
-		return nil, fmt.Errorf("not found")
+		return nil, notFoundAPIError("not found")
 	}
 	subsystem.AllowAnyHost = allowAnyHost
 	return subsystem, nil
@@ -1406,7 +1431,7 @@ func (m *MockClient) NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSub
 	if s, ok := m.NVMeSubsystems[id]; ok {
 		return s, nil
 	}
-	return nil, fmt.Errorf("not found")
+	return nil, notFoundAPIError("not found")
 }
 func (m *MockClient) NVMeoFSubsystemFindByNQN(ctx context.Context, nqn string) (*NVMeoFSubsystem, error) {
 	m.mu.RLock()
@@ -1459,7 +1484,7 @@ func (m *MockClient) NVMeoFNamespaceGet(ctx context.Context, id int) (*NVMeoFNam
 	if n, ok := m.NVMeNamespaces[id]; ok {
 		return n, nil
 	}
-	return nil, fmt.Errorf("not found")
+	return nil, notFoundAPIError("not found")
 }
 func (m *MockClient) NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error) {
 	m.mu.RLock()
@@ -1492,6 +1517,16 @@ func (m *MockClient) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysI
 		if n.SubsystemID == subsysID {
 			list = append(list, n)
 		}
+	}
+	return list, nil
+}
+func (m *MockClient) NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespace, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	list := make([]*NVMeoFNamespace, 0, len(m.NVMeNamespaces))
+	for _, n := range m.NVMeNamespaces {
+		list = append(list, n)
 	}
 	return list, nil
 }

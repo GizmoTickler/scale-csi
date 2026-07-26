@@ -787,7 +787,7 @@ func TestCreateVolumeLocksOnSanitizedVolumeID(t *testing.T) {
 		truenasClient: truenas.NewMockClient(),
 	}
 	name := "volume/name with spaces"
-	lockKey := "volume:" + d.sanitizeVolumeID(name)
+	lockKey := volumeLockKey(sanitizeVolumeID(name))
 	require.True(t, d.acquireOperationLock(lockKey))
 	defer d.releaseOperationLock(lockKey)
 
@@ -2177,11 +2177,11 @@ func TestDeleteSnapshotAcquiresSourceVolumeLockBeforeSnapshotLock(t *testing.T) 
 		PropCSISnapshotSourceVolumeID: "source",
 	})
 	require.NoError(t, err)
-	require.True(t, d.acquireOperationLock("volume:source"))
+	require.True(t, d.acquireOperationLock(volumeLockKey("source")))
 	require.True(t, d.acquireOperationLock("snapshot:snapshot"))
 	t.Cleanup(func() {
 		d.releaseOperationLock("snapshot:snapshot")
-		d.releaseOperationLock("volume:source")
+		d.releaseOperationLock(volumeLockKey("source"))
 	})
 
 	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "snapshot"})
@@ -2379,7 +2379,7 @@ func TestSnapshotListEntryClassification(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			entry := snapshotListEntry(tc.snapshot, tc.filter)
+			entry := buildSnapshotListEntry(tc.snapshot, tc.filter)
 			assert.Equal(t, tc.wantBlocks, snapshotBlocksVolumeDeletion(tc.snapshot))
 			if !tc.wantEntry {
 				assert.Nil(t, entry)

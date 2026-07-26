@@ -65,7 +65,7 @@ const (
 	PropRecoveryNonce = "truenas-csi:recovery_nonce"
 
 	inflightMarkerVersion  = 1
-	tombstoneLedgerVersion = 1
+	tombstoneLedgerVersion = 2
 	inflightModeClone      = "clone"
 	inflightModeCopy       = "copy"
 )
@@ -303,7 +303,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if len(req.GetVolumeCapabilities()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
-	volumeID := d.sanitizeVolumeID(name)
+	volumeID := sanitizeVolumeID(name)
 	datasetName, err := d.datasetForID(volumeID)
 	if err != nil {
 		return nil, err
@@ -346,258 +346,23 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	// Lock on the sanitized volume ID so all operations use the same key space.
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
 	defer d.releaseOperationLock(lockKey)
 
-	// Calculate and validate capacity
-	capacityBytes := int64(0)
-	requiredBytes := int64(0)
-	limitBytes := int64(0)
-	if req.GetCapacityRange() != nil {
-		requiredBytes = req.GetCapacityRange().GetRequiredBytes()
-		limitBytes = req.GetCapacityRange().GetLimitBytes()
-		capacityBytes = requiredBytes
-	}
-	if capacityBytes == 0 {
-		capacityBytes = 1024 * 1024 * 1024 // Default 1GiB
-	}
-	// Validate the applied capacity against the limit. This covers both an
-	// explicit required_bytes that exceeds limit_bytes and the case where
-	// required_bytes is omitted (0): the 1GiB default is then applied and must
-	// itself respect a caller-supplied limit below that default.
-	if limitBytes > 0 && capacityBytes > limitBytes {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"required capacity (%d bytes) exceeds limit (%d bytes)", capacityBytes, limitBytes)
-	}
-
-	// Minimum capacity validation (at least 1MiB to avoid edge cases)
-	const minCapacity = 1024 * 1024 // 1 MiB
-	if capacityBytes < minCapacity {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"requested capacity (%d bytes) is below minimum (%d bytes)", capacityBytes, minCapacity)
-	}
-
-	// Maximum capacity sanity check (1PiB should be more than enough)
-	const maxCapacity = 1024 * 1024 * 1024 * 1024 * 1024 // 1 PiB
-	if capacityBytes > maxCapacity {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"requested capacity (%d bytes) exceeds maximum (%d bytes)", capacityBytes, maxCapacity)
-	}
-
-	// A unified multi-protocol deployment cannot infer whether an omitted
-	// StorageClass parameter meant NFS, iSCSI, or NVMe-oF. Keep the historical
-	// driver-name fallback only for instances that serve at most one protocol.
-	params := req.GetParameters()
-	protocol, hasProtocol := params["protocol"]
-	if !hasProtocol {
-		if d.config.enabledShareTypeCount() > 1 {
-			return nil, status.Errorf(codes.InvalidArgument,
-				"StorageClass parameter %q is required when multiple storage protocols are enabled; valid options are: %s",
-				"protocol", strings.Join(ValidShareTypeStrings(), ", "))
-		}
-	} else {
-		explicitShareType := ShareType(strings.ToLower(strings.TrimSpace(protocol)))
-		if !explicitShareType.IsValid() {
-			return nil, status.Errorf(codes.InvalidArgument,
-				"invalid protocol %q; valid options are: %s",
-				protocol, strings.Join(ValidShareTypeStrings(), ", "))
-		}
-		// Reject a syntactically valid protocol that this instance does not
-		// serve. Without this, an nfs+iscsi install accepts nvmeof here and
-		// only fails deep in the share-creation path. Legacy configs with no
-		// enabled markers (enabledShareTypeStrings empty) keep the historical
-		// driver-name fallback and are not gated here.
-		if enabled := d.config.enabledShareTypeStrings(); len(enabled) > 0 && !d.config.isShareTypeEnabled(explicitShareType) {
-			return nil, status.Errorf(codes.InvalidArgument,
-				"StorageClass parameter %q value %q is not enabled on this driver; enabled options are: %s",
-				"protocol", protocol, strings.Join(enabled, ", "))
-		}
-	}
-	shareType := d.config.GetShareType(params)
-	klog.Infof("CreateVolume: using share type %s for volume %s", shareType, volumeID)
-	if shareType == ShareTypeNFS {
-		for _, capability := range req.GetVolumeCapabilities() {
-			if capability.GetBlock() != nil {
-				return nil, status.Error(codes.InvalidArgument, "raw block volume capability is incompatible with NFS protocol")
-			}
-		}
-	}
-
-	// Validate access mode against protocol
-	// RWX (ReadWriteMany) is only supported for NFS volumes
-	if mode, ok := multiNodeAccessMode(req.GetVolumeCapabilities()); ok && !shareType.SupportsMultiNode() {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"access mode %s requires NFS protocol, but %s was requested",
-			mode.String(), shareType)
-	}
-
-	// Resolve clone-vs-detached for a snapshot content source. The StorageClass
-	// parameter opts a class in or out; otherwise the global default applies. This
-	// single resolved value drives every content-source decision below (existing
-	// remnant recovery, in-flight marker mode, and the clone/copy branch) so a
-	// retry stays consistent with the class that made the request.
-	detached, err := d.snapshotRestoreDetached(params)
+	vp, err := d.validateCreateVolumeRequest(req, volumeID)
 	if err != nil {
 		return nil, err
 	}
+	capacityBytes := vp.capacityBytes
+	shareType, detached := vp.shareType, vp.detached
 
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {
-		// Volume exists - check and ensure properties are set
-		klog.Infof("Volume %s already exists", volumeID)
-		if shareType.IsBlockProtocol() && existingDS.Type == "FILESYSTEM" {
-			return nil, status.Errorf(codes.AlreadyExists,
-				"volume %s already exists as a filesystem, incompatible with requested %s protocol",
-				volumeID, shareType)
-		}
-		if shareType == ShareTypeNFS && existingDS.Type == "VOLUME" {
-			return nil, status.Errorf(codes.AlreadyExists,
-				"volume %s already exists as a block volume, incompatible with requested NFS protocol",
-				volumeID)
-		}
-		if storedBlockProtocol(existingDS, ShareTypeISCSI) && shareType != ShareTypeISCSI {
-			return nil, status.Errorf(codes.AlreadyExists,
-				"volume %s exists with protocol %s, requested %s", volumeID, ShareTypeISCSI, shareType)
-		}
-		if storedBlockProtocol(existingDS, ShareTypeNVMeoF) && shareType != ShareTypeNVMeoF {
-			return nil, status.Errorf(codes.AlreadyExists,
-				"volume %s exists with protocol %s, requested %s", volumeID, ShareTypeNVMeoF, shareType)
-		}
-		// Crash self-healing for a content-source create that built the destination
-		// (clone or detached copy) but crashed before ownership was stamped. Such a
-		// remnant otherwise wedges the PVC permanently (terminal AlreadyExists below)
-		// and leaks invisibly (no managed_resource for the orphan reconciler). This
-		// runs before the content-source and ownership gates because an unstamped
-		// clone has no local content-source properties yet and would trip those
-		// gates first; recovery itself validates source/protocol/capacity
-		// compatibility against the marker and the remnant before any mutation. It
-		// is a strict no-op for any dataset without a matching in-flight marker.
-		if source := req.GetVolumeContentSource(); source != nil {
-			recovered, action, recoverErr := d.recoverInFlightContentSourceRemnant(
-				ctx, existingDS, datasetName, name, source, capacityBytes, limitBytes, shareType, detached,
-			)
-			if recoverErr != nil {
-				return nil, recoverErr
-			}
-			switch action {
-			case remnantActionResume:
-				// The remnant is now stamped and its content-source flow completed;
-				// fall through so the normal existing-dataset tail (capacity checks,
-				// idempotent share creation, response) finishes the volume.
-				existingDS = recovered
-			case remnantActionDestroy:
-				return nil, status.Errorf(codes.Aborted,
-					"destroyed unstamped interrupted detached-copy remnant %s; retry CreateVolume to recreate it cleanly", datasetName)
-			}
-		}
-		storedContentSource := volumeContentSourceFromDataset(existingDS)
-		requestedContentSource := req.GetVolumeContentSource()
-		storedSourceIsDurable := datasetHasDurableContentSource(existingDS)
-		if (storedSourceIsDurable && storedContentSource == nil) ||
-			(storedContentSource == nil) != (requestedContentSource == nil) ||
-			(storedContentSource != nil && !volumeContentSourcesEqual(storedContentSource, requestedContentSource)) {
-			return nil, status.Errorf(codes.AlreadyExists,
-				"volume %s already exists with content source %s, incompatible with requested %s",
-				volumeID, describeDatasetContentSource(existingDS), describeVolumeContentSource(requestedContentSource))
-		}
-		// A present owner is authoritative and must match locally. The v1.2.22
-		// installed base predates this stamp, so an actually absent owner may be
-		// backfilled only when both older local managed markers identify the same
-		// CSI volume. Empty, inherited, or different owner values are present-and-
-		// different and are never auto-adopted.
-		owner, ownerPresent := datasetUserPropertyProjection(existingDS, PropDriverInstanceID)
-		switch {
-		case ownerPresent:
-			if !datasetHasLocalUserProperty(existingDS, PropDriverInstanceID, d.driverInstanceID()) {
-				return nil, status.Errorf(codes.AlreadyExists,
-					"dataset %s already exists but ownership property %s is %q, expected a local value of %q",
-					datasetName, PropDriverInstanceID, owner.Value, d.driverInstanceID())
-			}
-		case datasetHasLocalUserProperty(existingDS, PropManagedResource, "true") &&
-			datasetHasLocalUserProperty(existingDS, PropCSIVolumeName, name):
-			verified, stampErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
-				PropDriverInstanceID: d.driverInstanceID(),
-			})
-			if stampErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to backfill legacy volume ownership: %v", stampErr)
-			}
-			existingDS = verified
-			klog.Infof("Backfilled ownership stamp on legacy managed dataset %s", datasetName)
-		default:
-			return nil, status.Errorf(codes.AlreadyExists,
-				"dataset %s already exists without ownership property %s and does not have matching local legacy CSI markers",
-				datasetName, PropDriverInstanceID)
-		}
-		if snapshot := req.GetVolumeContentSource().GetSnapshot(); detached && snapshot != nil {
-			existingDS, err = d.prepareDetachedSnapshotCopy(
-				ctx, datasetName, existingDS, name, snapshot.GetSnapshotId(), snapshot.GetSnapshotId(), capacityBytes, shareType,
-			)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		existingCapacity := d.getDatasetCapacity(existingDS)
-		if existingCapacity > 0 {
-			if existingCapacity < requiredBytes {
-				return nil, status.Errorf(codes.AlreadyExists,
-					"volume %s already exists with capacity %d bytes, less than required capacity %d bytes",
-					volumeID, existingCapacity, requiredBytes)
-			}
-			if limitBytes > 0 && existingCapacity > limitBytes {
-				return nil, status.Errorf(codes.AlreadyExists,
-					"volume %s already exists with capacity %d bytes, greater than capacity limit %d bytes",
-					volumeID, existingCapacity, limitBytes)
-			}
-		}
-
-		// Ensure properties are set (idempotent) in one API update.
-		propertyUpdates := make(map[string]string, 3)
-		if datasetUserProperty(existingDS, PropManagedResource) != "true" {
-			propertyUpdates[PropManagedResource] = "true"
-		}
-		if datasetUserProperty(existingDS, PropProvisionSuccess) != "true" {
-			propertyUpdates[PropProvisionSuccess] = "true"
-		}
-		if datasetUserProperty(existingDS, PropCSIVolumeName) != name {
-			propertyUpdates[PropCSIVolumeName] = name
-		}
-		if detached &&
-			req.GetVolumeContentSource().GetSnapshot() != nil &&
-			shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
-			requestedSize := strconv.FormatInt(capacityBytes, 10)
-			if datasetUserProperty(existingDS, PropRequestedSizeBytes) != requestedSize {
-				propertyUpdates[PropRequestedSizeBytes] = requestedSize
-			}
-		}
-		if waitErr := d.setDatasetUserProperties(ctx, existingDS, datasetName, propertyUpdates); waitErr != nil {
-			klog.Errorf("Failed to ensure properties for existing volume %s: %v", volumeID, waitErr)
-			return nil, status.Errorf(codes.Internal, "failed to ensure volume properties: %v", waitErr)
-		}
-
-		// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
-		// This handles the case where a previous CreateVolume created the dataset but failed
-		// to create the share (e.g., due to timeout, TrueNAS API error, etc.)
-		if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType); shareErr != nil {
-			return nil, shareErr
-		}
-
-		volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType)
-		if ctxErr != nil {
-			return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
-		}
-		volume := &csi.Volume{
-			VolumeId:           volumeID,
-			CapacityBytes:      d.getDatasetCapacity(existingDS),
-			VolumeContext:      volumeContext,
-			ContentSource:      storedContentSource,
-			AccessibleTopology: d.getAccessibleTopology(),
-		}
-		return &csi.CreateVolumeResponse{Volume: volume}, nil
+		return d.createVolumeExisting(ctx, req, existingDS, datasetName, name, volumeID, vp)
 	}
 	if err != nil && !truenas.IsNotFoundError(err) {
 		return nil, status.Errorf(codes.Internal, "failed to check whether volume exists: %v", err)
@@ -607,11 +372,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
 	var createdDS *truenas.Dataset
+	var snapshotCloneMarker *inflightMarker
 	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
 		_, srcErr := d.handleVolumeContentSource(
 			ctx, datasetName, name, contentSource, capacityBytes, shareType, detached, &detachedCopyJobID,
+			&snapshotCloneMarker,
 		)
 		if srcErr != nil {
 			return nil, srcErr
@@ -623,6 +390,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			PropDriverInstanceID: d.driverInstanceID(),
 		})
 		if ownerErr != nil {
+			if snapshotCloneMarker != nil {
+				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, snapshotCloneMarker, ownerErr)
+			}
 			d.cleanupFailedClone(ctx, datasetName, "")
 			return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
 		}
@@ -631,6 +401,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		d.deleteInflightMarker(ctx, volumeID)
 		createdDS = verifiedClone
 		zvolReady = true
+		// Scrub backend share-object IDs the clone inherited from its source dataset
+		// (ZFS copies the source's user properties into the clone). A stale inherited
+		// ID would make ensureShareExists validate the clone against the SOURCE
+		// volume's share objects. Best-effort and a SEPARATE pool.dataset.update from
+		// the authoritative ownership stamp above (cleanup, not provenance).
+		d.scrubInheritedProtocolProperties(ctx, createdDS, datasetName, shareType)
 	} else {
 		// Create new dataset
 		var createErr error
@@ -723,6 +499,285 @@ func (d *Driver) parentDatasetName() string {
 	return strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/")
 }
 
+// createVolumeParams holds the validated, request-derived values CreateVolume
+// needs after the pure (no backend I/O) validation phase.
+type createVolumeParams struct {
+	capacityBytes int64
+	requiredBytes int64
+	limitBytes    int64
+	shareType     ShareType
+	detached      bool
+}
+
+// validateCreateVolumeRequest performs the pure (no backend I/O) validation of a
+// CreateVolume request: capacity-range clamping and bounds, protocol-parameter
+// validation against the enabled protocol set, NFS/raw-block and access-mode
+// compatibility, and clone-vs-detached resolution. Extracted verbatim from
+// CreateVolume (Batch 18 R7).
+func (d *Driver) validateCreateVolumeRequest(req *csi.CreateVolumeRequest, volumeID string) (createVolumeParams, error) {
+	// Calculate and validate capacity
+	capacityBytes := int64(0)
+	requiredBytes := int64(0)
+	limitBytes := int64(0)
+	if req.GetCapacityRange() != nil {
+		requiredBytes = req.GetCapacityRange().GetRequiredBytes()
+		limitBytes = req.GetCapacityRange().GetLimitBytes()
+		capacityBytes = requiredBytes
+	}
+	if capacityBytes == 0 {
+		capacityBytes = 1024 * 1024 * 1024 // Default 1GiB
+	}
+	// Validate the applied capacity against the limit. This covers both an
+	// explicit required_bytes that exceeds limit_bytes and the case where
+	// required_bytes is omitted (0): the 1GiB default is then applied and must
+	// itself respect a caller-supplied limit below that default.
+	if limitBytes > 0 && capacityBytes > limitBytes {
+		return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
+			"required capacity (%d bytes) exceeds limit (%d bytes)", capacityBytes, limitBytes)
+	}
+
+	// Minimum capacity validation (at least 1MiB to avoid edge cases)
+	const minCapacity = 1024 * 1024 // 1 MiB
+	if capacityBytes < minCapacity {
+		return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
+			"requested capacity (%d bytes) is below minimum (%d bytes)", capacityBytes, minCapacity)
+	}
+
+	// Maximum capacity sanity check (1PiB should be more than enough)
+	const maxCapacity = 1024 * 1024 * 1024 * 1024 * 1024 // 1 PiB
+	if capacityBytes > maxCapacity {
+		return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
+			"requested capacity (%d bytes) exceeds maximum (%d bytes)", capacityBytes, maxCapacity)
+	}
+
+	// A unified multi-protocol deployment cannot infer whether an omitted
+	// StorageClass parameter meant NFS, iSCSI, or NVMe-oF. Keep the historical
+	// driver-name fallback only for instances that serve at most one protocol.
+	params := req.GetParameters()
+	protocol, hasProtocol := params["protocol"]
+	if !hasProtocol {
+		if d.config.enabledShareTypeCount() > 1 {
+			return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
+				"StorageClass parameter %q is required when multiple storage protocols are enabled; valid options are: %s",
+				"protocol", strings.Join(ValidShareTypeStrings(), ", "))
+		}
+	} else {
+		explicitShareType := ShareType(strings.ToLower(strings.TrimSpace(protocol)))
+		if !explicitShareType.IsValid() {
+			return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
+				"invalid protocol %q; valid options are: %s",
+				protocol, strings.Join(ValidShareTypeStrings(), ", "))
+		}
+		// Reject a syntactically valid protocol that this instance does not
+		// serve. Without this, an nfs+iscsi install accepts nvmeof here and
+		// only fails deep in the share-creation path. Legacy configs with no
+		// enabled markers (enabledShareTypeStrings empty) keep the historical
+		// driver-name fallback and are not gated here.
+		if enabled := d.config.enabledShareTypeStrings(); len(enabled) > 0 && !d.config.isShareTypeEnabled(explicitShareType) {
+			return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
+				"StorageClass parameter %q value %q is not enabled on this driver; enabled options are: %s",
+				"protocol", protocol, strings.Join(enabled, ", "))
+		}
+	}
+	shareType := d.config.GetShareType(params)
+	klog.Infof("CreateVolume: using share type %s for volume %s", shareType, volumeID)
+	if shareType == ShareTypeNFS {
+		for _, capability := range req.GetVolumeCapabilities() {
+			if capability.GetBlock() != nil {
+				return createVolumeParams{}, status.Error(codes.InvalidArgument, "raw block volume capability is incompatible with NFS protocol")
+			}
+		}
+	}
+
+	// Validate access mode against protocol
+	// RWX (ReadWriteMany) is only supported for NFS volumes
+	if mode, ok := multiNodeAccessMode(req.GetVolumeCapabilities()); ok && !shareType.SupportsMultiNode() {
+		return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
+			"access mode %s requires NFS protocol, but %s was requested",
+			mode.String(), shareType)
+	}
+
+	// Resolve clone-vs-detached for a snapshot content source. The StorageClass
+	// parameter opts a class in or out; otherwise the global default applies. This
+	// single resolved value drives every content-source decision below (existing
+	// remnant recovery, in-flight marker mode, and the clone/copy branch) so a
+	// retry stays consistent with the class that made the request.
+	detached, err := d.snapshotRestoreDetached(params)
+	if err != nil {
+		return createVolumeParams{}, err
+	}
+	return createVolumeParams{
+		capacityBytes: capacityBytes,
+		requiredBytes: requiredBytes,
+		limitBytes:    limitBytes,
+		shareType:     shareType,
+		detached:      detached,
+	}, nil
+}
+
+// createVolumeExisting handles the already-exists arm of CreateVolume: the
+// self-contained path taken when the target dataset already exists. It
+// validates protocol/content-source/ownership compatibility, self-heals an
+// interrupted content-source remnant, ensures properties and the share exist,
+// and returns the idempotent CreateVolume response. Extracted verbatim from
+// CreateVolume (Batch 18 R7).
+func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolumeRequest, existingDS *truenas.Dataset, datasetName, name, volumeID string, vp createVolumeParams) (*csi.CreateVolumeResponse, error) {
+	capacityBytes, requiredBytes, limitBytes := vp.capacityBytes, vp.requiredBytes, vp.limitBytes
+	shareType, detached := vp.shareType, vp.detached
+	var err error
+	// Volume exists - check and ensure properties are set
+	klog.Infof("Volume %s already exists", volumeID)
+	if shareType.IsBlockProtocol() && existingDS.Type == "FILESYSTEM" {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"volume %s already exists as a filesystem, incompatible with requested %s protocol",
+			volumeID, shareType)
+	}
+	if shareType == ShareTypeNFS && existingDS.Type == "VOLUME" {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"volume %s already exists as a block volume, incompatible with requested NFS protocol",
+			volumeID)
+	}
+	if storedBlockProtocol(existingDS, ShareTypeISCSI) && shareType != ShareTypeISCSI {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"volume %s exists with protocol %s, requested %s", volumeID, ShareTypeISCSI, shareType)
+	}
+	if storedBlockProtocol(existingDS, ShareTypeNVMeoF) && shareType != ShareTypeNVMeoF {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"volume %s exists with protocol %s, requested %s", volumeID, ShareTypeNVMeoF, shareType)
+	}
+	// Crash self-healing for a content-source create that built the destination
+	// (clone or detached copy) but crashed before ownership was stamped. Such a
+	// remnant otherwise wedges the PVC permanently (terminal AlreadyExists below)
+	// and leaks invisibly (no managed_resource for the orphan reconciler). This
+	// runs before the content-source and ownership gates because an unstamped
+	// clone has no local content-source properties yet and would trip those
+	// gates first; recovery itself validates source/protocol/capacity
+	// compatibility against the marker and the remnant before any mutation. It
+	// is a strict no-op for any dataset without a matching in-flight marker.
+	if source := req.GetVolumeContentSource(); source != nil {
+		recovered, action, recoverErr := d.recoverInFlightContentSourceRemnant(
+			ctx, existingDS, datasetName, name, source, capacityBytes, limitBytes, shareType, detached,
+		)
+		if recoverErr != nil {
+			return nil, recoverErr
+		}
+		switch action {
+		case remnantActionResume:
+			// The remnant is now stamped and its content-source flow completed;
+			// fall through so the normal existing-dataset tail (capacity checks,
+			// idempotent share creation, response) finishes the volume.
+			existingDS = recovered
+		case remnantActionDestroy:
+			return nil, status.Errorf(codes.Aborted,
+				"destroyed unstamped interrupted detached-copy remnant %s; retry CreateVolume to recreate it cleanly", datasetName)
+		}
+	}
+	storedContentSource := volumeContentSourceFromDataset(existingDS)
+	requestedContentSource := req.GetVolumeContentSource()
+	storedSourceIsDurable := datasetHasDurableContentSource(existingDS)
+	if (storedSourceIsDurable && storedContentSource == nil) ||
+		(storedContentSource == nil) != (requestedContentSource == nil) ||
+		(storedContentSource != nil && !volumeContentSourcesEqual(storedContentSource, requestedContentSource)) {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"volume %s already exists with content source %s, incompatible with requested %s",
+			volumeID, describeDatasetContentSource(existingDS), describeVolumeContentSource(requestedContentSource))
+	}
+	// A present owner is authoritative and must match locally. The v1.2.22
+	// installed base predates this stamp, so an actually absent owner may be
+	// backfilled only when both older local managed markers identify the same
+	// CSI volume. Empty, inherited, or different owner values are present-and-
+	// different and are never auto-adopted.
+	owner, ownerPresent := datasetUserPropertyProjection(existingDS, PropDriverInstanceID)
+	switch {
+	case ownerPresent:
+		if !datasetHasLocalUserProperty(existingDS, PropDriverInstanceID, d.driverInstanceID()) {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"dataset %s already exists but ownership property %s is %q, expected a local value of %q",
+				datasetName, PropDriverInstanceID, owner.Value, d.driverInstanceID())
+		}
+	case datasetHasLocalUserProperty(existingDS, PropManagedResource, "true") &&
+		datasetHasLocalUserProperty(existingDS, PropCSIVolumeName, name):
+		verified, stampErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+			PropDriverInstanceID: d.driverInstanceID(),
+		})
+		if stampErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to backfill legacy volume ownership: %v", stampErr)
+		}
+		existingDS = verified
+		klog.Infof("Backfilled ownership stamp on legacy managed dataset %s", datasetName)
+	default:
+		return nil, status.Errorf(codes.AlreadyExists,
+			"dataset %s already exists without ownership property %s and does not have matching local legacy CSI markers",
+			datasetName, PropDriverInstanceID)
+	}
+	if snapshot := req.GetVolumeContentSource().GetSnapshot(); detached && snapshot != nil {
+		existingDS, err = d.prepareDetachedSnapshotCopy(
+			ctx, datasetName, existingDS, name, snapshot.GetSnapshotId(), snapshot.GetSnapshotId(), capacityBytes, shareType,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	existingCapacity := d.getDatasetCapacity(existingDS)
+	if existingCapacity > 0 {
+		if existingCapacity < requiredBytes {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume %s already exists with capacity %d bytes, less than required capacity %d bytes",
+				volumeID, existingCapacity, requiredBytes)
+		}
+		if limitBytes > 0 && existingCapacity > limitBytes {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume %s already exists with capacity %d bytes, greater than capacity limit %d bytes",
+				volumeID, existingCapacity, limitBytes)
+		}
+	}
+
+	// Ensure properties are set (idempotent) in one API update.
+	propertyUpdates := make(map[string]string, 3)
+	if datasetUserProperty(existingDS, PropManagedResource) != "true" {
+		propertyUpdates[PropManagedResource] = "true"
+	}
+	if datasetUserProperty(existingDS, PropProvisionSuccess) != "true" {
+		propertyUpdates[PropProvisionSuccess] = "true"
+	}
+	if datasetUserProperty(existingDS, PropCSIVolumeName) != name {
+		propertyUpdates[PropCSIVolumeName] = name
+	}
+	if detached &&
+		req.GetVolumeContentSource().GetSnapshot() != nil &&
+		shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
+		requestedSize := strconv.FormatInt(capacityBytes, 10)
+		if datasetUserProperty(existingDS, PropRequestedSizeBytes) != requestedSize {
+			propertyUpdates[PropRequestedSizeBytes] = requestedSize
+		}
+	}
+	if waitErr := d.setDatasetUserProperties(ctx, existingDS, datasetName, propertyUpdates); waitErr != nil {
+		klog.Errorf("Failed to ensure properties for existing volume %s: %v", volumeID, waitErr)
+		return nil, status.Errorf(codes.Internal, "failed to ensure volume properties: %v", waitErr)
+	}
+
+	// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
+	// This handles the case where a previous CreateVolume created the dataset but failed
+	// to create the share (e.g., due to timeout, TrueNAS API error, etc.)
+	if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, nil); shareErr != nil {
+		return nil, shareErr
+	}
+
+	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType)
+	if ctxErr != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get volume context: %v", ctxErr)
+	}
+	volume := &csi.Volume{
+		VolumeId:           volumeID,
+		CapacityBytes:      d.getDatasetCapacity(existingDS),
+		VolumeContext:      volumeContext,
+		ContentSource:      storedContentSource,
+		AccessibleTopology: d.getAccessibleTopology(),
+	}
+	return &csi.CreateVolumeResponse{Volume: volume}, nil
+}
+
 func storedBlockProtocol(ds *truenas.Dataset, shareType ShareType) bool {
 	var properties []string
 	switch shareType {
@@ -734,7 +789,7 @@ func storedBlockProtocol(ds *truenas.Dataset, shareType ShareType) bool {
 		return false
 	}
 	for _, property := range properties {
-		if value := datasetUserProperty(ds, property); value != "" && value != "-" {
+		if datasetUserPropertyHasValue(ds, property) {
 			return true
 		}
 	}
@@ -846,7 +901,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	klog.Infof("DeleteVolume: volumeID=%s", volumeID)
 
 	// Lock on volume ID
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -891,19 +946,20 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	shareTypeKnown := false
 	if ds != nil {
 		// Check stored properties to determine share type - these were set during CreateVolume
-		if prop, ok := ds.UserProperties[PropNVMeoFSubsystemID]; ok && prop.Value != "" && prop.Value != "-" {
+		switch {
+		case datasetUserPropertyHasValue(ds, PropNVMeoFSubsystemID):
 			shareType = ShareTypeNVMeoF
 			shareTypeKnown = true
 			klog.V(4).Infof("Detected NVMe-oF volume from stored subsystem ID property")
-		} else if prop, ok := ds.UserProperties[PropISCSITargetID]; ok && prop.Value != "" && prop.Value != "-" {
+		case datasetUserPropertyHasValue(ds, PropISCSITargetID):
 			shareType = ShareTypeISCSI
 			shareTypeKnown = true
 			klog.V(4).Infof("Detected iSCSI volume from stored target ID property")
-		} else if prop, ok := ds.UserProperties[PropNFSShareID]; ok && prop.Value != "" && prop.Value != "-" {
+		case datasetUserPropertyHasValue(ds, PropNFSShareID):
 			shareType = ShareTypeNFS
 			shareTypeKnown = true
 			klog.V(4).Infof("Detected NFS volume from stored share ID property")
-		} else {
+		default:
 			// Fallback to dataset type-based detection
 			switch ds.Type {
 			case "FILESYSTEM":
@@ -1178,7 +1234,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	if d.runNode && identity.Name != d.nodeID {
 		return nil, status.Errorf(codes.NotFound, "node not found: %s", nodeID)
 	}
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -1200,15 +1256,18 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 
 	klog.Infof("ControllerPublishVolume: volumeID=%s, nodeID=%s, shareType=%s", volumeID, nodeID, shareType)
 
+	// Per-request memo so the ensure-share step and the fence phases resolve the
+	// backend share objects once and reuse them (see fenceResolution).
+	res := &fenceResolution{}
 	// Ensure the share exists (critical for restored volumes)
 	// This recreates missing iSCSI targets or NVMe-oF subsystems
-	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType); err != nil {
+	if err := d.ensureShareExists(ctx, ds, datasetName, volumeID, shareType, res); err != nil {
 		return nil, err
 	}
 	// Publication records (CSI single-node exclusivity, idempotency, takeover) are
 	// maintained unconditionally; fencing.mode only governs backend allowlist
 	// enforcement inside publishFencedVolume.
-	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly()); err != nil {
+	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly(), res); err != nil {
 		return nil, err
 	}
 
@@ -1222,7 +1281,7 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -1242,7 +1301,7 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	// stays correct in every fencing mode; backend allowlist revocation inside
 	// unpublishFencedVolume remains governed by fencing.mode.
 	shareType := shareTypeForPublishedVolume(ds, nil)
-	if err := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, req.GetNodeId()); err != nil {
+	if err := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, req.GetNodeId(), &fenceResolution{}); err != nil {
 		return nil, err
 	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
@@ -1397,13 +1456,13 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	// Always acquire the source-volume lock before the snapshot lock. This
 	// serializes snapshot creation with DeleteVolume and gives all creators a
 	// fixed lock order.
-	volumeLockKey := "volume:" + sourceVolumeID
-	if !d.acquireOperationLock(volumeLockKey) {
+	sourceVolumeLockKey := volumeLockKey(sourceVolumeID)
+	if !d.acquireOperationLock(sourceVolumeLockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 	}
-	defer d.releaseOperationLock(volumeLockKey)
+	defer d.releaseOperationLock(sourceVolumeLockKey)
 
-	snapshotID := d.sanitizeVolumeID(name)
+	snapshotID := sanitizeVolumeID(name)
 	if _, err := d.datasetForID(snapshotID); err != nil {
 		return nil, err
 	}
@@ -1451,6 +1510,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	// ignores post-create pool.snapshot.update property writes.
 	snap, err := d.truenasClient.SnapshotCreate(ctx, datasetName, snapshotID, map[string]string{
 		PropManagedResource:           "true",
+		PropDriverInstanceID:          d.driverInstanceID(),
 		PropCSISnapshotName:           name,
 		PropCSISnapshotSourceVolumeID: sourceVolumeID,
 	})
@@ -1527,11 +1587,11 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 	parentPrefix := strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/") + "/"
 	if strings.HasPrefix(snap.Dataset, parentPrefix) {
 		sourceVolumeID := path.Base(snap.Dataset)
-		volumeLockKey := "volume:" + sourceVolumeID
-		if !d.acquireOperationLock(volumeLockKey) {
+		sourceVolumeLockKey := volumeLockKey(sourceVolumeID)
+		if !d.acquireOperationLock(sourceVolumeLockKey) {
 			return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
 		}
-		defer d.releaseOperationLock(volumeLockKey)
+		defer d.releaseOperationLock(sourceVolumeLockKey)
 	}
 	snapshotLockKey := "snapshot:" + snapshotID
 	if !d.acquireOperationLock(snapshotLockKey) {
@@ -1664,7 +1724,7 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	klog.Infof("ControllerExpandVolume: volumeID=%s, capacity=%d", volumeID, capacityBytes)
 
 	// Lock on volume ID to prevent concurrent expansions of same volume
-	lockKey := "volume:" + volumeID
+	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this volume")
 	}
@@ -1788,10 +1848,6 @@ func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.Controller
 
 // Helper functions
 
-func (d *Driver) sanitizeVolumeID(name string) string {
-	return sanitizeVolumeID(name)
-}
-
 func sanitizeVolumeID(name string) string {
 	// Rebuild through a rune range so arbitrary invalid UTF-8 input is repaired
 	// while replacing the path and space characters disallowed by this scheme.
@@ -1851,7 +1907,7 @@ func multiNodeAccessMode(caps []*csi.VolumeCapability) (csi.VolumeCapability_Acc
 	return csi.VolumeCapability_AccessMode_UNKNOWN, false
 }
 
-func snapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.ListSnapshotsResponse_Entry {
+func buildSnapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.ListSnapshotsResponse_Entry {
 	if !isCSISnapshot(snap) {
 		return nil
 	}
@@ -1886,7 +1942,7 @@ func snapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *csi.L
 }
 
 func (d *Driver) snapshotListEntry(ctx context.Context, snap *truenas.Snapshot, sourceVolumeFilter string) (*csi.ListSnapshotsResponse_Entry, error) {
-	entry := snapshotListEntry(snap, sourceVolumeFilter)
+	entry := buildSnapshotListEntry(snap, sourceVolumeFilter)
 	if entry == nil {
 		return nil, nil
 	}
@@ -2035,17 +2091,18 @@ func stampAndMirror(ctx context.Context, client truenas.ClientInterface, ds *tru
 	return nil
 }
 
-// setAndVerifyDatasetUserProperties writes properties through
-// pool.dataset.update and verifies they persisted with source=local. Unlike
-// stampAndMirror it calls pool.dataset.update directly (not the batch setter)
-// because it needs the authoritative post-write dataset the update response
-// reflects: Live TrueNAS 26.0 returns the post-write state in the response, so
-// the returned dataset is authoritative for verification — no fresh re-read on
-// the hot path (the batch-12 consolidation). It is kept separate from
-// stampAndMirror deliberately: the error-injecting test seam distinguishes
-// DatasetUpdate from the batch setter, and the verification path requires the
-// returned dataset.
-func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetName string, properties map[string]string) (*truenas.Dataset, error) {
+// setAndVerifyDatasetProps writes an optional filesystem refquota together with
+// user properties through one pool.dataset.update and verifies that every
+// requested value persisted with source=local. The widened shape is used by the
+// snapshot-clone fold: content-source identity and quota become durable in one
+// response-verifying update, while ownership remains a later, separate crash
+// boundary.
+func (d *Driver) setAndVerifyDatasetProps(
+	ctx context.Context,
+	datasetName string,
+	refquota interface{},
+	properties map[string]string,
+) (*truenas.Dataset, error) {
 	// Build sorted user-property updates mirroring DatasetSetUserProperties, then
 	// call pool.dataset.update directly. Live TrueNAS 26.0 persists these with
 	// source=local AND reflects the post-write state in the response, so the
@@ -2060,11 +2117,17 @@ func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetN
 	for _, key := range keys {
 		updates = append(updates, truenas.UserPropertyUpdate{Key: key, Value: properties[key]})
 	}
-	updated, err := d.truenasClient.DatasetUpdate(ctx, datasetName, &truenas.DatasetUpdateParams{UserPropertiesUpdate: updates})
+	updated, err := d.truenasClient.DatasetUpdate(ctx, datasetName, &truenas.DatasetUpdateParams{
+		Refquota:             refquota,
+		UserPropertiesUpdate: updates,
+	})
 	if err != nil {
 		return nil, err
 	}
 	if verifyErr := verifyLocalUserProperties(updated, properties); verifyErr != nil {
+		return nil, verifyErr
+	}
+	if verifyErr := verifyLocalRefquota(updated, refquota); verifyErr != nil {
 		return nil, verifyErr
 	}
 	// Belt-and-braces: the very first write in this Driver's lifetime also
@@ -2079,9 +2142,18 @@ func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetN
 		if verifyErr := verifyLocalUserProperties(reread, properties); verifyErr != nil {
 			return nil, verifyErr
 		}
+		if verifyErr := verifyLocalRefquota(reread, refquota); verifyErr != nil {
+			return nil, verifyErr
+		}
 		d.datasetUpdateVerifiedOnce.Store(true)
 	}
 	return updated, nil
+}
+
+// setAndVerifyDatasetUserProperties preserves the property-only call surface
+// for ownership, bookkeeping, and recovery stamps.
+func (d *Driver) setAndVerifyDatasetUserProperties(ctx context.Context, datasetName string, properties map[string]string) (*truenas.Dataset, error) {
+	return d.setAndVerifyDatasetProps(ctx, datasetName, nil, properties)
 }
 
 // verifyLocalUserProperties returns an errDatasetPropertyVerification-wrapped
@@ -2092,6 +2164,21 @@ func verifyLocalUserProperties(ds *truenas.Dataset, properties map[string]string
 		if !datasetHasLocalUserProperty(ds, key, expected) {
 			return fmt.Errorf("%w: property %s did not persist locally with the expected value", errDatasetPropertyVerification, key)
 		}
+	}
+	return nil
+}
+
+func verifyLocalRefquota(ds *truenas.Dataset, expected interface{}) error {
+	if expected == nil {
+		return nil
+	}
+	expectedBytes, ok := expected.(int64)
+	if !ok {
+		return fmt.Errorf("%w: unsupported refquota verification type %T", errDatasetPropertyVerification, expected)
+	}
+	if ds == nil || !isLocalUserPropertySource(ds.Refquota.Source) ||
+		datasetPropertyBytes(ds.Refquota) != expectedBytes {
+		return fmt.Errorf("%w: refquota did not persist locally with the expected value", errDatasetPropertyVerification)
 	}
 	return nil
 }
@@ -2192,6 +2279,73 @@ func (d *Driver) snapshotRestoreDetached(params map[string]string) (bool, error)
 	return d.config.ZFS.DetachedVolumesFromSnapshots, nil
 }
 
+// inheritedProtocolPropertyKeys are the per-volume backend share-object IDs that
+// ZFS may inherit from a clone's source dataset. The scrub removes only
+// source-proven inherited IDs belonging to OTHER protocols: local values are
+// authoritative, and the selected protocol's resolver owns repair of its own
+// stale backreferences. The scrub runs best-effort after the ownership stamp.
+var inheritedProtocolPropertyKeys = []string{
+	PropNFSShareID,
+	PropISCSITargetID,
+	PropISCSIExtentID,
+	PropISCSITargetExtentID,
+	PropISCSIInitiatorID,
+	PropNVMeoFSubsystemID,
+	PropNVMeoFNamespaceID,
+	PropNVMeoFPortSubsysID,
+}
+
+// scrubInheritedProtocolProperties removes only provably inherited backend
+// share-object IDs from protocols foreign to shareType. Local properties and all
+// current-protocol properties survive; the protocol-specific backreference
+// resolver repairs same-protocol stale IDs. It is idempotent and best-effort.
+func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) {
+	if ds == nil {
+		return
+	}
+	currentProtocol := map[string]struct{}{}
+	switch shareType {
+	case ShareTypeNFS:
+		currentProtocol[PropNFSShareID] = struct{}{}
+	case ShareTypeISCSI:
+		currentProtocol[PropISCSITargetID] = struct{}{}
+		currentProtocol[PropISCSIExtentID] = struct{}{}
+		currentProtocol[PropISCSITargetExtentID] = struct{}{}
+		currentProtocol[PropISCSIInitiatorID] = struct{}{}
+	case ShareTypeNVMeoF:
+		currentProtocol[PropNVMeoFSubsystemID] = struct{}{}
+		currentProtocol[PropNVMeoFNamespaceID] = struct{}{}
+		currentProtocol[PropNVMeoFPortSubsysID] = struct{}{}
+	default:
+		return
+	}
+	present := make([]string, 0, len(inheritedProtocolPropertyKeys))
+	for _, key := range inheritedProtocolPropertyKeys {
+		property, ok := ds.UserProperties[key]
+		if !ok {
+			continue
+		}
+		if _, ownProtocol := currentProtocol[key]; ownProtocol {
+			continue
+		}
+		source := strings.TrimSpace(property.Source)
+		if source == "" || isLocalUserPropertySource(source) {
+			continue
+		}
+		present = append(present, key)
+	}
+	if len(present) == 0 {
+		return
+	}
+	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, datasetName, present); err != nil {
+		klog.Warningf("Failed to scrub inherited protocol properties from clone %s (reconcile will reconcile the backreference): %v", datasetName, err)
+		return
+	}
+	for _, key := range present {
+		delete(ds.UserProperties, key)
+	}
+}
+
 func (d *Driver) handleVolumeContentSource(
 	ctx context.Context,
 	datasetName, volumeName string,
@@ -2200,6 +2354,7 @@ func (d *Driver) handleVolumeContentSource(
 	shareType ShareType,
 	detached bool,
 	detachedCopyJobID *int64,
+	snapshotCloneMarker **inflightMarker,
 ) (*truenas.Dataset, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
 	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
@@ -2240,6 +2395,10 @@ func (d *Driver) handleVolumeContentSource(
 		}
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
 			return nil, markerWriteErr
+		}
+		if !detached && snapshotCloneMarker != nil {
+			markerCopy := marker
+			*snapshotCloneMarker = &markerCopy
 		}
 		if detached {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
@@ -2284,11 +2443,12 @@ func (d *Driver) handleVolumeContentSource(
 		// This is critical for iSCSI/NVMe-oF where extent creation needs the zvol
 		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 		if err != nil {
-			d.cleanupFailedClone(ctx, datasetName, "")
 			if detached {
+				d.cleanupFailedClone(ctx, datasetName, "")
 				return nil, status.Errorf(codes.Internal, "failed waiting for detached snapshot copy to become ready: %v", err)
 			}
-			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
+			return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
+				status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err))
 		}
 		if detached {
 			createdDS, err = d.prepareDetachedSnapshotCopy(
@@ -2299,17 +2459,23 @@ func (d *Driver) handleVolumeContentSource(
 				return nil, err
 			}
 		} else {
-			if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
-				d.cleanupFailedClone(ctx, datasetName, "")
-				return nil, err
+			var refquota interface{}
+			if createdDS.Type == "FILESYSTEM" && d.config.ZFS.DatasetEnableQuotas && capacityBytes > 0 {
+				refquota = capacityBytes
 			}
-
-			if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+			if createdDS.Type == "VOLUME" {
+				if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
+					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, err)
+				}
+			}
+			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, map[string]string{
 				PropVolumeContentSourceType: "snapshot",
 				PropVolumeContentSourceID:   snapshotID,
-			}); err != nil {
-				klog.Warningf("Failed to set content source properties for snapshot clone: %v", err)
+			})
+			if updateErr != nil {
+				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, updateErr)
 			}
+			createdDS = verified
 		}
 
 	} else if volume := source.GetVolume(); volume != nil {
@@ -2329,7 +2495,7 @@ func (d *Driver) handleVolumeContentSource(
 		}
 
 		// Create a snapshot of source volume, then clone it
-		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
+		tempSnapshotName := fmt.Sprintf("clone-source-%s", sanitizeVolumeID(path.Base(datasetName)))
 		// Durable in-flight provenance BEFORE any mutation; the recorded origin is
 		// the deterministic internal snapshot the clone must descend from.
 		marker, markerErr := d.newInflightMarker(datasetName, source, shareType)
@@ -2435,6 +2601,56 @@ func (d *Driver) cleanupFailedClone(ctx context.Context, datasetName, tempSnapsh
 		return
 	}
 	klog.Warningf("Keeping in-flight marker for %s: cleanup destroy failed and the remnant may still exist; a retry will recover it", datasetName)
+}
+
+// guardedCleanupFailedSnapshotClone destroys a failed snapshot-clone attempt
+// only while the destination and its durable marker still prove they belong to
+// this exact attempt. operationLock is process-local, so a peer controller may
+// have recovered and stamped the clone while this process was handling an
+// error. Any local ownership stamp, missing marker, changed nonce/identity, or
+// failed guard read is a lost race: refuse deletion and return retryable
+// Aborted. Ownership is intentionally checked before marker identity because a
+// peer removes the marker only after its ownership stamp is durable.
+func (d *Driver) guardedCleanupFailedSnapshotClone(
+	ctx context.Context,
+	datasetName string,
+	expected *inflightMarker,
+	cause error,
+) error {
+	dataset, getErr := d.truenasClient.DatasetGet(ctx, datasetName)
+	if getErr != nil {
+		if truenas.IsNotFoundError(getErr) {
+			d.cleanupFailedClone(ctx, datasetName, "")
+			return status.Errorf(codes.Internal, "failed snapshot clone %s: %v", datasetName, cause)
+		}
+		return status.Errorf(codes.Aborted,
+			"cannot verify failed snapshot clone %s before cleanup; refusing delete and retry CreateVolume: %v",
+			datasetName, cause)
+	}
+	if datasetHasLocalOwnershipStamp(dataset) {
+		return status.Errorf(codes.Aborted,
+			"lost snapshot-clone cleanup race for %s (now owned); refusing delete and retry CreateVolume: %v",
+			datasetName, cause)
+	}
+	marker, markerErr := d.readInflightMarker(ctx, path.Base(datasetName))
+	if markerErr != nil || marker == nil || expected == nil ||
+		marker.Version != expected.Version ||
+		marker.Instance != expected.Instance ||
+		marker.Dataset != expected.Dataset ||
+		marker.Mode != expected.Mode ||
+		marker.SourceType != expected.SourceType ||
+		marker.SourceID != expected.SourceID ||
+		marker.Origin != expected.Origin ||
+		marker.Protocol != expected.Protocol ||
+		marker.Nonce != expected.Nonce ||
+		dataset.Name != expected.Dataset ||
+		datasetOriginSnapshotID(dataset) != expected.Origin {
+		return status.Errorf(codes.Aborted,
+			"snapshot-clone cleanup identity changed for %s; refusing delete and retry CreateVolume: %v",
+			datasetName, cause)
+	}
+	d.cleanupFailedClone(ctx, datasetName, "")
+	return status.Errorf(codes.Internal, "failed snapshot clone %s: %v", datasetName, cause)
 }
 
 func datasetPropertyBytes(property truenas.DatasetProperty) int64 {

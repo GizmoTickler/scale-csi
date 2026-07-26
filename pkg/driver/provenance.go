@@ -81,10 +81,18 @@ func (d *Driver) bookkeepingEnabled() bool {
 }
 
 // ensureBookkeepingDataset lazily and idempotently creates the dedicated
-// bookkeeping child dataset on first write.
+// bookkeeping child dataset on first write. Once the dataset is known to exist
+// the existence check is short-circuited by bookkeepingExists, removing one
+// pool.dataset.query per marker / tombstone-ledger write; the flag is re-armed
+// on any bookkeeping write failure (see noteBookkeepingWriteFailure) so a
+// deleted-out-from-under dataset is re-checked and recreated on the next write.
 func (d *Driver) ensureBookkeepingDataset(ctx context.Context) error {
+	if d.bookkeepingExists.Load() {
+		return nil
+	}
 	name := d.bookkeepingDatasetName()
 	if _, err := d.truenasClient.DatasetGet(ctx, name); err == nil {
+		d.bookkeepingExists.Store(true)
 		return nil
 	} else if !truenas.IsNotFoundError(err) {
 		return err
@@ -92,7 +100,19 @@ func (d *Driver) ensureBookkeepingDataset(ctx context.Context) error {
 	if _, err := d.truenasClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: name, Type: "FILESYSTEM"}); err != nil && !truenas.IsAlreadyExistsError(err) {
 		return err
 	}
+	d.bookkeepingExists.Store(true)
 	return nil
+}
+
+// noteBookkeepingWriteFailure re-arms the bookkeeping-existence fast path when a
+// write that targeted the dedicated bookkeeping dataset fails. A failure there
+// means the cached "exists" assumption may be stale (e.g. the dataset was deleted
+// out from under the driver), so the next ensure re-checks and recreates it.
+// Writes to the parent dataset never touch the flag.
+func (d *Driver) noteBookkeepingWriteFailure(target string, err error) {
+	if err != nil && d.bookkeepingEnabled() && target == d.bookkeepingDatasetName() {
+		d.bookkeepingExists.Store(false)
+	}
 }
 
 // bookkeepingWriteTarget returns the dataset new bookkeeping entries are written
@@ -124,8 +144,11 @@ func (d *Driver) removeBookkeepingProperties(ctx context.Context, keys []string)
 		firstErr = err
 	}
 	if d.bookkeepingEnabled() {
-		if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.bookkeepingDatasetName(), keys); err != nil && !truenas.IsNotFoundError(err) && firstErr == nil {
-			firstErr = err
+		if err := d.truenasClient.DatasetRemoveUserProperties(ctx, d.bookkeepingDatasetName(), keys); err != nil {
+			d.noteBookkeepingWriteFailure(d.bookkeepingDatasetName(), err)
+			if !truenas.IsNotFoundError(err) && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
@@ -158,6 +181,7 @@ func (d *Driver) writeInflightMarker(ctx context.Context, marker inflightMarker)
 		return status.Errorf(codes.Internal, "resolve bookkeeping dataset for in-flight marker: %v", err)
 	}
 	if _, err := d.setAndVerifyDatasetUserProperties(ctx, target, map[string]string{key: string(encoded)}); err != nil {
+		d.noteBookkeepingWriteFailure(target, err)
 		return status.Errorf(codes.Internal,
 			"record in-flight creation marker for %s on %s: %v", marker.Dataset, target, err)
 	}
@@ -421,7 +445,7 @@ func (d *Driver) completeResumedCloneRemnant(
 		if err != nil {
 			return nil, err
 		}
-		tempSnapshotName := fmt.Sprintf("clone-source-%s", d.sanitizeVolumeID(path.Base(datasetName)))
+		tempSnapshotName := fmt.Sprintf("clone-source-%s", sanitizeVolumeID(path.Base(datasetName)))
 		properties[PropVolumeContentSourceType] = "volume"
 		properties[PropVolumeContentSourceID] = volume.GetVolumeId()
 		properties[PropVolumeOriginSnapshot] = sourceDataset + "@" + tempSnapshotName
@@ -454,14 +478,15 @@ func (d *Driver) completeResumedCloneRemnant(
 // has no ledger entry and is never touched. A crash between ledger write and
 // rename leaves an entry without a tombstone, which the reconciler sweeps.
 type tombstoneLedgerEntry struct {
-	Version  int    `json:"v"`
-	Snapshot string `json:"snapshot"` // full tombstone ID: dataset@tombstone-name
-	Dataset  string `json:"dataset"`
-	// CreatedAt is the tombstoned snapshot's immutable ZFS creation time (unix
-	// seconds), captured at ledger-write time. The reaper requires the observed
-	// snapshot's creation time to MATCH, so a stale ledger entry can never
-	// authorize reaping a different snapshot later recreated at the same full ID.
+	Version   int    `json:"v"`
+	Snapshot  string `json:"snapshot"` // full tombstone ID: dataset@tombstone-name
+	Dataset   string `json:"dataset"`
 	CreatedAt int64  `json:"created_at,omitempty"`
+	// CreateTXG strengthens v2 identity with ZFS's monotonic, non-reusable
+	// creation transaction group. A zero value records that the backend did not
+	// expose TXG, in which case v2 deliberately degrades to the v1
+	// full-ID-plus-creation-seconds predicate.
+	CreateTXG uint64 `json:"createtxg,omitempty"`
 	RenamedAt string `json:"renamed_at"`
 }
 
@@ -481,6 +506,7 @@ func (d *Driver) writeTombstoneLedgerEntry(ctx context.Context, entry tombstoneL
 	if _, err := d.setAndVerifyDatasetUserProperties(ctx, target, map[string]string{
 		tombstoneLedgerKey(entry.Snapshot): string(encoded),
 	}); err != nil {
+		d.noteBookkeepingWriteFailure(target, err)
 		return fmt.Errorf("record tombstone ledger entry for %s on %s: %w", entry.Snapshot, target, err)
 	}
 	return nil
@@ -547,6 +573,7 @@ func (d *Driver) migrateParentBookkeeping(ctx context.Context, parent *truenas.D
 	// on 26.0 with a ~300-entry single-call migration).
 	for _, batch := range chunkUserProperties(pending, bookkeepingMigrationBatchBudget) {
 		if err := d.truenasClient.DatasetSetUserProperties(ctx, d.bookkeepingDatasetName(), batch); err != nil {
+			d.noteBookkeepingWriteFailure(d.bookkeepingDatasetName(), err)
 			d.recordReconcileObjectFailure("bookkeeping_migration", d.bookkeepingDatasetName(), err)
 			return
 		}
@@ -583,7 +610,8 @@ func tombstoneLedgerFromDataset(parent *truenas.Dataset) map[string]tombstoneLed
 			klog.Warningf("Ignoring unparseable tombstone ledger entry %s: %v", key, err)
 			continue
 		}
-		if entry.Version != tombstoneLedgerVersion || entry.Snapshot == "" || key != tombstoneLedgerKey(entry.Snapshot) {
+		if (entry.Version != 1 && entry.Version != tombstoneLedgerVersion) ||
+			entry.Snapshot == "" || key != tombstoneLedgerKey(entry.Snapshot) {
 			continue
 		}
 		entries[key] = entry
@@ -604,6 +632,7 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 		Snapshot:  deleteID,
 		Dataset:   snap.Dataset,
 		CreatedAt: snap.GetCreationTime(),
+		CreateTXG: snap.CreateTXG,
 		RenamedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
 		return status.Errorf(codes.Internal, "failed to record tombstone provenance for snapshot %s: %v", snap.ID, err)
@@ -833,6 +862,36 @@ func chunkUserProperties(properties map[string]string, budget int) []map[string]
 			size = 0
 		}
 		current[key] = properties[key]
+		size += entrySize
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	return batches
+}
+
+// chunkKeyList splits a list of property keys into deterministic batches whose
+// approximate encoded size stays within budget, mirroring chunkUserProperties for
+// the removal path (a user_properties_update remove carries keys but no values).
+// The same 64 kB WebSocket inbound limit applies, so batched bookkeeping removals
+// use this to stay well under it.
+func chunkKeyList(keys []string, budget int) [][]string {
+	if len(keys) == 0 {
+		return nil
+	}
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
+	var batches [][]string
+	var current []string
+	size := 0
+	for _, key := range sorted {
+		entrySize := len(key) + 64
+		if len(current) > 0 && size+entrySize > budget {
+			batches = append(batches, current)
+			current = nil
+			size = 0
+		}
+		current = append(current, key)
 		size += entrySize
 	}
 	if len(current) > 0 {

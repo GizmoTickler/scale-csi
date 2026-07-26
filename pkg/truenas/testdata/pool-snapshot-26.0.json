@@ -1,0 +1,40 @@
+[
+  {
+    "id": "flashstor/csi/volumes/pvc-c@snapshot-c",
+    "name": "snapshot-c",
+    "dataset": "flashstor/csi/volumes/pvc-c",
+    "pool": "flashstor",
+    "type": "SNAPSHOT",
+    "createtxg": 987656,
+    "properties": {
+      "used": {
+        "value": "8192",
+        "rawvalue": "8192",
+        "parsed": 8192,
+        "source": "LOCAL"
+      },
+      "creation": {
+        "value": "1754693450",
+        "rawvalue": "1754693450",
+        "parsed": {
+          "$date": 1754693450000
+        },
+        "source": "LOCAL"
+      },
+      "truenas-csi:content_source_type": {
+        "value": "snapshot",
+        "source": "LOCAL"
+      }
+    },
+    "user_properties": {
+      "truenas-csi:content_source_type": {
+        "value": "snapshot",
+        "source": "LOCAL"
+      },
+      "truenas-csi:content_source_id": {
+        "value": "source@snapshot",
+        "source": "LOCAL"
+      }
+    }
+  }
+]

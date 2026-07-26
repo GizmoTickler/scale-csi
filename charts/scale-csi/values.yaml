@@ -374,7 +374,10 @@ sidecars:
 
   attacher:
     image: registry.k8s.io/sig-storage/csi-attacher:v4.12.0
-    timeout: 300s
+    # Bounds the ControllerPublish/Unpublish (attach/detach) deadline. 120s keeps
+    # a stuck TrueNAS publish from holding the external-attacher's --timeout for
+    # 300s; the driver's own publish path is far faster after the P1 RTT cuts.
+    timeout: 120s
     workerThreads: 10
     extraArgs: []
     resources:
@@ -386,7 +389,8 @@ sidecars:
 
   resizer:
     image: registry.k8s.io/sig-storage/csi-resizer:v2.2.1
-    timeout: 300s
+    # Bounds the ControllerExpandVolume deadline (see attacher note).
+    timeout: 120s
     workerThreads: 10
     extraArgs: []
     resources:
@@ -547,6 +551,19 @@ reconcile:
   bookkeeping:
     enabled: false
     cleanupParent: false
+
+  # Tombstone reaper tuning.
+  tombstoneReaper:
+    # Bounded-scan fallback for the deferred-delete tombstone reaper. When a
+    # reconcile pass finds ZERO tombstones through the ledger-driven path (the
+    # production failure mode where lost/missing tombstone-ledger entries strand
+    # tombstone-shaped snapshots forever), do ONE bounded snapshot scan of the
+    # parent (limit 500) and reap tombstone-shaped snapshots proven by either a
+    # ledger entry OR (tombstone shape + source-dataset ownership stamp + age
+    # gate). The ledger-driven reaper is unchanged when it finds tombstones.
+    # Default: false.
+    scanFallback:
+      enabled: false
   delete:
     # SAFETY: guarded deletion is opt-in and disabled by default. When enabled,
     # a CronJob runs --mode=reconcile and backend cleanup still goes through the

@@ -193,7 +193,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	lockKey := "volume:" + volume.volumeID
+	lockKey := volumeLockKey(volume.volumeID)
 	if !d.acquireOperationLock(lockKey) {
 		return fmt.Errorf("startup reconcile volume %s: live CSI operation is in progress", volume.volumeID)
 	}
@@ -233,6 +233,10 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	}
 	desired := make(map[string]publicationRecord)
 	deferred := false
+	// Per-volume memo so the validate/classify/ensure/apply phases resolve the
+	// backend share objects once and reuse them across this startup pass (see
+	// fenceResolution). The per-volume lock is held for the whole pass.
+	res := &fenceResolution{}
 	for _, publication := range volume.publications {
 		isDeferred, identityErr := d.validateOrDeferFencingIdentity(publication.identity, shareType)
 		if identityErr != nil {
@@ -249,7 +253,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 			return fmt.Errorf("startup fencing for volume %s has not converged: %w", volume.volumeID, compatibilityErr)
 		}
 		if compatibilityErr := d.validateBackendSingleNodeCompatibility(
-			ctx, dataset, datasetName, shareType, publication.identity, compatibilityRecords, publication.mode,
+			ctx, dataset, datasetName, shareType, publication.identity, compatibilityRecords, publication.mode, res,
 		); compatibilityErr != nil {
 			return fmt.Errorf("startup fencing for volume %s has not converged: %w", volume.volumeID, compatibilityErr)
 		}
@@ -257,7 +261,7 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 		previous, hasPrevious := records[key]
 		if ownershipErr := d.populateAdditiveGrantOwnership(
 			ctx, dataset, datasetName, shareType, publication.identity,
-			previous, hasPrevious, isDeferred, &record,
+			previous, hasPrevious, isDeferred, &record, res,
 		); ownershipErr != nil {
 			return fmt.Errorf("classify startup grant ownership for volume %s on node %s: %w",
 				volume.volumeID, publication.identity.Name, ownershipErr)
@@ -282,10 +286,10 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 		d.stalePublicationRecordsSeen.Delete(stalePublicationObservationKey(datasetName, key))
 	}
 	if len(desired) > 0 {
-		if err := d.ensureShareExists(ctx, dataset, datasetName, volume.volumeID, shareType); err != nil {
+		if err := d.ensureShareExists(ctx, dataset, datasetName, volume.volumeID, shareType, res); err != nil {
 			return fmt.Errorf("ensure share for startup attachment %s: %w", volume.volumeID, err)
 		}
-		if err := d.applyBackendFence(ctx, dataset, datasetName, shareType, records); err != nil {
+		if err := d.applyBackendFence(ctx, dataset, datasetName, shareType, records, res); err != nil {
 			return fmt.Errorf("enforce startup attachment fence for volume %s: %w", volume.volumeID, err)
 		}
 	}

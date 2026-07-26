@@ -205,6 +205,44 @@ func (c *Client) DatasetGet(ctx context.Context, name string) (*Dataset, error) 
 	return parseDataset(datasets[0])
 }
 
+// DatasetGetByNames retrieves multiple datasets by name in a single
+// source-bearing pool.dataset.query (["id","in",[names]]) using the exact same
+// projection/options as DatasetGet, so user-property SOURCE is preserved (the
+// zfs.resource.query listing strips it). It returns a map keyed by dataset name;
+// names with no dataset are simply absent. Callers batch many per-name reads
+// (e.g. the stale-publication reconcile) into one round trip without losing the
+// source information publicationRecordsFromDataset depends on.
+func (c *Client) DatasetGetByNames(ctx context.Context, names []string) (map[string]*Dataset, error) {
+	result := make(map[string]*Dataset, len(names))
+	if len(names) == 0 {
+		return result, nil
+	}
+	filters := [][]interface{}{{"id", "in", names}}
+	options := map[string]interface{}{
+		"extra": map[string]interface{}{
+			"properties": datasetQueryProperties,
+		},
+	}
+
+	response, err := c.Call(ctx, "pool.dataset.query", filters, options)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get datasets: %w", err)
+	}
+
+	items, ok := response.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type")
+	}
+	for _, item := range items {
+		dataset, parseErr := parseDataset(item)
+		if parseErr != nil || dataset == nil {
+			continue
+		}
+		result[dataset.Name] = dataset
+	}
+	return result, nil
+}
+
 // DatasetUpdate updates a dataset's properties.
 func (c *Client) DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error) {
 	result, err := c.Call(ctx, "pool.dataset.update", name, params)
@@ -237,26 +275,11 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offs
 		options["offset"] = offset
 	}
 
-	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
-	if err != nil {
+	var raw []*rawDataset
+	if err := callTyped(ctx, c, &raw, "pool.dataset.query", filters, options); err != nil {
 		return nil, fmt.Errorf("failed to list datasets: %w", err)
 	}
-
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-
-	datasets := make([]*Dataset, 0, len(items))
-	for _, item := range items {
-		ds, err := parseDataset(item)
-		if err != nil {
-			continue
-		}
-		datasets = append(datasets, ds)
-	}
-
-	return datasets, nil
+	return rawDatasetsToDatasets(raw, false), nil
 }
 
 // datasetResourceQueryStatus detects the TrueNAS 26.0 dataset resource API
@@ -352,24 +375,11 @@ func (c *Client) DatasetQueryByParent(ctx context.Context, parentDataset string)
 		return nil, fmt.Errorf("dataset resource API (zfs.resource.query) is not available")
 	}
 	parent := strings.TrimSuffix(parentDataset, "/")
-	result, err := c.Call(ctx, datasetResourceQueryMethod, datasetResourceQueryOptions([]string{parent}, true))
-	if err != nil {
+	var raw []*rawDataset
+	if err := callTyped(ctx, c, &raw, datasetResourceQueryMethod, datasetResourceQueryOptions([]string{parent}, true)); err != nil {
 		return nil, fmt.Errorf("failed to query datasets by parent: %w", err)
 	}
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-	datasets := make([]*Dataset, 0, len(items))
-	for _, item := range items {
-		ds, parseErr := parseDatasetResource(item)
-		if parseErr != nil {
-			continue
-		}
-		ds.ResourceQuery = true
-		datasets = append(datasets, ds)
-	}
-	return datasets, nil
+	return rawDatasetsToDatasets(raw, true), nil
 }
 
 // LIVE-PROBE GATE: parseDatasetResource parses the MODELED (not live-verified)
@@ -512,20 +522,13 @@ func (c *Client) queryDatasetOrigins(ctx context.Context, parent string) (map[st
 			"properties": []string{"origin"},
 		},
 	}
-	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
-	if err != nil {
+	var raw []*rawDataset
+	if err := callTyped(ctx, c, &raw, "pool.dataset.query", filters, options); err != nil {
 		return nil, fmt.Errorf("failed to query dataset origins: %w", err)
 	}
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-	origins := make(map[string]string, len(items))
-	for _, item := range items {
-		dataset, parseErr := parseDataset(item)
-		if parseErr != nil {
-			continue
-		}
+	origins := make(map[string]string, len(raw))
+	for _, item := range raw {
+		dataset := item.toDataset(false)
 		origins[dataset.Name] = datasetPropertyString(dataset.Origin)
 	}
 	return origins, nil

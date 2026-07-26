@@ -471,6 +471,7 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 	requested NodeIdentity,
 	records map[string]publicationRecord,
 	mode csi.VolumeCapability_AccessMode_Mode,
+	res *fenceResolution,
 ) error {
 	if isMultiNodeMode(mode) {
 		return nil
@@ -483,7 +484,7 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 
 	switch shareType {
 	case ShareTypeNFS:
-		share, err := d.resolveNFSShare(ctx, ds, datasetName)
+		share, err := d.resolvedNFSShare(ctx, res, ds, datasetName)
 		if err != nil {
 			return status.Errorf(codes.Internal, "verify NFS publication allowlist: %v", err)
 		}
@@ -503,7 +504,7 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 		}
 
 	case ShareTypeISCSI:
-		target, err := d.resolveISCSITarget(ctx, ds, datasetName)
+		target, err := d.resolvedISCSITarget(ctx, res, ds, datasetName)
 		if err != nil {
 			return status.Errorf(codes.Internal, "verify iSCSI publication allowlist: %v", err)
 		}
@@ -537,11 +538,7 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 		}
 
 	case ShareTypeNVMeoF:
-		namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
-		if err != nil {
-			return status.Errorf(codes.Internal, "verify NVMe-oF publication allowlist: %v", err)
-		}
-		subsystem, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+		_, subsystem, err := d.resolvedNVMeObjects(ctx, res, ds, datasetName)
 		if err != nil {
 			return status.Errorf(codes.Internal, "verify NVMe-oF publication allowlist: %v", err)
 		}
@@ -566,7 +563,7 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 				exemptHostIDs[host.ID] = struct{}{}
 			}
 		}
-		associations, listErr := d.truenasClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+		associations, listErr := d.resolvedNVMeAssociations(ctx, res, subsystem.ID)
 		if listErr != nil {
 			return status.Errorf(codes.Internal, "verify NVMe-oF subsystem allowlist: %v", listErr)
 		}
@@ -609,6 +606,7 @@ func (d *Driver) populateAdditiveGrantOwnership(
 	hasPrevious bool,
 	deferred bool,
 	record *publicationRecord,
+	res *fenceResolution,
 ) error {
 	if d.config.Fencing.Mode != FencingModeAdditive || record == nil {
 		return nil
@@ -623,7 +621,7 @@ func (d *Driver) populateAdditiveGrantOwnership(
 
 	switch shareType {
 	case ShareTypeNFS:
-		share, err := d.resolveNFSShare(ctx, ds, datasetName)
+		share, err := d.resolvedNFSShare(ctx, res, ds, datasetName)
 		if err != nil {
 			return err
 		}
@@ -685,11 +683,7 @@ func (d *Driver) populateAdditiveGrantOwnership(
 		if _, static := stringSet(d.config.NVMeoF.SubsystemHosts)[nqn]; static {
 			return nil
 		}
-		namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
-		if err != nil {
-			return err
-		}
-		subsystem, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+		_, subsystem, err := d.resolvedNVMeObjects(ctx, res, ds, datasetName)
 		if err != nil {
 			return err
 		}
@@ -701,7 +695,7 @@ func (d *Driver) populateAdditiveGrantOwnership(
 			if findErr != nil {
 				return findErr
 			}
-			associations, listErr := d.truenasClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+			associations, listErr := d.resolvedNVMeAssociations(ctx, res, subsystem.ID)
 			if listErr != nil {
 				return listErr
 			}
@@ -855,7 +849,7 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 	if nodeID == "" {
 		nodeID = blocking.Node
 	}
-	if revokeErr := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, nodeID); revokeErr != nil {
+	if revokeErr := d.unpublishFencedVolume(ctx, ds, datasetName, shareType, nodeID, nil); revokeErr != nil {
 		return ds, records, status.Errorf(codes.Internal,
 			"revoke stale publication for node %s before granting node %s: %v", blocking.Node, requested.Node, revokeErr)
 	}
@@ -879,7 +873,7 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 	return freshDS, freshRecords, nil
 }
 
-func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, identity NodeIdentity, capability *csi.VolumeCapability, readonly bool) error {
+func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, identity NodeIdentity, capability *csi.VolumeCapability, readonly bool, res *fenceResolution) error {
 	// Publication records are the CSI spec-semantics layer and are maintained in
 	// EVERY fencing mode: same-node idempotency, different-node SINGLE_NODE
 	// FailedPrecondition, stale-record takeover, and empty-node-id unpublish-all
@@ -926,7 +920,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	if backendEnforcement {
 		if err := d.validateBackendSingleNodeCompatibility(
 			ctx, ds, datasetName, shareType, identity, records,
-			csi.VolumeCapability_AccessMode_Mode(record.AccessMode),
+			csi.VolumeCapability_AccessMode_Mode(record.AccessMode), res,
 		); err != nil {
 			return err
 		}
@@ -935,7 +929,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	previous, hasPrevious := records[key]
 	if backendEnforcement {
 		if err := d.populateAdditiveGrantOwnership(
-			ctx, ds, datasetName, shareType, identity, previous, hasPrevious, deferred, &record,
+			ctx, ds, datasetName, shareType, identity, previous, hasPrevious, deferred, &record, res,
 		); err != nil {
 			// The provenance-overflow refusal is a deliberate, actionable status;
 			// preserve its code instead of masking it as Internal.
@@ -957,7 +951,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 		// way the durable record is written and the transport grant is left untouched.
 		return nil
 	}
-	if err := d.applyBackendFence(ctx, ds, datasetName, shareType, records); err != nil {
+	if err := d.applyBackendFence(ctx, ds, datasetName, shareType, records, res); err != nil {
 		// Keep the durable record. A retry or startup reconciliation will converge
 		// the allowlist without needing the node to report its identity again.
 		return status.Errorf(codes.Internal, "failed to enforce backend publication fence: %v", err)
@@ -965,7 +959,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	return nil
 }
 
-func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, nodeID string) error {
+func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, nodeID string, res *fenceResolution) error {
 	records, err := publicationRecordsFromDataset(ds)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to read durable publication records: %v", err)
@@ -1001,7 +995,7 @@ func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset,
 	// Backend allowlist revocation is governed by fencing.mode; off mode tracks
 	// publications purely through the durable records and never touches it.
 	if d.config.Fencing.Enabled() {
-		if err := d.applyBackendFence(ctx, ds, datasetName, shareType, records); err != nil && !errors.Is(err, errFenceBackendAbsent) {
+		if err := d.applyBackendFence(ctx, ds, datasetName, shareType, records, res); err != nil && !errors.Is(err, errFenceBackendAbsent) {
 			return status.Errorf(codes.Internal, "failed to remove backend publication fence: %v", err)
 		}
 	}
@@ -1035,7 +1029,7 @@ func additiveGrantOwnership(records map[string]publicationRecord) (nfsHosts, nvm
 	return uniqueSortedStrings(nfsHosts), uniqueSortedStrings(nvmeNQNs)
 }
 
-func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, records map[string]publicationRecord) error {
+func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, records map[string]publicationRecord, res *fenceResolution) error {
 	active, removing := activeAndRemovingIdentities(records)
 	// Provenance is cumulative across same-node identity rotations. Supplying it
 	// for published as well as removing records lets each convergence remove old
@@ -1067,7 +1061,7 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 	if backend == nil {
 		return fmt.Errorf("unsupported share type %q", shareType)
 	}
-	return backend.ApplyFence(ctx, ds, datasetName, enforceable, removing, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs)
+	return backend.ApplyFence(ctx, ds, datasetName, enforceable, removing, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs, res)
 }
 
 func uniqueSortedStrings(values []string) []string {
@@ -1110,8 +1104,9 @@ func (d *Driver) applyNFSFence(
 	datasetName string,
 	active []NodeIdentity,
 	additiveRemovingHosts, additiveProtectedHosts []string,
+	res *fenceResolution,
 ) error {
-	share, err := d.resolveNFSShare(ctx, ds, datasetName)
+	share, err := d.resolvedNFSShare(ctx, res, ds, datasetName)
 	if err != nil {
 		return err
 	}
@@ -1296,8 +1291,8 @@ func (d *Driver) safeAdditiveISCSIGroups(ctx context.Context, target *truenas.IS
 	return result, nil
 }
 
-func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity) error {
-	target, err := d.resolveISCSITarget(ctx, ds, datasetName)
+func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, res *fenceResolution) error {
+	target, err := d.resolvedISCSITarget(ctx, res, ds, datasetName)
 	if err != nil {
 		return err
 	}
@@ -1399,12 +1394,9 @@ func (d *Driver) applyNVMeFence(
 	datasetName string,
 	active, removing []NodeIdentity,
 	additiveRemovingNQNs, additiveProtectedNQNs []string,
+	res *fenceResolution,
 ) error {
-	namespace, err := d.resolveNVMeNamespace(ctx, ds, datasetName)
-	if err != nil {
-		return err
-	}
-	subsystem, err := d.resolveNVMeSubsystem(ctx, ds, datasetName, namespace)
+	_, subsystem, err := d.resolvedNVMeObjects(ctx, res, ds, datasetName)
 	if err != nil {
 		return err
 	}
@@ -1415,6 +1407,12 @@ func (d *Driver) applyNVMeFence(
 		if _, updateErr := d.truenasClient.NVMeoFSubsystemUpdateAllowAnyHost(ctx, subsystem.ID, false); updateErr != nil {
 			return updateErr
 		}
+	}
+	// Compatibility/classification reads are not enforcement evidence: an
+	// operator, peer controller, or backend action can change the allowlist
+	// outside this process-local volume lock. Fresh-list at the mutation boundary.
+	if _, refreshErr := d.refreshNVMeAssociations(ctx, res, subsystem.ID); refreshErr != nil {
+		return refreshErr
 	}
 	desiredNQNs := make([]string, 0, len(active)+len(d.config.NVMeoF.SubsystemHosts))
 	for _, identity := range active {
@@ -1433,11 +1431,19 @@ func (d *Driver) applyNVMeFence(
 	desiredByID := make(map[int]struct{}, len(desiredIDs))
 	for _, hostID := range desiredIDs {
 		desiredByID[hostID] = struct{}{}
-		if _, createErr := d.truenasClient.NVMeoFHostSubsysCreate(ctx, hostID, subsystem.ID); createErr != nil {
+		// Issue the desired association unconditionally. The client keeps its
+		// AlreadyExists tolerance, and this closes the race where an association
+		// observed during compatibility disappears before enforcement.
+		_, createErr := d.truenasClient.NVMeoFHostSubsysCreate(ctx, hostID, subsystem.ID)
+		res.invalidateNVMeAssociations()
+		if createErr != nil {
 			return createErr
 		}
 	}
-	associations, err := d.truenasClient.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+	// Removals must use a fresh POST-create list. A foreign association can
+	// appear after the boundary read, and strict fencing must revoke it before
+	// reporting success.
+	associations, err := d.refreshNVMeAssociations(ctx, res, subsystem.ID)
 	if err != nil {
 		return err
 	}
@@ -1493,8 +1499,10 @@ func (d *Driver) applyNVMeFence(
 			_, remove = removeByID[association.HostID]
 		}
 		if remove {
-			if err := d.truenasClient.NVMeoFHostSubsysDelete(ctx, association.ID); err != nil {
-				return err
+			deleteErr := d.truenasClient.NVMeoFHostSubsysDelete(ctx, association.ID)
+			res.invalidateNVMeAssociations()
+			if deleteErr != nil {
+				return deleteErr
 			}
 		}
 	}

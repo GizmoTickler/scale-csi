@@ -812,6 +812,15 @@ func TestClient_CircuitBreakerCountsLogicalCalls(t *testing.T) {
 				}
 				continue
 			}
+			if req.Method == "core.subscribe" {
+				// Every connection generation issues a core.get_jobs subscribe
+				// frame (job-event dispatcher); it must not perturb the breaker
+				// call accounting this test pins.
+				if err := conn.WriteJSON(rpcTestResponse{JSONRPC: "2.0", ID: req.ID, Result: true}); err != nil {
+					return
+				}
+				continue
+			}
 			atomic.AddInt32(&queryCount, 1)
 			_ = conn.UnderlyingConn().Close()
 			return
@@ -875,6 +884,16 @@ func TestClient_CircuitBreakerHalfOpenRetryDoesNotWedge(t *testing.T) {
 				return
 			}
 			if req.Method == "auth.login_with_api_key" {
+				if err := conn.WriteJSON(rpcTestResponse{JSONRPC: "2.0", ID: req.ID, Result: true}); err != nil {
+					return
+				}
+				continue
+			}
+
+			if req.Method == "core.subscribe" {
+				// Every connection generation issues a core.get_jobs subscribe
+				// frame (job-event dispatcher); it must not perturb the breaker
+				// attempt accounting this test pins.
 				if err := conn.WriteJSON(rpcTestResponse{JSONRPC: "2.0", ID: req.ID, Result: true}); err != nil {
 					return
 				}

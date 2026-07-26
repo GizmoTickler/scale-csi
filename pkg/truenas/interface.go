@@ -22,6 +22,7 @@ type ClientInterface interface {
 	DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error)
 	DatasetDelete(ctx context.Context, name string, recursive, force bool) error
 	DatasetGet(ctx context.Context, name string) (*Dataset, error)
+	DatasetGetByNames(ctx context.Context, names []string) (map[string]*Dataset, error)
 	DatasetUpdate(ctx context.Context, name string, params *DatasetUpdateParams) (*Dataset, error)
 	DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*Dataset, error)
 	DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*Dataset, error)
@@ -115,6 +116,7 @@ type ClientInterface interface {
 	NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID int, devicePath string) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath string) (*NVMeoFNamespace, error)
 	NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFNamespace, error)
+	NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespace, error)
 	NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error)
 	NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error)
 	NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error)

@@ -316,6 +316,16 @@ func datasetUserProperty(ds *truenas.Dataset, key string) string {
 	return ""
 }
 
+// datasetUserPropertyHasValue reports whether a dataset carries key with a
+// meaningful stored value — present and neither empty nor the ZFS sentinel "-".
+// It is the shared primitive behind the stored-protocol-property sniffs
+// (storedBlockProtocol's per-protocol pair check and DeleteVolume's share-type
+// detection), replacing the predicate each hand-rolled.
+func datasetUserPropertyHasValue(ds *truenas.Dataset, key string) bool {
+	value := datasetUserProperty(ds, key)
+	return value != "" && value != "-"
+}
+
 func datasetUserPropertyProjection(ds *truenas.Dataset, key string) (truenas.UserProperty, bool) {
 	if ds == nil {
 		return truenas.UserProperty{}, false
@@ -555,12 +565,14 @@ const (
 
 // ensureShareExists checks if a share exists for the dataset and creates it if missing.
 // This is critical for idempotency when a volume was created but share creation failed.
-func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType) error {
+// res, when non-nil, receives the backend objects the ensure resolved so the
+// subsequent fence phases reuse them instead of re-resolving (see fenceResolution).
+func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, res *fenceResolution) error {
 	backend := backendForShareType(d, shareType)
 	if backend == nil {
 		return nil
 	}
-	return backend.EnsureShare(ctx, ds, datasetName, volumeName)
+	return backend.EnsureShare(ctx, ds, datasetName, volumeName, res)
 }
 
 // createShareWithOptions creates a share with additional options.

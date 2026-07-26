@@ -28,31 +28,94 @@ import (
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
+// fencingHarness bundles the Driver + MockClient scaffold that the fencing
+// tests repeatedly hand-built as a &Driver{...} literal. newFencingTestHarness
+// centralizes it, parameterized by fencing mode and share protocol. Precedent:
+// newTestNodeDriver (node_test.go). Narrative scenario tests keep their own
+// bodies; only the setup boilerplate is shared.
+type fencingHarness struct {
+	d      *Driver
+	client *truenas.MockClient
+}
+
+type fencingHarnessOptions struct {
+	nvmeAllowAnyHost   bool
+	nfsShareHost       string
+	nfsAllowedNetworks []string
+}
+
+type fencingHarnessOption func(*fencingHarnessOptions)
+
+func withNVMeAllowAnyHost() fencingHarnessOption {
+	return func(o *fencingHarnessOptions) { o.nvmeAllowAnyHost = true }
+}
+
+func withNFSShareConfig(shareHost string, allowedNetworks ...string) fencingHarnessOption {
+	return func(o *fencingHarnessOptions) {
+		o.nfsShareHost = shareHost
+		o.nfsAllowedNetworks = allowedNetworks
+	}
+}
+
+func fencingDriverName(proto ShareType) string {
+	switch proto {
+	case ShareTypeISCSI:
+		return "org.scale.csi.iscsi"
+	case ShareTypeNVMeoF:
+		return "org.scale.csi.nvmeof"
+	default:
+		return "org.scale.csi.nfs"
+	}
+}
+
+func newFencingTestHarness(t *testing.T, mode FencingMode, proto ShareType, opts ...fencingHarnessOption) fencingHarness {
+	t.Helper()
+	o := fencingHarnessOptions{}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	client := truenas.NewMockClient()
+	name := fencingDriverName(proto)
+	cfg := &Config{
+		DriverName: name,
+		Fencing:    FencingConfig{Mode: mode},
+		ZFS:        ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
+	}
+	switch proto {
+	case ShareTypeNVMeoF:
+		cfg.NVMeoF = NVMeoFConfig{
+			Transport:             "TCP",
+			TransportAddress:      "192.0.2.20",
+			TransportServiceID:    4420,
+			SubsystemAllowAnyHost: o.nvmeAllowAnyHost,
+		}
+	case ShareTypeISCSI:
+		cfg.ISCSI = ISCSIConfig{TargetPortal: "192.0.2.10:3260"}
+	case ShareTypeNFS:
+		cfg.NFS = NFSConfig{ShareHost: o.nfsShareHost, ShareAllowedNetworks: o.nfsAllowedNetworks}
+	}
+	return fencingHarness{
+		d: &Driver{
+			name:              name,
+			config:            cfg,
+			truenasClient:     client,
+			nvmeResolvedHosts: make(map[string]int),
+		},
+		client: client,
+	}
+}
+
 func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nvmeof",
-		config: &Config{
-			DriverName: "org.scale.csi.nvmeof",
-			Fencing:    FencingConfig{Mode: FencingModeStrict},
-			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
-			NVMeoF: NVMeoFConfig{
-				Transport:          "TCP",
-				TransportAddress:   "192.0.2.20",
-				TransportServiceID: 4420,
-			},
-		},
-		truenasClient:     client,
-		nvmeResolvedHosts: make(map[string]int),
-	}
+	h := newFencingTestHarness(t, FencingModeStrict, ShareTypeNVMeoF)
+	d, client := h.d, h.client
 
 	datasetName := "pool/parent/fenced-volume"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
 	})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "fenced-volume", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "fenced-volume", true, true, nil))
 
 	nodeA, err := encodeNodeIdentity(NodeIdentity{
 		Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a",
@@ -128,6 +191,42 @@ func TestControllerPublishSingleWriterRejectsSecondNodeAndNodeGoneUnpublishIsIde
 	assert.False(t, retained, "backend conflict must be detected before persisting a new publication")
 }
 
+func TestControllerPublishRepairsCompletelyMissingNVMeShareBeforeFencing(t *testing.T) {
+	ctx := context.Background()
+	h := newFencingTestHarness(t, FencingModeStrict, ShareTypeNVMeoF)
+	d, client := h.d, h.client
+	datasetName := "pool/parent/restored-without-share"
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
+	})
+	require.NoError(t, err)
+
+	nodeID, err := encodeNodeIdentity(NodeIdentity{
+		Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a",
+	})
+	require.NoError(t, err)
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: "restored-without-share",
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "nvmeof"},
+	})
+	require.NoError(t, err,
+		"ensureShareExists must replace its memoized miss with the newly created namespace/subsystem")
+
+	dataset, err := client.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
+	namespaceID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFNamespaceID))
+	assert.Positive(t, namespaceID)
+	associations, err := client.NVMeoFHostSubsysListBySubsystem(ctx, subsystemID)
+	require.NoError(t, err)
+	require.Len(t, associations, 1)
+	assert.Equal(t, "nqn.2014-08.org.nvmexpress:uuid:worker-a", associations[0].HostNQN)
+}
+
 // allowlistCountingClient wraps the mock and counts every backend transport
 // allowlist mutation (NFS host lists, iSCSI initiator groups/target groups,
 // NVMe-oF host-subsystem associations). Off-mode publication tracking must keep
@@ -141,6 +240,103 @@ type allowlistCountingClient struct {
 	nvmeHostSubsysCreate atomic.Int64
 	nvmeHostSubsysDelete atomic.Int64
 	nvmeAllowAnyHost     atomic.Int64
+}
+
+type nvmeAssociationInterleavingClient struct {
+	*truenas.MockClient
+	listCalls  int
+	afterFirst func()
+}
+
+func (c *nvmeAssociationInterleavingClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFHostSubsys, error) {
+	associations, err := c.MockClient.NVMeoFHostSubsysListBySubsystem(ctx, subsysID)
+	c.listCalls++
+	if c.listCalls == 1 && c.afterFirst != nil {
+		c.afterFirst()
+	}
+	return associations, err
+}
+
+func TestApplyNVMeFenceFreshensAssociationStateAtMutationBoundaries(t *testing.T) {
+	t.Run("desired association removed after compatibility is recreated", func(t *testing.T) {
+		ctx := context.Background()
+		client := truenas.NewMockClient()
+		d := &Driver{
+			config: &Config{
+				Fencing: FencingConfig{Mode: FencingModeStrict},
+				ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			},
+			truenasClient: client, nvmeResolvedHosts: make(map[string]int),
+		}
+		dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/fresh-create", Type: "VOLUME", Volsize: testGiB,
+		})
+		require.NoError(t, err)
+		subsystem, err := client.NVMeoFSubsystemCreate(ctx, "fresh-create", false, nil)
+		require.NoError(t, err)
+		namespace, err := client.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+dataset.Name, "ZVOL")
+		require.NoError(t, err)
+		nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+		host, err := client.NVMeoFHostCreate(ctx, nqn)
+		require.NoError(t, err)
+		association, err := client.NVMeoFHostSubsysCreate(ctx, host.ID, subsystem.ID)
+		require.NoError(t, err)
+		res := &fenceResolution{
+			nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true,
+			nvmeAssociations: []*truenas.NVMeoFHostSubsys{association}, nvmeAssocLoaded: true,
+		}
+		require.NoError(t, client.NVMeoFHostSubsysDelete(ctx, association.ID),
+			"external removal lands after compatibility cached the association")
+
+		require.NoError(t, d.applyNVMeFence(ctx, dataset, dataset.Name,
+			[]NodeIdentity{{Name: "worker-a", NVMeNQN: nqn}}, nil, nil, nil, res))
+		associations, err := client.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+		require.NoError(t, err)
+		require.Len(t, associations, 1)
+		assert.Equal(t, nqn, associations[0].HostNQN)
+	})
+
+	t.Run("foreign association created after boundary read is removed", func(t *testing.T) {
+		ctx := context.Background()
+		base := truenas.NewMockClient()
+		client := &nvmeAssociationInterleavingClient{MockClient: base}
+		d := &Driver{
+			config: &Config{
+				Fencing: FencingConfig{Mode: FencingModeStrict},
+				ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
+			},
+			truenasClient: client, nvmeResolvedHosts: make(map[string]int),
+		}
+		dataset, err := base.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/fresh-remove", Type: "VOLUME", Volsize: testGiB,
+		})
+		require.NoError(t, err)
+		subsystem, err := base.NVMeoFSubsystemCreate(ctx, "fresh-remove", false, nil)
+		require.NoError(t, err)
+		namespace, err := base.NVMeoFNamespaceCreate(ctx, subsystem.ID, "zvol/"+dataset.Name, "ZVOL")
+		require.NoError(t, err)
+		desiredNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
+		desired, err := base.NVMeoFHostCreate(ctx, desiredNQN)
+		require.NoError(t, err)
+		_, err = base.NVMeoFHostSubsysCreate(ctx, desired.ID, subsystem.ID)
+		require.NoError(t, err)
+		foreign, err := base.NVMeoFHostCreate(ctx, "nqn.2014-08.org.nvmexpress:uuid:foreign")
+		require.NoError(t, err)
+		client.afterFirst = func() {
+			_, createErr := base.NVMeoFHostSubsysCreate(ctx, foreign.ID, subsystem.ID)
+			require.NoError(t, createErr)
+		}
+		res := &fenceResolution{
+			nvmeNamespace: namespace, nvmeSubsystem: subsystem, nvmeNSLoaded: true,
+		}
+
+		require.NoError(t, d.applyNVMeFence(ctx, dataset, dataset.Name,
+			[]NodeIdentity{{Name: "worker-a", NVMeNQN: desiredNQN}}, nil, nil, nil, res))
+		associations, err := base.NVMeoFHostSubsysListBySubsystem(ctx, subsystem.ID)
+		require.NoError(t, err)
+		require.Len(t, associations, 1)
+		assert.Equal(t, desiredNQN, associations[0].HostNQN)
+	})
 }
 
 func (c *allowlistCountingClient) allowlistCalls() int64 {
@@ -301,7 +497,7 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
 	})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "off-nvme-volume", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, ds, datasetName, "off-nvme-volume", true, true, nil))
 
 	// Baseline: share creation may reconcile the (empty) static host set; the
 	// assertion below is that the PUBLISH flow adds no further allowlist calls.
@@ -373,17 +569,8 @@ func TestControllerPublishOffModeNVMeoFMakesNoBackendAllowlistCalls(t *testing.T
 // silently treated as single-node.
 func TestControllerPublishRejectsUnknownAccessMode(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nfs",
-		config: &Config{
-			DriverName: "org.scale.csi.nfs",
-			Fencing:    FencingConfig{Mode: FencingModeOff},
-			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS:        NFSConfig{ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"}},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeOff, ShareTypeNFS, withNFSShareConfig("192.0.2.10", "192.0.2.0/24"))
+	d, client := h.d, h.client
 	datasetName := "pool/parent/unknown-mode"
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
 	require.NoError(t, err)
@@ -431,7 +618,7 @@ func TestNVMeBackendCompatibilityFallsBackToHostIDWhenHostNQNIsEmpty(t *testing.
 	datasetName := "pool/parent/host-id-fallback"
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, datasetName, "host-id-fallback", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, datasetName, "host-id-fallback", true, true, nil))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
 	host, err := client.NVMeoFHostCreate(ctx, nqn)
@@ -442,30 +629,20 @@ func TestNVMeBackendCompatibilityFallsBackToHostIDWhenHostNQNIsEmpty(t *testing.
 
 	err = d.validateBackendSingleNodeCompatibility(ctx, dataset, datasetName, ShareTypeNVMeoF,
 		NodeIdentity{Name: "worker-a", NVMeNQN: nqn}, map[string]publicationRecord{},
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, nil)
 	require.NoError(t, err, "the nested association HostID remains authoritative when host.hostnqn is omitted")
 
 	err = d.validateBackendSingleNodeCompatibility(ctx, dataset, datasetName, ShareTypeNVMeoF,
 		NodeIdentity{Name: "worker-b", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-b"},
-		map[string]publicationRecord{}, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+		map[string]publicationRecord{}, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "host ID")
 }
 
 func TestControllerUnpublishVolumeEmptyNodeIDRevokesAllPublications(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nfs",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeStrict},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS: NFSConfig{
-				ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"},
-			},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeStrict, ShareTypeNFS, withNFSShareConfig("192.0.2.10", "192.0.2.0/24"))
+	d, client := h.d, h.client
 	datasetName := "pool/parent/unpublish-all"
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
 	require.NoError(t, err)
@@ -502,18 +679,8 @@ func TestControllerUnpublishVolumeEmptyNodeIDRevokesAllPublications(t *testing.T
 
 func TestAdditivePublishDefersMissingAndOutOfCIDRIdentityWhilePreservingNFSNetworks(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nfs",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS: NFSConfig{
-				ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"},
-			},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNFS, withNFSShareConfig("192.0.2.10", "192.0.2.0/24"))
+	d, client := h.d, h.client
 	datasetName := "pool/parent/additive-nfs"
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "FILESYSTEM"})
 	require.NoError(t, err)
@@ -569,16 +736,8 @@ func TestAdditivePublishDefersMissingAndOutOfCIDRIdentityWhilePreservingNFSNetwo
 
 func TestAdditiveSingleNodeDeferredOwnershipRejectsSecondLegacyNode(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nfs",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS:     NFSConfig{ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"}},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNFS, withNFSShareConfig("192.0.2.10", "192.0.2.0/24"))
+	d, client := h.d, h.client
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/deferred-single", Type: "FILESYSTEM"})
 	require.NoError(t, err)
 	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
@@ -616,16 +775,8 @@ func TestAdditiveSingleNodeDeferredOwnershipRejectsSecondLegacyNode(t *testing.T
 
 func TestAdditiveDeferredAndValidNFSPublishesPreserveBroadAllowAll(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nfs",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS:     NFSConfig{ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"}},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNFS, withNFSShareConfig("192.0.2.10", "192.0.2.0/24"))
+	d, client := h.d, h.client
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/broad-nfs", Type: "FILESYSTEM"})
 	require.NoError(t, err)
 	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{Path: dataset.Mountpoint, Enabled: true})
@@ -859,16 +1010,8 @@ func TestAdditiveNFSPublishFailsWhenBackendLiveProvenanceExceedsCap(t *testing.T
 
 func TestAdditiveNFSIdentityRotationRemovesOldCSIAddedGrant(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nfs",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS:     NFSConfig{ShareAllowedNetworks: []string{"192.0.2.0/24"}},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNFS, withNFSShareConfig("", "192.0.2.0/24"))
+	d, client := h.d, h.client
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: "pool/parent/nfs-identity-rotation", Type: "FILESYSTEM",
 	})
@@ -924,16 +1067,8 @@ func TestAdditiveNFSIdentityRotationRemovesOldCSIAddedGrant(t *testing.T) {
 
 func TestAdditiveNFSDeferredIdentityProtectsEarlierCSIAddedGrant(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nfs",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS:     NFSConfig{ShareAllowedNetworks: []string{"192.0.2.0/24"}},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNFS, withNFSShareConfig("", "192.0.2.0/24"))
+	d, client := h.d, h.client
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: "pool/parent/nfs-deferred-provenance", Type: "FILESYSTEM",
 	})
@@ -974,16 +1109,8 @@ func TestAdditiveNFSDeferredIdentityProtectsEarlierCSIAddedGrant(t *testing.T) {
 
 func TestAdditiveDeferredAndValidISCSIPublishesPreserveLegacyAllowAll(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.iscsi",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
-			ISCSI:   ISCSIConfig{TargetPortal: "192.0.2.10:3260"},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeISCSI)
+	d, client := h.d, h.client
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/broad-iscsi", Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
 	target, err := client.ISCSITargetCreate(ctx, "broad-iscsi", "", "ISCSI", []truenas.ISCSITargetGroup{{
@@ -1024,20 +1151,11 @@ func TestAdditiveDeferredAndValidISCSIPublishesPreserveLegacyAllowAll(t *testing
 
 func TestAdditiveNVMePublishAndUnpublishPreserveAllowAnyHost(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nvmeof",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
-			NVMeoF: NVMeoFConfig{Transport: "TCP", TransportAddress: "192.0.2.20", TransportServiceID: 4420,
-				SubsystemAllowAnyHost: true},
-		},
-		truenasClient: client, nvmeResolvedHosts: make(map[string]int),
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNVMeoF, withNVMeAllowAnyHost())
+	d, client := h.d, h.client
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/broad-nvme", Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "broad-nvme", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "broad-nvme", true, true, nil))
 	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a"})
 	require.NoError(t, err)
 	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
@@ -1066,16 +1184,8 @@ func TestAdditiveNVMePublishAndUnpublishPreserveAllowAnyHost(t *testing.T) {
 // published without being seen as "published elsewhere".
 func TestClonedVolumeInheritsNoPublicationRecordsAndPublishesCleanly(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nfs",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent"},
-			NFS:     NFSConfig{ShareHost: "192.0.2.10", ShareAllowedNetworks: []string{"192.0.2.0/24"}},
-		},
-		truenasClient: client,
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNFS, withNFSShareConfig("192.0.2.10", "192.0.2.0/24"))
+	d, client := h.d, h.client
 	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
 	require.NoError(t, err)
 	sourceShare, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
@@ -1157,7 +1267,7 @@ func TestAdditiveNVMeUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 				Name: "pool/parent/" + volumeID, Type: "VOLUME", Volsize: testGiB,
 			})
 			require.NoError(t, err)
-			require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, volumeID, true, true))
+			require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, volumeID, true, true, nil))
 			subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 			nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
 			if test.preassociate {
@@ -1199,25 +1309,14 @@ func TestAdditiveNVMeUnpublishUsesDurableCSIAddedProvenance(t *testing.T) {
 
 func TestAdditiveNVMeIdentityRotationRemovesOldCSIAddedAssociation(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nvmeof",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
-			NVMeoF: NVMeoFConfig{
-				Transport: "TCP", TransportAddress: "192.0.2.20", TransportServiceID: 4420,
-				SubsystemAllowAnyHost: true,
-			},
-		},
-		truenasClient: client, nvmeResolvedHosts: make(map[string]int),
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNVMeoF, withNVMeAllowAnyHost())
+	d, client := h.d, h.client
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: "pool/parent/nvme-identity-rotation", Type: "VOLUME", Volsize: testGiB,
 	})
 	require.NoError(t, err)
 	require.NoError(t, d.createNVMeoFShareForDataset(
-		ctx, dataset, dataset.Name, "nvme-identity-rotation", true, true,
+		ctx, dataset, dataset.Name, "nvme-identity-rotation", true, true, nil,
 	))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	publish := func(nqn string) string {
@@ -1264,25 +1363,14 @@ func TestAdditiveNVMeIdentityRotationRemovesOldCSIAddedAssociation(t *testing.T)
 
 func TestAdditiveNVMeDeferredIdentityProtectsEarlierCSIAddedAssociation(t *testing.T) {
 	ctx := context.Background()
-	client := truenas.NewMockClient()
-	d := &Driver{
-		name: "org.scale.csi.nvmeof",
-		config: &Config{
-			Fencing: FencingConfig{Mode: FencingModeAdditive},
-			ZFS:     ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
-			NVMeoF: NVMeoFConfig{
-				Transport: "TCP", TransportAddress: "192.0.2.20", TransportServiceID: 4420,
-				SubsystemAllowAnyHost: true,
-			},
-		},
-		truenasClient: client, nvmeResolvedHosts: make(map[string]int),
-	}
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNVMeoF, withNVMeAllowAnyHost())
+	d, client := h.d, h.client
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 		Name: "pool/parent/nvme-deferred-provenance", Type: "VOLUME", Volsize: testGiB,
 	})
 	require.NoError(t, err)
 	require.NoError(t, d.createNVMeoFShareForDataset(
-		ctx, dataset, dataset.Name, "nvme-deferred-provenance", true, true,
+		ctx, dataset, dataset.Name, "nvme-deferred-provenance", true, true, nil,
 	))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	publish := func(nodeID string) {
@@ -1669,7 +1757,7 @@ func TestStartupReconcileAdditivePreservesNVMeGrantDuringIdentityGapThenRotates(
 	})
 	require.NoError(t, err)
 	require.NoError(t, d.createNVMeoFShareForDataset(
-		ctx, dataset, dataset.Name, "startup-nvme-identity-gap", true, true,
+		ctx, dataset, dataset.Name, "startup-nvme-identity-gap", true, true, nil,
 	))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	oldNQN := "nqn.2014-08.org.nvmexpress:uuid:worker-a-old"
@@ -1989,7 +2077,7 @@ func TestISCSILastUnpublishReattachesDenyGroupToExistingTargetPortals(t *testing
 		truenasClient: client,
 	}
 
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, nil))
 	target, err = client.ISCSITargetGet(ctx, target.ID)
 	require.NoError(t, err)
 	require.Equal(t, []truenas.ISCSITargetGroup{{Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE"}}, target.Groups,
@@ -2574,7 +2662,7 @@ func TestAdditiveNVMeHostnqnlessRepublishRetainsProvenanceForUnpublish(t *testin
 		Name: "pool/parent/nvme-hostnqnless", Type: "VOLUME", Volsize: testGiB,
 	})
 	require.NoError(t, err)
-	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "nvme-hostnqnless", true, true))
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, dataset, dataset.Name, "nvme-hostnqnless", true, true, nil))
 	subsystemID := mustAtoi(t, datasetUserProperty(dataset, PropNVMeoFSubsystemID))
 	nqn := "nqn.2014-08.org.nvmexpress:uuid:worker-a"
 	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: nqn})
