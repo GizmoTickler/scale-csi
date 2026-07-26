@@ -1,0 +1,28 @@
+[
+  {
+    "id": "flashstor/csi/volumes/pvc-a",
+    "name": "flashstor/csi/volumes/pvc-a",
+    "pool": "flashstor",
+    "type": "FILESYSTEM",
+    "origin": {
+      "value": "-",
+      "rawvalue": "",
+      "parsed": "",
+      "source": "NONE"
+    },
+    "user_properties": {}
+  },
+  {
+    "id": "flashstor/csi/volumes/pvc-clone",
+    "name": "flashstor/csi/volumes/pvc-clone",
+    "pool": "flashstor",
+    "type": "FILESYSTEM",
+    "origin": {
+      "value": "FLASHSTOR/CSI/VOLUMES/PVC-A@SNAPSHOT-A",
+      "rawvalue": "flashstor/csi/volumes/pvc-a@snapshot-a",
+      "parsed": "flashstor/csi/volumes/pvc-a@snapshot-a",
+      "source": "LOCAL"
+    },
+    "user_properties": {}
+  }
+]

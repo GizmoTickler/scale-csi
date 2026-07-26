@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -328,6 +329,7 @@ const (
 type Connection struct {
 	id                  int
 	config              *ClientConfig
+	client              *Client
 	conn                atomic.Pointer[websocket.Conn] // atomic for lock-free reads
 	mu                  sync.RWMutex
 	messageID           int64
@@ -354,6 +356,8 @@ type Connection struct {
 	heartbeatDone chan struct{}
 	lastPong      int64 // atomic unix timestamp
 
+	// jobSubState packs generation<<1 | subscribedBit.
+	jobSubState atomic.Uint64
 }
 
 // NewConnection creates a new connection instance.
@@ -418,6 +422,19 @@ type Client struct {
 	// probe once instead of on every debounced reload (2 RTTs -> 1 RTT).
 	serviceReloadResolved   atomic.Bool
 	serviceReloadUseControl atomic.Bool
+
+	dispatcher *jobDispatcher
+
+	// A successful subscription closes the current pulse and installs a new
+	// one. Waiters snapshot it before polling, so reconnect subscriptions always
+	// trigger a post-subscribe poll without callbacks in the state machine.
+	jobSubscriptionMu      sync.Mutex
+	jobSubscriptionChanged chan struct{}
+
+	// Test-only timing/call overrides. Zero values use production behavior.
+	jobWaitPollInterval   time.Duration
+	jobWaitSafetyInterval time.Duration
+	jobPollOnceOverride   func(context.Context, int64) (bool, error)
 }
 
 // rpcRequest is a JSON-RPC 2.0 request.
@@ -430,10 +447,12 @@ type rpcRequest struct {
 
 // rpcResponse is a JSON-RPC 2.0 response.
 type rpcResponse struct {
-	JSONRPC      string      `json:"jsonrpc"`
-	ID           int64       `json:"id"`
-	Result       interface{} `json:"result,omitempty"`
-	Error        *rpcError   `json:"error,omitempty"`
+	JSONRPC      string          `json:"jsonrpc"`
+	ID           int64           `json:"id"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	Error        *rpcError       `json:"error,omitempty"`
+	Method       string          `json:"method,omitempty"`
+	Params       json.RawMessage `json:"params,omitempty"`
 	transportErr error
 }
 
@@ -530,16 +549,26 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		replicationJobAbortRecorder: cfg.ReplicationJobAbortRecorder,
 		circuitBreaker:              cb,
 		nvmeResolvedPort:            make(map[string]*NVMeoFPort),
+		dispatcher:                  newJobDispatcher(),
+		jobSubscriptionChanged:      make(chan struct{}),
 	}
+	stopDispatcher := true
+	defer func() {
+		if stopDispatcher {
+			client.dispatcher.Stop()
+		}
+	}()
 
 	// Initialize connection pool
 	insecureWarningOnce := &sync.Once{}
 	for i := 0; i < cfg.MaxConnections; i++ {
 		client.pool[i] = NewConnection(i, cfg)
+		client.pool[i].client = client
 		client.pool[i].insecureWarningOnce = insecureWarningOnce
 	}
 	if cfg.LazyConnect {
 		klog.Infof("TrueNAS client initialized in lazy-connect mode")
+		stopDispatcher = false
 		return client, nil
 	}
 
@@ -586,6 +615,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		}
 	}
 
+	stopDispatcher = false
 	return client, nil
 }
 
@@ -748,10 +778,11 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 			continue
 		}
 		c.authenticated = true
-		handles.waitGroup.Add(1)
+		handles.waitGroup.Add(2)
 		c.mu.Unlock()
 		atomic.StoreInt64(&c.lastPong, time.Now().Unix())
 
+		go c.subscribeJobs(handles.generation, handles.waitGroup)
 		go c.heartbeatLoop(handles.generation, handles.heartbeatDone, handles.waitGroup)
 
 		klog.Infof("Conn %d: Connected and authenticated", c.id)
@@ -807,6 +838,7 @@ func (c *Connection) startGeneration(wsConn *websocket.Conn) (generationHandles,
 	}
 	c.generation++
 	generation := c.generation
+	c.jobSubState.Store(generation << 1)
 	writeCh := make(chan writeRequest, 100)
 	writeDone := make(chan struct{})
 	heartbeatDone := make(chan struct{})
@@ -856,13 +888,13 @@ func (c *Connection) stopGeneration(generation uint64) bool {
 }
 
 func (c *Connection) authenticate(ctx context.Context, generation uint64) error {
-	result, err := c.callWithGeneration(ctx, generation, true, "auth.login_with_api_key", c.config.APIKey)
+	raw, err := c.callWithGeneration(ctx, generation, true, "auth.login_with_api_key", c.config.APIKey)
 	if err != nil {
 		return fmt.Errorf("failed to send auth request: %w", err)
 	}
-	success, ok := result.(bool)
-	if !ok || !success {
-		return fmt.Errorf("authentication returned unexpected result: %v", result)
+	var success bool
+	if err := json.Unmarshal(raw, &success); err != nil || !success {
+		return fmt.Errorf("authentication returned unexpected result: %s", raw)
 	}
 	return nil
 }
@@ -993,6 +1025,13 @@ func (c *Connection) readMessages(generation uint64, conn *websocket.Conn, gener
 			return
 		}
 
+		if resp.ID == 0 && resp.Method != "" {
+			if c.client != nil && c.client.dispatcher != nil {
+				c.client.dispatcher.offer(resp.Params)
+			}
+			continue
+		}
+
 		c.pendingMu.Lock()
 		if pending, ok := c.pending[resp.ID]; ok && pending.generation == generation {
 			pending.responseCh <- &resp
@@ -1036,6 +1075,14 @@ func (c *Connection) failPending(generation uint64, cause error) {
 
 // CallWithContext makes a JSON-RPC call using this connection.
 func (c *Connection) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
+	raw, err := c.callRawWithContext(ctx, method, params...)
+	if err != nil {
+		return nil, err
+	}
+	return rawResultToInterface(raw)
+}
+
+func (c *Connection) callRawWithContext(ctx context.Context, method string, params ...interface{}) (json.RawMessage, error) {
 	if err := c.connect(ctx); err != nil {
 		return nil, err
 	}
@@ -1045,7 +1092,7 @@ func (c *Connection) CallWithContext(ctx context.Context, method string, params 
 	return c.callWithGeneration(ctx, generation, false, method, params...)
 }
 
-func (c *Connection) callWithGeneration(ctx context.Context, generation uint64, allowUnauthenticated bool, method string, params ...interface{}) (interface{}, error) {
+func (c *Connection) callWithGeneration(ctx context.Context, generation uint64, allowUnauthenticated bool, method string, params ...interface{}) (json.RawMessage, error) {
 	c.mu.Lock()
 	if generation != c.generation || c.stopped || c.conn.Load() == nil || (!allowUnauthenticated && !c.authenticated) {
 		c.mu.Unlock()
@@ -1114,7 +1161,7 @@ func requestTransportError(method string, sent bool, cause error) error {
 	return fmt.Errorf("%w: failed to send %s request: %w", ErrTransportFailure, method, cause)
 }
 
-func (c *Connection) failedWriteResult(id int64, method string, responseCh <-chan *rpcResponse, cause error) (interface{}, error) {
+func (c *Connection) failedWriteResult(id int64, method string, responseCh <-chan *rpcResponse, cause error) (json.RawMessage, error) {
 	c.pendingMu.Lock()
 	select {
 	case resp := <-responseCh:
@@ -1130,7 +1177,7 @@ func (c *Connection) failedWriteResult(id int64, method string, responseCh <-cha
 	return nil, requestTransportError(method, sent, cause)
 }
 
-func (c *Connection) canceledCallResult(id int64, method string, responseCh <-chan *rpcResponse, ctxErr error) (interface{}, error) {
+func (c *Connection) canceledCallResult(id int64, method string, responseCh <-chan *rpcResponse, ctxErr error) (json.RawMessage, error) {
 	c.pendingMu.Lock()
 	select {
 	case resp := <-responseCh:
@@ -1150,7 +1197,7 @@ func (c *Connection) canceledCallResult(id int64, method string, responseCh <-ch
 	return nil, ctxErr
 }
 
-func responseResult(resp *rpcResponse) (interface{}, error) {
+func responseResult(resp *rpcResponse) (json.RawMessage, error) {
 	if resp.transportErr != nil {
 		return nil, resp.transportErr
 	}
@@ -1192,9 +1239,41 @@ func (c *Client) Call(ctx context.Context, method string, params ...interface{})
 }
 
 // CallWithContext makes a JSON-RPC call with a context using the connection pool.
+func (c *Client) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
+	raw, err := c.callRaw(ctx, method, params...)
+	if err != nil {
+		return nil, err
+	}
+	return rawResultToInterface(raw)
+}
+
+func rawResultToInterface(raw json.RawMessage) (interface{}, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var result interface{}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode JSON-RPC result: %w", err)
+	}
+	return result, nil
+}
+
+func callTyped[T any](ctx context.Context, c *Client, out *T, method string, params ...interface{}) error {
+	raw, err := c.callRaw(ctx, method, params...)
+	if err != nil {
+		return err
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, out)
+}
+
+// callRaw is the single resilience pipeline shared by the generic and typed
+// result decoders.
 // Uses a semaphore to limit concurrent requests and prevent overwhelming TrueNAS.
 // Implements circuit breaker pattern and automatic retry on connection errors with exponential backoff.
-func (c *Client) CallWithContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
+func (c *Client) callRaw(ctx context.Context, method string, params ...interface{}) (json.RawMessage, error) {
 	start := time.Now()
 	var halfOpenProbe bool
 	var breakerOutcomeRecorded bool
@@ -1258,7 +1337,7 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params ...i
 				callCtx, cancel = context.WithTimeout(ctx, c.config.Timeout)
 			}
 		}
-		result, err := conn.CallWithContext(callCtx, method, params...)
+		result, err := conn.callRawWithContext(callCtx, method, params...)
 		attemptTimedOut := err != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		if err == nil {
@@ -1425,6 +1504,9 @@ func (c *Client) Close() error {
 		if err := conn.Close(); err != nil {
 			lastErr = err
 		}
+	}
+	if c.dispatcher != nil {
+		c.dispatcher.Stop()
 	}
 	return lastErr
 }

@@ -400,8 +400,8 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 		return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
 	}
 
-	result, err := c.Call(ctx, c.snapshotMethod("get_instance"), snapshotID)
-	if err != nil {
+	var raw *rawSnapshot
+	if err := callTyped(ctx, c, &raw, c.snapshotMethod("get_instance"), snapshotID); err != nil {
 		// Log full error details before fallback logic (helps debug ambiguous errors)
 		LogAPIError(err, "SnapshotGet error")
 
@@ -420,8 +420,11 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 		}
 		return nil, fmt.Errorf("failed to get snapshot: %w", err)
 	}
+	if raw == nil {
+		return nil, fmt.Errorf("unexpected snapshot format")
+	}
 
-	return parseSnapshot(result)
+	return raw.toSnapshot(), nil
 }
 
 // SnapshotList lists snapshots for a dataset.
@@ -442,26 +445,11 @@ func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot,
 
 	filters := [][]interface{}{{"dataset", "=", dataset}}
 
-	result, err := c.Call(ctx, c.snapshotMethod("query"), filters, map[string]interface{}{})
-	if err != nil {
+	var raw []*rawSnapshot
+	if err := callTyped(ctx, c, &raw, c.snapshotMethod("query"), filters, map[string]interface{}{}); err != nil {
 		return nil, fmt.Errorf("failed to list snapshots: %w", err)
 	}
-
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-
-	snapshots := make([]*Snapshot, 0, len(items))
-	for _, item := range items {
-		snap, err := parseSnapshot(item)
-		if err != nil {
-			continue
-		}
-		snapshots = append(snapshots, snap)
-	}
-
-	return snapshots, nil
+	return rawSnapshotsToSnapshots(raw, false), nil
 }
 
 // SnapshotListAll lists all snapshots under a parent dataset (recursive).
@@ -493,26 +481,11 @@ func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limi
 		options["offset"] = offset
 	}
 
-	result, err := c.Call(ctx, c.snapshotMethod("query"), filters, options)
-	if err != nil {
+	var raw []*rawSnapshot
+	if err := callTyped(ctx, c, &raw, c.snapshotMethod("query"), filters, options); err != nil {
 		return nil, fmt.Errorf("failed to list snapshots: %w", err)
 	}
-
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-
-	snapshots := make([]*Snapshot, 0, len(items))
-	for _, item := range items {
-		snap, err := parseSnapshot(item)
-		if err != nil {
-			continue
-		}
-		snapshots = append(snapshots, snap)
-	}
-
-	return snapshots, nil
+	return rawSnapshotsToSnapshots(raw, false), nil
 }
 
 // SnapshotFindByName finds a snapshot by its short name under a parent dataset.
@@ -539,21 +512,14 @@ func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name str
 	// The pattern matches any string ending with "@" + name
 	filters := legacySnapshotNameFilters(parentDataset, name)
 
-	result, err := c.Call(ctx, c.snapshotMethod("query"), filters, map[string]interface{}{})
-	if err != nil {
+	var raw []*rawSnapshot
+	if err := callTyped(ctx, c, &raw, c.snapshotMethod("query"), filters, map[string]interface{}{}); err != nil {
 		return nil, fmt.Errorf("failed to query snapshots: %w", err)
 	}
-
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-
-	if len(items) == 0 {
+	if len(raw) == 0 {
 		return nil, nil // Not found, not an error
 	}
-
-	return parseSnapshot(items[0])
+	return raw[0].toSnapshot(), nil
 }
 
 func legacySnapshotNameFilters(parentDataset, name string) [][]interface{} {
@@ -564,24 +530,11 @@ func legacySnapshotNameFilters(parentDataset, name string) [][]interface{} {
 }
 
 func (c *Client) querySnapshotResources(ctx context.Context, paths []string, recursive bool, properties []string) ([]*Snapshot, error) {
-	result, err := c.Call(ctx, snapshotResourceQueryMethod, snapshotResourceQueryOptions(paths, recursive, properties))
-	if err != nil {
+	var raw []*rawSnapshot
+	if err := callTyped(ctx, c, &raw, snapshotResourceQueryMethod, snapshotResourceQueryOptions(paths, recursive, properties)); err != nil {
 		return nil, err
 	}
-	items, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-	snapshots := make([]*Snapshot, 0, len(items))
-	for _, item := range items {
-		snap, parseErr := parseSnapshot(item)
-		if parseErr != nil {
-			continue
-		}
-		snap.ResourceQuery = true
-		snapshots = append(snapshots, snap)
-	}
-	return snapshots, nil
+	return rawSnapshotsToSnapshots(raw, true), nil
 }
 
 func paginateSnapshots(snapshots []*Snapshot, limit, offset int) []*Snapshot {
@@ -675,6 +628,7 @@ func (c *Client) SnapshotClone(ctx context.Context, snapshotID, newDatasetName s
 const (
 	replicationJobPollInterval = 500 * time.Millisecond
 	replicationJobAbortTimeout = 10 * time.Second
+	slowSafetyNetInterval      = 10 * time.Second
 )
 
 // CopyDatasetFromSnapshotLocal creates an independent dataset with a local ZFS
@@ -808,44 +762,95 @@ func replicationJobID(result interface{}) (int64, error) {
 }
 
 func (c *Client) waitForJob(ctx context.Context, jobID int64) error {
-	filters := [][]interface{}{{"id", "=", jobID}}
-	for {
-		result, err := c.Call(ctx, "core.get_jobs", filters)
-		if err != nil {
-			return fmt.Errorf("failed to query job: %w", err)
-		}
-		jobs, ok := result.([]interface{})
-		if !ok {
-			return fmt.Errorf("unexpected core.get_jobs response type %T", result)
-		}
-		if len(jobs) > 0 {
-			job, ok := jobs[0].(map[string]interface{})
-			if !ok {
-				return fmt.Errorf("unexpected job response type %T", jobs[0])
-			}
-			state, _ := job["state"].(string)
-			switch strings.ToUpper(state) {
-			case "SUCCESS":
-				return nil
-			case "FAILED", "ABORTED", "CANCELED":
-				detail := "no error detail"
-				if message, ok := job["error"].(string); ok && message != "" {
-					detail = message
-				} else if exception, ok := job["exception"].(string); ok && exception != "" {
-					detail = exception
-				}
-				return &jobTerminalError{state: state, detail: detail}
-			}
-		}
+	if c.dispatcher == nil {
+		return clientClosedJobWaitError(jobID)
+	}
+	evCh := c.dispatcher.register(jobID)
+	defer c.dispatcher.unregister(jobID, evCh)
 
-		timer := time.NewTimer(replicationJobPollInterval)
+	// Snapshot this before the initial poll. If a connection subscribes while
+	// the poll is in flight, its pulse triggers the post-subscribe poll for that
+	// generation and closes the subscribe-after-terminal gap.
+	subscriptionChanged := c.jobSubscriptionSignal()
+	if done, err := c.pollJob(ctx, jobID); done || err != nil {
+		return err
+	}
+
+	pollInterval := replicationJobPollInterval
+	if c.jobWaitPollInterval > 0 {
+		pollInterval = c.jobWaitPollInterval
+	}
+	safetyInterval := slowSafetyNetInterval
+	if c.jobWaitSafetyInterval > 0 {
+		safetyInterval = c.jobWaitSafetyInterval
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	lastPoll := time.Now()
+
+	for {
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return fmt.Errorf("context ended while waiting for job: %w", ctx.Err())
-		case <-timer.C:
+		case ev, ok := <-evCh:
+			if !ok {
+				return clientClosedJobWaitError(jobID)
+			}
+			if terminalJobState(ev.state) {
+				return terminalJobResult(ev)
+			}
+		case <-subscriptionChanged:
+			if done, err := c.pollJob(ctx, jobID); done || err != nil {
+				return err
+			}
+			lastPoll = time.Now()
+			subscriptionChanged = c.jobSubscriptionSignal()
+		case <-ticker.C:
+			if !c.anyConnectionJobSubscribed() || time.Since(lastPoll) >= safetyInterval {
+				if done, err := c.pollJob(ctx, jobID); done || err != nil {
+					return err
+				}
+				lastPoll = time.Now()
+			}
 		}
 	}
+}
+
+func (c *Client) pollJob(ctx context.Context, jobID int64) (bool, error) {
+	if c.jobPollOnceOverride != nil {
+		return c.jobPollOnceOverride(ctx, jobID)
+	}
+	return c.pollJobOnce(ctx, jobID)
+}
+
+func (c *Client) pollJobOnce(ctx context.Context, jobID int64) (bool, error) {
+	filters := [][]interface{}{{"id", "=", jobID}}
+	result, err := c.Call(ctx, "core.get_jobs", filters)
+	if err != nil {
+		return false, fmt.Errorf("failed to query job: %w", err)
+	}
+	jobs, ok := result.([]interface{})
+	if !ok {
+		return false, fmt.Errorf("unexpected core.get_jobs response type %T", result)
+	}
+	if len(jobs) == 0 {
+		return false, nil
+	}
+	job, ok := jobs[0].(map[string]interface{})
+	if !ok {
+		return false, fmt.Errorf("unexpected job response type %T", jobs[0])
+	}
+	state, _ := job["state"].(string)
+	if !terminalJobState(state) {
+		return false, nil
+	}
+	detail := ""
+	if message, ok := job["error"].(string); ok && message != "" {
+		detail = message
+	} else if exception, ok := job["exception"].(string); ok && exception != "" {
+		detail = exception
+	}
+	return true, terminalJobResult(jobEvent{jobID: jobID, state: state, detail: detail})
 }
 
 // DestroyReplicatedTargetSnapshot removes the snapshot transferred to the

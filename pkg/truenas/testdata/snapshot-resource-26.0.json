@@ -1,0 +1,67 @@
+[
+  {
+    "name": "flashstor/csi/volumes/pvc-a@snapshot-a",
+    "snapshot_name": "snapshot-a",
+    "dataset": "flashstor/csi/volumes/pvc-a",
+    "pool": "flashstor",
+    "type": "SNAPSHOT",
+    "createtxg": 987654,
+    "properties": {
+      "used": {
+        "value": 2723840,
+        "raw": "2723840",
+        "source": "LOCAL"
+      },
+      "creation": {
+        "value": 1754693322,
+        "raw": "1754693322",
+        "source": "LOCAL"
+      },
+      "clones": {
+        "value": "flashstor/csi/volumes/clone-a",
+        "source": "LOCAL"
+      },
+      "truenas-csi:managed": {
+        "value": "from-properties",
+        "source": "LOCAL"
+      }
+    },
+    "user_properties": {
+      "truenas-csi:managed": {
+        "value": "from-user-properties",
+        "source": "INHERITED"
+      },
+      "truenas-csi:flat": "flat-value"
+    }
+  },
+  {
+    "id": "flashstor/csi/volumes/pvc-b@snapshot-b",
+    "name": "snapshot-b",
+    "dataset": "flashstor/csi/volumes/pvc-b",
+    "pool": "flashstor",
+    "type": "SNAPSHOT",
+    "createtxg": "987655",
+    "properties": {
+      "used": {
+        "value": 4096,
+        "rawvalue": "4096",
+        "parsed": 4096,
+        "source": "LOCAL"
+      },
+      "creation": {
+        "value": "1754693399",
+        "rawvalue": "1754693399",
+        "parsed": {
+          "$date": 1754693399000
+        },
+        "source": "LOCAL"
+      }
+    },
+    "user_properties": {
+      "truenas-csi:driver_instance": {
+        "value": "cluster-a",
+        "source": "LOCAL"
+      }
+    }
+  }
+]

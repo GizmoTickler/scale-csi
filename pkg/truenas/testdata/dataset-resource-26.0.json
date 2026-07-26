@@ -1,0 +1,77 @@
+[
+  {
+    "name": "flashstor/csi/volumes/pvc-a",
+    "path": "flashstor/csi/volumes/pvc-a",
+    "pool": "flashstor",
+    "type": "FILESYSTEM",
+    "mountpoint": "/mnt/flashstor/csi/volumes/pvc-a",
+    "properties": {
+      "used": {
+        "value": 1048576,
+        "rawvalue": "1048576",
+        "parsed": 1048576,
+        "source": "LOCAL"
+      },
+      "available": {
+        "value": 10737418240,
+        "raw": "10737418240",
+        "parsed": 10737418240,
+        "source": "LOCAL"
+      },
+      "refquota": {
+        "value": "NONE",
+        "rawvalue": "0",
+        "parsed": null,
+        "source": "DEFAULT"
+      },
+      "origin": {
+        "value": "-",
+        "rawvalue": "",
+        "parsed": "",
+        "source": "NONE"
+      },
+      "creation": {
+        "value": "1754693000",
+        "rawvalue": "1754693000",
+        "parsed": {
+          "$date": 1754693000000
+        },
+        "source": "LOCAL"
+      }
+    },
+    "user_properties": {
+      "truenas-csi:managed_resource": {
+        "value": "true",
+        "source": "LOCAL"
+      },
+      "truenas-csi:flat": "flat-resource-value"
+    }
+  },
+  {
+    "id": "flashstor/csi/volumes/pvc-clone",
+    "name": "flashstor/csi/volumes/pvc-clone",
+    "pool": "flashstor",
+    "type": "FILESYSTEM",
+    "mountpoint": "/mnt/flashstor/csi/volumes/pvc-clone",
+    "properties": {
+      "used": {
+        "value": 524288,
+        "rawvalue": "524288",
+        "parsed": 524288,
+        "source": "LOCAL"
+      },
+      "origin": {
+        "value": "FLASHSTOR/CSI/VOLUMES/PVC-A@SNAPSHOT-A",
+        "rawvalue": "flashstor/csi/volumes/pvc-a@snapshot-a",
+        "parsed": "flashstor/csi/volumes/pvc-a@snapshot-a",
+        "source": "LOCAL"
+      }
+    },
+    "user_properties": {
+      "truenas-csi:managed_resource": {
+        "value": "true",
+        "source": "LOCAL"
+      }
+    }
+  }
+]
