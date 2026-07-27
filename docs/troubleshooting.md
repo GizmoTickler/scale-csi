@@ -8,23 +8,29 @@ This guide helps diagnose and resolve common issues with the Scale CSI driver.
 
 ```bash
 # Check controller pod status
-kubectl get pods -n scale-csi -l app=scale-csi-controller
+kubectl get pods -n scale-csi -l app.kubernetes.io/component=controller
 
 # Check node plugin status (should have one per node)
-kubectl get pods -n scale-csi -l app=scale-csi-node
+kubectl get pods -n scale-csi -l app.kubernetes.io/component=node
 
 # Check CSI driver registration
 kubectl get csidrivers
 ```
 
+The chart labels pods with `app.kubernetes.io/name`,
+`app.kubernetes.io/instance` (the Helm release name), and
+`app.kubernetes.io/component` (`controller` or `node`) — there is no `app=`
+label. Combine with the instance label to scope to one release, e.g.
+`-l app.kubernetes.io/instance=scale-csi,app.kubernetes.io/component=controller`.
+
 ### View Logs
 
 ```bash
 # Controller logs
-kubectl logs -n scale-csi -l app=scale-csi-controller -c scale-csi --tail=100
+kubectl logs -n scale-csi -l app.kubernetes.io/component=controller -c scale-csi --tail=100
 
 # Node plugin logs (on specific node)
-kubectl logs -n scale-csi -l app=scale-csi-node -c scale-csi --tail=100
+kubectl logs -n scale-csi -l app.kubernetes.io/component=node -c scale-csi --tail=100
 
 # With Helm, enable verbose logging with: --set logging.verbosity=4
 ```
@@ -235,7 +241,7 @@ The driver includes automatic session garbage collection. If you see duplicate s
 | `discovery failed` | Can't reach iSCSI portal | Check network connectivity and portal address |
 | `device not found after timeout` | Device didn't appear in time | Increase `deviceWaitTimeout` |
 | `target is busy` | Volume still in use | Ensure all pods using volume are terminated |
-| `already exists` | Resource already created | Usually idempotent - retry should work |
+| `already exists` | A backend object with that name already exists | Retry is safe **only** if it is a compatible, fully stamped object owned by this driver instance. Foreign, unstamped, incompatible, or conflicting objects return terminal ownership/compatibility errors by design — inspect the object's `truenas-csi:*` ownership properties and resolve the name collision; do **not** blindly retry, and do not delete/rename the backend object to force success |
 | `not found` | Resource doesn't exist | Check TrueNAS for dataset/share existence |
 | `connection lost` | WebSocket disconnected | Will auto-reconnect; check TrueNAS status |
 
@@ -261,8 +267,10 @@ When reporting issues, include:
 
 1. **Driver version:**
    ```bash
-   kubectl exec -n scale-csi <pod> -c scale-csi -- /scale-csi --version
+   kubectl exec -n scale-csi <pod> -c scale-csi -- /usr/local/bin/scale-csi -version
    ```
+   (The binary is on `PATH`, so `scale-csi -version` also works. Flags use the
+   single-dash `-version` form.)
 
 2. **Configuration (sanitized):**
    ```bash
@@ -271,8 +279,8 @@ When reporting issues, include:
 
 3. **Recent logs:**
    ```bash
-   kubectl logs -n scale-csi -l app=scale-csi-controller --tail=500
-   kubectl logs -n scale-csi -l app=scale-csi-node --tail=500
+   kubectl logs -n scale-csi -l app.kubernetes.io/component=controller --tail=500
+   kubectl logs -n scale-csi -l app.kubernetes.io/component=node --tail=500
    ```
 
 4. **Events:**
@@ -303,11 +311,14 @@ kubectl rollout restart deployment -n scale-csi scale-csi-controller
 
 The controller detects old CSI-managed backend resources automatically and
 exports `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`,
-`scale_csi_remnant_volumes`, `scale_csi_tombstone_snapshots`,
-`scale_csi_spent_restore_snapshots`, and matching byte gauges. Use
-`scale_csi_reconcile_last_success_timestamp_seconds` to detect a stalled loop
-and `scale_csi_reconcile_failures_total{phase}` to isolate partial object
-failures. Detection is read-only and enabled by default:
+`scale_csi_remnant_volumes`, `scale_csi_tombstone_snapshots`, and
+`scale_csi_spent_restore_snapshots` count gauges. Byte gauges exist only for
+orphan volumes (`scale_csi_orphan_volumes_bytes`), orphan snapshots
+(`scale_csi_orphan_snapshots_bytes`), and tombstones
+(`scale_csi_tombstone_snapshots_bytes`) — there is no remnant or spent-restore
+byte gauge. Use `scale_csi_reconcile_last_success_timestamp_seconds` to detect a
+stalled loop and `scale_csi_reconcile_failures_total{phase}` to isolate partial
+object failures. Detection is read-only and enabled by default:
 
 ```yaml
 reconcile:
@@ -320,11 +331,15 @@ reconcile:
 
 Inspect the controller logs and metrics first. To opt into cleanup, set
 `reconcile.delete.enabled: true`; the chart then creates a scheduled run-once
-job. The job never issues a raw ZFS destroy. It calls the existing guarded CSI
-delete paths, which refuse resources with live clone or snapshot dependencies.
-Guarded deletions are capped per pass by `reconcile.delete.maxPerRun`
-(default 5), which is shared across orphan volumes, remnant volumes, and
-tombstone reaping.
+job. It never issues an unguarded raw ZFS destroy. The cleanup uses different
+guarded paths per object class: orphan volumes and snapshots go through the CSI
+`DeleteVolume`/`DeleteSnapshot` paths (which refuse resources with live clone or
+snapshot dependencies); tombstones and marker-proven remnant orphans use
+separately guarded direct TrueNAS-client destroys after re-proving provenance;
+and spent-restore cleanup deletes the Kubernetes `VolumeSnapshot`. A single
+`reconcile.delete.maxPerRun` cap (default 5) is shared across orphan volumes,
+orphan snapshots, tombstones, remnants, and spent restores; orphaned-share
+cleanup has its own separate `maxPerRun` invocation.
 
 #### Tombstones that never drain
 
@@ -338,15 +353,20 @@ recover them:
 - **Legacy stamp adoption** re-stamps `driver_instance_id` onto pre-v1.2.21
   managed datasets that a live Bound PV references, which unblocks reaping of
   their tombstones. This always-on step deletes nothing.
-- **Scan fallback** is opt-in and off by default. When a pass finds zero
-  ledger-proven tombstones, `reconcile.tombstoneReaper.scanFallback.enabled: true`
-  performs one bounded snapshot scan (limit 500, no recursion) and reaps only
-  tombstone-shaped snapshots whose provenance is proven by *either* a ledger
-  entry *or* (tombstone shape + source-dataset ownership stamp + age gate).
+- **Scan fallback** is opt-in and off by default
+  (`reconcile.tombstoneReaper.scanFallback.enabled: true`). It runs on **every**
+  pass, independent of the strict ledger backlog. It issues no separate query —
+  it reuses the pass's already-fetched recursive, unpaginated snapshot set and
+  processes at most 500 accepted candidates. A candidate is reaped only when it
+  has **no** ledger property at either bookkeeping location and carries retained
+  creation-time identity that exactly reproduces the driver's nonce-derived
+  tombstone rename (retained snapshot/instance identity, exact tombstone name,
+  local source-instance ownership, age gate, and the inheritance-mask guard).
 
 Tombstones the reaper refuses because no belt can prove provenance are counted
-as `manualRecoveryTombstones` in the reconcile summary line — they require
-operator inspection and are never destroyed automatically.
+as `manualRecoveryTombstones` in the reconcile summary line — and that inventory
+is populated **only while scan fallback is enabled**. They require operator
+inspection and are never destroyed automatically.
 
 You can inspect the same managed-resource boundary on TrueNAS with:
 

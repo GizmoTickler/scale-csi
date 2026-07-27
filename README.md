@@ -54,11 +54,13 @@ Follow the complete
 ### TrueNAS SCALE Setup
 
 1. **Generate an API Key**: Settings → API Keys → Add
-2. **Create parent datasets** for your volumes:
+2. **Create the parent dataset** for your volumes:
    ```
-   tank/k8s/volumes    # For persistent volumes
-   tank/k8s/snapshots  # For volume snapshots (sibling, not nested)
+   tank/k8s/volumes    # zfs.parentDataset — the exclusive CSI parent
    ```
+   This is the only dataset you create. There is no separate snapshot dataset:
+   CSI snapshots are ZFS snapshots taken directly on each volume dataset
+   (`<parent>/<volume>@<snapshot>`).
 3. **Enable the storage service** you plan to use (NFS, iSCSI, or NVMe-oF)
 
 The driver handles all share/target/subsystem creation automatically.
@@ -242,10 +244,14 @@ Ensure these ports are accessible from your Kubernetes nodes to TrueNAS:
 
 | Service | Port | Required For |
 |---------|------|--------------|
-| HTTPS | 443 | WebSocket API (always required) |
+| HTTPS | 443 | WebSocket API (chart default; HTTPS strongly recommended) |
 | NFS | 2049 | NFS volumes |
 | iSCSI | 3260 | iSCSI volumes |
 | NVMe-TCP | 4420 | NVMe-oF volumes |
+
+The API defaults to `https` on 443. Selecting `http` (via `truenas.protocol`)
+defaults the port to 80; HTTPS is strongly recommended for the API key in
+transit.
 
 ## License
 

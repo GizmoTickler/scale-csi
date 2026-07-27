@@ -210,11 +210,12 @@ is no `node.topology` chart value. See the [topology guide](guides/topology.md).
   move workload manifests to it, then delete/recreate the old class only after
   no manifests depend on its name. Existing PVs keep their original class and
   are not reprovisioned by this metadata migration.
-- The node DaemonSet intentionally receives no `TRUENAS_API_KEY`. Routine stage,
-  publish, unpublish, unstage, and local expansion use host tools and can run in
-  lazy-connect mode. A node-side operation that actually needs the management
-  API will fail without credentials; do not assume the controller Secret is
-  present on node pods after upgrading.
+- The node DaemonSet intentionally receives no `TRUENAS_API_KEY`. A node-only
+  pod constructs **no TrueNAS management client at all** — stage, publish,
+  unpublish, unstage, and local expansion use host tools exclusively, so a node
+  pod initializes and reports ready even while TrueNAS is unreachable. There is
+  no deferred/lazy API connection on node pods; do not assume the controller
+  Secret is present on them after upgrading.
 - ConfigMap changes restart controller and node pods. Rotating an externally
   managed Secret does not change the pod-template checksum, so restart both
   workloads explicitly after rotation.

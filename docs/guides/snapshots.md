@@ -153,8 +153,13 @@ spec:
 
 1. CSI driver creates a temporary ZFS snapshot of the source volume
 2. Clone is created from the snapshot using `zfs clone`
-3. Temporary snapshot is tracked and cleaned up when clone is deleted
-4. Clone is immediately independent - changes don't affect source
+3. Temporary snapshot is tracked and cleaned up when the clone is deleted
+4. Writes are independent (changes don't affect the source), but the clone is
+   **not lifecycle-independent**: it pins that temporary origin snapshot until the
+   clone is deleted
+
+Volume-to-volume cloning is **always** clone-backed; `snapshotRestoreMode` only
+governs restores whose source is a `VolumeSnapshot`.
 
 ## VolSync Integration
 
@@ -294,11 +299,17 @@ zfs:
   zvolReadyTimeout: 120  # Increase from default 60 seconds
 ```
 
-### "Snapshot has dependent clones" Error
+### Deleting a snapshot that still has clones
 
-Delete all clones created from the snapshot before deleting the snapshot:
+You do **not** need to delete dependent clones first to complete the CSI delete.
+`DeleteSnapshot` renames a clone-backed snapshot to an internal tombstone and
+requests deferred ZFS destruction: the `VolumeSnapshot` disappears from CSI
+immediately, and the reconcile reaper destroys the underlying snapshot once its
+last dependent clone releases it. Its referenced space stays charged until then.
+
+To see which volumes still pin snapshots (clone-mode restores):
 
 ```bash
-# List PVCs that were cloned from snapshots
+# List PVCs that were restored/cloned from a VolumeSnapshot
 kubectl get pvc -o json | jq '.items[] | select(.spec.dataSource.kind=="VolumeSnapshot")'
 ```
