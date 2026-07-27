@@ -1,8 +1,9 @@
 # Deployment and configuration
 
 This guide covers the bundled OCI Helm chart. The chart and image use the same
-release number: chart `1.2.23` deploys image `v1.2.23` unless `image.tag` or
-`image.digest` is overridden.
+release number: chart `1.3.0` deploys image `v1.3.0` unless `image.tag` or
+`image.digest` is overridden. (The in-tree `Chart.yaml` carries a `0.0.0-dev`
+placeholder that CI stamps with the tag at release time.)
 
 ## Supported deployment matrix
 
@@ -63,13 +64,13 @@ helm install scale-csi \
 
 The example deliberately avoids a soon-stale version literal. For a controlled
 production rollout, verify the release signature and add the exact reviewed
-version, for example `--version 1.2.23`. See the root README for image, chart,
+version, for example `--version 1.3.0`. See the root README for image, chart,
 and provenance verification commands.
 
 ## Flux
 
 The current Flux OCI source shape uses `OCIRepository` plus `HelmRelease`. Pin
-the exact release you reviewed; this example uses the v1.2.23 baseline:
+the exact release you reviewed; this example uses the v1.3.0 baseline:
 
 ```yaml
 apiVersion: source.toolkit.fluxcd.io/v1
@@ -84,7 +85,7 @@ spec:
     mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
     operation: copy
   ref:
-    semver: "1.2.23"
+    semver: "1.3.0"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -183,14 +184,20 @@ When more than one protocol is enabled, `protocol` is required and omission
 returns `InvalidArgument`; it never silently provisions NFS. A single-protocol
 legacy instance may omit it and uses its sole enabled protocol.
 
+A StorageClass may also set `snapshotRestoreMode: clone` or `detached` to choose
+how snapshot restores are materialized (clone pins the source snapshot; detached
+is an independent copy). Chart `storageClasses[]` entries expose it as a
+first-class field; it is only emitted when set. See the
+[StorageClass reference](reference/storageclass.md#restore-mode).
+
 ## Availability and topology
 
-With `fencing.mode=off`, `controller.replicas>1` enables leader election on the
-provisioner, attacher, resizer, and snapshotter. The chart supplies preferred
-hostname anti-affinity and, by default, a PDB with `maxUnavailable: 1`.
-`additive` and `strict` fencing require exactly one controller because their
-background reconcilers are singleton writers; chart schema and template guards
-enforce that invariant.
+Leader election is enabled on the provisioner, attacher, resizer, and
+snapshotter unconditionally, even at the default single replica.
+`controller.replicas>1` additionally supplies preferred hostname anti-affinity
+and, by default, a PDB with `maxUnavailable: 1`. `additive` and `strict`
+fencing require exactly one controller because their background reconcilers are
+singleton writers; chart schema and template guards enforce that invariant.
 
 Topology is auto-detected per node from the standard
 `topology.kubernetes.io/zone` and `topology.kubernetes.io/region` labels. There
@@ -203,14 +210,15 @@ is no `node.topology` chart value. See the [topology guide](guides/topology.md).
   move workload manifests to it, then delete/recreate the old class only after
   no manifests depend on its name. Existing PVs keep their original class and
   are not reprovisioned by this metadata migration.
-- The node DaemonSet intentionally receives no `TRUENAS_API_KEY`. Routine stage,
-  publish, unpublish, unstage, and local expansion use host tools and can run in
-  lazy-connect mode. A node-side operation that actually needs the management
-  API will fail without credentials; do not assume the controller Secret is
-  present on node pods after upgrading.
+- The node DaemonSet intentionally receives no `TRUENAS_API_KEY`. A node-only
+  pod constructs **no TrueNAS management client at all** — stage, publish,
+  unpublish, unstage, and local expansion use host tools exclusively, so a node
+  pod initializes and reports ready even while TrueNAS is unreachable. There is
+  no deferred/lazy API connection on node pods; do not assume the controller
+  Secret is present on them after upgrading.
 - ConfigMap changes restart controller and node pods. Rotating an externally
   managed Secret does not change the pod-template checksum, so restart both
   workloads explicitly after rotation.
 
-For fencing's node-first v1.2.23 migration and the full production contract,
+For fencing's node-first migration and the full production contract,
 read [Production deployment](production.md).

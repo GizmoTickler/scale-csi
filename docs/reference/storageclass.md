@@ -13,12 +13,27 @@ All protocols use the unified provisioner `csi.scale.io`.
 | Parameter | Meaning | Required |
 |---|---|---|
 | `protocol` | `nfs`, `iscsi`, or `nvmeof` | Yes when more than one protocol is enabled |
+| `snapshotRestoreMode` | `clone` or `detached` — how a volume restored from a snapshot is materialized | No; default is `clone` unless the driver sets `zfs.detachedVolumesFromSnapshots` |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
-`protocol` is the only scale-csi-specific ordinary parameter. A multi-protocol
-driver returns `InvalidArgument` when it is absent; it no longer silently
-chooses NFS. A single-protocol legacy deployment may omit it and uses its sole
-enabled protocol.
+`protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
+parameters. A multi-protocol driver returns `InvalidArgument` when `protocol`
+is absent; it no longer silently chooses NFS. A single-protocol legacy
+deployment may omit it and uses its sole enabled protocol.
+
+`snapshotRestoreMode` selects how a snapshot content-source restore is
+materialized, per StorageClass:
+
+- `clone` (default) creates a ZFS clone. Restore is instant and
+  space-efficient, but the clone pins its source snapshot for its whole life —
+  the snapshot cannot be reclaimed until the restored volume is deleted.
+- `detached` creates an independent local send/receive copy. It costs more time
+  and space up front but has no dependency on the source snapshot afterward.
+
+An invalid value returns `InvalidArgument` listing `clone, detached`. When the
+parameter is omitted, the driver falls back to its `zfs.detachedVolumesFromSnapshots`
+config default (chart value `zfs.detachedVolumesFromSnapshots`, default `false`
+= clone).
 
 ZFS properties, TrueNAS endpoints, and protocol service settings belong in the
 driver configuration/Helm values. The driver ignores ad-hoc StorageClass
@@ -136,6 +151,25 @@ volumeBindingMode: WaitForFirstConsumer
 NVMe-oF requires TrueNAS SCALE 25.10+, `nvme-cli`, and the selected transport's
 kernel modules on every eligible node. Set `nvmeof.subsystemHosts` or deliberately
 choose `nvmeof.subsystemAllowAnyHost: true` when fencing is off.
+
+## Restore mode
+
+A class that restores snapshots into fully independent volumes (no lingering
+snapshot dependency) sets `snapshotRestoreMode: detached`:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: scale-nfs-detached-restore
+provisioner: csi.scale.io
+parameters:
+  protocol: nfs
+  snapshotRestoreMode: detached
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+```
 
 ## Policies and binding
 

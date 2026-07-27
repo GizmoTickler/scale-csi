@@ -101,6 +101,33 @@ spec:
 
 **Important**: The restored PVC size must be greater than or equal to the original volume size.
 
+### Restore mode: clone vs detached
+
+By default a restore is a ZFS **clone**: it is instant and space-efficient, but
+the restored volume pins its source snapshot until the restored volume is
+deleted. To get a fully independent volume with no lingering snapshot
+dependency, use a StorageClass whose `snapshotRestoreMode` parameter is
+`detached` (an independent local send/receive copy — more time and space up
+front, no source-snapshot pin afterward):
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: scale-nfs-detached-restore
+provisioner: csi.scale.io
+parameters:
+  protocol: nfs
+  snapshotRestoreMode: detached
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+```
+
+The value is resolved per StorageClass; when unset it follows the driver's
+`zfs.detachedVolumesFromSnapshots` default (`false` = clone). See the
+[StorageClass reference](../reference/storageclass.md#restore-mode).
+
 ## Cloning a Volume
 
 You can create a clone directly from an existing PVC without creating a snapshot first:
@@ -126,8 +153,13 @@ spec:
 
 1. CSI driver creates a temporary ZFS snapshot of the source volume
 2. Clone is created from the snapshot using `zfs clone`
-3. Temporary snapshot is tracked and cleaned up when clone is deleted
-4. Clone is immediately independent - changes don't affect source
+3. Temporary snapshot is tracked and cleaned up when the clone is deleted
+4. Writes are independent (changes don't affect the source), but the clone is
+   **not lifecycle-independent**: it pins that temporary origin snapshot until the
+   clone is deleted
+
+Volume-to-volume cloning is **always** clone-backed; `snapshotRestoreMode` only
+governs restores whose source is a `VolumeSnapshot`.
 
 ## VolSync Integration
 
@@ -235,7 +267,15 @@ kubectl get volumesnapshot -l app=myapp \
 1. **Snapshot Size**: Snapshots are point-in-time; they grow as source changes
 2. **Cross-Pool**: Snapshots cannot span ZFS pools
 3. **Clone Size**: Clone must be >= source volume size
-4. **Deletion Order**: Cannot delete a volume with dependent snapshots
+4. **Foreign snapshots block volume delete**: `DeleteVolume` refuses (returns
+   `FailedPrecondition`) when the dataset carries non-CSI snapshots — for
+   example those made by a TrueNAS periodic-snapshot task covering the CSI
+   parent. Remove them, exclude the parent from the task, or opt into
+   `zfs.destroyForeignSnapshotsOnDelete`.
+5. **Deleting a snapshot that still has clones**: the driver renames it to an
+   internal tombstone and requests deferred ZFS destruction. The snapshot
+   disappears from CSI immediately, but its referenced space stays charged until
+   the last dependent clone (for example a `clone`-mode restore) is deleted.
 
 ## Troubleshooting
 
@@ -259,11 +299,17 @@ zfs:
   zvolReadyTimeout: 120  # Increase from default 60 seconds
 ```
 
-### "Snapshot has dependent clones" Error
+### Deleting a snapshot that still has clones
 
-Delete all clones created from the snapshot before deleting the snapshot:
+You do **not** need to delete dependent clones first to complete the CSI delete.
+`DeleteSnapshot` renames a clone-backed snapshot to an internal tombstone and
+requests deferred ZFS destruction: the `VolumeSnapshot` disappears from CSI
+immediately, and the reconcile reaper destroys the underlying snapshot once its
+last dependent clone releases it. Its referenced space stays charged until then.
+
+To see which volumes still pin snapshots (clone-mode restores):
 
 ```bash
-# List PVCs that were cloned from snapshots
+# List PVCs that were restored/cloned from a VolumeSnapshot
 kubectl get pvc -o json | jq '.items[] | select(.spec.dataSource.kind=="VolumeSnapshot")'
 ```

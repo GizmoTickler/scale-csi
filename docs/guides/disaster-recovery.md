@@ -37,6 +37,16 @@ the first time a pod attaches it — no manual re-export step.
    **recursive** + **include dataset properties** so every child volume and its
    `truenas-csi:*` metadata (and CSI snapshots) are carried over.
 
+   > **Snapshot-lifecycle cost of this task.** A periodic/replication task's own
+   > snapshots created *under* the CSI parent are **foreign** to the driver and by
+   > default block `DeleteVolume` (`FailedPrecondition`) on any volume that carries
+   > them — see [Production](../production.md#current-known-limitations). This is a
+   > deliberate tension with the "exclude the CSI parent from snapshot tasks" rule.
+   > For DR, prefer a task snapshot **naming schema/hold** you can prune, exclude
+   > the task's own snapshots from the volumes' delete path, or accept
+   > `zfs.destroyForeignSnapshotsOnDelete: true` on the DR install. Otherwise later
+   > PVC deletion on the DR cluster wedges until those task snapshots are removed.
+
 2. **Point a scale-csi install at the DR TrueNAS.** Deploy the driver on the DR cluster
    (or repoint the existing one) with the **same** `zfs.parentDataset` value and the same
    `StorageClass` definitions (same protocols, portals/transport). Keep
@@ -45,9 +55,12 @@ the first time a pod attaches it — no manual re-export step.
 
 3. **Restore the Kubernetes objects.** Re-apply the `PV`/`PVC` objects (and any
    `VolumeSnapshotContent`) from your etcd/Velero/GitOps backup. The critical field is
-   `spec.csi.volumeHandle`, which **is** the dataset name under the parent — it must
-   match the replicated dataset. Static PVs bind by `volumeHandle`; the driver adopts
-   the existing dataset via the idempotent-create / `ensureShareExists` path.
+   `spec.csi.volumeHandle`, which is the **volume ID — the sanitized child leaf
+   only, not the full `pool/parent/leaf` path**. The driver rejects any handle
+   containing a `/` and joins the leaf to its configured `zfs.datasetParentName`, so
+   the leaf must equal the replicated dataset's basename and the DR install must use
+   the same parent. Static PVs bind by `volumeHandle`; the driver adopts the
+   existing dataset via the idempotent-create / `ensureShareExists` path.
 
 4. **Attach.** When a pod schedules onto the volume, `ControllerPublishVolume` →
    `ensureShareExists` verifies the export by ID and **recreates the iSCSI target /
@@ -72,7 +85,14 @@ the first time a pod attaches it — no manual re-export step.
 - **Single-writer safety still applies.** Do not run workloads against the same
   volume on both sites simultaneously; the driver provides no cross-site fencing
   (this is the standard CSI shared-responsibility model — see
-  [Production → Known limitations](../production.md)).
+  [Production → Known limitations](../production.md#current-known-limitations)).
+- **Publication records replicate too.** The durable per-volume publication
+  records are `truenas-csi:publication_*` user-properties, so a replicated
+  dataset can arrive on the DR side still carrying a record naming a primary-side
+  node. This is safe: the driver performs synchronous stale-record takeover on
+  publish, so the first attach on the DR cluster reconciles the record to the new
+  node. It is another reason not to run both sites against the same volume at
+  once.
 - **App-level consistency.** ZFS/CSI snapshots are crash-consistent. For databases,
   prefer the application's own backup/replication (e.g. CloudNativePG) for
   transaction-consistent DR rather than relying on volume snapshots alone.

@@ -1,7 +1,7 @@
 # Production deployment
 
 This guide describes the current scale-csi repository and bundled Helm chart,
-based on the v1.2.23 release line. Review the [deployment guide](deployment.md)
+based on the v1.3.0 release line. Review the [deployment guide](deployment.md)
 for installation examples and the chart's
 [values reference](../charts/scale-csi/README.md) for every setting.
 
@@ -17,13 +17,27 @@ operations that moved). TrueNAS 25.04 is the documented floor; the 24.x
 caches the 26.0 resource API separately. NVMe-oF is different: the driver
 rejects it before TrueNAS 25.10.
 
-The controller plane has been validated live against a real TrueNAS 26.0
-system: the official csi-sanity controller suites pass 52/52 for NFS and 52/52
-for iSCSI against real datasets, zvols, shares, targets, and extents (node
-specs excluded — they require real initiator hosts). That validation is what
-surfaced the 26.0 middleware behaviors documented under Known limitations.
-Still validate your exact TrueNAS patch release and protocol in a staging
-cluster before production, and node-path behavior end to end.
+The repository's automated conformance is the `TestCSISanity` suite, which runs
+the official kubernetes-csi `csi-sanity` specs against the driver over a real
+gRPC socket with a `MockClient` backend and PATH-faked node commands: the NFS
+full surface (controller plus node specs) and the iSCSI controller surface (its
+Node Service specs are skipped because they need a real block device and root
+privileges). NVMe-oF has unit and controller-level tests but no protocol-specific
+sanity suite. Tests named `e2e` in this repository also use `MockClient`; they
+exercise driver logic, not a live appliance. Fake-command conformance is not a
+substitute for validating your exact TrueNAS patch release, protocol, and the
+node data path end to end on a real initiator host in a staging cluster before
+production. The 26.0 middleware behaviors documented under Known limitations were
+surfaced against a real TrueNAS 26.0 appliance.
+
+Separately, and distinct from the in-repo automated suite above, the maintainer
+ran the full `csi-sanity` controller suites live against a real TrueNAS 26.0
+system (NFS 52/52, iSCSI 52/52, 2026-07-17) and the full node-plane suites
+including the Node Service specs on real Linux initiator hosts for NFS, iSCSI,
+and NVMe-oF (75/75 each, 2026-07-18) during the v1.2.x hardening program. These
+are maintainer-attested out-of-band results against specific hardware and TrueNAS
+builds; they are not reproducible from this repository's automated tests and do
+not replace validating your own appliance and node data path.
 
 Use a user-linked API key over HTTPS. API keys inherit the roles of their user.
 On role-based TrueNAS releases, the built-in `SHARING_ADMIN` plus
@@ -35,13 +49,23 @@ operations. Role names and method assignments differ between TrueNAS API
 generations, so confirm a custom privilege against the API documentation served
 by the target appliance. See the TrueNAS [role reference][truenas-rbac].
 
+> **Exclude the CSI parent from periodic-snapshot and replication tasks.** The
+> configured `zfs.parentDataset` subtree is exclusive driver territory. A
+> TrueNAS periodic-snapshot task (or a replication task's snapshots) that covers
+> the CSI parent will create snapshots the driver did not make. Those snapshots
+> are *foreign* to the driver: by default `DeleteVolume` refuses to remove a
+> dataset that carries them and returns `FailedPrecondition`, so PVC deletion
+> stalls until the snapshots are gone or the task excludes the parent. Scope any
+> such task to datasets *outside* `zfs.parentDataset`, or accept destructive
+> cleanup by setting `zfs.destroyForeignSnapshotsOnDelete: true`.
+
 ### Network and nodes
 
 Allow the following paths; do not expose storage ports beyond the node networks:
 
 | Source | Destination | Port | Purpose |
 |---|---|---:|---|
-| Controller and node pods | TrueNAS API | TCP 443 | JSON-RPC 2.0 WebSocket (`wss://<host>:443/api/current`) |
+| Controller pods only | TrueNAS API | TCP 443 | JSON-RPC 2.0 WebSocket (`wss://<host>:443/api/current`). Node pods build no management client and do not need this path |
 | Kubernetes nodes | TrueNAS NFS | TCP 2049 | NFS volume mounts |
 | Kubernetes nodes | TrueNAS iSCSI portals | TCP 3260 | iSCSI discovery, login, and I/O |
 | Kubernetes nodes | TrueNAS NVMe/TCP target | TCP 4420 | NVMe discovery, connect, and I/O |
@@ -54,11 +78,14 @@ not install host packages or load modules.
 
 ## Availability and outage behavior
 
-The default is `controller.replicas: 1`. With `fencing.mode=off`, values greater
-than one enable leader election on the provisioner, attacher, resizer, and
-snapshotter; the chart also supplies preferred hostname anti-affinity and, by
-default, a PDB with `maxUnavailable: 1`. This is controller-availability
-groundwork, not a claim that the driver has a distributed operation lock.
+The default is `controller.replicas: 1`. Leader election is enabled on every
+capable controller sidecar (provisioner, attacher, resizer, snapshotter)
+unconditionally — even at a single replica — so a `fencing.mode=off`
+RollingUpdate that transiently runs two controller pods never has both acting as
+the active provisioner/attacher. Replica counts greater than one additionally
+add preferred hostname anti-affinity and, by default, a PDB with
+`maxUnavailable: 1`. This is controller-availability groundwork, not a claim
+that the driver has a distributed operation lock.
 Additive and strict fencing require exactly one controller because their
 background reconcilers are singleton writers; schema and template guards reject
 any other replica count. The controller is restart-recovered: downtime pauses
@@ -76,10 +103,11 @@ is a layered contract, not a single mechanism:
   that only one controller process mutates the backend at a time. With
   `replicas>1`, each CSI sidecar elects its own leader; those independent
   elections improve failover but can select different pods and do not serialize
-  every controller RPC through one process. The chart enforces the
-  `Recreate` deployment strategy only when `fencing.mode` is not `off`; in the
-  default `off` mode the Deployment keeps the server-default `RollingUpdate`,
-  so a rollout can briefly run an old and a new controller pod side by side.
+  every controller RPC through one process. The v1.3.0 template renders an
+  explicit strategy in every mode: `off` uses `RollingUpdate` with
+  `maxUnavailable: 25%` / `maxSurge: 25%`, so a rollout can briefly run an old
+  and a new controller pod side by side; `additive`/`strict` use `Recreate`
+  with `rollingUpdate: null` (their reconcilers are in-process singleton writers).
 - The driver's operation locks are per process. They serialize work inside one
   controller but provide no exclusion between two controller processes.
 - The durable in-flight creation markers, the tombstone ledger, and the
@@ -119,19 +147,20 @@ is a layered contract, not a single mechanism:
   `reconcile.bookkeeping.cleanupParent` flow (copy entries to the child, then
   remove the confirmed copies from the parent), not disabling the relocation.
 
-The node component runs as a DaemonSet on all tolerated nodes. Established node
-pods perform stage, publish, unpublish, and unstage through host NFS/iSCSI/NVMe
-tools rather than through TrueNAS management API calls. During a management API
-outage, controller operations fail or retry. Node-only processes start in
-lazy-connect mode, so a node pod that restarts while TrueNAS is unreachable can
-still initialize and report ready; its first operation that actually needs the
-management API attempts the deferred connection. Node stage, publish,
-unpublish, unstage, and local filesystem expansion remain available through the
-host tools when they do not need an API call.
+The node component runs as a DaemonSet on all tolerated nodes and performs
+stage, publish, unpublish, and unstage through host NFS/iSCSI/NVMe tools. A
+node-only pod builds **no TrueNAS management client at all** (credential-free
+since v1.2.22), so it has no deferred/lazy API connection: it initializes and
+reports ready regardless of TrueNAS reachability, and every node RPC it serves
+uses local host tools. During a management API outage only controller
+operations fail or retry; node stage, publish, unpublish, unstage, and local
+filesystem expansion remain available.
 
 The API retry and circuit-breaker behavior comes from this values block:
 
 ```yaml
+truenas:
+  maxConcurrentRequests: 10   # the effective API concurrency semaphore
 resilience:
   circuitBreaker:
     enabled: false
@@ -143,14 +172,21 @@ resilience:
     maxDelay: 5000
     backoffMultiplier: 2.0
   rateLimiting:
-    maxConcurrentRequests: 10
     maxConcurrentLogins: 2
 ```
 
+> **The API concurrency limit is `truenas.maxConcurrentRequests`, not
+> `resilience.rateLimiting.maxConcurrentRequests`.** The chart/schema accept a
+> `resilience.rateLimiting.maxConcurrentRequests` key, but it is **not wired to
+> anything** — only `truenas.maxConcurrentRequests` reaches the client's API
+> semaphore. Under `resilience.rateLimiting`, only `maxConcurrentLogins` (iSCSI
+> login concurrency) is effective. Tune `truenas.maxConcurrentRequests` to protect
+> an overloaded NAS.
+
 Retries apply only to connection-class failures; an ambiguous non-idempotent
 mutation is not retried. The circuit breaker is opt-in and disabled by default;
-connection-only retry, the API concurrency semaphore, and rate limiting provide
-the baseline protection. If enabled, five consecutive failures open it for 30
+connection-only retry and the API concurrency semaphore provide the baseline
+protection. If enabled, five consecutive failures open it for 30
 seconds before half-open probes are admitted. These controls do not replace
 protocol-level mount/login timeouts under `commandTimeouts`.
 
@@ -256,6 +292,13 @@ failures exceed 10% for ten minutes, or CSI operation errors exceed 0.01
 operations/second for ten minutes.
 Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
+> **Benign `already exists` on the NVMe-oF path.** The driver treats an
+> `AlreadyExists` response to `nvmet.host_subsys.create` as success (the
+> host/subsystem association it wanted already exists). A small, non-growing
+> count of failed `nvmet.host_subsys.create` samples in
+> `scale_csi_truenas_requests_total{status="error"}` is therefore expected by
+> design during NVMe-oF provisioning and is not an operational fault.
+
 ## Upgrades
 
 1. Render and validate the release before applying it:
@@ -306,10 +349,10 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
    credentials. Treat this as an explicit security boundary when upgrading
    from manifests that injected the key into every pod.
 
-7. For the v1.2.23 fencing migration, keep `fencing.mode=off`, upgrade the node
+7. For the fencing migration, keep `fencing.mode=off`, upgrade the node
    DaemonSet/image first, and wait for every CSINode to re-register its versioned
    transport identity before enabling `additive`. Enable `strict` only after
-   `scale_csi_fencing_deferred_total` remains at zero. Roll the v1.2.23
+   `scale_csi_fencing_deferred_total` remains at zero. Roll the
    controller image and its ConfigMap together; applying new fencing keys to an
    older strict-YAML binary can make that older pod fail configuration parsing.
    The chart uses a shared image value, so patch and await the node DaemonSet
@@ -332,15 +375,12 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 - Foreign snapshots block `DeleteVolume` by default. Removing them or excluding
   the CSI parent from external snapshot tasks is required unless destructive
   cleanup is explicitly enabled with `zfs.destroyForeignSnapshotsOnDelete`.
-- Fake-command conformance does not cover the iSCSI or NVMe-oF node paths.
-  iSCSI runs the controller portion of `csi-sanity`; NVMe-oF has unit/controller
-  tests but no protocol-specific sanity suite. Neither substitutes for node tests
-  with real block devices and a real target.
-- Live validation against a real TrueNAS 26.0 appliance now covers the full
-  node plane on a real initiator host: csi-sanity including Node Service specs
-  passes for NFS (75/75), iSCSI (real iscsiadm logins, device staging, mkfs,
-  mounts), and NVMe-oF (real fabric connects). Tests named `e2e` in this
-  repository use `MockClient`.
+- Automated conformance does not cover the iSCSI or NVMe-oF node paths. The
+  `csi-sanity` suite runs the NFS full surface and the iSCSI *controller* surface
+  against a `MockClient` backend with PATH-faked node commands; the iSCSI Node
+  Service specs are skipped and NVMe-oF has no protocol-specific sanity suite.
+  None of this substitutes for node tests with real block devices and a real
+  target. Validate the node data path on a real initiator host in staging.
 - With `fencing.mode=off`, NVMe-oF host-NQN allowlisting is configured
   statically through `nvmeof.subsystemHosts`. Additive and strict modes consume
   the host NQN registered by each node plugin and enforce per-volume host
@@ -359,9 +399,36 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   configured parent from the CSI driver's perspective.
 - Deleting a snapshot that still has clones renames it to an internal tombstone
   and requests deferred ZFS destruction. The snapshot disappears from CSI, but
-  its referenced space remains charged until the last clone releases it.
-- Restores use ZFS clones: a restored volume pins its source snapshot until the
-  volume is deleted, with deferred destroy handling the snapshot lifecycle.
+  its referenced space remains charged until the last clone releases it. The
+  reaper acts on tombstones through a durable ledger. Tombstones whose provenance
+  no belt can prove (no ledger entry, no adoptable ownership stamp) are never
+  destroyed automatically; they are surfaced as `manualRecoveryTombstones` in the
+  reconcile summary for operator inspection — and `manualRecoveryTombstones` is
+  populated **only while scan fallback is enabled**. The
+  `reconcile.tombstoneReaper.scanFallback.enabled` flag (default **off**) adds a
+  provenance-gated fallback that runs on **every** pass, independent of whether
+  the ledger backlog is empty. It does not issue a separate query: it reuses the
+  pass's already-fetched recursive, unpaginated snapshot set and processes at most
+  500 accepted candidates. A candidate is authorized only when it has **no** ledger
+  property at either bookkeeping location **and** carries retained creation-time
+  identity that exactly reproduces the driver's nonce-derived tombstone rename —
+  exact retained snapshot/instance identity, exact tombstone name, local
+  source-instance ownership, the age gate, and the inheritance-mask guard. It never
+  widens what counts as this driver's own object.
+- The durable bookkeeping (tombstone ledger + in-flight markers) can be
+  relocated off the inheritable parent onto a `<parent>/.csi-bookkeeping` child
+  via `reconcile.bookkeeping.enabled`, so its user properties no longer inherit
+  into every descendant snapshot. This is a one-way migration: once entries live
+  on the child, do not disable the flag (see the concurrency contract's
+  downgrade caveat). Inbound volume/snapshot IDs equal to the `.csi-bookkeeping`
+  leaf are rejected with `InvalidArgument` before any TrueNAS access.
+- Snapshot restores default to ZFS clones (`snapshotRestoreMode: clone`): a
+  clone-restored volume pins its source snapshot until the volume is deleted, with
+  deferred destroy handling the snapshot lifecycle. A StorageClass with
+  `snapshotRestoreMode: detached` (or driver default
+  `zfs.detachedVolumesFromSnapshots: true`) restores via local send/receive with
+  no source-snapshot pin. Volume-to-volume clones (PVC dataSource) are always
+  clone-backed regardless of that setting.
 - After upgrading a NAS from TrueNAS 25.x to 26.0, CSI snapshots created by
   older driver versions without `truenas-csi:csi_snapshot_name` are omitted
   from `ListSnapshots`. Restore and deletion by snapshot ID continue to work.
