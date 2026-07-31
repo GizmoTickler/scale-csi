@@ -333,7 +333,9 @@ func TestISCSIGroupCHAPFromDatasetProperty(t *testing.T) {
 		})
 		method, authRef, authTag := d.iscsiGroupCHAP(ctx, &truenas.Dataset{})
 		assert.Equal(t, "CHAP", method)
-		assert.Equal(t, 99, authRef)
+		// G1 live drill: the group auth ref is the peer TAG (SCST only emits
+		// IncomingUser for tag-keyed refs), so authRef == authTag here.
+		assert.Equal(t, 5000, authRef)
 		assert.Equal(t, 5000, authTag)
 	})
 }
@@ -443,11 +445,13 @@ func TestCreateVolumeISCSICHAPStampsGroupsAndProps(t *testing.T) {
 			for _, group := range target.Groups {
 				assert.Equal(t, tc.wantMethod, group.AuthMethod)
 				require.NotNil(t, group.Auth, "CHAP group must reference the auth peer")
-				assert.Equal(t, peer.ID, *group.Auth)
+				// G1 live drill: the auth ref must be the peer TAG — an ID-keyed
+				// ref renders a CHAP target with no IncomingUser in SCST.
+				assert.Equal(t, peer.Tag, *group.Auth)
 			}
 
 			// The auth linkage is persisted for fence/idempotent rebuilds.
-			assert.Equal(t, strconv.Itoa(peer.ID), datasetUserProperty(ds, PropISCSIAuthID))
+			assert.Equal(t, strconv.Itoa(peer.Tag), datasetUserProperty(ds, PropISCSIAuthID))
 			assert.Equal(t, strconv.Itoa(peer.Tag), datasetUserProperty(ds, PropISCSIAuthTag))
 
 			// The volume context advertises only the mode flag, never a credential.

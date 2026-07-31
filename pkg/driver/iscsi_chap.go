@@ -193,15 +193,20 @@ func deriveISCSIAuthTag(key string) int {
 }
 
 // iscsiGroupAuthRef is the single source of truth for the value linked into a
-// target group's "auth" field. The TrueNAS SCALE 26.0 schema labels it "ID of
-// the authentication credential", so the default is peer.ID. If the live drill
-// (design §6.5, gate G1) determines the field is keyed by tag instead, flip the
-// returned value to peer.Tag — this is the only site that must change.
+// target group's "auth" field.
+//
+// Live-drill resolved (gate G1; nas01, TrueNAS 26.0, 2026-07-31): the field
+// references the iscsi.auth record's TAG, not its row ID. A group created with
+// auth=<row id> is accepted by the middleware but the generated SCST config
+// carries NO IncomingUser line (silently broken CHAP); auth=<tag> produces the
+// credential line. The 26.0 API schema wording ("ID of the authentication
+// credential") is misleading — do not "fix" this back to peer.ID without
+// re-running the drill (design §6.5).
 func iscsiGroupAuthRef(peer *truenas.ISCSIAuth) int {
 	if peer == nil {
 		return 0
 	}
-	return peer.ID
+	return peer.Tag
 }
 
 // iscsiGroupCHAP resolves the authmethod, auth ref, and auth tag to stamp on a
