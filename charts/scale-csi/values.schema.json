@@ -716,6 +716,41 @@
         "subsystemAllowAnyHost": {
           "type": "boolean"
         },
+        "portPerf": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "inlineDataSize": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "maxQueueSize": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "piEnable": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        },
+        "multipath": {
+          "type": "boolean"
+        },
+        "addresses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "commandTimeout": {
           "description": "DEPRECATED, ignored; the nvme CLI timeout is commandTimeouts.nvme. Retained only so old values files pass validation.",
           "type": "integer",

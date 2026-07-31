@@ -109,6 +109,28 @@ data:
       subsystemHosts:
         {{- toYaml .Values.nvmeof.subsystemHosts | nindent 8 }}
       subsystemAllowAnyHost: {{ .Values.nvmeof.subsystemAllowAnyHost }}
+      {{- /* GF-Sprint 4 (E-4): install-wide port performance fields render ONLY
+           when a value is non-null so the default ConfigMap is byte-identical to
+           pre-GF4 (every field omitted => backend defaults). */}}
+      {{- if or (not (kindIs "invalid" .Values.nvmeof.portPerf.inlineDataSize)) (not (kindIs "invalid" .Values.nvmeof.portPerf.maxQueueSize)) (not (kindIs "invalid" .Values.nvmeof.portPerf.piEnable)) }}
+      portPerf:
+        {{- if not (kindIs "invalid" .Values.nvmeof.portPerf.inlineDataSize) }}
+        inlineDataSize: {{ .Values.nvmeof.portPerf.inlineDataSize }}
+        {{- end }}
+        {{- if not (kindIs "invalid" .Values.nvmeof.portPerf.maxQueueSize) }}
+        maxQueueSize: {{ .Values.nvmeof.portPerf.maxQueueSize }}
+        {{- end }}
+        {{- if not (kindIs "invalid" .Values.nvmeof.portPerf.piEnable) }}
+        piEnable: {{ .Values.nvmeof.portPerf.piEnable }}
+        {{- end }}
+      {{- end }}
+      {{- /* GF-Sprint 4 (E-6): multi-port multipath renders ONLY when enabled so
+           the default ConfigMap carries no multipath key (single-port path). */}}
+      {{- if .Values.nvmeof.multipath }}
+      multipath: true
+      addresses:
+        {{- toYaml .Values.nvmeof.addresses | nindent 8 }}
+      {{- end }}
     {{- end }}
 
     # Session garbage collection (node plugin only)
