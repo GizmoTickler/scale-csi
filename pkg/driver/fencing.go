@@ -1304,7 +1304,7 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 	// a fence pass would silently strip it off a CHAP target. The linkage is read
 	// from the dataset property stamped at CreateVolume; preserved static groups
 	// already carry their own authmethod/auth verbatim from target.Groups.
-	chapMethod, chapAuthRef, _ := d.iscsiGroupCHAP(ctx, ds)
+	chapMethod, chapAuthRef := d.iscsiGroupCHAP(ctx, ds)
 	iqns := make([]string, 0, len(active))
 	for _, identity := range active {
 		if identity.ISCSIIQN != "" {

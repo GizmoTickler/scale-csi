@@ -56,11 +56,12 @@ func (d *Driver) iscsiVolumeContext(ctx context.Context, ds *truenas.Dataset, da
 	volumeContext["interface"] = d.config.ISCSI.Interface
 	// Advertise the CHAP mode (never credentials) so the node knows to expect a
 	// node-stage secret and which direction to configure. Prefer the request
-	// resolution on create; fall back to the stored dataset property otherwise.
-	if res := iscsiCHAPResolutionFromContext(ctx); res != nil {
+	// resolution on create; otherwise read the immutable stored per-volume mode
+	// (source==local) — never the mutable global iscsi.chap.mutual flag.
+	if res := iscsiCHAPResolutionFromContext(ctx); res != nil && res.Peer != nil {
 		volumeContext[volumeContextCHAPKey] = res.authMethod()
-	} else if datasetUserPropertyHasValue(ds, PropISCSIAuthID) {
-		volumeContext[volumeContextCHAPKey] = d.iscsiCHAPAuthMethod()
+	} else if mode, _ := d.storedISCSICHAPPolicy(ds); mode != iscsiCHAPModeNone {
+		volumeContext[volumeContextCHAPKey] = mode
 	}
 	return nil
 }
@@ -82,9 +83,10 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	}
 
 	// Resolve the CHAP posture for this dataset: the request-scoped resolution on
-	// a fresh CreateVolume, else the stored dataset property on idempotent
-	// rebuilds. authRef==0 means CHAP is off and groups stay authmethod=NONE.
-	chapMethod, chapAuthRef, chapTag := d.iscsiGroupCHAP(ctx, ds)
+	// a fresh CreateVolume, else the stored (local) dataset properties on
+	// idempotent rebuilds. authRef==0 means CHAP is off and groups stay
+	// authmethod=NONE.
+	chapMethod, chapAuthRef := d.iscsiGroupCHAP(ctx, ds)
 
 	// Generate iSCSI name and disk path upfront
 	iscsiName := d.iscsiShareName(path.Base(datasetName))
@@ -325,13 +327,14 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 		PropISCSIExtentID:       strconv.Itoa(extentID),
 		PropISCSITargetExtentID: strconv.Itoa(targetExtent.ID),
 	}
-	// Persist the CHAP auth linkage so fence passes and idempotent rebuilds can
-	// reconstruct authmethod+auth without the StorageClass secret. Folded into the
-	// same update so a CHAP volume adds no extra pool.dataset.update RTT.
-	if chapAuthRef > 0 && chapTag > 0 {
-		resourceProps[PropISCSIAuthID] = strconv.Itoa(chapAuthRef)
-		resourceProps[PropISCSIAuthTag] = strconv.Itoa(chapTag)
-	}
+	// NOTE: the CHAP auth linkage (PropISCSIAuthTag + PropISCSIAuthMode) is NOT
+	// written here. It is a security control that a fence pass depends on, so it
+	// must be durable-or-fail: a warn-only write could return CreateVolume success
+	// with a chap volumeContext but no stored linkage, and the next fence would
+	// rebuild the target as authmethod=NONE (a strict-mode auth downgrade). The
+	// linkage is instead folded into CreateVolume's FATAL managed-property update
+	// (controller.go), which rolls back the share+dataset on failure. The group
+	// authmethod+auth are still applied to the live target groups above.
 	if err := d.setDatasetUserProperties(ctx, ds, datasetName, resourceProps); err != nil {
 		klog.Warningf("Failed to store iSCSI resource IDs: %v", err)
 	}

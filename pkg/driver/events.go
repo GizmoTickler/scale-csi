@@ -39,6 +39,7 @@ const (
 	EventReasonTrueNASError         = "TrueNASError"
 	EventReasonTrueNASReconnected   = "TrueNASReconnected"
 	EventReasonFencingTakeover      = "FencingTakeover"
+	EventReasonISCSICHAPRotated     = "ISCSICHAPRotated"
 	EventReasonRemnantOrphanReaped  = "RemnantOrphanReaped"
 )
 
@@ -143,6 +144,13 @@ func (d *Driver) recordWarningEvent(object runtime.Object, reason, message strin
 		return
 	}
 	d.eventRecorder.Event(object, corev1.EventTypeWarning, reason, message)
+}
+
+func (d *Driver) recordNormalEvent(object runtime.Object, reason, message string) {
+	if object == nil || d.eventRecorder == nil {
+		return
+	}
+	d.eventRecorder.Event(object, corev1.EventTypeNormal, reason, message)
 }
 
 func firstEventObject(objects []runtime.Object) runtime.Object {

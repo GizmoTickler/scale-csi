@@ -1574,6 +1574,10 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext, secrets ma
 	// letting iscsiadm enter a login retry storm.
 	chapCreds, err := nodeISCSIChAPCredentials(volumeContext, secrets)
 	if err != nil {
+		// Aid debugging without leaking: log the REDACTED secret key set (values
+		// masked by redactCHAP) alongside the sanitized validation error.
+		klog.V(4).Infof("iSCSI CHAP credential validation failed for %s (secret keys: %v): %v",
+			iqn, redactCHAP(secrets), err)
 		return err
 	}
 

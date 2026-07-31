@@ -334,6 +334,23 @@ func datasetUserPropertyProjection(ds *truenas.Dataset, key string) (truenas.Use
 	return property, ok
 }
 
+// datasetLocalUserProperty returns the value of key only when it is set
+// directly on this dataset (source=="local"). A clone-inherited value (whose
+// source is the origin snapshot name) returns "". CHAP identity is read through
+// this guard so a clone can never adopt its source volume's auth policy even if
+// a best-effort scrub failed — the same source==local discipline the ownership
+// stamps use.
+func datasetLocalUserProperty(ds *truenas.Dataset, key string) string {
+	property, ok := datasetUserPropertyProjection(ds, key)
+	if !ok || !isLocalUserPropertySource(property.Source) {
+		return ""
+	}
+	if property.Value == "-" {
+		return ""
+	}
+	return property.Value
+}
+
 func datasetHasLocalUserProperty(ds *truenas.Dataset, key, expected string) bool {
 	// An inherited value is not proof that this specific dataset was created or
 	// explicitly adopted by this driver instance.

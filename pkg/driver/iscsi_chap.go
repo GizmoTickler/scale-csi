@@ -57,6 +57,9 @@ const (
 
 // iscsiCHAPSecret is the driver-side parse of a per-StorageClass CHAP Secret.
 // It is short-lived: validated, used to ensure the backend peer, and dropped.
+// Password/MutualPassword hold the EXACT unmodified secret (never trimmed) so
+// validation can reject a value TrueNAS would reject rather than silently
+// mutating it.
 type iscsiCHAPSecret struct {
 	Username       string
 	Password       string
@@ -64,13 +67,22 @@ type iscsiCHAPSecret struct {
 	MutualPassword string
 	Tag            int
 	HasTag         bool
+	// tagRaw/tagPresent capture an explicitly supplied tag key before parsing so a
+	// present-but-malformed tag is rejected (InvalidArgument) rather than silently
+	// falling back to a derived/global tag.
+	tagRaw     string
+	tagPresent bool
 }
 
 // iscsiCHAPResolution is the result of ensuring a backend CHAP peer: the peer to
-// link into target groups and the negotiated mode.
+// link into target groups and the negotiated mode. Rotated is set when the
+// backend peer's secret was updated in place (iscsi.auth.update) because the
+// StorageClass Secret's credential changed for the same username/tag; the caller
+// surfaces a redacted K8s Event.
 type iscsiCHAPResolution struct {
-	Peer   *truenas.ISCSIAuth
-	Mutual bool
+	Peer    *truenas.ISCSIAuth
+	Mutual  bool
+	Rotated bool
 }
 
 // authMethod returns the TrueNAS authmethod enum for the resolution.
@@ -100,17 +112,22 @@ func iscsiCHAPResolutionFromContext(ctx context.Context) *iscsiCHAPResolution {
 	return nil
 }
 
-// firstSecretKey returns the first non-empty value among the given keys.
+// firstSecretKey returns the first value among the given keys whose content is
+// non-whitespace, and returns it VERBATIM (untrimmed). Selection ignores
+// whitespace-only values, but the returned value is exactly what the operator
+// supplied so validation can reject (not silently repair) a malformed secret.
 func firstSecretKey(secrets map[string]string, keys ...string) string {
 	for _, key := range keys {
-		if value := strings.TrimSpace(secrets[key]); value != "" {
-			return value
+		if raw, ok := secrets[key]; ok && strings.TrimSpace(raw) != "" {
+			return raw
 		}
 	}
 	return ""
 }
 
 // parseISCSIChAPSecret reads the canonical CHAP keys plus their legacy aliases.
+// The tag is captured raw here and validated in validateISCSIChAPSecret so a
+// malformed explicit tag fails fast instead of silently falling back.
 func parseISCSIChAPSecret(secrets map[string]string) iscsiCHAPSecret {
 	parsed := iscsiCHAPSecret{
 		Username:       firstSecretKey(secrets, chapSecretKeyUsername, chapAliasUsername),
@@ -118,8 +135,10 @@ func parseISCSIChAPSecret(secrets map[string]string) iscsiCHAPSecret {
 		MutualUsername: firstSecretKey(secrets, chapSecretKeyMutualUsername, chapAliasMutualUsername),
 		MutualPassword: firstSecretKey(secrets, chapSecretKeyMutualPassword, chapAliasMutualPassword),
 	}
-	if rawTag := firstSecretKey(secrets, chapSecretKeyTag); rawTag != "" {
-		if tag, err := strconv.Atoi(rawTag); err == nil && tag > 0 {
+	if raw, ok := secrets[chapSecretKeyTag]; ok && strings.TrimSpace(raw) != "" {
+		parsed.tagRaw = raw
+		parsed.tagPresent = true
+		if tag, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && tag > 0 {
 			parsed.Tag = tag
 			parsed.HasTag = true
 		}
@@ -127,18 +146,25 @@ func parseISCSIChAPSecret(secrets map[string]string) iscsiCHAPSecret {
 	return parsed
 }
 
-// validateISCSIChAPSecret enforces the TrueNAS CHAP constraints before any API
-// call so a bad secret fails fast with InvalidArgument instead of a backend
-// rejection (or, worse, a node-side login storm).
+// validateISCSIChAPSecret enforces the TrueNAS CHAP constraints (mirrored from
+// middleware plugins/iscsi_/auth.py) on the EXACT unmodified secret before any
+// API call, so a bad secret fails fast with InvalidArgument instead of a backend
+// Internal error (or a node-side login storm).
 func validateISCSIChAPSecret(secret iscsiCHAPSecret) error {
 	if secret.Username == "" {
 		return status.Error(codes.InvalidArgument, "iSCSI CHAP username is required when CHAP is enabled")
 	}
-	if err := validateCHAPSecretLength("password", secret.Password); err != nil {
+	// An explicit tag key must be a positive integer; a present-but-malformed tag
+	// is rejected rather than silently replaced by a derived/global tag.
+	if secret.tagPresent && !secret.HasTag {
+		return status.Errorf(codes.InvalidArgument,
+			"iSCSI CHAP tag %q must be a positive integer", strings.TrimSpace(secret.tagRaw))
+	}
+	if err := validateCHAPSecretValue("password", secret.Password); err != nil {
 		return err
 	}
 	if secret.MutualUsername != "" {
-		if err := validateCHAPSecretLength("mutualPassword", secret.MutualPassword); err != nil {
+		if err := validateCHAPSecretValue("mutualPassword", secret.MutualPassword); err != nil {
 			return err
 		}
 		if secret.MutualPassword == secret.Password {
@@ -150,10 +176,23 @@ func validateISCSIChAPSecret(secret iscsiCHAPSecret) error {
 	return nil
 }
 
-func validateCHAPSecretLength(name, value string) error {
+// validateCHAPSecretValue mirrors the TrueNAS auth.py secret rules on the exact
+// value: 12-16 chars inclusive; no leading/trailing whitespace (auth.py strips
+// and rejects a difference); and no '#' character (auth.py forbids it because it
+// breaks the generated SCST config). The value is never trimmed before checking.
+func validateCHAPSecretValue(name, value string) error {
 	if value == "" {
 		return status.Errorf(codes.InvalidArgument, "iSCSI CHAP %s is required when CHAP is enabled", name)
 	}
+	// TrueNAS auth.py: reject leading/trailing whitespace (do not silently trim).
+	if value != strings.TrimSpace(value) {
+		return status.Errorf(codes.InvalidArgument, "iSCSI CHAP %s must not have leading or trailing whitespace", name)
+	}
+	// TrueNAS auth.py: '#' is rejected (unsupported in the SCST auth config).
+	if strings.Contains(value, "#") {
+		return status.Errorf(codes.InvalidArgument, "iSCSI CHAP %s must not contain '#'", name)
+	}
+	// TrueNAS auth.py: secret length is 12-16 characters inclusive.
 	if length := len(value); length < iscsiCHAPSecretMinLen || length > iscsiCHAPSecretMaxLen {
 		return status.Errorf(codes.InvalidArgument,
 			"iSCSI CHAP %s must be %d-%d characters (got %d)", name, iscsiCHAPSecretMinLen, iscsiCHAPSecretMaxLen, length)
@@ -209,22 +248,41 @@ func iscsiGroupAuthRef(peer *truenas.ISCSIAuth) int {
 	return peer.Tag
 }
 
-// iscsiGroupCHAP resolves the authmethod, auth ref, and auth tag to stamp on a
-// freshly built target group. It prefers the request-scoped CreateVolume
-// resolution; otherwise it reconstructs the auth ref from the stored dataset
-// property so idempotent rebuilds (and fence-adjacent creates) retain CHAP.
-// authRef is 0 when CHAP is not active for the dataset; authTag is 0 when only
-// the stored ref is known (the tag property is already persisted in that case).
-func (d *Driver) iscsiGroupCHAP(ctx context.Context, ds *truenas.Dataset) (authMethod string, authRef, authTag int) {
-	if res := iscsiCHAPResolutionFromContext(ctx); res != nil {
-		return res.authMethod(), iscsiGroupAuthRef(res.Peer), res.Peer.Tag
+// iscsiGroupCHAP resolves the authmethod and auth ref (the iscsi.auth TAG) to
+// stamp on a freshly built target group. It prefers the request-scoped
+// CreateVolume resolution; otherwise it reconstructs both from the STORED,
+// LOCAL dataset properties so idempotent rebuilds and fence passes retain the
+// exact per-volume CHAP policy. authRef is 0 when CHAP is not active for the
+// dataset. The mode comes from PropISCSIAuthMode — never from the mutable
+// controller-wide iscsi.chap.mutual flag — so a global-flag flip cannot change
+// an existing volume and mixed one-way/mutual classes coexist.
+func (d *Driver) iscsiGroupCHAP(ctx context.Context, ds *truenas.Dataset) (authMethod string, authRef int) {
+	if res := iscsiCHAPResolutionFromContext(ctx); res != nil && res.Peer != nil {
+		return res.authMethod(), iscsiGroupAuthRef(res.Peer)
 	}
-	if rawID := datasetUserProperty(ds, PropISCSIAuthID); rawID != "" && rawID != "-" {
-		if id, err := strconv.Atoi(rawID); err == nil && id > 0 {
-			return d.iscsiCHAPAuthMethod(), id, 0
-		}
+	mode, tag := d.storedISCSICHAPPolicy(ds)
+	if mode == iscsiCHAPModeNone || tag <= 0 {
+		return iscsiCHAPModeNone, 0
 	}
-	return iscsiCHAPModeNone, 0, 0
+	return mode, tag
+}
+
+// storedISCSICHAPPolicy reads the durable per-volume CHAP policy from the
+// dataset's LOCAL properties: the immutable mode (PropISCSIAuthMode) and the
+// tag-keyed auth ref (PropISCSIAuthTag). It returns (NONE, 0) when either is
+// absent, non-local (clone-inherited), or malformed. This is the single reader
+// every fence/replay/context path consults.
+func (d *Driver) storedISCSICHAPPolicy(ds *truenas.Dataset) (mode string, tag int) {
+	rawMode := datasetLocalUserProperty(ds, PropISCSIAuthMode)
+	if rawMode != iscsiCHAPModeCHAP && rawMode != iscsiCHAPModeMutual {
+		return iscsiCHAPModeNone, 0
+	}
+	rawTag := datasetLocalUserProperty(ds, PropISCSIAuthTag)
+	parsedTag, err := strconv.Atoi(rawTag)
+	if err != nil || parsedTag <= 0 {
+		return iscsiCHAPModeNone, 0
+	}
+	return rawMode, parsedTag
 }
 
 // applyISCSIGroupCHAP stamps authmethod+auth onto a target group when CHAP is
@@ -239,17 +297,6 @@ func applyISCSIGroupCHAP(group *truenas.ISCSITargetGroup, authMethod string, aut
 	group.Auth = &ref
 }
 
-// iscsiCHAPAuthMethod returns the authmethod enum for the controller's global
-// CHAP posture. It is used when rebuilding groups from a stored dataset property
-// (fence/idempotent paths) where only the auth ref, not the original mode, is
-// persisted.
-func (d *Driver) iscsiCHAPAuthMethod() string {
-	if d.config.ISCSI.CHAP.Mutual {
-		return iscsiCHAPModeMutual
-	}
-	return iscsiCHAPModeCHAP
-}
-
 // chapEnabledForCreate reports whether a CreateVolume request opts into CHAP:
 // the controller-wide feature must be on, and either the StorageClass sets
 // iscsi.chapSecret=true or the provisioner secret carries a username.
@@ -261,6 +308,33 @@ func (d *Driver) chapEnabledForCreate(params, secrets map[string]string) bool {
 		return true
 	}
 	return firstSecretKey(secrets, chapSecretKeyUsername, chapAliasUsername) != ""
+}
+
+// guardExistingISCSICHAPPolicy enforces that an idempotent CreateVolume replay
+// against an already-provisioned iSCSI volume cannot change its authentication
+// policy (X4). The dataset's stored, LOCAL policy is authoritative and immutable
+// for the life of the volume; the request's resolved policy must match it
+// exactly (mode and tag). A conflict — CHAP-vs-none in either direction, or a
+// different tag/mode — is a FailedPrecondition, never a silent re-stamp. This
+// blocks retro-converting a legacy non-CHAP volume to CHAP (and the reverse),
+// preserving CSI volume_context immutability.
+func (d *Driver) guardExistingISCSICHAPPolicy(ctx context.Context, ds *truenas.Dataset) error {
+	storedMode, storedTag := d.storedISCSICHAPPolicy(ds)
+
+	requestMode := iscsiCHAPModeNone
+	requestTag := 0
+	if res := iscsiCHAPResolutionFromContext(ctx); res != nil && res.Peer != nil {
+		requestMode = res.authMethod()
+		requestTag = res.Peer.Tag
+	}
+
+	if storedMode == requestMode && (requestMode == iscsiCHAPModeNone || storedTag == requestTag) {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"volume already exists with iSCSI CHAP policy %s (tag %d); the request resolves %s (tag %d). "+
+			"CHAP authentication policy is immutable for the life of a volume — provision a new volume to change it",
+		storedMode, storedTag, requestMode, requestTag)
 }
 
 // EnsureISCSIAuthPeer validates the CHAP secret and returns the shared backend
@@ -282,14 +356,35 @@ func (d *Driver) EnsureISCSIAuthPeer(ctx context.Context, secrets map[string]str
 		}
 	}
 
+	mutual := secret.MutualUsername != ""
+	// The full credential-identity fingerprint (user|secret|peeruser|peersecret).
+	// It is compared against the peer's server-side fingerprint to distinguish an
+	// exact reuse from a rotation (same user/tag, changed secret). It is a one-way
+	// hash and never persisted to a dataset.
+	requestFingerprint := truenas.ISCSIAuthCredentialFingerprint(
+		secret.Username, secret.Password, secret.MutualUsername, secret.MutualPassword)
+
 	d.iscsiAuthMu.Lock()
 	defer d.iscsiAuthMu.Unlock()
 
 	if d.iscsiResolvedAuth == nil {
 		d.iscsiResolvedAuth = make(map[int]*truenas.ISCSIAuth)
 	}
-	if peer, ok := d.iscsiResolvedAuth[tag]; ok {
-		return &iscsiCHAPResolution{Peer: peer, Mutual: secret.MutualUsername != ""}, nil
+
+	// Hot cache: validate the cached peer against THIS request's identity before
+	// returning it (kills the collision bypass). A different username on the same
+	// tag is a FailedPrecondition — identically to the cold path. A matching user
+	// with a changed credential is a rotation: fall through to the cold path,
+	// which applies iscsi.auth.update.
+	if cached, ok := d.iscsiResolvedAuth[tag]; ok {
+		if cached.User != secret.Username {
+			return nil, tagCollisionError(tag)
+		}
+		if cached.CredentialFingerprint == requestFingerprint {
+			return &iscsiCHAPResolution{Peer: cached, Mutual: mutual}, nil
+		}
+		// Rotation: the cached fingerprint is stale. Drop it and re-resolve.
+		delete(d.iscsiResolvedAuth, tag)
 	}
 
 	peers, err := d.truenasClient.ISCSIAuthQueryByTag(ctx, tag)
@@ -297,25 +392,98 @@ func (d *Driver) EnsureISCSIAuthPeer(ctx context.Context, secrets map[string]str
 		return nil, status.Errorf(codes.Internal, "failed to query iSCSI auth peers for tag %d: %v", tag, err)
 	}
 	for _, peer := range peers {
-		if peer.User == secret.Username {
-			d.iscsiResolvedAuth[tag] = peer
-			return &iscsiCHAPResolution{Peer: peer, Mutual: secret.MutualUsername != ""}, nil
+		if peer.User != secret.Username {
+			continue
 		}
+		if peer.CredentialFingerprint == requestFingerprint {
+			// Exact reuse across a controller restart or cold cache.
+			d.iscsiResolvedAuth[tag] = peer
+			return &iscsiCHAPResolution{Peer: peer, Mutual: mutual}, nil
+		}
+		// Same user + tag but a different credential fingerprint (or one-way/mutual
+		// shape change) is a ROTATION. Re-key the backend peer in place so the
+		// documented rotation story is real rather than a silent adoption of the
+		// stale secret. The tag stays stable, so target groups need no change.
+		updated, updateErr := d.truenasClient.ISCSIAuthUpdate(
+			ctx, peer.ID, secret.Username, secret.Password, secret.MutualUsername, secret.MutualPassword)
+		if updateErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to rotate iSCSI auth peer for tag %d: %v", tag, updateErr)
+		}
+		klog.Infof("Rotated iSCSI CHAP auth peer: tag=%d id=%d user=%q mutual=%v (secret updated)", tag, updated.ID, secret.Username, mutual)
+		d.iscsiResolvedAuth[tag] = updated
+		return &iscsiCHAPResolution{Peer: updated, Mutual: mutual, Rotated: true}, nil
 	}
 	if len(peers) > 0 {
 		// A peer already owns this tag under a different username. Never silently
 		// overwrite an operator credential; the collision is a configuration error.
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"iSCSI auth tag %d is already in use by a different username; set an explicit tag in the CHAP secret", tag)
+		return nil, tagCollisionError(tag)
 	}
 
 	peer, err := d.truenasClient.ISCSIAuthCreate(ctx, tag, secret.Username, secret.Password, secret.MutualUsername, secret.MutualPassword)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create iSCSI auth peer for tag %d: %v", tag, err)
 	}
-	klog.Infof("Ensured shared iSCSI CHAP auth peer: tag=%d id=%d user=%q mutual=%v", tag, peer.ID, secret.Username, secret.MutualUsername != "")
+
+	// TrueNAS middleware does not enforce tag uniqueness on create, so two
+	// controllers (HA / upgrade window) can both miss the query and create a peer
+	// for the same tag. Re-query and keep a deterministic winner (lowest id): if
+	// the winner is not ours, delete ours and adopt the winner when its identity
+	// matches, else fail rather than leave ambiguous duplicates. Bounded to one
+	// extra query (+ at most one delete); no reconcile sweep.
+	peer, err = d.reconcileDuplicateAuthPeers(ctx, tag, peer, secret.Username, requestFingerprint)
+	if err != nil {
+		return nil, err
+	}
+
+	klog.Infof("Ensured shared iSCSI CHAP auth peer: tag=%d id=%d user=%q mutual=%v", tag, peer.ID, secret.Username, mutual)
 	d.iscsiResolvedAuth[tag] = peer
-	return &iscsiCHAPResolution{Peer: peer, Mutual: secret.MutualUsername != ""}, nil
+	return &iscsiCHAPResolution{Peer: peer, Mutual: mutual}, nil
+}
+
+// tagCollisionError is the shared FailedPrecondition for a tag already owned by
+// a different username, so the hot-cache and cold-query paths report collisions
+// identically.
+func tagCollisionError(tag int) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"iSCSI auth tag %d is already in use by a different username; set an explicit tag in the CHAP secret", tag)
+}
+
+// reconcileDuplicateAuthPeers resolves a cross-process duplicate-tag race after
+// a create. It re-queries the tag and, if more than one peer exists, keeps the
+// lowest-id winner: when the winner is not the peer we just created it deletes
+// ours and adopts the winner iff the winner's identity matches this request,
+// otherwise returns FailedPrecondition. With a single peer it returns ours
+// unchanged.
+func (d *Driver) reconcileDuplicateAuthPeers(ctx context.Context, tag int, ours *truenas.ISCSIAuth, username, requestFingerprint string) (*truenas.ISCSIAuth, error) {
+	peers, err := d.truenasClient.ISCSIAuthQueryByTag(ctx, tag)
+	if err != nil {
+		// The create succeeded; a failed verification query is non-fatal — return
+		// ours and let a later resolve reconcile. Do not fail provisioning here.
+		klog.Warningf("post-create duplicate-tag verification query failed for tag %d (using created peer id=%d): %v", tag, ours.ID, err)
+		return ours, nil
+	}
+	if len(peers) <= 1 {
+		return ours, nil
+	}
+	winner := peers[0]
+	for _, peer := range peers[1:] {
+		if peer.ID < winner.ID {
+			winner = peer
+		}
+	}
+	if winner.ID == ours.ID {
+		return ours, nil
+	}
+	// A concurrent controller won the tag. Drop our duplicate.
+	klog.Warningf("duplicate iSCSI auth peers for tag %d; keeping winner id=%d, deleting our id=%d", tag, winner.ID, ours.ID)
+	if delErr := d.truenasClient.ISCSIAuthDelete(ctx, ours.ID); delErr != nil {
+		klog.Warningf("failed to delete losing duplicate iSCSI auth peer id=%d for tag %d: %v", ours.ID, tag, delErr)
+	}
+	if winner.User != username || winner.CredentialFingerprint != requestFingerprint {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"iSCSI auth tag %d resolved to a peer with a different identity after a concurrent create; set an explicit tag in the CHAP secret", tag)
+	}
+	return winner, nil
 }
 
 // nodeISCSIChAPCredentials builds the node-side CHAP credentials from the volume

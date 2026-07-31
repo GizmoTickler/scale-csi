@@ -42,11 +42,19 @@ const (
 	PropISCSIExtentID             = "truenas-csi:truenas_iscsi_extent_id"
 	PropISCSITargetExtentID       = "truenas-csi:truenas_iscsi_targetextent_id"
 	PropISCSIInitiatorID          = "truenas-csi:truenas_iscsi_initiator_id"
-	PropISCSIAuthID               = "truenas-csi:truenas_iscsi_auth_id"
-	PropISCSIAuthTag              = "truenas-csi:truenas_iscsi_auth_tag"
-	PropNVMeoFSubsystemID         = "truenas-csi:truenas_nvmeof_subsystem_id"
-	PropNVMeoFNamespaceID         = "truenas-csi:truenas_nvmeof_namespace_id"
-	PropNVMeoFPortSubsysID        = "truenas-csi:truenas_nvmeof_portsubsys_id"
+	// PropISCSIAuthTag stores the iscsi.auth TAG that the target group's auth ref
+	// points at (G1: SCST only emits IncomingUser for tag-keyed refs). It is the
+	// durable link fence/rebuild passes use to re-stamp CHAP without the secret.
+	PropISCSIAuthTag = "truenas-csi:truenas_iscsi_auth_tag"
+	// PropISCSIAuthMode stores the immutable per-volume auth mode (CHAP or
+	// CHAP_MUTUAL) stamped at CreateVolume. Every later path (fence, volume
+	// context, idempotent replay) reads THIS, never the mutable controller-wide
+	// iscsi.chap.mutual flag, so a global-flag flip cannot downgrade or upgrade an
+	// existing volume and mixed one-way/mutual StorageClasses coexist correctly.
+	PropISCSIAuthMode      = "truenas-csi:truenas_iscsi_auth_mode"
+	PropNVMeoFSubsystemID  = "truenas-csi:truenas_nvmeof_subsystem_id"
+	PropNVMeoFNamespaceID  = "truenas-csi:truenas_nvmeof_namespace_id"
+	PropNVMeoFPortSubsysID = "truenas-csi:truenas_nvmeof_portsubsys_id"
 
 	// PropInflightMarkerPrefix namespaces per-volume in-flight content-source
 	// creation markers written on the PARENT dataset (the only object proven to
@@ -371,6 +379,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if chapErr != nil {
 			return nil, chapErr
 		}
+		if chapResolution.Rotated {
+			// The backend peer's secret was re-keyed in place. Surface a redacted
+			// Event (no credential) so operators can confirm the rotation applied.
+			d.recordNormalEvent(createVolumeEventRef(req), EventReasonISCSICHAPRotated,
+				fmt.Sprintf("Rotated iSCSI CHAP credential for auth tag %d", chapResolution.Peer.Tag))
+		}
 		ctx = withISCSIChAPResolution(ctx, chapResolution)
 	}
 
@@ -445,6 +459,19 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
 		volumeProperties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
+	}
+	// Fold the durable CHAP auth linkage into the FATAL managed-property update
+	// below so it is stamped-or-rolled-back with the rest of provisioning (X1): a
+	// fence pass reconstructs authmethod+auth purely from PropISCSIAuthTag +
+	// PropISCSIAuthMode, so a missing stamp would silently downgrade the target to
+	// authmethod=NONE. The immutable mode is stored here (never re-derived from the
+	// mutable global flag). Only the fresh-create path reaches this; existing
+	// volumes are policy-guarded in createVolumeExisting and never re-stamped.
+	if shareType == ShareTypeISCSI {
+		if res := iscsiCHAPResolutionFromContext(ctx); res != nil && res.Peer != nil {
+			volumeProperties[PropISCSIAuthTag] = strconv.Itoa(res.Peer.Tag)
+			volumeProperties[PropISCSIAuthMode] = res.authMethod()
+		}
 	}
 
 	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
@@ -770,6 +797,16 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	if waitErr := d.setDatasetUserProperties(ctx, existingDS, datasetName, propertyUpdates); waitErr != nil {
 		klog.Errorf("Failed to ensure properties for existing volume %s: %v", volumeID, waitErr)
 		return nil, status.Errorf(codes.Internal, "failed to ensure volume properties: %v", waitErr)
+	}
+
+	// The stored per-volume CHAP policy is authoritative: an idempotent replay may
+	// not convert this volume to/from CHAP or change its tag/mode (X4). Guard
+	// BEFORE ensureShareExists so a conflicting replay fails fast and never
+	// rebuilds the target's auth groups.
+	if shareType == ShareTypeISCSI {
+		if guardErr := d.guardExistingISCSICHAPPolicy(ctx, existingDS); guardErr != nil {
+			return nil, guardErr
+		}
 	}
 
 	// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
@@ -2305,8 +2342,8 @@ var inheritedProtocolPropertyKeys = []string{
 	PropISCSIExtentID,
 	PropISCSITargetExtentID,
 	PropISCSIInitiatorID,
-	PropISCSIAuthID,
 	PropISCSIAuthTag,
+	PropISCSIAuthMode,
 	PropNVMeoFSubsystemID,
 	PropNVMeoFNamespaceID,
 	PropNVMeoFPortSubsysID,
@@ -2329,8 +2366,12 @@ func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truen
 		currentProtocol[PropISCSIExtentID] = struct{}{}
 		currentProtocol[PropISCSITargetExtentID] = struct{}{}
 		currentProtocol[PropISCSIInitiatorID] = struct{}{}
-		currentProtocol[PropISCSIAuthID] = struct{}{}
-		currentProtocol[PropISCSIAuthTag] = struct{}{}
+		// PropISCSIAuthTag/PropISCSIAuthMode are deliberately NOT current-protocol:
+		// CHAP identity is POLICY, not a same-protocol share-object back-reference.
+		// An iSCSI->iSCSI clone must NOT inherit the source's CHAP tag/mode, so the
+		// scrub removes any inherited CHAP props here. When the CURRENT CreateVolume
+		// request itself resolves CHAP, createISCSIShareForDataset re-stamps the
+		// request's own tag/mode as a local property afterward.
 	case ShareTypeNVMeoF:
 		currentProtocol[PropNVMeoFSubsystemID] = struct{}{}
 		currentProtocol[PropNVMeoFNamespaceID] = struct{}{}
