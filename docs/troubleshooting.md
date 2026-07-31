@@ -35,6 +35,11 @@ kubectl logs -n scale-csi -l app.kubernetes.io/component=node -c scale-csi --tai
 # With Helm, enable verbose logging with: --set logging.verbosity=4
 ```
 
+> **CHAP credentials are never logged.** CSI request `secrets` are structurally
+> stripped before the V(5) request dump, and iSCSI CHAP argv values are redacted
+> (`***`) in any param-set error. Raising `-v`/`logging.verbosity` will NOT expose
+> a CHAP username/password secret value.
+
 ## Common Issues
 
 ### Volume Provisioning Failures

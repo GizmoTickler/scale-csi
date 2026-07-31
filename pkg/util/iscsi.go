@@ -785,6 +785,14 @@ func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 }
 
 // SetISCSINodeParam sets a parameter on an iSCSI node.
+//
+// When name is a CHAP credential key (node.session.auth.username/password and
+// their mutual variants) the value is a secret: on error the returned message
+// carries only the redacted argv (value masked) and an exit-class summary — never
+// the raw value or iscsiadm output, which iscsiadm or a wrapper could echo
+// (E4/O22). This mirrors ConfigureISCSICHAPWithContext's redaction. Non-auth
+// params keep the fuller output for debuggability; their argv is still passed
+// through redactISCSIArgs so future auth-key use is safe by construction.
 func SetISCSINodeParam(portal, iqn, name, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
 	defer cancel()
@@ -793,9 +801,58 @@ func SetISCSINodeParam(portal, iqn, name, value string) error {
 		"-o", "update", "-n", name, "-v", value)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to set node param: %w, output: %s", err, string(output))
+		if isISCSIAuthParam(name) {
+			return fmt.Errorf("failed to set node param %s (%s), args: %v", name, sanitizedExecClass(err), redactISCSIArgs(cmd.Args))
+		}
+		return fmt.Errorf("failed to set node param %s: %w, args: %v, output: %s", name, err, redactISCSIArgs(cmd.Args), string(output))
 	}
 	return nil
+}
+
+// isISCSIAuthParam reports whether an iscsiadm node parameter name carries a CHAP
+// credential value that must never be logged.
+func isISCSIAuthParam(name string) bool {
+	switch name {
+	case "node.session.auth.username",
+		"node.session.auth.password",
+		"node.session.auth.username_in",
+		"node.session.auth.password_in":
+		return true
+	}
+	return false
+}
+
+// redactISCSIArgs returns a copy of an iscsiadm argv with CHAP credential values
+// masked as "***". It redacts the value following -v when the active -n is an auth
+// key, and (belt-and-suspenders) any bare value token directly following an
+// auth-key name. Parameter NAMES and non-auth values are preserved. The input
+// slice is never mutated.
+func redactISCSIArgs(args []string) []string {
+	redacted := make([]string, len(args))
+	copy(redacted, args)
+	authValuePending := false
+	for i := 0; i < len(redacted); i++ {
+		switch redacted[i] {
+		case "-n":
+			authValuePending = false
+			if i+1 < len(redacted) {
+				authValuePending = isISCSIAuthParam(redacted[i+1])
+				i++ // skip the parameter name token; it is not secret
+			}
+		case "-v":
+			if authValuePending && i+1 < len(redacted) {
+				redacted[i+1] = "***"
+				i++ // skip the value token just redacted
+			}
+			authValuePending = false
+		default:
+			if authValuePending && !strings.HasPrefix(redacted[i], "-") {
+				redacted[i] = "***"
+			}
+			authValuePending = false
+		}
+	}
+	return redacted
 }
 
 // ConfigureISCSICHAPWithContext applies session CHAP credentials to a target's

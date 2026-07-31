@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -1140,4 +1141,60 @@ func stringJoin(parts []string, sep string) string {
 		result += sep + parts[i]
 	}
 	return result
+}
+
+// TestRedactISCSIArgs guards the E4/O22 argv redactor: CHAP credential values are
+// masked, parameter names and non-auth values are preserved, and the input slice
+// is never mutated.
+func TestRedactISCSIArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			name: "auth password value is masked",
+			args: []string{"iscsiadm", "-m", "node", "-T", "iqn.test:x", "-p", "192.0.2.10:3260", "-o", "update", "-n", "node.session.auth.password", "-v", "hunter2secret"},
+			want: []string{"iscsiadm", "-m", "node", "-T", "iqn.test:x", "-p", "192.0.2.10:3260", "-o", "update", "-n", "node.session.auth.password", "-v", "***"},
+		},
+		{
+			name: "auth username value is masked",
+			args: []string{"-n", "node.session.auth.username", "-v", "chapuser"},
+			want: []string{"-n", "node.session.auth.username", "-v", "***"},
+		},
+		{
+			name: "mutual password_in value is masked",
+			args: []string{"-n", "node.session.auth.password_in", "-v", "peersecret"},
+			want: []string{"-n", "node.session.auth.password_in", "-v", "***"},
+		},
+		{
+			name: "non-auth value is preserved",
+			args: []string{"-n", "node.session.auth.authmethod", "-v", "CHAP"},
+			want: []string{"-n", "node.session.auth.authmethod", "-v", "CHAP"},
+		},
+		{
+			name: "bare value directly after an auth name is masked",
+			args: []string{"-n", "node.session.auth.password", "hunter2secret"},
+			want: []string{"-n", "node.session.auth.password", "***"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := slices.Clone(tc.args)
+			assert.Equal(t, tc.want, redactISCSIArgs(tc.args))
+			assert.Equal(t, original, tc.args, "input slice must not be mutated")
+		})
+	}
+}
+
+// TestSetISCSINodeParamErrorNeverLeaksCHAPSecret guards the E4/O22 error wrap: a
+// forced auth-param failure carries the masked argv and never the secret value.
+func TestSetISCSINodeParamErrorNeverLeaksCHAPSecret(t *testing.T) {
+	if _, err := exec.LookPath("iscsiadm"); err == nil {
+		t.Skip("iscsiadm present; cannot force a deterministic param-set failure")
+	}
+	const secret = "hunter2-do-not-leak"
+	err := SetISCSINodeParam("192.0.2.99:3260", "iqn.test:redact", "node.session.auth.password", secret)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), secret, "CHAP secret must never appear in a SetISCSINodeParam error")
+	assert.Contains(t, err.Error(), "***", "the auth value must be masked in the redacted argv")
 }
