@@ -159,10 +159,14 @@ func parseISCSIAuth(data interface{}) (*ISCSIAuth, error) {
 		auth.PeerUser = v
 	}
 	// Derive the credential fingerprint from the live secret fields and drop the
-	// raw secrets immediately — they are never assigned to the struct. If the
-	// server omits secrets from the query the fingerprint is over empty strings,
-	// which the driver treats as an opaque value (rotation comparison still works
-	// consistently because both sides observe the same server behavior).
+	// raw secrets immediately — they are never assigned to the struct. NOTE: this
+	// scheme depends on TrueNAS returning secret/peersecret in iscsi.auth.query
+	// (verified against 26.0 middleware). If a future TrueNAS masked secrets in
+	// query results, the server-side fingerprint would be computed over empty
+	// strings and would NEVER match a request fingerprint — the driver would then
+	// degrade to issuing a (harmless but spurious) iscsi.auth.update + rotation
+	// Event on every CreateVolume for that class, not to silent misbehavior. If
+	// that ever appears in logs, re-probe the query shape before changing code.
 	secret, _ := m["secret"].(string)
 	peerSecret, _ := m["peersecret"].(string)
 	auth.CredentialFingerprint = ISCSIAuthCredentialFingerprint(auth.User, secret, auth.PeerUser, peerSecret)

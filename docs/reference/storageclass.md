@@ -228,6 +228,13 @@ restarting the controller never changes an existing volume's authmethod.
   policy — enabling CHAP on a previously non-CHAP volume (or the reverse), or a
   different tag/mode — is rejected with `FailedPrecondition`. Only the secret
   *value* rotates (above); to change the policy, provision a new volume.
+  Note: because the shared auth peer is ensured before the per-volume policy
+  guard runs, a *rejected* policy-change replay can still have side effects on
+  the shared peer — a mode-shape change (one-way↔mutual) re-keys the shared
+  peer (you will see an `ISCSICHAPRotated` Event alongside the
+  `FailedPrecondition`), and a username change creates a new peer that the
+  rejected volume then never uses (one bounded orphan per username change).
+  Existing volumes and their groups are unaffected either way.
 - **Wrong secret.** A bad password fails `NodeStageVolume` fast with
   `Unauthenticated` and no discovery-retry storm; the pod stays
   `ContainerCreating` until the Secret is corrected.
