@@ -461,15 +461,18 @@ capacity:
 			return helmTemplate(t, "--show-only", "templates/prometheusrule.yaml", "-f", valuesPath)
 		}
 
+		// wantExpr is newline-anchored: a bare Contains(") > 0") would also match
+		// ") > 0.85", making the zero-lower-bound case vacuous (it would pass even
+		// if a Sprig `default` swallowed the 0 back to 0.85).
 		cases := []struct {
 			name      string
 			threshold string // empty => use the values.yaml default
 			wantExpr  string
 		}{
-			{"zero lower bound", "    poolUsageThreshold: 0\n", ") > 0"},
-			{"default", "", ") > 0.85"},
-			{"fractional", "    poolUsageThreshold: 0.5\n", ") > 0.5"},
-			{"one upper bound", "    poolUsageThreshold: 1\n", ") > 1"},
+			{"zero lower bound", "    poolUsageThreshold: 0\n", ") > 0\n"},
+			{"default", "", ") > 0.85\n"},
+			{"fractional", "    poolUsageThreshold: 0.5\n", ") > 0.5\n"},
+			{"one upper bound", "    poolUsageThreshold: 1\n", ") > 1\n"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
