@@ -174,13 +174,23 @@ spec:
             description: Driver-tombstoned deferred-delete snapshots have awaited reap for forty-eight hours.
             runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
         - alert: ScaleCSIReconcileStalled
-          expr: time() - max(scale_csi_reconcile_last_success_timestamp_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 3 * 3600
+          # The age threshold is DERIVED from the configured reconcile.interval
+          # (3x the cadence, in seconds) instead of a hard-coded three hours, so
+          # an operator who lengthens reconcile.interval no longer gets a false
+          # critical before the next scheduled pass (codex M3). The coupling is
+          # also documented next to reconcile.interval in values.yaml.
+          #
+          # A controller that has NEVER completed a reconcile exports the gauge
+          # as 0, so the age is time()-0 (huge) and this alert trips after the
+          # 15m hold. That is intentional: a reconcile that never succeeds is
+          # worth paging on, not a false positive (opus informational note).
+          expr: time() - max(scale_csi_reconcile_last_success_timestamp_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > {{ mul 3 (include "scale-csi.durationToSeconds" .Values.reconcile.interval | int) }}
           for: 15m
           labels:
             severity: critical
           annotations:
             summary: Scale CSI controller reconcile loop is stalled
-            description: No reconcile pass has succeeded for over three hours (three times the default interval); orphan detection is frozen.
+            description: No reconcile pass has succeeded for over three times the configured reconcile.interval ({{ .Values.reconcile.interval }}); orphan detection is frozen. A controller that has never completed a reconcile also trips this alert.
             runbook_url: docs/troubleshooting.md#clean-up-orphaned-truenas-resources
         {{- end }}
         {{- if .Values.capacity.gaugeEnabled }}

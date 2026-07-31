@@ -146,3 +146,26 @@ Get the kubelet directory
 {{- define "scale-csi.kubeletDir" -}}
 {{- .Values.kubeletDir }}
 {{- end }}
+
+{{/*
+Convert a Go-style duration string composed of h/m/s segments (e.g. "1h",
+"90m", "1h30m", "45s") to whole seconds. Used to derive the
+ScaleCSIReconcileStalled age threshold from reconcile.interval so the alert
+tracks the configured cadence instead of a hard-coded three hours (codex M3).
+reconcile.interval is schema-restricted to ^([0-9]+(s|m|h))+$, so every segment
+is parseable here and there is no ms/m ambiguity.
+*/}}
+{{- define "scale-csi.durationToSeconds" -}}
+{{- $dur := toString . -}}
+{{- $seconds := 0 -}}
+{{- range regexFindAll "([0-9]+)h" $dur -1 -}}
+{{- $seconds = add $seconds (mul (trimSuffix "h" . | int) 3600) -}}
+{{- end -}}
+{{- range regexFindAll "([0-9]+)m" $dur -1 -}}
+{{- $seconds = add $seconds (mul (trimSuffix "m" . | int) 60) -}}
+{{- end -}}
+{{- range regexFindAll "([0-9]+)s" $dur -1 -}}
+{{- $seconds = add $seconds (trimSuffix "s" . | int) -}}
+{{- end -}}
+{{- $seconds -}}
+{{- end }}

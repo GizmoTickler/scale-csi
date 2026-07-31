@@ -485,6 +485,53 @@ capacity:
 	})
 }
 
+// TestChartReconcileStalledThresholdDerivation guards the codex M3 fix: the
+// ScaleCSIReconcileStalled age threshold is DERIVED from reconcile.interval
+// (3x the cadence, rendered to seconds) rather than a hard-coded three hours, so
+// an operator who lengthens the interval lengthens the threshold in lockstep and
+// no longer gets a false critical before the next scheduled pass.
+func TestChartReconcileStalledThresholdDerivation(t *testing.T) {
+	for _, tc := range []struct {
+		interval    string // empty => values.yaml default (1h)
+		wantSeconds string
+	}{
+		{"", "10800"},      // default 1h -> 3 * 3600
+		{"2h", "21600"},    // 3 * 7200
+		{"2h30m", "27000"}, // 3 * (2*3600 + 30*60)
+		{"45m", "8100"},    // 3 * 2700
+		{"90s", "270"},     // 3 * 90
+	} {
+		name := tc.interval
+		if name == "" {
+			name = "default-1h"
+		}
+		t.Run(name, func(t *testing.T) {
+			args := []string{"--show-only", "templates/prometheusrule.yaml", "--set", "metrics.prometheusRule.enabled=true"}
+			if tc.interval != "" {
+				args = append(args, "--set", "reconcile.interval="+tc.interval)
+			}
+			out := helmTemplate(t, args...)
+
+			// Find the reconcile-stalled expr line and assert its threshold.
+			var exprLine string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, "scale_csi_reconcile_last_success_timestamp_seconds") {
+					exprLine = strings.TrimSpace(line)
+					break
+				}
+			}
+			if exprLine == "" {
+				t.Fatalf("rendered prometheusrule has no reconcile-stalled expr; got:\n%s", out)
+			}
+			// HasSuffix anchors the exact threshold so "> 270" cannot silently
+			// match a "> 2700" render.
+			if want := "> " + tc.wantSeconds; !strings.HasSuffix(exprLine, want) {
+				t.Errorf("interval %q: expected expr to end with %q, got: %s", tc.interval, want, exprLine)
+			}
+		})
+	}
+}
+
 // TestChartHealthMonitorSidecar guards the external-health-monitor sidecar render
 // invariant (E3/K11b). The sidecar and its extra RBAC are strictly opt-in: the
 // default render carries no csi-external-health-monitor container and no health
@@ -582,6 +629,27 @@ func TestChartDurationValidation(t *testing.T) {
 			setKey:  "capacity.gaugeInterval",
 			bad:     "0s",
 			pointer: "/capacity/gaugeInterval",
+		},
+		// reconcile.interval feeds the ScaleCSIReconcileStalled threshold helper
+		// (codex M3), which parses whole h/m/s segments; the schema rejects
+		// anything it cannot parse (malformed, zero, and fractional durations).
+		{
+			name:    "reconcile.interval malformed",
+			setKey:  "reconcile.interval",
+			bad:     "bogus",
+			pointer: "/reconcile/interval",
+		},
+		{
+			name:    "reconcile.interval zero",
+			setKey:  "reconcile.interval",
+			bad:     "0s",
+			pointer: "/reconcile/interval",
+		},
+		{
+			name:    "reconcile.interval fractional",
+			setKey:  "reconcile.interval",
+			bad:     "1.5h",
+			pointer: "/reconcile/interval",
 		},
 	}
 	for _, tc := range cases {

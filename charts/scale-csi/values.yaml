@@ -642,6 +642,13 @@ reconcile:
   enabled: true
 
   # Interval between controller reconcile passes (including the job sweep).
+  # Must be a Go duration in whole h/m/s segments (e.g. "1h", "90m", "1h30m");
+  # fractional ("1.5h") and sub-second units are rejected by the schema.
+  #
+  # COUPLING: the ScaleCSIReconcileStalled alert threshold is DERIVED from this
+  # value (3x interval, rendered to seconds by the chart), so lengthening the
+  # interval lengthens the stall threshold in lockstep — no separate alert knob
+  # to keep in sync. Keep alertAfter (below) strictly greater than 2x interval.
   interval: 1h
 
   # Managed backend objects must be older than this before they are orphaned.
