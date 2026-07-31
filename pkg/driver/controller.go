@@ -42,6 +42,8 @@ const (
 	PropISCSIExtentID             = "truenas-csi:truenas_iscsi_extent_id"
 	PropISCSITargetExtentID       = "truenas-csi:truenas_iscsi_targetextent_id"
 	PropISCSIInitiatorID          = "truenas-csi:truenas_iscsi_initiator_id"
+	PropISCSIAuthID               = "truenas-csi:truenas_iscsi_auth_id"
+	PropISCSIAuthTag              = "truenas-csi:truenas_iscsi_auth_tag"
 	PropNVMeoFSubsystemID         = "truenas-csi:truenas_nvmeof_subsystem_id"
 	PropNVMeoFNamespaceID         = "truenas-csi:truenas_nvmeof_namespace_id"
 	PropNVMeoFPortSubsysID        = "truenas-csi:truenas_nvmeof_portsubsys_id"
@@ -2290,6 +2292,8 @@ var inheritedProtocolPropertyKeys = []string{
 	PropISCSIExtentID,
 	PropISCSITargetExtentID,
 	PropISCSIInitiatorID,
+	PropISCSIAuthID,
+	PropISCSIAuthTag,
 	PropNVMeoFSubsystemID,
 	PropNVMeoFNamespaceID,
 	PropNVMeoFPortSubsysID,
@@ -2312,6 +2316,8 @@ func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truen
 		currentProtocol[PropISCSIExtentID] = struct{}{}
 		currentProtocol[PropISCSITargetExtentID] = struct{}{}
 		currentProtocol[PropISCSIInitiatorID] = struct{}{}
+		currentProtocol[PropISCSIAuthID] = struct{}{}
+		currentProtocol[PropISCSIAuthTag] = struct{}{}
 	case ShareTypeNVMeoF:
 		currentProtocol[PropNVMeoFSubsystemID] = struct{}{}
 		currentProtocol[PropNVMeoFNamespaceID] = struct{}{}

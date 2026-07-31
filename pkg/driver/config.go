@@ -258,6 +258,27 @@ type ISCSIConfig struct {
 	// Multiple share creations within this window will be coalesced into a single reload.
 	// This prevents reload storms during bulk volume provisioning. (default: 2000ms)
 	ServiceReloadDebounce int `yaml:"serviceReloadDebounce"`
+
+	// CHAP configures iSCSI CHAP authentication. It is strictly opt-in: the zero
+	// value (Enabled=false) leaves every target group at authmethod=NONE, so a
+	// deployment that never sets this block behaves exactly as before CHAP existed.
+	CHAP ISCSICHAPSettings `yaml:"chap"`
+}
+
+// ISCSICHAPSettings holds the controller-wide iSCSI CHAP posture. Credentials
+// themselves are never configured here; they are supplied per-StorageClass via
+// CSI provisioner/node-stage secret refs (see docs/reference/storageclass.md).
+type ISCSICHAPSettings struct {
+	// Enabled opts the controller into CHAP peer management. Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// Tag is an optional operator-pinned iscsi.auth tag. Zero means derive a
+	// deterministic per-StorageClass tag (see deriveISCSIAuthTag).
+	Tag int `yaml:"tag"`
+
+	// Mutual selects CHAP_MUTUAL (bidirectional) authentication when true.
+	// Default false (one-way CHAP).
+	Mutual bool `yaml:"mutual"`
 }
 
 // ISCSITargetGroup represents a portal/initiator group configuration.
@@ -997,6 +1018,7 @@ func validateNonNegativeConfig(cfg *Config) error {
 		{"iscsi.extentBlocksize", cfg.ISCSI.ExtentBlocksize},
 		{"iscsi.deviceWaitTimeout", cfg.ISCSI.DeviceWaitTimeout},
 		{"iscsi.serviceReloadDebounce", cfg.ISCSI.ServiceReloadDebounce},
+		{"iscsi.chap.tag", cfg.ISCSI.CHAP.Tag},
 		{"nvmeof.transportServiceId", cfg.NVMeoF.TransportServiceID},
 		{"nvmeof.deviceWaitTimeout", cfg.NVMeoF.DeviceWaitTimeout},
 		{"sessionGC.interval", cfg.SessionGC.Interval},

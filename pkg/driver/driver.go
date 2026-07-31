@@ -157,6 +157,12 @@ type Driver struct {
 	iscsiGroupMu       sync.Mutex
 	iscsiResolvedGroup *truenas.ISCSITargetGroup
 
+	// Cached iSCSI CHAP auth peers keyed by iscsi.auth tag. A per-StorageClass
+	// credential is ensured once per controller lifetime and shared by every
+	// volume of that class; see EnsureISCSIAuthPeer.
+	iscsiAuthMu       sync.Mutex
+	iscsiResolvedAuth map[int]*truenas.ISCSIAuth
+
 	// Cached TrueNAS NVMe-oF host IDs keyed by initiator NQN. Resolution is
 	// serialized so concurrent volume creates do not race to create one host.
 	nvmeHostMu        sync.Mutex
@@ -298,6 +304,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		eventRecorder:          eventRecorder,
 		serviceReloadDebouncer: serviceDebouncer,
 		nvmeResolvedHosts:      make(map[string]int),
+		iscsiResolvedAuth:      make(map[int]*truenas.ISCSIAuth),
 		stagedTargets:          make(map[string]nodeMountRecord),
 		publishedTargets:       make(map[string]nodeMountRecord),
 		expectedDeleteLogLast:  make(map[string]time.Time),
