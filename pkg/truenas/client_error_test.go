@@ -75,6 +75,24 @@ func TestIsLockContentionError(t *testing.T) {
 			want: false,
 		},
 		{
+			// opus hardening: "lock" must match as a whole word, so an EBUSY
+			// error that merely mentions deadlock/blocked/unlock stays a real
+			// error rather than being masked as benign contention.
+			name: "ebusy deadlock mention is real",
+			err:  &APIError{Code: int(syscall.EBUSY), Message: "deadlock detected on resource"},
+			want: false,
+		},
+		{
+			name: "ebusy blocked mention is real",
+			err:  &APIError{Code: int(syscall.EBUSY), Message: "operation blocked on device"},
+			want: false,
+		},
+		{
+			name: "ebusy unlock mention is real",
+			err:  &APIError{Code: int(syscall.EBUSY), Message: "failed to unlock resource"},
+			want: false,
+		},
+		{
 			name: "enoent is not contention",
 			err:  &APIError{Code: int(syscall.ENOENT), Message: "call already in progress"},
 			want: false,

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -123,8 +124,15 @@ func IsLockContentionError(err error) bool {
 	if errors.As(err, &apiErr) {
 		message = strings.ToLower(apiErr.Message)
 	}
-	return strings.Contains(message, "already in progress") || strings.Contains(message, "lock")
+	return strings.Contains(message, "already in progress") || lockWord.MatchString(message)
 }
+
+// lockWord matches "lock" as a whole word. The word-boundary anchors keep an
+// EBUSY message such as "deadlock", "blocked", or "unlock" from being
+// misclassified as benign lock contention (opus hardening): only a genuine
+// "lock held"/"lock busy" style message is benign, while a real busy-resource
+// failure that merely mentions one of those words still falls through to error.
+var lockWord = regexp.MustCompile(`\block\b`)
 
 // MessageFallbackContains is for APIs whose older releases did not expose a
 // semantic errno. If a structured errno is present it is authoritative, even
