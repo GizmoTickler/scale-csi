@@ -38,6 +38,7 @@ type ClientInterface interface {
 	DatasetExists(ctx context.Context, name string) (bool, error)
 	DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error)
 	DatasetPromote(ctx context.Context, datasetName string) error
+	DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error)
 	GetPoolAvailable(ctx context.Context, poolName string) (int64, error)
 	WaitForDatasetReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)
 	WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)

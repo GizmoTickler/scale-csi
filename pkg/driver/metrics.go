@@ -360,6 +360,36 @@ var (
 		[]string{"status"},
 	)
 
+	// Per-volume quota/usage gauges (GF2/E4), populated by ControllerGetVolume
+	// only when zfs.reportVolumeUsage is set. Cardinality is one series per volume
+	// observed; the near-quota gauge is the alert source (ScaleCSIVolumeNearQuota).
+	volumeUsedBytes = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "volume_used_bytes",
+			Help:      "Reported used bytes per volume from the most recent ControllerGetVolume usage read",
+		},
+		[]string{"volume"},
+	)
+
+	volumeQuotaBytes = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "volume_quota_bytes",
+			Help:      "Effective quota bytes per volume (refquota if set, else quota; 0 = unlimited)",
+		},
+		[]string{"volume"},
+	)
+
+	volumeNearQuota = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "volume_near_quota",
+			Help:      "1 when a volume's used bytes exceed 95% of its effective quota, else 0",
+		},
+		[]string{"volume"},
+	)
+
 	// Pool-capacity gauges (E4). Populated only when capacity.gaugeEnabled by a
 	// controller-only poll loop; cardinality is fixed at one series per gauge for
 	// this single-backend driver, labeled {pool,dataset}. pool_capacity_bytes is
@@ -693,6 +723,38 @@ func RecordClonePromoted(err error) {
 		status = "error"
 	}
 	clonesPromotedTotal.WithLabelValues(status).Inc()
+}
+
+// effectiveQuotaBytes returns a volume's binding quota: refquota when set,
+// otherwise quota; 0 means unlimited (GF2/E4).
+func effectiveQuotaBytes(usage *truenas.DatasetQuotaUsage) int64 {
+	if usage.Refquota > 0 {
+		return usage.Refquota
+	}
+	return usage.Quota
+}
+
+// volumeUsageNearQuota reports whether used bytes exceed 95% of the effective
+// quota. An unlimited volume (no quota) is never near quota. The comparison is
+// integer-scaled (used*100 > quota*95) to avoid floating-point edge cases.
+func volumeUsageNearQuota(usage *truenas.DatasetQuotaUsage) bool {
+	quota := effectiveQuotaBytes(usage)
+	if quota <= 0 {
+		return false
+	}
+	return usage.Used*100 > quota*95
+}
+
+// RecordVolumeUsage publishes the per-volume quota/usage gauges (GF2/E4) from a
+// ControllerGetVolume usage read.
+func RecordVolumeUsage(volumeID string, usage *truenas.DatasetQuotaUsage) {
+	volumeUsedBytes.WithLabelValues(volumeID).Set(float64(usage.Used))
+	volumeQuotaBytes.WithLabelValues(volumeID).Set(float64(effectiveQuotaBytes(usage)))
+	near := 0.0
+	if volumeUsageNearQuota(usage) {
+		near = 1.0
+	}
+	volumeNearQuota.WithLabelValues(volumeID).Set(near)
 }
 
 // SetOrphanReconcileMetrics publishes the latest detection report, including a

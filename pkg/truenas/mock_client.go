@@ -647,6 +647,25 @@ func (m *MockClient) DatasetPromote(ctx context.Context, datasetName string) err
 	return nil
 }
 
+func (m *MockClient) DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	ds, ok := m.Datasets[datasetName]
+	if !ok {
+		return nil, notFoundAPIError("dataset not found")
+	}
+	return &DatasetQuotaUsage{
+		Used:      datasetPropertyInt64(ds.Used),
+		Quota:     datasetPropertyInt64(ds.Quota),
+		Refquota:  datasetPropertyInt64(ds.Refquota),
+		Available: datasetPropertyInt64(ds.Available),
+	}, nil
+}
+
 func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	return m.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
 }

@@ -573,6 +573,10 @@
           "type": "boolean",
           "default": false
         },
+        "reportVolumeUsage": {
+          "type": "boolean",
+          "default": false
+        },
         "dedup": {
           "type": "boolean",
           "description": "Deprecated compatibility value; use datasetProperties."

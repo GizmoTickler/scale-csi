@@ -12,6 +12,46 @@ work) and earlier per-release entries are retained below for history. Sections
 after the per-release entries (Breaking change, Helm chart, Release governance)
 are cross-cutting themes that span several of these releases.
 
+## GF-Sprint 2 — Storage-native data protection
+
+Four opt-in features that use TrueNAS-native mechanisms to protect CSI volumes
+and snapshots. Every flag defaults OFF and the default Helm render stays
+byte-identical to v1.4.1; each new chart key ships values + schema +
+removal-only configmap render + a render-assert in the same commit.
+
+- **E1 — Deletion-proof CSI VolumeSnapshots (`zfs.holdCsiSnapshots`).** Places
+  the fixed `truenas` ZFS hold on every CSI VolumeSnapshot at create so foreign
+  actors (a box-wide periodic-task prune, an admin, replication retention) hit
+  EBUSY on destroy. The driver's own destroy paths (DeleteSnapshot,
+  handleSnapshotClones, reapTombstoneSnapshot) release the hold first — gated on
+  driver provenance — so the hold never wedges the driver's lifecycle. Hold
+  failure at create is non-fatal (metered + `SnapshotHoldFailed` event). Metrics:
+  `scale_csi_snapshot_holds_total{operation,status}`.
+- **E2 — Driver-managed periodic snapshots (per-SC `snapshotSchedule`).** The
+  driver owns ONE non-recursive `pool.snapshottask` per scheduled volume dataset
+  with bounded TIME-based retention (`snapshotRetention`, default 30d safety
+  bound; 26.0 has no count cap and `pool.snapshottask.run` is broken, so it is
+  never called). Task-created snapshots carry no CSI props and are recognized as
+  driver-owned (naming-schema prefix on a driver-owned dataset): excluded from
+  the foreign guard, deleted with the volume, and counted in
+  `scale_csi_scheduled_snapshots` (never an orphan/delete candidate). Controller
+  defaults: `zfs.snapshotSchedule` / `zfs.snapshotRetention`. Metrics:
+  `scale_csi_scheduled_snapshot_tasks_ensured_total`,
+  `scale_csi_scheduled_snapshot_task_ensure_failed_total`.
+- **E3 — Lazy clone independence (`zfs.promoteRestoredClones`).** A background
+  reconcile step promotes a clone-restored volume (`pool.dataset.promote`) to
+  drop its origin-snapshot pin once it is the sole dependent of that origin,
+  letting the tombstone reaper reclaim the source snapshot. Promote is atomic,
+  idempotent, and gated on sole-dependency (it re-parents siblings). The tombstone
+  ledger self-heals across the promote ID migration. Metrics:
+  `scale_csi_clones_promoted_total{status}`.
+- **E4 — Quota/usage reporting (`zfs.reportVolumeUsage`).** ControllerGetVolume
+  fetches each volume's quota/usage (one `pool.dataset.query`) and reports a
+  near-quota VolumeCondition (abnormal above 95% of the effective quota) plus
+  per-volume metrics. Metrics: `scale_csi_volume_used_bytes{volume}`,
+  `scale_csi_volume_quota_bytes{volume}`, `scale_csi_volume_near_quota{volume}`,
+  and the `ScaleCSIVolumeNearQuota` alert.
+
 ## v1.4.0 — CHAP, capacity, volume health, clone latency, observability taxonomy
 
 Five sprints of feature and hardening work. No existing config key, volume, or

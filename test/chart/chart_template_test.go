@@ -254,6 +254,32 @@ func TestChartPromoteRestoredClonesPlumbing(t *testing.T) {
 	})
 }
 
+// TestChartReportVolumeUsagePlumbing proves the GF2/E4 zfs.reportVolumeUsage key
+// and its ScaleCSIVolumeNearQuota alert are removal-only rendered: ABSENT from the
+// default configmap and prometheusrule (default false => byte-identical render)
+// and present only when enabled.
+func TestChartReportVolumeUsagePlumbing(t *testing.T) {
+	t.Run("default render omits the key and the alert", func(t *testing.T) {
+		if out := helmTemplate(t, "--show-only", "templates/configmap.yaml"); strings.Contains(out, "reportVolumeUsage:") {
+			t.Errorf("default configmap must not emit zfs.reportVolumeUsage; the feature is opt-in")
+		}
+		if out := helmTemplate(t, "--set", "metrics.prometheusRule.enabled=true"); strings.Contains(out, "ScaleCSIVolumeNearQuota") {
+			t.Errorf("ScaleCSIVolumeNearQuota must stay absent unless zfs.reportVolumeUsage is also true")
+		}
+	})
+
+	t.Run("enabled renders the key and the alert", func(t *testing.T) {
+		if out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.reportVolumeUsage=true"); !strings.Contains(out, "      reportVolumeUsage: true\n") {
+			t.Errorf("--set zfs.reportVolumeUsage=true did not render into the configmap; got:\n%s", out)
+		}
+		out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+			"--set", "metrics.prometheusRule.enabled=true", "--set", "zfs.reportVolumeUsage=true")
+		if !strings.Contains(out, "- alert: ScaleCSIVolumeNearQuota") {
+			t.Errorf("both toggles on did not render ScaleCSIVolumeNearQuota; got:\n%s", out)
+		}
+	})
+}
+
 // TestChartDeprecatedKeysNotRendered proves the retired iscsi.extentAvailThreshold
 // and nvmeof.commandTimeout keys are no longer rendered into the driver configmap.
 // Both were parsed but consumed by nothing (the nvme CLI timeout is

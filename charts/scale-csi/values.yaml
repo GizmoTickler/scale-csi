@@ -303,6 +303,13 @@ zfs:
   # the rendered config carries no promoteRestoredClones key.
   promoteRestoredClones: false
 
+  # Report per-volume quota/usage from ControllerGetVolume (GF2/E4): one extra
+  # pool.dataset.query per ControllerGetVolume feeds the volume_used_bytes /
+  # volume_quota_bytes / volume_near_quota metrics and a near-quota
+  # VolumeCondition (abnormal above 95% of the effective quota). Default false:
+  # no extra call and the rendered config carries no reportVolumeUsage key.
+  reportVolumeUsage: false
+
 # NFS configuration
 nfs:
   # Enable NFS support

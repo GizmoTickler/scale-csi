@@ -206,5 +206,18 @@ spec:
             summary: Scale CSI backend pool is nearly full
             description: Parent dataset usable capacity is above the configured threshold.
         {{- end }}
+        {{- if .Values.zfs.reportVolumeUsage }}
+        - alert: ScaleCSIVolumeNearQuota
+          # GF2/E4: the per-volume near-quota gauge is populated only when
+          # zfs.reportVolumeUsage is set, so the alert renders only then (the
+          # default render carries no such series and stays byte-identical).
+          expr: scale_csi_volume_near_quota == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI volume is near its quota
+            description: A volume has exceeded 95% of its effective ZFS quota for fifteen minutes; writes will fail once the quota is reached.
+        {{- end }}
         {{- end }}
 {{- end }}

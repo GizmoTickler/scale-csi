@@ -167,6 +167,11 @@ func (c *apiCallCountingClient) DatasetPromote(ctx context.Context, name string)
 	return c.MockClient.DatasetPromote(ctx, name)
 }
 
+func (c *apiCallCountingClient) DatasetGetQuotaUsage(ctx context.Context, name string) (*truenas.DatasetQuotaUsage, error) {
+	c.record("DatasetGetQuotaUsage")
+	return c.MockClient.DatasetGetQuotaUsage(ctx, name)
+}
+
 func (c *apiCallCountingClient) GetPoolAvailable(ctx context.Context, poolName string) (int64, error) {
 	c.record("GetPoolAvailable")
 	return c.MockClient.GetPoolAvailable(ctx, poolName)

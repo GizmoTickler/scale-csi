@@ -2048,18 +2048,41 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 		return nil, status.Errorf(codes.Internal, "failed to get volume details: %v", err)
 	}
 
+	// VolumeCondition is derived from the dataset's ALREADY-returned user
+	// properties (no extra API call) via the same helper ListVolumes uses. A
+	// dataset-gone case returns NotFound above, so reaching here means the
+	// backend object exists; abnormal is reserved for a definitive negative
+	// marker (see volumeConditionFromDataset).
+	condition := volumeConditionFromDataset(ds)
+
+	// GF2/E4 quota/usage reporting is strictly opt-in: when enabled, one extra
+	// pool.dataset.query feeds the per-volume usage metrics and upgrades the
+	// condition to abnormal once the volume crosses 95% of its effective quota.
+	// When disabled (the default) no extra call is made and the condition is the
+	// stamp-derived one above, exactly as before.
+	if d.config.ZFS.ReportVolumeUsage {
+		usage, usageErr := d.truenasClient.DatasetGetQuotaUsage(ctx, datasetName)
+		if usageErr != nil {
+			klog.Warningf("ControllerGetVolume: failed to read quota/usage for volume %s: %v", volumeID, usageErr)
+		} else {
+			RecordVolumeUsage(volumeID, usage)
+			if volumeUsageNearQuota(usage) {
+				condition = &csi.VolumeCondition{
+					Abnormal: true,
+					Message: fmt.Sprintf("volume used %d of %d effective quota bytes (>95%%)",
+						usage.Used, effectiveQuotaBytes(usage)),
+				}
+			}
+		}
+	}
+
 	return &csi.ControllerGetVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      volumeID,
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
-		// VolumeCondition is derived from the dataset's ALREADY-returned user
-		// properties (no extra API call) via the same helper ListVolumes uses. A
-		// dataset-gone case returns NotFound above, so reaching here means the
-		// backend object exists; abnormal is reserved for a definitive negative
-		// marker (see volumeConditionFromDataset).
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			VolumeCondition: volumeConditionFromDataset(ds),
+			VolumeCondition: condition,
 		},
 	}, nil
 }

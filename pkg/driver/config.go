@@ -219,6 +219,13 @@ type ZFSConfig struct {
 	// tombstone reaper reclaim the source snapshot and the source volume become
 	// destroyable. Default false: clones keep their origin pin exactly as before.
 	PromoteRestoredClones bool `yaml:"promoteRestoredClones"`
+
+	// ReportVolumeUsage makes ControllerGetVolume fetch each volume's quota/usage
+	// (one pool.dataset.query) and report it: a near-quota VolumeCondition
+	// (abnormal above 95% of the effective quota) plus per-volume usage metrics
+	// (GF2/E4). Default false: ControllerGetVolume makes no extra call and reports
+	// only the stamp-derived condition, exactly as before.
+	ReportVolumeUsage bool `yaml:"reportVolumeUsage"`
 }
 
 // NFSConfig holds NFS share configuration.

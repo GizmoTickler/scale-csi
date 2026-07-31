@@ -506,6 +506,42 @@ func (c *Client) DatasetPromote(ctx context.Context, datasetName string) error {
 	return nil
 }
 
+// DatasetQuotaUsage reports a dataset's space accounting for quota/usage
+// reporting (GF2/E4). Quota and Refquota are 0 when unset (no limit).
+type DatasetQuotaUsage struct {
+	Used      int64
+	Quota     int64
+	Refquota  int64
+	Available int64
+}
+
+// DatasetGetQuotaUsage returns a dataset's used/quota/refquota/available bytes.
+// It reuses the dataset query path (which already projects these properties) so
+// it is one pool.dataset.query, not a separate endpoint (P-usage).
+func (c *Client) DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error) {
+	ds, err := c.DatasetGet(ctx, datasetName)
+	if err != nil {
+		return nil, err
+	}
+	return &DatasetQuotaUsage{
+		Used:      datasetPropertyInt64(ds.Used),
+		Quota:     datasetPropertyInt64(ds.Quota),
+		Refquota:  datasetPropertyInt64(ds.Refquota),
+		Available: datasetPropertyInt64(ds.Available),
+	}, nil
+}
+
+// datasetPropertyInt64 extracts a non-negative int64 from a dataset property's
+// parsed value, returning 0 when absent or out of range (e.g. an unset quota).
+func datasetPropertyInt64(property DatasetProperty) int64 {
+	if value, ok := property.Parsed.(float64); ok {
+		if result, valid := nonNegativeInt64FromFloat(value); valid {
+			return result
+		}
+	}
+	return 0
+}
+
 // snapshotDependentClones returns the datasets cloned from one exact snapshot —
 // the authoritative dependent-clone check on TrueNAS 26.0, where the snapshot
 // query APIs no longer expose the ZFS clones property.
