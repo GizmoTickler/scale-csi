@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
@@ -233,4 +235,228 @@ func TestRedactCHAP(t *testing.T) {
 	assert.Equal(t, "***", redacted["mutualPassword"])
 	assert.Equal(t, "1234", redacted["tag"])
 	assert.Nil(t, redactCHAP(nil))
+}
+
+func TestValidateISCSIChAPSecret(t *testing.T) {
+	cases := []struct {
+		name    string
+		secret  iscsiCHAPSecret
+		wantSub string
+	}{
+		{"missing username", iscsiCHAPSecret{Password: "chapsecret123"}, "username is required"},
+		{"missing password", iscsiCHAPSecret{Username: "chapuser"}, "password is required"},
+		{"short password", iscsiCHAPSecret{Username: "chapuser", Password: "short"}, "12-16 characters"},
+		{"long password", iscsiCHAPSecret{Username: "chapuser", Password: "thispasswordiswaytoolong"}, "12-16 characters"},
+		{"mutual password without username", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", MutualPassword: "peersecret456"}, "mutualPassword requires mutualUsername"},
+		{"mutual username without password", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", MutualUsername: "peeruser"}, "mutualPassword is required"},
+		{"mutual password equals password", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", MutualUsername: "peeruser", MutualPassword: "chapsecret123"}, "must differ"},
+		{"valid one-way", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123"}, ""},
+		{"valid mutual", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", MutualUsername: "peeruser", MutualPassword: "peersecret456"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateISCSIChAPSecret(tc.secret)
+			if tc.wantSub == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+			assert.Contains(t, err.Error(), tc.wantSub)
+		})
+	}
+}
+
+func TestApplyISCSIGroupCHAP(t *testing.T) {
+	t.Run("stamps when active", func(t *testing.T) {
+		group := &truenas.ISCSITargetGroup{Portal: 1, Initiator: 2, AuthMethod: "NONE"}
+		applyISCSIGroupCHAP(group, iscsiCHAPModeCHAP, 42)
+		assert.Equal(t, "CHAP", group.AuthMethod)
+		require.NotNil(t, group.Auth)
+		assert.Equal(t, 42, *group.Auth)
+	})
+
+	t.Run("no-op when auth ref is zero", func(t *testing.T) {
+		group := &truenas.ISCSITargetGroup{Portal: 1, Initiator: 2, AuthMethod: "NONE"}
+		applyISCSIGroupCHAP(group, iscsiCHAPModeCHAP, 0)
+		assert.Equal(t, "NONE", group.AuthMethod)
+		assert.Nil(t, group.Auth)
+	})
+
+	t.Run("no-op when mode is NONE", func(t *testing.T) {
+		group := &truenas.ISCSITargetGroup{Portal: 1, Initiator: 2, AuthMethod: "NONE"}
+		applyISCSIGroupCHAP(group, iscsiCHAPModeNone, 42)
+		assert.Equal(t, "NONE", group.AuthMethod)
+		assert.Nil(t, group.Auth)
+	})
+}
+
+// TestISCSIGroupCHAPFromDatasetProperty guards the fence/rebuild linkage (R1):
+// a dataset that carries PropISCSIAuthID must resolve back to a CHAP group so a
+// fence pass rebuilds the group WITH its auth ref instead of stripping it to
+// authmethod=NONE. A dataset without the property stays NONE.
+func TestISCSIGroupCHAPFromDatasetProperty(t *testing.T) {
+	d := &Driver{config: &Config{}}
+
+	t.Run("property present resolves CHAP", func(t *testing.T) {
+		ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{
+			PropISCSIAuthID: {Value: "42"},
+		}}
+		method, authRef, authTag := d.iscsiGroupCHAP(context.Background(), ds)
+		assert.Equal(t, "CHAP", method)
+		assert.Equal(t, 42, authRef)
+		assert.Equal(t, 0, authTag)
+	})
+
+	t.Run("mutual config resolves CHAP_MUTUAL", func(t *testing.T) {
+		dm := &Driver{config: &Config{ISCSI: ISCSIConfig{CHAP: ISCSICHAPSettings{Mutual: true}}}}
+		ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{
+			PropISCSIAuthID: {Value: "7"},
+		}}
+		method, authRef, _ := dm.iscsiGroupCHAP(context.Background(), ds)
+		assert.Equal(t, "CHAP_MUTUAL", method)
+		assert.Equal(t, 7, authRef)
+	})
+
+	t.Run("absent property stays NONE", func(t *testing.T) {
+		ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{}}
+		method, authRef, authTag := d.iscsiGroupCHAP(context.Background(), ds)
+		assert.Equal(t, "NONE", method)
+		assert.Equal(t, 0, authRef)
+		assert.Equal(t, 0, authTag)
+	})
+
+	t.Run("request-scoped resolution wins", func(t *testing.T) {
+		ctx := withISCSIChAPResolution(context.Background(), &iscsiCHAPResolution{
+			Peer:   &truenas.ISCSIAuth{ID: 99, Tag: 5000, User: "chapuser"},
+			Mutual: false,
+		})
+		method, authRef, authTag := d.iscsiGroupCHAP(ctx, &truenas.Dataset{})
+		assert.Equal(t, "CHAP", method)
+		assert.Equal(t, 99, authRef)
+		assert.Equal(t, 5000, authTag)
+	})
+}
+
+func TestEnsureISCSIAuthPeerReuseAndCollision(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("reuse by tag for same username", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newAPICallCountDriver(t, client, "iscsi")
+		d.config.ISCSI.CHAP.Enabled = true
+		secrets := map[string]string{"username": "chapuser", "password": "chapsecret123", "tag": "5000"}
+
+		first, err := d.EnsureISCSIAuthPeer(ctx, secrets)
+		require.NoError(t, err)
+		require.NotNil(t, first.Peer)
+
+		// Drop the in-driver cache to prove reuse comes from the backend query,
+		// not the cache. Same tag+user adopts the existing peer (no new create).
+		d.iscsiResolvedAuth = nil
+		second, err := d.EnsureISCSIAuthPeer(ctx, secrets)
+		require.NoError(t, err)
+		assert.Equal(t, first.Peer.ID, second.Peer.ID)
+		assert.Len(t, client.ISCSIAuths, 1)
+	})
+
+	t.Run("tag collision with different username is FailedPrecondition", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newAPICallCountDriver(t, client, "iscsi")
+		d.config.ISCSI.CHAP.Enabled = true
+
+		_, err := d.EnsureISCSIAuthPeer(ctx, map[string]string{"username": "chapuser", "password": "chapsecret123", "tag": "6000"})
+		require.NoError(t, err)
+
+		d.iscsiResolvedAuth = nil
+		_, err = d.EnsureISCSIAuthPeer(ctx, map[string]string{"username": "otheruser", "password": "othersecret12", "tag": "6000"})
+		require.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	})
+
+	t.Run("invalid secret fails fast", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newAPICallCountDriver(t, client, "iscsi")
+		d.config.ISCSI.CHAP.Enabled = true
+		_, err := d.EnsureISCSIAuthPeer(ctx, map[string]string{"username": "chapuser", "password": "short"})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Empty(t, client.ISCSIAuths, "no peer may be created for an invalid secret")
+	})
+}
+
+// TestCreateVolumeISCSICHAPStampsGroupsAndProps is the end-to-end controller
+// guard: a CHAP StorageClass provisions a target whose groups carry the CHAP
+// authmethod + auth ref, persists the auth linkage as dataset properties (so
+// fence/rebuild paths retain it), and advertises only a non-secret mode flag in
+// the volume context.
+func TestCreateVolumeISCSICHAPStampsGroupsAndProps(t *testing.T) {
+	cases := []struct {
+		name       string
+		mutual     bool
+		secrets    map[string]string
+		wantMethod string
+	}{
+		{
+			name:       "one-way",
+			secrets:    map[string]string{"username": "chapuser", "password": "chapsecret123"},
+			wantMethod: "CHAP",
+		},
+		{
+			name:       "mutual",
+			mutual:     true,
+			secrets:    map[string]string{"username": "chapuser", "password": "chapsecret123", "mutualUsername": "peeruser", "mutualPassword": "peersecret456"},
+			wantMethod: "CHAP_MUTUAL",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newAPICallCountingClient()
+			d := newAPICallCountDriver(t, client, "iscsi")
+			d.config.ISCSI.CHAP.Enabled = true
+			d.config.ISCSI.CHAP.Mutual = tc.mutual
+
+			volumeName := "chap-" + tc.name
+			req := apiCallCountVolumeRequest(volumeName, "iscsi")
+			req.Parameters[paramISCSIChAPSecret] = "true"
+			req.Secrets = tc.secrets
+			resp, err := d.CreateVolume(context.Background(), req)
+			require.NoError(t, err)
+
+			// Exactly one shared auth peer was created for the credential.
+			require.Len(t, client.ISCSIAuths, 1)
+			var peer *truenas.ISCSIAuth
+			for _, p := range client.ISCSIAuths {
+				peer = p
+			}
+			require.NotNil(t, peer)
+
+			// Every created target group carries the CHAP authmethod + auth ref.
+			ds, err := client.MockClient.DatasetGet(context.Background(), "pool/parent/"+volumeName)
+			require.NoError(t, err)
+			targetID, err := strconv.Atoi(datasetUserProperty(ds, PropISCSITargetID))
+			require.NoError(t, err)
+			target, err := client.MockClient.ISCSITargetGet(context.Background(), targetID)
+			require.NoError(t, err)
+			require.NotEmpty(t, target.Groups)
+			for _, group := range target.Groups {
+				assert.Equal(t, tc.wantMethod, group.AuthMethod)
+				require.NotNil(t, group.Auth, "CHAP group must reference the auth peer")
+				assert.Equal(t, peer.ID, *group.Auth)
+			}
+
+			// The auth linkage is persisted for fence/idempotent rebuilds.
+			assert.Equal(t, strconv.Itoa(peer.ID), datasetUserProperty(ds, PropISCSIAuthID))
+			assert.Equal(t, strconv.Itoa(peer.Tag), datasetUserProperty(ds, PropISCSIAuthTag))
+
+			// The volume context advertises only the mode flag, never a credential.
+			volumeCtx := resp.GetVolume().GetVolumeContext()
+			assert.Equal(t, tc.wantMethod, volumeCtx[volumeContextCHAPKey])
+			for _, value := range volumeCtx {
+				assert.NotEqual(t, "chapsecret123", value, "secret must never reach volumeContext")
+				assert.NotEqual(t, "peersecret456", value, "mutual secret must never reach volumeContext")
+			}
+		})
+	}
 }
