@@ -684,6 +684,19 @@ func apiCallCountVolumeRequest(name, protocol string) *csi.CreateVolumeRequest {
 	}
 }
 
+// apiCallCountCHAPVolumeRequest builds an iSCSI CreateVolume request that opts
+// into CHAP: the StorageClass parameter plus a per-StorageClass secret carrying
+// a valid 12-16 char credential. The secret values are test fixtures only.
+func apiCallCountCHAPVolumeRequest(name string) *csi.CreateVolumeRequest {
+	req := apiCallCountVolumeRequest(name, "iscsi")
+	req.Parameters[paramISCSIChAPSecret] = "true"
+	req.Secrets = map[string]string{
+		"username": "chapuser",
+		"password": "chapsecret123",
+	}
+	return req
+}
+
 func assertAPICallCount(t *testing.T, operation string, client *apiCallCountingClient, want int) {
 	t.Helper()
 	got, methods := client.callSnapshot()
@@ -706,6 +719,11 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 	tests := []struct {
 		name string
 		want int
+		// iscsi selects the iSCSI backend driver config for the case.
+		iscsi bool
+		// chap additionally enables iscsi.chap.enabled on the driver so the
+		// CHAP peer-ensure path runs (the request must also carry a secret).
+		chap bool
 		run  func(*testing.T, *apiCallCountingClient, *Driver)
 	}{
 		// Six calls: existence lookup; DatasetCreate; the createDataset ownership
@@ -733,8 +751,19 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// resource-ID stamp (DatasetSetUserProperties); the debounced ServiceReload;
 		// getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and the final
 		// managed/ownership/provision/name stamp (DatasetSetUserProperties).
-		{name: "CreateVolume fresh iSCSI", want: 14, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		{name: "CreateVolume fresh iSCSI", want: 14, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
+			require.NoError(t, err)
+		}},
+		// Sixteen calls: the 14-call iSCSI baseline PLUS two CHAP peer calls on a
+		// cold controller — ISCSIAuthQueryByTag (tag miss) and ISCSIAuthCreate.
+		// The authmethod+auth linkage is folded into the existing target-group
+		// create and the auth id/tag dataset props fold into the existing
+		// resource-ID stamp, so CHAP adds no other round trip. Steady-state (warm
+		// cache, second volume on the same controller) would be +0; the golden
+		// driver is fresh per case so 16 is the measured cold count.
+		{name: "CreateVolume fresh iSCSI CHAP", want: 16, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("fresh-iscsi-chap"))
 			require.NoError(t, err)
 		}},
 		// A fully provisioned NFS retry re-reads the dataset and verifies that the
@@ -758,11 +787,21 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		}},
 		// iSCSI deletion validates target, extent, and association backreferences
 		// before cleanup, then retains the two dataset dependency guards.
-		{name: "DeleteVolume iSCSI", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		{name: "DeleteVolume iSCSI", want: 10, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-iscsi", "iscsi"))
 			require.NoError(t, err)
 			client.resetCalls()
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi"})
+			require.NoError(t, err)
+		}},
+		// Ten calls: identical to the non-CHAP iSCSI delete. The shared CHAP auth
+		// peer is intentionally NOT deleted per-volume (other volumes of the
+		// StorageClass reference it), so DeleteVolume adds +0 CHAP round trips.
+		{name: "DeleteVolume iSCSI CHAP", want: 10, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("delete-iscsi-chap"))
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi-chap"})
 			require.NoError(t, err)
 		}},
 		// Fresh snapshot creation performs one source lookup, one global-name
@@ -858,10 +897,13 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newAPICallCountingClient()
 			protocol := "nfs"
-			if tc.name == "CreateVolume fresh iSCSI" || tc.name == "DeleteVolume iSCSI" {
+			if tc.iscsi {
 				protocol = "iscsi"
 			}
 			d := newAPICallCountDriver(t, client, protocol)
+			if tc.chap {
+				d.config.ISCSI.CHAP.Enabled = true
+			}
 			tc.run(t, client, d)
 			assertAPICallCount(t, tc.name, client, tc.want)
 		})
