@@ -193,6 +193,17 @@
           "description": "Per-class read-only export override.",
           "type": "boolean"
         },
+        "zfsPerformanceClass": {
+          "description": "Curated ZFS property preset applied to newly provisioned volumes. volblocksize/logbias/primarycache/secondarycache are CREATE-ONLY; changing the class on an existing PVC is rejected.",
+          "type": "string",
+          "enum": [
+            "database",
+            "media",
+            "vm",
+            "backup",
+            "general"
+          ]
+        },
         "nfsACLTemplate": {
           "description": "Builtin TrueNAS NFS4 ACL template applied to newly provisioned volumes. Mutually exclusive with nfsACL. See the fsGroupPolicy interaction in docs/reference/storageclass.md.",
           "type": "string",

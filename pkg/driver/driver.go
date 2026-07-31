@@ -164,6 +164,15 @@ type Driver struct {
 	nfsServiceMu  sync.Mutex
 	nfsServiceCfg *truenas.NFSServiceConfig
 
+	// Cached ZFS property choice lists and pool special-vdev presence, read at
+	// most once per controller lifetime and ONLY when a StorageClass requests a
+	// curated zfsPerformanceClass. Both are static backend facts.
+	zfsChoicesMu       sync.Mutex
+	zfsChoices         *truenas.ZFSPropertyChoices
+	zfsChoicesErr      error
+	specialVdevChecked bool
+	specialVdevPresent bool
+
 	// Cached auto-resolved iSCSI target group (portal/initiator) used when
 	// iscsi.targetGroups is not configured; see resolveISCSITargetGroup.
 	iscsiGroupMu       sync.Mutex

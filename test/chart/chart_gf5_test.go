@@ -201,3 +201,70 @@ func TestChartGF5NFSACLStorageClassParameters(t *testing.T) {
 		}
 	})
 }
+
+// TestChartGF5ZFSPerformanceClass proves the curated-class parameter is emitted
+// only when a class sets it, that the schema pins the five documented classes,
+// and that the bundled opt-in example stays disabled by default.
+func TestChartGF5ZFSPerformanceClass(t *testing.T) {
+	t.Run("default render carries no performance class", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml")
+		if strings.Contains(out, "zfsPerformanceClass") {
+			t.Errorf("default StorageClass render must not emit zfsPerformanceClass; got:\n%s", out)
+		}
+		if strings.Contains(out, "scale-nfs-media") {
+			t.Errorf("the opt-in curated-class example must stay disabled by default; got:\n%s", out)
+		}
+	})
+
+	t.Run("the bundled example renders when enabled", func(t *testing.T) {
+		// Mirrors the values.yaml `scale-nfs-media` entry verbatim; enabling an
+		// array element in place requires re-supplying the entry.
+		valuesPath := writeValues(t, "gf5-perf-example.yaml", `storageClasses:
+  - name: scale-nfs-media
+    enabled: true
+    protocol: nfs
+    zfsPerformanceClass: media
+    mountOptions:
+      - nfsvers=4.1
+      - nconnect=8
+      - hard
+      - noatime
+      - rsize=1048576
+      - wsize=1048576
+`)
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		if !strings.Contains(out, "zfsPerformanceClass: media") {
+			t.Errorf("enabling the curated-class example did not emit the parameter; got:\n%s", out)
+		}
+		for _, want := range []string{"- nfsvers=4.1", "- nconnect=8", "- rsize=1048576"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("curated-class example is missing the matching mount profile option %q; got:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("every documented class is accepted", func(t *testing.T) {
+		for _, class := range []string{"database", "media", "vm", "backup", "general"} {
+			valuesPath := writeValues(t, "gf5-perf-"+class+".yaml", `storageClasses:
+  - name: scale-perf
+    protocol: nfs
+    zfsPerformanceClass: `+class+`
+`)
+			out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+			if !strings.Contains(out, "zfsPerformanceClass: "+class) {
+				t.Errorf("class %q did not render; got:\n%s", class, out)
+			}
+		}
+	})
+
+	t.Run("schema rejects an unknown class", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf5-perf-bad.yaml", `storageClasses:
+  - name: scale-perf
+    protocol: nfs
+    zfsPerformanceClass: ludicrous
+`)
+		if out := helmTemplateExpectError(t, "-f", valuesPath); !strings.Contains(out, "zfsPerformanceClass") {
+			t.Errorf("schema did not reject an unknown performance class; got:\n%s", out)
+		}
+	})
+}

@@ -282,6 +282,21 @@ func (c *apiCallCountingClient) NFSServiceUpdate(ctx context.Context, params map
 	return c.MockClient.NFSServiceUpdate(ctx, params)
 }
 
+func (c *apiCallCountingClient) ZFSPropertyChoices(ctx context.Context) (*truenas.ZFSPropertyChoices, error) {
+	c.record("ZFSPropertyChoices")
+	return c.MockClient.ZFSPropertyChoices(ctx)
+}
+
+func (c *apiCallCountingClient) RecommendedZvolBlocksize(ctx context.Context, pool string) (string, error) {
+	c.record("RecommendedZvolBlocksize")
+	return c.MockClient.RecommendedZvolBlocksize(ctx, pool)
+}
+
+func (c *apiCallCountingClient) PoolHasSpecialVdev(ctx context.Context, pool string) (bool, error) {
+	c.record("PoolHasSpecialVdev")
+	return c.MockClient.PoolHasSpecialVdev(ctx, pool)
+}
+
 func (c *apiCallCountingClient) FilesystemGetACL(ctx context.Context, path string) (*truenas.FilesystemACL, error) {
 	c.record("FilesystemGetACL")
 	return c.MockClient.FilesystemGetACL(ctx, path)

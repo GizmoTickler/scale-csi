@@ -25,16 +25,23 @@ import (
 
 // ZFS property names for tracking CSI resources
 const (
-	PropManagedResource           = "truenas-csi:managed_resource"
-	PropDriverInstanceID          = "truenas-csi:driver_instance_id"
-	PropProvisionSuccess          = "truenas-csi:provision_success"
-	PropCSIVolumeName             = "truenas-csi:csi_volume_name"
-	PropShareVolumeContext        = "truenas-csi:csi_share_volume_context"
-	PropVolumeContentSourceType   = "truenas-csi:csi_volume_content_source_type"
-	PropVolumeContentSourceID     = "truenas-csi:csi_volume_content_source_id"
-	PropVolumeOriginSnapshot      = "truenas-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
-	PropInternalResource          = "truenas-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
-	PropRequestedSizeBytes        = "truenas-csi:requested_size_bytes"       // requested capacity for quota-less filesystem volumes
+	PropManagedResource         = "truenas-csi:managed_resource"
+	PropDriverInstanceID        = "truenas-csi:driver_instance_id"
+	PropProvisionSuccess        = "truenas-csi:provision_success"
+	PropCSIVolumeName           = "truenas-csi:csi_volume_name"
+	PropShareVolumeContext      = "truenas-csi:csi_share_volume_context"
+	PropVolumeContentSourceType = "truenas-csi:csi_volume_content_source_type"
+	PropVolumeContentSourceID   = "truenas-csi:csi_volume_content_source_id"
+	PropVolumeOriginSnapshot    = "truenas-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
+	PropInternalResource        = "truenas-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
+	PropRequestedSizeBytes      = "truenas-csi:requested_size_bytes"       // requested capacity for quota-less filesystem volumes
+	// PropZFSPerformanceClass records the curated ZFS performance class a volume
+	// was CREATED with. It is the anchor for the create-only property guard: a
+	// later StorageClass edit is compared against this stamp, never re-derived
+	// from the live dataset (whose immutable geometry could not be changed anyway).
+	// Only stamped when a class was requested, so it never appears on volumes
+	// that do not use the feature.
+	PropZFSPerformanceClass       = "truenas-csi:zfs_performance_class"
 	PropCSISnapshotName           = "truenas-csi:csi_snapshot_name"
 	PropCSISnapshotSourceVolumeID = "truenas-csi:csi_snapshot_source_volume_id"
 	snapshotTombstoneMarker       = "-csi-deleted-"
@@ -419,6 +426,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		ctx = withNFSACLOptions(ctx, aclOptions)
 	}
 
+	// Curated ZFS performance class. Validated here (pure, no backend I/O) so a
+	// typo is InvalidArgument before anything is created; the preset itself is
+	// resolved and validated against the live choice lists inside createDataset.
+	performanceClass, performanceErr := zfsPerformanceClassFromParams(req.GetParameters())
+	if performanceErr != nil {
+		return nil, performanceErr
+	}
+	ctx = withZFSPerformanceClass(ctx, performanceClass)
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {
@@ -494,6 +510,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
 		volumeProperties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
+	}
+	// Record the curated class this volume was created with so a later
+	// StorageClass edit can be checked against the create-only property rules
+	// instead of silently pretending the volume was retuned. Folded into the
+	// existing property update, so it costs no extra round trip; absent unless
+	// the class was requested.
+	if performanceClass != "" {
+		volumeProperties[PropZFSPerformanceClass] = performanceClass
 	}
 	// Fold the durable CHAP auth linkage into the FATAL managed-property update
 	// below so it is stamped-or-rolled-back with the rest of provisioning (X1): a
@@ -799,6 +823,21 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// IMMUTABILITY GUARD (risk R1). volblocksize is immutable in ZFS itself, and
+	// logbias/primarycache/secondarycache are rejected by pool.dataset.update, so
+	// a StorageClass that now names a different curated class CANNOT be satisfied
+	// in place. Refuse loudly rather than let an operator believe an existing
+	// volume was retuned.
+	if requestedClass := zfsPerformanceClassFromContext(ctx); requestedClass != "" {
+		storedClass := datasetUserProperty(existingDS, PropZFSPerformanceClass)
+		if storedClass == "-" {
+			storedClass = ""
+		}
+		if guardErr := d.guardPerformanceClassChange(ctx, volumeID, storedClass, requestedClass, existingDS.Type); guardErr != nil {
+			return nil, guardErr
 		}
 	}
 
@@ -2183,6 +2222,16 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 			params.Refreservation = capacityBytes
 		}
 	}
+	// Curated ZFS performance class, layered UNDER zfs.datasetProperties so an
+	// explicit operator key always wins. Absent parameter = zero properties and
+	// the historical create payload.
+	if class := zfsPerformanceClassFromContext(ctx); class != "" {
+		curated, resolveErr := d.resolvePerformanceClassProperties(ctx, class, params.Type)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		applyPerformanceClassProperties(params, curated)
+	}
 	d.applyDatasetProperties(params)
 	// An NFSv4 dacl can only be applied to an acltype=NFSV4 dataset. Stamp it
 	// (plus aclmode=PASSTHROUGH) ONLY when this volume actually requested an ACL;
@@ -2394,10 +2443,21 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 			params.Atime = strings.ToUpper(value)
 		case "recordsize":
 			params.Recordsize = strings.ToUpper(value)
+		case "checksum":
+			params.Checksum = strings.ToUpper(value)
 		case "logbias":
 			params.Logbias = strings.ToUpper(value)
 		case "primarycache":
 			params.Primarycache = strings.ToUpper(value)
+		case "secondarycache":
+			params.Secondarycache = strings.ToUpper(value)
+		case "snapdir":
+			params.Snapdir = strings.ToUpper(value)
+		case "special_small_block_size":
+			// The correct key is special_small_block_size; pool.dataset.* rejects
+			// the commonly mis-typed special_small_blocks. Previously this key fell
+			// through to the unknown-key warning and was silently dropped.
+			params.SpecialSmallBlockSize = strings.ToUpper(value)
 		case "dedup":
 			params.Deduplication = strings.ToUpper(value)
 		case "readonly":

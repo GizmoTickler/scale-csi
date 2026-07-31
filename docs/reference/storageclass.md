@@ -22,6 +22,7 @@ All protocols use the unified provisioner `csi.scale.io`.
 | `nfsAllowedNetworks` / `nfsAllowedHosts` | Comma lists overriding the static export allow-lists | No; defaults to `nfs.shareAllowed*`. Ignored in strict fencing mode, which owns these lists |
 | `nfsACLTemplate` | `NFS4_OPEN`, `NFS4_RESTRICTED`, `NFS4_HOME`, `NFS4_DOMAIN_HOME`, `NFS4_ADMIN` — a builtin NFSv4 ACL applied at create | No; mutually exclusive with `nfsACL` |
 | `nfsACL` | Explicit NFSv4 dacl as a JSON array | No; mutually exclusive with `nfsACLTemplate` |
+| `zfsPerformanceClass` | `database`, `media`, `vm`, `backup`, `general` — a curated ZFS property preset | No; unset inherits the parent dataset's properties |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -44,11 +45,63 @@ config default (chart value `zfs.detachedVolumesFromSnapshots`, default `false`
 = clone).
 
 ZFS properties, TrueNAS endpoints, and protocol service settings belong in the
-driver configuration/Helm values. The driver ignores ad-hoc StorageClass
-parameters such as `dataset_recordsize`, `dataset_compression`,
-`zvol_volblocksize`, `zvol_compression`, `mountOptions`, and `fsType`.
-`mountOptions` is a top-level StorageClass list, and the standardized filesystem
-key is `csi.storage.k8s.io/fstype`.
+driver configuration/Helm values, or in the curated `zfsPerformanceClass` below.
+The driver ignores ad-hoc StorageClass parameters such as `dataset_recordsize`,
+`dataset_compression`, `zvol_volblocksize`, `zvol_compression`, `mountOptions`,
+and `fsType`. `mountOptions` is a top-level StorageClass list, and the
+standardized filesystem key is `csi.storage.k8s.io/fstype`.
+
+## ZFS performance classes
+
+`zfsPerformanceClass` applies a vetted ZFS property preset to newly provisioned
+volumes. Every value is validated against the backend's own
+`recordsize`/`compression`/`checksum` choice lists at `CreateVolume`, so a
+mismatch is an `InvalidArgument` rather than an opaque `pool.dataset.create`
+failure.
+
+| Class | `recordsize` (fs) | `volblocksize` (zvol) | `sync` | `logbias` | `compression` | `primarycache` | `special_small_block_size` | `atime` |
+|---|---|---|---|---|---|---|---|---|
+| `database` | 16K | 16K | standard | latency | LZ4 | all | 16K | off |
+| `media` | 1M | 64K | standard | throughput | ZSTD | all | — | off |
+| `vm` | 64K | 16K | standard | latency | LZ4 | all | — | off |
+| `backup` | 1M | 128K | standard | throughput | ZSTD | metadata | — | off |
+| `general` | 128K | 16K | standard | latency | LZ4 | all | — | off |
+
+Filesystem-only keys (`recordsize`, `atime`) are dropped for zvols and the
+volume-only key (`volblocksize`) is dropped for filesystems, exactly as
+`zfs.datasetProperties` already behaves.
+
+The preset is layered **under** `zfs.datasetProperties`: an explicit operator
+key always wins. The one exception matches pre-existing behavior — zvol
+geometry has a single owner, so a `datasetProperties` `volblocksize` is still
+warned-and-skipped when the class (or `zfs.zvolBlocksize`) already set it.
+
+`special_small_block_size` requires the pool to have a `special`
+allocation-class vdev. When there is none, the driver drops the property with a
+warning rather than failing provisioning. Note the correct key is
+`special_small_block_size`; `special_small_blocks` is rejected by the API.
+
+### ⚠ Create-only vs live-tunable properties
+
+| Create-only (**immutable**) | Live-tunable |
+|---|---|
+| `volblocksize` — zvol geometry, immutable in ZFS itself | `recordsize`, `sync`, `compression`, `checksum` |
+| `logbias`, `primarycache`, `secondarycache` — rejected by `pool.dataset.update` | `atime`, `special_small_block_size`, `copies`, `readonly` |
+
+A volume records the class it was **created** with. If a bound PVC's
+StorageClass later names a different class:
+
+- when the difference touches any create-only property, `CreateVolume` returns
+  `FailedPrecondition` naming the offending properties. The request is
+  physically impossible to satisfy in place; provision a new volume with the
+  desired class and migrate the data;
+- when only live-tunable properties differ, the request succeeds and the driver
+  logs that existing datasets are **not** retuned. Even if they were,
+  `recordsize`/`compression`/`checksum` apply only to NEW writes — blocks
+  already on disk keep the geometry they were written with.
+
+A volume provisioned before this feature existed carries no class stamp; it is
+never wedged, only warned about.
 
 ## NFS
 

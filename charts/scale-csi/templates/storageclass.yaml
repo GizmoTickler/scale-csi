@@ -59,6 +59,13 @@ parameters:
   {{- if $storageClass.snapshotRestoreMode }}
   {{- $_ := set $parameters "snapshotRestoreMode" $storageClass.snapshotRestoreMode -}}
   {{- end }}
+  {{- /* Curated ZFS performance class. Emitted only when set; unset classes
+       inherit the parent dataset's properties plus zfs.datasetProperties,
+       exactly as before. volblocksize/logbias/primarycache/secondarycache are
+       CREATE-ONLY: a class change on an existing PVC is rejected, not applied. */}}
+  {{- if $storageClass.zfsPerformanceClass }}
+  {{- $_ := set $parameters "zfsPerformanceClass" $storageClass.zfsPerformanceClass -}}
+  {{- end }}
   {{- /* GF5 NFS export overrides. Each is emitted ONLY when the class sets it,
        so an untouched class renders the exact parameter map it did before and
        the driver keeps its historical create payload. */}}

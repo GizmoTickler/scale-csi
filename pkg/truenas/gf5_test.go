@@ -241,3 +241,78 @@ func TestFilesystemGetACL(t *testing.T) {
 	assert.Equal(t, 3000, *acl.ACL[1].ID)
 	assert.True(t, acl.NFS41Flags["protected"])
 }
+
+func TestZFSPropertyChoices(t *testing.T) {
+	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+		// Array shape.
+		"pool.dataset.recordsize_choices": static([]interface{}{"4K", "128K", "1M"}),
+		// Object shape (keys are the accepted values) — TrueNAS uses both.
+		"pool.dataset.compression_choices": static(map[string]interface{}{"LZ4": "lz4", "ZSTD": "zstd"}),
+		"pool.dataset.checksum_choices":    static([]interface{}{"BLAKE3", "SHA256", ""}),
+	})
+
+	choices, err := client.ZFSPropertyChoices(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"4K", "128K", "1M"}, choices.Recordsize)
+	assert.Len(t, choices.Compression, 2)
+	assert.Equal(t, []string{"BLAKE3", "SHA256"}, choices.Checksum, "empty entries are dropped")
+
+	allowed, known := choices.AllowsRecordsize("1m")
+	assert.True(t, allowed)
+	assert.True(t, known)
+	allowed, known = choices.AllowsRecordsize("64K")
+	assert.False(t, allowed)
+	assert.True(t, known)
+
+	// An unreported list must never be read as "unsupported".
+	empty := &ZFSPropertyChoices{}
+	allowed, known = empty.AllowsChecksum("ANYTHING")
+	assert.True(t, allowed)
+	assert.False(t, known)
+}
+
+func TestRecommendedZvolBlocksize(t *testing.T) {
+	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+		"pool.dataset.recommended_zvol_blocksize": static("16K"),
+	})
+	size, err := client.RecommendedZvolBlocksize(context.Background(), "flashstor")
+	require.NoError(t, err)
+	assert.Equal(t, "16K", size)
+}
+
+func TestPoolHasSpecialVdev(t *testing.T) {
+	t.Run("special vdev present", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"pool.query": static([]interface{}{map[string]interface{}{
+				"name": "flashstor",
+				"topology": map[string]interface{}{
+					"data":    []interface{}{map[string]interface{}{"type": "RAIDZ1"}},
+					"special": []interface{}{map[string]interface{}{"type": "MIRROR"}},
+				},
+			}}),
+		})
+		present, err := client.PoolHasSpecialVdev(context.Background(), "flashstor")
+		require.NoError(t, err)
+		assert.True(t, present)
+	})
+
+	t.Run("no special vdev", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"pool.query": static([]interface{}{map[string]interface{}{
+				"name":     "tank",
+				"topology": map[string]interface{}{"data": []interface{}{}, "special": []interface{}{}},
+			}}),
+		})
+		present, err := client.PoolHasSpecialVdev(context.Background(), "tank")
+		require.NoError(t, err)
+		assert.False(t, present)
+	})
+
+	t.Run("missing pool is an error", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"pool.query": static([]interface{}{}),
+		})
+		_, err := client.PoolHasSpecialVdev(context.Background(), "nope")
+		require.Error(t, err)
+	})
+}

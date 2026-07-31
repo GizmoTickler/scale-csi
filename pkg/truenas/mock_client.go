@@ -84,6 +84,51 @@ type MockClient struct {
 	SetACLCalls    []SetACLOptions
 	ACLTemplates   map[string][]ACLEntry
 	InjectACLError error
+
+	// ZFS choice / topology surfaces for the curated performance classes.
+	ZFSChoicesValue    *ZFSPropertyChoices
+	ZFSChoicesCalls    int
+	InjectChoicesError error
+	SpecialVdevPresent bool
+	SpecialVdevCalls   int
+	InjectPoolError    error
+}
+
+func (m *MockClient) ZFSPropertyChoices(ctx context.Context) (*ZFSPropertyChoices, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ZFSChoicesCalls++
+	if m.InjectChoicesError != nil {
+		return nil, m.InjectChoicesError
+	}
+	if m.ZFSChoicesValue != nil {
+		return m.ZFSChoicesValue, nil
+	}
+	// The live nas01 lists, trimmed to what the curated classes use.
+	return &ZFSPropertyChoices{
+		Recordsize:  []string{"512", "512B", "1K", "2K", "4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", "1M", "2M", "4M", "8M", "16M"},
+		Compression: []string{"ON", "OFF", "LZ4", "GZIP", "ZSTD", "ZLE", "LZJB"},
+		Checksum:    []string{"ON", "FLETCHER2", "FLETCHER4", "SHA256", "SHA512", "SKEIN", "EDONR", "BLAKE3"},
+	}, nil
+}
+
+func (m *MockClient) RecommendedZvolBlocksize(ctx context.Context, pool string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectPoolError != nil {
+		return "", m.InjectPoolError
+	}
+	return "16K", nil
+}
+
+func (m *MockClient) PoolHasSpecialVdev(ctx context.Context, pool string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SpecialVdevCalls++
+	if m.InjectPoolError != nil {
+		return false, m.InjectPoolError
+	}
+	return m.SpecialVdevPresent, nil
 }
 
 // builtinACLTemplates mirrors the NFS4 templates TrueNAS ships. Only the shape

@@ -68,6 +68,11 @@ type ClientInterface interface {
 	NFSServiceConfig(ctx context.Context) (*NFSServiceConfig, error)
 	NFSServiceUpdate(ctx context.Context, params map[string]interface{}) (*NFSServiceConfig, error)
 
+	// ZFS property choice / topology introspection (curated performance classes).
+	ZFSPropertyChoices(ctx context.Context) (*ZFSPropertyChoices, error)
+	RecommendedZvolBlocksize(ctx context.Context, pool string) (string, error)
+	PoolHasSpecialVdev(ctx context.Context, pool string) (bool, error)
+
 	// Filesystem ACL methods (NFSv4 ACLs). FilesystemSetACL is a @job.
 	FilesystemGetACL(ctx context.Context, path string) (*FilesystemACL, error)
 	FilesystemSetACL(ctx context.Context, opts *SetACLOptions) error

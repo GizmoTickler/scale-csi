@@ -452,6 +452,37 @@ storageClasses:
     volumeBindingMode: Immediate
     mountOptions: []
     extraParameters: {}
+  # Opt-in example: a curated ZFS performance class. `zfsPerformanceClass`
+  # selects a vetted property preset (database | media | vm | backup | general)
+  # layered UNDER zfs.datasetProperties, so an explicit operator key still wins.
+  #
+  # IMMUTABILITY: volblocksize, logbias, primarycache and secondarycache are
+  # fixed when the dataset is CREATED (volblocksize is immutable in ZFS itself;
+  # the other three are rejected by pool.dataset.update). Changing a bound PVC's
+  # class is REJECTED with FailedPrecondition rather than silently ignored —
+  # provision a new volume with the desired class and migrate the data.
+  # recordsize/sync/compression/checksum/atime/special_small_block_size are
+  # live-tunable, but the driver still does not retune existing datasets, and
+  # recordsize-style changes would only affect NEW writes anyway.
+  #
+  # Disabled by default; enable it (and pair it with a matching mountOptions
+  # profile) to use it. See docs/reference/storageclass.md for the full table.
+  - name: scale-nfs-media
+    enabled: false
+    protocol: nfs
+    zfsPerformanceClass: media
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions:
+      - nfsvers=4.1
+      - nconnect=8
+      - hard
+      - noatime
+      - rsize=1048576
+      - wsize=1048576
+    extraParameters: {}
   # Opt-in example: an iSCSI class with CHAP authentication. Disabled by
   # default. Enable it (and iscsi.chap.enabled above) to create it. The CHAP
   # credentials live in a Kubernetes Secret named chapSecretName (created by
