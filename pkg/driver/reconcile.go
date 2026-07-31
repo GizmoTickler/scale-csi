@@ -136,6 +136,27 @@ func (r *ReconcileReport) CapSkippedDeletes() int {
 	return count
 }
 
+// emitReconcileGuardEvents emits at most one aggregated Warning Event per pass
+// for the conditions that need operator attention (E3/O13): manual-recovery
+// tombstones the guarded reaper REFUSES (they never drain on their own), and
+// guarded deletes refused for a reason other than the per-run deletion cap. Both
+// are cluster-scoped, so they are recorded against the controller's own Node ref
+// rather than a per-object ref (no live PV handle is available here).
+func (d *Driver) emitReconcileGuardEvents(report *ReconcileReport) {
+	if d.eventRecorder == nil || report == nil {
+		return
+	}
+	ref := NodeRef(getHostname())
+	if report.ManualRecoveryTombstoneCount > 0 {
+		d.recordWarningEvent(ref, EventReasonReaperRefused,
+			fmt.Sprintf("guarded reaper refuses %d deferred-delete tombstone(s) with unproven creation-time identity; manual recovery required", report.ManualRecoveryTombstoneCount))
+	}
+	if guardRefusals := len(report.SkippedDeletes) - report.CapSkippedDeletes(); guardRefusals > 0 {
+		d.recordWarningEvent(ref, EventReasonReconcileGuardRefusal,
+			fmt.Sprintf("guarded reconcile skipped %d deletion(s) after a safety revalidation refusal (not the per-run deletion cap)", guardRefusals))
+	}
+}
+
 // ReconcileOrphans detects managed TrueNAS resources that no longer have a
 // matching Kubernetes object. Backend deletion, when explicitly enabled, is
 // routed exclusively through the existing guarded CSI delete methods.
@@ -173,6 +194,10 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		// Publish even a partial pass so a single malformed object cannot freeze
 		// the last visible inventory indefinitely.
 		SetOrphanReconcileMetrics(report)
+		// Emit at most one aggregated Warning Event per pass for the operator-
+		// attention conditions (E3/O13). The defer runs once per pass, which is the
+		// rate limit (the reconcile loop is ~hourly).
+		d.emitReconcileGuardEvents(&report)
 		if retErr == nil {
 			RecordReconcileSuccess(time.Now())
 		}

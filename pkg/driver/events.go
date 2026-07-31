@@ -41,6 +41,19 @@ const (
 	EventReasonFencingTakeover      = "FencingTakeover"
 	EventReasonISCSICHAPRotated     = "ISCSICHAPRotated"
 	EventReasonRemnantOrphanReaped  = "RemnantOrphanReaped"
+	// EventReasonReaperRefused is emitted once per reconcile pass when the guarded
+	// reaper refuses one or more manual-recovery tombstones (unproven creation-time
+	// identity). These never drain automatically; each needs operator action (E3/O13).
+	EventReasonReaperRefused = "ReaperRefused"
+	// EventReasonReconcileGuardRefusal is emitted once per reconcile pass when guarded
+	// deletes are refused for a reason other than the per-run deletion cap (E3/O13).
+	EventReasonReconcileGuardRefusal = "ReconcileGuardRefusal"
+	// EventReasonFencingProvenanceOverflow is emitted when a publish is refused because
+	// additive fencing provenance exceeded the per-node cap (ResourceExhausted) (E3/O14).
+	EventReasonFencingProvenanceOverflow = "FencingProvenanceOverflow"
+	// EventReasonISCSICHAPFailed is emitted when CHAP configuration fails in the
+	// NodeStage path. The message never includes the username/password (E3/O15).
+	EventReasonISCSICHAPFailed = "ISCSICHAPFailed"
 )
 
 const (

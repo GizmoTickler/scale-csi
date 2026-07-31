@@ -934,6 +934,10 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 			// The provenance-overflow refusal is a deliberate, actionable status;
 			// preserve its code instead of masking it as Internal.
 			if status.Code(err) == codes.ResourceExhausted {
+				// Surface the publish-blocking refusal on the PV so an operator sees
+				// it without scraping the controller log (E3/O14).
+				d.recordWarningEvent(volumeEventRef(path.Base(datasetName)), EventReasonFencingProvenanceOverflow,
+					fmt.Sprintf("publish refused: additive fencing grant provenance exceeded the %d-entry cap; investigate node identity churn or clean stale backend hosts", additiveGrantHardCap))
 				return err
 			}
 			return status.Errorf(codes.Internal, "failed to classify additive grant ownership: %v", err)

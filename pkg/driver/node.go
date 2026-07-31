@@ -1614,6 +1614,14 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext, secrets ma
 			d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSILoginFailed, operationErr.Error())
 			return operationErr
 		}
+		if errors.Is(err, util.ErrISCSICHAPConfig) {
+			// CHAP credentials could not be applied to the node record before login.
+			// The wrapped error is already redacted (parameter name + exit class only,
+			// never the secret value), so it is safe to surface on the PVC/PV (E3/O15).
+			operationErr := status.Errorf(codes.Internal, "failed to configure iSCSI CHAP for %s", iqn)
+			d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSICHAPFailed, "CHAP configuration failed: "+err.Error())
+			return operationErr
+		}
 		operationErr := status.Errorf(codes.Internal, "failed to connect iSCSI: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSILoginFailed, operationErr.Error())
 		return operationErr

@@ -133,6 +133,13 @@ type ISCSICHAPCredentials struct {
 // discovery retry loop, because a wrong secret is not a missing target.
 var ErrISCSIAuthFailure = errors.New("iSCSI CHAP authentication failed")
 
+// ErrISCSICHAPConfig marks a failure APPLYING CHAP credentials to the node record
+// (node.session.auth.*), as distinct from ErrISCSIAuthFailure which is a login
+// rejection. The wrapped error carries only the parameter NAME and an exit-class
+// summary — never the credential value (ConfigureISCSICHAPWithContext redacts it)
+// — so the node can safely surface it on a PVC/PV Event (E3/O15).
+var ErrISCSICHAPConfig = errors.New("iSCSI CHAP configuration failed")
+
 // ISCSIConnect connects to an iSCSI target and returns the device path.
 func ISCSIConnect(portal, iqn string, lun int) (string, error) {
 	return ISCSIConnectWithOptions(context.Background(), portal, iqn, lun, nil)
@@ -210,7 +217,10 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 	// (-o update); skipped on the healthy-session reuse branch above.
 	if opts != nil && opts.CHAP != nil {
 		if chapErr := ConfigureISCSICHAPWithContext(ctx, portal, iqn, opts.CHAP); chapErr != nil {
-			return "", fmt.Errorf("failed to configure iSCSI CHAP for %s: %w", iqn, chapErr)
+			// chapErr is already redacted (parameter name + exit class, never the
+			// value); wrap it in a sentinel so the node can emit a distinct
+			// ISCSICHAPFailed Event without leaking the credential (E3/O15).
+			return "", fmt.Errorf("%w for %s: %v", ErrISCSICHAPConfig, iqn, chapErr)
 		}
 	}
 

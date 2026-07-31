@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/GizmoTickler/scale-csi/pkg/util"
@@ -148,6 +150,65 @@ func TestNodeStageVolumeISCSIAuthFailureReturnsUnauthenticated(t *testing.T) {
 	require.NotNil(t, capturedOpts.CHAP, "CHAP credentials must be threaded into connect options")
 	assert.Equal(t, "chapuser", capturedOpts.CHAP.Username)
 	assert.Equal(t, secretPassword, capturedOpts.CHAP.Password)
+}
+
+// TestNodeStageVolumeISCSICHAPConfigFailureEmitsEvent guards O15: when CHAP
+// credentials cannot be applied to the node record (util.ErrISCSICHAPConfig), the
+// node emits an ISCSICHAPFailed Warning Event whose message — like the returned
+// status — NEVER contains the secret value.
+func TestNodeStageVolumeISCSICHAPConfigFailureEmitsEvent(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt", "iscsiadm")
+	originalConnect := iscsiConnectWithSessions
+	t.Cleanup(func() { iscsiConnectWithSessions = originalConnect })
+
+	// 12-16 chars, no '#', no surrounding whitespace (TrueNAS auth.py rules).
+	const secretPassword = "DONOTLEAKpw123"
+	// Simulate the util connect path: a redacted CHAP-config failure carrying only
+	// the parameter name and an exit-class summary — never the credential value.
+	iscsiConnectWithSessions = func(_ context.Context, _, _ string, _ int, _ *util.ISCSIConnectOptions, _ []util.ISCSISessionInfo) (string, error) {
+		return "", fmt.Errorf("%w for iqn.test:chap-config: failed to set node param node.session.auth.password (exit status 1)", util.ErrISCSICHAPConfig)
+	}
+
+	d := newTestNodeDriver(ShareTypeISCSI)
+	fakeRecorder := record.NewFakeRecorder(8)
+	d.eventRecorder = &EventRecorder{recorder: fakeRecorder, enabled: true}
+
+	_, err := d.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "chap-config",
+		StagingTargetPath: t.TempDir(),
+		VolumeCapability:  testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		Secrets: map[string]string{
+			"username": "chapuser",
+			"password": secretPassword,
+		},
+		VolumeContext: map[string]string{
+			"node_attach_driver": "iscsi",
+			"portal":             "192.0.2.40:3260",
+			"iqn":                "iqn.test:chap-config",
+			"lun":                "0",
+			"chap":               "CHAP",
+		},
+	})
+	require.Error(t, err)
+	st, _ := status.FromError(err)
+	assert.Equal(t, codes.Internal, st.Code())
+	assert.NotContains(t, st.Message(), secretPassword, "secret must never appear in the status message")
+
+	sawCHAPFailed := false
+drain:
+	for {
+		select {
+		case event := <-fakeRecorder.Events:
+			assert.NotContains(t, event, secretPassword, "secret must never appear in any event")
+			assert.NotContains(t, event, "chapuser", "username must never appear in any event")
+			if strings.Contains(event, EventReasonISCSICHAPFailed) {
+				sawCHAPFailed = true
+			}
+		default:
+			break drain
+		}
+	}
+	assert.True(t, sawCHAPFailed, "CHAP config failure must emit an ISCSICHAPFailed event")
 }
 
 func TestNodeStageVolumeISCSIBuildsMutualCHAPCreds(t *testing.T) {

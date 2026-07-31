@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -899,6 +901,57 @@ func TestReconcileNeverReapsForeignTombstoneShapedSnapshots(t *testing.T) {
 	require.NoError(t, err, "the manual lookalike snapshot must survive")
 	_, err = client.SnapshotGet(ctx, liveCSI.ID)
 	require.NoError(t, err, "the live CSI lookalike snapshot must survive despite the stale ledger entry")
+}
+
+// TestReconcileEmitsReaperRefusedEvent guards O13: a reconcile pass that finds a
+// manual-recovery tombstone (one the guarded reaper refuses) emits exactly one
+// aggregated ReaperRefused Warning Event, and no ReconcileGuardRefusal event when
+// there are no non-cap guard refusals.
+func TestReconcileEmitsReaperRefusedEvent(t *testing.T) {
+	ctx := context.Background()
+	pvSource := reconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pvSource}, nil)
+	client.NoDeferredSnapshotDestroy = true
+	enabled := true
+	d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
+	mustCreateParentDataset(t, client)
+	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+
+	// A manual (non-CSI) snapshot with a tombstone-shaped name: scan fallback
+	// classifies it for manual recovery (never deletion).
+	manual, err := client.SnapshotCreate(ctx, source.Name, "backup-csi-deleted-2024", nil)
+	require.NoError(t, err)
+	manual.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+
+	// Augment (do not replace) the test driver's recorder so the fake kubernetes
+	// clients it carries for the reconcile pass are preserved.
+	fakeRecorder := record.NewFakeRecorder(16)
+	d.eventRecorder.recorder = fakeRecorder
+	d.eventRecorder.enabled = true
+
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	require.Equal(t, 1, report.ManualRecoveryTombstoneCount, "precondition: one manual-recovery tombstone")
+
+	reaperRefused := 0
+	guardRefusal := 0
+drain:
+	for {
+		select {
+		case event := <-fakeRecorder.Events:
+			if strings.Contains(event, EventReasonReaperRefused) {
+				reaperRefused++
+			}
+			if strings.Contains(event, EventReasonReconcileGuardRefusal) {
+				guardRefusal++
+			}
+		default:
+			break drain
+		}
+	}
+	assert.Equal(t, 1, reaperRefused, "exactly one aggregated ReaperRefused event per pass")
+	assert.Zero(t, guardRefusal, "no non-cap guard refusals in this scenario")
 }
 
 // TestReconcileTombstoneScanFallbackRecoversStrandedTombstone proves the

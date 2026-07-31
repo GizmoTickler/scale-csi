@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -984,6 +986,37 @@ func TestAdditiveNFSPublishFailsWhenBackendLiveProvenanceExceedsCap(t *testing.T
 		require.NoError(t, err)
 		assert.Equal(t, liveHosts, records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts,
 			"backend-live provenance must be fully preserved by a refused publish")
+	})
+
+	// O14: the publish-blocking refusal must surface as a Warning Event on the PV.
+	t.Run("overflow refusal emits a FencingProvenanceOverflow event", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		d := newNFSDriver(client)
+		fakeRecorder := record.NewFakeRecorder(8)
+		d.eventRecorder = &EventRecorder{
+			recorder:  fakeRecorder,
+			clientset: kubernetesfake.NewSimpleClientset(),
+			enabled:   true,
+		}
+		buildVolume(t, client, "nfs-provenance-overflow-event", additiveGrantHardCap+3)
+
+		err := publish(d, "nfs-provenance-overflow-event")
+		require.Error(t, err)
+		require.Equal(t, codes.ResourceExhausted, status.Code(err))
+
+		saw := false
+	drain:
+		for {
+			select {
+			case event := <-fakeRecorder.Events:
+				if strings.Contains(event, EventReasonFencingProvenanceOverflow) {
+					saw = true
+				}
+			default:
+				break drain
+			}
+		}
+		assert.True(t, saw, "overflow refusal must emit a FencingProvenanceOverflow event on the PV")
 	})
 
 	t.Run("over cap with dead entries resolves through compaction", func(t *testing.T) {
