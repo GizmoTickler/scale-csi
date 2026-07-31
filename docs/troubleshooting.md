@@ -257,7 +257,11 @@ generation). If it persists:
 
 - Verify source snapshot exists
 - Check that cloned volume capacity >= snapshot source capacity
-- Review `zfs.zvolReadyTimeout` for slow clone operations
+- For **standard (clone-mode)** restores, `zfs.zvolReadyTimeout` does not apply:
+  verification is one `DatasetGet` plus a single 250 ms retry, and exhaustion
+  returns `Unavailable` for the sidecar to retry — investigate backend/API
+  propagation latency. `zfs.zvolReadyTimeout` only affects the **detached**
+  snapshot-copy path (readiness failure there maps to `Internal`).
 
 ## Error Messages Reference
 
@@ -344,7 +348,11 @@ orphan volumes (`scale_csi_orphan_volumes_bytes`), orphan snapshots
 (`scale_csi_tombstone_snapshots_bytes`) — there is no remnant or spent-restore
 byte gauge. Use `scale_csi_reconcile_last_success_timestamp_seconds` to detect a
 stalled loop and `scale_csi_reconcile_failures_total{phase}` to isolate partial
-object failures. Detection is read-only and enabled by default:
+object failures. Orphan **detection** is enabled by default; destructive orphan
+**deletion** stays off until `reconcile.delete.enabled: true`. (A pass is not
+wholly read-only — independent of the delete gate it performs always-on repair
+mutations: legacy ownership-stamp adoption, stale marker/publication repair, and
+the replication-job `core.job_abort` sweep.)
 
 ```yaml
 reconcile:
@@ -407,8 +415,10 @@ zfs list -o name,truenas-csi:managed_resource -r <pool>
 ## Alerts → Runbook
 
 Every alert the chart's `PrometheusRule` can render (when
-`metrics.prometheusRule.enabled: true`), cross-linked to a runbook anchor. The
-new alerts also carry a `runbook_url` annotation with the same target.
+`metrics.prometheusRule.enabled: true`), cross-linked to a runbook anchor. Nine
+of the rendered alerts additionally emit a `runbook_url` annotation pointing at
+the same target; the others (including `ScaleCSIPoolNearFull`) rely on this table
+for their runbook link.
 
 | Alert | Severity | Runbook |
 |-------|----------|---------|

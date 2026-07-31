@@ -4,20 +4,37 @@ scale-csi stores **all** of a volume's metadata as ZFS user-properties on the da
 itself (`truenas-csi:*`) — there is no external database. This makes the driver
 restart-recoverable and, importantly, makes ZFS-native replication a viable DR path:
 when a dataset is replicated with `zfs send | zfs recv` (a TrueNAS replication task),
-its user-properties travel with the stream, so the destination has everything the
-driver needs to re-adopt the volume.
+its user-properties travel with the stream, so the destination has the per-volume
+CSI metadata the driver needs to re-adopt the volume. Two things are **not** ZFS
+properties and must be recovered separately: the export configuration
+(auto-recreated on publish, below) and — for CHAP volumes — the TrueNAS
+`iscsi.auth` peer and its credential (which must be pre-created on the DR side).
 
-The one piece that does **not** replicate is the **export configuration** (the iSCSI
-target/extent, NVMe-oF subsystem/namespace, or NFS share). Those objects live in
-TrueNAS's configuration database, not on the pool, so a `zfs recv` restores the data
-(the zvol/dataset) but not the export. The driver handles this automatically:
-`ControllerPublishVolume` calls `ensureShareExists`, which **verifies each export
-object by ID and recreates it if missing**. So a restored volume's export is rebuilt
-the first time a pod attaches it — no manual re-export step.
+The pieces that do **not** replicate are TrueNAS **configuration-database** state:
+the **export configuration** (the iSCSI target/extent, NVMe-oF
+subsystem/namespace, or NFS share) and, for CHAP volumes, the **`iscsi.auth`
+peer** (tag, username, mode, and credential). Those objects live in TrueNAS's
+config DB, not on the pool, so a `zfs recv` restores the data (the zvol/dataset)
+but not them. For **NFS/NVMe and non-CHAP** exports the driver handles this
+automatically: `ControllerPublishVolume` calls `ensureShareExists`, which
+**verifies each export object by ID and recreates it if missing** from the
+volume's replicated `truenas-csi:*` properties. So a non-CHAP restored volume's
+export is rebuilt the first time a pod attaches it — no manual re-export step.
 
 > This is the exact path exercised by the `ensureShareExists` GET-by-ID verification:
 > a stored `truenas-csi:*_id` property that no longer resolves on the destination is
 > treated as "missing" and the target/namespace/share is recreated.
+
+> **CHAP volumes need the peer pre-created on the DR TrueNAS.** ZFS replication
+> carries the per-volume CHAP *policy* properties
+> (`truenas-csi:truenas_iscsi_auth_tag`/`_mode`), but the `iscsi.auth` peer and
+> its credential live in the config DB and do **not** replicate.
+> `ControllerPublishVolume`/`ensureShareExists` has no CSI Secret and does **not**
+> recreate the peer, so recreating the export with a stored auth tag is **not** a
+> complete automatic CHAP recovery. Back up or deliberately pre-create/re-key the
+> same tag/username/mode/credential peer on the DR TrueNAS **before** the first
+> attach, and test it. Do not expect a "no manual step" attach for CHAP volumes
+> until peer recovery is implemented.
 
 ## What replicates vs. what you must back up separately
 
@@ -27,6 +44,7 @@ the first time a pod attaches it — no manual re-export step.
 | Volume metadata (`truenas-csi:*` props) | ✅ yes (with `--props`/"include properties") | replicated with the dataset |
 | CSI snapshots (on the pool) | ✅ yes (recursive replication) | replicated; re-import the `VolumeSnapshotContent` |
 | iSCSI/NVMe/NFS **export** config | ❌ no (config DB, not pool) | **auto-recreated** by `ensureShareExists` on publish |
+| iSCSI **CHAP `iscsi.auth` peer** (tag/username/mode/credential) | ❌ no (config DB, not pool) | **pre-create/re-key manually** on the DR TrueNAS before first attach (CHAP policy tag/mode props do replicate) |
 | Kubernetes `PV` / `PVC` / `VolumeSnapshotContent` objects | ❌ no (etcd) | back up with Velero / GitOps and re-apply |
 
 ## Runbook: fail over to a DR TrueNAS
@@ -65,7 +83,10 @@ the first time a pod attaches it — no manual re-export step.
 4. **Attach.** When a pod schedules onto the volume, `ControllerPublishVolume` →
    `ensureShareExists` verifies the export by ID and **recreates the iSCSI target /
    NVMe namespace / NFS share** that didn't replicate. `NodeStageVolume` then logs in
-   and mounts. No manual export step is required.
+   and mounts. No manual export step is required for NFS/NVMe and non-CHAP iSCSI
+   volumes. **For CHAP volumes**, first pre-create the matching `iscsi.auth` peer
+   (same tag/username/mode/credential) on the DR TrueNAS — the driver does not
+   recreate the peer — otherwise login fails `Unauthenticated`.
 
 5. **Verify.** Confirm the pod reaches `Running`, data is present, and a leak audit is
    clean (`iscsiadm -m session` / `nvme list-subsys` on the node show exactly the

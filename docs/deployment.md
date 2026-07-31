@@ -1,9 +1,10 @@
 # Deployment and configuration
 
-This guide covers the bundled OCI Helm chart. The chart and image use the same
-release number: chart `1.3.0` deploys image `v1.3.0` unless `image.tag` or
-`image.digest` is overridden. (The in-tree `Chart.yaml` carries a `0.0.0-dev`
-placeholder that CI stamps with the tag at release time.)
+This guide covers the bundled OCI Helm chart, based on the v1.4.0 release line.
+The chart and image use the same release number: chart `1.4.0` deploys image
+`v1.4.0` unless `image.tag` or `image.digest` is overridden. (The in-tree
+`Chart.yaml` carries a `0.0.0-dev` placeholder that CI stamps with the tag at
+release time.)
 
 ## Supported deployment matrix
 
@@ -64,13 +65,13 @@ helm install scale-csi \
 
 The example deliberately avoids a soon-stale version literal. For a controlled
 production rollout, verify the release signature and add the exact reviewed
-version, for example `--version 1.3.0`. See the root README for image, chart,
+version, for example `--version 1.4.0`. See the root README for image, chart,
 and provenance verification commands.
 
 ## Flux
 
 The current Flux OCI source shape uses `OCIRepository` plus `HelmRelease`. Pin
-the exact release you reviewed; this example uses the v1.3.0 baseline:
+the exact release you reviewed; this example uses the v1.4.0 baseline:
 
 ```yaml
 apiVersion: source.toolkit.fluxcd.io/v1
@@ -85,7 +86,7 @@ spec:
     mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
     operation: copy
   ref:
-    semver: "1.3.0"
+    semver: "1.4.0"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -215,6 +216,32 @@ If you need capacity published for non-scheduler consumers against `Immediate`
 classes, set `capacity.forImmediateBinding: true` (default off), which adds the
 provisioner's `--capacity-for-immediate-binding` flag.
 
+The full `capacity.*` surface (all default off):
+
+| Key | Effect / caveat |
+|---|---|
+| `capacity.enabled` | Advertise `CSIDriver.spec.storageCapacity=true`, run the capacity controller, add its RBAC |
+| `capacity.forImmediateBinding` | Also publish `CSIStorageCapacity` for `Immediate` classes — non-scheduler consumers only; no effect unless `capacity.enabled` |
+| `capacity.reportMaximumVolumeSize` | Set `GetCapacityResponse.maximum_volume_size` to the parent dataset's available bytes. Appropriate **only** for thick/reserved zvol deployments (`zfs.zvolEnableReservation: true`); under thin overcommit a hard maximum makes the scheduler wrongly reject legitimate volumes |
+| `capacity.gaugeEnabled` | Run a controller-only poll loop exporting `scale_csi_pool_available_bytes` / `scale_csi_pool_capacity_bytes` |
+| `capacity.gaugeInterval` | Gauge cadence; default `60s`, values below `30s` clamp to `30s` |
+
+Cost and cleanup caveats:
+
+- `GetCapacity` is exactly one `pool.dataset.query` against the parent per
+  referencing StorageClass; it is background provisioner load, not part of the
+  CreateVolume/publish golden totals.
+- The gauge loop samples immediately then every interval and performs **one parent
+  dataset query per interval per controller replica** — it has **no
+  leader-election gate**, so the supported/documented topology is `replicas=1`
+  (one query/min).
+- Disabling capacity after it has been on can leave owner-referenced
+  `CSIStorageCapacity` objects behind (no finalizer) until the controller
+  Deployment is deleted or the objects are removed manually.
+- `metrics.prometheusRule.poolUsageThreshold` (default `0.85`) drives the
+  `ScaleCSIPoolNearFull` alert, which renders only when the bundled PrometheusRule
+  **and** `capacity.gaugeEnabled` are both enabled.
+
 ## Availability and topology
 
 Leader election is enabled on the provisioner, attacher, resizer, and
@@ -242,8 +269,11 @@ is no `node.topology` chart value. See the [topology guide](guides/topology.md).
   no deferred/lazy API connection on node pods; do not assume the controller
   Secret is present on them after upgrading.
 - ConfigMap changes restart controller and node pods. Rotating an externally
-  managed Secret does not change the pod-template checksum, so restart both
-  workloads explicitly after rotation.
+  managed `truenas.existingSecret` does not change the pod-template checksum;
+  restart the **controller** workload explicitly after rotation (only the
+  controller holds the TrueNAS API key — the node builds no API client, so it does
+  not need a restart for that credential). CHAP Secrets are request-scoped CSI
+  Secrets and need no driver rollout at all.
 
 For fencing's node-first migration and the full production contract,
 read [Production deployment](production.md).

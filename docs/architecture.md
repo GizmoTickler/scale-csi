@@ -157,10 +157,15 @@ flowchart LR
         D --> E[Create Association]
     end
     subgraph Node
-        F[NodeStageVolume] --> G[iSCSI Discovery]
-        G --> H[iSCSI Login]
-        H --> I[Format Device]
-        I --> J[Mount to Staging]
+        F[NodeStageVolume] --> G{Healthy existing<br/>session?}
+        G -->|reuse| J[Mount to Staging]
+        G -->|no| H[Ensure static node record]
+        H --> H2[Apply CHAP if configured]
+        H2 --> H3[iSCSI Login]
+        H3 -->|target not found| D2[SendTargets discovery + retry]
+        D2 --> H3
+        H3 --> I[Format Device]
+        I --> J
         J --> K[Bind Mount to Pod]
     end
     E --> F
@@ -168,7 +173,11 @@ flowchart LR
 
 1. **Provisioning**: Controller creates a ZFS volume (`zvol`) with `type=VOLUME`.
 2. **Exporting**: Controller creates an iSCSI Target, Extent, and TargetExtent mapping.
-3. **Attachment**: Node uses `iscsiadm` to discover and login to the target.
+3. **Attachment**: The node path first **reuses a validated healthy existing
+   session**. For a fresh connection it ensures a static node record, applies CHAP
+   if the class configured it, then logs in. `SendTargets` **discovery is only a
+   fallback** when the fast login reports target-not-found / no portal record — it
+   does not precede every login.
 4. **Formatting**: Node formats the device (ext4/xfs) if it's a new volume.
 5. **Mounting**: Node mounts the formatted device.
 6. **Access**: Primarily `ReadWriteOnce` (RWO).
@@ -239,10 +248,14 @@ and ZFS user properties.
 
 ## ZFS User Properties
 
-The driver stores **all** durable state as ZFS user properties prefixed with
-`truenas-csi:` — there is no external database, which is what makes the driver
-restart-recoverable and ZFS-replication-friendly (see the
-[disaster-recovery guide](guides/disaster-recovery.md)).
+The driver stores **all durable per-volume CSI metadata** as ZFS user properties
+prefixed with `truenas-csi:` — there is no external database for it, which is what
+makes the driver restart-recoverable and ZFS-replication-friendly (see the
+[disaster-recovery guide](guides/disaster-recovery.md)). Two exceptions are
+**not** ZFS properties and must be managed/recovered separately: CHAP **secret
+material** (a request-scoped CSI Secret) and the TrueNAS `iscsi.auth` **peer
+object** (configuration-database state). The per-volume CHAP *policy* (tag and
+mode) is property-backed — see the CHAP properties below.
 
 **Ownership and identity**
 
@@ -279,6 +292,17 @@ restart-recoverable and ZFS-replication-friendly (see the
 | `truenas-csi:truenas_iscsi_target_id` / `_extent_id` / `_targetextent_id` / `_initiator_id` | iSCSI object IDs |
 | `truenas-csi:truenas_nvmeof_subsystem_id` / `_namespace_id` / `_portsubsys_id` | NVMe-oF object IDs |
 
+**iSCSI CHAP policy (immutable per volume)**
+
+| Property | Description |
+|----------|-------------|
+| `truenas-csi:truenas_iscsi_auth_tag` | The `iscsi.auth` tag the target group's auth ref points at; stamped immutably at `CreateVolume` |
+| `truenas-csi:truenas_iscsi_auth_mode` | The immutable per-volume auth mode (`CHAP` or `CHAP_MUTUAL`); every fence pass reconstructs `authmethod`+auth purely from these two properties |
+
+The CHAP **credential** itself is never a ZFS property; it is a request-scoped
+CSI Secret, and the backing TrueNAS `iscsi.auth` peer is configuration-database
+state that does not replicate with the pool.
+
 Snapshots carry their own identity properties (`truenas-csi:csi_snapshot_name`,
 `truenas-csi:csi_snapshot_source_volume_id`, `truenas-csi:csi_share_volume_context`).
 
@@ -304,11 +328,12 @@ See [Snapshots and Clones Guide](guides/snapshots.md) for detailed usage instruc
   single replica, so a `fencing.mode=off` RollingUpdate that briefly runs two
   controller pods never has both acting as the active provisioner/attacher.
 - **Node** runs as a DaemonSet and is **credential-free**: it receives no
-  `TRUENAS_API_KEY`. Stage/publish/unpublish/unstage and local filesystem
-  expansion use host tools (`mount`, `iscsiadm`, `nvme`, `resize2fs`), so node
-  pods start in lazy-connect mode and stay available during a management-API
-  outage. A node operation that genuinely needs the management API fails without
-  credentials by design.
+  `TRUENAS_API_KEY` and **constructs no TrueNAS management client at all**. Every
+  supported Node RPC (stage/publish/unpublish/unstage and local filesystem
+  expansion) uses host tools (`mount`, `iscsiadm`, `nvme`, `resize2fs`) and local
+  host state. There is **no deferred/lazy management-API path** on node pods that
+  could later fail for lack of credentials; node pods initialize and report ready
+  independently of TrueNAS reachability.
 - `additive`/`strict` fencing require **exactly one** controller replica because
   their background reconcilers are singleton writers; chart schema and template
   guards enforce that.
@@ -366,10 +391,22 @@ fails closed and may require manual cleanup.
 
 A controller-side reconcile pass (`ReconcileOrphans`, default hourly; also
 runnable once via `--mode=reconcile`) detects and — only under
-`reconcile.delete.enabled` — cleans CSI-managed backend objects with no live
-Kubernetes reference. Detection is read-only; a shared `reconcile.delete.maxPerRun`
-caps destructive actions per pass. The v1.3.0 refactor split the former
-monolithic `reconcile.go` along its test seams into per-concern files:
+`reconcile.delete.enabled` — deletes CSI-managed **orphan objects** (volumes and
+snapshots) with no live Kubernetes reference; a shared
+`reconcile.delete.maxPerRun` caps those destructive deletions per pass.
+
+**The pass as a whole is not read-only.** The safety guarantee is narrower:
+**orphan object deletion is disabled by default**. Independent of
+`reconcile.enabled` and guarded delete, a pass performs always-on repair
+mutations — it can write/adopt legacy ownership stamps
+(`reconcile_adoption.go`), repair stale bookkeeping/marker and publication state,
+and the replication-job sweep can call `core.job_abort` on orphaned
+`replication.run_onetime` jobs (this sweep runs even when both `reconcile.enabled`
+and guarded delete are off). Only the orphan-volume/snapshot, tombstone, and
+remnant destroys are gated behind `reconcile.delete.enabled`.
+
+The v1.3.0 refactor split the former monolithic `reconcile.go` along its test
+seams into per-concern files:
 
 | File | Concern |
 |------|---------|
@@ -394,9 +431,14 @@ that adds a wasted round trip fails loudly. Representative controller costs:
 |-----------|--------------------:|
 | CreateVolume (fresh NFS) | 6 |
 | CreateVolume (fresh iSCSI) | 14 |
-| CreateVolume (clone from snapshot) | 12 |
+| CreateVolume (NFS clone from **snapshot** source) | 10 |
+| CreateVolume (NFS clone from **volume** source) | 13 |
 | CreateVolume / CreateSnapshot (idempotent retry) | 2 |
 | DeleteVolume (NFS / iSCSI) | 6 / 10 |
 | ControllerPublish/Unpublish (fencing `off`, NFS) | 3 |
 | ControllerPublish/Unpublish (`additive`, NFS) | 5 |
 | ControllerPublish/Unpublish (`strict`, NVMe-oF, steady-state) | 9 |
+
+Clone cost is per-protocol/source-type, not a single protocol-independent number
+(the older "12" predates the single-get fold). These are the counts pinned by the
+golden fixtures; a live end-to-end re-measure is pending post-deploy.

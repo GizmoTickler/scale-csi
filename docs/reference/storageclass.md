@@ -146,14 +146,31 @@ true for a class to use CHAP:
    the standard CSI secret-ref parameters. The same Secret is used for both
    provisioning (`CreateVolume`) and node staging (`NodeStageVolume`).
 
+> **The effective per-class opt-in is the non-blank Secret username.** For
+> chart-generated StorageClasses, CHAP engages at `CreateVolume` only when the
+> global gate is on **and** the provisioner Secret carries a non-blank username
+> (the driver's internal `iscsi.chapSecret` marker — the chart does not emit
+> `iscsi.chapSecret=true`). Under current behavior a readable referenced Secret
+> whose username is absent or blank **fails open** to `authmethod=NONE` rather
+> than entering CHAP validation; only a request that has already selected CHAP
+> fails closed on malformed or missing CHAP fields. Ensure the referenced Secret
+> always carries a username.
+
 ### The CHAP Secret
 
 One Secret per StorageClass credential, shared by all volumes of that class
 (per-volume credentials are not supported — there is no CSI channel to deliver a
-driver-generated per-volume secret to the node). TrueNAS enforces a secret
-length of **12–16 characters inclusive** for both `password` and
-`mutualPassword`; the driver rejects anything else with `InvalidArgument` before
-calling TrueNAS.
+driver-generated per-volume secret to the node). The driver validates the Secret
+locally and rejects it with `InvalidArgument` **before** calling TrueNAS (once
+CHAP has been selected). The enforced rules are:
+
+- `password` and, when present, `mutualPassword` must be **12–16 bytes**
+  inclusive. The check uses Go `len`, so the boundary is bytes, not runes.
+- Leading or trailing whitespace and the `#` character are rejected.
+- `mutualPassword` is required if and only if `mutualUsername` is set, and it
+  **must differ** from `password`.
+- `tag`, if present, must be a **positive integer**.
+- The accepted keys and aliases are listed below.
 
 ```yaml
 apiVersion: v1
@@ -166,12 +183,33 @@ stringData:
   password:       chapsecret123     # required, 12-16 chars
   mutualUsername: peeruser          # optional; presence implies CHAP_MUTUAL
   mutualPassword: peersecret456     # required iff mutualUsername is set, 12-16 chars, != password
-  tag:            "1234"            # optional operator-pinned iscsi.auth tag (omit to derive)
+  tag:            "1234"            # optional positive-integer iscsi.auth tag (omit to derive)
 ```
 
 Legacy open-iscsi-style aliases are also accepted: `node.session.auth.username`,
 `node.session.auth.password`, `node.session.auth.username_in`,
 `node.session.auth.password_in`.
+
+### Peer identity and tag derivation
+
+Peer identity is **tag-based**, and the tag is derived from the *username* — no
+StorageClass identity participates. The precedence is:
+
+1. a positive Secret `tag`, if set; otherwise
+2. a positive global `iscsi.chap.tag`, if set; otherwise
+3. FNV-1a of the username mapped into `[1000, 61000)`.
+
+Consequences to plan for:
+
+- Two StorageClasses that use the **same username** with no explicit tag share
+  the **same derived tag and `iscsi.auth` peer**.
+- A positive global `iscsi.chap.tag` makes **every** untagged class contend for
+  one peer.
+- Two **different** usernames that resolve to the same explicit or global tag
+  collide and fail with `FailedPrecondition`.
+
+Operators who need per-class peer isolation must pin **distinct positive Secret
+`tag` values**.
 
 ### The CHAP StorageClass
 
@@ -206,23 +244,36 @@ mode — never the controller-wide `iscsi.chap.mutual` Helm flag. This means one
 and mutual StorageClasses coexist safely, and flipping the global flag or
 restarting the controller never changes an existing volume's authmethod.
 
+> **`iscsi.chap.mutual` is currently inert.** Production code never reads
+> `config.ISCSI.CHAP.Mutual`; the effective mode for a new volume is derived
+> solely from whether the Secret carries a `mutualUsername`. Treat the flag as an
+> ignored compatibility key, not a working default-mode hint, until it is
+> implemented.
+
 ### Behavior and limitations
 
 - **Session auth only.** CHAP is applied to the node session record
   (`node.session.auth.*`) before login. Discovery auth is out of scope.
-- **Shared peer, not deleted per volume.** The driver creates one `iscsi.auth`
-  peer per StorageClass credential (keyed by tag) and reuses it. `DeleteVolume`
-  does not delete the peer; removing a CHAP StorageClass leaves its peer behind
-  for the operator to reap.
+- **Shared peer, keyed by tag, not deleted per volume.** The driver creates one
+  `iscsi.auth` peer per **tag** (derived from the username as above) and reuses
+  it, so two classes sharing a username/tag share one peer. `DeleteVolume` does
+  not delete the peer; removing a CHAP StorageClass leaves its peer behind for the
+  operator to reap. The peer lives in the TrueNAS configuration database, not on
+  the pool, so it does **not** ZFS-replicate (see the DR guide for the peer
+  recovery prerequisite).
 - **Rotation.** Update the Secret's `password`/`mutualPassword` (keep the same
   `username` and tag). The next `CreateVolume` on the class detects the changed
   credential — the in-driver peer cache is validated by credential fingerprint,
   not just username — and re-keys the backend peer in place via
   `iscsi.auth.update` (no controller restart required); a redacted
   `ISCSICHAPRotated` Event records it. The tag is stable, so no target group is
-  touched. Established sessions survive a rotation — CHAP is checked only at
-  login — so a rotated secret takes effect on the next `NodeStageVolume`. To force
-  immediate enforcement, cordon/drain the node to re-stage.
+  touched. **Established sessions survive a rotation**, and the new node
+  credential is applied only before a **fresh login** (including after a
+  stale-session disconnect) — not merely on the next `NodeStageVolume`, which can
+  reuse a healthy pre-rotation session and its old credentials. For immediate
+  enforcement, coordinate an unstage/logout or drain the node **and verify the old
+  session is gone** (`iscsiadm -m session`); a controller restart does not force
+  reauthentication.
 - **CHAP policy is immutable per volume.** The auth *mode* and *tag* are fixed for
   a volume's lifetime. An idempotent `CreateVolume` replay that would change the
   policy — enabling CHAP on a previously non-CHAP volume (or the reverse), or a

@@ -117,9 +117,14 @@ iscsiadm --version
 cat /etc/iscsi/initiatorname.iscsi  # Should show iqn.* identifier
 ```
 
-The driver does not implement CHAP. Restrict TCP 3260 to the Kubernetes nodes
-on a dedicated storage network (for example, a storage VLAN plus firewall or
-SGACL policy).
+iSCSI CHAP is supported as a default-off, controller-wide feature gate
+(`iscsi.chap.enabled`) with per-StorageClass CSI provisioner and node-stage
+Secret refs. One-way and mutual session authentication are supported; discovery
+authentication and dm-multipath remain unsupported. CHAP authenticates the
+session but does not encrypt TCP 3260, so still restrict it to the Kubernetes
+nodes on a dedicated storage network (for example, a storage VLAN plus firewall
+or SGACL policy). See the
+[StorageClass CHAP reference](docs/reference/storageclass.md#iscsi-chap).
 
 </details>
 
@@ -233,25 +238,31 @@ documented exception ledger is [`.trivyignore`](.trivyignore).
 | [Architecture](docs/architecture.md) | How the driver works internally |
 | [Deployment](docs/deployment.md) | Helm and Flux installation with full configuration reference |
 | [Production](docs/production.md) | HA, security, monitoring, upgrades, and known limitations |
-| [Disaster recovery](docs/guides/disaster-recovery.md) | ZFS replication + export auto-recreation for cross-site failover |
+| [Disaster recovery](docs/guides/disaster-recovery.md) | ZFS replication + export auto-recreation for cross-site failover (CHAP volumes additionally need the `iscsi.auth` peer pre-created on the DR TrueNAS) |
 | [Topology](docs/guides/topology.md) | Zone/region-aware provisioning (advanced; single-backend usually doesn't need it) |
 | [Snapshots](docs/guides/snapshots.md) | Snapshot and clone/restore workflow |
-| [Release notes](docs/release-notes-next.md) | v1.3.0 changelog and upgrade actions |
+| [Release notes](docs/release-notes-next.md) | v1.4.0 changelog and upgrade actions |
 
 ## Network Ports
 
-Ensure these ports are accessible from your Kubernetes nodes to TrueNAS:
+The **controller** pods need the TrueNAS WebSocket API path; the **node** pods
+need only the data path for the protocol(s) they mount (the node DaemonSet is
+credential-free and builds no management client, so do not expose the management
+API from every Kubernetes node):
 
-| Service | Port | Required For |
-|---------|------|--------------|
-| HTTPS | 443 | WebSocket API (chart default; HTTPS strongly recommended) |
-| NFS | 2049 | NFS volumes |
-| iSCSI | 3260 | iSCSI volumes |
-| NVMe-TCP | 4420 | NVMe-oF volumes |
+| Service | Port | Source | Required For |
+|---------|------|--------|--------------|
+| HTTPS | 443 | Controller pods only | WebSocket API (chart default; HTTPS strongly recommended) |
+| NFS | 2049 | Nodes | NFS volumes |
+| iSCSI | 3260 | Nodes | iSCSI volumes |
+| NVMe-TCP | 4420 | Nodes | NVMe-oF volumes |
 
-The API defaults to `https` on 443. Selecting `http` (via `truenas.protocol`)
-defaults the port to 80; HTTPS is strongly recommended for the API key in
-transit.
+For raw driver config, `protocol: http` plus an omitted/zero port defaults the
+API port to 80. For the Helm chart there is **no** `truenas.protocol` key: it
+exposes `truenas.secure` (default `true`) and `truenas.port` (always rendered,
+default 443). To use plain HTTP set **both** `truenas.secure=false` **and**
+`truenas.port=80`; changing `secure` alone continues to use port 443. HTTPS is
+strongly recommended for the API key in transit.
 
 ## License
 
