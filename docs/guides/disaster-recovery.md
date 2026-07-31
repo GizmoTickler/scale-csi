@@ -71,6 +71,53 @@ the first time a pod attaches it — no manual re-export step.
    clean (`iscsiadm -m session` / `nvme list-subsys` on the node show exactly the
    expected sessions).
 
+## Runbook: fencing takeover for a confirmed-dead node
+
+In `fencing.mode: strict`, a `SINGLE_NODE` volume that still carries a durable
+publication record for a *different* node is refused with `FailedPrecondition`
+until the stale record is revoked. When the controller can prove the old node's
+`VolumeAttachment` is gone, it revokes the stale record and grants the new node
+**synchronously** (a "takeover"). This is the normal, safe recovery path — prefer
+it over any manual intervention.
+
+**(a) The empty-list brake is intentional, not a bug.** If the controller cannot
+list `VolumeAttachments` (informer unsynced, API discontinuity) or the list comes
+back **empty while a backend record still exists**, it treats that as *ambiguous*
+— not as evidence of absence — and **keeps** `FailedPrecondition` instead of
+taking over. A zero-result list can mean "the attachment is gone" *or* "the API
+server momentarily returned nothing"; acting on the wrong reading would revoke a
+grant a live node still holds. The controller fails safe and lets the periodic
+reconcile (with its mass-absence brake and grace window) converge.
+
+**(b) Force-removing a VolumeAttachment finalizer bypasses that brake.** The
+escape hatch is:
+
+```bash
+kubectl patch volumeattachment <name> -p '{"metadata":{"finalizers":null}}'
+```
+
+This deletes the attachment object out from under the controller's safety check,
+which can then observe "no attachment" and proceed to take over the volume. That
+is **ONLY** safe once the old node is **CONFIRMED dead** — powered off, fenced at
+the BMC/IPMI, or cordoned + drained + `NotReady` well beyond the pod grace period.
+Force-removing the finalizer while the old node is still alive and mounted lets
+two nodes hold the same `SINGLE_NODE` volume simultaneously, which **corrupts the
+filesystem**. When in doubt, do not remove the finalizer.
+
+**(c) Prefer the controller's synchronous takeover.** Before any manual finalizer
+removal, watch the driver perform takeovers itself:
+
+```promql
+sum by (reason) (rate(scale_csi_fencing_takeover_total[1h]))
+```
+
+A `ScaleCSIFencingTakeoverSpike` alert fires on any takeover. If takeovers are
+not happening and a volume is stuck `FailedPrecondition`, first confirm the node
+is genuinely dead (step b), then — and only then — remove the finalizer. A
+`ScaleCSIFencingProvenanceOverflow` alert is a different condition (publishes
+refused because additive grant provenance exceeded its cap) and points at node
+identity churn or stale backend hosts, not a dead node.
+
 ## Notes and caveats
 
 - **Snapshots restore, but their K8s objects don't.** CSI snapshots on the pool
