@@ -48,6 +48,22 @@ spec:
           annotations:
             summary: Scale CSI TrueNAS API failure rate is high
             description: More than 10% of TrueNAS API requests have failed for ten minutes.
+        - alert: ScaleCSISustainedLockContention
+          # Sprint 5 moved EBUSY lock-contention/in-progress outcomes OUT of
+          # status="error" into status="benign_aborted" (E1), so the failure-rate
+          # alert above no longer covers a sustained abort storm. This alert
+          # restores that signal: the TrueNAS client returns non-connection API
+          # errors immediately instead of retrying them, so sustained lock
+          # contention remains an operational latency/retry symptom even though
+          # each individual outcome is benign (codex M2 / opus hardening).
+          expr: sum(rate(scale_csi_truenas_requests_total{status="benign_aborted"}[15m])) > 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI TrueNAS lock contention is sustained
+            description: Benign lock-contention/in-progress aborts (status="benign_aborted") have exceeded 1 per second for fifteen minutes; an EBUSY abort storm elevates API load and publish latency though it is not a hard backend failure.
+            runbook_url: docs/troubleshooting.md#performance-issues
         - alert: ScaleCSIOperationErrorsSustained
           expr: sum(rate(scale_csi_operations_total{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }},status="error",code!~"FailedPrecondition|AlreadyExists|Aborted"}[10m])) > 0.02
           for: 15m

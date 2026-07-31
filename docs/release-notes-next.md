@@ -34,11 +34,27 @@ span several of these releases.
   | `scale_csi_truenas_requests_duration_seconds` | **unchanged** (no status label) |
   | cardinality | 2 → ≤5 values per method; `method` is a fixed API-method enum → still bounded |
 
-  **Operator action:** existing `status="success"` and `status="error"` selectors
-  keep working unchanged. Because benign outcomes leave the `error` series, any
-  panel/rule — including THIRD-PARTY dashboards — that sums `status="error"` as
-  "failures" will now read LOWER (this is the honest value); the benign volume is
-  visible in the new `benign_*` values. No expression has to change to get the fix.
+  **Operator action — this is a semantic change, not just a rename.** Existing
+  `status="success"` and `status="error"` selectors remain SYNTACTICALLY valid
+  (no expression breaks), but their MEANING changes: `status="error"` now counts
+  real failures only, so any panel/rule — including THIRD-PARTY dashboards — that
+  summed `status="error"` as "all non-success" will read LOWER by exactly the
+  benign volume that moved out. The built-in `ScaleCSIHighTrueNASAPIFailureRate`
+  alert is affected the same way: it still selects `status="error"`, so EBUSY
+  lock-contention abort-storms NO LONGER contribute to it (that signal is now
+  covered by the new `ScaleCSISustainedLockContention` alert). Decide
+  deliberately which population each of your queries should track:
+
+  - **Real failures only** — keep `status="error"` (the new, honest value; no
+    change needed).
+  - **The old all-non-success population** — change the selector to
+    `status!="success"` (or enumerate
+    `status=~"error|benign_exists|benign_notfound|benign_aborted"`). This is the
+    change a third-party panel/rule that intentionally tracked every non-success
+    outcome MUST make to preserve its prior meaning.
+  - **Contention signaling** — rely on the new `ScaleCSISustainedLockContention`
+    alert / the "TrueNAS API Outcomes" dashboard band, or deliberately include
+    `benign_aborted` alongside `error` in your own query.
 
 ## v1.3.0 — publish/reconcile performance, subscribe job-wait, clone fold, ledger v2
 

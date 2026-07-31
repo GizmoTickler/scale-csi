@@ -416,6 +416,7 @@ new alerts also carry a `runbook_url` annotation with the same target.
 | `ScaleCSICircuitBreakerOpen` | warning | [Reset Circuit Breaker](#reset-circuit-breaker) |
 | `ScaleCSITrueNASConnectionDown` | critical | [Session/Connection Issues](#sessionconnection-issues) |
 | `ScaleCSIHighTrueNASAPIFailureRate` | warning | [Session/Connection Issues](#sessionconnection-issues) |
+| `ScaleCSISustainedLockContention` | warning | [Performance Issues](#performance-issues) |
 | `ScaleCSIOperationErrorsSustained` | warning | [Volume Provisioning Failures](#volume-provisioning-failures) |
 | `ScaleCSISpentRestoreSnapshotBacklog` | warning | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
 | `ScaleCSISessionGCDisconnects` | warning | [Session/Connection Issues](#sessionconnection-issues) |
