@@ -344,6 +344,14 @@ func validateIdentityForProtocol(identity NodeIdentity, shareType ShareType) err
 		if identity.ISCSIIQN == "" {
 			return status.Errorf(codes.FailedPrecondition, "node %s did not report an iSCSI initiator IQN; upgrade/restart its node plugin before publishing this fenced volume", identity.Name)
 		}
+		if isISCSIDenyAllSentinel(identity.ISCSIIQN) {
+			// The deny-all sentinel is a reserved backend value, never a real node
+			// identity. Reject it fail-closed so a node that reports it (or a
+			// persisted collision) is treated as having no valid iSCSI identity and
+			// is never enforced as an allowlist grant that would match the deny-all
+			// entry and defeat the fence.
+			return status.Errorf(codes.FailedPrecondition, "node %s reported the reserved iSCSI fencing identity %q as its own initiator IQN; a node must report a real IQN before publishing this fenced volume", identity.Name, identity.ISCSIIQN)
+		}
 	case ShareTypeNFS:
 		if len(identity.IPs) == 0 {
 			return status.Errorf(codes.FailedPrecondition, "node %s did not report an IP address; upgrade/restart its node plugin before publishing this fenced volume", identity.Name)
@@ -1046,6 +1054,7 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 	enforceable := make([]NodeIdentity, 0, len(active))
 	protectedNFSHosts := make([]string, 0)
 	protectedNVMeNQNs := make([]string, 0)
+	hasDeferredActiveISCSI := false
 	for _, identity := range active {
 		deferred, err := d.validateOrDeferFencingIdentity(identity, shareType)
 		if err != nil {
@@ -1057,6 +1066,13 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 			// the preserved static policy until they re-register a transport
 			// identity. Preserve any earlier CSI-added grant without recreating it;
 			// enforceable peers must still converge independently.
+			if shareType == ShareTypeISCSI {
+				// A deferred iSCSI identity is a LIVE publication whose IQN is only
+				// momentarily unresolvable — not a removal. Signal the iSCSI backend
+				// so an otherwise-empty allowlist is treated as "defer, preserve the
+				// existing grant" rather than "last unpublish, write deny-all".
+				hasDeferredActiveISCSI = true
+			}
 			record := records[publicationPropertyKey(identity.Name)]
 			protectedNFSHosts = append(protectedNFSHosts, record.CSIAddedNFSHosts...)
 			protectedNVMeNQNs = append(protectedNVMeNQNs, record.CSIAddedNVMeNQNs...)
@@ -1068,7 +1084,7 @@ func (d *Driver) applyBackendFence(ctx context.Context, ds *truenas.Dataset, dat
 	if backend == nil {
 		return fmt.Errorf("unsupported share type %q", shareType)
 	}
-	return backend.ApplyFence(ctx, ds, datasetName, enforceable, removing, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs, res)
+	return backend.ApplyFence(ctx, ds, datasetName, enforceable, removing, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs, hasDeferredActiveISCSI, res)
 }
 
 func uniqueSortedStrings(values []string) []string {
@@ -1324,7 +1340,7 @@ func isISCSIDenyAllSentinel(iqn string) bool {
 	return iqn == iscsiDenyAllSentinelIQN
 }
 
-func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, res *fenceResolution) error {
+func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, hasDeferredActiveISCSI bool, res *fenceResolution) error {
 	target, err := d.resolvedISCSITarget(ctx, res, ds, datasetName)
 	if err != nil {
 		return err
@@ -1345,6 +1361,17 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 		}
 	}
 	iqns = uniqueSortedStrings(iqns)
+	if len(iqns) == 0 && hasDeferredActiveISCSI {
+		// An empty real-IQN allowlist with a deferred-active identity is NOT a
+		// genuine last unpublish: a live publication's IQN is merely unresolved
+		// (re-registration/rolling upgrade), so writing the deny-all sentinel here
+		// would fence the live node off its OWN volume. Leave the existing initiator
+		// group untouched — its current grant (the deferred node's last-known real
+		// IQN) stays in place, and a later reconcile converges once the IQN
+		// resolves. Do not create a sentinel group in this state either.
+		klog.V(2).Infof("iSCSI fence: deferring deny-all; a published identity is unresolved, preserving existing grant for %s", datasetName)
+		return nil
+	}
 	// The group allowlist mirrors the active node IQNs, except on last unpublish
 	// (zero active identities): an EMPTY allowlist is NOT deny-all on TrueNAS 26.0
 	// SCST (it renders INITIATOR *), so the empty case writes a non-matchable

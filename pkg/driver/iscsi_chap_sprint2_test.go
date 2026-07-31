@@ -112,7 +112,7 @@ func TestSprint2FenceRetainsCHAPAcrossModes(t *testing.T) {
 			// authmethod=CHAP + auth=<tag>. A fence that stripped CHAP would emit
 			// authmethod=NONE here (the R1/X1 downgrade).
 			active := []NodeIdentity{{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:01:worker-a"}}
-			require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, active, nil))
+			require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, active, false, nil))
 
 			target := iscsiTargetForVolume(t, client, volumeName)
 			require.NotEmpty(t, target.Groups)
@@ -126,7 +126,7 @@ func TestSprint2FenceRetainsCHAPAcrossModes(t *testing.T) {
 			// portal relationships rather than downgrading them.
 			ds, err = client.MockClient.DatasetGet(ctx, datasetName)
 			require.NoError(t, err)
-			require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, nil))
+			require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, nil))
 			target = iscsiTargetForVolume(t, client, volumeName)
 			for _, g := range target.Groups {
 				assert.Equal(t, "CHAP", g.AuthMethod, "unpublish must retain CHAP authmethod")
@@ -160,7 +160,7 @@ func TestSprint2FenceUsesStoredModeNotGlobalFlag(t *testing.T) {
 		ds, err := client.MockClient.DatasetGet(ctx, datasetName)
 		require.NoError(t, err)
 		require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName,
-			[]NodeIdentity{{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:01:worker-a"}}, nil))
+			[]NodeIdentity{{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:01:worker-a"}}, false, nil))
 
 		target := iscsiTargetForVolume(t, client, volumeName)
 		require.NotEmpty(t, target.Groups)
@@ -186,7 +186,7 @@ func TestSprint2FenceUsesStoredModeNotGlobalFlag(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "CHAP_MUTUAL", datasetLocalUserProperty(ds, PropISCSIAuthMode))
 		require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName,
-			[]NodeIdentity{{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:01:worker-a"}}, nil))
+			[]NodeIdentity{{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:01:worker-a"}}, false, nil))
 
 		target := iscsiTargetForVolume(t, client, volumeName)
 		require.NotEmpty(t, target.Groups)

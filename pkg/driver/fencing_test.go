@@ -2110,7 +2110,7 @@ func TestISCSILastUnpublishReattachesDenyGroupToExistingTargetPortals(t *testing
 		truenasClient: client,
 	}
 
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
 	target, err = client.ISCSITargetGet(ctx, target.ID)
 	require.NoError(t, err)
 	require.Equal(t, []truenas.ISCSITargetGroup{{Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE"}}, target.Groups,
@@ -2149,7 +2149,7 @@ func TestISCSIFenceZeroActiveIdentitiesWritesDenyAllSentinelGroup(t *testing.T) 
 	}
 
 	// Last unpublish: zero active identities.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
 
 	initiator, err := client.ISCSIInitiatorGet(ctx, dynamic.ID)
 	require.NoError(t, err)
@@ -2202,17 +2202,95 @@ func TestISCSIFenceRepublishReplacesSentinelWithRealIQN(t *testing.T) {
 	}
 
 	// Publish to A.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeA, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeA, false, nil))
 	assert.Equal(t, []string{"iqn.1993-08.org.debian:worker-a"}, allowlist())
 
 	// Last unpublish: deny-all sentinel replaces A.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, false, nil))
 	assert.Equal(t, []string{iscsiDenyAllSentinelIQN}, allowlist())
 
 	// Republish to B: the update must REPLACE the sentinel, not append to it.
-	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeB, nil))
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeB, false, nil))
 	assert.Equal(t, []string{"iqn.1993-08.org.debian:worker-b"}, allowlist(),
 		"republish must replace the sentinel, never accumulate it alongside a real IQN")
+}
+
+// TestISCSIFenceDeferredActiveIdentityPreservesExistingGrant pins the round-2 F1
+// fix: a live iSCSI publication whose IQN is momentarily unresolvable (deferred,
+// NOT removed — e.g. a legacy/plain node-ID during re-registration or a rolling
+// upgrade) must not be collapsed to the deny-all sentinel. applyBackendFence
+// signals the deferred-active identity and applyISCSIFence skips the mutation,
+// leaving the node's existing real-IQN grant intact. Writing the sentinel here
+// would fence the live node off its OWN volume (the round-1 self-fence bug).
+func TestISCSIFenceDeferredActiveIdentityPreservesExistingGrant(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	client.RejectEmptyISCSITargetGroups = true
+	datasetName := "pool/parent/deferred-iscsi"
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	// Converged state before the identity blip: the CSI fencing group holds the
+	// node's real IQN.
+	realIQN := "iqn.1993-08.org.debian:worker-a"
+	dynamic, err := client.ISCSIInitiatorCreateWithInitiators(ctx, []string{realIQN}, "scale-csi fencing: "+datasetName)
+	require.NoError(t, err)
+	target, err := client.ISCSITargetCreate(ctx, "deferred-iscsi", "", "ISCSI", []truenas.ISCSITargetGroup{{
+		Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE",
+	}})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperties(ctx, datasetName, map[string]string{
+		PropISCSITargetID:    strconv.Itoa(target.ID),
+		PropISCSIInitiatorID: strconv.Itoa(dynamic.ID),
+	}))
+	d := &Driver{
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeAdditive},
+			ISCSI:   ISCSIConfig{TargetPortal: "203.0.113.250:3260"}, // deliberately unresolvable
+		},
+		truenasClient: client,
+	}
+
+	// The live publication record no longer carries a resolvable IQN, so additive
+	// mode defers it (keeps the durable record) rather than enforcing it.
+	record, err := newPublicationRecord(NodeIdentity{Name: "worker-a"}, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	records := map[string]publicationRecord{publicationPropertyKey("worker-a"): record}
+
+	require.NoError(t, d.applyBackendFence(ctx, dataset, datasetName, ShareTypeISCSI, records, nil))
+
+	initiator, err := client.ISCSIInitiatorGet(ctx, dynamic.ID)
+	require.NoError(t, err)
+	require.NotNil(t, initiator)
+	assert.Equal(t, []string{realIQN}, initiator.Initiators,
+		"a deferred-live identity must preserve the existing real-IQN grant, not collapse to deny-all")
+	assert.NotContains(t, initiator.Initiators, iscsiDenyAllSentinelIQN,
+		"the deny-all sentinel must never be written while a live identity is merely unresolved")
+}
+
+// TestValidateIdentityForProtocolRejectsDenyAllSentinelIQN pins the round-2 F2
+// fix: the deny-all sentinel is a reserved backend value and must never be
+// accepted as a node-reported iSCSI identity. This is the enforcement gate that
+// neutralizes an already-persisted collision fail-closed (treated as invalid,
+// never enforced as an allowlist grant that would match the deny-all entry).
+func TestValidateIdentityForProtocolRejectsDenyAllSentinelIQN(t *testing.T) {
+	err := validateIdentityForProtocol(NodeIdentity{Name: "worker-a", ISCSIIQN: iscsiDenyAllSentinelIQN}, ShareTypeISCSI)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "reserved iSCSI fencing identity")
+
+	// A real IQN still validates.
+	require.NoError(t, validateIdentityForProtocol(
+		NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:worker-a"}, ShareTypeISCSI))
+}
+
+// TestNewPublicationRecordRejectsDenyAllSentinelIQN proves the sentinel can never
+// enter a durable publication record: newPublicationRecord flows through
+// encodeNodeIdentity, which rejects the reserved IQN.
+func TestNewPublicationRecordRejectsDenyAllSentinelIQN(t *testing.T) {
+	_, err := newPublicationRecord(NodeIdentity{Name: "worker-a", ISCSIIQN: iscsiDenyAllSentinelIQN},
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved iSCSI fencing identity")
 }
 
 func TestStrictISCSIShareCreationStartsWithPortalBoundDenyAllGroup(t *testing.T) {

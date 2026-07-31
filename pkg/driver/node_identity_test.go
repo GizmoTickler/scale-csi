@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -90,4 +91,66 @@ func nodeIPStrings(ips []net.IP) []string {
 		values = append(values, ip.String())
 	}
 	return values
+}
+
+// TestEncodeNodeIdentityRejectsDenyAllSentinelIQN pins the round-2 F2 fix at the
+// node_id / publication-record choke point: encodeNodeIdentity (which both
+// NodeGetInfo's node_id and newPublicationRecord flow through) must reject the
+// reserved deny-all sentinel so it can never be packed into a node identity.
+func TestEncodeNodeIdentityRejectsDenyAllSentinelIQN(t *testing.T) {
+	_, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: iscsiDenyAllSentinelIQN})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved iSCSI fencing identity")
+
+	// A real IQN still encodes.
+	_, err = encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:worker-a"})
+	require.NoError(t, err)
+}
+
+// TestDiscoverNodeIdentityRejectsDenyAllSentinelIQN proves a misconfigured
+// initiatorname.iscsi carrying the sentinel is refused as the node's identity
+// (treated as unreported) rather than propagated into node_id. The node plugin
+// still starts for other protocols; fenced iSCSI publish then fails closed.
+func TestDiscoverNodeIdentityRejectsDenyAllSentinelIQN(t *testing.T) {
+	origRead := nodeReadIdentityFile
+	origCmd := nodeIdentityCommand
+	origAddrs := nodeInterfaceAddrs
+	t.Cleanup(func() {
+		nodeReadIdentityFile = origRead
+		nodeIdentityCommand = origCmd
+		nodeInterfaceAddrs = origAddrs
+	})
+	nodeIdentityCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, fmt.Errorf("nvme not installed")
+	}
+	nodeInterfaceAddrs = func() ([]net.Addr, error) { return nil, nil }
+	nodeReadIdentityFile = func(path string) ([]byte, error) {
+		if path == "/etc/iscsi/initiatorname.iscsi" {
+			return []byte("InitiatorName=" + iscsiDenyAllSentinelIQN + "\n"), nil
+		}
+		return nil, fmt.Errorf("no such file")
+	}
+
+	identity := discoverNodeIdentity(context.Background(), "worker-a")
+	assert.Equal(t, "worker-a", identity.Name)
+	assert.Empty(t, identity.ISCSIIQN, "the reserved deny-all sentinel must never be accepted as a node IQN")
+}
+
+// TestParsedDenyAllSentinelNodeIDIsRejectedAtValidation covers an
+// already-persisted collision: parseNodeIdentity stays intentionally tolerant so
+// a legacy node_id carrying the sentinel is surfaced (not silently dropped), but
+// the parsed identity must then be rejected at protocol validation so it is never
+// enforced as an allowlist grant.
+func TestParsedDenyAllSentinelNodeIDIsRejectedAtValidation(t *testing.T) {
+	raw := []byte{nodeIdentityVersion}
+	raw = append(raw, nodeIdentityFieldName, byte(len("worker-a")))
+	raw = append(raw, "worker-a"...)
+	raw = append(raw, nodeIdentityFieldIQN, byte(len(iscsiDenyAllSentinelIQN)))
+	raw = append(raw, iscsiDenyAllSentinelIQN...)
+	identity, err := parseNodeIdentity(nodeIdentityPrefix + base64.RawURLEncoding.EncodeToString(raw))
+	require.NoError(t, err, "parse stays tolerant so a persisted collision is surfaced, not dropped")
+	require.Equal(t, iscsiDenyAllSentinelIQN, identity.ISCSIIQN)
+
+	require.Error(t, validateIdentityForProtocol(identity, ShareTypeISCSI),
+		"a persisted sentinel identity must be rejected before it can be enforced as a grant")
 }

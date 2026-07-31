@@ -36,7 +36,13 @@ type ShareBackend interface {
 	// backend applies the subset its protocol uses, preserving the former
 	// per-protocol switch exactly. res carries the request's memoized backend
 	// objects (see fenceResolution); backends reuse them instead of re-resolving.
-	ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, res *fenceResolution) error
+	// hasDeferredActiveISCSI reports that at least one ACTIVE iSCSI identity was
+	// deferred (live publication whose IQN is momentarily unresolvable) rather
+	// than removed. Only the iSCSI backend consumes it: when the real-IQN
+	// allowlist is empty AND a deferred-active identity exists, the empty set is
+	// NOT a genuine last-unpublish, so iSCSI skips the mutation instead of
+	// writing the deny-all sentinel (which would self-fence the live node).
+	ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, hasDeferredActiveISCSI bool, res *fenceResolution) error
 	// VolumeContext populates the protocol-specific publish context keys onto
 	// volumeContext (which already carries node_attach_driver).
 	VolumeContext(ctx context.Context, ds *truenas.Dataset, datasetName string, volumeContext map[string]string) error

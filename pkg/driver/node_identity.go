@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+
+	"k8s.io/klog/v2"
 )
 
 // CSI limits node_id to 256 bytes. A small versioned TLV envelope keeps the
@@ -65,6 +67,13 @@ func encodeNodeIdentity(identity NodeIdentity) (string, error) {
 	identity = trimNodeIdentityDescriptionFields(identity)
 	if strings.TrimSpace(identity.Name) == "" {
 		return "", fmt.Errorf("node name is required")
+	}
+	if isISCSIDenyAllSentinel(identity.ISCSIIQN) {
+		// The deny-all sentinel is a reserved backend fencing value, never a real
+		// node identity. Reject it here so it can never be packed into a node_id or
+		// a durable publication record (both flow through encodeNodeIdentity); a
+		// node that reports it cannot publish until it reports a real IQN.
+		return "", fmt.Errorf("node %s reported the reserved iSCSI fencing identity %q as its own initiator IQN", identity.Name, identity.ISCSIIQN)
 	}
 	raw := []byte{nodeIdentityVersion}
 	var err error
@@ -239,6 +248,15 @@ func discoverNodeIdentity(ctx context.Context, nodeName string) NodeIdentity {
 				break
 			}
 		}
+	}
+	if isISCSIDenyAllSentinel(identity.ISCSIIQN) {
+		// The deny-all sentinel is a reserved backend fencing value, never a real
+		// node IQN. Refuse it as this node's identity (treat it as unreported) so a
+		// misconfigured initiatorname.iscsi cannot put the sentinel into node_id;
+		// the node plugin still starts for other protocols, but fenced iSCSI
+		// publish fails closed until a real IQN is reported.
+		klog.Warningf("discoverNodeIdentity: node %s reported the reserved iSCSI fencing identity %q; ignoring it as a node IQN", nodeName, identity.ISCSIIQN)
+		identity.ISCSIIQN = ""
 	}
 	for _, envName := range []string{"NODE_IP", "NODE_IPS"} {
 		for _, value := range strings.FieldsFunc(os.Getenv(envName), func(r rune) bool { return r == ',' || r == ' ' }) {

@@ -27,7 +27,7 @@ func (b nfsShareBackend) DeleteShare(ctx context.Context, ds *truenas.Dataset, d
 	return b.d.deleteNFSShareForDataset(ctx, ds, datasetName)
 }
 
-func (b nfsShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, res *fenceResolution) error {
+func (b nfsShareBackend) ApplyFence(ctx context.Context, ds *truenas.Dataset, datasetName string, enforceable, removing []NodeIdentity, ownedNFSHosts, ownedNVMeNQNs, protectedNFSHosts, protectedNVMeNQNs []string, hasDeferredActiveISCSI bool, res *fenceResolution) error {
 	return b.d.applyNFSFence(ctx, ds, datasetName, enforceable, ownedNFSHosts, uniqueSortedStrings(protectedNFSHosts), res)
 }
 
