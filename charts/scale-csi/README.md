@@ -450,12 +450,16 @@ are singleton writers.
 | `resilience.retry.initialDelay` | Initial retry delay in milliseconds | `500` |
 | `resilience.retry.maxDelay` | Maximum retry delay in milliseconds | `5000` |
 | `resilience.retry.backoffMultiplier` | Exponential backoff multiplier | `2.0` |
-| `resilience.rateLimiting.maxConcurrentRequests` | Concurrent API request limit | `10` |
 | `resilience.rateLimiting.maxConcurrentLogins` | Concurrent login limit per portal | `2` |
 | `commandTimeouts.mount` | Mount timeout in seconds | `30` |
 | `commandTimeouts.format` | Format timeout in seconds | `300` |
 | `commandTimeouts.iscsi` | `iscsiadm` timeout in seconds | `10` |
 | `commandTimeouts.nvme` | `nvme` timeout in seconds | `30` |
+
+> `resilience.rateLimiting.maxConcurrentRequests` was removed: it was never wired
+> to anything. The API concurrency limit is `truenas.maxConcurrentRequests`. The
+> values schema still accepts the old key (ignored) so existing values files do
+> not fail validation.
 
 ### Session garbage collection
 

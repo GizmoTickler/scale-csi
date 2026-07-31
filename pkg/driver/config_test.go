@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -454,6 +455,59 @@ iscsi:
 	require.NoError(t, err)
 	assert.Contains(t, warning, "iscsi.targetPortals")
 	assert.Contains(t, warning, "does not currently support iSCSI multipath")
+}
+
+func TestLoadConfigWarnsWhenDeprecatedRateLimitingConcurrencySet(t *testing.T) {
+	originalWarningf := configWarningf
+	t.Cleanup(func() { configWarningf = originalWarningf })
+	var warnings []string
+	configWarningf = func(format string, args ...interface{}) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}
+
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+resilience:
+  rateLimiting:
+    maxConcurrentRequests: 25
+`)
+	require.NoError(t, err, "the deprecated key must still parse for backward compatibility")
+	assert.Equal(t, 25, cfg.Resilience.RateLimiting.MaxConcurrentRequests, "the key still parses for backward compatibility but is consumed by nothing")
+
+	var deprecations int
+	for _, warning := range warnings {
+		if strings.Contains(warning, "resilience.rateLimiting.maxConcurrentRequests is deprecated") {
+			deprecations++
+			assert.Contains(t, warning, "truenas.maxConcurrentRequests")
+		}
+	}
+	assert.Equal(t, 1, deprecations, "exactly one deprecation warning must fire when the key is set")
+}
+
+func TestLoadConfigNoDeprecationWarningWhenRateLimitingConcurrencyUnset(t *testing.T) {
+	originalWarningf := configWarningf
+	t.Cleanup(func() { configWarningf = originalWarningf })
+	var warnings []string
+	configWarningf = func(format string, args ...interface{}) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}
+
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+resilience:
+  rateLimiting:
+    maxConcurrentLogins: 4
+`)
+	require.NoError(t, err)
+	assert.Zero(t, cfg.Resilience.RateLimiting.MaxConcurrentRequests, "the deprecated key carries no default once unset")
+	assert.Equal(t, 4, cfg.Resilience.RateLimiting.MaxConcurrentLogins, "the still-wired login limit keeps its explicit value")
+	for _, warning := range warnings {
+		assert.NotContains(t, warning, "rateLimiting.maxConcurrentRequests is deprecated")
+	}
 }
 
 func TestRepositoryExampleConfigsParseStrictly(t *testing.T) {

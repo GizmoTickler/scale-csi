@@ -622,7 +622,9 @@ resilience:
     maxDelay: 5000
     backoffMultiplier: 2.0
   rateLimiting:
-    maxConcurrentRequests: 10
+    # maxConcurrentRequests was removed: it was never wired to anything. The API
+    # concurrency limit is truenas.maxConcurrentRequests. The schema still accepts
+    # the old key so existing values files do not fail validation, but it is ignored.
     maxConcurrentLogins: 2
 
 # Host command timeouts in seconds

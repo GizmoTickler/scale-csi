@@ -1020,6 +1020,7 @@
           "additionalProperties": false,
           "properties": {
             "maxConcurrentRequests": {
+              "description": "DEPRECATED, ignored. Retained only so old values files pass validation; the API concurrency limit is truenas.maxConcurrentRequests.",
               "type": "integer",
               "minimum": 1
             },

@@ -194,8 +194,10 @@ The driver includes automatic session garbage collection. If you see duplicate s
        maxConcurrentLogins: 2   # Limit iSCSI login concurrency
    ```
 
-   The chart exposes only `maxConcurrentRequests` and
-   `maxConcurrentLogins` under `resilience.rateLimiting`;
+   The chart exposes only `maxConcurrentLogins` under
+   `resilience.rateLimiting` (iSCSI login concurrency). The former
+   `maxConcurrentRequests` key was deprecated and removed — the API
+   concurrency limit is `truenas.maxConcurrentRequests`.
    `discoveryCacheDuration` is not a valid chart value.
 
 2. **Tune retry settings:**

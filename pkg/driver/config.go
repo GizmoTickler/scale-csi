@@ -495,7 +495,8 @@ type ResilienceConfig struct {
 	// Retry configures retry behavior for API calls
 	Retry RetryConfig `yaml:"retry"`
 
-	// RateLimiting configures rate limiting for API calls
+	// RateLimiting configures iSCSI login concurrency and discovery caching. Its
+	// maxConcurrentRequests key is deprecated and ignored (see RateLimitConfig).
 	RateLimiting RateLimitConfig `yaml:"rateLimiting"`
 }
 
@@ -534,7 +535,10 @@ type RetryConfig struct {
 
 // RateLimitConfig holds rate limiting configuration.
 type RateLimitConfig struct {
-	// MaxConcurrentRequests limits concurrent API requests (default: 10)
+	// MaxConcurrentRequests is DEPRECATED and has no effect. It was never wired
+	// to the API concurrency limiter — that is truenas.maxConcurrentRequests. The
+	// field is retained only so strict YAML parsing of existing configmaps does
+	// not fail; LoadConfig logs a deprecation warning when it is set.
 	MaxConcurrentRequests int `yaml:"maxConcurrentRequests"`
 
 	// MaxConcurrentLogins limits concurrent iSCSI logins per portal (default: 2)
@@ -641,6 +645,9 @@ func LoadConfig(path string) (*Config, error) {
 	if len(cfg.ISCSI.TargetPortals) > 0 {
 		configWarningf("iscsi.targetPortals is configured with %d additional portal(s), but scale-csi does not currently support iSCSI multipath; only iscsi.targetPortal will be used", len(cfg.ISCSI.TargetPortals))
 	}
+	if deprecatedRateLimitingConcurrencySet(data) {
+		configWarningf("resilience.rateLimiting.maxConcurrentRequests is deprecated and has no effect; the concurrency limit is truenas.maxConcurrentRequests")
+	}
 	if strings.TrimSpace(cfg.DriverInstanceID) == "" {
 		cfg.DriverInstanceID = strings.TrimSpace(cfg.InstanceID)
 	}
@@ -703,6 +710,18 @@ func applyProtocolEnabledBackCompat(cfg *Config, data []byte) error {
 		cfg.NVMeoF.Enabled = true
 	}
 	return nil
+}
+
+// deprecatedRateLimitingConcurrencySet reports whether the raw config document
+// sets the retired resilience.rateLimiting.maxConcurrentRequests key, so
+// LoadConfig can warn exactly once for configs that still carry it. Presence (not
+// value) is the trigger: the field is ignored regardless of what it is set to.
+func deprecatedRateLimitingConcurrencySet(data []byte) bool {
+	var configDocument yaml.Node
+	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&configDocument); err != nil {
+		return false
+	}
+	return yamlPathExists(&configDocument, "resilience", "rateLimiting", "maxConcurrentRequests")
 }
 
 // applyConfigDefaults fills in the post-decode default values for every optional
@@ -833,10 +852,8 @@ func applyConfigDefaults(cfg *Config) {
 		cfg.Resilience.Retry.BackoffMultiplier = 2.0
 	}
 
-	// Resilience defaults - Rate Limiting
-	if cfg.Resilience.RateLimiting.MaxConcurrentRequests == 0 {
-		cfg.Resilience.RateLimiting.MaxConcurrentRequests = 10
-	}
+	// Resilience defaults - Rate Limiting. maxConcurrentRequests is deprecated and
+	// ignored, so it deliberately has no default (see RateLimitConfig).
 	if cfg.Resilience.RateLimiting.MaxConcurrentLogins == 0 {
 		cfg.Resilience.RateLimiting.MaxConcurrentLogins = 2
 	}
@@ -945,7 +962,6 @@ func validateNonNegativeConfig(cfg *Config) error {
 		{"resilience.retry.maxAttempts", cfg.Resilience.Retry.MaxAttempts},
 		{"resilience.retry.initialDelay", cfg.Resilience.Retry.InitialDelay},
 		{"resilience.retry.maxDelay", cfg.Resilience.Retry.MaxDelay},
-		{"resilience.rateLimiting.maxConcurrentRequests", cfg.Resilience.RateLimiting.MaxConcurrentRequests},
 		{"resilience.rateLimiting.maxConcurrentLogins", cfg.Resilience.RateLimiting.MaxConcurrentLogins},
 		{"resilience.rateLimiting.discoveryCacheDuration", cfg.Resilience.RateLimiting.DiscoveryCacheDuration},
 		{"commandTimeouts.mount", cfg.CommandTimeouts.Mount},

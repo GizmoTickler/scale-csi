@@ -175,13 +175,14 @@ resilience:
     maxConcurrentLogins: 2
 ```
 
-> **The API concurrency limit is `truenas.maxConcurrentRequests`, not
-> `resilience.rateLimiting.maxConcurrentRequests`.** The chart/schema accept a
-> `resilience.rateLimiting.maxConcurrentRequests` key, but it is **not wired to
-> anything** — only `truenas.maxConcurrentRequests` reaches the client's API
-> semaphore. Under `resilience.rateLimiting`, only `maxConcurrentLogins` (iSCSI
-> login concurrency) is effective. Tune `truenas.maxConcurrentRequests` to protect
-> an overloaded NAS.
+> **The API concurrency limit is `truenas.maxConcurrentRequests`.** The former
+> `resilience.rateLimiting.maxConcurrentRequests` key was never wired to anything
+> and is now **deprecated and ignored**: the chart no longer renders it and the
+> driver logs a warning if a configmap still sets it (the values schema keeps
+> accepting it so old values files do not fail validation). Only
+> `truenas.maxConcurrentRequests` reaches the client's API semaphore. Under
+> `resilience.rateLimiting`, only `maxConcurrentLogins` (iSCSI login concurrency)
+> is effective. Tune `truenas.maxConcurrentRequests` to protect an overloaded NAS.
 
 Retries apply only to connection-class failures; an ambiguous non-idempotent
 mutation is not retried. The circuit breaker is opt-in and disabled by default;

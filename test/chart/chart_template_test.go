@@ -51,6 +51,22 @@ func TestChartTombstoneReaperScanFallbackPlumbing(t *testing.T) {
 	}
 }
 
+// TestChartRateLimitingDeprecation proves the retired
+// resilience.rateLimiting.maxConcurrentRequests key is no longer rendered into the
+// driver configmap, while the still-wired maxConcurrentLogins key keeps rendering.
+// The driver ignores maxConcurrentRequests (the API concurrency limit is
+// truenas.maxConcurrentRequests), so rendering it would suggest a wiring that does
+// not exist.
+func TestChartRateLimitingDeprecation(t *testing.T) {
+	out := helmTemplate(t)
+	if strings.Contains(out, "      rateLimiting:\n        maxConcurrentRequests:") {
+		t.Errorf("rendered configmap still carries the deprecated resilience.rateLimiting.maxConcurrentRequests key")
+	}
+	if !strings.Contains(out, "      rateLimiting:\n        maxConcurrentLogins: 2\n") {
+		t.Errorf("rendered configmap dropped the still-wired resilience.rateLimiting.maxConcurrentLogins key")
+	}
+}
+
 // TestChartSidecarTimeouts pins the CSI sidecar --timeout flags: the attacher and
 // resizer run with a 120s deadline (bounding publish/unpublish/expand), while the
 // provisioner and snapshotter keep 300s. A regression that reverts the

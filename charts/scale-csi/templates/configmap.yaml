@@ -147,7 +147,6 @@ data:
         maxDelay: {{ .Values.resilience.retry.maxDelay }}
         backoffMultiplier: {{ .Values.resilience.retry.backoffMultiplier }}
       rateLimiting:
-        maxConcurrentRequests: {{ .Values.resilience.rateLimiting.maxConcurrentRequests }}
         maxConcurrentLogins: {{ .Values.resilience.rateLimiting.maxConcurrentLogins }}
 
     commandTimeouts:
