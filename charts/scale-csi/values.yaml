@@ -296,6 +296,13 @@ zfs:
   # 30d safety bound. TrueNAS 26.0 retention is time-based only (no count cap).
   snapshotRetention: ""
 
+  # Promote clone-restored volumes in the background reconcile pass to drop their
+  # origin-snapshot pin once each is the sole dependent of its origin (GF2/E3),
+  # letting the tombstone reaper reclaim the source snapshot and the source volume
+  # become destroyable. Default false: clones keep their origin pin as before and
+  # the rendered config carries no promoteRestoredClones key.
+  promoteRestoredClones: false
+
 # NFS configuration
 nfs:
   # Enable NFS support

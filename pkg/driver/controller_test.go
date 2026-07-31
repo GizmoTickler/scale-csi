@@ -1721,6 +1721,10 @@ func TestDeleteVolumeReturnsOriginSnapshotDeleteFailure(t *testing.T) {
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/clone", Type: "FILESYSTEM"})
 	require.NoError(t, err)
 	require.NoError(t, client.DatasetSetUserProperty(ctx, "pool/parent/clone", PropVolumeOriginSnapshot, originID))
+	// A real volume-to-volume clone carries the temp snapshot as its live ZFS
+	// origin; model it so the GF2/E3 promote-away guard (empty live origin) does
+	// not mistake this fixture for a promoted clone.
+	client.Datasets["pool/parent/clone"].Origin = originProp(originID)
 
 	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "clone"})
 	require.Error(t, err)
@@ -1749,6 +1753,9 @@ func TestDeleteVolumeRetriesOriginSnapshotDelete(t *testing.T) {
 	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/clone", Type: "FILESYSTEM"})
 	require.NoError(t, err)
 	require.NoError(t, client.DatasetSetUserProperty(ctx, "pool/parent/clone", PropVolumeOriginSnapshot, originID))
+	// Model the live ZFS origin a real volume-to-volume clone carries (see the
+	// promote-away guard note in TestDeleteVolumeReturnsOriginSnapshotDeleteFailure).
+	client.Datasets["pool/parent/clone"].Origin = originProp(originID)
 
 	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "clone"})
 	require.NoError(t, err)

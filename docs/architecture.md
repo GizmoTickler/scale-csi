@@ -236,6 +236,18 @@ The driver leverages native ZFS capabilities:
 - **Volume-to-volume clone** (PVC dataSource) is always clone-backed regardless of
   `snapshotRestoreMode`: the driver takes an internal temporary snapshot and
   `zfs clone`s it.
+- **Lazy clone independence (GF2/E3, opt-in `zfs.promoteRestoredClones`)**: a
+  background reconcile step can `pool.dataset.promote` a clone-restored volume to
+  drop its origin-snapshot pin once it is the **sole dependent** of that origin,
+  making the restored volume lifecycle-independent and letting the tombstone
+  reaper reclaim the source snapshot (and the source volume become destroyable).
+  Promote is a single atomic ZFS operation that MOVES the origin snapshot onto
+  the promoted clone and re-parents any sibling clones — so it is gated on
+  sole-dependency and is idempotent (an already-independent dataset has an empty
+  origin and is skipped). The tombstone ledger self-heals across the promote ID
+  migration: an entry keyed by the pre-promote snapshot ID resolves to NotFound
+  and is retired as already-gone, while the migrated tombstone stays reaped under
+  the promoted dataset's ownership stamp.
 
 ## Volume ID Format
 

@@ -61,6 +61,9 @@ data:
       {{- with .Values.zfs.snapshotRetention }}
       snapshotRetention: {{ . | quote }}
       {{- end }}
+      {{- if .Values.zfs.promoteRestoredClones }}
+      promoteRestoredClones: true
+      {{- end }}
 
     {{- if .Values.nfs.enabled }}
     # NFS configuration

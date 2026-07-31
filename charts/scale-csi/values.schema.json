@@ -569,6 +569,10 @@
           "type": "string",
           "default": ""
         },
+        "promoteRestoredClones": {
+          "type": "boolean",
+          "default": false
+        },
         "dedup": {
           "type": "boolean",
           "description": "Deprecated compatibility value; use datasetProperties."

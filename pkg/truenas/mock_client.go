@@ -45,6 +45,7 @@ type MockClient struct {
 	nextSnapshotTaskID         int
 	deferredSnapshots          map[string]struct{}
 	DatasetDeleteCalls         []DatasetDeleteCall
+	DatasetPromoteCalls        []string
 	ReplicationJobAbortCalls   []int64
 	ReplicationJobAbortReasons []string
 	SnapshotSetCalls           int
@@ -595,6 +596,55 @@ func (m *MockClient) DatasetHasDependentClones(ctx context.Context, datasetName 
 		}
 	}
 	return false, nil
+}
+
+// DatasetPromote models pool.dataset.promote (P3): the promoted clone becomes
+// independent (its origin is cleared), the origin snapshot MIGRATES onto the
+// promoted clone (its dataset/ID change), and every sibling clone whose origin
+// was that snapshot is re-parented onto the migrated snapshot. This is the
+// dependency inversion the ledger self-heal (R3) must survive.
+func (m *MockClient) DatasetPromote(ctx context.Context, datasetName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	ds, ok := m.Datasets[datasetName]
+	if !ok {
+		return notFoundAPIError("dataset not found")
+	}
+	origin := datasetPropertyString(ds.Origin)
+	if origin == "" {
+		return &APIError{Code: -1, Message: "dataset is not a clone; nothing to promote"}
+	}
+	m.DatasetPromoteCalls = append(m.DatasetPromoteCalls, datasetName)
+
+	_, originSnapName, _ := strings.Cut(origin, "@")
+	migratedID := datasetName + "@" + originSnapName
+
+	// Migrate the origin snapshot object intact onto the promoted clone.
+	if snap, ok := m.Snapshots[origin]; ok {
+		delete(m.Snapshots, origin)
+		snap.Dataset = datasetName
+		snap.Name = originSnapName
+		snap.ID = migratedID
+		m.Snapshots[migratedID] = snap
+		// Carry a hold across the migration (P1: holds survive rename/promote).
+		if _, held := m.snapshotHolds[origin]; held {
+			delete(m.snapshotHolds, origin)
+			m.snapshotHolds[migratedID] = struct{}{}
+		}
+	}
+
+	// Re-parent sibling clones (and clear the promoted clone's own origin).
+	for _, other := range m.Datasets {
+		if datasetPropertyString(other.Origin) == origin {
+			other.Origin = DatasetProperty{Value: migratedID, Parsed: migratedID, Rawvalue: migratedID, Source: "LOCAL"}
+		}
+	}
+	ds.Origin = DatasetProperty{}
+	return nil
 }
 
 func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {

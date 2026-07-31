@@ -104,7 +104,10 @@ type ReconcileReport struct {
 	// ScheduledSnapshotCount is the number of driver-managed periodic snapshots
 	// (GF2/E2) observed under scheduled volumes during the pass. Reported for
 	// visibility only; these snapshots are never an orphan/delete candidate (R4).
-	ScheduledSnapshotCount     int
+	ScheduledSnapshotCount int
+	// PromotedCloneCount is the number of clone-restored volumes promoted (GF2/E3)
+	// during the pass to release their origin-snapshot pin.
+	PromotedCloneCount         int
 	OrphanVolumeBytes          int64
 	OrphanSnapshotBytes        int64
 	TombstoneSnapshotBytes     int64
@@ -255,6 +258,16 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	managedBackendVolumeCount := d.classifyOrphanVolumes(ctx, now, datasets, kubeState, minOrphanAge, &report)
 	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, datasets, kubeState, minOrphanAge, &report)
 	d.classifyTombstones(now, tombstones, ledger, minOrphanAge, &report)
+
+	// GF2/E3 background promote (opt-in zfs.promoteRestoredClones): free
+	// clone-restored volumes from their origin-snapshot pin when each is the sole
+	// dependent of its origin, so the tombstone reaper can reclaim source
+	// snapshots. The step is a no-op unless the flag is set.
+	d.reconcilePromoteRestoredClones(ctx, datasets, &report)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		RecordReconcileFailure("promote_restored_clones")
+		return report, ctxErr
+	}
 
 	// Scan fallback (reconcile.tombstoneReaper.scanFallback, default off) runs
 	// independently of the strict ledger backlog. It reuses this pass's already

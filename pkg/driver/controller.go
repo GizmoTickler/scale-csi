@@ -1151,9 +1151,18 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// Get origin snapshot property before deletion (for volume-to-volume clones)
 	// This snapshot was created during cloning and should be cleaned up after the clone is deleted
 	var originSnapshotID string
+	originPromotedAway := false
 	if ds != nil {
 		if prop, ok := ds.UserProperties[PropVolumeOriginSnapshot]; ok && prop.Value != "" && prop.Value != "-" {
 			originSnapshotID = prop.Value
+			// GF2/E3 (R3.3): promote migrates the origin snapshot onto the promoted
+			// clone and clears the dataset's live origin property. When the stored
+			// origin-snapshot id is present but the LIVE origin is now empty, the
+			// clone was promoted and the snapshot no longer lives where the stored
+			// id points — skip the cleanup rather than chase a migrated snapshot.
+			if datasetOriginSnapshotID(ds) == "" {
+				originPromotedAway = true
+			}
 		}
 	}
 
@@ -1260,12 +1269,14 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 
 	// Clean up origin snapshot if this was a volume-to-volume clone
 	// The clone's dependency on the snapshot is now broken, so we can delete it
-	if originSnapshotID != "" {
+	if originSnapshotID != "" && !originPromotedAway {
 		klog.Infof("Cleaning up origin snapshot %s for deleted volume clone %s", originSnapshotID, volumeID)
 		if err := d.deleteCloneOriginSnapshot(ctx, originSnapshotID); err != nil {
 			klog.Errorf("Failed to delete origin snapshot %s: %v", originSnapshotID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete clone origin snapshot %s: %v", originSnapshotID, err)
 		}
+	} else if originPromotedAway {
+		klog.V(4).Infof("Skipping origin-snapshot cleanup for promoted clone %s: origin snapshot %s migrated away", volumeID, originSnapshotID)
 	}
 
 	klog.Infof("Volume %s deleted successfully", volumeID)

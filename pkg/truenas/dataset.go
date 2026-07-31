@@ -491,6 +491,21 @@ func (c *Client) DatasetHasDependentClones(ctx context.Context, datasetName stri
 	return false, nil
 }
 
+// DatasetPromote promotes a clone so it no longer depends on its origin
+// snapshot (GF2/E3). pool.dataset.promote takes a single dataset-name string,
+// returns null, and works on both filesystems and zvols (P3). Promote MOVES the
+// origin snapshot (and every snapshot older-or-equal) onto the promoted clone
+// and re-parents the source + sibling clones onto it — so callers must gate on
+// sole-dependency before promoting (R3). Promoting an already-independent
+// dataset (empty origin) is a no-op the caller gates on; the backend error from
+// a redundant promote is surfaced for the caller to treat as benign.
+func (c *Client) DatasetPromote(ctx context.Context, datasetName string) error {
+	if _, err := c.Call(ctx, "pool.dataset.promote", datasetName); err != nil {
+		return fmt.Errorf("failed to promote dataset %s: %w", datasetName, err)
+	}
+	return nil
+}
+
 // snapshotDependentClones returns the datasets cloned from one exact snapshot —
 // the authoritative dependent-clone check on TrueNAS 26.0, where the snapshot
 // query APIs no longer expose the ZFS clones property.

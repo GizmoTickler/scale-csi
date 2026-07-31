@@ -212,6 +212,13 @@ type ZFSConfig struct {
 	// unbounded snapshots. TrueNAS 26.0 retention is TIME-based only (no count
 	// cap in the API, P2); a count cap is a separate driver-side follow-up.
 	SnapshotRetention string `yaml:"snapshotRetention"`
+
+	// PromoteRestoredClones enables the background reconcile step (GF2/E3) that
+	// promotes clone-restored volumes to drop their origin-snapshot pin once it is
+	// safe (the clone is the sole dependent of its origin snapshot), letting the
+	// tombstone reaper reclaim the source snapshot and the source volume become
+	// destroyable. Default false: clones keep their origin pin exactly as before.
+	PromoteRestoredClones bool `yaml:"promoteRestoredClones"`
 }
 
 // NFSConfig holds NFS share configuration.

@@ -348,6 +348,18 @@ var (
 		},
 	)
 
+	// clonesPromotedTotal counts background promote operations (GF2/E3) by
+	// outcome. A promote releases a clone-restored volume's origin-snapshot pin so
+	// the tombstone reaper can reclaim the source snapshot.
+	clonesPromotedTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "clones_promoted_total",
+			Help:      "Total clone-restored volumes promoted to release their origin-snapshot pin, by outcome",
+		},
+		[]string{"status"},
+	)
+
 	// Pool-capacity gauges (E4). Populated only when capacity.gaugeEnabled by a
 	// controller-only poll loop; cardinality is fixed at one series per gauge for
 	// this single-backend driver, labeled {pool,dataset}. pool_capacity_bytes is
@@ -527,6 +539,8 @@ func init() {
 		snapshotHoldsTotal.WithLabelValues(op, "success").Add(0)
 		snapshotHoldsTotal.WithLabelValues(op, "error").Add(0)
 	}
+	clonesPromotedTotal.WithLabelValues("success").Add(0)
+	clonesPromotedTotal.WithLabelValues("error").Add(0)
 }
 
 // RecordCSIOperation records metrics for a CSI operation
@@ -669,6 +683,16 @@ func RecordScheduledSnapshotTaskEnsured() {
 // periodic-snapshot task could not be ensured (GF2/E2).
 func RecordScheduledSnapshotTaskEnsureFailed() {
 	scheduledSnapshotTaskEnsureFailedTotal.Inc()
+}
+
+// RecordClonePromoted counts a background promote operation and its outcome
+// (GF2/E3).
+func RecordClonePromoted(err error) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	clonesPromotedTotal.WithLabelValues(status).Inc()
 }
 
 // SetOrphanReconcileMetrics publishes the latest detection report, including a

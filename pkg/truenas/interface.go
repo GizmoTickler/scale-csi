@@ -37,6 +37,7 @@ type ClientInterface interface {
 	DatasetExpand(ctx context.Context, name string, newSize int64) error
 	DatasetExists(ctx context.Context, name string) (bool, error)
 	DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error)
+	DatasetPromote(ctx context.Context, datasetName string) error
 	GetPoolAvailable(ctx context.Context, poolName string) (int64, error)
 	WaitForDatasetReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)
 	WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)

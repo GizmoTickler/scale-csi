@@ -236,6 +236,24 @@ func TestChartSnapshotSchedulePlumbing(t *testing.T) {
 	})
 }
 
+// TestChartPromoteRestoredClonesPlumbing proves the GF2/E3 zfs.promoteRestoredClones
+// key is removal-only rendered: ABSENT from the default configmap (default false =>
+// byte-identical render) and present only when enabled.
+func TestChartPromoteRestoredClonesPlumbing(t *testing.T) {
+	t.Run("default render omits promoteRestoredClones", func(t *testing.T) {
+		if out := helmTemplate(t, "--show-only", "templates/configmap.yaml"); strings.Contains(out, "promoteRestoredClones:") {
+			t.Errorf("default configmap must not emit zfs.promoteRestoredClones; the feature is opt-in")
+		}
+	})
+
+	t.Run("enabled renders the key", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.promoteRestoredClones=true")
+		if !strings.Contains(out, "      promoteRestoredClones: true\n") {
+			t.Errorf("--set zfs.promoteRestoredClones=true did not propagate into the rendered configmap; got:\n%s", out)
+		}
+	})
+}
+
 // TestChartDeprecatedKeysNotRendered proves the retired iscsi.extentAvailThreshold
 // and nvmeof.commandTimeout keys are no longer rendered into the driver configmap.
 // Both were parsed but consumed by nothing (the nvme CLI timeout is

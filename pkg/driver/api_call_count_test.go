@@ -162,6 +162,11 @@ func (c *apiCallCountingClient) DatasetHasDependentClones(ctx context.Context, n
 	return c.MockClient.DatasetHasDependentClones(ctx, name)
 }
 
+func (c *apiCallCountingClient) DatasetPromote(ctx context.Context, name string) error {
+	c.record("DatasetPromote")
+	return c.MockClient.DatasetPromote(ctx, name)
+}
+
 func (c *apiCallCountingClient) GetPoolAvailable(ctx context.Context, poolName string) (int64, error) {
 	c.record("GetPoolAvailable")
 	return c.MockClient.GetPoolAvailable(ctx, poolName)
