@@ -90,5 +90,15 @@ spec:
             summary: Scale CSI orphan snapshots detected
             description: CSI-managed TrueNAS snapshots have had no matching live VolumeSnapshotContent handle for longer than the reconcile alert window.
         {{- end }}
+        {{- if .Values.capacity.gaugeEnabled }}
+        - alert: ScaleCSIPoolNearFull
+          expr: (1 - (scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes)) > {{ .Values.metrics.prometheusRule.poolUsageThreshold | default 0.85 }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI backend pool is nearly full
+            description: Parent dataset usable capacity is above the configured threshold.
+        {{- end }}
         {{- end }}
 {{- end }}

@@ -138,6 +138,11 @@ type Driver struct {
 	startupReconcileOnce   sync.Once
 	startupReconcileSignal chan struct{}
 
+	// Controller-side pool-capacity gauge poll loop (E4). Runs only when
+	// capacity.gaugeEnabled; each tick is one bounded pool.dataset.query.
+	capacityCancel context.CancelFunc
+	capacityWg     sync.WaitGroup
+
 	// Background fencing state. Missing-record observations are in-memory on
 	// purpose: a controller restart restarts the full grace period rather than
 	// revoking an old record immediately after a fresh VA disappearance.
@@ -388,6 +393,7 @@ func (d *Driver) Run() error {
 	if d.runController {
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
+		d.startCapacityGauges()
 	}
 	if d.runNode {
 		d.startSessionGC()
@@ -405,6 +411,7 @@ func (d *Driver) Stop() {
 	d.stopSessionGC()
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
+	d.stopCapacityGauges()
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {

@@ -178,6 +178,29 @@ var (
 		},
 	)
 
+	// Pool-capacity gauges (E4). Populated only when capacity.gaugeEnabled by a
+	// controller-only poll loop; cardinality is fixed at one series per gauge for
+	// this single-backend driver, labeled {pool,dataset}. pool_capacity_bytes is
+	// used+available from the same pool.dataset.query row that feeds
+	// pool_available_bytes, so the near-full ratio is internally consistent.
+	poolAvailableBytes = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_available_bytes",
+			Help:      "ZFS-computed available bytes on the parent dataset (parity/quota/reservation-aware)",
+		},
+		[]string{"pool", "dataset"},
+	)
+
+	poolCapacityBytes = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_capacity_bytes",
+			Help:      "Total usable bytes (used + available) on the parent dataset",
+		},
+		[]string{"pool", "dataset"},
+	)
+
 	reconcileLastSuccessTimestamp = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -400,6 +423,14 @@ func SetOrphanReconcileMetrics(report ReconcileReport) {
 
 func RecordReconcileSuccess(at time.Time) {
 	reconcileLastSuccessTimestamp.Set(float64(at.Unix()))
+}
+
+// SetPoolCapacityMetrics publishes the latest parent-dataset capacity sample.
+// pool is the ZFS pool name and dataset the parent dataset path; available and
+// capacity are bytes (capacity = used + available from one pool.dataset.query).
+func SetPoolCapacityMetrics(pool, dataset string, available, capacity float64) {
+	poolAvailableBytes.WithLabelValues(pool, dataset).Set(available)
+	poolCapacityBytes.WithLabelValues(pool, dataset).Set(capacity)
 }
 
 func RecordReconcileFailure(phase string) {

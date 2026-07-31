@@ -235,6 +235,53 @@ func TestChartCapacityConfigPlumbing(t *testing.T) {
 			t.Errorf("--set capacity.reportMaximumVolumeSize=true did not render the capacity block; got:\n%s", out)
 		}
 	})
+
+	t.Run("gaugeEnabled renders the gauge block", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "capacity.gaugeEnabled=true")
+		const block = "    capacity:\n      gaugeEnabled: true\n      gaugeInterval: \"60s\"\n"
+		if !strings.Contains(out, block) {
+			t.Errorf("--set capacity.gaugeEnabled=true did not render the gauge block with default interval; got:\n%s", out)
+		}
+	})
+}
+
+// TestChartPoolCapacityAlert guards the ScaleCSIPoolNearFull PrometheusRule alert
+// (E4/K15). The alert depends on the capacity gauges, so it renders ONLY when both
+// metrics.prometheusRule.enabled and capacity.gaugeEnabled are true; with either
+// off (the default) it is absent, keeping the default render byte-identical.
+func TestChartPoolCapacityAlert(t *testing.T) {
+	t.Run("absent by default and with only prometheusRule", func(t *testing.T) {
+		if out := helmTemplate(t); strings.Contains(out, "ScaleCSIPoolNearFull") {
+			t.Errorf("default render must not emit ScaleCSIPoolNearFull")
+		}
+		out := helmTemplate(t, "--set", "metrics.prometheusRule.enabled=true")
+		if strings.Contains(out, "ScaleCSIPoolNearFull") {
+			t.Errorf("ScaleCSIPoolNearFull must stay absent unless capacity.gaugeEnabled is also true")
+		}
+	})
+
+	t.Run("present with both toggles and honors the threshold", func(t *testing.T) {
+		// A values file (not --set) supplies the numeric threshold: helm --set
+		// delivers decimals as strings, which the schema's type:number rejects.
+		valuesPath := filepath.Join(t.TempDir(), "pool-alert-values.yaml")
+		const values = `metrics:
+  prometheusRule:
+    enabled: true
+    poolUsageThreshold: 0.9
+capacity:
+  gaugeEnabled: true
+`
+		if err := os.WriteFile(valuesPath, []byte(values), 0o600); err != nil {
+			t.Fatalf("write override values: %v", err)
+		}
+		out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml", "-f", valuesPath)
+		if !strings.Contains(out, "- alert: ScaleCSIPoolNearFull") {
+			t.Errorf("both toggles on did not render ScaleCSIPoolNearFull; got:\n%s", out)
+		}
+		if !strings.Contains(out, ") > 0.9") {
+			t.Errorf("poolUsageThreshold=0.9 did not propagate into the alert expr; got:\n%s", out)
+		}
+	})
 }
 
 // TestChartHealthMonitorSidecar guards the external-health-monitor sidecar render

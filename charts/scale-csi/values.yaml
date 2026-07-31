@@ -23,6 +23,14 @@ capacity:
   # overcommit. TrueNAS 26.0 exposes no dedicated max-size API, so the ceiling
   # is the parent dataset's available bytes. Default off.
   reportMaximumVolumeSize: false
+  # E4: run a controller-only poll loop publishing scale_csi_pool_available_bytes
+  # and scale_csi_pool_capacity_bytes. STEADY-STATE API COST when enabled: +1
+  # pool.dataset.query per gaugeInterval per controller (default 60s => 1/min,
+  # singleton). Zero impact on the CreateVolume/publish/unpublish request-path
+  # golden totals. Default off (zero new calls).
+  gaugeEnabled: false
+  # Poll cadence for the capacity gauge loop. Values below 30s are clamped to it.
+  gaugeInterval: 60s
 
 # Stable ownership identity stamped on newly-created datasets/zvols. Empty
 # derives "<csiDriverName>@<zfs.parentDataset>". Never change this for an
@@ -586,6 +594,10 @@ metrics:
     additionalLabels: {}
     # Replaces the bundled rules when non-empty
     rules: []
+    # Pool-usage alert threshold (fraction 0..1) for ScaleCSIPoolNearFull. The
+    # alert renders only when capacity.gaugeEnabled is also true (it needs the
+    # scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes gauges).
+    poolUsageThreshold: 0.85
 
   # Grafana sidecar-discoverable dashboard ConfigMap
   dashboards:
