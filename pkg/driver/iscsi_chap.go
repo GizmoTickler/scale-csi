@@ -11,6 +11,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
+	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
 // CHAP mode strings stamped into target groups and the volume context. They
@@ -310,4 +311,36 @@ func (d *Driver) EnsureISCSIAuthPeer(ctx context.Context, secrets map[string]str
 	klog.Infof("Ensured shared iSCSI CHAP auth peer: tag=%d id=%d user=%q mutual=%v", tag, peer.ID, secret.Username, secret.MutualUsername != "")
 	d.iscsiResolvedAuth[tag] = peer
 	return &iscsiCHAPResolution{Peer: peer, Mutual: secret.MutualUsername != ""}, nil
+}
+
+// nodeISCSIChAPCredentials builds the node-side CHAP credentials from the volume
+// context mode flag and the node-stage secret. It returns nil when the volume is
+// not CHAP-enabled (mode absent or NONE), so the connect path applies no auth
+// params and behaves exactly as before CHAP existed. When CHAP is expected but
+// the secret is missing or invalid it fails fast with InvalidArgument rather
+// than letting iscsiadm enter a login retry storm. The returned struct is
+// short-lived and never logged.
+func nodeISCSIChAPCredentials(volumeContext, secrets map[string]string) (*util.ISCSICHAPCredentials, error) {
+	mode := volumeContext[volumeContextCHAPKey]
+	if mode == "" || mode == iscsiCHAPModeNone {
+		return nil, nil
+	}
+	secret := parseISCSIChAPSecret(secrets)
+	if err := validateISCSIChAPSecret(secret); err != nil {
+		return nil, err
+	}
+	creds := &util.ISCSICHAPCredentials{
+		Username: secret.Username,
+		Password: secret.Password,
+	}
+	if mode == iscsiCHAPModeMutual {
+		if secret.MutualUsername == "" || secret.MutualPassword == "" {
+			return nil, status.Error(codes.InvalidArgument,
+				"iSCSI CHAP_MUTUAL volume requires mutualUsername and mutualPassword in the node-stage secret")
+		}
+		creds.Mutual = true
+		creds.MutualUsername = secret.MutualUsername
+		creds.MutualPassword = secret.MutualPassword
+	}
+	return creds, nil
 }

@@ -1314,7 +1314,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeISCSI)
 
 	t.Run("NilVolumeContext", func(t *testing.T) {
-		err := d.stageISCSIVolume(context.Background(), nil, "/staging", nil)
+		err := d.stageISCSIVolume(context.Background(), nil, nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -1325,7 +1325,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 	t.Run("MissingPortal", func(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"iqn": "iqn.2005-10.org.freenas.ctl:vol1",
-		}, "/staging", nil)
+		}, nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -1337,7 +1337,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 	t.Run("MissingIQN", func(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260",
-		}, "/staging", nil)
+		}, nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -1351,7 +1351,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.2005-10.org.freenas.ctl:vol1",
 			"lun":    "invalid",
-		}, "/staging", nil)
+		}, nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -1392,7 +1392,7 @@ func TestBlockBackedFilesystemStagePassesNormalizedMountFlags(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.10:3260", "iqn": "iqn.test:volume", "lun": "0",
-		}, filepath.Join(t.TempDir(), "stage"), capability)
+		}, nil, filepath.Join(t.TempDir(), "stage"), capability)
 		require.NoError(t, err)
 		assert.Equal(t, "xfs", gotFS)
 		assert.Equal(t, []string{"noatime", "discard", "nouuid"}, gotFlags)
@@ -1479,7 +1479,7 @@ func TestStageISCSIVolumeRejectsMultipathOwnedDeviceBeforeMount(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeISCSI)
 	err := d.stageISCSIVolume(context.Background(), map[string]string{
 		"portal": "192.0.2.10:3260", "iqn": "iqn.test:volume", "lun": "0",
-	}, filepath.Join(t.TempDir(), "stage"), &csi.VolumeCapability{
+	}, nil, filepath.Join(t.TempDir(), "stage"), &csi.VolumeCapability{
 		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
 	})
 	require.Error(t, err)
@@ -1500,7 +1500,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
-		}, stagingPath, &csi.VolumeCapability{
+		}, nil, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
 		})
 		require.NoError(t, err)
@@ -1545,7 +1545,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
-		}, stagingPath, &csi.VolumeCapability{
+		}, nil, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
 		require.NoError(t, err)
@@ -1598,7 +1598,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
-		}, stagingPath, &csi.VolumeCapability{
+		}, nil, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
 		require.NoError(t, err)
@@ -1663,7 +1663,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260", "iqn": "iqn.test:vol1",
-		}, stagingPath, &csi.VolumeCapability{
+		}, nil, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
 		require.NoError(t, err)

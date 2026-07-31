@@ -645,7 +645,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			return nil, err
 		}
 	case ShareTypeISCSI:
-		if err := d.stageISCSIVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+		if err := d.stageISCSIVolume(ctx, volumeContext, req.GetSecrets(), stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	case ShareTypeNVMeoF:
@@ -1513,7 +1513,7 @@ func (d *Driver) finalizeStagedDevice(ctx context.Context, devicePath, stagingPa
 }
 
 // stageISCSIVolume connects and mounts an iSCSI volume to the staging path.
-func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
+func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext, secrets map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for iSCSI staging")
 	}
@@ -1567,14 +1567,33 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		relist:      util.ListISCSISessions,
 	}, iqn, stagingPath, sessions)
 
+	// Build node-side CHAP credentials from the volume context mode flag and the
+	// node-stage secret. nil means CHAP is off for this volume and the connect
+	// path applies no auth params (zero behavior change). A CHAP volume with a
+	// missing/invalid secret fails fast here with InvalidArgument rather than
+	// letting iscsiadm enter a login retry storm.
+	chapCreds, err := nodeISCSIChAPCredentials(volumeContext, secrets)
+	if err != nil {
+		return err
+	}
+
 	// Connect to iSCSI target with configurable timeout
 	connectOpts := &util.ISCSIConnectOptions{
 		DeviceTimeout:       time.Duration(d.config.ISCSI.DeviceWaitTimeout) * time.Second,
 		SessionCleanupDelay: time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond,
+		CHAP:                chapCreds,
 	}
 	devicePath, err := iscsiConnectWithSessions(ctx, portal, iqn, lun, connectOpts, sessions)
 	if err != nil {
 		RecordNodeConnect("iscsi", "error")
+		if errors.Is(err, util.ErrISCSIAuthFailure) {
+			// A wrong CHAP secret is terminal and must not retry. Return
+			// Unauthenticated with a redacted message (no credential, no raw
+			// iscsiadm output) so kubelet surfaces a clean failure.
+			operationErr := status.Errorf(codes.Unauthenticated, "iSCSI CHAP authentication failed for %s", iqn)
+			d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSILoginFailed, operationErr.Error())
+			return operationErr
+		}
 		operationErr := status.Errorf(codes.Internal, "failed to connect iSCSI: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSILoginFailed, operationErr.Error())
 		return operationErr
