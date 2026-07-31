@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -56,7 +57,29 @@ func (d *Driver) nvmeofVolumeContext(ctx context.Context, ds *truenas.Dataset, d
 	volumeContext["transport"] = d.config.NVMeoF.Transport
 	volumeContext["address"] = d.config.NVMeoF.TransportAddress
 	volumeContext["port"] = strconv.Itoa(d.config.NVMeoF.TransportServiceID)
+	// E-6 multipath: advertise every storage address so a multipath-aware node can
+	// connect each to the same NQN. The single "address" key above is retained for
+	// back-compat with nodes that connect one path. Emitted only when multipath is
+	// enabled so the default publish context is unchanged.
+	if addresses := d.config.NVMeoF.multipathAddresses(); len(addresses) > 0 {
+		encoded, err := json.Marshal(addresses)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to encode NVMe-oF multipath addresses: %v", err)
+		}
+		volumeContext["addresses"] = string(encoded)
+	}
 	return nil
+}
+
+// nvmeofPortCreateOpts builds the install-wide NVMe-oF port performance options
+// (E-4) from config. An all-nil config yields a zero options value, which omits
+// every field and reproduces the historical port create exactly.
+func (d *Driver) nvmeofPortCreateOpts() truenas.NVMeoFPortCreateOptions {
+	return truenas.NVMeoFPortCreateOptions{
+		InlineDataSize: d.config.NVMeoF.PortPerf.InlineDataSize,
+		MaxQueueSize:   d.config.NVMeoF.PortPerf.MaxQueueSize,
+		PiEnable:       d.config.NVMeoF.PortPerf.PiEnable,
+	}
 }
 
 func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution) error {
@@ -72,6 +95,9 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 
 	// Generate NVMe-oF subsystem name (TrueNAS 25.10+ auto-generates NQN from name)
 	subsysName := d.nvmeSubsystemName(datasetName)
+	// Resolved per-StorageClass block-protocol tuning (GF-Sprint 4). Nil when the
+	// StorageClass opted into nothing, keeping subsystem creation byte-identical.
+	opts := blockOptsFromContext(ctx)
 	var subsys *truenas.NVMeoFSubsystem
 	if !freshlyCreated {
 		namespace, resolvedSubsys, resolveErr := d.resolvedNVMeObjects(ctx, res, ds, datasetName)
@@ -139,7 +165,7 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	// Create subsystem (TrueNAS 25.10+: serial is auto-generated, hosts are IDs not NQNs).
 	subsysWasExisting := subsys != nil
 	if subsys == nil {
-		subsys, err = d.truenasClient.NVMeoFSubsystemCreate(ctx, subsysName, allowAnyHost, hostIDs)
+		subsys, err = d.truenasClient.NVMeoFSubsystemCreate(ctx, subsysName, allowAnyHost, hostIDs, opts.nvmeofSubsystemCreateOpts())
 	}
 	if err != nil && len(hostIDs) > 0 && isNVMeoFHostNotFoundError(err) {
 		d.invalidateNVMeoFHostIDs(staticHosts)
@@ -152,6 +178,7 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 			subsysName,
 			allowAnyHost,
 			hostIDs,
+			opts.nvmeofSubsystemCreateOpts(),
 		)
 	}
 	if err != nil {
@@ -166,49 +193,70 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", err)
 	}
 
-	// Get or create the NVMe-oF TCP port BEFORE creating namespace
-	// TrueNAS 25.10+: Subsystems must be associated with a port to be accessible over the network
-	port, err := d.truenasClient.NVMeoFGetOrCreatePort(
-		ctx,
-		d.config.NVMeoF.Transport,
-		d.config.NVMeoF.TransportAddress,
-		d.config.NVMeoF.TransportServiceID,
-	)
-	if err != nil {
-		// Cleanup subsystem on port failure - volume would be unusable without a port
-		if !subsysWasExisting {
-			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-				klog.Warningf("Failed to cleanup NVMe-oF subsystem after port failure: %v", delErr)
-			}
-		}
-		return status.Errorf(codes.Internal, "failed to get/create NVMe-oF port: %v", err)
+	// Get or create the NVMe-oF TCP port(s) BEFORE creating namespace.
+	// TrueNAS 25.10+: Subsystems must be associated with a port to be accessible
+	// over the network. When multipath is enabled the subsystem is associated with
+	// one port per configured storage address (E-6); otherwise a single port on
+	// TransportAddress is used (byte-identical to pre-GF4). Install-wide port
+	// performance fields (E-4) apply to every created port.
+	addresses := d.config.NVMeoF.multipathAddresses()
+	if len(addresses) == 0 {
+		addresses = []string{d.config.NVMeoF.TransportAddress}
 	}
-
-	// Associate subsystem with port (required for network accessibility)
-	portSubsys, err := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsys.ID)
-	if err != nil {
-		d.truenasClient.InvalidateNVMeoFPort(
+	portOpts := d.nvmeofPortCreateOpts()
+	var portSubsysIDs []int
+	for _, addr := range addresses {
+		port, portErr := d.truenasClient.NVMeoFGetOrCreatePort(
+			ctx,
 			d.config.NVMeoF.Transport,
-			d.config.NVMeoF.TransportAddress,
+			addr,
 			d.config.NVMeoF.TransportServiceID,
+			portOpts,
 		)
-		// Cleanup subsystem on association failure - volume would be unusable
-		if !subsysWasExisting {
-			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-				klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
+		if portErr != nil {
+			// Cleanup subsystem on port failure - volume would be unusable without a port
+			if !subsysWasExisting {
+				if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+					klog.Warningf("Failed to cleanup NVMe-oF subsystem after port failure: %v", delErr)
+				}
 			}
+			return status.Errorf(codes.Internal, "failed to get/create NVMe-oF port for %s: %v", addr, portErr)
 		}
-		return status.Errorf(codes.Internal, "failed to associate subsystem with port: %v", err)
+
+		// Associate subsystem with port (required for network accessibility)
+		assoc, assocErr := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsys.ID)
+		if assocErr != nil {
+			d.truenasClient.InvalidateNVMeoFPort(
+				d.config.NVMeoF.Transport,
+				addr,
+				d.config.NVMeoF.TransportServiceID,
+			)
+			// Cleanup subsystem on association failure - volume would be unusable
+			if !subsysWasExisting {
+				if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+					klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
+				}
+			}
+			return status.Errorf(codes.Internal, "failed to associate subsystem with port %s: %v", addr, assocErr)
+		}
+		portSubsysIDs = append(portSubsysIDs, assoc.ID)
+		klog.V(4).Infof("Associated NVMe-oF subsystem %d with port %d (association ID %d)", subsys.ID, port.ID, assoc.ID)
 	}
-	klog.V(4).Infof("Associated NVMe-oF subsystem %d with port %d (association ID %d)", subsys.ID, port.ID, portSubsys.ID)
+	// The first association is the canonical one recorded in the dataset property
+	// (back-compat with the single-port path). The delete path lists and removes
+	// ALL associations for the subsystem, so the extra multipath associations are
+	// reaped on volume delete.
+	portSubsys := &truenas.NVMeoFPortSubsys{ID: portSubsysIDs[0]}
 
 	// Create namespace (TrueNAS 25.10+: device_path format is "zvol/pool/vol", device_type is required)
 	devicePath := fmt.Sprintf("zvol/%s", datasetName)
 	namespace, err := d.truenasClient.NVMeoFNamespaceCreate(ctx, subsys.ID, devicePath, "ZVOL")
 	if err != nil {
-		// Cleanup port-subsystem association and subsystem on namespace failure
-		if delErr := d.truenasClient.NVMeoFPortSubsysDelete(ctx, portSubsys.ID); delErr != nil {
-			klog.Warningf("Failed to cleanup NVMe-oF port-subsystem association: %v", delErr)
+		// Cleanup port-subsystem association(s) and subsystem on namespace failure
+		for _, assocID := range portSubsysIDs {
+			if delErr := d.truenasClient.NVMeoFPortSubsysDelete(ctx, assocID); delErr != nil {
+				klog.Warningf("Failed to cleanup NVMe-oF port-subsystem association %d: %v", assocID, delErr)
+			}
 		}
 		if !subsysWasExisting {
 			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {

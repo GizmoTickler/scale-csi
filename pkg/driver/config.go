@@ -536,6 +536,64 @@ type NVMeoFConfig struct {
 	// existing configmaps does not fail; LoadConfig logs a deprecation warning when
 	// it is set.
 	CommandTimeout int `yaml:"commandTimeout"`
+
+	// PortPerf holds install-wide NVMe-oF port performance tuning (GF-Sprint 4,
+	// E-4). These fields live on a port that is SHARED across volumes, so they are
+	// install-wide only — never per-StorageClass (a per-SC value would mutate a
+	// shared object under other volumes). The zero value omits every field so the
+	// backend defaults apply and port creation stays byte-identical to pre-GF4.
+	// Named portPerf (not port) to avoid colliding with nvmeof.port, the transport
+	// service port number.
+	PortPerf NVMeoFPortConfig `yaml:"portPerf"`
+
+	// Multipath enables NVMe-oF multi-port multipath (GF-Sprint 4, E-6). When
+	// true, the controller associates each subsystem with one port per address in
+	// Addresses (in addition to TransportAddress) and advertises all of them in
+	// the publish context so the node connects each and the kernel's native NVMe
+	// multipath load-balances/fails over. Default false (single port, byte-identical).
+	Multipath bool `yaml:"multipath"`
+
+	// Addresses is the list of additional storage transport addresses (IPs) to
+	// expose for multipath when Multipath is true. TransportAddress is always
+	// included first. Empty with Multipath=true is a startup validation error.
+	Addresses []string `yaml:"addresses"`
+}
+
+// NVMeoFPortConfig holds install-wide NVMe-oF port performance fields. Pointer
+// fields are nil when unset, which omits the corresponding API parameter so the
+// backend default applies (byte-identical to pre-GF4 port creation).
+type NVMeoFPortConfig struct {
+	// InlineDataSize is the inline write cutoff in bytes. Nil omits.
+	InlineDataSize *int `yaml:"inlineDataSize"`
+
+	// MaxQueueSize is the queue entries per connection. Nil omits.
+	MaxQueueSize *int `yaml:"maxQueueSize"`
+
+	// PiEnable enables T10-PI on the port. Nil omits.
+	PiEnable *bool `yaml:"piEnable"`
+}
+
+// multipathAddresses returns the ordered, de-duplicated list of transport
+// addresses to expose when multipath is enabled: TransportAddress first, then
+// each configured additional address. It returns nil when multipath is off.
+func (c NVMeoFConfig) multipathAddresses() []string {
+	if !c.Multipath {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(c.Addresses)+1)
+	addresses := make([]string, 0, len(c.Addresses)+1)
+	for _, addr := range append([]string{c.TransportAddress}, c.Addresses...) {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		if _, dup := seen[addr]; dup {
+			continue
+		}
+		seen[addr] = struct{}{}
+		addresses = append(addresses, addr)
+	}
+	return addresses
 }
 
 // NodeConfig holds node-side configuration options.
@@ -1045,6 +1103,15 @@ func validateConfig(cfg *Config) error {
 		}
 		if cfg.Fencing.Mode != FencingModeStrict && !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
 			return fmt.Errorf("nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty; no host could connect")
+		}
+		if cfg.NVMeoF.Multipath && len(cfg.NVMeoF.Addresses) == 0 {
+			return fmt.Errorf("nvmeof.addresses must list at least one additional storage address when nvmeof.multipath is enabled")
+		}
+		if v := cfg.NVMeoF.PortPerf.InlineDataSize; v != nil && *v < 0 {
+			return fmt.Errorf("nvmeof.portPerf.inlineDataSize must be non-negative (got %d)", *v)
+		}
+		if v := cfg.NVMeoF.PortPerf.MaxQueueSize; v != nil && *v < 1 {
+			return fmt.Errorf("nvmeof.portPerf.maxQueueSize must be positive (got %d)", *v)
 		}
 	}
 	return nil

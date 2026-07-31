@@ -624,3 +624,71 @@ func TestRepositoryExampleConfigsParseStrictly(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfigNVMeoFBlockKnobsDefaultOmit(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nvmeof:
+  enabled: true
+  transportAddress: 192.0.2.20
+  subsystemAllowAnyHost: true
+`)
+	require.NoError(t, err)
+	// GF-Sprint 4 knobs default to omit so an unchanged config is byte-identical.
+	assert.Nil(t, cfg.NVMeoF.PortPerf.InlineDataSize)
+	assert.Nil(t, cfg.NVMeoF.PortPerf.MaxQueueSize)
+	assert.Nil(t, cfg.NVMeoF.PortPerf.PiEnable)
+	assert.False(t, cfg.NVMeoF.Multipath)
+	assert.Empty(t, cfg.NVMeoF.Addresses)
+	assert.Nil(t, cfg.NVMeoF.multipathAddresses(), "multipath off yields no address list")
+}
+
+func TestLoadConfigNVMeoFPortPerfAndMultipath(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nvmeof:
+  enabled: true
+  transportAddress: 192.168.120.10
+  subsystemAllowAnyHost: true
+  portPerf:
+    inlineDataSize: 8192
+    maxQueueSize: 128
+    piEnable: true
+  multipath: true
+  addresses:
+    - 192.168.202.10
+    - 192.168.203.10
+`)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.NVMeoF.PortPerf.InlineDataSize)
+	assert.Equal(t, 8192, *cfg.NVMeoF.PortPerf.InlineDataSize)
+	require.NotNil(t, cfg.NVMeoF.PortPerf.MaxQueueSize)
+	assert.Equal(t, 128, *cfg.NVMeoF.PortPerf.MaxQueueSize)
+	require.NotNil(t, cfg.NVMeoF.PortPerf.PiEnable)
+	assert.True(t, *cfg.NVMeoF.PortPerf.PiEnable)
+	assert.True(t, cfg.NVMeoF.Multipath)
+	assert.Equal(t, []string{"192.168.120.10", "192.168.202.10", "192.168.203.10"}, cfg.NVMeoF.multipathAddresses())
+}
+
+func TestLoadConfigRejectsMultipathWithoutAddresses(t *testing.T) {
+	_, err := loadTestConfig(t, requiredTestConfig+`
+nvmeof:
+  enabled: true
+  transportAddress: 192.0.2.20
+  subsystemAllowAnyHost: true
+  multipath: true
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nvmeof.addresses")
+}
+
+func TestNVMeoFMultipathAddresses(t *testing.T) {
+	off := NVMeoFConfig{TransportAddress: "192.168.120.10"}
+	assert.Nil(t, off.multipathAddresses(), "multipath off must yield nil")
+
+	on := NVMeoFConfig{
+		TransportAddress: "192.168.120.10",
+		Multipath:        true,
+		Addresses:        []string{"192.168.202.10", "192.168.120.10", "192.168.203.10", ""},
+	}
+	// TransportAddress first, de-duplicated, blanks dropped.
+	assert.Equal(t, []string{"192.168.120.10", "192.168.202.10", "192.168.203.10"}, on.multipathAddresses())
+}
