@@ -19,6 +19,20 @@ on-disk property changes meaning; every new surface is opt-in or gated and the
 default Helm render stays byte-identical to v1.3.0. `Chart.yaml` carries a
 `0.0.0-dev` placeholder that CI stamps with the release tag.
 
+Two additional fixes were found and live-verified during the pre-release drill
+against a real TrueNAS 26.0 system:
+
+- **Fresh-install iSCSI provisioning on TrueNAS 26.0 (fencing off).** The
+  allow-all initiator-group path matched only `null` initiator lists, but 26.0
+  returns `[]` for allow-all groups and rejects the `null` create shape — so a
+  fresh install with no pre-existing group could never provision iSCSI volumes.
+  Reuse now accepts empty non-fencing groups and creation always sends a list.
+- **`zfs.resource.query` managed-dataset listing restored.** 26.0 returns
+  native-property `source` as an object, which the v1.3.0 typed decoder
+  rejected — silently degrading every reconcile listing to the slower
+  `pool.dataset.query` fallback since v1.3.0. The decoder now tolerates both
+  shapes (matching pre-v1.3.0 semantics), restoring the faster listing path.
+
 ### Headline features
 
 - **iSCSI CHAP session authentication (end to end).** Opt-in, per-StorageClass
