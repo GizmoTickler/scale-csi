@@ -57,6 +57,12 @@ const (
 	PropNVMeoFNamespaceID  = "truenas-csi:truenas_nvmeof_namespace_id"
 	PropNVMeoFPortSubsysID = "truenas-csi:truenas_nvmeof_portsubsys_id"
 
+	// PropSnapshotTaskID stores the id of the driver-owned periodic-snapshot task
+	// (GF2/E2) bound to a volume dataset. Written when CreateVolume schedules
+	// periodic snapshots so DeleteVolume can remove the exact task; DeleteVolume
+	// falls back to a dataset-scoped task query when the property is absent.
+	PropSnapshotTaskID = "truenas-csi:snapshot_task_id"
+
 	// PropInflightMarkerPrefix namespaces per-volume in-flight content-source
 	// creation markers written on the PARENT dataset (the only object proven to
 	// accept durable user-property writes on 26.0 while the destination does not
@@ -517,6 +523,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 	}
 
+	// Create the driver-owned periodic-snapshot task (GF2/E2) now that the dataset
+	// exists and is owned/stamped for every path (fresh, clone, detached; NFS and
+	// block). A nil spec (the default) is a no-op; a task failure is non-fatal.
+	d.ensureSnapshotTask(ctx, datasetName, volumeID, vp.snapshotTask, req)
+
 	// Get volume context for response
 	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType)
 	if err != nil {
@@ -563,6 +574,9 @@ type createVolumeParams struct {
 	limitBytes    int64
 	shareType     ShareType
 	detached      bool
+	// snapshotTask is the resolved, validated driver-managed periodic-snapshot
+	// configuration (GF2/E2), or nil when the volume is not scheduled.
+	snapshotTask *snapshotTaskSpec
 }
 
 // validateCreateVolumeRequest performs the pure (no backend I/O) validation of a
@@ -662,12 +676,21 @@ func (d *Driver) validateCreateVolumeRequest(req *csi.CreateVolumeRequest, volum
 	if err != nil {
 		return createVolumeParams{}, err
 	}
+	// Resolve the driver-managed periodic-snapshot configuration (GF2/E2). A nil
+	// spec means the volume is not scheduled (the default-off case); a malformed
+	// schedule/retention is an InvalidArgument so a bad StorageClass parameter
+	// fails fast rather than provisioning without PITR.
+	snapshotTask, err := d.resolveSnapshotTaskSpec(params, volumeID)
+	if err != nil {
+		return createVolumeParams{}, err
+	}
 	return createVolumeParams{
 		capacityBytes: capacityBytes,
 		requiredBytes: requiredBytes,
 		limitBytes:    limitBytes,
 		shareType:     shareType,
 		detached:      detached,
+		snapshotTask:  snapshotTask,
 	}, nil
 }
 
@@ -829,6 +852,12 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	if shareErr := d.ensureShareExists(ctx, existingDS, datasetName, name, shareType, nil); shareErr != nil {
 		return nil, shareErr
 	}
+
+	// Idempotently re-ensure the driver-owned periodic-snapshot task (GF2/E2) so a
+	// retry whose first attempt failed to create the task still converges. A nil
+	// spec (the default) is a no-op; FindByDataset adopts an existing task rather
+	// than duplicating it.
+	d.ensureSnapshotTask(ctx, datasetName, volumeID, vp.snapshotTask, req)
 
 	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType)
 	if ctxErr != nil {
@@ -1078,8 +1107,12 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// but any snapshot still prevents a non-recursive dataset delete. Refuse
 	// BEFORE deleting the share (default policy) so we never strand a shareless
 	// volume; the post-share-delete fallback stays as a second line of defense
-	// for snapshots that appear after this check.
-	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(snapshots) > 0 {
+	// for snapshots that appear after this check. Driver-owned scheduled
+	// snapshots (GF2/E2) are recognized by their task naming-schema prefix and
+	// excluded here: they are deleted WITH the volume, never treated as foreign
+	// (R4).
+	foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds)
+	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(foreignSnapshots) > 0 {
 		klog.Infof("Volume %s has non-CSI snapshots and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion", volumeID)
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
@@ -1124,6 +1157,12 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 	}
 
+	// Delete the driver-owned periodic-snapshot task (GF2/E2) BEFORE the dataset
+	// delete so the recursive destroy below removes the task-created snapshots and
+	// the task cannot fire again mid-delete. Best-effort: a failure never blocks
+	// DeleteVolume (the recursive delete removes the snapshots regardless).
+	d.deleteVolumeSnapshotTask(ctx, ds, datasetName)
+
 	// Try to delete dataset without recursive first to preserve snapshots
 	// This follows CSI spec: snapshots should survive after source volume deletion
 	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
@@ -1164,10 +1203,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 						"volume %s has dependent snapshots that must be deleted first", volumeID)
 				}
 			}
-			// Non-CSI-managed snapshots exist. Preserve them by default; recursive
-			// deletion is an explicit operator opt-in because it destroys snapshots
-			// with an independent lifecycle from the CSI volume.
-			if !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
+			// Non-CSI-managed snapshots exist. Driver-owned scheduled snapshots
+			// (GF2/E2) are deleted WITH the volume via the recursive destroy below
+			// and never respect the foreign-preserve policy (R4); only genuinely
+			// foreign snapshots are preserved by default (recursive deletion of
+			// them is an explicit operator opt-in).
+			foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds)
+			if len(foreignSnapshots) > 0 && !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
 			}

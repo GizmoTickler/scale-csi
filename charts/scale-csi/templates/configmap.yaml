@@ -55,6 +55,12 @@ data:
       {{- if .Values.zfs.holdCsiSnapshots }}
       holdCsiSnapshots: true
       {{- end }}
+      {{- with .Values.zfs.snapshotSchedule }}
+      snapshotSchedule: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.zfs.snapshotRetention }}
+      snapshotRetention: {{ . | quote }}
+      {{- end }}
 
     {{- if .Values.nfs.enabled }}
     # NFS configuration

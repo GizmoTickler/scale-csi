@@ -315,6 +315,39 @@ var (
 		[]string{"operation", "status"},
 	)
 
+	// scheduledSnapshots counts driver-managed periodic snapshots observed during
+	// the reconcile pass (GF2/E2). These snapshots carry no CSI props (P2) and are
+	// recognized by their task naming-schema prefix; they are reported for
+	// visibility only and are NEVER an orphan/delete candidate (R4).
+	scheduledSnapshots = regGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshots",
+			Help:      "Number of driver-managed periodic snapshots observed under scheduled volumes (metrics only; never a delete candidate)",
+		},
+	)
+
+	// scheduledSnapshotTasksEnsuredTotal counts successful create-or-adopt of a
+	// driver-owned periodic-snapshot task at CreateVolume (GF2/E2).
+	scheduledSnapshotTasksEnsuredTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshot_tasks_ensured_total",
+			Help:      "Total driver-managed periodic-snapshot tasks created or adopted at CreateVolume",
+		},
+	)
+
+	// scheduledSnapshotTaskEnsureFailedTotal counts CreateVolume calls whose
+	// periodic-snapshot task could not be ensured (GF2/E2). The volume still
+	// provisions; this is the signal that a volume runs without automatic PITR.
+	scheduledSnapshotTaskEnsureFailedTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshot_task_ensure_failed_total",
+			Help:      "Total CreateVolume calls whose driver-managed periodic-snapshot task failed to ensure (volume provisioned without PITR)",
+		},
+	)
+
 	// Pool-capacity gauges (E4). Populated only when capacity.gaugeEnabled by a
 	// controller-only poll loop; cardinality is fixed at one series per gauge for
 	// this single-backend driver, labeled {pool,dataset}. pool_capacity_bytes is
@@ -626,6 +659,18 @@ func RecordSnapshotHold(operation string, err error) {
 	snapshotHoldsTotal.WithLabelValues(operation, status).Inc()
 }
 
+// RecordScheduledSnapshotTaskEnsured counts a successful create-or-adopt of a
+// driver-owned periodic-snapshot task at CreateVolume (GF2/E2).
+func RecordScheduledSnapshotTaskEnsured() {
+	scheduledSnapshotTasksEnsuredTotal.Inc()
+}
+
+// RecordScheduledSnapshotTaskEnsureFailed counts a CreateVolume whose
+// periodic-snapshot task could not be ensured (GF2/E2).
+func RecordScheduledSnapshotTaskEnsureFailed() {
+	scheduledSnapshotTaskEnsureFailedTotal.Inc()
+}
+
 // SetOrphanReconcileMetrics publishes the latest detection report, including a
 // partial report from a failed pass so gauges never silently freeze.
 func SetOrphanReconcileMetrics(report ReconcileReport) {
@@ -638,6 +683,7 @@ func SetOrphanReconcileMetrics(report ReconcileReport) {
 	tombstoneSnapshotsBytes.Set(float64(report.TombstoneSnapshotBytes))
 	remnantVolumes.Set(float64(report.RemnantVolumeCount))
 	manualRecoveryTombstones.Set(float64(report.ManualRecoveryTombstoneCount))
+	scheduledSnapshots.Set(float64(report.ScheduledSnapshotCount))
 }
 
 func RecordReconcileSuccess(at time.Time) {

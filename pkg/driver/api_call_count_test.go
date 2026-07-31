@@ -622,6 +622,26 @@ func (c *apiCallCountingClient) ReplicationJobAbort(ctx context.Context, jobID i
 	return c.MockClient.ReplicationJobAbort(ctx, jobID, reason)
 }
 
+func (c *apiCallCountingClient) SnapshotTaskCreate(ctx context.Context, params *truenas.SnapshotTaskCreateParams) (*truenas.SnapshotTask, error) {
+	c.record("SnapshotTaskCreate")
+	return c.MockClient.SnapshotTaskCreate(ctx, params)
+}
+
+func (c *apiCallCountingClient) SnapshotTaskFindByDataset(ctx context.Context, dataset string) (*truenas.SnapshotTask, error) {
+	c.record("SnapshotTaskFindByDataset")
+	return c.MockClient.SnapshotTaskFindByDataset(ctx, dataset)
+}
+
+func (c *apiCallCountingClient) SnapshotTaskUpdate(ctx context.Context, id int, params *truenas.SnapshotTaskCreateParams) error {
+	c.record("SnapshotTaskUpdate")
+	return c.MockClient.SnapshotTaskUpdate(ctx, id, params)
+}
+
+func (c *apiCallCountingClient) SnapshotTaskDelete(ctx context.Context, id int) error {
+	c.record("SnapshotTaskDelete")
+	return c.MockClient.SnapshotTaskDelete(ctx, id)
+}
+
 var _ truenas.ClientInterface = (*apiCallCountingClient)(nil)
 
 func TestAPICallCountingClientWrapsEveryClientInterfaceMethod(t *testing.T) {
@@ -826,6 +846,30 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			require.NoError(t, err)
 			client.resetCalls()
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi-chap"})
+			require.NoError(t, err)
+		}},
+		// GF2/E2 (snapshotSchedule set): the six-call fresh-NFS baseline PLUS three
+		// task calls — SnapshotTaskFindByDataset (idempotency probe, miss),
+		// SnapshotTaskCreate (scoped recursive:false), and one DatasetSetUserProperties
+		// that binds snapshot_task_id + snapshot_naming_schema to the volume dataset.
+		// A schedule-less volume pays none of these (the default goldens above).
+		{name: "CreateVolume fresh NFS scheduled", want: 9, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			req := apiCallCountVolumeRequest("fresh-nfs-scheduled", "nfs")
+			req.Parameters["snapshotSchedule"] = "0 0 * * *"
+			req.Parameters["snapshotRetention"] = "30d"
+			_, err := d.CreateVolume(context.Background(), req)
+			require.NoError(t, err)
+		}},
+		// GF2/E2 scheduled delete: the six-call NFS delete baseline PLUS one
+		// SnapshotTaskDelete. The task id is read from the dataset's stamped
+		// snapshot_task_id property (already fetched), so no extra lookup round trip.
+		{name: "DeleteVolume NFS scheduled", want: 7, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			req := apiCallCountVolumeRequest("delete-nfs-scheduled", "nfs")
+			req.Parameters["snapshotSchedule"] = "0 0 * * *"
+			_, err := d.CreateVolume(context.Background(), req)
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-nfs-scheduled"})
 			require.NoError(t, err)
 		}},
 		// Fresh snapshot creation performs one source lookup, one global-name

@@ -197,6 +197,21 @@ type ZFSConfig struct {
 	// (GF2/E1, R1). Default false: no holds are placed and behavior is identical
 	// to pre-GF2.
 	HoldCSISnapshots bool `yaml:"holdCsiSnapshots"`
+
+	// SnapshotSchedule is the controller-wide DEFAULT periodic-snapshot schedule
+	// (GF2/E2), a five-field cron string "minute hour dom month dow". Empty (the
+	// default) disables driver-managed periodic snapshots globally. A StorageClass
+	// `snapshotSchedule` parameter overrides this per class; an explicit empty
+	// parameter opts a class out. The driver owns one non-recursive task per
+	// scheduled volume dataset.
+	SnapshotSchedule string `yaml:"snapshotSchedule"`
+
+	// SnapshotRetention is the controller-wide DEFAULT bounded retention for
+	// driver-managed periodic snapshots (GF2/E2), e.g. "24h", "30d", "2w", "6M",
+	// "1y". Empty resolves to a 30d safety bound so a scheduled task never grows
+	// unbounded snapshots. TrueNAS 26.0 retention is TIME-based only (no count
+	// cap in the API, P2); a count cap is a separate driver-side follow-up.
+	SnapshotRetention string `yaml:"snapshotRetention"`
 }
 
 // NFSConfig holds NFS share configuration.

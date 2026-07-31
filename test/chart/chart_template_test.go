@@ -209,6 +209,33 @@ func TestChartHoldCSISnapshotsPlumbing(t *testing.T) {
 	})
 }
 
+// TestChartSnapshotSchedulePlumbing proves the GF2/E2 driver-managed periodic
+// snapshot keys (zfs.snapshotSchedule, zfs.snapshotRetention) are removal-only
+// rendered: ABSENT from the default configmap (empty default => byte-identical
+// render) and present only when set to a non-empty value.
+func TestChartSnapshotSchedulePlumbing(t *testing.T) {
+	t.Run("default render omits the schedule keys", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml")
+		if strings.Contains(out, "snapshotSchedule:") {
+			t.Errorf("default configmap must not emit zfs.snapshotSchedule; empty default must stay byte-identical")
+		}
+		if strings.Contains(out, "snapshotRetention:") {
+			t.Errorf("default configmap must not emit zfs.snapshotRetention; empty default must stay byte-identical")
+		}
+	})
+
+	t.Run("set renders both keys", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml",
+			"--set", "zfs.snapshotSchedule=0 0 * * *", "--set", "zfs.snapshotRetention=30d")
+		if !strings.Contains(out, "      snapshotSchedule: \"0 0 * * *\"\n") {
+			t.Errorf("--set zfs.snapshotSchedule did not render quoted into the configmap; got:\n%s", out)
+		}
+		if !strings.Contains(out, "      snapshotRetention: \"30d\"\n") {
+			t.Errorf("--set zfs.snapshotRetention did not render quoted into the configmap; got:\n%s", out)
+		}
+	})
+}
+
 // TestChartDeprecatedKeysNotRendered proves the retired iscsi.extentAvailThreshold
 // and nvmeof.commandTimeout keys are no longer rendered into the driver configmap.
 // Both were parsed but consumed by nothing (the nvme CLI timeout is

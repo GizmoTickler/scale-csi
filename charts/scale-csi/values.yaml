@@ -284,6 +284,18 @@ zfs:
   # and the rendered config carries no holdCsiSnapshots key (GF2/E1).
   holdCsiSnapshots: false
 
+  # Controller-wide DEFAULT schedule for driver-managed periodic snapshots
+  # (GF2/E2): a five-field cron string "minute hour dom month dow". Empty (the
+  # default) disables driver-managed periodic snapshots globally. A StorageClass
+  # `snapshotSchedule` parameter overrides this per class. The rendered config
+  # carries no snapshotSchedule key while empty (default render stays identical).
+  snapshotSchedule: ""
+
+  # Controller-wide DEFAULT bounded retention for driver-managed periodic
+  # snapshots (GF2/E2), e.g. "24h", "30d", "2w", "6M", "1y". Empty resolves to a
+  # 30d safety bound. TrueNAS 26.0 retention is time-based only (no count cap).
+  snapshotRetention: ""
+
 # NFS configuration
 nfs:
   # Enable NFS support

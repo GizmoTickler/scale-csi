@@ -561,6 +561,14 @@
           "type": "boolean",
           "default": false
         },
+        "snapshotSchedule": {
+          "type": "string",
+          "default": ""
+        },
+        "snapshotRetention": {
+          "type": "string",
+          "default": ""
+        },
         "dedup": {
           "type": "boolean",
           "description": "Deprecated compatibility value; use datasetProperties."

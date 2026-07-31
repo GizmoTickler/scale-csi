@@ -47,7 +47,9 @@ equivalent dataset create/update/delete, NFS/iSCSI/NVMe sharing, snapshot
 read/create/update/clone/rename/delete/hold/release, service read/reload, and
 `system.info` operations. The opt-in GF2 data-protection features exercise a few
 additional methods, each only when its flag is enabled — snapshot hold/release
-for `zfs.holdCsiSnapshots`. Role names and method assignments differ between
+for `zfs.holdCsiSnapshots`, and `pool.snapshottask.*` (create/query/update/delete)
+for driver-managed periodic snapshots (`zfs.snapshotSchedule` or the per-SC
+`snapshotSchedule` parameter). Role names and method assignments differ between
 TrueNAS API generations, so confirm a custom privilege against the API
 documentation served by the target appliance. See the TrueNAS
 [role reference][truenas-rbac].

@@ -33,7 +33,12 @@ const (
 	// EventReasonSnapshotHoldFailed is emitted when a deletion-proof hold could not
 	// be placed on a CSI snapshot (GF2/E1). The failure is non-fatal: the snapshot
 	// is still ReadyToUse and degrades to pre-GF2 (unprotected) behavior.
-	EventReasonSnapshotHoldFailed  = "SnapshotHoldFailed"
+	EventReasonSnapshotHoldFailed = "SnapshotHoldFailed"
+	// EventReasonSnapshotTaskFailed is emitted when a driver-managed
+	// periodic-snapshot task could not be created for a volume (GF2/E2). The
+	// failure is non-fatal: the volume is still provisioned, just without
+	// automatic PITR until the next create retry.
+	EventReasonSnapshotTaskFailed  = "SnapshotTaskFailed"
 	EventReasonISCSILoginFailed    = "ISCSILoginFailed"
 	EventReasonNVMeConnectFailed   = "NVMeConnectFailed"
 	EventReasonMountFailed         = "MountFailed"

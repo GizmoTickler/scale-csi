@@ -101,26 +101,30 @@ type ReconcileReport struct {
 	TombstoneSnapshotCount       int
 	ManualRecoveryTombstoneCount int
 	RemnantVolumeCount           int
-	OrphanVolumeBytes            int64
-	OrphanSnapshotBytes          int64
-	TombstoneSnapshotBytes       int64
-	OrphanVolumes                []ReconcileObject
-	OrphanSnapshots              []ReconcileObject
-	OrphanShares                 []ReconcileObject
-	SpentRestoreSnapshots        []SpentRestoreSnapshot
-	TombstoneSnapshots           []ReconcileObject
-	ManualRecoveryTombstones     []ReconcileObject
-	RemnantVolumes               []ReconcileObject
-	DeletedVolumes               []string
-	DeletedSnapshots             []string
-	DeletedShares                []string
-	DeletedSpentRestoreObjects   []string
-	DeletedTombstones            []string
-	DeletedRemnants              []string
-	AdoptedStamps                []string
-	SkippedDeletes               []ReconcileActionFailure
-	DeleteEnabled                bool
-	AdoptedStampCount            int
+	// ScheduledSnapshotCount is the number of driver-managed periodic snapshots
+	// (GF2/E2) observed under scheduled volumes during the pass. Reported for
+	// visibility only; these snapshots are never an orphan/delete candidate (R4).
+	ScheduledSnapshotCount     int
+	OrphanVolumeBytes          int64
+	OrphanSnapshotBytes        int64
+	TombstoneSnapshotBytes     int64
+	OrphanVolumes              []ReconcileObject
+	OrphanSnapshots            []ReconcileObject
+	OrphanShares               []ReconcileObject
+	SpentRestoreSnapshots      []SpentRestoreSnapshot
+	TombstoneSnapshots         []ReconcileObject
+	ManualRecoveryTombstones   []ReconcileObject
+	RemnantVolumes             []ReconcileObject
+	DeletedVolumes             []string
+	DeletedSnapshots           []string
+	DeletedShares              []string
+	DeletedSpentRestoreObjects []string
+	DeletedTombstones          []string
+	DeletedRemnants            []string
+	AdoptedStamps              []string
+	SkippedDeletes             []ReconcileActionFailure
+	DeleteEnabled              bool
+	AdoptedStampCount          int
 }
 
 // CapSkippedDeletes counts guarded deletes that were skipped only because the
@@ -249,7 +253,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 
 	now := time.Now()
 	managedBackendVolumeCount := d.classifyOrphanVolumes(ctx, now, datasets, kubeState, minOrphanAge, &report)
-	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, kubeState, minOrphanAge, &report)
+	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, datasets, kubeState, minOrphanAge, &report)
 	d.classifyTombstones(now, tombstones, ledger, minOrphanAge, &report)
 
 	// Scan fallback (reconcile.tombstoneReaper.scanFallback, default off) runs
@@ -421,10 +425,22 @@ func (d *Driver) classifyOrphanVolumes(ctx context.Context, now time.Time, datas
 // classifyOrphanSnapshots appends age-eligible, non-live CSI snapshots to
 // report.OrphanSnapshots and returns the count of managed backend snapshots
 // observed. Extracted verbatim from reconcileOrphans (Batch 18 R2).
-func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Snapshot, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, report *ReconcileReport) int {
+func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Snapshot, datasets []*truenas.Dataset, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, report *ReconcileReport) int {
+	datasetByPath := make(map[string]*truenas.Dataset, len(datasets))
+	for _, ds := range datasets {
+		datasetByPath[ds.Name] = ds
+	}
 	managedBackendSnapshotCount := 0
 	for _, snap := range snapshots {
 		if !isCSISnapshot(snap) {
+			// Driver-managed periodic snapshots (GF2/E2) carry no CSI props (P2),
+			// so they land here. Recognize them by task naming-schema prefix on a
+			// driver-owned dataset and count them for visibility ONLY — they are
+			// never an orphan or delete candidate (R4), which this non-CSI skip
+			// already guarantees.
+			if isDriverScheduledSnapshot(snap, datasetByPath[snap.Dataset], d.driverInstanceID()) {
+				report.ScheduledSnapshotCount++
+			}
 			continue
 		}
 		managedBackendSnapshotCount++

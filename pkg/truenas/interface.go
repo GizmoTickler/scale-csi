@@ -61,6 +61,12 @@ type ClientInterface interface {
 	ReplicationJobList(ctx context.Context) ([]*ReplicationJob, error)
 	ReplicationJobAbort(ctx context.Context, jobID int64, reason string) error
 
+	// Snapshot task methods (GF2/E2 driver-managed periodic snapshots)
+	SnapshotTaskCreate(ctx context.Context, params *SnapshotTaskCreateParams) (*SnapshotTask, error)
+	SnapshotTaskFindByDataset(ctx context.Context, dataset string) (*SnapshotTask, error)
+	SnapshotTaskUpdate(ctx context.Context, id int, params *SnapshotTaskCreateParams) error
+	SnapshotTaskDelete(ctx context.Context, id int) error
+
 	// NFS methods
 	NFSShareCreate(ctx context.Context, params *NFSShareCreateParams) (*NFSShare, error)
 	NFSShareDelete(ctx context.Context, id int) error

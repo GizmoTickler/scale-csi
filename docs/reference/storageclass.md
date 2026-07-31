@@ -14,6 +14,9 @@ All protocols use the unified provisioner `csi.scale.io`.
 |---|---|---|
 | `protocol` | `nfs`, `iscsi`, or `nvmeof` | Yes when more than one protocol is enabled |
 | `snapshotRestoreMode` | `clone` or `detached` — how a volume restored from a snapshot is materialized | No; default is `clone` unless the driver sets `zfs.detachedVolumesFromSnapshots` |
+| `snapshotSchedule` | Five-field cron (`minute hour dom month dow`) for a driver-managed periodic-snapshot task scoped to the volume (GF2/E2) | No; default is the controller-wide `zfs.snapshotSchedule` (empty = off) |
+| `snapshotRetention` | Bounded time-based retention for those snapshots, e.g. `24h`, `30d`, `2w`, `6M`, `1y` | No; default `zfs.snapshotRetention` (empty = 30d safety bound) |
+| `snapshotNamingSchema` | strftime naming schema for the scheduled snapshots | No; default `csi-%Y%m%d-%H%M%S-<volume>` |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -34,6 +37,34 @@ An invalid value returns `InvalidArgument` listing `clone, detached`. When the
 parameter is omitted, the driver falls back to its `zfs.detachedVolumesFromSnapshots`
 config default (chart value `zfs.detachedVolumesFromSnapshots`, default `false`
 = clone).
+
+### Driver-managed periodic snapshots (GF2/E2)
+
+Setting `snapshotSchedule` makes the driver own ONE non-recursive
+periodic-snapshot task scoped to each volume's dataset, so a PVC gets automatic
+point-in-time snapshots with bounded retention and no external scheduler or
+box-wide task covering the CSI parent. The task is created at `CreateVolume`,
+its id is stamped on the volume dataset, and it is removed at `DeleteVolume`
+(its snapshots are recognized as driver-owned and deleted with the volume, never
+treated as foreign). Retention is TIME-based only — TrueNAS 26.0 exposes no
+count cap — so an empty `snapshotRetention` resolves to a 30d safety bound and
+never grows unbounded snapshots. The feature is off until a schedule is set
+(per-SC parameter or the controller-wide `zfs.snapshotSchedule`).
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: scale-nfs-pitr
+provisioner: csi.scale.io
+parameters:
+  protocol: nfs
+  snapshotSchedule: "0 */6 * * *"   # every six hours
+  snapshotRetention: "2w"           # keep two weeks
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+```
 
 ZFS properties, TrueNAS endpoints, and protocol service settings belong in the
 driver configuration/Helm values. The driver ignores ad-hoc StorageClass

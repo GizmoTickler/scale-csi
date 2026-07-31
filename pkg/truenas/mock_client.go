@@ -40,6 +40,9 @@ type MockClient struct {
 	ISCSIAuths                 map[int]*ISCSIAuth
 	PoolAvailable              int64
 	ReplicationJobs            map[int64]*ReplicationJob
+	SnapshotTasks              map[int]*SnapshotTask
+	SnapshotTaskDeleteCalls    []int
+	nextSnapshotTaskID         int
 	deferredSnapshots          map[string]struct{}
 	DatasetDeleteCalls         []DatasetDeleteCall
 	ReplicationJobAbortCalls   []int64
@@ -96,6 +99,8 @@ func NewMockClient() *MockClient {
 		NVMeSubsystems:     make(map[int]*NVMeoFSubsystem),
 		NVMeNamespaces:     make(map[int]*NVMeoFNamespace),
 		ReplicationJobs:    make(map[int64]*ReplicationJob),
+		SnapshotTasks:      make(map[int]*SnapshotTask),
+		nextSnapshotTaskID: 1,
 		// Default portal/initiator fixtures cover the portal addresses used
 		// across the test suites so target-group auto-resolution succeeds
 		// without per-test setup. Tests may replace these maps.
@@ -840,6 +845,78 @@ func (m *MockClient) SnapshotIsHeld(ctx context.Context, snapshotID string) (boo
 	}
 	_, held := m.snapshotHolds[snapshotID]
 	return held, nil
+}
+
+func (m *MockClient) SnapshotTaskCreate(ctx context.Context, params *SnapshotTaskCreateParams) (*SnapshotTask, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	task := &SnapshotTask{
+		ID:            m.nextSnapshotTaskID,
+		Dataset:       params.Dataset,
+		Recursive:     params.Recursive,
+		NamingSchema:  params.NamingSchema,
+		Schedule:      params.Schedule,
+		LifetimeValue: params.LifetimeValue,
+		LifetimeUnit:  params.LifetimeUnit,
+		Enabled:       params.Enabled,
+		AllowEmpty:    params.AllowEmpty,
+	}
+	m.SnapshotTasks[task.ID] = task
+	m.nextSnapshotTaskID++
+	return task, nil
+}
+
+func (m *MockClient) SnapshotTaskFindByDataset(ctx context.Context, dataset string) (*SnapshotTask, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	for _, task := range m.SnapshotTasks {
+		if task.Dataset == dataset {
+			return task, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *MockClient) SnapshotTaskUpdate(ctx context.Context, id int, params *SnapshotTaskCreateParams) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	task, ok := m.SnapshotTasks[id]
+	if !ok {
+		return notFoundAPIError("snapshot task not found")
+	}
+	task.Dataset = params.Dataset
+	task.Recursive = params.Recursive
+	task.NamingSchema = params.NamingSchema
+	task.Schedule = params.Schedule
+	task.LifetimeValue = params.LifetimeValue
+	task.LifetimeUnit = params.LifetimeUnit
+	task.Enabled = params.Enabled
+	task.AllowEmpty = params.AllowEmpty
+	return nil
+}
+
+func (m *MockClient) SnapshotTaskDelete(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	m.SnapshotTaskDeleteCalls = append(m.SnapshotTaskDeleteCalls, id)
+	delete(m.SnapshotTasks, id)
+	return nil
 }
 
 func (m *MockClient) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error) {
