@@ -158,6 +158,12 @@ type Driver struct {
 	// Service reload debouncer (prevents reload storms during bulk provisioning)
 	serviceReloadDebouncer *ServiceReloadDebouncer
 
+	// Cached GLOBAL nfs.config, read at most once per controller lifetime and
+	// only when nfs.versionPreflight / nfs.ensureProtocols opt in. NFS protocol
+	// enablement is an operator-driven, effectively static setting.
+	nfsServiceMu  sync.Mutex
+	nfsServiceCfg *truenas.NFSServiceConfig
+
 	// Cached auto-resolved iSCSI target group (portal/initiator) used when
 	// iscsi.targetGroups is not configured; see resolveISCSITargetGroup.
 	iscsiGroupMu       sync.Mutex
@@ -391,6 +397,12 @@ func (d *Driver) Run() error {
 	klog.Infof("CSI driver listening on %s", d.endpoint)
 
 	if d.runController {
+		// Opt-in, default-empty global NFS service enablement. It is deliberately
+		// non-fatal: a driver that cannot widen the service must still serve every
+		// volume whose version IS enabled.
+		if protocolErr := d.ensureNFSProtocols(context.Background()); protocolErr != nil {
+			klog.Errorf("nfs.ensureProtocols failed: %v", protocolErr)
+		}
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
 		d.startCapacityGauges()

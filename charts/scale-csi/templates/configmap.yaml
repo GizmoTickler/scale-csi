@@ -65,6 +65,27 @@ data:
       shareMaprootGroup: {{ .Values.nfs.shareMaprootGroup | quote }}
       shareMapallUser: {{ .Values.nfs.shareMapallUser | quote }}
       shareMapallGroup: {{ .Values.nfs.shareMapallGroup | quote }}
+      {{- /* Every GF5 NFS key renders ONLY when it is non-default, so the
+           default ConfigMap is byte-identical to the pre-GF5 render and stays
+           parseable by a rolled-back binary that has no such field. */}}
+      {{- with .Values.nfs.shareSecurity }}
+      shareSecurity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.nfs.shareExposeSnapshots }}
+      shareExposeSnapshots: true
+      {{- end }}
+      {{- if .Values.nfs.krbEnabled }}
+      krbEnabled: true
+      {{- end }}
+      {{- if .Values.nfs.versionPreflight }}
+      versionPreflight: true
+      {{- end }}
+      {{- with .Values.nfs.ensureProtocols }}
+      # HARD RULE: mutates the GLOBAL TrueNAS NFS service (all exports).
+      ensureProtocols:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     {{- end }}
 
     {{- if .Values.iscsi.enabled }}

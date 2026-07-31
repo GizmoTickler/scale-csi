@@ -170,6 +170,28 @@
         },
         "chapSecretNamespace": {
           "type": "string"
+        },
+        "nfsSecurity": {
+          "description": "Per-class sharing.nfs security list. Rendered as the comma-joined nfsSecurity parameter.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "SYS",
+              "KRB5",
+              "KRB5I",
+              "KRB5P"
+            ]
+          }
+        },
+        "nfsExposeSnapshots": {
+          "description": "Per-class expose_snapshots override (read-only .zfs/snapshot over NFS).",
+          "type": "boolean"
+        },
+        "nfsReadOnly": {
+          "description": "Per-class read-only export override.",
+          "type": "boolean"
         }
       }
     }
@@ -598,6 +620,42 @@
         },
         "shareMapallGroup": {
           "type": "string"
+        },
+        "shareSecurity": {
+          "description": "Default sharing.nfs security list. Empty (default) omits the field, keeping the TrueNAS default (AUTH_SYS).",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "SYS",
+              "KRB5",
+              "KRB5I",
+              "KRB5P"
+            ]
+          }
+        },
+        "shareExposeSnapshots": {
+          "description": "Publish the dataset's read-only .zfs/snapshot tree through new exports.",
+          "type": "boolean"
+        },
+        "krbEnabled": {
+          "description": "Acknowledge that nfs.config v4_krb plus a keytab are configured. Required before KRB5* share security is accepted.",
+          "type": "boolean"
+        },
+        "versionPreflight": {
+          "description": "Validate a StorageClass's pinned NFS version against the global nfs.config protocols.",
+          "type": "boolean"
+        },
+        "ensureProtocols": {
+          "description": "HARD RULE, opt-in: mutate the GLOBAL TrueNAS NFS service so these major versions are enabled. Affects every export on the appliance.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "NFSV3",
+              "NFSV4"
+            ]
+          }
         }
       }
     },

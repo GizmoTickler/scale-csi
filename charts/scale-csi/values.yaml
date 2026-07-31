@@ -293,6 +293,52 @@ nfs:
   shareMapallUser: ""
   shareMapallGroup: ""
 
+  # Default `security` list for newly created exports: SYS, KRB5, KRB5I, KRB5P.
+  # EMPTY (the default) omits the field entirely, which is exactly what the
+  # driver has always sent and leaves TrueNAS on AUTH_SYS. Override per class
+  # with the StorageClass `nfsSecurity` parameter. Existing shares are never
+  # rewritten — security is a create-time property of a volume.
+  shareSecurity: []
+
+  # Publish the dataset's read-only .zfs/snapshot tree through new exports.
+  # TrueNAS only honors it when the export path is the dataset root, which is
+  # always true for CSI volumes. Override per class with `nfsExposeSnapshots`.
+  shareExposeSnapshots: false
+
+  # Explicit acknowledgement that this TrueNAS has Kerberos configured for NFSv4
+  # (nfs.config v4_krb plus a keytab). KRB5/KRB5I/KRB5P share security is
+  # REJECTED at CreateVolume unless this is true, because a krb-only export on a
+  # box with no keytab makes every mount fail with an opaque server error.
+  krbEnabled: false
+
+  # Validate a StorageClass's pinned NFS version (its `vers=`/`nfsvers=`
+  # mountOption) against the GLOBAL nfs.config protocols, so a class asking for a
+  # version the server does not enable fails with a clear message instead of a
+  # cryptic mount error. Off by default: enabling it adds one cached nfs.config
+  # read per controller lifetime.
+  versionPreflight: false
+
+  # HARD RULE — opt-in only. Non-empty makes the controller MUTATE the GLOBAL
+  # TrueNAS NFS service at startup so the listed major versions (NFSV3/NFSV4)
+  # are enabled. That is a service-wide write affecting EVERY export on the
+  # appliance, driver-managed or not. The supported default is the read-only
+  # versionPreflight above. Values: NFSV3, NFSV4.
+  ensureProtocols: []
+
+  # --- Performance mount-option profiles -------------------------------------
+  # NFS version selection is a NODE-side mount option, not a share property:
+  # there is no `vers` field on sharing.nfs.*. Set it on a StorageClass's
+  # `mountOptions` (see storageClasses below). Validated profiles:
+  #
+  #   v4.1-throughput: nfsvers=4.1,nconnect=8,hard,noatime,rsize=1048576,wsize=1048576
+  #   v4.1-lowlat:     nfsvers=4.1,nconnect=4,hard,noatime,ac
+  #   v3-compat:       nfsvers=3,hard,noatime
+  #
+  # `nconnect` (multiple TCP connections behind one NFSv4.1 session — session
+  # trunking) is a pure client-side option needing no server state, and the
+  # kernel silently ignores it on v3. The driver passes mountOptions through
+  # unchanged and only logs a warning for contradictory combinations.
+
 # iSCSI configuration
 iscsi:
   # Enable iSCSI support

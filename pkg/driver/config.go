@@ -219,6 +219,42 @@ type NFSConfig struct {
 	// only so strict YAML parsing of existing configmaps does not fail; LoadConfig
 	// logs a deprecation warning when it is set.
 	ShareCommentTemplate string `yaml:"shareCommentTemplate"`
+
+	// ShareSecurity is the default `security` list stamped on newly created
+	// exports (SYS, KRB5, KRB5I, KRB5P). EMPTY IS THE DEFAULT AND MEANS "omit the
+	// field entirely", which is byte-identical to the pre-GF5 create payload and
+	// leaves TrueNAS on its own default (AUTH_SYS). A StorageClass may override
+	// per-volume with the `nfsSecurity` parameter.
+	ShareSecurity []string `yaml:"shareSecurity"`
+
+	// ShareExposeSnapshots is the default `expose_snapshots` value for newly
+	// created exports — it publishes the dataset's read-only .zfs/snapshot tree
+	// over NFS. Default false = field omitted = unchanged behavior. A
+	// StorageClass may override per-volume with `nfsExposeSnapshots`.
+	ShareExposeSnapshots bool `yaml:"shareExposeSnapshots"`
+
+	// KrbEnabled is the operator's explicit acknowledgement that this TrueNAS has
+	// Kerberos configured for NFSv4 (nfs.config v4_krb + a keytab). KRB5/KRB5I/
+	// KRB5P share security is REJECTED unless this is set: silently creating a
+	// krb-only export on a box with no keytab makes every mount fail with an
+	// opaque server error, so the driver fails closed at CreateVolume instead.
+	KrbEnabled bool `yaml:"krbEnabled"`
+
+	// VersionPreflight enables a cached `nfs.config` read that validates a
+	// StorageClass's requested NFS major version (from its `vers=`/`nfsvers=`
+	// mountOptions) against the server's globally enabled protocols. Default off
+	// so a deployment that does not opt in issues ZERO additional API calls and
+	// keeps the golden per-CreateVolume round-trip counts.
+	VersionPreflight bool `yaml:"versionPreflight"`
+
+	// EnsureProtocols opts into MUTATING the GLOBAL NFS service so it enables the
+	// listed major versions (NFSV3/NFSV4) at controller start.
+	//
+	// HARD RULE: this writes a service-wide setting that affects EVERY export on
+	// the appliance, driver-managed or not. It is default-empty (no write, ever)
+	// and should stay that way unless an operator has deliberately accepted that
+	// blast radius. The supported default path is the read-only preflight above.
+	EnsureProtocols []string `yaml:"ensureProtocols"`
 }
 
 // ISCSIConfig holds iSCSI configuration.

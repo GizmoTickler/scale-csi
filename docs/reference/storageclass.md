@@ -14,6 +14,12 @@ All protocols use the unified provisioner `csi.scale.io`.
 |---|---|---|
 | `protocol` | `nfs`, `iscsi`, or `nvmeof` | Yes when more than one protocol is enabled |
 | `snapshotRestoreMode` | `clone` or `detached` — how a volume restored from a snapshot is materialized | No; default is `clone` unless the driver sets `zfs.detachedVolumesFromSnapshots` |
+| `nfsSecurity` | Comma list of `SYS`, `KRB5`, `KRB5I`, `KRB5P` — the export's `security` list | No; unset omits the field (TrueNAS default AUTH_SYS) |
+| `nfsExposeSnapshots` | Boolean — publish the dataset's read-only `.zfs/snapshot` tree through the export | No; default false |
+| `nfsReadOnly` | Boolean — create the export read-only | No; default false |
+| `nfsMaprootUser` / `nfsMaprootGroup` | Per-class override of the root mapping | No; defaults to `nfs.shareMaproot*` |
+| `nfsMapallUser` / `nfsMapallGroup` | Per-class override of the all-users mapping | No; defaults to `nfs.shareMapall*` |
+| `nfsAllowedNetworks` / `nfsAllowedHosts` | Comma lists overriding the static export allow-lists | No; defaults to `nfs.shareAllowed*`. Ignored in strict fencing mode, which owns these lists |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -64,6 +70,65 @@ volumeBindingMode: Immediate
 NFS supports `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`. Use hard
 mount semantics for persistent data; soft mounts can surface application-visible
 I/O errors during a transient server outage.
+
+### NFS version selection (v3 / v4 / v4.1)
+
+**Version is a node-side mount option, not a share property.** There is no
+`vers` field on `sharing.nfs.*`; a client picks the protocol with `vers=` /
+`nfsvers=` and the TrueNAS NFS service must have that MAJOR version enabled
+globally (`nfs.config` → `protocols`, typically `["NFSV3","NFSV4"]`). NFSv4.1 is
+part of the server's `NFSV4` support and needs no extra server flag.
+
+Set the version on the StorageClass's `mountOptions`. The driver passes them
+through unchanged (deduplicated, as always).
+
+Enable `nfs.versionPreflight` in the chart to have `CreateVolume` validate a
+class's pinned version against the server's protocol list and return a clear
+`FailedPrecondition` instead of letting the mount fail cryptically at
+`NodeStageVolume`. It costs one cached `nfs.config` read per controller
+lifetime and is off by default.
+
+`nfs.ensureProtocols` can additively enable a version on the server, but that is
+a **global service write affecting every export on the appliance** — it is
+default-empty and should stay that way unless you have accepted that blast
+radius.
+
+### Validated performance mount-option profiles
+
+| Profile | `mountOptions` | Use for |
+|---|---|---|
+| `v4.1-throughput` | `nfsvers=4.1`, `nconnect=8`, `hard`, `noatime`, `rsize=1048576`, `wsize=1048576` | Large sequential I/O (media, backups) |
+| `v4.1-lowlat` | `nfsvers=4.1`, `nconnect=4`, `hard`, `noatime`, `ac` | Small random I/O (databases) |
+| `v3-compat` | `nfsvers=3`, `hard`, `noatime` | Apps that need v3 locking/semantics |
+
+`nconnect` opens N TCP connections behind ONE NFSv4.1 session (session
+trunking). It is purely client-side — no server state, no TrueNAS setting. Older
+kernels and NFSv3 ignore it silently, which is safe. The node logs a warning
+(and changes nothing) when it sees `nconnect` with `vers=3` or two conflicting
+`vers=` options.
+
+For NFS-over-RDMA the server needs `nfs.config.rdma` enabled and clients mount
+with `proto=rdma`. That is an advanced, out-of-default-scope profile.
+
+### Export security and snapshot exposure
+
+`nfsSecurity` sets the export's `security` list. Leaving it unset omits the
+field entirely, which is the historical behavior and leaves TrueNAS on its
+AUTH_SYS default.
+
+`KRB5`/`KRB5I`/`KRB5P` require Kerberos on the NFS service (`nfs.config`
+`v4_krb` plus a keytab). The driver **fails closed**: those modes are rejected
+with `InvalidArgument` unless the operator sets `nfs.krbEnabled=true` to
+acknowledge that Kerberos is actually configured.
+
+Security is a **create-time** property of a volume. The driver never rewrites an
+existing share's security, because flipping SYS→KRB5 on a live export breaks
+every mounted client.
+
+`nfsExposeSnapshots` publishes the volume's read-only `.zfs/snapshot` directory
+through the export, which composes with the driver's snapshot machinery to give
+in-place browsing of point-in-time copies. TrueNAS only honors it when the
+export path is the dataset root — always true for CSI volumes.
 
 ```yaml
 apiVersion: v1

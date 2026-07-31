@@ -65,6 +65,8 @@ type ClientInterface interface {
 	NFSShareFindByPath(ctx context.Context, path string) (*NFSShare, error)
 	NFSShareList(ctx context.Context) ([]*NFSShare, error)
 	NFSShareUpdate(ctx context.Context, id int, params map[string]interface{}) (*NFSShare, error)
+	NFSServiceConfig(ctx context.Context) (*NFSServiceConfig, error)
+	NFSServiceUpdate(ctx context.Context, params map[string]interface{}) (*NFSServiceConfig, error)
 
 	// Service methods
 	ServiceReload(ctx context.Context, service string) error

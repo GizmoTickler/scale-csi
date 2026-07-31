@@ -399,6 +399,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		ctx = withISCSIChAPResolution(ctx, chapResolution)
 	}
 
+	// Resolve the per-StorageClass NFS export overrides and (opt-in) validate the
+	// class's pinned NFS version against the server's global protocol set. Both
+	// are strict no-ops for a class that sets none of the new parameters.
+	if shareType == ShareTypeNFS {
+		nfsOptions, nfsErr := d.parseNFSShareOptions(req.GetParameters())
+		if nfsErr != nil {
+			return nil, nfsErr
+		}
+		if preflightErr := d.preflightNFSVersion(ctx, mountFlagsFromCapabilities(req.GetVolumeCapabilities())); preflightErr != nil {
+			return nil, preflightErr
+		}
+		ctx = withNFSShareOptions(ctx, nfsOptions)
+	}
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {

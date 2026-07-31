@@ -272,6 +272,16 @@ func (c *apiCallCountingClient) NFSShareUpdate(ctx context.Context, id int, para
 	return c.MockClient.NFSShareUpdate(ctx, id, params)
 }
 
+func (c *apiCallCountingClient) NFSServiceConfig(ctx context.Context) (*truenas.NFSServiceConfig, error) {
+	c.record("NFSServiceConfig")
+	return c.MockClient.NFSServiceConfig(ctx)
+}
+
+func (c *apiCallCountingClient) NFSServiceUpdate(ctx context.Context, params map[string]interface{}) (*truenas.NFSServiceConfig, error) {
+	c.record("NFSServiceUpdate")
+	return c.MockClient.NFSServiceUpdate(ctx, params)
+}
+
 func (c *apiCallCountingClient) ServiceReload(ctx context.Context, service string) error {
 	c.record("ServiceReload")
 	return c.MockClient.ServiceReload(ctx, service)

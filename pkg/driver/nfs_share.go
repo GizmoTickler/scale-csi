@@ -115,6 +115,19 @@ func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Datas
 		MapallGroup:  d.config.NFS.ShareMapallGroup,
 		Enabled:      d.config.Fencing.Mode != FencingModeStrict,
 	}
+	// Global GF5 export defaults. Both are empty/false out of the box, and both
+	// fields are `omitempty`, so an un-opted-in deployment marshals the exact same
+	// sharing.nfs.create payload it did before GF5.
+	if len(d.config.NFS.ShareSecurity) > 0 {
+		params.Security = append([]string(nil), d.config.NFS.ShareSecurity...)
+	}
+	if d.config.NFS.ShareExposeSnapshots {
+		params.ExposeSnapshots = true
+	}
+	// Per-StorageClass overrides ride the request context (CreateVolume only).
+	// ensureShareExists / reconcile / adoption paths carry none, so an existing
+	// share is never rewritten because its class gained an option (risk R4).
+	applyNFSShareOptions(params, nfsShareOptionsFromContext(ctx))
 	if d.config.Fencing.Mode == FencingModeStrict {
 		// An enabled export with both lists empty means allow-all in TrueNAS. New
 		// strict volumes therefore start disabled until ControllerPublish writes at

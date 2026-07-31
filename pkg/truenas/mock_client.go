@@ -68,6 +68,15 @@ type MockClient struct {
 	// JobSubscribed is the value AnyConnectionJobSubscribed reports, letting a
 	// health test drive the scale_csi_job_dispatcher_subscribed gauge.
 	JobSubscribed bool
+
+	// GF5 NFS/ACL/health test surfaces.
+	//
+	// NFSShareCreateParams records every sharing.nfs.create payload verbatim so a
+	// test can assert the DEFAULT payload is byte-identical to the pre-GF5 one.
+	NFSShareCreateParams  []NFSShareCreateParams
+	NFSServiceConfigValue *NFSServiceConfig
+	NFSServiceConfigCalls int
+	NFSServiceUpdateCalls []map[string]interface{}
 }
 
 // DatasetDeleteCall records the deletion mode requested by a test.
@@ -1041,8 +1050,12 @@ func (m *MockClient) NFSShareCreate(ctx context.Context, params *NFSShareCreateP
 		MapallUser:   params.MapallUser,
 		MapallGroup:  params.MapallGroup,
 		Enabled:      params.Enabled,
+
+		Security:        append([]string(nil), params.Security...),
+		ExposeSnapshots: params.ExposeSnapshots,
 	}
 	m.NFSShares[id] = share
+	m.NFSShareCreateParams = append(m.NFSShareCreateParams, *params)
 	return share, nil
 }
 
@@ -1104,6 +1117,41 @@ func (m *MockClient) NFSShareUpdate(ctx context.Context, id int, params map[stri
 		share.Enabled = enabled
 	}
 	return share, nil
+}
+
+// NFSServiceConfigValue is the global nfs.config the mock reports. Nil means
+// "backend did not answer" and NFSServiceConfig returns an error.
+func (m *MockClient) NFSServiceConfig(ctx context.Context) (*NFSServiceConfig, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.NFSServiceConfigCalls++
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	if m.NFSServiceConfigValue == nil {
+		return &NFSServiceConfig{Protocols: []string{NFSProtocolV3, NFSProtocolV4}, Servers: 64}, nil
+	}
+	clone := *m.NFSServiceConfigValue
+	clone.Protocols = append([]string(nil), m.NFSServiceConfigValue.Protocols...)
+	return &clone, nil
+}
+
+func (m *MockClient) NFSServiceUpdate(ctx context.Context, params map[string]interface{}) (*NFSServiceConfig, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.NFSServiceUpdateCalls = append(m.NFSServiceUpdateCalls, params)
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	if m.NFSServiceConfigValue == nil {
+		m.NFSServiceConfigValue = &NFSServiceConfig{Protocols: []string{NFSProtocolV3, NFSProtocolV4}, Servers: 64}
+	}
+	if protocols, ok := params["protocols"].([]string); ok {
+		m.NFSServiceConfigValue.Protocols = append([]string(nil), protocols...)
+	}
+	clone := *m.NFSServiceConfigValue
+	clone.Protocols = append([]string(nil), m.NFSServiceConfigValue.Protocols...)
+	return &clone, nil
 }
 
 // Service methods
