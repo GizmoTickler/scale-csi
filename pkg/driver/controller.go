@@ -1610,6 +1610,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 			return nil, status.Errorf(codes.AlreadyExists,
 				"snapshot name %q is already associated with another snapshot", name)
 		}
+		d.holdCSISnapshotIfEnabled(ctx, existing.ID, req)
 		return d.createSnapshotResponse(existing, sourceDataset, snapshotID, sourceVolumeID, start), nil
 	}
 
@@ -1625,9 +1626,56 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		return nil, status.Errorf(codes.Internal, "failed to create snapshot: %v", err)
 	}
 
+	// Place the deletion-proof hold now that the snapshot and its identity exist.
+	d.holdCSISnapshotIfEnabled(ctx, snap.ID, req)
+
 	// The source dataset fetched for the existence check above still reflects
 	// the volume size for restoreSize — no need to re-query it.
 	return d.createSnapshotResponse(snap, sourceDataset, snapshotID, sourceVolumeID, start), nil
+}
+
+// holdCSISnapshotIfEnabled places a deletion-proof hold on a CSI snapshot when
+// zfs.holdCsiSnapshots is set (GF2/E1). A hold is a hardening layer, not a
+// correctness precondition: failure is non-fatal — logged, metered, and surfaced
+// as a warning event — so the snapshot still becomes/stays ReadyToUse and simply
+// degrades to pre-GF2 (unprotected) behavior. The idempotent client treats an
+// already-held snapshot as success, so the idempotent-create retry re-holds
+// safely.
+func (d *Driver) holdCSISnapshotIfEnabled(ctx context.Context, snapshotID string, req *csi.CreateSnapshotRequest) {
+	if !d.config.ZFS.HoldCSISnapshots {
+		return
+	}
+	if err := d.truenasClient.SnapshotHold(ctx, snapshotID); err != nil {
+		RecordSnapshotHold(snapshotHoldOpHold, err)
+		klog.Warningf("Failed to place deletion-proof hold on snapshot %s (continuing unprotected): %v", snapshotID, err)
+		d.recordWarningEvent(createSnapshotEventRef(req), EventReasonSnapshotHoldFailed,
+			fmt.Sprintf("Snapshot %s was created but its deletion-proof hold failed; it is not protected from foreign deletion: %v", snapshotID, err))
+		return
+	}
+	RecordSnapshotHold(snapshotHoldOpHold, nil)
+	klog.V(4).Infof("Placed deletion-proof hold on snapshot %s", snapshotID)
+}
+
+// releaseCSISnapshotHoldIfEnabled removes a deletion-proof hold before the
+// driver's own destroy paths run (GF2/E1, R1). It is called by DeleteSnapshot,
+// handleSnapshotClones, and reapTombstoneSnapshot — the only three driver sites
+// that destroy a snapshot — each of which has already provenance-proven the
+// snapshot is a driver CSI snapshot/tombstone, so releasing never strips a hold
+// the driver does not own (R2). The release is idempotent and best-effort: a
+// failure is logged and metered, and the subsequent destroy surfaces a retryable
+// EBUSY if the hold is genuinely still present. Gated on zfs.holdCsiSnapshots so
+// the default path makes no extra call.
+func (d *Driver) releaseCSISnapshotHoldIfEnabled(ctx context.Context, snapshotID string) {
+	if !d.config.ZFS.HoldCSISnapshots {
+		return
+	}
+	if err := d.truenasClient.SnapshotRelease(ctx, snapshotID); err != nil {
+		RecordSnapshotHold(snapshotHoldOpRelease, err)
+		klog.Warningf("Failed to release deletion-proof hold on snapshot %s before destroy: %v", snapshotID, err)
+		return
+	}
+	RecordSnapshotHold(snapshotHoldOpRelease, nil)
+	klog.V(4).Infof("Released deletion-proof hold on snapshot %s before destroy", snapshotID)
 }
 
 func (d *Driver) createSnapshotResponse(
@@ -1705,6 +1753,13 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 		return nil, status.Error(codes.Aborted, "operation already in progress for this snapshot")
 	}
 	defer d.releaseOperationLock(snapshotLockKey)
+
+	// Release the deletion-proof hold BEFORE any destroy/tombstone (GF2/E1, R1).
+	// The hold survives the tombstone rename, so releasing here — under the same
+	// source-volume+snapshot locks — guarantees the snapshot the reaper may later
+	// destroy is already unheld. Idempotent: a snapshot that was never held (the
+	// feature defaults off) releases to a no-op success.
+	d.releaseCSISnapshotHoldIfEnabled(ctx, snap.ID)
 
 	if err := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); err != nil {
 		// Handle "not found" as success (idempotency)

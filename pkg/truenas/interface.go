@@ -45,6 +45,9 @@ type ClientInterface interface {
 	SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*Snapshot, error)
 	SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error
 	SnapshotRename(ctx context.Context, snapshotID, newName string) error
+	SnapshotHold(ctx context.Context, snapshotID string) error
+	SnapshotRelease(ctx context.Context, snapshotID string) error
+	SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, error)
 	SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error)
 	SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error)
 	SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error)

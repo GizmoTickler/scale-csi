@@ -276,6 +276,14 @@ zfs:
   # driver. Keep false unless those snapshots are deliberately disposable.
   destroyForeignSnapshotsOnDelete: false
 
+  # Place a deletion-proof ZFS hold (the fixed `truenas` tag) on every CSI
+  # VolumeSnapshot at create so foreign actors — a box-wide periodic-snapshot
+  # task's pruning, an admin, replication retention — cannot destroy it (they hit
+  # EBUSY). The driver's own delete/tombstone/reaper paths release the hold first,
+  # so it never wedges the driver's lifecycle. Default false: no holds are placed
+  # and the rendered config carries no holdCsiSnapshots key (GF2/E1).
+  holdCsiSnapshots: false
+
 # NFS configuration
 nfs:
   # Enable NFS support

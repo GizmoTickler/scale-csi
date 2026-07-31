@@ -301,6 +301,20 @@ var (
 		[]string{"path"},
 	)
 
+	// snapshotHoldsTotal counts deletion-proof snapshot hold operations (GF2/E1),
+	// labeled by operation (hold, release) and outcome (success, error). A hold
+	// error is non-fatal to the CSI operation (the snapshot still becomes/stays
+	// ReadyToUse and degrades to pre-GF2 behavior), so the error series is the
+	// signal that a snapshot fell back to unprotected.
+	snapshotHoldsTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "snapshot_holds_total",
+			Help:      "Total snapshot hold/release operations, by operation and outcome",
+		},
+		[]string{"operation", "status"},
+	)
+
 	// Pool-capacity gauges (E4). Populated only when capacity.gaugeEnabled by a
 	// controller-only poll loop; cardinality is fixed at one series per gauge for
 	// this single-backend driver, labeled {pool,dataset}. pool_capacity_bytes is
@@ -476,6 +490,10 @@ func init() {
 	}
 	tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathLedger).Add(0)
 	tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathScanFallback).Add(0)
+	for _, op := range []string{snapshotHoldOpHold, snapshotHoldOpRelease} {
+		snapshotHoldsTotal.WithLabelValues(op, "success").Add(0)
+		snapshotHoldsTotal.WithLabelValues(op, "error").Add(0)
+	}
 }
 
 // RecordCSIOperation records metrics for a CSI operation
@@ -590,6 +608,22 @@ const (
 // (tombstoneReapedPathLedger or tombstoneReapedPathScanFallback).
 func RecordTombstoneReaped(path string) {
 	tombstoneReapedTotal.WithLabelValues(path).Inc()
+}
+
+// Snapshot hold operation labels for snapshotHoldsTotal (GF2/E1).
+const (
+	snapshotHoldOpHold    = "hold"
+	snapshotHoldOpRelease = "release"
+)
+
+// RecordSnapshotHold counts a snapshot hold or release operation and its
+// outcome. operation is snapshotHoldOpHold or snapshotHoldOpRelease.
+func RecordSnapshotHold(operation string, err error) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	snapshotHoldsTotal.WithLabelValues(operation, status).Inc()
 }
 
 // SetOrphanReconcileMetrics publishes the latest detection report, including a

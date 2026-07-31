@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -379,6 +380,82 @@ func (c *Client) SnapshotRename(ctx context.Context, snapshotID, newName string)
 		return fmt.Errorf("failed to rename snapshot: %w", err)
 	}
 	return nil
+}
+
+// The hold tag applied by pool.snapshot.hold is hard-coded to "truenas" on
+// TrueNAS 26.0: the live probe (P1) proved neither pool.snapshot.hold nor
+// zfs.resource.snapshot.hold accepts a custom tag — a hold is a single global
+// boolean per snapshot, so the driver never names a tag and treats a hold as
+// "ours" only after it has provenance-proven the snapshot is a driver CSI
+// snapshot/tombstone (R2).
+
+// SnapshotHold places a deletion-proof hold on a snapshot so foreign actors
+// (box-wide periodic-task pruning, admin, replication retention) hit EBUSY on
+// destroy. It is idempotent: an already-held snapshot (EEXIST/errno 17, surfaced
+// by TrueNAS as a wrapped lzc_hold() failure) is treated as success. The hold is
+// the fixed `truenas` tag; the API accepts no custom tag (P1).
+func (c *Client) SnapshotHold(ctx context.Context, snapshotID string) error {
+	_, err := c.Call(ctx, c.snapshotMethod("hold"), snapshotID)
+	if err == nil || isSnapshotAlreadyHeldError(err) {
+		return nil
+	}
+	return fmt.Errorf("failed to hold snapshot: %w", err)
+}
+
+// SnapshotRelease removes the hold placed by SnapshotHold. It is idempotent:
+// releasing a snapshot that is not held (ENOENT / no-such-hold) is success.
+func (c *Client) SnapshotRelease(ctx context.Context, snapshotID string) error {
+	_, err := c.Call(ctx, c.snapshotMethod("release"), snapshotID)
+	if err == nil || isSnapshotNotHeldError(err) {
+		return nil
+	}
+	return fmt.Errorf("failed to release snapshot: %w", err)
+}
+
+// SnapshotIsHeld reports whether the snapshot carries any hold. It reads the
+// resource path (zfs.resource.snapshot.holds) rather than the extra:{holds}
+// query so it works on the same API generation as destroy/rename. On a backend
+// without the method (pre-26.0) it fails closed to "not held" so a hold-less
+// older backend never blocks the driver's own lifecycle.
+func (c *Client) SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, error) {
+	var holds []string
+	if err := callTyped(ctx, c, &holds, "zfs.resource.snapshot.holds", map[string]interface{}{"path": snapshotID}); err != nil {
+		if isMethodNotFoundError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to query snapshot holds: %w", err)
+	}
+	return len(holds) > 0, nil
+}
+
+// isSnapshotAlreadyHeldError treats the idempotent already-held outcomes as
+// success. TrueNAS reports a re-hold as EEXIST/errno 17, sometimes wrapped as a
+// bare lzc_hold() failure whose only structured signal is the errno; both the
+// errno path and the ZFS wrapper message are accepted.
+func isSnapshotAlreadyHeldError(err error) bool {
+	if err == nil || IsAlreadyExistsError(err) {
+		return true
+	}
+	if errno, ok := APIErrno(err); ok {
+		return errno == syscall.EEXIST
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "lzc_hold") && strings.Contains(message, "17")
+}
+
+// isSnapshotNotHeldError treats releasing a non-held snapshot as success: an
+// authoritative ENOENT, or (on releases that surface no errno) a message that
+// names the missing hold.
+func isSnapshotNotHeldError(err error) bool {
+	if err == nil || IsNotFoundError(err) {
+		return true
+	}
+	if _, ok := APIErrno(err); ok {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "hold") &&
+		(strings.Contains(message, "not") || strings.Contains(message, "no such"))
 }
 
 // SnapshotGet retrieves a snapshot by ID (dataset@snapshot format).

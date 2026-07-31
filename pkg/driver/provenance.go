@@ -656,6 +656,12 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 	if err := d.truenasClient.SnapshotRemoveUserProperties(ctx, deleteID, properties); err != nil {
 		klog.Warningf("Failed to strip CSI properties from deferred snapshot %s: %v", deleteID, err)
 	}
+	// Release the deletion-proof hold before the immediate destroy (GF2/E1, R1):
+	// the hold survives the rename onto deleteID, so without this release the
+	// destroy below would EBUSY and the immediate-destroy path would wedge. This
+	// snapshot is driver-proven (it carries the ledger entry written above), so
+	// releasing never strips a hold the driver does not own (R2).
+	d.releaseCSISnapshotHoldIfEnabled(ctx, deleteID)
 	if err := d.truenasClient.SnapshotDelete(ctx, deleteID, true, false); err != nil {
 		if truenas.IsNotFoundError(err) {
 			d.removeTombstoneLedgerEntry(ctx, deleteID)

@@ -30,17 +30,21 @@ const (
 	EventReasonSnapshotCreateFailed = "SnapshotCreateFailed"
 	EventReasonSnapshotDeleted      = "SnapshotDeleted"
 	EventReasonSnapshotDeleteFailed = "SnapshotDeleteFailed"
-	EventReasonISCSILoginFailed     = "ISCSILoginFailed"
-	EventReasonNVMeConnectFailed    = "NVMeConnectFailed"
-	EventReasonMountFailed          = "MountFailed"
-	EventReasonISCSILogoutFailed    = "ISCSILogoutFailed"
-	EventReasonNFSMountFailed       = "NFSMountFailed"
-	EventReasonNFSUnmountFailed     = "NFSUnmountFailed"
-	EventReasonTrueNASError         = "TrueNASError"
-	EventReasonTrueNASReconnected   = "TrueNASReconnected"
-	EventReasonFencingTakeover      = "FencingTakeover"
-	EventReasonISCSICHAPRotated     = "ISCSICHAPRotated"
-	EventReasonRemnantOrphanReaped  = "RemnantOrphanReaped"
+	// EventReasonSnapshotHoldFailed is emitted when a deletion-proof hold could not
+	// be placed on a CSI snapshot (GF2/E1). The failure is non-fatal: the snapshot
+	// is still ReadyToUse and degrades to pre-GF2 (unprotected) behavior.
+	EventReasonSnapshotHoldFailed  = "SnapshotHoldFailed"
+	EventReasonISCSILoginFailed    = "ISCSILoginFailed"
+	EventReasonNVMeConnectFailed   = "NVMeConnectFailed"
+	EventReasonMountFailed         = "MountFailed"
+	EventReasonISCSILogoutFailed   = "ISCSILogoutFailed"
+	EventReasonNFSMountFailed      = "NFSMountFailed"
+	EventReasonNFSUnmountFailed    = "NFSUnmountFailed"
+	EventReasonTrueNASError        = "TrueNASError"
+	EventReasonTrueNASReconnected  = "TrueNASReconnected"
+	EventReasonFencingTakeover     = "FencingTakeover"
+	EventReasonISCSICHAPRotated    = "ISCSICHAPRotated"
+	EventReasonRemnantOrphanReaped = "RemnantOrphanReaped"
 	// EventReasonReaperRefused is emitted once per reconcile pass when the guarded
 	// reaper refuses one or more manual-recovery tombstones (unproven creation-time
 	// identity). These never drain automatically; each needs operator action (E3/O13).

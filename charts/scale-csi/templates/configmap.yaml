@@ -52,6 +52,9 @@ data:
       zvolEnableReservation: {{ .Values.zfs.zvolEnableReservation }}
       zvolReadyTimeout: {{ .Values.zfs.zvolReadyTimeout | default 60 }}
       destroyForeignSnapshotsOnDelete: {{ .Values.zfs.destroyForeignSnapshotsOnDelete }}
+      {{- if .Values.zfs.holdCsiSnapshots }}
+      holdCsiSnapshots: true
+      {{- end }}
 
     {{- if .Values.nfs.enabled }}
     # NFS configuration

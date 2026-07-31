@@ -192,6 +192,21 @@ func (c *apiCallCountingClient) SnapshotRename(ctx context.Context, snapshotID, 
 	return c.MockClient.SnapshotRename(ctx, snapshotID, newName)
 }
 
+func (c *apiCallCountingClient) SnapshotHold(ctx context.Context, snapshotID string) error {
+	c.record("SnapshotHold")
+	return c.MockClient.SnapshotHold(ctx, snapshotID)
+}
+
+func (c *apiCallCountingClient) SnapshotRelease(ctx context.Context, snapshotID string) error {
+	c.record("SnapshotRelease")
+	return c.MockClient.SnapshotRelease(ctx, snapshotID)
+}
+
+func (c *apiCallCountingClient) SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, error) {
+	c.record("SnapshotIsHeld")
+	return c.MockClient.SnapshotIsHeld(ctx, snapshotID)
+}
+
 func (c *apiCallCountingClient) SnapshotGet(ctx context.Context, snapshotID string) (*truenas.Snapshot, error) {
 	c.record("SnapshotGet")
 	return c.MockClient.SnapshotGet(ctx, snapshotID)
@@ -868,6 +883,75 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			require.NoError(t, client.MockClient.SnapshotClone(context.Background(), snapshotID, "pool/parent/restored"))
 			client.resetCalls()
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
+			require.NoError(t, err)
+		}},
+		// GF2/E1 (zfs.holdCsiSnapshots=true): the fresh-create baseline of three
+		// (source lookup, global-name lookup, atomic create) plus ONE SnapshotHold
+		// placed after the snapshot and its identity exist. The hold is the only
+		// added round trip; a hold failure is non-fatal and not modeled here.
+		{name: "CreateSnapshot fresh with hold", want: 4, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			d.config.ZFS.HoldCSISnapshots = true
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/hold-snapshot-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "hold-snapshot", SourceVolumeId: "hold-snapshot-source"})
+			require.NoError(t, err)
+		}},
+		// GF2/E1 idempotent retry with hold: the retry baseline of two (source
+		// re-read + global-name resolution) plus ONE SnapshotHold from the
+		// idempotent-existing branch (re-holding an already-held snapshot is
+		// idempotent success, so the retry still pays exactly one hold call).
+		{name: "CreateSnapshot idempotent retry with hold", want: 3, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			d.config.ZFS.HoldCSISnapshots = true
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/hold-retry-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			req := &csi.CreateSnapshotRequest{Name: "hold-retry-snapshot", SourceVolumeId: "hold-retry-source"}
+			_, err = d.CreateSnapshot(context.Background(), req)
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.CreateSnapshot(context.Background(), req)
+			require.NoError(t, err)
+		}},
+		// GF2/E1 simple delete with hold: the baseline of two (name resolution +
+		// destroy) plus ONE SnapshotRelease issued strictly BEFORE the destroy so
+		// the held snapshot is unheld first (R1 ordering).
+		{name: "DeleteSnapshot simple with hold", want: 3, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			d.config.ZFS.HoldCSISnapshots = true
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/hold-delete-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "hold-delete-snapshot", SourceVolumeId: "hold-delete-source"})
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "hold-delete-snapshot"})
+			require.NoError(t, err)
+		}},
+		// GF2/E1 clone-backed delete with hold: the eight-call tombstone baseline
+		// plus TWO SnapshotRelease calls — one in DeleteSnapshot before the initial
+		// destroy (R1), and one in handleSnapshotClones before the tombstone's own
+		// deferred destroy (the release-before-destroy guard at BOTH driver destroy
+		// sites). The second release is an idempotent no-op once DeleteSnapshot has
+		// already unheld the snapshot, but it is still one round trip.
+		{name: "DeleteSnapshot with clones with hold", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			d.config.ZFS.HoldCSISnapshots = true
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent", Type: "FILESYSTEM",
+			})
+			require.NoError(t, err)
+			_, err = client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/hold-tombstone-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			created, err := d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "hold-tombstone-snapshot", SourceVolumeId: "hold-tombstone-source"})
+			require.NoError(t, err)
+			snapshotID := "pool/parent/hold-tombstone-source@" + created.GetSnapshot().GetSnapshotId()
+			require.NoError(t, client.MockClient.SnapshotClone(context.Background(), snapshotID, "pool/parent/hold-restored"))
+			client.resetCalls()
+			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "hold-tombstone-snapshot"})
 			require.NoError(t, err)
 		}},
 		// Ten calls (Sprint 3: L2a folded the ownership stamp into the

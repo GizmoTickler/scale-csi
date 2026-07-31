@@ -44,10 +44,13 @@ On role-based TrueNAS releases, the built-in `SHARING_ADMIN` plus
 `REPLICATION_ADMIN` roles cover the dataset/share and snapshot operations used
 by the driver; `FULL_ADMIN` is not required. A custom privilege must cover the
 equivalent dataset create/update/delete, NFS/iSCSI/NVMe sharing, snapshot
-read/create/update/clone/rename/delete, service read/reload, and `system.info`
-operations. Role names and method assignments differ between TrueNAS API
-generations, so confirm a custom privilege against the API documentation served
-by the target appliance. See the TrueNAS [role reference][truenas-rbac].
+read/create/update/clone/rename/delete/hold/release, service read/reload, and
+`system.info` operations. The opt-in GF2 data-protection features exercise a few
+additional methods, each only when its flag is enabled — snapshot hold/release
+for `zfs.holdCsiSnapshots`. Role names and method assignments differ between
+TrueNAS API generations, so confirm a custom privilege against the API
+documentation served by the target appliance. See the TrueNAS
+[role reference][truenas-rbac].
 
 > **Exclude the CSI parent from periodic-snapshot and replication tasks.** The
 > configured `zfs.parentDataset` subtree is exclusive driver territory. A

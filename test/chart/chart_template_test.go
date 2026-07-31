@@ -190,6 +190,25 @@ func TestChartTombstoneReaperScanFallbackPlumbing(t *testing.T) {
 	}
 }
 
+// TestChartHoldCSISnapshotsPlumbing proves the GF2/E1 zfs.holdCsiSnapshots key is
+// removal-only rendered: ABSENT from the default configmap (so the default render
+// stays byte-identical to v1.4.1 and a rolled-back binary with no holdCsiSnapshots
+// field still strict-parses it) and present only when explicitly enabled.
+func TestChartHoldCSISnapshotsPlumbing(t *testing.T) {
+	t.Run("default render omits holdCsiSnapshots", func(t *testing.T) {
+		if out := helmTemplate(t, "--show-only", "templates/configmap.yaml"); strings.Contains(out, "holdCsiSnapshots:") {
+			t.Errorf("default configmap must not emit zfs.holdCsiSnapshots; the feature is opt-in and the default render must stay byte-identical")
+		}
+	})
+
+	t.Run("enabled renders the key", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.holdCsiSnapshots=true")
+		if !strings.Contains(out, "      holdCsiSnapshots: true\n") {
+			t.Errorf("--set zfs.holdCsiSnapshots=true did not propagate into the rendered configmap; got:\n%s", out)
+		}
+	})
+}
+
 // TestChartDeprecatedKeysNotRendered proves the retired iscsi.extentAvailThreshold
 // and nvmeof.commandTimeout keys are no longer rendered into the driver configmap.
 // Both were parsed but consumed by nothing (the nvme CLI timeout is

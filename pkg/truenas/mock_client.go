@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -45,6 +46,9 @@ type MockClient struct {
 	ReplicationJobAbortReasons []string
 	SnapshotSetCalls           int
 	SnapshotRemoveCalls        int
+	SnapshotHoldCalls          int
+	SnapshotReleaseCalls       int
+	snapshotHolds              map[string]struct{}
 	nextReplicationJobID       int64
 
 	// Error injection
@@ -106,6 +110,7 @@ func NewMockClient() *MockClient {
 			1: {ID: 1, Initiators: nil, Comment: "allow-all (mock)"},
 		},
 		deferredSnapshots:    make(map[string]struct{}),
+		snapshotHolds:        make(map[string]struct{}),
 		PoolAvailable:        100 * 1024 * 1024 * 1024, // 100 GiB default
 		nextReplicationJobID: 1,
 	}
@@ -735,6 +740,11 @@ func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defe
 	if _, ok := m.Snapshots[snapshotID]; !ok {
 		return nil
 	}
+	// A held snapshot cannot be destroyed (P1): model the EBUSY a foreign actor
+	// hits so tests can prove a hold blocks deletion until the driver releases it.
+	if _, held := m.snapshotHolds[snapshotID]; held {
+		return &APIError{Code: int(syscall.EBUSY), Message: fmt.Sprintf("'%s' has the following holds: truenas", snapshotID)}
+	}
 	clones := m.snapshotClonesLocked(snapshotID)
 	if len(clones) > 0 {
 		// TrueNAS 26.0 has no deferred destroy: the request fails with has-clones
@@ -783,7 +793,53 @@ func (m *MockClient) SnapshotRename(ctx context.Context, snapshotID, newName str
 			dataset.Origin = DatasetProperty{Value: newSnapshotID, Parsed: newSnapshotID, Rawvalue: newSnapshotID, Source: "LOCAL"}
 		}
 	}
+	// A hold survives the rename (P1): carry it onto the tombstone ID so the
+	// reaper interaction (release-before-reap) is exercisable.
+	if _, held := m.snapshotHolds[snapshotID]; held {
+		delete(m.snapshotHolds, snapshotID)
+		m.snapshotHolds[newSnapshotID] = struct{}{}
+	}
 	return nil
+}
+
+func (m *MockClient) SnapshotHold(ctx context.Context, snapshotID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SnapshotHoldCalls++
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	if _, ok := m.Snapshots[snapshotID]; !ok {
+		return notFoundAPIError("snapshot not found")
+	}
+	// Re-holding an already-held snapshot is idempotent success (P1: EEXIST/17).
+	m.snapshotHolds[snapshotID] = struct{}{}
+	return nil
+}
+
+func (m *MockClient) SnapshotRelease(ctx context.Context, snapshotID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SnapshotReleaseCalls++
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	// Releasing a non-held (or absent) snapshot is idempotent success.
+	delete(m.snapshotHolds, snapshotID)
+	return nil
+}
+
+func (m *MockClient) SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return false, m.InjectError
+	}
+	_, held := m.snapshotHolds[snapshotID]
+	return held, nil
 }
 
 func (m *MockClient) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error) {

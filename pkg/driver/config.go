@@ -187,6 +187,16 @@ type ZFSConfig struct {
 	// DestroyForeignSnapshotsOnDelete allows recursive dataset deletion to remove
 	// snapshots that were not created by the CSI driver (default: false)
 	DestroyForeignSnapshotsOnDelete bool `yaml:"destroyForeignSnapshotsOnDelete"`
+
+	// HoldCSISnapshots places a deletion-proof ZFS hold (the fixed `truenas` tag)
+	// on every CSI VolumeSnapshot at create so foreign actors — a box-wide
+	// periodic-snapshot task's pruning, an admin, replication retention — cannot
+	// destroy it (they hit EBUSY). The driver's own destroy paths
+	// (handleSnapshotClones, reapTombstoneSnapshot) release the hold first, gated
+	// on driver provenance, so the hold never wedges the driver's lifecycle
+	// (GF2/E1, R1). Default false: no holds are placed and behavior is identical
+	// to pre-GF2.
+	HoldCSISnapshots bool `yaml:"holdCsiSnapshots"`
 }
 
 // NFSConfig holds NFS share configuration.
