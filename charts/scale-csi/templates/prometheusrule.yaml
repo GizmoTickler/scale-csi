@@ -48,6 +48,22 @@ spec:
           annotations:
             summary: Scale CSI TrueNAS API failure rate is high
             description: More than 10% of TrueNAS API requests have failed for ten minutes.
+        - alert: ScaleCSISustainedLockContention
+          # Sprint 5 moved EBUSY lock-contention/in-progress outcomes OUT of
+          # status="error" into status="benign_aborted" (E1), so the failure-rate
+          # alert above no longer covers a sustained abort storm. This alert
+          # restores that signal: the TrueNAS client returns non-connection API
+          # errors immediately instead of retrying them, so sustained lock
+          # contention remains an operational latency/retry symptom even though
+          # each individual outcome is benign (codex M2 / opus hardening).
+          expr: sum(rate(scale_csi_truenas_requests_total{status="benign_aborted"}[15m])) > 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI TrueNAS lock contention is sustained
+            description: Benign lock-contention/in-progress aborts (status="benign_aborted") have exceeded 1 per second for fifteen minutes; an EBUSY abort storm elevates API load and publish latency though it is not a hard backend failure.
+            runbook_url: docs/troubleshooting.md#performance-issues
         - alert: ScaleCSIOperationErrorsSustained
           expr: sum(rate(scale_csi_operations_total{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }},status="error",code!~"FailedPrecondition|AlreadyExists|Aborted"}[10m])) > 0.02
           for: 15m
@@ -72,6 +88,47 @@ spec:
           annotations:
             summary: Scale CSI garbage-collected storage sessions
             description: A node plugin disconnected at least one orphaned iSCSI or NVMe-oF session in the last hour.
+        - alert: ScaleCSIFencingTakeoverSpike
+          expr: sum(increase(scale_csi_fencing_takeover_total[1h])) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI performed a synchronous fencing takeover
+            description: A stale publication was forcibly revoked to hand the volume to another node. Any takeover is notable; investigate the fenced node.
+            runbook_url: docs/guides/disaster-recovery.md#runbook-fencing-takeover-for-a-confirmed-dead-node
+        - alert: ScaleCSIFencingProvenanceOverflow
+          expr: increase(scale_csi_fencing_provenance_overflow_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: Scale CSI is refusing publishes on provenance overflow
+            description: Additive fencing provenance exceeded the per-node cap; publishes fail closed with ResourceExhausted until grants drain.
+            runbook_url: docs/guides/disaster-recovery.md#runbook-fencing-takeover-for-a-confirmed-dead-node
+        - alert: ScaleCSIJobDispatcherUnsubscribed
+          # Scoped to the controller job (codex H1): the gauge is published only
+          # by controller-mode processes, but selecting the controller target
+          # explicitly keeps the query correct even if a node target ever exposed
+          # the series. `min` fires when ANY controller replica loses its
+          # subscription.
+          expr: min(scale_csi_job_dispatcher_subscribed{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI degraded to pure-poll job waiting
+            description: At least one controller replica has no pooled connection holding a live core.get_jobs subscription (pure-poll fallback); API load and latency are elevated.
+            runbook_url: docs/troubleshooting.md#job-dispatcher-pure-poll-fallback
+        - alert: ScaleCSIDeleteResidualCleanupFailing
+          expr: sum(increase(scale_csi_delete_volume_orphan_cleanup_failures_total[1h])) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI DeleteVolume residual share cleanup is failing
+            description: DeleteVolume succeeded on an absent dataset but best-effort residual share cleanup failed; the orphan reconcile sweeps the residue.
+            runbook_url: docs/troubleshooting.md#clean-up-orphaned-truenas-resources
         {{- if .Values.reconcile.enabled }}
         - alert: ScaleCSIOrphanVolumesDetected
           expr: scale_csi_orphan_volumes > 0
@@ -89,6 +146,65 @@ spec:
           annotations:
             summary: Scale CSI orphan snapshots detected
             description: CSI-managed TrueNAS snapshots have had no matching live VolumeSnapshotContent handle for longer than the reconcile alert window.
+        - alert: ScaleCSIManualRecoveryTombstones
+          expr: scale_csi_manual_recovery_tombstones > 0
+          for: {{ .Values.reconcile.alertAfter }}
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI reaper refuses manual-recovery tombstones
+            description: Driver-tombstoned snapshots have unproven creation-time identity and will never drain automatically; operator action required.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
+        - alert: ScaleCSIRemnantVolumesDetected
+          expr: scale_csi_remnant_volumes > 0
+          for: {{ .Values.reconcile.alertAfter }}
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI remnant volumes detected
+            description: Marker-proven unstamped remnant datasets from interrupted creates await guarded reap.
+            runbook_url: docs/troubleshooting.md#clean-up-orphaned-truenas-resources
+        - alert: ScaleCSITombstoneBacklog
+          expr: scale_csi_tombstone_snapshots > 0
+          for: 48h
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI tombstone backlog is not draining
+            description: Driver-tombstoned deferred-delete snapshots have awaited reap for forty-eight hours.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
+        - alert: ScaleCSIReconcileStalled
+          # The age threshold is DERIVED from the configured reconcile.interval
+          # (3x the cadence, in seconds) instead of a hard-coded three hours, so
+          # an operator who lengthens reconcile.interval no longer gets a false
+          # critical before the next scheduled pass (codex M3). The coupling is
+          # also documented next to reconcile.interval in values.yaml.
+          #
+          # A controller that has NEVER completed a reconcile exports the gauge
+          # as 0, so the age is time()-0 (huge) and this alert trips after the
+          # 15m hold. That is intentional: a reconcile that never succeeds is
+          # worth paging on, not a false positive (opus informational note).
+          expr: time() - max(scale_csi_reconcile_last_success_timestamp_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > {{ mul 3 (include "scale-csi.durationToSeconds" .Values.reconcile.interval | int) }}
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: Scale CSI controller reconcile loop is stalled
+            description: No reconcile pass has succeeded for over three times the configured reconcile.interval ({{ .Values.reconcile.interval }}); orphan detection is frozen. A controller that has never completed a reconcile also trips this alert.
+            runbook_url: docs/troubleshooting.md#clean-up-orphaned-truenas-resources
+        {{- end }}
+        {{- if .Values.capacity.gaugeEnabled }}
+        - alert: ScaleCSIPoolNearFull
+          # Render the threshold directly (no Sprig `default`): the default lives
+          # in values.yaml, and `default` treats a legitimate numeric 0 as empty,
+          # silently rewriting it to 0.85 (codex M4).
+          expr: (1 - (scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes)) > {{ .Values.metrics.prometheusRule.poolUsageThreshold }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI backend pool is nearly full
+            description: Parent dataset usable capacity is above the configured threshold.
         {{- end }}
         {{- end }}
 {{- end }}

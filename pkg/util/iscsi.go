@@ -114,7 +114,31 @@ const staleSessionValidationTimeout = 2 * time.Second
 type ISCSIConnectOptions struct {
 	DeviceTimeout       time.Duration // Timeout for waiting for device to appear (default: 60s)
 	SessionCleanupDelay time.Duration // Delay after cleaning up stale session (default: 500ms)
+	CHAP                *ISCSICHAPCredentials
 }
+
+// ISCSICHAPCredentials carries the session CHAP credentials applied to a node
+// record before login. MutualUsername/MutualPassword are only used when Mutual
+// is true. The struct is short-lived and never logged.
+type ISCSICHAPCredentials struct {
+	Username       string
+	Password       string
+	MutualUsername string
+	MutualPassword string
+	Mutual         bool
+}
+
+// ErrISCSIAuthFailure marks an iSCSI login that failed CHAP authentication. The
+// node maps it to codes.Unauthenticated and — critically — does NOT enter the
+// discovery retry loop, because a wrong secret is not a missing target.
+var ErrISCSIAuthFailure = errors.New("iSCSI CHAP authentication failed")
+
+// ErrISCSICHAPConfig marks a failure APPLYING CHAP credentials to the node record
+// (node.session.auth.*), as distinct from ErrISCSIAuthFailure which is a login
+// rejection. The wrapped error carries only the parameter NAME and an exit-class
+// summary — never the credential value (ConfigureISCSICHAPWithContext redacts it)
+// — so the node can safely surface it on a PVC/PV Event (E3/O15).
+var ErrISCSICHAPConfig = errors.New("iSCSI CHAP configuration failed")
 
 // ISCSIConnect connects to an iSCSI target and returns the device path.
 func ISCSIConnect(portal, iqn string, lun int) (string, error) {
@@ -187,11 +211,31 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 	}
 	klog.Infof("iSCSI fast-path node record ensured for %s in %v", iqn, time.Since(nodeRecordStart))
 
+	// Apply session CHAP credentials to the node record before login. Session
+	// auth only (not discovery auth): the happy path uses the static node record,
+	// so node.session.auth.* is set here and discovery_auth stays NONE. Idempotent
+	// (-o update); skipped on the healthy-session reuse branch above.
+	if opts != nil && opts.CHAP != nil {
+		if chapErr := ConfigureISCSICHAPWithContext(ctx, portal, iqn, opts.CHAP); chapErr != nil {
+			// chapErr is already redacted (parameter name + exit class, never the
+			// value); wrap it in a sentinel so the node can emit a distinct
+			// ISCSICHAPFailed Event without leaking the credential (E3/O15).
+			return "", fmt.Errorf("%w for %s: %w", ErrISCSICHAPConfig, iqn, chapErr)
+		}
+	}
+
 	// Login to target (also serialized per portal to prevent overload)
 	// If login fails due to target not found, retry with exponential backoff.
 	// TrueNAS may take time to propagate newly created targets to the iSCSI daemon.
 	loginStart := time.Now()
 	loginErr := iscsiLoginSerializedWithSessions(ctx, portal, iqn, sessions)
+	if loginErr != nil && isAuthFailure(loginErr) {
+		// A wrong secret is terminal: classify it so the node returns Unauthenticated
+		// and never enters the discovery retry loop (no ~34s backoff storm). The
+		// returned error carries only the IQN — never the credential or raw output.
+		klog.Warningf("iSCSI CHAP authentication failed for %s; not retrying discovery", iqn)
+		return "", fmt.Errorf("%w for %s", ErrISCSIAuthFailure, iqn)
+	}
 	if loginErr != nil && isTargetNotFoundError(loginErr) {
 		klog.Warningf("iSCSI fast-path login failed for %s (target not found/no portal record), falling back to SendTargets discovery: %v", iqn, loginErr)
 
@@ -225,6 +269,13 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 					break
 				}
 
+				if isAuthFailure(loginErr) {
+					// Classify auth failures on EVERY login attempt, including the
+					// post-discovery retry: a wrong secret is terminal and must return
+					// the same redacted Unauthenticated sentinel, not a raw login error.
+					klog.Warningf("iSCSI CHAP authentication failed for %s on post-discovery retry; not retrying", iqn)
+					return "", fmt.Errorf("%w for %s", ErrISCSIAuthFailure, iqn)
+				}
 				if !isTargetNotFoundError(loginErr) {
 					// Different error, don't retry
 					return "", fmt.Errorf("login failed for %s after discovery retry %d: %w", iqn, attempt, loginErr)
@@ -734,6 +785,14 @@ func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 }
 
 // SetISCSINodeParam sets a parameter on an iSCSI node.
+//
+// When name is a CHAP credential key (node.session.auth.username/password and
+// their mutual variants) the value is a secret: on error the returned message
+// carries only the redacted argv (value masked) and an exit-class summary — never
+// the raw value or iscsiadm output, which iscsiadm or a wrapper could echo
+// (E4/O22). This mirrors ConfigureISCSICHAPWithContext's redaction. Non-auth
+// params keep the fuller output for debuggability; their argv is still passed
+// through redactISCSIArgs so future auth-key use is safe by construction.
 func SetISCSINodeParam(portal, iqn, name, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
 	defer cancel()
@@ -742,29 +801,133 @@ func SetISCSINodeParam(portal, iqn, name, value string) error {
 		"-o", "update", "-n", name, "-v", value)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to set node param: %w, output: %s", err, string(output))
+		if isISCSIAuthParam(name) {
+			return fmt.Errorf("failed to set node param %s (%s), args: %v", name, sanitizedExecClass(err), redactISCSIArgs(cmd.Args))
+		}
+		return fmt.Errorf("failed to set node param %s: %w, args: %v, output: %s", name, err, redactISCSIArgs(cmd.Args), string(output))
 	}
 	return nil
 }
 
-// ConfigureISCSICHAP configures CHAP authentication for an iSCSI target.
-func ConfigureISCSICHAP(portal, iqn, username, password string) error {
-	// Set auth method to CHAP
-	if err := SetISCSINodeParam(portal, iqn, "node.session.auth.authmethod", "CHAP"); err != nil {
-		return err
+// isISCSIAuthParam reports whether an iscsiadm node parameter name carries a CHAP
+// credential value that must never be logged.
+func isISCSIAuthParam(name string) bool {
+	switch name {
+	case "node.session.auth.username",
+		"node.session.auth.password",
+		"node.session.auth.username_in",
+		"node.session.auth.password_in":
+		return true
+	}
+	return false
+}
+
+// redactISCSIArgs returns a copy of an iscsiadm argv with CHAP credential values
+// masked as "***". It redacts the value following -v when the active -n is an auth
+// key, and (belt-and-suspenders) any bare value token directly following an
+// auth-key name. Parameter NAMES and non-auth values are preserved. The input
+// slice is never mutated.
+func redactISCSIArgs(args []string) []string {
+	redacted := make([]string, len(args))
+	copy(redacted, args)
+	authValuePending := false
+	for i := 0; i < len(redacted); i++ {
+		switch redacted[i] {
+		case "-n":
+			authValuePending = false
+			if i+1 < len(redacted) {
+				authValuePending = isISCSIAuthParam(redacted[i+1])
+				i++ // skip the parameter name token; it is not secret
+			}
+		case "-v":
+			if authValuePending && i+1 < len(redacted) {
+				redacted[i+1] = "***"
+				i++ // skip the value token just redacted
+			}
+			authValuePending = false
+		default:
+			if authValuePending && !strings.HasPrefix(redacted[i], "-") {
+				redacted[i] = "***"
+			}
+			authValuePending = false
+		}
+	}
+	return redacted
+}
+
+// ConfigureISCSICHAPWithContext applies session CHAP credentials to a target's
+// node record before login. It uses the ctx-aware iscsiAdmCombinedOutput seam
+// (not the plain-exec SetISCSINodeParam) so it is testable and cancellable. The
+// parameter NAMES may appear in errors; the credential VALUES never do.
+func ConfigureISCSICHAPWithContext(ctx context.Context, portal, iqn string, creds *ISCSICHAPCredentials) error {
+	if creds == nil {
+		return nil
+	}
+	setParam := func(name, value string) error {
+		cmdCtx, cancel := context.WithTimeout(ctx, getISCSITimeout())
+		defer cancel()
+		// The value passed to iscsiadm is a CHAP credential. On failure NEVER append
+		// the command's CombinedOutput or the raw exec error: iscsiadm (or a wrapper
+		// / exec logger) can echo the submitted argv/value. Return only the parameter
+		// NAME and an exit-class summary so no credential can reach a gRPC status,
+		// Event, or log line.
+		_, err := iscsiAdmCombinedOutput(cmdCtx, "-m", "node", "-T", iqn, "-p", portal,
+			"-o", "update", "-n", name, "-v", value)
+		if err != nil {
+			return fmt.Errorf("failed to set node param %s (%s)", name, sanitizedExecClass(err))
+		}
+		return nil
 	}
 
-	// Set username
-	if err := SetISCSINodeParam(portal, iqn, "node.session.auth.username", username); err != nil {
+	if err := setParam("node.session.auth.authmethod", "CHAP"); err != nil {
 		return err
 	}
-
-	// Set password
-	if err := SetISCSINodeParam(portal, iqn, "node.session.auth.password", password); err != nil {
+	if err := setParam("node.session.auth.username", creds.Username); err != nil {
 		return err
 	}
-
+	if err := setParam("node.session.auth.password", creds.Password); err != nil {
+		return err
+	}
+	if creds.Mutual {
+		if err := setParam("node.session.auth.username_in", creds.MutualUsername); err != nil {
+			return err
+		}
+		if err := setParam("node.session.auth.password_in", creds.MutualPassword); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// sanitizedExecClass summarizes an exec error WITHOUT its message or output, so
+// a credential that iscsiadm or a wrapper echoed into stdout/stderr cannot leak
+// into a returned error. A real *exec.ExitError yields "exit status N"; any
+// other error is reported only by class.
+func sanitizedExecClass(err error) string {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return fmt.Sprintf("exit status %d", exitErr.ExitCode())
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timed out"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	return "command execution error"
+}
+
+// isAuthFailure reports whether a login error is a CHAP authentication failure
+// (a 403-class rejection) rather than a missing target/portal. Such failures are
+// terminal and must not trigger discovery retries.
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "authorization failure") ||
+		strings.Contains(errStr, "authentication failed") ||
+		strings.Contains(errStr, "login failed")
 }
 
 // GetDeviceWWN returns the WWN (World Wide Name) for a device.

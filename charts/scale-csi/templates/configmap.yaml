@@ -34,6 +34,9 @@ data:
       connectTimeout: {{ .Values.truenas.connectTimeout }}
       writeTimeout: {{ .Values.truenas.writeTimeout | default 30 }}
       maxConcurrentRequests: {{ .Values.truenas.maxConcurrentRequests | default 10 }}
+      {{- if not (kindIs "invalid" .Values.truenas.maxConnections) }}
+      maxConnections: {{ .Values.truenas.maxConnections }}
+      {{- end }}
 
     # ZFS dataset configuration
     zfs:
@@ -85,9 +88,15 @@ data:
       extentBlocksize: {{ .Values.iscsi.extentBlocksize }}
       extentDisablePhysicalBlocksize: {{ .Values.iscsi.extentDisablePhysicalBlocksize }}
       extentRpm: {{ .Values.iscsi.extentRpm | quote }}
-      extentAvailThreshold: {{ .Values.iscsi.extentAvailThreshold }}
       deviceWaitTimeout: {{ .Values.iscsi.deviceWaitTimeout | default 60 }}
       serviceReloadDebounce: {{ .Values.iscsi.serviceReloadDebounce | default 2000 }}
+      {{- if .Values.iscsi.chap.enabled }}
+      # CHAP is opt-in; this block renders only when iscsi.chap.enabled=true.
+      chap:
+        enabled: true
+        tag: {{ .Values.iscsi.chap.tag | default 0 }}
+        mutual: {{ .Values.iscsi.chap.mutual }}
+      {{- end }}
     {{- end }}
 
     {{- if .Values.nvmeof.enabled }}
@@ -100,7 +109,6 @@ data:
       subsystemHosts:
         {{- toYaml .Values.nvmeof.subsystemHosts | nindent 8 }}
       subsystemAllowAnyHost: {{ .Values.nvmeof.subsystemAllowAnyHost }}
-      commandTimeout: {{ .Values.nvmeof.commandTimeout }}
     {{- end }}
 
     # Session garbage collection (node plugin only)
@@ -136,6 +144,22 @@ data:
         schedule: {{ .Values.reconcile.delete.schedule | quote }}
         maxPerRun: {{ .Values.reconcile.delete.maxPerRun }}
 
+    {{- if or .Values.capacity.reportMaximumVolumeSize .Values.capacity.gaugeEnabled }}
+    # Capacity reporting / pool-capacity gauges (opt-in). The block renders ONLY
+    # when a capacity value is non-default so the default ConfigMap carries no
+    # capacity: key and stays parseable by a rolled-back binary with no capacity
+    # field (F1 invariant); the driver default (off) is the source of truth when
+    # the block is absent.
+    capacity:
+      {{- if .Values.capacity.reportMaximumVolumeSize }}
+      reportMaximumVolumeSize: {{ .Values.capacity.reportMaximumVolumeSize }}
+      {{- end }}
+      {{- if .Values.capacity.gaugeEnabled }}
+      gaugeEnabled: true
+      gaugeInterval: {{ .Values.capacity.gaugeInterval | default "60s" | quote }}
+      {{- end }}
+    {{- end }}
+
     resilience:
       circuitBreaker:
         enabled: {{ .Values.resilience.circuitBreaker.enabled }}
@@ -147,7 +171,6 @@ data:
         maxDelay: {{ .Values.resilience.retry.maxDelay }}
         backoffMultiplier: {{ .Values.resilience.retry.backoffMultiplier }}
       rateLimiting:
-        maxConcurrentRequests: {{ .Values.resilience.rateLimiting.maxConcurrentRequests }}
         maxConcurrentLogins: {{ .Values.resilience.rateLimiting.maxConcurrentLogins }}
 
     commandTimeouts:

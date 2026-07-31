@@ -950,6 +950,13 @@ func TestNodeUnpublishVolume_Validation(t *testing.T) {
 func TestNodeGetVolumeStats_Validation(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeNFS)
 
+	// The bounded mount pre-gate runs before the path stat; stub it to
+	// not-mounted so the nonexistent-path case still reaches the resolver (the
+	// real findmnt-backed check is unavailable on non-Linux test hosts).
+	originalMountCheck := nodeStatsMountCheck
+	t.Cleanup(func() { nodeStatsMountCheck = originalMountCheck })
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return false, nil }
+
 	t.Run("MissingVolumeID", func(t *testing.T) {
 		req := &csi.NodeGetVolumeStatsRequest{
 			VolumePath: "/var/lib/kubelet/pods/xxx/volumes/csi",
@@ -997,14 +1004,19 @@ func TestNodeGetVolumeStats_BlockMode(t *testing.T) {
 	originalDeviceSize := getNodeDeviceSize
 	originalStat := nodeStatsStat
 	originalSysfsRoot := nodeStatsSysfsRoot
+	originalMountCheck := nodeStatsMountCheck
 	t.Cleanup(func() {
 		resolveNodeStatsDevice = originalResolver
 		getNodeDeviceSize = originalDeviceSize
 		nodeStatsStat = originalStat
 		nodeStatsSysfsRoot = originalSysfsRoot
+		nodeStatsMountCheck = originalMountCheck
 	})
 	resolveNodeStatsDevice = nodeStatsDevice
 	getNodeDeviceSize = nodeStatsDeviceSize
+	// A block-device path is not a mountpoint; the pre-gate returns not-mounted
+	// with no error and falls through to the device stat.
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return false, nil }
 
 	volumePath := filepath.Join(t.TempDir(), "published-block-device")
 	require.NoError(t, os.WriteFile(volumePath, nil, 0o640))
@@ -1046,11 +1058,14 @@ func TestNodeStatsDeviceSizeRejectsSectorOverflow(t *testing.T) {
 func TestNodeGetVolumeStats_FilesystemModeUnchanged(t *testing.T) {
 	originalResolver := resolveNodeStatsDevice
 	originalFilesystemStats := getNodeFilesystemStats
+	originalMountCheck := nodeStatsMountCheck
 	t.Cleanup(func() {
 		resolveNodeStatsDevice = originalResolver
 		getNodeFilesystemStats = originalFilesystemStats
+		nodeStatsMountCheck = originalMountCheck
 	})
 	resolveNodeStatsDevice = func(string) (string, bool, error) { return "", false, nil }
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return true, nil }
 	getNodeFilesystemStats = func(string) (*util.FilesystemStats, error) {
 		return &util.FilesystemStats{
 			TotalBytes: 100, AvailableBytes: 40, UsedBytes: 60,
@@ -1069,9 +1084,113 @@ func TestNodeGetVolumeStats_FilesystemModeUnchanged(t *testing.T) {
 	assert.False(t, resp.VolumeCondition.Abnormal)
 }
 
+// TestNodeGetVolumeStats_MountUnresponsiveIsAbnormal proves the bounded liveness
+// pre-gate (E3/K11): when the bounded findmnt check errors/times out, the RPC
+// returns an abnormal VolumeCondition immediately instead of blocking in statfs
+// over a dead hard mount.
+func TestNodeGetVolumeStats_MountUnresponsiveIsAbnormal(t *testing.T) {
+	originalResolver := resolveNodeStatsDevice
+	originalMountCheck := nodeStatsMountCheck
+	originalFilesystemStats := getNodeFilesystemStats
+	t.Cleanup(func() {
+		resolveNodeStatsDevice = originalResolver
+		nodeStatsMountCheck = originalMountCheck
+		getNodeFilesystemStats = originalFilesystemStats
+	})
+	resolveNodeStatsDevice = func(string) (string, bool, error) { return "", false, nil }
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) {
+		return false, errors.New("findmnt timed out on dead NFS hard mount")
+	}
+	// If the pre-gate failed to short-circuit, statfs would be reached; make that
+	// a loud failure rather than a hang.
+	getNodeFilesystemStats = func(string) (*util.FilesystemStats, error) {
+		t.Fatal("statfs must not be reached when the mount check is unresponsive")
+		return nil, nil
+	}
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId: "fs-vol", VolumePath: "/pods/fs-vol",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.VolumeCondition)
+	assert.True(t, resp.VolumeCondition.Abnormal)
+	assert.Contains(t, resp.VolumeCondition.Message, "mount unresponsive")
+}
+
+// TestNodeGetVolumeStats_PregateRunsBeforeStat exercises the REAL device
+// resolver (resolveNodeStatsDevice = nodeStatsDevice, not a mock) with a
+// blocking stat injected at the lowest seam to model a dead NFS hard mount whose
+// root stat hangs in D-state. The bounded mount pre-gate must run first and
+// short-circuit, so the RPC returns an abnormal condition promptly and the
+// blocking stat is never invoked. Were the pre-gate ordered behind the resolver
+// (the opus-M1 hazard), the goroutine would block in nodeStatsStat and the test
+// would time out.
+func TestNodeGetVolumeStats_PregateRunsBeforeStat(t *testing.T) {
+	originalResolver := resolveNodeStatsDevice
+	originalStat := nodeStatsStat
+	originalMountCheck := nodeStatsMountCheck
+	t.Cleanup(func() {
+		resolveNodeStatsDevice = originalResolver
+		nodeStatsStat = originalStat
+		nodeStatsMountCheck = originalMountCheck
+	})
+
+	resolveNodeStatsDevice = nodeStatsDevice // real resolver, deliberately not mocked
+	statCalled := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	nodeStatsStat = func(string) (uint32, uint64, error) {
+		select {
+		case statCalled <- struct{}{}:
+		default:
+		}
+		<-release // hang until the test releases us, simulating D-state
+		return 0, 0, nil
+	}
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) {
+		return false, errors.New("findmnt timed out on dead NFS hard mount")
+	}
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	type result struct {
+		resp *csi.NodeGetVolumeStatsResponse
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+			VolumeId: "fs-vol", VolumePath: "/pods/fs-vol",
+		})
+		done <- result{resp, err}
+	}()
+
+	select {
+	case res := <-done:
+		require.NoError(t, res.err)
+		require.NotNil(t, res.resp.VolumeCondition)
+		assert.True(t, res.resp.VolumeCondition.Abnormal)
+		assert.Contains(t, res.resp.VolumeCondition.Message, "mount unresponsive")
+	case <-time.After(2 * time.Second):
+		t.Fatal("NodeGetVolumeStats hung: the bounded pre-gate did not run before the blocking stat")
+	}
+
+	select {
+	case <-statCalled:
+		t.Fatal("nodeStatsStat was invoked: the pre-gate did not short-circuit ahead of device resolution")
+	default:
+	}
+}
+
 func TestNodeGetVolumeStats_StatFailureIsAbnormal(t *testing.T) {
 	originalResolver := resolveNodeStatsDevice
-	t.Cleanup(func() { resolveNodeStatsDevice = originalResolver })
+	originalMountCheck := nodeStatsMountCheck
+	t.Cleanup(func() {
+		resolveNodeStatsDevice = originalResolver
+		nodeStatsMountCheck = originalMountCheck
+	})
+	// Let the pre-gate pass so the injected resolver failure is the path exercised.
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return false, nil }
 	resolveNodeStatsDevice = func(string) (string, bool, error) {
 		return "", false, errors.New("injected stat failure")
 	}
@@ -1314,7 +1433,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeISCSI)
 
 	t.Run("NilVolumeContext", func(t *testing.T) {
-		err := d.stageISCSIVolume(context.Background(), nil, "/staging", nil)
+		err := d.stageISCSIVolume(context.Background(), nil, nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -1325,7 +1444,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 	t.Run("MissingPortal", func(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"iqn": "iqn.2005-10.org.freenas.ctl:vol1",
-		}, "/staging", nil)
+		}, nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -1337,7 +1456,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 	t.Run("MissingIQN", func(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260",
-		}, "/staging", nil)
+		}, nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -1351,7 +1470,7 @@ func TestStageISCSIVolume_Validation(t *testing.T) {
 			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.2005-10.org.freenas.ctl:vol1",
 			"lun":    "invalid",
-		}, "/staging", nil)
+		}, nil, "/staging", nil)
 
 		require.Error(t, err)
 		st, ok := status.FromError(err)
@@ -1392,7 +1511,7 @@ func TestBlockBackedFilesystemStagePassesNormalizedMountFlags(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.10:3260", "iqn": "iqn.test:volume", "lun": "0",
-		}, filepath.Join(t.TempDir(), "stage"), capability)
+		}, nil, filepath.Join(t.TempDir(), "stage"), capability)
 		require.NoError(t, err)
 		assert.Equal(t, "xfs", gotFS)
 		assert.Equal(t, []string{"noatime", "discard", "nouuid"}, gotFlags)
@@ -1479,7 +1598,7 @@ func TestStageISCSIVolumeRejectsMultipathOwnedDeviceBeforeMount(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeISCSI)
 	err := d.stageISCSIVolume(context.Background(), map[string]string{
 		"portal": "192.0.2.10:3260", "iqn": "iqn.test:volume", "lun": "0",
-	}, filepath.Join(t.TempDir(), "stage"), &csi.VolumeCapability{
+	}, nil, filepath.Join(t.TempDir(), "stage"), &csi.VolumeCapability{
 		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
 	})
 	require.Error(t, err)
@@ -1500,7 +1619,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWhenMounted(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
-		}, stagingPath, &csi.VolumeCapability{
+		}, nil, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
 		})
 		require.NoError(t, err)
@@ -1545,7 +1664,7 @@ func TestStageBlockProtocolVolumesListSessionsOnce(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
-		}, stagingPath, &csi.VolumeCapability{
+		}, nil, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
 		require.NoError(t, err)
@@ -1598,7 +1717,7 @@ func TestStageBlockProtocolVolumesAreIdempotentWithLiveSymlink(t *testing.T) {
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260",
 			"iqn":    "iqn.test:vol1",
-		}, stagingPath, &csi.VolumeCapability{
+		}, nil, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
 		require.NoError(t, err)
@@ -1663,7 +1782,7 @@ func TestStageRetryDoesNotDisconnectLiveDeviceOnIdentityFailure(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeISCSI)
 		err := d.stageISCSIVolume(context.Background(), map[string]string{
 			"portal": "192.0.2.100:3260", "iqn": "iqn.test:vol1",
-		}, stagingPath, &csi.VolumeCapability{
+		}, nil, stagingPath, &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
 		})
 		require.NoError(t, err)

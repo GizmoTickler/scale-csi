@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -310,6 +311,55 @@ nfs:
 	assert.Equal(t, 10, cfg.TrueNAS.MaxConcurrentRequests)
 }
 
+func TestLoadConfigTrueNASMaxConnections(t *testing.T) {
+	withMaxConnections := func(extra string) string {
+		return `
+driver: csi.scale.io
+truenas:
+  host: truenas.example.test
+  apiKey: test-key
+` + extra + `
+zfs:
+  datasetParentName: tank/csi
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`
+	}
+
+	t.Run("defaults to five when unset", func(t *testing.T) {
+		cfg, err := loadTestConfig(t, withMaxConnections(""))
+		require.NoError(t, err)
+		assert.Equal(t, 5, cfg.TrueNAS.MaxConnections)
+	})
+
+	t.Run("accepts the full clamp range", func(t *testing.T) {
+		for _, n := range []int{1, 8, 16} {
+			cfg, err := loadTestConfig(t, withMaxConnections(fmt.Sprintf("  maxConnections: %d\n", n)))
+			require.NoError(t, err)
+			assert.Equal(t, n, cfg.TrueNAS.MaxConnections)
+		}
+	})
+
+	t.Run("rejects values outside the clamp", func(t *testing.T) {
+		for _, n := range []int{-1, 17, 100} {
+			_, err := loadTestConfig(t, withMaxConnections(fmt.Sprintf("  maxConnections: %d\n", n)))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "truenas.maxConnections")
+		}
+	})
+
+	// An explicit zero must be rejected, not coerced to the default of 5: the
+	// default is seeded pre-decode so a hand-written `maxConnections: 0` survives
+	// decoding and trips the 1..16 validation, matching the chart schema (which
+	// also rejects 0). Coercing it would silently accept an operator typo.
+	t.Run("rejects an explicit zero", func(t *testing.T) {
+		_, err := loadTestConfig(t, withMaxConnections("  maxConnections: 0\n"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "truenas.maxConnections")
+	})
+}
+
 func TestLoadConfigReconcileDefaultsAreSafe(t *testing.T) {
 	cfg, err := loadTestConfig(t, requiredTestConfig+`
 nfs:
@@ -454,6 +504,110 @@ iscsi:
 	require.NoError(t, err)
 	assert.Contains(t, warning, "iscsi.targetPortals")
 	assert.Contains(t, warning, "does not currently support iSCSI multipath")
+}
+
+func TestLoadConfigWarnsWhenDeprecatedRateLimitingConcurrencySet(t *testing.T) {
+	originalWarningf := configWarningf
+	t.Cleanup(func() { configWarningf = originalWarningf })
+	var warnings []string
+	configWarningf = func(format string, args ...interface{}) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}
+
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+resilience:
+  rateLimiting:
+    maxConcurrentRequests: 25
+`)
+	require.NoError(t, err, "the deprecated key must still parse for backward compatibility")
+	assert.Equal(t, 25, cfg.Resilience.RateLimiting.MaxConcurrentRequests, "the key still parses for backward compatibility but is consumed by nothing")
+
+	var deprecations int
+	for _, warning := range warnings {
+		if strings.Contains(warning, "resilience.rateLimiting.maxConcurrentRequests is deprecated") {
+			deprecations++
+			assert.Contains(t, warning, "truenas.maxConcurrentRequests")
+		}
+	}
+	assert.Equal(t, 1, deprecations, "exactly one deprecation warning must fire when the key is set")
+}
+
+func TestLoadConfigWarnsForOtherDeprecatedKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "nfs.shareCommentTemplate",
+			body: "nfs:\n  enabled: true\n  shareHost: 192.0.2.10\n  shareCommentTemplate: csi\n",
+			want: "nfs.shareCommentTemplate is deprecated",
+		},
+		{
+			name: "iscsi.extentAvailThreshold",
+			body: "iscsi:\n  enabled: true\n  targetPortal: 192.0.2.10:3260\n  extentAvailThreshold: 50\n",
+			want: "iscsi.extentAvailThreshold is deprecated",
+		},
+		{
+			name: "nvmeof.nameTemplate",
+			body: "nvmeof:\n  enabled: true\n  transportAddress: 192.0.2.20\n  subsystemAllowAnyHost: true\n  nameTemplate: csi\n",
+			want: "nvmeof.nameTemplate is deprecated",
+		},
+		{
+			name: "nvmeof.commandTimeout",
+			body: "nvmeof:\n  enabled: true\n  transportAddress: 192.0.2.20\n  subsystemAllowAnyHost: true\n  commandTimeout: 30\n",
+			want: "nvmeof.commandTimeout is deprecated",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			originalWarningf := configWarningf
+			t.Cleanup(func() { configWarningf = originalWarningf })
+			var warnings []string
+			configWarningf = func(format string, args ...interface{}) {
+				warnings = append(warnings, fmt.Sprintf(format, args...))
+			}
+
+			_, err := loadTestConfig(t, requiredTestConfig+test.body)
+			require.NoError(t, err, "deprecated keys must still parse for backward compatibility")
+
+			var hits int
+			for _, warning := range warnings {
+				if strings.Contains(warning, test.want) {
+					hits++
+				}
+			}
+			assert.Equal(t, 1, hits, "exactly one deprecation warning must fire for %s", test.name)
+		})
+	}
+}
+
+func TestLoadConfigNoDeprecationWarningWhenRateLimitingConcurrencyUnset(t *testing.T) {
+	originalWarningf := configWarningf
+	t.Cleanup(func() { configWarningf = originalWarningf })
+	var warnings []string
+	configWarningf = func(format string, args ...interface{}) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}
+
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+resilience:
+  rateLimiting:
+    maxConcurrentLogins: 4
+`)
+	require.NoError(t, err)
+	assert.Zero(t, cfg.Resilience.RateLimiting.MaxConcurrentRequests, "the deprecated key carries no default once unset")
+	assert.Equal(t, 4, cfg.Resilience.RateLimiting.MaxConcurrentLogins, "the still-wired login limit keeps its explicit value")
+	for _, warning := range warnings {
+		assert.NotContains(t, warning, "rateLimiting.maxConcurrentRequests is deprecated")
+	}
 }
 
 func TestRepositoryExampleConfigsParseStrictly(t *testing.T) {

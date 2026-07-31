@@ -35,6 +35,11 @@ kubectl logs -n scale-csi -l app.kubernetes.io/component=node -c scale-csi --tai
 # With Helm, enable verbose logging with: --set logging.verbosity=4
 ```
 
+> **CHAP credentials are never logged.** CSI request `secrets` are structurally
+> stripped before the V(5) request dump, and iSCSI CHAP argv values are redacted
+> (`***`) in any param-set error. Raising `-v`/`logging.verbosity` will NOT expose
+> a CHAP username/password secret value.
+
 ## Common Issues
 
 ### Volume Provisioning Failures
@@ -180,6 +185,25 @@ The driver includes automatic session garbage collection. If you see duplicate s
 - Session GC runs on startup by default (`sessionGC.runOnStartup: true`)
 - Increase `sessionGC.startupDelay` if sessions need more time to initialize
 
+### Job Dispatcher Pure-Poll Fallback
+
+The driver waits on TrueNAS job-completion events through a `core.get_jobs`
+WebSocket subscription. When no pooled connection holds a live subscription it
+degrades to a **pure-poll fallback**: correct, but with higher API load and
+latency. `scale_csi_job_dispatcher_subscribed` is `1` while subscribed and `0`
+in the fallback; the `ScaleCSIJobDispatcherUnsubscribed` alert fires when it
+stays `0`.
+
+This is usually transient (a reconnecting socket re-subscribes on its next
+generation). If it persists:
+
+1. Check the controller log for repeated `core.get_jobs subscribe failed
+   (pure-poll fallback)` lines and the underlying WebSocket error.
+2. Confirm `scale_csi_truenas_connections_active` is non-zero and
+   `scale_csi_truenas_connection_status` is `1` — a dead connection cannot
+   subscribe.
+3. Restart the controller pod; the subscription is re-established at connect.
+
 ### Performance Issues
 
 #### Slow Volume Operations
@@ -194,8 +218,10 @@ The driver includes automatic session garbage collection. If you see duplicate s
        maxConcurrentLogins: 2   # Limit iSCSI login concurrency
    ```
 
-   The chart exposes only `maxConcurrentRequests` and
-   `maxConcurrentLogins` under `resilience.rateLimiting`;
+   The chart exposes only `maxConcurrentLogins` under
+   `resilience.rateLimiting` (iSCSI login concurrency). The former
+   `maxConcurrentRequests` key was deprecated and removed — the API
+   concurrency limit is `truenas.maxConcurrentRequests`.
    `discoveryCacheDuration` is not a valid chart value.
 
 2. **Tune retry settings:**
@@ -231,7 +257,11 @@ The driver includes automatic session garbage collection. If you see duplicate s
 
 - Verify source snapshot exists
 - Check that cloned volume capacity >= snapshot source capacity
-- Review `zfs.zvolReadyTimeout` for slow clone operations
+- For **standard (clone-mode)** restores, `zfs.zvolReadyTimeout` does not apply:
+  verification is one `DatasetGet` plus a single 250 ms retry, and exhaustion
+  returns `Unavailable` for the sidecar to retry — investigate backend/API
+  propagation latency. `zfs.zvolReadyTimeout` only affects the **detached**
+  snapshot-copy path (readiness failure there maps to `Internal`).
 
 ## Error Messages Reference
 
@@ -318,7 +348,11 @@ orphan volumes (`scale_csi_orphan_volumes_bytes`), orphan snapshots
 (`scale_csi_tombstone_snapshots_bytes`) — there is no remnant or spent-restore
 byte gauge. Use `scale_csi_reconcile_last_success_timestamp_seconds` to detect a
 stalled loop and `scale_csi_reconcile_failures_total{phase}` to isolate partial
-object failures. Detection is read-only and enabled by default:
+object failures. Orphan **detection** is enabled by default; destructive orphan
+**deletion** stays off until `reconcile.delete.enabled: true`. (A pass is not
+wholly read-only — independent of the delete gate it performs always-on repair
+mutations: legacy ownership-stamp adoption, stale marker/publication repair, and
+the replication-job `core.job_abort` sweep.)
 
 ```yaml
 reconcile:
@@ -377,3 +411,33 @@ zfs list -o name,truenas-csi:managed_resource -r <pool>
 > **DANGER:** never share one configured `zfs.parentDataset` between Kubernetes
 > clusters. Reconcile cannot see handles owned by the other cluster and would
 > classify its managed objects as orphaned.
+
+## Alerts → Runbook
+
+Every alert the chart's `PrometheusRule` can render (when
+`metrics.prometheusRule.enabled: true`), cross-linked to a runbook anchor. Nine
+of the rendered alerts additionally emit a `runbook_url` annotation pointing at
+the same target; the others (including `ScaleCSIPoolNearFull`) rely on this table
+for their runbook link.
+
+| Alert | Severity | Runbook |
+|-------|----------|---------|
+| `ScaleCSIControllerDown` | critical | [Check Driver Status](#check-driver-status) |
+| `ScaleCSICircuitBreakerOpen` | warning | [Reset Circuit Breaker](#reset-circuit-breaker) |
+| `ScaleCSITrueNASConnectionDown` | critical | [Session/Connection Issues](#sessionconnection-issues) |
+| `ScaleCSIHighTrueNASAPIFailureRate` | warning | [Session/Connection Issues](#sessionconnection-issues) |
+| `ScaleCSISustainedLockContention` | warning | [Performance Issues](#performance-issues) |
+| `ScaleCSIOperationErrorsSustained` | warning | [Volume Provisioning Failures](#volume-provisioning-failures) |
+| `ScaleCSISpentRestoreSnapshotBacklog` | warning | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
+| `ScaleCSISessionGCDisconnects` | warning | [Session/Connection Issues](#sessionconnection-issues) |
+| `ScaleCSIFencingTakeoverSpike` | warning | [Fencing takeover for a confirmed-dead node](guides/disaster-recovery.md#runbook-fencing-takeover-for-a-confirmed-dead-node) |
+| `ScaleCSIFencingProvenanceOverflow` | critical | [Fencing takeover for a confirmed-dead node](guides/disaster-recovery.md#runbook-fencing-takeover-for-a-confirmed-dead-node) |
+| `ScaleCSIJobDispatcherUnsubscribed` | warning | [Job Dispatcher Pure-Poll Fallback](#job-dispatcher-pure-poll-fallback) |
+| `ScaleCSIDeleteResidualCleanupFailing` | warning | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
+| `ScaleCSIOrphanVolumesDetected` | warning | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
+| `ScaleCSIOrphanSnapshotsDetected` | warning | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
+| `ScaleCSIManualRecoveryTombstones` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSIRemnantVolumesDetected` | warning | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
+| `ScaleCSITombstoneBacklog` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSIReconcileStalled` | critical | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
+| `ScaleCSIPoolNearFull` | warning | [Performance Issues](#performance-issues) |

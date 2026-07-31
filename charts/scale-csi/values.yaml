@@ -3,6 +3,55 @@
 # CSI Driver name (should match the driver name in StorageClass)
 csiDriverName: csi.scale.io
 
+# CSIStorageCapacity tracking. Strictly opt-in (default off) so the default
+# render stays byte-identical and no cluster-scoped csistoragecapacities
+# objects or extra RBAC are created unless an operator asks for them.
+#
+# SCHEDULER PREREQUISITE (codex M2): external-provisioner v6.3.0 publishes
+# CSIStorageCapacity objects ONLY for StorageClasses whose volumeBindingMode is
+# WaitForFirstConsumer; it ignores Immediate classes by default, and the
+# Kubernetes scheduler likewise only consults capacity for WaitForFirstConsumer
+# binding. The bundled `scale-nfs` class is Immediate, so enabling capacity
+# against otherwise-default values starts the capacity controller but creates NO
+# capacity objects and cannot influence scheduling. To make capacity affect
+# scheduling you must ALSO use a WaitForFirstConsumer StorageClass. If you only
+# need capacity published for non-scheduler consumers against Immediate classes,
+# opt in to forImmediateBinding below.
+#
+# STEADY-STATE API COST when enabled: the external-provisioner issues a periodic
+# GetCapacity per referencing StorageClass on its resync interval. After the
+# E2/K7 fix each GetCapacity is exactly ONE pool.dataset.query against the parent
+# dataset (all StorageClasses of this single-backend driver report the same pool
+# number). This is background provisioner load, NOT part of the
+# CreateVolume/publish/unpublish request-path golden totals.
+capacity:
+  # Advertise CSIDriver.spec.storageCapacity=true and add the provisioner's
+  # --enable-capacity flag plus its csistoragecapacities RBAC. Default off.
+  enabled: false
+  # Opt-in: also publish CSIStorageCapacity for Immediate-binding StorageClasses
+  # (renders the provisioner's --capacity-for-immediate-binding). Default off
+  # because the scheduler ignores capacity for immediate binding; this is only
+  # useful for non-scheduler capacity consumers. Has no effect unless
+  # capacity.enabled is true.
+  forImmediateBinding: false
+  # E2: set GetCapacityResponse.maximum_volume_size. Intended ONLY for thick
+  # deployments (zfs.zvolEnableReservation=true); under the default thin/sparse
+  # provisioning a hard maximum makes the scheduler wrongly reject legitimate
+  # overcommit. TrueNAS 26.0 exposes no dedicated max-size API, so the ceiling
+  # is the parent dataset's available bytes. Default off.
+  reportMaximumVolumeSize: false
+  # E4: run a controller-only poll loop publishing scale_csi_pool_available_bytes
+  # and scale_csi_pool_capacity_bytes. STEADY-STATE API COST when enabled: +1
+  # pool.dataset.query per gaugeInterval PER CONTROLLER REPLICA. The gauge loop
+  # has no leader-election gate (consistent with the orphan reconcile), so with
+  # controller.replicas>1 the documented +1 query/interval is incurred by EACH
+  # replica; the supported/documented configuration is replicas=1 (singleton),
+  # where it is 1/min. Zero impact on the CreateVolume/publish/unpublish
+  # request-path golden totals. Default off (zero new calls).
+  gaugeEnabled: false
+  # Poll cadence for the capacity gauge loop. Values below 30s are clamped to it.
+  gaugeInterval: 60s
+
 # Stable ownership identity stamped on newly-created datasets/zvols. Empty
 # derives "<csiDriverName>@<zfs.parentDataset>". Never change this for an
 # existing installation unless the matching datasets are deliberately adopted.
@@ -184,6 +233,14 @@ truenas:
   # Lower this if TrueNAS becomes overloaded with many PVC operations
   maxConcurrentRequests: 10
 
+  # Size of the TrueNAS WebSocket connection pool the controller multiplexes API
+  # calls across (valid range 1..16). Left null by default so the key is NOT
+  # rendered into the ConfigMap and the driver applies its own default of 5 —
+  # keeping the default render compatible with the v1.3.0 strict config parser,
+  # which has no maxConnections field. Set a value to override; values outside
+  # the range are a startup validation error.
+  maxConnections: null
+
 # ZFS configuration
 zfs:
   # Parent dataset for volumes (required — the driver refuses to start without it)
@@ -257,7 +314,8 @@ iscsi:
   # Disable physical block size reporting on created extents.
   extentDisablePhysicalBlocksize: false
   extentRpm: SSD
-  extentAvailThreshold: 0
+  # extentAvailThreshold was removed: it was never wired to anything. The schema
+  # still accepts the old key (ignored) so existing values files pass validation.
 
   # Timeout in seconds to wait for iSCSI device to appear after login
   # Increase this for heavily loaded nodes or slow networks
@@ -267,6 +325,24 @@ iscsi:
   # Multiple volume creations within this window will trigger a single reload
   # This prevents reload storms during bulk volume provisioning (default: 2000ms)
   serviceReloadDebounce: 2000
+
+  # iSCSI CHAP authentication. Strictly opt-in: with enabled=false (default)
+  # every target group stays authmethod=NONE and nothing CHAP-related renders
+  # into the ConfigMap, so behavior is identical to a pre-CHAP deployment.
+  # Credentials are NEVER set here; they are supplied per-StorageClass via the
+  # CSI provisioner/node-stage secret refs (see chapSecretName on a
+  # storageClasses[] entry and docs/reference/storageclass.md).
+  chap:
+    # Opt the controller into CHAP peer management. Default off.
+    enabled: false
+    # Optional operator-pinned iscsi.auth tag. 0 means derive a deterministic
+    # per-StorageClass tag.
+    tag: 0
+    # Default authmethod hint for the controller. The effective per-volume mode is
+    # determined at CreateVolume by the CHAP Secret (presence of mutualUsername
+    # selects CHAP_MUTUAL) and stamped immutably on the volume; this flag does not
+    # override an existing volume's stored mode. Default one-way.
+    mutual: false
 
 # NVMe-oF configuration
 nvmeof:
@@ -290,8 +366,9 @@ nvmeof:
   # Allow any host NQN to connect. Enabling this bypasses subsystemHosts.
   subsystemAllowAnyHost: false
 
-  # Timeout for nvme CLI commands in seconds
-  commandTimeout: 30
+  # commandTimeout was removed: it was never wired to anything. The nvme CLI
+  # timeout is commandTimeouts.nvme. The schema still accepts the old key
+  # (ignored) so existing values files pass validation.
 
 # Storage classes to create.
 #
@@ -323,6 +400,25 @@ storageClasses:
     enabled: false
     protocol: nvmeof
     snapshotRestoreMode: detached
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: []
+    extraParameters: {}
+  # Opt-in example: an iSCSI class with CHAP authentication. Disabled by
+  # default. Enable it (and iscsi.chap.enabled above) to create it. The CHAP
+  # credentials live in a Kubernetes Secret named chapSecretName (created by
+  # the operator, see docs/reference/storageclass.md); the chart only renders
+  # the CSI secret-ref parameters, never the credential values. The same Secret
+  # is used for both provisioner-secret (CreateVolume) and node-stage-secret
+  # (NodeStageVolume).
+  - name: scale-iscsi-chap
+    enabled: false
+    protocol: iscsi
+    chapSecretName: scale-iscsi-chap
+    # chapSecretNamespace defaults to the release namespace when unset.
+    chapSecretNamespace: ""
     isDefault: false
     reclaimPolicy: Delete
     allowVolumeExpansion: true
@@ -430,6 +526,33 @@ sidecars:
       limits:
         memory: 128Mi
 
+  # External health monitor controller (volume-health sidecar). Strictly opt-in
+  # (default off): with enabled=false no container and no extra RBAC render, so
+  # the default manifest is byte-identical. The node-side stale-mount pre-gate
+  # and controller-side VolumeCondition (both zero-new-API) are always on; this
+  # sidecar additionally emits Kubernetes Events for abnormal volumes.
+  #
+  # STEADY-STATE API COST when enabled: because Scale-CSI advertises
+  # LIST_VOLUMES, external-health-monitor v0.18.0 drives the ListVolumes path and
+  # reads Entry.Status.VolumeCondition; it does NOT also issue per-PV
+  # ControllerGetVolume (it picks ListVolumes OR per-PV ControllerGetVolume, never
+  # both). So the background load is ONE periodic ListVolumes (a single
+  # pool.dataset.query) per interval, NOT part of the request-path golden totals.
+  # `interval` renders both --list-volumes-interval (the ACTIVE cadence for this
+  # driver) and --monitor-interval (the fallback cadence used only by a driver
+  # that lacks LIST_VOLUMES). Image tag is pinned (G2: v0.18.0 is the current
+  # published release) — do not float it.
+  healthMonitor:
+    enabled: false
+    image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0
+    interval: 60s
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+
 # Service account configuration
 serviceAccount:
   # Create service accounts
@@ -496,6 +619,10 @@ metrics:
     additionalLabels: {}
     # Replaces the bundled rules when non-empty
     rules: []
+    # Pool-usage alert threshold (fraction 0..1) for ScaleCSIPoolNearFull. The
+    # alert renders only when capacity.gaugeEnabled is also true (it needs the
+    # scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes gauges).
+    poolUsageThreshold: 0.85
 
   # Grafana sidecar-discoverable dashboard ConfigMap
   dashboards:
@@ -515,6 +642,13 @@ reconcile:
   enabled: true
 
   # Interval between controller reconcile passes (including the job sweep).
+  # Must be a Go duration in whole h/m/s segments (e.g. "1h", "90m", "1h30m");
+  # fractional ("1.5h") and sub-second units are rejected by the schema.
+  #
+  # COUPLING: the ScaleCSIReconcileStalled alert threshold is DERIVED from this
+  # value (3x interval, rendered to seconds by the chart), so lengthening the
+  # interval lengthens the stall threshold in lockstep — no separate alert knob
+  # to keep in sync. Keep alertAfter (below) strictly greater than 2x interval.
   interval: 1h
 
   # Managed backend objects must be older than this before they are orphaned.
@@ -622,7 +756,9 @@ resilience:
     maxDelay: 5000
     backoffMultiplier: 2.0
   rateLimiting:
-    maxConcurrentRequests: 10
+    # maxConcurrentRequests was removed: it was never wired to anything. The API
+    # concurrency limit is truenas.maxConcurrentRequests. The schema still accepts
+    # the old key so existing values files do not fail validation, but it is ignored.
     maxConcurrentLogins: 2
 
 # Host command timeouts in seconds

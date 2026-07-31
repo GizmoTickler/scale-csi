@@ -87,6 +87,11 @@ func (c *apiCallCountingClient) ResetCircuitBreaker() {
 	c.MockClient.ResetCircuitBreaker()
 }
 
+func (c *apiCallCountingClient) AnyConnectionJobSubscribed() bool {
+	c.record("AnyConnectionJobSubscribed")
+	return c.MockClient.AnyConnectionJobSubscribed()
+}
+
 func (c *apiCallCountingClient) DatasetCreate(ctx context.Context, params *truenas.DatasetCreateParams) (*truenas.Dataset, error) {
 	c.record("DatasetCreate")
 	return c.MockClient.DatasetCreate(ctx, params)
@@ -370,6 +375,31 @@ func (c *apiCallCountingClient) ISCSITargetExtentFindByExtent(ctx context.Contex
 func (c *apiCallCountingClient) ISCSIGlobalConfigGet(ctx context.Context) (*truenas.ISCSIGlobalConfig, error) {
 	c.record("ISCSIGlobalConfigGet")
 	return c.MockClient.ISCSIGlobalConfigGet(ctx)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthCreate(ctx context.Context, tag int, user, secret, peerUser, peerSecret string) (*truenas.ISCSIAuth, error) {
+	c.record("ISCSIAuthCreate")
+	return c.MockClient.ISCSIAuthCreate(ctx, tag, user, secret, peerUser, peerSecret)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthQueryByTag(ctx context.Context, tag int) ([]*truenas.ISCSIAuth, error) {
+	c.record("ISCSIAuthQueryByTag")
+	return c.MockClient.ISCSIAuthQueryByTag(ctx, tag)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthGet(ctx context.Context, id int) (*truenas.ISCSIAuth, error) {
+	c.record("ISCSIAuthGet")
+	return c.MockClient.ISCSIAuthGet(ctx, id)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthUpdate(ctx context.Context, id int, user, secret, peerUser, peerSecret string) (*truenas.ISCSIAuth, error) {
+	c.record("ISCSIAuthUpdate")
+	return c.MockClient.ISCSIAuthUpdate(ctx, id, user, secret, peerUser, peerSecret)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthDelete(ctx context.Context, id int) error {
+	c.record("ISCSIAuthDelete")
+	return c.MockClient.ISCSIAuthDelete(ctx, id)
 }
 
 func (c *apiCallCountingClient) NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*truenas.NVMeoFHost, error) {
@@ -659,6 +689,19 @@ func apiCallCountVolumeRequest(name, protocol string) *csi.CreateVolumeRequest {
 	}
 }
 
+// apiCallCountCHAPVolumeRequest builds an iSCSI CreateVolume request that opts
+// into CHAP: the StorageClass parameter plus a per-StorageClass secret carrying
+// a valid 12-16 char credential. The secret values are test fixtures only.
+func apiCallCountCHAPVolumeRequest(name string) *csi.CreateVolumeRequest {
+	req := apiCallCountVolumeRequest(name, "iscsi")
+	req.Parameters[paramISCSIChAPSecret] = "true"
+	req.Secrets = map[string]string{
+		"username": "chapuser",
+		"password": "chapsecret123",
+	}
+	return req
+}
+
 func assertAPICallCount(t *testing.T, operation string, client *apiCallCountingClient, want int) {
 	t.Helper()
 	got, methods := client.callSnapshot()
@@ -667,10 +710,25 @@ func assertAPICallCount(t *testing.T, operation string, client *apiCallCountingC
 	}
 }
 
+// assertAPICallMethodMap pins the exact per-method ClientInterface call counts so
+// a method substitution that keeps the total constant still fails (the total-only
+// assert above would pass such a substitution). It complements assertAPICallCount,
+// which is still called alongside it to keep the headline total readable.
+func assertAPICallMethodMap(t *testing.T, operation string, client *apiCallCountingClient, want map[string]int) {
+	t.Helper()
+	_, methods := client.callSnapshot()
+	assert.Equal(t, want, methods, "%s per-method API call map mismatch", operation)
+}
+
 func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 	tests := []struct {
 		name string
 		want int
+		// iscsi selects the iSCSI backend driver config for the case.
+		iscsi bool
+		// chap additionally enables iscsi.chap.enabled on the driver so the
+		// CHAP peer-ensure path runs (the request must also carry a secret).
+		chap bool
 		run  func(*testing.T, *apiCallCountingClient, *Driver)
 	}{
 		// Six calls: existence lookup; DatasetCreate; the createDataset ownership
@@ -698,8 +756,23 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// resource-ID stamp (DatasetSetUserProperties); the debounced ServiceReload;
 		// getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and the final
 		// managed/ownership/provision/name stamp (DatasetSetUserProperties).
-		{name: "CreateVolume fresh iSCSI", want: 14, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		{name: "CreateVolume fresh iSCSI", want: 14, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
+			require.NoError(t, err)
+		}},
+		// Seventeen calls: the 14-call iSCSI baseline PLUS three CHAP peer calls on
+		// a cold controller — ISCSIAuthQueryByTag (tag miss), ISCSIAuthCreate, and a
+		// second ISCSIAuthQueryByTag that verifies no cross-process duplicate peer
+		// raced the create (X5: TrueNAS middleware does not enforce tag uniqueness,
+		// so the driver keeps a deterministic lowest-id winner). The authmethod+auth
+		// linkage folds into the existing target-group create and the auth tag/mode
+		// dataset props fold into the existing FATAL managed-property update (X1), so
+		// CHAP adds no other round trip. Steady-state (warm cache, second volume on
+		// the same controller) is +0; the golden driver is fresh per case so 17 is
+		// the measured cold count. (Was 16 before Sprint 2 added the post-create
+		// duplicate-tag reconciliation query.)
+		{name: "CreateVolume fresh iSCSI CHAP", want: 17, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("fresh-iscsi-chap"))
 			require.NoError(t, err)
 		}},
 		// A fully provisioned NFS retry re-reads the dataset and verifies that the
@@ -723,11 +796,21 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		}},
 		// iSCSI deletion validates target, extent, and association backreferences
 		// before cleanup, then retains the two dataset dependency guards.
-		{name: "DeleteVolume iSCSI", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		{name: "DeleteVolume iSCSI", want: 10, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("delete-iscsi", "iscsi"))
 			require.NoError(t, err)
 			client.resetCalls()
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi"})
+			require.NoError(t, err)
+		}},
+		// Ten calls: identical to the non-CHAP iSCSI delete. The shared CHAP auth
+		// peer is intentionally NOT deleted per-volume (other volumes of the
+		// StorageClass reference it), so DeleteVolume adds +0 CHAP round trips.
+		{name: "DeleteVolume iSCSI CHAP", want: 10, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("delete-iscsi-chap"))
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi-chap"})
 			require.NoError(t, err)
 		}},
 		// Fresh snapshot creation performs one source lookup, one global-name
@@ -787,19 +870,25 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
 			require.NoError(t, err)
 		}},
-		// Twelve calls: existence lookup; snapshot name resolution; the durable
-		// in-flight marker write on the parent dataset via pool.dataset.update plus
-		// its one-time post-connect verifying re-read (the marker mechanism stays
-		// intact); one clone and readiness wait; one response-verified update that
-		// folds filesystem refquota together with both content-source keys; the
-		// ownership stamp via a separate pool.dataset.update (the inviolable
-		// content-source-vs-ownership crash boundary); marker retirement after the
-		// durable ownership stamp; NFS share resolution + create; and a single
-		// post-share update that folds the share-ID stamp together with the
-		// managed/ownership/provision/name stamps. The remaining writes are
-		// separated by crash boundaries or are the protected marker mechanism, so
-		// 12 is the safe floor without weakening crash consistency.
-		{name: "CreateVolume clone from snapshot", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Ten calls (Sprint 3: L2a folded the ownership stamp into the
+		// content-source+refquota update 12->11, then L1b removed the post-clone
+		// readiness poll for filesystem clones 11->10): existence lookup; snapshot
+		// name resolution; the durable in-flight marker write on the parent dataset
+		// via pool.dataset.update plus its one-time post-connect verifying re-read
+		// (the marker mechanism stays intact); one clone (a filesystem clone is
+		// synchronously queryable per the L1b probe, so there is no readiness round
+		// trip and the dataset comes from the merged update below); ONE
+		// response-verified update that folds filesystem refquota, both content-source
+		// keys, AND the ownership stamp into a single atomic pool.dataset.update (one
+		// ZFS txg — this removes the old content-source-vs-ownership crash window by
+		// making the two durable simultaneously rather than weakening it); marker
+		// retirement after that durable write; NFS share resolution + create; and a
+		// single post-share update that folds the share-ID stamp together with the
+		// managed/provision/name stamps. The remaining writes are separated by crash
+		// boundaries or are the protected marker mechanism, so 10 is the safe floor
+		// without weakening crash consistency. (Zvol clones still pay one bounded
+		// readiness get to confirm volsize; this NFS golden does not.)
+		{name: "CreateVolume clone from snapshot", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})
@@ -817,16 +906,52 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.CreateVolume(context.Background(), req)
 			require.NoError(t, err)
 		}},
+		// Thirteen calls (pinned Sprint 3 L4 so the volume-clone path is
+		// regression-guarded; the L2a ownership fold applies here too, -1 vs the
+		// pre-L2a 14): existence lookup; source-volume existence get; the durable
+		// in-flight marker write plus its one-time post-connect verifying re-read;
+		// temp source-snapshot create; clone; a single bounded readiness get (L1b
+		// replaced the exponential poll — the clone is synchronously queryable, but
+		// the dataset is still fetched here because ensureCloneCapacity needs it, so
+		// the total is unchanged); a filesystem refquota update (ensureCloneCapacity);
+		// ONE content-source write that folds the content-source keys, the
+		// origin-snapshot key, AND the ownership stamp into a single atomic
+		// pool.dataset.update (L2a); marker retirement; NFS share resolution + create;
+		// and the post-share managed/provision/name fold. The Sprint 3 fix made this
+		// fold response-verifying (ownership must be durable before the marker is
+		// retired) WITHOUT adding a call: verification reads the update RESPONSE, and
+		// the one-time post-connect paranoia re-read is already consumed by the marker
+		// write above, so the count stays 13 (the write simply moves from
+		// DatasetSetUserProperties to DatasetUpdate, both one high-level call).
+		{name: "CreateVolume clone from volume", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent", Type: "FILESYSTEM",
+			})
+			require.NoError(t, err)
+			_, err = client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/volume-clone-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			req := apiCallCountVolumeRequest("restored-from-volume", "nfs")
+			req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "volume-clone-source"},
+			}}
+			_, err = d.CreateVolume(context.Background(), req)
+			require.NoError(t, err)
+		}},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newAPICallCountingClient()
 			protocol := "nfs"
-			if tc.name == "CreateVolume fresh iSCSI" || tc.name == "DeleteVolume iSCSI" {
+			if tc.iscsi {
 				protocol = "iscsi"
 			}
 			d := newAPICallCountDriver(t, client, protocol)
+			if tc.chap {
+				d.config.ISCSI.CHAP.Enabled = true
+			}
 			tc.run(t, client, d)
 			assertAPICallCount(t, tc.name, client, tc.want)
 		})
@@ -885,10 +1010,27 @@ func nvmeoFPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeR
 	}
 }
 
+func iscsiPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest {
+	return &csi.ControllerPublishVolumeRequest{
+		VolumeId: volumeID,
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "iscsi"},
+	}
+}
+
 // TestControllerPublishUnpublishGoldenAPICallCounts pins the round-trip cost of
 // the publish/unpublish path (the P1 optimization target). Each case documents
 // every driver-to-TrueNAS call so a regression that re-introduces a duplicate
 // resolution or a wasted write fails with an explicit per-method delta.
+//
+// These goldens count high-level ClientInterface calls, NOT wire RTTs: a single
+// counted method may issue several JSON-RPC round trips underneath (e.g.
+// WaitForZvolReady polls with repeated DatasetGet wire calls, and an unresolved
+// ServiceReload can issue both service.reload and service.control), all folded
+// into one count here.
 func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 	ctx := context.Background()
 
@@ -1053,6 +1195,151 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		// 8. NVMeoFHostSubsysDelete          — revoke worker-a's association.
 		// 9. DatasetRemoveUserProperties     — removePublicationRecords.
 		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 9)
+	})
+
+	// (d) fencing OFF + iSCSI — the block-protocol records-only floor. The share
+	// (target/extent/association) already exists from CreateVolume, so the publish
+	// takes the idempotent fast path and the unpublish only clears the durable
+	// record; no initiator allowlist is touched while enforcement is off.
+	t.Run("off iSCSI publish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeOff)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("off-iscsi", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi", nodeA))
+		require.NoError(t, err)
+		// Eight calls:
+		// 1. DatasetGet                  — ControllerPublishVolume volume read.
+		// 2. ISCSITargetGet              — ensureShare resolves the stored target.
+		// 3. WaitForZvolReady            — zvol readiness gate before extent work.
+		// 4. ISCSIExtentGet              — ensureShare resolves the stored extent.
+		// 5. ISCSITargetExtentGet        — ensureShare resolves the target-extent
+		//                                  association.
+		// 6. DatasetSetUserProperties    — ensureShare re-stamps the target/extent/
+		//                                  association IDs.
+		// 7. ServiceReload               — debounced iscsitarget reload so the target
+		//                                  is discoverable.
+		// 8. DatasetSetUserProperties    — storePublicationRecord (off mode skips
+		//                                  validateBackend/applyBackendFence, so this
+		//                                  is the floor).
+		assertAPICallCount(t, "off iSCSI publish", client, 8)
+		assertAPICallMethodMap(t, "off iSCSI publish", client, map[string]int{
+			"DatasetGet":               1,
+			"ISCSITargetGet":           1,
+			"WaitForZvolReady":         1,
+			"ISCSIExtentGet":           1,
+			"ISCSITargetExtentGet":     1,
+			"DatasetSetUserProperties": 2,
+			"ServiceReload":            1,
+		})
+	})
+	t.Run("off iSCSI unpublish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeOff)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("off-iscsi-unpub", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi-unpub", nodeA))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-iscsi-unpub", NodeId: nodeA})
+		require.NoError(t, err)
+		// Three calls (mirror of off NFS unpublish; off mode never touches a backend
+		// allowlist):
+		// 1. DatasetGet                  — ControllerUnpublishVolume volume read.
+		// 2. DatasetSetUserProperties    — flip the record to "unpublishing" BEFORE
+		//                                  access is removed (crash-safe tombstone).
+		// 3. DatasetRemoveUserProperties — removePublicationRecords clears the record.
+		assertAPICallCount(t, "off iSCSI unpublish", client, 3)
+		assertAPICallMethodMap(t, "off iSCSI unpublish", client, map[string]int{
+			"DatasetGet":                  1,
+			"DatasetSetUserProperties":    1,
+			"DatasetRemoveUserProperties": 1,
+		})
+	})
+
+	// (e) strict + iSCSI — full backend enforcement. The publish ensures the share
+	// then converges the per-volume initiator allowlist and rebinds the target; the
+	// unpublish revokes the initiator. The per-method tally below is the source of
+	// truth (measured); strict iSCSI re-resolves topology at the fence's mutation
+	// boundary rather than reusing the ensure-path reads.
+	t.Run("strict iSCSI publish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeStrict)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("strict-iscsi", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("strict-iscsi", nodeA))
+		require.NoError(t, err)
+		// Sixteen calls, per-method tally:
+		//   DatasetGet                x1 — ControllerPublishVolume volume read.
+		//   ISCSITargetGet            x2 — ensureShare resolves the target; the fence
+		//                                  re-resolves it at its mutation boundary.
+		//   WaitForZvolReady          x1 — zvol readiness gate before extent work.
+		//   ISCSIExtentGet            x1 — ensureShare resolves the extent.
+		//   ISCSITargetExtentGet      x1 — ensureShare resolves the association.
+		//   DatasetSetUserProperties  x3 — ensureShare ID re-stamp, strict per-volume
+		//                                  initiator-group ID stamp, storePublicationRecord.
+		//   ServiceReload             x2 — ensureShare reload + post-fence reload.
+		//   ISCSIPortalList           x1 — fence resolves the portal group IDs.
+		//   ISCSIInitiatorGet         x2 — fence reads the per-volume initiator group.
+		//   ISCSIInitiatorUpdate      x1 — fence converges the initiator allowlist.
+		//   ISCSITargetUpdate         x1 — fence rebinds the target to the converged
+		//                                  initiator group.
+		assertAPICallCount(t, "strict iSCSI publish", client, 16)
+		assertAPICallMethodMap(t, "strict iSCSI publish", client, map[string]int{
+			"DatasetGet":               1,
+			"ISCSITargetGet":           2,
+			"WaitForZvolReady":         1,
+			"ISCSIExtentGet":           1,
+			"ISCSITargetExtentGet":     1,
+			"DatasetSetUserProperties": 3,
+			"ServiceReload":            2,
+			"ISCSIPortalList":          1,
+			"ISCSIInitiatorGet":        2,
+			"ISCSIInitiatorUpdate":     1,
+			"ISCSITargetUpdate":        1,
+		})
+	})
+	t.Run("strict iSCSI unpublish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeStrict)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("strict-iscsi-unpub", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("strict-iscsi-unpub", nodeA))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "strict-iscsi-unpub", NodeId: nodeA})
+		require.NoError(t, err)
+		// Nine calls, per-method tally:
+		//   DatasetGet                  x1 — ControllerUnpublishVolume volume read.
+		//   DatasetSetUserProperties    x2 — flip the record to "unpublishing", then
+		//                                    the fence's record update.
+		//   ISCSITargetGet              x1 — fence resolves the target.
+		//   ISCSIInitiatorGet           x1 — fence reads the per-volume initiator group.
+		//   ISCSIInitiatorUpdate        x1 — fence revokes the node's initiator.
+		//   ISCSITargetUpdate           x1 — fence rebinds the target after the revoke.
+		//   ServiceReload               x1 — post-fence iscsitarget reload.
+		//   DatasetRemoveUserProperties x1 — removePublicationRecords clears the record.
+		assertAPICallCount(t, "strict iSCSI unpublish", client, 9)
+		assertAPICallMethodMap(t, "strict iSCSI unpublish", client, map[string]int{
+			"DatasetGet":                  1,
+			"DatasetSetUserProperties":    2,
+			"ISCSITargetGet":              1,
+			"ISCSIInitiatorGet":           1,
+			"ISCSIInitiatorUpdate":        1,
+			"ISCSITargetUpdate":           1,
+			"ServiceReload":               1,
+			"DatasetRemoveUserProperties": 1,
+		})
 	})
 }
 

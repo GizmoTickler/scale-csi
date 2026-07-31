@@ -4,7 +4,12 @@ A Helm chart for deploying the Scale CSI driver for TrueNAS SCALE.
 
 ## Prerequisites
 
-- Kubernetes 1.25+
+- Kubernetes 1.20+ — this is the floor the chart actually enforces
+  (`Chart.yaml` `kubeVersion: ">=1.20.0-0"`), consistent with the pinned
+  external-provisioner v6.3 and external-snapshotter v8.6 (both document a
+  Kubernetes 1.20 minimum). Note that `CSIDriver.spec.storageCapacity` is
+  immutable on Kubernetes 1.20–1.22, so toggling `capacity.enabled` on those
+  versions requires a `CSIDriver` delete/recreate; it is mutable from 1.23+.
 - Helm 3.8+
 - TrueNAS SCALE with API access enabled
 - The external snapshot CRDs/controller when `snapshotClass.create` is enabled
@@ -158,6 +163,7 @@ new ownership boundary.
 | `truenas.connectTimeout` | Connection timeout in seconds | `10` |
 | `truenas.writeTimeout` | WebSocket write timeout in seconds | `30` |
 | `truenas.maxConcurrentRequests` | Maximum concurrent API requests | `10` |
+| `truenas.maxConnections` | TrueNAS WebSocket connection pool size; chart default `null`/omitted (absent from the ConfigMap for rollback compatibility) → **effective driver default 5**. Accepted explicit range 1–16; explicit `0` or out-of-range fails validation (zero is preserved and rejected, not treated as omitted) | `null` |
 
 ### ZFS
 
@@ -196,7 +202,6 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `iscsi.extentBlocksize` | Extent block size | `512` |
 | `iscsi.extentDisablePhysicalBlocksize` | Disable extent physical-block-size reporting | `false` |
 | `iscsi.extentRpm` | Extent RPM value | `SSD` |
-| `iscsi.extentAvailThreshold` | Extent available-space warning threshold | `0` |
 | `iscsi.deviceWaitTimeout` | Device wait timeout in seconds | `60` |
 | `iscsi.serviceReloadDebounce` | Service reload debounce in milliseconds | `2000` |
 | `nvmeof.enabled` | Render NVMe-oF configuration | `false` |
@@ -205,7 +210,11 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.port` | Target service ID/port | `4420` |
 | `nvmeof.subsystemHosts` | Allowed host NQNs | `[]` |
 | `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `false` |
-| `nvmeof.commandTimeout` | `nvme` command timeout in seconds | `30` |
+
+> `iscsi.extentAvailThreshold` and `nvmeof.commandTimeout` were removed: neither
+> was wired to anything (`nvmeof.commandTimeout` is superseded by
+> `commandTimeouts.nvme`). The values schema still accepts both keys (ignored) so
+> existing values files do not fail validation.
 
 With `fencing.mode=off`, NVMe-oF requires an explicit
 `nvmeof.subsystemHosts` allow-list unless `subsystemAllowAnyHost=true`. In
@@ -217,16 +226,36 @@ not a chart or driver ConfigMap setting. The removed `iscsi.basename` and
 `nvmeof.basename` values had no effect.
 
 iSCSI uses one `iscsi.portal`; additional portal configuration is not exposed.
-CHAP and dm-multipath are unsupported. Restrict TCP 3260 to Kubernetes nodes
-using a dedicated storage network and firewall or SGACL policy.
+dm-multipath is unsupported. iSCSI CHAP **is** supported (default off). Restrict
+TCP 3260 to Kubernetes nodes using a dedicated storage network and firewall or
+SGACL policy — CHAP authenticates but does not encrypt the session.
+
+#### iSCSI CHAP keys
+
+| Parameter | Description | Default |
+|---|---|---|
+| `iscsi.chap.enabled` | Opt the controller into CHAP peer management. With `false`, nothing CHAP-related renders into the ConfigMap and targets stay `authmethod=NONE` | `false` |
+| `iscsi.chap.tag` | Optional operator-pinned `iscsi.auth` tag; `0` derives a deterministic tag from the username (FNV-1a into `[1000,61000)`) | `0` |
+| `iscsi.chap.mutual` | **Currently inert compatibility key** — production code never reads it; the effective per-volume mode is derived from the Secret's `mutualUsername` and stamped immutably. Do not rely on it as a default-mode hint | `false` |
+
+Credentials are never set in chart values — they are supplied per StorageClass
+via a Kubernetes Secret referenced by `storageClasses[].chapSecretName` (see the
+StorageClasses table below). Tag derivation is username-based, so two classes
+sharing a username/tag share one `iscsi.auth` peer; pin distinct positive Secret
+tags for isolation. Full contract in the
+[StorageClass CHAP reference](../../docs/reference/storageclass.md#iscsi-chap).
 
 ### StorageClasses
 
 `storageClasses` is a list, so one release can create NFS, iSCSI, and NVMe-oF
-classes. The driver reads only `protocol` from ordinary StorageClass parameters;
-TrueNAS, ZFS, and protocol settings belong in the driver ConfigMap values above.
-When multiple protocols are enabled, `protocol` is required and an omitted
-value returns `InvalidArgument` instead of defaulting to NFS.
+classes. The driver-specific **ordinary** StorageClass parameters are `protocol`,
+`snapshotRestoreMode`, and the internal CHAP opt-in marker `iscsi.chapSecret`;
+the standardized CSI **Secret-ref** parameters
+(`csi.storage.k8s.io/provisioner-secret-*`, `node-stage-secret-*`) are also
+consumed, through the provisioner/node-stage request paths. Other TrueNAS, ZFS,
+and protocol settings belong in the driver ConfigMap values above. When multiple
+protocols are enabled, `protocol` is required and an omitted value returns
+`InvalidArgument` instead of defaulting to NFS.
 
 | Field | Description | Default in bundled class |
 |---|---|---|
@@ -234,6 +263,8 @@ value returns `InvalidArgument` instead of defaulting to NFS.
 | `storageClasses[].enabled` | Render this class (`false` ships an opt-in example disabled) | `true` |
 | `storageClasses[].protocol` | `nfs`, `iscsi`, or `nvmeof` | `nfs` |
 | `storageClasses[].snapshotRestoreMode` | `clone` or `detached`: how a snapshot-sourced PVC is provisioned (unset follows `zfs.detachedVolumesFromSnapshots`) | unset |
+| `storageClasses[].chapSecretName` | Name of the CHAP Secret; renders **both** the provisioner-secret-name and node-stage-secret-name parameters. Requires `iscsi.chap.enabled` | unset |
+| `storageClasses[].chapSecretNamespace` | Namespace for the CHAP Secret refs (renders both namespace parameters); defaults to the release namespace when unset | release namespace |
 | `storageClasses[].isDefault` | Add the default-class annotation | `false` |
 | `storageClasses[].reclaimPolicy` | `Delete` or `Retain` | `Delete` |
 | `storageClasses[].allowVolumeExpansion` | Allow PVC expansion | `true` |
@@ -283,12 +314,16 @@ storageClasses:
 ```
 
 The old `storageClass` map remains supported for compatibility. When it is
-non-empty, it takes precedence over `storageClasses` and renders one class. It
-accepts the former `create`, `name`, `protocol`, `isDefault`, `reclaimPolicy`,
-`allowVolumeExpansion`, `volumeBindingMode`, and `mountOptions` fields plus
-`extraParameters`. The deprecated path emits `protocol` and `mountOptions` only
-when they are explicitly set. Migrate existing values files to `storageClasses`
-when convenient.
+non-empty, it takes precedence over the `storageClasses` list and renders one
+class. The shared schema/template path accepts the former `create`, `name`,
+`protocol`, `isDefault`, `reclaimPolicy`, `allowVolumeExpansion`,
+`volumeBindingMode`, and `mountOptions` fields plus `extraParameters`, and also
+the same `enabled`, `snapshotRestoreMode`, `chapSecretName`, and
+`chapSecretNamespace` fields as a list entry. Note the semantic distinction:
+legacy `create` and list-style `enabled` both gate rendering but are separate
+fields. The deprecated path emits `protocol` and `mountOptions` only when they
+are explicitly set. Migrate existing values files to `storageClasses` when
+convenient.
 
 ### Snapshots
 
@@ -299,6 +334,45 @@ when convenient.
 | `snapshotClass.deletionPolicy` | `Delete` or `Retain` | `Delete` |
 | `snapshotClass.labels` | Additional labels | `{}` |
 | `snapshotClass.annotations` | Additional annotations | `{}` |
+
+### Capacity-aware scheduling and volume health
+
+CSIStorageCapacity tracking and external volume-health monitoring are both
+strictly opt-in (default off); the default render stays byte-identical without
+them.
+
+| Parameter | Description | Default |
+|---|---|---|
+| `capacity.enabled` | Advertise `CSIDriver.spec.storageCapacity=true`, run the external-provisioner capacity controller, add its `csistoragecapacities` RBAC | `false` |
+| `capacity.forImmediateBinding` | Also publish `CSIStorageCapacity` for `Immediate` classes (renders `--capacity-for-immediate-binding`); non-scheduler consumers only, no effect unless `capacity.enabled` | `false` |
+| `capacity.reportMaximumVolumeSize` | Set `GetCapacityResponse.maximum_volume_size` to the parent's available bytes; appropriate **only** for thick/reserved zvol deployments, not thin overcommit | `false` |
+| `capacity.gaugeEnabled` | Run a controller-only poll loop exporting `scale_csi_pool_available_bytes` / `scale_csi_pool_capacity_bytes` | `false` |
+| `capacity.gaugeInterval` | Gauge cadence; values below `30s` clamp to `30s` | `60s` |
+| `sidecars.healthMonitor.enabled` | Deploy the v0.18.0 external-health-monitor controller sidecar (emits PVC Events from controller-side `VolumeCondition`) | `false` |
+| `sidecars.healthMonitor.image` | Health-monitor sidecar image (pinned; do not float) | `registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0` |
+| `sidecars.healthMonitor.interval` | Renders both `--list-volumes-interval` (the active cadence for this `LIST_VOLUMES` driver) and the fallback `--monitor-interval` | `60s` |
+| `sidecars.healthMonitor.resources` | Health-monitor sidecar resources | requests `10m`/`32Mi`, memory limit `128Mi` |
+
+Operator caveats:
+
+- **Scheduler prerequisite (WFFC).** external-provisioner publishes
+  `CSIStorageCapacity` **only** for `WaitForFirstConsumer` classes, and the
+  scheduler consults capacity only for WFFC binding. Enabling `capacity.enabled`
+  against the `Immediate` bundled class starts the controller but creates no
+  capacity objects.
+- **Gauge/API cost.** `GetCapacity` is one `pool.dataset.query` per referencing
+  class; the gauge loop performs one parent query per interval **per controller
+  replica** (no leader-election gate) — the supported topology is `replicas=1`.
+- **Disable cleanup.** Flipping capacity off can leave owner-referenced
+  `CSIStorageCapacity` objects until the controller Deployment is deleted or they
+  are removed manually. `CSIDriver.spec.storageCapacity` is mutable on Kubernetes
+  1.23+ (immutable on 1.20–1.22).
+- **`sidecars.healthMonitor` is unlike the other sidecars** — it does **not**
+  expose `timeout`/`workerThreads`/`extraArgs`. Because the driver advertises
+  `LIST_VOLUMES`, it uses one periodic `ListVolumes` path (not per-PV
+  `ControllerGetVolume`); that path reports backend provisioning-metadata health,
+  not node stale mounts or the data path. Node-side `VolumeCondition` needs
+  Kubernetes/kubelet's separate **alpha** volume-health feature gates.
 
 ### Workloads, RBAC, and metrics
 
@@ -334,30 +408,46 @@ when convenient.
 | `metrics.prometheusRule.enabled` | Create the bundled PrometheusRule | `false` |
 | `metrics.prometheusRule.additionalLabels` | Additional PrometheusRule labels | `{}` |
 | `metrics.prometheusRule.rules` | Replace the bundled alert rules when non-empty | `[]` |
+| `metrics.prometheusRule.poolUsageThreshold` | Used-fraction threshold (0–1) for `ScaleCSIPoolNearFull`; the alert renders only when the bundled PrometheusRule **and** `capacity.gaugeEnabled` are both enabled | `0.85` |
 | `metrics.dashboards.enabled` | Create a Grafana dashboard ConfigMap | `false` |
 | `metrics.dashboards.annotations` | Dashboard ConfigMap annotations (for example, a folder selector) | `{}` |
 
-The bundled PrometheusRule alerts on a missing controller scrape target,
-TrueNAS disconnection, an open circuit breaker, a high TrueNAS API failure
-ratio, sustained CSI operation errors, and detected orphan volumes or snapshots.
-The dashboard ConfigMap is labeled `grafana_dashboard: "1"`
-for Grafana sidecar discovery and uses only metrics exported by the driver.
+The bundled PrometheusRule renders **19** alerts (not only the categories once
+listed here): `ScaleCSIControllerDown`, `ScaleCSICircuitBreakerOpen`,
+`ScaleCSITrueNASConnectionDown`, `ScaleCSIHighTrueNASAPIFailureRate`,
+`ScaleCSISustainedLockContention`, `ScaleCSIOperationErrorsSustained`,
+`ScaleCSISpentRestoreSnapshotBacklog`, `ScaleCSISessionGCDisconnects`,
+`ScaleCSIFencingTakeoverSpike`, `ScaleCSIFencingProvenanceOverflow`,
+`ScaleCSIJobDispatcherUnsubscribed`, `ScaleCSIDeleteResidualCleanupFailing`,
+`ScaleCSIOrphanVolumesDetected`, `ScaleCSIOrphanSnapshotsDetected`,
+`ScaleCSIManualRecoveryTombstones`, `ScaleCSIRemnantVolumesDetected`,
+`ScaleCSITombstoneBacklog`, `ScaleCSIReconcileStalled`, and
+`ScaleCSIPoolNearFull` (the last renders only with `capacity.gaugeEnabled`). Nine
+of them also carry a `runbook_url` annotation; the full alert → runbook mapping
+is in [troubleshooting](../../docs/troubleshooting.md#alerts--runbook). The
+dashboard ConfigMap is labeled `grafana_dashboard: "1"` for Grafana sidecar
+discovery and uses only metrics exported by the driver.
 
 ### Orphan reconcile and guarded cleanup
 
 | Parameter | Description | Default |
 |---|---|---|
-| `reconcile.enabled` | Run periodic read-only orphan object detection in the controller | `true` |
+| `reconcile.enabled` | Run periodic orphan-object detection (plus always-on repair mutations) in the controller. Destructive orphan **deletion** stays gated behind `reconcile.delete.enabled` | `true` |
 | `reconcile.interval` | Controller reconcile interval, including replication-job hygiene | `1h` |
 | `reconcile.minOrphanAge` | Minimum backend object age before orphan classification | `24h` |
 | `reconcile.alertAfter` | Prometheus alert hold time; keep greater than 2x the interval | `2h5m` |
 | `reconcile.spentRestore.enabled` | Classify/reap spent VolSync restore VolumeSnapshots (`volsync-*-dst-dest*`); set false to skip this VolSync-specific classification while other reconcile phases still run | `true` |
-| `reconcile.tombstoneReaper.scanFallback.enabled` | Bounded-scan fallback for the tombstone reaper: when a pass finds zero ledger-proven tombstones, do one bounded snapshot scan and reap tombstone-shaped snapshots proven by a ledger entry OR (tombstone shape + source-dataset ownership stamp + age gate). Recovers tombstones stranded by lost ledger entries | `false` |
+| `reconcile.tombstoneReaper.scanFallback.enabled` | Bounded-scan fallback for the tombstone reaper. It runs on **every** enabled pass, independent of the ledger backlog, and issues no separate query (it reuses the pass's already-fetched recursive snapshot set), accepting at most 500 candidates. A candidate is reaped only when it has **no** ledger property at either bookkeeping location **and** carries retained creation-time identity exactly reproducing the driver's nonce-derived tombstone rename (retained snapshot/instance identity, exact tombstone name, local source-instance ownership, age gate, inheritance-mask guard). Recovers tombstones stranded by lost ledger entries | `false` |
 | `reconcile.delete.enabled` | Create the opt-in guarded cleanup CronJob | `false` |
 | `reconcile.delete.schedule` | Guarded cleanup CronJob schedule | `0 4 * * *` |
 | `reconcile.delete.maxPerRun` | Maximum successful deletions in one cleanup run | `5` |
 
-Read-only detection is enabled by default and exports
+Orphan **detection** is enabled by default (the destructive orphan-object
+**deletion** stays gated behind `reconcile.delete.enabled`), but a reconcile pass
+is **not** wholly read-only: independent of the delete gate it performs always-on
+repair mutations — legacy ownership-stamp adoption, stale bookkeeping/marker and
+publication repair, and the replication-job sweep's `core.job_abort` (which runs
+even when `reconcile.enabled=false`). Detection exports
 `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`,
 `scale_csi_spent_restore_snapshots`, orphan-byte gauges,
 `scale_csi_reconcile_last_success_timestamp_seconds`, and
@@ -414,15 +504,20 @@ tight resource limit into a driver crash loop. Use `/readyz` and
 
 ### Controller sidecars
 
-Each controller sidecar exposes `timeout`, `workerThreads`, and `extraArgs`.
-The resizer maps `workerThreads` to its `--workers` CLI flag; the other sidecars
-use `--worker-threads`.
+The provisioner, attacher, resizer, and snapshotter each expose `timeout`,
+`workerThreads`, and `extraArgs`. The resizer maps `workerThreads` to its
+`--workers` CLI flag; the other three use `--worker-threads`. The optional
+`sidecars.healthMonitor` sidecar is the exception — it does **not** expose those
+three keys (see the capacity/volume-health section above).
 
-When `controller.replicas>1`, the provisioner, attacher, resizer, and snapshotter
-receive leader-election flags and the pod template gets preferred hostname
-anti-affinity. With one replica those flags are omitted. Fencing modes other
-than `off` require exactly one replica because background fencing reconcilers
-are singleton writers.
+Leader-election flags render **unconditionally** on every capable controller
+sidecar (provisioner, attacher, resizer, snapshotter, and the optional health
+monitor), **including at a single replica** — so an `off`-mode RollingUpdate that
+transiently runs two controller pods never has both acting as the active
+provisioner/attacher. Only the preferred hostname anti-affinity (and the default
+PDB) is conditional on `controller.replicas>1`. Additive/strict fencing still
+require exactly one replica because their background reconcilers are singleton
+writers.
 
 | Parameter | Default |
 |---|---|
@@ -450,12 +545,16 @@ are singleton writers.
 | `resilience.retry.initialDelay` | Initial retry delay in milliseconds | `500` |
 | `resilience.retry.maxDelay` | Maximum retry delay in milliseconds | `5000` |
 | `resilience.retry.backoffMultiplier` | Exponential backoff multiplier | `2.0` |
-| `resilience.rateLimiting.maxConcurrentRequests` | Concurrent API request limit | `10` |
 | `resilience.rateLimiting.maxConcurrentLogins` | Concurrent login limit per portal | `2` |
 | `commandTimeouts.mount` | Mount timeout in seconds | `30` |
 | `commandTimeouts.format` | Format timeout in seconds | `300` |
 | `commandTimeouts.iscsi` | `iscsiadm` timeout in seconds | `10` |
 | `commandTimeouts.nvme` | `nvme` timeout in seconds | `30` |
+
+> `resilience.rateLimiting.maxConcurrentRequests` was removed: it was never wired
+> to anything. The API concurrency limit is `truenas.maxConcurrentRequests`. The
+> values schema still accepts the old key (ignored) so existing values files do
+> not fail validation.
 
 ### Session garbage collection
 

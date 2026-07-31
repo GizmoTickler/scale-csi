@@ -1,11 +1,324 @@
-# Release notes — v1.3.0
+# Release notes — v1.4.0
 
 This document is the accumulated changelog from the v1.2.23 documentation
-baseline through the **v1.3.0** tag, ordered newest-first (v1.3.0 → v1.2.25).
-v1.3.0 bundles the v1.2.24–v1.2.35 fixes plus the batch 17–20 performance,
-resilience, and maintainability work. Sections after the per-release entries
-(Breaking change, Helm chart, Release governance) are cross-cutting themes that
-span several of these releases.
+baseline through the **v1.4.0** release candidate, ordered newest-first. v1.4.0
+is a backward-compatible **MINOR** release over v1.3.0: it adds iSCSI CHAP,
+CSIStorageCapacity tracking, opt-in volume-health monitoring, clone-latency
+work, `truenas.maxConnections`, and an observability taxonomy migration, with
+**no breaking change** to existing configuration or volumes and a verified
+v1.4.0 → v1.3.0 rollback window. The v1.3.0 entry (which bundled the
+v1.2.24–v1.2.35 fixes plus the batch 17–20 performance/resilience/maintainability
+work) and earlier per-release entries are retained below for history. Sections
+after the per-release entries (Breaking change, Helm chart, Release governance)
+are cross-cutting themes that span several of these releases.
+
+## v1.4.0 — CHAP, capacity, volume health, clone latency, observability taxonomy
+
+Five sprints of feature and hardening work. No existing config key, volume, or
+on-disk property changes meaning; every new surface is opt-in or gated and the
+default Helm render stays byte-identical to v1.3.0. `Chart.yaml` carries a
+`0.0.0-dev` placeholder that CI stamps with the release tag.
+
+Two additional fixes were found and live-verified during the pre-release drill
+against a real TrueNAS 26.0 system:
+
+- **Fresh-install iSCSI provisioning on TrueNAS 26.0 (fencing off).** The
+  allow-all initiator-group path matched only `null` initiator lists, but 26.0
+  returns `[]` for allow-all groups and rejects the `null` create shape — so a
+  fresh install with no pre-existing group could never provision iSCSI volumes.
+  Reuse now accepts empty non-fencing groups and creation always sends a list.
+- **`zfs.resource.query` managed-dataset listing restored.** 26.0 returns
+  native-property `source` as an object, which the v1.3.0 typed decoder
+  rejected — silently degrading every reconcile listing to the slower
+  `pool.dataset.query` fallback since v1.3.0. The decoder now tolerates both
+  shapes (matching pre-v1.3.0 semantics), restoring the faster listing path.
+
+### Headline features
+
+- **iSCSI CHAP session authentication (end to end).** Opt-in, per-StorageClass
+  one-way or mutual CHAP with tag-keyed `iscsi.auth` peers, immutable per-volume
+  auth mode/tag, and in-place credential rotation. Credentials never reach the PV
+  volume context and are redacted from logs, errors, and Events. Discovery
+  authentication and dm-multipath remain unsupported, and CHAP authenticates but
+  does **not** encrypt TCP 3260 — network segmentation is still required. Details
+  in Sprint 2 below.
+- **CSIStorageCapacity tracking (opt-in, `capacity.enabled`).** Advertises
+  `CSIDriver.spec.storageCapacity=true` and runs the external-provisioner
+  capacity controller. See the WFFC scheduler prerequisite in Upgrade notes.
+- **Volume health monitoring (opt-in, `sidecars.healthMonitor.enabled`).** The
+  v0.18.0 external-health-monitor controller sidecar emits PVC Events from the
+  controller-side `VolumeCondition`. Node-side volume health depends on a
+  separate Kubernetes alpha path (caveat below).
+- **Clone provisioning latency.** New per-protocol golden round-trip counts and a
+  removed standard-clone readiness poll (Sprint 3).
+- **`truenas.maxConnections`** — WebSocket connection-pool sizing (Sprint 1).
+- **Observability taxonomy.** The `scale_csi_truenas_requests_total{status}`
+  label migrates to a 5-value outcome taxonomy, plus five new metric families,
+  ten new alerts, and five new Event reasons (Sprint 5).
+
+### Breaking changes
+
+**None expected in v1.4.0.** Every new surface is backward-compatible. The
+`CreateVolume` explicit-protocol requirement and the removed multi-portal setting
+shipped in v1.3.0 (see the Breaking-change section far below) and are unchanged
+here. Three never-wired keys are now deprecated-but-accepted — the chart no
+longer renders them but `values.schema.json` still validates them so existing
+values files pass: `resilience.rateLimiting.maxConcurrentRequests`,
+`iscsi.extentAvailThreshold`, and `nvmeof.commandTimeout`.
+`nfs.shareCommentTemplate` and `nvmeof.nameTemplate` are likewise
+accepted-and-ignored compatibility keys.
+
+### Upgrade and rollback notes
+
+- **Rollback is safe (verified).** The cluster-shaped v1.4.0 ConfigMap emits
+  **zero** keys unknown to the v1.3.0 strict (`KnownFields(true)`) config parser:
+  every new config surface (`truenas.maxConnections`, `iscsi.chap.*`,
+  `capacity.*`) is gated and renders nothing when off/default. The two new CHAP
+  dataset properties (`truenas-csi:truenas_iscsi_auth_tag`/`_mode`) and the gated
+  `chap` volume-context key are ignored by v1.3.0; marker/ledger formats are
+  unchanged. A v1.4.0 → v1.3.0 downgrade against the deployed state is verified
+  safe.
+- **Capacity scheduler prerequisite (WaitForFirstConsumer).** external-provisioner
+  publishes `CSIStorageCapacity` **only** for `WaitForFirstConsumer`
+  StorageClasses and the scheduler consults capacity only for WFFC binding.
+  Enabling `capacity.enabled` against the `Immediate` bundled class starts the
+  controller but creates no capacity objects. `capacity.forImmediateBinding: true`
+  publishes for Immediate classes for non-scheduler consumers only.
+- **Health-monitor caveats.** Because this driver advertises `LIST_VOLUMES`, the
+  sidecar uses one periodic `ListVolumes` path rather than per-PV
+  `ControllerGetVolume`; that path reports backend provisioning-metadata health,
+  not node stale mounts or the data path. Node-side `VolumeCondition` delivery
+  depends on Kubernetes/kubelet's separate **alpha** volume-health feature gates;
+  enabling this controller sidecar alone does not provide it.
+- **CSIDriver.storageCapacity flip.** `spec.storageCapacity` is mutable on
+  Kubernetes 1.23+, so a `helm upgrade` that flips `capacity.enabled` succeeds in
+  place; on 1.20–1.22 (the chart's `kubeVersion` floor) the field is immutable.
+  Flipping capacity **off** leaves owner-referenced `CSIStorageCapacity` objects
+  behind (no finalizer) until the controller Deployment is deleted; remove them
+  manually if undesired.
+- All v1.3.0 upgrade contracts still apply: the fencing node-first migration, the
+  singleton controller for additive/strict, and rolling the ConfigMap and image
+  together.
+
+### Sprint 1 — configuration truth and connection-pool sizing
+
+- **`truenas.maxConnections`** sizes the controller's WebSocket connection pool.
+  The **chart** default is `null`/omitted (the key is absent from the ConfigMap
+  for rollback compatibility); the **driver** then applies its own default of
+  **5**. Accepted explicit range is **1–16**; an explicit `0` or an out-of-range
+  value fails validation (explicit zero is preserved and rejected, not treated as
+  omitted). Node pods build no client and ignore it.
+- **Deprecated-but-accepted keys.**
+  `resilience.rateLimiting.maxConcurrentRequests` (use
+  `truenas.maxConcurrentRequests`), `iscsi.extentAvailThreshold`,
+  `nvmeof.commandTimeout` (use `commandTimeouts.nvme`), `nfs.shareCommentTemplate`,
+  and `nvmeof.nameTemplate` are no longer rendered by the chart and are ignored by
+  the driver; the schema still accepts them so old values files validate.
+
+### Sprint 2 — iSCSI CHAP
+
+- **Opt-in, per StorageClass.** Two conditions gate CHAP for a class: the
+  controller is opted in (`iscsi.chap.enabled: true`), and the StorageClass
+  references a Kubernetes Secret through the standard CSI provisioner- and
+  node-stage secret-ref parameters (the chart renders all four from
+  `storageClasses[].chapSecretName`/`chapSecretNamespace`, the latter defaulting
+  to the release namespace). With `iscsi.chap.enabled: false` (default) no peers
+  are managed and targets stay `authmethod=NONE`.
+- **Effective per-class opt-in is the non-blank Secret username.** For
+  chart-generated classes, CHAP engages at `CreateVolume` only when the global
+  gate is on **and** the provisioner Secret carries a non-blank username (the
+  driver's internal `iscsi.chapSecret` marker; the chart does not emit
+  `iscsi.chapSecret=true`). A referenced Secret with an absent/blank username
+  currently **fails open** to `authmethod=NONE`; only a request that has already
+  selected CHAP fails closed on malformed CHAP fields.
+- **Secret schema and validation.** Keys: `username`; `password` (12–16 **bytes**,
+  Go `len`); optional `mutualUsername` (its presence selects `CHAP_MUTUAL`);
+  `mutualPassword` (required iff `mutualUsername` set, 12–16 bytes, **must differ**
+  from `password`); optional `tag` (must be a positive integer). Legacy open-iscsi
+  aliases are accepted (`node.session.auth.username`/`password`/`username_in`/`password_in`).
+  Validation also rejects leading/trailing whitespace and `#`. All such failures
+  occur before any TrueNAS call, returning `InvalidArgument`, once CHAP has been
+  selected.
+- **Tag precedence, collision, and sharing.** Peer identity is tag-based and the
+  tag is derived from the username (no StorageClass identity participates):
+  positive Secret `tag`; else positive global `iscsi.chap.tag`; else FNV-1a of the
+  username mapped into `[1000,61000)`. Two classes with the same username and no
+  explicit tag **share** one derived tag/peer; a positive global tag makes every
+  untagged class contend for one peer; two different usernames that resolve to the
+  same explicit/global tag fail with `FailedPrecondition`. Pin distinct positive
+  Secret tags for isolation.
+- **Immutable per-volume policy.** The auth *mode* and *tag* are stamped immutably
+  at `CreateVolume` as local dataset properties
+  (`truenas-csi:truenas_iscsi_auth_tag`/`_mode`); every later fence/rebuild reads the
+  stored value — never the controller-wide `iscsi.chap.mutual` flag. A replay that
+  would change the policy is rejected with `FailedPrecondition`; only the secret
+  *value* rotates. Because the shared peer is ensured before the per-volume guard,
+  a *rejected* policy-change replay can still re-key a shared peer (with an
+  `ISCSICHAPRotated` Event alongside the `FailedPrecondition`) or leave one bounded
+  unused peer per username change; existing volumes and groups are unaffected.
+- **`iscsi.chap.mutual` is presently inert.** Production code never reads it; the
+  effective mode is selected solely by the Secret's `mutualUsername`. It is an
+  ignored compatibility hint until implemented.
+- **Rotation and enforcement.** Update the Secret's `password`/`mutualPassword`
+  (keep the same username and tag); the next `CreateVolume` re-keys the backend
+  peer in place via `iscsi.auth.update` (no controller restart) and emits a
+  redacted `ISCSICHAPRotated` Event. Established sessions survive rotation — the
+  node applies the new credential only before a **fresh login** (including after a
+  stale-session disconnect), not merely on the next `NodeStageVolume`. Immediate
+  enforcement requires coordinated unstage/logout or node drain plus verification
+  that the old session is gone; a controller restart does not force reauth.
+- **Peer persistence and DR prerequisite.** One `iscsi.auth` peer per class
+  credential is created and reused; `DeleteVolume` does not delete it. The peer
+  lives in the TrueNAS configuration database and does **not** ZFS-replicate — CHAP
+  DR additionally requires the destination TrueNAS to already contain the same
+  tag/username/mode/credential before publish (see the DR guide).
+- **Host-trust exposure.** Credentials are briefly visible in the node host
+  process table (`iscsiadm -v <value>`) and persist in open-iscsi node state under
+  `/var/lib/iscsi`; the privileged node DaemonSet makes node root equivalent to
+  holding every CHAP secret staged on that node. CHAP protects against off-host
+  initiators, not a compromised node.
+- **Fencing composition.** CHAP is an independent session-authentication layer:
+  the immutable authmethod/tag stays on the target group while `additive`/`strict`
+  fencing changes the initiator allowlist. CHAP neither disables fencing nor
+  implies allow-all.
+- **Events:** `ISCSICHAPRotated` (redacted rotation) and `ISCSICHAPFailed`.
+
+### Sprint 3 — clone provisioning latency
+
+- **Per-protocol golden round-trip counts (single-get fold).** The tested NFS
+  snapshot-clone golden is now **10** TrueNAS round trips and the NFS
+  volume-to-volume clone golden is **13**; the previous protocol-independent "12"
+  predates the single-get response-verified fold. Golden counts are scoped by
+  protocol and source type. **Honest note:** these are the values pinned by the
+  in-repo golden fixtures; a live end-to-end re-measure against a real appliance
+  is pending post-deploy.
+- **Standard clone verification** now performs one `DatasetGet` and at most one
+  fixed retry after 250 ms — it no longer calls `WaitForZvolReady`. Exhaustion
+  maps to `Unavailable` so the sidecar retries; `Canceled`/`DeadlineExceeded` are
+  preserved. Increasing `zfs.zvolReadyTimeout` does **not** extend this standard
+  clone retry. The distinct detached snapshot-copy zvol-readiness path still uses
+  `WaitForZvolReady` and maps readiness failure to `Internal`.
+
+### Sprint 4 — capacity-aware scheduling and volume health
+
+- **`capacity.*` keys (all opt-in, default off):** `capacity.enabled` (advertise
+  `storageCapacity=true` + capacity controller + RBAC),
+  `capacity.forImmediateBinding` (publish for Immediate classes; non-scheduler
+  consumers only), `capacity.reportMaximumVolumeSize` (sets `maximum_volume_size`
+  to the parent's available bytes — appropriate **only** for thick/reserved zvol
+  deployments, not thin overcommit), `capacity.gaugeEnabled`, and
+  `capacity.gaugeInterval` (default 60s; values below 30s clamp to 30s).
+- **`GetCapacity`** issues exactly one `pool.dataset.query` against the parent per
+  referencing class. The gauge loop samples immediately then every interval and
+  performs **one parent dataset query per interval per controller replica** (no
+  leader-election gate) — the supported topology is `replicas=1`. Neither is on
+  the CreateVolume/publish/unpublish golden path.
+- **Disable/rollback cleanup.** Flipping capacity off can leave owner-referenced
+  `CSIStorageCapacity` objects until the controller Deployment is deleted or they
+  are removed manually.
+- **Pool metrics:** `scale_csi_pool_available_bytes` and
+  `scale_csi_pool_capacity_bytes` (present only with `capacity.gaugeEnabled`).
+- **`metrics.prometheusRule.poolUsageThreshold`** (default **0.85** used-fraction,
+  schema-ranged) drives the `ScaleCSIPoolNearFull` alert, which renders only when
+  the bundled PrometheusRule **and** `capacity.gaugeEnabled` are both enabled.
+- **Controller `VolumeCondition`.** The same declarative condition is derived for
+  `ControllerGetVolume` and `ListVolumes`: an explicit local
+  `provision_success=false` is abnormal, a managed successfully-provisioned volume
+  is normal, and missing legacy stamps report normal-but-"unverified." It is
+  backend provisioning-metadata health — **not** existence-only and **not** a
+  protocol/data-path probe. `NodeGetVolumeStats` separately detects stale-mount
+  state before its stats gate. For this driver the external health monitor
+  observes the controller/`ListVolumes` condition.
+- **`sidecars.healthMonitor.*` keys:** `enabled` (default off), `image` (pinned
+  v0.18.0), `interval` (renders both `--list-volumes-interval`, the active cadence
+  here, and the fallback `--monitor-interval`), and `resources`. The sidecar emits
+  PVC Events from controller-side conditions; node-side health needs the separate
+  Kubernetes alpha path.
+
+### Sprint 5 — observability taxonomy and new signals
+
+- **Honest TrueNAS transport counter (`scale_csi_truenas_requests_total`).** The
+  `status` label keeps its name but expands from `{success, error}` to a 5-value
+  outcome taxonomy. Expected idempotent outcomes and lock-contention retries move
+  OUT of `status="error"` into dedicated `benign_*` values, so the per-method
+  transport counter now tells the same truth as the RPC-level
+  `scale_csi_operations_total` (which has classified Aborted/NotFound/AlreadyExists
+  as benign since v1.2.13). This fixes the live finding where
+  `nvmet.host_subsys.create` showed a 13%+ `status="error"` rate that was entirely
+  benign `AlreadyExists` from the unconditional enforcement-boundary create at
+  publish. The classifier is method-agnostic, so the `iscsi.auth.*` peer-CRUD
+  calls added for CHAP are classified `benign_exists` on their idempotent creates
+  automatically.
+
+  | series | change |
+  |--------|--------|
+  | `scale_csi_truenas_requests_total{status="success"}` | **unchanged** |
+  | `scale_csi_truenas_requests_total{status="error"}` | **narrows** — benign EEXIST/ENOENT/lock-contention no longer counted here (intended); real errors only |
+  | `scale_csi_truenas_requests_total{status="benign_exists"}` | **new** — expected idempotent AlreadyExists |
+  | `scale_csi_truenas_requests_total{status="benign_notfound"}` | **new** — expected idempotent NotFound (deletes/reads) |
+  | `scale_csi_truenas_requests_total{status="benign_aborted"}` | **new** — lock-contention retry / busy |
+  | `scale_csi_truenas_requests_duration_seconds` | **unchanged** (no status label) |
+  | cardinality | 2 → ≤5 values per method; `method` is a fixed API-method enum → still bounded |
+
+  **Operator action — this is a semantic change, not just a rename.** Existing
+  `status="success"` and `status="error"` selectors remain SYNTACTICALLY valid
+  (no expression breaks), but their MEANING changes: `status="error"` now counts
+  real failures only, so any panel/rule — including THIRD-PARTY dashboards — that
+  summed `status="error"` as "all non-success" will read LOWER by exactly the
+  benign volume that moved out. The built-in `ScaleCSIHighTrueNASAPIFailureRate`
+  alert is affected the same way: it still selects `status="error"`, so EBUSY
+  lock-contention abort-storms NO LONGER contribute to it (that signal is now
+  covered by the new `ScaleCSISustainedLockContention` alert). Decide
+  deliberately which population each of your queries should track:
+
+  - **Real failures only** — keep `status="error"` (the new, honest value; no
+    change needed).
+  - **The old all-non-success population** — change the selector to
+    `status!="success"` (or enumerate
+    `status=~"error|benign_exists|benign_notfound|benign_aborted"`). This is the
+    change a third-party panel/rule that intentionally tracked every non-success
+    outcome MUST make to preserve its prior meaning.
+  - **Contention signaling** — rely on the new `ScaleCSISustainedLockContention`
+    alert / the "TrueNAS API Outcomes" dashboard band, or deliberately include
+    `benign_aborted` alongside `error` in your own query.
+
+- **Five new metric families.**
+  - `scale_csi_job_dispatcher_subscribed` — `1` while the `core.get_jobs`
+    subscription is live, `0` in the pure-poll fallback; drives
+    `ScaleCSIJobDispatcherUnsubscribed`. Action: investigate a persistently `0`
+    value (dead/reconnecting socket).
+  - `scale_csi_manual_recovery_tombstones` — tombstones no belt can prove, for
+    operator inspection; populated **only while scan fallback is enabled**.
+  - `scale_csi_tombstone_reaped_total{path}` — reaper throughput by discovery path
+    (ledger vs scan fallback).
+  - `scale_csi_pool_available_bytes` and `scale_csi_pool_capacity_bytes` — opt-in,
+    present only with `capacity.gaugeEnabled`; feed `ScaleCSIPoolNearFull`.
+
+  The existing documented metric names continue to match `driver.MetricNames()`.
+
+- **Ten new alerts** relative to `main` (the bundled PrometheusRule now renders
+  **19** alerts total): `ScaleCSISustainedLockContention`,
+  `ScaleCSIFencingTakeoverSpike`, `ScaleCSIFencingProvenanceOverflow`,
+  `ScaleCSIJobDispatcherUnsubscribed`, `ScaleCSIDeleteResidualCleanupFailing`,
+  `ScaleCSIManualRecoveryTombstones`, `ScaleCSIRemnantVolumesDetected`,
+  `ScaleCSITombstoneBacklog`, `ScaleCSIReconcileStalled`, and
+  `ScaleCSIPoolNearFull`. `ScaleCSIHighTrueNASAPIFailureRate` still selects
+  `status="error"`, so EBUSY lock-contention storms are now covered by
+  `ScaleCSISustainedLockContention` instead. Nine of the rendered alerts also
+  carry a resolvable `runbook_url` annotation; see the troubleshooting
+  Alerts → Runbook table for the full mapping.
+
+- **Five new Event reasons:** `ISCSICHAPRotated`, `ReaperRefused`,
+  `ReconcileGuardRefusal`, `FencingProvenanceOverflow`, and `ISCSICHAPFailed`.
+
+### Post-requested-snapshot delta (49-commit head, `360e268`)
+
+Three code-only commits landed after the audit snapshot: two harden typed JSON
+decoding to exact legacy-decode equivalence (differential-fuzz findings), and one
+folds the CHAP policy mode/tag for snapshot and volume clones into the **same
+atomic ownership/content-source update**. That fold closes a crash window that
+could otherwise leave an owned clone permanently rejected on retry — a correctness
+fix recorded here for the nominated 49-commit head.
 
 ## v1.3.0 — publish/reconcile performance, subscribe job-wait, clone fold, ledger v2
 
@@ -31,7 +344,10 @@ Batches 17–20, plus an adversarial-review maintainability round.
   `map[string]interface{}` reflection.
 - **Response-verified quota + content-source fold.** `CreateVolume` from a
   snapshot trusts the mutation response to verify quota and content-source
-  instead of re-reading, folding the clone hot path to **12 round trips**.
+  instead of re-reading, folding the clone hot path. After the v1.4.0 single-get
+  fold the current per-protocol goldens are **10** round trips for an NFS
+  snapshot source and **13** for an NFS volume source (see v1.4.0 Sprint 3); the
+  earlier protocol-independent "12" is superseded.
 - **Attacher/resizer timeout.** The external-attacher and external-resizer
   sidecar `--timeout` is **120s** (was 300s), so a stuck TrueNAS publish or
   expand cannot pin the sidecar for five minutes. Provisioner and snapshotter
@@ -342,8 +658,13 @@ PVs are not reprovisioned merely because new claims use the replacement class.
   defaults.
 - The unused additional-iSCSI-portal chart setting is removed. Existing values
   files that attempted multi-portal configuration must remove that entry.
-- CHAP and iSCSI multipath remain unsupported; TCP 3260 must be protected by the
-  storage-network trust boundary.
+- iSCSI CHAP session authentication is now supported (opt-in, per StorageClass;
+  one-way and mutual). The per-volume auth mode/tag are stamped immutably and
+  reconstructed on fence passes; credentials never reach the PV volume context and
+  are redacted from logs, errors, and Events. iSCSI multipath remains unsupported.
+  CHAP authenticates the session but does not encrypt data in flight, so TCP 3260
+  must still be protected by the storage-network trust boundary. See
+  [iSCSI CHAP](reference/storageclass.md#iscsi-chap).
 
 ## Release governance
 
@@ -365,8 +686,11 @@ PVs are not reprovisioned merely because new claims use the replacement class.
 All shipped direct-driver examples pass strict YAML parsing. The README and the
 deployment, Nomad, topology, StorageClass, production, troubleshooting,
 architecture, snapshots, and disaster-recovery guides were re-audited against the
-v1.3.0 code and describe only implemented flags, values, metrics, and runtime
-behavior. This pass corrected stale chart keys in troubleshooting
-(`nfs.server`/`iscsi.portal`/`nvmeof.address`), documented the
-`snapshotRestoreMode` StorageClass parameter, and recorded the always-on leader
-election and the WebSocket pool/resilience internals.
+**v1.4.0** code and describe only implemented flags, values, metrics, and runtime
+behavior. The v1.4.0 documentation pass folded in the release audit's
+corrections: the CHAP opt-in/validation/tag/rotation/DR contract, the capacity
+and volume-health chart keys and caveats, the per-protocol clone goldens
+(10/13, replacing the stale 12), `truenas.maxConnections` (chart `null`/omitted,
+driver default 5, range 1–16), the observability `status="error"` narrowing and
+the new metric families/alerts, and the corrected node-runtime and
+reconcile-mutation descriptions.

@@ -163,9 +163,32 @@ spec:
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
             - "--extra-create-metadata"
+            {{- if .Values.capacity.enabled }}
+            - "--enable-capacity"
+            # owner = controller Deployment (Deployment -> ReplicaSet -> Pod = 2)
+            - "--capacity-ownerref-level=2"
+            {{- if .Values.capacity.forImmediateBinding }}
+            # Opt-in: publish CSIStorageCapacity for Immediate-binding
+            # StorageClasses too. external-provisioner ignores Immediate classes
+            # by default (the scheduler ignores capacity for immediate binding),
+            # so this is only useful for non-scheduler capacity consumers.
+            - "--capacity-for-immediate-binding"
+            {{- end }}
+            {{- end }}
             {{- range .Values.sidecars.provisioner.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+          {{- if .Values.capacity.enabled }}
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}
@@ -252,6 +275,32 @@ spec:
               mountPath: {{ include "scale-csi.socketDir" . }}
           resources:
             {{- toYaml .Values.sidecars.livenessProbe.resources | nindent 12 }}
+
+        {{- if .Values.sidecars.healthMonitor.enabled }}
+        # External Health Monitor (volume-health; opt-in via
+        # sidecars.healthMonitor.enabled). Emits Events for abnormal volumes;
+        # default off => no container => byte-identical render.
+        - name: csi-external-health-monitor
+          image: {{ .Values.sidecars.healthMonitor.image }}
+          args:
+            - "--csi-address={{ include "scale-csi.socketPath" . }}"
+            - "--leader-election"
+            - "--leader-election-namespace={{ .Release.Namespace }}"
+            # Scale-CSI advertises LIST_VOLUMES, so external-health-monitor
+            # v0.18.0 drives the ListVolumes path, whose cadence is set by
+            # --list-volumes-interval (NOT --monitor-interval). Render the active
+            # flag from the configured interval; --monitor-interval is kept as the
+            # fallback cadence for the ControllerGetVolume path a driver without
+            # LIST_VOLUMES would use.
+            - "--list-volumes-interval={{ .Values.sidecars.healthMonitor.interval }}"
+            - "--monitor-interval={{ .Values.sidecars.healthMonitor.interval }}"
+            - "--v={{ .Values.logging.verbosity }}"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ include "scale-csi.socketDir" . }}
+          resources:
+            {{- toYaml .Values.sidecars.healthMonitor.resources | nindent 12 }}
+        {{- end }}
 
       volumes:
         - name: socket-dir

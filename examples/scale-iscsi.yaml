@@ -32,11 +32,12 @@ iscsi:
   targetPortal: truenas.example.com:3260
   interface: default
   # Leave targetGroups absent to let the driver resolve the portal and an
-  # allow-all initiator group. CHAP and dm-multipath are not supported; protect
-  # TCP 3260 with a dedicated storage network and node-only filtering.
+  # allow-all initiator group. iSCSI CHAP session auth is supported (default-off
+  # gate iscsi.chap.enabled plus per-StorageClass Secret refs; one-way or mutual)
+  # but dm-multipath is not. CHAP authenticates but does not encrypt TCP 3260, so
+  # still protect it with a dedicated storage network and node-only filtering.
   extentBlocksize: 512
   extentDisablePhysicalBlocksize: false
   extentRpm: SSD
-  extentAvailThreshold: 0
   deviceWaitTimeout: 60
   serviceReloadDebounce: 2000

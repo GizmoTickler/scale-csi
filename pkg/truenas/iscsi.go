@@ -713,10 +713,16 @@ func (c *Client) ISCSIInitiatorCreate(ctx context.Context, comment string) (*ISC
 	return c.ISCSIInitiatorCreateWithInitiators(ctx, nil, comment)
 }
 
-// ISCSIInitiatorCreateWithInitiators creates an exact initiator allowlist. The
-// legacy allow-all path passes nil; fenced callers pass a non-nil list, where an
-// empty list intentionally authorizes no initiators while retaining portals.
+// ISCSIInitiatorCreateWithInitiators creates an initiator group. The legacy
+// allow-all path passes nil, which is normalized to an empty list: TrueNAS
+// 26.0 rejects "initiators": null with a bare -32602, and the allow-all shape
+// on 26.0 IS the empty list (SCST renders it INITIATOR *; live-verified
+// 2026-07-31 drill). Fencing's deny-all semantics are carried by the
+// "scale-csi fencing:" comment convention, not by list shape.
 func (c *Client) ISCSIInitiatorCreateWithInitiators(ctx context.Context, initiators []string, comment string) (*ISCSIInitiator, error) {
+	if initiators == nil {
+		initiators = []string{}
+	}
 	params := map[string]interface{}{
 		"initiators": initiators,
 		"comment":    comment,

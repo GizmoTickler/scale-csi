@@ -183,11 +183,17 @@ func seedSnapshotCloneSource(
 
 func TestSnapshotCloneFoldCrashStatesRecoverThroughExistingArm(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		applyFolded bool
+		name                     string
+		applyFolded              bool
+		wantOwnershipBeforeRetry bool
 	}{
 		{name: "crash immediately before merged update"},
-		{name: "crash after merged update before ownership", applyFolded: true},
+		// Sprint 3 (L2a): the merged update now carries ownership atomically, so the
+		// old "crash after merged update before ownership" state no longer exists.
+		// The surviving post-merged-write crash point is "after the merged update,
+		// before marker retire": ownership+content-source are durable and the marker
+		// is still present, and a retry recovers through the existing-volume arm.
+		{name: "crash after merged update before marker retire", applyFolded: true, wantOwnershipBeforeRetry: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -205,13 +211,14 @@ func TestSnapshotCloneFoldCrashStatesRecoverThroughExistingArm(t *testing.T) {
 				_, err = d.setAndVerifyDatasetProps(ctx, marker.Dataset, 2*testGiB, map[string]string{
 					PropVolumeContentSourceType: "snapshot",
 					PropVolumeContentSourceID:   "snap-1",
+					PropDriverInstanceID:        d.driverInstanceID(),
 				})
 				require.NoError(t, err)
 			}
 			beforeRetry, err := client.DatasetGet(ctx, marker.Dataset)
 			require.NoError(t, err)
-			require.False(t, datasetHasLocalOwnershipStamp(beforeRetry),
-				"the simulated crash must occur before ownership")
+			require.Equal(t, tc.wantOwnershipBeforeRetry, datasetHasLocalOwnershipStamp(beforeRetry),
+				"the simulated crash point must carry exactly the expected ownership state")
 
 			response, err := d.CreateVolume(ctx, request)
 			require.NoError(t, err)
@@ -321,7 +328,6 @@ func TestSnapshotCloneFoldQuotaAndZvolPaths(t *testing.T) {
 			client := &cloneFoldCaptureClient{MockClient: truenas.NewMockClient()}
 			d := newSnapshotCloneFoldDriver(client, tc.quotas)
 			seedSnapshotCloneSource(t, client.MockClient, tc.datasetType, testGiB)
-			var marker *inflightMarker
 			source := snapshotCloneRequest("restored", "snap-1", string(tc.protocol), 2*testGiB).GetVolumeContentSource()
 
 			created, err := d.handleVolumeContentSource(
@@ -333,11 +339,12 @@ func TestSnapshotCloneFoldQuotaAndZvolPaths(t *testing.T) {
 				tc.protocol,
 				false,
 				nil,
-				&marker,
 			)
 			require.NoError(t, err)
 			require.NotNil(t, created)
-			require.NotNil(t, marker)
+			writtenMarker, markerErr := d.readInflightMarker(ctx, "restored")
+			require.NoError(t, markerErr)
+			require.NotNil(t, writtenMarker, "the clone must write a durable in-flight marker before mutating")
 			require.Len(t, client.foldUpdates, 1, "quota and content source must share exactly one update")
 			fold := client.foldUpdates[0]
 			if tc.wantRefquota {
@@ -352,12 +359,13 @@ func TestSnapshotCloneFoldQuotaAndZvolPaths(t *testing.T) {
 			for _, update := range fold.UserPropertiesUpdate {
 				properties[update.Key] = update.Value
 			}
+			// Sprint 3 (L2a): the ownership stamp folds INTO the merged content-source
+			// update, so all three keys persist in one atomic pool.dataset.update.
 			assert.Equal(t, map[string]string{
 				PropVolumeContentSourceID:   "snap-1",
 				PropVolumeContentSourceType: "snapshot",
+				PropDriverInstanceID:        d.driverInstanceID(),
 			}, properties)
-			assert.NotContains(t, properties, PropDriverInstanceID,
-				"ownership must stay outside the merged content-source update")
 			if tc.datasetType == "VOLUME" {
 				assert.Equal(t, 2*testGiB, datasetPropertyBytes(created.Volsize))
 			}

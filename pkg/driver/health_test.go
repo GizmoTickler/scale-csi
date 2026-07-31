@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -215,6 +216,32 @@ func TestCheckHealth_WithoutCircuitBreakerStats(t *testing.T) {
 	assert.Nil(t, status.CircuitBreaker, "CircuitBreaker should be nil when stats unavailable")
 	assert.True(t, status.Ready)
 	assert.True(t, status.TrueNASConnected)
+}
+
+// TestCheckHealth_JobDispatcherSubscribed guards the O7 wiring: the health tick
+// publishes the client's core.get_jobs subscription bit to the gauge so a
+// degraded pure-poll fallback (higher API load + latency) is observable.
+func TestCheckHealth_JobDispatcherSubscribed(t *testing.T) {
+	for _, subscribed := range []bool{true, false} {
+		mockClient := &MockClientWithCircuitBreaker{
+			MockClient: truenas.NewMockClient(),
+			cbStats:    nil,
+		}
+		mockClient.JobSubscribed = subscribed
+
+		d := &Driver{runController: true, truenasClient: mockClient}
+		d.ready.Store(true)
+		h := &HealthServer{driver: d, lastCheck: time.Time{}} // force cache miss
+
+		h.checkHealth()
+
+		want := float64(0)
+		if subscribed {
+			want = 1
+		}
+		assert.Equal(t, want, testutil.ToFloat64(jobDispatcherSubscribed),
+			"gauge must track the subscription bit (subscribed=%v)", subscribed)
+	}
 }
 
 func TestNodeReadinessIgnoresTrueNASDisconnection(t *testing.T) {

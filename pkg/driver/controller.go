@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
@@ -42,9 +43,19 @@ const (
 	PropISCSIExtentID             = "truenas-csi:truenas_iscsi_extent_id"
 	PropISCSITargetExtentID       = "truenas-csi:truenas_iscsi_targetextent_id"
 	PropISCSIInitiatorID          = "truenas-csi:truenas_iscsi_initiator_id"
-	PropNVMeoFSubsystemID         = "truenas-csi:truenas_nvmeof_subsystem_id"
-	PropNVMeoFNamespaceID         = "truenas-csi:truenas_nvmeof_namespace_id"
-	PropNVMeoFPortSubsysID        = "truenas-csi:truenas_nvmeof_portsubsys_id"
+	// PropISCSIAuthTag stores the iscsi.auth TAG that the target group's auth ref
+	// points at (G1: SCST only emits IncomingUser for tag-keyed refs). It is the
+	// durable link fence/rebuild passes use to re-stamp CHAP without the secret.
+	PropISCSIAuthTag = "truenas-csi:truenas_iscsi_auth_tag"
+	// PropISCSIAuthMode stores the immutable per-volume auth mode (CHAP or
+	// CHAP_MUTUAL) stamped at CreateVolume. Every later path (fence, volume
+	// context, idempotent replay) reads THIS, never the mutable controller-wide
+	// iscsi.chap.mutual flag, so a global-flag flip cannot downgrade or upgrade an
+	// existing volume and mixed one-way/mutual StorageClasses coexist correctly.
+	PropISCSIAuthMode      = "truenas-csi:truenas_iscsi_auth_mode"
+	PropNVMeoFSubsystemID  = "truenas-csi:truenas_nvmeof_subsystem_id"
+	PropNVMeoFNamespaceID  = "truenas-csi:truenas_nvmeof_namespace_id"
+	PropNVMeoFPortSubsysID = "truenas-csi:truenas_nvmeof_portsubsys_id"
 
 	// PropInflightMarkerPrefix namespaces per-volume in-flight content-source
 	// creation markers written on the PARENT dataset (the only object proven to
@@ -273,6 +284,16 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 			},
 		},
 		{
+			// Meaningful only alongside GET_VOLUME: ControllerGetVolume populates
+			// Volume.Status.VolumeCondition from the dataset's already-returned
+			// user properties (no extra API call).
+			Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_VOLUME_CONDITION,
+				},
+			},
+		},
+		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
@@ -359,6 +380,25 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	capacityBytes := vp.capacityBytes
 	shareType, detached := vp.shareType, vp.detached
 
+	// iSCSI CHAP is strictly opt-in. When this StorageClass opts in, ensure the
+	// shared backend auth peer once (cached per tag) and thread the resolution to
+	// the share builder and volume-context builder via the request context. A
+	// deployment that never enables CHAP skips this entirely, so the non-CHAP
+	// golden RTT counts are unaffected.
+	if shareType == ShareTypeISCSI && d.chapEnabledForCreate(req.GetParameters(), req.GetSecrets()) {
+		chapResolution, chapErr := d.EnsureISCSIAuthPeer(ctx, req.GetSecrets())
+		if chapErr != nil {
+			return nil, chapErr
+		}
+		if chapResolution.Rotated {
+			// The backend peer's secret was re-keyed in place. Surface a redacted
+			// Event (no credential) so operators can confirm the rotation applied.
+			d.recordNormalEvent(createVolumeEventRef(req), EventReasonISCSICHAPRotated,
+				fmt.Sprintf("Rotated iSCSI CHAP credential for auth tag %d", chapResolution.Peer.Tag))
+		}
+		ctx = withISCSIChAPResolution(ctx, chapResolution)
+	}
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {
@@ -372,34 +412,38 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
 	var createdDS *truenas.Dataset
-	var snapshotCloneMarker *inflightMarker
 	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
-		_, srcErr := d.handleVolumeContentSource(
+		clonedDS, srcErr := d.handleVolumeContentSource(
 			ctx, datasetName, name, contentSource, capacityBytes, shareType, detached, &detachedCopyJobID,
-			&snapshotCloneMarker,
 		)
 		if srcErr != nil {
 			return nil, srcErr
 		}
-		// Clone/replication APIs cannot stamp properties atomically. The initial
-		// absence check plus a successful (not AlreadyExists) clone/copy response is
-		// the creation proof; stamp ownership before creating any share object.
-		verifiedClone, ownerErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
-			PropDriverInstanceID: d.driverInstanceID(),
-		})
-		if ownerErr != nil {
-			if snapshotCloneMarker != nil {
-				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, snapshotCloneMarker, ownerErr)
+		if detached {
+			// Detached snapshot copies do NOT fold the ownership stamp into their
+			// content-source write, so stamp it here before any share object exists.
+			// Clone/replication APIs cannot stamp properties atomically; the initial
+			// absence check plus a successful (not AlreadyExists) copy response is the
+			// creation proof.
+			verifiedClone, ownerErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+				PropDriverInstanceID: d.driverInstanceID(),
+			})
+			if ownerErr != nil {
+				d.cleanupFailedClone(ctx, datasetName, "")
+				return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
 			}
-			d.cleanupFailedClone(ctx, datasetName, "")
-			return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
+			createdDS = verifiedClone
+		} else {
+			// Sprint 3 (L2a): the snapshot-clone and volume-clone paths folded the
+			// ownership stamp into their atomic content-source write, so clonedDS
+			// already carries durable ownership and no separate stamp is needed.
+			createdDS = clonedDS
 		}
 		// Ownership is durable; the in-flight marker has served its purpose.
 		// Best-effort removal — the reconciler sweep retires leftovers.
 		d.deleteInflightMarker(ctx, volumeID)
-		createdDS = verifiedClone
 		zvolReady = true
 		// Scrub backend share-object IDs the clone inherited from its source dataset
 		// (ZFS copies the source's user properties into the clone). A stale inherited
@@ -430,6 +474,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
 		volumeProperties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
+	}
+	// Fold the durable CHAP auth linkage into the FATAL managed-property update
+	// below so it is stamped-or-rolled-back with the rest of provisioning (X1): a
+	// fence pass reconstructs authmethod+auth purely from PropISCSIAuthTag +
+	// PropISCSIAuthMode, so a missing stamp would silently downgrade the target to
+	// authmethod=NONE. The immutable mode is stored here (never re-derived from the
+	// mutable global flag). Only the create path reaches this; existing volumes are
+	// policy-guarded in createVolumeExisting and never re-stamped. For clones this
+	// re-writes the CHAP policy the clone fold already stamped atomically with
+	// ownership (Sprint 6 H1) — idempotent, same values via iscsiCHAPPolicyProps.
+	for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+		volumeProperties[key] = value
 	}
 
 	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
@@ -757,6 +813,16 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		return nil, status.Errorf(codes.Internal, "failed to ensure volume properties: %v", waitErr)
 	}
 
+	// The stored per-volume CHAP policy is authoritative: an idempotent replay may
+	// not convert this volume to/from CHAP or change its tag/mode (X4). Guard
+	// BEFORE ensureShareExists so a conflicting replay fails fast and never
+	// rebuilds the target's auth groups.
+	if shareType == ShareTypeISCSI {
+		if guardErr := d.guardExistingISCSICHAPPolicy(ctx, existingDS); guardErr != nil {
+			return nil, guardErr
+		}
+	}
+
 	// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
 	// This handles the case where a previous CreateVolume created the dataset but failed
 	// to create the share (e.g., due to timeout, TrueNAS API error, etc.)
@@ -898,7 +964,9 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
 
-	klog.Infof("DeleteVolume: volumeID=%s", volumeID)
+	// Benign teardown entry: demoted to V(2) so a steady-state VolSync delete hour
+	// emits ~0 V(0) controller lines (E4/O21). Delete failures still log at Error.
+	klog.V(2).Infof("DeleteVolume: volumeID=%s", volumeID)
 
 	// Lock on volume ID
 	lockKey := volumeLockKey(volumeID)
@@ -1405,6 +1473,14 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 				VolumeId:      volumeID,
 				CapacityBytes: capacity,
 			},
+			// Populate the entry's VolumeCondition from the same helper
+			// ControllerGetVolume uses. external-health-monitor v0.18.0 prefers
+			// ListVolumes whenever LIST_VOLUMES is advertised and reads
+			// Entry.Status.VolumeCondition; leaving it nil made its nil-safe
+			// getters report every listed volume as normal (codex H1).
+			Status: &csi.ListVolumesResponse_VolumeStatus{
+				VolumeCondition: volumeConditionFromDataset(ds),
+			},
 		})
 	}
 
@@ -1425,14 +1501,45 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 func (d *Driver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
 	klog.V(4).Info("GetCapacity called")
 
-	available, err := d.truenasClient.GetPoolAvailable(ctx, d.config.ZFS.DatasetParentName)
+	// Report the parent dataset's ZFS-computed `available` bytes rather than a
+	// raw vdev free-space sum. `available` natively nets out RAIDZ parity
+	// overhead, ancestor quota/refquota, and existing refreservations, so it is
+	// the honest "how much can I still provision here" number (G1 probe confirmed
+	// the parsed value is bytes on 26.0). req.Parameters is deliberately ignored:
+	// the driver honors no per-StorageClass parent/pool override (only `protocol`
+	// is consumed at CreateVolume), and datasetForID always derives
+	// path.Join(DatasetParentName, id), so every StorageClass of this
+	// single-backend driver shares the one parent dataset reported here.
+	parent := strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/")
+	ds, err := d.truenasClient.DatasetGet(ctx, parent)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get capacity: %v", err)
 	}
 
-	return &csi.GetCapacityResponse{
-		AvailableCapacity: available,
-	}, nil
+	avail := int64(0)
+	if v, ok := ds.Available.Parsed.(float64); ok {
+		avail = int64(v)
+	} else {
+		// A scheduler reads AvailableCapacity=0 as "backend full" and can halt
+		// provisioning cluster-wide, so a missing/unparseable `available` must not
+		// degrade silently. Keep returning 0 (honest "nothing confirmed free")
+		// but surface why, so an operator can tell a full pool from a parse miss.
+		klog.Warningf("GetCapacity: dataset %s has absent/unparseable `available` (%v); reporting 0", parent, ds.Available.Parsed)
+	}
+
+	resp := &csi.GetCapacityResponse{
+		AvailableCapacity: avail,
+	}
+	// maximum_volume_size is opt-in (capacity.reportMaximumVolumeSize). Under the
+	// default thin/sparse provisioning `available` is a soft estimate and a hard
+	// maximum would make the scheduler wrongly reject legitimate overcommit; only
+	// thick deployments (zvolEnableReservation) should advertise it, where
+	// `available` already nets out refreservations and is a true remaining ceiling.
+	// TrueNAS 26.0 exposes no dedicated max-size API, so the ceiling is `available`.
+	if d.config.Capacity.ReportMaximumVolumeSize {
+		resp.MaximumVolumeSize = wrapperspb.Int64(avail)
+	}
+	return resp, nil
 }
 
 // CreateSnapshot creates a snapshot.
@@ -1838,7 +1945,49 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 			VolumeId:      volumeID,
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
+		// VolumeCondition is derived from the dataset's ALREADY-returned user
+		// properties (no extra API call) via the same helper ListVolumes uses. A
+		// dataset-gone case returns NotFound above, so reaching here means the
+		// backend object exists; abnormal is reserved for a definitive negative
+		// marker (see volumeConditionFromDataset).
+		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
+			VolumeCondition: volumeConditionFromDataset(ds),
+		},
 	}, nil
+}
+
+// volumeConditionFromDataset derives a CSI VolumeCondition from a fetched
+// dataset's user properties without any further API call. It is the single
+// source of truth shared by ControllerGetVolume and ListVolumes so both RPCs —
+// and whichever path the external-health-monitor selects (it prefers
+// ListVolumes when LIST_VOLUMES is advertised) — report an identical condition.
+//
+// The semantics are deliberately conservative about declaring ill health. A
+// volume is abnormal ONLY on a definitive negative marker: an explicit
+// provision_success="false". A dataset-gone condition never reaches here (both
+// callers return NotFound first). Missing managed/provision stamps are NOT
+// evidence of ill health: the always-on adoption reconcile backfills only
+// driver_instance_id, and a long-Bound legacy volume never re-runs CreateVolume
+// (the sole path that writes both stamps), so an unstamped dataset can be
+// perfectly healthy. Those are reported normal with a message noting the health
+// is unverified, rather than flagged abnormal and raising spurious volume-health
+// events on clusters with pre-stamp legacy PVs.
+func volumeConditionFromDataset(ds *truenas.Dataset) *csi.VolumeCondition {
+	if datasetUserProperty(ds, PropProvisionSuccess) == "false" {
+		return &csi.VolumeCondition{
+			Abnormal: true,
+			Message:  "dataset provisioning is explicitly marked failed",
+		}
+	}
+	managed := datasetUserProperty(ds, PropManagedResource) == "true"
+	provisioned := datasetUserProperty(ds, PropProvisionSuccess) == "true"
+	if managed && provisioned {
+		return &csi.VolumeCondition{Abnormal: false}
+	}
+	return &csi.VolumeCondition{
+		Abnormal: false,
+		Message:  "volume health unverified: managed/provision stamps absent (legacy or adoption-pending dataset)",
+	}
 }
 
 // ControllerModifyVolume modifies a volume (not implemented).
@@ -2094,9 +2243,10 @@ func stampAndMirror(ctx context.Context, client truenas.ClientInterface, ds *tru
 // setAndVerifyDatasetProps writes an optional filesystem refquota together with
 // user properties through one pool.dataset.update and verifies that every
 // requested value persisted with source=local. The widened shape is used by the
-// snapshot-clone fold: content-source identity and quota become durable in one
-// response-verifying update, while ownership remains a later, separate crash
-// boundary.
+// snapshot-clone fold: refquota, content-source identity, and (since Sprint 3
+// L2a) the ownership stamp all become durable in one response-verifying update,
+// so there is no intermediate state where content-source exists without
+// ownership.
 func (d *Driver) setAndVerifyDatasetProps(
 	ctx context.Context,
 	datasetName string,
@@ -2290,6 +2440,8 @@ var inheritedProtocolPropertyKeys = []string{
 	PropISCSIExtentID,
 	PropISCSITargetExtentID,
 	PropISCSIInitiatorID,
+	PropISCSIAuthTag,
+	PropISCSIAuthMode,
 	PropNVMeoFSubsystemID,
 	PropNVMeoFNamespaceID,
 	PropNVMeoFPortSubsysID,
@@ -2312,6 +2464,12 @@ func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truen
 		currentProtocol[PropISCSIExtentID] = struct{}{}
 		currentProtocol[PropISCSITargetExtentID] = struct{}{}
 		currentProtocol[PropISCSIInitiatorID] = struct{}{}
+		// PropISCSIAuthTag/PropISCSIAuthMode are deliberately NOT current-protocol:
+		// CHAP identity is POLICY, not a same-protocol share-object back-reference.
+		// An iSCSI->iSCSI clone must NOT inherit the source's CHAP tag/mode, so the
+		// scrub removes any inherited CHAP props here. When the CURRENT CreateVolume
+		// request itself resolves CHAP, createISCSIShareForDataset re-stamps the
+		// request's own tag/mode as a local property afterward.
 	case ShareTypeNVMeoF:
 		currentProtocol[PropNVMeoFSubsystemID] = struct{}{}
 		currentProtocol[PropNVMeoFNamespaceID] = struct{}{}
@@ -2346,6 +2504,78 @@ func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truen
 	}
 }
 
+// cloneReadyRetryDelay is the single bounded retry gap used when confirming a
+// freshly cloned dataset is queryable (L1b). The live probe showed clones are
+// immediately queryable, so this guards transient load only — it is deliberately
+// NOT an exponential poll.
+const cloneReadyRetryDelay = 250 * time.Millisecond
+
+// confirmCloneReady confirms a freshly cloned dataset is queryable. TrueNAS 26.0
+// returns pool.snapshot.clone synchronously queryable (probe-verified on nas01:
+// 10/10 scratch clones immediately queryable with a populated volsize/type and
+// zero retries), so a single DatasetGet suffices; one bounded retry guards the
+// load conditions the probe did not model. When requireVolsize is set (zvol
+// clones) the get must also show type=VOLUME with a populated volsize. Filesystem
+// clones pass requireVolsize=false and return on the first successful get.
+func (d *Driver) confirmCloneReady(ctx context.Context, datasetName string, timeout time.Duration, requireVolsize bool) (*truenas.Dataset, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			delay := cloneReadyRetryDelay
+			if remaining := time.Until(deadline); remaining < delay {
+				if remaining <= 0 {
+					break
+				}
+				delay = remaining
+			}
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context canceled confirming clone %s readiness: %w", datasetName, ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+		ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if requireVolsize {
+			if ds.Type != "VOLUME" {
+				lastErr = fmt.Errorf("clone %s is type %s, expected VOLUME", datasetName, ds.Type)
+				continue
+			}
+			if volsize, ok := ds.Volsize.Parsed.(float64); !ok || volsize <= 0 {
+				lastErr = fmt.Errorf("clone %s zvol has no populated volsize yet", datasetName)
+				continue
+			}
+		}
+		return ds, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("clone %s was not queryable before the readiness deadline", datasetName)
+	}
+	return nil, fmt.Errorf("confirming clone %s readiness: %w", datasetName, lastErr)
+}
+
+// cloneReadinessExhaustedStatus maps a confirmCloneReady exhaustion to the gRPC
+// code the external-provisioner retries in background. A genuine readiness miss
+// is codes.Unavailable: external-provisioner v6.3.0 checkError maps Internal to
+// ProvisioningFinished (terminal), which would abandon a clone that simply needs
+// a moment to become queryable, whereas Unavailable maps to
+// ProvisioningInBackground. A context cancellation or deadline is preserved as the
+// actual cause so the CO sees the real reason rather than a generic Unavailable.
+func cloneReadinessExhaustedStatus(ctx context.Context, datasetName string, err error) error {
+	code := codes.Unavailable
+	switch {
+	case ctx.Err() == context.Canceled || errors.Is(err, context.Canceled):
+		code = codes.Canceled
+	case ctx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded):
+		code = codes.DeadlineExceeded
+	}
+	return status.Errorf(code, "failed waiting for cloned volume %s to become ready: %v", datasetName, err)
+}
+
 func (d *Driver) handleVolumeContentSource(
 	ctx context.Context,
 	datasetName, volumeName string,
@@ -2354,7 +2584,6 @@ func (d *Driver) handleVolumeContentSource(
 	shareType ShareType,
 	detached bool,
 	detachedCopyJobID *int64,
-	snapshotCloneMarker **inflightMarker,
 ) (*truenas.Dataset, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
 	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
@@ -2396,10 +2625,6 @@ func (d *Driver) handleVolumeContentSource(
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
 			return nil, markerWriteErr
 		}
-		if !detached && snapshotCloneMarker != nil {
-			markerCopy := marker
-			*snapshotCloneMarker = &markerCopy
-		}
 		if detached {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
 			jobID, copyErr := d.truenasClient.CopyDatasetFromSnapshotLocal(ctx, snap.Dataset, snap.Name, datasetName)
@@ -2439,18 +2664,15 @@ func (d *Driver) handleVolumeContentSource(
 			klog.Infof("Snapshot clone created: %s -> %s", sourceSnapshot, datasetName)
 		}
 
-		// Wait for the new dataset to be ready before proceeding.
-		// This is critical for iSCSI/NVMe-oF where extent creation needs the zvol
-		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
-		if err != nil {
-			if detached {
+		if detached {
+			// Detached snapshot copies use the replication path, which the L1b
+			// synchronous-clone probe did NOT cover; keep the (L1a-tuned) readiness
+			// poll. prepareDetachedSnapshotCopy needs the dataset.
+			createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
+			if err != nil {
 				d.cleanupFailedClone(ctx, datasetName, "")
 				return nil, status.Errorf(codes.Internal, "failed waiting for detached snapshot copy to become ready: %v", err)
 			}
-			return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
-				status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err))
-		}
-		if detached {
 			createdDS, err = d.prepareDetachedSnapshotCopy(
 				ctx, datasetName, createdDS, volumeName, snapshotID, snap.Name, capacityBytes, shareType,
 			)
@@ -2459,19 +2681,60 @@ func (d *Driver) handleVolumeContentSource(
 				return nil, err
 			}
 		} else {
-			var refquota interface{}
-			if createdDS.Type == "FILESYSTEM" && d.config.ZFS.DatasetEnableQuotas && capacityBytes > 0 {
-				refquota = capacityBytes
-			}
-			if createdDS.Type == "VOLUME" {
+			// Sprint 3 (L1b): TrueNAS 26.0 pool.snapshot.clone is synchronously
+			// queryable (probe-verified: 10/10 clones immediately queryable, zero
+			// retries). Zvol clones confirm volsize with a single bounded get; this is
+			// critical for iSCSI/NVMe-oF where extent creation needs the volsize.
+			// Filesystem clones trust the clone response and take their dataset from
+			// the merged property update below — no readiness round trip at all.
+			if shareType.IsBlockProtocol() {
+				createdDS, err = d.confirmCloneReady(ctx, datasetName, cloneReadyTimeout, true)
+				if err != nil {
+					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
+						cloneReadinessExhaustedStatus(ctx, datasetName, err))
+				}
 				if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
 					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, err)
 				}
 			}
-			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, map[string]string{
+			// The clone's dataset type is fixed by the share type (NFS->filesystem,
+			// block->zvol), so the filesystem refquota decision no longer needs a
+			// readiness read of createdDS.Type.
+			var refquota interface{}
+			if !shareType.IsBlockProtocol() && d.config.ZFS.DatasetEnableQuotas && capacityBytes > 0 {
+				refquota = capacityBytes
+			}
+			// Sprint 3 (L2a): refquota + content-source identity + the ownership
+			// stamp persist in ONE atomic pool.dataset.update (single ZFS txg;
+			// DatasetUpdate sets every user property atomically). This REMOVES the
+			// old content-source-vs-ownership crash window by making the two durable
+			// simultaneously rather than weakening it: a crash before this write
+			// leaves marker+clone with no ownership (recoverable, identical to the
+			// old "crash before #7"); a crash after it leaves a complete owned volume
+			// with the marker still present, which the reconciler sweep retires
+			// (identical to the old "crash after #8, before #9"). The marker is still
+			// written before the clone and retired only after this write is durable.
+			// For filesystem clones this update also yields the createdDS the caller
+			// publishes (L1b removed their separate readiness read).
+			//
+			// Sprint 6 (H1): a CHAP-resolved iSCSI clone folds its durable CHAP
+			// policy (PropISCSIAuthTag + PropISCSIAuthMode) into this SAME atomic
+			// write, so ownership + content-source + CHAP become durable in one txg
+			// — matching the fresh path, which stamps CHAP atomically with
+			// ownership. Without this, a crash between the early ownership fold and
+			// the late fatal managed-property stamp left an owned dataset with
+			// stored CHAP=NONE; guardExistingISCSICHAPPolicy then rejected every
+			// retry forever (stored NONE vs request CHAP), wedging the PVC. nil for
+			// non-CHAP requests, so non-CHAP clones are byte-for-byte unchanged.
+			foldProps := map[string]string{
 				PropVolumeContentSourceType: "snapshot",
 				PropVolumeContentSourceID:   snapshotID,
-			})
+				PropDriverInstanceID:        d.driverInstanceID(),
+			}
+			for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+				foldProps[key] = value
+			}
+			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, foldProps)
 			if updateErr != nil {
 				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, updateErr)
 			}
@@ -2536,11 +2799,14 @@ func (d *Driver) handleVolumeContentSource(
 		}
 		klog.Infof("Volume clone created: %s -> %s", sourceVolumeID, datasetName)
 
-		// Wait for cloned dataset to be ready
-		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
+		// Sprint 3 (L1b): the volume clone descends from pool.snapshot.clone (via the
+		// temporary source snapshot), which the probe verified is synchronously
+		// queryable. Confirm with a single bounded get instead of an exponential poll;
+		// the dataset is still fetched here because ensureCloneCapacity needs it.
+		createdDS, err = d.confirmCloneReady(ctx, datasetName, cloneReadyTimeout, shareType.IsBlockProtocol())
 		if err != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
-			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
+			return nil, cloneReadinessExhaustedStatus(ctx, datasetName, err)
 		}
 		if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
@@ -2548,14 +2814,45 @@ func (d *Driver) handleVolumeContentSource(
 		}
 
 		// Include origin snapshot so it can be cleaned up when the clone is deleted.
-		if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+		// Sprint 3 (L2a): the ownership stamp folds into this same content-source
+		// write so content-source identity and ownership become durable in one atomic
+		// pool.dataset.update (single txg), removing the intermediate state where one
+		// existed without the other. The marker is still retired only after this write
+		// succeeds (see the shared ownership gate in CreateVolume).
+		//
+		// Sprint 3 fix: this fold MUST be response-verifying. The ownership stamp is
+		// the only thing that makes the clone recoverable, so an acknowledged update
+		// that silently dropped PropDriverInstanceID would otherwise let CreateVolume
+		// retire the in-flight marker and strand a markerless/ownerless dataset that
+		// is invisible to marker recovery AND remnant GC AND the managed-keyed list —
+		// a permanent invisible leak. setAndVerifyDatasetUserProperties checks every
+		// key (ownership included) against the update RESPONSE with no extra round
+		// trip, matching the snapshot-clone fold and the stampAndMirror contract that
+		// ownership stamps never use the non-verifying path. A verification failure
+		// returns before CreateVolume retires the marker, and cleanupFailedClone keeps
+		// the marker unless the destination is verifiably gone, so no markerless
+		// remnant is ever left behind. The verified dataset is the one published.
+		//
+		// Sprint 6 (H1): a CHAP-resolved iSCSI volume clone folds its durable CHAP
+		// policy into this same atomic write (see the snapshot-clone fold above for
+		// the full crash-window rationale), so ownership + content-source + CHAP are
+		// durable in one txg and a crash before the late fatal stamp can no longer
+		// wedge guardExistingISCSICHAPPolicy. nil for non-CHAP requests.
+		foldProps := map[string]string{
 			PropVolumeContentSourceType: "volume",
 			PropVolumeContentSourceID:   sourceVolumeID,
 			PropVolumeOriginSnapshot:    snap.ID,
-		}); err != nil {
-			d.cleanupFailedClone(ctx, datasetName, snap.ID)
-			return nil, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", err)
+			PropDriverInstanceID:        d.driverInstanceID(),
 		}
+		for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+			foldProps[key] = value
+		}
+		verified, updateErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, foldProps)
+		if updateErr != nil {
+			d.cleanupFailedClone(ctx, datasetName, snap.ID)
+			return nil, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", updateErr)
+		}
+		createdDS = verified
 	}
 
 	return createdDS, nil
@@ -2621,7 +2918,7 @@ func (d *Driver) guardedCleanupFailedSnapshotClone(
 	if getErr != nil {
 		if truenas.IsNotFoundError(getErr) {
 			d.cleanupFailedClone(ctx, datasetName, "")
-			return status.Errorf(codes.Internal, "failed snapshot clone %s: %v", datasetName, cause)
+			return snapshotCloneFailureStatus(datasetName, cause)
 		}
 		return status.Errorf(codes.Aborted,
 			"cannot verify failed snapshot clone %s before cleanup; refusing delete and retry CreateVolume: %v",
@@ -2650,7 +2947,22 @@ func (d *Driver) guardedCleanupFailedSnapshotClone(
 			datasetName, cause)
 	}
 	d.cleanupFailedClone(ctx, datasetName, "")
-	return status.Errorf(codes.Internal, "failed snapshot clone %s: %v", datasetName, cause)
+	return snapshotCloneFailureStatus(datasetName, cause)
+}
+
+// snapshotCloneFailureStatus builds the terminal status for a failed snapshot
+// clone that guardedCleanupFailedSnapshotClone has proven safe to clean up. It
+// preserves the cause's gRPC code when the cause already carries one — so a
+// readiness exhaustion stays codes.Unavailable, which external-provisioner v6.3.0
+// retries in background — and defaults to codes.Internal for raw backend errors
+// (the merged-update and capacity failures). The Aborted lost-race returns above
+// never route through here.
+func snapshotCloneFailureStatus(datasetName string, cause error) error {
+	code := codes.Internal
+	if st, ok := status.FromError(cause); ok && st.Code() != codes.Unknown {
+		code = st.Code()
+	}
+	return status.Errorf(code, "failed snapshot clone %s: %v", datasetName, cause)
 }
 
 func datasetPropertyBytes(property truenas.DatasetProperty) int64 {

@@ -645,7 +645,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			return nil, err
 		}
 	case ShareTypeISCSI:
-		if err := d.stageISCSIVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+		if err := d.stageISCSIVolume(ctx, volumeContext, req.GetSecrets(), stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	case ShareTypeNVMeoF:
@@ -691,7 +691,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
 	}
 
-	klog.Infof("NodeUnstageVolume: volumeID=%s, stagingPath=%s", volumeID, stagingPath)
+	klog.V(2).Infof("NodeUnstageVolume: volumeID=%s, stagingPath=%s", volumeID, stagingPath)
 
 	// Lock on volume ID
 	lockKey := nodeVolumeLockKey(volumeID)
@@ -759,7 +759,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI)
 		}
 		d.deleteStageRecord(stagingPath)
-		klog.Infof("Volume %s unstaged successfully", volumeID)
+		klog.V(2).Infof("Volume %s unstaged successfully", volumeID)
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
@@ -811,7 +811,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	}
 
 	d.deleteStageRecord(stagingPath)
-	klog.Infof("Volume %s unstaged successfully", volumeID)
+	klog.V(2).Infof("Volume %s unstaged successfully", volumeID)
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -1020,7 +1020,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 		return nil, status.Error(codes.InvalidArgument, "target path is required")
 	}
 
-	klog.Infof("NodeUnpublishVolume: volumeID=%s, targetPath=%s", volumeID, targetPath)
+	klog.V(2).Infof("NodeUnpublishVolume: volumeID=%s, targetPath=%s", volumeID, targetPath)
 
 	// Lock on volume ID
 	lockKey := nodeVolumeLockKey(volumeID)
@@ -1055,7 +1055,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	}
 	d.deletePublicationRecord(targetPath)
 
-	klog.Infof("Volume %s unpublished successfully", volumeID)
+	klog.V(2).Infof("Volume %s unpublished successfully", volumeID)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -1072,6 +1072,22 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 	}
 
 	klog.V(4).Infof("NodeGetVolumeStats: volumeID=%s, volumePath=%s", volumeID, volumePath)
+
+	// Bounded liveness pre-gate, run BEFORE any unix.Stat on volumePath. For a
+	// filesystem (NFS/remote) volume volumePath is the mountpoint, and unix.Stat
+	// on the root of a dead hard mount issues a GETATTR that blocks in
+	// uninterruptible D-state indefinitely — the exact hazard this gate closes.
+	// The findmnt-backed check reads the kernel mount table (never the filesystem
+	// itself) and is bounded by both the configured mount timeout and the kubelet's
+	// inbound RPC deadline, so it cannot itself hang; if it cannot confirm the path
+	// promptly we report an abnormal condition instead of touching it. Ordering it
+	// ahead of device resolution means a dead mount can hang NEITHER stat (in the
+	// resolver) NOR the statfs below. Block-device paths are not mountpoints, so
+	// the check returns not-mounted with no error and falls through to the fast
+	// local device stat. No new TrueNAS API calls are involved.
+	if _, mountErr := nodeStatsMountCheck(ctx, volumePath); mountErr != nil {
+		return abnormalVolumeStatsResponse(fmt.Sprintf("mount unresponsive for %s: %v", volumePath, mountErr)), nil
+	}
 
 	devicePath, blockMode, err := resolveNodeStatsDevice(volumePath)
 	if err != nil {
@@ -1094,7 +1110,7 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 		}, nil
 	}
 
-	// Get filesystem stats
+	// Get filesystem stats (mount liveness was already gated above, before stat).
 	stats, err := getNodeFilesystemStats(volumePath)
 	if err != nil {
 		return abnormalVolumeStatsResponse(fmt.Sprintf("failed to get filesystem stats for %s: %v", volumePath, err)), nil
@@ -1513,7 +1529,7 @@ func (d *Driver) finalizeStagedDevice(ctx context.Context, devicePath, stagingPa
 }
 
 // stageISCSIVolume connects and mounts an iSCSI volume to the staging path.
-func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
+func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext, secrets map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for iSCSI staging")
 	}
@@ -1567,14 +1583,45 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext map[string]
 		relist:      util.ListISCSISessions,
 	}, iqn, stagingPath, sessions)
 
+	// Build node-side CHAP credentials from the volume context mode flag and the
+	// node-stage secret. nil means CHAP is off for this volume and the connect
+	// path applies no auth params (zero behavior change). A CHAP volume with a
+	// missing/invalid secret fails fast here with InvalidArgument rather than
+	// letting iscsiadm enter a login retry storm.
+	chapCreds, err := nodeISCSIChAPCredentials(volumeContext, secrets)
+	if err != nil {
+		// Aid debugging without leaking: log the REDACTED secret key set (values
+		// masked by redactCHAP) alongside the sanitized validation error.
+		klog.V(4).Infof("iSCSI CHAP credential validation failed for %s (secret keys: %v): %v",
+			iqn, redactCHAP(secrets), err)
+		return err
+	}
+
 	// Connect to iSCSI target with configurable timeout
 	connectOpts := &util.ISCSIConnectOptions{
 		DeviceTimeout:       time.Duration(d.config.ISCSI.DeviceWaitTimeout) * time.Second,
 		SessionCleanupDelay: time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond,
+		CHAP:                chapCreds,
 	}
 	devicePath, err := iscsiConnectWithSessions(ctx, portal, iqn, lun, connectOpts, sessions)
 	if err != nil {
 		RecordNodeConnect("iscsi", "error")
+		if errors.Is(err, util.ErrISCSIAuthFailure) {
+			// A wrong CHAP secret is terminal and must not retry. Return
+			// Unauthenticated with a redacted message (no credential, no raw
+			// iscsiadm output) so kubelet surfaces a clean failure.
+			operationErr := status.Errorf(codes.Unauthenticated, "iSCSI CHAP authentication failed for %s", iqn)
+			d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSILoginFailed, operationErr.Error())
+			return operationErr
+		}
+		if errors.Is(err, util.ErrISCSICHAPConfig) {
+			// CHAP credentials could not be applied to the node record before login.
+			// The wrapped error is already redacted (parameter name + exit class only,
+			// never the secret value), so it is safe to surface on the PVC/PV (E3/O15).
+			operationErr := status.Errorf(codes.Internal, "failed to configure iSCSI CHAP for %s", iqn)
+			d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSICHAPFailed, "CHAP configuration failed: "+err.Error())
+			return operationErr
+		}
 		operationErr := status.Errorf(codes.Internal, "failed to connect iSCSI: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSILoginFailed, operationErr.Error())
 		return operationErr

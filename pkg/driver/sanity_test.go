@@ -19,10 +19,12 @@ import (
 )
 
 var (
-	nfsSanityConfig    = sanity.NewTestConfig()
-	iscsiSanityConfig  = sanity.NewTestConfig()
-	nfsSanityContext   *sanity.TestContext
-	iscsiSanityContext *sanity.TestContext
+	nfsSanityConfig        = sanity.NewTestConfig()
+	iscsiSanityConfig      = sanity.NewTestConfig()
+	iscsiCHAPSanityConfig  = sanity.NewTestConfig()
+	nfsSanityContext       *sanity.TestContext
+	iscsiSanityContext     *sanity.TestContext
+	iscsiCHAPSanityContext *sanity.TestContext
 )
 
 var _ = Describe("scale-csi conformance", func() {
@@ -47,6 +49,22 @@ var _ = Describe("scale-csi conformance", func() {
 			iscsiSanityContext = sanity.GinkgoTest(&iscsiSanityConfig)
 		})
 	})
+
+	Context("iSCSI CHAP controller only", func() {
+		BeforeEach(func() {
+			// The CHAP controller surface exercises CreateVolume/DeleteVolume secret
+			// handling (provisioner-secret ensures the iscsi.auth peer + stamps the
+			// group authmethod). The Node Service specs stay skipped for the same
+			// reason as the plain iSCSI suite: they need a real block device.
+			if strings.Contains(CurrentSpecReport().FullText(), "Node Service") {
+				Skip("iSCSI CHAP node tests require a real block device and root privileges")
+			}
+		})
+
+		Describe("official csi-sanity suite", func() {
+			iscsiCHAPSanityContext = sanity.GinkgoTest(&iscsiCHAPSanityConfig)
+		})
+	})
 })
 
 func TestCSISanity(t *testing.T) {
@@ -58,14 +76,22 @@ func TestCSISanity(t *testing.T) {
 	installSanityNodeCommands(t)
 	testRoot := t.TempDir()
 
-	nfsEndpoint := startSanityDriver(t, filepath.Join(testRoot, "nfs.sock"), "nfs", true)
+	nfsEndpoint := startSanityDriver(t, filepath.Join(testRoot, "nfs.sock"), "nfs", true, false)
 	// The Node service is registered only so controller publish checks can obtain
 	// and validate a node ID. The iSCSI Node Service specs are skipped below and
 	// no block-device operation is executed.
-	iscsiEndpoint := startSanityDriver(t, filepath.Join(testRoot, "iscsi.sock"), "iscsi", true)
+	iscsiEndpoint := startSanityDriver(t, filepath.Join(testRoot, "iscsi.sock"), "iscsi", true, false)
+	// CHAP is opt-in; a separate controller-only driver keeps the default
+	// (non-CHAP) iSCSI suite unchanged while exercising the CHAP secret surface.
+	iscsiCHAPEndpoint := startSanityDriver(t, filepath.Join(testRoot, "iscsi-chap.sock"), "iscsi", true, true)
 
 	configureSanityTest(&nfsSanityConfig, filepath.Join(testRoot, "nfs"), nfsEndpoint, "nfs")
 	configureSanityTest(&iscsiSanityConfig, filepath.Join(testRoot, "iscsi"), iscsiEndpoint, "iscsi")
+	configureSanityTest(&iscsiCHAPSanityConfig, filepath.Join(testRoot, "iscsi-chap"), iscsiCHAPEndpoint, "iscsi")
+	// Opt this context into CHAP: the provisioner + node-stage secret carry a
+	// valid 12-16 char credential and the StorageClass parameter requests it.
+	iscsiCHAPSanityConfig.TestVolumeParameters[paramISCSIChAPSecret] = "true"
+	iscsiCHAPSanityConfig.SecretsFile = writeSanityCHAPSecretsFile(t, testRoot)
 
 	RegisterFailHandler(Fail)
 	defer func() {
@@ -75,8 +101,31 @@ func TestCSISanity(t *testing.T) {
 		if iscsiSanityContext != nil {
 			iscsiSanityContext.Finalize()
 		}
+		if iscsiCHAPSanityContext != nil {
+			iscsiCHAPSanityContext.Finalize()
+		}
 	}()
 	RunSpecs(t, "scale-csi csi-sanity suite")
+}
+
+// writeSanityCHAPSecretsFile writes a csi-sanity secrets YAML providing the CHAP
+// provisioner and node-stage credentials. Node specs are skipped, so only the
+// CreateVolume/DeleteVolume controller path consumes CreateVolumeSecret; the
+// NodeStage entry is included for completeness and future node coverage.
+func writeSanityCHAPSecretsFile(t *testing.T, root string) string {
+	t.Helper()
+	path := filepath.Join(root, "chap-secrets.yaml")
+	content := "" +
+		"CreateVolumeSecret:\n" +
+		"  username: sanitychapusr\n" +
+		"  password: sanitychap123\n" +
+		"NodeStageVolumeSecret:\n" +
+		"  username: sanitychapusr\n" +
+		"  password: sanitychap123\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write CHAP sanity secrets: %v", err)
+	}
+	return path
 }
 
 func configureSanityTest(config *sanity.TestConfig, root, endpoint, protocol string) {
@@ -116,11 +165,17 @@ func checkSanityPath(path string) (sanity.PathKind, error) {
 	return sanity.PathIsOther, nil
 }
 
-func startSanityDriver(t *testing.T, socketPath, protocol string, runNode bool) string {
+func startSanityDriver(t *testing.T, socketPath, protocol string, runNode, chap bool) string {
 	t.Helper()
 
 	endpoint := "unix://" + socketPath
 	config := sanityDriverConfig(protocol)
+	if chap {
+		// A distinct parent dataset keeps this CHAP driver's backend objects
+		// isolated from the plain iSCSI driver sharing the same mock package.
+		config.ZFS.DatasetParentName = "tank/csi-sanity/" + protocol + "-chap"
+		config.ISCSI.CHAP = ISCSICHAPSettings{Enabled: true}
+	}
 
 	// NewDriver constructs all production wiring. Replace only its external
 	// TrueNAS boundary with the repository's stateful mock via the client

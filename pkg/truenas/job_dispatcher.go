@@ -227,6 +227,16 @@ func (c *Client) anyConnectionJobSubscribed() bool {
 	return false
 }
 
+// AnyConnectionJobSubscribed reports whether at least one pooled connection
+// holds a live core.get_jobs subscription. The driver health tick publishes it
+// as scale_csi_job_dispatcher_subscribed; false means pure-poll fallback.
+func (c *Client) AnyConnectionJobSubscribed() bool {
+	if c == nil {
+		return false
+	}
+	return c.anyConnectionJobSubscribed()
+}
+
 func (c *Client) jobSubscriptionSignal() <-chan struct{} {
 	c.jobSubscriptionMu.Lock()
 	defer c.jobSubscriptionMu.Unlock()

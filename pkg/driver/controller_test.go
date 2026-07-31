@@ -112,19 +112,55 @@ type silentCloneOwnerUpdateMock struct {
 }
 
 func (m *silentCloneOwnerUpdateMock) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
-	if len(params.UserPropertiesUpdate) == 1 &&
-		params.UserPropertiesUpdate[0].Key == PropDriverInstanceID &&
-		params.UserPropertiesUpdate[0].Value != "" &&
-		!params.UserPropertiesUpdate[0].Remove {
-		// Model an acknowledged pool.dataset.update whose ownership write did not
-		// persist: strip it so the update response — which
-		// setAndVerifyDatasetUserProperties now trusts — lacks source=local
-		// ownership and verification fails before any share is created.
-		stripped := *params
-		stripped.UserPropertiesUpdate = nil
+	// Model an acknowledged pool.dataset.update whose ownership write did not
+	// persist. Since Sprint 3 L2a the ownership stamp shares the merged
+	// content-source+refquota update, so strip PropDriverInstanceID from any
+	// update that carries it (folded or alone) while letting the other keys
+	// persist; the trusted update response then lacks source=local ownership and
+	// verification fails before any share is created. The first clone-path update
+	// carrying ownership is the merged content-source write, so that is where the
+	// driver detects the loss and guard-cleans the clone.
+	stripped := *params
+	stripped.UserPropertiesUpdate = nil
+	sawOwner := false
+	for _, update := range params.UserPropertiesUpdate {
+		if update.Key == PropDriverInstanceID && update.Value != "" && !update.Remove {
+			sawOwner = true
+			continue
+		}
+		stripped.UserPropertiesUpdate = append(stripped.UserPropertiesUpdate, update)
+	}
+	if sawOwner {
 		return m.MockClient.DatasetUpdate(ctx, name, &stripped)
 	}
 	return m.MockClient.DatasetUpdate(ctx, name, params)
+}
+
+// silentVolumeCloneOwnerDropMock reproduces the Sprint 3 volume-clone crash state:
+// an acknowledged pool.dataset.update that silently drops ONLY PropDriverInstanceID
+// (inherited from silentCloneOwnerUpdateMock) while the failed clone's destroy also
+// fails, so the ownerless remnant survives exactly as it would after a crash mid
+// cleanup. The crash test asserts the driver keeps the in-flight marker for this
+// remnant rather than retiring it — a markerless/ownerless dataset would be
+// invisible to marker recovery, remnant GC, and the managed-keyed list.
+type silentVolumeCloneOwnerDropMock struct {
+	*silentCloneOwnerUpdateMock
+}
+
+func (m *silentVolumeCloneOwnerDropMock) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
+	return fmt.Errorf("simulated destroy failure for %s", name)
+}
+
+// absentNFSCloneMock models a pool.snapshot.clone that acknowledges success but
+// silently creates nothing. pool.dataset.update is update-only (never a create),
+// so the merged content-source write against the absent dataset fails loudly with
+// "dataset not found" — the behavior the silently-absent-NFS-clone test pins.
+type absentNFSCloneMock struct {
+	*truenas.MockClient
+}
+
+func (m *absentNFSCloneMock) SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error {
+	return nil
 }
 
 type silentDatasetPropertyUpdateMock struct {
@@ -147,11 +183,18 @@ func (m *datasetCreateCaptureMock) DatasetCreate(ctx context.Context, params *tr
 	return m.MockClient.DatasetCreate(ctx, params)
 }
 
-func (m *clonePropertyFailureMock) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
-	if _, authoritative := properties[PropVolumeOriginSnapshot]; authoritative {
-		return m.err
+func (m *clonePropertyFailureMock) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
+	// The volume-clone content-source write is a response-verifying
+	// pool.dataset.update (Sprint 3 fix folded ownership into it and made it
+	// verifying), so inject the failure there when the update carries the
+	// authoritative origin-snapshot key. The marker write's update carries only the
+	// marker key and is left alone.
+	for _, update := range params.UserPropertiesUpdate {
+		if update.Key == PropVolumeOriginSnapshot {
+			return nil, m.err
+		}
 	}
-	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
+	return m.MockClient.DatasetUpdate(ctx, name, params)
 }
 
 type originSnapshotDeleteFailureMock struct {

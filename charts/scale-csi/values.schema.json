@@ -163,6 +163,13 @@
         },
         "extraParameters": {
           "$ref": "#/definitions/stringMap"
+        },
+        "chapSecretName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chapSecretNamespace": {
+          "type": "string"
         }
       }
     }
@@ -177,6 +184,31 @@
     "csiDriverName": {
       "type": "string",
       "minLength": 1
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "forImmediateBinding": {
+          "type": "boolean"
+        },
+        "reportMaximumVolumeSize": {
+          "type": "boolean"
+        },
+        "gaugeEnabled": {
+          "type": "boolean"
+        },
+        "gaugeInterval": {
+          "type": "string",
+          "pattern": "^([0-9]+(ms|s|m|h))+$",
+          "not": {
+            "pattern": "^(0+(ms|s|m|h))+$"
+          }
+        }
+      }
     },
     "driverInstanceId": {
       "type": "string"
@@ -456,6 +488,14 @@
         "maxConcurrentRequests": {
           "type": "integer",
           "minimum": 1
+        },
+        "maxConnections": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 16
         }
       },
       "not": {
@@ -590,6 +630,7 @@
           ]
         },
         "extentAvailThreshold": {
+          "description": "DEPRECATED, ignored. Retained only so old values files pass validation.",
           "type": "integer",
           "minimum": 0,
           "maximum": 100
@@ -601,6 +642,22 @@
         "serviceReloadDebounce": {
           "type": "integer",
           "minimum": 0
+        },
+        "chap": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "tag": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "mutual": {
+              "type": "boolean"
+            }
+          }
         },
         "targetGroups": {
           "type": "array",
@@ -660,6 +717,7 @@
           "type": "boolean"
         },
         "commandTimeout": {
+          "description": "DEPRECATED, ignored; the nvme CLI timeout is commandTimeouts.nvme. Retained only so old values files pass validation.",
           "type": "integer",
           "minimum": 1
         }
@@ -739,6 +797,30 @@
         },
         "livenessProbe": {
           "$ref": "#/definitions/sidecar"
+        },
+        "healthMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "string",
+              "minLength": 1
+            },
+            "interval": {
+              "type": "string",
+              "pattern": "^([0-9]+(ms|s|m|h))+$",
+              "not": {
+                "pattern": "^(0+(ms|s|m|h))+$"
+              }
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
         }
       }
     },
@@ -843,6 +925,11 @@
                 "type": "object",
                 "additionalProperties": true
               }
+            },
+            "poolUsageThreshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
             }
           }
         },
@@ -870,7 +957,10 @@
         },
         "interval": {
           "type": "string",
-          "minLength": 2
+          "pattern": "^([0-9]+(s|m|h))+$",
+          "not": {
+            "pattern": "^(0+(s|m|h))+$"
+          }
         },
         "minOrphanAge": {
           "type": "string",
@@ -1020,6 +1110,7 @@
           "additionalProperties": false,
           "properties": {
             "maxConcurrentRequests": {
+              "description": "DEPRECATED, ignored. Retained only so old values files pass validation; the API concurrency limit is truenas.maxConcurrentRequests.",
               "type": "integer",
               "minimum": 1
             },

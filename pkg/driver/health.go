@@ -184,6 +184,10 @@ func (h *HealthServer) checkHealth() HealthStatus {
 				TotalCircuitOpens: cbStats.TotalCircuitOpens,
 			}
 		}
+
+		// Publish the job-dispatcher subscription bit so a degraded pure-poll
+		// fallback (higher API load + latency) is observable (E2/O7).
+		SetJobDispatcherSubscribed(h.driver.truenasClient.AnyConnectionJobSubscribed())
 	}
 
 	h.lastCheck = time.Now()

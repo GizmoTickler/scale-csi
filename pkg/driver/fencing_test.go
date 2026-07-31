@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -984,6 +986,37 @@ func TestAdditiveNFSPublishFailsWhenBackendLiveProvenanceExceedsCap(t *testing.T
 		require.NoError(t, err)
 		assert.Equal(t, liveHosts, records[publicationPropertyKey("worker-a")].CSIAddedNFSHosts,
 			"backend-live provenance must be fully preserved by a refused publish")
+	})
+
+	// O14: the publish-blocking refusal must surface as a Warning Event on the PV.
+	t.Run("overflow refusal emits a FencingProvenanceOverflow event", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		d := newNFSDriver(client)
+		fakeRecorder := record.NewFakeRecorder(8)
+		d.eventRecorder = &EventRecorder{
+			recorder:  fakeRecorder,
+			clientset: kubernetesfake.NewSimpleClientset(),
+			enabled:   true,
+		}
+		buildVolume(t, client, "nfs-provenance-overflow-event", additiveGrantHardCap+3)
+
+		err := publish(d, "nfs-provenance-overflow-event")
+		require.Error(t, err)
+		require.Equal(t, codes.ResourceExhausted, status.Code(err))
+
+		saw := false
+	drain:
+		for {
+			select {
+			case event := <-fakeRecorder.Events:
+				if strings.Contains(event, EventReasonFencingProvenanceOverflow) {
+					saw = true
+				}
+			default:
+				break drain
+			}
+		}
+		assert.True(t, saw, "overflow refusal must emit a FencingProvenanceOverflow event on the PV")
 	})
 
 	t.Run("over cap with dead entries resolves through compaction", func(t *testing.T) {
@@ -2436,6 +2469,57 @@ func TestCreateVolumeCloneOwnershipUpdateMustPersistBeforeShareCreation(t *testi
 	assert.Empty(t, client.NFSShares, "ownership must be verified before any share is created")
 	_, getErr := client.DatasetGet(ctx, "pool/parent/clone-owner-verify")
 	require.Error(t, getErr, "a clone whose ownership could not be proven is cleaned up")
+}
+
+// TestCreateVolumeCloneFromVolumeOwnershipDropKeepsMarker pins the Sprint 3 fix for
+// the volume-clone ownership fold. Before the fix the volume-clone content-source
+// write was non-verifying (stampAndMirror), so an acknowledged update that silently
+// dropped PropDriverInstanceID let CreateVolume retire the in-flight marker and
+// strand a markerless/ownerless dataset — a permanent invisible leak unreachable by
+// marker recovery, remnant GC, or the managed-keyed list. The mock drops ONLY the
+// ownership key from the merged update response and fails the cleanup destroy so the
+// ownerless remnant survives; the driver must FAIL CreateVolume before marker
+// retirement and KEEP the marker so the remnant stays recoverable.
+func TestCreateVolumeCloneFromVolumeOwnershipDropKeepsMarker(t *testing.T) {
+	ctx := context.Background()
+	client := &silentVolumeCloneOwnerDropMock{
+		silentCloneOwnerUpdateMock: &silentCloneOwnerUpdateMock{MockClient: truenas.NewMockClient()},
+	}
+	mustCreateParentDataset(t, client.MockClient)
+	d := newComplianceTestDriver(client)
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/volume-clone-source", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+
+	const volumeID = "clone-from-volume-owner-drop"
+	datasetName := "pool/parent/" + volumeID
+	_, err = d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               volumeID,
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "volume-clone-source"},
+		}},
+	})
+	// The verifying fold rejects the silent ownership drop ...
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "did not persist locally")
+	// ... before any share is created ...
+	assert.Empty(t, client.NFSShares, "ownership must be verified before any share is created")
+	// ... and the failed cleanup destroy leaves the ownerless remnant behind ...
+	remnant, getErr := client.DatasetGet(ctx, datasetName)
+	require.NoError(t, getErr, "the simulated destroy failure keeps the remnant dataset")
+	assert.False(t, datasetHasLocalOwnershipStamp(remnant),
+		"the dropped ownership key must not appear local on the remnant")
+	// ... but the in-flight marker MUST survive: this is the exact state the old
+	// non-verifying path turned into an unrecoverable markerless leak.
+	marker, markerErr := d.readInflightMarker(ctx, volumeID)
+	require.NoError(t, markerErr)
+	require.NotNil(t, marker, "a surviving ownerless volume-clone remnant must keep its in-flight marker")
+	assert.Equal(t, datasetName, marker.Dataset)
 }
 
 func TestCreateVolumePostCreateOwnershipUpdateMustPersist(t *testing.T) {

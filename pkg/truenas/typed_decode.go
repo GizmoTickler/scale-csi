@@ -11,7 +11,14 @@ type rawProperty struct {
 	Parsed   interface{} `json:"parsed"`
 	Rawvalue string      `json:"rawvalue"`
 	Raw      string      `json:"raw"`
-	Source   string      `json:"source"`
+	// Source is a string on pool.dataset.query but an OBJECT {type,value} on
+	// zfs.resource.query native properties (TrueNAS 26.0). The legacy
+	// parseProperty dropped non-string sources; a plain string field instead
+	// hard-failed the whole decode, silently degrading every managed-dataset
+	// listing to the pool.dataset.query fallback since v1.3.0 (found live in
+	// the 2026-07-31 drill; prod logged the fallback 125x/24h). tolerantString
+	// restores the legacy drop-if-not-string semantics.
+	Source tolerantString `json:"source"`
 }
 
 func (p rawProperty) toDatasetProperty() DatasetProperty {
@@ -19,7 +26,7 @@ func (p rawProperty) toDatasetProperty() DatasetProperty {
 		Value:    p.Value,
 		Parsed:   p.Parsed,
 		Rawvalue: p.Rawvalue,
-		Source:   p.Source,
+		Source:   string(p.Source),
 	}
 }
 
@@ -79,7 +86,11 @@ func (p rawUserProperty) toUserProperty() UserProperty {
 
 type rawSnapshot struct {
 	Snapshot
-	SnapshotName      string                 `json:"snapshot_name"`
+	// SnapshotName is a pointer so present-but-empty is distinguishable from
+	// absent: the legacy parseSnapshot overwrites Name whenever the key is
+	// PRESENT (even with ""), and the typed decoder must match it exactly
+	// (2026-07-31 differential-fuzz find).
+	SnapshotName      *string                `json:"snapshot_name"`
 	CreateTXGRaw      rawUnsigned            `json:"createtxg"`
 	RawUserProperties map[string]interface{} `json:"user_properties"`
 }
@@ -107,8 +118,8 @@ func (snapshot *rawSnapshot) toSnapshot() *Snapshot {
 	if result.ID == "" && strings.Contains(snapshot.Name, "@") {
 		result.ID = snapshot.Name
 	}
-	if snapshot.SnapshotName != "" {
-		result.Name = snapshot.SnapshotName
+	if snapshot.SnapshotName != nil {
+		result.Name = *snapshot.SnapshotName
 	}
 	if snapshot.CreateTXGRaw.valid {
 		result.CreateTXG = snapshot.CreateTXGRaw.value
@@ -174,7 +185,11 @@ type rawDatasetProperties struct {
 
 func (dataset *rawDataset) toDataset(resourceQuery bool) *Dataset {
 	result := &dataset.Dataset
-	if result.Name == "" {
+	// The path→name fallback is a zfs.resource.query shape concern only:
+	// parseDatasetResource accepts name-or-path, but the legacy parseDataset
+	// (pool.dataset.query) reads only "name". Keep the typed decoder exactly
+	// equivalent to the parser it replaced (2026-07-31 differential-fuzz find).
+	if resourceQuery && result.Name == "" {
 		result.Name = dataset.Path
 	}
 	if resourceQuery && result.ID == "" {

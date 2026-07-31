@@ -59,5 +59,16 @@ parameters:
   {{- if $storageClass.snapshotRestoreMode }}
   {{- $_ := set $parameters "snapshotRestoreMode" $storageClass.snapshotRestoreMode -}}
   {{- end }}
+  {{- /* CHAP: when a per-StorageClass CHAP Secret is named, emit the four CSI
+       secret-ref parameters (provisioner + node-stage). The chart references
+       the Secret by name/namespace only; credential values never appear here.
+       The namespace defaults to the release namespace when left unset. */}}
+  {{- if $storageClass.chapSecretName }}
+  {{- $chapSecretNamespace := $storageClass.chapSecretNamespace | default $root.Release.Namespace -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-name" $storageClass.chapSecretName -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-namespace" $chapSecretNamespace -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-name" $storageClass.chapSecretName -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-namespace" $chapSecretNamespace -}}
+  {{- end }}
   {{- toYaml $parameters | nindent 2 }}
 {{- end }}

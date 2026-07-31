@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
@@ -16,9 +15,85 @@ const (
 	metricsNamespace = "scale_csi"
 )
 
+// metricNames accumulates the fully-qualified name of every metric as it is
+// registered by the reg* helpers below. It is the single source of truth that
+// MetricNames() exposes and that the chart drift test compares dashboard/alert
+// expressions against — registering a metric and naming it can never diverge.
+var metricNames []string
+
+// histogramNames accumulates the fully-qualified base name of every histogram
+// (and summary) metric. The chart drift test uses it to decide whether a
+// generated _bucket/_sum/_count suffix is legal: those series exist ONLY for
+// histogram/summary bases, so `scale_csi_<gauge>_count` must be rejected.
+var histogramNames []string
+
+// recordName appends the metric's fully-qualified name (namespace + name) to
+// metricNames. The name is derived from the SAME opts the collector is built
+// from, so there is no second copy of the name to drift.
+func recordName(namespace, subsystem, name string) {
+	metricNames = append(metricNames, prometheus.BuildFQName(namespace, subsystem, name))
+}
+
+// The reg* helpers replace promauto: they build the collector, register it on
+// the default registerer (identical to promauto), and record its name. A metric
+// added through them is automatically visible to MetricNames().
+
+func regCounter(opts prometheus.CounterOpts) prometheus.Counter {
+	c := prometheus.NewCounter(opts)
+	prometheus.MustRegister(c)
+	recordName(opts.Namespace, opts.Subsystem, opts.Name)
+	return c
+}
+
+func regCounterVec(opts prometheus.CounterOpts, labels []string) *prometheus.CounterVec {
+	c := prometheus.NewCounterVec(opts, labels)
+	prometheus.MustRegister(c)
+	recordName(opts.Namespace, opts.Subsystem, opts.Name)
+	return c
+}
+
+func regGauge(opts prometheus.GaugeOpts) prometheus.Gauge {
+	g := prometheus.NewGauge(opts)
+	prometheus.MustRegister(g)
+	recordName(opts.Namespace, opts.Subsystem, opts.Name)
+	return g
+}
+
+func regGaugeVec(opts prometheus.GaugeOpts, labels []string) *prometheus.GaugeVec {
+	g := prometheus.NewGaugeVec(opts, labels)
+	prometheus.MustRegister(g)
+	recordName(opts.Namespace, opts.Subsystem, opts.Name)
+	return g
+}
+
+func regHistogramVec(opts prometheus.HistogramOpts, labels []string) *prometheus.HistogramVec {
+	h := prometheus.NewHistogramVec(opts, labels)
+	prometheus.MustRegister(h)
+	recordName(opts.Namespace, opts.Subsystem, opts.Name)
+	histogramNames = append(histogramNames, prometheus.BuildFQName(opts.Namespace, opts.Subsystem, opts.Name))
+	return h
+}
+
+// MetricNames returns the fully-qualified names of every metric the driver
+// registers, in registration order. The returned slice is a copy. Adding a
+// metric through the reg* helpers is the ONLY way to make it appear here; the
+// chart drift test fails if a dashboard/alert names anything not in this set.
+func MetricNames() []string {
+	return append([]string(nil), metricNames...)
+}
+
+// HistogramMetricNames returns the fully-qualified base names of every
+// histogram/summary the driver registers, in registration order. The chart
+// drift test uses this set to permit the Prometheus-generated
+// _bucket/_sum/_count suffixes ONLY on histogram bases. The returned slice is a
+// copy.
+func HistogramMetricNames() []string {
+	return append([]string(nil), histogramNames...)
+}
+
 var (
 	// CSI operation metrics
-	csiOperationsTotal = promauto.NewCounterVec(
+	csiOperationsTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "operations_total",
@@ -27,7 +102,7 @@ var (
 		[]string{"operation", "status", "code"},
 	)
 
-	csiOperationsDuration = promauto.NewHistogramVec(
+	csiOperationsDuration = regHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Name:      "operations_duration_seconds",
@@ -38,7 +113,7 @@ var (
 	)
 
 	// TrueNAS API metrics
-	truenasRequestsTotal = promauto.NewCounterVec(
+	truenasRequestsTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "truenas_requests_total",
@@ -47,7 +122,7 @@ var (
 		[]string{"method", "status"},
 	)
 
-	truenasRequestsDuration = promauto.NewHistogramVec(
+	truenasRequestsDuration = regHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Name:      "truenas_requests_duration_seconds",
@@ -58,7 +133,7 @@ var (
 	)
 
 	// Connection metrics
-	truenasConnectionStatus = promauto.NewGauge(
+	truenasConnectionStatus = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "truenas_connection_status",
@@ -66,7 +141,7 @@ var (
 		},
 	)
 
-	truenasConnectionsActive = promauto.NewGauge(
+	truenasConnectionsActive = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "truenas_connections_active",
@@ -74,8 +149,29 @@ var (
 		},
 	)
 
+	// jobDispatcherSubscribed is 1 when at least one pooled connection holds a
+	// live core.get_jobs subscription and 0 when the driver has degraded to the
+	// pure-poll fallback (higher API load + latency). Published from the health
+	// tick off Client.AnyConnectionJobSubscribed (E2/O7).
+	//
+	// It is a label-less GaugeVec (not a plain Gauge) on purpose, and is touched
+	// ONLY by the controller health tick (which runs only with a live TrueNAS
+	// client). A label-less vec exports NO series until its single child is
+	// created, so a node-mode process — which builds no client and never calls
+	// SetJobDispatcherSubscribed — exports nothing for it. This is the same
+	// mechanism as the controller-only pool_*_bytes GaugeVecs and is what keeps
+	// an unscoped min()/==0 from ever observing a phantom node-mode 0 (codex H1).
+	jobDispatcherSubscribed = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "job_dispatcher_subscribed",
+			Help:      "1 when a pooled connection holds a live core.get_jobs subscription; 0 = pure-poll fallback",
+		},
+		nil,
+	)
+
 	// iSCSI metrics
-	iscsiSessionsTotal = promauto.NewGauge(
+	iscsiSessionsTotal = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "iscsi_sessions_total",
@@ -83,7 +179,7 @@ var (
 		},
 	)
 
-	nvmeSessionsTotal = promauto.NewGauge(
+	nvmeSessionsTotal = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "nvme_sessions_total",
@@ -91,7 +187,7 @@ var (
 		},
 	)
 
-	nodeConnectTotal = promauto.NewCounterVec(
+	nodeConnectTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "node_connect_total",
@@ -100,7 +196,7 @@ var (
 		[]string{"transport", "result"},
 	)
 
-	gcSessionsDisconnectedTotal = promauto.NewCounterVec(
+	gcSessionsDisconnectedTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "gc_sessions_disconnected_total",
@@ -110,7 +206,7 @@ var (
 	)
 
 	// Controller orphan reconcile metrics.
-	orphanVolumes = promauto.NewGauge(
+	orphanVolumes = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "orphan_volumes",
@@ -118,7 +214,7 @@ var (
 		},
 	)
 
-	orphanSnapshots = promauto.NewGauge(
+	orphanSnapshots = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "orphan_snapshots",
@@ -126,7 +222,7 @@ var (
 		},
 	)
 
-	spentRestoreSnapshots = promauto.NewGauge(
+	spentRestoreSnapshots = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "spent_restore_snapshots",
@@ -134,7 +230,7 @@ var (
 		},
 	)
 
-	orphanVolumesBytes = promauto.NewGauge(
+	orphanVolumesBytes = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "orphan_volumes_bytes",
@@ -142,7 +238,7 @@ var (
 		},
 	)
 
-	orphanSnapshotsBytes = promauto.NewGauge(
+	orphanSnapshotsBytes = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "orphan_snapshots_bytes",
@@ -154,7 +250,7 @@ var (
 	// deferred destroy until their last restored clone disappears. Detection is
 	// always on; guarded reaping only runs where reconcile deletion is enabled,
 	// so these gauges are how default installs see the reapable backlog.
-	tombstoneSnapshots = promauto.NewGauge(
+	tombstoneSnapshots = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "tombstone_snapshots",
@@ -162,7 +258,7 @@ var (
 		},
 	)
 
-	tombstoneSnapshotsBytes = promauto.NewGauge(
+	tombstoneSnapshotsBytes = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "tombstone_snapshots_bytes",
@@ -170,7 +266,7 @@ var (
 		},
 	)
 
-	remnantVolumes = promauto.NewGauge(
+	remnantVolumes = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "remnant_volumes",
@@ -178,7 +274,57 @@ var (
 		},
 	)
 
-	reconcileLastSuccessTimestamp = promauto.NewGauge(
+	// manualRecoveryTombstones are driver-tombstoned deferred-delete snapshots
+	// the guarded reaper REFUSES to reap because creation-time snapshot identity
+	// is unproven. They never drain on their own — each is an operator-attention
+	// item, so the gauge is alertable rather than merely informational. Populated
+	// from ReconcileReport.ManualRecoveryTombstoneCount (E2/O5), which was
+	// previously computed but dropped on the floor.
+	manualRecoveryTombstones = regGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "manual_recovery_tombstones",
+			Help:      "Driver-tombstoned deferred-delete snapshots the guarded reaper refuses to reap (unproven creation-time identity); operator attention required",
+		},
+	)
+
+	// tombstoneReapedTotal counts successful tombstone reaps labeled by discovery
+	// path: "ledger" (the strict ledger-driven reaper) or "scan_fallback"
+	// (reconcile.tombstoneReaper.scanFallback). The fixed 2-value enum gives
+	// scan-fallback coverage visibility without an unbounded label (E2/O6).
+	tombstoneReapedTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_reaped_total",
+			Help:      "Total driver-tombstoned deferred-delete snapshots successfully reaped, by discovery path",
+		},
+		[]string{"path"},
+	)
+
+	// Pool-capacity gauges (E4). Populated only when capacity.gaugeEnabled by a
+	// controller-only poll loop; cardinality is fixed at one series per gauge for
+	// this single-backend driver, labeled {pool,dataset}. pool_capacity_bytes is
+	// used+available from the same pool.dataset.query row that feeds
+	// pool_available_bytes, so the near-full ratio is internally consistent.
+	poolAvailableBytes = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_available_bytes",
+			Help:      "ZFS-computed available bytes on the parent dataset (parity/quota/reservation-aware)",
+		},
+		[]string{"pool", "dataset"},
+	)
+
+	poolCapacityBytes = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_capacity_bytes",
+			Help:      "Total usable bytes (used + available) on the parent dataset",
+		},
+		[]string{"pool", "dataset"},
+	)
+
+	reconcileLastSuccessTimestamp = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "reconcile_last_success_timestamp_seconds",
@@ -186,7 +332,7 @@ var (
 		},
 	)
 
-	reconcileFailuresTotal = promauto.NewCounterVec(
+	reconcileFailuresTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "reconcile_failures_total",
@@ -195,7 +341,7 @@ var (
 		[]string{"phase"},
 	)
 
-	replicationJobsAbortedTotal = promauto.NewCounterVec(
+	replicationJobsAbortedTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "replication_jobs_aborted_total",
@@ -204,7 +350,7 @@ var (
 		[]string{"reason"},
 	)
 
-	fencingDeferredTotal = promauto.NewCounterVec(
+	fencingDeferredTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "fencing_deferred_total",
@@ -213,7 +359,7 @@ var (
 		[]string{"reason", "protocol"},
 	)
 
-	fencingStaleDeferredTotal = promauto.NewCounter(
+	fencingStaleDeferredTotal = regCounter(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "fencing_stale_deferred_total",
@@ -225,7 +371,7 @@ var (
 	// takeovers — the single most dangerous operation on a live strict cluster
 	// (it revokes one node's grant to hand the volume to another). It is labeled
 	// by reason so alerting can watch the stale_record path specifically.
-	fencingTakeoverTotal = promauto.NewCounterVec(
+	fencingTakeoverTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "fencing_takeover_total",
@@ -239,7 +385,7 @@ var (
 	// compaction — i.e. it consists entirely of backend-live entries. Provenance
 	// is never silently evicted (that would turn revocable grants into permanent
 	// static policy); the publish fails closed with ResourceExhausted instead.
-	fencingProvenanceOverflowTotal = promauto.NewCounterVec(
+	fencingProvenanceOverflowTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "fencing_provenance_overflow_total",
@@ -253,7 +399,7 @@ var (
 	// The delete still succeeds (CSI DeleteVolume is idempotent: volume-not-found is
 	// success) and the orphan reconcile sweeps the residue, so this is observable
 	// rather than fatal. Labeled by protocol so a stuck backend is identifiable.
-	deleteVolumeOrphanCleanupFailuresTotal = promauto.NewCounterVec(
+	deleteVolumeOrphanCleanupFailuresTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "delete_volume_orphan_cleanup_failures_total",
@@ -263,7 +409,7 @@ var (
 	)
 
 	// Circuit breaker metrics
-	circuitBreakerState = promauto.NewGauge(
+	circuitBreakerState = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "circuit_breaker_state",
@@ -271,7 +417,7 @@ var (
 		},
 	)
 
-	circuitBreakerFailuresTotal = promauto.NewCounter(
+	circuitBreakerFailuresTotal = regCounter(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "circuit_breaker_failures_total",
@@ -279,7 +425,7 @@ var (
 		},
 	)
 
-	circuitBreakerSuccessesTotal = promauto.NewCounter(
+	circuitBreakerSuccessesTotal = regCounter(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "circuit_breaker_successes_total",
@@ -287,7 +433,7 @@ var (
 		},
 	)
 
-	circuitBreakerOpensTotal = promauto.NewCounter(
+	circuitBreakerOpensTotal = regCounter(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "circuit_breaker_opens_total",
@@ -295,7 +441,7 @@ var (
 		},
 	)
 
-	circuitBreakerCurrentFailures = promauto.NewGauge(
+	circuitBreakerCurrentFailures = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "circuit_breaker_current_failures",
@@ -305,6 +451,12 @@ var (
 )
 
 func init() {
+	// The transport counter's benign_* status values (E1) are intentionally NOT
+	// pre-touched here. The method label set is large (every TrueNAS API method),
+	// so pre-creating every method×benign-value series would be pure cardinality
+	// bloat for series that may never appear. Prometheus rate() tolerates a
+	// series' first appearance, so lazy creation on the first benign event is
+	// correct and cheaper. Only the small, fixed enums below are pre-touched.
 	for _, reason := range []string{
 		truenas.ReplicationJobAbortReasonContextEnded,
 		truenas.ReplicationJobAbortReasonCopyFailed,
@@ -322,6 +474,8 @@ func init() {
 	for _, protocol := range []string{"nfs", "nvmeof"} {
 		fencingProvenanceOverflowTotal.WithLabelValues(protocol).Add(0)
 	}
+	tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathLedger).Add(0)
+	tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathScanFallback).Add(0)
 }
 
 // RecordCSIOperation records metrics for a CSI operation
@@ -341,14 +495,41 @@ func RecordCSIOperation(operation string, duration float64, err error) {
 	csiOperationsDuration.WithLabelValues(operation).Observe(duration)
 }
 
-// RecordTrueNASRequest records metrics for a TrueNAS API request
+// RecordTrueNASRequest records metrics for a TrueNAS API request.
+//
+// The status label carries a 5-value outcome taxonomy (E1): success,
+// benign_exists, benign_notfound, benign_aborted, and error. Benign idempotent
+// outcomes (AlreadyExists/NotFound) and lock-contention retries MOVE OUT of
+// "error" so this per-method transport counter tells the same truth as the
+// RPC-level operations_total. Existing status="error" selectors keep working and
+// become honest for free; see docs/release-notes-next.md for the migration table.
+//
+// The classifier is method-agnostic, so the iscsi.auth.* peer-CRUD calls added
+// for CHAP are classified benign_exists on their idempotent enforcement-boundary
+// creates automatically — no per-method special-casing.
+//
+// Latency is observed for every outcome (the histogram has no status label).
 func RecordTrueNASRequest(method string, duration float64, err error) {
-	status := "success"
-	if err != nil {
-		status = "error"
-	}
-	truenasRequestsTotal.WithLabelValues(method, status).Inc()
+	truenasRequestsTotal.WithLabelValues(method, trueNASRequestStatus(err)).Inc()
 	truenasRequestsDuration.WithLabelValues(method).Observe(duration)
+}
+
+// trueNASRequestStatus classifies a TrueNAS API outcome for the transport
+// counter. Order matters: the idempotency classifiers are checked before the
+// generic error fallthrough.
+func trueNASRequestStatus(err error) string {
+	switch {
+	case err == nil:
+		return "success"
+	case truenas.IsAlreadyExistsError(err):
+		return "benign_exists"
+	case truenas.IsNotFoundError(err):
+		return "benign_notfound"
+	case truenas.IsLockContentionError(err):
+		return "benign_aborted"
+	default:
+		return "error"
+	}
 }
 
 // SetTrueNASConnectionStatus sets the connection status metric
@@ -363,6 +544,19 @@ func SetTrueNASConnectionStatus(connected bool) {
 // SetTrueNASActiveConnections sets the number of active connections
 func SetTrueNASActiveConnections(count int) {
 	truenasConnectionsActive.Set(float64(count))
+}
+
+// SetJobDispatcherSubscribed publishes whether any pooled connection holds a
+// live core.get_jobs subscription (true → 1). False means the driver has
+// degraded to the pure-poll fallback. Calling it creates the label-less vec's
+// single child, which is what makes the series exportable — so it must only be
+// called in controller mode (see the gauge's declaration comment, codex H1).
+func SetJobDispatcherSubscribed(subscribed bool) {
+	if subscribed {
+		jobDispatcherSubscribed.WithLabelValues().Set(1)
+	} else {
+		jobDispatcherSubscribed.WithLabelValues().Set(0)
+	}
 }
 
 // SetISCSISessions sets the number of active iSCSI sessions
@@ -385,6 +579,19 @@ func RecordGCSessionDisconnected(transport string) {
 	gcSessionsDisconnectedTotal.WithLabelValues(transport).Inc()
 }
 
+// Tombstone reap discovery paths for tombstoneReapedTotal (E2/O6). The label is
+// a fixed 2-value enum, never a path or ID.
+const (
+	tombstoneReapedPathLedger       = "ledger"
+	tombstoneReapedPathScanFallback = "scan_fallback"
+)
+
+// RecordTombstoneReaped counts a successful tombstone reap by discovery path
+// (tombstoneReapedPathLedger or tombstoneReapedPathScanFallback).
+func RecordTombstoneReaped(path string) {
+	tombstoneReapedTotal.WithLabelValues(path).Inc()
+}
+
 // SetOrphanReconcileMetrics publishes the latest detection report, including a
 // partial report from a failed pass so gauges never silently freeze.
 func SetOrphanReconcileMetrics(report ReconcileReport) {
@@ -396,10 +603,19 @@ func SetOrphanReconcileMetrics(report ReconcileReport) {
 	tombstoneSnapshots.Set(float64(report.TombstoneSnapshotCount))
 	tombstoneSnapshotsBytes.Set(float64(report.TombstoneSnapshotBytes))
 	remnantVolumes.Set(float64(report.RemnantVolumeCount))
+	manualRecoveryTombstones.Set(float64(report.ManualRecoveryTombstoneCount))
 }
 
 func RecordReconcileSuccess(at time.Time) {
 	reconcileLastSuccessTimestamp.Set(float64(at.Unix()))
+}
+
+// SetPoolCapacityMetrics publishes the latest parent-dataset capacity sample.
+// pool is the ZFS pool name and dataset the parent dataset path; available and
+// capacity are bytes (capacity = used + available from one pool.dataset.query).
+func SetPoolCapacityMetrics(pool, dataset string, available, capacity float64) {
+	poolAvailableBytes.WithLabelValues(pool, dataset).Set(available)
+	poolCapacityBytes.WithLabelValues(pool, dataset).Set(capacity)
 }
 
 func RecordReconcileFailure(phase string) {

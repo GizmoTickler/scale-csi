@@ -934,6 +934,10 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 			// The provenance-overflow refusal is a deliberate, actionable status;
 			// preserve its code instead of masking it as Internal.
 			if status.Code(err) == codes.ResourceExhausted {
+				// Surface the publish-blocking refusal on the PV so an operator sees
+				// it without scraping the controller log (E3/O14).
+				d.recordWarningEvent(volumeEventRef(path.Base(datasetName)), EventReasonFencingProvenanceOverflow,
+					fmt.Sprintf("publish refused: additive fencing grant provenance exceeded the %d-entry cap; investigate node identity churn or clean stale backend hosts", additiveGrantHardCap))
 				return err
 			}
 			return status.Errorf(codes.Internal, "failed to classify additive grant ownership: %v", err)
@@ -1299,6 +1303,12 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 	if target == nil {
 		return fmt.Errorf("%w: iSCSI target for %s", errFenceBackendAbsent, datasetName)
 	}
+	// CHAP (authmethod+auth) and fencing (initiator allowlist) are orthogonal
+	// fields of the SAME target group. Rebuilt dynamic groups must retain CHAP or
+	// a fence pass would silently strip it off a CHAP target. The linkage is read
+	// from the dataset property stamped at CreateVolume; preserved static groups
+	// already carry their own authmethod/auth verbatim from target.Groups.
+	chapMethod, chapAuthRef := d.iscsiGroupCHAP(ctx, ds)
 	iqns := make([]string, 0, len(active))
 	for _, identity := range active {
 		if identity.ISCSIIQN != "" {
@@ -1339,7 +1349,9 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 			return portalErr
 		}
 		for _, portalID := range portals {
-			groups = append(groups, truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"})
+			group := truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"}
+			applyISCSIGroupCHAP(&group, chapMethod, chapAuthRef)
+			groups = append(groups, group)
 		}
 	} else {
 		// Retain the exact existing portal relationships on last unpublish. Some
@@ -1373,7 +1385,9 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 				}
 			}
 			for _, portalID := range portals {
-				groups = append(groups, truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"})
+				group := truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"}
+				applyISCSIGroupCHAP(&group, chapMethod, chapAuthRef)
+				groups = append(groups, group)
 			}
 		}
 	}

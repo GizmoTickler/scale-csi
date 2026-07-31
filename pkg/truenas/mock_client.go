@@ -36,6 +36,7 @@ type MockClient struct {
 	NVMeNamespaces             map[int]*NVMeoFNamespace
 	ISCSIPortals               map[int]*ISCSIPortal
 	ISCSIInitiators            map[int]*ISCSIInitiator
+	ISCSIAuths                 map[int]*ISCSIAuth
 	PoolAvailable              int64
 	ReplicationJobs            map[int64]*ReplicationJob
 	deferredSnapshots          map[string]struct{}
@@ -64,6 +65,9 @@ type MockClient struct {
 	// live clones always fails with ErrSnapshotHasClones regardless of the defer
 	// flag, so the driver's tombstone is retained until its last clone is gone.
 	NoDeferredSnapshotDestroy bool
+	// JobSubscribed is the value AnyConnectionJobSubscribed reports, letting a
+	// health test drive the scale_csi_job_dispatcher_subscribed gauge.
+	JobSubscribed bool
 }
 
 // DatasetDeleteCall records the deletion mode requested by a test.
@@ -82,6 +86,7 @@ func NewMockClient() *MockClient {
 		ISCSITargets:       make(map[int]*ISCSITarget),
 		ISCSIExtents:       make(map[int]*ISCSIExtent),
 		TargetExtents:      make(map[int]*ISCSITargetExtent),
+		ISCSIAuths:         make(map[int]*ISCSIAuth),
 		NVMeHosts:          make(map[string]*NVMeoFHost),
 		NVMeHostSubsystems: make(map[int]*NVMeoFHostSubsys),
 		NVMeSubsystems:     make(map[int]*NVMeoFSubsystem),
@@ -188,6 +193,71 @@ func (m *MockClient) ISCSIInitiatorDelete(ctx context.Context, id int) error {
 	return nil
 }
 
+// ISCSIAuthCreate stores a mock iSCSI CHAP auth peer. Secret arguments are
+// accepted to satisfy the interface but are never retained.
+func (m *MockClient) ISCSIAuthCreate(ctx context.Context, tag int, user, secret, peerUser, peerSecret string) (*ISCSIAuth, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	id := len(m.ISCSIAuths) + 1
+	for m.ISCSIAuths[id] != nil {
+		id++
+	}
+	auth := &ISCSIAuth{
+		ID:                    id,
+		Tag:                   tag,
+		User:                  user,
+		PeerUser:              peerUser,
+		CredentialFingerprint: ISCSIAuthCredentialFingerprint(user, secret, peerUser, peerSecret),
+	}
+	m.ISCSIAuths[id] = auth
+	return auth, nil
+}
+
+func (m *MockClient) ISCSIAuthQueryByTag(ctx context.Context, tag int) ([]*ISCSIAuth, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	peers := make([]*ISCSIAuth, 0)
+	for _, auth := range m.ISCSIAuths {
+		if auth.Tag == tag {
+			peers = append(peers, auth)
+		}
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].ID < peers[j].ID })
+	return peers, nil
+}
+
+func (m *MockClient) ISCSIAuthGet(ctx context.Context, id int) (*ISCSIAuth, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ISCSIAuths[id], nil
+}
+
+func (m *MockClient) ISCSIAuthUpdate(ctx context.Context, id int, user, secret, peerUser, peerSecret string) (*ISCSIAuth, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth := m.ISCSIAuths[id]
+	if auth == nil {
+		return nil, notFoundAPIError("iSCSI auth peer not found")
+	}
+	auth.User = user
+	auth.PeerUser = peerUser
+	auth.CredentialFingerprint = ISCSIAuthCredentialFingerprint(user, secret, peerUser, peerSecret)
+	return auth, nil
+}
+
+func (m *MockClient) ISCSIAuthDelete(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.ISCSIAuths, id)
+	return nil
+}
+
 // Core methods
 func (m *MockClient) Close() error      { return nil }
 func (m *MockClient) IsConnected() bool { return true }
@@ -259,6 +329,13 @@ func (m *MockClient) ReplicationJobAbortHistory() ([]int64, []string) {
 // Circuit breaker methods (return nil/no-op for mock)
 func (m *MockClient) CircuitBreakerStats() *CircuitBreakerStats { return nil }
 func (m *MockClient) ResetCircuitBreaker()                      {}
+
+// AnyConnectionJobSubscribed returns the test-configurable subscription bit.
+func (m *MockClient) AnyConnectionJobSubscribed() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.JobSubscribed
+}
 
 // Dataset methods
 func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error) {

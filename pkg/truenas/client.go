@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,6 +98,41 @@ func IsAlreadyExistsError(err error) bool {
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
+
+// IsLockContentionError reports whether err is a benign lock-contention /
+// in-progress retry rather than a genuine busy-resource failure. It is
+// conservative by design: only an EBUSY errno whose message indicates a lock or
+// an already-in-progress operation is benign; any other EBUSY (e.g. destroying
+// a mounted dataset) and any non-EBUSY error fall through to a real error so a
+// genuinely-busy resource is never masked.
+//
+// MessageFallbackContains is deliberately NOT reused here: it returns false
+// whenever a structured errno is present, and EBUSY IS a structured errno, so it
+// could never return true for the very errors this classifier targets. The
+// message is inspected directly instead. The bare fragment "busy" is also
+// excluded on purpose — "dataset is busy" is a real failure, not contention.
+func IsLockContentionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errno, ok := APIErrno(err)
+	if !ok || errno != syscall.EBUSY {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		message = strings.ToLower(apiErr.Message)
+	}
+	return strings.Contains(message, "already in progress") || lockWord.MatchString(message)
+}
+
+// lockWord matches "lock" as a whole word. The word-boundary anchors keep an
+// EBUSY message such as "deadlock", "blocked", or "unlock" from being
+// misclassified as benign lock contention (opus hardening): only a genuine
+// "lock held"/"lock busy" style message is benign, while a real busy-resource
+// failure that merely mentions one of those words still falls through to error.
+var lockWord = regexp.MustCompile(`\block\b`)
 
 // MessageFallbackContains is for APIs whose older releases did not expose a
 // semantic errno. If a structured errno is present it is authoritative, even

@@ -291,10 +291,20 @@ kubectl logs -n scale-csi deploy/scale-csi-controller -c scale-csi
 
 ### Clone Creation Slow
 
-For large volumes or busy TrueNAS systems, increase the timeout:
+**Standard clone verification does not use the zvol-readiness poll.** A standard
+(clone-mode) restore performs one `DatasetGet` and at most one fixed retry after
+250 ms; it does **not** call `WaitForZvolReady`, so increasing
+`zfs.zvolReadyTimeout` does **not** extend this path. If the single retry is
+exhausted the create returns `Unavailable` and the external-provisioner sidecar
+retries the whole `CreateVolume` — investigate backend/API propagation latency
+rather than raising the timeout. (`Canceled`/`DeadlineExceeded` are preserved.)
+
+`zfs.zvolReadyTimeout` still matters for the **detached** snapshot-copy path,
+which retains `WaitForZvolReady` and maps a readiness failure to `Internal`. For
+large detached copies on busy TrueNAS systems, raise it:
 
 ```yaml
-# In Helm values
+# In Helm values (affects the detached send/receive copy path, not standard clones)
 zfs:
   zvolReadyTimeout: 120  # Increase from default 60 seconds
 ```

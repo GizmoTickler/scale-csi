@@ -822,7 +822,10 @@ func (ds *Dataset) GetUsedBytes() int64 {
 // immediately available for subsequent operations.
 func (c *Client) WaitForDatasetReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error) {
 	start := time.Now()
-	pollInterval := 100 * time.Millisecond
+	// Sprint 3 (L1a): the first re-poll starts at 50ms (was 100ms) so the common
+	// fast-ready clone pays less than one 100ms tick; doubling still caps at 2s
+	// (50,100,200,400,800,1600,2000...).
+	pollInterval := 50 * time.Millisecond
 	maxPollInterval := 2 * time.Second
 
 	klog.V(4).Infof("Waiting for dataset %s to be ready (timeout: %v)", name, timeout)
@@ -858,7 +861,10 @@ func (c *Client) WaitForDatasetReady(ctx context.Context, name string, timeout t
 // After cloning, the zvol may not immediately have all properties available.
 func (c *Client) WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error) {
 	start := time.Now()
-	pollInterval := 100 * time.Millisecond
+	// Sprint 3 (L1a): the first re-poll starts at 50ms (was 100ms) so the common
+	// fast-ready clone pays less than one 100ms tick; doubling still caps at 2s
+	// (50,100,200,400,800,1600,2000...).
+	pollInterval := 50 * time.Millisecond
 	maxPollInterval := 2 * time.Second
 
 	klog.V(4).Infof("Waiting for zvol %s to be ready (timeout: %v)", name, timeout)

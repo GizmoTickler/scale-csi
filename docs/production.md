@@ -1,7 +1,7 @@
 # Production deployment
 
 This guide describes the current scale-csi repository and bundled Helm chart,
-based on the v1.3.0 release line. Review the [deployment guide](deployment.md)
+based on the v1.4.0 release line. Review the [deployment guide](deployment.md)
 for installation examples and the chart's
 [values reference](../charts/scale-csi/README.md) for every setting.
 
@@ -175,13 +175,14 @@ resilience:
     maxConcurrentLogins: 2
 ```
 
-> **The API concurrency limit is `truenas.maxConcurrentRequests`, not
-> `resilience.rateLimiting.maxConcurrentRequests`.** The chart/schema accept a
-> `resilience.rateLimiting.maxConcurrentRequests` key, but it is **not wired to
-> anything** — only `truenas.maxConcurrentRequests` reaches the client's API
-> semaphore. Under `resilience.rateLimiting`, only `maxConcurrentLogins` (iSCSI
-> login concurrency) is effective. Tune `truenas.maxConcurrentRequests` to protect
-> an overloaded NAS.
+> **The API concurrency limit is `truenas.maxConcurrentRequests`.** The former
+> `resilience.rateLimiting.maxConcurrentRequests` key was never wired to anything
+> and is now **deprecated and ignored**: the chart no longer renders it and the
+> driver logs a warning if a configmap still sets it (the values schema keeps
+> accepting it so old values files do not fail validation). Only
+> `truenas.maxConcurrentRequests` reaches the client's API semaphore. Under
+> `resilience.rateLimiting`, only `maxConcurrentLogins` (iSCSI login concurrency)
+> is effective. Tune `truenas.maxConcurrentRequests` to protect an overloaded NAS.
 
 Retries apply only to connection-class failures; an ambiguous non-idempotent
 mutation is not retried. The circuit breaker is opt-in and disabled by default;
@@ -224,10 +225,37 @@ backend loss.
   `truenas.apiKey`. Rotate the TrueNAS key and Secret together.
 - Set `nfs.shareAllowedNetworks` to the node CIDRs. Its empty default permits all
   networks accepted by TrueNAS for each dynamically created share.
-- Driver-created iSCSI targets use an allow-all initiator group and no CHAP.
-  Network segmentation (such as a VLAN or SGACL) is therefore the access-control
-  boundary for TCP 3260. The driver does not currently provide per-tenant iSCSI
-  isolation.
+- The iSCSI initiator allowlist depends on `fencing.mode`, and CHAP composes with
+  it rather than replacing it: in `off` the driver leaves configured/static
+  backend allowlists alone (and the resolved default may be allow-all); `additive`
+  retains legacy/static entries and **adds** the live CSI initiators; `strict`
+  **replaces** them with the exact live publication set. In `additive`/`strict`
+  the immutable per-volume CHAP authmethod/tag stays attached to the target group
+  while fencing changes only the initiator allowlist — CHAP is an independent
+  session-authentication layer that neither disables fencing nor implies allow-all
+  access. CHAP session authentication is available but strictly opt-in
+  (`iscsi.chap.enabled: true` plus a per-StorageClass CHAP Secret — see
+  [the StorageClass reference](reference/storageclass.md#iscsi-chap)); with it
+  off (the default) targets stay `authmethod=NONE`. CHAP authenticates the
+  session — it does **not** encrypt data in flight — so network segmentation
+  (such as a VLAN or SGACL) remains the confidentiality boundary for TCP 3260
+  even when CHAP is on. The driver does not currently provide per-tenant iSCSI
+  isolation. CHAP credentials are supplied per StorageClass via a Kubernetes
+  Secret, are never written to the PV volume context, and are redacted from all
+  driver logs, gRPC errors, and Kubernetes Events: password-setting `iscsiadm`
+  failures surface only the parameter name and an exit class, never the command
+  output.
+- **Accepted host-trust exposure (CHAP).** CHAP session credentials are applied
+  on the node by passing them to `iscsiadm` as `-v <value>` arguments, so the
+  credential is briefly visible in the host process table (`/proc/<pid>/cmdline`)
+  while the call runs, and open-iscsi persists the session credential in the host
+  node database under `/var/lib/iscsi` (and `/etc/iscsi`) for as long as the node
+  record exists. The node DaemonSet is privileged with `hostPID` and mounts these
+  host paths, so any root-level actor on the node can read the credential. This is
+  an explicit, accepted root-on-host trust assumption — CHAP protects against
+  off-host initiators, not against a compromised node. Treat node root as
+  equivalent to holding every CHAP secret staged on that node, and rely on
+  network segmentation plus node hardening accordingly.
 - `DeleteVolume` preserves non-CSI snapshots by default, including snapshots
   inherited from periodic-snapshot or replication tasks on the parent dataset.
   It returns `FailedPrecondition` until those snapshots are removed or the task
@@ -263,10 +291,25 @@ Prometheus Operator users can enable `metrics.serviceMonitor.enabled`; enable
 `metrics.prometheusRule.enabled` for the bundled rules and
 `metrics.dashboards.enabled` for a Grafana sidecar-discoverable ConfigMap.
 
-Controller-side `VolumeCondition` is existence-only: `ControllerGetVolume`
-reports healthy after confirming the dataset exists, without probing protocol
-or data-path health. `NodeGetVolumeStats` supplies the real per-volume health
-condition from the node path.
+Controller-side `VolumeCondition` reports **backend provisioning-metadata
+health**, not mere existence. The driver derives the same declarative condition
+for `ControllerGetVolume` and `ListVolumes`: an explicit local
+`provision_success=false` is abnormal; a managed, successfully provisioned volume
+is normal; a managed volume missing the legacy stamps is reported normal but
+"unverified." It does **not** probe protocol or data-path health.
+`NodeGetVolumeStats` separately detects stale-mount state before its stats gate,
+so node-side evidence is distinct from the controller condition.
+
+The optional external health-monitor sidecar
+(`sidecars.healthMonitor.enabled`, default off; v0.18.0 controller sidecar) emits
+PVC Events from controller-side volume conditions. Because this driver advertises
+`LIST_VOLUMES`, that sidecar uses one periodic `ListVolumes` path rather than
+per-PV `ControllerGetVolume`, so it observes the **controller/`ListVolumes`**
+condition above — not node stale mounts or the data path. Node-side
+`VolumeCondition` delivery depends on Kubernetes/kubelet's separate **alpha**
+volume-health path and feature gating; enabling this controller sidecar alone
+does not provide it. The sidecar's `interval` drives both its list-volumes and
+fallback monitor cadence.
 
 Watch these series:
 
@@ -286,18 +329,45 @@ Watch these series:
   `scale_csi_gc_sessions_disconnected_total` for per-transport node connection
   attempts and orphan cleanup.
 
-The bundled rules alert when the controller target is absent for five minutes,
-TrueNAS is disconnected or the circuit is open for two minutes, TrueNAS API
-failures exceed 10% for ten minutes, or CSI operation errors exceed 0.01
-operations/second for ten minutes.
+Five metric families added in v1.4.0 (the existing documented names still match
+`driver.MetricNames()`):
+
+- `scale_csi_job_dispatcher_subscribed` — `1` while the `core.get_jobs`
+  subscription is live, `0` in the pure-poll fallback; a persistent `0` (alerted
+  by `ScaleCSIJobDispatcherUnsubscribed`) means investigate the WebSocket
+  subscription.
+- `scale_csi_manual_recovery_tombstones` — tombstones no provenance belt can
+  prove, for operator inspection; **populated only while scan fallback is
+  enabled**.
+- `scale_csi_tombstone_reaped_total{path}` — reaper throughput by discovery path
+  (ledger vs scan fallback).
+- `scale_csi_pool_available_bytes` and `scale_csi_pool_capacity_bytes` — parent
+  pool free/total; **present only when `capacity.gaugeEnabled`**, and they drive
+  `ScaleCSIPoolNearFull`.
+
+The bundled rules use distinct expressions, rate windows, and `for` durations —
+do not collapse them into one sentence:
+
+- `ScaleCSIControllerDown`: controller scrape target absent, held **5m**.
+- `ScaleCSITrueNASConnectionDown`: TrueNAS disconnected, held **5m**.
+- `ScaleCSICircuitBreakerOpen`: circuit breaker open, held **2m**.
+- `ScaleCSIHighTrueNASAPIFailureRate`: TrueNAS API failure **ratio > 10%** over a
+  **5m** rate window, held **10m**. It selects `status="error"`, whose meaning
+  narrowed in Sprint 5 (benign outcomes no longer counted — see below).
+- `ScaleCSIOperationErrorsSustained`: CSI operation error rate **> 0.02/s** over a
+  **10m** rate window, excluding selected benign gRPC codes, held **15m** (not
+  `> 0.01/s for ten minutes`).
+
 Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
 > **Benign `already exists` on the NVMe-oF path.** The driver treats an
 > `AlreadyExists` response to `nvmet.host_subsys.create` as success (the
-> host/subsystem association it wanted already exists). A small, non-growing
-> count of failed `nvmet.host_subsys.create` samples in
-> `scale_csi_truenas_requests_total{status="error"}` is therefore expected by
-> design during NVMe-oF provisioning and is not an operational fault.
+> host/subsystem association it wanted already exists). Since Sprint 5 this
+> outcome is intentionally classified `status="benign_exists"`, **not**
+> `status="error"`. A small, non-growing count of
+> `scale_csi_truenas_requests_total{method="nvmet.host_subsys.create",status="benign_exists"}`
+> is therefore expected by design during NVMe-oF provisioning and must not be
+> read as an error sample. Real transport failures remain `status="error"`.
 
 ## Upgrades
 
@@ -325,8 +395,15 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
 3. ConfigMap changes roll both controller and node pods through checksum
    annotations. Changes to the chart-managed Secret do the same. Changes to an
-   `existingSecret` do **not** alter a checksum annotation, so restart both
-   workloads explicitly after rotating that Secret.
+   `existingSecret` do **not** alter a checksum annotation. Because only the
+   **controller** consumes the TrueNAS API key (the node builds no API client),
+   after rotating the external `truenas.existingSecret` restart the **controller**
+   workload and verify `/readyz`/backend auth; restarting node pods is not
+   required for that credential. **CHAP Secrets are different** — they are
+   request-scoped CSI Secrets, not pod configuration, so they need no driver
+   rollout: a rotated CHAP Secret takes effect on the backend only when a later
+   `CreateVolume` revalidates/re-keys the peer, and on the node only before a
+   fresh login. Do not restart driver pods as a substitute for session turnover.
 
 4. The chart declares versioned provisioner, attacher, resizer, snapshotter,
    registrar, and liveness image defaults, all overridable in values and tracked
@@ -342,12 +419,13 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
    Existing bound PVs are not reprovisioned by this metadata migration. See the
    [StorageClass upgrade procedure](reference/storageclass.md#upgrade-add-protocol-safely).
 
-6. The node DaemonSet intentionally receives no `TRUENAS_API_KEY`. Routine
-   stage/publish/unpublish/unstage and local expansion use host tools and start
-   in lazy-connect mode, but a node-side operation that actually requires the
-   management API cannot borrow the controller's Secret and will fail without
-   credentials. Treat this as an explicit security boundary when upgrading
-   from manifests that injected the key into every pod.
+6. The node DaemonSet intentionally receives no `TRUENAS_API_KEY` and
+   **constructs no TrueNAS management client at all**. Every supported Node RPC
+   (stage/publish/unpublish/unstage and local expansion) uses host tools and local
+   state, so there is **no deferred/lazy management-API path** that could later
+   fail for lack of credentials — node pods stay independent of management-API
+   availability. Treat the absent key as an explicit security boundary when
+   upgrading from manifests that injected it into every pod.
 
 7. For the fencing migration, keep `fencing.mode=off`, upgrade the node
    DaemonSet/image first, and wait for every CSINode to re-register its versioned
@@ -366,9 +444,15 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
 ## Current known limitations
 
-- Driver-created iSCSI targets have no CHAP or per-tenant initiator isolation;
-  an allow-all initiator group makes storage-network segmentation the access
-  boundary for TCP 3260.
+- On the unfenced (`fencing.mode=off`) default path, driver-created iSCSI targets
+  have no per-tenant initiator isolation — the resolved default allow-all
+  initiator group makes storage-network segmentation the access boundary for TCP
+  3260. `additive`/`strict` fencing narrow the initiator allowlist per volume (and
+  compose with CHAP, which stays attached independently). CHAP session
+  authentication is available (opt-in) but does not encrypt data in flight and has
+  limitations: rotated secrets take effect only before a fresh login (established
+  sessions are not re-authenticated), and deleting a CHAP StorageClass leaves its
+  shared `iscsi.auth` peer behind for the operator to reap.
 - Host dm-multipath ownership of TrueNAS iSCSI LUNs is unsupported. The node
   service refuses to stage an iSCSI device with a `dm-*` sysfs holder instead
   of formatting or mounting a raw component path.

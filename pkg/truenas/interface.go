@@ -18,6 +18,10 @@ type ClientInterface interface {
 	CircuitBreakerStats() *CircuitBreakerStats
 	ResetCircuitBreaker()
 
+	// AnyConnectionJobSubscribed reports whether a pooled connection holds a live
+	// core.get_jobs subscription (false = pure-poll fallback).
+	AnyConnectionJobSubscribed() bool
+
 	// Dataset methods
 	DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error)
 	DatasetDelete(ctx context.Context, name string, recursive, force bool) error
@@ -96,6 +100,11 @@ type ClientInterface interface {
 	ISCSITargetExtentFindByTarget(ctx context.Context, targetID int) ([]*ISCSITargetExtent, error)
 	ISCSITargetExtentFindByExtent(ctx context.Context, extentID int) ([]*ISCSITargetExtent, error)
 	ISCSIGlobalConfigGet(ctx context.Context) (*ISCSIGlobalConfig, error)
+	ISCSIAuthCreate(ctx context.Context, tag int, user, secret, peerUser, peerSecret string) (*ISCSIAuth, error)
+	ISCSIAuthQueryByTag(ctx context.Context, tag int) ([]*ISCSIAuth, error)
+	ISCSIAuthGet(ctx context.Context, id int) (*ISCSIAuth, error)
+	ISCSIAuthUpdate(ctx context.Context, id int, user, secret, peerUser, peerSecret string) (*ISCSIAuth, error)
+	ISCSIAuthDelete(ctx context.Context, id int) error
 
 	// NVMe-oF methods (updated for TrueNAS SCALE 25.10+)
 	NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*NVMeoFHost, error)

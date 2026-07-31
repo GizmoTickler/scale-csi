@@ -126,7 +126,13 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	}
 	initiatorID := 0
 	for _, g := range initiators {
-		if g.Initiators == nil && !strings.HasPrefix(strings.TrimSpace(g.Comment), "scale-csi fencing:") {
+		// Allow-all reuse accepts nil OR empty initiator lists: TrueNAS 26.0
+		// query returns [] for allow-all groups (SCST renders them INITIATOR *,
+		// live-verified 2026-07-31 drill), and 26.0 rejects the legacy null
+		// create shape outright — so nil-only matching left fresh installs with
+		// no reusable group AND a doomed create. Fencing's deliberate deny-all
+		// [] groups are excluded by their comment prefix, not by shape.
+		if len(g.Initiators) == 0 && !strings.HasPrefix(strings.TrimSpace(g.Comment), "scale-csi fencing:") {
 			initiatorID = g.ID
 			break
 		}
@@ -332,6 +338,23 @@ func datasetUserPropertyProjection(ds *truenas.Dataset, key string) (truenas.Use
 	}
 	property, ok := ds.UserProperties[key]
 	return property, ok
+}
+
+// datasetLocalUserProperty returns the value of key only when it is set
+// directly on this dataset (source=="local"). A clone-inherited value (whose
+// source is the origin snapshot name) returns "". CHAP identity is read through
+// this guard so a clone can never adopt its source volume's auth policy even if
+// a best-effort scrub failed — the same source==local discipline the ownership
+// stamps use.
+func datasetLocalUserProperty(ds *truenas.Dataset, key string) string {
+	property, ok := datasetUserPropertyProjection(ds, key)
+	if !ok || !isLocalUserPropertySource(property.Source) {
+		return ""
+	}
+	if property.Value == "-" {
+		return ""
+	}
+	return property.Value
 }
 
 func datasetHasLocalUserProperty(ds *truenas.Dataset, key, expected string) bool {

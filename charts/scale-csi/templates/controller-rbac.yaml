@@ -74,6 +74,34 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "watch", "list", "create", "update", "delete"]
+  {{- if .Values.capacity.enabled }}
+  # CSIStorageCapacity tracking (external-provisioner --enable-capacity). The
+  # provisioner also resolves its ownerref (Deployment -> ReplicaSet -> Pod), so
+  # it needs get on its own Pod and the ReplicaSet. Default off => rules absent.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csistoragecapacities"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+  {{- end }}
+  {{- if .Values.sidecars.healthMonitor.enabled }}
+  # External health monitor (csi-external-health-monitor-controller). It needs
+  # get/list/watch on pods to map abnormal volumes to workloads; persistentvolumes
+  # (get/list/watch) and nodes are already granted above. The provisioner's events
+  # rule above omits `get`, which upstream's health-monitor RBAC grants, so it is
+  # added here (gated) for canonical parity. Default off => rules absent =>
+  # byte-identical render.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -37,6 +37,7 @@ var (
 	resolveNodeStatsDevice             = nodeStatsDevice
 	getNodeDeviceSize                  = nodeStatsDeviceSize
 	getNodeFilesystemStats             = util.GetFilesystemStats
+	nodeStatsMountCheck                = util.IsMountedWithContext
 	gcListISCSISessions                = util.ListISCSISessions
 	gcDisconnectISCSI                  = util.ISCSIDisconnect
 	gcListNVMeoFSessions               = util.ListNVMeoFSessions
@@ -137,6 +138,11 @@ type Driver struct {
 	startupReconcileOnce   sync.Once
 	startupReconcileSignal chan struct{}
 
+	// Controller-side pool-capacity gauge poll loop (E4). Runs only when
+	// capacity.gaugeEnabled; each tick is one bounded pool.dataset.query.
+	capacityCancel context.CancelFunc
+	capacityWg     sync.WaitGroup
+
 	// Background fencing state. Missing-record observations are in-memory on
 	// purpose: a controller restart restarts the full grace period rather than
 	// revoking an old record immediately after a fresh VA disappearance.
@@ -156,6 +162,12 @@ type Driver struct {
 	// iscsi.targetGroups is not configured; see resolveISCSITargetGroup.
 	iscsiGroupMu       sync.Mutex
 	iscsiResolvedGroup *truenas.ISCSITargetGroup
+
+	// Cached iSCSI CHAP auth peers keyed by iscsi.auth tag. A per-StorageClass
+	// credential is ensured once per controller lifetime and shared by every
+	// volume of that class; see EnsureISCSIAuthPeer.
+	iscsiAuthMu       sync.Mutex
+	iscsiResolvedAuth map[int]*truenas.ISCSIAuth
 
 	// Cached TrueNAS NVMe-oF host IDs keyed by initiator NQN. Resolution is
 	// serialized so concurrent volume creates do not race to create one host.
@@ -231,6 +243,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 			Timeout:                     time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
 			ConnectTimeout:              time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
 			WriteTimeout:                time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,
+			MaxConnections:              cfg.Config.TrueNAS.MaxConnections,
 			MaxConcurrentReqs:           cfg.Config.TrueNAS.MaxConcurrentRequests,
 			MetricsRecorder:             RecordTrueNASRequest,
 			ReplicationJobAbortRecorder: RecordReplicationJobAborted,
@@ -297,6 +310,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		eventRecorder:          eventRecorder,
 		serviceReloadDebouncer: serviceDebouncer,
 		nvmeResolvedHosts:      make(map[string]int),
+		iscsiResolvedAuth:      make(map[int]*truenas.ISCSIAuth),
 		stagedTargets:          make(map[string]nodeMountRecord),
 		publishedTargets:       make(map[string]nodeMountRecord),
 		expectedDeleteLogLast:  make(map[string]time.Time),
@@ -379,6 +393,7 @@ func (d *Driver) Run() error {
 	if d.runController {
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
+		d.startCapacityGauges()
 	}
 	if d.runNode {
 		d.startSessionGC()
@@ -396,6 +411,7 @@ func (d *Driver) Stop() {
 	d.stopSessionGC()
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
+	d.stopCapacityGauges()
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {
@@ -432,24 +448,31 @@ func (d *Driver) logInterceptor(
 	requestID := atomic.AddUint64(&d.requestCounter, 1)
 	startTime := time.Now()
 
-	// Extract key identifiers from common request types for better logging
+	// Extract key identifiers from common request types for better logging.
+	// Provisioning paths (Create/Stage/Publish/Expand) stay at V(0): operators
+	// want them in the default log. Benign teardown verbs (Delete/Unstage/
+	// Unpublish) are demoted to V(2) so a steady-state VolSync delete/detach hour
+	// emits ~0 V(0) interceptor lines (E4/O19). Failures still log at Error below
+	// regardless of verbosity.
 	switch r := req.(type) {
 	case *csi.CreateVolumeRequest:
 		klog.Infof("[req-%d] %s name=%s", requestID, info.FullMethod, r.GetName())
 	case *csi.DeleteVolumeRequest:
-		klog.Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
+		klog.V(2).Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
 	case *csi.NodeStageVolumeRequest:
 		klog.Infof("[req-%d] %s volumeID=%s stagingPath=%s", requestID, info.FullMethod, r.GetVolumeId(), r.GetStagingTargetPath())
 	case *csi.NodeUnstageVolumeRequest:
-		klog.Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
+		klog.V(2).Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
 	case *csi.NodePublishVolumeRequest:
 		klog.Infof("[req-%d] %s volumeID=%s targetPath=%s", requestID, info.FullMethod, r.GetVolumeId(), r.GetTargetPath())
 	case *csi.NodeUnpublishVolumeRequest:
-		klog.Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
+		klog.V(2).Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
+	case *csi.ControllerUnpublishVolumeRequest:
+		klog.V(2).Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
 	case *csi.CreateSnapshotRequest:
 		klog.Infof("[req-%d] %s name=%s sourceVolumeID=%s", requestID, info.FullMethod, r.GetName(), r.GetSourceVolumeId())
 	case *csi.DeleteSnapshotRequest:
-		klog.Infof("[req-%d] %s snapshotID=%s", requestID, info.FullMethod, r.GetSnapshotId())
+		klog.V(2).Infof("[req-%d] %s snapshotID=%s", requestID, info.FullMethod, r.GetSnapshotId())
 	case *csi.ControllerExpandVolumeRequest:
 		klog.Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
 	case *csi.NodeExpandVolumeRequest:

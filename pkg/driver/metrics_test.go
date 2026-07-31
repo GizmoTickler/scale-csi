@@ -1,12 +1,16 @@
 package driver
 
 import (
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -221,6 +225,69 @@ func TestRecordCSIOperationClassifiesAbortedAsBenign(t *testing.T) {
 	assert.Equal(t, hardErrorBefore, testutil.ToFloat64(hardError))
 }
 
+// TestRecordTrueNASRequestClassifiesBenign guards the E1 5-value transport
+// status taxonomy: benign idempotent outcomes and lock contention move OUT of
+// status="error" into benign_* so the per-method counter tells the truth.
+func TestRecordTrueNASRequestClassifiesBenign(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		method     string
+		err        error
+		wantStatus string
+	}{
+		{name: "nil error is success", method: "pool.dataset.create", err: nil, wantStatus: "success"},
+		{
+			name:       "already-exists is benign_exists",
+			method:     "pool.dataset.create",
+			err:        &truenas.APIError{Code: int(syscall.EEXIST), Message: "dataset already exists"},
+			wantStatus: "benign_exists",
+		},
+		{
+			name:       "not-found is benign_notfound",
+			method:     "pool.dataset.delete",
+			err:        &truenas.APIError{Code: int(syscall.ENOENT), Message: "dataset not found"},
+			wantStatus: "benign_notfound",
+		},
+		{
+			name:       "lock contention is benign_aborted",
+			method:     "pool.dataset.create",
+			err:        &truenas.APIError{Code: int(syscall.EBUSY), Message: "call already in progress"},
+			wantStatus: "benign_aborted",
+		},
+		{
+			name:       "generic failure is error",
+			method:     "pool.dataset.create",
+			err:        &truenas.APIError{Code: int(syscall.EACCES), Message: "permission denied"},
+			wantStatus: "error",
+		},
+		{
+			// The classifier is method-agnostic: the CHAP peer-CRUD calls
+			// (iscsi.auth.*) added in sprint2 are classified benign_exists on
+			// their idempotent enforcement-boundary creates with no CHAP-specific
+			// code, exactly as the E1 design predicted.
+			name:       "iscsi.auth create already-exists is benign_exists",
+			method:     "iscsi.auth.create",
+			err:        &truenas.APIError{Code: int(syscall.EEXIST), Message: "peer user already exists"},
+			wantStatus: "benign_exists",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := truenasRequestsTotal.WithLabelValues(tc.method, tc.wantStatus)
+			wantBefore := testutil.ToFloat64(want)
+			errSeries := truenasRequestsTotal.WithLabelValues(tc.method, "error")
+			errBefore := testutil.ToFloat64(errSeries)
+
+			RecordTrueNASRequest(tc.method, 0.01, tc.err)
+
+			assert.Equal(t, wantBefore+1, testutil.ToFloat64(want))
+			if tc.wantStatus != "error" {
+				assert.Equal(t, errBefore, testutil.ToFloat64(errSeries),
+					"a benign outcome must not increment the error series")
+			}
+		})
+	}
+}
+
 func TestTransportCountersIncrementThroughMetricsRegistry(t *testing.T) {
 	for _, tc := range []struct {
 		transport string
@@ -246,11 +313,12 @@ func TestTransportCountersIncrementThroughMetricsRegistry(t *testing.T) {
 
 func TestSetOrphanReconcileMetrics(t *testing.T) {
 	SetOrphanReconcileMetrics(ReconcileReport{
-		OrphanVolumeCount:         2,
-		OrphanSnapshotCount:       3,
-		SpentRestoreSnapshotCount: 4,
-		OrphanVolumeBytes:         1024,
-		OrphanSnapshotBytes:       2048,
+		OrphanVolumeCount:            2,
+		OrphanSnapshotCount:          3,
+		SpentRestoreSnapshotCount:    4,
+		OrphanVolumeBytes:            1024,
+		OrphanSnapshotBytes:          2048,
+		ManualRecoveryTombstoneCount: 7,
 	})
 
 	assert.Equal(t, float64(2), testutil.ToFloat64(orphanVolumes))
@@ -258,6 +326,111 @@ func TestSetOrphanReconcileMetrics(t *testing.T) {
 	assert.Equal(t, float64(4), testutil.ToFloat64(spentRestoreSnapshots))
 	assert.Equal(t, float64(1024), testutil.ToFloat64(orphanVolumesBytes))
 	assert.Equal(t, float64(2048), testutil.ToFloat64(orphanSnapshotsBytes))
+	// O5: the manual-recovery tombstone count was previously computed but dropped
+	// on the floor; it must now publish to its gauge.
+	assert.Equal(t, float64(7), testutil.ToFloat64(manualRecoveryTombstones))
+}
+
+// TestRecordTombstoneReaped guards the O6 reap-throughput counter: the path
+// label is a fixed 2-value enum (ledger / scan_fallback) and each reap
+// increments exactly its own series.
+func TestRecordTombstoneReaped(t *testing.T) {
+	ledger := tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathLedger)
+	scanFallback := tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathScanFallback)
+	ledgerBefore := testutil.ToFloat64(ledger)
+	scanFallbackBefore := testutil.ToFloat64(scanFallback)
+
+	RecordTombstoneReaped(tombstoneReapedPathLedger)
+	RecordTombstoneReaped(tombstoneReapedPathScanFallback)
+	RecordTombstoneReaped(tombstoneReapedPathScanFallback)
+
+	assert.Equal(t, ledgerBefore+1, testutil.ToFloat64(ledger))
+	assert.Equal(t, scanFallbackBefore+2, testutil.ToFloat64(scanFallback))
+}
+
+// TestSetJobDispatcherSubscribed guards the O7 health gauge: it tracks the
+// core.get_jobs subscription bit exactly (1 = subscribed, 0 = pure-poll).
+func TestSetJobDispatcherSubscribed(t *testing.T) {
+	SetJobDispatcherSubscribed(true)
+	assert.Equal(t, float64(1), testutil.ToFloat64(jobDispatcherSubscribed.WithLabelValues()))
+
+	SetJobDispatcherSubscribed(false)
+	assert.Equal(t, float64(0), testutil.ToFloat64(jobDispatcherSubscribed.WithLabelValues()))
+}
+
+// TestJobDispatcherSubscribedNodeModeExport guards the codex H1 fix: a
+// node-mode process builds no TrueNAS client and never calls
+// SetJobDispatcherSubscribed, so the label-less gauge vec is never touched and
+// must export NO scale_csi_job_dispatcher_subscribed series. Before the fix the
+// metric was a plain gauge that every process exported as 0, which forced an
+// unscoped min()/==0 to read 0 (PURE-POLL / alert firing) in any normal
+// controller-plus-node install. This mirrors the controller-only pool_*_bytes
+// GaugeVecs, which likewise export nothing until the controller loop touches
+// them.
+func TestJobDispatcherSubscribedNodeModeExport(t *testing.T) {
+	const name = "scale_csi_job_dispatcher_subscribed"
+
+	// Model node mode: drop any child an earlier test created so the vec is
+	// untouched, exactly as it is in a process that never runs the controller
+	// health tick.
+	jobDispatcherSubscribed.Reset()
+	assert.False(t, gatherHasMetric(t, name),
+		"an untouched (node-mode) gauge vec must not export %s", name)
+
+	// Model controller mode: the health tick touches the gauge, so the series
+	// appears.
+	SetJobDispatcherSubscribed(true)
+	assert.True(t, gatherHasMetric(t, name),
+		"a touched (controller-mode) gauge vec must export %s", name)
+}
+
+// gatherHasMetric reports whether the default Prometheus gatherer currently
+// exposes any series for the named metric family.
+func gatherHasMetric(t *testing.T, name string) bool {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, mf := range families {
+		if mf.GetName() == name && len(mf.GetMetric()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// TestMetricNamesIsComplete guards the O11 single-source-of-truth invariant:
+// MetricNames() must list every registered scale_csi metric (no manual list to
+// drift) and every name must carry the scale_csi_ prefix. The chart drift test
+// relies on this set being exactly the registered set.
+func TestMetricNamesIsComplete(t *testing.T) {
+	names := MetricNames()
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		assert.True(t, strings.HasPrefix(name, "scale_csi_"), "metric name %q missing the scale_csi_ prefix", name)
+		assert.False(t, set[name], "metric name %q registered more than once", name)
+		set[name] = true
+	}
+
+	// A representative cross-section of metrics across every reg* helper must be
+	// present, proving registration populates the list automatically.
+	for _, want := range []string{
+		"scale_csi_operations_total",
+		"scale_csi_operations_duration_seconds",
+		"scale_csi_truenas_requests_total",
+		"scale_csi_truenas_connection_status",
+		"scale_csi_pool_available_bytes",
+		"scale_csi_pool_capacity_bytes",
+		"scale_csi_fencing_stale_deferred_total",
+		"scale_csi_manual_recovery_tombstones",
+		"scale_csi_tombstone_reaped_total",
+		"scale_csi_job_dispatcher_subscribed",
+	} {
+		assert.True(t, set[want], "MetricNames() missing %q", want)
+	}
+
+	// The returned slice is a copy: mutating it must not corrupt the source.
+	names[0] = "tampered"
+	assert.NotEqual(t, "tampered", MetricNames()[0])
 }
 
 func TestReconcileAndFencingMetrics(t *testing.T) {

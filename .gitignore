@@ -8,3 +8,7 @@ test-smoke-nfs.yaml
 test-snapshot.yaml
 /debug-api
 /scale-csi
+
+# Local build/test artifacts
+*.log
+*.out

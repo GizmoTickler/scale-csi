@@ -11,7 +11,8 @@ spec:
   # Requests pod information in NodePublishVolume calls
   podInfoOnMount: true
   # Storage capacity tracking
-  storageCapacity: false
+  {{- /* UPGRADE NOTE: opt-in via capacity.enabled (default false => byte-identical render). spec.storageCapacity is mutable, but flipping true -> false leaves orphan CSIStorageCapacity objects: the external-provisioner GCs them via ownerref on Deployment delete, yet a toggle-off WITHOUT a redeploy leaks them, so disabling capacity requires deleting the driver's csistoragecapacities (no finalizer). Helm-side comment so output stays byte-identical. */}}
+  storageCapacity: {{ .Values.capacity.enabled }}
   # Volume lifecycle modes
   volumeLifecycleModes:
     - Persistent
