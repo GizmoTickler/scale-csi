@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -310,11 +311,12 @@ func TestTransportCountersIncrementThroughMetricsRegistry(t *testing.T) {
 
 func TestSetOrphanReconcileMetrics(t *testing.T) {
 	SetOrphanReconcileMetrics(ReconcileReport{
-		OrphanVolumeCount:         2,
-		OrphanSnapshotCount:       3,
-		SpentRestoreSnapshotCount: 4,
-		OrphanVolumeBytes:         1024,
-		OrphanSnapshotBytes:       2048,
+		OrphanVolumeCount:            2,
+		OrphanSnapshotCount:          3,
+		SpentRestoreSnapshotCount:    4,
+		OrphanVolumeBytes:            1024,
+		OrphanSnapshotBytes:          2048,
+		ManualRecoveryTombstoneCount: 7,
 	})
 
 	assert.Equal(t, float64(2), testutil.ToFloat64(orphanVolumes))
@@ -322,6 +324,71 @@ func TestSetOrphanReconcileMetrics(t *testing.T) {
 	assert.Equal(t, float64(4), testutil.ToFloat64(spentRestoreSnapshots))
 	assert.Equal(t, float64(1024), testutil.ToFloat64(orphanVolumesBytes))
 	assert.Equal(t, float64(2048), testutil.ToFloat64(orphanSnapshotsBytes))
+	// O5: the manual-recovery tombstone count was previously computed but dropped
+	// on the floor; it must now publish to its gauge.
+	assert.Equal(t, float64(7), testutil.ToFloat64(manualRecoveryTombstones))
+}
+
+// TestRecordTombstoneReaped guards the O6 reap-throughput counter: the path
+// label is a fixed 2-value enum (ledger / scan_fallback) and each reap
+// increments exactly its own series.
+func TestRecordTombstoneReaped(t *testing.T) {
+	ledger := tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathLedger)
+	scanFallback := tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathScanFallback)
+	ledgerBefore := testutil.ToFloat64(ledger)
+	scanFallbackBefore := testutil.ToFloat64(scanFallback)
+
+	RecordTombstoneReaped(tombstoneReapedPathLedger)
+	RecordTombstoneReaped(tombstoneReapedPathScanFallback)
+	RecordTombstoneReaped(tombstoneReapedPathScanFallback)
+
+	assert.Equal(t, ledgerBefore+1, testutil.ToFloat64(ledger))
+	assert.Equal(t, scanFallbackBefore+2, testutil.ToFloat64(scanFallback))
+}
+
+// TestSetJobDispatcherSubscribed guards the O7 health gauge: it tracks the
+// core.get_jobs subscription bit exactly (1 = subscribed, 0 = pure-poll).
+func TestSetJobDispatcherSubscribed(t *testing.T) {
+	SetJobDispatcherSubscribed(true)
+	assert.Equal(t, float64(1), testutil.ToFloat64(jobDispatcherSubscribed))
+
+	SetJobDispatcherSubscribed(false)
+	assert.Equal(t, float64(0), testutil.ToFloat64(jobDispatcherSubscribed))
+}
+
+// TestMetricNamesIsComplete guards the O11 single-source-of-truth invariant:
+// MetricNames() must list every registered scale_csi metric (no manual list to
+// drift) and every name must carry the scale_csi_ prefix. The chart drift test
+// relies on this set being exactly the registered set.
+func TestMetricNamesIsComplete(t *testing.T) {
+	names := MetricNames()
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		assert.True(t, strings.HasPrefix(name, "scale_csi_"), "metric name %q missing the scale_csi_ prefix", name)
+		assert.False(t, set[name], "metric name %q registered more than once", name)
+		set[name] = true
+	}
+
+	// A representative cross-section of metrics across every reg* helper must be
+	// present, proving registration populates the list automatically.
+	for _, want := range []string{
+		"scale_csi_operations_total",
+		"scale_csi_operations_duration_seconds",
+		"scale_csi_truenas_requests_total",
+		"scale_csi_truenas_connection_status",
+		"scale_csi_pool_available_bytes",
+		"scale_csi_pool_capacity_bytes",
+		"scale_csi_fencing_stale_deferred_total",
+		"scale_csi_manual_recovery_tombstones",
+		"scale_csi_tombstone_reaped_total",
+		"scale_csi_job_dispatcher_subscribed",
+	} {
+		assert.True(t, set[want], "MetricNames() missing %q", want)
+	}
+
+	// The returned slice is a copy: mutating it must not corrupt the source.
+	names[0] = "tampered"
+	assert.NotEqual(t, "tampered", MetricNames()[0])
 }
 
 func TestReconcileAndFencingMetrics(t *testing.T) {

@@ -845,6 +845,11 @@ func (d *Driver) deleteDetectedOrphans(
 			continue
 		}
 		report.DeletedTombstones = append(report.DeletedTombstones, tombstone.ID)
+		if tombstone.tombstoneScanFallback {
+			RecordTombstoneReaped(tombstoneReapedPathScanFallback)
+		} else {
+			RecordTombstoneReaped(tombstoneReapedPathLedger)
+		}
 		deletedCount++
 	}
 	// Batch-remove the retired tombstone ledger entries now (one size-bounded

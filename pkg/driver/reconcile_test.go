@@ -1008,6 +1008,65 @@ func TestReconcileTombstoneScanFallbackRunsAlongsideStrictBacklog(t *testing.T) 
 	assert.True(t, truenas.IsNotFoundError(err), "independent fallback candidate is reaped")
 }
 
+// TestReconcileTombstoneReapedCounterByPath guards the O6 reap-throughput counter
+// wiring at the reap site: a ledger-proven tombstone increments
+// tombstone_reaped_total{path="ledger"} and a scan-fallback tombstone increments
+// {path="scan_fallback"}, each exactly once in the same pass.
+func TestReconcileTombstoneReapedCounterByPath(t *testing.T) {
+	ctx := context.Background()
+	pvs := []runtime.Object{
+		reconcilePV("ledger-source", "csi.scale.io"),
+		reconcilePV("fallback-source", "csi.scale.io"),
+	}
+	d, client := newReconcileTestDriver(t, false, pvs, nil)
+	client.NoDeferredSnapshotDestroy = true
+	enabled := true
+	d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
+	mustCreateParentDataset(t, client)
+
+	createRenamed := func(sourceID, original string, nonce int64) *truenas.Snapshot {
+		source := addReconcileDataset(client, sourceID, time.Now().Add(-72*time.Hour), true, testGiB)
+		require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+		snapshot, err := client.SnapshotCreate(ctx, source.Name, sanitizeVolumeID(original), map[string]string{
+			PropManagedResource:           "true",
+			PropDriverInstanceID:          d.driverInstanceID(),
+			PropCSISnapshotName:           original,
+			PropCSISnapshotSourceVolumeID: sourceID,
+		})
+		require.NoError(t, err)
+		snapshot.Properties["creation"] = map[string]interface{}{"parsed": float64(time.Now().Add(-48 * time.Hour).Unix())}
+		tombstoneName := snapshotTombstoneName(source.Name, sanitizeVolumeID(original), nonce)
+		require.NoError(t, client.SnapshotRename(ctx, snapshot.ID, tombstoneName))
+		renamed, err := client.SnapshotGet(ctx, source.Name+"@"+tombstoneName)
+		require.NoError(t, err)
+		return renamed
+	}
+
+	// Ledger-proven: carries a ledger entry and no blocking clone, so the strict
+	// ledger path reaps it.
+	ledger := createRenamed("ledger-source", "ledger-snap", 1)
+	require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+		Version: tombstoneLedgerVersion, Snapshot: ledger.ID, Dataset: ledger.Dataset,
+		CreatedAt: ledger.GetCreationTime(), RenamedAt: time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339Nano),
+	}))
+	// Scan-fallback: no ledger entry, so it is discovered and reaped only by the
+	// scan fallback path.
+	fallback := createRenamed("fallback-source", "fallback-snap", 2)
+
+	ledgerSeries := tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathLedger)
+	fallbackSeries := tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathScanFallback)
+	ledgerBefore := testutil.ToFloat64(ledgerSeries)
+	fallbackBefore := testutil.ToFloat64(fallbackSeries)
+
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: true, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Contains(t, report.DeletedTombstones, ledger.ID, "ledger-proven tombstone is reaped")
+	assert.Contains(t, report.DeletedTombstones, fallback.ID, "scan-fallback tombstone is reaped")
+
+	assert.Equal(t, ledgerBefore+1, testutil.ToFloat64(ledgerSeries), "exactly one ledger-path reap")
+	assert.Equal(t, fallbackBefore+1, testutil.ToFloat64(fallbackSeries), "exactly one scan-fallback-path reap")
+}
+
 // TestReconcileScanFallbackRefusesInheritedTombstoneIdentity is the Batch 18 R0
 // regression: on TrueNAS 26.0 the snapshot resource path returns SOURCELESS
 // user_properties, so a tombstone-shaped snapshot could carry csi_snapshot_name

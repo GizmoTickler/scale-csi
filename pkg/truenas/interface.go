@@ -18,6 +18,10 @@ type ClientInterface interface {
 	CircuitBreakerStats() *CircuitBreakerStats
 	ResetCircuitBreaker()
 
+	// AnyConnectionJobSubscribed reports whether a pooled connection holds a live
+	// core.get_jobs subscription (false = pure-poll fallback).
+	AnyConnectionJobSubscribed() bool
+
 	// Dataset methods
 	DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error)
 	DatasetDelete(ctx context.Context, name string, recursive, force bool) error

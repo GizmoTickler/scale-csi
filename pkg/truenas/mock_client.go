@@ -65,6 +65,9 @@ type MockClient struct {
 	// live clones always fails with ErrSnapshotHasClones regardless of the defer
 	// flag, so the driver's tombstone is retained until its last clone is gone.
 	NoDeferredSnapshotDestroy bool
+	// JobSubscribed is the value AnyConnectionJobSubscribed reports, letting a
+	// health test drive the scale_csi_job_dispatcher_subscribed gauge.
+	JobSubscribed bool
 }
 
 // DatasetDeleteCall records the deletion mode requested by a test.
@@ -326,6 +329,13 @@ func (m *MockClient) ReplicationJobAbortHistory() ([]int64, []string) {
 // Circuit breaker methods (return nil/no-op for mock)
 func (m *MockClient) CircuitBreakerStats() *CircuitBreakerStats { return nil }
 func (m *MockClient) ResetCircuitBreaker()                      {}
+
+// AnyConnectionJobSubscribed returns the test-configurable subscription bit.
+func (m *MockClient) AnyConnectionJobSubscribed() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.JobSubscribed
+}
 
 // Dataset methods
 func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error) {
