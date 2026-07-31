@@ -235,7 +235,20 @@ backend loss.
   even when CHAP is on. The driver does not currently provide per-tenant iSCSI
   isolation. CHAP credentials are supplied per StorageClass via a Kubernetes
   Secret, are never written to the PV volume context, and are redacted from all
-  driver logs and errors.
+  driver logs, gRPC errors, and Kubernetes Events: password-setting `iscsiadm`
+  failures surface only the parameter name and an exit class, never the command
+  output.
+- **Accepted host-trust exposure (CHAP).** CHAP session credentials are applied
+  on the node by passing them to `iscsiadm` as `-v <value>` arguments, so the
+  credential is briefly visible in the host process table (`/proc/<pid>/cmdline`)
+  while the call runs, and open-iscsi persists the session credential in the host
+  node database under `/var/lib/iscsi` (and `/etc/iscsi`) for as long as the node
+  record exists. The node DaemonSet is privileged with `hostPID` and mounts these
+  host paths, so any root-level actor on the node can read the credential. This is
+  an explicit, accepted root-on-host trust assumption — CHAP protects against
+  off-host initiators, not against a compromised node. Treat node root as
+  equivalent to holding every CHAP secret staged on that node, and rely on
+  network segmentation plus node hardening accordingly.
 - `DeleteVolume` preserves non-CSI snapshots by default, including snapshots
   inherited from periodic-snapshot or replication tasks on the parent dataset.
   It returns `FailedPrecondition` until those snapshots are removed or the task

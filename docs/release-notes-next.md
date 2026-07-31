@@ -342,8 +342,13 @@ PVs are not reprovisioned merely because new claims use the replacement class.
   defaults.
 - The unused additional-iSCSI-portal chart setting is removed. Existing values
   files that attempted multi-portal configuration must remove that entry.
-- CHAP and iSCSI multipath remain unsupported; TCP 3260 must be protected by the
-  storage-network trust boundary.
+- iSCSI CHAP session authentication is now supported (opt-in, per StorageClass;
+  one-way and mutual). The per-volume auth mode/tag are stamped immutably and
+  reconstructed on fence passes; credentials never reach the PV volume context and
+  are redacted from logs, errors, and Events. iSCSI multipath remains unsupported.
+  CHAP authenticates the session but does not encrypt data in flight, so TCP 3260
+  must still be protected by the storage-network trust boundary. See
+  [iSCSI CHAP](reference/storageclass.md#iscsi-chap).
 
 ## Release governance
 

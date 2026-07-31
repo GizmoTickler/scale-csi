@@ -289,7 +289,10 @@ iscsi:
     # Optional operator-pinned iscsi.auth tag. 0 means derive a deterministic
     # per-StorageClass tag.
     tag: 0
-    # true selects CHAP_MUTUAL (bidirectional) authentication. Default one-way.
+    # Default authmethod hint for the controller. The effective per-volume mode is
+    # determined at CreateVolume by the CHAP Secret (presence of mutualUsername
+    # selects CHAP_MUTUAL) and stamped immutably on the volume; this flag does not
+    # override an existing volume's stored mode. Default one-way.
     mutual: false
 
 # NVMe-oF configuration

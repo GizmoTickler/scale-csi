@@ -200,8 +200,11 @@ never templated into the chart or the ConfigMap.
 
 Setting `mutualUsername`/`mutualPassword` in the Secret switches the class to
 `CHAP_MUTUAL` (bidirectional) authentication; otherwise one-way CHAP is used.
-The controller-wide `iscsi.chap.mutual` Helm flag sets the authmethod advertised
-on target groups rebuilt from a stored dataset property (fence/idempotent paths).
+The per-volume auth mode is stamped immutably at `CreateVolume` (as a local
+dataset property) and every later fence/idempotent-rebuild path reads that stored
+mode — never the controller-wide `iscsi.chap.mutual` Helm flag. This means one-way
+and mutual StorageClasses coexist safely, and flipping the global flag or
+restarting the controller never changes an existing volume's authmethod.
 
 ### Behavior and limitations
 
@@ -211,11 +214,20 @@ on target groups rebuilt from a stored dataset property (fence/idempotent paths)
   peer per StorageClass credential (keyed by tag) and reuses it. `DeleteVolume`
   does not delete the peer; removing a CHAP StorageClass leaves its peer behind
   for the operator to reap.
-- **Rotation.** Update the Secret, then restart the controller (clears the
-  in-driver peer cache) and create any volume on the class to trigger
-  `iscsi.auth.update`. Established sessions survive a rotation — CHAP is checked
-  only at login — so a rotated secret takes effect on the next `NodeStageVolume`.
-  To force immediate enforcement, cordon/drain the node to re-stage.
+- **Rotation.** Update the Secret's `password`/`mutualPassword` (keep the same
+  `username` and tag). The next `CreateVolume` on the class detects the changed
+  credential — the in-driver peer cache is validated by credential fingerprint,
+  not just username — and re-keys the backend peer in place via
+  `iscsi.auth.update` (no controller restart required); a redacted
+  `ISCSICHAPRotated` Event records it. The tag is stable, so no target group is
+  touched. Established sessions survive a rotation — CHAP is checked only at
+  login — so a rotated secret takes effect on the next `NodeStageVolume`. To force
+  immediate enforcement, cordon/drain the node to re-stage.
+- **CHAP policy is immutable per volume.** The auth *mode* and *tag* are fixed for
+  a volume's lifetime. An idempotent `CreateVolume` replay that would change the
+  policy — enabling CHAP on a previously non-CHAP volume (or the reverse), or a
+  different tag/mode — is rejected with `FailedPrecondition`. Only the secret
+  *value* rotates (above); to change the policy, provision a new volume.
 - **Wrong secret.** A bad password fails `NodeStageVolume` fast with
   `Unauthenticated` and no discovery-retry storm; the pod stays
   `ContainerCreating` until the Secret is corrected.
