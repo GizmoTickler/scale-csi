@@ -348,6 +348,16 @@ nfs:
 			assert.Contains(t, err.Error(), "truenas.maxConnections")
 		}
 	})
+
+	// An explicit zero must be rejected, not coerced to the default of 5: the
+	// default is seeded pre-decode so a hand-written `maxConnections: 0` survives
+	// decoding and trips the 1..16 validation, matching the chart schema (which
+	// also rejects 0). Coercing it would silently accept an operator typo.
+	t.Run("rejects an explicit zero", func(t *testing.T) {
+		_, err := loadTestConfig(t, withMaxConnections("  maxConnections: 0\n"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "truenas.maxConnections")
+	})
 }
 
 func TestLoadConfigReconcileDefaultsAreSafe(t *testing.T) {

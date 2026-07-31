@@ -34,7 +34,9 @@ data:
       connectTimeout: {{ .Values.truenas.connectTimeout }}
       writeTimeout: {{ .Values.truenas.writeTimeout | default 30 }}
       maxConcurrentRequests: {{ .Values.truenas.maxConcurrentRequests | default 10 }}
-      maxConnections: {{ .Values.truenas.maxConnections | default 5 }}
+      {{- if not (kindIs "invalid" .Values.truenas.maxConnections) }}
+      maxConnections: {{ .Values.truenas.maxConnections }}
+      {{- end }}
 
     # ZFS dataset configuration
     zfs:

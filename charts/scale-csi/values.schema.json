@@ -458,7 +458,10 @@
           "minimum": 1
         },
         "maxConnections": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "maximum": 16
         }

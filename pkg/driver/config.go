@@ -618,13 +618,16 @@ func LoadConfig(path string) (*Config, error) {
 	data = []byte(os.ExpandEnv(string(data)))
 
 	// Defaults must be applied before unmarshalling so an explicit YAML false
-	// still overrides the default.
+	// still overrides the default. MaxConnections is seeded here (not normalized
+	// post-decode) so an explicit `maxConnections: 0` survives decoding and is
+	// rejected by the 1..16 validation instead of being silently coerced to 5.
 	cfg := &Config{
 		Fencing: FencingConfig{
 			Mode:                    FencingModeOff,
 			StartupReconcileTimeout: "10m",
 			StaleRecordGracePeriod:  "10m",
 		},
+		TrueNAS:   TrueNASConfig{MaxConnections: 5},
 		ZFS:       ZFSConfig{DatasetEnableQuotas: true},
 		SessionGC: SessionGCConfig{Enabled: true},
 		Reconcile: ReconcileConfig{
@@ -795,9 +798,6 @@ func applyConfigDefaults(cfg *Config) {
 	}
 	if cfg.TrueNAS.MaxConcurrentRequests == 0 {
 		cfg.TrueNAS.MaxConcurrentRequests = 10
-	}
-	if cfg.TrueNAS.MaxConnections == 0 {
-		cfg.TrueNAS.MaxConnections = 5
 	}
 	if cfg.ZFS.ZvolBlocksize == "" {
 		cfg.ZFS.ZvolBlocksize = "16K"

@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func chartDir(t *testing.T) string {
@@ -69,17 +71,93 @@ func TestChartDeprecatedKeysNotRendered(t *testing.T) {
 	}
 }
 
-// TestChartTrueNASMaxConnectionsPlumbing proves the truenas.maxConnections key
-// renders end-to-end into the driver configmap: the pool-size default of 5 when
-// unset, and the overridden value when set. A regression that drops the plumbing
-// (reverting the pool to a hardcoded, unconfigurable size) fails here.
+// v130TrueNASConfig is a replica of the TrueNASConfig struct shipped in v1.3.0,
+// BEFORE sprint1 added maxConnections. It is the strict-parse rollback contract
+// for the default rendered truenas: block: a v1.3.0 binary decodes config with
+// KnownFields(true) and has no maxConnections field, so any key the DEFAULT
+// render emits that is absent here crash-loops an image-only rollback or mixed
+// rollout at config parse. If you add a new truenas key to the default render,
+// this replica makes the regression test fail until you consciously add the field
+// here WITH a rollback note explaining why an old binary can still parse the new
+// ConfigMap (usually it cannot — so render the key only on explicit override).
+type v130TrueNASConfig struct {
+	Host                  string `yaml:"host"`
+	Port                  int    `yaml:"port"`
+	Protocol              string `yaml:"protocol"`
+	APIKey                string `yaml:"apiKey"`
+	AllowInsecure         bool   `yaml:"allowInsecure"`
+	CACert                string `yaml:"caCert"`
+	CACertFile            string `yaml:"caCertFile"`
+	RequestTimeout        int    `yaml:"requestTimeout"`
+	ConnectTimeout        int    `yaml:"connectTimeout"`
+	WriteTimeout          int    `yaml:"writeTimeout"`
+	MaxConcurrentRequests int    `yaml:"maxConcurrentRequests"`
+}
+
+// renderedTrueNASBlock extracts the truenas: mapping from the rendered driver
+// ConfigMap so it can be strict-parsed against v130TrueNASConfig.
+func renderedTrueNASBlock(t *testing.T, rendered string) []byte {
+	t.Helper()
+	var manifest struct {
+		Kind string            `yaml:"kind"`
+		Data map[string]string `yaml:"data"`
+	}
+	if err := yaml.Unmarshal([]byte(rendered), &manifest); err != nil {
+		t.Fatalf("decode rendered ConfigMap manifest: %v", err)
+	}
+	if manifest.Kind != "ConfigMap" {
+		t.Fatalf("expected a ConfigMap manifest, got kind %q", manifest.Kind)
+	}
+	configYAML, ok := manifest.Data["config.yaml"]
+	if !ok {
+		t.Fatalf("rendered ConfigMap has no config.yaml data key")
+	}
+	// Isolate the truenas: subtree (non-strict, so the other top-level config
+	// keys are ignored) and re-encode it for a strict decode against the replica.
+	var cfg struct {
+		TrueNAS yaml.Node `yaml:"truenas"`
+	}
+	if err := yaml.Unmarshal([]byte(configYAML), &cfg); err != nil {
+		t.Fatalf("decode rendered config.yaml: %v", err)
+	}
+	if cfg.TrueNAS.Kind != yaml.MappingNode {
+		t.Fatalf("rendered config.yaml has no truenas: mapping")
+	}
+	out, err := yaml.Marshal(&cfg.TrueNAS)
+	if err != nil {
+		t.Fatalf("re-encode truenas block: %v", err)
+	}
+	return out
+}
+
+// TestChartTrueNASMaxConnectionsPlumbing guards the truenas.maxConnections
+// removal-only render invariant. The driver-side default of 5 is the source of
+// truth; the chart renders the key ONLY on explicit override so the default
+// ConfigMap stays parseable by the v1.3.0 strict loader (which has no
+// maxConnections field). A regression that re-adds the key to the default render
+// (breaking image-only rollback / mixed rollouts) fails here.
 func TestChartTrueNASMaxConnectionsPlumbing(t *testing.T) {
-	if out := helmTemplate(t); !strings.Contains(out, "      maxConnections: 5\n") {
-		t.Errorf("default render does not carry truenas.maxConnections=5 in the configmap")
-	}
-	if out := helmTemplate(t, "--set", "truenas.maxConnections=9"); !strings.Contains(out, "      maxConnections: 9\n") {
-		t.Errorf("--set truenas.maxConnections=9 did not propagate into the rendered configmap")
-	}
+	t.Run("default render omits maxConnections", func(t *testing.T) {
+		if out := helmTemplate(t); strings.Contains(out, "maxConnections:") {
+			t.Errorf("default render must not emit truenas.maxConnections; a v1.3.0 strict parser has no such field and would crash-loop")
+		}
+	})
+
+	t.Run("override renders the key", func(t *testing.T) {
+		if out := helmTemplate(t, "--set", "truenas.maxConnections=8"); !strings.Contains(out, "      maxConnections: 8\n") {
+			t.Errorf("--set truenas.maxConnections=8 did not propagate into the rendered configmap")
+		}
+	})
+
+	t.Run("default truenas block parses on the v1.3.0 strict loader", func(t *testing.T) {
+		block := renderedTrueNASBlock(t, helmTemplate(t, "--show-only", "templates/configmap.yaml"))
+		dec := yaml.NewDecoder(strings.NewReader(string(block)))
+		dec.KnownFields(true)
+		var replica v130TrueNASConfig
+		if err := dec.Decode(&replica); err != nil {
+			t.Errorf("default rendered truenas: block is not parseable by the v1.3.0 strict loader; a new key was added without a rollback note: %v", err)
+		}
+	})
 }
 
 // TestChartRateLimitingDeprecation proves the retired

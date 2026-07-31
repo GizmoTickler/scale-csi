@@ -185,9 +185,12 @@ truenas:
   maxConcurrentRequests: 10
 
   # Size of the TrueNAS WebSocket connection pool the controller multiplexes API
-  # calls across (default: 5, valid range 1..16). Values outside the range are a
-  # startup validation error.
-  maxConnections: 5
+  # calls across (valid range 1..16). Left null by default so the key is NOT
+  # rendered into the ConfigMap and the driver applies its own default of 5 —
+  # keeping the default render compatible with the v1.3.0 strict config parser,
+  # which has no maxConnections field. Set a value to override; values outside
+  # the range are a startup validation error.
+  maxConnections: null
 
 # ZFS configuration
 zfs:

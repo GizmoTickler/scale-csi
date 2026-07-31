@@ -667,6 +667,16 @@ func assertAPICallCount(t *testing.T, operation string, client *apiCallCountingC
 	}
 }
 
+// assertAPICallMethodMap pins the exact per-method ClientInterface call counts so
+// a method substitution that keeps the total constant still fails (the total-only
+// assert above would pass such a substitution). It complements assertAPICallCount,
+// which is still called alongside it to keep the headline total readable.
+func assertAPICallMethodMap(t *testing.T, operation string, client *apiCallCountingClient, want map[string]int) {
+	t.Helper()
+	_, methods := client.callSnapshot()
+	assert.Equal(t, want, methods, "%s per-method API call map mismatch", operation)
+}
+
 func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 	tests := []struct {
 		name string
@@ -900,6 +910,12 @@ func iscsiPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRe
 // the publish/unpublish path (the P1 optimization target). Each case documents
 // every driver-to-TrueNAS call so a regression that re-introduces a duplicate
 // resolution or a wasted write fails with an explicit per-method delta.
+//
+// These goldens count high-level ClientInterface calls, NOT wire RTTs: a single
+// counted method may issue several JSON-RPC round trips underneath (e.g.
+// WaitForZvolReady polls with repeated DatasetGet wire calls, and an unresolved
+// ServiceReload can issue both service.reload and service.control), all folded
+// into one count here.
 func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 	ctx := context.Background()
 
@@ -1095,6 +1111,15 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		//                                  validateBackend/applyBackendFence, so this
 		//                                  is the floor).
 		assertAPICallCount(t, "off iSCSI publish", client, 8)
+		assertAPICallMethodMap(t, "off iSCSI publish", client, map[string]int{
+			"DatasetGet":               1,
+			"ISCSITargetGet":           1,
+			"WaitForZvolReady":         1,
+			"ISCSIExtentGet":           1,
+			"ISCSITargetExtentGet":     1,
+			"DatasetSetUserProperties": 2,
+			"ServiceReload":            1,
+		})
 	})
 	t.Run("off iSCSI unpublish", func(t *testing.T) {
 		client := newAPICallCountingClient()
@@ -1115,6 +1140,11 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		//                                  access is removed (crash-safe tombstone).
 		// 3. DatasetRemoveUserProperties — removePublicationRecords clears the record.
 		assertAPICallCount(t, "off iSCSI unpublish", client, 3)
+		assertAPICallMethodMap(t, "off iSCSI unpublish", client, map[string]int{
+			"DatasetGet":                  1,
+			"DatasetSetUserProperties":    1,
+			"DatasetRemoveUserProperties": 1,
+		})
 	})
 
 	// (e) strict + iSCSI — full backend enforcement. The publish ensures the share
@@ -1148,6 +1178,19 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		//   ISCSITargetUpdate         x1 — fence rebinds the target to the converged
 		//                                  initiator group.
 		assertAPICallCount(t, "strict iSCSI publish", client, 16)
+		assertAPICallMethodMap(t, "strict iSCSI publish", client, map[string]int{
+			"DatasetGet":               1,
+			"ISCSITargetGet":           2,
+			"WaitForZvolReady":         1,
+			"ISCSIExtentGet":           1,
+			"ISCSITargetExtentGet":     1,
+			"DatasetSetUserProperties": 3,
+			"ServiceReload":            2,
+			"ISCSIPortalList":          1,
+			"ISCSIInitiatorGet":        2,
+			"ISCSIInitiatorUpdate":     1,
+			"ISCSITargetUpdate":        1,
+		})
 	})
 	t.Run("strict iSCSI unpublish", func(t *testing.T) {
 		client := newAPICallCountingClient()
@@ -1172,6 +1215,16 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		//   ServiceReload               x1 — post-fence iscsitarget reload.
 		//   DatasetRemoveUserProperties x1 — removePublicationRecords clears the record.
 		assertAPICallCount(t, "strict iSCSI unpublish", client, 9)
+		assertAPICallMethodMap(t, "strict iSCSI unpublish", client, map[string]int{
+			"DatasetGet":                  1,
+			"DatasetSetUserProperties":    2,
+			"ISCSITargetGet":              1,
+			"ISCSIInitiatorGet":           1,
+			"ISCSIInitiatorUpdate":        1,
+			"ISCSITargetUpdate":           1,
+			"ServiceReload":               1,
+			"DatasetRemoveUserProperties": 1,
+		})
 	})
 }
 
