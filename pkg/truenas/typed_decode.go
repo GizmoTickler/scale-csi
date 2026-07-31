@@ -11,7 +11,14 @@ type rawProperty struct {
 	Parsed   interface{} `json:"parsed"`
 	Rawvalue string      `json:"rawvalue"`
 	Raw      string      `json:"raw"`
-	Source   string      `json:"source"`
+	// Source is a string on pool.dataset.query but an OBJECT {type,value} on
+	// zfs.resource.query native properties (TrueNAS 26.0). The legacy
+	// parseProperty dropped non-string sources; a plain string field instead
+	// hard-failed the whole decode, silently degrading every managed-dataset
+	// listing to the pool.dataset.query fallback since v1.3.0 (found live in
+	// the 2026-07-31 drill; prod logged the fallback 125x/24h). tolerantString
+	// restores the legacy drop-if-not-string semantics.
+	Source tolerantString `json:"source"`
 }
 
 func (p rawProperty) toDatasetProperty() DatasetProperty {
@@ -19,7 +26,7 @@ func (p rawProperty) toDatasetProperty() DatasetProperty {
 		Value:    p.Value,
 		Parsed:   p.Parsed,
 		Rawvalue: p.Rawvalue,
-		Source:   p.Source,
+		Source:   string(p.Source),
 	}
 }
 
