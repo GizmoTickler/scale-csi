@@ -90,6 +90,13 @@ data:
       extentRpm: {{ .Values.iscsi.extentRpm | quote }}
       deviceWaitTimeout: {{ .Values.iscsi.deviceWaitTimeout | default 60 }}
       serviceReloadDebounce: {{ .Values.iscsi.serviceReloadDebounce | default 2000 }}
+      {{- if .Values.iscsi.chap.enabled }}
+      # CHAP is opt-in; this block renders only when iscsi.chap.enabled=true.
+      chap:
+        enabled: true
+        tag: {{ .Values.iscsi.chap.tag | default 0 }}
+        mutual: {{ .Values.iscsi.chap.mutual }}
+      {{- end }}
     {{- end }}
 
     {{- if .Values.nvmeof.enabled }}

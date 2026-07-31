@@ -163,6 +163,13 @@
         },
         "extraParameters": {
           "$ref": "#/definitions/stringMap"
+        },
+        "chapSecretName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chapSecretNamespace": {
+          "type": "string"
         }
       }
     }
@@ -610,6 +617,22 @@
         "serviceReloadDebounce": {
           "type": "integer",
           "minimum": 0
+        },
+        "chap": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "tag": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "mutual": {
+              "type": "boolean"
+            }
+          }
         },
         "targetGroups": {
           "type": "array",

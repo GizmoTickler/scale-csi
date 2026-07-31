@@ -277,6 +277,21 @@ iscsi:
   # This prevents reload storms during bulk volume provisioning (default: 2000ms)
   serviceReloadDebounce: 2000
 
+  # iSCSI CHAP authentication. Strictly opt-in: with enabled=false (default)
+  # every target group stays authmethod=NONE and nothing CHAP-related renders
+  # into the ConfigMap, so behavior is identical to a pre-CHAP deployment.
+  # Credentials are NEVER set here; they are supplied per-StorageClass via the
+  # CSI provisioner/node-stage secret refs (see chapSecretName on a
+  # storageClasses[] entry and docs/reference/storageclass.md).
+  chap:
+    # Opt the controller into CHAP peer management. Default off.
+    enabled: false
+    # Optional operator-pinned iscsi.auth tag. 0 means derive a deterministic
+    # per-StorageClass tag.
+    tag: 0
+    # true selects CHAP_MUTUAL (bidirectional) authentication. Default one-way.
+    mutual: false
+
 # NVMe-oF configuration
 nvmeof:
   # Enable NVMe-oF support
@@ -333,6 +348,25 @@ storageClasses:
     enabled: false
     protocol: nvmeof
     snapshotRestoreMode: detached
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: []
+    extraParameters: {}
+  # Opt-in example: an iSCSI class with CHAP authentication. Disabled by
+  # default. Enable it (and iscsi.chap.enabled above) to create it. The CHAP
+  # credentials live in a Kubernetes Secret named chapSecretName (created by
+  # the operator, see docs/reference/storageclass.md); the chart only renders
+  # the CSI secret-ref parameters, never the credential values. The same Secret
+  # is used for both provisioner-secret (CreateVolume) and node-stage-secret
+  # (NodeStageVolume).
+  - name: scale-iscsi-chap
+    enabled: false
+    protocol: iscsi
+    chapSecretName: scale-iscsi-chap
+    # chapSecretNamespace defaults to the release namespace when unset.
+    chapSecretNamespace: ""
     isDefault: false
     reclaimPolicy: Delete
     allowVolumeExpansion: true

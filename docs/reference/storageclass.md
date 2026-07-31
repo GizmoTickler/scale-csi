@@ -128,9 +128,100 @@ spec:
       storage: 100Gi
 ```
 
-iSCSI is single-path. CHAP and dm-multipath are unsupported; protect TCP 3260
-with node-only network policy outside Kubernetes (for example a storage VLAN
-and firewall/SGACL rules).
+iSCSI is single-path; dm-multipath is unsupported. CHAP authentication is
+supported (see [iSCSI CHAP](#iscsi-chap) below) but CHAP authenticates the
+session — it does not encrypt data in flight — so also protect TCP 3260 with
+node-only network policy outside Kubernetes (for example a storage VLAN and
+firewall/SGACL rules).
+
+## iSCSI CHAP
+
+CHAP is strictly opt-in and is configured per StorageClass. Two things must be
+true for a class to use CHAP:
+
+1. The controller is opted in via Helm (`iscsi.chap.enabled: true`). With this
+   off (the default), no CHAP peers are managed and every target stays
+   `authmethod=NONE`.
+2. The StorageClass references a Kubernetes Secret holding the credential, via
+   the standard CSI secret-ref parameters. The same Secret is used for both
+   provisioning (`CreateVolume`) and node staging (`NodeStageVolume`).
+
+### The CHAP Secret
+
+One Secret per StorageClass credential, shared by all volumes of that class
+(per-volume credentials are not supported — there is no CSI channel to deliver a
+driver-generated per-volume secret to the node). TrueNAS enforces a secret
+length of **12–16 characters inclusive** for both `password` and
+`mutualPassword`; the driver rejects anything else with `InvalidArgument` before
+calling TrueNAS.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: scale-iscsi-chap
+  namespace: scale-csi
+stringData:
+  username:       chapuser          # required
+  password:       chapsecret123     # required, 12-16 chars
+  mutualUsername: peeruser          # optional; presence implies CHAP_MUTUAL
+  mutualPassword: peersecret456     # required iff mutualUsername is set, 12-16 chars, != password
+  tag:            "1234"            # optional operator-pinned iscsi.auth tag (omit to derive)
+```
+
+Legacy open-iscsi-style aliases are also accepted: `node.session.auth.username`,
+`node.session.auth.password`, `node.session.auth.username_in`,
+`node.session.auth.password_in`.
+
+### The CHAP StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: scale-iscsi-chap
+provisioner: csi.scale.io
+parameters:
+  protocol: iscsi
+  csi.storage.k8s.io/provisioner-secret-name: scale-iscsi-chap
+  csi.storage.k8s.io/provisioner-secret-namespace: scale-csi
+  csi.storage.k8s.io/node-stage-secret-name: scale-iscsi-chap
+  csi.storage.k8s.io/node-stage-secret-namespace: scale-csi
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+```
+
+The chart renders those four parameters from a `storageClasses[]` entry that
+sets `chapSecretName` (and optional `chapSecretNamespace`, defaulting to the
+release namespace); see the bundled `scale-iscsi-chap` example in `values.yaml`.
+The chart references the Secret by name/namespace only — credential values are
+never templated into the chart or the ConfigMap.
+
+Setting `mutualUsername`/`mutualPassword` in the Secret switches the class to
+`CHAP_MUTUAL` (bidirectional) authentication; otherwise one-way CHAP is used.
+The controller-wide `iscsi.chap.mutual` Helm flag sets the authmethod advertised
+on target groups rebuilt from a stored dataset property (fence/idempotent paths).
+
+### Behavior and limitations
+
+- **Session auth only.** CHAP is applied to the node session record
+  (`node.session.auth.*`) before login. Discovery auth is out of scope.
+- **Shared peer, not deleted per volume.** The driver creates one `iscsi.auth`
+  peer per StorageClass credential (keyed by tag) and reuses it. `DeleteVolume`
+  does not delete the peer; removing a CHAP StorageClass leaves its peer behind
+  for the operator to reap.
+- **Rotation.** Update the Secret, then restart the controller (clears the
+  in-driver peer cache) and create any volume on the class to trigger
+  `iscsi.auth.update`. Established sessions survive a rotation — CHAP is checked
+  only at login — so a rotated secret takes effect on the next `NodeStageVolume`.
+  To force immediate enforcement, cordon/drain the node to re-stage.
+- **Wrong secret.** A bad password fails `NodeStageVolume` fast with
+  `Unauthenticated` and no discovery-retry storm; the pod stays
+  `ContainerCreating` until the Secret is corrected.
+- **Secrets are never persisted in the PV.** The only CHAP-related volume-context
+  key is a non-secret mode flag (`chap: CHAP|CHAP_MUTUAL`); credentials are
+  redacted from all logs and errors.
 
 ## NVMe-oF
 

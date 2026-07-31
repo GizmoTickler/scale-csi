@@ -6,6 +6,7 @@
 package chart
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -188,4 +189,94 @@ func TestChartSidecarTimeouts(t *testing.T) {
 	if got := strings.Count(out, `"--timeout=300s"`); got != 2 {
 		t.Errorf("expected exactly 2 sidecars (provisioner, snapshotter) with --timeout=300s, got %d", got)
 	}
+}
+
+// TestChartISCSIChAPPlumbing guards the iSCSI CHAP render invariant. CHAP is
+// strictly opt-in: the default render must emit NO chap: block (zero behavior
+// change for existing installs), and the block renders only when
+// iscsi.chap.enabled=true. Every new chap key (enabled/tag/mutual) is asserted
+// so a key shipped without chart plumbing fails here.
+func TestChartISCSIChAPPlumbing(t *testing.T) {
+	t.Run("default render omits the chap block", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml")
+		if strings.Contains(out, "      chap:") {
+			t.Errorf("default render must not emit iscsi.chap; CHAP is opt-in and default-off")
+		}
+	})
+
+	t.Run("enabled renders the chap block with defaults", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "iscsi.chap.enabled=true")
+		const block = "      chap:\n        enabled: true\n        tag: 0\n        mutual: false\n"
+		if !strings.Contains(out, block) {
+			t.Errorf("--set iscsi.chap.enabled=true did not render the default chap block; got:\n%s", out)
+		}
+	})
+
+	t.Run("tag and mutual propagate", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml",
+			"--set", "iscsi.chap.enabled=true",
+			"--set", "iscsi.chap.tag=1234",
+			"--set", "iscsi.chap.mutual=true")
+		const block = "      chap:\n        enabled: true\n        tag: 1234\n        mutual: true\n"
+		if !strings.Contains(out, block) {
+			t.Errorf("iscsi.chap.tag/mutual did not propagate into the rendered configmap; got:\n%s", out)
+		}
+	})
+}
+
+// TestChartISCSIChAPStorageClassSecretRefs guards the per-StorageClass CHAP
+// secret-ref plumbing. The four CSI secret-ref parameters render ONLY when a
+// class sets chapSecretName (omit-when-unset), reference the Secret by
+// name/namespace only (never credential values), and default the namespace to
+// the release namespace.
+func TestChartISCSIChAPStorageClassSecretRefs(t *testing.T) {
+	t.Run("default render emits no secret refs", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml")
+		if strings.Contains(out, "csi.storage.k8s.io/provisioner-secret-name") {
+			t.Errorf("default render must not emit CHAP secret-ref parameters")
+		}
+	})
+
+	t.Run("chapSecretName renders the four secret refs", func(t *testing.T) {
+		valuesPath := filepath.Join(t.TempDir(), "chap-values.yaml")
+		const values = `storageClasses:
+  - name: scale-iscsi-chap
+    enabled: true
+    protocol: iscsi
+    chapSecretName: scale-iscsi-chap
+    chapSecretNamespace: ""
+`
+		if err := os.WriteFile(valuesPath, []byte(values), 0o600); err != nil {
+			t.Fatalf("write override values: %v", err)
+		}
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		for _, want := range []string{
+			"csi.storage.k8s.io/provisioner-secret-name: scale-iscsi-chap",
+			"csi.storage.k8s.io/provisioner-secret-namespace: default",
+			"csi.storage.k8s.io/node-stage-secret-name: scale-iscsi-chap",
+			"csi.storage.k8s.io/node-stage-secret-namespace: default",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rendered CHAP StorageClass missing %q; got:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("explicit chapSecretNamespace is honored", func(t *testing.T) {
+		valuesPath := filepath.Join(t.TempDir(), "chap-values-ns.yaml")
+		const values = `storageClasses:
+  - name: scale-iscsi-chap
+    enabled: true
+    protocol: iscsi
+    chapSecretName: scale-iscsi-chap
+    chapSecretNamespace: kube-system
+`
+		if err := os.WriteFile(valuesPath, []byte(values), 0o600); err != nil {
+			t.Fatalf("write override values: %v", err)
+		}
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		if !strings.Contains(out, "csi.storage.k8s.io/provisioner-secret-namespace: kube-system") {
+			t.Errorf("explicit chapSecretNamespace was not honored; got:\n%s", out)
+		}
+	})
 }

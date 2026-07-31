@@ -225,10 +225,17 @@ backend loss.
   `truenas.apiKey`. Rotate the TrueNAS key and Secret together.
 - Set `nfs.shareAllowedNetworks` to the node CIDRs. Its empty default permits all
   networks accepted by TrueNAS for each dynamically created share.
-- Driver-created iSCSI targets use an allow-all initiator group and no CHAP.
-  Network segmentation (such as a VLAN or SGACL) is therefore the access-control
-  boundary for TCP 3260. The driver does not currently provide per-tenant iSCSI
-  isolation.
+- Driver-created iSCSI targets use an allow-all initiator group. CHAP session
+  authentication is available but strictly opt-in (`iscsi.chap.enabled: true`
+  plus a per-StorageClass CHAP Secret — see
+  [the StorageClass reference](reference/storageclass.md#iscsi-chap)); with it
+  off (the default) targets stay `authmethod=NONE`. CHAP authenticates the
+  session — it does **not** encrypt data in flight — so network segmentation
+  (such as a VLAN or SGACL) remains the confidentiality boundary for TCP 3260
+  even when CHAP is on. The driver does not currently provide per-tenant iSCSI
+  isolation. CHAP credentials are supplied per StorageClass via a Kubernetes
+  Secret, are never written to the PV volume context, and are redacted from all
+  driver logs and errors.
 - `DeleteVolume` preserves non-CSI snapshots by default, including snapshots
   inherited from periodic-snapshot or replication tasks on the parent dataset.
   It returns `FailedPrecondition` until those snapshots are removed or the task
@@ -367,9 +374,13 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 
 ## Current known limitations
 
-- Driver-created iSCSI targets have no CHAP or per-tenant initiator isolation;
-  an allow-all initiator group makes storage-network segmentation the access
-  boundary for TCP 3260.
+- Driver-created iSCSI targets have no per-tenant initiator isolation; an
+  allow-all initiator group makes storage-network segmentation the access
+  boundary for TCP 3260. CHAP session authentication is available (opt-in) but
+  does not encrypt data in flight and has limitations: rotated secrets take
+  effect only on the next login (established sessions are not re-authenticated),
+  and deleting a CHAP StorageClass leaves its shared `iscsi.auth` peer behind
+  for the operator to reap.
 - Host dm-multipath ownership of TrueNAS iSCSI LUNs is unsupported. The node
   service refuses to stage an iSCSI device with a `dm-*` sysfs holder instead
   of formatting or mounting a raw component path.
