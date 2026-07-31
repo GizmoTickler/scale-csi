@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -350,10 +352,50 @@ func TestRecordTombstoneReaped(t *testing.T) {
 // core.get_jobs subscription bit exactly (1 = subscribed, 0 = pure-poll).
 func TestSetJobDispatcherSubscribed(t *testing.T) {
 	SetJobDispatcherSubscribed(true)
-	assert.Equal(t, float64(1), testutil.ToFloat64(jobDispatcherSubscribed))
+	assert.Equal(t, float64(1), testutil.ToFloat64(jobDispatcherSubscribed.WithLabelValues()))
 
 	SetJobDispatcherSubscribed(false)
-	assert.Equal(t, float64(0), testutil.ToFloat64(jobDispatcherSubscribed))
+	assert.Equal(t, float64(0), testutil.ToFloat64(jobDispatcherSubscribed.WithLabelValues()))
+}
+
+// TestJobDispatcherSubscribedNodeModeExport guards the codex H1 fix: a
+// node-mode process builds no TrueNAS client and never calls
+// SetJobDispatcherSubscribed, so the label-less gauge vec is never touched and
+// must export NO scale_csi_job_dispatcher_subscribed series. Before the fix the
+// metric was a plain gauge that every process exported as 0, which forced an
+// unscoped min()/==0 to read 0 (PURE-POLL / alert firing) in any normal
+// controller-plus-node install. This mirrors the controller-only pool_*_bytes
+// GaugeVecs, which likewise export nothing until the controller loop touches
+// them.
+func TestJobDispatcherSubscribedNodeModeExport(t *testing.T) {
+	const name = "scale_csi_job_dispatcher_subscribed"
+
+	// Model node mode: drop any child an earlier test created so the vec is
+	// untouched, exactly as it is in a process that never runs the controller
+	// health tick.
+	jobDispatcherSubscribed.Reset()
+	assert.False(t, gatherHasMetric(t, name),
+		"an untouched (node-mode) gauge vec must not export %s", name)
+
+	// Model controller mode: the health tick touches the gauge, so the series
+	// appears.
+	SetJobDispatcherSubscribed(true)
+	assert.True(t, gatherHasMetric(t, name),
+		"a touched (controller-mode) gauge vec must export %s", name)
+}
+
+// gatherHasMetric reports whether the default Prometheus gatherer currently
+// exposes any series for the named metric family.
+func gatherHasMetric(t *testing.T, name string) bool {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, mf := range families {
+		if mf.GetName() == name && len(mf.GetMetric()) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // TestMetricNamesIsComplete guards the O11 single-source-of-truth invariant:

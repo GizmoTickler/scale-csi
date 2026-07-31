@@ -137,12 +137,21 @@ var (
 	// live core.get_jobs subscription and 0 when the driver has degraded to the
 	// pure-poll fallback (higher API load + latency). Published from the health
 	// tick off Client.AnyConnectionJobSubscribed (E2/O7).
-	jobDispatcherSubscribed = regGauge(
+	//
+	// It is a label-less GaugeVec (not a plain Gauge) on purpose, and is touched
+	// ONLY by the controller health tick (which runs only with a live TrueNAS
+	// client). A label-less vec exports NO series until its single child is
+	// created, so a node-mode process — which builds no client and never calls
+	// SetJobDispatcherSubscribed — exports nothing for it. This is the same
+	// mechanism as the controller-only pool_*_bytes GaugeVecs and is what keeps
+	// an unscoped min()/==0 from ever observing a phantom node-mode 0 (codex H1).
+	jobDispatcherSubscribed = regGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "job_dispatcher_subscribed",
 			Help:      "1 when a pooled connection holds a live core.get_jobs subscription; 0 = pure-poll fallback",
 		},
+		nil,
 	)
 
 	// iSCSI metrics
@@ -523,12 +532,14 @@ func SetTrueNASActiveConnections(count int) {
 
 // SetJobDispatcherSubscribed publishes whether any pooled connection holds a
 // live core.get_jobs subscription (true → 1). False means the driver has
-// degraded to the pure-poll fallback.
+// degraded to the pure-poll fallback. Calling it creates the label-less vec's
+// single child, which is what makes the series exportable — so it must only be
+// called in controller mode (see the gauge's declaration comment, codex H1).
 func SetJobDispatcherSubscribed(subscribed bool) {
 	if subscribed {
-		jobDispatcherSubscribed.Set(1)
+		jobDispatcherSubscribed.WithLabelValues().Set(1)
 	} else {
-		jobDispatcherSubscribed.Set(0)
+		jobDispatcherSubscribed.WithLabelValues().Set(0)
 	}
 }
 
