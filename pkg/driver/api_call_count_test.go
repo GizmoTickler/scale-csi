@@ -372,6 +372,31 @@ func (c *apiCallCountingClient) ISCSIGlobalConfigGet(ctx context.Context) (*true
 	return c.MockClient.ISCSIGlobalConfigGet(ctx)
 }
 
+func (c *apiCallCountingClient) ISCSIAuthCreate(ctx context.Context, tag int, user, secret, peerUser, peerSecret string) (*truenas.ISCSIAuth, error) {
+	c.record("ISCSIAuthCreate")
+	return c.MockClient.ISCSIAuthCreate(ctx, tag, user, secret, peerUser, peerSecret)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthQueryByTag(ctx context.Context, tag int) ([]*truenas.ISCSIAuth, error) {
+	c.record("ISCSIAuthQueryByTag")
+	return c.MockClient.ISCSIAuthQueryByTag(ctx, tag)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthGet(ctx context.Context, id int) (*truenas.ISCSIAuth, error) {
+	c.record("ISCSIAuthGet")
+	return c.MockClient.ISCSIAuthGet(ctx, id)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthUpdate(ctx context.Context, id int, user, secret, peerUser, peerSecret string) (*truenas.ISCSIAuth, error) {
+	c.record("ISCSIAuthUpdate")
+	return c.MockClient.ISCSIAuthUpdate(ctx, id, user, secret, peerUser, peerSecret)
+}
+
+func (c *apiCallCountingClient) ISCSIAuthDelete(ctx context.Context, id int) error {
+	c.record("ISCSIAuthDelete")
+	return c.MockClient.ISCSIAuthDelete(ctx, id)
+}
+
 func (c *apiCallCountingClient) NVMeoFHostFindByNQN(ctx context.Context, nqn string) (*truenas.NVMeoFHost, error) {
 	c.record("NVMeoFHostFindByNQN")
 	return c.MockClient.NVMeoFHostFindByNQN(ctx, nqn)
