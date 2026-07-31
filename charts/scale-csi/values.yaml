@@ -7,6 +7,17 @@ csiDriverName: csi.scale.io
 # render stays byte-identical and no cluster-scoped csistoragecapacities
 # objects or extra RBAC are created unless an operator asks for them.
 #
+# SCHEDULER PREREQUISITE (codex M2): external-provisioner v6.3.0 publishes
+# CSIStorageCapacity objects ONLY for StorageClasses whose volumeBindingMode is
+# WaitForFirstConsumer; it ignores Immediate classes by default, and the
+# Kubernetes scheduler likewise only consults capacity for WaitForFirstConsumer
+# binding. The bundled `scale-nfs` class is Immediate, so enabling capacity
+# against otherwise-default values starts the capacity controller but creates NO
+# capacity objects and cannot influence scheduling. To make capacity affect
+# scheduling you must ALSO use a WaitForFirstConsumer StorageClass. If you only
+# need capacity published for non-scheduler consumers against Immediate classes,
+# opt in to forImmediateBinding below.
+#
 # STEADY-STATE API COST when enabled: the external-provisioner issues a periodic
 # GetCapacity per referencing StorageClass on its resync interval. After the
 # E2/K7 fix each GetCapacity is exactly ONE pool.dataset.query against the parent
@@ -17,6 +28,12 @@ capacity:
   # Advertise CSIDriver.spec.storageCapacity=true and add the provisioner's
   # --enable-capacity flag plus its csistoragecapacities RBAC. Default off.
   enabled: false
+  # Opt-in: also publish CSIStorageCapacity for Immediate-binding StorageClasses
+  # (renders the provisioner's --capacity-for-immediate-binding). Default off
+  # because the scheduler ignores capacity for immediate binding; this is only
+  # useful for non-scheduler capacity consumers. Has no effect unless
+  # capacity.enabled is true.
+  forImmediateBinding: false
   # E2: set GetCapacityResponse.maximum_volume_size. Intended ONLY for thick
   # deployments (zfs.zvolEnableReservation=true); under the default thin/sparse
   # provisioning a hard maximum makes the scheduler wrongly reject legitimate
@@ -25,9 +42,12 @@ capacity:
   reportMaximumVolumeSize: false
   # E4: run a controller-only poll loop publishing scale_csi_pool_available_bytes
   # and scale_csi_pool_capacity_bytes. STEADY-STATE API COST when enabled: +1
-  # pool.dataset.query per gaugeInterval per controller (default 60s => 1/min,
-  # singleton). Zero impact on the CreateVolume/publish/unpublish request-path
-  # golden totals. Default off (zero new calls).
+  # pool.dataset.query per gaugeInterval PER CONTROLLER REPLICA. The gauge loop
+  # has no leader-election gate (consistent with the orphan reconcile), so with
+  # controller.replicas>1 the documented +1 query/interval is incurred by EACH
+  # replica; the supported/documented configuration is replicas=1 (singleton),
+  # where it is 1/min. Zero impact on the CreateVolume/publish/unpublish
+  # request-path golden totals. Default off (zero new calls).
   gaugeEnabled: false
   # Poll cadence for the capacity gauge loop. Values below 30s are clamped to it.
   gaugeInterval: 60s
@@ -512,11 +532,16 @@ sidecars:
   # and controller-side VolumeCondition (both zero-new-API) are always on; this
   # sidecar additionally emits Kubernetes Events for abnormal volumes.
   #
-  # STEADY-STATE API COST when enabled: the sidecar issues periodic ListVolumes
-  # plus a per-PV ControllerGetVolume (ONE pool.dataset.query each) on its
-  # monitor-interval. This is background load, NOT part of the request-path
-  # golden totals. Image tag is pinned (G2: v0.18.0 is the current published
-  # release) — do not float it.
+  # STEADY-STATE API COST when enabled: because Scale-CSI advertises
+  # LIST_VOLUMES, external-health-monitor v0.18.0 drives the ListVolumes path and
+  # reads Entry.Status.VolumeCondition; it does NOT also issue per-PV
+  # ControllerGetVolume (it picks ListVolumes OR per-PV ControllerGetVolume, never
+  # both). So the background load is ONE periodic ListVolumes (a single
+  # pool.dataset.query) per interval, NOT part of the request-path golden totals.
+  # `interval` renders both --list-volumes-interval (the ACTIVE cadence for this
+  # driver) and --monitor-interval (the fallback cadence used only by a driver
+  # that lacks LIST_VOLUMES). Image tag is pinned (G2: v0.18.0 is the current
+  # published release) — do not float it.
   healthMonitor:
     enabled: false
     image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0

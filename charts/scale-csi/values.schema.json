@@ -192,6 +192,9 @@
         "enabled": {
           "type": "boolean"
         },
+        "forImmediateBinding": {
+          "type": "boolean"
+        },
         "reportMaximumVolumeSize": {
           "type": "boolean"
         },
@@ -200,7 +203,10 @@
         },
         "gaugeInterval": {
           "type": "string",
-          "minLength": 2
+          "pattern": "^([0-9]+(ms|s|m|h))+$",
+          "not": {
+            "pattern": "^(0+(ms|s|m|h))+$"
+          }
         }
       }
     },
@@ -805,7 +811,10 @@
             },
             "interval": {
               "type": "string",
-              "minLength": 2
+              "pattern": "^([0-9]+(ms|s|m|h))+$",
+              "not": {
+                "pattern": "^(0+(ms|s|m|h))+$"
+              }
             },
             "resources": {
               "type": "object",

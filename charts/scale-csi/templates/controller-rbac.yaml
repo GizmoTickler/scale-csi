@@ -91,11 +91,16 @@ rules:
   {{- if .Values.sidecars.healthMonitor.enabled }}
   # External health monitor (csi-external-health-monitor-controller). It needs
   # get/list/watch on pods to map abnormal volumes to workloads; persistentvolumes
-  # (get/list/watch), events, and nodes are already granted above. Default off =>
-  # rule absent => byte-identical render.
+  # (get/list/watch) and nodes are already granted above. The provisioner's events
+  # rule above omits `get`, which upstream's health-monitor RBAC grants, so it is
+  # added here (gated) for canonical parity. Default off => rules absent =>
+  # byte-identical render.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

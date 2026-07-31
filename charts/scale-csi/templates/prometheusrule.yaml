@@ -92,7 +92,10 @@ spec:
         {{- end }}
         {{- if .Values.capacity.gaugeEnabled }}
         - alert: ScaleCSIPoolNearFull
-          expr: (1 - (scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes)) > {{ .Values.metrics.prometheusRule.poolUsageThreshold | default 0.85 }}
+          # Render the threshold directly (no Sprig `default`): the default lives
+          # in values.yaml, and `default` treats a legitimate numeric 0 as empty,
+          # silently rewriting it to 0.85 (codex M4).
+          expr: (1 - (scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes)) > {{ .Values.metrics.prometheusRule.poolUsageThreshold }}
           for: 15m
           labels:
             severity: warning

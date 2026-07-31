@@ -6,6 +6,8 @@
 package chart
 
 import (
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +38,140 @@ func helmTemplate(t *testing.T, extraArgs ...string) string {
 		t.Fatalf("helm template %v failed: %v\n%s", args, err, out)
 	}
 	return string(out)
+}
+
+// helmTemplateExpectError runs helm template expecting it to FAIL (e.g. a schema
+// validation rejection) and returns the combined output so callers can assert on
+// the failure reason. It fails the test if helm unexpectedly succeeds.
+func helmTemplateExpectError(t *testing.T, extraArgs ...string) string {
+	t.Helper()
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH; skipping chart template assertion")
+	}
+	args := append([]string{"template", "scale-csi", chartDir(t)}, extraArgs...)
+	out, err := exec.Command("helm", args...).CombinedOutput()
+	if err == nil {
+		t.Fatalf("helm template %v unexpectedly succeeded; expected a validation error\n%s", args, out)
+	}
+	return string(out)
+}
+
+// manifest is a loosely-typed decoded Kubernetes object from a helm render.
+type manifest map[string]any
+
+// decodeManifests splits a multi-document helm render into decoded manifests,
+// skipping empty documents (the `---` separators helm emits). Parsing
+// per-resource — rather than substring-matching the whole render — is what lets
+// the negative RBAC invariants below actually catch an accidentally unconditional
+// rule (codex L2).
+func decodeManifests(t *testing.T, rendered string) []manifest {
+	t.Helper()
+	var out []manifest
+	dec := yaml.NewDecoder(strings.NewReader(rendered))
+	for {
+		var m manifest
+		err := dec.Decode(&m)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode rendered manifest: %v", err)
+		}
+		if len(m) == 0 {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// findManifest returns the first manifest of kind whose metadata.name contains
+// nameSubstr, failing the test if none matches.
+func findManifest(t *testing.T, manifests []manifest, kind, nameSubstr string) manifest {
+	t.Helper()
+	for _, m := range manifests {
+		if m["kind"] != kind {
+			continue
+		}
+		meta, _ := asManifest(m["metadata"])
+		name, _ := meta["name"].(string)
+		if strings.Contains(name, nameSubstr) {
+			return m
+		}
+	}
+	t.Fatalf("no %s manifest with name containing %q", kind, nameSubstr)
+	return nil
+}
+
+// asManifest normalizes a decoded YAML mapping to manifest. yaml.v3 decodes
+// nested mappings into the named manifest type (not a bare map[string]any), so a
+// plain type assertion to map[string]any would fail; accept both forms.
+func asManifest(v any) (manifest, bool) {
+	switch m := v.(type) {
+	case manifest:
+		return m, true
+	case map[string]any:
+		return manifest(m), true
+	default:
+		return nil, false
+	}
+}
+
+func asStringSlice(v any) []string {
+	items, _ := v.([]any)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		s, _ := item.(string)
+		out = append(out, s)
+	}
+	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// roleHasRule reports whether a ClusterRole/Role manifest carries a rule with
+// exactly these resources and exactly these verbs (order-sensitive, matching the
+// rendered template).
+func roleHasRule(role manifest, resources, verbs []string) bool {
+	rules, _ := role["rules"].([]any)
+	for _, r := range rules {
+		rule, ok := asManifest(r)
+		if !ok {
+			continue
+		}
+		if equalStrings(asStringSlice(rule["resources"]), resources) && equalStrings(asStringSlice(rule["verbs"]), verbs) {
+			return true
+		}
+	}
+	return false
+}
+
+// roleTouchesResource reports whether any rule in a ClusterRole/Role manifest
+// lists resource.
+func roleTouchesResource(role manifest, resource string) bool {
+	rules, _ := role["rules"].([]any)
+	for _, r := range rules {
+		rule, ok := asManifest(r)
+		if !ok {
+			continue
+		}
+		for _, res := range asStringSlice(rule["resources"]) {
+			if res == resource {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestChartTombstoneReaperScanFallbackPlumbing proves the new
@@ -189,7 +325,9 @@ func TestChartCSIStorageCapacityPlumbing(t *testing.T) {
 		if !strings.Contains(out, "storageCapacity: false") {
 			t.Errorf("default render must keep CSIDriver storageCapacity: false")
 		}
-		for _, absent := range []string{"--enable-capacity", "csistoragecapacities", "POD_NAME"} {
+		// NAMESPACE is asserted alongside POD_NAME (codex L2): both Downward API
+		// env vars are capacity-gated, so neither may appear in the default render.
+		for _, absent := range []string{"--enable-capacity", "csistoragecapacities", "POD_NAME", "NAMESPACE"} {
 			if strings.Contains(out, absent) {
 				t.Errorf("default render must not emit %q; capacity tracking is opt-in", absent)
 			}
@@ -210,6 +348,31 @@ func TestChartCSIStorageCapacityPlumbing(t *testing.T) {
 			if !strings.Contains(out, want) {
 				t.Errorf("--set capacity.enabled=true did not render %q", want)
 			}
+		}
+		// The immediate-binding flag is opt-in and must stay absent by default.
+		if strings.Contains(out, "--capacity-for-immediate-binding") {
+			t.Errorf("capacity.enabled=true must not render --capacity-for-immediate-binding unless forImmediateBinding is set")
+		}
+	})
+
+	// codex M2: external-provisioner ignores Immediate-binding StorageClasses by
+	// default (the scheduler ignores capacity for immediate binding), so the flag
+	// is a deliberate opt-in for non-scheduler capacity consumers.
+	t.Run("forImmediateBinding renders the opt-in flag both states", func(t *testing.T) {
+		on := helmTemplate(t, "--set", "capacity.enabled=true", "--set", "capacity.forImmediateBinding=true")
+		if !strings.Contains(on, `"--capacity-for-immediate-binding"`) {
+			t.Errorf("capacity.forImmediateBinding=true did not render --capacity-for-immediate-binding")
+		}
+
+		off := helmTemplate(t, "--set", "capacity.enabled=true", "--set", "capacity.forImmediateBinding=false")
+		if strings.Contains(off, "--capacity-for-immediate-binding") {
+			t.Errorf("capacity.forImmediateBinding=false must not render --capacity-for-immediate-binding")
+		}
+
+		// The flag is nested under capacity.enabled: setting it alone renders nothing.
+		disabled := helmTemplate(t, "--set", "capacity.forImmediateBinding=true")
+		if strings.Contains(disabled, "--capacity-for-immediate-binding") {
+			t.Errorf("forImmediateBinding must have no effect while capacity.enabled is false")
 		}
 	})
 }
@@ -282,22 +445,66 @@ capacity:
 			t.Errorf("poolUsageThreshold=0.9 did not propagate into the alert expr; got:\n%s", out)
 		}
 	})
+
+	// codex M4: the threshold renders directly (no Sprig `default`), so a
+	// legitimate numeric 0 must propagate as `> 0`, not be silently rewritten to
+	// the 0.85 default. Cover the lower bound, the default, a fractional value,
+	// and the upper bound.
+	t.Run("threshold boundary values propagate exactly", func(t *testing.T) {
+		render := func(t *testing.T, thresholdLine string) string {
+			t.Helper()
+			valuesPath := filepath.Join(t.TempDir(), "threshold-values.yaml")
+			values := "metrics:\n  prometheusRule:\n    enabled: true\n" + thresholdLine + "capacity:\n  gaugeEnabled: true\n"
+			if err := os.WriteFile(valuesPath, []byte(values), 0o600); err != nil {
+				t.Fatalf("write override values: %v", err)
+			}
+			return helmTemplate(t, "--show-only", "templates/prometheusrule.yaml", "-f", valuesPath)
+		}
+
+		cases := []struct {
+			name      string
+			threshold string // empty => use the values.yaml default
+			wantExpr  string
+		}{
+			{"zero lower bound", "    poolUsageThreshold: 0\n", ") > 0"},
+			{"default", "", ") > 0.85"},
+			{"fractional", "    poolUsageThreshold: 0.5\n", ") > 0.5"},
+			{"one upper bound", "    poolUsageThreshold: 1\n", ") > 1"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				out := render(t, tc.threshold)
+				if !strings.Contains(out, tc.wantExpr) {
+					t.Errorf("threshold case %q did not render %q; got:\n%s", tc.name, tc.wantExpr, out)
+				}
+			})
+		}
+	})
 }
 
 // TestChartHealthMonitorSidecar guards the external-health-monitor sidecar render
 // invariant (E3/K11b). The sidecar and its extra RBAC are strictly opt-in: the
 // default render carries no csi-external-health-monitor container and no health
 // pods watch rule, keeping the default manifest byte-identical. Enabling
-// sidecars.healthMonitor renders the pinned-image container, its monitor-interval,
-// and the pods get/list/watch RBAC delta.
+// sidecars.healthMonitor renders the pinned-image container, the ACTIVE
+// --list-volumes-interval cadence (this driver advertises LIST_VOLUMES; codex M1)
+// plus the --monitor-interval fallback, and the pods get/list/watch + events get
+// RBAC delta. The RBAC assertions parse the controller ClusterRole per-resource
+// (codex L2) so an accidentally unconditional pods rule cannot slip past a
+// whole-render substring match.
 func TestChartHealthMonitorSidecar(t *testing.T) {
 	t.Run("default render omits the sidecar and its RBAC", func(t *testing.T) {
 		out := helmTemplate(t)
 		if strings.Contains(out, "csi-external-health-monitor") {
 			t.Errorf("default render must not emit the external-health-monitor sidecar; it is opt-in")
 		}
-		if strings.Contains(out, `verbs: ["get", "list", "watch"]`) && strings.Contains(out, "external-health-monitor") {
-			t.Errorf("default render must not emit health-monitor RBAC")
+		// Parse the controller ClusterRole and assert it carries NO pods rule at
+		// all (capacity and health-monitor are both off). A substring match on the
+		// whole render could not distinguish an unconditional pods rule from the
+		// gated one; per-resource parsing can.
+		role := findManifest(t, decodeManifests(t, out), "ClusterRole", "scale-csi-controller")
+		if roleTouchesResource(role, "pods") {
+			t.Errorf("default controller ClusterRole must not grant any pods rule; health-monitor RBAC is opt-in")
 		}
 	})
 
@@ -306,14 +513,83 @@ func TestChartHealthMonitorSidecar(t *testing.T) {
 		for _, want := range []string{
 			"- name: csi-external-health-monitor",
 			"image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0",
+			// codex M1: LIST_VOLUMES is advertised, so --list-volumes-interval is
+			// the active cadence; --monitor-interval is retained as the fallback.
+			`"--list-volumes-interval=60s"`,
 			`"--monitor-interval=60s"`,
-			`resources: ["pods"]`,
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("--set sidecars.healthMonitor.enabled=true did not render %q", want)
 			}
 		}
+
+		// Per-resource RBAC assertions on the controller ClusterRole.
+		role := findManifest(t, decodeManifests(t, out), "ClusterRole", "scale-csi-controller")
+		if !roleHasRule(role, []string{"pods"}, []string{"get", "list", "watch"}) {
+			t.Errorf("health-monitor RBAC must grant pods get/list/watch")
+		}
+		if !roleHasRule(role, []string{"events"}, []string{"get"}) {
+			t.Errorf("health-monitor RBAC must grant events get (codex L1 upstream parity)")
+		}
+		// Leader election runs in the release namespace via a Lease; the sidecar
+		// relies on the existing leases rule, so confirm it covers create/update.
+		if !roleHasRule(role, []string{"leases"}, []string{"get", "watch", "list", "create", "update", "delete"}) {
+			t.Errorf("controller ClusterRole must keep the leases rule that backs health-monitor leader election")
+		}
 	})
+}
+
+// TestChartDurationValidation guards the two opt-in duration strings (codex M3):
+// sidecars.healthMonitor.interval and capacity.gaugeInterval. Both must be
+// positive Go durations. The schema rejects malformed strings — which previously
+// passed validation and then crash-looped the health-monitor's Go duration flag
+// parser (or silently disabled the opted-in gauges) — and zero durations, which
+// would make the interval meaningless. Each case asserts helm fails validation
+// and names the offending field by its schema JSON-pointer.
+func TestChartDurationValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		setKey  string
+		bad     string
+		pointer string
+		extra   []string
+	}{
+		{
+			name:    "healthMonitor.interval malformed",
+			setKey:  "sidecars.healthMonitor.interval",
+			bad:     "bogus",
+			pointer: "/sidecars/healthMonitor/interval",
+			extra:   []string{"--set", "sidecars.healthMonitor.enabled=true"},
+		},
+		{
+			name:    "healthMonitor.interval zero",
+			setKey:  "sidecars.healthMonitor.interval",
+			bad:     "0s",
+			pointer: "/sidecars/healthMonitor/interval",
+			extra:   []string{"--set", "sidecars.healthMonitor.enabled=true"},
+		},
+		{
+			name:    "capacity.gaugeInterval malformed",
+			setKey:  "capacity.gaugeInterval",
+			bad:     "bogus",
+			pointer: "/capacity/gaugeInterval",
+		},
+		{
+			name:    "capacity.gaugeInterval zero",
+			setKey:  "capacity.gaugeInterval",
+			bad:     "0s",
+			pointer: "/capacity/gaugeInterval",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(tc.extra, "--set", tc.setKey+"="+tc.bad)
+			out := helmTemplateExpectError(t, args...)
+			if !strings.Contains(out, tc.pointer) {
+				t.Errorf("expected a schema validation error at %q; got:\n%s", tc.pointer, out)
+			}
+		})
+	}
 }
 
 // TestChartSidecarTimeouts pins the CSI sidecar --timeout flags: the attacher and

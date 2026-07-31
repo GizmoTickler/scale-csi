@@ -190,6 +190,31 @@ is an independent copy). Chart `storageClasses[]` entries expose it as a
 first-class field; it is only emitted when set. See the
 [StorageClass reference](reference/storageclass.md#restore-mode).
 
+## Capacity-aware scheduling
+
+CSIStorageCapacity tracking is opt-in (`capacity.enabled`, default off). When
+enabled, the chart advertises `CSIDriver.spec.storageCapacity=true` and runs the
+external-provisioner capacity controller, which publishes `CSIStorageCapacity`
+objects from the driver's `GetCapacity` (the parent dataset's ZFS `available`).
+
+For this to influence pod scheduling you must use a StorageClass whose
+`volumeBindingMode` is `WaitForFirstConsumer`:
+
+- external-provisioner publishes capacity objects **only** for
+  `WaitForFirstConsumer` classes by default; it ignores `Immediate` classes.
+- The Kubernetes scheduler likewise consults storage capacity only for
+  `WaitForFirstConsumer` binding.
+
+The chart's bundled `scale-nfs` class is `Immediate`, so enabling
+`capacity.enabled` against otherwise-default values starts the capacity
+controller but creates **no** capacity objects and cannot affect scheduling.
+Pair it with a `WaitForFirstConsumer` class (as in the `scale-iscsi-xfs` example
+above) for scheduler integration.
+
+If you need capacity published for non-scheduler consumers against `Immediate`
+classes, set `capacity.forImmediateBinding: true` (default off), which adds the
+provisioner's `--capacity-for-immediate-binding` flag.
+
 ## Availability and topology
 
 Leader election is enabled on the provisioner, attacher, resizer, and
