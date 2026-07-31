@@ -214,6 +214,29 @@ func TestChartCSIStorageCapacityPlumbing(t *testing.T) {
 	})
 }
 
+// TestChartCapacityConfigPlumbing guards the driver-config capacity: block render
+// invariant (E2/K8). The block must be ABSENT from the default ConfigMap so a
+// rolled-back binary whose Config struct has no capacity field still strict-parses
+// it (F1 removal-only invariant); it renders only when a capacity value is
+// non-default. If you add a capacity key to the DEFAULT render, a v1.3.0-style
+// strict loader crash-loops — keep the block opt-in.
+func TestChartCapacityConfigPlumbing(t *testing.T) {
+	t.Run("default configmap omits the capacity block", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml")
+		if strings.Contains(out, "    capacity:") {
+			t.Errorf("default configmap must not emit a capacity: block; a rolled-back strict parser has no such field")
+		}
+	})
+
+	t.Run("reportMaximumVolumeSize renders the block", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "capacity.reportMaximumVolumeSize=true")
+		const block = "    capacity:\n      reportMaximumVolumeSize: true\n"
+		if !strings.Contains(out, block) {
+			t.Errorf("--set capacity.reportMaximumVolumeSize=true did not render the capacity block; got:\n%s", out)
+		}
+	})
+}
+
 // TestChartSidecarTimeouts pins the CSI sidecar --timeout flags: the attacher and
 // resizer run with a 120s deadline (bounding publish/unpublish/expand), while the
 // provisioner and snapshotter keep 300s. A regression that reverts the

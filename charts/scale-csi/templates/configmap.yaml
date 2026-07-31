@@ -144,6 +144,15 @@ data:
         schedule: {{ .Values.reconcile.delete.schedule | quote }}
         maxPerRun: {{ .Values.reconcile.delete.maxPerRun }}
 
+    {{- if .Values.capacity.reportMaximumVolumeSize }}
+    # Capacity reporting (opt-in). The block renders ONLY when a capacity value
+    # is non-default so the default ConfigMap carries no capacity: key and stays
+    # parseable by a rolled-back binary with no capacity field (F1 invariant);
+    # the driver default (off) is the source of truth when the block is absent.
+    capacity:
+      reportMaximumVolumeSize: {{ .Values.capacity.reportMaximumVolumeSize }}
+    {{- end }}
+
     resilience:
       circuitBreaker:
         enabled: {{ .Values.resilience.circuitBreaker.enabled }}

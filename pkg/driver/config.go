@@ -57,6 +57,10 @@ type Config struct {
 	// Reconcile configures controller-side orphan detection and gated cleanup.
 	Reconcile ReconcileConfig `yaml:"reconcile"`
 
+	// Capacity configures capacity reporting and the optional pool-capacity
+	// gauge loop. The zero value disables every capacity feature.
+	Capacity CapacityConfig `yaml:"capacity"`
+
 	// Node configuration (node plugin only)
 	Node NodeConfig `yaml:"node"`
 
@@ -449,6 +453,48 @@ func (c ReconcileConfig) IntervalDuration() (time.Duration, error) {
 // MinOrphanAgeDuration parses the configured minimum orphan age.
 func (c ReconcileConfig) MinOrphanAgeDuration() (time.Duration, error) {
 	return time.ParseDuration(c.MinOrphanAge)
+}
+
+// CapacityConfig configures GetCapacity reporting and the optional controller
+// pool-capacity gauge loop. Every field defaults to its zero value (off) so an
+// absent capacity: block keeps pre-capacity behavior exactly.
+type CapacityConfig struct {
+	// ReportMaximumVolumeSize sets GetCapacityResponse.maximum_volume_size to the
+	// parent dataset's available bytes. Intended only for thick provisioning
+	// (zfs.zvolEnableReservation=true); under the default thin/sparse provisioning
+	// a hard maximum makes the scheduler reject legitimate overcommit. TrueNAS 26.0
+	// exposes no dedicated max-size API, so available is the practical ceiling.
+	ReportMaximumVolumeSize bool `yaml:"reportMaximumVolumeSize"`
+
+	// GaugeEnabled starts a controller-only poll loop that publishes
+	// scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes. Each tick is
+	// ONE pool.dataset.query against the parent dataset; the steady-state cost is
+	// +1 call per GaugeInterval per controller. Default off (zero new API calls).
+	GaugeEnabled bool `yaml:"gaugeEnabled"`
+
+	// GaugeInterval is the poll cadence for the capacity gauge loop. Values below
+	// the 30s floor are clamped to it. Default (empty) resolves to 60s.
+	GaugeInterval string `yaml:"gaugeInterval"`
+}
+
+// minCapacityGaugeInterval floors the gauge poll cadence so a misconfiguration
+// cannot hammer the backend with sub-30s pool.dataset.query calls.
+const minCapacityGaugeInterval = 30 * time.Second
+
+// GaugeIntervalDuration parses the gauge poll cadence, applying the default (60s)
+// for an empty value and a 30s floor for any positive value below it.
+func (c CapacityConfig) GaugeIntervalDuration() (time.Duration, error) {
+	if strings.TrimSpace(c.GaugeInterval) == "" {
+		return 60 * time.Second, nil
+	}
+	interval, err := time.ParseDuration(c.GaugeInterval)
+	if err != nil {
+		return 0, err
+	}
+	if interval < minCapacityGaugeInterval {
+		return minCapacityGaugeInterval, nil
+	}
+	return interval, nil
 }
 
 // NVMeoFConfig holds NVMe-oF configuration.

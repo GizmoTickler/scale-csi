@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
@@ -1481,14 +1482,39 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 func (d *Driver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
 	klog.V(4).Info("GetCapacity called")
 
-	available, err := d.truenasClient.GetPoolAvailable(ctx, d.config.ZFS.DatasetParentName)
+	// Report the parent dataset's ZFS-computed `available` bytes rather than a
+	// raw vdev free-space sum. `available` natively nets out RAIDZ parity
+	// overhead, ancestor quota/refquota, and existing refreservations, so it is
+	// the honest "how much can I still provision here" number (G1 probe confirmed
+	// the parsed value is bytes on 26.0). req.Parameters is deliberately ignored:
+	// the driver honors no per-StorageClass parent/pool override (only `protocol`
+	// is consumed at CreateVolume), and datasetForID always derives
+	// path.Join(DatasetParentName, id), so every StorageClass of this
+	// single-backend driver shares the one parent dataset reported here.
+	parent := strings.TrimSuffix(d.config.ZFS.DatasetParentName, "/")
+	ds, err := d.truenasClient.DatasetGet(ctx, parent)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get capacity: %v", err)
 	}
 
-	return &csi.GetCapacityResponse{
-		AvailableCapacity: available,
-	}, nil
+	avail := int64(0)
+	if v, ok := ds.Available.Parsed.(float64); ok {
+		avail = int64(v)
+	}
+
+	resp := &csi.GetCapacityResponse{
+		AvailableCapacity: avail,
+	}
+	// maximum_volume_size is opt-in (capacity.reportMaximumVolumeSize). Under the
+	// default thin/sparse provisioning `available` is a soft estimate and a hard
+	// maximum would make the scheduler wrongly reject legitimate overcommit; only
+	// thick deployments (zvolEnableReservation) should advertise it, where
+	// `available` already nets out refreservations and is a true remaining ceiling.
+	// TrueNAS 26.0 exposes no dedicated max-size API, so the ceiling is `available`.
+	if d.config.Capacity.ReportMaximumVolumeSize {
+		resp.MaximumVolumeSize = wrapperspb.Int64(avail)
+	}
+	return resp, nil
 }
 
 // CreateSnapshot creates a snapshot.
