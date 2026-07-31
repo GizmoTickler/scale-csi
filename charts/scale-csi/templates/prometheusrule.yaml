@@ -91,13 +91,18 @@ spec:
             description: Additive fencing provenance exceeded the per-node cap; publishes fail closed with ResourceExhausted until grants drain.
             runbook_url: docs/guides/disaster-recovery.md#runbook-fencing-takeover-for-a-confirmed-dead-node
         - alert: ScaleCSIJobDispatcherUnsubscribed
-          expr: min(scale_csi_job_dispatcher_subscribed) == 0
+          # Scoped to the controller job (codex H1): the gauge is published only
+          # by controller-mode processes, but selecting the controller target
+          # explicitly keeps the query correct even if a node target ever exposed
+          # the series. `min` fires when ANY controller replica loses its
+          # subscription.
+          expr: min(scale_csi_job_dispatcher_subscribed{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) == 0
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: Scale CSI degraded to pure-poll job waiting
-            description: No pooled connection holds a live core.get_jobs subscription; API load and latency are elevated.
+            description: At least one controller replica has no pooled connection holding a live core.get_jobs subscription (pure-poll fallback); API load and latency are elevated.
             runbook_url: docs/troubleshooting.md#job-dispatcher-pure-poll-fallback
         - alert: ScaleCSIDeleteResidualCleanupFailing
           expr: sum(increase(scale_csi_delete_volume_orphan_cleanup_failures_total[1h])) > 0
