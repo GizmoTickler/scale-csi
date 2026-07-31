@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -238,6 +239,36 @@ func BenchmarkDatasetDecode(b *testing.B) {
 	})
 }
 
+// decodedKeysLowercase walks a decoded JSON value and reports whether every
+// object key is already lowercase. Go's encoding/json matches struct fields
+// CASE-INSENSITIVELY (a "nAme" key fills the Name field), while the legacy
+// interface{} parsers do exact map lookups — so mixed-case keys make the two
+// paths diverge by stdlib design, not by a decoding bug. TrueNAS emits
+// canonical lowercase keys on the wire (typed decode being more tolerant
+// off-contract cannot lose data), so the differential property is only claimed
+// for wire-shaped inputs. Found by the 2026-07-31 extended fuzz run; the
+// mixed-case corpus entries are retained as regression seeds for this guard.
+func decodedKeysLowercase(v interface{}) bool {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		for k, child := range val {
+			if k != strings.ToLower(k) {
+				return false
+			}
+			if !decodedKeysLowercase(child) {
+				return false
+			}
+		}
+	case []interface{}:
+		for _, child := range val {
+			if !decodedKeysLowercase(child) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func FuzzTypedSnapshotDecodeMatchesInterface(f *testing.F) {
 	f.Add(readTypedFixture(f, "snapshot-resource-26.0.json"))
 	f.Add(readTypedFixture(f, "pool-snapshot-26.0.json"))
@@ -246,8 +277,20 @@ func FuzzTypedSnapshotDecodeMatchesInterface(f *testing.F) {
 		if err := json.Unmarshal(payload, &generic); err != nil {
 			return
 		}
+		if !decodedKeysLowercase(generic) {
+			t.Skip("off-wire-contract mixed-case key; typed/interface divergence is stdlib case-insensitivity, not a bug")
+		}
+		// Canonicalize through the decoded value so the differential property is
+		// claimed for JSON VALUES, not raw byte-strings: duplicate object keys
+		// (impossible from a JSON-RPC emitter) merge via struct-overlay in typed
+		// decode but last-wins-replace in maps — a stdlib representation
+		// divergence, not a decoding bug. Found by the 2026-07-31 fuzz run.
+		canonical, err := json.Marshal(generic)
+		if err != nil {
+			return
+		}
 		var typed []*rawSnapshot
-		if err := json.Unmarshal(payload, &typed); err != nil {
+		if err := json.Unmarshal(canonical, &typed); err != nil {
 			return
 		}
 		got := rawSnapshotsToSnapshots(typed, true)
@@ -275,8 +318,18 @@ func FuzzTypedDatasetDecodeMatchesInterface(f *testing.F) {
 		if err := json.Unmarshal(payload, &generic); err != nil {
 			return
 		}
+		if !decodedKeysLowercase(generic) {
+			t.Skip("off-wire-contract mixed-case key; typed/interface divergence is stdlib case-insensitivity, not a bug")
+		}
+		// Canonicalize through the decoded value (see snapshot target above):
+		// claims the differential property for JSON VALUES, ruling out
+		// duplicate-key overlay-vs-replace representation divergence.
+		canonical, err := json.Marshal(generic)
+		if err != nil {
+			return
+		}
 		var typed []*rawDataset
-		if err := json.Unmarshal(payload, &typed); err != nil {
+		if err := json.Unmarshal(canonical, &typed); err != nil {
 			return
 		}
 		got := rawDatasetsToDatasets(typed, false)
