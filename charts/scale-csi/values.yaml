@@ -184,6 +184,11 @@ truenas:
   # Lower this if TrueNAS becomes overloaded with many PVC operations
   maxConcurrentRequests: 10
 
+  # Size of the TrueNAS WebSocket connection pool the controller multiplexes API
+  # calls across (default: 5, valid range 1..16). Values outside the range are a
+  # startup validation error.
+  maxConnections: 5
+
 # ZFS configuration
 zfs:
   # Parent dataset for volumes (required — the driver refuses to start without it)
@@ -257,7 +262,8 @@ iscsi:
   # Disable physical block size reporting on created extents.
   extentDisablePhysicalBlocksize: false
   extentRpm: SSD
-  extentAvailThreshold: 0
+  # extentAvailThreshold was removed: it was never wired to anything. The schema
+  # still accepts the old key (ignored) so existing values files pass validation.
 
   # Timeout in seconds to wait for iSCSI device to appear after login
   # Increase this for heavily loaded nodes or slow networks
@@ -290,8 +296,9 @@ nvmeof:
   # Allow any host NQN to connect. Enabling this bypasses subsystemHosts.
   subsystemAllowAnyHost: false
 
-  # Timeout for nvme CLI commands in seconds
-  commandTimeout: 30
+  # commandTimeout was removed: it was never wired to anything. The nvme CLI
+  # timeout is commandTimeouts.nvme. The schema still accepts the old key
+  # (ignored) so existing values files pass validation.
 
 # Storage classes to create.
 #

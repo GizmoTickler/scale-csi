@@ -231,6 +231,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 			Timeout:                     time.Duration(cfg.Config.TrueNAS.RequestTimeout) * time.Second,
 			ConnectTimeout:              time.Duration(cfg.Config.TrueNAS.ConnectTimeout) * time.Second,
 			WriteTimeout:                time.Duration(cfg.Config.TrueNAS.WriteTimeout) * time.Second,
+			MaxConnections:              cfg.Config.TrueNAS.MaxConnections,
 			MaxConcurrentReqs:           cfg.Config.TrueNAS.MaxConcurrentRequests,
 			MetricsRecorder:             RecordTrueNASRequest,
 			ReplicationJobAbortRecorder: RecordReplicationJobAborted,

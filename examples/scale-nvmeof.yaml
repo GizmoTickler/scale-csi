@@ -37,4 +37,3 @@ nvmeof:
   subsystemHosts:
     - nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000001
   deviceWaitTimeout: 60
-  commandTimeout: 30

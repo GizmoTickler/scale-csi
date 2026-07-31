@@ -158,6 +158,7 @@ new ownership boundary.
 | `truenas.connectTimeout` | Connection timeout in seconds | `10` |
 | `truenas.writeTimeout` | WebSocket write timeout in seconds | `30` |
 | `truenas.maxConcurrentRequests` | Maximum concurrent API requests | `10` |
+| `truenas.maxConnections` | TrueNAS WebSocket connection pool size (1..16) | `5` |
 
 ### ZFS
 
@@ -196,7 +197,6 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `iscsi.extentBlocksize` | Extent block size | `512` |
 | `iscsi.extentDisablePhysicalBlocksize` | Disable extent physical-block-size reporting | `false` |
 | `iscsi.extentRpm` | Extent RPM value | `SSD` |
-| `iscsi.extentAvailThreshold` | Extent available-space warning threshold | `0` |
 | `iscsi.deviceWaitTimeout` | Device wait timeout in seconds | `60` |
 | `iscsi.serviceReloadDebounce` | Service reload debounce in milliseconds | `2000` |
 | `nvmeof.enabled` | Render NVMe-oF configuration | `false` |
@@ -205,7 +205,11 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.port` | Target service ID/port | `4420` |
 | `nvmeof.subsystemHosts` | Allowed host NQNs | `[]` |
 | `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `false` |
-| `nvmeof.commandTimeout` | `nvme` command timeout in seconds | `30` |
+
+> `iscsi.extentAvailThreshold` and `nvmeof.commandTimeout` were removed: neither
+> was wired to anything (`nvmeof.commandTimeout` is superseded by
+> `commandTimeouts.nvme`). The values schema still accepts both keys (ignored) so
+> existing values files do not fail validation.
 
 With `fencing.mode=off`, NVMe-oF requires an explicit
 `nvmeof.subsystemHosts` allow-list unless `subsystemAllowAnyHost=true`. In

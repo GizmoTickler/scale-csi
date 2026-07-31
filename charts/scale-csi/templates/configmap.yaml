@@ -34,6 +34,7 @@ data:
       connectTimeout: {{ .Values.truenas.connectTimeout }}
       writeTimeout: {{ .Values.truenas.writeTimeout | default 30 }}
       maxConcurrentRequests: {{ .Values.truenas.maxConcurrentRequests | default 10 }}
+      maxConnections: {{ .Values.truenas.maxConnections | default 5 }}
 
     # ZFS dataset configuration
     zfs:
@@ -85,7 +86,6 @@ data:
       extentBlocksize: {{ .Values.iscsi.extentBlocksize }}
       extentDisablePhysicalBlocksize: {{ .Values.iscsi.extentDisablePhysicalBlocksize }}
       extentRpm: {{ .Values.iscsi.extentRpm | quote }}
-      extentAvailThreshold: {{ .Values.iscsi.extentAvailThreshold }}
       deviceWaitTimeout: {{ .Values.iscsi.deviceWaitTimeout | default 60 }}
       serviceReloadDebounce: {{ .Values.iscsi.serviceReloadDebounce | default 2000 }}
     {{- end }}
@@ -100,7 +100,6 @@ data:
       subsystemHosts:
         {{- toYaml .Values.nvmeof.subsystemHosts | nindent 8 }}
       subsystemAllowAnyHost: {{ .Values.nvmeof.subsystemAllowAnyHost }}
-      commandTimeout: {{ .Values.nvmeof.commandTimeout }}
     {{- end }}
 
     # Session garbage collection (node plugin only)

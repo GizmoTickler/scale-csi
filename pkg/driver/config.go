@@ -145,6 +145,11 @@ type TrueNASConfig struct {
 
 	// MaxConcurrentRequests limits concurrent API requests to prevent overwhelming TrueNAS (default: 10)
 	MaxConcurrentRequests int `yaml:"maxConcurrentRequests"`
+
+	// MaxConnections is the size of the TrueNAS WebSocket connection pool the
+	// controller multiplexes API calls across (default: 5, valid range 1..16).
+	// Values outside the range are a startup validation error.
+	MaxConnections int `yaml:"maxConnections"`
 }
 
 // ZFSConfig holds ZFS dataset configuration.
@@ -206,7 +211,9 @@ type NFSConfig struct {
 	// ShareMapallGroup maps all users to this group
 	ShareMapallGroup string `yaml:"shareMapallGroup"`
 
-	// ShareCommentTemplate is a template for share comments
+	// ShareCommentTemplate is DEPRECATED and has no effect. The field is retained
+	// only so strict YAML parsing of existing configmaps does not fail; LoadConfig
+	// logs a deprecation warning when it is set.
 	ShareCommentTemplate string `yaml:"shareCommentTemplate"`
 }
 
@@ -239,7 +246,9 @@ type ISCSIConfig struct {
 	// ExtentRpm sets the RPM reported to initiators (default: "SSD")
 	ExtentRpm string `yaml:"extentRpm"`
 
-	// ExtentAvailThreshold is the threshold for space warnings (0-100)
+	// ExtentAvailThreshold is DEPRECATED and has no effect. The field is retained
+	// only so strict YAML parsing of existing configmaps does not fail; LoadConfig
+	// logs a deprecation warning when it is set.
 	ExtentAvailThreshold int `yaml:"extentAvailThreshold"`
 
 	// DeviceWaitTimeout is the timeout for waiting for iSCSI devices to appear in seconds (default: 60)
@@ -441,7 +450,9 @@ type NVMeoFConfig struct {
 	// NameSuffix is a suffix for subsystem/namespace names
 	NameSuffix string `yaml:"nameSuffix"`
 
-	// NameTemplate is a template for generating names
+	// NameTemplate is DEPRECATED and has no effect. The field is retained only so
+	// strict YAML parsing of existing configmaps does not fail; LoadConfig logs a
+	// deprecation warning when it is set.
 	NameTemplate string `yaml:"nameTemplate"`
 
 	// SubsystemAllowAnyHost allows any host to connect
@@ -453,7 +464,10 @@ type NVMeoFConfig struct {
 	// DeviceWaitTimeout is the timeout for waiting for NVMe-oF devices to appear in seconds (default: 60)
 	DeviceWaitTimeout int `yaml:"deviceWaitTimeout"`
 
-	// CommandTimeout is the timeout for nvme CLI commands in seconds (default: 30)
+	// CommandTimeout is DEPRECATED and has no effect; the nvme CLI timeout is
+	// commandTimeouts.nvme. The field is retained only so strict YAML parsing of
+	// existing configmaps does not fail; LoadConfig logs a deprecation warning when
+	// it is set.
 	CommandTimeout int `yaml:"commandTimeout"`
 }
 
@@ -645,9 +659,7 @@ func LoadConfig(path string) (*Config, error) {
 	if len(cfg.ISCSI.TargetPortals) > 0 {
 		configWarningf("iscsi.targetPortals is configured with %d additional portal(s), but scale-csi does not currently support iSCSI multipath; only iscsi.targetPortal will be used", len(cfg.ISCSI.TargetPortals))
 	}
-	if deprecatedRateLimitingConcurrencySet(data) {
-		configWarningf("resilience.rateLimiting.maxConcurrentRequests is deprecated and has no effect; the concurrency limit is truenas.maxConcurrentRequests")
-	}
+	warnDeprecatedConfigKeys(data)
 	if strings.TrimSpace(cfg.DriverInstanceID) == "" {
 		cfg.DriverInstanceID = strings.TrimSpace(cfg.InstanceID)
 	}
@@ -712,16 +724,49 @@ func applyProtocolEnabledBackCompat(cfg *Config, data []byte) error {
 	return nil
 }
 
-// deprecatedRateLimitingConcurrencySet reports whether the raw config document
-// sets the retired resilience.rateLimiting.maxConcurrentRequests key, so
-// LoadConfig can warn exactly once for configs that still carry it. Presence (not
-// value) is the trigger: the field is ignored regardless of what it is set to.
-func deprecatedRateLimitingConcurrencySet(data []byte) bool {
+// deprecatedConfigKeys are retired config keys that strict YAML parsing still
+// accepts for backward compatibility but nothing consumes. LoadConfig logs one
+// warning per key a config still carries, pointing at the live replacement where
+// one exists. Presence (not value) is the trigger: a deprecated key is ignored
+// regardless of what it is set to.
+var deprecatedConfigKeys = []struct {
+	path    []string
+	warning string
+}{
+	{
+		path:    []string{"resilience", "rateLimiting", "maxConcurrentRequests"},
+		warning: "resilience.rateLimiting.maxConcurrentRequests is deprecated and has no effect; the concurrency limit is truenas.maxConcurrentRequests",
+	},
+	{
+		path:    []string{"nfs", "shareCommentTemplate"},
+		warning: "nfs.shareCommentTemplate is deprecated and has no effect",
+	},
+	{
+		path:    []string{"iscsi", "extentAvailThreshold"},
+		warning: "iscsi.extentAvailThreshold is deprecated and has no effect",
+	},
+	{
+		path:    []string{"nvmeof", "nameTemplate"},
+		warning: "nvmeof.nameTemplate is deprecated and has no effect",
+	},
+	{
+		path:    []string{"nvmeof", "commandTimeout"},
+		warning: "nvmeof.commandTimeout is deprecated and has no effect; the nvme CLI timeout is commandTimeouts.nvme",
+	},
+}
+
+// warnDeprecatedConfigKeys logs one warning per retired key still present in the
+// raw config document, so operators learn that a key they set is ignored.
+func warnDeprecatedConfigKeys(data []byte) {
 	var configDocument yaml.Node
 	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&configDocument); err != nil {
-		return false
+		return
 	}
-	return yamlPathExists(&configDocument, "resilience", "rateLimiting", "maxConcurrentRequests")
+	for _, key := range deprecatedConfigKeys {
+		if yamlPathExists(&configDocument, key.path...) {
+			configWarningf("%s", key.warning)
+		}
+	}
 }
 
 // applyConfigDefaults fills in the post-decode default values for every optional
@@ -750,6 +795,9 @@ func applyConfigDefaults(cfg *Config) {
 	}
 	if cfg.TrueNAS.MaxConcurrentRequests == 0 {
 		cfg.TrueNAS.MaxConcurrentRequests = 10
+	}
+	if cfg.TrueNAS.MaxConnections == 0 {
+		cfg.TrueNAS.MaxConnections = 5
 	}
 	if cfg.ZFS.ZvolBlocksize == "" {
 		cfg.ZFS.ZvolBlocksize = "16K"
@@ -875,10 +923,8 @@ func applyConfigDefaults(cfg *Config) {
 		cfg.CommandTimeouts.NVMe = 30 // 30 seconds
 	}
 
-	// NVMe-oF command timeout default
-	if cfg.NVMeoF.CommandTimeout == 0 {
-		cfg.NVMeoF.CommandTimeout = 30 // 30 seconds
-	}
+	// nvmeof.commandTimeout is deprecated and ignored (the nvme CLI timeout is
+	// commandTimeouts.nvme), so it deliberately has no default.
 }
 
 // validateConfig enforces the config invariants that must hold after defaults are
@@ -904,6 +950,11 @@ func validateConfig(cfg *Config) error {
 	// Validate required fields
 	if cfg.TrueNAS.Host == "" {
 		return fmt.Errorf("truenas.host is required")
+	}
+	// The connection pool is sized once at client construction; clamp it so a
+	// typo cannot open an unbounded number of WebSockets against TrueNAS.
+	if cfg.TrueNAS.MaxConnections < 1 || cfg.TrueNAS.MaxConnections > 16 {
+		return fmt.Errorf("truenas.maxConnections must be between 1 and 16 (got %d)", cfg.TrueNAS.MaxConnections)
 	}
 	if cfg.ZFS.DatasetParentName == "" {
 		return fmt.Errorf("zfs.datasetParentName is required")
@@ -944,12 +995,10 @@ func validateNonNegativeConfig(cfg *Config) error {
 		{"truenas.maxConcurrentRequests", cfg.TrueNAS.MaxConcurrentRequests},
 		{"zfs.zvolReadyTimeout", cfg.ZFS.ZvolReadyTimeout},
 		{"iscsi.extentBlocksize", cfg.ISCSI.ExtentBlocksize},
-		{"iscsi.extentAvailThreshold", cfg.ISCSI.ExtentAvailThreshold},
 		{"iscsi.deviceWaitTimeout", cfg.ISCSI.DeviceWaitTimeout},
 		{"iscsi.serviceReloadDebounce", cfg.ISCSI.ServiceReloadDebounce},
 		{"nvmeof.transportServiceId", cfg.NVMeoF.TransportServiceID},
 		{"nvmeof.deviceWaitTimeout", cfg.NVMeoF.DeviceWaitTimeout},
-		{"nvmeof.commandTimeout", cfg.NVMeoF.CommandTimeout},
 		{"sessionGC.interval", cfg.SessionGC.Interval},
 		{"sessionGC.gracePeriod", cfg.SessionGC.GracePeriod},
 		{"sessionGC.startupDelay", cfg.SessionGC.StartupDelay},

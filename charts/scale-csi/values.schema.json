@@ -456,6 +456,11 @@
         "maxConcurrentRequests": {
           "type": "integer",
           "minimum": 1
+        },
+        "maxConnections": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
         }
       },
       "not": {
@@ -590,6 +595,7 @@
           ]
         },
         "extentAvailThreshold": {
+          "description": "DEPRECATED, ignored. Retained only so old values files pass validation.",
           "type": "integer",
           "minimum": 0,
           "maximum": 100
@@ -660,6 +666,7 @@
           "type": "boolean"
         },
         "commandTimeout": {
+          "description": "DEPRECATED, ignored; the nvme CLI timeout is commandTimeouts.nvme. Retained only so old values files pass validation.",
           "type": "integer",
           "minimum": 1
         }

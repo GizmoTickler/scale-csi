@@ -51,6 +51,37 @@ func TestChartTombstoneReaperScanFallbackPlumbing(t *testing.T) {
 	}
 }
 
+// TestChartDeprecatedKeysNotRendered proves the retired iscsi.extentAvailThreshold
+// and nvmeof.commandTimeout keys are no longer rendered into the driver configmap.
+// Both were parsed but consumed by nothing (the nvme CLI timeout is
+// commandTimeouts.nvme), so rendering them would suggest a wiring that does not
+// exist. The plural commandTimeouts block must remain.
+func TestChartDeprecatedKeysNotRendered(t *testing.T) {
+	out := helmTemplate(t, "--set", "iscsi.enabled=true", "--set", "nvmeof.enabled=true", "--set", "nvmeof.subsystemAllowAnyHost=true")
+	if strings.Contains(out, "extentAvailThreshold:") {
+		t.Errorf("rendered configmap still carries the deprecated iscsi.extentAvailThreshold key")
+	}
+	if strings.Contains(out, "commandTimeout:") {
+		t.Errorf("rendered configmap still carries the deprecated nvmeof.commandTimeout key")
+	}
+	if !strings.Contains(out, "    commandTimeouts:") {
+		t.Errorf("rendered configmap dropped the live commandTimeouts block")
+	}
+}
+
+// TestChartTrueNASMaxConnectionsPlumbing proves the truenas.maxConnections key
+// renders end-to-end into the driver configmap: the pool-size default of 5 when
+// unset, and the overridden value when set. A regression that drops the plumbing
+// (reverting the pool to a hardcoded, unconfigurable size) fails here.
+func TestChartTrueNASMaxConnectionsPlumbing(t *testing.T) {
+	if out := helmTemplate(t); !strings.Contains(out, "      maxConnections: 5\n") {
+		t.Errorf("default render does not carry truenas.maxConnections=5 in the configmap")
+	}
+	if out := helmTemplate(t, "--set", "truenas.maxConnections=9"); !strings.Contains(out, "      maxConnections: 9\n") {
+		t.Errorf("--set truenas.maxConnections=9 did not propagate into the rendered configmap")
+	}
+}
+
 // TestChartRateLimitingDeprecation proves the retired
 // resilience.rateLimiting.maxConcurrentRequests key is no longer rendered into the
 // driver configmap, while the still-wired maxConcurrentLogins key keeps rendering.
