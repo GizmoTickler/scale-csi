@@ -150,15 +150,17 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 		}
 		if len(targetGroups) == 0 {
 			// TrueNAS may reject a target with no portal groups. Strict mode starts
-			// with a CSI-owned, non-nil-empty initiator allowlist attached to the
-			// resolved portals: the target is valid but authorizes no initiator.
+			// with a CSI-owned deny-all initiator group attached to the resolved
+			// portals: the target is valid but authorizes no initiator. The group
+			// carries the non-matchable sentinel because an EMPTY allowlist renders
+			// allow-all (INITIATOR *) on TrueNAS 26.0 SCST, not deny-all.
 			dynamicGroup, groupErr := d.resolveFencingInitiatorGroup(ctx, ds, datasetName)
 			if groupErr != nil {
 				return status.Errorf(codes.Internal, "failed to resolve strict iSCSI initiator group: %v", groupErr)
 			}
 			if dynamicGroup == nil {
 				dynamicGroup, groupErr = d.truenasClient.ISCSIInitiatorCreateWithInitiators(
-					ctx, []string{}, "scale-csi fencing: "+datasetName,
+					ctx, iscsiDenyAllInitiators(), "scale-csi fencing: "+datasetName,
 				)
 			}
 			if groupErr != nil {

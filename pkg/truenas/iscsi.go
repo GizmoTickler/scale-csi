@@ -793,9 +793,10 @@ func parseISCSIInitiator(raw interface{}) (*ISCSIInitiator, error) {
 	}
 	switch initiators := m["initiators"].(type) {
 	case []interface{}:
-		// Preserve JSON [] as a non-nil empty slice. TrueNAS uses null for the
-		// legacy allow-all group, while [] is the deliberate deny-all shape used
-		// by fencing on last unpublish.
+		// Preserve JSON [] as a non-nil empty slice (distinct from null so the
+		// driver can tell "empty allowlist" from "legacy allow-all"). NB: on
+		// TrueNAS 26.0 SCST an empty list renders as INITIATOR * (allow-all),
+		// so fencing's deny-all path uses a non-matchable sentinel IQN, not [].
 		group.Initiators = []string{}
 		for _, initiator := range initiators {
 			if value, ok := initiator.(string); ok {

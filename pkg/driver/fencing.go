@@ -531,6 +531,9 @@ func (d *Driver) validateBackendSingleNodeCompatibility(
 				continue
 			}
 			for _, iqn := range initiator.Initiators {
+				if isISCSIDenyAllSentinel(iqn) {
+					continue // deny-all sentinel carries no node identity
+				}
 				if _, allowed := exempt[iqn]; iqn != "" && !allowed {
 					return failedPrecondition("iSCSI initiator", iqn)
 				}
@@ -1285,14 +1288,40 @@ func (d *Driver) safeAdditiveISCSIGroups(ctx context.Context, target *truenas.IS
 		}
 		if initiator.Initiators == nil {
 			// TrueNAS null is the legacy allow-all shape. Preserve it in additive
-			// mode; a non-nil empty list is intentionally different (deny-all) and
-			// is also a valid static relationship.
+			// mode; a non-nil list is a static relationship preserved verbatim.
+			// (NB: an EMPTY list is NOT deny-all on 26.0 — SCST renders it as
+			// INITIATOR * (allow-all), live-proven; that is why the fencing
+			// deny-all path uses a non-matchable sentinel IQN, not [].)
 			result = append(result, group)
 			continue
 		}
 		result = append(result, group)
 	}
 	return result, nil
+}
+
+// iscsiDenyAllSentinelIQN is a non-matchable initiator IQN that makes a CSI-owned
+// fencing initiator group genuinely deny-all. TrueNAS 26.0 SCST renders an EMPTY
+// initiator allowlist as INITIATOR * (allow-all) — live-verified 2026-07-31 — so
+// the intuitive "empty list = deny" shape actually grants access to every
+// initiator on the fabric. A deny-all group must instead carry a specific
+// initiator that matches no real host. The IQN is namespaced under a
+// scale-csi-owned prefix so it can never collide with a real node IQN; code that
+// reasons about active node identities (the published-elsewhere check) skips it
+// via isISCSIDenyAllSentinel.
+const iscsiDenyAllSentinelIQN = "iqn.2016-09.io.scale-csi:deny-all-fence"
+
+// iscsiDenyAllInitiators returns the initiator allowlist for a CSI-owned fencing
+// group that must deny every initiator: a single non-matchable sentinel. See
+// iscsiDenyAllSentinelIQN for why an empty list is NOT a deny-all on TrueNAS 26.0.
+func iscsiDenyAllInitiators() []string {
+	return []string{iscsiDenyAllSentinelIQN}
+}
+
+// isISCSIDenyAllSentinel reports whether an initiator IQN is the fencing
+// deny-all sentinel rather than a real node identity.
+func isISCSIDenyAllSentinel(iqn string) bool {
+	return iqn == iscsiDenyAllSentinelIQN
 }
 
 func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datasetName string, active []NodeIdentity, res *fenceResolution) error {
@@ -1316,6 +1345,15 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 		}
 	}
 	iqns = uniqueSortedStrings(iqns)
+	// The group allowlist mirrors the active node IQNs, except on last unpublish
+	// (zero active identities): an EMPTY allowlist is NOT deny-all on TrueNAS 26.0
+	// SCST (it renders INITIATOR *), so the empty case writes a non-matchable
+	// sentinel that matches no real host. The portal-retention logic below still
+	// keys off iqns so the group stays attached to the target on last unpublish.
+	allowlist := iqns
+	if len(allowlist) == 0 {
+		allowlist = iscsiDenyAllInitiators()
+	}
 	dynamicGroup, err := d.resolveFencingInitiatorGroup(ctx, ds, datasetName)
 	if err != nil {
 		return err
@@ -1329,12 +1367,12 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 		return err
 	}
 	if dynamicGroup == nil {
-		// A non-nil empty list is an exact deny-all allowlist. Keeping this
-		// CSI-owned group attached to the target preserves portal validity on the
-		// last unpublish without granting an initiator access.
-		dynamicGroup, err = d.truenasClient.ISCSIInitiatorCreateWithInitiators(ctx, iqns, "scale-csi fencing: "+datasetName)
+		// Keeping this CSI-owned group attached to the target preserves portal
+		// validity on the last unpublish; the sentinel allowlist (not an empty
+		// list) is what actually denies every initiator.
+		dynamicGroup, err = d.truenasClient.ISCSIInitiatorCreateWithInitiators(ctx, allowlist, "scale-csi fencing: "+datasetName)
 	} else {
-		dynamicGroup, err = d.truenasClient.ISCSIInitiatorUpdate(ctx, dynamicGroup.ID, iqns, dynamicGroup.Comment)
+		dynamicGroup, err = d.truenasClient.ISCSIInitiatorUpdate(ctx, dynamicGroup.ID, allowlist, dynamicGroup.Comment)
 	}
 	if err != nil {
 		return err

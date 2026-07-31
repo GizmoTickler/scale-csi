@@ -2076,8 +2076,8 @@ func TestISCSIMultiNodePublishMaintainsExactPerTargetInitiatorGroup(t *testing.T
 	initiator, err = client.ISCSIInitiatorGet(ctx, initiatorID)
 	require.NoError(t, err)
 	require.NotNil(t, initiator)
-	assert.NotNil(t, initiator.Initiators, "a non-nil empty initiator list is deny-all, not allow-all")
-	assert.Empty(t, initiator.Initiators)
+	assert.Equal(t, []string{iscsiDenyAllSentinelIQN}, initiator.Initiators,
+		"last unpublish must write the deny-all sentinel; an empty allowlist renders allow-all on TrueNAS 26.0 SCST")
 	target, err = d.resolveISCSITarget(ctx, ds, datasetName)
 	require.NoError(t, err)
 	require.NotEmpty(t, target.Groups, "last unpublish must retain portal relationships")
@@ -2117,6 +2117,104 @@ func TestISCSILastUnpublishReattachesDenyGroupToExistingTargetPortals(t *testing
 		"recovery must use the target's actual portal rather than config lookup")
 }
 
+// TestISCSIFenceZeroActiveIdentitiesWritesDenyAllSentinelGroup pins the v1.4.1
+// fix: on last unpublish (zero active identities) the CSI-owned fencing group
+// must carry the non-matchable deny-all sentinel, because TrueNAS 26.0 SCST
+// renders an EMPTY allowlist as INITIATOR * (allow-all). The group must also
+// stay attached to the target so the portal relationship remains valid.
+func TestISCSIFenceZeroActiveIdentitiesWritesDenyAllSentinelGroup(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	client.RejectEmptyISCSITargetGroups = true
+	datasetName := "pool/parent/deny-all-iscsi"
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	// Published state: the CSI fencing group holds a real node IQN.
+	dynamic, err := client.ISCSIInitiatorCreateWithInitiators(ctx, []string{"iqn.1993-08.org.debian:worker-a"}, "scale-csi fencing: "+datasetName)
+	require.NoError(t, err)
+	target, err := client.ISCSITargetCreate(ctx, "deny-all-iscsi", "", "ISCSI", []truenas.ISCSITargetGroup{{
+		Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE",
+	}})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperties(ctx, datasetName, map[string]string{
+		PropISCSITargetID:    strconv.Itoa(target.ID),
+		PropISCSIInitiatorID: strconv.Itoa(dynamic.ID),
+	}))
+	d := &Driver{
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeStrict},
+			ISCSI:   ISCSIConfig{TargetPortal: "203.0.113.250:3260"}, // deliberately unresolvable
+		},
+		truenasClient: client,
+	}
+
+	// Last unpublish: zero active identities.
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, nil))
+
+	initiator, err := client.ISCSIInitiatorGet(ctx, dynamic.ID)
+	require.NoError(t, err)
+	require.NotNil(t, initiator)
+	assert.Equal(t, []string{iscsiDenyAllSentinelIQN}, initiator.Initiators,
+		"zero active identities must write the deny-all sentinel, not an empty (allow-all) allowlist")
+
+	target, err = client.ISCSITargetGet(ctx, target.ID)
+	require.NoError(t, err)
+	require.Equal(t, []truenas.ISCSITargetGroup{{Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE"}}, target.Groups,
+		"the sentinel group must stay attached to the target to preserve portal validity")
+}
+
+// TestISCSIFenceRepublishReplacesSentinelWithRealIQN proves the deny-all
+// sentinel never accumulates alongside a real IQN: a publish->unpublish->
+// republish cycle walks the allowlist [A] -> [sentinel] -> [B], and the
+// republish update REPLACES the sentinel rather than appending to it.
+func TestISCSIFenceRepublishReplacesSentinelWithRealIQN(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	client.RejectEmptyISCSITargetGroups = true
+	datasetName := "pool/parent/republish-iscsi"
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	dynamic, err := client.ISCSIInitiatorCreateWithInitiators(ctx, []string{}, "scale-csi fencing: "+datasetName)
+	require.NoError(t, err)
+	target, err := client.ISCSITargetCreate(ctx, "republish-iscsi", "", "ISCSI", []truenas.ISCSITargetGroup{{
+		Portal: 1, Initiator: dynamic.ID, AuthMethod: "NONE",
+	}})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperties(ctx, datasetName, map[string]string{
+		PropISCSITargetID:    strconv.Itoa(target.ID),
+		PropISCSIInitiatorID: strconv.Itoa(dynamic.ID),
+	}))
+	d := &Driver{
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeStrict},
+			ISCSI:   ISCSIConfig{TargetPortal: "192.0.2.10:3260"}, // matches the default mock portal
+		},
+		truenasClient: client,
+	}
+	nodeA := []NodeIdentity{{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:worker-a"}}
+	nodeB := []NodeIdentity{{Name: "worker-b", ISCSIIQN: "iqn.1993-08.org.debian:worker-b"}}
+	allowlist := func() []string {
+		t.Helper()
+		initiator, getErr := client.ISCSIInitiatorGet(ctx, dynamic.ID)
+		require.NoError(t, getErr)
+		require.NotNil(t, initiator)
+		return initiator.Initiators
+	}
+
+	// Publish to A.
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeA, nil))
+	assert.Equal(t, []string{"iqn.1993-08.org.debian:worker-a"}, allowlist())
+
+	// Last unpublish: deny-all sentinel replaces A.
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nil, nil))
+	assert.Equal(t, []string{iscsiDenyAllSentinelIQN}, allowlist())
+
+	// Republish to B: the update must REPLACE the sentinel, not append to it.
+	require.NoError(t, d.applyISCSIFence(ctx, dataset, datasetName, nodeB, nil))
+	assert.Equal(t, []string{"iqn.1993-08.org.debian:worker-b"}, allowlist(),
+		"republish must replace the sentinel, never accumulate it alongside a real IQN")
+}
+
 func TestStrictISCSIShareCreationStartsWithPortalBoundDenyAllGroup(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
@@ -2141,8 +2239,8 @@ func TestStrictISCSIShareCreationStartsWithPortalBoundDenyAllGroup(t *testing.T)
 		initiator, getErr := client.ISCSIInitiatorGet(ctx, group.Initiator)
 		require.NoError(t, getErr)
 		require.NotNil(t, initiator)
-		assert.NotNil(t, initiator.Initiators)
-		assert.Empty(t, initiator.Initiators, "strict target creation must begin deny-all")
+		assert.Equal(t, []string{iscsiDenyAllSentinelIQN}, initiator.Initiators,
+			"strict target creation must begin deny-all via the sentinel, not an empty allowlist")
 	}
 }
 
