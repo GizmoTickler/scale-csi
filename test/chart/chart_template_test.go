@@ -766,3 +766,99 @@ func TestChartISCSIChAPStorageClassSecretRefs(t *testing.T) {
 		}
 	})
 }
+
+// TestChartNVMeoFBlockExcellencePlumbing guards the GF-Sprint 4 NVMe-oF chart
+// plumbing: the install-wide port-performance fields (E-4) and multi-port
+// multipath (E-6). Both are strictly opt-in — the default render (nvmeof enabled)
+// must carry NEITHER a portPerf: nor a multipath: block so the ConfigMap stays
+// byte-identical to pre-GF4 and a rolled-back binary strict-parses it. Setting a
+// field renders only that block.
+func TestChartNVMeoFBlockExcellencePlumbing(t *testing.T) {
+	nvmeOn := []string{"--set", "nvmeof.enabled=true", "--set", "nvmeof.subsystemAllowAnyHost=true"}
+
+	t.Run("default render omits portPerf and multipath", func(t *testing.T) {
+		out := helmTemplate(t, append(nvmeOn, "--show-only", "templates/configmap.yaml")...)
+		if strings.Contains(out, "portPerf:") {
+			t.Errorf("default nvmeof render must not emit a portPerf: block; it is opt-in")
+		}
+		if strings.Contains(out, "multipath:") {
+			t.Errorf("default nvmeof render must not emit a multipath: block; it is opt-in")
+		}
+	})
+
+	t.Run("portPerf renders only when a field is set", func(t *testing.T) {
+		out := helmTemplate(t, append(nvmeOn,
+			"--show-only", "templates/configmap.yaml",
+			"--set", "nvmeof.portPerf.inlineDataSize=8192",
+			"--set", "nvmeof.portPerf.maxQueueSize=128",
+			"--set", "nvmeof.portPerf.piEnable=true",
+		)...)
+		const block = "      portPerf:\n        inlineDataSize: 8192\n        maxQueueSize: 128\n        piEnable: true\n"
+		if !strings.Contains(out, block) {
+			t.Errorf("portPerf fields did not render into the configmap; got:\n%s", out)
+		}
+	})
+
+	t.Run("multipath renders the address list when enabled", func(t *testing.T) {
+		valuesPath := filepath.Join(t.TempDir(), "nvme-multipath-values.yaml")
+		const values = `nvmeof:
+  enabled: true
+  subsystemAllowAnyHost: true
+  address: 192.168.120.10
+  multipath: true
+  addresses:
+    - 192.168.202.10
+    - 192.168.203.10
+`
+		if err := os.WriteFile(valuesPath, []byte(values), 0o600); err != nil {
+			t.Fatalf("write override values: %v", err)
+		}
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "-f", valuesPath)
+		const block = "      multipath: true\n      addresses:\n        - 192.168.202.10\n        - 192.168.203.10\n"
+		if !strings.Contains(out, block) {
+			t.Errorf("multipath + addresses did not render into the configmap; got:\n%s", out)
+		}
+	})
+}
+
+// TestChartBlockProtocolStorageClassParams guards the GF-Sprint 4 per-StorageClass
+// block-protocol knobs (E-1/E-2/E-3/E-5). They are ordinary StorageClass
+// parameters supplied via extraParameters and must flow verbatim into the rendered
+// StorageClass parameters. The example classes ship disabled, so the default
+// render creates no such class (byte-identical).
+func TestChartBlockProtocolStorageClassParams(t *testing.T) {
+	t.Run("disabled example classes do not render by default", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml")
+		for _, absent := range []string{"scale-iscsi-4k", "scale-nvmeof-tuned"} {
+			if strings.Contains(out, "name: "+absent) {
+				t.Errorf("default render must not create the disabled example class %s", absent)
+			}
+		}
+	})
+
+	t.Run("per-SC block knobs flow into parameters", func(t *testing.T) {
+		valuesPath := filepath.Join(t.TempDir(), "block-sc-values.yaml")
+		const values = `storageClasses:
+  - name: scale-iscsi-4k
+    enabled: true
+    protocol: iscsi
+    extraParameters:
+      iscsi/blocksize: "4096"
+      iscsi/queuedCommands: "128"
+      iscsi/insecureTpc: "false"
+`
+		if err := os.WriteFile(valuesPath, []byte(values), 0o600); err != nil {
+			t.Fatalf("write override values: %v", err)
+		}
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		for _, want := range []string{
+			`iscsi/blocksize: "4096"`,
+			`iscsi/queuedCommands: "128"`,
+			`iscsi/insecureTpc: "false"`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rendered StorageClass missing %q; got:\n%s", want, out)
+			}
+		}
+	})
+}
