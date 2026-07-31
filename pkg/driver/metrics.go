@@ -21,6 +21,12 @@ const (
 // expressions against — registering a metric and naming it can never diverge.
 var metricNames []string
 
+// histogramNames accumulates the fully-qualified base name of every histogram
+// (and summary) metric. The chart drift test uses it to decide whether a
+// generated _bucket/_sum/_count suffix is legal: those series exist ONLY for
+// histogram/summary bases, so `scale_csi_<gauge>_count` must be rejected.
+var histogramNames []string
+
 // recordName appends the metric's fully-qualified name (namespace + name) to
 // metricNames. The name is derived from the SAME opts the collector is built
 // from, so there is no second copy of the name to drift.
@@ -64,6 +70,7 @@ func regHistogramVec(opts prometheus.HistogramOpts, labels []string) *prometheus
 	h := prometheus.NewHistogramVec(opts, labels)
 	prometheus.MustRegister(h)
 	recordName(opts.Namespace, opts.Subsystem, opts.Name)
+	histogramNames = append(histogramNames, prometheus.BuildFQName(opts.Namespace, opts.Subsystem, opts.Name))
 	return h
 }
 
@@ -73,6 +80,15 @@ func regHistogramVec(opts prometheus.HistogramOpts, labels []string) *prometheus
 // chart drift test fails if a dashboard/alert names anything not in this set.
 func MetricNames() []string {
 	return append([]string(nil), metricNames...)
+}
+
+// HistogramMetricNames returns the fully-qualified base names of every
+// histogram/summary the driver registers, in registration order. The chart
+// drift test uses this set to permit the Prometheus-generated
+// _bucket/_sum/_count suffixes ONLY on histogram bases. The returned slice is a
+// copy.
+func HistogramMetricNames() []string {
+	return append([]string(nil), histogramNames...)
 }
 
 var (
