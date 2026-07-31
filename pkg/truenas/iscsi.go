@@ -12,6 +12,11 @@ type ISCSITarget struct {
 	Alias  string             `json:"alias"`
 	Mode   string             `json:"mode"`
 	Groups []ISCSITargetGroup `json:"groups"`
+	// QueuedCommands mirrors iscsi_parameters.QueuedCommands when the backend
+	// reports it; nil means the target uses the SCST default queue depth.
+	QueuedCommands *int `json:"-"`
+	// AuthNetworks is the target-level network ACL.
+	AuthNetworks []string `json:"auth_networks,omitempty"`
 }
 
 // ISCSITargetGroup represents a portal/initiator group for a target.
@@ -40,6 +45,9 @@ type ISCSIExtent struct {
 	Rpm         string `json:"rpm"`
 	Ro          bool   `json:"ro"`
 	Enabled     bool   `json:"enabled"`
+	// AvailThreshold is the per-extent early-full warning percentage (1-99); nil
+	// means no threshold is configured.
+	AvailThreshold *int `json:"-"`
 }
 
 // ISCSITargetExtent represents a target-to-extent association.
@@ -58,8 +66,24 @@ type ISCSIGlobalConfig struct {
 	PoolAvailThreshold int    `json:"pool_avail_threshold"`
 }
 
+// ISCSITargetCreateOptions carries optional target fields that default to omit
+// so an unset option reproduces the historical create byte-for-byte.
+type ISCSITargetCreateOptions struct {
+	// QueuedCommands sets iscsi_parameters.QueuedCommands (the per-target SCST
+	// queue depth; TrueNAS accepts 32 or 128). Nil omits the whole
+	// iscsi_parameters object so the backend default applies.
+	QueuedCommands *int
+	// AuthNetworks sets the target-level network ACL. Nil/empty omits it so
+	// access stays governed by the per-group initiator allowlists only.
+	AuthNetworks []string
+}
+
 // ISCSITargetCreate creates a new iSCSI target.
-func (c *Client) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
+func (c *Client) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup, opts ...ISCSITargetCreateOptions) (*ISCSITarget, error) {
+	var opt ISCSITargetCreateOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	params := map[string]interface{}{
 		"name":   name,
 		"mode":   mode,
@@ -68,6 +92,14 @@ func (c *Client) ISCSITargetCreate(ctx context.Context, name, alias, mode string
 	// Only include alias if non-empty
 	if alias != "" {
 		params["alias"] = alias
+	}
+	if opt.QueuedCommands != nil {
+		params["iscsi_parameters"] = map[string]interface{}{
+			"QueuedCommands": *opt.QueuedCommands,
+		}
+	}
+	if len(opt.AuthNetworks) > 0 {
+		params["auth_networks"] = append([]string(nil), opt.AuthNetworks...)
 	}
 
 	result, err := c.Call(ctx, "iscsi.target.create", params)
@@ -192,9 +224,25 @@ func (c *Client) ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error) {
 	return targets, nil
 }
 
+// ISCSIExtentCreateOptions carries optional extent fields that default to omit
+// so an unset option reproduces the historical create byte-for-byte.
+type ISCSIExtentCreateOptions struct {
+	// InsecureTpc overrides the historical hardcoded insecure_tpc=true. Nil keeps
+	// true (byte-identical); set false for stricter XCOPY/ODX isolation.
+	InsecureTpc *bool
+	// ReadOnly creates a read-only extent. Nil keeps false.
+	ReadOnly *bool
+	// AvailThreshold sets the per-extent early-full warning percentage (1-99).
+	// Nil omits the field so no threshold is configured.
+	AvailThreshold *int
+	// Serial pins a stable SCSI serial so identity survives delete+recreate.
+	// Empty omits the field so TrueNAS auto-generates one.
+	Serial string
+}
+
 // ISCSIExtentCreate creates a new iSCSI extent.
-func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error) {
-	params := iscsiExtentCreateParams(name, diskPath, comment, blocksize, physicalBlocksize, rpm)
+func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string, opts ...ISCSIExtentCreateOptions) (*ISCSIExtent, error) {
+	params := iscsiExtentCreateParams(name, diskPath, comment, blocksize, physicalBlocksize, rpm, opts...)
 
 	result, err := c.Call(ctx, "iscsi.extent.create", params)
 	if err != nil {
@@ -215,19 +263,38 @@ func (c *Client) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment 
 	return parseISCSIExtent(result)
 }
 
-func iscsiExtentCreateParams(name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) map[string]interface{} {
-	return map[string]interface{}{
+func iscsiExtentCreateParams(name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string, opts ...ISCSIExtentCreateOptions) map[string]interface{} {
+	var opt ISCSIExtentCreateOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	insecureTpc := true
+	if opt.InsecureTpc != nil {
+		insecureTpc = *opt.InsecureTpc
+	}
+	readOnly := false
+	if opt.ReadOnly != nil {
+		readOnly = *opt.ReadOnly
+	}
+	params := map[string]interface{}{
 		"name":         name,
 		"type":         "DISK",
 		"disk":         diskPath,
 		"comment":      comment,
 		"blocksize":    blocksize,
 		"pblocksize":   physicalBlocksize,
-		"insecure_tpc": true,
+		"insecure_tpc": insecureTpc,
 		"rpm":          rpm,
-		"ro":           false,
+		"ro":           readOnly,
 		"enabled":      true,
 	}
+	if opt.AvailThreshold != nil {
+		params["avail_threshold"] = *opt.AvailThreshold
+	}
+	if opt.Serial != "" {
+		params["serial"] = opt.Serial
+	}
+	return params
 }
 
 // ISCSIExtentDelete deletes an iSCSI extent.
@@ -389,6 +456,22 @@ func parseISCSITarget(data interface{}) (*ISCSITarget, error) {
 	if v, ok := m["mode"].(string); ok {
 		target.Mode = v
 	}
+	if params, ok := m["iscsi_parameters"].(map[string]interface{}); ok {
+		if v, ok := params["QueuedCommands"].(float64); ok {
+			qc := int(v)
+			target.QueuedCommands = &qc
+		}
+	}
+	switch networks := m["auth_networks"].(type) {
+	case []interface{}:
+		for _, network := range networks {
+			if value, ok := network.(string); ok {
+				target.AuthNetworks = append(target.AuthNetworks, value)
+			}
+		}
+	case []string:
+		target.AuthNetworks = append(target.AuthNetworks, networks...)
+	}
 
 	if groups, ok := m["groups"].([]interface{}); ok {
 		for _, g := range groups {
@@ -480,6 +563,10 @@ func parseISCSIExtent(data interface{}) (*ISCSIExtent, error) {
 	}
 	if v, ok := m["enabled"].(bool); ok {
 		extent.Enabled = v
+	}
+	if v, ok := m["avail_threshold"].(float64); ok {
+		threshold := int(v)
+		extent.AvailThreshold = &threshold
 	}
 
 	return extent, nil

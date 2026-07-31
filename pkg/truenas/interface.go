@@ -81,13 +81,13 @@ type ClientInterface interface {
 	ISCSIInitiatorGet(ctx context.Context, id int) (*ISCSIInitiator, error)
 	ISCSIInitiatorUpdate(ctx context.Context, id int, initiators []string, comment string) (*ISCSIInitiator, error)
 	ISCSIInitiatorDelete(ctx context.Context, id int) error
-	ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error)
+	ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup, opts ...ISCSITargetCreateOptions) (*ISCSITarget, error)
 	ISCSITargetUpdate(ctx context.Context, id int, groups []ISCSITargetGroup) (*ISCSITarget, error)
 	ISCSITargetDelete(ctx context.Context, id int, force bool) error
 	ISCSITargetGet(ctx context.Context, id int) (*ISCSITarget, error)
 	ISCSITargetFindByName(ctx context.Context, name string) (*ISCSITarget, error)
 	ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error)
-	ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error)
+	ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string, opts ...ISCSIExtentCreateOptions) (*ISCSIExtent, error)
 	ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error
 	ISCSIExtentGet(ctx context.Context, id int) (*ISCSIExtent, error)
 	ISCSIExtentFindByName(ctx context.Context, name string) (*ISCSIExtent, error)
@@ -113,7 +113,7 @@ type ClientInterface interface {
 	NVMeoFHostSubsysFind(ctx context.Context, hostID, subsysID int) (*NVMeoFHostSubsys, error)
 	NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFHostSubsys, error)
 	NVMeoFHostSubsysDelete(ctx context.Context, id int) error
-	NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error)
+	NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...NVMeoFSubsystemCreateOptions) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemUpdateAllowAnyHost(ctx context.Context, id int, allowAnyHost bool) (*NVMeoFSubsystem, error)
 	NVMeoFSubsystemDelete(ctx context.Context, id int) error
 	NVMeoFSubsystemGet(ctx context.Context, id int) (*NVMeoFSubsystem, error)
@@ -127,7 +127,7 @@ type ClientInterface interface {
 	NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFNamespace, error)
 	NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespace, error)
 	NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error)
-	NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error)
+	NVMeoFPortCreate(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error)
 	NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error)
 	NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID int) (*NVMeoFPortSubsys, error)
 	NVMeoFPortSubsysFindBySubsystem(ctx context.Context, subsysID int) (bool, error)
@@ -135,7 +135,7 @@ type ClientInterface interface {
 	NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*NVMeoFPortSubsys, error)
 	NVMeoFPortSubsysDelete(ctx context.Context, id int) error
 	NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, error)
-	NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int) (*NVMeoFPort, error)
+	NVMeoFGetOrCreatePort(ctx context.Context, transport string, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error)
 	InvalidateNVMeoFPort(transport, address string, port int)
 	NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error)
 }

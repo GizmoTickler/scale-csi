@@ -92,6 +92,11 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	iscsiName := d.iscsiShareName(path.Base(datasetName))
 	diskPath := fmt.Sprintf("zvol/%s", datasetName)
 
+	// Resolved per-StorageClass block-protocol tuning (GF-Sprint 4). Nil when the
+	// StorageClass opted into nothing, in which case every field falls back to the
+	// controller default and provisioning is byte-identical to pre-GF4.
+	opts := blockOptsFromContext(ctx)
+
 	// Step 2: Find or create target (idempotent)
 	var target *truenas.ISCSITarget
 	var targetID int
@@ -184,7 +189,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			}
 		}
 
-		target, err = d.truenasClient.ISCSITargetCreate(ctx, iscsiName, "", "ISCSI", targetGroups)
+		target, err = d.truenasClient.ISCSITargetCreate(ctx, iscsiName, "", "ISCSI", targetGroups, opts.iscsiTargetCreateOpts())
 		if err != nil {
 			if usedResolvedGroup {
 				d.invalidateISCSITargetGroup()
@@ -223,6 +228,13 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			return status.Errorf(codes.Internal, "failed to resolve iSCSI extent: %v", err)
 		}
 		if extent != nil {
+			// R-1: blocksize is immutable once an extent holds data. Reject a
+			// request whose resolved blocksize diverges from the existing extent
+			// rather than silently keeping a geometry that desyncs the
+			// StorageClass contract from the backend.
+			if guardErr := guardISCSIBlocksizeImmutability(extent, opts.resolvedISCSIBlocksize(d.config.ISCSI.ExtentBlocksize), datasetName); guardErr != nil {
+				return guardErr
+			}
 			extentID = extent.ID
 			klog.V(4).Infof("Resolved existing extent by disk path %s (ID %d)", diskPath, extentID)
 		}
@@ -250,9 +262,10 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				iscsiName,
 				diskPath,
 				comment,
-				d.config.ISCSI.ExtentBlocksize,
-				!d.config.ISCSI.ExtentDisablePhysicalBlocksize,
+				opts.resolvedISCSIBlocksize(d.config.ISCSI.ExtentBlocksize),
+				opts.resolvedISCSIPblocksize(d.config.ISCSI.ExtentDisablePhysicalBlocksize),
 				d.config.ISCSI.ExtentRpm,
+				opts.iscsiExtentCreateOpts(),
 			)
 			if createErr == nil {
 				extentID = extent.ID

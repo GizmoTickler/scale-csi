@@ -112,16 +112,16 @@ func (m *nvmeReconcileFailureMock) NVMeoFSubsystemDelete(ctx context.Context, id
 	return m.MockClient.NVMeoFSubsystemDelete(ctx, id)
 }
 
-func (m *iscsiTargetCreateFailMock) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []truenas.ISCSITargetGroup) (*truenas.ISCSITarget, error) {
+func (m *iscsiTargetCreateFailMock) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []truenas.ISCSITargetGroup, opts ...truenas.ISCSITargetCreateOptions) (*truenas.ISCSITarget, error) {
 	if m.targetCreateErr != nil {
 		err := m.targetCreateErr
 		m.targetCreateErr = nil
 		return nil, err
 	}
-	return m.MockClient.ISCSITargetCreate(ctx, name, alias, mode, groups)
+	return m.MockClient.ISCSITargetCreate(ctx, name, alias, mode, groups, opts...)
 }
 
-func (m *nvmePortAssociationFailMock) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*truenas.NVMeoFPort, error) {
+func (m *nvmePortAssociationFailMock) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...truenas.NVMeoFPortCreateOptions) (*truenas.NVMeoFPort, error) {
 	if m.cachedPort != nil {
 		return m.cachedPort, nil
 	}
@@ -159,7 +159,7 @@ func (m *nvmeHostCountingMock) NVMeoFHostCreate(ctx context.Context, nqn string)
 	return m.MockClient.NVMeoFHostCreate(ctx, nqn)
 }
 
-func (m *nvmeHostCountingMock) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*truenas.NVMeoFSubsystem, error) {
+func (m *nvmeHostCountingMock) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...truenas.NVMeoFSubsystemCreateOptions) (*truenas.NVMeoFSubsystem, error) {
 	m.subsystemAllowAny = append(m.subsystemAllowAny, allowAnyHost)
 	m.subsystemHostIDs = append(m.subsystemHostIDs, append([]int(nil), hostIDs...))
 	if m.subsystemCreateFail != nil {
@@ -167,7 +167,7 @@ func (m *nvmeHostCountingMock) NVMeoFSubsystemCreate(ctx context.Context, name s
 		m.subsystemCreateFail = nil
 		return nil, err
 	}
-	return m.MockClient.NVMeoFSubsystemCreate(ctx, name, allowAnyHost, hostIDs)
+	return m.MockClient.NVMeoFSubsystemCreate(ctx, name, allowAnyHost, hostIDs, opts...)
 }
 
 func (m *nvmeDeleteAssociationCountingMock) NVMeoFPortSubsysList(ctx context.Context) ([]*truenas.NVMeoFPortSubsys, error) {
@@ -207,9 +207,9 @@ func (m *shareCallCountingMock) DatasetSetUserProperties(ctx context.Context, na
 	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
 }
 
-func (m *shareCallCountingMock) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*truenas.ISCSIExtent, error) {
+func (m *shareCallCountingMock) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string, opts ...truenas.ISCSIExtentCreateOptions) (*truenas.ISCSIExtent, error) {
 	m.extentPblocksize = append(m.extentPblocksize, physicalBlocksize)
-	return m.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, physicalBlocksize, rpm)
+	return m.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, physicalBlocksize, rpm, opts...)
 }
 
 func (m *shareCallCountingMock) ISCSITargetGet(ctx context.Context, id int) (*truenas.ISCSITarget, error) {

@@ -1129,7 +1129,7 @@ func (m *MockClient) CheckNVMeoFSupport(ctx context.Context) error {
 }
 
 // iSCSI methods
-func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
+func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup, opts ...ISCSITargetCreateOptions) (*ISCSITarget, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.RejectEmptyISCSITargetGroups && len(groups) == 0 {
@@ -1138,6 +1138,10 @@ func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode st
 
 	id := len(m.ISCSITargets) + 1
 	target := &ISCSITarget{ID: id, Name: name, Alias: alias, Mode: mode, Groups: groups}
+	if len(opts) > 0 {
+		target.QueuedCommands = opts[0].QueuedCommands
+		target.AuthNetworks = append([]string(nil), opts[0].AuthNetworks...)
+	}
 	m.ISCSITargets[id] = target
 	return target, nil
 }
@@ -1191,12 +1195,36 @@ func (m *MockClient) ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error
 	}
 	return list, nil
 }
-func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error) {
+func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string, opts ...ISCSIExtentCreateOptions) (*ISCSIExtent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	id := len(m.ISCSIExtents) + 1
-	ext := &ISCSIExtent{ID: id, Name: name, Disk: diskPath, Comment: comment}
+	ext := &ISCSIExtent{
+		ID:          id,
+		Name:        name,
+		Disk:        diskPath,
+		Comment:     comment,
+		Blocksize:   blocksize,
+		Pblocksize:  physicalBlocksize,
+		Rpm:         rpm,
+		InsecureTpc: true,
+		Enabled:     true,
+	}
+	if len(opts) > 0 {
+		opt := opts[0]
+		if opt.InsecureTpc != nil {
+			ext.InsecureTpc = *opt.InsecureTpc
+		}
+		if opt.ReadOnly != nil {
+			ext.Ro = *opt.ReadOnly
+		}
+		if opt.AvailThreshold != nil {
+			threshold := *opt.AvailThreshold
+			ext.AvailThreshold = &threshold
+		}
+		ext.Serial = opt.Serial
+	}
 	m.ISCSIExtents[id] = ext
 	return ext, nil
 }
@@ -1438,7 +1466,7 @@ func (m *MockClient) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
 	return nil
 }
 
-func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error) {
+func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...NVMeoFSubsystemCreateOptions) (*NVMeoFSubsystem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.InjectError != nil {
@@ -1467,6 +1495,15 @@ func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, all
 		NQN:          fmt.Sprintf("nqn.2011-06.com.truenas:%s", name), // Mock auto-generated NQN
 		AllowAnyHost: allowAnyHost,
 		Hosts:        hosts,
+	}
+	if len(opts) > 0 {
+		if opts[0].QidMax != nil {
+			qidMax := *opts[0].QidMax
+			sub.QidMax = &qidMax
+		}
+		if opts[0].PiEnable != nil {
+			sub.PiEnable = *opts[0].PiEnable
+		}
 	}
 	m.NVMeSubsystems[id] = sub
 	for _, hostID := range hostIDs {
@@ -1610,7 +1647,7 @@ func (m *MockClient) NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespac
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	return []*NVMeoFPort{{ID: 1, Transport: "TCP", Address: "0.0.0.0", Port: 4420}}, nil
 }
-func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
+func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
 func (m *MockClient) NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
@@ -1642,7 +1679,7 @@ func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsyste
 	}
 	return list, nil
 }
-func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
+func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
 func (m *MockClient) InvalidateNVMeoFPort(transport, address string, port int) {}
