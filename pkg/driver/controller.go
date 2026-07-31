@@ -1472,6 +1472,14 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 				VolumeId:      volumeID,
 				CapacityBytes: capacity,
 			},
+			// Populate the entry's VolumeCondition from the same helper
+			// ControllerGetVolume uses. external-health-monitor v0.18.0 prefers
+			// ListVolumes whenever LIST_VOLUMES is advertised and reads
+			// Entry.Status.VolumeCondition; leaving it nil made its nil-safe
+			// getters report every listed volume as normal (codex H1).
+			Status: &csi.ListVolumesResponse_VolumeStatus{
+				VolumeCondition: volumeConditionFromDataset(ds),
+			},
 		})
 	}
 
@@ -1510,6 +1518,12 @@ func (d *Driver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (
 	avail := int64(0)
 	if v, ok := ds.Available.Parsed.(float64); ok {
 		avail = int64(v)
+	} else {
+		// A scheduler reads AvailableCapacity=0 as "backend full" and can halt
+		// provisioning cluster-wide, so a missing/unparseable `available` must not
+		// degrade silently. Keep returning 0 (honest "nothing confirmed free")
+		// but surface why, so an operator can tell a full pool from a parse miss.
+		klog.Warningf("GetCapacity: dataset %s has absent/unparseable `available` (%v); reporting 0", parent, ds.Available.Parsed)
 	}
 
 	resp := &csi.GetCapacityResponse{
@@ -1931,9 +1945,10 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
 		// VolumeCondition is derived from the dataset's ALREADY-returned user
-		// properties (no extra API call). A dataset-gone case returns NotFound
-		// above, so reaching here means the backend object exists; abnormal is
-		// reserved for a managed/provision stamp that never landed.
+		// properties (no extra API call) via the same helper ListVolumes uses. A
+		// dataset-gone case returns NotFound above, so reaching here means the
+		// backend object exists; abnormal is reserved for a definitive negative
+		// marker (see volumeConditionFromDataset).
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
 			VolumeCondition: volumeConditionFromDataset(ds),
 		},
@@ -1941,24 +1956,37 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 }
 
 // volumeConditionFromDataset derives a CSI VolumeCondition from a fetched
-// dataset's user properties without any further API call. A dataset is healthy
-// when it carries both the managed-resource and provision-success stamps; a
-// missing stamp means provisioning never completed (or the object is foreign),
-// which is reported as abnormal with an explanatory message.
+// dataset's user properties without any further API call. It is the single
+// source of truth shared by ControllerGetVolume and ListVolumes so both RPCs —
+// and whichever path the external-health-monitor selects (it prefers
+// ListVolumes when LIST_VOLUMES is advertised) — report an identical condition.
+//
+// The semantics are deliberately conservative about declaring ill health. A
+// volume is abnormal ONLY on a definitive negative marker: an explicit
+// provision_success="false". A dataset-gone condition never reaches here (both
+// callers return NotFound first). Missing managed/provision stamps are NOT
+// evidence of ill health: the always-on adoption reconcile backfills only
+// driver_instance_id, and a long-Bound legacy volume never re-runs CreateVolume
+// (the sole path that writes both stamps), so an unstamped dataset can be
+// perfectly healthy. Those are reported normal with a message noting the health
+// is unverified, rather than flagged abnormal and raising spurious volume-health
+// events on clusters with pre-stamp legacy PVs.
 func volumeConditionFromDataset(ds *truenas.Dataset) *csi.VolumeCondition {
-	if datasetUserProperty(ds, PropManagedResource) != "true" {
+	if datasetUserProperty(ds, PropProvisionSuccess) == "false" {
 		return &csi.VolumeCondition{
 			Abnormal: true,
-			Message:  "dataset is not marked as a CSI-managed resource",
+			Message:  "dataset provisioning is explicitly marked failed",
 		}
 	}
-	if datasetUserProperty(ds, PropProvisionSuccess) != "true" {
-		return &csi.VolumeCondition{
-			Abnormal: true,
-			Message:  "dataset provisioning did not complete successfully",
-		}
+	managed := datasetUserProperty(ds, PropManagedResource) == "true"
+	provisioned := datasetUserProperty(ds, PropProvisionSuccess) == "true"
+	if managed && provisioned {
+		return &csi.VolumeCondition{Abnormal: false}
 	}
-	return &csi.VolumeCondition{Abnormal: false}
+	return &csi.VolumeCondition{
+		Abnormal: false,
+		Message:  "volume health unverified: managed/provision stamps absent (legacy or adoption-pending dataset)",
+	}
 }
 
 // ControllerModifyVolume modifies a volume (not implemented).

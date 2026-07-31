@@ -1135,10 +1135,14 @@ func TestControllerGetVolumeDatasetErrors(t *testing.T) {
 
 // TestControllerGetVolumeVolumeCondition proves the advertised VOLUME_CONDITION
 // capability is backed by a populated Volume.Status.VolumeCondition derived from
-// the dataset's already-returned user properties (no extra API call): a fully
-// stamped dataset is healthy, while a missing managed/provision stamp is abnormal.
+// the dataset's already-returned user properties (no extra API call). Semantics
+// are conservative (opus L1): a fully stamped dataset is healthy; a legacy
+// dataset missing stamps is normal-but-unverified (NOT abnormal, since the
+// always-on adoption reconcile backfills only driver_instance_id); only a
+// definitive negative marker — an explicit provision_success="false" — is
+// abnormal.
 func TestControllerGetVolumeVolumeCondition(t *testing.T) {
-	t.Run("unstamped dataset is abnormal", func(t *testing.T) {
+	t.Run("unstamped legacy dataset is normal but unverified", func(t *testing.T) {
 		mockClient := truenas.NewMockClient()
 		mockClient.Datasets["pool/parent/volume"] = &truenas.Dataset{
 			ID:             "pool/parent/volume",
@@ -1153,8 +1157,8 @@ func TestControllerGetVolumeVolumeCondition(t *testing.T) {
 		require.NotNil(t, response.GetStatus())
 		cond := response.GetStatus().GetVolumeCondition()
 		require.NotNil(t, cond)
-		assert.True(t, cond.GetAbnormal())
-		assert.NotEmpty(t, cond.GetMessage())
+		assert.False(t, cond.GetAbnormal(), "missing stamps are not evidence of ill health")
+		assert.Contains(t, cond.GetMessage(), "unverified")
 	})
 
 	t.Run("fully stamped dataset is healthy", func(t *testing.T) {
@@ -1175,7 +1179,96 @@ func TestControllerGetVolumeVolumeCondition(t *testing.T) {
 		cond := response.GetStatus().GetVolumeCondition()
 		require.NotNil(t, cond)
 		assert.False(t, cond.GetAbnormal())
+		assert.Empty(t, cond.GetMessage())
 	})
+
+	t.Run("explicit provision failure marker is abnormal", func(t *testing.T) {
+		mockClient := truenas.NewMockClient()
+		mockClient.Datasets["pool/parent/volume"] = &truenas.Dataset{
+			ID:   "pool/parent/volume",
+			Name: "pool/parent/volume",
+			Type: "FILESYSTEM",
+			UserProperties: map[string]truenas.UserProperty{
+				PropManagedResource:  {Value: "true"},
+				PropProvisionSuccess: {Value: "false"},
+			},
+		}
+		driver := newComplianceTestDriver(mockClient)
+
+		response, err := driver.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: "volume"})
+		require.NoError(t, err)
+		cond := response.GetStatus().GetVolumeCondition()
+		require.NotNil(t, cond)
+		assert.True(t, cond.GetAbnormal())
+		assert.NotEmpty(t, cond.GetMessage())
+	})
+}
+
+// TestListVolumesVolumeConditionContract proves the external-health-monitor
+// v0.18.0 integration path. That sidecar prefers ListVolumes whenever
+// LIST_VOLUMES is advertised and reads Entry.Status.VolumeCondition (it never
+// falls through to ControllerGetVolume). The condition must therefore be
+// populated on every entry — a nil Status made the sidecar's nil-safe getters
+// report every listed volume as normal (codex H1). The assertions read the
+// response through the exact Entry.GetStatus().GetVolumeCondition() shape the
+// sidecar uses, and cover an abnormal volume, a legacy normal volume, and a
+// fully stamped healthy volume.
+func TestListVolumesVolumeConditionContract(t *testing.T) {
+	mockClient := truenas.NewMockClient()
+	mockClient.Datasets["pool/parent/abnormal-vol"] = &truenas.Dataset{
+		ID:   "pool/parent/abnormal-vol",
+		Name: "pool/parent/abnormal-vol",
+		Type: "FILESYSTEM",
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource:  {Value: "true"},
+			PropProvisionSuccess: {Value: "false"},
+		},
+	}
+	mockClient.Datasets["pool/parent/legacy-vol"] = &truenas.Dataset{
+		ID:   "pool/parent/legacy-vol",
+		Name: "pool/parent/legacy-vol",
+		Type: "FILESYSTEM",
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource: {Value: "true"},
+		},
+	}
+	mockClient.Datasets["pool/parent/healthy-vol"] = &truenas.Dataset{
+		ID:   "pool/parent/healthy-vol",
+		Name: "pool/parent/healthy-vol",
+		Type: "FILESYSTEM",
+		UserProperties: map[string]truenas.UserProperty{
+			PropManagedResource:  {Value: "true"},
+			PropProvisionSuccess: {Value: "true"},
+		},
+	}
+	driver := newComplianceTestDriver(mockClient)
+
+	response, err := driver.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
+	require.NoError(t, err)
+	require.Len(t, response.Entries, 3)
+
+	// Index by volume ID through the exact getters the health-monitor uses.
+	conditions := make(map[string]*csi.VolumeCondition, len(response.Entries))
+	for _, entry := range response.Entries {
+		require.NotNil(t, entry.GetStatus(), "entry %s must carry a Status", entry.GetVolume().GetVolumeId())
+		require.NotNil(t, entry.GetStatus().GetVolumeCondition(), "entry %s must carry a VolumeCondition", entry.GetVolume().GetVolumeId())
+		conditions[entry.GetVolume().GetVolumeId()] = entry.GetStatus().GetVolumeCondition()
+	}
+
+	abnormal := conditions["abnormal-vol"]
+	require.NotNil(t, abnormal, "abnormal volume must surface through the ListVolumes path")
+	assert.True(t, abnormal.GetAbnormal())
+	assert.NotEmpty(t, abnormal.GetMessage())
+
+	legacy := conditions["legacy-vol"]
+	require.NotNil(t, legacy, "legacy volume must be listed")
+	assert.False(t, legacy.GetAbnormal(), "a healthy legacy volume must not be flagged abnormal")
+	assert.Contains(t, legacy.GetMessage(), "unverified")
+
+	healthy := conditions["healthy-vol"]
+	require.NotNil(t, healthy)
+	assert.False(t, healthy.GetAbnormal())
+	assert.Empty(t, healthy.GetMessage())
 }
 
 // FIX 3 regression: a snapshot-sourced CreateVolume chooses clone vs detached
