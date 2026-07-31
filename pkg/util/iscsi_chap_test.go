@@ -3,6 +3,7 @@ package util
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -76,21 +77,62 @@ func TestConfigureISCSICHAPWithContextNilIsNoop(t *testing.T) {
 }
 
 func TestConfigureISCSICHAPWithContextErrorCarriesParamNameNotValue(t *testing.T) {
+	const secret = "supersecretvalue"
 	originalRunner := iscsiAdmCombinedOutput
 	iscsiAdmCombinedOutput = func(_ context.Context, args ...string) ([]byte, error) {
-		// Fail only on the password write.
+		// Fail only on the password write, and make BOTH the stdout AND the error
+		// echo the submitted secret value — the worst case where iscsiadm or a
+		// wrapper/exec-logger reflects the argv. The returned error must still be
+		// clean (parameter name + exit class only).
 		if slices.Contains(args, "node.session.auth.password") {
-			return []byte("boom"), errors.New("exit status 1")
+			return []byte("iscsiadm set -v " + secret + " failed"),
+				fmt.Errorf("exec failed running -v %s", secret)
 		}
 		return nil, nil
 	}
 	t.Cleanup(func() { iscsiAdmCombinedOutput = originalRunner })
 
-	creds := &ISCSICHAPCredentials{Username: "chapuser", Password: "supersecretvalue"}
+	creds := &ISCSICHAPCredentials{Username: "chapuser", Password: secret}
 	err := ConfigureISCSICHAPWithContext(context.Background(), "192.0.2.23:3260", "iqn.test:y", creds)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "node.session.auth.password")
-	assert.NotContains(t, err.Error(), "supersecretvalue", "credential value must never appear in errors")
+	assert.Contains(t, err.Error(), "node.session.auth.password", "the parameter NAME is safe to surface")
+	assert.NotContains(t, err.Error(), secret, "credential value must never appear in errors (stdout or raw exec error)")
+}
+
+// TestISCSIConnectPostDiscoveryAuthFailureIsClassified is the F-07 regression:
+// first login reports target-not-found, discovery succeeds, and the retry login
+// fails authentication. The post-discovery auth failure must be classified as
+// ErrISCSIAuthFailure (redacted), not returned as a generic login error.
+func TestISCSIConnectPostDiscoveryAuthFailureIsClassified(t *testing.T) {
+	portal := "192.0.2.26:3260"
+	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-postdisc"
+	const secret = "wrongsecret12"
+	loginAttempts := 0
+
+	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
+		if slices.Contains(args, "--login") {
+			loginAttempts++
+			if loginAttempts == 1 {
+				// First login: target node record not yet propagated.
+				return []byte("iscsiadm: No records found"), errors.New("exit status 21")
+			}
+			// Post-discovery retry: the credential is wrong. Echo the secret in the
+			// raw output to prove it is not surfaced in the returned error.
+			return []byte("Could not login: authentication failed (-v " + secret + ")"),
+				fmt.Errorf("authentication failed: -v %s", secret)
+		}
+		return nil, nil
+	})
+
+	_, err := ISCSIConnectWithOptionsAndSessions(
+		context.Background(), portal, iqn, 0,
+		&ISCSIConnectOptions{CHAP: &ISCSICHAPCredentials{Username: "u", Password: secret}},
+		nil,
+	)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrISCSIAuthFailure), "post-discovery auth failure must be classified, got: %v", err)
+	assert.NotContains(t, err.Error(), secret, "credential must never appear in the returned error")
+	assert.GreaterOrEqual(t, loginAttempts, 2, "must have retried after discovery before classifying")
 }
 
 func TestISCSIConnectAuthFailureShortCircuitsDiscovery(t *testing.T) {

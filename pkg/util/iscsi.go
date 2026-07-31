@@ -259,6 +259,13 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 					break
 				}
 
+				if isAuthFailure(loginErr) {
+					// Classify auth failures on EVERY login attempt, including the
+					// post-discovery retry: a wrong secret is terminal and must return
+					// the same redacted Unauthenticated sentinel, not a raw login error.
+					klog.Warningf("iSCSI CHAP authentication failed for %s on post-discovery retry; not retrying", iqn)
+					return "", fmt.Errorf("%w for %s", ErrISCSIAuthFailure, iqn)
+				}
 				if !isTargetNotFoundError(loginErr) {
 					// Different error, don't retry
 					return "", fmt.Errorf("login failed for %s after discovery retry %d: %w", iqn, attempt, loginErr)
@@ -792,10 +799,15 @@ func ConfigureISCSICHAPWithContext(ctx context.Context, portal, iqn string, cred
 	setParam := func(name, value string) error {
 		cmdCtx, cancel := context.WithTimeout(ctx, getISCSITimeout())
 		defer cancel()
-		output, err := iscsiAdmCombinedOutput(cmdCtx, "-m", "node", "-T", iqn, "-p", portal,
+		// The value passed to iscsiadm is a CHAP credential. On failure NEVER append
+		// the command's CombinedOutput or the raw exec error: iscsiadm (or a wrapper
+		// / exec logger) can echo the submitted argv/value. Return only the parameter
+		// NAME and an exit-class summary so no credential can reach a gRPC status,
+		// Event, or log line.
+		_, err := iscsiAdmCombinedOutput(cmdCtx, "-m", "node", "-T", iqn, "-p", portal,
 			"-o", "update", "-n", name, "-v", value)
 		if err != nil {
-			return fmt.Errorf("failed to set node param %s: %w, output: %s", name, err, string(output))
+			return fmt.Errorf("failed to set node param %s (%s)", name, sanitizedExecClass(err))
 		}
 		return nil
 	}
@@ -818,6 +830,24 @@ func ConfigureISCSICHAPWithContext(ctx context.Context, portal, iqn string, cred
 		}
 	}
 	return nil
+}
+
+// sanitizedExecClass summarizes an exec error WITHOUT its message or output, so
+// a credential that iscsiadm or a wrapper echoed into stdout/stderr cannot leak
+// into a returned error. A real *exec.ExitError yields "exit status N"; any
+// other error is reported only by class.
+func sanitizedExecClass(err error) string {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return fmt.Sprintf("exit status %d", exitErr.ExitCode())
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timed out"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	return "command execution error"
 }
 
 // isAuthFailure reports whether a login error is a CHAP authentication failure
