@@ -480,13 +480,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// fence pass reconstructs authmethod+auth purely from PropISCSIAuthTag +
 	// PropISCSIAuthMode, so a missing stamp would silently downgrade the target to
 	// authmethod=NONE. The immutable mode is stored here (never re-derived from the
-	// mutable global flag). Only the fresh-create path reaches this; existing
-	// volumes are policy-guarded in createVolumeExisting and never re-stamped.
-	if shareType == ShareTypeISCSI {
-		if res := iscsiCHAPResolutionFromContext(ctx); res != nil && res.Peer != nil {
-			volumeProperties[PropISCSIAuthTag] = strconv.Itoa(res.Peer.Tag)
-			volumeProperties[PropISCSIAuthMode] = res.authMethod()
-		}
+	// mutable global flag). Only the create path reaches this; existing volumes are
+	// policy-guarded in createVolumeExisting and never re-stamped. For clones this
+	// re-writes the CHAP policy the clone fold already stamped atomically with
+	// ownership (Sprint 6 H1) — idempotent, same values via iscsiCHAPPolicyProps.
+	for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+		volumeProperties[key] = value
 	}
 
 	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
@@ -2717,11 +2716,25 @@ func (d *Driver) handleVolumeContentSource(
 			// written before the clone and retired only after this write is durable.
 			// For filesystem clones this update also yields the createdDS the caller
 			// publishes (L1b removed their separate readiness read).
-			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, map[string]string{
+			//
+			// Sprint 6 (H1): a CHAP-resolved iSCSI clone folds its durable CHAP
+			// policy (PropISCSIAuthTag + PropISCSIAuthMode) into this SAME atomic
+			// write, so ownership + content-source + CHAP become durable in one txg
+			// — matching the fresh path, which stamps CHAP atomically with
+			// ownership. Without this, a crash between the early ownership fold and
+			// the late fatal managed-property stamp left an owned dataset with
+			// stored CHAP=NONE; guardExistingISCSICHAPPolicy then rejected every
+			// retry forever (stored NONE vs request CHAP), wedging the PVC. nil for
+			// non-CHAP requests, so non-CHAP clones are byte-for-byte unchanged.
+			foldProps := map[string]string{
 				PropVolumeContentSourceType: "snapshot",
 				PropVolumeContentSourceID:   snapshotID,
 				PropDriverInstanceID:        d.driverInstanceID(),
-			})
+			}
+			for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+				foldProps[key] = value
+			}
+			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, foldProps)
 			if updateErr != nil {
 				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, updateErr)
 			}
@@ -2819,12 +2832,22 @@ func (d *Driver) handleVolumeContentSource(
 		// returns before CreateVolume retires the marker, and cleanupFailedClone keeps
 		// the marker unless the destination is verifiably gone, so no markerless
 		// remnant is ever left behind. The verified dataset is the one published.
-		verified, updateErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+		//
+		// Sprint 6 (H1): a CHAP-resolved iSCSI volume clone folds its durable CHAP
+		// policy into this same atomic write (see the snapshot-clone fold above for
+		// the full crash-window rationale), so ownership + content-source + CHAP are
+		// durable in one txg and a crash before the late fatal stamp can no longer
+		// wedge guardExistingISCSICHAPPolicy. nil for non-CHAP requests.
+		foldProps := map[string]string{
 			PropVolumeContentSourceType: "volume",
 			PropVolumeContentSourceID:   sourceVolumeID,
 			PropVolumeOriginSnapshot:    snap.ID,
 			PropDriverInstanceID:        d.driverInstanceID(),
-		})
+		}
+		for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+			foldProps[key] = value
+		}
+		verified, updateErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, foldProps)
 		if updateErr != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
 			return nil, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", updateErr)

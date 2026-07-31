@@ -112,6 +112,34 @@ func iscsiCHAPResolutionFromContext(ctx context.Context) *iscsiCHAPResolution {
 	return nil
 }
 
+// iscsiCHAPPolicyProps returns the durable per-volume CHAP policy properties
+// (PropISCSIAuthTag + PropISCSIAuthMode) for a CHAP-resolved iSCSI request, or
+// nil when CHAP is not active. It is the single source of truth for folding the
+// CHAP linkage into a dataset write: the fresh-create path folds it into the
+// fatal managed-property update, and the clone folds pass it to
+// setAndVerifyDatasetProps so ownership + content-source + CHAP policy become
+// durable in ONE atomic pool.dataset.update (single txg). Folding CHAP into the
+// clone's ownership write closes the H1 crash window: a controller crash between
+// the early ownership fold and the late fatal stamp previously left an owned
+// dataset with stored CHAP=NONE, which guardExistingISCSICHAPPolicy then rejected
+// forever (stored NONE vs request CHAP => FailedPrecondition), permanently
+// wedging the PVC. The later fatal update re-writing the same values is
+// idempotent. The mode comes from the immutable resolution, never the mutable
+// global flag, matching storedISCSICHAPPolicy's reader.
+func iscsiCHAPPolicyProps(ctx context.Context, shareType ShareType) map[string]string {
+	if shareType != ShareTypeISCSI {
+		return nil
+	}
+	res := iscsiCHAPResolutionFromContext(ctx)
+	if res == nil || res.Peer == nil {
+		return nil
+	}
+	return map[string]string{
+		PropISCSIAuthTag:  strconv.Itoa(res.Peer.Tag),
+		PropISCSIAuthMode: res.authMethod(),
+	}
+}
+
 // firstSecretKey returns the first value among the given keys whose content is
 // non-whitespace, and returns it VERBATIM (untrimmed). Selection ignores
 // whitespace-only values, but the returned value is exactly what the operator
