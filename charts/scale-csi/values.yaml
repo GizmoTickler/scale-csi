@@ -3,6 +3,27 @@
 # CSI Driver name (should match the driver name in StorageClass)
 csiDriverName: csi.scale.io
 
+# CSIStorageCapacity tracking. Strictly opt-in (default off) so the default
+# render stays byte-identical and no cluster-scoped csistoragecapacities
+# objects or extra RBAC are created unless an operator asks for them.
+#
+# STEADY-STATE API COST when enabled: the external-provisioner issues a periodic
+# GetCapacity per referencing StorageClass on its resync interval. After the
+# E2/K7 fix each GetCapacity is exactly ONE pool.dataset.query against the parent
+# dataset (all StorageClasses of this single-backend driver report the same pool
+# number). This is background provisioner load, NOT part of the
+# CreateVolume/publish/unpublish request-path golden totals.
+capacity:
+  # Advertise CSIDriver.spec.storageCapacity=true and add the provisioner's
+  # --enable-capacity flag plus its csistoragecapacities RBAC. Default off.
+  enabled: false
+  # E2: set GetCapacityResponse.maximum_volume_size. Intended ONLY for thick
+  # deployments (zfs.zvolEnableReservation=true); under the default thin/sparse
+  # provisioning a hard maximum makes the scheduler wrongly reject legitimate
+  # overcommit. TrueNAS 26.0 exposes no dedicated max-size API, so the ceiling
+  # is the parent dataset's available bytes. Default off.
+  reportMaximumVolumeSize: false
+
 # Stable ownership identity stamped on newly-created datasets/zvols. Empty
 # derives "<csiDriverName>@<zfs.parentDataset>". Never change this for an
 # existing installation unless the matching datasets are deliberately adopted.

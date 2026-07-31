@@ -163,9 +163,25 @@ spec:
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
             - "--extra-create-metadata"
+            {{- if .Values.capacity.enabled }}
+            - "--enable-capacity"
+            # owner = controller Deployment (Deployment -> ReplicaSet -> Pod = 2)
+            - "--capacity-ownerref-level=2"
+            {{- end }}
             {{- range .Values.sidecars.provisioner.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+          {{- if .Values.capacity.enabled }}
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}

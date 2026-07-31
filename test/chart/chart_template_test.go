@@ -177,6 +177,43 @@ func TestChartRateLimitingDeprecation(t *testing.T) {
 	}
 }
 
+// TestChartCSIStorageCapacityPlumbing guards the CSIStorageCapacity render
+// invariant (E1). Capacity tracking is strictly opt-in: the default render must
+// keep storageCapacity=false and emit NO provisioner --enable-capacity flag, NO
+// csistoragecapacities RBAC, and NO provisioner NAMESPACE/POD_NAME env, so the
+// default manifest stays byte-identical and creates no cluster objects. Enabling
+// capacity.enabled flips the CSIDriver field and wires the provisioner + RBAC.
+func TestChartCSIStorageCapacityPlumbing(t *testing.T) {
+	t.Run("default render keeps capacity off", func(t *testing.T) {
+		out := helmTemplate(t)
+		if !strings.Contains(out, "storageCapacity: false") {
+			t.Errorf("default render must keep CSIDriver storageCapacity: false")
+		}
+		for _, absent := range []string{"--enable-capacity", "csistoragecapacities", "POD_NAME"} {
+			if strings.Contains(out, absent) {
+				t.Errorf("default render must not emit %q; capacity tracking is opt-in", absent)
+			}
+		}
+	})
+
+	t.Run("enabled wires CSIDriver, provisioner, and RBAC", func(t *testing.T) {
+		out := helmTemplate(t, "--set", "capacity.enabled=true")
+		for _, want := range []string{
+			"storageCapacity: true",
+			`"--enable-capacity"`,
+			`"--capacity-ownerref-level=2"`,
+			`resources: ["csistoragecapacities"]`,
+			`resources: ["replicasets"]`,
+			"name: POD_NAME",
+			"name: NAMESPACE",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("--set capacity.enabled=true did not render %q", want)
+			}
+		}
+	})
+}
+
 // TestChartSidecarTimeouts pins the CSI sidecar --timeout flags: the attacher and
 // resizer run with a 120s deadline (bounding publish/unpublish/expand), while the
 // provisioner and snapshotter keep 300s. A regression that reverts the
