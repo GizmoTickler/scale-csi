@@ -885,6 +885,17 @@ func nvmeoFPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeR
 	}
 }
 
+func iscsiPublishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest {
+	return &csi.ControllerPublishVolumeRequest{
+		VolumeId: volumeID,
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "iscsi"},
+	}
+}
+
 // TestControllerPublishUnpublishGoldenAPICallCounts pins the round-trip cost of
 // the publish/unpublish path (the P1 optimization target). Each case documents
 // every driver-to-TrueNAS call so a regression that re-introduces a duplicate
@@ -1053,6 +1064,114 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		// 8. NVMeoFHostSubsysDelete          — revoke worker-a's association.
 		// 9. DatasetRemoveUserProperties     — removePublicationRecords.
 		assertAPICallCount(t, "strict NVMe-oF unpublish", client, 9)
+	})
+
+	// (d) fencing OFF + iSCSI — the block-protocol records-only floor. The share
+	// (target/extent/association) already exists from CreateVolume, so the publish
+	// takes the idempotent fast path and the unpublish only clears the durable
+	// record; no initiator allowlist is touched while enforcement is off.
+	t.Run("off iSCSI publish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeOff)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("off-iscsi", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi", nodeA))
+		require.NoError(t, err)
+		// Eight calls:
+		// 1. DatasetGet                  — ControllerPublishVolume volume read.
+		// 2. ISCSITargetGet              — ensureShare resolves the stored target.
+		// 3. WaitForZvolReady            — zvol readiness gate before extent work.
+		// 4. ISCSIExtentGet              — ensureShare resolves the stored extent.
+		// 5. ISCSITargetExtentGet        — ensureShare resolves the target-extent
+		//                                  association.
+		// 6. DatasetSetUserProperties    — ensureShare re-stamps the target/extent/
+		//                                  association IDs.
+		// 7. ServiceReload               — debounced iscsitarget reload so the target
+		//                                  is discoverable.
+		// 8. DatasetSetUserProperties    — storePublicationRecord (off mode skips
+		//                                  validateBackend/applyBackendFence, so this
+		//                                  is the floor).
+		assertAPICallCount(t, "off iSCSI publish", client, 8)
+	})
+	t.Run("off iSCSI unpublish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeOff)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("off-iscsi-unpub", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi-unpub", nodeA))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-iscsi-unpub", NodeId: nodeA})
+		require.NoError(t, err)
+		// Three calls (mirror of off NFS unpublish; off mode never touches a backend
+		// allowlist):
+		// 1. DatasetGet                  — ControllerUnpublishVolume volume read.
+		// 2. DatasetSetUserProperties    — flip the record to "unpublishing" BEFORE
+		//                                  access is removed (crash-safe tombstone).
+		// 3. DatasetRemoveUserProperties — removePublicationRecords clears the record.
+		assertAPICallCount(t, "off iSCSI unpublish", client, 3)
+	})
+
+	// (e) strict + iSCSI — full backend enforcement. The publish ensures the share
+	// then converges the per-volume initiator allowlist and rebinds the target; the
+	// unpublish revokes the initiator. The per-method tally below is the source of
+	// truth (measured); strict iSCSI re-resolves topology at the fence's mutation
+	// boundary rather than reusing the ensure-path reads.
+	t.Run("strict iSCSI publish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeStrict)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("strict-iscsi", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("strict-iscsi", nodeA))
+		require.NoError(t, err)
+		// Sixteen calls, per-method tally:
+		//   DatasetGet                x1 — ControllerPublishVolume volume read.
+		//   ISCSITargetGet            x2 — ensureShare resolves the target; the fence
+		//                                  re-resolves it at its mutation boundary.
+		//   WaitForZvolReady          x1 — zvol readiness gate before extent work.
+		//   ISCSIExtentGet            x1 — ensureShare resolves the extent.
+		//   ISCSITargetExtentGet      x1 — ensureShare resolves the association.
+		//   DatasetSetUserProperties  x3 — ensureShare ID re-stamp, strict per-volume
+		//                                  initiator-group ID stamp, storePublicationRecord.
+		//   ServiceReload             x2 — ensureShare reload + post-fence reload.
+		//   ISCSIPortalList           x1 — fence resolves the portal group IDs.
+		//   ISCSIInitiatorGet         x2 — fence reads the per-volume initiator group.
+		//   ISCSIInitiatorUpdate      x1 — fence converges the initiator allowlist.
+		//   ISCSITargetUpdate         x1 — fence rebinds the target to the converged
+		//                                  initiator group.
+		assertAPICallCount(t, "strict iSCSI publish", client, 16)
+	})
+	t.Run("strict iSCSI unpublish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeStrict)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("strict-iscsi-unpub", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		_, err = d.ControllerPublishVolume(ctx, iscsiPublishRequest("strict-iscsi-unpub", nodeA))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "strict-iscsi-unpub", NodeId: nodeA})
+		require.NoError(t, err)
+		// Nine calls, per-method tally:
+		//   DatasetGet                  x1 — ControllerUnpublishVolume volume read.
+		//   DatasetSetUserProperties    x2 — flip the record to "unpublishing", then
+		//                                    the fence's record update.
+		//   ISCSITargetGet              x1 — fence resolves the target.
+		//   ISCSIInitiatorGet           x1 — fence reads the per-volume initiator group.
+		//   ISCSIInitiatorUpdate        x1 — fence revokes the node's initiator.
+		//   ISCSITargetUpdate           x1 — fence rebinds the target after the revoke.
+		//   ServiceReload               x1 — post-fence iscsitarget reload.
+		//   DatasetRemoveUserProperties x1 — removePublicationRecords clears the record.
+		assertAPICallCount(t, "strict iSCSI unpublish", client, 9)
 	})
 }
 
