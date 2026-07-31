@@ -202,7 +202,13 @@ func (m *MockClient) ISCSIAuthCreate(ctx context.Context, tag int, user, secret,
 	for m.ISCSIAuths[id] != nil {
 		id++
 	}
-	auth := &ISCSIAuth{ID: id, Tag: tag, User: user, PeerUser: peerUser}
+	auth := &ISCSIAuth{
+		ID:                    id,
+		Tag:                   tag,
+		User:                  user,
+		PeerUser:              peerUser,
+		CredentialFingerprint: ISCSIAuthCredentialFingerprint(user, secret, peerUser, peerSecret),
+	}
 	m.ISCSIAuths[id] = auth
 	return auth, nil
 }
@@ -238,6 +244,7 @@ func (m *MockClient) ISCSIAuthUpdate(ctx context.Context, id int, user, secret, 
 	}
 	auth.User = user
 	auth.PeerUser = peerUser
+	auth.CredentialFingerprint = ISCSIAuthCredentialFingerprint(user, secret, peerUser, peerSecret)
 	return auth, nil
 }
 

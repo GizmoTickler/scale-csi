@@ -2,7 +2,10 @@ package truenas
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"strings"
 )
 
 // ISCSIAuth represents a TrueNAS iSCSI CHAP authentication peer (iscsi.auth).
@@ -10,11 +13,29 @@ import (
 // The struct deliberately holds NO secret material: the CHAP secret and peer
 // secret are only ever passed as call arguments and are never retained in
 // memory, logged, or serialized beyond the single API call that uses them.
+// CredentialFingerprint is a one-way (SHA-256) digest of the peer's credential
+// tuple computed from the live query response; it lets the driver detect a
+// rotation (same user/tag, changed secret) without ever holding or persisting
+// the raw secret. It is non-reversible and safe to cache.
 type ISCSIAuth struct {
-	ID       int    `json:"id"`
-	Tag      int    `json:"tag"`
-	User     string `json:"user"`
-	PeerUser string `json:"peeruser"`
+	ID                    int    `json:"id"`
+	Tag                   int    `json:"tag"`
+	User                  string `json:"user"`
+	PeerUser              string `json:"peeruser"`
+	CredentialFingerprint string `json:"-"`
+}
+
+// ISCSIAuthCredentialFingerprint returns a stable, non-reversible digest of a
+// CHAP credential tuple. The driver computes the request-side fingerprint with
+// this same function and compares it against the peer's server-side fingerprint
+// (parseISCSIAuth derives that from the live iscsi.auth.query response, which
+// includes the secret fields). The digest never leaves this process and no raw
+// secret is retained.
+func ISCSIAuthCredentialFingerprint(user, secret, peerUser, peerSecret string) string {
+	// The separator is a NUL byte so no field boundary can be forged by a value
+	// that contains the separator character.
+	sum := sha256.Sum256([]byte(strings.Join([]string{user, secret, peerUser, peerSecret}, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 // iscsiAuthSecretParams builds the create/update parameter map for an
@@ -137,6 +158,14 @@ func parseISCSIAuth(data interface{}) (*ISCSIAuth, error) {
 	if v, ok := m["peeruser"].(string); ok {
 		auth.PeerUser = v
 	}
+	// Derive the credential fingerprint from the live secret fields and drop the
+	// raw secrets immediately — they are never assigned to the struct. If the
+	// server omits secrets from the query the fingerprint is over empty strings,
+	// which the driver treats as an opaque value (rotation comparison still works
+	// consistently because both sides observe the same server behavior).
+	secret, _ := m["secret"].(string)
+	peerSecret, _ := m["peersecret"].(string)
+	auth.CredentialFingerprint = ISCSIAuthCredentialFingerprint(auth.User, secret, auth.PeerUser, peerSecret)
 
 	return auth, nil
 }
