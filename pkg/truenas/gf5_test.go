@@ -1,0 +1,243 @@
+package truenas
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// gf5TestClient spins the shared websocket mock with a per-method result map and
+// returns a connected client. Methods not in the map produce a JSON-RPC error.
+func gf5TestClient(t *testing.T, results map[string]func(req rpcTestRequest) (interface{}, *rpcError)) *Client {
+	t.Helper()
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			var resp rpcTestResponse
+			resp.JSONRPC = "2.0"
+			resp.ID = req.ID
+			if req.Method == "auth.login_with_api_key" {
+				resp.Result = true
+			} else if handler, ok := results[req.Method]; ok {
+				result, rpcErr := handler(req)
+				resp.Result, resp.Error = result, rpcErr
+			} else {
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found: " + req.Method}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	t.Cleanup(mock.close)
+
+	wsURL := strings.Replace(server.URL, "http://", "", 1)
+	parts := strings.Split(wsURL, ":")
+	host := parts[0]
+	port := 80
+	if len(parts) > 1 {
+		_, _ = fmt.Sscanf(parts[1], "%d", &port)
+	}
+	client, err := NewClient(&ClientConfig{
+		Host:           host,
+		Port:           port,
+		Protocol:       "http",
+		APIKey:         "test-api-key",
+		Timeout:        5 * time.Second,
+		ConnectTimeout: 5 * time.Second,
+		MaxConnections: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func static(result interface{}) func(rpcTestRequest) (interface{}, *rpcError) {
+	return func(rpcTestRequest) (interface{}, *rpcError) { return result, nil }
+}
+
+// TestNFSShareCreateParamsOmitsGF5FieldsWhenUnset is the wire-level byte-identity
+// guard: the two GF5 fields must not appear at all in a default payload.
+func TestNFSShareCreateParamsOmitsGF5FieldsWhenUnset(t *testing.T) {
+	encoded, err := json.Marshal(&NFSShareCreateParams{Path: "/mnt/tank/vol", Enabled: true})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"path":"/mnt/tank/vol","enabled":true}`, string(encoded))
+}
+
+func TestNFSServiceConfig(t *testing.T) {
+	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+		"nfs.config": static(map[string]interface{}{
+			"protocols":      []interface{}{"NFSV4", "NFSV3"},
+			"v4_krb":         false,
+			"v4_krb_enabled": false,
+			"rdma":           false,
+			"servers":        float64(64),
+		}),
+	})
+
+	cfg, err := client.NFSServiceConfig(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"NFSV3", "NFSV4"}, cfg.Protocols, "protocols are normalized and sorted")
+	assert.Equal(t, 64, cfg.Servers)
+	assert.False(t, cfg.RDMA)
+	assert.True(t, cfg.SupportsMajorVersion("NFSV4"))
+	assert.True(t, cfg.SupportsMajorVersion("nfsv3"))
+	assert.False(t, cfg.SupportsMajorVersion("NFSV2"))
+}
+
+func TestNFSServiceConfigSupportsMajorVersionFailsOpen(t *testing.T) {
+	// A nil or empty protocol list cannot PROVE a version unsupported, so the
+	// preflight must not fail closed on it.
+	var cfg *NFSServiceConfig
+	assert.True(t, cfg.SupportsMajorVersion("NFSV4"))
+	assert.True(t, (&NFSServiceConfig{}).SupportsMajorVersion("NFSV4"))
+}
+
+func TestNFSServiceUpdate(t *testing.T) {
+	var seen []interface{}
+	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+		"nfs.update": func(req rpcTestRequest) (interface{}, *rpcError) {
+			seen = req.Params
+			return map[string]interface{}{"protocols": []interface{}{"NFSV3", "NFSV4"}}, nil
+		},
+	})
+
+	cfg, err := client.NFSServiceUpdate(context.Background(), map[string]interface{}{"protocols": []string{"NFSV3", "NFSV4"}})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"NFSV3", "NFSV4"}, cfg.Protocols)
+	require.Len(t, seen, 1)
+}
+
+func TestACLTemplateDACL(t *testing.T) {
+	t.Run("resolves an NFS4 template", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"filesystem.acltemplate.query": static([]interface{}{map[string]interface{}{
+				"name":    "NFS4_RESTRICTED",
+				"acltype": "NFS4",
+				"acl": []interface{}{
+					map[string]interface{}{"tag": "owner@", "type": "ALLOW", "perms": map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+					map[string]interface{}{"tag": "group@", "type": "ALLOW", "perms": map[string]interface{}{"BASIC": "MODIFY"}},
+				},
+			}}),
+		})
+		dacl, err := client.ACLTemplateDACL(context.Background(), "NFS4_RESTRICTED")
+		require.NoError(t, err)
+		require.Len(t, dacl, 2)
+		assert.Equal(t, "owner@", dacl[0].Tag)
+		assert.Equal(t, "FULL_CONTROL", dacl[0].Perms["BASIC"])
+	})
+
+	t.Run("rejects a POSIX1E template", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"filesystem.acltemplate.query": static([]interface{}{map[string]interface{}{
+				"name": "POSIX_OPEN", "acltype": "POSIX1E", "acl": []interface{}{},
+			}}),
+		})
+		_, err := client.ACLTemplateDACL(context.Background(), "POSIX_OPEN")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "POSIX1E")
+	})
+
+	t.Run("missing template is an error", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"filesystem.acltemplate.query": static([]interface{}{}),
+		})
+		_, err := client.ACLTemplateDACL(context.Background(), "NOPE")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+	})
+}
+
+// TestFilesystemSetACLJobSemantics proves setacl is dispatched as a @job: the
+// call returns a job id and the client awaits its terminal state.
+func TestFilesystemSetACLJobSemantics(t *testing.T) {
+	t.Run("successful job", func(t *testing.T) {
+		var setaclArgs []interface{}
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			SetACLMethod: func(req rpcTestRequest) (interface{}, *rpcError) {
+				setaclArgs = req.Params
+				return float64(7001), nil
+			},
+			"core.get_jobs": static([]interface{}{map[string]interface{}{
+				"id": float64(7001), "state": "SUCCESS",
+			}}),
+			"core.subscribe": static("sub-1"),
+		})
+
+		err := client.FilesystemSetACL(context.Background(), &SetACLOptions{
+			Path:       "/mnt/tank/k8s/vol",
+			DACL:       []ACLEntry{{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}}},
+			NFS41Flags: map[string]bool{"protected": true},
+		})
+		require.NoError(t, err)
+		require.Len(t, setaclArgs, 1)
+		args, ok := setaclArgs[0].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "/mnt/tank/k8s/vol", args["path"])
+		assert.NotNil(t, args["dacl"])
+		flags, ok := args["nfs41_flags"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, true, flags["protected"])
+	})
+
+	t.Run("failed job surfaces as an error", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			SetACLMethod: static(float64(7002)),
+			"core.get_jobs": static([]interface{}{map[string]interface{}{
+				"id": float64(7002), "state": "FAILED", "error": "acltype is not NFSV4",
+			}}),
+			"core.subscribe": static("sub-1"),
+		})
+
+		err := client.FilesystemSetACL(context.Background(), &SetACLOptions{
+			Path: "/mnt/tank/k8s/vol",
+			DACL: []ACLEntry{{Tag: "owner@"}},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "job 7002")
+	})
+
+	t.Run("argument validation happens before dispatch", func(t *testing.T) {
+		client := gf5TestClient(t, nil)
+		require.Error(t, client.FilesystemSetACL(context.Background(), nil))
+		require.Error(t, client.FilesystemSetACL(context.Background(), &SetACLOptions{Path: ""}))
+		require.Error(t, client.FilesystemSetACL(context.Background(), &SetACLOptions{Path: "/mnt/x"}))
+	})
+}
+
+func TestFilesystemGetACL(t *testing.T) {
+	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+		"filesystem.getacl": static(map[string]interface{}{
+			"path":    "/mnt/tank/k8s/vol",
+			"acltype": "NFS4",
+			"trivial": false,
+			"acl": []interface{}{
+				map[string]interface{}{"tag": "owner@", "type": "ALLOW", "id": float64(-1)},
+				map[string]interface{}{"tag": "USER", "type": "ALLOW", "id": float64(3000)},
+				map[string]interface{}{"no-tag": true},
+			},
+			"nfs41_flags": map[string]interface{}{"protected": true, "autoinherit": false},
+		}),
+	})
+
+	acl, err := client.FilesystemGetACL(context.Background(), "/mnt/tank/k8s/vol")
+	require.NoError(t, err)
+	assert.Equal(t, "NFS4", acl.ACLType)
+	assert.False(t, acl.Trivial)
+	require.Len(t, acl.ACL, 2, "entries without a tag are dropped")
+	assert.Nil(t, acl.ACL[0].ID, "the -1 sentinel is not a real uid")
+	require.NotNil(t, acl.ACL[1].ID)
+	assert.Equal(t, 3000, *acl.ACL[1].ID)
+	assert.True(t, acl.NFS41Flags["protected"])
+}

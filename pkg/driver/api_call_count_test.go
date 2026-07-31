@@ -282,6 +282,21 @@ func (c *apiCallCountingClient) NFSServiceUpdate(ctx context.Context, params map
 	return c.MockClient.NFSServiceUpdate(ctx, params)
 }
 
+func (c *apiCallCountingClient) FilesystemGetACL(ctx context.Context, path string) (*truenas.FilesystemACL, error) {
+	c.record("FilesystemGetACL")
+	return c.MockClient.FilesystemGetACL(ctx, path)
+}
+
+func (c *apiCallCountingClient) FilesystemSetACL(ctx context.Context, opts *truenas.SetACLOptions) error {
+	c.record("FilesystemSetACL")
+	return c.MockClient.FilesystemSetACL(ctx, opts)
+}
+
+func (c *apiCallCountingClient) ACLTemplateDACL(ctx context.Context, name string) ([]truenas.ACLEntry, error) {
+	c.record("ACLTemplateDACL")
+	return c.MockClient.ACLTemplateDACL(ctx, name)
+}
+
 func (c *apiCallCountingClient) ServiceReload(ctx context.Context, service string) error {
 	c.record("ServiceReload")
 	return c.MockClient.ServiceReload(ctx, service)

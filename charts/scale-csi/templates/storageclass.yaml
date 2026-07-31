@@ -71,6 +71,14 @@ parameters:
   {{- if hasKey $storageClass "nfsReadOnly" }}
   {{- $_ := set $parameters "nfsReadOnly" (printf "%v" $storageClass.nfsReadOnly) -}}
   {{- end }}
+  {{- /* NFSv4 ACL. Emitted only when set; see docs/reference/storageclass.md for
+       the fsGroupPolicy=File interaction this opts a class into. */}}
+  {{- if $storageClass.nfsACLTemplate }}
+  {{- $_ := set $parameters "nfsACLTemplate" $storageClass.nfsACLTemplate -}}
+  {{- end }}
+  {{- if $storageClass.nfsACL }}
+  {{- $_ := set $parameters "nfsACL" (toJson $storageClass.nfsACL) -}}
+  {{- end }}
   {{- /* CHAP: when a per-StorageClass CHAP Secret is named, emit the four CSI
        secret-ref parameters (provisioner + node-stage). The chart references
        the Secret by name/namespace only; credential values never appear here.

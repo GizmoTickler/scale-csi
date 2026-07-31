@@ -411,6 +411,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			return nil, preflightErr
 		}
 		ctx = withNFSShareOptions(ctx, nfsOptions)
+
+		aclOptions, aclErr := parseNFSACLOptions(req.GetParameters())
+		if aclErr != nil {
+			return nil, aclErr
+		}
+		ctx = withNFSACLOptions(ctx, aclOptions)
 	}
 
 	// Check if volume already exists
@@ -529,6 +535,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			}
 			return nil, status.Errorf(codes.Internal, "failed to set volume properties: %v", waitErr)
 		}
+	}
+
+	// Apply the requested NFSv4 ACL after the dataset, its ownership stamps and
+	// its export all exist. Strict no-op unless a StorageClass asked for one, and
+	// best-effort by design: it never blocks a Bound PVC (risk R7).
+	if shareType == ShareTypeNFS {
+		d.applyNFSVolumeACL(ctx, createdDS, datasetName, createVolumeEventRef(req))
 	}
 
 	// Get volume context for response
@@ -2171,6 +2184,10 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 		}
 	}
 	d.applyDatasetProperties(params)
+	// An NFSv4 dacl can only be applied to an acltype=NFSV4 dataset. Stamp it
+	// (plus aclmode=PASSTHROUGH) ONLY when this volume actually requested an ACL;
+	// otherwise both stay inherited from the parent, exactly as before.
+	applyDatasetACLParams(params, nfsACLOptionsFromContext(ctx))
 	postCreateProperties := make(map[string]string, len(params.UserProperties)+1)
 	for _, property := range params.UserProperties {
 		postCreateProperties[property.Key] = property.Value

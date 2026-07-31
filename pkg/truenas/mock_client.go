@@ -77,6 +77,96 @@ type MockClient struct {
 	NFSServiceConfigValue *NFSServiceConfig
 	NFSServiceConfigCalls int
 	NFSServiceUpdateCalls []map[string]interface{}
+
+	// ACLs is the per-path ACL state filesystem.setacl mutates; SetACLCalls is
+	// the verbatim call log. ACLTemplates overrides the builtin template set.
+	ACLs           map[string]*FilesystemACL
+	SetACLCalls    []SetACLOptions
+	ACLTemplates   map[string][]ACLEntry
+	InjectACLError error
+}
+
+// builtinACLTemplates mirrors the NFS4 templates TrueNAS ships. Only the shape
+// matters for driver tests: a non-empty NFS4 dacl resolved by name.
+var builtinACLTemplates = map[string][]ACLEntry{
+	"NFS4_OPEN": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+		{Tag: "group@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "MODIFY"}},
+		{Tag: "everyone@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "MODIFY"}},
+	},
+	"NFS4_RESTRICTED": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+		{Tag: "group@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "MODIFY"}},
+	},
+	"NFS4_HOME": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+		{Tag: "group@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "TRAVERSE"}},
+	},
+	"NFS4_DOMAIN_HOME": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+	},
+	"NFS4_ADMIN": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+	},
+}
+
+func (m *MockClient) FilesystemGetACL(ctx context.Context, path string) (*FilesystemACL, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectACLError != nil {
+		return nil, m.InjectACLError
+	}
+	if acl, ok := m.ACLs[path]; ok {
+		return acl, nil
+	}
+	// An un-ACLed dataset reports the mode-derived trivial 3-ACE ACL.
+	return &FilesystemACL{
+		Path:    path,
+		ACLType: "NFS4",
+		Trivial: true,
+		ACL:     append([]ACLEntry(nil), builtinACLTemplates["NFS4_OPEN"]...),
+	}, nil
+}
+
+func (m *MockClient) FilesystemSetACL(ctx context.Context, opts *SetACLOptions) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if opts == nil || opts.Path == "" {
+		return fmt.Errorf("filesystem.setacl requires a path")
+	}
+	if len(opts.DACL) == 0 {
+		return fmt.Errorf("filesystem.setacl requires a non-empty dacl for %s", opts.Path)
+	}
+	m.SetACLCalls = append(m.SetACLCalls, *opts)
+	if m.InjectACLError != nil {
+		return m.InjectACLError
+	}
+	if m.ACLs == nil {
+		m.ACLs = make(map[string]*FilesystemACL)
+	}
+	m.ACLs[opts.Path] = &FilesystemACL{
+		Path:       opts.Path,
+		ACLType:    "NFS4",
+		Trivial:    false,
+		ACL:        append([]ACLEntry(nil), opts.DACL...),
+		NFS41Flags: opts.NFS41Flags,
+	}
+	return nil
+}
+
+func (m *MockClient) ACLTemplateDACL(ctx context.Context, name string) ([]ACLEntry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectACLError != nil {
+		return nil, m.InjectACLError
+	}
+	if dacl, ok := m.ACLTemplates[name]; ok {
+		return append([]ACLEntry(nil), dacl...), nil
+	}
+	if dacl, ok := builtinACLTemplates[name]; ok {
+		return append([]ACLEntry(nil), dacl...), nil
+	}
+	return nil, fmt.Errorf("ACL template %q not found", name)
 }
 
 // DatasetDeleteCall records the deletion mode requested by a test.

@@ -127,3 +127,77 @@ func TestChartGF5NFSStorageClassParameters(t *testing.T) {
 		}
 	})
 }
+
+// TestChartGF5FsGroupPolicy proves the CSIDriver fsGroupPolicy is now a chart
+// value whose DEFAULT render is byte-identical (`File`), and that an operator
+// committing to ACL-managed volumes can select `None`. Flipping the shipped
+// default would change fsGroup semantics for every existing volume, so the
+// default is asserted explicitly.
+func TestChartGF5FsGroupPolicy(t *testing.T) {
+	out := helmTemplate(t, "--show-only", "templates/csidriver.yaml")
+	if !strings.Contains(out, "  fsGroupPolicy: File\n") {
+		t.Errorf("default CSIDriver render must keep fsGroupPolicy: File; got:\n%s", out)
+	}
+
+	out = helmTemplate(t, "--show-only", "templates/csidriver.yaml", "--set", "csidriver.fsGroupPolicy=None")
+	if !strings.Contains(out, "  fsGroupPolicy: None\n") {
+		t.Errorf("csidriver.fsGroupPolicy=None did not render; got:\n%s", out)
+	}
+
+	if out := helmTemplateExpectError(t, "--set", "csidriver.fsGroupPolicy=Nonsense"); !strings.Contains(out, "fsGroupPolicy") {
+		t.Errorf("schema did not reject an invalid fsGroupPolicy; got:\n%s", out)
+	}
+}
+
+// TestChartGF5NFSACLStorageClassParameters proves the ACL parameters are emitted
+// only when a class sets them, and that a template and an inline ACL both round
+// trip into CSI parameters.
+func TestChartGF5NFSACLStorageClassParameters(t *testing.T) {
+	t.Run("default class emits no ACL parameters", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml")
+		for _, key := range []string{"nfsACLTemplate", "nfsACL:"} {
+			if strings.Contains(out, key) {
+				t.Errorf("default StorageClass render must not emit %q; got:\n%s", key, out)
+			}
+		}
+	})
+
+	t.Run("template renders", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf5-acl-template.yaml", `storageClasses:
+  - name: scale-nfs-acl
+    protocol: nfs
+    nfsACLTemplate: NFS4_RESTRICTED
+`)
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		if !strings.Contains(out, "nfsACLTemplate: NFS4_RESTRICTED") {
+			t.Errorf("nfsACLTemplate did not render; got:\n%s", out)
+		}
+	})
+
+	t.Run("inline acl renders as JSON", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf5-acl-inline.yaml", `storageClasses:
+  - name: scale-nfs-acl
+    protocol: nfs
+    nfsACL:
+      - tag: owner@
+        type: ALLOW
+        perms:
+          BASIC: FULL_CONTROL
+`)
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		if !strings.Contains(out, `"tag":"owner@"`) {
+			t.Errorf("nfsACL did not render as JSON; got:\n%s", out)
+		}
+	})
+
+	t.Run("schema rejects an unknown template", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf5-acl-bad.yaml", `storageClasses:
+  - name: scale-nfs-acl
+    protocol: nfs
+    nfsACLTemplate: NFS4_WIDE_OPEN
+`)
+		if out := helmTemplateExpectError(t, "-f", valuesPath); !strings.Contains(out, "nfsACLTemplate") {
+			t.Errorf("schema did not reject an unknown ACL template; got:\n%s", out)
+		}
+	})
+}

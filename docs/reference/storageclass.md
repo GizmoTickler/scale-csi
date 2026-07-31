@@ -20,6 +20,8 @@ All protocols use the unified provisioner `csi.scale.io`.
 | `nfsMaprootUser` / `nfsMaprootGroup` | Per-class override of the root mapping | No; defaults to `nfs.shareMaproot*` |
 | `nfsMapallUser` / `nfsMapallGroup` | Per-class override of the all-users mapping | No; defaults to `nfs.shareMapall*` |
 | `nfsAllowedNetworks` / `nfsAllowedHosts` | Comma lists overriding the static export allow-lists | No; defaults to `nfs.shareAllowed*`. Ignored in strict fencing mode, which owns these lists |
+| `nfsACLTemplate` | `NFS4_OPEN`, `NFS4_RESTRICTED`, `NFS4_HOME`, `NFS4_DOMAIN_HOME`, `NFS4_ADMIN` — a builtin NFSv4 ACL applied at create | No; mutually exclusive with `nfsACL` |
+| `nfsACL` | Explicit NFSv4 dacl as a JSON array | No; mutually exclusive with `nfsACLTemplate` |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -129,6 +131,47 @@ every mounted client.
 through the export, which composes with the driver's snapshot machinery to give
 in-place browsing of point-in-time copies. TrueNAS only honors it when the
 export path is the dataset root — always true for CSI volumes.
+
+### NFSv4 ACLs
+
+`nfsACLTemplate` (a builtin TrueNAS NFS4 template) or `nfsACL` (an explicit
+dacl) applies an NFSv4 ACL to a newly provisioned volume's dataset. When either
+is set, the driver additionally creates the dataset with `acltype=NFSV4` and
+`aclmode=PASSTHROUGH`; when neither is set, both properties keep inheriting from
+the parent exactly as before.
+
+`filesystem.setacl` is an asynchronous middleware job. ACL application is
+**best-effort**: it runs after the dataset, its ownership stamps and its export
+all exist, and a failure produces a Warning event on the PVC rather than a
+failed `CreateVolume`. A volume never fails to bind because a permission model
+could not be applied; re-apply out of band if needed.
+
+#### ⚠ ACL × `fsGroup` — read this before enabling
+
+This driver ships `CSIDriver.fsGroupPolicy: File`. Under that policy **kubelet
+recursively chowns and chmods a volume to the Pod's `securityContext.fsGroup` at
+every publish**, which rewrites the mode-bearing ACEs and silently defeats a
+driver-applied ACL.
+
+`fsGroupPolicy` is a driver-global field and effectively immutable on a live
+`CSIDriver`, so it cannot be chosen per StorageClass and the shipped default is
+deliberately **not** changed (flipping it would alter fsGroup semantics for every
+existing volume).
+
+Mitigations, in order of preference:
+
+1. Run ACL-managed workloads with **no `securityContext.fsGroup`**. Nothing then
+   rewrites the ACL.
+2. For an installation fully committed to ACL-managed volumes, install the chart
+   with `csidriver.fsGroupPolicy: None`. Do this on a **fresh installation**;
+   changing it on an existing one requires recreating the CSIDriver object and
+   changes fsGroup behavior for all its volumes.
+3. The driver always sets `nfs41_flags.protected: true` on ACLs it applies, so a
+   chmod cannot make the server recompute the ACL from the mode. This limits —
+   but does not eliminate — the damage under `File`.
+
+Every volume that receives a driver-applied ACL also gets a Warning event
+(`NFSACLFsGroupConflict`) spelling this out.
 
 ```yaml
 apiVersion: v1

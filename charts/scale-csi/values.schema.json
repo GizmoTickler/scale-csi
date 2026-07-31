@@ -192,6 +192,56 @@
         "nfsReadOnly": {
           "description": "Per-class read-only export override.",
           "type": "boolean"
+        },
+        "nfsACLTemplate": {
+          "description": "Builtin TrueNAS NFS4 ACL template applied to newly provisioned volumes. Mutually exclusive with nfsACL. See the fsGroupPolicy interaction in docs/reference/storageclass.md.",
+          "type": "string",
+          "enum": [
+            "NFS4_OPEN",
+            "NFS4_RESTRICTED",
+            "NFS4_HOME",
+            "NFS4_DOMAIN_HOME",
+            "NFS4_ADMIN"
+          ]
+        },
+        "nfsACL": {
+          "description": "Explicit NFSv4 dacl applied to newly provisioned volumes, rendered as JSON. Mutually exclusive with nfsACLTemplate.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "tag"
+            ],
+            "properties": {
+              "tag": {
+                "type": "string",
+                "enum": [
+                  "owner@",
+                  "group@",
+                  "everyone@",
+                  "USER",
+                  "GROUP"
+                ]
+              },
+              "id": {
+                "type": "integer"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ALLOW",
+                  "DENY"
+                ]
+              },
+              "perms": {
+                "type": "object"
+              },
+              "flags": {
+                "type": "object"
+              }
+            }
+          }
         }
       }
     }
@@ -206,6 +256,21 @@
     "csiDriverName": {
       "type": "string",
       "minLength": 1
+    },
+    "csidriver": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fsGroupPolicy": {
+          "description": "CSIDriver.spec.fsGroupPolicy. Default File (unchanged). Set None only for installations committed to driver-applied NFSv4 ACLs; the field is effectively immutable on a live CSIDriver.",
+          "type": "string",
+          "enum": [
+            "File",
+            "None",
+            "ReadWriteOnceWithFSType"
+          ]
+        }
+      }
     },
     "capacity": {
       "type": "object",

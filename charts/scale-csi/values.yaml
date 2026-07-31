@@ -472,6 +472,18 @@ storageClasses:
     mountOptions: []
     extraParameters: {}
 
+# CSIDriver object settings.
+csidriver:
+  # fsGroupPolicy is effectively IMMUTABLE on a live CSIDriver and is a
+  # driver-global choice — it cannot be set per StorageClass.
+  #
+  # Keep `File` (the default, unchanged) unless this installation is committed
+  # to driver-applied NFSv4 ACLs. Under `File`, kubelet recursively chowns and
+  # chmods each volume to a Pod's securityContext.fsGroup at publish, which
+  # rewrites the mode-bearing ACEs of an ACL set via the StorageClass
+  # `nfsACLTemplate`/`nfsACL` parameters. Options: File, None, ReadWriteOnceWithFSType.
+  fsGroupPolicy: File
+
 # Deprecated single-StorageClass configuration. When non-empty, this takes
 # precedence over storageClasses for compatibility with existing values files.
 # mountOptions and protocol are emitted only when explicitly set here.

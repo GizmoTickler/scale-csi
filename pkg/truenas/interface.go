@@ -68,6 +68,11 @@ type ClientInterface interface {
 	NFSServiceConfig(ctx context.Context) (*NFSServiceConfig, error)
 	NFSServiceUpdate(ctx context.Context, params map[string]interface{}) (*NFSServiceConfig, error)
 
+	// Filesystem ACL methods (NFSv4 ACLs). FilesystemSetACL is a @job.
+	FilesystemGetACL(ctx context.Context, path string) (*FilesystemACL, error)
+	FilesystemSetACL(ctx context.Context, opts *SetACLOptions) error
+	ACLTemplateDACL(ctx context.Context, name string) ([]ACLEntry, error)
+
 	// Service methods
 	ServiceReload(ctx context.Context, service string) error
 
