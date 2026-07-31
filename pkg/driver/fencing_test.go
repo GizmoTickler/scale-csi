@@ -2421,6 +2421,171 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 	assert.Empty(t, records, "a hard-rejected sentinel-reporting node must persist NO publication record")
 }
 
+// TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment pins
+// round-4 gap 1: a node that physically reported the reserved deny-all sentinel
+// (so discovery blanked its IQN and set ISCSIReportedSentinel) but publishes with
+// a LEGACY/plain node ID must STILL be hard-rejected. resolveControllerNodeIdentity
+// enriches the legacy ID from the current CSINode via mergeNodeIdentity; that merge
+// must monotonically OR the sentinel marker so the reserved-identity reject fires
+// and NO publication record is persisted. Revert-sensitive: without the OR in
+// mergeNodeIdentity, the marker is dropped, additive validation defers the blank
+// IQN as missing_identity, publish returns success, and persists an empty-IQN record.
+func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	driverName := "org.scale.csi.iscsi"
+	d := &Driver{
+		name: driverName,
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeAdditive},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
+			ISCSI: ISCSIConfig{
+				Enabled: true, TargetPortal: "192.0.2.10:3260", ExtentBlocksize: 512, ExtentRpm: "SSD",
+			},
+		},
+		truenasClient: client,
+		serviceReloadDebouncer: NewServiceReloadDebouncer(0, func(context.Context, string) error {
+			return nil
+		}),
+	}
+	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	datasetName := "pool/parent/f2-legacy-enrich"
+	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-legacy-enrich", true, true))
+	// Pre-existing backend deny-all sentinel group (last-unpublish state): its
+	// sentinel entry is exactly what the sentinel-reporting node's real initiator
+	// matches, which is why publishing it must fail closed.
+	ds, err = client.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, nil))
+
+	// Real node-side discovery reads the reserved sentinel; this is the identity
+	// encoded into the CURRENT CSINode registration.
+	origRead := nodeReadIdentityFile
+	origCmd := nodeIdentityCommand
+	origAddrs := nodeInterfaceAddrs
+	t.Cleanup(func() {
+		nodeReadIdentityFile = origRead
+		nodeIdentityCommand = origCmd
+		nodeInterfaceAddrs = origAddrs
+	})
+	nodeIdentityCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("nvme not installed")
+	}
+	nodeInterfaceAddrs = func() ([]net.Addr, error) { return nil, nil }
+	nodeReadIdentityFile = func(path string) ([]byte, error) {
+		if path == "/etc/iscsi/initiatorname.iscsi" {
+			return []byte("InitiatorName=" + iscsiDenyAllSentinelIQN + "\n"), nil
+		}
+		return nil, errors.New("no such file")
+	}
+	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	require.Empty(t, identity.ISCSIIQN, "discovery must blank the sentinel out of the IQN field")
+	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision")
+	encodedCurrent, err := encodeNodeIdentity(identity)
+	require.NoError(t, err)
+
+	// Current CSINode carries the sentinel-marked identity; the publish arrives with
+	// a LEGACY/plain node ID that resolveControllerNodeIdentity must enrich.
+	csiNode := &storagev1.CSINode{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-sentinel"},
+		Spec: storagev1.CSINodeSpec{Drivers: []storagev1.CSINodeDriver{{
+			Name: driverName, NodeID: encodedCurrent,
+		}}},
+	}
+	d.eventRecorder = &EventRecorder{clientset: kubernetesfake.NewSimpleClientset(csiNode)}
+
+	capability := &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+		Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+	}}
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: "f2-legacy-enrich", NodeId: "worker-sentinel", VolumeCapability: capability,
+		VolumeContext: map[string]string{"node_attach_driver": "iscsi"},
+	})
+	require.Error(t, err, "sentinel marker must survive legacy-node-ID enrichment and hard-fail publish")
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "reserved iSCSI fencing identity")
+
+	fresh, err := client.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(fresh)
+	require.NoError(t, err)
+	assert.Empty(t, records, "an enriched sentinel-reporting node must persist NO publication record")
+}
+
+// TestControllerPublishRejectsSentinelReporterWithFencingModeOff pins round-4
+// gap 2: the reserved-sentinel rejection is a SAFETY INVARIANT independent of
+// fencing enforcement. Even with fencing.mode=off (backend enforcement skipped),
+// a node reporting the reserved deny-all IQN as its own identity must be
+// hard-rejected NON-DEFERABLY before any publication record is persisted.
+// Revert-sensitive: if the reject only runs under backendEnforcement, off-mode
+// skips validation, publish returns success, and persists an empty-IQN record.
+func TestControllerPublishRejectsSentinelReporterWithFencingModeOff(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.iscsi",
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeOff},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
+			ISCSI: ISCSIConfig{
+				Enabled: true, TargetPortal: "192.0.2.10:3260", ExtentBlocksize: 512, ExtentRpm: "SSD",
+			},
+		},
+		truenasClient: client,
+		serviceReloadDebouncer: NewServiceReloadDebouncer(0, func(context.Context, string) error {
+			return nil
+		}),
+	}
+	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	datasetName := "pool/parent/f2-off-mode"
+	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-off-mode", true, true))
+
+	// Real discovery reads the reserved sentinel and marks the collision.
+	origRead := nodeReadIdentityFile
+	origCmd := nodeIdentityCommand
+	origAddrs := nodeInterfaceAddrs
+	t.Cleanup(func() {
+		nodeReadIdentityFile = origRead
+		nodeIdentityCommand = origCmd
+		nodeInterfaceAddrs = origAddrs
+	})
+	nodeIdentityCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("nvme not installed")
+	}
+	nodeInterfaceAddrs = func() ([]net.Addr, error) { return nil, nil }
+	nodeReadIdentityFile = func(path string) ([]byte, error) {
+		if path == "/etc/iscsi/initiatorname.iscsi" {
+			return []byte("InitiatorName=" + iscsiDenyAllSentinelIQN + "\n"), nil
+		}
+		return nil, errors.New("no such file")
+	}
+	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision")
+	nodeID, err := encodeNodeIdentity(identity)
+	require.NoError(t, err)
+
+	capability := &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+		Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+	}}
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: "f2-off-mode", NodeId: nodeID, VolumeCapability: capability,
+		VolumeContext: map[string]string{"node_attach_driver": "iscsi"},
+	})
+	require.Error(t, err, "reserved sentinel must be rejected even with fencing.mode=off")
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "reserved iSCSI fencing identity")
+
+	fresh, err := client.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(fresh)
+	require.NoError(t, err)
+	assert.Empty(t, records, "off-mode sentinel-reporting node must persist NO publication record")
+}
+
 // TestValidateIdentityForProtocolRejectsDenyAllSentinelIQN pins the round-2 F2
 // fix: the deny-all sentinel is a reserved backend value and must never be
 // accepted as a node-reported iSCSI identity. This is the enforcement gate that

@@ -296,6 +296,16 @@ func mergeNodeIdentity(base, additional NodeIdentity) NodeIdentity {
 	if base.ISCSIIQN == "" {
 		base.ISCSIIQN = additional.ISCSIIQN
 	}
+	// F2: the reserved-sentinel marker is a fail-closed safety signal, never a
+	// value to be dropped. Monotonically OR it so that once either the base
+	// (e.g. a legacy publish node ID) or the enriching identity (the current
+	// CSINode parsed from discovery) reported the sentinel, the merged identity
+	// still carries it. Otherwise a node that physically reported the deny-all
+	// sentinel but publishes via the legacy-node-ID enrichment path would lose
+	// the marker, be treated as a temporarily-missing IQN, and persist an
+	// empty-IQN publication record. This helper is shared by controller
+	// enrichment and startup reconciliation, so the guard holds on both paths.
+	base.ISCSIReportedSentinel = base.ISCSIReportedSentinel || additional.ISCSIReportedSentinel
 	base.IPs = canonicalNodeIPs(append(base.IPs, additional.IPs...))
 	return base
 }
@@ -371,24 +381,39 @@ func (d *Driver) recordFencingDeferred(identity NodeIdentity, shareType ShareTyp
 		identity.Name, shareType, reason, detail)
 }
 
+// rejectReservedSentinelIdentity enforces the reserved-sentinel safety invariant
+// independent of fencing.mode. A node that physically reported the reserved
+// deny-all sentinel as its own initiator IQN is never a valid publisher: its real
+// initiator is exactly the sentinel already present in fenced deny-all groups, so
+// authorizing it would defeat the fence. This is a NON-DEFERABLE FailedPrecondition
+// refused in off/additive/strict alike, before any publication record is created.
+func rejectReservedSentinelIdentity(identity NodeIdentity, shareType ShareType) error {
+	if shareType == ShareTypeISCSI && identity.ISCSIReportedSentinel {
+		return status.Errorf(codes.FailedPrecondition,
+			"node %s reported the reserved iSCSI fencing identity %q as its own initiator IQN; it must report a real IQN before publishing this fenced volume",
+			identity.Name, iscsiDenyAllSentinelIQN)
+	}
+	return nil
+}
+
 // validateOrDeferFencingIdentity keeps additive mode rolling-upgrade safe. A
 // node that has not re-registered its transport identity continues using the
 // static allowlist. The publish still writes a durable ownership record so a
 // second legacy node cannot bypass SINGLE_NODE semantics, but skips only that
 // node's backend grant. Strict mode preserves the fail-closed contract.
 func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType ShareType) (bool, error) {
-	if shareType == ShareTypeISCSI && identity.ISCSIReportedSentinel {
+	if err := rejectReservedSentinelIdentity(identity, shareType); err != nil {
 		// F2: a node that physically reported the reserved deny-all sentinel as its
 		// own initiator IQN is NOT a temporarily-missing-IQN rolling-upgrade node.
 		// Its real initiator is exactly the sentinel already present in fenced
 		// deny-all groups, so deferring it (additive) would persist a success record
 		// while the deny-all entry implicitly authorizes it. Hard-fail closed and
-		// NON-DEFERABLY in every mode — return the error without recording a deferral,
-		// so ControllerPublishVolume returns it before any publication record or
-		// backend grant is created.
-		return false, status.Errorf(codes.FailedPrecondition,
-			"node %s reported the reserved iSCSI fencing identity %q as its own initiator IQN; it must report a real IQN before publishing this fenced volume",
-			identity.Name, iscsiDenyAllSentinelIQN)
+		// NON-DEFERABLY — return the error without recording a deferral, so
+		// ControllerPublishVolume returns it before any publication record or backend
+		// grant is created. publishFencedVolume also invokes this check unconditionally
+		// (in every fencing.mode, including off) so the invariant does not depend on
+		// backend enforcement being enabled.
+		return false, err
 	}
 	if err := validateIdentityForProtocol(identity, shareType); err != nil {
 		if d.config.Fencing.Mode == FencingModeAdditive {
@@ -906,6 +931,14 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	// is a separate concern governed by fencing.mode and is skipped entirely when
 	// the mode is off. This keeps the default configuration spec-conformant at the
 	// cost of only the publication property writes.
+	// The reserved-sentinel rejection is a safety invariant independent of fencing
+	// enforcement: a node reporting the reserved deny-all IQN as its own identity is
+	// refused NON-DEFERABLY in EVERY mode (off/additive/strict) before any
+	// publication record is persisted. Only this rejection runs unconditionally;
+	// all other identity validation remains governed by fencing.mode below.
+	if err := rejectReservedSentinelIdentity(identity, shareType); err != nil {
+		return err
+	}
 	backendEnforcement := d.config.Fencing.Enabled()
 	deferred := false
 	if backendEnforcement {
