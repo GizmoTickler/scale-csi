@@ -220,7 +220,7 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 			// chapErr is already redacted (parameter name + exit class, never the
 			// value); wrap it in a sentinel so the node can emit a distinct
 			// ISCSICHAPFailed Event without leaking the credential (E3/O15).
-			return "", fmt.Errorf("%w for %s: %v", ErrISCSICHAPConfig, iqn, chapErr)
+			return "", fmt.Errorf("%w for %s: %w", ErrISCSICHAPConfig, iqn, chapErr)
 		}
 	}
 
