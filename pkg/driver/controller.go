@@ -401,34 +401,38 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
 	var createdDS *truenas.Dataset
-	var snapshotCloneMarker *inflightMarker
 	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
-		_, srcErr := d.handleVolumeContentSource(
+		clonedDS, srcErr := d.handleVolumeContentSource(
 			ctx, datasetName, name, contentSource, capacityBytes, shareType, detached, &detachedCopyJobID,
-			&snapshotCloneMarker,
 		)
 		if srcErr != nil {
 			return nil, srcErr
 		}
-		// Clone/replication APIs cannot stamp properties atomically. The initial
-		// absence check plus a successful (not AlreadyExists) clone/copy response is
-		// the creation proof; stamp ownership before creating any share object.
-		verifiedClone, ownerErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
-			PropDriverInstanceID: d.driverInstanceID(),
-		})
-		if ownerErr != nil {
-			if snapshotCloneMarker != nil {
-				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, snapshotCloneMarker, ownerErr)
+		if detached {
+			// Detached snapshot copies do NOT fold the ownership stamp into their
+			// content-source write, so stamp it here before any share object exists.
+			// Clone/replication APIs cannot stamp properties atomically; the initial
+			// absence check plus a successful (not AlreadyExists) copy response is the
+			// creation proof.
+			verifiedClone, ownerErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+				PropDriverInstanceID: d.driverInstanceID(),
+			})
+			if ownerErr != nil {
+				d.cleanupFailedClone(ctx, datasetName, "")
+				return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
 			}
-			d.cleanupFailedClone(ctx, datasetName, "")
-			return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
+			createdDS = verifiedClone
+		} else {
+			// Sprint 3 (L2a): the snapshot-clone and volume-clone paths folded the
+			// ownership stamp into their atomic content-source write, so clonedDS
+			// already carries durable ownership and no separate stamp is needed.
+			createdDS = clonedDS
 		}
 		// Ownership is durable; the in-flight marker has served its purpose.
 		// Best-effort removal — the reconciler sweep retires leftovers.
 		d.deleteInflightMarker(ctx, volumeID)
-		createdDS = verifiedClone
 		zvolReady = true
 		// Scrub backend share-object IDs the clone inherited from its source dataset
 		// (ZFS copies the source's user properties into the clone). A stale inherited
@@ -2146,9 +2150,10 @@ func stampAndMirror(ctx context.Context, client truenas.ClientInterface, ds *tru
 // setAndVerifyDatasetProps writes an optional filesystem refquota together with
 // user properties through one pool.dataset.update and verifies that every
 // requested value persisted with source=local. The widened shape is used by the
-// snapshot-clone fold: content-source identity and quota become durable in one
-// response-verifying update, while ownership remains a later, separate crash
-// boundary.
+// snapshot-clone fold: refquota, content-source identity, and (since Sprint 3
+// L2a) the ownership stamp all become durable in one response-verifying update,
+// so there is no intermediate state where content-source exists without
+// ownership.
 func (d *Driver) setAndVerifyDatasetProps(
 	ctx context.Context,
 	datasetName string,
@@ -2414,7 +2419,6 @@ func (d *Driver) handleVolumeContentSource(
 	shareType ShareType,
 	detached bool,
 	detachedCopyJobID *int64,
-	snapshotCloneMarker **inflightMarker,
 ) (*truenas.Dataset, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
 	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
@@ -2455,10 +2459,6 @@ func (d *Driver) handleVolumeContentSource(
 		}
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
 			return nil, markerWriteErr
-		}
-		if !detached && snapshotCloneMarker != nil {
-			markerCopy := marker
-			*snapshotCloneMarker = &markerCopy
 		}
 		if detached {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
@@ -2528,9 +2528,20 @@ func (d *Driver) handleVolumeContentSource(
 					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, err)
 				}
 			}
+			// Sprint 3 (L2a): refquota + content-source identity + the ownership
+			// stamp persist in ONE atomic pool.dataset.update (single ZFS txg;
+			// DatasetUpdate sets every user property atomically). This REMOVES the
+			// old content-source-vs-ownership crash window by making the two durable
+			// simultaneously rather than weakening it: a crash before this write
+			// leaves marker+clone with no ownership (recoverable, identical to the
+			// old "crash before #7"); a crash after it leaves a complete owned volume
+			// with the marker still present, which the reconciler sweep retires
+			// (identical to the old "crash after #8, before #9"). The marker is still
+			// written before the clone and retired only after this write is durable.
 			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, map[string]string{
 				PropVolumeContentSourceType: "snapshot",
 				PropVolumeContentSourceID:   snapshotID,
+				PropDriverInstanceID:        d.driverInstanceID(),
 			})
 			if updateErr != nil {
 				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, updateErr)
@@ -2608,10 +2619,16 @@ func (d *Driver) handleVolumeContentSource(
 		}
 
 		// Include origin snapshot so it can be cleaned up when the clone is deleted.
+		// Sprint 3 (L2a): the ownership stamp folds into this same content-source
+		// write so content-source identity and ownership become durable in one atomic
+		// pool.dataset.update (single txg), removing the intermediate state where one
+		// existed without the other. The marker is still retired only after this write
+		// succeeds (see the shared ownership gate in CreateVolume).
 		if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
 			PropVolumeContentSourceType: "volume",
 			PropVolumeContentSourceID:   sourceVolumeID,
 			PropVolumeOriginSnapshot:    snap.ID,
+			PropDriverInstanceID:        d.driverInstanceID(),
 		}); err != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
 			return nil, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", err)

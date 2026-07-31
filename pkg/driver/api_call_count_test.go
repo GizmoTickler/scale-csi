@@ -865,19 +865,21 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
 			require.NoError(t, err)
 		}},
-		// Twelve calls: existence lookup; snapshot name resolution; the durable
-		// in-flight marker write on the parent dataset via pool.dataset.update plus
-		// its one-time post-connect verifying re-read (the marker mechanism stays
-		// intact); one clone and readiness wait; one response-verified update that
-		// folds filesystem refquota together with both content-source keys; the
-		// ownership stamp via a separate pool.dataset.update (the inviolable
-		// content-source-vs-ownership crash boundary); marker retirement after the
-		// durable ownership stamp; NFS share resolution + create; and a single
-		// post-share update that folds the share-ID stamp together with the
-		// managed/ownership/provision/name stamps. The remaining writes are
-		// separated by crash boundaries or are the protected marker mechanism, so
-		// 12 is the safe floor without weakening crash consistency.
-		{name: "CreateVolume clone from snapshot", want: 12, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Eleven calls (Sprint 3 L2a folded the ownership stamp into the
+		// content-source+refquota update, 12->11): existence lookup; snapshot name
+		// resolution; the durable in-flight marker write on the parent dataset via
+		// pool.dataset.update plus its one-time post-connect verifying re-read (the
+		// marker mechanism stays intact); one clone and readiness wait; ONE
+		// response-verified update that folds filesystem refquota, both content-source
+		// keys, AND the ownership stamp into a single atomic pool.dataset.update (one
+		// ZFS txg — this removes the old content-source-vs-ownership crash window by
+		// making the two durable simultaneously rather than weakening it); marker
+		// retirement after that durable write; NFS share resolution + create; and a
+		// single post-share update that folds the share-ID stamp together with the
+		// managed/provision/name stamps. The remaining writes are separated by crash
+		// boundaries or are the protected marker mechanism, so 11 is the safe floor
+		// without weakening crash consistency.
+		{name: "CreateVolume clone from snapshot", want: 11, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})
@@ -891,6 +893,31 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			req := apiCallCountVolumeRequest("restored-from-snapshot", "nfs")
 			req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
 				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "clone-point"},
+			}}
+			_, err = d.CreateVolume(context.Background(), req)
+			require.NoError(t, err)
+		}},
+		// Thirteen calls (pinned Sprint 3 L4 so the volume-clone path is
+		// regression-guarded; the L2a ownership fold applies here too, -1 vs the
+		// pre-L2a 14): existence lookup; source-volume existence get; the durable
+		// in-flight marker write plus its one-time post-connect verifying re-read;
+		// temp source-snapshot create; clone; readiness wait; a filesystem refquota
+		// update (ensureCloneCapacity); ONE content-source write that folds the
+		// content-source keys, the origin-snapshot key, AND the ownership stamp into
+		// a single atomic pool.dataset.update (L2a); marker retirement; NFS share
+		// resolution + create; and the post-share managed/provision/name fold.
+		{name: "CreateVolume clone from volume", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent", Type: "FILESYSTEM",
+			})
+			require.NoError(t, err)
+			_, err = client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/volume-clone-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			req := apiCallCountVolumeRequest("restored-from-volume", "nfs")
+			req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "volume-clone-source"},
 			}}
 			_, err = d.CreateVolume(context.Background(), req)
 			require.NoError(t, err)

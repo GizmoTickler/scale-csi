@@ -112,16 +112,25 @@ type silentCloneOwnerUpdateMock struct {
 }
 
 func (m *silentCloneOwnerUpdateMock) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
-	if len(params.UserPropertiesUpdate) == 1 &&
-		params.UserPropertiesUpdate[0].Key == PropDriverInstanceID &&
-		params.UserPropertiesUpdate[0].Value != "" &&
-		!params.UserPropertiesUpdate[0].Remove {
-		// Model an acknowledged pool.dataset.update whose ownership write did not
-		// persist: strip it so the update response — which
-		// setAndVerifyDatasetUserProperties now trusts — lacks source=local
-		// ownership and verification fails before any share is created.
-		stripped := *params
-		stripped.UserPropertiesUpdate = nil
+	// Model an acknowledged pool.dataset.update whose ownership write did not
+	// persist. Since Sprint 3 L2a the ownership stamp shares the merged
+	// content-source+refquota update, so strip PropDriverInstanceID from any
+	// update that carries it (folded or alone) while letting the other keys
+	// persist; the trusted update response then lacks source=local ownership and
+	// verification fails before any share is created. The first clone-path update
+	// carrying ownership is the merged content-source write, so that is where the
+	// driver detects the loss and guard-cleans the clone.
+	stripped := *params
+	stripped.UserPropertiesUpdate = nil
+	sawOwner := false
+	for _, update := range params.UserPropertiesUpdate {
+		if update.Key == PropDriverInstanceID && update.Value != "" && !update.Remove {
+			sawOwner = true
+			continue
+		}
+		stripped.UserPropertiesUpdate = append(stripped.UserPropertiesUpdate, update)
+	}
+	if sawOwner {
 		return m.MockClient.DatasetUpdate(ctx, name, &stripped)
 	}
 	return m.MockClient.DatasetUpdate(ctx, name, params)
