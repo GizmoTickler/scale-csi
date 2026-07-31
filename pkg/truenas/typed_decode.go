@@ -79,7 +79,11 @@ func (p rawUserProperty) toUserProperty() UserProperty {
 
 type rawSnapshot struct {
 	Snapshot
-	SnapshotName      string                 `json:"snapshot_name"`
+	// SnapshotName is a pointer so present-but-empty is distinguishable from
+	// absent: the legacy parseSnapshot overwrites Name whenever the key is
+	// PRESENT (even with ""), and the typed decoder must match it exactly
+	// (2026-07-31 differential-fuzz find).
+	SnapshotName      *string                `json:"snapshot_name"`
 	CreateTXGRaw      rawUnsigned            `json:"createtxg"`
 	RawUserProperties map[string]interface{} `json:"user_properties"`
 }
@@ -107,8 +111,8 @@ func (snapshot *rawSnapshot) toSnapshot() *Snapshot {
 	if result.ID == "" && strings.Contains(snapshot.Name, "@") {
 		result.ID = snapshot.Name
 	}
-	if snapshot.SnapshotName != "" {
-		result.Name = snapshot.SnapshotName
+	if snapshot.SnapshotName != nil {
+		result.Name = *snapshot.SnapshotName
 	}
 	if snapshot.CreateTXGRaw.valid {
 		result.CreateTXG = snapshot.CreateTXGRaw.value
@@ -174,7 +178,11 @@ type rawDatasetProperties struct {
 
 func (dataset *rawDataset) toDataset(resourceQuery bool) *Dataset {
 	result := &dataset.Dataset
-	if result.Name == "" {
+	// The path→name fallback is a zfs.resource.query shape concern only:
+	// parseDatasetResource accepts name-or-path, but the legacy parseDataset
+	// (pool.dataset.query) reads only "name". Keep the typed decoder exactly
+	// equivalent to the parser it replaced (2026-07-31 differential-fuzz find).
+	if resourceQuery && result.Name == "" {
 		result.Name = dataset.Path
 	}
 	if resourceQuery && result.ID == "" {
