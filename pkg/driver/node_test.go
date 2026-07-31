@@ -950,6 +950,13 @@ func TestNodeUnpublishVolume_Validation(t *testing.T) {
 func TestNodeGetVolumeStats_Validation(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeNFS)
 
+	// The bounded mount pre-gate runs before the path stat; stub it to
+	// not-mounted so the nonexistent-path case still reaches the resolver (the
+	// real findmnt-backed check is unavailable on non-Linux test hosts).
+	originalMountCheck := nodeStatsMountCheck
+	t.Cleanup(func() { nodeStatsMountCheck = originalMountCheck })
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return false, nil }
+
 	t.Run("MissingVolumeID", func(t *testing.T) {
 		req := &csi.NodeGetVolumeStatsRequest{
 			VolumePath: "/var/lib/kubelet/pods/xxx/volumes/csi",
@@ -997,14 +1004,19 @@ func TestNodeGetVolumeStats_BlockMode(t *testing.T) {
 	originalDeviceSize := getNodeDeviceSize
 	originalStat := nodeStatsStat
 	originalSysfsRoot := nodeStatsSysfsRoot
+	originalMountCheck := nodeStatsMountCheck
 	t.Cleanup(func() {
 		resolveNodeStatsDevice = originalResolver
 		getNodeDeviceSize = originalDeviceSize
 		nodeStatsStat = originalStat
 		nodeStatsSysfsRoot = originalSysfsRoot
+		nodeStatsMountCheck = originalMountCheck
 	})
 	resolveNodeStatsDevice = nodeStatsDevice
 	getNodeDeviceSize = nodeStatsDeviceSize
+	// A block-device path is not a mountpoint; the pre-gate returns not-mounted
+	// with no error and falls through to the device stat.
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return false, nil }
 
 	volumePath := filepath.Join(t.TempDir(), "published-block-device")
 	require.NoError(t, os.WriteFile(volumePath, nil, 0o640))
@@ -1106,9 +1118,79 @@ func TestNodeGetVolumeStats_MountUnresponsiveIsAbnormal(t *testing.T) {
 	assert.Contains(t, resp.VolumeCondition.Message, "mount unresponsive")
 }
 
+// TestNodeGetVolumeStats_PregateRunsBeforeStat exercises the REAL device
+// resolver (resolveNodeStatsDevice = nodeStatsDevice, not a mock) with a
+// blocking stat injected at the lowest seam to model a dead NFS hard mount whose
+// root stat hangs in D-state. The bounded mount pre-gate must run first and
+// short-circuit, so the RPC returns an abnormal condition promptly and the
+// blocking stat is never invoked. Were the pre-gate ordered behind the resolver
+// (the opus-M1 hazard), the goroutine would block in nodeStatsStat and the test
+// would time out.
+func TestNodeGetVolumeStats_PregateRunsBeforeStat(t *testing.T) {
+	originalResolver := resolveNodeStatsDevice
+	originalStat := nodeStatsStat
+	originalMountCheck := nodeStatsMountCheck
+	t.Cleanup(func() {
+		resolveNodeStatsDevice = originalResolver
+		nodeStatsStat = originalStat
+		nodeStatsMountCheck = originalMountCheck
+	})
+
+	resolveNodeStatsDevice = nodeStatsDevice // real resolver, deliberately not mocked
+	statCalled := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	nodeStatsStat = func(string) (uint32, uint64, error) {
+		select {
+		case statCalled <- struct{}{}:
+		default:
+		}
+		<-release // hang until the test releases us, simulating D-state
+		return 0, 0, nil
+	}
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) {
+		return false, errors.New("findmnt timed out on dead NFS hard mount")
+	}
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	type result struct {
+		resp *csi.NodeGetVolumeStatsResponse
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+			VolumeId: "fs-vol", VolumePath: "/pods/fs-vol",
+		})
+		done <- result{resp, err}
+	}()
+
+	select {
+	case res := <-done:
+		require.NoError(t, res.err)
+		require.NotNil(t, res.resp.VolumeCondition)
+		assert.True(t, res.resp.VolumeCondition.Abnormal)
+		assert.Contains(t, res.resp.VolumeCondition.Message, "mount unresponsive")
+	case <-time.After(2 * time.Second):
+		t.Fatal("NodeGetVolumeStats hung: the bounded pre-gate did not run before the blocking stat")
+	}
+
+	select {
+	case <-statCalled:
+		t.Fatal("nodeStatsStat was invoked: the pre-gate did not short-circuit ahead of device resolution")
+	default:
+	}
+}
+
 func TestNodeGetVolumeStats_StatFailureIsAbnormal(t *testing.T) {
 	originalResolver := resolveNodeStatsDevice
-	t.Cleanup(func() { resolveNodeStatsDevice = originalResolver })
+	originalMountCheck := nodeStatsMountCheck
+	t.Cleanup(func() {
+		resolveNodeStatsDevice = originalResolver
+		nodeStatsMountCheck = originalMountCheck
+	})
+	// Let the pre-gate pass so the injected resolver failure is the path exercised.
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return false, nil }
 	resolveNodeStatsDevice = func(string) (string, bool, error) {
 		return "", false, errors.New("injected stat failure")
 	}

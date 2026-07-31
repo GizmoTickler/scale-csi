@@ -1073,6 +1073,22 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 
 	klog.V(4).Infof("NodeGetVolumeStats: volumeID=%s, volumePath=%s", volumeID, volumePath)
 
+	// Bounded liveness pre-gate, run BEFORE any unix.Stat on volumePath. For a
+	// filesystem (NFS/remote) volume volumePath is the mountpoint, and unix.Stat
+	// on the root of a dead hard mount issues a GETATTR that blocks in
+	// uninterruptible D-state indefinitely — the exact hazard this gate closes.
+	// The findmnt-backed check reads the kernel mount table (never the filesystem
+	// itself) and is bounded by both the configured mount timeout and the kubelet's
+	// inbound RPC deadline, so it cannot itself hang; if it cannot confirm the path
+	// promptly we report an abnormal condition instead of touching it. Ordering it
+	// ahead of device resolution means a dead mount can hang NEITHER stat (in the
+	// resolver) NOR the statfs below. Block-device paths are not mountpoints, so
+	// the check returns not-mounted with no error and falls through to the fast
+	// local device stat. No new TrueNAS API calls are involved.
+	if _, mountErr := nodeStatsMountCheck(ctx, volumePath); mountErr != nil {
+		return abnormalVolumeStatsResponse(fmt.Sprintf("mount unresponsive for %s: %v", volumePath, mountErr)), nil
+	}
+
 	devicePath, blockMode, err := resolveNodeStatsDevice(volumePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1094,17 +1110,7 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 		}, nil
 	}
 
-	// Bounded liveness pre-gate for filesystem (NFS/remote) volumes: a dead hard
-	// mount can block the statfs below indefinitely. findmnt is bounded by both
-	// the configured mount timeout and the kubelet's inbound RPC deadline, so if
-	// it cannot confirm the mount promptly we report an abnormal condition instead
-	// of hanging the NodeGetVolumeStats RPC. The block-device branch above is
-	// unchanged (no remote mount to gate). No new TrueNAS API calls are involved.
-	if _, mountErr := nodeStatsMountCheck(ctx, volumePath); mountErr != nil {
-		return abnormalVolumeStatsResponse(fmt.Sprintf("mount unresponsive for %s: %v", volumePath, mountErr)), nil
-	}
-
-	// Get filesystem stats
+	// Get filesystem stats (mount liveness was already gated above, before stat).
 	stats, err := getNodeFilesystemStats(volumePath)
 	if err != nil {
 		return abnormalVolumeStatsResponse(fmt.Sprintf("failed to get filesystem stats for %s: %v", volumePath, err)), nil
