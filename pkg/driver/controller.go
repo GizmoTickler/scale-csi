@@ -399,6 +399,23 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		ctx = withISCSIChAPResolution(ctx, chapResolution)
 	}
 
+	// Block-protocol tuning (GF-Sprint 4) is strictly opt-in per StorageClass.
+	// Resolve and validate the knobs once and thread them to the share builder
+	// via the request context, mirroring the CHAP resolution. A StorageClass that
+	// sets none of these resolves to nil and provisions byte-identically to
+	// pre-GF4. NVMe-oF port performance fields are install-wide (shared port) and
+	// are rejected here so a per-SC value cannot mutate a shared object (R-4).
+	if shareType == ShareTypeISCSI || shareType == ShareTypeNVMeoF {
+		if portErr := validateNoNVMeoFPortParams(req.GetParameters()); portErr != nil {
+			return nil, portErr
+		}
+		opts, optsErr := resolveBlockOpts(req.GetParameters(), volumeID)
+		if optsErr != nil {
+			return nil, optsErr
+		}
+		ctx = withBlockOpts(ctx, opts)
+	}
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {
