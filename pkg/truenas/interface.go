@@ -73,6 +73,10 @@ type ClientInterface interface {
 	RecommendedZvolBlocksize(ctx context.Context, pool string) (string, error)
 	PoolHasSpecialVdev(ctx context.Context, pool string) (bool, error)
 
+	// Backend health (read-only).
+	PoolHealth(ctx context.Context, pool string) (*PoolHealthSnapshot, error)
+	DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error)
+
 	// Filesystem ACL methods (NFSv4 ACLs). FilesystemSetACL is a @job.
 	FilesystemGetACL(ctx context.Context, path string) (*FilesystemACL, error)
 	FilesystemSetACL(ctx context.Context, opts *SetACLOptions) error

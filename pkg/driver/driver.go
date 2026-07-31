@@ -143,6 +143,13 @@ type Driver struct {
 	capacityCancel context.CancelFunc
 	capacityWg     sync.WaitGroup
 
+	// Controller-side backend-health poll loop (GF5 E4). Runs only when
+	// backendHealth.enabled; each tick is at most two bounded READ calls
+	// (pool.query + disk.temperature_alerts) and never writes.
+	backendHealthCancel context.CancelFunc
+	backendHealthWg     sync.WaitGroup
+	backendHealth       atomic.Pointer[truenas.PoolHealthSnapshot]
+
 	// Background fencing state. Missing-record observations are in-memory on
 	// purpose: a controller restart restarts the full grace period rather than
 	// revoking an old record immediately after a fresh VA disappearance.
@@ -415,6 +422,7 @@ func (d *Driver) Run() error {
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
 		d.startCapacityGauges()
+		d.startBackendHealth()
 	}
 	if d.runNode {
 		d.startSessionGC()
@@ -433,6 +441,7 @@ func (d *Driver) Stop() {
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
+	d.stopBackendHealth()
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {

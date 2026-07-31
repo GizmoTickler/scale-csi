@@ -283,6 +283,21 @@
         }
       }
     },
+    "backendHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Run the read-only pool-health poller that drives per-PVC VolumeCondition and the scale_csi_pool_* gauges. Default off.",
+          "type": "boolean"
+        },
+        "interval": {
+          "description": "Poll cadence; values below 30s are clamped to it.",
+          "type": "string",
+          "minLength": 2
+        }
+      }
+    },
     "capacity": {
       "type": "object",
       "additionalProperties": false,

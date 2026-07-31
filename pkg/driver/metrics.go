@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -324,6 +325,63 @@ var (
 		[]string{"pool", "dataset"},
 	)
 
+	// Backend-health gauges (GF5 E4). Published only when backendHealth.enabled
+	// by a controller-only READ-ONLY poll loop. ZFS has no per-dataset health, so
+	// these are per-POOL signals that the VolumeCondition path fans out to every
+	// managed volume on that pool.
+	//
+	// pool_status is a one-hot series over the {pool,status} label pair: exactly
+	// one status label is 1 at a time, the rest are 0, so `max by (pool)` style
+	// queries and label-based alerting both work.
+	poolStatus = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_status",
+			Help:      "ZFS pool status, one-hot over the status label (1 = current status)",
+		},
+		[]string{"pool", "status"},
+	)
+
+	poolHealthy = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_healthy",
+			Help:      "1 when TrueNAS reports the pool healthy, 0 otherwise",
+		},
+		[]string{"pool"},
+	)
+
+	// poolScanState is one-hot over {pool,function,state}: it reports whether a
+	// scrub or resilver is SCANNING/FINISHED/CANCELED. A running scrub is normal
+	// maintenance, not ill health, which is why it is a separate series from
+	// pool_healthy rather than folded into it.
+	poolScanState = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_scan_state",
+			Help:      "ZFS pool scrub/resilver state, one-hot over the function and state labels (1 = current)",
+		},
+		[]string{"pool", "function", "state"},
+	)
+
+	poolScanErrors = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_scan_errors",
+			Help:      "Errors reported by the pool's most recent scrub/resilver",
+		},
+		[]string{"pool"},
+	)
+
+	poolDiskTempAlerts = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_disk_temp_alerts",
+			Help:      "Number of the pool's member disks currently raising a temperature alert",
+		},
+		[]string{"pool"},
+	)
+
 	reconcileLastSuccessTimestamp = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -608,6 +666,69 @@ func SetOrphanReconcileMetrics(report ReconcileReport) {
 
 func RecordReconcileSuccess(at time.Time) {
 	reconcileLastSuccessTimestamp.Set(float64(at.Unix()))
+}
+
+// poolStatusLabels is the fixed status label set the one-hot pool_status series
+// covers. Keeping it fixed bounds cardinality and means a status that goes away
+// is explicitly zeroed instead of leaving a stale 1 behind.
+var poolStatusLabels = []string{
+	truenas.PoolStatusOnline,
+	truenas.PoolStatusDegraded,
+	truenas.PoolStatusFaulted,
+	truenas.PoolStatusOffline,
+	truenas.PoolStatusUnavail,
+	truenas.PoolStatusRemoved,
+}
+
+// poolScanStateLabels is the fixed scan-state label set, zeroed the same way.
+var poolScanStateLabels = []string{
+	truenas.PoolScanStateScanning,
+	truenas.PoolScanStateFinished,
+	truenas.PoolScanStateCanceled,
+}
+
+// SetPoolHealthMetrics publishes one backend-health sample. Every one-hot series
+// is rewritten on each sample (current label 1, all others 0) so a recovered
+// pool never leaves a stale DEGRADED series firing an alert forever.
+func SetPoolHealthMetrics(snapshot *truenas.PoolHealthSnapshot) {
+	if snapshot == nil || snapshot.Pool == "" {
+		return
+	}
+	current := strings.ToUpper(strings.TrimSpace(snapshot.Status))
+	matched := false
+	for _, label := range poolStatusLabels {
+		value := 0.0
+		if label == current {
+			value, matched = 1.0, true
+		}
+		poolStatus.WithLabelValues(snapshot.Pool, label).Set(value)
+	}
+	if !matched && current != "" {
+		// An unrecognized status must still be visible rather than silently absent.
+		poolStatus.WithLabelValues(snapshot.Pool, current).Set(1)
+	}
+
+	healthy := 0.0
+	if snapshot.Healthy {
+		healthy = 1
+	}
+	poolHealthy.WithLabelValues(snapshot.Pool).Set(healthy)
+
+	function := snapshot.ScanFunction
+	if function == "" {
+		function = "NONE"
+	}
+	currentScan := strings.ToUpper(strings.TrimSpace(snapshot.ScanState))
+	for _, label := range poolScanStateLabels {
+		value := 0.0
+		if label == currentScan {
+			value = 1
+		}
+		poolScanState.WithLabelValues(snapshot.Pool, function, label).Set(value)
+	}
+
+	poolScanErrors.WithLabelValues(snapshot.Pool).Set(float64(snapshot.ScanErrors))
+	poolDiskTempAlerts.WithLabelValues(snapshot.Pool).Set(float64(snapshot.TemperatureAlerts))
 }
 
 // SetPoolCapacityMetrics publishes the latest parent-dataset capacity sample.

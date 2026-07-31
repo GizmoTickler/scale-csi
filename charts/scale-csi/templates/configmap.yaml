@@ -181,6 +181,17 @@ data:
       {{- end }}
     {{- end }}
 
+    {{- if .Values.backendHealth.enabled }}
+    # Read-only backend-health poller (opt-in). Each tick is at most TWO reads
+    # (pool.query + disk.temperature_alerts) and performs no writes. The block
+    # renders ONLY when enabled so the default ConfigMap carries no
+    # backendHealth: key and stays parseable by a rolled-back binary; the driver
+    # default (off) is the source of truth when the block is absent.
+    backendHealth:
+      enabled: true
+      interval: {{ .Values.backendHealth.interval | default "60s" | quote }}
+    {{- end }}
+
     resilience:
       circuitBreaker:
         enabled: {{ .Values.resilience.circuitBreaker.enabled }}

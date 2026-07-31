@@ -92,6 +92,51 @@ type MockClient struct {
 	SpecialVdevPresent bool
 	SpecialVdevCalls   int
 	InjectPoolError    error
+
+	// Backend health surfaces.
+	PoolHealthValue    *PoolHealthSnapshot
+	PoolHealthCalls    int
+	TemperatureAlerts  []string
+	TempAlertCalls     int
+	InjectHealthError  error
+	InjectTempAlertErr error
+}
+
+func (m *MockClient) PoolHealth(ctx context.Context, pool string) (*PoolHealthSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.PoolHealthCalls++
+	if m.InjectHealthError != nil {
+		return nil, m.InjectHealthError
+	}
+	if m.PoolHealthValue != nil {
+		clone := *m.PoolHealthValue
+		clone.Pool = pool
+		clone.Disks = append([]string(nil), m.PoolHealthValue.Disks...)
+		return &clone, nil
+	}
+	return &PoolHealthSnapshot{
+		Pool:         pool,
+		Status:       PoolStatusOnline,
+		Healthy:      true,
+		ScanFunction: PoolScanFunctionScrub,
+		ScanState:    PoolScanStateFinished,
+		Disks:        []string{"nvme0n1", "nvme1n1"},
+		SampledAt:    time.Now(),
+	}, nil
+}
+
+func (m *MockClient) DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(names) == 0 {
+		return nil, nil
+	}
+	m.TempAlertCalls++
+	if m.InjectTempAlertErr != nil {
+		return nil, m.InjectTempAlertErr
+	}
+	return append([]string(nil), m.TemperatureAlerts...), nil
 }
 
 func (m *MockClient) ZFSPropertyChoices(ctx context.Context) (*ZFSPropertyChoices, error) {

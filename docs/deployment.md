@@ -225,6 +225,14 @@ The full `capacity.*` surface (all default off):
 | `capacity.reportMaximumVolumeSize` | Set `GetCapacityResponse.maximum_volume_size` to the parent dataset's available bytes. Appropriate **only** for thick/reserved zvol deployments (`zfs.zvolEnableReservation: true`); under thin overcommit a hard maximum makes the scheduler wrongly reject legitimate volumes |
 | `capacity.gaugeEnabled` | Run a controller-only poll loop exporting `scale_csi_pool_available_bytes` / `scale_csi_pool_capacity_bytes` |
 | `capacity.gaugeInterval` | Gauge cadence; default `60s`, values below `30s` clamp to `30s` |
+| `backendHealth.enabled` | Run a controller-only **read-only** pool-health poller (`pool.query` + `disk.temperature_alerts`) that fans pool health onto every managed PVC's `VolumeCondition` and exports the `scale_csi_pool_status`/`_healthy`/`_scan_state`/`_scan_errors`/`_disk_temp_alerts` gauges. Default off; see `docs/production.md` |
+| `backendHealth.interval` | Health poll cadence; default `60s`, values below `30s` clamp to `30s` |
+| `csidriver.fsGroupPolicy` | `CSIDriver.spec.fsGroupPolicy`; default `File` (unchanged). Set `None` only on a fresh install committed to driver-applied NFSv4 ACLs — see `docs/reference/storageclass.md` |
+| `nfs.shareSecurity` | Default `sharing.nfs` security list (`SYS`/`KRB5`/`KRB5I`/`KRB5P`); empty omits the field, keeping the TrueNAS default |
+| `nfs.shareExposeSnapshots` | Publish the read-only `.zfs/snapshot` tree through new exports |
+| `nfs.krbEnabled` | Acknowledge that Kerberos is configured on the NFS service; required before `KRB5*` share security is accepted |
+| `nfs.versionPreflight` | Validate a StorageClass's pinned NFS version against the global `nfs.config` protocols |
+| `nfs.ensureProtocols` | **HARD RULE, opt-in:** mutate the GLOBAL TrueNAS NFS service to enable these major versions. Affects every export on the appliance, driver-managed or not |
 
 Cost and cleanup caveats:
 

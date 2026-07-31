@@ -61,6 +61,10 @@ type Config struct {
 	// gauge loop. The zero value disables every capacity feature.
 	Capacity CapacityConfig `yaml:"capacity"`
 
+	// BackendHealth configures the read-only pool-health poller that drives
+	// per-PVC VolumeCondition and the scale_csi_pool_* health gauges.
+	BackendHealth BackendHealthConfig `yaml:"backendHealth"`
+
 	// Node configuration (node plugin only)
 	Node NodeConfig `yaml:"node"`
 
@@ -529,6 +533,38 @@ func (c CapacityConfig) GaugeIntervalDuration() (time.Duration, error) {
 	}
 	if interval < minCapacityGaugeInterval {
 		return minCapacityGaugeInterval, nil
+	}
+	return interval, nil
+}
+
+// BackendHealthConfig configures the controller-only backend-health poller.
+type BackendHealthConfig struct {
+	// Enabled starts a READ-ONLY poll loop that samples the parent dataset's pool
+	// health (pool.query) plus its member disks' temperature alerts
+	// (disk.temperature_alerts), fans the result out onto every managed volume's
+	// CSI VolumeCondition, and publishes the scale_csi_pool_* gauges.
+	//
+	// DEFAULT OFF. Enabling it costs at most TWO reads per Interval per
+	// controller and performs no writes at all; leaving it off keeps
+	// VolumeCondition semantics byte-identical to the pre-GF5 driver.
+	Enabled bool `yaml:"enabled"`
+
+	// Interval is the poll cadence. Values below the 30s floor are clamped to it.
+	// Default (empty) resolves to 60s.
+	Interval string `yaml:"interval"`
+}
+
+// IntervalDuration resolves the poll cadence, applying the default and floor.
+func (c BackendHealthConfig) IntervalDuration() (time.Duration, error) {
+	if strings.TrimSpace(c.Interval) == "" {
+		return 60 * time.Second, nil
+	}
+	interval, err := time.ParseDuration(c.Interval)
+	if err != nil {
+		return 0, err
+	}
+	if interval < minBackendHealthInterval {
+		return minBackendHealthInterval, nil
 	}
 	return interval, nil
 }

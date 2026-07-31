@@ -297,6 +297,16 @@ func (c *apiCallCountingClient) PoolHasSpecialVdev(ctx context.Context, pool str
 	return c.MockClient.PoolHasSpecialVdev(ctx, pool)
 }
 
+func (c *apiCallCountingClient) PoolHealth(ctx context.Context, pool string) (*truenas.PoolHealthSnapshot, error) {
+	c.record("PoolHealth")
+	return c.MockClient.PoolHealth(ctx, pool)
+}
+
+func (c *apiCallCountingClient) DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error) {
+	c.record("DiskTemperatureAlerts")
+	return c.MockClient.DiskTemperatureAlerts(ctx, names)
+}
+
 func (c *apiCallCountingClient) FilesystemGetACL(ctx context.Context, path string) (*truenas.FilesystemACL, error) {
 	c.record("FilesystemGetACL")
 	return c.MockClient.FilesystemGetACL(ctx, path)

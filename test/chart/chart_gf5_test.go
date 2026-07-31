@@ -268,3 +268,76 @@ func TestChartGF5ZFSPerformanceClass(t *testing.T) {
 		}
 	})
 }
+
+// TestChartGF5BackendHealthPlumbing proves the backend-health block renders only
+// when enabled (byte-identical default), that the gated alerts appear with it,
+// and that the interval is plumbed.
+func TestChartGF5BackendHealthPlumbing(t *testing.T) {
+	t.Run("default configmap carries no backendHealth block", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml")
+		if strings.Contains(out, "backendHealth") {
+			t.Errorf("default configmap render must not contain backendHealth; got:\n%s", out)
+		}
+	})
+
+	t.Run("enabled renders the block with its interval", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "backendHealth.enabled=true")
+		if !strings.Contains(out, "    backendHealth:\n      enabled: true\n      interval: \"60s\"\n") {
+			t.Errorf("backendHealth block did not render; got:\n%s", out)
+		}
+		out = helmTemplate(t, "--show-only", "templates/configmap.yaml",
+			"--set", "backendHealth.enabled=true", "--set", "backendHealth.interval=5m")
+		if !strings.Contains(out, "interval: \"5m\"") {
+			t.Errorf("backendHealth.interval did not propagate; got:\n%s", out)
+		}
+	})
+
+	t.Run("health alerts are gated on the poller", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+			"--set", "metrics.prometheusRule.enabled=true")
+		for _, alert := range []string{"ScaleCSIPoolDegraded", "ScaleCSIPoolScanErrors", "ScaleCSIPoolDiskTemperatureAlert"} {
+			if strings.Contains(out, alert) {
+				t.Errorf("%s must not render without backendHealth.enabled; got:\n%s", alert, out)
+			}
+		}
+
+		out = helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+			"--set", "metrics.prometheusRule.enabled=true", "--set", "backendHealth.enabled=true")
+		for _, alert := range []string{"ScaleCSIPoolDegraded", "ScaleCSIPoolScanErrors", "ScaleCSIPoolDiskTemperatureAlert"} {
+			if !strings.Contains(out, alert) {
+				t.Errorf("%s did not render with backendHealth.enabled; got:\n%s", alert, out)
+			}
+		}
+		// The alert must use the SAME severity split as the VolumeCondition path,
+		// so an alert and a PVC event can never disagree.
+		if !strings.Contains(out, `status=~"DEGRADED|FAULTED|UNAVAIL"`) {
+			t.Errorf("ScaleCSIPoolDegraded must match the VolumeCondition severity split; got:\n%s", out)
+		}
+		if strings.Contains(out, `status=~"DEGRADED|FAULTED|UNAVAIL|OFFLINE`) {
+			t.Errorf("OFFLINE/REMOVED must not raise a critical alert; got:\n%s", out)
+		}
+	})
+
+	t.Run("schema rejects an unknown backendHealth key", func(t *testing.T) {
+		if out := helmTemplateExpectError(t, "--set", "backendHealth.bogus=true"); !strings.Contains(out, "backendHealth") {
+			t.Errorf("schema did not reject an unknown backendHealth key; got:\n%s", out)
+		}
+	})
+}
+
+// TestChartGF5BackendHealthDashboardPanel proves the health panel ships with the
+// dashboard and references only registered metrics (the drift test covers the
+// name check; this covers presence).
+func TestChartGF5BackendHealthDashboardPanel(t *testing.T) {
+	out := helmTemplate(t, "--show-only", "templates/grafana-dashboard.yaml", "--set", "metrics.dashboards.enabled=true")
+	for _, want := range []string{
+		"Backend Pool Health",
+		"scale_csi_pool_healthy",
+		"scale_csi_pool_scan_state",
+		"scale_csi_pool_disk_temp_alerts",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dashboard is missing %q; got a %d-byte render", want, len(out))
+		}
+	}
+}

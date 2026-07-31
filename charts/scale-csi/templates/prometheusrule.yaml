@@ -206,5 +206,35 @@ spec:
             summary: Scale CSI backend pool is nearly full
             description: Parent dataset usable capacity is above the configured threshold.
         {{- end }}
+        {{- if .Values.backendHealth.enabled }}
+        - alert: ScaleCSIPoolDegraded
+          # DEGRADED/FAULTED/UNAVAIL only. OFFLINE/REMOVED are excluded: an
+          # offline spare or a removed cache device does not put the data path at
+          # risk. This is the SAME severity split the per-PVC VolumeCondition
+          # applies, so an alert and a PVC event can never disagree.
+          expr: max(scale_csi_pool_status{status=~"DEGRADED|FAULTED|UNAVAIL"}) by (pool) == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Scale CSI backend pool is degraded
+            description: The ZFS pool backing every Scale CSI volume reports a degraded, faulted or unavailable state. Every managed PVC on this pool is also reporting an abnormal VolumeCondition.
+        - alert: ScaleCSIPoolScanErrors
+          expr: max(scale_csi_pool_scan_errors) by (pool) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI backend pool scrub reported errors
+            description: The pool's most recent scrub or resilver reported unrecovered errors.
+        - alert: ScaleCSIPoolDiskTemperatureAlert
+          expr: max(scale_csi_pool_disk_temp_alerts) by (pool) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI backend pool has a disk temperature alert
+            description: At least one member disk of the pool backing Scale CSI volumes is raising a temperature alert.
+        {{- end }}
         {{- end }}
 {{- end }}

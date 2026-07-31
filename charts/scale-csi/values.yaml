@@ -52,6 +52,31 @@ capacity:
   # Poll cadence for the capacity gauge loop. Values below 30s are clamped to it.
   gaugeInterval: 60s
 
+# Backend health -> per-PVC VolumeCondition + scale_csi_pool_* gauges.
+#
+# ZFS exposes NO per-dataset health signal: health is a per-POOL fact (plus
+# per-disk temperature). Every volume this driver manages lives on ONE pool, so
+# a pool condition is legitimately attributable to all of them and is fanned out
+# onto every managed PVC's CSI VolumeCondition, which the external health
+# monitor turns into PVC events.
+#
+# Severity is deliberately conservative: DEGRADED/FAULTED/UNAVAIL marks volumes
+# Abnormal, while a routine scrub/resilver or a disk temperature alert only adds
+# a descriptive message — a monthly scrub must never mark every PVC unhealthy.
+#
+# STEADY-STATE API COST when enabled: at most TWO reads (pool.query +
+# disk.temperature_alerts) per interval PER CONTROLLER REPLICA, and zero writes.
+# Like the capacity gauge loop it has no leader-election gate; the supported
+# configuration is controller.replicas=1. No effect on the CreateVolume /
+# publish / unpublish request-path golden totals.
+#
+# Default OFF so an upgrade changes neither the rendered manifest nor the
+# VolumeCondition semantics of existing volumes.
+backendHealth:
+  enabled: false
+  # Poll cadence. Values below 30s are clamped to it.
+  interval: 60s
+
 # Stable ownership identity stamped on newly-created datasets/zvols. Empty
 # derives "<csiDriverName>@<zfs.parentDataset>". Never change this for an
 # existing installation unless the matching datasets are deliberately adopted.

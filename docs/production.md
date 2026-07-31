@@ -345,6 +345,49 @@ Five metric families added in v1.4.0 (the existing documented names still match
   pool free/total; **present only when `capacity.gaugeEnabled`**, and they drive
   `ScaleCSIPoolNearFull`.
 
+### Backend health (`backendHealth.enabled`, default off)
+
+Enabling `backendHealth.enabled` starts a controller-only, **read-only** poll
+loop: at most two calls per interval (`pool.query` +
+`disk.temperature_alerts`), no writes, default cadence 60s (30s floor). Like the
+capacity gauge loop it has no leader-election gate, so run
+`controller.replicas=1`. It does not touch the CreateVolume/publish/unpublish
+request path.
+
+ZFS exposes **no per-dataset health**. Health is a per-POOL fact plus a per-disk
+temperature signal. Every volume this driver manages lives on one pool, so the
+pool condition is fanned out onto **every managed PVC's `VolumeCondition`** — a
+deliberate attribution, not an approximation, and the finest granularity ZFS
+makes available.
+
+Severity is conservative, and identical between the PVC condition and the
+bundled alerts so the two can never disagree:
+
+| Backend state | `VolumeCondition` | Alert |
+|---|---|---|
+| `DEGRADED` / `FAULTED` / `UNAVAIL` | `Abnormal: true` | `ScaleCSIPoolDegraded` (critical) |
+| `OFFLINE` / `REMOVED` | normal | none — an offline spare is not a data-path risk |
+| scrub or resilver in progress | normal, with a progress message | none — routine maintenance |
+| last scan reported errors | normal, with a message | `ScaleCSIPoolScanErrors` (warning) |
+| member disk temperature alert | normal, with a message | `ScaleCSIPoolDiskTemperatureAlert` (warning) |
+
+A dataset-level `provision_success=false` still outranks any pool signal: the
+more specific marker wins.
+
+New gauges, all labeled by `pool` and present only while the poller runs:
+
+- `scale_csi_pool_status{pool,status}` — one-hot; exactly one status label is
+  `1` and the rest are explicitly `0`, so a recovered pool cannot leave a stale
+  `DEGRADED` series alerting forever;
+- `scale_csi_pool_healthy{pool}`;
+- `scale_csi_pool_scan_state{pool,function,state}` — one-hot scrub/resilver
+  state, deliberately separate from `pool_healthy`;
+- `scale_csi_pool_scan_errors{pool}`;
+- `scale_csi_pool_disk_temp_alerts{pool}`.
+
+A failed sample leaves the previous snapshot in place: a transient backend blip
+must not flip every PVC's condition, and slightly stale health beats none.
+
 The bundled rules use distinct expressions, rate windows, and `for` durations —
 do not collapse them into one sentence:
 

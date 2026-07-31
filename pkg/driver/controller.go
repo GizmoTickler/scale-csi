@@ -1545,7 +1545,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 			// Entry.Status.VolumeCondition; leaving it nil made its nil-safe
 			// getters report every listed volume as normal (codex H1).
 			Status: &csi.ListVolumesResponse_VolumeStatus{
-				VolumeCondition: volumeConditionFromDataset(ds),
+				VolumeCondition: d.volumeCondition(ds),
 			},
 		})
 	}
@@ -2017,7 +2017,7 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 		// backend object exists; abnormal is reserved for a definitive negative
 		// marker (see volumeConditionFromDataset).
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			VolumeCondition: volumeConditionFromDataset(ds),
+			VolumeCondition: d.volumeCondition(ds),
 		},
 	}, nil
 }

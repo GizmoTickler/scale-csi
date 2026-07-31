@@ -316,3 +316,103 @@ func TestPoolHasSpecialVdev(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+func TestPoolHealth(t *testing.T) {
+	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+		"pool.query": static([]interface{}{map[string]interface{}{
+			"name":          "flashstor",
+			"status":        "degraded",
+			"healthy":       false,
+			"warning":       true,
+			"status_detail": "One or more devices are faulted.",
+			"scan": map[string]interface{}{
+				"function":   "resilver",
+				"state":      "scanning",
+				"percentage": 42.5,
+				"errors":     float64(3),
+			},
+			"topology": map[string]interface{}{
+				"data": []interface{}{map[string]interface{}{
+					"type": "RAIDZ1",
+					"children": []interface{}{
+						map[string]interface{}{"disk": "nvme1n1"},
+						map[string]interface{}{"disk": "nvme0n1"},
+						map[string]interface{}{"disk": "nvme0n1"},
+					},
+				}},
+				"special": []interface{}{map[string]interface{}{"disk": "nvme9n1"}},
+				"cache":   []interface{}{},
+			},
+		}}),
+	})
+
+	snapshot, err := client.PoolHealth(context.Background(), "flashstor")
+	require.NoError(t, err)
+	assert.Equal(t, PoolStatusDegraded, snapshot.Status, "status is normalized to upper case")
+	assert.False(t, snapshot.Healthy)
+	assert.True(t, snapshot.Warning)
+	assert.Equal(t, PoolScanFunctionResilver, snapshot.ScanFunction)
+	assert.Equal(t, PoolScanStateScanning, snapshot.ScanState)
+	assert.InDelta(t, 42.5, snapshot.ScanPercentage, 0.001)
+	assert.Equal(t, int64(3), snapshot.ScanErrors)
+	assert.Equal(t, []string{"nvme0n1", "nvme1n1", "nvme9n1"}, snapshot.Disks,
+		"member disks are deduplicated, sorted, and collected across every topology class")
+	assert.True(t, snapshot.Degraded())
+	assert.True(t, snapshot.Scanning())
+	assert.False(t, snapshot.SampledAt.IsZero())
+}
+
+func TestPoolHealthSeverityHelpers(t *testing.T) {
+	var nilSnapshot *PoolHealthSnapshot
+	assert.False(t, nilSnapshot.Degraded())
+	assert.False(t, nilSnapshot.Scanning())
+
+	for _, status := range []string{PoolStatusDegraded, PoolStatusFaulted, PoolStatusUnavail} {
+		assert.True(t, (&PoolHealthSnapshot{Status: status}).Degraded(), status)
+	}
+	// OFFLINE/REMOVED are not data-path risks.
+	for _, status := range []string{PoolStatusOnline, PoolStatusOffline, PoolStatusRemoved, ""} {
+		assert.False(t, (&PoolHealthSnapshot{Status: status}).Degraded(), status)
+	}
+}
+
+func TestPoolHealthMissingPool(t *testing.T) {
+	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+		"pool.query": static([]interface{}{}),
+	})
+	_, err := client.PoolHealth(context.Background(), "nope")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestDiskTemperatureAlerts(t *testing.T) {
+	t.Run("empty names short circuits without an API call", func(t *testing.T) {
+		client := gf5TestClient(t, nil)
+		alerts, err := client.DiskTemperatureAlerts(context.Background(), nil)
+		require.NoError(t, err)
+		assert.Empty(t, alerts)
+	})
+
+	t.Run("healthy backend returns no alerts", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"disk.temperature_alerts": static([]interface{}{}),
+		})
+		alerts, err := client.DiskTemperatureAlerts(context.Background(), []string{"nvme0n1"})
+		require.NoError(t, err)
+		assert.Empty(t, alerts)
+	})
+
+	t.Run("both string and object alert shapes are captured", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"disk.temperature_alerts": static([]interface{}{
+				"nvme0n1 is too hot",
+				map[string]interface{}{"device": "nvme1n1"},
+				map[string]interface{}{"formatted": "nvme2n1 at 80C"},
+				map[string]interface{}{"unexpected": "shape"},
+			}),
+		})
+		alerts, err := client.DiskTemperatureAlerts(context.Background(), []string{"nvme0n1", "nvme1n1", "nvme2n1"})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"nvme0n1 is too hot", "nvme1n1", "nvme2n1 at 80C"}, alerts)
+	})
+}
