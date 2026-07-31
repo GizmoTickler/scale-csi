@@ -126,7 +126,13 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	}
 	initiatorID := 0
 	for _, g := range initiators {
-		if g.Initiators == nil && !strings.HasPrefix(strings.TrimSpace(g.Comment), "scale-csi fencing:") {
+		// Allow-all reuse accepts nil OR empty initiator lists: TrueNAS 26.0
+		// query returns [] for allow-all groups (SCST renders them INITIATOR *,
+		// live-verified 2026-07-31 drill), and 26.0 rejects the legacy null
+		// create shape outright — so nil-only matching left fresh installs with
+		// no reusable group AND a doomed create. Fencing's deliberate deny-all
+		// [] groups are excluded by their comment prefix, not by shape.
+		if len(g.Initiators) == 0 && !strings.HasPrefix(strings.TrimSpace(g.Comment), "scale-csi fencing:") {
 			initiatorID = g.ID
 			break
 		}
