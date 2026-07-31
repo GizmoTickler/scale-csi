@@ -26,6 +26,14 @@ const (
 	nodeIdentityFieldIQN  = byte(3)
 	nodeIdentityFieldIPv4 = byte(4)
 	nodeIdentityFieldIPv6 = byte(5)
+	// nodeIdentityFieldISCSISentinelReported is a flag field set when a node
+	// physically reported the reserved deny-all sentinel as its own iSCSI
+	// initiator IQN. Its ISCSIIQN is blanked (never packed as a grant), but this
+	// marker still travels in node_id so the controller can HARD-fail publication
+	// fail-closed instead of mistaking the collision for a temporarily-missing IQN
+	// and deferring it (which would persist a success record while the deny-all
+	// group implicitly authorizes that node's real initiator).
+	nodeIdentityFieldISCSISentinelReported = byte(6)
 )
 
 // NodeIdentity is the durable identity carried by NodeGetInfo and copied into
@@ -38,6 +46,13 @@ type NodeIdentity struct {
 	ISCSIIQN string
 	IPs      []net.IP
 	Legacy   bool
+
+	// ISCSIReportedSentinel is true when discovery read the reserved deny-all
+	// sentinel from the node's initiatorname.iscsi. ISCSIIQN is then blanked so the
+	// sentinel can never be enforced as a grant, but this distinct signal is
+	// preserved (and round-tripped through node_id) so publish validation rejects
+	// the node NON-DEFERABLY rather than treating it as a temporarily-missing IQN.
+	ISCSIReportedSentinel bool
 }
 
 var (
@@ -85,6 +100,15 @@ func encodeNodeIdentity(identity NodeIdentity) (string, error) {
 	}
 	if raw, err = appendNodeIdentityField(raw, nodeIdentityFieldIQN, []byte(identity.ISCSIIQN)); err != nil {
 		return "", err
+	}
+	if identity.ISCSIReportedSentinel {
+		// Mandatory, non-truncatable marker: a node that reported the reserved
+		// sentinel must remain distinguishable at the controller so publish
+		// fail-closes rather than defers. Packed before the optional IPs so it can
+		// never be dropped by the CSI size-limit trimming below.
+		if raw, err = appendNodeIdentityField(raw, nodeIdentityFieldISCSISentinelReported, []byte{1}); err != nil {
+			return "", err
+		}
 	}
 	if len(nodeIdentityPrefix)+base64.RawURLEncoding.EncodedLen(len(raw)) > maxCSINodeIDBytes {
 		return "", fmt.Errorf("node name and transport identities exceed CSI's %d-byte node_id limit", maxCSINodeIDBytes)
@@ -170,6 +194,10 @@ func parseNodeIdentity(nodeID string) (NodeIdentity, error) {
 				return NodeIdentity{}, fmt.Errorf("invalid IPv6 identity length")
 			}
 			identity.IPs = append(identity.IPs, net.IP(append([]byte(nil), value...)))
+		case nodeIdentityFieldISCSISentinelReported:
+			// The node reported the reserved deny-all sentinel as its own IQN.
+			// Surface it so the controller hard-fails publication fail-closed.
+			identity.ISCSIReportedSentinel = true
 		default:
 			// Reserved for future identity types.
 		}
@@ -195,6 +223,10 @@ func nodeIdentityForEnabledProtocols(identity NodeIdentity, config *Config) Node
 	}
 	if !config.ISCSI.Enabled {
 		identity.ISCSIIQN = ""
+		// No iSCSI publish is possible on this node, so the sentinel-collision
+		// signal is moot; drop it so it never travels in node_id for a
+		// non-iSCSI deployment.
+		identity.ISCSIReportedSentinel = false
 	}
 	if !config.NVMeoF.Enabled {
 		identity.NVMeNQN = ""
@@ -255,8 +287,14 @@ func discoverNodeIdentity(ctx context.Context, nodeName string) NodeIdentity {
 		// misconfigured initiatorname.iscsi cannot put the sentinel into node_id;
 		// the node plugin still starts for other protocols, but fenced iSCSI
 		// publish fails closed until a real IQN is reported.
-		klog.Warningf("discoverNodeIdentity: node %s reported the reserved iSCSI fencing identity %q; ignoring it as a node IQN", nodeName, identity.ISCSIIQN)
+		klog.Warningf("discoverNodeIdentity: node %s reported the reserved iSCSI fencing identity %q; ignoring it as a node IQN and marking the collision so fenced iSCSI publish fails closed", nodeName, identity.ISCSIIQN)
 		identity.ISCSIIQN = ""
+		// Do NOT blank this into a plain "missing IQN": that would enter the
+		// deferable/additive rolling-upgrade path and persist a success record while
+		// the node's real initiator (the sentinel) is authorized by the deny-all
+		// group. Carry a distinct signal so publish validation hard-fails
+		// non-deferably (see validateOrDeferFencingIdentity).
+		identity.ISCSIReportedSentinel = true
 	}
 	for _, envName := range []string{"NODE_IP", "NODE_IPS"} {
 		for _, value := range strings.FieldsFunc(os.Getenv(envName), func(r rune) bool { return r == ',' || r == ' ' }) {

@@ -1179,7 +1179,15 @@ func TestAdditiveDeferredAndValidISCSIPublishesPreserveLegacyAllowAll(t *testing
 		}
 	}
 	assert.True(t, staticPreserved, "additive must retain the legacy allow-all target group")
-	assert.True(t, dynamicPresent, "the enforceable peer still receives its CSI-owned group")
+	// Round-3 F1: while a deferred-live peer (legacy-worker, IQN unresolved) exists,
+	// the enforceable peer's initiator-group mutation is SKIPPED verbatim rather than
+	// partially applied. Both nodes keep access via the preserved legacy allow-all
+	// group; the CSI-owned restrictive group is created only once every active
+	// identity resolves and a later reconcile converges. (Under the round-2 rule this
+	// asserted dynamicPresent==true — the very partial-application that dropped a live
+	// deferred peer's grant when no legacy allow-all group cushioned it.)
+	assert.False(t, dynamicPresent,
+		"a deferred-live peer must defer the whole mutation; the enforceable peer must not get its own group yet")
 }
 
 func TestAdditiveNVMePublishAndUnpublishPreserveAllowAnyHost(t *testing.T) {
@@ -2265,6 +2273,152 @@ func TestISCSIFenceDeferredActiveIdentityPreservesExistingGrant(t *testing.T) {
 		"a deferred-live identity must preserve the existing real-IQN grant, not collapse to deny-all")
 	assert.NotContains(t, initiator.Initiators, iscsiDenyAllSentinelIQN,
 		"the deny-all sentinel must never be written while a live identity is merely unresolved")
+}
+
+// TestISCSIFenceDeferredActivePeerWithEnforceablePeerPreservesWholeGroup pins the
+// round-3 F1 fix: when a LIVE deferred iSCSI identity (IQN momentarily
+// unresolvable) coexists with an enforceable peer, applyBackendFence must NOT
+// mutate the initiator group to the enforceable subset — doing so would drop the
+// deferred node's last-known grant and self-fence a live node. The group must be
+// left VERBATIM (both peers retained), the deny-all sentinel must be absent, and
+// zero initiator-group updates must occur, until every active identity resolves.
+// Revert-sensitive: with the round-2 guard (skip only when len(iqns)==0), the
+// non-empty enforceable set [B] replaces the group and this fails ([A,B] -> [B]).
+func TestISCSIFenceDeferredActivePeerWithEnforceablePeerPreservesWholeGroup(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	client.RejectEmptyISCSITargetGroups = true
+	datasetName := "pool/parent/mixed-deferred-iscsi"
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	// Converged pre-blip state: the CSI fencing group holds BOTH nodes' real IQNs.
+	iqnA := "iqn.1993-08.org.debian:worker-a"
+	iqnB := "iqn.1993-08.org.debian:worker-b"
+	dynamic, err := client.ISCSIInitiatorCreateWithInitiators(ctx, []string{iqnA, iqnB}, "scale-csi fencing: "+datasetName)
+	require.NoError(t, err)
+	target, err := client.ISCSITargetCreate(ctx, "mixed-deferred-iscsi", "", "ISCSI", []truenas.ISCSITargetGroup{{
+		Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE",
+	}})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperties(ctx, datasetName, map[string]string{
+		PropISCSITargetID:    strconv.Itoa(target.ID),
+		PropISCSIInitiatorID: strconv.Itoa(dynamic.ID),
+	}))
+	d := &Driver{
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeAdditive},
+			ISCSI:   ISCSIConfig{TargetPortal: "203.0.113.250:3260"}, // deliberately unresolvable: no mutation must occur
+		},
+		truenasClient: client,
+	}
+
+	// worker-a is LIVE but its IQN is momentarily unresolvable -> additive defers it
+	// (durable record kept, no resolvable IQN). worker-b reports a real IQN and is
+	// enforceable. The deferred-active peer must still preserve the whole group.
+	recordA, err := newPublicationRecord(NodeIdentity{Name: "worker-a"}, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	recordB, err := newPublicationRecord(NodeIdentity{Name: "worker-b", ISCSIIQN: iqnB}, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER, false)
+	require.NoError(t, err)
+	records := map[string]publicationRecord{
+		publicationPropertyKey("worker-a"): recordA,
+		publicationPropertyKey("worker-b"): recordB,
+	}
+
+	require.NoError(t, d.applyBackendFence(ctx, dataset, datasetName, ShareTypeISCSI, records, nil))
+
+	initiator, err := client.ISCSIInitiatorGet(ctx, dynamic.ID)
+	require.NoError(t, err)
+	require.NotNil(t, initiator)
+	assert.Equal(t, []string{iqnA, iqnB}, initiator.Initiators,
+		"a deferred-live peer must preserve the ENTIRE existing group, never collapse to the enforceable subset [B]")
+	assert.NotContains(t, initiator.Initiators, iscsiDenyAllSentinelIQN,
+		"the deny-all sentinel must never be written while a live identity is merely unresolved")
+	// The target relationship must also be untouched (no ISCSITargetUpdate churn).
+	freshTarget, err := client.ISCSITargetGet(ctx, target.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []truenas.ISCSITargetGroup{{Portal: 7, Initiator: dynamic.ID, AuthMethod: "NONE"}}, freshTarget.Groups,
+		"deferring the mutation must leave the target's portal/initiator relationship verbatim")
+}
+
+// TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed pins the round-3
+// F2 fix: a node whose initiatorname.iscsi is the reserved deny-all sentinel must
+// be HARD-rejected at ControllerPublishVolume (non-deferable), and NO publication
+// record may be persisted. Composes real discovery (blanks the IQN but marks the
+// collision) + node_id encode/parse + additive publish against a dataset that
+// already carries a backend deny-all sentinel group (which would otherwise
+// implicitly authorize this node's real initiator). Revert-sensitive: without the
+// discovery marker + node_id round-trip + non-deferable guard, additive publish
+// defers the empty IQN, returns success, and persists an empty-IQN record.
+func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.iscsi",
+		config: &Config{
+			Fencing: FencingConfig{Mode: FencingModeAdditive},
+			ZFS:     ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
+			ISCSI: ISCSIConfig{
+				Enabled: true, TargetPortal: "192.0.2.10:3260", ExtentBlocksize: 512, ExtentRpm: "SSD",
+			},
+		},
+		truenasClient: client,
+		serviceReloadDebouncer: NewServiceReloadDebouncer(0, func(context.Context, string) error {
+			return nil
+		}),
+	}
+	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	datasetName := "pool/parent/f2-sentinel"
+	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-sentinel", true, true))
+	// Establish the already-present backend deny-all sentinel group (last-unpublish
+	// state). Its sentinel entry is exactly what a sentinel-reporting node's real
+	// initiator would match, which is why publish must fail closed.
+	ds, err = client.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	require.NoError(t, d.applyISCSIFence(ctx, ds, datasetName, nil, false, nil))
+
+	// Real node-side discovery: initiatorname.iscsi carries the reserved sentinel.
+	origRead := nodeReadIdentityFile
+	origCmd := nodeIdentityCommand
+	origAddrs := nodeInterfaceAddrs
+	t.Cleanup(func() {
+		nodeReadIdentityFile = origRead
+		nodeIdentityCommand = origCmd
+		nodeInterfaceAddrs = origAddrs
+	})
+	nodeIdentityCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("nvme not installed")
+	}
+	nodeInterfaceAddrs = func() ([]net.Addr, error) { return nil, nil }
+	nodeReadIdentityFile = func(path string) ([]byte, error) {
+		if path == "/etc/iscsi/initiatorname.iscsi" {
+			return []byte("InitiatorName=" + iscsiDenyAllSentinelIQN + "\n"), nil
+		}
+		return nil, errors.New("no such file")
+	}
+	identity := discoverNodeIdentity(ctx, "worker-sentinel")
+	require.Empty(t, identity.ISCSIIQN, "discovery must blank the sentinel out of the IQN field")
+	require.True(t, identity.ISCSIReportedSentinel, "discovery must mark the sentinel collision as a distinct signal")
+	nodeID, err := encodeNodeIdentity(identity)
+	require.NoError(t, err)
+
+	capability := &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+		Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+	}}
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: "f2-sentinel", NodeId: nodeID, VolumeCapability: capability,
+		VolumeContext: map[string]string{"node_attach_driver": "iscsi"},
+	})
+	require.Error(t, err, "a node reporting the reserved sentinel IQN must hard-fail publication")
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "reserved iSCSI fencing identity")
+
+	fresh, err := client.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	records, err := publicationRecordsFromDataset(fresh)
+	require.NoError(t, err)
+	assert.Empty(t, records, "a hard-rejected sentinel-reporting node must persist NO publication record")
 }
 
 // TestValidateIdentityForProtocolRejectsDenyAllSentinelIQN pins the round-2 F2

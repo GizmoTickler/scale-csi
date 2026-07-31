@@ -377,6 +377,19 @@ func (d *Driver) recordFencingDeferred(identity NodeIdentity, shareType ShareTyp
 // second legacy node cannot bypass SINGLE_NODE semantics, but skips only that
 // node's backend grant. Strict mode preserves the fail-closed contract.
 func (d *Driver) validateOrDeferFencingIdentity(identity NodeIdentity, shareType ShareType) (bool, error) {
+	if shareType == ShareTypeISCSI && identity.ISCSIReportedSentinel {
+		// F2: a node that physically reported the reserved deny-all sentinel as its
+		// own initiator IQN is NOT a temporarily-missing-IQN rolling-upgrade node.
+		// Its real initiator is exactly the sentinel already present in fenced
+		// deny-all groups, so deferring it (additive) would persist a success record
+		// while the deny-all entry implicitly authorizes it. Hard-fail closed and
+		// NON-DEFERABLY in every mode — return the error without recording a deferral,
+		// so ControllerPublishVolume returns it before any publication record or
+		// backend grant is created.
+		return false, status.Errorf(codes.FailedPrecondition,
+			"node %s reported the reserved iSCSI fencing identity %q as its own initiator IQN; it must report a real IQN before publishing this fenced volume",
+			identity.Name, iscsiDenyAllSentinelIQN)
+	}
 	if err := validateIdentityForProtocol(identity, shareType); err != nil {
 		if d.config.Fencing.Mode == FencingModeAdditive {
 			d.recordFencingDeferred(identity, shareType, "missing_identity", err.Error())
@@ -1348,6 +1361,24 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 	if target == nil {
 		return fmt.Errorf("%w: iSCSI target for %s", errFenceBackendAbsent, datasetName)
 	}
+	// F1: if ANY active iSCSI identity is currently deferred (its IQN only
+	// momentarily unresolvable — node re-registration / rolling upgrade), preserve
+	// the existing initiator group VERBATIM, regardless of how many enforceable
+	// peers are present. Mutating now — even to an enforceable subset like [B] —
+	// would drop the deferred node's last-known grant, because we cannot
+	// reconstruct a deferred node's IQN; that self-fences a live node off its OWN
+	// volume. Wait until every active identity resolves; a later reconcile
+	// converges once it does. A departing node's grant may linger transiently,
+	// which is strictly safer than self-fencing a live node and matches the
+	// low-severity original exposure this whole change tightens. Never partially
+	// apply an enforceable subset here, and never write the deny-all sentinel while
+	// an identity is unresolved. (Genuine last-unpublish — zero active AND not
+	// deferred — has hasDeferredActiveISCSI=false and still writes the sentinel
+	// below.)
+	if hasDeferredActiveISCSI {
+		klog.V(2).Infof("iSCSI fence: preserving existing initiator group for %s; an active published identity is unresolved (deferred), skipping the initiator-group mutation until it resolves", datasetName)
+		return nil
+	}
 	// CHAP (authmethod+auth) and fencing (initiator allowlist) are orthogonal
 	// fields of the SAME target group. Rebuilt dynamic groups must retain CHAP or
 	// a fence pass would silently strip it off a CHAP target. The linkage is read
@@ -1361,17 +1392,6 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 		}
 	}
 	iqns = uniqueSortedStrings(iqns)
-	if len(iqns) == 0 && hasDeferredActiveISCSI {
-		// An empty real-IQN allowlist with a deferred-active identity is NOT a
-		// genuine last unpublish: a live publication's IQN is merely unresolved
-		// (re-registration/rolling upgrade), so writing the deny-all sentinel here
-		// would fence the live node off its OWN volume. Leave the existing initiator
-		// group untouched — its current grant (the deferred node's last-known real
-		// IQN) stays in place, and a later reconcile converges once the IQN
-		// resolves. Do not create a sentinel group in this state either.
-		klog.V(2).Infof("iSCSI fence: deferring deny-all; a published identity is unresolved, preserving existing grant for %s", datasetName)
-		return nil
-	}
 	// The group allowlist mirrors the active node IQNs, except on last unpublish
 	// (zero active identities): an EMPTY allowlist is NOT deny-all on TrueNAS 26.0
 	// SCST (it renders INITIATOR *), so the empty case writes a non-matchable
