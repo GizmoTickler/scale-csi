@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
@@ -525,8 +524,16 @@ type cloneWaitErrorClient struct {
 	snapshotDeletes []string
 }
 
-func (m *cloneWaitErrorClient) WaitForZvolReady(context.Context, string, time.Duration) (*truenas.Dataset, error) {
-	return nil, errors.New("injected readiness failure")
+func (m *cloneWaitErrorClient) DatasetGet(ctx context.Context, name string) (*truenas.Dataset, error) {
+	if name == "pool/parent/clone-target" {
+		// Sprint 3 (L1b): clone readiness is confirmed via a single bounded
+		// DatasetGet (confirmCloneReady), not WaitForZvolReady. Model a clone that
+		// never becomes queryable by reporting it absent. The CreateVolume existence
+		// lookup tolerates NotFound and proceeds to clone; the readiness confirmation
+		// then fails and the clone (and any temp source snapshot) must be cleaned up.
+		return m.MockClient.DatasetGet(ctx, "pool/parent/readiness-probe-absent")
+	}
+	return m.MockClient.DatasetGet(ctx, name)
 }
 
 func (m *cloneWaitErrorClient) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {

@@ -2411,6 +2411,60 @@ func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truen
 	}
 }
 
+// cloneReadyRetryDelay is the single bounded retry gap used when confirming a
+// freshly cloned dataset is queryable (L1b). The live probe showed clones are
+// immediately queryable, so this guards transient load only — it is deliberately
+// NOT an exponential poll.
+const cloneReadyRetryDelay = 250 * time.Millisecond
+
+// confirmCloneReady confirms a freshly cloned dataset is queryable. TrueNAS 26.0
+// returns pool.snapshot.clone synchronously queryable (probe-verified on nas01:
+// 10/10 scratch clones immediately queryable with a populated volsize/type and
+// zero retries), so a single DatasetGet suffices; one bounded retry guards the
+// load conditions the probe did not model. When requireVolsize is set (zvol
+// clones) the get must also show type=VOLUME with a populated volsize. Filesystem
+// clones pass requireVolsize=false and return on the first successful get.
+func (d *Driver) confirmCloneReady(ctx context.Context, datasetName string, timeout time.Duration, requireVolsize bool) (*truenas.Dataset, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			delay := cloneReadyRetryDelay
+			if remaining := time.Until(deadline); remaining < delay {
+				if remaining <= 0 {
+					break
+				}
+				delay = remaining
+			}
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context canceled confirming clone %s readiness: %w", datasetName, ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+		ds, err := d.truenasClient.DatasetGet(ctx, datasetName)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if requireVolsize {
+			if ds.Type != "VOLUME" {
+				lastErr = fmt.Errorf("clone %s is type %s, expected VOLUME", datasetName, ds.Type)
+				continue
+			}
+			if volsize, ok := ds.Volsize.Parsed.(float64); !ok || volsize <= 0 {
+				lastErr = fmt.Errorf("clone %s zvol has no populated volsize yet", datasetName)
+				continue
+			}
+		}
+		return ds, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("clone %s was not queryable before the readiness deadline", datasetName)
+	}
+	return nil, fmt.Errorf("confirming clone %s readiness: %w", datasetName, lastErr)
+}
+
 func (d *Driver) handleVolumeContentSource(
 	ctx context.Context,
 	datasetName, volumeName string,
@@ -2499,18 +2553,15 @@ func (d *Driver) handleVolumeContentSource(
 			klog.Infof("Snapshot clone created: %s -> %s", sourceSnapshot, datasetName)
 		}
 
-		// Wait for the new dataset to be ready before proceeding.
-		// This is critical for iSCSI/NVMe-oF where extent creation needs the zvol
-		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
-		if err != nil {
-			if detached {
+		if detached {
+			// Detached snapshot copies use the replication path, which the L1b
+			// synchronous-clone probe did NOT cover; keep the (L1a-tuned) readiness
+			// poll. prepareDetachedSnapshotCopy needs the dataset.
+			createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
+			if err != nil {
 				d.cleanupFailedClone(ctx, datasetName, "")
 				return nil, status.Errorf(codes.Internal, "failed waiting for detached snapshot copy to become ready: %v", err)
 			}
-			return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
-				status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err))
-		}
-		if detached {
 			createdDS, err = d.prepareDetachedSnapshotCopy(
 				ctx, datasetName, createdDS, volumeName, snapshotID, snap.Name, capacityBytes, shareType,
 			)
@@ -2519,14 +2570,28 @@ func (d *Driver) handleVolumeContentSource(
 				return nil, err
 			}
 		} else {
-			var refquota interface{}
-			if createdDS.Type == "FILESYSTEM" && d.config.ZFS.DatasetEnableQuotas && capacityBytes > 0 {
-				refquota = capacityBytes
-			}
-			if createdDS.Type == "VOLUME" {
+			// Sprint 3 (L1b): TrueNAS 26.0 pool.snapshot.clone is synchronously
+			// queryable (probe-verified: 10/10 clones immediately queryable, zero
+			// retries). Zvol clones confirm volsize with a single bounded get; this is
+			// critical for iSCSI/NVMe-oF where extent creation needs the volsize.
+			// Filesystem clones trust the clone response and take their dataset from
+			// the merged property update below — no readiness round trip at all.
+			if shareType.IsBlockProtocol() {
+				createdDS, err = d.confirmCloneReady(ctx, datasetName, cloneReadyTimeout, true)
+				if err != nil {
+					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
+						status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err))
+				}
 				if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
 					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, err)
 				}
+			}
+			// The clone's dataset type is fixed by the share type (NFS->filesystem,
+			// block->zvol), so the filesystem refquota decision no longer needs a
+			// readiness read of createdDS.Type.
+			var refquota interface{}
+			if !shareType.IsBlockProtocol() && d.config.ZFS.DatasetEnableQuotas && capacityBytes > 0 {
+				refquota = capacityBytes
 			}
 			// Sprint 3 (L2a): refquota + content-source identity + the ownership
 			// stamp persist in ONE atomic pool.dataset.update (single ZFS txg;
@@ -2538,6 +2603,8 @@ func (d *Driver) handleVolumeContentSource(
 			// with the marker still present, which the reconciler sweep retires
 			// (identical to the old "crash after #8, before #9"). The marker is still
 			// written before the clone and retired only after this write is durable.
+			// For filesystem clones this update also yields the createdDS the caller
+			// publishes (L1b removed their separate readiness read).
 			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, map[string]string{
 				PropVolumeContentSourceType: "snapshot",
 				PropVolumeContentSourceID:   snapshotID,
@@ -2607,8 +2674,11 @@ func (d *Driver) handleVolumeContentSource(
 		}
 		klog.Infof("Volume clone created: %s -> %s", sourceVolumeID, datasetName)
 
-		// Wait for cloned dataset to be ready
-		createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
+		// Sprint 3 (L1b): the volume clone descends from pool.snapshot.clone (via the
+		// temporary source snapshot), which the probe verified is synchronously
+		// queryable. Confirm with a single bounded get instead of an exponential poll;
+		// the dataset is still fetched here because ensureCloneCapacity needs it.
+		createdDS, err = d.confirmCloneReady(ctx, datasetName, cloneReadyTimeout, shareType.IsBlockProtocol())
 		if err != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
 			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
