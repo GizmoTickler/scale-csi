@@ -269,6 +269,25 @@ spec:
           resources:
             {{- toYaml .Values.sidecars.livenessProbe.resources | nindent 12 }}
 
+        {{- if .Values.sidecars.healthMonitor.enabled }}
+        # External Health Monitor (volume-health; opt-in via
+        # sidecars.healthMonitor.enabled). Emits Events for abnormal volumes;
+        # default off => no container => byte-identical render.
+        - name: csi-external-health-monitor
+          image: {{ .Values.sidecars.healthMonitor.image }}
+          args:
+            - "--csi-address={{ include "scale-csi.socketPath" . }}"
+            - "--leader-election"
+            - "--leader-election-namespace={{ .Release.Namespace }}"
+            - "--monitor-interval={{ .Values.sidecars.healthMonitor.interval }}"
+            - "--v={{ .Values.logging.verbosity }}"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ include "scale-csi.socketDir" . }}
+          resources:
+            {{- toYaml .Values.sidecars.healthMonitor.resources | nindent 12 }}
+        {{- end }}
+
       volumes:
         - name: socket-dir
           emptyDir: {}

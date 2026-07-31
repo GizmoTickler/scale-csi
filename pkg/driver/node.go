@@ -1094,6 +1094,16 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 		}, nil
 	}
 
+	// Bounded liveness pre-gate for filesystem (NFS/remote) volumes: a dead hard
+	// mount can block the statfs below indefinitely. findmnt is bounded by both
+	// the configured mount timeout and the kubelet's inbound RPC deadline, so if
+	// it cannot confirm the mount promptly we report an abnormal condition instead
+	// of hanging the NodeGetVolumeStats RPC. The block-device branch above is
+	// unchanged (no remote mount to gate). No new TrueNAS API calls are involved.
+	if _, mountErr := nodeStatsMountCheck(ctx, volumePath); mountErr != nil {
+		return abnormalVolumeStatsResponse(fmt.Sprintf("mount unresponsive for %s: %v", volumePath, mountErr)), nil
+	}
+
 	// Get filesystem stats
 	stats, err := getNodeFilesystemStats(volumePath)
 	if err != nil {

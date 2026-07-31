@@ -784,6 +784,27 @@
         },
         "livenessProbe": {
           "$ref": "#/definitions/sidecar"
+        },
+        "healthMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "string",
+              "minLength": 1
+            },
+            "interval": {
+              "type": "string",
+              "minLength": 2
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
         }
       }
     },

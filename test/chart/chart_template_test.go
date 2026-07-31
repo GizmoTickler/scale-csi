@@ -237,6 +237,38 @@ func TestChartCapacityConfigPlumbing(t *testing.T) {
 	})
 }
 
+// TestChartHealthMonitorSidecar guards the external-health-monitor sidecar render
+// invariant (E3/K11b). The sidecar and its extra RBAC are strictly opt-in: the
+// default render carries no csi-external-health-monitor container and no health
+// pods watch rule, keeping the default manifest byte-identical. Enabling
+// sidecars.healthMonitor renders the pinned-image container, its monitor-interval,
+// and the pods get/list/watch RBAC delta.
+func TestChartHealthMonitorSidecar(t *testing.T) {
+	t.Run("default render omits the sidecar and its RBAC", func(t *testing.T) {
+		out := helmTemplate(t)
+		if strings.Contains(out, "csi-external-health-monitor") {
+			t.Errorf("default render must not emit the external-health-monitor sidecar; it is opt-in")
+		}
+		if strings.Contains(out, `verbs: ["get", "list", "watch"]`) && strings.Contains(out, "external-health-monitor") {
+			t.Errorf("default render must not emit health-monitor RBAC")
+		}
+	})
+
+	t.Run("enabled renders the sidecar and RBAC", func(t *testing.T) {
+		out := helmTemplate(t, "--set", "sidecars.healthMonitor.enabled=true")
+		for _, want := range []string{
+			"- name: csi-external-health-monitor",
+			"image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0",
+			`"--monitor-interval=60s"`,
+			`resources: ["pods"]`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("--set sidecars.healthMonitor.enabled=true did not render %q", want)
+			}
+		}
+	})
+}
+
 // TestChartSidecarTimeouts pins the CSI sidecar --timeout flags: the attacher and
 // resizer run with a 120s deadline (bounding publish/unpublish/expand), while the
 // provisioner and snapshotter keep 300s. A regression that reverts the

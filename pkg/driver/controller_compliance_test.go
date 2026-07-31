@@ -1133,20 +1133,49 @@ func TestControllerGetVolumeDatasetErrors(t *testing.T) {
 	})
 }
 
-func TestControllerGetVolumeOmitsUnadvertisedVolumeCondition(t *testing.T) {
-	mockClient := truenas.NewMockClient()
-	mockClient.Datasets["pool/parent/volume"] = &truenas.Dataset{
-		ID:             "pool/parent/volume",
-		Name:           "pool/parent/volume",
-		Type:           "FILESYSTEM",
-		UserProperties: make(map[string]truenas.UserProperty),
-	}
-	driver := newComplianceTestDriver(mockClient)
+// TestControllerGetVolumeVolumeCondition proves the advertised VOLUME_CONDITION
+// capability is backed by a populated Volume.Status.VolumeCondition derived from
+// the dataset's already-returned user properties (no extra API call): a fully
+// stamped dataset is healthy, while a missing managed/provision stamp is abnormal.
+func TestControllerGetVolumeVolumeCondition(t *testing.T) {
+	t.Run("unstamped dataset is abnormal", func(t *testing.T) {
+		mockClient := truenas.NewMockClient()
+		mockClient.Datasets["pool/parent/volume"] = &truenas.Dataset{
+			ID:             "pool/parent/volume",
+			Name:           "pool/parent/volume",
+			Type:           "FILESYSTEM",
+			UserProperties: make(map[string]truenas.UserProperty),
+		}
+		driver := newComplianceTestDriver(mockClient)
 
-	response, err := driver.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: "volume"})
+		response, err := driver.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: "volume"})
+		require.NoError(t, err)
+		require.NotNil(t, response.GetStatus())
+		cond := response.GetStatus().GetVolumeCondition()
+		require.NotNil(t, cond)
+		assert.True(t, cond.GetAbnormal())
+		assert.NotEmpty(t, cond.GetMessage())
+	})
 
-	require.NoError(t, err)
-	assert.Nil(t, response.GetStatus())
+	t.Run("fully stamped dataset is healthy", func(t *testing.T) {
+		mockClient := truenas.NewMockClient()
+		mockClient.Datasets["pool/parent/volume"] = &truenas.Dataset{
+			ID:   "pool/parent/volume",
+			Name: "pool/parent/volume",
+			Type: "FILESYSTEM",
+			UserProperties: map[string]truenas.UserProperty{
+				PropManagedResource:  {Value: "true"},
+				PropProvisionSuccess: {Value: "true"},
+			},
+		}
+		driver := newComplianceTestDriver(mockClient)
+
+		response, err := driver.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: "volume"})
+		require.NoError(t, err)
+		cond := response.GetStatus().GetVolumeCondition()
+		require.NotNil(t, cond)
+		assert.False(t, cond.GetAbnormal())
+	})
 }
 
 // FIX 3 regression: a snapshot-sourced CreateVolume chooses clone vs detached

@@ -37,6 +37,7 @@ var (
 	resolveNodeStatsDevice             = nodeStatsDevice
 	getNodeDeviceSize                  = nodeStatsDeviceSize
 	getNodeFilesystemStats             = util.GetFilesystemStats
+	nodeStatsMountCheck                = util.IsMountedWithContext
 	gcListISCSISessions                = util.ListISCSISessions
 	gcDisconnectISCSI                  = util.ISCSIDisconnect
 	gcListNVMeoFSessions               = util.ListNVMeoFSessions

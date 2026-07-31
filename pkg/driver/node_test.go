@@ -1046,11 +1046,14 @@ func TestNodeStatsDeviceSizeRejectsSectorOverflow(t *testing.T) {
 func TestNodeGetVolumeStats_FilesystemModeUnchanged(t *testing.T) {
 	originalResolver := resolveNodeStatsDevice
 	originalFilesystemStats := getNodeFilesystemStats
+	originalMountCheck := nodeStatsMountCheck
 	t.Cleanup(func() {
 		resolveNodeStatsDevice = originalResolver
 		getNodeFilesystemStats = originalFilesystemStats
+		nodeStatsMountCheck = originalMountCheck
 	})
 	resolveNodeStatsDevice = func(string) (string, bool, error) { return "", false, nil }
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return true, nil }
 	getNodeFilesystemStats = func(string) (*util.FilesystemStats, error) {
 		return &util.FilesystemStats{
 			TotalBytes: 100, AvailableBytes: 40, UsedBytes: 60,
@@ -1067,6 +1070,40 @@ func TestNodeGetVolumeStats_FilesystemModeUnchanged(t *testing.T) {
 	assert.Equal(t, int64(100), resp.Usage[0].Total)
 	assert.Equal(t, int64(10), resp.Usage[1].Total)
 	assert.False(t, resp.VolumeCondition.Abnormal)
+}
+
+// TestNodeGetVolumeStats_MountUnresponsiveIsAbnormal proves the bounded liveness
+// pre-gate (E3/K11): when the bounded findmnt check errors/times out, the RPC
+// returns an abnormal VolumeCondition immediately instead of blocking in statfs
+// over a dead hard mount.
+func TestNodeGetVolumeStats_MountUnresponsiveIsAbnormal(t *testing.T) {
+	originalResolver := resolveNodeStatsDevice
+	originalMountCheck := nodeStatsMountCheck
+	originalFilesystemStats := getNodeFilesystemStats
+	t.Cleanup(func() {
+		resolveNodeStatsDevice = originalResolver
+		nodeStatsMountCheck = originalMountCheck
+		getNodeFilesystemStats = originalFilesystemStats
+	})
+	resolveNodeStatsDevice = func(string) (string, bool, error) { return "", false, nil }
+	nodeStatsMountCheck = func(context.Context, string) (bool, error) {
+		return false, errors.New("findmnt timed out on dead NFS hard mount")
+	}
+	// If the pre-gate failed to short-circuit, statfs would be reached; make that
+	// a loud failure rather than a hang.
+	getNodeFilesystemStats = func(string) (*util.FilesystemStats, error) {
+		t.Fatal("statfs must not be reached when the mount check is unresponsive")
+		return nil, nil
+	}
+
+	d := newTestNodeDriver(ShareTypeNFS)
+	resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId: "fs-vol", VolumePath: "/pods/fs-vol",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.VolumeCondition)
+	assert.True(t, resp.VolumeCondition.Abnormal)
+	assert.Contains(t, resp.VolumeCondition.Message, "mount unresponsive")
 }
 
 func TestNodeGetVolumeStats_StatFailureIsAbnormal(t *testing.T) {

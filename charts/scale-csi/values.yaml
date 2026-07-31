@@ -498,6 +498,28 @@ sidecars:
       limits:
         memory: 128Mi
 
+  # External health monitor controller (volume-health sidecar). Strictly opt-in
+  # (default off): with enabled=false no container and no extra RBAC render, so
+  # the default manifest is byte-identical. The node-side stale-mount pre-gate
+  # and controller-side VolumeCondition (both zero-new-API) are always on; this
+  # sidecar additionally emits Kubernetes Events for abnormal volumes.
+  #
+  # STEADY-STATE API COST when enabled: the sidecar issues periodic ListVolumes
+  # plus a per-PV ControllerGetVolume (ONE pool.dataset.query each) on its
+  # monitor-interval. This is background load, NOT part of the request-path
+  # golden totals. Image tag is pinned (G2: v0.18.0 is the current published
+  # release) — do not float it.
+  healthMonitor:
+    enabled: false
+    image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0
+    interval: 60s
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+
 # Service account configuration
 serviceAccount:
   # Create service accounts

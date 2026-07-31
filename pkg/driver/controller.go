@@ -284,6 +284,16 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 			},
 		},
 		{
+			// Meaningful only alongside GET_VOLUME: ControllerGetVolume populates
+			// Volume.Status.VolumeCondition from the dataset's already-returned
+			// user properties (no extra API call).
+			Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_VOLUME_CONDITION,
+				},
+			},
+		},
+		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
@@ -1920,7 +1930,35 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 			VolumeId:      volumeID,
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
+		// VolumeCondition is derived from the dataset's ALREADY-returned user
+		// properties (no extra API call). A dataset-gone case returns NotFound
+		// above, so reaching here means the backend object exists; abnormal is
+		// reserved for a managed/provision stamp that never landed.
+		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
+			VolumeCondition: volumeConditionFromDataset(ds),
+		},
 	}, nil
+}
+
+// volumeConditionFromDataset derives a CSI VolumeCondition from a fetched
+// dataset's user properties without any further API call. A dataset is healthy
+// when it carries both the managed-resource and provision-success stamps; a
+// missing stamp means provisioning never completed (or the object is foreign),
+// which is reported as abnormal with an explanatory message.
+func volumeConditionFromDataset(ds *truenas.Dataset) *csi.VolumeCondition {
+	if datasetUserProperty(ds, PropManagedResource) != "true" {
+		return &csi.VolumeCondition{
+			Abnormal: true,
+			Message:  "dataset is not marked as a CSI-managed resource",
+		}
+	}
+	if datasetUserProperty(ds, PropProvisionSuccess) != "true" {
+		return &csi.VolumeCondition{
+			Abnormal: true,
+			Message:  "dataset provisioning did not complete successfully",
+		}
+	}
+	return &csi.VolumeCondition{Abnormal: false}
 }
 
 // ControllerModifyVolume modifies a volume (not implemented).
