@@ -87,6 +87,11 @@ func (c *apiCallCountingClient) ResetCircuitBreaker() {
 	c.MockClient.ResetCircuitBreaker()
 }
 
+func (c *apiCallCountingClient) AnyConnectionJobSubscribed() bool {
+	c.record("AnyConnectionJobSubscribed")
+	return c.MockClient.AnyConnectionJobSubscribed()
+}
+
 func (c *apiCallCountingClient) DatasetCreate(ctx context.Context, params *truenas.DatasetCreateParams) (*truenas.Dataset, error) {
 	c.record("DatasetCreate")
 	return c.MockClient.DatasetCreate(ctx, params)
