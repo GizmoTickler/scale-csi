@@ -361,6 +361,19 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	capacityBytes := vp.capacityBytes
 	shareType, detached := vp.shareType, vp.detached
 
+	// iSCSI CHAP is strictly opt-in. When this StorageClass opts in, ensure the
+	// shared backend auth peer once (cached per tag) and thread the resolution to
+	// the share builder and volume-context builder via the request context. A
+	// deployment that never enables CHAP skips this entirely, so the non-CHAP
+	// golden RTT counts are unaffected.
+	if shareType == ShareTypeISCSI && d.chapEnabledForCreate(req.GetParameters(), req.GetSecrets()) {
+		chapResolution, chapErr := d.EnsureISCSIAuthPeer(ctx, req.GetSecrets())
+		if chapErr != nil {
+			return nil, chapErr
+		}
+		ctx = withISCSIChAPResolution(ctx, chapResolution)
+	}
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {

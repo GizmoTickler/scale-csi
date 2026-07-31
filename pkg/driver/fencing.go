@@ -1299,6 +1299,12 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 	if target == nil {
 		return fmt.Errorf("%w: iSCSI target for %s", errFenceBackendAbsent, datasetName)
 	}
+	// CHAP (authmethod+auth) and fencing (initiator allowlist) are orthogonal
+	// fields of the SAME target group. Rebuilt dynamic groups must retain CHAP or
+	// a fence pass would silently strip it off a CHAP target. The linkage is read
+	// from the dataset property stamped at CreateVolume; preserved static groups
+	// already carry their own authmethod/auth verbatim from target.Groups.
+	chapMethod, chapAuthRef, _ := d.iscsiGroupCHAP(ctx, ds)
 	iqns := make([]string, 0, len(active))
 	for _, identity := range active {
 		if identity.ISCSIIQN != "" {
@@ -1339,7 +1345,9 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 			return portalErr
 		}
 		for _, portalID := range portals {
-			groups = append(groups, truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"})
+			group := truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"}
+			applyISCSIGroupCHAP(&group, chapMethod, chapAuthRef)
+			groups = append(groups, group)
 		}
 	} else {
 		// Retain the exact existing portal relationships on last unpublish. Some
@@ -1373,7 +1381,9 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 				}
 			}
 			for _, portalID := range portals {
-				groups = append(groups, truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"})
+				group := truenas.ISCSITargetGroup{Portal: portalID, Initiator: dynamicID, AuthMethod: "NONE"}
+				applyISCSIGroupCHAP(&group, chapMethod, chapAuthRef)
+				groups = append(groups, group)
 			}
 		}
 	}

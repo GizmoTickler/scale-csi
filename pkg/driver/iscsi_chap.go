@@ -203,6 +203,36 @@ func iscsiGroupAuthRef(peer *truenas.ISCSIAuth) int {
 	return peer.ID
 }
 
+// iscsiGroupCHAP resolves the authmethod, auth ref, and auth tag to stamp on a
+// freshly built target group. It prefers the request-scoped CreateVolume
+// resolution; otherwise it reconstructs the auth ref from the stored dataset
+// property so idempotent rebuilds (and fence-adjacent creates) retain CHAP.
+// authRef is 0 when CHAP is not active for the dataset; authTag is 0 when only
+// the stored ref is known (the tag property is already persisted in that case).
+func (d *Driver) iscsiGroupCHAP(ctx context.Context, ds *truenas.Dataset) (authMethod string, authRef, authTag int) {
+	if res := iscsiCHAPResolutionFromContext(ctx); res != nil {
+		return res.authMethod(), iscsiGroupAuthRef(res.Peer), res.Peer.Tag
+	}
+	if rawID := datasetUserProperty(ds, PropISCSIAuthID); rawID != "" && rawID != "-" {
+		if id, err := strconv.Atoi(rawID); err == nil && id > 0 {
+			return d.iscsiCHAPAuthMethod(), id, 0
+		}
+	}
+	return iscsiCHAPModeNone, 0, 0
+}
+
+// applyISCSIGroupCHAP stamps authmethod+auth onto a target group when CHAP is
+// active (authRef > 0). It is a no-op for non-CHAP datasets so the historical
+// authmethod=NONE groups are emitted unchanged.
+func applyISCSIGroupCHAP(group *truenas.ISCSITargetGroup, authMethod string, authRef int) {
+	if authRef <= 0 || authMethod == iscsiCHAPModeNone {
+		return
+	}
+	ref := authRef
+	group.AuthMethod = authMethod
+	group.Auth = &ref
+}
+
 // iscsiCHAPAuthMethod returns the authmethod enum for the controller's global
 // CHAP posture. It is used when rebuilding groups from a stored dataset property
 // (fence/idempotent paths) where only the auth ref, not the original mode, is

@@ -54,6 +54,14 @@ func (d *Driver) iscsiVolumeContext(ctx context.Context, ds *truenas.Dataset, da
 	volumeContext["portal"] = d.config.ISCSI.TargetPortal
 	volumeContext["lun"] = "0"
 	volumeContext["interface"] = d.config.ISCSI.Interface
+	// Advertise the CHAP mode (never credentials) so the node knows to expect a
+	// node-stage secret and which direction to configure. Prefer the request
+	// resolution on create; fall back to the stored dataset property otherwise.
+	if res := iscsiCHAPResolutionFromContext(ctx); res != nil {
+		volumeContext[volumeContextCHAPKey] = res.authMethod()
+	} else if datasetUserPropertyHasValue(ds, PropISCSIAuthID) {
+		volumeContext[volumeContextCHAPKey] = d.iscsiCHAPAuthMethod()
+	}
 	return nil
 }
 
@@ -72,6 +80,11 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to get dataset: %v", err)
 	}
+
+	// Resolve the CHAP posture for this dataset: the request-scoped resolution on
+	// a fresh CreateVolume, else the stored dataset property on idempotent
+	// rebuilds. authRef==0 means CHAP is off and groups stay authmethod=NONE.
+	chapMethod, chapAuthRef, chapTag := d.iscsiGroupCHAP(ctx, ds)
 
 	// Generate iSCSI name and disk path upfront
 	iscsiName := d.iscsiShareName(path.Base(datasetName))
@@ -115,18 +128,21 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			if tg.Auth != nil && *tg.Auth > 0 {
 				auth = tg.Auth
 			}
-			targetGroups = append(targetGroups, truenas.ISCSITargetGroup{
+			group := truenas.ISCSITargetGroup{
 				Portal:     tg.Portal,
 				Initiator:  tg.Initiator,
 				AuthMethod: tg.AuthMethod,
 				Auth:       auth,
-			})
+			}
+			applyISCSIGroupCHAP(&group, chapMethod, chapAuthRef)
+			targetGroups = append(targetGroups, group)
 		}
 		if len(targetGroups) == 0 && d.config.Fencing.Mode != FencingModeStrict {
 			resolved, resolveErr := d.resolveISCSITargetGroup(ctx)
 			if resolveErr != nil {
 				return status.Errorf(codes.Internal, "cannot create iSCSI target for %s: %v", datasetName, resolveErr)
 			}
+			applyISCSIGroupCHAP(resolved, chapMethod, chapAuthRef)
 			targetGroups = append(targetGroups, *resolved)
 			usedResolvedGroup = true
 		}
@@ -156,9 +172,11 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				return status.Errorf(codes.Internal, "failed to resolve strict iSCSI portal groups: %v", portalErr)
 			}
 			for _, portalID := range portals {
-				targetGroups = append(targetGroups, truenas.ISCSITargetGroup{
+				group := truenas.ISCSITargetGroup{
 					Portal: portalID, Initiator: dynamicGroup.ID, AuthMethod: "NONE",
-				})
+				}
+				applyISCSIGroupCHAP(&group, chapMethod, chapAuthRef)
+				targetGroups = append(targetGroups, group)
 			}
 		}
 
@@ -302,11 +320,19 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 
 	// Step 6: Store all property IDs in one dataset update.
 	// These properties are used for idempotency on retry and cleanup during deletion.
-	if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+	resourceProps := map[string]string{
 		PropISCSITargetID:       strconv.Itoa(targetID),
 		PropISCSIExtentID:       strconv.Itoa(extentID),
 		PropISCSITargetExtentID: strconv.Itoa(targetExtent.ID),
-	}); err != nil {
+	}
+	// Persist the CHAP auth linkage so fence passes and idempotent rebuilds can
+	// reconstruct authmethod+auth without the StorageClass secret. Folded into the
+	// same update so a CHAP volume adds no extra pool.dataset.update RTT.
+	if chapAuthRef > 0 && chapTag > 0 {
+		resourceProps[PropISCSIAuthID] = strconv.Itoa(chapAuthRef)
+		resourceProps[PropISCSIAuthTag] = strconv.Itoa(chapTag)
+	}
+	if err := d.setDatasetUserProperties(ctx, ds, datasetName, resourceProps); err != nil {
 		klog.Warningf("Failed to store iSCSI resource IDs: %v", err)
 	}
 
