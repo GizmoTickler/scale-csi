@@ -98,6 +98,34 @@ func IsAlreadyExistsError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
 
+// IsLockContentionError reports whether err is a benign lock-contention /
+// in-progress retry rather than a genuine busy-resource failure. It is
+// conservative by design: only an EBUSY errno whose message indicates a lock or
+// an already-in-progress operation is benign; any other EBUSY (e.g. destroying
+// a mounted dataset) and any non-EBUSY error fall through to a real error so a
+// genuinely-busy resource is never masked.
+//
+// MessageFallbackContains is deliberately NOT reused here: it returns false
+// whenever a structured errno is present, and EBUSY IS a structured errno, so it
+// could never return true for the very errors this classifier targets. The
+// message is inspected directly instead. The bare fragment "busy" is also
+// excluded on purpose — "dataset is busy" is a real failure, not contention.
+func IsLockContentionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errno, ok := APIErrno(err)
+	if !ok || errno != syscall.EBUSY {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		message = strings.ToLower(apiErr.Message)
+	}
+	return strings.Contains(message, "already in progress") || strings.Contains(message, "lock")
+}
+
 // MessageFallbackContains is for APIs whose older releases did not expose a
 // semantic errno. If a structured errno is present it is authoritative, even
 // when the accompanying human-readable text contains a familiar substring.

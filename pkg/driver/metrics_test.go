@@ -2,6 +2,7 @@ package driver
 
 import (
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -219,6 +220,69 @@ func TestRecordCSIOperationClassifiesAbortedAsBenign(t *testing.T) {
 
 	assert.Equal(t, benignBefore+1, testutil.ToFloat64(benign))
 	assert.Equal(t, hardErrorBefore, testutil.ToFloat64(hardError))
+}
+
+// TestRecordTrueNASRequestClassifiesBenign guards the E1 5-value transport
+// status taxonomy: benign idempotent outcomes and lock contention move OUT of
+// status="error" into benign_* so the per-method counter tells the truth.
+func TestRecordTrueNASRequestClassifiesBenign(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		method     string
+		err        error
+		wantStatus string
+	}{
+		{name: "nil error is success", method: "pool.dataset.create", err: nil, wantStatus: "success"},
+		{
+			name:       "already-exists is benign_exists",
+			method:     "pool.dataset.create",
+			err:        &truenas.APIError{Code: int(syscall.EEXIST), Message: "dataset already exists"},
+			wantStatus: "benign_exists",
+		},
+		{
+			name:       "not-found is benign_notfound",
+			method:     "pool.dataset.delete",
+			err:        &truenas.APIError{Code: int(syscall.ENOENT), Message: "dataset not found"},
+			wantStatus: "benign_notfound",
+		},
+		{
+			name:       "lock contention is benign_aborted",
+			method:     "pool.dataset.create",
+			err:        &truenas.APIError{Code: int(syscall.EBUSY), Message: "call already in progress"},
+			wantStatus: "benign_aborted",
+		},
+		{
+			name:       "generic failure is error",
+			method:     "pool.dataset.create",
+			err:        &truenas.APIError{Code: int(syscall.EACCES), Message: "permission denied"},
+			wantStatus: "error",
+		},
+		{
+			// The classifier is method-agnostic: the CHAP peer-CRUD calls
+			// (iscsi.auth.*) added in sprint2 are classified benign_exists on
+			// their idempotent enforcement-boundary creates with no CHAP-specific
+			// code, exactly as the E1 design predicted.
+			name:       "iscsi.auth create already-exists is benign_exists",
+			method:     "iscsi.auth.create",
+			err:        &truenas.APIError{Code: int(syscall.EEXIST), Message: "peer user already exists"},
+			wantStatus: "benign_exists",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := truenasRequestsTotal.WithLabelValues(tc.method, tc.wantStatus)
+			wantBefore := testutil.ToFloat64(want)
+			errSeries := truenasRequestsTotal.WithLabelValues(tc.method, "error")
+			errBefore := testutil.ToFloat64(errSeries)
+
+			RecordTrueNASRequest(tc.method, 0.01, tc.err)
+
+			assert.Equal(t, wantBefore+1, testutil.ToFloat64(want))
+			if tc.wantStatus != "error" {
+				assert.Equal(t, errBefore, testutil.ToFloat64(errSeries),
+					"a benign outcome must not increment the error series")
+			}
+		})
+	}
 }
 
 func TestTransportCountersIncrementThroughMetricsRegistry(t *testing.T) {

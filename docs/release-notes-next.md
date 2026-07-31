@@ -7,6 +7,39 @@ resilience, and maintainability work. Sections after the per-release entries
 (Breaking change, Helm chart, Release governance) are cross-cutting themes that
 span several of these releases.
 
+## Unreleased — observability polish
+
+### Observability
+
+- **Honest TrueNAS transport counter (`scale_csi_truenas_requests_total`).** The
+  `status` label keeps its name but expands from `{success, error}` to a 5-value
+  outcome taxonomy. Expected idempotent outcomes and lock-contention retries move
+  OUT of `status="error"` into dedicated `benign_*` values, so the per-method
+  transport counter now tells the same truth as the RPC-level
+  `scale_csi_operations_total` (which has classified Aborted/NotFound/AlreadyExists
+  as benign since v1.2.13). This fixes the live finding where
+  `nvmet.host_subsys.create` showed a 13%+ `status="error"` rate that was entirely
+  benign `AlreadyExists` from the unconditional enforcement-boundary create at
+  publish. The classifier is method-agnostic, so the `iscsi.auth.*` peer-CRUD
+  calls added for CHAP are classified `benign_exists` on their idempotent creates
+  automatically.
+
+  | series | change |
+  |--------|--------|
+  | `scale_csi_truenas_requests_total{status="success"}` | **unchanged** |
+  | `scale_csi_truenas_requests_total{status="error"}` | **narrows** — benign EEXIST/ENOENT/lock-contention no longer counted here (intended); real errors only |
+  | `scale_csi_truenas_requests_total{status="benign_exists"}` | **new** — expected idempotent AlreadyExists |
+  | `scale_csi_truenas_requests_total{status="benign_notfound"}` | **new** — expected idempotent NotFound (deletes/reads) |
+  | `scale_csi_truenas_requests_total{status="benign_aborted"}` | **new** — lock-contention retry / busy |
+  | `scale_csi_truenas_requests_duration_seconds` | **unchanged** (no status label) |
+  | cardinality | 2 → ≤5 values per method; `method` is a fixed API-method enum → still bounded |
+
+  **Operator action:** existing `status="success"` and `status="error"` selectors
+  keep working unchanged. Because benign outcomes leave the `error` series, any
+  panel/rule — including THIRD-PARTY dashboards — that sums `status="error"` as
+  "failures" will now read LOWER (this is the honest value); the benign volume is
+  visible in the new `benign_*` values. No expression has to change to get the fix.
+
 ## v1.3.0 — publish/reconcile performance, subscribe job-wait, clone fold, ledger v2
 
 Batches 17–20, plus an adversarial-review maintainability round.

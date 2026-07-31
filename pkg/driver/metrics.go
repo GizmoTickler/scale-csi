@@ -328,6 +328,12 @@ var (
 )
 
 func init() {
+	// The transport counter's benign_* status values (E1) are intentionally NOT
+	// pre-touched here. The method label set is large (every TrueNAS API method),
+	// so pre-creating every method×benign-value series would be pure cardinality
+	// bloat for series that may never appear. Prometheus rate() tolerates a
+	// series' first appearance, so lazy creation on the first benign event is
+	// correct and cheaper. Only the small, fixed enums below are pre-touched.
 	for _, reason := range []string{
 		truenas.ReplicationJobAbortReasonContextEnded,
 		truenas.ReplicationJobAbortReasonCopyFailed,
@@ -364,14 +370,41 @@ func RecordCSIOperation(operation string, duration float64, err error) {
 	csiOperationsDuration.WithLabelValues(operation).Observe(duration)
 }
 
-// RecordTrueNASRequest records metrics for a TrueNAS API request
+// RecordTrueNASRequest records metrics for a TrueNAS API request.
+//
+// The status label carries a 5-value outcome taxonomy (E1): success,
+// benign_exists, benign_notfound, benign_aborted, and error. Benign idempotent
+// outcomes (AlreadyExists/NotFound) and lock-contention retries MOVE OUT of
+// "error" so this per-method transport counter tells the same truth as the
+// RPC-level operations_total. Existing status="error" selectors keep working and
+// become honest for free; see docs/release-notes-next.md for the migration table.
+//
+// The classifier is method-agnostic, so the iscsi.auth.* peer-CRUD calls added
+// for CHAP are classified benign_exists on their idempotent enforcement-boundary
+// creates automatically — no per-method special-casing.
+//
+// Latency is observed for every outcome (the histogram has no status label).
 func RecordTrueNASRequest(method string, duration float64, err error) {
-	status := "success"
-	if err != nil {
-		status = "error"
-	}
-	truenasRequestsTotal.WithLabelValues(method, status).Inc()
+	truenasRequestsTotal.WithLabelValues(method, trueNASRequestStatus(err)).Inc()
 	truenasRequestsDuration.WithLabelValues(method).Observe(duration)
+}
+
+// trueNASRequestStatus classifies a TrueNAS API outcome for the transport
+// counter. Order matters: the idempotency classifiers are checked before the
+// generic error fallthrough.
+func trueNASRequestStatus(err error) string {
+	switch {
+	case err == nil:
+		return "success"
+	case truenas.IsAlreadyExistsError(err):
+		return "benign_exists"
+	case truenas.IsNotFoundError(err):
+		return "benign_notfound"
+	case truenas.IsLockContentionError(err):
+		return "benign_aborted"
+	default:
+		return "error"
+	}
 }
 
 // SetTrueNASConnectionStatus sets the connection status metric

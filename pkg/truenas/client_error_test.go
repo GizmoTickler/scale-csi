@@ -49,6 +49,44 @@ func TestIsNotFoundErrorIgnoresNotFoundMentionsInDataBlob(t *testing.T) {
 		"a not-found mention buried in the Data blob must not be treated as this object's absence")
 }
 
+// TestIsLockContentionError guards the E1 benign_aborted classifier: only an
+// EBUSY errno whose message signals a lock / in-progress operation is benign. A
+// genuinely busy dataset (e.g. a mounted-dataset destroy) must stay a real error
+// so it is never masked as retryable contention.
+func TestIsLockContentionError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "ebusy already in progress is contention",
+			err:  &APIError{Code: int(syscall.EBUSY), Message: "call already in progress"},
+			want: true,
+		},
+		{
+			name: "ebusy lock held is contention",
+			err:  &APIError{Code: int(syscall.EBUSY), Message: "dataset lock held by another operation"},
+			want: true,
+		},
+		{
+			name: "ebusy genuinely busy dataset is real",
+			err:  &APIError{Code: int(syscall.EBUSY), Message: "dataset is busy"},
+			want: false,
+		},
+		{
+			name: "enoent is not contention",
+			err:  &APIError{Code: int(syscall.ENOENT), Message: "call already in progress"},
+			want: false,
+		},
+		{name: "nil error", err: nil, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, IsLockContentionError(tc.err))
+		})
+	}
+}
+
 func TestStructuredErrnoIsAuthoritativeOverMessageFallbacks(t *testing.T) {
 	positivePermissionCode := &APIError{Code: int(syscall.EACCES), Message: "dataset not found and already exists"}
 	assert.False(t, IsNotFoundError(positivePermissionCode))
