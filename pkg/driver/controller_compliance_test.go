@@ -522,10 +522,27 @@ type cloneWaitErrorClient struct {
 	*truenas.MockClient
 	datasetDeletes  []string
 	snapshotDeletes []string
+	cloneCreated    bool
+	readinessGets   int
+}
+
+func (m *cloneWaitErrorClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error {
+	err := m.MockClient.SnapshotClone(ctx, snapshotID, newDatasetName)
+	if err == nil && newDatasetName == "pool/parent/clone-target" {
+		m.cloneCreated = true
+	}
+	return err
 }
 
 func (m *cloneWaitErrorClient) DatasetGet(ctx context.Context, name string) (*truenas.Dataset, error) {
 	if name == "pool/parent/clone-target" {
+		// Count only post-clone gets: the bounded confirmCloneReady attempts (plus,
+		// for snapshot clones, the guarded-cleanup ownership re-check). The pre-clone
+		// existence lookup is deliberately excluded so readinessGets pins exactly the
+		// readiness-confirmation shape.
+		if m.cloneCreated {
+			m.readinessGets++
+		}
 		// Sprint 3 (L1b): clone readiness is confirmed via a single bounded
 		// DatasetGet (confirmCloneReady), not WaitForZvolReady. Model a clone that
 		// never becomes queryable by reporting it absent. The CreateVolume existence
@@ -551,19 +568,27 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 		name                string
 		source              *csi.VolumeContentSource
 		wantSnapshotCleanup bool
+		wantReadinessGets   int
 	}{
 		{
+			// Post-clone target gets: the two bounded confirmCloneReady attempts plus
+			// the guarded-cleanup ownership re-check (1) that snapshot clones perform
+			// before destroying the failed clone.
 			name: "snapshot clone",
 			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
 				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "source-snapshot"},
 			}},
+			wantReadinessGets: 3,
 		},
 		{
+			// Post-clone target gets: exactly the two bounded confirmCloneReady
+			// attempts. The volume path cleans up directly (no guarded re-check).
 			name: "volume clone",
 			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
 				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "source"},
 			}},
 			wantSnapshotCleanup: true,
+			wantReadinessGets:   2,
 		},
 	}
 
@@ -581,6 +606,10 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 			}
 
 			driver := newComplianceTestDriver(client)
+			// A positive readiness timeout lets confirmCloneReady's single bounded
+			// retry fire (a zero timeout expires the deadline before the second
+			// attempt), so this test pins the genuine two-attempt shape.
+			driver.config.ZFS.ZvolReadyTimeout = 2
 			_, err = driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
 				Name:                "clone-target",
 				CapacityRange:       &csi.CapacityRange{RequiredBytes: testGiB},
@@ -590,7 +619,14 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 			})
 
 			require.Error(t, err)
-			assert.Equal(t, codes.Internal, status.Code(err))
+			// Sprint 3 fix: readiness exhaustion is codes.Unavailable, which
+			// external-provisioner v6.3.0 retries in background; codes.Internal would
+			// map to ProvisioningFinished and terminate a clone that needs a moment.
+			assert.Equal(t, codes.Unavailable, status.Code(err))
+			// Pins the L1b bounded shape: confirmCloneReady probes the target exactly
+			// twice (one get + one bounded retry), never an unbounded poll.
+			assert.Equal(t, tc.wantReadinessGets, client.readinessGets,
+				"readiness confirmation must be a bounded two-attempt get")
 			assert.Equal(t, []string{"pool/parent/clone-target"}, client.datasetDeletes)
 			if tc.wantSnapshotCleanup {
 				require.Len(t, client.snapshotDeletes, 1)
@@ -600,6 +636,49 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCreateVolumeNFSCloneSilentlyAbsentFailsLoudly pins the L1b property that a
+// filesystem snapshot clone whose backend clone silently never appears still fails
+// loudly. NFS filesystem clones skip the readiness get (they trust the clone
+// response), so the next backend interaction is the merged pool.dataset.update —
+// which is update-only and errors on the absent dataset. CreateVolume must surface
+// that error, create no share, leave no target dataset, and retire the now-useless
+// in-flight marker.
+func TestCreateVolumeNFSCloneSilentlyAbsentFailsLoudly(t *testing.T) {
+	ctx := context.Background()
+	client := &absentNFSCloneMock{MockClient: truenas.NewMockClient()}
+	mustCreateParentDataset(t, client.MockClient)
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/nfs-clone-source", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	_, err = client.SnapshotCreate(ctx, source.Name, "clone-point", nil)
+	require.NoError(t, err)
+
+	driver := newComplianceTestDriver(client)
+	const volumeID = "absent-nfs-clone"
+	_, err = driver.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               volumeID,
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters:         map[string]string{"protocol": "nfs"},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "clone-point"},
+		}},
+	})
+	// The absent clone fails loudly at the merged update ...
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "dataset not found")
+	// ... with no share created and no target dataset left behind ...
+	assert.Empty(t, client.NFSShares, "no NFS share may be created for an absent clone")
+	_, getErr := client.DatasetGet(ctx, "pool/parent/"+volumeID)
+	require.Error(t, getErr, "the absent clone must not leave a target dataset")
+	// ... and the now-useless in-flight marker is retired.
+	marker, markerErr := driver.readInflightMarker(ctx, volumeID)
+	require.NoError(t, markerErr)
+	assert.Nil(t, marker, "the marker for an absent clone must be retired")
 }
 
 func TestCreateVolumeNFSCloneSetsRefquota(t *testing.T) {

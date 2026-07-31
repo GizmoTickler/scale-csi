@@ -912,7 +912,12 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// ONE content-source write that folds the content-source keys, the
 		// origin-snapshot key, AND the ownership stamp into a single atomic
 		// pool.dataset.update (L2a); marker retirement; NFS share resolution + create;
-		// and the post-share managed/provision/name fold.
+		// and the post-share managed/provision/name fold. The Sprint 3 fix made this
+		// fold response-verifying (ownership must be durable before the marker is
+		// retired) WITHOUT adding a call: verification reads the update RESPONSE, and
+		// the one-time post-connect paranoia re-read is already consumed by the marker
+		// write above, so the count stays 13 (the write simply moves from
+		// DatasetSetUserProperties to DatasetUpdate, both one high-level call).
 		{name: "CreateVolume clone from volume", want: 13, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",

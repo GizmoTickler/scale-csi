@@ -2465,6 +2465,24 @@ func (d *Driver) confirmCloneReady(ctx context.Context, datasetName string, time
 	return nil, fmt.Errorf("confirming clone %s readiness: %w", datasetName, lastErr)
 }
 
+// cloneReadinessExhaustedStatus maps a confirmCloneReady exhaustion to the gRPC
+// code the external-provisioner retries in background. A genuine readiness miss
+// is codes.Unavailable: external-provisioner v6.3.0 checkError maps Internal to
+// ProvisioningFinished (terminal), which would abandon a clone that simply needs
+// a moment to become queryable, whereas Unavailable maps to
+// ProvisioningInBackground. A context cancellation or deadline is preserved as the
+// actual cause so the CO sees the real reason rather than a generic Unavailable.
+func cloneReadinessExhaustedStatus(ctx context.Context, datasetName string, err error) error {
+	code := codes.Unavailable
+	switch {
+	case ctx.Err() == context.Canceled || errors.Is(err, context.Canceled):
+		code = codes.Canceled
+	case ctx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded):
+		code = codes.DeadlineExceeded
+	}
+	return status.Errorf(code, "failed waiting for cloned volume %s to become ready: %v", datasetName, err)
+}
+
 func (d *Driver) handleVolumeContentSource(
 	ctx context.Context,
 	datasetName, volumeName string,
@@ -2580,7 +2598,7 @@ func (d *Driver) handleVolumeContentSource(
 				createdDS, err = d.confirmCloneReady(ctx, datasetName, cloneReadyTimeout, true)
 				if err != nil {
 					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
-						status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err))
+						cloneReadinessExhaustedStatus(ctx, datasetName, err))
 				}
 				if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
 					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, err)
@@ -2681,7 +2699,7 @@ func (d *Driver) handleVolumeContentSource(
 		createdDS, err = d.confirmCloneReady(ctx, datasetName, cloneReadyTimeout, shareType.IsBlockProtocol())
 		if err != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
-			return nil, status.Errorf(codes.Internal, "failed waiting for cloned volume to become ready: %v", err)
+			return nil, cloneReadinessExhaustedStatus(ctx, datasetName, err)
 		}
 		if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
@@ -2694,15 +2712,30 @@ func (d *Driver) handleVolumeContentSource(
 		// pool.dataset.update (single txg), removing the intermediate state where one
 		// existed without the other. The marker is still retired only after this write
 		// succeeds (see the shared ownership gate in CreateVolume).
-		if err := d.setDatasetUserProperties(ctx, createdDS, datasetName, map[string]string{
+		//
+		// Sprint 3 fix: this fold MUST be response-verifying. The ownership stamp is
+		// the only thing that makes the clone recoverable, so an acknowledged update
+		// that silently dropped PropDriverInstanceID would otherwise let CreateVolume
+		// retire the in-flight marker and strand a markerless/ownerless dataset that
+		// is invisible to marker recovery AND remnant GC AND the managed-keyed list —
+		// a permanent invisible leak. setAndVerifyDatasetUserProperties checks every
+		// key (ownership included) against the update RESPONSE with no extra round
+		// trip, matching the snapshot-clone fold and the stampAndMirror contract that
+		// ownership stamps never use the non-verifying path. A verification failure
+		// returns before CreateVolume retires the marker, and cleanupFailedClone keeps
+		// the marker unless the destination is verifiably gone, so no markerless
+		// remnant is ever left behind. The verified dataset is the one published.
+		verified, updateErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
 			PropVolumeContentSourceType: "volume",
 			PropVolumeContentSourceID:   sourceVolumeID,
 			PropVolumeOriginSnapshot:    snap.ID,
 			PropDriverInstanceID:        d.driverInstanceID(),
-		}); err != nil {
+		})
+		if updateErr != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
-			return nil, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", updateErr)
 		}
+		createdDS = verified
 	}
 
 	return createdDS, nil
@@ -2768,7 +2801,7 @@ func (d *Driver) guardedCleanupFailedSnapshotClone(
 	if getErr != nil {
 		if truenas.IsNotFoundError(getErr) {
 			d.cleanupFailedClone(ctx, datasetName, "")
-			return status.Errorf(codes.Internal, "failed snapshot clone %s: %v", datasetName, cause)
+			return snapshotCloneFailureStatus(datasetName, cause)
 		}
 		return status.Errorf(codes.Aborted,
 			"cannot verify failed snapshot clone %s before cleanup; refusing delete and retry CreateVolume: %v",
@@ -2797,7 +2830,22 @@ func (d *Driver) guardedCleanupFailedSnapshotClone(
 			datasetName, cause)
 	}
 	d.cleanupFailedClone(ctx, datasetName, "")
-	return status.Errorf(codes.Internal, "failed snapshot clone %s: %v", datasetName, cause)
+	return snapshotCloneFailureStatus(datasetName, cause)
+}
+
+// snapshotCloneFailureStatus builds the terminal status for a failed snapshot
+// clone that guardedCleanupFailedSnapshotClone has proven safe to clean up. It
+// preserves the cause's gRPC code when the cause already carries one — so a
+// readiness exhaustion stays codes.Unavailable, which external-provisioner v6.3.0
+// retries in background — and defaults to codes.Internal for raw backend errors
+// (the merged-update and capacity failures). The Aborted lost-race returns above
+// never route through here.
+func snapshotCloneFailureStatus(datasetName string, cause error) error {
+	code := codes.Internal
+	if st, ok := status.FromError(cause); ok && st.Code() != codes.Unknown {
+		code = st.Code()
+	}
+	return status.Errorf(code, "failed snapshot clone %s: %v", datasetName, cause)
 }
 
 func datasetPropertyBytes(property truenas.DatasetProperty) int64 {

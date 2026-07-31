@@ -136,6 +136,33 @@ func (m *silentCloneOwnerUpdateMock) DatasetUpdate(ctx context.Context, name str
 	return m.MockClient.DatasetUpdate(ctx, name, params)
 }
 
+// silentVolumeCloneOwnerDropMock reproduces the Sprint 3 volume-clone crash state:
+// an acknowledged pool.dataset.update that silently drops ONLY PropDriverInstanceID
+// (inherited from silentCloneOwnerUpdateMock) while the failed clone's destroy also
+// fails, so the ownerless remnant survives exactly as it would after a crash mid
+// cleanup. The crash test asserts the driver keeps the in-flight marker for this
+// remnant rather than retiring it — a markerless/ownerless dataset would be
+// invisible to marker recovery, remnant GC, and the managed-keyed list.
+type silentVolumeCloneOwnerDropMock struct {
+	*silentCloneOwnerUpdateMock
+}
+
+func (m *silentVolumeCloneOwnerDropMock) DatasetDelete(ctx context.Context, name string, recursive, force bool) error {
+	return fmt.Errorf("simulated destroy failure for %s", name)
+}
+
+// absentNFSCloneMock models a pool.snapshot.clone that acknowledges success but
+// silently creates nothing. pool.dataset.update is update-only (never a create),
+// so the merged content-source write against the absent dataset fails loudly with
+// "dataset not found" — the behavior the silently-absent-NFS-clone test pins.
+type absentNFSCloneMock struct {
+	*truenas.MockClient
+}
+
+func (m *absentNFSCloneMock) SnapshotClone(ctx context.Context, snapshotID, newDatasetName string) error {
+	return nil
+}
+
 type silentDatasetPropertyUpdateMock struct {
 	*truenas.MockClient
 }
@@ -156,11 +183,18 @@ func (m *datasetCreateCaptureMock) DatasetCreate(ctx context.Context, params *tr
 	return m.MockClient.DatasetCreate(ctx, params)
 }
 
-func (m *clonePropertyFailureMock) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
-	if _, authoritative := properties[PropVolumeOriginSnapshot]; authoritative {
-		return m.err
+func (m *clonePropertyFailureMock) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
+	// The volume-clone content-source write is a response-verifying
+	// pool.dataset.update (Sprint 3 fix folded ownership into it and made it
+	// verifying), so inject the failure there when the update carries the
+	// authoritative origin-snapshot key. The marker write's update carries only the
+	// marker key and is left alone.
+	for _, update := range params.UserPropertiesUpdate {
+		if update.Key == PropVolumeOriginSnapshot {
+			return nil, m.err
+		}
 	}
-	return m.MockClient.DatasetSetUserProperties(ctx, name, properties)
+	return m.MockClient.DatasetUpdate(ctx, name, params)
 }
 
 type originSnapshotDeleteFailureMock struct {
