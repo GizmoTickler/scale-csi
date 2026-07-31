@@ -250,6 +250,12 @@ func TestValidateISCSIChAPSecret(t *testing.T) {
 		{"mutual password without username", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", MutualPassword: "peersecret456"}, "mutualPassword requires mutualUsername"},
 		{"mutual username without password", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", MutualUsername: "peeruser"}, "mutualPassword is required"},
 		{"mutual password equals password", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", MutualUsername: "peeruser", MutualPassword: "chapsecret123"}, "must differ"},
+		// X7: TrueNAS auth.py parity — exact unmodified secret.
+		{"password with leading whitespace", iscsiCHAPSecret{Username: "chapuser", Password: " chapsecret12"}, "leading or trailing whitespace"},
+		{"password with trailing whitespace", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret12 "}, "leading or trailing whitespace"},
+		{"password with hash", iscsiCHAPSecret{Username: "chapuser", Password: "chap#secret12"}, "must not contain '#'"},
+		{"malformed explicit tag", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", tagRaw: "abc", tagPresent: true}, "must be a positive integer"},
+		{"zero explicit tag", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", tagRaw: "0", tagPresent: true}, "must be a positive integer"},
 		{"valid one-way", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123"}, ""},
 		{"valid mutual", iscsiCHAPSecret{Username: "chapuser", Password: "chapsecret123", MutualUsername: "peeruser", MutualPassword: "peersecret456"}, ""},
 	}
@@ -291,39 +297,56 @@ func TestApplyISCSIGroupCHAP(t *testing.T) {
 	})
 }
 
-// TestISCSIGroupCHAPFromDatasetProperty guards the fence/rebuild linkage (R1):
-// a dataset that carries PropISCSIAuthID must resolve back to a CHAP group so a
-// fence pass rebuilds the group WITH its auth ref instead of stripping it to
-// authmethod=NONE. A dataset without the property stays NONE.
+// TestISCSIGroupCHAPFromDatasetProperty guards the fence/rebuild linkage (R1/X2):
+// a dataset that carries the LOCAL PropISCSIAuthTag + PropISCSIAuthMode must
+// resolve back to a CHAP group so a fence pass rebuilds the group WITH its auth
+// ref and stored mode instead of stripping it to authmethod=NONE or re-deriving
+// the mode from the mutable global flag. A dataset without the properties — or
+// one whose properties are clone-inherited (non-local) — stays NONE (X3).
 func TestISCSIGroupCHAPFromDatasetProperty(t *testing.T) {
 	d := &Driver{config: &Config{}}
 
-	t.Run("property present resolves CHAP", func(t *testing.T) {
+	t.Run("local one-way property resolves CHAP", func(t *testing.T) {
 		ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{
-			PropISCSIAuthID: {Value: "42"},
+			PropISCSIAuthTag:  {Value: "42", Source: "local"},
+			PropISCSIAuthMode: {Value: "CHAP", Source: "local"},
 		}}
-		method, authRef, authTag := d.iscsiGroupCHAP(context.Background(), ds)
+		method, authRef := d.iscsiGroupCHAP(context.Background(), ds)
 		assert.Equal(t, "CHAP", method)
 		assert.Equal(t, 42, authRef)
-		assert.Equal(t, 0, authTag)
 	})
 
-	t.Run("mutual config resolves CHAP_MUTUAL", func(t *testing.T) {
-		dm := &Driver{config: &Config{ISCSI: ISCSIConfig{CHAP: ISCSICHAPSettings{Mutual: true}}}}
+	t.Run("stored mode drives CHAP_MUTUAL regardless of global flag", func(t *testing.T) {
+		// The controller's global mutual flag is false, but the stored per-volume
+		// mode is CHAP_MUTUAL: the stored mode wins (never the global flag).
+		dm := &Driver{config: &Config{ISCSI: ISCSIConfig{CHAP: ISCSICHAPSettings{Mutual: false}}}}
 		ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{
-			PropISCSIAuthID: {Value: "7"},
+			PropISCSIAuthTag:  {Value: "7", Source: "local"},
+			PropISCSIAuthMode: {Value: "CHAP_MUTUAL", Source: "local"},
 		}}
-		method, authRef, _ := dm.iscsiGroupCHAP(context.Background(), ds)
+		method, authRef := dm.iscsiGroupCHAP(context.Background(), ds)
 		assert.Equal(t, "CHAP_MUTUAL", method)
 		assert.Equal(t, 7, authRef)
 	})
 
 	t.Run("absent property stays NONE", func(t *testing.T) {
 		ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{}}
-		method, authRef, authTag := d.iscsiGroupCHAP(context.Background(), ds)
+		method, authRef := d.iscsiGroupCHAP(context.Background(), ds)
 		assert.Equal(t, "NONE", method)
 		assert.Equal(t, 0, authRef)
-		assert.Equal(t, 0, authTag)
+	})
+
+	t.Run("clone-inherited property is ignored (source not local)", func(t *testing.T) {
+		// A clone's inherited CHAP props carry the origin snapshot name as source,
+		// not "local". They must never be honored — that would couple the clone to
+		// the source volume's credentials (X3 / opus#2).
+		ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{
+			PropISCSIAuthTag:  {Value: "42", Source: "pool/src@snap"},
+			PropISCSIAuthMode: {Value: "CHAP", Source: "pool/src@snap"},
+		}}
+		method, authRef := d.iscsiGroupCHAP(context.Background(), ds)
+		assert.Equal(t, "NONE", method)
+		assert.Equal(t, 0, authRef)
 	})
 
 	t.Run("request-scoped resolution wins", func(t *testing.T) {
@@ -331,12 +354,11 @@ func TestISCSIGroupCHAPFromDatasetProperty(t *testing.T) {
 			Peer:   &truenas.ISCSIAuth{ID: 99, Tag: 5000, User: "chapuser"},
 			Mutual: false,
 		})
-		method, authRef, authTag := d.iscsiGroupCHAP(ctx, &truenas.Dataset{})
+		method, authRef := d.iscsiGroupCHAP(ctx, &truenas.Dataset{})
 		assert.Equal(t, "CHAP", method)
 		// G1 live drill: the group auth ref is the peer TAG (SCST only emits
-		// IncomingUser for tag-keyed refs), so authRef == authTag here.
+		// IncomingUser for tag-keyed refs).
 		assert.Equal(t, 5000, authRef)
-		assert.Equal(t, 5000, authTag)
 	})
 }
 
@@ -450,9 +472,11 @@ func TestCreateVolumeISCSICHAPStampsGroupsAndProps(t *testing.T) {
 				assert.Equal(t, peer.Tag, *group.Auth)
 			}
 
-			// The auth linkage is persisted for fence/idempotent rebuilds.
-			assert.Equal(t, strconv.Itoa(peer.Tag), datasetUserProperty(ds, PropISCSIAuthID))
-			assert.Equal(t, strconv.Itoa(peer.Tag), datasetUserProperty(ds, PropISCSIAuthTag))
+			// The auth linkage is persisted for fence/idempotent rebuilds: the
+			// tag-keyed auth ref plus the immutable per-volume mode (X2). Both are
+			// LOCAL so a clone cannot inherit them (X3).
+			assert.Equal(t, strconv.Itoa(peer.Tag), datasetLocalUserProperty(ds, PropISCSIAuthTag))
+			assert.Equal(t, tc.wantMethod, datasetLocalUserProperty(ds, PropISCSIAuthMode))
 
 			// The volume context advertises only the mode flag, never a credential.
 			volumeCtx := resp.GetVolume().GetVolumeContext()

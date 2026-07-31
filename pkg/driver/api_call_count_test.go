@@ -755,14 +755,18 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
 		}},
-		// Sixteen calls: the 14-call iSCSI baseline PLUS two CHAP peer calls on a
-		// cold controller — ISCSIAuthQueryByTag (tag miss) and ISCSIAuthCreate.
-		// The authmethod+auth linkage is folded into the existing target-group
-		// create and the auth id/tag dataset props fold into the existing
-		// resource-ID stamp, so CHAP adds no other round trip. Steady-state (warm
-		// cache, second volume on the same controller) would be +0; the golden
-		// driver is fresh per case so 16 is the measured cold count.
-		{name: "CreateVolume fresh iSCSI CHAP", want: 16, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// Seventeen calls: the 14-call iSCSI baseline PLUS three CHAP peer calls on
+		// a cold controller — ISCSIAuthQueryByTag (tag miss), ISCSIAuthCreate, and a
+		// second ISCSIAuthQueryByTag that verifies no cross-process duplicate peer
+		// raced the create (X5: TrueNAS middleware does not enforce tag uniqueness,
+		// so the driver keeps a deterministic lowest-id winner). The authmethod+auth
+		// linkage folds into the existing target-group create and the auth tag/mode
+		// dataset props fold into the existing FATAL managed-property update (X1), so
+		// CHAP adds no other round trip. Steady-state (warm cache, second volume on
+		// the same controller) is +0; the golden driver is fresh per case so 17 is
+		// the measured cold count. (Was 16 before Sprint 2 added the post-create
+		// duplicate-tag reconciliation query.)
+		{name: "CreateVolume fresh iSCSI CHAP", want: 17, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("fresh-iscsi-chap"))
 			require.NoError(t, err)
 		}},
