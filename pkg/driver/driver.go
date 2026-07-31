@@ -448,24 +448,31 @@ func (d *Driver) logInterceptor(
 	requestID := atomic.AddUint64(&d.requestCounter, 1)
 	startTime := time.Now()
 
-	// Extract key identifiers from common request types for better logging
+	// Extract key identifiers from common request types for better logging.
+	// Provisioning paths (Create/Stage/Publish/Expand) stay at V(0): operators
+	// want them in the default log. Benign teardown verbs (Delete/Unstage/
+	// Unpublish) are demoted to V(2) so a steady-state VolSync delete/detach hour
+	// emits ~0 V(0) interceptor lines (E4/O19). Failures still log at Error below
+	// regardless of verbosity.
 	switch r := req.(type) {
 	case *csi.CreateVolumeRequest:
 		klog.Infof("[req-%d] %s name=%s", requestID, info.FullMethod, r.GetName())
 	case *csi.DeleteVolumeRequest:
-		klog.Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
+		klog.V(2).Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
 	case *csi.NodeStageVolumeRequest:
 		klog.Infof("[req-%d] %s volumeID=%s stagingPath=%s", requestID, info.FullMethod, r.GetVolumeId(), r.GetStagingTargetPath())
 	case *csi.NodeUnstageVolumeRequest:
-		klog.Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
+		klog.V(2).Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
 	case *csi.NodePublishVolumeRequest:
 		klog.Infof("[req-%d] %s volumeID=%s targetPath=%s", requestID, info.FullMethod, r.GetVolumeId(), r.GetTargetPath())
 	case *csi.NodeUnpublishVolumeRequest:
-		klog.Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
+		klog.V(2).Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
+	case *csi.ControllerUnpublishVolumeRequest:
+		klog.V(2).Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
 	case *csi.CreateSnapshotRequest:
 		klog.Infof("[req-%d] %s name=%s sourceVolumeID=%s", requestID, info.FullMethod, r.GetName(), r.GetSourceVolumeId())
 	case *csi.DeleteSnapshotRequest:
-		klog.Infof("[req-%d] %s snapshotID=%s", requestID, info.FullMethod, r.GetSnapshotId())
+		klog.V(2).Infof("[req-%d] %s snapshotID=%s", requestID, info.FullMethod, r.GetSnapshotId())
 	case *csi.ControllerExpandVolumeRequest:
 		klog.Infof("[req-%d] %s volumeID=%s", requestID, info.FullMethod, r.GetVolumeId())
 	case *csi.NodeExpandVolumeRequest:

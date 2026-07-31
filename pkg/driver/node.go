@@ -691,7 +691,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
 	}
 
-	klog.Infof("NodeUnstageVolume: volumeID=%s, stagingPath=%s", volumeID, stagingPath)
+	klog.V(2).Infof("NodeUnstageVolume: volumeID=%s, stagingPath=%s", volumeID, stagingPath)
 
 	// Lock on volume ID
 	lockKey := nodeVolumeLockKey(volumeID)
@@ -759,7 +759,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI)
 		}
 		d.deleteStageRecord(stagingPath)
-		klog.Infof("Volume %s unstaged successfully", volumeID)
+		klog.V(2).Infof("Volume %s unstaged successfully", volumeID)
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
@@ -811,7 +811,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	}
 
 	d.deleteStageRecord(stagingPath)
-	klog.Infof("Volume %s unstaged successfully", volumeID)
+	klog.V(2).Infof("Volume %s unstaged successfully", volumeID)
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -1020,7 +1020,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 		return nil, status.Error(codes.InvalidArgument, "target path is required")
 	}
 
-	klog.Infof("NodeUnpublishVolume: volumeID=%s, targetPath=%s", volumeID, targetPath)
+	klog.V(2).Infof("NodeUnpublishVolume: volumeID=%s, targetPath=%s", volumeID, targetPath)
 
 	// Lock on volume ID
 	lockKey := nodeVolumeLockKey(volumeID)
@@ -1055,7 +1055,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	}
 	d.deletePublicationRecord(targetPath)
 
-	klog.Infof("Volume %s unpublished successfully", volumeID)
+	klog.V(2).Infof("Volume %s unpublished successfully", volumeID)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 

@@ -965,7 +965,9 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
 
-	klog.Infof("DeleteVolume: volumeID=%s", volumeID)
+	// Benign teardown entry: demoted to V(2) so a steady-state VolSync delete hour
+	// emits ~0 V(0) controller lines (E4/O21). Delete failures still log at Error.
+	klog.V(2).Infof("DeleteVolume: volumeID=%s", volumeID)
 
 	// Lock on volume ID
 	lockKey := volumeLockKey(volumeID)
