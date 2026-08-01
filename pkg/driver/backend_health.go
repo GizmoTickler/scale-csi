@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -20,49 +21,72 @@ const backendHealthCallTimeout = 30 * time.Second
 // free, and health is not a sub-30s signal.
 const minBackendHealthInterval = 30 * time.Second
 
-// maxBackendHealthInterval is the CEILING, and it exists to keep a documented
-// promise honest rather than to save API calls.
+// maxBackendHealthInterval is the CEILING, and it exists to bound how far the
+// debounced VolumeCondition may trail the raw gauges rather than to save API
+// calls.
 //
 // The fan-out hysteresis (backendHealthFlipSamples) needs two consecutive
-// samples to flip a PVC's VolumeCondition, so a degradation reaches conditions
-// within at most 2 × interval. The ScaleCSIPoolDegraded alert fires off the
-// UNDAMPED gauge after a 5m hold. Unless 2 × interval stays under that hold, the
-// alert can fire while every PVC still carries the previous verdict — which
-// would contradict docs/production.md's claim that the two can never disagree.
-// 2m leaves a full minute of margin under that hold (2 × 2m = 4m < 5m).
+// samples to flip a PVC's VolumeCondition, so a degradation that keeps being
+// observed reaches conditions within at most 2 × interval. The
+// ScaleCSIPoolDegraded alert fires off the UNDAMPED gauge after a 5m hold. The
+// ceiling keeps 2 × interval under that hold (2 × 2m = 4m < 5m), so an operator
+// paged by that alert finds the PVC conditions already agreeing WHEN SAMPLES
+// KEEP ARRIVING.
+//
+// This is a bound, NOT a guarantee that the two signals always agree — see
+// backendHealthFlipSamples for the two windows in which they deliberately or
+// unavoidably differ.
 //
 // A larger configured value is clamped with a loud warning rather than rejected:
 // failing the controller over an observability cadence would be a worse outcome
 // than honoring the ceiling.
 const maxBackendHealthInterval = 2 * time.Minute
 
+// configuredBackendHealthInterval parses the cadence exactly as configured, with
+// NO clamping, so the poller can report a clamp against the operator's own
+// value. An empty/absent setting is the 60s default.
+func (d *Driver) configuredBackendHealthInterval() (time.Duration, error) {
+	if d.config == nil {
+		return 2 * minBackendHealthInterval, nil
+	}
+	raw := strings.TrimSpace(d.config.BackendHealth.Interval)
+	if raw == "" {
+		return 2 * minBackendHealthInterval, nil
+	}
+	interval, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	return interval, nil
+}
+
+// clampBackendHealthInterval applies [minBackendHealthInterval,
+// maxBackendHealthInterval].
+func clampBackendHealthInterval(interval time.Duration) time.Duration {
+	switch {
+	case interval < minBackendHealthInterval:
+		return minBackendHealthInterval
+	case interval > maxBackendHealthInterval:
+		return maxBackendHealthInterval
+	}
+	return interval
+}
+
 // resolveBackendHealthInterval resolves the configured cadence and clamps it to
 // [minBackendHealthInterval, maxBackendHealthInterval]. It is the ONE place the
 // effective interval is derived, so the poll loop and the staleness TTL can
 // never disagree about it.
+//
+// It is deliberately SILENT. backendHealthTTL calls it, and the TTL is
+// recomputed for every composed VolumeCondition — ListVolumes composes one per
+// volume — so warning from here would turn a supported configuration into a
+// per-volume log storm. The clamp is reported ONCE, from startBackendHealth.
 func (d *Driver) resolveBackendHealthInterval() (time.Duration, error) {
-	interval := 2 * minBackendHealthInterval
-	if d.config != nil {
-		resolved, err := d.config.BackendHealth.IntervalDuration()
-		if err != nil {
-			return 0, err
-		}
-		if resolved > 0 {
-			interval = resolved
-		}
+	interval, err := d.configuredBackendHealthInterval()
+	if err != nil {
+		return 0, err
 	}
-	switch {
-	case interval < minBackendHealthInterval:
-		klog.Warningf("backendHealth.interval %v is below the %v floor; using %v",
-			interval, minBackendHealthInterval, minBackendHealthInterval)
-		interval = minBackendHealthInterval
-	case interval > maxBackendHealthInterval:
-		klog.Warningf("backendHealth.interval %v exceeds the %v ceiling; using %v so a hysteresis-confirmed VolumeCondition "+
-			"flip (at most 2 x interval) still lands inside the ScaleCSIPoolDegraded alert's 5m hold",
-			interval, maxBackendHealthInterval, maxBackendHealthInterval)
-		interval = maxBackendHealthInterval
-	}
-	return interval, nil
+	return clampBackendHealthInterval(interval), nil
 }
 
 // backendHealthStaleIntervals is how many consecutive missed samples make the
@@ -87,6 +111,30 @@ const backendHealthStaleIntervals = 3
 // The FIRST observation is never damped: with no previous snapshot there is
 // nothing to flap against, and delaying the initial signal would only blind the
 // first interval after startup.
+//
+// THE HONEST CONTRACT (do not restate this as "the alert and the PVC condition
+// can never disagree" — that claim is false). The raw gauges and the debounced
+// condition share one SEVERITY SPLIT — the same states are abnormal in both —
+// but they are not the same signal in TIME. They differ in exactly three
+// bounded, intended ways:
+//
+//  1. Confirmation lag. An established-state transition is withheld until the
+//     second consecutive sample, so the condition trails the gauges by up to one
+//     successful poll interval. maxBackendHealthInterval keeps that under
+//     ScaleCSIPoolDegraded's 5m hold, so a degradation that keeps being observed
+//     reaches conditions before the alert fires.
+//  2. Recovery window. The raw degraded series drops to 0 on the FIRST healthy
+//     sample while the condition stays Abnormal until the second: a deliberate
+//     one-sample window where the alert has cleared and PVCs still read
+//     abnormal. Nothing about the interval can remove this; it is the point of
+//     the damper.
+//  3. Poll stall. If samples stop arriving the condition HOLDS its last value
+//     and the gauges FREEZE at theirs, so a single unconfirmed degraded sample
+//     can keep the raw alert expression true while the condition still reads
+//     normal. This is observable, not silent: scale_csi_pool_health_flip_pending
+//     is 1 for the whole window, and the first failed sample that finds an
+//     unconfirmed flip (or an expired TTL) raises scale_csi_pool_health_stale.
+//     Past the TTL the condition stops being served at all.
 const backendHealthFlipSamples = 2
 
 // startBackendHealth launches the controller-only backend-health poll loop when
@@ -99,10 +147,22 @@ func (d *Driver) startBackendHealth() {
 	if d.config == nil || !d.config.BackendHealth.Enabled {
 		return
 	}
-	interval, err := d.resolveBackendHealthInterval()
+	configured, err := d.configuredBackendHealthInterval()
 	if err != nil {
 		klog.Errorf("Backend health polling disabled due to invalid interval %q: %v", d.config.BackendHealth.Interval, err)
 		return
+	}
+	// Report the clamp exactly once, here, against the operator's own value.
+	// resolveBackendHealthInterval stays silent because the condition path calls
+	// it per volume.
+	interval := clampBackendHealthInterval(configured)
+	switch {
+	case configured < minBackendHealthInterval:
+		klog.Warningf("backendHealth.interval %v is below the %v floor; using %v", configured, minBackendHealthInterval, interval)
+	case configured > maxBackendHealthInterval:
+		klog.Warningf("backendHealth.interval %v exceeds the %v ceiling; using %v so a hysteresis-CONFIRMED VolumeCondition "+
+			"flip (at most 2 x interval) still lands inside the ScaleCSIPoolDegraded alert's 5m hold",
+			configured, maxBackendHealthInterval, interval)
 	}
 	pool := d.parentPoolName()
 	if pool == "" {
@@ -169,13 +229,32 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 		}
 		// Publish the staleness verdict from inside the poll loop so it keeps
 		// updating even while the backend is unreachable.
+		//
+		// The verdict answers ONE question: is the condition the driver is
+		// currently serving backed by a fresh sample? Two ways it is not, and
+		// both must be visible or the poll-stall window in
+		// backendHealthFlipSamples(3) would be silent:
+		//   - the snapshot aged past its TTL, so conditions have fallen back to
+		//     dataset-only; or
+		//   - a flip is pending and its CONFIRMING sample is exactly the one that
+		//     just failed to arrive, so the served verdict is one the latest raw
+		//     sample already contradicts.
 		if previous := d.backendHealth.Load(); previous != nil {
-			stale := time.Since(previous.SampledAt) > d.backendHealthTTL()
-			SetPoolHealthStale(previous.Pool, stale)
-			if stale {
+			age := time.Since(previous.SampledAt)
+			ttl := d.backendHealthTTL()
+			expired := age > ttl
+			unconfirmedFlip := d.backendHealthPendingFlips.Load() > 0
+			SetPoolHealthStale(previous.Pool, expired || unconfirmedFlip)
+			switch {
+			case expired:
 				klog.Warningf("Backend health snapshot for pool %s is stale (last successful sample %v ago, TTL %v); "+
 					"VolumeConditions fall back to dataset-only until the backend answers again",
-					previous.Pool, time.Since(previous.SampledAt).Truncate(time.Second), d.backendHealthTTL())
+					previous.Pool, age.Truncate(time.Second), ttl)
+			case unconfirmedFlip:
+				klog.Warningf("Backend health snapshot for pool %s is unconfirmed: a held health transition is still waiting for a "+
+					"confirming sample (last successful sample %v ago, TTL %v). VolumeConditions keep the previous verdict, "+
+					"which the raw scale_csi_pool_* gauges already contradict",
+					previous.Pool, age.Truncate(time.Second), ttl)
 			}
 		}
 		return
@@ -201,11 +280,16 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 
 // publishBackendHealth applies the fan-out hysteresis and updates the cache that
 // drives every managed volume's VolumeCondition.
+//
+// scale_csi_pool_health_flip_pending tracks the held window exactly, so the
+// deliberate raw-vs-condition disagreement documented on backendHealthFlipSamples
+// is always readable from Prometheus rather than inferred from logs.
 func (d *Driver) publishBackendHealth(snapshot *truenas.PoolHealthSnapshot) {
 	previous := d.backendHealth.Load()
 	if previous == nil || previous.Degraded() == snapshot.Degraded() {
 		// No transition to confirm (or nothing to compare against yet).
 		d.backendHealthPendingFlips.Store(0)
+		SetPoolHealthFlipPending(snapshot.Pool, false)
 		d.backendHealth.Store(snapshot)
 		return
 	}
@@ -213,8 +297,9 @@ func (d *Driver) publishBackendHealth(snapshot *truenas.PoolHealthSnapshot) {
 	pending := d.backendHealthPendingFlips.Add(1)
 	if pending < backendHealthFlipSamples {
 		klog.V(2).Infof("Pool %s health transition (%s -> %s) held for confirmation (%d/%d consecutive samples); "+
-			"per-PVC VolumeConditions are unchanged for now",
+			"per-PVC VolumeConditions are unchanged for now and deliberately disagree with the raw gauges until it confirms",
 			snapshot.Pool, previous.Status, snapshot.Status, pending, backendHealthFlipSamples)
+		SetPoolHealthFlipPending(snapshot.Pool, true)
 		// Keep serving the previous verdict, but carry the fresh sample time so the
 		// staleness TTL measures backend liveness, not the age of the verdict.
 		held := *previous
@@ -225,6 +310,7 @@ func (d *Driver) publishBackendHealth(snapshot *truenas.PoolHealthSnapshot) {
 	klog.Infof("Pool %s health transition (%s -> %s) confirmed by %d consecutive samples; updating every managed volume's condition",
 		snapshot.Pool, previous.Status, snapshot.Status, pending)
 	d.backendHealthPendingFlips.Store(0)
+	SetPoolHealthFlipPending(snapshot.Pool, false)
 	d.backendHealth.Store(snapshot)
 }
 

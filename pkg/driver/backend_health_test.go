@@ -412,16 +412,19 @@ func TestBackendHealthTTLTracksTheInterval(t *testing.T) {
 	assert.Equal(t, 3*minBackendHealthInterval, d.backendHealthTTL())
 
 	// So is an over-ceiling one (M6 timing caveat): 2 x interval must stay inside
-	// the ScaleCSIPoolDegraded alert's 5m hold, or the undamped gauge could fire
-	// an alert while every PVC still carries the previous verdict — contradicting
-	// docs/production.md's "can never disagree".
+	// the ScaleCSIPoolDegraded alert's 5m hold, so a CONFIRMED degradation always
+	// reaches conditions before the undamped gauge pages anyone. The ceiling
+	// bounds the confirmation lag; it does not (and cannot) make the raw gauges
+	// and the debounced condition agree at every instant — see
+	// TestBackendHealthPollStallHoldsConditionAndFlagsStale and
+	// TestBackendHealthRecoveryWindowIsAnIntentionalMismatch.
 	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "1h"}
 	assert.Equal(t, 3*maxBackendHealthInterval, d.backendHealthTTL())
 	interval, err := d.resolveBackendHealthInterval()
 	require.NoError(t, err)
 	assert.Equal(t, maxBackendHealthInterval, interval)
 	assert.Less(t, 2*interval, 5*time.Minute,
-		"a hysteresis-confirmed condition flip must land inside the alert hold docs/production.md promises")
+		"a hysteresis-confirmed condition flip must land inside the alert hold docs/production.md documents")
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +463,112 @@ func TestBackendHealthFanOutHasHysteresis(t *testing.T) {
 	assert.True(t, d.volumeCondition(managedDataset()).GetAbnormal(), "a single healthy sample must not clear it either")
 	d.sampleBackendHealth(ctx, "flashstor")
 	assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal())
+}
+
+// ---------------------------------------------------------------------------
+// M6 round-3 — the HONEST timing contract between the raw gauges and the
+// debounced VolumeCondition. The 2m interval ceiling bounds the confirmation
+// lag; it does NOT make the two signals agree at every instant. The two tests
+// below pin the windows in which they deliberately differ, plus the telemetry
+// that makes each window visible. If anyone re-asserts "an alert and a PVC
+// event can never disagree", these are what contradict it.
+// ---------------------------------------------------------------------------
+
+// TestBackendHealthPollStallHoldsConditionAndFlagsStale pins the poll-stall
+// window: one DEGRADED sample followed by failing polls. The condition HOLDS its
+// previous verdict (correct — a blip must not flip the fleet) while the raw
+// gauge already reads degraded, so the two disagree for as long as the backend
+// stays silent. That must not be silent telemetry: the pending flip is exported,
+// and the first FAILED sample that finds an unconfirmed flip raises the
+// staleness gauge immediately instead of waiting out the TTL (which is 6m at the
+// interval ceiling — longer than the 5m alert hold).
+func TestBackendHealthPollStallHoldsConditionAndFlagsStale(t *testing.T) {
+	const pool = "gf5-m6-stall-pool"
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true, SampledAt: time.Now()}
+	d := healthTestDriver(mock)
+
+	d.sampleBackendHealth(ctx, pool)
+	require.False(t, d.volumeCondition(managedDataset()).GetAbnormal())
+	require.Equal(t, 0.0, testutil.ToFloat64(poolHealthFlipPending.WithLabelValues(pool)))
+	require.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
+
+	// One degraded sample: the RAW gauge flips at once, the condition is held.
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusDegraded, SampledAt: time.Now()}
+	d.sampleBackendHealth(ctx, pool)
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolStatus.WithLabelValues(pool, truenas.PoolStatusDegraded)),
+		"metrics are never damped")
+	assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal(),
+		"one sample must not flip every managed PVC's condition")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthFlipPending.WithLabelValues(pool)),
+		"the deliberate raw-vs-condition disagreement must be observable while it lasts")
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
+		"the sample itself was fresh; nothing is stale yet")
+
+	// The confirming sample never arrives.
+	mock.InjectHealthError = errors.New("appliance unreachable")
+	d.sampleBackendHealth(ctx, pool)
+	assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal(),
+		"a failed sample holds the previous verdict; it must not synthesize a flip")
+	require.NotNil(t, d.poolHealthSnapshot(), "inside the TTL the held verdict is still served")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
+		"a failed sample with a PENDING flip is stale immediately, without waiting out the TTL")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthFlipPending.WithLabelValues(pool)),
+		"the flip stays pending while the backend is silent")
+
+	// Past the TTL the held verdict stops driving conditions at all.
+	held := *d.backendHealth.Load()
+	held.SampledAt = time.Now().Add(-d.backendHealthTTL() - time.Second)
+	d.backendHealth.Store(&held)
+	d.sampleBackendHealth(ctx, pool)
+	assert.Nil(t, d.poolHealthSnapshot(), "past the TTL the snapshot is not served")
+	assert.Equal(t, volumeConditionFromDataset(managedDataset()), d.volumeCondition(managedDataset()),
+		"past the TTL conditions fall back to the pre-GF5 dataset-only semantics")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
+
+	// A successful sample clears both flags.
+	mock.InjectHealthError = nil
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true, SampledAt: time.Now()}
+	d.sampleBackendHealth(ctx, pool)
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthFlipPending.WithLabelValues(pool)))
+	assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal())
+}
+
+// TestBackendHealthRecoveryWindowIsAnIntentionalMismatch pins the second honest
+// window. On the FIRST healthy sample the raw degraded series drops to 0 — so
+// ScaleCSIPoolDegraded clears — while the condition stays Abnormal until the
+// SECOND. No interval, ceiling or alert hold removes this: it is the damper
+// doing its job, and it is why the "can never disagree" wording was wrong.
+func TestBackendHealthRecoveryWindowIsAnIntentionalMismatch(t *testing.T) {
+	const pool = "gf5-m6-recovery-pool"
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true, SampledAt: time.Now()}
+	d := healthTestDriver(mock)
+	d.sampleBackendHealth(ctx, pool)
+
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusDegraded, SampledAt: time.Now()}
+	d.sampleBackendHealth(ctx, pool)
+	d.sampleBackendHealth(ctx, pool)
+	require.True(t, d.volumeCondition(managedDataset()).GetAbnormal(), "two samples confirm the degradation")
+	require.Equal(t, 0.0, testutil.ToFloat64(poolHealthFlipPending.WithLabelValues(pool)))
+
+	// First healthy sample: the alert's input clears, the condition does not.
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true, SampledAt: time.Now()}
+	d.sampleBackendHealth(ctx, pool)
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolStatus.WithLabelValues(pool, truenas.PoolStatusDegraded)),
+		"the raw degraded series clears on the first healthy sample")
+	assert.True(t, d.volumeCondition(managedDataset()).GetAbnormal(),
+		"the condition deliberately lags the raw gauge by one sample on recovery")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthFlipPending.WithLabelValues(pool)),
+		"the recovery mismatch window must be readable from Prometheus, not only from logs")
+
+	// The second healthy sample closes the window.
+	d.sampleBackendHealth(ctx, pool)
+	assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal())
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthFlipPending.WithLabelValues(pool)))
 }
 
 // TestBackendHealthFlapNeverFlips proves a pool alternating on every sample

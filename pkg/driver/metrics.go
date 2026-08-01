@@ -382,14 +382,31 @@ var (
 		[]string{"pool"},
 	)
 
-	// poolHealthStale is 1 when the cached backend-health snapshot has aged past
-	// its TTL and no longer drives per-PVC VolumeConditions. Every other
-	// scale_csi_pool_* gauge is only meaningful while this is 0.
+	// poolHealthStale is 1 when the VolumeCondition the driver is serving is NOT
+	// backed by a fresh sample: either the cached snapshot aged past its TTL (so
+	// conditions have fallen back to dataset-only), or a pending condition flip
+	// never received the confirming sample it is waiting on because the backend
+	// stopped answering. Every other scale_csi_pool_* gauge is only current while
+	// this is 0.
 	poolHealthStale = regGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "pool_health_stale",
-			Help:      "1 when the cached pool-health snapshot is older than its TTL and no longer drives VolumeCondition",
+			Help:      "1 when the served VolumeCondition is not backed by a fresh sample (snapshot past its TTL, or a pending flip whose confirming sample never arrived)",
+		},
+		[]string{"pool"},
+	)
+
+	// poolHealthFlipPending is 1 while a health transition is waiting for its
+	// confirming sample. It makes the ONE deliberate disagreement window between
+	// the raw scale_csi_pool_* gauges and the debounced per-PVC VolumeCondition
+	// observable instead of implicit: while this is 1 the condition still carries
+	// the PREVIOUS verdict even though the raw gauges already show the new one.
+	poolHealthFlipPending = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_health_flip_pending",
+			Help:      "1 while a pool-health transition awaits its confirming sample; the per-PVC VolumeCondition still carries the previous verdict",
 		},
 		[]string{"pool"},
 	)
@@ -851,11 +868,13 @@ func setDynamicPoolScanState(pool, function, state string, matched bool) {
 	seen[current] = struct{}{}
 }
 
-// SetPoolHealthStale publishes whether the cached pool-health snapshot is too
-// old to drive VolumeConditions. 1 means the driver has fallen back to
-// dataset-only conditions because the backend has not answered for several poll
-// intervals — a stale DEGRADED must not keep alerting after a real recovery, and
-// a stale ONLINE must not mask a real degradation.
+// SetPoolHealthStale publishes whether the VolumeCondition currently being
+// served is backed by a fresh sample. 1 means it is NOT: either the snapshot
+// aged past its TTL (conditions have fallen back to dataset-only — a stale
+// DEGRADED must not keep alerting after a real recovery, and a stale ONLINE must
+// not mask a real degradation), or a pending flip's confirming sample never
+// arrived, so the served verdict is one the driver's own latest raw sample
+// already contradicts.
 func SetPoolHealthStale(pool string, stale bool) {
 	if pool == "" {
 		return
@@ -865,6 +884,21 @@ func SetPoolHealthStale(pool string, stale bool) {
 		value = 1
 	}
 	poolHealthStale.WithLabelValues(pool).Set(value)
+}
+
+// SetPoolHealthFlipPending publishes whether a pool-health transition is waiting
+// for its confirming sample. While it is 1 the raw gauges and the per-PVC
+// VolumeCondition deliberately disagree: the condition is still the previous
+// verdict. This is the operator-visible form of the fan-out hysteresis.
+func SetPoolHealthFlipPending(pool string, pending bool) {
+	if pool == "" {
+		return
+	}
+	value := 0.0
+	if pending {
+		value = 1
+	}
+	poolHealthFlipPending.WithLabelValues(pool).Set(value)
 }
 
 // SetPoolCapacityMetrics publishes the latest parent-dataset capacity sample.

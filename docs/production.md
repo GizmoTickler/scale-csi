@@ -350,11 +350,13 @@ Five metric families added in v1.4.0 (the existing documented names still match
 Enabling `backendHealth.enabled` starts a controller-only, **read-only** poll
 loop: at most two calls per interval (`pool.query` +
 `disk.temperature_alerts`), no writes, default cadence 60s. The interval is
-clamped to **30s–2m**; a value outside that range is clamped with a warning
-rather than rejected. The 2m ceiling is what keeps the "can never disagree"
-promise below true: the fan-out hysteresis needs two samples, so a confirmed
-condition flip takes at most 2 × interval, and that has to stay inside the 5m
-`for` hold on `ScaleCSIPoolDegraded`. Like the capacity gauge loop this poller
+clamped to **30s–2m**; a value outside that range is clamped (with a single
+warning logged when the poller starts) rather than rejected. The 2m ceiling
+bounds how far the debounced condition may trail the raw gauges: the fan-out
+hysteresis needs two samples, so a **confirmed** condition flip takes at most
+2 × interval, and that has to stay inside the 5m `for` hold on
+`ScaleCSIPoolDegraded`. It is a bound, **not** a guarantee that the alert and the
+PVC condition always agree — see "Signal timing" below. Like the capacity gauge loop this poller
 has no leader-election gate, so run `controller.replicas=1`. It does not touch the CreateVolume/publish/unpublish
 request path.
 
@@ -364,8 +366,11 @@ pool condition is fanned out onto **every managed PVC's `VolumeCondition`** — 
 deliberate attribution, not an approximation, and the finest granularity ZFS
 makes available.
 
-Severity is conservative, and identical between the PVC condition and the
-bundled alerts so the two can never disagree:
+Severity is conservative, and the **severity split** is identical between the PVC
+condition and the bundled alerts — the same backend states are abnormal in both.
+That is an agreement about *which* states are abnormal, not about *when*; the
+alerts read the raw gauges while the condition is debounced, so read "Signal
+timing" below before treating a difference as a bug:
 
 | Backend state | `VolumeCondition` | Alert |
 |---|---|---|
@@ -396,22 +401,33 @@ New gauges, all labeled by `pool` and present only while the poller runs:
   `1` alongside the current one. Deliberately separate from `pool_healthy`;
 - `scale_csi_pool_scan_errors{pool}`;
 - `scale_csi_pool_disk_temp_alerts{pool}`;
-- `scale_csi_pool_health_stale{pool}` — `1` when the cached snapshot has aged
-  past its TTL (below). Every other `scale_csi_pool_*` gauge is only meaningful
-  while this is `0`.
+- `scale_csi_pool_health_stale{pool}` — `1` when the `VolumeCondition` being
+  served is **not backed by a fresh sample**: either the cached snapshot aged
+  past its TTL (below), or a held transition never received the confirming sample
+  it was waiting on. Every other `scale_csi_pool_*` gauge is frozen, not current,
+  while this is `1`;
+- `scale_csi_pool_health_flip_pending{pool}` — `1` while a health transition is
+  waiting for its confirming sample, i.e. exactly while the raw gauges and the
+  per-PVC condition deliberately disagree. In steady state it is `1` for at most
+  one poll interval; a value stuck at `1` means samples stopped arriving and is
+  alerted by `ScaleCSIPoolConditionFlipPending`.
 
 Metrics always carry the **raw** sample. The two dampers below apply only to the
 per-PVC `VolumeCondition` fan-out, so Prometheus still sees a flap as a flap.
 
 **Staleness TTL.** A failed sample leaves the previous snapshot in place — a
 transient backend blip must not flip every PVC's condition. That only holds for a
-blip: after three consecutive missed intervals (3 × `backendHealth.interval`, so
-3m at the default) the snapshot is considered stale, stops driving
-`VolumeCondition` entirely (conditions fall back to the pre-GF5 dataset-only
-semantics), and `scale_csi_pool_health_stale` goes to `1`. Without this an
-appliance unreachable for hours would keep a stale `DEGRADED` firing
-`ScaleCSIPoolDegraded` long after a real recovery, and a stale `ONLINE` would
-mask a real degradation.
+blip: after three consecutive missed intervals (3 × the effective clamped
+`backendHealth.interval`, so 3m at the default and never more than 6m) the
+snapshot is considered stale, stops driving `VolumeCondition` entirely
+(conditions fall back to the pre-GF5 dataset-only semantics), and
+`scale_csi_pool_health_stale` goes to `1`. Without this an appliance unreachable
+for hours would keep a stale `DEGRADED` firing `ScaleCSIPoolDegraded` long after
+a real recovery, and a stale `ONLINE` would mask a real degradation. A failed
+sample that finds a **pending, unconfirmed flip** raises
+`scale_csi_pool_health_stale` immediately, without waiting for the TTL: the
+condition being served is one the driver's own latest raw sample already
+contradicts, and that must not be silent for up to 6m.
 
 **Hysteresis.** The fan-out is fleet-wide by construction, so an undamped
 `DEGRADED`↔`ONLINE` flap would rewrite every managed PVC's condition and churn a
@@ -419,6 +435,25 @@ PVC event for each of them on every tick. A health transition must therefore be
 confirmed by **two consecutive samples** before it flips the conditions. The
 first observation after startup is never damped — there is nothing to flap
 against yet.
+
+**Signal timing — the alerts and the PVC conditions can differ, on purpose.**
+The bundled alerts read the **raw** gauges; the `VolumeCondition` is the
+**debounced** view of the same samples. They share one severity split, not one
+timeline, and there are exactly three windows in which they differ. Do not
+document or assume that the two signals always agree — they are not required to,
+and the interval ceiling does not make them:
+
+| Window | What you see | Bound | Observable via |
+|---|---|---|---|
+| Confirmation lag | raw gauge already shows the new state; every PVC still reports the previous condition | one successful poll interval (≤ 2m; `2 × interval < 5m` keeps a confirmed degradation ahead of the `ScaleCSIPoolDegraded` hold) | `scale_csi_pool_health_flip_pending = 1` |
+| Recovery | the degraded gauge — and therefore the alert — clears on the **first** healthy sample while PVCs stay `Abnormal` until the **second** | one sample, deliberately; no interval setting removes it | `scale_csi_pool_health_flip_pending = 1` |
+| Poll stall | samples stop arriving: the condition **holds** its last value and the gauges freeze at theirs, so a single unconfirmed `DEGRADED` sample can keep the raw alert expression true while conditions still read normal | until the backend answers; past the TTL conditions fall back to dataset-only | `scale_csi_pool_health_stale = 1` (raised on the first failed sample when a flip is pending, else at the TTL) and `scale_csi_pool_health_flip_pending = 1` |
+
+Triage rule: when `ScaleCSIPoolDegraded` fires and a PVC does not report
+`Abnormal` (or vice versa), check `scale_csi_pool_health_flip_pending` and
+`scale_csi_pool_health_stale` first. If either is `1`, the difference is the
+documented damper — not a bug and not a lost sample. If both are `0`, the two
+signals are describing the same confirmed state and any difference is real.
 
 The bundled rules use distinct expressions, rate windows, and `for` durations —
 do not collapse them into one sentence:

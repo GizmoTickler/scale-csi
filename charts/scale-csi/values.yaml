@@ -79,12 +79,30 @@ capacity:
 #     semantics) and scale_csi_pool_health_stale goes to 1, so a stale DEGRADED
 #     cannot keep alerting after a recovery and a stale ONLINE cannot mask one.
 #
+# BECAUSE the condition is damped and the gauges are not, the alerts (raw) and
+# the PVC conditions (debounced) DO differ transiently — they share one severity
+# split, not one timeline:
+#   * a confirmed transition reaches conditions up to one successful poll
+#     interval after the gauges (bounded: the 2m ceiling keeps 2 x interval
+#     inside the 5m ScaleCSIPoolDegraded hold);
+#   * on recovery the raw degraded gauge clears one sample BEFORE the condition,
+#     by design;
+#   * if samples stop arriving the condition holds its last value while
+#     scale_csi_pool_health_flip_pending and/or scale_csi_pool_health_stale go to
+#     1 (alerts ScaleCSIPoolConditionFlipPending / ScaleCSIPoolHealthStale).
+# Read those two gauges before treating a PVC condition as wrong. Full contract:
+# docs/production.md, "Backend health".
+#
 # Default OFF so an upgrade changes neither the rendered manifest nor the
 # VolumeCondition semantics of existing volumes.
 backendHealth:
   enabled: false
-  # Poll cadence. Values below 30s are clamped to it. The staleness TTL is
-  # three times this value.
+  # Poll cadence, clamped to 30s-2m. The 2m CEILING is not arbitrary: the
+  # two-sample hysteresis makes a CONFIRMED condition flip take up to
+  # 2 x interval, which has to stay inside the 5m ScaleCSIPoolDegraded hold. An
+  # out-of-range value is clamped (one warning at controller startup), never
+  # rejected. The staleness TTL is three times the EFFECTIVE (clamped) value: 3m
+  # at this default, never more than 6m.
   interval: 60s
 
 # Stable ownership identity stamped on newly-created datasets/zvols. Empty

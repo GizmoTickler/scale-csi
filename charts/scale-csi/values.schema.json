@@ -292,7 +292,7 @@
           "type": "boolean"
         },
         "interval": {
-          "description": "Poll cadence; values below 30s are clamped to it.",
+          "description": "Poll cadence, clamped to 30s-2m; an out-of-range value is clamped with one startup warning, never rejected. The 2m ceiling keeps a hysteresis-CONFIRMED VolumeCondition flip (up to 2 x interval) inside the 5m ScaleCSIPoolDegraded hold; it does not make the raw gauges and the debounced condition agree at every instant. The staleness TTL is 3 x the effective clamped value.",
           "type": "string",
           "minLength": 2
         }

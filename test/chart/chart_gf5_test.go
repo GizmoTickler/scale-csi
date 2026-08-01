@@ -295,7 +295,11 @@ func TestChartGF5BackendHealthPlumbing(t *testing.T) {
 	t.Run("health alerts are gated on the poller", func(t *testing.T) {
 		out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
 			"--set", "metrics.prometheusRule.enabled=true")
-		for _, alert := range []string{"ScaleCSIPoolDegraded", "ScaleCSIPoolScanErrors", "ScaleCSIPoolDiskTemperatureAlert"} {
+		gated := []string{
+			"ScaleCSIPoolDegraded", "ScaleCSIPoolScanErrors", "ScaleCSIPoolDiskTemperatureAlert",
+			"ScaleCSIPoolHealthStale", "ScaleCSIPoolConditionFlipPending",
+		}
+		for _, alert := range gated {
 			if strings.Contains(out, alert) {
 				t.Errorf("%s must not render without backendHealth.enabled; got:\n%s", alert, out)
 			}
@@ -303,18 +307,33 @@ func TestChartGF5BackendHealthPlumbing(t *testing.T) {
 
 		out = helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
 			"--set", "metrics.prometheusRule.enabled=true", "--set", "backendHealth.enabled=true")
-		for _, alert := range []string{"ScaleCSIPoolDegraded", "ScaleCSIPoolScanErrors", "ScaleCSIPoolDiskTemperatureAlert"} {
+		for _, alert := range gated {
 			if !strings.Contains(out, alert) {
 				t.Errorf("%s did not render with backendHealth.enabled; got:\n%s", alert, out)
 			}
 		}
-		// The alert must use the SAME severity split as the VolumeCondition path,
-		// so an alert and a PVC event can never disagree.
+		// The alert uses the SAME severity split as the VolumeCondition path: the
+		// two agree on WHICH states are abnormal.
 		if !strings.Contains(out, `status=~"DEGRADED|FAULTED|UNAVAIL"`) {
 			t.Errorf("ScaleCSIPoolDegraded must match the VolumeCondition severity split; got:\n%s", out)
 		}
 		if strings.Contains(out, `status=~"DEGRADED|FAULTED|UNAVAIL|OFFLINE`) {
 			t.Errorf("OFFLINE/REMOVED must not raise a critical alert; got:\n%s", out)
+		}
+		// M6 round 3: they do NOT agree on WHEN. The rendered rules must never
+		// promise otherwise, and must point at the two gauges that expose the
+		// disagreement windows (confirmation lag, recovery, poll stall).
+		if strings.Contains(out, "can never disagree") {
+			t.Errorf("the rules must not claim the alert and the PVC condition can never disagree; got:\n%s", out)
+		}
+		for _, honest := range []string{
+			"once the two-sample hysteresis confirms the transition",
+			"scale_csi_pool_health_flip_pending",
+			"max(scale_csi_pool_health_flip_pending) by (pool) == 1",
+		} {
+			if !strings.Contains(out, honest) {
+				t.Errorf("the rendered rules are missing the honest timing wording %q; got:\n%s", honest, out)
+			}
 		}
 	})
 
@@ -335,6 +354,10 @@ func TestChartGF5BackendHealthDashboardPanel(t *testing.T) {
 		"scale_csi_pool_healthy",
 		"scale_csi_pool_scan_state",
 		"scale_csi_pool_disk_temp_alerts",
+		// M6 round 3: an operator reading the panel must be able to tell a held or
+		// stale condition from a healthy one without leaving the dashboard.
+		"scale_csi_pool_health_flip_pending",
+		"scale_csi_pool_health_stale",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("dashboard is missing %q; got a %d-byte render", want, len(out))
@@ -475,11 +498,78 @@ func TestGF5Fix2DocsRecordTheContentSourceSemantics(t *testing.T) {
 		// M4: idle is a representable state and unknown cells are retired.
 		`Idle is `,
 		"retired (zeroed) on the next sample",
-		// M6 timing caveat: the interval ceiling that keeps "can never disagree" true.
+		// M6 timing caveat: the interval ceiling that BOUNDS the confirmation lag.
 		"clamped to **30s–2m**",
 	} {
 		if !strings.Contains(production, required) {
 			t.Errorf("production.md is missing %q", required)
 		}
+	}
+}
+
+// TestGF5Fix3DocsAreHonestAboutSignalTiming pins the M6 round-3 correction: the
+// raw gauges (what the alerts read) and the debounced per-PVC VolumeCondition
+// share a severity split, NOT a timeline. The absolute "can never disagree"
+// promise was false — the ceiling bounds the confirmation lag but cannot cover a
+// confirming sample that never arrives, and cannot remove the deliberate
+// one-sample recovery window. Documentation and values must state that plainly
+// and name the telemetry that exposes each window.
+func TestGF5Fix3DocsAreHonestAboutSignalTiming(t *testing.T) {
+	for _, doc := range []struct {
+		name     string
+		body     string
+		required []string
+	}{
+		{
+			name: "docs/production.md",
+			body: repoFile(t, "docs", "production.md"),
+			required: []string{
+				"Signal timing",
+				"Confirmation lag",
+				"Recovery",
+				"Poll stall",
+				"scale_csi_pool_health_flip_pending",
+				"the condition **holds** its last value",
+				"It is a bound, **not** a guarantee",
+			},
+		},
+		{
+			name: "charts/scale-csi/values.yaml",
+			body: repoFile(t, "charts", "scale-csi", "values.yaml"),
+			required: []string{
+				"DO differ transiently",
+				"scale_csi_pool_health_flip_pending",
+				"clamped to 30s-2m",
+				"three times the EFFECTIVE (clamped) value",
+			},
+		},
+		{
+			name: "charts/scale-csi/values.schema.json",
+			body: repoFile(t, "charts", "scale-csi", "values.schema.json"),
+			required: []string{
+				"clamped to 30s-2m",
+				"does not make the raw gauges and the debounced condition agree at every instant",
+			},
+		},
+		{
+			name: "charts/scale-csi/templates/prometheusrule.yaml",
+			body: repoFile(t, "charts", "scale-csi", "templates", "prometheusrule.yaml"),
+			required: []string{
+				"do not claim they",
+				"always agree",
+				"ScaleCSIPoolConditionFlipPending",
+			},
+		},
+	} {
+		t.Run(doc.name, func(t *testing.T) {
+			if strings.Contains(doc.body, "can never disagree") {
+				t.Errorf("%s still promises the two signals can never disagree; the design does not provide that", doc.name)
+			}
+			for _, required := range doc.required {
+				if !strings.Contains(doc.body, required) {
+					t.Errorf("%s is missing the honest timing wording %q", doc.name, required)
+				}
+			}
+		})
 	}
 }

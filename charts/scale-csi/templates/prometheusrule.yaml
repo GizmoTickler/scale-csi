@@ -211,14 +211,19 @@ spec:
           # DEGRADED/FAULTED/UNAVAIL only. OFFLINE/REMOVED are excluded: an
           # offline spare or a removed cache device does not put the data path at
           # risk. This is the SAME severity split the per-PVC VolumeCondition
-          # applies, so an alert and a PVC event can never disagree.
+          # applies: the two agree on WHICH states are abnormal. They are not the
+          # same signal in TIME — this alert reads the RAW gauge, while the
+          # condition is debounced by two-sample hysteresis — so do not claim they
+          # always agree. See docs/production.md#backend-health for the three
+          # bounded windows (confirmation lag, recovery, poll stall) and the
+          # scale_csi_pool_health_flip_pending / _stale gauges that expose them.
           expr: max(scale_csi_pool_status{status=~"DEGRADED|FAULTED|UNAVAIL"}) by (pool) == 1
           for: 5m
           labels:
             severity: critical
           annotations:
             summary: Scale CSI backend pool is degraded
-            description: The ZFS pool backing every Scale CSI volume reports a degraded, faulted or unavailable state. Every managed PVC on this pool is also reporting an abnormal VolumeCondition.
+            description: The ZFS pool backing every Scale CSI volume reports a degraded, faulted or unavailable state. Managed PVCs on this pool report an abnormal VolumeCondition once the two-sample hysteresis confirms the transition (at most 2 x backendHealth.interval, capped at 2m). Check scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before concluding the condition is wrong - while either is 1 the condition deliberately still carries the previous verdict.
         - alert: ScaleCSIPoolScanErrors
           expr: max(scale_csi_pool_scan_errors) by (pool) > 0
           for: 15m
@@ -237,16 +242,30 @@ spec:
             description: At least one member disk of the pool backing Scale CSI volumes is raising a temperature alert.
         - alert: ScaleCSIPoolHealthStale
           # Fires when the backend stops answering, and is the reason to distrust
-          # every other scale_csi_pool_* series: past the staleness TTL the driver
-          # stops using the cached snapshot, so per-PVC VolumeConditions silently
-          # fall back to the dataset-only signal.
+          # every other scale_csi_pool_* series: the served VolumeCondition is no
+          # longer backed by a fresh sample, either because the snapshot aged past
+          # the staleness TTL (conditions silently fall back to the dataset-only
+          # signal) or because a held transition never got its confirming sample.
           expr: max(scale_csi_pool_health_stale) by (pool) == 1
           for: 10m
           labels:
             severity: warning
           annotations:
             summary: Scale CSI backend health data is stale
-            description: The controller has not obtained a fresh pool.query sample for several poll intervals. Pool health no longer drives per-PVC VolumeCondition, and the other scale_csi_pool_* gauges are not current.
+            description: The controller has not obtained a fresh pool.query sample. The VolumeCondition being served is not backed by a current sample - either the snapshot aged past its TTL (3 x backendHealth.interval) and conditions fell back to dataset-only, or a held health transition never received its confirming sample. The other scale_csi_pool_* gauges are frozen at their last values.
+        - alert: ScaleCSIPoolConditionFlipPending
+          # The debounce is stuck. Normally a held transition confirms or clears on
+          # the very next sample, so this is 1 for at most one interval (<= 2m).
+          # Staying pending means the confirming sample is not arriving, which is
+          # exactly the case where the raw gauges and the per-PVC VolumeCondition
+          # disagree for longer than the ScaleCSIPoolDegraded hold.
+          expr: max(scale_csi_pool_health_flip_pending) by (pool) == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI pool health transition is stuck awaiting confirmation
+            description: A pool-health transition has been held for confirmation far longer than one poll interval, so every managed PVC still reports the PREVIOUS VolumeCondition while the raw scale_csi_pool_* gauges show the new state. Check controller logs and TrueNAS reachability - the confirming pool.query sample is not arriving.
         {{- end }}
         {{- end }}
 {{- end }}
