@@ -45,6 +45,47 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "backendHealth",
+          "controller"
+        ],
+        "properties": {
+          "backendHealth": {
+            "required": [
+              "enabled"
+            ],
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          },
+          "controller": {
+            "required": [
+              "replicas"
+            ],
+            "properties": {
+              "replicas": {
+                "minimum": 2
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "controller": {
+            "properties": {
+              "replicas": {
+                "const": 1
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "definitions": {
@@ -288,7 +329,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "description": "Run the read-only pool-health poller that drives per-PVC VolumeCondition and the scale_csi_pool_* gauges. Default off.",
+          "description": "Run the read-only pool-health poller that drives per-PVC VolumeCondition and the scale_csi_pool_* gauges. Requires controller.replicas=1 because the poller has no leader-election gate; the Deployment guard also documents termination/eviction overlap as a residual. Default off.",
           "type": "boolean"
         },
         "interval": {

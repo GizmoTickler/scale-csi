@@ -3,13 +3,16 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -26,6 +29,27 @@ func healthTestDriver(mock *truenas.MockClient) *Driver {
 		},
 		truenasClient: mock,
 	}
+}
+
+func gatheredBackendHealthGauge(families []*dto.MetricFamily, family string, labels map[string]string) (float64, bool) {
+	for _, metricFamily := range families {
+		if metricFamily.GetName() != family {
+			continue
+		}
+		for _, metric := range metricFamily.GetMetric() {
+			matched := len(metric.GetLabel()) == len(labels)
+			for _, label := range metric.GetLabel() {
+				if want, ok := labels[label.GetName()]; !ok || want != label.GetValue() {
+					matched = false
+					break
+				}
+			}
+			if matched && metric.GetGauge() != nil {
+				return metric.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
 }
 
 func managedDataset() *truenas.Dataset {
@@ -85,12 +109,13 @@ func TestComposeVolumeConditionMatrix(t *testing.T) {
 		PropProvisionSuccess: {Value: "false", Source: "local"},
 	}})
 
-	t.Run("healthy pool leaves the condition untouched", func(t *testing.T) {
+	t.Run("healthy pool reports an unverified temperature component", func(t *testing.T) {
 		got := composeVolumeCondition(base, &truenas.PoolHealthSnapshot{
 			Pool: "flashstor", Status: truenas.PoolStatusOnline, Healthy: true,
 			ScanFunction: truenas.PoolScanFunctionScrub, ScanState: truenas.PoolScanStateFinished,
 		})
-		assert.Equal(t, base, got)
+		assert.False(t, got.GetAbnormal())
+		assert.Contains(t, got.GetMessage(), "unverified")
 	})
 
 	t.Run("DEGRADED/FAULTED/UNAVAIL are abnormal", func(t *testing.T) {
@@ -144,7 +169,7 @@ func TestComposeVolumeConditionMatrix(t *testing.T) {
 		require.NotNil(t, got)
 		assert.False(t, got.GetAbnormal())
 		assert.Contains(t, got.GetMessage(), "3 errors")
-		assert.Contains(t, got.GetMessage(), "2 disk temperature alert(s)")
+		assert.Contains(t, got.GetMessage(), "unverified")
 	})
 
 	t.Run("a dataset-level failure outranks a pool warning", func(t *testing.T) {
@@ -231,14 +256,20 @@ func TestSampleBackendHealthKeepsLastGoodSnapshot(t *testing.T) {
 // TestSampleBackendHealthTemperatureFailureIsNonFatal proves a temperature-alert
 // failure still publishes the pool sample.
 func TestSampleBackendHealthTemperatureFailureIsNonFatal(t *testing.T) {
+	const pool = "nf3-temp-failure-pool"
 	mock := truenas.NewMockClient()
 	mock.InjectTempAlertErr = errors.New("simulated disk.temperature_alerts failure")
 	d := healthTestDriver(mock)
 
-	d.sampleBackendHealth(context.Background(), "flashstor")
+	d.sampleBackendHealth(context.Background(), pool)
 	snapshot := d.poolHealthSnapshot()
 	require.NotNil(t, snapshot)
 	assert.Equal(t, 0, snapshot.TemperatureAlerts)
+	assert.Contains(t, d.volumeCondition(managedDataset()).GetMessage(), "unverified")
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	_, hasAge := gatheredBackendHealthGauge(families, "scale_csi_pool_disk_temp_alerts_age_seconds", map[string]string{"pool": pool})
+	assert.False(t, hasAge, "a failed first temperature follow-up must not publish a current-looking age")
 }
 
 // TestStartBackendHealthDefaultOff is the zero-cost guard.
@@ -270,6 +301,72 @@ func TestStartBackendHealthRejectsInvalidInterval(t *testing.T) {
 	d.startBackendHealth()
 	d.stopBackendHealth()
 	assert.Zero(t, mock.PoolHealthCalls)
+}
+
+// TestStopBackendHealthBeforeStartIsTerminal pins the startup interleaving: a
+// shutdown that observes a nil cancel function must still prevent a later start
+// from launching the poller.
+func TestStopBackendHealthBeforeStartIsTerminal(t *testing.T) {
+	mock := truenas.NewMockClient()
+	mock.PoolHealthEntered = make(chan struct{}, 1)
+	d := healthTestDriver(mock)
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "1h"}
+
+	d.stopBackendHealth()
+	d.startBackendHealth()
+	select {
+	case <-mock.PoolHealthEntered:
+		t.Fatal("backend-health start launched a poll after stop had already completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	d.stopBackendHealth()
+	assert.Zero(t, mock.PoolHealthCalls)
+}
+
+// TestSampleBackendHealthRejectsMalformedDecodedSamples exercises the real
+// pool.query decoder through the driver. Wrong-pool, missing-status and
+// missing-healthy responses are failed samples and must not advance the
+// driver-owned last-success timestamp.
+func TestSampleBackendHealthRejectsMalformedDecodedSamples(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry func(pool string) map[string]interface{}
+	}{
+		{
+			name: "wrong-pool",
+			entry: func(string) map[string]interface{} {
+				return map[string]interface{}{"name": "different-pool", "status": "ONLINE", "healthy": true}
+			},
+		},
+		{
+			name: "missing-status",
+			entry: func(pool string) map[string]interface{} {
+				return map[string]interface{}{"name": pool, "healthy": true}
+			},
+		},
+		{
+			name: "missing-healthy",
+			entry: func(pool string) map[string]interface{} {
+				return map[string]interface{}{"name": pool, "status": "ONLINE"}
+			},
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := fmt.Sprintf("nf4-malformed-pool-%d", i)
+			mock := truenas.NewMockClient()
+			mock.PoolQueryResultSet = true
+			mock.PoolQueryResult = []interface{}{tc.entry(pool)}
+			d := healthTestDriver(mock)
+
+			d.sampleBackendHealth(context.Background(), pool)
+			assert.Nil(t, d.backendHealth.Load(), "a malformed decoded item must not publish a snapshot")
+			assert.Equal(t, 1, mock.PoolHealthCalls)
+			assert.Zero(t, testutil.ToFloat64(poolHealthLastSuccess.WithLabelValues(pool)),
+				"a malformed decoded item must not advance last-success")
+			assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
+		})
+	}
 }
 
 // TestSetPoolHealthMetricsIsOneHot proves a recovered pool does not leave a
@@ -538,10 +635,17 @@ func TestBackendHealthPublishesThePoolSampleBeforeTheSecondBackendRead(t *testin
 		"the RAW gauges must carry the sample as soon as it exists")
 	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
 		"the staleness verdict must be cleared by the sample, not by the disk-temperature call that follows it")
-	assert.True(t, d.volumeCondition(managedDataset()).GetAbnormal(),
+	condition := d.volumeCondition(managedDataset())
+	assert.True(t, condition.GetAbnormal(),
 		"every managed PVC must already read the new condition")
+	assert.Contains(t, condition.GetMessage(), "unverified",
+		"the pool component is fresh while the first temperature component is still in flight")
 	assert.NotZero(t, testutil.ToFloat64(poolHealthLastSuccess.WithLabelValues(pool)),
 		"the driver-owned last-success timestamp is part of the same publication")
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	_, hasTemperatureAge := gatheredBackendHealthGauge(families, "scale_csi_pool_disk_temp_alerts_age_seconds", map[string]string{"pool": pool})
+	assert.False(t, hasTemperatureAge, "the collector must not present an in-flight temperature follow-up as current")
 
 	close(release)
 	<-done
@@ -550,8 +654,113 @@ func TestBackendHealthPublishesThePoolSampleBeforeTheSecondBackendRead(t *testin
 	require.NotNil(t, refreshed)
 	assert.Equal(t, 1, refreshed.TemperatureAlerts, "the temperature count is refreshed onto the published sample")
 	assert.Equal(t, 1.0, testutil.ToFloat64(poolDiskTempAlerts.WithLabelValues(pool)))
+	assert.Contains(t, d.volumeCondition(managedDataset()).GetMessage(), "has 1 disk temperature alert(s)")
+	families, err = prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	_, hasTemperatureAge = gatheredBackendHealthGauge(families, "scale_csi_pool_disk_temp_alerts_age_seconds", map[string]string{"pool": pool})
+	assert.True(t, hasTemperatureAge, "a successful follow-up must publish the component age")
 	assert.Zero(t, d.backendHealthPendingFlips.Load(),
 		"the temperature refresh must NOT re-run the hysteresis; one backend sample must never count twice")
+}
+
+// TestBackendHealthCollectorGatherIsSingleGeneration uses the real default
+// registry Gather path while the production sampler alternates complete pool
+// observations. A scrape may see either generation, but it must never combine
+// the status from one with the healthy/scan/temperature fields from the other.
+func TestBackendHealthCollectorGatherIsSingleGeneration(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("the collector interleaving requires at least two schedulable Ps")
+	}
+	const pool = "nf1-collector-generation-pool"
+	mock := truenas.NewMockClient()
+	d := healthTestDriver(mock)
+
+	publishGeneration := func(generation int) {
+		online := generation%2 == 0
+		status := truenas.PoolStatusOffline
+		healthy := false
+		scanErrors := int64(202)
+		alerts := []string{"disk-a", "disk-b"}
+		if online {
+			status = truenas.PoolStatusOnline
+			healthy = true
+			scanErrors = 101
+			alerts = []string{"disk-a"}
+		}
+		mock.SetPoolHealthValue(&truenas.PoolHealthSnapshot{
+			Pool: pool, Status: status, Healthy: healthy,
+			ScanFunction: truenas.PoolScanFunctionScrub, ScanState: truenas.PoolScanStateFinished,
+			ScanErrors: scanErrors, Disks: []string{"disk-a", "disk-b"}, SampledAt: time.Now(),
+		})
+		mock.SetTemperatureAlerts(alerts)
+		d.sampleBackendHealth(context.Background(), pool)
+	}
+
+	publishGeneration(0)
+	var stop atomic.Bool
+	var readerWG sync.WaitGroup
+	mismatches := make(chan string, 1)
+	readerStarted := make(chan struct{})
+	var completeObservations atomic.Int64
+	readerWG.Add(1)
+	go func() {
+		defer readerWG.Done()
+		close(readerStarted)
+		for !stop.Load() {
+			families, err := prometheus.DefaultGatherer.Gather()
+			if err != nil {
+				select {
+				case mismatches <- fmt.Sprintf("gather failed: %v", err):
+				default:
+				}
+				return
+			}
+			online, onlineOK := gatheredBackendHealthGauge(families, "scale_csi_pool_status", map[string]string{"pool": pool, "status": truenas.PoolStatusOnline})
+			offline, offlineOK := gatheredBackendHealthGauge(families, "scale_csi_pool_status", map[string]string{"pool": pool, "status": truenas.PoolStatusOffline})
+			healthy, healthyOK := gatheredBackendHealthGauge(families, "scale_csi_pool_healthy", map[string]string{"pool": pool})
+			scanState, scanStateOK := gatheredBackendHealthGauge(families, "scale_csi_pool_scan_state", map[string]string{"pool": pool, "function": truenas.PoolScanFunctionScrub, "state": truenas.PoolScanStateFinished})
+			scanErrors, scanErrorsOK := gatheredBackendHealthGauge(families, "scale_csi_pool_scan_errors", map[string]string{"pool": pool})
+			temperature, temperatureOK := gatheredBackendHealthGauge(families, "scale_csi_pool_disk_temp_alerts", map[string]string{"pool": pool})
+			temperatureAge, temperatureAgeOK := gatheredBackendHealthGauge(families, "scale_csi_pool_disk_temp_alerts_age_seconds", map[string]string{"pool": pool})
+			stale, staleOK := gatheredBackendHealthGauge(families, "scale_csi_pool_health_stale", map[string]string{"pool": pool})
+			lastSuccess, lastSuccessOK := gatheredBackendHealthGauge(families, "scale_csi_pool_health_last_success_timestamp_seconds", map[string]string{"pool": pool})
+			flipPending, flipPendingOK := gatheredBackendHealthGauge(families, "scale_csi_pool_health_flip_pending", map[string]string{"pool": pool})
+			if !onlineOK || !offlineOK || !healthyOK || !scanStateOK || !scanErrorsOK || !temperatureOK || !temperatureAgeOK ||
+				!staleOK || !lastSuccessOK || !flipPendingOK {
+				continue
+			}
+			completeObservations.Add(1)
+			validOnline := online == 1 && offline == 0 && healthy == 1 && scanState == 1 && scanErrors == 101
+			validOffline := online == 0 && offline == 1 && healthy == 0 && scanState == 1 && scanErrors == 202
+			if temperature != 1 && temperature != 2 {
+				validOnline, validOffline = false, false
+			}
+			if temperatureAge < 0 || stale != 0 || lastSuccess <= 0 || flipPending < 0 || flipPending > 1 {
+				validOnline, validOffline = false, false
+			}
+			if !validOnline && !validOffline {
+				select {
+				case mismatches <- fmt.Sprintf("mixed generation: online=%v offline=%v healthy=%v scan_errors=%v temp_alerts=%v", online, offline, healthy, scanErrors, temperature):
+				default:
+				}
+				return
+			}
+		}
+	}()
+	<-readerStarted
+
+	for generation := 1; generation < 2000; generation++ {
+		publishGeneration(generation)
+		runtime.Gosched()
+	}
+	stop.Store(true)
+	readerWG.Wait()
+	select {
+	case mismatch := <-mismatches:
+		t.Fatal(mismatch)
+	default:
+	}
+	assert.Greater(t, completeObservations.Load(), int64(0), "the reader must observe complete backend-health metric generations")
 }
 
 // TestPoolHealthLastSuccessTimestampTracksSamplesNotScrapes pins N3: the triage

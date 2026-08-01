@@ -1,3 +1,6 @@
+{{- if and .Values.backendHealth.enabled (gt (int .Values.controller.replicas) 1) }}
+{{- fail "backendHealth.enabled requires controller.replicas=1: the poller has no leader election, and Deployment termination/eviction/drain can overlap producers even when rollout surge is zero" }}
+{{- end }}
 {{- if .Values.controller.enabled }}
 apiVersion: apps/v1
 kind: Deployment

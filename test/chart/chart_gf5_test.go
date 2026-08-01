@@ -319,12 +319,13 @@ func TestChartGF5BackendHealthPlumbing(t *testing.T) {
 			}
 		}
 		// The alert uses the SAME severity split as the VolumeCondition path: the
-		// two agree on WHICH states are abnormal.
-		if !strings.Contains(out, `status=~"DEGRADED|FAULTED|UNAVAIL"`) {
-			t.Errorf("ScaleCSIPoolDegraded must match the VolumeCondition severity split; got:\n%s", out)
-		}
-		if strings.Contains(out, `status=~"DEGRADED|FAULTED|UNAVAIL|OFFLINE`) {
-			t.Errorf("OFFLINE/REMOVED must not raise a critical alert; got:\n%s", out)
+		// two agree on WHICH states are abnormal. Assert the rendered selector as
+		// a complete object, not as a phrase that a decoy comment can satisfy.
+		degraded := renderedAlert(t, "ScaleCSIPoolDegraded")
+		degradedExpr, _ := degraded["expr"].(string)
+		statusSelector := regexp.MustCompile(`scale_csi_pool_status\{([^}]*)\}`).FindStringSubmatch(degradedExpr)
+		if len(statusSelector) != 2 || statusSelector[1] != `status=~"DEGRADED|FAULTED|UNAVAIL"` {
+			t.Errorf("ScaleCSIPoolDegraded must render the exact VolumeCondition severity selector; got %q", degradedExpr)
 		}
 		// M6 round 3: they do NOT agree on WHEN. The rendered rules must never
 		// promise otherwise, and must point at the two gauges that expose the
@@ -350,6 +351,21 @@ func TestChartGF5BackendHealthPlumbing(t *testing.T) {
 	})
 }
 
+// TestChartGF5BackendHealthRejectsMultipleControllerReplicas is the chart-side
+// enforcement for NF2. The poller has no leader-election gate; a second steady
+// replica is therefore a configuration error, while termination/drain/eviction
+// overlap remains a documented Deployment residual detected by the skew alert.
+func TestChartGF5BackendHealthRejectsMultipleControllerReplicas(t *testing.T) {
+	schemaOut := helmTemplateExpectError(t, "--set", "backendHealth.enabled=true", "--set", "controller.replicas=2")
+	if !strings.Contains(schemaOut, "value must be 1") {
+		t.Errorf("the values schema must reject multiple backend-health controller replicas; got:\n%s", schemaOut)
+	}
+	templateOut := helmTemplateExpectError(t, "--skip-schema-validation", "--set", "backendHealth.enabled=true", "--set", "controller.replicas=2")
+	if !strings.Contains(templateOut, "backendHealth.enabled requires controller.replicas=1") {
+		t.Errorf("the template must fail with the actionable replica constraint; got:\n%s", templateOut)
+	}
+}
+
 // TestChartGF5BackendHealthDashboardPanel proves the health panel ships with the
 // dashboard and references only registered metrics (the drift test covers the
 // name check; this covers presence).
@@ -360,6 +376,7 @@ func TestChartGF5BackendHealthDashboardPanel(t *testing.T) {
 		"scale_csi_pool_healthy",
 		"scale_csi_pool_scan_state",
 		"scale_csi_pool_disk_temp_alerts",
+		"scale_csi_pool_disk_temp_alerts_age_seconds",
 		// M6 round 3: an operator reading the panel must be able to tell a held or
 		// stale condition from a healthy one without leaving the dashboard.
 		"scale_csi_pool_health_flip_pending",
@@ -594,6 +611,8 @@ func TestGF5Fix3DocsAreHonestAboutSignalTiming(t *testing.T) {
 // numbered list, in canonical order, count-complete, with each item's own
 // boundedness qualifier inside that item's own text.
 
+// ADJUDICATED BOUNDARY: these guards defend against accidental drift; adversarial editing of prose is a non-goal.
+
 // signalTimingClasses is the CANONICAL taxonomy of ways the raw gauges, the
 // debounced VolumeCondition, the alert (raw gauge + its own `for` hold, observed
 // on Prometheus's cadence) and the external-health-monitor PVC refresh can
@@ -658,6 +677,10 @@ var (
 	// only a successful usable SAMPLE ends the stall.
 	backendAnswersRe = regexp.MustCompile(
 		`until (?:a|the) (?:backend|appliance|truenas)[^.\n]{0,30}?\b(answers?|answered|responds?|responded|replies|replied|returns?|returned|is reachable|comes back|recovers)\b`)
+	// pollStallTerminationRe is the termination statement itself. A neighboring
+	// sentence mentioning a successful sample is not enough: item 4 must say
+	// that the stall lasts until that sample arrives.
+	pollStallTerminationRe = regexp.MustCompile(`(?i)\blast(?:s|ing)?\s+until\s+(?:a|the)\s+successful\s+usable\s+sample\s+arrives\b`)
 	// numberedItemRe finds an enumeration entry marker. The leading group keeps
 	// it from matching inside a version or a decimal.
 	numberedItemRe = regexp.MustCompile(`(^|[^\w.])(\d{1,2})\.[ \t]+`)
@@ -750,6 +773,7 @@ func markerContent(line, marker string) string {
 // the same comment paragraph cannot be read as part of it.
 func extractSignalTimingTaxonomy(t *testing.T, name, body string) ([]taxonomyItem, int, int) {
 	t.Helper()
+	body = visibleTaxonomyBody(body)
 
 	anchorRe := regexp.MustCompile(`(^|[^\w.])1\.[ \t]+` + regexp.QuoteMeta(signalTimingClasses[0]))
 	all := anchorRe.FindAllStringIndex(body, -1)
@@ -882,7 +906,7 @@ func signalTimingSurfaces() []timingSurface {
 // process whose FIRST sample fails publishes no raw series at all (cold start).
 //
 // This test fails if ANY surface:
-//   - asserts a divergence count below six, or fails to state six;
+//   - asserts a divergence count below seven, or fails to state seven;
 //   - writes the enumeration as anything other than the canonical numbered
 //     classes, in canonical order, with no item missing and no item added;
 //   - puts the wrong boundedness qualifier inside an item's own text;
@@ -891,15 +915,15 @@ func signalTimingSurfaces() []timingSurface {
 func TestGF5Fix5SignalTimingTaxonomyIsStructurallyComplete(t *testing.T) {
 	for _, surface := range signalTimingSurfaces() {
 		t.Run(surface.name, func(t *testing.T) {
-			body := normalizeTimingProse(repoFile(t, surface.path...))
+			body := normalizeTimingProse(visibleTaxonomyBody(repoFile(t, surface.path...)))
 
 			if m := findTimingCountClaim(forbiddenWindowCountRe, body); m != "" {
-				t.Errorf("%s re-asserts an incomplete divergence count (%q). The taxonomy has SIX numbered classes — %s —"+
+				t.Errorf("%s re-asserts an incomplete divergence count (%q). The taxonomy has SEVEN numbered classes — %s —"+
 					" and a count stated on one surface is a promise on all of them.",
 					surface.name, m, strings.Join(signalTimingClasses, ", "))
 			}
 			if m := findTimingCountClaim(exactlyCountRe, body); m != "" {
-				t.Errorf("%s re-asserts an incomplete divergence count (%q); the taxonomy has SIX classes", surface.name, m)
+				t.Errorf("%s re-asserts an incomplete divergence count (%q); the taxonomy has SEVEN classes", surface.name, m)
 			}
 			if m := backendAnswersRe.FindString(body); m != "" {
 				t.Errorf("%s still ends the poll stall when %q. The stall ends at the next SUCCESSFUL USABLE sample:"+
@@ -934,7 +958,7 @@ func TestGF5Fix5SignalTimingTaxonomyIsStructurallyComplete(t *testing.T) {
 			}
 
 			if m := findTimingCountClaim(declaredClassCountRe, body); m == "" {
-				t.Errorf("%s enumerates the divergence classes but never states the count (six)", surface.name)
+				t.Errorf("%s enumerates the divergence classes but never states the count (seven)", surface.name)
 			}
 
 			if len(items) != len(signalTimingClasses) {
@@ -967,16 +991,21 @@ func TestGF5Fix5SignalTimingTaxonomyIsStructurallyComplete(t *testing.T) {
 					t.Errorf("%s: item %d (%s) must call itself UNBOUNDED, and must not claim a bound, inside its own"+
 						" text; got %q", surface.name, i+1, class, collapse(item.text))
 				}
+				itemText := collapseTaxonomyText(item.text)
 				// Item-SCOPED vocabulary. A required phrase sitting in a NEIGHBORING
 				// item is not this item saying it.
 				for _, required := range signalTimingClassRequires[class] {
-					if !strings.Contains(item.text, required) {
+					if !strings.Contains(itemText, required) {
 						t.Errorf("%s: item %d (%s) must state %q in ITS OWN text; got %q. Moving the phrase into another"+
 							" item leaves this one free to state the wrong termination condition.",
-							surface.name, i+1, class, required, collapse(item.text))
+							surface.name, i+1, class, required, itemText)
 					}
 				}
-				if m := backendAnswersRe.FindString(item.text); m != "" {
+				if class == "poll stall" && !pollStallTerminationRe.MatchString(itemText) {
+					t.Errorf("%s: item %d (%s) must make its OWN termination statement that the stall lasts until a successful"+
+						" usable sample arrives; got %q", surface.name, i+1, class, itemText)
+				}
+				if m := backendAnswersRe.FindString(itemText); m != "" {
 					t.Errorf("%s: item %d (%s) ends the window at %q. Only a SUCCESSFUL USABLE sample ends it — a valid"+
 						" pool.query that does not list the pool answers and is still a failed sample.",
 						surface.name, i+1, class, m)
@@ -992,6 +1021,43 @@ func firstLine(s string) string {
 
 func collapse(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// collapseTaxonomyText folds a numbered item while removing the line markers
+// used by Go/YAML/Markdown comment blocks. This lets the structural guards
+// assert a sentence that crosses a wrapped comment line without treating the
+// marker itself as prose.
+func collapseTaxonomyText(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		for _, marker := range []string{"//", "#", "|", "*"} {
+			if strings.HasPrefix(trimmed, marker) {
+				trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, marker))
+				break
+			}
+		}
+		trimmed = strings.NewReplacer("**", "", "`", "").Replace(trimmed)
+		lines[i] = trimmed
+	}
+	return collapse(strings.Join(lines, " "))
+}
+
+var nonVisibleHTMLBlockRe = regexp.MustCompile(`(?is)<!--.*?-->|<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>|<template\b[^>]*>.*?</template\s*>|<noscript\b[^>]*>.*?</noscript\s*>|<(?:div|span|section|article|p|li|ol|ul|table|thead|tbody|tr|td|th|pre)\b[^>]*(?:\bhidden\b|aria-hidden\s*=\s*["']?true|display\s*:\s*none|visibility\s*:\s*hidden)[^>]*>.*?</(?:div|span|section|article|p|li|ol|ul|table|thead|tbody|tr|td|th|pre)\s*>`)
+
+// visibleTaxonomyBody removes HTML comments and blocks that cannot be seen by
+// an operator before locating the canonical anchor. Newlines are retained so
+// diagnostics still point at useful source lines, and a visible duplicate
+// remains an ambiguity that must fail the guard.
+func visibleTaxonomyBody(body string) string {
+	return nonVisibleHTMLBlockRe.ReplaceAllStringFunc(body, func(hidden string) string {
+		return strings.Map(func(r rune) rune {
+			if r == '\n' {
+				return r
+			}
+			return ' '
+		}, hidden)
+	})
 }
 
 // collapseProse folds a wrapped comment block into a single line so a sentence
@@ -1049,9 +1115,20 @@ func triageRuleBlock(t *testing.T, production string) string {
 // survived in order.
 var conclusionVocabRe = regexp.MustCompile(`(?i)\b(real|defect|defects|bug|bugs|genuine|broken)\b`)
 
-// negationRe is what makes such a word legitimate: the procedure is allowed to
-// say "never conclude a defect from two zero gauges", and nothing else.
-var negationRe = regexp.MustCompile(`(?i)\b(not|never|cannot|can't|don't|do not|does not|must not|no|neither|rather than|instead of|without)\b`)
+// structuredConclusionNegationRe is deliberately narrow. A generic negation
+// token anywhere in the sentence lets "A mismatch is a defect, not a bug"
+// satisfy the guard for "defect" even though that conclusion is positive.
+var structuredConclusionNegationRe = regexp.MustCompile(`(?i)(?:\bnot\s+(?:a|an)?\s*(?:real\s+)?(?:defect|defects|bug|bugs|genuine|broken)|\bnever\s+conclude\s+(?:a|an)?\s*(?:real\s+)?(?:defect|defects|bug|bugs|genuine|broken))\s*$`)
+
+var (
+	triageConclusionStructureRe = regexp.MustCompile(`(?i)\bonly when\b[^.?!]*\bremaining difference\b[^.?!]*\bunexplained by the documented classes\b`)
+	triageExplicitNegationRe    = regexp.MustCompile(`(?i)\bnever conclude a defect from two diagnostic gauges reading 0\b`)
+)
+
+func conclusionWordIsNegated(flat string, loc []int) bool {
+	sentenceStart := strings.LastIndexAny(flat[:loc[0]], ".?!") + 1
+	return structuredConclusionNegationRe.MatchString(flat[sentenceStart:loc[1]])
+}
 
 func TestGF5Fix5TriageRuleRequiresSynchronizedObservations(t *testing.T) {
 	production := repoFile(t, "docs", "production.md")
@@ -1069,9 +1146,14 @@ func TestGF5Fix5TriageRuleRequiresSynchronizedObservations(t *testing.T) {
 	// sentence. This is the semantic form of the round-5 rule: it no longer
 	// matters which noun the wording picks.
 	flat := collapse(block)
+	structureFlat := strings.NewReplacer("**", "", "`", "").Replace(flat)
+	if !triageConclusionStructureRe.MatchString(structureFlat) || !triageExplicitNegationRe.MatchString(structureFlat) {
+		t.Errorf("the triage conclusion no longer has the required structure: one fresh pod observation must establish an"+
+			" unexplained difference before the explicit two-gauge conclusion is negated; got %q", flat)
+	}
 	for _, loc := range conclusionVocabRe.FindAllStringIndex(flat, -1) {
-		sentence := enclosingSentence(flat, loc[0], loc[1])
-		if !negationRe.MatchString(sentence) {
+		if !conclusionWordIsNegated(flat, loc) {
+			sentence := enclosingSentence(flat, loc[0], loc[1])
 			t.Errorf("the triage procedure declares a mismatch %q without negating it: %q. A remaining difference can"+
 				" only be called UNEXPLAINED, and only after sample age and producer identity have been checked.",
 				flat[loc[0]:loc[1]], strings.TrimSpace(sentence))
@@ -1198,11 +1280,11 @@ func TestGF5Fix5TimeBoundsIncludeTheCallTimeout(t *testing.T) {
 			if !strings.Contains(lower, "call timeout") && !strings.Contains(lower, "backendhealthcalltimeout") {
 				t.Errorf("%s states the confirmation bound without naming the backend call timeout that is part of it", surface.name)
 			}
-			if !strings.Contains(lower, perStep) && !strings.Contains(lower, confirmed) {
-				t.Errorf("%s does not state the bound COMPUTED from the shipped constants (maxBackendHealthInterval=%v,"+
-					" backendHealthCallTimeout=%v, backendHealthFlipSamples=%d): %s per confirmation step, %s to a"+
-					" confirmed condition at the ceiling. Changing a constant without updating this text is exactly"+
-					" the drift this asserts.", surface.name, maxInterval, callTimeout, flipSamples, perStep, confirmed)
+			if !strings.Contains(lower, confirmed) {
+				t.Errorf("%s does not state the AGGREGATE confirmed bound COMPUTED from the shipped constants (maxBackendHealthInterval=%v,"+
+					" backendHealthCallTimeout=%v, backendHealthFlipSamples=%d): %s to a confirmed condition at the ceiling."+
+					" A per-step bound (%s) is not sufficient; changing a constant without updating the aggregate text is"+
+					" exactly the drift this asserts.", surface.name, maxInterval, callTimeout, flipSamples, confirmed, perStep)
 			}
 			// The number is a DRIVER-SIDE publication bound. Presenting it as an
 			// end-to-end PVC/alert deadline is the round-5 overclaim.
@@ -1233,9 +1315,10 @@ func TestGF5Fix5PollStallEndsAtAUsableSample(t *testing.T) {
 		{name: "charts/scale-csi/values.schema.json", path: []string{"charts", "scale-csi", "values.schema.json"}},
 	} {
 		t.Run(surface.name, func(t *testing.T) {
-			body := normalizeTimingProse(repoFile(t, surface.path...))
-			if !strings.Contains(body, "successful usable sample") {
-				t.Errorf("%s does not say the poll stall ends at a SUCCESSFUL USABLE sample", surface.name)
+			body := normalizeTimingProse(visibleTaxonomyBody(repoFile(t, surface.path...)))
+			items, _, _ := extractSignalTimingTaxonomy(t, surface.name, body)
+			if len(items) <= 3 || !pollStallTerminationRe.MatchString(collapseTaxonomyText(items[3].text)) {
+				t.Errorf("%s does not make the poll stall's OWN item say it lasts until a SUCCESSFUL USABLE sample arrives", surface.name)
 			}
 		})
 	}
@@ -1285,11 +1368,8 @@ func renderedAlert(t *testing.T, name string) manifest {
 func TestGF5Fix5ReplicaSkewIsDetectable(t *testing.T) {
 	skew := renderedAlert(t, "ScaleCSIPoolHealthProducerSkew")
 	expr, _ := skew["expr"].(string)
-	if !strings.Contains(expr, "scale_csi_pool_health_last_success_timestamp_seconds") {
-		t.Errorf("ScaleCSIPoolHealthProducerSkew must count producers via the driver-owned last-success timestamp; got %q", expr)
-	}
-	if !strings.Contains(expr, "count") {
-		t.Errorf("ScaleCSIPoolHealthProducerSkew must COUNT series (one per publishing process); got %q", expr)
+	if !regexp.MustCompile(`^\s*count\s+by\s+\(\s*pool\s*\)\s*\(\s*scale_csi_pool_health_last_success_timestamp_seconds\s*\)\s*>\s*1\s*$`).MatchString(expr) {
+		t.Errorf("ScaleCSIPoolHealthProducerSkew must render count by (pool) of the driver-owned timestamp > 1; got %q", expr)
 	}
 
 	// The chart must also render a NON-OVERLAPPING rollout when the poller is on,

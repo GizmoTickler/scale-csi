@@ -148,7 +148,12 @@ type Driver struct {
 	// (pool.query + disk.temperature_alerts) and never writes.
 	backendHealthCancel context.CancelFunc
 	backendHealthWg     sync.WaitGroup
-	backendHealth       atomic.Pointer[truenas.PoolHealthSnapshot]
+	// backendHealthStateMu serializes startup and shutdown. Stop is terminal for
+	// this Driver: recording that state closes the interleaving where Stop sees a
+	// nil cancel before Run assigns it and Run then starts a poller anyway.
+	backendHealthStateMu sync.Mutex
+	backendHealthStopped bool
+	backendHealth        atomic.Pointer[truenas.PoolHealthSnapshot]
 	// backendHealthPendingFlips counts CONSECUTIVE samples that disagree with the
 	// currently published verdict. The fan-out only flips once it reaches
 	// backendHealthFlipSamples, so a flapping pool cannot rewrite every managed

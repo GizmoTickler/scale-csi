@@ -165,6 +165,23 @@ func (m *MockClient) PoolHealth(ctx context.Context, pool string) (*PoolHealthSn
 	}, nil
 }
 
+// SetPoolHealthValue updates the health fixture through the mock's lock so a
+// test can change the backend response while a real production poll is in
+// flight.
+func (m *MockClient) SetPoolHealthValue(snapshot *PoolHealthSnapshot) {
+	m.mu.Lock()
+	m.PoolHealthValue = snapshot
+	m.mu.Unlock()
+}
+
+// SetTemperatureAlerts updates the temperature fixture through the mock's lock
+// for concurrent production-path sampling tests.
+func (m *MockClient) SetTemperatureAlerts(alerts []string) {
+	m.mu.Lock()
+	m.TemperatureAlerts = append([]string(nil), alerts...)
+	m.mu.Unlock()
+}
+
 func (m *MockClient) DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error) {
 	if len(names) == 0 {
 		return nil, nil

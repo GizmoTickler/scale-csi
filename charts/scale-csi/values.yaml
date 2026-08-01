@@ -67,7 +67,10 @@ capacity:
 # STEADY-STATE API COST when enabled: at most TWO reads (pool.query +
 # disk.temperature_alerts) per interval PER CONTROLLER REPLICA, and zero writes.
 # Like the capacity gauge loop it has no leader-election gate; the supported
-# configuration is controller.replicas=1. No effect on the CreateVolume /
+# configuration is controller.replicas=1; Helm rejects a larger replica count.
+# maxSurge 0 only covers rollout surge — Deployment termination, drain and
+# eviction overlap remain an inherent residual detected by the skew alert, not
+# prevented by this chart. No effect on the CreateVolume /
 # publish / unpublish request-path golden totals.
 #
 # The fan-out is damped so a flapping or unreachable backend cannot churn every
@@ -127,7 +130,10 @@ capacity:
 #      controller.replicas=1, which is why enabling backendHealth renders a
 #      non-overlapping rollout. Detect it with
 #      count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds) > 1
-#      (alert ScaleCSIPoolHealthProducerSkew).
+#      (alert ScaleCSIPoolHealthProducerSkew). Termination, drain and eviction
+#      overlap remain residuals detected rather than prevented by that alert.
+# The temperature count is accompanied by scale_csi_pool_disk_temp_alerts_age_seconds;
+# an absent age means the follow-up has not successfully returned yet.
 # Read scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before
 # treating a PVC condition as wrong, but remember they do not cover the alert
 # hold, observer lag, cold start or replica skew. Full contract:
@@ -139,9 +145,10 @@ backendHealth:
   enabled: false
   # Poll cadence, clamped to 30s-2m. The 2m CEILING is not arbitrary: the
   # two-sample hysteresis makes a CONFIRMED condition flip take up to
-  # 2 x interval, which has to stay inside the 5m ScaleCSIPoolDegraded hold —
-  # WHILE SUCCESSFUL SAMPLES KEEP ARRIVING; it is a cadence bound, not a
-  # wall-clock guarantee, and it cannot cover a sample that never arrives. An
+  # 2 x interval PLUS one 30s backend call timeout (4m30s at the ceiling),
+  # which has to stay inside the 5m ScaleCSIPoolDegraded hold — WHILE
+  # SUCCESSFUL SAMPLES KEEP ARRIVING; it is a cadence bound, not a wall-clock
+  # guarantee, and it cannot cover a sample that never arrives. An
   # out-of-range value is clamped (one warning at controller startup), never
   # rejected. The staleness TTL is three times the EFFECTIVE (clamped) value: 3m
   # at this default, never more than 6m.

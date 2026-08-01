@@ -50,7 +50,15 @@ type PoolHealthSnapshot struct {
 	// TemperatureAlerts is the number of member disks currently raising a
 	// temperature alert (0 = healthy).
 	TemperatureAlerts int
-	SampledAt         time.Time
+	// TemperatureSampledAt is when disk.temperature_alerts last returned
+	// successfully. It is separate from SampledAt because the temperature read
+	// is a follow-up call and may fail or still be in flight after pool.query has
+	// published a fresh pool component.
+	TemperatureSampledAt time.Time
+	// SampledAt is when pool.query returned successfully. Both timestamps are
+	// wall-clock, process-local observations; callers must not treat an absent
+	// temperature timestamp as a current zero-alert result.
+	SampledAt time.Time
 }
 
 // Degraded reports a pool state that makes the data path genuinely at risk.
@@ -102,13 +110,26 @@ func poolHealthFromQueryResult(pool string, result interface{}) (*PoolHealthSnap
 		return nil, fmt.Errorf("unexpected pool.query entry type %T", pools[0])
 	}
 
-	snapshot := &PoolHealthSnapshot{Pool: pool, SampledAt: time.Now()}
-	if v, ok := entry["status"].(string); ok {
-		snapshot.Status = strings.ToUpper(strings.TrimSpace(v))
+	name, ok := entry["name"].(string)
+	if !ok || strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("pool %s query result has no usable name", pool)
 	}
-	if v, ok := entry["healthy"].(bool); ok {
-		snapshot.Healthy = v
+	name = strings.TrimSpace(name)
+	if name != pool {
+		return nil, fmt.Errorf("pool query returned %q while requesting %q", name, pool)
 	}
+	status, ok := entry["status"].(string)
+	if !ok || strings.TrimSpace(status) == "" {
+		return nil, fmt.Errorf("pool %s query result has no usable status", pool)
+	}
+	healthy, ok := entry["healthy"].(bool)
+	if !ok {
+		return nil, fmt.Errorf("pool %s query result has no usable healthy field", pool)
+	}
+
+	snapshot := &PoolHealthSnapshot{Pool: name, SampledAt: time.Now()}
+	snapshot.Status = strings.ToUpper(strings.TrimSpace(status))
+	snapshot.Healthy = healthy
 	if v, ok := entry["warning"].(bool); ok {
 		snapshot.Warning = v
 	}

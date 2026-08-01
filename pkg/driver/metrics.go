@@ -1,7 +1,6 @@
 package driver
 
 import (
-	"strings"
 	"sync"
 	"time"
 
@@ -325,119 +324,6 @@ var (
 		[]string{"pool", "dataset"},
 	)
 
-	// Backend-health gauges (GF5 E4). Published only when backendHealth.enabled
-	// by a controller-only READ-ONLY poll loop. ZFS has no per-dataset health, so
-	// these are per-POOL signals that the VolumeCondition path fans out to every
-	// managed volume on that pool.
-	//
-	// pool_status is a one-hot series over the {pool,status} label pair: exactly
-	// one status label is 1 at a time, the rest are 0, so `max by (pool)` style
-	// queries and label-based alerting both work.
-	poolStatus = regGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "pool_status",
-			Help:      "ZFS pool status, one-hot over the status label (1 = current status)",
-		},
-		[]string{"pool", "status"},
-	)
-
-	poolHealthy = regGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "pool_healthy",
-			Help:      "1 when TrueNAS reports the pool healthy, 0 otherwise",
-		},
-		[]string{"pool"},
-	)
-
-	// poolScanState is one-hot over {pool,function,state}: it reports whether a
-	// scrub or resilver is SCANNING/FINISHED/CANCELED. A running scrub is normal
-	// maintenance, not ill health, which is why it is a separate series from
-	// pool_healthy rather than folded into it.
-	poolScanState = regGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "pool_scan_state",
-			Help:      "ZFS pool scrub/resilver state, one-hot over the function and state labels (1 = current)",
-		},
-		[]string{"pool", "function", "state"},
-	)
-
-	poolScanErrors = regGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "pool_scan_errors",
-			Help:      "Errors reported by the pool's most recent scrub/resilver",
-		},
-		[]string{"pool"},
-	)
-
-	poolDiskTempAlerts = regGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "pool_disk_temp_alerts",
-			Help:      "Number of the pool's member disks currently raising a temperature alert",
-		},
-		[]string{"pool"},
-	)
-
-	// poolHealthStale is 1 when the VolumeCondition the driver is serving is NOT
-	// backed by a fresh sample: the cached snapshot aged past its TTL (so
-	// conditions have fallen back to dataset-only), a pending condition flip never
-	// received the confirming sample it is waiting on, or no successful usable
-	// sample has landed since this process started (cold start — at which point
-	// the other scale_csi_pool_* series are ABSENT rather than frozen). Every
-	// other scale_csi_pool_* gauge is only current while this is 0.
-	poolHealthStale = regGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "pool_health_stale",
-			Help:      "1 when the served VolumeCondition is not backed by a fresh sample (snapshot past its TTL, a pending flip whose confirming sample never arrived, or no successful sample since startup)",
-		},
-		[]string{"pool"},
-	)
-
-	// poolHealthLastSuccess is the DRIVER-OWNED time of the most recent
-	// successful usable pool sample. It exists because PromQL cannot recover it:
-	// timestamp(some_gauge) returns the SAMPLE's timestamp, which for a pull
-	// exporter is the SCRAPE time, and a frozen driver that keeps answering
-	// scrapes therefore looks perfectly fresh by that query while a scrape outage
-	// makes a healthy driver look stale. A last-change time has to be exported as
-	// its own gauge, which is what this is: it advances ONLY when a sample
-	// succeeds, never on a scrape, and it is the correct input to
-	// `time() - scale_csi_pool_health_last_success_timestamp_seconds`.
-	//
-	// It is also the producer-identity probe: each controller process publishes
-	// its OWN series, so `count by (pool) (...) > 1` says two processes are
-	// publishing and the alerts' `max by (pool)` is merging independently sampled
-	// histories (the replica-skew class).
-	poolHealthLastSuccess = regGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "pool_health_last_success_timestamp_seconds",
-			Help:      "Unix timestamp of the most recent successful usable pool health sample (driver-owned; not the scrape time)",
-		},
-		[]string{"pool"},
-	)
-
-	// poolHealthFlipPending is 1 while a health transition is waiting for its
-	// confirming sample. It makes the confirmation-lag and recovery classes of
-	// raw-vs-condition divergence observable instead of implicit. It is NOT a
-	// complete disagreement detector: it reads 0 during the alert-hold class, and
-	// past the staleness TTL it can still read 1 after the condition has fallen
-	// back to dataset-only, where the served condition is NOT the previous verdict.
-	// It also says nothing about the observer-lag and cold-start classes. See
-	// backendHealthFlipSamples for the canonical numbered list.
-	poolHealthFlipPending = regGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Name:      "pool_health_flip_pending",
-			Help:      "1 while a pool-health transition awaits its confirming sample; until the staleness TTL expires the per-PVC VolumeCondition still carries the previous verdict",
-		},
-		[]string{"pool"},
-	)
-
 	reconcileLastSuccessTimestamp = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -724,6 +610,14 @@ func RecordReconcileSuccess(at time.Time) {
 	reconcileLastSuccessTimestamp.Set(float64(at.Unix()))
 }
 
+// Backend-health timing notes belong to the canonical taxonomy in
+// backendHealthFlipSamples. ScaleCSIPoolDegraded is deliberately not gated on
+// this one (scale_csi_pool_health_stale): a FROZEN DEGRADED sample keeps that alert firing
+// until a successful sample changes it. pool_health_flip_pending is NOT a
+// complete disagreement detector; it is silent during alert hold, observer lag
+// and cold start, and can remain 1 after the staleness TTL. See
+// backendHealthFlipSamples in pkg/driver/backend_health.go.
+
 // poolStatusLabels is the fixed status label set the one-hot pool_status series
 // covers. Keeping it fixed bounds cardinality and means a status that goes away
 // is explicitly zeroed instead of leaving a stale 1 behind.
@@ -762,206 +656,6 @@ var poolScanFunctionLabels = []string{
 	truenas.PoolScanFunctionScrub,
 	truenas.PoolScanFunctionResilver,
 	poolScanNone,
-}
-
-// poolDynamicStatuses remembers the UNRECOGNIZED pool_status labels this process
-// has ever exported, per pool, so they can be zeroed when the pool moves on.
-// Without it an unknown status stays pinned at 1 forever — the exact
-// stale-alerting failure the one-hot design exists to prevent.
-//
-// poolDynamicScanCells does the same job for pool_scan_state, keyed by the
-// {function,state} PAIR. Both dimensions can carry a value outside the fixed
-// sets (an unknown scan function, an unknown scan state, or both), and such a
-// cell lives outside the zeroing cross-product below — so without this registry
-// it would stay pinned at 1 forever while a later known sample lit a second
-// cell, breaking one-hot exactly where an operator is least likely to notice.
-var (
-	poolDynamicStatusMu sync.Mutex
-	poolDynamicStatuses = map[string]map[string]struct{}{}
-
-	poolDynamicScanMu    sync.Mutex
-	poolDynamicScanCells = map[string]map[[2]string]struct{}{}
-)
-
-// SetPoolHealthMetrics publishes one backend-health sample. Every one-hot series
-// is rewritten on each sample (current label 1, all others 0) so a recovered
-// pool never leaves a stale DEGRADED series firing an alert forever.
-func SetPoolHealthMetrics(snapshot *truenas.PoolHealthSnapshot) {
-	if snapshot == nil || snapshot.Pool == "" {
-		return
-	}
-	current := strings.ToUpper(strings.TrimSpace(snapshot.Status))
-	matched := false
-	for _, label := range poolStatusLabels {
-		value := 0.0
-		if label == current {
-			value, matched = 1.0, true
-		}
-		poolStatus.WithLabelValues(snapshot.Pool, label).Set(value)
-	}
-	setDynamicPoolStatus(snapshot.Pool, current, matched)
-
-	healthy := 0.0
-	if snapshot.Healthy {
-		healthy = 1
-	}
-	poolHealthy.WithLabelValues(snapshot.Pool).Set(healthy)
-
-	currentFunction := strings.ToUpper(strings.TrimSpace(snapshot.ScanFunction))
-	if currentFunction == "" {
-		currentFunction = poolScanNone
-	}
-	currentScan := strings.ToUpper(strings.TrimSpace(snapshot.ScanState))
-	if currentScan == "" {
-		// Idle is a STATE, not the absence of one. Mapping it onto the NONE label
-		// keeps the cross-product one-hot for a pool that has never been scanned.
-		currentScan = poolScanNone
-	}
-	scanMatched := false
-	for _, function := range poolScanFunctionLabels {
-		for _, label := range poolScanStateLabels {
-			value := 0.0
-			if function == currentFunction && label == currentScan {
-				value, scanMatched = 1.0, true
-			}
-			poolScanState.WithLabelValues(snapshot.Pool, function, label).Set(value)
-		}
-	}
-	// A scan function OR state the driver does not know about still has to be
-	// visible, and still has to be retired on the next sample, so route it through
-	// the same bookkeeping as the fixed set.
-	setDynamicPoolScanState(snapshot.Pool, currentFunction, currentScan, scanMatched)
-
-	poolScanErrors.WithLabelValues(snapshot.Pool).Set(float64(snapshot.ScanErrors))
-	poolDiskTempAlerts.WithLabelValues(snapshot.Pool).Set(float64(snapshot.TemperatureAlerts))
-}
-
-// setDynamicPoolStatus exports an unrecognized status as 1 and zeroes every
-// previously-exported unrecognized status for that pool.
-func setDynamicPoolStatus(pool, current string, matched bool) {
-	poolDynamicStatusMu.Lock()
-	defer poolDynamicStatusMu.Unlock()
-	seen := poolDynamicStatuses[pool]
-	for label := range seen {
-		if label == current && !matched {
-			continue
-		}
-		poolStatus.WithLabelValues(pool, label).Set(0)
-	}
-	if matched || current == "" {
-		return
-	}
-	poolStatus.WithLabelValues(pool, current).Set(1)
-	if seen == nil {
-		seen = map[string]struct{}{}
-		poolDynamicStatuses[pool] = seen
-	}
-	seen[current] = struct{}{}
-}
-
-// setDynamicPoolScanState exports a {function,state} cell that falls outside the
-// fixed cross-product as 1, and RETIRES every such cell this process previously
-// exported for the pool by zeroing it.
-//
-// Retiring matters more here than the initial export does: the fixed
-// cross-product loop above cannot zero a cell whose labels it does not enumerate,
-// so an unknown function (or unknown state) observed once would otherwise stay at
-// 1 for the process's lifetime and sit alongside whatever cell the current sample
-// lights — two series at 1, which is precisely the one-hot contract violation the
-// design is supposed to rule out.
-func setDynamicPoolScanState(pool, function, state string, matched bool) {
-	poolDynamicScanMu.Lock()
-	defer poolDynamicScanMu.Unlock()
-	current := [2]string{function, state}
-	seen := poolDynamicScanCells[pool]
-	for cell := range seen {
-		if cell == current && !matched {
-			continue
-		}
-		poolScanState.WithLabelValues(pool, cell[0], cell[1]).Set(0)
-		delete(seen, cell)
-	}
-	if matched || function == "" || state == "" {
-		if len(seen) == 0 {
-			delete(poolDynamicScanCells, pool)
-		}
-		return
-	}
-	poolScanState.WithLabelValues(pool, function, state).Set(1)
-	if seen == nil {
-		seen = map[[2]string]struct{}{}
-		poolDynamicScanCells[pool] = seen
-	}
-	seen[current] = struct{}{}
-}
-
-// SetPoolHealthStale publishes whether the VolumeCondition currently being
-// served is backed by a fresh sample. 1 means it is NOT: the snapshot aged past
-// its TTL (conditions have fallen back to dataset-only, so a stale verdict stops
-// driving CONDITIONS), a pending flip's confirming sample never arrived (the
-// served verdict is one the driver's own latest raw sample already contradicts),
-// or no successful usable sample has landed since startup (cold start).
-//
-// It does NOT silence alerting, and nothing here stops a stale verdict from
-// alerting: ScaleCSIPoolDegraded reads the RAW gauge and is deliberately not
-// gated on this one (charts/scale-csi/templates/prometheusrule.yaml), so a
-// FROZEN DEGRADED sample keeps that alert firing after a real recovery until a
-// successful usable sample changes it. Publishing this gauge is what makes that
-// state diagnosable — ScaleCSIPoolHealthStale is the signal to distrust every
-// other scale_csi_pool_* series.
-func SetPoolHealthStale(pool string, stale bool) {
-	if pool == "" {
-		return
-	}
-	value := 0.0
-	if stale {
-		value = 1
-	}
-	poolHealthStale.WithLabelValues(pool).Set(value)
-}
-
-// SetPoolHealthLastSuccess publishes the driver's own last successful usable
-// sample time. Call it ONLY from the successful-sample publication path: the
-// whole point is that it does not move when a scrape happens, when a sample
-// fails, or when a pool.query answers without listing the pool.
-func SetPoolHealthLastSuccess(pool string, at time.Time) {
-	if pool == "" || at.IsZero() {
-		return
-	}
-	poolHealthLastSuccess.WithLabelValues(pool).Set(float64(at.UnixNano()) / 1e9)
-}
-
-// SetPoolDiskTemperatureAlerts refreshes the per-disk temperature alert count on
-// an already published sample. disk.temperature_alerts is a SECOND backend call;
-// publishing the pool verdict first and correcting this count when the call
-// returns is what keeps a valid pool sample from sitting unpublished behind it.
-func SetPoolDiskTemperatureAlerts(pool string, alerts int) {
-	if pool == "" {
-		return
-	}
-	poolDiskTempAlerts.WithLabelValues(pool).Set(float64(alerts))
-}
-
-// SetPoolHealthFlipPending publishes whether a pool-health transition is waiting
-// for its confirming sample — the operator-visible form of the fan-out
-// hysteresis. While it is 1 AND the held snapshot is still inside its staleness
-// TTL, the raw gauges and the per-PVC VolumeCondition deliberately disagree and
-// the condition carries the previous verdict.
-//
-// Those are NOT the same statement, and this gauge is NOT a complete
-// disagreement detector: past the TTL it can still read 1 while the condition
-// has fallen back to dataset-only (which is not the previous verdict, and which
-// may well agree with the raw sample), and it reads 0 throughout the alert-hold,
-// observer-lag and cold-start classes. See backendHealthFlipSamples.
-func SetPoolHealthFlipPending(pool string, pending bool) {
-	if pool == "" {
-		return
-	}
-	value := 0.0
-	if pending {
-		value = 1
-	}
-	poolHealthFlipPending.WithLabelValues(pool).Set(value)
 }
 
 // SetPoolCapacityMetrics publishes the latest parent-dataset capacity sample.

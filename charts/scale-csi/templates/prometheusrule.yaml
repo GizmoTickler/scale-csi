@@ -237,7 +237,10 @@ spec:
           #   7. replica skew (UNBOUNDED: the poller has no leader-election gate,
           #      so every replica — and, with fencing.mode=off, an overlapping
           #      rollout — publishes its own sampled history, which the `max by
-          #      (pool)` below merges. ScaleCSIPoolHealthProducerSkew detects it).
+          #      (pool)` below merges. Helm rejects replicas > 1 when this poller
+          #      is enabled and maxSurge 0 removes rollout surge, but Deployment
+          #      termination/drain/eviction overlap remains inherent and is
+          #      detected, not prevented, by ScaleCSIPoolHealthProducerSkew).
           # See docs/production.md#backend-health; the canonical list lives on
           # backendHealthFlipSamples in pkg/driver/backend_health.go.
           expr: max(scale_csi_pool_status{status=~"DEGRADED|FAULTED|UNAVAIL"}) by (pool) == 1
@@ -262,7 +265,7 @@ spec:
             severity: warning
           annotations:
             summary: Scale CSI backend pool has a disk temperature alert
-            description: At least one member disk of the pool backing Scale CSI volumes is raising a temperature alert.
+            description: At least one member disk of the pool backing Scale CSI volumes is raising a temperature alert. Interpret the count with scale_csi_pool_disk_temp_alerts_age_seconds; the age is absent until disk.temperature_alerts has returned successfully and is the component's actual observation age thereafter.
         - alert: ScaleCSIPoolHealthStale
           # Fires when the served VolumeCondition is no longer backed by a fresh
           # sample, and is the reason to distrust every other scale_csi_pool_*
@@ -312,13 +315,13 @@ spec:
           # (one series per controller process). The 15m hold is longer than any
           # normal rollout, so this fires on a STANDING second producer -
           # replicas > 1 - rather than on a routine restart.
-          expr: count(scale_csi_pool_health_last_success_timestamp_seconds) by (pool) > 1
+          expr: count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds) > 1
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: More than one Scale CSI controller is publishing backend health
-            description: Two or more controller processes are publishing scale_csi_pool_* series for the same pool, so every max by (pool) rule is merging independently sampled histories and the per-PVC VolumeCondition comes from whichever process the external health monitor is elected in. This is the replica-skew class - a producer-identity difference, not a timing one, and nothing in the driver bounds it. The supported single-producer configuration for backendHealth is controller.replicas=1; enabling backendHealth also renders a non-overlapping rollout so an upgrade does not create a second producer. Until this clears, pin one pod label before comparing gauges, conditions and alerts.
+            description: Two or more controller processes are publishing scale_csi_pool_* series for the same pool, so every max by (pool) rule is merging independently sampled histories and the per-PVC VolumeCondition comes from whichever process the external health monitor is elected in. This is the replica-skew class - a producer-identity difference, not a timing one, and nothing in the driver bounds it. The supported single-producer configuration for backendHealth is controller.replicas=1 and Helm rejects a larger value; maxSurge 0 removes rollout surge, but Deployment termination, drain and eviction can still overlap producers. This alert detects that residual, it does not fence it. Until this clears, pin one pod label before comparing gauges, conditions and alerts.
         {{- end }}
         {{- end }}
 {{- end }}

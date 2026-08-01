@@ -127,9 +127,9 @@ const backendHealthStaleIntervals = 3
 //
 // The fan-out is fleet-wide by construction — one pool backs every volume — so
 // an unfiltered DEGRADED<->ONLINE flap would rewrite N conditions and churn N
-// PVC events on every tick. Metrics are deliberately NOT damped: SetPoolHealthMetrics
-// always publishes the raw sample, so a flap stays fully visible to Prometheus
-// while the per-PVC condition stays stable.
+// PVC events on every tick. Metrics are deliberately NOT damped: the immutable
+// backend-health collector always publishes the raw sample, so a flap stays
+// fully visible to Prometheus while the per-PVC condition stays stable.
 //
 // The FIRST observation is never damped: with no previous snapshot there is
 // nothing to flap against, and delaying the initial signal would only blind the
@@ -227,6 +227,13 @@ const backendHealthStaleIntervals = 3
 //     alerts on. The chart's supported single-producer configuration is
 //     controller.replicas = 1 with the non-overlapping rollout the chart renders
 //     when backendHealth.enabled (maxSurge 0, or Recreate under fencing).
+
+// The disk-temperature follow-up is not an eighth timing class: it is a
+// separate component in the immutable published snapshot. Its observation
+// time travels with its count, so an in-flight or failed refresh is exposed as
+// unverified or aged rather than paired with a fresh-looking zero/current value.
+// The last-success and temperature timestamps are wall-clock, process-local
+// observations; they reset on restart and can move when the wall clock steps.
 const backendHealthFlipSamples = 2
 
 // startBackendHealth launches the controller-only backend-health poll loop when
@@ -236,6 +243,11 @@ const backendHealthFlipSamples = 2
 // DEFAULT OFF: an un-opted-in deployment issues zero additional API calls and
 // its VolumeConditions keep the exact dataset-only semantics they had before.
 func (d *Driver) startBackendHealth() {
+	d.backendHealthStateMu.Lock()
+	defer d.backendHealthStateMu.Unlock()
+	if d.backendHealthStopped || d.backendHealthCancel != nil {
+		return
+	}
 	if d.config == nil || !d.config.BackendHealth.Enabled {
 		return
 	}
@@ -265,42 +277,52 @@ func (d *Driver) startBackendHealth() {
 	ctx, cancel := context.WithCancel(context.Background())
 	d.backendHealthCancel = cancel
 	d.backendHealthWg.Add(1)
-	go func() {
-		defer d.backendHealthWg.Done()
-		klog.Infof("Backend health polling started: interval=%v pool=%s", interval, pool)
-		run := func() {
-			// Publish the staleness verdict BEFORE the call, not only after it: a
-			// hung poll may burn the whole backendHealthCallTimeout, and until it
-			// returns the error branch in sampleBackendHealth cannot run. Without
-			// this, a snapshot that expires during a stalled call leaves a frozen
-			// DEGRADED gauge alerting with BOTH diagnostics reading 0.
-			d.markPoolHealthStaleIfExpired()
-			callCtx, callCancel := context.WithTimeout(ctx, backendHealthCallTimeout)
-			defer callCancel()
-			d.sampleBackendHealth(callCtx, pool)
+	// The goroutine is launched after the state is published and before this
+	// method releases the state mutex. Stop therefore either sees this complete
+	// startup or marks the driver stopped before startup can commit.
+	go d.runBackendHealth(ctx, interval, pool)
+}
+
+func (d *Driver) runBackendHealth(ctx context.Context, interval time.Duration, pool string) {
+	defer d.backendHealthWg.Done()
+	klog.Infof("Backend health polling started: interval=%v pool=%s", interval, pool)
+	run := func() {
+		// Publish the staleness verdict BEFORE the call, not only after it: a
+		// hung poll may burn the whole backendHealthCallTimeout, and until it
+		// returns the error branch in sampleBackendHealth cannot run. Without
+		// this, a snapshot that expires during a stalled call leaves a frozen
+		// DEGRADED gauge alerting with BOTH diagnostics reading 0.
+		d.markPoolHealthStaleIfExpired()
+		callCtx, callCancel := context.WithTimeout(ctx, backendHealthCallTimeout)
+		defer callCancel()
+		d.sampleBackendHealth(callCtx, pool)
+	}
+	// Populate immediately so the first ControllerGetVolume after startup is
+	// already pool-aware rather than falling back for a whole interval.
+	run()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			run()
+		case <-ctx.Done():
+			klog.Info("Backend health polling stopped")
+			return
 		}
-		// Populate immediately so the first ControllerGetVolume after startup is
-		// already pool-aware rather than falling back for a whole interval.
-		run()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				run()
-			case <-ctx.Done():
-				klog.Info("Backend health polling stopped")
-				return
-			}
-		}
-	}()
+	}
 }
 
 func (d *Driver) stopBackendHealth() {
-	if d.backendHealthCancel != nil {
-		d.backendHealthCancel()
-		d.backendHealthWg.Wait()
+	d.backendHealthStateMu.Lock()
+	d.backendHealthStopped = true
+	cancel := d.backendHealthCancel
+	d.backendHealthCancel = nil
+	d.backendHealthStateMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+	d.backendHealthWg.Wait()
 }
 
 // backendHealthTTL is how long a cached snapshot may drive VolumeConditions
@@ -335,11 +357,18 @@ func (d *Driver) backendHealthTTL() time.Duration {
 //
 // The temperature count is therefore a FOLLOW-UP refresh of an already published
 // sample. It cannot hold the health verdict back, and it cannot fabricate: until
-// it lands, the pool carries the LAST KNOWN count (0 on a first sample), which
-// the refresh then corrects.
+// it lands, the pool carries the LAST KNOWN count (0 on a first sample) together
+// with that component's observation time, which the refresh then corrects.
 func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 	snapshot, err := d.truenasClient.PoolHealth(ctx, pool)
 	if err != nil {
+		if ctx.Err() == nil {
+			klog.Warningf("Backend health sample failed for pool %s: %v", pool, err)
+		}
+		d.publishFailedSampleStaleness(pool)
+		return
+	}
+	if err := validateBackendHealthSnapshot(snapshot, pool); err != nil {
 		if ctx.Err() == nil {
 			klog.Warningf("Backend health sample failed for pool %s: %v", pool, err)
 		}
@@ -363,6 +392,22 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 	d.publishTemperatureAlerts(snapshot.Pool, len(alerts))
 }
 
+func validateBackendHealthSnapshot(snapshot *truenas.PoolHealthSnapshot, requestedPool string) error {
+	if snapshot == nil {
+		return fmt.Errorf("pool %s query returned a nil snapshot", requestedPool)
+	}
+	if strings.TrimSpace(snapshot.Pool) == "" {
+		return fmt.Errorf("pool %s query result has no usable pool name", requestedPool)
+	}
+	if snapshot.Pool != requestedPool {
+		return fmt.Errorf("pool query returned %q while requesting %q", snapshot.Pool, requestedPool)
+	}
+	if strings.TrimSpace(snapshot.Status) == "" {
+		return fmt.Errorf("pool %s query result has no usable status", requestedPool)
+	}
+	return nil
+}
+
 // publishSample publishes ONE successful sample: the raw gauges, the hysteresis
 // decision, the cached snapshot pointer, the staleness verdict and the
 // last-success timestamp. All of it happens inside ONE critical section, so the
@@ -374,15 +419,16 @@ func (d *Driver) publishSample(snapshot *truenas.PoolHealthSnapshot) {
 	d.backendHealthPublishMu.Lock()
 	defer d.backendHealthPublishMu.Unlock()
 
-	// Carry the last known temperature count forward instead of publishing a
-	// fabricated 0 for the length of the disk.temperature_alerts call.
+	// Carry the last known temperature component forward, including its
+	// observation time. The condition and collector expose that age until the
+	// follow-up returns; they never present the carried count as current.
+	published := *snapshot
 	if previous := d.backendHealth.Load(); previous != nil && previous.Pool == snapshot.Pool {
-		snapshot.TemperatureAlerts = previous.TemperatureAlerts
+		published.TemperatureAlerts = previous.TemperatureAlerts
+		published.TemperatureSampledAt = previous.TemperatureSampledAt
 	}
-	SetPoolHealthMetrics(snapshot)
-	d.publishBackendHealthLocked(snapshot)
-	SetPoolHealthStale(snapshot.Pool, false)
-	SetPoolHealthLastSuccess(snapshot.Pool, snapshot.SampledAt)
+	pending := d.publishBackendHealthLocked(&published)
+	publishBackendHealthSampleMetricsLocked(&published, pending)
 }
 
 // publishTemperatureAlerts refreshes the per-DISK temperature count on an
@@ -404,12 +450,11 @@ func (d *Driver) publishTemperatureAlerts(pool string, alerts int) {
 	if current == nil || current.Pool != pool {
 		return
 	}
-	if current.TemperatureAlerts != alerts {
-		updated := *current
-		updated.TemperatureAlerts = alerts
-		d.backendHealth.Store(&updated)
-	}
-	SetPoolDiskTemperatureAlerts(pool, alerts)
+	updated := *current
+	updated.TemperatureAlerts = alerts
+	updated.TemperatureSampledAt = time.Now()
+	d.backendHealth.Store(&updated)
+	publishBackendHealthTemperatureMetrics(pool, alerts, updated.TemperatureSampledAt)
 }
 
 // publishFailedSampleStaleness publishes the staleness verdict from inside the
@@ -452,8 +497,7 @@ func (d *Driver) publishFailedSampleStaleness(pool string) {
 			d.backendHealthPublishMu.Unlock()
 			return
 		}
-		SetPoolHealthStale(pool, true)
-		SetPoolHealthFlipPending(pool, false)
+		publishBackendHealthColdStartMetrics(pool)
 		d.backendHealthPublishMu.Unlock()
 		klog.Warningf("Backend health has no successful sample yet for pool %s: VolumeConditions are dataset-only and the raw "+
 			"scale_csi_pool_* series stay ABSENT until a successful usable sample arrives, so ScaleCSIPoolDegraded cannot fire. "+
@@ -465,7 +509,7 @@ func (d *Driver) publishFailedSampleStaleness(pool string) {
 	ttl := d.backendHealthTTL()
 	expired := age > ttl
 	unconfirmedFlip := d.backendHealthPendingFlips.Load() > 0
-	SetPoolHealthStale(previous.Pool, expired || unconfirmedFlip)
+	publishBackendHealthStaleMetrics(previous.Pool, expired || unconfirmedFlip, unconfirmedFlip)
 	d.backendHealthPublishMu.Unlock()
 	switch {
 	case expired:
@@ -534,7 +578,7 @@ func (d *Driver) markPoolHealthStale(snapshot *truenas.PoolHealthSnapshot) {
 		// and must not be overwritten by a decision made against an older pointer.
 		return
 	}
-	SetPoolHealthStale(snapshot.Pool, true)
+	publishBackendHealthStaleOnlyMetrics(snapshot.Pool, true)
 }
 
 // publishBackendHealthLocked applies the fan-out hysteresis and updates the cache
@@ -549,14 +593,13 @@ func (d *Driver) markPoolHealthStale(snapshot *truenas.PoolHealthSnapshot) {
 // the alert-hold class, and past the staleness TTL it can still read 1 after the
 // condition has fallen back to dataset-only. See backendHealthFlipSamples for
 // the canonical numbered list of divergence classes.
-func (d *Driver) publishBackendHealthLocked(snapshot *truenas.PoolHealthSnapshot) {
+func (d *Driver) publishBackendHealthLocked(snapshot *truenas.PoolHealthSnapshot) bool {
 	previous := d.backendHealth.Load()
 	if previous == nil || previous.Degraded() == snapshot.Degraded() {
 		// No transition to confirm (or nothing to compare against yet).
 		d.backendHealthPendingFlips.Store(0)
-		SetPoolHealthFlipPending(snapshot.Pool, false)
 		d.backendHealth.Store(snapshot)
-		return
+		return false
 	}
 
 	pending := d.backendHealthPendingFlips.Add(1)
@@ -564,19 +607,20 @@ func (d *Driver) publishBackendHealthLocked(snapshot *truenas.PoolHealthSnapshot
 		klog.V(2).Infof("Pool %s health transition (%s -> %s) held for confirmation (%d/%d consecutive samples); "+
 			"per-PVC VolumeConditions are unchanged for now and deliberately disagree with the raw gauges until it confirms",
 			snapshot.Pool, previous.Status, snapshot.Status, pending, backendHealthFlipSamples)
-		SetPoolHealthFlipPending(snapshot.Pool, true)
 		// Keep serving the previous verdict, but carry the fresh sample time so the
 		// staleness TTL measures backend liveness, not the age of the verdict.
 		held := *previous
 		held.SampledAt = snapshot.SampledAt
+		held.TemperatureAlerts = snapshot.TemperatureAlerts
+		held.TemperatureSampledAt = snapshot.TemperatureSampledAt
 		d.backendHealth.Store(&held)
-		return
+		return true
 	}
 	klog.Infof("Pool %s health transition (%s -> %s) confirmed by %d consecutive samples; updating every managed volume's condition",
 		snapshot.Pool, previous.Status, snapshot.Status, pending)
 	d.backendHealthPendingFlips.Store(0)
-	SetPoolHealthFlipPending(snapshot.Pool, false)
 	d.backendHealth.Store(snapshot)
+	return false
 }
 
 // poolHealthSnapshot returns the most recent sample, or nil when the poller is
@@ -636,6 +680,9 @@ func composeVolumeCondition(base *csi.VolumeCondition, snapshot *truenas.PoolHea
 		if snapshot.StatusDetail != "" {
 			message += ": " + snapshot.StatusDetail
 		}
+		if temperatureWarning := backendHealthTemperatureWarning(snapshot); temperatureWarning != "" {
+			message += "; " + temperatureWarning
+		}
 		return &csi.VolumeCondition{Abnormal: true, Message: message}
 	}
 
@@ -650,8 +697,8 @@ func composeVolumeCondition(base *csi.VolumeCondition, snapshot *truenas.PoolHea
 	if snapshot.ScanErrors > 0 {
 		warnings = append(warnings, fmt.Sprintf("pool %s last scan reported %d errors", snapshot.Pool, snapshot.ScanErrors))
 	}
-	if snapshot.TemperatureAlerts > 0 {
-		warnings = append(warnings, fmt.Sprintf("pool %s has %d disk temperature alert(s)", snapshot.Pool, snapshot.TemperatureAlerts))
+	if temperatureWarning := backendHealthTemperatureWarning(snapshot); temperatureWarning != "" {
+		warnings = append(warnings, temperatureWarning)
 	}
 	if len(warnings) == 0 {
 		return base
@@ -662,6 +709,35 @@ func composeVolumeCondition(base *csi.VolumeCondition, snapshot *truenas.PoolHea
 		message = base.GetMessage() + "; " + message
 	}
 	return &csi.VolumeCondition{Abnormal: false, Message: message}
+}
+
+// backendHealthTemperatureWarning keeps the asynchronous temperature
+// component honest. A count from a previous follow-up is useful information,
+// but it is not a current observation of the newly published pool sample. The
+// condition therefore says either that temperature is unverified or exactly how
+// old the last successful temperature observation is.
+func backendHealthTemperatureWarning(snapshot *truenas.PoolHealthSnapshot) string {
+	if snapshot == nil {
+		return ""
+	}
+	if snapshot.TemperatureSampledAt.IsZero() {
+		return fmt.Sprintf("pool %s disk temperature alerts are unverified (no successful temperature sample yet)", snapshot.Pool)
+	}
+	if !snapshot.SampledAt.IsZero() && snapshot.TemperatureSampledAt.Before(snapshot.SampledAt) {
+		age := backendHealthObservationAge(snapshot.TemperatureSampledAt)
+		if snapshot.TemperatureAlerts > 0 {
+			return fmt.Sprintf("pool %s has %d last-known disk temperature alert(s); temperature sample age %s", snapshot.Pool, snapshot.TemperatureAlerts, formatBackendHealthAge(age))
+		}
+		return fmt.Sprintf("pool %s disk temperature alerts are not current; temperature sample age %s", snapshot.Pool, formatBackendHealthAge(age))
+	}
+	if snapshot.TemperatureAlerts > 0 {
+		return fmt.Sprintf("pool %s has %d disk temperature alert(s)", snapshot.Pool, snapshot.TemperatureAlerts)
+	}
+	return ""
+}
+
+func formatBackendHealthAge(age float64) string {
+	return (time.Duration(age * float64(time.Second))).Truncate(time.Second).String()
 }
 
 func joinNonEmpty(values []string, sep string) string {
