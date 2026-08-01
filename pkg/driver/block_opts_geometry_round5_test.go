@@ -287,6 +287,44 @@ func TestGuardRequestAgainstEvidence(t *testing.T) {
 	assert.Contains(t, status.Convert(err).Message(), paramISCSIPblocksize)
 }
 
+// TestSnapshotGeometryCaptureCost pins the ONE API-call movement round 5 adds,
+// so it stays honest about what it charges and to whom.
+//
+// The `CreateSnapshot fresh` golden in TestControllerGoldenPathAPICallCounts is
+// unchanged (3), because its fixture is a plain dataset with no iSCSI
+// bookkeeping. The charge lands only on a zvol that IS an iSCSI volume and is not
+// yet recorded — the pre-GF4 fleet — and it disappears permanently the moment
+// that volume is recorded, which its first publish or replay does for free.
+func TestSnapshotGeometryCaptureCost(t *testing.T) {
+	measure := func(t *testing.T, name string, stripStamp bool) map[string]int {
+		t.Helper()
+		client := newAPICallCountingClient()
+		d := newAPICallCountDriver(t, client, "iscsi")
+		ctx := context.Background()
+		_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+		require.NoError(t, err)
+		_, err = d.CreateVolume(ctx, apiCallCountVolumeRequest(name, "iscsi"))
+		require.NoError(t, err)
+		if stripStamp {
+			require.NoError(t, client.MockClient.DatasetRemoveUserProperties(ctx, "pool/parent/"+name,
+				[]string{PropBlockISCSIBlocksize, PropBlockISCSIPblocksize}))
+		}
+		client.resetCalls()
+		_, err = d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{SourceVolumeId: name, Name: name + "-point"})
+		require.NoError(t, err)
+		_, methods := client.callSnapshot()
+		return methods
+	}
+
+	recorded := measure(t, "snap-cost-recorded", false)
+	assert.Zero(t, recorded["ISCSIExtentFindByDisk"],
+		"a volume that already records its geometry pays nothing to snapshot it")
+
+	legacy := measure(t, "snap-cost-legacy", true)
+	assert.Equal(t, 1, legacy["ISCSIExtentFindByDisk"],
+		"an UNRECORDED iSCSI zvol pays exactly one live-extent read, once, to give its snapshot provenance")
+}
+
 // foreignExtentClient makes ISCSIExtentCreate behave the way the TrueNAS client
 // does on an ambiguous "already exists"/"invalid params": it returns an EXISTING
 // object found by name instead of the one that was asked for.
