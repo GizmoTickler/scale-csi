@@ -478,18 +478,31 @@ func (d *Driver) ensureNFSProtocols(ctx context.Context) error {
 		return err
 	}
 	// FAIL CLOSED (M3). "Only adds, never removes" is only true if the CURRENT
-	// list is known: nfs.update {protocols: X} SETS the list, it does not union
-	// with it. An empty cfg.Protocols means parseNFSServiceConfig could not read
-	// the field (renamed/reshaped on a future TrueNAS, or a non-list value) — and
-	// merging into an empty base would write exactly the configured list, DISABLING
-	// every major version missing from it appliance-wide and breaking every export,
-	// driver-managed or not. An unparseable service config is never a safe basis
-	// for a service-wide write.
-	if len(cfg.Protocols) == 0 {
+	// list is known COMPLETELY: nfs.update {protocols: X} SETS the list, it does
+	// not union with it. Two ways the base can fail to be a complete picture, and
+	// BOTH are refused:
+	//
+	//   - the list is empty — the field is absent, or the appliance genuinely
+	//     enables nothing;
+	//   - the list parsed only PARTIALLY (ProtocolsComplete=false) — a non-list
+	//     container, or ANY item the reader could not turn into a token, e.g. a
+	//     reshaped ["NFSV4", {"name":"NFSV5"}] on a future TrueNAS. Merging into a
+	//     half-read base writes a list missing exactly the entries the reader
+	//     could not see, silently DISABLING them.
+	//
+	// Either way the write would disable every major version missing from the
+	// merged list appliance-wide and break every export, driver-managed or not.
+	// An incompletely-read service config is never a safe basis for a
+	// service-wide REPLACEMENT write.
+	if !cfg.ProtocolsComplete || len(cfg.Protocols) == 0 {
+		reason := cfg.ProtocolsAnomaly
+		if reason == "" {
+			reason = "the TrueNAS nfs.config reported an empty protocols list"
+		}
 		return fmt.Errorf(
-			"nfs.ensureProtocols refused: the TrueNAS nfs.config reported no protocols list, so the driver cannot prove which "+
-				"major versions are currently enabled; writing the configured list %v would DISABLE every version missing from it "+
-				"for every export on the appliance", desired)
+			"nfs.ensureProtocols refused: %s, so the driver cannot prove which major versions are currently enabled; "+
+				"writing the configured list %v would DISABLE every version missing from it for every export on the appliance",
+			reason, desired)
 	}
 
 	merged := append([]string(nil), cfg.Protocols...)

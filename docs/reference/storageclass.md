@@ -120,6 +120,17 @@ stamp as ground truth, so a stamped clone would be both falsely accepted (a
 rejected (`logbias ... fixed when the dataset is created`, for a property the
 driver never set on that dataset).
 
+A class stamp the volume **inherited from its source** is treated the same way.
+ZFS copies a source dataset's user properties into a clone (and a detached
+replication copy reproduces them as local values), so restoring a stamped volume
+would otherwise produce a target that claims a class nobody applied to it. The
+driver scrubs that inherited stamp when it materializes the volume, and the
+immutability guard independently **never treats a content-source volume's class
+stamp as authoritative** — belt and braces, because the scrub is one best-effort
+`pool.dataset.update`. Without both, replaying an identical, already-successful
+`CreateVolume` for a restored PVC could be refused with `FailedPrecondition`,
+which is a CSI idempotency violation.
+
 If a restored volume must carry a curated geometry, provision an empty volume
 with the class and copy the data in.
 
@@ -254,6 +265,24 @@ properties keep inheriting from the parent exactly as before. `nfsACLMode` on
 its own is rejected — `aclmode` only matters on a dataset that carries a
 driver-applied ACL.
 
+**Volumes provisioned from a content source** (a snapshot restore, a volume
+clone, or a detached copy) are the exception, and the driver is explicit about
+it. `acltype`/`aclmode` are only ever set in the `pool.dataset.create` payload,
+and none of those paths issues one — the materialized dataset carries the
+**origin's** `acltype` and `aclmode`. Therefore:
+
+- `nfsACL` / `nfsACLTemplate` still work: `filesystem.setacl` acts on the
+  materialized path and genuinely applies, so a VolSync restore into an
+  ACL-managed StorageClass keeps working;
+- `nfsACLMode` is **rejected with `InvalidArgument` before anything is created**.
+  The parameter exists only to opt into the loud `RESTRICTED` behavior, so
+  silently handing back whatever the origin had would be the worst outcome
+  available. Drop it from the class used for restores, or restore into an empty
+  volume provisioned by a class that sets it and copy the data in;
+- the `NFSACLApplied` and `NFSACLFsGroupConflict` events on such a volume say
+  that the driver did **not** set `acltype`/`aclmode` and that the chmod
+  behavior is the origin's. They never report a mode the driver did not apply.
+
 `filesystem.setacl` is an asynchronous middleware job. ACL application is
 **best-effort**: it runs after the dataset, its ownership stamps and its export
 all exist, and a failure produces a Warning event on the PVC rather than a
@@ -314,7 +343,8 @@ path at all, and it does **not** mitigate the fsGroup hazard. Only mitigations
 
 Every volume that receives a driver-applied ACL also gets a Warning event
 (`NFSACLFsGroupConflict`) spelling this out, including which `aclmode` the
-volume ended up with.
+driver applied — or, on a content-source volume, an explicit statement that it
+applied none and the origin's `aclmode` governs.
 
 ```yaml
 apiVersion: v1

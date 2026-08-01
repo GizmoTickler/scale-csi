@@ -21,7 +21,20 @@ const (
 // support and needs no extra server flag.
 type NFSServiceConfig struct {
 	// Protocols is the enabled major-version set, e.g. ["NFSV3","NFSV4"].
+	// UNKNOWN string tokens are preserved (trimmed/uppercased) rather than
+	// filtered out: nfs.update REPLACES this list, so dropping a token the driver
+	// does not recognize — a future NFSV5, say — would silently disable it
+	// appliance-wide on the next managed write.
 	Protocols []string
+	// ProtocolsComplete reports that the whole protocols list was read without
+	// anomaly, i.e. that Protocols is a faithful and COMPLETE picture of what the
+	// appliance currently enables. Any managed write that REPLACES the list must
+	// refuse unless this is true.
+	ProtocolsComplete bool
+	// ProtocolsAnomaly describes why the list could not be read completely: the
+	// field is absent, is not a list, or contains ANY unusable item. Empty when
+	// the field parsed cleanly, including for a cleanly-empty list.
+	ProtocolsAnomaly string
 	// V4Krb / V4KrbEnabled report whether Kerberos is configured. KRB5* share
 	// security is unusable without them, so the driver fails closed.
 	V4Krb        bool
@@ -71,20 +84,49 @@ func (c *Client) NFSServiceUpdate(ctx context.Context, params map[string]interfa
 	return parseNFSServiceConfig(result)
 }
 
+// parseNFSProtocolList reads nfs.config's `protocols` field ALL-OR-NOTHING
+// (M3). It returns the normalized tokens plus a non-empty anomaly string when
+// the list could not be read in full.
+//
+// Partial parsing is the dangerous case and the one this exists for: nfs.update
+// {protocols: X} SETS the list, it does not union with it. If the response ever
+// carries a reshaped item (say ["NFSV4", {"name":"NFSV5"}]) and the parser
+// silently kept only the readable half, a managed write would compute its merge
+// against an INCOMPLETE base and remove the item it could not read — disabling a
+// live protocol for every export on the appliance, driver-managed or not. A
+// half-read list is therefore reported as no basis for a write at all, exactly
+// like a missing or wrong-typed one.
+func parseNFSProtocolList(m map[string]interface{}) (protocols []string, anomaly string) {
+	raw, present := m["protocols"]
+	if !present {
+		return nil, `nfs.config returned no "protocols" field`
+	}
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Sprintf(`nfs.config "protocols" is %T, not a list`, raw)
+	}
+	for index, item := range items {
+		token, ok := item.(string)
+		if !ok {
+			return nil, fmt.Sprintf(`nfs.config "protocols" entry %d is %T, not a string`, index, item)
+		}
+		if strings.TrimSpace(token) == "" {
+			return nil, fmt.Sprintf(`nfs.config "protocols" entry %d is an empty string`, index)
+		}
+		protocols = append(protocols, strings.ToUpper(strings.TrimSpace(token)))
+	}
+	sort.Strings(protocols)
+	return protocols, ""
+}
+
 func parseNFSServiceConfig(data interface{}) (*NFSServiceConfig, error) {
 	m, ok := data.(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("unexpected nfs.config response format %T", data)
 	}
 	cfg := &NFSServiceConfig{}
-	if v, ok := m["protocols"].([]interface{}); ok {
-		for _, item := range v {
-			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
-				cfg.Protocols = append(cfg.Protocols, strings.ToUpper(strings.TrimSpace(s)))
-			}
-		}
-		sort.Strings(cfg.Protocols)
-	}
+	cfg.Protocols, cfg.ProtocolsAnomaly = parseNFSProtocolList(m)
+	cfg.ProtocolsComplete = cfg.ProtocolsAnomaly == ""
 	if v, ok := m["v4_krb"].(bool); ok {
 		cfg.V4Krb = v
 	}

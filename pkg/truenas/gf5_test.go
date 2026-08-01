@@ -416,3 +416,64 @@ func TestDiskTemperatureAlerts(t *testing.T) {
 		assert.Equal(t, []string{"nvme0n1 is too hot", "nvme1n1", "nvme2n1 at 80C"}, alerts)
 	})
 }
+
+// ---------------------------------------------------------------------------
+// M3 round 2 — protocols parsing must be ALL-OR-NOTHING
+// ---------------------------------------------------------------------------
+
+// TestParseNFSServiceConfigProtocolsCompleteness pins M3's round-2 gap. Round 1
+// only caught a WHOLLY unreadable list; a PARTIALLY parseable one still reported
+// success, and `nfs.update {protocols: X}` REPLACES the list rather than unioning
+// with it — so merging into a half-read base silently removes whatever the
+// reader could not parse, for every export on the appliance.
+func TestParseNFSServiceConfigProtocolsCompleteness(t *testing.T) {
+	t.Run("a clean list is complete", func(t *testing.T) {
+		cfg, err := parseNFSServiceConfig(map[string]interface{}{
+			"protocols": []interface{}{"NFSV4", "nfsv3"},
+		})
+		require.NoError(t, err)
+		assert.True(t, cfg.ProtocolsComplete)
+		assert.Empty(t, cfg.ProtocolsAnomaly)
+		assert.Equal(t, []string{"NFSV3", "NFSV4"}, cfg.Protocols)
+	})
+
+	t.Run("an UNKNOWN token is preserved, not filtered", func(t *testing.T) {
+		cfg, err := parseNFSServiceConfig(map[string]interface{}{
+			"protocols": []interface{}{"NFSV4", "NFSV5"},
+		})
+		require.NoError(t, err)
+		assert.True(t, cfg.ProtocolsComplete)
+		assert.Equal(t, []string{"NFSV4", "NFSV5"}, cfg.Protocols,
+			"a future protocol must survive a managed write verbatim")
+	})
+
+	t.Run("a partially parseable list is INCOMPLETE", func(t *testing.T) {
+		cfg, err := parseNFSServiceConfig(map[string]interface{}{
+			"protocols": []interface{}{"NFSV4", map[string]interface{}{"name": "NFSV5"}},
+		})
+		require.NoError(t, err)
+		assert.False(t, cfg.ProtocolsComplete,
+			"one unreadable entry makes the whole list an unsafe basis for a replacement write")
+		assert.Contains(t, cfg.ProtocolsAnomaly, "entry 1")
+	})
+
+	t.Run("an empty-string entry is INCOMPLETE", func(t *testing.T) {
+		cfg, err := parseNFSServiceConfig(map[string]interface{}{
+			"protocols": []interface{}{"NFSV4", "   "},
+		})
+		require.NoError(t, err)
+		assert.False(t, cfg.ProtocolsComplete)
+	})
+
+	t.Run("a missing or wrong-typed field is INCOMPLETE", func(t *testing.T) {
+		cfg, err := parseNFSServiceConfig(map[string]interface{}{"servers": float64(64)})
+		require.NoError(t, err)
+		assert.False(t, cfg.ProtocolsComplete)
+		assert.Contains(t, cfg.ProtocolsAnomaly, "no \"protocols\" field")
+
+		cfg, err = parseNFSServiceConfig(map[string]interface{}{"protocols": "NFSV4"})
+		require.NoError(t, err)
+		assert.False(t, cfg.ProtocolsComplete)
+		assert.Contains(t, cfg.ProtocolsAnomaly, "not a list")
+	})
+}

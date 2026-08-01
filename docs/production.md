@@ -349,9 +349,13 @@ Five metric families added in v1.4.0 (the existing documented names still match
 
 Enabling `backendHealth.enabled` starts a controller-only, **read-only** poll
 loop: at most two calls per interval (`pool.query` +
-`disk.temperature_alerts`), no writes, default cadence 60s (30s floor). Like the
-capacity gauge loop it has no leader-election gate, so run
-`controller.replicas=1`. It does not touch the CreateVolume/publish/unpublish
+`disk.temperature_alerts`), no writes, default cadence 60s. The interval is
+clamped to **30s–2m**; a value outside that range is clamped with a warning
+rather than rejected. The 2m ceiling is what keeps the "can never disagree"
+promise below true: the fan-out hysteresis needs two samples, so a confirmed
+condition flip takes at most 2 × interval, and that has to stay inside the 5m
+`for` hold on `ScaleCSIPoolDegraded`. Like the capacity gauge loop this poller
+has no leader-election gate, so run `controller.replicas=1`. It does not touch the CreateVolume/publish/unpublish
 request path.
 
 ZFS exposes **no per-dataset health**. Health is a per-POOL fact plus a per-disk
@@ -381,9 +385,15 @@ New gauges, all labeled by `pool` and present only while the poller runs:
   `DEGRADED` series alerting forever;
 - `scale_csi_pool_healthy{pool}`;
 - `scale_csi_pool_scan_state{pool,function,state}` — one-hot across the **whole**
-  `function × state` cross-product (`SCRUB`, `RESILVER`, `NONE`), not merely
-  within the current function: a finished SCRUB followed by a running RESILVER
-  leaves exactly one series at `1`. Deliberately separate from `pool_healthy`;
+  `function × state` domain, not merely within the current function: a finished
+  SCRUB followed by a running RESILVER leaves exactly one series at `1`.
+  `function` is `SCRUB`, `RESILVER` or `NONE`; `state` is `SCANNING`, `FINISHED`,
+  `CANCELED` or `NONE`. **Idle is `{function="NONE",state="NONE"}`**, not the
+  absence of a series — `sum(scale_csi_pool_scan_state{pool="…"}) == 1` holds at
+  all times, including for a pool that has never been scanned. A `function` or
+  `state` the driver does not recognize is exported as its own cell and is
+  **retired (zeroed) on the next sample**, so an unknown value can never sit at
+  `1` alongside the current one. Deliberately separate from `pool_healthy`;
 - `scale_csi_pool_scan_errors{pool}`;
 - `scale_csi_pool_disk_temp_alerts{pool}`;
 - `scale_csi_pool_health_stale{pool}` — `1` when the cached snapshot has aged

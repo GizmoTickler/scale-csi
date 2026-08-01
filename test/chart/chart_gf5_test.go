@@ -448,3 +448,38 @@ func TestGF5DocsRecordThePerformanceClassCloneLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestGF5Fix2DocsRecordTheContentSourceSemantics is the round-2 documentation
+// revert-proof. Both H1 and H3 resolve to ONE semantic — a volume materialized
+// from a content source inherits the origin dataset's properties, and the driver
+// neither applies nor CLAIMS the dataset-level properties it could not set — and
+// the shipped docs have to say so for each of them.
+func TestGF5Fix2DocsRecordTheContentSourceSemantics(t *testing.T) {
+	doc := repoFile(t, "docs", "reference", "storageclass.md")
+	for _, required := range []string{
+		// H1: the inherited stamp, the scrub, and the guard that ignores it.
+		"inherited from its source",
+		"never treats a content-source volume's class\nstamp as authoritative**",
+		"CSI idempotency violation",
+		// H3: nfsACLMode refused before mutation, ACL itself still applied.
+		"`nfsACLMode` is **rejected with `InvalidArgument` before anything is created**",
+		"filesystem.setacl` acts on the\n  materialized path and genuinely applies",
+	} {
+		if !strings.Contains(doc, required) {
+			t.Errorf("storageclass.md is missing the round-2 content-source semantics %q", required)
+		}
+	}
+
+	production := repoFile(t, "docs", "production.md")
+	for _, required := range []string{
+		// M4: idle is a representable state and unknown cells are retired.
+		`Idle is `,
+		"retired (zeroed) on the next sample",
+		// M6 timing caveat: the interval ceiling that keeps "can never disagree" true.
+		"clamped to **30s–2m**",
+	} {
+		if !strings.Contains(production, required) {
+			t.Errorf("production.md is missing %q", required)
+		}
+	}
+}

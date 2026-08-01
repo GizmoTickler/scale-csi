@@ -132,7 +132,7 @@ func TestApplyNFSVolumeACL(t *testing.T) {
 	t.Run("no ACL requested: zero setacl calls, zero events", func(t *testing.T) {
 		mock := truenas.NewMockClient()
 		d, recorder := aclTestDriver(t, mock)
-		d.applyNFSVolumeACL(context.Background(), ds, "tank/k8s/vol", aclEventRef())
+		d.applyNFSVolumeACL(context.Background(), ds, "tank/k8s/vol", aclEventRef(), nil)
 		assert.Empty(t, mock.SetACLCalls)
 		assert.Empty(t, drainEvents(recorder))
 	})
@@ -142,7 +142,7 @@ func TestApplyNFSVolumeACL(t *testing.T) {
 		d, recorder := aclTestDriver(t, mock)
 		ctx := withNFSACLOptions(context.Background(), &nfsACLOptions{template: "NFS4_RESTRICTED"})
 
-		d.applyNFSVolumeACL(ctx, ds, "tank/k8s/vol", aclEventRef())
+		d.applyNFSVolumeACL(ctx, ds, "tank/k8s/vol", aclEventRef(), nil)
 		require.Len(t, mock.SetACLCalls, 1)
 		call := mock.SetACLCalls[0]
 		assert.Equal(t, "/mnt/tank/k8s/vol", call.Path)
@@ -167,7 +167,7 @@ func TestApplyNFSVolumeACL(t *testing.T) {
 		dacl := []truenas.ACLEntry{{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}}}
 		ctx := withNFSACLOptions(context.Background(), &nfsACLOptions{dacl: dacl})
 
-		d.applyNFSVolumeACL(ctx, ds, "tank/k8s/vol", aclEventRef())
+		d.applyNFSVolumeACL(ctx, ds, "tank/k8s/vol", aclEventRef(), nil)
 		require.Len(t, mock.SetACLCalls, 1)
 		assert.Equal(t, dacl, mock.SetACLCalls[0].DACL)
 	})
@@ -179,7 +179,7 @@ func TestApplyNFSVolumeACL(t *testing.T) {
 		ctx := withNFSACLOptions(context.Background(), &nfsACLOptions{dacl: []truenas.ACLEntry{{Tag: "owner@"}}})
 
 		// Returns nothing: an ACL failure cannot fail CreateVolume.
-		d.applyNFSVolumeACL(ctx, ds, "tank/k8s/vol", aclEventRef())
+		d.applyNFSVolumeACL(ctx, ds, "tank/k8s/vol", aclEventRef(), nil)
 		events := drainEvents(recorder)
 		require.Len(t, events, 1)
 		assert.Contains(t, events[0], "Warning "+EventReasonNFSACLFailed)
@@ -190,7 +190,7 @@ func TestApplyNFSVolumeACL(t *testing.T) {
 		d, recorder := aclTestDriver(t, mock)
 		ctx := withNFSACLOptions(context.Background(), &nfsACLOptions{template: "NFS4_OPEN"})
 
-		d.applyNFSVolumeACL(ctx, &truenas.Dataset{Name: "tank/k8s/vol"}, "tank/k8s/vol", aclEventRef())
+		d.applyNFSVolumeACL(ctx, &truenas.Dataset{Name: "tank/k8s/vol"}, "tank/k8s/vol", aclEventRef(), nil)
 		assert.Empty(t, mock.SetACLCalls)
 		events := drainEvents(recorder)
 		require.Len(t, events, 1)
@@ -330,7 +330,7 @@ func TestACLEventTextDoesNotOverclaimProtected(t *testing.T) {
 	require.NoError(t, err)
 	d.applyNFSVolumeACL(withNFSACLOptions(ctx, opts), &truenas.Dataset{
 		Name: "tank/k8s/vol", Mountpoint: "/mnt/tank/k8s/vol",
-	}, "tank/k8s/vol", aclEventRef())
+	}, "tank/k8s/vol", aclEventRef(), nil)
 
 	messages := drainEvents(recorder)
 	joined := strings.Join(messages, "\n")
@@ -345,4 +345,129 @@ func TestACLEventTextDoesNotOverclaimProtected(t *testing.T) {
 	assert.Contains(t, joined, "not a chmod guard")
 	assert.Contains(t, joined, "nfsACLMode=RESTRICTED",
 		"the fsGroup warning must name the only ZFS lever that actually works")
+}
+
+// ---------------------------------------------------------------------------
+// H3 round 2 — aclmode on CONTENT-SOURCE volumes
+// ---------------------------------------------------------------------------
+
+// aclContentSourceDriver provisions from the "pool/parent" tree the shared
+// content-source helpers seed, and records events so the ACL claims can be read.
+func aclContentSourceDriver(mock *truenas.MockClient) (*Driver, *record.FakeRecorder) {
+	recorder := record.NewFakeRecorder(32)
+	d := perfContentSourceDriver(mock)
+	d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+	return d, recorder
+}
+
+func aclContentSourceRequest(source *csi.VolumeContentSource, params map[string]string) *csi.CreateVolumeRequest {
+	parameters := map[string]string{"protocol": "nfs"}
+	for key, value := range params {
+		parameters[key] = value
+	}
+	return &csi.CreateVolumeRequest{
+		Name:                "acl-restored",
+		CapacityRange:       &csi.CapacityRange{RequiredBytes: testGiB},
+		VolumeCapabilities:  []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters:          parameters,
+		VolumeContentSource: source,
+	}
+}
+
+// TestNFSACLModeIsRejectedOnContentSourceRequests pins the first half of H3.
+// aclmode is fixed in the pool.dataset.create payload, which a clone/restore
+// never issues — so nfsACLMode cannot be applied to such a volume. Since the
+// parameter exists ONLY to opt into the loud aclmode=RESTRICTED behavior,
+// silently giving the operator whatever the ORIGIN had is the worst outcome
+// available; the request is refused before anything is created.
+func TestNFSACLModeIsRejectedOnContentSourceRequests(t *testing.T) {
+	for _, tc := range contentSourceClassCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mock := truenas.NewMockClient()
+			d, _ := aclContentSourceDriver(mock)
+			d.config.ZFS.DetachedVolumesFromSnapshots = tc.detached
+			seedStampedPerformanceClassSource(t, mock)
+
+			_, err := d.CreateVolume(ctx, aclContentSourceRequest(tc.source, map[string]string{
+				nfsACLTemplateParam: "NFS4_RESTRICTED",
+				nfsACLModeParam:     "RESTRICTED",
+			}))
+			require.Error(t, err)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+			assert.Contains(t, err.Error(), nfsACLModeParam)
+			_, getErr := mock.DatasetGet(ctx, "pool/parent/acl-restored")
+			assert.Error(t, getErr, "the request must be refused BEFORE any mutation")
+
+			// The default direction is refused identically: the driver cannot
+			// establish PASSTHROUGH on such a volume either.
+			_, err = d.CreateVolume(ctx, aclContentSourceRequest(tc.source, map[string]string{
+				nfsACLTemplateParam: "NFS4_RESTRICTED",
+				nfsACLModeParam:     "PASSTHROUGH",
+			}))
+			require.Error(t, err)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		})
+	}
+}
+
+// TestACLEventsOnContentSourceDoNotClaimAnAclmode pins the second half of H3.
+// nfsACL / nfsACLTemplate stay ALLOWED on a restore (filesystem.setacl acts on
+// the materialized path and genuinely applies, and a VolSync restore into an
+// ACL-managed StorageClass has to keep working) — but the driver set no
+// acltype/aclmode there, so the events must not report one as fact.
+func TestACLEventsOnContentSourceDoNotClaimAnAclmode(t *testing.T) {
+	for _, tc := range contentSourceClassCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mock := truenas.NewMockClient()
+			d, recorder := aclContentSourceDriver(mock)
+			d.config.ZFS.DetachedVolumesFromSnapshots = tc.detached
+			seedStampedPerformanceClassSource(t, mock)
+
+			_, err := d.CreateVolume(ctx, aclContentSourceRequest(tc.source, map[string]string{
+				nfsACLTemplateParam: "NFS4_RESTRICTED",
+			}))
+			require.NoError(t, err, "the ACL itself still applies to a restored volume")
+
+			joined := strings.Join(drainEvents(recorder), "\n")
+			require.NotEmpty(t, joined)
+			assert.NotContains(t, joined, "aclmode=PASSTHROUGH",
+				"the driver did not set this volume's aclmode and must not report one as fact")
+			assert.NotContains(t, joined, "aclmode=RESTRICTED")
+			assert.NotContains(t, joined, "The dataset's aclmode is",
+				"the fsGroup warning must not state an aclmode the driver never set")
+			assert.Contains(t, joined, "NOT set by the driver")
+			assert.Contains(t, joined, "inherits the ORIGIN dataset's acltype and aclmode")
+		})
+	}
+}
+
+// TestACLEventsOnFreshCreateStillReportTheAppliedMode is the positive half: on
+// the ordinary path the reported mode IS the applied state — it is the value
+// sent in the pool.dataset.create payload that created the dataset — so H3's fix
+// cannot be mistaken for "stop reporting aclmode".
+func TestACLEventsOnFreshCreateStillReportTheAppliedMode(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	d, recorder := aclContentSourceDriver(mock)
+	mustCreateParentDataset(t, mock)
+
+	_, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "acl-fresh",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters: map[string]string{
+			"protocol":          "nfs",
+			nfsACLTemplateParam: "NFS4_RESTRICTED",
+			nfsACLModeParam:     "RESTRICTED",
+		},
+	})
+	require.NoError(t, err)
+
+	joined := strings.Join(drainEvents(recorder), "\n")
+	assert.Contains(t, joined, "aclmode=RESTRICTED and acltype=NFSV4 set by the driver in the dataset create payload")
+	assert.Contains(t, joined, "The dataset's aclmode is RESTRICTED")
+	created := mock.Datasets["pool/parent/acl-fresh"]
+	require.NotNil(t, created)
 }

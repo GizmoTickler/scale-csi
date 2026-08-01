@@ -256,7 +256,7 @@ func TestEnsureNFSProtocols(t *testing.T) {
 
 	t.Run("already-enabled protocols are a read-only no-op", func(t *testing.T) {
 		mock := truenas.NewMockClient()
-		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3", "NFSV4"}}
+		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3", "NFSV4"}, ProtocolsComplete: true}
 		d := nfsOptionsTestDriver(t, mock, NFSConfig{EnsureProtocols: []string{"NFSV4"}})
 		require.NoError(t, d.ensureNFSProtocols(ctx))
 		assert.Empty(t, mock.NFSServiceUpdateCalls, "no write when the server already enables the version")
@@ -264,7 +264,7 @@ func TestEnsureNFSProtocols(t *testing.T) {
 
 	t.Run("missing protocol is added, never removed", func(t *testing.T) {
 		mock := truenas.NewMockClient()
-		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3"}}
+		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3"}, ProtocolsComplete: true}
 		d := nfsOptionsTestDriver(t, mock, NFSConfig{EnsureProtocols: []string{"NFSV4"}})
 		require.NoError(t, d.ensureNFSProtocols(ctx))
 		require.Len(t, mock.NFSServiceUpdateCalls, 1)
@@ -533,7 +533,7 @@ func TestEnsureNFSProtocolsFailsClosedOnEmptyProtocols(t *testing.T) {
 
 	t.Run("a readable list still widens normally", func(t *testing.T) {
 		mock := truenas.NewMockClient()
-		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3"}}
+		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3"}, ProtocolsComplete: true}
 		d := nfsOptionsTestDriver(t, mock, NFSConfig{EnsureProtocols: []string{"NFSV4"}})
 		require.NoError(t, d.ensureNFSProtocols(ctx))
 		assert.Len(t, mock.NFSServiceUpdateCalls, 1)
@@ -541,7 +541,7 @@ func TestEnsureNFSProtocolsFailsClosedOnEmptyProtocols(t *testing.T) {
 
 	t.Run("an already-satisfied list writes nothing", func(t *testing.T) {
 		mock := truenas.NewMockClient()
-		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3", "NFSV4"}}
+		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3", "NFSV4"}, ProtocolsComplete: true}
 		d := nfsOptionsTestDriver(t, mock, NFSConfig{EnsureProtocols: []string{"NFSV4"}})
 		require.NoError(t, d.ensureNFSProtocols(ctx))
 		assert.Empty(t, mock.NFSServiceUpdateCalls)
@@ -624,5 +624,42 @@ func TestExistingShareIsNeverUpdatedOnReplay(t *testing.T) {
 
 		require.NoError(t, d.ensureNFSShareExists(replayCtx, ds, "tank/k8s/vol", "vol"))
 		assertUntouched(t, mock)
+	})
+}
+
+// TestEnsureNFSProtocolsFailsClosedOnPartialParse pins the driver half of M3's
+// round-2 gap. Round 1 aborted only when the parsed list came back EMPTY. A list
+// that parsed PARTIALLY — say ["NFSV4", {"name":"NFSV5"}] on a future TrueNAS —
+// still looked usable, and because nfs.update REPLACES the protocol list, the
+// merged write would have removed the entry the reader could not see, disabling
+// it for every export on the appliance.
+func TestEnsureNFSProtocolsFailsClosedOnPartialParse(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	// What parseNFSServiceConfig now reports for a half-read list: usable-looking
+	// tokens, but an explicit "this is not the whole picture" verdict.
+	mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{
+		Protocols:         []string{"NFSV4"},
+		ProtocolsComplete: false,
+		ProtocolsAnomaly:  `nfs.config "protocols" entry 1 is map[string]interface {}, not a string`,
+	}
+	d := nfsOptionsTestDriver(t, mock, NFSConfig{EnsureProtocols: []string{"NFSV3"}})
+
+	err := d.ensureNFSProtocols(ctx)
+	require.Error(t, err, "a half-read protocol list is never a safe basis for a replacement write")
+	assert.Contains(t, err.Error(), "DISABLE")
+	assert.Contains(t, err.Error(), "entry 1", "the refusal names the anomaly it saw")
+	assert.Empty(t, mock.NFSServiceUpdateCalls, "no nfs.update may be issued")
+
+	t.Run("an unknown but cleanly-read token is preserved, not removed", func(t *testing.T) {
+		mock := truenas.NewMockClient()
+		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{
+			Protocols: []string{"NFSV4", "NFSV5"}, ProtocolsComplete: true,
+		}
+		d := nfsOptionsTestDriver(t, mock, NFSConfig{EnsureProtocols: []string{"NFSV3"}})
+		require.NoError(t, d.ensureNFSProtocols(ctx))
+		require.Len(t, mock.NFSServiceUpdateCalls, 1)
+		assert.Equal(t, []string{"NFSV3", "NFSV4", "NFSV5"}, mock.NFSServiceUpdateCalls[0]["protocols"],
+			"a widening write must carry every currently-enabled token forward")
 	})
 }

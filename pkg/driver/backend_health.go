@@ -20,6 +20,51 @@ const backendHealthCallTimeout = 30 * time.Second
 // free, and health is not a sub-30s signal.
 const minBackendHealthInterval = 30 * time.Second
 
+// maxBackendHealthInterval is the CEILING, and it exists to keep a documented
+// promise honest rather than to save API calls.
+//
+// The fan-out hysteresis (backendHealthFlipSamples) needs two consecutive
+// samples to flip a PVC's VolumeCondition, so a degradation reaches conditions
+// within at most 2 × interval. The ScaleCSIPoolDegraded alert fires off the
+// UNDAMPED gauge after a 5m hold. Unless 2 × interval stays under that hold, the
+// alert can fire while every PVC still carries the previous verdict — which
+// would contradict docs/production.md's claim that the two can never disagree.
+// 2m leaves a full minute of margin under that hold (2 × 2m = 4m < 5m).
+//
+// A larger configured value is clamped with a loud warning rather than rejected:
+// failing the controller over an observability cadence would be a worse outcome
+// than honoring the ceiling.
+const maxBackendHealthInterval = 2 * time.Minute
+
+// resolveBackendHealthInterval resolves the configured cadence and clamps it to
+// [minBackendHealthInterval, maxBackendHealthInterval]. It is the ONE place the
+// effective interval is derived, so the poll loop and the staleness TTL can
+// never disagree about it.
+func (d *Driver) resolveBackendHealthInterval() (time.Duration, error) {
+	interval := 2 * minBackendHealthInterval
+	if d.config != nil {
+		resolved, err := d.config.BackendHealth.IntervalDuration()
+		if err != nil {
+			return 0, err
+		}
+		if resolved > 0 {
+			interval = resolved
+		}
+	}
+	switch {
+	case interval < minBackendHealthInterval:
+		klog.Warningf("backendHealth.interval %v is below the %v floor; using %v",
+			interval, minBackendHealthInterval, minBackendHealthInterval)
+		interval = minBackendHealthInterval
+	case interval > maxBackendHealthInterval:
+		klog.Warningf("backendHealth.interval %v exceeds the %v ceiling; using %v so a hysteresis-confirmed VolumeCondition "+
+			"flip (at most 2 x interval) still lands inside the ScaleCSIPoolDegraded alert's 5m hold",
+			interval, maxBackendHealthInterval, maxBackendHealthInterval)
+		interval = maxBackendHealthInterval
+	}
+	return interval, nil
+}
+
 // backendHealthStaleIntervals is how many consecutive missed samples make the
 // cached snapshot untrustworthy. Keeping the last snapshot across a blip is
 // correct; keeping it across an outage is not — a stale DEGRADED keeps
@@ -54,7 +99,7 @@ func (d *Driver) startBackendHealth() {
 	if d.config == nil || !d.config.BackendHealth.Enabled {
 		return
 	}
-	interval, err := d.config.BackendHealth.IntervalDuration()
+	interval, err := d.resolveBackendHealthInterval()
 	if err != nil {
 		klog.Errorf("Backend health polling disabled due to invalid interval %q: %v", d.config.BackendHealth.Interval, err)
 		return
@@ -104,14 +149,9 @@ func (d *Driver) stopBackendHealth() {
 // before it is considered stale. It is derived from the configured poll cadence
 // so it self-tunes, and never falls below the interval floor.
 func (d *Driver) backendHealthTTL() time.Duration {
-	interval := 60 * time.Second
-	if d.config != nil {
-		if resolved, err := d.config.BackendHealth.IntervalDuration(); err == nil && resolved > 0 {
-			interval = resolved
-		}
-	}
-	if interval < minBackendHealthInterval {
-		interval = minBackendHealthInterval
+	interval, err := d.resolveBackendHealthInterval()
+	if err != nil || interval <= 0 {
+		interval = 2 * minBackendHealthInterval
 	}
 	return time.Duration(backendHealthStaleIntervals) * interval
 }

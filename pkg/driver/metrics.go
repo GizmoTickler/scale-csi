@@ -692,15 +692,20 @@ var poolStatusLabels = []string{
 	truenas.PoolStatusRemoved,
 }
 
+// poolScanNone is the label used on BOTH the `function` and the `state`
+// dimension when the pool reports no scan at all. Giving idle a REPRESENTABLE
+// state is what makes the cross-product genuinely one-hot: without it an idle
+// pool zeroed every fixed cell and set none, silently degrading the documented
+// "exactly one cell is 1" contract to "at most one".
+const poolScanNone = "NONE"
+
 // poolScanStateLabels is the fixed scan-state label set, zeroed the same way.
 var poolScanStateLabels = []string{
 	truenas.PoolScanStateScanning,
 	truenas.PoolScanStateFinished,
 	truenas.PoolScanStateCanceled,
+	poolScanNone,
 }
-
-// poolScanNone is the `function` label used when the pool reports no scan at all.
-const poolScanNone = "NONE"
 
 // poolScanFunctionLabels is the fixed scan-FUNCTION label set. One-hot means
 // one-hot across the whole {function} × {state} cross-product, not merely within
@@ -719,9 +724,19 @@ var poolScanFunctionLabels = []string{
 // has ever exported, per pool, so they can be zeroed when the pool moves on.
 // Without it an unknown status stays pinned at 1 forever — the exact
 // stale-alerting failure the one-hot design exists to prevent.
+//
+// poolDynamicScanCells does the same job for pool_scan_state, keyed by the
+// {function,state} PAIR. Both dimensions can carry a value outside the fixed
+// sets (an unknown scan function, an unknown scan state, or both), and such a
+// cell lives outside the zeroing cross-product below — so without this registry
+// it would stay pinned at 1 forever while a later known sample lit a second
+// cell, breaking one-hot exactly where an operator is least likely to notice.
 var (
 	poolDynamicStatusMu sync.Mutex
 	poolDynamicStatuses = map[string]map[string]struct{}{}
+
+	poolDynamicScanMu    sync.Mutex
+	poolDynamicScanCells = map[string]map[[2]string]struct{}{}
 )
 
 // SetPoolHealthMetrics publishes one backend-health sample. Every one-hot series
@@ -753,29 +768,25 @@ func SetPoolHealthMetrics(snapshot *truenas.PoolHealthSnapshot) {
 		currentFunction = poolScanNone
 	}
 	currentScan := strings.ToUpper(strings.TrimSpace(snapshot.ScanState))
+	if currentScan == "" {
+		// Idle is a STATE, not the absence of one. Mapping it onto the NONE label
+		// keeps the cross-product one-hot for a pool that has never been scanned.
+		currentScan = poolScanNone
+	}
+	scanMatched := false
 	for _, function := range poolScanFunctionLabels {
 		for _, label := range poolScanStateLabels {
 			value := 0.0
 			if function == currentFunction && label == currentScan {
-				value = 1
+				value, scanMatched = 1.0, true
 			}
 			poolScanState.WithLabelValues(snapshot.Pool, function, label).Set(value)
 		}
 	}
-	// A scan function the driver does not know about still has to be visible, and
-	// still has to be zeroed on the next sample, so route it through the same
-	// bookkeeping as the fixed set.
-	if currentFunction != poolScanNone &&
-		currentFunction != truenas.PoolScanFunctionScrub &&
-		currentFunction != truenas.PoolScanFunctionResilver {
-		for _, label := range poolScanStateLabels {
-			value := 0.0
-			if label == currentScan {
-				value = 1
-			}
-			poolScanState.WithLabelValues(snapshot.Pool, currentFunction, label).Set(value)
-		}
-	}
+	// A scan function OR state the driver does not know about still has to be
+	// visible, and still has to be retired on the next sample, so route it through
+	// the same bookkeeping as the fixed set.
+	setDynamicPoolScanState(snapshot.Pool, currentFunction, currentScan, scanMatched)
 
 	poolScanErrors.WithLabelValues(snapshot.Pool).Set(float64(snapshot.ScanErrors))
 	poolDiskTempAlerts.WithLabelValues(snapshot.Pool).Set(float64(snapshot.TemperatureAlerts))
@@ -800,6 +811,42 @@ func setDynamicPoolStatus(pool, current string, matched bool) {
 	if seen == nil {
 		seen = map[string]struct{}{}
 		poolDynamicStatuses[pool] = seen
+	}
+	seen[current] = struct{}{}
+}
+
+// setDynamicPoolScanState exports a {function,state} cell that falls outside the
+// fixed cross-product as 1, and RETIRES every such cell this process previously
+// exported for the pool by zeroing it.
+//
+// Retiring matters more here than the initial export does: the fixed
+// cross-product loop above cannot zero a cell whose labels it does not enumerate,
+// so an unknown function (or unknown state) observed once would otherwise stay at
+// 1 for the process's lifetime and sit alongside whatever cell the current sample
+// lights — two series at 1, which is precisely the one-hot contract violation the
+// design is supposed to rule out.
+func setDynamicPoolScanState(pool, function, state string, matched bool) {
+	poolDynamicScanMu.Lock()
+	defer poolDynamicScanMu.Unlock()
+	current := [2]string{function, state}
+	seen := poolDynamicScanCells[pool]
+	for cell := range seen {
+		if cell == current && !matched {
+			continue
+		}
+		poolScanState.WithLabelValues(pool, cell[0], cell[1]).Set(0)
+		delete(seen, cell)
+	}
+	if matched || function == "" || state == "" {
+		if len(seen) == 0 {
+			delete(poolDynamicScanCells, pool)
+		}
+		return
+	}
+	poolScanState.WithLabelValues(pool, function, state).Set(1)
+	if seen == nil {
+		seen = map[[2]string]struct{}{}
+		poolDynamicScanCells[pool] = seen
 	}
 	seen[current] = struct{}{}
 }

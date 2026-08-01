@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -162,6 +163,36 @@ func parseNFSACLOptions(params map[string]string) (*nfsACLOptions, error) {
 	return opts, nil
 }
 
+// validateNFSACLContentSource rejects an ACL request the driver cannot honestly
+// satisfy on a volume materialized from a content source (H3).
+//
+// acltype/aclmode are set exactly once, in the pool.dataset.create payload
+// (applyDatasetACLParams -> createDataset). A snapshot clone, a volume clone and
+// a detached replication copy all bypass createDataset entirely and accept no
+// property payload, so the resulting dataset carries the ORIGIN's acltype and
+// aclmode. nfsACLMode exists for exactly one purpose — opting into
+// aclmode=RESTRICTED so an fsGroup chmod fails loudly instead of silently
+// degrading the ACL — so honoring it "except on restores" would be the worst
+// possible outcome: the operator asked for the loud behavior and would silently
+// get whatever the origin happened to have.
+//
+// Only the MODE parameter is refused. nfsACL / nfsACLTemplate stay allowed on a
+// content-source volume because filesystem.setacl acts on the materialized path
+// and genuinely applies; a VolSync restore into an ACL-managed StorageClass must
+// keep working. What the driver stops doing is CLAIMING an aclmode it did not
+// set — see applyNFSVolumeACL.
+func validateNFSACLContentSource(opts *nfsACLOptions, source *csi.VolumeContentSource) error {
+	if opts == nil || opts.aclMode == "" || source == nil {
+		return nil
+	}
+	return status.Errorf(codes.InvalidArgument,
+		"StorageClass parameter %s=%q cannot be honored for a volume provisioned from a %s content source: "+
+			"aclmode is fixed in the dataset CREATE payload, and a clone/restore inherits the origin dataset's "+
+			"acltype/aclmode instead. Remove %s from the StorageClass used for restores (the ACL itself is still "+
+			"applied), or restore into an empty volume provisioned by a class that sets it and copy the data in",
+		nfsACLModeParam, opts.aclMode, contentSourceKind(source), nfsACLModeParam)
+}
+
 func sortedACLTemplates() []string {
 	templates := make([]string, 0, len(supportedACLTemplates))
 	for template := range supportedACLTemplates {
@@ -246,7 +277,22 @@ func applyDatasetACLParams(params *truenas.DatasetCreateParams, opts *nfsACLOpti
 // chmod/SETATTR-mode path at all. It is set here because suppressing inheritance
 // IS the correct semantic for an explicitly-applied ACL — not because it defends
 // against fsGroup.
-func (d *Driver) applyNFSVolumeACL(ctx context.Context, ds *truenas.Dataset, datasetName string, eventObject runtime.Object) {
+//
+// CONTENT-SOURCE VOLUMES (H3). contentSource is non-nil when the dataset was
+// materialized by a clone or a replication copy. Those paths never reach
+// createDataset, so applyDatasetACLParams never ran and the dataset carries the
+// ORIGIN's acltype/aclmode. The DACL below is still applied — filesystem.setacl
+// acts on the materialized path and genuinely works — but this function must not
+// report an aclmode the driver did not set. On the fresh path the reported mode
+// IS the applied state: it is the value sent in the pool.dataset.create payload
+// that created this dataset, so a successful create is proof it took effect.
+func (d *Driver) applyNFSVolumeACL(
+	ctx context.Context,
+	ds *truenas.Dataset,
+	datasetName string,
+	eventObject runtime.Object,
+	contentSource *csi.VolumeContentSource,
+) {
 	opts := nfsACLOptionsFromContext(ctx)
 	if opts.empty() {
 		return
@@ -289,11 +335,25 @@ func (d *Driver) applyNFSVolumeACL(ctx context.Context, ds *truenas.Dataset, dat
 		return
 	}
 
-	klog.Infof("Applied NFSv4 ACL (%s) to %s", opts.describe(), datasetName)
+	aclModeReport := aclModeStatement(opts, contentSource)
+	klog.Infof("Applied NFSv4 ACL (%s) to %s (%s)", opts.describe(), datasetName, aclModeReport)
 	d.recordNormalEvent(eventObject, EventReasonNFSACLApplied,
-		fmt.Sprintf("Applied NFSv4 ACL (%s) to %s (aclmode=%s, nfs41_flags.protected=true — inheritance suppression, not a chmod guard)",
-			opts.describe(), datasetName, opts.resolvedACLMode()))
-	d.warnACLFsGroupConflict(eventObject, datasetName, opts.resolvedACLMode())
+		fmt.Sprintf("Applied NFSv4 ACL (%s) to %s (%s, nfs41_flags.protected=true — inheritance suppression, not a chmod guard)",
+			opts.describe(), datasetName, aclModeReport))
+	d.warnACLFsGroupConflict(eventObject, datasetName, opts, contentSource)
+}
+
+// aclModeStatement reports what the driver ACTUALLY did about aclmode, never
+// merely what the StorageClass asked for (H3).
+func aclModeStatement(opts *nfsACLOptions, contentSource *csi.VolumeContentSource) string {
+	if contentSource == nil {
+		return fmt.Sprintf("aclmode=%s and acltype=NFSV4 set by the driver in the dataset create payload",
+			opts.resolvedACLMode())
+	}
+	return fmt.Sprintf(
+		"acltype/aclmode NOT set by the driver: this volume was materialized from a %s content source, which accepts no "+
+			"property payload, so it inherits the ORIGIN dataset's acltype and aclmode — the driver cannot state which they are",
+		contentSourceKind(contentSource))
 }
 
 // warnACLFsGroupConflict emits the fsGroupPolicy hazard warning. fsGroupPolicy
@@ -301,12 +361,25 @@ func (d *Driver) applyNFSVolumeACL(ctx context.Context, ds *truenas.Dataset, dat
 // decided per StorageClass; the driver refuses to flip the shipped default
 // (that would change fsGroup semantics for EVERY existing volume) and warns
 // instead.
-func (d *Driver) warnACLFsGroupConflict(eventObject runtime.Object, datasetName, aclMode string) {
+func (d *Driver) warnACLFsGroupConflict(
+	eventObject runtime.Object,
+	datasetName string,
+	opts *nfsACLOptions,
+	contentSource *csi.VolumeContentSource,
+) {
 	lever := "The dataset's aclmode is PASSTHROUGH, so that chmod SUCCEEDS and the ACL degrades silently; " +
 		"nfs41_flags.protected does NOT prevent this (it only suppresses inheritance-driven recomputation). " +
 		"Set the StorageClass parameter nfsACLMode=RESTRICTED to make such a chmod fail with EPERM instead — " +
 		"note that this makes the publish fail loudly rather than degrade quietly."
-	if strings.EqualFold(aclMode, "RESTRICTED") {
+	switch {
+	case contentSource != nil:
+		// H3: the driver set no aclmode here, so it must not state one. Whether the
+		// chmod degrades the ACL or fails with EPERM depends on the ORIGIN's aclmode.
+		lever = "The driver did NOT set this volume's aclmode: it was materialized from a content source and inherits " +
+			"the ORIGIN dataset's aclmode, so whether that chmod degrades the ACL (PASSTHROUGH) or fails with EPERM " +
+			"(RESTRICTED) is the origin's setting, not this StorageClass's. nfsACLMode is rejected on content-source " +
+			"requests precisely because it cannot be applied here; check the origin dataset's aclmode on the appliance."
+	case strings.EqualFold(opts.resolvedACLMode(), "RESTRICTED"):
 		lever = "The dataset's aclmode is RESTRICTED, so that chmod FAILS with EPERM and the publish fails loudly " +
 			"rather than degrading the ACL silently."
 	}

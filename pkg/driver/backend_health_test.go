@@ -404,12 +404,24 @@ func TestBackendHealthTTLTracksTheInterval(t *testing.T) {
 	d := healthTestDriver(truenas.NewMockClient())
 	assert.Equal(t, 3*time.Minute, d.backendHealthTTL(), "the default 60s cadence gives a 3m TTL")
 
-	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "5m"}
-	assert.Equal(t, 15*time.Minute, d.backendHealthTTL())
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "2m"}
+	assert.Equal(t, 6*time.Minute, d.backendHealthTTL())
 
 	// A sub-floor interval is clamped before the multiplier is applied.
 	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "1s"}
 	assert.Equal(t, 3*minBackendHealthInterval, d.backendHealthTTL())
+
+	// So is an over-ceiling one (M6 timing caveat): 2 x interval must stay inside
+	// the ScaleCSIPoolDegraded alert's 5m hold, or the undamped gauge could fire
+	// an alert while every PVC still carries the previous verdict — contradicting
+	// docs/production.md's "can never disagree".
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "1h"}
+	assert.Equal(t, 3*maxBackendHealthInterval, d.backendHealthTTL())
+	interval, err := d.resolveBackendHealthInterval()
+	require.NoError(t, err)
+	assert.Equal(t, maxBackendHealthInterval, interval)
+	assert.Less(t, 2*interval, 5*time.Minute,
+		"a hysteresis-confirmed condition flip must land inside the alert hold docs/production.md promises")
 }
 
 // ---------------------------------------------------------------------------
@@ -468,5 +480,70 @@ func TestBackendHealthFlapNeverFlips(t *testing.T) {
 		d.sampleBackendHealth(ctx, "flashstor")
 		assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal(),
 			"an alternating pool must never flip the fleet-wide condition (sample %d)", i)
+	}
+}
+
+// TestSetPoolHealthMetricsScanStateIsOneHotAcrossTheWholeDomain pins M4's
+// round-2 gap. Round 1 made the KNOWN-function transition one-hot, but the
+// contract in docs/production.md is "exactly one cell is 1" across the whole
+// advertised domain, and three cases still broke it:
+//
+//   - a pool with NO scan zeroed all nine fixed cells and set none (sum 0);
+//   - an UNKNOWN state did the same;
+//   - an UNKNOWN function lit a dynamic cell that nothing ever retired, so the
+//     next known sample left TWO series at 1.
+//
+// Every assertion below is a sum over the FULL domain — the fixed cross-product
+// plus every dynamic cell this test has ever caused to be exported.
+func TestSetPoolHealthMetricsScanStateIsOneHotAcrossTheWholeDomain(t *testing.T) {
+	const pool = "gf5-scan-domain-pool"
+	dynamic := [][2]string{
+		{"REBUILD", truenas.PoolScanStateScanning},
+		{"REBUILD", "TRUNDLING"},
+		{truenas.PoolScanFunctionScrub, "TRUNDLING"},
+	}
+	total := func() float64 {
+		sum := 0.0
+		for _, function := range poolScanFunctionLabels {
+			for _, state := range poolScanStateLabels {
+				sum += testutil.ToFloat64(poolScanState.WithLabelValues(pool, function, state))
+			}
+		}
+		for _, cell := range dynamic {
+			sum += testutil.ToFloat64(poolScanState.WithLabelValues(pool, cell[0], cell[1]))
+		}
+		return sum
+	}
+
+	for _, step := range []struct {
+		name            string
+		function, state string
+		wantFunction    string
+		wantState       string
+	}{
+		{name: "running scrub", function: truenas.PoolScanFunctionScrub, state: truenas.PoolScanStateScanning,
+			wantFunction: truenas.PoolScanFunctionScrub, wantState: truenas.PoolScanStateScanning},
+		{name: "no scan at all", wantFunction: poolScanNone, wantState: poolScanNone},
+		{name: "unknown function, known state", function: "REBUILD", state: truenas.PoolScanStateScanning,
+			wantFunction: "REBUILD", wantState: truenas.PoolScanStateScanning},
+		{name: "unknown function AND unknown state", function: "REBUILD", state: "trundling",
+			wantFunction: "REBUILD", wantState: "TRUNDLING"},
+		{name: "known function, unknown state", function: truenas.PoolScanFunctionScrub, state: "trundling",
+			wantFunction: truenas.PoolScanFunctionScrub, wantState: "TRUNDLING"},
+		{name: "back to a finished resilver", function: truenas.PoolScanFunctionResilver, state: truenas.PoolScanStateFinished,
+			wantFunction: truenas.PoolScanFunctionResilver, wantState: truenas.PoolScanStateFinished},
+		{name: "and idle again", wantFunction: poolScanNone, wantState: poolScanNone},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			SetPoolHealthMetrics(&truenas.PoolHealthSnapshot{
+				Pool: pool, Status: truenas.PoolStatusOnline, Healthy: true,
+				ScanFunction: step.function, ScanState: step.state,
+			})
+			assert.Equal(t, 1.0,
+				testutil.ToFloat64(poolScanState.WithLabelValues(pool, step.wantFunction, step.wantState)),
+				"the current cell must be 1")
+			assert.Equal(t, 1.0, total(),
+				"pool_scan_state must be one-hot across the WHOLE function x state domain, dynamic cells included")
+		})
 	}
 }

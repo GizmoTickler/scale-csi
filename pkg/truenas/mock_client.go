@@ -1314,7 +1314,7 @@ func (m *MockClient) NFSServiceConfig(ctx context.Context) (*NFSServiceConfig, e
 		return nil, m.InjectError
 	}
 	if m.NFSServiceConfigValue == nil {
-		return &NFSServiceConfig{Protocols: []string{NFSProtocolV3, NFSProtocolV4}, Servers: 64}, nil
+		return &NFSServiceConfig{Protocols: []string{NFSProtocolV3, NFSProtocolV4}, ProtocolsComplete: true, Servers: 64}, nil
 	}
 	clone := *m.NFSServiceConfigValue
 	clone.Protocols = append([]string(nil), m.NFSServiceConfigValue.Protocols...)
@@ -1329,7 +1329,7 @@ func (m *MockClient) NFSServiceUpdate(ctx context.Context, params map[string]int
 		return nil, m.InjectError
 	}
 	if m.NFSServiceConfigValue == nil {
-		m.NFSServiceConfigValue = &NFSServiceConfig{Protocols: []string{NFSProtocolV3, NFSProtocolV4}, Servers: 64}
+		m.NFSServiceConfigValue = &NFSServiceConfig{Protocols: []string{NFSProtocolV3, NFSProtocolV4}, ProtocolsComplete: true, Servers: 64}
 	}
 	if protocols, ok := params["protocols"].([]string); ok {
 		m.NFSServiceConfigValue.Protocols = append([]string(nil), protocols...)

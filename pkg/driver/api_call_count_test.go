@@ -1460,7 +1460,7 @@ func TestCreateVolumeCloneScrubInheritedProtocolProperties(t *testing.T) {
 	scrubTarget.UserProperties[PropNVMeoFPortSubsysID] = truenas.UserProperty{
 		Value: "unknown-source", Source: "",
 	}
-	d.scrubInheritedProtocolProperties(ctx, scrubTarget, scrubTarget.Name, ShareTypeNFS)
+	d.scrubInheritedCloneProperties(ctx, scrubTarget, scrubTarget.Name, ShareTypeNFS)
 	scrubbed, err := client.MockClient.DatasetGet(ctx, scrubTarget.Name)
 	require.NoError(t, err)
 	assert.Equal(t, "current-protocol", scrubbed.UserProperties[PropNFSShareID].Value,

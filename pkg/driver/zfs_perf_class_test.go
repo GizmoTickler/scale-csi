@@ -445,3 +445,157 @@ func TestCreateVolumeAppliesAndStampsClassOnlyOnFreshCreate(t *testing.T) {
 	require.NotNil(t, ds)
 	assert.Equal(t, "media", ds.UserProperties[PropZFSPerformanceClass].Value)
 }
+
+// ---------------------------------------------------------------------------
+// H1 round 2 — a STAMPED source must not launder its class into the clone
+// ---------------------------------------------------------------------------
+
+// seedStampedPerformanceClassSource creates a source volume that legitimately
+// carries a class stamp ("database"), i.e. a volume the driver itself created
+// with the curated properties applied. Everything downstream of it inherits that
+// stamp through ordinary ZFS behavior, which is exactly the hazard under test.
+func seedStampedPerformanceClassSource(t *testing.T, mock *truenas.MockClient) {
+	t.Helper()
+	ctx := context.Background()
+	mustCreateParentDataset(t, mock)
+	source, err := mock.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/stamped-source", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	require.NoError(t, mock.DatasetSetUserProperties(ctx, source.Name, map[string]string{
+		PropManagedResource:     "true",
+		PropCSIVolumeName:       "stamped-source",
+		PropZFSPerformanceClass: "database",
+	}))
+	_, err = mock.SnapshotCreate(ctx, source.Name, "stamped-snap", nil)
+	require.NoError(t, err)
+}
+
+// contentSourceClassCases enumerates the THREE ways CreateVolume materializes a
+// volume from existing content. Round 1 fixed only the stamp WRITE on the fresh
+// path; every one of these still let a SOURCE-INHERITED stamp survive.
+func contentSourceClassCases() []struct {
+	name     string
+	detached bool
+	source   *csi.VolumeContentSource
+} {
+	return []struct {
+		name     string
+		detached bool
+		source   *csi.VolumeContentSource
+	}{
+		{
+			name: "snapshot clone",
+			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "stamped-snap"},
+			}},
+		},
+		{
+			name:     "detached snapshot copy",
+			detached: true,
+			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "stamped-snap"},
+			}},
+		},
+		{
+			name: "volume clone",
+			source: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "stamped-source"},
+			}},
+		},
+	}
+}
+
+// TestContentSourceVolumeNeverInheritsPerformanceClassStamp is the H1 round-2
+// regression. A ZFS clone copies the source's user properties (with the origin
+// snapshot as their source), and a detached replication copy reproduces them as
+// LOCAL values — so a clone/restore of a legitimately stamped volume came out
+// carrying a class stamp the driver never applied to it.
+//
+// That stamp then drove the immutability guard, which produces a CSI IDEMPOTENCY
+// VIOLATION: replaying an identical, previously SUCCESSFUL CreateVolume compared
+// the requested class against the ORIGIN's stored class and returned
+// FailedPrecondition. All three materialization paths are covered, in both
+// failure directions.
+func TestContentSourceVolumeNeverInheritsPerformanceClassStamp(t *testing.T) {
+	for _, tc := range contentSourceClassCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mock := truenas.NewMockClient()
+			d := perfContentSourceDriver(mock)
+			d.config.ZFS.DetachedVolumesFromSnapshots = tc.detached
+			seedStampedPerformanceClassSource(t, mock)
+
+			request := func(class string) *csi.CreateVolumeRequest {
+				return &csi.CreateVolumeRequest{
+					Name:               "restored",
+					CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+					VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+					Parameters:         map[string]string{"protocol": "nfs", zfsPerformanceClassParam: class},
+					VolumeContentSource: &csi.VolumeContentSource{
+						Type: tc.source.GetType(),
+					},
+				}
+			}
+
+			_, err := d.CreateVolume(ctx, request("media"))
+			require.NoError(t, err)
+
+			target, err := mock.DatasetGet(ctx, "pool/parent/restored")
+			require.NoError(t, err)
+			require.True(t, datasetHasDurableContentSource(target),
+				"the volume under test must actually be a content-source volume")
+			_, stamped := target.UserProperties[PropZFSPerformanceClass]
+			assert.False(t, stamped,
+				"a class stamp copied from the source asserts curated geometry that was never applied to THIS volume")
+
+			// IDEMPOTENCY: the exact same successful request, replayed.
+			_, err = d.CreateVolume(ctx, request("media"))
+			require.NoError(t, err, "an identical replay of a successful CreateVolume must never fail")
+
+			// And a later StorageClass edit must not wedge it either.
+			_, err = d.CreateVolume(ctx, request("backup"))
+			require.NoError(t, err,
+				"the guard must not refuse a class change for create-only properties the driver never set here")
+		})
+	}
+}
+
+// TestPerformanceClassGuardIgnoresContentSourceStamp is the defense-in-depth
+// half: the SCRUB is best-effort (one pool.dataset.update that can fail), so the
+// guard itself must never treat a content-source volume's class stamp as
+// authoritative. This simulates a volume whose scrub did not land — or one
+// provisioned by a driver version that predates it.
+func TestPerformanceClassGuardIgnoresContentSourceStamp(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	d := perfContentSourceDriver(mock)
+	seedStampedPerformanceClassSource(t, mock)
+
+	request := func(class string) *csi.CreateVolumeRequest {
+		return &csi.CreateVolumeRequest{
+			Name:               "restored",
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			Parameters:         map[string]string{"protocol": "nfs", zfsPerformanceClassParam: class},
+			VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "stamped-snap"},
+			}},
+		}
+	}
+	_, err := d.CreateVolume(ctx, request("media"))
+	require.NoError(t, err)
+
+	// Put the lie back, exactly as a failed scrub would leave it.
+	require.NoError(t, mock.DatasetSetUserProperties(ctx, "pool/parent/restored", map[string]string{
+		PropZFSPerformanceClass: "database",
+	}))
+
+	_, err = d.CreateVolume(ctx, request("media"))
+	require.NoError(t, err, "an inherited stamp must not be able to refuse an exact request replay")
+
+	healed, err := mock.DatasetGet(ctx, "pool/parent/restored")
+	require.NoError(t, err)
+	_, stamped := healed.UserProperties[PropZFSPerformanceClass]
+	assert.False(t, stamped, "the existing-volume arm heals a content-source volume's stale class stamp")
+}
