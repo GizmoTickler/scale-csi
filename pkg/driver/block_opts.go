@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,20 @@ type blockOpts struct {
 	iscsiAuthNetworks   []string
 	nvmeofQidMax        *int
 	nvmeofPiEnable      *bool
+
+	// iscsiStableSerial and iscsiAuthNetworksSet record that the StorageClass
+	// EXPLICITLY set those two keys, including to their "off" value
+	// (stableSerial: "false", authNetworks: ""). Both knobs degrade to an empty
+	// value — "" and an empty CIDR list — which is indistinguishable from "the
+	// class said nothing" in iscsiSerial / iscsiAuthNetworks alone. Without these
+	// two flags, turning either knob OFF on an existing volume would be the one
+	// direction that is silently accepted-and-ignored, contradicting the single
+	// rule that all ten knobs are immutable. They are set ONLY by
+	// resolveBlockOpts (a real CreateVolume request); the stored stamp never
+	// carries them, because a stamp records what a volume HAS, not what a class
+	// asked for.
+	iscsiStableSerial    *bool
+	iscsiAuthNetworksSet bool
 }
 
 // blockOptsContextKey carries the request-scoped resolution from CreateVolume
@@ -166,9 +181,12 @@ func resolveBlockOpts(params map[string]string, volumeName string) (*blockOpts, 
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "%s must be a boolean, got %q", paramISCSIStableSerial, raw)
 		}
+		// Record the explicit request even when it is false, so "the class turned
+		// stableSerial off" stays distinguishable from "the class said nothing".
+		opts.iscsiStableSerial = &value
+		set = true
 		if value {
 			opts.iscsiSerial = stableISCSISerial(volumeName)
-			set = true
 		}
 	}
 
@@ -178,6 +196,7 @@ func resolveBlockOpts(params map[string]string, volumeName string) (*blockOpts, 
 			return nil, err
 		}
 		opts.iscsiAuthNetworks = networks
+		opts.iscsiAuthNetworksSet = true
 		set = true
 	}
 
@@ -613,7 +632,10 @@ func guardStoredBlockGeometry(stored, request *blockOpts, datasetName string) er
 //
 // It fires ONLY when both sides are explicit. A restore into a class that opts
 // into nothing inherits the source geometry (correct, and verified) and is left
-// alone; a source with no stamp has no recorded geometry to contradict.
+// alone. A source with no STAMP is not "no geometry": its geometry is resolved
+// from its live iSCSI extent before this runs (see resolveCloneSourceGeometry),
+// because every volume provisioned before these knobs existed is unstamped and
+// is exactly the installed base a newly-knobbed StorageClass gets pointed at.
 func guardCloneSourceGeometry(sourceOpts, request *blockOpts, sourceRef, datasetName string) error {
 	if sourceOpts == nil || request == nil {
 		return nil
@@ -670,7 +692,83 @@ func (d *Driver) guardCloneSourceBlockGeometry(
 				"failed to read the stored block geometry of clone source %s: %v", sourceDataset, err)
 		}
 	}
-	return guardCloneSourceGeometry(blockOptsFromDataset(sourceDS), request, sourceRef, datasetName)
+	sourceOpts, err := d.resolveCloneSourceGeometry(ctx, sourceDataset, blockOptsFromDataset(sourceDS), request)
+	if err != nil {
+		return err
+	}
+	return guardCloneSourceGeometry(sourceOpts, request, sourceRef, datasetName)
+}
+
+// resolveCloneSourceGeometry answers "what geometry does the source ACTUALLY
+// hold" for the fields the request has an opinion about.
+//
+// The stamp is the first answer, and the authoritative one where it exists. But
+// a stamp only exists for a volume provisioned by a StorageClass that opted into
+// that knob — which is NO volume created before these parameters shipped, and no
+// volume from a class that sets none of them. Treating an unstamped source as
+// "no geometry to contradict" is precisely the corruption this guard exists to
+// stop, only aimed at the entire pre-existing fleet: a 4096-geometry volume with
+// no stamp, restored into a class that says blocksize: "512", would be accepted
+// and get a 512-byte extent laid over data whose filesystem and partition table
+// were written for 4096.
+//
+// So for a field the stamp does not carry, the source's LIVE iSCSI extent is
+// consulted — it reports the geometry the data was actually written against.
+// The lookup is strictly opted-in-only: the caller has already short-circuited
+// on hasGeometryOpinion, and even then it is issued only for a field the stamp
+// leaves unanswered, so the default provisioning path's round-trip count is
+// unchanged and a fully stamped source costs nothing extra.
+//
+// A source with no extent at all (an NVMe-oF volume, or one whose share objects
+// are gone) yields no live answer and is left as it was: nothing to contradict.
+func (d *Driver) resolveCloneSourceGeometry(
+	ctx context.Context,
+	sourceDataset string,
+	stamped, request *blockOpts,
+) (*blockOpts, error) {
+	if !needsLiveSourceGeometry(stamped, request) {
+		return stamped, nil
+	}
+	extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, "zvol/"+sourceDataset)
+	if err != nil {
+		// Fail closed, for the same reason the DatasetGet above does: an explicit
+		// geometry in the request plus no way to read the source's real one is the
+		// exact state in which proceeding corrupts data.
+		return nil, status.Errorf(codes.Internal,
+			"failed to read the live block geometry of clone source %s: %v", sourceDataset, err)
+	}
+	if extent == nil {
+		return stamped, nil
+	}
+	resolved := &blockOpts{}
+	if stamped != nil {
+		*resolved = *stamped
+	}
+	if resolved.iscsiBlocksize == nil && extent.Blocksize != 0 {
+		blocksize := extent.Blocksize
+		resolved.iscsiBlocksize = &blocksize
+	}
+	if resolved.iscsiPblocksize == nil && extent.Pblocksize != nil {
+		pblocksize := *extent.Pblocksize
+		resolved.iscsiPblocksize = &pblocksize
+	}
+	return resolved, nil
+}
+
+// needsLiveSourceGeometry reports whether the live-extent probe can tell us
+// anything we do not already know: it fires only for a geometry field the
+// REQUEST opts into and the source's stamp does not answer.
+func needsLiveSourceGeometry(stamped, request *blockOpts) bool {
+	if request == nil {
+		return false
+	}
+	if request.iscsiBlocksize != nil && (stamped == nil || stamped.iscsiBlocksize == nil) {
+		return true
+	}
+	if request.iscsiPblocksize != nil && (stamped == nil || stamped.iscsiPblocksize == nil) {
+		return true
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +902,49 @@ func blockOptNetworksConflict(requested, live, stored []string) (conflict bool, 
 	return true, "unset"
 }
 
+// blockOptStableSerialOffConflict decides the OFF direction of
+// iscsi/stableSerial — the direction the value-based conflict helpers
+// structurally cannot see, because "no stable serial" and "the class said
+// nothing about stableSerial" are the same empty string in blockOpts.iscsiSerial.
+//
+// The live serial alone cannot decide it: TrueNAS auto-generates a serial for
+// every extent, so a non-empty live serial is not evidence that the volume was
+// pinned. The two things that ARE evidence are the volume's stamp (only written
+// when stableSerial was on) and a live serial that equals the deterministic
+// serial this volume's name derives — which a random auto-generated one never
+// does. Together they make a same-value replay of a stableSerial: "false"
+// volume succeed while a genuine on -> off change fails closed.
+func blockOptStableSerialOffConflict(request *blockOpts, live, stored, volumeName string) (conflict bool, current string) {
+	if request == nil || request.iscsiStableSerial == nil || *request.iscsiStableSerial {
+		return false, ""
+	}
+	if stored != "" {
+		return true, "true"
+	}
+	if live != "" && volumeName != "" && live == stableISCSISerial(volumeName) {
+		return true, "true"
+	}
+	return false, ""
+}
+
+// blockOptNetworksOffConflict is blockOptStableSerialOffConflict for
+// iscsi/authNetworks: an explicitly EMPTY list ("remove the target ACL") on a
+// volume whose target carries one is a change, not a no-opinion, and dropping a
+// network ACL silently is exactly the accepted-and-ignored shape the immutability
+// policy exists to prevent.
+func blockOptNetworksOffConflict(request *blockOpts, live, stored []string) (conflict bool, current string) {
+	if request == nil || !request.iscsiAuthNetworksSet || len(request.iscsiAuthNetworks) > 0 {
+		return false, ""
+	}
+	if len(live) > 0 {
+		return true, strings.Join(live, ",")
+	}
+	if len(stored) > 0 {
+		return true, strings.Join(stored, ",")
+	}
+	return false, ""
+}
+
 func sameNetworkSet(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -846,6 +987,14 @@ func guardStoredBlockTuning(stored, request *blockOpts, datasetName string) erro
 	if conflict, current := blockOptNetworksConflict(request.iscsiAuthNetworks, nil, stored.iscsiAuthNetworks); conflict {
 		return blockOptConflict(datasetName, paramISCSIAuthNetworks, current, strings.Join(request.iscsiAuthNetworks, ","))
 	}
+	// Off-direction, absent-object flavor: the stamp is the only record here, so
+	// the live-serial half of the comparison is deliberately empty.
+	if conflict, current := blockOptStableSerialOffConflict(request, "", stored.iscsiSerial, ""); conflict {
+		return blockOptConflict(datasetName, paramISCSIStableSerial, current, "false")
+	}
+	if conflict, current := blockOptNetworksOffConflict(request, nil, stored.iscsiAuthNetworks); conflict {
+		return blockOptConflict(datasetName, paramISCSIAuthNetworks, current, "none")
+	}
 	if conflict, current := blockOptIntConflict(request.nvmeofQidMax, nil, stored.nvmeofQidMax); conflict {
 		return blockOptConflict(datasetName, paramNVMeoFQidMax, current, strconv.Itoa(*request.nvmeofQidMax))
 	}
@@ -866,16 +1015,18 @@ func guardExistingISCSIExtentOpts(extent *truenas.ISCSIExtent, request, stored *
 	if stored == nil {
 		stored = &blockOpts{}
 	}
-	// pblocksize / insecure_tpc / ro are plain booleans that TrueNAS always
-	// reports on iscsi.extent.query, so the live object is authoritative.
-	livePblocksize, liveInsecureTpc, liveReadOnly := extent.Pblocksize, extent.InsecureTpc, extent.Ro
-	if conflict, current := blockOptBoolConflict(request.iscsiPblocksize, &livePblocksize, stored.iscsiPblocksize); conflict {
+	// pblocksize / insecure_tpc / ro are nullable in the response model, so the
+	// SAME rule applies to all ten knobs without exception: the live object is
+	// authoritative when it reports the field, and the stamp is the fallback when
+	// it does not. (A response that omits one used to parse as false and reject a
+	// same-value replay as a conflict.)
+	if conflict, current := blockOptBoolConflict(request.iscsiPblocksize, extent.Pblocksize, stored.iscsiPblocksize); conflict {
 		return blockOptConflict(datasetName, paramISCSIPblocksize, current, strconv.FormatBool(*request.iscsiPblocksize))
 	}
-	if conflict, current := blockOptBoolConflict(request.iscsiInsecureTpc, &liveInsecureTpc, stored.iscsiInsecureTpc); conflict {
+	if conflict, current := blockOptBoolConflict(request.iscsiInsecureTpc, extent.InsecureTpc, stored.iscsiInsecureTpc); conflict {
 		return blockOptConflict(datasetName, paramISCSIInsecureTpc, current, strconv.FormatBool(*request.iscsiInsecureTpc))
 	}
-	if conflict, current := blockOptBoolConflict(request.iscsiReadOnly, &liveReadOnly, stored.iscsiReadOnly); conflict {
+	if conflict, current := blockOptBoolConflict(request.iscsiReadOnly, extent.Ro, stored.iscsiReadOnly); conflict {
 		return blockOptConflict(datasetName, paramISCSIReadOnly, current, strconv.FormatBool(*request.iscsiReadOnly))
 	}
 	if conflict, current := blockOptIntConflict(request.iscsiAvailThreshold, extent.AvailThreshold, stored.iscsiAvailThreshold); conflict {
@@ -883,6 +1034,14 @@ func guardExistingISCSIExtentOpts(extent *truenas.ISCSIExtent, request, stored *
 	}
 	if conflict, current := blockOptStringConflict(request.iscsiSerial, extent.Serial, stored.iscsiSerial); conflict {
 		return blockOptConflict(datasetName, paramISCSIStableSerial, current, request.iscsiSerial)
+	}
+	// The OFF direction of iscsi/stableSerial: turning a knob off is a change like
+	// any other and must not be accepted-and-ignored either (see
+	// blockOptStableSerialOffConflict for why the live serial alone cannot decide
+	// it). path.Base(datasetName) is the volume ID the serial was derived from —
+	// datasetForID builds every dataset name as <parent>/<volumeID>.
+	if conflict, current := blockOptStableSerialOffConflict(request, extent.Serial, stored.iscsiSerial, path.Base(datasetName)); conflict {
+		return blockOptConflict(datasetName, paramISCSIStableSerial, current, "false")
 	}
 	return nil
 }
@@ -901,6 +1060,9 @@ func guardExistingISCSITargetOpts(target *truenas.ISCSITarget, request, stored *
 	}
 	if conflict, current := blockOptNetworksConflict(request.iscsiAuthNetworks, target.AuthNetworks, stored.iscsiAuthNetworks); conflict {
 		return blockOptConflict(datasetName, paramISCSIAuthNetworks, current, strings.Join(request.iscsiAuthNetworks, ","))
+	}
+	if conflict, current := blockOptNetworksOffConflict(request, target.AuthNetworks, stored.iscsiAuthNetworks); conflict {
+		return blockOptConflict(datasetName, paramISCSIAuthNetworks, current, "none")
 	}
 	return nil
 }

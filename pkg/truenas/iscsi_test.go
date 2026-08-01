@@ -295,12 +295,42 @@ func TestParseISCSIExtent_AllProperties(t *testing.T) {
 	assert.Equal(t, "CSI managed volume", extent.Comment)
 	assert.Equal(t, "0x600120001234567890ABCDEF", extent.Naa)
 	assert.Equal(t, 4096, extent.Blocksize)
-	assert.True(t, extent.Pblocksize)
-	assert.False(t, extent.InsecureTpc)
+	require.NotNil(t, extent.Pblocksize)
+	assert.True(t, *extent.Pblocksize)
+	require.NotNil(t, extent.InsecureTpc)
+	assert.False(t, *extent.InsecureTpc)
 	assert.True(t, extent.Xen)
 	assert.Equal(t, "7200", extent.Rpm)
-	assert.True(t, extent.Ro)
+	require.NotNil(t, extent.Ro)
+	assert.True(t, *extent.Ro)
 	assert.True(t, extent.Enabled)
+}
+
+// TestParseISCSIExtentDistinguishesOmittedBoolsFromFalse pins the response-model
+// half of "the live object is authoritative when it REPORTS the field, and the
+// stamp is the fallback when it does not". pblocksize / insecure_tpc / ro used to
+// be plain bools, so a response that omitted one parsed as an authoritative
+// false — and a same-value CreateVolume replay of a volume stamped
+// insecureTpc=true was rejected as a conflict against a value the backend never
+// reported.
+func TestParseISCSIExtentDistinguishesOmittedBoolsFromFalse(t *testing.T) {
+	omitted, err := parseISCSIExtent(map[string]interface{}{
+		"id": float64(7), "name": "quiet-extent", "blocksize": float64(4096),
+	})
+	require.NoError(t, err)
+	assert.Nil(t, omitted.Pblocksize, "an omitted pblocksize must stay nil, not collapse to false")
+	assert.Nil(t, omitted.InsecureTpc, "an omitted insecure_tpc must stay nil, not collapse to false")
+	assert.Nil(t, omitted.Ro, "an omitted ro must stay nil, not collapse to false")
+
+	reportedFalse, err := parseISCSIExtent(map[string]interface{}{
+		"id": float64(8), "name": "explicit-extent",
+		"pblocksize": false, "insecure_tpc": false, "ro": false,
+	})
+	require.NoError(t, err)
+	falseValue := false
+	assert.Equal(t, &falseValue, reportedFalse.Pblocksize)
+	assert.Equal(t, &falseValue, reportedFalse.InsecureTpc)
+	assert.Equal(t, &falseValue, reportedFalse.Ro)
 }
 
 func TestParseISCSITargetExtent_AllFields(t *testing.T) {

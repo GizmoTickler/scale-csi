@@ -1200,24 +1200,30 @@ func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comm
 	defer m.mu.Unlock()
 
 	id := len(m.ISCSIExtents) + 1
+	// The mock mirrors a backend that DOES report pblocksize / insecure_tpc / ro
+	// on iscsi.extent.query (the normal case). The pointer model exists so the
+	// abnormal case — a response that omits one — stays distinguishable from a
+	// reported false; see parseISCSIExtent.
+	pblocksize, insecureTpc, readOnly := physicalBlocksize, true, false
 	ext := &ISCSIExtent{
 		ID:          id,
 		Name:        name,
 		Disk:        diskPath,
 		Comment:     comment,
 		Blocksize:   blocksize,
-		Pblocksize:  physicalBlocksize,
+		Pblocksize:  &pblocksize,
 		Rpm:         rpm,
-		InsecureTpc: true,
+		InsecureTpc: &insecureTpc,
+		Ro:          &readOnly,
 		Enabled:     true,
 	}
 	if len(opts) > 0 {
 		opt := opts[0]
 		if opt.InsecureTpc != nil {
-			ext.InsecureTpc = *opt.InsecureTpc
+			insecureTpc = *opt.InsecureTpc
 		}
 		if opt.ReadOnly != nil {
-			ext.Ro = *opt.ReadOnly
+			readOnly = *opt.ReadOnly
 		}
 		if opt.AvailThreshold != nil {
 			threshold := *opt.AvailThreshold

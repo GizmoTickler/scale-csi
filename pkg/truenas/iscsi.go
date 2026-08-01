@@ -30,21 +30,28 @@ type ISCSITargetGroup struct {
 
 // ISCSIExtent represents an iSCSI extent from the TrueNAS API.
 type ISCSIExtent struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	Disk        string `json:"disk"`
-	Serial      string `json:"serial"`
-	Path        string `json:"path"`
-	Comment     string `json:"comment"`
-	Naa         string `json:"naa"`
-	Blocksize   int    `json:"blocksize"`
-	Pblocksize  bool   `json:"pblocksize"`
-	InsecureTpc bool   `json:"insecure_tpc"`
-	Xen         bool   `json:"xen"`
-	Rpm         string `json:"rpm"`
-	Ro          bool   `json:"ro"`
-	Enabled     bool   `json:"enabled"`
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Disk      string `json:"disk"`
+	Serial    string `json:"serial"`
+	Path      string `json:"path"`
+	Comment   string `json:"comment"`
+	Naa       string `json:"naa"`
+	Blocksize int    `json:"blocksize"`
+	Xen       bool   `json:"xen"`
+	Rpm       string `json:"rpm"`
+	Enabled   bool   `json:"enabled"`
+	// Pblocksize / InsecureTpc / Ro are POINTERS so that "the response did not
+	// report this field" is distinguishable from "the response reported false".
+	// iscsi.extent.query normally reports all three, but the driver's
+	// existing-volume immutability check treats the live object as authoritative
+	// and the volume's stamp as the fallback — collapsing an omitted field into
+	// false would make the live object claim authority it does not have and
+	// reject a same-value replay as a conflict.
+	Pblocksize  *bool `json:"pblocksize"`
+	InsecureTpc *bool `json:"insecure_tpc"`
+	Ro          *bool `json:"ro"`
 	// AvailThreshold is the per-extent early-full warning percentage (1-99); nil
 	// means no threshold is configured.
 	AvailThreshold *int `json:"-"`
@@ -547,10 +554,12 @@ func parseISCSIExtent(data interface{}) (*ISCSIExtent, error) {
 		extent.Blocksize = int(v)
 	}
 	if v, ok := m["pblocksize"].(bool); ok {
-		extent.Pblocksize = v
+		pblocksize := v
+		extent.Pblocksize = &pblocksize
 	}
 	if v, ok := m["insecure_tpc"].(bool); ok {
-		extent.InsecureTpc = v
+		insecureTpc := v
+		extent.InsecureTpc = &insecureTpc
 	}
 	if v, ok := m["xen"].(bool); ok {
 		extent.Xen = v
@@ -559,7 +568,8 @@ func parseISCSIExtent(data interface{}) (*ISCSIExtent, error) {
 		extent.Rpm = v
 	}
 	if v, ok := m["ro"].(bool); ok {
-		extent.Ro = v
+		readOnly := v
+		extent.Ro = &readOnly
 	}
 	if v, ok := m["enabled"].(bool); ok {
 		extent.Enabled = v

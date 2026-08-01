@@ -103,6 +103,15 @@ There is exactly one rule, and it is the same for all ten parameters:
 > resolves a value that is not already in effect, the call fails with
 > `FailedPrecondition` naming the parameter. Nothing is accepted and ignored.
 
+That includes turning a knob **off**. Emptying `iscsi/authNetworks` on a volume
+whose target carries an ACL, and setting `iscsi/stableSerial: "false"` on a
+volume whose serial is pinned, are changes like any other and are rejected the
+same way — a dropped network ACL or an un-pinned SCSI identity is not something
+to apply silently. A volume created with either knob off still replays at off
+idempotently: "stableSerial is on" is decided from the volume's stamp, or from a
+live serial equal to the deterministic one its name derives, never from the mere
+presence of the serial TrueNAS auto-generates for every extent.
+
 | Parameter | TrueNAS 26.0 API | Driver policy | Enforcement |
 |---|---|---|---|
 | `iscsi/blocksize` | mutable on `iscsi.extent.update`, but **not** over existing data | Immutable | `FailedPrecondition` (live extent **and** stored stamp) |
@@ -143,6 +152,12 @@ So a same-value replay is never rejected, and a value that was never applied —
 for example `iscsi/stableSerial` added to a class after its volumes were
 provisioned — is rejected rather than acknowledged.
 
+That rule holds for **all ten** knobs without exception: every field the check
+reads is nullable in the driver's response model (`pblocksize`, `insecure_tpc`
+and `ro` included), so "the backend did not report this" stays distinguishable
+from "the backend reported false" and an omitted field can never masquerade as an
+authoritative one.
+
 A rebuild path that carries **no** StorageClass parameters (`ControllerPublish`,
 the startup attachment reconcile, a DR restore) has no opinion at all and is
 never rejected; it simply replays the volume's own stamp.
@@ -159,8 +174,18 @@ single StorageClass but places no such restriction on restoring a
 `VolumeSnapshot` into a different class, so this is reachable in exactly the
 deployment two differently-tuned classes invite.
 
+The source's geometry is read from its stamp when it has one, and from its **live
+iSCSI extent** when it does not — which is the case for every volume provisioned
+before these parameters existed. A pre-existing 4096 volume is therefore just as
+protected as a stamped one: restoring its snapshot into a `blocksize: "512"`
+class is rejected, not accepted with a 512-byte extent laid over 4096-geometry
+data. The live lookup is issued only when the class opts into a geometry the
+stamp cannot answer, so the default provisioning path costs exactly what it did
+before.
+
 A restore into a class that sets **no** geometry inherits the source's geometry
-(the conservative direction) rather than reverting to the controller default.
+(the conservative direction) rather than reverting to the controller default, and
+performs no lookup at all.
 
 ## NFS
 

@@ -197,5 +197,6 @@ func TestISCSICreateThreadsBlocksize(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, extent)
 	assert.Equal(t, 4096, extent.Blocksize, "per-SC blocksize must reach the extent create")
-	assert.False(t, extent.InsecureTpc, "per-SC insecureTpc=false must reach the extent create")
+	require.NotNil(t, extent.InsecureTpc)
+	assert.False(t, *extent.InsecureTpc, "per-SC insecureTpc=false must reach the extent create")
 }

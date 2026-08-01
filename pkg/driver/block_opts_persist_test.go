@@ -78,7 +78,8 @@ func TestRebuildWithoutRequestOptsUsesStoredBlocksize(t *testing.T) {
 	assert.Equal(t, 4096, extent.Blocksize,
 		"a rebuild with no request opts must re-create the extent at the volume's STORED blocksize; "+
 			"512 here means the controller default was silently written over 4096-geometry data")
-	assert.True(t, extent.Pblocksize, "stored pblocksize must be re-applied on rebuild")
+	require.NotNil(t, extent.Pblocksize)
+	assert.True(t, *extent.Pblocksize, "stored pblocksize must be re-applied on rebuild")
 }
 
 // TestPublishWithoutRequestOptsOnStored4096Succeeds is the F-1 HIGH regression
@@ -174,9 +175,12 @@ func TestRebuildReappliesAllStoredBlockOptions(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, extent)
 	assert.Equal(t, 4096, extent.Blocksize, "stored blocksize must survive the rebuild")
-	assert.False(t, extent.Pblocksize, "stored pblocksize=false must survive the rebuild")
-	assert.False(t, extent.InsecureTpc, "stored insecureTpc=false must survive the rebuild (re-enabling XCOPY/ODX is a downgrade)")
-	assert.True(t, extent.Ro, "stored readOnly=true must survive the rebuild (a safety control must not be silently revoked)")
+	require.NotNil(t, extent.Pblocksize)
+	assert.False(t, *extent.Pblocksize, "stored pblocksize=false must survive the rebuild")
+	require.NotNil(t, extent.InsecureTpc)
+	assert.False(t, *extent.InsecureTpc, "stored insecureTpc=false must survive the rebuild (re-enabling XCOPY/ODX is a downgrade)")
+	require.NotNil(t, extent.Ro)
+	assert.True(t, *extent.Ro, "stored readOnly=true must survive the rebuild (a safety control must not be silently revoked)")
 	require.NotNil(t, extent.AvailThreshold)
 	assert.Equal(t, 80, *extent.AvailThreshold, "stored availThreshold must survive the rebuild")
 	assert.Equal(t, serial, extent.Serial,
@@ -362,8 +366,10 @@ func TestDefaultPathCreateVolumeStampsNothing(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, extent)
 	assert.Equal(t, 512, extent.Blocksize, "the default path keeps the historical 512 blocksize")
-	assert.True(t, extent.InsecureTpc, "the default path keeps the historical insecure_tpc=true")
-	assert.False(t, extent.Ro)
+	require.NotNil(t, extent.InsecureTpc)
+	assert.True(t, *extent.InsecureTpc, "the default path keeps the historical insecure_tpc=true")
+	require.NotNil(t, extent.Ro)
+	assert.False(t, *extent.Ro)
 	assert.Empty(t, extent.Serial, "the default path still lets TrueNAS auto-generate the serial")
 	assert.Nil(t, extent.AvailThreshold)
 }
