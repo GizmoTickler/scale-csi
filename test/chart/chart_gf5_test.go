@@ -575,31 +575,73 @@ func TestGF5Fix3DocsAreHonestAboutSignalTiming(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// GF5 fix-5 — the taxonomy guards assert STRUCTURE, not word presence
+// ---------------------------------------------------------------------------
+//
+// The round-4 guards searched for class names anywhere in a file and checked the
+// "bounded poll stall" defect on a single line. Four semantically identical
+// regressions walked straight through them: naming the poll stall on one line
+// and calling it bounded on the next; renaming the canonical numbered item while
+// leaving the phrase elsewhere in the file; paraphrasing the unsound triage
+// conclusion; and adding a numbered class while the hard-coded names still all
+// matched. The guards below therefore parse the ENUMERATION BLOCK itself — a
+// numbered list, in canonical order, count-complete, with each item's own
+// boundedness qualifier inside that item's own text.
+
 // signalTimingClasses is the CANONICAL taxonomy of ways the raw gauges, the
-// debounced VolumeCondition and the alert (raw gauge + its own `for` hold) can
+// debounced VolumeCondition, the alert (raw gauge + its own `for` hold, observed
+// on Prometheus's cadence) and the external-health-monitor PVC refresh can
 // disagree. The canonical prose lives on backendHealthFlipSamples in
-// pkg/driver/backend_health.go; every other surface must name the SAME classes.
+// pkg/driver/backend_health.go; every enumerating surface must number the SAME
+// classes in the SAME order.
 var signalTimingClasses = []string{
 	"confirmation lag",
 	"alert hold",
 	"recovery",
 	"poll stall",
+	"observer lag",
+	"cold start",
+}
+
+// signalTimingClassBounded records which qualifier each class must carry IN ITS
+// OWN item text. A class whose duration has an upper bound must say "bounded"
+// and must not say "unbounded"; the three that have none must say the opposite.
+// This is what makes "Poll stall" on one line and "BOUNDED by the TTL" on the
+// next a failure rather than a pass.
+var signalTimingClassBounded = map[string]bool{
+	"confirmation lag": true,
+	"alert hold":       true,
+	"recovery":         true,
+	"poll stall":       false,
+	"observer lag":     false,
+	"cold start":       false,
 }
 
 var (
 	// forbiddenWindowCountRe catches any surface that re-asserts a divergence
-	// count smaller than the real one ("two windows", "exactly three bounded,
-	// intended ways", "the three bounded windows", ...). A count is a promise: if
-	// it is asserted anywhere it has to be right everywhere, so the only safe
-	// numbers here are none at all or "four".
-	forbiddenWindowCountRe = regexp.MustCompile(`(?i)\b(two|three|2|3)\b[^.\n]{0,40}?\b(windows?|ways?|classes|divergences?)\b`)
+	// count smaller than the real one ("two windows", "exactly three bounded
+	// ways", "four classes", ...). A count is a promise: if it is asserted
+	// anywhere it has to be right everywhere.
+	forbiddenWindowCountRe = regexp.MustCompile(`(?i)\b(two|three|four|five|2|3|4|5)\b[^.\n]{0,40}?\b(windows?|ways?|classes|divergences?)\b`)
 	// exactlyCountRe catches the "exactly N" phrasing even when the noun is far
 	// away or on the next line.
-	exactlyCountRe = regexp.MustCompile(`(?i)\bexactly (two|three)\b`)
+	exactlyCountRe = regexp.MustCompile(`(?i)\bexactly (two|three|four|five)\b`)
+	// declaredClassCountRe is the positive form: an enumerating surface must
+	// state the real count.
+	declaredClassCountRe = regexp.MustCompile(`(?i)\b(six|6)\b[^.\n]{0,40}?\b(classes|windows?|ways?|divergences?)\b`)
 	// boundedWordRe matches only the standalone word. "unbounded" is one word, so
 	// the leading \b cannot match inside it.
-	boundedWordRe = regexp.MustCompile(`\bbounded\b`)
-	pollStallRe   = regexp.MustCompile(`poll stall`)
+	boundedWordRe   = regexp.MustCompile(`\bbounded\b`)
+	unboundedWordRe = regexp.MustCompile(`\bunbounded\b`)
+	pollStallRe     = regexp.MustCompile(`poll stall`)
+	// backendAnswersRe is the WRONG termination condition for the poll stall: a
+	// valid pool.query that does not list the pool answers and is still a failed
+	// sample (pkg/truenas/pool_health.go).
+	backendAnswersRe = regexp.MustCompile(`until (?:a|the) backend answers`)
+	// numberedItemRe finds an enumeration entry marker. The leading group keeps
+	// it from matching inside a version or a decimal.
+	numberedItemRe = regexp.MustCompile(`(^|[^\w.])(\d{1,2})\.[ \t]+`)
 )
 
 // signalTimingVocabularyRe scopes the count check to sentences that are actually
@@ -607,7 +649,7 @@ var (
 // write/verify race analysis), and flagging that would make the guard useless.
 // Word boundaries matter: "unconditional" is not a mention of a condition.
 var signalTimingVocabularyRe = regexp.MustCompile(
-	`\b(diverg\w*|differs?|differing|gauges?|alerts?|volumecondition|conditions?|hysteresis|debounced?|confirmation lag|poll stall|signal timing)\b`)
+	`\b(diverg\w*|differs?|differing|gauges?|alerts?|volumecondition|conditions?|hysteresis|debounced?|taxonom\w*|classes|confirmation lag|poll stall|observer lag|cold start|signal timing)\b`)
 
 // normalizeTimingProse lowercases and folds hyphens so "Alert hold",
 // "alert-hold" and "poll-stall" all compare equal.
@@ -648,30 +690,145 @@ func findTimingCountClaim(re *regexp.Regexp, body string) string {
 	return ""
 }
 
-// TestGF5Fix4SignalTimingTaxonomyIsCompleteEverywhere is the mechanical guard
-// for the M6 round-4 correction, and it exists because the same overclaim came
-// back three times in slightly different words.
+// taxonomyItem is one numbered entry of the canonical enumeration together with
+// the text that belongs to IT and to no other entry.
+type taxonomyItem struct {
+	number int
+	name   string
+	text   string
+}
+
+// lineMarker returns the comment/table marker a line carries ("//", "#", "|" or
+// ""), which is how the enumeration block is delimited without hard-coding a
+// span: the block is the run of lines that share the anchor's marker.
+func lineMarker(line string) string {
+	trimmed := strings.TrimLeft(line, " \t")
+	for _, marker := range []string{"//", "#", "|", "*"} {
+		if strings.HasPrefix(trimmed, marker) {
+			return marker
+		}
+	}
+	return ""
+}
+
+// markerContent strips the marker so an "empty" comment line can be recognized.
+func markerContent(line, marker string) string {
+	trimmed := strings.TrimSpace(line)
+	if marker != "" {
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, marker))
+	}
+	return trimmed
+}
+
+// extractSignalTimingTaxonomy parses the canonical enumeration out of one
+// surface and returns its items in file order.
 //
-// Round 3 replaced "the signals can never disagree" with "exactly three bounded
-// windows". That was still false twice over: the PrometheusRule's own `for: 5m`
-// creates a FOURTH window in which the PVC condition has already confirmed while
-// the alert is merely PENDING (and BOTH diagnostic gauges read 0), and the
-// poll-stall window is not bounded at all — its own stated duration is "until
-// the backend answers".
-//
-// So this test fails if ANY surface:
-//   - asserts a divergence count below four (in any of the usual phrasings), or
-//   - calls the poll-stall class "bounded" on the same line it names it, or
-//   - drops one of the four canonical class names, or
-//   - stops saying, somewhere, that something here is unbounded.
-func TestGF5Fix4SignalTimingTaxonomyIsCompleteEverywhere(t *testing.T) {
-	for _, surface := range []struct {
-		name string
-		path []string
-		// enumerates surfaces carry the whole taxonomy and must name every class.
-		// The rest must merely never contradict it.
-		enumerates bool
-	}{
+// The block is located structurally, never by a fixed window: it starts at
+// "1. <first class>" and runs to the end of the marker run that the anchor line
+// belongs to (or to the end of the anchor line when the whole enumeration is
+// written inline, as it is in a JSON description or a table cell). The last
+// item additionally stops at the first blank comment line, so trailing prose in
+// the same comment paragraph cannot be read as part of it.
+func extractSignalTimingTaxonomy(t *testing.T, name, body string) ([]taxonomyItem, int, int) {
+	t.Helper()
+
+	anchorRe := regexp.MustCompile(`(^|[^\w.])1\.[ \t]+` + regexp.QuoteMeta(signalTimingClasses[0]))
+	loc := anchorRe.FindStringIndex(body)
+	if loc == nil {
+		t.Fatalf("%s: no canonical enumeration found. It must start with a numbered item %q — "+
+			"every enumerating surface carries the SAME numbered classes in the SAME order: %s",
+			name, "1. "+signalTimingClasses[0], strings.Join(signalTimingClasses, ", "))
+	}
+	start := loc[0]
+	if body[start] != '1' {
+		start++
+	}
+
+	lines := strings.Split(body, "\n")
+	anchorLine, offset := 0, 0
+	for i, line := range lines {
+		if offset+len(line) >= start {
+			anchorLine = i
+			break
+		}
+		offset += len(line) + 1
+	}
+	marker := lineMarker(lines[anchorLine])
+
+	// Inline enumeration (JSON description, markdown table cell): the whole list
+	// lives on the anchor line, so the block must not swallow the lines after it.
+	inline := true
+	for _, class := range signalTimingClasses[1:] {
+		if !strings.Contains(lines[anchorLine], class) {
+			inline = false
+			break
+		}
+	}
+
+	blockLines := []string{lines[anchorLine]}
+	if !inline {
+		for i := anchorLine + 1; i < len(lines); i++ {
+			if lineMarker(lines[i]) != marker || (marker == "" && strings.TrimSpace(lines[i]) == "") {
+				break
+			}
+			blockLines = append(blockLines, lines[i])
+		}
+	}
+	block := strings.Join(blockLines, "\n")
+	block = block[start-offset:]
+
+	// The last item ends at the first blank comment line, so a following
+	// paragraph in the same comment run is not attributed to it.
+	limit := len(block)
+	for i, line := range strings.Split(block, "\n") {
+		if i == 0 {
+			continue
+		}
+		if markerContent(line, marker) == "" {
+			limit = len(strings.Join(strings.Split(block, "\n")[:i], "\n"))
+			break
+		}
+	}
+
+	matches := numberedItemRe.FindAllStringSubmatchIndex(block, -1)
+	items := make([]taxonomyItem, 0, len(matches))
+	for i, m := range matches {
+		numStart := m[4]
+		number := 0
+		for _, c := range block[m[4]:m[5]] {
+			number = number*10 + int(c-'0')
+		}
+		end := len(block)
+		if i+1 < len(matches) {
+			end = matches[i+1][0]
+		}
+		if end > limit {
+			end = limit
+		}
+		if numStart >= limit {
+			// A numbered item after the enumeration paragraph is not part of it.
+			continue
+		}
+		text := block[m[1]:end]
+		items = append(items, taxonomyItem{number: number, text: text, name: strings.TrimSpace(text)})
+	}
+	return items, anchorLine, anchorLine + len(blockLines) - 1
+}
+
+// timingSurface records what a file is REQUIRED to do with the taxonomy. Being
+// honest about this matters: only six surfaces carry the enumeration. metrics.go
+// and the Grafana dashboard reference the canonical list and must merely never
+// contradict it — claiming they "name the same classes" was itself false.
+type timingSurface struct {
+	name string
+	path []string
+	// enumerates surfaces carry the whole numbered taxonomy.
+	// The rest must never contradict it and must point at the canonical copy.
+	enumerates bool
+}
+
+func signalTimingSurfaces() []timingSurface {
+	return []timingSurface{
 		{name: "pkg/driver/backend_health.go", path: []string{"pkg", "driver", "backend_health.go"}, enumerates: true},
 		{name: "charts/scale-csi/templates/prometheusrule.yaml", path: []string{"charts", "scale-csi", "templates", "prometheusrule.yaml"}, enumerates: true},
 		{name: "charts/scale-csi/values.yaml", path: []string{"charts", "scale-csi", "values.yaml"}, enumerates: true},
@@ -680,65 +837,299 @@ func TestGF5Fix4SignalTimingTaxonomyIsCompleteEverywhere(t *testing.T) {
 		{name: "docs/deployment.md", path: []string{"docs", "deployment.md"}, enumerates: true},
 		{name: "pkg/driver/metrics.go", path: []string{"pkg", "driver", "metrics.go"}},
 		{name: "charts/scale-csi/templates/grafana-dashboard.yaml", path: []string{"charts", "scale-csi", "templates", "grafana-dashboard.yaml"}},
-	} {
+	}
+}
+
+// TestGF5Fix5SignalTimingTaxonomyIsStructurallyComplete is the mechanical guard
+// for M6, and it exists because the same overclaim came back four times in
+// slightly different words.
+//
+// Round 3 replaced "the signals can never disagree" with "exactly three bounded
+// windows". Round 4 made it four. Both were incomplete: Prometheus observes the
+// gauges on its own scrape and rule-evaluation cadence (observer lag), and a
+// process whose FIRST sample fails publishes no raw series at all (cold start).
+//
+// This test fails if ANY surface:
+//   - asserts a divergence count below six, or fails to state six;
+//   - writes the enumeration as anything other than the canonical numbered
+//     classes, in canonical order, with no item missing and no item added;
+//   - puts the wrong boundedness qualifier inside an item's own text;
+//   - calls the poll stall bounded on the line that names it;
+//   - still says the poll stall ends when "the backend answers".
+func TestGF5Fix5SignalTimingTaxonomyIsStructurallyComplete(t *testing.T) {
+	for _, surface := range signalTimingSurfaces() {
 		t.Run(surface.name, func(t *testing.T) {
 			body := normalizeTimingProse(repoFile(t, surface.path...))
 
 			if m := findTimingCountClaim(forbiddenWindowCountRe, body); m != "" {
-				t.Errorf("%s re-asserts an incomplete divergence count (%q). The taxonomy has FOUR classes — %s —"+
+				t.Errorf("%s re-asserts an incomplete divergence count (%q). The taxonomy has SIX numbered classes — %s —"+
 					" and a count stated on one surface is a promise on all of them.",
 					surface.name, m, strings.Join(signalTimingClasses, ", "))
 			}
 			if m := findTimingCountClaim(exactlyCountRe, body); m != "" {
-				t.Errorf("%s re-asserts an incomplete divergence count (%q); the taxonomy has FOUR classes", surface.name, m)
+				t.Errorf("%s re-asserts an incomplete divergence count (%q); the taxonomy has SIX classes", surface.name, m)
 			}
-
-			// The poll stall lasts "until the backend answers" — there is no bound
-			// on that. Naming it and calling it bounded in the same breath is the
-			// exact round-3 defect.
+			if m := backendAnswersRe.FindString(body); m != "" {
+				t.Errorf("%s still ends the poll stall when %q. The stall ends at the next SUCCESSFUL USABLE sample:"+
+					" a valid pool.query that does not list the pool answers and still takes the failed-sample path.", surface.name, m)
+			}
+			blockFrom, blockTo := -1, -1
+			var items []taxonomyItem
+			if surface.enumerates {
+				items, blockFrom, blockTo = extractSignalTimingTaxonomy(t, surface.name, body)
+			}
+			// Outside the enumeration block nothing may call the poll stall
+			// bounded. Inside it, the per-ITEM rules below are stricter: they read
+			// each item's own text, which is what an inline enumeration needs.
 			for i, line := range strings.Split(body, "\n") {
+				if i >= blockFrom && i <= blockTo {
+					continue
+				}
 				if pollStallRe.MatchString(line) && boundedWordRe.MatchString(line) {
-					t.Errorf("%s:%d describes the poll-stall class as \"bounded\": %q. It lasts until the backend answers;"+
-						" say so plainly instead.", surface.name, i+1, strings.TrimSpace(line))
+					t.Errorf("%s:%d describes the poll-stall class as \"bounded\": %q. It lasts until a successful usable"+
+						" sample arrives; say so plainly instead.", surface.name, i+1, strings.TrimSpace(line))
 				}
 			}
 
 			if !surface.enumerates {
+				// A non-enumerating surface must still send the reader to the one
+				// canonical copy rather than growing a divergent summary.
+				if !strings.Contains(body, "backendhealthflipsamples") {
+					t.Errorf("%s summarizes the timing contract without pointing at the canonical list"+
+						" (backendHealthFlipSamples in pkg/driver/backend_health.go)", surface.name)
+				}
 				return
 			}
-			for _, class := range signalTimingClasses {
-				if !strings.Contains(body, class) {
-					t.Errorf("%s enumerates the divergence classes but omits %q; every enumeration must be complete and identical", surface.name, class)
-				}
+
+			if m := findTimingCountClaim(declaredClassCountRe, body); m == "" {
+				t.Errorf("%s enumerates the divergence classes but never states the count (six)", surface.name)
 			}
-			if !strings.Contains(body, "unbounded") {
-				t.Errorf("%s enumerates the divergence classes without ever saying the poll stall is unbounded", surface.name)
+
+			if len(items) != len(signalTimingClasses) {
+				got := make([]string, 0, len(items))
+				for _, item := range items {
+					got = append(got, strings.SplitN(item.name, "\n", 2)[0])
+				}
+				t.Fatalf("%s enumerates %d numbered divergence classes, want exactly %d (%s). Parsed items: %q."+
+					" Adding, dropping or renumbering a class here silently breaks every other surface.",
+					surface.name, len(items), len(signalTimingClasses), strings.Join(signalTimingClasses, ", "), got)
+			}
+			for i, item := range items {
+				class := signalTimingClasses[i]
+				if item.number != i+1 {
+					t.Errorf("%s: enumeration item %d is numbered %d; the canonical order is fixed", surface.name, i+1, item.number)
+				}
+				if !strings.HasPrefix(strings.TrimLeft(item.name, "*_`| "), class) {
+					t.Errorf("%s: numbered item %d must be %q, got %q. Renaming the canonical item while the phrase"+
+						" survives somewhere else in the file is exactly the regression this guard exists for.",
+						surface.name, i+1, class, firstLine(item.name))
+				}
+				bounded := signalTimingClassBounded[class]
+				hasBounded := boundedWordRe.MatchString(item.text)
+				hasUnbounded := unboundedWordRe.MatchString(item.text)
+				if bounded && (!hasBounded || hasUnbounded) {
+					t.Errorf("%s: item %d (%s) must call itself BOUNDED, and only bounded, inside its own text; got %q",
+						surface.name, i+1, class, collapse(item.text))
+				}
+				if !bounded && (!hasUnbounded || hasBounded) {
+					t.Errorf("%s: item %d (%s) must call itself UNBOUNDED, and must not claim a bound, inside its own"+
+						" text; got %q", surface.name, i+1, class, collapse(item.text))
+				}
 			}
 		})
 	}
 }
 
-// TestGF5Fix4TriageRuleAccountsForTheAlertHold pins the operator-facing
-// consequence of the fourth window: during the alert hold BOTH diagnostic gauges
-// read 0 while the PVC condition and the alert genuinely disagree, so
-// "both gauges are 0 therefore any difference is real" is not a sound triage
-// rule and must not come back.
-func TestGF5Fix4TriageRuleAccountsForTheAlertHold(t *testing.T) {
-	production := repoFile(t, "docs", "production.md")
-	collapsed := strings.Join(strings.Fields(production), " ")
+func firstLine(s string) string {
+	return strings.TrimSpace(strings.SplitN(s, "\n", 2)[0])
+}
 
-	if strings.Contains(collapsed, "signals are describing the same confirmed state and any difference is real") {
-		t.Error("docs/production.md still tells operators that both gauges reading 0 proves a difference is real;" +
-			" during the alert hold both gauges read 0 while the condition and the alert legitimately differ")
+func collapse(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// collapseProse folds a wrapped comment block into a single line so a sentence
+// that spans lines can be matched: leading // and # markers are dropped first.
+func collapseProse(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		trimmed = strings.TrimPrefix(trimmed, "//")
+		trimmed = strings.TrimPrefix(trimmed, "#")
+		lines[i] = trimmed
 	}
+	return collapse(strings.Join(lines, " "))
+}
+
+// triageRuleBlock returns the operator-facing triage procedure in
+// docs/production.md: the "Triage rule" paragraph plus the numbered steps that
+// belong to it, and nothing after them.
+func triageRuleBlock(t *testing.T, production string) string {
+	t.Helper()
+	idx := strings.Index(production, "**Triage rule.**")
+	if idx < 0 {
+		t.Fatal("docs/production.md no longer contains a `**Triage rule.**` block")
+	}
+	lines := strings.Split(production[idx:], "\n")
+	listish := regexp.MustCompile(`^(\s+\S|\s*(\d+\.|[-*])\s)`)
+	end := len(lines)
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			continue
+		}
+		if i+1 < len(lines) && listish.MatchString(lines[i+1]) {
+			continue
+		}
+		end = i
+		break
+	}
+	return strings.Join(lines[:end], "\n")
+}
+
+// TestGF5Fix5TriageRuleRequiresSynchronizedObservations pins the operator-facing
+// consequence of classes 2, 5 and 6: two diagnostic gauges reading 0 prove
+// nothing on their own.
+//
+// During the alert hold both gauges read 0 while the condition and the alert
+// genuinely differ. After a recovery both gauges read 0 while the alert is still
+// firing simply because Prometheus has not scraped or re-evaluated yet. So the
+// triage procedure has to (a) check the gauges, (b) check the alert's own state,
+// (c) check that the three observations are SYNCHRONIZED — sample/scrape
+// freshness and, during a rollout, controller identity — and (d) stop short of
+// declaring a defect. The order matters, so it is asserted.
+func TestGF5Fix5TriageRuleRequiresSynchronizedObservations(t *testing.T) {
+	production := repoFile(t, "docs", "production.md")
+	collapsed := collapse(production)
+
+	// Whole-file: the unsound conclusion must not exist anywhere, in any wording.
+	unsoundConclusionRe := regexp.MustCompile(`(?i)both[^.\n]{0,80}gauges[^.]{0,240}\breal\b`)
+	if m := unsoundConclusionRe.FindString(collapsed); m != "" {
+		t.Errorf("docs/production.md still concludes from two zero gauges that a difference is real (%q)."+
+			" Both gauges read 0 throughout the alert-hold, observer-lag and cold-start classes.", m)
+	}
+
+	block := triageRuleBlock(t, production)
+	if realRe := regexp.MustCompile(`(?i)\breal\b`); realRe.MatchString(block) {
+		t.Errorf("the triage block calls a remaining mismatch %q; it can only be called UNEXPLAINED after"+
+			" freshness and controller identity have been checked", realRe.FindString(block))
+	}
+
+	// The procedure, in order. Each step must come after the previous one.
+	cursor := 0
 	for _, required := range []string{
-		// The window itself, and the ONLY signal that can distinguish it.
+		"scale_csi_pool_health_flip_pending",
+		"scale_csi_pool_health_stale",
 		`alertstate="pending"`,
 		"neither gauge",
-		"check the alert's own state",
+		"synchronized observations",
+		"scrape freshness",
+		"timestamp(scale_csi_pool_health_stale",
+		"ontroller identity",
+		"pod",
+		"unexplained by the documented classes",
 	} {
-		if !strings.Contains(collapsed, strings.Join(strings.Fields(required), " ")) {
-			t.Errorf("docs/production.md triage guidance is missing %q", required)
+		at := strings.Index(block[cursor:], required)
+		if at < 0 {
+			t.Errorf("the triage block is missing %q, or states it out of order (gauges -> alert state ->"+
+				" synchronized observations -> conclusion)", required)
+			continue
 		}
+		cursor += at + len(required)
+	}
+}
+
+// TestGF5Fix5TimeBoundsIncludeTheCallTimeout pins finding 4: nothing is
+// published until the backend call RETURNS, and that call is bounded at 30s by
+// backendHealthCallTimeout. A confirmed condition therefore trails a state
+// change by up to 2 x interval PLUS one call timeout — 4m30s at the ceiling, not
+// the 4m that 2 x interval alone suggests (still inside the 5m alert hold).
+func TestGF5Fix5TimeBoundsIncludeTheCallTimeout(t *testing.T) {
+	staleBoundRe := regexp.MustCompile(`(?i)at most 4m\b|\bso at most 4m\b|(<=|≤) 2m\b`)
+	for _, surface := range []struct {
+		name string
+		path []string
+	}{
+		{name: "pkg/driver/backend_health.go", path: []string{"pkg", "driver", "backend_health.go"}},
+		{name: "docs/production.md", path: []string{"docs", "production.md"}},
+		{name: "charts/scale-csi/templates/prometheusrule.yaml", path: []string{"charts", "scale-csi", "templates", "prometheusrule.yaml"}},
+		{name: "charts/scale-csi/values.yaml", path: []string{"charts", "scale-csi", "values.yaml"}},
+		{name: "charts/scale-csi/values.schema.json", path: []string{"charts", "scale-csi", "values.schema.json"}},
+	} {
+		t.Run(surface.name, func(t *testing.T) {
+			body := repoFile(t, surface.path...)
+			if m := staleBoundRe.FindString(body); m != "" {
+				t.Errorf("%s states a driver-side bound of %q, which omits the bounded backend call time:"+
+					" a poll may take the full 30s backendHealthCallTimeout before anything is published",
+					surface.name, m)
+			}
+			lower := normalizeTimingProse(body)
+			if !strings.Contains(lower, "call timeout") && !strings.Contains(lower, "backendhealthcalltimeout") {
+				t.Errorf("%s states the confirmation bound without naming the backend call timeout that is part of it", surface.name)
+			}
+			if !strings.Contains(lower, "2m30s") && !strings.Contains(lower, "4m30s") {
+				t.Errorf("%s does not state the corrected bound (one interval + one 30s call timeout: 2m30s per"+
+					" confirmation step, 4m30s to a confirmed condition at the ceiling)", surface.name)
+			}
+		})
+	}
+}
+
+// TestGF5Fix5PollStallEndsAtAUsableSample pins finding (c): "the backend
+// answered" is not the poll stall's termination condition. PoolHealth can get a
+// perfectly valid pool.query response that simply does not contain the pool and
+// return "pool ... not found" (pkg/truenas/pool_health.go), which takes the same
+// failed-sample path as an unreachable appliance.
+func TestGF5Fix5PollStallEndsAtAUsableSample(t *testing.T) {
+	for _, surface := range []struct {
+		name string
+		path []string
+	}{
+		{name: "pkg/driver/backend_health.go", path: []string{"pkg", "driver", "backend_health.go"}},
+		{name: "docs/production.md", path: []string{"docs", "production.md"}},
+		{name: "charts/scale-csi/templates/prometheusrule.yaml", path: []string{"charts", "scale-csi", "templates", "prometheusrule.yaml"}},
+		{name: "charts/scale-csi/values.yaml", path: []string{"charts", "scale-csi", "values.yaml"}},
+		{name: "charts/scale-csi/values.schema.json", path: []string{"charts", "scale-csi", "values.schema.json"}},
+	} {
+		t.Run(surface.name, func(t *testing.T) {
+			body := normalizeTimingProse(repoFile(t, surface.path...))
+			if !strings.Contains(body, "successful usable sample") {
+				t.Errorf("%s does not say the poll stall ends at a SUCCESSFUL USABLE sample", surface.name)
+			}
+		})
+	}
+}
+
+// TestGF5Fix5MetricsCommentsAgreeWithTheBundledAlerts pins finding 3: two
+// comments in pkg/driver/metrics.go contradicted the alerts they describe.
+// ScaleCSIPoolDegraded has NO stale gate, so a frozen DEGRADED sample keeps it
+// firing after a real recovery; and flip_pending = 1 does not imply the served
+// condition is the previous verdict, because past the TTL it is dataset-only.
+func TestGF5Fix5MetricsCommentsAgreeWithTheBundledAlerts(t *testing.T) {
+	metrics := repoFile(t, "pkg", "driver", "metrics.go")
+	rule := repoFile(t, "charts", "scale-csi", "templates", "prometheusrule.yaml")
+
+	if strings.Contains(rule, "scale_csi_pool_health_stale") &&
+		strings.Contains(rule, "expr: max(scale_csi_pool_status{status=~\"DEGRADED|FAULTED|UNAVAIL\"}) by (pool) == 1\n          for: 5m") {
+		// The alert really is ungated; the comments must not claim otherwise.
+		if strings.Contains(metrics, "must not keep alerting after a real recovery") {
+			t.Error("pkg/driver/metrics.go still claims the staleness TTL stops a stale DEGRADED from alerting;" +
+				" ScaleCSIPoolDegraded has no stale gate, so the frozen sample keeps it firing")
+		}
+	}
+	collapsedMetrics := collapseProse(metrics)
+	for _, required := range []string{
+		"deliberately not gated on this one",
+		"FROZEN DEGRADED sample keeps that alert firing",
+		"NOT a complete disagreement detector",
+	} {
+		if !strings.Contains(collapsedMetrics, collapse(required)) {
+			t.Errorf("pkg/driver/metrics.go is missing the corrected wording %q", required)
+		}
+	}
+
+	health := collapseProse(repoFile(t, "pkg", "driver", "backend_health_test.go"))
+	if strings.Contains(health, "a stale DEGRADED keeps alerting after a real recovery") {
+		t.Error("pkg/driver/backend_health_test.go repeats the same false claim in a comment: the TTL bounds" +
+			" CONDITIONS, not alerting")
 	}
 }

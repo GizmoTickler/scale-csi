@@ -366,8 +366,14 @@ func TestSetPoolHealthMetricsZeroesUnrecognizedStatus(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestPoolHealthSnapshotExpires pins M5. Keeping the last snapshot across a blip
-// is correct; keeping it across an outage is not — a stale DEGRADED keeps
-// alerting after a real recovery, and a stale ONLINE masks a real degradation.
+// is correct; keeping it across an outage is not — a stale DEGRADED would keep
+// asserting an abnormal CONDITION on every PVC after a real recovery, and a
+// stale ONLINE would mask a real degradation.
+//
+// The TTL bounds CONDITIONS only. It does NOT stop the frozen raw gauge from
+// keeping ScaleCSIPoolDegraded firing (that alert is deliberately not gated on
+// scale_csi_pool_health_stale), which is precisely why the staleness gauge must
+// be published the moment the snapshot stops being served.
 func TestPoolHealthSnapshotExpires(t *testing.T) {
 	mock := truenas.NewMockClient()
 	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{
@@ -398,6 +404,110 @@ func TestPoolHealthSnapshotExpires(t *testing.T) {
 	mock.InjectHealthError = nil
 	d.sampleBackendHealth(context.Background(), "flashstor")
 	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues("flashstor")))
+}
+
+// TestBackendHealthColdStartPublishesHonestState pins divergence class 6.
+//
+// The CSI and metrics servers are serving before startBackendHealth produces
+// anything, and every bit of this state is process-local. If the FIRST sample of
+// a process fails there is no previous snapshot to freeze, so the raw
+// scale_csi_pool_* series never come into existence and ScaleCSIPoolDegraded
+// cannot fire whatever the pool is doing. That window is unbounded, and it used
+// to be completely SILENT because the staleness verdict was published only when
+// a previous snapshot existed.
+//
+// The sample here also pins the poll-stall termination condition: a valid
+// pool.query that simply does not list the pool comes back as "pool ... not
+// found". The backend ANSWERED; this is still a failed sample.
+func TestBackendHealthColdStartPublishesHonestState(t *testing.T) {
+	const pool = "coldstartpool"
+	mock := truenas.NewMockClient()
+	mock.InjectHealthError = errors.New("pool " + pool + " not found")
+	d := healthTestDriver(mock)
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+
+	statusSeries := testutil.CollectAndCount(poolStatus)
+	healthySeries := testutil.CollectAndCount(poolHealthy)
+
+	d.sampleBackendHealth(context.Background(), pool)
+
+	require.Nil(t, d.poolHealthSnapshot(), "a failed first sample must not fabricate a snapshot")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
+		"the first failing sample of a process must publish stale=1: there is no previous snapshot, so the raw "+
+			"scale_csi_pool_* series are absent and ScaleCSIPoolDegraded cannot fire - that blind window must not be silent")
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthFlipPending.WithLabelValues(pool)),
+		"there is no held transition at cold start, and an absent series is not the same operator signal as an explicit 0")
+
+	assert.Equal(t, statusSeries, testutil.CollectAndCount(poolStatus),
+		"cold start must not INVENT a pool status; an absent series is the truth")
+	assert.Equal(t, healthySeries, testutil.CollectAndCount(poolHealthy),
+		"cold start must not INVENT a pool health verdict")
+
+	// The next successful sample takes it out of the cold-start window.
+	mock.InjectHealthError = nil
+	d.sampleBackendHealth(context.Background(), pool)
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
+	assert.NotNil(t, d.poolHealthSnapshot())
+}
+
+// TestPoolHealthStaleRaisedWhenTheTTLExpires pins the driver-local half of the
+// poll-stall class: the TTL expires on the READ path, and the staleness verdict
+// has to be published at that instant. Waiting for a hung call to return can
+// take the whole backendHealthCallTimeout, and during that gap the served
+// condition has already fallen back to dataset-only while a frozen DEGRADED
+// gauge keeps alerting with BOTH diagnostic gauges reading 0.
+func TestPoolHealthStaleRaisedWhenTheTTLExpires(t *testing.T) {
+	const pool = "ttlgappool"
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusDegraded}
+	d := healthTestDriver(mock)
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+
+	d.sampleBackendHealth(context.Background(), pool)
+	require.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
+
+	// A poll is in flight and hanging; the cached snapshot ages past its TTL
+	// while the failed-sample branch cannot run yet.
+	expired := *d.backendHealth.Load()
+	expired.SampledAt = time.Now().Add(-d.backendHealthTTL() - time.Second)
+	d.backendHealth.Store(&expired)
+
+	require.Nil(t, d.poolHealthSnapshot(), "past the TTL the snapshot stops being served")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
+		"the CSI read path already refuses to serve the snapshot, so stale must already be 1")
+
+	// The same gap is closed from the poll loop for a controller that is taking
+	// no CSI traffic at all: the pre-call check raises it without waiting for the
+	// in-flight call to return.
+	SetPoolHealthStale(pool, false)
+	d.markPoolHealthStaleIfExpired()
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
+}
+
+// TestMarkPoolHealthStaleYieldsToAFreshSample covers the read-path/poller race:
+// markPoolHealthStale runs concurrently with the poller, and a successful sample
+// that lands while it is publishing has already written the authoritative
+// verdict. The read path must not leave a false 1 behind it.
+func TestMarkPoolHealthStaleYieldsToAFreshSample(t *testing.T) {
+	const pool = "raceypool"
+	d := healthTestDriver(truenas.NewMockClient())
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+
+	expired := &truenas.PoolHealthSnapshot{
+		Pool: pool, Status: truenas.PoolStatusDegraded,
+		SampledAt: time.Now().Add(-d.backendHealthTTL() - time.Second),
+	}
+	fresh := &truenas.PoolHealthSnapshot{
+		Pool: pool, Status: truenas.PoolStatusOnline, Healthy: true, SampledAt: time.Now(),
+	}
+	d.backendHealth.Store(fresh)
+	SetPoolHealthStale(pool, false)
+
+	// The read path decided on the now-superseded snapshot.
+	d.markPoolHealthStale(expired)
+
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
+		"a successful sample landed first; the read path must not re-raise staleness against it")
 }
 
 func TestBackendHealthTTLTracksTheInterval(t *testing.T) {

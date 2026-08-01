@@ -213,13 +213,26 @@ spec:
           # risk. This is the SAME severity split the per-PVC VolumeCondition
           # applies: the two agree on WHICH states are abnormal. They are not the
           # same signal in TIME — this alert reads the RAW gauge, the condition is
-          # debounced by two-sample hysteresis, and THIS RULE ADDS ITS OWN 5m
-          # `for` hold on top — so do not claim they always agree. There are FOUR
-          # classes of divergence: confirmation lag (bounded, <= 2m), alert hold
-          # (bounded by the 5m `for` below — after the condition confirms, PVCs
-          # read Abnormal while this alert is still PENDING, and BOTH diagnostic
-          # gauges read 0), recovery (bounded, one sample), and
-          # poll stall, which is UNBOUNDED: it lasts until the backend answers.
+          # debounced by two-sample hysteresis, THIS RULE ADDS ITS OWN 5m `for`
+          # hold on top, and Prometheus observes all of it on its own scrape and
+          # rule-evaluation cadence — so do not claim they always agree. There are
+          # SIX NUMBERED classes of divergence:
+          #   1. confirmation lag (BOUNDED: one interval plus one 30s call
+          #      timeout, <= 2m30s at the interval ceiling);
+          #   2. alert hold (BOUNDED by the 5m `for` below — after the condition
+          #      confirms, PVCs read Abnormal while this alert is still PENDING,
+          #      and BOTH diagnostic gauges read 0);
+          #   3. recovery (BOUNDED, one sample);
+          #   4. poll stall (UNBOUNDED: it lasts until a successful USABLE sample
+          #      arrives — a `pool ... not found` reply is still a failed sample);
+          #   5. observer lag (UNBOUNDED: scrape and rule-evaluation cadence, plus
+          #      cross-replica skew during a rollout, none of which the driver
+          #      controls — `for` starts at the first true EVALUATION, not at the
+          #      driver's sample, so after a recovery both diagnostic gauges can
+          #      read 0 while this alert still fires);
+          #   6. cold start (UNBOUNDED: before the first successful sample of a
+          #      controller process the raw series do not exist, so THIS ALERT
+          #      CANNOT FIRE — scale_csi_pool_health_stale is the only signal).
           # See docs/production.md#backend-health; the canonical list lives on
           # backendHealthFlipSamples in pkg/driver/backend_health.go.
           expr: max(scale_csi_pool_status{status=~"DEGRADED|FAULTED|UNAVAIL"}) by (pool) == 1
@@ -228,7 +241,7 @@ spec:
             severity: critical
           annotations:
             summary: Scale CSI backend pool is degraded
-            description: The ZFS pool backing every Scale CSI volume reports a degraded, faulted or unavailable state. Managed PVCs on this pool report an abnormal VolumeCondition once the two-sample hysteresis confirms the transition (at most 2 x the effective clamped backendHealth.interval, so at most 4m, while successful samples keep arriving). Check scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before concluding the condition is wrong - while flip_pending is 1 and the snapshot is still inside its staleness TTL the condition deliberately carries the previous verdict; past the TTL conditions fall back to dataset-only even though flip_pending may still read 1.
+            description: The ZFS pool backing every Scale CSI volume reports a degraded, faulted or unavailable state. Managed PVCs on this pool report an abnormal VolumeCondition once the two-sample hysteresis confirms the transition (at most 2 x the effective clamped backendHealth.interval PLUS one 30s backend call timeout, so at most 4m30s, while successful samples keep arriving). Check scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before concluding the condition is wrong - while flip_pending is 1 and the snapshot is still inside its staleness TTL the condition deliberately carries the previous verdict; past the TTL conditions fall back to dataset-only even though flip_pending may still read 1. Both gauges reading 0 does NOT prove a remaining mismatch is a defect - this alert changes state on Prometheus scrape and rule-evaluation cadence, not at the driver's sample time, so a confirmed recovery can leave both gauges at 0 while this alert is still firing. Compare sample freshness and pin one controller pod first - see docs/production.md, Signal timing.
         - alert: ScaleCSIPoolScanErrors
           expr: max(scale_csi_pool_scan_errors) by (pool) > 0
           for: 15m
@@ -257,16 +270,17 @@ spec:
             severity: warning
           annotations:
             summary: Scale CSI backend health data is stale
-            description: The controller has not obtained a fresh pool.query sample. The VolumeCondition being served is not backed by a current sample - either the snapshot aged past its TTL (3 x the EFFECTIVE clamped backendHealth.interval, so 3m at the default and never more than 6m) and conditions fell back to dataset-only, or a held health transition never received its confirming sample. The other scale_csi_pool_* gauges are frozen at their last values, so a frozen DEGRADED keeps ScaleCSIPoolDegraded firing until a successful sample changes it - that alert is deliberately NOT gated on this one. This is the poll-stall class and it is UNBOUNDED - it lasts until the backend answers.
+            description: The controller has not obtained a fresh pool.query sample. The VolumeCondition being served is not backed by a current sample - the snapshot aged past its TTL (3 x the EFFECTIVE clamped backendHealth.interval, so 3m at the default and never more than 6m) and conditions fell back to dataset-only, a held health transition never received its confirming sample, or no successful sample has landed since this controller process started. The other scale_csi_pool_* gauges are frozen at their last values, so a frozen DEGRADED keeps ScaleCSIPoolDegraded firing until a successful sample changes it - that alert is deliberately NOT gated on this one. At cold start those gauges do not exist at all and ScaleCSIPoolDegraded cannot fire, which is why this alert is the only signal there. This is the poll-stall/cold-start pair and both are UNBOUNDED - they last until a successful USABLE sample arrives, and a pool.query reply that does not list the pool is not one.
         - alert: ScaleCSIPoolConditionFlipPending
           # The debounce is stuck. Normally a held transition confirms or clears on
-          # the very next sample, so this is 1 for at most one interval (<= 2m).
-          # Staying pending means the confirming sample is not arriving: the
-          # poll-stall class, which is UNBOUNDED (it lasts until the backend
-          # answers). Note this gauge is NOT a complete raw-vs-condition
-          # disagreement detector - it reads 0 during the alert-hold class, and
-          # past the staleness TTL it can still read 1 after conditions have
-          # fallen back to dataset-only.
+          # the very next sample, so this is 1 for at most one interval plus one
+          # 30s call timeout (<= 2m30s). Staying pending means the confirming
+          # sample is not arriving: the poll-stall class, which is UNBOUNDED (it
+          # lasts until a successful USABLE sample arrives). Note this gauge is NOT
+          # a complete raw-vs-condition disagreement detector - it reads 0 during
+          # the alert-hold, observer-lag and cold-start classes, and past the
+          # staleness TTL it can still read 1 after conditions have fallen back to
+          # dataset-only.
           expr: max(scale_csi_pool_health_flip_pending) by (pool) == 1
           for: 10m
           labels:

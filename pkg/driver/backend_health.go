@@ -26,12 +26,18 @@ const minBackendHealthInterval = 30 * time.Second
 // calls.
 //
 // The fan-out hysteresis (backendHealthFlipSamples) needs two consecutive
-// samples to flip a PVC's VolumeCondition, so a degradation that keeps being
-// observed reaches conditions within at most 2 × interval. The
-// ScaleCSIPoolDegraded alert fires off the UNDAMPED gauge after a 5m hold. The
-// ceiling keeps 2 × interval under that hold (2 × 2m = 4m < 5m), so an operator
-// paged by that alert finds the PVC conditions already agreeing WHEN SAMPLES
-// KEEP ARRIVING.
+// samples to flip a PVC's VolumeCondition, and NOTHING is published until each
+// of those samples' backend calls RETURNS — backendHealthCallTimeout bounds that
+// at 30s. So a degradation that keeps being observed reaches conditions within
+// at most 2 × interval + backendHealthCallTimeout: 4m30s at the ceiling, NOT the
+// 4m that 2 × interval alone suggests. The ScaleCSIPoolDegraded alert fires off
+// the UNDAMPED gauge after a 5m hold, so the ceiling still keeps a confirmed
+// flip inside that hold (4m30s < 5m) WHEN SAMPLES KEEP ARRIVING.
+//
+// This is a DRIVER-SIDE bound. It says nothing about when Prometheus SCRAPES the
+// change or when the rule is EVALUATED, and the chart puts no upper bound on the
+// ServiceMonitor interval — that is the observer-lag class, and it is outside
+// every number here.
 //
 // This is a bound, NOT a guarantee that the two signals always agree, and it
 // does not reduce the number of ways they can differ — it CREATES one of them:
@@ -39,12 +45,13 @@ const minBackendHealthInterval = 30 * time.Second
 // reads Abnormal while ScaleCSIPoolDegraded is still PENDING (the "alert hold"
 // class).
 //
-// backendHealthFlipSamples carries the SINGLE canonical enumeration: FOUR
-// classes of divergence — confirmation lag, alert hold and recovery, each with
-// an upper bound, plus poll stall, which is UNBOUNDED. Every other copy of that
-// list (prometheusrule.yaml, values.yaml, values.schema.json,
-// docs/production.md, docs/deployment.md) names the same four classes. A count
-// asserted in one place is a promise in all of them.
+// backendHealthFlipSamples carries the SINGLE canonical enumeration: SIX
+// NUMBERED classes of divergence — confirmation lag, alert hold, recovery, poll
+// stall, observer lag and cold start. The first three have an upper bound; the
+// last three do not. Every other copy of that list (prometheusrule.yaml,
+// values.yaml, values.schema.json, docs/production.md, docs/deployment.md)
+// numbers the SAME classes in the SAME order. A count asserted in one place is a
+// promise in all of them.
 //
 // A larger configured value is clamped with a loud warning rather than rejected:
 // failing the controller over an observability cadence would be a worse outcome
@@ -122,20 +129,24 @@ const backendHealthStaleIntervals = 3
 // first interval after startup.
 //
 // THE HONEST CONTRACT (do not restate this as "the alert and the PVC condition
-// can never disagree" — that claim is false). THREE signals are involved, not
-// two: the RAW gauges, the DEBOUNCED per-PVC condition, and the ALERT, which is
-// the raw gauge plus its own `for` hold. They share one SEVERITY SPLIT — the
-// same states are abnormal in all three — but they are not the same signal in
-// TIME. This is the CANONICAL list, and it is complete: FOUR classes of
-// divergence, three bounded and one unbounded. Do not restate it with a smaller
-// count anywhere.
+// can never disagree" — that claim is false). FOUR observers are involved, not
+// two: the RAW gauges, the DEBOUNCED per-PVC condition, the ALERT (the raw gauge
+// plus its own `for` hold, which Prometheus evaluates on ITS OWN scrape and
+// rule-evaluation cadence, not on the driver's), and the PVC condition/Event
+// refresh that external-health-monitor drives on a third cadence. They share one
+// SEVERITY SPLIT — the same states are abnormal in all of them — but they are
+// not the same signal in TIME. This is the CANONICAL list and it is complete:
+// SIX NUMBERED classes of divergence; the first three have an upper bound, the
+// last three do not. Do not restate it with a smaller count, and do not rename
+// or reorder the items — every other copy is checked against this one.
 //
-//  1. Confirmation lag (BOUNDED: one successful poll interval, ≤ 2m). An
+//  1. Confirmation lag (BOUNDED: one successful poll interval plus one
+//     backendHealthCallTimeout, so ≤ 2m30s at the interval ceiling). An
 //     established-state transition is withheld until the second consecutive
 //     sample, so the condition trails the gauges. maxBackendHealthInterval keeps
-//     2 × interval under ScaleCSIPoolDegraded's 5m hold, so a degradation that
-//     keeps being observed reaches conditions before the alert fires. Observable
-//     via scale_csi_pool_health_flip_pending = 1.
+//     2 × interval + one call timeout under ScaleCSIPoolDegraded's 5m hold, so a
+//     degradation that keeps being observed reaches conditions before the alert
+//     fires. Observable via scale_csi_pool_health_flip_pending = 1.
 //  2. Alert hold (BOUNDED: the remainder of the rule's own `for: 5m`). Once the
 //     second sample confirms, PVCs read Abnormal while ScaleCSIPoolDegraded is
 //     still PENDING and therefore NOT firing. The ceiling in
@@ -147,16 +158,45 @@ const backendHealthStaleIntervals = 3
 //     until the second: the alert has cleared and PVCs still read abnormal.
 //     Nothing about the interval can remove this; it is the point of the damper.
 //     Observable via scale_csi_pool_health_flip_pending = 1.
-//  4. Poll stall (UNBOUNDED — it lasts until the backend answers; there is no
-//     bound on that). If samples stop arriving the condition HOLDS its last
-//     value and the gauges FREEZE at theirs, so a single unconfirmed degraded
-//     sample can keep the raw alert expression true while the condition still
-//     reads normal. It is observable, not silent: the first failed sample that
-//     finds an unconfirmed flip (or an expired TTL) raises
-//     scale_csi_pool_health_stale. Past the TTL the condition stops being served
-//     and falls back to dataset-only — at which point flip_pending may still
-//     read 1 even though the served condition no longer carries the held
-//     verdict; it is cleared by the next successful sample.
+//  4. Poll stall (UNBOUNDED — it lasts until a SUCCESSFUL USABLE sample arrives,
+//     and nothing here limits that). "The backend answered" is NOT the end of
+//     it: a valid pool.query that simply does not contain the pool comes back as
+//     `pool ... not found` (pkg/truenas/pool_health.go) and takes this same
+//     failed-sample path. If usable samples stop arriving the condition HOLDS
+//     its last value and the gauges FREEZE at theirs, so a single unconfirmed
+//     degraded sample can keep the raw alert expression true while the condition
+//     still reads normal. It is observable, not silent: scale_csi_pool_health_stale
+//     goes to 1 on the first failed sample that finds an unconfirmed flip, and
+//     the moment the TTL expires — at the sample attempt or at the CSI read that
+//     first refuses to serve the snapshot, whichever comes first, NOT only when
+//     a hung call finally returns. Past the TTL the condition falls back to
+//     dataset-only, at which point flip_pending may still read 1 even though the
+//     served condition no longer carries the held verdict; the next successful
+//     sample clears it.
+//  5. Observer lag (UNBOUNDED — the driver does not control it and cannot see
+//     it). Prometheus sees these gauges only on its next successful SCRAPE and
+//     changes alert state only on its next rule EVALUATION; `for: 5m` starts
+//     when the EXPRESSION first evaluates true, not when the driver sampled. The
+//     chart places no upper limit on the ServiceMonitor interval and a
+//     scrape/evaluation outage is not limited at all. Two consequences, both
+//     EXPECTED: after a recovery both diagnostic gauges can read 0 while the
+//     alert is still firing, and before the first true evaluation the condition
+//     can already be abnormal with no ALERTS{alertstate="pending"} series yet.
+//     During a RollingUpdate two controller processes publish independently
+//     sampled series that the alert's `max by (pool)` merges. Diagnose it by
+//     comparing sample/scrape freshness and pinning the pod, never by reading
+//     the two diagnostic gauges.
+//  6. Cold start (UNBOUNDED — until the FIRST successful sample of this
+//     process). All of this state is process-local and the CSI and metrics
+//     servers are already serving before startBackendHealth produces anything
+//     (see driver.go): conditions are dataset-only and the raw
+//     scale_csi_pool_status/_healthy series DO NOT EXIST yet, so
+//     ScaleCSIPoolDegraded cannot fire whatever the pool is doing. That is not
+//     the poll-stall shape — there is nothing frozen to see. The first failing
+//     sample therefore publishes scale_csi_pool_health_stale = 1 (and
+//     flip_pending = 0) for the configured pool so the blind window is visible
+//     and ScaleCSIPoolHealthStale can fire; the raw gauges stay ABSENT rather
+//     than being invented.
 const backendHealthFlipSamples = 2
 
 // startBackendHealth launches the controller-only backend-health poll loop when
@@ -199,6 +239,12 @@ func (d *Driver) startBackendHealth() {
 		defer d.backendHealthWg.Done()
 		klog.Infof("Backend health polling started: interval=%v pool=%s", interval, pool)
 		run := func() {
+			// Publish the staleness verdict BEFORE the call, not only after it: a
+			// hung poll may burn the whole backendHealthCallTimeout, and until it
+			// returns the error branch in sampleBackendHealth cannot run. Without
+			// this, a snapshot that expires during a stalled call leaves a frozen
+			// DEGRADED gauge alerting with BOTH diagnostics reading 0.
+			d.markPoolHealthStaleIfExpired()
 			callCtx, callCancel := context.WithTimeout(ctx, backendHealthCallTimeout)
 			defer callCancel()
 			d.sampleBackendHealth(callCtx, pool)
@@ -249,36 +295,7 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 		if ctx.Err() == nil {
 			klog.Warningf("Backend health sample failed for pool %s: %v", pool, err)
 		}
-		// Publish the staleness verdict from inside the poll loop so it keeps
-		// updating even while the backend is unreachable.
-		//
-		// The verdict answers ONE question: is the condition the driver is
-		// currently serving backed by a fresh sample? It is not in either of the
-		// cases below, and both must be visible or the poll-stall class in
-		// backendHealthFlipSamples(4) would be silent:
-		//   - the snapshot aged past its TTL, so conditions have fallen back to
-		//     dataset-only; or
-		//   - a flip is pending and its CONFIRMING sample is exactly the one that
-		//     just failed to arrive, so the served verdict is one the latest raw
-		//     sample already contradicts.
-		if previous := d.backendHealth.Load(); previous != nil {
-			age := time.Since(previous.SampledAt)
-			ttl := d.backendHealthTTL()
-			expired := age > ttl
-			unconfirmedFlip := d.backendHealthPendingFlips.Load() > 0
-			SetPoolHealthStale(previous.Pool, expired || unconfirmedFlip)
-			switch {
-			case expired:
-				klog.Warningf("Backend health snapshot for pool %s is stale (last successful sample %v ago, TTL %v); "+
-					"VolumeConditions fall back to dataset-only until the backend answers again",
-					previous.Pool, age.Truncate(time.Second), ttl)
-			case unconfirmedFlip:
-				klog.Warningf("Backend health snapshot for pool %s is unconfirmed: a held health transition is still waiting for a "+
-					"confirming sample (last successful sample %v ago, TTL %v). VolumeConditions keep the previous verdict, "+
-					"which the raw scale_csi_pool_* gauges already contradict",
-					previous.Pool, age.Truncate(time.Second), ttl)
-			}
-		}
+		d.publishFailedSampleStaleness(pool)
 		return
 	}
 	// Disk temperature alerts are a per-DISK signal; fan them out with the pool.
@@ -300,6 +317,96 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 	d.publishBackendHealth(snapshot)
 }
 
+// publishFailedSampleStaleness publishes the staleness verdict from inside the
+// poll loop so it keeps updating even while the backend is unreachable.
+//
+// The verdict answers ONE question: is the condition the driver is currently
+// serving backed by a fresh sample? It is not in any of the cases below, and all
+// of them must be visible or classes 4 and 6 in backendHealthFlipSamples would
+// be silent:
+//   - no successful sample has landed since this process started (COLD START);
+//   - the snapshot aged past its TTL, so conditions have fallen back to
+//     dataset-only; or
+//   - a flip is pending and its CONFIRMING sample is exactly the one that just
+//     failed to arrive, so the served verdict is one the latest raw sample
+//     already contradicts.
+func (d *Driver) publishFailedSampleStaleness(pool string) {
+	previous := d.backendHealth.Load()
+	if previous == nil {
+		// COLD START (class 6). There is no previous snapshot to freeze, so the raw
+		// scale_csi_pool_* series do not exist at all and ScaleCSIPoolDegraded
+		// cannot fire whatever the pool is doing — an unbounded blind window that
+		// used to be COMPLETELY silent because the staleness verdict was published
+		// only when a previous snapshot existed.
+		//
+		// The honest publication is: stale = 1 (nothing served is sample-backed)
+		// and flip_pending = 0 (there is no held transition). The raw health gauges
+		// are deliberately NOT invented — an absent scale_csi_pool_status is the
+		// truth, and ScaleCSIPoolHealthStale is the alert that covers it.
+		if pool == "" {
+			return
+		}
+		SetPoolHealthStale(pool, true)
+		SetPoolHealthFlipPending(pool, false)
+		klog.Warningf("Backend health has no successful sample yet for pool %s: VolumeConditions are dataset-only and the raw "+
+			"scale_csi_pool_* series stay ABSENT until a successful usable sample arrives, so ScaleCSIPoolDegraded cannot fire. "+
+			"scale_csi_pool_health_stale is 1 so this window is not silent", pool)
+		return
+	}
+	age := time.Since(previous.SampledAt)
+	ttl := d.backendHealthTTL()
+	expired := age > ttl
+	unconfirmedFlip := d.backendHealthPendingFlips.Load() > 0
+	SetPoolHealthStale(previous.Pool, expired || unconfirmedFlip)
+	switch {
+	case expired:
+		klog.Warningf("Backend health snapshot for pool %s is stale (last successful sample %v ago, TTL %v); "+
+			"VolumeConditions fall back to dataset-only until a successful usable sample arrives",
+			previous.Pool, age.Truncate(time.Second), ttl)
+	case unconfirmedFlip:
+		klog.Warningf("Backend health snapshot for pool %s is unconfirmed: a held health transition is still waiting for a "+
+			"confirming sample (last successful sample %v ago, TTL %v). VolumeConditions keep the previous verdict, "+
+			"which the raw scale_csi_pool_* gauges already contradict",
+			previous.Pool, age.Truncate(time.Second), ttl)
+	}
+}
+
+// markPoolHealthStaleIfExpired raises the staleness verdict for an already
+// expired snapshot without waiting for an in-flight backend call to return. The
+// poll loop calls it before each sample so a stall that outlives the TTL cannot
+// leave a frozen gauge alerting with both diagnostics at 0 for a whole
+// backendHealthCallTimeout.
+func (d *Driver) markPoolHealthStaleIfExpired() {
+	snapshot := d.backendHealth.Load()
+	if snapshot == nil || snapshot.SampledAt.IsZero() {
+		return
+	}
+	if time.Since(snapshot.SampledAt) > d.backendHealthTTL() {
+		d.markPoolHealthStale(snapshot)
+	}
+}
+
+// markPoolHealthStale publishes stale = 1 for a snapshot the driver has just
+// decided it can no longer serve.
+//
+// It is deliberately SILENT (no logging): poolHealthSnapshot calls it, and
+// ListVolumes composes one condition per volume, so logging here would be a
+// per-volume storm. The poll loop does the logging.
+//
+// The re-check exists because this runs on the CSI read path, concurrently with
+// the poller: if a successful sample landed while we were publishing, IT wrote
+// the authoritative verdict (stale = 0, immediately before storing the new
+// snapshot) and this call must not leave a false 1 behind it.
+func (d *Driver) markPoolHealthStale(snapshot *truenas.PoolHealthSnapshot) {
+	if snapshot == nil || snapshot.Pool == "" {
+		return
+	}
+	SetPoolHealthStale(snapshot.Pool, true)
+	if d.backendHealth.Load() != snapshot {
+		SetPoolHealthStale(snapshot.Pool, false)
+	}
+}
+
 // publishBackendHealth applies the fan-out hysteresis and updates the cache that
 // drives every managed volume's VolumeCondition.
 //
@@ -308,7 +415,7 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 // same thing as "the raw gauges and the condition disagree" — it reads 0 during
 // the alert-hold class, and past the staleness TTL it can still read 1 after the
 // condition has fallen back to dataset-only. See backendHealthFlipSamples for
-// the canonical four classes.
+// the canonical numbered list of divergence classes.
 func (d *Driver) publishBackendHealth(snapshot *truenas.PoolHealthSnapshot) {
 	previous := d.backendHealth.Load()
 	if previous == nil || previous.Degraded() == snapshot.Degraded() {
@@ -345,12 +452,19 @@ func (d *Driver) publishBackendHealth(snapshot *truenas.PoolHealthSnapshot) {
 // Returning nil past the TTL is what makes composeVolumeCondition fall back to
 // the pre-GF5 dataset-only condition instead of asserting hours-old pool state
 // as current fact.
+//
+// The TTL expires HERE, on the read path — not when a stalled poll finally
+// returns — so the staleness verdict is published at the same instant the
+// snapshot stops being served. Otherwise a call burning the full
+// backendHealthCallTimeout would leave the served condition already fallen back
+// while both diagnostic gauges still read 0.
 func (d *Driver) poolHealthSnapshot() *truenas.PoolHealthSnapshot {
 	snapshot := d.backendHealth.Load()
 	if snapshot == nil {
 		return nil
 	}
 	if !snapshot.SampledAt.IsZero() && time.Since(snapshot.SampledAt) > d.backendHealthTTL() {
+		d.markPoolHealthStale(snapshot)
 		return nil
 	}
 	return snapshot

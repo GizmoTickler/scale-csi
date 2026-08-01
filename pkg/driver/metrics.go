@@ -383,16 +383,17 @@ var (
 	)
 
 	// poolHealthStale is 1 when the VolumeCondition the driver is serving is NOT
-	// backed by a fresh sample: either the cached snapshot aged past its TTL (so
-	// conditions have fallen back to dataset-only), or a pending condition flip
-	// never received the confirming sample it is waiting on because the backend
-	// stopped answering. Every other scale_csi_pool_* gauge is only current while
-	// this is 0.
+	// backed by a fresh sample: the cached snapshot aged past its TTL (so
+	// conditions have fallen back to dataset-only), a pending condition flip never
+	// received the confirming sample it is waiting on, or no successful usable
+	// sample has landed since this process started (cold start — at which point
+	// the other scale_csi_pool_* series are ABSENT rather than frozen). Every
+	// other scale_csi_pool_* gauge is only current while this is 0.
 	poolHealthStale = regGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "pool_health_stale",
-			Help:      "1 when the served VolumeCondition is not backed by a fresh sample (snapshot past its TTL, or a pending flip whose confirming sample never arrived)",
+			Help:      "1 when the served VolumeCondition is not backed by a fresh sample (snapshot past its TTL, a pending flip whose confirming sample never arrived, or no successful sample since startup)",
 		},
 		[]string{"pool"},
 	)
@@ -402,8 +403,9 @@ var (
 	// raw-vs-condition divergence observable instead of implicit. It is NOT a
 	// complete disagreement detector: it reads 0 during the alert-hold class, and
 	// past the staleness TTL it can still read 1 after the condition has fallen
-	// back to dataset-only. See backendHealthFlipSamples for the canonical four
-	// classes.
+	// back to dataset-only, where the served condition is NOT the previous verdict.
+	// It also says nothing about the observer-lag and cold-start classes. See
+	// backendHealthFlipSamples for the canonical numbered list.
 	poolHealthFlipPending = regGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -871,12 +873,19 @@ func setDynamicPoolScanState(pool, function, state string, matched bool) {
 }
 
 // SetPoolHealthStale publishes whether the VolumeCondition currently being
-// served is backed by a fresh sample. 1 means it is NOT: either the snapshot
-// aged past its TTL (conditions have fallen back to dataset-only — a stale
-// DEGRADED must not keep alerting after a real recovery, and a stale ONLINE must
-// not mask a real degradation), or a pending flip's confirming sample never
-// arrived, so the served verdict is one the driver's own latest raw sample
-// already contradicts.
+// served is backed by a fresh sample. 1 means it is NOT: the snapshot aged past
+// its TTL (conditions have fallen back to dataset-only, so a stale verdict stops
+// driving CONDITIONS), a pending flip's confirming sample never arrived (the
+// served verdict is one the driver's own latest raw sample already contradicts),
+// or no successful usable sample has landed since startup (cold start).
+//
+// It does NOT silence alerting, and nothing here stops a stale verdict from
+// alerting: ScaleCSIPoolDegraded reads the RAW gauge and is deliberately not
+// gated on this one (charts/scale-csi/templates/prometheusrule.yaml), so a
+// FROZEN DEGRADED sample keeps that alert firing after a real recovery until a
+// successful usable sample changes it. Publishing this gauge is what makes that
+// state diagnosable — ScaleCSIPoolHealthStale is the signal to distrust every
+// other scale_csi_pool_* series.
 func SetPoolHealthStale(pool string, stale bool) {
 	if pool == "" {
 		return
@@ -889,9 +898,16 @@ func SetPoolHealthStale(pool string, stale bool) {
 }
 
 // SetPoolHealthFlipPending publishes whether a pool-health transition is waiting
-// for its confirming sample. While it is 1 the raw gauges and the per-PVC
-// VolumeCondition deliberately disagree: the condition is still the previous
-// verdict. This is the operator-visible form of the fan-out hysteresis.
+// for its confirming sample — the operator-visible form of the fan-out
+// hysteresis. While it is 1 AND the held snapshot is still inside its staleness
+// TTL, the raw gauges and the per-PVC VolumeCondition deliberately disagree and
+// the condition carries the previous verdict.
+//
+// Those are NOT the same statement, and this gauge is NOT a complete
+// disagreement detector: past the TTL it can still read 1 while the condition
+// has fallen back to dataset-only (which is not the previous verdict, and which
+// may well agree with the raw sample), and it reads 0 throughout the alert-hold,
+// observer-lag and cold-start classes. See backendHealthFlipSamples.
 func SetPoolHealthFlipPending(pool string, pending bool) {
 	if pool == "" {
 		return

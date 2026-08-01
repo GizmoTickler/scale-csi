@@ -82,27 +82,42 @@ capacity:
 #     ScaleCSIPoolDegraded firing until a successful sample changes it — that
 #     alert is deliberately not gated on scale_csi_pool_health_stale.
 #
-# BECAUSE the condition is damped, the gauges are not, and the alerts add their
-# own `for` hold on top of the gauges, the three views DO differ transiently —
-# they share one severity split, not one timeline. There are FOUR classes of
-# divergence, three bounded and one unbounded (canonical list:
+# BECAUSE the condition is damped, the gauges are not, the alerts add their own
+# `for` hold on top of the gauges AND Prometheus observes all of it on its own
+# scrape/evaluation cadence, these views DO differ transiently — they share one
+# severity split, not one timeline. There are SIX NUMBERED classes of divergence;
+# the first three have an upper bound, the last three do not (canonical list:
 # backendHealthFlipSamples in pkg/driver/backend_health.go):
-#   * confirmation lag — BOUNDED: a confirmed transition reaches conditions up to
-#     one successful poll interval after the gauges; the 2m ceiling keeps
-#     2 x interval inside the 5m ScaleCSIPoolDegraded hold. flip_pending = 1;
-#   * alert hold — BOUNDED by the rule's own 5m `for`: once the condition
-#     confirms, PVCs read Abnormal while ScaleCSIPoolDegraded is still PENDING.
-#     The ceiling CREATES this ordering rather than removing it, and BOTH
-#     diagnostic gauges read 0 here — use the alert's pending state, not them;
-#   * recovery — BOUNDED, one sample: the raw degraded gauge clears one sample
-#     BEFORE the condition, by design. flip_pending = 1;
-#   * poll stall — UNBOUNDED: it lasts until the backend answers. The condition
-#     holds its last value while scale_csi_pool_health_flip_pending and/or
-#     scale_csi_pool_health_stale go to 1 (alerts
-#     ScaleCSIPoolConditionFlipPending / ScaleCSIPoolHealthStale). Past the TTL
-#     conditions fall back to dataset-only while flip_pending may still read 1.
-# Read those two gauges before treating a PVC condition as wrong, but remember
-# they do not cover the alert-hold class. Full contract: docs/production.md,
+#   1. confirmation lag — BOUNDED: a confirmed transition reaches conditions up
+#      to one successful poll interval plus one 30s call timeout after the gauges
+#      (<= 2m30s at the ceiling), which stays inside the 5m ScaleCSIPoolDegraded
+#      hold. flip_pending = 1;
+#   2. alert hold — BOUNDED by the rule's own 5m `for`: once the condition
+#      confirms, PVCs read Abnormal while ScaleCSIPoolDegraded is still PENDING.
+#      The ceiling CREATES this ordering rather than removing it, and BOTH
+#      diagnostic gauges read 0 here — use the alert's pending state, not them;
+#   3. recovery — BOUNDED, one sample: the raw degraded gauge clears one sample
+#      BEFORE the condition, by design. flip_pending = 1;
+#   4. poll stall — UNBOUNDED: it lasts until a SUCCESSFUL USABLE sample arrives.
+#      A reply is not a usable sample: a valid pool.query that does not list the
+#      pool returns `pool ... not found` and is still a failed sample.
+#      The condition holds its last value while flip_pending and/or
+#      scale_csi_pool_health_stale go to 1 (alerts
+#      ScaleCSIPoolConditionFlipPending / ScaleCSIPoolHealthStale). Past the TTL
+#      conditions fall back to dataset-only while flip_pending may still read 1;
+#   5. observer lag — UNBOUNDED and invisible to the driver: Prometheus sees the
+#      gauges only on its next scrape and starts `for` at the first true
+#      EVALUATION, so after a recovery both diagnostic gauges can read 0 while
+#      the alert still fires. This chart puts no upper limit on the
+#      ServiceMonitor interval, and a rollout briefly has two controllers
+#      publishing series that `max by (pool)` merges;
+#   6. cold start — UNBOUNDED until the first successful sample of a process: the
+#      raw scale_csi_pool_* series do not exist yet, so ScaleCSIPoolDegraded
+#      cannot fire at all; the driver publishes scale_csi_pool_health_stale = 1
+#      (flip_pending = 0) so the window is visible.
+# Read scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before
+# treating a PVC condition as wrong, but remember they do not cover the alert
+# hold, observer lag or cold start. Full contract: docs/production.md,
 # "Backend health".
 #
 # Default OFF so an upgrade changes neither the rendered manifest nor the
