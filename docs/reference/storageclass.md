@@ -17,12 +17,13 @@ All protocols use the unified provisioner `csi.scale.io`.
 | `nfsSecurity` | Comma list of `SYS`, `KRB5`, `KRB5I`, `KRB5P` — the export's `security` list | No; unset omits the field (TrueNAS default AUTH_SYS) |
 | `nfsExposeSnapshots` | Boolean — publish the dataset's read-only `.zfs/snapshot` tree through the export | No; default false |
 | `nfsReadOnly` | Boolean — create the export read-only | No; default false |
-| `nfsMaprootUser` / `nfsMaprootGroup` | Per-class override of the root mapping | No; defaults to `nfs.shareMaproot*` |
-| `nfsMapallUser` / `nfsMapallGroup` | Per-class override of the all-users mapping | No; defaults to `nfs.shareMapall*` |
-| `nfsAllowedNetworks` / `nfsAllowedHosts` | Comma lists overriding the static export allow-lists | No; defaults to `nfs.shareAllowed*`. Ignored in strict fencing mode, which owns these lists |
+| `nfsMaprootUser` / `nfsMaprootGroup` | Per-class override of the root mapping | No; defaults to `nfs.shareMaproot*`. **Mutually exclusive with `nfsMapall*`** |
+| `nfsMapallUser` / `nfsMapallGroup` | Per-class override of the all-users mapping | No; defaults to `nfs.shareMapall*`. **Mutually exclusive with `nfsMaproot*`** |
+| `nfsAllowedNetworks` / `nfsAllowedHosts` | Comma lists overriding the static export allow-lists | No; defaults to `nfs.shareAllowed*`. **Rejected** under strict fencing, which owns these lists |
 | `nfsACLTemplate` | `NFS4_OPEN`, `NFS4_RESTRICTED`, `NFS4_HOME`, `NFS4_DOMAIN_HOME`, `NFS4_ADMIN` — a builtin NFSv4 ACL applied at create | No; mutually exclusive with `nfsACL` |
 | `nfsACL` | Explicit NFSv4 dacl as a JSON array | No; mutually exclusive with `nfsACLTemplate` |
-| `zfsPerformanceClass` | `database`, `media`, `vm`, `backup`, `general` — a curated ZFS property preset | No; unset inherits the parent dataset's properties |
+| `nfsACLMode` | `PASSTHROUGH` (default) or `RESTRICTED` — the dataset's `aclmode` | No; requires `nfsACLTemplate` or `nfsACL` |
+| `zfsPerformanceClass` | `database`, `media`, `vm`, `backup`, `general` — a curated ZFS property preset | No; unset inherits the parent dataset's properties. **Ignored on volumes restored/cloned from a content source** |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -103,6 +104,25 @@ StorageClass later names a different class:
 A volume provisioned before this feature existed carries no class stamp; it is
 never wedged, only warned about.
 
+### ⚠ Performance classes do not apply to clones or snapshot restores
+
+A PVC created from a `dataSource` (snapshot or another PVC) is materialized by a
+ZFS clone or a dataset copy. Both **inherit the origin dataset's geometry** and
+accept no property payload, so the curated preset cannot be applied — there is
+no API through which to apply it.
+
+The driver therefore **ignores** `zfsPerformanceClass` on those volumes, does
+**not** stamp the class, and emits a Warning event
+(`ZFSPerformanceClassIgnored`) plus a log line on the PVC. Stamping a class that
+was never applied would be worse than useless: the immutability guard treats the
+stamp as ground truth, so a stamped clone would be both falsely accepted (a
+`general`-geometry volume passing every future check as `database`) and falsely
+rejected (`logbias ... fixed when the dataset is created`, for a property the
+driver never set on that dataset).
+
+If a restored volume must carry a curated geometry, provision an empty volume
+with the class and copy the data in.
+
 ## NFS
 
 ```yaml
@@ -172,26 +192,67 @@ field entirely, which is the historical behavior and leaves TrueNAS on its
 AUTH_SYS default.
 
 `KRB5`/`KRB5I`/`KRB5P` require Kerberos on the NFS service (`nfs.config`
-`v4_krb` plus a keytab). The driver **fails closed**: those modes are rejected
-with `InvalidArgument` unless the operator sets `nfs.krbEnabled=true` to
-acknowledge that Kerberos is actually configured.
+`v4_krb` plus a keytab). The driver **fails closed**, on **every** path that can
+set `security`:
+
+- the StorageClass `nfsSecurity` parameter is rejected with `InvalidArgument`;
+- the global `nfs.shareSecurity` config key is rejected **at config load**, so
+  the controller refuses to start rather than stamping a Kerberos-only export on
+  every volume it subsequently creates, and is re-checked where the value reaches
+  the wire;
+- the chart schema couples `nfs.shareSecurity` to `nfs.krbEnabled`, so
+  `--set nfs.shareSecurity={KRB5}` without the acknowledgement fails at
+  `helm template` time.
+
+All three exist on purpose: a hand-written ConfigMap bypasses the chart schema,
+and a `Config` assembled in-process bypasses `LoadConfig`.
 
 Security is a **create-time** property of a volume. The driver never rewrites an
 existing share's security, because flipping SYS→KRB5 on a live export breaks
-every mounted client.
+every mounted client. Concretely, the only `sharing.nfs.update` the driver ever
+issues (the fencing reconciler) writes exactly `{hosts, networks, enabled}`, and
+the share builder has **no update path at all** — it either creates a missing
+export or returns early when one already exists.
 
 `nfsExposeSnapshots` publishes the volume's read-only `.zfs/snapshot` directory
 through the export, which composes with the driver's snapshot machinery to give
 in-place browsing of point-in-time copies. TrueNAS only honors it when the
 export path is the dataset root — always true for CSI volumes.
 
+### Squash mapping and export allowlists
+
+`maproot_*` and `mapall_*` are **mutually exclusive** in TrueNAS —
+`sharing.nfs.create` rejects a payload carrying both. Because the shipped default
+config sets `nfs.shareMaprootUser: root` / `nfs.shareMaprootGroup: wheel`, a
+StorageClass that sets only `nfsMapallUser` resolves to *both* and would fail
+provisioning with an opaque middleware error. The driver validates the
+**effective** payload (class override layered over the global config) and returns
+`InvalidArgument` naming all four values. To use `mapall`, clear the inherited
+maproot values on the class:
+
+```yaml
+parameters:
+  nfsMapallUser: nobody
+  nfsMaprootUser: ""
+  nfsMaprootGroup: ""
+```
+
+`nfsAllowedNetworks` / `nfsAllowedHosts` are **rejected with `InvalidArgument`
+under `fencing.mode: strict`**. Strict fencing owns the export allowlist: every
+share is created with empty `networks`/`hosts` (deny-all until
+`ControllerPublishVolume` grants a node), so the parameters would be silently
+discarded. Use `fencing.mode: additive` if a static per-class allowlist is
+required.
+
 ### NFSv4 ACLs
 
 `nfsACLTemplate` (a builtin TrueNAS NFS4 template) or `nfsACL` (an explicit
 dacl) applies an NFSv4 ACL to a newly provisioned volume's dataset. When either
 is set, the driver additionally creates the dataset with `acltype=NFSV4` and
-`aclmode=PASSTHROUGH`; when neither is set, both properties keep inheriting from
-the parent exactly as before.
+`aclmode=PASSTHROUGH` (override with `nfsACLMode`); when neither is set, both
+properties keep inheriting from the parent exactly as before. `nfsACLMode` on
+its own is rejected — `aclmode` only matters on a dataset that carries a
+driver-applied ACL.
 
 `filesystem.setacl` is an asynchronous middleware job. ACL application is
 **best-effort**: it runs after the dataset, its ownership stamps and its export
@@ -211,6 +272,16 @@ driver-applied ACL.
 deliberately **not** changed (flipping it would alter fsGroup semantics for every
 existing volume).
 
+Concretely: kubelet's `SetVolumeOwnership` walks the staged mount and issues a
+recursive `chown(-1, fsGroup)` plus `chmod`. Over NFSv4 those become SETATTR ops
+that TrueNAS applies to ZFS, and the property that decides what a `chmod` does to
+a non-trivial ACL is **`aclmode`**. Under the default `aclmode=PASSTHROUGH`,
+`zfsprops(7)` says "no changes are made to the ACL other than **generating the
+necessary ACL entries to represent the new mode**" — explicit `USER`/`GROUP` ACEs
+survive, the mode-bearing `owner@`/`group@`/`everyone@` ACEs do not. With
+`fsGroupChangePolicy: OnRootMismatch` this happens once; with the default
+`Always`, on every publish.
+
 Mitigations, in order of preference:
 
 1. Run ACL-managed workloads with **no `securityContext.fsGroup`**. Nothing then
@@ -219,12 +290,31 @@ Mitigations, in order of preference:
    with `csidriver.fsGroupPolicy: None`. Do this on a **fresh installation**;
    changing it on an existing one requires recreating the CSIDriver object and
    changes fsGroup behavior for all its volumes.
-3. The driver always sets `nfs41_flags.protected: true` on ACLs it applies, so a
-   chmod cannot make the server recompute the ACL from the mode. This limits —
-   but does not eliminate — the damage under `File`.
+3. Set `nfsACLMode: RESTRICTED` on the StorageClass. This is the **only ZFS
+   lever** that actually stops a `chmod` from touching the ACL: under
+   `aclmode=RESTRICTED` an ACL-altering `chmod` returns `EPERM`, so kubelet's
+   fsGroup pass **fails the publish loudly** instead of silently degrading the
+   ACL. Understand the trade before enabling it — it converts a silent,
+   recoverable degradation into a hard mount-time failure, and it also breaks
+   any in-container `chmod` (many images do one at startup). That is why the
+   driver's default stays `PASSTHROUGH`.
+
+#### What `nfs41_flags.protected` does and does not do
+
+The driver sets `nfs41_flags.protected: true` on every ACL it applies. That flag
+is NFSv4.1 `ACL4_PROTECTED` / ZFS `ZFS_ACL_PROTECTED`, and its defined meaning
+(RFC 5661 §6.4.3.2; OpenZFS `zfs_acl_inherit`) is **automatic-inheritance
+suppression**: "this ACL was set explicitly, do not re-derive it from the
+parent". That is the correct semantic for an explicitly-applied ACL, and it is
+why the driver sets it.
+
+It is **not** a `chmod` guard — it is not consulted on the `chmod`/SETATTR-mode
+path at all, and it does **not** mitigate the fsGroup hazard. Only mitigations
+1–3 above do.
 
 Every volume that receives a driver-applied ACL also gets a Warning event
-(`NFSACLFsGroupConflict`) spelling this out.
+(`NFSACLFsGroupConflict`) spelling this out, including which `aclmode` the
+volume ended up with.
 
 ```yaml
 apiVersion: v1

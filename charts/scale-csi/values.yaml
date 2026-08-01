@@ -70,11 +70,21 @@ capacity:
 # configuration is controller.replicas=1. No effect on the CreateVolume /
 # publish / unpublish request-path golden totals.
 #
+# The fan-out is damped so a flapping or unreachable backend cannot churn every
+# PVC. Metrics always carry the RAW sample; only the VolumeCondition is damped:
+#   * hysteresis — a health transition must be confirmed by TWO consecutive
+#     samples before it flips every managed PVC's condition;
+#   * staleness TTL — after three missed intervals the cached snapshot stops
+#     driving conditions at all (they fall back to the pre-GF5 dataset-only
+#     semantics) and scale_csi_pool_health_stale goes to 1, so a stale DEGRADED
+#     cannot keep alerting after a recovery and a stale ONLINE cannot mask one.
+#
 # Default OFF so an upgrade changes neither the rendered manifest nor the
 # VolumeCondition semantics of existing volumes.
 backendHealth:
   enabled: false
-  # Poll cadence. Values below 30s are clamped to it.
+  # Poll cadence. Values below 30s are clamped to it. The staleness TTL is
+  # three times this value.
   interval: 60s
 
 # Stable ownership identity stamped on newly-created datasets/zvols. Empty
@@ -313,6 +323,11 @@ nfs:
   # all networks and should be restricted in production.
   shareAllowedNetworks: []
 
+  # maproot_* and mapall_* are MUTUALLY EXCLUSIVE in TrueNAS: sharing.nfs.create
+  # rejects a payload carrying both. To use mapall, clear the maproot values here
+  # (or, per StorageClass, set nfsMaprootUser: "" and nfsMaprootGroup: ""). The
+  # schema and the driver both reject the combination rather than letting it
+  # surface as an opaque middleware error at CreateVolume.
   shareMaprootUser: root
   shareMaprootGroup: wheel
   shareMapallUser: ""
@@ -323,6 +338,13 @@ nfs:
   # driver has always sent and leaves TrueNAS on AUTH_SYS. Override per class
   # with the StorageClass `nfsSecurity` parameter. Existing shares are never
   # rewritten — security is a create-time property of a volume.
+  #
+  # FAIL CLOSED: KRB5/KRB5I/KRB5P here require krbEnabled: true below. This list
+  # is stamped on EVERY newly created export, so a Kerberos mode on a box with no
+  # KDC/keytab would mean dead mounts fleet-wide. The coupling is enforced by
+  # this chart's values.schema.json AND independently by the driver at config
+  # load — a hand-written ConfigMap bypasses the schema entirely, and the
+  # controller refuses to start rather than build unmountable exports.
   shareSecurity: []
 
   # Publish the dataset's read-only .zfs/snapshot tree through new exports.
@@ -348,6 +370,10 @@ nfs:
   # are enabled. That is a service-wide write affecting EVERY export on the
   # appliance, driver-managed or not. The supported default is the read-only
   # versionPreflight above. Values: NFSV3, NFSV4.
+  #
+  # nfs.update SETS the protocol list, it does not union with it, so "only adds,
+  # never removes" only holds while the CURRENT list is readable. If nfs.config
+  # reports no protocols, the driver hard-aborts the write instead of guessing.
   ensureProtocols: []
 
   # --- Performance mount-option profiles -------------------------------------

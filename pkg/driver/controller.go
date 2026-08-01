@@ -449,6 +449,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	var contentSource *csi.VolumeContentSource
 	var createdDS *truenas.Dataset
 	zvolReady := false
+	// performanceClassApplied is the ONLY authority for stamping
+	// PropZFSPerformanceClass. The stamp asserts "this dataset was CREATED with
+	// the curated class's properties", and createDataset is the only place they
+	// are ever applied. A clone / snapshot restore inherits the ORIGIN dataset's
+	// geometry and accepts no property payload, so stamping there would be a
+	// silent correctness lie in both directions: a later replay would be
+	// false-accepted against a class the volume does not carry, or false-rejected
+	// with "logbias is fixed when the dataset is created" for a property the
+	// driver never set on this dataset.
+	performanceClassApplied := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
 		clonedDS, srcErr := d.handleVolumeContentSource(
@@ -487,6 +497,19 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		// volume's share objects. Best-effort and a SEPARATE pool.dataset.update from
 		// the authoritative ownership stamp above (cleanup, not provenance).
 		d.scrubInheritedProtocolProperties(ctx, createdDS, datasetName, shareType)
+		if performanceClass != "" {
+			// H1: say so out loud. A clone silently carrying its origin's geometry
+			// under a different class name is exactly the correctness lie the
+			// immutability guard exists to prevent.
+			message := fmt.Sprintf(
+				"StorageClass parameter %s=%q was IGNORED for volume %s: the volume is provisioned from a %s content source, "+
+					"and a ZFS clone/restore inherits the origin dataset's geometry (recordsize, volblocksize, logbias, ...) — "+
+					"the curated properties cannot be applied and the volume is NOT stamped with the class. "+
+					"Provision an empty volume with this class and copy the data in if the curated geometry is required.",
+				zfsPerformanceClassParam, performanceClass, volumeID, contentSourceKind(contentSource))
+			klog.Warning(message)
+			d.recordWarningEvent(createVolumeEventRef(req), EventReasonZFSPerformanceClassIgnored, message)
+		}
 	} else {
 		// Create new dataset
 		var createErr error
@@ -496,6 +519,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 		freshlyCreated = createdDS.CreatedByCall
 		zvolReady = freshlyCreated
+		// createDataset is the one and only place applyPerformanceClassProperties
+		// runs, so this is the one and only place the stamp becomes truthful.
+		performanceClassApplied = performanceClass != ""
 	}
 
 	// Mark as managed and successful. NFS folds these stamps into the share-ID
@@ -515,8 +541,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// StorageClass edit can be checked against the create-only property rules
 	// instead of silently pretending the volume was retuned. Folded into the
 	// existing property update, so it costs no extra round trip; absent unless
-	// the class was requested.
-	if performanceClass != "" {
+	// the class was requested AND actually applied (never on clone/restore —
+	// see performanceClassApplied above).
+	if performanceClassApplied {
 		volumeProperties[PropZFSPerformanceClass] = performanceClass
 	}
 	// Fold the durable CHAP auth linkage into the FATAL managed-property update
@@ -835,6 +862,15 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		storedClass := datasetUserProperty(existingDS, PropZFSPerformanceClass)
 		if storedClass == "-" {
 			storedClass = ""
+		}
+		// H1: a clone/restore is never stamped, because the curated properties were
+		// never applied to it. Make the reason explicit instead of letting it look
+		// like an ordinary "legacy unstamped volume" — the class was requested, it
+		// was refused, and the volume carries its origin's geometry to this day.
+		if storedClass == "" && volumeContentSourceFromDataset(existingDS) != nil {
+			klog.Warningf("Volume %s was provisioned from a content source, so ZFS performance class %q was never applied "+
+				"(a clone/restore inherits the origin dataset's geometry). The replay is accepted and the volume is left unchanged.",
+				volumeID, requestedClass)
 		}
 		if guardErr := d.guardPerformanceClassChange(ctx, volumeID, storedClass, requestedClass, existingDS.Type); guardErr != nil {
 			return nil, guardErr

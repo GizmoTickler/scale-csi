@@ -119,14 +119,32 @@ func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Datas
 	// fields are `omitempty`, so an un-opted-in deployment marshals the exact same
 	// sharing.nfs.create payload it did before GF5.
 	if len(d.config.NFS.ShareSecurity) > 0 {
-		params.Security = append([]string(nil), d.config.NFS.ShareSecurity...)
+		// FAIL CLOSED, defense in depth. validateConfig already rejects an invalid
+		// global list at LOAD time, but this is the point where the value actually
+		// reaches the wire, and a Config assembled in-process (tests, embedders)
+		// never passes through LoadConfig. Refusing here is strictly better than
+		// stamping an unmountable KRB5 export on every volume the driver creates.
+		security, secErr := normalizeNFSSecurityList("nfs.shareSecurity", d.config.NFS.ShareSecurity, d.config.NFS.KrbEnabled)
+		if secErr != nil {
+			return status.Error(codes.FailedPrecondition, secErr.Error())
+		}
+		params.Security = security
 	}
 	if d.config.NFS.ShareExposeSnapshots {
 		params.ExposeSnapshots = true
 	}
 	// Per-StorageClass overrides ride the request context (CreateVolume only).
-	// ensureShareExists / reconcile / adoption paths carry none, so an existing
-	// share is never rewritten because its class gained an option (risk R4).
+	//
+	// R4 INVARIANT — an EXISTING export is never rewritten. Two things hold it up,
+	// and only the second one is load-bearing:
+	//  1. the reconcilers and the adoption path build their own context and carry
+	//     no options at all; but
+	//  2. createVolumeExisting DOES pass the CreateVolume context (options and
+	//     all) into ensureShareExists. What makes that safe is the `existing != nil`
+	//     early return above: this function only ever CREATES a missing share and
+	//     has no update path, so the options below can only ever shape a brand-new
+	//     export. Do not add an update branch here without re-deriving R4 — the
+	//     nfs_options_test.go replay test pins this invariant.
 	applyNFSShareOptions(params, nfsShareOptionsFromContext(ctx))
 	if d.config.Fencing.Mode == FencingModeStrict {
 		// An enabled export with both lists empty means allow-all in TrueNAS. New

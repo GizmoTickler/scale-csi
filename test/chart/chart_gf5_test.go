@@ -341,3 +341,110 @@ func TestChartGF5BackendHealthDashboardPanel(t *testing.T) {
 		}
 	}
 }
+
+// repoFile reads a file relative to the repository root.
+func repoFile(t *testing.T, parts ...string) string {
+	t.Helper()
+	path := filepath.Join(append([]string{chartDir(t), "..", ".."}, parts...)...)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+// TestChartGF5SchemaCouplesKRB5ToKrbEnabled is the chart-side half of the KRB5
+// fail-closed gate (H2). The schema previously enumerated KRB5* independently of
+// nfs.krbEnabled, so `--set nfs.shareSecurity={KRB5}` with krbEnabled=false
+// rendered a ConfigMap that stamped KRB5 on EVERY newly created export.
+//
+// The driver enforces the same rule at config load, because a hand-written
+// ConfigMap bypasses this schema entirely; both halves are required.
+func TestChartGF5SchemaCouplesKRB5ToKrbEnabled(t *testing.T) {
+	for _, mode := range []string{"KRB5", "KRB5I", "KRB5P"} {
+		t.Run(mode+" without krbEnabled is rejected", func(t *testing.T) {
+			out := helmTemplateExpectError(t, "--set", "nfs.shareSecurity={"+mode+"}")
+			if !strings.Contains(out, "shareSecurity") {
+				t.Errorf("schema rejection did not mention shareSecurity; got:\n%s", out)
+			}
+		})
+		t.Run(mode+" with krbEnabled renders", func(t *testing.T) {
+			out := helmTemplate(t, "--show-only", "templates/configmap.yaml",
+				"--set", "nfs.shareSecurity={"+mode+"}", "--set", "nfs.krbEnabled=true")
+			if !strings.Contains(out, "        - "+mode+"\n") {
+				t.Errorf("acknowledged %s did not render; got:\n%s", mode, out)
+			}
+		})
+	}
+
+	t.Run("SYS never needs the acknowledgement", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "nfs.shareSecurity={SYS}")
+		if !strings.Contains(out, "        - SYS\n") {
+			t.Errorf("SYS did not render without krbEnabled; got:\n%s", out)
+		}
+	})
+
+	t.Run("a mixed list is rejected on its Kerberos member", func(t *testing.T) {
+		helmTemplateExpectError(t, "--set", "nfs.shareSecurity={SYS,KRB5P}")
+	})
+}
+
+// TestChartGF5SchemaRejectsMaprootMapallCombo is the chart-side half of M2:
+// TrueNAS rejects a sharing.nfs.create payload carrying both squash mappings,
+// and the shipped defaults set maproot, so setting mapall alone is a trap.
+func TestChartGF5SchemaRejectsMaprootMapallCombo(t *testing.T) {
+	out := helmTemplateExpectError(t, "--set", "nfs.shareMapallUser=nobody")
+	if !strings.Contains(out, "shareMaproot") {
+		t.Errorf("schema rejection did not name the conflicting maproot keys; got:\n%s", out)
+	}
+
+	// Clearing maproot resolves it.
+	helmTemplate(t, "--show-only", "templates/configmap.yaml",
+		"--set", "nfs.shareMapallUser=nobody",
+		"--set", "nfs.shareMaprootUser=",
+		"--set", "nfs.shareMaprootGroup=")
+}
+
+// TestGF5DocsDoNotOverclaimACLProtected is the H3 revert-proof on the shipped
+// documentation. `nfs41_flags.protected` is NFSv4.1 ACL4_PROTECTED — automatic
+// INHERITANCE suppression — not a chmod guard. The property that governs what a
+// chmod does to a non-trivial ACL is `aclmode`, and the driver sets PASSTHROUGH,
+// which regenerates the mode-bearing ACEs on every chmod.
+func TestGF5DocsDoNotOverclaimACLProtected(t *testing.T) {
+	doc := repoFile(t, "docs", "reference", "storageclass.md")
+
+	for _, wrong := range []string{
+		"so a\nchmod cannot make the server recompute the ACL from the mode",
+		"chmod cannot make the server recompute the ACL from the mode",
+	} {
+		if strings.Contains(doc, wrong) {
+			t.Errorf("storageclass.md still claims protected=true blocks a chmod recompute: %q", wrong)
+		}
+	}
+
+	for _, required := range []string{
+		"inheritance",
+		"`aclmode`",
+		"nfsACLMode: RESTRICTED",
+		"It is **not** a `chmod` guard",
+	} {
+		if !strings.Contains(doc, required) {
+			t.Errorf("storageclass.md is missing the corrected ACL wording %q", required)
+		}
+	}
+}
+
+// TestGF5DocsRecordThePerformanceClassCloneLimit is the H1 revert-proof on the
+// documentation: a clone/restore inherits the origin's geometry, so the curated
+// class is neither applied nor stamped, and that must be written down.
+func TestGF5DocsRecordThePerformanceClassCloneLimit(t *testing.T) {
+	doc := repoFile(t, "docs", "reference", "storageclass.md")
+	for _, required := range []string{
+		"Performance classes do not apply to clones or snapshot restores",
+		"ZFSPerformanceClassIgnored",
+	} {
+		if !strings.Contains(doc, required) {
+			t.Errorf("storageclass.md is missing %q", required)
+		}
+	}
+}

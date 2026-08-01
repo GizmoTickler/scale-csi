@@ -364,3 +364,84 @@ func TestParentPoolName(t *testing.T) {
 	d.config.ZFS.DatasetParentName = "tank"
 	assert.Equal(t, "tank", d.parentPoolName())
 }
+
+// ---------------------------------------------------------------------------
+// Performance class x VolumeContentSource (H1)
+// ---------------------------------------------------------------------------
+
+// perfContentSourceDriver mirrors perfTestDriver on the parent dataset the
+// shared snapshot-clone helpers seed ("pool/parent").
+func perfContentSourceDriver(mock *truenas.MockClient) *Driver {
+	return &Driver{
+		name: "org.scale.csi",
+		config: &Config{
+			DriverName: "org.scale.csi",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", ZvolBlocksize: "16K", ZvolReadyTimeout: 1},
+			NFS:        NFSConfig{Enabled: true, ShareHost: "192.0.2.10"},
+		},
+		truenasClient: mock,
+	}
+}
+
+// TestCreateVolumeFromContentSourceDoesNotStampPerformanceClass is the H1
+// regression: a clone/restore inherits the ORIGIN dataset's geometry and accepts
+// no property payload, so the curated class is never applied to it. Stamping it
+// anyway would make the immutability guard treat a fiction as ground truth.
+//
+// Both failure directions are asserted:
+//   - FALSE ACCEPT — a clone must not carry a class stamp it does not satisfy;
+//   - FALSE REJECT — a later replay under a DIFFERENT class must not be refused
+//     with "logbias ... fixed when the dataset is created" for a property the
+//     driver never set on this dataset.
+func TestCreateVolumeFromContentSourceDoesNotStampPerformanceClass(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	d := perfContentSourceDriver(mock)
+	seedSnapshotCloneSource(t, mock, "FILESYSTEM", 1<<30)
+
+	request := snapshotCloneRequest("restored-clone", "snap-1", "nfs", 1<<30)
+	request.Parameters[zfsPerformanceClassParam] = "media"
+	_, err := d.CreateVolume(ctx, request)
+	require.NoError(t, err)
+
+	ds := mock.Datasets["pool/parent/restored-clone"]
+	require.NotNil(t, ds)
+	_, stamped := ds.UserProperties[PropZFSPerformanceClass]
+	assert.False(t, stamped,
+		"a clone/restore carries the ORIGIN's geometry, so it must NOT be stamped with a class that was never applied")
+
+	// The clone genuinely came from the origin dataset (so it carries the origin's
+	// geometry, which is precisely why a class stamp on it would be a lie).
+	assert.NotEmpty(t, datasetUserProperty(ds, PropVolumeContentSourceID),
+		"the volume under test must actually be a content-source clone")
+
+	// FALSE REJECT: replaying under a class whose create-only properties differ
+	// must NOT be refused, because nothing was ever fixed at create here.
+	replay := snapshotCloneRequest("restored-clone", "snap-1", "nfs", 1<<30)
+	replay.Parameters[zfsPerformanceClassParam] = "database"
+	_, err = d.CreateVolume(ctx, replay)
+	require.NoError(t, err,
+		"an unstamped clone must not be wedged by the immutability guard for a property the driver never set")
+}
+
+// TestCreateVolumeAppliesAndStampsClassOnlyOnFreshCreate is the positive half:
+// the stamp still happens on the ordinary create path, so H1's fix cannot be
+// mistaken for "disable the feature".
+func TestCreateVolumeAppliesAndStampsClassOnlyOnFreshCreate(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	d := perfContentSourceDriver(mock)
+	mustCreateParentDataset(t, mock)
+
+	_, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "fresh-vol",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1 << 30},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters:         map[string]string{"protocol": "nfs", zfsPerformanceClassParam: "media"},
+	})
+	require.NoError(t, err)
+
+	ds := mock.Datasets["pool/parent/fresh-vol"]
+	require.NotNil(t, ds)
+	assert.Equal(t, "media", ds.UserProperties[PropZFSPerformanceClass].Value)
+}

@@ -258,3 +258,91 @@ func TestCreateVolumeWithoutACLTouchesNothing(t *testing.T) {
 	assert.Empty(t, mock.SetACLCalls)
 	require.NotNil(t, mock.Datasets["tank/k8s/plain-vol"])
 }
+
+// ---------------------------------------------------------------------------
+// H3 — aclmode is the real chmod lever; nfs41_flags.protected is not
+// ---------------------------------------------------------------------------
+
+// TestNFSACLModeParameter covers the opt-in aclmode selector. The DEFAULT stays
+// PASSTHROUGH: flipping it would turn a silent, recoverable ACL degradation into
+// a hard publish failure for every fsGroup Pod (and for any in-container chmod)
+// on an explicitly best-effort feature.
+func TestNFSACLModeParameter(t *testing.T) {
+	t.Run("unset resolves to the unchanged historical default", func(t *testing.T) {
+		opts, err := parseNFSACLOptions(map[string]string{nfsACLTemplateParam: "NFS4_RESTRICTED"})
+		require.NoError(t, err)
+		assert.Empty(t, opts.aclMode)
+		assert.Equal(t, "PASSTHROUGH", opts.resolvedACLMode())
+
+		params := &truenas.DatasetCreateParams{Name: "tank/k8s/vol", Type: "FILESYSTEM"}
+		applyDatasetACLParams(params, opts)
+		assert.Equal(t, "NFSV4", params.Acltype)
+		assert.Equal(t, "PASSTHROUGH", params.Aclmode)
+	})
+
+	t.Run("RESTRICTED is honored on the create payload", func(t *testing.T) {
+		opts, err := parseNFSACLOptions(map[string]string{
+			nfsACLTemplateParam: "NFS4_RESTRICTED",
+			nfsACLModeParam:     "restricted",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "RESTRICTED", opts.resolvedACLMode())
+
+		params := &truenas.DatasetCreateParams{Name: "tank/k8s/vol", Type: "FILESYSTEM"}
+		applyDatasetACLParams(params, opts)
+		assert.Equal(t, "RESTRICTED", params.Aclmode)
+	})
+
+	t.Run("DISCARD is not offered", func(t *testing.T) {
+		_, err := parseNFSACLOptions(map[string]string{
+			nfsACLTemplateParam: "NFS4_RESTRICTED",
+			nfsACLModeParam:     "DISCARD",
+		})
+		require.Error(t, err, "DISCARD deletes the whole ACL on the first chmod and must not be selectable")
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	})
+
+	t.Run("aclmode without an ACL is rejected", func(t *testing.T) {
+		_, err := parseNFSACLOptions(map[string]string{nfsACLModeParam: "RESTRICTED"})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), nfsACLTemplateParam)
+	})
+
+	t.Run("no ACL parameter still leaves both properties inherited", func(t *testing.T) {
+		params := &truenas.DatasetCreateParams{Name: "tank/k8s/vol", Type: "FILESYSTEM"}
+		applyDatasetACLParams(params, &nfsACLOptions{})
+		assert.Empty(t, params.Acltype)
+		assert.Empty(t, params.Aclmode)
+	})
+}
+
+// TestACLEventTextDoesNotOverclaimProtected is the H3 revert-proof on the
+// operator-facing strings: nfs41_flags.protected is ACL4_PROTECTED
+// (inheritance suppression), NOT a chmod guard, and neither the applied-event
+// nor the fsGroup warning may claim otherwise.
+func TestACLEventTextDoesNotOverclaimProtected(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	d, recorder := aclTestDriver(t, mock)
+
+	opts, err := parseNFSACLOptions(map[string]string{nfsACLTemplateParam: "NFS4_RESTRICTED"})
+	require.NoError(t, err)
+	d.applyNFSVolumeACL(withNFSACLOptions(ctx, opts), &truenas.Dataset{
+		Name: "tank/k8s/vol", Mountpoint: "/mnt/tank/k8s/vol",
+	}, "tank/k8s/vol", aclEventRef())
+
+	messages := drainEvents(recorder)
+	joined := strings.Join(messages, "\n")
+	require.NotEmpty(t, joined)
+
+	// The claim the reviewer proved false must not come back.
+	assert.NotContains(t, joined, "chmod cannot",
+		"protected does not stop a chmod; the docs and events must not say it does")
+	assert.NotContains(t, joined, "recompute the ACL from the mode")
+	// And the truth must be present.
+	assert.Contains(t, joined, "aclmode=PASSTHROUGH")
+	assert.Contains(t, joined, "not a chmod guard")
+	assert.Contains(t, joined, "nfsACLMode=RESTRICTED",
+		"the fsGroup warning must name the only ZFS lever that actually works")
+}

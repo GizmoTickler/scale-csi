@@ -1108,6 +1108,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.NFS.Enabled && cfg.NFS.ShareHost == "" {
 		return fmt.Errorf("nfs.shareHost is required when NFS is enabled")
 	}
+	if err := validateNFSExportConfig(&cfg.NFS); err != nil {
+		return err
+	}
 	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {
 		return fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
 	}
@@ -1118,6 +1121,45 @@ func validateConfig(cfg *Config) error {
 		if cfg.Fencing.Mode != FencingModeStrict && !cfg.NVMeoF.SubsystemAllowAnyHost && len(cfg.NVMeoF.SubsystemHosts) == 0 {
 			return fmt.Errorf("nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty; no host could connect")
 		}
+	}
+	return nil
+}
+
+// validateNFSExportConfig validates (and normalizes) the GLOBAL NFS export
+// defaults at config LOAD time, so a bad ConfigMap stops the controller from
+// starting instead of stamping an unusable export on every volume it creates.
+//
+// It is deliberately unconditional on cfg.NFS.Enabled: a value that is wrong is
+// wrong, and a deployment that later enables NFS must not inherit an invalid
+// list that was never checked.
+//
+// This is the config-load half of the KRB5 fail-closed gate. The chart schema
+// couples nfs.shareSecurity to nfs.krbEnabled as well, but a hand-written
+// ConfigMap bypasses the chart entirely, so the Go-side check is not optional:
+// `shareSecurity: [KRB5]` with `krbEnabled: false` would otherwise stamp KRB5 on
+// EVERY newly created export on a box with no KDC or keytab — dead mounts
+// fleet-wide, silently.
+func validateNFSExportConfig(nfs *NFSConfig) error {
+	normalized, err := normalizeNFSSecurityList("nfs.shareSecurity", nfs.ShareSecurity, nfs.KrbEnabled)
+	if err != nil {
+		return err
+	}
+	// Persist the normalized (uppercased, de-duplicated) list so the create
+	// payload matches the middleware enum exactly regardless of how the operator
+	// spelled it, and so the KRB5 prefix check can never be evaded by casing.
+	if len(nfs.ShareSecurity) > 0 {
+		nfs.ShareSecurity = normalized
+	}
+
+	// maproot_* and mapall_* are mutually exclusive in TrueNAS; a payload with
+	// both is rejected by sharing.nfs.create.
+	maproot := strings.TrimSpace(nfs.ShareMaprootUser) != "" || strings.TrimSpace(nfs.ShareMaprootGroup) != ""
+	mapall := strings.TrimSpace(nfs.ShareMapallUser) != "" || strings.TrimSpace(nfs.ShareMapallGroup) != ""
+	if maproot && mapall {
+		return fmt.Errorf(
+			"nfs.shareMaproot* and nfs.shareMapall* are mutually exclusive in TrueNAS "+
+				"(maprootUser=%q maprootGroup=%q mapallUser=%q mapallGroup=%q); sharing.nfs.create rejects a payload carrying both",
+			nfs.ShareMaprootUser, nfs.ShareMaprootGroup, nfs.ShareMapallUser, nfs.ShareMapallGroup)
 	}
 	return nil
 }

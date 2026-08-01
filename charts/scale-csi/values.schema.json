@@ -687,6 +687,72 @@
     "nfs": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "title": "KRB5 share security is coupled to krbEnabled",
+          "description": "KRB5/KRB5I/KRB5P require Kerberos on the TrueNAS NFS service (nfs.config v4_krb plus a keytab). Without nfs.krbEnabled=true the only selectable mode is SYS: a krb-only export on a box with no KDC or keytab makes every mount fail, and nfs.shareSecurity is stamped on EVERY newly created export. The driver enforces the same rule at config load, because a hand-written ConfigMap bypasses this schema.",
+          "if": {
+            "properties": {
+              "krbEnabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "krbEnabled"
+            ]
+          },
+          "then": true,
+          "else": {
+            "properties": {
+              "shareSecurity": {
+                "items": {
+                  "enum": [
+                    "SYS"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "title": "maproot_* and mapall_* are mutually exclusive",
+          "description": "TrueNAS rejects a sharing.nfs.create payload that carries both squash mappings. Setting nfs.shareMapallUser/Group requires clearing nfs.shareMaprootUser/Group.",
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "shareMapallUser": {
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "shareMapallUser"
+                ]
+              },
+              {
+                "properties": {
+                  "shareMapallGroup": {
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "shareMapallGroup"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "shareMaprootUser": {
+                "maxLength": 0
+              },
+              "shareMaprootGroup": {
+                "maxLength": 0
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "enabled": {
           "type": "boolean"

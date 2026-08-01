@@ -382,6 +382,18 @@ var (
 		[]string{"pool"},
 	)
 
+	// poolHealthStale is 1 when the cached backend-health snapshot has aged past
+	// its TTL and no longer drives per-PVC VolumeConditions. Every other
+	// scale_csi_pool_* gauge is only meaningful while this is 0.
+	poolHealthStale = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_health_stale",
+			Help:      "1 when the cached pool-health snapshot is older than its TTL and no longer drives VolumeCondition",
+		},
+		[]string{"pool"},
+	)
+
 	reconcileLastSuccessTimestamp = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -687,6 +699,31 @@ var poolScanStateLabels = []string{
 	truenas.PoolScanStateCanceled,
 }
 
+// poolScanNone is the `function` label used when the pool reports no scan at all.
+const poolScanNone = "NONE"
+
+// poolScanFunctionLabels is the fixed scan-FUNCTION label set. One-hot means
+// one-hot across the whole {function} × {state} cross-product, not merely within
+// the current function: a SCRUB that FINISHED followed by a RESILVER that is
+// SCANNING would otherwise leave BOTH
+// {function="SCRUB",state="FINISHED"}=1 and {function="RESILVER",state="SCANNING"}=1
+// exported simultaneously, which breaks every query written against the
+// documented contract.
+var poolScanFunctionLabels = []string{
+	truenas.PoolScanFunctionScrub,
+	truenas.PoolScanFunctionResilver,
+	poolScanNone,
+}
+
+// poolDynamicStatuses remembers the UNRECOGNIZED pool_status labels this process
+// has ever exported, per pool, so they can be zeroed when the pool moves on.
+// Without it an unknown status stays pinned at 1 forever — the exact
+// stale-alerting failure the one-hot design exists to prevent.
+var (
+	poolDynamicStatusMu sync.Mutex
+	poolDynamicStatuses = map[string]map[string]struct{}{}
+)
+
 // SetPoolHealthMetrics publishes one backend-health sample. Every one-hot series
 // is rewritten on each sample (current label 1, all others 0) so a recovered
 // pool never leaves a stale DEGRADED series firing an alert forever.
@@ -703,10 +740,7 @@ func SetPoolHealthMetrics(snapshot *truenas.PoolHealthSnapshot) {
 		}
 		poolStatus.WithLabelValues(snapshot.Pool, label).Set(value)
 	}
-	if !matched && current != "" {
-		// An unrecognized status must still be visible rather than silently absent.
-		poolStatus.WithLabelValues(snapshot.Pool, current).Set(1)
-	}
+	setDynamicPoolStatus(snapshot.Pool, current, matched)
 
 	healthy := 0.0
 	if snapshot.Healthy {
@@ -714,21 +748,76 @@ func SetPoolHealthMetrics(snapshot *truenas.PoolHealthSnapshot) {
 	}
 	poolHealthy.WithLabelValues(snapshot.Pool).Set(healthy)
 
-	function := snapshot.ScanFunction
-	if function == "" {
-		function = "NONE"
+	currentFunction := strings.ToUpper(strings.TrimSpace(snapshot.ScanFunction))
+	if currentFunction == "" {
+		currentFunction = poolScanNone
 	}
 	currentScan := strings.ToUpper(strings.TrimSpace(snapshot.ScanState))
-	for _, label := range poolScanStateLabels {
-		value := 0.0
-		if label == currentScan {
-			value = 1
+	for _, function := range poolScanFunctionLabels {
+		for _, label := range poolScanStateLabels {
+			value := 0.0
+			if function == currentFunction && label == currentScan {
+				value = 1
+			}
+			poolScanState.WithLabelValues(snapshot.Pool, function, label).Set(value)
 		}
-		poolScanState.WithLabelValues(snapshot.Pool, function, label).Set(value)
+	}
+	// A scan function the driver does not know about still has to be visible, and
+	// still has to be zeroed on the next sample, so route it through the same
+	// bookkeeping as the fixed set.
+	if currentFunction != poolScanNone &&
+		currentFunction != truenas.PoolScanFunctionScrub &&
+		currentFunction != truenas.PoolScanFunctionResilver {
+		for _, label := range poolScanStateLabels {
+			value := 0.0
+			if label == currentScan {
+				value = 1
+			}
+			poolScanState.WithLabelValues(snapshot.Pool, currentFunction, label).Set(value)
+		}
 	}
 
 	poolScanErrors.WithLabelValues(snapshot.Pool).Set(float64(snapshot.ScanErrors))
 	poolDiskTempAlerts.WithLabelValues(snapshot.Pool).Set(float64(snapshot.TemperatureAlerts))
+}
+
+// setDynamicPoolStatus exports an unrecognized status as 1 and zeroes every
+// previously-exported unrecognized status for that pool.
+func setDynamicPoolStatus(pool, current string, matched bool) {
+	poolDynamicStatusMu.Lock()
+	defer poolDynamicStatusMu.Unlock()
+	seen := poolDynamicStatuses[pool]
+	for label := range seen {
+		if label == current && !matched {
+			continue
+		}
+		poolStatus.WithLabelValues(pool, label).Set(0)
+	}
+	if matched || current == "" {
+		return
+	}
+	poolStatus.WithLabelValues(pool, current).Set(1)
+	if seen == nil {
+		seen = map[string]struct{}{}
+		poolDynamicStatuses[pool] = seen
+	}
+	seen[current] = struct{}{}
+}
+
+// SetPoolHealthStale publishes whether the cached pool-health snapshot is too
+// old to drive VolumeConditions. 1 means the driver has fallen back to
+// dataset-only conditions because the backend has not answered for several poll
+// intervals — a stale DEGRADED must not keep alerting after a real recovery, and
+// a stale ONLINE must not mask a real degradation.
+func SetPoolHealthStale(pool string, stale bool) {
+	if pool == "" {
+		return
+	}
+	value := 0.0
+	if stale {
+		value = 1
+	}
+	poolHealthStale.WithLabelValues(pool).Set(value)
 }
 
 // SetPoolCapacityMetrics publishes the latest parent-dataset capacity sample.

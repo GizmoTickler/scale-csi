@@ -149,6 +149,11 @@ type Driver struct {
 	backendHealthCancel context.CancelFunc
 	backendHealthWg     sync.WaitGroup
 	backendHealth       atomic.Pointer[truenas.PoolHealthSnapshot]
+	// backendHealthPendingFlips counts CONSECUTIVE samples that disagree with the
+	// currently published verdict. The fan-out only flips once it reaches
+	// backendHealthFlipSamples, so a flapping pool cannot rewrite every managed
+	// PVC's VolumeCondition on every tick.
+	backendHealthPendingFlips atomic.Int64
 
 	// Background fencing state. Missing-record observations are in-memory on
 	// purpose: a controller restart restarts the full grace period rather than

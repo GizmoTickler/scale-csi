@@ -228,11 +228,12 @@ The full `capacity.*` surface (all default off):
 | `backendHealth.enabled` | Run a controller-only **read-only** pool-health poller (`pool.query` + `disk.temperature_alerts`) that fans pool health onto every managed PVC's `VolumeCondition` and exports the `scale_csi_pool_status`/`_healthy`/`_scan_state`/`_scan_errors`/`_disk_temp_alerts` gauges. Default off; see `docs/production.md` |
 | `backendHealth.interval` | Health poll cadence; default `60s`, values below `30s` clamp to `30s` |
 | `csidriver.fsGroupPolicy` | `CSIDriver.spec.fsGroupPolicy`; default `File` (unchanged). Set `None` only on a fresh install committed to driver-applied NFSv4 ACLs — see `docs/reference/storageclass.md` |
-| `nfs.shareSecurity` | Default `sharing.nfs` security list (`SYS`/`KRB5`/`KRB5I`/`KRB5P`); empty omits the field, keeping the TrueNAS default |
+| `nfs.shareSecurity` | Default `sharing.nfs` security list (`SYS`/`KRB5`/`KRB5I`/`KRB5P`); empty omits the field, keeping the TrueNAS default. `KRB5*` requires `nfs.krbEnabled=true`, enforced by the chart schema **and** at driver config load — the controller refuses to start otherwise |
 | `nfs.shareExposeSnapshots` | Publish the read-only `.zfs/snapshot` tree through new exports |
-| `nfs.krbEnabled` | Acknowledge that Kerberos is configured on the NFS service; required before `KRB5*` share security is accepted |
+| `nfs.krbEnabled` | Acknowledge that Kerberos is configured on the NFS service; required before `KRB5*` share security is accepted anywhere (global default or StorageClass parameter) |
+| `nfs.shareMaproot*` / `nfs.shareMapall*` | Mutually exclusive in TrueNAS; setting both is rejected by the chart schema and at config load |
 | `nfs.versionPreflight` | Validate a StorageClass's pinned NFS version against the global `nfs.config` protocols |
-| `nfs.ensureProtocols` | **HARD RULE, opt-in:** mutate the GLOBAL TrueNAS NFS service to enable these major versions. Affects every export on the appliance, driver-managed or not |
+| `nfs.ensureProtocols` | **HARD RULE, opt-in:** mutate the GLOBAL TrueNAS NFS service to enable these major versions. Affects every export on the appliance, driver-managed or not. `nfs.update` **sets** the protocol list rather than unioning with it, so the driver hard-aborts the write when it cannot read the current list — an unparseable service config is never a safe basis for a service-wide write |
 
 Cost and cleanup caveats:
 

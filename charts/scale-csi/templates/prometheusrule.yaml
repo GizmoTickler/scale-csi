@@ -235,6 +235,18 @@ spec:
           annotations:
             summary: Scale CSI backend pool has a disk temperature alert
             description: At least one member disk of the pool backing Scale CSI volumes is raising a temperature alert.
+        - alert: ScaleCSIPoolHealthStale
+          # Fires when the backend stops answering, and is the reason to distrust
+          # every other scale_csi_pool_* series: past the staleness TTL the driver
+          # stops using the cached snapshot, so per-PVC VolumeConditions silently
+          # fall back to the dataset-only signal.
+          expr: max(scale_csi_pool_health_stale) by (pool) == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI backend health data is stale
+            description: The controller has not obtained a fresh pool.query sample for several poll intervals. Pool health no longer drives per-PVC VolumeCondition, and the other scale_csi_pool_* gauges are not current.
         {{- end }}
         {{- end }}
 {{- end }}

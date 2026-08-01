@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -169,6 +170,19 @@ func zfsPerformanceClassFromParams(params map[string]string) (string, error) {
 			zfsPerformanceClassParam, raw, strings.Join(sortedPerformanceClasses(), ", "))
 	}
 	return class, nil
+}
+
+// contentSourceKind names a CreateVolume content source for operator-facing
+// messages.
+func contentSourceKind(source *csi.VolumeContentSource) string {
+	switch {
+	case source.GetSnapshot() != nil:
+		return "snapshot"
+	case source.GetVolume() != nil:
+		return "volume"
+	default:
+		return "volume content"
+	}
 }
 
 type zfsPerformanceClassContextKey struct{}
@@ -377,8 +391,14 @@ func liveTunableZFSPropertyDiff(current, desired map[string]string) []string {
 //   - Only live-tunable properties differ -> allowed, with a loud warning that
 //     the driver does NOT retroactively rewrite an existing volume's properties
 //     and that recordsize-style changes would only affect new writes anyway.
-//   - The volume predates the stamp (legacy) -> warn only; there is nothing to
-//     compare against and an unstamped healthy volume must not be wedged.
+//   - The volume carries no stamp -> warn only; there is nothing to compare
+//     against and an unstamped healthy volume must not be wedged. Two distinct
+//     populations land here, and BOTH are honest: volumes that predate the
+//     feature, and clone/restore volumes, which are deliberately never stamped
+//     because the curated properties were never applied to them (a ZFS clone
+//     inherits the origin's geometry). Stamping a clone would make this guard
+//     compare a declared class against geometry that does not exist — the exact
+//     false-accept / false-reject pair the stamp is supposed to rule out.
 func (d *Driver) guardPerformanceClassChange(ctx context.Context, volumeID, storedClass, requestedClass, datasetType string) error {
 	if requestedClass == "" || requestedClass == storedClass {
 		return nil

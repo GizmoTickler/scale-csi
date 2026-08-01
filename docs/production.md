@@ -380,13 +380,35 @@ New gauges, all labeled by `pool` and present only while the poller runs:
   `1` and the rest are explicitly `0`, so a recovered pool cannot leave a stale
   `DEGRADED` series alerting forever;
 - `scale_csi_pool_healthy{pool}`;
-- `scale_csi_pool_scan_state{pool,function,state}` — one-hot scrub/resilver
-  state, deliberately separate from `pool_healthy`;
+- `scale_csi_pool_scan_state{pool,function,state}` — one-hot across the **whole**
+  `function × state` cross-product (`SCRUB`, `RESILVER`, `NONE`), not merely
+  within the current function: a finished SCRUB followed by a running RESILVER
+  leaves exactly one series at `1`. Deliberately separate from `pool_healthy`;
 - `scale_csi_pool_scan_errors{pool}`;
-- `scale_csi_pool_disk_temp_alerts{pool}`.
+- `scale_csi_pool_disk_temp_alerts{pool}`;
+- `scale_csi_pool_health_stale{pool}` — `1` when the cached snapshot has aged
+  past its TTL (below). Every other `scale_csi_pool_*` gauge is only meaningful
+  while this is `0`.
 
-A failed sample leaves the previous snapshot in place: a transient backend blip
-must not flip every PVC's condition, and slightly stale health beats none.
+Metrics always carry the **raw** sample. The two dampers below apply only to the
+per-PVC `VolumeCondition` fan-out, so Prometheus still sees a flap as a flap.
+
+**Staleness TTL.** A failed sample leaves the previous snapshot in place — a
+transient backend blip must not flip every PVC's condition. That only holds for a
+blip: after three consecutive missed intervals (3 × `backendHealth.interval`, so
+3m at the default) the snapshot is considered stale, stops driving
+`VolumeCondition` entirely (conditions fall back to the pre-GF5 dataset-only
+semantics), and `scale_csi_pool_health_stale` goes to `1`. Without this an
+appliance unreachable for hours would keep a stale `DEGRADED` firing
+`ScaleCSIPoolDegraded` long after a real recovery, and a stale `ONLINE` would
+mask a real degradation.
+
+**Hysteresis.** The fan-out is fleet-wide by construction, so an undamped
+`DEGRADED`↔`ONLINE` flap would rewrite every managed PVC's condition and churn a
+PVC event for each of them on every tick. A health transition must therefore be
+confirmed by **two consecutive samples** before it flips the conditions. The
+first observation after startup is never damped — there is nothing to flap
+against yet.
 
 The bundled rules use distinct expressions, rate windows, and `for` durations —
 do not collapse them into one sentence:

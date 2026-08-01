@@ -73,7 +73,11 @@ type MockClient struct {
 	//
 	// NFSShareCreateParams records every sharing.nfs.create payload verbatim so a
 	// test can assert the DEFAULT payload is byte-identical to the pre-GF5 one.
-	NFSShareCreateParams  []NFSShareCreateParams
+	NFSShareCreateParams []NFSShareCreateParams
+	// NFSShareUpdateParams records every sharing.nfs.update payload verbatim so a
+	// test can pin the R4 invariant: an idempotent replay must NEVER rewrite an
+	// existing export's security or squash mapping.
+	NFSShareUpdateParams  []map[string]interface{}
 	NFSServiceConfigValue *NFSServiceConfig
 	NFSServiceConfigCalls int
 	NFSServiceUpdateCalls []map[string]interface{}
@@ -1283,6 +1287,7 @@ func (m *MockClient) NFSShareList(ctx context.Context) ([]*NFSShare, error) {
 func (m *MockClient) NFSShareUpdate(ctx context.Context, id int, params map[string]interface{}) (*NFSShare, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.NFSShareUpdateParams = append(m.NFSShareUpdateParams, params)
 	share := m.NFSShares[id]
 	if share == nil {
 		return nil, notFoundAPIError("share not found")

@@ -95,7 +95,7 @@ func (d *Driver) parseNFSShareOptions(params map[string]string) (*nfsShareOption
 	}
 
 	if raw, ok := params[nfsSecurityParam]; ok {
-		security, err := parseNFSSecurityList(nfsSecurityParam, raw)
+		security, err := parseNFSSecurityList(nfsSecurityParam, raw, d.config != nil && d.config.NFS.KrbEnabled)
 		if err != nil {
 			return nil, err
 		}
@@ -139,7 +139,85 @@ func (d *Driver) parseNFSShareOptions(params map[string]string) (*nfsShareOption
 	if raw, ok := params[nfsAllowedHostsParam]; ok {
 		opts.allowedHosts = splitNFSList(raw)
 	}
+	if err := d.validateNFSFencingConflict(opts); err != nil {
+		return nil, err
+	}
+	if err := d.validateNFSSquashConflict(opts); err != nil {
+		return nil, err
+	}
 	return opts, nil
+}
+
+// validateNFSFencingConflict (M1) refuses a StorageClass that sets an export
+// allowlist under STRICT fencing, instead of accepting it and throwing it away.
+//
+// createNFSShareForDataset applies the per-class networks/hosts and then, under
+// strict fencing, unconditionally resets both to [] so a new volume starts
+// deny-all until ControllerPublishVolume writes a node identity. The two
+// parameters are therefore a pure no-op in that mode — an operator who sets them
+// gets neither the allowlist they asked for nor any signal that it was dropped.
+// Strict fencing owns the allowlist by design, so the conflict is a
+// configuration error, not a preference to be silently resolved.
+func (d *Driver) validateNFSFencingConflict(opts *nfsShareOptions) error {
+	if d.config == nil || d.config.Fencing.Mode != FencingModeStrict {
+		return nil
+	}
+	if opts.allowedNetworks == nil && opts.allowedHosts == nil {
+		return nil
+	}
+	set := make([]string, 0, 2)
+	if opts.allowedNetworks != nil {
+		set = append(set, nfsAllowedNetworksParam)
+	}
+	if opts.allowedHosts != nil {
+		set = append(set, nfsAllowedHostsParam)
+	}
+	return status.Errorf(codes.InvalidArgument,
+		"StorageClass parameter(s) %s cannot be combined with fencing.mode=strict: strict fencing owns the export allowlist and "+
+			"creates every share with empty networks/hosts (deny-all until ControllerPublishVolume grants a node), so these values "+
+			"would be silently discarded. Use fencing.mode=additive, or drop the parameter(s)",
+		strings.Join(set, ", "))
+}
+
+// validateNFSSquashConflict (M2) enforces the TrueNAS rule that maproot_* and
+// mapall_* are MUTUALLY EXCLUSIVE: sharing.nfs.create rejects a payload carrying
+// both, with an opaque middleware error surfacing as a hard CreateVolume failure.
+//
+// The trap is that the driver's DEFAULT config sets maproot_user=root /
+// maproot_group=wheel, so a StorageClass that innocently sets only nfsMapallUser
+// produces a both-fields payload. Validate the EFFECTIVE payload (per-class
+// override layered over the global config), not just the parameters, and say
+// exactly how to resolve it.
+func (d *Driver) validateNFSSquashConflict(opts *nfsShareOptions) error {
+	var cfg NFSConfig
+	if d.config != nil {
+		cfg = d.config.NFS
+	}
+	maproot := effectiveNFSSquash(opts.maprootUser, cfg.ShareMaprootUser) != "" ||
+		effectiveNFSSquash(opts.maprootGroup, cfg.ShareMaprootGroup) != ""
+	mapall := effectiveNFSSquash(opts.mapallUser, cfg.ShareMapallUser) != "" ||
+		effectiveNFSSquash(opts.mapallGroup, cfg.ShareMapallGroup) != ""
+	if !maproot || !mapall {
+		return nil
+	}
+	return status.Errorf(codes.InvalidArgument,
+		"NFS export maproot_* and mapall_* are mutually exclusive in TrueNAS, but this StorageClass resolves to both "+
+			"(maproot_user=%q maproot_group=%q mapall_user=%q mapall_group=%q). sharing.nfs.create would reject the payload. "+
+			"Set %s=\"\" and %s=\"\" on the StorageClass to drop the inherited nfs.shareMaproot* defaults, or do not set %s/%s",
+		effectiveNFSSquash(opts.maprootUser, cfg.ShareMaprootUser),
+		effectiveNFSSquash(opts.maprootGroup, cfg.ShareMaprootGroup),
+		effectiveNFSSquash(opts.mapallUser, cfg.ShareMapallUser),
+		effectiveNFSSquash(opts.mapallGroup, cfg.ShareMapallGroup),
+		nfsMaprootUserParam, nfsMaprootGroupParam, nfsMapallUserParam, nfsMapallGroupParam)
+}
+
+// effectiveNFSSquash resolves what a squash field will actually be on the wire:
+// the per-StorageClass override when present, otherwise the global config value.
+func effectiveNFSSquash(override *string, configured string) string {
+	if override != nil {
+		return strings.TrimSpace(*override)
+	}
+	return strings.TrimSpace(configured)
 }
 
 // validateNFSSecurity rejects unusable Kerberos security fail-closed. KRB5* is
@@ -147,35 +225,64 @@ func (d *Driver) parseNFSShareOptions(params map[string]string) (*nfsShareOption
 // neither of which the driver can provision, so it demands an explicit
 // `nfs.krbEnabled` acknowledgement from the operator.
 func (d *Driver) validateNFSSecurity(security []string) error {
-	for _, mode := range security {
-		if !strings.HasPrefix(mode, "KRB5") {
-			continue
-		}
-		if d.config == nil || !d.config.NFS.KrbEnabled {
-			return status.Errorf(codes.InvalidArgument,
-				"NFS share security %q requires Kerberos on the TrueNAS NFS service; set nfs.krbEnabled=true to acknowledge that nfs.config v4_krb and a keytab are configured",
-				mode)
-		}
+	krbEnabled := d.config != nil && d.config.NFS.KrbEnabled
+	if _, err := normalizeNFSSecurityList("StorageClass parameter "+nfsSecurityParam, security, krbEnabled); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	return nil
 }
 
-func parseNFSSecurityList(param, raw string) ([]string, error) {
-	items := splitNFSList(raw)
-	result := make([]string, 0, len(items))
-	seen := make(map[string]struct{}, len(items))
-	for _, item := range items {
-		mode := strings.ToUpper(item)
+// normalizeNFSSecurityList is THE single fail-closed gate for the NFS export
+// `security` list. It is deliberately shared by EVERY path that can put a value
+// into sharing.nfs.create's `security` field:
+//
+//   - the StorageClass `nfsSecurity` parameter (parseNFSShareOptions);
+//   - the GLOBAL `nfs.shareSecurity` config key, both at config load
+//     (validateConfig, so a hand-written ConfigMap refuses to start the
+//     controller) and again where it is applied (createNFSShareForDataset),
+//     defense in depth for a Config assembled in-process rather than parsed.
+//
+// It uppercases and de-duplicates, rejects anything outside the middleware's
+// enum, and rejects KRB5* unless the operator has explicitly acknowledged that
+// Kerberos really is configured (nfs.krbEnabled). A krb-only export on a box
+// with no KDC/keytab makes EVERY mount of it fail with an opaque server error,
+// so silently stamping one on every newly created export fleet-wide is far
+// worse than refusing to start.
+//
+// source names the origin of the value for the error message. The returned
+// error is a plain error; callers on a gRPC path wrap it with a code.
+func normalizeNFSSecurityList(source string, security []string, krbEnabled bool) ([]string, error) {
+	result := make([]string, 0, len(security))
+	seen := make(map[string]struct{}, len(security))
+	for _, item := range security {
+		mode := strings.ToUpper(strings.TrimSpace(item))
+		if mode == "" {
+			continue
+		}
 		if _, ok := validNFSSecurityModes[mode]; !ok {
-			return nil, status.Errorf(codes.InvalidArgument,
-				"invalid StorageClass parameter %s value %q; valid options are: %s",
-				param, item, strings.Join(sortedNFSSecurityModes(), ", "))
+			return nil, fmt.Errorf("invalid %s value %q; valid options are: %s",
+				source, item, strings.Join(sortedNFSSecurityModes(), ", "))
+		}
+		if strings.HasPrefix(mode, "KRB5") && !krbEnabled {
+			return nil, fmt.Errorf(
+				"%s requests NFS share security %q, which requires Kerberos on the TrueNAS NFS service; "+
+					"set nfs.krbEnabled=true to acknowledge that nfs.config v4_krb and a keytab are configured. "+
+					"Without them every mount of the export fails",
+				source, mode)
 		}
 		if _, duplicate := seen[mode]; duplicate {
 			continue
 		}
 		seen[mode] = struct{}{}
 		result = append(result, mode)
+	}
+	return result, nil
+}
+
+func parseNFSSecurityList(param, raw string, krbEnabled bool) ([]string, error) {
+	result, err := normalizeNFSSecurityList("StorageClass parameter "+param, splitNFSList(raw), krbEnabled)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if len(result) == 0 {
 		return nil, status.Errorf(codes.InvalidArgument,
@@ -370,12 +477,24 @@ func (d *Driver) ensureNFSProtocols(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// FAIL CLOSED (M3). "Only adds, never removes" is only true if the CURRENT
+	// list is known: nfs.update {protocols: X} SETS the list, it does not union
+	// with it. An empty cfg.Protocols means parseNFSServiceConfig could not read
+	// the field (renamed/reshaped on a future TrueNAS, or a non-list value) — and
+	// merging into an empty base would write exactly the configured list, DISABLING
+	// every major version missing from it appliance-wide and breaking every export,
+	// driver-managed or not. An unparseable service config is never a safe basis
+	// for a service-wide write.
+	if len(cfg.Protocols) == 0 {
+		return fmt.Errorf(
+			"nfs.ensureProtocols refused: the TrueNAS nfs.config reported no protocols list, so the driver cannot prove which "+
+				"major versions are currently enabled; writing the configured list %v would DISABLE every version missing from it "+
+				"for every export on the appliance", desired)
+	}
+
 	merged := append([]string(nil), cfg.Protocols...)
 	changed := false
 	for _, token := range desired {
-		if cfg.SupportsMajorVersion(token) && len(cfg.Protocols) > 0 {
-			continue
-		}
 		if containsString(merged, token) {
 			continue
 		}

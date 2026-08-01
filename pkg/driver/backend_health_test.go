@@ -299,3 +299,174 @@ func TestSetPoolHealthMetricsIsOneHot(t *testing.T) {
 	SetPoolHealthMetrics(nil)
 	SetPoolHealthMetrics(&truenas.PoolHealthSnapshot{})
 }
+
+// ---------------------------------------------------------------------------
+// M4 — pool_scan_state must be one-hot across the FUNCTION change too
+// ---------------------------------------------------------------------------
+
+// TestSetPoolHealthMetricsScanStateIsOneHotAcrossFunctions pins M4. Before the
+// fix, SetPoolHealthMetrics only zeroed the states of the CURRENT function, so a
+// finished SCRUB followed by a running RESILVER exported
+// {function=SCRUB,state=FINISHED}=1 AND {function=RESILVER,state=SCANNING}=1
+// simultaneously — the documented one-hot contract broken, and a stale series
+// left for anyone alerting on it.
+func TestSetPoolHealthMetricsScanStateIsOneHotAcrossFunctions(t *testing.T) {
+	const pool = "gf5-scan-function-pool"
+
+	SetPoolHealthMetrics(&truenas.PoolHealthSnapshot{
+		Pool: pool, Status: truenas.PoolStatusOnline, Healthy: true,
+		ScanFunction: truenas.PoolScanFunctionScrub, ScanState: truenas.PoolScanStateFinished,
+	})
+	require.Equal(t, 1.0, testutil.ToFloat64(
+		poolScanState.WithLabelValues(pool, truenas.PoolScanFunctionScrub, truenas.PoolScanStateFinished)))
+
+	// The scan function changes: a disk was replaced and the pool is resilvering.
+	SetPoolHealthMetrics(&truenas.PoolHealthSnapshot{
+		Pool: pool, Status: truenas.PoolStatusDegraded,
+		ScanFunction: truenas.PoolScanFunctionResilver, ScanState: truenas.PoolScanStateScanning,
+	})
+	assert.Equal(t, 0.0, testutil.ToFloat64(
+		poolScanState.WithLabelValues(pool, truenas.PoolScanFunctionScrub, truenas.PoolScanStateFinished)),
+		"the previous scan FUNCTION's series must be zeroed, not merely left behind")
+	assert.Equal(t, 1.0, testutil.ToFloat64(
+		poolScanState.WithLabelValues(pool, truenas.PoolScanFunctionResilver, truenas.PoolScanStateScanning)))
+
+	// Exactly one series across the whole function x state cross-product.
+	total := 0.0
+	for _, function := range poolScanFunctionLabels {
+		for _, state := range poolScanStateLabels {
+			total += testutil.ToFloat64(poolScanState.WithLabelValues(pool, function, state))
+		}
+	}
+	assert.Equal(t, 1.0, total, "pool_scan_state must be one-hot across function x state")
+
+	// And a pool with no scan at all lands on the NONE function.
+	SetPoolHealthMetrics(&truenas.PoolHealthSnapshot{Pool: pool, Status: truenas.PoolStatusOnline, Healthy: true})
+	assert.Equal(t, 0.0, testutil.ToFloat64(
+		poolScanState.WithLabelValues(pool, truenas.PoolScanFunctionResilver, truenas.PoolScanStateScanning)))
+}
+
+// TestSetPoolHealthMetricsZeroesUnrecognizedStatus pins the smaller half of M4:
+// an unrecognized status is exported dynamically, and must be zeroed when the
+// pool moves on rather than staying pinned at 1 forever.
+func TestSetPoolHealthMetricsZeroesUnrecognizedStatus(t *testing.T) {
+	const pool = "gf5-dynamic-status-pool"
+
+	SetPoolHealthMetrics(&truenas.PoolHealthSnapshot{Pool: pool, Status: "SUSPENDED"})
+	require.Equal(t, 1.0, testutil.ToFloat64(poolStatus.WithLabelValues(pool, "SUSPENDED")))
+
+	SetPoolHealthMetrics(&truenas.PoolHealthSnapshot{Pool: pool, Status: truenas.PoolStatusOnline, Healthy: true})
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolStatus.WithLabelValues(pool, "SUSPENDED")),
+		"a recovered pool must not leave an unrecognized status series at 1 forever")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolStatus.WithLabelValues(pool, truenas.PoolStatusOnline)))
+}
+
+// ---------------------------------------------------------------------------
+// M5 — the cached snapshot needs a staleness bound
+// ---------------------------------------------------------------------------
+
+// TestPoolHealthSnapshotExpires pins M5. Keeping the last snapshot across a blip
+// is correct; keeping it across an outage is not — a stale DEGRADED keeps
+// alerting after a real recovery, and a stale ONLINE masks a real degradation.
+func TestPoolHealthSnapshotExpires(t *testing.T) {
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{
+		Status: truenas.PoolStatusDegraded, StatusDetail: "One or more devices are faulted.",
+	}
+	d := healthTestDriver(mock)
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+
+	d.sampleBackendHealth(context.Background(), "flashstor")
+	require.NotNil(t, d.poolHealthSnapshot())
+	require.True(t, d.volumeCondition(managedDataset()).GetAbnormal())
+
+	// Age the cached snapshot past its TTL (3 x interval).
+	stale := *d.backendHealth.Load()
+	stale.SampledAt = time.Now().Add(-d.backendHealthTTL() - time.Second)
+	d.backendHealth.Store(&stale)
+
+	assert.Nil(t, d.poolHealthSnapshot(), "a snapshot older than its TTL must stop driving conditions")
+	assert.Equal(t, volumeConditionFromDataset(managedDataset()), d.volumeCondition(managedDataset()),
+		"past the TTL the condition falls back to the pre-GF5 dataset-only semantics")
+
+	// A failing sample past the TTL raises the staleness gauge.
+	mock.InjectHealthError = errors.New("appliance unreachable")
+	d.sampleBackendHealth(context.Background(), "flashstor")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues("flashstor")))
+
+	// A recovered sample clears it.
+	mock.InjectHealthError = nil
+	d.sampleBackendHealth(context.Background(), "flashstor")
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues("flashstor")))
+}
+
+func TestBackendHealthTTLTracksTheInterval(t *testing.T) {
+	d := healthTestDriver(truenas.NewMockClient())
+	assert.Equal(t, 3*time.Minute, d.backendHealthTTL(), "the default 60s cadence gives a 3m TTL")
+
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "5m"}
+	assert.Equal(t, 15*time.Minute, d.backendHealthTTL())
+
+	// A sub-floor interval is clamped before the multiplier is applied.
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "1s"}
+	assert.Equal(t, 3*minBackendHealthInterval, d.backendHealthTTL())
+}
+
+// ---------------------------------------------------------------------------
+// M6 — hysteresis on the fleet-wide condition fan-out
+// ---------------------------------------------------------------------------
+
+// TestBackendHealthFanOutHasHysteresis pins M6. One pool backs every managed
+// volume, so an undamped DEGRADED<->ONLINE flap rewrites every PVC's condition
+// and churns a PVC event for each of them on every tick.
+func TestBackendHealthFanOutHasHysteresis(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true}
+	d := healthTestDriver(mock)
+
+	// First observation is never damped: there is nothing to flap against.
+	d.sampleBackendHealth(ctx, "flashstor")
+	require.False(t, d.volumeCondition(managedDataset()).GetAbnormal())
+
+	// A single DEGRADED sample must NOT flip the whole fleet.
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusDegraded}
+	d.sampleBackendHealth(ctx, "flashstor")
+	assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal(),
+		"one degraded sample must not flip every managed PVC's condition")
+	// Metrics are NOT damped: Prometheus must see the flap as a flap.
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolStatus.WithLabelValues("flashstor", truenas.PoolStatusDegraded)))
+
+	// The second consecutive degraded sample confirms it.
+	d.sampleBackendHealth(ctx, "flashstor")
+	assert.True(t, d.volumeCondition(managedDataset()).GetAbnormal(),
+		"a transition confirmed by K consecutive samples must flip")
+
+	// Recovery is damped symmetrically.
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true}
+	d.sampleBackendHealth(ctx, "flashstor")
+	assert.True(t, d.volumeCondition(managedDataset()).GetAbnormal(), "a single healthy sample must not clear it either")
+	d.sampleBackendHealth(ctx, "flashstor")
+	assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal())
+}
+
+// TestBackendHealthFlapNeverFlips proves a pool alternating on every sample
+// never flips the fan-out at all, which is the actual anti-churn property.
+func TestBackendHealthFlapNeverFlips(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true}
+	d := healthTestDriver(mock)
+	d.sampleBackendHealth(ctx, "flashstor")
+
+	for i := 0; i < 6; i++ {
+		if i%2 == 0 {
+			mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusDegraded}
+		} else {
+			mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true}
+		}
+		d.sampleBackendHealth(ctx, "flashstor")
+		assert.False(t, d.volumeCondition(managedDataset()).GetAbnormal(),
+			"an alternating pool must never flip the fleet-wide condition (sample %d)", i)
+	}
+}
