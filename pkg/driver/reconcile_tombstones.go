@@ -329,7 +329,7 @@ func (d *Driver) reapTombstoneSnapshot(
 	// hold the driver does not own (R2). Without this the destroy EBUSYs and the
 	// tombstone leaks forever.
 	d.releaseCSISnapshotHoldIfEnabled(ctx, snapshot.ID)
-	if err := d.truenasClient.SnapshotDelete(ctx, snapshot.ID, false, false); err != nil {
+	if err := d.destroyDriverSnapshot(ctx, snapshot.ID, false, false); err != nil {
 		if truenas.IsNotFoundError(err) {
 			retire.add(snapshot.ID)
 			return true, ""

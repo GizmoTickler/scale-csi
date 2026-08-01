@@ -107,7 +107,13 @@ type ReconcileReport struct {
 	ScheduledSnapshotCount int
 	// PromotedCloneCount is the number of clone-restored volumes promoted (GF2/E3)
 	// during the pass to release their origin-snapshot pin.
-	PromotedCloneCount         int
+	PromotedCloneCount int
+	// StrandedSnapshotTasks lists the volume datasets whose driver-minted
+	// periodic-snapshot task outlived its dataset (GF2-fix/H2). Detection is
+	// always-on; deletion (DeletedSnapshotTasks) stays gated by opts.Delete like
+	// every other reconcile destroy.
+	StrandedSnapshotTasks      []string
+	DeletedSnapshotTasks       []string
 	OrphanVolumeBytes          int64
 	OrphanSnapshotBytes        int64
 	TombstoneSnapshotBytes     int64
@@ -224,7 +230,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		RecordReconcileFailure("list_backend_volumes")
 		return report, fmt.Errorf("list managed backend volumes: %w", err)
 	}
-	snapshots, tombstones, err := d.listAllManagedSnapshots(ctx)
+	snapshots, tombstones, unowned, err := d.listAllManagedSnapshots(ctx)
 	if err != nil {
 		RecordReconcileFailure("list_backend_snapshots")
 		return report, fmt.Errorf("list managed backend snapshots: %w", err)
@@ -256,16 +262,35 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 
 	now := time.Now()
 	managedBackendVolumeCount := d.classifyOrphanVolumes(ctx, now, datasets, kubeState, minOrphanAge, &report)
-	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, datasets, kubeState, minOrphanAge, &report)
+	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, kubeState, minOrphanAge, &report)
+	d.countScheduledSnapshots(unowned, datasets, &report)
 	d.classifyTombstones(now, tombstones, ledger, minOrphanAge, &report)
 
 	// GF2/E3 background promote (opt-in zfs.promoteRestoredClones): free
-	// clone-restored volumes from their origin-snapshot pin when each is the sole
-	// dependent of its origin, so the tombstone reaper can reclaim source
-	// snapshots. The step is a no-op unless the flag is set.
-	d.reconcilePromoteRestoredClones(ctx, datasets, &report)
+	// clone-restored volumes from their origin-snapshot pin when each is the
+	// AUTHORITATIVE sole dependent of its origin and no other live CSI snapshot
+	// would migrate with it, carrying tombstone ledger provenance across the id
+	// migration. The step is a no-op unless the flag is set.
+	d.reconcilePromoteRestoredClones(ctx, datasets, snapshots, tombstones, ledger, &report)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		RecordReconcileFailure("promote_restored_clones")
+		return report, ctxErr
+	}
+
+	// GF2-fix/F6: publish the per-volume quota/usage gauges from THIS pass's
+	// dataset walk (zero extra API calls), which is what the design specified and
+	// what makes ScaleCSIVolumeNearQuota reachable: the shipped
+	// external-health-monitor sidecar drives ListVolumes, not ControllerGetVolume,
+	// so gauges written only by ControllerGetVolume essentially never appeared.
+	// The reset also un-latches series for volumes that vanished or fell back
+	// below the threshold. No-op unless zfs.reportVolumeUsage is set.
+	d.publishVolumeUsageMetrics(datasets)
+
+	// GF2-fix/H2: reclaim periodic-snapshot tasks whose volume dataset is gone.
+	// No-op (zero API calls) in a deployment that never used scheduling.
+	d.sweepStrandedSnapshotTasks(ctx, datasets, &report, opts.Delete)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		RecordReconcileFailure("snapshot_task_sweep")
 		return report, ctxErr
 	}
 
@@ -438,22 +463,13 @@ func (d *Driver) classifyOrphanVolumes(ctx context.Context, now time.Time, datas
 // classifyOrphanSnapshots appends age-eligible, non-live CSI snapshots to
 // report.OrphanSnapshots and returns the count of managed backend snapshots
 // observed. Extracted verbatim from reconcileOrphans (Batch 18 R2).
-func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Snapshot, datasets []*truenas.Dataset, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, report *ReconcileReport) int {
-	datasetByPath := make(map[string]*truenas.Dataset, len(datasets))
-	for _, ds := range datasets {
-		datasetByPath[ds.Name] = ds
-	}
+func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Snapshot, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, report *ReconcileReport) int {
 	managedBackendSnapshotCount := 0
 	for _, snap := range snapshots {
 		if !isCSISnapshot(snap) {
-			// Driver-managed periodic snapshots (GF2/E2) carry no CSI props (P2),
-			// so they land here. Recognize them by task naming-schema prefix on a
-			// driver-owned dataset and count them for visibility ONLY — they are
-			// never an orphan or delete candidate (R4), which this non-CSI skip
-			// already guarantees.
-			if isDriverScheduledSnapshot(snap, datasetByPath[snap.Dataset], d.driverInstanceID()) {
-				report.ScheduledSnapshotCount++
-			}
+			// Non-CSI snapshots never reach the orphan path. Driver-scheduled
+			// snapshots (GF2/E2) are counted separately in countScheduledSnapshots,
+			// which sees the partition bucket this classifier never receives.
 			continue
 		}
 		managedBackendSnapshotCount++
@@ -758,10 +774,16 @@ func (d *Driver) listAllManagedDatasetsPaged(ctx context.Context) ([]*truenas.Da
 // just to slice one page out — O(N²) wire volume per reconcile pass. Fetching the
 // full set once (limit=0) and partitioning in memory collapses that to a single
 // transfer; sorting/paging is then pure memory work.
-func (d *Driver) listAllManagedSnapshots(ctx context.Context) (managed, tombstones []*truenas.Snapshot, err error) {
+// The third bucket ("unowned") is every remaining snapshot under the parent:
+// neither a CSI snapshot nor a tombstone. It is NEVER a delete candidate — it is
+// returned only so the driver-scheduled-snapshot GAUGE can be computed. The
+// previous code discarded this bucket inside the partition, which made the
+// scheduled-snapshot metric permanently zero in production while a test that
+// fed the classifier a raw snapshot list appeared to validate it.
+func (d *Driver) listAllManagedSnapshots(ctx context.Context) (managed, tombstones, unowned []*truenas.Snapshot, err error) {
 	all, err := d.truenasClient.SnapshotListAll(ctx, d.config.ZFS.DatasetParentName, 0, 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for _, snap := range all {
 		switch {
@@ -769,9 +791,48 @@ func (d *Driver) listAllManagedSnapshots(ctx context.Context) (managed, tombston
 			managed = append(managed, snap)
 		case isSnapshotTombstone(snap):
 			tombstones = append(tombstones, snap)
+		default:
+			unowned = append(unowned, snap)
 		}
 	}
-	return managed, tombstones, nil
+	return managed, tombstones, unowned, nil
+}
+
+// publishVolumeUsageMetrics republishes the per-volume usage gauges from an
+// already-fetched dataset slice. Reset-then-set is deliberate: a Prometheus
+// GaugeVec keyed by volume id otherwise LATCHES forever once a volume is deleted.
+func (d *Driver) publishVolumeUsageMetrics(datasets []*truenas.Dataset) {
+	if d.config == nil || !d.config.ZFS.ReportVolumeUsage {
+		return
+	}
+	ResetVolumeUsageMetrics()
+	for _, ds := range datasets {
+		if ds == nil {
+			continue
+		}
+		RecordVolumeUsage(datasetVolumeID(ds.Name), ds.QuotaUsage())
+	}
+}
+
+// countScheduledSnapshots publishes the driver-scheduled-snapshot gauge (GF2/E2)
+// from the pass's non-CSI, non-tombstone snapshots. It is metrics-only: nothing
+// it touches can ever become a delete candidate, which is why it may use the
+// source-tolerant form of the ownership predicate (TrueNAS 26.0's
+// zfs.resource.query projection strips per-property source entirely, so the
+// strict form can never match on this path).
+func (d *Driver) countScheduledSnapshots(unowned []*truenas.Snapshot, datasets []*truenas.Dataset, report *ReconcileReport) {
+	if len(unowned) == 0 {
+		return
+	}
+	datasetByPath := make(map[string]*truenas.Dataset, len(datasets))
+	for _, ds := range datasets {
+		datasetByPath[ds.Name] = ds
+	}
+	for _, snap := range unowned {
+		if driverScheduledSnapshotProvenance(snap, datasetByPath[snap.Dataset], d.driverInstanceID(), false) {
+			report.ScheduledSnapshotCount++
+		}
+	}
 }
 
 func (d *Driver) findBackendSnapshotForHandle(ctx context.Context, handle string) (*truenas.Snapshot, error) {

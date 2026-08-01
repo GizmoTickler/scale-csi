@@ -531,6 +531,24 @@ func (c *Client) DatasetGetQuotaUsage(ctx context.Context, datasetName string) (
 	}, nil
 }
 
+// QuotaUsage projects an ALREADY-FETCHED dataset's space accounting, with no
+// additional API call. It is what lets the reconcile dataset walk publish the
+// per-volume usage gauges for every managed volume (GF2-fix/F6) — the shipped
+// health-monitor sidecar drives ListVolumes, not ControllerGetVolume, so gauges
+// populated only from ControllerGetVolume left the near-quota alert unable to
+// fire in the shipped topology.
+func (d *Dataset) QuotaUsage() *DatasetQuotaUsage {
+	if d == nil {
+		return nil
+	}
+	return &DatasetQuotaUsage{
+		Used:      datasetPropertyInt64(d.Used),
+		Quota:     datasetPropertyInt64(d.Quota),
+		Refquota:  datasetPropertyInt64(d.Refquota),
+		Available: datasetPropertyInt64(d.Available),
+	}
+}
+
 // datasetPropertyInt64 extracts a non-negative int64 from a dataset property's
 // parsed value, returning 0 when absent or out of range (e.g. an unset quota).
 func datasetPropertyInt64(property DatasetProperty) int64 {
@@ -540,6 +558,23 @@ func datasetPropertyInt64(property DatasetProperty) int64 {
 		}
 	}
 	return 0
+}
+
+// SnapshotDependentClones is the exported, authoritative dependent-clone query
+// for ONE exact snapshot. It answers "which datasets are clones of this
+// snapshot" from the backend's own origin projection rather than from any
+// caller-side slice, so a clone the caller's managed-dataset listing never saw
+// (an admin's `zfs clone`, a replication/VolSync target, another driver
+// instance's volume) is still counted (GF2-fix/H3).
+//
+// Scope note, documented honestly: TrueNAS 26.0 exposes no `clones` property on
+// snapshots, so the only available authority is a dataset-origin query. It
+// covers the whole CSI PARENT subtree — every clone that can exist under the
+// driver's parent, managed or not. A clone living OUTSIDE the parent subtree is
+// invisible to every 26.0 API, so callers that mutate dependency structure
+// (promote) must treat that as a residual documented risk, not proven absence.
+func (c *Client) SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
+	return c.snapshotDependentClones(ctx, snapshotID)
 }
 
 // snapshotDependentClones returns the datasets cloned from one exact snapshot —

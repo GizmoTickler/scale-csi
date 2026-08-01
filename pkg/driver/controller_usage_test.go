@@ -5,11 +5,34 @@ import (
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+// gaugeVecHasVolume reports whether a per-volume gauge vector currently carries
+// a series for volumeID, independent of any other test's series.
+func gaugeVecHasVolume(vec *prometheus.GaugeVec, volumeID string) bool {
+	ch := make(chan prometheus.Metric, 256)
+	vec.Collect(ch)
+	close(ch)
+	for metric := range ch {
+		var pb dto.Metric
+		if err := metric.Write(&pb); err != nil {
+			continue
+		}
+		for _, label := range pb.GetLabel() {
+			if label.GetName() == "volume" && label.GetValue() == volumeID {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func setDatasetUsage(client *truenas.MockClient, name string, used, quota, refquota, available int64) {
 	ds := client.Datasets[name]
@@ -105,4 +128,71 @@ func TestControllerGetVolumeHealthyUnderQuota(t *testing.T) {
 	resp, err := d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "ok-vol"})
 	require.NoError(t, err)
 	assert.False(t, resp.GetStatus().GetVolumeCondition().GetAbnormal(), "a volume well under quota is healthy")
+}
+
+// F6 — the per-volume gauges LATCHED: nothing ever deleted a volume's series, so
+// a volume observed once above 95% kept near_quota=1 forever (a permanently
+// firing ScaleCSIVolumeNearQuota plus unbounded label cardinality), even after
+// the PVC was gone.
+func TestDeleteVolumeDropsPerVolumeUsageSeries(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newUsageTestDriver(client, true)
+	_, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "latch-vol",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters:         map[string]string{"protocol": "nfs"},
+	})
+	require.NoError(t, err)
+	setDatasetUsage(client, "pool/parent/latch-vol", 990, 1000, 0, 10)
+
+	_, err = d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "latch-vol"})
+	require.NoError(t, err)
+	require.Equal(t, 1.0, testutil.ToFloat64(volumeNearQuota.WithLabelValues("latch-vol")),
+		"precondition: the near-quota gauge is latched at 1")
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "latch-vol"})
+	require.NoError(t, err)
+
+	assert.False(t, gaugeVecHasVolume(volumeNearQuota, "latch-vol"), "the deleted volume's series must be dropped")
+	assert.False(t, gaugeVecHasVolume(volumeUsedBytes, "latch-vol"))
+	assert.False(t, gaugeVecHasVolume(volumeQuotaBytes, "latch-vol"))
+}
+
+// F6 — the shipped external-health-monitor sidecar drives ListVolumes, not
+// ControllerGetVolume, so gauges written only from ControllerGetVolume left the
+// near-quota alert effectively unable to fire. The reconcile dataset walk must
+// publish them (with no extra API calls) and un-latch vanished volumes.
+func TestReconcilePublishesVolumeUsageFromDatasetWalk(t *testing.T) {
+	client := truenas.NewMockClient()
+	d := newUsageTestDriver(client, true)
+	ResetVolumeUsageMetrics()
+
+	near := &truenas.Dataset{
+		Name:     "pool/parent/walk-near",
+		Used:     truenas.DatasetProperty{Parsed: float64(990)},
+		Refquota: truenas.DatasetProperty{Parsed: float64(1000)},
+	}
+	ok := &truenas.Dataset{
+		Name:     "pool/parent/walk-ok",
+		Used:     truenas.DatasetProperty{Parsed: float64(10)},
+		Refquota: truenas.DatasetProperty{Parsed: float64(1000)},
+	}
+	d.publishVolumeUsageMetrics([]*truenas.Dataset{near, ok})
+
+	assert.Equal(t, 1.0, testutil.ToFloat64(volumeNearQuota.WithLabelValues("walk-near")))
+	assert.Equal(t, 0.0, testutil.ToFloat64(volumeNearQuota.WithLabelValues("walk-ok")))
+	assert.Equal(t, 990.0, testutil.ToFloat64(volumeUsedBytes.WithLabelValues("walk-near")))
+
+	// The next pass no longer observes walk-near: its latched series must go.
+	d.publishVolumeUsageMetrics([]*truenas.Dataset{ok})
+	assert.False(t, gaugeVecHasVolume(volumeNearQuota, "walk-near"), "a vanished volume must not keep a latched series")
+	assert.True(t, gaugeVecHasVolume(volumeNearQuota, "walk-ok"))
+
+	// Feature off => nothing published at all.
+	ResetVolumeUsageMetrics()
+	d.config.ZFS.ReportVolumeUsage = false
+	d.publishVolumeUsageMetrics([]*truenas.Dataset{near})
+	assert.False(t, gaugeVecHasVolume(volumeNearQuota, "walk-near"), "the default path publishes no per-volume series")
 }

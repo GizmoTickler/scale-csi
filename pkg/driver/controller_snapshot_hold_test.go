@@ -163,3 +163,79 @@ func TestReaperReleasesHoldBeforeReap(t *testing.T) {
 	_, err = client.SnapshotGet(ctx, tombstoneID)
 	assert.True(t, truenas.IsNotFoundError(err), "the held tombstone is reaped, not wedged")
 }
+
+// H4 — the rollback wedge. Holds are backend state that outlives the flag that
+// placed them, so with zfs.holdCsiSnapshots turned back OFF every previously
+// held CSI snapshot became undeletable: SnapshotDelete returned EBUSY, which is
+// neither NotFound nor has-clones, so DeleteSnapshot answered codes.Internal and
+// external-snapshotter retried forever (and the source volume's DeleteVolume was
+// blocked behind it). Release must run whenever a hold is actually present,
+// regardless of the flag.
+func TestDeleteSnapshotSucceedsOnHeldSnapshotAfterFlagDisabled(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newHoldTestDriver(t, client)
+	createHoldSourceDataset(t, client, "rollback-source")
+
+	_, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{Name: "rollback-snap", SourceVolumeId: "rollback-source"})
+	require.NoError(t, err)
+	snapshotID := "pool/parent/rollback-source@rollback-snap"
+	held, err := client.SnapshotIsHeld(ctx, snapshotID)
+	require.NoError(t, err)
+	require.True(t, held, "precondition: the snapshot was held while the feature was on")
+
+	// The operator rolls the Helm value back to false. The hold remains.
+	d.config.ZFS.HoldCSISnapshots = false
+
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "rollback-snap"})
+	require.NoError(t, err, "disabling the feature must never wedge an already-held snapshot")
+	_, err = client.SnapshotGet(ctx, snapshotID)
+	assert.True(t, truenas.IsNotFoundError(err), "the held snapshot is released and destroyed")
+}
+
+// H4 — the recursive-destroy half of the same wedge (codex E1 finding #3): ZFS
+// refuses the WHOLE recursive dataset destroy with EBUSY when any snapshot
+// beneath it is held, and the per-snapshot release sites never see those
+// snapshots. A held driver tombstone therefore made its volume undeletable.
+func TestDeleteVolumeReleasesHeldDriverTombstoneUnderRecursiveDestroy(t *testing.T) {
+	ctx := context.Background()
+	pv := boundReconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	d.config.ZFS.HoldCSISnapshots = true
+	d.config.ZFS.DestroyForeignSnapshotsOnDelete = true
+
+	tombstoneID := bookkeepingTombstone(t, d, client)
+	require.NoError(t, client.SnapshotHold(ctx, tombstoneID))
+	// Drop the restored clone so only the held tombstone blocks the destroy.
+	require.NoError(t, client.DatasetDelete(ctx, "pool/parent/restored", false, true))
+
+	// The rollback case again: the flag is off by the time the volume is deleted.
+	d.config.ZFS.HoldCSISnapshots = false
+
+	_, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "source"})
+	require.NoError(t, err, "a held driver tombstone must not make its volume undeletable")
+	assert.NotContains(t, client.Datasets, "pool/parent/source")
+}
+
+// R2 — the release recovery must never strip a hold the driver cannot prove it
+// owns. A FOREIGN held snapshot keeps the recursive destroy correctly refused.
+func TestDeleteVolumeDoesNotReleaseForeignHeldSnapshot(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newHoldTestDriver(t, client)
+	d.config.ZFS.DestroyForeignSnapshotsOnDelete = true
+	createHoldSourceDataset(t, client, "foreign-held")
+
+	_, err := client.SnapshotCreate(ctx, "pool/parent/foreign-held", "admin-backup", nil)
+	require.NoError(t, err)
+	require.NoError(t, client.SnapshotHold(ctx, "pool/parent/foreign-held@admin-backup"))
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "foreign-held"})
+	require.Error(t, err, "a foreign hold must keep the destroy refused")
+
+	held, err := client.SnapshotIsHeld(ctx, "pool/parent/foreign-held@admin-backup")
+	require.NoError(t, err)
+	assert.True(t, held, "the driver must never release a foreign snapshot's hold")
+	_, err = client.SnapshotGet(ctx, "pool/parent/foreign-held@admin-backup")
+	assert.NoError(t, err, "the foreign snapshot survives")
+}

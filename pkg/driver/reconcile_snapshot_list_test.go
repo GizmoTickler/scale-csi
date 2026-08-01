@@ -45,7 +45,7 @@ func TestListAllManagedSnapshotsSingleFetch(t *testing.T) {
 	d := newOrphanShareSweepDriver(base)
 	d.truenasClient = mock
 
-	managed, tombstones, err := d.listAllManagedSnapshots(ctx)
+	managed, tombstones, _, err := d.listAllManagedSnapshots(ctx)
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, mock.listAllCalls, "the recursive snapshot listing must be issued exactly once per pass")

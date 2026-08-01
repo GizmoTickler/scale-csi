@@ -662,7 +662,7 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 	// snapshot is driver-proven (it carries the ledger entry written above), so
 	// releasing never strips a hold the driver does not own (R2).
 	d.releaseCSISnapshotHoldIfEnabled(ctx, deleteID)
-	if err := d.truenasClient.SnapshotDelete(ctx, deleteID, true, false); err != nil {
+	if err := d.destroyDriverSnapshot(ctx, deleteID, true, false); err != nil {
 		if truenas.IsNotFoundError(err) {
 			d.removeTombstoneLedgerEntry(ctx, deleteID)
 			return nil

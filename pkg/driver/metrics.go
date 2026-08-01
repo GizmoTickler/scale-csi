@@ -348,6 +348,50 @@ var (
 		},
 	)
 
+	// scheduledSnapshotTaskDeleteFailedTotal counts DeleteVolume calls whose
+	// driver-owned periodic-snapshot task could not be removed (GF2-fix/H2). The
+	// volume delete proceeds regardless — a task must never wedge a delete — so
+	// this is the operator's signal that the stranded-task sweep has work to do.
+	scheduledSnapshotTaskDeleteFailedTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshot_task_delete_failed_total",
+			Help:      "Total DeleteVolume calls whose driver-managed periodic-snapshot task could not be deleted (delete proceeded anyway)",
+		},
+	)
+
+	// strandedSnapshotTasksReapedTotal counts periodic-snapshot tasks the orphan
+	// reconcile reclaimed because their volume dataset no longer exists.
+	strandedSnapshotTasksReapedTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "stranded_snapshot_tasks_reaped_total",
+			Help:      "Total stranded driver-managed periodic-snapshot tasks deleted by the orphan reconcile",
+		},
+	)
+
+	// snapshotHoldRecoveriesTotal counts destroys that were refused by a ZFS hold
+	// and recovered by an UNCONDITIONAL release + retry (GF2-fix/H4). A non-zero
+	// value means holds outlived the flag that placed them — the rollback case.
+	snapshotHoldRecoveriesTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "snapshot_hold_recoveries_total",
+			Help:      "Total driver destroys refused by a ZFS hold and recovered by an unconditional release",
+		},
+	)
+
+	// clonePromotesRefusedTotal counts promote candidates the eligibility gates
+	// refused, by reason (GF2-fix/H1, H3).
+	clonePromotesRefusedTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "clone_promotes_refused_total",
+			Help:      "Total clone-promote candidates refused by an eligibility gate, by reason",
+		},
+		[]string{"reason"},
+	)
+
 	// clonesPromotedTotal counts background promote operations (GF2/E3) by
 	// outcome. A promote releases a clone-restored volume's origin-snapshot pin so
 	// the tombstone reaper can reclaim the source snapshot.
@@ -571,6 +615,7 @@ func init() {
 	}
 	clonesPromotedTotal.WithLabelValues("success").Add(0)
 	clonesPromotedTotal.WithLabelValues("error").Add(0)
+	clonePromotesRefusedTotal.WithLabelValues("live_csi_snapshot_would_migrate").Add(0)
 }
 
 // RecordCSIOperation records metrics for a CSI operation
@@ -715,6 +760,30 @@ func RecordScheduledSnapshotTaskEnsureFailed() {
 	scheduledSnapshotTaskEnsureFailedTotal.Inc()
 }
 
+// RecordScheduledSnapshotTaskDeleteFailed counts a DeleteVolume whose
+// periodic-snapshot task could not be removed (GF2-fix/H2).
+func RecordScheduledSnapshotTaskDeleteFailed() {
+	scheduledSnapshotTaskDeleteFailedTotal.Inc()
+}
+
+// RecordStrandedSnapshotTaskReaped counts a stranded periodic-snapshot task the
+// orphan reconcile reclaimed (GF2-fix/H2).
+func RecordStrandedSnapshotTaskReaped() {
+	strandedSnapshotTasksReapedTotal.Inc()
+}
+
+// RecordSnapshotHoldRecovery counts a destroy that a ZFS hold refused and an
+// unconditional release recovered (GF2-fix/H4).
+func RecordSnapshotHoldRecovery() {
+	snapshotHoldRecoveriesTotal.Inc()
+}
+
+// RecordClonePromoteRefused counts a promote candidate an eligibility gate
+// refused (GF2-fix/H1, H3).
+func RecordClonePromoteRefused(reason string) {
+	clonePromotesRefusedTotal.WithLabelValues(reason).Inc()
+}
+
 // RecordClonePromoted counts a background promote operation and its outcome
 // (GF2/E3).
 func RecordClonePromoted(err error) {
@@ -745,8 +814,7 @@ func volumeUsageNearQuota(usage *truenas.DatasetQuotaUsage) bool {
 	return usage.Used*100 > quota*95
 }
 
-// RecordVolumeUsage publishes the per-volume quota/usage gauges (GF2/E4) from a
-// ControllerGetVolume usage read.
+// RecordVolumeUsage publishes the per-volume quota/usage gauges (GF2/E4).
 func RecordVolumeUsage(volumeID string, usage *truenas.DatasetQuotaUsage) {
 	volumeUsedBytes.WithLabelValues(volumeID).Set(float64(usage.Used))
 	volumeQuotaBytes.WithLabelValues(volumeID).Set(float64(effectiveQuotaBytes(usage)))
@@ -755,6 +823,27 @@ func RecordVolumeUsage(volumeID string, usage *truenas.DatasetQuotaUsage) {
 		near = 1.0
 	}
 	volumeNearQuota.WithLabelValues(volumeID).Set(near)
+}
+
+// DeleteVolumeUsageMetrics drops a volume's per-volume usage series (GF2-fix/F6).
+// Without this the gauges LATCH: a volume observed once at 96% kept
+// near_quota=1 forever — a permanently firing alert plus unbounded label
+// cardinality over the cluster's lifetime, because nothing ever re-observed a
+// deleted volume.
+func DeleteVolumeUsageMetrics(volumeID string) {
+	volumeUsedBytes.DeleteLabelValues(volumeID)
+	volumeQuotaBytes.DeleteLabelValues(volumeID)
+	volumeNearQuota.DeleteLabelValues(volumeID)
+}
+
+// ResetVolumeUsageMetrics clears every per-volume usage series. The reconcile
+// pass calls it before republishing from its own dataset walk, so a volume that
+// has disappeared (or whose usage fell back below the threshold) cannot leave a
+// stale latched series behind.
+func ResetVolumeUsageMetrics() {
+	volumeUsedBytes.Reset()
+	volumeQuotaBytes.Reset()
+	volumeNearQuota.Reset()
 }
 
 // SetOrphanReconcileMetrics publishes the latest detection report, including a

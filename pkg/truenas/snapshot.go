@@ -440,7 +440,53 @@ func isSnapshotAlreadyHeldError(err error) bool {
 		return errno == syscall.EEXIST
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "lzc_hold") && strings.Contains(message, "17")
+	return strings.Contains(message, "lzc_hold") && lzcErrnoMatches(message, 17)
+}
+
+// lzcErrnoTuplePattern matches the errno POSITION of a libzfs_core traceback,
+// e.g. `('lzc_hold() failed', (…, 17))` or `lzc_hold() failed: errno 17`. The
+// errno must sit in a tuple-tail or explicit `errno N` position, so a digit run
+// that merely appears inside the snapshot path can never be mistaken for it —
+// PVC names are UUIDs and routinely contain "17" (e.g. `pvc-17a3…`), which the
+// previous bare substring match would have reported as "already held" for ANY
+// lzc_hold failure on such a snapshot (GF2-fix/F9).
+var lzcErrnoTuplePattern = regexp.MustCompile(`errno\D{0,3}(\d+)|,\s*(\d+)\s*\)`)
+
+// lzcErrnoMatches reports whether an lzc_* traceback message carries exactly
+// the given errno in an errno-shaped position.
+func lzcErrnoMatches(message string, want int) bool {
+	for _, match := range lzcErrnoTuplePattern.FindAllStringSubmatch(message, -1) {
+		for _, group := range match[1:] {
+			if group == "" {
+				continue
+			}
+			if value, err := strconv.Atoi(group); err == nil && value == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsSnapshotHeldError reports whether a destroy failed BECAUSE the snapshot (or
+// one under a recursively destroyed dataset) still carries a ZFS hold. TrueNAS
+// surfaces this as EBUSY with a "has the following holds: truenas" message (P1).
+//
+// This is what makes hold/release fail-safe against configuration history
+// (GF2-fix/H4): holds are backend state that outlives the zfs.holdCsiSnapshots
+// flag, so a driver whose flag was turned back OFF must still be able to destroy
+// its OWN previously-held snapshots. Callers use it to trigger an unconditional
+// release-and-retry — which costs zero extra API calls on the default path,
+// because a deployment that never held anything never sees this error.
+func IsSnapshotHeldError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errno, ok := APIErrno(err); ok && errno == syscall.EBUSY {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "has the following holds")
 }
 
 // isSnapshotNotHeldError treats releasing a non-held snapshot as success: an

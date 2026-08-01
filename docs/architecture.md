@@ -241,13 +241,30 @@ The driver leverages native ZFS capabilities:
   drop its origin-snapshot pin once it is the **sole dependent** of that origin,
   making the restored volume lifecycle-independent and letting the tombstone
   reaper reclaim the source snapshot (and the source volume become destroyable).
-  Promote is a single atomic ZFS operation that MOVES the origin snapshot onto
-  the promoted clone and re-parents any sibling clones — so it is gated on
-  sole-dependency and is idempotent (an already-independent dataset has an empty
-  origin and is skipped). The tombstone ledger self-heals across the promote ID
-  migration: an entry keyed by the pre-promote snapshot ID resolves to NotFound
-  and is retired as already-gone, while the migrated tombstone stays reaped under
-  the promoted dataset's ownership stamp.
+  Promote is a single atomic ZFS operation, but it is far from a simple unpin: it
+  MOVES the origin snapshot **and every snapshot older-or-equal to it** onto the
+  promoted clone, re-parents all sibling clones, and re-parents the SOURCE dataset
+  itself onto the promoted one. The step therefore refuses unless every gate
+  holds, all re-proven under the clone's and the source volume's operation locks
+  immediately before the call:
+  - the candidate is re-read with a source-bearing `pool.dataset.query` (the
+    reconcile listing's `zfs.resource.query` projection carries no property
+    source, so the ownership stamp cannot be proven from it);
+  - the authoritative `pool.dataset.query` origin projection shows this clone is
+    the **sole** dependent of the origin snapshot — including unmanaged clones
+    under the CSI parent that the driver's managed-dataset listing never sees;
+  - no OTHER live CSI VolumeSnapshot is in the migrating set. Such a snapshot's
+    backend ID would silently change, so `SnapshotGet` of its recorded ID would
+    404 and `DeleteSnapshot` would report success while it persisted forever;
+  - every migrating tombstone's ledger entry is RE-KEYED to its post-promote ID
+    **before** the promote, so the reaper's provenance follows the snapshot.
+    (Writing the new key first is the crash-safe order: a ledger entry whose
+    snapshot does not exist is what the age-gated ledger sweep retires, whereas a
+    migrated tombstone with no entry would be unreapable forever.)
+
+  Residual, documented limitation: a clone living OUTSIDE the CSI parent subtree
+  is invisible to every TrueNAS 26.0 API (snapshots no longer expose `clones`),
+  so it cannot be counted by the sole-dependent gate.
 
 ## Volume ID Format
 

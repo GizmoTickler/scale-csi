@@ -32,25 +32,56 @@ removal-only configmap render + a render-assert in the same commit.
   with bounded TIME-based retention (`snapshotRetention`, default 30d safety
   bound; 26.0 has no count cap and `pool.snapshottask.run` is broken, so it is
   never called). Task-created snapshots carry no CSI props and are recognized as
-  driver-owned (naming-schema prefix on a driver-owned dataset): excluded from
-  the foreign guard, deleted with the volume, and counted in
-  `scale_csi_scheduled_snapshots` (never an orphan/delete candidate). Controller
-  defaults: `zfs.snapshotSchedule` / `zfs.snapshotRetention`. Metrics:
+  driver-owned ONLY through a complete ownership chain: the snapshot sits on the
+  volume's own dataset, that dataset carries this instance's local ownership
+  stamp plus a naming schema the driver's own algorithm re-derives byte-for-byte
+  for this volume (`csi-<volume>-<16-hex nonce>-%Y%m%d-%H%M%S`, minted by the
+  driver — there is deliberately no caller-chosen `snapshotNamingSchema`), and
+  the snapshot's name is a complete rendering of that schema. Proven snapshots are
+  excluded from the foreign guard and deleted with the volume; anything
+  unprovable stays FOREIGN and is preserved. Counted in
+  `scale_csi_scheduled_snapshots` (never an orphan/delete candidate). The schema
+  binding is stamped BEFORE the task is created, so a task can never outlive its
+  binding, and the orphan reconcile sweeps tasks whose dataset is gone.
+  Controller defaults: `zfs.snapshotSchedule` / `zfs.snapshotRetention`. Metrics:
   `scale_csi_scheduled_snapshot_tasks_ensured_total`,
-  `scale_csi_scheduled_snapshot_task_ensure_failed_total`.
+  `scale_csi_scheduled_snapshot_task_ensure_failed_total`,
+  `scale_csi_scheduled_snapshot_task_delete_failed_total`,
+  `scale_csi_stranded_snapshot_tasks_reaped_total`.
 - **E3 — Lazy clone independence (`zfs.promoteRestoredClones`).** A background
   reconcile step promotes a clone-restored volume (`pool.dataset.promote`) to
-  drop its origin-snapshot pin once it is the sole dependent of that origin,
-  letting the tombstone reaper reclaim the source snapshot. Promote is atomic,
-  idempotent, and gated on sole-dependency (it re-parents siblings). The tombstone
-  ledger self-heals across the promote ID migration. Metrics:
-  `scale_csi_clones_promoted_total{status}`.
+  drop its origin-snapshot pin, letting the tombstone reaper reclaim the source
+  snapshot and the source volume become destroyable. Promote is atomic but it
+  MOVES the origin and every older-or-equal snapshot and re-parents siblings AND
+  the source, so every gate is re-proven under the clone's and source volume's
+  operation locks immediately before the call: a fresh source-bearing dataset
+  read (the reconcile listing carries no property source), the AUTHORITATIVE
+  per-snapshot dependent-clone query (which sees unmanaged clones the managed
+  listing never contained), a refusal if any OTHER live CSI VolumeSnapshot would
+  migrate, and a RE-KEY of every migrating tombstone's ledger entry to its
+  post-promote ID before the promote so provenance follows the snapshot. Metrics:
+  `scale_csi_clones_promoted_total{status}`,
+  `scale_csi_clone_promotes_refused_total{reason}`.
 - **E4 — Quota/usage reporting (`zfs.reportVolumeUsage`).** ControllerGetVolume
   fetches each volume's quota/usage (one `pool.dataset.query`) and reports a
-  near-quota VolumeCondition (abnormal above 95% of the effective quota) plus
-  per-volume metrics. Metrics: `scale_csi_volume_used_bytes{volume}`,
+  near-quota VolumeCondition (abnormal above 95% of the effective quota). The
+  per-volume gauges are ALSO published from the reconcile pass's existing dataset
+  walk (zero extra API calls), because the shipped external-health-monitor
+  sidecar drives ListVolumes rather than per-PV ControllerGetVolume — without
+  that the `ScaleCSIVolumeNearQuota` alert would essentially never fire. Series
+  are dropped at DeleteVolume and re-derived each pass, so a gauge cannot latch.
+  Metrics: `scale_csi_volume_used_bytes{volume}`,
   `scale_csi_volume_quota_bytes{volume}`, `scale_csi_volume_near_quota{volume}`,
   and the `ScaleCSIVolumeNearQuota` alert.
+
+**Lifecycle safety notes.** Snapshot-hold release is fail-safe against
+configuration history: any driver destroy refused with `EBUSY` ("has the
+following holds") releases the hold UNCONDITIONALLY and retries once — including
+the recursive `DeleteVolume` destroy, which first releases the holds on
+driver-proven snapshots beneath the dataset — so turning `zfs.holdCsiSnapshots`
+back off never wedges an already-held snapshot, and the default path still makes
+zero extra calls. `docs/production.md` carries the mass-release rollback runbook.
+Counter: `scale_csi_snapshot_hold_recoveries_total`.
 
 ## v1.4.0 — CHAP, capacity, volume health, clone latency, observability taxonomy
 

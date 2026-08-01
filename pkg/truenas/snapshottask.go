@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // SnapshotTask is a TrueNAS periodic-snapshot task (pool.snapshottask.*). The
@@ -48,19 +49,38 @@ func (c *Client) SnapshotTaskCreate(ctx context.Context, params *SnapshotTaskCre
 	return &task, nil
 }
 
-// SnapshotTaskFindByDataset returns the periodic-snapshot task scoped to dataset,
-// or nil when none exists. It is the idempotency probe CreateVolume uses before
-// creating a task so a retry does not duplicate tasks.
-func (c *Client) SnapshotTaskFindByDataset(ctx context.Context, dataset string) (*SnapshotTask, error) {
+// SnapshotTaskListByDataset returns EVERY periodic-snapshot task scoped to
+// dataset. It deliberately returns the full list rather than "the first task":
+// a dataset may legitimately carry a pre-existing FOREIGN task alongside the
+// driver's own, and the caller must select its own by naming-schema provenance
+// rather than adopting whichever task the backend happens to return first
+// (GF2-fix/H2 — first-match adoption both mis-adopted foreign tasks and later
+// authorized deleting them at DeleteVolume as if the driver owned them).
+func (c *Client) SnapshotTaskListByDataset(ctx context.Context, dataset string) ([]*SnapshotTask, error) {
 	filters := [][]interface{}{{"dataset", "=", dataset}}
+	return c.snapshotTaskQuery(ctx, filters, "dataset "+dataset)
+}
+
+// SnapshotTaskListByParent returns every periodic-snapshot task whose dataset
+// lives below parentDataset. It is the input to the stranded-task sweep
+// (GF2-fix/H2): a task whose volume dataset is gone can only be found this way,
+// because no dataset is left to carry its binding property.
+func (c *Client) SnapshotTaskListByParent(ctx context.Context, parentDataset string) ([]*SnapshotTask, error) {
+	prefix := strings.TrimSuffix(parentDataset, "/") + "/"
+	filters := [][]interface{}{{"dataset", "^", prefix}}
+	return c.snapshotTaskQuery(ctx, filters, "parent "+parentDataset)
+}
+
+func (c *Client) snapshotTaskQuery(ctx context.Context, filters [][]interface{}, scope string) ([]*SnapshotTask, error) {
 	var tasks []SnapshotTask
 	if err := callTyped(ctx, c, &tasks, "pool.snapshottask.query", filters, map[string]interface{}{}); err != nil {
-		return nil, fmt.Errorf("failed to query snapshot tasks for dataset %s: %w", dataset, err)
+		return nil, fmt.Errorf("failed to query snapshot tasks for %s: %w", scope, err)
 	}
-	if len(tasks) == 0 {
-		return nil, nil
+	out := make([]*SnapshotTask, 0, len(tasks))
+	for i := range tasks {
+		out = append(out, &tasks[i])
 	}
-	return &tasks[0], nil
+	return out, nil
 }
 
 // SnapshotTaskUpdate updates an existing periodic-snapshot task in place.

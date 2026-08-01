@@ -53,7 +53,12 @@ type MockClient struct {
 	SnapshotHoldCalls          int
 	SnapshotReleaseCalls       int
 	snapshotHolds              map[string]struct{}
+	nextSnapshotCreateTXG      uint64
 	nextReplicationJobID       int64
+
+	// FailUserPropertyKeys makes DatasetSetUserProperties fail for these exact
+	// property keys (test hook for binding-write failures).
+	FailUserPropertyKeys map[string]struct{}
 
 	// Error injection
 	InjectError error
@@ -425,6 +430,23 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 			}
 		}
 	}
+	// A recursive destroy cannot remove a HELD snapshot: ZFS returns EBUSY for
+	// the whole operation (P1). Modeling this is what makes the DeleteVolume
+	// held-tombstone recovery path testable — the previous mock silently deleted
+	// held snapshots and hid the wedge entirely (GF2-fix/H4).
+	if recursive {
+		for snapshotID, snapshot := range m.Snapshots {
+			if snapshot.Dataset != name {
+				continue
+			}
+			if _, held := m.snapshotHolds[snapshotID]; held {
+				return &APIError{
+					Code:    int(syscall.EBUSY),
+					Message: fmt.Sprintf("'%s' has the following holds: truenas", snapshotID),
+				}
+			}
+		}
+	}
 	origin := ""
 	if dataset, ok := m.Datasets[name]; ok {
 		origin = datasetPropertyString(dataset.Origin)
@@ -598,11 +620,18 @@ func (m *MockClient) DatasetHasDependentClones(ctx context.Context, datasetName 
 	return false, nil
 }
 
-// DatasetPromote models pool.dataset.promote (P3): the promoted clone becomes
-// independent (its origin is cleared), the origin snapshot MIGRATES onto the
-// promoted clone (its dataset/ID change), and every sibling clone whose origin
-// was that snapshot is re-parented onto the migrated snapshot. This is the
-// dependency inversion the ledger self-heal (R3) must survive.
+// DatasetPromote models pool.dataset.promote with FULL live fidelity (P3):
+//
+//   - the promoted clone becomes independent (its origin is cleared);
+//   - EVERY snapshot of the source dataset older-or-equal to the origin
+//     (createtxg <= the origin's) MIGRATES onto the promoted clone — not just
+//     the origin. Real ZFS moves the whole older-or-equal set, which is exactly
+//     how an unrelated LIVE CSI VolumeSnapshot silently changes backend ID
+//     (GF2-fix/H1). The previous mock migrated only the origin, so no test could
+//     observe that class of defect;
+//   - the SOURCE dataset itself is re-parented onto the migrated origin (the
+//     live-probed dependency inversion), as is every sibling clone;
+//   - holds and deferred markers travel with each migrated snapshot (P1).
 func (m *MockClient) DatasetPromote(ctx context.Context, datasetName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -620,31 +649,68 @@ func (m *MockClient) DatasetPromote(ctx context.Context, datasetName string) err
 	}
 	m.DatasetPromoteCalls = append(m.DatasetPromoteCalls, datasetName)
 
-	_, originSnapName, _ := strings.Cut(origin, "@")
+	sourceDataset, originSnapName, _ := strings.Cut(origin, "@")
 	migratedID := datasetName + "@" + originSnapName
 
-	// Migrate the origin snapshot object intact onto the promoted clone.
+	originTXG := uint64(0)
 	if snap, ok := m.Snapshots[origin]; ok {
-		delete(m.Snapshots, origin)
+		originTXG = snap.CreateTXG
+	}
+
+	for id, snap := range m.Snapshots {
+		if snap.Dataset != sourceDataset {
+			continue
+		}
+		olderOrEqual := snap.CreateTXG != 0 && originTXG != 0 && snap.CreateTXG <= originTXG
+		if id != origin && !olderOrEqual {
+			continue
+		}
+		newID := datasetName + "@" + snap.Name
+		delete(m.Snapshots, id)
 		snap.Dataset = datasetName
-		snap.Name = originSnapName
-		snap.ID = migratedID
-		m.Snapshots[migratedID] = snap
-		// Carry a hold across the migration (P1: holds survive rename/promote).
-		if _, held := m.snapshotHolds[origin]; held {
-			delete(m.snapshotHolds, origin)
-			m.snapshotHolds[migratedID] = struct{}{}
+		snap.ID = newID
+		m.Snapshots[newID] = snap
+		if _, held := m.snapshotHolds[id]; held {
+			delete(m.snapshotHolds, id)
+			m.snapshotHolds[newID] = struct{}{}
+		}
+		if _, deferred := m.deferredSnapshots[id]; deferred {
+			delete(m.deferredSnapshots, id)
+			m.deferredSnapshots[newID] = struct{}{}
 		}
 	}
 
-	// Re-parent sibling clones (and clear the promoted clone's own origin).
+	// Re-parent sibling clones onto the migrated origin.
 	for _, other := range m.Datasets {
 		if datasetPropertyString(other.Origin) == origin {
 			other.Origin = DatasetProperty{Value: migratedID, Parsed: migratedID, Rawvalue: migratedID, Source: "LOCAL"}
 		}
 	}
+	// The SOURCE itself becomes a clone of the promoted dataset (P3 inversion).
+	if source, ok := m.Datasets[sourceDataset]; ok && source != ds {
+		source.Origin = DatasetProperty{Value: migratedID, Parsed: migratedID, Rawvalue: migratedID, Source: "LOCAL"}
+	}
 	ds.Origin = DatasetProperty{}
 	return nil
+}
+
+// SnapshotDependentClones mirrors the real client's authoritative per-snapshot
+// dependent-clone query: it walks ALL datasets, not only driver-managed ones,
+// so a test can seed an unmanaged sibling clone and see it counted.
+func (m *MockClient) SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	var clones []string
+	for name, dataset := range m.Datasets {
+		if datasetPropertyString(dataset.Origin) == snapshotID {
+			clones = append(clones, name)
+		}
+	}
+	sort.Strings(clones)
+	return clones, nil
 }
 
 func (m *MockClient) DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error) {
@@ -685,6 +751,14 @@ func (m *MockClient) DatasetSetUserProperties(ctx context.Context, name string, 
 	m.setUserPropertiesCalls++
 	if m.InjectError != nil {
 		return m.InjectError
+	}
+	// FailUserPropertyKeys lets a test reproduce a partial/failed binding write
+	// for a specific property, which is how the create-then-stamp orderings that
+	// strand backend objects are exercised.
+	for key := range properties {
+		if _, fail := m.FailUserPropertyKeys[key]; fail {
+			return &APIError{Code: -1, Message: "injected user-property write failure for " + key}
+		}
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
@@ -772,10 +846,16 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 		return nil, m.InjectError
 	}
 	id := fmt.Sprintf("%s@%s", dataset, name)
+	// Model ZFS's monotonic, never-reused creation transaction group. Promote's
+	// "migrate every snapshot older-or-equal to the origin" semantics are defined
+	// in terms of createtxg, so the mock must issue one per snapshot or that
+	// behavior cannot be modeled faithfully (GF2-fix/H1).
+	m.nextSnapshotCreateTXG++
 	snap := &Snapshot{
-		ID:      id,
-		Name:    name,
-		Dataset: dataset,
+		ID:        id,
+		Name:      name,
+		Dataset:   dataset,
+		CreateTXG: m.nextSnapshotCreateTXG,
 		Properties: map[string]interface{}{
 			"creation": map[string]interface{}{"parsed": float64(time.Now().Unix())},
 		},
@@ -939,19 +1019,39 @@ func (m *MockClient) SnapshotTaskCreate(ctx context.Context, params *SnapshotTas
 	return task, nil
 }
 
-func (m *MockClient) SnapshotTaskFindByDataset(ctx context.Context, dataset string) (*SnapshotTask, error) {
+func (m *MockClient) SnapshotTaskListByDataset(ctx context.Context, dataset string) ([]*SnapshotTask, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	if m.InjectError != nil {
 		return nil, m.InjectError
 	}
+	var tasks []*SnapshotTask
 	for _, task := range m.SnapshotTasks {
 		if task.Dataset == dataset {
-			return task, nil
+			tasks = append(tasks, task)
 		}
 	}
-	return nil, nil
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
+	return tasks, nil
+}
+
+func (m *MockClient) SnapshotTaskListByParent(ctx context.Context, parentDataset string) ([]*SnapshotTask, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	prefix := strings.TrimSuffix(parentDataset, "/") + "/"
+	var tasks []*SnapshotTask
+	for _, task := range m.SnapshotTasks {
+		if strings.HasPrefix(task.Dataset, prefix) {
+			tasks = append(tasks, task)
+		}
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
+	return tasks, nil
 }
 
 func (m *MockClient) SnapshotTaskUpdate(ctx context.Context, id int, params *SnapshotTaskCreateParams) error {

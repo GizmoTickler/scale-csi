@@ -526,7 +526,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Create the driver-owned periodic-snapshot task (GF2/E2) now that the dataset
 	// exists and is owned/stamped for every path (fresh, clone, detached; NFS and
 	// block). A nil spec (the default) is a no-op; a task failure is non-fatal.
-	d.ensureSnapshotTask(ctx, datasetName, volumeID, vp.snapshotTask, req)
+	d.ensureSnapshotTask(ctx, createdDS, datasetName, volumeID, vp.snapshotTask, req)
 
 	// Get volume context for response
 	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType)
@@ -857,7 +857,7 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	// retry whose first attempt failed to create the task still converges. A nil
 	// spec (the default) is a no-op; FindByDataset adopts an existing task rather
 	// than duplicating it.
-	d.ensureSnapshotTask(ctx, datasetName, volumeID, vp.snapshotTask, req)
+	d.ensureSnapshotTask(ctx, existingDS, datasetName, volumeID, vp.snapshotTask, req)
 
 	volumeContext, ctxErr := d.getVolumeContext(ctx, existingDS, datasetName, shareType)
 	if ctxErr != nil {
@@ -1111,6 +1111,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// snapshots (GF2/E2) are recognized by their task naming-schema prefix and
 	// excluded here: they are deleted WITH the volume, never treated as foreign
 	// (R4).
+	// Delete the driver-owned periodic-snapshot task (GF2/E2) BEFORE the foreign
+	// guard runs (GF2-fix/H2): if the guard refuses, the task must already be gone
+	// so it cannot keep minting snapshots that make the next attempt refuse again
+	// — a self-sustaining wedge. Best-effort and never fatal; a repeated
+	// DeleteVolume simply finds no task.
+	d.deleteVolumeSnapshotTask(ctx, ds, datasetName, volumeID)
+
 	foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds)
 	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(foreignSnapshots) > 0 {
 		klog.Infof("Volume %s has non-CSI snapshots and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion", volumeID)
@@ -1151,26 +1158,11 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// Get origin snapshot property before deletion (for volume-to-volume clones)
 	// This snapshot was created during cloning and should be cleaned up after the clone is deleted
 	var originSnapshotID string
-	originPromotedAway := false
 	if ds != nil {
 		if prop, ok := ds.UserProperties[PropVolumeOriginSnapshot]; ok && prop.Value != "" && prop.Value != "-" {
 			originSnapshotID = prop.Value
-			// GF2/E3 (R3.3): promote migrates the origin snapshot onto the promoted
-			// clone and clears the dataset's live origin property. When the stored
-			// origin-snapshot id is present but the LIVE origin is now empty, the
-			// clone was promoted and the snapshot no longer lives where the stored
-			// id points — skip the cleanup rather than chase a migrated snapshot.
-			if datasetOriginSnapshotID(ds) == "" {
-				originPromotedAway = true
-			}
 		}
 	}
-
-	// Delete the driver-owned periodic-snapshot task (GF2/E2) BEFORE the dataset
-	// delete so the recursive destroy below removes the task-created snapshots and
-	// the task cannot fire again mid-delete. Best-effort: a failure never blocks
-	// DeleteVolume (the recursive delete removes the snapshots regardless).
-	d.deleteVolumeSnapshotTask(ctx, ds, datasetName)
 
 	// Try to delete dataset without recursive first to preserve snapshots
 	// This follows CSI spec: snapshots should survive after source volume deletion
@@ -1223,7 +1215,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 					"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
 			}
 			klog.V(4).Infof("Volume %s has non-managed snapshots, deleting recursively", volumeID)
-			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); delErr != nil {
+			if delErr := d.recursiveDatasetDeleteWithHoldRecovery(ctx, datasetName); delErr != nil {
 				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, delErr)
 				if isDatasetDependencyOrBusyError(delErr) {
 					return nil, status.Errorf(codes.FailedPrecondition,
@@ -1239,7 +1231,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 					"cannot verify snapshots for volume %s; refusing recursive delete: %v", volumeID, snapErr)
 			}
 			klog.V(4).Infof("Could not list snapshots for %s (%v), trying recursive delete", volumeID, snapErr)
-			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); delErr != nil {
+			if delErr := d.recursiveDatasetDeleteWithHoldRecovery(ctx, datasetName); delErr != nil {
 				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, delErr)
 				if isDatasetDependencyOrBusyError(delErr) {
 					return nil, status.Errorf(codes.FailedPrecondition,
@@ -1269,15 +1261,25 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 
 	// Clean up origin snapshot if this was a volume-to-volume clone
 	// The clone's dependency on the snapshot is now broken, so we can delete it
-	if originSnapshotID != "" && !originPromotedAway {
+	// NOTE (GF2-fix/F5): GF2 briefly added an ungated "origin promoted away" skip
+	// here. It was removed: deleteCloneOriginSnapshot already treats NotFound as
+	// success, so chasing a migrated origin snapshot is harmless, while the guard
+	// was the sprint's ONLY default-path behavior change (it fired for every
+	// volume-to-volume clone with all four GF2 flags off) and it failed OPEN —
+	// an absent origin property would have silently orphaned the temp
+	// clone-source snapshot with no tombstone and no ledger entry.
+	if originSnapshotID != "" {
 		klog.Infof("Cleaning up origin snapshot %s for deleted volume clone %s", originSnapshotID, volumeID)
 		if err := d.deleteCloneOriginSnapshot(ctx, originSnapshotID); err != nil {
 			klog.Errorf("Failed to delete origin snapshot %s: %v", originSnapshotID, err)
 			return nil, status.Errorf(codes.Internal, "failed to delete clone origin snapshot %s: %v", originSnapshotID, err)
 		}
-	} else if originPromotedAway {
-		klog.V(4).Infof("Skipping origin-snapshot cleanup for promoted clone %s: origin snapshot %s migrated away", volumeID, originSnapshotID)
 	}
+
+	// Drop the volume's per-volume usage series so a deleted volume cannot leave
+	// a latched near-quota gauge (and unbounded label cardinality) behind
+	// (GF2-fix/F6). A no-op when the feature never published one.
+	DeleteVolumeUsageMetrics(volumeID)
 
 	klog.Infof("Volume %s deleted successfully", volumeID)
 
@@ -1722,6 +1724,19 @@ func (d *Driver) releaseCSISnapshotHoldIfEnabled(ctx context.Context, snapshotID
 	if !d.config.ZFS.HoldCSISnapshots {
 		return
 	}
+	d.releaseCSISnapshotHold(ctx, snapshotID)
+}
+
+// releaseCSISnapshotHold releases UNCONDITIONALLY — regardless of
+// zfs.holdCsiSnapshots (GF2-fix/H4). Holds are backend state that outlives the
+// flag: flipping the flag back off (an ordinary Helm rollback) must never leave
+// previously-held CSI snapshots and tombstones undeletable by the driver, which
+// is exactly what a flag-gated release produced (EBUSY -> codes.Internal ->
+// infinite external-snapshotter retry, with the source volume's DeleteVolume
+// blocked behind it). Every caller has already provenance-proven the snapshot is
+// a driver CSI snapshot or tombstone, so this never strips a hold the driver
+// does not own (R2).
+func (d *Driver) releaseCSISnapshotHold(ctx context.Context, snapshotID string) {
 	if err := d.truenasClient.SnapshotRelease(ctx, snapshotID); err != nil {
 		RecordSnapshotHold(snapshotHoldOpRelease, err)
 		klog.Warningf("Failed to release deletion-proof hold on snapshot %s before destroy: %v", snapshotID, err)
@@ -1729,6 +1744,126 @@ func (d *Driver) releaseCSISnapshotHoldIfEnabled(ctx context.Context, snapshotID
 	}
 	RecordSnapshotHold(snapshotHoldOpRelease, nil)
 	klog.V(4).Infof("Released deletion-proof hold on snapshot %s before destroy", snapshotID)
+}
+
+// destroyDriverSnapshot destroys a snapshot the caller has already
+// provenance-proven the driver owns, recovering from a hold the CURRENT
+// configuration did not place (GF2-fix/H4).
+//
+// The flag-gated pre-release above saves a round trip while the feature is on.
+// This is the fail-safe underneath it: if the destroy still returns EBUSY "has
+// the following holds", the hold is released UNCONDITIONALLY and the destroy is
+// retried exactly once. On the default path (no hold was ever placed) that EBUSY
+// never occurs, so this adds zero API calls — the default-off invariant survives
+// while "turn the flag back off" stops being a permanent wedge.
+func (d *Driver) destroyDriverSnapshot(ctx context.Context, snapshotID string, defer_, recursive bool) error {
+	err := d.truenasClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
+	if err == nil || !truenas.IsSnapshotHeldError(err) {
+		return err
+	}
+	klog.Warningf("Destroy of driver-owned snapshot %s was refused by a ZFS hold; releasing unconditionally and retrying once", snapshotID)
+	RecordSnapshotHoldRecovery()
+	d.releaseCSISnapshotHold(ctx, snapshotID)
+	return d.truenasClient.SnapshotDelete(ctx, snapshotID, defer_, recursive)
+}
+
+// releaseHeldDriverSnapshotsUnder releases the hold on every snapshot beneath a
+// volume dataset that this driver can PROVE it owns: a live CSI snapshot
+// carrying this instance's identity, or a tombstone whose retained identity
+// re-derives through the production rename algorithm. Foreign snapshots are
+// never released (R2).
+//
+// It exists for the one destroy path that cannot release per snapshot — the
+// recursive DatasetDelete in DeleteVolume, where ZFS refuses the WHOLE operation
+// with EBUSY if any snapshot beneath the dataset is held. Without it a held
+// driver tombstone made its volume permanently undeletable. This is also the
+// only production wiring of SnapshotIsHeld, which was otherwise dead code
+// carried on ClientInterface.
+func (d *Driver) releaseHeldDriverSnapshotsUnder(ctx context.Context, datasetName string) int {
+	snapshots, err := d.truenasClient.SnapshotList(ctx, datasetName)
+	if err != nil {
+		klog.Warningf("Could not list snapshots of %s to clear driver-owned holds: %v", datasetName, err)
+		return 0
+	}
+	// The tombstone ledger is the driver's AUTHORITATIVE proof that it tombstoned
+	// a snapshot. It is read once, lazily, and only on this already-failed path:
+	// the retained-identity chain alone is not sufficient here because
+	// handleSnapshotClones attempts to strip those identity properties at rename.
+	var ledger map[string]tombstoneLedgerEntry
+	ledgerFor := func() map[string]tombstoneLedgerEntry {
+		if ledger != nil {
+			return ledger
+		}
+		ledger = make(map[string]tombstoneLedgerEntry)
+		reads := d.readBookkeepingDatasets(ctx, d.bookkeepingEnabled())
+		for key, entry := range tombstoneLedgerFromDataset(reads.parent) {
+			ledger[key] = entry
+		}
+		for key, entry := range tombstoneLedgerFromDataset(reads.child) {
+			ledger[key] = entry
+		}
+		return ledger
+	}
+
+	released := 0
+	for _, snap := range snapshots {
+		if snap == nil {
+			continue
+		}
+		owned := isCSISnapshot(snap) && snapshotCarriesInstanceIdentity(snap, d.driverInstanceID())
+		if !owned && isSnapshotTombstone(snap) {
+			if snapshotMatchesRetainedTombstoneIdentity(snap, d.driverInstanceID()) {
+				owned = true
+			} else if entry, recorded := ledgerFor()[tombstoneLedgerKey(snap.ID)]; recorded {
+				owned = tombstoneLedgerEntryMatchesSnapshot(entry, snap)
+			}
+		}
+		if !owned {
+			continue
+		}
+		held, heldErr := d.truenasClient.SnapshotIsHeld(ctx, snap.ID)
+		if heldErr != nil {
+			klog.Warningf("Could not read holds on driver-owned snapshot %s: %v", snap.ID, heldErr)
+			continue
+		}
+		if !held {
+			continue
+		}
+		RecordSnapshotHoldRecovery()
+		d.releaseCSISnapshotHold(ctx, snap.ID)
+		released++
+	}
+	return released
+}
+
+// recursiveDatasetDeleteWithHoldRecovery performs DeleteVolume's recursive
+// dataset destroy, recovering once from a driver-owned ZFS hold beneath it
+// (GF2-fix/H4). ZFS refuses the entire recursive destroy with EBUSY when any
+// snapshot under the dataset is held, and the per-snapshot release sites cannot
+// see those snapshots — so with holds enabled (or previously enabled and since
+// disabled) a held driver tombstone made its volume undeletable forever. Only
+// driver-proven snapshots are released; a hold on a foreign snapshot correctly
+// keeps the destroy refused. Zero extra calls unless the EBUSY actually happens.
+func (d *Driver) recursiveDatasetDeleteWithHoldRecovery(ctx context.Context, datasetName string) error {
+	err := d.truenasClient.DatasetDelete(ctx, datasetName, true, true)
+	if err == nil || !truenas.IsSnapshotHeldError(err) {
+		return err
+	}
+	if released := d.releaseHeldDriverSnapshotsUnder(ctx, datasetName); released == 0 {
+		return err
+	}
+	klog.Warningf("Recursive delete of %s was refused by ZFS holds on driver-owned snapshots; released them and retrying once", datasetName)
+	return d.truenasClient.DatasetDelete(ctx, datasetName, true, true)
+}
+
+// snapshotCarriesInstanceIdentity reports whether a snapshot's retained identity
+// names THIS driver instance.
+func snapshotCarriesInstanceIdentity(snap *truenas.Snapshot, instanceID string) bool {
+	if snap == nil || instanceID == "" {
+		return false
+	}
+	property, ok := snap.UserProperties[PropDriverInstanceID]
+	return ok && property.Value == instanceID
 }
 
 func (d *Driver) createSnapshotResponse(
@@ -1814,7 +1949,7 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 	// feature defaults off) releases to a no-op success.
 	d.releaseCSISnapshotHoldIfEnabled(ctx, snap.ID)
 
-	if err := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); err != nil {
+	if err := d.destroyDriverSnapshot(ctx, snap.ID, false, false); err != nil {
 		// Handle "not found" as success (idempotency)
 		if truenas.IsNotFoundError(err) {
 			klog.Infof("Snapshot %s already deleted", snapshotID)

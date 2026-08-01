@@ -2654,3 +2654,44 @@ func TestSnapshotHoldIdempotencyHelpers(t *testing.T) {
 	// A structured errno that is neither ENOENT nor a hold message is a real error.
 	assert.False(t, isSnapshotNotHeldError(&APIError{Code: 13, Message: "permission denied mentioning hold not"}))
 }
+
+// F9 — the already-held classifier matched a bare "17" ANYWHERE in the error
+// text. TrueNAS embeds the snapshot path in lzc_hold() tracebacks and PVC names
+// are UUIDs that routinely contain "17" (e.g. pvc-17a3…), so an lzc_hold()
+// failure with a completely different errno on such a snapshot was silently
+// reported as "already held": the operator believed the snapshot was
+// deletion-proof when it was not, and the metric recorded a success.
+func TestSnapshotAlreadyHeldErrnoIsPositionAnchored(t *testing.T) {
+	// A real EEXIST traceback: errno in tuple-tail position.
+	assert.True(t, isSnapshotAlreadyHeldError(&APIError{
+		Code:    -1,
+		Message: "[EFAULT] ('lzc_hold() failed', ('tank/csi/pvc-abc@s1', 17))",
+	}))
+	assert.True(t, isSnapshotAlreadyHeldError(&APIError{
+		Code:    -1,
+		Message: "lzc_hold() failed: errno 17",
+	}))
+
+	// A DIFFERENT errno on a snapshot whose PATH contains 17 must NOT be
+	// swallowed as already-held.
+	assert.False(t, isSnapshotAlreadyHeldError(&APIError{
+		Code:    -1,
+		Message: "[EFAULT] ('lzc_hold() failed', ('tank/csi/pvc-17a3b9de@snap-2017-01@s1', 13))",
+	}))
+	assert.False(t, isSnapshotAlreadyHeldError(&APIError{
+		Code:    -1,
+		Message: "[EFAULT] ('lzc_hold() failed', ('tank/csi/pvc-1717@s1', 5))",
+	}))
+}
+
+// IsSnapshotHeldError drives the unconditional release-and-retry that makes
+// hold/release fail-safe against a disabled flag (GF2-fix/H4).
+func TestIsSnapshotHeldError(t *testing.T) {
+	assert.False(t, IsSnapshotHeldError(nil))
+	assert.True(t, IsSnapshotHeldError(&APIError{Code: 16, Message: "boom"}))
+	assert.True(t, IsSnapshotHeldError(&APIError{
+		Code:    -1,
+		Message: "zfs.resource.snapshot.destroy: 'tank/csi/vol@s1' has the following holds: truenas",
+	}))
+	assert.False(t, IsSnapshotHeldError(&APIError{Code: -1, Message: "dataset has snapshots"}))
+}

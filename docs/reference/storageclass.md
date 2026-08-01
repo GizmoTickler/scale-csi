@@ -16,7 +16,6 @@ All protocols use the unified provisioner `csi.scale.io`.
 | `snapshotRestoreMode` | `clone` or `detached` — how a volume restored from a snapshot is materialized | No; default is `clone` unless the driver sets `zfs.detachedVolumesFromSnapshots` |
 | `snapshotSchedule` | Five-field cron (`minute hour dom month dow`) for a driver-managed periodic-snapshot task scoped to the volume (GF2/E2) | No; default is the controller-wide `zfs.snapshotSchedule` (empty = off) |
 | `snapshotRetention` | Bounded time-based retention for those snapshots, e.g. `24h`, `30d`, `2w`, `6M`, `1y` | No; default `zfs.snapshotRetention` (empty = 30d safety bound) |
-| `snapshotNamingSchema` | strftime naming schema for the scheduled snapshots | No; default `csi-%Y%m%d-%H%M%S-<volume>` |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -43,10 +42,25 @@ config default (chart value `zfs.detachedVolumesFromSnapshots`, default `false`
 Setting `snapshotSchedule` makes the driver own ONE non-recursive
 periodic-snapshot task scoped to each volume's dataset, so a PVC gets automatic
 point-in-time snapshots with bounded retention and no external scheduler or
-box-wide task covering the CSI parent. The task is created at `CreateVolume`,
-its id is stamped on the volume dataset, and it is removed at `DeleteVolume`
-(its snapshots are recognized as driver-owned and deleted with the volume, never
-treated as foreign). Retention is TIME-based only — TrueNAS 26.0 exposes no
+box-wide task covering the CSI parent. The task's naming schema is stamped on
+the volume dataset BEFORE the task is created (so a task can never outlive its
+binding), its id is stamped after, and it is removed at `DeleteVolume`.
+
+**There is no `snapshotNamingSchema` parameter, by design.** Task-created
+snapshots carry no CSI user properties (TrueNAS 26.0 cannot add properties to an
+existing snapshot), so the naming schema is the driver's ONLY ownership proof for
+them. The driver therefore mints the schema itself as
+`csi-<volume>-<16-hex nonce>-%Y%m%d-%H%M%S`. A snapshot is treated as
+driver-owned — and therefore deleted with the volume rather than protected by the
+foreign-snapshot guard — only when it sits on the volume's own dataset, that
+dataset carries this driver instance's local ownership stamp and a schema the
+driver's own algorithm re-derives byte-for-byte for this volume, and the
+snapshot's name is a complete rendering of that schema (same nonce, full strftime
+expansion). Anything else stays FOREIGN and is preserved by the default policy:
+an operator snapshot named `csi-preupgrade`, a box-wide task using a `csi-`
+schema, or a replication-inherited name is never destroyed by the driver.
+
+Retention is TIME-based only — TrueNAS 26.0 exposes no
 count cap — so an empty `snapshotRetention` resolves to a 30d safety bound and
 never grows unbounded snapshots. The feature is off until a schedule is set
 (per-SC parameter or the controller-wide `zfs.snapshotSchedule`).

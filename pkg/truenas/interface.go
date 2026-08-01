@@ -37,6 +37,7 @@ type ClientInterface interface {
 	DatasetExpand(ctx context.Context, name string, newSize int64) error
 	DatasetExists(ctx context.Context, name string) (bool, error)
 	DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error)
+	SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error)
 	DatasetPromote(ctx context.Context, datasetName string) error
 	DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error)
 	GetPoolAvailable(ctx context.Context, poolName string) (int64, error)
@@ -65,7 +66,8 @@ type ClientInterface interface {
 
 	// Snapshot task methods (GF2/E2 driver-managed periodic snapshots)
 	SnapshotTaskCreate(ctx context.Context, params *SnapshotTaskCreateParams) (*SnapshotTask, error)
-	SnapshotTaskFindByDataset(ctx context.Context, dataset string) (*SnapshotTask, error)
+	SnapshotTaskListByDataset(ctx context.Context, dataset string) ([]*SnapshotTask, error)
+	SnapshotTaskListByParent(ctx context.Context, parentDataset string) ([]*SnapshotTask, error)
 	SnapshotTaskUpdate(ctx context.Context, id int, params *SnapshotTaskCreateParams) error
 	SnapshotTaskDelete(ctx context.Context, id int) error
 

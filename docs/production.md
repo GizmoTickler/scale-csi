@@ -55,6 +55,60 @@ differ between TrueNAS API generations, so confirm a custom privilege against th
 API documentation served by the target appliance. See the TrueNAS
 [role reference][truenas-rbac].
 
+### Rollback runbook: releasing ZFS holds after disabling `zfs.holdCsiSnapshots`
+
+A ZFS hold is backend state that OUTLIVES the flag that placed it. The driver is
+fail-safe about this on its own paths — every destroy that comes back `EBUSY`
+("has the following holds") releases the hold unconditionally and retries once,
+and the recursive `DeleteVolume` destroy releases the holds on driver-proven
+snapshots beneath the dataset — so simply turning the flag back off does **not**
+wedge the lifecycle, and it costs zero extra API calls when nothing is held.
+
+Two cases still warrant an operator sweep:
+
+1. **Downgrading to a driver older than GF2**, which has no EBUSY recovery at
+   all. Release before the downgrade.
+2. **A persistent release failure** (a privilege that no longer permits
+   `pool.snapshot.release`), visible as a rising
+   `scale_csi_snapshot_holds_total{operation="release",status="error"}`.
+
+Mass-release every hold under the CSI parent from the appliance:
+
+```sh
+# List held snapshots under the CSI parent.
+midclt call pool.snapshot.query \
+  '[["dataset","^","<pool>/<parentDataset>/"]]' \
+  '{"extra": {"holds": true}}' | \
+  jq -r '.[] | select(.holds | length > 0) | .id'
+
+# Release them (review the list first — this strips the hold from every
+# snapshot it names, including any an operator placed deliberately).
+midclt call pool.snapshot.query \
+  '[["dataset","^","<pool>/<parentDataset>/"]]' \
+  '{"extra": {"holds": true}}' | \
+  jq -r '.[] | select(.holds | length > 0) | .id' | \
+  while read -r snap; do midclt call pool.snapshot.release "$snap"; done
+```
+
+`scale_csi_snapshot_hold_recoveries_total` counts destroys that a hold refused
+and an unconditional release recovered; a non-zero value means holds outlived the
+flag that placed them, which is exactly the case this runbook covers.
+
+### Rollback runbook: driver-managed periodic-snapshot tasks
+
+Disabling `zfs.snapshotSchedule` (or removing the per-SC `snapshotSchedule`)
+stops new tasks but leaves existing ones firing — harmlessly, since they are
+non-recursive and time-bounded. `DeleteVolume` still removes the task bound to a
+volume, and the orphan reconcile sweeps tasks whose dataset is gone (deletion
+gated by `reconcile.delete`, and only for tasks whose naming schema the driver's
+own algorithm re-derives — foreign tasks are never touched). To clear them
+manually:
+
+```sh
+midclt call pool.snapshottask.query '[["dataset","^","<pool>/<parentDataset>/"]]' | \
+  jq -r '.[] | select(.naming_schema | test("^csi-.*-[0-9a-f]{16}-%Y%m%d-%H%M%S$")) | .id'
+```
+
 > **Exclude the CSI parent from periodic-snapshot and replication tasks.** The
 > configured `zfs.parentDataset` subtree is exclusive driver territory. A
 > TrueNAS periodic-snapshot task (or a replication task's snapshots) that covers
