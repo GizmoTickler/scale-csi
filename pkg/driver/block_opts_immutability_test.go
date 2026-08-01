@@ -686,9 +686,18 @@ func TestUnstampedSourceRestoreIntoMatchingClassSucceeds(t *testing.T) {
 }
 
 // TestUnstampedSourceWithNoExtentIsNotAConflict covers the remaining shape: a
-// source that carries neither a stamp NOR a live extent (an NVMe-oF volume, or
-// one whose share objects are gone) yields no geometry to contradict, and the
-// restore must not be rejected on a guess.
+// source that carries neither a stamp NOR a live extent yields no geometry to
+// contradict, and the restore must not be rejected on a guess.
+//
+// WHAT IT DOES NOT PROVE (round 5, stated because the previous comment implied
+// otherwise): the source here is an explicitly EMPTY bare zvol with no CSI
+// bookkeeping at all, so it does not establish that "no stamp and no extent"
+// generally means data-free. It does not, and assuming it did was round-5 HIGH
+// (c). The general rule is the WITNESS SET, and the two tests that actually
+// exercise it are TestDetachedCopySentinelCountsAsBlockHistory (a dataset whose
+// extent-ID is the "-" sentinel holds somebody else's bytes and is refused) and
+// TestBareZvolWithNoWitnessIsStillDataFree (no witness at all, so the default is
+// honest). This one is the narrow no-regression pin for the empty case.
 func TestUnstampedSourceWithNoExtentIsNotAConflict(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()

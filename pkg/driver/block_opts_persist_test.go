@@ -395,6 +395,11 @@ func TestDefaultPathCreateVolumeStampsOnlyTheGeometryItGot(t *testing.T) {
 	// Pre-round-4 the rebuilt extent came back at the NEW default over the old
 	// data; now the volume answers for itself.
 	require.NoError(t, client.MockClient.ISCSIExtentDelete(ctx, extent.ID, false, true))
+	// Save/restore the driver config this test mutates. Nothing leaks today (each
+	// test builds its own driver), but a mutated controller default left behind by
+	// a test is exactly how the round-3 tautology was manufactured.
+	originalDefault := d.config.ISCSI.ExtentBlocksize
+	t.Cleanup(func() { d.config.ISCSI.ExtentBlocksize = originalDefault })
 	d.config.ISCSI.ExtentBlocksize = 4096
 	require.NoError(t, iscsiShareBackend{d}.EnsureShare(ctx, nil, "pool/parent/default-path", "default-path", nil))
 	rebuilt, err := client.ISCSIExtentFindByDisk(ctx, "zvol/pool/parent/default-path")
