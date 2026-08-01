@@ -1331,22 +1331,35 @@ func TestRebuildWithNoDiscoverableGeometryFailsClosed(t *testing.T) {
 // back-stamp is folded into the resource-ID dataset update the share builder
 // already performs, so learning a legacy volume's geometry is free — which is
 // what makes it acceptable to do it on the publish hot path.
+// THE TAUTOLOGY THIS REPLACES (round 5): the previous version asserted the
+// back-stamped value was "512" while the fixture's controller default WAS 512,
+// so an implementation that stamped the default instead of the live extent's
+// geometry would have passed identically. The volume is now created at 4096 and
+// the controller default is left at 512 for the publish, so 4096 in the stamp
+// can only have come from the live extent.
 func TestBackStampingAVolumeCostsNoExtraRoundTrip(t *testing.T) {
-	measure := func(t *testing.T, name string, stamp map[string]string) (int, map[string]int, *truenas.Dataset) {
+	measure := func(t *testing.T, name string, stripStamp bool) (int, map[string]int, *truenas.Dataset) {
 		t.Helper()
 		client := newAPICallCountingClient()
 		d := newAPICallCountDriver(t, client, "iscsi")
 		ctx := context.Background()
 		_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
 		require.NoError(t, err)
-		_, err = d.CreateVolume(ctx, apiCallCountVolumeRequest(name, "iscsi"))
+		req := apiCallCountVolumeRequest(name, "iscsi")
+		req.Parameters[paramISCSIBlocksize] = "4096"
+		req.Parameters[paramISCSIPblocksize] = "true"
+		_, err = d.CreateVolume(ctx, req)
 		require.NoError(t, err)
 		// Strip or keep the geometry record to make the two runs differ ONLY in
 		// whether the publish has something to learn.
-		if len(stamp) == 0 {
+		if stripStamp {
 			require.NoError(t, client.MockClient.DatasetRemoveUserProperties(ctx, "pool/parent/"+name,
 				[]string{PropBlockISCSIBlocksize, PropBlockISCSIPblocksize}))
 		}
+		// The controller default is something the live extent is NOT. Anything
+		// that stamps 512 stamped the default.
+		require.NotEqual(t, 4096, d.config.ISCSI.ExtentBlocksize,
+			"the controller default must differ from the volume's real geometry, or the assertion below proves nothing")
 		client.resetCalls()
 		require.NoError(t, iscsiShareBackend{d}.EnsureShare(ctx, nil, "pool/parent/"+name, name, nil))
 		total, methods := client.callSnapshot()
@@ -1355,14 +1368,16 @@ func TestBackStampingAVolumeCostsNoExtraRoundTrip(t *testing.T) {
 		return total, methods, ds
 	}
 
-	stampedTotal, stampedMethods, _ := measure(t, "already-stamped", map[string]string{"keep": "yes"})
-	legacyTotal, legacyMethods, legacyDS := measure(t, "legacy-unstamped", nil)
+	stampedTotal, stampedMethods, _ := measure(t, "already-stamped", false)
+	legacyTotal, legacyMethods, legacyDS := measure(t, "legacy-unstamped", true)
 
 	// It really did learn something — otherwise "it cost nothing" is trivially
 	// true and this test proves only that nothing happened.
 	require.NotNil(t, legacyDS)
-	assert.Equal(t, "512", legacyDS.UserProperties[PropBlockISCSIBlocksize].Value,
-		"the publish must have back-stamped the live extent's geometry onto the legacy volume")
+	assert.Equal(t, "4096", legacyDS.UserProperties[PropBlockISCSIBlocksize].Value,
+		"the publish must back-stamp the LIVE extent's geometry; 512 here is the controller default being stamped instead")
+	assert.Equal(t, "true", legacyDS.UserProperties[PropBlockISCSIPblocksize].Value,
+		"and the physical half with it — a half-stamped volume is refused on its next rebuild")
 	assert.Equal(t, stampedTotal, legacyTotal,
 		"and back-stamping it must cost exactly what re-ensuring an already-recorded volume costs")
 	assert.Equal(t, stampedMethods["DatasetSetUserProperties"], legacyMethods["DatasetSetUserProperties"],
@@ -1545,9 +1560,14 @@ func TestNoOptsHopCannotLaunderGeometry(t *testing.T) {
 // so "the restore came out at 4096" was the default echoing back and the
 // assertion could not fail. The helper now leaves the default where the caller
 // says, and this test shows the outcome tracks the SOURCE and not the default by
-// varying the default across three values while the source stays 4096. On a tree
-// where a no-opts restore inherits the default, exactly one of the three would
-// pass — which is the definition of a test that discriminates.
+// varying the default across three values while the source stays 4096.
+//
+// CORRECTION (round 5): the previous comment here claimed "exactly one of the
+// three would pass" on a tree where a no-opts restore inherits the default. That
+// was factually WRONG — none of 512/1024/2048 is 4096, so ALL THREE fail on such
+// a tree. The property is stronger than the comment claimed, and stating it
+// correctly matters: a reader who believes one subtest is expected to pass will
+// not notice when three do.
 func TestUnstampedSourceFixtureActuallyDiscriminates(t *testing.T) {
 	for _, controllerDefault := range []int{512, 1024, 2048} {
 		t.Run(fmt.Sprintf("controller default %d", controllerDefault), func(t *testing.T) {
