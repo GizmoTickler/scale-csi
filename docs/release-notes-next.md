@@ -41,27 +41,52 @@ removal-only configmap render + a render-assert in the same commit.
   on exactly that dataset, the snapshot's name is a complete CANONICAL rendering
   of that schema encoding a real calendar instant, and that instant is EXACTLY
   (±2s clock skew) when the snapshot was created — its `creation` property
-  rendered in the NAS's own civil timezone, read once from
-  `system.general.config` and cached off the CSI hot path (one-hour TTL, warmed
-  by the reconcile pass, dropped on reconnect; the image embeds `time/tzdata` so
-  zone resolution is identical in-container and in tests). Snapshots that pass
-  are excluded from the foreign guard and deleted with the volume; anything
-  unprovable stays FOREIGN and is preserved — including when the NAS timezone is
-  unreadable (`scale_csi_nas_timezone_unresolved_total`) or was CHANGED after the
-  snapshots were taken. Both fail CLOSED rather than widening the window.
-  **Documented trust boundary:** this chain does NOT establish "a snapshot the
-  driver did not create cannot be deleted". The schema is readable through
-  `pool.snapshottask.query` and TrueNAS 26.0 can neither stamp a property on an
-  existing snapshot nor attribute one to its task, so an actor with pool-write
-  access on the CSI parent can still construct an indistinguishable snapshot.
-  Storage-administrator access to `zfs.parentDataset` is trusted; everything
-  outside it (other tasks, replication, clone-inherited properties, `csi-`
-  prefixed operator snapshots, other volumes' schemas, other driver instances) is
-  provably never destroyed as driver-owned. See `docs/reference/storageclass.md`.
+  rendered in the NAS's own civil timezone. That zone is proven, not guessed:
+  the IANA zone in force when the TASK was created is recorded on the volume's
+  own dataset (`truenas-csi:snapshot_task_timezone`, write-once, read only when
+  `source == local`, so a clone/received/detached copy that inherits it proves
+  nothing), and the delete path requires it to still equal the NAS's LIVE
+  `system.general.config` zone. This is what makes the FACT of a timezone
+  reconfiguration detectable even when the civil fields coincide
+  (`America/New_York` -> `America/Toronto`, or a switch to a fixed `-05:00` for a
+  winter-created snapshot). There is no driver-level cache of the live zone; the
+  single cache lives on the API client, is dropped on reconnect, never caches a
+  failure, and has a short (5-minute) TTL. The image embeds `time/tzdata` so
+  zone resolution is identical in-container and in tests. A task is NEVER created
+  when the zone cannot be read, because its snapshots could never afterwards be
+  proven. Snapshots that pass are excluded from the foreign guard and deleted
+  with the volume; anything unprovable stays FOREIGN and is preserved — a
+  missing/inherited zone record, an unreadable live zone
+  (`scale_csi_nas_timezone_unresolved_total`), a stored-vs-live mismatch, or a
+  missing corroborating task all fail CLOSED rather than widening the window.
+  **Documented trust boundary — stated precisely, claiming nothing stronger:**
+  this chain does NOT establish "a snapshot the driver did not create cannot be
+  deleted", and TrueNAS 26.0 makes that unachievable in principle: it can
+  neither stamp a user property on an EXISTING snapshot nor attribute a snapshot
+  to the task that made it, so authorship is unprovable for a foreign snapshot
+  AND for the driver's own. (The alternative posture — treat every unprovable
+  snapshot as foreign — is unusable for exactly that reason: it would wedge the
+  DeleteVolume of every scheduled volume.) The predicate exists only to BLOCK
+  DeleteVolume's recursive destroy when something foreign is present, so the
+  residual is correspondingly narrow and bounded: **a foreign snapshot that
+  matches BOTH the driver-minted per-volume nonce-bearing name AND the creation
+  SECOND that name encodes will not block that destroy.** Constructing one
+  requires reading the schema (available through `pool.snapshottask.query`) and
+  pool-write access on the CSI parent dataset. Storage-administrator access to
+  `zfs.parentDataset` is therefore trusted; everything outside that one case
+  (other tasks, replication, clone-inherited properties, `csi-` prefixed
+  operator snapshots, other volumes' schemas, other driver instances, any name
+  that is off by a second) is provably never destroyed as driver-owned. See
+  `docs/reference/storageclass.md`.
   Counted in
   `scale_csi_scheduled_snapshots` (never an orphan/delete candidate). The schema
-  binding is stamped BEFORE the task is created, so a task can never outlive its
-  binding, and the orphan reconcile sweeps tasks whose dataset is gone.
+  binding — schema AND recorded zone — is stamped BEFORE the task is created, so
+  a task can never outlive its binding, and the orphan reconcile sweeps tasks
+  whose dataset is gone. DeleteVolume records its observation of the live task
+  (`truenas-csi:snapshot_task_corroboration`) and VERIFIES that record with a
+  source-bearing re-read BEFORE destroying the task; if the record does not land
+  the task is deliberately left alive, so a DeleteVolume that fails later can
+  still be retried instead of wedging behind the foreign guard forever.
   Controller defaults: `zfs.snapshotSchedule` / `zfs.snapshotRetention`. Metrics:
   `scale_csi_scheduled_snapshot_tasks_ensured_total`,
   `scale_csi_scheduled_snapshot_task_ensure_failed_total`,
@@ -84,7 +109,15 @@ removal-only configmap render + a render-assert in the same commit.
   buckets of the pass's snapshot partition (CSI snapshots, tombstones AND
   unowned), because ZFS migrates by `createtxg` and not by ownership; the only
   class allowed to migrate is a tombstone, whose provenance is explicitly
-  re-keyed. Metrics:
+  re-keyed. That set is also only as trustworthy as the listing it comes from,
+  and the snapshot query returns a bare slice with no total, page token or
+  completeness marker — a truncated result is indistinguishable from a complete
+  one, so "no error" is NOT completeness. Completeness is therefore established
+  POSITIVELY, by corroborating the pass's recursive parent walk against a second
+  authoritative dataset-scoped inventory taken under the lock; the two must
+  agree exactly on membership, and any disagreement, any unobtainable inventory,
+  or any missing `createtxg` REFUSES the promote rather than reasoning from a
+  set that might be short. Metrics:
   `scale_csi_clones_promoted_total{status}`,
   `scale_csi_clone_promotes_refused_total{reason}`.
 - **E4 — Quota/usage reporting (`zfs.reportVolumeUsage`).** ControllerGetVolume

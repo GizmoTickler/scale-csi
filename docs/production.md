@@ -124,11 +124,18 @@ midclt call pool.snapshottask.query '[["dataset","^","<pool>/<parentDataset>/"]]
 > **Changing the NAS timezone makes existing scheduled snapshots FOREIGN.** A
 > task renders its snapshot names from the NAS's civil clock, and the driver
 > proves ownership by converting each snapshot's `creation` property into that
-> same clock and demanding exact agreement. After a `system.general.config`
-> timezone change, snapshots taken under the old zone no longer agree, and the
-> driver preserves them rather than guessing — same remedy as above. Watch
-> `scale_csi_nas_timezone_unresolved_total` for the related live failure: while it
-> climbs the driver cannot read the zone at all, and every scheduled volume's
+> same clock and demanding exact agreement. The zone is not inferred from the
+> names: the driver records the IANA zone in force when the task was created
+> (`truenas-csi:snapshot_task_timezone`, on the volume's own dataset) and
+> requires it to still equal the NAS's live `system.general.config` value. So a
+> re-home is detected as a FACT, including the cases where the civil fields
+> happen to be identical (`America/New_York` -> `America/Toronto`, or a switch to
+> a fixed `-05:00` evaluated against a winter-created snapshot). After any such
+> change the affected volumes' scheduled snapshots become foreign and are
+> preserved rather than guessed at — same remedy as above (remove the snapshots,
+> or opt in per controller). Watch `scale_csi_nas_timezone_unresolved_total`: it
+> counts BOTH the live failure (the zone cannot be read at all) and the
+> stored-vs-live mismatch, and while it climbs every affected scheduled volume's
 > delete refuses (it never destroys).
 
 > **Exclude the CSI parent from periodic-snapshot and replication tasks.** The
@@ -343,6 +350,10 @@ backend loss.
   It returns `FailedPrecondition` until those snapshots are removed or the task
   excludes the CSI parent. Setting `zfs.destroyForeignSnapshotsOnDelete: true`
   explicitly permits recursive deletion of the dataset and those snapshots.
+  The opt-in authorizes destroying snapshots the driver has SEEN and classified;
+  it never authorizes a blind destroy. If the snapshot listing itself fails, the
+  delete refuses regardless of the setting, because an error is not evidence of
+  absence.
 - The default `nvmeof.subsystemAllowAnyHost: false` denies unlisted initiator
   NQNs. Populate `nvmeof.subsystemHosts` with each node's NVMe host NQN —
   obtained by running `nvme show-hostnqn` on the node (nvme-cli derives a

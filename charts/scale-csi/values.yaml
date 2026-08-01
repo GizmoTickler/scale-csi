@@ -274,6 +274,9 @@ zfs:
 
   # Allow DeleteVolume to recursively destroy snapshots not created by the CSI
   # driver. Keep false unless those snapshots are deliberately disposable.
+  # This authorizes destroying snapshots the driver has SEEN and classified; it
+  # is NOT a blind-destroy switch. When the snapshot listing itself fails, the
+  # delete refuses regardless of this setting.
   destroyForeignSnapshotsOnDelete: false
 
   # Place a deletion-proof ZFS hold (the fixed `truenas` tag) on every CSI

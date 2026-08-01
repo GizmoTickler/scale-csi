@@ -65,7 +65,10 @@ the foreign-snapshot guard — only when ALL of the following hold:
    timestamp is a real calendar instant; and
 6. that instant is EXACTLY when the snapshot was created — its own `creation`
    property, rendered in the NAS's own civil timezone, within a ±2 second
-   clock-skew allowance.
+   clock-skew allowance; and
+7. that timezone is the one RECORDED on the dataset when the task was created
+   (`truenas-csi:snapshot_task_timezone`, local source only) AND is still the
+   NAS's live zone.
 
 Anything else stays FOREIGN and is preserved by the default policy: an operator
 snapshot named `csi-preupgrade`, a box-wide task using a `csi-` schema, a
@@ -78,23 +81,39 @@ the NAS's LOCAL civil clock, while a snapshot's `creation` property is UTC epoch
 seconds. The driver therefore reads the NAS's zone from `system.general.config`
 (`timezone`, an IANA name) and converts `creation` into that civil clock —
 epoch → civil, which is total and unambiguous, so a DST fall-back repeated hour
-or spring-forward gap introduces no slack. The value is cached with a one-hour
-TTL, warmed by the background reconcile pass and dropped on reconnect, so no CSI
-operation pays a round trip for it, and an unscheduled volume never asks. The
-driver image embeds the IANA database in the binary (`time/tzdata`), so zone
-resolution behaves identically in the container and in tests.
+or spring-forward gap introduces no slack.
 
-Two timezone failure modes exist, and both **fail closed** — the snapshot is
+Reading only the CURRENT zone is not enough, because not every reconfiguration
+changes the civil fields: `America/New_York` → `America/Toronto` never does, and
+a switch to a fixed `-05:00` does not for a winter-created snapshot. So the zone
+in force when the TASK was created is WRITTEN DOWN on the volume's own dataset
+(`truenas-csi:snapshot_task_timezone`) and compared against the live value. It is
+write-once — a CreateVolume retry after a re-home must not overwrite the evidence
+— and it is read only when its ZFS source is `local`, so a clone, a
+replication-received dataset or a detached copy that merely INHERITS it proves
+nothing. A task is never created at all when the zone cannot be read, because its
+snapshots could never afterwards be proven.
+
+There is no driver-level cache of the live zone. The single cache lives on the
+API client, is dropped on reconnect, never caches a failure, and expires after 5
+minutes; only a scheduled volume's `DeleteVolume` asks for it, so the default
+path pays nothing. The driver image embeds the IANA database in the binary
+(`time/tzdata`), so zone resolution behaves identically in the container and in
+tests.
+
+Three timezone failure modes exist, and all **fail closed** — the snapshot is
 treated as foreign and PRESERVED, never destroyed:
 
 - the zone cannot be read (API failure, or a value that is not a loadable IANA
   zone). Watch `scale_csi_nas_timezone_unresolved_total`; while it is climbing, a
   scheduled volume's `DeleteVolume` returns `FailedPrecondition`.
-- the NAS's timezone was CHANGED after the snapshots were taken. Their names then
-  describe the old civil clock and no longer agree. The window is deliberately
-  NOT widened to absorb this: a false-foreign is a preserved snapshot, a
-  false-owned is deleted data. Remove the snapshots, or set
-  `zfs.destroyForeignSnapshotsOnDelete: true`, to let the delete proceed.
+- the dataset carries no locally-sourced recorded zone (including an inherited
+  one on a clone/received/detached copy).
+- the recorded zone and the NAS's live zone DIFFER — i.e. the NAS was re-homed
+  after the task was created. The window is deliberately NOT widened to absorb
+  this: a false-foreign is a preserved snapshot, a false-owned is deleted data.
+  Remove the snapshots, or set `zfs.destroyForeignSnapshotsOnDelete: true`, to
+  let the delete proceed.
 
 > **Trust boundary — stated plainly.** These checks do NOT establish "a snapshot
 > this driver did not create cannot be deleted", and no claim to that effect
@@ -111,15 +130,26 @@ treated as foreign and PRESERVED, never destroyed:
 > another volume's schema, another driver instance — is ever destroyed as if the
 > driver had made it.
 >
-> Reading the NAS timezone does not change that boundary; it only removes the
-> accidental-collision slack. The timestamp check accepts a fixed 5-second window
-> (±2s) around one specific instant, so a name whose timestamp was chosen
-> anywhere within a day agrees by chance with probability 5/86400 ≈ 5.8e-5 (over
-> a week, 8.3e-6, and it keeps shrinking with the range). The earlier design
-> accepted 241 of every 900 seconds — 26.8%, and that rate did not shrink with
-> range at all. It is still not literally zero: an actor who creates the snapshot
-> at the second its name encodes passes, which is precisely the
+> Reading (and pinning) the NAS timezone does not change that boundary; it only
+> removes the accidental-collision slack. The timestamp check accepts a fixed
+> 5-second window (±2s) around one specific instant, so a name whose timestamp
+> was chosen anywhere within a day agrees by chance with probability 5/86400 ≈
+> 5.8e-5 (over a week, 8.3e-6, and it keeps shrinking with the range). The
+> earlier design accepted 241 of every 900 seconds — 26.8%, and that rate did not
+> shrink with range at all. It is still not literally zero: an actor who creates
+> the snapshot at the second its name encodes passes, which is precisely the
 > storage-administrator case above and is unchanged by this.
+>
+> **Why this is WONTFIX and not a deferred fix.** Authorship is unprovable in
+> principle on TrueNAS 26.0: it can neither stamp a property on an existing
+> snapshot nor attribute one to the task that made it, so the driver cannot prove
+> authorship of its OWN scheduled snapshots either. The alternative posture —
+> treat every unprovable snapshot as foreign — would therefore wedge the
+> `DeleteVolume` of every scheduled volume, permanently. Because this predicate
+> exists solely to BLOCK the recursive destroy when something foreign is present,
+> the residual is exactly and only this: **a foreign snapshot that matches both
+> the nonce-bearing name and the creation second that name encodes will not block
+> the destroy.** Nothing in this repository may claim more than that.
 
 Retention is TIME-based only — TrueNAS 26.0 exposes no
 count cap — so an empty `snapshotRetention` resolves to a 30d safety bound and

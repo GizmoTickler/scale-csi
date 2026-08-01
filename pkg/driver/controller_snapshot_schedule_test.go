@@ -986,7 +986,11 @@ func TestDeleteVolumeRefusesBlindRecursiveDestroyWhenSnapshotListFails(t *testin
 // simply never deleting anything. An unchanged zone still deletes on the first
 // attempt, which is the whole point of the feature.
 //
-// PASSES on 9929315: compatibility guard, not a regression proof.
+// FAILS on 9929315, but for a WEAK reason, and that is worth being precise
+// about: its delete-succeeds claim holds on both sides; what fails there is only
+// the assertion that the zone was RECORDED locally on the dataset, a property
+// that does not exist at that commit. Treat this as a no-over-refusal control
+// plus a record-shape assertion, not as a safety proof.
 func TestDeleteVolumeStillAcceptsScheduledSnapshotWhenTheZoneIsUnchanged(t *testing.T) {
 	client := truenas.NewMockClient()
 	client.SystemTimezoneName = "America/New_York"
