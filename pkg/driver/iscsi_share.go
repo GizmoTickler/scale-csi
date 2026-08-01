@@ -92,10 +92,28 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	iscsiName := d.iscsiShareName(path.Base(datasetName))
 	diskPath := fmt.Sprintf("zvol/%s", datasetName)
 
-	// Resolved per-StorageClass block-protocol tuning (GF-Sprint 4). Nil when the
-	// StorageClass opted into nothing, in which case every field falls back to the
-	// controller default and provisioning is byte-identical to pre-GF4.
-	opts := blockOptsFromContext(ctx)
+	// Resolved per-volume block-protocol tuning (GF-Sprint 4), through the ONE
+	// resolver: request-scoped StorageClass opts (CreateVolume only) -> the
+	// volume's STORED dataset properties -> the controller default. This function
+	// is reached by four callers and only ONE of them (a fresh/replayed
+	// CreateVolume) carries request opts; ControllerPublishVolume, the startup
+	// attachment reconcile and DR/restore rebuilds do not. Reading the stored
+	// properties is what stops those paths from re-creating an absent extent at
+	// the 512 default over 4096-geometry data, and from dropping the stable
+	// serial / read-only / insecure_tpc / auth_networks / avail_threshold /
+	// qid_max / pi_enable the volume was provisioned with.
+	//
+	// Nil on both sides means nothing was ever opted into: byte-identical to
+	// pre-GF4.
+	requestOpts := blockOptsFromContext(ctx)
+	storedOpts := blockOptsFromDataset(ds)
+	// R-1, absent-extent half: a genuine StorageClass geometry change must fail
+	// closed BEFORE the extent is (re-)created, because on a rebuild there is no
+	// live extent left to compare against.
+	if guardErr := guardStoredBlockGeometry(storedOpts, requestOpts, datasetName); guardErr != nil {
+		return guardErr
+	}
+	opts := mergeBlockOpts(requestOpts, storedOpts)
 
 	// Step 2: Find or create target (idempotent)
 	var target *truenas.ISCSITarget
@@ -228,11 +246,16 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			return status.Errorf(codes.Internal, "failed to resolve iSCSI extent: %v", err)
 		}
 		if extent != nil {
-			// R-1: blocksize is immutable once an extent holds data. Reject a
-			// request whose resolved blocksize diverges from the existing extent
-			// rather than silently keeping a geometry that desyncs the
-			// StorageClass contract from the backend.
-			if guardErr := guardISCSIBlocksizeImmutability(extent, opts.resolvedISCSIBlocksize(d.config.ISCSI.ExtentBlocksize), datasetName); guardErr != nil {
+			// R-1, existing-extent half: blocksize is immutable once an extent
+			// holds data. Reject a request whose resolved blocksize diverges from
+			// the existing extent rather than silently keeping a geometry that
+			// desyncs the StorageClass contract from the backend.
+			//
+			// The comparison uses the OPINION (per-SC override, else the stored
+			// stamp), never the controller default. Defaulting here is what made a
+			// no-opts publish of a 4096 volume compare 4096 vs 512 and return
+			// FailedPrecondition forever.
+			if guardErr := guardISCSIBlocksizeImmutability(extent, opts.requestedISCSIBlocksize(), datasetName); guardErr != nil {
 				return guardErr
 			}
 			extentID = extent.ID

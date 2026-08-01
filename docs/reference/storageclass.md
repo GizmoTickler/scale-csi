@@ -42,6 +42,60 @@ parameters such as `dataset_recordsize`, `dataset_compression`,
 `mountOptions` is a top-level StorageClass list, and the standardized filesystem
 key is `csi.storage.k8s.io/fstype`.
 
+## Block-protocol tuning
+
+These parameters tune the iSCSI extent/target and the NVMe-oF subsystem per
+StorageClass. Every one is optional: an omitted parameter uses the controller
+default, so a class that sets none of them provisions exactly as it did before
+these knobs existed.
+
+| Parameter | Values | Applies to | Notes |
+|---|---|---|---|
+| `iscsi/blocksize` | `512`, `1024`, `2048`, `4096` | extent | **Immutable.** Pair `4096` with a 16K `zvolBlocksize`. |
+| `iscsi/pblocksize` | `true`, `false` | extent | **Immutable.** Reports the physical blocksize to the initiator. |
+| `iscsi/queuedCommands` | `32`, `128` | target | Per-target SCST queue depth. |
+| `iscsi/insecureTpc` | `true`, `false` | extent | Default `true`. Set `false` to disable cross-LUN XCOPY/ODX. |
+| `iscsi/readOnly` | `true`, `false` | extent | Read-only extent (restore-verify use cases). |
+| `iscsi/availThreshold` | `1`–`99` | extent | Per-extent early-full warning percentage. |
+| `iscsi/stableSerial` | `true`, `false` | extent | Derives a deterministic SCSI serial from the volume, so identity survives an extent rebuild. |
+| `iscsi/authNetworks` | comma-separated CIDRs | target | Target-level network ACL. |
+| `nvmeof/qidMax` | `1`–`65535` | subsystem | Maximum I/O queue count (a queue identifier is 16-bit). |
+| `nvmeof/piEnable` | `true`, `false` | subsystem | T10-PI. Advanced — validate initiator support first. |
+
+Invalid values return `InvalidArgument` at `CreateVolume`, and the chart's
+`values.schema.json` rejects them earlier still, at `helm install`.
+
+NVMe-oF **port** performance fields (`inlineDataSize`, `maxQueueSize`,
+`portPiEnable`) are deliberately NOT StorageClass parameters — the port is
+shared across volumes, so a per-class value would mutate a shared object under
+other volumes. Supplying one returns `InvalidArgument`; configure them
+install-wide under Helm `nvmeof.portPerf`. Those install-wide fields are applied
+at port CREATE only: changing them on an install whose ports already exist is a
+no-op, and the driver logs a warning naming each drifted field.
+
+### These options are persisted per volume
+
+The resolved options are stamped onto the volume's dataset as
+`truenas-csi:block_*` / `truenas-csi:nvme_*` user properties at `CreateVolume`,
+and **only** for the parameters the class actually set. Every later path that
+rebuilds the share for an existing volume — `ControllerPublishVolume`, the
+startup attachment reconcile, a DR/restore rebuild — reads those properties, so
+the volume keeps its own geometry and safety settings instead of falling back to
+the controller default. Without this, a restore rebuild would re-create the
+extent at the default `512` over data laid out for `4096`, and would drop the
+stable serial, read-only flag, `insecure_tpc`, target `auth_networks`,
+`avail_threshold`, `qid_max` and `pi_enable`.
+
+Resolution order is: StorageClass parameter → stored property → controller
+default, merged **per key**. Changing a mutable knob on the class therefore
+cannot reset a volume's stored geometry.
+
+`iscsi/blocksize` and `iscsi/pblocksize` are fixed for the life of a volume: its
+filesystem and partition table are laid out against the logical block size the
+initiator sees. Changing either on a StorageClass and then re-provisioning
+against an existing volume returns `FailedPrecondition` — including on a rebuild
+where the extent is missing. To change them, provision a new volume.
+
 ## NFS
 
 ```yaml

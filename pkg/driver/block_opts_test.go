@@ -84,17 +84,21 @@ func TestGuardISCSIBlocksizeImmutability(t *testing.T) {
 	existing := &truenas.ISCSIExtent{ID: 1, Blocksize: 4096}
 
 	// Matching blocksize: no error.
-	assert.NoError(t, guardISCSIBlocksizeImmutability(existing, 4096, "ds"))
+	assert.NoError(t, guardISCSIBlocksizeImmutability(existing, intPtr(4096), "ds"))
 	// Divergent blocksize: FailedPrecondition.
-	err := guardISCSIBlocksizeImmutability(existing, 512, "ds")
+	err := guardISCSIBlocksizeImmutability(existing, intPtr(512), "ds")
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	// Zero resolved (unset config) is not a meaningful request: no error.
-	assert.NoError(t, guardISCSIBlocksizeImmutability(existing, 0, "ds"))
+	assert.NoError(t, guardISCSIBlocksizeImmutability(existing, intPtr(0), "ds"))
+	// NO opinion at all (a no-opts publish on an unstamped volume) must NOT be
+	// compared against the controller default — that false positive is what made
+	// tuned volumes permanently unattachable.
+	assert.NoError(t, guardISCSIBlocksizeImmutability(existing, nil, "ds"))
 	// Legacy extent with no reported blocksize: no error.
-	assert.NoError(t, guardISCSIBlocksizeImmutability(&truenas.ISCSIExtent{ID: 2}, 512, "ds"))
+	assert.NoError(t, guardISCSIBlocksizeImmutability(&truenas.ISCSIExtent{ID: 2}, intPtr(512), "ds"))
 	// Nil extent: no error.
-	assert.NoError(t, guardISCSIBlocksizeImmutability(nil, 512, "ds"))
+	assert.NoError(t, guardISCSIBlocksizeImmutability(nil, intPtr(512), "ds"))
 }
 
 func TestBlockOptsBuildersOmitWhenNil(t *testing.T) {

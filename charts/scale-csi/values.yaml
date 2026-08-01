@@ -371,6 +371,13 @@ nvmeof:
   # (never per-StorageClass). Every field defaults to unset, which omits the API
   # parameter and keeps port creation identical to a pre-GF4 deployment. Named
   # portPerf (not port) to avoid colliding with nvmeof.port (the service port).
+  #
+  # CREATE-ONLY: these values are applied when the driver CREATES a port. On an
+  # install whose ports already exist, changing them here has NO effect — the
+  # driver reuses the existing port and logs a warning naming each drifted field.
+  # TrueNAS refuses to change an enabled port while the target is running, so
+  # applying a change means a maintenance window: disable the port, update it,
+  # re-enable it.
   portPerf:
     # Inline write cutoff in bytes. Unset omits.
     inlineDataSize: null
@@ -379,14 +386,26 @@ nvmeof:
     # Enable T10-PI (protection information) on the port. Unset omits.
     piEnable: null
 
-  # NVMe-oF multi-port multipath (GF-Sprint 4). When enabled, each subsystem is
-  # associated with one port per address below (in addition to `address`) and all
-  # addresses are advertised in the publish context so a multipath-aware node can
-  # connect each path to the same NQN; the kernel's native NVMe multipath then
-  # load-balances and fails over. Default off (single port, identical to pre-GF4).
+  # NVMe-oF multi-port multipath (GF-Sprint 4, E-6). When enabled, each subsystem
+  # is associated with one port per address below (in addition to `address`), and
+  # all addresses are advertised in the publish context under `addresses`.
+  # Existing volumes are converged on their next publish, so every advertised
+  # address really is associated with the subsystem.
+  #
+  # HONEST SCOPE — CONTROLLER SIDE ONLY. The node half is NOT shipped: the node
+  # still runs a single `nvme connect` to `address`, so enabling this today
+  # delivers NO multipath, NO load balancing and NO path failover. What it does
+  # deliver is the backend exposure (one port per storage NIC) that the node work
+  # will build on, at a cost of 2*(N-1) extra API calls per volume. There is also
+  # no ANA on this platform (nvmet rejects it), so when the node half lands all
+  # paths are equally optimized — correct for a single controller.
+  #
+  # Leave this off unless you are deliberately staging that exposure. Default off
+  # (single port, identical to pre-GF4).
   multipath: false
   # Additional storage transport addresses (IPs) to expose when multipath=true.
-  # `address` is always included first. Must be non-empty when multipath=true.
+  # `address` is always included first, and duplicates are collapsed. Must be
+  # non-empty when multipath=true.
   addresses: []
 
   # commandTimeout was removed: it was never wired to anything. The nvme CLI

@@ -7,11 +7,13 @@ package chart
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -861,4 +863,146 @@ func TestChartBlockProtocolStorageClassParams(t *testing.T) {
 			}
 		}
 	})
+}
+
+// blockParamValues writes a values file with a single StorageClass carrying one
+// extraParameters entry, so schema behavior can be probed one key at a time.
+// A values FILE is used rather than --set because helm's --set treats dots in a
+// key as path separators, which would mangle keys like iscsi/blocksize the
+// moment a realistic parameter set is involved.
+func blockParamValues(t *testing.T, key, value string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "block-param-values.yaml")
+	values := fmt.Sprintf("storageClasses:\n  - name: probe\n    enabled: true\n    protocol: iscsi\n    extraParameters:\n      %s: %q\n", key, value)
+	if err := os.WriteFile(path, []byte(values), 0o600); err != nil {
+		t.Fatalf("write override values: %v", err)
+	}
+	return path
+}
+
+// TestChartBlockProtocolParamSchemaRejection proves the design's §4 requirement
+// that values.schema.json rejects out-of-enum per-StorageClass values at
+// `helm install`, instead of letting a typo reach the cluster and fail EVERY
+// CreateVolume at provision time. extraParameters used to be an unconstrained
+// stringMap, so a StorageClass with iscsi/blocksize: "8192" installed cleanly
+// and then silently provisioned nothing.
+func TestChartBlockProtocolParamSchemaRejection(t *testing.T) {
+	rejected := []struct{ key, value string }{
+		{"iscsi/blocksize", "8192"},
+		{"iscsi/blocksize", "999"},
+		{"iscsi/blocksize", "4k"},
+		{"iscsi/queuedCommands", "64"},
+		{"iscsi/pblocksize", "maybe"},
+		{"iscsi/readOnly", "yes"},
+		{"iscsi/insecureTpc", "1"},
+		{"iscsi/stableSerial", "on"},
+		{"iscsi/availThreshold", "0"},
+		{"iscsi/availThreshold", "100"},
+		{"nvmeof/qidMax", "0"},
+		{"nvmeof/qidMax", "-1"},
+		{"nvmeof/piEnable", "enabled"},
+		// Port performance fields are install-wide (the port is shared across
+		// volumes), so a per-SC value must be rejected by the SCHEMA too, not only
+		// at CreateVolume.
+		{"nvmeof/inlineDataSize", "16384"},
+		{"nvmeof/maxQueueSize", "256"},
+		{"nvmeof/portPiEnable", "true"},
+	}
+	for _, tc := range rejected {
+		t.Run("reject "+tc.key+"="+tc.value, func(t *testing.T) {
+			helmTemplateExpectError(t, "--show-only", "templates/storageclass.yaml", "-f", blockParamValues(t, tc.key, tc.value))
+		})
+	}
+
+	accepted := []struct{ key, value string }{
+		{"iscsi/blocksize", "512"},
+		{"iscsi/blocksize", "4096"},
+		{"iscsi/queuedCommands", "32"},
+		{"iscsi/queuedCommands", "128"},
+		{"iscsi/pblocksize", "true"},
+		{"iscsi/readOnly", "false"},
+		{"iscsi/stableSerial", "true"},
+		{"iscsi/availThreshold", "1"},
+		{"iscsi/availThreshold", "99"},
+		{"nvmeof/qidMax", "1"},
+		{"nvmeof/qidMax", "65535"},
+		{"nvmeof/piEnable", "false"},
+		// An unrelated key must still pass through verbatim: the schema constrains
+		// the known knobs without turning extraParameters into a closed set.
+		{"csi.storage.k8s.io/provisioner-secret-name", "chap"},
+		{"some.vendor/param", "anything"},
+	}
+	for _, tc := range accepted {
+		t.Run("accept "+tc.key+"="+tc.value, func(t *testing.T) {
+			out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", blockParamValues(t, tc.key, tc.value))
+			// toYaml quotes a value only when it would otherwise parse as a
+			// non-string scalar, so accept both renderings.
+			quoted := tc.key + ": " + strconv.Quote(tc.value)
+			bare := tc.key + ": " + tc.value + "\n"
+			if !strings.Contains(out, quoted) && !strings.Contains(out, bare) {
+				t.Errorf("rendered StorageClass missing %s: %q; got:\n%s", tc.key, tc.value, out)
+			}
+		})
+	}
+
+	t.Run("the shipped example classes satisfy the schema", func(t *testing.T) {
+		valuesPath := filepath.Join(t.TempDir(), "enable-examples.yaml")
+		// Re-enable both opt-in example classes from values.yaml verbatim; if the
+		// schema and the shipped examples ever disagree, this fails.
+		const values = `storageClasses:
+  - name: scale-iscsi-4k
+    enabled: true
+    protocol: iscsi
+    extraParameters:
+      iscsi/blocksize: "4096"
+      iscsi/pblocksize: "true"
+      iscsi/queuedCommands: "128"
+      iscsi/insecureTpc: "false"
+      iscsi/availThreshold: "80"
+  - name: scale-nvmeof-tuned
+    enabled: true
+    protocol: nvmeof
+    extraParameters:
+      nvmeof/qidMax: "128"
+      nvmeof/piEnable: "false"
+`
+		if err := os.WriteFile(valuesPath, []byte(values), 0o600); err != nil {
+			t.Fatalf("write override values: %v", err)
+		}
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		for _, want := range []string{"name: scale-iscsi-4k", "name: scale-nvmeof-tuned"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rendered output missing %q; got:\n%s", want, out)
+			}
+		}
+	})
+}
+
+// TestChartMultipathDocumentsMissingNodeHalf keeps the values.yaml multipath
+// comment honest. The node-side multi-address connect is NOT shipped, so
+// enabling nvmeof.multipath today buys backend exposure and extra API calls with
+// zero multipath benefit. The comment previously claimed "the kernel's native
+// NVMe multipath then load-balances and fails over" with no mention that the
+// node half is missing — an operator reading only values.yaml would enable it
+// expecting path failover and get none.
+func TestChartMultipathDocumentsMissingNodeHalf(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(chartDir(t), "values.yaml"))
+	if err != nil {
+		t.Fatalf("read values.yaml: %v", err)
+	}
+	values := string(raw)
+	for _, want := range []string{
+		"CONTROLLER SIDE ONLY",
+		"The node half is NOT shipped",
+		"NO multipath",
+	} {
+		if !strings.Contains(values, want) {
+			t.Errorf("values.yaml multipath documentation must state %q so the feature is not oversold", want)
+		}
+	}
+	// And the create-only nature of portPerf must be documented (F-7): changing
+	// it on an install whose ports exist is a silent no-op.
+	if !strings.Contains(values, "CREATE-ONLY") {
+		t.Error("values.yaml must document that nvmeof.portPerf is applied at port create only")
+	}
 }

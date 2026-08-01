@@ -82,6 +82,47 @@ func (d *Driver) nvmeofPortCreateOpts() truenas.NVMeoFPortCreateOptions {
 	}
 }
 
+// associateNVMeoFPorts ensures the subsystem is reachable on one port per
+// address and returns the association IDs in address order. It is a no-op
+// returning (nil, nil) for an empty address list, which is what makes the
+// multipath convergence call on the already-exists path cost zero API round
+// trips when multipath is disabled.
+//
+// Both the port get-or-create and the association create are already-exists
+// tolerant, so calling this repeatedly for the same subsystem converges rather
+// than duplicating objects.
+func (d *Driver) associateNVMeoFPorts(ctx context.Context, subsysID int, addresses []string) ([]int, error) {
+	if len(addresses) == 0 {
+		return nil, nil
+	}
+	portOpts := d.nvmeofPortCreateOpts()
+	portSubsysIDs := make([]int, 0, len(addresses))
+	for _, addr := range addresses {
+		port, portErr := d.truenasClient.NVMeoFGetOrCreatePort(
+			ctx,
+			d.config.NVMeoF.Transport,
+			addr,
+			d.config.NVMeoF.TransportServiceID,
+			portOpts,
+		)
+		if portErr != nil {
+			return portSubsysIDs, fmt.Errorf("failed to get/create NVMe-oF port for %s: %w", addr, portErr)
+		}
+		assoc, assocErr := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsysID)
+		if assocErr != nil {
+			d.truenasClient.InvalidateNVMeoFPort(
+				d.config.NVMeoF.Transport,
+				addr,
+				d.config.NVMeoF.TransportServiceID,
+			)
+			return portSubsysIDs, fmt.Errorf("failed to associate subsystem with port %s: %w", addr, assocErr)
+		}
+		portSubsysIDs = append(portSubsysIDs, assoc.ID)
+		klog.V(4).Infof("Associated NVMe-oF subsystem %d with port %d (association ID %d)", subsysID, port.ID, assoc.ID)
+	}
+	return portSubsysIDs, nil
+}
+
 func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution) error {
 	if !d.config.Fencing.Enabled() && !d.config.NVMeoF.SubsystemAllowAnyHost && len(d.config.NVMeoF.SubsystemHosts) == 0 {
 		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
@@ -95,9 +136,14 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 
 	// Generate NVMe-oF subsystem name (TrueNAS 25.10+ auto-generates NQN from name)
 	subsysName := d.nvmeSubsystemName(datasetName)
-	// Resolved per-StorageClass block-protocol tuning (GF-Sprint 4). Nil when the
-	// StorageClass opted into nothing, keeping subsystem creation byte-identical.
-	opts := blockOptsFromContext(ctx)
+	// Resolved per-volume block-protocol tuning (GF-Sprint 4) through the ONE
+	// resolver: request-scoped StorageClass opts (CreateVolume only) -> the
+	// volume's STORED dataset properties -> the controller default. A rebuild
+	// reached from ControllerPublishVolume / the startup reconcile carries no
+	// request opts, so without the stored half a re-created subsystem silently
+	// dropped qid_max and pi_enable (disabling T10-PI under a connected
+	// initiator).
+	opts := effectiveBlockOpts(ctx, ds)
 	var subsys *truenas.NVMeoFSubsystem
 	if !freshlyCreated {
 		namespace, resolvedSubsys, resolveErr := d.resolvedNVMeObjects(ctx, res, ds, datasetName)
@@ -130,6 +176,17 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 				if reconcileErr := d.reconcileNVMeoFHostAssociations(ctx, subsys.ID); reconcileErr != nil {
 					return status.Errorf(codes.Internal, "failed to reconcile NVMe-oF subsystem hosts: %v", reconcileErr)
 				}
+			}
+			// E-6 convergence (F-4): this early return used to skip the port
+			// association loop entirely, so flipping nvmeof.multipath=true on a
+			// live install added the extra ports for NEW volumes only — while the
+			// publish context advertised all addresses for EVERY volume. An
+			// existing volume therefore advertised paths it had no port_subsys
+			// association for. Converge here so the advertisement is true.
+			// No-op (zero extra API calls) when multipath is off, which is the
+			// default, so the single-port path is unchanged.
+			if _, assocErr := d.associateNVMeoFPorts(ctx, subsys.ID, d.config.NVMeoF.multipathAddresses()); assocErr != nil {
+				return status.Errorf(codes.Internal, "failed to converge NVMe-oF multipath port associations: %v", assocErr)
 			}
 			klog.Infof("NVMe-oF share already exists for %s (namespace=%d, subsystem=%d)", datasetName, namespace.ID, subsys.ID)
 			return nil
@@ -203,44 +260,22 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	if len(addresses) == 0 {
 		addresses = []string{d.config.NVMeoF.TransportAddress}
 	}
-	portOpts := d.nvmeofPortCreateOpts()
-	var portSubsysIDs []int
-	for _, addr := range addresses {
-		port, portErr := d.truenasClient.NVMeoFGetOrCreatePort(
-			ctx,
-			d.config.NVMeoF.Transport,
-			addr,
-			d.config.NVMeoF.TransportServiceID,
-			portOpts,
-		)
-		if portErr != nil {
-			// Cleanup subsystem on port failure - volume would be unusable without a port
-			if !subsysWasExisting {
-				if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-					klog.Warningf("Failed to cleanup NVMe-oF subsystem after port failure: %v", delErr)
-				}
+	portSubsysIDs, assocErr := d.associateNVMeoFPorts(ctx, subsys.ID, addresses)
+	if assocErr != nil {
+		// Cleanup subsystem on port/association failure - the volume would be
+		// unusable without a port. Deleting the subsystem also reaps every
+		// association already created for it, which is why no explicit
+		// association rollback runs here: a partial loop leaves associations
+		// only when the subsystem PRE-EXISTED, and in that case some of the
+		// collected IDs may be associations this call merely adopted (the
+		// create is already-exists-tolerant), so deleting them would tear down
+		// working paths. The loop is idempotent, so a retry converges.
+		if !subsysWasExisting {
+			if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
+				klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
 			}
-			return status.Errorf(codes.Internal, "failed to get/create NVMe-oF port for %s: %v", addr, portErr)
 		}
-
-		// Associate subsystem with port (required for network accessibility)
-		assoc, assocErr := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsys.ID)
-		if assocErr != nil {
-			d.truenasClient.InvalidateNVMeoFPort(
-				d.config.NVMeoF.Transport,
-				addr,
-				d.config.NVMeoF.TransportServiceID,
-			)
-			// Cleanup subsystem on association failure - volume would be unusable
-			if !subsysWasExisting {
-				if delErr := d.truenasClient.NVMeoFSubsystemDelete(ctx, subsys.ID); delErr != nil {
-					klog.Warningf("Failed to cleanup NVMe-oF subsystem after port association failure: %v", delErr)
-				}
-			}
-			return status.Errorf(codes.Internal, "failed to associate subsystem with port %s: %v", addr, assocErr)
-		}
-		portSubsysIDs = append(portSubsysIDs, assoc.ID)
-		klog.V(4).Infof("Associated NVMe-oF subsystem %d with port %d (association ID %d)", subsys.ID, port.ID, assoc.ID)
+		return status.Errorf(codes.Internal, "%v", assocErr)
 	}
 	// The first association is the canonical one recorded in the dataset property
 	// (back-compat with the single-port path). The delete path lists and removes

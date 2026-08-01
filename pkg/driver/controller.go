@@ -52,7 +52,43 @@ const (
 	// context, idempotent replay) reads THIS, never the mutable controller-wide
 	// iscsi.chap.mutual flag, so a global-flag flip cannot downgrade or upgrade an
 	// existing volume and mixed one-way/mutual StorageClasses coexist correctly.
-	PropISCSIAuthMode      = "truenas-csi:truenas_iscsi_auth_mode"
+	PropISCSIAuthMode = "truenas-csi:truenas_iscsi_auth_mode"
+
+	// Block-protocol tuning (GF-Sprint 4) persisted per volume. The resolved
+	// per-StorageClass options are stamped here at CreateVolume so EVERY later
+	// path that rebuilds or re-ensures the share for an EXISTING volume
+	// (ControllerPublishVolume -> ensureShareExists, the startup attachment
+	// reconcile, a DR/restore rebuild) resolves the volume's OWN geometry and
+	// safety knobs instead of collapsing to the controller default.
+	//
+	// This mirrors PropISCSIAuthMode/PropISCSIAuthTag, which exist for exactly
+	// this reason. Without it: a rebuild whose extent is ABSENT silently
+	// re-created the extent at the 512 controller default over data laid down
+	// against 4096-byte logical blocks (silent corruption); a rebuild whose
+	// extent EXISTS was rejected forever by the immutability guard (stored 4096
+	// vs default 512 => permanently unattachable); and every other
+	// create-time-only option (stable serial, read-only, insecure_tpc, target
+	// auth_networks, avail_threshold, qid_max, pi_enable) was silently dropped.
+	//
+	// ONLY keys whose option was actually SET are stamped: an absent key means
+	// "use the controller default", so a StorageClass that opts into nothing
+	// stamps nothing and provisions byte-identically to pre-GF4.
+	//
+	// Unlike the CHAP props these are read WITHOUT the source==local guard. CHAP
+	// is a credential policy a clone must never inherit; block geometry
+	// describes the DATA layout, which a ZFS clone shares byte-for-byte with its
+	// source, so inheriting it is both correct and the safe direction.
+	PropBlockISCSIBlocksize      = "truenas-csi:block_blocksize"
+	PropBlockISCSIPblocksize     = "truenas-csi:block_pblocksize"
+	PropBlockISCSIQueuedCommands = "truenas-csi:block_queued_commands"
+	PropBlockISCSIInsecureTpc    = "truenas-csi:block_insecure_tpc"
+	PropBlockISCSIReadOnly       = "truenas-csi:block_readonly"
+	PropBlockISCSIAvailThreshold = "truenas-csi:block_avail_threshold"
+	PropBlockISCSISerial         = "truenas-csi:block_serial"
+	PropBlockISCSIAuthNetworks   = "truenas-csi:block_auth_networks"
+	PropBlockNVMeoFQidMax        = "truenas-csi:nvme_qid_max"
+	PropBlockNVMeoFPiEnable      = "truenas-csi:nvme_pi_enable"
+
 	PropNVMeoFSubsystemID  = "truenas-csi:truenas_nvmeof_subsystem_id"
 	PropNVMeoFNamespaceID  = "truenas-csi:truenas_nvmeof_namespace_id"
 	PropNVMeoFPortSubsysID = "truenas-csi:truenas_nvmeof_portsubsys_id"
@@ -502,6 +538,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// re-writes the CHAP policy the clone fold already stamped atomically with
 	// ownership (Sprint 6 H1) — idempotent, same values via iscsiCHAPPolicyProps.
 	for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+		volumeProperties[key] = value
+	}
+	// Fold the resolved block-protocol tuning into the SAME fatal update, for the
+	// same reason: every rebuild path reconstructs the volume's geometry and
+	// safety knobs purely from these properties, so a missing stamp silently
+	// re-creates the extent at the controller-default blocksize over data laid
+	// out for a different one, and drops the stable serial / read-only /
+	// insecure_tpc / target auth_networks / avail_threshold / qid_max /
+	// pi_enable. Adding keys to a map that is already written costs NO extra
+	// round trip. nil (adds nothing, byte-identical write) for NFS and for any
+	// StorageClass that opts into no block tuning.
+	for key, value := range blockOptsProps(ctx, shareType) {
 		volumeProperties[key] = value
 	}
 
@@ -2751,6 +2799,14 @@ func (d *Driver) handleVolumeContentSource(
 			for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
 				foldProps[key] = value
 			}
+			// GF-4: the resolved block tuning folds into this SAME atomic write for
+			// the CHAP rationale above — the clone's share is built from these
+			// properties on every later rebuild, so they must be durable with
+			// ownership rather than only at the late fatal stamp. nil for requests
+			// that opt into nothing, so default clones are byte-for-byte unchanged.
+			for key, value := range blockOptsProps(ctx, shareType) {
+				foldProps[key] = value
+			}
 			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, foldProps)
 			if updateErr != nil {
 				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, updateErr)
@@ -2862,6 +2918,11 @@ func (d *Driver) handleVolumeContentSource(
 			PropDriverInstanceID:        d.driverInstanceID(),
 		}
 		for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+			foldProps[key] = value
+		}
+		// GF-4: same atomic write for the resolved block tuning (see the
+		// snapshot-clone fold above). nil for requests that opt into nothing.
+		for key, value := range blockOptsProps(ctx, shareType) {
 			foldProps[key] = value
 		}
 		verified, updateErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, foldProps)

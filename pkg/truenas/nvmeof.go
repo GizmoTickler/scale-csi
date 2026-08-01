@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -58,6 +59,13 @@ type NVMeoFPort struct {
 	AddrFamily string `json:"addr_adrfam"` // New in 25.10: "IPV4", "IPV6", "FC"
 	Enabled    bool   `json:"enabled"`     // New in 25.10
 	Subsystems []int  `json:"subsystems"`
+
+	// Performance fields, parsed so a get-or-create can report that an EXISTING
+	// port does not carry the currently configured nvmeof.portPerf values (these
+	// are applied at port CREATE only). Nil when the backend omits/nulls them.
+	InlineDataSize *int  `json:"-"`
+	MaxQueueSize   *int  `json:"-"`
+	PiEnable       *bool `json:"-"`
 }
 
 // NVMeoFSubsystemCreateOptions carries optional subsystem fields that default to
@@ -579,6 +587,63 @@ func (o NVMeoFPortCreateOptions) apply(params map[string]interface{}) {
 	}
 }
 
+// drift reports the port performance fields whose configured value differs from
+// the live value on an EXISTING port. These fields are applied at port CREATE
+// only — the port is shared across volumes, and TrueNAS refuses to change an
+// enabled port while the target is running — so a changed nvmeof.portPerf value
+// silently no-ops on an install whose ports already exist. Surfacing the drift
+// is what turns that silence into an actionable warning (F-7 / R-4). An empty
+// result means "nothing to say": either no field is configured or every
+// configured field already matches.
+func (o NVMeoFPortCreateOptions) Drift(port *NVMeoFPort) []string {
+	if port == nil {
+		return nil
+	}
+	var fields []string
+	if o.InlineDataSize != nil && (port.InlineDataSize == nil || *port.InlineDataSize != *o.InlineDataSize) {
+		fields = append(fields, fmt.Sprintf("inline_data_size: live=%s configured=%d", formatOptionalInt(port.InlineDataSize), *o.InlineDataSize))
+	}
+	if o.MaxQueueSize != nil && (port.MaxQueueSize == nil || *port.MaxQueueSize != *o.MaxQueueSize) {
+		fields = append(fields, fmt.Sprintf("max_queue_size: live=%s configured=%d", formatOptionalInt(port.MaxQueueSize), *o.MaxQueueSize))
+	}
+	if o.PiEnable != nil && (port.PiEnable == nil || *port.PiEnable != *o.PiEnable) {
+		fields = append(fields, fmt.Sprintf("pi_enable: live=%s configured=%t", formatOptionalBool(port.PiEnable), *o.PiEnable))
+	}
+	return fields
+}
+
+func formatOptionalInt(v *int) string {
+	if v == nil {
+		return "unset"
+	}
+	return strconv.Itoa(*v)
+}
+
+func formatOptionalBool(v *bool) string {
+	if v == nil {
+		return "unset"
+	}
+	return strconv.FormatBool(*v)
+}
+
+// warnPortPerfDrift emits the create-only warning for an existing port. It is
+// called on the cold (uncached) resolution paths only, so a steady-state
+// controller logs it once per port rather than on every provision.
+func warnPortPerfDrift(port *NVMeoFPort, opts []NVMeoFPortCreateOptions) {
+	if len(opts) == 0 {
+		return
+	}
+	fields := opts[0].Drift(port)
+	if len(fields) == 0 {
+		return
+	}
+	klog.Warningf(
+		"NVMe-oF port %s:%s:%d already exists and was NOT updated: nvmeof.portPerf fields are applied at port CREATE only "+
+			"(the port is shared across volumes and TrueNAS refuses to change an enabled port while the target is running). "+
+			"Drift: %s. Apply the change in a maintenance window (disable the port, nvmet.port.update, re-enable).",
+		port.Transport, port.Address, port.Port, strings.Join(fields, "; "))
+}
+
 // NVMeoFPortCreate creates a new NVMe-oF port.
 // Updated for TrueNAS SCALE 25.10+: uses addr_trtype, addr_traddr, addr_trsvcid.
 // Note: addr_adrfam is auto-detected by TrueNAS and should not be passed on create.
@@ -853,6 +918,7 @@ func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address s
 		return nil, err
 	}
 	if existingPort != nil {
+		warnPortPerfDrift(existingPort, opts)
 		return cache(existingPort), nil
 	}
 
@@ -865,6 +931,12 @@ func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address s
 			return nil, findErr
 		}
 		if wildcardPort != nil {
+			// A wildcard port binds every interface, so all multipath addresses
+			// resolve to this ONE port: the "one port per storage address" model
+			// does not hold on such an install (functionally fine — the wildcard
+			// already serves every address — but the port count is 1, not N).
+			klog.V(4).Infof("NVMe-oF address %s resolved to the wildcard 0.0.0.0 port %d on service port %d; all addresses share this port", resolvedAddr, wildcardPort.ID, port)
+			warnPortPerfDrift(wildcardPort, opts)
 			return cache(wildcardPort), nil
 		}
 	}
@@ -1131,6 +1203,20 @@ func parseNVMeoFPort(data interface{}) (*NVMeoFPort, error) {
 				port.Subsystems = append(port.Subsystems, int(id))
 			}
 		}
+	}
+	// Performance fields (nullable) — read back so drift against the configured
+	// nvmeof.portPerf can be reported on an existing port.
+	if v, ok := m["inline_data_size"].(float64); ok {
+		value := int(v)
+		port.InlineDataSize = &value
+	}
+	if v, ok := m["max_queue_size"].(float64); ok {
+		value := int(v)
+		port.MaxQueueSize = &value
+	}
+	if v, ok := m["pi_enable"].(bool); ok {
+		value := v
+		port.PiEnable = &value
 	}
 
 	return port, nil
