@@ -706,7 +706,7 @@ func TestCreateISCSIShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testing
 	})
 	require.NoError(t, err)
 
-	err = d.createISCSIShareForDataset(ctx, ds, datasetName, "fresh-iscsi", true, true)
+	err = d.createISCSIShareForDataset(ctx, ds, datasetName, "fresh-iscsi", true, true, nil)
 	require.NoError(t, err)
 	assert.Zero(t, mockClient.datasetGets)
 	assert.Zero(t, mockClient.zvolWaits)
@@ -1013,7 +1013,7 @@ func TestEnsureShareExistsRecreatesStaleStoredObjects(t *testing.T) {
 		datasetName := "tank/k8s/volumes/stale-iscsi"
 		ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 		require.NoError(t, err)
-		require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "stale-iscsi", true, true))
+		require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "stale-iscsi", true, true, nil))
 		oldID, err := client.DatasetGetUserProperty(ctx, datasetName, PropISCSITargetExtentID)
 		require.NoError(t, err)
 		oldIDInt, err := strconv.Atoi(oldID)
@@ -1315,7 +1315,7 @@ func TestISCSITargetCreateFailureInvalidatesResolvedGroup(t *testing.T) {
 	ds, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME"})
 	require.NoError(t, err)
 
-	err = d.createISCSIShareForDataset(ctx, ds, datasetName, "iscsi-cache-invalidation", true, true)
+	err = d.createISCSIShareForDataset(ctx, ds, datasetName, "iscsi-cache-invalidation", true, true, nil)
 	require.Error(t, err)
 	d.iscsiGroupMu.Lock()
 	assert.Nil(t, d.iscsiResolvedGroup)

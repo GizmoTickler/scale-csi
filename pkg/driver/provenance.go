@@ -460,7 +460,7 @@ func (d *Driver) completeResumedCloneRemnant(
 	// into this same stamp, so the remnant reaches the share builder with a record
 	// instead of a gap. An unresolvable source fails the recovery closed rather
 	// than completing a volume whose extent would then be created from a guess.
-	geometry, geometryErr := d.resumedRemnantSourceGeometry(ctx, datasetName, source, shareType)
+	geometry, geometryErr := d.contentSourceBlockGeometry(ctx, datasetName, source, shareType)
 	if geometryErr != nil {
 		return nil, geometryErr
 	}
@@ -485,12 +485,14 @@ func (d *Driver) completeResumedCloneRemnant(
 	return verified, nil
 }
 
-// resumedRemnantSourceGeometry resolves the geometry of the content source a
-// crashed clone descended from, for the recovery stamp above. It re-uses the
-// normal clone resolver, so a snapshot remnant gets the SNAPSHOT's captured
-// provenance and a volume remnant gets the source's live geometry — the same
-// answers the un-crashed path would have produced.
-func (d *Driver) resumedRemnantSourceGeometry(
+// contentSourceBlockGeometry resolves the geometry of the content source a
+// destination descended from, for any arm that does NOT run the normal clone
+// path: the crashed-clone recovery stamp, and an existing-volume CreateVolume
+// replay whose destination carries no geometry record of its own. It re-uses the
+// normal clone resolver, so a snapshot source gets the SNAPSHOT's captured
+// provenance and a volume source gets the source's live geometry — the same
+// answers the un-crashed, un-replayed path would have produced.
+func (d *Driver) contentSourceBlockGeometry(
 	ctx context.Context,
 	datasetName string,
 	source *csi.VolumeContentSource,

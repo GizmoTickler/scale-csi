@@ -922,6 +922,23 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		}
 	}
 
+	// GEOMETRY (round 5). A replay whose destination is a clone/restore that
+	// carries no geometry record of its own must RE-RESOLVE the source, exactly as
+	// the un-replayed path did. Without this, a destination cloned from a source
+	// that provably held no block-addressed data is indistinguishable from one
+	// whose geometry record was simply lost — the first may take the controller
+	// default, the second must never — and the replay wedges on the second reading.
+	// Costs nothing for a stamped destination, which is every destination the
+	// driver has finished provisioning.
+	if shareType.IsBlockProtocol() && req.GetVolumeContentSource() != nil &&
+		!stampGeometry(blockOptsFromDataset(existingDS), "").complete() {
+		resolved, geometryErr := d.contentSourceBlockGeometry(ctx, datasetName, req.GetVolumeContentSource(), shareType)
+		if geometryErr != nil {
+			return nil, geometryErr
+		}
+		ctx = withResolvedGeometry(ctx, resolved)
+	}
+
 	// CRITICAL: Ensure share exists for existing volumes (fixes missing iSCSI targets after retries)
 	// This handles the case where a previous CreateVolume created the dataset but failed
 	// to create the share (e.g., due to timeout, TrueNAS API error, etc.)

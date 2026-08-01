@@ -2027,7 +2027,7 @@ func TestISCSIMultiNodePublishMaintainsExactPerTargetInitiatorGroup(t *testing.T
 	datasetName := "pool/parent/shared-iscsi"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "shared-iscsi", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "shared-iscsi", true, true, nil))
 
 	encode := func(name, iqn string) string {
 		t.Helper()
@@ -2370,7 +2370,7 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 	datasetName := "pool/parent/f2-sentinel"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-sentinel", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-sentinel", true, true, nil))
 	// Establish the already-present backend deny-all sentinel group (last-unpublish
 	// state). Its sentinel entry is exactly what a sentinel-reporting node's real
 	// initiator would match, which is why publish must fail closed.
@@ -2452,7 +2452,7 @@ func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *te
 	datasetName := "pool/parent/f2-legacy-enrich"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-legacy-enrich", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-legacy-enrich", true, true, nil))
 	// Pre-existing backend deny-all sentinel group (last-unpublish state): its
 	// sentinel entry is exactly what the sentinel-reporting node's real initiator
 	// matches, which is why publishing it must fail closed.
@@ -2542,7 +2542,7 @@ func TestControllerPublishRejectsSentinelReporterWithFencingModeOff(t *testing.T
 	datasetName := "pool/parent/f2-off-mode"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-off-mode", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-off-mode", true, true, nil))
 
 	// Real discovery reads the reserved sentinel and marks the collision.
 	origRead := nodeReadIdentityFile
@@ -2626,7 +2626,7 @@ func TestStrictISCSIShareCreationStartsWithPortalBoundDenyAllGroup(t *testing.T)
 	}
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/strict-iscsi", Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, dataset, dataset.Name, "strict-iscsi", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, dataset, dataset.Name, "strict-iscsi", true, true, nil))
 	targetID := mustAtoi(t, datasetUserProperty(dataset, PropISCSITargetID))
 	target, err := client.ISCSITargetGet(ctx, targetID)
 	require.NoError(t, err)

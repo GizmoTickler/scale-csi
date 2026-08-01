@@ -284,15 +284,18 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 			return d, client
 		}
 
+		// A PVC-to-PVC clone asks about the source AS IT IS NOW, because its
+		// temporary snapshot is taken from that state moments later. Stamp read
+		// plus live-extent read.
 		d, client := newSource(t, nil, true)
-		_, err := d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, "snap", "pool/parent/dst", ShareTypeISCSI)
+		_, err := d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, nil, "vol", "pool/parent/dst", ShareTypeISCSI)
 		require.NoError(t, err)
 		_, methods := client.callSnapshot()
 		assert.Equal(t, map[string]int{"DatasetGet": 1, "ISCSIExtentFindByDisk": 1}, methods,
-			"an UNSTAMPED source costs exactly one stamp read plus one live-extent read")
+			"an UNSTAMPED volume-clone source costs exactly one stamp read plus one live-extent read")
 
 		d, client = newSource(t, map[string]string{PropBlockISCSIBlocksize: "4096"}, true)
-		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, "snap", "pool/parent/dst", ShareTypeISCSI)
+		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, nil, "vol", "pool/parent/dst", ShareTypeISCSI)
 		require.NoError(t, err)
 		_, methods = client.callSnapshot()
 		assert.Equal(t, map[string]int{"DatasetGet": 1, "ISCSIExtentFindByDisk": 1}, methods,
@@ -304,16 +307,45 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 		sourceDS, err := client.MockClient.DatasetGet(context.Background(), "pool/parent/src")
 		require.NoError(t, err)
 		client.resetCalls()
-		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", sourceDS, "vol", "pool/parent/dst", ShareTypeISCSI)
+		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", sourceDS, nil, "vol", "pool/parent/dst", ShareTypeISCSI)
 		require.NoError(t, err)
 		_, methods = client.callSnapshot()
 		assert.Equal(t, map[string]int{"ISCSIExtentFindByDisk": 1}, methods,
 			"a caller that already read the source must not be charged for reading it again")
 
+		// Round 5: a SNAPSHOT restore is a different question, and a snapshot that
+		// captured its own geometry answers it with NO read of the source at all —
+		// cheaper than round 4, which paid two calls to ask the wrong thing.
+		d, client = newSource(t, map[string]string{PropBlockISCSIBlocksize: "4096"}, true)
+		capturedSnap := &truenas.Snapshot{
+			ID: "pool/parent/src@point", Name: "point", Dataset: "pool/parent/src",
+			UserProperties: map[string]truenas.UserProperty{
+				PropBlockISCSIBlocksize:  {Value: "4096"},
+				PropBlockISCSIPblocksize: {Value: "true"},
+			},
+		}
+		resolved, err := d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, capturedSnap, "point", "pool/parent/dst", ShareTypeISCSI)
+		require.NoError(t, err)
+		require.Equal(t, geometryKnown, resolved.knowledge)
+		require.Equal(t, 4096, *resolved.blocksize)
+		_, methods = client.callSnapshot()
+		assert.Empty(t, methods, "a snapshot that carries its own geometry needs no source read at all")
+
+		// A snapshot that captured nothing costs exactly one DatasetGet — the
+		// history check — and then fails closed. It never reads the source's live
+		// extent, because the source's live extent cannot answer for the snapshot.
+		d, client = newSource(t, nil, true)
+		bareSnap := &truenas.Snapshot{ID: "pool/parent/src@bare", Name: "bare", Dataset: "pool/parent/src"}
+		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, bareSnap, "bare", "pool/parent/dst", ShareTypeISCSI)
+		require.Error(t, err)
+		_, methods = client.callSnapshot()
+		assert.Equal(t, map[string]int{"DatasetGet": 1}, methods,
+			"an uncaptured snapshot costs one history read and no live-extent read")
+
 		// NFS pays nothing at all: the short-circuit precedes every API call, so a
 		// filesystem deployment does not fund a block-only guard.
 		d, client = newSource(t, nil, true)
-		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, "snap", "pool/parent/dst", ShareTypeNFS)
+		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, nil, "vol", "pool/parent/dst", ShareTypeNFS)
 		require.NoError(t, err)
 		_, methods = client.callSnapshot()
 		assert.Empty(t, methods, "an NFS clone must issue no call for the block geometry resolution")

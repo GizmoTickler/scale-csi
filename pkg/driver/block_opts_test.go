@@ -169,14 +169,14 @@ func TestISCSIBlocksizeImmutabilityGuardRejects(t *testing.T) {
 	// Request a divergent blocksize (512) on the existing 4096 extent.
 	blocksize := 512
 	ctx = withBlockOpts(ctx, &blockOpts{iscsiBlocksize: &blocksize})
-	err = d.createISCSIShareForDataset(ctx, nil, datasetName, "pvc-existing", false, true)
+	err = d.createISCSIShareForDataset(ctx, nil, datasetName, "pvc-existing", false, true, nil)
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.Contains(t, err.Error(), "immutable blocksize")
 
 	// A matching blocksize is accepted (idempotent, no geometry change).
 	ctxMatch := withBlockOpts(context.Background(), &blockOpts{iscsiBlocksize: func() *int { v := 4096; return &v }()})
-	assert.NoError(t, d.createISCSIShareForDataset(ctxMatch, nil, datasetName, "pvc-existing", false, true))
+	assert.NoError(t, d.createISCSIShareForDataset(ctxMatch, nil, datasetName, "pvc-existing", false, true, nil))
 }
 
 // TestISCSICreateThreadsBlocksize proves a fresh create applies the per-SC
@@ -191,7 +191,7 @@ func TestISCSICreateThreadsBlocksize(t *testing.T) {
 	blocksize := 4096
 	insecure := false
 	ctx = withBlockOpts(ctx, &blockOpts{iscsiBlocksize: &blocksize, iscsiInsecureTpc: &insecure})
-	require.NoError(t, d.createISCSIShareForDataset(ctx, nil, datasetName, "pvc-fresh", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, nil, datasetName, "pvc-fresh", true, true, nil))
 
 	extent, err := client.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
 	require.NoError(t, err)
