@@ -24,8 +24,12 @@ type NVMeoFSubsystem struct {
 	// QidMax mirrors the subsystem's maximum I/O queue count when reported; nil
 	// means the backend default applies.
 	QidMax *int `json:"-"`
-	// PiEnable reports whether T10-PI is enabled on the subsystem.
-	PiEnable bool `json:"pi_enable"`
+	// PiEnable reports whether T10-PI is enabled on the subsystem. It is a
+	// POINTER because nvmet.subsys.query returns boolean-or-null and the two are
+	// NOT equivalent: null means "the backend did not report the field", which
+	// must not collapse into an explicit false when a replay is deciding whether
+	// a requested pi_enable is already in effect.
+	PiEnable *bool `json:"pi_enable,omitempty"`
 }
 
 // NVMeoFHost represents an NVMe-oF initiator host from the TrueNAS API.
@@ -1092,7 +1096,8 @@ func parseNVMeoFSubsystem(data interface{}) (*NVMeoFSubsystem, error) {
 		subsys.QidMax = &qidMax
 	}
 	if v, ok := m["pi_enable"].(bool); ok {
-		subsys.PiEnable = v
+		piEnable := v
+		subsys.PiEnable = &piEnable
 	}
 
 	return subsys, nil

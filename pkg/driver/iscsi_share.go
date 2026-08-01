@@ -113,6 +113,13 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	if guardErr := guardStoredBlockGeometry(storedOpts, requestOpts, datasetName); guardErr != nil {
 		return guardErr
 	}
+	// Same fail-closed treatment for the eight non-geometry knobs on the
+	// absent-object rebuild path (codex gate #1). Per-volume block tuning is
+	// immutable; a rebuild that re-creates the objects must not quietly adopt a
+	// value the volume was never provisioned with.
+	if guardErr := guardStoredBlockTuning(storedOpts, requestOpts, datasetName); guardErr != nil {
+		return guardErr
+	}
 	opts := mergeBlockOpts(requestOpts, storedOpts)
 
 	// Step 2: Find or create target (idempotent)
@@ -125,6 +132,15 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			return status.Errorf(codes.Internal, "failed to resolve iSCSI target: %v", err)
 		}
 		if target != nil {
+			// codex gate #1, target half: queuedCommands / authNetworks are
+			// create-time-only for this driver, so a replay that resolves a value
+			// the LIVE target does not already carry must fail closed instead of
+			// returning success over an unchanged backend. The comparison prefers
+			// the live object and falls back to the volume's stamp only for a field
+			// TrueNAS does not report, so a same-value replay is never rejected.
+			if guardErr := guardExistingISCSITargetOpts(target, requestOpts, storedOpts, datasetName); guardErr != nil {
+				return guardErr
+			}
 			targetID = target.ID
 			klog.V(4).Infof("Resolved existing target %s (ID %d)", iscsiName, targetID)
 		}
@@ -256,6 +272,14 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			// no-opts publish of a 4096 volume compare 4096 vs 512 and return
 			// FailedPrecondition forever.
 			if guardErr := guardISCSIBlocksizeImmutability(extent, opts.requestedISCSIBlocksize(), datasetName); guardErr != nil {
+				return guardErr
+			}
+			// codex gate #1, extent half: pblocksize / insecureTpc / readOnly /
+			// availThreshold / stableSerial are create-time-only for this driver.
+			// Silently returning success while the extent stays permissive
+			// (insecure_tpc) or writable (ro) was a safety-contract violation, not
+			// just a docs gap.
+			if guardErr := guardExistingISCSIExtentOpts(extent, requestOpts, storedOpts, datasetName); guardErr != nil {
 				return guardErr
 			}
 			extentID = extent.ID

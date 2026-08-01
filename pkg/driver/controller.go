@@ -2674,6 +2674,17 @@ func (d *Driver) handleVolumeContentSource(
 		}
 
 		sourceSnapshot := snap.ID
+		// N-1: fail a geometry-changing restore closed BEFORE the first
+		// destination mutation. The clone fold below stamps the REQUEST's own
+		// block options onto the destination, so by the time the share builder
+		// runs, guardStoredBlockGeometry compares the request against itself and
+		// always agrees — the inherited source geometry has already been
+		// overwritten. The SOURCE dataset's stamp is the only honest comparand and
+		// it has to be read here, before anything is written. Costs zero extra API
+		// round trips unless the class explicitly opts into a geometry.
+		if guardErr := d.guardCloneSourceBlockGeometry(ctx, snap.Dataset, nil, snapshotID, datasetName, shareType); guardErr != nil {
+			return nil, guardErr
+		}
 		// Durable in-flight provenance BEFORE the first destination mutation. A
 		// crash between clone/copy and the ownership stamp leaves a dataset with
 		// no local identity; only this marker lets a retry prove the remnant is
@@ -2823,11 +2834,18 @@ func (d *Driver) handleVolumeContentSource(
 		}
 		klog.Infof("Creating volume from volume: %s -> %s", sourceVolumeID, datasetName)
 
-		if _, getErr := d.truenasClient.DatasetGet(ctx, sourceDataset); getErr != nil {
+		sourceDS, getErr := d.truenasClient.DatasetGet(ctx, sourceDataset)
+		if getErr != nil {
 			if truenas.IsNotFoundError(getErr) {
 				return nil, status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
 			}
 			return nil, status.Errorf(codes.Internal, "failed to get source volume: %v", getErr)
+		}
+		// N-1 (volume-clone flavor). This existence probe was already querying the
+		// source, so reusing its result makes the geometry guard free: ZERO extra
+		// API calls even for a class that opts into a geometry.
+		if guardErr := d.guardCloneSourceBlockGeometry(ctx, sourceDataset, sourceDS, sourceVolumeID, datasetName, shareType); guardErr != nil {
+			return nil, guardErr
 		}
 
 		// Create a snapshot of source volume, then clone it

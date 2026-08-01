@@ -51,8 +51,8 @@ these knobs existed.
 
 | Parameter | Values | Applies to | Notes |
 |---|---|---|---|
-| `iscsi/blocksize` | `512`, `1024`, `2048`, `4096` | extent | **Immutable.** Pair `4096` with a 16K `zvolBlocksize`. |
-| `iscsi/pblocksize` | `true`, `false` | extent | **Immutable.** Reports the physical blocksize to the initiator. |
+| `iscsi/blocksize` | `512`, `1024`, `2048`, `4096` | extent | Pair `4096` with a 16K `zvolBlocksize`. |
+| `iscsi/pblocksize` | `true`, `false` | extent | Reports the physical blocksize to the initiator. |
 | `iscsi/queuedCommands` | `32`, `128` | target | Per-target SCST queue depth. |
 | `iscsi/insecureTpc` | `true`, `false` | extent | Default `true`. Set `false` to disable cross-LUN XCOPY/ODX. |
 | `iscsi/readOnly` | `true`, `false` | extent | Read-only extent (restore-verify use cases). |
@@ -64,6 +64,10 @@ these knobs existed.
 
 Invalid values return `InvalidArgument` at `CreateVolume`, and the chart's
 `values.schema.json` rejects them earlier still, at `helm install`.
+
+**Every parameter above is applied at volume CREATE and is then immutable for the
+life of that volume.** No value is ever accepted and quietly ignored — see
+[Mutability](#mutability-every-knob-is-fixed-at-create).
 
 NVMe-oF **port** performance fields (`inlineDataSize`, `maxQueueSize`,
 `portPiEnable`) are deliberately NOT StorageClass parameters — the port is
@@ -87,14 +91,76 @@ stable serial, read-only flag, `insecure_tpc`, target `auth_networks`,
 `avail_threshold`, `qid_max` and `pi_enable`.
 
 Resolution order is: StorageClass parameter → stored property → controller
-default, merged **per key**. Changing a mutable knob on the class therefore
-cannot reset a volume's stored geometry.
+default, merged **per key**. A class that sets only one knob therefore cannot
+reset a volume's other stored values to the controller default.
 
-`iscsi/blocksize` and `iscsi/pblocksize` are fixed for the life of a volume: its
+### Mutability: every knob is fixed at create
+
+There is exactly one rule, and it is the same for all ten parameters:
+
+> A per-volume block-protocol parameter is applied when the volume is created and
+> is **immutable** afterwards. If a `CreateVolume` for an existing volume
+> resolves a value that is not already in effect, the call fails with
+> `FailedPrecondition` naming the parameter. Nothing is accepted and ignored.
+
+| Parameter | TrueNAS 26.0 API | Driver policy | Enforcement |
+|---|---|---|---|
+| `iscsi/blocksize` | mutable on `iscsi.extent.update`, but **not** over existing data | Immutable | `FailedPrecondition` (live extent **and** stored stamp) |
+| `iscsi/pblocksize` | mutable on `iscsi.extent.update`, but **not** over existing data | Immutable | `FailedPrecondition` (live extent **and** stored stamp) |
+| `iscsi/queuedCommands` | mutable (`iscsi.target.update` → `iscsi_parameters.QueuedCommands`) | Immutable by driver policy | `FailedPrecondition` |
+| `iscsi/insecureTpc` | mutable (`iscsi.extent.update`) | Immutable by driver policy | `FailedPrecondition` |
+| `iscsi/readOnly` | mutable (`iscsi.extent.update` → `ro`) | Immutable by driver policy | `FailedPrecondition` |
+| `iscsi/availThreshold` | mutable (`iscsi.extent.update`) | Immutable by driver policy | `FailedPrecondition` |
+| `iscsi/stableSerial` | mutable (`iscsi.extent.update` → `serial`) | Immutable — it *is* the volume's SCSI identity | `FailedPrecondition` |
+| `iscsi/authNetworks` | mutable (`iscsi.target.update`) | Immutable by driver policy | `FailedPrecondition` |
+| `nvmeof/qidMax` | mutable (`nvmet.subsys.update`) | Immutable by driver policy | `FailedPrecondition` |
+| `nvmeof/piEnable` | mutable (`nvmet.subsys.update`) | Immutable — changes the block-integrity format | `FailedPrecondition` |
+
+`blocksize` and `pblocksize` are immutable at the **data** level: a volume's
 filesystem and partition table are laid out against the logical block size the
-initiator sees. Changing either on a StorageClass and then re-provisioning
-against an existing volume returns `FailedPrecondition` — including on a rebuild
-where the extent is missing. To change them, provision a new volume.
+initiator sees. The other eight are mutable at the TrueNAS API level and are
+immutable by deliberate driver policy, for three reasons:
+
+1. **The stamp, not the backend object, is the source of truth.** Every
+   publish / startup-reconcile / DR rebuild re-creates the share purely from the
+   volume's stored properties. Pushing a new value onto a live target or extent
+   without also re-stamping would drift, and the next rebuild would silently
+   revert it; re-stamping on the existing-volume arm would add a new fatal write
+   and a new crash window to a path whose whole job is to be idempotent.
+2. **Kubernetes treats StorageClass `parameters` as immutable.** A changed value
+   can therefore never reach the driver as an in-place operator edit — only from
+   a deleted-and-recreated class, or a different class colliding on the same
+   volume name. Neither is an intent-to-mutate signal for a volume that already
+   holds data.
+3. **`ro`, `insecure_tpc`, `auth_networks` and `pi_enable` are enforced while an
+   initiator is connected.** Silently retargeting a live, mounted volume's safety
+   posture is worse than refusing and saying exactly why.
+
+How the check decides whether a value is "already in effect": the **live backend
+object is authoritative** when it reports the field, and the volume's stored
+stamp is the fallback **only** for a field TrueNAS omits from its query response.
+So a same-value replay is never rejected, and a value that was never applied —
+for example `iscsi/stableSerial` added to a class after its volumes were
+provisioned — is rejected rather than acknowledged.
+
+A rebuild path that carries **no** StorageClass parameters (`ControllerPublish`,
+the startup attachment reconcile, a DR restore) has no opinion at all and is
+never rejected; it simply replays the volume's own stamp.
+
+To change any of these, provision a new volume and migrate the data.
+
+### Restoring a snapshot or cloning a volume
+
+A ZFS clone shares its source's data byte-for-byte, so the clone's on-disk layout
+is the **source's** layout. A restore or clone into a class whose
+`iscsi/blocksize` or `iscsi/pblocksize` differs from the source volume's is
+rejected with `FailedPrecondition` — Kubernetes restricts PVC-to-PVC cloning to a
+single StorageClass but places no such restriction on restoring a
+`VolumeSnapshot` into a different class, so this is reachable in exactly the
+deployment two differently-tuned classes invite.
+
+A restore into a class that sets **no** geometry inherits the source's geometry
+(the conservative direction) rather than reverting to the controller default.
 
 ## NFS
 

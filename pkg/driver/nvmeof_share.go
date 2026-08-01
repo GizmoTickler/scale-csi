@@ -143,7 +143,15 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	// request opts, so without the stored half a re-created subsystem silently
 	// dropped qid_max and pi_enable (disabling T10-PI under a connected
 	// initiator).
-	opts := effectiveBlockOpts(ctx, ds)
+	requestOpts := blockOptsFromContext(ctx)
+	storedOpts := blockOptsFromDataset(ds)
+	// codex gate #1, absent-object half: qidMax / piEnable are create-time-only
+	// for this driver, so a rebuild that re-creates the subsystem must not adopt a
+	// value the volume was never provisioned with.
+	if guardErr := guardStoredBlockTuning(storedOpts, requestOpts, datasetName); guardErr != nil {
+		return guardErr
+	}
+	opts := mergeBlockOpts(requestOpts, storedOpts)
 	var subsys *truenas.NVMeoFSubsystem
 	if !freshlyCreated {
 		namespace, resolvedSubsys, resolveErr := d.resolvedNVMeObjects(ctx, res, ds, datasetName)
@@ -154,6 +162,13 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		if namespace != nil {
 			if subsys == nil || namespace.SubsystemID != subsys.ID {
 				return status.Errorf(codes.Internal, "NVMe-oF namespace %d for %s has no matching subsystem", namespace.ID, datasetName)
+			}
+			// codex gate #1, live-object half: this fast path used to return
+			// success BEFORE the requested subsystem options were even looked at,
+			// so a changed qid_max or pi_enable (a data-integrity control) was
+			// always ignored. Fail closed instead.
+			if guardErr := guardExistingNVMeoFSubsystemOpts(subsys, requestOpts, storedOpts, datasetName); guardErr != nil {
+				return guardErr
 			}
 			// The repair-stamp write heals missing/stale cached object IDs. When the
 			// dataset already carries the resolved IDs it is a no-op, so re-issuing

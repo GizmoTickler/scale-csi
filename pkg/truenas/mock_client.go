@@ -1502,7 +1502,8 @@ func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, all
 			sub.QidMax = &qidMax
 		}
 		if opts[0].PiEnable != nil {
-			sub.PiEnable = *opts[0].PiEnable
+			piEnable := *opts[0].PiEnable
+			sub.PiEnable = &piEnable
 		}
 	}
 	m.NVMeSubsystems[id] = sub

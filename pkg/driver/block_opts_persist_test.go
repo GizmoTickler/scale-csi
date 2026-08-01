@@ -481,7 +481,8 @@ func TestNVMeoFRebuildReappliesStoredSubsystemOptions(t *testing.T) {
 	require.NotNil(t, subsys)
 	require.NotNil(t, subsys.QidMax, "stored qid_max must be re-applied on a subsystem rebuild")
 	assert.Equal(t, 128, *subsys.QidMax)
-	assert.True(t, subsys.PiEnable, "stored pi_enable must be re-applied on a subsystem rebuild")
+	require.NotNil(t, subsys.PiEnable, "stored pi_enable must be re-applied on a subsystem rebuild")
+	assert.True(t, *subsys.PiEnable, "stored pi_enable must be re-applied on a subsystem rebuild")
 }
 
 // TestQidMaxUpperBound is the F-8 regression test: an out-of-range qidMax must

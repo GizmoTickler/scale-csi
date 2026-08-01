@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -519,6 +520,16 @@ func (o *blockOpts) resolvedISCSIPblocksize(disablePhysicalBlocksize bool) bool 
 	return !disablePhysicalBlocksize
 }
 
+// hasGeometryOpinion reports whether the caller explicitly asked for a logical
+// data layout (blocksize / pblocksize). Only these two describe how bytes are
+// addressed on the media, so only these two have to be reconciled against a
+// clone SOURCE — the rest describe the volume's own share objects, which a clone
+// gets fresh. Used to keep the clone-source geometry probe off the default path
+// entirely (zero extra API round trips when no class opts into geometry).
+func (o *blockOpts) hasGeometryOpinion() bool {
+	return o != nil && (o.iscsiBlocksize != nil || o.iscsiPblocksize != nil)
+}
+
 // requestedISCSIBlocksize returns the blocksize the caller has an OPINION about
 // — the per-SC override or the volume's stored geometry — and nil when neither
 // exists. It is deliberately NOT defaulted to the controller-wide blocksize:
@@ -547,8 +558,8 @@ func guardISCSIBlocksizeImmutability(existing *truenas.ISCSIExtent, requested *i
 	}
 	return status.Errorf(codes.FailedPrecondition,
 		"iSCSI extent for %s already exists with immutable blocksize %d; requested %d. "+
-			"blocksize is fixed for the life of the volume and cannot be changed on an extent that holds data",
-		datasetName, existing.Blocksize, *requested)
+			"%s is fixed for the life of the volume and cannot be changed on an extent that holds data",
+		datasetName, existing.Blocksize, *requested, paramISCSIBlocksize)
 }
 
 // guardStoredBlockGeometry enforces R-1 against the volume's STORED geometry,
@@ -569,16 +580,346 @@ func guardStoredBlockGeometry(stored, request *blockOpts, datasetName string) er
 	if stored.iscsiBlocksize != nil && request.iscsiBlocksize != nil && *stored.iscsiBlocksize != *request.iscsiBlocksize {
 		return status.Errorf(codes.FailedPrecondition,
 			"volume %s was provisioned with immutable iSCSI extent blocksize %d; the StorageClass now resolves %d. "+
-				"blocksize is fixed for the life of the volume (its filesystem and partition table are laid out against "+
+				"%s is fixed for the life of the volume (its filesystem and partition table are laid out against "+
 				"that logical block size) — provision a new volume to change it",
-			datasetName, *stored.iscsiBlocksize, *request.iscsiBlocksize)
+			datasetName, *stored.iscsiBlocksize, *request.iscsiBlocksize, paramISCSIBlocksize)
 	}
 	if stored.iscsiPblocksize != nil && request.iscsiPblocksize != nil && *stored.iscsiPblocksize != *request.iscsiPblocksize {
 		return status.Errorf(codes.FailedPrecondition,
 			"volume %s was provisioned with immutable iSCSI physical-blocksize reporting %t; the StorageClass now resolves %t. "+
-				"pblocksize is fixed at extent create and changes the alignment the initiator optimizes for — "+
+				"%s is fixed at extent create and changes the alignment the initiator optimizes for — "+
 				"provision a new volume to change it",
-			datasetName, *stored.iscsiPblocksize, *request.iscsiPblocksize)
+			datasetName, *stored.iscsiPblocksize, *request.iscsiPblocksize, paramISCSIPblocksize)
+	}
+	return nil
+}
+
+// guardCloneSourceGeometry enforces R-1 on the CLONE / SNAPSHOT-RESTORE path,
+// which guardStoredBlockGeometry structurally cannot cover (N-1).
+//
+// A clone's own stamp is written by the clone fold from the REQUEST's options
+// BEFORE the share builder runs, so by the time guardStoredBlockGeometry reads
+// the destination it compares the request against itself and always agrees — the
+// inherited source geometry has already been overwritten. The only honest
+// comparison is against the SOURCE dataset's stored geometry, taken before any
+// destination write.
+//
+// This matters because a ZFS clone shares its source's data byte-for-byte: the
+// filesystem and partition table on it were laid out against the SOURCE's
+// logical block size. Kubernetes restricts PVC-to-PVC cloning to one
+// StorageClass but places NO such restriction on restoring a VolumeSnapshot into
+// a different class, so "restore a 4096 volume into a 512 class" is reachable in
+// exactly the deployment two differently-tuned classes invite.
+//
+// It fires ONLY when both sides are explicit. A restore into a class that opts
+// into nothing inherits the source geometry (correct, and verified) and is left
+// alone; a source with no stamp has no recorded geometry to contradict.
+func guardCloneSourceGeometry(sourceOpts, request *blockOpts, sourceRef, datasetName string) error {
+	if sourceOpts == nil || request == nil {
+		return nil
+	}
+	if sourceOpts.iscsiBlocksize != nil && request.iscsiBlocksize != nil && *sourceOpts.iscsiBlocksize != *request.iscsiBlocksize {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot create %s from %s: the source volume was provisioned with iSCSI extent blocksize %d and a ZFS clone "+
+				"shares its data layout byte-for-byte, but the StorageClass resolves %d. Exposing %d-byte logical blocks over "+
+				"data whose filesystem and partition table were written against %d-byte blocks corrupts it — restore into a "+
+				"StorageClass whose %s matches the source",
+			datasetName, sourceRef, *sourceOpts.iscsiBlocksize, *request.iscsiBlocksize,
+			*request.iscsiBlocksize, *sourceOpts.iscsiBlocksize, paramISCSIBlocksize)
+	}
+	if sourceOpts.iscsiPblocksize != nil && request.iscsiPblocksize != nil && *sourceOpts.iscsiPblocksize != *request.iscsiPblocksize {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot create %s from %s: the source volume was provisioned with iSCSI physical-blocksize reporting %t and a "+
+				"ZFS clone shares its data layout byte-for-byte, but the StorageClass resolves %t. pblocksize changes the "+
+				"alignment the initiator optimizes for against data already laid out for the source's value — restore into a "+
+				"StorageClass whose %s matches the source",
+			datasetName, sourceRef, *sourceOpts.iscsiPblocksize, *request.iscsiPblocksize, paramISCSIPblocksize)
+	}
+	return nil
+}
+
+// guardCloneSourceBlockGeometry resolves the clone/restore source's stored
+// geometry and runs guardCloneSourceGeometry against the request. sourceDS may
+// be supplied by a caller that already queried the source (the volume-clone path
+// does, so the guard is free there); otherwise it is fetched, but ONLY when the
+// StorageClass actually opts into a geometry — a default class, and every NFS
+// request, short-circuits before any API call, which is what keeps the default
+// provisioning path's round-trip count unchanged.
+func (d *Driver) guardCloneSourceBlockGeometry(
+	ctx context.Context,
+	sourceDataset string,
+	sourceDS *truenas.Dataset,
+	sourceRef, datasetName string,
+	shareType ShareType,
+) error {
+	if !shareType.IsBlockProtocol() {
+		return nil
+	}
+	request := blockOptsFromContext(ctx)
+	if !request.hasGeometryOpinion() {
+		return nil
+	}
+	if sourceDS == nil {
+		var err error
+		sourceDS, err = d.truenasClient.DatasetGet(ctx, sourceDataset)
+		if err != nil {
+			// Fail closed: with an explicit geometry in the request and no way to
+			// read what the source actually holds, proceeding is the corruption we
+			// are guarding against.
+			return status.Errorf(codes.Internal,
+				"failed to read the stored block geometry of clone source %s: %v", sourceDataset, err)
+		}
+	}
+	return guardCloneSourceGeometry(blockOptsFromDataset(sourceDS), request, sourceRef, datasetName)
+}
+
+// ---------------------------------------------------------------------------
+// Existing-volume mutability policy (codex gate #1)
+//
+// EVERY per-volume block-protocol knob is IMMUTABLE for the life of the volume.
+// A CreateVolume replay whose StorageClass resolves a value that is not already
+// in effect fails closed with FailedPrecondition naming the parameter; nothing
+// is ever accepted-and-ignored.
+//
+// Several of these fields ARE mutable at the TrueNAS 26.0 API level
+// (iscsi.target.update accepts iscsi_parameters.QueuedCommands and
+// auth_networks; iscsi.extent.update accepts avail_threshold, insecure_tpc, ro
+// and serial; nvmet.subsys.update accepts qid_max and pi_enable). The driver
+// deliberately does NOT reconcile them onto a live object, for three reasons:
+//
+//  1. The volume's stored stamp — not the backend object — is what every
+//     publish / startup-reconcile / DR rebuild replays (F-2/F-3). Pushing a new
+//     value to the backend without also re-stamping produces stamp-vs-backend
+//     drift that the next rebuild silently reverts; re-stamping on the
+//     existing-volume arm would add a new fatal write and a new crash window to
+//     a path whose whole job is to be idempotent.
+//  2. Kubernetes treats StorageClass `parameters` as immutable, so a changed
+//     value never arrives as an in-place operator edit — it can only come from a
+//     deleted-and-recreated class or a different class colliding on the same
+//     volume name. Neither is an intent-to-mutate signal for a volume that
+//     already holds data.
+//  3. ro / insecure_tpc / auth_networks / pi_enable are enforced by the target
+//     while an initiator is connected. Silently retargeting a live, mounted
+//     volume's safety posture mid-flight is strictly worse than refusing and
+//     saying why.
+//
+// blocksize / pblocksize are additionally immutable at the DATA level and keep
+// their own dedicated guards and messages.
+// ---------------------------------------------------------------------------
+
+// blockOptConflict renders the FailedPrecondition for an immutable knob.
+func blockOptConflict(datasetName, param, current, requested string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"volume %s already exists with %s=%s; the StorageClass resolves %s. Per-volume block-protocol tuning is fixed at "+
+			"volume create — the driver never reconciles it onto a live share object, because the volume's stored stamp is "+
+			"what every publish and DR rebuild replays, so a backend-only change would be silently reverted. Provision a new "+
+			"volume, or restore %s on the StorageClass",
+		datasetName, param, current, requested, param)
+}
+
+// blockOptIntConflict decides whether an explicitly requested integer is already
+// in effect. live is what the backend reports for the existing object (nil when
+// the backend does not report the field at all); stored is the volume's stamp.
+// The backend is authoritative when it reports the field; the stamp is the
+// fallback ONLY when it does not, so a same-value replay of a tuned volume can
+// never be rejected just because TrueNAS omits a field from its query response.
+func blockOptIntConflict(requested, live, stored *int) (conflict bool, current string) {
+	if requested == nil {
+		return false, ""
+	}
+	if live != nil {
+		if *live == *requested {
+			return false, ""
+		}
+		return true, strconv.Itoa(*live)
+	}
+	if stored != nil {
+		if *stored == *requested {
+			return false, ""
+		}
+		return true, strconv.Itoa(*stored)
+	}
+	return true, "unset"
+}
+
+// blockOptBoolConflict is blockOptIntConflict for booleans.
+func blockOptBoolConflict(requested, live, stored *bool) (conflict bool, current string) {
+	if requested == nil {
+		return false, ""
+	}
+	if live != nil {
+		if *live == *requested {
+			return false, ""
+		}
+		return true, strconv.FormatBool(*live)
+	}
+	if stored != nil {
+		if *stored == *requested {
+			return false, ""
+		}
+		return true, strconv.FormatBool(*stored)
+	}
+	return true, "unset"
+}
+
+// blockOptStringConflict is blockOptIntConflict for strings; "" means the
+// backend did not report the field.
+func blockOptStringConflict(requested, live, stored string) (conflict bool, current string) {
+	if requested == "" {
+		return false, ""
+	}
+	if live != "" {
+		if live == requested {
+			return false, ""
+		}
+		return true, live
+	}
+	if stored != "" {
+		if stored == requested {
+			return false, ""
+		}
+		return true, stored
+	}
+	return true, "unset"
+}
+
+// blockOptNetworksConflict is blockOptIntConflict for the CIDR list. Comparison
+// is order-insensitive so a backend that reorders the ACL is not a conflict.
+func blockOptNetworksConflict(requested, live, stored []string) (conflict bool, current string) {
+	if len(requested) == 0 {
+		return false, ""
+	}
+	if len(live) > 0 {
+		if sameNetworkSet(live, requested) {
+			return false, ""
+		}
+		return true, strings.Join(live, ",")
+	}
+	if len(stored) > 0 {
+		if sameNetworkSet(stored, requested) {
+			return false, ""
+		}
+		return true, strings.Join(stored, ",")
+	}
+	return true, "unset"
+}
+
+func sameNetworkSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := append([]string(nil), a...)
+	right := append([]string(nil), b...)
+	sort.Strings(left)
+	sort.Strings(right)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// guardStoredBlockTuning is guardStoredBlockGeometry for the eight NON-geometry
+// knobs, on the path where the backend object is ABSENT (a DR/restore rebuild).
+// There is nothing live to compare against, so the stamp is the only record of
+// what the volume was provisioned with.
+func guardStoredBlockTuning(stored, request *blockOpts, datasetName string) error {
+	if stored == nil || request == nil {
+		return nil
+	}
+	if conflict, current := blockOptIntConflict(request.iscsiQueuedCommands, nil, stored.iscsiQueuedCommands); conflict {
+		return blockOptConflict(datasetName, paramISCSIQueuedCommands, current, strconv.Itoa(*request.iscsiQueuedCommands))
+	}
+	if conflict, current := blockOptBoolConflict(request.iscsiInsecureTpc, nil, stored.iscsiInsecureTpc); conflict {
+		return blockOptConflict(datasetName, paramISCSIInsecureTpc, current, strconv.FormatBool(*request.iscsiInsecureTpc))
+	}
+	if conflict, current := blockOptBoolConflict(request.iscsiReadOnly, nil, stored.iscsiReadOnly); conflict {
+		return blockOptConflict(datasetName, paramISCSIReadOnly, current, strconv.FormatBool(*request.iscsiReadOnly))
+	}
+	if conflict, current := blockOptIntConflict(request.iscsiAvailThreshold, nil, stored.iscsiAvailThreshold); conflict {
+		return blockOptConflict(datasetName, paramISCSIAvailThreshold, current, strconv.Itoa(*request.iscsiAvailThreshold))
+	}
+	if conflict, current := blockOptStringConflict(request.iscsiSerial, "", stored.iscsiSerial); conflict {
+		return blockOptConflict(datasetName, paramISCSIStableSerial, current, request.iscsiSerial)
+	}
+	if conflict, current := blockOptNetworksConflict(request.iscsiAuthNetworks, nil, stored.iscsiAuthNetworks); conflict {
+		return blockOptConflict(datasetName, paramISCSIAuthNetworks, current, strings.Join(request.iscsiAuthNetworks, ","))
+	}
+	if conflict, current := blockOptIntConflict(request.nvmeofQidMax, nil, stored.nvmeofQidMax); conflict {
+		return blockOptConflict(datasetName, paramNVMeoFQidMax, current, strconv.Itoa(*request.nvmeofQidMax))
+	}
+	if conflict, current := blockOptBoolConflict(request.nvmeofPiEnable, nil, stored.nvmeofPiEnable); conflict {
+		return blockOptConflict(datasetName, paramNVMeoFPiEnable, current, strconv.FormatBool(*request.nvmeofPiEnable))
+	}
+	return nil
+}
+
+// guardExistingISCSIExtentOpts fails a replay closed when the StorageClass asks
+// for an extent value the EXISTING extent does not already carry. Blocksize has
+// its own dedicated data-corruption message (guardISCSIBlocksizeImmutability)
+// and is not repeated here.
+func guardExistingISCSIExtentOpts(extent *truenas.ISCSIExtent, request, stored *blockOpts, datasetName string) error {
+	if extent == nil || request == nil {
+		return nil
+	}
+	if stored == nil {
+		stored = &blockOpts{}
+	}
+	// pblocksize / insecure_tpc / ro are plain booleans that TrueNAS always
+	// reports on iscsi.extent.query, so the live object is authoritative.
+	livePblocksize, liveInsecureTpc, liveReadOnly := extent.Pblocksize, extent.InsecureTpc, extent.Ro
+	if conflict, current := blockOptBoolConflict(request.iscsiPblocksize, &livePblocksize, stored.iscsiPblocksize); conflict {
+		return blockOptConflict(datasetName, paramISCSIPblocksize, current, strconv.FormatBool(*request.iscsiPblocksize))
+	}
+	if conflict, current := blockOptBoolConflict(request.iscsiInsecureTpc, &liveInsecureTpc, stored.iscsiInsecureTpc); conflict {
+		return blockOptConflict(datasetName, paramISCSIInsecureTpc, current, strconv.FormatBool(*request.iscsiInsecureTpc))
+	}
+	if conflict, current := blockOptBoolConflict(request.iscsiReadOnly, &liveReadOnly, stored.iscsiReadOnly); conflict {
+		return blockOptConflict(datasetName, paramISCSIReadOnly, current, strconv.FormatBool(*request.iscsiReadOnly))
+	}
+	if conflict, current := blockOptIntConflict(request.iscsiAvailThreshold, extent.AvailThreshold, stored.iscsiAvailThreshold); conflict {
+		return blockOptConflict(datasetName, paramISCSIAvailThreshold, current, strconv.Itoa(*request.iscsiAvailThreshold))
+	}
+	if conflict, current := blockOptStringConflict(request.iscsiSerial, extent.Serial, stored.iscsiSerial); conflict {
+		return blockOptConflict(datasetName, paramISCSIStableSerial, current, request.iscsiSerial)
+	}
+	return nil
+}
+
+// guardExistingISCSITargetOpts is guardExistingISCSIExtentOpts for the target
+// half (queue depth and the network ACL).
+func guardExistingISCSITargetOpts(target *truenas.ISCSITarget, request, stored *blockOpts, datasetName string) error {
+	if target == nil || request == nil {
+		return nil
+	}
+	if stored == nil {
+		stored = &blockOpts{}
+	}
+	if conflict, current := blockOptIntConflict(request.iscsiQueuedCommands, target.QueuedCommands, stored.iscsiQueuedCommands); conflict {
+		return blockOptConflict(datasetName, paramISCSIQueuedCommands, current, strconv.Itoa(*request.iscsiQueuedCommands))
+	}
+	if conflict, current := blockOptNetworksConflict(request.iscsiAuthNetworks, target.AuthNetworks, stored.iscsiAuthNetworks); conflict {
+		return blockOptConflict(datasetName, paramISCSIAuthNetworks, current, strings.Join(request.iscsiAuthNetworks, ","))
+	}
+	return nil
+}
+
+// guardExistingNVMeoFSubsystemOpts is guardExistingISCSIExtentOpts for the NVMe
+// subsystem. Both fields are nullable on nvmet.subsys.query, so both fall back
+// to the stamp when the backend omits them.
+func guardExistingNVMeoFSubsystemOpts(subsys *truenas.NVMeoFSubsystem, request, stored *blockOpts, datasetName string) error {
+	if subsys == nil || request == nil {
+		return nil
+	}
+	if stored == nil {
+		stored = &blockOpts{}
+	}
+	if conflict, current := blockOptIntConflict(request.nvmeofQidMax, subsys.QidMax, stored.nvmeofQidMax); conflict {
+		return blockOptConflict(datasetName, paramNVMeoFQidMax, current, strconv.Itoa(*request.nvmeofQidMax))
+	}
+	if conflict, current := blockOptBoolConflict(request.nvmeofPiEnable, subsys.PiEnable, stored.nvmeofPiEnable); conflict {
+		return blockOptConflict(datasetName, paramNVMeoFPiEnable, current, strconv.FormatBool(*request.nvmeofPiEnable))
 	}
 	return nil
 }
