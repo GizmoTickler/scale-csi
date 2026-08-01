@@ -176,21 +176,28 @@ single StorageClass but places no such restriction on restoring a
 `VolumeSnapshot` into a different class, so this is reachable in exactly the
 deployment two differently-tuned classes invite.
 
-The source's geometry is read from **both** its stamp and its **live iSCSI
-extent**, on every block clone or restore. A pre-existing 4096 volume is
+For an **iSCSI** source, the source's geometry is read from **both** its stamp
+and its **live iSCSI extent**, on every clone or restore. A pre-existing 4096 volume is
 therefore just as protected as a stamped one: restoring its snapshot into a
 `blocksize: "512"` class is rejected, not accepted with a 512-byte extent laid
 over 4096-geometry data. Where the stamp and the live extent disagree, the clone
 is refused and both values are named — a drifted source has no establishable
 geometry, and the driver will not pick one for you.
 
-A restore into a class that sets **no** geometry inherits the **source's**
+A restore into an iSCSI class that sets **no** geometry inherits the **source's**
 geometry, and that geometry is recorded on the destination. It does not revert to
 the controller default. A class that names no geometry still produces an extent,
 and gating the lookup on "did the class ask" is exactly what let the
 controller-wide default — a helm value, not a StorageClass parameter — silently
-supply the geometry for a no-opts restore. NFS clones and every non-clone path
-pay nothing.
+supply the geometry for a no-opts restore. NVMe-oF uses its namespace path and
+does not run the iSCSI geometry guard; NFS clones and every non-clone path pay
+nothing for it.
+
+NVMe-oF has a separate geometry surface: this driver's TrueNAS namespace
+create/query model exposes no namespace block-size input or reported field, so
+the zvol/platform owns that value. The iSCSI extent stamp, iSCSI live-extent
+probe, and iSCSI recovery error do not apply to NVMe-oF clones or snapshot
+restores, and the driver does not fabricate iSCSI geometry properties for them.
 
 A **PVC-to-PVC clone** asks what the source is addressed through *now*, because
 its temporary snapshot is taken from the source's current state: one source
@@ -205,21 +212,23 @@ source whose extent was re-created at a different geometry after the snapshot wa
 taken would hand the restore a layout the snapshot's data was never written
 against. Provenance is therefore tied to the snapshot itself:
 
-- `CreateSnapshot` records the source's **live** geometry on the snapshot it
-  takes. ZFS captures a dataset's user properties at snapshot time, so this is a
-  durable point-in-time record. It costs one `iscsi.extent.query` per **zvol**
-  snapshot; filesystem snapshots pay nothing.
-- The live extent is consulted **every time**, including for a volume that
-  already records a geometry. A recorded value is a record of a record; the
-  extent is the bytes. Where the two disagree — an extent re-created at a
-  different geometry after the volume was stamped — `CreateSnapshot` **fails
+- For an **iSCSI** source, `CreateSnapshot` records the source's **live** geometry
+  on the snapshot it takes. ZFS captures a dataset's user properties at snapshot
+  time, so this is a durable point-in-time record. It costs one
+  `iscsi.extent.query` per iSCSI zvol snapshot; filesystem and NVMe-oF snapshots
+  pay no iSCSI geometry query.
+- For iSCSI, the live extent is consulted on each snapshot, including for a
+  volume that already records a geometry. A recorded value is a record of a
+  record; the extent is the bytes. Where the two disagree — an extent re-created
+  at a different geometry after the volume was stamped — `CreateSnapshot` **fails
   `FailedPrecondition`** and names both values, rather than capturing a stale
   record onto bytes it does not describe. (Such a volume is already unpublishable
   for the same reason, so nothing that worked stops working.)
-- A restore reads that captured record. When it is present and complete, the
-  restore issues **no source read at all**.
-- A snapshot that captured **no** geometry, whose source shows any history of
-  having been block-addressed, **fails `FailedPrecondition`**. The driver will
+- An iSCSI restore reads that captured record. When it is present and complete,
+  the restore issues **no source read at all**. NVMe-oF restore reads no iSCSI
+  geometry record and continues through namespace creation.
+- An iSCSI snapshot that captured **no** geometry, whose source shows any history
+  of having been block-addressed, **fails `FailedPrecondition`**. The driver will
   not lay a guessed geometry over a snapshot's data. A snapshot of a
   driver-provisioned zvol nothing has ever exported is unaffected — there is no
   layout to preserve. A snapshot of a zvol the driver did **not** create is not
@@ -272,7 +281,10 @@ already holds data, in either direction:
   the driver did not create — imported, attached by an administrator, or restored
   by some other tool — cannot supply that proof and is refused. An *inherited*
   ownership stamp is the source dataset's fact, not the clone's, and does not
-  count.
+  count. Reconciliation may add a separate
+  `truenas-csi:driver_instance_id_adopted` marker to a legacy dataset for
+  cleanup ownership; that marker is not create-time provenance and does not
+  qualify the dataset for this proof.
 - **Two records that disagree are never combined.** Where a destination's own
   record and its content source's record both describe the same bytes and give
   different values, the driver names both and refuses. It never fills the

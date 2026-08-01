@@ -153,14 +153,13 @@ func TestMergeGeometryRefusesDisagreementAndAttributesEachField(t *testing.T) {
 	assert.Contains(t, merged.provenance, "and",
 		"a record assembled from two sources must SAY it was assembled from two sources")
 
-	// And "known" is derived from ATTRIBUTION, not from field presence: a record
-	// whose fields name no evidence can never claim knowledge.
-	unattributed := blockGeometry{blocksize: intPtr(4096), pblocksize: boolPtr(true)}
-	assert.False(t, unattributed.attributed())
-	combined, combineErr := mergeGeometry(unattributed, blockGeometry{}, "pool/parent/pvc")
+	// A half-record remains unresolved after a merge, so physical cannot be
+	// supplied by a controller default.
+	partialOnly := blockGeometry{blocksize: intPtr(4096)}.attribute("the volume's recorded geometry stamp")
+	combined, combineErr := mergeGeometry(partialOnly, blockGeometry{}, "pool/parent/pvc")
 	require.NoError(t, combineErr)
 	assert.NotEqual(t, geometryKnown, combined.knowledge,
-		"two non-nil pointers are field PRESENCE; knowledge requires each field to name its evidence")
+		"a partial record must not claim known geometry")
 }
 
 // ---------------------------------------------------------------------------
@@ -211,10 +210,9 @@ func TestCreateSnapshotRefusesToCaptureAStaleStamp(t *testing.T) {
 }
 
 // TestCreateSnapshotCapturesLiveGeometryWithoutTargetMarkers is the second half
-// of round-6 HIGH 2: storedBlockProtocol only checks the target and
-// target-extent IDs, so an iSCSI zvol missing those two properties skipped the
-// live capture probe entirely and its snapshot captured nothing at all. The
-// probe is now driven by the dataset TYPE.
+// of round-6 HIGH 2: an iSCSI zvol missing its target markers still has a live
+// extent and must be probed for snapshot capture. Protocol detection accepts
+// that extent identity while the geometry read remains driven by iSCSI.
 //
 // FAILS ON bdf3c36: yes. VERIFIED EMPIRICALLY by restoring the
 // storedBlockProtocol gate and re-running: the snapshot carries no geometry key
@@ -229,8 +227,8 @@ func TestCreateSnapshotCapturesLiveGeometryWithoutTargetMarkers(t *testing.T) {
 	}))
 	require.NoError(t, err)
 
-	// Strip everything storedBlockProtocol looks at, and the geometry stamp, but
-	// leave the extent live. This is the imported / partially-stripped zvol.
+	// Strip the target markers and geometry stamp, but leave the extent identity
+	// and live extent. This is the imported / partially-stripped zvol shape.
 	require.NoError(t, client.DatasetRemoveUserProperties(ctx, "pool/parent/pvc-nomarkers", []string{
 		PropISCSITargetID, PropISCSITargetExtentID, PropBlockISCSIBlocksize, PropBlockISCSIPblocksize,
 	}))
@@ -816,8 +814,8 @@ func TestMockSnapshotInheritsEveryUserProperty(t *testing.T) {
 	assert.Equal(t, "17", snap.UserProperties[PropISCSIExtentID].Value,
 		"a ZFS snapshot carries the WITNESS properties too, not just the geometry keys")
 	assert.Equal(t, "inherit-src", snap.UserProperties[PropCSIVolumeName].Value)
-	_, hasSentinel := snap.UserProperties[PropNFSShareID]
-	assert.False(t, hasSentinel, "a ZFS '-' sentinel is not a property and is not inherited")
+	assert.Equal(t, "-", snap.UserProperties[PropNFSShareID].Value,
+		"a ZFS '-' value remains a property and is inherited; removal uses a separate property update")
 	assert.Equal(t, "inherit-point", snap.UserProperties[PropCSISnapshotName].Value,
 		"explicitly written snapshot properties still win over inherited ones")
 }

@@ -422,32 +422,38 @@ The stamps are adopted, not the reaper weakened.
 
 - **Data safety — guarded stamp-adoption pass.** A new reconcile step runs in
   every pass (before tombstone sweeping, so a freshly adopted source unblocks
-  reaping in the SAME pass) and stamps `driver_instance_id` onto a legacy
-  managed dataset only when ALL hold: it sits strictly under the CSI parent and
-  is a valid volume leaf (not the `.csi-bookkeeping` dataset); a source-bearing
-  re-read (the batch-12 `DatasetGet` pattern, never the sourceless listing)
-  proves a LOCAL `managed_resource=true` AND a LOCAL `csi_volume_name` matching
-  the dataset leaf; the dataset carries NO existing `driver_instance_id` of ANY
-  source; and a live **Bound** PersistentVolume of THIS driver references it
-  (live clientset list, not informer caches). The write goes through the proven
-  `stampAndMirror` user-property path used at create time and is verified by a
-  source-bearing re-read before it counts as adopted. Adoptions are capped at
-  `maxPerRun` per pass as a blast-radius bound and reported in
+  reaping in the SAME pass) and stamps `driver_instance_id` plus a distinct
+  `driver_instance_id_adopted` marker onto a legacy managed dataset only when
+  ALL hold: it sits strictly under the CSI parent and is a valid volume leaf
+  (not the `.csi-bookkeeping` dataset); a source-bearing re-read (the batch-12
+  `DatasetGet` pattern, never the sourceless listing) proves a LOCAL
+  `managed_resource=true` AND a LOCAL `csi_volume_name` matching the dataset
+  leaf; the dataset carries NO existing `driver_instance_id` of ANY source; and
+  a live **Bound** PersistentVolume of THIS driver references it (live clientset
+  list, not informer caches). The write goes through the proven `stampAndMirror`
+  user-property path and is verified by a source-bearing re-read before it
+  counts as adopted. The adoption marker preserves cleanup ownership while
+  excluding the dataset from the create-time iSCSI data-free proof. Adoptions
+  are capped at `maxPerRun` per pass as a blast-radius bound and reported in
   `ReconcileReport.AdoptedStamps` (+ count in the detection-complete summary line
   and one klog line per adoption).
   - **Absolute rule:** an existing `driver_instance_id` — local, inherited, or
     foreign — is NEVER overwritten. A dataset stamped by another driver instance
     sharing a pool is left untouched (never hijacked). The absence is re-proved
     under the per-volume lock immediately before the write.
-  - **Why a write runs in detection mode:** the step only ADDS provenance to
+  - **Why a write runs in detection mode:** the step adds cleanup ownership to
     datasets that are provably this cluster's Bound volumes; it deletes nothing;
-    and it is required for the delete-mode reaper to ever act on legacy
-    tombstones. It is not gated by `delete.enabled`.
+    and it is required for the delete-mode reaper to act on legacy tombstones.
+    It is not gated by `delete.enabled`.
   - **Fail-safe:** a PV-list error, or an empty PV list for the whole driver,
     adopts NOTHING that pass (an API discontinuity is not evidence).
-  - **Residual:** a legacy dataset that is NOT currently Bound is never adopted,
+  - **Residual:** a legacy dataset that is NOT currently Bound is not adopted,
     so its tombstones stay refused (fail-safe); operators can bind it or clean it
-    up manually.
+    up manually. A driver-owned volume whose eleven witness properties are
+    stripped can still pass the default data-free proof without an error; the
+    fatal create-time fold added on this branch prevents new provisioning from
+    entering that shape, but released volumes with a warning-only write failure
+    may already have it.
 - **Hygiene — comment typo.** The spent-restore classification comment referenced
   `deleteDetachedOrphans`; it now correctly reads `deleteDetectedOrphans`.
 

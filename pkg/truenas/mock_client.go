@@ -718,8 +718,9 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 	// need a snapshot to look like a NON-CSI snapshot must set up a dataset that
 	// does not carry the CSI markers, rather than relying on the mock to drop them.
 	//
-	// The sentinel rule is real ZFS too: a property whose value is "-" or empty is
-	// not a property, so it is not inherited.
+	// A ZFS user property whose value is "-" is still a local property and is
+	// inherited by a snapshot. Removing a property is a separate remove update;
+	// the mock follows that distinction here.
 	for key, prop := range m.datasetUserPropertiesLocked(dataset) {
 		snap.UserProperties[key] = prop
 	}
@@ -739,7 +740,7 @@ func (m *MockClient) datasetUserPropertiesLocked(dataset string) map[string]User
 	}
 	inherited := make(map[string]UserProperty, len(ds.UserProperties))
 	for key, prop := range ds.UserProperties {
-		if prop.Value == "" || prop.Value == "-" {
+		if prop.Value == "" {
 			continue
 		}
 		inherited[key] = prop

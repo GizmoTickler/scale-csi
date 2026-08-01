@@ -251,14 +251,14 @@ func TestPblocksizeCloneConflictFailsClosed(t *testing.T) {
 // a source that may have been written against something else. A guard that is
 // cheap because it is blind is not cheap.
 //
-// A BLOCK clone/restore therefore resolves the source's real geometry ALWAYS:
+// An iSCSI clone/restore resolves the source's real geometry:
 // one DatasetGet for the source's stamp (skipped where the caller already holds
 // the source dataset — the volume-clone path does) plus one ISCSIExtentFindByDisk
 // for its live extent, which is the only thing that can answer for the pre-GF4
 // fleet. The answer is stamped on the destination, so it is paid once per clone
-// and never again per rebuild. Everything else is untouched: NFS short-circuits
-// on share type before any call, and fresh provisioning / publish / unpublish /
-// reconcile keep the golden counts in TestControllerGoldenPathAPICallCounts and
+// and not again per rebuild. NVMe-oF and NFS short-circuit on share type before
+// any iSCSI call, and fresh provisioning / publish / unpublish / reconcile keep
+// the golden counts in TestControllerGoldenPathAPICallCounts and
 // TestControllerPublishUnpublishGoldenAPICallCounts exactly as they were.
 func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 	// (1) The resolution measured in isolation, which is the only way to state
@@ -352,7 +352,7 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 	})
 
 	// (2) The end-to-end totals, pinned so a future change has to argue with a
-	// number. Every block restore costs the SAME whatever the class says — the
+	// number. Every iSCSI restore costs the SAME whatever the class says — the
 	// uniformity is the point: no shape of request can buy its way past the
 	// resolution by declining to have an opinion.
 	t.Run("end-to-end restore totals", func(t *testing.T) {
@@ -1499,6 +1499,8 @@ func TestDriftedCloneSourceIsRefused(t *testing.T) {
 		message := status.Convert(err).Message()
 		assert.Contains(t, message, "512", "the refusal must name the recorded value")
 		assert.Contains(t, message, "4096", "and the live one")
+		assert.Contains(t, message, "two records of the SAME bytes",
+			"the clone arm must use the conflict-rejecting source reconciler, not merely reject the request against one side")
 		_, getErr := client.DatasetGet(ctx, "pool/parent/pvc-drift-dst")
 		assert.True(t, truenas.IsNotFoundError(getErr), "the refusal must precede the first destination mutation")
 	})

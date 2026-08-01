@@ -25,8 +25,13 @@ import (
 
 // ZFS property names for tracking CSI resources
 const (
-	PropManagedResource           = "truenas-csi:managed_resource"
-	PropDriverInstanceID          = "truenas-csi:driver_instance_id"
+	PropManagedResource  = "truenas-csi:managed_resource"
+	PropDriverInstanceID = "truenas-csi:driver_instance_id"
+	// PropDriverInstanceIDAdopted marks an ownership stamp written by legacy
+	// reconciliation rather than by createDataset. It keeps adoption useful for
+	// cleanup provenance without making pre-existing bytes eligible for a
+	// create-time data-free proof.
+	PropDriverInstanceIDAdopted   = "truenas-csi:driver_instance_id_adopted"
 	PropProvisionSuccess          = "truenas-csi:provision_success"
 	PropCSIVolumeName             = "truenas-csi:csi_volume_name"
 	PropShareVolumeContext        = "truenas-csi:csi_share_volume_context"
@@ -964,7 +969,7 @@ func storedBlockProtocol(ds *truenas.Dataset, shareType ShareType) bool {
 	var properties []string
 	switch shareType {
 	case ShareTypeISCSI:
-		properties = []string{PropISCSITargetID, PropISCSITargetExtentID}
+		properties = []string{PropISCSITargetID, PropISCSIExtentID, PropISCSITargetExtentID}
 	case ShareTypeNVMeoF:
 		properties = []string{PropNVMeoFSubsystemID, PropNVMeoFNamespaceID}
 	default:
@@ -1739,19 +1744,22 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	}
 	// GEOMETRY PROVENANCE (round 5). A restore has to know the layout of the bytes
 	// IN THIS SNAPSHOT, and the source's state at RESTORE time cannot answer that
-	// — the extent can be re-created at a different geometry in between. Capture
-	// it HERE, where "now" IS the snapshot's content, and fold it into the create's
-	// own property write. Zero extra round trips for a volume the driver has
-	// already stamped; one ISCSIExtentFindByDisk for a zvol that is not stamped
-	// yet, which is the pre-GF4 fleet and exactly the population whose snapshots
-	// would otherwise be unrestorable.
+	// — the extent can be re-created at a different geometry in between. For an
+	// iSCSI source, capture it HERE, where "now" IS the snapshot's content, and
+	// fold it into the create's own property write. NVMe-oF has no iSCSI extent
+	// geometry to capture, so it follows its namespace path without this probe.
 	// ROUND 6: this returns an ERROR when the volume's stamp and its live extent
 	// disagree. Capturing either one would be a guess about which describes the
 	// bytes in this snapshot, and the restore that reads it back would act on that
 	// guess — so the snapshot is refused instead. The volume is already
 	// unpublishable in that state (guardStampedVsLiveGeometry), so this costs no
 	// availability that was not already lost.
-	geometryProps, geometryErr := d.snapshotGeometryProps(ctx, sourceDataset, datasetName)
+	// The geometry capture is iSCSI-specific. NVMe-oF's namespace is the
+	// protocol object and this client exposes no namespace block-size setting to
+	// compare; its namespace witness must not route the snapshot through an
+	// iSCSI extent lookup.
+	sourceShareType := shareTypeForPublishedVolume(sourceDataset, nil)
+	geometryProps, geometryErr := d.snapshotGeometryProps(ctx, sourceDataset, datasetName, sourceShareType)
 	if geometryErr != nil {
 		return nil, geometryErr
 	}
@@ -2770,18 +2778,19 @@ func (d *Driver) handleVolumeContentSource(
 		// overwritten. The SOURCE's real geometry is the only honest comparand and
 		// it has to be read here, before anything is written.
 		//
-		// Round 4: this runs for EVERY block restore, not only for a class that
+		// Round 4: for an iSCSI restore this runs whether or not the class
 		// opts into a geometry. A no-opts restore still creates an extent, and
 		// before this that extent was created at whatever the controller-wide
 		// default (`iscsi.extentBlocksize`) happened to be — laid over data cloned
 		// byte-for-byte from a source that may have been written against something
 		// else entirely. The resolved source geometry is stamped onto the
 		// destination in the folds below, so no later rebuild consults the default
-		// either. NFS pays nothing: the resolver short-circuits on share type.
+		// either. NVMe-oF and NFS pay nothing: the resolver short-circuits on
+		// share type.
 		//
-		// Round 5: the SNAPSHOT is passed, not just its dataset name. The bytes
-		// being restored are the snapshot's, and the source dataset's current stamp
-		// and current live extent describe the source NOW — a source whose extent
+		// Round 5: for iSCSI, the SNAPSHOT is passed, not just its dataset name.
+		// The bytes being restored are the snapshot's, and the source dataset's
+		// current stamp and current live extent describe the source NOW — a source whose extent
 		// was re-created at a different geometry after this snapshot was taken
 		// would otherwise hand the restore a geometry its data was never written
 		// against. Provenance now comes from the stamp the snapshot itself

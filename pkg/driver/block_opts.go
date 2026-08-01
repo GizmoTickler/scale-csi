@@ -698,16 +698,17 @@ func guardStoredBlockGeometry(stored, request *blockOpts, datasetName string) er
 // a different class, so "restore a 4096 volume into a 512 class" is reachable in
 // exactly the deployment two differently-tuned classes invite.
 //
-// It fires ONLY when both sides are explicit. A restore into a class that opts
+// It fires ONLY when both iSCSI sides are explicit. A restore into an iSCSI class that opts
 // into nothing has nothing to contradict and is left alone HERE — but it does
 // not therefore inherit the controller default: its destination is stamped with
 // the source geometry resolved by resolveCloneSourceBlockGeometry, which runs
-// for every block clone whether or not the class said anything.
+// for every iSCSI clone whether or not the class said anything. NVMe-oF uses its
+// namespace path and does not enter this resolver.
 //
-// A source with no STAMP is not "no geometry" either: its geometry is resolved
-// from its live iSCSI extent before this runs, because every volume provisioned
-// before these knobs existed is unstamped and is exactly the installed base a
-// newly-knobbed StorageClass gets pointed at.
+// An iSCSI source with no STAMP is not "no geometry" either: its geometry is
+// resolved from its live iSCSI extent before this runs, because every volume
+// provisioned before these knobs existed is unstamped and is exactly the
+// installed base a newly-knobbed StorageClass gets pointed at.
 func guardCloneSourceGeometry(sourceOpts blockGeometry, request *blockOpts, sourceRef, datasetName string) error {
 	if request == nil {
 		return nil
@@ -767,11 +768,12 @@ func guardCloneSourceGeometry(sourceOpts blockGeometry, request *blockOpts, sour
 //     ZFS "-" sentinel as presence — because a detached copy writes exactly that
 //     sentinel BECAUSE the dataset holds somebody else's bytes.
 //
-//  5. SNAPSHOT PROVENANCE IS THE SNAPSHOT'S. A restore resolves geometry from
-//     the stamp the SNAPSHOT captured, never from the source's current state,
-//     which describes the source now. CreateSnapshot stamps every snapshot it
-//     takes; a snapshot that captured nothing and whose source has block-data
-//     history fails closed.
+//  5. SNAPSHOT PROVENANCE IS THE SNAPSHOT'S. An iSCSI restore resolves geometry
+//     from the stamp the SNAPSHOT captured, never from the source's current
+//     state, which describes the source now. CreateSnapshot stamps each iSCSI
+//     snapshot it takes; an iSCSI snapshot that captured nothing and whose
+//     source has block-data history fails closed. NVMe-oF uses its namespace
+//     path instead.
 //
 //  6. RECORD WHAT WE CREATED. The share builder folds the extent's actual
 //     geometry AND the extent-ID witness into the caller's FATAL property update
@@ -794,14 +796,14 @@ func guardCloneSourceGeometry(sourceOpts blockGeometry, request *blockOpts, sour
 // freezes the observable state rather than repairing the history. Only an
 // operator who knows the original geometry can correct such a volume.
 //
-// Cost, stated honestly: a PVC-to-PVC BLOCK clone pays one source DatasetGet
+// Cost, stated honestly: a PVC-to-PVC iSCSI clone pays one source DatasetGet
 // (skipped when the caller already has the source dataset) plus one source
-// ISCSIExtentFindByDisk. A BLOCK snapshot restore pays NOTHING when the snapshot
+// ISCSIExtentFindByDisk. An iSCSI snapshot restore pays NOTHING when the snapshot
 // carries its own geometry stamp (round 4 paid two calls here) and one
 // DatasetGet when it does not. CreateSnapshot pays one ISCSIExtentFindByDisk for
-// a zvol whose dataset is not yet stamped, and nothing once it is. Fresh
-// provisioning, publish, unpublish, reconcile and every NFS path pay nothing
-// extra.
+// each iSCSI zvol snapshot, including a dataset that already carries a stamp,
+// so a stale stamp cannot be captured without checking the live extent. NVMe-oF
+// and NFS paths pay no iSCSI geometry calls.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -880,12 +882,11 @@ func (k geometryKnowledge) String() string {
 // ROUND 6. Each FIELD additionally names the evidence IT came from
 // (blocksizeFrom / pblocksizeFrom). Round 5 kept one provenance string for the
 // whole record, which is what made a manufactured record indistinguishable from
-// an observed one: mergeGeometry filled each field independently, recomputed
-// "known" from mere field PRESENCE, and never noticed that the two halves came
-// from sources that disagreed. Per-field attribution is what lets
-// mergeGeometry refuse a disagreement and name both sides of it, and it is what
-// makes "known" mean "every field is attributed to a named body of evidence"
-// rather than "both pointers happen to be non-nil".
+// an observed one: mergeGeometry filled each field independently and never
+// noticed that the two halves came from sources that disagreed. The per-field
+// names let mergeGeometry refuse a disagreement and identify both records in
+// the error; a complete record returned by the production constructors is the
+// known geometry.
 type blockGeometry struct {
 	knowledge      geometryKnowledge
 	blocksize      *int
@@ -896,9 +897,8 @@ type blockGeometry struct {
 }
 
 // unattributedGeometry is the provenance a constructor falls back to when its
-// caller named no evidence. It is deliberately NOT the empty string: an empty
-// per-field provenance makes a record unattributed, and an unattributed record
-// can never be geometryKnown (see attributed).
+// caller named no evidence. It remains visible in diagnostics rather than
+// making a missing provenance look like a backend observation.
 const unattributedGeometry = "an unattributed geometry record"
 
 // complete reports whether BOTH geometry fields are resolved. A half-resolved
@@ -906,17 +906,6 @@ const unattributedGeometry = "an unattributed geometry record"
 // from the mutable controller default while logical came from the stamp.
 func (g blockGeometry) complete() bool {
 	return g.blocksize != nil && g.pblocksize != nil
-}
-
-// attributed is the stronger predicate "known" is derived from: both fields are
-// resolved AND each one names the evidence it came from. complete() alone is
-// field PRESENCE, which is exactly what round 5 recomputed geometryKnown from —
-// so a record assembled field-by-field from unrelated sources certified itself
-// as known. A record may only claim knowledge about bytes when every field in it
-// can say which body of evidence about those bytes produced it.
-func (g blockGeometry) attributed() bool {
-	return g.blocksize != nil && g.blocksizeFrom != "" &&
-		g.pblocksize != nil && g.pblocksizeFrom != ""
 }
 
 // props renders the geometry keys this record carries, for stamping onto a
@@ -936,9 +925,9 @@ func (g blockGeometry) props() map[string]string {
 	return props
 }
 
-// attribute stamps every RESOLVED field of a freshly constructed record with the
-// evidence it came from, and derives knowledge from ATTRIBUTION rather than from
-// field presence. It is the only way a blockGeometry becomes geometryKnown.
+// attribute stamps every resolved field of a freshly constructed record with
+// the evidence it came from. The field names are used to explain conflicts;
+// completeness is what makes the constructed record known.
 func (g blockGeometry) attribute(provenance string) blockGeometry {
 	if provenance == "" {
 		provenance = unattributedGeometry
@@ -952,7 +941,7 @@ func (g blockGeometry) attribute(provenance string) blockGeometry {
 	if g.provenance == "" {
 		g.provenance = provenance
 	}
-	if g.attributed() {
+	if g.complete() {
 		g.knowledge = geometryKnown
 	}
 	return g
@@ -1078,8 +1067,9 @@ func mergeGeometry(primary, fill blockGeometry, subject string) (blockGeometry, 
 		merged.pblocksizeFrom = fill.pblocksizeFrom
 	}
 	merged.provenance = mergedProvenance(merged)
-	// Knowledge is derived from ATTRIBUTION, never from presence alone.
-	if merged.attributed() {
+	// A conflict has already been rejected for every field both records carry;
+	// once both fields are present, the merged record is usable.
+	if merged.complete() {
 		merged.knowledge = geometryKnown
 	} else if merged.knowledge == geometryKnown {
 		merged.knowledge = geometryUnexamined
@@ -1170,24 +1160,19 @@ func datasetMayHoldBlockData(ds *truenas.Dataset) (mayHoldData bool, witness str
 //	(P1) THIS CALL CREATED IT. DatasetCreate produced the zvol during this very
 //	     CreateVolume, so nothing has ever been written to it. Established by the
 //	     caller (freshlyCreated), not by reading properties at all.
-//	(P2) THIS DRIVER INSTANCE CREATED IT, AND ITS OWN COMPLETE RECORD OF EVERY
-//	     OPERATION IT HAS EVER PERFORMED ON IT CONTAINS NO BLOCK SHARE. The
-//	     dataset carries THIS driver instance's ownership stamp with ZFS source
-//	     `local` — written by createDataset, and never inheritable, so a clone
-//	     cannot borrow its source's — which says: this dataset was created here,
-//	     and nothing but this driver has ever provisioned it. Only against a
-//	     history the driver OWNS is "our record contains no block share" a
-//	     statement about the bytes rather than a statement about our own
-//	     ignorance.
+//	(P2) createDataset created the zvol for THIS driver instance, and the dataset
+//	     carries that instance's local ownership stamp with no block-history
+//	     witness. This is creation-time provenance, not a complete audit log of
+//	     every later operation: the adoption path writes a separate marker and
+//	     cannot satisfy this proof, while a clone-inherited ownership value is
+//	     rejected because it describes the source dataset.
 //
-// The residual, stated honestly: (P2) would still be wrong for a dataset this
-// driver created, exported, and then lost BOTH witness writes for. Round 5's
-// fold is what makes that a rolled-back provisioning rather than a silent gap —
-// the extent-ID witness and the geometry now ride CreateVolume's FATAL
-// managed-property update as well as the warning-only one, so losing the witness
-// means losing the volume, not keeping a volume with no record. (P2) is a claim
-// about a history this driver controls; it is not a claim about bytes whose
-// history it does not.
+// The residual, stated honestly: stripping all eleven witness properties from
+// a driver-owned volume still leaves it eligible for a default rebuild without
+// an error. The fatal fold is new on this branch, so a released volume whose
+// warning-only property write failed can already have that shape. (P2) is a
+// claim about this driver's ownership model, not a complete record of bytes
+// written after creation.
 //
 // Everything else — including the previously-permitted "a bare zvol with no
 // CSI properties at all" — is now UNKNOWN and fails closed. That is a
@@ -1204,16 +1189,21 @@ func (d *Driver) blockDataFreeProof(ds *truenas.Dataset) (proof string, ok bool)
 	if ds == nil {
 		return "the dataset could not be read", false
 	}
+	// Adoption proves legacy cleanup ownership, not that this driver created the
+	// blank zvol. Keep it distinct from the create-time proof below.
+	if adopted, present := datasetUserPropertyProjection(ds, PropDriverInstanceIDAdopted); present {
+		return fmt.Sprintf("its %s marker records legacy ownership adoption (%q), so the driver has no create-time proof that the bytes are data-free",
+			PropDriverInstanceIDAdopted, adopted.Value), false
+	}
 	// A witness beats everything: the driver's own record says these bytes have
 	// been block-addressed.
 	if mayHoldData, witness := datasetMayHoldBlockData(ds); mayHoldData {
 		return fmt.Sprintf("%s records that it has been block-addressed", witness), false
 	}
-	// LOCAL ownership by THIS instance. `local` is load-bearing twice over: a ZFS
-	// clone inherits its source's ownership stamp non-locally, and a clone
-	// destination is the one thing that certainly DOES carry somebody else's
-	// bytes; and a dataset stamped by a different driver instance has a history
-	// this instance cannot account for.
+	// LOCAL ownership by THIS instance is the create-time provenance check. A ZFS
+	// clone inherits its source's ownership stamp non-locally, and a dataset
+	// stamped by a different driver instance has a history this instance cannot
+	// account for.
 	if !datasetHasLocalUserProperty(ds, PropDriverInstanceID, d.driverInstanceID()) {
 		owner, present := datasetUserPropertyProjection(ds, PropDriverInstanceID)
 		switch {
@@ -1228,8 +1218,8 @@ func (d *Driver) blockDataFreeProof(ds *truenas.Dataset) (proof string, ok bool)
 				"has been written to it", PropDriverInstanceID, owner.Value, d.driverInstanceID()), false
 		}
 	}
-	return fmt.Sprintf("this driver instance created it (local %s) and its own complete record of every operation it has "+
-		"performed on it contains no block share", PropDriverInstanceID), true
+	return fmt.Sprintf("this driver instance created it through the create-time path (local %s) and no block-history witness is present",
+		PropDriverInstanceID), true
 }
 
 // observedGeometryProps is mechanism (1): back-stamp the geometry of an extent
@@ -1300,10 +1290,9 @@ func guardStampedVsLiveGeometry(stored *blockOpts, extent *truenas.ISCSIExtent, 
 	return nil
 }
 
-// extentGeometry is the ONE complete, validated record an iSCSI extent is
-// created from. Both fields are concrete; there is no way to construct one where
-// only half the geometry was resolved, which is what makes "logical from the
-// stamp, physical from today's helm value" unrepresentable.
+// extentGeometry is the complete, validated record an iSCSI extent is created
+// from. Both fields are concrete; resolveExtentGeometry supplies them together
+// after it has selected evidence or a permitted data-free path.
 type extentGeometry struct {
 	blocksize  int
 	pblocksize bool
@@ -1350,8 +1339,8 @@ func resolvedGeometryFromContext(ctx context.Context) (blockGeometry, bool) {
 //     mutated; geometryNoHistory means the source provably held no
 //     block-addressed data, so the destination holds none either.
 //  3. The volume's own durable stamp, merged with (2).
-//  4. No witness in blockDataHistoryWitnesses — this storage has never been
-//     block-addressed by anything the driver can see, so the default cannot lie.
+//  4. A positive blockDataFreeProof. Absence of witnesses is not sufficient;
+//     this branch is reached only when the create-time ownership proof applies.
 //  5. Otherwise: UNKNOWN. Fail closed, naming BOTH properties an operator can
 //     record to recover. This is the state in which every previous round quietly
 //     wrote the current helm default over old data.
@@ -1403,8 +1392,10 @@ func (d *Driver) resolveExtentGeometry(
 		}
 	}
 
-	// (3) A complete record, every field attributed to evidence about the bytes.
-	if evidence.attributed() {
+	// (3) A complete record assembled from the stored geometry and any source
+	// record. mergeGeometry has already rejected disagreements between fields
+	// that both records carried.
+	if evidence.complete() {
 		if err := guardRequestAgainstEvidence(requestOpts, evidence, datasetName); err != nil {
 			return extentGeometry{}, err
 		}
@@ -1470,9 +1461,10 @@ func guardRequestAgainstEvidence(request *blockOpts, evidence blockGeometry, dat
 	return nil
 }
 
-// unknownGeometryError is the single fail-closed message for rule (a). It names
-// BOTH properties, because a record that resolves only logical is exactly the
-// half-resolved state that let physical come from the mutable controller default.
+// unknownGeometryError is the iSCSI fail-closed message for rule (a). It names
+// both iSCSI properties because a record that resolves only logical is the
+// half-resolved state that lets physical come from the mutable controller
+// default.
 func (d *Driver) unknownGeometryError(datasetName, reason string) error {
 	return status.Errorf(codes.FailedPrecondition,
 		"cannot create the iSCSI extent for %s: %s, so the driver cannot establish the geometry its data is addressed "+
@@ -1515,18 +1507,19 @@ func validateExtentAgainstGeometry(extent *truenas.ISCSIExtent, geometry extentG
 	return nil
 }
 
-// resolveCloneSourceBlockGeometry is mechanism (3). It answers "what geometry is
-// the data we are about to clone actually addressed through", rejects a request
-// that contradicts that answer, and returns the properties that record it on the
-// DESTINATION so no later path has to ask again.
+// resolveCloneSourceBlockGeometry is the iSCSI geometry mechanism. It answers
+// "what geometry is the data we are about to clone actually addressed through",
+// rejects a request that contradicts that answer, and returns the properties
+// that record it on the DESTINATION so no later iSCSI path has to ask again.
 //
-// It runs for EVERY block clone/restore, not only for a class that opts into a
+// It runs for every iSCSI clone/restore, not only for a class that opts into a
 // geometry. That is the round-4 correction: a class with no geometry parameter
 // still produces an extent, and before this the extent it produced was created
 // at the current controller default — over data cloned byte-for-byte from a
-// source that may have been written against something else entirely. Gating this
-// on hasExplicitGeometry made the default invisible to the guard; the guard has
-// to see it precisely because nobody else does.
+// source that may have been written against something else entirely. NVMe-oF
+// takes a separate path: this client's namespace create/query surface exposes
+// no namespace block-size option or field, so the zvol/platform supplies that
+// geometry and this iSCSI resolver does not make a claim about it.
 //
 // sourceDS may be supplied by a caller that already queried the source (the
 // volume-clone path does), which saves the DatasetGet there. NFS short-circuits
@@ -1562,7 +1555,7 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 	sourceRef, datasetName string,
 	shareType ShareType,
 ) (blockGeometry, error) {
-	if !shareType.IsBlockProtocol() {
+	if shareType != ShareTypeISCSI {
 		return blockGeometry{knowledge: geometryUnexamined}, nil
 	}
 
@@ -1639,9 +1632,9 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 	}
 }
 
-// snapshotGeometryProps renders the geometry a new snapshot of datasetName must
-// CAPTURE so that a later restore has provenance tied to the snapshot rather
-// than to whatever the source looks like at restore time.
+// snapshotGeometryProps renders the iSCSI geometry a new snapshot of
+// datasetName must capture so that a later restore has provenance tied to the
+// snapshot rather than to whatever the source looks like at restore time.
 //
 // A failure to READ the live geometry is best-effort, and that is safe in
 // exactly one direction: a snapshot whose geometry could not be captured is
@@ -1658,20 +1651,21 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 //     whose extent was later re-created at 512 therefore had the stale 4096
 //     captured onto a snapshot of bytes that are now addressed at 512, and the
 //     restore would then create a 4096 extent over them. The live-vs-stamp guard
-//     existed but only the share-rebuild path called it. The live extent is now
-//     ALWAYS consulted, it is the PRIMARY record (it is what the bytes are), and
-//     a stamp that contradicts it fails the snapshot rather than being captured.
+//     existed but only the share-rebuild path called it. For iSCSI, the live
+//     extent is consulted and is the PRIMARY record (it is what the bytes are),
+//     while a stamp that contradicts it fails the snapshot rather than being
+//     captured.
 //   - Round 5 also skipped the live probe entirely unless storedBlockProtocol
 //     found a target or target-extent ID, so an iSCSI zvol missing those two
 //     properties — the imported, the stripped, the pre-GF4 — captured nothing at
-//     all. The probe is now driven by the dataset TYPE: every zvol is asked.
+//     all. The iSCSI probe is driven by the source protocol, including an
+//     iSCSI zvol with those target properties missing.
 //
-// Cost: nil (no call) for a filesystem dataset. ONE ISCSIExtentFindByDisk for
-// every zvol snapshot, including volumes the driver has already stamped (round 5
-// charged this only to unstamped zvols, which is exactly the saving that made
-// the stale-stamp capture possible).
-func (d *Driver) snapshotGeometryProps(ctx context.Context, ds *truenas.Dataset, datasetName string) (map[string]string, error) {
-	if ds == nil || !strings.EqualFold(ds.Type, "VOLUME") {
+// Cost: nil (no call) for a filesystem dataset and for an NVMe-oF volume. An
+// iSCSI zvol pays one ISCSIExtentFindByDisk, including a volume that already
+// carries a stamp, because the live read catches a stale stamp.
+func (d *Driver) snapshotGeometryProps(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) (map[string]string, error) {
+	if shareType != ShareTypeISCSI || ds == nil || !strings.EqualFold(ds.Type, "VOLUME") {
 		return nil, nil
 	}
 	stamped := stampGeometry(blockOptsFromDataset(ds), "the volume's recorded geometry stamp")

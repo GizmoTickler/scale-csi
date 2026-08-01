@@ -504,7 +504,7 @@ func (d *Driver) contentSourceBlockGeometry(
 	source *csi.VolumeContentSource,
 	shareType ShareType,
 ) (blockGeometry, error) {
-	if !shareType.IsBlockProtocol() {
+	if shareType != ShareTypeISCSI {
 		return blockGeometry{knowledge: geometryUnexamined}, nil
 	}
 	var (
