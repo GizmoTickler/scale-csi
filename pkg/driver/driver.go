@@ -154,6 +154,19 @@ type Driver struct {
 	// backendHealthFlipSamples, so a flapping pool cannot rewrite every managed
 	// PVC's VolumeCondition on every tick.
 	backendHealthPendingFlips atomic.Int64
+	// backendHealthPublishMu makes the snapshot POINTER and the
+	// scale_csi_pool_health_stale GAUGE change ATOMICALLY WITH RESPECT TO EACH
+	// OTHER. Two goroutines write that pair — the poller (a successful sample
+	// clears staleness and stores a fresh snapshot) and the CSI read path (an
+	// expired snapshot raises staleness) — and the pair is what an operator
+	// reads. Without one critical section covering BOTH, a reader that decides
+	// on snapshot S, and a poller that clears the gauge for a sample it has not
+	// yet stored, produce a LOST UPDATE: a fresh cached sample carrying
+	// stale = 1 forever. That is not a Go data race, so `go test -race` cannot
+	// see it, and re-reading the pointer AFTER an unsynchronized gauge write is
+	// not synchronization — the write and the re-read must be inside the same
+	// critical section the publisher uses.
+	backendHealthPublishMu sync.Mutex
 
 	// Background fencing state. Missing-record observations are in-memory on
 	// purpose: a controller restart restarts the full grace period rather than

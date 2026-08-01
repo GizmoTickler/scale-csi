@@ -84,6 +84,15 @@ func (c *Client) PoolHealth(ctx context.Context, pool string) (*PoolHealthSnapsh
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pool %s: %w", pool, err)
 	}
+	return poolHealthFromQueryResult(pool, result)
+}
+
+// poolHealthFromQueryResult is the pool.query DECODER, split out from the call so
+// a test double can feed it a real middleware response instead of hand-rolling
+// the outcome. That matters most for the empty result: a valid pool.query that
+// simply does not list the pool is an ANSWER, and it still has to come back as a
+// failed sample.
+func poolHealthFromQueryResult(pool string, result interface{}) (*PoolHealthSnapshot, error) {
 	pools, ok := result.([]interface{})
 	if !ok || len(pools) == 0 {
 		return nil, fmt.Errorf("pool %s not found", pool)

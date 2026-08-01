@@ -104,20 +104,55 @@ type MockClient struct {
 	TempAlertCalls     int
 	InjectHealthError  error
 	InjectTempAlertErr error
+	// PoolQueryResult is a RAW pool.query result decoded by the production
+	// decoder, so a test can exercise a real middleware response — in particular
+	// an empty result, which is a valid answer that must still fail the sample as
+	// "pool ... not found". Set PoolQueryResultSet to use it (an empty result is
+	// itself meaningful, so nil cannot be the switch).
+	PoolQueryResult    interface{}
+	PoolQueryResultSet bool
+	// PoolHealthEntered / PoolHealthRelease and TempAlertEntered /
+	// TempAlertRelease turn either backend read into a call the test can hold
+	// IN FLIGHT: the mock signals Entered once it is inside the call and then
+	// blocks until Release is closed. That is what lets a test observe what the
+	// driver publishes WHILE a backend call has not returned.
+	PoolHealthEntered chan struct{}
+	PoolHealthRelease chan struct{}
+	TempAlertEntered  chan struct{}
+	TempAlertRelease  chan struct{}
 }
 
 func (m *MockClient) PoolHealth(ctx context.Context, pool string) (*PoolHealthSnapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.PoolHealthCalls++
-	if m.InjectHealthError != nil {
-		return nil, m.InjectHealthError
-	}
+	entered, release := m.PoolHealthEntered, m.PoolHealthRelease
+	injected := m.InjectHealthError
+	queryResult, queryResultSet := m.PoolQueryResult, m.PoolQueryResultSet
+	var clone *PoolHealthSnapshot
 	if m.PoolHealthValue != nil {
-		clone := *m.PoolHealthValue
-		clone.Pool = pool
-		clone.Disks = append([]string(nil), m.PoolHealthValue.Disks...)
-		return &clone, nil
+		copied := *m.PoolHealthValue
+		copied.Pool = pool
+		copied.Disks = append([]string(nil), m.PoolHealthValue.Disks...)
+		clone = &copied
+	}
+	m.mu.Unlock()
+
+	// Gate OUTSIDE the mutex so a held call does not deadlock unrelated mock use.
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+
+	if injected != nil {
+		return nil, injected
+	}
+	if queryResultSet {
+		return poolHealthFromQueryResult(pool, queryResult)
+	}
+	if clone != nil {
+		return clone, nil
 	}
 	return &PoolHealthSnapshot{
 		Pool:         pool,
@@ -131,16 +166,26 @@ func (m *MockClient) PoolHealth(ctx context.Context, pool string) (*PoolHealthSn
 }
 
 func (m *MockClient) DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	if len(names) == 0 {
 		return nil, nil
 	}
+	m.mu.Lock()
 	m.TempAlertCalls++
-	if m.InjectTempAlertErr != nil {
-		return nil, m.InjectTempAlertErr
+	entered, release := m.TempAlertEntered, m.TempAlertRelease
+	injected := m.InjectTempAlertErr
+	alerts := append([]string(nil), m.TemperatureAlerts...)
+	m.mu.Unlock()
+
+	if entered != nil {
+		entered <- struct{}{}
 	}
-	return append([]string(nil), m.TemperatureAlerts...), nil
+	if release != nil {
+		<-release
+	}
+	if injected != nil {
+		return nil, injected
+	}
+	return alerts, nil
 }
 
 func (m *MockClient) ZFSPropertyChoices(ctx context.Context) (*ZFSPropertyChoices, error) {

@@ -3,6 +3,9 @@ package driver
 import (
 	"context"
 	"errors"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -406,6 +409,187 @@ func TestPoolHealthSnapshotExpires(t *testing.T) {
 	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues("flashstor")))
 }
 
+// TestBackendHealthStalePublicationSurvivesAConcurrentSample is the regression
+// test for the LOST UPDATE between the CSI read path and the poller.
+//
+// It is deliberately CONCURRENT, and it has to be: the defect is not a data
+// race, so `go test -race` is blind to it. Two goroutines write one observable
+// pair — the cached snapshot POINTER and scale_csi_pool_health_stale. The reader
+// decides "the pointer I read is expired" and raises the gauge; the poller
+// clears the gauge for a sample it has not stored yet. Interleave them and the
+// process ends with a FRESH cached sample carrying stale = 1, which no later
+// event corrects until the next successful sample:
+//
+//	reader: mark S stale ... poller: stale = 0 ... reader: re-read, still S,
+//	leave 1 ... poller: store fresh pointer.
+//
+// The old test fabricated the fresh pointer, never called the successful-sample
+// publication path, and never ran the two paths at the same time, so it could
+// not fail on this. This one runs the REAL publication path against a spinning
+// CSI reader and asserts the only invariant that matters: once everything has
+// quiesced, a fresh cached sample never carries stale = 1.
+func TestBackendHealthStalePublicationSurvivesAConcurrentSample(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("the interleaving requires at least two schedulable Ps")
+	}
+	const pool = "lostupdatepool"
+	mock := truenas.NewMockClient()
+	// The same verdict on both sides, so the hysteresis never holds the sample:
+	// the poller publishes the fresh pointer directly, which is the shape that
+	// exposes the lost update.
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{
+		Status: truenas.PoolStatusDegraded, StatusDetail: "vdev degraded", SampledAt: time.Now(),
+	}
+	d := healthTestDriver(mock)
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+
+	const rounds = 400
+	for round := 0; round < rounds; round++ {
+		expired := &truenas.PoolHealthSnapshot{
+			Pool: pool, Status: truenas.PoolStatusDegraded,
+			SampledAt: time.Now().Add(-d.backendHealthTTL() - time.Second),
+		}
+		d.backendHealthPendingFlips.Store(0)
+		d.backendHealth.Store(expired)
+		// The read path has already raised staleness for the expired snapshot; the
+		// successful sample below is what has to clear it and keep it cleared.
+		SetPoolHealthStale(pool, true)
+
+		var wg sync.WaitGroup
+		var reading, stop atomic.Bool
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reading.Store(true)
+			for !stop.Load() {
+				// The real CSI read path: it loads the pointer, finds it expired and
+				// publishes the staleness verdict for it.
+				d.poolHealthSnapshot()
+			}
+		}()
+		for !reading.Load() {
+			runtime.Gosched()
+		}
+		d.sampleBackendHealth(context.Background(), pool)
+		stop.Store(true)
+		wg.Wait()
+
+		published := d.backendHealth.Load()
+		require.NotNil(t, published)
+		require.NotSame(t, expired, published, "round %d: the poller must have published a fresh snapshot", round)
+		if got := testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)); got != 0 {
+			t.Fatalf("round %d: a fresh cached sample is published with scale_csi_pool_health_stale = %v. The read path's "+
+				"staleness decision was made against the SUPERSEDED snapshot and survived the poller's publication: the gauge "+
+				"write and the pointer change must happen inside ONE critical section, not as a gauge write followed by a "+
+				"pointer re-read.", round, got)
+		}
+	}
+}
+
+// TestBackendHealthPublishesThePoolSampleBeforeTheSecondBackendRead closes the
+// publication/commit gap.
+//
+// PoolHealth timestamps the snapshot when pool.query returns, but publication
+// used to wait for disk.temperature_alerts — a SECOND backend read that may burn
+// the rest of the 30s call context. For that whole window a VALID pool sample
+// existed while the old raw gauges, the old condition, flip_pending and stale
+// were all still exposed. That fits none of the named divergence classes (the
+// raw sample had not changed, the sample had not failed, the exporter had not
+// published it, and a previous sample existed), so it is closed by construction
+// rather than documented.
+//
+// The test holds disk.temperature_alerts IN FLIGHT and asserts the pool verdict
+// is already published, then that the temperature count is refreshed afterwards
+// without re-running the hysteresis.
+func TestBackendHealthPublishesThePoolSampleBeforeTheSecondBackendRead(t *testing.T) {
+	const pool = "pubgappool"
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{
+		Status: truenas.PoolStatusDegraded, StatusDetail: "One or more devices are faulted.",
+		Disks: []string{"nvme0n1"}, SampledAt: time.Now(),
+	}
+	mock.TemperatureAlerts = []string{"nvme0n1 is 78C"}
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	mock.TempAlertEntered = entered
+	mock.TempAlertRelease = release
+
+	d := healthTestDriver(mock)
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+	SetPoolHealthStale(pool, true) // the cold-start verdict that is still standing
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.sampleBackendHealth(context.Background(), pool)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("disk.temperature_alerts was never called")
+	}
+
+	// The pool sample is in hand and the SECOND backend read has not returned.
+	snapshot := d.poolHealthSnapshot()
+	require.NotNil(t, snapshot, "a pool sample that already exists must not sit unpublished behind a second backend read")
+	assert.True(t, snapshot.Degraded())
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolStatus.WithLabelValues(pool, truenas.PoolStatusDegraded)),
+		"the RAW gauges must carry the sample as soon as it exists")
+	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
+		"the staleness verdict must be cleared by the sample, not by the disk-temperature call that follows it")
+	assert.True(t, d.volumeCondition(managedDataset()).GetAbnormal(),
+		"every managed PVC must already read the new condition")
+	assert.NotZero(t, testutil.ToFloat64(poolHealthLastSuccess.WithLabelValues(pool)),
+		"the driver-owned last-success timestamp is part of the same publication")
+
+	close(release)
+	<-done
+
+	refreshed := d.poolHealthSnapshot()
+	require.NotNil(t, refreshed)
+	assert.Equal(t, 1, refreshed.TemperatureAlerts, "the temperature count is refreshed onto the published sample")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolDiskTempAlerts.WithLabelValues(pool)))
+	assert.Zero(t, d.backendHealthPendingFlips.Load(),
+		"the temperature refresh must NOT re-run the hysteresis; one backend sample must never count twice")
+}
+
+// TestPoolHealthLastSuccessTimestampTracksSamplesNotScrapes pins N3: the triage
+// procedure needs the driver's own last successful sample time. PromQL
+// timestamp() returns the SAMPLE's timestamp, which for a pull exporter is the
+// scrape time — a frozen driver that keeps answering scrapes looks fresh by that
+// query, and a scrape outage makes a healthy driver look stale. So the driver
+// exports the value itself, and it moves ONLY when a usable sample lands.
+func TestPoolHealthLastSuccessTimestampTracksSamplesNotScrapes(t *testing.T) {
+	const pool = "lastsuccesspool"
+	first := time.Now().Add(-90 * time.Second)
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusOnline, Healthy: true, SampledAt: first}
+	d := healthTestDriver(mock)
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+
+	d.sampleBackendHealth(context.Background(), pool)
+	assert.InDelta(t, float64(first.UnixNano())/1e9, testutil.ToFloat64(poolHealthLastSuccess.WithLabelValues(pool)), 0.001)
+
+	// A failed sample must NOT advance it — that is the whole point: this is what
+	// stops a frozen poller from looking fresh.
+	mock.InjectHealthError = errors.New("appliance unreachable")
+	d.sampleBackendHealth(context.Background(), pool)
+	assert.InDelta(t, float64(first.UnixNano())/1e9, testutil.ToFloat64(poolHealthLastSuccess.WithLabelValues(pool)), 0.001)
+
+	// Nor does a valid pool.query that simply does not list the pool.
+	mock.InjectHealthError = nil
+	mock.PoolQueryResultSet, mock.PoolQueryResult = true, []interface{}{}
+	d.sampleBackendHealth(context.Background(), pool)
+	assert.InDelta(t, float64(first.UnixNano())/1e9, testutil.ToFloat64(poolHealthLastSuccess.WithLabelValues(pool)), 0.001)
+
+	second := time.Now()
+	mock.PoolQueryResultSet = false
+	mock.PoolHealthValue.SampledAt = second
+	d.sampleBackendHealth(context.Background(), pool)
+	assert.InDelta(t, float64(second.UnixNano())/1e9, testutil.ToFloat64(poolHealthLastSuccess.WithLabelValues(pool)), 0.001)
+}
+
 // TestBackendHealthColdStartPublishesHonestState pins divergence class 6.
 //
 // The CSI and metrics servers are serving before startBackendHealth produces
@@ -418,11 +602,19 @@ func TestPoolHealthSnapshotExpires(t *testing.T) {
 //
 // The sample here also pins the poll-stall termination condition: a valid
 // pool.query that simply does not list the pool comes back as "pool ... not
-// found". The backend ANSWERED; this is still a failed sample.
+// found". The backend ANSWERED; this is still a failed sample. The fixture is
+// therefore a REAL pool.query response — an empty result decoded by the
+// production decoder — not an injected error string, because an injected string
+// would prove only that some error takes the failed-sample path.
 func TestBackendHealthColdStartPublishesHonestState(t *testing.T) {
 	const pool = "coldstartpool"
 	mock := truenas.NewMockClient()
-	mock.InjectHealthError = errors.New("pool " + pool + " not found")
+	mock.PoolQueryResultSet, mock.PoolQueryResult = true, []interface{}{}
+	// Prove the fixture really is the missing-pool ANSWER, not a transport error.
+	_, fixtureErr := mock.PoolHealth(context.Background(), pool)
+	require.ErrorContains(t, fixtureErr, "not found",
+		"the cold-start fixture must be a valid pool.query response that lists no pool")
+
 	d := healthTestDriver(mock)
 	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
 
@@ -444,7 +636,7 @@ func TestBackendHealthColdStartPublishesHonestState(t *testing.T) {
 		"cold start must not INVENT a pool health verdict")
 
 	// The next successful sample takes it out of the cold-start window.
-	mock.InjectHealthError = nil
+	mock.PoolQueryResultSet = false
 	d.sampleBackendHealth(context.Background(), pool)
 	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
 	assert.NotNil(t, d.poolHealthSnapshot())
@@ -456,38 +648,67 @@ func TestBackendHealthColdStartPublishesHonestState(t *testing.T) {
 // take the whole backendHealthCallTimeout, and during that gap the served
 // condition has already fallen back to dataset-only while a frozen DEGRADED
 // gauge keeps alerting with BOTH diagnostic gauges reading 0.
+//
+// The poll here is REAL and genuinely blocked: the poller runs, its pool.query
+// is held inside the mock, and the assertions are made while that call has not
+// returned. Ageing a copied snapshot and calling the helper directly (which is
+// what this used to do) proves the helper works, not that the driver publishes
+// without waiting for the backend. The TTL floor is 90s, so time cannot be
+// waited out in a unit test — the snapshot is aged, but it is aged UNDER a call
+// that is still in flight.
 func TestPoolHealthStaleRaisedWhenTheTTLExpires(t *testing.T) {
 	const pool = "ttlgappool"
 	mock := truenas.NewMockClient()
-	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusDegraded}
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Status: truenas.PoolStatusDegraded, SampledAt: time.Now()}
 	d := healthTestDriver(mock)
-	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "30s"}
 
 	d.sampleBackendHealth(context.Background(), pool)
 	require.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
 
-	// A poll is in flight and hanging; the cached snapshot ages past its TTL
-	// while the failed-sample branch cannot run yet.
+	// Hold the NEXT pool.query inside the backend so a poll is genuinely in
+	// flight for the rest of this test.
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	mock.PoolHealthEntered, mock.PoolHealthRelease = entered, release
+	d.startBackendHealth()
+	defer func() {
+		close(release)
+		d.stopBackendHealth()
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poller never issued its pool.query")
+	}
+
+	// The cached snapshot ages past its TTL WHILE that call hangs, so the
+	// failed-sample branch cannot run and nothing in the poll loop will publish
+	// until the call returns.
 	expired := *d.backendHealth.Load()
 	expired.SampledAt = time.Now().Add(-d.backendHealthTTL() - time.Second)
 	d.backendHealth.Store(&expired)
 
 	require.Nil(t, d.poolHealthSnapshot(), "past the TTL the snapshot stops being served")
 	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
-		"the CSI read path already refuses to serve the snapshot, so stale must already be 1")
+		"the CSI read path already refuses to serve the snapshot, so stale must already be 1 — "+
+			"with the backend call still unreturned")
 
-	// The same gap is closed from the poll loop for a controller that is taking
-	// no CSI traffic at all: the pre-call check raises it without waiting for the
-	// in-flight call to return.
+	// The same gap is closed for a controller taking no CSI traffic at all: the
+	// check the poll loop runs BEFORE each sample raises it without waiting for
+	// the in-flight call.
 	SetPoolHealthStale(pool, false)
 	d.markPoolHealthStaleIfExpired()
 	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
 }
 
-// TestMarkPoolHealthStaleYieldsToAFreshSample covers the read-path/poller race:
-// markPoolHealthStale runs concurrently with the poller, and a successful sample
-// that lands while it is publishing has already written the authoritative
-// verdict. The read path must not leave a false 1 behind it.
+// TestMarkPoolHealthStaleYieldsToAFreshSample is the single-goroutine unit test
+// for the supersede check: a staleness decision made against a snapshot that is
+// no longer the published one must write nothing at all.
+//
+// It is NOT the race proof and cannot be — it fabricates the fresh pointer and
+// never runs the two paths at once. TestBackendHealthStalePublicationSurvivesA
+// ConcurrentSample is the concurrent regression test for the lost update.
 func TestMarkPoolHealthStaleYieldsToAFreshSample(t *testing.T) {
 	const pool = "raceypool"
 	d := healthTestDriver(truenas.NewMockClient())

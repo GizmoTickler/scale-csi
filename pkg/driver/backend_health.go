@@ -289,6 +289,24 @@ func (d *Driver) backendHealthTTL() time.Duration {
 // a transient backend blip must not flip every PVC's condition, and a recent
 // snapshot is strictly better information than none. Past backendHealthTTL the
 // snapshot stops being served at all (see poolHealthSnapshot).
+//
+// PUBLICATION ORDER IS PART OF THE CONTRACT. The pool sample is published the
+// INSTANT it is in hand, BEFORE the second backend read. Doing the
+// disk.temperature_alerts call first — as this used to — opened a
+// publication/commit gap: a VALID pool sample existed, timestamped, while the
+// old raw gauges, the old condition, flip_pending and stale were all still
+// exposed for however long that second call took (up to the remainder of
+// backendHealthCallTimeout). That window fitted NONE of the named divergence
+// classes: the raw sample had not changed (not confirmation lag), the sample had
+// succeeded (not a poll stall), the exporter had not published it (not observer
+// lag) and a previous sample existed (not cold start). It is closed here by
+// construction — no backend I/O sits between acquiring a sample and publishing
+// it — rather than being documented as a seventh class.
+//
+// The temperature count is therefore a FOLLOW-UP refresh of an already published
+// sample. It cannot hold the health verdict back, and it cannot fabricate: until
+// it lands, the pool carries the LAST KNOWN count (0 on a first sample), which
+// the refresh then corrects.
 func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 	snapshot, err := d.truenasClient.PoolHealth(ctx, pool)
 	if err != nil {
@@ -298,23 +316,70 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 		d.publishFailedSampleStaleness(pool)
 		return
 	}
+	d.publishSample(snapshot)
+	if snapshot.Degraded() {
+		klog.Warningf("Pool %s is %s (healthy=%t detail=%q)", snapshot.Pool, snapshot.Status, snapshot.Healthy, snapshot.StatusDetail)
+	}
+
 	// Disk temperature alerts are a per-DISK signal; fan them out with the pool.
 	alerts, alertErr := d.truenasClient.DiskTemperatureAlerts(ctx, snapshot.Disks)
 	if alertErr != nil {
 		if ctx.Err() == nil {
-			klog.Warningf("Disk temperature alert sample failed for pool %s: %v", pool, alertErr)
+			klog.Warningf("Disk temperature alert sample failed for pool %s: %v; scale_csi_pool_disk_temp_alerts keeps its "+
+				"last known value rather than being reset to 0", pool, alertErr)
 		}
-	} else {
-		snapshot.TemperatureAlerts = len(alerts)
+		return
 	}
+	d.publishTemperatureAlerts(snapshot.Pool, len(alerts))
+}
 
-	// Metrics get the RAW sample, always: Prometheus must see a flap as a flap.
-	SetPoolHealthMetrics(snapshot)
-	SetPoolHealthStale(snapshot.Pool, false)
-	if snapshot.Degraded() {
-		klog.Warningf("Pool %s is %s (healthy=%t detail=%q)", snapshot.Pool, snapshot.Status, snapshot.Healthy, snapshot.StatusDetail)
+// publishSample publishes ONE successful sample: the raw gauges, the hysteresis
+// decision, the cached snapshot pointer, the staleness verdict and the
+// last-success timestamp. All of it happens inside ONE critical section, so the
+// (pointer, stale gauge) pair can never be observed half-updated and a
+// concurrent read-path staleness decision can never survive across it.
+//
+// Metrics get the RAW sample, always: Prometheus must see a flap as a flap.
+func (d *Driver) publishSample(snapshot *truenas.PoolHealthSnapshot) {
+	d.backendHealthPublishMu.Lock()
+	defer d.backendHealthPublishMu.Unlock()
+
+	// Carry the last known temperature count forward instead of publishing a
+	// fabricated 0 for the length of the disk.temperature_alerts call.
+	if previous := d.backendHealth.Load(); previous != nil && previous.Pool == snapshot.Pool {
+		snapshot.TemperatureAlerts = previous.TemperatureAlerts
 	}
-	d.publishBackendHealth(snapshot)
+	SetPoolHealthMetrics(snapshot)
+	d.publishBackendHealthLocked(snapshot)
+	SetPoolHealthStale(snapshot.Pool, false)
+	SetPoolHealthLastSuccess(snapshot.Pool, snapshot.SampledAt)
+}
+
+// publishTemperatureAlerts refreshes the per-DISK temperature count on an
+// ALREADY PUBLISHED sample. It deliberately does NOT run the hysteresis: the
+// count plays no part in PoolHealthSnapshot.Degraded(), so re-publishing the
+// sample through publishBackendHealthLocked would count one backend sample twice and
+// confirm a held flip with a single observation.
+//
+// The cached snapshot is replaced by an updated COPY: the stored pointer is read
+// concurrently by every CSI read, so mutating it in place would be a genuine
+// data race.
+func (d *Driver) publishTemperatureAlerts(pool string, alerts int) {
+	if pool == "" {
+		return
+	}
+	d.backendHealthPublishMu.Lock()
+	defer d.backendHealthPublishMu.Unlock()
+	current := d.backendHealth.Load()
+	if current == nil || current.Pool != pool {
+		return
+	}
+	if current.TemperatureAlerts != alerts {
+		updated := *current
+		updated.TemperatureAlerts = alerts
+		d.backendHealth.Store(&updated)
+	}
+	SetPoolDiskTemperatureAlerts(pool, alerts)
 }
 
 // publishFailedSampleStaleness publishes the staleness verdict from inside the
@@ -330,7 +395,11 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 //   - a flip is pending and its CONFIRMING sample is exactly the one that just
 //     failed to arrive, so the served verdict is one the latest raw sample
 //     already contradicts.
+//
+// It runs inside the same critical section as publishSample so its verdict and
+// a successful sample's verdict can never interleave into a lost update.
 func (d *Driver) publishFailedSampleStaleness(pool string) {
+	d.backendHealthPublishMu.Lock()
 	previous := d.backendHealth.Load()
 	if previous == nil {
 		// COLD START (class 6). There is no previous snapshot to freeze, so the raw
@@ -343,14 +412,23 @@ func (d *Driver) publishFailedSampleStaleness(pool string) {
 		// and flip_pending = 0 (there is no held transition). The raw health gauges
 		// are deliberately NOT invented — an absent scale_csi_pool_status is the
 		// truth, and ScaleCSIPoolHealthStale is the alert that covers it.
+		//
+		// stale = 1 does NOT identify WHY: a misspelled, renamed or deleted pool
+		// produces exactly this state, because the label is the CONFIGURED pool
+		// string and nothing has verified it against the appliance. Read it as "no
+		// fresh sample for this configured identity", never as "an existing pool is
+		// stale".
 		if pool == "" {
+			d.backendHealthPublishMu.Unlock()
 			return
 		}
 		SetPoolHealthStale(pool, true)
 		SetPoolHealthFlipPending(pool, false)
+		d.backendHealthPublishMu.Unlock()
 		klog.Warningf("Backend health has no successful sample yet for pool %s: VolumeConditions are dataset-only and the raw "+
 			"scale_csi_pool_* series stay ABSENT until a successful usable sample arrives, so ScaleCSIPoolDegraded cannot fire. "+
-			"scale_csi_pool_health_stale is 1 so this window is not silent", pool)
+			"scale_csi_pool_health_stale is 1 so this window is not silent. This does not say the pool is unhealthy or even that "+
+			"it EXISTS — %q is the configured name, and a missing or renamed pool reaches this same state", pool, pool)
 		return
 	}
 	age := time.Since(previous.SampledAt)
@@ -358,6 +436,7 @@ func (d *Driver) publishFailedSampleStaleness(pool string) {
 	expired := age > ttl
 	unconfirmedFlip := d.backendHealthPendingFlips.Load() > 0
 	SetPoolHealthStale(previous.Pool, expired || unconfirmedFlip)
+	d.backendHealthPublishMu.Unlock()
 	switch {
 	case expired:
 		klog.Warningf("Backend health snapshot for pool %s is stale (last successful sample %v ago, TTL %v); "+
@@ -393,22 +472,46 @@ func (d *Driver) markPoolHealthStaleIfExpired() {
 // ListVolumes composes one condition per volume, so logging here would be a
 // per-volume storm. The poll loop does the logging.
 //
-// The re-check exists because this runs on the CSI read path, concurrently with
-// the poller: if a successful sample landed while we were publishing, IT wrote
-// the authoritative verdict (stale = 0, immediately before storing the new
-// snapshot) and this call must not leave a false 1 behind it.
+// This runs on the CSI read path, CONCURRENTLY WITH THE POLLER, and the decision
+// it publishes is about ONE snapshot: "the pointer I read is expired". Both the
+// re-check of that pointer and the gauge write therefore happen inside the SAME
+// critical section publishSample uses.
+//
+// Writing the gauge first and re-reading the pointer afterwards — which is what
+// this did — is NOT synchronization, and the failure is a lost update rather
+// than a data race, so `go test -race` cannot see it:
+//
+//	 1. the reader marks expired snapshot S stale;
+//	 2. the poller clears staleness for a successful sample it has NOT yet
+//	    stored;
+//	 3. the reader re-reads, still sees S, and leaves stale = 1;
+//	 4. the poller stores the fresh pointer.
+//
+// End state: a fresh cached sample with stale = 1 until the NEXT successful
+// sample. Reversing the poller's two steps fails the same way with the roles
+// swapped. Under one mutex neither interleaving exists: if the pointer still is
+// S the poller has not published (and its later write, ordered after this one,
+// is the newer truth); if it is not, the decision is already superseded and
+// nothing is written at all.
 func (d *Driver) markPoolHealthStale(snapshot *truenas.PoolHealthSnapshot) {
 	if snapshot == nil || snapshot.Pool == "" {
 		return
 	}
-	SetPoolHealthStale(snapshot.Pool, true)
+	d.backendHealthPublishMu.Lock()
+	defer d.backendHealthPublishMu.Unlock()
 	if d.backendHealth.Load() != snapshot {
-		SetPoolHealthStale(snapshot.Pool, false)
+		// A successful sample superseded this snapshot; ITS verdict is authoritative
+		// and must not be overwritten by a decision made against an older pointer.
+		return
 	}
+	SetPoolHealthStale(snapshot.Pool, true)
 }
 
-// publishBackendHealth applies the fan-out hysteresis and updates the cache that
-// drives every managed volume's VolumeCondition.
+// publishBackendHealthLocked applies the fan-out hysteresis and updates the cache
+// that drives every managed volume's VolumeCondition. The caller MUST hold
+// backendHealthPublishMu: the pending-flip counter, the flip_pending gauge, the
+// snapshot pointer and the staleness gauge are one observable state, and a
+// reader deciding staleness against the pointer must not see them half-written.
 //
 // scale_csi_pool_health_flip_pending tracks the HELD-FLIP window exactly: 1 from
 // the unconfirmed sample until a successful sample resolves it. That is not the
@@ -416,7 +519,7 @@ func (d *Driver) markPoolHealthStale(snapshot *truenas.PoolHealthSnapshot) {
 // the alert-hold class, and past the staleness TTL it can still read 1 after the
 // condition has fallen back to dataset-only. See backendHealthFlipSamples for
 // the canonical numbered list of divergence classes.
-func (d *Driver) publishBackendHealth(snapshot *truenas.PoolHealthSnapshot) {
+func (d *Driver) publishBackendHealthLocked(snapshot *truenas.PoolHealthSnapshot) {
 	previous := d.backendHealth.Load()
 	if previous == nil || previous.Degraded() == snapshot.Degraded() {
 		// No transition to confirm (or nothing to compare against yet).

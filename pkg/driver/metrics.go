@@ -398,6 +398,29 @@ var (
 		[]string{"pool"},
 	)
 
+	// poolHealthLastSuccess is the DRIVER-OWNED time of the most recent
+	// successful usable pool sample. It exists because PromQL cannot recover it:
+	// timestamp(some_gauge) returns the SAMPLE's timestamp, which for a pull
+	// exporter is the SCRAPE time, and a frozen driver that keeps answering
+	// scrapes therefore looks perfectly fresh by that query while a scrape outage
+	// makes a healthy driver look stale. A last-change time has to be exported as
+	// its own gauge, which is what this is: it advances ONLY when a sample
+	// succeeds, never on a scrape, and it is the correct input to
+	// `time() - scale_csi_pool_health_last_success_timestamp_seconds`.
+	//
+	// It is also the producer-identity probe: each controller process publishes
+	// its OWN series, so `count by (pool) (...) > 1` says two processes are
+	// publishing and the alerts' `max by (pool)` is merging independently sampled
+	// histories (the replica-skew class).
+	poolHealthLastSuccess = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "pool_health_last_success_timestamp_seconds",
+			Help:      "Unix timestamp of the most recent successful usable pool health sample (driver-owned; not the scrape time)",
+		},
+		[]string{"pool"},
+	)
+
 	// poolHealthFlipPending is 1 while a health transition is waiting for its
 	// confirming sample. It makes the confirmation-lag and recovery classes of
 	// raw-vs-condition divergence observable instead of implicit. It is NOT a
@@ -895,6 +918,28 @@ func SetPoolHealthStale(pool string, stale bool) {
 		value = 1
 	}
 	poolHealthStale.WithLabelValues(pool).Set(value)
+}
+
+// SetPoolHealthLastSuccess publishes the driver's own last successful usable
+// sample time. Call it ONLY from the successful-sample publication path: the
+// whole point is that it does not move when a scrape happens, when a sample
+// fails, or when a pool.query answers without listing the pool.
+func SetPoolHealthLastSuccess(pool string, at time.Time) {
+	if pool == "" || at.IsZero() {
+		return
+	}
+	poolHealthLastSuccess.WithLabelValues(pool).Set(float64(at.UnixNano()) / 1e9)
+}
+
+// SetPoolDiskTemperatureAlerts refreshes the per-disk temperature alert count on
+// an already published sample. disk.temperature_alerts is a SECOND backend call;
+// publishing the pool verdict first and correcting this count when the call
+// returns is what keeps a valid pool sample from sitting unpublished behind it.
+func SetPoolDiskTemperatureAlerts(pool string, alerts int) {
+	if pool == "" {
+		return
+	}
+	poolDiskTempAlerts.WithLabelValues(pool).Set(float64(alerts))
 }
 
 // SetPoolHealthFlipPending publishes whether a pool-health transition is waiting
