@@ -85,13 +85,15 @@ capacity:
 # BECAUSE the condition is damped, the gauges are not, the alerts add their own
 # `for` hold on top of the gauges AND Prometheus observes all of it on its own
 # scrape/evaluation cadence, these views DO differ transiently — they share one
-# severity split, not one timeline. There are SIX NUMBERED classes of divergence;
-# the first three have an upper bound, the last three do not (canonical list:
+# severity split, not one timeline. There are SEVEN NUMBERED classes of divergence;
+# the first three have an upper bound, the last four do not (canonical list:
 # backendHealthFlipSamples in pkg/driver/backend_health.go):
-#   1. confirmation lag — BOUNDED: a confirmed transition reaches conditions up
-#      to one successful poll interval plus one 30s call timeout after the gauges
-#      (<= 2m30s at the ceiling), which stays inside the 5m ScaleCSIPoolDegraded
-#      hold. flip_pending = 1;
+#   1. confirmation lag — BOUNDED: a confirmed transition reaches the DRIVER's own
+#      published condition up to one poll interval plus one 30s call timeout
+#      after the gauges (<= 2m30s at the ceiling), which stays inside the 5m
+#      ScaleCSIPoolDegraded hold. That bounds DRIVER-SIDE PUBLICATION only —
+#      the PVC object and the alert are downstream of it and outside this
+#      number entirely. flip_pending = 1;
 #   2. alert hold — BOUNDED by the rule's own 5m `for`: once the condition
 #      confirms, PVCs read Abnormal while ScaleCSIPoolDegraded is still PENDING.
 #      The ceiling CREATES this ordering rather than removing it, and BOTH
@@ -109,16 +111,27 @@ capacity:
 #      gauges only on its next scrape and starts `for` at the first true
 #      EVALUATION, so after a recovery both diagnostic gauges can read 0 while
 #      the alert still fires. This chart puts no upper limit on the
-#      ServiceMonitor interval, and a rollout briefly has two controllers
-#      publishing series that `max by (pool)` merges;
+#      ServiceMonitor interval. Compare
+#      scale_csi_pool_health_last_success_timestamp_seconds (driver-owned) with
+#      scrape freshness — never timestamp(), which returns the SCRAPE time;
 #   6. cold start — UNBOUNDED until the first successful sample of a process: the
 #      raw scale_csi_pool_* series do not exist yet, so ScaleCSIPoolDegraded
 #      cannot fire at all; the driver publishes scale_csi_pool_health_stale = 1
-#      (flip_pending = 0) so the window is visible.
+#      (flip_pending = 0) so the window is visible. The pool label is the
+#      CONFIGURED name, so a missing or renamed pool looks exactly like an
+#      unreachable one;
+#   7. replica skew — UNBOUNDED, and a PRODUCER-IDENTITY difference rather than a
+#      timing one: every replica polls (no leader election) and a fencing-off
+#      RollingUpdate can overlap processes, so `max by (pool)` merges
+#      independently sampled histories. Supported single-producer setup is
+#      controller.replicas=1, which is why enabling backendHealth renders a
+#      non-overlapping rollout. Detect it with
+#      count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds) > 1
+#      (alert ScaleCSIPoolHealthProducerSkew).
 # Read scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before
 # treating a PVC condition as wrong, but remember they do not cover the alert
-# hold, observer lag or cold start. Full contract: docs/production.md,
-# "Backend health".
+# hold, observer lag, cold start or replica skew. Full contract:
+# docs/production.md, "Backend health".
 #
 # Default OFF so an upgrade changes neither the rendered manifest nor the
 # VolumeCondition semantics of existing volumes.

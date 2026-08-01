@@ -1,11 +1,16 @@
 package chart
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // writeValues writes a temporary values override file and returns its path.
@@ -602,6 +607,15 @@ var signalTimingClasses = []string{
 	"poll stall",
 	"observer lag",
 	"cold start",
+	"replica skew",
+}
+
+// signalTimingClassRequires pins vocabulary that must appear INSIDE a specific
+// item's own text. Scoping matters: round 5 required "successful usable sample"
+// anywhere in the file, so moving it into a neighbouring item while item 4 said
+// "until the backend responds" passed the guard while saying the wrong thing.
+var signalTimingClassRequires = map[string][]string{
+	"poll stall": {"successful usable sample"},
 }
 
 // signalTimingClassBounded records which qualifier each class must carry IN ITS
@@ -616,6 +630,7 @@ var signalTimingClassBounded = map[string]bool{
 	"poll stall":       false,
 	"observer lag":     false,
 	"cold start":       false,
+	"replica skew":     false,
 }
 
 var (
@@ -623,13 +638,13 @@ var (
 	// count smaller than the real one ("two windows", "exactly three bounded
 	// ways", "four classes", ...). A count is a promise: if it is asserted
 	// anywhere it has to be right everywhere.
-	forbiddenWindowCountRe = regexp.MustCompile(`(?i)\b(two|three|four|five|2|3|4|5)\b[^.\n]{0,40}?\b(windows?|ways?|classes|divergences?)\b`)
+	forbiddenWindowCountRe = regexp.MustCompile(`(?i)\b(two|three|four|five|six|2|3|4|5|6)\b[^.\n]{0,40}?\b(windows?|ways?|classes|divergences?)\b`)
 	// exactlyCountRe catches the "exactly N" phrasing even when the noun is far
 	// away or on the next line.
-	exactlyCountRe = regexp.MustCompile(`(?i)\bexactly (two|three|four|five)\b`)
+	exactlyCountRe = regexp.MustCompile(`(?i)\bexactly (two|three|four|five|six)\b`)
 	// declaredClassCountRe is the positive form: an enumerating surface must
 	// state the real count.
-	declaredClassCountRe = regexp.MustCompile(`(?i)\b(six|6)\b[^.\n]{0,40}?\b(classes|windows?|ways?|divergences?)\b`)
+	declaredClassCountRe = regexp.MustCompile(`(?i)\b(seven|7)\b[^.\n]{0,40}?\b(classes|windows?|ways?|divergences?)\b`)
 	// boundedWordRe matches only the standalone word. "unbounded" is one word, so
 	// the leading \b cannot match inside it.
 	boundedWordRe   = regexp.MustCompile(`\bbounded\b`)
@@ -637,8 +652,12 @@ var (
 	pollStallRe     = regexp.MustCompile(`poll stall`)
 	// backendAnswersRe is the WRONG termination condition for the poll stall: a
 	// valid pool.query that does not list the pool answers and is still a failed
-	// sample (pkg/truenas/pool_health.go).
-	backendAnswersRe = regexp.MustCompile(`until (?:a|the) backend answers`)
+	// sample (pkg/truenas/pool_health.go). Round 5 matched only the exact phrase
+	// "until a/the backend answers", so "until the backend responds" — the same
+	// false claim — walked straight through. Any verb of ANSWERING is wrong here;
+	// only a successful usable SAMPLE ends the stall.
+	backendAnswersRe = regexp.MustCompile(
+		`until (?:a|the) (?:backend|appliance|truenas)[^.\n]{0,30}?\b(answers?|answered|responds?|responded|replies|replied|returns?|returned|is reachable|comes back|recovers)\b`)
 	// numberedItemRe finds an enumeration entry marker. The leading group keeps
 	// it from matching inside a version or a decimal.
 	numberedItemRe = regexp.MustCompile(`(^|[^\w.])(\d{1,2})\.[ \t]+`)
@@ -733,12 +752,25 @@ func extractSignalTimingTaxonomy(t *testing.T, name, body string) ([]taxonomyIte
 	t.Helper()
 
 	anchorRe := regexp.MustCompile(`(^|[^\w.])1\.[ \t]+` + regexp.QuoteMeta(signalTimingClasses[0]))
-	loc := anchorRe.FindStringIndex(body)
-	if loc == nil {
+	all := anchorRe.FindAllStringIndex(body, -1)
+	if len(all) == 0 {
 		t.Fatalf("%s: no canonical enumeration found. It must start with a numbered item %q — "+
 			"every enumerating surface carries the SAME numbered classes in the SAME order: %s",
 			name, "1. "+signalTimingClasses[0], strings.Join(signalTimingClasses, ", "))
 	}
+	if len(all) > 1 {
+		// The anchor MUST be unique. Taking the first match let a compliant DECOY
+		// list be inserted ahead of the shipped enumeration: the guard validated
+		// the decoy and never read the list the operator actually sees.
+		lines := make([]int, 0, len(all))
+		for _, loc := range all {
+			lines = append(lines, strings.Count(body[:loc[0]], "\n")+1)
+		}
+		t.Fatalf("%s: %d enumerations start with %q (around lines %v). The canonical list must appear EXACTLY ONCE "+
+			"per surface — with more than one, a guard that parses the first cannot tell which list ships.",
+			name, len(all), "1. "+signalTimingClasses[0], lines)
+	}
+	loc := all[0]
 	start := loc[0]
 	if body[start] != '1' {
 		start++
@@ -935,6 +967,20 @@ func TestGF5Fix5SignalTimingTaxonomyIsStructurallyComplete(t *testing.T) {
 					t.Errorf("%s: item %d (%s) must call itself UNBOUNDED, and must not claim a bound, inside its own"+
 						" text; got %q", surface.name, i+1, class, collapse(item.text))
 				}
+				// Item-SCOPED vocabulary. A required phrase sitting in a NEIGHBOURING
+				// item is not this item saying it.
+				for _, required := range signalTimingClassRequires[class] {
+					if !strings.Contains(item.text, required) {
+						t.Errorf("%s: item %d (%s) must state %q in ITS OWN text; got %q. Moving the phrase into another"+
+							" item leaves this one free to state the wrong termination condition.",
+							surface.name, i+1, class, required, collapse(item.text))
+					}
+				}
+				if m := backendAnswersRe.FindString(item.text); m != "" {
+					t.Errorf("%s: item %d (%s) ends the window at %q. Only a SUCCESSFUL USABLE sample ends it — a valid"+
+						" pool.query that does not list the pool answers and is still a failed sample.",
+						surface.name, i+1, class, m)
+				}
 			}
 		})
 	}
@@ -997,21 +1043,54 @@ func triageRuleBlock(t *testing.T, production string) string {
 // (c) check that the three observations are SYNCHRONIZED — sample/scrape
 // freshness and, during a rollout, controller identity — and (d) stop short of
 // declaring a defect. The order matters, so it is asserted.
+// conclusionVocabRe is the vocabulary of DECLARING a defect. Round 5 forbade
+// only the literal word "real" in the triage block, so "treat the mismatch as a
+// defect" — the same unsound conclusion — passed while every required substring
+// survived in order.
+var conclusionVocabRe = regexp.MustCompile(`(?i)\b(real|defect|defects|bug|bugs|genuine|broken)\b`)
+
+// negationRe is what makes such a word legitimate: the procedure is allowed to
+// say "never conclude a defect from two zero gauges", and nothing else.
+var negationRe = regexp.MustCompile(`(?i)\b(not|never|cannot|can't|don't|do not|does not|must not|no|neither|rather than|instead of|without)\b`)
+
 func TestGF5Fix5TriageRuleRequiresSynchronizedObservations(t *testing.T) {
 	production := repoFile(t, "docs", "production.md")
 	collapsed := collapse(production)
 
 	// Whole-file: the unsound conclusion must not exist anywhere, in any wording.
-	unsoundConclusionRe := regexp.MustCompile(`(?i)both[^.\n]{0,80}gauges[^.]{0,240}\breal\b`)
+	unsoundConclusionRe := regexp.MustCompile(`(?i)both[^.\n]{0,80}gauges[^.]{0,240}\b(real|defect|bug|genuine|broken)\b`)
 	if m := unsoundConclusionRe.FindString(collapsed); m != "" {
-		t.Errorf("docs/production.md still concludes from two zero gauges that a difference is real (%q)."+
-			" Both gauges read 0 throughout the alert-hold, observer-lag and cold-start classes.", m)
+		t.Errorf("docs/production.md still concludes from two zero gauges that a difference is a defect (%q)."+
+			" Both gauges read 0 throughout the alert-hold, observer-lag, cold-start and replica-skew classes.", m)
 	}
 
 	block := triageRuleBlock(t, production)
-	if realRe := regexp.MustCompile(`(?i)\breal\b`); realRe.MatchString(block) {
-		t.Errorf("the triage block calls a remaining mismatch %q; it can only be called UNEXPLAINED after"+
-			" freshness and controller identity have been checked", realRe.FindString(block))
+	// Every defect-declaring word in the procedure must sit inside a NEGATED
+	// sentence. This is the semantic form of the round-5 rule: it no longer
+	// matters which noun the wording picks.
+	flat := collapse(block)
+	for _, loc := range conclusionVocabRe.FindAllStringIndex(flat, -1) {
+		sentence := enclosingSentence(flat, loc[0], loc[1])
+		if !negationRe.MatchString(sentence) {
+			t.Errorf("the triage procedure declares a mismatch %q without negating it: %q. A remaining difference can"+
+				" only be called UNEXPLAINED, and only after sample age and producer identity have been checked.",
+				flat[loc[0]:loc[1]], strings.TrimSpace(sentence))
+		}
+	}
+
+	// The freshness step must use the DRIVER-OWNED timestamp. PromQL timestamp()
+	// returns the scrape time, so it cannot answer "when did the driver last
+	// sample?" — wherever it still appears, it must be labelled as scrape age.
+	if !strings.Contains(block, "scale_csi_pool_health_last_success_timestamp_seconds") {
+		t.Error("the triage block does not use the driver-owned scale_csi_pool_health_last_success_timestamp_seconds" +
+			" for sample age; timestamp() on any other gauge returns the SCRAPE time, so a frozen driver that keeps" +
+			" answering scrapes reads as fresh")
+	}
+	for _, loc := range regexp.MustCompile(`timestamp\(scale_csi\w*`).FindAllStringIndex(flat, -1) {
+		window := flat[loc[0]:min(len(flat), loc[1]+200)]
+		if !strings.Contains(strings.ToLower(window), "scrape") {
+			t.Errorf("the triage block uses %q without saying it is the SCRAPE time: %q", flat[loc[0]:loc[1]], collapse(window))
+		}
 	}
 
 	// The procedure, in order. Each step must come after the previous one.
@@ -1022,8 +1101,8 @@ func TestGF5Fix5TriageRuleRequiresSynchronizedObservations(t *testing.T) {
 		`alertstate="pending"`,
 		"neither gauge",
 		"synchronized observations",
-		"scrape freshness",
-		"timestamp(scale_csi_pool_health_stale",
+		"sample age",
+		"scale_csi_pool_health_last_success_timestamp_seconds",
 		"ontroller identity",
 		"pod",
 		"unexplained by the documented classes",
@@ -1043,8 +1122,61 @@ func TestGF5Fix5TriageRuleRequiresSynchronizedObservations(t *testing.T) {
 // backendHealthCallTimeout. A confirmed condition therefore trails a state
 // change by up to 2 x interval PLUS one call timeout — 4m30s at the ceiling, not
 // the 4m that 2 x interval alone suggests (still inside the 5m alert hold).
+// driverConstRe extracts a Go constant declaration from the driver source. The
+// guard reads the CONSTANTS rather than the prose, because round 5 asserted the
+// literal strings "2m30s"/"4m30s" and would therefore have passed with
+// backendHealthCallTimeout changed to 45s and the docs untouched.
+func driverConstRe(name string) *regexp.Regexp {
+	return regexp.MustCompile(`(?m)^const ` + regexp.QuoteMeta(name) + ` = (\d+)(?: \* time\.(Second|Minute))?$`)
+}
+
+func driverDurationConst(t *testing.T, src, name string) time.Duration {
+	t.Helper()
+	m := driverConstRe(name).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatalf("pkg/driver/backend_health.go no longer declares `const %s = N * time.Unit`; the documented bounds are"+
+			" computed from it, so the guard cannot verify them", name)
+	}
+	n, err := strconv.Atoi(m[1])
+	require.NoError(t, err)
+	switch m[2] {
+	case "Second":
+		return time.Duration(n) * time.Second
+	case "Minute":
+		return time.Duration(n) * time.Minute
+	}
+	t.Fatalf("const %s is not a duration", name)
+	return 0
+}
+
+func driverIntConst(t *testing.T, src, name string) int {
+	t.Helper()
+	m := driverConstRe(name).FindStringSubmatch(src)
+	if m == nil || m[2] != "" {
+		t.Fatalf("pkg/driver/backend_health.go no longer declares `const %s = N`", name)
+	}
+	n, err := strconv.Atoi(m[1])
+	require.NoError(t, err)
+	return n
+}
+
 func TestGF5Fix5TimeBoundsIncludeTheCallTimeout(t *testing.T) {
-	staleBoundRe := regexp.MustCompile(`(?i)at most 4m\b|\bso at most 4m\b|(<=|≤) 2m\b`)
+	// COMPUTE the bounds from the shipped constants. Changing a constant while
+	// leaving the old number in the docs now fails here.
+	driverSrc := repoFile(t, "pkg", "driver", "backend_health.go")
+	callTimeout := driverDurationConst(t, driverSrc, "backendHealthCallTimeout")
+	maxInterval := driverDurationConst(t, driverSrc, "maxBackendHealthInterval")
+	flipSamples := driverIntConst(t, driverSrc, "backendHealthFlipSamples")
+
+	perStep := (maxInterval + callTimeout).String()                             // one confirmation step
+	confirmed := (time.Duration(flipSamples)*maxInterval + callTimeout).String() // to a confirmed condition
+	if perStep == confirmed {
+		t.Fatalf("the two computed bounds collapsed to %q; the guard would assert nothing", perStep)
+	}
+	// The bound that OMITS the call timeout is the regression this pins.
+	omitted := (time.Duration(flipSamples) * maxInterval).String()
+	staleBoundRe := regexp.MustCompile(`(?i)at most ` + regexp.QuoteMeta(omitted) + `\b|(<=|≤) ` + regexp.QuoteMeta(maxInterval.String()) + `\b`)
+
 	for _, surface := range []struct {
 		name string
 		path []string
@@ -1059,16 +1191,26 @@ func TestGF5Fix5TimeBoundsIncludeTheCallTimeout(t *testing.T) {
 			body := repoFile(t, surface.path...)
 			if m := staleBoundRe.FindString(body); m != "" {
 				t.Errorf("%s states a driver-side bound of %q, which omits the bounded backend call time:"+
-					" a poll may take the full 30s backendHealthCallTimeout before anything is published",
-					surface.name, m)
+					" a poll may take the full %v backendHealthCallTimeout before anything is published",
+					surface.name, m, callTimeout)
 			}
 			lower := normalizeTimingProse(body)
 			if !strings.Contains(lower, "call timeout") && !strings.Contains(lower, "backendhealthcalltimeout") {
 				t.Errorf("%s states the confirmation bound without naming the backend call timeout that is part of it", surface.name)
 			}
-			if !strings.Contains(lower, "2m30s") && !strings.Contains(lower, "4m30s") {
-				t.Errorf("%s does not state the corrected bound (one interval + one 30s call timeout: 2m30s per"+
-					" confirmation step, 4m30s to a confirmed condition at the ceiling)", surface.name)
+			if !strings.Contains(lower, perStep) && !strings.Contains(lower, confirmed) {
+				t.Errorf("%s does not state the bound COMPUTED from the shipped constants (maxBackendHealthInterval=%v,"+
+					" backendHealthCallTimeout=%v, backendHealthFlipSamples=%d): %s per confirmation step, %s to a"+
+					" confirmed condition at the ceiling. Changing a constant without updating this text is exactly"+
+					" the drift this asserts.", surface.name, maxInterval, callTimeout, flipSamples, perStep, confirmed)
+			}
+			// The number is a DRIVER-SIDE publication bound. Presenting it as an
+			// end-to-end PVC/alert deadline is the round-5 overclaim.
+			if strings.Contains(lower, confirmed) &&
+				!strings.Contains(lower, "driver-side") && !strings.Contains(lower, "driver side") {
+				t.Errorf("%s states %s without scoping it to DRIVER-SIDE publication. The CSI read,"+
+					" external-health-monitor refresh, scrape and rule evaluation are all downstream of it and"+
+					" unbounded, so it is not a deadline for a PVC becoming abnormal.", surface.name, confirmed)
 			}
 		})
 	}
@@ -1099,6 +1241,87 @@ func TestGF5Fix5PollStallEndsAtAUsableSample(t *testing.T) {
 	}
 }
 
+// renderedAlert renders the bundled PrometheusRule with every gated block on and
+// returns one alert rule as decoded YAML. Comparing against the RENDERED object
+// is what makes the assertions below semantic: an equivalent re-formatting of
+// the template cannot skip them, and a changed expression cannot hide behind a
+// substring that is no longer there.
+func renderedAlert(t *testing.T, name string) manifest {
+	t.Helper()
+	rendered := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true",
+		"--set", "capacity.gaugeEnabled=true",
+		"--set", "backendHealth.enabled=true")
+	rule := findManifest(t, decodeManifests(t, rendered), "PrometheusRule", "scale-csi")
+	spec, ok := asManifest(rule["spec"])
+	if !ok {
+		t.Fatal("PrometheusRule has no decodable spec")
+	}
+	groups, _ := spec["groups"].([]any)
+	for _, groupAny := range groups {
+		group, ok := asManifest(groupAny)
+		if !ok {
+			continue
+		}
+		rules, _ := group["rules"].([]any)
+		for _, ruleAny := range rules {
+			alert, ok := asManifest(ruleAny)
+			if !ok {
+				continue
+			}
+			if got, _ := alert["alert"].(string); got == name {
+				return alert
+			}
+		}
+	}
+	t.Fatalf("the rendered PrometheusRule contains no alert named %q", name)
+	return nil
+}
+
+// TestGF5Fix5ReplicaSkewIsDetectableNotInferred pins divergence class 7: the
+// producer-identity class needs its own DETECTION, not a "pin a pod" hint. The
+// driver-owned last-success timestamp is one series per controller process, so
+// counting it counts producers.
+func TestGF5Fix5ReplicaSkewIsDetectable(t *testing.T) {
+	skew := renderedAlert(t, "ScaleCSIPoolHealthProducerSkew")
+	expr, _ := skew["expr"].(string)
+	if !strings.Contains(expr, "scale_csi_pool_health_last_success_timestamp_seconds") {
+		t.Errorf("ScaleCSIPoolHealthProducerSkew must count producers via the driver-owned last-success timestamp; got %q", expr)
+	}
+	if !strings.Contains(expr, "count") {
+		t.Errorf("ScaleCSIPoolHealthProducerSkew must COUNT series (one per publishing process); got %q", expr)
+	}
+
+	// The chart must also render a NON-OVERLAPPING rollout when the poller is on,
+	// or the invariant the taxonomy claims does not exist.
+	deployment := helmTemplate(t, "--show-only", "templates/controller-deployment.yaml", "--set", "backendHealth.enabled=true")
+	controller := findManifest(t, decodeManifests(t, deployment), "Deployment", "controller")
+	spec, ok := asManifest(controller["spec"])
+	if !ok {
+		t.Fatal("controller Deployment has no decodable spec")
+	}
+	strategy, ok := asManifest(spec["strategy"])
+	if !ok {
+		t.Fatal("controller Deployment renders no strategy")
+	}
+	switch strategy["type"] {
+	case "Recreate":
+		// Non-overlapping by construction.
+	case "RollingUpdate":
+		rolling, ok := asManifest(strategy["rollingUpdate"])
+		if !ok {
+			t.Fatal("RollingUpdate strategy with no rollingUpdate block")
+		}
+		if fmt.Sprint(rolling["maxSurge"]) != "0" {
+			t.Errorf("with backendHealth.enabled the controller rollout must not overlap producers"+
+				" (maxSurge must be 0); got maxSurge=%v. Two overlapping processes publish independently sampled"+
+				" scale_csi_pool_* series that every `max by (pool)` rule merges.", rolling["maxSurge"])
+		}
+	default:
+		t.Errorf("unexpected controller strategy type %v", strategy["type"])
+	}
+}
+
 // TestGF5Fix5MetricsCommentsAgreeWithTheBundledAlerts pins finding 3: two
 // comments in pkg/driver/metrics.go contradicted the alerts they describe.
 // ScaleCSIPoolDegraded has NO stale gate, so a frozen DEGRADED sample keeps it
@@ -1106,16 +1329,35 @@ func TestGF5Fix5PollStallEndsAtAUsableSample(t *testing.T) {
 // condition is the previous verdict, because past the TTL it is dataset-only.
 func TestGF5Fix5MetricsCommentsAgreeWithTheBundledAlerts(t *testing.T) {
 	metrics := repoFile(t, "pkg", "driver", "metrics.go")
-	rule := repoFile(t, "charts", "scale-csi", "templates", "prometheusrule.yaml")
 
-	if strings.Contains(rule, "scale_csi_pool_health_stale") &&
-		strings.Contains(rule, "expr: max(scale_csi_pool_status{status=~\"DEGRADED|FAULTED|UNAVAIL\"}) by (pool) == 1\n          for: 5m") {
-		// The alert really is ungated; the comments must not claim otherwise.
-		if strings.Contains(metrics, "must not keep alerting after a real recovery") {
-			t.Error("pkg/driver/metrics.go still claims the staleness TTL stops a stale DEGRADED from alerting;" +
-				" ScaleCSIPoolDegraded has no stale gate, so the frozen sample keeps it firing")
-		}
+	// Assert against the RENDERED alert, not the template text. Round 5 read raw
+	// bytes and only entered this branch for ONE exact formatting of the
+	// expression and hold, so re-formatting the YAML — or actually gating the
+	// alert on the stale gauge — skipped the semantic check entirely.
+	degraded := renderedAlert(t, "ScaleCSIPoolDegraded")
+	expr, _ := degraded["expr"].(string)
+	if !strings.Contains(expr, "scale_csi_pool_status") {
+		t.Fatalf("ScaleCSIPoolDegraded no longer reads the raw pool status gauge: %q", expr)
 	}
+	if strings.Contains(expr, "scale_csi_pool_health_stale") {
+		t.Errorf("ScaleCSIPoolDegraded is now GATED on scale_csi_pool_health_stale (%q), but pkg/driver/metrics.go"+
+			" documents it as deliberately ungated. Change both or neither.", expr)
+	} else if strings.Contains(metrics, "must not keep alerting after a real recovery") {
+		t.Error("pkg/driver/metrics.go still claims the staleness TTL stops a stale DEGRADED from alerting;" +
+			" ScaleCSIPoolDegraded has no stale gate, so the frozen sample keeps it firing")
+	}
+	// The alert-hold class is BOUNDED BY THIS HOLD, so the canonical taxonomy has
+	// to name the value the chart actually renders.
+	hold, _ := degraded["for"].(string)
+	if hold == "" {
+		t.Fatal("ScaleCSIPoolDegraded renders no `for` hold; the alert-hold class has nothing to be bounded by")
+	}
+	canonical := repoFile(t, "pkg", "driver", "backend_health.go")
+	if !strings.Contains(canonical, "`for: "+hold+"`") {
+		t.Errorf("ScaleCSIPoolDegraded renders `for: %s`, but the canonical taxonomy in"+
+			" pkg/driver/backend_health.go does not bound the alert-hold class by that value", hold)
+	}
+
 	collapsedMetrics := collapseProse(metrics)
 	for _, required := range []string{
 		"deliberately not gated on this one",

@@ -354,10 +354,13 @@ clamped to **30s–2m**; a value outside that range is clamped (with a single
 warning logged when the poller starts) rather than rejected. The 2m ceiling
 bounds how far the debounced condition may trail the raw gauges: the fan-out
 hysteresis needs two samples and nothing is published until each sample's backend
-call returns, so a **confirmed** condition flip takes at most 2 × interval **plus
-one 30s `backendHealthCallTimeout`** (4m30s at the ceiling) **while successful
-samples keep arriving**, and that has to stay inside the 5m `for` hold on
-`ScaleCSIPoolDegraded`. It is a bound on cadence, and it is
+call returns, so a **confirmed** condition flip is **published by the driver**
+within at most 2 × interval **plus one 30s `backendHealthCallTimeout`** (4m30s at
+the ceiling) **while successful samples keep arriving**, and that has to stay
+inside the 5m `for` hold on `ScaleCSIPoolDegraded`. That is a **driver-side
+publication** bound only — not a deadline for the PVC object or the alert, both
+of which are downstream of it and unbounded here (see "What 4m30s bounds, and
+what it does not" below). It is a bound on cadence, and it is
 **not** a guarantee that the alert and the PVC condition always agree — it in
 fact creates one of the documented divergence classes, because it deliberately
 puts the confirmed condition *ahead* of the alert. See "Signal timing" below. Like the capacity gauge loop this poller
@@ -457,8 +460,8 @@ There are **four** observers here, not two: the **raw** gauges, the **debounced*
 Prometheus evaluates on **its** scrape and rule-evaluation cadence, not on the
 driver's), and the PVC condition/Event refresh that **external-health-monitor**
 drives on a third cadence. They share one severity split, not one timeline. This
-table is the complete taxonomy — **six** numbered classes of divergence; the
-first three have an upper bound, the last three do not. Do not document or assume
+table is the complete taxonomy — **seven** numbered classes of divergence; the
+first three have an upper bound, the last four do not. Do not document or assume
 that the signals always agree; they are not required to, and the interval ceiling
 does not make them (it creates the alert-hold class). The canonical copy of this
 list lives on `backendHealthFlipSamples` in `pkg/driver/backend_health.go`; if
@@ -466,12 +469,24 @@ you change one, change all of them, keeping the numbering and the order:
 
 | Class | What you see | Duration | Observable via |
 |---|---|---|---|
-| 1. Confirmation lag | raw gauge already shows the new state; every PVC still reports the previous condition | **bounded**: one successful poll interval **plus one 30s `backendHealthCallTimeout`** (≤ 2m30s at the ceiling, which keeps a confirmed degradation ahead of the `ScaleCSIPoolDegraded` hold as long as samples keep arriving) | `scale_csi_pool_health_flip_pending = 1` |
+| 1. Confirmation lag | raw gauge already shows the new state; every PVC still reports the previous condition | **bounded**: one successful poll interval **plus one 30s `backendHealthCallTimeout`** (≤ 2m30s at the ceiling, which keeps a confirmed degradation ahead of the `ScaleCSIPoolDegraded` hold as long as samples keep arriving). This bounds **driver-side publication** only — see the scope note below the table | `scale_csi_pool_health_flip_pending = 1` |
 | 2. Alert hold | the condition has **already** confirmed and PVCs read `Abnormal`, but `ScaleCSIPoolDegraded` is still **pending** and therefore not firing | **bounded**: the remainder of the rule's own `for: 5m`. The 2m ceiling deliberately produces this ordering — it does not remove the window | **neither gauge** — both read `0` here. Use the alert's own state: `ALERTS{alertname="ScaleCSIPoolDegraded",alertstate="pending"}` |
 | 3. Recovery | the degraded gauge clears on the **first** healthy sample while PVCs stay `Abnormal` until the **second**; the alert then clears one scrape and one rule evaluation later (class 5) | **bounded**: one sample, deliberately; no interval setting removes it | `scale_csi_pool_health_flip_pending = 1` |
 | 4. Poll stall | usable samples stop arriving: the condition **holds** its last value and the gauges freeze at theirs, so a single unconfirmed `DEGRADED` sample can keep the raw alert expression true while conditions still read normal | **unbounded** — it lasts until a **successful usable sample** arrives. A reply is not a usable sample: a valid `pool.query` that does not list the pool returns `pool ... not found` and takes the same failed-sample path. Past the TTL conditions fall back to dataset-only (`flip_pending` may still read `1` at that point) | `scale_csi_pool_health_stale = 1` — raised on the first failed sample that finds a pending flip, and the moment the TTL expires: at the next sample attempt or at the CSI read that first refuses to serve the snapshot, whichever comes first |
-| 5. Observer lag | the gauges, the alert state and the PVC condition are read at **different instants**: Prometheus sees a change only on its next successful scrape, `for: 5m` starts when the **expression** first evaluates true rather than when the driver sampled, and PVC conditions refresh on external-health-monitor's own cadence. So after a recovery both diagnostic gauges can read `0` while the alert is **still firing**, and before the first true evaluation a condition can be `Abnormal` with no `ALERTS{alertstate="pending"}` series at all | **unbounded** — the driver does not control it: this chart puts no upper limit on the ServiceMonitor interval, and a scrape or evaluation outage has no limit either. During a `RollingUpdate` two controller processes publish independently sampled series that the alert's `max by (pool)` merges | **neither gauge** — compare freshness (`time() - timestamp(scale_csi_pool_health_stale)`) and pin the `pod` label |
-| 6. Cold start | no successful sample has landed since the controller process started: conditions are dataset-only and `scale_csi_pool_status`/`_healthy` **do not exist**, so `ScaleCSIPoolDegraded` cannot fire whatever the pool is doing. This is **not** the frozen-gauge shape of class 4 — there is nothing frozen to look at | **unbounded** — until the first successful usable sample of that process. A restart with a missing or renamed pool stays here indefinitely | `scale_csi_pool_health_stale = 1` **with the raw `scale_csi_pool_*` series absent** (`flip_pending` is published as `0`); alerted by `ScaleCSIPoolHealthStale` |
+| 5. Observer lag | the gauges, the alert state and the PVC condition are read at **different instants**: Prometheus sees a change only on its next successful scrape, `for: 5m` starts when the **expression** first evaluates true rather than when the driver sampled, and PVC conditions refresh on external-health-monitor's own cadence. So after a recovery both diagnostic gauges can read `0` while the alert is **still firing**, and before the first true evaluation a condition can be `Abnormal` with no `ALERTS{alertstate="pending"}` series at all | **unbounded** — the driver does not control it: this chart puts no upper limit on the ServiceMonitor interval, and a scrape or evaluation outage has no limit either. This is a timing class about **one** producer; disagreement *between* producers is class 7 | **neither gauge** — compare the driver-owned `time() - scale_csi_pool_health_last_success_timestamp_seconds` (sample age) against scrape age. Never `timestamp()`: it returns the **scrape** time |
+| 6. Cold start | no successful sample has landed since the controller process started: conditions are dataset-only and `scale_csi_pool_status`/`_healthy` **do not exist**, so `ScaleCSIPoolDegraded` cannot fire whatever the pool is doing. This is **not** the frozen-gauge shape of class 4 — there is nothing frozen to look at | **unbounded** — until the first successful usable sample of that process. A restart with a missing or renamed pool stays here indefinitely | `scale_csi_pool_health_stale = 1` **with the raw `scale_csi_pool_*` series absent** (`flip_pending` is published as `0`); alerted by `ScaleCSIPoolHealthStale`. That gauge does **not** say the pool exists — the label is the configured name, so a missing, renamed or misspelled pool is indistinguishable from an unreachable one |
+| 7. Replica skew | more than one controller process publishes `scale_csi_pool_*` for the same pool, so `max by (pool)` merges independently sampled histories and keeps the worst of them. Two **perfectly synchronized** reads can disagree with flawless scrape and rule timing, and the PVC condition comes from whichever process external-health-monitor is talking to. This is a **producer-identity** difference, not a timing one | **unbounded** — the poller has no leader-election gate, so every replica polls, and with `fencing.mode=off` an overlapping rollout adds another producer. Pinning a pod is a mitigation, not a contract: the supported single-producer configuration is `controller.replicas=1`, and enabling `backendHealth` renders a non-overlapping rollout (`maxSurge: 0`) so an upgrade does not create a second producer | `count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds) > 1`; alerted by `ScaleCSIPoolHealthProducerSkew` |
+
+**What 4m30s bounds, and what it does not.** The 2m interval ceiling plus the
+30s `backendHealthCallTimeout` bound **driver-side publication**: the instant
+*this controller process's* cached `VolumeCondition` and raw gauges carry the
+confirmed state. It is **not** an end-to-end deadline and must never be used as
+an incident SLO for a PVC. Everything after publication is outside it and is
+**unbounded** here: the CSI read that composes the condition, the
+**external-health-monitor** refresh (`healthMonitor.interval` has no maximum in
+`values.schema.json`), the Prometheus **scrape** (the ServiceMonitor interval has
+no maximum either), **rule evaluation**, and any outage of either. The driver
+also does not bound how long a *second* producer keeps publishing (class 7).
 
 **Triage rule.** The observers above sample at different instants, so read them
 for the **same moment** before comparing them at all:
@@ -484,16 +499,26 @@ for the **same moment** before comparing them at all:
    reporting `Abnormal` while the alert is merely **pending** is the expected
    alert-hold class (2), and **neither gauge** can see it.
 3. If both are `0` and the alert is firing, check that you are comparing
-   **synchronized observations** before blaming the driver (class 5):
-   **scrape freshness** — `time() - timestamp(scale_csi_pool_health_stale{pool="..."})`
-   tells you how old the sample behind those gauges is; if the alert's last
-   evaluation predates the driver's last poll you are looking at observer lag.
-   Two successful `ONLINE` polls landing between scrapes leave both gauges at `0`
+   **synchronized observations** before blaming the driver (classes 5 and 7):
+   **sample age** — `time() - scale_csi_pool_health_last_success_timestamp_seconds{pool="..."}`.
+   This gauge is written by the **driver**, and only when a successful usable
+   sample lands, so it is the age of the sample behind the other gauges. Do
+   **not** use `timestamp(scale_csi_pool_health_stale)`: PromQL `timestamp()`
+   returns the *sample's* timestamp, which for a pull exporter is the **scrape**
+   time — a frozen poller that keeps answering scrapes looks perfectly fresh by
+   that query, and a scrape outage makes a healthy driver look stale. Compare
+   this driver-owned age against scrape age
+   (`time() - timestamp(scale_csi_pool_health_stale{pool="..."})`, which is the
+   scrape age and nothing else): if the alert's last evaluation predates the
+   driver's last successful sample you are looking at observer lag. Two
+   successful `ONLINE` polls landing between scrapes leave both gauges at `0`
    while the alert is still firing, and that is expected.
-   **Controller identity** — during a rollout more than one controller process
-   publishes; two `pod` values, or `count by (pool) (scale_csi_pool_status)`
-   above its steady-state value, means `max by (pool)` is merging independently
-   sampled series. Pin one `pod` before comparing.
+   **Controller identity** — `count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds)`
+   above `1` means more than one controller process is publishing and `max by
+   (pool)` is merging independently sampled histories (class 7, which
+   `ScaleCSIPoolHealthProducerSkew` alerts on). Pin one `pod` before comparing —
+   and note that pinning is a workaround; the supported configuration is one
+   producer.
    **PVC refresh cadence** — external-health-monitor rewrites conditions on its
    own schedule, so a PVC can still show a condition the driver has already
    replaced.

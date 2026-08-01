@@ -27,17 +27,24 @@ const minBackendHealthInterval = 30 * time.Second
 //
 // The fan-out hysteresis (backendHealthFlipSamples) needs two consecutive
 // samples to flip a PVC's VolumeCondition, and NOTHING is published until each
-// of those samples' backend calls RETURNS — backendHealthCallTimeout bounds that
-// at 30s. So a degradation that keeps being observed reaches conditions within
-// at most 2 × interval + backendHealthCallTimeout: 4m30s at the ceiling, NOT the
-// 4m that 2 × interval alone suggests. The ScaleCSIPoolDegraded alert fires off
-// the UNDAMPED gauge after a 5m hold, so the ceiling still keeps a confirmed
-// flip inside that hold (4m30s < 5m) WHEN SAMPLES KEEP ARRIVING.
+// of those samples' pool.query RETURNS — backendHealthCallTimeout bounds that at
+// 30s. So a degradation that keeps being observed reaches the driver's own
+// cached condition within at most 2 × interval + backendHealthCallTimeout: 4m30s
+// at the ceiling, NOT the 4m that 2 × interval alone suggests. The
+// ScaleCSIPoolDegraded alert fires off the UNDAMPED gauge after a 5m hold, so the
+// ceiling still keeps a confirmed flip inside that hold (4m30s < 5m) WHEN
+// SAMPLES KEEP ARRIVING.
 //
-// This is a DRIVER-SIDE bound. It says nothing about when Prometheus SCRAPES the
-// change or when the rule is EVALUATED, and the chart puts no upper bound on the
-// ServiceMonitor interval — that is the observer-lag class, and it is outside
-// every number here.
+// SCOPE, because this number keeps being read as something it is not. 4m30s
+// bounds DRIVER-SIDE PUBLICATION ONLY: the moment this process's cached
+// condition and raw gauges carry the new state. It is NOT a bound on when a PVC
+// object shows it and NOT a bound on when an alert fires. Everything downstream
+// is outside it and is separately UNBOUNDED: the CSI read that composes the
+// condition, external-health-monitor's own refresh cadence (values.schema.json
+// puts no maximum on healthMonitor.interval), the Prometheus scrape (no maximum
+// on the ServiceMonitor interval either) and rule evaluation, including an
+// evaluation outage the driver cannot see or limit. Do not write "every managed
+// PVC reaches the new condition within 4m30s" — that claim is false.
 //
 // This is a bound, NOT a guarantee that the two signals always agree, and it
 // does not reduce the number of ways they can differ — it CREATES one of them:
@@ -45,13 +52,13 @@ const minBackendHealthInterval = 30 * time.Second
 // reads Abnormal while ScaleCSIPoolDegraded is still PENDING (the "alert hold"
 // class).
 //
-// backendHealthFlipSamples carries the SINGLE canonical enumeration: SIX
+// backendHealthFlipSamples carries the SINGLE canonical enumeration: SEVEN
 // NUMBERED classes of divergence — confirmation lag, alert hold, recovery, poll
-// stall, observer lag and cold start. The first three have an upper bound; the
-// last three do not. Every other copy of that list (prometheusrule.yaml,
-// values.yaml, values.schema.json, docs/production.md, docs/deployment.md)
-// numbers the SAME classes in the SAME order. A count asserted in one place is a
-// promise in all of them.
+// stall, observer lag, cold start and replica skew. The first three have an
+// upper bound; the last four do not. Every other copy of that list
+// (prometheusrule.yaml, values.yaml, values.schema.json, docs/production.md,
+// docs/deployment.md) numbers the SAME classes in the SAME order. A count
+// asserted in one place is a promise in all of them.
 //
 // A larger configured value is clamped with a loud warning rather than rejected:
 // failing the controller over an observability cadence would be a worse outcome
@@ -136,13 +143,20 @@ const backendHealthStaleIntervals = 3
 // refresh that external-health-monitor drives on a third cadence. They share one
 // SEVERITY SPLIT — the same states are abnormal in all of them — but they are
 // not the same signal in TIME. This is the CANONICAL list and it is complete:
-// SIX NUMBERED classes of divergence; the first three have an upper bound, the
-// last three do not. Do not restate it with a smaller count, and do not rename
+// SEVEN NUMBERED classes of divergence; the first three have an upper bound, the
+// last four do not. Do not restate it with a smaller count, and do not rename
 // or reorder the items — every other copy is checked against this one.
 //
+// One divergence that ONCE existed is deliberately absent because it was CLOSED
+// IN CODE rather than named: the publication/commit gap, in which an acquired
+// pool sample sat unpublished behind the disk.temperature_alerts call. See
+// sampleBackendHealth — no backend I/O is interposed between acquiring a sample
+// and publishing it, so there is no such window to classify.
+//
 //  1. Confirmation lag (BOUNDED: one successful poll interval plus one
-//     backendHealthCallTimeout, so ≤ 2m30s at the interval ceiling). An
-//     established-state transition is withheld until the second consecutive
+//     backendHealthCallTimeout, so ≤ 2m30s at the interval ceiling, and that
+//     bounds DRIVER-SIDE PUBLICATION only — not the PVC object, not the alert).
+//     An established-state transition is withheld until the second consecutive
 //     sample, so the condition trails the gauges. maxBackendHealthInterval keeps
 //     2 × interval + one call timeout under ScaleCSIPoolDegraded's 5m hold, so a
 //     degradation that keeps being observed reaches conditions before the alert
@@ -182,10 +196,10 @@ const backendHealthStaleIntervals = 3
 //     EXPECTED: after a recovery both diagnostic gauges can read 0 while the
 //     alert is still firing, and before the first true evaluation the condition
 //     can already be abnormal with no ALERTS{alertstate="pending"} series yet.
-//     During a RollingUpdate two controller processes publish independently
-//     sampled series that the alert's `max by (pool)` merges. Diagnose it by
-//     comparing sample/scrape freshness and pinning the pod, never by reading
-//     the two diagnostic gauges.
+//     Diagnose it by comparing the DRIVER-OWNED sample time
+//     (scale_csi_pool_health_last_success_timestamp_seconds) against scrape
+//     freshness, never by reading the two diagnostic gauges. This is a TIMING
+//     class about ONE producer; disagreement between producers is class 7.
 //  6. Cold start (UNBOUNDED — until the FIRST successful sample of this
 //     process). All of this state is process-local and the CSI and metrics
 //     servers are already serving before startBackendHealth produces anything
@@ -196,7 +210,23 @@ const backendHealthStaleIntervals = 3
 //     sample therefore publishes scale_csi_pool_health_stale = 1 (and
 //     flip_pending = 0) for the configured pool so the blind window is visible
 //     and ScaleCSIPoolHealthStale can fire; the raw gauges stay ABSENT rather
-//     than being invented.
+//     than being invented. The stale gauge does NOT say the pool exists: the
+//     label is the CONFIGURED name, so a missing, renamed or misspelled pool
+//     reaches exactly this state and is indistinguishable from an unreachable
+//     one. Read it as "no fresh sample for this configured identity".
+//  7. Replica skew (UNBOUNDED — a PRODUCER-IDENTITY difference, not a timing
+//     one). The poller has no leader-election gate: EVERY controller replica
+//     runs it, and with fencing.mode=off a RollingUpdate may also overlap an old
+//     and a new process. Each publishes its OWN independently sampled series and
+//     the alerts merge them with `max by (pool)`, so two perfectly synchronized
+//     reads can disagree with flawless scrape and evaluation timing, and `max`
+//     keeps the WORST of several histories. Nothing in the driver bounds it —
+//     "pin a pod" is a mitigation, not a contract. Detect it, do not infer it:
+//     `count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds)`
+//     above 1 means more than one producer, which ScaleCSIPoolHealthProducerSkew
+//     alerts on. The chart's supported single-producer configuration is
+//     controller.replicas = 1 with the non-overlapping rollout the chart renders
+//     when backendHealth.enabled (maxSurge 0, or Recreate under fencing).
 const backendHealthFlipSamples = 2
 
 // startBackendHealth launches the controller-only backend-health poll loop when

@@ -443,7 +443,7 @@ func TestBackendHealthStalePublicationSurvivesAConcurrentSample(t *testing.T) {
 	d := healthTestDriver(mock)
 	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
 
-	const rounds = 400
+	const rounds = 1500
 	for round := 0; round < rounds; round++ {
 		expired := &truenas.PoolHealthSnapshot{
 			Pool: pool, Status: truenas.PoolStatusDegraded,
