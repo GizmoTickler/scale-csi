@@ -67,6 +67,15 @@ type MockClient struct {
 	// then be retried.
 	FailDatasetDelete map[string]struct{}
 
+	// FailSnapshotListAfter makes SnapshotList succeed for this many calls and
+	// fail on every call after that; 0 never fails and a NEGATIVE value fails
+	// every call. It models the DeleteVolume sequence where the up-front snapshot
+	// guard reads a good list and the backend then stops answering (the only way
+	// to reach the post-destroy "snapshot state cannot be verified" branch), and
+	// the promote path's unobtainable corroborating inventory.
+	FailSnapshotListAfter int
+	snapshotListCalls     int
+
 	// SystemTimezoneName is the IANA zone SystemTimezone reports (default UTC).
 	// SystemTimezoneErr makes it unreadable, for the fail-closed path.
 	SystemTimezoneName string
@@ -1213,8 +1222,13 @@ func (m *MockClient) SnapshotGet(ctx context.Context, snapshotID string) (*Snaps
 }
 
 func (m *MockClient) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.snapshotListCalls++
+	if m.FailSnapshotListAfter != 0 && m.snapshotListCalls > m.FailSnapshotListAfter {
+		return nil, &APIError{Code: -1, Message: "injected snapshot list failure"}
+	}
 
 	var list []*Snapshot
 	for _, snap := range m.Snapshots {

@@ -345,3 +345,73 @@ func TestPromoteCarriesTombstoneLedgerProvenanceAcrossMigration(t *testing.T) {
 	_, err = client.SnapshotGet(ctx, newTombstoneID)
 	assert.True(t, truenas.IsNotFoundError(err), "the migrated tombstone is actually drained")
 }
+
+// GF2-fix3/B1-g — PROMOTE MUST REFUSE ON AN UNPROVABLY COMPLETE INVENTORY.
+//
+// SnapshotListAll returns ([]*Snapshot, error) with no total, no page token and
+// no completeness marker, and listAllManagedSnapshots treated every nil-error
+// slice as complete. A truncated-but-successful result therefore dropped an
+// older unowned snapshot from the migrating set, and pool.dataset.promote
+// silently re-parented it. "No error" is not completeness.
+//
+// The fixture is exactly that: the operator's older snapshot EXISTS on the
+// backend but is absent from the buckets the pass hands in — which is what a
+// truncated success looks like from here. The refusal comes from the
+// corroborating dataset-scoped inventory disagreeing with the pass's view.
+//
+// FAILS on 9929315: there the migrating set is computed straight from the
+// pass's (short) view, the promote runs, and the operator's snapshot is
+// re-parented onto pool/parent/restored — so both the PromotedCloneCount and
+// the Dataset assertions fail.
+func TestReconcilePromoteRefusesWhenPassInventoryIsTruncated(t *testing.T) {
+	ctx := context.Background()
+	pv := boundReconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	d.config.ZFS.PromoteRestoredClones = true
+
+	// Older than the origin, so ZFS WOULD migrate it.
+	foreign, err := client.SnapshotCreate(ctx, "pool/parent/source", "admin-preupgrade", nil)
+	require.NoError(t, err)
+	origin := seedOriginTombstone(t, client, "pool/parent/source", "snap")
+	require.Less(t, foreign.CreateTXG, origin.CreateTXG, "fixture: the omitted snapshot must be in the migrating range")
+	client.Datasets["pool/parent/source"] = &truenas.Dataset{Name: "pool/parent/source"}
+	clone := seedCloneRestoredVolume(client, d, "restored", origin.ID)
+
+	report := promoteReport()
+	// The unowned bucket is EMPTY although the snapshot exists — the truncated
+	// success. Nothing else about the pass is wrong.
+	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{clone},
+		nil, []*truenas.Snapshot{origin}, nil, map[string]tombstoneLedgerEntry{}, report)
+
+	assert.Equal(t, 0, report.PromotedCloneCount,
+		"an inventory that cannot be proven complete must refuse the promote")
+	assert.Empty(t, client.DatasetPromoteCalls)
+	got, err := client.SnapshotGet(ctx, foreign.ID)
+	require.NoError(t, err, "the operator's snapshot must not be re-parented")
+	assert.Equal(t, "pool/parent/source", got.Dataset)
+}
+
+// GF2-fix3/B1-g — the corroboration must also refuse when the AUTHORITATIVE
+// listing is the one that cannot be obtained. An error there is not permission
+// to reason from the cached view.
+//
+// FAILS on 9929315: no second inventory is taken at all, so the promote runs.
+func TestReconcilePromoteRefusesWhenTheCorroboratingInventoryFails(t *testing.T) {
+	ctx := context.Background()
+	pv := boundReconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	d.config.ZFS.PromoteRestoredClones = true
+
+	origin := seedOriginTombstone(t, client, "pool/parent/source", "snap")
+	client.Datasets["pool/parent/source"] = &truenas.Dataset{Name: "pool/parent/source"}
+	clone := seedCloneRestoredVolume(client, d, "restored", origin.ID)
+	client.FailSnapshotListAfter = -1 // every SnapshotList call fails
+
+	report := promoteReport()
+	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{clone},
+		nil, []*truenas.Snapshot{origin}, nil, map[string]tombstoneLedgerEntry{}, report)
+
+	assert.Equal(t, 0, report.PromotedCloneCount,
+		"an unobtainable corroborating inventory must refuse the promote")
+	assert.Empty(t, client.DatasetPromoteCalls)
+}

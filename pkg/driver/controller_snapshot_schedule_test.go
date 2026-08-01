@@ -790,3 +790,243 @@ func TestReconcileCountsScheduledSnapshotsFromProductionPartition(t *testing.T) 
 	assert.Equal(t, 0, count)
 	assert.Empty(t, report.OrphanSnapshots, "a scheduled snapshot is never an orphan/delete candidate (R4)")
 }
+
+// ---------------------------------------------------------------------------
+// GF2-fix3 regression proofs. Each states, in its own doc comment, whether it
+// FAILS on the round-2 head 9929315 and why — a test that passes both sides is
+// a compatibility guard, not evidence, and is labelled as such.
+// ---------------------------------------------------------------------------
+
+// B1-d — A TIMEZONE RECONFIGURATION THAT LEAVES THE CIVIL FIELDS IDENTICAL.
+//
+// America/New_York and America/Toronto have had identical offsets and identical
+// DST rules for the whole tzdata era, so every scheduled snapshot name renders
+// byte-for-byte the same under either. Round 2 read only the CURRENT zone, so
+// after the operator re-homed the NAS the names still "agreed" and the
+// snapshots stayed deletable — the change was undetectable in principle. The
+// zone RECORDED when the task was created makes the FACT of the change visible
+// whether or not the offsets coincide, and the delete path fails closed on it.
+//
+// FAILS on 9929315: there the delete succeeds (the civil comparison is
+// unchanged by the re-home), so require.Error is not satisfied.
+func TestDeleteVolumePreservesScheduledSnapshotAfterEquivalentZoneReconfiguration(t *testing.T) {
+	client := truenas.NewMockClient()
+	client.SystemTimezoneName = "America/New_York"
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	seedScheduledVolume(t, client, d, "sched-tzequiv")
+	taken := time.Date(2026, 1, 15, 3, 0, 0, 0, time.UTC) // winter: both zones -05:00
+	fireScheduledSnapshot(t, client, taken, "America/New_York")
+
+	// Prove the fixture really is the indistinguishable case: the same instant
+	// renders to the same civil fields in both zones, so nothing about the NAME
+	// or the CREATION time can reveal the reconfiguration.
+	ny, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	toronto, err := time.LoadLocation("America/Toronto")
+	require.NoError(t, err)
+	require.Equal(t,
+		taken.In(ny).Format(scheduledSnapshotTimestampLayout),
+		taken.In(toronto).Format(scheduledSnapshotTimestampLayout),
+		"fixture: the two zones must be civil-identical at this instant, otherwise this tests the round-2 offset check instead")
+
+	client.SystemTimezoneName = "America/Toronto"
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-tzequiv"})
+	require.Error(t, err, "an offset-equivalent zone reconfiguration must still fail closed")
+	assert.Contains(t, err.Error(), "non-CSI snapshots")
+}
+
+// B1-a — A ZONE CHANGE MUST NOT BE BYPASSED BY A WARM CACHE.
+//
+// Round 2 memoized the zone on the Driver for an hour, and only the truenas
+// Client's copy was dropped on reconnect. So a first scheduled DeleteVolume
+// warmed the driver cache, and any later delete within the TTL kept using the
+// OLD zone — authorizing snapshots under a clock the NAS no longer keeps. This
+// drives exactly that sequence: warm it with one delete, re-home the NAS, then
+// delete a second volume.
+//
+// FAILS on 9929315: the second delete is served from the warm driver cache,
+// classifies the snapshot as driver-owned and SUCCEEDS, so require.Error fails.
+func TestScheduledDeleteDoesNotServeAZoneChangeFromAWarmCache(t *testing.T) {
+	client := truenas.NewMockClient()
+	client.SystemTimezoneName = "America/New_York"
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	// Volume 1: deleted normally, which is what warmed the round-2 driver cache.
+	seedScheduledVolume(t, client, d, "sched-warm")
+	fireScheduledSnapshot(t, client, time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC), "America/New_York")
+	_, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-warm"})
+	require.NoError(t, err, "fixture: the first scheduled delete must succeed and warm any cache")
+
+	// Volume 2: its snapshot is taken under the OLD zone, then the NAS is
+	// re-homed to a zone with a different offset. Within the round-2 TTL nothing
+	// re-reads the zone, so the stale value keeps authorizing.
+	seedScheduledVolume(t, client, d, "sched-stale")
+	fireScheduledSnapshot(t, client, time.Date(2026, 7, 1, 13, 0, 0, 0, time.UTC), "America/New_York")
+	client.SystemTimezoneName = "Europe/Berlin"
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-stale"})
+	require.Error(t, err, "a zone change must be observed immediately, never bypassed for a cache TTL")
+	assert.Contains(t, err.Error(), "non-CSI snapshots")
+}
+
+// B1-e — THE CORROBORATION RECORD MUST LAND BEFORE THE EVIDENCE IS DESTROYED.
+//
+// deleteVolumeSnapshotTask deletes the only live proof that a driver task was
+// minting these snapshots. Round 2 logged a failed corroboration write and
+// deleted the task anyway: if the delete then failed later (share or dataset
+// destroy), the next attempt saw neither a task nor a record, classified the
+// driver's OWN snapshots as foreign, and returned FailedPrecondition forever.
+// The task must SURVIVE a failed record, because its liveness is what keeps the
+// retry decidable.
+//
+// FAILS on 9929315: there the task is deleted despite the injected write
+// failure, so the SnapshotTasks assertion fails; the retry then also wedges.
+func TestDeleteVolumeKeepsTaskWhenCorroborationRecordDoesNotLand(t *testing.T) {
+	client := truenas.NewMockClient()
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	seedScheduledVolume(t, client, d, "sched-nolanding")
+	fireScheduledSnapshot(t, client, time.Now().Add(-time.Hour), "UTC")
+	require.Len(t, client.SnapshotTasks, 1, "fixture: the driver's task exists")
+
+	// The durable record cannot be written, and this attempt fails at the dataset
+	// destroy — the exact combination that wedged the retry.
+	client.FailUserPropertyKeys = map[string]struct{}{PropSnapshotTaskCorroboration: {}}
+	client.FailDatasetDelete = map[string]struct{}{"pool/parent/sched-nolanding": {}}
+	_, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-nolanding"})
+	require.Error(t, err, "fixture: the injected destroy failure must surface")
+	assert.Len(t, client.SnapshotTasks, 1,
+		"the task must NOT be destroyed when its durable replacement did not land")
+
+	// The backend recovers. The retry re-observes the live task and completes.
+	client.FailUserPropertyKeys = nil
+	client.FailDatasetDelete = nil
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-nolanding"})
+	require.NoError(t, err, "the retry must not be wedged behind the foreign guard")
+	assert.Empty(t, client.SnapshotTasks, "the task is retired once the delete really completes")
+}
+
+// B1-e (companion) — THE RETRY MUST BE AUTHORIZED BY THE RECORD, NOT BY
+// PERMISSIVENESS.
+//
+// TestDeleteVolumeRetryStillOwnsScheduledSnapshotAfterTaskRemoved shows a retry
+// SUCCEEDING after the task is gone, but on its own it cannot say WHY: the
+// pre-corroboration code succeeded there too, for the overly-permissive reason
+// that it never required a live task at all. This is the discriminating half:
+// same shape, with the durable record removed, so the only difference between
+// the two outcomes is the record itself.
+//
+// PASSES on 9929315 (the record is read the same way there) — it is the
+// discriminator for the sibling test, not an independent regression proof.
+func TestDeleteVolumeRetryRefusesWhenTheCorroborationRecordIsAbsent(t *testing.T) {
+	client := truenas.NewMockClient()
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	seedScheduledVolume(t, client, d, "sched-norecord")
+	fireScheduledSnapshot(t, client, time.Now().Add(-time.Hour), "UTC")
+
+	client.FailDatasetDelete = map[string]struct{}{"pool/parent/sched-norecord": {}}
+	_, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-norecord"})
+	require.Error(t, err, "fixture: the injected destroy failure must surface")
+	require.Empty(t, client.SnapshotTasks, "fixture: the record landed, so the task was retired")
+
+	// Remove the durable record, leaving the retry with no proof at all. Nothing
+	// else changes: same dataset, same snapshot, same schema binding.
+	require.NoError(t, client.DatasetRemoveUserProperties(ctx, "pool/parent/sched-norecord",
+		[]string{PropSnapshotTaskCorroboration}))
+
+	client.FailDatasetDelete = nil
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-norecord"})
+	require.Error(t, err, "with neither a task nor a record, the snapshot is unprovable and must be preserved")
+	assert.Contains(t, err.Error(), "non-CSI snapshots")
+}
+
+// B1-f — AN UNREADABLE SNAPSHOT LIST IS NOT EVIDENCE OF ABSENCE, EVEN FOR AN
+// OPTED-IN OPERATOR.
+//
+// zfs.destroyForeignSnapshotsOnDelete authorizes destroying foreign snapshots
+// the driver has SEEN and classified. Round 2 also let it authorize a BLIND
+// recursive destroy when the second SnapshotList errored, which can take out
+// snapshots nothing ever looked at.
+//
+// FAILS on 9929315: there the opted-in branch recurses and the delete SUCCEEDS,
+// so require.Error is not satisfied.
+func TestDeleteVolumeRefusesBlindRecursiveDestroyWhenSnapshotListFails(t *testing.T) {
+	client := truenas.NewMockClient()
+	d := newScheduleTestDriver(client)
+	d.config.ZFS.DestroyForeignSnapshotsOnDelete = true
+	ctx := context.Background()
+
+	_, err := d.CreateVolume(ctx, scheduleVolumeRequest("blind-delete", nil))
+	require.NoError(t, err)
+	// An operator snapshot makes the non-recursive destroy fail, which is what
+	// carries control into the post-destroy classification branch.
+	_, err = client.SnapshotCreate(ctx, "pool/parent/blind-delete", "admin-keepme", nil)
+	require.NoError(t, err)
+	// The up-front guard reads a good list; the backend then stops answering.
+	client.FailSnapshotListAfter = 1
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "blind-delete"})
+	require.Error(t, err, "an unverifiable snapshot list must refuse even with destroyForeignSnapshotsOnDelete=true")
+	assert.Contains(t, err.Error(), "cannot verify snapshots")
+
+	client.FailSnapshotListAfter = 0
+	survivor, err := client.SnapshotGet(ctx, "pool/parent/blind-delete@admin-keepme")
+	require.NoError(t, err, "nothing may be destroyed on the strength of a failed listing")
+	assert.NotNil(t, survivor)
+}
+
+// B1-d (positive control) — the stored-zone gate must not be satisfiable by
+// simply never deleting anything. An unchanged zone still deletes on the first
+// attempt, which is the whole point of the feature.
+//
+// PASSES on 9929315: compatibility guard, not a regression proof.
+func TestDeleteVolumeStillAcceptsScheduledSnapshotWhenTheZoneIsUnchanged(t *testing.T) {
+	client := truenas.NewMockClient()
+	client.SystemTimezoneName = "America/New_York"
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	seedScheduledVolume(t, client, d, "sched-samezone")
+	ds, err := client.DatasetGet(ctx, "pool/parent/sched-samezone")
+	require.NoError(t, err)
+	assert.Equal(t, "America/New_York", ds.UserProperties[PropSnapshotTaskTimezone].Value,
+		"the zone in force at task creation must be recorded on the dataset")
+	assert.Equal(t, "local", ds.UserProperties[PropSnapshotTaskTimezone].Source,
+		"an inherited record proves nothing and must never be what is read")
+	fireScheduledSnapshot(t, client, time.Date(2026, 7, 4, 9, 0, 0, 0, time.UTC), "America/New_York")
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-samezone"})
+	require.NoError(t, err, "an unchanged zone must still delete the driver's own scheduled snapshots")
+}
+
+// B1-d — NO TASK MAY EXIST WITHOUT THE ZONE THAT PROVES ITS SNAPSHOTS.
+//
+// If the zone cannot be read at CreateVolume time the task is not created at
+// all: a task whose snapshots could never be proven would wedge the volume's own
+// DeleteVolume behind the foreign guard forever. Failing the ensure (never the
+// volume) is the fail-closed direction.
+//
+// FAILS on 9929315: there the task is created regardless of the zone read.
+func TestScheduledTaskIsNotCreatedWhenTheNASZoneIsUnreadable(t *testing.T) {
+	client := truenas.NewMockClient()
+	client.SystemTimezoneErr = errors.New("system.general.config unavailable")
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	_, err := d.CreateVolume(ctx, scheduleVolumeRequest("sched-nozone", map[string]string{
+		"snapshotSchedule": "0 0 * * *",
+	}))
+	require.NoError(t, err, "a task failure must never fail the volume")
+	assert.Empty(t, client.SnapshotTasks, "no task may be created without the zone that proves its snapshots")
+
+	ds, err := client.DatasetGet(ctx, "pool/parent/sched-nozone")
+	require.NoError(t, err)
+	assert.Empty(t, ds.UserProperties[PropSnapshotTaskTimezone].Value)
+}
