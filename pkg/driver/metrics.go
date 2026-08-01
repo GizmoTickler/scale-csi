@@ -398,15 +398,17 @@ var (
 	)
 
 	// poolHealthFlipPending is 1 while a health transition is waiting for its
-	// confirming sample. It makes the ONE deliberate disagreement window between
-	// the raw scale_csi_pool_* gauges and the debounced per-PVC VolumeCondition
-	// observable instead of implicit: while this is 1 the condition still carries
-	// the PREVIOUS verdict even though the raw gauges already show the new one.
+	// confirming sample. It makes the confirmation-lag and recovery classes of
+	// raw-vs-condition divergence observable instead of implicit. It is NOT a
+	// complete disagreement detector: it reads 0 during the alert-hold class, and
+	// past the staleness TTL it can still read 1 after the condition has fallen
+	// back to dataset-only. See backendHealthFlipSamples for the canonical four
+	// classes.
 	poolHealthFlipPending = regGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "pool_health_flip_pending",
-			Help:      "1 while a pool-health transition awaits its confirming sample; the per-PVC VolumeCondition still carries the previous verdict",
+			Help:      "1 while a pool-health transition awaits its confirming sample; until the staleness TTL expires the per-PVC VolumeCondition still carries the previous verdict",
 		},
 		[]string{"pool"},
 	)

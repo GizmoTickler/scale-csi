@@ -292,7 +292,7 @@
           "type": "boolean"
         },
         "interval": {
-          "description": "Poll cadence, clamped to 30s-2m; an out-of-range value is clamped with one startup warning, never rejected. The 2m ceiling keeps a hysteresis-CONFIRMED VolumeCondition flip (up to 2 x interval) inside the 5m ScaleCSIPoolDegraded hold; it does not make the raw gauges and the debounced condition agree at every instant. The staleness TTL is 3 x the effective clamped value.",
+          "description": "Poll cadence, clamped to 30s-2m; an out-of-range value is clamped with one startup warning, never rejected. The 2m ceiling keeps a hysteresis-CONFIRMED VolumeCondition flip (up to 2 x interval) inside the 5m ScaleCSIPoolDegraded hold WHILE SUCCESSFUL SAMPLES KEEP ARRIVING - it bounds cadence, not wall-clock publication, and it does not make the raw gauges, the debounced condition and the alert agree at every instant. It in fact creates the alert-hold divergence, in which the condition is already abnormal while the alert is still pending. The full, canonical taxonomy is four classes - confirmation lag, alert hold and recovery, each with an upper bound, plus poll stall, which is UNBOUNDED: it lasts until the backend answers. See docs/production.md#backend-health. The staleness TTL is 3 x the effective clamped value.",
           "type": "string",
           "minLength": 2
         }

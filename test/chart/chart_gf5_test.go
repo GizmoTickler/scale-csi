@@ -3,6 +3,7 @@ package chart
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -530,7 +531,7 @@ func TestGF5Fix3DocsAreHonestAboutSignalTiming(t *testing.T) {
 				"Poll stall",
 				"scale_csi_pool_health_flip_pending",
 				"the condition **holds** its last value",
-				"It is a bound, **not** a guarantee",
+				"**not** a guarantee that the alert and the",
 			},
 		},
 		{
@@ -548,7 +549,7 @@ func TestGF5Fix3DocsAreHonestAboutSignalTiming(t *testing.T) {
 			body: repoFile(t, "charts", "scale-csi", "values.schema.json"),
 			required: []string{
 				"clamped to 30s-2m",
-				"does not make the raw gauges and the debounced condition agree at every instant",
+				"does not make the raw gauges, the debounced condition and the alert agree at every instant",
 			},
 		},
 		{
@@ -571,5 +572,173 @@ func TestGF5Fix3DocsAreHonestAboutSignalTiming(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// signalTimingClasses is the CANONICAL taxonomy of ways the raw gauges, the
+// debounced VolumeCondition and the alert (raw gauge + its own `for` hold) can
+// disagree. The canonical prose lives on backendHealthFlipSamples in
+// pkg/driver/backend_health.go; every other surface must name the SAME classes.
+var signalTimingClasses = []string{
+	"confirmation lag",
+	"alert hold",
+	"recovery",
+	"poll stall",
+}
+
+var (
+	// forbiddenWindowCountRe catches any surface that re-asserts a divergence
+	// count smaller than the real one ("two windows", "exactly three bounded,
+	// intended ways", "the three bounded windows", ...). A count is a promise: if
+	// it is asserted anywhere it has to be right everywhere, so the only safe
+	// numbers here are none at all or "four".
+	forbiddenWindowCountRe = regexp.MustCompile(`(?i)\b(two|three|2|3)\b[^.\n]{0,40}?\b(windows?|ways?|classes|divergences?)\b`)
+	// exactlyCountRe catches the "exactly N" phrasing even when the noun is far
+	// away or on the next line.
+	exactlyCountRe = regexp.MustCompile(`(?i)\bexactly (two|three)\b`)
+	// boundedWordRe matches only the standalone word. "unbounded" is one word, so
+	// the leading \b cannot match inside it.
+	boundedWordRe = regexp.MustCompile(`\bbounded\b`)
+	pollStallRe   = regexp.MustCompile(`poll stall`)
+)
+
+// signalTimingVocabularyRe scopes the count check to sentences that are actually
+// about this contract. Repos contain unrelated prose about "windows" (e.g. the
+// write/verify race analysis), and flagging that would make the guard useless.
+// Word boundaries matter: "unconditional" is not a mention of a condition.
+var signalTimingVocabularyRe = regexp.MustCompile(
+	`\b(diverg\w*|differs?|differing|gauges?|alerts?|volumecondition|conditions?|hysteresis|debounced?|confirmation lag|poll stall|signal timing)\b`)
+
+// normalizeTimingProse lowercases and folds hyphens so "Alert hold",
+// "alert-hold" and "poll-stall" all compare equal.
+func normalizeTimingProse(s string) string {
+	return strings.ReplaceAll(strings.ToLower(s), "-", " ")
+}
+
+// enclosingSentence returns the text around [start,end) delimited by sentence
+// stops, so a match can be judged in context.
+func enclosingSentence(body string, start, end int) string {
+	from := strings.LastIndexAny(body[:start], ".!?")
+	to := strings.IndexAny(body[end:], ".!?")
+	if to < 0 {
+		to = len(body)
+	} else {
+		to += end
+	}
+	return body[from+1 : to]
+}
+
+// aboutSignalTiming reports whether a sentence is discussing the raw-versus-
+// condition-versus-alert contract at all.
+func aboutSignalTiming(sentence string) bool {
+	return signalTimingVocabularyRe.MatchString(sentence)
+}
+
+// findTimingCountClaim returns the first count claim made INSIDE a signal-timing
+// sentence, or "".
+func findTimingCountClaim(re *regexp.Regexp, body string) string {
+	// Newlines are folded so a claim wrapped across comment lines is still seen
+	// as one sentence; the regexes themselves stop at sentence stops.
+	flat := strings.ReplaceAll(body, "\n", " ")
+	for _, loc := range re.FindAllStringIndex(flat, -1) {
+		if aboutSignalTiming(enclosingSentence(flat, loc[0], loc[1])) {
+			return strings.TrimSpace(flat[loc[0]:loc[1]])
+		}
+	}
+	return ""
+}
+
+// TestGF5Fix4SignalTimingTaxonomyIsCompleteEverywhere is the mechanical guard
+// for the M6 round-4 correction, and it exists because the same overclaim came
+// back three times in slightly different words.
+//
+// Round 3 replaced "the signals can never disagree" with "exactly three bounded
+// windows". That was still false twice over: the PrometheusRule's own `for: 5m`
+// creates a FOURTH window in which the PVC condition has already confirmed while
+// the alert is merely PENDING (and BOTH diagnostic gauges read 0), and the
+// poll-stall window is not bounded at all — its own stated duration is "until
+// the backend answers".
+//
+// So this test fails if ANY surface:
+//   - asserts a divergence count below four (in any of the usual phrasings), or
+//   - calls the poll-stall class "bounded" on the same line it names it, or
+//   - drops one of the four canonical class names, or
+//   - stops saying, somewhere, that something here is unbounded.
+func TestGF5Fix4SignalTimingTaxonomyIsCompleteEverywhere(t *testing.T) {
+	for _, surface := range []struct {
+		name string
+		path []string
+		// enumerates surfaces carry the whole taxonomy and must name every class.
+		// The rest must merely never contradict it.
+		enumerates bool
+	}{
+		{name: "pkg/driver/backend_health.go", path: []string{"pkg", "driver", "backend_health.go"}, enumerates: true},
+		{name: "charts/scale-csi/templates/prometheusrule.yaml", path: []string{"charts", "scale-csi", "templates", "prometheusrule.yaml"}, enumerates: true},
+		{name: "charts/scale-csi/values.yaml", path: []string{"charts", "scale-csi", "values.yaml"}, enumerates: true},
+		{name: "charts/scale-csi/values.schema.json", path: []string{"charts", "scale-csi", "values.schema.json"}, enumerates: true},
+		{name: "docs/production.md", path: []string{"docs", "production.md"}, enumerates: true},
+		{name: "docs/deployment.md", path: []string{"docs", "deployment.md"}, enumerates: true},
+		{name: "pkg/driver/metrics.go", path: []string{"pkg", "driver", "metrics.go"}},
+		{name: "charts/scale-csi/templates/grafana-dashboard.yaml", path: []string{"charts", "scale-csi", "templates", "grafana-dashboard.yaml"}},
+	} {
+		t.Run(surface.name, func(t *testing.T) {
+			body := normalizeTimingProse(repoFile(t, surface.path...))
+
+			if m := findTimingCountClaim(forbiddenWindowCountRe, body); m != "" {
+				t.Errorf("%s re-asserts an incomplete divergence count (%q). The taxonomy has FOUR classes — %s —"+
+					" and a count stated on one surface is a promise on all of them.",
+					surface.name, m, strings.Join(signalTimingClasses, ", "))
+			}
+			if m := findTimingCountClaim(exactlyCountRe, body); m != "" {
+				t.Errorf("%s re-asserts an incomplete divergence count (%q); the taxonomy has FOUR classes", surface.name, m)
+			}
+
+			// The poll stall lasts "until the backend answers" — there is no bound
+			// on that. Naming it and calling it bounded in the same breath is the
+			// exact round-3 defect.
+			for i, line := range strings.Split(body, "\n") {
+				if pollStallRe.MatchString(line) && boundedWordRe.MatchString(line) {
+					t.Errorf("%s:%d describes the poll-stall class as \"bounded\": %q. It lasts until the backend answers;"+
+						" say so plainly instead.", surface.name, i+1, strings.TrimSpace(line))
+				}
+			}
+
+			if !surface.enumerates {
+				return
+			}
+			for _, class := range signalTimingClasses {
+				if !strings.Contains(body, class) {
+					t.Errorf("%s enumerates the divergence classes but omits %q; every enumeration must be complete and identical", surface.name, class)
+				}
+			}
+			if !strings.Contains(body, "unbounded") {
+				t.Errorf("%s enumerates the divergence classes without ever saying the poll stall is unbounded", surface.name)
+			}
+		})
+	}
+}
+
+// TestGF5Fix4TriageRuleAccountsForTheAlertHold pins the operator-facing
+// consequence of the fourth window: during the alert hold BOTH diagnostic gauges
+// read 0 while the PVC condition and the alert genuinely disagree, so
+// "both gauges are 0 therefore any difference is real" is not a sound triage
+// rule and must not come back.
+func TestGF5Fix4TriageRuleAccountsForTheAlertHold(t *testing.T) {
+	production := repoFile(t, "docs", "production.md")
+	collapsed := strings.Join(strings.Fields(production), " ")
+
+	if strings.Contains(collapsed, "signals are describing the same confirmed state and any difference is real") {
+		t.Error("docs/production.md still tells operators that both gauges reading 0 proves a difference is real;" +
+			" during the alert hold both gauges read 0 while the condition and the alert legitimately differ")
+	}
+	for _, required := range []string{
+		// The window itself, and the ONLY signal that can distinguish it.
+		`alertstate="pending"`,
+		"neither gauge",
+		"check the alert's own state",
+	} {
+		if !strings.Contains(collapsed, strings.Join(strings.Fields(required), " ")) {
+			t.Errorf("docs/production.md triage guidance is missing %q", required)
+		}
 	}
 }

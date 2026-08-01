@@ -75,23 +75,35 @@ capacity:
 #   * hysteresis — a health transition must be confirmed by TWO consecutive
 #     samples before it flips every managed PVC's condition;
 #   * staleness TTL — after three missed intervals the cached snapshot stops
-#     driving conditions at all (they fall back to the pre-GF5 dataset-only
-#     semantics) and scale_csi_pool_health_stale goes to 1, so a stale DEGRADED
-#     cannot keep alerting after a recovery and a stale ONLINE cannot mask one.
+#     driving CONDITIONS at all (they fall back to the pre-GF5 dataset-only
+#     semantics) and scale_csi_pool_health_stale goes to 1. This bounds how long
+#     a stale verdict can drive PVC conditions; it does NOT silence alerting.
+#     The raw gauges stay FROZEN at their last sample, so a frozen DEGRADED keeps
+#     ScaleCSIPoolDegraded firing until a successful sample changes it — that
+#     alert is deliberately not gated on scale_csi_pool_health_stale.
 #
-# BECAUSE the condition is damped and the gauges are not, the alerts (raw) and
-# the PVC conditions (debounced) DO differ transiently — they share one severity
-# split, not one timeline:
-#   * a confirmed transition reaches conditions up to one successful poll
-#     interval after the gauges (bounded: the 2m ceiling keeps 2 x interval
-#     inside the 5m ScaleCSIPoolDegraded hold);
-#   * on recovery the raw degraded gauge clears one sample BEFORE the condition,
-#     by design;
-#   * if samples stop arriving the condition holds its last value while
-#     scale_csi_pool_health_flip_pending and/or scale_csi_pool_health_stale go to
-#     1 (alerts ScaleCSIPoolConditionFlipPending / ScaleCSIPoolHealthStale).
-# Read those two gauges before treating a PVC condition as wrong. Full contract:
-# docs/production.md, "Backend health".
+# BECAUSE the condition is damped, the gauges are not, and the alerts add their
+# own `for` hold on top of the gauges, the three views DO differ transiently —
+# they share one severity split, not one timeline. There are FOUR classes of
+# divergence, three bounded and one unbounded (canonical list:
+# backendHealthFlipSamples in pkg/driver/backend_health.go):
+#   * confirmation lag — BOUNDED: a confirmed transition reaches conditions up to
+#     one successful poll interval after the gauges; the 2m ceiling keeps
+#     2 x interval inside the 5m ScaleCSIPoolDegraded hold. flip_pending = 1;
+#   * alert hold — BOUNDED by the rule's own 5m `for`: once the condition
+#     confirms, PVCs read Abnormal while ScaleCSIPoolDegraded is still PENDING.
+#     The ceiling CREATES this ordering rather than removing it, and BOTH
+#     diagnostic gauges read 0 here — use the alert's pending state, not them;
+#   * recovery — BOUNDED, one sample: the raw degraded gauge clears one sample
+#     BEFORE the condition, by design. flip_pending = 1;
+#   * poll stall — UNBOUNDED: it lasts until the backend answers. The condition
+#     holds its last value while scale_csi_pool_health_flip_pending and/or
+#     scale_csi_pool_health_stale go to 1 (alerts
+#     ScaleCSIPoolConditionFlipPending / ScaleCSIPoolHealthStale). Past the TTL
+#     conditions fall back to dataset-only while flip_pending may still read 1.
+# Read those two gauges before treating a PVC condition as wrong, but remember
+# they do not cover the alert-hold class. Full contract: docs/production.md,
+# "Backend health".
 #
 # Default OFF so an upgrade changes neither the rendered manifest nor the
 # VolumeCondition semantics of existing volumes.
@@ -99,7 +111,9 @@ backendHealth:
   enabled: false
   # Poll cadence, clamped to 30s-2m. The 2m CEILING is not arbitrary: the
   # two-sample hysteresis makes a CONFIRMED condition flip take up to
-  # 2 x interval, which has to stay inside the 5m ScaleCSIPoolDegraded hold. An
+  # 2 x interval, which has to stay inside the 5m ScaleCSIPoolDegraded hold —
+  # WHILE SUCCESSFUL SAMPLES KEEP ARRIVING; it is a cadence bound, not a
+  # wall-clock guarantee, and it cannot cover a sample that never arrives. An
   # out-of-range value is clamped (one warning at controller startup), never
   # rejected. The staleness TTL is three times the EFFECTIVE (clamped) value: 3m
   # at this default, never more than 6m.

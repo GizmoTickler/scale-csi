@@ -33,9 +33,18 @@ const minBackendHealthInterval = 30 * time.Second
 // paged by that alert finds the PVC conditions already agreeing WHEN SAMPLES
 // KEEP ARRIVING.
 //
-// This is a bound, NOT a guarantee that the two signals always agree — see
-// backendHealthFlipSamples for the two windows in which they deliberately or
-// unavoidably differ.
+// This is a bound, NOT a guarantee that the two signals always agree, and it
+// does not reduce the number of ways they can differ — it CREATES one of them:
+// ordering the confirmed condition ahead of the 5m hold means the PVC already
+// reads Abnormal while ScaleCSIPoolDegraded is still PENDING (the "alert hold"
+// class).
+//
+// backendHealthFlipSamples carries the SINGLE canonical enumeration: FOUR
+// classes of divergence — confirmation lag, alert hold and recovery, each with
+// an upper bound, plus poll stall, which is UNBOUNDED. Every other copy of that
+// list (prometheusrule.yaml, values.yaml, values.schema.json,
+// docs/production.md, docs/deployment.md) names the same four classes. A count
+// asserted in one place is a promise in all of them.
 //
 // A larger configured value is clamped with a loud warning rather than rejected:
 // failing the controller over an observability cadence would be a worse outcome
@@ -113,28 +122,41 @@ const backendHealthStaleIntervals = 3
 // first interval after startup.
 //
 // THE HONEST CONTRACT (do not restate this as "the alert and the PVC condition
-// can never disagree" — that claim is false). The raw gauges and the debounced
-// condition share one SEVERITY SPLIT — the same states are abnormal in both —
-// but they are not the same signal in TIME. They differ in exactly three
-// bounded, intended ways:
+// can never disagree" — that claim is false). THREE signals are involved, not
+// two: the RAW gauges, the DEBOUNCED per-PVC condition, and the ALERT, which is
+// the raw gauge plus its own `for` hold. They share one SEVERITY SPLIT — the
+// same states are abnormal in all three — but they are not the same signal in
+// TIME. This is the CANONICAL list, and it is complete: FOUR classes of
+// divergence, three bounded and one unbounded. Do not restate it with a smaller
+// count anywhere.
 //
-//  1. Confirmation lag. An established-state transition is withheld until the
-//     second consecutive sample, so the condition trails the gauges by up to one
-//     successful poll interval. maxBackendHealthInterval keeps that under
-//     ScaleCSIPoolDegraded's 5m hold, so a degradation that keeps being observed
-//     reaches conditions before the alert fires.
-//  2. Recovery window. The raw degraded series drops to 0 on the FIRST healthy
-//     sample while the condition stays Abnormal until the second: a deliberate
-//     one-sample window where the alert has cleared and PVCs still read
-//     abnormal. Nothing about the interval can remove this; it is the point of
-//     the damper.
-//  3. Poll stall. If samples stop arriving the condition HOLDS its last value
-//     and the gauges FREEZE at theirs, so a single unconfirmed degraded sample
-//     can keep the raw alert expression true while the condition still reads
-//     normal. This is observable, not silent: scale_csi_pool_health_flip_pending
-//     is 1 for the whole window, and the first failed sample that finds an
-//     unconfirmed flip (or an expired TTL) raises scale_csi_pool_health_stale.
-//     Past the TTL the condition stops being served at all.
+//  1. Confirmation lag (BOUNDED: one successful poll interval, ≤ 2m). An
+//     established-state transition is withheld until the second consecutive
+//     sample, so the condition trails the gauges. maxBackendHealthInterval keeps
+//     2 × interval under ScaleCSIPoolDegraded's 5m hold, so a degradation that
+//     keeps being observed reaches conditions before the alert fires. Observable
+//     via scale_csi_pool_health_flip_pending = 1.
+//  2. Alert hold (BOUNDED: the remainder of the rule's own `for: 5m`). Once the
+//     second sample confirms, PVCs read Abnormal while ScaleCSIPoolDegraded is
+//     still PENDING and therefore NOT firing. The ceiling in
+//     maxBackendHealthInterval deliberately produces this ordering; it does not
+//     remove the window. NOT observable via the two diagnostic gauges — both
+//     read 0 here. Distinguish it with the alert's own pending state.
+//  3. Recovery (BOUNDED: one sample, deliberately). The raw degraded series
+//     drops to 0 on the FIRST healthy sample while the condition stays Abnormal
+//     until the second: the alert has cleared and PVCs still read abnormal.
+//     Nothing about the interval can remove this; it is the point of the damper.
+//     Observable via scale_csi_pool_health_flip_pending = 1.
+//  4. Poll stall (UNBOUNDED — it lasts until the backend answers; there is no
+//     bound on that). If samples stop arriving the condition HOLDS its last
+//     value and the gauges FREEZE at theirs, so a single unconfirmed degraded
+//     sample can keep the raw alert expression true while the condition still
+//     reads normal. It is observable, not silent: the first failed sample that
+//     finds an unconfirmed flip (or an expired TTL) raises
+//     scale_csi_pool_health_stale. Past the TTL the condition stops being served
+//     and falls back to dataset-only — at which point flip_pending may still
+//     read 1 even though the served condition no longer carries the held
+//     verdict; it is cleared by the next successful sample.
 const backendHealthFlipSamples = 2
 
 // startBackendHealth launches the controller-only backend-health poll loop when
@@ -161,7 +183,7 @@ func (d *Driver) startBackendHealth() {
 		klog.Warningf("backendHealth.interval %v is below the %v floor; using %v", configured, minBackendHealthInterval, interval)
 	case configured > maxBackendHealthInterval:
 		klog.Warningf("backendHealth.interval %v exceeds the %v ceiling; using %v so a hysteresis-CONFIRMED VolumeCondition "+
-			"flip (at most 2 x interval) still lands inside the ScaleCSIPoolDegraded alert's 5m hold",
+			"flip (at most 2 x interval) still lands inside the ScaleCSIPoolDegraded alert's 5m hold while samples keep arriving",
 			configured, maxBackendHealthInterval, interval)
 	}
 	pool := d.parentPoolName()
@@ -231,9 +253,9 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 		// updating even while the backend is unreachable.
 		//
 		// The verdict answers ONE question: is the condition the driver is
-		// currently serving backed by a fresh sample? Two ways it is not, and
-		// both must be visible or the poll-stall window in
-		// backendHealthFlipSamples(3) would be silent:
+		// currently serving backed by a fresh sample? It is not in either of the
+		// cases below, and both must be visible or the poll-stall class in
+		// backendHealthFlipSamples(4) would be silent:
 		//   - the snapshot aged past its TTL, so conditions have fallen back to
 		//     dataset-only; or
 		//   - a flip is pending and its CONFIRMING sample is exactly the one that
@@ -281,9 +303,12 @@ func (d *Driver) sampleBackendHealth(ctx context.Context, pool string) {
 // publishBackendHealth applies the fan-out hysteresis and updates the cache that
 // drives every managed volume's VolumeCondition.
 //
-// scale_csi_pool_health_flip_pending tracks the held window exactly, so the
-// deliberate raw-vs-condition disagreement documented on backendHealthFlipSamples
-// is always readable from Prometheus rather than inferred from logs.
+// scale_csi_pool_health_flip_pending tracks the HELD-FLIP window exactly: 1 from
+// the unconfirmed sample until a successful sample resolves it. That is not the
+// same thing as "the raw gauges and the condition disagree" — it reads 0 during
+// the alert-hold class, and past the staleness TTL it can still read 1 after the
+// condition has fallen back to dataset-only. See backendHealthFlipSamples for
+// the canonical four classes.
 func (d *Driver) publishBackendHealth(snapshot *truenas.PoolHealthSnapshot) {
 	previous := d.backendHealth.Load()
 	if previous == nil || previous.Degraded() == snapshot.Degraded() {

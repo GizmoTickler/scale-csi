@@ -212,18 +212,23 @@ spec:
           # offline spare or a removed cache device does not put the data path at
           # risk. This is the SAME severity split the per-PVC VolumeCondition
           # applies: the two agree on WHICH states are abnormal. They are not the
-          # same signal in TIME — this alert reads the RAW gauge, while the
-          # condition is debounced by two-sample hysteresis — so do not claim they
-          # always agree. See docs/production.md#backend-health for the three
-          # bounded windows (confirmation lag, recovery, poll stall) and the
-          # scale_csi_pool_health_flip_pending / _stale gauges that expose them.
+          # same signal in TIME — this alert reads the RAW gauge, the condition is
+          # debounced by two-sample hysteresis, and THIS RULE ADDS ITS OWN 5m
+          # `for` hold on top — so do not claim they always agree. There are FOUR
+          # classes of divergence: confirmation lag (bounded, <= 2m), alert hold
+          # (bounded by the 5m `for` below — after the condition confirms, PVCs
+          # read Abnormal while this alert is still PENDING, and BOTH diagnostic
+          # gauges read 0), recovery (bounded, one sample), and
+          # poll stall, which is UNBOUNDED: it lasts until the backend answers.
+          # See docs/production.md#backend-health; the canonical list lives on
+          # backendHealthFlipSamples in pkg/driver/backend_health.go.
           expr: max(scale_csi_pool_status{status=~"DEGRADED|FAULTED|UNAVAIL"}) by (pool) == 1
           for: 5m
           labels:
             severity: critical
           annotations:
             summary: Scale CSI backend pool is degraded
-            description: The ZFS pool backing every Scale CSI volume reports a degraded, faulted or unavailable state. Managed PVCs on this pool report an abnormal VolumeCondition once the two-sample hysteresis confirms the transition (at most 2 x backendHealth.interval, capped at 2m). Check scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before concluding the condition is wrong - while either is 1 the condition deliberately still carries the previous verdict.
+            description: The ZFS pool backing every Scale CSI volume reports a degraded, faulted or unavailable state. Managed PVCs on this pool report an abnormal VolumeCondition once the two-sample hysteresis confirms the transition (at most 2 x the effective clamped backendHealth.interval, so at most 4m, while successful samples keep arriving). Check scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before concluding the condition is wrong - while flip_pending is 1 and the snapshot is still inside its staleness TTL the condition deliberately carries the previous verdict; past the TTL conditions fall back to dataset-only even though flip_pending may still read 1.
         - alert: ScaleCSIPoolScanErrors
           expr: max(scale_csi_pool_scan_errors) by (pool) > 0
           for: 15m
@@ -252,20 +257,23 @@ spec:
             severity: warning
           annotations:
             summary: Scale CSI backend health data is stale
-            description: The controller has not obtained a fresh pool.query sample. The VolumeCondition being served is not backed by a current sample - either the snapshot aged past its TTL (3 x backendHealth.interval) and conditions fell back to dataset-only, or a held health transition never received its confirming sample. The other scale_csi_pool_* gauges are frozen at their last values.
+            description: The controller has not obtained a fresh pool.query sample. The VolumeCondition being served is not backed by a current sample - either the snapshot aged past its TTL (3 x the EFFECTIVE clamped backendHealth.interval, so 3m at the default and never more than 6m) and conditions fell back to dataset-only, or a held health transition never received its confirming sample. The other scale_csi_pool_* gauges are frozen at their last values, so a frozen DEGRADED keeps ScaleCSIPoolDegraded firing until a successful sample changes it - that alert is deliberately NOT gated on this one. This is the poll-stall class and it is UNBOUNDED - it lasts until the backend answers.
         - alert: ScaleCSIPoolConditionFlipPending
           # The debounce is stuck. Normally a held transition confirms or clears on
           # the very next sample, so this is 1 for at most one interval (<= 2m).
-          # Staying pending means the confirming sample is not arriving, which is
-          # exactly the case where the raw gauges and the per-PVC VolumeCondition
-          # disagree for longer than the ScaleCSIPoolDegraded hold.
+          # Staying pending means the confirming sample is not arriving: the
+          # poll-stall class, which is UNBOUNDED (it lasts until the backend
+          # answers). Note this gauge is NOT a complete raw-vs-condition
+          # disagreement detector - it reads 0 during the alert-hold class, and
+          # past the staleness TTL it can still read 1 after conditions have
+          # fallen back to dataset-only.
           expr: max(scale_csi_pool_health_flip_pending) by (pool) == 1
           for: 10m
           labels:
             severity: warning
           annotations:
             summary: Scale CSI pool health transition is stuck awaiting confirmation
-            description: A pool-health transition has been held for confirmation far longer than one poll interval, so every managed PVC still reports the PREVIOUS VolumeCondition while the raw scale_csi_pool_* gauges show the new state. Check controller logs and TrueNAS reachability - the confirming pool.query sample is not arriving.
+            description: A pool-health transition has been held for confirmation far longer than one poll interval, so while the held snapshot is still inside its staleness TTL every managed PVC reports the PREVIOUS VolumeCondition while the raw scale_csi_pool_* gauges show the new state. Past that TTL conditions fall back to dataset-only and this gauge can still read 1 until the next successful sample clears it. Check controller logs and TrueNAS reachability - the confirming pool.query sample is not arriving.
         {{- end }}
         {{- end }}
 {{- end }}
