@@ -186,45 +186,110 @@ geometry, and the driver will not pick one for you.
 
 A restore into a class that sets **no** geometry inherits the **source's**
 geometry, and that geometry is recorded on the destination. It does not revert to
-the controller default. This costs one source `pool.dataset.query` (skipped on
-the PVC-to-PVC path, which already read the source) plus one
-`iscsi.extent.query`, on block clones only. That charge is deliberate and it is
-paid on every block clone rather than only when a class opts in: a class that
-names no geometry still produces an extent, and gating the lookup on "did the
-class ask" is exactly what let the controller-wide default — a helm value, not a
-StorageClass parameter — silently supply the geometry for a no-opts restore. NFS
-clones and every non-clone path pay nothing.
+the controller default. A class that names no geometry still produces an extent,
+and gating the lookup on "did the class ask" is exactly what let the
+controller-wide default — a helm value, not a StorageClass parameter — silently
+supply the geometry for a no-opts restore. NFS clones and every non-clone path
+pay nothing.
+
+A **PVC-to-PVC clone** asks what the source is addressed through *now*, because
+its temporary snapshot is taken from the source's current state: one source
+`pool.dataset.query` (skipped here — the path already read the source) plus one
+`iscsi.extent.query`.
+
+### Snapshot geometry provenance
+
+A **snapshot restore** asks a different question: what are the bytes *inside this
+snapshot* addressed through. The source's current extent cannot answer it — a
+source whose extent was re-created at a different geometry after the snapshot was
+taken would hand the restore a layout the snapshot's data was never written
+against. Provenance is therefore tied to the snapshot itself:
+
+- `CreateSnapshot` records the source's geometry **on the snapshot** it takes.
+  ZFS captures a dataset's user properties at snapshot time, so this is a durable
+  point-in-time record. It costs nothing for a volume already recorded, and one
+  `iscsi.extent.query` for one that is not.
+- A restore reads that captured record. When it is present and complete, the
+  restore issues **no source read at all**.
+- A snapshot that captured **no** geometry, whose source shows any history of
+  having been block-addressed, **fails `FailedPrecondition`**. The driver will
+  not lay a guessed geometry over a snapshot's data. A snapshot of a zvol nothing
+  has ever exported is unaffected — there is no layout to preserve.
+
+> **Upgrade note.** Snapshots taken before this version carry no captured
+> geometry, so restoring one of a block volume fails closed until its real
+> geometry is recorded. Confirm the value the snapshot's data was written
+> against, then record it on the **snapshot**:
+>
+> ```sh
+> zfs set truenas-csi:block_blocksize=4096 \
+>         truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...@snap-...
+> ```
+>
+> Snapshots taken from this version on carry it automatically. NFS snapshots are
+> unaffected.
 
 ### Geometry is recorded, never guessed
 
-`iscsi.extentBlocksize` is an install-wide default for **new** volumes only. It
-can never reach a volume that already holds data, in either direction:
+`iscsi.extentBlocksize` and `iscsi.extentDisablePhysicalBlocksize` are
+install-wide defaults for **new** volumes only. Neither can reach a volume that
+already holds data, in either direction:
 
 - **Every extent the driver creates or observes is recorded on its dataset**
   (`truenas-csi:block_blocksize`, `truenas-csi:block_pblocksize`), including for
   a StorageClass that opts into nothing — what a volume *has* is a different fact
   from what its class *asked for*. Volumes provisioned before this shipped are
   recorded the first time the driver sees their extent alive (a publish, a
-  startup reconcile, an idempotent replay). The write is folded into a dataset
-  update those paths already issue, so it costs no extra round trip.
+  startup reconcile, an idempotent replay). On a fresh create the record and the
+  extent-ID witness also ride in the same fatal property update as the ownership
+  stamp, so they are durable-or-rolled-back with the rest of provisioning. Every
+  write is folded into a dataset update those paths already issue, so none of it
+  costs an extra round trip.
+- **The record must be COMPLETE.** Logical and physical block size are resolved
+  together, from the same evidence, by one function. A volume that records only
+  one of the two is refused rather than having the other filled in from today's
+  install-wide default.
+- **A StorageClass parameter is intent, not evidence.** An explicit
+  `iscsi/blocksize` may only *agree* with what the storage is already known to
+  be. It supplies a value only where the storage provably holds no
+  block-addressed data — a zvol this call just created, or one carrying no
+  witness of ever having been exported.
 - **Changing `iscsi.extentBlocksize` never re-geometries an existing volume.** A
   rebuild whose extent is absent replays the volume's own recorded geometry. It
   never falls back to the current default, because the default may have moved
   since the data was written.
 - **If the geometry cannot be established, the driver refuses.** A volume whose
-  extent is gone *and* which carries no geometry record fails
+  extent is gone *and* which carries no complete geometry record fails
   `FailedPrecondition` rather than being re-created at a guess. Recover by
-  restoring the original extent, or by recording the real value:
+  restoring the original extent, or by recording the real values:
 
   ```sh
-  zfs set truenas-csi:block_blocksize=4096 tank/k8s/volumes/pvc-...
+  zfs set truenas-csi:block_blocksize=4096 \
+          truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...
   ```
 
-  This can only happen to a volume that lost its extent before this version was
-  ever able to look at it.
+- **An extent the driver did not create is validated before it is adopted.** If a
+  create-error recovery or an "already exists" fallback returns an extent whose
+  geometry differs from the one the create was authorized at, the driver refuses
+  and names both values instead of adopting it and recording its geometry as this
+  volume's truth.
 - **The live extent is authoritative for what the data is; the record states the
   intent it was provisioned with.** Where the two disagree the driver names both
   and refuses, rather than silently preferring either.
+
+#### What the record claims, exactly
+
+Recording an extent's geometry says **what that extent reports now**. It is proof
+of how the data is addressed today, and it is what stops any later rebuild — or
+any later change to the install-wide defaults — from reaching the volume.
+
+It is **not** proof of historical truth. A volume that was already corrupted
+before this mechanism existed — an unstamped 512-byte extent laid over
+4096-layout bytes by an old defaulted rebuild — is observationally
+indistinguishable from a correct 512-byte volume. Recording its geometry freezes
+the observable state; it cannot repair the history. Only an operator who knows
+the original geometry can correct such a volume, by recording the real values and
+re-creating the extent.
 
 ## NFS
 

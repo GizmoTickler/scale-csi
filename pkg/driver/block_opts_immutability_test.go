@@ -511,7 +511,7 @@ func provisionUnstamped4096Source(
 
 	// The RAW backend call with no properties: a snapshot from before geometry
 	// capture existed. It captures nothing, and the dataset is unstamped, so the
-	// mock's ZFS-capture modelling gives it nothing either.
+	// mock's ZFS-capture modeling gives it nothing either.
 	_, err := client.SnapshotCreate(ctx, "pool/parent/"+volumeName, snapshotName, map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           snapshotName,

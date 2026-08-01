@@ -255,7 +255,7 @@ func TestSnapshotOfABlockVolumeCapturesItsGeometry(t *testing.T) {
 // TestGuardRequestAgainstEvidence unit-tests the choke point's own
 // request-vs-evidence check.
 //
-// HONESTY NOTE: this one is DEFENCE IN DEPTH, and it is tested directly because
+// HONESTY NOTE: this one is DEFENSE IN DEPTH, and it is tested directly because
 // it cannot be revert-proved end to end. Deleting the call from
 // resolveExtentGeometry leaves the whole suite green, because every reachable
 // conflict today is also caught earlier — by guardStoredBlockGeometry on a

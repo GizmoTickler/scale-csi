@@ -985,7 +985,7 @@ var blockDataHistoryWitnesses = []string{
 // dataset's bytes may already be addressed through a logical block size, and
 // names the witness. A dataset the driver could not read is treated as
 // data-bearing: absence of evidence is not evidence of absence.
-func datasetMayHoldBlockData(ds *truenas.Dataset) (bool, string) {
+func datasetMayHoldBlockData(ds *truenas.Dataset) (mayHoldData bool, witness string) {
 	if ds == nil {
 		return true, "the dataset could not be read"
 	}
@@ -1172,11 +1172,12 @@ func (d *Driver) resolveExtentGeometry(
 	} else if !evidence.complete() {
 		// (5) It may hold data and the record is absent or half-present.
 		reason := fmt.Sprintf("its extent is absent, %s records that it has been block-addressed", witness)
-		if evidence.blocksize != nil {
+		switch {
+		case evidence.blocksize != nil:
 			reason += fmt.Sprintf(", and it records %s=%d but no %s", PropBlockISCSIBlocksize, *evidence.blocksize, PropBlockISCSIPblocksize)
-		} else if evidence.pblocksize != nil {
+		case evidence.pblocksize != nil:
 			reason += fmt.Sprintf(", and it records %s=%t but no %s", PropBlockISCSIPblocksize, *evidence.pblocksize, PropBlockISCSIBlocksize)
-		} else {
+		default:
 			reason += ", and it records neither geometry property"
 		}
 		return extentGeometry{}, d.unknownGeometryError(datasetName, reason)
