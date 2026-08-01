@@ -20,11 +20,11 @@ type iscsiShareBackend struct{ d *Driver }
 func (b iscsiShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, res *fenceResolution) error {
 	// The create path validates every cached ID against its target/extent
 	// relationship before taking the idempotent fast path.
-	return b.d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, false, false)
+	return b.d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, false, false, nil)
 }
 
 func (b iscsiShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
-	return b.d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady)
+	return b.d.createISCSIShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, finalProperties)
 }
 
 func (b iscsiShareBackend) DeleteShare(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
@@ -70,10 +70,16 @@ func (d *Driver) iscsiVolumeContext(ctx context.Context, ds *truenas.Dataset, da
 // This function is idempotent and includes retry logic for robustness during
 // high-load scenarios (e.g., volsync backup bursts).
 func (d *Driver) createISCSIShare(ctx context.Context, datasetName, volumeName string) error {
-	return d.createISCSIShareForDataset(ctx, nil, datasetName, volumeName, false, false)
+	return d.createISCSIShareForDataset(ctx, nil, datasetName, volumeName, false, false, nil)
 }
 
-func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool) error {
+// finalProperties, when non-nil, is the caller's FATAL managed-property update
+// (CreateVolume's). The share builder folds the extent-ID witness and the
+// extent's ACTUAL geometry into it so both become durable-or-rolled-back with
+// the rest of provisioning instead of depending on the warning-only resource-ID
+// write below. That closes the "the witness can simply be lost" hole without a
+// single extra round trip: the map is written either way.
+func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
 	start := time.Now()
 	klog.Infof("createISCSIShare: starting for dataset %s", datasetName)
 	var err error
@@ -302,17 +308,17 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 		comment := fmt.Sprintf("truenas-csi: %s", datasetName)
 		var lastErr error
 
-		// THE geometry decision, made exactly once and never from the controller
-		// default when the default could be wrong. There is no live extent here to
-		// read (that is why we are creating one), so the volume's own record is the
-		// only honest answer for a dataset that already holds data; the install-wide
-		// helm value is allowed only for a zvol this call just created or a dataset
-		// with no history of ever having been a CSI block volume. See "the geometry
-		// invariant" in block_opts.go.
-		blocksize, geometryErr := d.resolveExtentCreateBlocksize(opts, ds, datasetName, freshlyCreated)
+		// THE GEOMETRY CHOKE POINT. One record, logical AND physical resolved
+		// together by one function from evidence about the bytes that already
+		// exist — never from a StorageClass parameter or a helm default over
+		// storage that may hold data. There is no live extent here to read (that is
+		// why we are creating one). See "the geometry invariant" in block_opts.go.
+		geometry, geometryErr := d.resolveExtentGeometry(ctx, requestOpts, storedOpts, ds, datasetName, freshlyCreated)
 		if geometryErr != nil {
 			return geometryErr
 		}
+		klog.V(4).Infof("Resolved extent geometry for %s: blocksize=%d pblocksize=%t (%s)",
+			datasetName, geometry.blocksize, geometry.pblocksize, geometry.provenance)
 
 		for attempt := 0; attempt < defaultShareRetryAttempts; attempt++ {
 			if attempt > 0 {
@@ -331,12 +337,20 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				iscsiName,
 				diskPath,
 				comment,
-				blocksize,
-				opts.resolvedISCSIPblocksize(d.config.ISCSI.ExtentDisablePhysicalBlocksize),
+				geometry.blocksize,
+				geometry.pblocksize,
 				d.config.ISCSI.ExtentRpm,
 				opts.iscsiExtentCreateOpts(),
 			)
 			if createErr == nil {
+				// ISCSIExtentCreate itself falls back to find-by-name on an ambiguous
+				// "already exists"/"invalid params", so even a nil error can hand back
+				// an object this call did not create. Validate before adopting it: an
+				// unvalidated adoption is what let a stale or concurrently-created
+				// extent at a different geometry become this volume's back-stamped truth.
+				if mismatch := validateExtentAgainstGeometry(extent, geometry, datasetName); mismatch != nil {
+					return mismatch
+				}
 				extentID = extent.ID
 				klog.Infof("Created iSCSI extent %s (ID %d) on attempt %d", iscsiName, extentID, attempt+1)
 				break
@@ -349,6 +363,12 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			if !freshlyCreated || truenas.IsAlreadyExistsError(createErr) {
 				e, findErr := d.truenasClient.ISCSIExtentFindByDisk(ctx, diskPath)
 				if findErr == nil && e != nil {
+					// Same rule for the idempotency arm. The object is NOT deleted on a
+					// mismatch: the driver did not create it and must not destroy an
+					// extent another controller may be mid-flight on. Refuse and say so.
+					if mismatch := validateExtentAgainstGeometry(e, geometry, datasetName); mismatch != nil {
+						return mismatch
+					}
 					extent = e
 					extentID = e.ID
 					klog.Infof("Extent found after error (ID %d), continuing", extentID)
@@ -424,6 +444,17 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	// later change to the helm value can reach its data.
 	for key, value := range observedGeometryProps(ds, extent) {
 		resourceProps[key] = value
+	}
+	// ...and, when the caller has a FATAL property update of its own (CreateVolume
+	// does), the SAME keys ride in it. The write below is warning-only, which is
+	// exactly how a volume could end up with data, no extent-ID witness and no
+	// geometry stamp — the state in which a later rebuild has nothing to resolve
+	// from. Folding into a map the caller writes anyway costs zero round trips and
+	// makes the witness and the geometry durable-or-rolled-back with provisioning.
+	if finalProperties != nil {
+		for key, value := range resourceProps {
+			finalProperties[key] = value
+		}
 	}
 	// NOTE: the CHAP auth linkage (PropISCSIAuthTag + PropISCSIAuthMode) is NOT
 	// written here. It is a security control that a fence pass depends on, so it
