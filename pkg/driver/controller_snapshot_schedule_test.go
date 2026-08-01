@@ -794,7 +794,7 @@ func TestReconcileCountsScheduledSnapshotsFromProductionPartition(t *testing.T) 
 // ---------------------------------------------------------------------------
 // GF2-fix3 regression proofs. Each states, in its own doc comment, whether it
 // FAILS on the round-2 head 9929315 and why — a test that passes both sides is
-// a compatibility guard, not evidence, and is labelled as such.
+// a compatibility guard, not evidence, and is labeled as such.
 // ---------------------------------------------------------------------------
 
 // B1-d — A TIMEZONE RECONFIGURATION THAT LEAVES THE CIVIL FIELDS IDENTICAL.
@@ -1033,4 +1033,53 @@ func TestScheduledTaskIsNotCreatedWhenTheNASZoneIsUnreadable(t *testing.T) {
 	ds, err := client.DatasetGet(ctx, "pool/parent/sched-nozone")
 	require.NoError(t, err)
 	assert.Empty(t, ds.UserProperties[PropSnapshotTaskTimezone].Value)
+}
+
+// B1-d / STANDING CONTENT-SOURCE RULE — a recorded task timezone that was
+// INHERITED proves nothing.
+//
+// Snapshot clones, volume clones and detached (send/receive) copies do not go
+// through createDataset, so they arrive carrying the source's ZFS user
+// properties with a non-local source: the origin snapshot's name for a clone,
+// "received" for a replication target, "inherited" from a parent. Reading the
+// zone record through datasetLocalUserProperty is what stops any of those from
+// laundering a proof, exactly as for the ownership stamp and the corroboration.
+//
+// PASSES on 9929315: the property does not exist there, so this is a rule guard
+// for the NEW property rather than a regression proof. Its value is that it
+// FAILS the moment someone switches this read to the source-tolerant form.
+func TestScheduledSnapshotZoneRejectsInheritedTimezoneRecord(t *testing.T) {
+	client := truenas.NewMockClient()
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	for _, tc := range []struct{ name, source string }{
+		{"snapshot clone", "pool/parent/source@snap"},
+		{"volume clone", "pool/parent/other"},
+		{"replication received", "received"},
+		{"parent inherited", "inherited"},
+		{"unknown", ""},
+		{"flat projection", "-"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ds := &truenas.Dataset{
+				Name: "pool/parent/inherited-zone",
+				UserProperties: map[string]truenas.UserProperty{
+					PropSnapshotTaskTimezone: {Value: "UTC", Source: tc.source},
+				},
+			}
+			assert.Nil(t, d.scheduledSnapshotZone(ctx, ds, ds.Name),
+				"a %s timezone record must never authorize a scheduled snapshot", tc.name)
+		})
+	}
+
+	// Control: the same value, locally sourced and matching the live NAS zone,
+	// does resolve — so the rejection above is about the SOURCE, not the value.
+	local := &truenas.Dataset{
+		Name: "pool/parent/local-zone",
+		UserProperties: map[string]truenas.UserProperty{
+			PropSnapshotTaskTimezone: {Value: "UTC", Source: "local"},
+		},
+	}
+	require.NotNil(t, d.scheduledSnapshotZone(ctx, local, local.Name))
 }
