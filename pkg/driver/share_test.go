@@ -712,11 +712,20 @@ func TestCreateISCSIShareFreshDatasetSkipsLookupsAndBatchesProperties(t *testing
 	assert.Zero(t, mockClient.zvolWaits)
 	assert.Zero(t, mockClient.idempotencyLookups)
 	assert.Equal(t, []bool{false}, mockClient.extentPblocksize)
+	// STILL exactly one property update — that is what this test pins. Its
+	// contents now also carry the geometry the extent was actually created with
+	// (GF-4 round 4, mechanism (1)): the driver records what it created so no
+	// later rebuild has to re-derive it from a mutable install-wide default. The
+	// key is folded into a write that was happening anyway, so the round-trip
+	// count is unchanged. blocksize is absent here only because this fixture's
+	// ISCSIConfig sets no ExtentBlocksize, so the backend reports 0 and an unknown
+	// value is never invented.
 	require.Len(t, mockClient.propertyUpdates, 1)
 	assert.Equal(t, map[string]string{
-		PropISCSITargetID:       "1",
-		PropISCSIExtentID:       "1",
-		PropISCSITargetExtentID: "1",
+		PropISCSITargetID:        "1",
+		PropISCSIExtentID:        "1",
+		PropISCSITargetExtentID:  "1",
+		PropBlockISCSIPblocksize: "false",
 	}, mockClient.propertyUpdates[0])
 }
 

@@ -330,7 +330,7 @@ func TestSnapshotCloneFoldQuotaAndZvolPaths(t *testing.T) {
 			seedSnapshotCloneSource(t, client.MockClient, tc.datasetType, testGiB)
 			source := snapshotCloneRequest("restored", "snap-1", string(tc.protocol), 2*testGiB).GetVolumeContentSource()
 
-			created, err := d.handleVolumeContentSource(
+			created, _, err := d.handleVolumeContentSource(
 				ctx,
 				"pool/parent/restored",
 				"restored",

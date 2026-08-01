@@ -341,11 +341,22 @@ func TestStoredPropertiesEmptyForDefaultPath(t *testing.T) {
 	assert.Nil(t, effectiveBlockOpts(context.Background(), nil))
 }
 
-// TestDefaultPathCreateVolumeStampsNothing drives the real CreateVolume and
-// asserts the provisioned dataset carries no block-tuning property at all, and
-// that the extent used the historical defaults. This is the guard on the
-// "an install that opts into nothing is unaffected" claim.
-func TestDefaultPathCreateVolumeStampsNothing(t *testing.T) {
+// TestDefaultPathCreateVolumeStampsOnlyTheGeometryItGot drives the real
+// CreateVolume on a class that opts into NOTHING and pins both halves of the
+// round-4 contract change.
+//
+// Unchanged: no TUNING is stamped. A stamp of a knob records what a StorageClass
+// asked for, and this one asked for nothing, so none of the eight non-geometry
+// keys appears and the extent keeps every historical default.
+//
+// New: the GEOMETRY the extent was actually created with IS recorded. That is
+// not the same fact — it is what the volume HAS, not what its class wanted — and
+// leaving it unrecorded is the invariant violation that produced all five forms
+// of this corruption. Without it, `iscsi.extentBlocksize` is the only thing that
+// remembers a default-path volume's geometry, it is mutable, install-wide, and
+// invisible to every guard, and the next rebuild of this volume writes whatever
+// it says at that moment over data written against whatever it said today.
+func TestDefaultPathCreateVolumeStampsOnlyTheGeometryItGot(t *testing.T) {
 	client := newAPICallCountingClient()
 	d := newAPICallCountDriver(t, client, "iscsi")
 	ctx := context.Background()
@@ -355,12 +366,19 @@ func TestDefaultPathCreateVolumeStampsNothing(t *testing.T) {
 
 	ds, err := client.DatasetGet(ctx, "pool/parent/default-path")
 	require.NoError(t, err)
+	geometryKeys := map[string]bool{PropBlockISCSIBlocksize: true, PropBlockISCSIPblocksize: true}
 	for key := range ds.UserProperties {
+		if geometryKeys[key] {
+			continue
+		}
 		assert.NotContains(t, key, "truenas-csi:block_",
-			"a StorageClass that opts into nothing must stamp no block property (got %s)", key)
+			"a StorageClass that opts into nothing must stamp no block TUNING property (got %s)", key)
 		assert.NotContains(t, key, "truenas-csi:nvme_",
 			"a StorageClass that opts into nothing must stamp no NVMe property (got %s)", key)
 	}
+	assert.Equal(t, "512", ds.UserProperties[PropBlockISCSIBlocksize].Value,
+		"the geometry a default-path volume actually got must be recorded on the volume, not left to a mutable helm value")
+	assert.Equal(t, "true", ds.UserProperties[PropBlockISCSIPblocksize].Value)
 
 	extent, err := client.ISCSIExtentFindByDisk(ctx, "zvol/pool/parent/default-path")
 	require.NoError(t, err)
@@ -372,6 +390,18 @@ func TestDefaultPathCreateVolumeStampsNothing(t *testing.T) {
 	assert.False(t, *extent.Ro)
 	assert.Empty(t, extent.Serial, "the default path still lets TrueNAS auto-generate the serial")
 	assert.Nil(t, extent.AvailThreshold)
+
+	// And the record is load-bearing: move the install-wide default and rebuild.
+	// Pre-round-4 the rebuilt extent came back at the NEW default over the old
+	// data; now the volume answers for itself.
+	require.NoError(t, client.MockClient.ISCSIExtentDelete(ctx, extent.ID, false, true))
+	d.config.ISCSI.ExtentBlocksize = 4096
+	require.NoError(t, iscsiShareBackend{d}.EnsureShare(ctx, nil, "pool/parent/default-path", "default-path", nil))
+	rebuilt, err := client.ISCSIExtentFindByDisk(ctx, "zvol/pool/parent/default-path")
+	require.NoError(t, err)
+	require.NotNil(t, rebuilt)
+	assert.Equal(t, 512, rebuilt.Blocksize,
+		"a rebuild must replay the volume's own recorded geometry; 4096 here is the changed helm default written over 512 data")
 }
 
 // TestTunedCreateVolumeStampsResolvedOptions closes the loop: an opted-in
@@ -392,11 +422,15 @@ func TestTunedCreateVolumeStampsResolvedOptions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "4096", ds.UserProperties[PropBlockISCSIBlocksize].Value)
 	assert.Equal(t, stableISCSISerial("tuned-path"), ds.UserProperties[PropBlockISCSISerial].Value)
-	// Only the keys actually set are stamped.
-	_, hasPblocksize := ds.UserProperties[PropBlockISCSIPblocksize]
-	assert.False(t, hasPblocksize, "an unset knob must not be stamped")
+	// Only the TUNING keys actually set are stamped.
 	_, hasReadOnly := ds.UserProperties[PropBlockISCSIReadOnly]
 	assert.False(t, hasReadOnly, "an unset knob must not be stamped")
+	// pblocksize is GEOMETRY, not tuning: the class did not ask for it, but the
+	// extent still got one, so the value it got is recorded (round 4, mechanism
+	// (1)). Recording what a volume HAS is what stops a later helm-value change
+	// from reaching its data.
+	assert.Equal(t, "true", ds.UserProperties[PropBlockISCSIPblocksize].Value,
+		"the geometry the extent was actually created with must be recorded even when the class did not name it")
 
 	// And the stamp is immediately load-bearing: a plain-ctx rebuild after the
 	// extent is destroyed comes back at 4096 with the same serial.

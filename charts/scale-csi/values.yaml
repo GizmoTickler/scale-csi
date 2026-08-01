@@ -310,8 +310,15 @@ iscsi:
   # or creates an allow-all initiator group.
   targetGroups: []
 
+  # Logical block size for NEWLY created extents only. Changing it never
+  # re-geometries an existing volume: the driver records the geometry of every
+  # extent it creates or observes on the volume's own dataset and replays THAT on
+  # every later rebuild, so a changed value here can never be laid over data
+  # written against the old one. See docs/reference/storageclass.md, "Geometry is
+  # recorded, never guessed".
   extentBlocksize: 512
-  # Disable physical block size reporting on created extents.
+  # Disable physical block size reporting on created extents. Same rule: new
+  # extents only, and the value each volume got is recorded per volume.
   extentDisablePhysicalBlocksize: false
   extentRpm: SSD
   # extentAvailThreshold was removed: it was never wired to anything. The schema

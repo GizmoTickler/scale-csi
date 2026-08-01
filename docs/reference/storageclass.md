@@ -159,8 +159,10 @@ from "the backend reported false" and an omitted field can never masquerade as a
 authoritative one.
 
 A rebuild path that carries **no** StorageClass parameters (`ControllerPublish`,
-the startup attachment reconcile, a DR restore) has no opinion at all and is
-never rejected; it simply replays the volume's own stamp.
+the startup attachment reconcile, a DR restore) has no opinion about the eight
+tuning knobs and is never rejected on them; it simply replays the volume's own
+stamp. Geometry is different, and has its own rule — see
+[Geometry is recorded, never guessed](#geometry-is-recorded-never-guessed).
 
 To change any of these, provision a new volume and migrate the data.
 
@@ -174,18 +176,55 @@ single StorageClass but places no such restriction on restoring a
 `VolumeSnapshot` into a different class, so this is reachable in exactly the
 deployment two differently-tuned classes invite.
 
-The source's geometry is read from its stamp when it has one, and from its **live
-iSCSI extent** when it does not — which is the case for every volume provisioned
-before these parameters existed. A pre-existing 4096 volume is therefore just as
-protected as a stamped one: restoring its snapshot into a `blocksize: "512"`
-class is rejected, not accepted with a 512-byte extent laid over 4096-geometry
-data. The live lookup is issued only when the class opts into a geometry the
-stamp cannot answer, so the default provisioning path costs exactly what it did
-before.
+The source's geometry is read from **both** its stamp and its **live iSCSI
+extent**, on every block clone or restore. A pre-existing 4096 volume is
+therefore just as protected as a stamped one: restoring its snapshot into a
+`blocksize: "512"` class is rejected, not accepted with a 512-byte extent laid
+over 4096-geometry data. Where the stamp and the live extent disagree, the clone
+is refused and both values are named — a drifted source has no establishable
+geometry, and the driver will not pick one for you.
 
-A restore into a class that sets **no** geometry inherits the source's geometry
-(the conservative direction) rather than reverting to the controller default, and
-performs no lookup at all.
+A restore into a class that sets **no** geometry inherits the **source's**
+geometry, and that geometry is recorded on the destination. It does not revert to
+the controller default. This costs one source `pool.dataset.query` (skipped on
+the PVC-to-PVC path, which already read the source) plus one
+`iscsi.extent.query`, on block clones only. That charge is deliberate and it is
+paid on every block clone rather than only when a class opts in: a class that
+names no geometry still produces an extent, and gating the lookup on "did the
+class ask" is exactly what let the controller-wide default — a helm value, not a
+StorageClass parameter — silently supply the geometry for a no-opts restore. NFS
+clones and every non-clone path pay nothing.
+
+### Geometry is recorded, never guessed
+
+`iscsi.extentBlocksize` is an install-wide default for **new** volumes only. It
+can never reach a volume that already holds data, in either direction:
+
+- **Every extent the driver creates or observes is recorded on its dataset**
+  (`truenas-csi:block_blocksize`, `truenas-csi:block_pblocksize`), including for
+  a StorageClass that opts into nothing — what a volume *has* is a different fact
+  from what its class *asked for*. Volumes provisioned before this shipped are
+  recorded the first time the driver sees their extent alive (a publish, a
+  startup reconcile, an idempotent replay). The write is folded into a dataset
+  update those paths already issue, so it costs no extra round trip.
+- **Changing `iscsi.extentBlocksize` never re-geometries an existing volume.** A
+  rebuild whose extent is absent replays the volume's own recorded geometry. It
+  never falls back to the current default, because the default may have moved
+  since the data was written.
+- **If the geometry cannot be established, the driver refuses.** A volume whose
+  extent is gone *and* which carries no geometry record fails
+  `FailedPrecondition` rather than being re-created at a guess. Recover by
+  restoring the original extent, or by recording the real value:
+
+  ```sh
+  zfs set truenas-csi:block_blocksize=4096 tank/k8s/volumes/pvc-...
+  ```
+
+  This can only happen to a volume that lost its extent before this version was
+  ever able to look at it.
+- **The live extent is authoritative for what the data is; the record states the
+  intent it was provisioned with.** Where the two disagree the driver names both
+  and refuses, rather than silently preferring either.
 
 ## NFS
 

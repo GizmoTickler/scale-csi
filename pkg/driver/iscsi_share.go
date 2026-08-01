@@ -262,6 +262,16 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			return status.Errorf(codes.Internal, "failed to resolve iSCSI extent: %v", err)
 		}
 		if extent != nil {
+			// Precedence, and the one case the driver refuses to decide: the LIVE
+			// extent says what the data is addressed through, the STAMP says what the
+			// volume was provisioned with, and a disagreement between them is real
+			// drift (an out-of-band edit, or a geometry laundered onto this volume by
+			// an earlier defaulted rebuild). Surfacing it beats silently preferring
+			// either side, which is what let a wrong geometry certify itself to every
+			// downstream guard.
+			if guardErr := guardStampedVsLiveGeometry(storedOpts, extent, datasetName); guardErr != nil {
+				return guardErr
+			}
 			// R-1, existing-extent half: blocksize is immutable once an extent
 			// holds data. Reject a request whose resolved blocksize diverges from
 			// the existing extent rather than silently keeping a geometry that
@@ -292,6 +302,18 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 		comment := fmt.Sprintf("truenas-csi: %s", datasetName)
 		var lastErr error
 
+		// THE geometry decision, made exactly once and never from the controller
+		// default when the default could be wrong. There is no live extent here to
+		// read (that is why we are creating one), so the volume's own record is the
+		// only honest answer for a dataset that already holds data; the install-wide
+		// helm value is allowed only for a zvol this call just created or a dataset
+		// with no history of ever having been a CSI block volume. See "the geometry
+		// invariant" in block_opts.go.
+		blocksize, geometryErr := d.resolveExtentCreateBlocksize(opts, ds, datasetName, freshlyCreated)
+		if geometryErr != nil {
+			return geometryErr
+		}
+
 		for attempt := 0; attempt < defaultShareRetryAttempts; attempt++ {
 			if attempt > 0 {
 				delay := defaultShareRetryDelay * time.Duration(1<<uint(attempt-1))
@@ -309,7 +331,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 				iscsiName,
 				diskPath,
 				comment,
-				opts.resolvedISCSIBlocksize(d.config.ISCSI.ExtentBlocksize),
+				blocksize,
 				opts.resolvedISCSIPblocksize(d.config.ISCSI.ExtentDisablePhysicalBlocksize),
 				d.config.ISCSI.ExtentRpm,
 				opts.iscsiExtentCreateOpts(),
@@ -388,6 +410,20 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 		PropISCSITargetID:       strconv.Itoa(targetID),
 		PropISCSIExtentID:       strconv.Itoa(extentID),
 		PropISCSITargetExtentID: strconv.Itoa(targetExtent.ID),
+	}
+	// Mechanism (1) of the geometry invariant: record the geometry of the extent
+	// we just created, or back-stamp the one we just resolved, onto a dataset that
+	// does not already carry it. Folded into a dataset update that happens anyway,
+	// so it costs ZERO extra round trips and adds nothing to the hot path.
+	//
+	// This is what makes the rest of the invariant safe: it stamps volumes at
+	// create (including the default path — the geometry a volume HAS is not the
+	// same fact as what its StorageClass asked for), and it stamps the entire
+	// pre-GF4 fleet on its first publish / reconcile / replay. Once a volume is
+	// stamped, no later rebuild has to consult the controller default, and no
+	// later change to the helm value can reach its data.
+	for key, value := range observedGeometryProps(ds, extent) {
+		resourceProps[key] = value
 	}
 	// NOTE: the CHAP auth linkage (PropISCSIAuthTag + PropISCSIAuthMode) is NOT
 	// written here. It is a security control that a fence pass depends on, so it

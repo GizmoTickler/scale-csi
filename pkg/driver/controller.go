@@ -465,24 +465,43 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Handle volume content source (clone from snapshot or volume)
 	var contentSource *csi.VolumeContentSource
 	var createdDS *truenas.Dataset
+	// contentSourceGeometry is the SOURCE's resolved block geometry (nil for NFS
+	// and for a fresh, source-less create). Each clone branch already folds it
+	// into its own atomic content-source write; it is also folded into the FATAL
+	// managed-property update below so the record of what the cloned data is
+	// addressed through is durable-or-rolled-back with the rest of provisioning,
+	// exactly like the CHAP linkage. Adding keys to a map that is already written
+	// costs no extra round trip.
+	var contentSourceGeometry map[string]string
 	zvolReady := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
-		clonedDS, srcErr := d.handleVolumeContentSource(
+		clonedDS, sourceGeometry, srcErr := d.handleVolumeContentSource(
 			ctx, datasetName, name, contentSource, capacityBytes, shareType, detached, &detachedCopyJobID,
 		)
 		if srcErr != nil {
 			return nil, srcErr
 		}
+		contentSourceGeometry = sourceGeometry
 		if detached {
 			// Detached snapshot copies do NOT fold the ownership stamp into their
 			// content-source write, so stamp it here before any share object exists.
 			// Clone/replication APIs cannot stamp properties atomically; the initial
 			// absence check plus a successful (not AlreadyExists) copy response is the
 			// creation proof.
-			verifiedClone, ownerErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, map[string]string{
+			//
+			// GF-4 round 4, mechanism (3): the SOURCE's real geometry rides along in
+			// this same write. A detached copy carries the source's byte layout just
+			// like a clone does, so its extent must be created from the source's
+			// geometry rather than the controller default. Adding keys to a map that
+			// is already written costs no extra round trip.
+			detachedStamp := map[string]string{
 				PropDriverInstanceID: d.driverInstanceID(),
-			})
+			}
+			for key, value := range sourceGeometry {
+				detachedStamp[key] = value
+			}
+			verifiedClone, ownerErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, detachedStamp)
 			if ownerErr != nil {
 				d.cleanupFailedClone(ctx, datasetName, "")
 				return nil, status.Errorf(codes.Internal, "failed to stamp and verify cloned volume ownership: %v", ownerErr)
@@ -550,6 +569,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// round trip. nil (adds nothing, byte-identical write) for NFS and for any
 	// StorageClass that opts into no block tuning.
 	for key, value := range blockOptsProps(ctx, shareType) {
+		volumeProperties[key] = value
+	}
+	// GF-4 round 4: and the geometry the CLONED DATA is actually addressed
+	// through, for the same reason (see contentSourceGeometry above). nil for a
+	// fresh create — a zvol this call just made holds nothing, so the controller
+	// default is the honest answer there and the share builder stamps whatever the
+	// extent really came out at.
+	for key, value := range contentSourceGeometry {
 		volumeProperties[key] = value
 	}
 
@@ -2641,6 +2668,17 @@ func cloneReadinessExhaustedStatus(ctx context.Context, datasetName string, err 
 	return status.Errorf(code, "failed waiting for cloned volume %s to become ready: %v", datasetName, err)
 }
 
+// handleVolumeContentSource clones/copies the requested content source into
+// datasetName.
+//
+// It returns, alongside the created dataset, the SOURCE's resolved block
+// geometry rendered as dataset properties (nil for NFS and for a source with no
+// discoverable geometry). Mechanism (3) of the geometry invariant: cloned data
+// is addressed through the geometry it was WRITTEN against, so the destination
+// must record that geometry rather than inherit whatever the controller-wide
+// default happens to be when its extent is created. Each branch folds the
+// properties into the atomic write it already performs; the detached branch
+// hands them back because its ownership stamp is issued by the caller.
 func (d *Driver) handleVolumeContentSource(
 	ctx context.Context,
 	datasetName, volumeName string,
@@ -2649,28 +2687,29 @@ func (d *Driver) handleVolumeContentSource(
 	shareType ShareType,
 	detached bool,
 	detachedCopyJobID *int64,
-) (*truenas.Dataset, error) {
+) (*truenas.Dataset, map[string]string, error) {
 	// Timeout for waiting for cloned dataset to be ready (configurable via zfs.zvolReadyTimeout)
 	cloneReadyTimeout := time.Duration(d.config.ZFS.ZvolReadyTimeout) * time.Second
 	var createdDS *truenas.Dataset
+	var sourceGeometry map[string]string
 
 	if snapshot := source.GetSnapshot(); snapshot != nil {
 		// Create from snapshot using either the legacy clone or the gated
 		// independent local send/receive path.
 		snapshotID := snapshot.GetSnapshotId()
 		if _, err := d.datasetForID(snapshotID); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		klog.Infof("Creating volume from snapshot: %s -> %s", snapshotID, datasetName)
 
 		// Find the snapshot using efficient query (PERF-001 fix)
 		snap, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to find snapshot: %v", err)
+			return nil, nil, status.Errorf(codes.Internal, "failed to find snapshot: %v", err)
 		}
 
 		if snap == nil {
-			return nil, status.Errorf(codes.NotFound, "snapshot not found: %s", snapshotID)
+			return nil, nil, status.Errorf(codes.NotFound, "snapshot not found: %s", snapshotID)
 		}
 
 		sourceSnapshot := snap.ID
@@ -2679,11 +2718,21 @@ func (d *Driver) handleVolumeContentSource(
 		// block options onto the destination, so by the time the share builder
 		// runs, guardStoredBlockGeometry compares the request against itself and
 		// always agrees — the inherited source geometry has already been
-		// overwritten. The SOURCE dataset's stamp is the only honest comparand and
-		// it has to be read here, before anything is written. Costs zero extra API
-		// round trips unless the class explicitly opts into a geometry.
-		if guardErr := d.guardCloneSourceBlockGeometry(ctx, snap.Dataset, nil, snapshotID, datasetName, shareType); guardErr != nil {
-			return nil, guardErr
+		// overwritten. The SOURCE's real geometry is the only honest comparand and
+		// it has to be read here, before anything is written.
+		//
+		// Round 4: this runs for EVERY block restore, not only for a class that
+		// opts into a geometry. A no-opts restore still creates an extent, and
+		// before this that extent was created at whatever the controller-wide
+		// default (`iscsi.extentBlocksize`) happened to be — laid over data cloned
+		// byte-for-byte from a source that may have been written against something
+		// else entirely. The resolved source geometry is stamped onto the
+		// destination in the folds below, so no later rebuild consults the default
+		// either. NFS pays nothing: the resolver short-circuits on share type.
+		var geometryErr error
+		sourceGeometry, geometryErr = d.resolveCloneSourceBlockGeometry(ctx, snap.Dataset, nil, snapshotID, datasetName, shareType)
+		if geometryErr != nil {
+			return nil, nil, geometryErr
 		}
 		// Durable in-flight provenance BEFORE the first destination mutation. A
 		// crash between clone/copy and the ownership stamp leaves a dataset with
@@ -2691,7 +2740,7 @@ func (d *Driver) handleVolumeContentSource(
 		// ours and recover it instead of wedging on terminal AlreadyExists.
 		marker, markerErr := d.newInflightMarker(datasetName, source, shareType)
 		if markerErr != nil {
-			return nil, markerErr
+			return nil, nil, markerErr
 		}
 		if detached {
 			marker.Mode = inflightModeCopy
@@ -2699,7 +2748,7 @@ func (d *Driver) handleVolumeContentSource(
 			marker.Origin = snap.ID
 		}
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
-			return nil, markerWriteErr
+			return nil, nil, markerWriteErr
 		}
 		if detached {
 			klog.V(4).Infof("Found snapshot %s for independent local copy", sourceSnapshot)
@@ -2711,11 +2760,11 @@ func (d *Driver) handleVolumeContentSource(
 					// name+source, and if it crashes before its ownership stamp the
 					// surviving marker is what lets a retry recover its remnant. The
 					// winner's post-stamp delete and the reconciler sweep retire it.
-					return nil, status.Errorf(codes.Aborted,
+					return nil, nil, status.Errorf(codes.Aborted,
 						"detached snapshot copy destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
 				}
 				d.cleanupFailedClone(ctx, datasetName, "")
-				return nil, status.Errorf(codes.Internal, "failed to copy snapshot into an independent volume: %v", copyErr)
+				return nil, nil, status.Errorf(codes.Internal, "failed to copy snapshot into an independent volume: %v", copyErr)
 			}
 			// The low-level copy owns abort-on-error while it runs. Once it
 			// succeeds, publish the ID immediately so CreateVolume's fail-path
@@ -2731,11 +2780,11 @@ func (d *Driver) handleVolumeContentSource(
 				if truenas.IsDatasetDestinationExistsError(cloneErr) {
 					// KEEP the shared marker: the same-instance winner may still need
 					// it for crash recovery (see the detached branch above).
-					return nil, status.Errorf(codes.Aborted,
+					return nil, nil, status.Errorf(codes.Aborted,
 						"snapshot clone destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
 				}
 				d.deleteInflightMarker(ctx, path.Base(datasetName))
-				return nil, status.Errorf(codes.Internal, "failed to clone snapshot: %v", cloneErr)
+				return nil, nil, status.Errorf(codes.Internal, "failed to clone snapshot: %v", cloneErr)
 			}
 			klog.Infof("Snapshot clone created: %s -> %s", sourceSnapshot, datasetName)
 		}
@@ -2747,14 +2796,14 @@ func (d *Driver) handleVolumeContentSource(
 			createdDS, err = d.truenasClient.WaitForZvolReady(ctx, datasetName, cloneReadyTimeout)
 			if err != nil {
 				d.cleanupFailedClone(ctx, datasetName, "")
-				return nil, status.Errorf(codes.Internal, "failed waiting for detached snapshot copy to become ready: %v", err)
+				return nil, nil, status.Errorf(codes.Internal, "failed waiting for detached snapshot copy to become ready: %v", err)
 			}
 			createdDS, err = d.prepareDetachedSnapshotCopy(
 				ctx, datasetName, createdDS, volumeName, snapshotID, snap.Name, capacityBytes, shareType,
 			)
 			if err != nil {
 				d.cleanupFailedClone(ctx, datasetName, "")
-				return nil, err
+				return nil, nil, err
 			}
 		} else {
 			// Sprint 3 (L1b): TrueNAS 26.0 pool.snapshot.clone is synchronously
@@ -2766,11 +2815,11 @@ func (d *Driver) handleVolumeContentSource(
 			if shareType.IsBlockProtocol() {
 				createdDS, err = d.confirmCloneReady(ctx, datasetName, cloneReadyTimeout, true)
 				if err != nil {
-					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
+					return nil, nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker,
 						cloneReadinessExhaustedStatus(ctx, datasetName, err))
 				}
 				if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
-					return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, err)
+					return nil, nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, err)
 				}
 			}
 			// The clone's dataset type is fixed by the share type (NFS->filesystem,
@@ -2818,9 +2867,20 @@ func (d *Driver) handleVolumeContentSource(
 			for key, value := range blockOptsProps(ctx, shareType) {
 				foldProps[key] = value
 			}
+			// GF-4 round 4, mechanism (3): the SOURCE's real geometry, recorded on
+			// the destination in the same atomic write. This is what a no-opts
+			// restore of an unstamped source now inherits instead of the controller
+			// default, and it is also what stops a no-opts hop from LAUNDERING a
+			// wrong geometry into the next restore's ground truth. Written BEFORE the
+			// share builder runs, so the extent below is created from it. Where the
+			// request also sets a geometry the two agree by construction — the guard
+			// above rejected every case where they would not.
+			for key, value := range sourceGeometry {
+				foldProps[key] = value
+			}
 			verified, updateErr := d.setAndVerifyDatasetProps(ctx, datasetName, refquota, foldProps)
 			if updateErr != nil {
-				return nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, updateErr)
+				return nil, nil, d.guardedCleanupFailedSnapshotClone(ctx, datasetName, &marker, updateErr)
 			}
 			createdDS = verified
 		}
@@ -2830,22 +2890,25 @@ func (d *Driver) handleVolumeContentSource(
 		sourceVolumeID := volume.GetVolumeId()
 		sourceDataset, err := d.datasetForID(sourceVolumeID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		klog.Infof("Creating volume from volume: %s -> %s", sourceVolumeID, datasetName)
 
 		sourceDS, getErr := d.truenasClient.DatasetGet(ctx, sourceDataset)
 		if getErr != nil {
 			if truenas.IsNotFoundError(getErr) {
-				return nil, status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
+				return nil, nil, status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
 			}
-			return nil, status.Errorf(codes.Internal, "failed to get source volume: %v", getErr)
+			return nil, nil, status.Errorf(codes.Internal, "failed to get source volume: %v", getErr)
 		}
 		// N-1 (volume-clone flavor). This existence probe was already querying the
-		// source, so reusing its result makes the geometry guard free: ZERO extra
-		// API calls even for a class that opts into a geometry.
-		if guardErr := d.guardCloneSourceBlockGeometry(ctx, sourceDataset, sourceDS, sourceVolumeID, datasetName, shareType); guardErr != nil {
-			return nil, guardErr
+		// source, so reusing its result saves the DatasetGet: the only extra call
+		// here is the source's live-extent read, which is what tells the driver what
+		// the cloned data is actually addressed through.
+		var geometryErr error
+		sourceGeometry, geometryErr = d.resolveCloneSourceBlockGeometry(ctx, sourceDataset, sourceDS, sourceVolumeID, datasetName, shareType)
+		if geometryErr != nil {
+			return nil, nil, geometryErr
 		}
 
 		// Create a snapshot of source volume, then clone it
@@ -2854,18 +2917,18 @@ func (d *Driver) handleVolumeContentSource(
 		// the deterministic internal snapshot the clone must descend from.
 		marker, markerErr := d.newInflightMarker(datasetName, source, shareType)
 		if markerErr != nil {
-			return nil, markerErr
+			return nil, nil, markerErr
 		}
 		marker.Origin = sourceDataset + "@" + tempSnapshotName
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
-			return nil, markerWriteErr
+			return nil, nil, markerWriteErr
 		}
 		snap, err := d.truenasClient.SnapshotCreate(ctx, sourceDataset, tempSnapshotName, map[string]string{
 			PropInternalResource: "true",
 		})
 		if err != nil {
 			d.deleteInflightMarker(ctx, path.Base(datasetName))
-			return nil, status.Errorf(codes.Internal, "failed to create source snapshot: %v", err)
+			return nil, nil, status.Errorf(codes.Internal, "failed to create source snapshot: %v", err)
 		}
 		klog.V(4).Infof("Created temporary snapshot %s for volume clone", snap.ID)
 		// Internal snapshots are deliberately not marked as CSI-managed. Their
@@ -2879,14 +2942,14 @@ func (d *Driver) handleVolumeContentSource(
 				// completion and the retry will pass through the full ownership gate.
 				// KEEP the shared marker too: the same-instance winner may still
 				// need it for crash recovery if it dies before its ownership stamp.
-				return nil, status.Errorf(codes.Aborted,
+				return nil, nil, status.Errorf(codes.Aborted,
 					"volume clone destination %s appeared concurrently; retry CreateVolume through the ownership gate", datasetName)
 			}
 			d.deleteInflightMarker(ctx, path.Base(datasetName))
 			if delErr := d.truenasClient.SnapshotDelete(ctx, snap.ID, false, false); delErr != nil {
 				klog.Warningf("Failed to cleanup snapshot after clone failure: %v", delErr)
 			}
-			return nil, status.Errorf(codes.Internal, "failed to clone volume: %v", cloneErr)
+			return nil, nil, status.Errorf(codes.Internal, "failed to clone volume: %v", cloneErr)
 		}
 		klog.Infof("Volume clone created: %s -> %s", sourceVolumeID, datasetName)
 
@@ -2897,11 +2960,11 @@ func (d *Driver) handleVolumeContentSource(
 		createdDS, err = d.confirmCloneReady(ctx, datasetName, cloneReadyTimeout, shareType.IsBlockProtocol())
 		if err != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
-			return nil, cloneReadinessExhaustedStatus(ctx, datasetName, err)
+			return nil, nil, cloneReadinessExhaustedStatus(ctx, datasetName, err)
 		}
 		if err := d.ensureCloneCapacity(ctx, datasetName, createdDS, capacityBytes); err != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
-			return nil, err
+			return nil, nil, err
 		}
 
 		// Include origin snapshot so it can be cleaned up when the clone is deleted.
@@ -2943,15 +3006,20 @@ func (d *Driver) handleVolumeContentSource(
 		for key, value := range blockOptsProps(ctx, shareType) {
 			foldProps[key] = value
 		}
+		// GF-4 round 4, mechanism (3): the SOURCE's real geometry, recorded on the
+		// destination in the same atomic write (see the snapshot-clone fold above).
+		for key, value := range sourceGeometry {
+			foldProps[key] = value
+		}
 		verified, updateErr := d.setAndVerifyDatasetUserProperties(ctx, datasetName, foldProps)
 		if updateErr != nil {
 			d.cleanupFailedClone(ctx, datasetName, snap.ID)
-			return nil, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", updateErr)
+			return nil, nil, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", updateErr)
 		}
 		createdDS = verified
 	}
 
-	return createdDS, nil
+	return createdDS, sourceGeometry, nil
 }
 
 func (d *Driver) abortReplicationJobBestEffort(ctx context.Context, jobID int64, reason string) {

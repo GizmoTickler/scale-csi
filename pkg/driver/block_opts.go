@@ -539,15 +539,21 @@ func (o *blockOpts) resolvedISCSIPblocksize(disablePhysicalBlocksize bool) bool 
 	return !disablePhysicalBlocksize
 }
 
-// hasGeometryOpinion reports whether the caller explicitly asked for a logical
-// data layout (blocksize / pblocksize). Only these two describe how bytes are
-// addressed on the media, so only these two have to be reconciled against a
-// clone SOURCE — the rest describe the volume's own share objects, which a clone
-// gets fresh. Used to keep the clone-source geometry probe off the default path
-// entirely (zero extra API round trips when no class opts into geometry).
-func (o *blockOpts) hasGeometryOpinion() bool {
-	return o != nil && (o.iscsiBlocksize != nil || o.iscsiPblocksize != nil)
-}
+// NOTE: there is deliberately no "does this caller have a geometry opinion"
+// predicate any more. hasGeometryOpinion() used to exist and to mean "the
+// StorageClass set blocksize or pblocksize", and gating the clone-source
+// resolution on it is precisely how the controller-wide default became invisible
+// to every geometry guard (N-1e).
+//
+// The reasoning it encoded is false: a request that names neither key still
+// creates an extent, and that extent still gets a logical block size — the
+// controller-wide default (helm `iscsi.extentBlocksize`), which is every bit as
+// much an opinion about how the data is addressed, just one nobody recorded.
+// Round 4 therefore handles the default where it would actually be APPLIED
+// (resolveExtentCreateBlocksize for an absent extent on an existing volume,
+// resolveCloneSourceBlockGeometry for cloned data) instead of letting any guard
+// short-circuit on "the caller said nothing". Re-introducing such a predicate as
+// a guard gate would re-open the class. See "the geometry invariant" below.
 
 // requestedISCSIBlocksize returns the blocksize the caller has an OPINION about
 // — the per-SC override or the volume's stored geometry — and nil when neither
@@ -631,11 +637,15 @@ func guardStoredBlockGeometry(stored, request *blockOpts, datasetName string) er
 // exactly the deployment two differently-tuned classes invite.
 //
 // It fires ONLY when both sides are explicit. A restore into a class that opts
-// into nothing inherits the source geometry (correct, and verified) and is left
-// alone. A source with no STAMP is not "no geometry": its geometry is resolved
-// from its live iSCSI extent before this runs (see resolveCloneSourceGeometry),
-// because every volume provisioned before these knobs existed is unstamped and
-// is exactly the installed base a newly-knobbed StorageClass gets pointed at.
+// into nothing has nothing to contradict and is left alone HERE — but it does
+// not therefore inherit the controller default: its destination is stamped with
+// the source geometry resolved by resolveCloneSourceBlockGeometry, which runs
+// for every block clone whether or not the class said anything.
+//
+// A source with no STAMP is not "no geometry" either: its geometry is resolved
+// from its live iSCSI extent before this runs, because every volume provisioned
+// before these knobs existed is unstamped and is exactly the installed base a
+// newly-knobbed StorageClass gets pointed at.
 func guardCloneSourceGeometry(sourceOpts, request *blockOpts, sourceRef, datasetName string) error {
 	if sourceOpts == nil || request == nil {
 		return nil
@@ -660,83 +670,264 @@ func guardCloneSourceGeometry(sourceOpts, request *blockOpts, sourceRef, dataset
 	return nil
 }
 
-// guardCloneSourceBlockGeometry resolves the clone/restore source's stored
-// geometry and runs guardCloneSourceGeometry against the request. sourceDS may
-// be supplied by a caller that already queried the source (the volume-clone path
-// does, so the guard is free there); otherwise it is fetched, but ONLY when the
-// StorageClass actually opts into a geometry — a default class, and every NFS
-// request, short-circuits before any API call, which is what keeps the default
-// provisioning path's round-trip count unchanged.
-func (d *Driver) guardCloneSourceBlockGeometry(
+// ---------------------------------------------------------------------------
+// THE GEOMETRY INVARIANT (GF-4 round 4)
+//
+//	The driver never creates an iSCSI extent at a geometry it has not resolved
+//	from a durable or observable record of THAT VOLUME'S ACTUAL LAYOUT. The
+//	controller-wide default is itself a geometry opinion and may only be applied
+//	to storage that provably holds no data yet.
+//
+// Five forms of the same corruption were found across four rounds — a rebuild
+// with no opts; a publish/startup-reconcile; a restore from a STAMPED source; a
+// restore from an UNSTAMPED source; and finally the controller-wide default
+// (helm `iscsi.extentBlocksize`) reaching both a no-opts restore and a plain
+// rebuild. Each round closed the trigger in front of it. They are all the same
+// bug: an unstamped volume's true geometry was recorded NOWHERE the driver
+// consults before creating an extent, so something had to supply it, and that
+// something was a mutable install-wide setting no guard could see.
+//
+// Four mechanisms enforce the invariant. None adds a round trip to a path that
+// did not already need one:
+//
+//  1. RECORD WHAT WE CREATED, AND BACK-STAMP WHAT WE SEE. Every time the iSCSI
+//     share builder creates an extent, or resolves a live one for a volume whose
+//     dataset carries no geometry stamp, the extent's ACTUAL geometry is folded
+//     into the resource-ID dataset update that path already performs
+//     (observedGeometryProps). Volumes this driver creates are stamped at
+//     create; the entire pre-GF4 fleet back-stamps itself on its first publish /
+//     reconcile / replay. +0 API calls, and it is what makes (2) safe.
+//
+//  2. NEVER DEFAULT OVER EXISTING DATA. When an ABSENT extent must be
+//     re-created, the blocksize comes from the stamp; there is no live extent to
+//     read, so if the dataset is an existing CSI block volume with no stamp the
+//     request is REFUSED (resolveExtentCreateBlocksize) rather than guessed. The
+//     controller default survives only where it cannot lie: a zvol this very
+//     call created, or a dataset carrying no evidence of ever having held a CSI
+//     block volume. This closes the plain-rebuild form (N-1e(b)).
+//
+//  3. A CLONE INHERITS ITS SOURCE'S REAL GEOMETRY, ALWAYS. Cloning or restoring
+//     a BLOCK volume resolves the SOURCE's geometry unconditionally — stamp and
+//     live extent, before the first destination mutation — rejects a request
+//     that conflicts with it, and stamps the answer onto the destination
+//     (resolveCloneSourceBlockGeometry). A no-opts restore can therefore never
+//     fall through to whatever the controller default happens to be today
+//     (N-1e(a)), and a no-opts hop can no longer LAUNDER a wrong geometry into
+//     the next restore's ground truth, because the destination now records the
+//     source's real layout instead of the default it was created with.
+//
+//  4. PRECEDENCE, AND REFUSE ON DISAGREEMENT. The LIVE extent is authoritative
+//     for what the data actually IS; the STAMP records the intent the volume was
+//     provisioned with. Where only one exists, it answers. Where both exist and
+//     DISAGREE, the driver refuses and names both values
+//     (guardStampedVsLiveGeometry on a volume, reconcileSourceGeometry on a
+//     clone source) instead of silently picking a side — a drifted volume is a
+//     fact an operator has to see, not one to resolve by coin flip.
+//
+// Cost, stated honestly: a BLOCK clone/restore now pays one source DatasetGet
+// (skipped when the caller already has the source dataset, i.e. the volume-clone
+// path) plus one source ISCSIExtentFindByDisk, ALWAYS rather than only when a
+// StorageClass opted into a geometry. Fresh provisioning, publish, unpublish,
+// reconcile and every NFS path pay nothing extra; their golden counts are
+// unchanged.
+// ---------------------------------------------------------------------------
+
+// geometryProps renders ONLY the two geometry keys of a resolved blockOpts.
+// Unlike storedProperties (which records what a StorageClass asked for) this
+// records what a volume's data IS, which is why it is written for volumes whose
+// class opted into nothing at all.
+func geometryProps(o *blockOpts) map[string]string {
+	if o == nil {
+		return nil
+	}
+	props := make(map[string]string, 2)
+	if o.iscsiBlocksize != nil {
+		props[PropBlockISCSIBlocksize] = strconv.Itoa(*o.iscsiBlocksize)
+	}
+	if o.iscsiPblocksize != nil {
+		props[PropBlockISCSIPblocksize] = strconv.FormatBool(*o.iscsiPblocksize)
+	}
+	if len(props) == 0 {
+		return nil
+	}
+	return props
+}
+
+// observedGeometryProps is mechanism (1): back-stamp the geometry of an extent
+// the driver just created or just resolved onto a dataset that does not already
+// record it.
+//
+// It returns only the keys the dataset is MISSING, so it is idempotent and a
+// fully stamped volume yields nil — the caller folds the result into a dataset
+// update it was going to issue anyway, so the cost is zero round trips whether
+// or not there is anything to stamp. A backend that does not report a field
+// (blocksize 0, pblocksize null) contributes nothing: an unknown value is never
+// invented.
+func observedGeometryProps(ds *truenas.Dataset, extent *truenas.ISCSIExtent) map[string]string {
+	if extent == nil {
+		return nil
+	}
+	props := make(map[string]string, 2)
+	if extent.Blocksize != 0 && !datasetUserPropertyHasValue(ds, PropBlockISCSIBlocksize) {
+		props[PropBlockISCSIBlocksize] = strconv.Itoa(extent.Blocksize)
+	}
+	if extent.Pblocksize != nil && !datasetUserPropertyHasValue(ds, PropBlockISCSIPblocksize) {
+		props[PropBlockISCSIPblocksize] = strconv.FormatBool(*extent.Pblocksize)
+	}
+	if len(props) == 0 {
+		return nil
+	}
+	return props
+}
+
+// guardStampedVsLiveGeometry is mechanism (4) on the volume itself: the stamp
+// records intent, the live extent records what the data is, and a disagreement
+// between them is a fact the driver must surface rather than resolve silently.
+//
+// Before this, the stamp beat the live extent unconditionally (the stamp was
+// consulted first and the live read only happened when the stamp was silent), so
+// a volume whose extent had been re-created out of band — or laundered through a
+// no-opts hop by the very bug this round fixes — would keep certifying its own
+// wrong geometry to every downstream guard.
+func guardStampedVsLiveGeometry(stored *blockOpts, extent *truenas.ISCSIExtent, datasetName string) error {
+	if stored == nil || extent == nil {
+		return nil
+	}
+	if stored.iscsiBlocksize != nil && extent.Blocksize != 0 && *stored.iscsiBlocksize != extent.Blocksize {
+		return status.Errorf(codes.FailedPrecondition,
+			"volume %s records iSCSI extent blocksize %d but its live extent reports %d. The live extent is what the data is "+
+				"actually addressed through and the stamp is what the volume was provisioned with, so this is real drift "+
+				"(an out-of-band extent edit, or an extent re-created at a different geometry). The driver refuses to pick a "+
+				"side: reconcile the extent's blocksize with %s=%d, or correct the stamp to match the extent",
+			datasetName, *stored.iscsiBlocksize, extent.Blocksize, PropBlockISCSIBlocksize, *stored.iscsiBlocksize)
+	}
+	if stored.iscsiPblocksize != nil && extent.Pblocksize != nil && *stored.iscsiPblocksize != *extent.Pblocksize {
+		return status.Errorf(codes.FailedPrecondition,
+			"volume %s records iSCSI physical-blocksize reporting %t but its live extent reports %t. The driver refuses to "+
+				"pick a side: reconcile the extent with %s=%t, or correct the stamp to match the extent",
+			datasetName, *stored.iscsiPblocksize, *extent.Pblocksize, PropBlockISCSIPblocksize, *stored.iscsiPblocksize)
+	}
+	return nil
+}
+
+// datasetRecordsAPriorISCSIExtent reports whether the driver's own bookkeeping
+// says this dataset HAS had an iSCSI extent — and therefore that its bytes may
+// already be addressed through a logical block size the driver must not guess.
+//
+// PropISCSIExtentID is the right and only witness: it is written by the share
+// builder in the same dataset update as the geometry stamp (see
+// observedGeometryProps), so "the driver recorded an extent for this dataset"
+// and "the driver recorded that extent's geometry" are durable together. Its
+// presence WITHOUT a geometry stamp is precisely the pre-GF4 legacy volume whose
+// extent has since gone missing — a DR restore, an orphan reconcile, a share
+// teardown — which is the shape that silently re-created the extent at whatever
+// `iscsi.extentBlocksize` happened to be that day. A ZFS clone inherits its
+// source's user properties, so a clone of a real volume carries the witness too;
+// that is correct, and its geometry is supplied by mechanism (3) long before
+// this is consulted.
+//
+// A dataset without it has no extent history the driver could contradict: a zvol
+// nothing has ever exported cannot have a filesystem laid out against a logical
+// block size, so the controller default is the honest answer there, not a guess.
+func datasetRecordsAPriorISCSIExtent(ds *truenas.Dataset) bool {
+	return datasetUserPropertyHasValue(ds, PropISCSIExtentID)
+}
+
+// resolveExtentCreateBlocksize is mechanism (2): the ONE place the blocksize an
+// extent is created with is decided.
+//
+// Resolution order is stamp (per-SC override or the volume's own record) ->
+// controller default, and the controller default is available ONLY when it
+// cannot lie:
+//
+//   - freshlyCreated: DatasetCreate produced this zvol during this very call, so
+//     there is no data on it and no layout to contradict; or
+//   - the driver's bookkeeping shows the dataset never had an iSCSI extent, so
+//     nothing has ever addressed its bytes through a logical block size.
+//
+// Otherwise the volume exists, its extent is absent (so there is no live
+// geometry to read), and nothing records what its data was written against —
+// the state in which every previous round silently wrote the current helm
+// default over old data. It fails closed instead, naming the property an
+// operator can set to recover.
+func (d *Driver) resolveExtentCreateBlocksize(opts *blockOpts, ds *truenas.Dataset, datasetName string, freshlyCreated bool) (int, error) {
+	if opts != nil && opts.iscsiBlocksize != nil {
+		return *opts.iscsiBlocksize, nil
+	}
+	if freshlyCreated || !datasetRecordsAPriorISCSIExtent(ds) {
+		return d.config.ISCSI.ExtentBlocksize, nil
+	}
+	return 0, status.Errorf(codes.FailedPrecondition,
+		"cannot re-create the iSCSI extent for %s: the volume already exists, its extent is absent (so there is no live "+
+			"geometry to read), and it carries no %s record of the logical block size its data was written against. "+
+			"Falling back to the controller-wide default (iscsi.extentBlocksize=%d) would lay a guessed geometry over data "+
+			"that may have been written against a different one, which corrupts it — the driver refuses instead. Recover by "+
+			"restoring the volume's original extent, or by recording its real blocksize on the dataset "+
+			"(zfs set %s=<512|1024|2048|4096> %s) and retrying",
+		datasetName, PropBlockISCSIBlocksize, d.config.ISCSI.ExtentBlocksize, PropBlockISCSIBlocksize, datasetName)
+}
+
+// resolveCloneSourceBlockGeometry is mechanism (3). It answers "what geometry is
+// the data we are about to clone actually addressed through", rejects a request
+// that contradicts that answer, and returns the properties that record it on the
+// DESTINATION so no later path has to ask again.
+//
+// It runs for EVERY block clone/restore, not only for a class that opts into a
+// geometry. That is the round-4 correction: a class with no geometry parameter
+// still produces an extent, and before this the extent it produced was created
+// at the current controller default — over data cloned byte-for-byte from a
+// source that may have been written against something else entirely. Gating this
+// on hasExplicitGeometry made the default invisible to the guard; the guard has
+// to see it precisely because nobody else does.
+//
+// sourceDS may be supplied by a caller that already queried the source (the
+// volume-clone path does), which saves the DatasetGet there. NFS short-circuits
+// before any API call, so no filesystem path pays for this.
+//
+// A source with neither a stamp nor a live extent yields no properties and no
+// error: nothing has ever exported that data, so there is no layout to preserve
+// and nothing to contradict.
+func (d *Driver) resolveCloneSourceBlockGeometry(
 	ctx context.Context,
 	sourceDataset string,
 	sourceDS *truenas.Dataset,
 	sourceRef, datasetName string,
 	shareType ShareType,
-) error {
+) (map[string]string, error) {
 	if !shareType.IsBlockProtocol() {
-		return nil
-	}
-	request := blockOptsFromContext(ctx)
-	if !request.hasGeometryOpinion() {
-		return nil
+		return nil, nil
 	}
 	if sourceDS == nil {
 		var err error
 		sourceDS, err = d.truenasClient.DatasetGet(ctx, sourceDataset)
 		if err != nil {
-			// Fail closed: with an explicit geometry in the request and no way to
-			// read what the source actually holds, proceeding is the corruption we
-			// are guarding against.
-			return status.Errorf(codes.Internal,
+			// Fail closed: about to lay a geometry over this source's data with no
+			// way to read what that data is, which is the corruption itself.
+			return nil, status.Errorf(codes.Internal,
 				"failed to read the stored block geometry of clone source %s: %v", sourceDataset, err)
 		}
 	}
-	sourceOpts, err := d.resolveCloneSourceGeometry(ctx, sourceDataset, blockOptsFromDataset(sourceDS), request)
-	if err != nil {
-		return err
-	}
-	return guardCloneSourceGeometry(sourceOpts, request, sourceRef, datasetName)
-}
-
-// resolveCloneSourceGeometry answers "what geometry does the source ACTUALLY
-// hold" for the fields the request has an opinion about.
-//
-// The stamp is the first answer, and the authoritative one where it exists. But
-// a stamp only exists for a volume provisioned by a StorageClass that opted into
-// that knob — which is NO volume created before these parameters shipped, and no
-// volume from a class that sets none of them. Treating an unstamped source as
-// "no geometry to contradict" is precisely the corruption this guard exists to
-// stop, only aimed at the entire pre-existing fleet: a 4096-geometry volume with
-// no stamp, restored into a class that says blocksize: "512", would be accepted
-// and get a 512-byte extent laid over data whose filesystem and partition table
-// were written for 4096.
-//
-// So for a field the stamp does not carry, the source's LIVE iSCSI extent is
-// consulted — it reports the geometry the data was actually written against.
-// The lookup is strictly opted-in-only: the caller has already short-circuited
-// on hasGeometryOpinion, and even then it is issued only for a field the stamp
-// leaves unanswered, so the default provisioning path's round-trip count is
-// unchanged and a fully stamped source costs nothing extra.
-//
-// A source with no extent at all (an NVMe-oF volume, or one whose share objects
-// are gone) yields no live answer and is left as it was: nothing to contradict.
-func (d *Driver) resolveCloneSourceGeometry(
-	ctx context.Context,
-	sourceDataset string,
-	stamped, request *blockOpts,
-) (*blockOpts, error) {
-	if !needsLiveSourceGeometry(stamped, request) {
-		return stamped, nil
-	}
 	extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, "zvol/"+sourceDataset)
 	if err != nil {
-		// Fail closed, for the same reason the DatasetGet above does: an explicit
-		// geometry in the request plus no way to read the source's real one is the
-		// exact state in which proceeding corrupts data.
 		return nil, status.Errorf(codes.Internal,
 			"failed to read the live block geometry of clone source %s: %v", sourceDataset, err)
 	}
+	sourceGeometry, err := reconcileSourceGeometry(blockOptsFromDataset(sourceDS), extent, sourceRef)
+	if err != nil {
+		return nil, err
+	}
+	if guardErr := guardCloneSourceGeometry(sourceGeometry, blockOptsFromContext(ctx), sourceRef, datasetName); guardErr != nil {
+		return nil, guardErr
+	}
+	return geometryProps(sourceGeometry), nil
+}
+
+// reconcileSourceGeometry applies the precedence rule of mechanism (4) to a
+// clone source: the live extent is authoritative for what the data is, the stamp
+// answers where there is no extent, and a disagreement is refused rather than
+// silently resolved. A drifted source is exactly the state in which "which of
+// these two numbers is the truth" cannot be answered from inside the driver.
+func reconcileSourceGeometry(stamped *blockOpts, extent *truenas.ISCSIExtent, sourceRef string) (*blockOpts, error) {
 	if extent == nil {
 		return stamped, nil
 	}
@@ -744,31 +935,28 @@ func (d *Driver) resolveCloneSourceGeometry(
 	if stamped != nil {
 		*resolved = *stamped
 	}
-	if resolved.iscsiBlocksize == nil && extent.Blocksize != 0 {
+	if extent.Blocksize != 0 {
+		if resolved.iscsiBlocksize != nil && *resolved.iscsiBlocksize != extent.Blocksize {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"clone source %s records iSCSI extent blocksize %d but its live extent reports %d. The driver will not clone "+
+					"data whose real geometry it cannot establish: reconcile the source's extent and its %s stamp, then retry",
+				sourceRef, *resolved.iscsiBlocksize, extent.Blocksize, PropBlockISCSIBlocksize)
+		}
 		blocksize := extent.Blocksize
 		resolved.iscsiBlocksize = &blocksize
 	}
-	if resolved.iscsiPblocksize == nil && extent.Pblocksize != nil {
+	if extent.Pblocksize != nil {
+		if resolved.iscsiPblocksize != nil && *resolved.iscsiPblocksize != *extent.Pblocksize {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"clone source %s records iSCSI physical-blocksize reporting %t but its live extent reports %t. The driver will "+
+					"not clone data whose real geometry it cannot establish: reconcile the source's extent and its %s stamp, "+
+					"then retry",
+				sourceRef, *resolved.iscsiPblocksize, *extent.Pblocksize, PropBlockISCSIPblocksize)
+		}
 		pblocksize := *extent.Pblocksize
 		resolved.iscsiPblocksize = &pblocksize
 	}
 	return resolved, nil
-}
-
-// needsLiveSourceGeometry reports whether the live-extent probe can tell us
-// anything we do not already know: it fires only for a geometry field the
-// REQUEST opts into and the source's stamp does not answer.
-func needsLiveSourceGeometry(stamped, request *blockOpts) bool {
-	if request == nil {
-		return false
-	}
-	if request.iscsiBlocksize != nil && (stamped == nil || stamped.iscsiBlocksize == nil) {
-		return true
-	}
-	if request.iscsiPblocksize != nil && (stamped == nil || stamped.iscsiPblocksize == nil) {
-		return true
-	}
-	return false
 }
 
 // ---------------------------------------------------------------------------
