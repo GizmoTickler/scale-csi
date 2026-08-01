@@ -405,10 +405,20 @@ func TestDeleteVolumePreservesScheduledSnapshotWhenZoneIsWrongOrUnreadable(t *te
 	})
 }
 
-// The zone must be resolved ONCE and reused — the property that keeps this off
-// the per-DeleteVolume budget. Stronger evidence than a golden count, which is
-// taken against a driver warmed the way a running controller is.
-func TestScheduledDeleteResolvesNASTimezoneOnceAcrossVolumes(t *testing.T) {
+// GF2-fix3 (B1-a) HONESTY CORRECTION. This test previously asserted "resolved
+// ONCE across three deletes" and was named accordingly. That was true only
+// because the Driver memoized the zone behind a one-hour TTL that no reconnect
+// could invalidate — the stale-authorization bug itself. There is no Driver
+// cache any more, so the honest budget claim is: exactly ONE resolution PER
+// SCHEDULED DELETE, and ZERO for anything unscheduled (asserted separately by
+// TestUnscheduledDeleteNeverResolvesNASTimezone). Deduplication now lives only
+// where it can be dropped on reconnect and where a failure is never cached —
+// truenas.Client's short-TTL cache — which this counting mock deliberately does
+// not emulate, so what is measured here is the driver's real call rate.
+//
+// Revert-proof: on 9929315 the driver resolves the zone once for all three
+// volumes, so this assertion of 3 observes 1 and FAILS.
+func TestScheduledDeleteResolvesNASTimezoneOncePerScheduledDelete(t *testing.T) {
 	client := newAPICallCountingClient()
 	d := newScheduleTestDriver(client)
 	ctx := context.Background()
@@ -427,8 +437,8 @@ func TestScheduledDeleteResolvesNASTimezoneOnceAcrossVolumes(t *testing.T) {
 	}
 
 	_, methods := client.callSnapshot()
-	assert.Equal(t, 1, methods["SystemTimezone"],
-		"three scheduled deletes must resolve the NAS timezone once, not once each")
+	assert.Equal(t, 3, methods["SystemTimezone"],
+		"each scheduled delete resolves the live NAS zone itself; nothing may serve it from an uninvalidatable driver cache")
 }
 
 // A volume with NO schedule must never ask for the NAS timezone — this is what
@@ -751,6 +761,9 @@ func TestReconcileCountsScheduledSnapshotsFromProductionPartition(t *testing.T) 
 	schema, err := newDriverScheduledNamingSchema("source")
 	require.NoError(t, err)
 	require.NoError(t, client.DatasetSetUserProperty(ctx, ds.Name, PropSnapshotNamingSchema, schema))
+	// GF2-fix3/B1-d: the recorded task timezone is part of the binding, and the
+	// gauge applies the same stored-vs-current comparison the delete path does.
+	require.NoError(t, client.DatasetSetUserProperty(ctx, ds.Name, PropSnapshotTaskTimezone, "UTC"))
 	_, err = client.SnapshotTaskCreate(ctx, &truenas.SnapshotTaskCreateParams{
 		Dataset: ds.Name, NamingSchema: schema, Enabled: true,
 	})

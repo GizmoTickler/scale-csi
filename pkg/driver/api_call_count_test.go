@@ -737,25 +737,19 @@ func newAPICallCountDriver(t *testing.T, client *apiCallCountingClient, protocol
 		return client.ServiceReload(ctx, service)
 	})
 	t.Cleanup(d.serviceReloadDebouncer.Stop)
-	warmAPICallCountDriver(t, client, d)
+	client.resetCalls()
 	return d
 }
 
-// warmAPICallCountDriver models what a RUNNING controller has already done
-// before any CSI RPC arrives: the reconcile pass resolves the NAS civil timezone
-// and it is TTL-cached on the Driver (GF2-fix2/B1-a). Taking the golden counts
-// against a warm driver keeps them a measure of PER-RPC round trips instead of
-// one-time startup work. That the resolution really is one-time is proven
-// separately, by TestScheduledDeleteResolvesNASTimezoneOnceAcrossVolumes.
-func warmAPICallCountDriver(t *testing.T, client *apiCallCountingClient, d *Driver) {
-	t.Helper()
-	zone, err := d.truenasClient.SystemTimezone(context.Background())
-	require.NoError(t, err)
-	d.nasZoneMu.Lock()
-	d.nasZone, d.nasZoneAt = zone, time.Now()
-	d.nasZoneMu.Unlock()
-	client.resetCalls()
-}
+// GF2-fix3 TEST-HONESTY NOTE. A warmAPICallCountDriver helper used to live here.
+// It reached into the Driver, populated a nasZone field and reset the counter,
+// on the theory that a running controller has already warmed the NAS timezone.
+// No production code ever set that field at startup — the only warm call
+// happened inside an eligible reconcile sweep — so the goldens UNDERCOUNTED the
+// first scheduled DeleteVolume whenever reconcile was disabled or had not run.
+// A fixture that invents state production never sets does not measure
+// production. The Driver-level cache is gone (GF2-fix3/B1-a) and the goldens
+// below now count the SystemTimezone calls the driver really makes.
 
 func apiCallCountVolumeRequest(name, protocol string) *csi.CreateVolumeRequest {
 	return &csi.CreateVolumeRequest{
@@ -918,7 +912,15 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// resulting task id. The binding write is deliberately NOT folded into the
 		// id write: the whole point is that it lands before the task exists.
 		// A schedule-less volume pays none of these (the default goldens above).
-		{name: "CreateVolume fresh NFS scheduled", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		//
+		// GF2-fix3 MOVEMENT 10 -> 11: one SystemTimezone. The binding is now
+		// (schema, timezone) — the IANA zone in force when the task is created is
+		// recorded so a later reconfiguration is DETECTABLE (B1-d) — and both keys
+		// go out in the SAME DatasetSetUserProperties, so the only new call is the
+		// system.general.config read. An idempotent retry adds nothing: the zone
+		// record is write-once and a dataset that already carries one is not
+		// re-read.
+		{name: "CreateVolume fresh NFS scheduled", want: 11, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			req := apiCallCountVolumeRequest("fresh-nfs-scheduled", "nfs")
 			req.Parameters["snapshotSchedule"] = "0 0 * * *"
 			req.Parameters["snapshotRetention"] = "30d"
@@ -936,7 +938,20 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// failed delete is not wedged behind the foreign guard.
 		// A schedule-less volume pays NONE of these three — the default DeleteVolume
 		// goldens above are unchanged.
-		{name: "DeleteVolume NFS scheduled", want: 9, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		//
+		// GF2-fix3 MOVEMENT 9 -> 11, and BOTH increments are corrections of things
+		// round 2 was not paying honestly:
+		//
+		//   +1 SystemTimezone. Round 2's golden was taken against a fixture that
+		//     hand-populated a Driver-level zone cache no production startup path
+		//     ever filled, so the real first scheduled delete always paid this and
+		//     the golden hid it. The Driver cache is gone (B1-a); the driver reads
+		//     the zone here, and truenas.Client serves repeats from a short TTL it
+		//     drops on reconnect.
+		//   +1 DatasetGet. The corroboration record is now VERIFIED with a
+		//     source-bearing re-read before the task is destroyed (B1-e), because
+		//     an assumed write is exactly what wedges a retry forever.
+		{name: "DeleteVolume NFS scheduled", want: 11, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			req := apiCallCountVolumeRequest("delete-nfs-scheduled", "nfs")
 			req.Parameters["snapshotSchedule"] = "0 0 * * *"
 			_, err := d.CreateVolume(context.Background(), req)
@@ -1186,7 +1201,7 @@ func newFencedAPICallCountDriver(t *testing.T, client *apiCallCountingClient, pr
 		return client.ServiceReload(ctx, service)
 	})
 	t.Cleanup(d.serviceReloadDebouncer.Stop)
-	warmAPICallCountDriver(t, client, d)
+	client.resetCalls()
 	return d
 }
 

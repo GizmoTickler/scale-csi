@@ -18,10 +18,21 @@ import (
 )
 
 // systemTimezoneTTL bounds how long a resolved NAS timezone is trusted before it
-// is re-read. It is deliberately long: the value changes only when an operator
-// edits the system configuration, and the consumers (scheduled-snapshot
-// ownership, reconcile metrics) resolve it OUTSIDE the CSI RPC hot path.
-const systemTimezoneTTL = time.Hour
+// is re-read.
+//
+// It is deliberately SHORT (GF2-fix3/B1-a). Round 2 used an hour here and
+// memoized the result a second time on the Driver, so a zone reconfiguration —
+// or a lookup that would now FAIL — could be bypassed for an hour while the
+// stale value kept authorizing deletes. This is now the ONLY cache of the value,
+// it is dropped on every reconnect (invalidateSystemTimezone), and an error is
+// never cached. Five minutes bounds the stale-authorization window to something
+// an operator can reason about while still collapsing bursts of scheduled
+// DeleteVolume calls into a single round trip.
+//
+// The correctness of a scheduled-snapshot decision does NOT rest on this TTL:
+// the driver additionally compares the live value against the zone RECORDED on
+// the dataset when its task was created, and any difference fails closed.
+const systemTimezoneTTL = 5 * time.Minute
 
 // SystemTimezone returns the NAS's configured civil timezone.
 //
