@@ -197,9 +197,37 @@ func (d *Driver) promoteRestoredClone(
 		return nil, fmt.Sprintf("origin %s has %d dependent clones (%v); promoting would re-parent them (R3)", origin, len(dependents), dependents)
 	}
 
+	// CORROBORATE THE INVENTORY BEFORE TRUSTING IT (GF2-fix3/B1-g).
+	//
+	// The migrating set is only as good as the snapshot listing it is computed
+	// from, and SnapshotListAll returns ([]*Snapshot, error) with no total, page
+	// token or completeness marker: a truncated-but-nil-error result is
+	// indistinguishable from a complete one, and an older UNOWNED snapshot missing
+	// from it is silently re-parented by pool.dataset.promote. "No error" is not
+	// completeness.
+	//
+	// So completeness is established POSITIVELY, from a second independent
+	// authoritative inventory: a fresh, dataset-scoped SnapshotList taken here,
+	// under the lock, through a different query shape than the pass's recursive
+	// parent walk. The two must agree EXACTLY on membership. They disagree when
+	// either listing was truncated, and they also disagree when the source
+	// dataset's snapshots changed since the pass — both are cases where the
+	// migration analysis would be made on a view that is not the live one, and
+	// both REFUSE. Promotion is a background, opt-in, always-retryable step; a
+	// skipped pass costs nothing and a wrong answer corrupts snapshot identity.
+	fresh, err := d.truenasClient.SnapshotList(ctx, sourceDataset)
+	if err != nil {
+		return nil, fmt.Sprintf("corroborating snapshot inventory for %s failed; refusing to promote on an unprovable migration set: %v", sourceDataset, err)
+	}
+	candidates, reason := corroboratedMigrationCandidates(snapshotsByDataset[sourceDataset], fresh, sourceDataset)
+	if reason != "" {
+		RecordClonePromoteRefused("uncorroborated_snapshot_inventory")
+		return nil, reason
+	}
+
 	// Determine the MIGRATING SET: promote moves the origin and every snapshot of
 	// the source dataset that is older-or-equal to it (P3).
-	migrating, reason := migratingSnapshots(snapshotsByDataset[sourceDataset], origin)
+	migrating, reason := migratingSnapshots(candidates, origin)
 	if reason != "" {
 		return nil, reason
 	}
@@ -274,6 +302,59 @@ func (d *Driver) promoteRestoredClone(
 	klog.Infof("GF2/E3: promoted clone-restored volume %s; origin snapshot %s pin released (%d snapshot(s) migrated, ledger re-keyed)",
 		datasetName, origin, len(migrating))
 	return migratedOldIDs, ""
+}
+
+// corroboratedMigrationCandidates cross-checks the reconcile pass's view of a
+// dataset's snapshots against a second, independently obtained authoritative
+// listing of the SAME dataset, and returns the snapshots the migration analysis
+// may be run on (GF2-fix3/B1-g).
+//
+// Neither listing can prove its own completeness — the backend returns a bare
+// slice with no total and no page token — so completeness is established the
+// only way an unmarked API allows: two inventories obtained through DIFFERENT
+// query shapes (a recursive parent walk vs. a dataset-scoped query) must agree
+// exactly on membership. A truncation in either one, in either direction, breaks
+// the agreement and REFUSES. The fresh listing is what is returned, because it is
+// the one taken under the lock.
+//
+// Any nil entry, any id that is not on this dataset, and an empty fresh listing
+// (the origin must be in it) are refusals too: each means the inventory the
+// promote would reason about is not the inventory that exists.
+func corroboratedMigrationCandidates(passView, fresh []*truenas.Snapshot, sourceDataset string) (candidates []*truenas.Snapshot, refusal string) {
+	freshIDs := make(map[string]struct{}, len(fresh))
+	candidates = make([]*truenas.Snapshot, 0, len(fresh))
+	for _, snap := range fresh {
+		if snap == nil {
+			return nil, fmt.Sprintf("the corroborating snapshot inventory for %s contains a nil entry; refusing to promote on an unprovable migration set", sourceDataset)
+		}
+		if snap.Dataset != sourceDataset {
+			return nil, fmt.Sprintf("the corroborating snapshot inventory for %s returned snapshot %s from another dataset; refusing to promote on an unprovable migration set", sourceDataset, snap.ID)
+		}
+		if _, dup := freshIDs[snap.ID]; dup {
+			return nil, fmt.Sprintf("the corroborating snapshot inventory for %s lists %s twice; refusing to promote on an unprovable migration set", sourceDataset, snap.ID)
+		}
+		freshIDs[snap.ID] = struct{}{}
+		candidates = append(candidates, snap)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Sprintf("the corroborating snapshot inventory for %s is empty although the pass observed %d snapshot(s) there; refusing to promote on an unprovable migration set", sourceDataset, len(passView))
+	}
+	seen := make(map[string]struct{}, len(passView))
+	for _, snap := range passView {
+		if snap == nil || snap.Dataset != sourceDataset {
+			continue
+		}
+		seen[snap.ID] = struct{}{}
+		if _, ok := freshIDs[snap.ID]; !ok {
+			return nil, fmt.Sprintf("snapshot %s was observed by this reconcile pass but is absent from the corroborating inventory of %s; refusing to promote on an unprovable migration set", snap.ID, sourceDataset)
+		}
+	}
+	for id := range freshIDs {
+		if _, ok := seen[id]; !ok {
+			return nil, fmt.Sprintf("snapshot %s is present on %s but was absent from this reconcile pass's inventory (a truncated or stale listing); refusing to promote on an unprovable migration set", id, sourceDataset)
+		}
+	}
+	return candidates, ""
 }
 
 // migratingSnapshots returns the snapshots ZFS will move onto the promoted clone

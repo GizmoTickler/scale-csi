@@ -837,13 +837,25 @@ func (d *Driver) countScheduledSnapshots(ctx context.Context, unowned []*truenas
 	}
 	// Zero extra calls for a deployment that never scheduled anything: without a
 	// single schema binding the count is necessarily zero, so the NAS timezone is
-	// never resolved. Otherwise it comes from the driver's TTL cache.
+	// never resolved. Otherwise it is ONE resolution for the whole pass.
 	if !scheduled {
 		return
 	}
 	zone := d.nasCivilZone(ctx)
+	if zone == nil {
+		return
+	}
 	for _, snap := range unowned {
-		if driverScheduledSnapshotProvenance(snap, datasetByPath[snap.Dataset], d.driverInstanceID(),
+		ds := datasetByPath[snap.Dataset]
+		// Same stored-vs-current zone comparison the delete path makes
+		// (GF2-fix3/B1-d), in the source-tolerant form this metrics-only call site
+		// is restricted to: a dataset whose recorded task timezone is missing or no
+		// longer the NAS's is not counted, so the gauge cannot claim ownership the
+		// delete path would refuse.
+		if datasetUserProperty(ds, PropSnapshotTaskTimezone) != zone.String() {
+			continue
+		}
+		if driverScheduledSnapshotProvenance(snap, ds, d.driverInstanceID(),
 			scheduledProvenanceOptions{requireLocalSource: false, requireTaskCorroboration: false, nasZone: zone}) {
 			report.ScheduledSnapshotCount++
 		}

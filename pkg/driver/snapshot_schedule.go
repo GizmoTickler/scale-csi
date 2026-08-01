@@ -54,6 +54,26 @@ const PropSnapshotNamingSchema = "truenas-csi:snapshot_naming_schema"
 // only once.
 const PropSnapshotTaskCorroboration = "truenas-csi:snapshot_task_corroboration"
 
+// PropSnapshotTaskTimezone records the IANA timezone name the NAS was configured
+// with at the moment this volume's periodic-snapshot task was created
+// (GF2-fix3/B1-d).
+//
+// A task renders %Y%m%d-%H%M%S from the NAS's civil clock, so proving a
+// task-created snapshot's name requires knowing WHICH clock. Reading only the
+// CURRENT zone cannot detect every reconfiguration — New_York -> Toronto, or a
+// switch to a fixed -05:00 evaluated against a winter-created snapshot, leaves
+// the civil fields identical — so the zone in force at task-creation time is
+// written down here and compared against the live value at delete time. Any
+// difference is then detectable regardless of whether the offsets coincide, and
+// the delete path fails CLOSED on a mismatch.
+//
+// It is WRITE-ONCE. A CreateVolume retry after a zone change must NOT re-stamp
+// it: overwriting would launder exactly the reconfiguration this property
+// exists to expose. It is read only through datasetLocalUserProperty, so a
+// clone, a replication-received dataset, or a detached copy that INHERITS it
+// proves nothing (the standing content-source rule).
+const PropSnapshotTaskTimezone = "truenas-csi:snapshot_task_timezone"
+
 // defaultSnapshotRetention bounds a scheduled task's snapshot lifetime when no
 // retention is configured, so an enabled schedule can never grow unbounded
 // snapshots (TrueNAS 26.0 retention is time-based only, P2/R6).
@@ -431,9 +451,31 @@ func (d *Driver) ensureSnapshotTask(ctx context.Context, dataset *truenas.Datase
 	}
 	// 1. Durable binding FIRST. Without it the driver could not later prove it
 	//    owns the task, nor prove the task's snapshots are its own.
-	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, map[string]string{
-		PropSnapshotNamingSchema: spec.namingSchema,
-	}); err != nil {
+	//
+	//    The binding is (schema, timezone) — see PropSnapshotTaskTimezone. The
+	//    zone the task renders its names from is as much a part of the ownership
+	//    proof as the nonce, so a task is NEVER created without it: an unreadable
+	//    zone here means the driver could never prove the resulting snapshots and
+	//    would wedge its own DeleteVolume behind the foreign guard. Failing the
+	//    ensure (never the volume) is the fail-closed direction.
+	binding := map[string]string{PropSnapshotNamingSchema: spec.namingSchema}
+	// WRITE-ONCE: only stamp the zone when this dataset does not already carry a
+	// locally-sourced one. Re-stamping on a CreateVolume retry that happens to
+	// follow a NAS timezone change would overwrite the very evidence the delete
+	// path uses to detect that change.
+	if recorded := datasetLocalUserProperty(dataset, PropSnapshotTaskTimezone); recorded == "" {
+		zone := d.nasCivilZone(ctx)
+		if zone == nil {
+			d.recordSnapshotTaskWarning(req, volumeID,
+				"could not read the NAS timezone (system.general.config); no periodic-snapshot task was created, because its snapshots could not later be proven")
+			return
+		}
+		binding[PropSnapshotTaskTimezone] = zone.String()
+	}
+	// An already-recorded zone is left ALONE and costs zero extra calls: the
+	// delete path is where stored-vs-current is compared and where a
+	// reconfiguration must fail closed.
+	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, binding); err != nil {
 		d.recordSnapshotTaskWarning(req, volumeID,
 			fmt.Sprintf("could not stamp the periodic-snapshot binding (no task was created): %v", err))
 		return
@@ -541,21 +583,64 @@ func (d *Driver) deleteVolumeSnapshotTask(ctx context.Context, dataset *truenas.
 		return ""
 	}
 	corroboratingTaskSchema = task.NamingSchema
-	// Persist the observation BEFORE destroying the evidence, so a retry of a
-	// DeleteVolume that fails later (share or dataset delete) is not wedged.
-	// A write failure is not fatal: this attempt saw the task with its own eyes.
-	if datasetLocalUserProperty(dataset, PropSnapshotTaskCorroboration) != schema {
-		if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, map[string]string{
-			PropSnapshotTaskCorroboration: schema,
-		}); err != nil {
-			klog.Warningf("Failed to record the periodic-snapshot task corroboration for volume dataset %s (a retry of this delete may refuse until the volume's snapshots are removed): %v", datasetName, err)
-		}
+	// DURABLE RECORD BEFORE THE EVIDENCE IS DESTROYED (GF2-fix3/B1-e).
+	//
+	// The task is the only live proof that something on this dataset was minting
+	// snapshots under this schema, and this call is about to delete it. If the
+	// record does not land, a LATER failure in this same DeleteVolume (share or
+	// dataset delete) leaves the next attempt with neither a task nor a
+	// corroboration: it would classify the driver's OWN snapshots as foreign and
+	// return FailedPrecondition forever. Round 2 logged that write failure and
+	// deleted the task anyway, which defeats the entire reason the property
+	// exists.
+	//
+	// So: write it, VERIFY it with a source-bearing re-read (an ambiguous
+	// "succeeded remotely but returned an error" is exactly the case an assumed
+	// write gets wrong, in both directions), and delete the task ONLY when the
+	// record is provably durable. When it is not, the task SURVIVES — which is
+	// what keeps a retry decidable, because the retry will observe it alive
+	// again. This attempt still proceeds on its own first-hand observation.
+	if !d.recordSnapshotTaskCorroboration(ctx, dataset, datasetName, schema) {
+		return corroboratingTaskSchema
 	}
 	if err := d.truenasClient.SnapshotTaskDelete(ctx, task.ID); err != nil {
 		klog.Warningf("Failed to delete periodic-snapshot task %d for volume dataset %s (continuing; the sweep will retire it): %v", task.ID, datasetName, err)
 		RecordScheduledSnapshotTaskDeleteFailed()
 	}
 	return corroboratingTaskSchema
+}
+
+// recordSnapshotTaskCorroboration durably records, and then VERIFIES, that this
+// driver observed its own live task with this schema on this dataset. It reports
+// whether the record is provably in place; false means the caller must NOT
+// destroy the task it just observed.
+func (d *Driver) recordSnapshotTaskCorroboration(ctx context.Context, dataset *truenas.Dataset, datasetName, schema string) bool {
+	if datasetLocalUserProperty(dataset, PropSnapshotTaskCorroboration) == schema {
+		return true
+	}
+	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, map[string]string{
+		PropSnapshotTaskCorroboration: schema,
+	}); err != nil {
+		klog.Warningf("Failed to record the periodic-snapshot task corroboration for volume dataset %s; KEEPING the task so a retry of this delete can still observe it: %v", datasetName, err)
+		RecordScheduledSnapshotTaskDeleteFailed()
+		return false
+	}
+	// Verify rather than assume. DatasetGet is the source-bearing read, so this
+	// also proves the value landed LOCALLY (an inherited value would prove
+	// nothing on a retry, which reads it through datasetLocalUserProperty).
+	verified, err := d.truenasClient.DatasetGet(ctx, datasetName)
+	if err != nil {
+		klog.Warningf("Could not verify the periodic-snapshot task corroboration for volume dataset %s; KEEPING the task so a retry of this delete can still observe it: %v", datasetName, err)
+		RecordScheduledSnapshotTaskDeleteFailed()
+		return false
+	}
+	if datasetLocalUserProperty(verified, PropSnapshotTaskCorroboration) != schema {
+		klog.Warningf("The periodic-snapshot task corroboration for volume dataset %s did not read back as a local %s=%q; KEEPING the task so a retry of this delete can still observe it",
+			datasetName, PropSnapshotTaskCorroboration, schema)
+		RecordScheduledSnapshotTaskDeleteFailed()
+		return false
+	}
+	return true
 }
 
 // scheduledProvenanceOptions selects how strict the provenance predicate is for
@@ -714,45 +799,73 @@ func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *tr
 	return foreign
 }
 
-// nasCivilZoneTTL bounds how long the driver trusts its cached copy of the NAS
-// timezone. It is shorter than nothing-at-all and longer than any RPC: the
-// background reconcile pass refreshes it, so the CSI hot paths normally read a
-// warm value and issue ZERO extra calls.
-const nasCivilZoneTTL = time.Hour
-
-// nasCivilZone returns the NAS's civil timezone — the clock a periodic-snapshot
-// task renders its %Y%m%d-%H%M%S names from (GF2-fix2/B1-a).
+// nasCivilZone returns the NAS's CURRENT civil timezone — the clock a
+// periodic-snapshot task renders its %Y%m%d-%H%M%S names from (GF2-fix2/B1-a).
 //
-// CALL BUDGET. The value is cached on the Driver for nasCivilZoneTTL and warmed
-// at controller startup (warmNASCivilZone) and on every reconcile pass, so no
-// CSI RPC pays a round trip for it in steady state. It is also resolved ONLY for
-// volumes that actually carry a periodic-snapshot binding, so an unscheduled
-// deployment never calls it at all.
+// NO DRIVER-LEVEL CACHE (GF2-fix3/B1-a). Round 2 memoized this on the Driver
+// behind a one-hour TTL that nothing could invalidate: a reconnect dropped only
+// the truenas.Client's copy, so a zone reconfiguration — or a lookup that would
+// now FAIL — was bypassed for the rest of the TTL while the stale zone kept
+// authorizing deletes. Every call now goes to truenas.Client.SystemTimezone,
+// whose cache IS dropped on reconnect, never caches an error, and is bounded by
+// the deliberately short systemTimezoneTTL.
+//
+// CALL BUDGET. This is resolved ONLY for a volume that actually carries a
+// periodic-snapshot binding, so an unscheduled deployment — the default — never
+// calls it at all. A scheduled volume pays at most one system.general.config
+// round trip per client-cache expiry, on a path that already makes ~9 calls.
 //
 // FAIL CLOSED. A nil return (with the error logged) means every candidate
 // scheduled snapshot is treated as FOREIGN and preserved — the same direction as
 // a missing corroborating task. Guessing UTC here would silently misclassify
 // every snapshot on a non-UTC NAS, in the deleting direction.
 func (d *Driver) nasCivilZone(ctx context.Context) *time.Location {
-	d.nasZoneMu.RLock()
-	if d.nasZone != nil && time.Since(d.nasZoneAt) < nasCivilZoneTTL {
-		cached := d.nasZone
-		d.nasZoneMu.RUnlock()
-		return cached
-	}
-	d.nasZoneMu.RUnlock()
-
 	zone, err := d.truenasClient.SystemTimezone(ctx)
 	if err != nil || zone == nil {
 		klog.Warningf("Could not read the NAS timezone (system.general.config); driver-scheduled snapshots cannot be proven and will be preserved as foreign: %v", err)
 		RecordNASTimezoneUnresolved()
 		return nil
 	}
-	d.nasZoneMu.Lock()
-	d.nasZone = zone
-	d.nasZoneAt = time.Now()
-	d.nasZoneMu.Unlock()
 	return zone
+}
+
+// scheduledSnapshotZone resolves the zone a volume's scheduled snapshot names
+// must be proven in, and is the ONLY zone source the delete path may use
+// (GF2-fix3/B1-d).
+//
+// WHY A STORED ZONE. Reading only the CURRENT zone cannot detect every timezone
+// reconfiguration: America/New_York -> America/Toronto, or a switch to a fixed
+// -05:00 for a winter-created snapshot, leaves the civil fields identical, so a
+// name minted under the old configuration still "agrees" and stays deletable.
+// ensureSnapshotTask therefore records the IANA zone that was in force when the
+// TASK was created, durably, on the volume's own dataset, WRITE-ONCE. Comparing
+// stored-vs-current makes the FACT of a reconfiguration detectable whether or
+// not the offsets happen to coincide.
+//
+// FAIL CLOSED on: no locally-sourced stored zone (a clone/received/detached copy
+// inherits the property non-locally and is rejected by datasetLocalUserProperty,
+// exactly like the corroboration and ownership stamps); an unreadable current
+// zone; or any difference between the two. A nil return makes every candidate
+// snapshot FOREIGN, i.e. preserved.
+func (d *Driver) scheduledSnapshotZone(ctx context.Context, dataset *truenas.Dataset, datasetName string) *time.Location {
+	stored := datasetLocalUserProperty(dataset, PropSnapshotTaskTimezone)
+	if stored == "" {
+		klog.Warningf("Volume dataset %s carries no locally-recorded %s; its scheduled snapshots cannot be proven and will be preserved as foreign",
+			datasetName, PropSnapshotTaskTimezone)
+		RecordNASTimezoneUnresolved()
+		return nil
+	}
+	current := d.nasCivilZone(ctx)
+	if current == nil {
+		return nil
+	}
+	if current.String() != stored {
+		klog.Warningf("Volume dataset %s recorded NAS timezone %q when its periodic-snapshot task was created but the NAS now reports %q; the snapshot names cannot be proven under a reconfigured clock and will be preserved as foreign",
+			datasetName, stored, current.String())
+		RecordNASTimezoneUnresolved()
+		return nil
+	}
+	return current
 }
 
 // scheduledSnapshotsConfigured reports whether this controller has any
@@ -798,13 +911,12 @@ func (d *Driver) sweepStrandedSnapshotTasks(ctx context.Context, datasets []*tru
 		return
 	}
 
-	// Warm the NAS civil-timezone cache off the CSI hot path (GF2-fix2/B1-a).
-	// This gate — controller-wide schedule OR any dataset carrying a schema
-	// binding — is exactly the population whose DeleteVolume will need the zone,
-	// and it covers the per-StorageClass-only deployment that
-	// scheduledSnapshotsConfigured alone would miss. A deployment that never
-	// scheduled anything still issues zero calls.
-	d.nasCivilZone(ctx)
+	// NOTE (GF2-fix3/B1-a): round 2 warmed the driver's NAS-timezone cache here.
+	// There is no driver cache any more, and the client's is deliberately far
+	// shorter than the reconcile interval, so a "warm" call from this pass could
+	// never actually serve a later CSI RPC — it was an API call that bought
+	// nothing and a comment that overstated what the hot path pays. DeleteVolume
+	// resolves the zone itself, for scheduled volumes only.
 
 	tasks, err := d.truenasClient.SnapshotTaskListByParent(ctx, d.parentDatasetName())
 	if err != nil {

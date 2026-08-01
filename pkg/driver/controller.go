@@ -1129,12 +1129,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// The NAS's civil timezone is the clock a periodic-snapshot task renders its
 	// names from, so proving those names needs it (GF2-fix2/B1-a). Resolved ONLY
 	// for a volume that actually carries a task binding — an unscheduled volume,
-	// and therefore the default path, never asks — and served from the driver's
-	// TTL cache that the reconcile pass keeps warm, so this is not a
-	// per-DeleteVolume round trip. nil (unreadable) fails closed.
+	// and therefore the default path, never asks. It is the zone RECORDED when the
+	// task was created, confirmed to still be the NAS's live zone
+	// (GF2-fix3/B1-d): a missing record, an unreadable live zone, or any
+	// difference between the two returns nil and fails closed.
 	var scheduledZone *time.Location
 	if scheduledTaskSchema != "" {
-		scheduledZone = d.nasCivilZone(ctx)
+		scheduledZone = d.scheduledSnapshotZone(ctx, ds, datasetName)
 	}
 
 	foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
@@ -1243,21 +1244,15 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 				return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", delErr)
 			}
 		case snapErr != nil:
-			// When snapshot state cannot be verified, fail safe unless the operator
-			// explicitly allowed destructive cleanup of foreign snapshots.
-			if !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"cannot verify snapshots for volume %s; refusing recursive delete: %v", volumeID, snapErr)
-			}
-			klog.V(4).Infof("Could not list snapshots for %s (%v), trying recursive delete", volumeID, snapErr)
-			if delErr := d.recursiveDatasetDeleteWithHoldRecovery(ctx, datasetName); delErr != nil {
-				klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, delErr)
-				if isDatasetDependencyOrBusyError(delErr) {
-					return nil, status.Errorf(codes.FailedPrecondition,
-						"volume %s has dependent snapshot clones that must be deleted first: %v", volumeID, delErr)
-				}
-				return nil, status.Errorf(codes.Internal, "failed to delete volume: %v", delErr)
-			}
+			// UNCONDITIONALLY fail closed (GF2-fix3/B1-f). An error is not evidence
+			// of absence, and destroyForeignSnapshotsOnDelete does not authorize a
+			// BLIND recursive destroy: the opt-in means "you may destroy the foreign
+			// snapshots I have seen and classified", not "destroy whatever is there
+			// when the listing fails". Round 2 still recursed here for opted-in
+			// operators, which could take out snapshots nothing ever classified.
+			// A retry once the backend answers again is always available.
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot verify snapshots for volume %s; refusing recursive delete (this refusal is not affected by zfs.destroyForeignSnapshotsOnDelete — an unreadable snapshot list is not evidence that there is nothing to destroy): %v", volumeID, snapErr)
 		default:
 			if !hadSnapshotsBeforeInternalCleanup {
 				// No snapshots, but non-recursive delete still failed - preserve the
