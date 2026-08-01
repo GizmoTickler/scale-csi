@@ -252,6 +252,41 @@ func TestSnapshotOfABlockVolumeCapturesItsGeometry(t *testing.T) {
 		"and the physical half, because a half record is refused on restore")
 }
 
+// TestGuardRequestAgainstEvidence unit-tests the choke point's own
+// request-vs-evidence check.
+//
+// HONESTY NOTE: this one is DEFENCE IN DEPTH, and it is tested directly because
+// it cannot be revert-proved end to end. Deleting the call from
+// resolveExtentGeometry leaves the whole suite green, because every reachable
+// conflict today is also caught earlier — by guardStoredBlockGeometry on a
+// stamped volume and by guardCloneSourceGeometry on a clone source. It exists so
+// that the rule "a request is intent, never evidence" holds AT the one place an
+// extent is created, rather than only at the places that currently happen to
+// reach it. Do not read the green suite as proof that it is load-bearing.
+func TestGuardRequestAgainstEvidence(t *testing.T) {
+	evidence := blockGeometry{
+		knowledge: geometryKnown, blocksize: intPtr(4096), pblocksize: boolPtr(true),
+		provenance: "the volume's recorded geometry stamp",
+	}
+	assert.NoError(t, guardRequestAgainstEvidence(nil, evidence, "pool/parent/pvc"))
+	assert.NoError(t, guardRequestAgainstEvidence(
+		&blockOpts{iscsiBlocksize: intPtr(4096), iscsiPblocksize: boolPtr(true)}, evidence, "pool/parent/pvc"),
+		"a request that AGREES with the evidence is not a conflict")
+	assert.NoError(t, guardRequestAgainstEvidence(&blockOpts{iscsiQueuedCommands: intPtr(128)}, evidence, "pool/parent/pvc"),
+		"a request with no geometry opinion has nothing to contradict")
+
+	err := guardRequestAgainstEvidence(&blockOpts{iscsiBlocksize: intPtr(512)}, evidence, "pool/parent/pvc")
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), paramISCSIBlocksize)
+	assert.Contains(t, status.Convert(err).Message(), evidence.provenance,
+		"the refusal must name the evidence it is deferring to")
+
+	err = guardRequestAgainstEvidence(&blockOpts{iscsiPblocksize: boolPtr(false)}, evidence, "pool/parent/pvc")
+	require.Error(t, err)
+	assert.Contains(t, status.Convert(err).Message(), paramISCSIPblocksize)
+}
+
 // foreignExtentClient makes ISCSIExtentCreate behave the way the TrueNAS client
 // does on an ambiguous "already exists"/"invalid params": it returns an EXISTING
 // object found by name instead of the one that was asked for.
