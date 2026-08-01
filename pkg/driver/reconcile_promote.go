@@ -41,10 +41,21 @@ import (
 //	B2 — for each tombstone in the migrating set, the ledger entry is RE-KEYED to
 //	     the post-promote ID *before* the promote, so the reaper's provenance
 //	     follows the snapshot instead of being retired as "already gone".
+//
+// GF2-fix2 supplies the missing third of that inventory. listAllManagedSnapshots
+// partitions the parent's snapshots into CSI snapshots, tombstones and UNOWNED
+// (foreign snapshots plus this driver's own task-created scheduled snapshots,
+// which carry no CSI properties). The unowned bucket was DROPPED at this call
+// site, so H1 analyzed an incomplete migration set while pool.dataset.promote
+// moves every older-or-equal snapshot regardless of who owns it. An unowned
+// snapshot could migrate onto the restored clone unseen, where it is stranded
+// under the wrong volume — or destroyed with it once
+// destroyForeignSnapshotsOnDelete is enabled. All three buckets are now indexed
+// and promoteRestoredClone refuses when any unowned snapshot would migrate.
 func (d *Driver) reconcilePromoteRestoredClones(
 	ctx context.Context,
 	datasets []*truenas.Dataset,
-	snapshots, tombstones []*truenas.Snapshot,
+	snapshots, tombstones, unowned []*truenas.Snapshot,
 	ledger map[string]tombstoneLedgerEntry,
 	report *ReconcileReport,
 ) {
@@ -52,17 +63,15 @@ func (d *Driver) reconcilePromoteRestoredClones(
 		return
 	}
 
-	// Index every snapshot the pass observed by its dataset, so the migrating-set
-	// analysis needs no extra listing.
+	// Index every snapshot the pass observed by its dataset — ALL THREE buckets,
+	// because ZFS migrates by createtxg, not by ownership — so the migrating-set
+	// analysis needs no extra listing and can never be silently partial.
 	byDataset := make(map[string][]*truenas.Snapshot)
-	for _, snap := range snapshots {
-		if snap != nil {
-			byDataset[snap.Dataset] = append(byDataset[snap.Dataset], snap)
-		}
-	}
-	for _, snap := range tombstones {
-		if snap != nil {
-			byDataset[snap.Dataset] = append(byDataset[snap.Dataset], snap)
+	for _, bucket := range [][]*truenas.Snapshot{snapshots, tombstones, unowned} {
+		for _, snap := range bucket {
+			if snap != nil {
+				byDataset[snap.Dataset] = append(byDataset[snap.Dataset], snap)
+			}
 		}
 	}
 
@@ -198,10 +207,25 @@ func (d *Driver) promoteRestoredClone(
 	// H1: refuse when a live CSI VolumeSnapshot would migrate. Its backend ID
 	// would change under Kubernetes' feet: SnapshotGet(old id) 404s, so
 	// DeleteSnapshot would report SUCCESS while the snapshot persists forever.
+	//
+	// GF2-fix2: the same refusal now covers UNOWNED snapshots — foreign ones and
+	// the driver's own task-created scheduled snapshots. Migrating either is
+	// destructive of meaning: a foreign snapshot lands under a volume its owner
+	// never picked (and is destroyed with it if destroyForeignSnapshotsOnDelete is
+	// on), and a scheduled snapshot's name stops proving out against the new
+	// dataset's leaf and schema, permanently wedging the clone's own DeleteVolume
+	// behind the foreign guard. Tombstones are the only non-CSI class that may
+	// migrate, because their ledger provenance is explicitly re-keyed below.
 	for _, snap := range migrating {
-		if isCSISnapshot(snap) {
+		switch {
+		case isCSISnapshot(snap):
 			RecordClonePromoteRefused("live_csi_snapshot_would_migrate")
 			return nil, fmt.Sprintf("promote would migrate live CSI snapshot %s off %s (its backend id would change)", snap.ID, sourceDataset)
+		case isSnapshotTombstone(snap):
+			// Provenance is carried across the id migration below.
+		default:
+			RecordClonePromoteRefused("unowned_snapshot_would_migrate")
+			return nil, fmt.Sprintf("promote would migrate non-CSI snapshot %s off %s (it would be stranded under the promoted volume, or destroyed with it when destroyForeignSnapshotsOnDelete is enabled)", snap.ID, sourceDataset)
 		}
 	}
 

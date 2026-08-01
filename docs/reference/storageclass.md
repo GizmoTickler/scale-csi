@@ -48,17 +48,50 @@ binding), its id is stamped after, and it is removed at `DeleteVolume`.
 
 **There is no `snapshotNamingSchema` parameter, by design.** Task-created
 snapshots carry no CSI user properties (TrueNAS 26.0 cannot add properties to an
-existing snapshot), so the naming schema is the driver's ONLY ownership proof for
-them. The driver therefore mints the schema itself as
+existing snapshot), so their provenance has to be assembled from durable state
+the driver controls. The driver therefore mints the schema itself as
 `csi-<volume>-<16-hex nonce>-%Y%m%d-%H%M%S`. A snapshot is treated as
-driver-owned — and therefore deleted with the volume rather than protected by the
-foreign-snapshot guard — only when it sits on the volume's own dataset, that
-dataset carries this driver instance's local ownership stamp and a schema the
-driver's own algorithm re-derives byte-for-byte for this volume, and the
-snapshot's name is a complete rendering of that schema (same nonce, full strftime
-expansion). Anything else stays FOREIGN and is preserved by the default policy:
-an operator snapshot named `csi-preupgrade`, a box-wide task using a `csi-`
-schema, or a replication-inherited name is never destroyed by the driver.
+driver-created — and therefore deleted with the volume rather than protected by
+the foreign-snapshot guard — only when ALL of the following hold:
+
+1. it sits on the volume's own dataset;
+2. that dataset carries this driver instance's LOCAL ownership stamp;
+3. that dataset carries a schema the driver's own algorithm re-derives
+   byte-for-byte for this volume (nonce and all);
+4. a driver-minted, non-recursive periodic-snapshot task carrying exactly that
+   schema is observed alive on exactly that dataset at delete time (or was
+   recorded alive by an earlier attempt of the same delete);
+5. the snapshot's name is a complete, CANONICAL rendering of that schema whose
+   timestamp is a real calendar instant; and
+6. that instant agrees with the snapshot's actual `creation` property.
+
+Anything else stays FOREIGN and is preserved by the default policy: an operator
+snapshot named `csi-preupgrade`, a box-wide task using a `csi-` schema, a
+replication-inherited name, a name with an impossible date, a non-canonical
+volume segment, or a name whose timestamp does not match when the snapshot was
+really taken.
+
+> **Trust boundary — stated plainly.** These checks do NOT establish "a snapshot
+> this driver did not create cannot be deleted", and no claim to that effect
+> should be made anywhere. The naming schema is READABLE by anyone who can read
+> the dataset property or run `pool.snapshottask.query`, and TrueNAS 26.0 can
+> neither stamp a user property on an existing snapshot nor attribute a snapshot
+> to the task that made it. An actor with pool-write access on the CSI parent can
+> therefore construct a snapshot indistinguishable from a task-created one — it
+> need only carry the exact schema rendering and be created at the second its
+> name encodes. **Storage-administrator access to `zfs.parentDataset` is a
+> trusted boundary for this feature.** What the checks do guarantee is that no
+> snapshot outside that trust boundary — an unrelated task, a replication
+> stream, a clone-inherited property, a `csi-`-prefixed operator snapshot,
+> another volume's schema, another driver instance — is ever destroyed as if the
+> driver had made it.
+>
+> One further honest caveat on the timestamp check: the task renders the name in
+> the NAS's LOCAL civil time while `creation` is UTC epoch seconds, and the
+> driver does not know the NAS's timezone. Agreement is therefore required only
+> modulo the 15-minute quantum of civil UTC offsets, within ±2 minutes — a window
+> that roughly 27% of arbitrary timestamps satisfy by chance. It forces a forged
+> name to be created at (near) the right second; it is not a proof of authorship.
 
 Retention is TIME-based only — TrueNAS 26.0 exposes no
 count cap — so an empty `snapshotRetention` resolves to a 30d safety bound and

@@ -551,9 +551,16 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 }
 
 // SnapshotList lists snapshots for a dataset.
+//
+// It requests the SAME explicit property projection as every other read path
+// (used + creation) rather than leaving `properties` unset. DeleteVolume's
+// scheduled-snapshot ownership predicate requires the `creation` property and
+// fails CLOSED without it (GF2-fix2/B1-a), so this call must not depend on the
+// server's default projection for a property the driver's safety decision reads.
+// No extra round trip: same call, narrower payload.
 func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
 	if c.hasSnapshotResourceQuery(ctx) {
-		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, nil)
+		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, []string{"used", "creation"})
 		if err != nil {
 			return nil, fmt.Errorf("failed to list snapshots: %w", err)
 		}

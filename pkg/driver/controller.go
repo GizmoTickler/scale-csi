@@ -1116,9 +1116,17 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// so it cannot keep minting snapshots that make the next attempt refuse again
 	// — a self-sustaining wedge. Best-effort and never fatal; a repeated
 	// DeleteVolume simply finds no task.
-	d.deleteVolumeSnapshotTask(ctx, ds, datasetName, volumeID)
+	//
+	// It returns the CORROBORATING task schema (GF2-fix2/B1): the ownership
+	// predicate requires a live driver-minted task on this exact dataset, and
+	// this is the last moment such a task can be observed. An empty value makes
+	// every unlabeled snapshot foreign, so a repeated DeleteVolume that finds no
+	// task refuses rather than destroying — the safe direction. A volume whose
+	// snapshots the driver really did schedule is deleted on the FIRST attempt,
+	// while the task is still there.
+	scheduledTaskSchema := d.deleteVolumeSnapshotTask(ctx, ds, datasetName, volumeID)
 
-	foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds)
+	foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema)
 	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(foreignSnapshots) > 0 {
 		klog.Infof("Volume %s has non-CSI snapshots and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion", volumeID)
 		return nil, status.Errorf(codes.FailedPrecondition,
@@ -1209,7 +1217,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// and never respect the foreign-preserve policy (R4); only genuinely
 			// foreign snapshots are preserved by default (recursive deletion of
 			// them is an explicit operator opt-in).
-			foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds)
+			foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema)
 			if len(foreignSnapshots) > 0 && !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)

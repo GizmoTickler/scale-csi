@@ -31,15 +31,28 @@ removal-only configmap render + a render-assert in the same commit.
   driver owns ONE non-recursive `pool.snapshottask` per scheduled volume dataset
   with bounded TIME-based retention (`snapshotRetention`, default 30d safety
   bound; 26.0 has no count cap and `pool.snapshottask.run` is broken, so it is
-  never called). Task-created snapshots carry no CSI props and are recognized as
-  driver-owned ONLY through a complete ownership chain: the snapshot sits on the
+  never called). Task-created snapshots carry no CSI props and are treated as
+  driver-created ONLY through a complete chain: the snapshot sits on the
   volume's own dataset, that dataset carries this instance's local ownership
   stamp plus a naming schema the driver's own algorithm re-derives byte-for-byte
   for this volume (`csi-<volume>-<16-hex nonce>-%Y%m%d-%H%M%S`, minted by the
-  driver — there is deliberately no caller-chosen `snapshotNamingSchema`), and
-  the snapshot's name is a complete rendering of that schema. Proven snapshots are
-  excluded from the foreign guard and deleted with the volume; anything
-  unprovable stays FOREIGN and is preserved. Counted in
+  driver — there is deliberately no caller-chosen `snapshotNamingSchema`), a
+  driver-minted non-recursive task carrying exactly that schema is observed alive
+  on exactly that dataset, the snapshot's name is a complete CANONICAL rendering
+  of that schema encoding a real calendar instant, and that instant agrees with
+  the snapshot's actual `creation` property. Snapshots that pass are excluded
+  from the foreign guard and deleted with the volume; anything unprovable stays
+  FOREIGN and is preserved.
+  **Documented trust boundary:** this chain does NOT establish "a snapshot the
+  driver did not create cannot be deleted". The schema is readable through
+  `pool.snapshottask.query` and TrueNAS 26.0 can neither stamp a property on an
+  existing snapshot nor attribute one to its task, so an actor with pool-write
+  access on the CSI parent can still construct an indistinguishable snapshot.
+  Storage-administrator access to `zfs.parentDataset` is trusted; everything
+  outside it (other tasks, replication, clone-inherited properties, `csi-`
+  prefixed operator snapshots, other volumes' schemas, other driver instances) is
+  provably never destroyed as driver-owned. See `docs/reference/storageclass.md`.
+  Counted in
   `scale_csi_scheduled_snapshots` (never an orphan/delete candidate). The schema
   binding is stamped BEFORE the task is created, so a task can never outlive its
   binding, and the orphan reconcile sweeps tasks whose dataset is gone.
@@ -57,9 +70,14 @@ removal-only configmap render + a render-assert in the same commit.
   operation locks immediately before the call: a fresh source-bearing dataset
   read (the reconcile listing carries no property source), the AUTHORITATIVE
   per-snapshot dependent-clone query (which sees unmanaged clones the managed
-  listing never contained), a refusal if any OTHER live CSI VolumeSnapshot would
-  migrate, and a RE-KEY of every migrating tombstone's ledger entry to its
-  post-promote ID before the promote so provenance follows the snapshot. Metrics:
+  listing never contained), a refusal if any OTHER live CSI VolumeSnapshot — or
+  any non-CSI snapshot at all — would migrate, and a RE-KEY of every migrating
+  tombstone's ledger entry to its post-promote ID before the promote so
+  provenance follows the snapshot. The migration set is computed from ALL three
+  buckets of the pass's snapshot partition (CSI snapshots, tombstones AND
+  unowned), because ZFS migrates by `createtxg` and not by ownership; the only
+  class allowed to migrate is a tombstone, whose provenance is explicitly
+  re-keyed. Metrics:
   `scale_csi_clones_promoted_total{status}`,
   `scale_csi_clone_promotes_refused_total{reason}`.
 - **E4 — Quota/usage reporting (`zfs.reportVolumeUsage`).** ControllerGetVolume

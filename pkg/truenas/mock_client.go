@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -59,6 +60,12 @@ type MockClient struct {
 	// FailUserPropertyKeys makes DatasetSetUserProperties fail for these exact
 	// property keys (test hook for binding-write failures).
 	FailUserPropertyKeys map[string]struct{}
+
+	// FailDatasetDelete makes DatasetDelete fail for these exact dataset names
+	// with a non-dependency backend error, so a test can model a DeleteVolume
+	// that fails AFTER its earlier best-effort cleanup steps already ran and must
+	// then be retried.
+	FailDatasetDelete map[string]struct{}
 
 	// Error injection
 	InjectError error
@@ -416,6 +423,9 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 
 	if m.InjectError != nil {
 		return m.InjectError
+	}
+	if _, fail := m.FailDatasetDelete[name]; fail {
+		return &APIError{Code: -1, Message: "injected dataset delete failure"}
 	}
 	originPrefix := name + "@"
 	for _, dataset := range m.Datasets {
@@ -1017,6 +1027,102 @@ func (m *MockClient) SnapshotTaskCreate(ctx context.Context, params *SnapshotTas
 	m.SnapshotTasks[task.ID] = task
 	m.nextSnapshotTaskID++
 	return task, nil
+}
+
+// FireSnapshotTasks models the TrueNAS middleware taking the snapshots its
+// enabled periodic-snapshot tasks are due for, at wall-clock instant `at` in
+// `zone` (the NAS's local timezone — pass nil for UTC).
+//
+// It exists so a test can obtain a task-created snapshot the way production
+// obtains one, instead of hand-writing a name with the driver's own rendering
+// helper and then asserting the driver accepts it (which asserts nothing). The
+// strftime expansion here is the MOCK's own, deliberately independent of
+// pkg/driver's schema algorithm: if the driver's rendering and its verification
+// ever drift apart, this is what notices.
+//
+// It also models the split the driver cannot see through: the NAME is rendered
+// from LOCAL civil time while the `creation` property is UTC epoch seconds.
+func (m *MockClient) FireSnapshotTasks(ctx context.Context, at time.Time, zone *time.Location) ([]*Snapshot, error) {
+	if zone == nil {
+		zone = time.UTC
+	}
+	m.mu.RLock()
+	due := make([]*SnapshotTask, 0, len(m.SnapshotTasks))
+	for _, task := range m.SnapshotTasks {
+		if task != nil && task.Enabled {
+			due = append(due, task)
+		}
+	}
+	m.mu.RUnlock()
+	sort.Slice(due, func(i, j int) bool { return due[i].ID < due[j].ID })
+
+	created := make([]*Snapshot, 0, len(due))
+	for _, task := range due {
+		name := expandStrftimeNamingSchema(task.NamingSchema, at.In(zone))
+		snap, err := m.SnapshotCreate(ctx, task.Dataset, name, nil)
+		if err != nil {
+			return created, err
+		}
+		m.SetSnapshotCreationTime(snap.ID, at.Unix())
+		created = append(created, snap)
+	}
+	return created, nil
+}
+
+// expandStrftimeNamingSchema expands the strftime directives TrueNAS supports in
+// a periodic-snapshot task naming schema. Written from the strftime spec rather
+// than from the driver's schema constants on purpose (see FireSnapshotTasks).
+func expandStrftimeNamingSchema(schema string, at time.Time) string {
+	replacements := []struct{ directive, layout string }{
+		{"%Y", "2006"},
+		{"%m", "01"},
+		{"%d", "02"},
+		{"%H", "15"},
+		{"%M", "04"},
+		{"%S", "05"},
+	}
+	var out strings.Builder
+	for i := 0; i < len(schema); {
+		if schema[i] == '%' && i+1 < len(schema) {
+			directive := schema[i : i+2]
+			expanded := false
+			for _, r := range replacements {
+				if directive == r.directive {
+					out.WriteString(at.Format(r.layout))
+					expanded = true
+					break
+				}
+			}
+			if expanded {
+				i += 2
+				continue
+			}
+		}
+		out.WriteByte(schema[i])
+		i++
+	}
+	return out.String()
+}
+
+// SetSnapshotCreationTime is a test helper that sets a snapshot's `creation`
+// property to a specific UTC epoch second, in the exact wire shape TrueNAS 26.0
+// returns from zfs.resource.snapshot.query (see
+// pkg/truenas/testdata/snapshot-resource-26.0.json).
+func (m *MockClient) SetSnapshotCreationTime(snapshotID string, creationUnix int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snap, ok := m.Snapshots[snapshotID]
+	if !ok {
+		return
+	}
+	if snap.Properties == nil {
+		snap.Properties = make(map[string]interface{})
+	}
+	snap.Properties["creation"] = map[string]interface{}{
+		"value": float64(creationUnix),
+		"raw":   strconv.FormatInt(creationUnix, 10),
+	}
 }
 
 func (m *MockClient) SnapshotTaskListByDataset(ctx context.Context, dataset string) ([]*SnapshotTask, error) {

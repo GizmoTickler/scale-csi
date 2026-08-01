@@ -312,6 +312,8 @@ mode) is property-backed — see the CHAP properties below.
 | `truenas-csi:tombstone_*` | Deferred-delete tombstone ledger. The property key is a hash of the tombstone snapshot ID; v2 stores the snapshot's `CreateTXG` in the entry as an extra immutable identity predicate (degrading to the v1 full-ID + creation-seconds check when TXG is unavailable). v1 entries remain readable |
 | `truenas-csi:publication_*` | Durable per-volume publication records (see fencing, below) |
 | `truenas-csi:internal_resource` | Marks internal temporary snapshots used by volume-to-volume cloning so they are excluded from `ListSnapshots` (it does **not** mark the `.csi-bookkeeping` dataset — that is identified by its reserved leaf name) |
+| `truenas-csi:snapshot_naming_schema` / `truenas-csi:snapshot_task_id` | The driver-minted strftime naming schema bound to a scheduled volume's periodic-snapshot task, and that task's id (GF2/E2) |
+| `truenas-csi:snapshot_task_corroboration` | Records that this driver instance observed its OWN live, dataset-scoped task carrying that schema, written just before the task is deleted so a RETRIED `DeleteVolume` can still recognize the volume's scheduled snapshots instead of wedging behind the foreign guard |
 
 **Backend share-object backreferences**
 

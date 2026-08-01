@@ -271,7 +271,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	// AUTHORITATIVE sole dependent of its origin and no other live CSI snapshot
 	// would migrate with it, carrying tombstone ledger provenance across the id
 	// migration. The step is a no-op unless the flag is set.
-	d.reconcilePromoteRestoredClones(ctx, datasets, snapshots, tombstones, ledger, &report)
+	d.reconcilePromoteRestoredClones(ctx, datasets, snapshots, tombstones, unowned, ledger, &report)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		RecordReconcileFailure("promote_restored_clones")
 		return report, ctxErr
@@ -819,7 +819,10 @@ func (d *Driver) publishVolumeUsageMetrics(datasets []*truenas.Dataset) {
 // it touches can ever become a delete candidate, which is why it may use the
 // source-tolerant form of the ownership predicate (TrueNAS 26.0's
 // zfs.resource.query projection strips per-property source entirely, so the
-// strict form can never match on this path).
+// strict form can never match on this path) and why it does not pay a
+// per-dataset pool.snapshottask.query for task corroboration. The gauge is
+// therefore an ESTIMATE that carries NO delete authority — do not reuse this
+// call site's options for anything that destroys.
 func (d *Driver) countScheduledSnapshots(unowned []*truenas.Snapshot, datasets []*truenas.Dataset, report *ReconcileReport) {
 	if len(unowned) == 0 {
 		return
@@ -829,7 +832,8 @@ func (d *Driver) countScheduledSnapshots(unowned []*truenas.Snapshot, datasets [
 		datasetByPath[ds.Name] = ds
 	}
 	for _, snap := range unowned {
-		if driverScheduledSnapshotProvenance(snap, datasetByPath[snap.Dataset], d.driverInstanceID(), false) {
+		if driverScheduledSnapshotProvenance(snap, datasetByPath[snap.Dataset], d.driverInstanceID(),
+			scheduledProvenanceOptions{requireLocalSource: false, requireTaskCorroboration: false}) {
 			report.ScheduledSnapshotCount++
 		}
 	}

@@ -109,6 +109,15 @@ midclt call pool.snapshottask.query '[["dataset","^","<pool>/<parentDataset>/"]]
   jq -r '.[] | select(.naming_schema | test("^csi-.*-[0-9a-f]{16}-%Y%m%d-%H%M%S$")) | .id'
 ```
 
+> **Deleting a volume's task by hand makes its own scheduled snapshots FOREIGN.**
+> `DeleteVolume` requires a live driver-minted task on the dataset before it will
+> treat that dataset's unlabeled, schema-named snapshots as its own (the
+> ownership chain in `docs/reference/storageclass.md`). If you clear tasks
+> manually while their volumes still exist, a later PVC deletion returns
+> `FailedPrecondition` naming the leftover snapshots. That is the safe direction:
+> remove the snapshots, or set `zfs.destroyForeignSnapshotsOnDelete: true` for
+> that controller, and the delete proceeds.
+
 > **Exclude the CSI parent from periodic-snapshot and replication tasks.** The
 > configured `zfs.parentDataset` subtree is exclusive driver territory. A
 > TrueNAS periodic-snapshot task (or a replication task's snapshots) that covers

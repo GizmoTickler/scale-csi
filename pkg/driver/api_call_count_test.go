@@ -904,12 +904,17 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			require.NoError(t, err)
 		}},
 		// GF2/E2 scheduled delete: the six-call NFS delete baseline PLUS
-		// SnapshotTaskListByDataset + SnapshotTaskDelete. The list is the ownership
-		// re-proof (GF2-fix/H2): the driver deletes only the task whose naming
-		// schema its own algorithm re-derives for this volume, so a stamped id that
-		// happens to point at a pre-existing FOREIGN task can never authorize
-		// deleting it.
-		{name: "DeleteVolume NFS scheduled", want: 8, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// SnapshotTaskListByDataset + SnapshotTaskDelete + one
+		// DatasetSetUserProperties. The list is the ownership re-proof
+		// (GF2-fix/H2): the driver deletes only the task whose naming schema its
+		// own algorithm re-derives for this volume, so a stamped id that happens to
+		// point at a pre-existing FOREIGN task can never authorize deleting it.
+		// The property write is GF2-fix2/B1-b, recording that this driver saw its
+		// OWN live task here before destroying that evidence, so a RETRY of a
+		// failed delete is not wedged behind the foreign guard.
+		// A schedule-less volume pays NONE of these three — the default DeleteVolume
+		// goldens above are unchanged.
+		{name: "DeleteVolume NFS scheduled", want: 9, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			req := apiCallCountVolumeRequest("delete-nfs-scheduled", "nfs")
 			req.Parameters["snapshotSchedule"] = "0 0 * * *"
 			_, err := d.CreateVolume(context.Background(), req)

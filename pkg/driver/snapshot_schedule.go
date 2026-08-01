@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -39,6 +40,20 @@ const (
 // property and the task object itself (GF2/E2, R4).
 const PropSnapshotNamingSchema = "truenas-csi:snapshot_naming_schema"
 
+// PropSnapshotTaskCorroboration records that THIS driver instance observed its
+// OWN live, non-recursive, dataset-scoped periodic-snapshot task carrying this
+// exact naming schema on this dataset (GF2-fix2/B1-b).
+//
+// It exists because the delete path deletes that task before the foreign-snapshot
+// guard runs (GF2-fix/H2), so on a RETRY of a failed DeleteVolume the task is
+// gone and the live-task requirement could never be met again — the volume's own
+// scheduled snapshots would be reclassified foreign and the delete would be
+// wedged forever. Writing the observation down before deleting the task keeps a
+// retry decidable without weakening the first attempt. It is written only on the
+// delete path, only for a volume that already proves out a schema binding, and
+// only once.
+const PropSnapshotTaskCorroboration = "truenas-csi:snapshot_task_corroboration"
+
 // defaultSnapshotRetention bounds a scheduled task's snapshot lifetime when no
 // retention is configured, so an enabled schedule can never grow unbounded
 // snapshots (TrueNAS 26.0 retention is time-based only, P2/R6).
@@ -62,14 +77,41 @@ const (
 	scheduledSnapshotNonceBytes      = 8
 )
 
+// scheduledSnapshotTimestampLayout is the Go layout equivalent of the schema's
+// strftime tail (%Y%m%d-%H%M%S). Parsing through it — rather than matching eight
+// digits and six digits — is what makes a name with an impossible calendar or
+// clock value (20260230-250000) unprovable (GF2-fix2/B1-c).
+const scheduledSnapshotTimestampLayout = "20060102-150405"
+
+// Bounds for the name-vs-creation agreement check (GF2-fix2/B1-a). See
+// scheduledSnapshotCreationAgrees for what these can and cannot establish.
+const (
+	// scheduledSnapshotCreationSkew is how far the instant a task RENDERED into
+	// the snapshot name may sit from the snapshot's actual `creation` property.
+	// Deliberately generous: a false negative here only makes a genuine driver
+	// snapshot look foreign, which turns a DeleteVolume into a FailedPrecondition
+	// refusal — annoying, never destructive — but a false positive is a data-loss
+	// hazard, so the check must never be the only thing standing between a
+	// foreign snapshot and a recursive destroy (it is not; see the task
+	// corroboration below).
+	scheduledSnapshotCreationSkew = 2 * time.Minute
+	// civilOffsetQuantum is the granularity of every civil UTC offset in current
+	// use (whole, half and three-quarter hours). The driver does not know the
+	// NAS's timezone, so agreement can only be required modulo this quantum.
+	civilOffsetQuantum = 15 * time.Minute
+	// maxCivilOffset bounds the plausible NAS offset (UTC-12:00 .. UTC+14:00).
+	maxCivilOffset = 14 * time.Hour
+)
+
 // scheduledSnapshotNoncePattern is the exact shape of a driver-minted nonce.
 var scheduledSnapshotNoncePattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
 // scheduledSnapshotNamePattern matches the rendered output of the driver-minted
-// schema: the literal prefix, the volume id, the nonce, then the FULL strftime
-// timestamp expansion (8 digits, '-', 6 digits) — anchored at both ends. This is
-// the structural half of the ownership proof; the nonce is the secret half.
-var scheduledSnapshotNamePattern = regexp.MustCompile(`^csi-(.+)-([0-9a-f]{16})-\d{8}-\d{6}$`)
+// schema: the literal prefix, the volume id, the nonce, then the strftime
+// timestamp expansion — anchored at both ends. The digit classes are only the
+// lexer; parseScheduledSnapshotName is what enforces the canonical volume
+// segment and the valid calendar/clock domain.
+var scheduledSnapshotNamePattern = regexp.MustCompile(`^csi-(.+)-([0-9a-f]{16})-(\d{8}-\d{6})$`)
 
 // snapshotTaskSpec is the resolved, validated periodic-snapshot configuration for
 // a single CreateVolume request. A nil *snapshotTaskSpec means the volume is not
@@ -213,20 +255,93 @@ func scheduledSchemaNonce(schema string) (string, bool) {
 	return nonce, true
 }
 
-// scheduledSnapshotNameMatchesSchema reports whether a snapshot's short name is
-// EXACTLY an output the given driver-minted schema could have produced: the
-// literal prefix, the same volume id, the same nonce, and a fully-formed
-// strftime timestamp. Nothing about this is a prefix test — the previous
-// `strings.HasPrefix(name, "csi-")` classifier authorized destroying any
-// operator snapshot beginning with "csi-" (GF2-fix/B1).
-func scheduledSnapshotNameMatchesSchema(name, schema string) bool {
+// parseScheduledSnapshotName reports whether a snapshot's short name is EXACTLY
+// an output the given driver-minted schema could have produced, and returns the
+// wall-clock instant the name encodes.
+//
+// Three things are required, and each closed a real hole (GF2-fix2/B1-c):
+//
+//  1. The captured volume segment must be its own CANONICAL rendering. The
+//     previous version pushed the segment through sanitizeVolumeID before
+//     re-rendering, so any non-canonical spelling that merely SANITIZES to the
+//     dataset leaf (e.g. "Abc" for leaf "vAbc") re-rendered to the stamped schema
+//     and was accepted as driver-owned.
+//  2. Re-rendering through the production algorithm must reproduce the stamped
+//     schema byte-for-byte — same volume id, same nonce.
+//  3. The timestamp must be a REAL calendar instant, not merely eight digits and
+//     six digits. 20260230-250000 is now rejected.
+//
+// Nothing about this is a prefix test — the original `strings.HasPrefix(name,
+// "csi-")` classifier authorized destroying any operator snapshot beginning with
+// "csi-" (GF2-fix/B1).
+func parseScheduledSnapshotName(name, schema string) (encoded time.Time, ok bool) {
 	match := scheduledSnapshotNamePattern.FindStringSubmatch(name)
 	if match == nil {
+		return time.Time{}, false
+	}
+	volumeSegment, nonce, timestamp := match[1], match[2], match[3]
+	if sanitizeVolumeID(volumeSegment) != volumeSegment {
+		return time.Time{}, false
+	}
+	if driverScheduledNamingSchema(volumeSegment, nonce) != schema {
+		return time.Time{}, false
+	}
+	// Parsed as a bare wall clock (UTC is only the carrier — see
+	// scheduledSnapshotCreationAgrees for why the zone is unknown). The
+	// round-trip re-render is belt-and-braces against any layout element the
+	// parser would normalize rather than reject.
+	encoded, err := time.ParseInLocation(scheduledSnapshotTimestampLayout, timestamp, time.UTC)
+	if err != nil || encoded.Format(scheduledSnapshotTimestampLayout) != timestamp {
+		return time.Time{}, false
+	}
+	return encoded, true
+}
+
+// scheduledSnapshotCreationAgrees reports whether the instant a scheduled
+// snapshot's NAME encodes agrees with the snapshot's ACTUAL `creation` property
+// (GF2-fix2/B1-a).
+//
+// WHAT THIS IS. A TrueNAS periodic-snapshot task renders %Y%m%d-%H%M%S from the
+// clock at the moment it takes the snapshot, so a genuine task snapshot's name
+// and its creation property always agree. A hand-authored name agrees only if
+// its author created the snapshot at the exact second the name encodes.
+//
+// WHAT THIS IS NOT. It is NOT absolute-instant agreement. The task renders in the
+// NAS's LOCAL civil time while `creation` is UTC epoch seconds (verified against
+// the captured 26.0 payloads in pkg/truenas/testdata: both
+// zfs.resource.snapshot.query and pool.snapshot.query return `creation` as
+// epoch seconds — `{"value":1754693322,"raw":"1754693322"}` and
+// `{"value":"1754693450","parsed":{"$date":1754693450000}}` respectively). The
+// driver does not know the NAS's timezone and will not spend an API call plus an
+// embedded tzdata to learn it, so agreement is required only MODULO the
+// 15-minute quantum of civil UTC offsets, within a bounded ±14h.
+//
+// RESIDUE, STATED PLAINLY. With a ±2min skew against a 900s quantum, roughly
+// 27% of arbitrary timestamps satisfy this check by luck. It is therefore a
+// CORROBORATION that forces a forged name to be created at (near) the right
+// second, not a proof of authorship. The unguessable nonce and the mandatory
+// task corroboration are what carry the weight.
+//
+// An unavailable creation property means UNVERIFIABLE, which means NOT PROVEN,
+// which means the snapshot stays foreign and is preserved.
+func scheduledSnapshotCreationAgrees(encoded time.Time, creationUnix int64) bool {
+	if creationUnix <= 0 {
 		return false
 	}
-	// Re-render through the production algorithm from the parsed parts and
-	// demand exact equality with the stamped schema.
-	return driverScheduledNamingSchema(match[1], match[2]) == schema
+	delta := encoded.Unix() - creationUnix
+	skew := int64(scheduledSnapshotCreationSkew / time.Second)
+	if delta > int64(maxCivilOffset/time.Second)+skew || delta < -int64(maxCivilOffset/time.Second)-skew {
+		return false
+	}
+	quantum := int64(civilOffsetQuantum / time.Second)
+	residue := ((delta % quantum) + quantum) % quantum
+	if residue > quantum/2 {
+		residue -= quantum
+	}
+	if residue < 0 {
+		residue = -residue
+	}
+	return residue <= skew
 }
 
 // parseSnapshotSchedule parses a five-field cron string "minute hour dom month
@@ -378,7 +493,17 @@ func driverOwnedTask(tasks []*truenas.SnapshotTask, namingSchema string) *truena
 // has been re-derived for this volume, so a stamped id that points at a
 // pre-existing foreign task (the old first-match adoption bug) cannot authorize
 // its deletion.
-func (d *Driver) deleteVolumeSnapshotTask(ctx context.Context, dataset *truenas.Dataset, datasetName, volumeID string) {
+//
+// It returns the CORROBORATING TASK SCHEMA (GF2-fix2/B1-b): the naming schema of
+// a driver-minted, non-recursive task that this call observed alive on EXACTLY
+// this dataset immediately before deleting it. That observation is the delete
+// path's positive evidence that a task really was minting snapshots with that
+// name shape here, and it must be captured HERE because the task is deleted
+// before the foreign guard runs. An empty return means NO corroboration — no
+// task, an unreadable task list, or a task whose schema does not prove out — and
+// the foreign guard then treats every unlabeled snapshot on the dataset as
+// foreign. Unprovable is never deletable.
+func (d *Driver) deleteVolumeSnapshotTask(ctx context.Context, dataset *truenas.Dataset, datasetName, volumeID string) (corroboratingTaskSchema string) {
 	schema := datasetLocalUserProperty(dataset, PropSnapshotNamingSchema)
 	if !schemaProvesVolumeOwnership(schema, volumeID) {
 		// A volume that was never scheduled carries no binding: skip entirely so
@@ -388,32 +513,70 @@ func (d *Driver) deleteVolumeSnapshotTask(ctx context.Context, dataset *truenas.
 			klog.Warningf("Volume dataset %s carries an unprovable %s=%q; refusing to delete any periodic-snapshot task",
 				datasetName, PropSnapshotNamingSchema, schema)
 		}
-		return
+		return ""
 	}
 
 	tasks, err := d.truenasClient.SnapshotTaskListByDataset(ctx, datasetName)
 	if err != nil {
 		klog.Warningf("Failed to look up periodic-snapshot tasks for volume dataset %s during delete (continuing; the sweep will retire a stranded task): %v", datasetName, err)
 		RecordScheduledSnapshotTaskDeleteFailed()
-		return
+		return ""
 	}
 	task := driverOwnedTask(tasks, schema)
-	if task == nil {
-		return
+	// Corroboration requires the task to be scoped to EXACTLY this dataset and
+	// non-recursive, which is the only shape ensureSnapshotTask ever creates.
+	if task == nil || task.Dataset != datasetName || task.Recursive {
+		// No live task. Honor a corroboration THIS driver durably recorded on an
+		// earlier attempt of this same delete (see PropSnapshotTaskCorroboration);
+		// anything else is uncorroborated and every snapshot stays foreign.
+		if datasetLocalUserProperty(dataset, PropSnapshotTaskCorroboration) == schema {
+			return schema
+		}
+		return ""
+	}
+	corroboratingTaskSchema = task.NamingSchema
+	// Persist the observation BEFORE destroying the evidence, so a retry of a
+	// DeleteVolume that fails later (share or dataset delete) is not wedged.
+	// A write failure is not fatal: this attempt saw the task with its own eyes.
+	if datasetLocalUserProperty(dataset, PropSnapshotTaskCorroboration) != schema {
+		if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, map[string]string{
+			PropSnapshotTaskCorroboration: schema,
+		}); err != nil {
+			klog.Warningf("Failed to record the periodic-snapshot task corroboration for volume dataset %s (a retry of this delete may refuse until the volume's snapshots are removed): %v", datasetName, err)
+		}
 	}
 	if err := d.truenasClient.SnapshotTaskDelete(ctx, task.ID); err != nil {
 		klog.Warningf("Failed to delete periodic-snapshot task %d for volume dataset %s (continuing; the sweep will retire it): %v", task.ID, datasetName, err)
 		RecordScheduledSnapshotTaskDeleteFailed()
 	}
+	return corroboratingTaskSchema
+}
+
+// scheduledProvenanceOptions selects how strict the provenance predicate is for
+// a particular call site.
+type scheduledProvenanceOptions struct {
+	// requireLocalSource demands source=="local" on the dataset's ownership and
+	// schema properties. Delete-authorizing callers set it; the metrics-only
+	// reconcile caller cannot, because TrueNAS 26.0's zfs.resource.query
+	// projection strips per-property source entirely.
+	requireLocalSource bool
+	// requireTaskCorroboration demands that corroboratingTaskSchema equals the
+	// dataset's stamped schema — i.e. that a driver-minted periodic-snapshot task
+	// with exactly this schema was observed ALIVE on exactly this dataset. Only
+	// the delete path sets it; it is what makes the predicate FAIL CLOSED when
+	// the owning task is absent, unreadable, or mismatched.
+	requireTaskCorroboration bool
+	// corroboratingTaskSchema is that observation (empty = none obtained).
+	corroboratingTaskSchema string
 }
 
 // driverScheduledSnapshotProvenance is the SINGLE ownership predicate for
-// task-created snapshots (GF2-fix/B1).
+// task-created snapshots (GF2-fix/B1, tightened in GF2-fix2/B1).
 //
 // Task-created snapshots carry NO CSI user properties (P2) and TrueNAS 26.0
 // cannot add properties to an existing snapshot, so per-snapshot provenance must
-// come from something the driver alone controls. That is the naming schema's
-// per-volume NONCE. A snapshot is proven driver-owned only when ALL of:
+// be assembled from durable state the driver controls. A snapshot is treated as
+// driver-created only when ALL of:
 //
 //  1. it is not a CSI snapshot or tombstone (those have their own provenance);
 //  2. it lives on EXACTLY the volume's own dataset;
@@ -421,25 +584,41 @@ func (d *Driver) deleteVolumeSnapshotTask(ctx context.Context, dataset *truenas.
 //  4. that dataset carries a naming-schema binding that the driver's own
 //     production algorithm reproduces byte-for-byte for THIS volume id (so the
 //     nonce is one the driver minted, not one an outsider chose);
-//  5. the snapshot's short name is exactly a rendering of that schema — same
-//     volume id, same nonce, full strftime timestamp expansion.
+//  5. a driver-minted, non-recursive periodic-snapshot task carrying EXACTLY
+//     that schema was observed alive on exactly this dataset (delete path only);
+//  6. the snapshot's short name is exactly a rendering of that schema — same
+//     volume id in canonical form, same nonce, a REAL calendar/clock instant;
+//  7. that encoded instant AGREES with the snapshot's actual creation property,
+//     modulo the unknown civil UTC offset of the NAS.
 //
 // If any link is missing the answer is NO and the snapshot stays FOREIGN, which
 // means the default policy refuses to destroy it. Unprovable never means
 // deletable.
 //
-// requireLocalSource distinguishes the two call sites. Delete-authorizing callers
-// (DeleteVolume's foreign guard) pass true and read the dataset from
-// pool.dataset.query, which carries property sources, so a value INHERITED from a
-// clone origin can never masquerade as a local ownership stamp. The metrics-only
-// reconcile caller passes false because TrueNAS 26.0's zfs.resource.query
-// projection strips per-property source entirely; that path only increments a
-// gauge and can never delete anything.
+// # DOCUMENTED TRUST BOUNDARY — read this before strengthening any claim
+//
+// This predicate does NOT establish "a snapshot this driver did not create
+// cannot be deleted". It establishes: "a snapshot that does not sit on this
+// volume's own locally-stamped dataset, or whose name does not reproduce the
+// driver-minted per-volume nonce, or that is not corroborated by a live
+// driver-minted task on that dataset, or whose name does not encode a real
+// instant agreeing with its creation time, is never deleted as driver-owned."
+//
+// The residue is real and is accepted deliberately: an actor with pool-write
+// access on the NAS can READ the naming schema (it is stored on the dataset and
+// on the task, and pool.snapshottask.query exposes it) and can create a snapshot
+// on the volume dataset with that exact name at the matching second. Such a
+// snapshot is INDISTINGUISHABLE from a task-created one, because TrueNAS 26.0
+// offers no way to stamp a user property on an existing snapshot and no way to
+// attribute a snapshot to the task that made it. Closing this would require
+// per-snapshot provenance the platform does not provide. Storage-administrator
+// access to the CSI parent dataset is therefore a TRUSTED boundary for this
+// feature. Do not let a doc, comment or test name claim otherwise.
 func driverScheduledSnapshotProvenance(
 	snap *truenas.Snapshot,
 	dataset *truenas.Dataset,
 	driverInstanceID string,
-	requireLocalSource bool,
+	opts scheduledProvenanceOptions,
 ) bool {
 	if snap == nil || dataset == nil || isCSISnapshot(snap) || isSnapshotTombstone(snap) {
 		return false
@@ -447,7 +626,7 @@ func driverScheduledSnapshotProvenance(
 	if snap.Dataset != dataset.Name {
 		return false
 	}
-	if requireLocalSource {
+	if opts.requireLocalSource {
 		if !datasetHasLocalUserProperty(dataset, PropDriverInstanceID, driverInstanceID) {
 			return false
 		}
@@ -456,7 +635,7 @@ func driverScheduledSnapshotProvenance(
 	}
 
 	schema := ""
-	if requireLocalSource {
+	if opts.requireLocalSource {
 		schema = datasetLocalUserProperty(dataset, PropSnapshotNamingSchema)
 	} else {
 		schema = datasetUserProperty(dataset, PropSnapshotNamingSchema)
@@ -466,13 +645,27 @@ func driverScheduledSnapshotProvenance(
 	if !schemaProvesVolumeOwnership(schema, datasetVolumeID(dataset.Name)) {
 		return false
 	}
-	return scheduledSnapshotNameMatchesSchema(snapshotShortName(snap), schema)
+	// FAIL CLOSED without a corroborating live task: no task means nothing on
+	// this dataset was minting snapshots under this schema, so an unlabeled
+	// snapshot bearing it has no claim to driver authorship at all.
+	if opts.requireTaskCorroboration && (opts.corroboratingTaskSchema == "" || opts.corroboratingTaskSchema != schema) {
+		return false
+	}
+	encoded, ok := parseScheduledSnapshotName(snapshotShortName(snap), schema)
+	if !ok {
+		return false
+	}
+	return scheduledSnapshotCreationAgrees(encoded, snap.GetCreationTime())
 }
 
 // isDriverScheduledSnapshot is the delete-authorizing form of the provenance
-// predicate: strict property sources required.
-func isDriverScheduledSnapshot(snap *truenas.Snapshot, dataset *truenas.Dataset, driverInstanceID string) bool {
-	return driverScheduledSnapshotProvenance(snap, dataset, driverInstanceID, true)
+// predicate: strict property sources AND a live corroborating task required.
+func isDriverScheduledSnapshot(snap *truenas.Snapshot, dataset *truenas.Dataset, driverInstanceID, corroboratingTaskSchema string) bool {
+	return driverScheduledSnapshotProvenance(snap, dataset, driverInstanceID, scheduledProvenanceOptions{
+		requireLocalSource:       true,
+		requireTaskCorroboration: true,
+		corroboratingTaskSchema:  corroboratingTaskSchema,
+	})
 }
 
 // datasetVolumeID derives a volume id from a dataset path.
@@ -483,14 +676,18 @@ func datasetVolumeID(datasetName string) string {
 	return datasetName
 }
 
-// foreignSnapshotsOnly filters out PROVEN driver-owned scheduled snapshots
-// (GF2/E2, R4) from a volume's snapshot list, returning every snapshot the
-// foreign-snapshot guard must still police. Anything the ownership chain above
+// foreignSnapshotsOnly filters out driver-scheduled snapshots the ownership
+// chain proves out (GF2/E2, R4) from a volume's snapshot list, returning every
+// snapshot the foreign-snapshot guard must still police. Anything the chain
 // cannot prove stays foreign and is therefore preserved by the default policy.
-func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *truenas.Dataset) []*truenas.Snapshot {
+//
+// corroboratingTaskSchema comes from deleteVolumeSnapshotTask, which ran just
+// before this call and is the only place the owning task can still be observed.
+// Passing "" (no task seen) makes every snapshot foreign — the safe direction.
+func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *truenas.Dataset, corroboratingTaskSchema string) []*truenas.Snapshot {
 	foreign := make([]*truenas.Snapshot, 0, len(snapshots))
 	for _, snap := range snapshots {
-		if isDriverScheduledSnapshot(snap, dataset, d.driverInstanceID()) {
+		if isDriverScheduledSnapshot(snap, dataset, d.driverInstanceID(), corroboratingTaskSchema) {
 			continue
 		}
 		foreign = append(foreign, snap)

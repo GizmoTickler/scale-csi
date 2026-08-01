@@ -52,6 +52,22 @@ func resourceQueryProjection(ds *truenas.Dataset) *truenas.Dataset {
 
 func promoteReport() *ReconcileReport { return &ReconcileReport{} }
 
+// seedOriginTombstone creates the snapshot a clone-restored volume is actually
+// pinned to in production: the TOMBSTONE of a deleted CSI source snapshot.
+//
+// The fixtures previously passed a property-less snapshot in the CSI-snapshot
+// bucket, which listAllManagedSnapshots can never produce (a snapshot with no
+// CSI identity lands in the UNOWNED bucket). That mislabeling is precisely what
+// hid the dropped-unowned-bucket defect this round fixes, so the fixtures now
+// place every snapshot in the bucket the production partition would.
+func seedOriginTombstone(t *testing.T, client *truenas.MockClient, dataset, name string) *truenas.Snapshot {
+	t.Helper()
+	snap, err := client.SnapshotCreate(context.Background(), dataset, name+snapshotTombstoneMarker+"1", nil)
+	require.NoError(t, err)
+	require.True(t, isSnapshotTombstone(snap), "fixture must be a real tombstone")
+	return snap
+}
+
 func TestMockDatasetPromoteMigratesEveryOlderOrEqualSnapshot(t *testing.T) {
 	client := truenas.NewMockClient()
 	ctx := context.Background()
@@ -95,15 +111,14 @@ func TestReconcilePromoteRunsOnResourceQueryProjection(t *testing.T) {
 	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
 	d.config.ZFS.PromoteRestoredClones = true
 
-	snap, err := client.SnapshotCreate(ctx, "pool/parent/source", "snap", nil)
-	require.NoError(t, err)
+	snap := seedOriginTombstone(t, client, "pool/parent/source", "snap")
 	client.Datasets["pool/parent/source"] = &truenas.Dataset{Name: "pool/parent/source"}
 	clone := seedCloneRestoredVolume(client, d, "restored", snap.ID)
 
 	report := promoteReport()
 	d.reconcilePromoteRestoredClones(ctx,
 		[]*truenas.Dataset{resourceQueryProjection(clone)},
-		[]*truenas.Snapshot{snap}, nil, map[string]tombstoneLedgerEntry{}, report)
+		nil, []*truenas.Snapshot{snap}, nil, map[string]tombstoneLedgerEntry{}, report)
 
 	assert.Equal(t, 1, report.PromotedCloneCount, "promote must run on the sourceless resource-query projection")
 	assert.Contains(t, client.DatasetPromoteCalls, "pool/parent/restored")
@@ -119,8 +134,7 @@ func TestReconcilePromoteRefusesUnmanagedSiblingClone(t *testing.T) {
 	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
 	d.config.ZFS.PromoteRestoredClones = true
 
-	snap, err := client.SnapshotCreate(ctx, "pool/parent/source", "snap", nil)
-	require.NoError(t, err)
+	snap := seedOriginTombstone(t, client, "pool/parent/source", "snap")
 	client.Datasets["pool/parent/source"] = &truenas.Dataset{Name: "pool/parent/source"}
 	clone := seedCloneRestoredVolume(client, d, "restored", snap.ID)
 	// An admin's restore-test clone of the same origin, outside driver management.
@@ -133,7 +147,7 @@ func TestReconcilePromoteRefusesUnmanagedSiblingClone(t *testing.T) {
 	// The driver's own slice contains ONLY the managed clone, exactly as the
 	// managed_resource filter produces in production.
 	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{clone},
-		[]*truenas.Snapshot{snap}, nil, map[string]tombstoneLedgerEntry{}, report)
+		nil, []*truenas.Snapshot{snap}, nil, map[string]tombstoneLedgerEntry{}, report)
 
 	assert.Equal(t, 0, report.PromotedCloneCount, "an unmanaged sibling clone must block the promote")
 	assert.Empty(t, client.DatasetPromoteCalls)
@@ -158,14 +172,13 @@ func TestReconcilePromoteRefusesWhenLiveCSISnapshotWouldMigrate(t *testing.T) {
 		PropCSISnapshotSourceVolumeID: "source",
 	})
 	require.NoError(t, err)
-	origin, err := client.SnapshotCreate(ctx, "pool/parent/source", "s2", nil)
-	require.NoError(t, err)
+	origin := seedOriginTombstone(t, client, "pool/parent/source", "s2")
 	client.Datasets["pool/parent/source"] = &truenas.Dataset{Name: "pool/parent/source"}
 	clone := seedCloneRestoredVolume(client, d, "restored", origin.ID)
 
 	report := promoteReport()
 	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{clone},
-		[]*truenas.Snapshot{older, origin}, nil, map[string]tombstoneLedgerEntry{}, report)
+		[]*truenas.Snapshot{older}, []*truenas.Snapshot{origin}, nil, map[string]tombstoneLedgerEntry{}, report)
 
 	assert.Equal(t, 0, report.PromotedCloneCount, "a live CSI snapshot in the migrating set must refuse the promote")
 	assert.Empty(t, client.DatasetPromoteCalls)
@@ -174,21 +187,87 @@ func TestReconcilePromoteRefusesWhenLiveCSISnapshotWouldMigrate(t *testing.T) {
 	assert.Equal(t, "pool/parent/source", got.Dataset)
 }
 
+// GF2-fix2 (new HIGH) — the promote step analyzed only the CSI-snapshot and
+// tombstone buckets, while pool.dataset.promote migrates EVERY snapshot
+// older-or-equal to the origin. A foreign/unowned snapshot on the source
+// therefore migrated onto the restored clone unseen by the H1 refusal gate: it
+// ends up stranded under a volume its owner never chose, and is destroyed with
+// that volume once destroyForeignSnapshotsOnDelete is enabled.
+//
+// REVERT-PROOF: passing the unowned bucket is the fix. On 03d37b8 the promote
+// call site drops it, the migrating set contains only the origin tombstone, the
+// promote SUCCEEDS, and the foreign snapshot is silently re-parented onto
+// pool/parent/restored — so both the PromotedCloneCount assertion and the
+// "stays on the source dataset" assertion below fail. Verified by running this
+// scenario on a 03d37b8 worktree against the pre-fix SIX-argument call site
+// (which has no unowned parameter at all, so the foreign snapshot simply is not
+// passed — exactly what production did): all three assertions failed and the
+// snapshot's dataset came back as pool/parent/restored.
+func TestReconcilePromoteRefusesWhenUnownedSnapshotWouldMigrate(t *testing.T) {
+	ctx := context.Background()
+	pv := boundReconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	d.config.ZFS.PromoteRestoredClones = true
+
+	// An operator's own snapshot, OLDER than the restore origin, with no CSI
+	// identity — exactly what listAllManagedSnapshots puts in the unowned bucket.
+	foreign, err := client.SnapshotCreate(ctx, "pool/parent/source", "admin-preupgrade", nil)
+	require.NoError(t, err)
+	require.False(t, isCSISnapshot(foreign))
+	require.False(t, isSnapshotTombstone(foreign))
+	origin := seedOriginTombstone(t, client, "pool/parent/source", "snap")
+	client.Datasets["pool/parent/source"] = &truenas.Dataset{Name: "pool/parent/source"}
+	clone := seedCloneRestoredVolume(client, d, "restored", origin.ID)
+
+	report := promoteReport()
+	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{clone},
+		nil, []*truenas.Snapshot{origin}, []*truenas.Snapshot{foreign}, map[string]tombstoneLedgerEntry{}, report)
+
+	assert.Equal(t, 0, report.PromotedCloneCount, "an unowned snapshot in the migrating set must refuse the promote")
+	assert.Empty(t, client.DatasetPromoteCalls)
+	got, err := client.SnapshotGet(ctx, foreign.ID)
+	require.NoError(t, err, "the operator's snapshot must not be re-parented")
+	assert.Equal(t, "pool/parent/source", got.Dataset)
+}
+
+// The complete-inventory fix must not be satisfiable by simply never promoting:
+// a source carrying only NEWER unowned snapshots (which ZFS does not migrate)
+// must still promote.
+func TestReconcilePromoteStillRunsWhenUnownedSnapshotIsNewerThanOrigin(t *testing.T) {
+	ctx := context.Background()
+	pv := boundReconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	d.config.ZFS.PromoteRestoredClones = true
+
+	origin := seedOriginTombstone(t, client, "pool/parent/source", "snap")
+	newer, err := client.SnapshotCreate(ctx, "pool/parent/source", "admin-after", nil)
+	require.NoError(t, err)
+	require.Greater(t, newer.CreateTXG, origin.CreateTXG, "fixture: the foreign snapshot is newer")
+	client.Datasets["pool/parent/source"] = &truenas.Dataset{Name: "pool/parent/source"}
+	clone := seedCloneRestoredVolume(client, d, "restored", origin.ID)
+
+	report := promoteReport()
+	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{clone},
+		nil, []*truenas.Snapshot{origin}, []*truenas.Snapshot{newer}, map[string]tombstoneLedgerEntry{}, report)
+
+	assert.Equal(t, 1, report.PromotedCloneCount, "a NEWER unowned snapshot does not migrate and must not block")
+	assert.Contains(t, client.DatasetPromoteCalls, "pool/parent/restored")
+}
+
 func TestReconcilePromoteSkipsSharedOriginSiblings(t *testing.T) {
 	ctx := context.Background()
 	pv := boundReconcilePV("source", "csi.scale.io")
 	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
 	d.config.ZFS.PromoteRestoredClones = true
 
-	snap, err := client.SnapshotCreate(ctx, "pool/parent/source", "snap", nil)
-	require.NoError(t, err)
+	snap := seedOriginTombstone(t, client, "pool/parent/source", "snap")
 	client.Datasets["pool/parent/source"] = &truenas.Dataset{Name: "pool/parent/source"}
 	cloneA := seedCloneRestoredVolume(client, d, "restored-a", snap.ID)
 	cloneB := seedCloneRestoredVolume(client, d, "restored-b", snap.ID)
 
 	report := promoteReport()
 	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{cloneA, cloneB},
-		[]*truenas.Snapshot{snap}, nil, map[string]tombstoneLedgerEntry{}, report)
+		nil, []*truenas.Snapshot{snap}, nil, map[string]tombstoneLedgerEntry{}, report)
 
 	assert.Equal(t, 0, report.PromotedCloneCount, "siblings sharing an origin are NOT promoted (R3 ordering rule)")
 	assert.Empty(t, client.DatasetPromoteCalls)
@@ -200,13 +279,12 @@ func TestReconcilePromoteNoOpWhenDisabled(t *testing.T) {
 	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
 	// PromoteRestoredClones defaults to false.
 
-	snap, err := client.SnapshotCreate(ctx, "pool/parent/source", "snap", nil)
-	require.NoError(t, err)
+	snap := seedOriginTombstone(t, client, "pool/parent/source", "snap")
 	clone := seedCloneRestoredVolume(client, d, "restored", snap.ID)
 
 	report := promoteReport()
 	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{clone},
-		[]*truenas.Snapshot{snap}, nil, map[string]tombstoneLedgerEntry{}, report)
+		nil, []*truenas.Snapshot{snap}, nil, map[string]tombstoneLedgerEntry{}, report)
 
 	assert.Equal(t, 0, report.PromotedCloneCount, "promote is off by default")
 	assert.Empty(t, client.DatasetPromoteCalls)
@@ -244,7 +322,7 @@ func TestPromoteCarriesTombstoneLedgerProvenanceAcrossMigration(t *testing.T) {
 
 	report := promoteReport()
 	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{resourceQueryProjection(listedClone)},
-		nil, []*truenas.Snapshot{tombstone}, ledger, report)
+		nil, []*truenas.Snapshot{tombstone}, nil, ledger, report)
 	require.Equal(t, 1, report.PromotedCloneCount)
 
 	newTombstoneID := "pool/parent/restored@" + snapshotShortName(tombstone)
