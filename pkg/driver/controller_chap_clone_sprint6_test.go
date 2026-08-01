@@ -125,13 +125,16 @@ func chapVolumeCloneRequest(name, sourceVolumeID string) *csi.CreateVolumeReques
 	return req
 }
 
-func seedISCSIVolumeCloneSource(t *testing.T, client *truenas.MockClient, volumeID string, capacity int64) {
+// ROUND 6: see seedSnapshotCloneSource — a block clone source must carry the
+// local ownership stamp for the destination's geometry to be resolvable.
+func seedISCSIVolumeCloneSource(t *testing.T, client *truenas.MockClient, d *Driver, volumeID string, capacity int64) {
 	t.Helper()
 	mustCreateParentDataset(t, client)
 	_, err := client.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 		Name: "pool/parent/" + volumeID, Type: "VOLUME", Volsize: capacity,
 	})
 	require.NoError(t, err)
+	stampDriverOwnership(t, client, d, "pool/parent/"+volumeID)
 }
 
 // assertCHAPCloneRecoversAfterFoldCrash drives the exact H1 scenario: the first
@@ -201,7 +204,7 @@ func assertCHAPCloneRecoversAfterFoldCrash(
 func TestSprint6CHAPSnapshotCloneCrashAfterMergedUpdateRecovers(t *testing.T) {
 	client := &chapCloneCrashAfterFoldClient{MockClient: truenas.NewMockClient(), crash: true}
 	d := newSprint2CHAPDriver(t, client, FencingModeStrict)
-	seedSnapshotCloneSource(t, client.MockClient, "VOLUME", testGiB)
+	seedSnapshotCloneSource(t, client.MockClient, d, "VOLUME", testGiB)
 
 	req := chapSnapshotCloneRequest("chap-snap-clone", "snap-1", false)
 	assertCHAPCloneRecoversAfterFoldCrash(t, d, client, req, "pool/parent/chap-snap-clone", "chap-snap-clone")
@@ -213,7 +216,7 @@ func TestSprint6CHAPSnapshotCloneCrashAfterMergedUpdateRecovers(t *testing.T) {
 func TestSprint6CHAPVolumeCloneCrashAfterMergedUpdateRecovers(t *testing.T) {
 	client := &chapCloneCrashAfterFoldClient{MockClient: truenas.NewMockClient(), crash: true}
 	d := newSprint2CHAPDriver(t, client, FencingModeStrict)
-	seedISCSIVolumeCloneSource(t, client.MockClient, "chap-vol-source", testGiB)
+	seedISCSIVolumeCloneSource(t, client.MockClient, d, "chap-vol-source", testGiB)
 
 	req := chapVolumeCloneRequest("chap-vol-clone", "chap-vol-source")
 	assertCHAPCloneRecoversAfterFoldCrash(t, d, client, req, "pool/parent/chap-vol-clone", "chap-vol-clone")
@@ -226,7 +229,7 @@ func TestSprint6NonCHAPCloneFoldOmitsCHAPPolicy(t *testing.T) {
 	ctx := context.Background()
 	client := &cloneFoldCaptureClient{MockClient: truenas.NewMockClient()}
 	d := newSprint2CHAPDriver(t, client, FencingModeStrict)
-	seedSnapshotCloneSource(t, client.MockClient, "VOLUME", testGiB)
+	seedSnapshotCloneSource(t, client.MockClient, d, "VOLUME", testGiB)
 
 	// CHAP is enabled globally, but this request carries no chapSecret param and no
 	// username secret, so chapEnabledForCreate is false and no resolution is threaded.
@@ -267,7 +270,7 @@ func TestSprint6CHAPCloneFoldModeDropFailsBeforeMarkerRetirement(t *testing.T) {
 	ctx := context.Background()
 	client := &chapModeDropFoldResponseClient{MockClient: truenas.NewMockClient()}
 	d := newSprint2CHAPDriver(t, client, FencingModeStrict)
-	seedSnapshotCloneSource(t, client.MockClient, "VOLUME", testGiB)
+	seedSnapshotCloneSource(t, client.MockClient, d, "VOLUME", testGiB)
 
 	req := chapSnapshotCloneRequest("chap-drop", "snap-1", false)
 	_, err := d.CreateVolume(ctx, req)

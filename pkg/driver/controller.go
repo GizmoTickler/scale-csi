@@ -1745,7 +1745,17 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	// already stamped; one ISCSIExtentFindByDisk for a zvol that is not stamped
 	// yet, which is the pre-GF4 fleet and exactly the population whose snapshots
 	// would otherwise be unrestorable.
-	for key, value := range d.snapshotGeometryProps(ctx, sourceDataset, datasetName) {
+	// ROUND 6: this returns an ERROR when the volume's stamp and its live extent
+	// disagree. Capturing either one would be a guess about which describes the
+	// bytes in this snapshot, and the restore that reads it back would act on that
+	// guess — so the snapshot is refused instead. The volume is already
+	// unpublishable in that state (guardStampedVsLiveGeometry), so this costs no
+	// availability that was not already lost.
+	geometryProps, geometryErr := d.snapshotGeometryProps(ctx, sourceDataset, datasetName)
+	if geometryErr != nil {
+		return nil, geometryErr
+	}
+	for key, value := range geometryProps {
 		snapshotProperties[key] = value
 	}
 	snap, err := d.truenasClient.SnapshotCreate(ctx, datasetName, snapshotID, snapshotProperties)

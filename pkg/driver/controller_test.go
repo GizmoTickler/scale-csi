@@ -1672,6 +1672,7 @@ func TestCreateVolumeCloneReportsInheritedActualCapacity(t *testing.T) {
 	mustCreateParentDataset(t, client)
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "VOLUME", Volsize: 8 * testGiB})
 	require.NoError(t, err)
+	stampDriverOwnership(t, client, d, "pool/parent/source")
 
 	resp, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
 		Name:               "clone",

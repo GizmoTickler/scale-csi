@@ -205,16 +205,26 @@ source whose extent was re-created at a different geometry after the snapshot wa
 taken would hand the restore a layout the snapshot's data was never written
 against. Provenance is therefore tied to the snapshot itself:
 
-- `CreateSnapshot` records the source's geometry **on the snapshot** it takes.
-  ZFS captures a dataset's user properties at snapshot time, so this is a durable
-  point-in-time record. It costs nothing for a volume already recorded, and one
-  `iscsi.extent.query` for one that is not.
+- `CreateSnapshot` records the source's **live** geometry on the snapshot it
+  takes. ZFS captures a dataset's user properties at snapshot time, so this is a
+  durable point-in-time record. It costs one `iscsi.extent.query` per **zvol**
+  snapshot; filesystem snapshots pay nothing.
+- The live extent is consulted **every time**, including for a volume that
+  already records a geometry. A recorded value is a record of a record; the
+  extent is the bytes. Where the two disagree — an extent re-created at a
+  different geometry after the volume was stamped — `CreateSnapshot` **fails
+  `FailedPrecondition`** and names both values, rather than capturing a stale
+  record onto bytes it does not describe. (Such a volume is already unpublishable
+  for the same reason, so nothing that worked stops working.)
 - A restore reads that captured record. When it is present and complete, the
   restore issues **no source read at all**.
 - A snapshot that captured **no** geometry, whose source shows any history of
   having been block-addressed, **fails `FailedPrecondition`**. The driver will
-  not lay a guessed geometry over a snapshot's data. A snapshot of a zvol nothing
-  has ever exported is unaffected — there is no layout to preserve.
+  not lay a guessed geometry over a snapshot's data. A snapshot of a
+  driver-provisioned zvol nothing has ever exported is unaffected — there is no
+  layout to preserve. A snapshot of a zvol the driver did **not** create is not
+  in that category: absence of the driver's bookkeeping is not evidence that the
+  bytes are unaddressed, so it fails closed too.
 
 > **Upgrade note.** Snapshots taken before this version carry no captured
 > geometry, so restoring one of a block volume fails closed until its real
@@ -225,6 +235,9 @@ against. Provenance is therefore tied to the snapshot itself:
 > zfs set truenas-csi:block_blocksize=4096 \
 >         truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...@snap-...
 > ```
+>
+> `truenas-csi:block_blocksize` must be one of 512, 1024, 2048, 4096; any other
+> value is treated as untrusted and the restore keeps failing closed.
 >
 > Snapshots taken from this version on carry it automatically. NFS snapshots are
 > unaffected.
@@ -251,9 +264,20 @@ already holds data, in either direction:
   install-wide default.
 - **A StorageClass parameter is intent, not evidence.** An explicit
   `iscsi/blocksize` may only *agree* with what the storage is already known to
-  be. It supplies a value only where the storage provably holds no
-  block-addressed data — a zvol this call just created, or one carrying no
-  witness of ever having been exported.
+  be. It supplies a value only where the storage is **provably** free of
+  block-addressed data, and that proof is POSITIVE, never the absence of the
+  driver's own bookkeeping: either the zvol was created by this very call, or it
+  carries this driver instance's `truenas-csi:driver_instance_id` ownership stamp
+  with ZFS source `local` **and** no witness of ever having been exported. A zvol
+  the driver did not create — imported, attached by an administrator, or restored
+  by some other tool — cannot supply that proof and is refused. An *inherited*
+  ownership stamp is the source dataset's fact, not the clone's, and does not
+  count.
+- **Two records that disagree are never combined.** Where a destination's own
+  record and its content source's record both describe the same bytes and give
+  different values, the driver names both and refuses. It never fills the
+  missing half of one record from the other while keeping a contradicted value —
+  that would manufacture a geometry that was never observed anywhere.
 - **Changing `iscsi.extentBlocksize` never re-geometries an existing volume.** A
   rebuild whose extent is absent replays the volume's own recorded geometry. It
   never falls back to the current default, because the default may have moved
@@ -267,6 +291,13 @@ already holds data, in either direction:
   zfs set truenas-csi:block_blocksize=4096 \
           truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...
   ```
+
+  `truenas-csi:block_blocksize` must be one of **512, 1024, 2048, 4096** — the
+  sizes an extent can actually be created at. A stored value outside that set (a
+  typo in the command above) is treated as **untrusted**: it records nothing, the
+  volume reads as unrecorded, and the rebuild keeps failing closed rather than
+  acting on it. The same applies to a stored `queuedCommands`, `availThreshold`
+  or `qidMax` outside its documented range.
 
 - **An extent the driver did not create is validated before it is adopted.** If a
   create-error recovery or an "already exists" fallback returns an extent whose

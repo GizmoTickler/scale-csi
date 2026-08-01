@@ -638,6 +638,11 @@ func TestCreateISCSIShare_TargetCreation_Success(t *testing.T) {
 		Type:    "VOLUME",
 		Volsize: 1024 * 1024 * 1024,
 	})
+	// ROUND 6: the local ownership stamp createDataset writes in production. It
+	// is the POSITIVE proof blockDataFreeProof requires before the controller
+	// default may be laid over a zvol; without it this is an imported zvol of
+	// unknown provenance and the extent create fails closed.
+	stampDriverOwnership(t, mockClient, d, datasetName)
 
 	// Call createISCSIShare
 	err := d.createISCSIShare(ctx, datasetName, "test-vol")
@@ -673,6 +678,7 @@ func TestCreateISCSIShareNameSuffixCompatibility(t *testing.T) {
 		Name: datasetName, Type: "VOLUME", Volsize: 1024 * 1024 * 1024,
 	})
 	require.NoError(t, err)
+	stampDriverOwnership(t, mockClient, d, datasetName)
 
 	require.NoError(t, d.createISCSIShare(ctx, datasetName, volumeID))
 	const expectedName = "pvc-12345678-1234-1234-1234-123456789abc-cluster"

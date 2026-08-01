@@ -502,6 +502,9 @@ func TestCreateVolumeCloneExpansionFailure(t *testing.T) {
 			mustCreateParentDataset(t, client.MockClient)
 			driver := newComplianceTestDriver(client)
 			source := tc.contentSource(client.MockClient)
+			// ROUND 6: see TestCreateVolumeCloneReadinessFailure — the source must be
+			// driver-owned for the geometry of a block clone to be resolvable.
+			stampDriverOwnership(t, client.MockClient, driver, "pool/parent/source")
 
 			_, err := driver.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
 				Name:                "clone-target",
@@ -606,6 +609,10 @@ func TestCreateVolumeCloneReadinessFailure(t *testing.T) {
 			}
 
 			driver := newComplianceTestDriver(client)
+			// ROUND 6: a block clone source must carry the local ownership stamp
+			// createDataset writes, or the destination's geometry is unresolvable and
+			// the request is refused before it ever reaches the arm under test.
+			stampDriverOwnership(t, client.MockClient, driver, "pool/parent/source")
 			// A positive readiness timeout lets confirmCloneReady's single bounded
 			// retry fire (a zero timeout expires the deadline before the second
 			// attempt), so this test pins the genuine two-attempt shape.

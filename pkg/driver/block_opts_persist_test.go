@@ -453,10 +453,21 @@ func TestTunedCreateVolumeStampsResolvedOptions(t *testing.T) {
 	assert.Equal(t, stableISCSISerial("tuned-path"), rebuilt.Serial)
 }
 
-// TestMalformedStoredBlockPropertyIsIgnored proves a corrupt advisory stamp can
-// never wedge an attach: the property is skipped and resolution falls through to
-// the controller default rather than erroring.
-func TestMalformedStoredBlockPropertyIsIgnored(t *testing.T) {
+// TestMalformedStoredBlockPropertyParsesToNoOpinion is a PARSER test, and says
+// so.
+//
+// ROUND 6 LABEL CORRECTION. It was named TestMalformedStoredBlockPropertyIsIgnored
+// and its comment claimed attach behavior ("can never wedge an attach... falls
+// through to the controller default") that it never exercised — and the second
+// half of that claim is not even true for the geometry keys, which stay WITNESSES
+// when malformed so an absent-extent rebuild fails closed. Both halves of the
+// real behavior are driven end to end by
+// TestMalformedStoredGeometryDoesNotWedgeAnAttachButIsNotEvidence.
+//
+// Round 6 also adds the out-of-domain case: a syntactically valid integer that no
+// extent could ever have been created at is untrusted for the same reason a
+// malformed one is.
+func TestMalformedStoredBlockPropertyParsesToNoOpinion(t *testing.T) {
 	ds := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{
 		PropBlockISCSIBlocksize:    {Value: "not-a-number", Source: "local"},
 		PropBlockISCSIReadOnly:     {Value: "sometimes", Source: "local"},
@@ -464,6 +475,15 @@ func TestMalformedStoredBlockPropertyIsIgnored(t *testing.T) {
 		PropBlockISCSISerial:       {Value: "-", Source: "local"},
 	}}
 	assert.Nil(t, blockOptsFromDataset(ds), "malformed and ZFS-sentinel values must resolve to no opinion")
+
+	outOfDomain := &truenas.Dataset{UserProperties: map[string]truenas.UserProperty{
+		PropBlockISCSIBlocksize:      {Value: "1234", Source: "local"},
+		PropBlockISCSIQueuedCommands: {Value: "64", Source: "local"},
+		PropBlockISCSIAvailThreshold: {Value: "0", Source: "local"},
+		PropBlockNVMeoFQidMax:        {Value: "70000", Source: "local"},
+	}}
+	assert.Nil(t, blockOptsFromDataset(outOfDomain),
+		"a stored value outside the knob's request domain records nothing and must not become an opinion")
 }
 
 // TestStoredBlockPropertiesAreInheritedByClones documents the deliberate

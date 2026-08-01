@@ -423,6 +423,16 @@ func (d *Driver) completeResumedCloneRemnant(
 	capacityBytes int64,
 	shareType ShareType,
 ) (*truenas.Dataset, error) {
+	// GEOMETRY FIRST (round 6 ordering fix). Resolving the source's geometry is
+	// read-only and can fail closed; ensureCloneCapacity is a MUTATION of the
+	// destination. Round 5 expanded the remnant first and only then discovered
+	// that the source's layout was unestablishable, which widened the remnant on a
+	// recovery that was going to be refused anyway. Nothing below may move above
+	// this call.
+	geometry, geometryErr := d.contentSourceBlockGeometry(ctx, datasetName, source, shareType)
+	if geometryErr != nil {
+		return nil, geometryErr
+	}
 	if err := d.ensureCloneCapacity(ctx, datasetName, existingDS, capacityBytes); err != nil {
 		return nil, err
 	}
@@ -455,15 +465,11 @@ func (d *Driver) completeResumedCloneRemnant(
 	}
 	// GEOMETRY (round 5). Recovery used to carry NO source geometry and relied on
 	// whatever the remnant happened to inherit from its source's user properties —
-	// safe only by accident, and not at all when the source was unstamped. Resolve
-	// the source's geometry the same way the normal clone path does and fold it
-	// into this same stamp, so the remnant reaches the share builder with a record
+	// safe only by accident, and not at all when the source was unstamped. The
+	// source geometry resolved above (before the capacity mutation) is folded into
+	// this same stamp, so the remnant reaches the share builder with a record
 	// instead of a gap. An unresolvable source fails the recovery closed rather
 	// than completing a volume whose extent would then be created from a guess.
-	geometry, geometryErr := d.contentSourceBlockGeometry(ctx, datasetName, source, shareType)
-	if geometryErr != nil {
-		return nil, geometryErr
-	}
 	for key, value := range geometry.props() {
 		properties[key] = value
 	}

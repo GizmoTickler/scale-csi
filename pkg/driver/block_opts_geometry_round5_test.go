@@ -88,6 +88,11 @@ func TestExplicitRequestIsIntentNotEvidence(t *testing.T) {
 // so the one shape most certain to hold foreign data was classified as
 // data-free and took the controller default.
 //
+// ROUND 6 SCOPE NOTE. This fixture CONSTRUCTS the sentinel shape directly rather
+// than running prepareDetachedSnapshotCopy, so it pins the WITNESS rule only —
+// it cannot notice if that function stops writing the sentinel. The end-to-end
+// dependency is TestDetachedCopyRunThroughItsRealPathCountsAsBlockHistory.
+//
 // FAILS ON 8cec385: yes. datasetUserPropertyHasValue("-") is false there, so
 // resolveExtentCreateBlocksize returns d.config.ISCSI.ExtentBlocksize and the
 // rebuild succeeds with a 512 extent; the error assertion fails.
@@ -122,29 +127,34 @@ func TestDetachedCopySentinelCountsAsBlockHistory(t *testing.T) {
 	assert.Nil(t, created, "no extent may be created at the controller default over copied data")
 }
 
-// TestBareZvolWithNoWitnessIsStillDataFree is the other side of the same rule,
-// and the reason the witness set has to be a set rather than a mood: a zvol with
-// NO CSI bookkeeping at all has never been block-addressed by anything the
-// driver can see, so refusing there would wedge every legitimate fresh build.
+// TestDriverOwnedZvolWithNoWitnessIsDataFree is the other side of the same rule.
 //
-// FAILS ON 8cec385: no. This is a no-regression pin for the broadened witness
-// set, and it is labeled as such rather than presented as a proof.
-func TestBareZvolWithNoWitnessIsStillDataFree(t *testing.T) {
+// ROUND 6 CORRECTION. This was TestBareZvolWithNoWitnessIsStillDataFree, and it
+// asserted that a zvol with NO CSI bookkeeping at all could take the controller
+// default — which is exactly the absence-of-evidence fail-open round 6 removes:
+// an imported or admin-created zvol carrying a foreign filesystem looks
+// identical to a blank one under any number of absence checks. The rule the
+// driver actually needs is the POSITIVE one, so the fixture now carries the
+// LOCAL ownership stamp createDataset writes, and the un-owned half of the
+// contrast moved to TestUnownedZvolIsNotProvablyDataFree.
+//
+// FAILS ON bdf3c36: no. This is a no-regression pin for the case that must keep
+// working — the driver's own zvol that nothing has ever exported — and it is
+// labeled as such rather than presented as a proof.
+func TestDriverOwnedZvolWithNoWitnessIsDataFree(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
 	datasetName := "pool/parent/pvc-bare-zvol"
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
 	require.NoError(t, err)
-	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
-		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
-	})
-	require.NoError(t, err)
+	newOwnedBareZvol(t, client, d, datasetName)
 
 	require.NoError(t, iscsiShareBackend{d}.EnsureShare(ctx, nil, datasetName, "pvc-bare-zvol", nil))
 	created, err := client.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
 	require.NoError(t, err)
 	require.NotNil(t, created)
-	assert.Equal(t, 512, created.Blocksize, "with no history to contradict, the controller default is the honest answer")
+	assert.Equal(t, 512, created.Blocksize,
+		"on storage this driver created and never exported, the controller default is the honest answer")
 }
 
 // TestUncapturedSnapshotRestoreFailsClosed is round-5 HIGH 1: a snapshot's data
@@ -209,10 +219,7 @@ func TestSnapshotWithNoHistorySourceRestoresFreely(t *testing.T) {
 	ctx := context.Background()
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
 	require.NoError(t, err)
-	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
-		Name: "pool/parent/empty-source", Type: "VOLUME", Volsize: testGiB,
-	})
-	require.NoError(t, err)
+	newOwnedBareZvol(t, client, d, "pool/parent/empty-source")
 	_, err = client.SnapshotCreate(ctx, "pool/parent/empty-source", "empty-point", nil)
 	require.NoError(t, err)
 
@@ -230,6 +237,19 @@ func TestSnapshotWithNoHistorySourceRestoresFreely(t *testing.T) {
 // source's live geometry onto every snapshot it takes, including for a source
 // the driver has never stamped.
 //
+// ROUND 6 TAUTOLOGY REPAIR. This test used to leave the controller default at
+// 4096 — the value provisionUnstamped4096Volume sets, and the value the source
+// extent was created from — while asserting that the capture produced 4096. An
+// implementation that stamped the controller default instead of reading the live
+// extent passed. The default is now moved AWAY from the live value before the
+// capture, so the two possible implementations produce different answers and
+// only the correct one passes.
+//
+// VERIFIED EMPIRICALLY: with snapshotGeometryProps replaced by an implementation
+// that stamps d.dataFreeGeometry (the controller default) instead of reading the
+// live extent, the ROUND-5 form of this test PASSES and this form FAILS. That is
+// the discrimination the round-5 form did not have.
+//
 // FAILS ON 8cec385: yes. CreateSnapshot wrote only the four identity properties
 // there, so the snapshot carries no geometry and the assertions on
 // PropBlockISCSIBlocksize / PropBlockISCSIPblocksize fail.
@@ -237,6 +257,11 @@ func TestSnapshotOfABlockVolumeCapturesItsGeometry(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
 	provisionUnstamped4096Volume(t, d, client, "pvc-capture-src")
+
+	// THE DISCRIMINATION: the live extent is 4096 and the controller default is
+	// now 512. Only a capture that reads the extent can produce 4096.
+	d.config.ISCSI.ExtentBlocksize = 512
+	d.config.ISCSI.ExtentDisablePhysicalBlocksize = true
 
 	_, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
 		SourceVolumeId: "pvc-capture-src", Name: "capture-point",
@@ -287,14 +312,20 @@ func TestGuardRequestAgainstEvidence(t *testing.T) {
 	assert.Contains(t, status.Convert(err).Message(), paramISCSIPblocksize)
 }
 
-// TestSnapshotGeometryCaptureCost pins the ONE API-call movement round 5 adds,
-// so it stays honest about what it charges and to whom.
+// TestSnapshotGeometryCaptureCost pins the API-call cost of geometry capture, so
+// it stays honest about what it charges and to whom.
+//
+// ROUND 6 GOLDEN MOVEMENT, stated plainly: a snapshot of a RECORDED zvol now
+// costs one ISCSIExtentFindByDisk too (round 5 charged zero). That saving is
+// precisely what made the stale-stamp capture possible — round 5 returned the
+// stamp without ever asking the extent, so a volume whose extent had been
+// re-created at a different geometry captured the stale value onto a snapshot of
+// bytes addressed through the new one. One read per zvol snapshot is the price of
+// capturing a record of the bytes rather than a record of a record.
 //
 // The `CreateSnapshot fresh` golden in TestControllerGoldenPathAPICallCounts is
-// unchanged (3), because its fixture is a plain dataset with no iSCSI
-// bookkeeping. The charge lands only on a zvol that IS an iSCSI volume and is not
-// yet recorded — the pre-GF4 fleet — and it disappears permanently the moment
-// that volume is recorded, which its first publish or replay does for free.
+// unchanged (3), because its fixture is a FILESYSTEM dataset and the probe is
+// driven by the dataset type. Filesystem snapshots pay nothing.
 func TestSnapshotGeometryCaptureCost(t *testing.T) {
 	measure := func(t *testing.T, name string, stripStamp bool) map[string]int {
 		t.Helper()
@@ -317,12 +348,12 @@ func TestSnapshotGeometryCaptureCost(t *testing.T) {
 	}
 
 	recorded := measure(t, "snap-cost-recorded", false)
-	assert.Zero(t, recorded["ISCSIExtentFindByDisk"],
-		"a volume that already records its geometry pays nothing to snapshot it")
+	assert.Equal(t, 1, recorded["ISCSIExtentFindByDisk"],
+		"even a recorded volume must have its stamp checked against the live extent before the stamp is captured")
 
 	legacy := measure(t, "snap-cost-legacy", true)
 	assert.Equal(t, 1, legacy["ISCSIExtentFindByDisk"],
-		"an UNRECORDED iSCSI zvol pays exactly one live-extent read, once, to give its snapshot provenance")
+		"an UNRECORDED iSCSI zvol pays exactly one live-extent read to give its snapshot provenance")
 }
 
 // foreignExtentClient makes ISCSIExtentCreate behave the way the TrueNAS client
@@ -345,19 +376,22 @@ func (c *foreignExtentClient) ISCSIExtentCreate(
 	return c.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, physicalBlocksize, rpm, opts...)
 }
 
-// TestCreateErrorRecoveryRejectsAForeignExtent is round-5 MEDIUM 3.
+// TestCreateSuccessArmRejectsAForeignExtent is round-5 MEDIUM 3, POST-CREATE arm.
 //
-// The create-error / idempotency arms adopted whatever object came back —
-// ISCSIExtentFindByDisk after an ambiguous error in the share builder, and the
-// client's own find-by-name fallback — with NO geometry check. A concurrent
-// controller or a stale same-name extent could therefore win the race at a
-// different geometry, and the next resource update back-stamped it as this
-// volume's truth.
+// ROUND 6 LABEL CORRECTION. This was named TestCreateErrorRecoveryRejectsAForeignExtent
+// and its comment claimed it covered the createErr + ISCSIExtentFindByDisk
+// recovery arm. It does not: the wrapper below returns the foreign object with a
+// NIL error, which exercises only the post-create validation that follows a
+// SUCCESSFUL ISCSIExtentCreate (the client's own find-by-name fallback shape). A
+// regression that removed the validation from just the error-recovery arm passed
+// here. That arm is covered by TestCreateErrorRecoveryArmRejectsAForeignExtent,
+// which fails the create for real; this test is now named and documented for the
+// arm it does cover.
 //
 // FAILS ON 8cec385: yes. Nothing there compares the returned extent against the
 // geometry the create was authorized at, so CreateVolume returns OK and the
 // dataset is back-stamped with the foreign 512.
-func TestCreateErrorRecoveryRejectsAForeignExtent(t *testing.T) {
+func TestCreateSuccessArmRejectsAForeignExtent(t *testing.T) {
 	d, mock := newBlockImmutabilityDriver(t)
 	client := &foreignExtentClient{MockClient: mock}
 	d.truenasClient = client
@@ -475,15 +509,20 @@ func TestResumedCloneRemnantCarriesSourceGeometry(t *testing.T) {
 		"the recovered volume's extent must be built from it; 512 here is the controller default over cloned 4096 data")
 }
 
-// TestGeometryAndWitnessRideInTheFatalUpdate is round-5 (c), third bullet: the
-// share builder's resource-ID write is warning-only, so a volume could end up
-// with data, no extent-ID witness and no geometry stamp — the precise state in
-// which a later rebuild has nothing to resolve from. Both now ride in
-// CreateVolume's FATAL managed-property update as well, at zero extra cost.
+// TestGeometryAndWitnessAreFoldedIntoTheCallersMap is round-5 (c), third bullet.
+//
+// ROUND 6 LABEL CORRECTION. This was named TestGeometryAndWitnessRideInTheFatalUpdate
+// and its comment claimed it proved CreateVolume's FATAL update persists the keys
+// when the warning-only resource-ID write fails. It proves no such thing: it
+// invokes the backend directly with a SYNTHETIC finalProperties map and asserts
+// the map got the keys. That is map folding, which is worth pinning, but the
+// claim belongs to TestRealCreateVolumePersistsGeometryWhenTheWarningWriteFails,
+// which drives the whole CreateVolume with the warning-only write actually
+// failing. This test is now named and documented for what it does.
 //
 // FAILS ON 8cec385: yes. There the iSCSI backend ignored finalProperties
-// entirely, so a failing resource-ID write left the dataset with neither key.
-func TestGeometryAndWitnessRideInTheFatalUpdate(t *testing.T) {
+// entirely, so nothing was folded into the caller's map.
+func TestGeometryAndWitnessAreFoldedIntoTheCallersMap(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})

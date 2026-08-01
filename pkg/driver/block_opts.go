@@ -42,6 +42,40 @@ const (
 	nvmeoFQidMaxMax = 65535
 )
 
+// validISCSIBlocksizeList is the human-readable rendering of the four logical
+// block sizes an iSCSI extent may be created at, used in every message that asks
+// an operator to record one.
+const validISCSIBlocksizeList = "512, 1024, 2048, 4096"
+
+// validISCSIBlocksize is the SINGLE domain for a logical block size, applied to
+// a StorageClass parameter, a stored dataset stamp and a snapshot-captured stamp
+// alike (round 6).
+//
+// Round 5 validated the request domain (resolveBlockOpts) but parsed a STORED
+// value as any integer at all, so `zfs set truenas-csi:block_blocksize=1234`
+// produced a "known" geometry that a rebuild would then create an extent from.
+// A value outside this set cannot be the layout of any extent the backend can
+// create, so it is not a record of anything: it is treated as UNTRUSTED, which
+// leaves the volume unrecorded and fails a rebuild CLOSED (naming both
+// properties) rather than acting on a typo.
+func validISCSIBlocksize(value int) bool {
+	switch value {
+	case 512, 1024, 2048, 4096:
+		return true
+	default:
+		return false
+	}
+}
+
+// validISCSIQueuedCommands / validISCSIAvailThreshold / validNVMeoFQidMax are
+// the same rule for the stored flavors of the three other bounded knobs, so a
+// stamp can never carry a value resolveBlockOpts would have rejected outright.
+func validISCSIQueuedCommands(value int) bool { return value == 32 || value == 128 }
+func validISCSIAvailThreshold(value int) bool { return value >= 1 && value <= 99 }
+func validNVMeoFQidMax(value int) bool {
+	return value >= nvmeoFQidMaxMin && value <= nvmeoFQidMaxMax
+}
+
 // blockOpts carries the resolved per-volume block-protocol tuning. Pointer
 // fields are nil when the StorageClass did not opt in, which means "omit the
 // API parameter / keep the historical behavior". This is what preserves the
@@ -309,7 +343,8 @@ func blockOptsFromDataset(ds *truenas.Dataset) *blockOpts {
 	opts := &blockOpts{}
 	set := false
 
-	if value, ok := storedBlockInt(ds, PropBlockISCSIBlocksize); ok {
+	if value, ok := storedBlockInt(ds, PropBlockISCSIBlocksize); ok && storedInDomain(
+		PropBlockISCSIBlocksize, value, validISCSIBlocksize, validISCSIBlocksizeList) {
 		opts.iscsiBlocksize = &value
 		set = true
 	}
@@ -317,7 +352,8 @@ func blockOptsFromDataset(ds *truenas.Dataset) *blockOpts {
 		opts.iscsiPblocksize = &value
 		set = true
 	}
-	if value, ok := storedBlockInt(ds, PropBlockISCSIQueuedCommands); ok {
+	if value, ok := storedBlockInt(ds, PropBlockISCSIQueuedCommands); ok && storedInDomain(
+		PropBlockISCSIQueuedCommands, value, validISCSIQueuedCommands, "32, 128") {
 		opts.iscsiQueuedCommands = &value
 		set = true
 	}
@@ -329,7 +365,8 @@ func blockOptsFromDataset(ds *truenas.Dataset) *blockOpts {
 		opts.iscsiReadOnly = &value
 		set = true
 	}
-	if value, ok := storedBlockInt(ds, PropBlockISCSIAvailThreshold); ok {
+	if value, ok := storedBlockInt(ds, PropBlockISCSIAvailThreshold); ok && storedInDomain(
+		PropBlockISCSIAvailThreshold, value, validISCSIAvailThreshold, "1-99") {
 		opts.iscsiAvailThreshold = &value
 		set = true
 	}
@@ -346,7 +383,9 @@ func blockOptsFromDataset(ds *truenas.Dataset) *blockOpts {
 			set = true
 		}
 	}
-	if value, ok := storedBlockInt(ds, PropBlockNVMeoFQidMax); ok {
+	if value, ok := storedBlockInt(ds, PropBlockNVMeoFQidMax); ok && storedInDomain(
+		PropBlockNVMeoFQidMax, value, validNVMeoFQidMax,
+		strconv.Itoa(nvmeoFQidMaxMin)+"-"+strconv.Itoa(nvmeoFQidMaxMax)) {
 		opts.nvmeofQidMax = &value
 		set = true
 	}
@@ -385,6 +424,22 @@ func storedBlockInt(ds *truenas.Dataset, key string) (int, bool) {
 		return 0, false
 	}
 	return value, true
+}
+
+// storedInDomain applies a knob's REQUEST domain to a value read back from a
+// dataset stamp. A stored value outside it is not a record of anything the
+// backend could have been configured with — the likeliest source is an operator
+// typo in the documented `zfs set` recovery — so it is logged and treated as
+// UNRECORDED rather than trusted. The property key stays present, so it still
+// counts as a block-data witness and the volume fails closed instead of silently
+// taking the controller default.
+func storedInDomain(key string, value int, valid func(int) bool, domain string) bool {
+	if valid(value) {
+		return true
+	}
+	klog.Warningf("Ignoring out-of-domain stored block property %s=%d (must be one of %s); "+
+		"treating it as UNRECORDED rather than acting on it", key, value, domain)
+	return false
 }
 
 func storedBlockBool(ds *truenas.Dataset, key string) (value, ok bool) {
@@ -821,18 +876,47 @@ func (k geometryKnowledge) String() string {
 // together; provenance names the evidence, and appears verbatim in the
 // fail-closed messages so an operator can see WHY the driver believes what it
 // believes.
+//
+// ROUND 6. Each FIELD additionally names the evidence IT came from
+// (blocksizeFrom / pblocksizeFrom). Round 5 kept one provenance string for the
+// whole record, which is what made a manufactured record indistinguishable from
+// an observed one: mergeGeometry filled each field independently, recomputed
+// "known" from mere field PRESENCE, and never noticed that the two halves came
+// from sources that disagreed. Per-field attribution is what lets
+// mergeGeometry refuse a disagreement and name both sides of it, and it is what
+// makes "known" mean "every field is attributed to a named body of evidence"
+// rather than "both pointers happen to be non-nil".
 type blockGeometry struct {
-	knowledge  geometryKnowledge
-	blocksize  *int
-	pblocksize *bool
-	provenance string
+	knowledge      geometryKnowledge
+	blocksize      *int
+	blocksizeFrom  string
+	pblocksize     *bool
+	pblocksizeFrom string
+	provenance     string
 }
+
+// unattributedGeometry is the provenance a constructor falls back to when its
+// caller named no evidence. It is deliberately NOT the empty string: an empty
+// per-field provenance makes a record unattributed, and an unattributed record
+// can never be geometryKnown (see attributed).
+const unattributedGeometry = "an unattributed geometry record"
 
 // complete reports whether BOTH geometry fields are resolved. A half-resolved
 // record is never usable for a create: that is the hole that let pblocksize come
 // from the mutable controller default while logical came from the stamp.
 func (g blockGeometry) complete() bool {
 	return g.blocksize != nil && g.pblocksize != nil
+}
+
+// attributed is the stronger predicate "known" is derived from: both fields are
+// resolved AND each one names the evidence it came from. complete() alone is
+// field PRESENCE, which is exactly what round 5 recomputed geometryKnown from —
+// so a record assembled field-by-field from unrelated sources certified itself
+// as known. A record may only claim knowledge about bytes when every field in it
+// can say which body of evidence about those bytes produced it.
+func (g blockGeometry) attributed() bool {
+	return g.blocksize != nil && g.blocksizeFrom != "" &&
+		g.pblocksize != nil && g.pblocksizeFrom != ""
 }
 
 // props renders the geometry keys this record carries, for stamping onto a
@@ -852,26 +936,45 @@ func (g blockGeometry) props() map[string]string {
 	return props
 }
 
-// stampGeometry lifts the two geometry fields out of a parsed stamp. The result
-// is evidence FRAGMENTS: knowledge is only geometryKnown when both are present.
-func stampGeometry(o *blockOpts, provenance string) blockGeometry {
-	g := blockGeometry{knowledge: geometryUnexamined, provenance: provenance}
-	if o != nil {
-		g.blocksize = o.iscsiBlocksize
-		g.pblocksize = o.iscsiPblocksize
+// attribute stamps every RESOLVED field of a freshly constructed record with the
+// evidence it came from, and derives knowledge from ATTRIBUTION rather than from
+// field presence. It is the only way a blockGeometry becomes geometryKnown.
+func (g blockGeometry) attribute(provenance string) blockGeometry {
+	if provenance == "" {
+		provenance = unattributedGeometry
 	}
-	if g.complete() {
+	if g.blocksize != nil {
+		g.blocksizeFrom = provenance
+	}
+	if g.pblocksize != nil {
+		g.pblocksizeFrom = provenance
+	}
+	if g.provenance == "" {
+		g.provenance = provenance
+	}
+	if g.attributed() {
 		g.knowledge = geometryKnown
 	}
 	return g
 }
 
+// stampGeometry lifts the two geometry fields out of a parsed stamp. The result
+// is evidence FRAGMENTS: knowledge is only geometryKnown when both are present.
+func stampGeometry(o *blockOpts, provenance string) blockGeometry {
+	g := blockGeometry{knowledge: geometryUnexamined}
+	if o != nil {
+		g.blocksize = o.iscsiBlocksize
+		g.pblocksize = o.iscsiPblocksize
+	}
+	return g.attribute(provenance)
+}
+
 // liveGeometry lifts the geometry out of a live extent. A backend that omits a
 // field contributes nothing for it — an unknown value is never invented.
 func liveGeometry(extent *truenas.ISCSIExtent, provenance string) blockGeometry {
-	g := blockGeometry{knowledge: geometryUnexamined, provenance: provenance}
+	g := blockGeometry{knowledge: geometryUnexamined}
 	if extent == nil {
-		return g
+		return g.attribute(provenance)
 	}
 	if extent.Blocksize != 0 {
 		blocksize := extent.Blocksize
@@ -881,10 +984,7 @@ func liveGeometry(extent *truenas.ISCSIExtent, provenance string) blockGeometry 
 		pblocksize := *extent.Pblocksize
 		g.pblocksize = &pblocksize
 	}
-	if g.complete() {
-		g.knowledge = geometryKnown
-	}
-	return g
+	return g.attribute(provenance)
 }
 
 // snapshotGeometry reads the geometry a SNAPSHOT captured. A ZFS snapshot holds
@@ -910,10 +1010,18 @@ func snapshotGeometry(snap *truenas.Snapshot) blockGeometry {
 		return value
 	}
 	if raw := read(PropBlockISCSIBlocksize); raw != "" {
-		if value, err := strconv.Atoi(raw); err == nil {
-			g.blocksize = &value
-		} else {
+		if value, err := strconv.Atoi(raw); err != nil {
 			klog.Warningf("Ignoring malformed snapshot geometry property %s=%q on %s: %v", PropBlockISCSIBlocksize, raw, snap.ID, err)
+		} else if !validISCSIBlocksize(value) {
+			// Domain-checked for the same reason the stored stamp is: a value
+			// outside the four sizes an extent can be created at cannot be the
+			// layout of any real data, so treating it as a RECORD would let a typo
+			// drive a rebuild. Dropping it leaves the snapshot half-recorded, which
+			// fails the restore closed.
+			klog.Warningf("Ignoring out-of-domain snapshot geometry property %s=%d on %s (must be one of %s)",
+				PropBlockISCSIBlocksize, value, snap.ID, validISCSIBlocksizeList)
+		} else {
+			g.blocksize = &value
 		}
 	}
 	if raw := read(PropBlockISCSIPblocksize); raw != "" {
@@ -923,38 +1031,76 @@ func snapshotGeometry(snap *truenas.Snapshot) blockGeometry {
 			klog.Warningf("Ignoring malformed snapshot geometry property %s=%q on %s: %v", PropBlockISCSIPblocksize, raw, snap.ID, err)
 		}
 	}
-	if g.complete() {
-		g.knowledge = geometryKnown
-	}
-	return g
+	return g.attribute("the geometry the snapshot captured")
 }
 
-// mergeGeometry fills the gaps in primary from fill without ever overriding a
-// value primary already holds, and recomputes knowledge from the result.
-func mergeGeometry(primary, fill blockGeometry) blockGeometry {
+// mergeGeometry combines two bodies of evidence about the SAME bytes into one
+// record, and REFUSES when they disagree.
+//
+// Round 5 filled each missing field from fill independently, never compared a
+// field the two records both held, and then recomputed geometryKnown from field
+// presence. That is how a "complete" record could be MANUFACTURED out of
+// conflicting halves: a cloned destination stamped block_blocksize=512 with no
+// physical property merged with a complete 4096/true content-source record kept
+// the 512, took physical from the source, and handed ISCSIExtentCreate a 512
+// geometry over 4096-layout data. Two KNOWN records with different values became
+// one known record with no trace that anything had been contradicted.
+//
+// The rule now: a field present on BOTH sides must AGREE. A disagreement is the
+// same class of fact as a stamp-vs-live drift (guardStampedVsLiveGeometry) — the
+// driver cannot know which side describes the bytes, so it names both and
+// refuses. Gap-filling is still allowed, because a field only one side holds is
+// not a contradiction; but the filled field carries the provenance of the record
+// it came FROM, so the result can never claim to be one observation.
+func mergeGeometry(primary, fill blockGeometry, subject string) (blockGeometry, error) {
 	merged := primary
+	if primary.blocksize != nil && fill.blocksize != nil && *primary.blocksize != *fill.blocksize {
+		return blockGeometry{}, status.Errorf(codes.FailedPrecondition,
+			"cannot establish the geometry of %s: %s says its data is addressed through %d-byte logical blocks and %s says %d. "+
+				"These are two records of the SAME bytes and they disagree, so the driver cannot know which one describes them — "+
+				"combining them would manufacture a geometry that was never observed anywhere. Reconcile the two records "+
+				"(%s) and retry",
+			subject, primary.blocksizeFrom, *primary.blocksize, fill.blocksizeFrom, *fill.blocksize, PropBlockISCSIBlocksize)
+	}
+	if primary.pblocksize != nil && fill.pblocksize != nil && *primary.pblocksize != *fill.pblocksize {
+		return blockGeometry{}, status.Errorf(codes.FailedPrecondition,
+			"cannot establish the geometry of %s: %s says its data was laid out for physical-blocksize reporting %t and %s says %t. "+
+				"These are two records of the SAME bytes and they disagree, so the driver cannot know which one describes them. "+
+				"Reconcile the two records (%s) and retry",
+			subject, primary.pblocksizeFrom, *primary.pblocksize, fill.pblocksizeFrom, *fill.pblocksize, PropBlockISCSIPblocksize)
+	}
 	if merged.blocksize == nil && fill.blocksize != nil {
 		merged.blocksize = fill.blocksize
-		if merged.provenance == "" {
-			merged.provenance = fill.provenance
-		} else if fill.provenance != "" && fill.provenance != merged.provenance {
-			merged.provenance = merged.provenance + " and " + fill.provenance
-		}
+		merged.blocksizeFrom = fill.blocksizeFrom
 	}
 	if merged.pblocksize == nil && fill.pblocksize != nil {
 		merged.pblocksize = fill.pblocksize
-		if merged.provenance == "" {
-			merged.provenance = fill.provenance
-		} else if fill.provenance != "" && !strings.Contains(merged.provenance, fill.provenance) {
-			merged.provenance = merged.provenance + " and " + fill.provenance
-		}
+		merged.pblocksizeFrom = fill.pblocksizeFrom
 	}
-	if merged.complete() {
+	merged.provenance = mergedProvenance(merged)
+	// Knowledge is derived from ATTRIBUTION, never from presence alone.
+	if merged.attributed() {
 		merged.knowledge = geometryKnown
 	} else if merged.knowledge == geometryKnown {
 		merged.knowledge = geometryUnexamined
 	}
-	return merged
+	return merged, nil
+}
+
+// mergedProvenance renders the human-readable summary from the per-field
+// attributions, so a record assembled from two sources SAYS it was assembled
+// from two sources instead of presenting one source's name for both halves.
+func mergedProvenance(g blockGeometry) string {
+	switch {
+	case g.blocksizeFrom != "" && g.pblocksizeFrom != "" && g.blocksizeFrom != g.pblocksizeFrom:
+		return g.blocksizeFrom + " and " + g.pblocksizeFrom
+	case g.blocksizeFrom != "":
+		return g.blocksizeFrom
+	case g.pblocksizeFrom != "":
+		return g.pblocksizeFrom
+	default:
+		return g.provenance
+	}
 }
 
 // blockDataHistoryWitnesses is the FULL witness set for "this storage may
@@ -985,6 +1131,12 @@ var blockDataHistoryWitnesses = []string{
 // dataset's bytes may already be addressed through a logical block size, and
 // names the witness. A dataset the driver could not read is treated as
 // data-bearing: absence of evidence is not evidence of absence.
+//
+// NOTE ON WHAT THIS IS AND IS NOT. A `true` here is POSITIVE: a witness was
+// found. A `false` is merely "no witness found", which is NOT the same fact as
+// "these bytes are data-free" — see blockDataFreeProof, which is what every
+// caller that wants to apply a default must use. This function may only be used
+// to REFUSE, never to permit.
 func datasetMayHoldBlockData(ds *truenas.Dataset) (mayHoldData bool, witness string) {
 	if ds == nil {
 		return true, "the dataset could not be read"
@@ -995,6 +1147,89 @@ func datasetMayHoldBlockData(ds *truenas.Dataset) (mayHoldData bool, witness str
 		}
 	}
 	return false, ""
+}
+
+// ---------------------------------------------------------------------------
+// DATA-FREE IS POSITIVE KNOWLEDGE (round 6)
+//
+// Three rounds in a row, the same error: the driver concluded "this storage
+// holds no block-addressed data" from the ABSENCE of its own bookkeeping, and
+// then applied the controller-wide default to it. Round 3 asked one property;
+// round 4 asked one property with a sentinel bug; round 5 asked eleven
+// properties. Widening the question never fixed it, because the answer was
+// always of the form "we looked and saw nothing", and a dataset the driver never
+// created — an imported zvol, a raw zvol an admin attached, a dataset whose
+// bookkeeping was lost or stripped — carries somebody's bytes and none of the
+// driver's properties, so it is INDISTINGUISHABLE from a blank one under any
+// number of absence checks.
+//
+// The fix is structural: the default may only be applied where the driver can
+// state a POSITIVE fact about where these bytes came from. There are exactly two
+// such facts, and blockDataFreeProof returns one of them or refuses:
+//
+//	(P1) THIS CALL CREATED IT. DatasetCreate produced the zvol during this very
+//	     CreateVolume, so nothing has ever been written to it. Established by the
+//	     caller (freshlyCreated), not by reading properties at all.
+//	(P2) THIS DRIVER INSTANCE CREATED IT, AND ITS OWN COMPLETE RECORD OF EVERY
+//	     OPERATION IT HAS EVER PERFORMED ON IT CONTAINS NO BLOCK SHARE. The
+//	     dataset carries THIS driver instance's ownership stamp with ZFS source
+//	     `local` — written by createDataset, and never inheritable, so a clone
+//	     cannot borrow its source's — which says: this dataset was created here,
+//	     and nothing but this driver has ever provisioned it. Only against a
+//	     history the driver OWNS is "our record contains no block share" a
+//	     statement about the bytes rather than a statement about our own
+//	     ignorance.
+//
+// The residual, stated honestly: (P2) would still be wrong for a dataset this
+// driver created, exported, and then lost BOTH witness writes for. Round 5's
+// fold is what makes that a rolled-back provisioning rather than a silent gap —
+// the extent-ID witness and the geometry now ride CreateVolume's FATAL
+// managed-property update as well as the warning-only one, so losing the witness
+// means losing the volume, not keeping a volume with no record. (P2) is a claim
+// about a history this driver controls; it is not a claim about bytes whose
+// history it does not.
+//
+// Everything else — including the previously-permitted "a bare zvol with no
+// CSI properties at all" — is now UNKNOWN and fails closed. That is a
+// deliberate availability cost on exactly one shape: a zvol the driver is asked
+// to export but has never provisioned. Such a zvol is not part of any driver
+// flow (CreateVolume creates its own), and it is precisely the shape that can be
+// carrying a foreign filesystem laid out at some other block size.
+// ---------------------------------------------------------------------------
+
+// blockDataFreeProof returns the POSITIVE proof that ds's bytes cannot already
+// be addressed through some other logical block size, or the reason there is
+// none. Only a caller holding a proof may apply the controller-wide defaults.
+func (d *Driver) blockDataFreeProof(ds *truenas.Dataset) (proof string, ok bool) {
+	if ds == nil {
+		return "the dataset could not be read", false
+	}
+	// A witness beats everything: the driver's own record says these bytes have
+	// been block-addressed.
+	if mayHoldData, witness := datasetMayHoldBlockData(ds); mayHoldData {
+		return fmt.Sprintf("%s records that it has been block-addressed", witness), false
+	}
+	// LOCAL ownership by THIS instance. `local` is load-bearing twice over: a ZFS
+	// clone inherits its source's ownership stamp non-locally, and a clone
+	// destination is the one thing that certainly DOES carry somebody else's
+	// bytes; and a dataset stamped by a different driver instance has a history
+	// this instance cannot account for.
+	if !datasetHasLocalUserProperty(ds, PropDriverInstanceID, d.driverInstanceID()) {
+		owner, present := datasetUserPropertyProjection(ds, PropDriverInstanceID)
+		switch {
+		case !present:
+			return fmt.Sprintf("it carries no %s ownership stamp, so this driver did not create it and cannot account for "+
+				"what has been written to it", PropDriverInstanceID), false
+		case !isLocalUserPropertySource(owner.Source):
+			return fmt.Sprintf("its %s is INHERITED (source %q) rather than local, so it descends from another dataset and "+
+				"carries that dataset's bytes", PropDriverInstanceID, owner.Source), false
+		default:
+			return fmt.Sprintf("%s records owner %q, not this driver instance (%q), so this driver cannot account for what "+
+				"has been written to it", PropDriverInstanceID, owner.Value, d.driverInstanceID()), false
+		}
+	}
+	return fmt.Sprintf("this driver instance created it (local %s) and its own complete record of every operation it has "+
+		"performed on it contains no block share", PropDriverInstanceID), true
 }
 
 // observedGeometryProps is mechanism (1): back-stamp the geometry of an extent
@@ -1145,17 +1380,31 @@ func (d *Driver) resolveExtentGeometry(
 		case geometryUnknown:
 			return extentGeometry{}, d.unknownGeometryError(datasetName, carried.provenance)
 		case geometryNoHistory:
+			// The SOURCE provably held no block-addressed data, so the destination
+			// holds none either and NOTHING can be contradicted: dataFreeGeometry
+			// applies the request/stamp values, which is where a partial stamp
+			// written by this very request's blockOptsProps comes back in. There is
+			// deliberately no conflict check here — a conflict needs two records OF
+			// BYTES, and this branch is the one where there are no bytes.
 			if !evidence.complete() {
 				return d.dataFreeGeometry(merged, carried.provenance), nil
 			}
 		case geometryKnown:
-			evidence = mergeGeometry(evidence, carried)
+			// CONFLICT-REJECTING. Two records of the same bytes that disagree can no
+			// longer be silently combined into one "complete" record — the shape in
+			// which a stale destination stamp of 512 kept its 512 and took physical
+			// from a 4096 source.
+			combined, mergeErr := mergeGeometry(evidence, carried, datasetName)
+			if mergeErr != nil {
+				return extentGeometry{}, mergeErr
+			}
+			evidence = combined
 		case geometryUnexamined:
 		}
 	}
 
-	// (3) A complete record from evidence about the bytes.
-	if evidence.complete() {
+	// (3) A complete record, every field attributed to evidence about the bytes.
+	if evidence.attributed() {
 		if err := guardRequestAgainstEvidence(requestOpts, evidence, datasetName); err != nil {
 			return extentGeometry{}, err
 		}
@@ -1166,23 +1415,25 @@ func (d *Driver) resolveExtentGeometry(
 		}, nil
 	}
 
-	// (4) Nothing the driver can see says this storage was ever block-addressed.
-	if mayHoldData, witness := datasetMayHoldBlockData(ds); !mayHoldData {
-		return d.dataFreeGeometry(merged, "no witness of this dataset ever having been block-addressed"), nil
-	} else if !evidence.complete() {
-		// (5) It may hold data and the record is absent or half-present.
-		reason := fmt.Sprintf("its extent is absent, %s records that it has been block-addressed", witness)
+	// (4) POSITIVE proof that this storage cannot already hold block-addressed
+	// data. Round 5 asked the opposite question here ("did we fail to find a
+	// witness?") and treated the answer as proof; see blockDataFreeProof for why
+	// that is an absence-of-evidence error and what replaced it.
+	if proof, dataFree := d.blockDataFreeProof(ds); dataFree {
+		return d.dataFreeGeometry(merged, proof), nil
+	} else {
+		// (5) There is no proof, and the record is absent or half-present.
+		reason := "its extent is absent and " + proof
 		switch {
 		case evidence.blocksize != nil:
-			reason += fmt.Sprintf(", and it records %s=%d but no %s", PropBlockISCSIBlocksize, *evidence.blocksize, PropBlockISCSIPblocksize)
+			reason += fmt.Sprintf("; it records %s=%d but no %s", PropBlockISCSIBlocksize, *evidence.blocksize, PropBlockISCSIPblocksize)
 		case evidence.pblocksize != nil:
-			reason += fmt.Sprintf(", and it records %s=%t but no %s", PropBlockISCSIPblocksize, *evidence.pblocksize, PropBlockISCSIBlocksize)
+			reason += fmt.Sprintf("; it records %s=%t but no %s", PropBlockISCSIPblocksize, *evidence.pblocksize, PropBlockISCSIBlocksize)
 		default:
-			reason += ", and it records neither geometry property"
+			reason += "; it records neither geometry property"
 		}
 		return extentGeometry{}, d.unknownGeometryError(datasetName, reason)
 	}
-	return extentGeometry{}, d.unknownGeometryError(datasetName, "its geometry could not be established")
 }
 
 // dataFreeGeometry is the ONLY place the controller-wide defaults may be
@@ -1228,9 +1479,10 @@ func (d *Driver) unknownGeometryError(datasetName, reason string) error {
 			"through. Falling back to the controller-wide defaults (iscsi.extentBlocksize=%d, pblocksize=%t) would lay a "+
 			"GUESSED geometry over data that may have been written against a different one, which corrupts it — the driver "+
 			"refuses instead. Recover by restoring the original extent, or by recording the real geometry "+
-			"(zfs set %s=<512|1024|2048|4096> %s=<true|false> %s) and retrying",
+			"(zfs set %s=<%s> %s=<true|false> %s) and retrying; a value outside those four sizes is rejected as untrusted "+
+			"rather than acted on",
 		datasetName, reason, d.config.ISCSI.ExtentBlocksize, !d.config.ISCSI.ExtentDisablePhysicalBlocksize,
-		PropBlockISCSIBlocksize, PropBlockISCSIPblocksize, datasetName)
+		PropBlockISCSIBlocksize, validISCSIBlocksizeList, PropBlockISCSIPblocksize, datasetName)
 }
 
 // validateExtentAgainstGeometry is the retry/idempotency half of the choke point.
@@ -1340,22 +1592,21 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 	// the snapshot's layout, so the only honest answers are "there was never any
 	// block-addressed data to preserve" or "unknown".
 	if snap != nil {
-		if mayHoldData, witness := datasetMayHoldBlockData(sourceDS); !mayHoldData {
+		proof, dataFree := d.blockDataFreeProof(sourceDS)
+		if dataFree {
 			return blockGeometry{
 				knowledge:  geometryNoHistory,
-				provenance: fmt.Sprintf("clone source %s has never been block-addressed", sourceRef),
+				provenance: fmt.Sprintf("clone source %s provably holds no block-addressed data (%s)", sourceRef, proof),
 			}, nil
-		} else {
-			return blockGeometry{}, status.Errorf(codes.FailedPrecondition,
-				"cannot restore %s from %s: the snapshot records no %s/%s geometry of its own, and %s shows its source has "+
-					"held block-addressed data — so the source's CURRENT extent describes the source now, not the layout of "+
-					"the bytes inside this snapshot. Creating the destination from it would lay a guessed geometry over the "+
-					"snapshot's data. Record the snapshot's real geometry and retry "+
-					"(zfs set %s=<512|1024|2048|4096> %s=<true|false> %s); snapshots taken by this driver carry it "+
-					"automatically",
-				datasetName, sourceRef, PropBlockISCSIBlocksize, PropBlockISCSIPblocksize, witness,
-				PropBlockISCSIBlocksize, PropBlockISCSIPblocksize, snap.ID)
 		}
+		return blockGeometry{}, status.Errorf(codes.FailedPrecondition,
+			"cannot restore %s from %s: the snapshot records no %s/%s geometry of its own, and its source is not provably "+
+				"free of block-addressed data (%s) — so the source's CURRENT extent describes the source now, not the layout "+
+				"of the bytes inside this snapshot. Creating the destination from it would lay a guessed geometry over the "+
+				"snapshot's data. Record the snapshot's real geometry and retry "+
+				"(zfs set %s=<%s> %s=<true|false> %s); snapshots taken by this driver carry it automatically",
+			datasetName, sourceRef, PropBlockISCSIBlocksize, PropBlockISCSIPblocksize, proof,
+			PropBlockISCSIBlocksize, validISCSIBlocksizeList, PropBlockISCSIPblocksize, snap.ID)
 	}
 
 	extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, "zvol/"+sourceDataset)
@@ -1373,51 +1624,75 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 	if sourceGeometry.knowledge == geometryKnown {
 		return sourceGeometry, nil
 	}
-	if mayHoldData, _ := datasetMayHoldBlockData(sourceDS); !mayHoldData {
+	if proof, dataFree := d.blockDataFreeProof(sourceDS); dataFree {
 		return blockGeometry{
 			knowledge:  geometryNoHistory,
-			provenance: fmt.Sprintf("clone source %s has never been block-addressed", sourceRef),
+			provenance: fmt.Sprintf("clone source %s provably holds no block-addressed data (%s)", sourceRef, proof),
+		}, nil
+	} else {
+		return blockGeometry{
+			knowledge: geometryUnknown,
+			provenance: fmt.Sprintf(
+				"clone source %s is not provably free of block-addressed data (%s) and neither a complete geometry stamp "+
+					"nor a live extent could establish its layout", sourceRef, proof),
 		}, nil
 	}
-	return blockGeometry{
-		knowledge: geometryUnknown,
-		provenance: fmt.Sprintf(
-			"clone source %s may hold block-addressed data but neither a complete geometry stamp nor a live extent could "+
-				"establish its layout", sourceRef),
-	}, nil
 }
 
 // snapshotGeometryProps renders the geometry a new snapshot of datasetName must
 // CAPTURE so that a later restore has provenance tied to the snapshot rather
 // than to whatever the source looks like at restore time.
 //
-// It is best-effort by construction, and that is safe in exactly one direction:
-// a snapshot whose geometry could not be captured is still taken, and restoring
-// it later fails CLOSED (resolveCloneSourceBlockGeometry) instead of guessing.
-// A missed capture therefore costs availability, never integrity.
+// A failure to READ the live geometry is best-effort, and that is safe in
+// exactly one direction: a snapshot whose geometry could not be captured is
+// still taken, and restoring it later fails CLOSED
+// (resolveCloneSourceBlockGeometry) instead of guessing. A missed capture
+// therefore costs availability, never integrity.
 //
-// Cost: nil (no call) for a filesystem dataset, for a zvol nothing has ever
-// exported, and for any volume the driver has already stamped — which is every
-// volume it has created or published since the geometry stamp existed. One
-// ISCSIExtentFindByDisk for an unstamped iSCSI zvol, i.e. the pre-GF4 fleet.
-func (d *Driver) snapshotGeometryProps(ctx context.Context, ds *truenas.Dataset, datasetName string) map[string]string {
+// A DISAGREEMENT is not best-effort. It fails the snapshot.
+//
+// ROUND 6, two fixes:
+//
+//   - Round 5 returned the volume's STAMP immediately when it was complete,
+//     without ever looking at the live extent. A volume that records 4096 and
+//     whose extent was later re-created at 512 therefore had the stale 4096
+//     captured onto a snapshot of bytes that are now addressed at 512, and the
+//     restore would then create a 4096 extent over them. The live-vs-stamp guard
+//     existed but only the share-rebuild path called it. The live extent is now
+//     ALWAYS consulted, it is the PRIMARY record (it is what the bytes are), and
+//     a stamp that contradicts it fails the snapshot rather than being captured.
+//   - Round 5 also skipped the live probe entirely unless storedBlockProtocol
+//     found a target or target-extent ID, so an iSCSI zvol missing those two
+//     properties — the imported, the stripped, the pre-GF4 — captured nothing at
+//     all. The probe is now driven by the dataset TYPE: every zvol is asked.
+//
+// Cost: nil (no call) for a filesystem dataset. ONE ISCSIExtentFindByDisk for
+// every zvol snapshot, including volumes the driver has already stamped (round 5
+// charged this only to unstamped zvols, which is exactly the saving that made
+// the stale-stamp capture possible).
+func (d *Driver) snapshotGeometryProps(ctx context.Context, ds *truenas.Dataset, datasetName string) (map[string]string, error) {
 	if ds == nil || !strings.EqualFold(ds.Type, "VOLUME") {
-		return nil
+		return nil, nil
 	}
-	stamped := stampGeometry(blockOptsFromDataset(ds), "")
-	if stamped.complete() {
-		return stamped.props()
-	}
-	if !storedBlockProtocol(ds, ShareTypeISCSI) {
-		return stamped.props()
-	}
+	stamped := stampGeometry(blockOptsFromDataset(ds), "the volume's recorded geometry stamp")
 	extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
 	if err != nil {
 		klog.Warningf("Could not capture the live iSCSI geometry of %s onto its snapshot (a later restore of it will "+
 			"fail closed rather than guess): %v", datasetName, err)
-		return stamped.props()
+		return stamped.props(), nil
 	}
-	return mergeGeometry(stamped, liveGeometry(extent, "")).props()
+	// The live extent FIRST: it is what the bytes are addressed through right
+	// now, which is what this snapshot's content is. The stamp only fills a field
+	// the backend does not report.
+	captured, mergeErr := mergeGeometry(
+		liveGeometry(extent, "the volume's live iSCSI extent"), stamped, datasetName)
+	if mergeErr != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot snapshot %s: %s. A snapshot must carry the geometry of the bytes INSIDE it, and the driver will not "+
+				"capture a record it knows to be contradicted — a restore would then lay that geometry over data addressed "+
+				"through the other one", datasetName, status.Convert(mergeErr).Message())
+	}
+	return captured.props(), nil
 }
 
 // reconcileSourceGeometry applies the precedence rule of mechanism (4) to a
@@ -1425,37 +1700,23 @@ func (d *Driver) snapshotGeometryProps(ctx context.Context, ds *truenas.Dataset,
 // answers where there is no extent, and a disagreement is refused rather than
 // silently resolved. A drifted source is exactly the state in which "which of
 // these two numbers is the truth" cannot be answered from inside the driver.
+// ROUND 6: this used to hand-roll the same field-by-field combination
+// mergeGeometry does, which meant the two had to be kept in agreement by hand —
+// and they were not (mergeGeometry had no disagreement check at all). Both now
+// go through the ONE conflict-rejecting combiner, so there is a single place
+// where two records of the same bytes are reconciled.
 func reconcileSourceGeometry(stamped *blockOpts, extent *truenas.ISCSIExtent, sourceRef string) (blockGeometry, error) {
-	resolved := stampGeometry(stamped, fmt.Sprintf("clone source %s's recorded geometry stamp", sourceRef))
+	stamp := stampGeometry(stamped, fmt.Sprintf("clone source %s's recorded geometry stamp", sourceRef))
 	if extent == nil {
-		return resolved, nil
+		return stamp, nil
 	}
-	if extent.Blocksize != 0 {
-		if resolved.blocksize != nil && *resolved.blocksize != extent.Blocksize {
-			return blockGeometry{}, status.Errorf(codes.FailedPrecondition,
-				"clone source %s records iSCSI extent blocksize %d but its live extent reports %d. The driver will not clone "+
-					"data whose real geometry it cannot establish: reconcile the source's extent and its %s stamp, then retry",
-				sourceRef, *resolved.blocksize, extent.Blocksize, PropBlockISCSIBlocksize)
-		}
-		blocksize := extent.Blocksize
-		resolved.blocksize = &blocksize
-	}
-	if extent.Pblocksize != nil {
-		if resolved.pblocksize != nil && *resolved.pblocksize != *extent.Pblocksize {
-			return blockGeometry{}, status.Errorf(codes.FailedPrecondition,
-				"clone source %s records iSCSI physical-blocksize reporting %t but its live extent reports %t. The driver will "+
-					"not clone data whose real geometry it cannot establish: reconcile the source's extent and its %s stamp, "+
-					"then retry",
-				sourceRef, *resolved.pblocksize, *extent.Pblocksize, PropBlockISCSIPblocksize)
-		}
-		pblocksize := *extent.Pblocksize
-		resolved.pblocksize = &pblocksize
-	}
-	if resolved.complete() {
-		resolved.knowledge = geometryKnown
-		resolved.provenance = fmt.Sprintf("clone source %s's live extent", sourceRef)
-	}
-	return resolved, nil
+	// The live extent is PRIMARY: it is what the source's data is addressed
+	// through. The stamp only fills a field the backend does not report.
+	return mergeGeometry(
+		liveGeometry(extent, fmt.Sprintf("clone source %s's live extent", sourceRef)),
+		stamp,
+		"clone source "+sourceRef,
+	)
 }
 
 // ---------------------------------------------------------------------------

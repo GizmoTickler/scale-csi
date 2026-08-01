@@ -703,20 +703,25 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 		UserProperties: make(map[string]UserProperty, len(userProperties)),
 	}
 	// A ZFS snapshot holds the dataset's user properties as of the instant it was
-	// taken, and the driver's geometry-provenance rule depends on exactly that:
-	// the block-geometry stamp a snapshot CAPTURED is the only record of the
-	// layout of the bytes inside it. Model that capture for the two geometry keys
-	// so a fixture that stamps a dataset and then snapshots it behaves like the
-	// real backend.
+	// taken — ALL of them, not a chosen subset. The driver's geometry-provenance
+	// rule depends on exactly that (the block-geometry stamp a snapshot CAPTURED is
+	// the only record of the layout of the bytes inside it), and so does every
+	// witness- and identity-sniffing rule that reads a snapshot back.
 	//
-	// Deliberately NARROW. Full property inheritance is also real ZFS behavior,
-	// but managed_resource inheriting into manual snapshots is precisely the case
-	// isCSISnapshot has to reason about, so widening this would silently change
-	// unrelated identity sniffs across the suite.
-	for _, key := range snapshotInheritedGeometryProperties {
-		if prop, ok := m.datasetUserPropertyLocked(dataset, key); ok {
-			snap.UserProperties[key] = prop
-		}
+	// ROUND 6 WIDENING. Round 5 modeled the capture for the two geometry keys ONLY,
+	// on the reasoning that widening it would disturb identity sniffs elsewhere.
+	// That reasoning had the fidelity argument backwards: the narrowing did not
+	// prevent a behavior, it prevented the SUITE FROM SEEING one, so no test could
+	// expose a bug that depends on a witness or identity property riding a snapshot
+	// — which is precisely the class this driver's restore path reasons about.
+	// The mock now inherits every user property, exactly like ZFS. Callers that
+	// need a snapshot to look like a NON-CSI snapshot must set up a dataset that
+	// does not carry the CSI markers, rather than relying on the mock to drop them.
+	//
+	// The sentinel rule is real ZFS too: a property whose value is "-" or empty is
+	// not a property, so it is not inherited.
+	for key, prop := range m.datasetUserPropertiesLocked(dataset) {
+		snap.UserProperties[key] = prop
 	}
 	for key, value := range userProperties {
 		snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
@@ -725,25 +730,21 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 	return snap, nil
 }
 
-// snapshotInheritedGeometryProperties are the block-geometry user properties a
-// ZFS snapshot captures from its dataset. Kept as literals because the driver
-// package that declares them imports this one.
-var snapshotInheritedGeometryProperties = []string{
-	"truenas-csi:block_blocksize",
-	"truenas-csi:block_pblocksize",
-}
-
-// datasetUserPropertyLocked reads a dataset user property. The caller holds m.mu.
-func (m *MockClient) datasetUserPropertyLocked(dataset, key string) (UserProperty, bool) {
+// datasetUserPropertiesLocked snapshots the inheritable user properties of a
+// dataset. The caller holds m.mu.
+func (m *MockClient) datasetUserPropertiesLocked(dataset string) map[string]UserProperty {
 	ds, ok := m.Datasets[dataset]
 	if !ok || ds == nil || ds.UserProperties == nil {
-		return UserProperty{}, false
+		return nil
 	}
-	prop, ok := ds.UserProperties[key]
-	if !ok || prop.Value == "" || prop.Value == "-" {
-		return UserProperty{}, false
+	inherited := make(map[string]UserProperty, len(ds.UserProperties))
+	for key, prop := range ds.UserProperties {
+		if prop.Value == "" || prop.Value == "-" {
+			continue
+		}
+		inherited[key] = prop
 	}
-	return prop, true
+	return inherited
 }
 
 // SetSnapshotUsedBytes is a test helper to set the "used" property on a snapshot.

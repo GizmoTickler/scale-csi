@@ -373,6 +373,7 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 				Name: "pool/parent/clone-source", Type: sourceType, Volsize: testGiB,
 			})
 			require.NoError(t, err)
+			stampDriverOwnership(t, client.MockClient, d, "pool/parent/clone-source")
 			if len(stamp) > 0 {
 				require.NoError(t, client.MockClient.DatasetSetUserProperties(ctx, "pool/parent/clone-source", stamp))
 			}
@@ -536,6 +537,13 @@ func provisionUnstamped4096SourceCaptured(
 	ctx := context.Background()
 	provisionUnstamped4096Volume(t, d, client, volumeName)
 
+	// ROUND 6 TAUTOLOGY REPAIR. The controller default is moved to the RESTORE
+	// value BEFORE the capture, not after it. Round 5 left it at 4096 — the value
+	// the source extent was created from — so an implementation that stamped the
+	// controller default instead of reading the live extent produced 4096 and the
+	// capture assertion below could not tell the two apart.
+	d.config.ISCSI.ExtentBlocksize = controllerDefaultAtRestore
+
 	// Through the DRIVER: CreateSnapshot reads the unstamped zvol's LIVE extent
 	// and captures its geometry onto the snapshot, which is what "now IS the
 	// snapshot's content" buys.
@@ -548,9 +556,8 @@ func provisionUnstamped4096SourceCaptured(
 	require.NoError(t, err)
 	require.NotNil(t, snap)
 	require.Equal(t, "4096", snap.UserProperties[PropBlockISCSIBlocksize].Value,
-		"the driver must capture the source's LIVE geometry onto the snapshot it takes")
-
-	d.config.ISCSI.ExtentBlocksize = controllerDefaultAtRestore
+		"the driver must capture the source's LIVE geometry onto the snapshot it takes, not the controller default (%d)",
+		controllerDefaultAtRestore)
 	return snapshotName
 }
 
@@ -703,10 +710,7 @@ func TestUnstampedSourceWithNoExtentIsNotAConflict(t *testing.T) {
 	ctx := context.Background()
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
 	require.NoError(t, err)
-	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
-		Name: "pool/parent/bare-source", Type: "VOLUME", Volsize: testGiB,
-	})
-	require.NoError(t, err)
+	newOwnedBareZvol(t, client, d, "pool/parent/bare-source")
 	_, err = client.SnapshotCreate(ctx, "pool/parent/bare-source", "bare-point", nil)
 	require.NoError(t, err)
 

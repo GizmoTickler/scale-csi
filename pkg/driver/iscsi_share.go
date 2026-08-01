@@ -128,6 +128,81 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	}
 	opts := mergeBlockOpts(requestOpts, storedOpts)
 
+	// Step 1: resolve the EXISTING extent, and — when there is none to resolve —
+	// the geometry a new one may be created at.
+	//
+	// ORDERING (round 6). This block used to sit AFTER target creation and after
+	// strict-mode initiator-group creation + its PropISCSIInitiatorID write, so
+	// the round-5 comment claiming the geometry decision happened "before the
+	// first destination mutation" was false on the generic
+	// existing-volume/publish/startup path: an unresolvable geometry refused only
+	// after a target (and, in strict mode, an initiator group and a dataset
+	// property) had already been created, and the error path deletes neither. Each
+	// retried publish or reconcile pass therefore accreted remnants on a volume
+	// that could never be published. Everything from here to the geometry
+	// resolution is READ-ONLY, so the refusal now genuinely precedes the first
+	// write. Do not move a mutation above it.
+	var extent *truenas.ISCSIExtent
+	var extentID int
+
+	if !freshlyCreated {
+		extent, err = d.resolveISCSIExtent(ctx, ds, datasetName)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to resolve iSCSI extent: %v", err)
+		}
+		if extent != nil {
+			// Precedence, and the one case the driver refuses to decide: the LIVE
+			// extent says what the data is addressed through, the STAMP says what the
+			// volume was provisioned with, and a disagreement between them is real
+			// drift (an out-of-band edit, or a geometry laundered onto this volume by
+			// an earlier defaulted rebuild). Surfacing it beats silently preferring
+			// either side, which is what let a wrong geometry certify itself to every
+			// downstream guard.
+			if guardErr := guardStampedVsLiveGeometry(storedOpts, extent, datasetName); guardErr != nil {
+				return guardErr
+			}
+			// R-1, existing-extent half: blocksize is immutable once an extent
+			// holds data. Reject a request whose resolved blocksize diverges from
+			// the existing extent rather than silently keeping a geometry that
+			// desyncs the StorageClass contract from the backend.
+			//
+			// The comparison uses the OPINION (per-SC override, else the stored
+			// stamp), never the controller default. Defaulting here is what made a
+			// no-opts publish of a 4096 volume compare 4096 vs 512 and return
+			// FailedPrecondition forever.
+			if guardErr := guardISCSIBlocksizeImmutability(extent, opts.requestedISCSIBlocksize(), datasetName); guardErr != nil {
+				return guardErr
+			}
+			// codex gate #1, extent half: pblocksize / insecureTpc / readOnly /
+			// availThreshold / stableSerial are create-time-only for this driver.
+			// Silently returning success while the extent stays permissive
+			// (insecure_tpc) or writable (ro) was a safety-contract violation, not
+			// just a docs gap.
+			if guardErr := guardExistingISCSIExtentOpts(extent, requestOpts, storedOpts, datasetName); guardErr != nil {
+				return guardErr
+			}
+			extentID = extent.ID
+			klog.V(4).Infof("Resolved existing extent by disk path %s (ID %d)", diskPath, extentID)
+		}
+	}
+
+	// THE GEOMETRY CHOKE POINT. One record, logical AND physical resolved
+	// together by one function from evidence about the bytes that already exist —
+	// never from a StorageClass parameter or a helm default over storage that may
+	// hold data. Resolved here, before ANY backend object is created, so an
+	// unestablishable geometry refuses without leaving a remnant behind. See "the
+	// geometry invariant" in block_opts.go.
+	var geometry extentGeometry
+	if extent == nil {
+		var geometryErr error
+		geometry, geometryErr = d.resolveExtentGeometry(ctx, requestOpts, storedOpts, ds, datasetName, freshlyCreated)
+		if geometryErr != nil {
+			return geometryErr
+		}
+		klog.V(4).Infof("Resolved extent geometry for %s: blocksize=%d pblocksize=%t (%s)",
+			datasetName, geometry.blocksize, geometry.pblocksize, geometry.provenance)
+	}
+
 	// Step 2: Find or create target (idempotent)
 	var target *truenas.ISCSITarget
 	var targetID int
@@ -258,67 +333,12 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 		klog.V(4).Infof("Skipping zvol wait for %s (already verified ready)", datasetName)
 	}
 
-	// Step 4: Find or create extent with retry (idempotent)
-	var extent *truenas.ISCSIExtent
-	var extentID int
-
-	if !freshlyCreated {
-		extent, err = d.resolveISCSIExtent(ctx, ds, datasetName)
-		if err != nil {
-			return status.Errorf(codes.Internal, "failed to resolve iSCSI extent: %v", err)
-		}
-		if extent != nil {
-			// Precedence, and the one case the driver refuses to decide: the LIVE
-			// extent says what the data is addressed through, the STAMP says what the
-			// volume was provisioned with, and a disagreement between them is real
-			// drift (an out-of-band edit, or a geometry laundered onto this volume by
-			// an earlier defaulted rebuild). Surfacing it beats silently preferring
-			// either side, which is what let a wrong geometry certify itself to every
-			// downstream guard.
-			if guardErr := guardStampedVsLiveGeometry(storedOpts, extent, datasetName); guardErr != nil {
-				return guardErr
-			}
-			// R-1, existing-extent half: blocksize is immutable once an extent
-			// holds data. Reject a request whose resolved blocksize diverges from
-			// the existing extent rather than silently keeping a geometry that
-			// desyncs the StorageClass contract from the backend.
-			//
-			// The comparison uses the OPINION (per-SC override, else the stored
-			// stamp), never the controller default. Defaulting here is what made a
-			// no-opts publish of a 4096 volume compare 4096 vs 512 and return
-			// FailedPrecondition forever.
-			if guardErr := guardISCSIBlocksizeImmutability(extent, opts.requestedISCSIBlocksize(), datasetName); guardErr != nil {
-				return guardErr
-			}
-			// codex gate #1, extent half: pblocksize / insecureTpc / readOnly /
-			// availThreshold / stableSerial are create-time-only for this driver.
-			// Silently returning success while the extent stays permissive
-			// (insecure_tpc) or writable (ro) was a safety-contract violation, not
-			// just a docs gap.
-			if guardErr := guardExistingISCSIExtentOpts(extent, requestOpts, storedOpts, datasetName); guardErr != nil {
-				return guardErr
-			}
-			extentID = extent.ID
-			klog.V(4).Infof("Resolved existing extent by disk path %s (ID %d)", diskPath, extentID)
-		}
-	}
-
-	// Create extent with retry logic
+	// Step 4: Create the extent with retry (idempotent). The existing extent, and
+	// the geometry a new one may be created at, were both resolved in step 1
+	// before any backend object was touched.
 	if extent == nil {
 		comment := fmt.Sprintf("truenas-csi: %s", datasetName)
 		var lastErr error
-
-		// THE GEOMETRY CHOKE POINT. One record, logical AND physical resolved
-		// together by one function from evidence about the bytes that already
-		// exist — never from a StorageClass parameter or a helm default over
-		// storage that may hold data. There is no live extent here to read (that is
-		// why we are creating one). See "the geometry invariant" in block_opts.go.
-		geometry, geometryErr := d.resolveExtentGeometry(ctx, requestOpts, storedOpts, ds, datasetName, freshlyCreated)
-		if geometryErr != nil {
-			return geometryErr
-		}
-		klog.V(4).Infof("Resolved extent geometry for %s: blocksize=%d pblocksize=%t (%s)",
-			datasetName, geometry.blocksize, geometry.pblocksize, geometry.provenance)
 
 		for attempt := 0; attempt < defaultShareRetryAttempts; attempt++ {
 			if attempt > 0 {
