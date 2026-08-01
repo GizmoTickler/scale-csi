@@ -822,6 +822,13 @@ func TestCreateVolumeDetachedSnapshotCopyNormalizesZvolCapacityAndIdentity(t *te
 			{Key: PropCSIVolumeName, Value: "block-intermediate"},
 			{Key: PropVolumeContentSourceType, Value: "volume"},
 			{Key: PropVolumeContentSourceID, Value: "stale-source"},
+			// A real block volume records the geometry its data is addressed
+			// through. The round-5 invariant refuses to restore a snapshot that
+			// captured no geometry of its own from a source with block-data
+			// history; the mock models the ZFS capture, so stamping the source here
+			// is what makes the snapshot below carry it.
+			{Key: PropBlockISCSIBlocksize, Value: "512"},
+			{Key: PropBlockISCSIPblocksize, Value: "true"},
 		},
 	})
 	require.NoError(t, err)

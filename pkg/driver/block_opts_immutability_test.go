@@ -294,7 +294,7 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 		assert.Equal(t, map[string]int{"DatasetGet": 1, "ISCSIExtentFindByDisk": 1}, methods,
 			"an UNSTAMPED volume-clone source costs exactly one stamp read plus one live-extent read")
 
-		d, client = newSource(t, map[string]string{PropBlockISCSIBlocksize: "4096"}, true)
+		d, client = newSource(t, map[string]string{PropBlockISCSIBlocksize: "4096", PropBlockISCSIPblocksize: "true"}, true)
 		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, nil, "vol", "pool/parent/dst", ShareTypeISCSI)
 		require.NoError(t, err)
 		_, methods = client.callSnapshot()
@@ -316,7 +316,7 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 		// Round 5: a SNAPSHOT restore is a different question, and a snapshot that
 		// captured its own geometry answers it with NO read of the source at all —
 		// cheaper than round 4, which paid two calls to ask the wrong thing.
-		d, client = newSource(t, map[string]string{PropBlockISCSIBlocksize: "4096"}, true)
+		d, client = newSource(t, map[string]string{PropBlockISCSIBlocksize: "4096", PropBlockISCSIPblocksize: "true"}, true)
 		capturedSnap := &truenas.Snapshot{
 			ID: "pool/parent/src@point", Name: "point", Dataset: "pool/parent/src",
 			UserProperties: map[string]truenas.UserProperty{
@@ -334,7 +334,7 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 		// A snapshot that captured nothing costs exactly one DatasetGet — the
 		// history check — and then fails closed. It never reads the source's live
 		// extent, because the source's live extent cannot answer for the snapshot.
-		d, client = newSource(t, nil, true)
+		d, client = newSource(t, map[string]string{PropISCSIExtentID: "7"}, true)
 		bareSnap := &truenas.Snapshot{ID: "pool/parent/src@bare", Name: "bare", Dataset: "pool/parent/src"}
 		_, err = d.resolveCloneSourceBlockGeometry(context.Background(), "pool/parent/src", nil, bareSnap, "bare", "pool/parent/dst", ShareTypeISCSI)
 		require.Error(t, err)
@@ -385,21 +385,33 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 			return client.callSnapshot()
 		}
 
-		// 23 calls for an iSCSI snapshot restore. Of those, exactly two belong to
-		// the geometry resolution (one of the four DatasetGets, one of the two
-		// ISCSIExtentFindByDisks); the isolation subtest above is what proves that
-		// split rather than this arithmetic.
+		// Round 5 MOVED these numbers, downward, and the movement is the fix: a
+		// snapshot restore no longer interrogates the source's CURRENT state,
+		// because the source's current state cannot answer for the snapshot's
+		// bytes. It asks the snapshot.
+		//
+		// 22 calls for a restore whose source has no block history at all: one
+		// DatasetGet establishes that (no live-extent read follows, because there
+		// is nothing to preserve). Round 4 spent 23 here, the extra one being an
+		// ISCSIExtentFindByDisk asking the wrong question.
 		base, baseMethods := measure(t, "restore-default", "iscsi", nil, nil)
-		assert.Equal(t, 23, base, "the block snapshot-restore total, geometry resolution included")
+		assert.Equal(t, 22, base, "the block snapshot-restore total, geometry resolution included")
 		assert.Equal(t, 4, baseMethods["DatasetGet"])
-		assert.Equal(t, 2, baseMethods["ISCSIExtentFindByDisk"])
+		assert.Equal(t, 1, baseMethods["ISCSIExtentFindByDisk"],
+			"the one remaining find-by-disk belongs to the DESTINATION's share build, not to the source probe")
 
-		stamped, _ := measure(t, "restore-stamped", "iscsi",
-			map[string]string{paramISCSIBlocksize: "512"}, map[string]string{PropBlockISCSIBlocksize: "512"})
-		assert.Equal(t, base, stamped, "opting into a geometry adds nothing: the source is resolved either way")
+		// A snapshot that carries its own COMPLETE geometry record is resolved with
+		// no source read whatsoever — one call cheaper still.
+		stamped, stampedMethods := measure(t, "restore-stamped", "iscsi",
+			map[string]string{paramISCSIBlocksize: "512"},
+			map[string]string{PropBlockISCSIBlocksize: "512", PropBlockISCSIPblocksize: "true"})
+		assert.Equal(t, base-1, stamped,
+			"a snapshot that captured its own geometry needs no source read at all")
+		assert.Equal(t, 3, stampedMethods["DatasetGet"])
 
 		unstamped, _ := measure(t, "restore-unstamped", "iscsi", map[string]string{paramISCSIBlocksize: "512"}, nil)
-		assert.Equal(t, base, unstamped, "an UNSTAMPED source costs the same as a stamped one")
+		assert.Equal(t, base, unstamped,
+			"a source with no block history costs the one history read, whatever the class says")
 
 		nfs, nfsMethods := measure(t, "restore-nfs", "nfs", nil, nil)
 		assert.Equal(t, 10, nfs, "the NFS clone golden is untouched by any of this")
@@ -432,15 +444,32 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 // construction. The stamp is therefore stripped here — that is what "pre-GF4
 // volume" now means, and it is stripped BEFORE the snapshot so the snapshot and
 // any clone of it inherit nothing either.
-func provisionUnstamped4096Source(
-	t *testing.T,
-	d *Driver,
-	client *truenas.MockClient,
-	volumeName, snapshotName string,
-	controllerDefaultAtRestore int,
-) string {
+// ROUND 5 SPLIT. The fixture now comes in two flavors, because the round-5
+// provenance rule makes them behave differently ON PURPOSE:
+//
+//   - provisionUnstamped4096Source takes the snapshot with the RAW backend call
+//     and no properties, which is what a snapshot taken before this mechanism
+//     existed looks like: it captured no geometry. Restoring it FAILS CLOSED,
+//     because the source's current extent describes the source now, not the
+//     bytes inside the snapshot.
+//   - provisionUnstamped4096SourceCaptured takes it through the DRIVER's
+//     CreateSnapshot, which captures the source's live geometry onto the
+//     snapshot. That is the round-5 mechanism that keeps the pre-GF4 fleet
+//     restorable, and every "an unstamped source still restores at 4096" test
+//     uses it.
+//
+// Both leave the source DATASET unstamped: "pre-GF4 volume" still means the
+// dataset records nothing.
+func provisionUnstamped4096Volume(t *testing.T, d *Driver, client *truenas.MockClient, volumeName string) {
 	t.Helper()
 	ctx := context.Background()
+	// Save/restore the driver config this fixture mutates. Each caller builds its
+	// own driver today, so nothing leaks — but a fixture that silently leaves a
+	// mutated controller default behind is precisely how the round-3 tautology
+	// happened, and hygiene here is cheaper than re-deriving that argument.
+	original := d.config.ISCSI.ExtentBlocksize
+	t.Cleanup(func() { d.config.ISCSI.ExtentBlocksize = original })
+
 	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
 	require.NoError(t, err)
 
@@ -453,7 +482,12 @@ func provisionUnstamped4096Source(
 	extent, err := client.ISCSIExtentFindByDisk(ctx, "zvol/pool/parent/"+volumeName)
 	require.NoError(t, err)
 	require.NotNil(t, extent)
-	require.Equal(t, 4096, extent.Blocksize, "the source volume must really be 4096 for this test to mean anything")
+	// NOT a proof that the fixture works — the controller default IS 4096 at this
+	// instant, so this line can only echo it. It is a guard against a future
+	// change silently making CreateVolume ignore the default; the discrimination
+	// proof is TestUnstampedSourceFixtureActuallyDiscriminates, which varies the
+	// default at RESTORE time while the source stays 4096.
+	require.Equal(t, 4096, extent.Blocksize, "sanity: CreateVolume must honor the controller default on a fresh zvol")
 
 	// Strip the geometry record: a pre-GF4 volume has one nowhere.
 	require.NoError(t, client.DatasetRemoveUserProperties(ctx, "pool/parent/"+volumeName,
@@ -462,8 +496,23 @@ func provisionUnstamped4096Source(
 	require.NoError(t, err)
 	require.Nil(t, blockOptsFromDataset(ds),
 		"the source must be UNSTAMPED — that is the whole point of this fixture")
+}
 
-	_, err = client.SnapshotCreate(ctx, "pool/parent/"+volumeName, snapshotName, map[string]string{
+func provisionUnstamped4096Source(
+	t *testing.T,
+	d *Driver,
+	client *truenas.MockClient,
+	volumeName, snapshotName string,
+	controllerDefaultAtRestore int,
+) string {
+	t.Helper()
+	ctx := context.Background()
+	provisionUnstamped4096Volume(t, d, client, volumeName)
+
+	// The RAW backend call with no properties: a snapshot from before geometry
+	// capture existed. It captures nothing, and the dataset is unstamped, so the
+	// mock's ZFS-capture modelling gives it nothing either.
+	_, err := client.SnapshotCreate(ctx, "pool/parent/"+volumeName, snapshotName, map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           snapshotName,
 		PropCSISnapshotSourceVolumeID: volumeName,
@@ -472,6 +521,35 @@ func provisionUnstamped4096Source(
 
 	// The controller-wide default at RESTORE time is the caller's business, and
 	// stating it is what makes the caller's assertions discriminate.
+	d.config.ISCSI.ExtentBlocksize = controllerDefaultAtRestore
+	return snapshotName
+}
+
+func provisionUnstamped4096SourceCaptured(
+	t *testing.T,
+	d *Driver,
+	client *truenas.MockClient,
+	volumeName, snapshotName string,
+	controllerDefaultAtRestore int,
+) string {
+	t.Helper()
+	ctx := context.Background()
+	provisionUnstamped4096Volume(t, d, client, volumeName)
+
+	// Through the DRIVER: CreateSnapshot reads the unstamped zvol's LIVE extent
+	// and captures its geometry onto the snapshot, which is what "now IS the
+	// snapshot's content" buys.
+	_, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
+		SourceVolumeId: volumeName,
+		Name:           snapshotName,
+	})
+	require.NoError(t, err)
+	snap, err := client.SnapshotFindByName(ctx, "pool/parent", snapshotName)
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+	require.Equal(t, "4096", snap.UserProperties[PropBlockISCSIBlocksize].Value,
+		"the driver must capture the source's LIVE geometry onto the snapshot it takes")
+
 	d.config.ISCSI.ExtentBlocksize = controllerDefaultAtRestore
 	return snapshotName
 }
@@ -489,7 +567,7 @@ func provisionUnstamped4096Source(
 func TestSnapshotRestoreOfUnstampedSourceIntoConflictingBlocksizeFailsClosed(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
-	snapshotID := provisionUnstamped4096Source(t, d, client, "pvc-legacy-4k", "legacy-point", 512)
+	snapshotID := provisionUnstamped4096SourceCaptured(t, d, client, "pvc-legacy-4k", "legacy-point", 512)
 
 	_, err := d.CreateVolume(ctx, restoreFromSnapshot(
 		blockTuningRequest("pvc-legacy-restore", "iscsi", map[string]string{paramISCSIBlocksize: "512"}),
@@ -515,7 +593,7 @@ func TestSnapshotRestoreOfUnstampedSourceIntoConflictingBlocksizeFailsClosed(t *
 func TestDetachedRestoreOfUnstampedSourceFailsClosed(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
-	snapshotID := provisionUnstamped4096Source(t, d, client, "pvc-legacy-detach-src", "legacy-detach-point", 512)
+	snapshotID := provisionUnstamped4096SourceCaptured(t, d, client, "pvc-legacy-detach-src", "legacy-detach-point", 512)
 
 	req := restoreFromSnapshot(
 		blockTuningRequest("pvc-legacy-detach", "iscsi", map[string]string{paramISCSIBlocksize: "512"}),
@@ -573,7 +651,7 @@ func TestVolumeCloneOfUnstampedSourceFailsClosed(t *testing.T) {
 func TestUnstampedSourceRestoreWithNoOptsIsNeverRejected(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
-	snapshotID := provisionUnstamped4096Source(t, d, client, "pvc-legacy-inherit-src", "legacy-inherit-point", 512)
+	snapshotID := provisionUnstamped4096SourceCaptured(t, d, client, "pvc-legacy-inherit-src", "legacy-inherit-point", 512)
 
 	_, err := d.CreateVolume(ctx, restoreFromSnapshot(
 		blockTuningRequest("pvc-legacy-inherit", "iscsi", nil), snapshotID))
@@ -593,7 +671,7 @@ func TestUnstampedSourceRestoreWithNoOptsIsNeverRejected(t *testing.T) {
 func TestUnstampedSourceRestoreIntoMatchingClassSucceeds(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
-	snapshotID := provisionUnstamped4096Source(t, d, client, "pvc-legacy-match-src", "legacy-match-point", 512)
+	snapshotID := provisionUnstamped4096SourceCaptured(t, d, client, "pvc-legacy-match-src", "legacy-match-point", 512)
 
 	_, err := d.CreateVolume(ctx, restoreFromSnapshot(
 		blockTuningRequest("pvc-legacy-match", "iscsi", map[string]string{paramISCSIBlocksize: "4096"}),
@@ -1122,7 +1200,7 @@ func TestStoredTuningGuardRejectsChangeOnAbsentObject(t *testing.T) {
 func TestNoOptsRestoreOfUnstampedSourceAfterControllerDefaultChange(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
-	snapshotID := provisionUnstamped4096Source(t, d, client, "pvc-n1e-a-src", "n1e-a-point", 512)
+	snapshotID := provisionUnstamped4096SourceCaptured(t, d, client, "pvc-n1e-a-src", "n1e-a-point", 512)
 	require.Equal(t, 512, d.config.ISCSI.ExtentBlocksize,
 		"the controller default must have MOVED for this test to mean anything")
 
@@ -1214,20 +1292,39 @@ func TestRebuildWithNoDiscoverableGeometryFailsClosed(t *testing.T) {
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.Contains(t, status.Convert(err).Message(), PropBlockISCSIBlocksize,
 		"the refusal must name the property that recovers it")
+	assert.Contains(t, status.Convert(err).Message(), PropBlockISCSIPblocksize,
+		"and the PHYSICAL one, because a half-resolved record is exactly how pblocksize came from the mutable default")
 
 	// Nothing was created at the guessed geometry.
 	rebuilt, findErr := client.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
 	require.NoError(t, findErr)
 	assert.Nil(t, rebuilt, "the refused rebuild must not have created a 512-byte extent over 4096 data")
 
-	// And recording the real geometry is all it takes to recover.
+	// ROUND 5 / MEDIUM-2. Recording only the LOGICAL half is NOT enough: the
+	// record has to be COMPLETE, or physical silently comes from
+	// !iscsi.extentDisablePhysicalBlocksize — a second mutable install-wide value
+	// reaching existing data by a different door. Round 4 accepted this and
+	// created the extent with a defaulted pblocksize.
 	require.NoError(t, client.DatasetSetUserProperties(ctx, datasetName,
 		map[string]string{PropBlockISCSIBlocksize: "4096"}))
+	err = iscsiShareBackend{d}.EnsureShare(ctx, nil, datasetName, "pvc-n1e-unknown", nil)
+	require.Error(t, err, "logical alone is a HALF record; physical must not be filled in from the controller default")
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), PropBlockISCSIPblocksize)
+	rebuilt, findErr = client.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
+	require.NoError(t, findErr)
+	assert.Nil(t, rebuilt, "the half-recorded rebuild must not have created an extent either")
+
+	// Recording the COMPLETE geometry is all it takes to recover.
+	require.NoError(t, client.DatasetSetUserProperties(ctx, datasetName,
+		map[string]string{PropBlockISCSIBlocksize: "4096", PropBlockISCSIPblocksize: "true"}))
 	require.NoError(t, iscsiShareBackend{d}.EnsureShare(ctx, nil, datasetName, "pvc-n1e-unknown", nil))
 	recovered, err := client.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
 	require.NoError(t, err)
 	require.NotNil(t, recovered)
 	assert.Equal(t, 4096, recovered.Blocksize)
+	require.NotNil(t, recovered.Pblocksize)
+	assert.True(t, *recovered.Pblocksize)
 }
 
 // TestBackStampingAVolumeCostsNoExtraRoundTrip pins mechanism (1)'s price. The
@@ -1342,28 +1439,70 @@ func TestStampVsLiveGeometryDisagreementIsRefused(t *testing.T) {
 // clone is refused rather than resolved by whichever field the code happens to
 // read first. On 327a878 the stamp won silently and the destination inherited
 // the wrong one.
+//
+// ROUND 5 RETARGETED THIS TO THE PVC-TO-PVC PATH, deliberately. A volume clone
+// snapshots the source's CURRENT state, so the source's current drift is the
+// clone's problem and refusing is right. A SNAPSHOT restore is the opposite: the
+// snapshot's own captured stamp describes the snapshot's bytes, and the source's
+// later fate — drift, or being destroyed altogether — says nothing about them.
+// Refusing a DR restore because the source is now broken would deny exactly the
+// operation the operator needs. The second subtest pins that rule so it cannot
+// be "tidied" back into a refusal.
 func TestDriftedCloneSourceIsRefused(t *testing.T) {
-	d, client := newBlockImmutabilityDriver(t)
-	ctx := context.Background()
-	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
-	require.NoError(t, err)
-	_, err = d.CreateVolume(ctx, blockTuningRequest("pvc-drift-src", "iscsi", map[string]string{paramISCSIBlocksize: "512"}))
-	require.NoError(t, err)
-	// The source records 512; its extent actually reports 4096.
-	extent, err := client.ISCSIExtentFindByDisk(ctx, "zvol/pool/parent/pvc-drift-src")
-	require.NoError(t, err)
-	extent.Blocksize = 4096
-	_, err = client.SnapshotCreate(ctx, "pool/parent/pvc-drift-src", "drift-point", nil)
-	require.NoError(t, err)
+	t.Run("volume clone", func(t *testing.T) {
+		d, client := newBlockImmutabilityDriver(t)
+		ctx := context.Background()
+		_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+		require.NoError(t, err)
+		_, err = d.CreateVolume(ctx, blockTuningRequest("pvc-drift-src", "iscsi", map[string]string{paramISCSIBlocksize: "512"}))
+		require.NoError(t, err)
+		// The source records 512; its extent actually reports 4096.
+		extent, err := client.ISCSIExtentFindByDisk(ctx, "zvol/pool/parent/pvc-drift-src")
+		require.NoError(t, err)
+		extent.Blocksize = 4096
 
-	_, err = d.CreateVolume(ctx, restoreFromSnapshot(
-		blockTuningRequest("pvc-drift-dst", "iscsi", map[string]string{paramISCSIBlocksize: "512"}),
-		"drift-point",
-	))
-	require.Error(t, err, "a source whose geometry cannot be established must not be cloned on a guess")
-	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
-	_, getErr := client.DatasetGet(ctx, "pool/parent/pvc-drift-dst")
-	assert.True(t, truenas.IsNotFoundError(getErr), "the refusal must precede the first destination mutation")
+		req := blockTuningRequest("pvc-drift-dst", "iscsi", map[string]string{paramISCSIBlocksize: "512"})
+		req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "pvc-drift-src"},
+		}}
+		_, err = d.CreateVolume(ctx, req)
+		require.Error(t, err, "a source whose geometry cannot be established must not be cloned on a guess")
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		message := status.Convert(err).Message()
+		assert.Contains(t, message, "512", "the refusal must name the recorded value")
+		assert.Contains(t, message, "4096", "and the live one")
+		_, getErr := client.DatasetGet(ctx, "pool/parent/pvc-drift-dst")
+		assert.True(t, truenas.IsNotFoundError(getErr), "the refusal must precede the first destination mutation")
+	})
+
+	t.Run("snapshot restore uses the snapshot's own capture, not the source's later drift", func(t *testing.T) {
+		d, client := newBlockImmutabilityDriver(t)
+		ctx := context.Background()
+		_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+		require.NoError(t, err)
+		_, err = d.CreateVolume(ctx, blockTuningRequest("pvc-snapdrift-src", "iscsi", map[string]string{paramISCSIBlocksize: "512"}))
+		require.NoError(t, err)
+		// Snapshot FIRST — it captures the 512 the data really was written through.
+		_, err = d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{SourceVolumeId: "pvc-snapdrift-src", Name: "snapdrift-point"})
+		require.NoError(t, err)
+		// THEN the source's extent is re-created at 4096 behind the driver's back.
+		extent, err := client.ISCSIExtentFindByDisk(ctx, "zvol/pool/parent/pvc-snapdrift-src")
+		require.NoError(t, err)
+		extent.Blocksize = 4096
+
+		// This is the round-4 corruption sequence, and it is the whole reason
+		// provenance moved onto the snapshot: round 4 read the source's CURRENT
+		// 4096 extent and would have created the destination at 4096 over
+		// 512-layout bytes.
+		_, err = d.CreateVolume(ctx, restoreFromSnapshot(
+			blockTuningRequest("pvc-snapdrift-dst", "iscsi", nil), "snapdrift-point"))
+		require.NoError(t, err, "the snapshot's own record answers for the snapshot's bytes")
+		restored, err := client.ISCSIExtentFindByDisk(ctx, "zvol/pool/parent/pvc-snapdrift-dst")
+		require.NoError(t, err)
+		require.NotNil(t, restored)
+		assert.Equal(t, 512, restored.Blocksize,
+			"4096 here is the source's POST-snapshot geometry laid over the snapshot's 512-layout data")
+	})
 }
 
 // TestNoOptsHopCannotLaunderGeometry is the second LOW. On 327a878 a no-opts
@@ -1376,7 +1515,7 @@ func TestDriftedCloneSourceIsRefused(t *testing.T) {
 func TestNoOptsHopCannotLaunderGeometry(t *testing.T) {
 	d, client := newBlockImmutabilityDriver(t)
 	ctx := context.Background()
-	snapshotID := provisionUnstamped4096Source(t, d, client, "pvc-launder-a", "launder-point", 512)
+	snapshotID := provisionUnstamped4096SourceCaptured(t, d, client, "pvc-launder-a", "launder-point", 512)
 
 	// Hop 1: no opts. Pre-fix this produced a 512 extent over 4096 data.
 	_, err := d.CreateVolume(ctx, restoreFromSnapshot(
@@ -1414,7 +1553,7 @@ func TestUnstampedSourceFixtureActuallyDiscriminates(t *testing.T) {
 		t.Run(fmt.Sprintf("controller default %d", controllerDefault), func(t *testing.T) {
 			d, client := newBlockImmutabilityDriver(t)
 			ctx := context.Background()
-			snapshotID := provisionUnstamped4096Source(t, d, client, "pvc-disc-src", "disc-point", controllerDefault)
+			snapshotID := provisionUnstamped4096SourceCaptured(t, d, client, "pvc-disc-src", "disc-point", controllerDefault)
 			require.Equal(t, controllerDefault, d.config.ISCSI.ExtentBlocksize,
 				"the fixture must leave the controller default where the caller asked — the round-3 version did not, which is what made its callers tautologies")
 			require.NotEqual(t, 4096, d.config.ISCSI.ExtentBlocksize,
