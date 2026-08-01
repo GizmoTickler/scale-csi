@@ -39,10 +39,16 @@ removal-only configmap render + a render-assert in the same commit.
   driver — there is deliberately no caller-chosen `snapshotNamingSchema`), a
   driver-minted non-recursive task carrying exactly that schema is observed alive
   on exactly that dataset, the snapshot's name is a complete CANONICAL rendering
-  of that schema encoding a real calendar instant, and that instant agrees with
-  the snapshot's actual `creation` property. Snapshots that pass are excluded
-  from the foreign guard and deleted with the volume; anything unprovable stays
-  FOREIGN and is preserved.
+  of that schema encoding a real calendar instant, and that instant is EXACTLY
+  (±2s clock skew) when the snapshot was created — its `creation` property
+  rendered in the NAS's own civil timezone, read once from
+  `system.general.config` and cached off the CSI hot path (one-hour TTL, warmed
+  by the reconcile pass, dropped on reconnect; the image embeds `time/tzdata` so
+  zone resolution is identical in-container and in tests). Snapshots that pass
+  are excluded from the foreign guard and deleted with the volume; anything
+  unprovable stays FOREIGN and is preserved — including when the NAS timezone is
+  unreadable (`scale_csi_nas_timezone_unresolved_total`) or was CHANGED after the
+  snapshots were taken. Both fail CLOSED rather than widening the window.
   **Documented trust boundary:** this chain does NOT establish "a snapshot the
   driver did not create cannot be deleted". The schema is readable through
   `pool.snapshottask.query` and TrueNAS 26.0 can neither stamp a property on an
@@ -60,7 +66,8 @@ removal-only configmap render + a render-assert in the same commit.
   `scale_csi_scheduled_snapshot_tasks_ensured_total`,
   `scale_csi_scheduled_snapshot_task_ensure_failed_total`,
   `scale_csi_scheduled_snapshot_task_delete_failed_total`,
-  `scale_csi_stranded_snapshot_tasks_reaped_total`.
+  `scale_csi_stranded_snapshot_tasks_reaped_total`,
+  `scale_csi_nas_timezone_unresolved_total`.
 - **E3 — Lazy clone independence (`zfs.promoteRestoredClones`).** A background
   reconcile step promotes a clone-restored volume (`pool.dataset.promote`) to
   drop its origin-snapshot pin, letting the tombstone reaper reclaim the source

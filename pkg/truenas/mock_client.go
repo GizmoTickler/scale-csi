@@ -67,6 +67,11 @@ type MockClient struct {
 	// then be retried.
 	FailDatasetDelete map[string]struct{}
 
+	// SystemTimezoneName is the IANA zone SystemTimezone reports (default UTC).
+	// SystemTimezoneErr makes it unreadable, for the fail-closed path.
+	SystemTimezoneName string
+	SystemTimezoneErr  error
+
 	// Error injection
 	InjectError error
 	// SimulateUpdateNoOp models TrueNAS 26.0 pool.snapshot.update returning
@@ -1529,6 +1534,26 @@ func (m *MockClient) GetSystemInfo(ctx context.Context) (*SystemInfo, error) {
 		VersionPatch: 0,
 		Hostname:     "truenas-mock",
 	}, nil
+}
+
+// SystemTimezone returns the mock NAS's civil timezone. SystemTimezoneName
+// selects it (default UTC) and SystemTimezoneErr injects an unreadable-zone
+// failure, so a test can model both a non-UTC NAS and the fail-closed path.
+func (m *MockClient) SystemTimezone(ctx context.Context) (*time.Location, error) {
+	m.mu.RLock()
+	name, injected := m.SystemTimezoneName, m.SystemTimezoneErr
+	m.mu.RUnlock()
+	if injected != nil {
+		return nil, injected
+	}
+	if name == "" {
+		name = "UTC"
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("mock NAS timezone %q is not loadable: %w", name, err)
+	}
+	return loc, nil
 }
 
 func (m *MockClient) CheckNVMeoFSupport(ctx context.Context) error {

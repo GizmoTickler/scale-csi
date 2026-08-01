@@ -263,7 +263,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	now := time.Now()
 	managedBackendVolumeCount := d.classifyOrphanVolumes(ctx, now, datasets, kubeState, minOrphanAge, &report)
 	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, kubeState, minOrphanAge, &report)
-	d.countScheduledSnapshots(unowned, datasets, &report)
+	d.countScheduledSnapshots(ctx, unowned, datasets, &report)
 	d.classifyTombstones(now, tombstones, ledger, minOrphanAge, &report)
 
 	// GF2/E3 background promote (opt-in zfs.promoteRestoredClones): free
@@ -823,17 +823,28 @@ func (d *Driver) publishVolumeUsageMetrics(datasets []*truenas.Dataset) {
 // per-dataset pool.snapshottask.query for task corroboration. The gauge is
 // therefore an ESTIMATE that carries NO delete authority — do not reuse this
 // call site's options for anything that destroys.
-func (d *Driver) countScheduledSnapshots(unowned []*truenas.Snapshot, datasets []*truenas.Dataset, report *ReconcileReport) {
+func (d *Driver) countScheduledSnapshots(ctx context.Context, unowned []*truenas.Snapshot, datasets []*truenas.Dataset, report *ReconcileReport) {
 	if len(unowned) == 0 {
 		return
 	}
 	datasetByPath := make(map[string]*truenas.Dataset, len(datasets))
+	scheduled := false
 	for _, ds := range datasets {
 		datasetByPath[ds.Name] = ds
+		if datasetUserProperty(ds, PropSnapshotNamingSchema) != "" {
+			scheduled = true
+		}
 	}
+	// Zero extra calls for a deployment that never scheduled anything: without a
+	// single schema binding the count is necessarily zero, so the NAS timezone is
+	// never resolved. Otherwise it comes from the driver's TTL cache.
+	if !scheduled {
+		return
+	}
+	zone := d.nasCivilZone(ctx)
 	for _, snap := range unowned {
 		if driverScheduledSnapshotProvenance(snap, datasetByPath[snap.Dataset], d.driverInstanceID(),
-			scheduledProvenanceOptions{requireLocalSource: false, requireTaskCorroboration: false}) {
+			scheduledProvenanceOptions{requireLocalSource: false, requireTaskCorroboration: false, nasZone: zone}) {
 			report.ScheduledSnapshotCount++
 		}
 	}

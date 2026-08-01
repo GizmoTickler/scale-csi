@@ -312,6 +312,11 @@ func (c *apiCallCountingClient) GetSystemInfo(ctx context.Context) (*truenas.Sys
 	return c.MockClient.GetSystemInfo(ctx)
 }
 
+func (c *apiCallCountingClient) SystemTimezone(ctx context.Context) (*time.Location, error) {
+	c.record("SystemTimezone")
+	return c.MockClient.SystemTimezone(ctx)
+}
+
 func (c *apiCallCountingClient) CheckNVMeoFSupport(ctx context.Context) error {
 	c.record("CheckNVMeoFSupport")
 	return c.MockClient.CheckNVMeoFSupport(ctx)
@@ -732,7 +737,24 @@ func newAPICallCountDriver(t *testing.T, client *apiCallCountingClient, protocol
 		return client.ServiceReload(ctx, service)
 	})
 	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	warmAPICallCountDriver(t, client, d)
 	return d
+}
+
+// warmAPICallCountDriver models what a RUNNING controller has already done
+// before any CSI RPC arrives: the reconcile pass resolves the NAS civil timezone
+// and it is TTL-cached on the Driver (GF2-fix2/B1-a). Taking the golden counts
+// against a warm driver keeps them a measure of PER-RPC round trips instead of
+// one-time startup work. That the resolution really is one-time is proven
+// separately, by TestScheduledDeleteResolvesNASTimezoneOnceAcrossVolumes.
+func warmAPICallCountDriver(t *testing.T, client *apiCallCountingClient, d *Driver) {
+	t.Helper()
+	zone, err := d.truenasClient.SystemTimezone(context.Background())
+	require.NoError(t, err)
+	d.nasZoneMu.Lock()
+	d.nasZone, d.nasZoneAt = zone, time.Now()
+	d.nasZoneMu.Unlock()
+	client.resetCalls()
 }
 
 func apiCallCountVolumeRequest(name, protocol string) *csi.CreateVolumeRequest {
@@ -1164,6 +1186,7 @@ func newFencedAPICallCountDriver(t *testing.T, client *apiCallCountingClient, pr
 		return client.ServiceReload(ctx, service)
 	})
 	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	warmAPICallCountDriver(t, client, d)
 	return d
 }
 

@@ -1126,7 +1126,18 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// while the task is still there.
 	scheduledTaskSchema := d.deleteVolumeSnapshotTask(ctx, ds, datasetName, volumeID)
 
-	foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema)
+	// The NAS's civil timezone is the clock a periodic-snapshot task renders its
+	// names from, so proving those names needs it (GF2-fix2/B1-a). Resolved ONLY
+	// for a volume that actually carries a task binding — an unscheduled volume,
+	// and therefore the default path, never asks — and served from the driver's
+	// TTL cache that the reconcile pass keeps warm, so this is not a
+	// per-DeleteVolume round trip. nil (unreadable) fails closed.
+	var scheduledZone *time.Location
+	if scheduledTaskSchema != "" {
+		scheduledZone = d.nasCivilZone(ctx)
+	}
+
+	foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
 	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(foreignSnapshots) > 0 {
 		klog.Infof("Volume %s has non-CSI snapshots and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion", volumeID)
 		return nil, status.Errorf(codes.FailedPrecondition,
@@ -1217,7 +1228,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// and never respect the foreign-preserve policy (R4); only genuinely
 			// foreign snapshots are preserved by default (recursive deletion of
 			// them is an explicit operator opt-in).
-			foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema)
+			foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
 			if len(foreignSnapshots) > 0 && !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)

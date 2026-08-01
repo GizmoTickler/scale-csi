@@ -360,6 +360,19 @@ var (
 		},
 	)
 
+	// nasTimezoneUnresolvedTotal counts failures to read the NAS's civil timezone
+	// (system.general.config -> timezone). While this is failing, driver-scheduled
+	// snapshots cannot be proven and are PRESERVED as foreign, so a scheduled
+	// volume's DeleteVolume returns FailedPrecondition — the fail-closed
+	// direction, and a condition an operator needs to see (GF2-fix2/B1-a).
+	nasTimezoneUnresolvedTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "nas_timezone_unresolved_total",
+			Help:      "Total failures to resolve the NAS civil timezone; while non-zero, driver-scheduled snapshots are unprovable and preserved as foreign",
+		},
+	)
+
 	// strandedSnapshotTasksReapedTotal counts periodic-snapshot tasks the orphan
 	// reconcile reclaimed because their volume dataset no longer exists.
 	strandedSnapshotTasksReapedTotal = regCounter(
@@ -758,6 +771,13 @@ func RecordScheduledSnapshotTaskEnsured() {
 // periodic-snapshot task could not be ensured (GF2/E2).
 func RecordScheduledSnapshotTaskEnsureFailed() {
 	scheduledSnapshotTaskEnsureFailedTotal.Inc()
+}
+
+// RecordNASTimezoneUnresolved counts a failure to read the NAS civil timezone
+// (GF2-fix2/B1-a). While this is incrementing, scheduled snapshots are
+// unprovable and therefore preserved.
+func RecordNASTimezoneUnresolved() {
+	nasTimezoneUnresolvedTotal.Inc()
 }
 
 // RecordScheduledSnapshotTaskDeleteFailed counts a DeleteVolume whose

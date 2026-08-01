@@ -83,25 +83,15 @@ const (
 // clock value (20260230-250000) unprovable (GF2-fix2/B1-c).
 const scheduledSnapshotTimestampLayout = "20060102-150405"
 
-// Bounds for the name-vs-creation agreement check (GF2-fix2/B1-a). See
-// scheduledSnapshotCreationAgrees for what these can and cannot establish.
-const (
-	// scheduledSnapshotCreationSkew is how far the instant a task RENDERED into
-	// the snapshot name may sit from the snapshot's actual `creation` property.
-	// Deliberately generous: a false negative here only makes a genuine driver
-	// snapshot look foreign, which turns a DeleteVolume into a FailedPrecondition
-	// refusal — annoying, never destructive — but a false positive is a data-loss
-	// hazard, so the check must never be the only thing standing between a
-	// foreign snapshot and a recursive destroy (it is not; see the task
-	// corroboration below).
-	scheduledSnapshotCreationSkew = 2 * time.Minute
-	// civilOffsetQuantum is the granularity of every civil UTC offset in current
-	// use (whole, half and three-quarter hours). The driver does not know the
-	// NAS's timezone, so agreement can only be required modulo this quantum.
-	civilOffsetQuantum = 15 * time.Minute
-	// maxCivilOffset bounds the plausible NAS offset (UTC-12:00 .. UTC+14:00).
-	maxCivilOffset = 14 * time.Hour
-)
+// scheduledSnapshotCreationSkew is the ONLY tolerance in the name-vs-creation
+// agreement check (GF2-fix2/B1-a), and it exists solely for CLOCK SKEW between
+// the moment the middleware renders the name and the moment ZFS stamps
+// `creation` (which has whole-second granularity). It is deliberately expressed
+// in SECONDS: it is NOT an allowance for timezone or UTC-offset ambiguity —
+// there is none left, because the NAS's civil zone is now read from the backend
+// and the comparison is exact. Do not widen this to absorb an offset problem;
+// a zone the driver cannot resolve must fail CLOSED instead.
+const scheduledSnapshotCreationSkew = 2 * time.Second
 
 // scheduledSnapshotNoncePattern is the exact shape of a driver-minted nonce.
 var scheduledSnapshotNoncePattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
@@ -286,10 +276,10 @@ func parseScheduledSnapshotName(name, schema string) (encoded time.Time, ok bool
 	if driverScheduledNamingSchema(volumeSegment, nonce) != schema {
 		return time.Time{}, false
 	}
-	// Parsed as a bare wall clock (UTC is only the carrier — see
-	// scheduledSnapshotCreationAgrees for why the zone is unknown). The
-	// round-trip re-render is belt-and-braces against any layout element the
-	// parser would normalize rather than reject.
+	// Parsed as a bare civil wall clock. The zone is supplied separately by the
+	// caller (the NAS's own, read from system.general.config), so UTC is only the
+	// carrier here. The round-trip re-render is belt-and-braces against any
+	// layout element the parser would normalize rather than reject.
 	encoded, err := time.ParseInLocation(scheduledSnapshotTimestampLayout, timestamp, time.UTC)
 	if err != nil || encoded.Format(scheduledSnapshotTimestampLayout) != timestamp {
 		return time.Time{}, false
@@ -297,51 +287,67 @@ func parseScheduledSnapshotName(name, schema string) (encoded time.Time, ok bool
 	return encoded, true
 }
 
-// scheduledSnapshotCreationAgrees reports whether the instant a scheduled
-// snapshot's NAME encodes agrees with the snapshot's ACTUAL `creation` property
+// scheduledSnapshotCreationAgrees reports whether the civil instant a scheduled
+// snapshot's NAME encodes is EXACTLY when the snapshot was actually created
 // (GF2-fix2/B1-a).
 //
-// WHAT THIS IS. A TrueNAS periodic-snapshot task renders %Y%m%d-%H%M%S from the
-// clock at the moment it takes the snapshot, so a genuine task snapshot's name
-// and its creation property always agree. A hand-authored name agrees only if
-// its author created the snapshot at the exact second the name encodes.
+// HOW IT WORKS. A TrueNAS periodic-snapshot task renders %Y%m%d-%H%M%S from the
+// NAS's LOCAL civil clock at the moment it takes the snapshot, while the
+// snapshot's `creation` property is UTC epoch seconds (verified against the
+// captured 26.0 payloads in pkg/truenas/testdata: zfs.resource.snapshot.query
+// returns `{"value":1754693322,"raw":"1754693322"}` and pool.snapshot.query
+// returns `{"value":"1754693450","parsed":{"$date":1754693450000}}`). The NAS's
+// zone is read from `system.general.config` -> `timezone` (live-verified on
+// TrueNAS 26.0.0-BETA.1: "America/New_York") and cached, so the driver can
+// convert `creation` INTO that civil clock and demand exact agreement.
 //
-// WHAT THIS IS NOT. It is NOT absolute-instant agreement. The task renders in the
-// NAS's LOCAL civil time while `creation` is UTC epoch seconds (verified against
-// the captured 26.0 payloads in pkg/truenas/testdata: both
-// zfs.resource.snapshot.query and pool.snapshot.query return `creation` as
-// epoch seconds — `{"value":1754693322,"raw":"1754693322"}` and
-// `{"value":"1754693450","parsed":{"$date":1754693450000}}` respectively). The
-// driver does not know the NAS's timezone and will not spend an API call plus an
-// embedded tzdata to learn it, so agreement is required only MODULO the
-// 15-minute quantum of civil UTC offsets, within a bounded ±14h.
+// DIRECTION MATTERS. The conversion is epoch -> civil, which is total and
+// unambiguous. Converting the other way (civil -> epoch) would be ambiguous
+// during a DST fall-back hour and undefined during a spring-forward gap; doing
+// it this way removes DST as a source of slack entirely, and tzdata gives the
+// correct historical offset for any past instant.
 //
-// RESIDUE, STATED PLAINLY. With a ±2min skew against a 900s quantum, roughly
-// 27% of arbitrary timestamps satisfy this check by luck. It is therefore a
-// CORROBORATION that forces a forged name to be created at (near) the right
-// second, not a proof of authorship. The unguessable nonce and the mandatory
-// task corroboration are what carry the weight.
+// TOLERANCE. Exactly ±scheduledSnapshotCreationSkew (2 SECONDS), and only for
+// clock skew between name render and creation stamp. There is no offset
+// allowance, because there is no longer any offset uncertainty.
 //
-// An unavailable creation property means UNVERIFIABLE, which means NOT PROVEN,
-// which means the snapshot stays foreign and is preserved.
-func scheduledSnapshotCreationAgrees(encoded time.Time, creationUnix int64) bool {
-	if creationUnix <= 0 {
+// CHANCE-PASS RATE, RE-DERIVED. The predecessor of this check accepted any name
+// whose UTC delta fell within ±2min of a 15-minute quantum: 241 seconds in every
+// 900, i.e. 26.8%, regardless of how far the forged timestamp strayed. This
+// version accepts a fixed 5-second window (±2s inclusive) around one specific
+// instant. For a timestamp chosen anywhere within a day that is 5/86400 =
+// 5.8e-5; over a week, 8.3e-6; it keeps shrinking with the range, whereas the
+// old rate did not shrink at all. So roughly a 4,600x improvement at
+// day-scale and unbounded improvement beyond.
+//
+// It is NOT literally zero, and should not be described as such. An actor who
+// creates the snapshot at the second its name encodes still passes — but that is
+// the documented storage-administrator spoof case, which this change does not
+// close and does not claim to. What it removes is the accidental-collision
+// slack: a name that merely happens to look plausible no longer passes.
+//
+// FAIL CLOSED. A zero/absent `creation`, or a nil zone (the NAS timezone could
+// not be read), means UNVERIFIABLE, which means NOT PROVEN, which means the
+// snapshot stays FOREIGN and is preserved. The residual case this cannot detect
+// is a NAS whose timezone SETTING was changed between snapshot creation and
+// evaluation: the old snapshots' names then disagree under the new zone and are
+// reclassified foreign. That is deliberate — the window is NOT widened to absorb
+// it, because a false-foreign is a preserved snapshot while a false-owned is
+// deleted data.
+func scheduledSnapshotCreationAgrees(encoded time.Time, creationUnix int64, zone *time.Location) bool {
+	if creationUnix <= 0 || zone == nil {
 		return false
 	}
-	delta := encoded.Unix() - creationUnix
-	skew := int64(scheduledSnapshotCreationSkew / time.Second)
-	if delta > int64(maxCivilOffset/time.Second)+skew || delta < -int64(maxCivilOffset/time.Second)-skew {
-		return false
+	// creation (UTC epoch) rendered in the NAS's civil clock, then compared with
+	// the civil clock the name encodes.
+	civil := time.Unix(creationUnix, 0).In(zone)
+	actual := time.Date(civil.Year(), civil.Month(), civil.Day(),
+		civil.Hour(), civil.Minute(), civil.Second(), 0, time.UTC)
+	delta := encoded.Unix() - actual.Unix()
+	if delta < 0 {
+		delta = -delta
 	}
-	quantum := int64(civilOffsetQuantum / time.Second)
-	residue := ((delta % quantum) + quantum) % quantum
-	if residue > quantum/2 {
-		residue -= quantum
-	}
-	if residue < 0 {
-		residue = -residue
-	}
-	return residue <= skew
+	return delta <= int64(scheduledSnapshotCreationSkew/time.Second)
 }
 
 // parseSnapshotSchedule parses a five-field cron string "minute hour dom month
@@ -568,6 +574,10 @@ type scheduledProvenanceOptions struct {
 	requireTaskCorroboration bool
 	// corroboratingTaskSchema is that observation (empty = none obtained).
 	corroboratingTaskSchema string
+	// nasZone is the NAS's civil timezone, in which a periodic-snapshot task
+	// renders its %Y%m%d-%H%M%S name. NIL means the driver could not read it, and
+	// every candidate then fails closed — exactly like a missing task.
+	nasZone *time.Location
 }
 
 // driverScheduledSnapshotProvenance is the SINGLE ownership predicate for
@@ -588,8 +598,9 @@ type scheduledProvenanceOptions struct {
 //     that schema was observed alive on exactly this dataset (delete path only);
 //  6. the snapshot's short name is exactly a rendering of that schema — same
 //     volume id in canonical form, same nonce, a REAL calendar/clock instant;
-//  7. that encoded instant AGREES with the snapshot's actual creation property,
-//     modulo the unknown civil UTC offset of the NAS.
+//  7. that encoded instant is EXACTLY (±2s clock skew) when the snapshot was
+//     created, comparing against the snapshot's own creation property rendered
+//     in the NAS's own civil timezone, which the driver reads from the backend.
 //
 // If any link is missing the answer is NO and the snapshot stays FOREIGN, which
 // means the default policy refuses to destroy it. Unprovable never means
@@ -614,6 +625,10 @@ type scheduledProvenanceOptions struct {
 // per-snapshot provenance the platform does not provide. Storage-administrator
 // access to the CSI parent dataset is therefore a TRUSTED boundary for this
 // feature. Do not let a doc, comment or test name claim otherwise.
+//
+// Reading the NAS timezone (GF2-fix2 round 2) does NOT change that boundary. It
+// removes the accidental-collision slack in link 7 only — see
+// scheduledSnapshotCreationAgrees for the re-derived numbers.
 func driverScheduledSnapshotProvenance(
 	snap *truenas.Snapshot,
 	dataset *truenas.Dataset,
@@ -655,16 +670,18 @@ func driverScheduledSnapshotProvenance(
 	if !ok {
 		return false
 	}
-	return scheduledSnapshotCreationAgrees(encoded, snap.GetCreationTime())
+	return scheduledSnapshotCreationAgrees(encoded, snap.GetCreationTime(), opts.nasZone)
 }
 
 // isDriverScheduledSnapshot is the delete-authorizing form of the provenance
-// predicate: strict property sources AND a live corroborating task required.
-func isDriverScheduledSnapshot(snap *truenas.Snapshot, dataset *truenas.Dataset, driverInstanceID, corroboratingTaskSchema string) bool {
+// predicate: strict property sources, a live corroborating task, and the NAS's
+// own civil timezone all required.
+func isDriverScheduledSnapshot(snap *truenas.Snapshot, dataset *truenas.Dataset, driverInstanceID, corroboratingTaskSchema string, nasZone *time.Location) bool {
 	return driverScheduledSnapshotProvenance(snap, dataset, driverInstanceID, scheduledProvenanceOptions{
 		requireLocalSource:       true,
 		requireTaskCorroboration: true,
 		corroboratingTaskSchema:  corroboratingTaskSchema,
+		nasZone:                  nasZone,
 	})
 }
 
@@ -684,15 +701,58 @@ func datasetVolumeID(datasetName string) string {
 // corroboratingTaskSchema comes from deleteVolumeSnapshotTask, which ran just
 // before this call and is the only place the owning task can still be observed.
 // Passing "" (no task seen) makes every snapshot foreign — the safe direction.
-func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *truenas.Dataset, corroboratingTaskSchema string) []*truenas.Snapshot {
+// nasZone is likewise nil when the NAS timezone could not be read, and that too
+// makes every snapshot foreign.
+func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *truenas.Dataset, corroboratingTaskSchema string, nasZone *time.Location) []*truenas.Snapshot {
 	foreign := make([]*truenas.Snapshot, 0, len(snapshots))
 	for _, snap := range snapshots {
-		if isDriverScheduledSnapshot(snap, dataset, d.driverInstanceID(), corroboratingTaskSchema) {
+		if isDriverScheduledSnapshot(snap, dataset, d.driverInstanceID(), corroboratingTaskSchema, nasZone) {
 			continue
 		}
 		foreign = append(foreign, snap)
 	}
 	return foreign
+}
+
+// nasCivilZoneTTL bounds how long the driver trusts its cached copy of the NAS
+// timezone. It is shorter than nothing-at-all and longer than any RPC: the
+// background reconcile pass refreshes it, so the CSI hot paths normally read a
+// warm value and issue ZERO extra calls.
+const nasCivilZoneTTL = time.Hour
+
+// nasCivilZone returns the NAS's civil timezone — the clock a periodic-snapshot
+// task renders its %Y%m%d-%H%M%S names from (GF2-fix2/B1-a).
+//
+// CALL BUDGET. The value is cached on the Driver for nasCivilZoneTTL and warmed
+// at controller startup (warmNASCivilZone) and on every reconcile pass, so no
+// CSI RPC pays a round trip for it in steady state. It is also resolved ONLY for
+// volumes that actually carry a periodic-snapshot binding, so an unscheduled
+// deployment never calls it at all.
+//
+// FAIL CLOSED. A nil return (with the error logged) means every candidate
+// scheduled snapshot is treated as FOREIGN and preserved — the same direction as
+// a missing corroborating task. Guessing UTC here would silently misclassify
+// every snapshot on a non-UTC NAS, in the deleting direction.
+func (d *Driver) nasCivilZone(ctx context.Context) *time.Location {
+	d.nasZoneMu.RLock()
+	if d.nasZone != nil && time.Since(d.nasZoneAt) < nasCivilZoneTTL {
+		cached := d.nasZone
+		d.nasZoneMu.RUnlock()
+		return cached
+	}
+	d.nasZoneMu.RUnlock()
+
+	zone, err := d.truenasClient.SystemTimezone(ctx)
+	if err != nil || zone == nil {
+		klog.Warningf("Could not read the NAS timezone (system.general.config); driver-scheduled snapshots cannot be proven and will be preserved as foreign: %v", err)
+		RecordNASTimezoneUnresolved()
+		return nil
+	}
+	d.nasZoneMu.Lock()
+	d.nasZone = zone
+	d.nasZoneAt = time.Now()
+	d.nasZoneMu.Unlock()
+	return zone
 }
 
 // scheduledSnapshotsConfigured reports whether this controller has any
@@ -737,6 +797,14 @@ func (d *Driver) sweepStrandedSnapshotTasks(ctx context.Context, datasets []*tru
 	if !scheduledObserved {
 		return
 	}
+
+	// Warm the NAS civil-timezone cache off the CSI hot path (GF2-fix2/B1-a).
+	// This gate — controller-wide schedule OR any dataset carrying a schema
+	// binding — is exactly the population whose DeleteVolume will need the zone,
+	// and it covers the per-StorageClass-only deployment that
+	// scheduledSnapshotsConfigured alone would miss. A deployment that never
+	// scheduled anything still issues zero calls.
+	d.nasCivilZone(ctx)
 
 	tasks, err := d.truenasClient.SnapshotTaskListByParent(ctx, d.parentDatasetName())
 	if err != nil {

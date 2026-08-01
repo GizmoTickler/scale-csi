@@ -84,6 +84,10 @@ type ClientInterface interface {
 
 	// System information methods
 	GetSystemInfo(ctx context.Context) (*SystemInfo, error)
+	// SystemTimezone returns the NAS's configured IANA civil timezone
+	// (system.general.config -> timezone). Cached with a TTL and dropped on
+	// reconnect, so callers never pay a per-operation round trip.
+	SystemTimezone(ctx context.Context) (*time.Location, error)
 	CheckNVMeoFSupport(ctx context.Context) error
 
 	// iSCSI methods

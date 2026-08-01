@@ -49,7 +49,10 @@ read/create/update/clone/rename/delete/hold/release, service read/reload, and
 additional methods, each only when its flag is enabled — snapshot hold/release
 for `zfs.holdCsiSnapshots`, `pool.snapshottask.*` (create/query/update/delete)
 for driver-managed periodic snapshots (`zfs.snapshotSchedule` or the per-SC
-`snapshotSchedule` parameter), and `pool.dataset.promote` for lazy-clone
+`snapshotSchedule` parameter) plus `system.general.config` READ, which is how the
+driver learns the NAS civil timezone those tasks render their snapshot names from
+— without it a scheduled volume's `DeleteVolume` fails closed and refuses — and
+`pool.dataset.promote` for lazy-clone
 independence (`zfs.promoteRestoredClones`). Role names and method assignments
 differ between TrueNAS API generations, so confirm a custom privilege against the
 API documentation served by the target appliance. See the TrueNAS
@@ -117,6 +120,16 @@ midclt call pool.snapshottask.query '[["dataset","^","<pool>/<parentDataset>/"]]
 > `FailedPrecondition` naming the leftover snapshots. That is the safe direction:
 > remove the snapshots, or set `zfs.destroyForeignSnapshotsOnDelete: true` for
 > that controller, and the delete proceeds.
+
+> **Changing the NAS timezone makes existing scheduled snapshots FOREIGN.** A
+> task renders its snapshot names from the NAS's civil clock, and the driver
+> proves ownership by converting each snapshot's `creation` property into that
+> same clock and demanding exact agreement. After a `system.general.config`
+> timezone change, snapshots taken under the old zone no longer agree, and the
+> driver preserves them rather than guessing — same remedy as above. Watch
+> `scale_csi_nas_timezone_unresolved_total` for the related live failure: while it
+> climbs the driver cannot read the zone at all, and every scheduled volume's
+> delete refuses (it never destroys).
 
 > **Exclude the CSI parent from periodic-snapshot and replication tasks.** The
 > configured `zfs.parentDataset` subtree is exclusive driver territory. A

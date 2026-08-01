@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
@@ -284,9 +285,14 @@ func seededSchemaNonce(t *testing.T, schema string) string {
 // naming schema through its OWN strftime expansion and stamps the matching
 // creation property. Nothing in production names this snapshot, so a test built
 // on it exercises the driver rather than itself.
-func fireScheduledSnapshot(t *testing.T, client *truenas.MockClient, at time.Time, zone *time.Location) *truenas.Snapshot {
+// The zone is a real IANA name — the same kind of value system.general.config
+// returns — so the mock renders the name in the NAS's civil clock while stamping
+// `creation` as UTC epoch seconds, which is the split the driver has to bridge.
+func fireScheduledSnapshot(t *testing.T, client *truenas.MockClient, at time.Time, zone string) *truenas.Snapshot {
 	t.Helper()
-	created, err := client.FireSnapshotTasks(context.Background(), at, zone)
+	loc, err := time.LoadLocation(zone)
+	require.NoError(t, err, "zone %q must load — the driver embeds tzdata for exactly this reason", zone)
+	created, err := client.FireSnapshotTasks(context.Background(), at, loc)
 	require.NoError(t, err)
 	require.Len(t, created, 1, "exactly one enabled task should have fired")
 	return created[0]
@@ -314,26 +320,39 @@ func renderScheduledSnapshotName(schema string, at time.Time) string {
 // REVERT-PROOF STATUS: this test PASSES on 03d37b8 by construction — a positive
 // test cannot fail against a predicate that is too PERMISSIVE. Its job is the
 // opposite direction: to prove the tightened predicate (canonical rendering,
-// real calendar instant, creation-time agreement, live-task corroboration) does
-// not reject a snapshot the driver's own task genuinely produced, including on a
-// NAS whose timezone the driver cannot see. The revert-proof evidence for B1
-// lives in the four negative tests below.
+// real calendar instant, EXACT creation-time agreement in the NAS's own civil
+// zone, live-task corroboration) does not reject a snapshot the driver's own
+// task genuinely produced. The revert-proof evidence for B1 is in the negative
+// tests below.
+//
+// The zones are real IANA names and the instants deliberately cover what a
+// fixed-offset model gets wrong: a DST fall-back repeated hour, a spring-forward
+// instant, a +05:45 offset, and a southern-hemisphere zone whose DST runs the
+// other way round.
 func TestDeleteVolumeAcceptsTaskCreatedScheduledSnapshot(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		zone *time.Location
+		zone string
+		at   time.Time
 	}{
-		{"utc NAS", time.UTC},
-		{"west-of-UTC NAS", time.FixedZone("PST", -8*3600)},
-		{"quarter-hour-offset NAS", time.FixedZone("NPT", 5*3600+45*60)},
+		{"utc NAS", "UTC", time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)},
+		{"live nas01 zone", "America/New_York", time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)},
+		// 2026-11-01 05:30Z falls inside the US fall-back repeated hour: 01:30 EDT
+		// and 01:30 EST both occur that morning. epoch->civil stays unambiguous.
+		{"DST fall-back repeated hour", "America/New_York", time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC)},
+		// 2026-03-08 07:00Z is the US spring-forward instant (02:00 -> 03:00).
+		{"DST spring-forward instant", "America/New_York", time.Date(2026, 3, 8, 7, 0, 0, 0, time.UTC)},
+		{"quarter-hour-offset NAS", "Asia/Kathmandu", time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)},
+		{"southern-hemisphere DST", "Australia/Sydney", time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := truenas.NewMockClient()
+			client.SystemTimezoneName = tc.zone
 			d := newScheduleTestDriver(client)
 			ctx := context.Background()
 
 			seedScheduledVolume(t, client, d, "sched-owned")
-			snap := fireScheduledSnapshot(t, client, time.Now().Add(-time.Hour), tc.zone)
+			snap := fireScheduledSnapshot(t, client, tc.at, tc.zone)
 			require.Equal(t, "pool/parent/sched-owned", snap.Dataset)
 
 			// destroyForeignSnapshotsOnDelete is false, yet deletion succeeds: the
@@ -342,6 +361,91 @@ func TestDeleteVolumeAcceptsTaskCreatedScheduledSnapshot(t *testing.T) {
 			require.NoError(t, err, "a task-created scheduled snapshot must not trip the foreign guard")
 		})
 	}
+}
+
+// GF2-fix2 round 2 — the NAS's civil zone is now a link in the ownership chain,
+// so both ways it can go wrong must fail CLOSED (preserve, never destroy).
+//
+// REVERT-PROOF: neither case exists on 03d37b8, which reads no timezone at all
+// and destroys the snapshot in both. Verified by running this test on a 03d37b8
+// worktree — see the fix summary.
+func TestDeleteVolumePreservesScheduledSnapshotWhenZoneIsWrongOrUnreadable(t *testing.T) {
+	taken := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+
+	t.Run("zone unreadable", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		client.SystemTimezoneName = "America/New_York"
+		d := newScheduleTestDriver(client)
+
+		seedScheduledVolume(t, client, d, "sched-nozone")
+		fireScheduledSnapshot(t, client, taken, "America/New_York")
+		// system.general.config stops answering: provenance is unverifiable.
+		client.SystemTimezoneErr = errors.New("injected system.general.config failure")
+
+		_, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "sched-nozone"})
+		require.Error(t, err, "an unreadable NAS timezone must fail closed, exactly like a missing task")
+		assert.Contains(t, err.Error(), "non-CSI snapshots")
+	})
+
+	t.Run("zone changed after the snapshot was taken", func(t *testing.T) {
+		client := truenas.NewMockClient()
+		client.SystemTimezoneName = "America/New_York"
+		d := newScheduleTestDriver(client)
+
+		seedScheduledVolume(t, client, d, "sched-tzmoved")
+		fireScheduledSnapshot(t, client, taken, "America/New_York")
+		// The operator re-homes the NAS. The old names no longer describe the new
+		// civil clock, and the driver cannot distinguish that from a forgery — so
+		// it PRESERVES them rather than widening the window to absorb the doubt.
+		client.SystemTimezoneName = "Europe/Berlin"
+
+		_, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "sched-tzmoved"})
+		require.Error(t, err, "a timezone change must fail closed: preserved, not destroyed")
+		assert.Contains(t, err.Error(), "non-CSI snapshots")
+	})
+}
+
+// The zone must be resolved ONCE and reused — the property that keeps this off
+// the per-DeleteVolume budget. Stronger evidence than a golden count, which is
+// taken against a driver warmed the way a running controller is.
+func TestScheduledDeleteResolvesNASTimezoneOnceAcrossVolumes(t *testing.T) {
+	client := newAPICallCountingClient()
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	for _, name := range []string{"sched-a", "sched-b", "sched-c"} {
+		_, err := d.CreateVolume(ctx, scheduleVolumeRequest(name, map[string]string{"snapshotSchedule": "0 0 * * *"}))
+		require.NoError(t, err)
+	}
+	_, err := client.FireSnapshotTasks(ctx, time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC), time.UTC)
+	require.NoError(t, err)
+
+	client.resetCalls()
+	for _, name := range []string{"sched-a", "sched-b", "sched-c"} {
+		_, delErr := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: name})
+		require.NoError(t, delErr, "volume %s", name)
+	}
+
+	_, methods := client.callSnapshot()
+	assert.Equal(t, 1, methods["SystemTimezone"],
+		"three scheduled deletes must resolve the NAS timezone once, not once each")
+}
+
+// A volume with NO schedule must never ask for the NAS timezone — this is what
+// keeps the DEFAULT DeleteVolume path free of the call entirely.
+func TestUnscheduledDeleteNeverResolvesNASTimezone(t *testing.T) {
+	client := newAPICallCountingClient()
+	d := newScheduleTestDriver(client)
+	ctx := context.Background()
+
+	_, err := d.CreateVolume(ctx, scheduleVolumeRequest("plain-vol", nil))
+	require.NoError(t, err)
+	client.resetCalls()
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "plain-vol"})
+	require.NoError(t, err)
+
+	_, methods := client.callSnapshot()
+	assert.Zero(t, methods["SystemTimezone"], "the default path must not read the NAS timezone")
 }
 
 // GF2-fix2/B1-b — a snapshot that satisfies every name/nonce/dataset/stamp check
@@ -384,19 +488,42 @@ func TestDeleteVolumePreservesExactSchemaSnapshotWithoutCorroboratingTask(t *tes
 // REVERT-PROOF: 03d37b8 never reads the creation property at all, so it accepts
 // this snapshot and destroys it. Verified against 03d37b8.
 func TestDeleteVolumePreservesSchemaShapedSnapshotWithDisagreeingCreationTime(t *testing.T) {
-	client := truenas.NewMockClient()
-	d := newScheduleTestDriver(client)
-	ctx := context.Background()
-
-	schema := seedScheduledVolume(t, client, d, "sched-skew")
-	// The name says 09:07:33; the snapshot was really created 7 minutes later,
-	// which no civil UTC offset can explain (offsets are 15-minute multiples).
 	named := time.Date(2026, 7, 31, 9, 7, 33, 0, time.UTC)
-	forgeSnapshot(t, client, "pool/parent/sched-skew", renderScheduledSnapshotName(schema, named), named.Add(7*time.Minute))
+	for _, tc := range []struct {
+		name string
+		off  time.Duration
+	}{
+		// No civil UTC offset can explain seven minutes (offsets are 15-minute
+		// multiples), so this one also failed the round-1 quantum design.
+		{"off by seven minutes", 7 * time.Minute},
+		// THREE SECONDS is what round 2 adds. The round-1 design compared the UTC
+		// delta modulo 900s with a ±2min window, so a 3s disagreement sailed
+		// through it; exact civil-clock agreement with a ±2s clock-skew allowance
+		// rejects it. Verified: this sub-test fails on BOTH 03d37b8 and the
+		// round-1 commit 50b8c49.
+		{"off by three seconds", 3 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := truenas.NewMockClient()
+			client.SystemTimezoneName = "America/New_York"
+			d := newScheduleTestDriver(client)
 
-	_, err := d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "sched-skew"})
-	require.Error(t, err, "a name whose timestamp disagrees with the creation property proves nothing")
-	assert.Contains(t, err.Error(), "non-CSI snapshots")
+			schema := seedScheduledVolume(t, client, d, "sched-skew")
+			forgeSnapshot(t, client, "pool/parent/sched-skew",
+				renderScheduledSnapshotName(schema, named.In(mustZone(t, "America/New_York"))), named.Add(tc.off))
+
+			_, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "sched-skew"})
+			require.Error(t, err, "a name whose timestamp disagrees with the creation property proves nothing")
+			assert.Contains(t, err.Error(), "non-CSI snapshots")
+		})
+	}
+}
+
+func mustZone(t *testing.T, name string) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	require.NoError(t, err)
+	return loc
 }
 
 // GF2-fix2/B1-c — the matcher accepted any eight digits plus six digits, so a
@@ -462,7 +589,7 @@ func TestDeleteVolumeRetryStillOwnsScheduledSnapshotAfterTaskRemoved(t *testing.
 	ctx := context.Background()
 
 	seedScheduledVolume(t, client, d, "sched-retry")
-	fireScheduledSnapshot(t, client, time.Now().Add(-time.Hour), time.UTC)
+	fireScheduledSnapshot(t, client, time.Now().Add(-time.Hour), "UTC")
 
 	// Attempt 1 fails at the dataset destroy, AFTER the task has been deleted.
 	client.FailDatasetDelete = map[string]struct{}{"pool/parent/sched-retry": {}}
@@ -629,7 +756,7 @@ func TestReconcileCountsScheduledSnapshotsFromProductionPartition(t *testing.T) 
 	})
 	require.NoError(t, err)
 	// The task takes its own snapshot (mock-rendered, mock-timestamped).
-	fireScheduledSnapshot(t, client, time.Now().Add(-time.Hour), time.UTC)
+	fireScheduledSnapshot(t, client, time.Now().Add(-time.Hour), "UTC")
 	_, err = client.SnapshotCreate(ctx, ds.Name, "auto-2026-07-31_12-00", nil)
 	require.NoError(t, err)
 
@@ -643,7 +770,7 @@ func TestReconcileCountsScheduledSnapshotsFromProductionPartition(t *testing.T) 
 	report := &ReconcileReport{}
 	listed, err := client.DatasetQueryByParent(ctx, "pool/parent")
 	require.NoError(t, err)
-	d.countScheduledSnapshots(unowned, listed, report)
+	d.countScheduledSnapshots(ctx, unowned, listed, report)
 	assert.Equal(t, 1, report.ScheduledSnapshotCount, "only the schema-proven snapshot is counted")
 
 	count := d.classifyOrphanSnapshots(time.Now(), managed, &kubernetesReconcileState{snapshotHandles: map[string]struct{}{}}, time.Hour, report)

@@ -90,6 +90,14 @@ type Driver struct {
 	// Operation lock to prevent concurrent operations on same volume
 	operationLock sync.Map
 
+	// Cached NAS civil timezone (GF2-fix2/B1-a). A periodic-snapshot task renders
+	// its %Y%m%d-%H%M%S names from this clock, so proving a task-created
+	// snapshot's provenance needs it. Warmed by the reconcile pass and TTL'd, so
+	// no CSI RPC pays a round trip in steady state. See nasCivilZone.
+	nasZoneMu sync.RWMutex
+	nasZone   *time.Location
+	nasZoneAt time.Time
+
 	// Node mount state supplements the live mount table with the CSI identity
 	// and capability that cannot be reconstructed from kernel mount metadata.
 	nodeMountStateMu sync.Mutex
