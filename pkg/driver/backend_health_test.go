@@ -651,7 +651,7 @@ func TestBackendHealthColdStartPublishesHonestState(t *testing.T) {
 //
 // The poll here is REAL and genuinely blocked: the poller runs, its pool.query
 // is held inside the mock, and the assertions are made while that call has not
-// returned. Ageing a copied snapshot and calling the helper directly (which is
+// returned. Aging a copied snapshot and calling the helper directly (which is
 // what this used to do) proves the helper works, not that the driver publishes
 // without waiting for the backend. The TTL floor is 90s, so time cannot be
 // waited out in a unit test — the snapshot is aged, but it is aged UNDER a call

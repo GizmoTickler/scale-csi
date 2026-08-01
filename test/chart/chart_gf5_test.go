@@ -612,7 +612,7 @@ var signalTimingClasses = []string{
 
 // signalTimingClassRequires pins vocabulary that must appear INSIDE a specific
 // item's own text. Scoping matters: round 5 required "successful usable sample"
-// anywhere in the file, so moving it into a neighbouring item while item 4 said
+// anywhere in the file, so moving it into a neighboring item while item 4 said
 // "until the backend responds" passed the guard while saying the wrong thing.
 var signalTimingClassRequires = map[string][]string{
 	"poll stall": {"successful usable sample"},
@@ -967,7 +967,7 @@ func TestGF5Fix5SignalTimingTaxonomyIsStructurallyComplete(t *testing.T) {
 					t.Errorf("%s: item %d (%s) must call itself UNBOUNDED, and must not claim a bound, inside its own"+
 						" text; got %q", surface.name, i+1, class, collapse(item.text))
 				}
-				// Item-SCOPED vocabulary. A required phrase sitting in a NEIGHBOURING
+				// Item-SCOPED vocabulary. A required phrase sitting in a NEIGHBORING
 				// item is not this item saying it.
 				for _, required := range signalTimingClassRequires[class] {
 					if !strings.Contains(item.text, required) {
@@ -1080,7 +1080,7 @@ func TestGF5Fix5TriageRuleRequiresSynchronizedObservations(t *testing.T) {
 
 	// The freshness step must use the DRIVER-OWNED timestamp. PromQL timestamp()
 	// returns the scrape time, so it cannot answer "when did the driver last
-	// sample?" — wherever it still appears, it must be labelled as scrape age.
+	// sample?" — wherever it still appears, it must be labeled as scrape age.
 	if !strings.Contains(block, "scale_csi_pool_health_last_success_timestamp_seconds") {
 		t.Error("the triage block does not use the driver-owned scale_csi_pool_health_last_success_timestamp_seconds" +
 			" for sample age; timestamp() on any other gauge returns the SCRAPE time, so a frozen driver that keeps" +
@@ -1168,7 +1168,7 @@ func TestGF5Fix5TimeBoundsIncludeTheCallTimeout(t *testing.T) {
 	maxInterval := driverDurationConst(t, driverSrc, "maxBackendHealthInterval")
 	flipSamples := driverIntConst(t, driverSrc, "backendHealthFlipSamples")
 
-	perStep := (maxInterval + callTimeout).String()                             // one confirmation step
+	perStep := (maxInterval + callTimeout).String()                              // one confirmation step
 	confirmed := (time.Duration(flipSamples)*maxInterval + callTimeout).String() // to a confirmed condition
 	if perStep == confirmed {
 		t.Fatalf("the two computed bounds collapsed to %q; the guard would assert nothing", perStep)

@@ -511,11 +511,11 @@ func (d *Driver) markPoolHealthStaleIfExpired() {
 // this did — is NOT synchronization, and the failure is a lost update rather
 // than a data race, so `go test -race` cannot see it:
 //
-//	 1. the reader marks expired snapshot S stale;
-//	 2. the poller clears staleness for a successful sample it has NOT yet
-//	    stored;
-//	 3. the reader re-reads, still sees S, and leaves stale = 1;
-//	 4. the poller stores the fresh pointer.
+//  1. the reader marks expired snapshot S stale;
+//  2. the poller clears staleness for a successful sample it has NOT yet
+//     stored;
+//  3. the reader re-reads, still sees S, and leaves stale = 1;
+//  4. the poller stores the fresh pointer.
 //
 // End state: a fresh cached sample with stale = 1 until the NEXT successful
 // sample. Reversing the poller's two steps fails the same way with the roles
