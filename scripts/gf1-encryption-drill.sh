@@ -15,7 +15,17 @@
 #      back + pattern intact (reboot-survival proof; extent survives, NO recreation)
 #   4. wrong-passphrase unlock -> assert FAILED + stays locked (fail-closed, P-5)
 #   5. change_key -> assert old passphrase fails, new works (P-6)
+#   5b. change_key to the SAME passphrase -> assert SUCCESS and the key still
+#       valid (the 2026-08-02 probe the driver's rotation-completion arm relies
+#       on: an unlocked volume inside an open rotation window is re-keyed
+#       unconditionally, which must be a no-op by outcome when already rotated)
+#   5c. encryption_summary row name == the dataset id (the driver fails CLOSED
+#       when no row matches, so id/path normalisation drift must be caught here)
 #   6. snapshot + clone -> assert clone encryption_root == origin (shared-key, P-7)
+#   6b. detached copy (replication.run_onetime LOCAL, the driver's detached
+#       restore) of an ENCRYPTED source into a plaintext parent -> RECORD whether
+#       the copy comes out encrypted. UNPROBED as of 2026-08-02; the driver
+#       refuses encrypted content sources until this is settled either way
 #   7. DeleteVolume while locked -> assert clean destroy (needs no key, E-4)
 #   8. teardown + zero-residue audit (pool.dataset.query [id ~ gf1-enc-drill] == 0)
 #
@@ -71,6 +81,7 @@ TLS_VERIFY="${GF1_TLS_VERIFY:-0}"
 ZV="$POOL/gf1-enc-drill-zv"
 FS="$POOL/gf1-enc-drill-fs"
 CLONE="$POOL/gf1-enc-drill-clone"
+DETACHED="$POOL/gf1-enc-drill-detached"
 SNAP_NAME="gf1-enc-drill-snap"
 SNAP="$ZV@$SNAP_NAME"
 EXTENT_NAME="gf1-enc-drill-extent"
@@ -144,6 +155,7 @@ sweep_residue() {
   fi
   mc pool.snapshot.delete "$(jq -nc --arg id "$SNAP" '$id')" >/dev/null 2>&1 || true
   destroy_if_exists "$CLONE"
+  destroy_if_exists "$DETACHED"
   destroy_if_exists "$ZV"
   destroy_if_exists "$FS"
 }
@@ -409,6 +421,55 @@ else
   fail "step 5: change_key rotation did not behave per P-6"
 fi
 
+# --- step 5b: change_key to the SAME passphrase (rotation-completion probe) --
+
+step 5b "change_key(current) on an already-current dataset -> SUCCESS, key still valid"
+
+step5b_ok=1
+
+# The dataset is unlocked and keyed with PASSPHRASE_NEW after step 5. The driver
+# calls change_key(current) UNCONDITIONALLY whenever a rotation window is open
+# and the dataset is unlocked: that completes a rotation interrupted between
+# unlock(previous) and change_key, and must be harmless when the rotation already
+# landed. This step is that guarantee, end to end.
+if ! mc pool.dataset.change_key "$(jq -nc --arg id "$ZV" '$id')" \
+  "$(jq -nc --arg pass "$PASSPHRASE_NEW" '{passphrase:$pass}')" >/dev/null; then
+  detail "same-passphrase change_key FAILED: $(cat "$ERRFILE")"
+  detail "ACTION: the driver's unlocked-with-open-rotation-window arm is unsafe and must be redesigned"
+  step5b_ok=0
+fi
+
+# ... and the key must still work afterward.
+mc pool.dataset.lock "$(jq -nc --arg id "$ZV" '$id')" >/dev/null 2>&1 || true
+if ! mc pool.dataset.unlock "$new_json" >/dev/null; then
+  detail "the passphrase no longer unlocks after a same-key change_key"
+  step5b_ok=0
+fi
+
+if [ "$step5b_ok" = "1" ]; then
+  pass "step 5b: same-passphrase change_key SUCCEEDS and leaves the key valid (rotation completion is idempotent by outcome)"
+else
+  fail "step 5b: same-passphrase change_key did not behave as the driver assumes"
+fi
+
+# --- step 5c: encryption_summary row identity ------------------------------
+
+step 5c "encryption_summary <id> returns a row whose name == the dataset id"
+
+# The driver matches the summary row by EXACT dataset name and fails CLOSED when
+# no row matches (it will not read a child's lock state, and will not read an
+# empty result as 'unlocked'). Any id/path normalisation drift on this BETA would
+# turn every unlock into a hard error, so it must be caught here.
+summary_json="$(mc pool.dataset.encryption_summary "$(jq -nc --arg id "$ZV" '$id')")"
+summary_names="$(printf '%s' "$summary_json" | jq -r '.[].name' 2>/dev/null)"
+if printf '%s\n' "$summary_names" | grep -qx "$ZV"; then
+  pass "step 5c: encryption_summary names the dataset exactly ('$ZV')"
+else
+  detail "summary row names were: $(printf '%s' "$summary_names" | tr '\n' ' ')"
+  detail "ACTION: the driver's exact-name match (fail-closed) would reject every unlock"
+  fail "step 5c: encryption_summary returned no row named exactly '$ZV'"
+fi
+
 # --- step 6: snapshot + clone inherit the origin key -----------------------
 
 step 6 "snapshot + clone -> clone encryption_root == origin (shared-key, P-7)"
@@ -440,6 +501,51 @@ if [ "$step6_ok" = "1" ]; then
   pass "step 6: clone is encrypted with encryption_root == origin (inherits the origin key, not independently keyed)"
 else
   fail "step 6: clone encryption inheritance did not match P-7"
+fi
+
+# --- step 6b: detached copy of an ENCRYPTED source (UNPROBED outcome) -------
+
+step 6b "detached copy (replication.run_onetime LOCAL) of an encrypted source -> is the copy encrypted?"
+
+# This is the driver's `snapshotRestoreMode: detached` mechanism, run against an
+# ENCRYPTED source. Whether TrueNAS 26.0 sends raw (target encrypted, inheriting
+# nothing the driver has a policy record for) or plain (a SILENT DECRYPTION of
+# the data into a plaintext dataset) is UNPROBED as of 2026-08-02 — which is why
+# the driver currently REFUSES an encrypted content source in both restore modes.
+# This step settles it. It PASSES when it produces a determinate answer; the
+# answer itself is what matters, so read the recorded line.
+step6b_ok=1
+mc pool.dataset.unlock "$new_json" >/dev/null 2>&1 || true
+
+if ! mc replication.run_onetime "$(jq -nc --arg src "$ZV" --arg dst "$DETACHED" --arg snap "$SNAP_NAME" \
+  '{direction:"PUSH",transport:"LOCAL",source_datasets:[$src],target_dataset:$dst,recursive:false,
+    replicate:false,name_regex:("^" + $snap + "$"),retention_policy:"NONE",readonly:"IGNORE",
+    only_from_scratch:true}')" >/dev/null; then
+  detail "replication.run_onetime dispatch failed: $(cat "$ERRFILE")"
+  step6b_ok=0
+fi
+
+# The one-time replication is a @job; midclt waits for it. Give the dataset a
+# moment to materialise in the query view regardless.
+detached_out="$(mc pool.dataset.query "$(jq -nc --arg id "$DETACHED" '[["id","=",$id]]')" | jq '.[0] // empty' 2>/dev/null)"
+if [ -z "$detached_out" ]; then
+  detail "detached copy $DETACHED did not materialise; outcome UNDETERMINED"
+  step6b_ok=0
+else
+  detached_encrypted="$(printf '%s' "$detached_out" | jq -r '.encrypted // false' 2>/dev/null)"
+  detached_root="$(printf '%s' "$detached_out" | jq -r '.encryption_root.value // .encryption_root // "none"' 2>/dev/null)"
+  detail "RECORDED: detached copy of an encrypted source -> encrypted=$detached_encrypted encryption_root=$detached_root"
+  if [ "$detached_encrypted" = "true" ]; then
+    detail "=> raw send: the copy is encrypted; a driver that allowed this must stamp and key it explicitly"
+  else
+    detail "=> plain send: the copy is DECRYPTED; allowing this silently would downgrade the operator's data"
+  fi
+fi
+
+if [ "$step6b_ok" = "1" ]; then
+  pass "step 6b: detached-copy encryption outcome recorded (see the RECORDED line above)"
+else
+  fail "step 6b: could not determine the detached-copy encryption outcome"
 fi
 
 # --- step 7: DeleteVolume while locked destroys cleanly --------------------

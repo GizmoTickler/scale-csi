@@ -1154,17 +1154,41 @@ stringData:
 Encryption is immutable for the life of a volume. There is **no in-place
 encryption** of an existing plaintext volume, and an idempotent `CreateVolume`
 replay that would flip a volume encrypted↔plaintext is rejected with
-`FailedPrecondition`.
+`FailedPrecondition`. The replay guard compares the BACKEND's own answer
+(`pool.dataset.query` reports `encrypted`), not just the driver's stamp, so a
+create that was interrupted between `pool.dataset.create` and the stamp write is
+never described as plaintext: replaying the same encrypted StorageClass repairs
+the stamp, and replaying a plaintext class against it fails closed.
 
 A volume materialized from a content source (a `dataSource` snapshot restore or
 clone) **cannot be encrypted**: the driver refuses `encryption` together with a
 volume content source at `CreateVolume`, before any mutation, with
 `InvalidArgument`. The bytes of a restored volume come from its origin and carry
 the origin's encryption state; stamping a fresh key the inherited bytes do not
-hold would be a lie the immutability guard later treats as ground truth. To get
-an encrypted volume from existing data, restore into a **plaintext** class and
-create a new encrypted volume, or take the restore-to-plaintext path and
-re-encrypt out of band.
+hold would be a lie the immutability guard later treats as ground truth.
+
+The refusal is symmetric — **an encrypted volume cannot be a content source
+either**, in any restore mode, for any destination class. Restoring from an
+encrypted snapshot or volume is refused with `FailedPrecondition` before any
+mutation. Without that guard, a `clone` restore would produce a volume that is
+encrypted (with its ORIGIN's key, per the inheritance rule below) but carries no
+encryption policy of its own: publish would never unlock it, the unlock
+reconciler would never consider it, and the first appliance reboot would leave it
+dead with no recovery path in the driver at all. For a `detached` restore it is
+not established whether the send is raw (an encrypted, unmanageable copy) or
+plain (a silent decryption of your data), so that path is refused rather than
+guessed at.
+
+> **Known limitation — deviation from design §E-4.** The design recommended
+> allowing restore into an encrypted class with `snapshotRestoreMode: detached`
+> and rejecting only `clone`. This release takes the conservative position
+> instead: **no content source is combined with encryption, in either
+> direction.** Plan around it: snapshot restore, volume cloning and VolSync
+> restore into an encrypted class are not possible in this version, and neither
+> is restoring FROM an encrypted volume into a plaintext class. To move data into
+> or out of an encrypted volume, provision a fresh volume of the target class and
+> copy at the file/application level. A detached restore that establishes its own
+> `encryption_root` and its own key is the intended follow-up.
 
 ### ⚠ A locked dataset serves zero I/O (the availability model)
 
@@ -1181,13 +1205,32 @@ The consequences, in plain words:
   block device** (`/dev/zvol/<name>` is gone), and a locked filesystem has
   `mountpoint: null` — so a locked volume serves no I/O at all.
 - **The controller re-unlocks best-effort, not by guarantee.** An unlock
-  reconciler runs at startup and on every reconcile pass: it lists managed
-  datasets stamped encrypted, finds the ones reported locked, resolves each
-  dataset's PV → StorageClass → controller-publish-secret → passphrase, and
-  unlocks. Unlock is gated on `locked == true` first, because unlocking an
+  reconciler runs at startup — before the startup share-rebuild pass, so shares
+  are never rebuilt over a locked, device-less zvol — and on every reconcile
+  pass. It lists managed datasets carrying the encryption stamp, finds the ones
+  reported locked, confirms with a source-bearing re-read that the stamp is the
+  volume's OWN (a clone-inherited marker is skipped: its key belongs to the
+  origin), resolves each dataset's PV → StorageClass → controller-publish-secret
+  → passphrase, and unlocks — using the same two-key rotation window the publish
+  path uses, so a reboot inside an open rotation window still recovers without a
+  human. Unlock is gated on `locked == true` first, because unlocking an
   already-unlocked dataset returns a FAILED job (it is not idempotent). This is a
   reconvergence, not an SLA: **recovery latency is the reconcile interval**, and
   during the window the affected pods see I/O errors (EIO).
+- **The reconciler is bounded, and says so when it truncates.** Each pass acts on
+  at most 25 volumes, paces its unlock jobs, bounds every backend call at 30s and
+  the whole pass at 5 minutes. A fleet larger than the budget is worked off over
+  successive passes, and every truncation is logged with the carry-over count —
+  nothing is dropped silently. It takes the same per-volume lock
+  `ControllerPublishVolume` holds, so the two never issue overlapping unlock jobs
+  on one dataset, and a volume that another operation is handling is skipped, not
+  raced. A failure that turns out to be a lost race (the volume is unlocked when
+  re-read) is treated as benign and never reported as an unhealthy volume.
+- **Persistent failure is an Event.** Two consecutive failed passes for a volume
+  raise a redacted `EncryptionUnlockFailed` Warning naming the volume and the
+  failure class. If encryption is enabled but the reconciler cannot run at all
+  (no in-cluster Kubernetes client), that is logged once, loudly, at startup —
+  because it means this mitigation is off.
 - **Pair encrypted classes with pod restart policy.** Running pods do not
   re-stage on their own once the dataset is unlocked underneath them. Use pod
   liveness probes / `restartPolicy` so a pod that hit EIO re-stages and recovers
@@ -1215,15 +1258,36 @@ discards the only working key. The driver never auto-deletes the Secret.
 ### Key rotation
 
 Update the Secret's `passphrase` and keep the old value in `passphrasePrevious`.
-On the next `ControllerPublishVolume` unlock the driver tries `passphrase`
-first; if that fails and `passphrasePrevious` is present, it unlocks with the
-previous passphrase and then calls `pool.dataset.change_key` to rotate to the
-new one (`change_key` requires the dataset unlocked first). Once rotated, the
-old passphrase is dead, so a replay lands on the `passphrase`-succeeds branch —
-rotation is idempotent by outcome. A redacted Event records a successful
-rotation; the passphrase itself never appears in it. If both passphrases fail,
-the publish fails closed with `FailedPrecondition`. There is no CSI rotate RPC
-and no node-side rotation path; rotation is controller-side only.
+That pair is the **rotation window**: while both keys are present and differ, the
+driver drives the volume to the current passphrase.
+
+- **Locked volume** (a publish after a reboot, or the unlock reconciler): try
+  `passphrase`; if it unlocks, the volume already holds the current key and
+  nothing else is needed. If it fails, unlock with `passphrasePrevious` and then
+  `pool.dataset.change_key` to the current one (`change_key` requires the dataset
+  unlocked first). If both fail, the operation fails closed with
+  `FailedPrecondition`.
+- **Unlocked volume with the window open:** the driver calls `change_key` to the
+  current passphrase anyway. This is what completes a rotation that was
+  interrupted — a controller killed, or a `change_key` that failed, between the
+  unlock and the re-key leaves the volume unlocked and still on the OLD key while
+  everything looks healthy. Re-keying to the identical passphrase is a success
+  that leaves the key valid, so this is a no-op by outcome when the rotation has
+  already landed. The unlock reconciler performs this convergence once per open
+  window per volume, so leaving `passphrasePrevious` in place does not re-key on
+  every pass.
+- **A rotation that does NOT complete is never reported as success.** The
+  operation returns an error and a redacted `EncryptionRotationIncomplete`
+  Warning Event is raised telling you to **keep `passphrasePrevious` in the
+  Secret** until an `EncryptionRotated` Event is observed for that volume.
+  Removing the previous key while the volume is still keyed to it is the
+  permanent-data-loss case.
+
+Close the window by removing `passphrasePrevious` **after** you have seen
+`EncryptionRotated` (and no `EncryptionRotationIncomplete`) for every volume of
+the class. Redacted Events record rotation; the passphrase never appears in one.
+There is no CSI rotate RPC and no node-side rotation path; rotation is
+controller-side only.
 
 ### Clones inherit the origin's key
 
@@ -1234,12 +1298,11 @@ locks the clone, and a clone cannot be re-keyed on its own (`change_key` on an
 inheriting child is refused by ZFS). Deleting or locking the origin therefore
 affects its clones.
 
-For encrypted classes, prefer `snapshotRestoreMode: detached` (a full send/recv
-copy with its own `encryption_root` and its own key) over `clone`, unless you
-deliberately want the clone to share the origin's key and lock state. Note that a
-detached restore is itself a content source, so it is created **plaintext** (the
-create-time-only rule above); the point of choosing detached is key independence
-of the restored copy, not encryption of it.
+This inheritance is why an encrypted volume may not be a content source at all in
+this release (see the known limitation above): a clone of one would be encrypted
+with the origin's key and carry no policy of its own, which the driver could
+never unlock. `snapshotRestoreMode` therefore has no effect on encrypted
+volumes — neither mode is reachable from or into an encrypted class.
 
 ### ⚠ Do not roll back below encryption support
 

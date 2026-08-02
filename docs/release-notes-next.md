@@ -39,11 +39,18 @@ ConfigMap). Upgrading changes nothing for an install that does not opt in.
 - **Create-time only.** Encryption is immutable for the life of a volume. There
   is no in-place encryption of an existing plaintext volume, and an idempotent
   `CreateVolume` replay that would flip encrypted↔plaintext is refused with
-  `FailedPrecondition`. An encrypted create that also carries a content source
-  (snapshot restore or clone) is refused with `InvalidArgument` before any
-  mutation — restored bytes carry the origin's encryption state, so the driver
-  will not stamp a key they do not hold. Restore to a plaintext class, or create
-  new.
+  `FailedPrecondition` — compared against the BACKEND's own `encrypted` answer,
+  not just the driver's stamp, so a create interrupted before its stamp write is
+  repaired on replay instead of being wrongly called plaintext. An encrypted
+  create that also carries a content source (snapshot restore or clone) is
+  refused with `InvalidArgument` before any mutation, and an ENCRYPTED volume may
+  not be a content source either (`FailedPrecondition`, both restore modes) — a
+  clone of one would be encrypted with its ORIGIN's key and no policy of its own,
+  which the driver could never unlock. **Deviation from design §E-4, stated
+  plainly: snapshot restore, cloning and VolSync restore into an encrypted class
+  are not possible in v1.6.0, and neither is restoring from an encrypted volume
+  into a plaintext class.** Copy at the file level; detached-restore-with-its-own-
+  key is the follow-up.
 - **The passphrase is radioactive.** It exists only in the Secret, the
   short-lived parse, and request-scoped context. It never reaches a log, a gRPC
   status, a Kubernetes Event, the PV's `volumeContext`, or a dataset
@@ -60,13 +67,27 @@ TrueNAS does **not** persist a passphrase key (`encryption_summary` reports
   auto-unlocks it. A locked zvol has no backing block device; a locked
   filesystem has `mountpoint: null`. Both serve no I/O.
 - **The unlock reconciler is best-effort, not a guarantee.** It runs at startup
-  and on every reconcile pass, lists managed datasets stamped encrypted, gates on
-  `encryption_summary.locked == true` (unlock is NOT idempotent — unlocking an
+  (before the startup share-rebuild pass, so shares are never rebuilt over a
+  locked, device-less zvol) and on every reconcile pass. It enumerates candidates
+  from the managed-dataset listing, confirms each one's encryption stamp is its
+  OWN with a source-bearing re-read (a clone-inherited marker is skipped), gates
+  on `encryption_summary.locked == true` (unlock is NOT idempotent — unlocking an
   unlocked dataset returns a FAILED job), resolves PV → StorageClass →
-  controller-publish-secret → passphrase, and unlocks. **Recovery latency is the
-  reconcile interval; during the window the affected pods see EIO.** Pair
-  encrypted classes with pod liveness/restart so a pod that hit EIO re-stages
-  after unlock. An operator who cannot tolerate that window should not encrypt.
+  controller-publish-secret → passphrase, and unlocks — honoring the same two-key
+  rotation window the publish path uses, so a reboot inside an open window
+  recovers without a human. **Recovery latency is the reconcile interval; during
+  the window the affected pods see EIO.** Pair encrypted classes with pod
+  liveness/restart so a pod that hit EIO re-stages after unlock. An operator who
+  cannot tolerate that window should not encrypt.
+- **It is bounded and it is honest about it.** Per-pass action budget (25
+  volumes), paced unlock jobs, a 30s per-call bound and a 5-minute pass bound;
+  every truncation is logged with its carry-over count and worked off on later
+  passes. It takes the same per-volume lock as `ControllerPublishVolume`, so the
+  two never race on one dataset, and a failure that turns out to be a lost race
+  (the volume reads unlocked afterward) is benign, never an unhealthy-volume
+  Event. Two consecutive real failures raise a redacted `EncryptionUnlockFailed`
+  Warning. If encryption is on but the reconciler cannot run (no in-cluster
+  client), that is logged once, loudly — it means this mitigation is off.
 - **Publish unlocks before the share is built**, so an extent always has a
   backing device before fencing converges. There is no node-side unlock (the node
   has no TrueNAS client); if unlock never happens, `NodeStageVolume` fails closed
@@ -76,23 +97,37 @@ TrueNAS does **not** persist a passphrase key (`encryption_summary` reports
 
 ### Key rotation
 
-Set the new `passphrase` and keep the old one in `passphrasePrevious`. On the
-next publish unlock the driver tries the new key first; on failure it unlocks
-with the previous key and calls `pool.dataset.change_key` to rotate (`change_key`
-requires the dataset unlocked). Once rotated the old key is dead, so a replay
-lands on the new-key branch — rotation is idempotent by outcome. A redacted Event
-records it. Both keys failing fails closed. Rotation is controller-side only;
-there is no CSI rotate RPC and no node path.
+Set the new `passphrase` and keep the old one in `passphrasePrevious`. While both
+are present and differ, the rotation window is open and the driver drives every
+volume of the class to the current key:
+
+- **Locked:** try the current key (if it unlocks, the volume already holds it);
+  otherwise unlock with the previous key and `pool.dataset.change_key` to the
+  current one. Both failing fails closed.
+- **Unlocked:** `change_key` to the current key anyway. That completes a rotation
+  interrupted between the unlock and the re-key — the state where the volume is
+  unlocked, healthy-looking, and still on the OLD key — and is a no-op by outcome
+  when the rotation already landed (re-keying to the identical passphrase
+  succeeds and the key stays valid). The reconciler does this once per open
+  window per volume, not on every pass.
+- **A rotation that does not complete never reports success.** The operation
+  errors and raises a redacted `EncryptionRotationIncomplete` Warning telling you
+  to KEEP `passphrasePrevious` until an `EncryptionRotated` Event is observed for
+  the volume. Dropping the previous key while the volume still holds it is the
+  permanent-loss case.
+
+Rotation is controller-side only; there is no CSI rotate RPC and no node path.
 
 ### Clone inheritance
 
 A `clone`-restore volume created from an encrypted origin inherits the origin's
 key — its `encryption_root` is the **origin**, not itself. It is not
 independently keyed: locking the origin locks the clone, and a clone cannot be
-re-keyed (`change_key` on an inheriting child is refused by ZFS). Prefer
-`snapshotRestoreMode: detached` for encrypted classes when you need key
-independence (a detached copy has its own `encryption_root`); note a detached
-restore is itself a content source and is therefore created plaintext.
+re-keyed (`change_key` on an inheriting child is refused by ZFS). This is exactly
+why an encrypted volume cannot be a content source in v1.6.0: the clone would be
+encrypted with a key the driver has no policy record for, and no unlock path
+would ever consider it. `snapshotRestoreMode` therefore has no bearing on
+encrypted volumes in this release.
 
 ### Risk register (stated bluntly)
 
