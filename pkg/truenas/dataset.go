@@ -224,18 +224,18 @@ func datasetParamsJSONKeys(params interface{}) []string {
 // the exact diagnosis problem this check exists to prevent. The JSON-RPC code is
 // the real one.
 func UnsupportedDatasetPropertyError(datasetType, property string) *APIError {
-	path := "data." + property
+	keyPath := "data." + property
 	if datasetType != "" {
-		path = "data." + datasetType + "." + property
+		keyPath = "data." + datasetType + "." + property
 	}
 	return &APIError{
 		Code:    -32602,
-		Message: fmt.Sprintf("[EINVAL] %s: Extra inputs are not permitted", path),
+		Message: fmt.Sprintf("[EINVAL] %s: Extra inputs are not permitted", keyPath),
 	}
 }
 
 // ValidateDatasetPayloadKeys reports the first payload key that TrueNAS 26.0
-// would reject, marshalling the params exactly as the real client would so
+// would reject, marshaling the params exactly as the real client would so
 // `omitempty` decides what is actually on the wire.
 func ValidateDatasetPayloadKeys(params interface{}, accepted map[string]struct{}, datasetType string) error {
 	encoded, err := json.Marshal(params)
