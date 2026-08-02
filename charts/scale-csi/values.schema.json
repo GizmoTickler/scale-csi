@@ -359,6 +359,48 @@
           "description": "Per-class read-only export override.",
           "type": "boolean"
         },
+        "nfsMaprootUser": {
+          "description": "Per-class maproot_user override. An EMPTY STRING is meaningful and is emitted: it clears the driver's default root squash, which is how a class escapes the maproot/mapall exclusivity when it sets nfsMapallUser.",
+          "type": "string"
+        },
+        "nfsMaprootGroup": {
+          "description": "Per-class maproot_group override. An EMPTY STRING is meaningful and is emitted (clears the default).",
+          "type": "string"
+        },
+        "nfsMapallUser": {
+          "description": "Per-class mapall_user override. Mutually exclusive with maproot_* in the EFFECTIVE payload, so a class that sets this normally also sets nfsMaprootUser: \"\" and nfsMaprootGroup: \"\".",
+          "type": "string"
+        },
+        "nfsMapallGroup": {
+          "description": "Per-class mapall_group override. Mutually exclusive with maproot_* in the effective payload.",
+          "type": "string"
+        },
+        "nfsAllowedNetworks": {
+          "description": "Per-class export network allowlist (CIDRs), rendered as the comma-joined nfsAllowedNetworks parameter. Rejected at CreateVolume under fencing.mode=strict, which owns the allowlist.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "nfsAllowedHosts": {
+          "description": "Per-class export host allowlist, rendered as the comma-joined nfsAllowedHosts parameter. Rejected at CreateVolume under fencing.mode=strict, which owns the allowlist.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "nfsACLMode": {
+          "description": "Per-class dataset aclmode. RESTRICTED is the only ZFS lever that stops a chmod (including an fsGroup chown/chmod) from rewriting a driver-applied NFSv4 ACL. Requires nfsACLTemplate or nfsACL. DISCARD is deliberately not offered.",
+          "type": "string",
+          "enum": [
+            "PASSTHROUGH",
+            "RESTRICTED"
+          ]
+        },
         "zfsPerformanceClass": {
           "description": "Curated ZFS property preset applied to newly provisioned volumes. volblocksize/logbias/primarycache/secondarycache are CREATE-ONLY; changing the class on an existing PVC is rejected.",
           "type": "string",

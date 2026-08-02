@@ -208,6 +208,103 @@ func TestChartGF5NFSACLStorageClassParameters(t *testing.T) {
 	})
 }
 
+// TestChartGF5DocumentedMitigationsAreReachable pins the parameters the docs
+// present as PRIMARY mitigations. Every one of them was rejected by the typed
+// storageClasses[] schema (`additional properties ... not allowed`), so the only
+// way to reach them was the untyped extraParameters map that no doc mentions:
+//
+//   - nfsACLMode: RESTRICTED — docs/reference/storageclass.md calls it "the only
+//     ZFS lever that actually stops a chmod from touching the ACL";
+//   - nfsMapallUser alongside nfsMaprootUser/Group cleared to "" — the only
+//     documented way out of the maproot/mapall exclusivity the driver enforces;
+//   - the export allowlists.
+//
+// The empty-string case is the sharp one: the driver distinguishes "parameter
+// absent" from "parameter present and EMPTY", so a truthiness-keyed template
+// would render perfectly valid YAML that silently drops the clear.
+func TestChartGF5DocumentedMitigationsAreReachable(t *testing.T) {
+	t.Run("default class emits none of them", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml")
+		for _, key := range []string{
+			"nfsACLMode", "nfsMaprootUser", "nfsMaprootGroup", "nfsMapallUser", "nfsMapallGroup",
+			"nfsAllowedNetworks", "nfsAllowedHosts",
+		} {
+			if strings.Contains(out, key) {
+				t.Errorf("default StorageClass render must not emit %q; got:\n%s", key, out)
+			}
+		}
+	})
+
+	t.Run("nfsACLMode RESTRICTED renders as a CSI parameter", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf5-acl-mode.yaml", `storageClasses:
+  - name: scale-nfs-acl
+    protocol: nfs
+    nfsACLTemplate: NFS4_RESTRICTED
+    nfsACLMode: RESTRICTED
+`)
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		if !strings.Contains(out, "nfsACLMode: RESTRICTED") {
+			t.Errorf("nfsACLMode did not render; got:\n%s", out)
+		}
+	})
+
+	t.Run("the documented squash escape renders, empty strings included", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf5-squash.yaml", `storageClasses:
+  - name: scale-nfs-squash
+    protocol: nfs
+    nfsMapallUser: nobody
+    nfsMapallGroup: nogroup
+    nfsMaprootUser: ""
+    nfsMaprootGroup: ""
+`)
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		for _, want := range []string{
+			"nfsMapallUser: nobody",
+			"nfsMapallGroup: nogroup",
+			`nfsMaprootUser: ""`,
+			`nfsMaprootGroup: ""`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rendered StorageClass missing %q — an empty maproot override must still be EMITTED, "+
+					"because absent and empty mean different things to the driver; got:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("export allowlists render comma-joined", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf5-allowlists.yaml", `storageClasses:
+  - name: scale-nfs-allow
+    protocol: nfs
+    nfsAllowedNetworks:
+      - 10.0.0.0/24
+      - 10.1.0.0/24
+    nfsAllowedHosts:
+      - node-a
+`)
+		out := helmTemplate(t, "--show-only", "templates/storageclass.yaml", "-f", valuesPath)
+		for _, want := range []string{
+			"nfsAllowedNetworks: 10.0.0.0/24,10.1.0.0/24",
+			"nfsAllowedHosts: node-a",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rendered StorageClass missing %q; got:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("schema rejects an unknown aclmode", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf5-acl-mode-bad.yaml", `storageClasses:
+  - name: scale-nfs-acl
+    protocol: nfs
+    nfsACLTemplate: NFS4_RESTRICTED
+    nfsACLMode: DISCARD
+`)
+		if out := helmTemplateExpectError(t, "-f", valuesPath); !strings.Contains(out, "nfsACLMode") {
+			t.Errorf("schema did not reject DISCARD, which the driver deliberately does not offer; got:\n%s", out)
+		}
+	})
+}
+
 // TestChartGF5ZFSPerformanceClass proves the curated-class parameter is emitted
 // only when a class sets it, that the schema pins the five documented classes,
 // and that the bundled opt-in example stays disabled by default.

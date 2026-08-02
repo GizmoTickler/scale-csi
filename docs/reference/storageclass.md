@@ -724,6 +724,21 @@ parameters:
   nfsMaprootGroup: ""
 ```
 
+The chart exposes the same four keys (plus `nfsACLMode`, `nfsAllowedNetworks`
+and `nfsAllowedHosts`) as typed `storageClasses[]` entries, and it emits a key
+whenever the entry **has** it — so `nfsMaprootUser: ""` above renders as an empty
+parameter rather than being dropped, which is exactly what clears the inherited
+squash:
+
+```yaml
+storageClasses:
+  - name: scale-nfs-mapall
+    protocol: nfs
+    nfsMapallUser: nobody
+    nfsMaprootUser: ""
+    nfsMaprootGroup: ""
+```
+
 `nfsAllowedNetworks` / `nfsAllowedHosts` are **rejected with `InvalidArgument`
 under `fencing.mode: strict`**. Strict fencing owns the export allowlist: every
 share is created with empty `networks`/`hosts` (deny-all until

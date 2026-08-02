@@ -78,6 +78,26 @@ parameters:
   {{- if hasKey $storageClass "nfsReadOnly" }}
   {{- $_ := set $parameters "nfsReadOnly" (printf "%v" $storageClass.nfsReadOnly) -}}
   {{- end }}
+  {{- /* Squash overrides, keyed on hasKey rather than truthiness: the driver
+       distinguishes "parameter absent" (inherit the chart/global default) from
+       "parameter present and EMPTY", and the empty string is the documented way
+       to CLEAR the default root squash so a class can set mapall_* without
+       tripping the maproot/mapall exclusivity. A truthiness test would silently
+       drop exactly that value. */}}
+  {{- range $squashKey := (list "nfsMaprootUser" "nfsMaprootGroup" "nfsMapallUser" "nfsMapallGroup") }}
+  {{- if hasKey $storageClass $squashKey }}
+  {{- $_ := set $parameters $squashKey (printf "%v" (get $storageClass $squashKey)) -}}
+  {{- end }}
+  {{- end }}
+  {{- /* Export allowlists, comma-joined like nfsSecurity. Under
+       fencing.mode=strict the driver REJECTS these at CreateVolume rather than
+       discarding them, so a class that sets one must be on additive fencing. */}}
+  {{- with $storageClass.nfsAllowedNetworks }}
+  {{- $_ := set $parameters "nfsAllowedNetworks" (join "," .) -}}
+  {{- end }}
+  {{- with $storageClass.nfsAllowedHosts }}
+  {{- $_ := set $parameters "nfsAllowedHosts" (join "," .) -}}
+  {{- end }}
   {{- /* NFSv4 ACL. Emitted only when set; see docs/reference/storageclass.md for
        the fsGroupPolicy=File interaction this opts a class into. */}}
   {{- if $storageClass.nfsACLTemplate }}
@@ -85,6 +105,13 @@ parameters:
   {{- end }}
   {{- if $storageClass.nfsACL }}
   {{- $_ := set $parameters "nfsACL" (toJson $storageClass.nfsACL) -}}
+  {{- end }}
+  {{- /* aclmode. RESTRICTED is the documented primary mitigation for the
+       ACL x fsGroup interaction and is the ONLY ZFS lever that stops a chmod
+       from rewriting the ACL; the driver requires nfsACLTemplate or nfsACL
+       alongside it. */}}
+  {{- if $storageClass.nfsACLMode }}
+  {{- $_ := set $parameters "nfsACLMode" $storageClass.nfsACLMode -}}
   {{- end }}
   {{- /* CHAP: when a per-StorageClass CHAP Secret is named, emit the four CSI
        secret-ref parameters (provisioner + node-stage). The chart references
