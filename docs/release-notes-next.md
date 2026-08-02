@@ -61,6 +61,17 @@ ConfigMap). Upgrading changes nothing for an install that does not opt in.
   algorithm marker; the durable per-volume stamp is `truenas-csi:encryption =
   <algorithm>`, never the key.
 
+### Only volumes this driver keyed are touched
+
+ZFS encryption is inherited, so a deployment that encrypts the parent dataset or
+the pool makes every CSI volume report `encrypted: true`. That is not per-volume
+encryption and the driver leaves it alone: a volume counts as the driver's own
+only when it is encrypted, its `encryption_root` is the volume's **own** dataset,
+and its `key_format` is `PASSPHRASE` (the one format TrueNAS does not persist).
+Inherited keys and appliance-stored keys (hex/KMIP) are never unlocked, re-keyed,
+refused as a content source, or destroyed — plaintext StorageClasses on an
+encrypted pool behave exactly as they did before this release.
+
 ### The availability model (read before enabling)
 
 TrueNAS does **not** persist a passphrase key (`encryption_summary` reports

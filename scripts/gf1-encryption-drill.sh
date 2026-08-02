@@ -15,6 +15,12 @@
 #      back + pattern intact (reboot-survival proof; extent survives, NO recreation)
 #   4. wrong-passphrase unlock -> assert FAILED + stays locked (fail-closed, P-5)
 #   5. change_key -> assert old passphrase fails, new works (P-6)
+#   1b. encrypted PARENT + plain child -> assert the child reports encrypted:true
+#       with encryption_root == the PARENT and key_format PASSPHRASE (P-10), and
+#       that zfs.resource.query carries NO encryption fields at all (P-11). This
+#       is the discriminator the driver uses to tell "this volume has its own key
+#       the driver must manage" from "the deployment encrypted the parent" —
+#       getting it wrong destroyed restored data on ordinary deployments.
 #   5b. change_key to the SAME passphrase -> assert SUCCESS and the key still
 #       valid (the 2026-08-02 probe the driver's rotation-completion arm relies
 #       on: an unlocked volume inside an open rotation window is re-keyed
@@ -82,6 +88,8 @@ ZV="$POOL/gf1-enc-drill-zv"
 FS="$POOL/gf1-enc-drill-fs"
 CLONE="$POOL/gf1-enc-drill-clone"
 DETACHED="$POOL/gf1-enc-drill-detached"
+ENC_PARENT="$POOL/gf1-enc-drill-parent"
+ENC_CHILD="$ENC_PARENT/child"
 SNAP_NAME="gf1-enc-drill-snap"
 SNAP="$ZV@$SNAP_NAME"
 EXTENT_NAME="gf1-enc-drill-extent"
@@ -156,6 +164,8 @@ sweep_residue() {
   mc pool.snapshot.delete "$(jq -nc --arg id "$SNAP" '$id')" >/dev/null 2>&1 || true
   destroy_if_exists "$CLONE"
   destroy_if_exists "$DETACHED"
+  destroy_if_exists "$ENC_CHILD"
+  destroy_if_exists "$ENC_PARENT"
   destroy_if_exists "$ZV"
   destroy_if_exists "$FS"
 }
@@ -244,6 +254,70 @@ if [ "$step1_ok" = "1" ]; then
   pass "step 1: encrypted zvol + fs created (encrypted, PASSPHRASE, AES-256-GCM, unlocked)"
 else
   fail "step 1: encrypted dataset creation did not match the P-1/P-2 create shape"
+fi
+
+# --- step 1b: inherited encryption identity (P-10 / P-11) ------------------
+
+step 1b "encrypted parent + plain child -> encryption_root == PARENT, key_format PASSPHRASE; resource query carries nothing"
+
+step1b_ok=1
+
+if ! mc pool.dataset.create "$(jq -nc --arg name "$ENC_PARENT" --arg pass "$PASSPHRASE" \
+  '{name:$name,type:"FILESYSTEM",encryption:true,inherit_encryption:false,
+    encryption_options:{algorithm:"AES-256-GCM",passphrase:$pass}}')" >/dev/null; then
+  detail "encrypted parent create failed: $(cat "$ERRFILE")"
+  step1b_ok=0
+fi
+# A child with NO encryption arguments at all: it must INHERIT.
+if ! mc pool.dataset.create "$(jq -nc --arg name "$ENC_CHILD" '{name:$name,type:"FILESYSTEM"}')" >/dev/null; then
+  detail "plain child create failed: $(cat "$ERRFILE")"
+  step1b_ok=0
+fi
+
+child_out="$(mc pool.dataset.query "$(jq -nc --arg id "$ENC_CHILD" '[["id","=",$id]]')" | jq '.[0] // empty' 2>/dev/null)"
+child_encrypted="$(printf '%s' "$child_out" | jq -r '.encrypted // false' 2>/dev/null)"
+child_root="$(printf '%s' "$child_out" | jq -r '.encryption_root.value // .encryption_root // empty' 2>/dev/null)"
+child_format="$(printf '%s' "$child_out" | jq -r '.key_format.value // .key_format // empty' 2>/dev/null)"
+parent_root="$(mc pool.dataset.query "$(jq -nc --arg id "$ENC_PARENT" '[["id","=",$id]]')" | jq -r '.[0].encryption_root.value // .[0].encryption_root // empty' 2>/dev/null)"
+
+if [ "$child_encrypted" != "true" ]; then
+  detail "child is not encrypted (expected inheritance)"
+  step1b_ok=0
+fi
+if [ "$child_root" != "$ENC_PARENT" ]; then
+  detail "child encryption_root is '$child_root', expected the PARENT '$ENC_PARENT'"
+  detail "ACTION: the driver's self-keyed discriminator (root == self) depends on this exact shape"
+  step1b_ok=0
+fi
+if [ "$parent_root" != "$ENC_PARENT" ]; then
+  detail "parent encryption_root is '$parent_root', expected ITSELF '$ENC_PARENT'"
+  step1b_ok=0
+fi
+if [ "$child_format" != "PASSPHRASE" ]; then
+  detail "child key_format is '$child_format', expected PASSPHRASE"
+  step1b_ok=0
+fi
+
+# P-11: the bulk resource listing must carry NO encryption/key/lock fields, which
+# is why the driver never decides anything about encryption from it.
+resource_out="$(mc zfs.resource.query "$(jq -nc --arg p "$ENC_CHILD" '{paths:[$p]}')" 2>/dev/null | jq '.[0] // empty' 2>/dev/null)"
+if [ -n "$resource_out" ]; then
+  leaked="$(printf '%s' "$resource_out" | jq -r '[paths|join(".")] | map(select(test("encrypt|key_format|key_loaded|locked"))) | join(",")' 2>/dev/null)"
+  if [ -n "${leaked:-}" ]; then
+    detail "RECORDED: zfs.resource.query DOES carry encryption-ish fields now: $leaked"
+    detail "ACTION: P-11 changed — re-check every 'the bulk listing carries no encryption signal' claim"
+    step1b_ok=0
+  else
+    detail "zfs.resource.query carries no encryption/key/lock fields (P-11 holds)"
+  fi
+else
+  detail "zfs.resource.query returned nothing for the child; P-11 not re-verified this run"
+fi
+
+if [ "$step1b_ok" = "1" ]; then
+  pass "step 1b: inherited encryption reports the PARENT as encryption_root (P-10) and the resource listing carries no encryption signal (P-11)"
+else
+  fail "step 1b: the inherited-encryption identity did not match P-10/P-11"
 fi
 
 # --- step 2: iSCSI extent over the zvol + write a known pattern ------------

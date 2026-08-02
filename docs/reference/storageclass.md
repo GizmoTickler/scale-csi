@@ -1179,7 +1179,21 @@ not established whether the send is raw (an encrypted, unmanageable copy) or
 plain (a silent decryption of your data), so that path is refused rather than
 guessed at.
 
-Both refusals are **independent of `encryption.enabled`**. The hazard belongs to
+### Encryption the driver manages vs. encryption your pool already has
+
+Everything in this section is about volumes **this driver keyed**. A deployment
+that encrypts the parent dataset (or the pool) itself is a different thing, and
+the driver leaves it entirely alone. ZFS encryption is inherited, so on such a
+deployment every CSI volume reports `encrypted: true` — with `encryption_root`
+naming the **ancestor**, not the volume. The driver treats a volume as its own
+encryption only when all three hold: `encrypted`, `encryption_root` equal to the
+volume's **own** dataset, and `key_format: PASSPHRASE` (the one key format
+TrueNAS does not store, i.e. the only one that needs a key from Kubernetes). A
+volume whose key is inherited, or whose key the appliance stores and auto-loads
+(hex/KMIP), is never unlocked, re-keyed, refused or destroyed by this driver, and
+plaintext StorageClasses keep working exactly as before on such a pool.
+
+Both content-source refusals are **independent of `encryption.enabled`**. The hazard belongs to
 the data, not to the feature flag: turning encryption off (a rollback, a values
 regression) while encrypted volumes still exist does not re-enable cloning one.
 The flag only decides how hard the driver looks — with it off, the refusal is
@@ -1196,6 +1210,17 @@ is then destroyed rather than handed back as a volume nothing could ever unlock.
 > or out of an encrypted volume, provision a fresh volume of the target class and
 > copy at the file/application level. A detached restore that establishes its own
 > `encryption_root` and its own key is the intended follow-up.
+>
+> **One residual, stated exactly.** The refusals cover: any restore FROM a volume
+> the driver keyed (always, both modes, flag on or off), and any restore whose
+> RESULT comes out with a driver-managed key (always). The single combination they
+> do not cover is `encryption.enabled: false` **and** a snapshot source **and** a
+> `detached` restore whose send turns out to be non-raw: the copy would then be
+> plaintext, so nothing refuses it and the operator's data has been silently
+> decrypted into a plaintext dataset. Whether TrueNAS 26.0 sends raw here is
+> UNPROBED; `scripts/gf1-encryption-drill.sh` step 6b settles it, and until it
+> does, do not disable `encryption.enabled` on a cluster that holds encrypted
+> volumes.
 
 ### ⚠ A locked dataset serves zero I/O (the availability model)
 
@@ -1289,6 +1314,11 @@ driver drives the volume to the current passphrase.
   origin's key (see below) and ZFS refuses `change_key` on an inheriting child,
   so the rotation window simply does not apply to it: publish skips the re-key
   and attaches the volume normally rather than failing it.
+- **Unlocking and re-keying are separate permissions.** A volume whose encryption
+  stamp was lost to a crash is still unlocked with `passphrasePrevious` when that
+  is the key it holds — trying a key is safe, a wrong one fails closed — but it is
+  not re-keyed until a `CreateVolume` replay repairs its stamp. Keep
+  `passphrasePrevious` until that replay has run.
 - **A rotation that does NOT complete is never reported as success.** The
   operation returns an error and a redacted `EncryptionRotationIncomplete`
   Warning Event is raised telling you to **keep `passphrasePrevious` in the

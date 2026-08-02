@@ -149,14 +149,23 @@ func TestGuardExistingEncryptionPolicy(t *testing.T) {
 	// whose stamp write was lost must never be described as plaintext, and an
 	// encrypted replay of it must REPAIR the stamp rather than wedge the PVC.
 	t.Run("encrypted-on-wire but unstamped: an encrypted replay repairs the stamp", func(t *testing.T) {
-		unstamped := &truenas.Dataset{Encrypted: true, UserProperties: map[string]truenas.UserProperty{}}
+		// SELF-KEYED wire shape (P-10): encryption_root is the dataset itself and
+		// the key format is PASSPHRASE — i.e. this dataset really does hold its own
+		// driver-supplied key.
+		unstamped := &truenas.Dataset{
+			Name: "pool/parent/vol", Encrypted: true,
+			EncryptionRoot: "pool/parent/vol", KeyFormat: truenas.KeyFormatPassphrase,
+			UserProperties: map[string]truenas.UserProperty{}}
 		encCtx := withEncryptionResolution(ctx, &encryptionResolution{Algorithm: "AES-192-GCM", Passphrase: "longenough1"})
 		repair, err := d.guardExistingEncryptionPolicy(encCtx, unstamped)
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{PropEncryption: "AES-192-GCM"}, repair)
 	})
 	t.Run("encrypted-on-wire but unstamped: a plaintext replay fails closed and never says plaintext", func(t *testing.T) {
-		unstamped := &truenas.Dataset{Encrypted: true, UserProperties: map[string]truenas.UserProperty{}}
+		unstamped := &truenas.Dataset{
+			Name: "pool/parent/vol", Encrypted: true,
+			EncryptionRoot: "pool/parent/vol", KeyFormat: truenas.KeyFormatPassphrase,
+			UserProperties: map[string]truenas.UserProperty{}}
 		_, err := d.guardExistingEncryptionPolicy(ctx, unstamped)
 		require.Error(t, err)
 		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
@@ -165,10 +174,13 @@ func TestGuardExistingEncryptionPolicy(t *testing.T) {
 			"the driver must never describe an encrypted dataset as plaintext")
 	})
 	t.Run("encrypted-on-wire from a content source is never adopted as its own policy", func(t *testing.T) {
-		clone := &truenas.Dataset{Encrypted: true, UserProperties: map[string]truenas.UserProperty{
-			PropVolumeContentSourceType: {Value: "snapshot", Source: "local"},
-			PropVolumeContentSourceID:   {Value: "snap-1", Source: "local"},
-		}}
+		clone := &truenas.Dataset{
+			Name: "pool/parent/clone", Encrypted: true,
+			EncryptionRoot: "pool/parent/clone", KeyFormat: truenas.KeyFormatPassphrase,
+			UserProperties: map[string]truenas.UserProperty{
+				PropVolumeContentSourceType: {Value: "snapshot", Source: "local"},
+				PropVolumeContentSourceID:   {Value: "snap-1", Source: "local"},
+			}}
 		encCtx := withEncryptionResolution(ctx, &encryptionResolution{Algorithm: "AES-256-GCM", Passphrase: "longenough1"})
 		repair, err := d.guardExistingEncryptionPolicy(encCtx, clone)
 		require.Error(t, err)
@@ -1154,4 +1166,276 @@ func TestEncryptedContentSourceRefusedWithFeatureFlagOff(t *testing.T) {
 		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 		assertNoUnmanageableEncryptedVolume(t, mockClient, "pool/parent/restored-flag-off")
 	})
+}
+
+// encryptedParentDriver builds a deployment whose PARENT dataset is encrypted at
+// rest — a completely ordinary posture (encrypt the parent once, the appliance
+// holds the key) that has nothing to do with per-volume encryption. Every dataset
+// created under it inherits encrypted:true with the PARENT as its encryption_root
+// (P-10), which is precisely the state the driver used to misread as "this volume
+// has its own unmanageable key".
+func encryptedParentDriver(t *testing.T, encryptionEnabled bool) (*Driver, *truenas.MockClient) {
+	t.Helper()
+	mockClient := truenas.NewMockClient()
+	_, err := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+		Name: "pool/parent", Type: "FILESYSTEM",
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &truenas.EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "parent-pass-1"},
+	})
+	require.NoError(t, err)
+	return &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS:        NFSConfig{Enabled: true, ShareHost: "192.0.2.10"},
+			Encryption: EncryptionConfig{Enabled: encryptionEnabled},
+		},
+		truenasClient: mockClient,
+	}, mockClient
+}
+
+func plainVolumeRequest(name string) *csi.CreateVolumeRequest {
+	return &csi.CreateVolumeRequest{
+		Name:               name,
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+	}
+}
+
+// TestInheritedEncryptionIsNotPerVolumeEncryption is the N-5 regression, and it
+// is the reviewer's exact set of scenarios. On a deployment whose parent dataset
+// is encrypted, EVERY dataset reads encrypted:true with the parent as its root.
+// Reading that as "this volume holds its own unmanageable key" wedged ordinary
+// plaintext replays, refused legitimate restores, and — worst — DESTROYED the
+// restored data.
+//
+// The discriminator is P-10: encryption_root == the dataset itself (plus
+// key_format PASSPHRASE) means the key is the driver's business; anything else is
+// the deployment's baseline.
+//
+// PRE-FIX PROOF: with the predicate back to plain ds.Encrypted, sub-tests 1 and 2
+// FAIL (FailedPrecondition "already exists ENCRYPTED", and the restore refused
+// with its dataset destroyed).
+func TestInheritedEncryptionIsNotPerVolumeEncryption(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a plaintext volume under an encrypted parent replays normally", func(t *testing.T) {
+		d, mockClient := encryptedParentDriver(t, false)
+		req := plainVolumeRequest("inherited-plain")
+		resp, err := d.CreateVolume(ctx, req)
+		require.NoError(t, err)
+
+		// The state that used to be misread.
+		ds, err := mockClient.DatasetGet(ctx, "pool/parent/inherited-plain")
+		require.NoError(t, err)
+		require.True(t, ds.Encrypted, "P-10: a child of an encrypted parent is encrypted")
+		require.Equal(t, "pool/parent", ds.EncryptionRoot, "P-10: its root is the PARENT, not itself")
+		require.Equal(t, "", datasetLocalUserProperty(ds, PropEncryption), "and it carries no driver stamp")
+
+		replay, err := d.CreateVolume(ctx, req)
+		require.NoError(t, err, "an ordinary idempotent replay must not be wedged by baseline encryption")
+		assert.Equal(t, resp.GetVolume().GetVolumeId(), replay.GetVolume().GetVolumeId())
+	})
+
+	t.Run("a restore under an encrypted parent succeeds and is not destroyed", func(t *testing.T) {
+		d, mockClient := encryptedParentDriver(t, false)
+		_, err := d.CreateVolume(ctx, plainVolumeRequest("inherited-source"))
+		require.NoError(t, err)
+		d.config.Encryption.Enabled = true // snapshot machinery is unrelated
+		snapResp, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
+			SourceVolumeId: "inherited-source", Name: "inherited-snap",
+		})
+		require.NoError(t, err)
+		d.config.Encryption.Enabled = false
+
+		restore := plainVolumeRequest("inherited-restore")
+		restore.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snapResp.GetSnapshot().GetSnapshotId()},
+		}}
+		_, err = d.CreateVolume(ctx, restore)
+		require.NoError(t, err, "restoring under an encrypted parent is an ordinary restore")
+
+		restored, err := mockClient.DatasetGet(ctx, "pool/parent/inherited-restore")
+		require.NoError(t, err, "the restored data must still exist — never destroyed")
+		assert.True(t, restored.Encrypted, "it is encrypted, by inheritance, exactly like its source")
+	})
+
+	t.Run("a clone under an encrypted parent is not refused", func(t *testing.T) {
+		d, mockClient := encryptedParentDriver(t, true)
+		_, err := d.CreateVolume(ctx, plainVolumeRequest("inherited-clone-source"))
+		require.NoError(t, err)
+
+		clone := plainVolumeRequest("inherited-clone")
+		clone.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "inherited-clone-source"},
+		}}
+		_, err = d.CreateVolume(ctx, clone)
+		require.NoError(t, err, "the source's key is the deployment's, not another CSI volume's")
+		_, err = mockClient.DatasetGet(ctx, "pool/parent/inherited-clone")
+		require.NoError(t, err)
+	})
+
+	t.Run("publish of an inherited-encryption volume pays no encryption job", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent", Type: "FILESYSTEM",
+			Encryption:        boolPtr(true),
+			InheritEncryption: boolPtr(false),
+			EncryptionOptions: &truenas.EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "parent-pass-1"},
+		})
+		require.NoError(t, err)
+		d := &Driver{
+			name:          "org.scale.csi.nfs",
+			config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}, Encryption: EncryptionConfig{Enabled: true}},
+			truenasClient: client,
+		}
+		_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/inherited-pub", Type: "FILESYSTEM"})
+		require.NoError(t, err)
+		ds, err := client.DatasetGet(ctx, "pool/parent/inherited-pub")
+		require.NoError(t, err)
+		require.True(t, ds.Encrypted)
+
+		client.resetCalls()
+		require.NoError(t, d.unlockEncryptedDatasetForPublish(ctx, ds, "pool/parent/inherited-pub", "inherited-pub", nil))
+		_, methods := client.callSnapshot()
+		assert.Zero(t, methods["DatasetEncryptionSummary"],
+			"baseline encryption must not put every publish on the encryption path")
+		assert.Zero(t, methods["DatasetUnlock"])
+	})
+
+	t.Run("the predicate itself: root and key format decide", func(t *testing.T) {
+		selfKeyed := &truenas.Dataset{Name: "pool/parent/v", Encrypted: true,
+			EncryptionRoot: "pool/parent/v", KeyFormat: truenas.KeyFormatPassphrase}
+		inherited := &truenas.Dataset{Name: "pool/parent/v", Encrypted: true,
+			EncryptionRoot: "pool/parent", KeyFormat: truenas.KeyFormatPassphrase}
+		dbKeyed := &truenas.Dataset{Name: "pool/parent/v", Encrypted: true,
+			EncryptionRoot: "pool/parent/v", KeyFormat: "HEX"}
+		cloneOfDriverVolume := &truenas.Dataset{Name: "pool/parent/clone", Encrypted: true,
+			EncryptionRoot: "pool/parent/origin", KeyFormat: truenas.KeyFormatPassphrase}
+
+		assert.True(t, datasetSelfKeyedPassphrase(selfKeyed))
+		assert.False(t, datasetSelfKeyedPassphrase(inherited), "root is the parent: not this volume's key")
+		assert.False(t, datasetSelfKeyedPassphrase(dbKeyed), "a key the appliance stores needs nothing from us")
+		assert.False(t, datasetSelfKeyedPassphrase(cloneOfDriverVolume), "P-7: a clone's root is its origin")
+
+		d := &Driver{config: &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}}}
+		assert.True(t, d.datasetKeyIsDriverManaged(selfKeyed))
+		assert.True(t, d.datasetKeyIsDriverManaged(cloneOfDriverVolume),
+			"its key belongs to ANOTHER CSI volume — still the driver's problem")
+		assert.False(t, d.datasetKeyIsDriverManaged(inherited),
+			"a root at or above the driver's parent is the deployment's baseline")
+		assert.False(t, d.datasetKeyIsDriverManaged(dbKeyed))
+	})
+}
+
+// TestPublishUsesPreviousKeyForUnstampedVolume is the N-6 regression: one flag
+// gated two unrelated permissions. Trying the PREVIOUS passphrase to UNLOCK is
+// safe for any locked volume the driver is handling (a wrong key fails closed,
+// P-5); only the RE-KEY is ownership-gated. Gating both stranded exactly the
+// volume that needs it most — an encrypted volume whose stamp write was lost
+// while it was still on the previous passphrase, with the key that opens it
+// sitting in the Secret.
+//
+// PRE-FIX PROOF: with `rotating := keys.rotationIntent() && ownsKey` gating both,
+// this FAILS — one unlock attempted, FailedPrecondition, volume still locked.
+func TestPublishUsesPreviousKeyForUnstampedVolume(t *testing.T) {
+	const name = "pool/parent/enc-stamp-lost"
+	const volumeID = "enc-stamp-lost"
+	const oldPass = "old-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client := encryptionTestDriver()
+	recorder := record.NewFakeRecorder(16)
+	d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+	ctx := context.Background()
+
+	// Encrypted, self-keyed, still on the OLD passphrase, stamp never written.
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: name, Type: "VOLUME", Volsize: 1 << 30,
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &truenas.EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: oldPass},
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetLock(ctx, name))
+	ds, err := client.DatasetGet(ctx, name)
+	require.NoError(t, err)
+	require.Equal(t, "", datasetLocalUserProperty(ds, PropEncryption), "the stamp write was lost")
+
+	client.resetCalls()
+	require.NoError(t, d.unlockEncryptedDatasetForPublish(ctx, ds, name, volumeID,
+		map[string]string{"passphrase": newPass, "passphrasePrevious": oldPass}),
+		"the key that opens this volume is in the Secret and must be tried")
+
+	_, methods := client.callSnapshot()
+	assert.Equal(t, 2, methods["DatasetUnlock"], "current then previous")
+	assert.Zero(t, methods["DatasetChangeKey"], "but an unstamped volume is never re-keyed")
+	unlocked, err := client.DatasetGet(ctx, name)
+	require.NoError(t, err)
+	assert.False(t, unlocked.Locked, "the volume is serving again")
+	assert.Zero(t, eventsContainingReason(drainEvents(recorder), EventReasonEncryptionRotationIncomplete))
+}
+
+// TestRecoveredRemnantWithDriverManagedKeyIsRolledBack is the N-7 regression: the
+// crash-recovery path adopted an interrupted content-source remnant without ever
+// running the backstop, then dead-ended on the replay guard with two remediation
+// instructions that both lead back to a refusal. It now takes the same
+// destroy-and-refuse outcome as the uninterrupted path.
+//
+// PRE-FIX PROOF: without the backstop on the resume arm, this returns the replay
+// guard's dead-end refusal and leaves the remnant dataset in place.
+func TestRecoveredRemnantWithDriverManagedKeyIsRolledBack(t *testing.T) {
+	ctx := context.Background()
+	mockClient := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			NFS:        NFSConfig{Enabled: true, ShareHost: "192.0.2.10"},
+			Encryption: EncryptionConfig{Enabled: true},
+		},
+		truenasClient: mockClient,
+	}
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+
+	// A driver-encrypted source volume and a CSI snapshot of it.
+	_, err = d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "enc-src",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		Parameters:         map[string]string{"encryption": "true"},
+		Secrets:            map[string]string{"passphrase": "longenough1"},
+	})
+	require.NoError(t, err)
+	snapResp, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{SourceVolumeId: "enc-src", Name: "enc-snap"})
+	require.NoError(t, err)
+	backendSnapshot := "pool/parent/enc-src@" + snapResp.GetSnapshot().GetSnapshotId()
+
+	// Reproduce the interrupted create: marker written, clone made, crash before
+	// the ownership stamp.
+	const destination = "pool/parent/resumed"
+	source := &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+		Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snapResp.GetSnapshot().GetSnapshotId()},
+	}}
+	marker, err := d.newInflightMarker(destination, source, ShareTypeNFS)
+	require.NoError(t, err)
+	marker.Origin = backendSnapshot
+	require.NoError(t, d.writeInflightMarker(ctx, marker))
+	require.NoError(t, mockClient.SnapshotClone(ctx, backendSnapshot, destination))
+	remnant, err := mockClient.DatasetGet(ctx, destination)
+	require.NoError(t, err)
+	require.True(t, remnant.Encrypted, "P-7: the remnant inherited the source volume's key")
+
+	req := plainVolumeRequest("resumed")
+	req.VolumeContentSource = source
+	_, err = d.CreateVolume(ctx, req)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "copy the data in", "the remediation must be one the operator can follow")
+	_, getErr := mockClient.DatasetGet(ctx, destination)
+	require.Error(t, getErr, "the unmanageable remnant is rolled back, not left wedging the PVC")
 }

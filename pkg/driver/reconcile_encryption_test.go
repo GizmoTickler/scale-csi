@@ -524,8 +524,16 @@ func TestEncryptionUnlockCandidateIsSourceBlind(t *testing.T) {
 	assert.False(t, isEncryptedDataset(sourceless),
 		"...while the OWNERSHIP predicate still (correctly) refuses to call it ours")
 
-	assert.True(t, encryptionUnlockCandidate(&truenas.Dataset{Encrypted: true}),
-		"the backend's own encrypted flag is also a candidate signal")
+	// On the pool.dataset.query FALLBACK listing the backend's own answer is a
+	// candidate signal — but only for a SELF-KEYED passphrase dataset (P-10).
+	assert.True(t, encryptionUnlockCandidate(&truenas.Dataset{
+		Name: "pool/parent/self", Encrypted: true,
+		EncryptionRoot: "pool/parent/self", KeyFormat: truenas.KeyFormatPassphrase,
+	}), "a self-keyed passphrase dataset is a candidate")
+	assert.False(t, encryptionUnlockCandidate(&truenas.Dataset{
+		Name: "pool/parent/child", Encrypted: true,
+		EncryptionRoot: "pool/parent", KeyFormat: truenas.KeyFormatPassphrase,
+	}), "a dataset that merely sits under an encrypted PARENT is not a candidate")
 	assert.False(t, encryptionUnlockCandidate(&truenas.Dataset{
 		UserProperties: map[string]truenas.UserProperty{PropEncryption: {Value: "-"}},
 	}), "the ZFS sentinel is not a stamp")
@@ -737,4 +745,83 @@ func TestReconcileForgetsConvergedWindowWhenClosed(t *testing.T) {
 	_, stillConverged := d.encryptionRotationConverged[volumeID]
 	d.encryptionUnlockFailMu.Unlock()
 	assert.False(t, stillConverged, "a closed window keeps no fingerprint")
+}
+
+// TestReconcileKeepsFingerprintWhenSecretUnreadable is the N-8 regression: a
+// transient Secret read failure (API blip, RBAC hiccup, cache miss) was
+// indistinguishable from "the operator closed the window", so the converged
+// fingerprint was dropped and the SAME window re-keyed as soon as the Secret came
+// back — partially re-opening the change_key churn the once-per-window guard
+// exists to prevent.
+//
+// PRE-FIX PROOF: with `if !windowOpen { forget }`, the second converge happens
+// and the assertion below sees a 2nd DatasetChangeKey.
+func TestReconcileKeepsFingerprintWhenSecretUnreadable(t *testing.T) {
+	const volumeID = "enc-blip"
+	const oldPass = "old-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client, _ := encryptionReconcileDriver(t,
+		encryptionReconcilePV(volumeID), encryptionReconcileSC(), encryptionReconcileSecret(newPass, oldPass))
+	addManagedEncryptedVolume(t, client, volumeID, oldPass)
+
+	client.resetCalls()
+	d.reconcileEncryptedUnlocks(context.Background())
+	_, methods := client.callSnapshot()
+	require.Equal(t, 1, methods["DatasetChangeKey"], "the window converges once")
+
+	// The Secret becomes temporarily unreadable.
+	require.NoError(t, d.eventRecorder.clientset.CoreV1().Secrets(encReconcileSecretNS).Delete(
+		context.Background(), encReconcileSecretName, metav1.DeleteOptions{}))
+	d.reconcileEncryptedUnlocks(context.Background())
+	d.encryptionUnlockFailMu.Lock()
+	_, kept := d.encryptionRotationConverged[volumeID]
+	d.encryptionUnlockFailMu.Unlock()
+	assert.True(t, kept, "an unreadable Secret says nothing about the window and must not drop the fingerprint")
+
+	// It comes back with the SAME window: no second re-key.
+	_, err := d.eventRecorder.clientset.CoreV1().Secrets(encReconcileSecretNS).Create(
+		context.Background(), encryptionReconcileSecret(newPass, oldPass), metav1.CreateOptions{})
+	require.NoError(t, err)
+	client.resetCalls()
+	d.reconcileEncryptedUnlocks(context.Background())
+	_, methods = client.callSnapshot()
+	assert.Zero(t, methods["DatasetChangeKey"], "the same window must not converge twice after a read blip")
+}
+
+// TestReconcileIgnoresInheritedEncryptionVolumes is the reconciler half of N-5:
+// on a deployment whose parent dataset is encrypted, every managed dataset reads
+// encrypted:true (on the pool.dataset.query paths). None of them is this driver's
+// key to load, and none may cost a per-pass @job.
+//
+// PRE-FIX PROOF: with the candidate filter back on plain ds.Encrypted, the
+// plaintext volume becomes a candidate on the fallback listing path.
+func TestReconcileIgnoresInheritedEncryptionVolumes(t *testing.T) {
+	d, client, _ := encryptionReconcileDriver(t, encryptionReconcileSC(), encryptionReconcileSecret("unlock-me-123", ""))
+	ctx := context.Background()
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: encReconcileParent, Type: "FILESYSTEM",
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &truenas.EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "parent-pass-1"},
+	})
+	require.NoError(t, err)
+	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: encReconcileParent + "/inherited", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, encReconcileParent+"/inherited", PropManagedResource, "true"))
+	inherited, err := client.DatasetGet(ctx, encReconcileParent+"/inherited")
+	require.NoError(t, err)
+	require.True(t, inherited.Encrypted, "P-10: it inherits the parent's encryption")
+	require.Equal(t, encReconcileParent, inherited.EncryptionRoot)
+
+	// The pool.dataset.query fallback listing is where the wire fields are visible.
+	assert.False(t, encryptionUnlockCandidate(inherited),
+		"a dataset whose key is the deployment's baseline is not an unlock candidate")
+
+	client.resetCalls()
+	d.reconcileEncryptedUnlocks(ctx)
+	_, methods := client.callSnapshot()
+	assert.Zero(t, methods["DatasetEncryptionSummary"], "no @job is paid for baseline-encrypted volumes")
+	assert.Zero(t, methods["DatasetUnlock"])
 }
