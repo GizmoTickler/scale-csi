@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -188,8 +189,10 @@ func TestReconcileEncryptedUnlockConfirmsLocalOwnership(t *testing.T) {
 	_, methods := client.callSnapshot()
 	assert.Zero(t, methods["DatasetUnlock"],
 		"neither the clone (inherited key) nor an origin with no resolvable PV may be unlocked")
-	assert.GreaterOrEqual(t, methods["DatasetGet"], 1,
-		"ownership is confirmed with a source-bearing pool.dataset.query read")
+	assert.Equal(t, 1, methods["DatasetGetByNames"],
+		"ownership is confirmed with the batched source-bearing pool.dataset.query read")
+	assert.Zero(t, methods["DatasetEncryptionSummary"],
+		"a dataset that is not ours never costs a summary @job")
 	assert.Empty(t, eventsContainingReason(drainEvents(recorder), EventReasonEncryptionUnlockFailed),
 		"a foreign/inherited dataset is a skip, never a failure")
 }
@@ -289,8 +292,8 @@ func TestReconcileEncryptedUnlockSkipsVolumeHeldByPublish(t *testing.T) {
 
 	total, methods := client.callSnapshot()
 	assert.Zero(t, methods["DatasetUnlock"], "a volume a publish is handling is skipped, not raced")
-	assert.Zero(t, methods["DatasetEncryptionSummary"], "the busy check precedes any backend call for that volume")
-	assert.Equal(t, 1, total, "only the managed-dataset listing is issued")
+	assert.Zero(t, methods["DatasetEncryptionSummary"], "the busy check precedes any @job for that volume")
+	assert.Equal(t, 2, total, "only the pass-level reads are issued: the managed-dataset listing and the batched state read")
 	assert.Empty(t, eventsContainingReason(drainEvents(recorder), EventReasonEncryptionUnlockFailed))
 }
 
@@ -564,4 +567,174 @@ func TestStartupReconcileUnlocksBeforeShareRebuild(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, unlocked.Locked,
 		"the startup pass must unlock before it rebuilds shares over a locked, device-less zvol")
+}
+
+// TestReconcileEncryptedUnlockDoesNotSummaryEveryVolume is the F8-round-2
+// regression: the per-pass budget bounded ACTIONS but not @job fan-out, so a
+// healthy encrypted fleet cost one DatasetEncryptionSummary **job** (dispatch +
+// poll + core.get_jobs) per volume per cadence, forever — the per-volume-summary
+// cost design E-5 refused in ListVolumes.
+//
+// The cheap non-job `locked` signal (P-4, on the batched source-bearing read)
+// now decides whether a summary job is worth asking for at all.
+//
+// PRE-FIX PROOF: with the summary issued before the cheap state check, this
+// FAILS with 12 summary jobs for 12 healthy volumes.
+func TestReconcileEncryptedUnlockDoesNotSummaryEveryVolume(t *testing.T) {
+	const passphrase = "unlock-me-123"
+	const healthy = 12
+
+	objects := []runtime.Object{encryptionReconcileSC(), encryptionReconcileSecret(passphrase, "")}
+	volumeIDs := make([]string, 0, healthy)
+	for i := 0; i < healthy; i++ {
+		volumeID := fmt.Sprintf("enc-healthy-%02d", i)
+		volumeIDs = append(volumeIDs, volumeID)
+		objects = append(objects, encryptionReconcilePV(volumeID))
+	}
+	d, client, _ := encryptionReconcileDriver(t, objects...)
+	for _, volumeID := range volumeIDs {
+		addManagedEncryptedVolume(t, client, volumeID, passphrase)
+	}
+	// One locked volume among them, to prove the pass still does its job.
+	lockedID := "enc-locked-1"
+	lockedName := addManagedEncryptedVolume(t, client, lockedID, passphrase)
+	require.NoError(t, client.DatasetLock(context.Background(), lockedName))
+	_, err := d.eventRecorder.clientset.CoreV1().PersistentVolumes().Create(
+		context.Background(), encryptionReconcilePV(lockedID), metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	client.resetCalls()
+	d.reconcileEncryptedUnlocks(context.Background())
+
+	total, methods := client.callSnapshot()
+	assert.Equal(t, 1, methods["DatasetEncryptionSummary"],
+		"a summary @job is paid only for the volume that actually needs an action")
+	assert.Equal(t, 1, methods["DatasetGetByNames"], "one batched state read covers the whole candidate set")
+	assert.Equal(t, 1, methods["DatasetUnlock"])
+	assert.Equal(t, 4, total, "listing + batched read + one summary + one unlock, regardless of fleet size")
+
+	unlocked, err := client.DatasetGet(context.Background(), lockedName)
+	require.NoError(t, err)
+	assert.False(t, unlocked.Locked)
+}
+
+// TestReconcileRotationFailureIsNotBucketedAsARace is the N-3 regression. When
+// unlock(previous) succeeds and change_key(current) FAILS, the dataset ends up
+// UNLOCKED — so the post-failure "is it unlocked?" re-read says yes and the
+// outcome used to be classified as a benign lost race: failure streak cleared,
+// counted under benignRaces. The Event still fired, so this was telemetry lying
+// rather than a wedge, but a real rotation failure must count as a failure.
+//
+// PRE-FIX PROOF: with the errors.As(...) arm removed, the streak is cleared and
+// no EncryptionUnlockFailed Event is ever raised.
+func TestReconcileRotationFailureIsNotBucketedAsARace(t *testing.T) {
+	const volumeID = "enc-rot-fail"
+	const oldPass = "old-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client, recorder := encryptionReconcileDriver(t,
+		encryptionReconcilePV(volumeID), encryptionReconcileSC(), encryptionReconcileSecret(newPass, oldPass))
+	name := addManagedEncryptedVolume(t, client, volumeID, oldPass)
+	d.truenasClient = &encryptionFaultClient{
+		apiCallCountingClient: client,
+		changeKeyErr:          fmt.Errorf("pool.dataset.change_key job 9 failed: FAILED: backend refused"),
+		failChangeKeyTimes:    encryptionUnlockEventThreshold,
+	}
+
+	for pass := 0; pass < encryptionUnlockEventThreshold; pass++ {
+		require.NoError(t, client.DatasetLock(context.Background(), name))
+		d.reconcileEncryptedUnlocks(context.Background())
+	}
+
+	d.encryptionUnlockFailMu.Lock()
+	streak := d.encryptionUnlockFailures[volumeID]
+	d.encryptionUnlockFailMu.Unlock()
+	assert.Equal(t, encryptionUnlockEventThreshold, streak,
+		"a failed re-key is a failure, not a benign race")
+
+	events := drainEvents(recorder)
+	assert.Equal(t, 1, eventsContainingReason(events, EventReasonEncryptionUnlockFailed))
+	assert.GreaterOrEqual(t, eventsContainingReason(events, EventReasonEncryptionRotationIncomplete), 1,
+		"the operator instruction to keep passphrasePrevious still fires")
+	for _, event := range events {
+		assert.NotContains(t, event, oldPass)
+		assert.NotContains(t, event, newPass)
+	}
+}
+
+// TestEncryptionVolumeStateIsPruned is the N-4 regression: neither per-volume map
+// had a delete path, so an entry survived for the life of the process — bounded
+// by LIFETIME volume count rather than live volume count. Two prunes must exist:
+// the reconcile pass (a volume that is no longer a candidate) and DeleteVolume.
+//
+// PRE-FIX PROOF: with pruneEncryptionVolumeState and the DeleteVolume hook
+// removed, both entries survive.
+func TestEncryptionVolumeStateIsPruned(t *testing.T) {
+	const volumeID = "enc-pruned"
+	const oldPass = "old-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client, _ := encryptionReconcileDriver(t,
+		encryptionReconcilePV(volumeID), encryptionReconcileSC(), encryptionReconcileSecret(newPass, oldPass))
+	name := addManagedEncryptedVolume(t, client, volumeID, oldPass)
+
+	// A pass converges the open window and records the fingerprint.
+	d.reconcileEncryptedUnlocks(context.Background())
+	d.encryptionUnlockFailMu.Lock()
+	_, converged := d.encryptionRotationConverged[volumeID]
+	d.encryptionUnlockFailMu.Unlock()
+	require.True(t, converged, "the converged window is remembered")
+
+	// The volume goes away; the next pass must forget it.
+	require.NoError(t, client.DatasetDelete(context.Background(), name, true, true))
+	d.reconcileEncryptedUnlocks(context.Background())
+	d.encryptionUnlockFailMu.Lock()
+	_, stillTracked := d.encryptionRotationConverged[volumeID]
+	d.encryptionUnlockFailMu.Unlock()
+	assert.False(t, stillTracked, "a volume that is no longer a candidate keeps no entry")
+
+	// And DeleteVolume drops both maps' entries directly.
+	d.noteEncryptionUnlockFailure("enc-deleted", "test")
+	d.markEncryptionRotationConverged("enc-deleted", encryptionKeys{Passphrase: newPass, Previous: oldPass})
+	deleted := addManagedEncryptedVolume(t, client, "enc-deleted", newPass)
+	require.NotEmpty(t, deleted)
+	_, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "enc-deleted"})
+	require.NoError(t, err)
+	d.encryptionUnlockFailMu.Lock()
+	_, failTracked := d.encryptionUnlockFailures["enc-deleted"]
+	_, convergedTracked := d.encryptionRotationConverged["enc-deleted"]
+	d.encryptionUnlockFailMu.Unlock()
+	assert.False(t, failTracked, "DeleteVolume drops the failure streak")
+	assert.False(t, convergedTracked, "DeleteVolume drops the converged fingerprint")
+}
+
+// TestReconcileForgetsConvergedWindowWhenClosed proves the other prune trigger:
+// once the operator closes the rotation window (passphrasePrevious removed), the
+// remembered fingerprint is dropped, so a LATER window converges again instead of
+// being suppressed by a stale entry.
+func TestReconcileForgetsConvergedWindowWhenClosed(t *testing.T) {
+	const volumeID = "enc-window"
+	const oldPass = "old-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client, _ := encryptionReconcileDriver(t,
+		encryptionReconcilePV(volumeID), encryptionReconcileSC(), encryptionReconcileSecret(newPass, oldPass))
+	addManagedEncryptedVolume(t, client, volumeID, oldPass)
+
+	d.reconcileEncryptedUnlocks(context.Background())
+	d.encryptionUnlockFailMu.Lock()
+	_, converged := d.encryptionRotationConverged[volumeID]
+	d.encryptionUnlockFailMu.Unlock()
+	require.True(t, converged)
+
+	// Operator closes the window.
+	_, err := d.eventRecorder.clientset.CoreV1().Secrets(encReconcileSecretNS).Update(
+		context.Background(), encryptionReconcileSecret(newPass, ""), metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	d.reconcileEncryptedUnlocks(context.Background())
+	d.encryptionUnlockFailMu.Lock()
+	_, stillConverged := d.encryptionRotationConverged[volumeID]
+	d.encryptionUnlockFailMu.Unlock()
+	assert.False(t, stillConverged, "a closed window keeps no fingerprint")
 }

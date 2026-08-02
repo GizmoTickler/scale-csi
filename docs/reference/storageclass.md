@@ -1179,6 +1179,13 @@ not established whether the send is raw (an encrypted, unmanageable copy) or
 plain (a silent decryption of your data), so that path is refused rather than
 guessed at.
 
+Both refusals are **independent of `encryption.enabled`**. The hazard belongs to
+the data, not to the feature flag: turning encryption off (a rollback, a values
+regression) while encrypted volumes still exist does not re-enable cloning one.
+The flag only decides how hard the driver looks — with it off, the refusal is
+made from the wire state of the volume the restore actually materialized, which
+is then destroyed rather than handed back as a volume nothing could ever unlock.
+
 > **Known limitation — deviation from design §E-4.** The design recommended
 > allowing restore into an encrypted class with `snapshotRestoreMode: detached`
 > and rejecting only `clone`. This release takes the conservative position
@@ -1273,9 +1280,15 @@ driver drives the volume to the current passphrase.
   unlock and the re-key leaves the volume unlocked and still on the OLD key while
   everything looks healthy. Re-keying to the identical passphrase is a success
   that leaves the key valid, so this is a no-op by outcome when the rotation has
-  already landed. The unlock reconciler performs this convergence once per open
-  window per volume, so leaving `passphrasePrevious` in place does not re-key on
-  every pass.
+  already landed. The convergence runs **once per open window per volume** —
+  publish and the unlock reconciler share one guard — so leaving
+  `passphrasePrevious` in place does not re-key on every publish or every
+  reconcile pass. A different `passphrase`/`passphrasePrevious` pair is a new
+  window and converges again.
+- **A volume whose key is inherited is never re-keyed.** A clone shares its
+  origin's key (see below) and ZFS refuses `change_key` on an inheriting child,
+  so the rotation window simply does not apply to it: publish skips the re-key
+  and attaches the volume normally rather than failing it.
 - **A rotation that does NOT complete is never reported as success.** The
   operation returns an error and a redacted `EncryptionRotationIncomplete`
   Warning Event is raised telling you to **keep `passphrasePrevious` in the

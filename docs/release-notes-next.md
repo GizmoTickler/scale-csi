@@ -46,7 +46,10 @@ ConfigMap). Upgrading changes nothing for an install that does not opt in.
   refused with `InvalidArgument` before any mutation, and an ENCRYPTED volume may
   not be a content source either (`FailedPrecondition`, both restore modes) — a
   clone of one would be encrypted with its ORIGIN's key and no policy of its own,
-  which the driver could never unlock. **Deviation from design §E-4, stated
+  which the driver could never unlock. Neither refusal is gated on
+  `encryption.enabled`: the hazard is a property of the data, so turning the
+  feature off with encrypted volumes live does not re-open it. **Deviation from
+  design §E-4, stated
   plainly: snapshot restore, cloning and VolSync restore into an encrypted class
   are not possible in v1.6.0, and neither is restoring from an encrypted volume
   into a plaintext class.** Copy at the file level; detached-restore-with-its-own-
@@ -108,8 +111,11 @@ volume of the class to the current key:
   interrupted between the unlock and the re-key — the state where the volume is
   unlocked, healthy-looking, and still on the OLD key — and is a no-op by outcome
   when the rotation already landed (re-keying to the identical passphrase
-  succeeds and the key stays valid). The reconciler does this once per open
-  window per volume, not on every pass.
+  succeeds and the key stays valid). It runs **once per open window per volume**,
+  shared by publish and the reconciler, so an open window costs one `change_key`
+  per volume — not one per publish and one per reconcile pass. A volume whose key
+  is INHERITED (a clone) is never re-keyed: the window does not apply to it and
+  publish attaches it normally.
 - **A rotation that does not complete never reports success.** The operation
   errors and raises a redacted `EncryptionRotationIncomplete` Warning telling you
   to KEEP `passphrasePrevious` until an `EncryptionRotated` Event is observed for

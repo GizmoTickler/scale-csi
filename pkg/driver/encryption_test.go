@@ -978,3 +978,180 @@ func TestConflictingEncryptionReplayWritesNothing(t *testing.T) {
 		"the refused replay must not leave ownership stamps behind")
 	assert.Equal(t, "", datasetUserProperty(after, PropProvisionSuccess))
 }
+
+// TestPublishRotatesOncePerWindow is the N-1 regression. The unlocked+window-open
+// arm calls change_key on EVERY publish, and change_key at the default
+// pbkdf2iters (1,300,000, P-1) is a CPU-heavy appliance job: a node reboot that
+// re-publishes a fleet, or a flapping pod, with a window the operator forgot to
+// close, becomes a change_key storm plus a stream of "Rotated" Events that hide
+// the real rotation. The reconciler already had a once-per-window fingerprint
+// guard; publish now shares it.
+//
+// PRE-FIX PROOF: without the shared guard, five publishes issue five change_key
+// calls and five EncryptionRotated Events.
+func TestPublishRotatesOncePerWindow(t *testing.T) {
+	const name = "pool/parent/enc-window"
+	const volumeID = "enc-window"
+	const oldPass = "old-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client := encryptionTestDriver()
+	recorder := record.NewFakeRecorder(32)
+	d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+	createEncryptedDataset(t, client, name, oldPass)
+	ds, err := client.DatasetGet(context.Background(), name)
+	require.NoError(t, err)
+
+	secrets := map[string]string{"passphrase": newPass, "passphrasePrevious": oldPass}
+	client.resetCalls()
+	for publish := 0; publish < 5; publish++ {
+		require.NoError(t, d.unlockEncryptedDatasetForPublish(context.Background(), ds, name, volumeID, secrets))
+	}
+
+	_, methods := client.callSnapshot()
+	assert.Equal(t, 1, methods["DatasetChangeKey"], "the window converges once, not once per publish")
+	assert.Equal(t, 1, eventsContainingReason(drainEvents(recorder), EventReasonEncryptionRotated))
+
+	// The rotation really landed, and a NEW window (different keys) converges again.
+	require.NoError(t, client.DatasetLock(context.Background(), name))
+	require.NoError(t, client.DatasetUnlock(context.Background(), name, newPass))
+	ds, err = client.DatasetGet(context.Background(), name)
+	require.NoError(t, err)
+	client.resetCalls()
+	require.NoError(t, d.unlockEncryptedDatasetForPublish(context.Background(), ds, name, volumeID,
+		map[string]string{"passphrase": "third-pass-789", "passphrasePrevious": newPass}))
+	_, methods = client.callSnapshot()
+	assert.Equal(t, 1, methods["DatasetChangeKey"], "a NEW window is not suppressed by the previous one")
+}
+
+// TestPublishDoesNotRekeyInheritedKeyVolume is the N-2 regression, an
+// availability one. A P-7 clone is encrypted with its ORIGIN's key and has no
+// encryption policy of its own. Once a rotation window is open, publish used to
+// take the rotation arm for it, change_key was refused by the backend ("not an
+// encryption root"), and a HEALTHY, unlocked, serving volume failed to attach
+// with an Internal error telling the operator to keep a key that has nothing to
+// do with the problem.
+//
+// PRE-FIX PROOF: without the ownership check, this publish returns an error with
+// 1 change_key attempted and an EncryptionRotationIncomplete Event.
+func TestPublishDoesNotRekeyInheritedKeyVolume(t *testing.T) {
+	const origin = "pool/parent/enc-origin"
+	const clone = "pool/parent/enc-clone"
+	const passphrase = "origin-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client := encryptionTestDriver()
+	recorder := record.NewFakeRecorder(16)
+	d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+	ctx := context.Background()
+
+	createEncryptedDataset(t, client, origin, passphrase)
+	_, err := client.SnapshotCreate(ctx, origin, "snap", nil)
+	require.NoError(t, err)
+	require.NoError(t, client.SnapshotClone(ctx, origin+"@snap", clone))
+	cloneDS, err := client.DatasetGet(ctx, clone)
+	require.NoError(t, err)
+	require.True(t, cloneDS.Encrypted, "P-7: the clone is encrypted")
+	require.False(t, cloneDS.Locked, "and it is unlocked and serving")
+	require.Equal(t, "", datasetLocalUserProperty(cloneDS, PropEncryption), "its stamp is inherited, not local")
+
+	client.resetCalls()
+	err = d.unlockEncryptedDatasetForPublish(ctx, cloneDS, clone, "enc-clone",
+		map[string]string{"passphrase": newPass, "passphrasePrevious": passphrase})
+	require.NoError(t, err, "a healthy inherited-key volume must still publish")
+
+	_, methods := client.callSnapshot()
+	assert.Zero(t, methods["DatasetChangeKey"], "an inherited key is not this volume's to re-key")
+	events := drainEvents(recorder)
+	assert.Zero(t, eventsContainingReason(events, EventReasonEncryptionRotationIncomplete),
+		"no spurious keep-passphrasePrevious warning on a volume the window does not apply to")
+}
+
+// TestEncryptedContentSourceRefusedWithFeatureFlagOff is the F5-round-2
+// regression. The hazard is a property of the DATA, not of the feature flag:
+// flipping encryption.enabled to false (a rollback, a values regression) while
+// encrypted volumes exist must not re-open cloning an encrypted volume into a
+// class that can never unlock the result — and that is the configuration in
+// which the resulting dead volume is least likely to be noticed.
+//
+// PRE-FIX PROOF: with `if !d.config.Encryption.Enabled { return nil }` at the top
+// of guardEncryptedContentSource and no post-create backstop, both requests below
+// SUCCEED and leave a dataset with Encrypted=true and no local encryption stamp.
+func TestEncryptedContentSourceRefusedWithFeatureFlagOff(t *testing.T) {
+	newDriverWithEncryptedSource := func(t *testing.T) (*Driver, *truenas.MockClient, string) {
+		t.Helper()
+		mockClient := truenas.NewMockClient()
+		d := &Driver{
+			name: "org.scale.csi.nfs",
+			config: &Config{
+				DriverName: "org.scale.csi.nfs",
+				ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+				NFS:        NFSConfig{Enabled: true, ShareHost: "192.0.2.10"},
+				Encryption: EncryptionConfig{Enabled: true},
+			},
+			truenasClient: mockClient,
+		}
+		resp, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+			Name:               "enc-source",
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			Parameters:         map[string]string{"encryption": "true"},
+			Secrets:            map[string]string{"passphrase": "longenough1"},
+		})
+		require.NoError(t, err)
+		// The operator now turns the feature OFF while the encrypted volume lives.
+		d.config.Encryption.Enabled = false
+		return d, mockClient, resp.GetVolume().GetVolumeId()
+	}
+
+	assertNoUnmanageableEncryptedVolume := func(t *testing.T, mockClient *truenas.MockClient, datasetName string) {
+		t.Helper()
+		ds, err := mockClient.DatasetGet(context.Background(), datasetName)
+		if err != nil {
+			return // destroyed: the refusal rolled it back
+		}
+		require.Falsef(t, ds.Encrypted && datasetLocalUserProperty(ds, PropEncryption) == "",
+			"%s is encrypted with no encryption policy of its own — the driver could never unlock it", datasetName)
+	}
+
+	t.Run("volume source", func(t *testing.T) {
+		d, mockClient, sourceID := newDriverWithEncryptedSource(t)
+		_, err := d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+			Name:               "cloned-flag-off",
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: sourceID},
+			}},
+		})
+		require.Error(t, err, "cloning an encrypted volume is refused even with the feature flag off")
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		assertNoUnmanageableEncryptedVolume(t, mockClient, "pool/parent/cloned-flag-off")
+	})
+
+	t.Run("snapshot source", func(t *testing.T) {
+		d, mockClient, sourceID := newDriverWithEncryptedSource(t)
+		d.config.Encryption.Enabled = true // snapshot creation itself is unrelated
+		snapResp, err := d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+			SourceVolumeId: sourceID, Name: "enc-snap",
+		})
+		require.NoError(t, err)
+		d.config.Encryption.Enabled = false
+		// The clone path writes an in-flight marker on the parent dataset.
+		_, parentErr := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+			Name: "pool/parent", Type: "FILESYSTEM"})
+		require.NoError(t, parentErr)
+
+		_, err = d.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+			Name:               "restored-flag-off",
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snapResp.GetSnapshot().GetSnapshotId()},
+			}},
+		})
+		require.Error(t, err, "restoring from an encrypted snapshot is refused even with the feature flag off")
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		assertNoUnmanageableEncryptedVolume(t, mockClient, "pool/parent/restored-flag-off")
+	})
+}
