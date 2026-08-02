@@ -1151,6 +1151,15 @@ func TestAdditiveDeferredAndValidISCSIPublishesPreserveLegacyAllowAll(t *testing
 	}})
 	require.NoError(t, err)
 	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropISCSITargetID, strconv.Itoa(target.ID)))
+	// The round-5 geometry invariant refuses to re-create an ABSENT extent for a
+	// dataset whose bookkeeping says it has been block-addressed and that records
+	// no geometry. This test is about fencing, so give the fixture the geometry
+	// record a real volume carries (stamped at create, at publish, or by an
+	// operator recovering a pre-GF4 volume).
+	require.NoError(t, client.DatasetSetUserProperties(ctx, dataset.Name, map[string]string{
+		PropBlockISCSIBlocksize:  "512",
+		PropBlockISCSIPblocksize: "true",
+	}))
 	capability := &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
 		Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 	}}
@@ -2027,7 +2036,7 @@ func TestISCSIMultiNodePublishMaintainsExactPerTargetInitiatorGroup(t *testing.T
 	datasetName := "pool/parent/shared-iscsi"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "shared-iscsi", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "shared-iscsi", true, true, nil))
 
 	encode := func(name, iqn string) string {
 		t.Helper()
@@ -2370,7 +2379,7 @@ func TestControllerPublishRejectsNodeReportingSentinelIQNFailClosed(t *testing.T
 	datasetName := "pool/parent/f2-sentinel"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-sentinel", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-sentinel", true, true, nil))
 	// Establish the already-present backend deny-all sentinel group (last-unpublish
 	// state). Its sentinel entry is exactly what a sentinel-reporting node's real
 	// initiator would match, which is why publish must fail closed.
@@ -2452,7 +2461,7 @@ func TestControllerPublishRejectsSentinelReporterViaLegacyNodeIDEnrichment(t *te
 	datasetName := "pool/parent/f2-legacy-enrich"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-legacy-enrich", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-legacy-enrich", true, true, nil))
 	// Pre-existing backend deny-all sentinel group (last-unpublish state): its
 	// sentinel entry is exactly what the sentinel-reporting node's real initiator
 	// matches, which is why publishing it must fail closed.
@@ -2542,7 +2551,7 @@ func TestControllerPublishRejectsSentinelReporterWithFencingModeOff(t *testing.T
 	datasetName := "pool/parent/f2-off-mode"
 	ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-off-mode", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, ds, datasetName, "f2-off-mode", true, true, nil))
 
 	// Real discovery reads the reserved sentinel and marks the collision.
 	origRead := nodeReadIdentityFile
@@ -2626,7 +2635,7 @@ func TestStrictISCSIShareCreationStartsWithPortalBoundDenyAllGroup(t *testing.T)
 	}
 	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/strict-iscsi", Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
-	require.NoError(t, d.createISCSIShareForDataset(ctx, dataset, dataset.Name, "strict-iscsi", true, true))
+	require.NoError(t, d.createISCSIShareForDataset(ctx, dataset, dataset.Name, "strict-iscsi", true, true, nil))
 	targetID := mustAtoi(t, datasetUserProperty(dataset, PropISCSITargetID))
 	target, err := client.ISCSITargetGet(ctx, targetID)
 	require.NoError(t, err)

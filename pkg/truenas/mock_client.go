@@ -885,11 +885,50 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 		},
 		UserProperties: make(map[string]UserProperty, len(userProperties)),
 	}
+	// A ZFS snapshot holds the dataset's user properties as of the instant it was
+	// taken — ALL of them, not a chosen subset. The driver's geometry-provenance
+	// rule depends on exactly that (the block-geometry stamp a snapshot CAPTURED is
+	// the only record of the layout of the bytes inside it), and so does every
+	// witness- and identity-sniffing rule that reads a snapshot back.
+	//
+	// ROUND 6 WIDENING. Round 5 modeled the capture for the two geometry keys ONLY,
+	// on the reasoning that widening it would disturb identity sniffs elsewhere.
+	// That reasoning had the fidelity argument backwards: the narrowing did not
+	// prevent a behavior, it prevented the SUITE FROM SEEING one, so no test could
+	// expose a bug that depends on a witness or identity property riding a snapshot
+	// — which is precisely the class this driver's restore path reasons about.
+	// The mock now inherits every user property, exactly like ZFS. Callers that
+	// need a snapshot to look like a NON-CSI snapshot must set up a dataset that
+	// does not carry the CSI markers, rather than relying on the mock to drop them.
+	//
+	// A ZFS user property whose value is "-" is still a local property and is
+	// inherited by a snapshot. Removing a property is a separate remove update;
+	// the mock follows that distinction here.
+	for key, prop := range m.datasetUserPropertiesLocked(dataset) {
+		snap.UserProperties[key] = prop
+	}
 	for key, value := range userProperties {
 		snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
 	}
 	m.Snapshots[id] = snap
 	return snap, nil
+}
+
+// datasetUserPropertiesLocked snapshots the inheritable user properties of a
+// dataset. The caller holds m.mu.
+func (m *MockClient) datasetUserPropertiesLocked(dataset string) map[string]UserProperty {
+	ds, ok := m.Datasets[dataset]
+	if !ok || ds == nil || ds.UserProperties == nil {
+		return nil
+	}
+	inherited := make(map[string]UserProperty, len(ds.UserProperties))
+	for key, prop := range ds.UserProperties {
+		if prop.Value == "" {
+			continue
+		}
+		inherited[key] = prop
+	}
+	return inherited
 }
 
 // SetSnapshotUsedBytes is a test helper to set the "used" property on a snapshot.
@@ -1576,7 +1615,7 @@ func (m *MockClient) CheckNVMeoFSupport(ctx context.Context) error {
 }
 
 // iSCSI methods
-func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup) (*ISCSITarget, error) {
+func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup, opts ...ISCSITargetCreateOptions) (*ISCSITarget, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.RejectEmptyISCSITargetGroups && len(groups) == 0 {
@@ -1585,6 +1624,10 @@ func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode st
 
 	id := len(m.ISCSITargets) + 1
 	target := &ISCSITarget{ID: id, Name: name, Alias: alias, Mode: mode, Groups: groups}
+	if len(opts) > 0 {
+		target.QueuedCommands = opts[0].QueuedCommands
+		target.AuthNetworks = append([]string(nil), opts[0].AuthNetworks...)
+	}
 	m.ISCSITargets[id] = target
 	return target, nil
 }
@@ -1638,12 +1681,42 @@ func (m *MockClient) ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error
 	}
 	return list, nil
 }
-func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*ISCSIExtent, error) {
+func (m *MockClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string, opts ...ISCSIExtentCreateOptions) (*ISCSIExtent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	id := len(m.ISCSIExtents) + 1
-	ext := &ISCSIExtent{ID: id, Name: name, Disk: diskPath, Comment: comment}
+	// The mock mirrors a backend that DOES report pblocksize / insecure_tpc / ro
+	// on iscsi.extent.query (the normal case). The pointer model exists so the
+	// abnormal case — a response that omits one — stays distinguishable from a
+	// reported false; see parseISCSIExtent.
+	pblocksize, insecureTpc, readOnly := physicalBlocksize, true, false
+	ext := &ISCSIExtent{
+		ID:          id,
+		Name:        name,
+		Disk:        diskPath,
+		Comment:     comment,
+		Blocksize:   blocksize,
+		Pblocksize:  &pblocksize,
+		Rpm:         rpm,
+		InsecureTpc: &insecureTpc,
+		Ro:          &readOnly,
+		Enabled:     true,
+	}
+	if len(opts) > 0 {
+		opt := opts[0]
+		if opt.InsecureTpc != nil {
+			insecureTpc = *opt.InsecureTpc
+		}
+		if opt.ReadOnly != nil {
+			readOnly = *opt.ReadOnly
+		}
+		if opt.AvailThreshold != nil {
+			threshold := *opt.AvailThreshold
+			ext.AvailThreshold = &threshold
+		}
+		ext.Serial = opt.Serial
+	}
 	m.ISCSIExtents[id] = ext
 	return ext, nil
 }
@@ -1885,7 +1958,7 @@ func (m *MockClient) NVMeoFHostSubsysDelete(ctx context.Context, id int) error {
 	return nil
 }
 
-func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*NVMeoFSubsystem, error) {
+func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...NVMeoFSubsystemCreateOptions) (*NVMeoFSubsystem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.InjectError != nil {
@@ -1914,6 +1987,16 @@ func (m *MockClient) NVMeoFSubsystemCreate(ctx context.Context, name string, all
 		NQN:          fmt.Sprintf("nqn.2011-06.com.truenas:%s", name), // Mock auto-generated NQN
 		AllowAnyHost: allowAnyHost,
 		Hosts:        hosts,
+	}
+	if len(opts) > 0 {
+		if opts[0].QidMax != nil {
+			qidMax := *opts[0].QidMax
+			sub.QidMax = &qidMax
+		}
+		if opts[0].PiEnable != nil {
+			piEnable := *opts[0].PiEnable
+			sub.PiEnable = &piEnable
+		}
 	}
 	m.NVMeSubsystems[id] = sub
 	for _, hostID := range hostIDs {
@@ -2057,7 +2140,7 @@ func (m *MockClient) NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespac
 func (m *MockClient) NVMeoFPortList(ctx context.Context) ([]*NVMeoFPort, error) {
 	return []*NVMeoFPort{{ID: 1, Transport: "TCP", Address: "0.0.0.0", Port: 4420}}, nil
 }
-func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
+func (m *MockClient) NVMeoFPortCreate(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
 func (m *MockClient) NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
@@ -2089,7 +2172,7 @@ func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsyste
 	}
 	return list, nil
 }
-func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*NVMeoFPort, error) {
+func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
 func (m *MockClient) InvalidateNVMeoFPort(transport, address string, port int) {}

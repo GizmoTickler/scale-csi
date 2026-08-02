@@ -62,6 +62,131 @@
       "type": "object",
       "additionalProperties": true
     },
+    "storageClassParameters": {
+      "description": "StorageClass parameters. Arbitrary keys pass through verbatim, but the GF-Sprint 4 block-protocol knobs are validated here so an out-of-enum value is rejected at `helm install` instead of failing every CreateVolume at provision time. Values may be quoted strings (what Kubernetes stores) or bare YAML scalars.",
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean"
+        ]
+      },
+      "properties": {
+        "iscsi/blocksize": {
+          "description": "iSCSI extent logical blocksize. IMMUTABLE for the life of a volume.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "512",
+                "1024",
+                "2048",
+                "4096"
+              ]
+            },
+            {
+              "type": "integer",
+              "enum": [
+                512,
+                1024,
+                2048,
+                4096
+              ]
+            }
+          ]
+        },
+        "iscsi/pblocksize": {
+          "$ref": "#/definitions/storageClassBoolParameter"
+        },
+        "iscsi/queuedCommands": {
+          "description": "Per-target SCST queue depth (iscsi_parameters.QueuedCommands).",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "32",
+                "128"
+              ]
+            },
+            {
+              "type": "integer",
+              "enum": [
+                32,
+                128
+              ]
+            }
+          ]
+        },
+        "iscsi/insecureTpc": {
+          "$ref": "#/definitions/storageClassBoolParameter"
+        },
+        "iscsi/readOnly": {
+          "$ref": "#/definitions/storageClassBoolParameter"
+        },
+        "iscsi/stableSerial": {
+          "$ref": "#/definitions/storageClassBoolParameter"
+        },
+        "iscsi/availThreshold": {
+          "description": "Per-extent early-full warning percentage, 1-99.",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^([1-9]|[1-9][0-9])$"
+            },
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 99
+            }
+          ]
+        },
+        "nvmeof/qidMax": {
+          "description": "Maximum NVMe I/O queue count, 1-65535 (a queue identifier is 16-bit).",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,4}$"
+            },
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          ]
+        },
+        "nvmeof/piEnable": {
+          "$ref": "#/definitions/storageClassBoolParameter"
+        },
+        "nvmeof/inlineDataSize": {
+          "description": "REJECTED as a per-StorageClass parameter: NVMe-oF port performance fields are install-wide (nvmeof.portPerf) because the port is shared across volumes.",
+          "not": {}
+        },
+        "nvmeof/maxQueueSize": {
+          "description": "REJECTED as a per-StorageClass parameter: NVMe-oF port performance fields are install-wide (nvmeof.portPerf) because the port is shared across volumes.",
+          "not": {}
+        },
+        "nvmeof/portPiEnable": {
+          "description": "REJECTED as a per-StorageClass parameter: NVMe-oF port performance fields are install-wide (nvmeof.portPerf) because the port is shared across volumes.",
+          "not": {}
+        }
+      }
+    },
+    "storageClassBoolParameter": {
+      "description": "A boolean StorageClass parameter. Kubernetes stores parameters as strings, so the quoted form is canonical; a bare YAML boolean is also accepted.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
     "kubernetesList": {
       "type": "array",
       "items": {
@@ -162,7 +287,7 @@
           }
         },
         "extraParameters": {
-          "$ref": "#/definitions/stringMap"
+          "$ref": "#/definitions/storageClassParameters"
         },
         "chapSecretName": {
           "type": "string",
@@ -735,6 +860,41 @@
         },
         "subsystemAllowAnyHost": {
           "type": "boolean"
+        },
+        "portPerf": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "inlineDataSize": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "maxQueueSize": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "piEnable": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        },
+        "multipath": {
+          "type": "boolean"
+        },
+        "addresses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "commandTimeout": {
           "description": "DEPRECATED, ignored; the nvme CLI timeout is commandTimeouts.nvme. Retained only so old values files pass validation.",

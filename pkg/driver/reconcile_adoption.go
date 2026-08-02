@@ -10,7 +10,7 @@ import (
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
-// adoptLegacyOwnershipStamps stamps driver_instance_id onto legacy managed
+// adoptLegacyOwnershipStamps stamps driver_instance_id plus an adoption marker onto legacy managed
 // datasets that provably belong to this cluster's Bound volumes but predate the
 // v1.2.21 ownership stamp (the 2026-07-23 04:00Z incident: the reaper refused
 // every age-eligible migration-era tombstone because its source dataset carried
@@ -103,9 +103,9 @@ func (d *Driver) adoptLegacyOwnershipStamps(ctx context.Context, datasets []*tru
 	}
 }
 
-// writeAndVerifyAdoptionStamp persists driver_instance_id through the proven
-// stampAndMirror user-property write path used at create time, then verifies the
-// write with a source-bearing re-read before reporting it adopted. It serializes
+// writeAndVerifyAdoptionStamp persists the ownership stamp and its adoption
+// marker through the property write path, then verifies both with a source-bearing
+// re-read before reporting it adopted. It serializes
 // on the per-volume lock and re-proves the stamp is still absent immediately
 // before writing, so a concurrent create or peer that stamped the dataset between
 // the detection read and the write is never overwritten (the absolute rule). It
@@ -125,7 +125,8 @@ func (d *Driver) writeAndVerifyAdoptionStamp(ctx context.Context, datasetName, v
 		return false, nil
 	}
 	if stampErr := stampAndMirror(ctx, d.truenasClient, fresh, datasetName, map[string]string{
-		PropDriverInstanceID: d.driverInstanceID(),
+		PropDriverInstanceID:        d.driverInstanceID(),
+		PropDriverInstanceIDAdopted: d.driverInstanceID(),
 	}); stampErr != nil {
 		return false, stampErr
 	}
@@ -135,6 +136,9 @@ func (d *Driver) writeAndVerifyAdoptionStamp(ctx context.Context, datasetName, v
 	}
 	if !datasetHasLocalUserProperty(reread, PropDriverInstanceID, d.driverInstanceID()) {
 		return false, fmt.Errorf("adoption stamp did not persist with a local source on %s", datasetName)
+	}
+	if !datasetHasLocalUserProperty(reread, PropDriverInstanceIDAdopted, d.driverInstanceID()) {
+		return false, fmt.Errorf("adoption marker did not persist with a local source on %s", datasetName)
 	}
 	return true, nil
 }

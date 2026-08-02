@@ -423,6 +423,16 @@ func (d *Driver) completeResumedCloneRemnant(
 	capacityBytes int64,
 	shareType ShareType,
 ) (*truenas.Dataset, error) {
+	// GEOMETRY FIRST (round 6 ordering fix). Resolving the source's geometry is
+	// read-only and can fail closed; ensureCloneCapacity is a MUTATION of the
+	// destination. Round 5 expanded the remnant first and only then discovered
+	// that the source's layout was unestablishable, which widened the remnant on a
+	// recovery that was going to be refused anyway. Nothing below may move above
+	// this call.
+	geometry, geometryErr := d.contentSourceBlockGeometry(ctx, datasetName, source, shareType)
+	if geometryErr != nil {
+		return nil, geometryErr
+	}
 	if err := d.ensureCloneCapacity(ctx, datasetName, existingDS, capacityBytes); err != nil {
 		return nil, err
 	}
@@ -453,6 +463,16 @@ func (d *Driver) completeResumedCloneRemnant(
 	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
 		properties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
 	}
+	// GEOMETRY (round 5). Recovery used to carry NO source geometry and relied on
+	// whatever the remnant happened to inherit from its source's user properties —
+	// safe only by accident, and not at all when the source was unstamped. The
+	// source geometry resolved above (before the capacity mutation) is folded into
+	// this same stamp, so the remnant reaches the share builder with a record
+	// instead of a gap. An unresolvable source fails the recovery closed rather
+	// than completing a volume whose extent would then be created from a guess.
+	for key, value := range geometry.props() {
+		properties[key] = value
+	}
 	verified, err := d.setAndVerifyDatasetUserProperties(ctx, datasetName, properties)
 	if err != nil {
 		if errors.Is(err, errDatasetPropertyVerification) {
@@ -469,6 +489,59 @@ func (d *Driver) completeResumedCloneRemnant(
 	}
 	delete(verified.UserProperties, PropRecoveryNonce)
 	return verified, nil
+}
+
+// contentSourceBlockGeometry resolves the geometry of the content source a
+// destination descended from, for any arm that does NOT run the normal clone
+// path: the crashed-clone recovery stamp, and an existing-volume CreateVolume
+// replay whose destination carries no geometry record of its own. It re-uses the
+// normal clone resolver, so a snapshot source gets the SNAPSHOT's captured
+// provenance and a volume source gets the source's live geometry — the same
+// answers the un-crashed, un-replayed path would have produced.
+func (d *Driver) contentSourceBlockGeometry(
+	ctx context.Context,
+	datasetName string,
+	source *csi.VolumeContentSource,
+	shareType ShareType,
+) (blockGeometry, error) {
+	if shareType != ShareTypeISCSI {
+		return blockGeometry{knowledge: geometryUnexamined}, nil
+	}
+	var (
+		resolved blockGeometry
+		err      error
+	)
+	switch {
+	case source.GetSnapshot() != nil:
+		snapshotID := source.GetSnapshot().GetSnapshotId()
+		snap, findErr := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+		if findErr != nil {
+			return blockGeometry{}, status.Errorf(codes.Internal,
+				"failed to re-read the content source of in-flight remnant %s: %v", datasetName, findErr)
+		}
+		if snap == nil {
+			return blockGeometry{}, status.Errorf(codes.FailedPrecondition,
+				"cannot complete in-flight remnant %s: its content source snapshot %s no longer exists, so the geometry its "+
+					"data is addressed through cannot be established", datasetName, snapshotID)
+		}
+		resolved, err = d.resolveCloneSourceBlockGeometry(ctx, snap.Dataset, nil, snap, snapshotID, datasetName, shareType)
+	case source.GetVolume() != nil:
+		sourceVolumeID := source.GetVolume().GetVolumeId()
+		sourceDataset, datasetErr := d.datasetForID(sourceVolumeID)
+		if datasetErr != nil {
+			return blockGeometry{}, datasetErr
+		}
+		resolved, err = d.resolveCloneSourceBlockGeometry(ctx, sourceDataset, nil, nil, sourceVolumeID, datasetName, shareType)
+	default:
+		return blockGeometry{knowledge: geometryUnexamined}, nil
+	}
+	if err != nil {
+		return blockGeometry{}, err
+	}
+	if resolved.knowledge == geometryUnknown {
+		return blockGeometry{}, d.unknownGeometryError(datasetName, resolved.provenance)
+	}
+	return resolved, nil
 }
 
 // tombstoneLedgerEntry is the parent-dataset record proving that THIS driver

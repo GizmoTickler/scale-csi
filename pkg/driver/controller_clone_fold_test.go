@@ -156,9 +156,16 @@ func snapshotCloneRequest(name, snapshotID, protocol string, capacity int64) *cs
 	}
 }
 
+// ROUND 6: the seeded source now carries the LOCAL ownership stamp createDataset
+// writes in production. blockDataFreeProof requires it before the controller
+// default may be applied to a block clone/restore destination, and every clone
+// source in production is a volume this driver provisioned. A source WITHOUT it
+// models an imported/foreign zvol, which must fail closed — see
+// TestUnownedSnapshotSourceRestoreFailsClosed.
 func seedSnapshotCloneSource(
 	t *testing.T,
 	client *truenas.MockClient,
+	d *Driver,
 	datasetType string,
 	capacity int64,
 ) *truenas.Snapshot {
@@ -172,6 +179,7 @@ func seedSnapshotCloneSource(
 	}
 	_, err := client.DatasetCreate(context.Background(), params)
 	require.NoError(t, err)
+	stampDriverOwnership(t, client, d, params.Name)
 	snapshot, err := client.SnapshotCreate(context.Background(), params.Name, "snap-1", map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           "snap-1",
@@ -199,7 +207,7 @@ func TestSnapshotCloneFoldCrashStatesRecoverThroughExistingArm(t *testing.T) {
 			ctx := context.Background()
 			client := truenas.NewMockClient()
 			d := newSnapshotCloneFoldDriver(client, true)
-			snapshot := seedSnapshotCloneSource(t, client, "FILESYSTEM", testGiB)
+			snapshot := seedSnapshotCloneSource(t, client, d, "FILESYSTEM", testGiB)
 			request := snapshotCloneRequest("restored", "snap-1", "nfs", 2*testGiB)
 			marker, err := d.newInflightMarker("pool/parent/restored", request.GetVolumeContentSource(), ShareTypeNFS)
 			require.NoError(t, err)
@@ -241,7 +249,7 @@ func TestSnapshotCloneFoldPartialResponseIsFatalAndGuardCleaned(t *testing.T) {
 	base := &cloneFoldCaptureClient{MockClient: truenas.NewMockClient()}
 	client := &partialCloneFoldResponseClient{cloneFoldCaptureClient: base}
 	d := newSnapshotCloneFoldDriver(client, true)
-	seedSnapshotCloneSource(t, client.MockClient, "FILESYSTEM", testGiB)
+	seedSnapshotCloneSource(t, client.MockClient, d, "FILESYSTEM", testGiB)
 
 	_, err := d.CreateVolume(ctx, snapshotCloneRequest("restored", "snap-1", "nfs", 2*testGiB))
 	require.Error(t, err)
@@ -264,7 +272,7 @@ func TestSnapshotCloneFoldCleanupLosesToPeerRecovery(t *testing.T) {
 		owner:                  d.driverInstanceID(),
 	}
 	d.truenasClient = client
-	seedSnapshotCloneSource(t, client.MockClient, "FILESYSTEM", testGiB)
+	seedSnapshotCloneSource(t, client.MockClient, d, "FILESYSTEM", testGiB)
 
 	_, err := d.CreateVolume(ctx, snapshotCloneRequest("restored", "snap-1", "nfs", 2*testGiB))
 	require.Error(t, err)
@@ -280,7 +288,7 @@ func TestSnapshotCloneFoldInvalidStoredContentSourceAlreadyExists(t *testing.T) 
 	ctx := context.Background()
 	client := truenas.NewMockClient()
 	d := newSnapshotCloneFoldDriver(client, false)
-	seedSnapshotCloneSource(t, client, "FILESYSTEM", testGiB)
+	seedSnapshotCloneSource(t, client, d, "FILESYSTEM", testGiB)
 	request := snapshotCloneRequest("restored", "snap-1", "nfs", testGiB)
 	_, err := d.CreateVolume(ctx, request)
 	require.NoError(t, err)
@@ -327,10 +335,10 @@ func TestSnapshotCloneFoldQuotaAndZvolPaths(t *testing.T) {
 			ctx := context.Background()
 			client := &cloneFoldCaptureClient{MockClient: truenas.NewMockClient()}
 			d := newSnapshotCloneFoldDriver(client, tc.quotas)
-			seedSnapshotCloneSource(t, client.MockClient, tc.datasetType, testGiB)
+			seedSnapshotCloneSource(t, client.MockClient, d, tc.datasetType, testGiB)
 			source := snapshotCloneRequest("restored", "snap-1", string(tc.protocol), 2*testGiB).GetVolumeContentSource()
 
-			created, err := d.handleVolumeContentSource(
+			created, _, err := d.handleVolumeContentSource(
 				ctx,
 				"pool/parent/restored",
 				"restored",
@@ -400,7 +408,7 @@ func TestGuardedSnapshotCloneCleanupRefusesMarkerIdentityChanges(t *testing.T) {
 			ctx := context.Background()
 			client := truenas.NewMockClient()
 			d := newSnapshotCloneFoldDriver(client, false)
-			snapshot := seedSnapshotCloneSource(t, client, "FILESYSTEM", testGiB)
+			snapshot := seedSnapshotCloneSource(t, client, d, "FILESYSTEM", testGiB)
 			source := snapshotCloneRequest("restored", "snap-1", "nfs", testGiB).GetVolumeContentSource()
 			marker, err := d.newInflightMarker("pool/parent/restored", source, ShareTypeNFS)
 			require.NoError(t, err)

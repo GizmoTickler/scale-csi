@@ -322,9 +322,9 @@ func (c *apiCallCountingClient) CheckNVMeoFSupport(ctx context.Context) error {
 	return c.MockClient.CheckNVMeoFSupport(ctx)
 }
 
-func (c *apiCallCountingClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []truenas.ISCSITargetGroup) (*truenas.ISCSITarget, error) {
+func (c *apiCallCountingClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []truenas.ISCSITargetGroup, opts ...truenas.ISCSITargetCreateOptions) (*truenas.ISCSITarget, error) {
 	c.record("ISCSITargetCreate")
-	return c.MockClient.ISCSITargetCreate(ctx, name, alias, mode, groups)
+	return c.MockClient.ISCSITargetCreate(ctx, name, alias, mode, groups, opts...)
 }
 
 func (c *apiCallCountingClient) ISCSITargetDelete(ctx context.Context, id int, force bool) error {
@@ -347,9 +347,9 @@ func (c *apiCallCountingClient) ISCSITargetList(ctx context.Context) ([]*truenas
 	return c.MockClient.ISCSITargetList(ctx)
 }
 
-func (c *apiCallCountingClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string) (*truenas.ISCSIExtent, error) {
+func (c *apiCallCountingClient) ISCSIExtentCreate(ctx context.Context, name, diskPath, comment string, blocksize int, physicalBlocksize bool, rpm string, opts ...truenas.ISCSIExtentCreateOptions) (*truenas.ISCSIExtent, error) {
 	c.record("ISCSIExtentCreate")
-	return c.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, physicalBlocksize, rpm)
+	return c.MockClient.ISCSIExtentCreate(ctx, name, diskPath, comment, blocksize, physicalBlocksize, rpm, opts...)
 }
 
 func (c *apiCallCountingClient) ISCSIExtentDelete(ctx context.Context, id int, remove, force bool) error {
@@ -447,9 +447,9 @@ func (c *apiCallCountingClient) NVMeoFHostCreate(ctx context.Context, nqn string
 	return c.MockClient.NVMeoFHostCreate(ctx, nqn)
 }
 
-func (c *apiCallCountingClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int) (*truenas.NVMeoFSubsystem, error) {
+func (c *apiCallCountingClient) NVMeoFSubsystemCreate(ctx context.Context, name string, allowAnyHost bool, hostIDs []int, opts ...truenas.NVMeoFSubsystemCreateOptions) (*truenas.NVMeoFSubsystem, error) {
 	c.record("NVMeoFSubsystemCreate")
-	return c.MockClient.NVMeoFSubsystemCreate(ctx, name, allowAnyHost, hostIDs)
+	return c.MockClient.NVMeoFSubsystemCreate(ctx, name, allowAnyHost, hostIDs, opts...)
 }
 
 func (c *apiCallCountingClient) NVMeoFSubsystemDelete(ctx context.Context, id int) error {
@@ -512,9 +512,9 @@ func (c *apiCallCountingClient) NVMeoFPortList(ctx context.Context) ([]*truenas.
 	return c.MockClient.NVMeoFPortList(ctx)
 }
 
-func (c *apiCallCountingClient) NVMeoFPortCreate(ctx context.Context, transport, address string, port int) (*truenas.NVMeoFPort, error) {
+func (c *apiCallCountingClient) NVMeoFPortCreate(ctx context.Context, transport, address string, port int, opts ...truenas.NVMeoFPortCreateOptions) (*truenas.NVMeoFPort, error) {
 	c.record("NVMeoFPortCreate")
-	return c.MockClient.NVMeoFPortCreate(ctx, transport, address, port)
+	return c.MockClient.NVMeoFPortCreate(ctx, transport, address, port, opts...)
 }
 
 func (c *apiCallCountingClient) NVMeoFPortFindByAddress(ctx context.Context, transport, address string, port int) (*truenas.NVMeoFPort, error) {
@@ -552,9 +552,9 @@ func (c *apiCallCountingClient) NVMeoFSubsystemList(ctx context.Context) ([]*tru
 	return c.MockClient.NVMeoFSubsystemList(ctx)
 }
 
-func (c *apiCallCountingClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int) (*truenas.NVMeoFPort, error) {
+func (c *apiCallCountingClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...truenas.NVMeoFPortCreateOptions) (*truenas.NVMeoFPort, error) {
 	c.record("NVMeoFGetOrCreatePort")
-	return c.MockClient.NVMeoFGetOrCreatePort(ctx, transport, address, port)
+	return c.MockClient.NVMeoFGetOrCreatePort(ctx, transport, address, port, opts...)
 }
 
 func (c *apiCallCountingClient) InvalidateNVMeoFPort(transport, address string, port int) {

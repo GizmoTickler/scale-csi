@@ -11,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -280,4 +282,46 @@ func TestReconcileStampAdoptionSkipsInheritedInstanceStamp(t *testing.T) {
 	prop := fresh.UserProperties[PropDriverInstanceID]
 	assert.Equal(t, "some-other-install", prop.Value, "inherited instance stamp must be untouched")
 	assert.NotEqual(t, "local", prop.Source, "stamp must not have been re-written as local")
+}
+
+// TestAdoptedLegacyOwnershipDoesNotProveDataFree covers the safety boundary
+// between cleanup adoption and create-time data provenance. The reconciler
+// must be able to adopt the legacy dataset for tombstone ownership, while an
+// iSCSI rebuild still refuses to apply the controller default to its bytes.
+func TestAdoptedLegacyOwnershipDoesNotProveDataFree(t *testing.T) {
+	const adoptedMarker = "truenas-csi:driver_instance_id_adopted"
+	ctx := context.Background()
+	pv := boundReconcilePV("legacy-adopted", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	mustCreateParentDataset(t, client)
+
+	datasetName := "pool/parent/legacy-adopted"
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "VOLUME", Volsize: testGiB,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperties(ctx, datasetName, map[string]string{
+		PropManagedResource: "true",
+		PropCSIVolumeName:   "legacy-adopted",
+	}))
+
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Contains(t, report.AdoptedStamps, "legacy-adopted")
+
+	adopted, err := client.DatasetGet(ctx, datasetName)
+	require.NoError(t, err)
+	assert.True(t, datasetHasLocalUserProperty(adopted, PropDriverInstanceID, d.driverInstanceID()))
+	marker, ok := adopted.UserProperties[adoptedMarker]
+	require.True(t, ok, "adoption must leave a distinct marker beside the ownership stamp")
+	assert.Equal(t, d.driverInstanceID(), marker.Value)
+	assert.Equal(t, "local", marker.Source)
+
+	err = iscsiShareBackend{d}.EnsureShare(ctx, nil, datasetName, "legacy-adopted", nil)
+	require.Error(t, err, "an adopted legacy dataset must not qualify for the iSCSI default geometry")
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, status.Convert(err).Message(), adoptedMarker)
+	extent, findErr := client.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
+	require.NoError(t, findErr)
+	assert.Nil(t, extent, "adoption must not make a legacy volume default-eligible")
 }

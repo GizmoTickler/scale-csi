@@ -178,6 +178,298 @@ parameters such as `dataset_recordsize`, `dataset_compression`,
 `mountOptions` is a top-level StorageClass list, and the standardized filesystem
 key is `csi.storage.k8s.io/fstype`.
 
+## Block-protocol tuning
+
+These parameters tune the iSCSI extent/target and the NVMe-oF subsystem per
+StorageClass. Every one is optional: an omitted parameter uses the controller
+default, so a class that sets none of them provisions exactly as it did before
+these knobs existed.
+
+| Parameter | Values | Applies to | Notes |
+|---|---|---|---|
+| `iscsi/blocksize` | `512`, `1024`, `2048`, `4096` | extent | Pair `4096` with a 16K `zvolBlocksize`. |
+| `iscsi/pblocksize` | `true`, `false` | extent | Reports the physical blocksize to the initiator. |
+| `iscsi/queuedCommands` | `32`, `128` | target | Per-target SCST queue depth. |
+| `iscsi/insecureTpc` | `true`, `false` | extent | Default `true`. Set `false` to disable cross-LUN XCOPY/ODX. |
+| `iscsi/readOnly` | `true`, `false` | extent | Read-only extent (restore-verify use cases). |
+| `iscsi/availThreshold` | `1`–`99` | extent | Per-extent early-full warning percentage. |
+| `iscsi/stableSerial` | `true`, `false` | extent | Derives a deterministic SCSI serial from the volume, so identity survives an extent rebuild. |
+| `iscsi/authNetworks` | comma-separated CIDRs | target | Target-level network ACL. |
+| `nvmeof/qidMax` | `1`–`65535` | subsystem | Maximum I/O queue count (a queue identifier is 16-bit). |
+| `nvmeof/piEnable` | `true`, `false` | subsystem | T10-PI. Advanced — validate initiator support first. |
+
+Invalid values return `InvalidArgument` at `CreateVolume`, and the chart's
+`values.schema.json` rejects them earlier still, at `helm install`.
+
+**Every parameter above is applied at volume CREATE and is then immutable for the
+life of that volume.** No value is ever accepted and quietly ignored — see
+[Mutability](#mutability-every-knob-is-fixed-at-create).
+
+NVMe-oF **port** performance fields (`inlineDataSize`, `maxQueueSize`,
+`portPiEnable`) are deliberately NOT StorageClass parameters — the port is
+shared across volumes, so a per-class value would mutate a shared object under
+other volumes. Supplying one returns `InvalidArgument`; configure them
+install-wide under Helm `nvmeof.portPerf`. Those install-wide fields are applied
+at port CREATE only: changing them on an install whose ports already exist is a
+no-op, and the driver logs a warning naming each drifted field.
+
+### These options are persisted per volume
+
+The resolved options are stamped onto the volume's dataset as
+`truenas-csi:block_*` / `truenas-csi:nvme_*` user properties at `CreateVolume`,
+and **only** for the parameters the class actually set. Every later path that
+rebuilds the share for an existing volume — `ControllerPublishVolume`, the
+startup attachment reconcile, a DR/restore rebuild — reads those properties, so
+the volume keeps its own geometry and safety settings instead of falling back to
+the controller default. Without this, a restore rebuild would re-create the
+extent at the default `512` over data laid out for `4096`, and would drop the
+stable serial, read-only flag, `insecure_tpc`, target `auth_networks`,
+`avail_threshold`, `qid_max` and `pi_enable`.
+
+Resolution order is: StorageClass parameter → stored property → controller
+default, merged **per key**. A class that sets only one knob therefore cannot
+reset a volume's other stored values to the controller default.
+
+### Mutability: every knob is fixed at create
+
+There is exactly one rule, and it is the same for all ten parameters:
+
+> A per-volume block-protocol parameter is applied when the volume is created and
+> is **immutable** afterwards. If a `CreateVolume` for an existing volume
+> resolves a value that is not already in effect, the call fails with
+> `FailedPrecondition` naming the parameter. Nothing is accepted and ignored.
+
+That includes turning a knob **off**. Emptying `iscsi/authNetworks` on a volume
+whose target carries an ACL, and setting `iscsi/stableSerial: "false"` on a
+volume whose serial is pinned, are changes like any other and are rejected the
+same way — a dropped network ACL or an un-pinned SCSI identity is not something
+to apply silently. A volume created with either knob off still replays at off
+idempotently: "stableSerial is on" is decided from the volume's stamp, or from a
+live serial equal to the deterministic one its name derives, never from the mere
+presence of the serial TrueNAS auto-generates for every extent.
+
+| Parameter | TrueNAS 26.0 API | Driver policy | Enforcement |
+|---|---|---|---|
+| `iscsi/blocksize` | mutable on `iscsi.extent.update`, but **not** over existing data | Immutable | `FailedPrecondition` (live extent **and** stored stamp) |
+| `iscsi/pblocksize` | mutable on `iscsi.extent.update`, but **not** over existing data | Immutable | `FailedPrecondition` (live extent **and** stored stamp) |
+| `iscsi/queuedCommands` | mutable (`iscsi.target.update` → `iscsi_parameters.QueuedCommands`) | Immutable by driver policy | `FailedPrecondition` |
+| `iscsi/insecureTpc` | mutable (`iscsi.extent.update`) | Immutable by driver policy | `FailedPrecondition` |
+| `iscsi/readOnly` | mutable (`iscsi.extent.update` → `ro`) | Immutable by driver policy | `FailedPrecondition` |
+| `iscsi/availThreshold` | mutable (`iscsi.extent.update`) | Immutable by driver policy | `FailedPrecondition` |
+| `iscsi/stableSerial` | mutable (`iscsi.extent.update` → `serial`) | Immutable — it *is* the volume's SCSI identity | `FailedPrecondition` |
+| `iscsi/authNetworks` | mutable (`iscsi.target.update`) | Immutable by driver policy | `FailedPrecondition` |
+| `nvmeof/qidMax` | mutable (`nvmet.subsys.update`) | Immutable by driver policy | `FailedPrecondition` |
+| `nvmeof/piEnable` | mutable (`nvmet.subsys.update`) | Immutable — changes the block-integrity format | `FailedPrecondition` |
+
+`blocksize` and `pblocksize` are immutable at the **data** level: a volume's
+filesystem and partition table are laid out against the logical block size the
+initiator sees. The other eight are mutable at the TrueNAS API level and are
+immutable by deliberate driver policy, for three reasons:
+
+1. **The stamp, not the backend object, is the source of truth.** Every
+   publish / startup-reconcile / DR rebuild re-creates the share purely from the
+   volume's stored properties. Pushing a new value onto a live target or extent
+   without also re-stamping would drift, and the next rebuild would silently
+   revert it; re-stamping on the existing-volume arm would add a new fatal write
+   and a new crash window to a path whose whole job is to be idempotent.
+2. **Kubernetes treats StorageClass `parameters` as immutable.** A changed value
+   can therefore never reach the driver as an in-place operator edit — only from
+   a deleted-and-recreated class, or a different class colliding on the same
+   volume name. Neither is an intent-to-mutate signal for a volume that already
+   holds data.
+3. **`ro`, `insecure_tpc`, `auth_networks` and `pi_enable` are enforced while an
+   initiator is connected.** Silently retargeting a live, mounted volume's safety
+   posture is worse than refusing and saying exactly why.
+
+How the check decides whether a value is "already in effect": the **live backend
+object is authoritative** when it reports the field, and the volume's stored
+stamp is the fallback **only** for a field TrueNAS omits from its query response.
+So a same-value replay is never rejected, and a value that was never applied —
+for example `iscsi/stableSerial` added to a class after its volumes were
+provisioned — is rejected rather than acknowledged.
+
+That rule holds for **all ten** knobs without exception: every field the check
+reads is nullable in the driver's response model (`pblocksize`, `insecure_tpc`
+and `ro` included), so "the backend did not report this" stays distinguishable
+from "the backend reported false" and an omitted field can never masquerade as an
+authoritative one.
+
+A rebuild path that carries **no** StorageClass parameters (`ControllerPublish`,
+the startup attachment reconcile, a DR restore) has no opinion about the eight
+tuning knobs and is never rejected on them; it simply replays the volume's own
+stamp. Geometry is different, and has its own rule — see
+[Geometry is recorded, never guessed](#geometry-is-recorded-never-guessed).
+
+To change any of these, provision a new volume and migrate the data.
+
+### Restoring a snapshot or cloning a volume
+
+A ZFS clone shares its source's data byte-for-byte, so the clone's on-disk layout
+is the **source's** layout. A restore or clone into a class whose
+`iscsi/blocksize` or `iscsi/pblocksize` differs from the source volume's is
+rejected with `FailedPrecondition` — Kubernetes restricts PVC-to-PVC cloning to a
+single StorageClass but places no such restriction on restoring a
+`VolumeSnapshot` into a different class, so this is reachable in exactly the
+deployment two differently-tuned classes invite.
+
+For an **iSCSI** source, the source's geometry is read from **both** its stamp
+and its **live iSCSI extent**, on every clone or restore. A pre-existing 4096 volume is
+therefore just as protected as a stamped one: restoring its snapshot into a
+`blocksize: "512"` class is rejected, not accepted with a 512-byte extent laid
+over 4096-geometry data. Where the stamp and the live extent disagree, the clone
+is refused and both values are named — a drifted source has no establishable
+geometry, and the driver will not pick one for you.
+
+A restore into an iSCSI class that sets **no** geometry inherits the **source's**
+geometry, and that geometry is recorded on the destination. It does not revert to
+the controller default. A class that names no geometry still produces an extent,
+and gating the lookup on "did the class ask" is exactly what let the
+controller-wide default — a helm value, not a StorageClass parameter — silently
+supply the geometry for a no-opts restore. NVMe-oF uses its namespace path and
+does not run the iSCSI geometry guard; NFS clones and every non-clone path pay
+nothing for it.
+
+NVMe-oF has a separate geometry surface: this driver's TrueNAS namespace
+create/query model exposes no namespace block-size input or reported field, so
+the zvol/platform owns that value. The iSCSI extent stamp, iSCSI live-extent
+probe, and iSCSI recovery error do not apply to NVMe-oF clones or snapshot
+restores, and the driver does not fabricate iSCSI geometry properties for them.
+
+A **PVC-to-PVC clone** asks what the source is addressed through *now*, because
+its temporary snapshot is taken from the source's current state: one source
+`pool.dataset.query` (skipped here — the path already read the source) plus one
+`iscsi.extent.query`.
+
+### Snapshot geometry provenance
+
+A **snapshot restore** asks a different question: what are the bytes *inside this
+snapshot* addressed through. The source's current extent cannot answer it — a
+source whose extent was re-created at a different geometry after the snapshot was
+taken would hand the restore a layout the snapshot's data was never written
+against. Provenance is therefore tied to the snapshot itself:
+
+- For an **iSCSI** source, `CreateSnapshot` records the source's **live** geometry
+  on the snapshot it takes. ZFS captures a dataset's user properties at snapshot
+  time, so this is a durable point-in-time record. It costs one
+  `iscsi.extent.query` per iSCSI zvol snapshot; filesystem and NVMe-oF snapshots
+  pay no iSCSI geometry query.
+- For iSCSI, the live extent is consulted on each snapshot, including for a
+  volume that already records a geometry. A recorded value is a record of a
+  record; the extent is the bytes. Where the two disagree — an extent re-created
+  at a different geometry after the volume was stamped — `CreateSnapshot` **fails
+  `FailedPrecondition`** and names both values, rather than capturing a stale
+  record onto bytes it does not describe. (Such a volume is already unpublishable
+  for the same reason, so nothing that worked stops working.)
+- An iSCSI restore reads that captured record. When it is present and complete,
+  the restore issues **no source read at all**. NVMe-oF restore reads no iSCSI
+  geometry record and continues through namespace creation.
+- An iSCSI snapshot that captured **no** geometry, whose source shows any history
+  of having been block-addressed, **fails `FailedPrecondition`**. The driver will
+  not lay a guessed geometry over a snapshot's data. A snapshot of a
+  driver-provisioned zvol nothing has ever exported is unaffected — there is no
+  layout to preserve. A snapshot of a zvol the driver did **not** create is not
+  in that category: absence of the driver's bookkeeping is not evidence that the
+  bytes are unaddressed, so it fails closed too.
+
+> **Upgrade note.** Snapshots taken before this version carry no captured
+> geometry, so restoring one of a block volume fails closed until its real
+> geometry is recorded. Confirm the value the snapshot's data was written
+> against, then record it on the **snapshot**:
+>
+> ```sh
+> zfs set truenas-csi:block_blocksize=4096 \
+>         truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...@snap-...
+> ```
+>
+> `truenas-csi:block_blocksize` must be one of 512, 1024, 2048, 4096; any other
+> value is treated as untrusted and the restore keeps failing closed.
+>
+> Snapshots taken from this version on carry it automatically. NFS snapshots are
+> unaffected.
+
+### Geometry is recorded, never guessed
+
+`iscsi.extentBlocksize` and `iscsi.extentDisablePhysicalBlocksize` are
+install-wide defaults for **new** volumes only. Neither can reach a volume that
+already holds data, in either direction:
+
+- **Every extent the driver creates or observes is recorded on its dataset**
+  (`truenas-csi:block_blocksize`, `truenas-csi:block_pblocksize`), including for
+  a StorageClass that opts into nothing — what a volume *has* is a different fact
+  from what its class *asked for*. Volumes provisioned before this shipped are
+  recorded the first time the driver sees their extent alive (a publish, a
+  startup reconcile, an idempotent replay). On a fresh create the record and the
+  extent-ID witness also ride in the same fatal property update as the ownership
+  stamp, so they are durable-or-rolled-back with the rest of provisioning. Every
+  write is folded into a dataset update those paths already issue, so none of it
+  costs an extra round trip.
+- **The record must be COMPLETE.** Logical and physical block size are resolved
+  together, from the same evidence, by one function. A volume that records only
+  one of the two is refused rather than having the other filled in from today's
+  install-wide default.
+- **A StorageClass parameter is intent, not evidence.** An explicit
+  `iscsi/blocksize` may only *agree* with what the storage is already known to
+  be. It supplies a value only where the storage is **provably** free of
+  block-addressed data, and that proof is POSITIVE, never the absence of the
+  driver's own bookkeeping: either the zvol was created by this very call, or it
+  carries this driver instance's `truenas-csi:driver_instance_id` ownership stamp
+  with ZFS source `local` **and** no witness of ever having been exported. A zvol
+  the driver did not create — imported, attached by an administrator, or restored
+  by some other tool — cannot supply that proof and is refused. An *inherited*
+  ownership stamp is the source dataset's fact, not the clone's, and does not
+  count. Reconciliation may add a separate
+  `truenas-csi:driver_instance_id_adopted` marker to a legacy dataset for
+  cleanup ownership; that marker is not create-time provenance and does not
+  qualify the dataset for this proof.
+- **Two records that disagree are never combined.** Where a destination's own
+  record and its content source's record both describe the same bytes and give
+  different values, the driver names both and refuses. It never fills the
+  missing half of one record from the other while keeping a contradicted value —
+  that would manufacture a geometry that was never observed anywhere.
+- **Changing `iscsi.extentBlocksize` never re-geometries an existing volume.** A
+  rebuild whose extent is absent replays the volume's own recorded geometry. It
+  never falls back to the current default, because the default may have moved
+  since the data was written.
+- **If the geometry cannot be established, the driver refuses.** A volume whose
+  extent is gone *and* which carries no complete geometry record fails
+  `FailedPrecondition` rather than being re-created at a guess. Recover by
+  restoring the original extent, or by recording the real values:
+
+  ```sh
+  zfs set truenas-csi:block_blocksize=4096 \
+          truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...
+  ```
+
+  `truenas-csi:block_blocksize` must be one of **512, 1024, 2048, 4096** — the
+  sizes an extent can actually be created at. A stored value outside that set (a
+  typo in the command above) is treated as **untrusted**: it records nothing, the
+  volume reads as unrecorded, and the rebuild keeps failing closed rather than
+  acting on it. The same applies to a stored `queuedCommands`, `availThreshold`
+  or `qidMax` outside its documented range.
+
+- **An extent the driver did not create is validated before it is adopted.** If a
+  create-error recovery or an "already exists" fallback returns an extent whose
+  geometry differs from the one the create was authorized at, the driver refuses
+  and names both values instead of adopting it and recording its geometry as this
+  volume's truth.
+- **The live extent is authoritative for what the data is; the record states the
+  intent it was provisioned with.** Where the two disagree the driver names both
+  and refuses, rather than silently preferring either.
+
+#### What the record claims, exactly
+
+Recording an extent's geometry says **what that extent reports now**. It is proof
+of how the data is addressed today, and it is what stops any later rebuild — or
+any later change to the install-wide defaults — from reaching the volume.
+
+It is **not** proof of historical truth. A volume that was already corrupted
+before this mechanism existed — an unstamped 512-byte extent laid over
+4096-layout bytes by an old defaulted rebuild — is observationally
+indistinguishable from a correct 512-byte volume. Recording its geometry freezes
+the observable state; it cannot repair the history. Only an operator who knows
+the original geometry can correct such a volume, by recording the real values and
+re-creating the extent.
+
 ## NFS
 
 ```yaml

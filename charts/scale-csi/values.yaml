@@ -347,8 +347,15 @@ iscsi:
   # or creates an allow-all initiator group.
   targetGroups: []
 
+  # Logical block size for NEWLY created extents only. Changing it never
+  # re-geometries an existing volume: the driver records the geometry of every
+  # extent it creates or observes on the volume's own dataset and replays THAT on
+  # every later rebuild, so a changed value here can never be laid over data
+  # written against the old one. See docs/reference/storageclass.md, "Geometry is
+  # recorded, never guessed".
   extentBlocksize: 512
-  # Disable physical block size reporting on created extents.
+  # Disable physical block size reporting on created extents. Same rule: new
+  # extents only, and the value each volume got is recorded per volume.
   extentDisablePhysicalBlocksize: false
   extentRpm: SSD
   # extentAvailThreshold was removed: it was never wired to anything. The schema
@@ -402,6 +409,48 @@ nvmeof:
 
   # Allow any host NQN to connect. Enabling this bypasses subsystemHosts.
   subsystemAllowAnyHost: false
+
+  # Install-wide NVMe-oF port performance tuning (GF-Sprint 4). These fields
+  # live on a port that is SHARED across volumes, so they are install-wide only
+  # (never per-StorageClass). Every field defaults to unset, which omits the API
+  # parameter and keeps port creation identical to a pre-GF4 deployment. Named
+  # portPerf (not port) to avoid colliding with nvmeof.port (the service port).
+  #
+  # CREATE-ONLY: these values are applied when the driver CREATES a port. On an
+  # install whose ports already exist, changing them here has NO effect — the
+  # driver reuses the existing port and logs a warning naming each drifted field.
+  # TrueNAS refuses to change an enabled port while the target is running, so
+  # applying a change means a maintenance window: disable the port, update it,
+  # re-enable it.
+  portPerf:
+    # Inline write cutoff in bytes. Unset omits.
+    inlineDataSize: null
+    # Queue entries per connection. Unset omits.
+    maxQueueSize: null
+    # Enable T10-PI (protection information) on the port. Unset omits.
+    piEnable: null
+
+  # NVMe-oF multi-port multipath (GF-Sprint 4, E-6). When enabled, each subsystem
+  # is associated with one port per address below (in addition to `address`), and
+  # all addresses are advertised in the publish context under `addresses`.
+  # Existing volumes are converged on their next publish, so every advertised
+  # address really is associated with the subsystem.
+  #
+  # HONEST SCOPE — CONTROLLER SIDE ONLY. The node half is NOT shipped: the node
+  # still runs a single `nvme connect` to `address`, so enabling this today
+  # delivers NO multipath, NO load balancing and NO path failover. What it does
+  # deliver is the backend exposure (one port per storage NIC) that the node work
+  # will build on, at a cost of 2*(N-1) extra API calls per volume. There is also
+  # no ANA on this platform (nvmet rejects it), so when the node half lands all
+  # paths are equally optimized — correct for a single controller.
+  #
+  # Leave this off unless you are deliberately staging that exposure. Default off
+  # (single port, identical to pre-GF4).
+  multipath: false
+  # Additional storage transport addresses (IPs) to expose when multipath=true.
+  # `address` is always included first, and duplicates are collapsed. Must be
+  # non-empty when multipath=true.
+  addresses: []
 
   # commandTimeout was removed: it was never wired to anything. The nvme CLI
   # timeout is commandTimeouts.nvme. The schema still accepts the old key
@@ -462,6 +511,49 @@ storageClasses:
     volumeBindingMode: Immediate
     mountOptions: []
     extraParameters: {}
+  # Opt-in example: an iSCSI class tuned for 4K-aligned workloads (GF-Sprint 4).
+  # Disabled by default. The block-protocol knobs are per-StorageClass parameters
+  # (they flow through extraParameters verbatim). blocksize is IMMUTABLE for the
+  # life of a volume — it is fixed at extent create and cannot change on an extent
+  # that holds data. Pair iscsi/blocksize=4096 with zfs zvolBlocksize=16K. Every
+  # knob is optional; an unset knob keeps the controller/backend default.
+  - name: scale-iscsi-4k
+    enabled: false
+    protocol: iscsi
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: []
+    extraParameters:
+      # Extent logical blocksize: one of 512, 1024, 2048, 4096 (default 512).
+      iscsi/blocksize: "4096"
+      # Report physical blocksize to the initiator (default true).
+      iscsi/pblocksize: "true"
+      # Per-target SCST queue depth: 32 or 128 (default: backend default).
+      iscsi/queuedCommands: "128"
+      # Disable cross-LUN XCOPY/ODX for stricter isolation (default true).
+      iscsi/insecureTpc: "false"
+      # Per-extent early-full warning percentage 1-99 (default: none).
+      iscsi/availThreshold: "80"
+  # Opt-in example: an NVMe-oF class with per-SC subsystem tuning (GF-Sprint 4).
+  # Disabled by default. NVMe-oF PORT performance fields (inlineDataSize,
+  # maxQueueSize, port piEnable) are NOT per-StorageClass — the port is shared
+  # across volumes, so configure them install-wide under nvmeof.portPerf above;
+  # supplying them here is rejected at CreateVolume.
+  - name: scale-nvmeof-tuned
+    enabled: false
+    protocol: nvmeof
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions: []
+    extraParameters:
+      # Maximum number of I/O queues for the subsystem (default: backend default).
+      nvmeof/qidMax: "128"
+      # Enable T10-PI on the subsystem (advanced; validate initiator support).
+      nvmeof/piEnable: "false"
 
 # Deprecated single-StorageClass configuration. When non-empty, this takes
 # precedence over storageClasses for compatibility with existing values files.
