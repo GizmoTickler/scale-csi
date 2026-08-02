@@ -427,6 +427,21 @@ the zvol/platform owns that value. The iSCSI extent stamp, iSCSI live-extent
 probe, and iSCSI recovery error do not apply to NVMe-oF clones or snapshot
 restores, and the driver does not fabricate iSCSI geometry properties for them.
 
+There is exactly one **cross-protocol** check, and it exists because that
+exemption is about the destination, not the source. Kubernetes places no
+same-class restriction on restoring a `VolumeSnapshot`, so an iSCSI volume
+recorded at a **non-512** logical block size can be pointed at an NVMe-oF class —
+and the namespace created over those bytes would report whatever LBA format the
+platform derives, presenting a filesystem laid out for 4096-byte blocks through
+a different addressing. That restore (and the equivalent clone) is refused with
+`FailedPrecondition` naming the recorded geometry. Restore into an **iSCSI**
+class instead, which re-creates the recorded geometry over the same bytes. A
+source recorded at 512, or carrying no geometry record at all, claims nothing to
+contradict and is never refused; the check reads only the record the restore
+already holds, so it costs no extra API call. The reverse direction (an NVMe-oF
+source into an iSCSI class) was already protected — the source's namespace ID is
+a block-history witness, so it fails closed.
+
 A **PVC-to-PVC clone** asks what the source is addressed through *now*, because
 its temporary snapshot is taken from the source's current state: one source
 `pool.dataset.query` (skipped here — the path already read the source) plus one
@@ -455,6 +470,13 @@ against. Provenance is therefore tied to the snapshot itself:
 - An iSCSI restore reads that captured record. When it is present and complete,
   the restore issues **no source read at all**. NVMe-oF restore reads no iSCSI
   geometry record and continues through namespace creation.
+- Where the live extent could not be **read** at snapshot time (a transient API
+  failure), the snapshot is still taken but explicitly records **no** geometry:
+  both keys are written with ZFS's `-` no-value sentinel. Writing nothing would
+  not be enough — a snapshot inherits its dataset's user properties, and the
+  volume's unverified stamp is precisely what the live read exists to check.
+  Restoring such a snapshot fails closed (below), with the same recovery. A
+  missed capture costs availability, never integrity.
 - An iSCSI snapshot that captured **no** geometry, whose source shows any history
   of having been block-addressed, **fails `FailedPrecondition`**. The driver will
   not lay a guessed geometry over a snapshot's data. A snapshot of a
@@ -538,6 +560,18 @@ already holds data, in either direction:
   volume reads as unrecorded, and the rebuild keeps failing closed rather than
   acting on it. The same applies to a stored `queuedCommands`, `availThreshold`
   or `qidMax` outside its documented range.
+
+  **Blast radius.** Unlike every other failure on the rebuild path (API errors,
+  timeouts), this refusal is PERMANENT — only the operator action above clears
+  it — so the startup attachment reconcile treats it as a **per-volume operator
+  condition**, not as non-convergence: it logs the refusal, emits a
+  `StartupShareGeometryUnestablishable` **Warning Event on the PV** carrying this
+  recovery command, and converges the rest of the pass. In `fencing.mode:
+  strict` the controller therefore still becomes ready, and `CreateVolume` /
+  `ControllerPublishVolume` / `ControllerExpandVolume` keep working for every
+  other volume; only the affected volume is held. An absent extent exposes no
+  data path, so there is nothing on that volume to fence. Callers of the affected
+  volume still receive the unchanged `FailedPrecondition`.
 
 - **An extent the driver did not create is validated before it is adopted.** If a
   create-error recovery or an "already exists" fallback returns an extent whose

@@ -1,16 +1,154 @@
-# Release notes — v1.4.0
+# Release notes — v1.5.0
 
 This document is the accumulated changelog from the v1.2.23 documentation
-baseline through the **v1.4.0** release candidate, ordered newest-first. v1.4.0
-is a backward-compatible **MINOR** release over v1.3.0: it adds iSCSI CHAP,
-CSIStorageCapacity tracking, opt-in volume-health monitoring, clone-latency
-work, `truenas.maxConnections`, and an observability taxonomy migration, with
-**no breaking change** to existing configuration or volumes and a verified
-v1.4.0 → v1.3.0 rollback window. The v1.3.0 entry (which bundled the
-v1.2.24–v1.2.35 fixes plus the batch 17–20 performance/resilience/maintainability
-work) and earlier per-release entries are retained below for history. Sections
+baseline through the **v1.5.0** release candidate, ordered newest-first. v1.5.0
+is a backward-compatible **MINOR** release over v1.4.1 that lands the GF sprints
+(storage-native data protection, block-volume geometry safety, NFS performance
+and backend health) on top of it. Every new flag defaults OFF and the default
+Helm render stays byte-identical to v1.4.1, but v1.5.0 **does** change one
+runtime behavior for existing iSCSI volumes — read
+[GF-Sprint 4](#gf-sprint-4--block-volume-geometry-safety) before upgrading.
+
+The v1.4.0 entry below (iSCSI CHAP, CSIStorageCapacity tracking, opt-in
+volume-health monitoring, clone-latency work, `truenas.maxConnections`, and an
+observability taxonomy migration) and the v1.3.0 entry (which bundled the
+v1.2.24–v1.2.35 fixes plus the batch 17–20
+performance/resilience/maintainability work) are retained for history. Sections
 after the per-release entries (Breaking change, Helm chart, Release governance)
 are cross-cutting themes that span several of these releases.
+
+## GF-Sprint 5 — NFS performance and backend health
+
+Section added separately.
+
+## GF-Sprint 4 — Block-volume geometry safety
+
+The theme is one sentence: **an extent's geometry is recorded, never guessed.**
+Everything else in the sprint is either a per-volume tuning surface or a proof
+that makes that sentence true. The default Helm render is unchanged, and a
+StorageClass that sets none of the new parameters provisions exactly as it did
+on v1.4.1.
+
+### ⚠ Upgrade behavior change — iSCSI volumes with an absent extent
+
+This is the one behavior change in the release, and it is deliberate.
+
+Before v1.5.0, any path that had to (re-)create an iSCSI extent for an existing
+volume — `ControllerPublishVolume`, the startup attachment reconcile, a DR
+rebuild — created it at the **controller-wide default**
+(`iscsi.extentBlocksize`, `iscsi.extentDisablePhysicalBlocksize`). For a volume
+whose data was written against a different logical block size (a `4096` volume,
+or any volume provisioned while the default was something else), that laid a
+GUESSED geometry over existing data and corrupted it.
+
+From v1.5.0, a volume whose extent is **absent** and whose geometry is
+**unrecorded** — and which cannot prove it holds no block-addressed data — fails
+`FailedPrecondition` instead. The reachable shape is a pre-GF-4 volume on a
+TrueNAS restored from a configuration backup, or one whose extent an admin or an
+upgrade removed. Recovery is to restore the original extent, or to record the
+real geometry and retry:
+
+```sh
+zfs set truenas-csi:block_blocksize=4096 \
+        truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...
+```
+
+`block_blocksize` must be one of **512, 1024, 2048, 4096**; a value outside that
+set is treated as untrusted, records nothing, and keeps the rebuild failing
+closed rather than acting on a typo. Volumes the driver can see alive are
+back-stamped automatically the first time it observes their extent (a publish, a
+startup reconcile, an idempotent replay), so the exposure shrinks to zero on a
+healthy install without any operator action.
+
+**Blast radius, and why it is per-volume.** This refusal is PERMANENT: unlike
+every other failure on the rebuild path it never self-heals on retry. It is
+therefore classified as a per-volume operator condition rather than a
+convergence failure — the startup attachment reconcile logs it, emits a
+`StartupShareGeometryUnestablishable` **Warning Event on the PV** carrying the
+`zfs set` recovery, and lets the pass converge for every other volume. In
+`fencing.mode: strict` the controller still reaches ready, so `CreateVolume`,
+`ControllerPublishVolume` and `ControllerExpandVolume` keep working
+cluster-wide; only the affected volume is held. An absent extent exposes no data
+path, so there is nothing on that volume to fence. RPC callers still receive the
+unchanged `FailedPrecondition`.
+
+### Ten per-volume block-protocol StorageClass parameters
+
+`iscsi/blocksize`, `iscsi/pblocksize`, `iscsi/queuedCommands`,
+`iscsi/insecureTpc`, `iscsi/readOnly`, `iscsi/availThreshold`,
+`iscsi/stableSerial`, `iscsi/authNetworks`, `nvmeof/qidMax`,
+`nvmeof/piEnable`. Each is optional; an omitted parameter uses the controller
+default. Invalid values are rejected at `CreateVolume` (`InvalidArgument`) and
+earlier still by the chart's `values.schema.json`.
+
+The resolved values are stamped on the volume's dataset, so every later
+publish / reconcile / DR rebuild replays the volume's own settings instead of
+today's controller defaults.
+
+**Immutability policy: every one of the ten is fixed at volume create.** A
+`CreateVolume` for an existing volume that resolves a value not already in
+effect fails `FailedPrecondition` naming the parameter — nothing is accepted and
+quietly ignored, including turning a knob OFF. Several of these fields are
+mutable at the TrueNAS API level; the driver deliberately does not reconcile
+them onto a live object, because the volume's stamp (not the backend object) is
+what every rebuild replays, and silently retargeting a mounted volume's safety
+posture mid-flight is worse than refusing and saying why. See
+[StorageClass reference › Mutability](reference/storageclass.md#mutability-every-knob-is-fixed-at-create).
+
+### Snapshot geometry capture
+
+`CreateSnapshot` on an iSCSI zvol now consults the **live extent** and captures
+the resulting geometry onto the snapshot (one `iscsi.extent.query` per iSCSI
+zvol snapshot; filesystem and NVMe-oF snapshots pay nothing). A snapshot restore
+then answers from the geometry the snapshot itself captured, rather than from
+what the source looks like at restore time — which is a different question once
+a source's extent has been re-created at another geometry.
+
+Two consequences worth knowing:
+
+- Where the live extent and the volume's stamp **disagree**, `CreateSnapshot`
+  fails `FailedPrecondition` naming both, rather than capturing a record it
+  knows to be contradicted.
+- Where the live extent could not be **read** (a transient API failure), the
+  snapshot is still taken but explicitly records **no** geometry — the two keys
+  are written with ZFS's `-` no-value sentinel, because a snapshot otherwise
+  inherits its dataset's stamp and an unverified stamp is exactly what the live
+  read exists to check. Restoring such a snapshot fails closed with the same
+  `zfs set` recovery. This costs availability, never integrity.
+
+Snapshots taken before v1.5.0 carry no captured geometry. Restoring one into an
+iSCSI class succeeds as long as its source volume is still readable and
+consistent; where it is not, the restore fails closed rather than guessing.
+
+### Cross-protocol restore (iSCSI source → NVMe-oF class)
+
+The driver makes no geometry claim about an NVMe-oF namespace — the zvol and the
+platform own the LBA format. Restoring a snapshot of an iSCSI volume that
+records a **non-512** logical block size into an NVMe-oF StorageClass is
+therefore refused (`FailedPrecondition`): the same bytes would be presented
+through a different addressing. Restore into an iSCSI class instead. A source
+recorded at 512, or carrying no geometry record, is unaffected — and the check
+costs no extra backend call.
+
+### NVMe-oF chart values
+
+- **`nvmeof.portPerf.{inlineDataSize,maxQueueSize,piEnable}`** — install-wide
+  NVMe-oF port tuning. Deliberately NOT StorageClass parameters: the port is
+  shared across volumes, so a per-class value would mutate a shared object under
+  other volumes (supplying one returns `InvalidArgument`). Every field defaults
+  to unset, which omits the API parameter and keeps port creation identical to a
+  pre-GF-4 deployment. **CREATE-ONLY:** on an install whose ports already exist,
+  changing them is a no-op and the driver logs a warning naming each drifted
+  field.
+- **`nvmeof.multipath` + `nvmeof.addresses`** — associates each subsystem with
+  one port per address and advertises them all in the publish context.
+  **HONEST SCOPE — CONTROLLER SIDE ONLY.** The node half is NOT shipped: the
+  node still runs a single `nvme connect` to `address`, so enabling this today
+  delivers NO multipath, NO load balancing and NO path failover. What it
+  delivers is the backend exposure the node work will build on, at 2*(N-1) extra
+  API calls per volume. There is also no ANA on this platform. Leave it off
+  unless you are deliberately staging that exposure. `multipath: true` with an
+  empty `addresses` is a startup validation error.
 
 ## GF-Sprint 2 — Storage-native data protection
 
