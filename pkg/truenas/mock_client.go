@@ -698,6 +698,10 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 		ds.KeyLoaded = true
 		ds.Locked = false
 		ds.EncryptionRoot = params.Name
+		// P-10: a passphrase create reports key_format PASSPHRASE. It is what tells
+		// the driver this dataset needs a key from IT, rather than one the appliance
+		// stores and auto-loads.
+		ds.KeyFormat = KeyFormatPassphrase
 		if opts := params.EncryptionOptions; opts != nil {
 			// The key goes into the mock's own side table, never onto the *Dataset
 			// the driver receives.
@@ -708,8 +712,53 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 			ds.EncryptionAlgorithm = "AES-256-GCM"
 		}
 	}
+	// ZFS ENCRYPTION IS INHERITED (P-10). A dataset created with no encryption of
+	// its own under an ENCRYPTED ancestor comes out encrypted:true with the
+	// ANCESTOR as its encryption_root and the ancestor's key format, and it is
+	// locked exactly when the ancestor is. Modeling this is what makes the
+	// encrypted-parent deployment testable at all: without it every such dataset
+	// looked plaintext, and a driver that equated encrypted:true with "has its own
+	// key" destroyed restored data on those deployments with nothing to catch it.
+	m.applyInheritedEncryptionLocked(ds)
 	m.Datasets[params.Name] = ds
 	return mockDatasetResponse(ds, true), nil
+}
+
+// applyInheritedEncryptionLocked gives a dataset the encryption identity it
+// inherits from its nearest ENCRYPTED ancestor, when it has none of its own.
+// Callers hold m.mu.
+func (m *MockClient) applyInheritedEncryptionLocked(ds *Dataset) {
+	if ds == nil || ds.Encrypted {
+		return
+	}
+	name := ds.Name
+	for {
+		cut := strings.LastIndex(name, "/")
+		if cut <= 0 {
+			return
+		}
+		name = name[:cut]
+		ancestor, ok := m.Datasets[name]
+		if !ok {
+			continue
+		}
+		if !ancestor.Encrypted {
+			return
+		}
+		ds.Encrypted = true
+		ds.EncryptionRoot = ancestor.EncryptionRoot
+		if ds.EncryptionRoot == "" {
+			ds.EncryptionRoot = ancestor.Name
+		}
+		ds.KeyFormat = ancestor.KeyFormat
+		ds.EncryptionAlgorithm = ancestor.EncryptionAlgorithm
+		ds.Locked = ancestor.Locked
+		ds.KeyLoaded = ancestor.KeyLoaded
+		if ds.Locked {
+			ds.Mountpoint = ""
+		}
+		return
+	}
 }
 
 func mockDatasetResponse(dataset *Dataset, created bool) *Dataset {
@@ -940,16 +989,18 @@ func (m *MockClient) DatasetQueryByParent(ctx context.Context, parentDataset str
 			property.Source = ""
 			response.UserProperties[key] = property
 		}
-		// Same fidelity discipline for the encryption booleans: parseDatasetResource
-		// does NOT read encrypted/locked/key_loaded (they are pool.dataset.query
-		// fields, P-1/P-4), so a dataset that arrives through this path carries
-		// none of them in production. Zero them here so no caller can build on a
+		// Same fidelity discipline for every encryption field: zfs.resource.query
+		// returns NO encryption, key or lock fields AT ALL (P-11, nas01
+		// 26.0.0-BETA.1, 2026-08-02) and parseDatasetResource reads none of them, so
+		// a dataset that arrives through this path carries none of them in
+		// production. Zero them here so no caller can build on a
 		// signal the resource path does not actually deliver — the exact class of
 		// mistake that made the unlock reconciler a silent no-op.
 		response.Encrypted = false
 		response.Locked = false
 		response.KeyLoaded = false
 		response.EncryptionRoot = ""
+		response.KeyFormat = ""
 		response.EncryptionAlgorithm = ""
 		response.ResourceQuery = true
 		list = append(list, response)
@@ -1904,6 +1955,7 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetNa
 			if source.Encrypted {
 				clone.Encrypted = true
 				clone.EncryptionAlgorithm = source.EncryptionAlgorithm
+				clone.KeyFormat = source.KeyFormat
 				clone.EncryptionRoot = source.EncryptionRoot
 				if clone.EncryptionRoot == "" {
 					clone.EncryptionRoot = source.Name
@@ -1967,6 +2019,12 @@ func (m *MockClient) CopyDatasetFromSnapshotLocal(
 	if copy.Type != "VOLUME" {
 		copy.Mountpoint = "/mnt/" + strings.TrimPrefix(targetDataset, "/")
 	}
+	// A received dataset takes the destination parent's encryption, exactly like
+	// any other create under that parent (P-10 inheritance). Whether a send from
+	// an ENCRYPTED source is raw (an encrypted, independently-rooted target) or
+	// plain is UNPROBED as of 2026-08-02 — drill step 6b settles it — so the mock
+	// deliberately models only the inheritance half, which is probed.
+	m.applyInheritedEncryptionLocked(copy)
 	m.Datasets[targetDataset] = copy
 	m.ReplicationJobs[jobID] = &ReplicationJob{
 		ID:             jobID,

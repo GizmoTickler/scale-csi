@@ -430,3 +430,94 @@ func TestMockKeyMaterialStaysOffTheDatasetStruct(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, fmt.Sprintf("%+v", listed), passphrase)
 }
+
+// TestDatasetEncryptionIdentityParse pins the P-10 wire shape on the
+// pool.dataset.query path and the P-11 absence on zfs.resource.query, for BOTH
+// decoders (they must stay deep-equal).
+//
+// P-10 (nas01 26.0.0-BETA.1, 2026-08-02): pool.dataset.query returns
+// encryption_root as a PLAIN STRING naming the encryption ROOT — a child of an
+// encrypted parent reports the PARENT, a self-keyed dataset reports ITSELF — and
+// key_format as a PROPERTY DICT whose value is "PASSPHRASE".
+// P-11 (same date): zfs.resource.query returns NO encryption/key/lock fields at
+// all.
+func TestDatasetEncryptionIdentityParse(t *testing.T) {
+	payload := []byte(`[
+	  {"id":"flashstor/self","name":"flashstor/self","encrypted":true,"locked":false,"key_loaded":true,
+	   "encryption_root":"flashstor/self","key_format":{"value":"PASSPHRASE","rawvalue":"passphrase","parsed":"passphrase","source":"LOCAL"}},
+	  {"id":"flashstor/parent/child","name":"flashstor/parent/child","encrypted":true,"locked":false,"key_loaded":true,
+	   "encryption_root":"flashstor/parent","key_format":{"value":"PASSPHRASE"}},
+	  {"id":"flashstor/plain","name":"flashstor/plain","encrypted":false,"encryption_root":null,"key_format":null}
+	]`)
+
+	var generic []interface{}
+	require.NoError(t, json.Unmarshal(payload, &generic))
+	fromMap := make([]*Dataset, 0, len(generic))
+	for _, item := range generic {
+		ds, err := parseDataset(item)
+		require.NoError(t, err)
+		fromMap = append(fromMap, ds)
+	}
+
+	var raw []*rawDataset
+	require.NoError(t, json.Unmarshal(payload, &raw))
+	fromTyped := rawDatasetsToDatasets(raw, false)
+
+	require.Equal(t, fromMap, fromTyped, "the two decoders must stay deep-equal on the encryption fields")
+
+	assert.Equal(t, "flashstor/self", fromMap[0].EncryptionRoot, "a self-keyed dataset reports ITSELF")
+	assert.Equal(t, KeyFormatPassphrase, fromMap[0].KeyFormat)
+	assert.Equal(t, "flashstor/parent", fromMap[1].EncryptionRoot, "a child reports its PARENT")
+	assert.Equal(t, KeyFormatPassphrase, fromMap[1].KeyFormat)
+	assert.Equal(t, "", fromMap[2].EncryptionRoot)
+	assert.Equal(t, "", fromMap[2].KeyFormat)
+
+	t.Run("an unexpected key_format shape degrades to empty, never a decode failure", func(t *testing.T) {
+		odd := []byte(`[{"id":"flashstor/odd","name":"flashstor/odd","encrypted":true,"key_format":["PASSPHRASE"],"encryption_root":{"value":"x"}}]`)
+		var oddRaw []*rawDataset
+		require.NoError(t, json.Unmarshal(odd, &oddRaw), "a shape surprise must not fail the whole response")
+		got := rawDatasetsToDatasets(oddRaw, false)
+		require.Len(t, got, 1)
+		assert.Equal(t, "", got[0].KeyFormat)
+		assert.Equal(t, "", got[0].EncryptionRoot)
+	})
+
+	t.Run("the resource path carries no encryption fields (P-11)", func(t *testing.T) {
+		resourcePayload := []byte(`[{"name":"flashstor/self","user_properties":{"truenas-csi:encryption":"AES-256-GCM"}}]`)
+		var resourceRaw []*rawDataset
+		require.NoError(t, json.Unmarshal(resourcePayload, &resourceRaw))
+		resourceDatasets := rawDatasetsToDatasets(resourceRaw, true)
+		require.Len(t, resourceDatasets, 1)
+		assert.False(t, resourceDatasets[0].Encrypted)
+		assert.Equal(t, "", resourceDatasets[0].EncryptionRoot)
+		assert.Equal(t, "", resourceDatasets[0].KeyFormat)
+	})
+}
+
+// TestMockInheritedEncryption models P-10 inheritance: a dataset created with no
+// encryption of its own under an ENCRYPTED ancestor comes out encrypted with the
+// ANCESTOR as its root. Without this the encrypted-parent deployment — the one
+// the driver used to destroy data on — could not be tested at all.
+func TestMockInheritedEncryption(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockClient()
+	_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{
+		Name: "flashstor/parent", Type: "FILESYSTEM",
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "parent-pass-1"},
+	})
+	require.NoError(t, err)
+	child, err := mock.DatasetCreate(ctx, &DatasetCreateParams{Name: "flashstor/parent/child", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+
+	assert.True(t, child.Encrypted, "P-10: encryption is inherited")
+	assert.Equal(t, "flashstor/parent", child.EncryptionRoot, "the root is the PARENT, not the child")
+	assert.Equal(t, KeyFormatPassphrase, child.KeyFormat)
+	assert.False(t, child.Locked)
+
+	// And a dataset outside the encrypted subtree stays plaintext.
+	other, err := mock.DatasetCreate(ctx, &DatasetCreateParams{Name: "flashstor/plain", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	assert.False(t, other.Encrypted)
+}

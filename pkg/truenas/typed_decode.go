@@ -165,9 +165,51 @@ func (snapshot *rawSnapshot) toSnapshot() *Snapshot {
 
 type rawDataset struct {
 	Dataset
-	Path              string                     `json:"path"`
-	Properties        *rawDatasetProperties      `json:"properties"`
+	Path       string                `json:"path"`
+	Properties *rawDatasetProperties `json:"properties"`
+	// Encryption identity (P-10, pool.dataset.query only): encryption_root is a
+	// plain string, key_format a property dict. Both are decoded TOLERANTLY —
+	// an unexpected shape yields "" instead of failing the whole response —
+	// because these fields sit on the same decode as every other dataset in the
+	// listing. They are assigned only on the pool.dataset.query path, keeping this
+	// decoder exactly equivalent to parseDataset/parseDatasetResource (P-11:
+	// zfs.resource.query carries no encryption fields at all).
+	RawEncryptionRoot tolerantString             `json:"encryption_root"`
+	RawKeyFormat      tolerantPropertyString     `json:"key_format"`
 	RawUserProperties map[string]rawUserProperty `json:"user_properties"`
+}
+
+// tolerantPropertyString decodes a TrueNAS value that may be a property dict
+// ({"value": "..."} — the P-10 key_format shape), a plain string, or anything
+// else. Anything it cannot read becomes "", never a decode error: the same
+// discipline as tolerantString, which exists because a hard-typed field turned
+// one shape surprise into a silent fallback for every managed-dataset listing
+// (2026-07-31).
+type tolerantPropertyString string
+
+func (value *tolerantPropertyString) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		return nil
+	}
+	if data[0] == '"' {
+		var decoded string
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return nil
+		}
+		*value = tolerantPropertyString(decoded)
+		return nil
+	}
+	if data[0] != '{' {
+		return nil
+	}
+	var object struct {
+		Value tolerantString `json:"value"`
+	}
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil
+	}
+	*value = tolerantPropertyString(object.Value)
+	return nil
 }
 
 type rawDatasetProperties struct {
@@ -194,6 +236,13 @@ func (dataset *rawDataset) toDataset(resourceQuery bool) *Dataset {
 	}
 	if resourceQuery && result.ID == "" {
 		result.ID = result.Name
+	}
+	if !resourceQuery {
+		// P-10/P-11: these fields exist only on pool.dataset.query, and
+		// parseDatasetResource does not read them, so assigning them only here keeps
+		// the two decoders deep-equal on both paths.
+		result.EncryptionRoot = string(dataset.RawEncryptionRoot)
+		result.KeyFormat = strings.ToUpper(strings.TrimSpace(string(dataset.RawKeyFormat)))
 	}
 	if resourceQuery && dataset.Properties != nil {
 		result.Used = dataset.Properties.Used.toDatasetProperty()

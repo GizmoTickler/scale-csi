@@ -64,8 +64,28 @@ type Dataset struct {
 	// encryption_summary in ListVolumes. The driver's authoritative unlock GATE
 	// still uses DatasetEncryptionSummary (P-8); these fields drive the read-only
 	// health/VolumeCondition surface and let the mock model a locked zvol.
-	// EncryptionRoot/EncryptionAlgorithm stay json:"-": they are modeled state
-	// (P-7 clone inheritance) that no production parse populates today.
+	// EncryptionRoot and KeyFormat are what make `encrypted:true` MEANINGFUL, and
+	// both are parsed from the pool.dataset.query path (P-10, nas01
+	// 26.0.0-BETA.1, 2026-08-02): encryption_root comes back as a PLAIN STRING
+	// naming the encryption ROOT — a child that inherits from an encrypted parent
+	// reports the PARENT's name, a self-keyed dataset reports ITSELF — and
+	// key_format comes back as a PROPERTY DICT whose value is "PASSPHRASE" for a
+	// passphrase dataset. Without them, `encrypted` alone cannot tell "this
+	// dataset has its own passphrase key the driver must manage" from "this
+	// dataset sits under an encrypted parent whose key the appliance already
+	// holds" — a distinction the driver gets destructively wrong without it.
+	//
+	// They carry json:"-" and are filled by BOTH parsers explicitly (the tolerant
+	// path), not by struct tags: a hard-typed tag turns any unexpected shape into
+	// a decode failure for EVERY dataset in the response, which is exactly how a
+	// source-shape surprise silently degraded every managed-dataset listing on
+	// 2026-07-31.
+	//
+	// zfs.resource.query returns NO encryption, key or lock fields at all (P-11,
+	// same probe date), so on the bulk listing path every one of these is the zero
+	// value — see MockClient.DatasetQueryByParent, which models exactly that. Any
+	// decision that needs encryption state must therefore be taken on a
+	// pool.dataset.query read.
 	//
 	// NO KEY MATERIAL LIVES ON THIS STRUCT. The mock keeps its model of the
 	// appliance's key knowledge in a side table keyed by encryption root, so a
@@ -75,7 +95,30 @@ type Dataset struct {
 	Locked              bool   `json:"locked"`
 	KeyLoaded           bool   `json:"key_loaded"`
 	EncryptionRoot      string `json:"-"`
+	KeyFormat           string `json:"-"`
 	EncryptionAlgorithm string `json:"-"`
+}
+
+// KeyFormatPassphrase is the only key format this driver manages: the key is a
+// passphrase that TrueNAS does NOT persist (P-3), so the driver must supply it.
+// A dataset with any other key format (e.g. a hex key or KMIP, which TrueNAS can
+// store and auto-load at boot) needs nothing from this driver.
+const KeyFormatPassphrase = "PASSPHRASE"
+
+// datasetKeyFormat normalizes a key_format value that may arrive either as a
+// property dict {"value": "PASSPHRASE", ...} (the P-10 shape) or as a plain
+// string, and returns "" for anything else — never an error, because an
+// unreadable key format must degrade to "unknown", not fail a dataset read.
+func datasetKeyFormat(raw interface{}) string {
+	switch typed := raw.(type) {
+	case string:
+		return strings.ToUpper(strings.TrimSpace(typed))
+	case map[string]interface{}:
+		if value, ok := typed["value"].(string); ok {
+			return strings.ToUpper(strings.TrimSpace(value))
+		}
+	}
+	return ""
 }
 
 // DatasetProperty represents a ZFS property with parsed and raw values.
@@ -1140,6 +1183,13 @@ func parseDataset(data interface{}) (*Dataset, error) {
 	if v, ok := m["key_loaded"].(bool); ok {
 		ds.KeyLoaded = v
 	}
+	// P-10: encryption_root is a plain string naming the encryption ROOT; a child
+	// of an encrypted parent reports the PARENT, a self-keyed dataset reports
+	// itself. key_format is a property dict whose value is "PASSPHRASE".
+	if v, ok := m["encryption_root"].(string); ok {
+		ds.EncryptionRoot = v
+	}
+	ds.KeyFormat = datasetKeyFormat(m["key_format"])
 
 	// Parse properties
 	ds.Used = parseProperty(m["used"])
