@@ -1779,3 +1779,107 @@ func TestGF2FeaturesDefaultOffMakeNoNewAPICalls(t *testing.T) {
 		assert.Zero(t, methods[method], "GF2 method %s must not be called on the default path", method)
 	}
 }
+
+// TestControllerPublishEncryptedGoldenAPICallCounts pins the ENCRYPTED publish
+// path — the path where the encryption round trips actually live (the create
+// path is +0, already pinned above). Design E-5 budgets "+1 encryption_summary,
+// conditionally +1 unlock, rotation +2".
+//
+// Wire-level honesty: DatasetEncryptionSummary is a @job whose RESULT must be
+// re-read, so beneath this single counted call it issues the dispatch, the
+// job wait, AND one extra core.get_jobs (fetchJobResult). These goldens count
+// ClientInterface calls, not wire RTTs (see the header of the publish goldens).
+func TestControllerPublishEncryptedGoldenAPICallCounts(t *testing.T) {
+	ctx := context.Background()
+	const passphrase = "enc-passphrase-1"
+	const rotatedPassphrase = "enc-passphrase-2"
+
+	newEncryptedPublishDriver := func(t *testing.T, client *apiCallCountingClient) *Driver {
+		t.Helper()
+		d := newFencedAPICallCountDriver(t, client, "nfs", FencingModeOff)
+		d.config.Encryption.Enabled = true
+		return d
+	}
+	nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", IPs: []net.IP{net.ParseIP("192.0.2.31")}})
+	require.NoError(t, err)
+
+	// Already unlocked, no rotation window: the plaintext floor (3) + the P-8
+	// gate read. NO unlock call — unlocking an unlocked dataset is a FAILED job.
+	t.Run("encrypted NFS publish, already unlocked", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newEncryptedPublishDriver(t, client)
+		_, err := d.CreateVolume(ctx, apiCallCountEncryptionVolumeRequest("enc-pub-unlocked"))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, encryptedPublishRequest("enc-pub-unlocked", nodeA, passphrase, ""))
+		require.NoError(t, err)
+		// Four calls: the 3-call plaintext NFS publish floor (DatasetGet,
+		// NFSShareGet, DatasetSetUserProperties) PLUS DatasetEncryptionSummary,
+		// the P-8 gate.
+		assertAPICallCount(t, "encrypted NFS publish (unlocked)", client, 4)
+		_, methods := client.callSnapshot()
+		assert.Equal(t, 1, methods["DatasetEncryptionSummary"])
+		assert.Zero(t, methods["DatasetUnlock"], "P-8: no speculative unlock")
+	})
+
+	// Locked (the post-reboot state): + the unlock itself.
+	t.Run("encrypted NFS publish, locked", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newEncryptedPublishDriver(t, client)
+		_, err := d.CreateVolume(ctx, apiCallCountEncryptionVolumeRequest("enc-pub-locked"))
+		require.NoError(t, err)
+		require.NoError(t, client.DatasetLock(ctx, "pool/parent/enc-pub-locked"))
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, encryptedPublishRequest("enc-pub-locked", nodeA, passphrase, ""))
+		require.NoError(t, err)
+		// Five calls: the 4 above PLUS DatasetUnlock.
+		assertAPICallCount(t, "encrypted NFS publish (locked)", client, 5)
+		_, methods := client.callSnapshot()
+		assert.Equal(t, 1, methods["DatasetUnlock"])
+	})
+
+	// Rotation window, locked on the PREVIOUS key: summary + failed unlock
+	// (current) + unlock(previous) + change_key.
+	t.Run("encrypted NFS publish, locked inside the rotation window", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newEncryptedPublishDriver(t, client)
+		_, err := d.CreateVolume(ctx, apiCallCountEncryptionVolumeRequest("enc-pub-rotating"))
+		require.NoError(t, err)
+		require.NoError(t, client.DatasetLock(ctx, "pool/parent/enc-pub-rotating"))
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx,
+			encryptedPublishRequest("enc-pub-rotating", nodeA, rotatedPassphrase, passphrase))
+		require.NoError(t, err)
+		// Seven calls: the 4-call unlocked baseline PLUS the failed
+		// unlock(current), unlock(previous) and change_key(current) — the design's
+		// "rotation adds at most +2" measured honestly (the failed attempt is a
+		// round trip too).
+		assertAPICallCount(t, "encrypted NFS publish (rotation window)", client, 7)
+		_, methods := client.callSnapshot()
+		assert.Equal(t, 2, methods["DatasetUnlock"])
+		assert.Equal(t, 1, methods["DatasetChangeKey"])
+	})
+
+	// A plaintext volume on an encryption-enabled controller pays NOTHING.
+	t.Run("plaintext publish on an encryption-enabled controller is unchanged", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		d := newEncryptedPublishDriver(t, client)
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("plain-pub", "nfs"))
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.ControllerPublishVolume(ctx, nfsPublishRequest("plain-pub", nodeA))
+		require.NoError(t, err)
+		assertAPICallCount(t, "plaintext NFS publish (encryption enabled)", client, 3)
+	})
+}
+
+// encryptedPublishRequest is an NFS publish carrying the controller-publish
+// secret an encrypted StorageClass renders. Values are test fixtures only.
+func encryptedPublishRequest(volumeID, nodeID, passphrase, previous string) *csi.ControllerPublishVolumeRequest {
+	req := nfsPublishRequest(volumeID, nodeID)
+	req.Secrets = map[string]string{"passphrase": passphrase}
+	if previous != "" {
+		req.Secrets["passphrasePrevious"] = previous
+	}
+	return req
+}
