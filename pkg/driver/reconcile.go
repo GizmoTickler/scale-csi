@@ -1302,6 +1302,12 @@ func (d *Driver) startOrphanReconcile() {
 			interval, cadence, minAge, d.config.Reconcile.Enabled, d.config.Fencing.Enabled())
 		run := func() {
 			d.runReplicationJobSweep(ctx)
+			// Encryption at rest (GF-Sprint 1, E-2 §4): re-unlock locked encrypted
+			// volumes on startup and every cadence. Gated internally on
+			// encryption.enabled and in-cluster client access; best-effort, bounded,
+			// redacted. Runs independently of orphan detection because it is an
+			// availability reconvergence, not cleanup.
+			d.reconcileEncryptedUnlocks(ctx)
 			if !d.config.Reconcile.Enabled && !d.config.Fencing.Enabled() {
 				return
 			}
