@@ -1193,6 +1193,14 @@ volume whose key is inherited, or whose key the appliance stores and auto-loads
 (hex/KMIP), is never unlocked, re-keyed, refused or destroyed by this driver, and
 plaintext StorageClasses keep working exactly as before on such a pool.
 
+If the backend ever reports a volume as encrypted but the driver cannot read
+those identity fields, it says so — a warning naming the dataset and the field,
+once per dataset — and then errs deliberately in two different directions: it
+still **refuses** to clone or restore from that volume (the cost of being wrong
+is one clear error), and it never **destroys** anything on that basis (the cost
+of being wrong there is your data). Treat the warning as a signal to re-run
+`scripts/gf1-encryption-drill.sh` step 1b, which re-pins the shape.
+
 Both content-source refusals are **independent of `encryption.enabled`**. The hazard belongs to
 the data, not to the feature flag: turning encryption off (a rollback, a values
 regression) while encrypted volumes still exist does not re-enable cloning one.

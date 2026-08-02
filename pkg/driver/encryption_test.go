@@ -1,8 +1,11 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -11,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -1438,4 +1442,232 @@ func TestRecoveredRemnantWithDriverManagedKeyIsRolledBack(t *testing.T) {
 	assert.Contains(t, err.Error(), "copy the data in", "the remediation must be one the operator can follow")
 	_, getErr := mockClient.DatasetGet(ctx, destination)
 	require.Error(t, getErr, "the unmanageable remnant is rolled back, not left wedging the PVC")
+}
+
+// captureKlog redirects klog to a buffer for the duration of fn. It is how the
+// "warn once, not once per call" contract is asserted on the actual log output
+// rather than on the bookkeeping that produces it.
+func captureKlog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	klog.LogToStderr(false)
+	// Every severity needs a writer (klog mirrors a warning into the INFO stream
+	// too, glog semantics, and a nil writer panics), but only the WARNING stream
+	// is captured — a single shared writer would see every line twice and turn a
+	// once-per-dataset assertion into a lie.
+	klog.SetOutput(io.Discard)
+	klog.SetOutputBySeverity("WARNING", &buf)
+	t.Cleanup(func() {
+		klog.Flush()
+		klog.SetOutput(io.Discard)
+		klog.LogToStderr(true)
+	})
+	fn()
+	klog.Flush()
+	return buf.String()
+}
+
+// TestUnknownEncryptionIdentityIsLoudOncePerDataset is the first half of the N-9
+// regression. The tolerant decode is right — a strict tag on a BETA encryption
+// field would fail EVERY dataset in a response (real history, 2026-07-31) — but
+// the resulting "identity unknown" used to degrade to "not ours" with NO trace at
+// all: a genuinely self-keyed, unstamped volume whose key_format shape moved was
+// treated as plaintext at publish, with no unlock, no summary read, no error and
+// no Event, surfacing later as an unexplained device-wait timeout.
+//
+// PRE-FIX PROOF: with the warnUnknownEncryptionIdentity calls removed, the log
+// contains nothing at all for either dataset.
+func TestUnknownEncryptionIdentityIsLoudOncePerDataset(t *testing.T) {
+	rootless := &truenas.Dataset{Name: "pool/parent/n9-rootless", Encrypted: true}
+	formatless := &truenas.Dataset{
+		Name: "pool/parent/n9-formatless", Encrypted: true,
+		EncryptionRoot: "pool/parent/n9-formatless",
+	}
+
+	logged := captureKlog(t, func() {
+		for i := 0; i < 5; i++ {
+			assert.False(t, datasetSelfKeyedPassphrase(rootless))
+			assert.False(t, datasetSelfKeyedPassphrase(formatless))
+			assert.False(t, datasetNeedsEncryptionHandling(rootless))
+		}
+	})
+
+	assert.Equal(t, 1, strings.Count(logged, "pool/parent/n9-rootless"),
+		"the contradiction is reported once per dataset per process, not once per call")
+	assert.Equal(t, 1, strings.Count(logged, "pool/parent/n9-formatless"))
+	assert.Contains(t, logged, "encryption_root", "the warning names the field that did not parse")
+	assert.Contains(t, logged, "key_format")
+	assert.Contains(t, logged, "step 1b", "and points at the drill step that re-pins the shape")
+
+	// A healthy identity is silent.
+	quiet := captureKlog(t, func() {
+		assert.True(t, datasetSelfKeyedPassphrase(&truenas.Dataset{
+			Name: "pool/parent/n9-healthy", Encrypted: true,
+			EncryptionRoot: "pool/parent/n9-healthy", KeyFormat: truenas.KeyFormatPassphrase,
+		}))
+	})
+	assert.NotContains(t, quiet, "n9-healthy")
+}
+
+// TestUnknownEncryptionIdentityAsymmetry is the second half of N-9: unknown
+// identity must fail CLOSED where being wrong costs a refusal, and fail OPEN
+// where being wrong costs DESTROYED DATA.
+func TestUnknownEncryptionIdentityAsymmetry(t *testing.T) {
+	d := &Driver{config: &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}}}
+
+	unknownRoot := &truenas.Dataset{Name: "pool/parent/unknown-root", Encrypted: true}
+	unknownFormat := &truenas.Dataset{
+		Name: "pool/parent/unknown-format", Encrypted: true,
+		EncryptionRoot: "pool/parent/unknown-format",
+	}
+	baseline := &truenas.Dataset{
+		Name: "pool/parent/baseline", Encrypted: true,
+		EncryptionRoot: "pool", KeyFormat: "",
+	}
+	proven := &truenas.Dataset{
+		Name: "pool/parent/proven", Encrypted: true,
+		EncryptionRoot: "pool/parent/proven", KeyFormat: truenas.KeyFormatPassphrase,
+	}
+
+	_ = captureKlog(t, func() {
+		// REFUSAL scope: unknown counts (cost of being wrong = one clear error).
+		assert.True(t, d.datasetKeyMayBeDriverManaged(unknownRoot))
+		assert.True(t, d.datasetKeyMayBeDriverManaged(unknownFormat))
+		assert.True(t, d.datasetKeyMayBeDriverManaged(proven))
+		assert.False(t, d.datasetKeyMayBeDriverManaged(baseline),
+			"a root outside the driver's parent is KNOWN baseline whatever its key format")
+
+		// DESTROY scope: only positive proof (cost of being wrong = lost data).
+		assert.False(t, d.datasetKeyIsDriverManaged(unknownRoot))
+		assert.False(t, d.datasetKeyIsDriverManaged(unknownFormat))
+		assert.True(t, d.datasetKeyIsDriverManaged(proven))
+		assert.False(t, d.refuseEncryptedContentSourceResult(context.Background(), unknownRoot))
+		assert.False(t, d.refuseEncryptedContentSourceResult(context.Background(), unknownFormat))
+		assert.True(t, d.refuseEncryptedContentSourceResult(context.Background(), proven))
+	})
+}
+
+// encryptionIdentityStrippingClient models the exact failure the tolerant decode
+// produces when the pinned shape moves: every dataset still reports encrypted,
+// but its identity fields come back empty because the parser could not read
+// them.
+type encryptionIdentityStrippingClient struct {
+	*truenas.MockClient
+}
+
+func stripEncryptionIdentity(ds *truenas.Dataset) *truenas.Dataset {
+	if ds == nil {
+		return nil
+	}
+	stripped := *ds
+	stripped.EncryptionRoot = ""
+	stripped.KeyFormat = ""
+	return &stripped
+}
+
+func (c *encryptionIdentityStrippingClient) DatasetGet(ctx context.Context, name string) (*truenas.Dataset, error) {
+	ds, err := c.MockClient.DatasetGet(ctx, name)
+	return stripEncryptionIdentity(ds), err
+}
+
+func (c *encryptionIdentityStrippingClient) DatasetCreate(ctx context.Context, params *truenas.DatasetCreateParams) (*truenas.Dataset, error) {
+	ds, err := c.MockClient.DatasetCreate(ctx, params)
+	return stripEncryptionIdentity(ds), err
+}
+
+func (c *encryptionIdentityStrippingClient) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
+	ds, err := c.MockClient.DatasetUpdate(ctx, name, params)
+	return stripEncryptionIdentity(ds), err
+}
+
+// TestUnknownEncryptionIdentityRefusesButNeverDestroys drives the reviewer's
+// exact scenario end to end: the identity shape has moved, so every dataset reads
+// encrypted-with-unknown-identity.
+//
+//   - with the feature on, the pre-mutation content-source refusal still fires
+//     (fail closed: the cost is one clear error);
+//   - with the feature off, the post-create backstop does NOT destroy the
+//     restored volume (fail open: the cost of being wrong would be lost data).
+//
+// PRE-FIX PROOF: reverting the refusal to proven-only lets the first sub-test's
+// clone succeed; widening the backstop to may-be-managed destroys the second
+// sub-test's restored dataset.
+func TestUnknownEncryptionIdentityRefusesButNeverDestroys(t *testing.T) {
+	ctx := context.Background()
+
+	newStrippedDriver := func(t *testing.T, encryptionEnabled bool) (*Driver, *truenas.MockClient) {
+		t.Helper()
+		mockClient := truenas.NewMockClient()
+		_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent", Type: "FILESYSTEM"})
+		require.NoError(t, err)
+		return &Driver{
+			name: "org.scale.csi.nfs",
+			config: &Config{
+				DriverName: "org.scale.csi.nfs",
+				ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+				NFS:        NFSConfig{Enabled: true, ShareHost: "192.0.2.10"},
+				Encryption: EncryptionConfig{Enabled: encryptionEnabled},
+			},
+			truenasClient: &encryptionIdentityStrippingClient{MockClient: mockClient},
+		}, mockClient
+	}
+
+	t.Run("the content-source refusal still fires on unknown identity", func(t *testing.T) {
+		d, mockClient := newStrippedDriver(t, true)
+		// The exposed state: encrypted on the wire, NO local stamp (the crash
+		// window), and an identity the parser cannot read. The stamp cannot carry
+		// this decision — only the identity predicate can.
+		_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/n9-src", Type: "FILESYSTEM",
+			Encryption:        boolPtr(true),
+			InheritEncryption: boolPtr(false),
+			EncryptionOptions: &truenas.EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "longenough1"},
+		})
+		require.NoError(t, err)
+		source, err := d.truenasClient.DatasetGet(ctx, "pool/parent/n9-src")
+		require.NoError(t, err)
+		require.True(t, source.Encrypted, "the backend still says encrypted")
+		require.Equal(t, "", source.EncryptionRoot, "but its identity did not parse")
+		require.Equal(t, "", datasetLocalUserProperty(source, PropEncryption), "and it carries no stamp")
+
+		clone := plainVolumeRequest("n9-clone")
+		clone.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "n9-src"},
+		}}
+		_, err = d.CreateVolume(ctx, clone)
+		require.Error(t, err, "an unreadable identity must not silently allow cloning an encrypted volume")
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		_, cloneErr := mockClient.DatasetGet(ctx, "pool/parent/n9-clone")
+		require.Error(t, cloneErr, "and the refusal precedes any mutation")
+	})
+
+	t.Run("the backstop does NOT destroy on unknown identity", func(t *testing.T) {
+		d, mockClient := newStrippedDriver(t, true)
+		_, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+			Name:               "n9-src2",
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			Parameters:         map[string]string{"encryption": "true"},
+			Secrets:            map[string]string{"passphrase": "longenough1"},
+		})
+		require.NoError(t, err)
+		snapResp, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{SourceVolumeId: "n9-src2", Name: "n9-snap"})
+		require.NoError(t, err)
+
+		// Feature OFF: the snapshot branch's pre-mutation read is skipped, so the
+		// post-create backstop is the only thing left — and it must not delete a
+		// dataset whose identity it could not read.
+		d.config.Encryption.Enabled = false
+		restore := plainVolumeRequest("n9-restore")
+		restore.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snapResp.GetSnapshot().GetSnapshotId()},
+		}}
+		_, createErr := d.CreateVolume(ctx, restore)
+
+		restored, getErr := mockClient.DatasetGet(ctx, "pool/parent/n9-restore")
+		require.NoError(t, getErr,
+			"the restored dataset must survive: an unreadable identity is never a reason to destroy data (createErr=%v)", createErr)
+		assert.True(t, restored.Encrypted)
+		assert.Empty(t, mockClient.DatasetDeleteCalls, "no destroy is issued on unknown identity")
+	})
 }

@@ -6,6 +6,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -216,10 +217,64 @@ func datasetSelfKeyedPassphrase(ds *truenas.Dataset) bool {
 	if ds == nil || !ds.Encrypted {
 		return false
 	}
-	if ds.EncryptionRoot == "" || ds.EncryptionRoot != ds.Name {
+	if ds.EncryptionRoot == "" {
+		// A CONTRADICTION the backend should never emit: P-10 pins
+		// encryption_root as present on every encrypted dataset. Reaching here
+		// means the pinned shape moved and the tolerant decode degraded the field
+		// to "". The decode tolerance is deliberate (a strict tag would fail EVERY
+		// dataset in the response — that is real history, 2026-07-31), but the
+		// degradation must never be silent: it is the earliest signal that this
+		// feature's identity discipline has lost its ground truth.
+		warnUnknownEncryptionIdentity(ds.Name, "encryption_root")
+		return false
+	}
+	if ds.EncryptionRoot != ds.Name {
+		return false
+	}
+	if ds.KeyFormat == "" {
+		warnUnknownEncryptionIdentity(ds.Name, "key_format")
 		return false
 	}
 	return ds.KeyFormat == truenas.KeyFormatPassphrase
+}
+
+// encryptionIdentityWarned records the datasets already warned about, so the
+// contradiction is reported ONCE PER DATASET PER PROCESS rather than once per
+// call: the predicates run on every publish, every create replay and every
+// reconcile pass, and a per-call warning would bury the signal in its own noise.
+var encryptionIdentityWarned sync.Map
+
+func warnUnknownEncryptionIdentity(datasetName, field string) {
+	if datasetName == "" {
+		return
+	}
+	if _, seen := encryptionIdentityWarned.LoadOrStore(datasetName+"/"+field, struct{}{}); seen {
+		return
+	}
+	klog.Warningf("Dataset %s reports encrypted=true but its %s is unreadable: the pinned TrueNAS encryption "+
+		"shape (P-10) has moved, so this driver cannot tell whether the volume holds its own key. It is treated as "+
+		"NOT driver-encrypted for unlock and for the content-source rollback, and as possibly-driver-encrypted for "+
+		"the content-source refusal. Re-run scripts/gf1-encryption-drill.sh step 1b to re-pin the shape.",
+		datasetName, field)
+}
+
+// encryptionIdentityUnknown reports that a dataset is encrypted but the driver
+// CANNOT determine whose key it is, because the identity fields the decision
+// rests on did not parse (see datasetSelfKeyedPassphrase).
+//
+// "Unknown" is narrower than "not proven": a dataset whose root is known and
+// lies outside this driver's parent is definitively the deployment's baseline,
+// whatever its key format, and is not unknown. A self-rooted dataset whose key
+// format is a known non-passphrase format (the appliance holds the key) is not
+// unknown either.
+func encryptionIdentityUnknown(ds *truenas.Dataset) bool {
+	if ds == nil || !ds.Encrypted {
+		return false
+	}
+	if ds.EncryptionRoot == "" {
+		return true
+	}
+	return ds.EncryptionRoot == ds.Name && ds.KeyFormat == ""
 }
 
 // datasetEncryptionInheritedFrom returns the dataset's encryption root when the
@@ -255,6 +310,19 @@ func (d *Driver) datasetKeyIsDriverManaged(ds *truenas.Dataset) bool {
 	return parent != "" && strings.HasPrefix(root, parent+"/")
 }
 
+// datasetKeyMayBeDriverManaged is datasetKeyIsDriverManaged widened by the
+// UNKNOWN case, and it is used only where the cost of being wrong is a REFUSAL.
+//
+// The asymmetry is deliberate and is the whole point: when the identity fields
+// do not parse, the driver cannot prove whose key a dataset holds. Refusing to
+// clone it costs an operator one clear error they can act on. Destroying it —
+// the backstop's action — costs them their data. So the refusal fails CLOSED on
+// unknown identity and the rollback fails OPEN: it demands positively-proven
+// driver ownership (datasetKeyIsDriverManaged) before it deletes anything.
+func (d *Driver) datasetKeyMayBeDriverManaged(ds *truenas.Dataset) bool {
+	return d.datasetKeyIsDriverManaged(ds) || encryptionIdentityUnknown(ds)
+}
+
 // datasetNeedsEncryptionHandling reports whether a dataset must go through the
 // unlock/rotation machinery at publish time: either the driver stamped it, or the
 // backend says it holds its OWN passphrase key. An encrypted-but-unstamped
@@ -266,6 +334,13 @@ func (d *Driver) datasetKeyIsDriverManaged(ds *truenas.Dataset) bool {
 // load (the backend refuses unlock on a non-root), it is unlocked exactly when
 // its root is, and forcing it down this path is how a healthy, serving volume
 // gets failed at publish.
+//
+// UNKNOWN identity is deliberately NOT widened into here either, for the same
+// reason: pushing an inherited-key clone onto the unlock path fails a healthy,
+// serving volume's publish. The stamp — checked first — already covers every
+// volume this driver created, so the only exposure is an unstamped volume in the
+// crash window, and that case is now LOUD (warnUnknownEncryptionIdentity) rather
+// than silent.
 func datasetNeedsEncryptionHandling(ds *truenas.Dataset) bool {
 	return isEncryptedDataset(ds) || datasetSelfKeyedPassphrase(ds)
 }
@@ -474,7 +549,7 @@ func (d *Driver) guardEncryptedContentSource(
 	// clone inherits the same appliance-held key and is exactly as readable as the
 	// source, so refusing it would break ordinary restores on an encrypted-parent
 	// deployment.
-	if !isEncryptedDataset(sourceDS) && !d.datasetKeyIsDriverManaged(sourceDS) {
+	if !isEncryptedDataset(sourceDS) && !d.datasetKeyMayBeDriverManaged(sourceDS) {
 		return nil
 	}
 	return status.Errorf(codes.FailedPrecondition,
@@ -503,13 +578,20 @@ func (d *Driver) refuseEncryptedContentSourceResult(ctx context.Context, created
 	if createdDS == nil || !createdDS.Encrypted {
 		return false
 	}
-	// Only a DRIVER-MANAGED key is a hazard: the volume's own passphrase key, or
-	// the key of another CSI volume it inherits from (a P-7 clone of a
-	// driver-encrypted volume). A volume that came out encrypted because the
-	// deployment's PARENT dataset is encrypted (root at or above the parent, P-10)
-	// is a completely ordinary restore whose key the appliance already holds —
-	// destroying it would throw away legitimately restored data, and on the
-	// detached path an entire copy the operator just paid for.
+	// Only a POSITIVELY PROVEN driver-managed key is a hazard worth destroying
+	// data over: the volume's own passphrase key, or the key of another CSI volume
+	// it inherits from (a P-7 clone of a driver-encrypted volume). A volume that
+	// came out encrypted because the deployment's PARENT dataset is encrypted
+	// (root at or above the parent, P-10) is a completely ordinary restore whose
+	// key the appliance already holds — destroying it would throw away
+	// legitimately restored data, and on the detached path an entire copy the
+	// operator just paid for.
+	//
+	// UNKNOWN identity is deliberately NOT enough here, unlike on the refusal path
+	// (datasetKeyMayBeDriverManaged): an unreadable identity field must never be
+	// the reason a dataset is deleted. The unknown case is loud (see
+	// warnUnknownEncryptionIdentity) and it is refused at the source, so it does
+	// not pass silently — it simply is not destroyed on a guess.
 	if !d.datasetKeyIsDriverManaged(createdDS) {
 		return false
 	}
