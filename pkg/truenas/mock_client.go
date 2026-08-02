@@ -1139,6 +1139,14 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 			"creation": map[string]interface{}{"parsed": float64(time.Now().Unix())},
 		},
 		UserProperties: make(map[string]UserProperty, len(userProperties)),
+		// The mock models the TrueNAS 26.0 zfs.resource.snapshot.query read path,
+		// matching DatasetGet's ResourceQuery=true. This flag must accompany the
+		// full-property inheritance below: the 26.0 flat read returns inherited
+		// values AND sets this flag, so identity sniffs (isCSISnapshot) trust only
+		// snapshot-only properties on it. Inherited properties WITHOUT the flag
+		// would model a hybrid no real API version produces — the legacy path
+		// returns local-only properties.
+		ResourceQuery: true,
 	}
 	// A ZFS snapshot holds the dataset's user properties as of the instant it was
 	// taken — ALL of them, not a chosen subset. The driver's geometry-provenance
