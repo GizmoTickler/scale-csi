@@ -190,6 +190,96 @@ func TestChartTombstoneReaperScanFallbackPlumbing(t *testing.T) {
 	}
 }
 
+// TestChartHoldCSISnapshotsPlumbing proves the GF2/E1 zfs.holdCsiSnapshots key is
+// removal-only rendered: ABSENT from the default configmap (so the default render
+// stays byte-identical to v1.4.1 and a rolled-back binary with no holdCsiSnapshots
+// field still strict-parses it) and present only when explicitly enabled.
+func TestChartHoldCSISnapshotsPlumbing(t *testing.T) {
+	t.Run("default render omits holdCsiSnapshots", func(t *testing.T) {
+		if out := helmTemplate(t, "--show-only", "templates/configmap.yaml"); strings.Contains(out, "holdCsiSnapshots:") {
+			t.Errorf("default configmap must not emit zfs.holdCsiSnapshots; the feature is opt-in and the default render must stay byte-identical")
+		}
+	})
+
+	t.Run("enabled renders the key", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.holdCsiSnapshots=true")
+		if !strings.Contains(out, "      holdCsiSnapshots: true\n") {
+			t.Errorf("--set zfs.holdCsiSnapshots=true did not propagate into the rendered configmap; got:\n%s", out)
+		}
+	})
+}
+
+// TestChartSnapshotSchedulePlumbing proves the GF2/E2 driver-managed periodic
+// snapshot keys (zfs.snapshotSchedule, zfs.snapshotRetention) are removal-only
+// rendered: ABSENT from the default configmap (empty default => byte-identical
+// render) and present only when set to a non-empty value.
+func TestChartSnapshotSchedulePlumbing(t *testing.T) {
+	t.Run("default render omits the schedule keys", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml")
+		if strings.Contains(out, "snapshotSchedule:") {
+			t.Errorf("default configmap must not emit zfs.snapshotSchedule; empty default must stay byte-identical")
+		}
+		if strings.Contains(out, "snapshotRetention:") {
+			t.Errorf("default configmap must not emit zfs.snapshotRetention; empty default must stay byte-identical")
+		}
+	})
+
+	t.Run("set renders both keys", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml",
+			"--set", "zfs.snapshotSchedule=0 0 * * *", "--set", "zfs.snapshotRetention=30d")
+		if !strings.Contains(out, "      snapshotSchedule: \"0 0 * * *\"\n") {
+			t.Errorf("--set zfs.snapshotSchedule did not render quoted into the configmap; got:\n%s", out)
+		}
+		if !strings.Contains(out, "      snapshotRetention: \"30d\"\n") {
+			t.Errorf("--set zfs.snapshotRetention did not render quoted into the configmap; got:\n%s", out)
+		}
+	})
+}
+
+// TestChartPromoteRestoredClonesPlumbing proves the GF2/E3 zfs.promoteRestoredClones
+// key is removal-only rendered: ABSENT from the default configmap (default false =>
+// byte-identical render) and present only when enabled.
+func TestChartPromoteRestoredClonesPlumbing(t *testing.T) {
+	t.Run("default render omits promoteRestoredClones", func(t *testing.T) {
+		if out := helmTemplate(t, "--show-only", "templates/configmap.yaml"); strings.Contains(out, "promoteRestoredClones:") {
+			t.Errorf("default configmap must not emit zfs.promoteRestoredClones; the feature is opt-in")
+		}
+	})
+
+	t.Run("enabled renders the key", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.promoteRestoredClones=true")
+		if !strings.Contains(out, "      promoteRestoredClones: true\n") {
+			t.Errorf("--set zfs.promoteRestoredClones=true did not propagate into the rendered configmap; got:\n%s", out)
+		}
+	})
+}
+
+// TestChartReportVolumeUsagePlumbing proves the GF2/E4 zfs.reportVolumeUsage key
+// and its ScaleCSIVolumeNearQuota alert are removal-only rendered: ABSENT from the
+// default configmap and prometheusrule (default false => byte-identical render)
+// and present only when enabled.
+func TestChartReportVolumeUsagePlumbing(t *testing.T) {
+	t.Run("default render omits the key and the alert", func(t *testing.T) {
+		if out := helmTemplate(t, "--show-only", "templates/configmap.yaml"); strings.Contains(out, "reportVolumeUsage:") {
+			t.Errorf("default configmap must not emit zfs.reportVolumeUsage; the feature is opt-in")
+		}
+		if out := helmTemplate(t, "--set", "metrics.prometheusRule.enabled=true"); strings.Contains(out, "ScaleCSIVolumeNearQuota") {
+			t.Errorf("ScaleCSIVolumeNearQuota must stay absent unless zfs.reportVolumeUsage is also true")
+		}
+	})
+
+	t.Run("enabled renders the key and the alert", func(t *testing.T) {
+		if out := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "zfs.reportVolumeUsage=true"); !strings.Contains(out, "      reportVolumeUsage: true\n") {
+			t.Errorf("--set zfs.reportVolumeUsage=true did not render into the configmap; got:\n%s", out)
+		}
+		out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+			"--set", "metrics.prometheusRule.enabled=true", "--set", "zfs.reportVolumeUsage=true")
+		if !strings.Contains(out, "- alert: ScaleCSIVolumeNearQuota") {
+			t.Errorf("both toggles on did not render ScaleCSIVolumeNearQuota; got:\n%s", out)
+		}
+	})
+}
+
 // TestChartDeprecatedKeysNotRendered proves the retired iscsi.extentAvailThreshold
 // and nvmeof.commandTimeout keys are no longer rendered into the driver configmap.
 // Both were parsed but consumed by nothing (the nvme CLI timeout is

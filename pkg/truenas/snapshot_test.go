@@ -2565,3 +2565,133 @@ func BenchmarkSnapshot_GetClones(b *testing.B) {
 		_ = snap.GetClones()
 	}
 }
+
+// TestSnapshotHoldReleaseIsHeld pins the GF2/E1 hold client contract against the
+// live-probed wire behavior (P1): hold/release take a single positional snapshot
+// id, a re-hold surfaces EEXIST/errno 17 (wrapped lzc_hold() failure) which the
+// client treats as idempotent success, a release of a non-held snapshot surfaces
+// ENOENT which is likewise success, and holds are read off the resource path
+// zfs.resource.snapshot.holds as a bare tag list.
+func TestSnapshotHoldReleaseIsHeld(t *testing.T) {
+	mock := newMockWSServer()
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			snapID, _ := req.Params[0].(string)
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.hold":
+				switch snapID {
+				case "tank/vol@already-held":
+					// TrueNAS wraps the re-hold as a lzc_hold() failure carrying
+					// errno 17 (EEXIST) as the authoritative positive code.
+					resp.Error = &rpcError{Code: 17, Message: "('lzc_hold() failed', (..., 17))"}
+				case "tank/vol@hold-fails":
+					resp.Error = &rpcError{Code: -1, Message: "dataset is busy"}
+				default:
+					resp.Result = nil
+				}
+			case "pool.snapshot.release":
+				if snapID == "tank/vol@not-held" {
+					resp.Error = &rpcError{Code: 2, Message: "no such hold on snapshot"}
+					break
+				}
+				resp.Result = nil
+			case "zfs.resource.snapshot.holds":
+				options := req.Params[0].(map[string]interface{})
+				if options["path"] == "tank/vol@unheld" {
+					resp.Result = []interface{}{}
+					break
+				}
+				resp.Result = []interface{}{"truenas"}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+	ctx := context.Background()
+
+	assert.NoError(t, client.SnapshotHold(ctx, "tank/vol@fresh"), "a fresh hold succeeds")
+	assert.NoError(t, client.SnapshotHold(ctx, "tank/vol@already-held"), "re-holding an already-held snapshot is idempotent success (EEXIST/17)")
+	assert.Error(t, client.SnapshotHold(ctx, "tank/vol@hold-fails"), "a genuine hold failure is surfaced, not swallowed")
+
+	assert.NoError(t, client.SnapshotRelease(ctx, "tank/vol@held"), "a normal release succeeds")
+	assert.NoError(t, client.SnapshotRelease(ctx, "tank/vol@not-held"), "releasing a non-held snapshot is idempotent success (ENOENT)")
+
+	held, err := client.SnapshotIsHeld(ctx, "tank/vol@held")
+	require.NoError(t, err)
+	assert.True(t, held, "a snapshot with a non-empty hold list is held")
+
+	held, err = client.SnapshotIsHeld(ctx, "tank/vol@unheld")
+	require.NoError(t, err)
+	assert.False(t, held, "a snapshot with an empty hold list is not held")
+}
+
+// TestSnapshotHoldIdempotencyHelpers unit-tests the errno/message classifiers
+// directly so the already-held and not-held tolerances are pinned independent of
+// the WebSocket harness.
+func TestSnapshotHoldIdempotencyHelpers(t *testing.T) {
+	assert.True(t, isSnapshotAlreadyHeldError(nil))
+	assert.True(t, isSnapshotAlreadyHeldError(&APIError{Code: 17, Message: "lzc_hold() failed"}))
+	assert.True(t, isSnapshotAlreadyHeldError(&APIError{Code: -1, Message: "snapshot already exists"}))
+	assert.True(t, isSnapshotAlreadyHeldError(&APIError{Code: -1, Message: "('lzc_hold() failed', (..., 17))"}))
+	assert.False(t, isSnapshotAlreadyHeldError(&APIError{Code: -1, Message: "dataset is busy"}))
+
+	assert.True(t, isSnapshotNotHeldError(nil))
+	assert.True(t, isSnapshotNotHeldError(&APIError{Code: 2, Message: "no such hold"}))
+	assert.True(t, isSnapshotNotHeldError(&APIError{Code: -1, Message: "hold not found on snapshot"}))
+	assert.False(t, isSnapshotNotHeldError(&APIError{Code: -1, Message: "dataset is busy"}))
+	// A structured errno that is neither ENOENT nor a hold message is a real error.
+	assert.False(t, isSnapshotNotHeldError(&APIError{Code: 13, Message: "permission denied mentioning hold not"}))
+}
+
+// F9 — the already-held classifier matched a bare "17" ANYWHERE in the error
+// text. TrueNAS embeds the snapshot path in lzc_hold() tracebacks and PVC names
+// are UUIDs that routinely contain "17" (e.g. pvc-17a3…), so an lzc_hold()
+// failure with a completely different errno on such a snapshot was silently
+// reported as "already held": the operator believed the snapshot was
+// deletion-proof when it was not, and the metric recorded a success.
+func TestSnapshotAlreadyHeldErrnoIsPositionAnchored(t *testing.T) {
+	// A real EEXIST traceback: errno in tuple-tail position.
+	assert.True(t, isSnapshotAlreadyHeldError(&APIError{
+		Code:    -1,
+		Message: "[EFAULT] ('lzc_hold() failed', ('tank/csi/pvc-abc@s1', 17))",
+	}))
+	assert.True(t, isSnapshotAlreadyHeldError(&APIError{
+		Code:    -1,
+		Message: "lzc_hold() failed: errno 17",
+	}))
+
+	// A DIFFERENT errno on a snapshot whose PATH contains 17 must NOT be
+	// swallowed as already-held.
+	assert.False(t, isSnapshotAlreadyHeldError(&APIError{
+		Code:    -1,
+		Message: "[EFAULT] ('lzc_hold() failed', ('tank/csi/pvc-17a3b9de@snap-2017-01@s1', 13))",
+	}))
+	assert.False(t, isSnapshotAlreadyHeldError(&APIError{
+		Code:    -1,
+		Message: "[EFAULT] ('lzc_hold() failed', ('tank/csi/pvc-1717@s1', 5))",
+	}))
+}
+
+// IsSnapshotHeldError drives the unconditional release-and-retry that makes
+// hold/release fail-safe against a disabled flag (GF2-fix/H4).
+func TestIsSnapshotHeldError(t *testing.T) {
+	assert.False(t, IsSnapshotHeldError(nil))
+	assert.True(t, IsSnapshotHeldError(&APIError{Code: 16, Message: "boom"}))
+	assert.True(t, IsSnapshotHeldError(&APIError{
+		Code:    -1,
+		Message: "zfs.resource.snapshot.destroy: 'tank/csi/vol@s1' has the following holds: truenas",
+	}))
+	assert.False(t, IsSnapshotHeldError(&APIError{Code: -1, Message: "dataset has snapshots"}))
+}

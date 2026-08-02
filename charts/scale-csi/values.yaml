@@ -274,7 +274,44 @@ zfs:
 
   # Allow DeleteVolume to recursively destroy snapshots not created by the CSI
   # driver. Keep false unless those snapshots are deliberately disposable.
+  # This authorizes destroying snapshots the driver has SEEN and classified; it
+  # is NOT a blind-destroy switch. When the snapshot listing itself fails, the
+  # delete refuses regardless of this setting.
   destroyForeignSnapshotsOnDelete: false
+
+  # Place a deletion-proof ZFS hold (the fixed `truenas` tag) on every CSI
+  # VolumeSnapshot at create so foreign actors — a box-wide periodic-snapshot
+  # task's pruning, an admin, replication retention — cannot destroy it (they hit
+  # EBUSY). The driver's own delete/tombstone/reaper paths release the hold first,
+  # so it never wedges the driver's lifecycle. Default false: no holds are placed
+  # and the rendered config carries no holdCsiSnapshots key (GF2/E1).
+  holdCsiSnapshots: false
+
+  # Controller-wide DEFAULT schedule for driver-managed periodic snapshots
+  # (GF2/E2): a five-field cron string "minute hour dom month dow". Empty (the
+  # default) disables driver-managed periodic snapshots globally. A StorageClass
+  # `snapshotSchedule` parameter overrides this per class. The rendered config
+  # carries no snapshotSchedule key while empty (default render stays identical).
+  snapshotSchedule: ""
+
+  # Controller-wide DEFAULT bounded retention for driver-managed periodic
+  # snapshots (GF2/E2), e.g. "24h", "30d", "2w", "6M", "1y". Empty resolves to a
+  # 30d safety bound. TrueNAS 26.0 retention is time-based only (no count cap).
+  snapshotRetention: ""
+
+  # Promote clone-restored volumes in the background reconcile pass to drop their
+  # origin-snapshot pin once each is the sole dependent of its origin (GF2/E3),
+  # letting the tombstone reaper reclaim the source snapshot and the source volume
+  # become destroyable. Default false: clones keep their origin pin as before and
+  # the rendered config carries no promoteRestoredClones key.
+  promoteRestoredClones: false
+
+  # Report per-volume quota/usage from ControllerGetVolume (GF2/E4): one extra
+  # pool.dataset.query per ControllerGetVolume feeds the volume_used_bytes /
+  # volume_quota_bytes / volume_near_quota metrics and a near-quota
+  # VolumeCondition (abnormal above 95% of the effective quota). Default false:
+  # no extra call and the rendered config carries no reportVolumeUsage key.
+  reportVolumeUsage: false
 
 # NFS configuration
 nfs:

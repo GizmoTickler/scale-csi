@@ -12,6 +12,135 @@ work) and earlier per-release entries are retained below for history. Sections
 after the per-release entries (Breaking change, Helm chart, Release governance)
 are cross-cutting themes that span several of these releases.
 
+## GF-Sprint 2 — Storage-native data protection
+
+Four opt-in features that use TrueNAS-native mechanisms to protect CSI volumes
+and snapshots. Every flag defaults OFF and the default Helm render stays
+byte-identical to v1.4.1; each new chart key ships values + schema +
+removal-only configmap render + a render-assert in the same commit.
+
+- **E1 — Deletion-proof CSI VolumeSnapshots (`zfs.holdCsiSnapshots`).** Places
+  the fixed `truenas` ZFS hold on every CSI VolumeSnapshot at create so foreign
+  actors (a box-wide periodic-task prune, an admin, replication retention) hit
+  EBUSY on destroy. The driver's own destroy paths (DeleteSnapshot,
+  handleSnapshotClones, reapTombstoneSnapshot) release the hold first — gated on
+  driver provenance — so the hold never wedges the driver's lifecycle. Hold
+  failure at create is non-fatal (metered + `SnapshotHoldFailed` event). Metrics:
+  `scale_csi_snapshot_holds_total{operation,status}`.
+- **E2 — Driver-managed periodic snapshots (per-SC `snapshotSchedule`).** The
+  driver owns ONE non-recursive `pool.snapshottask` per scheduled volume dataset
+  with bounded TIME-based retention (`snapshotRetention`, default 30d safety
+  bound; 26.0 has no count cap and `pool.snapshottask.run` is broken, so it is
+  never called). Task-created snapshots carry no CSI props and are treated as
+  driver-created ONLY through a complete chain: the snapshot sits on the
+  volume's own dataset, that dataset carries this instance's local ownership
+  stamp plus a naming schema the driver's own algorithm re-derives byte-for-byte
+  for this volume (`csi-<volume>-<16-hex nonce>-%Y%m%d-%H%M%S`, minted by the
+  driver — there is deliberately no caller-chosen `snapshotNamingSchema`), a
+  driver-minted non-recursive task carrying exactly that schema is observed alive
+  on exactly that dataset, the snapshot's name is a complete CANONICAL rendering
+  of that schema encoding a real calendar instant, and that instant is EXACTLY
+  (±2s clock skew) when the snapshot was created — its `creation` property
+  rendered in the NAS's own civil timezone. That zone is proven, not guessed:
+  the IANA zone in force when the TASK was created is recorded on the volume's
+  own dataset (`truenas-csi:snapshot_task_timezone`, write-once, read only when
+  `source == local`, so a clone/received/detached copy that inherits it proves
+  nothing), and the delete path requires it to still equal the NAS's LIVE
+  `system.general.config` zone. This is what makes the FACT of a timezone
+  reconfiguration detectable even when the civil fields coincide
+  (`America/New_York` -> `America/Toronto`, or a switch to a fixed `-05:00` for a
+  winter-created snapshot). There is no driver-level cache of the live zone; the
+  single cache lives on the API client, is dropped on reconnect, never caches a
+  failure, and has a short (5-minute) TTL. The image embeds `time/tzdata` so
+  zone resolution is identical in-container and in tests. A task is NEVER created
+  when the zone cannot be read, because its snapshots could never afterwards be
+  proven. Snapshots that pass are excluded from the foreign guard and deleted
+  with the volume; anything unprovable stays FOREIGN and is preserved — a
+  missing/inherited zone record, an unreadable live zone
+  (`scale_csi_nas_timezone_unresolved_total`), a stored-vs-live mismatch, or a
+  missing corroborating task all fail CLOSED rather than widening the window.
+  **Documented trust boundary — stated precisely, claiming nothing stronger:**
+  this chain does NOT establish "a snapshot the driver did not create cannot be
+  deleted", and TrueNAS 26.0 makes that unachievable in principle: it can
+  neither stamp a user property on an EXISTING snapshot nor attribute a snapshot
+  to the task that made it, so authorship is unprovable for a foreign snapshot
+  AND for the driver's own. (The alternative posture — treat every unprovable
+  snapshot as foreign — is unusable for exactly that reason: it would wedge the
+  DeleteVolume of every scheduled volume.) The predicate exists only to BLOCK
+  DeleteVolume's recursive destroy when something foreign is present, so the
+  residual is correspondingly narrow and bounded: **a foreign snapshot that
+  matches BOTH the driver-minted per-volume nonce-bearing name AND the creation
+  SECOND that name encodes will not block that destroy.** Constructing one
+  requires reading the schema (available through `pool.snapshottask.query`) and
+  pool-write access on the CSI parent dataset. Storage-administrator access to
+  `zfs.parentDataset` is therefore trusted; everything outside that one case
+  (other tasks, replication, clone-inherited properties, `csi-` prefixed
+  operator snapshots, other volumes' schemas, other driver instances, any name
+  that is off by a second) is provably never destroyed as driver-owned. See
+  `docs/reference/storageclass.md`.
+  Counted in
+  `scale_csi_scheduled_snapshots` (never an orphan/delete candidate). The schema
+  binding — schema AND recorded zone — is stamped BEFORE the task is created, so
+  a task can never outlive its binding, and the orphan reconcile sweeps tasks
+  whose dataset is gone. DeleteVolume records its observation of the live task
+  (`truenas-csi:snapshot_task_corroboration`) and VERIFIES that record with a
+  source-bearing re-read BEFORE destroying the task; if the record does not land
+  the task is deliberately left alive, so a DeleteVolume that fails later can
+  still be retried instead of wedging behind the foreign guard forever.
+  Controller defaults: `zfs.snapshotSchedule` / `zfs.snapshotRetention`. Metrics:
+  `scale_csi_scheduled_snapshot_tasks_ensured_total`,
+  `scale_csi_scheduled_snapshot_task_ensure_failed_total`,
+  `scale_csi_scheduled_snapshot_task_delete_failed_total`,
+  `scale_csi_stranded_snapshot_tasks_reaped_total`,
+  `scale_csi_nas_timezone_unresolved_total`.
+- **E3 — Lazy clone independence (`zfs.promoteRestoredClones`).** A background
+  reconcile step promotes a clone-restored volume (`pool.dataset.promote`) to
+  drop its origin-snapshot pin, letting the tombstone reaper reclaim the source
+  snapshot and the source volume become destroyable. Promote is atomic but it
+  MOVES the origin and every older-or-equal snapshot and re-parents siblings AND
+  the source, so every gate is re-proven under the clone's and source volume's
+  operation locks immediately before the call: a fresh source-bearing dataset
+  read (the reconcile listing carries no property source), the AUTHORITATIVE
+  per-snapshot dependent-clone query (which sees unmanaged clones the managed
+  listing never contained), a refusal if any OTHER live CSI VolumeSnapshot — or
+  any non-CSI snapshot at all — would migrate, and a RE-KEY of every migrating
+  tombstone's ledger entry to its post-promote ID before the promote so
+  provenance follows the snapshot. The migration set is computed from ALL three
+  buckets of the pass's snapshot partition (CSI snapshots, tombstones AND
+  unowned), because ZFS migrates by `createtxg` and not by ownership; the only
+  class allowed to migrate is a tombstone, whose provenance is explicitly
+  re-keyed. That set is also only as trustworthy as the listing it comes from,
+  and the snapshot query returns a bare slice with no total, page token or
+  completeness marker — a truncated result is indistinguishable from a complete
+  one, so "no error" is NOT completeness. Completeness is therefore established
+  POSITIVELY, by corroborating the pass's recursive parent walk against a second
+  authoritative dataset-scoped inventory taken under the lock; the two must
+  agree exactly on membership, and any disagreement, any unobtainable inventory,
+  or any missing `createtxg` REFUSES the promote rather than reasoning from a
+  set that might be short. Metrics:
+  `scale_csi_clones_promoted_total{status}`,
+  `scale_csi_clone_promotes_refused_total{reason}`.
+- **E4 — Quota/usage reporting (`zfs.reportVolumeUsage`).** ControllerGetVolume
+  fetches each volume's quota/usage (one `pool.dataset.query`) and reports a
+  near-quota VolumeCondition (abnormal above 95% of the effective quota). The
+  per-volume gauges are ALSO published from the reconcile pass's existing dataset
+  walk (zero extra API calls), because the shipped external-health-monitor
+  sidecar drives ListVolumes rather than per-PV ControllerGetVolume — without
+  that the `ScaleCSIVolumeNearQuota` alert would essentially never fire. Series
+  are dropped at DeleteVolume and re-derived each pass, so a gauge cannot latch.
+  Metrics: `scale_csi_volume_used_bytes{volume}`,
+  `scale_csi_volume_quota_bytes{volume}`, `scale_csi_volume_near_quota{volume}`,
+  and the `ScaleCSIVolumeNearQuota` alert.
+
+**Lifecycle safety notes.** Snapshot-hold release is fail-safe against
+configuration history: any driver destroy refused with `EBUSY` ("has the
+following holds") releases the hold UNCONDITIONALLY and retries once — including
+the recursive `DeleteVolume` destroy, which first releases the holds on
+driver-proven snapshots beneath the dataset — so turning `zfs.holdCsiSnapshots`
+back off never wedges an already-held snapshot, and the default path still makes
+zero extra calls. `docs/production.md` carries the mass-release rollback runbook.
+Counter: `scale_csi_snapshot_hold_recoveries_total`.
+
 ## v1.4.0 — CHAP, capacity, volume health, clone latency, observability taxonomy
 
 Five sprints of feature and hardening work. No existing config key, volume, or

@@ -434,6 +434,10 @@ type Client struct {
 	versionMu    sync.RWMutex
 	versionCache *SystemInfo
 
+	// NAS civil-timezone cache (timezone.go). Separate from the version cache:
+	// it carries its own TTL and is dropped on reconnect.
+	systemTimezoneCache
+
 	// TrueNAS 26.0 introduced zfs.resource.snapshot.query, which is the only
 	// snapshot read API that still exposes user properties. Keep this detection
 	// separate from the mutation API prefix because create/update/delete remain
@@ -1090,6 +1094,13 @@ func (c *Connection) handleDisconnect(generation uint64, cause error) {
 		return
 	}
 	atomic.CompareAndSwapInt32(&c.connState, int32(stateConnected), int32(stateDisconnected))
+	// Drop the cached NAS civil timezone: the reconnect may land on a different
+	// backend (HA failover) or follow a middleware restart that applied a
+	// configuration change, and a stale zone would misclassify every scheduled
+	// snapshot's ownership (GF2-fix2/B1-a).
+	if c.client != nil {
+		c.client.invalidateSystemTimezone()
+	}
 	c.failPending(generation, cause)
 }
 

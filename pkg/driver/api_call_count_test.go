@@ -162,6 +162,21 @@ func (c *apiCallCountingClient) DatasetHasDependentClones(ctx context.Context, n
 	return c.MockClient.DatasetHasDependentClones(ctx, name)
 }
 
+func (c *apiCallCountingClient) DatasetPromote(ctx context.Context, name string) error {
+	c.record("DatasetPromote")
+	return c.MockClient.DatasetPromote(ctx, name)
+}
+
+func (c *apiCallCountingClient) SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
+	c.record("SnapshotDependentClones")
+	return c.MockClient.SnapshotDependentClones(ctx, snapshotID)
+}
+
+func (c *apiCallCountingClient) DatasetGetQuotaUsage(ctx context.Context, name string) (*truenas.DatasetQuotaUsage, error) {
+	c.record("DatasetGetQuotaUsage")
+	return c.MockClient.DatasetGetQuotaUsage(ctx, name)
+}
+
 func (c *apiCallCountingClient) GetPoolAvailable(ctx context.Context, poolName string) (int64, error) {
 	c.record("GetPoolAvailable")
 	return c.MockClient.GetPoolAvailable(ctx, poolName)
@@ -190,6 +205,21 @@ func (c *apiCallCountingClient) SnapshotDelete(ctx context.Context, snapshotID s
 func (c *apiCallCountingClient) SnapshotRename(ctx context.Context, snapshotID, newName string) error {
 	c.record("SnapshotRename")
 	return c.MockClient.SnapshotRename(ctx, snapshotID, newName)
+}
+
+func (c *apiCallCountingClient) SnapshotHold(ctx context.Context, snapshotID string) error {
+	c.record("SnapshotHold")
+	return c.MockClient.SnapshotHold(ctx, snapshotID)
+}
+
+func (c *apiCallCountingClient) SnapshotRelease(ctx context.Context, snapshotID string) error {
+	c.record("SnapshotRelease")
+	return c.MockClient.SnapshotRelease(ctx, snapshotID)
+}
+
+func (c *apiCallCountingClient) SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, error) {
+	c.record("SnapshotIsHeld")
+	return c.MockClient.SnapshotIsHeld(ctx, snapshotID)
 }
 
 func (c *apiCallCountingClient) SnapshotGet(ctx context.Context, snapshotID string) (*truenas.Snapshot, error) {
@@ -280,6 +310,11 @@ func (c *apiCallCountingClient) ServiceReload(ctx context.Context, service strin
 func (c *apiCallCountingClient) GetSystemInfo(ctx context.Context) (*truenas.SystemInfo, error) {
 	c.record("GetSystemInfo")
 	return c.MockClient.GetSystemInfo(ctx)
+}
+
+func (c *apiCallCountingClient) SystemTimezone(ctx context.Context) (*time.Location, error) {
+	c.record("SystemTimezone")
+	return c.MockClient.SystemTimezone(ctx)
 }
 
 func (c *apiCallCountingClient) CheckNVMeoFSupport(ctx context.Context) error {
@@ -607,6 +642,31 @@ func (c *apiCallCountingClient) ReplicationJobAbort(ctx context.Context, jobID i
 	return c.MockClient.ReplicationJobAbort(ctx, jobID, reason)
 }
 
+func (c *apiCallCountingClient) SnapshotTaskCreate(ctx context.Context, params *truenas.SnapshotTaskCreateParams) (*truenas.SnapshotTask, error) {
+	c.record("SnapshotTaskCreate")
+	return c.MockClient.SnapshotTaskCreate(ctx, params)
+}
+
+func (c *apiCallCountingClient) SnapshotTaskListByDataset(ctx context.Context, dataset string) ([]*truenas.SnapshotTask, error) {
+	c.record("SnapshotTaskListByDataset")
+	return c.MockClient.SnapshotTaskListByDataset(ctx, dataset)
+}
+
+func (c *apiCallCountingClient) SnapshotTaskListByParent(ctx context.Context, parentDataset string) ([]*truenas.SnapshotTask, error) {
+	c.record("SnapshotTaskListByParent")
+	return c.MockClient.SnapshotTaskListByParent(ctx, parentDataset)
+}
+
+func (c *apiCallCountingClient) SnapshotTaskUpdate(ctx context.Context, id int, params *truenas.SnapshotTaskCreateParams) error {
+	c.record("SnapshotTaskUpdate")
+	return c.MockClient.SnapshotTaskUpdate(ctx, id, params)
+}
+
+func (c *apiCallCountingClient) SnapshotTaskDelete(ctx context.Context, id int) error {
+	c.record("SnapshotTaskDelete")
+	return c.MockClient.SnapshotTaskDelete(ctx, id)
+}
+
 var _ truenas.ClientInterface = (*apiCallCountingClient)(nil)
 
 func TestAPICallCountingClientWrapsEveryClientInterfaceMethod(t *testing.T) {
@@ -677,8 +737,19 @@ func newAPICallCountDriver(t *testing.T, client *apiCallCountingClient, protocol
 		return client.ServiceReload(ctx, service)
 	})
 	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	client.resetCalls()
 	return d
 }
+
+// GF2-fix3 TEST-HONESTY NOTE. A warmAPICallCountDriver helper used to live here.
+// It reached into the Driver, populated a nasZone field and reset the counter,
+// on the theory that a running controller has already warmed the NAS timezone.
+// No production code ever set that field at startup — the only warm call
+// happened inside an eligible reconcile sweep — so the goldens UNDERCOUNTED the
+// first scheduled DeleteVolume whenever reconcile was disabled or had not run.
+// A fixture that invents state production never sets does not measure
+// production. The Driver-level cache is gone (GF2-fix3/B1-a) and the goldens
+// below now count the SystemTimezone calls the driver really makes.
 
 func apiCallCountVolumeRequest(name, protocol string) *csi.CreateVolumeRequest {
 	return &csi.CreateVolumeRequest{
@@ -813,6 +884,82 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-iscsi-chap"})
 			require.NoError(t, err)
 		}},
+		// GF2/E4 default: ControllerGetVolume reads the dataset ONCE and derives the
+		// condition from the already-returned user properties. Zero extra calls.
+		{name: "ControllerGetVolume default", want: 1, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("get-vol", "nfs"))
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: "get-vol"})
+			require.NoError(t, err)
+		}},
+		// GF2/E4 with zfs.reportVolumeUsage: exactly ONE extra pool.dataset.query,
+		// pinning the "+1 call" claim that was previously asserted only in prose.
+		{name: "ControllerGetVolume reportVolumeUsage", want: 2, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("get-vol-usage", "nfs"))
+			require.NoError(t, err)
+			d.config.ZFS.ReportVolumeUsage = true
+			client.resetCalls()
+			_, err = d.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: "get-vol-usage"})
+			require.NoError(t, err)
+		}},
+		// GF2/E2 (snapshotSchedule set): the six-call fresh-NFS baseline PLUS four
+		// task calls — DatasetSetUserProperties writing the naming-schema BINDING
+		// FIRST (GF2-fix/H2: no task may exist without durable provenance),
+		// SnapshotTaskListByDataset (ownership probe over every task on the
+		// dataset, not just the first), SnapshotTaskCreate (scoped
+		// recursive:false), and a second DatasetSetUserProperties recording the
+		// resulting task id. The binding write is deliberately NOT folded into the
+		// id write: the whole point is that it lands before the task exists.
+		// A schedule-less volume pays none of these (the default goldens above).
+		//
+		// GF2-fix3 MOVEMENT 10 -> 11: one SystemTimezone. The binding is now
+		// (schema, timezone) — the IANA zone in force when the task is created is
+		// recorded so a later reconfiguration is DETECTABLE (B1-d) — and both keys
+		// go out in the SAME DatasetSetUserProperties, so the only new call is the
+		// system.general.config read. An idempotent retry adds nothing: the zone
+		// record is write-once and a dataset that already carries one is not
+		// re-read.
+		{name: "CreateVolume fresh NFS scheduled", want: 11, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			req := apiCallCountVolumeRequest("fresh-nfs-scheduled", "nfs")
+			req.Parameters["snapshotSchedule"] = "0 0 * * *"
+			req.Parameters["snapshotRetention"] = "30d"
+			_, err := d.CreateVolume(context.Background(), req)
+			require.NoError(t, err)
+		}},
+		// GF2/E2 scheduled delete: the six-call NFS delete baseline PLUS
+		// SnapshotTaskListByDataset + SnapshotTaskDelete + one
+		// DatasetSetUserProperties. The list is the ownership re-proof
+		// (GF2-fix/H2): the driver deletes only the task whose naming schema its
+		// own algorithm re-derives for this volume, so a stamped id that happens to
+		// point at a pre-existing FOREIGN task can never authorize deleting it.
+		// The property write is GF2-fix2/B1-b, recording that this driver saw its
+		// OWN live task here before destroying that evidence, so a RETRY of a
+		// failed delete is not wedged behind the foreign guard.
+		// A schedule-less volume pays NONE of these three — the default DeleteVolume
+		// goldens above are unchanged.
+		//
+		// GF2-fix3 MOVEMENT 9 -> 11, and BOTH increments are corrections of things
+		// round 2 was not paying honestly:
+		//
+		//   +1 SystemTimezone. Round 2's golden was taken against a fixture that
+		//     hand-populated a Driver-level zone cache no production startup path
+		//     ever filled, so the real first scheduled delete always paid this and
+		//     the golden hid it. The Driver cache is gone (B1-a); the driver reads
+		//     the zone here, and truenas.Client serves repeats from a short TTL it
+		//     drops on reconnect.
+		//   +1 DatasetGet. The corroboration record is now VERIFIED with a
+		//     source-bearing re-read before the task is destroyed (B1-e), because
+		//     an assumed write is exactly what wedges a retry forever.
+		{name: "DeleteVolume NFS scheduled", want: 11, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			req := apiCallCountVolumeRequest("delete-nfs-scheduled", "nfs")
+			req.Parameters["snapshotSchedule"] = "0 0 * * *"
+			_, err := d.CreateVolume(context.Background(), req)
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "delete-nfs-scheduled"})
+			require.NoError(t, err)
+		}},
 		// Fresh snapshot creation performs one source lookup, one global-name
 		// lookup, and one atomic create carrying all identity properties.
 		{name: "CreateSnapshot fresh", want: 3, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
@@ -868,6 +1015,75 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			require.NoError(t, client.MockClient.SnapshotClone(context.Background(), snapshotID, "pool/parent/restored"))
 			client.resetCalls()
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
+			require.NoError(t, err)
+		}},
+		// GF2/E1 (zfs.holdCsiSnapshots=true): the fresh-create baseline of three
+		// (source lookup, global-name lookup, atomic create) plus ONE SnapshotHold
+		// placed after the snapshot and its identity exist. The hold is the only
+		// added round trip; a hold failure is non-fatal and not modeled here.
+		{name: "CreateSnapshot fresh with hold", want: 4, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			d.config.ZFS.HoldCSISnapshots = true
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/hold-snapshot-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "hold-snapshot", SourceVolumeId: "hold-snapshot-source"})
+			require.NoError(t, err)
+		}},
+		// GF2/E1 idempotent retry with hold: the retry baseline of two (source
+		// re-read + global-name resolution) plus ONE SnapshotHold from the
+		// idempotent-existing branch (re-holding an already-held snapshot is
+		// idempotent success, so the retry still pays exactly one hold call).
+		{name: "CreateSnapshot idempotent retry with hold", want: 3, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			d.config.ZFS.HoldCSISnapshots = true
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/hold-retry-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			req := &csi.CreateSnapshotRequest{Name: "hold-retry-snapshot", SourceVolumeId: "hold-retry-source"}
+			_, err = d.CreateSnapshot(context.Background(), req)
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.CreateSnapshot(context.Background(), req)
+			require.NoError(t, err)
+		}},
+		// GF2/E1 simple delete with hold: the baseline of two (name resolution +
+		// destroy) plus ONE SnapshotRelease issued strictly BEFORE the destroy so
+		// the held snapshot is unheld first (R1 ordering).
+		{name: "DeleteSnapshot simple with hold", want: 3, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			d.config.ZFS.HoldCSISnapshots = true
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/hold-delete-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			_, err = d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "hold-delete-snapshot", SourceVolumeId: "hold-delete-source"})
+			require.NoError(t, err)
+			client.resetCalls()
+			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "hold-delete-snapshot"})
+			require.NoError(t, err)
+		}},
+		// GF2/E1 clone-backed delete with hold: the eight-call tombstone baseline
+		// plus TWO SnapshotRelease calls — one in DeleteSnapshot before the initial
+		// destroy (R1), and one in handleSnapshotClones before the tombstone's own
+		// deferred destroy (the release-before-destroy guard at BOTH driver destroy
+		// sites). The second release is an idempotent no-op once DeleteSnapshot has
+		// already unheld the snapshot, but it is still one round trip.
+		{name: "DeleteSnapshot with clones with hold", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			d.config.ZFS.HoldCSISnapshots = true
+			_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent", Type: "FILESYSTEM",
+			})
+			require.NoError(t, err)
+			_, err = client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+				Name: "pool/parent/hold-tombstone-source", Type: "FILESYSTEM", Refquota: testGiB,
+			})
+			require.NoError(t, err)
+			created, err := d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "hold-tombstone-snapshot", SourceVolumeId: "hold-tombstone-source"})
+			require.NoError(t, err)
+			snapshotID := "pool/parent/hold-tombstone-source@" + created.GetSnapshot().GetSnapshotId()
+			require.NoError(t, client.MockClient.SnapshotClone(context.Background(), snapshotID, "pool/parent/hold-restored"))
+			client.resetCalls()
+			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "hold-tombstone-snapshot"})
 			require.NoError(t, err)
 		}},
 		// Ten calls (Sprint 3: L2a folded the ownership stamp into the
@@ -985,6 +1201,7 @@ func newFencedAPICallCountDriver(t *testing.T, client *apiCallCountingClient, pr
 		return client.ServiceReload(ctx, service)
 	})
 	t.Cleanup(d.serviceReloadDebouncer.Stop)
+	client.resetCalls()
 	return d
 }
 
@@ -1421,4 +1638,41 @@ func TestCreateVolumeCloneScrubInheritedProtocolProperties(t *testing.T) {
 	assert.False(t, hasInheritedForeign, "only provably inherited foreign-protocol properties are scrubbed")
 	assert.Equal(t, "unknown-source", scrubbed.UserProperties[PropNVMeoFPortSubsysID].Value,
 		"sourceless properties are not provably inherited and must survive")
+}
+
+// TestGF2FeaturesDefaultOffMakeNoNewAPICalls is the sprint-level default-off
+// proof: with all four GF2 flags at their defaults, a full volume + snapshot
+// lifecycle must issue ZERO calls to any method the sprint introduced. It
+// asserts per-method identity rather than a total, so a new call that happens to
+// displace an old one cannot hide inside an unchanged sum.
+func TestGF2FeaturesDefaultOffMakeNoNewAPICalls(t *testing.T) {
+	ctx := context.Background()
+	client := newAPICallCountingClient()
+	d := newAPICallCountDriver(t, client, "nfs")
+
+	require.False(t, d.config.ZFS.HoldCSISnapshots)
+	require.Empty(t, d.config.ZFS.SnapshotSchedule)
+	require.False(t, d.config.ZFS.PromoteRestoredClones)
+	require.False(t, d.config.ZFS.ReportVolumeUsage)
+
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("default-off", "nfs"))
+	require.NoError(t, err)
+	_, err = d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{Name: "default-off-snap", SourceVolumeId: "default-off"})
+	require.NoError(t, err)
+	_, err = d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "default-off"})
+	require.NoError(t, err)
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "default-off-snap"})
+	require.NoError(t, err)
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "default-off"})
+	require.NoError(t, err)
+
+	_, methods := client.callSnapshot()
+	for _, method := range []string{
+		"SnapshotHold", "SnapshotRelease", "SnapshotIsHeld",
+		"SnapshotTaskCreate", "SnapshotTaskListByDataset", "SnapshotTaskListByParent",
+		"SnapshotTaskUpdate", "SnapshotTaskDelete",
+		"DatasetPromote", "SnapshotDependentClones", "DatasetGetQuotaUsage",
+	} {
+		assert.Zero(t, methods[method], "GF2 method %s must not be called on the default path", method)
+	}
 }

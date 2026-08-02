@@ -37,6 +37,9 @@ type ClientInterface interface {
 	DatasetExpand(ctx context.Context, name string, newSize int64) error
 	DatasetExists(ctx context.Context, name string) (bool, error)
 	DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error)
+	SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error)
+	DatasetPromote(ctx context.Context, datasetName string) error
+	DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error)
 	GetPoolAvailable(ctx context.Context, poolName string) (int64, error)
 	WaitForDatasetReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)
 	WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)
@@ -45,6 +48,9 @@ type ClientInterface interface {
 	SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*Snapshot, error)
 	SnapshotDelete(ctx context.Context, snapshotID string, defer_, recursive bool) error
 	SnapshotRename(ctx context.Context, snapshotID, newName string) error
+	SnapshotHold(ctx context.Context, snapshotID string) error
+	SnapshotRelease(ctx context.Context, snapshotID string) error
+	SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, error)
 	SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error)
 	SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error)
 	SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error)
@@ -57,6 +63,13 @@ type ClientInterface interface {
 	SnapshotRollback(ctx context.Context, snapshotID string, force, recursive, recursiveClones bool) error
 	ReplicationJobList(ctx context.Context) ([]*ReplicationJob, error)
 	ReplicationJobAbort(ctx context.Context, jobID int64, reason string) error
+
+	// Snapshot task methods (GF2/E2 driver-managed periodic snapshots)
+	SnapshotTaskCreate(ctx context.Context, params *SnapshotTaskCreateParams) (*SnapshotTask, error)
+	SnapshotTaskListByDataset(ctx context.Context, dataset string) ([]*SnapshotTask, error)
+	SnapshotTaskListByParent(ctx context.Context, parentDataset string) ([]*SnapshotTask, error)
+	SnapshotTaskUpdate(ctx context.Context, id int, params *SnapshotTaskCreateParams) error
+	SnapshotTaskDelete(ctx context.Context, id int) error
 
 	// NFS methods
 	NFSShareCreate(ctx context.Context, params *NFSShareCreateParams) (*NFSShare, error)
@@ -71,6 +84,10 @@ type ClientInterface interface {
 
 	// System information methods
 	GetSystemInfo(ctx context.Context) (*SystemInfo, error)
+	// SystemTimezone returns the NAS's configured IANA civil timezone
+	// (system.general.config -> timezone). Cached with a TTL and dropped on
+	// reconnect, so callers never pay a per-operation round trip.
+	SystemTimezone(ctx context.Context) (*time.Location, error)
 	CheckNVMeoFSupport(ctx context.Context) error
 
 	// iSCSI methods

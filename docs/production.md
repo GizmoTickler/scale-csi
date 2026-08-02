@@ -44,10 +44,99 @@ On role-based TrueNAS releases, the built-in `SHARING_ADMIN` plus
 `REPLICATION_ADMIN` roles cover the dataset/share and snapshot operations used
 by the driver; `FULL_ADMIN` is not required. A custom privilege must cover the
 equivalent dataset create/update/delete, NFS/iSCSI/NVMe sharing, snapshot
-read/create/update/clone/rename/delete, service read/reload, and `system.info`
-operations. Role names and method assignments differ between TrueNAS API
-generations, so confirm a custom privilege against the API documentation served
-by the target appliance. See the TrueNAS [role reference][truenas-rbac].
+read/create/update/clone/rename/delete/hold/release, service read/reload, and
+`system.info` operations. The opt-in GF2 data-protection features exercise a few
+additional methods, each only when its flag is enabled — snapshot hold/release
+for `zfs.holdCsiSnapshots`, `pool.snapshottask.*` (create/query/update/delete)
+for driver-managed periodic snapshots (`zfs.snapshotSchedule` or the per-SC
+`snapshotSchedule` parameter) plus `system.general.config` READ, which is how the
+driver learns the NAS civil timezone those tasks render their snapshot names from
+— without it a scheduled volume's `DeleteVolume` fails closed and refuses — and
+`pool.dataset.promote` for lazy-clone
+independence (`zfs.promoteRestoredClones`). Role names and method assignments
+differ between TrueNAS API generations, so confirm a custom privilege against the
+API documentation served by the target appliance. See the TrueNAS
+[role reference][truenas-rbac].
+
+### Rollback runbook: releasing ZFS holds after disabling `zfs.holdCsiSnapshots`
+
+A ZFS hold is backend state that OUTLIVES the flag that placed it. The driver is
+fail-safe about this on its own paths — every destroy that comes back `EBUSY`
+("has the following holds") releases the hold unconditionally and retries once,
+and the recursive `DeleteVolume` destroy releases the holds on driver-proven
+snapshots beneath the dataset — so simply turning the flag back off does **not**
+wedge the lifecycle, and it costs zero extra API calls when nothing is held.
+
+Two cases still warrant an operator sweep:
+
+1. **Downgrading to a driver older than GF2**, which has no EBUSY recovery at
+   all. Release before the downgrade.
+2. **A persistent release failure** (a privilege that no longer permits
+   `pool.snapshot.release`), visible as a rising
+   `scale_csi_snapshot_holds_total{operation="release",status="error"}`.
+
+Mass-release every hold under the CSI parent from the appliance:
+
+```sh
+# List held snapshots under the CSI parent.
+midclt call pool.snapshot.query \
+  '[["dataset","^","<pool>/<parentDataset>/"]]' \
+  '{"extra": {"holds": true}}' | \
+  jq -r '.[] | select(.holds | length > 0) | .id'
+
+# Release them (review the list first — this strips the hold from every
+# snapshot it names, including any an operator placed deliberately).
+midclt call pool.snapshot.query \
+  '[["dataset","^","<pool>/<parentDataset>/"]]' \
+  '{"extra": {"holds": true}}' | \
+  jq -r '.[] | select(.holds | length > 0) | .id' | \
+  while read -r snap; do midclt call pool.snapshot.release "$snap"; done
+```
+
+`scale_csi_snapshot_hold_recoveries_total` counts destroys that a hold refused
+and an unconditional release recovered; a non-zero value means holds outlived the
+flag that placed them, which is exactly the case this runbook covers.
+
+### Rollback runbook: driver-managed periodic-snapshot tasks
+
+Disabling `zfs.snapshotSchedule` (or removing the per-SC `snapshotSchedule`)
+stops new tasks but leaves existing ones firing — harmlessly, since they are
+non-recursive and time-bounded. `DeleteVolume` still removes the task bound to a
+volume, and the orphan reconcile sweeps tasks whose dataset is gone (deletion
+gated by `reconcile.delete`, and only for tasks whose naming schema the driver's
+own algorithm re-derives — foreign tasks are never touched). To clear them
+manually:
+
+```sh
+midclt call pool.snapshottask.query '[["dataset","^","<pool>/<parentDataset>/"]]' | \
+  jq -r '.[] | select(.naming_schema | test("^csi-.*-[0-9a-f]{16}-%Y%m%d-%H%M%S$")) | .id'
+```
+
+> **Deleting a volume's task by hand makes its own scheduled snapshots FOREIGN.**
+> `DeleteVolume` requires a live driver-minted task on the dataset before it will
+> treat that dataset's unlabeled, schema-named snapshots as its own (the
+> ownership chain in `docs/reference/storageclass.md`). If you clear tasks
+> manually while their volumes still exist, a later PVC deletion returns
+> `FailedPrecondition` naming the leftover snapshots. That is the safe direction:
+> remove the snapshots, or set `zfs.destroyForeignSnapshotsOnDelete: true` for
+> that controller, and the delete proceeds.
+
+> **Changing the NAS timezone makes existing scheduled snapshots FOREIGN.** A
+> task renders its snapshot names from the NAS's civil clock, and the driver
+> proves ownership by converting each snapshot's `creation` property into that
+> same clock and demanding exact agreement. The zone is not inferred from the
+> names: the driver records the IANA zone in force when the task was created
+> (`truenas-csi:snapshot_task_timezone`, on the volume's own dataset) and
+> requires it to still equal the NAS's live `system.general.config` value. So a
+> re-home is detected as a FACT, including the cases where the civil fields
+> happen to be identical (`America/New_York` -> `America/Toronto`, or a switch to
+> a fixed `-05:00` evaluated against a winter-created snapshot). After any such
+> change the affected volumes' scheduled snapshots become foreign and are
+> preserved rather than guessed at — same remedy as above (remove the snapshots,
+> or opt in per controller). Watch `scale_csi_nas_timezone_unresolved_total`: it
+> counts BOTH the live failure (the zone cannot be read at all) and the
+> stored-vs-live mismatch, and while it climbs every affected scheduled volume's
+> delete refuses (it never destroys).
 
 > **Exclude the CSI parent from periodic-snapshot and replication tasks.** The
 > configured `zfs.parentDataset` subtree is exclusive driver territory. A
@@ -261,6 +350,10 @@ backend loss.
   It returns `FailedPrecondition` until those snapshots are removed or the task
   excludes the CSI parent. Setting `zfs.destroyForeignSnapshotsOnDelete: true`
   explicitly permits recursive deletion of the dataset and those snapshots.
+  The opt-in authorizes destroying snapshots the driver has SEEN and classified;
+  it never authorizes a blind destroy. If the snapshot listing itself fails, the
+  delete refuses regardless of the setting, because an error is not evidence of
+  absence.
 - The default `nvmeof.subsystemAllowAnyHost: false` denies unlisted initiator
   NQNs. Populate `nvmeof.subsystemHosts` with each node's NVMe host NQN —
   obtained by running `nvme show-hostnqn` on the node (nvme-cli derives a

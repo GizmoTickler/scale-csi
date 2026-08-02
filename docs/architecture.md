@@ -236,6 +236,35 @@ The driver leverages native ZFS capabilities:
 - **Volume-to-volume clone** (PVC dataSource) is always clone-backed regardless of
   `snapshotRestoreMode`: the driver takes an internal temporary snapshot and
   `zfs clone`s it.
+- **Lazy clone independence (GF2/E3, opt-in `zfs.promoteRestoredClones`)**: a
+  background reconcile step can `pool.dataset.promote` a clone-restored volume to
+  drop its origin-snapshot pin once it is the **sole dependent** of that origin,
+  making the restored volume lifecycle-independent and letting the tombstone
+  reaper reclaim the source snapshot (and the source volume become destroyable).
+  Promote is a single atomic ZFS operation, but it is far from a simple unpin: it
+  MOVES the origin snapshot **and every snapshot older-or-equal to it** onto the
+  promoted clone, re-parents all sibling clones, and re-parents the SOURCE dataset
+  itself onto the promoted one. The step therefore refuses unless every gate
+  holds, all re-proven under the clone's and the source volume's operation locks
+  immediately before the call:
+  - the candidate is re-read with a source-bearing `pool.dataset.query` (the
+    reconcile listing's `zfs.resource.query` projection carries no property
+    source, so the ownership stamp cannot be proven from it);
+  - the authoritative `pool.dataset.query` origin projection shows this clone is
+    the **sole** dependent of the origin snapshot — including unmanaged clones
+    under the CSI parent that the driver's managed-dataset listing never sees;
+  - no OTHER live CSI VolumeSnapshot is in the migrating set. Such a snapshot's
+    backend ID would silently change, so `SnapshotGet` of its recorded ID would
+    404 and `DeleteSnapshot` would report success while it persisted forever;
+  - every migrating tombstone's ledger entry is RE-KEYED to its post-promote ID
+    **before** the promote, so the reaper's provenance follows the snapshot.
+    (Writing the new key first is the crash-safe order: a ledger entry whose
+    snapshot does not exist is what the age-gated ledger sweep retires, whereas a
+    migrated tombstone with no entry would be unreapable forever.)
+
+  Residual, documented limitation: a clone living OUTSIDE the CSI parent subtree
+  is invisible to every TrueNAS 26.0 API (snapshots no longer expose `clones`),
+  so it cannot be counted by the sole-dependent gate.
 
 ## Volume ID Format
 
@@ -283,6 +312,8 @@ mode) is property-backed — see the CHAP properties below.
 | `truenas-csi:tombstone_*` | Deferred-delete tombstone ledger. The property key is a hash of the tombstone snapshot ID; v2 stores the snapshot's `CreateTXG` in the entry as an extra immutable identity predicate (degrading to the v1 full-ID + creation-seconds check when TXG is unavailable). v1 entries remain readable |
 | `truenas-csi:publication_*` | Durable per-volume publication records (see fencing, below) |
 | `truenas-csi:internal_resource` | Marks internal temporary snapshots used by volume-to-volume cloning so they are excluded from `ListSnapshots` (it does **not** mark the `.csi-bookkeeping` dataset — that is identified by its reserved leaf name) |
+| `truenas-csi:snapshot_naming_schema` / `truenas-csi:snapshot_task_id` | The driver-minted strftime naming schema bound to a scheduled volume's periodic-snapshot task, and that task's id (GF2/E2) |
+| `truenas-csi:snapshot_task_corroboration` | Records that this driver instance observed its OWN live, dataset-scoped task carrying that schema, written just before the task is deleted so a RETRIED `DeleteVolume` can still recognize the volume's scheduled snapshots instead of wedging behind the foreign guard |
 
 **Backend share-object backreferences**
 

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -381,6 +382,128 @@ func (c *Client) SnapshotRename(ctx context.Context, snapshotID, newName string)
 	return nil
 }
 
+// The hold tag applied by pool.snapshot.hold is hard-coded to "truenas" on
+// TrueNAS 26.0: the live probe (P1) proved neither pool.snapshot.hold nor
+// zfs.resource.snapshot.hold accepts a custom tag — a hold is a single global
+// boolean per snapshot, so the driver never names a tag and treats a hold as
+// "ours" only after it has provenance-proven the snapshot is a driver CSI
+// snapshot/tombstone (R2).
+
+// SnapshotHold places a deletion-proof hold on a snapshot so foreign actors
+// (box-wide periodic-task pruning, admin, replication retention) hit EBUSY on
+// destroy. It is idempotent: an already-held snapshot (EEXIST/errno 17, surfaced
+// by TrueNAS as a wrapped lzc_hold() failure) is treated as success. The hold is
+// the fixed `truenas` tag; the API accepts no custom tag (P1).
+func (c *Client) SnapshotHold(ctx context.Context, snapshotID string) error {
+	_, err := c.Call(ctx, c.snapshotMethod("hold"), snapshotID)
+	if err == nil || isSnapshotAlreadyHeldError(err) {
+		return nil
+	}
+	return fmt.Errorf("failed to hold snapshot: %w", err)
+}
+
+// SnapshotRelease removes the hold placed by SnapshotHold. It is idempotent:
+// releasing a snapshot that is not held (ENOENT / no-such-hold) is success.
+func (c *Client) SnapshotRelease(ctx context.Context, snapshotID string) error {
+	_, err := c.Call(ctx, c.snapshotMethod("release"), snapshotID)
+	if err == nil || isSnapshotNotHeldError(err) {
+		return nil
+	}
+	return fmt.Errorf("failed to release snapshot: %w", err)
+}
+
+// SnapshotIsHeld reports whether the snapshot carries any hold. It reads the
+// resource path (zfs.resource.snapshot.holds) rather than the extra:{holds}
+// query so it works on the same API generation as destroy/rename. On a backend
+// without the method (pre-26.0) it fails closed to "not held" so a hold-less
+// older backend never blocks the driver's own lifecycle.
+func (c *Client) SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, error) {
+	var holds []string
+	if err := callTyped(ctx, c, &holds, "zfs.resource.snapshot.holds", map[string]interface{}{"path": snapshotID}); err != nil {
+		if isMethodNotFoundError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to query snapshot holds: %w", err)
+	}
+	return len(holds) > 0, nil
+}
+
+// isSnapshotAlreadyHeldError treats the idempotent already-held outcomes as
+// success. TrueNAS reports a re-hold as EEXIST/errno 17, sometimes wrapped as a
+// bare lzc_hold() failure whose only structured signal is the errno; both the
+// errno path and the ZFS wrapper message are accepted.
+func isSnapshotAlreadyHeldError(err error) bool {
+	if err == nil || IsAlreadyExistsError(err) {
+		return true
+	}
+	if errno, ok := APIErrno(err); ok {
+		return errno == syscall.EEXIST
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "lzc_hold") && lzcErrnoMatches(message, 17)
+}
+
+// lzcErrnoTuplePattern matches the errno POSITION of a libzfs_core traceback,
+// e.g. `('lzc_hold() failed', (…, 17))` or `lzc_hold() failed: errno 17`. The
+// errno must sit in a tuple-tail or explicit `errno N` position, so a digit run
+// that merely appears inside the snapshot path can never be mistaken for it —
+// PVC names are UUIDs and routinely contain "17" (e.g. `pvc-17a3…`), which the
+// previous bare substring match would have reported as "already held" for ANY
+// lzc_hold failure on such a snapshot (GF2-fix/F9).
+var lzcErrnoTuplePattern = regexp.MustCompile(`errno\D{0,3}(\d+)|,\s*(\d+)\s*\)`)
+
+// lzcErrnoMatches reports whether an lzc_* traceback message carries exactly
+// the given errno in an errno-shaped position.
+func lzcErrnoMatches(message string, want int) bool {
+	for _, match := range lzcErrnoTuplePattern.FindAllStringSubmatch(message, -1) {
+		for _, group := range match[1:] {
+			if group == "" {
+				continue
+			}
+			if value, err := strconv.Atoi(group); err == nil && value == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsSnapshotHeldError reports whether a destroy failed BECAUSE the snapshot (or
+// one under a recursively destroyed dataset) still carries a ZFS hold. TrueNAS
+// surfaces this as EBUSY with a "has the following holds: truenas" message (P1).
+//
+// This is what makes hold/release fail-safe against configuration history
+// (GF2-fix/H4): holds are backend state that outlives the zfs.holdCsiSnapshots
+// flag, so a driver whose flag was turned back OFF must still be able to destroy
+// its OWN previously-held snapshots. Callers use it to trigger an unconditional
+// release-and-retry — which costs zero extra API calls on the default path,
+// because a deployment that never held anything never sees this error.
+func IsSnapshotHeldError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errno, ok := APIErrno(err); ok && errno == syscall.EBUSY {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "has the following holds")
+}
+
+// isSnapshotNotHeldError treats releasing a non-held snapshot as success: an
+// authoritative ENOENT, or (on releases that surface no errno) a message that
+// names the missing hold.
+func isSnapshotNotHeldError(err error) bool {
+	if err == nil || IsNotFoundError(err) {
+		return true
+	}
+	if _, ok := APIErrno(err); ok {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "hold") &&
+		(strings.Contains(message, "not") || strings.Contains(message, "no such"))
+}
+
 // SnapshotGet retrieves a snapshot by ID (dataset@snapshot format).
 func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot, error) {
 	if c.hasSnapshotResourceQuery(ctx) {
@@ -428,9 +551,16 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 }
 
 // SnapshotList lists snapshots for a dataset.
+//
+// It requests the SAME explicit property projection as every other read path
+// (used + creation) rather than leaving `properties` unset. DeleteVolume's
+// scheduled-snapshot ownership predicate requires the `creation` property and
+// fails CLOSED without it (GF2-fix2/B1-a), so this call must not depend on the
+// server's default projection for a property the driver's safety decision reads.
+// No extra round trip: same call, narrower payload.
 func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
 	if c.hasSnapshotResourceQuery(ctx) {
-		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, nil)
+		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, []string{"used", "creation"})
 		if err != nil {
 			return nil, fmt.Errorf("failed to list snapshots: %w", err)
 		}

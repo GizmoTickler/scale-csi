@@ -301,6 +301,152 @@ var (
 		[]string{"path"},
 	)
 
+	// snapshotHoldsTotal counts deletion-proof snapshot hold operations (GF2/E1),
+	// labeled by operation (hold, release) and outcome (success, error). A hold
+	// error is non-fatal to the CSI operation (the snapshot still becomes/stays
+	// ReadyToUse and degrades to pre-GF2 behavior), so the error series is the
+	// signal that a snapshot fell back to unprotected.
+	snapshotHoldsTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "snapshot_holds_total",
+			Help:      "Total snapshot hold/release operations, by operation and outcome",
+		},
+		[]string{"operation", "status"},
+	)
+
+	// scheduledSnapshots counts driver-managed periodic snapshots observed during
+	// the reconcile pass (GF2/E2). These snapshots carry no CSI props (P2) and are
+	// recognized by their task naming-schema prefix; they are reported for
+	// visibility only and are NEVER an orphan/delete candidate (R4).
+	scheduledSnapshots = regGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshots",
+			Help:      "Number of driver-managed periodic snapshots observed under scheduled volumes (metrics only; never a delete candidate)",
+		},
+	)
+
+	// scheduledSnapshotTasksEnsuredTotal counts successful create-or-adopt of a
+	// driver-owned periodic-snapshot task at CreateVolume (GF2/E2).
+	scheduledSnapshotTasksEnsuredTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshot_tasks_ensured_total",
+			Help:      "Total driver-managed periodic-snapshot tasks created or adopted at CreateVolume",
+		},
+	)
+
+	// scheduledSnapshotTaskEnsureFailedTotal counts CreateVolume calls whose
+	// periodic-snapshot task could not be ensured (GF2/E2). The volume still
+	// provisions; this is the signal that a volume runs without automatic PITR.
+	scheduledSnapshotTaskEnsureFailedTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshot_task_ensure_failed_total",
+			Help:      "Total CreateVolume calls whose driver-managed periodic-snapshot task failed to ensure (volume provisioned without PITR)",
+		},
+	)
+
+	// scheduledSnapshotTaskDeleteFailedTotal counts DeleteVolume calls whose
+	// driver-owned periodic-snapshot task could not be removed (GF2-fix/H2). The
+	// volume delete proceeds regardless — a task must never wedge a delete — so
+	// this is the operator's signal that the stranded-task sweep has work to do.
+	scheduledSnapshotTaskDeleteFailedTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshot_task_delete_failed_total",
+			Help:      "Total DeleteVolume calls whose driver-managed periodic-snapshot task could not be deleted (delete proceeded anyway)",
+		},
+	)
+
+	// nasTimezoneUnresolvedTotal counts failures to read the NAS's civil timezone
+	// (system.general.config -> timezone). While this is failing, driver-scheduled
+	// snapshots cannot be proven and are PRESERVED as foreign, so a scheduled
+	// volume's DeleteVolume returns FailedPrecondition — the fail-closed
+	// direction, and a condition an operator needs to see (GF2-fix2/B1-a).
+	nasTimezoneUnresolvedTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "nas_timezone_unresolved_total",
+			Help:      "Total failures to resolve the NAS civil timezone; while non-zero, driver-scheduled snapshots are unprovable and preserved as foreign",
+		},
+	)
+
+	// strandedSnapshotTasksReapedTotal counts periodic-snapshot tasks the orphan
+	// reconcile reclaimed because their volume dataset no longer exists.
+	strandedSnapshotTasksReapedTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "stranded_snapshot_tasks_reaped_total",
+			Help:      "Total stranded driver-managed periodic-snapshot tasks deleted by the orphan reconcile",
+		},
+	)
+
+	// snapshotHoldRecoveriesTotal counts destroys that were refused by a ZFS hold
+	// and recovered by an UNCONDITIONAL release + retry (GF2-fix/H4). A non-zero
+	// value means holds outlived the flag that placed them — the rollback case.
+	snapshotHoldRecoveriesTotal = regCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "snapshot_hold_recoveries_total",
+			Help:      "Total driver destroys refused by a ZFS hold and recovered by an unconditional release",
+		},
+	)
+
+	// clonePromotesRefusedTotal counts promote candidates the eligibility gates
+	// refused, by reason (GF2-fix/H1, H3).
+	clonePromotesRefusedTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "clone_promotes_refused_total",
+			Help:      "Total clone-promote candidates refused by an eligibility gate, by reason",
+		},
+		[]string{"reason"},
+	)
+
+	// clonesPromotedTotal counts background promote operations (GF2/E3) by
+	// outcome. A promote releases a clone-restored volume's origin-snapshot pin so
+	// the tombstone reaper can reclaim the source snapshot.
+	clonesPromotedTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "clones_promoted_total",
+			Help:      "Total clone-restored volumes promoted to release their origin-snapshot pin, by outcome",
+		},
+		[]string{"status"},
+	)
+
+	// Per-volume quota/usage gauges (GF2/E4), populated by ControllerGetVolume
+	// only when zfs.reportVolumeUsage is set. Cardinality is one series per volume
+	// observed; the near-quota gauge is the alert source (ScaleCSIVolumeNearQuota).
+	volumeUsedBytes = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "volume_used_bytes",
+			Help:      "Reported used bytes per volume from the most recent ControllerGetVolume usage read",
+		},
+		[]string{"volume"},
+	)
+
+	volumeQuotaBytes = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "volume_quota_bytes",
+			Help:      "Effective quota bytes per volume (refquota if set, else quota; 0 = unlimited)",
+		},
+		[]string{"volume"},
+	)
+
+	volumeNearQuota = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "volume_near_quota",
+			Help:      "1 when a volume's used bytes exceed 95% of its effective quota, else 0",
+		},
+		[]string{"volume"},
+	)
+
 	// Pool-capacity gauges (E4). Populated only when capacity.gaugeEnabled by a
 	// controller-only poll loop; cardinality is fixed at one series per gauge for
 	// this single-backend driver, labeled {pool,dataset}. pool_capacity_bytes is
@@ -476,6 +622,13 @@ func init() {
 	}
 	tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathLedger).Add(0)
 	tombstoneReapedTotal.WithLabelValues(tombstoneReapedPathScanFallback).Add(0)
+	for _, op := range []string{snapshotHoldOpHold, snapshotHoldOpRelease} {
+		snapshotHoldsTotal.WithLabelValues(op, "success").Add(0)
+		snapshotHoldsTotal.WithLabelValues(op, "error").Add(0)
+	}
+	clonesPromotedTotal.WithLabelValues("success").Add(0)
+	clonesPromotedTotal.WithLabelValues("error").Add(0)
+	clonePromotesRefusedTotal.WithLabelValues("live_csi_snapshot_would_migrate").Add(0)
 }
 
 // RecordCSIOperation records metrics for a CSI operation
@@ -592,6 +745,127 @@ func RecordTombstoneReaped(path string) {
 	tombstoneReapedTotal.WithLabelValues(path).Inc()
 }
 
+// Snapshot hold operation labels for snapshotHoldsTotal (GF2/E1).
+const (
+	snapshotHoldOpHold    = "hold"
+	snapshotHoldOpRelease = "release"
+)
+
+// RecordSnapshotHold counts a snapshot hold or release operation and its
+// outcome. operation is snapshotHoldOpHold or snapshotHoldOpRelease.
+func RecordSnapshotHold(operation string, err error) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	snapshotHoldsTotal.WithLabelValues(operation, status).Inc()
+}
+
+// RecordScheduledSnapshotTaskEnsured counts a successful create-or-adopt of a
+// driver-owned periodic-snapshot task at CreateVolume (GF2/E2).
+func RecordScheduledSnapshotTaskEnsured() {
+	scheduledSnapshotTasksEnsuredTotal.Inc()
+}
+
+// RecordScheduledSnapshotTaskEnsureFailed counts a CreateVolume whose
+// periodic-snapshot task could not be ensured (GF2/E2).
+func RecordScheduledSnapshotTaskEnsureFailed() {
+	scheduledSnapshotTaskEnsureFailedTotal.Inc()
+}
+
+// RecordNASTimezoneUnresolved counts a failure to read the NAS civil timezone
+// (GF2-fix2/B1-a). While this is incrementing, scheduled snapshots are
+// unprovable and therefore preserved.
+func RecordNASTimezoneUnresolved() {
+	nasTimezoneUnresolvedTotal.Inc()
+}
+
+// RecordScheduledSnapshotTaskDeleteFailed counts a DeleteVolume whose
+// periodic-snapshot task could not be removed (GF2-fix/H2).
+func RecordScheduledSnapshotTaskDeleteFailed() {
+	scheduledSnapshotTaskDeleteFailedTotal.Inc()
+}
+
+// RecordStrandedSnapshotTaskReaped counts a stranded periodic-snapshot task the
+// orphan reconcile reclaimed (GF2-fix/H2).
+func RecordStrandedSnapshotTaskReaped() {
+	strandedSnapshotTasksReapedTotal.Inc()
+}
+
+// RecordSnapshotHoldRecovery counts a destroy that a ZFS hold refused and an
+// unconditional release recovered (GF2-fix/H4).
+func RecordSnapshotHoldRecovery() {
+	snapshotHoldRecoveriesTotal.Inc()
+}
+
+// RecordClonePromoteRefused counts a promote candidate an eligibility gate
+// refused (GF2-fix/H1, H3).
+func RecordClonePromoteRefused(reason string) {
+	clonePromotesRefusedTotal.WithLabelValues(reason).Inc()
+}
+
+// RecordClonePromoted counts a background promote operation and its outcome
+// (GF2/E3).
+func RecordClonePromoted(err error) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	clonesPromotedTotal.WithLabelValues(status).Inc()
+}
+
+// effectiveQuotaBytes returns a volume's binding quota: refquota when set,
+// otherwise quota; 0 means unlimited (GF2/E4).
+func effectiveQuotaBytes(usage *truenas.DatasetQuotaUsage) int64 {
+	if usage.Refquota > 0 {
+		return usage.Refquota
+	}
+	return usage.Quota
+}
+
+// volumeUsageNearQuota reports whether used bytes exceed 95% of the effective
+// quota. An unlimited volume (no quota) is never near quota. The comparison is
+// integer-scaled (used*100 > quota*95) to avoid floating-point edge cases.
+func volumeUsageNearQuota(usage *truenas.DatasetQuotaUsage) bool {
+	quota := effectiveQuotaBytes(usage)
+	if quota <= 0 {
+		return false
+	}
+	return usage.Used*100 > quota*95
+}
+
+// RecordVolumeUsage publishes the per-volume quota/usage gauges (GF2/E4).
+func RecordVolumeUsage(volumeID string, usage *truenas.DatasetQuotaUsage) {
+	volumeUsedBytes.WithLabelValues(volumeID).Set(float64(usage.Used))
+	volumeQuotaBytes.WithLabelValues(volumeID).Set(float64(effectiveQuotaBytes(usage)))
+	near := 0.0
+	if volumeUsageNearQuota(usage) {
+		near = 1.0
+	}
+	volumeNearQuota.WithLabelValues(volumeID).Set(near)
+}
+
+// DeleteVolumeUsageMetrics drops a volume's per-volume usage series (GF2-fix/F6).
+// Without this the gauges LATCH: a volume observed once at 96% kept
+// near_quota=1 forever — a permanently firing alert plus unbounded label
+// cardinality over the cluster's lifetime, because nothing ever re-observed a
+// deleted volume.
+func DeleteVolumeUsageMetrics(volumeID string) {
+	volumeUsedBytes.DeleteLabelValues(volumeID)
+	volumeQuotaBytes.DeleteLabelValues(volumeID)
+	volumeNearQuota.DeleteLabelValues(volumeID)
+}
+
+// ResetVolumeUsageMetrics clears every per-volume usage series. The reconcile
+// pass calls it before republishing from its own dataset walk, so a volume that
+// has disappeared (or whose usage fell back below the threshold) cannot leave a
+// stale latched series behind.
+func ResetVolumeUsageMetrics() {
+	volumeUsedBytes.Reset()
+	volumeQuotaBytes.Reset()
+	volumeNearQuota.Reset()
+}
+
 // SetOrphanReconcileMetrics publishes the latest detection report, including a
 // partial report from a failed pass so gauges never silently freeze.
 func SetOrphanReconcileMetrics(report ReconcileReport) {
@@ -604,6 +878,7 @@ func SetOrphanReconcileMetrics(report ReconcileReport) {
 	tombstoneSnapshotsBytes.Set(float64(report.TombstoneSnapshotBytes))
 	remnantVolumes.Set(float64(report.RemnantVolumeCount))
 	manualRecoveryTombstones.Set(float64(report.ManualRecoveryTombstoneCount))
+	scheduledSnapshots.Set(float64(report.ScheduledSnapshotCount))
 }
 
 func RecordReconcileSuccess(at time.Time) {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,13 +41,45 @@ type MockClient struct {
 	ISCSIAuths                 map[int]*ISCSIAuth
 	PoolAvailable              int64
 	ReplicationJobs            map[int64]*ReplicationJob
+	SnapshotTasks              map[int]*SnapshotTask
+	SnapshotTaskDeleteCalls    []int
+	nextSnapshotTaskID         int
 	deferredSnapshots          map[string]struct{}
 	DatasetDeleteCalls         []DatasetDeleteCall
+	DatasetPromoteCalls        []string
 	ReplicationJobAbortCalls   []int64
 	ReplicationJobAbortReasons []string
 	SnapshotSetCalls           int
 	SnapshotRemoveCalls        int
+	SnapshotHoldCalls          int
+	SnapshotReleaseCalls       int
+	snapshotHolds              map[string]struct{}
+	nextSnapshotCreateTXG      uint64
 	nextReplicationJobID       int64
+
+	// FailUserPropertyKeys makes DatasetSetUserProperties fail for these exact
+	// property keys (test hook for binding-write failures).
+	FailUserPropertyKeys map[string]struct{}
+
+	// FailDatasetDelete makes DatasetDelete fail for these exact dataset names
+	// with a non-dependency backend error, so a test can model a DeleteVolume
+	// that fails AFTER its earlier best-effort cleanup steps already ran and must
+	// then be retried.
+	FailDatasetDelete map[string]struct{}
+
+	// FailSnapshotListAfter makes SnapshotList succeed for this many calls and
+	// fail on every call after that; 0 never fails and a NEGATIVE value fails
+	// every call. It models the DeleteVolume sequence where the up-front snapshot
+	// guard reads a good list and the backend then stops answering (the only way
+	// to reach the post-destroy "snapshot state cannot be verified" branch), and
+	// the promote path's unobtainable corroborating inventory.
+	FailSnapshotListAfter int
+	snapshotListCalls     int
+
+	// SystemTimezoneName is the IANA zone SystemTimezone reports (default UTC).
+	// SystemTimezoneErr makes it unreadable, for the fail-closed path.
+	SystemTimezoneName string
+	SystemTimezoneErr  error
 
 	// Error injection
 	InjectError error
@@ -92,6 +126,8 @@ func NewMockClient() *MockClient {
 		NVMeSubsystems:     make(map[int]*NVMeoFSubsystem),
 		NVMeNamespaces:     make(map[int]*NVMeoFNamespace),
 		ReplicationJobs:    make(map[int64]*ReplicationJob),
+		SnapshotTasks:      make(map[int]*SnapshotTask),
+		nextSnapshotTaskID: 1,
 		// Default portal/initiator fixtures cover the portal addresses used
 		// across the test suites so target-group auto-resolution succeeds
 		// without per-test setup. Tests may replace these maps.
@@ -106,6 +142,7 @@ func NewMockClient() *MockClient {
 			1: {ID: 1, Initiators: nil, Comment: "allow-all (mock)"},
 		},
 		deferredSnapshots:    make(map[string]struct{}),
+		snapshotHolds:        make(map[string]struct{}),
 		PoolAvailable:        100 * 1024 * 1024 * 1024, // 100 GiB default
 		nextReplicationJobID: 1,
 	}
@@ -401,6 +438,9 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 	if m.InjectError != nil {
 		return m.InjectError
 	}
+	if _, fail := m.FailDatasetDelete[name]; fail {
+		return &APIError{Code: -1, Message: "injected dataset delete failure"}
+	}
 	originPrefix := name + "@"
 	for _, dataset := range m.Datasets {
 		if strings.HasPrefix(datasetPropertyString(dataset.Origin), originPrefix) {
@@ -411,6 +451,23 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 		for _, snapshot := range m.Snapshots {
 			if snapshot.Dataset == name {
 				return &APIError{Code: -1, Message: "dataset has snapshots"}
+			}
+		}
+	}
+	// A recursive destroy cannot remove a HELD snapshot: ZFS returns EBUSY for
+	// the whole operation (P1). Modeling this is what makes the DeleteVolume
+	// held-tombstone recovery path testable — the previous mock silently deleted
+	// held snapshots and hid the wedge entirely (GF2-fix/H4).
+	if recursive {
+		for snapshotID, snapshot := range m.Snapshots {
+			if snapshot.Dataset != name {
+				continue
+			}
+			if _, held := m.snapshotHolds[snapshotID]; held {
+				return &APIError{
+					Code:    int(syscall.EBUSY),
+					Message: fmt.Sprintf("'%s' has the following holds: truenas", snapshotID),
+				}
 			}
 		}
 	}
@@ -587,6 +644,118 @@ func (m *MockClient) DatasetHasDependentClones(ctx context.Context, datasetName 
 	return false, nil
 }
 
+// DatasetPromote models pool.dataset.promote with FULL live fidelity (P3):
+//
+//   - the promoted clone becomes independent (its origin is cleared);
+//   - EVERY snapshot of the source dataset older-or-equal to the origin
+//     (createtxg <= the origin's) MIGRATES onto the promoted clone — not just
+//     the origin. Real ZFS moves the whole older-or-equal set, which is exactly
+//     how an unrelated LIVE CSI VolumeSnapshot silently changes backend ID
+//     (GF2-fix/H1). The previous mock migrated only the origin, so no test could
+//     observe that class of defect;
+//   - the SOURCE dataset itself is re-parented onto the migrated origin (the
+//     live-probed dependency inversion), as is every sibling clone;
+//   - holds and deferred markers travel with each migrated snapshot (P1).
+func (m *MockClient) DatasetPromote(ctx context.Context, datasetName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	ds, ok := m.Datasets[datasetName]
+	if !ok {
+		return notFoundAPIError("dataset not found")
+	}
+	origin := datasetPropertyString(ds.Origin)
+	if origin == "" {
+		return &APIError{Code: -1, Message: "dataset is not a clone; nothing to promote"}
+	}
+	m.DatasetPromoteCalls = append(m.DatasetPromoteCalls, datasetName)
+
+	sourceDataset, originSnapName, _ := strings.Cut(origin, "@")
+	migratedID := datasetName + "@" + originSnapName
+
+	originTXG := uint64(0)
+	if snap, ok := m.Snapshots[origin]; ok {
+		originTXG = snap.CreateTXG
+	}
+
+	for id, snap := range m.Snapshots {
+		if snap.Dataset != sourceDataset {
+			continue
+		}
+		olderOrEqual := snap.CreateTXG != 0 && originTXG != 0 && snap.CreateTXG <= originTXG
+		if id != origin && !olderOrEqual {
+			continue
+		}
+		newID := datasetName + "@" + snap.Name
+		delete(m.Snapshots, id)
+		snap.Dataset = datasetName
+		snap.ID = newID
+		m.Snapshots[newID] = snap
+		if _, held := m.snapshotHolds[id]; held {
+			delete(m.snapshotHolds, id)
+			m.snapshotHolds[newID] = struct{}{}
+		}
+		if _, deferred := m.deferredSnapshots[id]; deferred {
+			delete(m.deferredSnapshots, id)
+			m.deferredSnapshots[newID] = struct{}{}
+		}
+	}
+
+	// Re-parent sibling clones onto the migrated origin.
+	for _, other := range m.Datasets {
+		if datasetPropertyString(other.Origin) == origin {
+			other.Origin = DatasetProperty{Value: migratedID, Parsed: migratedID, Rawvalue: migratedID, Source: "LOCAL"}
+		}
+	}
+	// The SOURCE itself becomes a clone of the promoted dataset (P3 inversion).
+	if source, ok := m.Datasets[sourceDataset]; ok && source != ds {
+		source.Origin = DatasetProperty{Value: migratedID, Parsed: migratedID, Rawvalue: migratedID, Source: "LOCAL"}
+	}
+	ds.Origin = DatasetProperty{}
+	return nil
+}
+
+// SnapshotDependentClones mirrors the real client's authoritative per-snapshot
+// dependent-clone query: it walks ALL datasets, not only driver-managed ones,
+// so a test can seed an unmanaged sibling clone and see it counted.
+func (m *MockClient) SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	var clones []string
+	for name, dataset := range m.Datasets {
+		if datasetPropertyString(dataset.Origin) == snapshotID {
+			clones = append(clones, name)
+		}
+	}
+	sort.Strings(clones)
+	return clones, nil
+}
+
+func (m *MockClient) DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	ds, ok := m.Datasets[datasetName]
+	if !ok {
+		return nil, notFoundAPIError("dataset not found")
+	}
+	return &DatasetQuotaUsage{
+		Used:      datasetPropertyInt64(ds.Used),
+		Quota:     datasetPropertyInt64(ds.Quota),
+		Refquota:  datasetPropertyInt64(ds.Refquota),
+		Available: datasetPropertyInt64(ds.Available),
+	}, nil
+}
+
 func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	return m.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
 }
@@ -606,6 +775,14 @@ func (m *MockClient) DatasetSetUserProperties(ctx context.Context, name string, 
 	m.setUserPropertiesCalls++
 	if m.InjectError != nil {
 		return m.InjectError
+	}
+	// FailUserPropertyKeys lets a test reproduce a partial/failed binding write
+	// for a specific property, which is how the create-then-stamp orderings that
+	// strand backend objects are exercised.
+	for key := range properties {
+		if _, fail := m.FailUserPropertyKeys[key]; fail {
+			return &APIError{Code: -1, Message: "injected user-property write failure for " + key}
+		}
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {
@@ -693,10 +870,16 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 		return nil, m.InjectError
 	}
 	id := fmt.Sprintf("%s@%s", dataset, name)
+	// Model ZFS's monotonic, never-reused creation transaction group. Promote's
+	// "migrate every snapshot older-or-equal to the origin" semantics are defined
+	// in terms of createtxg, so the mock must issue one per snapshot or that
+	// behavior cannot be modeled faithfully (GF2-fix/H1).
+	m.nextSnapshotCreateTXG++
 	snap := &Snapshot{
-		ID:      id,
-		Name:    name,
-		Dataset: dataset,
+		ID:        id,
+		Name:      name,
+		Dataset:   dataset,
+		CreateTXG: m.nextSnapshotCreateTXG,
 		Properties: map[string]interface{}{
 			"creation": map[string]interface{}{"parsed": float64(time.Now().Unix())},
 		},
@@ -734,6 +917,11 @@ func (m *MockClient) SnapshotDelete(ctx context.Context, snapshotID string, defe
 	}
 	if _, ok := m.Snapshots[snapshotID]; !ok {
 		return nil
+	}
+	// A held snapshot cannot be destroyed (P1): model the EBUSY a foreign actor
+	// hits so tests can prove a hold blocks deletion until the driver releases it.
+	if _, held := m.snapshotHolds[snapshotID]; held {
+		return &APIError{Code: int(syscall.EBUSY), Message: fmt.Sprintf("'%s' has the following holds: truenas", snapshotID)}
 	}
 	clones := m.snapshotClonesLocked(snapshotID)
 	if len(clones) > 0 {
@@ -783,6 +971,240 @@ func (m *MockClient) SnapshotRename(ctx context.Context, snapshotID, newName str
 			dataset.Origin = DatasetProperty{Value: newSnapshotID, Parsed: newSnapshotID, Rawvalue: newSnapshotID, Source: "LOCAL"}
 		}
 	}
+	// A hold survives the rename (P1): carry it onto the tombstone ID so the
+	// reaper interaction (release-before-reap) is exercisable.
+	if _, held := m.snapshotHolds[snapshotID]; held {
+		delete(m.snapshotHolds, snapshotID)
+		m.snapshotHolds[newSnapshotID] = struct{}{}
+	}
+	return nil
+}
+
+func (m *MockClient) SnapshotHold(ctx context.Context, snapshotID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SnapshotHoldCalls++
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	if _, ok := m.Snapshots[snapshotID]; !ok {
+		return notFoundAPIError("snapshot not found")
+	}
+	// Re-holding an already-held snapshot is idempotent success (P1: EEXIST/17).
+	m.snapshotHolds[snapshotID] = struct{}{}
+	return nil
+}
+
+func (m *MockClient) SnapshotRelease(ctx context.Context, snapshotID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SnapshotReleaseCalls++
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	// Releasing a non-held (or absent) snapshot is idempotent success.
+	delete(m.snapshotHolds, snapshotID)
+	return nil
+}
+
+func (m *MockClient) SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return false, m.InjectError
+	}
+	_, held := m.snapshotHolds[snapshotID]
+	return held, nil
+}
+
+func (m *MockClient) SnapshotTaskCreate(ctx context.Context, params *SnapshotTaskCreateParams) (*SnapshotTask, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	task := &SnapshotTask{
+		ID:            m.nextSnapshotTaskID,
+		Dataset:       params.Dataset,
+		Recursive:     params.Recursive,
+		NamingSchema:  params.NamingSchema,
+		Schedule:      params.Schedule,
+		LifetimeValue: params.LifetimeValue,
+		LifetimeUnit:  params.LifetimeUnit,
+		Enabled:       params.Enabled,
+		AllowEmpty:    params.AllowEmpty,
+	}
+	m.SnapshotTasks[task.ID] = task
+	m.nextSnapshotTaskID++
+	return task, nil
+}
+
+// FireSnapshotTasks models the TrueNAS middleware taking the snapshots its
+// enabled periodic-snapshot tasks are due for, at wall-clock instant `at` in
+// `zone` (the NAS's local timezone — pass nil for UTC).
+//
+// It exists so a test can obtain a task-created snapshot the way production
+// obtains one, instead of hand-writing a name with the driver's own rendering
+// helper and then asserting the driver accepts it (which asserts nothing). The
+// strftime expansion here is the MOCK's own, deliberately independent of
+// pkg/driver's schema algorithm: if the driver's rendering and its verification
+// ever drift apart, this is what notices.
+//
+// It also models the split the driver cannot see through: the NAME is rendered
+// from LOCAL civil time while the `creation` property is UTC epoch seconds.
+func (m *MockClient) FireSnapshotTasks(ctx context.Context, at time.Time, zone *time.Location) ([]*Snapshot, error) {
+	if zone == nil {
+		zone = time.UTC
+	}
+	m.mu.RLock()
+	due := make([]*SnapshotTask, 0, len(m.SnapshotTasks))
+	for _, task := range m.SnapshotTasks {
+		if task != nil && task.Enabled {
+			due = append(due, task)
+		}
+	}
+	m.mu.RUnlock()
+	sort.Slice(due, func(i, j int) bool { return due[i].ID < due[j].ID })
+
+	created := make([]*Snapshot, 0, len(due))
+	for _, task := range due {
+		name := expandStrftimeNamingSchema(task.NamingSchema, at.In(zone))
+		snap, err := m.SnapshotCreate(ctx, task.Dataset, name, nil)
+		if err != nil {
+			return created, err
+		}
+		m.SetSnapshotCreationTime(snap.ID, at.Unix())
+		created = append(created, snap)
+	}
+	return created, nil
+}
+
+// expandStrftimeNamingSchema expands the strftime directives TrueNAS supports in
+// a periodic-snapshot task naming schema. Written from the strftime spec rather
+// than from the driver's schema constants on purpose (see FireSnapshotTasks).
+func expandStrftimeNamingSchema(schema string, at time.Time) string {
+	replacements := []struct{ directive, layout string }{
+		{"%Y", "2006"},
+		{"%m", "01"},
+		{"%d", "02"},
+		{"%H", "15"},
+		{"%M", "04"},
+		{"%S", "05"},
+	}
+	var out strings.Builder
+	for i := 0; i < len(schema); {
+		if schema[i] == '%' && i+1 < len(schema) {
+			directive := schema[i : i+2]
+			expanded := false
+			for _, r := range replacements {
+				if directive == r.directive {
+					out.WriteString(at.Format(r.layout))
+					expanded = true
+					break
+				}
+			}
+			if expanded {
+				i += 2
+				continue
+			}
+		}
+		out.WriteByte(schema[i])
+		i++
+	}
+	return out.String()
+}
+
+// SetSnapshotCreationTime is a test helper that sets a snapshot's `creation`
+// property to a specific UTC epoch second, in the exact wire shape TrueNAS 26.0
+// returns from zfs.resource.snapshot.query (see
+// pkg/truenas/testdata/snapshot-resource-26.0.json).
+func (m *MockClient) SetSnapshotCreationTime(snapshotID string, creationUnix int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snap, ok := m.Snapshots[snapshotID]
+	if !ok {
+		return
+	}
+	if snap.Properties == nil {
+		snap.Properties = make(map[string]interface{})
+	}
+	snap.Properties["creation"] = map[string]interface{}{
+		"value": float64(creationUnix),
+		"raw":   strconv.FormatInt(creationUnix, 10),
+	}
+}
+
+func (m *MockClient) SnapshotTaskListByDataset(ctx context.Context, dataset string) ([]*SnapshotTask, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	var tasks []*SnapshotTask
+	for _, task := range m.SnapshotTasks {
+		if task.Dataset == dataset {
+			tasks = append(tasks, task)
+		}
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
+	return tasks, nil
+}
+
+func (m *MockClient) SnapshotTaskListByParent(ctx context.Context, parentDataset string) ([]*SnapshotTask, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	prefix := strings.TrimSuffix(parentDataset, "/") + "/"
+	var tasks []*SnapshotTask
+	for _, task := range m.SnapshotTasks {
+		if strings.HasPrefix(task.Dataset, prefix) {
+			tasks = append(tasks, task)
+		}
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
+	return tasks, nil
+}
+
+func (m *MockClient) SnapshotTaskUpdate(ctx context.Context, id int, params *SnapshotTaskCreateParams) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	task, ok := m.SnapshotTasks[id]
+	if !ok {
+		return notFoundAPIError("snapshot task not found")
+	}
+	task.Dataset = params.Dataset
+	task.Recursive = params.Recursive
+	task.NamingSchema = params.NamingSchema
+	task.Schedule = params.Schedule
+	task.LifetimeValue = params.LifetimeValue
+	task.LifetimeUnit = params.LifetimeUnit
+	task.Enabled = params.Enabled
+	task.AllowEmpty = params.AllowEmpty
+	return nil
+}
+
+func (m *MockClient) SnapshotTaskDelete(ctx context.Context, id int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	m.SnapshotTaskDeleteCalls = append(m.SnapshotTaskDeleteCalls, id)
+	delete(m.SnapshotTasks, id)
 	return nil
 }
 
@@ -800,8 +1222,13 @@ func (m *MockClient) SnapshotGet(ctx context.Context, snapshotID string) (*Snaps
 }
 
 func (m *MockClient) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.snapshotListCalls++
+	if m.FailSnapshotListAfter != 0 && m.snapshotListCalls > m.FailSnapshotListAfter {
+		return nil, &APIError{Code: -1, Message: "injected snapshot list failure"}
+	}
 
 	var list []*Snapshot
 	for _, snap := range m.Snapshots {
@@ -1121,6 +1548,26 @@ func (m *MockClient) GetSystemInfo(ctx context.Context) (*SystemInfo, error) {
 		VersionPatch: 0,
 		Hostname:     "truenas-mock",
 	}, nil
+}
+
+// SystemTimezone returns the mock NAS's civil timezone. SystemTimezoneName
+// selects it (default UTC) and SystemTimezoneErr injects an unreadable-zone
+// failure, so a test can model both a non-UTC NAS and the fail-closed path.
+func (m *MockClient) SystemTimezone(ctx context.Context) (*time.Location, error) {
+	m.mu.RLock()
+	name, injected := m.SystemTimezoneName, m.SystemTimezoneErr
+	m.mu.RUnlock()
+	if injected != nil {
+		return nil, injected
+	}
+	if name == "" {
+		name = "UTC"
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("mock NAS timezone %q is not loadable: %w", name, err)
+	}
+	return loc, nil
 }
 
 func (m *MockClient) CheckNVMeoFSupport(ctx context.Context) error {

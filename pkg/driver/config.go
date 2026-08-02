@@ -187,6 +187,45 @@ type ZFSConfig struct {
 	// DestroyForeignSnapshotsOnDelete allows recursive dataset deletion to remove
 	// snapshots that were not created by the CSI driver (default: false)
 	DestroyForeignSnapshotsOnDelete bool `yaml:"destroyForeignSnapshotsOnDelete"`
+
+	// HoldCSISnapshots places a deletion-proof ZFS hold (the fixed `truenas` tag)
+	// on every CSI VolumeSnapshot at create so foreign actors — a box-wide
+	// periodic-snapshot task's pruning, an admin, replication retention — cannot
+	// destroy it (they hit EBUSY). The driver's own destroy paths
+	// (handleSnapshotClones, reapTombstoneSnapshot) release the hold first, gated
+	// on driver provenance, so the hold never wedges the driver's lifecycle
+	// (GF2/E1, R1). Default false: no holds are placed and behavior is identical
+	// to pre-GF2.
+	HoldCSISnapshots bool `yaml:"holdCsiSnapshots"`
+
+	// SnapshotSchedule is the controller-wide DEFAULT periodic-snapshot schedule
+	// (GF2/E2), a five-field cron string "minute hour dom month dow". Empty (the
+	// default) disables driver-managed periodic snapshots globally. A StorageClass
+	// `snapshotSchedule` parameter overrides this per class; an explicit empty
+	// parameter opts a class out. The driver owns one non-recursive task per
+	// scheduled volume dataset.
+	SnapshotSchedule string `yaml:"snapshotSchedule"`
+
+	// SnapshotRetention is the controller-wide DEFAULT bounded retention for
+	// driver-managed periodic snapshots (GF2/E2), e.g. "24h", "30d", "2w", "6M",
+	// "1y". Empty resolves to a 30d safety bound so a scheduled task never grows
+	// unbounded snapshots. TrueNAS 26.0 retention is TIME-based only (no count
+	// cap in the API, P2); a count cap is a separate driver-side follow-up.
+	SnapshotRetention string `yaml:"snapshotRetention"`
+
+	// PromoteRestoredClones enables the background reconcile step (GF2/E3) that
+	// promotes clone-restored volumes to drop their origin-snapshot pin once it is
+	// safe (the clone is the sole dependent of its origin snapshot), letting the
+	// tombstone reaper reclaim the source snapshot and the source volume become
+	// destroyable. Default false: clones keep their origin pin exactly as before.
+	PromoteRestoredClones bool `yaml:"promoteRestoredClones"`
+
+	// ReportVolumeUsage makes ControllerGetVolume fetch each volume's quota/usage
+	// (one pool.dataset.query) and report it: a near-quota VolumeCondition
+	// (abnormal above 95% of the effective quota) plus per-volume usage metrics
+	// (GF2/E4). Default false: ControllerGetVolume makes no extra call and reports
+	// only the stamp-derived condition, exactly as before.
+	ReportVolumeUsage bool `yaml:"reportVolumeUsage"`
 }
 
 // NFSConfig holds NFS share configuration.

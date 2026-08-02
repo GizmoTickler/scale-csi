@@ -320,7 +320,16 @@ func (d *Driver) reapTombstoneSnapshot(
 	if hasDependentClones {
 		return false, "tombstone snapshot still has dependent clones"
 	}
-	if err := d.truenasClient.SnapshotDelete(ctx, snapshot.ID, false, false); err != nil {
+	// Release-before-reap (GF2/E1, R1): a hold survives the tombstone rename, so
+	// a tombstone can reach this point still held — e.g. the feature was toggled
+	// on mid-life, or the controller crashed between rename and DeleteSnapshot's
+	// release. Every provenance gate above (ledger/scan-fallback identity,
+	// ownership stamp, no live CSI identity, age, no dependent clones) has passed,
+	// so this is a driver-proven tombstone and releasing its hold never strips a
+	// hold the driver does not own (R2). Without this the destroy EBUSYs and the
+	// tombstone leaks forever.
+	d.releaseCSISnapshotHoldIfEnabled(ctx, snapshot.ID)
+	if err := d.destroyDriverSnapshot(ctx, snapshot.ID, false, false); err != nil {
 		if truenas.IsNotFoundError(err) {
 			retire.add(snapshot.ID)
 			return true, ""

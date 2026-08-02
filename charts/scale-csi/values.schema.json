@@ -557,6 +557,26 @@
         "destroyForeignSnapshotsOnDelete": {
           "type": "boolean"
         },
+        "holdCsiSnapshots": {
+          "type": "boolean",
+          "default": false
+        },
+        "snapshotSchedule": {
+          "type": "string",
+          "default": ""
+        },
+        "snapshotRetention": {
+          "type": "string",
+          "default": ""
+        },
+        "promoteRestoredClones": {
+          "type": "boolean",
+          "default": false
+        },
+        "reportVolumeUsage": {
+          "type": "boolean",
+          "default": false
+        },
         "dedup": {
           "type": "boolean",
           "description": "Deprecated compatibility value; use datasetProperties."
