@@ -64,16 +64,18 @@ type Dataset struct {
 	// encryption_summary in ListVolumes. The driver's authoritative unlock GATE
 	// still uses DatasetEncryptionSummary (P-8); these fields drive the read-only
 	// health/VolumeCondition surface and let the mock model a locked zvol.
-	// EncryptionRoot/EncryptionAlgorithm/Passphrase stay json:"-": the passphrase
-	// is the mock's model of the dataset's CURRENT key (the backend's knowledge),
-	// used only to validate unlock (P-5) and rotate on change_key (P-6) — test
-	// state, never driver data, never logged or returned through a driver surface.
+	// EncryptionRoot/EncryptionAlgorithm stay json:"-": they are modeled state
+	// (P-7 clone inheritance) that no production parse populates today.
+	//
+	// NO KEY MATERIAL LIVES ON THIS STRUCT. The mock keeps its model of the
+	// appliance's key knowledge in a side table keyed by encryption root, so a
+	// passphrase can never ride into driver code — or into a %+v in a failing
+	// test's output — on an object the driver legitimately holds.
 	Encrypted           bool   `json:"encrypted"`
 	Locked              bool   `json:"locked"`
 	KeyLoaded           bool   `json:"key_loaded"`
 	EncryptionRoot      string `json:"-"`
 	EncryptionAlgorithm string `json:"-"`
-	Passphrase          string `json:"-"`
 }
 
 // DatasetProperty represents a ZFS property with parsed and raw values.

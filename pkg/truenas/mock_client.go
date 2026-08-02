@@ -57,6 +57,14 @@ type MockClient struct {
 	nextSnapshotCreateTXG      uint64
 	nextReplicationJobID       int64
 
+	// datasetPassphrases is the MOCK's model of the appliance's own key
+	// knowledge, keyed by ENCRYPTION ROOT dataset name. It lives here, not on the
+	// shared *Dataset struct, so no passphrase can ride into driver code under
+	// test (and into a %+v in a failing test's output) on an object the driver
+	// legitimately holds. Used only to validate unlock (P-5) and to re-key on
+	// change_key (P-6).
+	datasetPassphrases map[string]string
+
 	// FailUserPropertyKeys makes DatasetSetUserProperties fail for these exact
 	// property keys (test hook for binding-write failures).
 	FailUserPropertyKeys map[string]struct{}
@@ -398,6 +406,7 @@ func NewMockClient() *MockClient {
 		},
 		deferredSnapshots:    make(map[string]struct{}),
 		snapshotHolds:        make(map[string]struct{}),
+		datasetPassphrases:   make(map[string]string),
 		PoolAvailable:        100 * 1024 * 1024 * 1024, // 100 GiB default
 		nextReplicationJobID: 1,
 	}
@@ -690,7 +699,9 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 		ds.Locked = false
 		ds.EncryptionRoot = params.Name
 		if opts := params.EncryptionOptions; opts != nil {
-			ds.Passphrase = opts.Passphrase
+			// The key goes into the mock's own side table, never onto the *Dataset
+			// the driver receives.
+			m.datasetPassphrases[params.Name] = opts.Passphrase
 			ds.EncryptionAlgorithm = opts.Algorithm
 		}
 		if ds.EncryptionAlgorithm == "" {
@@ -929,6 +940,17 @@ func (m *MockClient) DatasetQueryByParent(ctx context.Context, parentDataset str
 			property.Source = ""
 			response.UserProperties[key] = property
 		}
+		// Same fidelity discipline for the encryption booleans: parseDatasetResource
+		// does NOT read encrypted/locked/key_loaded (they are pool.dataset.query
+		// fields, P-1/P-4), so a dataset that arrives through this path carries
+		// none of them in production. Zero them here so no caller can build on a
+		// signal the resource path does not actually deliver — the exact class of
+		// mistake that made the unlock reconciler a silent no-op.
+		response.Encrypted = false
+		response.Locked = false
+		response.KeyLoaded = false
+		response.EncryptionRoot = ""
+		response.EncryptionAlgorithm = ""
 		response.ResourceQuery = true
 		list = append(list, response)
 	}
@@ -1060,10 +1082,26 @@ func (m *MockClient) DatasetGetQuotaUsage(ctx context.Context, datasetName strin
 	return ds.QuotaUsage(), nil
 }
 
+// setEncryptionRootStateLocked flips an encryption root and EVERY dataset that
+// inherits its key to the same lock state. P-7: a clone's encryption_root is the
+// ORIGIN, so it shares the origin's key — locking the origin locks the clone.
+// Callers hold m.mu.
+func (m *MockClient) setEncryptionRootStateLocked(root string, locked bool) {
+	for _, candidate := range m.Datasets {
+		if !candidate.Encrypted || candidate.EncryptionRoot != root {
+			continue
+		}
+		candidate.Locked = locked
+		candidate.KeyLoaded = !locked
+	}
+}
+
 // DatasetLock models pool.dataset.lock (a @job). Test/drill only — no driver
 // control path locks a dataset. It flips the dataset to the P-4 locked state:
 // locked:true, key_loaded:false, and (via mockDatasetResponse) no mountpoint /
-// backing device.
+// backing device. A dataset whose key is INHERITED (encryption_root != itself,
+// i.e. a clone, P-7) cannot be locked on its own — the operation belongs to its
+// root.
 func (m *MockClient) DatasetLock(ctx context.Context, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1077,15 +1115,21 @@ func (m *MockClient) DatasetLock(ctx context.Context, name string) error {
 	if !ds.Encrypted {
 		return &jobTerminalError{state: "FAILED", detail: "dataset is not encrypted"}
 	}
+	if ds.EncryptionRoot != "" && ds.EncryptionRoot != name {
+		return &jobTerminalError{state: "FAILED",
+			detail: "dataset is not an encryption root; its key is inherited from " + ds.EncryptionRoot}
+	}
+	m.setEncryptionRootStateLocked(name, true)
 	ds.Locked = true
 	ds.KeyLoaded = false
 	return nil
 }
 
-// DatasetUnlock models pool.dataset.unlock (a @job), including its two sharp
-// edges: it is NOT idempotent — unlocking an already-unlocked dataset is a FAILED
-// job (P-8) — and a wrong passphrase is a FAILED job that leaves the dataset
-// locked (P-5, fail-closed native).
+// DatasetUnlock models pool.dataset.unlock (a @job), including its sharp edges:
+// it is NOT idempotent — unlocking an already-unlocked dataset is a FAILED job
+// (P-8) — a wrong passphrase is a FAILED job that leaves the dataset locked
+// (P-5, fail-closed native), and a dataset whose key is INHERITED (a clone,
+// P-7) has no key of its own to load.
 func (m *MockClient) DatasetUnlock(ctx context.Context, name, passphrase string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1099,14 +1143,19 @@ func (m *MockClient) DatasetUnlock(ctx context.Context, name, passphrase string)
 	if !ds.Encrypted {
 		return &jobTerminalError{state: "FAILED", detail: "dataset is not encrypted"}
 	}
+	if ds.EncryptionRoot != "" && ds.EncryptionRoot != name {
+		return &jobTerminalError{state: "FAILED",
+			detail: "dataset is not an encryption root; its key is inherited from " + ds.EncryptionRoot}
+	}
 	if !ds.Locked {
 		// P-8: unlock on an already-unlocked dataset fails.
 		return &jobTerminalError{state: "FAILED", detail: "dataset is already unlocked"}
 	}
-	if passphrase != ds.Passphrase {
+	if passphrase != m.datasetPassphrases[name] {
 		// P-5: wrong passphrase -> FAILED, dataset stays locked, no device.
 		return &jobTerminalError{state: "FAILED", detail: "failed to unlock dataset: invalid passphrase"}
 	}
+	m.setEncryptionRootStateLocked(name, false)
 	ds.Locked = false
 	ds.KeyLoaded = true
 	return nil
@@ -1114,7 +1163,12 @@ func (m *MockClient) DatasetUnlock(ctx context.Context, name, passphrase string)
 
 // DatasetChangeKey models pool.dataset.change_key (a @job, P-6): it re-keys an
 // UNLOCKED dataset and requires the key already loaded. Afterward the old
-// passphrase is dead.
+// passphrase is dead. Re-keying to the SAME passphrase SUCCEEDS and leaves that
+// key valid (probed live on nas01 26.0.0-BETA.1, 2026-08-02: same-key change_key
+// returns job SUCCESS and a following lock -> unlock with that passphrase
+// succeeds) — this is what makes the driver's rotation-completion arm safe to
+// call unconditionally on an unlocked dataset. An inheriting child (a clone,
+// P-7) cannot be re-keyed at all.
 func (m *MockClient) DatasetChangeKey(ctx context.Context, name, passphrase string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1128,10 +1182,14 @@ func (m *MockClient) DatasetChangeKey(ctx context.Context, name, passphrase stri
 	if !ds.Encrypted {
 		return &jobTerminalError{state: "FAILED", detail: "dataset is not encrypted"}
 	}
+	if ds.EncryptionRoot != "" && ds.EncryptionRoot != name {
+		return &jobTerminalError{state: "FAILED",
+			detail: "dataset is not an encryption root; its key is inherited from " + ds.EncryptionRoot}
+	}
 	if ds.Locked || !ds.KeyLoaded {
 		return &jobTerminalError{state: "FAILED", detail: "dataset must be unlocked before changing its key"}
 	}
-	ds.Passphrase = passphrase
+	m.datasetPassphrases[name] = passphrase
 	return nil
 }
 
@@ -1835,6 +1893,26 @@ func (m *MockClient) SnapshotClone(ctx context.Context, snapshotID, newDatasetNa
 			// must compare source == "local" and must not adopt these values.
 			for key, property := range source.UserProperties {
 				clone.UserProperties[key] = UserProperty{Value: property.Value, Source: snapshotID}
+			}
+			// P-7 ENCRYPTION INHERITANCE (probed): a clone of an encrypted dataset
+			// comes out encrypted:true with encryption_root == the ORIGIN, NOT
+			// itself. It shares the origin's key: it is not independently keyed, it
+			// cannot be re-keyed, and locking the origin locks the clone. Modeling
+			// this is what makes an encrypted-content-source test possible at all —
+			// without it, a clone looked plaintext to every test and the driver's
+			// missing source-side guard was invisible.
+			if source.Encrypted {
+				clone.Encrypted = true
+				clone.EncryptionAlgorithm = source.EncryptionAlgorithm
+				clone.EncryptionRoot = source.EncryptionRoot
+				if clone.EncryptionRoot == "" {
+					clone.EncryptionRoot = source.Name
+				}
+				clone.Locked = source.Locked
+				clone.KeyLoaded = source.KeyLoaded
+				if clone.Locked {
+					clone.Mountpoint = ""
+				}
 			}
 		}
 	}

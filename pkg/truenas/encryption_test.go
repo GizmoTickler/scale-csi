@@ -3,6 +3,7 @@ package truenas
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -329,4 +330,103 @@ func TestDatasetLockJobShape(t *testing.T) {
 	require.NoError(t, client.DatasetLock(context.Background(), "flashstor/gf1-enc-drill-zv"))
 	require.Len(t, lockArgs, 1)
 	assert.Equal(t, "flashstor/gf1-enc-drill-zv", lockArgs[0])
+}
+
+// TestMockCloneInheritsEncryption models P-7 (probed): a clone of an encrypted
+// dataset is encrypted:true with encryption_root == the ORIGIN. It shares the
+// origin's key — it is NOT independently keyed, it cannot be re-keyed, and
+// locking the origin locks the clone. Without this in the mock, an
+// encrypted-content-source test could not exist at all: every clone looked
+// plaintext, which is why the driver's missing source-side guard was invisible.
+func TestMockCloneInheritsEncryption(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockClient()
+	const origin = "flashstor/gf1-enc-drill-zv"
+	const clone = "flashstor/gf1-enc-drill-clone"
+
+	_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{
+		Name: origin, Type: "VOLUME", Volsize: 1 << 30, Sparse: true,
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "drill-pass-1"},
+	})
+	require.NoError(t, err)
+	_, err = mock.SnapshotCreate(ctx, origin, "snap", nil)
+	require.NoError(t, err)
+	require.NoError(t, mock.SnapshotClone(ctx, origin+"@snap", clone))
+
+	cloned, err := mock.DatasetGet(ctx, clone)
+	require.NoError(t, err)
+	assert.True(t, cloned.Encrypted, "P-7: the clone is encrypted")
+	assert.Equal(t, origin, cloned.EncryptionRoot, "P-7: encryption_root is the ORIGIN, not the clone")
+
+	// It has no key of its own: it can be neither unlocked nor re-keyed directly.
+	require.Error(t, mock.DatasetChangeKey(ctx, clone, "new-pass-456"),
+		"an inheriting child cannot be re-keyed")
+	require.Error(t, mock.DatasetLock(ctx, clone), "locking belongs to the encryption root")
+
+	// Locking the ORIGIN locks the clone with it.
+	require.NoError(t, mock.DatasetLock(ctx, origin))
+	cloned, err = mock.DatasetGet(ctx, clone)
+	require.NoError(t, err)
+	assert.True(t, cloned.Locked, "P-7: locking the origin locks the clone")
+	assert.Equal(t, "", cloned.Mountpoint, "P-4: a locked dataset has no mountpoint")
+
+	require.NoError(t, mock.DatasetUnlock(ctx, origin, "drill-pass-1"))
+	cloned, err = mock.DatasetGet(ctx, clone)
+	require.NoError(t, err)
+	assert.False(t, cloned.Locked)
+}
+
+// TestMockChangeKeyToSamePassphraseSucceeds pins the probe that makes the
+// driver's rotation-completion arm safe: change_key on an UNLOCKED dataset with
+// a passphrase IDENTICAL to the current one returns SUCCESS and the key stays
+// valid (probed live on nas01 26.0.0-BETA.1, 2026-08-02: same-key change_key
+// SUCCESS, followed by lock -> unlock with that same passphrase SUCCESS). The
+// driver calls change_key unconditionally when a rotation window is open, so an
+// interrupted rotation completes and an already-rotated one is a no-op by
+// outcome. scripts/gf1-encryption-drill.sh step 5b re-proves this end to end.
+func TestMockChangeKeyToSamePassphraseSucceeds(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockClient()
+	const name = "flashstor/gf1-enc-drill-zv"
+	const passphrase = "drill-pass-1"
+
+	_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{
+		Name: name, Type: "VOLUME", Volsize: 1 << 30, Sparse: true,
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: passphrase},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, mock.DatasetChangeKey(ctx, name, passphrase), "same-key change_key succeeds")
+	require.NoError(t, mock.DatasetLock(ctx, name))
+	require.NoError(t, mock.DatasetUnlock(ctx, name, passphrase), "the key is still valid afterward")
+}
+
+// TestMockKeyMaterialStaysOffTheDatasetStruct is the F16 guard: no *Dataset the
+// driver can hold ever carries a passphrase, so a %+v in a failing test cannot
+// print one. The mock keeps its key model in its own side table.
+func TestMockKeyMaterialStaysOffTheDatasetStruct(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockClient()
+	const name = "flashstor/gf1-enc-drill-zv"
+	const passphrase = "drill-pass-radioactive"
+
+	_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{
+		Name: name, Type: "VOLUME", Volsize: 1 << 30, Sparse: true,
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: passphrase},
+	})
+	require.NoError(t, err)
+	ds, err := mock.DatasetGet(ctx, name)
+	require.NoError(t, err)
+	assert.NotContains(t, fmt.Sprintf("%+v", ds), passphrase,
+		"no rendering of a *Dataset may contain key material")
+
+	listed, err := mock.DatasetList(ctx, "flashstor", 0, 0)
+	require.NoError(t, err)
+	assert.NotContains(t, fmt.Sprintf("%+v", listed), passphrase)
 }
