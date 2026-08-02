@@ -506,6 +506,63 @@ iscsi:
 	assert.Contains(t, warning, "does not currently support iSCSI multipath")
 }
 
+// TestLoadConfigWarnsForOrphanedGlobalSquashGroup covers the config-load half of
+// the squash preflight: a globally orphaned group passes startup (a StorageClass
+// can still supply the missing user, and failing here would take block
+// provisioning down with it) but no longer does so silently.
+func TestLoadConfigWarnsForOrphanedGlobalSquashGroup(t *testing.T) {
+	captureWarnings := func(t *testing.T) *[]string {
+		t.Helper()
+		originalWarningf := configWarningf
+		t.Cleanup(func() { configWarningf = originalWarningf })
+		warnings := &[]string{}
+		configWarningf = func(format string, args ...interface{}) {
+			*warnings = append(*warnings, fmt.Sprintf(format, args...))
+		}
+		return warnings
+	}
+
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		expected string
+	}{
+		{"maproot", "  shareMaprootUser: \"\"\n  shareMaprootGroup: wheel\n", "nfs.shareMaprootUser"},
+		{"mapall", "  shareMapallUser: \"\"\n  shareMapallGroup: nogroup\n", "nfs.shareMapallUser"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			warnings := captureWarnings(t)
+
+			_, err := loadTestConfig(t, requiredTestConfig+"nfs:\n  enabled: true\n  shareHost: 192.0.2.10\n"+tc.yaml)
+			require.NoError(t, err, "an orphaned squash group must not be startup-fatal")
+
+			var matched int
+			for _, warning := range *warnings {
+				if strings.Contains(warning, tc.expected) && strings.Contains(warning, "without its user") {
+					matched++
+				}
+			}
+			assert.Equal(t, 1, matched, "expected exactly one orphaned-group warning, got %v", *warnings)
+		})
+	}
+
+	t.Run("a complete pair warns about nothing", func(t *testing.T) {
+		warnings := captureWarnings(t)
+
+		_, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+  shareMaprootUser: root
+  shareMaprootGroup: wheel
+`)
+		require.NoError(t, err)
+		for _, warning := range *warnings {
+			assert.NotContains(t, warning, "without its user")
+		}
+	})
+}
+
 func TestLoadConfigWarnsWhenDeprecatedRateLimitingConcurrencySet(t *testing.T) {
 	originalWarningf := configWarningf
 	t.Cleanup(func() { configWarningf = originalWarningf })

@@ -498,8 +498,8 @@ func perfContentSourceDriver(mock *truenas.MockClient) *Driver {
 // Both failure directions are asserted:
 //   - FALSE ACCEPT — a clone must not carry a class stamp it does not satisfy;
 //   - FALSE REJECT — a later replay under a DIFFERENT class must not be refused
-//     with "logbias ... fixed when the dataset is created" for a property the
-//     driver never set on this dataset.
+//     with "volblocksize ... fixed when the dataset is created" for a property
+//     the driver never set on this dataset.
 func TestCreateVolumeFromContentSourceDoesNotStampPerformanceClass(t *testing.T) {
 	ctx := context.Background()
 	mock := truenas.NewMockClient()

@@ -1284,6 +1284,30 @@ func validateNFSExportConfig(nfs *NFSConfig) error {
 				"(maprootUser=%q maprootGroup=%q mapallUser=%q mapallGroup=%q); sharing.nfs.create rejects a payload carrying both",
 			nfs.ShareMaprootUser, nfs.ShareMaprootGroup, nfs.ShareMapallUser, nfs.ShareMapallGroup)
 	}
+
+	// A squash GROUP with no user is refused by sharing.nfs.create with
+	// "<family>_user: This field is required when map group is specified"
+	// (probed live on 26.0, 2026-08-02). validateNFSSquashPartialClear catches
+	// this on the EFFECTIVE per-StorageClass payload, which is the shape that
+	// actually reaches the appliance; the global config is only its default
+	// layer, and a StorageClass can still supply the missing user. So this is a
+	// WARNING, not a startup failure: refusing to start would take iSCSI and
+	// NVMe-oF provisioning down with it for an install whose classes may all be
+	// fine.
+	for _, family := range []struct {
+		userKey, groupKey string
+		user, group       string
+	}{
+		{"nfs.shareMaprootUser", "nfs.shareMaprootGroup", nfs.ShareMaprootUser, nfs.ShareMaprootGroup},
+		{"nfs.shareMapallUser", "nfs.shareMapallGroup", nfs.ShareMapallUser, nfs.ShareMapallGroup},
+	} {
+		if strings.TrimSpace(family.user) != "" || strings.TrimSpace(family.group) == "" {
+			continue
+		}
+		configWarningf("%s=%q is set with an empty %s; TrueNAS refuses a squash group without its user, so every NFS "+
+			"CreateVolume that does not override %s on the StorageClass will fail. Set %s, or clear %s as well",
+			family.groupKey, family.group, family.userKey, family.userKey, family.userKey, family.groupKey)
+	}
 	return nil
 }
 

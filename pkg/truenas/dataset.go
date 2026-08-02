@@ -298,9 +298,15 @@ func datasetKeyAccepted(scopes map[string]datasetKeyScope, key, datasetType stri
 	}
 }
 
-// datasetParamsJSONKeys lists the JSON tag names of a params struct.
+// datasetParamsJSONKeys lists the JSON tag names of a params struct. A non-struct
+// (a pointer, say) returns nothing rather than panicking in reflect: the caller
+// is TestDatasetParamsSchemaCoverage, whose require.NotEmpty then fails with the
+// callsite instead of a stack trace.
 func datasetParamsJSONKeys(params interface{}) []string {
 	structType := reflect.TypeOf(params)
+	if structType == nil || structType.Kind() != reflect.Struct {
+		return nil
+	}
 	keys := make([]string, 0, structType.NumField())
 	for i := 0; i < structType.NumField(); i++ {
 		tag := structType.Field(i).Tag.Get("json")

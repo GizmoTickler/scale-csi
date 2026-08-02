@@ -219,14 +219,21 @@ func (d *Driver) validateNFSSquashConflict(opts *nfsShareOptions) error {
 // its user: `sharing.nfs.create` rejects the pair, and the operator sees the
 // same opaque middleware error the GF5 validator was written to eliminate.
 //
-// Probed live on TrueNAS 26.0 (2026-08-02): a StorageClass setting
-// `nfsMaprootUser: ""` while the shipped `nfs.shareMaprootGroup: wheel` default
-// stayed in place produced
-// `failed to create NFS share: TrueNAS API error [-32602]: Invalid params`.
-// That is the shape an operator naturally produces by following the documented
-// "clear the defaults" escape halfway. The mapall_* pair is refused on the same
-// grounds: the group is an attribute of the user mapping, so it cannot stand
-// alone.
+// Probed live on TrueNAS 26.0 (nas01). The drill of 2026-08-02 hit it through a
+// StorageClass setting `nfsMaprootUser: ""` while the shipped
+// `nfs.shareMaprootGroup: wheel` default stayed in place, which produced
+// `failed to create NFS share: TrueNAS API error [-32602]: Invalid params` —
+// the shape an operator naturally produces by following the documented "clear
+// the defaults" escape halfway.
+//
+// BOTH families were then probed directly against `sharing.nfs.create`
+// (2026-08-02), group set with no user, and the middleware refuses each with its
+// own named error:
+//
+//	mapall_group  => [EINVAL] sharingnfs_create.mapall_user: This field is required when map group is specified
+//	maproot_group => [EINVAL] sharingnfs_create.maproot_user: This field is required when map group is specified
+//
+// so the rule is symmetric across the two families, not inferred from one.
 //
 // Both routes to the broken payload are covered, because it is the EFFECTIVE
 // payload that is validated: clearing the user with an explicit empty parameter

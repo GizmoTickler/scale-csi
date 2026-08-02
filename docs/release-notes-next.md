@@ -32,7 +32,14 @@ flag defaults change and the default Helm render is unchanged.
   `nfs.shareMaprootGroup: wheel`, orphaned the group and failed inside the
   middleware. A squash group with no user is now refused up front with an
   `InvalidArgument` naming both keys and the fix, for the `maproot_*` and
-  `mapall_*` families alike. A user with no group is legal and still accepted.
+  `mapall_*` families alike — both were probed directly against
+  `sharing.nfs.create`, which refuses each with
+  `This field is required when map group is specified`. A user with no group is
+  legal and still accepted. A globally orphaned pair (`nfs.shareMaprootGroup`
+  set with an empty `nfs.shareMaprootUser`) additionally logs a WARNING at
+  startup. It is not startup-fatal on purpose: a StorageClass can still supply
+  the missing user, and refusing to start would take iSCSI and NVMe-oF
+  provisioning down with it.
 - **`DeleteVolume` blamed a foreign task for the driver's own tombstones.** A
   deferred `DeleteSnapshot` leaves a ledger-recorded tombstone; the following
   `DeleteVolume` refusal described it as "likely from a TrueNAS
