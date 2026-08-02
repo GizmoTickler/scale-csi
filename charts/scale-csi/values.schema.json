@@ -944,27 +944,41 @@
         },
         {
           "title": "maproot_* and mapall_* are mutually exclusive",
-          "description": "TrueNAS rejects a sharing.nfs.create payload that carries both squash mappings. Setting nfs.shareMapallUser/Group requires clearing nfs.shareMaprootUser/Group.",
+          "description": "TrueNAS rejects a sharing.nfs.create payload that carries both squash mappings. Setting nfs.shareMapallUser/Group requires clearing nfs.shareMaprootUser/Group. Scoped to nfs.enabled, mirroring the driver: with NFS disabled these keys build no payload at all, and an install that was inert on 1.4.1 must not fail a 1.5.0 upgrade over them.",
           "if": {
-            "anyOf": [
+            "allOf": [
               {
                 "properties": {
-                  "shareMapallUser": {
-                    "minLength": 1
+                  "enabled": {
+                    "const": true
                   }
                 },
                 "required": [
-                  "shareMapallUser"
+                  "enabled"
                 ]
               },
               {
-                "properties": {
-                  "shareMapallGroup": {
-                    "minLength": 1
+                "anyOf": [
+                  {
+                    "properties": {
+                      "shareMapallUser": {
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "shareMapallUser"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "shareMapallGroup": {
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "shareMapallGroup"
+                    ]
                   }
-                },
-                "required": [
-                  "shareMapallGroup"
                 ]
               }
             ]

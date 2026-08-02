@@ -427,6 +427,42 @@ func TestDiskTemperatureAlerts(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []string{"nvme0n1 is too hot", "nvme1n1", "nvme2n1 at 80C"}, alerts)
 	})
+
+	// L3: the LENGTH of this slice is published as scale_csi_pool_disk_temp_alerts
+	// and read as a disk count. The middleware returns one entry per ALERT, and a
+	// single drive can raise several at once, so two alerts on one disk used to
+	// report two disks. Entries whose device is identifiable are deduplicated;
+	// prose-only fallback entries are not, because there is nothing to
+	// deduplicate them on and merging them would hide a second real alert.
+	t.Run("a disk raising several alerts is counted once", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"disk.temperature_alerts": static([]interface{}{
+				map[string]interface{}{"device": "nvme0n1"},
+				map[string]interface{}{"device": "nvme0n1"},
+				map[string]interface{}{"name": "nvme0n1"},
+				"nvme1n1",
+				"nvme1n1",
+				map[string]interface{}{"device": "nvme2n1"},
+			}),
+		})
+		alerts, err := client.DiskTemperatureAlerts(context.Background(), []string{"nvme0n1", "nvme1n1", "nvme2n1"})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"nvme0n1", "nvme1n1", "nvme2n1"}, alerts,
+			"the count is disks-with-an-alert, not alert entries")
+	})
+
+	t.Run("unidentifiable alerts are still counted individually", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			"disk.temperature_alerts": static([]interface{}{
+				map[string]interface{}{"formatted": "a disk is too hot"},
+				map[string]interface{}{"formatted": "a disk is too hot"},
+			}),
+		})
+		alerts, err := client.DiskTemperatureAlerts(context.Background(), []string{"nvme0n1"})
+		require.NoError(t, err)
+		assert.Len(t, alerts, 2,
+			"prose fallbacks name no device; collapsing them would hide a second real alert")
+	})
 }
 
 // ---------------------------------------------------------------------------

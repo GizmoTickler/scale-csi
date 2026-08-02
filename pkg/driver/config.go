@@ -588,24 +588,16 @@ type BackendHealthConfig struct {
 	// VolumeCondition semantics byte-identical to the pre-GF5 driver.
 	Enabled bool `yaml:"enabled"`
 
-	// Interval is the poll cadence. Values below the 30s floor are clamped to it.
-	// Default (empty) resolves to 60s.
+	// Interval is the poll cadence, clamped to [minBackendHealthInterval,
+	// maxBackendHealthInterval]. Default (empty) resolves to 60s.
+	//
+	// There is deliberately NO IntervalDuration() method on this type. The
+	// effective cadence is derived in exactly ONE place —
+	// Driver.resolveBackendHealthInterval — so the poll loop and the staleness TTL
+	// cannot disagree about it. The method that used to live here applied the
+	// floor but not the CEILING, which is exactly the disagreement that single
+	// resolver exists to prevent.
 	Interval string `yaml:"interval"`
-}
-
-// IntervalDuration resolves the poll cadence, applying the default and floor.
-func (c BackendHealthConfig) IntervalDuration() (time.Duration, error) {
-	if strings.TrimSpace(c.Interval) == "" {
-		return 60 * time.Second, nil
-	}
-	interval, err := time.ParseDuration(c.Interval)
-	if err != nil {
-		return 0, err
-	}
-	if interval < minBackendHealthInterval {
-		return minBackendHealthInterval, nil
-	}
-	return interval, nil
 }
 
 // NVMeoFConfig holds NVMe-oF configuration.
@@ -1245,16 +1237,27 @@ func validateConfig(cfg *Config) error {
 // defaults at config LOAD time, so a bad ConfigMap stops the controller from
 // starting instead of stamping an unusable export on every volume it creates.
 //
-// It is deliberately unconditional on cfg.NFS.Enabled: a value that is wrong is
-// wrong, and a deployment that later enables NFS must not inherit an invalid
-// list that was never checked.
+// The two halves are scoped DIFFERENTLY, on purpose.
 //
-// This is the config-load half of the KRB5 fail-closed gate. The chart schema
-// couples nfs.shareSecurity to nfs.krbEnabled as well, but a hand-written
-// ConfigMap bypasses the chart entirely, so the Go-side check is not optional:
-// `shareSecurity: [KRB5]` with `krbEnabled: false` would otherwise stamp KRB5 on
-// EVERY newly created export on a box with no KDC or keytab — dead mounts
-// fleet-wide, silently.
+// The SECURITY half is unconditional on cfg.NFS.Enabled. nfs.shareSecurity and
+// nfs.krbEnabled are both NEW in this release, so no existing install can be
+// carrying a value this check has not seen — nothing that used to start can be
+// stopped by it, and a deployment that later enables NFS must not inherit an
+// unchecked list. It is the config-load half of the KRB5 fail-closed gate: the
+// chart schema couples the two keys as well, but a hand-written ConfigMap
+// bypasses the chart entirely, and `shareSecurity: [KRB5]` with
+// `krbEnabled: false` would stamp KRB5 on EVERY newly created export on a box
+// with no KDC or keytab — dead mounts fleet-wide, silently.
+//
+// The SQUASH half is scoped to cfg.NFS.Enabled, and that is an upgrade
+// concession rather than a change of opinion. nfs.shareMaproot* / shareMapall*
+// are OLD keys and the shipped default is shareMaprootUser: root /
+// shareMaprootGroup: wheel, so an install with NFS DISABLED and a leftover
+// shareMapallUser carries an invalid pair today and starts fine — nothing ever
+// builds an NFS payload from it. Failing it unconditionally would turn an
+// upgrade into a controller crash-loop over a value the deployment does not use.
+// With NFS enabled the check is exactly as strict as it was: every
+// sharing.nfs.create would fail anyway, so failing at load is the better error.
 func validateNFSExportConfig(nfs *NFSConfig) error {
 	normalized, err := normalizeNFSSecurityList("nfs.shareSecurity", nfs.ShareSecurity, nfs.KrbEnabled)
 	if err != nil {
@@ -1265,6 +1268,10 @@ func validateNFSExportConfig(nfs *NFSConfig) error {
 	// spelled it, and so the KRB5 prefix check can never be evaded by casing.
 	if len(nfs.ShareSecurity) > 0 {
 		nfs.ShareSecurity = normalized
+	}
+
+	if !nfs.Enabled {
+		return nil
 	}
 
 	// maproot_* and mapall_* are mutually exclusive in TrueNAS; a payload with

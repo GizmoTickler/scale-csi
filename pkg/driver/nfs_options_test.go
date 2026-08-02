@@ -496,6 +496,33 @@ func TestValidateConfigRejectsUnusableShareSecurity(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "mutually exclusive")
 	})
+
+	// L1: the squash pair is scoped to nfs.enabled. shareMaproot*/shareMapall*
+	// are OLD keys with a non-empty shipped default (root/wheel), so an install
+	// with NFS off and a leftover mapall value was INERT before this release —
+	// nothing ever builds an NFS payload from it. Hard-failing it at load would
+	// turn an upgrade into a controller crash-loop over an unused value. The
+	// SECURITY half stays unconditional: those keys are new, so no existing
+	// install can be carrying one.
+	t.Run("a leftover squash pair on an NFS-disabled install still starts", func(t *testing.T) {
+		cfg := base()
+		cfg.NFS.Enabled = false
+		cfg.ISCSI = ISCSIConfig{Enabled: true, TargetPortal: "10.0.0.1:3260"}
+		cfg.NFS.ShareMaprootUser = "root"
+		cfg.NFS.ShareMaprootGroup = "wheel"
+		cfg.NFS.ShareMapallUser = "nobody"
+		require.NoError(t, validateConfig(cfg))
+	})
+
+	t.Run("an NFS-disabled install is still refused an unusable security list", func(t *testing.T) {
+		cfg := base()
+		cfg.NFS.Enabled = false
+		cfg.ISCSI = ISCSIConfig{Enabled: true, TargetPortal: "10.0.0.1:3260"}
+		cfg.NFS.ShareSecurity = []string{"KRB5"}
+		err := validateConfig(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "krbEnabled")
+	})
 }
 
 // ---------------------------------------------------------------------------

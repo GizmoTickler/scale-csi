@@ -160,6 +160,20 @@ func poolHealthFromQueryResult(pool string, result interface{}) (*PoolHealthSnap
 // DiskTemperatureAlerts returns the member disks currently raising a temperature
 // alert. The middleware REQUIRES an explicit names array; an empty list short
 // circuits without an API call.
+//
+// The result is DEDUPLICATED BY DEVICE, because its length is published as
+// scale_csi_pool_disk_temp_alerts and read as a disk count. The middleware
+// returns one entry per ALERT, and one disk can raise several (an over-
+// temperature and a critical-temperature alert on the same drive), so an
+// undeduplicated length reports two disks where there is one.
+//
+// An entry whose device is NOT identifiable — the `formatted`/`text` fallback,
+// which is prose rather than a device name — is kept and counted individually.
+// Collapsing those on their text would merge two genuinely different alerts
+// whenever the middleware phrases them identically, and inventing a device for
+// them would be worse. This is why the metric's help string says "member disks
+// with at least one temperature alert, plus any alert whose disk could not be
+// identified" rather than a flat disk count: that IS what the number is.
 func (c *Client) DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error) {
 	if len(names) == 0 {
 		return nil, nil
@@ -173,19 +187,34 @@ func (c *Client) DiskTemperatureAlerts(ctx context.Context, names []string) ([]s
 		return nil, fmt.Errorf("unexpected disk.temperature_alerts response type %T", result)
 	}
 	alerts := make([]string, 0, len(entries))
+	seenDevices := make(map[string]struct{}, len(entries))
+	appendDevice := func(device string) {
+		if _, ok := seenDevices[device]; ok {
+			return
+		}
+		seenDevices[device] = struct{}{}
+		alerts = append(alerts, device)
+	}
 	for _, item := range entries {
 		switch value := item.(type) {
 		case string:
-			alerts = append(alerts, value)
+			appendDevice(value)
 		case map[string]interface{}:
 			// Alert objects carry the device in one of these keys depending on the
 			// alert class; fall back to the formatted text so an alert is never
 			// silently dropped just because its shape is unfamiliar.
 			for _, key := range []string{"device", "name", "formatted", "text"} {
-				if s, ok := value[key].(string); ok && s != "" {
-					alerts = append(alerts, s)
-					break
+				s, ok := value[key].(string)
+				if !ok || s == "" {
+					continue
 				}
+				if key == "device" || key == "name" {
+					appendDevice(s)
+				} else {
+					// Not a device: count it, do not deduplicate it.
+					alerts = append(alerts, s)
+				}
+				break
 			}
 		}
 	}

@@ -67,25 +67,34 @@ func managedDataset() *truenas.Dataset {
 	}
 }
 
-func TestBackendHealthConfigIntervalDuration(t *testing.T) {
+// TestBackendHealthIntervalResolution exercises the PRODUCTION resolver, which
+// is the only place the effective cadence is derived. The config type used to
+// carry a second resolver that applied the floor but not the CEILING; testing
+// that one proved nothing about what the poller and the staleness TTL actually
+// use.
+func TestBackendHealthIntervalResolution(t *testing.T) {
 	cases := []struct {
 		interval string
 		want     time.Duration
 		wantErr  bool
 	}{
 		{"", 60 * time.Second, false},
-		{"5m", 5 * time.Minute, false},
-		{"1s", minBackendHealthInterval, false}, // clamped
+		{"90s", 90 * time.Second, false},
+		{"1s", minBackendHealthInterval, false}, // floored
+		{"5m", maxBackendHealthInterval, false}, // ceilinged
 		{"not-a-duration", 0, true},
 	}
 	for _, tc := range cases {
-		got, err := BackendHealthConfig{Interval: tc.interval}.IntervalDuration()
+		d := healthTestDriver(truenas.NewMockClient())
+		d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: tc.interval}
+		got, err := d.resolveBackendHealthInterval()
 		if tc.wantErr {
 			require.Error(t, err, tc.interval)
 			continue
 		}
 		require.NoError(t, err, tc.interval)
 		assert.Equal(t, tc.want, got, tc.interval)
+		assert.Equal(t, time.Duration(backendHealthStaleIntervals)*tc.want, d.backendHealthTTL(), tc.interval)
 	}
 }
 
@@ -1017,6 +1026,42 @@ func TestMarkPoolHealthStaleYieldsToAFreshSample(t *testing.T) {
 
 	assert.Equal(t, 0.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
 		"a successful sample landed first; the read path must not re-raise staleness against it")
+}
+
+// TestMarkPoolHealthStaleIsIdempotentOnTheReadPath pins L4. poolHealthSnapshot
+// calls markPoolHealthStale, and ListVolumes composes ONE condition per volume,
+// so past the TTL this runs once per volume. Each run took both mutexes,
+// deep-cloned the whole metric generation and swapped the global pointer to
+// store a `1` that was already there — the pointer-identity guard never absorbs
+// it, because the CSI snapshot is not cleared and the pointer keeps matching.
+//
+// The assertion is the generation POINTER, which is what the clone-and-swap
+// actually changes; the gauge VALUE is identical either way and would prove
+// nothing.
+func TestMarkPoolHealthStaleIsIdempotentOnTheReadPath(t *testing.T) {
+	const pool = "gf5-stale-idempotence-pool"
+	d := healthTestDriver(truenas.NewMockClient())
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+
+	expired := &truenas.PoolHealthSnapshot{
+		Pool: pool, Status: truenas.PoolStatusDegraded,
+		SampledAt: time.Now().Add(-d.backendHealthTTL() - time.Second),
+	}
+	d.storeBackendHealthSnapshot(expired)
+
+	// The first read is where the TTL expires, so it MUST publish.
+	require.Nil(t, d.poolHealthSnapshot())
+	require.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)))
+	published := backendHealthState.Load()
+
+	// Every later read is the ListVolumes fan-out over the same stale snapshot.
+	for volume := 0; volume < 50; volume++ {
+		require.Nil(t, d.poolHealthSnapshot())
+	}
+	assert.Same(t, published, backendHealthState.Load(),
+		"a stale snapshot must not re-clone and re-swap the whole generation once per volume")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
+		"and the verdict it already published must still be served")
 }
 
 func TestBackendHealthTTLTracksTheInterval(t *testing.T) {

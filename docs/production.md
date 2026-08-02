@@ -504,7 +504,10 @@ New gauges, all labeled by `pool` and present only while the poller runs:
   **retired (zeroed) on the next sample**, so an unknown value can never sit at
   `1` alongside the current one. Deliberately separate from `pool_healthy`;
 - `scale_csi_pool_scan_errors{pool}`;
-- `scale_csi_pool_disk_temp_alerts{pool}` — the last returned count;
+- `scale_csi_pool_disk_temp_alerts{pool}` — the last returned count: member
+  disks with **at least one** temperature alert (two alerts on one disk count
+  once), plus any alert whose disk the appliance did not identify, which are
+  counted individually because there is nothing to deduplicate them on;
 - `scale_csi_pool_disk_temp_alerts_age_seconds{pool}` — age of the last
   successful `disk.temperature_alerts` result. It is absent until that
   component has returned once, so a zero count without this age is not a

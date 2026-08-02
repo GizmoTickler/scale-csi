@@ -546,6 +546,16 @@ func TestChartGF5SchemaRejectsMaprootMapallCombo(t *testing.T) {
 		"--set", "nfs.shareMapallUser=nobody",
 		"--set", "nfs.shareMaprootUser=",
 		"--set", "nfs.shareMaprootGroup=")
+
+	// L1: the rule is scoped to nfs.enabled, mirroring the driver. With NFS off
+	// these keys build no payload at all, so an install carrying a leftover
+	// mapall alongside the shipped maproot defaults — inert on v1.4.1 — must not
+	// be blocked from upgrading by schema validation.
+	helmTemplate(t, "--show-only", "templates/configmap.yaml",
+		"--set", "nfs.enabled=false",
+		"--set", "iscsi.enabled=true",
+		"--set", "iscsi.portal=10.0.0.1",
+		"--set", "nfs.shareMapallUser=nobody")
 }
 
 // TestGF5DocsDoNotOverclaimACLProtected is the H3 revert-proof on the shipped

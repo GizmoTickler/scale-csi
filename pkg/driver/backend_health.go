@@ -623,6 +623,20 @@ func (d *Driver) markPoolHealthStale(snapshot *truenas.PoolHealthSnapshot) {
 		// and must not be overwritten by a decision made against an older pointer.
 		return
 	}
+	if backendHealthStaleAlreadyPublished(snapshot.Pool, true) {
+		// Nothing to publish. This matters because of WHO calls this: ListVolumes
+		// composes one condition per volume, so once the snapshot is past its TTL
+		// this path runs once PER VOLUME, and every run would otherwise deep-clone
+		// the whole metric generation and swap the global pointer to store a value
+		// that is already there. The pointer-identity guard above cannot absorb it —
+		// the CSI snapshot is not cleared, so the pointer keeps matching.
+		//
+		// This is a pure no-op skip and it does NOT weaken the guard above: the
+		// decision it declines to publish is byte-identical to what is already
+		// committed. The read is stable because every writer of the stale gauge
+		// holds backendHealthPublishMu, which this function is holding.
+		return
+	}
 	publishBackendHealthStaleOnlyMetrics(snapshot.Pool, true)
 }
 

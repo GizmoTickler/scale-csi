@@ -357,7 +357,7 @@ spec:
             severity: warning
           annotations:
             summary: Scale CSI backend pool has a disk temperature alert
-            description: At least one member disk of the pool backing Scale CSI volumes is raising a temperature alert. Interpret the count with scale_csi_pool_disk_temp_alerts_age_seconds; the age is absent until disk.temperature_alerts has returned successfully and is the component's actual observation age thereafter.
+            description: At least one member disk of the pool backing Scale CSI volumes is raising a temperature alert. The VALUE counts member disks that have at least one temperature alert (several alerts on one disk count once), plus any alert whose disk the appliance did not identify - those are counted individually because there is nothing to deduplicate them on. Interpret the count with scale_csi_pool_disk_temp_alerts_age_seconds; the age is absent until disk.temperature_alerts has returned successfully and is the component's actual observation age thereafter.
         - alert: ScaleCSIPoolHealthStale
           # Fires when the served VolumeCondition is no longer backed by a fresh
           # sample, and is the reason to distrust every other scale_csi_pool_*

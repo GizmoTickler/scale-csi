@@ -90,7 +90,7 @@ var (
 	)
 	backendHealthPoolTempAlertsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(metricsNamespace, "", backendHealthMetricPoolTempAlerts),
-		"Number of the pool's member disks currently raising a temperature alert", []string{"pool"}, nil,
+		"Member disks of the pool with at least one temperature alert, plus any alert whose disk the appliance did not identify (those are counted individually, not deduplicated)", []string{"pool"}, nil,
 	)
 	backendHealthTempAgeDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(metricsNamespace, "", backendHealthMetricTempAge),
@@ -450,6 +450,23 @@ func publishBackendHealthStaleOnlyMetrics(pool string, stale bool) {
 		metricPool.Stale = boolMetric(stale)
 		metricPool.StaleSet = true
 	})
+}
+
+// backendHealthStaleAlreadyPublished reports whether pool's staleness gauge is
+// ALREADY exactly this value in the current generation, so a caller can skip a
+// publication that would change nothing. Callers must hold
+// backendHealthPublishMu: every writer of the stale gauge holds it, so the read
+// is stable for the duration of the decision.
+func backendHealthStaleAlreadyPublished(pool string, stale bool) bool {
+	state := backendHealthState.Load()
+	if state == nil || state.Metrics == nil {
+		return false
+	}
+	metricPool := state.Metrics.Pools[pool]
+	if metricPool == nil || !metricPool.StaleSet {
+		return false
+	}
+	return metricPool.Stale == boolMetric(stale)
 }
 
 func publishBackendHealthTemperatureMetrics(pool string, alerts int, observedAt time.Time) {
