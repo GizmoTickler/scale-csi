@@ -362,6 +362,18 @@ func TestPoolHealth(t *testing.T) {
 	assert.False(t, snapshot.SampledAt.IsZero())
 }
 
+// TestPoolHealthRejectsUnexpectedMultipleFilteredResults proves the decoder
+// fails closed when the filtered middleware response has a valid first item
+// followed by an extra item. The response shape must be exactly one pool.
+func TestPoolHealthRejectsUnexpectedMultipleFilteredResults(t *testing.T) {
+	_, err := poolHealthFromQueryResult("flashstor", []interface{}{
+		map[string]interface{}{"name": "flashstor", "status": "ONLINE", "healthy": true},
+		map[string]interface{}{"name": "wrong-pool", "status": "ONLINE", "healthy": true},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected exactly one")
+}
+
 func TestPoolHealthSeverityHelpers(t *testing.T) {
 	var nilSnapshot *PoolHealthSnapshot
 	assert.False(t, nilSnapshot.Degraded())

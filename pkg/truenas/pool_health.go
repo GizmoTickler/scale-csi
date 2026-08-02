@@ -105,6 +105,9 @@ func poolHealthFromQueryResult(pool string, result interface{}) (*PoolHealthSnap
 	if !ok || len(pools) == 0 {
 		return nil, fmt.Errorf("pool %s not found", pool)
 	}
+	if len(pools) != 1 {
+		return nil, fmt.Errorf("pool %s query returned %d items; expected exactly one", pool, len(pools))
+	}
 	entry, ok := pools[0].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("unexpected pool.query entry type %T", pools[0])

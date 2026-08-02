@@ -13,11 +13,19 @@ import (
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
+// backendHealthSnapshot is the one immutable generation visible to both CSI
+// reads and Prometheus. The metric portion is deep-copied before each swap and
+// the CSI portion is never mutated after publication.
+type backendHealthSnapshot struct {
+	CSISnapshot *truenas.PoolHealthSnapshot
+	Metrics     *backendHealthMetricsSnapshot
+}
+
 // Backend-health metrics are deliberately exposed by one collector rather than
 // by GaugeVec children. A GaugeVec can be updated one child at a time, while a
 // Prometheus scrape gathers those children independently. The collector takes
-// one pointer to this immutable snapshot and emits every backend-health family
-// from that generation.
+// one pointer to the immutable backendHealthSnapshot and emits every
+// backend-health family from that generation.
 type backendHealthMetricsSnapshot struct {
 	Pools map[string]*backendHealthMetricPool
 }
@@ -93,9 +101,9 @@ var (
 		[]string{"pool"}, nil,
 	)
 
-	backendHealthMetricState atomic.Pointer[backendHealthMetricsSnapshot]
-	backendHealthMetricMu    sync.Mutex
-	backendHealthCollector   = &backendHealthMetricCollector{}
+	backendHealthState     atomic.Pointer[backendHealthSnapshot]
+	backendHealthMetricMu  sync.Mutex
+	backendHealthCollector = &backendHealthMetricCollector{}
 
 	// These read-only vector-shaped handles preserve the existing in-package test
 	// probes while making accidental per-gauge writes impossible. They are not
@@ -111,7 +119,9 @@ var (
 )
 
 func init() {
-	backendHealthMetricState.Store(&backendHealthMetricsSnapshot{Pools: map[string]*backendHealthMetricPool{}})
+	backendHealthState.Store(&backendHealthSnapshot{
+		Metrics: &backendHealthMetricsSnapshot{Pools: map[string]*backendHealthMetricPool{}},
+	})
 	prometheus.MustRegister(backendHealthCollector)
 	for _, name := range []string{
 		backendHealthMetricPoolStatus,
@@ -137,11 +147,11 @@ func (c *backendHealthMetricCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *backendHealthMetricCollector) Collect(ch chan<- prometheus.Metric) {
-	snapshot := backendHealthMetricState.Load()
-	if snapshot == nil {
+	snapshot := backendHealthState.Load()
+	if snapshot == nil || snapshot.Metrics == nil {
 		return
 	}
-	c.collectSnapshot(ch, snapshot, "")
+	c.collectSnapshot(ch, snapshot.Metrics, "")
 }
 
 func (c *backendHealthMetricCollector) collectSnapshot(ch chan<- prometheus.Metric, snapshot *backendHealthMetricsSnapshot, family string) {
@@ -233,6 +243,16 @@ func cloneBackendHealthMetricsSnapshot(previous *backendHealthMetricsSnapshot) *
 	return next
 }
 
+func cloneBackendHealthSnapshot(previous *backendHealthSnapshot) *backendHealthSnapshot {
+	next := &backendHealthSnapshot{Metrics: cloneBackendHealthMetricsSnapshot(nil)}
+	if previous == nil {
+		return next
+	}
+	next.CSISnapshot = previous.CSISnapshot
+	next.Metrics = cloneBackendHealthMetricsSnapshot(previous.Metrics)
+	return next
+}
+
 func cloneFloatMap(values map[string]float64) map[string]float64 {
 	if values == nil {
 		return nil
@@ -255,12 +275,21 @@ func cloneScanStateMap(values map[[2]string]float64) map[[2]string]float64 {
 	return cloned
 }
 
-func updateBackendHealthMetrics(mutator func(*backendHealthMetricsSnapshot)) {
+func updateBackendHealthState(mutator func(*backendHealthSnapshot)) {
 	backendHealthMetricMu.Lock()
 	defer backendHealthMetricMu.Unlock()
-	next := cloneBackendHealthMetricsSnapshot(backendHealthMetricState.Load())
+	next := cloneBackendHealthSnapshot(backendHealthState.Load())
 	mutator(next)
-	backendHealthMetricState.Store(next)
+	backendHealthState.Store(next)
+}
+
+func updateBackendHealthMetrics(mutator func(*backendHealthMetricsSnapshot)) {
+	updateBackendHealthState(func(state *backendHealthSnapshot) {
+		if state.Metrics == nil {
+			state.Metrics = cloneBackendHealthMetricsSnapshot(nil)
+		}
+		mutator(state.Metrics)
+	})
 }
 
 func ensureBackendHealthMetricPool(snapshot *backendHealthMetricsSnapshot, pool string) *backendHealthMetricPool {
@@ -317,17 +346,18 @@ func applyBackendHealthRawMetric(metricPool *backendHealthMetricPool, snapshot *
 	metricPool.TemperatureSampledAt = snapshot.TemperatureSampledAt
 }
 
-// publishBackendHealthSampleMetricsLocked publishes the complete metric state
-// for one successful pool sample. The caller holds the driver's
-// backendHealthPublishMu, so this atomic swap is ordered with the CSI pointer
-// and hysteresis state that represent the same publication.
-func publishBackendHealthSampleMetricsLocked(snapshot *truenas.PoolHealthSnapshot, pending bool) {
-	if snapshot == nil || snapshot.Pool == "" {
+// publishBackendHealthSampleState publishes the CSI-facing sample and the
+// complete metric state through one immutable generation. The metric snapshot
+// is the raw sample; csiSnapshot is the hysteresis-selected sample served by
+// CSI.
+func publishBackendHealthSampleState(csiSnapshot, metricSnapshot *truenas.PoolHealthSnapshot, pending bool) {
+	if csiSnapshot == nil || metricSnapshot == nil || metricSnapshot.Pool == "" {
 		return
 	}
-	updateBackendHealthMetrics(func(metrics *backendHealthMetricsSnapshot) {
-		metricPool := ensureBackendHealthMetricPool(metrics, snapshot.Pool)
-		applyBackendHealthRawMetric(metricPool, snapshot)
+	updateBackendHealthState(func(state *backendHealthSnapshot) {
+		state.CSISnapshot = csiSnapshot
+		metricPool := ensureBackendHealthMetricPool(state.Metrics, metricSnapshot.Pool)
+		applyBackendHealthRawMetric(metricPool, metricSnapshot)
 		metricPool.Stale = 0
 		metricPool.StaleSet = true
 		if pending {
@@ -336,10 +366,25 @@ func publishBackendHealthSampleMetricsLocked(snapshot *truenas.PoolHealthSnapsho
 			metricPool.FlipPending = 0
 		}
 		metricPool.FlipPendingSet = true
-		if !snapshot.SampledAt.IsZero() {
-			metricPool.LastSuccess = float64(snapshot.SampledAt.UnixNano()) / 1e9
+		if !metricSnapshot.SampledAt.IsZero() {
+			metricPool.LastSuccess = float64(metricSnapshot.SampledAt.UnixNano()) / 1e9
 			metricPool.LastSuccessSet = true
 		}
+	})
+}
+
+func publishBackendHealthTemperatureState(snapshot *truenas.PoolHealthSnapshot) {
+	if snapshot == nil || snapshot.Pool == "" {
+		return
+	}
+	updateBackendHealthState(func(state *backendHealthSnapshot) {
+		state.CSISnapshot = snapshot
+		metricPool := ensureBackendHealthMetricPool(state.Metrics, snapshot.Pool)
+		if !metricPool.RawPublished {
+			return
+		}
+		metricPool.TemperatureAlerts = float64(snapshot.TemperatureAlerts)
+		metricPool.TemperatureSampledAt = snapshot.TemperatureSampledAt
 	})
 }
 
@@ -468,11 +513,11 @@ func (v *backendHealthMetricVec) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (v *backendHealthMetricVec) Collect(ch chan<- prometheus.Metric) {
-	snapshot := backendHealthMetricState.Load()
-	if snapshot == nil {
+	snapshot := backendHealthState.Load()
+	if snapshot == nil || snapshot.Metrics == nil {
 		return
 	}
-	backendHealthCollector.collectSnapshot(ch, snapshot, v.family)
+	backendHealthCollector.collectSnapshot(ch, snapshot.Metrics, v.family)
 }
 
 type backendHealthMetricGauge struct {
@@ -483,14 +528,24 @@ type backendHealthMetricGauge struct {
 func (g *backendHealthMetricGauge) Desc() *prometheus.Desc { return g.vec.desc }
 
 func (g *backendHealthMetricGauge) Write(out *dto.Metric) error {
-	value := backendHealthMetricValue(backendHealthMetricState.Load(), g.vec.family, g.labels)
+	snapshot := backendHealthState.Load()
+	var metrics *backendHealthMetricsSnapshot
+	if snapshot != nil {
+		metrics = snapshot.Metrics
+	}
+	value := backendHealthMetricValue(metrics, g.vec.family, g.labels)
 	return prometheus.MustNewConstMetric(g.vec.desc, prometheus.GaugeValue, value, g.labels...).Write(out)
 }
 
 func (g *backendHealthMetricGauge) Describe(ch chan<- *prometheus.Desc) { ch <- g.vec.desc }
 
 func (g *backendHealthMetricGauge) Collect(ch chan<- prometheus.Metric) {
-	value := backendHealthMetricValue(backendHealthMetricState.Load(), g.vec.family, g.labels)
+	snapshot := backendHealthState.Load()
+	var metrics *backendHealthMetricsSnapshot
+	if snapshot != nil {
+		metrics = snapshot.Metrics
+	}
+	value := backendHealthMetricValue(metrics, g.vec.family, g.labels)
 	ch <- prometheus.MustNewConstMetric(g.vec.desc, prometheus.GaugeValue, value, g.labels...)
 }
 

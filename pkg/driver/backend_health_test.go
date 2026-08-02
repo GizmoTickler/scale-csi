@@ -20,6 +20,11 @@ import (
 )
 
 func healthTestDriver(mock *truenas.MockClient) *Driver {
+	backendHealthMetricMu.Lock()
+	backendHealthState.Store(&backendHealthSnapshot{
+		Metrics: &backendHealthMetricsSnapshot{Pools: map[string]*backendHealthMetricPool{}},
+	})
+	backendHealthMetricMu.Unlock()
 	return &Driver{
 		name: "org.scale.csi",
 		config: &Config{
@@ -360,7 +365,7 @@ func TestSampleBackendHealthRejectsMalformedDecodedSamples(t *testing.T) {
 			d := healthTestDriver(mock)
 
 			d.sampleBackendHealth(context.Background(), pool)
-			assert.Nil(t, d.backendHealth.Load(), "a malformed decoded item must not publish a snapshot")
+			assert.Nil(t, d.loadBackendHealthSnapshot(), "a malformed decoded item must not publish a snapshot")
 			assert.Equal(t, 1, mock.PoolHealthCalls)
 			assert.Zero(t, testutil.ToFloat64(poolHealthLastSuccess.WithLabelValues(pool)),
 				"a malformed decoded item must not advance last-success")
@@ -487,9 +492,9 @@ func TestPoolHealthSnapshotExpires(t *testing.T) {
 	require.True(t, d.volumeCondition(managedDataset()).GetAbnormal())
 
 	// Age the cached snapshot past its TTL (3 x interval).
-	stale := *d.backendHealth.Load()
+	stale := *d.loadBackendHealthSnapshot()
 	stale.SampledAt = time.Now().Add(-d.backendHealthTTL() - time.Second)
-	d.backendHealth.Store(&stale)
+	d.storeBackendHealthSnapshot(&stale)
 
 	assert.Nil(t, d.poolHealthSnapshot(), "a snapshot older than its TTL must stop driving conditions")
 	assert.Equal(t, volumeConditionFromDataset(managedDataset()), d.volumeCondition(managedDataset()),
@@ -547,7 +552,7 @@ func TestBackendHealthStalePublicationSurvivesAConcurrentSample(t *testing.T) {
 			SampledAt: time.Now().Add(-d.backendHealthTTL() - time.Second),
 		}
 		d.backendHealthPendingFlips.Store(0)
-		d.backendHealth.Store(expired)
+		d.storeBackendHealthSnapshot(expired)
 		// The read path has already raised staleness for the expired snapshot; the
 		// successful sample below is what has to clear it and keep it cleared.
 		SetPoolHealthStale(pool, true)
@@ -571,7 +576,7 @@ func TestBackendHealthStalePublicationSurvivesAConcurrentSample(t *testing.T) {
 		stop.Store(true)
 		wg.Wait()
 
-		published := d.backendHealth.Load()
+		published := d.loadBackendHealthSnapshot()
 		require.NotNil(t, published)
 		require.NotSame(t, expired, published, "round %d: the poller must have published a fresh snapshot", round)
 		if got := testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)); got != 0 {
@@ -763,6 +768,80 @@ func TestBackendHealthCollectorGatherIsSingleGeneration(t *testing.T) {
 	assert.Greater(t, completeObservations.Load(), int64(0), "the reader must observe complete backend-health metric generations")
 }
 
+// TestBackendHealthCSISnapshotAndGatherAreSingleGeneration uses the real
+// sampler while deliberately blocking its metric-side commit. On 583f582 the
+// CSI pointer was stored before the metric pointer, so this exact interleave
+// observed OFFLINE through CSI while Gather still reported ONLINE. A unified
+// backendHealthState must keep both readers on the old generation until the
+// one-pointer commit is possible.
+func TestBackendHealthCSISnapshotAndGatherAreSingleGeneration(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("the concurrent publication requires at least two schedulable Ps")
+	}
+	const pool = "nf1-csi-gather-generation-pool"
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Pool: pool, Status: truenas.PoolStatusOnline, Healthy: true}
+	d := healthTestDriver(mock)
+	d.sampleBackendHealth(context.Background(), pool)
+
+	mock.SetPoolHealthValue(&truenas.PoolHealthSnapshot{Pool: pool, Status: truenas.PoolStatusOffline})
+	backendHealthMetricMu.Lock()
+	sampleDone := make(chan struct{})
+	go func() {
+		d.sampleBackendHealth(context.Background(), pool)
+		close(sampleDone)
+	}()
+
+	var mismatch string
+	deadline := time.Now().Add(750 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		csiSnapshot := d.poolHealthSnapshot()
+		families, err := prometheus.DefaultGatherer.Gather()
+		if err != nil {
+			mismatch = fmt.Sprintf("gather failed during concurrent publish: %v", err)
+			break
+		}
+		if csiSnapshot == nil {
+			runtime.Gosched()
+			continue
+		}
+		online, onlineOK := gatheredBackendHealthGauge(families, "scale_csi_pool_status", map[string]string{"pool": pool, "status": truenas.PoolStatusOnline})
+		offline, offlineOK := gatheredBackendHealthGauge(families, "scale_csi_pool_status", map[string]string{"pool": pool, "status": truenas.PoolStatusOffline})
+		if !onlineOK || !offlineOK {
+			runtime.Gosched()
+			continue
+		}
+		wantOffline := csiSnapshot.Status == truenas.PoolStatusOffline
+		if wantOffline != (offline == 1 && online == 0) {
+			mismatch = fmt.Sprintf("CSI and Gather observed different generations: CSI status=%s, online=%v, offline=%v", csiSnapshot.Status, online, offline)
+			break
+		}
+		runtime.Gosched()
+	}
+	backendHealthMetricMu.Unlock()
+
+	select {
+	case <-sampleDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("real publishSample did not complete after the metric commit was released")
+	}
+	if mismatch != "" {
+		t.Fatal(mismatch)
+	}
+
+	csiSnapshot := d.poolHealthSnapshot()
+	require.NotNil(t, csiSnapshot)
+	assert.Equal(t, truenas.PoolStatusOffline, csiSnapshot.Status)
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	offline, offlineOK := gatheredBackendHealthGauge(families, "scale_csi_pool_status", map[string]string{"pool": pool, "status": truenas.PoolStatusOffline})
+	online, onlineOK := gatheredBackendHealthGauge(families, "scale_csi_pool_status", map[string]string{"pool": pool, "status": truenas.PoolStatusOnline})
+	require.True(t, offlineOK)
+	require.True(t, onlineOK)
+	assert.Equal(t, 1.0, offline)
+	assert.Equal(t, 0.0, online)
+}
+
 // TestPoolHealthLastSuccessTimestampTracksSamplesNotScrapes pins N3: the triage
 // procedure needs the driver's own last successful sample time. PromQL
 // timestamp() returns the SAMPLE's timestamp, which for a pull exporter is the
@@ -894,9 +973,9 @@ func TestPoolHealthStaleRaisedWhenTheTTLExpires(t *testing.T) {
 	// The cached snapshot ages past its TTL WHILE that call hangs, so the
 	// failed-sample branch cannot run and nothing in the poll loop will publish
 	// until the call returns.
-	expired := *d.backendHealth.Load()
+	expired := *d.loadBackendHealthSnapshot()
 	expired.SampledAt = time.Now().Add(-d.backendHealthTTL() - time.Second)
-	d.backendHealth.Store(&expired)
+	d.storeBackendHealthSnapshot(&expired)
 
 	require.Nil(t, d.poolHealthSnapshot(), "past the TTL the snapshot stops being served")
 	assert.Equal(t, 1.0, testutil.ToFloat64(poolHealthStale.WithLabelValues(pool)),
@@ -930,7 +1009,7 @@ func TestMarkPoolHealthStaleYieldsToAFreshSample(t *testing.T) {
 	fresh := &truenas.PoolHealthSnapshot{
 		Pool: pool, Status: truenas.PoolStatusOnline, Healthy: true, SampledAt: time.Now(),
 	}
-	d.backendHealth.Store(fresh)
+	d.storeBackendHealthSnapshot(fresh)
 	SetPoolHealthStale(pool, false)
 
 	// The read path decided on the now-superseded snapshot.
@@ -1058,9 +1137,9 @@ func TestBackendHealthPollStallHoldsConditionAndFlagsStale(t *testing.T) {
 		"the flip stays pending while the backend is silent")
 
 	// Past the TTL the held verdict stops driving conditions at all.
-	held := *d.backendHealth.Load()
+	held := *d.loadBackendHealthSnapshot()
 	held.SampledAt = time.Now().Add(-d.backendHealthTTL() - time.Second)
-	d.backendHealth.Store(&held)
+	d.storeBackendHealthSnapshot(&held)
 	d.sampleBackendHealth(ctx, pool)
 	assert.Nil(t, d.poolHealthSnapshot(), "past the TTL the snapshot is not served")
 	assert.Equal(t, volumeConditionFromDataset(managedDataset()), d.volumeCondition(managedDataset()),
