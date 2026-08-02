@@ -260,15 +260,36 @@ removal-only configmap render + a render-assert in the same commit.
   `scale_csi_clone_promotes_refused_total{reason}`.
 - **E4 — Quota/usage reporting (`zfs.reportVolumeUsage`).** ControllerGetVolume
   fetches each volume's quota/usage (one `pool.dataset.query`) and reports a
-  near-quota VolumeCondition (abnormal above 95% of the effective quota). The
-  per-volume gauges are ALSO published from the reconcile pass's existing dataset
-  walk (zero extra API calls), because the shipped external-health-monitor
-  sidecar drives ListVolumes rather than per-PV ControllerGetVolume — without
-  that the `ScaleCSIVolumeNearQuota` alert would essentially never fire. Series
-  are dropped at DeleteVolume and re-derived each pass, so a gauge cannot latch.
-  Metrics: `scale_csi_volume_used_bytes{volume}`,
+  near-quota VolumeCondition (abnormal above 95% of the effective limit). Each
+  limit is compared against the quantity ZFS actually bounds with it —
+  `refquota` against `referenced`, `quota` against `used` (which includes
+  snapshot-held space), taking the tighter when both are set — so a volume whose
+  snapshots hold gigabytes is not misreported near-quota while its writable
+  space is free; the condition message names the binding property and calls out
+  snapshot-held space. Block volumes (zvols) are covered through
+  `volsize`/`referenced` — a backend-occupancy figure, not guest-filesystem
+  fullness. The per-volume gauges are ALSO published from the reconcile pass's
+  existing dataset walk (zero extra API calls), because the shipped
+  external-health-monitor sidecar drives ListVolumes rather than per-PV
+  ControllerGetVolume — without that the `ScaleCSIVolumeNearQuota` alert would
+  essentially never fire. Series are dropped at DeleteVolume and re-derived each
+  pass, so a gauge cannot latch. Metrics: `scale_csi_volume_used_bytes{volume}`,
   `scale_csi_volume_quota_bytes{volume}`, `scale_csi_volume_near_quota{volume}`,
   and the `ScaleCSIVolumeNearQuota` alert.
+
+**Final-verification hardening (v1.5.0 round).** The scheduled-snapshot
+provenance chain is now diagnosable: a snapshot that carries the driver's
+scheduled-name shape but fails the name/creation-skew/zone proof increments
+`scale_csi_scheduled_snapshot_unproven_total{reason}` with a distinct warning,
+and the DeleteVolume refusal reports how many such snapshots exist instead of
+blaming a foreign task. `snapshotSchedule` cron fields are content-validated at
+CreateVolume (`InvalidArgument` on a malformed field, as always documented —
+previously only the field count was checked, so a typo'd schedule silently
+provisioned without PITR). Every GF2 degradation counter now has a gated
+PrometheusRule alert (task-ensure/task-delete failures, hold failures, timezone
+resolution failures, promote refusals) so a silently absent protection pages
+someone. The near-quota VolumeCondition upgrades an existing abnormal condition
+instead of replacing it.
 
 **Lifecycle safety notes.** Snapshot-hold release is fail-safe against
 configuration history: any driver destroy refused with `EBUSY` ("has the
