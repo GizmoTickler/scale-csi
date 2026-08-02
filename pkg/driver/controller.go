@@ -1714,6 +1714,12 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// (GF2-fix/F6). A no-op when the feature never published one.
 	DeleteVolumeUsageMetrics(volumeID)
 
+	// Same discipline for the encryption reconciler's per-volume bookkeeping (the
+	// unlock failure streak and the converged rotation-window fingerprint): a
+	// deleted volume must not keep an entry alive for the life of the process. A
+	// no-op for a volume that never had one.
+	d.forgetEncryptionVolumeState(volumeID)
+
 	klog.Infof("Volume %s deleted successfully", volumeID)
 
 	return &csi.DeleteVolumeResponse{}, nil
@@ -3737,6 +3743,15 @@ func (d *Driver) handleVolumeContentSource(
 			}
 			createdDS = verified
 		}
+		// GF-Sprint 1 backstop, UNCONDITIONAL (not gated on encryption.enabled):
+		// whatever mechanism produced this dataset, if it came out ENCRYPTED with no
+		// encryption policy of its own the driver can never unlock it. Destroy it
+		// here rather than hand back a volume that dies at the next appliance
+		// reboot. Reads the wire state the path already holds — +0 RTT.
+		if refuseEncryptedContentSourceResult(ctx, createdDS) {
+			return nil, blockGeometry{}, d.destroyRefusedEncryptedContentSource(ctx, datasetName, "",
+				fmt.Sprintf("snapshot %s", snapshotID))
+		}
 
 	} else if volume := source.GetVolume(); volume != nil {
 		// Clone from volume
@@ -3885,6 +3900,11 @@ func (d *Driver) handleVolumeContentSource(
 			return nil, blockGeometry{}, status.Errorf(codes.Internal, "failed to set content source properties for volume clone: %v", updateErr)
 		}
 		createdDS = verified
+		// GF-Sprint 1 backstop, UNCONDITIONAL — see the snapshot branch.
+		if refuseEncryptedContentSourceResult(ctx, createdDS) {
+			return nil, blockGeometry{}, d.destroyRefusedEncryptedContentSource(ctx, datasetName, snap.ID,
+				fmt.Sprintf("volume %s", sourceVolumeID))
+		}
 	}
 
 	return createdDS, resolvedGeometry, nil

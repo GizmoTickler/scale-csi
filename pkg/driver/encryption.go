@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 
@@ -363,20 +364,28 @@ func (d *Driver) guardExistingEncryptionPolicy(ctx context.Context, ds *truenas.
 //     produce without an explicit decision, so this is fail-closed until the
 //     drill settles it (see scripts/gf1-encryption-drill.sh step 6b).
 //
-// It costs one extra pool.dataset.query ONLY when encryption is enabled
-// controller-wide AND the caller has no already-read source dataset to hand; a
-// deployment with encryption off pays nothing and its clone/restore call counts
-// are byte-identical to pre-encryption.
+// THE HAZARD IS A PROPERTY OF THE DATA, NOT OF THE FEATURE FLAG. This check is
+// therefore NOT gated on encryption.enabled: turning the flag off (a rollback, a
+// values regression, "we do not use encryption any more") while encrypted
+// volumes still exist must not re-open the ability to clone one — that is the
+// configuration in which the resulting dead volume is least likely to be
+// noticed. The flag only decides how hard the driver LOOKS: with an already-read
+// source dataset the check is free and always runs; the extra
+// pool.dataset.query for a source the caller has not read is issued only when
+// encryption is enabled, and the unconditional post-create wire check in
+// refuseEncryptedContentSourceResult is the backstop that closes the flag-off
+// case at +0 RTT. A deployment that has never used encryption pays nothing on
+// either path.
 func (d *Driver) guardEncryptedContentSource(
 	ctx context.Context,
 	sourceDataset string,
 	sourceDS *truenas.Dataset,
 	sourceDescription string,
 ) error {
-	if d.config == nil || !d.config.Encryption.Enabled {
-		return nil
-	}
 	if sourceDS == nil {
+		if d.config == nil || !d.config.Encryption.Enabled {
+			return nil
+		}
 		var err error
 		sourceDS, err = d.truenasClient.DatasetGet(ctx, sourceDataset)
 		if err != nil {
@@ -396,6 +405,68 @@ func (d *Driver) guardEncryptedContentSource(
 			"never unlock it — the volume would be dead I/O after the first appliance reboot. Provision a fresh "+
 			"encrypted volume from the encrypted StorageClass and copy the data in",
 		sourceDescription)
+}
+
+// refuseEncryptedContentSourceResult is the UNCONDITIONAL backstop for the
+// encrypted-content-source refusal. It runs on the dataset the content-source
+// path actually MATERIALIZED, whose wire state the driver already holds (+0
+// RTT), and it fires regardless of encryption.enabled and regardless of which
+// mechanism produced the dataset — a clone (encrypted with its origin's key by
+// P-7) or a detached send/recv (whose encryption outcome is UNPROBED, see
+// guardEncryptedContentSource).
+//
+// It reports whether the freshly created content-source volume is encrypted
+// while carrying no encryption policy of its own. The caller must destroy it and
+// fail: a volume in that state is one the driver can never unlock — publish
+// would not (no local stamp to key off, and no key of its own to load) and the
+// unlock reconciler skips it as foreign — so the first appliance reboot would
+// leave it dead with no recovery path.
+func refuseEncryptedContentSourceResult(ctx context.Context, createdDS *truenas.Dataset) bool {
+	if createdDS == nil || !createdDS.Encrypted {
+		return false
+	}
+	// An encrypted destination is refused with a content source before any
+	// mutation, so a resolution present here would be a contradiction; treat it as
+	// "already accounted for" rather than destroying a volume this path did key.
+	return encryptionResolutionFromContext(ctx) == nil
+}
+
+// destroyRefusedEncryptedContentSource rolls back a content-source volume the
+// backstop refused, then returns the operator-facing refusal.
+//
+// The destroy is recursive+force because a detached copy still holds the
+// snapshot it received, and it does NOT use the guarded clone-cleanup helper:
+// that helper refuses to delete an OWNED dataset, and by this point the fold
+// write has stamped OUR ownership on it — the very dataset this call created
+// moments ago. Nothing else can be the owner here: a concurrent second creator
+// fails at the clone/copy with a destination-exists error long before reaching
+// this point. The in-flight marker is retired only when the destroy verifiably
+// succeeded, so a failed rollback stays recoverable by the remnant machinery
+// instead of becoming an invisible leak.
+func (d *Driver) destroyRefusedEncryptedContentSource(
+	ctx context.Context,
+	datasetName, tempSnapshotID, sourceDescription string,
+) error {
+	message := fmt.Sprintf(
+		"the volume materialized from %s came out ENCRYPTED but carries no encryption policy of its own (its key "+
+			"belongs to its origin, P-7). The driver could never unlock it, so it must not be handed back as a "+
+			"working volume. Provision a fresh volume from the encrypted StorageClass and copy the data in",
+		sourceDescription)
+	if destroyErr := d.truenasClient.DatasetDelete(ctx, datasetName, true, true); destroyErr != nil {
+		klog.Errorf("Failed to destroy refused encrypted content-source volume %s: %v", datasetName, destroyErr)
+		return status.Errorf(codes.FailedPrecondition,
+			"%s. Automatic cleanup of %s FAILED (%v) — destroy it manually", message, datasetName, destroyErr)
+	}
+	if tempSnapshotID != "" {
+		if err := d.truenasClient.SnapshotDelete(ctx, tempSnapshotID, false, false); err != nil {
+			klog.Warningf("Failed to clean up temporary clone-source snapshot %s after refusing an encrypted "+
+				"content source: %v", tempSnapshotID, err)
+		}
+	}
+	d.deleteInflightMarker(ctx, path.Base(datasetName))
+	klog.Warningf("Destroyed %s: it materialized ENCRYPTED from %s with no encryption policy of its own, so the "+
+		"driver could never have unlocked it", datasetName, sourceDescription)
+	return status.Error(codes.FailedPrecondition, message)
 }
 
 // applyEncryptionToCreateParams folds the request-scoped encryption resolution
@@ -497,13 +568,33 @@ func (d *Driver) unlockEncryptedDatasetForPublish(ctx context.Context, ds *truen
 			"encrypted volume %s is locked and requires a controller-publish secret with a %q key to unlock it",
 			volumeID, encryptionSecretKeyPassphrase)
 	}
-	if locked && !isEncryptedDataset(ds) {
-		klog.Warningf("Volume %s is locked and the backend reports it encrypted, but it carries no local encryption "+
-			"stamp (an interrupted create, or encryption inherited from a content source). Unlocking it with the "+
-			"supplied publish secret; replay CreateVolume against the same encrypted StorageClass to repair the stamp.",
-			volumeID)
+	// OWNERSHIP decides whether this volume's KEY is ours to change. ds comes from
+	// ControllerPublishVolume's own pool.dataset.query read, so its property
+	// sources are real: a LOCAL encryption stamp means this driver keyed this
+	// dataset. Encrypted-on-the-wire with no local stamp is either an interrupted
+	// create or a dataset whose key is INHERITED from a content-source origin
+	// (P-7).
+	//
+	// The asymmetry is deliberate. UNLOCK is still attempted for such a volume —
+	// fail-closed, and it is the only chance an interrupted create's dataset has
+	// of coming back. RE-KEY is not: change_key on an inheriting child is refused
+	// by ZFS ("not an encryption root"), so attempting it would turn a healthy,
+	// unlocked, serving clone into a FAILED publish with an
+	// EncryptionRotationIncomplete Event telling the operator to keep a key that
+	// has nothing to do with the problem.
+	ownsKey := isEncryptedDataset(ds)
+	if !ownsKey {
+		if locked {
+			klog.Warningf("Volume %s is locked and the backend reports it encrypted, but it carries no local "+
+				"encryption stamp (an interrupted create, or encryption inherited from a content source). Attempting "+
+				"the unlock with the supplied publish secret; replay CreateVolume against the same encrypted "+
+				"StorageClass to repair the stamp.", volumeID)
+		} else if keys.rotationIntent() {
+			klog.V(4).Infof("Volume %s is encrypted but its key is not this volume's own (inherited or unstamped); "+
+				"the open rotation window does not apply to it and no re-key is attempted", volumeID)
+		}
 	}
-	return d.convergeEncryptedDatasetKey(ctx, datasetName, volumeID, locked, keys)
+	return d.convergeEncryptedDatasetKey(ctx, datasetName, volumeID, locked, keys, ownsKey)
 }
 
 // convergeEncryptedDatasetKey drives a dataset to the state the Secret says it
@@ -539,16 +630,33 @@ func (d *Driver) convergeEncryptedDatasetKey(
 	datasetName, volumeID string,
 	locked bool,
 	keys encryptionKeys,
+	ownsKey bool,
 ) error {
-	rotating := keys.rotationIntent()
+	// A dataset whose key is inherited or unstamped is never re-keyed: it is not
+	// this volume's key (P-7), and ZFS refuses change_key on an inheriting child
+	// anyway. Unlock still runs below when it is locked.
+	rotating := keys.rotationIntent() && ownsKey
 
 	if !locked {
 		if !rotating {
 			return nil
 		}
+		// ONCE PER WINDOW, per volume, per process. change_key at the default
+		// pbkdf2iters (1,300,000 — P-1) is a CPU-heavy appliance job, and this arm
+		// runs on EVERY publish while the window is open: a node reboot that
+		// re-publishes a fleet, or a flapping pod, would otherwise turn a window the
+		// operator forgot to close into a change_key storm plus a stream of
+		// "Rotated" Events that hide the real rotation. The fingerprint is a salted
+		// hash of the two keys, never key material, and a NEW window (different
+		// keys) converges again. Shared with the unlock reconciler — one guard, both
+		// callers.
+		if d.encryptionRotationConvergedFor(volumeID, keys) {
+			return nil
+		}
 		if changeErr := d.truenasClient.DatasetChangeKey(ctx, datasetName, keys.Passphrase); changeErr != nil {
 			return d.noteEncryptionRotationIncomplete(volumeID, keys, changeErr)
 		}
+		d.markEncryptionRotationConverged(volumeID, keys)
 		d.recordEncryptionRotated(volumeID)
 		return nil
 	}
@@ -575,6 +683,7 @@ func (d *Driver) convergeEncryptedDatasetKey(
 	if changeErr := d.truenasClient.DatasetChangeKey(ctx, datasetName, keys.Passphrase); changeErr != nil {
 		return d.noteEncryptionRotationIncomplete(volumeID, keys, changeErr)
 	}
+	d.markEncryptionRotationConverged(volumeID, keys)
 	d.recordEncryptionRotated(volumeID)
 	return nil
 }
@@ -592,6 +701,22 @@ func (d *Driver) recordEncryptionRotated(volumeID string) {
 // drop passphrasePrevious. It emits a Warning Event saying exactly that, logs it
 // redacted, and returns an error — never success — so the next publish or
 // reconcile pass re-attempts the completion.
+// encryptionRotationIncompleteError marks the ONE failure mode in which the
+// dataset ends up UNLOCKED but on the wrong key: unlock succeeded (or was never
+// needed) and change_key failed. Callers must be able to tell it apart from a
+// lost unlock race, which also re-reads as "unlocked" but is benign. It carries
+// its own gRPC status so the publish path's error code and message are
+// unchanged.
+type encryptionRotationIncompleteError struct {
+	status *status.Status
+}
+
+func (e *encryptionRotationIncompleteError) Error() string { return e.status.Message() }
+
+// GRPCStatus lets status.FromError / status.Code see through the wrapper, so the
+// CO still receives Internal with the redacted message.
+func (e *encryptionRotationIncompleteError) GRPCStatus() *status.Status { return e.status }
+
 func (d *Driver) noteEncryptionRotationIncomplete(volumeID string, keys encryptionKeys, cause error) error {
 	detail := redactEncryptionError(cause, keys.Passphrase, keys.Previous)
 	d.recordWarningEvent(volumeEventRef(volumeID), EventReasonEncryptionRotationIncomplete,
@@ -600,7 +725,7 @@ func (d *Driver) noteEncryptionRotationIncomplete(volumeID string, keys encrypti
 			"observed for this volume — removing it now can make the data permanently unrecoverable", volumeID))
 	klog.Warningf("Encryption rotation for volume %s did not complete (re-key failed, rotation window must stay open): %s",
 		volumeID, detail)
-	return status.Errorf(codes.Internal,
+	return &encryptionRotationIncompleteError{status: status.Newf(codes.Internal,
 		"encrypted volume %s: re-keying to the current passphrase failed, so the rotation window must stay open "+
-			"(keep passphrasePrevious in the Secret): %s", volumeID, detail)
+			"(keep passphrasePrevious in the Secret): %s", volumeID, detail)}
 }
