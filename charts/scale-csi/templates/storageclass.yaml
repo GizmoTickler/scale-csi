@@ -61,8 +61,8 @@ parameters:
   {{- end }}
   {{- /* Curated ZFS performance class. Emitted only when set; unset classes
        inherit the parent dataset's properties plus zfs.datasetProperties,
-       exactly as before. volblocksize/logbias/primarycache/secondarycache are
-       CREATE-ONLY: a class change on an existing PVC is rejected, not applied. */}}
+       exactly as before. volblocksize is CREATE-ONLY, so a class change that
+       moves an existing zvol's geometry is rejected, not applied. */}}
   {{- if $storageClass.zfsPerformanceClass }}
   {{- $_ := set $parameters "zfsPerformanceClass" $storageClass.zfsPerformanceClass -}}
   {{- end }}

@@ -200,17 +200,27 @@ volumes. Every value is validated against the backend's own
 mismatch is an `InvalidArgument` rather than an opaque `pool.dataset.create`
 failure.
 
-| Class | `recordsize` (fs) | `volblocksize` (zvol) | `sync` | `logbias` | `compression` | `primarycache` | `special_small_block_size` | `atime` |
-|---|---|---|---|---|---|---|---|---|
-| `database` | 16K | 16K | standard | latency | LZ4 | all | 16K | off |
-| `media` | 1M | 64K | standard | throughput | ZSTD | all | — | off |
-| `vm` | 64K | 16K | standard | latency | LZ4 | all | — | off |
-| `backup` | 1M | 128K | standard | throughput | ZSTD | metadata | — | off |
-| `general` | 128K | 16K | standard | latency | LZ4 | all | — | off |
+| Class | `recordsize` (fs) | `volblocksize` (zvol) | `sync` | `compression` | `special_small_block_size` | `atime` |
+|---|---|---|---|---|---|---|
+| `database` | 16K | 16K | standard | LZ4 | 16K | off |
+| `media` | 1M | 64K | standard | ZSTD | — | off |
+| `vm` | 64K | 16K | standard | LZ4 | — | off |
+| `backup` | 1M | 128K | standard | ZSTD | — | off |
+| `general` | 128K | 16K | standard | LZ4 | — | off |
 
 Filesystem-only keys (`recordsize`, `atime`) are dropped for zvols and the
 volume-only key (`volblocksize`) is dropped for filesystems, exactly as
 `zfs.datasetProperties` already behaves.
+
+**No class sets `logbias` or `primarycache`.** The TrueNAS 26.0 API does not
+expose them: probed live on 2026-08-02, `pool.dataset.create` **and**
+`pool.dataset.update` reject `logbias`, `primarycache` and `secondarycache` for
+both dataset types with `Extra inputs are not permitted`, and no other
+middleware method sets them. If you need either property, set it out of band
+with `zfs set` — most usefully on the CSI parent dataset, which every new volume
+inherits from. One visible consequence: on a **filesystem**, `backup` and
+`media` now resolve to the same properties, because ARC policy
+(`primarycache=metadata`) was the only thing that separated them.
 
 The preset is layered **under** `zfs.datasetProperties`: an explicit operator
 key always wins. The one exception matches pre-existing behavior — zvol
@@ -226,8 +236,11 @@ warning rather than failing provisioning. Note the correct key is
 
 | Create-only (**immutable**) | Live-tunable |
 |---|---|
-| `volblocksize` — zvol geometry, immutable in ZFS itself | `recordsize`, `sync`, `compression`, `checksum` |
-| `logbias`, `primarycache`, `secondarycache` — rejected by `pool.dataset.update` | `atime`, `special_small_block_size`, `copies`, `readonly` |
+| `volblocksize` — zvol geometry, immutable in ZFS itself | `recordsize`, `sync`, `compression`, `checksum`, `atime`, `special_small_block_size`, `copies`, `readonly` |
+
+`volblocksize` is the only create-only property the presets emit, so in practice
+a **zvol** (iSCSI/NVMe-oF) class change can be refused and a **filesystem**
+(NFS) class change never is.
 
 A volume records the class it was **created** with. If a bound PVC's
 StorageClass later names a different class:
@@ -257,8 +270,8 @@ The driver therefore **ignores** `zfsPerformanceClass` on those volumes, does
 was never applied would be worse than useless: the immutability guard treats the
 stamp as ground truth, so a stamped clone would be both falsely accepted (a
 `general`-geometry volume passing every future check as `database`) and falsely
-rejected (`logbias ... fixed when the dataset is created`, for a property the
-driver never set on that dataset).
+rejected (`volblocksize ... fixed when the dataset is created`, for a property
+the driver never set on that dataset).
 
 A class stamp the volume **inherited from its source** is treated the same way.
 ZFS copies a source dataset's user properties into a clone (and a detached

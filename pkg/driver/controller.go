@@ -565,7 +565,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// geometry and accepts no property payload, so stamping there would be a
 	// silent correctness lie in both directions: a later replay would be
 	// false-accepted against a class the volume does not carry, or false-rejected
-	// with "logbias is fixed when the dataset is created" for a property the
+	// with "volblocksize is fixed when the dataset is created" for a property the
 	// driver never set on this dataset.
 	performanceClassApplied := false
 	if req.GetVolumeContentSource() != nil {
@@ -634,7 +634,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			// immutability guard exists to prevent.
 			message := fmt.Sprintf(
 				"StorageClass parameter %s=%q was IGNORED for volume %s: the volume is provisioned from a %s content source, "+
-					"and a ZFS clone/restore inherits the origin dataset's geometry (recordsize, volblocksize, logbias, ...) — "+
+					"and a ZFS clone/restore inherits the origin dataset's geometry (recordsize, volblocksize, compression, ...) — "+
 					"the curated properties cannot be applied and the volume is NOT stamped with the class "+
 					"(any class stamp copied from the source is scrubbed, and the class guard never treats a content-source "+
 					"volume's stamp as authoritative). "+
@@ -1027,11 +1027,12 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		}
 	}
 
-	// IMMUTABILITY GUARD (risk R1). volblocksize is immutable in ZFS itself, and
-	// logbias/primarycache/secondarycache are rejected by pool.dataset.update, so
-	// a StorageClass that now names a different curated class CANNOT be satisfied
-	// in place. Refuse loudly rather than let an operator believe an existing
-	// volume was retuned.
+	// IMMUTABILITY GUARD (risk R1). volblocksize is immutable in ZFS itself, so a
+	// StorageClass that now names a curated class with a different zvol geometry
+	// CANNOT be satisfied in place. Refuse loudly rather than let an operator
+	// believe an existing volume was retuned. Every other curated property is
+	// live-tunable, and for those the guard warns instead of refusing (the driver
+	// still does not retune existing datasets).
 	if requestedClass := zfsPerformanceClassFromContext(ctx); requestedClass != "" {
 		storedClass := datasetUserProperty(existingDS, PropZFSPerformanceClass)
 		if storedClass == "-" {

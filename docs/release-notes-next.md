@@ -148,14 +148,36 @@ silently disable whatever the reader could not see, for every export on the box.
 ### ZFS performance classes
 
 `zfsPerformanceClass` (`database`, `media`, `vm`, `backup`, `general`) applies a
-vetted ZFS property preset to newly provisioned volumes, validated against the
-backend's own `recordsize`/`compression`/`checksum` choice lists so a mismatch
-is `InvalidArgument` rather than an opaque `pool.dataset.create` failure. The
+vetted ZFS property preset — `recordsize`, `volblocksize`, `sync`,
+`compression`, `special_small_block_size`, `atime` — to newly provisioned
+volumes, validated against the backend's own
+`recordsize`/`compression`/`checksum` choice lists so a mismatch is
+`InvalidArgument` rather than an opaque `pool.dataset.create` failure. The
 preset is layered **under** `zfs.datasetProperties` — an explicit operator key
 always wins — and `special_small_block_size` is dropped with a warning on a pool
-with no `special` vdev instead of failing provisioning. `volblocksize`,
-`logbias`, `primarycache` and `secondarycache` are **create-only**: a class
-change on an existing PVC is rejected, not applied.
+with no `special` vdev instead of failing provisioning. `volblocksize` is
+**create-only** (immutable in ZFS itself), so a class change that would move a
+zvol's geometry is rejected rather than applied; every other curated property is
+live-tunable, so a filesystem class change is warned about rather than refused.
+
+**No preset sets `logbias` or `primarycache`, and that is a backend limit rather
+than a preference.** The v1.5.0 presets emitted both on the strength of a probe
+of `pool.dataset.update` alone, generalized into "create-only through this API".
+Probed properly on 2026-08-02 against live TrueNAS 26.0, `logbias`,
+`primarycache` and `secondarycache` are rejected by `pool.dataset.create` **and**
+`pool.dataset.update`, for FILESYSTEM and VOLUME alike (`Extra inputs are not
+permitted`); they are absent from the 26.0 schema, and an audit of
+`core.get_methods` found no alternative setter. Set either property out of band
+with `zfs set` — e.g. on the CSI parent dataset, which new volumes inherit from —
+if you need it. On a filesystem this makes `backup` and `media` resolve to the
+same properties, since `primarycache=metadata` was all that separated them.
+
+`MockClient` now enforces the 26.0 dataset payload schema, so a key the
+appliance would reject fails a unit test instead of every `CreateVolume` against
+a real appliance. `zfs.datasetProperties` still passes these three keys through —
+the supported floor is 25.04 and only 26.0 was probed — but now logs a warning
+naming the property and the `zfs set` alternative instead of leaving the
+operator with `Invalid params`.
 
 **The content-source exemption is deliberate and complete.** A PVC created from
 a `dataSource` is materialized by a ZFS clone or a dataset copy; both inherit the

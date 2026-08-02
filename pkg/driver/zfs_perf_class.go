@@ -26,31 +26,37 @@ const (
 	zfsPropRecordsize            = "recordsize"
 	zfsPropVolblocksize          = "volblocksize"
 	zfsPropSync                  = "sync"
-	zfsPropLogbias               = "logbias"
 	zfsPropCompression           = "compression"
 	zfsPropChecksum              = "checksum"
-	zfsPropPrimarycache          = "primarycache"
-	zfsPropSecondarycache        = "secondarycache"
 	zfsPropSpecialSmallBlockSize = "special_small_block_size"
 	zfsPropAtime                 = "atime"
 	zfsPropCopies                = "copies"
 	zfsPropReadonly              = "readonly"
 )
 
-// zfsImmutableProperties are fixed at dataset CREATE and cannot be changed
-// afterwards. Verified live against pool.dataset.update's accepted-key schema on
-// TrueNAS 26.0:
-//   - volblocksize — zvol geometry, immutable in ZFS itself
-//   - logbias, primarycache, secondarycache — rejected by pool.dataset.update
-//     ("Extra inputs are not permitted"), i.e. create-only through this API
+// NO CURATED CLASS EMITS logbias, primarycache OR secondarycache.
 //
-// Attempting to change any of them on an existing volume is a hard error rather
-// than a silently ignored request (risk R1).
+// Probed live against TrueNAS 26.0-BETA.1 on 2026-08-02, one property per call,
+// for FILESYSTEM and VOLUME: all three are rejected by pool.dataset.create AND
+// by pool.dataset.update with
+// "[EINVAL] data.<TYPE>.<prop>: Extra inputs are not permitted". They are absent
+// from the 26.0 API schema entirely, and no other middleware method sets them
+// (filesystem.set_zfs_attributes handles POSIX attributes, not ZFS properties).
+//
+// v1.5.0 shipped them in every preset on the strength of a probe of
+// pool.dataset.update ALONE, recorded here as "rejected by update, i.e.
+// create-only through this API". That inference was never tested against create
+// and is false: every CreateVolume carrying zfsPerformanceClass failed on a real
+// 26.0 appliance. An operator who wants either property must set it out of band
+// (`zfs set logbias=... <dataset>`, or on the parent dataset so new volumes
+// inherit it); the driver cannot.
+//
+// zfsImmutableProperties therefore holds only volblocksize — the sole create-only
+// property the curated presets can still emit, immutable in ZFS itself.
+// Attempting to change it on an existing volume is a hard error rather than a
+// silently ignored request (risk R1).
 var zfsImmutableProperties = map[string]struct{}{
-	zfsPropVolblocksize:   {},
-	zfsPropLogbias:        {},
-	zfsPropPrimarycache:   {},
-	zfsPropSecondarycache: {},
+	zfsPropVolblocksize: {},
 }
 
 // zfsLiveTunableProperties can be changed on an existing dataset via
@@ -74,27 +80,30 @@ var zfsLiveTunableProperties = map[string]struct{}{
 // `special_small_block_size` is emitted ONLY where it is non-zero, and only when
 // the pool actually has a `special` allocation-class vdev (risk R8); a zero
 // value is the ZFS default and is left unset so the create payload stays minimal.
+//
+// Every value below is a key TrueNAS 26.0 accepts on pool.dataset.create; see the
+// zfsImmutableProperties block for the three that are NOT and why they are gone.
+// One consequence is visible in the table: `backup` used to differ from `media`
+// on a FILESYSTEM only by primarycache=METADATA, so for filesystems the two now
+// resolve to the same property set. The ARC policy that separated them is not
+// settable through this API.
 var zfsPerformanceClasses = map[string]map[string]string{
-	// Small random I/O: match the typical 16K page, keep the ZIL on the low
-	// latency path, and route small blocks/metadata to the special vdev.
+	// Small random I/O: match the typical 16K page and route small
+	// blocks/metadata to the special vdev.
 	"database": {
 		zfsPropRecordsize:            "16K",
 		zfsPropVolblocksize:          "16K",
 		zfsPropSync:                  "STANDARD",
-		zfsPropLogbias:               "LATENCY",
 		zfsPropCompression:           "LZ4",
-		zfsPropPrimarycache:          "ALL",
 		zfsPropSpecialSmallBlockSize: "16K",
 		zfsPropAtime:                 "OFF",
 	},
-	// Large sequential I/O: big records, throughput-biased ZIL, denser codec.
+	// Large sequential I/O: big records, denser codec.
 	"media": {
 		zfsPropRecordsize:   "1M",
 		zfsPropVolblocksize: "64K",
 		zfsPropSync:         "STANDARD",
-		zfsPropLogbias:      "THROUGHPUT",
 		zfsPropCompression:  "ZSTD",
-		zfsPropPrimarycache: "ALL",
 		zfsPropAtime:        "OFF",
 	},
 	// Mixed guest-filesystem I/O behind a zvol.
@@ -102,19 +111,16 @@ var zfsPerformanceClasses = map[string]map[string]string{
 		zfsPropRecordsize:   "64K",
 		zfsPropVolblocksize: "16K",
 		zfsPropSync:         "STANDARD",
-		zfsPropLogbias:      "LATENCY",
 		zfsPropCompression:  "LZ4",
-		zfsPropPrimarycache: "ALL",
 		zfsPropAtime:        "OFF",
 	},
-	// Write-once/read-rarely: do not pollute ARC with data pages.
+	// Write-once/read-rarely: large records and a denser codec. (The ARC-bypass
+	// half of this profile needs primarycache, which 26.0 does not expose.)
 	"backup": {
 		zfsPropRecordsize:   "1M",
 		zfsPropVolblocksize: "128K",
 		zfsPropSync:         "STANDARD",
-		zfsPropLogbias:      "THROUGHPUT",
 		zfsPropCompression:  "ZSTD",
-		zfsPropPrimarycache: "METADATA",
 		zfsPropAtime:        "OFF",
 	},
 	// The balanced default, close to ZFS's own defaults.
@@ -122,9 +128,7 @@ var zfsPerformanceClasses = map[string]map[string]string{
 		zfsPropRecordsize:   "128K",
 		zfsPropVolblocksize: "16K",
 		zfsPropSync:         "STANDARD",
-		zfsPropLogbias:      "LATENCY",
 		zfsPropCompression:  "LZ4",
-		zfsPropPrimarycache: "ALL",
 		zfsPropAtime:        "OFF",
 	},
 }
@@ -300,16 +304,10 @@ func applyPerformanceClassProperties(params *truenas.DatasetCreateParams, proper
 			params.Volblocksize = value
 		case zfsPropSync:
 			params.Sync = value
-		case zfsPropLogbias:
-			params.Logbias = value
 		case zfsPropCompression:
 			params.Compression = value
 		case zfsPropChecksum:
 			params.Checksum = value
-		case zfsPropPrimarycache:
-			params.Primarycache = value
-		case zfsPropSecondarycache:
-			params.Secondarycache = value
 		case zfsPropSpecialSmallBlockSize:
 			params.SpecialSmallBlockSize = value
 		case zfsPropAtime:
@@ -343,10 +341,16 @@ func (e *zfsPropertyMutationError) Error() string {
 // must pass. It returns the create-only properties whose value would change
 // between two resolved property maps.
 //
-// This is not advisory: volblocksize is immutable in ZFS itself, and
-// logbias/primarycache/secondarycache are rejected outright by
-// pool.dataset.update. Letting a user believe a StorageClass edit re-tuned an
-// existing volume's zvol geometry would be a silent correctness lie.
+// This is not advisory: volblocksize is immutable in ZFS itself. Letting a user
+// believe a StorageClass edit re-tuned an existing volume's zvol geometry would
+// be a silent correctness lie.
+//
+// Both maps come from resolvePerformanceClassProperties, i.e. from the CURRENT
+// preset definitions — a stored class name is re-resolved, never replayed from
+// whatever that class meant in an older driver. That is what keeps a v1.5.0-era
+// stamp harmless: a volume stamped `database` by a driver whose `database`
+// included logbias is compared using today's `database`, which does not, so a
+// property this driver can no longer emit can never wedge a replay.
 func guardImmutableZFSProperties(current, desired map[string]string) []string {
 	var changed []string
 	for key := range zfsImmutableProperties {

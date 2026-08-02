@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
@@ -65,9 +66,7 @@ func TestResolvePerformanceClassProperties(t *testing.T) {
 		assert.Equal(t, map[string]string{
 			zfsPropRecordsize:            "16K",
 			zfsPropSync:                  "STANDARD",
-			zfsPropLogbias:               "LATENCY",
 			zfsPropCompression:           "LZ4",
-			zfsPropPrimarycache:          "ALL",
 			zfsPropSpecialSmallBlockSize: "16K",
 			zfsPropAtime:                 "OFF",
 		}, props)
@@ -79,18 +78,31 @@ func TestResolvePerformanceClassProperties(t *testing.T) {
 		assert.Equal(t, map[string]string{
 			zfsPropVolblocksize: "16K",
 			zfsPropSync:         "STANDARD",
-			zfsPropLogbias:      "LATENCY",
 			zfsPropCompression:  "LZ4",
-			zfsPropPrimarycache: "ALL",
 		}, props)
 	})
 
-	t.Run("backup keeps data out of ARC", func(t *testing.T) {
+	t.Run("backup is large-record and densely compressed", func(t *testing.T) {
 		props, err := d.resolvePerformanceClassProperties(ctx, "backup", "FILESYSTEM")
 		require.NoError(t, err)
-		assert.Equal(t, "METADATA", props[zfsPropPrimarycache])
 		assert.Equal(t, "1M", props[zfsPropRecordsize])
 		assert.Equal(t, "ZSTD", props[zfsPropCompression])
+	})
+
+	// No preset may emit a key TrueNAS 26.0 rejects. This is the property-level
+	// half of the v1.5.0 blocker; TestEveryPerformanceClassIsProvisionable is the
+	// payload-level half.
+	t.Run("no class emits a property the 26.0 API does not accept", func(t *testing.T) {
+		for _, class := range sortedPerformanceClasses() {
+			for _, datasetType := range []string{"FILESYSTEM", "VOLUME"} {
+				props, err := d.resolvePerformanceClassProperties(ctx, class, datasetType)
+				require.NoError(t, err)
+				for _, rejected := range []string{"logbias", "primarycache", "secondarycache"} {
+					assert.NotContains(t, props, rejected,
+						"class %s (%s) emits %s, which pool.dataset.create rejects on TrueNAS 26.0", class, datasetType, rejected)
+				}
+			}
+		}
 	})
 
 	t.Run("special_small_block_size is dropped without a special vdev (R8)", func(t *testing.T) {
@@ -139,30 +151,61 @@ func TestApplyPerformanceClassPropertiesUsesCorrectKeys(t *testing.T) {
 	applyPerformanceClassProperties(params, map[string]string{
 		zfsPropRecordsize:            "16K",
 		zfsPropSync:                  "STANDARD",
-		zfsPropLogbias:               "LATENCY",
 		zfsPropCompression:           "LZ4",
 		zfsPropChecksum:              "BLAKE3",
-		zfsPropPrimarycache:          "ALL",
-		zfsPropSecondarycache:        "ALL",
 		zfsPropSpecialSmallBlockSize: "16K",
 		zfsPropAtime:                 "OFF",
 		zfsPropReadonly:              "OFF",
 	})
 	assert.Equal(t, "16K", params.Recordsize)
 	assert.Equal(t, "STANDARD", params.Sync)
-	assert.Equal(t, "LATENCY", params.Logbias)
 	assert.Equal(t, "LZ4", params.Compression)
 	assert.Equal(t, "BLAKE3", params.Checksum)
-	assert.Equal(t, "ALL", params.Primarycache)
-	assert.Equal(t, "ALL", params.Secondarycache)
 	assert.Equal(t, "16K", params.SpecialSmallBlockSize)
 	assert.Equal(t, "OFF", params.Atime)
+
+	// The curated path has no wire route to the three keys TrueNAS 26.0 rejects,
+	// so even a hand-built map naming them cannot put them on a create payload.
+	applyPerformanceClassProperties(params, map[string]string{
+		"logbias": "LATENCY", "primarycache": "ALL", "secondarycache": "ALL",
+	})
+	assert.Empty(t, params.Logbias)
+	assert.Empty(t, params.Primarycache)
+	assert.Empty(t, params.Secondarycache)
 
 	// Empty property set is a strict no-op.
 	base := truenas.DatasetCreateParams{Name: "flashstor/scale-csi/vol", Type: "FILESYSTEM"}
 	untouched := base
 	applyPerformanceClassProperties(&untouched, nil)
 	assert.Equal(t, base, untouched)
+}
+
+// TestEveryPerformanceClassIsProvisionable is the v1.5.0 blocker's regression
+// test, at the layer the blocker actually lived on: the create PAYLOAD. Every
+// class, for both dataset types, must survive the schema TrueNAS 26.0 enforces —
+// which MockClient now enforces too. Restoring logbias/primarycache to any
+// preset fails this with
+// "[EINVAL] data.FILESYSTEM.logbias: Extra inputs are not permitted".
+func TestEveryPerformanceClassIsProvisionable(t *testing.T) {
+	ctx := context.Background()
+	for _, class := range sortedPerformanceClasses() {
+		for _, datasetType := range []string{"FILESYSTEM", "VOLUME"} {
+			t.Run(class+"/"+datasetType, func(t *testing.T) {
+				mock := truenas.NewMockClient()
+				mock.SpecialVdevPresent = true
+				d := perfTestDriver(mock)
+
+				name := "flashstor/scale-csi/" + class + "-" + strings.ToLower(datasetType)
+				params := &truenas.DatasetCreateParams{Name: name, Type: datasetType}
+				curated, err := d.resolvePerformanceClassProperties(ctx, class, datasetType)
+				require.NoError(t, err)
+				applyPerformanceClassProperties(params, curated)
+
+				_, err = mock.DatasetCreate(ctx, params)
+				require.NoError(t, err, "class %s must be provisionable on TrueNAS 26.0", class)
+			})
+		}
+	}
 }
 
 // TestApplyDatasetPropertiesSpecialSmallBlockSizeKey covers the driver bug the
@@ -200,7 +243,7 @@ func TestExplicitDatasetPropertiesWinOverPerformanceClass(t *testing.T) {
 	assert.Equal(t, "ZSTD-19", params.Compression, "explicit datasetProperties must win")
 	assert.Equal(t, "ALWAYS", params.Sync)
 	assert.Equal(t, "128K", params.Recordsize, "unopposed curated values still apply")
-	assert.Equal(t, "LATENCY", params.Logbias)
+	assert.Equal(t, "OFF", params.Atime)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,28 +253,38 @@ func TestExplicitDatasetPropertiesWinOverPerformanceClass(t *testing.T) {
 func TestGuardImmutableZFSProperties(t *testing.T) {
 	t.Run("names exactly the create-only properties that would change", func(t *testing.T) {
 		changed := guardImmutableZFSProperties(
-			map[string]string{zfsPropVolblocksize: "16K", zfsPropLogbias: "LATENCY", zfsPropPrimarycache: "ALL", zfsPropRecordsize: "128K"},
-			map[string]string{zfsPropVolblocksize: "128K", zfsPropLogbias: "THROUGHPUT", zfsPropPrimarycache: "ALL", zfsPropRecordsize: "1M"},
+			map[string]string{zfsPropVolblocksize: "16K", zfsPropCompression: "LZ4", zfsPropRecordsize: "128K"},
+			map[string]string{zfsPropVolblocksize: "128K", zfsPropCompression: "ZSTD", zfsPropRecordsize: "1M"},
 		)
-		assert.Equal(t, []string{zfsPropLogbias, zfsPropVolblocksize}, changed,
-			"recordsize is live-tunable and must not be reported as immutable")
+		assert.Equal(t, []string{zfsPropVolblocksize}, changed,
+			"recordsize and compression are live-tunable and must not be reported as immutable")
 	})
 
 	t.Run("identical values are not a change", func(t *testing.T) {
-		props := map[string]string{zfsPropVolblocksize: "16K", zfsPropLogbias: "latency"}
-		assert.Empty(t, guardImmutableZFSProperties(props, map[string]string{zfsPropVolblocksize: "16k", zfsPropLogbias: "LATENCY"}))
+		props := map[string]string{zfsPropVolblocksize: "16K"}
+		assert.Empty(t, guardImmutableZFSProperties(props, map[string]string{zfsPropVolblocksize: "16k"}))
 	})
 
-	t.Run("secondarycache is guarded too", func(t *testing.T) {
-		assert.Equal(t, []string{zfsPropSecondarycache},
-			guardImmutableZFSProperties(map[string]string{}, map[string]string{zfsPropSecondarycache: "ALL"}))
+	// A v1.5.0-era stamp is a class NAME, and the guard re-resolves it through
+	// today's presets — so the properties that release emitted and this one cannot
+	// are absent from both sides of the comparison and can never wedge a replay.
+	t.Run("properties removed from the presets cannot be reported", func(t *testing.T) {
+		for _, class := range sortedPerformanceClasses() {
+			for _, removed := range []string{"logbias", "primarycache", "secondarycache"} {
+				assert.NotContains(t, zfsPerformanceClasses[class], removed)
+			}
+		}
+		assert.Empty(t, guardImmutableZFSProperties(
+			map[string]string{"logbias": "LATENCY", "primarycache": "ALL"},
+			map[string]string{"logbias": "THROUGHPUT", "primarycache": "METADATA"}),
+			"a property no preset can emit is not a create-only property this driver guards")
 	})
 }
 
 func TestLiveTunableZFSPropertyDiff(t *testing.T) {
 	changed := liveTunableZFSPropertyDiff(
-		map[string]string{zfsPropRecordsize: "128K", zfsPropCompression: "LZ4", zfsPropLogbias: "LATENCY"},
-		map[string]string{zfsPropRecordsize: "1M", zfsPropCompression: "LZ4", zfsPropLogbias: "THROUGHPUT"},
+		map[string]string{zfsPropRecordsize: "128K", zfsPropCompression: "LZ4", zfsPropVolblocksize: "16K"},
+		map[string]string{zfsPropRecordsize: "1M", zfsPropCompression: "LZ4", zfsPropVolblocksize: "128K"},
 	)
 	assert.Equal(t, []string{zfsPropRecordsize}, changed,
 		"only live-tunable properties belong in this diff")
@@ -254,11 +307,18 @@ func TestGuardPerformanceClassChange(t *testing.T) {
 	})
 
 	t.Run("changing an immutable property is rejected", func(t *testing.T) {
-		err := d.guardPerformanceClassChange(ctx, "vol", "general", "media", "FILESYSTEM")
+		err := d.guardPerformanceClassChange(ctx, "vol", "general", "media", "VOLUME")
 		require.Error(t, err)
 		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
-		assert.Contains(t, err.Error(), zfsPropLogbias)
+		assert.Contains(t, err.Error(), zfsPropVolblocksize)
 		assert.Contains(t, err.Error(), "fixed when the dataset is created")
+	})
+
+	// volblocksize is the only create-only property left in the presets, and a
+	// FILESYSTEM has none — so the same class pair that is refused for a zvol is
+	// allowed (with a warning) for a filesystem.
+	t.Run("a filesystem class change touches no create-only property", func(t *testing.T) {
+		require.NoError(t, d.guardPerformanceClassChange(ctx, "vol", "general", "media", "FILESYSTEM"))
 	})
 
 	t.Run("zvol geometry change is rejected", func(t *testing.T) {
@@ -283,8 +343,12 @@ func TestGuardPerformanceClassChange(t *testing.T) {
 }
 
 // TestCreateVolumeStampsAndGuardsPerformanceClass is the end-to-end proof: the
-// class is stamped at create, and re-creating the same volume under a class with
-// different immutable properties is refused.
+// class provisions against a 26.0-schema backend, it is stamped at create, and
+// the stamp survives an idempotent replay.
+//
+// This volume is a FILESYSTEM, whose curated properties are now all
+// live-tunable, so a later class change is allowed with a warning rather than
+// refused; TestCreateVolumeGuardsZvolGeometryClassChange covers the refusal.
 func TestCreateVolumeStampsAndGuardsPerformanceClass(t *testing.T) {
 	ctx := context.Background()
 	mock := truenas.NewMockClient()
@@ -310,15 +374,58 @@ func TestCreateVolumeStampsAndGuardsPerformanceClass(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// A class whose create-only properties differ is refused.
+	// The recorded class is the one the volume was CREATED with; a later
+	// live-tunable-only change does not retune it and does not rewrite the stamp.
 	_, err = d.CreateVolume(ctx, &csi.CreateVolumeRequest{
 		Name:               "perf-vol",
 		VolumeCapabilities: capabilities,
 		Parameters:         map[string]string{"protocol": "nfs", zfsPerformanceClassParam: "media"},
 	})
+	require.NoError(t, err)
+	assert.Equal(t, "general", mock.Datasets["flashstor/scale-csi/perf-vol"].UserProperties[PropZFSPerformanceClass].Value)
+}
+
+// TestCreateVolumeGuardsZvolGeometryClassChange is the surviving end-to-end half
+// of the immutability guard: volblocksize is the one create-only property the
+// presets still emit, so a zvol whose StorageClass now names a class with a
+// different geometry is refused.
+func TestCreateVolumeGuardsZvolGeometryClassChange(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi",
+		config: &Config{
+			DriverName: "org.scale.csi",
+			ZFS:        ZFSConfig{DatasetParentName: "flashstor/scale-csi", ZvolBlocksize: "16K", ZvolReadyTimeout: 1},
+			ISCSI:      ISCSIConfig{Enabled: true, TargetPortal: "192.0.2.10:3260"},
+		},
+		truenasClient: mock,
+		serviceReloadDebouncer: NewServiceReloadDebouncer(0, func(context.Context, string) error {
+			return nil
+		}),
+	}
+	t.Cleanup(d.serviceReloadDebouncer.Stop)
+
+	request := func(class string) *csi.CreateVolumeRequest {
+		return &csi.CreateVolumeRequest{
+			Name:               "perf-zvol",
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			Parameters:         map[string]string{"protocol": "iscsi", zfsPerformanceClassParam: class},
+		}
+	}
+
+	_, err := d.CreateVolume(ctx, request("general"))
+	require.NoError(t, err)
+	ds := mock.Datasets["flashstor/scale-csi/perf-zvol"]
+	require.NotNil(t, ds)
+	assert.Equal(t, "general", ds.UserProperties[PropZFSPerformanceClass].Value)
+
+	// general volblocksize=16K -> backup volblocksize=128K: impossible in place.
+	_, err = d.CreateVolume(ctx, request("backup"))
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
-	assert.Contains(t, err.Error(), zfsPropLogbias)
+	assert.Contains(t, err.Error(), zfsPropVolblocksize)
 }
 
 // TestCreateVolumeWithoutPerformanceClassIsUnchanged is the default-off guard:
