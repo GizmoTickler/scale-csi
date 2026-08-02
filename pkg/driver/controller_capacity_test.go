@@ -194,4 +194,37 @@ func TestCreateVolumeBelowTrueNASRefquotaFloor(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, mock.Datasets, "pool/parent/tiny-quotaless")
 	})
+
+	// The floor keys on the CURRENT config, not on what this volume carries, so
+	// it must not run above the already-exists check: a sub-1GiB volume
+	// provisioned while quotas were OFF survives an operator turning them ON, and
+	// CSI requires its CreateVolume replay to keep returning the existing volume.
+	t.Run("a pre-existing sub-1GiB volume still replays after quotas are enabled", func(t *testing.T) {
+		d, mock := newDriver(false)
+		create := request("legacy-small", "nfs", sixtyFourMiB)
+		first, err := d.CreateVolume(ctx, create)
+		require.NoError(t, err)
+		require.Contains(t, mock.Datasets, "pool/parent/legacy-small")
+
+		d.config.ZFS.DatasetEnableQuotas = true
+
+		replay, err := d.CreateVolume(ctx, create)
+		require.NoError(t, err, "an identical replay of an existing volume must stay idempotent")
+		assert.Equal(t, first.GetVolume().GetVolumeId(), replay.GetVolume().GetVolumeId())
+		assert.Equal(t, first.GetVolume().GetCapacityBytes(), replay.GetVolume().GetCapacityBytes())
+	})
+
+	t.Run("a genuinely new sub-1GiB volume is still refused once quotas are enabled", func(t *testing.T) {
+		d, mock := newDriver(false)
+		_, err := d.CreateVolume(ctx, request("legacy-small", "nfs", sixtyFourMiB))
+		require.NoError(t, err)
+
+		d.config.ZFS.DatasetEnableQuotas = true
+
+		_, err = d.CreateVolume(ctx, request("brand-new-small", "nfs", sixtyFourMiB))
+		require.Error(t, err, "scoping the floor to creates must not disarm it for a dataset that does not exist yet")
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "1 GiB minimum")
+		assert.NotContains(t, mock.Datasets, "pool/parent/brand-new-small")
+	})
 }

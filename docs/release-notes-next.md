@@ -44,7 +44,10 @@ flag defaults change and the default Helm render is unchanged.
 - **Sub-1GiB NFS volumes failed opaquely.** TrueNAS floors a dataset `refquota`
   at 1 GiB. `CreateVolume` now says so, scoped to volumes whose size is applied
   as a refquota (NFS with `zfs.datasetEnableQuotas`); zvols and quota-less NFS
-  volumes are unaffected.
+  volumes are unaffected. The check runs on the CREATE path only, below the
+  already-exists arm, so a sub-1GiB volume provisioned before
+  `zfs.datasetEnableQuotas` was turned on keeps replaying idempotently instead of
+  becoming an `InvalidArgument` for a dataset that exists and is healthy.
 
 Everything below this section is the v1.5.0 changelog, unchanged except where a
 v1.5.1 fix corrected a statement in it.
