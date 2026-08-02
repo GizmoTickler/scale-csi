@@ -217,7 +217,17 @@ func isCSISnapshot(snap *truenas.Snapshot) bool {
 		// from CSI volume datasets into manual snapshots.
 		return hasCSIName
 	}
-	managed := snap.UserProperties[PropManagedResource].Value == "true"
+	// Legacy read path: managed_resource inherits from CSI volume datasets into
+	// every snapshot of them — task-created scheduled snapshots (GF2/E2) and
+	// manual ones alike — and here the API DOES report the source. An inherited
+	// or foreign source proves the value was not written on this snapshot at
+	// CreateSnapshot, so it must not classify the snapshot as CSI-created (the
+	// rule snapshotMatchesRetainedTombstoneIdentity already applies). Trusting
+	// it wedged DeleteVolume behind the dependent-snapshot guard for every
+	// scheduled snapshot on a legacy read.
+	managedProp := snap.UserProperties[PropManagedResource]
+	managed := managedProp.Value == "true" &&
+		(managedProp.Source == "" || isLocalUserPropertySource(managedProp.Source))
 	return managed || hasCSIName
 }
 
@@ -1802,11 +1812,14 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 				VolumeId:      volumeID,
 				CapacityBytes: capacity,
 			},
-			// Populate the entry's VolumeCondition from the same helper
-			// ControllerGetVolume uses. external-health-monitor v0.18.0 prefers
-			// ListVolumes whenever LIST_VOLUMES is advertised and reads
-			// Entry.Status.VolumeCondition; leaving it nil made its nil-safe
-			// getters report every listed volume as normal (codex H1).
+			// Populate the entry's VolumeCondition from the dataset+pool
+			// composition ControllerGetVolume also builds on. external-health-monitor
+			// v0.18.0 prefers ListVolumes whenever LIST_VOLUMES is advertised and
+			// reads Entry.Status.VolumeCondition; leaving it nil made its nil-safe
+			// getters report every listed volume as normal (codex H1). The opt-in
+			// quota upgrade (GF2/E4) is deliberately NOT applied here — one quota
+			// query per listed volume — so near-quota surfaces via the reconcile
+			// sweep's gauge and alert instead; see volumeConditionFromDataset.
 			Status: &csi.ListVolumesResponse_VolumeStatus{
 				VolumeCondition: d.volumeCondition(ds),
 			},
@@ -2527,10 +2540,15 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 }
 
 // volumeConditionFromDataset derives a CSI VolumeCondition from a fetched
-// dataset's user properties without any further API call. It is the single
-// source of truth shared by ControllerGetVolume and ListVolumes so both RPCs —
-// and whichever path the external-health-monitor selects (it prefers
-// ListVolumes when LIST_VOLUMES is advertised) — report an identical condition.
+// dataset's user properties without any further API call. It is the shared BASE
+// for ControllerGetVolume and ListVolumes (both then compose the pool-level
+// backend-health snapshot on top). The two RPCs are NOT guaranteed identical:
+// ControllerGetVolume alone upgrades on the opt-in quota signal (GF2/E4,
+// zfs.reportVolumeUsage) — doing that in ListVolumes would cost one quota query
+// per listed volume. The external-health-monitor prefers ListVolumes when
+// LIST_VOLUMES is advertised, so the near-quota signal reaches operators
+// through the reconcile sweep's scale_csi_volume_near_quota gauge and its
+// alert, not necessarily through the PVC's VolumeCondition.
 //
 // The semantics are deliberately conservative about declaring ill health. A
 // volume is abnormal ONLY on a definitive negative marker: an explicit

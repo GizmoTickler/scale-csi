@@ -660,9 +660,11 @@ func (d *Driver) poolHealthSnapshot() *truenas.PoolHealthSnapshot {
 }
 
 // volumeCondition composes the dataset-level condition with the pool-level
-// backend health snapshot. It is the single helper ControllerGetVolume and
-// ListVolumes share, so both RPCs — and whichever the external-health-monitor
-// picks — report an identical condition.
+// backend health snapshot. ListVolumes uses it directly; ControllerGetVolume
+// feeds composeVolumeCondition a base that may additionally carry the opt-in
+// quota upgrade (GF2/E4), so the two RPCs agree on dataset and pool health but
+// ControllerGetVolume alone can report near-quota — see
+// volumeConditionFromDataset for why that asymmetry is deliberate.
 //
 // Attribution rationale: ZFS exposes no per-dataset health. Every managed volume
 // lives on ONE pool, so a pool condition applies to all of them; this is a
