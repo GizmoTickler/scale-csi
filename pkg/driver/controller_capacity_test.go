@@ -122,3 +122,76 @@ func TestGetCapacityDatasetError(t *testing.T) {
 		assert.Zero(t, resp.GetAvailableCapacity())
 	})
 }
+
+// TestCreateVolumeBelowTrueNASRefquotaFloor is the drill's INFO finding: a
+// sub-1GiB NFS PVC failed with "TrueNAS API error [-32602]: Invalid params" and
+// nothing else. The floor belongs to `refquota`, so only volumes whose size is
+// applied AS a refquota are gated.
+func TestCreateVolumeBelowTrueNASRefquotaFloor(t *testing.T) {
+	ctx := context.Background()
+	const sixtyFourMiB = 64 * 1024 * 1024
+
+	newDriver := func(quotas bool) (*Driver, *truenas.MockClient) {
+		mock := truenas.NewMockClient()
+		d := &Driver{
+			name: "org.scale.csi",
+			config: &Config{
+				DriverName: "org.scale.csi",
+				ZFS: ZFSConfig{
+					DatasetParentName:   "pool/parent",
+					DatasetEnableQuotas: quotas,
+					ZvolBlocksize:       "16K",
+					ZvolReadyTimeout:    1,
+				},
+				NFS:   NFSConfig{Enabled: true, ShareHost: "192.0.2.10"},
+				ISCSI: ISCSIConfig{Enabled: true, TargetPortal: "192.0.2.10:3260"},
+			},
+			truenasClient: mock,
+			serviceReloadDebouncer: NewServiceReloadDebouncer(0, func(context.Context, string) error {
+				return nil
+			}),
+		}
+		t.Cleanup(d.serviceReloadDebouncer.Stop)
+		mustCreateParentDataset(t, mock)
+		return d, mock
+	}
+
+	request := func(name, protocol string, bytes int64) *csi.CreateVolumeRequest {
+		return &csi.CreateVolumeRequest{
+			Name:               name,
+			CapacityRange:      &csi.CapacityRange{RequiredBytes: bytes},
+			VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+			Parameters:         map[string]string{"protocol": protocol},
+		}
+	}
+
+	t.Run("a quota-bound NFS volume below 1 GiB is a clear InvalidArgument", func(t *testing.T) {
+		d, mock := newDriver(true)
+		_, err := d.CreateVolume(ctx, request("tiny-nfs", "nfs", sixtyFourMiB))
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), "1 GiB minimum")
+		assert.Contains(t, err.Error(), "refquota")
+		assert.NotContains(t, mock.Datasets, "pool/parent/tiny-nfs", "the refusal is a preflight, not a cleanup")
+	})
+
+	t.Run("exactly 1 GiB is accepted", func(t *testing.T) {
+		d, _ := newDriver(true)
+		_, err := d.CreateVolume(ctx, request("floor-nfs", "nfs", testGiB))
+		require.NoError(t, err)
+	})
+
+	t.Run("a zvol is sized by volsize and is not gated", func(t *testing.T) {
+		d, mock := newDriver(true)
+		_, err := d.CreateVolume(ctx, request("tiny-zvol", "iscsi", sixtyFourMiB))
+		require.NoError(t, err)
+		assert.Contains(t, mock.Datasets, "pool/parent/tiny-zvol")
+	})
+
+	t.Run("a quota-less NFS volume writes no refquota and is not gated", func(t *testing.T) {
+		d, mock := newDriver(false)
+		_, err := d.CreateVolume(ctx, request("tiny-quotaless", "nfs", sixtyFourMiB))
+		require.NoError(t, err)
+		assert.Contains(t, mock.Datasets, "pool/parent/tiny-quotaless")
+	})
+}

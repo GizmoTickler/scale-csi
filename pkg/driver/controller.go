@@ -145,6 +145,12 @@ const (
 	originSnapshotDeleteMaxBackoff         = 2 * time.Second
 	detachedCopyJobAbortTimeout            = 10 * time.Second
 	replicationJobReasonCreateVolumeFailed = "create_volume_failed"
+
+	// truenasMinRefquotaBytes is the smallest refquota TrueNAS accepts on a
+	// dataset. Below it, pool.dataset.create fails with the unqualified -32602
+	// "Invalid params" that every other schema/validation error also produces
+	// (observed live with a 64 MiB request, 2026-08-02).
+	truenasMinRefquotaBytes = 1024 * 1024 * 1024
 )
 
 func isDatasetDependencyOrBusyError(err error) bool {
@@ -835,7 +841,9 @@ func (d *Driver) validateCreateVolumeRequest(req *csi.CreateVolumeRequest, volum
 			"required capacity (%d bytes) exceeds limit (%d bytes)", capacityBytes, limitBytes)
 	}
 
-	// Minimum capacity validation (at least 1MiB to avoid edge cases)
+	// Minimum capacity validation (at least 1MiB to avoid edge cases). The
+	// protocol-specific refquota floor is applied below, once the share type is
+	// known.
 	const minCapacity = 1024 * 1024 // 1 MiB
 	if capacityBytes < minCapacity {
 		return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
@@ -886,6 +894,25 @@ func (d *Driver) validateCreateVolumeRequest(req *csi.CreateVolumeRequest, volum
 				return createVolumeParams{}, status.Error(codes.InvalidArgument, "raw block volume capability is incompatible with NFS protocol")
 			}
 		}
+	}
+
+	// TrueNAS floors `refquota` at 1 GiB and reports a violation as the same
+	// unqualified -32602 "Invalid params" as everything else, so a 64 MiB PVC
+	// failed with nothing to act on (live drill, 2026-08-02). Only a volume whose
+	// size is expressed AS a refquota is affected: NFS filesystems with
+	// zfs.datasetEnableQuotas. A zvol is sized by volsize and a quota-less NFS
+	// volume writes no refquota at all; neither is gated here.
+	//
+	// This runs before the already-exists check, which is safe precisely because
+	// the backend enforcing the floor is the same one that would have had to
+	// accept such a volume: a sub-1GiB refquota volume cannot exist to have its
+	// CreateVolume replayed.
+	if shareType == ShareTypeNFS && d.config.ZFS.DatasetEnableQuotas && capacityBytes < truenasMinRefquotaBytes {
+		return createVolumeParams{}, status.Errorf(codes.InvalidArgument,
+			"requested capacity (%d bytes) is below the 1 GiB minimum TrueNAS enforces for a dataset refquota, which is how this "+
+				"volume's size is applied (protocol nfs with zfs.datasetEnableQuotas). Request at least %d bytes, or disable "+
+				"zfs.datasetEnableQuotas to provision quota-less NFS volumes",
+			capacityBytes, int64(truenasMinRefquotaBytes))
 	}
 
 	// Validate access mode against protocol
