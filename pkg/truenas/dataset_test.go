@@ -1928,10 +1928,12 @@ func TestMockClient_DatasetOperations(t *testing.T) {
 	mock := NewMockClient()
 	ctx := context.Background()
 
-	// Test create
+	// Test create. The type is VOLUME because this fixture exercises volsize and
+	// DatasetExpand: 26.0's FILESYSTEM model carries no volsize, and the mock now
+	// refuses that payload the way the appliance does.
 	params := &DatasetCreateParams{
 		Name:    "tank/test/dataset",
-		Type:    "FILESYSTEM",
+		Type:    "VOLUME",
 		Volsize: 10737418240,
 	}
 	ds, err := mock.DatasetCreate(ctx, params)
@@ -2218,35 +2220,98 @@ func TestParseDatasetResourceFlatUserPropertiesDegradeSource(t *testing.T) {
 // pool.dataset.* accepted-key schema (TrueNAS 26.0)
 // ---------------------------------------------------------------------------
 
-// TestDatasetParamsSchemaCoverage keeps the mock's schema honest as the params
-// structs grow: every key this client can put on the wire must be classified as
-// either accepted by TrueNAS 26.0 or probed-rejected. A field added without
-// classifying it fails here rather than on a live appliance.
+// TestDatasetParamsSchemaCoverage is the anti-rot gate. It diffs the params
+// structs' JSON tags against the HAND-MAINTAINED classification maps in BOTH
+// directions, so:
+//
+//   - a field added to DatasetCreateParams / DatasetUpdateParams with no entry in
+//     datasetCreateKeyScopes / datasetUpdateKeyScopes fails here, naming the key,
+//     rather than being auto-classified as accepted and surfacing on a live
+//     appliance (this is exactly how v1.5.0 shipped logbias); and
+//   - a classification entry for a key the struct can no longer spell fails too,
+//     so the maps cannot accumulate dead evidence.
+//
+// It deliberately does NOT derive either side from the other. The previous
+// revision built the accepted set from the same struct tags it then checked,
+// which made the assertion true by construction for every possible key.
 func TestDatasetParamsSchemaCoverage(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		params   interface{}
-		accepted map[string]struct{}
+		name   string
+		params interface{}
+		scopes map[string]datasetKeyScope
 	}{
-		{"create", DatasetCreateParams{}, datasetCreateAcceptedKeys},
-		{"update", DatasetUpdateParams{}, datasetUpdateAcceptedKeys},
+		{"create", DatasetCreateParams{}, datasetCreateKeyScopes},
+		{"update", DatasetUpdateParams{}, datasetUpdateKeyScopes},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			keys := datasetParamsJSONKeys(tc.params)
 			require.NotEmpty(t, keys)
+
+			unclaimed := make(map[string]struct{}, len(tc.scopes))
+			for key := range tc.scopes {
+				unclaimed[key] = struct{}{}
+			}
 			for _, key := range keys {
-				_, acceptedKey := tc.accepted[key]
-				_, rejectedKey := datasetPropertiesRejectedBy26[key]
-				assert.True(t, acceptedKey != rejectedKey,
-					"payload key %q must be classified as exactly one of accepted / rejected-by-26.0", key)
+				assert.Contains(t, tc.scopes, key,
+					"payload key %q is unclassified: add it to the %s classification as accepted for FILESYSTEM, "+
+						"VOLUME, both, or rejected-by-26.0, with the evidence", key, tc.name)
+				delete(unclaimed, key)
+			}
+			for key := range unclaimed {
+				assert.Fail(t, "stale classification entry",
+					"the %s classification lists %q, which the params struct can no longer put on the wire", tc.name, key)
 			}
 		})
 	}
+}
 
-	for property := range datasetPropertiesRejectedBy26 {
-		assert.NotContains(t, datasetCreateAcceptedKeys, property)
-		assert.NotContains(t, datasetUpdateAcceptedKeys, property)
-	}
+// TestDatasetKeyScopesAreTypeAware pins the specific classifications the mock's
+// fidelity rests on, so a silent widening of the maps is a test failure. Each
+// assertion names a key and a type; none of them is derived from the map under
+// test.
+func TestDatasetKeyScopesAreTypeAware(t *testing.T) {
+	t.Run("keys 26.0 rejects fail for both dataset types", func(t *testing.T) {
+		for _, key := range []string{"logbias", "primarycache", "secondarycache"} {
+			for _, datasetType := range []string{"FILESYSTEM", "VOLUME", ""} {
+				assert.False(t, datasetKeyAccepted(datasetCreateKeyScopes, key, datasetType),
+					"%s must be rejected on %q: probed live on 26.0", key, datasetType)
+			}
+		}
+	})
+
+	t.Run("filesystem-only keys are refused on a VOLUME", func(t *testing.T) {
+		for _, key := range []string{"recordsize", "atime", "refquota", "quota", "acltype", "aclmode", "share_type"} {
+			assert.True(t, datasetKeyAccepted(datasetCreateKeyScopes, key, "FILESYSTEM"), "%s on FILESYSTEM", key)
+			assert.False(t, datasetKeyAccepted(datasetCreateKeyScopes, key, "VOLUME"), "%s on VOLUME", key)
+		}
+	})
+
+	t.Run("volume-only keys are refused on a FILESYSTEM", func(t *testing.T) {
+		for _, key := range []string{"volsize", "volblocksize", "sparse"} {
+			assert.True(t, datasetKeyAccepted(datasetCreateKeyScopes, key, "VOLUME"), "%s on VOLUME", key)
+			assert.False(t, datasetKeyAccepted(datasetCreateKeyScopes, key, "FILESYSTEM"), "%s on FILESYSTEM", key)
+		}
+	})
+
+	t.Run("keys both models take are accepted on both", func(t *testing.T) {
+		for _, key := range []string{"name", "type", "sync", "compression", "checksum", "special_small_block_size", "refreservation"} {
+			assert.True(t, datasetKeyAccepted(datasetCreateKeyScopes, key, "FILESYSTEM"), "%s on FILESYSTEM", key)
+			assert.True(t, datasetKeyAccepted(datasetCreateKeyScopes, key, "VOLUME"), "%s on VOLUME", key)
+		}
+	})
+
+	t.Run("an unclassified key fails closed", func(t *testing.T) {
+		assert.False(t, datasetKeyAccepted(datasetCreateKeyScopes, "totally_bogus_key", "FILESYSTEM"))
+		assert.False(t, datasetKeyAccepted(datasetUpdateKeyScopes, "totally_bogus_key", "VOLUME"))
+	})
+
+	t.Run("the update model carries the same split", func(t *testing.T) {
+		assert.True(t, datasetKeyAccepted(datasetUpdateKeyScopes, "refquota", "FILESYSTEM"))
+		assert.False(t, datasetKeyAccepted(datasetUpdateKeyScopes, "refquota", "VOLUME"))
+		assert.True(t, datasetKeyAccepted(datasetUpdateKeyScopes, "volsize", "VOLUME"))
+		assert.False(t, datasetKeyAccepted(datasetUpdateKeyScopes, "volsize", "FILESYSTEM"))
+		assert.True(t, datasetKeyAccepted(datasetUpdateKeyScopes, "user_properties_update", "VOLUME"))
+	})
 }
 
 // TestMockDatasetCreateEnforcesTrueNAS26Schema is what turns "the driver emits a
@@ -2290,14 +2355,67 @@ func TestMockDatasetCreateEnforcesTrueNAS26Schema(t *testing.T) {
 			SpecialSmallBlockSize: "16K",
 		})
 		require.NoError(t, err)
+
+		_, err = mock.DatasetCreate(ctx, &DatasetCreateParams{
+			Name: "pool/parent/ok-zvol", Type: "VOLUME", Volsize: 1 << 30, Volblocksize: "16K", Sparse: true,
+			Sync: "STANDARD", Compression: "LZ4", SpecialSmallBlockSize: "16K",
+		})
+		require.NoError(t, err)
+	})
+
+	// 26.0's models are PER DATASET TYPE — the live errors are literally
+	// data.FILESYSTEM.logbias and data.VOLUME.secondarycache. A flat key set
+	// shared by both types accepted these two payloads, which a real appliance
+	// refuses.
+	t.Run("a cross-type key is refused for the type that has no such property", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			property    string
+			datasetType string
+			params      *DatasetCreateParams
+		}{
+			{"recordsize on a zvol", "recordsize", "VOLUME",
+				&DatasetCreateParams{Name: "pool/parent/v", Type: "VOLUME", Volsize: 1 << 30, Recordsize: "128K"}},
+			{"atime on a zvol", "atime", "VOLUME",
+				&DatasetCreateParams{Name: "pool/parent/v", Type: "VOLUME", Volsize: 1 << 30, Atime: "OFF"}},
+			{"refquota on a zvol", "refquota", "VOLUME",
+				&DatasetCreateParams{Name: "pool/parent/v", Type: "VOLUME", Volsize: 1 << 30, Refquota: 1 << 30}},
+			{"volsize on a filesystem", "volsize", "FILESYSTEM",
+				&DatasetCreateParams{Name: "pool/parent/v", Type: "FILESYSTEM", Volsize: 1 << 30}},
+			{"volblocksize on a filesystem", "volblocksize", "FILESYSTEM",
+				&DatasetCreateParams{Name: "pool/parent/v", Type: "FILESYSTEM", Volblocksize: "16K"}},
+			{"sparse on a filesystem", "sparse", "FILESYSTEM",
+				&DatasetCreateParams{Name: "pool/parent/v", Type: "FILESYSTEM", Sparse: true}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				mock := NewMockClient()
+				_, err := mock.DatasetCreate(ctx, tc.params)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(),
+					fmt.Sprintf("[EINVAL] data.%s.%s: Extra inputs are not permitted", tc.datasetType, tc.property))
+				assert.Empty(t, mock.Datasets, "a rejected payload must create nothing")
+			})
+		}
+	})
+
+	t.Run("update is typed against the stored dataset", func(t *testing.T) {
+		mock := NewMockClient()
+		_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{Name: "pool/parent/zvol", Type: "VOLUME", Volsize: 1 << 30})
+		require.NoError(t, err)
+		_, err = mock.DatasetUpdate(ctx, "pool/parent/zvol", &DatasetUpdateParams{Refquota: int64(1 << 30)})
+		require.Error(t, err, "a zvol has no refquota; 26.0's VOLUME update model does not carry the key")
+		assert.Contains(t, err.Error(), "[EINVAL] data.VOLUME.refquota: Extra inputs are not permitted")
+
+		_, err = mock.DatasetUpdate(ctx, "pool/parent/zvol", &DatasetUpdateParams{Volsize: 2 << 30})
+		require.NoError(t, err, "volsize is how a zvol is resized")
 	})
 }
 
 // TestValidateDatasetPayloadKeysUpdate covers the update half. DatasetUpdateParams
-// cannot currently spell a rejected key, so the payload is built directly — the
-// gate exists for the next field somebody adds.
+// cannot currently spell a key that is outside BOTH models, so that payload is
+// built directly — the gate exists for the next field somebody adds.
 func TestValidateDatasetPayloadKeysUpdate(t *testing.T) {
-	err := ValidateDatasetPayloadKeys(map[string]string{"logbias": "LATENCY"}, datasetUpdateAcceptedKeys, "")
+	err := validateDatasetPayloadKeys(map[string]string{"logbias": "LATENCY"}, datasetUpdateKeyScopes, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "[EINVAL] data.logbias: Extra inputs are not permitted")
 
@@ -2305,5 +2423,8 @@ func TestValidateDatasetPayloadKeysUpdate(t *testing.T) {
 	require.ErrorAs(t, err, &apiErr)
 	assert.Equal(t, -32602, apiErr.Code, "the JSON-RPC code is the one live 26.0 returns")
 
-	require.NoError(t, ValidateDatasetPayloadKeys(&DatasetUpdateParams{Refquota: int64(1 << 30)}, datasetUpdateAcceptedKeys, ""))
+	require.NoError(t, validateDatasetPayloadKeys(&DatasetUpdateParams{Refquota: int64(1 << 30)}, datasetUpdateKeyScopes, "FILESYSTEM"))
+	// An unknown type (the mock's not-yet-stored arm) validates permissively so
+	// the not-found error still owns that ordering.
+	require.NoError(t, validateDatasetPayloadKeys(&DatasetUpdateParams{Refquota: int64(1 << 30)}, datasetUpdateKeyScopes, ""))
 }

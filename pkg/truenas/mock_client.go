@@ -640,8 +640,10 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	// TrueNAS 26.0 validates the payload SCHEMA before it looks at anything else,
 	// including whether the dataset already exists. Reproduce that ordering so a
 	// key 26.0 rejects fails here instead of being masked by the idempotent
-	// already-exists arm below.
-	if err := ValidateDatasetPayloadKeys(params, datasetCreateAcceptedKeys, params.Type); err != nil {
+	// already-exists arm below. The model is per dataset TYPE, so params.Type
+	// selects which keys are legal — recordsize on a VOLUME is as fatal as
+	// logbias on either.
+	if err := validateDatasetPayloadKeys(params, datasetCreateKeyScopes, params.Type); err != nil {
 		return nil, fmt.Errorf("failed to create dataset: %w", err)
 	}
 	if existing, exists := m.Datasets[params.Name]; exists {
@@ -789,9 +791,17 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 		return nil, m.InjectError
 	}
 	// Schema first, exactly as on create: the middleware rejects an out-of-model
-	// key before it resolves the dataset. The update model carries no dataset
-	// type, so the error path is the bare "data.<key>" form.
-	if err := ValidateDatasetPayloadKeys(params, datasetUpdateAcceptedKeys, ""); err != nil {
+	// key before it does anything with the dataset. pool.dataset.update is typed
+	// too, so the stored type is looked up (a read only — the not-found arm below
+	// still owns the ordering) and drives the per-type key set. A name the mock
+	// does not hold resolves to the empty type, which validates permissively:
+	// only the keys NEITHER model accepts are rejected, and the error path is the
+	// bare "data.<key>" form.
+	updateType := ""
+	if stored, held := m.Datasets[name]; held {
+		updateType = stored.Type
+	}
+	if err := validateDatasetPayloadKeys(params, datasetUpdateKeyScopes, updateType); err != nil {
 		return nil, fmt.Errorf("failed to update dataset: %w", err)
 	}
 	ds, ok := m.Datasets[name]

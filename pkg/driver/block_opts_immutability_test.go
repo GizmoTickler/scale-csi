@@ -361,17 +361,17 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 			client := newAPICallCountingClient()
 			d := newAPICallCountDriver(t, client, protocol)
 			ctx := context.Background()
-			sourceType := "VOLUME"
+			// A filesystem source is sized by refquota and a zvol by volsize; 26.0's
+			// per-type models carry only their own key, so the fixture must too.
+			source := &truenas.DatasetCreateParams{Name: "pool/parent/clone-source", Type: "VOLUME", Volsize: testGiB}
 			if protocol == "nfs" {
-				sourceType = "FILESYSTEM"
+				source = &truenas.DatasetCreateParams{Name: "pool/parent/clone-source", Type: "FILESYSTEM", Refquota: testGiB}
 			}
 			_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
 				Name: "pool/parent", Type: "FILESYSTEM",
 			})
 			require.NoError(t, err)
-			_, err = client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
-				Name: "pool/parent/clone-source", Type: sourceType, Volsize: testGiB,
-			})
+			_, err = client.MockClient.DatasetCreate(ctx, source)
 			require.NoError(t, err)
 			stampDriverOwnership(t, client.MockClient, d, "pool/parent/clone-source")
 			if len(stamp) > 0 {

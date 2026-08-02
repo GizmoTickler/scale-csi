@@ -139,62 +139,163 @@ type DatasetUpdateParams struct {
 // pool.dataset.create / pool.dataset.update accepted-key schema (TrueNAS 26.0)
 // ---------------------------------------------------------------------------
 //
-// TrueNAS 26.0's middleware is SCHEMA-STRICT: a payload key outside the method's
-// model is rejected with
-// "[EINVAL] data.<TYPE>.<key>: Extra inputs are not permitted", which the
+// TrueNAS 26.0's middleware is SCHEMA-STRICT and its models are PER DATASET
+// TYPE: a payload key outside the model for the type being created is rejected
+// with "[EINVAL] data.<TYPE>.<key>: Extra inputs are not permitted", which the
 // WebSocket transport collapses to the JSON-RPC -32602 "Invalid params" an
-// operator actually sees. The sets below are what MockClient enforces, so
-// "the driver emits a key 26.0 does not accept" fails a unit test instead of
-// every CreateVolume on a real appliance (v1.5.0's zfsPerformanceClass blocker).
+// operator actually sees. The classification below is what MockClient enforces,
+// so "the driver emits a key 26.0 does not accept for this dataset type" fails a
+// unit test instead of every CreateVolume on a real appliance (v1.5.0's
+// zfsPerformanceClass blocker).
 //
-// Membership is derived from the DatasetCreateParams / DatasetUpdateParams JSON
-// tags — the complete set of keys this client can put on the wire — minus the
-// keys probed live and found to be rejected. TestDatasetParamsSchemaCoverage
-// asserts the two stay in lockstep, so adding a struct field without recording
-// which side it belongs on is a test failure rather than a live surprise.
+// The classification is a HAND-MAINTAINED literal, not a derivation from the
+// params structs. That is the whole point: a set derived from the structs would
+// auto-classify every new field as accepted and could only ever catch keys
+// already known to be bad. TestDatasetParamsSchemaCoverage diffs the structs'
+// JSON tags against these maps in both directions, so a new field with no
+// classification entry — and a stale entry for a removed field — is a test
+// failure rather than a live surprise.
+//
+// SCOPE OF THE CLAIM: every entry below is annotated with the evidence behind
+// it. Only the datasetKeyRejectedBy26 entries and the FILESYSTEM/VOLUME split
+// the driver itself already enforces are probe- or code-backed; the rest are ZFS
+// semantics, marked as such. Keys whose type split is genuinely unknown are
+// classified datasetKeyBothTypes (permissive) and say so, so this is a real
+// per-type gate for what has been established and does not pretend to be a
+// complete model of 26.0.
 
-// datasetPropertiesRejectedBy26 are payload keys this client's structs can still
-// spell but TrueNAS 26.0 does NOT accept.
+// datasetKeyScope classifies one payload key against TrueNAS 26.0's per-type
+// pool.dataset.create / pool.dataset.update models.
+type datasetKeyScope uint8
+
+const (
+	// datasetKeyRejectedBy26 — absent from BOTH type models on 26.0.
+	datasetKeyRejectedBy26 datasetKeyScope = iota
+	// datasetKeyBothTypes — accepted for FILESYSTEM and VOLUME alike.
+	datasetKeyBothTypes
+	// datasetKeyFilesystemOnly — accepted for FILESYSTEM, rejected for VOLUME.
+	datasetKeyFilesystemOnly
+	// datasetKeyVolumeOnly — accepted for VOLUME, rejected for FILESYSTEM.
+	datasetKeyVolumeOnly
+)
+
+// datasetCreateKeyScopes classifies every JSON tag DatasetCreateParams can put
+// on the wire.
 //
-// Probed live on 26.0.0-BETA.1 (nas01, pool flashstor) on 2026-08-02, one
-// property per call, against BOTH pool.dataset.create and pool.dataset.update
-// and for BOTH dataset types:
+// PROBED (26.0.0-BETA.1, nas01, pool flashstor, 2026-08-02, one property per
+// call, against BOTH pool.dataset.create and pool.dataset.update, for BOTH
+// dataset types):
 //
 //	logbias        => [EINVAL] data.FILESYSTEM.logbias: Extra inputs are not permitted
 //	primarycache   => [EINVAL] data.FILESYSTEM.primarycache: Extra inputs are not permitted
 //	secondarycache => [EINVAL] data.VOLUME.secondarycache: Extra inputs are not permitted
 //
-// They are absent from the 26.0 API schema, and an audit of core.get_methods
-// found no alternative setter (filesystem.set_zfs_attributes is POSIX
-// attributes, not ZFS properties). The struct fields are retained because
+// Those three are absent from the 26.0 API schema, and an audit of
+// core.get_methods found no alternative setter (filesystem.set_zfs_attributes is
+// POSIX attributes, not ZFS properties). The struct fields are retained because
 // applyDatasetProperties still honors them for operators on the 25.04-25.10
 // floor this driver also supports; on 26.0 they cannot be set through the API at
 // all, only out of band with `zfs set` (e.g. on the parent dataset, so new
 // volumes inherit).
-var datasetPropertiesRejectedBy26 = map[string]struct{}{
-	"logbias":        {},
-	"primarycache":   {},
-	"secondarycache": {},
+var datasetCreateKeyScopes = map[string]datasetKeyScope{
+	// Structural: present in both models.
+	"name": datasetKeyBothTypes,
+	"type": datasetKeyBothTypes,
+
+	// VOLUME-only. DRIVER-BACKED: createDataset (controller.go) sets all three
+	// on the zvol branch only, and ZFS itself has no such properties on a
+	// filesystem.
+	"volsize":      datasetKeyVolumeOnly,
+	"volblocksize": datasetKeyVolumeOnly,
+	"sparse":       datasetKeyVolumeOnly,
+
+	// FILESYSTEM-only, DRIVER-BACKED. createDataset writes refquota only on the
+	// NFS filesystem branch; applyDatasetProperties warn-and-drops recordsize and
+	// atime for a VOLUME, and zfsFilesystemOnlyProperties encodes the same split
+	// for the curated presets. quota is the dataset-level sibling of refquota and
+	// has no zvol form in ZFS.
+	"quota":      datasetKeyFilesystemOnly,
+	"refquota":   datasetKeyFilesystemOnly,
+	"recordsize": datasetKeyFilesystemOnly,
+	"atime":      datasetKeyFilesystemOnly,
+
+	// FILESYSTEM-only by ZFS SEMANTICS — these describe a mounted POSIX
+	// namespace, which a zvol does not have. The driver only ever sets acltype
+	// and aclmode, and applyDatasetACLParams already returns early for a VOLUME.
+	// NOT independently probed against 26.0's VOLUME model; if one of these turns
+	// out to be accepted there, this is the line to correct.
+	"exec":            datasetKeyFilesystemOnly,
+	"snapdir":         datasetKeyFilesystemOnly,
+	"casesensitivity": datasetKeyFilesystemOnly,
+	"aclmode":         datasetKeyFilesystemOnly,
+	"acltype":         datasetKeyFilesystemOnly,
+	"share_type":      datasetKeyFilesystemOnly,
+	"xattr":           datasetKeyFilesystemOnly,
+
+	// Both types. refreservation is DRIVER-BACKED (createDataset writes it on
+	// both branches) and special_small_block_size is PRESET-BACKED (it is in the
+	// `database` preset and is absent from zfsFilesystemOnlyProperties, so it is
+	// emitted for zvols too). The rest are ZFS properties defined for filesystems
+	// and volumes alike; their type split was not separately probed, and BOTH is
+	// the permissive classification.
+	"reservation":              datasetKeyBothTypes,
+	"refreservation":           datasetKeyBothTypes,
+	"comments":                 datasetKeyBothTypes,
+	"readonly":                 datasetKeyBothTypes,
+	"sync":                     datasetKeyBothTypes,
+	"compression":              datasetKeyBothTypes,
+	"deduplication":            datasetKeyBothTypes,
+	"checksum":                 datasetKeyBothTypes,
+	"copies":                   datasetKeyBothTypes,
+	"special_small_block_size": datasetKeyBothTypes,
+	"user_properties":          datasetKeyBothTypes,
+
+	// Rejected by 26.0 outright — see the probe transcript above.
+	"logbias":        datasetKeyRejectedBy26,
+	"primarycache":   datasetKeyRejectedBy26,
+	"secondarycache": datasetKeyRejectedBy26,
 }
 
-// datasetCreateAcceptedKeys / datasetUpdateAcceptedKeys are the JSON tags of the
-// respective params struct minus datasetPropertiesRejectedBy26.
-var (
-	datasetCreateAcceptedKeys = acceptedDatasetKeys(DatasetCreateParams{})
-	datasetUpdateAcceptedKeys = acceptedDatasetKeys(DatasetUpdateParams{})
-)
+// datasetUpdateKeyScopes classifies every JSON tag DatasetUpdateParams can put
+// on the wire. Same evidence rules as datasetCreateKeyScopes; the type split is
+// the one ZFS enforces (a zvol is sized by volsize and carries no dataset
+// quota, a filesystem is the reverse).
+var datasetUpdateKeyScopes = map[string]datasetKeyScope{
+	"volsize":                datasetKeyVolumeOnly,
+	"quota":                  datasetKeyFilesystemOnly,
+	"refquota":               datasetKeyFilesystemOnly,
+	"reservation":            datasetKeyBothTypes,
+	"refreservation":         datasetKeyBothTypes,
+	"comments":               datasetKeyBothTypes,
+	"readonly":               datasetKeyBothTypes,
+	"user_properties_update": datasetKeyBothTypes,
+}
 
-// acceptedDatasetKeys reflects a params struct's JSON tags and drops the keys
-// 26.0 rejects.
-func acceptedDatasetKeys(params interface{}) map[string]struct{} {
-	keys := make(map[string]struct{})
-	for _, key := range datasetParamsJSONKeys(params) {
-		if _, rejected := datasetPropertiesRejectedBy26[key]; rejected {
-			continue
-		}
-		keys[key] = struct{}{}
+// datasetKeyAccepted reports whether TrueNAS 26.0 accepts key for datasetType,
+// per the classification map. An unclassified key is treated as rejected: a
+// field added to a params struct without a classification entry must fail
+// closed, and TestDatasetParamsSchemaCoverage names it explicitly.
+//
+// An EMPTY datasetType means "the caller does not know the type" (the mock's
+// update path when the dataset is not in its store). It resolves permissively:
+// only the keys neither model accepts are rejected.
+func datasetKeyAccepted(scopes map[string]datasetKeyScope, key, datasetType string) bool {
+	scope, classified := scopes[key]
+	if !classified {
+		return false
 	}
-	return keys
+	switch scope {
+	case datasetKeyRejectedBy26:
+		return false
+	case datasetKeyBothTypes:
+		return true
+	case datasetKeyFilesystemOnly:
+		return datasetType != "VOLUME"
+	case datasetKeyVolumeOnly:
+		return datasetType == "VOLUME" || datasetType == ""
+	default:
+		return false
+	}
 }
 
 // datasetParamsJSONKeys lists the JSON tag names of a params struct.
@@ -234,10 +335,10 @@ func UnsupportedDatasetPropertyError(datasetType, property string) *APIError {
 	}
 }
 
-// ValidateDatasetPayloadKeys reports the first payload key that TrueNAS 26.0
-// would reject, marshaling the params exactly as the real client would so
-// `omitempty` decides what is actually on the wire.
-func ValidateDatasetPayloadKeys(params interface{}, accepted map[string]struct{}, datasetType string) error {
+// validateDatasetPayloadKeys reports the first payload key that TrueNAS 26.0
+// would reject for datasetType, marshaling the params exactly as the real client
+// would so `omitempty` decides what is actually on the wire.
+func validateDatasetPayloadKeys(params interface{}, scopes map[string]datasetKeyScope, datasetType string) error {
 	encoded, err := json.Marshal(params)
 	if err != nil {
 		return fmt.Errorf("encode dataset params: %w", err)
@@ -253,7 +354,7 @@ func ValidateDatasetPayloadKeys(params interface{}, accepted map[string]struct{}
 	// Deterministic reporting when a payload carries more than one bad key.
 	sort.Strings(keys)
 	for _, key := range keys {
-		if _, ok := accepted[key]; !ok {
+		if !datasetKeyAccepted(scopes, key, datasetType) {
 			return UnsupportedDatasetPropertyError(datasetType, key)
 		}
 	}

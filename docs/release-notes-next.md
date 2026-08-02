@@ -14,8 +14,19 @@ flag defaults change and the default Helm render is unchanged.
   [ZFS performance classes](#zfs-performance-classes) below.
 - **The mock let it ship.** `MockClient` accepted any dataset property while the
   real middleware is schema-strict, so every unit test and `csi-sanity` run
-  passed against a payload the appliance would refuse. The mock now enforces the
-  26.0 dataset schema.
+  passed against a payload the appliance would refuse. `MockClient` now validates
+  `pool.dataset.create`/`.update` payload keys against a hand-maintained,
+  PER-DATASET-TYPE classification — 26.0's models are per type, and the live
+  errors are literally `data.FILESYSTEM.logbias` and `data.VOLUME.secondarycache`
+  — so `recordsize` on a zvol and `volsize` on a filesystem now fail a unit test
+  the way they fail on the appliance. The classification is deliberately NOT
+  derived from the client's own structs: a coverage test diffs the struct JSON
+  tags against it in both directions, so a new field with no classification entry
+  fails the test instead of being auto-accepted. Which entries are probe-backed
+  (`logbias`/`primarycache`/`secondarycache`, rejected on both types) and which
+  are inferred from ZFS semantics is annotated key by key in
+  `pkg/truenas/dataset.go`; it is a real gate for what has been established, not
+  a complete model of 26.0. Test-only — production behavior is unchanged.
 - **A partially-cleared NFS squash pair produced the exact opaque error the GF5
   preflight exists to remove.** `nfsMaprootUser: ""` alone, leaving the shipped
   `nfs.shareMaprootGroup: wheel`, orphaned the group and failed inside the
