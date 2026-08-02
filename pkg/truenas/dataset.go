@@ -209,15 +209,16 @@ var datasetCreateKeyScopes = map[string]datasetKeyScope{
 	"volblocksize": datasetKeyVolumeOnly,
 	"sparse":       datasetKeyVolumeOnly,
 
-	// FILESYSTEM-only, DRIVER-BACKED. createDataset writes refquota only on the
-	// NFS filesystem branch; applyDatasetProperties warn-and-drops recordsize and
+	// FILESYSTEM-only, DRIVER-BACKED: createDataset writes refquota only on the
+	// NFS filesystem branch, applyDatasetProperties warn-and-drops recordsize and
 	// atime for a VOLUME, and zfsFilesystemOnlyProperties encodes the same split
-	// for the curated presets. quota is the dataset-level sibling of refquota and
-	// has no zvol form in ZFS.
-	"quota":      datasetKeyFilesystemOnly,
+	// for the curated presets.
 	"refquota":   datasetKeyFilesystemOnly,
 	"recordsize": datasetKeyFilesystemOnly,
 	"atime":      datasetKeyFilesystemOnly,
+	// quota is ZFS SEMANTICS, not driver-backed — the driver never sets it. It is
+	// refquota's dataset-level sibling and ZFS has no zvol form of it.
+	"quota": datasetKeyFilesystemOnly,
 
 	// FILESYSTEM-only by ZFS SEMANTICS — these describe a mounted POSIX
 	// namespace, which a zvol does not have. The driver only ever sets acltype
