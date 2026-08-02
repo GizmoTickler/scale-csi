@@ -1,4 +1,44 @@
-# Release notes — v1.5.0
+# Release notes — v1.5.1
+
+## v1.5.1 — live-drill fixes on top of v1.5.0
+
+v1.5.0 was tagged but never deployed: a live drill against a real TrueNAS 26.0
+appliance (nas01, 2026-08-02) failed it. v1.5.1 is that drill's fix list. No
+flag defaults change and the default Helm render is unchanged.
+
+- **`zfsPerformanceClass` was 100% non-functional (release blocker).** All five
+  presets emitted `logbias` and `primarycache`, which TrueNAS 26.0 rejects, so
+  every `CreateVolume` carrying the parameter failed with `Invalid params`. The
+  presets now emit only properties the appliance accepts. Details and the
+  corrected create-only/live-tunable split are in
+  [ZFS performance classes](#zfs-performance-classes) below.
+- **The mock let it ship.** `MockClient` accepted any dataset property while the
+  real middleware is schema-strict, so every unit test and `csi-sanity` run
+  passed against a payload the appliance would refuse. The mock now enforces the
+  26.0 dataset schema.
+- **A partially-cleared NFS squash pair produced the exact opaque error the GF5
+  preflight exists to remove.** `nfsMaprootUser: ""` alone, leaving the shipped
+  `nfs.shareMaprootGroup: wheel`, orphaned the group and failed inside the
+  middleware. A squash group with no user is now refused up front with an
+  `InvalidArgument` naming both keys and the fix, for the `maproot_*` and
+  `mapall_*` families alike. A user with no group is legal and still accepted.
+- **`DeleteVolume` blamed a foreign task for the driver's own tombstones.** A
+  deferred `DeleteSnapshot` leaves a ledger-recorded tombstone; the following
+  `DeleteVolume` refusal described it as "likely from a TrueNAS
+  periodic-snapshot or replication task" and pointed the operator at
+  `zfs.destroyForeignSnapshotsOnDelete`. The refusal (preserve-until-reaped)
+  is unchanged and deliberate — the reconcile reaper clears these and the retry
+  then succeeds — but the message now identifies driver-proven tombstones and
+  drops the foreign-task advice when every blocking snapshot is one.
+- **Sub-1GiB NFS volumes failed opaquely.** TrueNAS floors a dataset `refquota`
+  at 1 GiB. `CreateVolume` now says so, scoped to volumes whose size is applied
+  as a refquota (NFS with `zfs.datasetEnableQuotas`); zvols and quota-less NFS
+  volumes are unaffected.
+
+Everything below this section is the v1.5.0 changelog, unchanged except where a
+v1.5.1 fix corrected a statement in it.
+
+---
 
 This document is the accumulated changelog from the v1.2.23 documentation
 baseline through the **v1.5.0** release candidate, ordered newest-first. v1.5.0
