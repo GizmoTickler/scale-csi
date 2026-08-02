@@ -504,6 +504,18 @@ func (d *Driver) contentSourceBlockGeometry(
 	source *csi.VolumeContentSource,
 	shareType ShareType,
 ) (blockGeometry, error) {
+	if shareType == ShareTypeNVMeoF {
+		// These two arms hold no source record — the normal clone path's snapshot
+		// and source dataset are gone by the time a remnant is resumed or a replay
+		// arrives — so the cross-protocol question has to be re-asked with a read.
+		// It is asked ONLY for NVMe-oF and only on these exceptional arms; the
+		// normal NVMe-oF create/clone/restore paths already hold the record and
+		// pay nothing (guardCrossProtocolBlockGeometry).
+		if guardErr := d.guardNVMeoFContentSourceGeometry(ctx, datasetName, source); guardErr != nil {
+			return blockGeometry{}, guardErr
+		}
+		return blockGeometry{knowledge: geometryUnexamined}, nil
+	}
 	if shareType != ShareTypeISCSI {
 		return blockGeometry{knowledge: geometryUnexamined}, nil
 	}
@@ -542,6 +554,53 @@ func (d *Driver) contentSourceBlockGeometry(
 		return blockGeometry{}, d.unknownGeometryError(datasetName, resolved.provenance)
 	}
 	return resolved, nil
+}
+
+// guardNVMeoFContentSourceGeometry is the recovery/replay half of the
+// cross-protocol geometry refusal (guardCrossProtocolBlockGeometry): it reads
+// the same record the create path already held, for the two arms that do not
+// run the normal clone path.
+//
+// A source that can no longer be READ is not turned into a refusal here. The
+// iSCSI arm below fails a vanished content source closed because it needs the
+// source's geometry to create the destination extent; this arm needs it only to
+// contradict a claim, so a missing source records nothing to contradict and the
+// arm proceeds exactly as it did before. A transport error IS surfaced
+// (Internal), because it is transient and the resumed remnant is retried.
+func (d *Driver) guardNVMeoFContentSourceGeometry(
+	ctx context.Context,
+	datasetName string,
+	source *csi.VolumeContentSource,
+) error {
+	switch {
+	case source.GetSnapshot() != nil:
+		snapshotID := source.GetSnapshot().GetSnapshotId()
+		snap, findErr := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+		if findErr != nil {
+			return status.Errorf(codes.Internal,
+				"failed to re-read the content source of in-flight remnant %s: %v", datasetName, findErr)
+		}
+		if snap == nil {
+			return nil
+		}
+		return guardCrossProtocolBlockGeometry(nil, snap, snapshotID, datasetName)
+	case source.GetVolume() != nil:
+		sourceVolumeID := source.GetVolume().GetVolumeId()
+		sourceDataset, datasetErr := d.datasetForID(sourceVolumeID)
+		if datasetErr != nil {
+			return datasetErr
+		}
+		sourceDS, getErr := d.truenasClient.DatasetGet(ctx, sourceDataset)
+		if getErr != nil {
+			if truenas.IsNotFoundError(getErr) {
+				return nil
+			}
+			return status.Errorf(codes.Internal,
+				"failed to read the recorded block geometry of clone source %s: %v", sourceDataset, getErr)
+		}
+		return guardCrossProtocolBlockGeometry(sourceDS, nil, sourceVolumeID, datasetName)
+	}
+	return nil
 }
 
 // tombstoneLedgerEntry is the parent-dataset record proving that THIS driver

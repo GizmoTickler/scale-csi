@@ -660,8 +660,18 @@ type NVMeoFConfig struct {
 	// Multipath enables NVMe-oF multi-port multipath (GF-Sprint 4, E-6). When
 	// true, the controller associates each subsystem with one port per address in
 	// Addresses (in addition to TransportAddress) and advertises all of them in
-	// the publish context so the node connects each and the kernel's native NVMe
-	// multipath load-balances/fails over. Default false (single port, byte-identical).
+	// the publish context under "addresses".
+	//
+	// HONEST SCOPE — CONTROLLER SIDE ONLY. The node half is NOT shipped:
+	// stageNVMeoFVolume still runs a single `nvme connect` to volumeContext
+	// "address" and never reads "addresses", so enabling this today delivers NO
+	// multipath, NO load balancing and NO path failover. What it does deliver is
+	// the backend exposure (one port per storage NIC) the node work will build
+	// on, at a cost of 2*(N-1) extra API calls per volume. There is also no ANA
+	// on this platform (nvmet rejects it), so when the node half lands all paths
+	// are equally optimized — correct for a single controller.
+	//
+	// Default false (single port, byte-identical to pre-GF4).
 	Multipath bool `yaml:"multipath"`
 
 	// Addresses is the list of additional storage transport addresses (IPs) to
