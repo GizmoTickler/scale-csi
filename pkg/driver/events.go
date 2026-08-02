@@ -63,6 +63,11 @@ const (
 	// EventReasonISCSICHAPFailed is emitted when CHAP configuration fails in the
 	// NodeStage path. The message never includes the username/password (E3/O15).
 	EventReasonISCSICHAPFailed = "ISCSICHAPFailed"
+	// EventReasonZFSPerformanceClassIgnored is emitted when a StorageClass names a
+	// curated zfsPerformanceClass on a volume provisioned from a content source.
+	// A ZFS clone/restore inherits the origin dataset's geometry and accepts no
+	// property payload, so the class is neither applied nor stamped.
+	EventReasonZFSPerformanceClassIgnored = "ZFSPerformanceClassIgnored"
 )
 
 const (

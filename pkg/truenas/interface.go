@@ -78,6 +78,22 @@ type ClientInterface interface {
 	NFSShareFindByPath(ctx context.Context, path string) (*NFSShare, error)
 	NFSShareList(ctx context.Context) ([]*NFSShare, error)
 	NFSShareUpdate(ctx context.Context, id int, params map[string]interface{}) (*NFSShare, error)
+	NFSServiceConfig(ctx context.Context) (*NFSServiceConfig, error)
+	NFSServiceUpdate(ctx context.Context, params map[string]interface{}) (*NFSServiceConfig, error)
+
+	// ZFS property choice / topology introspection (curated performance classes).
+	ZFSPropertyChoices(ctx context.Context) (*ZFSPropertyChoices, error)
+	RecommendedZvolBlocksize(ctx context.Context, pool string) (string, error)
+	PoolHasSpecialVdev(ctx context.Context, pool string) (bool, error)
+
+	// Backend health (read-only).
+	PoolHealth(ctx context.Context, pool string) (*PoolHealthSnapshot, error)
+	DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error)
+
+	// Filesystem ACL methods (NFSv4 ACLs). FilesystemSetACL is a @job.
+	FilesystemGetACL(ctx context.Context, path string) (*FilesystemACL, error)
+	FilesystemSetACL(ctx context.Context, opts *SetACLOptions) error
+	ACLTemplateDACL(ctx context.Context, name string) ([]ACLEntry, error)
 
 	// Service methods
 	ServiceReload(ctx context.Context, service string) error

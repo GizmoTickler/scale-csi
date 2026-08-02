@@ -270,7 +270,7 @@ func TestSprint2CloneScrubDropsInheritedCHAP(t *testing.T) {
 	_, err := mock.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
 
-	d.scrubInheritedProtocolProperties(ctx, ds, datasetName, ShareTypeISCSI)
+	d.scrubInheritedCloneProperties(ctx, ds, datasetName, ShareTypeISCSI)
 
 	_, tagPresent := ds.UserProperties[PropISCSIAuthTag]
 	_, modePresent := ds.UserProperties[PropISCSIAuthMode]

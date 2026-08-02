@@ -102,6 +102,261 @@ type MockClient struct {
 	// JobSubscribed is the value AnyConnectionJobSubscribed reports, letting a
 	// health test drive the scale_csi_job_dispatcher_subscribed gauge.
 	JobSubscribed bool
+
+	// GF5 NFS/ACL/health test surfaces.
+	//
+	// NFSShareCreateParams records every sharing.nfs.create payload verbatim so a
+	// test can assert the DEFAULT payload is byte-identical to the pre-GF5 one.
+	NFSShareCreateParams []NFSShareCreateParams
+	// NFSShareUpdateParams records every sharing.nfs.update payload verbatim so a
+	// test can pin the R4 invariant: an idempotent replay must NEVER rewrite an
+	// existing export's security or squash mapping.
+	NFSShareUpdateParams  []map[string]interface{}
+	NFSServiceConfigValue *NFSServiceConfig
+	NFSServiceConfigCalls int
+	NFSServiceUpdateCalls []map[string]interface{}
+
+	// ACLs is the per-path ACL state filesystem.setacl mutates; SetACLCalls is
+	// the verbatim call log. ACLTemplates overrides the builtin template set.
+	ACLs           map[string]*FilesystemACL
+	SetACLCalls    []SetACLOptions
+	ACLTemplates   map[string][]ACLEntry
+	InjectACLError error
+
+	// ZFS choice / topology surfaces for the curated performance classes.
+	ZFSChoicesValue    *ZFSPropertyChoices
+	ZFSChoicesCalls    int
+	InjectChoicesError error
+	SpecialVdevPresent bool
+	SpecialVdevCalls   int
+	InjectPoolError    error
+
+	// Backend health surfaces.
+	PoolHealthValue    *PoolHealthSnapshot
+	PoolHealthCalls    int
+	TemperatureAlerts  []string
+	TempAlertCalls     int
+	InjectHealthError  error
+	InjectTempAlertErr error
+	// PoolQueryResult is a RAW pool.query result decoded by the production
+	// decoder, so a test can exercise a real middleware response — in particular
+	// an empty result, which is a valid answer that must still fail the sample as
+	// "pool ... not found". Set PoolQueryResultSet to use it (an empty result is
+	// itself meaningful, so nil cannot be the switch).
+	PoolQueryResult    interface{}
+	PoolQueryResultSet bool
+	// PoolHealthEntered / PoolHealthRelease and TempAlertEntered /
+	// TempAlertRelease turn either backend read into a call the test can hold
+	// IN FLIGHT: the mock signals Entered once it is inside the call and then
+	// blocks until Release is closed. That is what lets a test observe what the
+	// driver publishes WHILE a backend call has not returned.
+	PoolHealthEntered chan struct{}
+	PoolHealthRelease chan struct{}
+	TempAlertEntered  chan struct{}
+	TempAlertRelease  chan struct{}
+}
+
+func (m *MockClient) PoolHealth(ctx context.Context, pool string) (*PoolHealthSnapshot, error) {
+	m.mu.Lock()
+	m.PoolHealthCalls++
+	entered, release := m.PoolHealthEntered, m.PoolHealthRelease
+	injected := m.InjectHealthError
+	queryResult, queryResultSet := m.PoolQueryResult, m.PoolQueryResultSet
+	var clone *PoolHealthSnapshot
+	if m.PoolHealthValue != nil {
+		copied := *m.PoolHealthValue
+		copied.Pool = pool
+		copied.Disks = append([]string(nil), m.PoolHealthValue.Disks...)
+		clone = &copied
+	}
+	m.mu.Unlock()
+
+	// Gate OUTSIDE the mutex so a held call does not deadlock unrelated mock use.
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+
+	if injected != nil {
+		return nil, injected
+	}
+	if queryResultSet {
+		return poolHealthFromQueryResult(pool, queryResult)
+	}
+	if clone != nil {
+		return clone, nil
+	}
+	return &PoolHealthSnapshot{
+		Pool:         pool,
+		Status:       PoolStatusOnline,
+		Healthy:      true,
+		ScanFunction: PoolScanFunctionScrub,
+		ScanState:    PoolScanStateFinished,
+		Disks:        []string{"nvme0n1", "nvme1n1"},
+		SampledAt:    time.Now(),
+	}, nil
+}
+
+// SetPoolHealthValue updates the health fixture through the mock's lock so a
+// test can change the backend response while a real production poll is in
+// flight.
+func (m *MockClient) SetPoolHealthValue(snapshot *PoolHealthSnapshot) {
+	m.mu.Lock()
+	m.PoolHealthValue = snapshot
+	m.mu.Unlock()
+}
+
+// SetTemperatureAlerts updates the temperature fixture through the mock's lock
+// for concurrent production-path sampling tests.
+func (m *MockClient) SetTemperatureAlerts(alerts []string) {
+	m.mu.Lock()
+	m.TemperatureAlerts = append([]string(nil), alerts...)
+	m.mu.Unlock()
+}
+
+func (m *MockClient) DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	m.TempAlertCalls++
+	entered, release := m.TempAlertEntered, m.TempAlertRelease
+	injected := m.InjectTempAlertErr
+	alerts := append([]string(nil), m.TemperatureAlerts...)
+	m.mu.Unlock()
+
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+	if injected != nil {
+		return nil, injected
+	}
+	return alerts, nil
+}
+
+func (m *MockClient) ZFSPropertyChoices(ctx context.Context) (*ZFSPropertyChoices, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ZFSChoicesCalls++
+	if m.InjectChoicesError != nil {
+		return nil, m.InjectChoicesError
+	}
+	if m.ZFSChoicesValue != nil {
+		return m.ZFSChoicesValue, nil
+	}
+	// The live nas01 lists, trimmed to what the curated classes use.
+	return &ZFSPropertyChoices{
+		Recordsize:  []string{"512", "512B", "1K", "2K", "4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", "1M", "2M", "4M", "8M", "16M"},
+		Compression: []string{"ON", "OFF", "LZ4", "GZIP", "ZSTD", "ZLE", "LZJB"},
+		Checksum:    []string{"ON", "FLETCHER2", "FLETCHER4", "SHA256", "SHA512", "SKEIN", "EDONR", "BLAKE3"},
+	}, nil
+}
+
+func (m *MockClient) RecommendedZvolBlocksize(ctx context.Context, pool string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectPoolError != nil {
+		return "", m.InjectPoolError
+	}
+	return "16K", nil
+}
+
+func (m *MockClient) PoolHasSpecialVdev(ctx context.Context, pool string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SpecialVdevCalls++
+	if m.InjectPoolError != nil {
+		return false, m.InjectPoolError
+	}
+	return m.SpecialVdevPresent, nil
+}
+
+// builtinACLTemplates mirrors the NFS4 templates TrueNAS ships. Only the shape
+// matters for driver tests: a non-empty NFS4 dacl resolved by name.
+var builtinACLTemplates = map[string][]ACLEntry{
+	"NFS4_OPEN": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+		{Tag: "group@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "MODIFY"}},
+		{Tag: "everyone@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "MODIFY"}},
+	},
+	"NFS4_RESTRICTED": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+		{Tag: "group@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "MODIFY"}},
+	},
+	"NFS4_HOME": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+		{Tag: "group@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "TRAVERSE"}},
+	},
+	"NFS4_DOMAIN_HOME": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+	},
+	"NFS4_ADMIN": {
+		{Tag: "owner@", Type: "ALLOW", Perms: map[string]interface{}{"BASIC": "FULL_CONTROL"}},
+	},
+}
+
+func (m *MockClient) FilesystemGetACL(ctx context.Context, path string) (*FilesystemACL, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectACLError != nil {
+		return nil, m.InjectACLError
+	}
+	if acl, ok := m.ACLs[path]; ok {
+		return acl, nil
+	}
+	// An un-ACLed dataset reports the mode-derived trivial 3-ACE ACL.
+	return &FilesystemACL{
+		Path:    path,
+		ACLType: "NFS4",
+		Trivial: true,
+		ACL:     append([]ACLEntry(nil), builtinACLTemplates["NFS4_OPEN"]...),
+	}, nil
+}
+
+func (m *MockClient) FilesystemSetACL(ctx context.Context, opts *SetACLOptions) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if opts == nil || opts.Path == "" {
+		return fmt.Errorf("filesystem.setacl requires a path")
+	}
+	if len(opts.DACL) == 0 {
+		return fmt.Errorf("filesystem.setacl requires a non-empty dacl for %s", opts.Path)
+	}
+	m.SetACLCalls = append(m.SetACLCalls, *opts)
+	if m.InjectACLError != nil {
+		return m.InjectACLError
+	}
+	if m.ACLs == nil {
+		m.ACLs = make(map[string]*FilesystemACL)
+	}
+	m.ACLs[opts.Path] = &FilesystemACL{
+		Path:       opts.Path,
+		ACLType:    "NFS4",
+		Trivial:    false,
+		ACL:        append([]ACLEntry(nil), opts.DACL...),
+		NFS41Flags: opts.NFS41Flags,
+	}
+	return nil
+}
+
+func (m *MockClient) ACLTemplateDACL(ctx context.Context, name string) ([]ACLEntry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectACLError != nil {
+		return nil, m.InjectACLError
+	}
+	if dacl, ok := m.ACLTemplates[name]; ok {
+		return append([]ACLEntry(nil), dacl...), nil
+	}
+	if dacl, ok := builtinACLTemplates[name]; ok {
+		return append([]ACLEntry(nil), dacl...), nil
+	}
+	return nil, fmt.Errorf("ACL template %q not found", name)
 }
 
 // DatasetDeleteCall records the deletion mode requested by a test.
@@ -1507,8 +1762,12 @@ func (m *MockClient) NFSShareCreate(ctx context.Context, params *NFSShareCreateP
 		MapallUser:   params.MapallUser,
 		MapallGroup:  params.MapallGroup,
 		Enabled:      params.Enabled,
+
+		Security:        append([]string(nil), params.Security...),
+		ExposeSnapshots: params.ExposeSnapshots,
 	}
 	m.NFSShares[id] = share
+	m.NFSShareCreateParams = append(m.NFSShareCreateParams, *params)
 	return share, nil
 }
 
@@ -1556,6 +1815,7 @@ func (m *MockClient) NFSShareList(ctx context.Context) ([]*NFSShare, error) {
 func (m *MockClient) NFSShareUpdate(ctx context.Context, id int, params map[string]interface{}) (*NFSShare, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.NFSShareUpdateParams = append(m.NFSShareUpdateParams, params)
 	share := m.NFSShares[id]
 	if share == nil {
 		return nil, notFoundAPIError("share not found")
@@ -1570,6 +1830,41 @@ func (m *MockClient) NFSShareUpdate(ctx context.Context, id int, params map[stri
 		share.Enabled = enabled
 	}
 	return share, nil
+}
+
+// NFSServiceConfigValue is the global nfs.config the mock reports. Nil means
+// "backend did not answer" and NFSServiceConfig returns an error.
+func (m *MockClient) NFSServiceConfig(ctx context.Context) (*NFSServiceConfig, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.NFSServiceConfigCalls++
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	if m.NFSServiceConfigValue == nil {
+		return &NFSServiceConfig{Protocols: []string{NFSProtocolV3, NFSProtocolV4}, ProtocolsComplete: true, Servers: 64}, nil
+	}
+	clone := *m.NFSServiceConfigValue
+	clone.Protocols = append([]string(nil), m.NFSServiceConfigValue.Protocols...)
+	return &clone, nil
+}
+
+func (m *MockClient) NFSServiceUpdate(ctx context.Context, params map[string]interface{}) (*NFSServiceConfig, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.NFSServiceUpdateCalls = append(m.NFSServiceUpdateCalls, params)
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	if m.NFSServiceConfigValue == nil {
+		m.NFSServiceConfigValue = &NFSServiceConfig{Protocols: []string{NFSProtocolV3, NFSProtocolV4}, ProtocolsComplete: true, Servers: 64}
+	}
+	if protocols, ok := params["protocols"].([]string); ok {
+		m.NFSServiceConfigValue.Protocols = append([]string(nil), protocols...)
+	}
+	clone := *m.NFSServiceConfigValue
+	clone.Protocols = append([]string(nil), m.NFSServiceConfigValue.Protocols...)
+	return &clone, nil
 }
 
 // Service methods

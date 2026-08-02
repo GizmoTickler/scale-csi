@@ -20,6 +20,10 @@ type NFSShare struct {
 	MapallGroup  string   `json:"mapall_group"`
 	Security     []string `json:"security"`
 	Enabled      bool     `json:"enabled"`
+	// ExposeSnapshots publishes the dataset's read-only .zfs/snapshot directory
+	// through the export. TrueNAS only honors it when the export path is the
+	// dataset root (which every CSI volume's export is).
+	ExposeSnapshots bool `json:"expose_snapshots"`
 }
 
 // NFSShareCreateParams holds parameters for creating an NFS share.
@@ -35,6 +39,10 @@ type NFSShareCreateParams struct {
 	MapallGroup  string   `json:"mapall_group,omitempty"`
 	Security     []string `json:"security,omitempty"`
 	Enabled      bool     `json:"enabled"`
+	// ExposeSnapshots is omitempty on purpose: an unset (false) value must not
+	// appear in the sharing.nfs.create payload at all, so a deployment that never
+	// opts in produces a byte-identical request to the pre-GF5 driver.
+	ExposeSnapshots bool `json:"expose_snapshots,omitempty"`
 }
 
 // NFSShareCreate creates a new NFS share.
@@ -235,6 +243,9 @@ func parseNFSShare(data interface{}) (*NFSShare, error) {
 	}
 	if v, ok := m["enabled"].(bool); ok {
 		share.Enabled = v
+	}
+	if v, ok := m["expose_snapshots"].(bool); ok {
+		share.ExposeSnapshots = v
 	}
 
 	return share, nil

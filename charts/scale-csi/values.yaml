@@ -52,6 +52,108 @@ capacity:
   # Poll cadence for the capacity gauge loop. Values below 30s are clamped to it.
   gaugeInterval: 60s
 
+# Backend health -> per-PVC VolumeCondition + scale_csi_pool_* gauges.
+#
+# ZFS exposes NO per-dataset health signal: health is a per-POOL fact (plus
+# per-disk temperature). Every volume this driver manages lives on ONE pool, so
+# a pool condition is legitimately attributable to all of them and is fanned out
+# onto every managed PVC's CSI VolumeCondition, which the external health
+# monitor turns into PVC events.
+#
+# Severity is deliberately conservative: DEGRADED/FAULTED/UNAVAIL marks volumes
+# Abnormal, while a routine scrub/resilver or a disk temperature alert only adds
+# a descriptive message — a monthly scrub must never mark every PVC unhealthy.
+#
+# STEADY-STATE API COST when enabled: at most TWO reads (pool.query +
+# disk.temperature_alerts) per interval PER CONTROLLER REPLICA, and zero writes.
+# Like the capacity gauge loop it has no leader-election gate; the supported
+# configuration is controller.replicas=1; Helm rejects a larger replica count.
+# maxSurge 0 only covers rollout surge — Deployment termination, drain and
+# eviction overlap remain an inherent residual detected by the skew alert, not
+# prevented by this chart. No effect on the CreateVolume /
+# publish / unpublish request-path golden totals.
+#
+# The fan-out is damped so a flapping or unreachable backend cannot churn every
+# PVC. Metrics always carry the RAW sample; only the VolumeCondition is damped:
+#   * hysteresis — a health transition must be confirmed by TWO consecutive
+#     samples before it flips every managed PVC's condition;
+#   * staleness TTL — after three missed intervals the cached snapshot stops
+#     driving CONDITIONS at all (they fall back to the pre-GF5 dataset-only
+#     semantics) and scale_csi_pool_health_stale goes to 1. This bounds how long
+#     a stale verdict can drive PVC conditions; it does NOT silence alerting.
+#     The raw gauges stay FROZEN at their last sample, so a frozen DEGRADED keeps
+#     ScaleCSIPoolDegraded firing until a successful sample changes it — that
+#     alert is deliberately not gated on scale_csi_pool_health_stale.
+#
+# BECAUSE the condition is damped, the gauges are not, the alerts add their own
+# `for` hold on top of the gauges AND Prometheus observes all of it on its own
+# scrape/evaluation cadence, these views DO differ transiently — they share one
+# severity split, not one timeline. There are SEVEN NUMBERED classes of divergence;
+# the first three have an upper bound, the last four do not (canonical list:
+# backendHealthFlipSamples in pkg/driver/backend_health.go):
+#   1. confirmation lag — BOUNDED: a confirmed transition reaches the DRIVER's own
+#      published condition up to one poll interval plus one 30s call timeout
+#      after the gauges (<= 2m30s at the ceiling), which stays inside the 5m
+#      ScaleCSIPoolDegraded hold. That bounds DRIVER-SIDE PUBLICATION only —
+#      the PVC object and the alert are downstream of it and outside this
+#      number entirely. flip_pending = 1;
+#   2. alert hold — BOUNDED by the rule's own 5m `for`: once the condition
+#      confirms, PVCs read Abnormal while ScaleCSIPoolDegraded is still PENDING.
+#      The ceiling CREATES this ordering rather than removing it, and BOTH
+#      diagnostic gauges read 0 here — use the alert's pending state, not them;
+#   3. recovery — BOUNDED, one sample: the raw degraded gauge clears one sample
+#      BEFORE the condition, by design. flip_pending = 1;
+#   4. poll stall — UNBOUNDED: it lasts until a SUCCESSFUL USABLE sample arrives.
+#      A reply is not a usable sample: a valid pool.query that does not list the
+#      pool returns `pool ... not found` and is still a failed sample.
+#      The condition holds its last value while flip_pending and/or
+#      scale_csi_pool_health_stale go to 1 (alerts
+#      ScaleCSIPoolConditionFlipPending / ScaleCSIPoolHealthStale). Past the TTL
+#      conditions fall back to dataset-only while flip_pending may still read 1;
+#   5. observer lag — UNBOUNDED and invisible to the driver: Prometheus sees the
+#      gauges only on its next scrape and starts `for` at the first true
+#      EVALUATION, so after a recovery both diagnostic gauges can read 0 while
+#      the alert still fires. This chart puts no upper limit on the
+#      ServiceMonitor interval. Compare
+#      scale_csi_pool_health_last_success_timestamp_seconds (driver-owned) with
+#      scrape freshness — never timestamp(), which returns the SCRAPE time;
+#   6. cold start — UNBOUNDED until the first successful sample of a process: the
+#      raw scale_csi_pool_* series do not exist yet, so ScaleCSIPoolDegraded
+#      cannot fire at all; the driver publishes scale_csi_pool_health_stale = 1
+#      (flip_pending = 0) so the window is visible. The pool label is the
+#      CONFIGURED name, so a missing or renamed pool looks exactly like an
+#      unreachable one;
+#   7. replica skew — UNBOUNDED, and a PRODUCER-IDENTITY difference rather than a
+#      timing one: every replica polls (no leader election) and a fencing-off
+#      RollingUpdate can overlap processes, so `max by (pool)` merges
+#      independently sampled histories. Supported single-producer setup is
+#      controller.replicas=1, which is why enabling backendHealth renders a
+#      non-overlapping rollout. Detect it with
+#      count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds) > 1
+#      (alert ScaleCSIPoolHealthProducerSkew). Termination, drain and eviction
+#      overlap remain residuals detected rather than prevented by that alert.
+# The temperature count is accompanied by scale_csi_pool_disk_temp_alerts_age_seconds;
+# an absent age means the follow-up has not successfully returned yet.
+# Read scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before
+# treating a PVC condition as wrong, but remember they do not cover the alert
+# hold, observer lag, cold start or replica skew. Full contract:
+# docs/production.md, "Backend health".
+#
+# Default OFF so an upgrade changes neither the rendered manifest nor the
+# VolumeCondition semantics of existing volumes.
+backendHealth:
+  enabled: false
+  # Poll cadence, clamped to 30s-2m. The 2m CEILING is not arbitrary: the
+  # two-sample hysteresis makes a CONFIRMED condition flip take up to
+  # 2 x interval PLUS one 30s backend call timeout (4m30s at the ceiling),
+  # which has to stay inside the 5m ScaleCSIPoolDegraded hold — WHILE
+  # SUCCESSFUL SAMPLES KEEP ARRIVING; it is a cadence bound, not a wall-clock
+  # guarantee, and it cannot cover a sample that never arrives. An
+  # out-of-range value is clamped (one warning at controller startup), never
+  # rejected. The staleness TTL is three times the EFFECTIVE (clamped) value: 3m
+  # at this default, never more than 6m.
+  interval: 60s
+
 # Stable ownership identity stamped on newly-created datasets/zvols. Empty
 # derives "<csiDriverName>@<zfs.parentDataset>". Never change this for an
 # existing installation unless the matching datasets are deliberately adopted.
@@ -325,10 +427,72 @@ nfs:
   # all networks and should be restricted in production.
   shareAllowedNetworks: []
 
+  # maproot_* and mapall_* are MUTUALLY EXCLUSIVE in TrueNAS: sharing.nfs.create
+  # rejects a payload carrying both. To use mapall, clear the maproot values here
+  # (or, per StorageClass, set nfsMaprootUser: "" and nfsMaprootGroup: ""). The
+  # schema and the driver both reject the combination rather than letting it
+  # surface as an opaque middleware error at CreateVolume.
   shareMaprootUser: root
   shareMaprootGroup: wheel
   shareMapallUser: ""
   shareMapallGroup: ""
+
+  # Default `security` list for newly created exports: SYS, KRB5, KRB5I, KRB5P.
+  # EMPTY (the default) omits the field entirely, which is exactly what the
+  # driver has always sent and leaves TrueNAS on AUTH_SYS. Override per class
+  # with the StorageClass `nfsSecurity` parameter. Existing shares are never
+  # rewritten — security is a create-time property of a volume.
+  #
+  # FAIL CLOSED: KRB5/KRB5I/KRB5P here require krbEnabled: true below. This list
+  # is stamped on EVERY newly created export, so a Kerberos mode on a box with no
+  # KDC/keytab would mean dead mounts fleet-wide. The coupling is enforced by
+  # this chart's values.schema.json AND independently by the driver at config
+  # load — a hand-written ConfigMap bypasses the schema entirely, and the
+  # controller refuses to start rather than build unmountable exports.
+  shareSecurity: []
+
+  # Publish the dataset's read-only .zfs/snapshot tree through new exports.
+  # TrueNAS only honors it when the export path is the dataset root, which is
+  # always true for CSI volumes. Override per class with `nfsExposeSnapshots`.
+  shareExposeSnapshots: false
+
+  # Explicit acknowledgement that this TrueNAS has Kerberos configured for NFSv4
+  # (nfs.config v4_krb plus a keytab). KRB5/KRB5I/KRB5P share security is
+  # REJECTED at CreateVolume unless this is true, because a krb-only export on a
+  # box with no keytab makes every mount fail with an opaque server error.
+  krbEnabled: false
+
+  # Validate a StorageClass's pinned NFS version (its `vers=`/`nfsvers=`
+  # mountOption) against the GLOBAL nfs.config protocols, so a class asking for a
+  # version the server does not enable fails with a clear message instead of a
+  # cryptic mount error. Off by default: enabling it adds one cached nfs.config
+  # read per controller lifetime.
+  versionPreflight: false
+
+  # HARD RULE — opt-in only. Non-empty makes the controller MUTATE the GLOBAL
+  # TrueNAS NFS service at startup so the listed major versions (NFSV3/NFSV4)
+  # are enabled. That is a service-wide write affecting EVERY export on the
+  # appliance, driver-managed or not. The supported default is the read-only
+  # versionPreflight above. Values: NFSV3, NFSV4.
+  #
+  # nfs.update SETS the protocol list, it does not union with it, so "only adds,
+  # never removes" only holds while the CURRENT list is readable. If nfs.config
+  # reports no protocols, the driver hard-aborts the write instead of guessing.
+  ensureProtocols: []
+
+  # --- Performance mount-option profiles -------------------------------------
+  # NFS version selection is a NODE-side mount option, not a share property:
+  # there is no `vers` field on sharing.nfs.*. Set it on a StorageClass's
+  # `mountOptions` (see storageClasses below). Validated profiles:
+  #
+  #   v4.1-throughput: nfsvers=4.1,nconnect=8,hard,noatime,rsize=1048576,wsize=1048576
+  #   v4.1-lowlat:     nfsvers=4.1,nconnect=4,hard,noatime,ac
+  #   v3-compat:       nfsvers=3,hard,noatime
+  #
+  # `nconnect` (multiple TCP connections behind one NFSv4.1 session — session
+  # trunking) is a pure client-side option needing no server state, and the
+  # kernel silently ignores it on v3. The driver passes mountOptions through
+  # unchanged and only logs a warning for contradictory combinations.
 
 # iSCSI configuration
 iscsi:
@@ -492,6 +656,37 @@ storageClasses:
     volumeBindingMode: Immediate
     mountOptions: []
     extraParameters: {}
+  # Opt-in example: a curated ZFS performance class. `zfsPerformanceClass`
+  # selects a vetted property preset (database | media | vm | backup | general)
+  # layered UNDER zfs.datasetProperties, so an explicit operator key still wins.
+  #
+  # IMMUTABILITY: volblocksize, logbias, primarycache and secondarycache are
+  # fixed when the dataset is CREATED (volblocksize is immutable in ZFS itself;
+  # the other three are rejected by pool.dataset.update). Changing a bound PVC's
+  # class is REJECTED with FailedPrecondition rather than silently ignored —
+  # provision a new volume with the desired class and migrate the data.
+  # recordsize/sync/compression/checksum/atime/special_small_block_size are
+  # live-tunable, but the driver still does not retune existing datasets, and
+  # recordsize-style changes would only affect NEW writes anyway.
+  #
+  # Disabled by default; enable it (and pair it with a matching mountOptions
+  # profile) to use it. See docs/reference/storageclass.md for the full table.
+  - name: scale-nfs-media
+    enabled: false
+    protocol: nfs
+    zfsPerformanceClass: media
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions:
+      - nfsvers=4.1
+      - nconnect=8
+      - hard
+      - noatime
+      - rsize=1048576
+      - wsize=1048576
+    extraParameters: {}
   # Opt-in example: an iSCSI class with CHAP authentication. Disabled by
   # default. Enable it (and iscsi.chap.enabled above) to create it. The CHAP
   # credentials live in a Kubernetes Secret named chapSecretName (created by
@@ -554,6 +749,18 @@ storageClasses:
       nvmeof/qidMax: "128"
       # Enable T10-PI on the subsystem (advanced; validate initiator support).
       nvmeof/piEnable: "false"
+
+# CSIDriver object settings.
+csidriver:
+  # fsGroupPolicy is effectively IMMUTABLE on a live CSIDriver and is a
+  # driver-global choice — it cannot be set per StorageClass.
+  #
+  # Keep `File` (the default, unchanged) unless this installation is committed
+  # to driver-applied NFSv4 ACLs. Under `File`, kubelet recursively chowns and
+  # chmods each volume to a Pod's securityContext.fsGroup at publish, which
+  # rewrites the mode-bearing ACEs of an ACL set via the StorageClass
+  # `nfsACLTemplate`/`nfsACL` parameters. Options: File, None, ReadWriteOnceWithFSType.
+  fsGroupPolicy: File
 
 # Deprecated single-StorageClass configuration. When non-empty, this takes
 # precedence over storageClasses for compatibility with existing values files.

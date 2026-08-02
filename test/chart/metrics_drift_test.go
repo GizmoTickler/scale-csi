@@ -206,9 +206,12 @@ func dashboardExpressions(t *testing.T) []string {
 func ruleExpressions(t *testing.T) (exprs []string, recordingRules map[string]bool) {
 	t.Helper()
 	recordingRules = map[string]bool{}
+	// Every VALUE-GATED alert block must be enabled here, or a metric typo inside
+	// one would never be seen by the drift check.
 	rendered := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
 		"--set", "metrics.prometheusRule.enabled=true",
-		"--set", "capacity.gaugeEnabled=true")
+		"--set", "capacity.gaugeEnabled=true",
+		"--set", "backendHealth.enabled=true")
 	ruleManifest := findManifest(t, decodeManifests(t, rendered), "PrometheusRule", "scale-csi")
 
 	spec, ok := asManifest(ruleManifest["spec"])

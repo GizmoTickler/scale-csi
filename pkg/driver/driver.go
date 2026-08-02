@@ -151,6 +151,27 @@ type Driver struct {
 	capacityCancel context.CancelFunc
 	capacityWg     sync.WaitGroup
 
+	// Controller-side backend-health poll loop (GF5 E4). Runs only when
+	// backendHealth.enabled; each tick is at most two bounded READ calls
+	// (pool.query + disk.temperature_alerts) and never writes.
+	backendHealthCancel context.CancelFunc
+	backendHealthWg     sync.WaitGroup
+	// backendHealthStateMu serializes startup and shutdown. Stop is terminal for
+	// this Driver: recording that state closes the interleaving where Stop sees a
+	// nil cancel before Run assigns it and Run then starts a poller anyway.
+	backendHealthStateMu sync.Mutex
+	backendHealthStopped bool
+	// backendHealthPendingFlips counts CONSECUTIVE samples that disagree with the
+	// currently published verdict. The fan-out only flips once it reaches
+	// backendHealthFlipSamples, so a flapping pool cannot rewrite every managed
+	// PVC's VolumeCondition on every tick.
+	backendHealthPendingFlips atomic.Int64
+	// backendHealthPublishMu serializes per-driver health transitions and the
+	// pending-flip counter. The immutable backendHealthState pointer publishes
+	// the CSI-facing snapshot and all metric-facing state together, so both
+	// readers load one generation.
+	backendHealthPublishMu sync.Mutex
+
 	// Background fencing state. Missing-record observations are in-memory on
 	// purpose: a controller restart restarts the full grace period rather than
 	// revoking an old record immediately after a fresh VA disappearance.
@@ -165,6 +186,21 @@ type Driver struct {
 
 	// Service reload debouncer (prevents reload storms during bulk provisioning)
 	serviceReloadDebouncer *ServiceReloadDebouncer
+
+	// Cached GLOBAL nfs.config, read at most once per controller lifetime and
+	// only when nfs.versionPreflight / nfs.ensureProtocols opt in. NFS protocol
+	// enablement is an operator-driven, effectively static setting.
+	nfsServiceMu  sync.Mutex
+	nfsServiceCfg *truenas.NFSServiceConfig
+
+	// Cached ZFS property choice lists and pool special-vdev presence, read at
+	// most once per controller lifetime and ONLY when a StorageClass requests a
+	// curated zfsPerformanceClass. Both are static backend facts.
+	zfsChoicesMu       sync.Mutex
+	zfsChoices         *truenas.ZFSPropertyChoices
+	zfsChoicesErr      error
+	specialVdevChecked bool
+	specialVdevPresent bool
 
 	// Cached auto-resolved iSCSI target group (portal/initiator) used when
 	// iscsi.targetGroups is not configured; see resolveISCSITargetGroup.
@@ -399,9 +435,16 @@ func (d *Driver) Run() error {
 	klog.Infof("CSI driver listening on %s", d.endpoint)
 
 	if d.runController {
+		// Opt-in, default-empty global NFS service enablement. It is deliberately
+		// non-fatal: a driver that cannot widen the service must still serve every
+		// volume whose version IS enabled.
+		if protocolErr := d.ensureNFSProtocols(context.Background()); protocolErr != nil {
+			klog.Errorf("nfs.ensureProtocols failed: %v", protocolErr)
+		}
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
 		d.startCapacityGauges()
+		d.startBackendHealth()
 	}
 	if d.runNode {
 		d.startSessionGC()
@@ -420,6 +463,7 @@ func (d *Driver) Stop() {
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
+	d.stopBackendHealth()
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {

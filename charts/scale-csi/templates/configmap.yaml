@@ -80,6 +80,27 @@ data:
       shareMaprootGroup: {{ .Values.nfs.shareMaprootGroup | quote }}
       shareMapallUser: {{ .Values.nfs.shareMapallUser | quote }}
       shareMapallGroup: {{ .Values.nfs.shareMapallGroup | quote }}
+      {{- /* Every GF5 NFS key renders ONLY when it is non-default, so the
+           default ConfigMap is byte-identical to the pre-GF5 render and stays
+           parseable by a rolled-back binary that has no such field. */}}
+      {{- with .Values.nfs.shareSecurity }}
+      shareSecurity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.nfs.shareExposeSnapshots }}
+      shareExposeSnapshots: true
+      {{- end }}
+      {{- if .Values.nfs.krbEnabled }}
+      krbEnabled: true
+      {{- end }}
+      {{- if .Values.nfs.versionPreflight }}
+      versionPreflight: true
+      {{- end }}
+      {{- with .Values.nfs.ensureProtocols }}
+      # HARD RULE: mutates the GLOBAL TrueNAS NFS service (all exports).
+      ensureProtocols:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     {{- end }}
 
     {{- if .Values.iscsi.enabled }}
@@ -195,6 +216,17 @@ data:
       gaugeEnabled: true
       gaugeInterval: {{ .Values.capacity.gaugeInterval | default "60s" | quote }}
       {{- end }}
+    {{- end }}
+
+    {{- if .Values.backendHealth.enabled }}
+    # Read-only backend-health poller (opt-in). Each tick is at most TWO reads
+    # (pool.query + disk.temperature_alerts) and performs no writes. The block
+    # renders ONLY when enabled so the default ConfigMap carries no
+    # backendHealth: key and stays parseable by a rolled-back binary; the driver
+    # default (off) is the source of truth when the block is absent.
+    backendHealth:
+      enabled: true
+      interval: {{ .Values.backendHealth.interval | default "60s" | quote }}
     {{- end }}
 
     resilience:

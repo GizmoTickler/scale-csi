@@ -17,4 +17,15 @@ spec:
   volumeLifecycleModes:
     - Persistent
   # FS group policy
-  fsGroupPolicy: File
+  {{- /* DEFAULT IS UNCHANGED (`File`) and must stay that way for existing
+       installs: fsGroupPolicy is effectively immutable on a live CSIDriver, and
+       flipping it would change fsGroup semantics for EVERY already-provisioned
+       volume. `File` makes kubelet recursively chown/chmod a volume to a Pod's
+       securityContext.fsGroup at publish; on a volume carrying a driver-applied
+       NFSv4 ACL (StorageClass nfsACLTemplate/nfsACL) that rewrites the
+       mode-bearing ACEs and silently defeats the ACL. An operator who commits an
+       installation to ACL-managed volumes can set csidriver.fsGroupPolicy=None;
+       the driver additionally sets nfs41_flags.protected=true on every ACL it
+       applies and emits a Warning event on each ACL-carrying volume.
+       Helm-side comment so the rendered output stays byte-identical. */}}
+  fsGroupPolicy: {{ .Values.csidriver.fsGroupPolicy | default "File" }}

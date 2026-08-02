@@ -61,6 +61,10 @@ type Config struct {
 	// gauge loop. The zero value disables every capacity feature.
 	Capacity CapacityConfig `yaml:"capacity"`
 
+	// BackendHealth configures the read-only pool-health poller that drives
+	// per-PVC VolumeCondition and the scale_csi_pool_* health gauges.
+	BackendHealth BackendHealthConfig `yaml:"backendHealth"`
+
 	// Node configuration (node plugin only)
 	Node NodeConfig `yaml:"node"`
 
@@ -258,6 +262,42 @@ type NFSConfig struct {
 	// only so strict YAML parsing of existing configmaps does not fail; LoadConfig
 	// logs a deprecation warning when it is set.
 	ShareCommentTemplate string `yaml:"shareCommentTemplate"`
+
+	// ShareSecurity is the default `security` list stamped on newly created
+	// exports (SYS, KRB5, KRB5I, KRB5P). EMPTY IS THE DEFAULT AND MEANS "omit the
+	// field entirely", which is byte-identical to the pre-GF5 create payload and
+	// leaves TrueNAS on its own default (AUTH_SYS). A StorageClass may override
+	// per-volume with the `nfsSecurity` parameter.
+	ShareSecurity []string `yaml:"shareSecurity"`
+
+	// ShareExposeSnapshots is the default `expose_snapshots` value for newly
+	// created exports — it publishes the dataset's read-only .zfs/snapshot tree
+	// over NFS. Default false = field omitted = unchanged behavior. A
+	// StorageClass may override per-volume with `nfsExposeSnapshots`.
+	ShareExposeSnapshots bool `yaml:"shareExposeSnapshots"`
+
+	// KrbEnabled is the operator's explicit acknowledgement that this TrueNAS has
+	// Kerberos configured for NFSv4 (nfs.config v4_krb + a keytab). KRB5/KRB5I/
+	// KRB5P share security is REJECTED unless this is set: silently creating a
+	// krb-only export on a box with no keytab makes every mount fail with an
+	// opaque server error, so the driver fails closed at CreateVolume instead.
+	KrbEnabled bool `yaml:"krbEnabled"`
+
+	// VersionPreflight enables a cached `nfs.config` read that validates a
+	// StorageClass's requested NFS major version (from its `vers=`/`nfsvers=`
+	// mountOptions) against the server's globally enabled protocols. Default off
+	// so a deployment that does not opt in issues ZERO additional API calls and
+	// keeps the golden per-CreateVolume round-trip counts.
+	VersionPreflight bool `yaml:"versionPreflight"`
+
+	// EnsureProtocols opts into MUTATING the GLOBAL NFS service so it enables the
+	// listed major versions (NFSV3/NFSV4) at controller start.
+	//
+	// HARD RULE: this writes a service-wide setting that affects EVERY export on
+	// the appliance, driver-managed or not. It is default-empty (no write, ever)
+	// and should stay that way unless an operator has deliberately accepted that
+	// blast radius. The supported default path is the read-only preflight above.
+	EnsureProtocols []string `yaml:"ensureProtocols"`
 }
 
 // ISCSIConfig holds iSCSI configuration.
@@ -532,6 +572,38 @@ func (c CapacityConfig) GaugeIntervalDuration() (time.Duration, error) {
 	}
 	if interval < minCapacityGaugeInterval {
 		return minCapacityGaugeInterval, nil
+	}
+	return interval, nil
+}
+
+// BackendHealthConfig configures the controller-only backend-health poller.
+type BackendHealthConfig struct {
+	// Enabled starts a READ-ONLY poll loop that samples the parent dataset's pool
+	// health (pool.query) plus its member disks' temperature alerts
+	// (disk.temperature_alerts), fans the result out onto every managed volume's
+	// CSI VolumeCondition, and publishes the scale_csi_pool_* gauges.
+	//
+	// DEFAULT OFF. Enabling it costs at most TWO reads per Interval per
+	// controller and performs no writes at all; leaving it off keeps
+	// VolumeCondition semantics byte-identical to the pre-GF5 driver.
+	Enabled bool `yaml:"enabled"`
+
+	// Interval is the poll cadence. Values below the 30s floor are clamped to it.
+	// Default (empty) resolves to 60s.
+	Interval string `yaml:"interval"`
+}
+
+// IntervalDuration resolves the poll cadence, applying the default and floor.
+func (c BackendHealthConfig) IntervalDuration() (time.Duration, error) {
+	if strings.TrimSpace(c.Interval) == "" {
+		return 60 * time.Second, nil
+	}
+	interval, err := time.ParseDuration(c.Interval)
+	if err != nil {
+		return 0, err
+	}
+	if interval < minBackendHealthInterval {
+		return minBackendHealthInterval, nil
 	}
 	return interval, nil
 }
@@ -1133,6 +1205,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.NFS.Enabled && cfg.NFS.ShareHost == "" {
 		return fmt.Errorf("nfs.shareHost is required when NFS is enabled")
 	}
+	if err := validateNFSExportConfig(&cfg.NFS); err != nil {
+		return err
+	}
 	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {
 		return fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
 	}
@@ -1152,6 +1227,45 @@ func validateConfig(cfg *Config) error {
 		if v := cfg.NVMeoF.PortPerf.MaxQueueSize; v != nil && *v < 1 {
 			return fmt.Errorf("nvmeof.portPerf.maxQueueSize must be positive (got %d)", *v)
 		}
+	}
+	return nil
+}
+
+// validateNFSExportConfig validates (and normalizes) the GLOBAL NFS export
+// defaults at config LOAD time, so a bad ConfigMap stops the controller from
+// starting instead of stamping an unusable export on every volume it creates.
+//
+// It is deliberately unconditional on cfg.NFS.Enabled: a value that is wrong is
+// wrong, and a deployment that later enables NFS must not inherit an invalid
+// list that was never checked.
+//
+// This is the config-load half of the KRB5 fail-closed gate. The chart schema
+// couples nfs.shareSecurity to nfs.krbEnabled as well, but a hand-written
+// ConfigMap bypasses the chart entirely, so the Go-side check is not optional:
+// `shareSecurity: [KRB5]` with `krbEnabled: false` would otherwise stamp KRB5 on
+// EVERY newly created export on a box with no KDC or keytab — dead mounts
+// fleet-wide, silently.
+func validateNFSExportConfig(nfs *NFSConfig) error {
+	normalized, err := normalizeNFSSecurityList("nfs.shareSecurity", nfs.ShareSecurity, nfs.KrbEnabled)
+	if err != nil {
+		return err
+	}
+	// Persist the normalized (uppercased, de-duplicated) list so the create
+	// payload matches the middleware enum exactly regardless of how the operator
+	// spelled it, and so the KRB5 prefix check can never be evaded by casing.
+	if len(nfs.ShareSecurity) > 0 {
+		nfs.ShareSecurity = normalized
+	}
+
+	// maproot_* and mapall_* are mutually exclusive in TrueNAS; a payload with
+	// both is rejected by sharing.nfs.create.
+	maproot := strings.TrimSpace(nfs.ShareMaprootUser) != "" || strings.TrimSpace(nfs.ShareMaprootGroup) != ""
+	mapall := strings.TrimSpace(nfs.ShareMapallUser) != "" || strings.TrimSpace(nfs.ShareMapallGroup) != ""
+	if maproot && mapall {
+		return fmt.Errorf(
+			"nfs.shareMaproot* and nfs.shareMapall* are mutually exclusive in TrueNAS "+
+				"(maprootUser=%q maprootGroup=%q mapallUser=%q mapallGroup=%q); sharing.nfs.create rejects a payload carrying both",
+			nfs.ShareMaprootUser, nfs.ShareMaprootGroup, nfs.ShareMapallUser, nfs.ShareMapallGroup)
 	}
 	return nil
 }

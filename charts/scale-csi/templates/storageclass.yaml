@@ -59,6 +59,33 @@ parameters:
   {{- if $storageClass.snapshotRestoreMode }}
   {{- $_ := set $parameters "snapshotRestoreMode" $storageClass.snapshotRestoreMode -}}
   {{- end }}
+  {{- /* Curated ZFS performance class. Emitted only when set; unset classes
+       inherit the parent dataset's properties plus zfs.datasetProperties,
+       exactly as before. volblocksize/logbias/primarycache/secondarycache are
+       CREATE-ONLY: a class change on an existing PVC is rejected, not applied. */}}
+  {{- if $storageClass.zfsPerformanceClass }}
+  {{- $_ := set $parameters "zfsPerformanceClass" $storageClass.zfsPerformanceClass -}}
+  {{- end }}
+  {{- /* GF5 NFS export overrides. Each is emitted ONLY when the class sets it,
+       so an untouched class renders the exact parameter map it did before and
+       the driver keeps its historical create payload. */}}
+  {{- with $storageClass.nfsSecurity }}
+  {{- $_ := set $parameters "nfsSecurity" (join "," .) -}}
+  {{- end }}
+  {{- if hasKey $storageClass "nfsExposeSnapshots" }}
+  {{- $_ := set $parameters "nfsExposeSnapshots" (printf "%v" $storageClass.nfsExposeSnapshots) -}}
+  {{- end }}
+  {{- if hasKey $storageClass "nfsReadOnly" }}
+  {{- $_ := set $parameters "nfsReadOnly" (printf "%v" $storageClass.nfsReadOnly) -}}
+  {{- end }}
+  {{- /* NFSv4 ACL. Emitted only when set; see docs/reference/storageclass.md for
+       the fsGroupPolicy=File interaction this opts a class into. */}}
+  {{- if $storageClass.nfsACLTemplate }}
+  {{- $_ := set $parameters "nfsACLTemplate" $storageClass.nfsACLTemplate -}}
+  {{- end }}
+  {{- if $storageClass.nfsACL }}
+  {{- $_ := set $parameters "nfsACL" (toJson $storageClass.nfsACL) -}}
+  {{- end }}
   {{- /* CHAP: when a per-StorageClass CHAP Secret is named, emit the four CSI
        secret-ref parameters (provisioner + node-stage). The chart references
        the Secret by name/namespace only; credential values never appear here.

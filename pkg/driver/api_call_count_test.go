@@ -302,6 +302,56 @@ func (c *apiCallCountingClient) NFSShareUpdate(ctx context.Context, id int, para
 	return c.MockClient.NFSShareUpdate(ctx, id, params)
 }
 
+func (c *apiCallCountingClient) NFSServiceConfig(ctx context.Context) (*truenas.NFSServiceConfig, error) {
+	c.record("NFSServiceConfig")
+	return c.MockClient.NFSServiceConfig(ctx)
+}
+
+func (c *apiCallCountingClient) NFSServiceUpdate(ctx context.Context, params map[string]interface{}) (*truenas.NFSServiceConfig, error) {
+	c.record("NFSServiceUpdate")
+	return c.MockClient.NFSServiceUpdate(ctx, params)
+}
+
+func (c *apiCallCountingClient) ZFSPropertyChoices(ctx context.Context) (*truenas.ZFSPropertyChoices, error) {
+	c.record("ZFSPropertyChoices")
+	return c.MockClient.ZFSPropertyChoices(ctx)
+}
+
+func (c *apiCallCountingClient) RecommendedZvolBlocksize(ctx context.Context, pool string) (string, error) {
+	c.record("RecommendedZvolBlocksize")
+	return c.MockClient.RecommendedZvolBlocksize(ctx, pool)
+}
+
+func (c *apiCallCountingClient) PoolHasSpecialVdev(ctx context.Context, pool string) (bool, error) {
+	c.record("PoolHasSpecialVdev")
+	return c.MockClient.PoolHasSpecialVdev(ctx, pool)
+}
+
+func (c *apiCallCountingClient) PoolHealth(ctx context.Context, pool string) (*truenas.PoolHealthSnapshot, error) {
+	c.record("PoolHealth")
+	return c.MockClient.PoolHealth(ctx, pool)
+}
+
+func (c *apiCallCountingClient) DiskTemperatureAlerts(ctx context.Context, names []string) ([]string, error) {
+	c.record("DiskTemperatureAlerts")
+	return c.MockClient.DiskTemperatureAlerts(ctx, names)
+}
+
+func (c *apiCallCountingClient) FilesystemGetACL(ctx context.Context, path string) (*truenas.FilesystemACL, error) {
+	c.record("FilesystemGetACL")
+	return c.MockClient.FilesystemGetACL(ctx, path)
+}
+
+func (c *apiCallCountingClient) FilesystemSetACL(ctx context.Context, opts *truenas.SetACLOptions) error {
+	c.record("FilesystemSetACL")
+	return c.MockClient.FilesystemSetACL(ctx, opts)
+}
+
+func (c *apiCallCountingClient) ACLTemplateDACL(ctx context.Context, name string) ([]truenas.ACLEntry, error) {
+	c.record("ACLTemplateDACL")
+	return c.MockClient.ACLTemplateDACL(ctx, name)
+}
+
 func (c *apiCallCountingClient) ServiceReload(ctx context.Context, service string) error {
 	c.record("ServiceReload")
 	return c.MockClient.ServiceReload(ctx, service)
@@ -1627,7 +1677,7 @@ func TestCreateVolumeCloneScrubInheritedProtocolProperties(t *testing.T) {
 	scrubTarget.UserProperties[PropNVMeoFPortSubsysID] = truenas.UserProperty{
 		Value: "unknown-source", Source: "",
 	}
-	d.scrubInheritedProtocolProperties(ctx, scrubTarget, scrubTarget.Name, ShareTypeNFS)
+	d.scrubInheritedCloneProperties(ctx, scrubTarget, scrubTarget.Name, ShareTypeNFS)
 	scrubbed, err := client.MockClient.DatasetGet(ctx, scrubTarget.Name)
 	require.NoError(t, err)
 	assert.Equal(t, "current-protocol", scrubbed.UserProperties[PropNFSShareID].Value,

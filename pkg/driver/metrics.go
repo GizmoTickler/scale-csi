@@ -885,6 +885,54 @@ func RecordReconcileSuccess(at time.Time) {
 	reconcileLastSuccessTimestamp.Set(float64(at.Unix()))
 }
 
+// Backend-health timing notes belong to the canonical taxonomy in
+// backendHealthFlipSamples. ScaleCSIPoolDegraded is deliberately not gated on
+// this one (scale_csi_pool_health_stale): a FROZEN DEGRADED sample keeps that alert firing
+// until a successful sample changes it. pool_health_flip_pending is NOT a
+// complete disagreement detector; it is silent during alert hold, observer lag
+// and cold start, and can remain 1 after the staleness TTL. See
+// backendHealthFlipSamples in pkg/driver/backend_health.go.
+
+// poolStatusLabels is the fixed status label set the one-hot pool_status series
+// covers. Keeping it fixed bounds cardinality and means a status that goes away
+// is explicitly zeroed instead of leaving a stale 1 behind.
+var poolStatusLabels = []string{
+	truenas.PoolStatusOnline,
+	truenas.PoolStatusDegraded,
+	truenas.PoolStatusFaulted,
+	truenas.PoolStatusOffline,
+	truenas.PoolStatusUnavail,
+	truenas.PoolStatusRemoved,
+}
+
+// poolScanNone is the label used on BOTH the `function` and the `state`
+// dimension when the pool reports no scan at all. Giving idle a REPRESENTABLE
+// state is what makes the cross-product genuinely one-hot: without it an idle
+// pool zeroed every fixed cell and set none, silently degrading the documented
+// "exactly one cell is 1" contract to "at most one".
+const poolScanNone = "NONE"
+
+// poolScanStateLabels is the fixed scan-state label set, zeroed the same way.
+var poolScanStateLabels = []string{
+	truenas.PoolScanStateScanning,
+	truenas.PoolScanStateFinished,
+	truenas.PoolScanStateCanceled,
+	poolScanNone,
+}
+
+// poolScanFunctionLabels is the fixed scan-FUNCTION label set. One-hot means
+// one-hot across the whole {function} × {state} cross-product, not merely within
+// the current function: a SCRUB that FINISHED followed by a RESILVER that is
+// SCANNING would otherwise leave BOTH
+// {function="SCRUB",state="FINISHED"}=1 and {function="RESILVER",state="SCANNING"}=1
+// exported simultaneously, which breaks every query written against the
+// documented contract.
+var poolScanFunctionLabels = []string{
+	truenas.PoolScanFunctionScrub,
+	truenas.PoolScanFunctionResilver,
+	poolScanNone,
+}
+
 // SetPoolCapacityMetrics publishes the latest parent-dataset capacity sample.
 // pool is the ZFS pool name and dataset the parent dataset path; available and
 // capacity are bytes (capacity = used + available from one pool.dataset.query).

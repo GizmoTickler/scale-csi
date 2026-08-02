@@ -31,15 +31,22 @@ const (
 	// reconciliation rather than by createDataset. It keeps adoption useful for
 	// cleanup provenance without making pre-existing bytes eligible for a
 	// create-time data-free proof.
-	PropDriverInstanceIDAdopted   = "truenas-csi:driver_instance_id_adopted"
-	PropProvisionSuccess          = "truenas-csi:provision_success"
-	PropCSIVolumeName             = "truenas-csi:csi_volume_name"
-	PropShareVolumeContext        = "truenas-csi:csi_share_volume_context"
-	PropVolumeContentSourceType   = "truenas-csi:csi_volume_content_source_type"
-	PropVolumeContentSourceID     = "truenas-csi:csi_volume_content_source_id"
-	PropVolumeOriginSnapshot      = "truenas-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
-	PropInternalResource          = "truenas-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
-	PropRequestedSizeBytes        = "truenas-csi:requested_size_bytes"       // requested capacity for quota-less filesystem volumes
+	PropDriverInstanceIDAdopted = "truenas-csi:driver_instance_id_adopted"
+	PropProvisionSuccess        = "truenas-csi:provision_success"
+	PropCSIVolumeName           = "truenas-csi:csi_volume_name"
+	PropShareVolumeContext      = "truenas-csi:csi_share_volume_context"
+	PropVolumeContentSourceType = "truenas-csi:csi_volume_content_source_type"
+	PropVolumeContentSourceID   = "truenas-csi:csi_volume_content_source_id"
+	PropVolumeOriginSnapshot    = "truenas-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
+	PropInternalResource        = "truenas-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
+	PropRequestedSizeBytes      = "truenas-csi:requested_size_bytes"       // requested capacity for quota-less filesystem volumes
+	// PropZFSPerformanceClass records the curated ZFS performance class a volume
+	// was CREATED with. It is the anchor for the create-only property guard: a
+	// later StorageClass edit is compared against this stamp, never re-derived
+	// from the live dataset (whose immutable geometry could not be changed anyway).
+	// Only stamped when a class was requested, so it never appears on volumes
+	// that do not use the feature.
+	PropZFSPerformanceClass       = "truenas-csi:zfs_performance_class"
 	PropCSISnapshotName           = "truenas-csi:csi_snapshot_name"
 	PropCSISnapshotSourceVolumeID = "truenas-csi:csi_snapshot_source_volume_id"
 	snapshotTombstoneMarker       = "-csi-deleted-"
@@ -463,6 +470,42 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		ctx = withBlockOpts(ctx, opts)
 	}
 
+	// Resolve the per-StorageClass NFS export overrides and (opt-in) validate the
+	// class's pinned NFS version against the server's global protocol set. Both
+	// are strict no-ops for a class that sets none of the new parameters.
+	if shareType == ShareTypeNFS {
+		nfsOptions, nfsErr := d.parseNFSShareOptions(req.GetParameters())
+		if nfsErr != nil {
+			return nil, nfsErr
+		}
+		if preflightErr := d.preflightNFSVersion(ctx, mountFlagsFromCapabilities(req.GetVolumeCapabilities())); preflightErr != nil {
+			return nil, preflightErr
+		}
+		ctx = withNFSShareOptions(ctx, nfsOptions)
+
+		aclOptions, aclErr := parseNFSACLOptions(req.GetParameters())
+		if aclErr != nil {
+			return nil, aclErr
+		}
+		// H3: aclmode/acltype are stamped in the pool.dataset.create payload, which
+		// a content-source volume never issues. Refuse an explicit nfsACLMode here,
+		// BEFORE any mutation, rather than materializing a volume whose chmod
+		// behavior is its origin's while the events claim the requested mode.
+		if aclErr := validateNFSACLContentSource(aclOptions, req.GetVolumeContentSource()); aclErr != nil {
+			return nil, aclErr
+		}
+		ctx = withNFSACLOptions(ctx, aclOptions)
+	}
+
+	// Curated ZFS performance class. Validated here (pure, no backend I/O) so a
+	// typo is InvalidArgument before anything is created; the preset itself is
+	// resolved and validated against the live choice lists inside createDataset.
+	performanceClass, performanceErr := zfsPerformanceClassFromParams(req.GetParameters())
+	if performanceErr != nil {
+		return nil, performanceErr
+	}
+	ctx = withZFSPerformanceClass(ctx, performanceClass)
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {
@@ -485,6 +528,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// costs no extra round trip.
 	var contentSourceGeometry map[string]string
 	zvolReady := false
+	// performanceClassApplied is the ONLY authority for stamping
+	// PropZFSPerformanceClass. The stamp asserts "this dataset was CREATED with
+	// the curated class's properties", and createDataset is the only place they
+	// are ever applied. A clone / snapshot restore inherits the ORIGIN dataset's
+	// geometry and accepts no property payload, so stamping there would be a
+	// silent correctness lie in both directions: a later replay would be
+	// false-accepted against a class the volume does not carry, or false-rejected
+	// with "logbias is fixed when the dataset is created" for a property the
+	// driver never set on this dataset.
+	performanceClassApplied := false
 	if req.GetVolumeContentSource() != nil {
 		contentSource = req.GetVolumeContentSource()
 		clonedDS, resolvedGeometry, srcErr := d.handleVolumeContentSource(
@@ -535,12 +588,31 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		// Best-effort removal — the reconciler sweep retires leftovers.
 		d.deleteInflightMarker(ctx, volumeID)
 		zvolReady = true
-		// Scrub backend share-object IDs the clone inherited from its source dataset
-		// (ZFS copies the source's user properties into the clone). A stale inherited
-		// ID would make ensureShareExists validate the clone against the SOURCE
-		// volume's share objects. Best-effort and a SEPARATE pool.dataset.update from
-		// the authoritative ownership stamp above (cleanup, not provenance).
-		d.scrubInheritedProtocolProperties(ctx, createdDS, datasetName, shareType)
+		// Scrub the user properties this volume inherited from its content source
+		// (ZFS copies the source's user properties into a clone, and a detached
+		// replication copy carries them over as LOCAL values). Two families:
+		// backend share-object IDs belonging to foreign protocols — a stale
+		// inherited ID would make ensureShareExists validate this volume against
+		// the SOURCE volume's share objects — and the curated performance-class
+		// stamp, which would otherwise assert curated geometry that was never
+		// applied here. Best-effort and a SEPARATE pool.dataset.update from the
+		// authoritative ownership stamp above (cleanup, not provenance).
+		d.scrubInheritedCloneProperties(ctx, createdDS, datasetName, shareType)
+		if performanceClass != "" {
+			// H1: say so out loud. A clone silently carrying its origin's geometry
+			// under a different class name is exactly the correctness lie the
+			// immutability guard exists to prevent.
+			message := fmt.Sprintf(
+				"StorageClass parameter %s=%q was IGNORED for volume %s: the volume is provisioned from a %s content source, "+
+					"and a ZFS clone/restore inherits the origin dataset's geometry (recordsize, volblocksize, logbias, ...) — "+
+					"the curated properties cannot be applied and the volume is NOT stamped with the class "+
+					"(any class stamp copied from the source is scrubbed, and the class guard never treats a content-source "+
+					"volume's stamp as authoritative). "+
+					"Provision an empty volume with this class and copy the data in if the curated geometry is required.",
+				zfsPerformanceClassParam, performanceClass, volumeID, contentSourceKind(contentSource))
+			klog.Warning(message)
+			d.recordWarningEvent(createVolumeEventRef(req), EventReasonZFSPerformanceClassIgnored, message)
+		}
 	} else {
 		// Create new dataset
 		var createErr error
@@ -550,6 +622,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 		freshlyCreated = createdDS.CreatedByCall
 		zvolReady = freshlyCreated
+		// createDataset is the one and only place applyPerformanceClassProperties
+		// runs, so this is the one and only place the stamp becomes truthful.
+		performanceClassApplied = performanceClass != ""
 	}
 
 	// Mark as managed and successful. NFS folds these stamps into the share-ID
@@ -564,6 +639,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	if shareType == ShareTypeNFS && !d.config.ZFS.DatasetEnableQuotas {
 		volumeProperties[PropRequestedSizeBytes] = strconv.FormatInt(capacityBytes, 10)
+	}
+	// Record the curated class this volume was created with so a later
+	// StorageClass edit can be checked against the create-only property rules
+	// instead of silently pretending the volume was retuned. Folded into the
+	// existing property update, so it costs no extra round trip; absent unless
+	// the class was requested AND actually applied (never on clone/restore —
+	// see performanceClassApplied above).
+	if performanceClassApplied {
+		volumeProperties[PropZFSPerformanceClass] = performanceClass
 	}
 	// Fold the durable CHAP auth linkage into the FATAL managed-property update
 	// below so it is stamped-or-rolled-back with the rest of provisioning (X1): a
@@ -631,6 +715,17 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// exists and is owned/stamped for every path (fresh, clone, detached; NFS and
 	// block). A nil spec (the default) is a no-op; a task failure is non-fatal.
 	d.ensureSnapshotTask(ctx, createdDS, datasetName, volumeID, vp.snapshotTask, req)
+
+	// Apply the requested NFSv4 ACL after the dataset, its ownership stamps and
+	// its export all exist. Strict no-op unless a StorageClass asked for one, and
+	// best-effort by design: it never blocks a Bound PVC (risk R7).
+	if shareType == ShareTypeNFS {
+		// contentSource != nil means the dataset was materialized by a clone /
+		// replication copy, which accepts no property payload: acltype and aclmode
+		// are the ORIGIN's, not the ones this request asked for. Tell
+		// applyNFSVolumeACL so its log/event report what was actually applied (H3).
+		d.applyNFSVolumeACL(ctx, createdDS, datasetName, createVolumeEventRef(req), contentSource)
+	}
 
 	// Get volume context for response
 	volumeContext, err := d.getVolumeContext(ctx, createdDS, datasetName, shareType)
@@ -899,6 +994,48 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// IMMUTABILITY GUARD (risk R1). volblocksize is immutable in ZFS itself, and
+	// logbias/primarycache/secondarycache are rejected by pool.dataset.update, so
+	// a StorageClass that now names a different curated class CANNOT be satisfied
+	// in place. Refuse loudly rather than let an operator believe an existing
+	// volume was retuned.
+	if requestedClass := zfsPerformanceClassFromContext(ctx); requestedClass != "" {
+		storedClass := datasetUserProperty(existingDS, PropZFSPerformanceClass)
+		if storedClass == "-" {
+			storedClass = ""
+		}
+		// H1: a content-source volume's class stamp is NEVER authoritative. The
+		// curated properties are applied exactly once, inside createDataset, and a
+		// clone/restore does not go through it — so any class property such a
+		// volume carries was COPIED from its origin (a ZFS clone inherits the
+		// source's user properties with the origin snapshot as their source; a
+		// detached replication copy reproduces them as local values). Feeding a
+		// copied stamp to the guard produces both failure directions: a false
+		// accept against geometry the volume does not have, and — because an
+		// identical replay of a SUCCESSFUL CreateVolume would be compared against
+		// the origin's class instead of the requested one — a FailedPrecondition
+		// on an exact request replay, i.e. a CSI idempotency violation.
+		//
+		// So: treat the volume as unstamped (which is what it honestly is) and
+		// scrub the copied stamp so the on-disk record stops asserting it. The
+		// scrub is best-effort; the ignore above is what makes behavior correct.
+		if datasetHasDurableContentSource(existingDS) {
+			if storedClass != "" {
+				klog.Warningf("Volume %s carries ZFS performance class stamp %q inherited from its %s content source; "+
+					"the curated properties were never applied to this volume, so the stamp is ignored and scrubbed.",
+					volumeID, storedClass, describeDatasetContentSource(existingDS))
+				d.scrubInheritedCloneProperties(ctx, existingDS, datasetName, shareType)
+			}
+			klog.Warningf("Volume %s was provisioned from a content source, so ZFS performance class %q was never applied "+
+				"(a clone/restore inherits the origin dataset's geometry). The replay is accepted and the volume is left unchanged.",
+				volumeID, requestedClass)
+			storedClass = ""
+		}
+		if guardErr := d.guardPerformanceClassChange(ctx, volumeID, storedClass, requestedClass, existingDS.Type); guardErr != nil {
+			return nil, guardErr
 		}
 	}
 
@@ -1669,7 +1806,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 			// Entry.Status.VolumeCondition; leaving it nil made its nil-safe
 			// getters report every listed volume as normal (codex H1).
 			Status: &csi.ListVolumesResponse_VolumeStatus{
-				VolumeCondition: volumeConditionFromDataset(ds),
+				VolumeCondition: d.volumeCondition(ds),
 			},
 		})
 	}
@@ -2377,7 +2514,11 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			VolumeCondition: condition,
+			// Compose the stamp+quota condition (GF2/E4) with the pool-level
+			// backend-health snapshot (GF5): a dataset-specific abnormal —
+			// including the >95% quota upgrade above — wins over a pool-level
+			// one, exactly as composeVolumeCondition orders it.
+			VolumeCondition: composeVolumeCondition(condition, d.poolHealthSnapshot()),
 		},
 	}, nil
 }
@@ -2582,7 +2723,21 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 			params.Refreservation = capacityBytes
 		}
 	}
+	// Curated ZFS performance class, layered UNDER zfs.datasetProperties so an
+	// explicit operator key always wins. Absent parameter = zero properties and
+	// the historical create payload.
+	if class := zfsPerformanceClassFromContext(ctx); class != "" {
+		curated, resolveErr := d.resolvePerformanceClassProperties(ctx, class, params.Type)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		applyPerformanceClassProperties(params, curated)
+	}
 	d.applyDatasetProperties(params)
+	// An NFSv4 dacl can only be applied to an acltype=NFSV4 dataset. Stamp it
+	// (plus aclmode=PASSTHROUGH) ONLY when this volume actually requested an ACL;
+	// otherwise both stay inherited from the parent, exactly as before.
+	applyDatasetACLParams(params, nfsACLOptionsFromContext(ctx))
 	postCreateProperties := make(map[string]string, len(params.UserProperties)+1)
 	for _, property := range params.UserProperties {
 		postCreateProperties[property.Key] = property.Value
@@ -2789,10 +2944,21 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 			params.Atime = strings.ToUpper(value)
 		case "recordsize":
 			params.Recordsize = strings.ToUpper(value)
+		case "checksum":
+			params.Checksum = strings.ToUpper(value)
 		case "logbias":
 			params.Logbias = strings.ToUpper(value)
 		case "primarycache":
 			params.Primarycache = strings.ToUpper(value)
+		case "secondarycache":
+			params.Secondarycache = strings.ToUpper(value)
+		case "snapdir":
+			params.Snapdir = strings.ToUpper(value)
+		case "special_small_block_size":
+			// The correct key is special_small_block_size; pool.dataset.* rejects
+			// the commonly mis-typed special_small_blocks. Previously this key fell
+			// through to the unknown-key warning and was silently dropped.
+			params.SpecialSmallBlockSize = strings.ToUpper(value)
 		case "dedup":
 			params.Deduplication = strings.ToUpper(value)
 		case "readonly":
@@ -2873,15 +3039,32 @@ var inheritedProtocolPropertyKeys = []string{
 	PropNVMeoFPortSubsysID,
 }
 
-// scrubInheritedProtocolProperties removes only provably inherited backend
-// share-object IDs from protocols foreign to shareType. Local properties and all
-// current-protocol properties survive; the protocol-specific backreference
-// resolver repairs same-protocol stale IDs. It is idempotent and best-effort.
-func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) {
+// scrubInheritedCloneProperties removes the user properties a freshly
+// materialized content-source volume must not keep, in ONE pool.dataset.update:
+//
+//   - provably inherited backend share-object IDs from protocols foreign to
+//     shareType. Local properties and all current-protocol properties survive;
+//     the protocol-specific backreference resolver repairs same-protocol stale
+//     IDs.
+//   - PropZFSPerformanceClass, UNCONDITIONALLY when present (H1). This volume
+//     was materialized from a content source in this very call, so the driver
+//     never applied a curated class to it: any class stamp it carries was copied
+//     from the origin and asserts geometry that was never applied here. The
+//     source qualifier the protocol keys use does NOT apply — a detached
+//     replication copy reproduces the source's properties as LOCAL values, so a
+//     source-based filter would let exactly that path keep the lie.
+//
+// It is idempotent and best-effort. Best-effort is safe for the class stamp
+// because the immutability guard independently refuses to treat a content-source
+// volume's stamp as authoritative (see createVolumeExisting): the scrub keeps
+// the on-disk record honest, the guard keeps the BEHAVIOR honest even if the
+// scrub could not run.
+func (d *Driver) scrubInheritedCloneProperties(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType) {
 	if ds == nil {
 		return
 	}
 	currentProtocol := map[string]struct{}{}
+	knownProtocol := true
 	switch shareType {
 	case ShareTypeNFS:
 		currentProtocol[PropNFSShareID] = struct{}{}
@@ -2901,28 +3084,38 @@ func (d *Driver) scrubInheritedProtocolProperties(ctx context.Context, ds *truen
 		currentProtocol[PropNVMeoFNamespaceID] = struct{}{}
 		currentProtocol[PropNVMeoFPortSubsysID] = struct{}{}
 	default:
-		return
+		// An unrecognized share type cannot decide which backend IDs are foreign,
+		// but the class stamp below is protocol-independent and still has to go.
+		knownProtocol = false
 	}
-	present := make([]string, 0, len(inheritedProtocolPropertyKeys))
-	for _, key := range inheritedProtocolPropertyKeys {
-		property, ok := ds.UserProperties[key]
-		if !ok {
-			continue
+	present := make([]string, 0, len(inheritedProtocolPropertyKeys)+1)
+	if knownProtocol {
+		for _, key := range inheritedProtocolPropertyKeys {
+			property, ok := ds.UserProperties[key]
+			if !ok {
+				continue
+			}
+			if _, ownProtocol := currentProtocol[key]; ownProtocol {
+				continue
+			}
+			source := strings.TrimSpace(property.Source)
+			if source == "" || isLocalUserPropertySource(source) {
+				continue
+			}
+			present = append(present, key)
 		}
-		if _, ownProtocol := currentProtocol[key]; ownProtocol {
-			continue
-		}
-		source := strings.TrimSpace(property.Source)
-		if source == "" || isLocalUserPropertySource(source) {
-			continue
-		}
-		present = append(present, key)
+	}
+	// H1: unconditional, source-independent. See the doc comment.
+	if _, stamped := ds.UserProperties[PropZFSPerformanceClass]; stamped {
+		present = append(present, PropZFSPerformanceClass)
 	}
 	if len(present) == 0 {
 		return
 	}
 	if err := d.truenasClient.DatasetRemoveUserProperties(ctx, datasetName, present); err != nil {
-		klog.Warningf("Failed to scrub inherited protocol properties from clone %s (reconcile will reconcile the backreference): %v", datasetName, err)
+		klog.Warningf("Failed to scrub inherited properties %v from content-source volume %s "+
+			"(reconcile will reconcile the backreference; the performance-class guard independently ignores an inherited class stamp): %v",
+			present, datasetName, err)
 		return
 	}
 	for _, key := range present {

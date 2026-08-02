@@ -1,3 +1,6 @@
+{{- if and .Values.backendHealth.enabled (gt (int .Values.controller.replicas) 1) }}
+{{- fail "backendHealth.enabled requires controller.replicas=1: the poller has no leader election, and Deployment termination/eviction/drain can overlap producers even when rollout surge is zero" }}
+{{- end }}
 {{- if .Values.controller.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -14,7 +17,22 @@ spec:
   # defaulted RollingUpdate and Helm's three-way merge never managed it; the
   # off -> additive upgrade then failed in production (2026-07-22) because the
   # server-defaulted rollingUpdate residue made the Recreate strategy invalid.
-  {{- if eq .Values.fencing.mode "off" }}
+  {{- if and (eq .Values.fencing.mode "off") .Values.backendHealth.enabled }}
+  # Off mode would allow overlapping controllers during a rollout, but the
+  # backend-health poller has NO leader-election gate, so an overlap means two
+  # processes publishing independently sampled scale_csi_pool_* series that every
+  # alert merges with `max by (pool)` — divergence class 7, replica skew. Surge 0
+  # makes the rollout NON-OVERLAPPING (the old pod terminates before the new one
+  # is created), which is the single-producer invariant the taxonomy promises,
+  # without Recreate's stricter semantics elsewhere. It is only an invariant at
+  # controller.replicas=1: more replicas are more producers by construction, and
+  # ScaleCSIPoolHealthProducerSkew is what detects that.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  {{- else if eq .Values.fencing.mode "off" }}
   # Off mode allows overlapping controllers during a rollout. RollingUpdate is
   # the Kubernetes default, declared explicitly (with its default surge and
   # unavailable) so the field is Helm-owned and the additive upgrade can replace

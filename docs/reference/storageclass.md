@@ -16,6 +16,16 @@ All protocols use the unified provisioner `csi.scale.io`.
 | `snapshotRestoreMode` | `clone` or `detached` — how a volume restored from a snapshot is materialized | No; default is `clone` unless the driver sets `zfs.detachedVolumesFromSnapshots` |
 | `snapshotSchedule` | Five-field cron (`minute hour dom month dow`) for a driver-managed periodic-snapshot task scoped to the volume (GF2/E2) | No; default is the controller-wide `zfs.snapshotSchedule` (empty = off) |
 | `snapshotRetention` | Bounded time-based retention for those snapshots, e.g. `24h`, `30d`, `2w`, `6M`, `1y` | No; default `zfs.snapshotRetention` (empty = 30d safety bound) |
+| `nfsSecurity` | Comma list of `SYS`, `KRB5`, `KRB5I`, `KRB5P` — the export's `security` list | No; unset omits the field (TrueNAS default AUTH_SYS) |
+| `nfsExposeSnapshots` | Boolean — publish the dataset's read-only `.zfs/snapshot` tree through the export | No; default false |
+| `nfsReadOnly` | Boolean — create the export read-only | No; default false |
+| `nfsMaprootUser` / `nfsMaprootGroup` | Per-class override of the root mapping | No; defaults to `nfs.shareMaproot*`. **Mutually exclusive with `nfsMapall*`** |
+| `nfsMapallUser` / `nfsMapallGroup` | Per-class override of the all-users mapping | No; defaults to `nfs.shareMapall*`. **Mutually exclusive with `nfsMaproot*`** |
+| `nfsAllowedNetworks` / `nfsAllowedHosts` | Comma lists overriding the static export allow-lists | No; defaults to `nfs.shareAllowed*`. **Rejected** under strict fencing, which owns these lists |
+| `nfsACLTemplate` | `NFS4_OPEN`, `NFS4_RESTRICTED`, `NFS4_HOME`, `NFS4_DOMAIN_HOME`, `NFS4_ADMIN` — a builtin NFSv4 ACL applied at create | No; mutually exclusive with `nfsACL` |
+| `nfsACL` | Explicit NFSv4 dacl as a JSON array | No; mutually exclusive with `nfsACLTemplate` |
+| `nfsACLMode` | `PASSTHROUGH` (default) or `RESTRICTED` — the dataset's `aclmode` | No; requires `nfsACLTemplate` or `nfsACL` |
+| `zfsPerformanceClass` | `database`, `media`, `vm`, `backup`, `general` — a curated ZFS property preset | No; unset inherits the parent dataset's properties. **Ignored on volumes restored/cloned from a content source** |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -172,11 +182,93 @@ volumeBindingMode: Immediate
 ```
 
 ZFS properties, TrueNAS endpoints, and protocol service settings belong in the
-driver configuration/Helm values. The driver ignores ad-hoc StorageClass
-parameters such as `dataset_recordsize`, `dataset_compression`,
-`zvol_volblocksize`, `zvol_compression`, `mountOptions`, and `fsType`.
-`mountOptions` is a top-level StorageClass list, and the standardized filesystem
-key is `csi.storage.k8s.io/fstype`.
+driver configuration/Helm values, or in the curated `zfsPerformanceClass` below.
+The driver ignores ad-hoc StorageClass parameters such as `dataset_recordsize`,
+`dataset_compression`, `zvol_volblocksize`, `zvol_compression`, `mountOptions`,
+and `fsType`. `mountOptions` is a top-level StorageClass list, and the
+standardized filesystem key is `csi.storage.k8s.io/fstype`.
+
+## ZFS performance classes
+
+`zfsPerformanceClass` applies a vetted ZFS property preset to newly provisioned
+volumes. Every value is validated against the backend's own
+`recordsize`/`compression`/`checksum` choice lists at `CreateVolume`, so a
+mismatch is an `InvalidArgument` rather than an opaque `pool.dataset.create`
+failure.
+
+| Class | `recordsize` (fs) | `volblocksize` (zvol) | `sync` | `logbias` | `compression` | `primarycache` | `special_small_block_size` | `atime` |
+|---|---|---|---|---|---|---|---|---|
+| `database` | 16K | 16K | standard | latency | LZ4 | all | 16K | off |
+| `media` | 1M | 64K | standard | throughput | ZSTD | all | — | off |
+| `vm` | 64K | 16K | standard | latency | LZ4 | all | — | off |
+| `backup` | 1M | 128K | standard | throughput | ZSTD | metadata | — | off |
+| `general` | 128K | 16K | standard | latency | LZ4 | all | — | off |
+
+Filesystem-only keys (`recordsize`, `atime`) are dropped for zvols and the
+volume-only key (`volblocksize`) is dropped for filesystems, exactly as
+`zfs.datasetProperties` already behaves.
+
+The preset is layered **under** `zfs.datasetProperties`: an explicit operator
+key always wins. The one exception matches pre-existing behavior — zvol
+geometry has a single owner, so a `datasetProperties` `volblocksize` is still
+warned-and-skipped when the class (or `zfs.zvolBlocksize`) already set it.
+
+`special_small_block_size` requires the pool to have a `special`
+allocation-class vdev. When there is none, the driver drops the property with a
+warning rather than failing provisioning. Note the correct key is
+`special_small_block_size`; `special_small_blocks` is rejected by the API.
+
+### ⚠ Create-only vs live-tunable properties
+
+| Create-only (**immutable**) | Live-tunable |
+|---|---|
+| `volblocksize` — zvol geometry, immutable in ZFS itself | `recordsize`, `sync`, `compression`, `checksum` |
+| `logbias`, `primarycache`, `secondarycache` — rejected by `pool.dataset.update` | `atime`, `special_small_block_size`, `copies`, `readonly` |
+
+A volume records the class it was **created** with. If a bound PVC's
+StorageClass later names a different class:
+
+- when the difference touches any create-only property, `CreateVolume` returns
+  `FailedPrecondition` naming the offending properties. The request is
+  physically impossible to satisfy in place; provision a new volume with the
+  desired class and migrate the data;
+- when only live-tunable properties differ, the request succeeds and the driver
+  logs that existing datasets are **not** retuned. Even if they were,
+  `recordsize`/`compression`/`checksum` apply only to NEW writes — blocks
+  already on disk keep the geometry they were written with.
+
+A volume provisioned before this feature existed carries no class stamp; it is
+never wedged, only warned about.
+
+### ⚠ Performance classes do not apply to clones or snapshot restores
+
+A PVC created from a `dataSource` (snapshot or another PVC) is materialized by a
+ZFS clone or a dataset copy. Both **inherit the origin dataset's geometry** and
+accept no property payload, so the curated preset cannot be applied — there is
+no API through which to apply it.
+
+The driver therefore **ignores** `zfsPerformanceClass` on those volumes, does
+**not** stamp the class, and emits a Warning event
+(`ZFSPerformanceClassIgnored`) plus a log line on the PVC. Stamping a class that
+was never applied would be worse than useless: the immutability guard treats the
+stamp as ground truth, so a stamped clone would be both falsely accepted (a
+`general`-geometry volume passing every future check as `database`) and falsely
+rejected (`logbias ... fixed when the dataset is created`, for a property the
+driver never set on that dataset).
+
+A class stamp the volume **inherited from its source** is treated the same way.
+ZFS copies a source dataset's user properties into a clone (and a detached
+replication copy reproduces them as local values), so restoring a stamped volume
+would otherwise produce a target that claims a class nobody applied to it. The
+driver scrubs that inherited stamp when it materializes the volume, and the
+immutability guard independently **never treats a content-source volume's class
+stamp as authoritative** — belt and braces, because the scrub is one best-effort
+`pool.dataset.update`. Without both, replaying an identical, already-successful
+`CreateVolume` for a restored PVC could be refused with `FailedPrecondition`,
+which is a CSI idempotency violation.
+
+If a restored volume must carry a curated geometry, provision an empty volume
+with the class and copy the data in.
 
 ## Block-protocol tuning
 
@@ -492,6 +584,195 @@ volumeBindingMode: Immediate
 NFS supports `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`. Use hard
 mount semantics for persistent data; soft mounts can surface application-visible
 I/O errors during a transient server outage.
+
+### NFS version selection (v3 / v4 / v4.1)
+
+**Version is a node-side mount option, not a share property.** There is no
+`vers` field on `sharing.nfs.*`; a client picks the protocol with `vers=` /
+`nfsvers=` and the TrueNAS NFS service must have that MAJOR version enabled
+globally (`nfs.config` → `protocols`, typically `["NFSV3","NFSV4"]`). NFSv4.1 is
+part of the server's `NFSV4` support and needs no extra server flag.
+
+Set the version on the StorageClass's `mountOptions`. The driver passes them
+through unchanged (deduplicated, as always).
+
+Enable `nfs.versionPreflight` in the chart to have `CreateVolume` validate a
+class's pinned version against the server's protocol list and return a clear
+`FailedPrecondition` instead of letting the mount fail cryptically at
+`NodeStageVolume`. It costs one cached `nfs.config` read per controller
+lifetime and is off by default.
+
+`nfs.ensureProtocols` can additively enable a version on the server, but that is
+a **global service write affecting every export on the appliance** — it is
+default-empty and should stay that way unless you have accepted that blast
+radius.
+
+### Validated performance mount-option profiles
+
+| Profile | `mountOptions` | Use for |
+|---|---|---|
+| `v4.1-throughput` | `nfsvers=4.1`, `nconnect=8`, `hard`, `noatime`, `rsize=1048576`, `wsize=1048576` | Large sequential I/O (media, backups) |
+| `v4.1-lowlat` | `nfsvers=4.1`, `nconnect=4`, `hard`, `noatime`, `ac` | Small random I/O (databases) |
+| `v3-compat` | `nfsvers=3`, `hard`, `noatime` | Apps that need v3 locking/semantics |
+
+`nconnect` opens N TCP connections behind ONE NFSv4.1 session (session
+trunking). It is purely client-side — no server state, no TrueNAS setting. Older
+kernels and NFSv3 ignore it silently, which is safe. The node logs a warning
+(and changes nothing) when it sees `nconnect` with `vers=3` or two conflicting
+`vers=` options.
+
+For NFS-over-RDMA the server needs `nfs.config.rdma` enabled and clients mount
+with `proto=rdma`. That is an advanced, out-of-default-scope profile.
+
+### Export security and snapshot exposure
+
+`nfsSecurity` sets the export's `security` list. Leaving it unset omits the
+field entirely, which is the historical behavior and leaves TrueNAS on its
+AUTH_SYS default.
+
+`KRB5`/`KRB5I`/`KRB5P` require Kerberos on the NFS service (`nfs.config`
+`v4_krb` plus a keytab). The driver **fails closed**, on **every** path that can
+set `security`:
+
+- the StorageClass `nfsSecurity` parameter is rejected with `InvalidArgument`;
+- the global `nfs.shareSecurity` config key is rejected **at config load**, so
+  the controller refuses to start rather than stamping a Kerberos-only export on
+  every volume it subsequently creates, and is re-checked where the value reaches
+  the wire;
+- the chart schema couples `nfs.shareSecurity` to `nfs.krbEnabled`, so
+  `--set nfs.shareSecurity={KRB5}` without the acknowledgement fails at
+  `helm template` time.
+
+All three exist on purpose: a hand-written ConfigMap bypasses the chart schema,
+and a `Config` assembled in-process bypasses `LoadConfig`.
+
+Security is a **create-time** property of a volume. The driver never rewrites an
+existing share's security, because flipping SYS→KRB5 on a live export breaks
+every mounted client. Concretely, the only `sharing.nfs.update` the driver ever
+issues (the fencing reconciler) writes exactly `{hosts, networks, enabled}`, and
+the share builder has **no update path at all** — it either creates a missing
+export or returns early when one already exists.
+
+`nfsExposeSnapshots` publishes the volume's read-only `.zfs/snapshot` directory
+through the export, which composes with the driver's snapshot machinery to give
+in-place browsing of point-in-time copies. TrueNAS only honors it when the
+export path is the dataset root — always true for CSI volumes.
+
+### Squash mapping and export allowlists
+
+`maproot_*` and `mapall_*` are **mutually exclusive** in TrueNAS —
+`sharing.nfs.create` rejects a payload carrying both. Because the shipped default
+config sets `nfs.shareMaprootUser: root` / `nfs.shareMaprootGroup: wheel`, a
+StorageClass that sets only `nfsMapallUser` resolves to *both* and would fail
+provisioning with an opaque middleware error. The driver validates the
+**effective** payload (class override layered over the global config) and returns
+`InvalidArgument` naming all four values. To use `mapall`, clear the inherited
+maproot values on the class:
+
+```yaml
+parameters:
+  nfsMapallUser: nobody
+  nfsMaprootUser: ""
+  nfsMaprootGroup: ""
+```
+
+`nfsAllowedNetworks` / `nfsAllowedHosts` are **rejected with `InvalidArgument`
+under `fencing.mode: strict`**. Strict fencing owns the export allowlist: every
+share is created with empty `networks`/`hosts` (deny-all until
+`ControllerPublishVolume` grants a node), so the parameters would be silently
+discarded. Use `fencing.mode: additive` if a static per-class allowlist is
+required.
+
+### NFSv4 ACLs
+
+`nfsACLTemplate` (a builtin TrueNAS NFS4 template) or `nfsACL` (an explicit
+dacl) applies an NFSv4 ACL to a newly provisioned volume's dataset. When either
+is set, the driver additionally creates the dataset with `acltype=NFSV4` and
+`aclmode=PASSTHROUGH` (override with `nfsACLMode`); when neither is set, both
+properties keep inheriting from the parent exactly as before. `nfsACLMode` on
+its own is rejected — `aclmode` only matters on a dataset that carries a
+driver-applied ACL.
+
+**Volumes provisioned from a content source** (a snapshot restore, a volume
+clone, or a detached copy) are the exception, and the driver is explicit about
+it. `acltype`/`aclmode` are only ever set in the `pool.dataset.create` payload,
+and none of those paths issues one — the materialized dataset carries the
+**origin's** `acltype` and `aclmode`. Therefore:
+
+- `nfsACL` / `nfsACLTemplate` still work: `filesystem.setacl` acts on the
+  materialized path and genuinely applies, so a VolSync restore into an
+  ACL-managed StorageClass keeps working;
+- `nfsACLMode` is **rejected with `InvalidArgument` before anything is created**.
+  The parameter exists only to opt into the loud `RESTRICTED` behavior, so
+  silently handing back whatever the origin had would be the worst outcome
+  available. Drop it from the class used for restores, or restore into an empty
+  volume provisioned by a class that sets it and copy the data in;
+- the `NFSACLApplied` and `NFSACLFsGroupConflict` events on such a volume say
+  that the driver did **not** set `acltype`/`aclmode` and that the chmod
+  behavior is the origin's. They never report a mode the driver did not apply.
+
+`filesystem.setacl` is an asynchronous middleware job. ACL application is
+**best-effort**: it runs after the dataset, its ownership stamps and its export
+all exist, and a failure produces a Warning event on the PVC rather than a
+failed `CreateVolume`. A volume never fails to bind because a permission model
+could not be applied; re-apply out of band if needed.
+
+#### ⚠ ACL × `fsGroup` — read this before enabling
+
+This driver ships `CSIDriver.fsGroupPolicy: File`. Under that policy **kubelet
+recursively chowns and chmods a volume to the Pod's `securityContext.fsGroup` at
+every publish**, which rewrites the mode-bearing ACEs and silently defeats a
+driver-applied ACL.
+
+`fsGroupPolicy` is a driver-global field and effectively immutable on a live
+`CSIDriver`, so it cannot be chosen per StorageClass and the shipped default is
+deliberately **not** changed (flipping it would alter fsGroup semantics for every
+existing volume).
+
+Concretely: kubelet's `SetVolumeOwnership` walks the staged mount and issues a
+recursive `chown(-1, fsGroup)` plus `chmod`. Over NFSv4 those become SETATTR ops
+that TrueNAS applies to ZFS, and the property that decides what a `chmod` does to
+a non-trivial ACL is **`aclmode`**. Under the default `aclmode=PASSTHROUGH`,
+`zfsprops(7)` says "no changes are made to the ACL other than **generating the
+necessary ACL entries to represent the new mode**" — explicit `USER`/`GROUP` ACEs
+survive, the mode-bearing `owner@`/`group@`/`everyone@` ACEs do not. With
+`fsGroupChangePolicy: OnRootMismatch` this happens once; with the default
+`Always`, on every publish.
+
+Mitigations, in order of preference:
+
+1. Run ACL-managed workloads with **no `securityContext.fsGroup`**. Nothing then
+   rewrites the ACL.
+2. For an installation fully committed to ACL-managed volumes, install the chart
+   with `csidriver.fsGroupPolicy: None`. Do this on a **fresh installation**;
+   changing it on an existing one requires recreating the CSIDriver object and
+   changes fsGroup behavior for all its volumes.
+3. Set `nfsACLMode: RESTRICTED` on the StorageClass. This is the **only ZFS
+   lever** that actually stops a `chmod` from touching the ACL: under
+   `aclmode=RESTRICTED` an ACL-altering `chmod` returns `EPERM`, so kubelet's
+   fsGroup pass **fails the publish loudly** instead of silently degrading the
+   ACL. Understand the trade before enabling it — it converts a silent,
+   recoverable degradation into a hard mount-time failure, and it also breaks
+   any in-container `chmod` (many images do one at startup). That is why the
+   driver's default stays `PASSTHROUGH`.
+
+#### What `nfs41_flags.protected` does and does not do
+
+The driver sets `nfs41_flags.protected: true` on every ACL it applies. That flag
+is NFSv4.1 `ACL4_PROTECTED` / ZFS `ZFS_ACL_PROTECTED`, and its defined meaning
+(RFC 5661 §6.4.3.2; OpenZFS `zfs_acl_inherit`) is **automatic-inheritance
+suppression**: "this ACL was set explicitly, do not re-derive it from the
+parent". That is the correct semantic for an explicitly-applied ACL, and it is
+why the driver sets it.
+
+It is **not** a `chmod` guard — it is not consulted on the `chmod`/SETATTR-mode
+path at all, and it does **not** mitigate the fsGroup hazard. Only mitigations
+1–3 above do.
+
+Every volume that receives a driver-applied ACL also gets a Warning event
+(`NFSACLFsGroupConflict`) spelling this out, including which `aclmode` the
+driver applied — or, on a content-source volume, an explicit statement that it
+applied none and the origin's `aclmode` governs.
 
 ```yaml
 apiVersion: v1

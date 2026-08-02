@@ -1441,7 +1441,7 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 	}
 
 	// Mount NFS
-	if err := util.MountNFSWithContext(ctx, source, stagingPath, volumeMountFlags(volCap)); err != nil {
+	if err := util.MountNFSWithContext(ctx, source, stagingPath, nfsMountFlags(volCap)); err != nil {
 		RecordNodeConnect("nfs", "error")
 		operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSMountFailed, operationErr.Error())
