@@ -33,6 +33,9 @@ type startupFencingVolume struct {
 	volumeID         string
 	volumeAttributes map[string]string
 	publications     []startupPublication
+	// pv carries one PersistentVolume referencing this volume so per-volume
+	// operator-attention conditions can be surfaced as Events, not just klog.
+	pv *corev1.PersistentVolume
 }
 
 // reconcilePublishedAttachments is the rolling-upgrade bridge from static
@@ -107,6 +110,7 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 			volume = &startupFencingVolume{
 				volumeID:         volumeID,
 				volumeAttributes: pv.Spec.CSI.VolumeAttributes,
+				pv:               pv,
 			}
 			volumes[volumeID] = volume
 		}
@@ -287,6 +291,21 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	}
 	if len(desired) > 0 {
 		if err := d.ensureShareExists(ctx, dataset, datasetName, volume.volumeID, shareType, res); err != nil {
+			// The PERMANENT geometry refusal (extent absent, layout unestablishable)
+			// is a per-volume operator condition, not a convergence failure: no
+			// retry clears it, the absent extent exposes no data path so there is
+			// nothing to fence on this volume, and letting it join the error set
+			// would hold strict-mode readiness — and with it CreateVolume /
+			// ControllerPublishVolume / ControllerExpandVolume for EVERY volume —
+			// down forever. Surface it loudly and let the rest of the pass converge.
+			var permanent errGeometryUnestablishable
+			if errors.As(err, &permanent) {
+				klog.Warningf("Startup fencing for volume %s cannot rebuild its share until an operator records its "+
+					"geometry or restores its extent; not blocking controller readiness on it: %v", volume.volumeID, err)
+				d.recordWarningEvent(volume.pv, "StartupShareGeometryUnestablishable",
+					fmt.Sprintf("startup share rebuild refused: %v", err))
+				return nil
+			}
 			return fmt.Errorf("ensure share for startup attachment %s: %w", volume.volumeID, err)
 		}
 		if err := d.applyBackendFence(ctx, dataset, datasetName, shareType, records, res); err != nil {
@@ -358,6 +377,7 @@ func (d *Driver) currentStartupFencingVolume(ctx context.Context, volumeID strin
 		identity := startupNodeIdentity(d.name, attachment.nodeName, csiNodes[attachment.nodeName], nodes[attachment.nodeName])
 		mode, readonly := accessModeForPersistentVolume(attachment.pv)
 		result.volumeAttributes = attachment.pv.Spec.CSI.VolumeAttributes
+		result.pv = attachment.pv
 		result.publications = append(result.publications, startupPublication{identity: identity, mode: mode, readonly: readonly})
 	}
 	return result, nil

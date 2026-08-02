@@ -1465,8 +1465,22 @@ func guardRequestAgainstEvidence(request *blockOpts, evidence blockGeometry, dat
 // both iSCSI properties because a record that resolves only logical is the
 // half-resolved state that lets physical come from the mutable controller
 // default.
+// errGeometryUnestablishable marks the PERMANENT form of the geometry refusal:
+// no retry converges it — only an operator restoring the extent or recording the
+// real geometry (zfs set) clears it. The startup attachment reconcile detects
+// this mark so one such volume cannot hold strict-mode readiness down
+// cluster-wide forever: an absent extent exposes no data path, so there is
+// nothing to fence, while every OTHER failure on that path is transient and must
+// keep blocking readiness. GRPCStatus is delegated so RPC callers still see the
+// FailedPrecondition unchanged.
+type errGeometryUnestablishable struct{ err error }
+
+func (e errGeometryUnestablishable) Error() string              { return e.err.Error() }
+func (e errGeometryUnestablishable) Unwrap() error              { return e.err }
+func (e errGeometryUnestablishable) GRPCStatus() *status.Status { return status.Convert(e.err) }
+
 func (d *Driver) unknownGeometryError(datasetName, reason string) error {
-	return status.Errorf(codes.FailedPrecondition,
+	return errGeometryUnestablishable{err: status.Errorf(codes.FailedPrecondition,
 		"cannot create the iSCSI extent for %s: %s, so the driver cannot establish the geometry its data is addressed "+
 			"through. Falling back to the controller-wide defaults (iscsi.extentBlocksize=%d, pblocksize=%t) would lay a "+
 			"GUESSED geometry over data that may have been written against a different one, which corrupts it — the driver "+
@@ -1474,7 +1488,7 @@ func (d *Driver) unknownGeometryError(datasetName, reason string) error {
 			"(zfs set %s=<%s> %s=<true|false> %s) and retrying; a value outside those four sizes is rejected as untrusted "+
 			"rather than acted on",
 		datasetName, reason, d.config.ISCSI.ExtentBlocksize, !d.config.ISCSI.ExtentDisablePhysicalBlocksize,
-		PropBlockISCSIBlocksize, validISCSIBlocksizeList, PropBlockISCSIPblocksize, datasetName)
+		PropBlockISCSIBlocksize, validISCSIBlocksizeList, PropBlockISCSIPblocksize, datasetName)}
 }
 
 // validateExtentAgainstGeometry is the retry/idempotency half of the choke point.
@@ -1671,9 +1685,14 @@ func (d *Driver) snapshotGeometryProps(ctx context.Context, ds *truenas.Dataset,
 	stamped := stampGeometry(blockOptsFromDataset(ds), "the volume's recorded geometry stamp")
 	extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
 	if err != nil {
-		klog.Warningf("Could not capture the live iSCSI geometry of %s onto its snapshot (a later restore of it will "+
-			"fail closed rather than guess): %v", datasetName, err)
-		return stamped.props(), nil
+		// Capture NOTHING. The stamp alone is exactly the unverified record the
+		// round-6 live read exists to check: returning it here would let a
+		// transient read error capture a stale 4096 onto bytes re-addressed at
+		// 512, and a restore would then act on it. An empty capture makes that
+		// restore fail closed instead — availability, never integrity.
+		klog.Warningf("Could not capture the live iSCSI geometry of %s onto its snapshot; capturing no geometry, so "+
+			"a later restore of it will fail closed rather than act on the unverified stamp: %v", datasetName, err)
+		return nil, nil
 	}
 	// The live extent FIRST: it is what the bytes are addressed through right
 	// now, which is what this snapshot's content is. The stamp only fills a field
