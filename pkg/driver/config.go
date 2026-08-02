@@ -65,6 +65,12 @@ type Config struct {
 	// per-PVC VolumeCondition and the scale_csi_pool_* health gauges.
 	BackendHealth BackendHealthConfig `yaml:"backendHealth"`
 
+	// Encryption configures ZFS-native encryption at rest (GF-Sprint 1). It is
+	// strictly opt-in: the zero value (Enabled=false) leaves every volume
+	// plaintext and a deployment that never touches encryption behaves exactly as
+	// before. A StorageClass opts a volume in via its encryptionSecretName.
+	Encryption EncryptionConfig `yaml:"encryption"`
+
 	// Node configuration (node plugin only)
 	Node NodeConfig `yaml:"node"`
 
@@ -362,6 +368,19 @@ type ISCSICHAPSettings struct {
 	// Mutual selects CHAP_MUTUAL (bidirectional) authentication when true.
 	// Default false (one-way CHAP).
 	Mutual bool `yaml:"mutual"`
+}
+
+// EncryptionConfig holds the controller-wide ZFS-native encryption-at-rest
+// posture (GF-Sprint 1). Credentials are never configured here; the passphrase
+// is supplied per-StorageClass via a CSI secret ref (encryptionSecretName). The
+// zero value (Enabled=false) is OFF: nothing encryption-related is parsed,
+// stamped, or called, so a deployment that never sets this block provisions
+// byte-identically to pre-encryption.
+type EncryptionConfig struct {
+	// Enabled opts the controller into encryption-at-rest management (create-time
+	// folding, publish-time unlock, the locked-volume reconciler, and the
+	// health/VolumeCondition signal). Default false.
+	Enabled bool `yaml:"enabled"`
 }
 
 // ISCSITargetGroup represents a portal/initiator group configuration.

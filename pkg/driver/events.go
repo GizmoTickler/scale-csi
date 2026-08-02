@@ -68,6 +68,14 @@ const (
 	// A ZFS clone/restore inherits the origin dataset's geometry and accepts no
 	// property payload, so the class is neither applied nor stamped.
 	EventReasonZFSPerformanceClassIgnored = "ZFSPerformanceClassIgnored"
+	// EventReasonEncryptionRotated is emitted when an encrypted volume's passphrase
+	// is rotated through the two-key window (GF-Sprint 1, E-3). The message is
+	// redacted: it names the volume, never the passphrase.
+	EventReasonEncryptionRotated = "EncryptionRotated"
+	// EventReasonEncryptionUnlockFailed is emitted when the unlock reconciler
+	// persistently fails to re-unlock a locked encrypted volume (GF-Sprint 1,
+	// E-2 §4). The message is redacted.
+	EventReasonEncryptionUnlockFailed = "EncryptionUnlockFailed"
 )
 
 const (

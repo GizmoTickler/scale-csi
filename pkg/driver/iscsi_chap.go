@@ -228,9 +228,12 @@ func validateCHAPSecretValue(name, value string) error {
 	return nil
 }
 
-// redactCHAP returns a copy of secrets with every password/secret value masked.
-// Use it before logging or embedding any CHAP secret map in an error so
-// credentials never reach logs or gRPC status strings.
+// redactCHAP returns a copy of secrets with every password/secret/passphrase
+// value masked. Use it before logging or embedding any secret map in an error so
+// credentials never reach logs or gRPC status strings. The matcher covers the
+// CHAP password/secret keys AND the encryption passphrase (GF-Sprint 1): any key
+// containing "passphrase" is radioactive and must never survive into a log,
+// status, Event, or volume context.
 func redactCHAP(secrets map[string]string) map[string]string {
 	if secrets == nil {
 		return nil
@@ -238,7 +241,7 @@ func redactCHAP(secrets map[string]string) map[string]string {
 	redacted := make(map[string]string, len(secrets))
 	for key, value := range secrets {
 		lower := strings.ToLower(key)
-		if strings.Contains(lower, "password") || strings.Contains(lower, "secret") {
+		if strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "passphrase") {
 			if value != "" {
 				redacted[key] = "***"
 			}
