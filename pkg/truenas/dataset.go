@@ -221,10 +221,15 @@ var datasetCreateKeyScopes = map[string]datasetKeyScope{
 	"quota": datasetKeyFilesystemOnly,
 
 	// FILESYSTEM-only by ZFS SEMANTICS — these describe a mounted POSIX
-	// namespace, which a zvol does not have. The driver only ever sets acltype
-	// and aclmode, and applyDatasetACLParams already returns early for a VOLUME.
-	// NOT independently probed against 26.0's VOLUME model; if one of these turns
-	// out to be accepted there, this is the line to correct.
+	// namespace, which a zvol does not have. The driver sets acltype/aclmode
+	// (applyDatasetACLParams returns early for a VOLUME) and snapdir
+	// (zfs.datasetProperties; applyDatasetProperties drops it on the VOLUME
+	// branch). snapdir IS probed (2026-08-02): 26.0's middleware schema accepts
+	// it for a VOLUME but ZFS fails the whole call with "snapdir: property is
+	// invalid for zfs type: ZFS_TYPE_VOLUME" — an EFAULT at the ZFS layer, not
+	// the schema EINVAL this mock emits; the classification is the same either
+	// way. The rest are NOT independently probed against 26.0's VOLUME model;
+	// if one turns out to be accepted there, this is the line to correct.
 	"exec":            datasetKeyFilesystemOnly,
 	"snapdir":         datasetKeyFilesystemOnly,
 	"casesensitivity": datasetKeyFilesystemOnly,
@@ -291,9 +296,13 @@ func datasetKeyAccepted(scopes map[string]datasetKeyScope, key, datasetType stri
 	case datasetKeyBothTypes:
 		return true
 	case datasetKeyFilesystemOnly:
+		// An empty type is FILESYSTEM: pool.dataset.create defaults an omitted
+		// `type` to FILESYSTEM, so a typeless payload must be validated under
+		// FILESYSTEM rules — an "" escape here would let a typeless payload
+		// carry volume-only keys the real API rejects.
 		return datasetType != "VOLUME"
 	case datasetKeyVolumeOnly:
-		return datasetType == "VOLUME" || datasetType == ""
+		return datasetType == "VOLUME"
 	default:
 		return false
 	}

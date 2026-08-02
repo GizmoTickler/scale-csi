@@ -788,6 +788,7 @@ func TestCreateDatasetZvolSkipsFilesystemOnlyProperties(t *testing.T) {
 				"atime":        "off",
 				"readonly":     "on",
 				"volblocksize": "64k",
+				"snapdir":      "visible",
 			},
 		}},
 		truenasClient: client,
@@ -803,6 +804,10 @@ func TestCreateDatasetZvolSkipsFilesystemOnlyProperties(t *testing.T) {
 	assert.Equal(t, "64K", params.Volblocksize)
 	assert.Empty(t, params.Recordsize)
 	assert.Empty(t, params.Atime)
+	// snapdir passes 26.0's middleware schema for a VOLUME but ZFS then fails
+	// the whole create ("property is invalid for zfs type: ZFS_TYPE_VOLUME",
+	// probed live 2026-08-02), so the driver must drop it here.
+	assert.Empty(t, params.Snapdir)
 }
 
 func TestCreateDatasetZvolReservation(t *testing.T) {
@@ -2735,11 +2740,15 @@ func TestControllerExpandVolume(t *testing.T) {
 		truenasClient: mockClient,
 	}
 
-	// Pre-create volume
+	// Pre-create volume. The test exercises the NFS/filesystem expand arm (see
+	// the NodeExpansionRequired assertion below), so the fixture is a
+	// refquota-bound FILESYSTEM — the old typeless+Volsize shape only existed
+	// because the mock's empty-type escape accepted it.
 	volName := "vol-expand"
 	_, err := mockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
-		Name:    "pool/parent/" + volName,
-		Volsize: 1024,
+		Name:     "pool/parent/" + volName,
+		Type:     "FILESYSTEM",
+		Refquota: 1024,
 	})
 	assert.NoError(t, err)
 

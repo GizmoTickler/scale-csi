@@ -2347,6 +2347,17 @@ func TestMockDatasetCreateEnforcesTrueNAS26Schema(t *testing.T) {
 		require.Error(t, err, "the idempotent already-exists fallback must not mask a schema rejection")
 	})
 
+	t.Run("a typeless payload is validated as FILESYSTEM, exactly as pool.dataset.create defaults it", func(t *testing.T) {
+		mock := NewMockClient()
+		_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{Name: "pool/parent/typeless", Volsize: 1 << 30})
+		require.Error(t, err, "volsize on a typeless (defaulted-FILESYSTEM) create must be rejected, not slip through an empty-type escape")
+		assert.Contains(t, err.Error(), "volsize")
+
+		created, err := mock.DatasetCreate(ctx, &DatasetCreateParams{Name: "pool/parent/typeless"})
+		require.NoError(t, err)
+		assert.Equal(t, "FILESYSTEM", created.Type, "the stored dataset must carry the defaulted type, not an empty one")
+	})
+
 	t.Run("the properties the drills proved out are accepted", func(t *testing.T) {
 		mock := NewMockClient()
 		_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{

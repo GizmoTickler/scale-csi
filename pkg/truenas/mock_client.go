@@ -642,8 +642,14 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	// key 26.0 rejects fails here instead of being masked by the idempotent
 	// already-exists arm below. The model is per dataset TYPE, so params.Type
 	// selects which keys are legal — recordsize on a VOLUME is as fatal as
-	// logbias on either.
-	if err := validateDatasetPayloadKeys(params, datasetCreateKeyScopes, params.Type); err != nil {
+	// logbias on either. An omitted type defaults to FILESYSTEM, exactly as
+	// pool.dataset.create does, so a typeless payload cannot slip volume-only
+	// keys past the gate (and the stored dataset never carries an empty type).
+	datasetType := params.Type
+	if datasetType == "" {
+		datasetType = "FILESYSTEM"
+	}
+	if err := validateDatasetPayloadKeys(params, datasetCreateKeyScopes, datasetType); err != nil {
 		return nil, fmt.Errorf("failed to create dataset: %w", err)
 	}
 	if existing, exists := m.Datasets[params.Name]; exists {
@@ -656,7 +662,7 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	ds := &Dataset{
 		ID:             params.Name,
 		Name:           params.Name,
-		Type:           params.Type,
+		Type:           datasetType,
 		UserProperties: make(map[string]UserProperty),
 		Creation:       DatasetProperty{Parsed: float64(time.Now().Unix())},
 		Volsize:        DatasetProperty{Parsed: float64(params.Volsize)},
@@ -670,7 +676,7 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 			ds.UserProperties[property.Key] = UserProperty{Value: property.Value, Source: "local"}
 		}
 	}
-	if params.Type != "VOLUME" {
+	if datasetType != "VOLUME" {
 		ds.Mountpoint = "/mnt/" + strings.TrimPrefix(params.Name, "/")
 	}
 	m.Datasets[params.Name] = ds

@@ -3105,7 +3105,11 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 		key := strings.TrimSpace(rawKey)
 		value := strings.TrimSpace(properties[rawKey])
 		normalizedKey := strings.ToLower(key)
-		if params.Type == "VOLUME" && (normalizedKey == "atime" || normalizedKey == "recordsize") {
+		// snapdir is filesystem-only at the ZFS layer: 26.0's middleware schema
+		// accepts it for a VOLUME but ZFS then fails the whole create/update with
+		// "snapdir: property is invalid for zfs type: ZFS_TYPE_VOLUME" (probed
+		// live 2026-08-02 on both pool.dataset.create and .update).
+		if params.Type == "VOLUME" && (normalizedKey == "atime" || normalizedKey == "recordsize" || normalizedKey == "snapdir") {
 			klog.Warningf("Ignoring filesystem-only zfs.datasetProperties key %q for VOLUME dataset %s", rawKey, params.Name)
 			continue
 		}
