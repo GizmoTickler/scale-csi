@@ -54,6 +54,26 @@ type Dataset struct {
 	// ResourceQuery is true when the dataset came from the TrueNAS 26.0
 	// zfs.resource.query read path rather than pool.dataset.query.
 	ResourceQuery bool `json:"-"`
+
+	// Encryption state (GF-Sprint 1), as pool.dataset.query reports it for an
+	// encrypted dataset (P-4: a locked dataset still returns its row with
+	// locked:true, key_loaded:false, mountpoint:null). Encrypted/Locked/KeyLoaded
+	// carry real JSON tags because pool.dataset.query returns them as top-level
+	// booleans and the health path (volumeConditionFromDataset) reads the locked
+	// signal straight off the queried dataset — zero extra RTT, no per-volume
+	// encryption_summary in ListVolumes. The driver's authoritative unlock GATE
+	// still uses DatasetEncryptionSummary (P-8); these fields drive the read-only
+	// health/VolumeCondition surface and let the mock model a locked zvol.
+	// EncryptionRoot/EncryptionAlgorithm/Passphrase stay json:"-": the passphrase
+	// is the mock's model of the dataset's CURRENT key (the backend's knowledge),
+	// used only to validate unlock (P-5) and rotate on change_key (P-6) — test
+	// state, never driver data, never logged or returned through a driver surface.
+	Encrypted           bool   `json:"encrypted"`
+	Locked              bool   `json:"locked"`
+	KeyLoaded           bool   `json:"key_loaded"`
+	EncryptionRoot      string `json:"-"`
+	EncryptionAlgorithm string `json:"-"`
+	Passphrase          string `json:"-"`
 }
 
 // DatasetProperty represents a ZFS property with parsed and raw values.
@@ -121,6 +141,31 @@ type DatasetCreateParams struct {
 	ShareType             string               `json:"share_type,omitempty"`
 	Xattr                 string               `json:"xattr,omitempty"`
 	UserProperties        []UserPropertyUpdate `json:"user_properties,omitempty"`
+
+	// Encryption opts a create into ZFS-native encryption at rest (GF-Sprint 1).
+	// PROBED accepted on BOTH pool.dataset.create type models (P-1 FILESYSTEM,
+	// P-2 VOLUME, nas01 26.0.0-BETA.1): the create shape is
+	//   {"encryption":true,"inherit_encryption":false,
+	//    "encryption_options":{"algorithm":"AES-256-GCM","passphrase":"<>"}}
+	// When Encryption is non-nil the driver MUST also set InheritEncryption=false
+	// (that probe shape), so a passphrase dataset becomes its own encryption_root.
+	// Encryption is create-time only: ZFS cannot encrypt an existing dataset in
+	// place, so these fields are never set on the update path.
+	Encryption        *bool              `json:"encryption,omitempty"`
+	InheritEncryption *bool              `json:"inherit_encryption,omitempty"`
+	EncryptionOptions *EncryptionOptions `json:"encryption_options,omitempty"`
+}
+
+// EncryptionOptions carries the key material for an encrypted dataset create.
+// It is the `encryption_options` object pool.dataset.create accepts (P-1/P-2).
+// Passphrase is the SOLE key format this driver supports (key_format PASSPHRASE);
+// it is request-scoped and must never be persisted to a dataset property, log,
+// gRPC status, Event, or volume context. Pbkdf2Iters is optional; TrueNAS
+// defaults it to 1300000 (P-1) when zero.
+type EncryptionOptions struct {
+	Algorithm   string `json:"algorithm,omitempty"`
+	Passphrase  string `json:"passphrase,omitempty"`
+	Pbkdf2Iters int    `json:"pbkdf2iters,omitempty"`
 }
 
 // DatasetUpdateParams holds parameters for updating a dataset.
@@ -255,6 +300,15 @@ var datasetCreateKeyScopes = map[string]datasetKeyScope{
 	"copies":                   datasetKeyBothTypes,
 	"special_small_block_size": datasetKeyBothTypes,
 	"user_properties":          datasetKeyBothTypes,
+
+	// Encryption at rest (GF-Sprint 1). PROBED accepted on BOTH type models
+	// (P-1 FILESYSTEM, P-2 VOLUME, nas01 26.0.0-BETA.1): an encrypted create
+	// carries encryption + inherit_encryption + encryption_options together and
+	// returns encrypted:true for a filesystem and a zvol alike. All three ride in
+	// the single pool.dataset.create call (+0 RTT vs a plaintext create).
+	"encryption":         datasetKeyBothTypes,
+	"inherit_encryption": datasetKeyBothTypes,
+	"encryption_options": datasetKeyBothTypes,
 
 	// Rejected by 26.0 outright — see the probe transcript above.
 	"logbias":        datasetKeyRejectedBy26,
@@ -1070,6 +1124,19 @@ func parseDataset(data interface{}) (*Dataset, error) {
 	}
 	if v, ok := m["mountpoint"].(string); ok {
 		ds.Mountpoint = v
+	}
+
+	// Encryption state (GF-Sprint 1): pool.dataset.query returns these as top-level
+	// booleans for an encrypted dataset (P-4). Read them identically to the typed
+	// decoder's JSON tags so the two parsers stay equivalent.
+	if v, ok := m["encrypted"].(bool); ok {
+		ds.Encrypted = v
+	}
+	if v, ok := m["locked"].(bool); ok {
+		ds.Locked = v
+	}
+	if v, ok := m["key_loaded"].(bool); ok {
+		ds.KeyLoaded = v
 	}
 
 	// Parse properties

@@ -40,6 +40,14 @@ type ClientInterface interface {
 	SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error)
 	DatasetPromote(ctx context.Context, datasetName string) error
 	DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error)
+	// Encryption at rest (GF-Sprint 1). All are TrueNAS @jobs; a FAILED job is
+	// returned as an error. DatasetLock is test/drill-only — no live control path
+	// locks a dataset. DatasetUnlock is NOT idempotent (P-8): gate on the summary's
+	// locked==true before calling.
+	DatasetLock(ctx context.Context, name string) error
+	DatasetUnlock(ctx context.Context, name, passphrase string) error
+	DatasetChangeKey(ctx context.Context, name, passphrase string) error
+	DatasetEncryptionSummary(ctx context.Context, name string) ([]EncryptionSummaryEntry, error)
 	GetPoolAvailable(ctx context.Context, poolName string) (int64, error)
 	WaitForDatasetReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)
 	WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error)

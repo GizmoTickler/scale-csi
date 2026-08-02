@@ -679,6 +679,24 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	if datasetType != "VOLUME" {
 		ds.Mountpoint = "/mnt/" + strings.TrimPrefix(params.Name, "/")
 	}
+	// Encryption at rest (GF-Sprint 1). A create with encryption:true comes up
+	// UNLOCKED with the key loaded and is its own encryption_root (P-1/P-2:
+	// encrypted:true, key_loaded:true, locked:false, encryption_root:<self>). The
+	// mock records the create passphrase as the dataset's current key so unlock /
+	// change_key can validate against it faithfully (P-5/P-6).
+	if params.Encryption != nil && *params.Encryption {
+		ds.Encrypted = true
+		ds.KeyLoaded = true
+		ds.Locked = false
+		ds.EncryptionRoot = params.Name
+		if opts := params.EncryptionOptions; opts != nil {
+			ds.Passphrase = opts.Passphrase
+			ds.EncryptionAlgorithm = opts.Algorithm
+		}
+		if ds.EncryptionAlgorithm == "" {
+			ds.EncryptionAlgorithm = "AES-256-GCM"
+		}
+	}
 	m.Datasets[params.Name] = ds
 	return mockDatasetResponse(ds, true), nil
 }
@@ -693,6 +711,11 @@ func mockDatasetResponse(dataset *Dataset, created bool) *Dataset {
 		response.UserProperties[key] = property
 	}
 	response.CreatedByCall = created
+	// P-4: a locked dataset reports mountpoint:null (filesystem) and has no backing
+	// zvol device. The row survives; the mountpoint/device does not.
+	if response.Locked {
+		response.Mountpoint = ""
+	}
 	return &response
 }
 
@@ -1037,6 +1060,108 @@ func (m *MockClient) DatasetGetQuotaUsage(ctx context.Context, datasetName strin
 	return ds.QuotaUsage(), nil
 }
 
+// DatasetLock models pool.dataset.lock (a @job). Test/drill only — no driver
+// control path locks a dataset. It flips the dataset to the P-4 locked state:
+// locked:true, key_loaded:false, and (via mockDatasetResponse) no mountpoint /
+// backing device.
+func (m *MockClient) DatasetLock(ctx context.Context, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	ds, ok := m.Datasets[name]
+	if !ok {
+		return notFoundAPIError("dataset not found")
+	}
+	if !ds.Encrypted {
+		return &jobTerminalError{state: "FAILED", detail: "dataset is not encrypted"}
+	}
+	ds.Locked = true
+	ds.KeyLoaded = false
+	return nil
+}
+
+// DatasetUnlock models pool.dataset.unlock (a @job), including its two sharp
+// edges: it is NOT idempotent — unlocking an already-unlocked dataset is a FAILED
+// job (P-8) — and a wrong passphrase is a FAILED job that leaves the dataset
+// locked (P-5, fail-closed native).
+func (m *MockClient) DatasetUnlock(ctx context.Context, name, passphrase string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	ds, ok := m.Datasets[name]
+	if !ok {
+		return notFoundAPIError("dataset not found")
+	}
+	if !ds.Encrypted {
+		return &jobTerminalError{state: "FAILED", detail: "dataset is not encrypted"}
+	}
+	if !ds.Locked {
+		// P-8: unlock on an already-unlocked dataset fails.
+		return &jobTerminalError{state: "FAILED", detail: "dataset is already unlocked"}
+	}
+	if passphrase != ds.Passphrase {
+		// P-5: wrong passphrase -> FAILED, dataset stays locked, no device.
+		return &jobTerminalError{state: "FAILED", detail: "failed to unlock dataset: invalid passphrase"}
+	}
+	ds.Locked = false
+	ds.KeyLoaded = true
+	return nil
+}
+
+// DatasetChangeKey models pool.dataset.change_key (a @job, P-6): it re-keys an
+// UNLOCKED dataset and requires the key already loaded. Afterward the old
+// passphrase is dead.
+func (m *MockClient) DatasetChangeKey(ctx context.Context, name, passphrase string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.InjectError != nil {
+		return m.InjectError
+	}
+	ds, ok := m.Datasets[name]
+	if !ok {
+		return notFoundAPIError("dataset not found")
+	}
+	if !ds.Encrypted {
+		return &jobTerminalError{state: "FAILED", detail: "dataset is not encrypted"}
+	}
+	if ds.Locked || !ds.KeyLoaded {
+		return &jobTerminalError{state: "FAILED", detail: "dataset must be unlocked before changing its key"}
+	}
+	ds.Passphrase = passphrase
+	return nil
+}
+
+// DatasetEncryptionSummary models pool.dataset.encryption_summary (a @job whose
+// result is the P-3 list). The driver reads Locked and ValidKey to gate unlock
+// and to report health.
+func (m *MockClient) DatasetEncryptionSummary(ctx context.Context, name string) ([]EncryptionSummaryEntry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	ds, ok := m.Datasets[name]
+	if !ok {
+		return nil, notFoundAPIError("dataset not found")
+	}
+	if !ds.Encrypted {
+		return nil, notFoundAPIError("dataset is not encrypted")
+	}
+	keyFormat := "PASSPHRASE"
+	return []EncryptionSummaryEntry{{
+		Name:                 name,
+		KeyFormat:            keyFormat,
+		KeyPresentInDatabase: false, // P-3: TrueNAS does not persist a passphrase
+		ValidKey:             ds.KeyLoaded,
+		Locked:               ds.Locked,
+		UnlockSuccessful:     ds.KeyLoaded,
+	}}, nil
+}
+
 func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {
 	return m.DatasetSetUserProperties(ctx, name, map[string]string{key: value})
 }
@@ -1139,6 +1264,18 @@ func (m *MockClient) WaitForDatasetReady(ctx context.Context, name string, timeo
 }
 
 func (m *MockClient) WaitForZvolReady(ctx context.Context, name string, timeout time.Duration) (*Dataset, error) {
+	// P-4: a locked zvol has NO backing device (/dev/zvol/<name> is gone), so it
+	// can never become ready. Model that so a publish/share build over a locked
+	// zvol fails the way it does on a real appliance.
+	m.mu.RLock()
+	locked := false
+	if ds, ok := m.Datasets[name]; ok {
+		locked = ds.Locked
+	}
+	m.mu.RUnlock()
+	if locked {
+		return nil, fmt.Errorf("zvol %s has no backing device: dataset is locked", name)
+	}
 	return m.DatasetGet(ctx, name)
 }
 
