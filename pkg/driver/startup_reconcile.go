@@ -415,6 +415,15 @@ func (d *Driver) runStartupAttachmentReconcile(parent context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
+	// Encryption at rest (GF-Sprint 1, E-2 §2 ordering): UNLOCK BEFORE the share
+	// ensure pass. On the exact scenario the feature exists for — an appliance
+	// reboot, which brings every encrypted volume up LOCKED (P-3/P-4) — this pass
+	// would otherwise rebuild shares over locked zvols that have no backing device
+	// (P-4) and fail each one in WaitForZvolReady before a single unlock had been
+	// attempted. The publish path already honors this ordering; the startup path
+	// must too. Internally gated on encryption.enabled and in-cluster client
+	// access, so it is a strict no-op for every deployment that does not encrypt.
+	d.reconcileEncryptedUnlocks(ctx)
 	return d.reconcilePublishedAttachments(ctx)
 }
 

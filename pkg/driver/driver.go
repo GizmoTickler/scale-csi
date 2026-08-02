@@ -146,11 +146,19 @@ type Driver struct {
 	startupReconcileOnce   sync.Once
 	startupReconcileSignal chan struct{}
 
-	// Encryption unlock reconciler state (GF-Sprint 1, E-2 §4). The map counts
-	// consecutive failed re-unlock passes per volume so a K8s Event is raised only
-	// on PERSISTENT failure, not a single transient blip.
-	encryptionUnlockFailMu   sync.Mutex
-	encryptionUnlockFailures map[string]int
+	// Encryption unlock reconciler state (GF-Sprint 1, E-2 §4), all guarded by
+	// encryptionUnlockFailMu. encryptionUnlockFailures counts consecutive failed
+	// re-unlock passes per volume so a K8s Event is raised only on PERSISTENT
+	// failure, not a single transient blip. encryptionRotationConverged records
+	// the rotation-window FINGERPRINT (a salted hash, never key material) whose
+	// completion this process already converged for a volume, so an open window
+	// does not re-key on every pass while a new window still does.
+	// encryptionReconcilerInertWarned makes the "encryption on, reconciler cannot
+	// run" warning fire once instead of every cadence.
+	encryptionUnlockFailMu          sync.Mutex
+	encryptionUnlockFailures        map[string]int
+	encryptionRotationConverged     map[string]string
+	encryptionReconcilerInertWarned bool
 
 	// Controller-side pool-capacity gauge poll loop (E4). Runs only when
 	// capacity.gaugeEnabled; each tick is one bounded pool.dataset.query.
