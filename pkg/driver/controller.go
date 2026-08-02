@@ -68,13 +68,18 @@ const (
 
 	// PropEncryption records the encryption ALGORITHM a volume was CREATED with
 	// (e.g. "AES-256-GCM"), stamped source==local (GF-Sprint 1). Its PRESENCE is
-	// the durable marker that the volume is encrypted; its value is the algorithm.
-	// It NEVER holds key material — the passphrase lives only in the K8s Secret and
-	// request-scoped context, never a dataset property. Every later path (publish
-	// unlock, the locked-volume reconciler, the health/VolumeCondition signal)
-	// reads this to know a volume is encrypted without holding a key. Read through
-	// the source==local guard so a clone never adopts its origin's marker as its
-	// own create-time policy (a clone shares the origin's key anyway, P-7).
+	// the durable OWNERSHIP marker that this driver encrypted this volume; its
+	// value is the algorithm. It NEVER holds key material — the passphrase lives
+	// only in the K8s Secret and request-scoped context, never a dataset property.
+	// The publish-unlock path and the locked-volume reconciler read it (through
+	// the source==local guard, so a clone never adopts its origin's marker as its
+	// own create-time policy — a clone shares the origin's key anyway, P-7) to
+	// decide whether a volume's encryption is theirs to manage. The
+	// health/VolumeCondition signal does NOT read it: volumeConditionFromDataset
+	// reads the WIRE booleans (ds.Encrypted && ds.Locked) so a locked dataset is
+	// reported abnormal even if its stamp was never written. Since the stamp is
+	// written after pool.dataset.create returns, its ABSENCE is not proof of
+	// plaintext — the wire fields are (see datasetEncryptedOnWire).
 	PropEncryption = "truenas-csi:encryption"
 
 	// Block-protocol tuning (GF-Sprint 4) persisted per volume. The resolved
@@ -1185,8 +1190,24 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		}
 	}
 
+	// The stored encryption posture is authoritative: an idempotent replay may not
+	// flip this volume encrypted<->plaintext (GF-Sprint 1). Encryption is create-
+	// time only, so guard BEFORE ANY WRITE — a conflicting replay must fail fast
+	// WITHOUT first stamping managed_resource/provision_success on the dataset,
+	// which would take the wedged volume out of the remnant sweeper's reach. The
+	// guard is read-only apart from encryptionRepair: the stamp-repair props for
+	// an encrypted dataset whose stamp write was lost to a crash, folded into the
+	// SAME idempotent property update below so the repair costs no round trip.
+	encryptionRepair, guardErr := d.guardExistingEncryptionPolicy(ctx, existingDS)
+	if guardErr != nil {
+		return nil, guardErr
+	}
+
 	// Ensure properties are set (idempotent) in one API update.
-	propertyUpdates := make(map[string]string, 3)
+	propertyUpdates := make(map[string]string, 3+len(encryptionRepair))
+	for key, value := range encryptionRepair {
+		propertyUpdates[key] = value
+	}
 	if datasetUserProperty(existingDS, PropManagedResource) != "true" {
 		propertyUpdates[PropManagedResource] = "true"
 	}
@@ -1217,14 +1238,6 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		if guardErr := d.guardExistingISCSICHAPPolicy(ctx, existingDS); guardErr != nil {
 			return nil, guardErr
 		}
-	}
-
-	// The stored encryption posture is authoritative: an idempotent replay may not
-	// flip this volume encrypted<->plaintext (GF-Sprint 1). Encryption is create-
-	// time only, so guard BEFORE any further work and fail fast with
-	// FailedPrecondition on a conflicting replay.
-	if guardErr := d.guardExistingEncryptionPolicy(ctx, existingDS); guardErr != nil {
-		return nil, guardErr
 	}
 
 	// GEOMETRY (round 5). A replay whose destination is a clone/restore that
@@ -3527,6 +3540,16 @@ func (d *Driver) handleVolumeContentSource(
 			return nil, blockGeometry{}, status.Errorf(codes.NotFound, "snapshot not found: %s", snapshotID)
 		}
 
+		// GF-Sprint 1: refuse an ENCRYPTED source before the first mutation. A
+		// clone of an encrypted dataset inherits its origin's key with no policy of
+		// its own (P-7) and would be silently unmanageable; a detached copy's
+		// encryption outcome is unprobed. Costs one read only when encryption is
+		// enabled controller-wide.
+		if encErr := d.guardEncryptedContentSource(ctx, snap.Dataset, nil,
+			fmt.Sprintf("snapshot %s", snapshotID)); encErr != nil {
+			return nil, blockGeometry{}, encErr
+		}
+
 		sourceSnapshot := snap.ID
 		// N-1: fail a geometry-changing restore closed BEFORE the first
 		// destination mutation. The clone fold below stamps the REQUEST's own
@@ -3730,6 +3753,13 @@ func (d *Driver) handleVolumeContentSource(
 				return nil, blockGeometry{}, status.Errorf(codes.NotFound, "source volume not found: %s", sourceVolumeID)
 			}
 			return nil, blockGeometry{}, status.Errorf(codes.Internal, "failed to get source volume: %v", getErr)
+		}
+		// GF-Sprint 1: refuse an ENCRYPTED source before the first mutation (see the
+		// snapshot branch). The existence probe above already read the source, so
+		// this check is +0 RTT.
+		if encErr := d.guardEncryptedContentSource(ctx, sourceDataset, sourceDS,
+			fmt.Sprintf("volume %s", sourceVolumeID)); encErr != nil {
+			return nil, blockGeometry{}, encErr
 		}
 		// N-1 (volume-clone flavor). This existence probe was already querying the
 		// source, so reusing its result saves the DatasetGet: the only extra call

@@ -72,6 +72,13 @@ const (
 	// is rotated through the two-key window (GF-Sprint 1, E-3). The message is
 	// redacted: it names the volume, never the passphrase.
 	EventReasonEncryptionRotated = "EncryptionRotated"
+	// EventReasonEncryptionRotationIncomplete is emitted when a two-key rotation
+	// was started but its change_key did not complete (GF-Sprint 1, E-3). The
+	// volume may still be keyed to passphrasePrevious, so this Event is the
+	// durable instruction to KEEP that key in the Secret until an
+	// EncryptionRotated event is observed for the volume. Redacted: it names the
+	// volume, never a passphrase.
+	EventReasonEncryptionRotationIncomplete = "EncryptionRotationIncomplete"
 	// EventReasonEncryptionUnlockFailed is emitted when the unlock reconciler
 	// persistently fails to re-unlock a locked encrypted volume (GF-Sprint 1,
 	// E-2 §4). The message is redacted.
