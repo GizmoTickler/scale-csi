@@ -66,6 +66,17 @@ const (
 	// existing volume and mixed one-way/mutual StorageClasses coexist correctly.
 	PropISCSIAuthMode = "truenas-csi:truenas_iscsi_auth_mode"
 
+	// PropEncryption records the encryption ALGORITHM a volume was CREATED with
+	// (e.g. "AES-256-GCM"), stamped source==local (GF-Sprint 1). Its PRESENCE is
+	// the durable marker that the volume is encrypted; its value is the algorithm.
+	// It NEVER holds key material — the passphrase lives only in the K8s Secret and
+	// request-scoped context, never a dataset property. Every later path (publish
+	// unlock, the locked-volume reconciler, the health/VolumeCondition signal)
+	// reads this to know a volume is encrypted without holding a key. Read through
+	// the source==local guard so a clone never adopts its origin's marker as its
+	// own create-time policy (a clone shares the origin's key anyway, P-7).
+	PropEncryption = "truenas-csi:encryption"
+
 	// Block-protocol tuning (GF-Sprint 4) persisted per volume. The resolved
 	// per-StorageClass options are stamped here at CreateVolume so EVERY later
 	// path that rebuilds or re-ensures the share for an EXISTING volume
@@ -473,6 +484,40 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		ctx = withISCSIChAPResolution(ctx, chapResolution)
 	}
 
+	// Encryption at rest (GF-Sprint 1) is strictly opt-in and applies to EVERY
+	// share type (NFS filesystem and iSCSI/NVMe zvol alike — P-1/P-2). When this
+	// StorageClass opts in, parse and validate the secret once (InvalidArgument
+	// before any API call) and thread the resolution to the dataset-param builder
+	// via the request context. The passphrase is folded into the single
+	// pool.dataset.create call (+0 RTT) and is never stamped as a property; only
+	// the algorithm marker is persisted. A deployment that never enables
+	// encryption skips this entirely, so the plaintext golden RTT counts are
+	// unaffected.
+	if d.encryptionEnabledForCreate(req.GetParameters(), req.GetSecrets()) {
+		encSecret := parseEncryptionSecret(req.GetSecrets())
+		algorithm, encErr := validateEncryptionSecret(encSecret)
+		if encErr != nil {
+			return nil, encErr
+		}
+		// Encryption is create-time only (ZFS cannot encrypt existing data in
+		// place). A content-source volume materializes PRE-EXISTING bytes — a clone
+		// inherits its origin's key and cannot be independently keyed (P-7), and a
+		// detached restore carries the source's layout — so refuse encryption here
+		// rather than stamping a marker the data does not carry. Provision a fresh
+		// encrypted volume and copy the data in.
+		if req.GetVolumeContentSource() != nil {
+			return nil, status.Error(codes.InvalidArgument,
+				"encryption cannot be combined with a volume content source: encryption is create-time only and a "+
+					"clone/restore inherits its source's bytes (and, for a clone, its key). Provision an empty encrypted "+
+					"volume and copy the data in")
+		}
+		ctx = withEncryptionResolution(ctx, &encryptionResolution{
+			Algorithm:   algorithm,
+			Passphrase:  encSecret.Passphrase,
+			Pbkdf2Iters: encSecret.Pbkdf2Iters,
+		})
+	}
+
 	// Block-protocol tuning (GF-Sprint 4) is strictly opt-in per StorageClass.
 	// Resolve and validate the knobs once and thread them to the share builder
 	// via the request context, mirroring the CHAP resolution. A StorageClass that
@@ -700,6 +745,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// re-writes the CHAP policy the clone fold already stamped atomically with
 	// ownership (Sprint 6 H1) — idempotent, same values via iscsiCHAPPolicyProps.
 	for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
+		volumeProperties[key] = value
+	}
+	// Fold the durable encryption marker (PropEncryption = <algorithm>) into the
+	// SAME fatal update (GF-Sprint 1): the publish unlock, the locked-volume
+	// reconciler, and the health signal all reconstruct "this volume is encrypted"
+	// purely from this stamp, so a missing marker would leave an encrypted volume
+	// permanently locked after a reboot with nothing to tell the driver to unlock
+	// it. ONLY the algorithm is stored — NEVER the passphrase. nil (adds nothing,
+	// byte-identical write) for a plaintext create. Encryption+content-source is
+	// rejected above, so a present resolution is always a fresh create and the
+	// stamp is truthful.
+	for key, value := range encryptionProps(ctx) {
 		volumeProperties[key] = value
 	}
 	// Fold the resolved block-protocol tuning into the SAME fatal update, for the
@@ -1160,6 +1217,14 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		if guardErr := d.guardExistingISCSICHAPPolicy(ctx, existingDS); guardErr != nil {
 			return nil, guardErr
 		}
+	}
+
+	// The stored encryption posture is authoritative: an idempotent replay may not
+	// flip this volume encrypted<->plaintext (GF-Sprint 1). Encryption is create-
+	// time only, so guard BEFORE any further work and fail fast with
+	// FailedPrecondition on a conflicting replay.
+	if guardErr := d.guardExistingEncryptionPolicy(ctx, existingDS); guardErr != nil {
+		return nil, guardErr
 	}
 
 	// GEOMETRY (round 5). A replay whose destination is a clone/restore that
@@ -1733,6 +1798,16 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	shareType := shareTypeForPublishedVolume(ds, req.GetVolumeContext())
 
 	klog.Infof("ControllerPublishVolume: volumeID=%s, nodeID=%s, shareType=%s", volumeID, nodeID, shareType)
+
+	// Encryption at rest (GF-Sprint 1, E-2 §2): unlock BEFORE the share/extent is
+	// built. A locked zvol has no backing device (P-4), so ensureShareExists would
+	// fail; the node has no TrueNAS client, so unlock must happen here, controller-
+	// side, using the controller-publish-secret. Gated on the summary's locked==true
+	// (P-8) and fail-closed (no secret / wrong key -> FailedPrecondition). A no-op
+	// for plaintext volumes and for encrypted volumes already unlocked.
+	if err := d.unlockEncryptedDatasetForPublish(ctx, ds, datasetName, volumeID, req.GetSecrets()); err != nil {
+		return nil, err
+	}
 
 	// Per-request memo so the ensure-share step and the fence phases resolve the
 	// backend share objects once and reuse them (see fenceResolution).
@@ -2678,6 +2753,18 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 // is unverified, rather than flagged abnormal and raising spurious volume-health
 // events on clusters with pre-stamp legacy PVs.
 func volumeConditionFromDataset(ds *truenas.Dataset) *csi.VolumeCondition {
+	// Encryption at rest (GF-Sprint 1, E-3 §2): a locked encrypted dataset serves
+	// ZERO I/O (P-4) — a definitive dataset-level negative, so it wins exactly like
+	// provision_success=false. The locked signal rides on the queried dataset
+	// (pool.dataset.query returns locked:true, P-4), so BOTH ControllerGetVolume and
+	// ListVolumes surface it through the existing composition with no extra call and
+	// no parallel path. A plaintext dataset (Encrypted=false) never takes this arm.
+	if ds != nil && ds.Encrypted && ds.Locked {
+		return &csi.VolumeCondition{
+			Abnormal: true,
+			Message:  "dataset locked (encrypted, key not loaded)",
+		}
+	}
 	if datasetUserProperty(ds, PropProvisionSuccess) == "false" {
 		return &csi.VolumeCondition{
 			Abnormal: true,
@@ -2908,6 +2995,11 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 	// (plus aclmode=PASSTHROUGH) ONLY when this volume actually requested an ACL;
 	// otherwise both stay inherited from the parent, exactly as before.
 	applyDatasetACLParams(params, nfsACLOptionsFromContext(ctx))
+	// Encryption at rest (GF-Sprint 1): fold the request-scoped resolution into
+	// the SINGLE pool.dataset.create call (P-1/P-2 shape, +0 RTT vs plaintext).
+	// No-op for a plaintext create, so the payload is byte-identical to
+	// pre-encryption. The passphrase rides only in this call.
+	applyEncryptionToCreateParams(ctx, params)
 	postCreateProperties := make(map[string]string, len(params.UserProperties)+1)
 	for _, property := range params.UserProperties {
 		postCreateProperties[property.Key] = property.Value
@@ -3934,6 +4026,13 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext); err != nil {
 			return nil, err
 		}
+	}
+
+	// Encryption at rest (GF-Sprint 1): expose ONLY the algorithm marker so
+	// consumers can tell the volume is encrypted. The passphrase is never written
+	// to the volume context — it is persisted in the PV.
+	if algorithm := storedEncryptionAlgorithm(ds); algorithm != "" {
+		volumeContext[volumeContextEncryptionKey] = algorithm
 	}
 
 	return volumeContext, nil

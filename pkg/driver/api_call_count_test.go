@@ -177,6 +177,26 @@ func (c *apiCallCountingClient) DatasetGetQuotaUsage(ctx context.Context, name s
 	return c.MockClient.DatasetGetQuotaUsage(ctx, name)
 }
 
+func (c *apiCallCountingClient) DatasetLock(ctx context.Context, name string) error {
+	c.record("DatasetLock")
+	return c.MockClient.DatasetLock(ctx, name)
+}
+
+func (c *apiCallCountingClient) DatasetUnlock(ctx context.Context, name, passphrase string) error {
+	c.record("DatasetUnlock")
+	return c.MockClient.DatasetUnlock(ctx, name, passphrase)
+}
+
+func (c *apiCallCountingClient) DatasetChangeKey(ctx context.Context, name, passphrase string) error {
+	c.record("DatasetChangeKey")
+	return c.MockClient.DatasetChangeKey(ctx, name, passphrase)
+}
+
+func (c *apiCallCountingClient) DatasetEncryptionSummary(ctx context.Context, name string) ([]truenas.EncryptionSummaryEntry, error) {
+	c.record("DatasetEncryptionSummary")
+	return c.MockClient.DatasetEncryptionSummary(ctx, name)
+}
+
 func (c *apiCallCountingClient) GetPoolAvailable(ctx context.Context, poolName string) (int64, error) {
 	c.record("GetPoolAvailable")
 	return c.MockClient.GetPoolAvailable(ctx, poolName)
@@ -823,6 +843,18 @@ func apiCallCountCHAPVolumeRequest(name string) *csi.CreateVolumeRequest {
 	return req
 }
 
+// apiCallCountEncryptionVolumeRequest builds an NFS CreateVolume request that
+// opts into encryption: the StorageClass parameter plus a per-StorageClass secret
+// carrying a valid >=8 char passphrase. The secret value is a test fixture only.
+func apiCallCountEncryptionVolumeRequest(name string) *csi.CreateVolumeRequest {
+	req := apiCallCountVolumeRequest(name, "nfs")
+	req.Parameters[paramEncryption] = "true"
+	req.Secrets = map[string]string{
+		"passphrase": "enc-passphrase-1",
+	}
+	return req
+}
+
 func assertAPICallCount(t *testing.T, operation string, client *apiCallCountingClient, want int) {
 	t.Helper()
 	got, methods := client.callSnapshot()
@@ -850,7 +882,10 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// chap additionally enables iscsi.chap.enabled on the driver so the
 		// CHAP peer-ensure path runs (the request must also carry a secret).
 		chap bool
-		run  func(*testing.T, *apiCallCountingClient, *Driver)
+		// encryption additionally enables encryption.enabled on the driver so the
+		// create-time encryption fold runs (the request must also carry a secret).
+		encryption bool
+		run        func(*testing.T, *apiCallCountingClient, *Driver)
 	}{
 		// Six calls: existence lookup; DatasetCreate; the createDataset ownership
 		// stamp via pool.dataset.update; the one-time post-connect re-read that
@@ -866,6 +901,16 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// guards, so 6 is the safe floor.
 		{name: "CreateVolume fresh NFS", want: 6, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-nfs", "nfs"))
+			require.NoError(t, err)
+		}},
+		// SIX calls — identical to the plaintext NFS create (+0 RTT, E-5 golden).
+		// Encryption folds into the SINGLE pool.dataset.create call (inline
+		// encryption_options, P-1) and the algorithm marker folds into the SAME
+		// fatal managed-property update that already stamps ownership/provision, so
+		// it adds no round trip. The passphrase rides in the create call and is
+		// never a separate API call or a dataset property.
+		{name: "CreateVolume fresh NFS encrypted", want: 6, encryption: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+			_, err := d.CreateVolume(context.Background(), apiCallCountEncryptionVolumeRequest("fresh-nfs-enc"))
 			require.NoError(t, err)
 		}},
 		// Fourteen calls: existence DatasetGet; DatasetCreate (zvol); the
@@ -1222,6 +1267,9 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			d := newAPICallCountDriver(t, client, protocol)
 			if tc.chap {
 				d.config.ISCSI.CHAP.Enabled = true
+			}
+			if tc.encryption {
+				d.config.Encryption.Enabled = true
 			}
 			tc.run(t, client, d)
 			assertAPICallCount(t, tc.name, client, tc.want)
