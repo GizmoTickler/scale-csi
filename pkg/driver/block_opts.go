@@ -47,6 +47,13 @@ const (
 // an operator to record one.
 const validISCSIBlocksizeList = "512, 1024, 2048, 4096"
 
+// zfsUserPropertyNoValue is ZFS's "no value" rendering. Every read path in this
+// file treats it as ABSENT, so writing it as a value is how a record is stated
+// to be empty on an object that would otherwise inherit one — the only way to
+// say "this snapshot captured no geometry" about a snapshot of a stamped volume,
+// since a ZFS snapshot inherits its dataset's user properties.
+const zfsUserPropertyNoValue = "-"
+
 // validISCSIBlocksize is the SINGLE domain for a logical block size, applied to
 // a StorageClass parameter, a stored dataset stamp and a snapshot-captured stamp
 // alike (round 6).
@@ -1461,10 +1468,6 @@ func guardRequestAgainstEvidence(request *blockOpts, evidence blockGeometry, dat
 	return nil
 }
 
-// unknownGeometryError is the iSCSI fail-closed message for rule (a). It names
-// both iSCSI properties because a record that resolves only logical is the
-// half-resolved state that lets physical come from the mutable controller
-// default.
 // errGeometryUnestablishable marks the PERMANENT form of the geometry refusal:
 // no retry converges it — only an operator restoring the extent or recording the
 // real geometry (zfs set) clears it. The startup attachment reconcile detects
@@ -1479,6 +1482,10 @@ func (e errGeometryUnestablishable) Error() string              { return e.err.E
 func (e errGeometryUnestablishable) Unwrap() error              { return e.err }
 func (e errGeometryUnestablishable) GRPCStatus() *status.Status { return status.Convert(e.err) }
 
+// unknownGeometryError is the iSCSI fail-closed message for rule (a). It names
+// both iSCSI properties because a record that resolves only logical is the
+// half-resolved state that lets physical come from the mutable controller
+// default.
 func (d *Driver) unknownGeometryError(datasetName, reason string) error {
 	return errGeometryUnestablishable{err: status.Errorf(codes.FailedPrecondition,
 		"cannot create the iSCSI extent for %s: %s, so the driver cannot establish the geometry its data is addressed "+
@@ -1558,6 +1565,9 @@ func validateExtentAgainstGeometry(extent *truenas.ISCSIExtent, geometry extentG
 //     snapshot is taken from the source's current state moments later, so the
 //     source's live extent IS the layout, and reconcileSourceGeometry answers.
 //
+// A NON-iSCSI destination still asks ONE question before it short-circuits, and
+// only of the record it already holds: see guardCrossProtocolBlockGeometry.
+//
 // sourceDS may be supplied by a caller that already queried the source (the
 // volume-clone path does), which saves the DatasetGet there. NFS short-circuits
 // before any API call, so no filesystem path pays for this.
@@ -1570,6 +1580,11 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 	shareType ShareType,
 ) (blockGeometry, error) {
 	if shareType != ShareTypeISCSI {
+		if shareType == ShareTypeNVMeoF {
+			if guardErr := guardCrossProtocolBlockGeometry(sourceDS, snap, sourceRef, datasetName); guardErr != nil {
+				return blockGeometry{}, guardErr
+			}
+		}
 		return blockGeometry{knowledge: geometryUnexamined}, nil
 	}
 
@@ -1646,6 +1661,71 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 	}
 }
 
+// platformLogicalBlocksize is the logical block size a zvol is addressed
+// through when nothing has claimed a different one: the extent default, and the
+// value an NVMe-oF namespace's LBA format is derived at on this platform. It is
+// the ONLY recorded source geometry a cross-protocol restore can carry without
+// changing how the destination's bytes are addressed.
+const platformLogicalBlocksize = 512
+
+// guardCrossProtocolBlockGeometry is the one geometry question an NVMe-oF
+// destination asks, and it exists because the two resolvers short-circuit on the
+// DESTINATION's share type.
+//
+// That short-circuit is correct for an NVMe-oF SOURCE — this client's namespace
+// create/query surface exposes no block-size option or field, so the iSCSI
+// extent resolver has nothing to say about it. But it also meant an iSCSI source
+// restored into an NVMe-oF class was examined not at all, while the reverse
+// direction (an NVMe-oF source into an iSCSI class) fails closed on
+// blockDataFreeProof. That asymmetry is silent, and Kubernetes places no
+// same-class restriction on restoring a VolumeSnapshot, so a 4096-byte iSCSI
+// volume whose filesystem and partition table are laid out for 4096-byte
+// logical blocks can be restored into an NVMe-oF class whose namespace reports
+// whatever the platform derives. Same bytes, different addressing.
+//
+// The refusal is therefore driven by the source's RECORD, not by a new probe: a
+// snapshot answers from the geometry it captured, a volume clone from the
+// source's stamp, and both are already in the caller's hand. Nothing is read
+// here, so an NVMe-oF -> NVMe-oF clone, a restore of a snapshot that captured no
+// geometry, and a fresh NVMe-oF create all stay at zero extra calls. A record of
+// platformLogicalBlocksize is what an unclaimed zvol is addressed through
+// anyway and is never refused.
+func guardCrossProtocolBlockGeometry(sourceDS *truenas.Dataset, snap *truenas.Snapshot, sourceRef, datasetName string) error {
+	var recorded blockGeometry
+	switch {
+	case snap != nil:
+		recorded = snapshotGeometry(snap)
+	case sourceDS != nil:
+		recorded = stampGeometry(blockOptsFromDataset(sourceDS),
+			fmt.Sprintf("clone source %s's recorded geometry stamp", sourceRef))
+	default:
+		// No record in hand and none worth a round trip: an unrecorded source
+		// claims nothing to contradict, exactly as before.
+		return nil
+	}
+	return refuseCrossProtocolBlockGeometry(recorded, sourceRef, datasetName)
+}
+
+// refuseCrossProtocolBlockGeometry renders the cross-protocol refusal for a
+// source record that is already resolved. It refuses on the recorded LOGICAL
+// size alone: physical-blocksize reporting is a hint to the initiator, while the
+// logical size is what the filesystem's addressing was laid out against.
+func refuseCrossProtocolBlockGeometry(recorded blockGeometry, sourceRef, datasetName string) error {
+	if recorded.blocksize == nil || *recorded.blocksize == platformLogicalBlocksize {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"cannot create NVMe-oF volume %s from %s: %s records that its data is addressed through %d-byte logical blocks, and "+
+			"this driver makes no namespace geometry claim — an NVMe-oF namespace's LBA format is whatever the zvol and the "+
+			"platform derive, which is not provably the %d these bytes were written against. Presenting them through a "+
+			"different logical block size misaddresses the filesystem and partition table laid out on them, so the driver "+
+			"refuses rather than creating a namespace over a geometry it cannot state. Restore into an iSCSI StorageClass, "+
+			"which re-creates the recorded %d-byte geometry over the same bytes; a source recorded at %d, or carrying no "+
+			"geometry record at all, claims nothing to contradict and is never refused",
+		datasetName, sourceRef, recorded.provenance, *recorded.blocksize, *recorded.blocksize, *recorded.blocksize,
+		platformLogicalBlocksize)
+}
+
 // snapshotGeometryProps renders the iSCSI geometry a new snapshot of
 // datasetName must capture so that a later restore has provenance tied to the
 // snapshot rather than to whatever the source looks like at restore time.
@@ -1654,7 +1734,9 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 // exactly one direction: a snapshot whose geometry could not be captured is
 // still taken, and restoring it later fails CLOSED
 // (resolveCloneSourceBlockGeometry) instead of guessing. A missed capture
-// therefore costs availability, never integrity.
+// therefore costs availability, never integrity. Making that true requires
+// WRITING the no-value sentinel rather than writing nothing — see the read-error
+// arm below.
 //
 // A DISAGREEMENT is not best-effort. It fails the snapshot.
 //
@@ -1672,8 +1754,15 @@ func (d *Driver) resolveCloneSourceBlockGeometry(
 //   - Round 5 also skipped the live probe entirely unless storedBlockProtocol
 //     found a target or target-extent ID, so an iSCSI zvol missing those two
 //     properties — the imported, the stripped, the pre-GF4 — captured nothing at
-//     all. The iSCSI probe is driven by the source protocol, including an
-//     iSCSI zvol with those target properties missing.
+//     all. fix7 widened that gate by one property (PropISCSIExtentID), so a zvol
+//     that kept only its extent identity is now probed. The rule, stated
+//     exactly: the probe runs when the dataset is a ZFS VOLUME and
+//     storedBlockProtocol resolves iSCSI from ANY of the three IDs
+//     (PropISCSITargetID, PropISCSIExtentID, PropISCSITargetExtentID). A zvol
+//     carrying NONE of the three reads as NFS to shareTypeForPublishedVolume
+//     (controller.go) and still captures nothing — which is safe but not free:
+//     restores of such a snapshot fail closed on
+//     resolveCloneSourceBlockGeometry's "records no geometry of its own" arm.
 //
 // Cost: nil (no call) for a filesystem dataset and for an NVMe-oF volume. An
 // iSCSI zvol pays one ISCSIExtentFindByDisk, including a volume that already
@@ -1685,14 +1774,27 @@ func (d *Driver) snapshotGeometryProps(ctx context.Context, ds *truenas.Dataset,
 	stamped := stampGeometry(blockOptsFromDataset(ds), "the volume's recorded geometry stamp")
 	extent, err := d.truenasClient.ISCSIExtentFindByDisk(ctx, "zvol/"+datasetName)
 	if err != nil {
-		// Capture NOTHING. The stamp alone is exactly the unverified record the
-		// round-6 live read exists to check: returning it here would let a
-		// transient read error capture a stale 4096 onto bytes re-addressed at
-		// 512, and a restore would then act on it. An empty capture makes that
-		// restore fail closed instead — availability, never integrity.
-		klog.Warningf("Could not capture the live iSCSI geometry of %s onto its snapshot; capturing no geometry, so "+
-			"a later restore of it will fail closed rather than act on the unverified stamp: %v", datasetName, err)
-		return nil, nil
+		// Record NO GEOMETRY — and say so EXPLICITLY, because returning an empty
+		// map does not achieve that. The stamp alone is exactly the unverified
+		// record the round-6 live read exists to check: acting on it here would
+		// let a transient read error capture a stale 4096 onto bytes re-addressed
+		// at 512, and a restore would then act on it.
+		//
+		// A ZFS snapshot holds the dataset's user properties as of the instant it
+		// was taken, so a stamped volume's snapshot INHERITS block_blocksize /
+		// block_pblocksize whatever this function returns. Capturing an empty map
+		// therefore leaves the unverified stamp readable on the snapshot and
+		// changes nothing. The two keys are instead written with ZFS's no-value
+		// sentinel, which snapshotGeometry reads as "this snapshot records no
+		// geometry of its own" — so the restore fails closed on that arm.
+		// Availability, never integrity.
+		klog.Warningf("Could not capture the live iSCSI geometry of %s onto its snapshot; recording NO geometry on it "+
+			"(overriding the inherited stamp), so a later restore of it will fail closed rather than act on the "+
+			"unverified stamp: %v", datasetName, err)
+		return map[string]string{
+			PropBlockISCSIBlocksize:  zfsUserPropertyNoValue,
+			PropBlockISCSIPblocksize: zfsUserPropertyNoValue,
+		}, nil
 	}
 	// The live extent FIRST: it is what the bytes are addressed through right
 	// now, which is what this snapshot's content is. The stamp only fills a field
