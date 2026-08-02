@@ -986,7 +986,13 @@ func datasetVolumeID(datasetName string) string {
 // snapshot is preserved — but the DeleteVolume refusal's advice ("delete them,
 // or exclude the CSI parent dataset from snapshot tasks") is actively wrong for
 // them, so the count is surfaced to the operator instead of being swallowed.
-func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *truenas.Dataset, corroboratingTaskSchema string, nasZone *time.Location) (foreign []*truenas.Snapshot, unproven int) {
+//
+// meter gates the counter and its warning. DeleteVolume classifies twice —
+// once before the share delete and again on the fresh post-share-delete list —
+// and only the first pass may meter, or one refusal double-increments
+// scale_csi_scheduled_snapshot_unproven_total and double-logs every snapshot.
+// The returned unproven count is unaffected.
+func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *truenas.Dataset, corroboratingTaskSchema string, nasZone *time.Location, meter bool) (foreign []*truenas.Snapshot, unproven int) {
 	opts := deleteAuthorizingProvenanceOptions(corroboratingTaskSchema, nasZone)
 	foreign = make([]*truenas.Snapshot, 0, len(snapshots))
 	for _, snap := range snapshots {
@@ -995,9 +1001,11 @@ func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *tr
 		}
 		if reason := scheduledSnapshotUnprovenReason(snap, dataset, d.driverInstanceID(), opts); reason != "" {
 			unproven++
-			RecordScheduledSnapshotUnproven(reason)
-			klog.Warningf("Snapshot %s carries volume dataset %s's own driver-scheduled naming shape but failed the %q provenance link; it is preserved as FOREIGN and will block a default DeleteVolume (scale_csi_scheduled_snapshot_unproven_total{reason=%q})",
-				snapshotShortName(snap), dataset.Name, reason, reason)
+			if meter {
+				RecordScheduledSnapshotUnproven(reason)
+				klog.Warningf("Snapshot %s carries volume dataset %s's own driver-scheduled naming shape but failed the %q provenance link; it is preserved as FOREIGN and will block a default DeleteVolume (scale_csi_scheduled_snapshot_unproven_total{reason=%q})",
+					snapshotShortName(snap), dataset.Name, reason, reason)
+			}
 		}
 		foreign = append(foreign, snap)
 	}

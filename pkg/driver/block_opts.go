@@ -1732,11 +1732,14 @@ func refuseCrossProtocolBlockGeometry(recorded blockGeometry, sourceRef, dataset
 //
 // A failure to READ the live geometry is best-effort, and that is safe in
 // exactly one direction: a snapshot whose geometry could not be captured is
-// still taken, and restoring it later fails CLOSED
-// (resolveCloneSourceBlockGeometry) instead of guessing. A missed capture
-// therefore costs availability, never integrity. Making that true requires
-// WRITING the no-value sentinel rather than writing nothing — see the read-error
-// arm below.
+// still taken, and an iSCSI restore of it later fails CLOSED
+// (resolveCloneSourceBlockGeometry) instead of guessing — availability, not
+// integrity. Making that true requires WRITING the no-value sentinel rather
+// than writing nothing — see the read-error arm below. SCOPE: the cross-protocol
+// guard refuses only a POSITIVE non-512 record, so a restore of this
+// geometry-less snapshot into an NVMe-oF class is NOT covered by it — that
+// restore keeps exactly the unguarded pre-GF4 exposure (the platform derives
+// the namespace LBA format unchecked).
 //
 // A DISAGREEMENT is not best-effort. It fails the snapshot.
 //
@@ -1786,8 +1789,10 @@ func (d *Driver) snapshotGeometryProps(ctx context.Context, ds *truenas.Dataset,
 		// therefore leaves the unverified stamp readable on the snapshot and
 		// changes nothing. The two keys are instead written with ZFS's no-value
 		// sentinel, which snapshotGeometry reads as "this snapshot records no
-		// geometry of its own" — so the restore fails closed on that arm.
-		// Availability, never integrity.
+		// geometry of its own" — so an iSCSI restore fails closed on that arm
+		// (availability, not integrity). An NVMe-oF restore of it is outside the
+		// cross-protocol guard (which needs a positive non-512 record) and keeps
+		// the pre-GF4 exposure — see the function comment.
 		klog.Warningf("Could not capture the live iSCSI geometry of %s onto its snapshot; recording NO geometry on it "+
 			"(overriding the inherited stamp), so a later restore of it will fail closed rather than act on the "+
 			"unverified stamp: %v", datasetName, err)

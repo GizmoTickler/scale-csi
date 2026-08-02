@@ -479,8 +479,11 @@ against. Provenance is therefore tied to the snapshot itself:
   both keys are written with ZFS's `-` no-value sentinel. Writing nothing would
   not be enough — a snapshot inherits its dataset's user properties, and the
   volume's unverified stamp is precisely what the live read exists to check.
-  Restoring such a snapshot fails closed (below), with the same recovery. A
-  missed capture costs availability, never integrity.
+  Restoring such a snapshot into an iSCSI class fails closed (below), with the
+  same recovery — availability, not integrity. Restoring it into an **NVMe-oF**
+  class is outside the cross-protocol guard, which refuses only a positively
+  recorded non-512 geometry: that restore keeps the unguarded pre-GF4 behavior
+  (the platform derives the namespace LBA format unchecked).
 - An iSCSI snapshot that captured **no** geometry, whose source shows any history
   of having been block-addressed, **fails `FailedPrecondition`**. The driver will
   not lay a guessed geometry over a snapshot's data. A snapshot of a

@@ -533,8 +533,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// says nothing about that existing dataset. Above the check it gated replays
 	// too, so an appliance missing NFSV4 failed every retry of an
 	// already-successful volume. createVolumeExisting has returned by here, so
-	// reaching this point means a real create — exactly the case the preflight is
-	// meant to stop before anything is provisioned.
+	// reaching this point means the dataset does not exist yet — a fresh create
+	// or content-source materialization, exactly the case the preflight is meant
+	// to stop before anything is provisioned. Known scope limit: a create whose
+	// dataset landed but which crashed before finishing resumes through
+	// createVolumeExisting and therefore skips the preflight; that volume was
+	// already materialized, so refusing it would strand storage, not save it.
 	if shareType == ShareTypeNFS {
 		if preflightErr := d.preflightNFSVersion(ctx, mountFlagsFromCapabilities(req.GetVolumeCapabilities())); preflightErr != nil {
 			return nil, preflightErr
@@ -1422,7 +1426,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		scheduledZone = d.scheduledSnapshotZone(ctx, ds, datasetName)
 	}
 
-	foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
+	foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone, true)
 	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(foreignSnapshots) > 0 {
 		klog.Infof("Volume %s has non-CSI snapshots and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion", volumeID)
 		return nil, status.Error(codes.FailedPrecondition, foreignSnapshotRefusalMessage(volumeID, unprovenSnapshots))
@@ -1512,7 +1516,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// and never respect the foreign-preserve policy (R4); only genuinely
 			// foreign snapshots are preserved by default (recursive deletion of
 			// them is an explicit operator opt-in).
-			foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
+			// meter=false: the pre-share-delete pass above already counted and
+			// logged these; this fresh list exists to catch snapshots that
+			// appeared after that check, not to re-report the same ones.
+			foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone, false)
 			if len(foreignSnapshots) > 0 && !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
 				return nil, status.Error(codes.FailedPrecondition, foreignSnapshotRefusalMessage(volumeID, unprovenSnapshots))
 			}

@@ -329,8 +329,12 @@ Two consequences worth knowing:
   snapshot is still taken but explicitly records **no** geometry — the two keys
   are written with ZFS's `-` no-value sentinel, because a snapshot otherwise
   inherits its dataset's stamp and an unverified stamp is exactly what the live
-  read exists to check. Restoring such a snapshot fails closed with the same
-  `zfs set` recovery. This costs availability, never integrity.
+  read exists to check. An iSCSI restore of such a snapshot fails closed with
+  the same `zfs set` recovery — availability, not integrity. One scope limit: a
+  cross-protocol restore of that geometry-less snapshot into an NVMe-oF class is
+  outside the cross-protocol guard (which refuses only a positively recorded
+  non-512 geometry) and keeps the unguarded pre-GF4 exposure — the platform
+  derives the namespace LBA format unchecked.
 
 Snapshots taken before v1.5.0 carry no captured geometry. Restoring one into an
 iSCSI class succeeds as long as its source volume is still readable and
