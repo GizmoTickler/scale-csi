@@ -26,6 +26,7 @@ All protocols use the unified provisioner `csi.scale.io`.
 | `nfsACL` | Explicit NFSv4 dacl as a JSON array | No; mutually exclusive with `nfsACLTemplate` |
 | `nfsACLMode` | `PASSTHROUGH` (default) or `RESTRICTED` — the dataset's `aclmode` | No; requires `nfsACLTemplate` or `nfsACL` |
 | `zfsPerformanceClass` | `database`, `media`, `vm`, `backup`, `general` — a curated ZFS property preset | No; unset inherits the parent dataset's properties. **Ignored on volumes restored/cloned from a content source** |
+| `encryption` | `"true"` — create the volume with ZFS-native encryption at rest (GF-Sprint 1) | No; requires `encryption.enabled` and a per-class encryption Secret. **Create-time only; cannot combine with a content source.** See [Encryption at rest](#encryption-at-rest) |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -1080,6 +1081,177 @@ restarting the controller never changes an existing volume's authmethod.
 - **Secrets are never persisted in the PV.** The only CHAP-related volume-context
   key is a non-secret mode flag (`chap: CHAP|CHAP_MUTUAL`); credentials are
   redacted from all logs and errors.
+
+## Encryption at rest
+
+ZFS-native encryption at rest (GF-Sprint 1) is strictly opt-in and is configured
+per StorageClass. It works for NFS filesystems and for iSCSI/NVMe-oF zvols alike
+(both dataset types were probed creating encrypted on nas01, 26.0.0-BETA.1). Two
+things must be true for a class to use it:
+
+1. The controller is opted in via Helm (`encryption.enabled: true`). With this
+   off (the default), nothing encryption-related is parsed, stamped, or called,
+   and every volume provisions plaintext.
+2. The StorageClass references a Kubernetes Secret holding the passphrase, via
+   the standard CSI secret-ref parameters. The chart renders them from a
+   `storageClasses[]` entry that sets `encryptionSecretName` (and optional
+   `encryptionSecretNamespace`, defaulting to the release namespace); see the
+   bundled `scale-nfs-encrypted` example in `values.yaml`.
+
+The StorageClass parameter that opts a class in is `encryption: "true"`. The
+chart emits it automatically when `encryptionSecretName` is set, alongside the
+three CSI secret refs the driver uses:
+
+- `csi.storage.k8s.io/provisioner-secret-*` — read at `CreateVolume` to fold the
+  passphrase into the single `pool.dataset.create` call (+0 RTT vs a plaintext
+  create);
+- `csi.storage.k8s.io/controller-publish-secret-*` — read at
+  `ControllerPublishVolume` to unlock before the share/extent is built, and the
+  ref the locked-volume reconciler resolves the passphrase through;
+- `csi.storage.k8s.io/node-stage-secret-*` — emitted for parity with the CHAP
+  block; the node has no TrueNAS client and never unlocks.
+
+The chart references the Secret by name/namespace only. The passphrase is never
+templated into the chart, the ConfigMap, the PV, a log line, a gRPC status, a
+Kubernetes Event, or a dataset property. The only encryption-related
+volume-context key is a non-secret algorithm marker (e.g. `encryption:
+AES-256-GCM`).
+
+### The encryption Secret
+
+One Secret per StorageClass, shared by all volumes of that class. The driver
+validates the Secret locally and rejects it with `InvalidArgument` **before**
+calling TrueNAS, so a bad Secret fails fast instead of surfacing as a backend
+error. The keys are:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: scale-nfs-encrypted
+  namespace: scale-csi
+stringData:
+  passphrase:         "correct-horse-battery"   # required, >= 8 characters (ZFS minimum)
+  passphrasePrevious: "old-passphrase-here"     # optional; opens the rotation window
+  algorithm:          "AES-256-GCM"             # optional; default AES-256-GCM
+  pbkdf2iters:        "1300000"                 # optional; positive integer override
+```
+
+- `passphrase` is required and must be **at least 8 characters** — the ZFS
+  minimum. The driver enforces this on the exact, untrimmed value before any API
+  call.
+- `algorithm` defaults to `AES-256-GCM`. The accepted set is exactly what
+  `pool.dataset.encryption_algorithm_choices` returns on the probed backend:
+  `AES-128-CCM`, `AES-192-CCM`, `AES-256-CCM`, `AES-128-GCM`, `AES-192-GCM`,
+  `AES-256-GCM`. Anything else is rejected before any API call.
+- `pbkdf2iters` overrides the key-derivation iteration count (the backend
+  default is 1,300,000). Higher values add unlock CPU latency; unlock is off the
+  steady-state I/O path, so the default is acceptable.
+- `passphrasePrevious` is optional and only meaningful during rotation (below).
+
+### Encryption is create-time only
+
+Encryption is immutable for the life of a volume. There is **no in-place
+encryption** of an existing plaintext volume, and an idempotent `CreateVolume`
+replay that would flip a volume encrypted↔plaintext is rejected with
+`FailedPrecondition`.
+
+A volume materialized from a content source (a `dataSource` snapshot restore or
+clone) **cannot be encrypted**: the driver refuses `encryption` together with a
+volume content source at `CreateVolume`, before any mutation, with
+`InvalidArgument`. The bytes of a restored volume come from its origin and carry
+the origin's encryption state; stamping a fresh key the inherited bytes do not
+hold would be a lie the immutability guard later treats as ground truth. To get
+an encrypted volume from existing data, restore into a **plaintext** class and
+create a new encrypted volume, or take the restore-to-plaintext path and
+re-encrypt out of band.
+
+### ⚠ A locked dataset serves zero I/O (the availability model)
+
+This is the thing to read before enabling encryption. TrueNAS does **not**
+persist a passphrase key — `pool.dataset.encryption_summary` reports
+`key_present_in_database: false` for a passphrase dataset. The passphrase lives
+only in your Kubernetes Secret; nothing on the appliance can re-derive the key.
+
+The consequences, in plain words:
+
+- **A nas01 reboot locks every encrypted volume.** Because the key is not in the
+  TrueNAS database, every passphrase dataset comes back from a reboot LOCKED,
+  and nothing on the appliance auto-unlocks it. A locked zvol has **no backing
+  block device** (`/dev/zvol/<name>` is gone), and a locked filesystem has
+  `mountpoint: null` — so a locked volume serves no I/O at all.
+- **The controller re-unlocks best-effort, not by guarantee.** An unlock
+  reconciler runs at startup and on every reconcile pass: it lists managed
+  datasets stamped encrypted, finds the ones reported locked, resolves each
+  dataset's PV → StorageClass → controller-publish-secret → passphrase, and
+  unlocks. Unlock is gated on `locked == true` first, because unlocking an
+  already-unlocked dataset returns a FAILED job (it is not idempotent). This is a
+  reconvergence, not an SLA: **recovery latency is the reconcile interval**, and
+  during the window the affected pods see I/O errors (EIO).
+- **Pair encrypted classes with pod restart policy.** Running pods do not
+  re-stage on their own once the dataset is unlocked underneath them. Use pod
+  liveness probes / `restartPolicy` so a pod that hit EIO re-stages and recovers
+  after the reconciler re-unlocks. An operator who cannot tolerate the
+  reboot-to-re-unlock window should not encrypt.
+- **Publish unlocks before the share is built.** `ControllerPublishVolume`
+  unlocks (when locked) before `ensureShareExists`, so an extent always has a
+  backing device before fencing converges. If unlock never happens, the node
+  side fails closed: `NodeStageVolume` waits for a device that never appears and
+  errors, and an NFS mount of a `mountpoint: null` export fails. There is no
+  node-side unlock.
+- **Health surfaces the hazard.** A locked encrypted volume reports an abnormal
+  `VolumeCondition` ("dataset locked") through `ControllerGetVolume` /
+  `ListVolumes`, so Kubernetes and the Grafana dashboard show it.
+
+### ⚠ **Lost Secret = permanent data loss**
+
+**The Kubernetes Secret is the sole store for the passphrase. There is no
+TrueNAS-side escrow. If you delete the Secret, or rotate the passphrase away
+with no copy of the old one, the data is unrecoverable — not locked, not
+degraded, gone.** Back up the Secret (or keep it in an external secret store),
+and use the `passphrasePrevious` rotation window below so a rotation never
+discards the only working key. The driver never auto-deletes the Secret.
+
+### Key rotation
+
+Update the Secret's `passphrase` and keep the old value in `passphrasePrevious`.
+On the next `ControllerPublishVolume` unlock the driver tries `passphrase`
+first; if that fails and `passphrasePrevious` is present, it unlocks with the
+previous passphrase and then calls `pool.dataset.change_key` to rotate to the
+new one (`change_key` requires the dataset unlocked first). Once rotated, the
+old passphrase is dead, so a replay lands on the `passphrase`-succeeds branch —
+rotation is idempotent by outcome. A redacted Event records a successful
+rotation; the passphrase itself never appears in it. If both passphrases fail,
+the publish fails closed with `FailedPrecondition`. There is no CSI rotate RPC
+and no node-side rotation path; rotation is controller-side only.
+
+### Clones inherit the origin's key
+
+A `snapshotRestoreMode: clone` volume created from an encrypted origin is
+encrypted, but its `encryption_root` is the **origin**, not the clone: the clone
+inherits the parent's key and is **not** independently keyed. Locking the origin
+locks the clone, and a clone cannot be re-keyed on its own (`change_key` on an
+inheriting child is refused by ZFS). Deleting or locking the origin therefore
+affects its clones.
+
+For encrypted classes, prefer `snapshotRestoreMode: detached` (a full send/recv
+copy with its own `encryption_root` and its own key) over `clone`, unless you
+deliberately want the clone to share the origin's key and lock state. Note that a
+detached restore is itself a content source, so it is created **plaintext** (the
+create-time-only rule above); the point of choosing detached is key independence
+of the restored copy, not encryption of it.
+
+### ⚠ Do not roll back below encryption support
+
+Downgrading the driver below the version that ships encryption while encrypted
+volumes are live leaves those volumes stranded: the older driver has no unlock
+logic, so `ControllerPublishVolume` will not unlock a locked dataset and the
+share/extent build fails — the volume is DEAD (though not lost; the keys are
+still safe in the Secret). The `truenas-csi:encryption` user-property the driver
+stamps is ignored by older drivers, so the rollback itself is safe; the hazard is
+running encrypted volumes under a driver that cannot unlock them. Manual
+`pool.dataset.unlock` recovers a stranded volume. Plaintext volumes are
+unaffected either way.
 
 ## NVMe-oF
 

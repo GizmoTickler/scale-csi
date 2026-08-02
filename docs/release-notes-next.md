@@ -1,4 +1,140 @@
-# Release notes — v1.5.1
+# Release notes — v1.6.0
+
+## v1.6.0 — GF-Sprint 1: per-volume encryption at rest
+
+One theme: **ZFS-native encryption at rest, opt-in per StorageClass, default
+off.** A class that sets none of the new keys provisions the byte-identical
+pre-encryption payload, the default Helm render is unchanged, and a deployment
+that never touches encryption behaves exactly as before. Encryption is folded
+into the single `pool.dataset.create` call (+0 RTT vs a plaintext create) and
+works for NFS filesystems and iSCSI/NVMe-oF zvols alike. Everything here is
+grounded in live nas01 probes (26.0.0-BETA.1, 2026-07-31); the API shapes are
+pinned to that date and the backend is a BETA, so the drill is re-run before GA.
+
+**Encryption is an availability hazard, not just a confidentiality feature.** A
+locked dataset serves ZERO I/O. Read the upgrade note and the risk register
+below before enabling it.
+
+### ⚠ Upgrade note — encryption is default off, and stays that way
+
+The controller-wide gate `encryption.enabled` defaults to `false`. With it off,
+nothing encryption-related is parsed, stamped, or called, no `encryption:` block
+renders into the ConfigMap, and a rolled-back binary that has no encryption
+field still strict-parses the rendered config. A class opts in by setting
+`encryptionSecretName`; the chart then emits the `encryption: "true"` parameter
+and the provisioner / controller-publish / node-stage CSI secret refs (name and
+namespace only — the passphrase is never templated into the chart or the
+ConfigMap). Upgrading changes nothing for an install that does not opt in.
+
+### Per-volume encryption, per StorageClass
+
+- **The Secret contract.** One Kubernetes Secret per class, shared by all of its
+  volumes. Keys: `passphrase` (required, **≥ 8 characters**, the ZFS minimum),
+  `passphrasePrevious` (optional rotation window), `algorithm` (optional,
+  default `AES-256-GCM`, validated against the probed backend choice set
+  `{AES-128-CCM, AES-192-CCM, AES-256-CCM, AES-128-GCM, AES-192-GCM,
+  AES-256-GCM}`), and `pbkdf2iters` (optional positive-integer override). The
+  driver validates the Secret and rejects a bad one with `InvalidArgument`
+  **before** any API call.
+- **Create-time only.** Encryption is immutable for the life of a volume. There
+  is no in-place encryption of an existing plaintext volume, and an idempotent
+  `CreateVolume` replay that would flip encrypted↔plaintext is refused with
+  `FailedPrecondition`. An encrypted create that also carries a content source
+  (snapshot restore or clone) is refused with `InvalidArgument` before any
+  mutation — restored bytes carry the origin's encryption state, so the driver
+  will not stamp a key they do not hold. Restore to a plaintext class, or create
+  new.
+- **The passphrase is radioactive.** It exists only in the Secret, the
+  short-lived parse, and request-scoped context. It never reaches a log, a gRPC
+  status, a Kubernetes Event, the PV's `volumeContext`, or a dataset
+  user-property. The only encryption-related volume-context key is a non-secret
+  algorithm marker; the durable per-volume stamp is `truenas-csi:encryption =
+  <algorithm>`, never the key.
+
+### The availability model (read before enabling)
+
+TrueNAS does **not** persist a passphrase key (`encryption_summary` reports
+`key_present_in_database: false`), so the passphrase lives only in your Secret.
+
+- **A nas01 reboot locks every encrypted volume**, and nothing on the appliance
+  auto-unlocks it. A locked zvol has no backing block device; a locked
+  filesystem has `mountpoint: null`. Both serve no I/O.
+- **The unlock reconciler is best-effort, not a guarantee.** It runs at startup
+  and on every reconcile pass, lists managed datasets stamped encrypted, gates on
+  `encryption_summary.locked == true` (unlock is NOT idempotent — unlocking an
+  unlocked dataset returns a FAILED job), resolves PV → StorageClass →
+  controller-publish-secret → passphrase, and unlocks. **Recovery latency is the
+  reconcile interval; during the window the affected pods see EIO.** Pair
+  encrypted classes with pod liveness/restart so a pod that hit EIO re-stages
+  after unlock. An operator who cannot tolerate that window should not encrypt.
+- **Publish unlocks before the share is built**, so an extent always has a
+  backing device before fencing converges. There is no node-side unlock (the node
+  has no TrueNAS client); if unlock never happens, `NodeStageVolume` fails closed
+  waiting for a device that never appears.
+- **Health surfaces it.** A locked encrypted volume reports an abnormal
+  `VolumeCondition` through `ControllerGetVolume` / `ListVolumes`.
+
+### Key rotation
+
+Set the new `passphrase` and keep the old one in `passphrasePrevious`. On the
+next publish unlock the driver tries the new key first; on failure it unlocks
+with the previous key and calls `pool.dataset.change_key` to rotate (`change_key`
+requires the dataset unlocked). Once rotated the old key is dead, so a replay
+lands on the new-key branch — rotation is idempotent by outcome. A redacted Event
+records it. Both keys failing fails closed. Rotation is controller-side only;
+there is no CSI rotate RPC and no node path.
+
+### Clone inheritance
+
+A `clone`-restore volume created from an encrypted origin inherits the origin's
+key — its `encryption_root` is the **origin**, not itself. It is not
+independently keyed: locking the origin locks the clone, and a clone cannot be
+re-keyed (`change_key` on an inheriting child is refused by ZFS). Prefer
+`snapshotRestoreMode: detached` for encrypted classes when you need key
+independence (a detached copy has its own `encryption_root`); note a detached
+restore is itself a content source and is therefore created plaintext.
+
+### Risk register (stated bluntly)
+
+- **R1 — locked dataset = dead I/O (HIGH, availability).** A nas01 reboot locks
+  ALL encrypted volumes; running pods get EIO until the reconciler re-unlocks.
+  Mitigation is the best-effort reconciler plus pod restart policy. This is an
+  honest operational model, not a guarantee.
+- **R2 — lost Secret = permanent data loss (CRITICAL).** The passphrase lives
+  ONLY in the Kubernetes Secret; there is no TrueNAS-side escrow. Delete or
+  rotate-away the Secret with no backup and the data is unrecoverable. Back up
+  the Secret; use the `passphrasePrevious` window; the driver never auto-deletes
+  it.
+- **R3 — downgrade below v1.6.0 with encrypted volumes live (HIGH).** An older
+  driver has no unlock logic, so a locked volume stays dead (not lost — keys are
+  safe in the Secret). Do not roll back below encryption support while encrypted
+  volumes exist; manual `pool.dataset.unlock` recovers. The
+  `truenas-csi:encryption` user-prop is ignored by older drivers, so the rollback
+  itself is safe; plaintext volumes are unaffected.
+- **R4 — unlock is not idempotent (MED).** Unlocking an already-unlocked dataset
+  returns FAILED; the driver always gates on `locked == true` and never treats
+  that FAILED as volume-unhealthy.
+- **R5 — clone shared-key surprise (MED).** `clone`-restore volumes inherit the
+  origin key and cannot be re-keyed. Default encrypted classes to `detached`.
+- **R6 — passphrase leak (HIGH).** Reuses and extends the CHAP redaction
+  (`passphrase` is masked); asserted in tests; the key is never stamped as a
+  dataset property and never carried in `volumeContext`.
+- **R7 — pbkdf2iters cost (LOW).** The 1.3M-iteration default adds unlock CPU
+  latency; acceptable, overridable, and off the steady-state I/O path.
+- **R8 — BETA backend (MED).** nas01 runs 26.0.0-BETA.1; the encryption API shape
+  could shift before GA. All shapes are pinned to the probe date; re-run the
+  drill (`scripts/gf1-encryption-drill.sh`) before GA/merge.
+
+Non-goals this sprint: KMIP / external key managers (design hook only), raw
+hex-key mode (passphrase only), node-level dm-crypt/LUKS, in-place re-encryption
+of existing plaintext volumes, encrypted send/recv replication to a DR target,
+and automatic key escrow/cross-cluster key sync. The driver only ever UNLOCKS;
+it never locks (locking is an operator/host action, exercised only by the drill
+and tests).
+
+Everything below this section is the v1.5.1 changelog, unchanged.
+
+---
 
 ## v1.5.1 — live-drill fixes on top of v1.5.0
 
