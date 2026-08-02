@@ -2213,3 +2213,97 @@ func TestParseDatasetResourceFlatUserPropertiesDegradeSource(t *testing.T) {
 	assert.Equal(t, "true", ds.UserProperties["truenas-csi:managed_resource"].Value)
 	assert.Equal(t, "", ds.UserProperties["truenas-csi:managed_resource"].Source)
 }
+
+// ---------------------------------------------------------------------------
+// pool.dataset.* accepted-key schema (TrueNAS 26.0)
+// ---------------------------------------------------------------------------
+
+// TestDatasetParamsSchemaCoverage keeps the mock's schema honest as the params
+// structs grow: every key this client can put on the wire must be classified as
+// either accepted by TrueNAS 26.0 or probed-rejected. A field added without
+// classifying it fails here rather than on a live appliance.
+func TestDatasetParamsSchemaCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		params   interface{}
+		accepted map[string]struct{}
+	}{
+		{"create", DatasetCreateParams{}, datasetCreateAcceptedKeys},
+		{"update", DatasetUpdateParams{}, datasetUpdateAcceptedKeys},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keys := datasetParamsJSONKeys(tc.params)
+			require.NotEmpty(t, keys)
+			for _, key := range keys {
+				_, acceptedKey := tc.accepted[key]
+				_, rejectedKey := datasetPropertiesRejectedBy26[key]
+				assert.True(t, acceptedKey != rejectedKey,
+					"payload key %q must be classified as exactly one of accepted / rejected-by-26.0", key)
+			}
+		})
+	}
+
+	for property := range datasetPropertiesRejectedBy26 {
+		assert.NotContains(t, datasetCreateAcceptedKeys, property)
+		assert.NotContains(t, datasetUpdateAcceptedKeys, property)
+	}
+}
+
+// TestMockDatasetCreateEnforcesTrueNAS26Schema is what turns "the driver emits a
+// property 26.0 does not accept" — the v1.5.0 zfsPerformanceClass blocker, which
+// the permissive mock let through every gate — into a unit-test failure.
+func TestMockDatasetCreateEnforcesTrueNAS26Schema(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("rejected properties fail with the middleware's own message", func(t *testing.T) {
+		for _, tc := range []struct {
+			property    string
+			datasetType string
+			params      *DatasetCreateParams
+		}{
+			{"logbias", "FILESYSTEM", &DatasetCreateParams{Name: "pool/parent/v", Type: "FILESYSTEM", Logbias: "LATENCY"}},
+			{"primarycache", "FILESYSTEM", &DatasetCreateParams{Name: "pool/parent/v", Type: "FILESYSTEM", Primarycache: "ALL"}},
+			{"secondarycache", "VOLUME", &DatasetCreateParams{Name: "pool/parent/v", Type: "VOLUME", Secondarycache: "ALL"}},
+		} {
+			mock := NewMockClient()
+			_, err := mock.DatasetCreate(ctx, tc.params)
+			require.Error(t, err, tc.property)
+			assert.Contains(t, err.Error(),
+				fmt.Sprintf("[EINVAL] data.%s.%s: Extra inputs are not permitted", tc.datasetType, tc.property))
+			assert.Empty(t, mock.Datasets, "a rejected payload must create nothing")
+		}
+	})
+
+	t.Run("the schema is checked before the already-exists arm", func(t *testing.T) {
+		mock := NewMockClient()
+		_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{Name: "pool/parent/v", Type: "FILESYSTEM"})
+		require.NoError(t, err)
+		_, err = mock.DatasetCreate(ctx, &DatasetCreateParams{Name: "pool/parent/v", Type: "FILESYSTEM", Logbias: "LATENCY"})
+		require.Error(t, err, "the idempotent already-exists fallback must not mask a schema rejection")
+	})
+
+	t.Run("the properties the drills proved out are accepted", func(t *testing.T) {
+		mock := NewMockClient()
+		_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{
+			Name: "pool/parent/ok", Type: "FILESYSTEM", Refquota: 1 << 30,
+			Recordsize: "16K", Sync: "STANDARD", Compression: "LZ4", Atime: "OFF",
+			SpecialSmallBlockSize: "16K",
+		})
+		require.NoError(t, err)
+	})
+}
+
+// TestValidateDatasetPayloadKeysUpdate covers the update half. DatasetUpdateParams
+// cannot currently spell a rejected key, so the payload is built directly — the
+// gate exists for the next field somebody adds.
+func TestValidateDatasetPayloadKeysUpdate(t *testing.T) {
+	err := ValidateDatasetPayloadKeys(map[string]string{"logbias": "LATENCY"}, datasetUpdateAcceptedKeys, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "[EINVAL] data.logbias: Extra inputs are not permitted")
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, -32602, apiErr.Code, "the JSON-RPC code is the one live 26.0 returns")
+
+	require.NoError(t, ValidateDatasetPayloadKeys(&DatasetUpdateParams{Refquota: int64(1 << 30)}, datasetUpdateAcceptedKeys, ""))
+}

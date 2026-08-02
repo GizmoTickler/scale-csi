@@ -719,8 +719,6 @@ func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
 				"sync":              "always",
 				"atime":             "off",
 				"recordsize":        "128k",
-				"logbias":           "throughput",
-				"primarycache":      "metadata",
 				"copies":            "2",
 				"dedup":             "verify",
 				"readonly":          "off",
@@ -739,8 +737,6 @@ func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
 	assert.Equal(t, "ALWAYS", params.Sync)
 	assert.Equal(t, "OFF", params.Atime)
 	assert.Equal(t, "128K", params.Recordsize)
-	assert.Equal(t, "THROUGHPUT", params.Logbias)
-	assert.Equal(t, "METADATA", params.Primarycache)
 	assert.Equal(t, 2, params.Copies)
 	assert.Equal(t, "VERIFY", params.Deduplication)
 	assert.Equal(t, "OFF", params.Readonly)
@@ -752,6 +748,34 @@ func TestCreateDatasetAppliesConfiguredProperties(t *testing.T) {
 	require.NoError(t, getErr)
 	assert.True(t, datasetHasLocalUserProperty(dataset, "org.truenas:owner", "storage-team"))
 	assert.True(t, datasetHasLocalUserProperty(dataset, PropDriverInstanceID, "org.scale.csi.test@pool/parent"))
+}
+
+// TestApplyDatasetPropertiesKeysTrueNAS26Rejects pins BOTH halves of the
+// operator escape hatch for logbias/primarycache/secondarycache.
+//
+// The mapping is unchanged — the driver's documented floor is TrueNAS 25.04 and
+// these keys are only PROVEN absent from the 26.0 schema — but a create carrying
+// them cannot succeed on 26.0, which is what the schema-faithful mock (and the
+// warning applyDatasetProperties logs) now says out loud instead of leaving the
+// operator with "Invalid params".
+func TestApplyDatasetPropertiesKeysTrueNAS26Rejects(t *testing.T) {
+	d := &Driver{config: &Config{ZFS: ZFSConfig{
+		DatasetParentName: "pool/parent",
+		DatasetProperties: map[string]string{
+			"logbias":        "throughput",
+			"primarycache":   "metadata",
+			"secondarycache": "none",
+		},
+	}}}
+	params := &truenas.DatasetCreateParams{Name: "pool/parent/volume", Type: "FILESYSTEM"}
+	d.applyDatasetProperties(params)
+	assert.Equal(t, "THROUGHPUT", params.Logbias)
+	assert.Equal(t, "METADATA", params.Primarycache)
+	assert.Equal(t, "NONE", params.Secondarycache)
+
+	_, err := truenas.NewMockClient().DatasetCreate(context.Background(), params)
+	require.Error(t, err, "TrueNAS 26.0 rejects these keys on pool.dataset.create")
+	assert.Contains(t, err.Error(), "data.FILESYSTEM.logbias: Extra inputs are not permitted")
 }
 
 func TestCreateDatasetZvolSkipsFilesystemOnlyProperties(t *testing.T) {

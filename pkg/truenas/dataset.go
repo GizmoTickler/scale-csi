@@ -2,10 +2,12 @@ package truenas
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"path"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,6 +133,131 @@ type DatasetUpdateParams struct {
 	Comments             string               `json:"comments,omitempty"`
 	Readonly             string               `json:"readonly,omitempty"`
 	UserPropertiesUpdate []UserPropertyUpdate `json:"user_properties_update,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// pool.dataset.create / pool.dataset.update accepted-key schema (TrueNAS 26.0)
+// ---------------------------------------------------------------------------
+//
+// TrueNAS 26.0's middleware is SCHEMA-STRICT: a payload key outside the method's
+// model is rejected with
+// "[EINVAL] data.<TYPE>.<key>: Extra inputs are not permitted", which the
+// WebSocket transport collapses to the JSON-RPC -32602 "Invalid params" an
+// operator actually sees. The sets below are what MockClient enforces, so
+// "the driver emits a key 26.0 does not accept" fails a unit test instead of
+// every CreateVolume on a real appliance (v1.5.0's zfsPerformanceClass blocker).
+//
+// Membership is derived from the DatasetCreateParams / DatasetUpdateParams JSON
+// tags — the complete set of keys this client can put on the wire — minus the
+// keys probed live and found to be rejected. TestDatasetParamsSchemaCoverage
+// asserts the two stay in lockstep, so adding a struct field without recording
+// which side it belongs on is a test failure rather than a live surprise.
+
+// datasetPropertiesRejectedBy26 are payload keys this client's structs can still
+// spell but TrueNAS 26.0 does NOT accept.
+//
+// Probed live on 26.0.0-BETA.1 (nas01, pool flashstor) on 2026-08-02, one
+// property per call, against BOTH pool.dataset.create and pool.dataset.update
+// and for BOTH dataset types:
+//
+//	logbias        => [EINVAL] data.FILESYSTEM.logbias: Extra inputs are not permitted
+//	primarycache   => [EINVAL] data.FILESYSTEM.primarycache: Extra inputs are not permitted
+//	secondarycache => [EINVAL] data.VOLUME.secondarycache: Extra inputs are not permitted
+//
+// They are absent from the 26.0 API schema, and an audit of core.get_methods
+// found no alternative setter (filesystem.set_zfs_attributes is POSIX
+// attributes, not ZFS properties). The struct fields are retained because
+// applyDatasetProperties still honors them for operators on the 25.04-25.10
+// floor this driver also supports; on 26.0 they cannot be set through the API at
+// all, only out of band with `zfs set` (e.g. on the parent dataset, so new
+// volumes inherit).
+var datasetPropertiesRejectedBy26 = map[string]struct{}{
+	"logbias":        {},
+	"primarycache":   {},
+	"secondarycache": {},
+}
+
+// datasetCreateAcceptedKeys / datasetUpdateAcceptedKeys are the JSON tags of the
+// respective params struct minus datasetPropertiesRejectedBy26.
+var (
+	datasetCreateAcceptedKeys = acceptedDatasetKeys(DatasetCreateParams{})
+	datasetUpdateAcceptedKeys = acceptedDatasetKeys(DatasetUpdateParams{})
+)
+
+// acceptedDatasetKeys reflects a params struct's JSON tags and drops the keys
+// 26.0 rejects.
+func acceptedDatasetKeys(params interface{}) map[string]struct{} {
+	keys := make(map[string]struct{})
+	for _, key := range datasetParamsJSONKeys(params) {
+		if _, rejected := datasetPropertiesRejectedBy26[key]; rejected {
+			continue
+		}
+		keys[key] = struct{}{}
+	}
+	return keys
+}
+
+// datasetParamsJSONKeys lists the JSON tag names of a params struct.
+func datasetParamsJSONKeys(params interface{}) []string {
+	structType := reflect.TypeOf(params)
+	keys := make([]string, 0, structType.NumField())
+	for i := 0; i < structType.NumField(); i++ {
+		tag := structType.Field(i).Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name != "" {
+			keys = append(keys, name)
+		}
+	}
+	return keys
+}
+
+// UnsupportedDatasetPropertyError builds the rejection TrueNAS 26.0 produces for
+// a payload key outside the method's schema.
+//
+// datasetType, when set, reproduces the live error's dataset-type path segment
+// ("data.FILESYSTEM.logbias"). The middleware detail is put in Message rather
+// than Data on purpose: the WebSocket transport shows an operator only
+// "Invalid params", and reproducing THAT in a unit-test failure would recreate
+// the exact diagnosis problem this check exists to prevent. The JSON-RPC code is
+// the real one.
+func UnsupportedDatasetPropertyError(datasetType, property string) *APIError {
+	path := "data." + property
+	if datasetType != "" {
+		path = "data." + datasetType + "." + property
+	}
+	return &APIError{
+		Code:    -32602,
+		Message: fmt.Sprintf("[EINVAL] %s: Extra inputs are not permitted", path),
+	}
+}
+
+// ValidateDatasetPayloadKeys reports the first payload key that TrueNAS 26.0
+// would reject, marshalling the params exactly as the real client would so
+// `omitempty` decides what is actually on the wire.
+func ValidateDatasetPayloadKeys(params interface{}, accepted map[string]struct{}, datasetType string) error {
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("encode dataset params: %w", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		return fmt.Errorf("decode dataset params: %w", err)
+	}
+	keys := make([]string, 0, len(payload))
+	for key := range payload {
+		keys = append(keys, key)
+	}
+	// Deterministic reporting when a payload carries more than one bad key.
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, ok := accepted[key]; !ok {
+			return UnsupportedDatasetPropertyError(datasetType, key)
+		}
+	}
+	return nil
 }
 
 // UserPropertyUpdate represents an update to a user property.

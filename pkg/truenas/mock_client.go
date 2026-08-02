@@ -637,6 +637,13 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	if m.InjectError != nil {
 		return nil, m.InjectError
 	}
+	// TrueNAS 26.0 validates the payload SCHEMA before it looks at anything else,
+	// including whether the dataset already exists. Reproduce that ordering so a
+	// key 26.0 rejects fails here instead of being masked by the idempotent
+	// already-exists arm below.
+	if err := ValidateDatasetPayloadKeys(params, datasetCreateAcceptedKeys, params.Type); err != nil {
+		return nil, fmt.Errorf("failed to create dataset: %w", err)
+	}
 	if existing, exists := m.Datasets[params.Name]; exists {
 		// Match the real client's idempotent AlreadyExists fallback while
 		// preserving the response-local fact that this call did not create the
@@ -780,6 +787,12 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 
 	if m.InjectError != nil {
 		return nil, m.InjectError
+	}
+	// Schema first, exactly as on create: the middleware rejects an out-of-model
+	// key before it resolves the dataset. The update model carries no dataset
+	// type, so the error path is the bare "data.<key>" form.
+	if err := ValidateDatasetPayloadKeys(params, datasetUpdateAcceptedKeys, ""); err != nil {
+		return nil, fmt.Errorf("failed to update dataset: %w", err)
 	}
 	ds, ok := m.Datasets[name]
 	if !ok {

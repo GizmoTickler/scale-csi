@@ -2987,6 +2987,15 @@ func verifyLocalRefquota(ds *truenas.Dataset, expected interface{}) error {
 	return nil
 }
 
+// warnDatasetPropertyUnsupportedOn26 names the one failure an operator cannot
+// diagnose from the wire error: a zfs.datasetProperties key TrueNAS 26.0 dropped
+// from its dataset schema.
+func warnDatasetPropertyUnsupportedOn26(key, datasetName string) {
+	klog.Warningf("zfs.datasetProperties %q is not in the TrueNAS 26.0 pool.dataset.create schema; on a 26.0 appliance this create "+
+		"(%s) fails with an opaque \"Invalid params\". Remove the key and set the property out of band (zfs set %s=... on the parent "+
+		"dataset, which new volumes inherit), or keep it only on a pre-26.0 appliance.", key, datasetName, key)
+}
+
 func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 	properties := d.config.ZFS.DatasetProperties
 	keys := make([]string, 0, len(properties))
@@ -3019,12 +3028,22 @@ func (d *Driver) applyDatasetProperties(params *truenas.DatasetCreateParams) {
 			params.Recordsize = strings.ToUpper(value)
 		case "checksum":
 			params.Checksum = strings.ToUpper(value)
+		// logbias/primarycache/secondarycache are NOT in the TrueNAS 26.0
+		// pool.dataset.create or .update schema (probed live 2026-08-02: "[EINVAL]
+		// data.<TYPE>.<key>: Extra inputs are not permitted"), so on 26.0 every
+		// create carrying one fails with an opaque "Invalid params". They are still
+		// emitted because this driver's documented floor is 25.04 and only 26.0 was
+		// probed; the warning is what turns that failure from a mystery into a
+		// diagnosis. The curated zfsPerformanceClass presets emit none of them.
 		case "logbias":
 			params.Logbias = strings.ToUpper(value)
+			warnDatasetPropertyUnsupportedOn26(normalizedKey, params.Name)
 		case "primarycache":
 			params.Primarycache = strings.ToUpper(value)
+			warnDatasetPropertyUnsupportedOn26(normalizedKey, params.Name)
 		case "secondarycache":
 			params.Secondarycache = strings.ToUpper(value)
+			warnDatasetPropertyUnsupportedOn26(normalizedKey, params.Name)
 		case "snapdir":
 			params.Snapdir = strings.ToUpper(value)
 		case "special_small_block_size":
