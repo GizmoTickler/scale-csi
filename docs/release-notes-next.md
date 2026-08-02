@@ -19,7 +19,223 @@ are cross-cutting themes that span several of these releases.
 
 ## GF-Sprint 5 — NFS performance and backend health
 
-Section added separately.
+Two themes. **NFS parity:** the `sharing.nfs.create` fields the driver used to
+hard-code or omit are now a per-StorageClass surface, and a class that sets none
+of them provisions the byte-identical pre-GF5 payload. **Backend health:** an
+opt-in, READ-ONLY poller that looks at the pool underneath the volumes and says
+what it sees — on every managed PVC's `VolumeCondition` and in Prometheus — with
+an explicit account of when those two signals can disagree. Every flag defaults
+OFF and the default Helm render stays byte-identical to v1.4.1.
+
+### ⚠ Upgrade note — a leftover `nfs.shareMapall*` on an NFS-disabled install
+
+`maproot_*` and `mapall_*` are mutually exclusive in TrueNAS, and the shipped
+defaults set `nfs.shareMaprootUser: root` / `nfs.shareMaprootGroup: wheel`. From
+v1.5.0 the controller validates that pair at config load instead of letting
+every `sharing.nfs.create` fail with an opaque middleware error, and the chart
+schema rejects the combination too.
+
+That check is **scoped to `nfs.enabled`**. An install with NFS disabled and a
+leftover `nfs.shareMapallUser` builds no NFS payload from those keys, was inert
+on v1.4.1, and must not be turned into a controller crash-loop (or a blocked
+`helm upgrade`) by an unused value. With NFS **enabled** the combination is a
+hard startup error — it could never have provisioned a volume — and the fix is
+the documented escape: clear the inherited maproot values.
+
+The `nfs.shareSecurity` / `nfs.krbEnabled` half of the same validator is
+deliberately unconditional. Both keys are new in this release, so no existing
+install can be carrying a value it has not already seen.
+
+### NFS export parameters, per StorageClass
+
+- **`nfsSecurity`** — the export's `security` list (`SYS`, `KRB5`, `KRB5I`,
+  `KRB5P`), with the controller-wide default `nfs.shareSecurity`. KRB5* is
+  **fail-closed on `nfs.krbEnabled`** at all three gates that can reach the
+  wire — the StorageClass parameter, config load, and the share builder —
+  because a krb-only export on a box with no KDC or keytab makes every mount
+  fail with an opaque server error. An empty list omits the field entirely, so
+  an un-opted-in deployment marshals the pre-GF5 body.
+- **`nfsMaprootUser`/`Group`, `nfsMapallUser`/`Group`** — per-class squash
+  overrides. The mutual exclusion is validated against the **effective** payload
+  (class override layered over the global config), which is the case that
+  actually bites: with the shipped `maproot: root/wheel` default, a class that
+  sets only `nfsMapallUser` resolves to both. The error names all four resolved
+  values, and the way out is to clear the inherited pair
+  (`nfsMaprootUser: ""`, `nfsMaprootGroup: ""`).
+- **`nfsAllowedNetworks` / `nfsAllowedHosts`** — static per-class export
+  allowlists. Under `fencing.mode: strict` they are **rejected** with
+  `InvalidArgument` rather than accepted and discarded: strict fencing creates
+  every share deny-all and owns the allowlist, so the parameters would have been
+  a silent no-op.
+- **`nfsReadOnly`**, **`nfsExposeSnapshots`** — read-only exports, and
+  publishing the volume's read-only `.zfs/snapshot` tree through the export.
+  `expose_snapshots` is `omitempty` on both the share struct and the create
+  params, so an un-opted-in deployment's payload is unchanged.
+
+All of these — plus `nfsACLMode` — are settable on a typed `storageClasses[]`
+entry in the chart, not only through the untyped `extraParameters` map. The
+squash keys are emitted whenever the entry **has** them, so
+`nfsMaprootUser: ""` renders as an empty parameter rather than being dropped:
+absent and empty mean different things to the driver, and empty is the
+documented way to clear the default squash.
+
+### NFSv4 ACLs, `aclmode`, and `fsGroup`
+
+`nfsACLTemplate` (a builtin TrueNAS `NFS4_*` template) and `nfsACL` (an explicit
+dacl, rendered as JSON) apply an ACL to newly provisioned volumes. They are
+mutually exclusive, validated before any backend call, and the apply itself is
+**best effort**: a failure emits a Warning Event and a log line, never a failed
+bind. `acltype`/`aclmode` are stamped in the `pool.dataset.create` payload only
+when an ACL was actually requested, and an operator-supplied `acltype` in
+`zfs.datasetProperties` is never overridden.
+
+`nfsACLMode` selects the dataset's `aclmode` — `PASSTHROUGH` (the historical
+value, still the default) or `RESTRICTED`. `DISCARD` is deliberately not
+offered: it deletes the whole non-trivial ACL on the first `chmod`.
+
+**Read `docs/reference/storageclass.md` › "ACL × `fsGroup`" before enabling
+this.** A pod `securityContext.fsGroup` makes kubelet `chown`/`chmod` the
+volume, and under `PASSTHROUGH` that rewrites the mode-bearing ACEs of the ACL
+the driver just applied. `nfsACLMode: RESTRICTED` is the only ZFS lever that
+stops it, and it converts a silent, recoverable degradation into a **loud
+publish failure** — including for the many images that `chmod` at startup. The
+alternatives are running ACL-managed workloads with no `fsGroup`, or installing
+with the new `csidriver.fsGroupPolicy: None` chart value (default stays `File`,
+so the default render is unchanged; changing it on an existing install requires
+recreating the CSIDriver object).
+
+On a **content-source** volume (clone or snapshot restore) `aclmode` cannot be
+set at all — there is no `pool.dataset.create` to carry it. `nfsACLMode` is
+therefore refused with `InvalidArgument` **before any mutation**, rather than
+materializing a volume whose `chmod` behavior is its origin's while the events
+claim the requested mode. The dacl itself is still applied, and neither the
+event text nor the docs report a mode the driver did not set.
+
+### NFS version selection and the opt-in preflight
+
+Version is a node-side mount option, not a share property: a class pins it with
+`mountOptions: [nfsvers=4.1]` and the driver passes the list through unchanged.
+The node side only **warns** (a conflicting second `vers=`, `nconnect` with v3)
+and rewrites nothing.
+
+`nfs.versionPreflight` (default off) validates a class's pinned major version
+against the appliance's global `nfs.config` protocols at `CreateVolume` and
+returns a clear `FailedPrecondition` instead of letting the mount fail
+cryptically at `NodeStageVolume`. It costs zero API calls when it is off or when
+the class pins no version, and it fails **open** if `nfs.config` cannot be read —
+a preflight must never become a new provisioning failure mode.
+
+Its cache has two rules worth knowing, because they are what make it usable:
+
+- a **successful** read is cached for the controller's lifetime (protocol
+  enablement is operator-driven and effectively static), but a **rejection**
+  drops the cache. The error tells the operator to enable the version on the
+  appliance; once they do, the next `CreateVolume` re-reads `nfs.config` and
+  provisioning recovers with **no controller restart**;
+- it gates **new** volumes only. It runs after the already-exists check, so an
+  idempotent `CreateVolume` replay for an already-provisioned volume still
+  succeeds while the server is missing the pinned version — CSI requires that
+  replay to succeed, and a global protocol setting says nothing about an
+  existing dataset.
+
+`nfs.ensureProtocols` (default empty) can additively enable a major version on
+the server, but it is a **global service write affecting every export on the
+appliance**. It only ever adds, and it **fails closed** when the current
+protocol list cannot be read COMPLETELY — `nfs.update {protocols: X}` SETS the
+list rather than unioning with it, so merging into a partially-parsed base would
+silently disable whatever the reader could not see, for every export on the box.
+
+### ZFS performance classes
+
+`zfsPerformanceClass` (`database`, `media`, `vm`, `backup`, `general`) applies a
+vetted ZFS property preset to newly provisioned volumes, validated against the
+backend's own `recordsize`/`compression`/`checksum` choice lists so a mismatch
+is `InvalidArgument` rather than an opaque `pool.dataset.create` failure. The
+preset is layered **under** `zfs.datasetProperties` — an explicit operator key
+always wins — and `special_small_block_size` is dropped with a warning on a pool
+with no `special` vdev instead of failing provisioning. `volblocksize`,
+`logbias`, `primarycache` and `secondarycache` are **create-only**: a class
+change on an existing PVC is rejected, not applied.
+
+**The content-source exemption is deliberate and complete.** A PVC created from
+a `dataSource` is materialized by a ZFS clone or a dataset copy; both inherit the
+origin's geometry and accept no property payload, so the preset cannot be
+applied — there is no API through which to apply it. The driver therefore
+ignores the class on those volumes, **does not stamp it**, and emits a
+`ZFSPerformanceClassIgnored` Warning Event. The stamp is written only on the
+`createDataset` branch, an inherited stamp is scrubbed from a clone or a
+detached replication copy, and `createVolumeExisting` independently treats a
+content-source volume as unstamped — which is what keeps an exact replay
+idempotent instead of a `FailedPrecondition`. Stamping a class that was never
+applied would be worse than useless: the immutability guard treats the stamp as
+ground truth.
+
+### Backend health (`backendHealth.enabled`, default off)
+
+A controller-only poll loop; each tick is at most **two bounded READ calls**
+(`pool.query` + `disk.temperature_alerts`) and it writes nothing. Leaving it off
+issues zero additional API calls and keeps `VolumeCondition` semantics
+byte-identical to the pre-GF5 driver.
+
+ZFS exposes no per-dataset health, so the pool verdict is fanned out onto every
+managed PVC's `VolumeCondition` — a deliberate attribution, and the finest
+granularity ZFS makes available. Severity is conservative:
+`DEGRADED`/`FAULTED`/`UNAVAIL` are abnormal; an in-progress scrub or resilver, a
+scan-error count and a disk temperature alert are descriptive messages only. A
+routine monthly scrub must never mark every PVC in the cluster unhealthy. A
+dataset-level `provision_success=false` still outranks any pool signal.
+
+New gauges, all labeled by `pool`: `scale_csi_pool_status` (one-hot),
+`scale_csi_pool_healthy`, `scale_csi_pool_scan_state` (one-hot across the whole
+`function × state` domain), `scale_csi_pool_scan_errors`,
+`scale_csi_pool_disk_temp_alerts` + `..._age_seconds`,
+`scale_csi_pool_health_stale`, `scale_csi_pool_health_flip_pending` and
+`scale_csi_pool_health_last_success_timestamp_seconds`. Alerts (rendered only
+with the feature): `ScaleCSIPoolDegraded`, `ScaleCSIPoolScanErrors`,
+`ScaleCSIPoolDiskTemperatureAlert`, `ScaleCSIPoolHealthStale`,
+`ScaleCSIPoolConditionFlipPending`, `ScaleCSIPoolHealthProducerSkew`.
+
+`scale_csi_pool_disk_temp_alerts` counts member **disks** with at least one
+temperature alert — several alerts on one drive count once — plus any alert
+whose disk the appliance did not identify, which are counted individually
+because there is nothing to deduplicate them on.
+
+Three properties are worth reading before wiring an alert to any of this:
+
+- **The condition is debounced; the gauges are not.** A pool-health transition
+  must be confirmed by two consecutive samples before it rewrites every managed
+  PVC's condition, because the fan-out is fleet-wide and an unfiltered flap
+  would churn N conditions and N Events per tick. Prometheus always sees the
+  RAW sample, so a flap stays fully visible.
+- **A cached snapshot has a TTL** of three times the effective (clamped) poll
+  interval — 3m at the 60s default, never more than 6m. Past it the condition
+  falls back to the exact pre-GF5 dataset-only semantics rather than asserting
+  hours-old pool state as current fact, and `scale_csi_pool_health_stale` goes
+  to 1 at the instant the snapshot stops being served.
+- **The two signals can disagree, in seven named ways.** The canonical
+  enumeration lives on `backendHealthFlipSamples` in `pkg/driver/backend_health.go`
+  and is repeated verbatim in `prometheusrule.yaml`, `values.yaml`,
+  `values.schema.json`, `docs/production.md` and `docs/deployment.md`:
+  confirmation lag, alert hold, recovery, poll stall, observer lag, cold start
+  and replica skew. The first three have an upper bound; the last four do not.
+  Do not restate that list with a smaller count.
+
+The poller has **no leader-election gate** — every controller replica runs it —
+so the supported configuration is `controller.replicas: 1`, which the chart
+enforces with both a schema `if/then` and a template `fail`, plus a
+non-overlapping rollout (`maxSurge: 0`, or `Recreate` under fencing). That is a
+singleton guard, not fencing: a drain or eviction can still overlap an old and a
+new process, which is why `ScaleCSIPoolHealthProducerSkew` alerts on
+`count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds) > 1`
+rather than the driver claiming to prevent it.
+
+The CSI-facing snapshot and every backend-health metric are committed through
+**one immutable generation** — a single atomic swap — so a `ControllerGetVolume`
+and a Prometheus `Gather` can never observe different halves of the same sample.
+That generation records the Driver that published it and is served back only to
+that Driver, so a second Driver in the same process (a Driver that never enabled
+the feature, on a pool it has never polled) is never handed someone else's pool
+verdict.
 
 ## GF-Sprint 4 — Block-volume geometry safety
 
