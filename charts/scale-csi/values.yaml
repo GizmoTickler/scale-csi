@@ -481,7 +481,10 @@ nfs:
   # mountOption) against the GLOBAL nfs.config protocols, so a class asking for a
   # version the server does not enable fails with a clear message instead of a
   # cryptic mount error. Off by default: enabling it adds one cached nfs.config
-  # read per controller lifetime.
+  # read per controller lifetime. A SUCCESSFUL read is cached for that lifetime;
+  # a REJECTION drops the cache, so enabling the missing version on the appliance
+  # is picked up by the next CreateVolume with no controller restart. It gates
+  # NEW volumes only — an idempotent replay of an existing volume still succeeds.
   versionPreflight: false
 
   # HARD RULE — opt-in only. Non-empty makes the controller MUTATE the GLOBAL

@@ -408,7 +408,15 @@ func mountFlagsFromCapabilities(capabilities []*csi.VolumeCapability) []string {
 // preflightNFSVersion validates a StorageClass's pinned NFS version against the
 // server's GLOBAL nfs.config protocols. Default-off: it costs zero API calls
 // unless nfs.versionPreflight is enabled AND the class actually pins a version.
-// The cached config is read once per controller lifetime.
+//
+// CACHE SEMANTICS, because a memoized NEGATIVE is not the same thing as a
+// memoized positive. A successful read is cached for the controller's lifetime —
+// protocol enablement is operator-driven and effectively static. The rejection
+// below, though, TELLS the operator to change that very setting, so keeping it
+// cached across the fix makes the next CreateVolume repeat the same message,
+// instructing them to do the thing they just did, until the controller pod is
+// restarted. The rejection path therefore INVALIDATES the cache: the next
+// attempt re-reads nfs.config and provisioning recovers with no restart.
 func (d *Driver) preflightNFSVersion(ctx context.Context, mountFlags []string) error {
 	if d.config == nil || !d.config.NFS.VersionPreflight {
 		return nil
@@ -428,6 +436,9 @@ func (d *Driver) preflightNFSVersion(ctx context.Context, mountFlags []string) e
 	if cfg.SupportsMajorVersion(token) {
 		return nil
 	}
+	// Drop the cached read the rejection was decided from, so an operator who
+	// enables the version is not held behind a stale negative until a restart.
+	d.invalidateNFSServiceConfig()
 	return status.Errorf(codes.FailedPrecondition,
 		"StorageClass mountOptions request NFS version %s but the TrueNAS NFS service only enables %s; enable it in the NFS service (or set nfs.ensureProtocols) before using this class",
 		raw, strings.Join(cfg.Protocols, ","))
@@ -448,6 +459,14 @@ func (d *Driver) nfsServiceConfig(ctx context.Context) (*truenas.NFSServiceConfi
 	}
 	d.nfsServiceCfg = cfg
 	return cfg, nil
+}
+
+// invalidateNFSServiceConfig drops the memoized nfs.config so the next reader
+// goes back to the appliance.
+func (d *Driver) invalidateNFSServiceConfig() {
+	d.nfsServiceMu.Lock()
+	d.nfsServiceCfg = nil
+	d.nfsServiceMu.Unlock()
 }
 
 // ensureNFSProtocols is the HARD-GATED, default-off managed enablement path. It

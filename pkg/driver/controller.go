@@ -484,16 +484,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		ctx = withBlockOpts(ctx, opts)
 	}
 
-	// Resolve the per-StorageClass NFS export overrides and (opt-in) validate the
-	// class's pinned NFS version against the server's global protocol set. Both
-	// are strict no-ops for a class that sets none of the new parameters.
+	// Resolve the per-StorageClass NFS export overrides. A strict no-op for a
+	// class that sets none of the new parameters. The class's PINNED NFS VERSION
+	// is preflighted further down, on the create arm only — see there.
 	if shareType == ShareTypeNFS {
 		nfsOptions, nfsErr := d.parseNFSShareOptions(req.GetParameters())
 		if nfsErr != nil {
 			return nil, nfsErr
-		}
-		if preflightErr := d.preflightNFSVersion(ctx, mountFlagsFromCapabilities(req.GetVolumeCapabilities())); preflightErr != nil {
-			return nil, preflightErr
 		}
 		ctx = withNFSShareOptions(ctx, nfsOptions)
 
@@ -527,6 +524,21 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	if err != nil && !truenas.IsNotFoundError(err) {
 		return nil, status.Errorf(codes.Internal, "failed to check whether volume exists: %v", err)
+	}
+
+	// Opt-in NFS version preflight, deliberately BELOW the already-exists check.
+	// CSI requires CreateVolume to be idempotent for an identical request, and a
+	// replay for a volume this driver already provisioned must not be turned into
+	// a hard FailedPrecondition by a GLOBAL, server-side protocol setting that
+	// says nothing about that existing dataset. Above the check it gated replays
+	// too, so an appliance missing NFSV4 failed every retry of an
+	// already-successful volume. createVolumeExisting has returned by here, so
+	// reaching this point means a real create — exactly the case the preflight is
+	// meant to stop before anything is provisioned.
+	if shareType == ShareTypeNFS {
+		if preflightErr := d.preflightNFSVersion(ctx, mountFlagsFromCapabilities(req.GetVolumeCapabilities())); preflightErr != nil {
+			return nil, preflightErr
+		}
 	}
 	freshlyCreated := false
 

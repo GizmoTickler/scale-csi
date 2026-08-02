@@ -241,6 +241,83 @@ func TestPreflightNFSVersion(t *testing.T) {
 		d := nfsOptionsTestDriver(t, mock, NFSConfig{VersionPreflight: true})
 		require.NoError(t, d.preflightNFSVersion(ctx, []string{"nfsvers=4.1"}))
 	})
+
+	// The cached NEGATIVE is the operator-facing half of the cache contract: the
+	// rejection tells them to enable the version on the appliance, so it must not
+	// then be the thing that keeps rejecting them once they have. Before the fix
+	// the memoized nfs.config survived the server-side change and every
+	// subsequent CreateVolume repeated the same message until a pod restart.
+	t.Run("a rejection re-reads nfs.config so a fixed server recovers without a restart", func(t *testing.T) {
+		mock := truenas.NewMockClient()
+		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3"}}
+		d := nfsOptionsTestDriver(t, mock, NFSConfig{VersionPreflight: true})
+
+		err := d.preflightNFSVersion(ctx, []string{"nfsvers=4.1"})
+		require.Error(t, err)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
+		reads := mock.NFSServiceConfigCalls
+
+		// The operator does exactly what the error told them to do.
+		mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3", "NFSV4"}}
+
+		require.NoError(t, d.preflightNFSVersion(ctx, []string{"nfsvers=4.1"}),
+			"the next attempt must see the fixed server, not the cached rejection")
+		assert.Greater(t, mock.NFSServiceConfigCalls, reads, "the rejection must have dropped the cached read")
+
+		// The POSITIVE is still cached: the fix must not turn the preflight into a
+		// per-CreateVolume nfs.config round trip.
+		cached := mock.NFSServiceConfigCalls
+		require.NoError(t, d.preflightNFSVersion(ctx, []string{"nfsvers=4.1"}))
+		assert.Equal(t, cached, mock.NFSServiceConfigCalls, "a successful read stays cached for the controller lifetime")
+	})
+}
+
+// TestCreateVolumeReplayIsNotGatedOnTheNFSVersionPreflight pins the idempotency
+// half of M1. CSI requires CreateVolume to be idempotent for an identical
+// request. The preflight used to run BEFORE the already-exists check, so a
+// GLOBAL, server-side protocol setting turned every replay of an
+// already-provisioned volume into a hard FailedPrecondition — including the
+// replays the external-provisioner keeps issuing while the operator is still
+// fixing the appliance.
+func TestCreateVolumeReplayIsNotGatedOnTheNFSVersionPreflight(t *testing.T) {
+	ctx := context.Background()
+	mock := truenas.NewMockClient()
+	// The server enables what the class pins, so the first create succeeds.
+	mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3", "NFSV4"}}
+	d := nfsOptionsTestDriver(t, mock, NFSConfig{VersionPreflight: true})
+	d.config.DriverName = "org.scale.csi.nfs"
+
+	request := &csi.CreateVolumeRequest{
+		Name:          "preflight-replay",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: testGiB},
+		VolumeCapabilities: []*csi.VolumeCapability{{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{MountFlags: []string{"nfsvers=4.1"}}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		}},
+	}
+	created, err := d.CreateVolume(ctx, request)
+	require.NoError(t, err)
+	require.NotNil(t, created)
+
+	// The appliance loses NFSV4 — or the preflight is only now enabled against a
+	// server that never had it. The already-provisioned volume is unaffected.
+	mock.NFSServiceConfigValue = &truenas.NFSServiceConfig{Protocols: []string{"NFSV3"}}
+	d.invalidateNFSServiceConfig()
+
+	replayed, err := d.CreateVolume(ctx, request)
+	require.NoError(t, err, "an idempotent replay of an existing volume must not be failed by a global protocol setting")
+	assert.Equal(t, created.GetVolume().GetVolumeId(), replayed.GetVolume().GetVolumeId())
+
+	// A NEW volume on the same class is still stopped before anything is
+	// provisioned: the preflight moved, it did not weaken.
+	fresh := &csi.CreateVolumeRequest{
+		Name:               "preflight-fresh",
+		CapacityRange:      request.GetCapacityRange(),
+		VolumeCapabilities: request.GetVolumeCapabilities(),
+	}
+	_, err = d.CreateVolume(ctx, fresh)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
 func TestEnsureNFSProtocols(t *testing.T) {

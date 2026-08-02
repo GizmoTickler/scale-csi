@@ -640,6 +640,16 @@ class's pinned version against the server's protocol list and return a clear
 `NodeStageVolume`. It costs one cached `nfs.config` read per controller
 lifetime and is off by default.
 
+Two scoping rules follow from that cache, and both matter operationally:
+
+- A **successful** read is cached for the controller's lifetime. A **rejection**
+  drops the cache, so once you enable the missing version on the appliance the
+  next `CreateVolume` re-reads `nfs.config` and provisioning recovers on its own
+  — no controller restart.
+- The preflight gates **new** volumes only. It runs after the already-exists
+  check, so an idempotent `CreateVolume` replay for a volume the driver already
+  provisioned still succeeds while the server is missing the pinned version.
+
 `nfs.ensureProtocols` can additively enable a version on the server, but that is
 a **global service write affecting every export on the appliance** — it is
 default-empty and should stay that way unless you have accepted that blast
