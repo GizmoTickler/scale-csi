@@ -180,29 +180,94 @@ func storedEncryptionAlgorithm(ds *truenas.Dataset) string {
 // This is an OWNERSHIP predicate, not an "is it encrypted" predicate. The stamp
 // is written after pool.dataset.create returns, so an encrypted dataset can
 // legitimately exist without it (a controller killed inside that window). Use
-// datasetEncryptedOnWire / datasetNeedsEncryptionHandling wherever the question
-// is "does this dataset hold ciphertext", and reserve this one for "is this
-// volume's encryption policy ours".
+// datasetSelfKeyedPassphrase / datasetNeedsEncryptionHandling wherever the
+// question is "does this dataset hold its own passphrase key", and reserve this
+// one for "is this volume's encryption policy ours".
 func isEncryptedDataset(ds *truenas.Dataset) bool {
 	return storedEncryptionAlgorithm(ds) != ""
 }
 
-// datasetEncryptedOnWire is the BACKEND's own answer, independent of any stamp:
-// pool.dataset.query returns encrypted:true for an encrypted dataset, including
-// a locked one (P-1/P-2 create result, P-4 locked row). It is the only truth
-// available for a dataset whose stamp write never landed, and for a clone, whose
-// encryption is inherited from its origin (P-7).
-func datasetEncryptedOnWire(ds *truenas.Dataset) bool {
-	return ds != nil && ds.Encrypted
+// datasetSelfKeyedPassphrase is the BACKEND's own answer to the only question
+// this driver's key machinery may act on: does THIS dataset hold ITS OWN
+// passphrase-protected key?
+//
+// `encrypted:true` alone does NOT answer it. Encryption is INHERITED in ZFS: on a
+// deployment whose parent dataset is encrypted, every dataset underneath reports
+// encrypted:true entirely benignly, with the key held by the ancestor (and, for a
+// non-passphrase key format, held by the appliance itself and auto-loaded at
+// boot). Equating the two destroys legitimately restored data and wedges ordinary
+// plaintext replays on such a deployment. All three conditions are required:
+//
+//   - encrypted (P-1/P-2 create result, P-4 locked row);
+//   - encryption_root == the dataset's own name — P-10 pins encryption_root as a
+//     plain string on pool.dataset.query naming the ROOT, so a child of an
+//     encrypted parent reports the PARENT and a self-keyed dataset reports
+//     ITSELF. A P-7 clone reports its ORIGIN, so clones fall out here too: their
+//     key is not theirs;
+//   - key_format == PASSPHRASE (P-10 property dict) — the one format TrueNAS does
+//     NOT persist (P-3), i.e. the only one that needs a key from this driver. A
+//     hex/KMIP-keyed dataset auto-unlocks and wants nothing from us.
+//
+// P-11: zfs.resource.query returns NO encryption/key/lock fields at all, so this
+// predicate is ALWAYS false on a bulk-listing dataset (MockClient's
+// DatasetQueryByParent models exactly that). Call it only on a pool.dataset.query
+// read.
+func datasetSelfKeyedPassphrase(ds *truenas.Dataset) bool {
+	if ds == nil || !ds.Encrypted {
+		return false
+	}
+	if ds.EncryptionRoot == "" || ds.EncryptionRoot != ds.Name {
+		return false
+	}
+	return ds.KeyFormat == truenas.KeyFormatPassphrase
+}
+
+// datasetEncryptionInheritedFrom returns the dataset's encryption root when the
+// key is INHERITED from another dataset (root != self), and "" otherwise. It is
+// how a caller tells "this volume's key belongs to something else" from "this
+// volume has no encryption at all".
+func datasetEncryptionInheritedFrom(ds *truenas.Dataset) string {
+	if ds == nil || !ds.Encrypted || ds.EncryptionRoot == "" || ds.EncryptionRoot == ds.Name {
+		return ""
+	}
+	return ds.EncryptionRoot
+}
+
+// datasetKeyIsDriverManaged reports whether a dataset's encryption key is one
+// this driver provisions and holds a Secret for — either the dataset's own
+// passphrase key, or the key of ANOTHER CSI volume it inherits from (a clone of
+// a driver-encrypted volume, P-7).
+//
+// The second arm is what separates the deployment's BASELINE encryption (a root
+// at or above the driver's parent dataset: the operator encrypted the pool or the
+// parent, the appliance holds that key, nothing here is involved) from a key this
+// driver owns (a root strictly BELOW the parent is another CSI volume). It is a
+// string comparison over data already read — no extra round trip.
+func (d *Driver) datasetKeyIsDriverManaged(ds *truenas.Dataset) bool {
+	if datasetSelfKeyedPassphrase(ds) {
+		return true
+	}
+	root := datasetEncryptionInheritedFrom(ds)
+	if root == "" {
+		return false
+	}
+	parent := d.parentDatasetName()
+	return parent != "" && strings.HasPrefix(root, parent+"/")
 }
 
 // datasetNeedsEncryptionHandling reports whether a dataset must go through the
-// unlock/rotation machinery at publish time: either the driver stamped it, or
-// the backend says it holds ciphertext. An encrypted-but-unstamped dataset MUST
-// take this path — treating it as plaintext skips the unlock and then fails
-// later, opaquely, in WaitForZvolReady/mount with no mention of encryption.
+// unlock/rotation machinery at publish time: either the driver stamped it, or the
+// backend says it holds its OWN passphrase key. An encrypted-but-unstamped
+// dataset MUST take this path — treating it as plaintext skips the unlock and
+// then fails later, opaquely, in WaitForZvolReady/mount with no mention of
+// encryption.
+//
+// A dataset whose key is INHERITED never takes it: it has no key of its own to
+// load (the backend refuses unlock on a non-root), it is unlocked exactly when
+// its root is, and forcing it down this path is how a healthy, serving volume
+// gets failed at publish.
 func datasetNeedsEncryptionHandling(ds *truenas.Dataset) bool {
-	return isEncryptedDataset(ds) || datasetEncryptedOnWire(ds)
+	return isEncryptedDataset(ds) || datasetSelfKeyedPassphrase(ds)
 }
 
 // encryptionKeys is the pair of passphrases a publish/reconcile pass may use:
@@ -303,7 +368,13 @@ func encryptionProps(ctx context.Context) map[string]string {
 func (d *Driver) guardExistingEncryptionPolicy(ctx context.Context, ds *truenas.Dataset) (map[string]string, error) {
 	storedAlgorithm := storedEncryptionAlgorithm(ds)
 	stamped := storedAlgorithm != ""
-	onWire := datasetEncryptedOnWire(ds)
+	// WIRE TRUTH means "this dataset holds its OWN passphrase key", not merely
+	// "encrypted:true". Under a deployment whose parent dataset is encrypted every
+	// child reports encrypted:true with the ancestor as its root (P-10); treating
+	// that as this volume's own encryption wedges every ordinary plaintext replay
+	// on such a deployment with a FailedPrecondition about a policy the operator
+	// never asked for.
+	onWire := datasetSelfKeyedPassphrase(ds)
 	storedEncrypted := stamped || onWire
 
 	resolution := encryptionResolutionFromContext(ctx)
@@ -396,7 +467,14 @@ func (d *Driver) guardEncryptedContentSource(
 				"failed to check whether content source %s is encrypted: %v", sourceDescription, err)
 		}
 	}
-	if !datasetNeedsEncryptionHandling(sourceDS) {
+	// Refuse only when the source's key is one this driver manages: its own
+	// passphrase key, or the key of another CSI volume it inherits from. A source
+	// that merely sits under an encrypted PARENT (the deployment's baseline, root
+	// at or above the driver's parent — P-10) is not a per-volume hazard: its
+	// clone inherits the same appliance-held key and is exactly as readable as the
+	// source, so refusing it would break ordinary restores on an encrypted-parent
+	// deployment.
+	if !isEncryptedDataset(sourceDS) && !d.datasetKeyIsDriverManaged(sourceDS) {
 		return nil
 	}
 	return status.Errorf(codes.FailedPrecondition,
@@ -421,8 +499,18 @@ func (d *Driver) guardEncryptedContentSource(
 // would not (no local stamp to key off, and no key of its own to load) and the
 // unlock reconciler skips it as foreign — so the first appliance reboot would
 // leave it dead with no recovery path.
-func refuseEncryptedContentSourceResult(ctx context.Context, createdDS *truenas.Dataset) bool {
+func (d *Driver) refuseEncryptedContentSourceResult(ctx context.Context, createdDS *truenas.Dataset) bool {
 	if createdDS == nil || !createdDS.Encrypted {
+		return false
+	}
+	// Only a DRIVER-MANAGED key is a hazard: the volume's own passphrase key, or
+	// the key of another CSI volume it inherits from (a P-7 clone of a
+	// driver-encrypted volume). A volume that came out encrypted because the
+	// deployment's PARENT dataset is encrypted (root at or above the parent, P-10)
+	// is a completely ordinary restore whose key the appliance already holds —
+	// destroying it would throw away legitimately restored data, and on the
+	// detached path an entire copy the operator just paid for.
+	if !d.datasetKeyIsDriverManaged(createdDS) {
 		return false
 	}
 	// An encrypted destination is refused with a content source before any
@@ -632,13 +720,21 @@ func (d *Driver) convergeEncryptedDatasetKey(
 	keys encryptionKeys,
 	ownsKey bool,
 ) error {
-	// A dataset whose key is inherited or unstamped is never re-keyed: it is not
-	// this volume's key (P-7), and ZFS refuses change_key on an inheriting child
-	// anyway. Unlock still runs below when it is locked.
-	rotating := keys.rotationIntent() && ownsKey
+	// TWO DIFFERENT PERMISSIONS, deliberately separate. Trying the PREVIOUS
+	// passphrase to UNLOCK is safe for any locked dataset the driver is handling:
+	// a wrong key is a FAILED job that leaves it locked (P-5), and the publish
+	// path already tries the current key on an unstamped dataset by design. Gating
+	// that on ownership stranded exactly the volume that needs it most — an
+	// encrypted volume whose stamp write was lost while it was still keyed to the
+	// PREVIOUS passphrase, with the key that opens it sitting in the Secret.
+	// RE-KEYING is the ownership-gated one: change_key on an inheriting child is
+	// refused by ZFS, and re-keying a dataset whose key the driver never chose
+	// would silently take it over.
+	tryPreviousForUnlock := keys.rotationIntent()
+	mayRekey := keys.rotationIntent() && ownsKey
 
 	if !locked {
-		if !rotating {
+		if !mayRekey {
 			return nil
 		}
 		// ONCE PER WINDOW, per volume, per process. change_key at the default
@@ -670,7 +766,7 @@ func (d *Driver) convergeEncryptedDatasetKey(
 		// so a supplied previous key is stale and there is nothing to re-key.
 		return nil
 	}
-	if !rotating {
+	if !tryPreviousForUnlock {
 		// P-5 fail-closed: the passphrase did not unlock and there is no rotation
 		// window. The dataset stays locked; surface the failure.
 		return status.Errorf(codes.FailedPrecondition,
@@ -679,6 +775,16 @@ func (d *Driver) convergeEncryptedDatasetKey(
 	if prevErr := d.truenasClient.DatasetUnlock(ctx, datasetName, keys.Previous); prevErr != nil {
 		return status.Errorf(codes.FailedPrecondition,
 			"encrypted volume %s is locked and neither the current nor the previous passphrase unlocked it", volumeID)
+	}
+	if !mayRekey {
+		// Unlocked with the previous key — the volume is serving again, which is the
+		// point. It is NOT re-keyed because its encryption is not this driver's to
+		// change (no local stamp, or an inherited key). The rotation window must
+		// stay open for it until a CreateVolume replay repairs the stamp.
+		klog.Warningf("Volume %s was unlocked with the previous passphrase but is not re-keyed: its encryption is "+
+			"not this driver's own (no local stamp, or an inherited key). KEEP passphrasePrevious in the Secret and "+
+			"replay CreateVolume against the same encrypted StorageClass to repair the stamp.", volumeID)
+		return nil
 	}
 	if changeErr := d.truenasClient.DatasetChangeKey(ctx, datasetName, keys.Passphrase); changeErr != nil {
 		return d.noteEncryptionRotationIncomplete(volumeID, keys, changeErr)

@@ -229,11 +229,14 @@ func (d *Driver) reconcileEncryptedUnlocks(ctx context.Context) {
 // bulk managed-dataset listing. It must not use any source-gated accessor: the
 // zfs.resource.query path strips user-property sources (see mock_client.go's
 // probe-confirmed note), so a source==local test here rejects everything. A
-// candidate is anything that carries the encryption stamp at all, or that the
-// backend itself reports encrypted when the listing carries that field.
-// Ownership is confirmed later, per candidate, with a source-bearing read.
+// candidate is anything that carries the encryption stamp at all — or, on the
+// pool.dataset.query FALLBACK listing (P-11: the resource listing carries no
+// encryption fields whatsoever), anything the backend reports as holding its own
+// passphrase key. Plain `encrypted` would make every dataset on an
+// encrypted-parent deployment a candidate, to be re-read and skipped as foreign
+// on every pass. Ownership is confirmed per candidate with a source-bearing read.
 func encryptionUnlockCandidate(ds *truenas.Dataset) bool {
-	return datasetUserPropertyHasValue(ds, PropEncryption) || datasetEncryptedOnWire(ds)
+	return datasetUserPropertyHasValue(ds, PropEncryption) || datasetSelfKeyedPassphrase(ds)
 }
 
 // reconcileEncryptedUnlockOne converges ONE candidate volume.
@@ -279,9 +282,9 @@ func (d *Driver) reconcileEncryptedUnlockOne(
 	// LOCAL to this dataset. A clone's stamp reports the ORIGIN SNAPSHOT as its
 	// source (never "local"), and its key belongs to its encryption root (P-7), so
 	// it is not this volume's key to load.
-	if !isEncryptedDataset(state) {
-		klog.V(4).Infof("Encryption unlock reconcile: %s carries no LOCAL encryption stamp (inherited or foreign); "+
-			"it is not this driver's key to load", volumeID)
+	if !encryptionOwnershipConfirmed(state) {
+		klog.V(4).Infof("Encryption unlock reconcile: %s is not a dataset whose key this driver loads (no LOCAL "+
+			"encryption stamp, or its key is inherited from another dataset)", volumeID)
 		return encryptionOutcomeForeign
 	}
 
@@ -290,9 +293,14 @@ func (d *Driver) reconcileEncryptedUnlockOne(
 	// window is open.
 	keys, resolveErr := resolver.keysFor(ctx, volumeID)
 	windowOpen := resolveErr == nil && keys.rotationIntent()
-	if !windowOpen {
-		// The window is closed (or never opened): drop any converged fingerprint so
-		// a LATER window for this volume converges again.
+	if resolveErr == nil && !keys.rotationIntent() {
+		// The Secret was READ and it shows no window: it is closed (or never
+		// opened), so drop any converged fingerprint and let a LATER window for this
+		// volume converge again. A read FAILURE is deliberately not this case — a
+		// transient API blip, an RBAC hiccup or a cache miss says nothing about the
+		// window, and forgetting on it re-keys the same window again as soon as the
+		// Secret comes back, re-opening the churn the once-per-window guard exists
+		// to prevent.
 		d.forgetEncryptionRotationConverged(volumeID)
 	}
 
@@ -413,6 +421,16 @@ func (d *Driver) readEncryptionCandidateStates(ctx context.Context, names []stri
 	return states
 }
 
+// encryptionOwnershipConfirmed decides, on a SOURCE-BEARING read, whether a
+// dataset's key is this driver's to load: it must carry the driver's own LOCAL
+// encryption stamp AND must not inherit its key from another dataset. The stamp
+// is the standing ownership rule; the inheritance check is what keeps a
+// clone-inherited or encrypted-parent dataset out of the unlock path, where the
+// backend would refuse the unlock anyway (it is not an encryption root).
+func encryptionOwnershipConfirmed(ds *truenas.Dataset) bool {
+	return isEncryptedDataset(ds) && datasetEncryptionInheritedFrom(ds) == ""
+}
+
 // confirmEncryptionOwner re-reads a candidate through pool.dataset.query (the
 // SOURCE-BEARING read path) and reports whether its encryption stamp is LOCAL to
 // this dataset. A clone-inherited stamp reports the ORIGIN SNAPSHOT as its
@@ -429,9 +447,9 @@ func (d *Driver) confirmEncryptionOwner(ctx context.Context, datasetName, volume
 		}
 		return nil, false
 	}
-	if !isEncryptedDataset(fresh) {
-		klog.V(4).Infof("Encryption unlock reconcile: %s carries no LOCAL encryption stamp (inherited or foreign); "+
-			"it is not this driver's key to load", volumeID)
+	if !encryptionOwnershipConfirmed(fresh) {
+		klog.V(4).Infof("Encryption unlock reconcile: %s is not a dataset whose key this driver loads (no LOCAL "+
+			"encryption stamp, or its key is inherited from another dataset)", volumeID)
 		return fresh, false
 	}
 	return fresh, true

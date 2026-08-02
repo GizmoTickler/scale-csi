@@ -79,7 +79,7 @@ const (
 	// reads the WIRE booleans (ds.Encrypted && ds.Locked) so a locked dataset is
 	// reported abnormal even if its stamp was never written. Since the stamp is
 	// written after pool.dataset.create returns, its ABSENCE is not proof of
-	// plaintext — the wire fields are (see datasetEncryptedOnWire).
+	// plaintext — the wire fields are (see datasetSelfKeyedPassphrase).
 	PropEncryption = "truenas-csi:encryption"
 
 	// Block-protocol tuning (GF-Sprint 4) persisted per volume. The resolved
@@ -1081,6 +1081,17 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 			// fall through so the normal existing-dataset tail (capacity checks,
 			// idempotent share creation, response) finishes the volume.
 			existingDS = recovered
+			// ...unless it came out with a DRIVER-MANAGED encryption key it has no
+			// policy for. The mainline content-source path refuses that state and
+			// rolls the dataset back; this recovery path bypassed the backstop and
+			// dead-ended instead: the replay guard refused the volume with
+			// instructions that both lead back to a refusal, leaving the PVC wedged
+			// until a human deleted the dataset by hand. Apply the same backstop, so
+			// the outcome and the remediation are identical to the uninterrupted path.
+			if d.refuseEncryptedContentSourceResult(ctx, recovered) {
+				return nil, d.destroyRefusedEncryptedContentSource(ctx, datasetName, "",
+					describeVolumeContentSource(source))
+			}
 		case remnantActionDestroy:
 			return nil, status.Errorf(codes.Aborted,
 				"destroyed unstamped interrupted detached-copy remnant %s; retry CreateVolume to recreate it cleanly", datasetName)
@@ -3748,7 +3759,7 @@ func (d *Driver) handleVolumeContentSource(
 		// encryption policy of its own the driver can never unlock it. Destroy it
 		// here rather than hand back a volume that dies at the next appliance
 		// reboot. Reads the wire state the path already holds — +0 RTT.
-		if refuseEncryptedContentSourceResult(ctx, createdDS) {
+		if d.refuseEncryptedContentSourceResult(ctx, createdDS) {
 			return nil, blockGeometry{}, d.destroyRefusedEncryptedContentSource(ctx, datasetName, "",
 				fmt.Sprintf("snapshot %s", snapshotID))
 		}
@@ -3901,7 +3912,7 @@ func (d *Driver) handleVolumeContentSource(
 		}
 		createdDS = verified
 		// GF-Sprint 1 backstop, UNCONDITIONAL — see the snapshot branch.
-		if refuseEncryptedContentSourceResult(ctx, createdDS) {
+		if d.refuseEncryptedContentSourceResult(ctx, createdDS) {
 			return nil, blockGeometry{}, d.destroyRefusedEncryptedContentSource(ctx, datasetName, snap.ID,
 				fmt.Sprintf("volume %s", sourceVolumeID))
 		}
