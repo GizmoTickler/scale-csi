@@ -217,7 +217,86 @@ spec:
             severity: warning
           annotations:
             summary: Scale CSI volume is near its quota
-            description: A volume has exceeded 95% of its effective ZFS quota for fifteen minutes; writes will fail once the quota is reached.
+            description: A volume has exceeded 95% of its binding ZFS limit (refquota vs referenced, quota vs used, or a zvol's volsize) for fifteen minutes; writes will fail once the limit is reached.
+        {{- end }}
+        {{- if .Values.zfs.snapshotSchedule }}
+        # GF2-fix4/M4. Every E2 failure path is deliberately NON-FATAL — the
+        # driver logs, meters, emits a warning Event and continues — so an alert
+        # is the ONLY way an operator learns the protection is absent. Each rule
+        # below is gated on the value that turns its feature on, so the default
+        # render stays byte-identical (the ScaleCSIVolumeNearQuota pattern).
+        #
+        # GATING CAVEAT: these three are gated on the controller-wide
+        # zfs.snapshotSchedule. A deployment that schedules ONLY through per-
+        # StorageClass `snapshotSchedule` parameters produces the same metrics but
+        # renders no rules; set zfs.snapshotSchedule (or supply
+        # metrics.prometheusRule.rules) to alert on it.
+        - alert: ScaleCSIScheduledSnapshotTaskEnsureFailed
+          # A volume was PROVISIONED and is Bound and healthy, with no
+          # periodic-snapshot task at all. Nothing retries until the next
+          # CreateVolume for that volume, and the discovery point is otherwise a
+          # restore that finds no snapshots.
+          expr: increase(scale_csi_scheduled_snapshot_task_ensure_failed_total[1h]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI provisioned a volume without its periodic-snapshot task
+            description: One or more volumes were provisioned in the last hour without driver-managed PITR; check the controller log for the failing StorageClass schedule/retention.
+            runbook_url: docs/reference/storageclass.md#driver-managed-periodic-snapshots-gf2e2
+        - alert: ScaleCSIScheduledSnapshotTaskDeleteFailed
+          # The DELETE succeeded but the task did not go away. The stranded-task
+          # sweep reclaims it only once the dataset is provably gone, so a
+          # persistent non-zero rate means the corroboration write or the task
+          # delete is wedging.
+          expr: increase(scale_csi_scheduled_snapshot_task_delete_failed_total[1h]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI could not remove a volume's periodic-snapshot task
+            description: DeleteVolume left a driver-owned periodic-snapshot task behind (the delete itself proceeded); the orphan reconcile sweep has work to do.
+            runbook_url: docs/troubleshooting.md#clean-up-orphaned-truenas-resources
+        - alert: ScaleCSINASTimezoneUnresolved
+          # The zone is a LINK in the scheduled-snapshot ownership chain and the
+          # delete path fails CLOSED without it: while this fires, every scheduled
+          # volume's DeleteVolume returns FailedPrecondition.
+          expr: increase(scale_csi_nas_timezone_unresolved_total[1h]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI cannot resolve the NAS civil timezone
+            description: Driver-scheduled snapshots cannot be proven while the NAS timezone is unresolved, so they are preserved as foreign and scheduled volumes fail to delete.
+            runbook_url: docs/production.md#backend-health
+        {{- end }}
+        {{- if .Values.zfs.holdCsiSnapshots }}
+        - alert: ScaleCSISnapshotHoldFailed
+          # holdCsiSnapshots is on, so the operator has asked for deletion-proof
+          # snapshots; a hold error means a VolumeSnapshot became ReadyToUse
+          # UNPROTECTED, silently degrading to pre-GF2 behavior.
+          expr: increase(scale_csi_snapshot_holds_total{operation="hold",status="error"}[1h]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI could not place a snapshot hold
+            description: A CSI VolumeSnapshot was created without the deletion-proof ZFS hold zfs.holdCsiSnapshots asks for; foreign actors can destroy it.
+            runbook_url: docs/troubleshooting.md#snapshots
+        {{- end }}
+        {{- if .Values.zfs.promoteRestoredClones }}
+        - alert: ScaleCSIClonePromoteRefused
+          # Promote is opt-in and always retryable, so ONE refusal is noise. A
+          # refusal every pass for an hour is a clone whose origin pin is never
+          # released, which keeps its source snapshot unreclaimable forever.
+          expr: increase(scale_csi_clone_promotes_refused_total[1h]) > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI keeps refusing to promote a restored clone
+            description: An eligibility gate has refused the same clone promotion for an hour; the clone's origin-snapshot pin is not being released. The reason label names the gate.
+            runbook_url: docs/troubleshooting.md#clean-up-orphaned-truenas-resources
         {{- end }}
         {{- if .Values.backendHealth.enabled }}
         - alert: ScaleCSIPoolDegraded

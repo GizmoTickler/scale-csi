@@ -282,6 +282,47 @@ func TestChartReportVolumeUsagePlumbing(t *testing.T) {
 	})
 }
 
+// TestChartGF2DegradationAlerts proves the GF2 degradation alerts (M4) are gated
+// on the value that turns each feature on: every E1/E2/E3 failure path is
+// deliberately non-fatal, so an alert is the only way an operator learns the
+// protection is absent — but the DEFAULT render must stay byte-identical, which
+// means none of them may appear until its feature is enabled.
+func TestChartGF2DegradationAlerts(t *testing.T) {
+	gated := []struct {
+		alert string
+		set   string
+	}{
+		{alert: "ScaleCSIScheduledSnapshotTaskEnsureFailed", set: "zfs.snapshotSchedule=0 0 * * *"},
+		{alert: "ScaleCSIScheduledSnapshotTaskDeleteFailed", set: "zfs.snapshotSchedule=0 0 * * *"},
+		{alert: "ScaleCSINASTimezoneUnresolved", set: "zfs.snapshotSchedule=0 0 * * *"},
+		{alert: "ScaleCSISnapshotHoldFailed", set: "zfs.holdCsiSnapshots=true"},
+		{alert: "ScaleCSIClonePromoteRefused", set: "zfs.promoteRestoredClones=true"},
+	}
+
+	t.Run("absent with only the PrometheusRule enabled", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+			"--set", "metrics.prometheusRule.enabled=true")
+		for _, tc := range gated {
+			if strings.Contains(out, tc.alert) {
+				t.Errorf("%s must stay absent until %s is set", tc.alert, tc.set)
+			}
+		}
+	})
+
+	for _, tc := range gated {
+		t.Run(tc.alert, func(t *testing.T) {
+			out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+				"--set", "metrics.prometheusRule.enabled=true", "--set", tc.set)
+			if !strings.Contains(out, "- alert: "+tc.alert) {
+				t.Errorf("--set %s did not render %s; got:\n%s", tc.set, tc.alert, out)
+			}
+			if !strings.Contains(out, "severity: warning") {
+				t.Errorf("%s must carry a warning severity", tc.alert)
+			}
+		})
+	}
+}
+
 // TestChartDeprecatedKeysNotRendered proves the retired iscsi.extentAvailThreshold
 // and nvmeof.commandTimeout keys are no longer rendered into the driver configmap.
 // Both were parsed but consumed by nothing (the nvme CLI timeout is

@@ -211,7 +211,11 @@ func ruleExpressions(t *testing.T) (exprs []string, recordingRules map[string]bo
 	rendered := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
 		"--set", "metrics.prometheusRule.enabled=true",
 		"--set", "capacity.gaugeEnabled=true",
-		"--set", "backendHealth.enabled=true")
+		"--set", "backendHealth.enabled=true",
+		"--set", "zfs.reportVolumeUsage=true",
+		"--set", "zfs.snapshotSchedule=0 0 * * *",
+		"--set", "zfs.holdCsiSnapshots=true",
+		"--set", "zfs.promoteRestoredClones=true")
 	ruleManifest := findManifest(t, decodeManifests(t, rendered), "PrometheusRule", "scale-csi")
 
 	spec, ok := asManifest(ruleManifest["spec"])
