@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -66,6 +67,11 @@ const encryptionUnlockPassDeadline = 5 * time.Minute
 // large fleet would flood the middleware. The remainder carries over to the next
 // pass and the carry-over is logged. A var so tests can shrink it.
 var encryptionUnlockMaxVolumesPerPass = 25
+
+// encryptionCandidateReadChunk bounds how many dataset ids ride in one batched
+// pool.dataset.query filter, so a large encrypted fleet cannot build an
+// unbounded "id in [...]" argument.
+const encryptionCandidateReadChunk = 100
 
 // encryptionUnlockPerVolumeDelay paces the acting volumes so a pass cannot
 // dispatch its whole budget of unlock jobs in a burst. It is a var so tests can
@@ -143,16 +149,25 @@ func (d *Driver) reconcileEncryptedUnlocks(ctx context.Context) {
 	// with NO per-property source, so every property on that path parses with
 	// Source=="" and any source=="local" test rejects 100% of datasets. Selecting
 	// candidates with a source-gated read here made the entire reconciler a silent
-	// no-op. The local-source OWNERSHIP requirement is not dropped — it moves to a
-	// per-candidate, source-bearing pool.dataset.query confirmation
-	// (confirmEncryptionOwner) taken only for candidates that actually need an
-	// action, which is rare (locked, or an open rotation window).
+	// no-op. The local-source OWNERSHIP requirement is not dropped — it moves to
+	// the BATCHED source-bearing read below.
 	candidates := make([]string, 0, len(datasets))
 	for _, ds := range datasets {
 		if encryptionUnlockCandidate(ds) {
 			candidates = append(candidates, ds.Name)
 		}
 	}
+
+	// ONE batched pool.dataset.query for every candidate. It is source-bearing
+	// (so it settles ownership) and it carries the cheap non-job `locked` signal
+	// (P-4), which is what keeps the pass's @job fan-out proportional to the
+	// volumes that actually need work rather than to the encrypted fleet size: a
+	// DatasetEncryptionSummary is a JOB (dispatch + poll + core.get_jobs), and
+	// paying one per encrypted volume per cadence forever is exactly the
+	// per-volume-summary cost design E-5 refused in ListVolumes. The summary is
+	// still the AUTHORITATIVE gate before any unlock (P-8) — this read only
+	// decides whether it is worth asking.
+	states := d.readEncryptionCandidateStates(passCtx, candidates)
 
 	resolver := &encryptionSecretResolver{
 		d:              d,
@@ -173,13 +188,20 @@ func (d *Driver) reconcileEncryptedUnlocks(ctx context.Context) {
 			case <-time.After(encryptionUnlockPerVolumeDelay):
 			}
 		}
-		outcome := d.reconcileEncryptedUnlockOne(passCtx, resolver, datasetName)
+		state, stateRead := states[datasetName]
+		outcome := d.reconcileEncryptedUnlockOne(passCtx, resolver, datasetName, state, stateRead)
 		counts[outcome]++
 		processed++
 		if outcome.acts() {
 			acted++
 		}
 	}
+
+	// Bound the per-volume bookkeeping to LIVE volumes. Enumeration is complete
+	// even when processing was truncated, so the candidate set is the right
+	// retention key: a deleted (or no-longer-encrypted) volume leaves no entry
+	// behind for the life of the process.
+	d.pruneEncryptionVolumeState(candidates)
 
 	remaining := len(candidates) - processed
 	if remaining > 0 && ctx.Err() == nil {
@@ -214,17 +236,80 @@ func encryptionUnlockCandidate(ds *truenas.Dataset) bool {
 	return datasetUserPropertyHasValue(ds, PropEncryption) || datasetEncryptedOnWire(ds)
 }
 
-// reconcileEncryptedUnlockOne converges ONE candidate volume. It takes the same
-// per-volume operation lock ControllerPublishVolume holds, so a publish and this
-// reconciler can never issue overlapping unlock/change_key jobs on one dataset
-// (which, on an already-unlocked dataset, is a FAILED job by P-8 and used to be
-// reported as an unhealthy volume — R4).
+// reconcileEncryptedUnlockOne converges ONE candidate volume.
+//
+// state is that volume's row from the pass's batched, SOURCE-BEARING read
+// (stateRead reports whether the row was returned at all). Everything that can
+// be decided from it — ownership, and whether the volume even looks locked — is
+// decided BEFORE any @job is dispatched, so a healthy encrypted fleet costs the
+// listing plus one batched query per pass and nothing per volume.
+//
+// It takes the same per-volume operation lock ControllerPublishVolume holds, so
+// a publish and this reconciler can never issue overlapping unlock/change_key
+// jobs on one dataset (which, on an already-unlocked dataset, is a FAILED job by
+// P-8 and used to be reported as an unhealthy volume — R4).
 func (d *Driver) reconcileEncryptedUnlockOne(
 	ctx context.Context,
 	resolver *encryptionSecretResolver,
 	datasetName string,
+	state *truenas.Dataset,
+	stateRead bool,
 ) encryptionUnlockOutcome {
 	volumeID := d.volumeIDForDataset(datasetName)
+
+	if !stateRead {
+		// The batched read did not cover this dataset (it errored, or the dataset
+		// disappeared between the listing and the read). Fall back to the
+		// single-dataset source-bearing read rather than acting on no evidence.
+		var confirmed bool
+		state, confirmed = d.confirmEncryptionOwner(ctx, datasetName, volumeID)
+		if state == nil {
+			d.noteEncryptionUnlockFailure(volumeID, "read dataset state")
+			return encryptionOutcomeFailed
+		}
+		if !confirmed {
+			return encryptionOutcomeForeign
+		}
+	}
+	if state == nil {
+		// Row absent from a successful batch: the dataset is gone. Nothing to do.
+		return encryptionOutcomeHealthy
+	}
+	// OWNERSHIP, settled on a source-bearing read: the encryption stamp must be
+	// LOCAL to this dataset. A clone's stamp reports the ORIGIN SNAPSHOT as its
+	// source (never "local"), and its key belongs to its encryption root (P-7), so
+	// it is not this volume's key to load.
+	if !isEncryptedDataset(state) {
+		klog.V(4).Infof("Encryption unlock reconcile: %s carries no LOCAL encryption stamp (inherited or foreign); "+
+			"it is not this driver's key to load", volumeID)
+		return encryptionOutcomeForeign
+	}
+
+	// Keys come from Kubernetes (PV -> StorageClass -> Secret), all cached per
+	// pass, so resolving them costs no backend call and decides whether a rotation
+	// window is open.
+	keys, resolveErr := resolver.keysFor(ctx, volumeID)
+	windowOpen := resolveErr == nil && keys.rotationIntent()
+	if !windowOpen {
+		// The window is closed (or never opened): drop any converged fingerprint so
+		// a LATER window for this volume converges again.
+		d.forgetEncryptionRotationConverged(volumeID)
+	}
+
+	// The cheap, non-job signal (P-4: pool.dataset.query returns locked) decides
+	// whether this volume is worth a summary @job at all.
+	needsRotationConvergence := windowOpen && !d.encryptionRotationConvergedFor(volumeID, keys)
+	if !state.Locked && !needsRotationConvergence {
+		d.clearEncryptionUnlockFailure(volumeID)
+		return encryptionOutcomeHealthy
+	}
+	if state.Locked && (resolveErr != nil || keys.Passphrase == "") {
+		// Redacted: name the volume and the reason, never a credential.
+		klog.Warningf("Encryption unlock reconcile: volume %s is locked but no unlock passphrase could be resolved: %v",
+			volumeID, resolveErr)
+		d.noteEncryptionUnlockFailure(volumeID, "no resolvable unlock passphrase")
+		return encryptionOutcomeFailed
+	}
 
 	lockKey := volumeLockKey(volumeID)
 	if !d.acquireOperationLock(lockKey) {
@@ -235,6 +320,9 @@ func (d *Driver) reconcileEncryptedUnlockOne(
 	}
 	defer d.releaseOperationLock(lockKey)
 
+	// AUTHORITATIVE gate (P-8), and the read that resolves any staleness in the
+	// batched pre-read: unlock is not idempotent, so the decision to call it is
+	// never made from a cached observation.
 	summaryCtx, cancel := context.WithTimeout(ctx, encryptionUnlockCallTimeout)
 	summary, summaryErr := d.truenasClient.DatasetEncryptionSummary(summaryCtx, datasetName)
 	cancel()
@@ -252,40 +340,27 @@ func (d *Driver) reconcileEncryptedUnlockOne(
 		d.noteEncryptionUnlockFailure(volumeID, "unreadable encryption summary")
 		return encryptionOutcomeFailed
 	}
-
-	if !locked {
-		d.clearEncryptionUnlockFailure(volumeID)
-		return d.completeInterruptedRotation(ctx, resolver, datasetName, volumeID)
-	}
-
-	// Source-bearing OWNERSHIP confirmation before touching a locked dataset. The
-	// listing that produced this candidate has no property sources, so this is the
-	// read that proves the encryption stamp is LOCAL to this dataset — i.e. that
-	// the volume's encryption is its own and not inherited from a clone origin
-	// (P-7). Paid only for candidates that need an action.
-	fresh, confirmed := d.confirmEncryptionOwner(ctx, datasetName, volumeID)
-	if !confirmed {
-		return encryptionOutcomeForeign
-	}
-	if fresh != nil && !fresh.Locked {
-		// Raced: a publish unlocked it between the summary read and this read.
+	if !locked && !windowOpen {
+		// It was unlocked by someone else between the batched read and now. Benign.
 		d.clearEncryptionUnlockFailure(volumeID)
 		return encryptionOutcomeRaced
 	}
 
-	keys, resolveErr := resolver.keysFor(ctx, volumeID)
-	if resolveErr != nil || keys.Passphrase == "" {
-		// Redacted: name the volume and the reason, never a credential.
-		klog.Warningf("Encryption unlock reconcile: volume %s is locked but no unlock passphrase could be resolved: %v",
-			volumeID, resolveErr)
-		d.noteEncryptionUnlockFailure(volumeID, "no resolvable unlock passphrase")
-		return encryptionOutcomeFailed
-	}
-
 	callCtx, callCancel := context.WithTimeout(ctx, encryptionUnlockCallTimeout)
-	convergeErr := d.convergeEncryptedDatasetKey(callCtx, datasetName, volumeID, true, keys)
+	convergeErr := d.convergeEncryptedDatasetKey(callCtx, datasetName, volumeID, locked, keys, true)
 	callCancel()
 	if convergeErr != nil {
+		var incomplete *encryptionRotationIncompleteError
+		if errors.As(convergeErr, &incomplete) {
+			// NOT a race: unlock worked, the RE-KEY failed. The dataset is unlocked,
+			// so the post-failure re-read would say "unlocked" and quietly bucket a
+			// real rotation failure as benign. It is a failure, and it is the one an
+			// operator must act on (keep passphrasePrevious).
+			klog.Warningf("Encryption unlock reconcile: volume %s was unlocked but its rotation did not complete: %s",
+				volumeID, redactEncryptionError(convergeErr, keys.Passphrase, keys.Previous))
+			d.noteEncryptionUnlockFailure(volumeID, "key rotation did not complete")
+			return encryptionOutcomeFailed
+		}
 		// R4/TOCTOU: a lost race with a publish looks exactly like a failed unlock
 		// (P-8 turns an unlock of an already-unlocked dataset into a FAILED job).
 		// Re-read before calling a healthy, serving volume dead.
@@ -301,58 +376,41 @@ func (d *Driver) reconcileEncryptedUnlockOne(
 		return encryptionOutcomeFailed
 	}
 	d.clearEncryptionUnlockFailure(volumeID)
-	if keys.rotationIntent() {
-		d.markEncryptionRotationConverged(volumeID, keys)
+	if !locked {
+		klog.Infof("Encryption unlock reconcile: completed the open key rotation for volume %s", volumeID)
+		return encryptionOutcomeRotated
 	}
 	klog.Infof("Encryption unlock reconcile: re-unlocked locked encrypted volume %s", volumeID)
 	return encryptionOutcomeUnlocked
 }
 
-// completeInterruptedRotation handles the UNLOCKED arm. An unlocked dataset is
-// serving I/O, so this is not an availability path — it is the R2 (permanent key
-// loss) path. A controller killed between unlock(previous) and change_key leaves
-// the volume unlocked but still keyed to the PREVIOUS passphrase while the
-// operator believes rotation completed; when they then drop passphrasePrevious,
-// the next lock is terminal. So while a rotation window is open, this converges
-// the key with change_key(current) — a no-op by outcome when the volume is
-// already on the current key (probed live 2026-08-02, see
-// convergeEncryptedDatasetKey) — exactly ONCE per window per volume, tracked by
-// a passphrase fingerprint so a later window converges again but a steady-state
-// open window does not re-key on every pass.
-func (d *Driver) completeInterruptedRotation(
-	ctx context.Context,
-	resolver *encryptionSecretResolver,
-	datasetName, volumeID string,
-) encryptionUnlockOutcome {
-	keys, err := resolver.keysFor(ctx, volumeID)
-	if err != nil || !keys.rotationIntent() {
-		// A healthy unlocked volume whose key cannot be resolved is NOT a failure:
-		// nothing is broken, and there is nothing to do.
-		return encryptionOutcomeHealthy
+// readEncryptionCandidateStates reads every candidate's row through the
+// SOURCE-BEARING pool.dataset.query path in one batched call (chunked so a large
+// encrypted fleet cannot build an unbounded filter). A failed chunk simply
+// returns no rows for its names; the per-volume path then falls back to a
+// single-dataset read rather than acting on no evidence.
+func (d *Driver) readEncryptionCandidateStates(ctx context.Context, names []string) map[string]*truenas.Dataset {
+	states := make(map[string]*truenas.Dataset, len(names))
+	for start := 0; start < len(names); start += encryptionCandidateReadChunk {
+		end := start + encryptionCandidateReadChunk
+		if end > len(names) {
+			end = len(names)
+		}
+		callCtx, cancel := context.WithTimeout(ctx, encryptionUnlockCallTimeout)
+		chunk, err := d.truenasClient.DatasetGetByNames(callCtx, names[start:end])
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil {
+				klog.Warningf("Encryption unlock reconcile: batched dataset read failed for %d candidates; "+
+					"falling back to per-volume reads: %v", end-start, err)
+			}
+			continue
+		}
+		for name, ds := range chunk {
+			states[name] = ds
+		}
 	}
-	if d.encryptionRotationConvergedFor(volumeID, keys) {
-		return encryptionOutcomeHealthy
-	}
-	fresh, confirmed := d.confirmEncryptionOwner(ctx, datasetName, volumeID)
-	if !confirmed {
-		return encryptionOutcomeForeign
-	}
-	if fresh != nil && fresh.Locked {
-		// It locked between the summary read and now; the next pass takes the
-		// locked arm.
-		return encryptionOutcomeRaced
-	}
-	callCtx, cancel := context.WithTimeout(ctx, encryptionUnlockCallTimeout)
-	convergeErr := d.convergeEncryptedDatasetKey(callCtx, datasetName, volumeID, false, keys)
-	cancel()
-	if convergeErr != nil {
-		klog.Warningf("Encryption unlock reconcile: could not converge the open rotation window for volume %s: %s",
-			volumeID, redactEncryptionError(convergeErr, keys.Passphrase, keys.Previous))
-		return encryptionOutcomeFailed
-	}
-	d.markEncryptionRotationConverged(volumeID, keys)
-	klog.Infof("Encryption unlock reconcile: completed the open key rotation for volume %s", volumeID)
-	return encryptionOutcomeRotated
+	return states
 }
 
 // confirmEncryptionOwner re-reads a candidate through pool.dataset.query (the
@@ -588,6 +646,49 @@ func (d *Driver) noteEncryptionUnlockFailure(volumeID, reason string) {
 	d.recordWarningEvent(volumeEventRef(volumeID), EventReasonEncryptionUnlockFailed,
 		fmt.Sprintf("Encrypted volume %s has stayed locked across %d reconcile passes (%s); its pods see I/O errors until it is re-unlocked",
 			volumeID, count, reason))
+}
+
+// forgetEncryptionRotationConverged drops a volume's converged-window
+// fingerprint, so a LATER rotation window for the same volume converges again
+// instead of being suppressed by a stale entry.
+func (d *Driver) forgetEncryptionRotationConverged(volumeID string) {
+	d.encryptionUnlockFailMu.Lock()
+	delete(d.encryptionRotationConverged, volumeID)
+	d.encryptionUnlockFailMu.Unlock()
+}
+
+// forgetEncryptionVolumeState drops every per-volume encryption bookkeeping
+// entry for a volume. Called when a volume is deleted: neither map may retain an
+// entry for an object that no longer exists.
+func (d *Driver) forgetEncryptionVolumeState(volumeID string) {
+	d.encryptionUnlockFailMu.Lock()
+	delete(d.encryptionRotationConverged, volumeID)
+	delete(d.encryptionUnlockFailures, volumeID)
+	d.encryptionUnlockFailMu.Unlock()
+}
+
+// pruneEncryptionVolumeState retains bookkeeping only for volumes that are still
+// encryption candidates on the backend. Both maps are keyed by volume id and
+// were previously only ever cleared on a positive event, so a deleted volume's
+// entry survived for the life of the process: bounded by LIFETIME volume count
+// rather than live volume count.
+func (d *Driver) pruneEncryptionVolumeState(candidateDatasets []string) {
+	live := make(map[string]struct{}, len(candidateDatasets))
+	for _, datasetName := range candidateDatasets {
+		live[d.volumeIDForDataset(datasetName)] = struct{}{}
+	}
+	d.encryptionUnlockFailMu.Lock()
+	defer d.encryptionUnlockFailMu.Unlock()
+	for volumeID := range d.encryptionRotationConverged {
+		if _, ok := live[volumeID]; !ok {
+			delete(d.encryptionRotationConverged, volumeID)
+		}
+	}
+	for volumeID := range d.encryptionUnlockFailures {
+		if _, ok := live[volumeID]; !ok {
+			delete(d.encryptionUnlockFailures, volumeID)
+		}
+	}
 }
 
 // clearEncryptionUnlockFailure resets a volume's consecutive-failure streak once
