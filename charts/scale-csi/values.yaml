@@ -154,6 +154,25 @@ backendHealth:
   # at this default, never more than 6m.
   interval: 60s
 
+# ZFS-native encryption at rest (GF-Sprint 1). Strictly opt-in: with
+# enabled=false (default) every volume is provisioned plaintext and nothing
+# encryption-related renders into the ConfigMap, so behavior is identical to a
+# pre-encryption deployment. Credentials are NEVER set here; the passphrase is
+# supplied per-StorageClass via the CSI secret refs (see encryptionSecretName on
+# a storageClasses[] entry and docs/reference/storageclass.md).
+#
+# AVAILABILITY HAZARD: a locked dataset serves ZERO I/O. Because TrueNAS does not
+# persist a passphrase key (the key is not in the TrueNAS database), a nas01
+# reboot leaves every encrypted volume LOCKED until the controller's unlock
+# reconciler re-unlocks it best-effort; pods on those volumes see I/O errors
+# during the window. Lost Secret = permanent data loss (no TrueNAS-side escrow).
+# Read docs/reference/storageclass.md › "Encryption at rest" before enabling.
+encryption:
+  # Opt the controller into encryption-at-rest management (create-time folding,
+  # publish-time unlock, the locked-volume reconciler, and the locked
+  # VolumeCondition signal). Default off.
+  enabled: false
+
 # Stable ownership identity stamped on newly-created datasets/zvols. Empty
 # derives "<csiDriverName>@<zfs.parentDataset>". Never change this for an
 # existing installation unless the matching datasets are deliberately adopted.
@@ -726,6 +745,35 @@ storageClasses:
     allowVolumeExpansion: true
     volumeBindingMode: Immediate
     mountOptions: []
+    extraParameters: {}
+  # Opt-in example: an NFS class with ZFS-native encryption at rest
+  # (GF-Sprint 1). Disabled by default. Enable it (and encryption.enabled above)
+  # to create it. The passphrase lives in a Kubernetes Secret named
+  # encryptionSecretName (created by the operator, see
+  # docs/reference/storageclass.md); the chart only renders the CSI secret-ref
+  # parameters, never the credential values. The same Secret is referenced for
+  # provisioner-secret (CreateVolume), controller-publish-secret (publish-time
+  # unlock) and node-stage-secret.
+  #
+  # CREATE-TIME ONLY: encryption is immutable for the life of a volume. An
+  # encrypted class cannot also restore from a content source — the driver
+  # refuses encryption + volumeContentSource at CreateVolume — so there is
+  # deliberately no snapshotRestoreMode coupling here. Restore to a plaintext
+  # class, or create new. See docs/reference/storageclass.md › "Encryption at
+  # rest".
+  - name: scale-nfs-encrypted
+    enabled: false
+    protocol: nfs
+    encryptionSecretName: scale-nfs-encrypted
+    # encryptionSecretNamespace defaults to the release namespace when unset.
+    encryptionSecretNamespace: ""
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: Immediate
+    mountOptions:
+      - nfsvers=4
+      - noatime
     extraParameters: {}
   # Opt-in example: an iSCSI class tuned for 4K-aligned workloads (GF-Sprint 4).
   # Disabled by default. The block-protocol knobs are per-StorageClass parameters

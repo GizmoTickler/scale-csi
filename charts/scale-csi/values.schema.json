@@ -337,6 +337,15 @@
         "chapSecretNamespace": {
           "type": "string"
         },
+        "encryptionSecretName": {
+          "description": "Name of the per-StorageClass Kubernetes Secret holding the ZFS-native encryption passphrase (GF-Sprint 1). Setting it emits the encryption parameter and the provisioner/controller-publish/node-stage CSI secret refs. The chart references the Secret by name/namespace only; the passphrase never appears in the chart. Encryption is create-time only and cannot be combined with a content-source restore.",
+          "type": "string",
+          "minLength": 1
+        },
+        "encryptionSecretNamespace": {
+          "description": "Namespace of the encryption Secret. Defaults to the release namespace when unset.",
+          "type": "string"
+        },
         "nfsSecurity": {
           "description": "Per-class sharing.nfs security list. Rendered as the comma-joined nfsSecurity parameter.",
           "type": "array",
@@ -503,6 +512,16 @@
           "description": "Poll cadence, clamped to 30s-2m; an out-of-range value is clamped with one startup warning, never rejected. The 2m ceiling keeps a hysteresis-CONFIRMED VolumeCondition flip (up to 2 x interval PLUS one 30s backend call timeout, so up to 4m30s) inside the 5m ScaleCSIPoolDegraded hold WHILE SUCCESSFUL SAMPLES KEEP ARRIVING - it bounds cadence, not wall-clock publication, and it does not make the raw gauges, the debounced condition and the alert agree at every instant. It in fact creates the alert-hold divergence, in which the condition is already abnormal while the alert is still pending. SCOPE: 4m30s bounds DRIVER-SIDE PUBLICATION only - the CSI read, external-health-monitor refresh (healthMonitor.interval has no maximum here), the Prometheus scrape (the ServiceMonitor interval has no maximum either) and rule evaluation are all downstream of it and unbounded, so it is NOT a deadline for a PVC becoming abnormal. The staleness TTL is 3 x the effective clamped value. See docs/production.md#backend-health. The full, canonical taxonomy is seven numbered classes: 1. confirmation lag (BOUNDED), 2. alert hold (BOUNDED), 3. recovery (BOUNDED), 4. poll stall (UNBOUNDED - it lasts until a successful USABLE sample arrives; a reply is not a usable sample, since a valid pool.query that does not list the pool returns 'pool ... not found' and is still a failed sample), 5. observer lag (UNBOUNDED - Prometheus scrape and rule-evaluation cadence, which this chart does not limit; compare the driver-owned scale_csi_pool_health_last_success_timestamp_seconds, never timestamp(), which returns the scrape time), 6. cold start (UNBOUNDED - before the first successful sample of a process the raw scale_csi_pool_* series do not exist at all, and the stale gauge cannot tell a missing or renamed pool from an unreachable one), 7. replica skew (UNBOUNDED - a producer-identity difference: every replica polls and a fencing-off rollout can overlap processes, so max by (pool) merges independently sampled histories; detect it with count by (pool) on the last-success timestamp, alert ScaleCSIPoolHealthProducerSkew).",
           "type": "string",
           "minLength": 2
+        }
+      }
+    },
+    "encryption": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Opt the controller into ZFS-native encryption-at-rest management (GF-Sprint 1): create-time folding, publish-time unlock, the locked-volume reconciler, and the locked VolumeCondition signal. Strictly opt-in; with this false (default) nothing encryption-related renders into the ConfigMap and every volume provisions plaintext. The passphrase is supplied per-StorageClass via encryptionSecretName, never here. Encryption is an availability hazard: a nas01 reboot locks every encrypted volume until the reconciler re-unlocks it, and a lost Secret is permanent data loss. See docs/reference/storageclass.md.",
+          "type": "boolean"
         }
       }
     },

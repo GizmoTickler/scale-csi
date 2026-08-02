@@ -124,5 +124,25 @@ parameters:
   {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-name" $storageClass.chapSecretName -}}
   {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-namespace" $chapSecretNamespace -}}
   {{- end }}
+  {{- /* Encryption (GF-Sprint 1): when a per-StorageClass encryption Secret is
+       named, emit the encryption parameter AND the three CSI secret-ref
+       parameters — provisioner-secret (CreateVolume), controller-publish-secret
+       (the publish-time unlock and the locked-volume reconciler's Secret
+       resolution) and node-stage-secret (parity with the CHAP block). The chart
+       references the Secret by name/namespace only; the passphrase never appears
+       here. The namespace defaults to the release namespace when left unset.
+       Encryption is create-time only: the driver refuses an encrypted create that
+       also carries a content source, so there is deliberately no chart-level
+       snapshotRestoreMode coupling. */}}
+  {{- if $storageClass.encryptionSecretName }}
+  {{- $encryptionSecretNamespace := $storageClass.encryptionSecretNamespace | default $root.Release.Namespace -}}
+  {{- $_ := set $parameters "encryption" "true" -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-name" $storageClass.encryptionSecretName -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-namespace" $encryptionSecretNamespace -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/controller-publish-secret-name" $storageClass.encryptionSecretName -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/controller-publish-secret-namespace" $encryptionSecretNamespace -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-name" $storageClass.encryptionSecretName -}}
+  {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-namespace" $encryptionSecretNamespace -}}
+  {{- end }}
   {{- toYaml $parameters | nindent 2 }}
 {{- end }}
