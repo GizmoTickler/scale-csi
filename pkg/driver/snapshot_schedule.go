@@ -1013,12 +1013,37 @@ func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *tr
 }
 
 // foreignSnapshotRefusalMessage composes the DeleteVolume foreign-snapshot
-// refusal (GF2-fix4/M2). When some of the blocking snapshots are the volume's
-// OWN scheduled snapshots that failed a provenance link, the generic advice does
-// not apply to them and saying so is the difference between an operator deleting
-// the right thing and deleting the wrong thing.
-func foreignSnapshotRefusalMessage(volumeID string, unproven int) string {
+// refusal (GF2-fix4/M2). When some of the blocking snapshots are not in fact
+// foreign, the generic advice does not apply to them and saying so is the
+// difference between an operator deleting the right thing and deleting the wrong
+// thing. Two such populations are named:
+//
+//   - the volume's OWN scheduled snapshots that failed a provenance link
+//     (unproven);
+//   - this driver's OWN deferred-deletion tombstones (v1.5.1). The live v1.5.0
+//     drill hit this: a DeleteSnapshot whose snapshot still had a live clone
+//     tombstones it and ledgers it, and the following DeleteVolume then blamed
+//     "a TrueNAS periodic-snapshot or replication task" for the driver's own
+//     object and pointed the operator at destroyForeignSnapshotsOnDelete — a far
+//     broader, riskier setting than the situation warrants, for snapshots the
+//     reconcile reaper clears by itself.
+//
+// blocking is the total number of preserved snapshots the refusal is about, so
+// an all-tombstone refusal can drop the foreign-task advice entirely instead of
+// merely appending a correction to it.
+func foreignSnapshotRefusalMessage(volumeID string, blocking, unproven, tombstones int) string {
+	if tombstones > 0 && tombstones >= blocking {
+		return fmt.Sprintf(
+			"volume %s cannot be deleted yet: all %d snapshots blocking it are this driver's own deferred-deletion tombstones "+
+				"awaiting the reconcile reaper (a DeleteSnapshot renamed them because the snapshot still had a live clone). "+
+				"They clear automatically on a later reconcile pass and the delete then succeeds — do NOT set "+
+				"zfs.destroyForeignSnapshotsOnDelete for them; nothing foreign is involved",
+			volumeID, blocking)
+	}
 	message := fmt.Sprintf("volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
+	if tombstones > 0 {
+		message += fmt.Sprintf("; that advice covers only %d of them — the other %d are this driver's own deferred-deletion tombstones awaiting the reconcile reaper, which clear automatically, so do NOT set zfs.destroyForeignSnapshotsOnDelete for them", blocking-tombstones, tombstones)
+	}
 	if unproven > 0 {
 		message += fmt.Sprintf("; %d of these carry this volume's own scheduled-snapshot naming shape but could not be proven driver-owned (see scale_csi_scheduled_snapshot_unproven_total and the controller log for the failing link), so that advice does not describe them", unproven)
 	}

@@ -3134,3 +3134,94 @@ func TestDeleteSnapshotWithTombstoneShapedNameHasFullLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, remaining, "DeleteSnapshot must actually delete the tombstone-shaped-name CSI snapshot")
 }
+
+// TestDeleteVolumeRefusalNamesOwnTombstonesNotForeignTasks is the v1.5.0 drill
+// regression. A DeleteSnapshot whose snapshot still had a live clone defers by
+// tombstoning it and recording it in the driver's own ledger; the DeleteVolume
+// that follows was then refused with "likely from a TrueNAS periodic-snapshot or
+// replication task on the parent dataset" and told the operator to set
+// zfs.destroyForeignSnapshotsOnDelete — for the driver's OWN object, which the
+// reconcile reaper clears by itself.
+//
+// The DECISION is deliberately unchanged (the volume is still preserved until
+// the tombstone is reaped); only the diagnosis is asserted here.
+func TestDeleteVolumeRefusalNamesOwnTombstonesNotForeignTasks(t *testing.T) {
+	ctx := context.Background()
+	mockClient := truenas.NewMockClient()
+	// TrueNAS 26.0 has no deferred destroy, which is exactly why the tombstone
+	// (and its ledger entry) survives for the reconcile reaper — the state the
+	// live drill was in when the refusal misdiagnosed it.
+	mockClient.NoDeferredSnapshotDestroy = true
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+			DriverName: "org.scale.csi.nfs",
+		},
+		truenasClient: mockClient,
+	}
+
+	mustCreateParentDataset(t, mockClient)
+	_, err := mockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: "pool/parent/source", Type: "FILESYSTEM", Refquota: testGiB,
+	})
+	require.NoError(t, err)
+	stampDriverOwnership(t, mockClient, d, "pool/parent/source")
+	created, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
+		Name: "restore-point", SourceVolumeId: "source",
+	})
+	require.NoError(t, err)
+
+	// A live clone forces DeleteSnapshot down the deferred (tombstone) path.
+	require.NoError(t, mockClient.SnapshotClone(ctx,
+		"pool/parent/source@"+created.GetSnapshot().GetSnapshotId(), "pool/parent/restored"))
+	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "restore-point"})
+	require.NoError(t, err)
+
+	// Delete the clone through the driver, as the drill did. The tombstone is NOT
+	// reclaimed with it — 26.0 has no deferred destroy — so it waits for the
+	// reconcile reaper, which is the state the misdiagnosis was reported from.
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "restored"})
+	require.NoError(t, err)
+
+	// The tombstone really is the driver's own, proven the way the delete path
+	// proves it: the rename strips the identity properties, so the ledger is what
+	// carries the proof.
+	snapshots, err := mockClient.SnapshotList(ctx, "pool/parent/source")
+	require.NoError(t, err)
+	require.Equal(t, 1, d.countProvenDriverTombstones(ctx, snapshots),
+		"the blocking snapshot must be a ledger-proven driver tombstone")
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "source"})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "deferred-deletion tombstones")
+	assert.Contains(t, err.Error(), "reconcile reaper")
+	assert.NotContains(t, err.Error(), "periodic-snapshot or replication task",
+		"the driver's own tombstone must not be blamed on a foreign task")
+	assert.NotContains(t, err.Error(), "set zfs.destroyForeignSnapshotsOnDelete=true",
+		"an operator must not be steered at the broad foreign-destroy setting for a self-healing tombstone")
+}
+
+// TestForeignSnapshotRefusalMessageMixedPopulations pins the composed message
+// for the cases the end-to-end test cannot cheaply build.
+func TestForeignSnapshotRefusalMessageMixedPopulations(t *testing.T) {
+	t.Run("no tombstones keeps the historical foreign-task advice", func(t *testing.T) {
+		message := foreignSnapshotRefusalMessage("vol", 2, 0, 0)
+		assert.Contains(t, message, "non-CSI snapshots")
+		assert.Contains(t, message, "periodic-snapshot or replication task")
+		assert.NotContains(t, message, "tombstone")
+	})
+
+	t.Run("a mixed population scopes the foreign advice to the foreign ones", func(t *testing.T) {
+		message := foreignSnapshotRefusalMessage("vol", 3, 0, 1)
+		assert.Contains(t, message, "periodic-snapshot or replication task")
+		assert.Contains(t, message, "covers only 2 of them")
+		assert.Contains(t, message, "1 are this driver's own deferred-deletion tombstones")
+	})
+
+	t.Run("the unproven-scheduled correction still composes", func(t *testing.T) {
+		message := foreignSnapshotRefusalMessage("vol", 3, 2, 1)
+		assert.Contains(t, message, "covers only 2 of them")
+		assert.Contains(t, message, "scale_csi_scheduled_snapshot_unproven_total")
+	})
+}

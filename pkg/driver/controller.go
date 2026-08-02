@@ -1429,8 +1429,14 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 
 	foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone, true)
 	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(foreignSnapshots) > 0 {
-		klog.Infof("Volume %s has non-CSI snapshots and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion", volumeID)
-		return nil, status.Error(codes.FailedPrecondition, foreignSnapshotRefusalMessage(volumeID, unprovenSnapshots))
+		// The DECISION is unchanged — preserve-until-reaped is deliberate. Only the
+		// DIAGNOSIS is refined: a blocking snapshot this driver provably tombstoned
+		// itself must not be blamed on a foreign task.
+		tombstones := d.countProvenDriverTombstones(ctx, foreignSnapshots)
+		klog.Infof("Volume %s has %d snapshots blocking deletion (%d of them this driver's own deferred-deletion tombstones) and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion",
+			volumeID, len(foreignSnapshots), tombstones)
+		return nil, status.Error(codes.FailedPrecondition,
+			foreignSnapshotRefusalMessage(volumeID, len(foreignSnapshots), unprovenSnapshots, tombstones))
 	}
 
 	// Delete share first (errors are fatal to prevent orphaned targets)
@@ -1522,7 +1528,8 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// appeared after that check, not to re-report the same ones.
 			foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone, false)
 			if len(foreignSnapshots) > 0 && !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
-				return nil, status.Error(codes.FailedPrecondition, foreignSnapshotRefusalMessage(volumeID, unprovenSnapshots))
+				return nil, status.Error(codes.FailedPrecondition, foreignSnapshotRefusalMessage(
+					volumeID, len(foreignSnapshots), unprovenSnapshots, d.countProvenDriverTombstones(ctx, foreignSnapshots)))
 			}
 			klog.V(4).Infof("Volume %s has non-managed snapshots, deleting recursively", volumeID)
 			if delErr := d.recursiveDatasetDeleteWithHoldRecovery(ctx, datasetName); delErr != nil {
@@ -2111,18 +2118,15 @@ func (d *Driver) destroyDriverSnapshot(ctx context.Context, snapshotID string, d
 // driver tombstone made its volume permanently undeletable. This is also the
 // only production wiring of SnapshotIsHeld, which was otherwise dead code
 // carried on ClientInterface.
-func (d *Driver) releaseHeldDriverSnapshotsUnder(ctx context.Context, datasetName string) int {
-	snapshots, err := d.truenasClient.SnapshotList(ctx, datasetName)
-	if err != nil {
-		klog.Warningf("Could not list snapshots of %s to clear driver-owned holds: %v", datasetName, err)
-		return 0
-	}
-	// The tombstone ledger is the driver's AUTHORITATIVE proof that it tombstoned
-	// a snapshot. It is read once, lazily, and only on this already-failed path:
-	// the retained-identity chain alone is not sufficient here because
-	// handleSnapshotClones attempts to strip those identity properties at rename.
+// lazyTombstoneLedger returns an accessor that reads the tombstone ledger at
+// most once, on first use. The ledger is the driver's AUTHORITATIVE proof that
+// it tombstoned a snapshot, and the retained-identity chain alone is not
+// sufficient because handleSnapshotClones attempts to strip those identity
+// properties at rename. Callers are on already-exceptional paths (a hold
+// recovery, a delete refusal), so the read costs nothing on the hot path.
+func (d *Driver) lazyTombstoneLedger(ctx context.Context) func() map[string]tombstoneLedgerEntry {
 	var ledger map[string]tombstoneLedgerEntry
-	ledgerFor := func() map[string]tombstoneLedgerEntry {
+	return func() map[string]tombstoneLedgerEntry {
 		if ledger != nil {
 			return ledger
 		}
@@ -2136,6 +2140,59 @@ func (d *Driver) releaseHeldDriverSnapshotsUnder(ctx context.Context, datasetNam
 		}
 		return ledger
 	}
+}
+
+// snapshotIsProvenTombstone reports whether a snapshot is one this driver
+// provably tombstoned: tombstone name SHAPE plus either a retained identity that
+// re-derives through the production rename algorithm, or a matching ledger
+// entry. Shape alone is never enough — a manual lookalike must not be claimed.
+func (d *Driver) snapshotIsProvenTombstone(snap *truenas.Snapshot, ledgerFor func() map[string]tombstoneLedgerEntry) bool {
+	if !isSnapshotTombstone(snap) {
+		return false
+	}
+	if snapshotMatchesRetainedTombstoneIdentity(snap, d.driverInstanceID()) {
+		return true
+	}
+	entry, recorded := ledgerFor()[tombstoneLedgerKey(snap.ID)]
+	return recorded && tombstoneLedgerEntryMatchesSnapshot(entry, snap)
+}
+
+// countProvenDriverTombstones reports how many of the snapshots blocking a
+// DeleteVolume are this driver's OWN deferred-deletion tombstones. It is a pure
+// DIAGNOSTIC for the refusal message: it changes no decision, and the
+// preserve-until-reaped behavior is deliberate (the reconcile reaper clears them
+// and the retry then succeeds).
+//
+// The ledger is read only when at least one blocking snapshot is
+// tombstone-shaped, so an ordinary foreign-snapshot refusal costs no extra call.
+func (d *Driver) countProvenDriverTombstones(ctx context.Context, snapshots []*truenas.Snapshot) int {
+	shaped := false
+	for _, snap := range snapshots {
+		if isSnapshotTombstone(snap) {
+			shaped = true
+			break
+		}
+	}
+	if !shaped {
+		return 0
+	}
+	ledgerFor := d.lazyTombstoneLedger(ctx)
+	count := 0
+	for _, snap := range snapshots {
+		if d.snapshotIsProvenTombstone(snap, ledgerFor) {
+			count++
+		}
+	}
+	return count
+}
+
+func (d *Driver) releaseHeldDriverSnapshotsUnder(ctx context.Context, datasetName string) int {
+	snapshots, err := d.truenasClient.SnapshotList(ctx, datasetName)
+	if err != nil {
+		klog.Warningf("Could not list snapshots of %s to clear driver-owned holds: %v", datasetName, err)
+		return 0
+	}
+	ledgerFor := d.lazyTombstoneLedger(ctx)
 
 	released := 0
 	for _, snap := range snapshots {
@@ -2143,12 +2200,8 @@ func (d *Driver) releaseHeldDriverSnapshotsUnder(ctx context.Context, datasetNam
 			continue
 		}
 		owned := isCSISnapshot(snap) && snapshotCarriesInstanceIdentity(snap, d.driverInstanceID())
-		if !owned && isSnapshotTombstone(snap) {
-			if snapshotMatchesRetainedTombstoneIdentity(snap, d.driverInstanceID()) {
-				owned = true
-			} else if entry, recorded := ledgerFor()[tombstoneLedgerKey(snap.ID)]; recorded {
-				owned = tombstoneLedgerEntryMatchesSnapshot(entry, snap)
-			}
+		if !owned {
+			owned = d.snapshotIsProvenTombstone(snap, ledgerFor)
 		}
 		if !owned {
 			continue
