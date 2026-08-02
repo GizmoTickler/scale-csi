@@ -145,6 +145,9 @@ func (d *Driver) parseNFSShareOptions(params map[string]string) (*nfsShareOption
 	if err := d.validateNFSSquashConflict(opts); err != nil {
 		return nil, err
 	}
+	if err := d.validateNFSSquashPartialClear(opts); err != nil {
+		return nil, err
+	}
 	return opts, nil
 }
 
@@ -209,6 +212,57 @@ func (d *Driver) validateNFSSquashConflict(opts *nfsShareOptions) error {
 		effectiveNFSSquash(opts.mapallUser, cfg.ShareMapallUser),
 		effectiveNFSSquash(opts.mapallGroup, cfg.ShareMapallGroup),
 		nfsMaprootUserParam, nfsMaprootGroupParam, nfsMapallUserParam, nfsMapallGroupParam)
+}
+
+// validateNFSSquashPartialClear closes the half of the squash preflight the
+// v1.5.0 drill walked straight through. A squash GROUP is meaningless without
+// its user: `sharing.nfs.create` rejects the pair, and the operator sees the
+// same opaque middleware error the GF5 validator was written to eliminate.
+//
+// Probed live on TrueNAS 26.0 (2026-08-02): a StorageClass setting
+// `nfsMaprootUser: ""` while the shipped `nfs.shareMaprootGroup: wheel` default
+// stayed in place produced
+// `failed to create NFS share: TrueNAS API error [-32602]: Invalid params`.
+// That is the shape an operator naturally produces by following the documented
+// "clear the defaults" escape halfway. The mapall_* pair is refused on the same
+// grounds: the group is an attribute of the user mapping, so it cannot stand
+// alone.
+//
+// Both routes to the broken payload are covered, because it is the EFFECTIVE
+// payload that is validated: clearing the user with an explicit empty parameter
+// over a configured group, and setting only the group on a class whose effective
+// user is empty.
+func (d *Driver) validateNFSSquashPartialClear(opts *nfsShareOptions) error {
+	var cfg NFSConfig
+	if d.config != nil {
+		cfg = d.config.NFS
+	}
+	for _, family := range []struct {
+		userParam, groupParam string
+		user, group           string
+	}{
+		{
+			userParam: nfsMaprootUserParam, groupParam: nfsMaprootGroupParam,
+			user:  effectiveNFSSquash(opts.maprootUser, cfg.ShareMaprootUser),
+			group: effectiveNFSSquash(opts.maprootGroup, cfg.ShareMaprootGroup),
+		},
+		{
+			userParam: nfsMapallUserParam, groupParam: nfsMapallGroupParam,
+			user:  effectiveNFSSquash(opts.mapallUser, cfg.ShareMapallUser),
+			group: effectiveNFSSquash(opts.mapallGroup, cfg.ShareMapallGroup),
+		},
+	} {
+		if family.user != "" || family.group == "" {
+			continue
+		}
+		return status.Errorf(codes.InvalidArgument,
+			"NFS export %s=%q has no user to attach to: this StorageClass resolves to an empty %s, and TrueNAS rejects a squash group "+
+				"without its user. Clear BOTH (%s=\"\" and %s=\"\") to drop the inherited nfs.share* defaults, or set %s to the user the "+
+				"group belongs to",
+			family.groupParam, family.group, family.userParam,
+			family.userParam, family.groupParam, family.userParam)
+	}
+	return nil
 }
 
 // effectiveNFSSquash resolves what a squash field will actually be on the wire:

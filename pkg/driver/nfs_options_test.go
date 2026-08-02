@@ -615,6 +615,62 @@ func TestMaprootMapallMutualExclusion(t *testing.T) {
 	})
 }
 
+// TestNFSSquashPartialClearIsRejected is the v1.5.0 drill regression: clearing
+// only the USER of a squash pair left the group orphaned, and the resulting
+// `sharing.nfs.create` failed with exactly the opaque middleware error the GF5
+// preflight exists to eliminate (`Invalid params`, surfaced as Internal).
+//
+// Both routes to that payload are covered, for both families.
+func TestNFSSquashPartialClearIsRejected(t *testing.T) {
+	shipped := func() *Driver {
+		return nfsOptionsTestDriver(t, truenas.NewMockClient(), NFSConfig{
+			ShareMaprootUser: "root", ShareMaprootGroup: "wheel",
+		})
+	}
+
+	t.Run("clearing the maproot user over the shipped group default", func(t *testing.T) {
+		_, err := shipped().parseNFSShareOptions(map[string]string{nfsMaprootUserParam: ""})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), nfsMaprootUserParam)
+		assert.Contains(t, err.Error(), nfsMaprootGroupParam)
+		assert.Contains(t, err.Error(), "wheel")
+	})
+
+	t.Run("setting only a maproot group on a class with no user", func(t *testing.T) {
+		d := nfsOptionsTestDriver(t, truenas.NewMockClient(), NFSConfig{})
+		_, err := d.parseNFSShareOptions(map[string]string{nfsMaprootGroupParam: "wheel"})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), nfsMaprootUserParam)
+	})
+
+	t.Run("the mapall family is refused the same way", func(t *testing.T) {
+		d := nfsOptionsTestDriver(t, truenas.NewMockClient(), NFSConfig{
+			ShareMapallUser: "nobody", ShareMapallGroup: "nogroup",
+		})
+		_, err := d.parseNFSShareOptions(map[string]string{nfsMapallUserParam: ""})
+		require.Error(t, err)
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		assert.Contains(t, err.Error(), nfsMapallGroupParam)
+	})
+
+	t.Run("the documented full clear still works", func(t *testing.T) {
+		opts, err := shipped().parseNFSShareOptions(map[string]string{
+			nfsMaprootUserParam:  "",
+			nfsMaprootGroupParam: "",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, opts.maprootUser)
+		assert.Empty(t, *opts.maprootUser)
+	})
+
+	t.Run("a user with no group is a legal TrueNAS mapping and stays accepted", func(t *testing.T) {
+		_, err := shipped().parseNFSShareOptions(map[string]string{nfsMaprootGroupParam: ""})
+		require.NoError(t, err, "maproot_user alone is a valid share; only an orphaned GROUP is refused")
+	})
+}
+
 // ---------------------------------------------------------------------------
 // M3 — ensureNFSProtocols must never write on an unreadable service config
 // ---------------------------------------------------------------------------
