@@ -323,6 +323,11 @@ func (d *Driver) stopBackendHealth() {
 		cancel()
 	}
 	d.backendHealthWg.Wait()
+	// Stop is terminal, so nothing will ever refresh this Driver's verdict again.
+	// Releasing it after Wait — never before — means an in-flight sample cannot
+	// re-publish behind the release and leave a stopped Driver's snapshot served
+	// for the rest of the process's life.
+	d.releaseBackendHealthSnapshot()
 }
 
 // backendHealthTTL is how long a cached snapshot may drive VolumeConditions
@@ -408,9 +413,16 @@ func validateBackendHealthSnapshot(snapshot *truenas.PoolHealthSnapshot, request
 	return nil
 }
 
+// loadBackendHealthSnapshot returns the CSI-facing snapshot ONLY when this
+// Driver published it. The generation is process-global so that one swap commits
+// the CSI and metric halves together (see backendHealthSnapshot), but a pool
+// verdict is not: it is about the pool THIS Driver polls, for the volumes THIS
+// Driver serves. Without the ownership gate a second Driver in the same process
+// — one that never enabled backendHealth, on a pool it has never polled —
+// reports every volume Abnormal off someone else's DEGRADED sample.
 func (d *Driver) loadBackendHealthSnapshot() *truenas.PoolHealthSnapshot {
 	state := backendHealthState.Load()
-	if state == nil {
+	if state == nil || state.Owner != d {
 		return nil
 	}
 	return state.CSISnapshot
@@ -418,10 +430,27 @@ func (d *Driver) loadBackendHealthSnapshot() *truenas.PoolHealthSnapshot {
 
 // storeBackendHealthSnapshot is used only by package tests that need to age or
 // seed the CSI-facing portion. Production publication uses publishSample so the
-// CSI and metric portions are committed together.
+// CSI and metric portions are committed together. It takes ownership on this
+// Driver's behalf, exactly as a real publication would.
 func (d *Driver) storeBackendHealthSnapshot(snapshot *truenas.PoolHealthSnapshot) {
 	updateBackendHealthState(func(state *backendHealthSnapshot) {
+		state.Owner = d
 		state.CSISnapshot = snapshot
+	})
+}
+
+// releaseBackendHealthSnapshot drops the CSI-facing half when this Driver still
+// owns it. It is CAS-shaped on purpose: a Driver that has already been
+// superseded by another publisher must not erase the newer owner's verdict. The
+// METRIC half is deliberately left alone — those series describe the process,
+// and zeroing them on shutdown would publish a health claim nothing sampled.
+func (d *Driver) releaseBackendHealthSnapshot() {
+	updateBackendHealthState(func(state *backendHealthSnapshot) {
+		if state.Owner != d {
+			return
+		}
+		state.Owner = nil
+		state.CSISnapshot = nil
 	})
 }
 
@@ -445,7 +474,7 @@ func (d *Driver) publishSample(snapshot *truenas.PoolHealthSnapshot) {
 		published.TemperatureSampledAt = previous.TemperatureSampledAt
 	}
 	csiSnapshot, pending := d.publishBackendHealthLocked(&published)
-	publishBackendHealthSampleState(csiSnapshot, &published, pending)
+	publishBackendHealthSampleState(d, csiSnapshot, &published, pending)
 }
 
 // publishTemperatureAlerts refreshes the per-DISK temperature count on an
@@ -470,7 +499,7 @@ func (d *Driver) publishTemperatureAlerts(pool string, alerts int) {
 	updated := *current
 	updated.TemperatureAlerts = alerts
 	updated.TemperatureSampledAt = time.Now()
-	publishBackendHealthTemperatureState(&updated)
+	publishBackendHealthTemperatureState(d, &updated)
 }
 
 // publishFailedSampleStaleness publishes the staleness verdict from inside the

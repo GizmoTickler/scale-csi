@@ -1275,3 +1275,142 @@ func TestSetPoolHealthMetricsScanStateIsOneHotAcrossTheWholeDomain(t *testing.T)
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// GF5/H1 — the process-global generation is shared; the pool VERDICT is not
+// ---------------------------------------------------------------------------
+
+// healthTestDriverSharingState builds a SECOND Driver in the same process
+// WITHOUT resetting the shared backend-health generation. Resetting it — as
+// healthTestDriver does — is exactly what hides the ownership defect, so the
+// ownership tests must not use that helper for the second driver.
+func healthTestDriverSharingState(mock *truenas.MockClient, parentDataset string) *Driver {
+	return &Driver{
+		name: "org.scale.csi",
+		config: &Config{
+			DriverName: "org.scale.csi",
+			ZFS:        ZFSConfig{DatasetParentName: parentDataset},
+			NFS:        NFSConfig{Enabled: true, ShareHost: "10.0.0.1"},
+		},
+		truenasClient: mock,
+	}
+}
+
+// TestBackendHealthSnapshotIsScopedToItsPublishingDriver pins H1. The immutable
+// generation is process-global so ONE swap commits the CSI and metric halves
+// together, but the CSI half is a verdict about the pool ONE Driver polls, for
+// the volumes THAT Driver serves. Serving it to any other Driver in the process
+// is the false-positive VolumeCondition the whole severity design exists to
+// avoid: driver B never enabled backendHealth, never polled anything, and lives
+// on a different pool.
+func TestBackendHealthSnapshotIsScopedToItsPublishingDriver(t *testing.T) {
+	const poolA = "gf5-owner-pool-a"
+	mockA := truenas.NewMockClient()
+	mockA.PoolHealthValue = &truenas.PoolHealthSnapshot{
+		Pool: poolA, Status: truenas.PoolStatusDegraded, StatusDetail: "one or more devices are faulted",
+	}
+	a := healthTestDriver(mockA)
+	a.config.ZFS.DatasetParentName = poolA + "/scale-csi"
+	a.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+	a.sampleBackendHealth(context.Background(), poolA)
+	require.NotNil(t, a.poolHealthSnapshot(), "driver A must have published its own sample")
+	require.True(t, a.volumeCondition(managedDataset()).GetAbnormal(), "driver A serves its own DEGRADED pool")
+
+	b := healthTestDriverSharingState(truenas.NewMockClient(), "otherpool/other")
+	assert.Nil(t, b.poolHealthSnapshot(),
+		"a driver that never enabled backendHealth, on a pool it has never polled, must see no snapshot at all")
+	assert.Equal(t, volumeConditionFromDataset(managedDataset()), b.volumeCondition(managedDataset()),
+		"driver B's volumes keep the dataset-only condition; another driver's pool verdict must never reach them")
+
+	assert.NotNil(t, a.poolHealthSnapshot(), "scoping the READ must not disturb the publishing driver")
+	assert.True(t, a.volumeCondition(managedDataset()).GetAbnormal())
+}
+
+// TestStopBackendHealthReleasesTheServedVerdict pins the shutdown half of H1:
+// stop is terminal, so nothing will refresh this driver's verdict again and it
+// must stop being served rather than being frozen into the generation for the
+// life of the process. The METRIC half deliberately survives — those series
+// describe the process, and zeroing them would publish a health claim nothing
+// sampled.
+func TestStopBackendHealthReleasesTheServedVerdict(t *testing.T) {
+	const pool = "gf5-owner-stop-pool"
+	mock := truenas.NewMockClient()
+	mock.PoolHealthValue = &truenas.PoolHealthSnapshot{Pool: pool, Status: truenas.PoolStatusDegraded}
+	d := healthTestDriver(mock)
+	d.config.ZFS.DatasetParentName = pool + "/scale-csi"
+	d.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+	d.sampleBackendHealth(context.Background(), pool)
+	require.NotNil(t, d.poolHealthSnapshot())
+
+	d.stopBackendHealth()
+	assert.Nil(t, d.poolHealthSnapshot(), "a stopped driver must stop serving the verdict nothing will refresh")
+	assert.Equal(t, 1.0, testutil.ToFloat64(poolStatus.WithLabelValues(pool, truenas.PoolStatusDegraded)),
+		"the metric half describes the process and must survive the release")
+}
+
+// TestStopBackendHealthDoesNotEraseANewerOwner pins the CAS shape of the
+// release. A driver that has already been superseded must not blank the
+// verdict its successor published: the release is conditional on still owning
+// the state, not an unconditional clear.
+func TestStopBackendHealthDoesNotEraseANewerOwner(t *testing.T) {
+	const oldPool = "gf5-owner-superseded-pool"
+	const newPool = "gf5-owner-successor-pool"
+	oldMock := truenas.NewMockClient()
+	oldMock.PoolHealthValue = &truenas.PoolHealthSnapshot{Pool: oldPool, Status: truenas.PoolStatusOnline, Healthy: true}
+	old := healthTestDriver(oldMock)
+	old.config.ZFS.DatasetParentName = oldPool + "/scale-csi"
+	old.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+	old.sampleBackendHealth(context.Background(), oldPool)
+	require.NotNil(t, old.poolHealthSnapshot())
+
+	newMock := truenas.NewMockClient()
+	newMock.PoolHealthValue = &truenas.PoolHealthSnapshot{Pool: newPool, Status: truenas.PoolStatusDegraded}
+	successor := healthTestDriverSharingState(newMock, newPool+"/scale-csi")
+	successor.config.BackendHealth = BackendHealthConfig{Enabled: true, Interval: "60s"}
+	successor.sampleBackendHealth(context.Background(), newPool)
+	require.NotNil(t, successor.poolHealthSnapshot())
+
+	old.stopBackendHealth()
+	published := successor.poolHealthSnapshot()
+	require.NotNil(t, published, "a superseded driver's shutdown must not erase the current owner's verdict")
+	assert.Equal(t, newPool, published.Pool)
+	assert.Nil(t, old.poolHealthSnapshot(), "and the stopped driver still serves nothing")
+}
+
+// ---------------------------------------------------------------------------
+// GF5/M3 — the temperature follow-up commits both halves or neither
+// ---------------------------------------------------------------------------
+
+// TestTemperatureFollowUpNeverCommitsACSIOnlyCount pins M3. The refresh used to
+// assign state.CSISnapshot ABOVE the RawPublished guard, so a pool with no
+// published raw state committed a generation whose CSI half carried a
+// temperature count scale_csi_pool_disk_temp_alerts does not export at all —
+// the exact CSI/Prometheus divergence the single-generation state exists to
+// eliminate. The assertion compares the two halves of the SAME generation
+// against each other, not against a value the test just set.
+func TestTemperatureFollowUpNeverCommitsACSIOnlyCount(t *testing.T) {
+	const pool = "gf5-temp-generation-pool"
+	d := healthTestDriver(truenas.NewMockClient())
+	// A CSI-facing snapshot with NO raw metric state behind it, which is what the
+	// test-only seeder produces and what any future CSI-snapshot seeder would.
+	d.storeBackendHealthSnapshot(&truenas.PoolHealthSnapshot{
+		Pool: pool, Status: truenas.PoolStatusOnline, Healthy: true, SampledAt: time.Now(),
+	})
+
+	d.publishTemperatureAlerts(pool, 7)
+
+	state := backendHealthState.Load()
+	require.NotNil(t, state)
+	require.NotNil(t, state.CSISnapshot)
+	metricPool := state.Metrics.Pools[pool]
+	require.NotNil(t, metricPool)
+	assert.False(t, metricPool.RawPublished, "the seeded snapshot has no raw sample behind it")
+	assert.Equal(t, float64(state.CSISnapshot.TemperatureAlerts), metricPool.TemperatureAlerts,
+		"one generation must never carry a CSI temperature count its metric half does not hold")
+	assert.Equal(t, state.CSISnapshot.TemperatureSampledAt, metricPool.TemperatureSampledAt,
+		"and the observation time must travel with the count on both halves")
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	_, exported := gatheredBackendHealthGauge(families, "scale_csi_pool_disk_temp_alerts", map[string]string{"pool": pool})
+	assert.False(t, exported, "no raw sample means no exported temperature series to diverge from")
+}

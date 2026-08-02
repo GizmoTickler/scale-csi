@@ -16,7 +16,18 @@ import (
 // backendHealthSnapshot is the one immutable generation visible to both CSI
 // reads and Prometheus. The metric portion is deep-copied before each swap and
 // the CSI portion is never mutated after publication.
+//
+// The generation is process-global so that ONE swap commits the CSI-facing
+// snapshot and the metric state together. The METRIC half is legitimately
+// process-wide — Prometheus families are — but the CSI half is NOT: a
+// VolumeCondition is a verdict about the pool THIS Driver polls, for volumes
+// THIS Driver serves. Owner records which Driver published CSISnapshot, and
+// loadBackendHealthSnapshot refuses to serve another Driver's verdict. Without
+// it a Driver that never enabled backendHealth, on a pool it has never polled,
+// reports every one of its volumes Abnormal because some other Driver in the
+// process saw a DEGRADED pool.
 type backendHealthSnapshot struct {
+	Owner       *Driver
 	CSISnapshot *truenas.PoolHealthSnapshot
 	Metrics     *backendHealthMetricsSnapshot
 }
@@ -248,6 +259,7 @@ func cloneBackendHealthSnapshot(previous *backendHealthSnapshot) *backendHealthS
 	if previous == nil {
 		return next
 	}
+	next.Owner = previous.Owner
 	next.CSISnapshot = previous.CSISnapshot
 	next.Metrics = cloneBackendHealthMetricsSnapshot(previous.Metrics)
 	return next
@@ -349,12 +361,14 @@ func applyBackendHealthRawMetric(metricPool *backendHealthMetricPool, snapshot *
 // publishBackendHealthSampleState publishes the CSI-facing sample and the
 // complete metric state through one immutable generation. The metric snapshot
 // is the raw sample; csiSnapshot is the hysteresis-selected sample served by
-// CSI.
-func publishBackendHealthSampleState(csiSnapshot, metricSnapshot *truenas.PoolHealthSnapshot, pending bool) {
+// CSI. owner is the Driver whose poller produced the sample; only that Driver
+// may serve the CSI half back (see backendHealthSnapshot.Owner).
+func publishBackendHealthSampleState(owner *Driver, csiSnapshot, metricSnapshot *truenas.PoolHealthSnapshot, pending bool) {
 	if csiSnapshot == nil || metricSnapshot == nil || metricSnapshot.Pool == "" {
 		return
 	}
 	updateBackendHealthState(func(state *backendHealthSnapshot) {
+		state.Owner = owner
 		state.CSISnapshot = csiSnapshot
 		metricPool := ensureBackendHealthMetricPool(state.Metrics, metricSnapshot.Pool)
 		applyBackendHealthRawMetric(metricPool, metricSnapshot)
@@ -373,16 +387,27 @@ func publishBackendHealthSampleState(csiSnapshot, metricSnapshot *truenas.PoolHe
 	})
 }
 
-func publishBackendHealthTemperatureState(snapshot *truenas.PoolHealthSnapshot) {
+// publishBackendHealthTemperatureState commits the temperature follow-up to BOTH
+// halves of one generation, or to neither.
+//
+// The RawPublished guard is what makes "or to neither" load-bearing: a pool with
+// no published raw state emits no scale_csi_pool_disk_temp_alerts series at all,
+// so committing state.CSISnapshot above the guard would publish a generation
+// whose CSI half carries a temperature count the metrics do not show — the exact
+// CSI/Prometheus divergence this single-generation state exists to eliminate.
+// The assignment therefore stays BELOW the guard: no raw sample, no refresh of
+// either half.
+func publishBackendHealthTemperatureState(owner *Driver, snapshot *truenas.PoolHealthSnapshot) {
 	if snapshot == nil || snapshot.Pool == "" {
 		return
 	}
 	updateBackendHealthState(func(state *backendHealthSnapshot) {
-		state.CSISnapshot = snapshot
 		metricPool := ensureBackendHealthMetricPool(state.Metrics, snapshot.Pool)
 		if !metricPool.RawPublished {
 			return
 		}
+		state.Owner = owner
+		state.CSISnapshot = snapshot
 		metricPool.TemperatureAlerts = float64(snapshot.TemperatureAlerts)
 		metricPool.TemperatureSampledAt = snapshot.TemperatureSampledAt
 	})
