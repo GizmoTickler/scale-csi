@@ -57,6 +57,13 @@ func (c *Client) SystemTimezone(ctx context.Context) (*time.Location, error) {
 		c.timezoneMu.RUnlock()
 		return cached, nil
 	}
+	// The generation observed BEFORE the call is what makes the store below safe
+	// (GF2-fix4/F2). The read is unlocked and can take arbitrarily long, so an
+	// invalidateSystemTimezone from handleDisconnect can run while it is in
+	// flight; without this the pre-reconnect zone would land in the cache AFTER
+	// the invalidation and be trusted for the whole TTL — the exact staleness the
+	// invalidation exists to prevent, on a value that authorizes deletes.
+	generation := c.timezoneGeneration
 	c.timezoneMu.RUnlock()
 
 	result, err := c.Call(ctx, "system.general.config")
@@ -75,8 +82,17 @@ func (c *Client) SystemTimezone(ctx context.Context) (*time.Location, error) {
 	}
 
 	c.timezoneMu.Lock()
-	c.timezoneLoc = loc
-	c.timezoneAt = time.Now()
+	// DISCARD the result if the cache was invalidated while the call was in
+	// flight: this zone was read from a connection that no longer exists, so it
+	// may predate an HA failover or a middleware restart that changed it. The
+	// CALLER still gets it — a fail-closed comparison against the zone recorded on
+	// the dataset is what actually decides, and returning an error here would turn
+	// a benign reconnect into a refusal — but it is not cached, so the next caller
+	// re-reads through the new connection.
+	if c.timezoneGeneration == generation {
+		c.timezoneLoc = loc
+		c.timezoneAt = time.Now()
+	}
 	c.timezoneMu.Unlock()
 	return loc, nil
 }
@@ -99,16 +115,23 @@ func systemTimezoneName(data interface{}) (string, error) {
 // invalidateSystemTimezone drops the cached zone. Called when the client
 // reconnects, because a reconnect may be to a different backend (HA failover) or
 // follow a middleware restart that applied a configuration change.
+//
+// It also BUMPS the generation, which is what makes an in-flight SystemTimezone
+// read unable to repopulate the cache behind it (GF2-fix4/F2).
 func (c *Client) invalidateSystemTimezone() {
 	c.timezoneMu.Lock()
 	c.timezoneLoc = nil
 	c.timezoneAt = time.Time{}
+	c.timezoneGeneration++
 	c.timezoneMu.Unlock()
 }
 
-// systemTimezoneCache is embedded in Client.
+// systemTimezoneCache is embedded in Client. timezoneGeneration counts
+// invalidations; a store is only accepted when the generation has not moved
+// since the read that produced it started.
 type systemTimezoneCache struct {
-	timezoneMu  sync.RWMutex
-	timezoneLoc *time.Location
-	timezoneAt  time.Time
+	timezoneMu         sync.RWMutex
+	timezoneLoc        *time.Location
+	timezoneAt         time.Time
+	timezoneGeneration uint64
 }
