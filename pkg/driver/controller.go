@@ -105,11 +105,15 @@ const (
 	PropNVMeoFNamespaceID  = "truenas-csi:truenas_nvmeof_namespace_id"
 	PropNVMeoFPortSubsysID = "truenas-csi:truenas_nvmeof_portsubsys_id"
 
-	// PropSnapshotTaskID stores the id of the driver-owned periodic-snapshot task
-	// (GF2/E2) bound to a volume dataset. Written when CreateVolume schedules
-	// periodic snapshots so DeleteVolume can remove the exact task; DeleteVolume
-	// falls back to a dataset-scoped task query when the property is absent.
-	PropSnapshotTaskID = "truenas-csi:snapshot_task_id"
+	// NOTE (GF2-fix4/L1): there is deliberately NO snapshot-task-id property.
+	// One existed, written on every scheduled CreateVolume and read by nothing:
+	// deleteVolumeSnapshotTask resolves the task through SnapshotTaskListByDataset
+	// plus the schema proof (which it must do anyway — a stamped id that pointed at
+	// a pre-existing FOREIGN task could never be allowed to authorize deleting it),
+	// so the id could only ever have saved a query the delete path still makes. It
+	// cost an extra DatasetSetUserProperties round trip per scheduled create and
+	// left a stale, meaningless value on every clone of a scheduled volume. Do not
+	// reintroduce it without a reader that is gated behind the same schema proof.
 
 	// PropInflightMarkerPrefix namespaces per-volume in-flight content-source
 	// creation markers written on the PARENT dataset (the only object proven to
@@ -1396,11 +1400,10 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		scheduledZone = d.scheduledSnapshotZone(ctx, ds, datasetName)
 	}
 
-	foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
+	foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
 	if !d.config.ZFS.DestroyForeignSnapshotsOnDelete && len(foreignSnapshots) > 0 {
 		klog.Infof("Volume %s has non-CSI snapshots and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion", volumeID)
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
+		return nil, status.Error(codes.FailedPrecondition, foreignSnapshotRefusalMessage(volumeID, unprovenSnapshots))
 	}
 
 	// Delete share first (errors are fatal to prevent orphaned targets)
@@ -1487,10 +1490,9 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			// and never respect the foreign-preserve policy (R4); only genuinely
 			// foreign snapshots are preserved by default (recursive deletion of
 			// them is an explicit operator opt-in).
-			foreignSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
+			foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone)
 			if len(foreignSnapshots) > 0 && !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
+				return nil, status.Error(codes.FailedPrecondition, foreignSnapshotRefusalMessage(volumeID, unprovenSnapshots))
 			}
 			klog.V(4).Infof("Volume %s has non-managed snapshots, deleting recursively", volumeID)
 			if delErr := d.recursiveDatasetDeleteWithHoldRecovery(ctx, datasetName); delErr != nil {
@@ -2499,11 +2501,12 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 		} else {
 			RecordVolumeUsage(volumeID, usage)
 			if volumeUsageNearQuota(usage) {
-				condition = &csi.VolumeCondition{
-					Abnormal: true,
-					Message: fmt.Sprintf("volume used %d of %d effective quota bytes (>95%%)",
-						usage.Used, effectiveQuotaBytes(usage)),
-				}
+				// UPGRADE, never REPLACE (GF2-fix4/L2). The stamp-derived condition
+				// can already be the definitive negative "provisioning is explicitly
+				// marked failed", and overwriting the whole struct lost that stronger
+				// reason exactly when both were true. Only Abnormal false->true and
+				// an appended message.
+				condition = upgradeConditionNearQuota(condition, usage)
 			}
 		}
 	}
@@ -2555,6 +2558,38 @@ func volumeConditionFromDataset(ds *truenas.Dataset) *csi.VolumeCondition {
 		Abnormal: false,
 		Message:  "volume health unverified: managed/provision stamps absent (legacy or adoption-pending dataset)",
 	}
+}
+
+// upgradeConditionNearQuota folds the >95% quota finding into an existing
+// VolumeCondition (GF2-fix4/L2): Abnormal is only ever raised false->true and
+// the quota text is APPENDED, so a definitive-negative message the stamp check
+// already produced survives instead of being overwritten by the quota one.
+func upgradeConditionNearQuota(condition *csi.VolumeCondition, usage *truenas.DatasetQuotaUsage) *csi.VolumeCondition {
+	message := volumeNearQuotaMessage(usage)
+	if condition == nil {
+		return &csi.VolumeCondition{Abnormal: true, Message: message}
+	}
+	condition.Abnormal = true
+	if condition.Message == "" {
+		condition.Message = message
+	} else {
+		condition.Message += "; " + message
+	}
+	return condition
+}
+
+// volumeNearQuotaMessage reports the REAL numbers behind the near-quota finding:
+// which ZFS property binds the volume and the usage measurement that property
+// actually governs (GF2-fix4/H1). When snapshots hold space that `refquota` does
+// NOT count, that is called out too — it is the number an operator otherwise
+// spends an afternoon reconciling against `zfs list`.
+func volumeNearQuotaMessage(usage *truenas.DatasetQuotaUsage) string {
+	used, quota, limit := volumeUsageBasis(usage)
+	message := fmt.Sprintf("volume uses %d of %d bytes (>95%% of its %s)", used, quota, limit)
+	if limit == volumeLimitRefquota && usage.UsedBySnapshots > 0 {
+		message += fmt.Sprintf("; a further %d bytes are held by snapshots and do not count against refquota", usage.UsedBySnapshots)
+	}
+	return message
 }
 
 // ControllerModifyVolume modifies a volume (not implemented).

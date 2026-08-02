@@ -54,7 +54,11 @@ periodic-snapshot task scoped to each volume's dataset, so a PVC gets automatic
 point-in-time snapshots with bounded retention and no external scheduler or
 box-wide task covering the CSI parent. The task's naming schema is stamped on
 the volume dataset BEFORE the task is created (so a task can never outlive its
-binding), its id is stamped after, and it is removed at `DeleteVolume`.
+binding), and the task is removed at `DeleteVolume` — located by a
+dataset-scoped task query whose result must re-prove out against that same
+naming schema. No task id is stored: an id could never authorize a deletion on
+its own (it might point at a pre-existing foreign task), so the schema proof is
+the only thing that decides.
 
 **There is no `snapshotNamingSchema` parameter, by design.** Task-created
 snapshots carry no CSI user properties (TrueNAS 26.0 cannot add properties to an

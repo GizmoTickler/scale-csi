@@ -1003,12 +1003,9 @@ func (m *MockClient) DatasetGetQuotaUsage(ctx context.Context, datasetName strin
 	if !ok {
 		return nil, notFoundAPIError("dataset not found")
 	}
-	return &DatasetQuotaUsage{
-		Used:      datasetPropertyInt64(ds.Used),
-		Quota:     datasetPropertyInt64(ds.Quota),
-		Refquota:  datasetPropertyInt64(ds.Refquota),
-		Available: datasetPropertyInt64(ds.Available),
-	}, nil
+	// Project through the SAME helper the real client uses, so a test can never
+	// observe a usage shape production does not produce.
+	return ds.QuotaUsage(), nil
 }
 
 func (m *MockClient) DatasetSetUserProperty(ctx context.Context, name, key, value string) error {

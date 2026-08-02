@@ -9,8 +9,11 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
@@ -48,6 +51,63 @@ func TestParseSnapshotSchedule(t *testing.T) {
 
 	_, err = parseSnapshotSchedule("0 0 *")
 	assert.Error(t, err, "fewer than five fields is rejected")
+}
+
+// M3 — validation used to be ARITY ONLY, so any five tokens passed. The backend
+// then rejected pool.snapshottask.create, ensureSnapshotTask took its non-fatal
+// path, and the volume came up Bound and healthy with NO PITR task at all.
+func TestParseSnapshotScheduleValidatesFieldContent(t *testing.T) {
+	valid := []string{
+		"0 0 * * *",
+		"*/15 * * * *",
+		"0 */6 * * *",
+		"0-30/5 * * * *",
+		"0 0 * * mon-fri",
+		"0 0 1 jan *",
+		"0 0 1,15 * *",
+		"30 2 * jan-mar sun",
+		"0 0 * * 7", // 7 is Sunday, like 0
+	}
+	for _, schedule := range valid {
+		_, err := parseSnapshotSchedule(schedule)
+		assert.NoError(t, err, "schedule %q is valid cron and must be accepted", schedule)
+	}
+
+	invalid := []string{
+		"every 6 hours please thanks", // five tokens of prose
+		"0 */6 * * mon-fry",           // typo'd day name
+		"61 * * * *",                  // minute out of range
+		"* 24 * * *",                  // hour out of range
+		"0 0 32 * *",                  // day-of-month out of range
+		"0 0 * 13 *",                  // month out of range
+		"0 0 * * 8",                   // day-of-week out of range
+		"*/0 * * * *",                 // zero step
+		"0 0 * * fri-mon",             // descending range
+		"0,, * * * *",                 // empty list element
+		"0 0 * * mon#2",               // non-standard croniter extension
+		"0 0 L * *",                   // non-standard croniter extension
+	}
+	for _, schedule := range invalid {
+		_, err := parseSnapshotSchedule(schedule)
+		assert.Error(t, err, "schedule %q is malformed and must be rejected", schedule)
+	}
+}
+
+// M3 — the contract CreateVolume documents: a malformed schedule is an
+// InvalidArgument, so a typo'd StorageClass fails fast instead of provisioning
+// every PVC from it without PITR.
+func TestCreateVolumeRejectsMalformedSchedule(t *testing.T) {
+	client := truenas.NewMockClient()
+	d := newScheduleTestDriver(client)
+
+	_, err := d.CreateVolume(context.Background(), scheduleVolumeRequest("bad-cron-vol", map[string]string{
+		"snapshotSchedule": "0 */6 * * mon-fry",
+	}))
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Empty(t, client.SnapshotTasks, "no task is created for a schedule the driver cannot honor")
+	_, getErr := client.DatasetGet(context.Background(), "pool/parent/bad-cron-vol")
+	assert.True(t, truenas.IsNotFoundError(getErr), "the volume is not provisioned at all")
 }
 
 func TestParseSnapshotRetention(t *testing.T) {
@@ -168,7 +228,10 @@ func TestCreateVolumeCreatesScopedSnapshotTask(t *testing.T) {
 
 	ds, err := client.DatasetGet(context.Background(), "pool/parent/sched-vol")
 	require.NoError(t, err)
-	assert.NotEmpty(t, ds.UserProperties[PropSnapshotTaskID].Value, "the task id is bound to the dataset")
+	// L1: the SCHEMA (not a task id) is the binding. Nothing ever read the id
+	// property, so it is no longer written — the dataset must carry no such key.
+	assert.NotContains(t, ds.UserProperties, "truenas-csi:snapshot_task_id",
+		"the write-only task-id property must not come back")
 	stampedSchema := ds.UserProperties[PropSnapshotNamingSchema].Value
 	assertMintedSchemaShape(t, stampedSchema, "sched-vol")
 	for _, task := range client.SnapshotTasks {
@@ -527,6 +590,79 @@ func TestDeleteVolumePreservesSchemaShapedSnapshotWithDisagreeingCreationTime(t 
 			assert.Contains(t, err.Error(), "non-CSI snapshots")
 		})
 	}
+}
+
+// M2 — links 1-5 of the provenance chain held (this IS the volume's own dataset,
+// carrying its own locally-stamped schema, with its own live task) and only the
+// creation-skew link failed. The classification is unchanged — the snapshot is
+// preserved — but the refusal used to blame "a TrueNAS periodic-snapshot or
+// replication task on the parent dataset" and advise deleting them, with no log
+// line and no metric naming the link that actually failed.
+func TestDeleteVolumeReportsUnprovenScheduledSnapshots(t *testing.T) {
+	named := time.Date(2026, 7, 31, 9, 7, 33, 0, time.UTC)
+	client := truenas.NewMockClient()
+	client.SystemTimezoneName = "America/New_York"
+	d := newScheduleTestDriver(client)
+
+	schema := seedScheduledVolume(t, client, d, "sched-unproven")
+	forgeSnapshot(t, client, "pool/parent/sched-unproven",
+		renderScheduledSnapshotName(schema, named.In(mustZone(t, "America/New_York"))), named.Add(3*time.Second))
+
+	before := testutil.ToFloat64(scheduledSnapshotUnprovenTotal.WithLabelValues(scheduledSnapshotUnprovenCreationSkew))
+	_, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "sched-unproven"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "carry this volume's own scheduled-snapshot naming shape but could not be proven",
+		"the refusal must not blame a foreign task for the volume's own snapshots")
+	assert.Contains(t, err.Error(), "scale_csi_scheduled_snapshot_unproven_total")
+	assert.Equal(t, before+1,
+		testutil.ToFloat64(scheduledSnapshotUnprovenTotal.WithLabelValues(scheduledSnapshotUnprovenCreationSkew)),
+		"the failing link is metered by reason")
+}
+
+// M2 — a GENUINELY foreign snapshot is not an unproven one: it never reached
+// link 6, the existing advice describes it correctly, and neither the counter nor
+// the extra sentence may fire for it.
+func TestDeleteVolumeDoesNotReportForeignSnapshotsAsUnproven(t *testing.T) {
+	client := truenas.NewMockClient()
+	client.SystemTimezoneName = "America/New_York"
+	d := newScheduleTestDriver(client)
+
+	seedScheduledVolume(t, client, d, "sched-foreign-only")
+	forgeSnapshot(t, client, "pool/parent/sched-foreign-only", "auto-2026-07-31_09-00",
+		time.Date(2026, 7, 31, 9, 0, 0, 0, time.UTC))
+
+	var before float64
+	for _, reason := range []string{scheduledSnapshotUnprovenName, scheduledSnapshotUnprovenCreationSkew, scheduledSnapshotUnprovenZone} {
+		before += testutil.ToFloat64(scheduledSnapshotUnprovenTotal.WithLabelValues(reason))
+	}
+	_, err := d.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "sched-foreign-only"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-CSI snapshots")
+	assert.NotContains(t, err.Error(), "could not be proven",
+		"a foreign snapshot is not an unproven driver-scheduled one")
+	var after float64
+	for _, reason := range []string{scheduledSnapshotUnprovenName, scheduledSnapshotUnprovenCreationSkew, scheduledSnapshotUnprovenZone} {
+		after += testutil.ToFloat64(scheduledSnapshotUnprovenTotal.WithLabelValues(reason))
+	}
+	assert.Equal(t, before, after, "no unproven counter may move for a genuinely foreign snapshot")
+}
+
+// M2 — the zone link is the other way a volume's own snapshots go unproven, and
+// it must be reported as `zone`, not as a name or skew failure.
+func TestUnprovenReasonNamesTheZoneLink(t *testing.T) {
+	client := truenas.NewMockClient()
+	client.SystemTimezoneName = "UTC"
+	d := newScheduleTestDriver(client)
+
+	seedScheduledVolume(t, client, d, "sched-zone-gap")
+	snap := fireScheduledSnapshot(t, client, time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC), "UTC")
+	ds, err := client.DatasetGet(context.Background(), "pool/parent/sched-zone-gap")
+	require.NoError(t, err)
+
+	// The schema and the task corroborate; only the zone is missing.
+	opts := deleteAuthorizingProvenanceOptions(datasetLocalUserProperty(ds, PropSnapshotNamingSchema), nil)
+	assert.Equal(t, scheduledSnapshotUnprovenZone,
+		scheduledSnapshotUnprovenReason(snap, ds, d.driverInstanceID(), opts))
 }
 
 func mustZone(t *testing.T, name string) *time.Location {

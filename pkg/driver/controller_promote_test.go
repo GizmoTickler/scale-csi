@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -407,6 +408,11 @@ func TestReconcilePromoteRefusesWhenTheCorroboratingInventoryFails(t *testing.T)
 	clone := seedCloneRestoredVolume(client, d, "restored", origin.ID)
 	client.FailSnapshotListAfter = -1 // every SnapshotList call fails
 
+	// F4: the refusal must be METERED, under the reason label the fix summary
+	// claims. Asserting only counts is what let the unmetered arm ship — the
+	// counter under-reported exactly the backend-unreachable case.
+	before := testutil.ToFloat64(clonePromotesRefusedTotal.WithLabelValues("uncorroborated_snapshot_inventory"))
+
 	report := promoteReport()
 	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{clone},
 		nil, []*truenas.Snapshot{origin}, nil, map[string]tombstoneLedgerEntry{}, report)
@@ -414,4 +420,7 @@ func TestReconcilePromoteRefusesWhenTheCorroboratingInventoryFails(t *testing.T)
 	assert.Equal(t, 0, report.PromotedCloneCount,
 		"an unobtainable corroborating inventory must refuse the promote")
 	assert.Empty(t, client.DatasetPromoteCalls)
+	assert.Equal(t, before+1,
+		testutil.ToFloat64(clonePromotesRefusedTotal.WithLabelValues("uncorroborated_snapshot_inventory")),
+		"the refusal is metered under its documented reason")
 }

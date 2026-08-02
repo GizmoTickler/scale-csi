@@ -217,6 +217,11 @@ func (d *Driver) promoteRestoredClone(
 	// skipped pass costs nothing and a wrong answer corrupts snapshot identity.
 	fresh, err := d.truenasClient.SnapshotList(ctx, sourceDataset)
 	if err != nil {
+		// Metered under the SAME reason as a membership disagreement (GF2-fix4/F4):
+		// both are "the corroborating inventory did not establish completeness", and
+		// leaving this arm unmetered made the counter under-report exactly the
+		// backend-unreachable case an operator most needs to see.
+		RecordClonePromoteRefused("uncorroborated_snapshot_inventory")
 		return nil, fmt.Sprintf("corroborating snapshot inventory for %s failed; refusing to promote on an unprovable migration set: %v", sourceDataset, err)
 	}
 	candidates, reason := corroboratedMigrationCandidates(snapshotsByDataset[sourceDataset], fresh, sourceDataset)

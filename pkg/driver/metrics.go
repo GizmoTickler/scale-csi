@@ -360,6 +360,21 @@ var (
 		},
 	)
 
+	// scheduledSnapshotUnprovenTotal counts snapshots that carry their OWN
+	// volume's driver-scheduled schema (links 1-5 of the provenance chain hold)
+	// but fail a final link, by which link failed (GF2-fix4/M2). Those snapshots
+	// stay FOREIGN — preserved, and blocking a default DeleteVolume — and the
+	// refusal's generic "periodic-snapshot or replication task" advice does not
+	// apply to them. Cardinality is bounded by the three reason values.
+	scheduledSnapshotUnprovenTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "scheduled_snapshot_unproven_total",
+			Help:      "Total snapshots carrying their volume's own scheduled-snapshot schema that could not be proven driver-owned, by failing provenance link",
+		},
+		[]string{"reason"},
+	)
+
 	// nasTimezoneUnresolvedTotal counts failures to read the NAS's civil timezone
 	// (system.general.config -> timezone). While this is failing, driver-scheduled
 	// snapshots cannot be proven and are PRESERVED as foreign, so a scheduled
@@ -420,11 +435,14 @@ var (
 	// Per-volume quota/usage gauges (GF2/E4), populated by ControllerGetVolume
 	// only when zfs.reportVolumeUsage is set. Cardinality is one series per volume
 	// observed; the near-quota gauge is the alert source (ScaleCSIVolumeNearQuota).
+	// The used gauge is the numerator BELONGING to the published limit — see
+	// volumeUsageBasis — so used/quota is internally consistent for every volume
+	// class (refquota/referenced, quota/used, zvol volsize/referenced).
 	volumeUsedBytes = regGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "volume_used_bytes",
-			Help:      "Reported used bytes per volume from the most recent ControllerGetVolume usage read",
+			Help:      "Used bytes per volume against its binding limit (referenced under refquota/volsize, used under quota)",
 		},
 		[]string{"volume"},
 	)
@@ -433,7 +451,7 @@ var (
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "volume_quota_bytes",
-			Help:      "Effective quota bytes per volume (refquota if set, else quota; 0 = unlimited)",
+			Help:      "Binding limit bytes per volume (refquota, quota, or a zvol's volsize; 0 = unlimited)",
 		},
 		[]string{"volume"},
 	)
@@ -442,7 +460,7 @@ var (
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "volume_near_quota",
-			Help:      "1 when a volume's used bytes exceed 95% of its effective quota, else 0",
+			Help:      "1 when a volume's usage exceeds 95% of its binding limit, else 0",
 		},
 		[]string{"volume"},
 	)
@@ -780,6 +798,14 @@ func RecordNASTimezoneUnresolved() {
 	nasTimezoneUnresolvedTotal.Inc()
 }
 
+// RecordScheduledSnapshotUnproven counts a snapshot that carries its own
+// volume's scheduled-snapshot schema but failed the named final provenance link
+// (GF2-fix4/M2). It is OBSERVABILITY ONLY: the snapshot is preserved as foreign
+// either way, and nothing about the accept/refuse decision consults this.
+func RecordScheduledSnapshotUnproven(reason string) {
+	scheduledSnapshotUnprovenTotal.WithLabelValues(reason).Inc()
+}
+
 // RecordScheduledSnapshotTaskDeleteFailed counts a DeleteVolume whose
 // periodic-snapshot task could not be removed (GF2-fix/H2).
 func RecordScheduledSnapshotTaskDeleteFailed() {
@@ -814,30 +840,77 @@ func RecordClonePromoted(err error) {
 	clonesPromotedTotal.WithLabelValues(status).Inc()
 }
 
-// effectiveQuotaBytes returns a volume's binding quota: refquota when set,
-// otherwise quota; 0 means unlimited (GF2/E4).
-func effectiveQuotaBytes(usage *truenas.DatasetQuotaUsage) int64 {
-	if usage.Refquota > 0 {
-		return usage.Refquota
+// The ZFS property that bounds a volume, as reported by volumeUsageBasis and
+// surfaced in the near-quota VolumeCondition message.
+const (
+	volumeLimitRefquota = "refquota"
+	volumeLimitQuota    = "quota"
+	volumeLimitVolsize  = "volsize"
+)
+
+// volumeUsageBasis picks the limit a volume is ACTUALLY bound by together with
+// the usage measurement ZFS compares against THAT limit (GF2-fix4/H1, M1).
+//
+// The two halves must match or the answer is simply wrong: `refquota` bounds
+// `referenced`, `quota` bounds `used` (= referenced + usedbysnapshots +
+// usedbychildren + usedbyrefreservation), and a zvol carries NEITHER quota
+// property — its capacity IS `volsize`, whose fill is `referenced`. The driver
+// only ever writes `refquota`, so the previous used-vs-refquota comparison
+// reported every volume that merely HAS snapshots — which GF2/E2 exists to
+// accumulate — as near-quota, permanently, with no threshold at which it
+// self-corrects.
+//
+// Both filesystem limits can be set at once (an operator may add a real `quota`
+// on top of the driver's `refquota`), so the TIGHTER of the two is reported: the
+// volume is near-quota when either binds. That selection uses float ratios
+// purely to avoid an int64 overflow in the cross-multiplication; the 95% test
+// itself stays integer-scaled.
+//
+// A returned quota of 0 means unlimited/unknown and is never near-quota. If a
+// refquota-bound volume's `referenced` is absent (a projection predating this
+// fix), the numerator is 0 and the volume degrades to "not near" — the direction
+// that reports nothing rather than the false alarm the old comparison produced.
+func volumeUsageBasis(usage *truenas.DatasetQuotaUsage) (used, quota int64, limit string) {
+	if usage == nil {
+		return 0, 0, ""
 	}
-	return usage.Quota
+	if usage.Type == "VOLUME" {
+		return usage.Referenced, usage.Volsize, volumeLimitVolsize
+	}
+	switch {
+	case usage.Refquota > 0 && usage.Quota > 0:
+		if float64(usage.Referenced)*float64(usage.Quota) >= float64(usage.Used)*float64(usage.Refquota) {
+			return usage.Referenced, usage.Refquota, volumeLimitRefquota
+		}
+		return usage.Used, usage.Quota, volumeLimitQuota
+	case usage.Refquota > 0:
+		return usage.Referenced, usage.Refquota, volumeLimitRefquota
+	case usage.Quota > 0:
+		return usage.Used, usage.Quota, volumeLimitQuota
+	default:
+		return usage.Used, 0, ""
+	}
 }
 
-// volumeUsageNearQuota reports whether used bytes exceed 95% of the effective
-// quota. An unlimited volume (no quota) is never near quota. The comparison is
-// integer-scaled (used*100 > quota*95) to avoid floating-point edge cases.
+// volumeUsageNearQuota reports whether the usage the binding limit governs
+// exceeds 95% of it. An unlimited volume (no quota) is never near quota. The
+// comparison is integer-scaled (used*100 > quota*95) to avoid floating-point
+// edge cases.
 func volumeUsageNearQuota(usage *truenas.DatasetQuotaUsage) bool {
-	quota := effectiveQuotaBytes(usage)
+	used, quota, _ := volumeUsageBasis(usage)
 	if quota <= 0 {
 		return false
 	}
-	return usage.Used*100 > quota*95
+	return used*100 > quota*95
 }
 
-// RecordVolumeUsage publishes the per-volume quota/usage gauges (GF2/E4).
+// RecordVolumeUsage publishes the per-volume quota/usage gauges (GF2/E4). The
+// used gauge carries the numerator that BELONGS to the published limit, so a
+// used/quota dashboard expression is internally consistent.
 func RecordVolumeUsage(volumeID string, usage *truenas.DatasetQuotaUsage) {
-	volumeUsedBytes.WithLabelValues(volumeID).Set(float64(usage.Used))
-	volumeQuotaBytes.WithLabelValues(volumeID).Set(float64(effectiveQuotaBytes(usage)))
+	used, quota, _ := volumeUsageBasis(usage)
+	volumeUsedBytes.WithLabelValues(volumeID).Set(float64(used))
+	volumeQuotaBytes.WithLabelValues(volumeID).Set(float64(quota))
 	near := 0.0
 	if volumeUsageNearQuota(usage) {
 		near = 1.0

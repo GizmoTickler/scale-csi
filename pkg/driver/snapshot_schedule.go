@@ -370,19 +370,127 @@ func scheduledSnapshotCreationAgrees(encoded time.Time, creationUnix int64, zone
 	return delta <= int64(scheduledSnapshotCreationSkew/time.Second)
 }
 
+// cronFieldSpec bounds one cron field: its schedule-map key, its numeric domain,
+// and the names TrueNAS accepts in it as well as numbers.
+type cronFieldSpec struct {
+	key   string
+	min   int
+	max   int
+	names map[string]int
+}
+
+// snapshotScheduleFields is the five-field cron layout, in order. dow spans 0-7
+// because cron accepts both 0 and 7 for Sunday.
+var snapshotScheduleFields = []cronFieldSpec{
+	{key: "minute", min: 0, max: 59},
+	{key: "hour", min: 0, max: 23},
+	{key: "dom", min: 1, max: 31},
+	{key: "month", min: 1, max: 12, names: cronMonthNames},
+	{key: "dow", min: 0, max: 7, names: cronDayNames},
+}
+
+var cronMonthNames = map[string]int{
+	"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+	"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+var cronDayNames = map[string]int{
+	"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
+}
+
 // parseSnapshotSchedule parses a five-field cron string "minute hour dom month
 // dow" into the TrueNAS pool.snapshottask schedule map.
+//
+// FIELD CONTENT IS VALIDATED, not just the arity (GF2-fix4/M3). Arity alone let
+// "every 6 hours please thanks" and "0 */6 * * mon-fry" through: the backend then
+// rejected pool.snapshottask.create, ensureSnapshotTask took its non-fatal path,
+// and the volume was provisioned Bound and healthy with NO periodic-snapshot task
+// at all — discovered at restore time. CreateVolume's contract (controller.go:
+// "a malformed schedule/retention is an InvalidArgument so a bad StorageClass
+// parameter fails fast rather than provisioning without PITR") only held for the
+// wrong number of fields.
+//
+// The accepted grammar is the standard cron one TrueNAS takes: `*`, numbers,
+// ranges (`1-5`), lists (`1,3,5`), steps on any of those (`*/6`, `0-30/5`), and
+// the three-letter month/day names in the month and dow fields (`jan`,
+// `mon-fri`). Non-standard croniter extensions (`L`, `W`, `#`, `?`) are
+// deliberately NOT accepted: a schedule the driver cannot itself understand is
+// one it cannot promise PITR for.
 func parseSnapshotSchedule(schedule string) (map[string]string, error) {
 	fields := strings.Fields(schedule)
-	if len(fields) != 5 {
+	if len(fields) != len(snapshotScheduleFields) {
 		return nil, fmt.Errorf("expected 5 cron fields (minute hour dom month dow), got %d", len(fields))
 	}
-	keys := []string{"minute", "hour", "dom", "month", "dow"}
-	out := make(map[string]string, len(keys))
-	for i, key := range keys {
-		out[key] = fields[i]
+	out := make(map[string]string, len(snapshotScheduleFields))
+	for i, spec := range snapshotScheduleFields {
+		if err := validateCronField(spec, fields[i]); err != nil {
+			return nil, err
+		}
+		out[spec.key] = fields[i]
 	}
 	return out, nil
+}
+
+// validateCronField checks one field against the grammar above. Every rejection
+// names the field and the offending token, because the operator's next move is
+// editing a StorageClass by hand.
+func validateCronField(spec cronFieldSpec, field string) error {
+	for _, item := range strings.Split(field, ",") {
+		if item == "" {
+			return fmt.Errorf("%s field %q has an empty list element", spec.key, field)
+		}
+		base := item
+		if rangePart, step, hasStep := strings.Cut(item, "/"); hasStep {
+			base = rangePart
+			value, err := strconv.Atoi(step)
+			if err != nil || value < 1 || value > spec.max {
+				return fmt.Errorf("%s field %q has an invalid step %q (expected 1-%d)", spec.key, field, step, spec.max)
+			}
+		}
+		if base == "*" {
+			continue
+		}
+		low, high, isRange := strings.Cut(base, "-")
+		lowValue, err := cronFieldValue(spec, low)
+		if err != nil {
+			return fmt.Errorf("%s field %q: %w", spec.key, field, err)
+		}
+		if !isRange {
+			continue
+		}
+		highValue, err := cronFieldValue(spec, high)
+		if err != nil {
+			return fmt.Errorf("%s field %q: %w", spec.key, field, err)
+		}
+		if highValue < lowValue {
+			return fmt.Errorf("%s field %q has a descending range (%s-%s)", spec.key, field, low, high)
+		}
+	}
+	return nil
+}
+
+// cronFieldValue resolves one endpoint — a number, or a three-letter name where
+// the field accepts names — and bounds it to the field's domain.
+func cronFieldValue(spec cronFieldSpec, token string) (int, error) {
+	if token == "" {
+		return 0, fmt.Errorf("empty value")
+	}
+	if spec.names != nil {
+		if value, ok := spec.names[strings.ToLower(token)]; ok {
+			return value, nil
+		}
+	}
+	value, err := strconv.Atoi(token)
+	if err != nil {
+		if spec.names != nil {
+			return 0, fmt.Errorf("%q is neither a number in %d-%d nor a known name", token, spec.min, spec.max)
+		}
+		return 0, fmt.Errorf("%q is not a number in %d-%d", token, spec.min, spec.max)
+	}
+	if value < spec.min || value > spec.max {
+		return 0, fmt.Errorf("%q is out of range (%d-%d)", token, spec.min, spec.max)
+	}
+	return value, nil
 }
 
 // parseSnapshotRetention parses a bounded-retention duration like "24h", "30d",
@@ -511,14 +619,12 @@ func (d *Driver) ensureSnapshotTask(ctx context.Context, dataset *truenas.Datase
 	}
 	RecordScheduledSnapshotTaskEnsured()
 
-	// 3. Record the exact id last. Its absence is recoverable (the delete path
-	//    re-queries by dataset and re-proves ownership by schema); its presence
-	//    just saves that query.
-	if err := d.truenasClient.DatasetSetUserProperties(ctx, datasetName, map[string]string{
-		PropSnapshotTaskID: strconv.Itoa(task.ID),
-	}); err != nil {
-		klog.Warningf("Failed to stamp periodic-snapshot task id on volume %s (the schema binding still resolves it): %v", volumeID, err)
-	}
+	// NO task-id stamp (GF2-fix4/L1). The delete path resolves the task by
+	// dataset and re-proves ownership by SCHEMA — it cannot do otherwise, since a
+	// stamped id pointing at a pre-existing foreign task must never authorize
+	// deleting it — so an id property was written by this function and read by
+	// nothing, at the price of one extra round trip per scheduled create and a
+	// stale inherited value on every clone.
 }
 
 // driverOwnedTask picks the task whose naming schema is EXACTLY the schema this
@@ -720,18 +826,40 @@ func driverScheduledSnapshotProvenance(
 	driverInstanceID string,
 	opts scheduledProvenanceOptions,
 ) bool {
-	if snap == nil || dataset == nil || isCSISnapshot(snap) || isSnapshotTombstone(snap) {
+	schema, ok := scheduledSnapshotSchemaBinding(snap, dataset, driverInstanceID, opts)
+	if !ok {
 		return false
 	}
-	if snap.Dataset != dataset.Name {
+	encoded, ok := parseScheduledSnapshotName(snapshotShortName(snap), schema)
+	if !ok {
 		return false
+	}
+	return scheduledSnapshotCreationAgrees(encoded, snap.GetCreationTime(), opts.nasZone)
+}
+
+// scheduledSnapshotSchemaBinding evaluates links 1-5 of the chain above and
+// returns the dataset's PROVEN naming schema. It is factored out of
+// driverScheduledSnapshotProvenance so the diagnostic below evaluates exactly
+// the links the decision does: a second copy would drift, and a diagnostic that
+// disagrees with the decision it explains is worse than none.
+func scheduledSnapshotSchemaBinding(
+	snap *truenas.Snapshot,
+	dataset *truenas.Dataset,
+	driverInstanceID string,
+	opts scheduledProvenanceOptions,
+) (string, bool) {
+	if snap == nil || dataset == nil || isCSISnapshot(snap) || isSnapshotTombstone(snap) {
+		return "", false
+	}
+	if snap.Dataset != dataset.Name {
+		return "", false
 	}
 	if opts.requireLocalSource {
 		if !datasetHasLocalUserProperty(dataset, PropDriverInstanceID, driverInstanceID) {
-			return false
+			return "", false
 		}
 	} else if datasetUserProperty(dataset, PropDriverInstanceID) != driverInstanceID || driverInstanceID == "" {
-		return false
+		return "", false
 	}
 
 	schema := ""
@@ -743,31 +871,94 @@ func driverScheduledSnapshotProvenance(
 	// The volume id is the dataset's own base name; the schema must prove out
 	// against it, which also rejects a schema inherited from another volume.
 	if !schemaProvesVolumeOwnership(schema, datasetVolumeID(dataset.Name)) {
-		return false
+		return "", false
 	}
 	// FAIL CLOSED without a corroborating live task: no task means nothing on
 	// this dataset was minting snapshots under this schema, so an unlabeled
 	// snapshot bearing it has no claim to driver authorship at all.
 	if opts.requireTaskCorroboration && (opts.corroboratingTaskSchema == "" || opts.corroboratingTaskSchema != schema) {
-		return false
+		return "", false
+	}
+	return schema, true
+}
+
+// The provenance link a schema-matching candidate failed, as reported by
+// scheduledSnapshotUnprovenReason and labeled on
+// scale_csi_scheduled_snapshot_unproven_total (GF2-fix4/M2).
+const (
+	// scheduledSnapshotUnprovenName: the snapshot carries the driver's scheduled
+	// naming SHAPE on this dataset, but the name is not a rendering of the
+	// dataset's own schema — a foreign nonce, a non-canonical volume segment, or
+	// an impossible calendar/clock instant.
+	scheduledSnapshotUnprovenName = "name"
+	// scheduledSnapshotUnprovenCreationSkew: the name IS a valid rendering, but
+	// the instant it encodes disagrees with the snapshot's own `creation` by more
+	// than the 2s skew allowance. This is the link a fleet of same-minute tasks on
+	// a loaded pool can fail, and it never self-heals: `creation` never changes.
+	scheduledSnapshotUnprovenCreationSkew = "creation_skew"
+	// scheduledSnapshotUnprovenZone: there is no usable NAS civil zone to render
+	// `creation` in (unreadable, unrecorded, or reconfigured), so the comparison
+	// cannot be made at all.
+	scheduledSnapshotUnprovenZone = "zone"
+)
+
+// scheduledSnapshotUnprovenReason names the link a candidate that ALREADY
+// satisfies links 1-5 failed. It returns "" for everything else: a snapshot that
+// proved out, and a snapshot that was never a plausible driver-scheduled one
+// (i.e. a genuinely foreign snapshot — the case the DeleteVolume refusal's
+// existing "periodic-snapshot or replication task" advice is written for).
+//
+// It is a pure DIAGNOSTIC (GF2-fix4/M2): it changes no decision, widens no
+// tolerance, and is evaluated only for snapshots the predicate has ALREADY
+// declined, so it cannot influence what is preserved or destroyed.
+func scheduledSnapshotUnprovenReason(
+	snap *truenas.Snapshot,
+	dataset *truenas.Dataset,
+	driverInstanceID string,
+	opts scheduledProvenanceOptions,
+) string {
+	schema, ok := scheduledSnapshotSchemaBinding(snap, dataset, driverInstanceID, opts)
+	if !ok {
+		return ""
 	}
 	encoded, ok := parseScheduledSnapshotName(snapshotShortName(snap), schema)
 	if !ok {
-		return false
+		// The name is not a rendering of this volume's schema. Report it ONLY when
+		// it is at least SHAPED like a driver-minted scheduled name; an ordinary
+		// foreign snapshot on a scheduled volume's dataset fails this link too, and
+		// for it the refusal's existing advice is exactly right.
+		if scheduledSnapshotNamePattern.MatchString(snapshotShortName(snap)) {
+			return scheduledSnapshotUnprovenName
+		}
+		return ""
 	}
-	return scheduledSnapshotCreationAgrees(encoded, snap.GetCreationTime(), opts.nasZone)
+	if opts.nasZone == nil {
+		return scheduledSnapshotUnprovenZone
+	}
+	if !scheduledSnapshotCreationAgrees(encoded, snap.GetCreationTime(), opts.nasZone) {
+		return scheduledSnapshotUnprovenCreationSkew
+	}
+	return ""
+}
+
+// deleteAuthorizingProvenanceOptions is the strict option set the delete path
+// evaluates every candidate under. The decision and the M2 diagnostic share it
+// so they can never be asking different questions.
+func deleteAuthorizingProvenanceOptions(corroboratingTaskSchema string, nasZone *time.Location) scheduledProvenanceOptions {
+	return scheduledProvenanceOptions{
+		requireLocalSource:       true,
+		requireTaskCorroboration: true,
+		corroboratingTaskSchema:  corroboratingTaskSchema,
+		nasZone:                  nasZone,
+	}
 }
 
 // isDriverScheduledSnapshot is the delete-authorizing form of the provenance
 // predicate: strict property sources, a live corroborating task, and the NAS's
 // own civil timezone all required.
 func isDriverScheduledSnapshot(snap *truenas.Snapshot, dataset *truenas.Dataset, driverInstanceID, corroboratingTaskSchema string, nasZone *time.Location) bool {
-	return driverScheduledSnapshotProvenance(snap, dataset, driverInstanceID, scheduledProvenanceOptions{
-		requireLocalSource:       true,
-		requireTaskCorroboration: true,
-		corroboratingTaskSchema:  corroboratingTaskSchema,
-		nasZone:                  nasZone,
-	})
+	return driverScheduledSnapshotProvenance(snap, dataset, driverInstanceID,
+		deleteAuthorizingProvenanceOptions(corroboratingTaskSchema, nasZone))
 }
 
 // datasetVolumeID derives a volume id from a dataset path.
@@ -788,15 +979,42 @@ func datasetVolumeID(datasetName string) string {
 // Passing "" (no task seen) makes every snapshot foreign — the safe direction.
 // nasZone is likewise nil when the NAS timezone could not be read, and that too
 // makes every snapshot foreign.
-func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *truenas.Dataset, corroboratingTaskSchema string, nasZone *time.Location) []*truenas.Snapshot {
-	foreign := make([]*truenas.Snapshot, 0, len(snapshots))
+//
+// It also reports how many of the returned snapshots are UNPROVEN rather than
+// foreign (GF2-fix4/M2): they carry this volume's own scheduled-snapshot schema
+// and failed only a final link. The classification is identical either way — the
+// snapshot is preserved — but the DeleteVolume refusal's advice ("delete them,
+// or exclude the CSI parent dataset from snapshot tasks") is actively wrong for
+// them, so the count is surfaced to the operator instead of being swallowed.
+func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *truenas.Dataset, corroboratingTaskSchema string, nasZone *time.Location) (foreign []*truenas.Snapshot, unproven int) {
+	opts := deleteAuthorizingProvenanceOptions(corroboratingTaskSchema, nasZone)
+	foreign = make([]*truenas.Snapshot, 0, len(snapshots))
 	for _, snap := range snapshots {
 		if isDriverScheduledSnapshot(snap, dataset, d.driverInstanceID(), corroboratingTaskSchema, nasZone) {
 			continue
 		}
+		if reason := scheduledSnapshotUnprovenReason(snap, dataset, d.driverInstanceID(), opts); reason != "" {
+			unproven++
+			RecordScheduledSnapshotUnproven(reason)
+			klog.Warningf("Snapshot %s carries volume dataset %s's own driver-scheduled naming shape but failed the %q provenance link; it is preserved as FOREIGN and will block a default DeleteVolume (scale_csi_scheduled_snapshot_unproven_total{reason=%q})",
+				snapshotShortName(snap), dataset.Name, reason, reason)
+		}
 		foreign = append(foreign, snap)
 	}
-	return foreign
+	return foreign, unproven
+}
+
+// foreignSnapshotRefusalMessage composes the DeleteVolume foreign-snapshot
+// refusal (GF2-fix4/M2). When some of the blocking snapshots are the volume's
+// OWN scheduled snapshots that failed a provenance link, the generic advice does
+// not apply to them and saying so is the difference between an operator deleting
+// the right thing and deleting the wrong thing.
+func foreignSnapshotRefusalMessage(volumeID string, unproven int) string {
+	message := fmt.Sprintf("volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
+	if unproven > 0 {
+		message += fmt.Sprintf("; %d of these carry this volume's own scheduled-snapshot naming shape but could not be proven driver-owned (see scale_csi_scheduled_snapshot_unproven_total and the controller log for the failing link), so that advice does not describe them", unproven)
+	}
+	return message
 }
 
 // nasCivilZone returns the NAS's CURRENT civil timezone — the clock a

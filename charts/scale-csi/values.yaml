@@ -411,8 +411,23 @@ zfs:
   # Report per-volume quota/usage from ControllerGetVolume (GF2/E4): one extra
   # pool.dataset.query per ControllerGetVolume feeds the volume_used_bytes /
   # volume_quota_bytes / volume_near_quota metrics and a near-quota
-  # VolumeCondition (abnormal above 95% of the effective quota). Default false:
+  # VolumeCondition (abnormal above 95% of the binding limit). Default false:
   # no extra call and the rendered config carries no reportVolumeUsage key.
+  #
+  # SCOPE. Every volume class is measured against the limit ZFS actually enforces
+  # on it, and against the usage measurement THAT limit governs:
+  #   * NFS filesystems  -> refquota vs referenced (the bound the driver itself
+  #                         writes), or quota vs used when an operator set a real
+  #                         quota; the tighter of the two binds. Space held by
+  #                         snapshots does NOT count against refquota, so a volume
+  #                         with large snapshots is not reported near-quota on
+  #                         their account.
+  #   * iSCSI / NVMe-oF  -> volsize vs referenced. A zvol carries neither quota
+  #                         nor refquota, so volsize IS its capacity. This is
+  #                         BACKEND occupancy of the zvol, not guest-filesystem
+  #                         fullness, which the driver cannot see.
+  # A volume with no limit at all publishes quota 0 (unlimited) and is never
+  # reported near-quota.
   reportVolumeUsage: false
 
 # NFS configuration

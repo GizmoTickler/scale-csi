@@ -953,14 +953,12 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err = d.ControllerGetVolume(context.Background(), &csi.ControllerGetVolumeRequest{VolumeId: "get-vol-usage"})
 			require.NoError(t, err)
 		}},
-		// GF2/E2 (snapshotSchedule set): the six-call fresh-NFS baseline PLUS four
+		// GF2/E2 (snapshotSchedule set): the six-call fresh-NFS baseline PLUS three
 		// task calls — DatasetSetUserProperties writing the naming-schema BINDING
 		// FIRST (GF2-fix/H2: no task may exist without durable provenance),
 		// SnapshotTaskListByDataset (ownership probe over every task on the
-		// dataset, not just the first), SnapshotTaskCreate (scoped
-		// recursive:false), and a second DatasetSetUserProperties recording the
-		// resulting task id. The binding write is deliberately NOT folded into the
-		// id write: the whole point is that it lands before the task exists.
+		// dataset, not just the first), and SnapshotTaskCreate (scoped
+		// recursive:false).
 		// A schedule-less volume pays none of these (the default goldens above).
 		//
 		// GF2-fix3 MOVEMENT 10 -> 11: one SystemTimezone. The binding is now
@@ -970,7 +968,14 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// system.general.config read. An idempotent retry adds nothing: the zone
 		// record is write-once and a dataset that already carries one is not
 		// re-read.
-		{name: "CreateVolume fresh NFS scheduled", want: 11, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		//
+		// GF2-fix4 MOVEMENT 11 -> 10 (L1): the second DatasetSetUserProperties, the
+		// one that recorded the resulting task id, is GONE. Nothing ever read that
+		// property — the delete path re-resolves the task by dataset and re-proves
+		// ownership by schema regardless, and must, since a stamped id pointing at a
+		// pre-existing foreign task can never authorize deleting it — so it bought a
+		// round trip per scheduled create and a stale inherited value on clones.
+		{name: "CreateVolume fresh NFS scheduled", want: 10, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			req := apiCallCountVolumeRequest("fresh-nfs-scheduled", "nfs")
 			req.Parameters["snapshotSchedule"] = "0 0 * * *"
 			req.Parameters["snapshotRetention"] = "30d"

@@ -22,22 +22,29 @@ const datasetResourceQueryMethod = "zfs.resource.query"
 
 // Dataset represents a ZFS dataset from the TrueNAS API.
 type Dataset struct {
-	ID             string                  `json:"id"`
-	Name           string                  `json:"name"`
-	Pool           string                  `json:"pool"`
-	Type           string                  `json:"type"`
-	Mountpoint     string                  `json:"mountpoint"`
-	Used           DatasetProperty         `json:"used"`
-	Available      DatasetProperty         `json:"available"`
-	Quota          DatasetProperty         `json:"quota"`
-	Refquota       DatasetProperty         `json:"refquota"`
-	Reservation    DatasetProperty         `json:"reservation"`
-	Refreservation DatasetProperty         `json:"refreservation"`
-	Volsize        DatasetProperty         `json:"volsize"`
-	Volblocksize   DatasetProperty         `json:"volblocksize"`
-	Origin         DatasetProperty         `json:"origin"`
-	Creation       DatasetProperty         `json:"creation"`
-	UserProperties map[string]UserProperty `json:"user_properties"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Pool       string          `json:"pool"`
+	Type       string          `json:"type"`
+	Mountpoint string          `json:"mountpoint"`
+	Used       DatasetProperty `json:"used"`
+	Available  DatasetProperty `json:"available"`
+	Quota      DatasetProperty `json:"quota"`
+	Refquota   DatasetProperty `json:"refquota"`
+	// Referenced and Usedbysnapshots are what let usage reporting compare LIKE
+	// WITH LIKE (GF2-fix4/H1): in ZFS `refquota` bounds `referenced`, while
+	// `quota` bounds `used` (= referenced + usedbysnapshots + usedbychildren +
+	// usedbyrefreservation). Comparing `used` against `refquota` reports every
+	// volume that merely HAS snapshots as near-quota.
+	Referenced      DatasetProperty         `json:"referenced"`
+	Usedbysnapshots DatasetProperty         `json:"usedbysnapshots"`
+	Reservation     DatasetProperty         `json:"reservation"`
+	Refreservation  DatasetProperty         `json:"refreservation"`
+	Volsize         DatasetProperty         `json:"volsize"`
+	Volblocksize    DatasetProperty         `json:"volblocksize"`
+	Origin          DatasetProperty         `json:"origin"`
+	Creation        DatasetProperty         `json:"creation"`
+	UserProperties  map[string]UserProperty `json:"user_properties"`
 	// CreatedByCall is true only when pool.dataset.create itself created this
 	// object. The idempotent AlreadyExists fallback leaves it false so callers
 	// never post-stamp a raced foreign dataset.
@@ -68,6 +75,8 @@ var datasetQueryProperties = []string{
 	"available",
 	"quota",
 	"refquota",
+	"referenced",
+	"usedbysnapshots",
 	"reservation",
 	"refreservation",
 	"volsize",
@@ -444,6 +453,8 @@ func parseDatasetResource(data interface{}) (*Dataset, error) {
 	ds.Available = parseProperty(props["available"])
 	ds.Quota = parseProperty(props["quota"])
 	ds.Refquota = parseProperty(props["refquota"])
+	ds.Referenced = parseProperty(props["referenced"])
+	ds.Usedbysnapshots = parseProperty(props["usedbysnapshots"])
 	ds.Reservation = parseProperty(props["reservation"])
 	ds.Refreservation = parseProperty(props["refreservation"])
 	ds.Volsize = parseProperty(props["volsize"])
@@ -514,15 +525,30 @@ func (c *Client) DatasetPromote(ctx context.Context, datasetName string) error {
 }
 
 // DatasetQuotaUsage reports a dataset's space accounting for quota/usage
-// reporting (GF2/E4). Quota and Refquota are 0 when unset (no limit).
+// reporting (GF2/E4). Quota, Refquota and Volsize are 0 when unset (no limit).
+//
+// It carries BOTH usage numerators on purpose (GF2-fix4/H1). ZFS bounds
+// `referenced` with `refquota` and `used` with `quota`, and the difference
+// between the two numerators is exactly the space a volume's snapshots hold —
+// which the GF2 scheduled-snapshot feature is designed to accumulate. A consumer
+// must therefore pick the numerator that belongs to the limit it evaluates;
+// mixing them reports a perfectly healthy volume as near-quota forever.
+//
+// Type is the dataset type ("FILESYSTEM" or "VOLUME"). A zvol carries neither
+// quota nor refquota — `volsize` IS its capacity — so block volumes are covered
+// through Volsize rather than being silently skipped (GF2-fix4/M1).
 type DatasetQuotaUsage struct {
-	Used      int64
-	Quota     int64
-	Refquota  int64
-	Available int64
+	Type            string
+	Used            int64
+	Referenced      int64
+	UsedBySnapshots int64
+	Quota           int64
+	Refquota        int64
+	Volsize         int64
+	Available       int64
 }
 
-// DatasetGetQuotaUsage returns a dataset's used/quota/refquota/available bytes.
+// DatasetGetQuotaUsage returns a dataset's space accounting.
 // It reuses the dataset query path (which already projects these properties) so
 // it is one pool.dataset.query, not a separate endpoint (P-usage).
 func (c *Client) DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error) {
@@ -530,12 +556,7 @@ func (c *Client) DatasetGetQuotaUsage(ctx context.Context, datasetName string) (
 	if err != nil {
 		return nil, err
 	}
-	return &DatasetQuotaUsage{
-		Used:      datasetPropertyInt64(ds.Used),
-		Quota:     datasetPropertyInt64(ds.Quota),
-		Refquota:  datasetPropertyInt64(ds.Refquota),
-		Available: datasetPropertyInt64(ds.Available),
-	}, nil
+	return ds.QuotaUsage(), nil
 }
 
 // QuotaUsage projects an ALREADY-FETCHED dataset's space accounting, with no
@@ -549,10 +570,14 @@ func (d *Dataset) QuotaUsage() *DatasetQuotaUsage {
 		return nil
 	}
 	return &DatasetQuotaUsage{
-		Used:      datasetPropertyInt64(d.Used),
-		Quota:     datasetPropertyInt64(d.Quota),
-		Refquota:  datasetPropertyInt64(d.Refquota),
-		Available: datasetPropertyInt64(d.Available),
+		Type:            d.Type,
+		Used:            datasetPropertyInt64(d.Used),
+		Referenced:      datasetPropertyInt64(d.Referenced),
+		UsedBySnapshots: datasetPropertyInt64(d.Usedbysnapshots),
+		Quota:           datasetPropertyInt64(d.Quota),
+		Refquota:        datasetPropertyInt64(d.Refquota),
+		Volsize:         datasetPropertyInt64(d.Volsize),
+		Available:       datasetPropertyInt64(d.Available),
 	}
 }
 
@@ -808,6 +833,8 @@ func parseDataset(data interface{}) (*Dataset, error) {
 	ds.Available = parseProperty(m["available"])
 	ds.Quota = parseProperty(m["quota"])
 	ds.Refquota = parseProperty(m["refquota"])
+	ds.Referenced = parseProperty(m["referenced"])
+	ds.Usedbysnapshots = parseProperty(m["usedbysnapshots"])
 	ds.Reservation = parseProperty(m["reservation"])
 	ds.Refreservation = parseProperty(m["refreservation"])
 	ds.Volsize = parseProperty(m["volsize"])
