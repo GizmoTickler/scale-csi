@@ -535,3 +535,33 @@ func TestVolumeIDForDataset(t *testing.T) {
 	assert.Equal(t, "vol-1", d.volumeIDForDataset(encReconcileParent+"/vol-1"))
 	assert.Equal(t, "other/vol-1", d.volumeIDForDataset("other/vol-1"))
 }
+
+// TestStartupReconcileUnlocksBeforeShareRebuild is the F10 regression. The
+// startup share-ensure pass and the unlock reconcile lived in DIFFERENT loops,
+// so on the exact scenario the feature exists for — an appliance reboot — the
+// startup pass rebuilt shares over locked zvols that have no backing device
+// (P-4) and failed each one in WaitForZvolReady before a single unlock had been
+// attempted. The design's own ordering rationale (unlock precedes
+// ensureShareExists) says otherwise, and the publish path already honors it.
+//
+// PRE-FIX PROOF: with the d.reconcileEncryptedUnlocks(ctx) call removed from
+// runStartupAttachmentReconcile, the volume below is still locked afterward.
+func TestStartupReconcileUnlocksBeforeShareRebuild(t *testing.T) {
+	const volumeID = "enc-startup"
+	const passphrase = "unlock-me-123"
+
+	d, client, _ := encryptionReconcileDriver(t,
+		encryptionReconcilePV(volumeID), encryptionReconcileSC(), encryptionReconcileSecret(passphrase, ""))
+	// Fencing on: this is the loop that owns the startup share-ensure pass.
+	d.config.Fencing = FencingConfig{Mode: FencingModeStrict, StartupReconcileTimeout: "30s"}
+
+	name := addManagedEncryptedVolume(t, client, volumeID, passphrase)
+	require.NoError(t, client.DatasetLock(context.Background(), name))
+
+	require.NoError(t, d.runStartupAttachmentReconcile(context.Background()))
+
+	unlocked, err := client.DatasetGet(context.Background(), name)
+	require.NoError(t, err)
+	assert.False(t, unlocked.Locked,
+		"the startup pass must unlock before it rebuilds shares over a locked, device-less zvol")
+}

@@ -923,3 +923,58 @@ func TestCreateVolumeRepairsLostEncryptionStamp(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "AES-256-GCM", datasetLocalUserProperty(healed, PropEncryption), "the stamp is repaired")
 }
+
+// TestConflictingEncryptionReplayWritesNothing is the F15 regression: the
+// encryption immutability guard must run BEFORE any write. It used to run after
+// setDatasetUserProperties had already stamped managed_resource /
+// provision_success / csi_volume_name onto the conflicting replay's dataset —
+// which is precisely what takes a wedged, unreclaimable volume out of the
+// remnant sweeper's reach (it now looks like a finished, owned volume).
+//
+// The dataset here is the crash remnant that makes the ordering observable: an
+// ENCRYPTED dataset that exists but was never stamped managed/provisioned.
+//
+// PRE-FIX PROOF: with the guard moved back below the property update, the replay
+// still fails but issues a DatasetSetUserProperties call first, leaving
+// managed_resource/provision_success on the dataset.
+func TestConflictingEncryptionReplayWritesNothing(t *testing.T) {
+	d, client := encryptionTestDriver()
+	d.config.DriverName = "org.scale.csi.nfs"
+	d.config.NFS = NFSConfig{Enabled: true, ShareHost: "192.0.2.10"}
+	ctx := context.Background()
+
+	const volumeID = "enc-conflict"
+	const datasetName = "pool/parent/" + volumeID
+	// An encrypted dataset owned by THIS driver instance whose provisioning
+	// stamps were never completed: the replay therefore has real property
+	// updates to write, which is what makes the guard's ordering observable.
+	_, createErr := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: datasetName, Type: "FILESYSTEM",
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &truenas.EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "longenough1"},
+	})
+	require.NoError(t, createErr)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, datasetName, PropEncryption, "AES-256-GCM"))
+	require.NoError(t, client.DatasetSetUserProperty(ctx, datasetName, PropDriverInstanceID, d.driverInstanceID()))
+
+	client.resetCalls()
+	// Replay the same volume name through a PLAINTEXT class.
+	_, err := d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               volumeID,
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	_, methods := client.callSnapshot()
+	assert.Zero(t, methods["DatasetSetUserProperties"], "a conflicting replay must not write first")
+	assert.Zero(t, methods["DatasetUpdate"], "a conflicting replay must not write first")
+
+	after, getErr := client.DatasetGet(ctx, datasetName)
+	require.NoError(t, getErr)
+	assert.Equal(t, "", datasetUserProperty(after, PropManagedResource),
+		"the refused replay must not leave ownership stamps behind")
+	assert.Equal(t, "", datasetUserProperty(after, PropProvisionSuccess))
+}
