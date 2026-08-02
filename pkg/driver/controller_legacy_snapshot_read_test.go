@@ -5,10 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // The 26.0 resource-query read path is sourceless and isCSISnapshot trusts only
