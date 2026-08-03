@@ -69,6 +69,9 @@
 #       fields at all (P-11)
 #   1c. the DRIVER's pool.dataset.query projection returns the encryption block,
 #       and the pre-fix projection does not (D-3, both directions asserted)
+#   1d. the driver's zfs.resource.snapshot.query projection: used+creation
+#       delivered, createtxg present as a top-level field (UNPROBED until this
+#       step runs), unprojected properties absent (N-10)
 #   2.  iSCSI extent over the zvol + write a known pattern (root only)
 #   3.  lock -> device gone + I/O dead -> unlock(correct) -> device back, pattern
 #       intact, extent id unchanged (the reboot-survival proof)
@@ -135,6 +138,10 @@ ENC_PARENT="$POOL/gf1-enc-drill-parent"
 ENC_CHILD="$ENC_PARENT/child"
 SNAP_NAME="gf1-enc-drill-snap"
 SNAP="$ZV@$SNAP_NAME"
+# step 1d measures the snapshot read shape long before step 6 takes its snapshot,
+# so it uses its own scratch snapshot and destroys it immediately.
+PROJ_SNAP_NAME="gf1-enc-drill-projsnap"
+PROJ_SNAP="$ZV@$PROJ_SNAP_NAME"
 EXTENT_NAME="gf1-enc-drill-extent"
 VOLSIZE=1073741824 # 1 GiB
 
@@ -350,6 +357,7 @@ sweep_residue() {
   destroy_if_exists "$CLONE"
   destroy_if_exists "$DETACHED"
   mc pool.snapshot.delete "$(jq -nc --arg id "$SNAP" '$id')" >/dev/null 2>&1 || true
+  mc pool.snapshot.delete "$(jq -nc --arg id "$PROJ_SNAP" '$id')" >/dev/null 2>&1 || true
   destroy_if_exists "$ENC_CHILD"
   destroy_if_exists "$ENC_PARENT"
   destroy_if_exists "$ZV"
@@ -648,6 +656,101 @@ if [ "$step1c_ok" = "1" ]; then
   pass "step 1c: the driver's projection returns encrypted/locked/key_format/encryption_root; the pre-fix one does not"
 else
   fail "step 1c: the driver's query projection does not carry the encryption block (D-3)"
+fi
+
+# --- step 1d: the driver's SNAPSHOT projection carries what its guards read --
+#
+# N-10: the same projected-read hazard as 1c, one API over. Every snapshot read
+# the driver issues goes through zfs.resource.snapshot.query with
+#   {paths, recursive, properties: ["used","creation"], get_user_properties: true}
+# — snapshotResourceQueryProperties in pkg/truenas/snapshot_projection.go.
+#
+# Two different questions, and this step is the ONLY thing that can settle the
+# second one:
+#
+#   projected PROPERTIES   used + creation. `creation` is read by the
+#                          scheduled-snapshot ownership predicate and by every
+#                          age gate (tombstones, spent-restore); `used` by the
+#                          reaper's reclaimable-bytes accounting.
+#   TOP-LEVEL fields       createtxg. It is NOT selected by the projection, and
+#                          the driver ASSUMES it is present — an assumption
+#                          carried over from an enumeration measured on the
+#                          DATASET resource API, never on this one. Tombstone
+#                          identity matching and promote refusal read it; both
+#                          degrade CLOSED without it (promote refuses outright),
+#                          so a missing createtxg is a silent capability loss,
+#                          not corruption.
+#
+# The unprojected-property half is asserted too (a property NOT asked for must be
+# absent), so the step measures the projection's semantics rather than assuming
+# them.
+
+step 1d "the driver's zfs.resource.snapshot.query projection: used+creation present, createtxg present, unprojected absent"
+
+step1d_ok=1
+
+# Keep byte-identical to snapshotResourceQueryProperties.
+SNAP_PROJ_DRIVER='["used","creation"]'
+
+snap_row() {
+  mc zfs.resource.snapshot.query \
+    "$(jq -nc --arg p "$ZV" --argjson props "$1" \
+      '{paths:[$p],recursive:false,properties:$props,get_user_properties:true}')" |
+    jq -c --arg id "$PROJ_SNAP" '.[] | select((.id // .name) == $id)' 2>/dev/null | head -1
+}
+
+if ! mc pool.snapshot.create "$(jq -nc --arg ds "$ZV" --arg n "$PROJ_SNAP_NAME" '{dataset:$ds,name:$n}')" >/dev/null; then
+  detail "could not create the scratch snapshot for the projection probe: $(tr -d '\n' <"$ERRFILE")"
+  step1d_ok=0
+fi
+
+snap_driver="$(snap_row "$SNAP_PROJ_DRIVER")"
+
+if [ -z "$snap_driver" ]; then
+  detail "the driver's snapshot projection returned no row for $SNAP: $(tr -d '\n' <"$ERRFILE")"
+  detail "ACTION: every snapshot read in the driver uses this exact shape"
+  step1d_ok=0
+else
+  snap_createtxg="$(printf '%s' "$snap_driver" | jq -r '.createtxg // empty' 2>/dev/null)"
+  snap_creation="$(printf '%s' "$snap_driver" | jq -r '.properties.creation // empty | if type=="object" then (.value // .raw // .rawvalue) else . end' 2>/dev/null)"
+  snap_used="$(printf '%s' "$snap_driver" | jq -r '.properties.used // empty | if type=="object" then (.value // .raw // .rawvalue) else . end' 2>/dev/null)"
+  snap_clones="$(printf '%s' "$snap_driver" | jq -r 'if (.properties // {}) | has("clones") then "present" else "" end' 2>/dev/null)"
+
+  if [ -z "$snap_createtxg" ] || [ "$snap_createtxg" = "null" ]; then
+    detail "RECORDED: createtxg is ABSENT from the driver's snapshot projection"
+    detail "ACTION: N-10 confirmed — promote will refuse every migration set and tombstone"
+    detail "        identity falls back to seconds-only. Both fail CLOSED, but the capability"
+    detail "        is lost silently; project it explicitly or re-shape the read."
+    step1d_ok=0
+  else
+    detail "createtxg present (top-level, value $snap_createtxg) — the assumption holds"
+  fi
+  if [ -z "$snap_creation" ] || [ "$snap_creation" = "null" ]; then
+    detail "the projected 'creation' property is absent — every age gate reads zero"
+    step1d_ok=0
+  fi
+  if [ -z "$snap_used" ] || [ "$snap_used" = "null" ]; then
+    detail "the projected 'used' property is absent — snapshot sizes report zero"
+    step1d_ok=0
+  fi
+  if [ "$snap_clones" = "present" ]; then
+    detail "RECORDED: an UNPROJECTED property ('clones') came back anyway"
+    detail "ACTION: this API does not filter properties the way the driver models it;"
+    detail "        re-check snapshot_projection.go before trusting the model"
+    step1d_ok=0
+  else
+    detail "an unprojected property is absent — the projection filters as modeled"
+  fi
+fi
+
+# The probe's scratch snapshot has served its purpose; take it out now so no
+# later step (or the residue audit) has to reason about it.
+mc pool.snapshot.delete "$(jq -nc --arg id "$PROJ_SNAP" '$id')" >/dev/null 2>&1 || true
+
+if [ "$step1d_ok" = "1" ]; then
+  pass "step 1d: the snapshot projection delivers used+creation, createtxg survives as a top-level field, and unprojected properties do not appear"
+else
+  fail "step 1d: the driver's snapshot projection does not deliver what its guards read (N-10)"
 fi
 
 # --- step 2: iSCSI extent over the zvol + write a known pattern ------------

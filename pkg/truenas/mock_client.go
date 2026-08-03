@@ -57,10 +57,13 @@ type MockClient struct {
 	nextSnapshotCreateTXG      uint64
 	nextReplicationJobID       int64
 
-	// ModelQueryProjection makes the pool.dataset.query-backed reads (DatasetGet,
-	// DatasetGetByNames, DatasetList) return ONLY the fields the driver's real
-	// extra.properties projection actually delivers, derived from
-	// datasetQueryProperties itself (see dataset_projection.go).
+	// ModelQueryProjection makes the PROJECTED reads return ONLY the fields the
+	// driver's real projections actually deliver: the pool.dataset.query-backed
+	// dataset reads (DatasetGet, DatasetGetByNames, DatasetList) derived from
+	// datasetQueryProperties (dataset_projection.go), and the
+	// zfs.resource.snapshot.query-backed snapshot reads (SnapshotGet,
+	// SnapshotList, SnapshotListAll, SnapshotFindByName) derived from
+	// snapshotResourceQueryProperties (snapshot_projection.go).
 	//
 	// It is OFF by default so the existing suite is unchanged, and ON in the
 	// tests that pin the encryption/identity predicates. This is the structural
@@ -69,6 +72,14 @@ type MockClient struct {
 	// tests and fail OPEN on hardware. With this on, dropping a property from the
 	// projection fails those tests instead of shipping.
 	ModelQueryProjection bool
+
+	// ModelSnapshotCreateTXGAbsent models the ONE unverified assumption in the
+	// snapshot read path (N-10): Snapshot.CreateTXG is a TOP-LEVEL field and is
+	// assumed present on every zfs.resource.snapshot.query response, but that was
+	// never measured on the SNAPSHOT resource API — only on the dataset one. With
+	// this set, createtxg comes back zero, which is what the driver would see if
+	// the assumption is wrong. It only takes effect with ModelQueryProjection on.
+	ModelSnapshotCreateTXGAbsent bool
 
 	// datasetPassphrases is the MOCK's model of the appliance's own key
 	// knowledge, keyed by ENCRYPTION ROOT dataset name. It lives here, not on the
@@ -855,6 +866,36 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 		m.reclaimDeferredSnapshotLocked(origin)
 	}
 	return nil
+}
+
+// snapshotQueryResponse applies the zfs.resource.snapshot.query PROJECTION MODEL
+// to a mock response when ModelQueryProjection is set. It strips PROPERTIES the
+// projection does not ask for; top-level fields (id/name/dataset/pool/type and
+// createtxg) are untouched, because the projection does not select them (N-10,
+// snapshot_projection.go).
+func (m *MockClient) snapshotQueryResponse(snap *Snapshot) *Snapshot {
+	if snap == nil || !m.ModelQueryProjection {
+		return snap
+	}
+	projected := projectSnapshotLikeResourceQuery(snap, snapshotResourceQueryProperties)
+	if m.ModelSnapshotCreateTXGAbsent {
+		// The UNPROBED half of N-10: if zfs.resource.snapshot.query does not carry
+		// createtxg, it decodes to the zero value. Every guard that reads it must
+		// degrade CLOSED, and that is testable rather than assumed.
+		projected.CreateTXG = 0
+	}
+	return projected
+}
+
+func (m *MockClient) snapshotQueryResponses(snapshots []*Snapshot) []*Snapshot {
+	if !m.ModelQueryProjection {
+		return snapshots
+	}
+	projected := make([]*Snapshot, 0, len(snapshots))
+	for _, snap := range snapshots {
+		projected = append(projected, m.snapshotQueryResponse(snap))
+	}
+	return projected
 }
 
 // poolQueryResponse applies the pool.dataset.query PROJECTION MODEL to a mock
@@ -1847,7 +1888,7 @@ func (m *MockClient) SnapshotGet(ctx context.Context, snapshotID string) (*Snaps
 		return nil, m.InjectError
 	}
 	if snap, ok := m.Snapshots[snapshotID]; ok {
-		return snap, nil
+		return m.snapshotQueryResponse(snap), nil
 	}
 	return nil, notFoundAPIError("snapshot not found")
 }
@@ -1867,7 +1908,7 @@ func (m *MockClient) SnapshotList(ctx context.Context, dataset string) ([]*Snaps
 			list = append(list, snap)
 		}
 	}
-	return list, nil
+	return m.snapshotQueryResponses(list), nil
 }
 
 func (m *MockClient) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error) {
@@ -1883,7 +1924,7 @@ func (m *MockClient) SnapshotListAll(ctx context.Context, parentDataset string, 
 		}
 	}
 	sort.SliceStable(list, func(i, j int) bool { return list[i].ID < list[j].ID })
-	return paginateSnapshots(list, limit, offset), nil
+	return m.snapshotQueryResponses(paginateSnapshots(list, limit, offset)), nil
 }
 
 func (m *MockClient) SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error) {
@@ -1895,7 +1936,7 @@ func (m *MockClient) SnapshotFindByName(ctx context.Context, parentDataset, name
 	}
 	for _, snap := range m.Snapshots {
 		if snap.Name == name && (snap.Dataset == parentDataset || strings.HasPrefix(snap.Dataset, parentDataset+"/")) {
-			return snap, nil
+			return m.snapshotQueryResponse(snap), nil
 		}
 	}
 	return nil, nil // Not found, not an error

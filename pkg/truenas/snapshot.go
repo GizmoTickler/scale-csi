@@ -511,7 +511,7 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 		if !ok || dataset == "" {
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)
 		}
-		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, []string{"used", "creation"})
+		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, snapshotResourceQueryProperties)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get snapshot: %w", err)
 		}
@@ -560,7 +560,7 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 // No extra round trip: same call, narrower payload.
 func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot, error) {
 	if c.hasSnapshotResourceQuery(ctx) {
-		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, []string{"used", "creation"})
+		snapshots, err := c.querySnapshotResources(ctx, []string{dataset}, false, snapshotResourceQueryProperties)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list snapshots: %w", err)
 		}
@@ -586,7 +586,7 @@ func (c *Client) SnapshotList(ctx context.Context, dataset string) ([]*Snapshot,
 func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*Snapshot, error) {
 	if c.hasSnapshotResourceQuery(ctx) {
 		parentDataset = strings.TrimSuffix(parentDataset, "/")
-		snapshots, err := c.querySnapshotResources(ctx, []string{parentDataset}, true, []string{"used", "creation"})
+		snapshots, err := c.querySnapshotResources(ctx, []string{parentDataset}, true, snapshotResourceQueryProperties)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list snapshots: %w", err)
 		}
@@ -624,7 +624,7 @@ func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limi
 func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error) {
 	if c.hasSnapshotResourceQuery(ctx) {
 		parentDataset = strings.TrimSuffix(parentDataset, "/")
-		snapshots, err := c.querySnapshotResources(ctx, []string{parentDataset}, true, []string{"used", "creation"})
+		snapshots, err := c.querySnapshotResources(ctx, []string{parentDataset}, true, snapshotResourceQueryProperties)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query snapshots: %w", err)
 		}
