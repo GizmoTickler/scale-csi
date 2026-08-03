@@ -8,6 +8,7 @@ import (
 	"math"
 	"path"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -137,7 +138,10 @@ type UserProperty struct {
 
 const datasetManagedResourceProperty = "truenas-csi:managed_resource"
 
-var datasetQueryProperties = []string{
+// datasetQueryPropertiesBase is the capacity/identity projection every dataset
+// read has carried since GF2. It is the SHARED part of both read paths; the
+// per-path lists below add what only that path can deliver.
+var datasetQueryPropertiesBase = []string{
 	"used",
 	"available",
 	"quota",
@@ -150,6 +154,68 @@ var datasetQueryProperties = []string{
 	"volblocksize",
 	"creation",
 }
+
+// datasetEncryptionQueryProperties is the ZFS property set that makes
+// pool.dataset.query emit its encryption block at all.
+//
+// MEASURED, not inferred (GF1 re-drill, 2026-08-03, nas01 26.0.0-BETA.1, report
+// §"Root cause (measured)"), same dataset, four call shapes:
+//
+//	A) no `extra`                          -> encrypted:true, locked:false, key_format:{...}, encryption_root:"..."
+//	B) the base projection alone           -> encrypted:null, locked:null,  key_format:null,  encryption_root:null
+//	C) the base projection + THIS set      -> encrypted:true, locked:false, key_format:{...}, encryption_root:"..."
+//	D) {"extra":{"retrieve_children":false}} -> same as A
+//
+// Shape B is what the driver used to send, and it is why every "wire truth"
+// encryption predicate (datasetSelfKeyedPassphrase, encryptionIdentityUnknown,
+// datasetNeedsEncryptionHandling, the publish unlock, the unlock reconciler's
+// locked gate, the health surface) evaluated on ZERO VALUES and failed OPEN
+// while every unit test passed against a fully-populated mock (re-drill D-3).
+//
+// The four names are measured AS A SET; the drill did not attribute individual
+// response fields to individual property names, so do not thin this list on the
+// assumption that one of them is redundant — re-measure first.
+var datasetEncryptionQueryProperties = []string{
+	"encryption",
+	"keyformat",
+	"encryptionroot",
+	"keystatus",
+}
+
+// datasetQueryProperties is the projection sent with EVERY pool.dataset.query
+// read (DatasetGet, DatasetGetByNames, DatasetList).
+//
+// `origin` is here because Dataset.Origin has real readers — datasetOriginSnapshotID
+// feeds the restored-clone promote candidate/revalidation, the in-flight clone
+// remnant identity check and the detached-copy remnant guard — and the re-drill's
+// enumeration of the keys a restricted-projection response actually carries
+// (`available, children, creation, id, mountpoint, name, pool, type, used,
+// user_properties`) does not include it. Projecting `origin` on
+// pool.dataset.query is separately live-proven: queryDatasetOrigins has shipped
+// with extra.properties:["origin"] and datasetPropertyString documents live
+// origin values read back through it.
+var datasetQueryProperties = slices.Concat(
+	datasetQueryPropertiesBase,
+	[]string{"origin"},
+	datasetEncryptionQueryProperties,
+)
+
+// datasetResourceQueryProperties is the projection sent with zfs.resource.query.
+//
+// It deliberately does NOT carry datasetEncryptionQueryProperties: P-11 measured
+// that zfs.resource.query returns NO encryption, key or lock fields at all, and
+// parseDatasetResource reads none of them, so asking would be an unverified
+// request shape for a response the path cannot deliver. `origin` IS asked for
+// because parseDatasetResource/rawDatasetProperties already decode it and the
+// promote candidate nomination reads it off this listing. That request shape is
+// UNVERIFIED against a live 26.0 appliance (see the LIVE-PROBE GATE below); if
+// the appliance rejects it, listAllManagedDatasets falls back to the
+// pool.dataset.query path, which carries origin — the outcome is slower, never
+// wrong.
+var datasetResourceQueryProperties = slices.Concat(
+	datasetQueryPropertiesBase,
+	[]string{"origin"},
+)
 
 // DatasetCreateParams holds parameters for creating a dataset.
 type DatasetCreateParams struct {
@@ -709,7 +775,7 @@ func datasetResourceQueryOptions(paths []string, getChildren bool) map[string]in
 	return map[string]interface{}{
 		"paths":               paths,
 		"get_children":        getChildren,
-		"properties":          datasetQueryProperties,
+		"properties":          datasetResourceQueryProperties,
 		"get_user_properties": true,
 		"get_source":          true,
 	}

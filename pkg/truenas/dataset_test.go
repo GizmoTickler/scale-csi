@@ -376,7 +376,7 @@ func TestDatasetGet_Success(t *testing.T) {
 	require.Len(t, params, 2)
 	options := params[1].(map[string]interface{})
 	extra := options["extra"].(map[string]interface{})
-	assert.Equal(t, []interface{}{"used", "available", "quota", "refquota", "referenced", "usedbysnapshots", "reservation", "refreservation", "volsize", "volblocksize", "creation"}, extra["properties"])
+	assertPoolQueryProjection(t, extra["properties"])
 }
 
 // TestDatasetGet_NotFound tests retrieving a non-existent dataset
@@ -843,7 +843,7 @@ func TestDatasetList_Success(t *testing.T) {
 	options := params[1].(map[string]interface{})
 	extra := options["extra"].(map[string]interface{})
 	assert.Equal(t, true, extra["flat"])
-	assert.Equal(t, []interface{}{"used", "available", "quota", "refquota", "referenced", "usedbysnapshots", "reservation", "refreservation", "volsize", "volblocksize", "creation"}, extra["properties"])
+	assertPoolQueryProjection(t, extra["properties"])
 }
 
 func TestDatasetReconcileProperties(t *testing.T) {

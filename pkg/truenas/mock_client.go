@@ -57,6 +57,19 @@ type MockClient struct {
 	nextSnapshotCreateTXG      uint64
 	nextReplicationJobID       int64
 
+	// ModelQueryProjection makes the pool.dataset.query-backed reads (DatasetGet,
+	// DatasetGetByNames, DatasetList) return ONLY the fields the driver's real
+	// extra.properties projection actually delivers, derived from
+	// datasetQueryProperties itself (see dataset_projection.go).
+	//
+	// It is OFF by default so the existing suite is unchanged, and ON in the
+	// tests that pin the encryption/identity predicates. This is the structural
+	// fix for the class of defect the GF1 re-drill found twice: a fully-populated
+	// mock made every predicate that reads an UNPROJECTED field pass in unit
+	// tests and fail OPEN on hardware. With this on, dropping a property from the
+	// projection fails those tests instead of shipping.
+	ModelQueryProjection bool
+
 	// datasetPassphrases is the MOCK's model of the appliance's own key
 	// knowledge, keyed by ENCRYPTION ROOT dataset name. It lives here, not on the
 	// shared *Dataset struct, so no passphrase can ride into driver code under
@@ -844,6 +857,16 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 	return nil
 }
 
+// poolQueryResponse applies the pool.dataset.query PROJECTION MODEL to a mock
+// response when ModelQueryProjection is set: the caller then sees exactly the
+// fields the real extra.properties projection delivers, and nothing else.
+func (m *MockClient) poolQueryResponse(ds *Dataset) *Dataset {
+	if ds == nil || !m.ModelQueryProjection {
+		return ds
+	}
+	return projectDatasetLikePoolQuery(ds, datasetQueryProperties)
+}
+
 func (m *MockClient) DatasetGet(ctx context.Context, name string) (*Dataset, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -852,7 +875,7 @@ func (m *MockClient) DatasetGet(ctx context.Context, name string) (*Dataset, err
 		return nil, m.InjectError
 	}
 	if ds, ok := m.Datasets[name]; ok {
-		return mockDatasetResponse(ds, false), nil
+		return m.poolQueryResponse(mockDatasetResponse(ds, false)), nil
 	}
 	return nil, notFoundAPIError("dataset not found")
 }
@@ -867,7 +890,7 @@ func (m *MockClient) DatasetGetByNames(ctx context.Context, names []string) (map
 	result := make(map[string]*Dataset, len(names))
 	for _, name := range names {
 		if ds, ok := m.Datasets[name]; ok {
-			result[name] = mockDatasetResponse(ds, false)
+			result[name] = m.poolQueryResponse(mockDatasetResponse(ds, false))
 		}
 	}
 	return result, nil
@@ -944,7 +967,7 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 		if prop, ok := ds.UserProperties[datasetManagedResourceProperty]; !ok || prop.Value != "true" {
 			continue
 		}
-		list = append(list, mockDatasetResponse(ds, false))
+		list = append(list, m.poolQueryResponse(mockDatasetResponse(ds, false)))
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 
