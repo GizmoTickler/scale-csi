@@ -213,6 +213,14 @@ func isEncryptedDataset(ds *truenas.Dataset) bool {
 // predicate is ALWAYS false on a bulk-listing dataset (MockClient's
 // DatasetQueryByParent models exactly that). Call it only on a pool.dataset.query
 // read.
+//
+// AND THAT READ MUST PROJECT THE ENCRYPTION PROPERTIES. "It came from
+// pool.dataset.query" is NOT sufficient and the branch got this wrong: the
+// projection (truenas.datasetQueryProperties) decides which fields the response
+// carries at all, and until the GF1 re-drill (D-3, 2026-08-03) it omitted the
+// encryption block — so this predicate answered false for every dataset on the
+// appliance while every unit test passed. Do not add a caller that reads a
+// dataset from some other projection.
 func datasetSelfKeyedPassphrase(ds *truenas.Dataset) bool {
 	if ds == nil || !ds.Encrypted {
 		return false
@@ -418,7 +426,12 @@ func encryptionProps(ctx context.Context) map[string]string {
 // repairs the one state where the stamp is missing but the truth is knowable.
 //
 // The comparand is WIRE TRUTH, not the stamp alone: pool.dataset.query reports
-// encrypted:true for an encrypted dataset (P-1/P-2/P-4), and the stamp is only
+// encrypted:true for an encrypted dataset (P-1/P-2/P-4) WHEN THE READ PROJECTS
+// THE ENCRYPTION PROPERTIES — it did not until GF1-fix6, which is how the live
+// re-drill (D-3a) got this function to tell an operator their aes-256-gcm
+// volume "already exists as plaintext", the exact wedge this comment claims to
+// prevent. The projection is the load-bearing part; see
+// truenas.datasetEncryptionQueryProperties. And the stamp is only
 // written after the create returns. A controller killed inside that window
 // leaves an ENCRYPTED dataset with no stamp; comparing stamps alone would then
 // tell the operator their encrypted volume "already exists as plaintext" and
@@ -711,6 +724,14 @@ func (d *Driver) unlockEncryptedDatasetForPublish(ctx context.Context, ds *truen
 	// lost to a controller kill must still be unlocked here. Skipping it would
 	// hand ensureShareExists a locked zvol with no backing device and surface as
 	// an unexplained device-wait timeout (F4).
+	//
+	// "Wire truth" is only as true as the READ that produced ds. The live
+	// re-drill (D-3b) measured this exact call returning nil for a LOCKED,
+	// encrypted, unstamped volume — zero unlock calls, zero warnings, publish
+	// SUCCESS — because the projection omitted the encryption block and this
+	// predicate collapsed to the stamp alone, the one thing the design says it
+	// must not rely on. ds must come from a read that projects
+	// truenas.datasetEncryptionQueryProperties.
 	if !datasetNeedsEncryptionHandling(ds) {
 		return nil
 	}

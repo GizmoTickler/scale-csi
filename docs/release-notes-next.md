@@ -41,7 +41,19 @@ ConfigMap). Upgrading changes nothing for an install that does not opt in.
   `CreateVolume` replay that would flip encrypted↔plaintext is refused with
   `FailedPrecondition` — compared against the BACKEND's own `encrypted` answer,
   not just the driver's stamp, so a create interrupted before its stamp write is
-  repaired on replay instead of being wrongly called plaintext. An encrypted
+  repaired on replay instead of being wrongly called plaintext. **This sentence
+  was FALSE in the pre-release branch, and the fix below is what makes it true.**
+  The driver's `pool.dataset.query` reads projected a fixed property list that did
+  not include the encryption properties, so TrueNAS 26.0 omitted `encrypted`,
+  `locked`, `key_format` and `encryption_root` from the response entirely and
+  "the backend's own answer" read as *plaintext* for every dataset. The live
+  re-drill (2026-08-03, nas01 26.0.0-BETA.1) measured a replay of an
+  `aes-256-gcm`/`passphrase` volume being refused with *"already exists as
+  plaintext"*, wedging the PVC. The projection now carries the measured property
+  set and the repair path is pinned by regression tests that fail without it;
+  the end-to-end replay behavior on the appliance is **re-verification pending**
+  until the drill is re-run (drill step 1c re-measures the response shape). An
+  encrypted
   create that also carries a content source (snapshot restore or clone) is
   refused with `InvalidArgument` before any mutation, and an ENCRYPTED volume may
   not be a content source either (`FailedPrecondition`, both restore modes) — a
@@ -186,6 +198,16 @@ encrypted volumes in this release.
 - **R8 — BETA backend (MED).** nas01 runs 26.0.0-BETA.1; the encryption API shape
   could shift before GA. All shapes are pinned to the probe date; re-run the
   drill (`scripts/gf1-encryption-drill.sh`) before GA/merge.
+- **R9 — a query PROJECTION decides which fields exist (MED, process).** The
+  driver's dataset reads send an `extra.properties` projection and TrueNAS omits
+  everything outside it — as an ABSENT key, which parses to the Go zero value,
+  not as an error. A predicate that reads an unprojected field therefore answers
+  confidently and wrongly. This shipped twice (the encryption block; `origin`)
+  and both times every unit test passed, because the mock answered every field
+  regardless of the projection. Mitigation is structural, not vigilance:
+  `MockClient.ModelQueryProjection` returns only what the current projection
+  delivers, and the encryption/identity regressions run under it. **Any new
+  predicate that reads a `truenas.Dataset` field must be tested in that mode.**
 
 Non-goals this sprint: KMIP / external key managers (design hook only), raw
 hex-key mode (passphrase only), node-level dm-crypt/LUKS, in-place re-encryption

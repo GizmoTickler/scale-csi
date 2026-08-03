@@ -88,6 +88,14 @@ type Dataset struct {
 	// decision that needs encryption state must therefore be taken on a
 	// pool.dataset.query read.
 	//
+	// AND that read must PROJECT the encryption properties. pool.dataset.query
+	// returns only what extra.properties asks for plus a small always-present
+	// core; a field outside the projection is simply ABSENT and lands here as the
+	// zero value, indistinguishable from a real answer. The GF1 re-drill measured
+	// exactly that (D-3, 2026-08-03): every one of these fields was false/"" on
+	// every read, for a whole sprint, with a green unit suite. See
+	// datasetEncryptionQueryProperties.
+	//
 	// NO KEY MATERIAL LIVES ON THIS STRUCT. The mock keeps its model of the
 	// appliance's key knowledge in a side table keyed by encryption root, so a
 	// passphrase can never ride into driver code — or into a %+v in a failing

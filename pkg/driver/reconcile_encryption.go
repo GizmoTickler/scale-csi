@@ -305,7 +305,11 @@ func (d *Driver) reconcileEncryptedUnlockOne(
 	}
 
 	// The cheap, non-job signal (P-4: pool.dataset.query returns locked) decides
-	// whether this volume is worth a summary @job at all.
+	// whether this volume is worth a summary @job at all. It is only a signal
+	// because the batched read PROJECTS the encryption properties (GF1-fix6,
+	// re-drill D-3): before that, state.Locked was false for every volume on the
+	// appliance and this early return made the whole reconciler — the only thing
+	// that brings an encrypted fleet back after a nas01 reboot — a silent no-op.
 	needsRotationConvergence := windowOpen && !d.encryptionRotationConvergedFor(volumeID, keys)
 	if !state.Locked && !needsRotationConvergence {
 		d.clearEncryptionUnlockFailure(volumeID)

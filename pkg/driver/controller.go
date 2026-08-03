@@ -2786,9 +2786,13 @@ func volumeConditionFromDataset(ds *truenas.Dataset) *csi.VolumeCondition {
 	// Encryption at rest (GF-Sprint 1, E-3 §2): a locked encrypted dataset serves
 	// ZERO I/O (P-4) — a definitive dataset-level negative, so it wins exactly like
 	// provision_success=false. The locked signal rides on the queried dataset
-	// (pool.dataset.query returns locked:true, P-4), so BOTH ControllerGetVolume and
+	// (pool.dataset.query returns locked:true, P-4 — but only when the read
+	// PROJECTS the encryption properties; until GF1-fix6 it did not and a locked,
+	// dead-I/O volume reported healthy), so BOTH ControllerGetVolume and
 	// ListVolumes surface it through the existing composition with no extra call and
 	// no parallel path. A plaintext dataset (Encrypted=false) never takes this arm.
+	// ListVolumes must therefore keep feeding this from a pool.dataset.query read:
+	// zfs.resource.query carries no encryption fields at all (P-11).
 	if ds != nil && ds.Encrypted && ds.Locked {
 		return &csi.VolumeCondition{
 			Abnormal: true,
