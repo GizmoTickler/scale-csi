@@ -1722,6 +1722,12 @@ func TestPublishNeverRekeysAnInheritingCloneEvenThoughTheBackendWould(t *testing
 	_, methods := client.callSnapshot()
 	require.Zero(t, methods["DatasetChangeKey"],
 		"the gate — not the backend — must stop the re-key; the backend would ACCEPT it (D-2)")
+	// Note on defense in depth: for THIS volume two independent gates say no —
+	// the identity predicate (its encryption_root is the origin, so it is not
+	// driver-encryption territory at all, N-5) and the ownsKey re-key gate. The
+	// ownsKey gate is isolated by TestPublishUsesPreviousKeyForUnstampedVolume,
+	// where the identity predicate says YES (self-keyed) and only the missing
+	// stamp withholds the re-key.
 
 	after, err := client.DatasetGet(ctx, clone)
 	require.NoError(t, err)
