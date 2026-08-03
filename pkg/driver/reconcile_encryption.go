@@ -425,8 +425,9 @@ func (d *Driver) readEncryptionCandidateStates(ctx context.Context, names []stri
 // dataset's key is this driver's to load: it must carry the driver's own LOCAL
 // encryption stamp AND must not inherit its key from another dataset. The stamp
 // is the standing ownership rule; the inheritance check is what keeps a
-// clone-inherited or encrypted-parent dataset out of the unlock path, where the
-// backend would refuse the unlock anyway (it is not an encryption root).
+// clone-inherited or encrypted-parent dataset out of the unlock path: it has no
+// key of its own to load, and (D-2) the neighboring re-key operation is NOT
+// refused by the backend, so nothing downstream would catch a mistake here.
 func encryptionOwnershipConfirmed(ds *truenas.Dataset) bool {
 	return isEncryptedDataset(ds) && datasetEncryptionInheritedFrom(ds) == ""
 }

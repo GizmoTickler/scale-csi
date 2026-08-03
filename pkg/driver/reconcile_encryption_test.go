@@ -363,7 +363,7 @@ func TestReconcileEncryptedUnlockEventOnlyOnPersistentFailure(t *testing.T) {
 
 	stillLocked, err := client.DatasetGet(context.Background(), name)
 	require.NoError(t, err)
-	assert.True(t, stillLocked.Locked, "P-5: a wrong passphrase leaves the dataset locked")
+	assert.True(t, stillLocked.Locked, "a wrong passphrase leaves the dataset locked (drill-verified at the ZFS layer)")
 
 	// Recovery clears the streak.
 	require.NoError(t, client.DatasetUnlock(context.Background(), name, "right-pass-123"))

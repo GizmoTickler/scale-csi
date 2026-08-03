@@ -326,7 +326,11 @@ func TestUnlockEncryptedDatasetForPublish(t *testing.T) {
 		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	})
 
-	t.Run("fail-closed: locked volume with wrong passphrase (P-5)", func(t *testing.T) {
+	// D-1: a wrong passphrase is a SUCCESSFUL unlock job whose RESULT payload
+	// carries the failure (live drill, 2026-08-02). The client now asserts on that
+	// payload; this test pins what the driver must do with it — fail CLOSED, and
+	// say why, using the backend's own scrubbed reason.
+	t.Run("fail-closed: locked volume with wrong passphrase (D-1 payload)", func(t *testing.T) {
 		d, client := encryptionTestDriver()
 		createEncryptedDataset(t, client, name, "longenough1")
 		require.NoError(t, client.DatasetLock(context.Background(), name))
@@ -334,8 +338,11 @@ func TestUnlockEncryptedDatasetForPublish(t *testing.T) {
 		err := d.unlockEncryptedDatasetForPublish(context.Background(), ds, name, volumeID, map[string]string{"passphrase": "wrong-pass-9"})
 		require.Error(t, err)
 		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		assert.Contains(t, err.Error(), "Invalid Key",
+			"the backend's own reason from the unlock result payload reaches the operator")
+		assert.NotContains(t, err.Error(), "wrong-pass-9", "and never the passphrase itself")
 		locked, _ := client.DatasetGet(context.Background(), name)
-		assert.True(t, locked.Locked, "P-5: a wrong passphrase leaves the dataset locked")
+		assert.True(t, locked.Locked, "the dataset stays locked (ZFS-level guarantee, drill-verified)")
 	})
 
 	t.Run("correct passphrase unlocks", func(t *testing.T) {
@@ -358,6 +365,11 @@ func TestUnlockEncryptedDatasetForPublish(t *testing.T) {
 		secrets := map[string]string{"passphrase": "new-pass-456", "passphrasePrevious": "old-pass-123"}
 		require.NoError(t, d.unlockEncryptedDatasetForPublish(context.Background(), ds, name, volumeID, secrets))
 		_, methods := client.callSnapshot()
+		// D-1: this arm is only REACHABLE because the client now reports a
+		// wrong-key unlock (from the job's result payload) instead of returning nil.
+		// Two unlock calls prove the branch ran: current (reported failed), then
+		// previous (succeeded).
+		assert.Equal(t, 2, methods["DatasetUnlock"], "the rotation branch is reached: current fails, previous unlocks")
 		assert.Equal(t, 1, methods["DatasetChangeKey"], "rotation re-keys to the current passphrase")
 		// The dataset now holds the new key: the old one no longer unlocks.
 		require.NoError(t, client.DatasetLock(context.Background(), name))
@@ -1337,7 +1349,7 @@ func TestInheritedEncryptionIsNotPerVolumeEncryption(t *testing.T) {
 // TestPublishUsesPreviousKeyForUnstampedVolume is the N-6 regression: one flag
 // gated two unrelated permissions. Trying the PREVIOUS passphrase to UNLOCK is
 // safe for any locked volume the driver is handling (a wrong key fails closed,
-// P-5); only the RE-KEY is ownership-gated. Gating both stranded exactly the
+// drill-verified at the ZFS layer); only the RE-KEY is ownership-gated. Gating both stranded exactly the
 // volume that needs it most — an encrypted volume whose stamp write was lost
 // while it was still on the previous passphrase, with the key that opens it
 // sitting in the Secret.
@@ -1670,4 +1682,57 @@ func TestUnknownEncryptionIdentityRefusesButNeverDestroys(t *testing.T) {
 		assert.True(t, restored.Encrypted)
 		assert.Empty(t, mockClient.DatasetDeleteCalls, "no destroy is issued on unknown identity")
 	})
+}
+
+// TestPublishNeverRekeysAnInheritingCloneEvenThoughTheBackendWould is the D-2
+// regression, and it is a SAFETY test, not an error-message test.
+//
+// The design assumed ZFS refuses change_key on an inheriting child. The live
+// drill (2026-08-02) measured the opposite: it SUCCEEDS and silently promotes the
+// child to its own encryption root, severing it from the origin key — restored
+// data re-keyed to a passphrase the origin's operator does not have, with no
+// error anywhere. The mock now models that, so this test pins the DRIVER's gate
+// as the only thing preventing it.
+//
+// PRE-FIX PROOF: forcing ownsKey true (the gate's regression) makes the clone's
+// encryption_root move to itself and its origin key stop opening it.
+func TestPublishNeverRekeysAnInheritingCloneEvenThoughTheBackendWould(t *testing.T) {
+	const origin = "pool/parent/d2-origin"
+	const clone = "pool/parent/d2-clone"
+	const originPass = "origin-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client := encryptionTestDriver()
+	d.eventRecorder = &EventRecorder{recorder: record.NewFakeRecorder(16), enabled: true}
+	ctx := context.Background()
+
+	createEncryptedDataset(t, client, origin, originPass)
+	_, err := client.SnapshotCreate(ctx, origin, "snap", nil)
+	require.NoError(t, err)
+	require.NoError(t, client.SnapshotClone(ctx, origin+"@snap", clone))
+	cloneDS, err := client.DatasetGet(ctx, clone)
+	require.NoError(t, err)
+	require.Equal(t, origin, cloneDS.EncryptionRoot, "P-7: the clone's key is the ORIGIN's")
+
+	// A rotation window is open on the class this clone belongs to.
+	client.resetCalls()
+	require.NoError(t, d.unlockEncryptedDatasetForPublish(ctx, cloneDS, clone, "d2-clone",
+		map[string]string{"passphrase": newPass, "passphrasePrevious": originPass}))
+
+	_, methods := client.callSnapshot()
+	require.Zero(t, methods["DatasetChangeKey"],
+		"the gate — not the backend — must stop the re-key; the backend would ACCEPT it (D-2)")
+
+	after, err := client.DatasetGet(ctx, clone)
+	require.NoError(t, err)
+	assert.Equal(t, origin, after.EncryptionRoot,
+		"the clone must still be keyed by its ORIGIN: a re-key here silently severs it")
+
+	// And the proof that the backend really would have done it: the same call
+	// made directly succeeds and re-roots the clone.
+	require.NoError(t, client.DatasetChangeKey(ctx, clone, newPass))
+	severed, err := client.DatasetGet(ctx, clone)
+	require.NoError(t, err)
+	assert.Equal(t, clone, severed.EncryptionRoot,
+		"D-2 measured: change_key on an inheriting child succeeds and promotes it")
 }

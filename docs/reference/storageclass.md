@@ -1174,10 +1174,18 @@ mutation. Without that guard, a `clone` restore would produce a volume that is
 encrypted (with its ORIGIN's key, per the inheritance rule below) but carries no
 encryption policy of its own: publish would never unlock it, the unlock
 reconciler would never consider it, and the first appliance reboot would leave it
-dead with no recovery path in the driver at all. For a `detached` restore it is
-not established whether the send is raw (an encrypted, unmanageable copy) or
-plain (a silent decryption of your data), so that path is refused rather than
-guessed at.
+dead with no recovery path in the driver at all.
+
+A `detached` restore is refused for a different, now-measured reason. The live
+drill (2026-08-02, TrueNAS 26.0.0-BETA.1) settled what that path actually does:
+`replication.run_onetime` performs a **raw send**. The copy is **encrypted** —
+there is no silent decryption — but it arrives **locked**, as its **own**
+encryption root, keyed with the **source volume's current passphrase**. So the
+copy is only usable if the driver is handed the SOURCE's key at CreateVolume,
+stamps the copy, and explicitly unlocks it. That is key handover, and this
+release does not implement it; an unstamped locked copy would be a permanently
+unusable volume. The refusal is therefore about **missing key handover**, not
+about a decryption risk.
 
 ### Encryption the driver manages vs. encryption your pool already has
 
@@ -1219,16 +1227,16 @@ is then destroyed rather than handed back as a volume nothing could ever unlock.
 > copy at the file/application level. A detached restore that establishes its own
 > `encryption_root` and its own key is the intended follow-up.
 >
-> **One residual, stated exactly.** The refusals cover: any restore FROM a volume
-> the driver keyed (always, both modes, flag on or off), and any restore whose
-> RESULT comes out with a driver-managed key (always). The single combination they
-> do not cover is `encryption.enabled: false` **and** a snapshot source **and** a
-> `detached` restore whose send turns out to be non-raw: the copy would then be
-> plaintext, so nothing refuses it and the operator's data has been silently
-> decrypted into a plaintext dataset. Whether TrueNAS 26.0 sends raw here is
-> UNPROBED; `scripts/gf1-encryption-drill.sh` step 6b settles it, and until it
-> does, do not disable `encryption.enabled` on a cluster that holds encrypted
-> volumes.
+> **What the drill settled (2026-08-02).** The residual this note used to warn
+> about — a `detached` restore silently DECRYPTING your data — does not exist:
+> the send is raw and the copy stays encrypted. What the drill found instead is
+> that the copy arrives **locked, as its own encryption root, keyed with the
+> source's current passphrase**. Supporting `detached` restore from an encrypted
+> source therefore needs three things this release does not have: the SOURCE
+> volume's passphrase at CreateVolume time, a stamp on the copy, and an explicit
+> unlock after the replication job. Until those exist the refusal stands, and its
+> reason is key handover. `scripts/gf1-encryption-drill.sh` step 6b asserts all
+> four measured facts, so a backend change that moves them fails the drill.
 
 ### ⚠ A locked dataset serves zero I/O (the availability model)
 
@@ -1339,6 +1347,17 @@ Close the window by removing `passphrasePrevious` **after** you have seen
 the class. Redacted Events record rotation; the passphrase never appears in one.
 There is no CSI rotate RPC and no node-side rotation path; rotation is
 controller-side only.
+
+### Re-keying an inherited-key volume is NOT refused by ZFS
+
+One more measured fact, because it changes how much weight the driver's own
+guard carries: `pool.dataset.change_key` on a dataset whose `encryption_root` is
+its **parent** (a clone, or any child of an encrypted parent) is **not** refused.
+It succeeds, and it silently promotes that dataset to its own encryption root —
+cutting it off from the key its origin's operator holds, with no error anywhere.
+The driver never re-keys a volume whose encryption is not its own, and that gate
+is the only thing standing between an open rotation window and exactly that
+outcome. It is pinned by its own regression test and by drill step 6c.
 
 ### Clones inherit the origin's key
 

@@ -46,10 +46,16 @@ ConfigMap). Upgrading changes nothing for an install that does not opt in.
   refused with `InvalidArgument` before any mutation, and an ENCRYPTED volume may
   not be a content source either (`FailedPrecondition`, both restore modes) — a
   clone of one would be encrypted with its ORIGIN's key and no policy of its own,
-  which the driver could never unlock. Neither refusal is gated on
-  `encryption.enabled`: the hazard is a property of the data, so turning the
-  feature off with encrypted volumes live does not re-open it. **Deviation from
-  design §E-4, stated
+  which the driver could never unlock. A `detached` restore is refused for a
+  measured reason (live drill, 2026-08-02): that path performs a **raw send**, so
+  the copy is encrypted — there is no silent decryption — but it arrives
+  **locked, as its own encryption root, keyed with the SOURCE volume's current
+  passphrase**. Making it usable needs key handover (the source's passphrase at
+  CreateVolume, a stamp on the copy, and an explicit unlock) which this release
+  does not implement, so an unstamped locked copy would be a permanently unusable
+  volume. Neither refusal is gated on `encryption.enabled`: the hazard is a
+  property of the data, so turning the feature off with encrypted volumes live
+  does not re-open it. **Deviation from design §E-4, stated
   plainly: snapshot restore, cloning and VolSync restore into an encrypted class
   are not possible in v1.6.0, and neither is restoring from an encrypted volume
   into a plaintext class.** Copy at the file level; detached-restore-with-its-own-
@@ -140,8 +146,12 @@ Rotation is controller-side only; there is no CSI rotate RPC and no node path.
 A `clone`-restore volume created from an encrypted origin inherits the origin's
 key — its `encryption_root` is the **origin**, not itself. It is not
 independently keyed: locking the origin locks the clone, and a clone cannot be
-re-keyed (`change_key` on an inheriting child is refused by ZFS). This is exactly
-why an encrypted volume cannot be a content source in v1.6.0: the clone would be
+re-keyed by this driver. That last part is a DRIVER guarantee, not a ZFS one: the
+live drill measured `change_key` on an inheriting child as SUCCEEDING and
+silently promoting it to its own encryption root, severing it from the origin
+key. The driver's ownership gate is what prevents that; it is pinned by a
+dedicated test and by drill step 6c. This inheritance is also exactly why an
+encrypted volume cannot be a content source in v1.6.0: the clone would be
 encrypted with a key the driver has no policy record for, and no unlock path
 would ever consider it. `snapshotRestoreMode` therefore has no bearing on
 encrypted volumes in this release.

@@ -747,11 +747,15 @@ func (d *Driver) unlockEncryptedDatasetForPublish(ctx context.Context, ds *truen
 	//
 	// The asymmetry is deliberate. UNLOCK is still attempted for such a volume —
 	// fail-closed, and it is the only chance an interrupted create's dataset has
-	// of coming back. RE-KEY is not: change_key on an inheriting child is refused
-	// by ZFS ("not an encryption root"), so attempting it would turn a healthy,
-	// unlocked, serving clone into a FAILED publish with an
-	// EncryptionRotationIncomplete Event telling the operator to keep a key that
-	// has nothing to do with the problem.
+	// of coming back. RE-KEY is not, and the reason is WORSE than the design
+	// assumed: the live drill (2026-08-02, /tmp/scale-csi-gf1-drill-report.md,
+	// D-2) measured change_key on a dataset whose encryption_root is its PARENT
+	// as SUCCEEDING — rc=0, result null — and SILENTLY PROMOTING that dataset to
+	// its own encryption root, severing it from the origin/parent key. ZFS does
+	// NOT refuse it. So this gate is not about error-message quality: it is the
+	// only thing preventing a rotation window from quietly re-keying a clone away
+	// from the key its origin's operator holds. Treat it as safety-critical; it is
+	// pinned by its own test rather than by a backend refusal that does not exist.
 	ownsKey := isEncryptedDataset(ds)
 	if !ownsKey {
 		if locked {
@@ -790,7 +794,11 @@ func (d *Driver) unlockEncryptedDatasetForPublish(ctx context.Context, ds *truen
 //   - locked: unlock(current). If it succeeds the dataset is BY DEFINITION keyed
 //     with the current passphrase, so no re-key is needed even mid-window.
 //   - locked and current fails, window open: unlock(previous) then
-//     change_key(current) (P-5 fail-closed on the first, P-6 on the re-key).
+//     change_key(current). "Fails" here means the CLIENT reported a failure,
+//     which since the drill means the unlock job's RESULT payload named the
+//     dataset in "failed" — the job itself succeeds either way (D-1). The design's
+//     P-5 ("a wrong passphrase is a FAILED job") is false for this call shape;
+//     what holds is the ZFS-level guarantee that the dataset stays LOCKED.
 //
 // A failed re-key NEVER returns success: it emits a persistent, actionable
 // Warning Event telling the operator to keep passphrasePrevious, and returns an
@@ -804,14 +812,18 @@ func (d *Driver) convergeEncryptedDatasetKey(
 ) error {
 	// TWO DIFFERENT PERMISSIONS, deliberately separate. Trying the PREVIOUS
 	// passphrase to UNLOCK is safe for any locked dataset the driver is handling:
-	// a wrong key is a FAILED job that leaves it locked (P-5), and the publish
-	// path already tries the current key on an unstamped dataset by design. Gating
-	// that on ownership stranded exactly the volume that needs it most — an
-	// encrypted volume whose stamp write was lost while it was still keyed to the
-	// PREVIOUS passphrase, with the key that opens it sitting in the Secret.
-	// RE-KEYING is the ownership-gated one: change_key on an inheriting child is
-	// refused by ZFS, and re-keying a dataset whose key the driver never chose
-	// would silently take it over.
+	// a wrong key leaves the dataset LOCKED (drill-verified at the ZFS layer) and
+	// the client reports it from the unlock job's result payload (D-1), and the
+	// publish path already tries the current key on an unstamped dataset by
+	// design. Gating that on ownership stranded exactly the volume that needs it
+	// most — an encrypted volume whose stamp write was lost while it was still
+	// keyed to the PREVIOUS passphrase, with the key that opens it sitting in the
+	// Secret.
+	//
+	// RE-KEYING is the ownership-gated one, and it is SAFETY-CRITICAL: change_key
+	// on an inheriting child is NOT refused by ZFS (D-2, drill-measured) — it
+	// succeeds and silently promotes the child to its own encryption root, cutting
+	// it off from the origin key. Nothing downstream would report that.
 	tryPreviousForUnlock := keys.rotationIntent()
 	mayRekey := keys.rotationIntent() && ownsKey
 
@@ -843,20 +855,25 @@ func (d *Driver) convergeEncryptedDatasetKey(
 		return status.Errorf(codes.FailedPrecondition,
 			"encrypted volume %s is locked and no unlock passphrase is available", volumeID)
 	}
-	if unlockErr := d.truenasClient.DatasetUnlock(ctx, datasetName, keys.Passphrase); unlockErr == nil {
+	unlockErr := d.truenasClient.DatasetUnlock(ctx, datasetName, keys.Passphrase)
+	if unlockErr == nil {
 		// Unlocked with the current passphrase: the dataset already holds that key,
 		// so a supplied previous key is stale and there is nothing to re-key.
 		return nil
 	}
 	if !tryPreviousForUnlock {
-		// P-5 fail-closed: the passphrase did not unlock and there is no rotation
-		// window. The dataset stays locked; surface the failure.
+		// Fail closed: the passphrase did not unlock it and there is no rotation
+		// window. The dataset stays locked (ZFS-level guarantee, drill-verified);
+		// surface the backend's own reason, scrubbed — it is text about a key
+		// operation whose argument is the passphrase (R6/F6).
 		return status.Errorf(codes.FailedPrecondition,
-			"encrypted volume %s is locked and the supplied passphrase did not unlock it", volumeID)
+			"encrypted volume %s is locked and the supplied passphrase did not unlock it: %s",
+			volumeID, redactEncryptionError(unlockErr, keys.Passphrase, keys.Previous))
 	}
 	if prevErr := d.truenasClient.DatasetUnlock(ctx, datasetName, keys.Previous); prevErr != nil {
 		return status.Errorf(codes.FailedPrecondition,
-			"encrypted volume %s is locked and neither the current nor the previous passphrase unlocked it", volumeID)
+			"encrypted volume %s is locked and neither the current nor the previous passphrase unlocked it: %s",
+			volumeID, redactEncryptionError(prevErr, keys.Passphrase, keys.Previous))
 	}
 	if !mayRekey {
 		// Unlocked with the previous key — the volume is serving again, which is the

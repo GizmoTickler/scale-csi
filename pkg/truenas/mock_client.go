@@ -61,7 +61,7 @@ type MockClient struct {
 	// knowledge, keyed by ENCRYPTION ROOT dataset name. It lives here, not on the
 	// shared *Dataset struct, so no passphrase can ride into driver code under
 	// test (and into a %+v in a failing test's output) on an object the driver
-	// legitimately holds. Used only to validate unlock (P-5) and to re-key on
+	// legitimately holds. Used only to validate unlock and to re-key on
 	// change_key (P-6).
 	datasetPassphrases map[string]string
 
@@ -692,7 +692,8 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 	// UNLOCKED with the key loaded and is its own encryption_root (P-1/P-2:
 	// encrypted:true, key_loaded:true, locked:false, encryption_root:<self>). The
 	// mock records the create passphrase as the dataset's current key so unlock /
-	// change_key can validate against it faithfully (P-5/P-6).
+	// change_key can validate against it faithfully (P-6, and the D-1 unlock
+	// payload shape).
 	if params.Encryption != nil && *params.Encryption {
 		ds.Encrypted = true
 		ds.KeyLoaded = true
@@ -1176,11 +1177,26 @@ func (m *MockClient) DatasetLock(ctx context.Context, name string) error {
 	return nil
 }
 
-// DatasetUnlock models pool.dataset.unlock (a @job), including its sharp edges:
-// it is NOT idempotent — unlocking an already-unlocked dataset is a FAILED job
-// (P-8) — a wrong passphrase is a FAILED job that leaves the dataset locked
-// (P-5, fail-closed native), and a dataset whose key is INHERITED (a clone,
-// P-7) has no key of its own to load.
+// DatasetUnlock models pool.dataset.unlock (a @job) as the LIVE DRILL measured
+// it (nas01 26.0.0-BETA.1, 2026-08-02, /tmp/scale-csi-gf1-drill-report.md, D-1),
+// not as the design's P-5 claim described it:
+//
+//   - a WRONG passphrase is a SUCCESSFUL job whose RESULT payload carries the
+//     failure: {"unlocked": [], "failed": {"<name>": {"error": "Invalid Key"}}}.
+//     The dataset stays locked. The previous model — a FAILED job — is exactly
+//     the false belief that let a fail-OPEN publish ship: the driver could not
+//     distinguish a wrong key from a correct one, and no test could see it.
+//   - a CORRECT passphrase returns {"unlocked": ["<name>"], "failed": {}}.
+//   - unlocking an ALREADY-UNLOCKED dataset is a hard call error
+//     ("[EINVAL] ... dataset is not locked"), drill-confirmed: P-8 holds.
+//
+// The mock builds the real payload and runs it through the SAME
+// datasetUnlockOutcome the production client uses, so the two cannot drift: a
+// regression in that assertion changes mock behavior too.
+//
+// UNPROBED: whether unlock of a dataset whose key is INHERITED errors or is a
+// no-op. The mock refuses it (conservative); no driver path depends on it
+// succeeding.
 func (m *MockClient) DatasetUnlock(ctx context.Context, name, passphrase string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1192,24 +1208,33 @@ func (m *MockClient) DatasetUnlock(ctx context.Context, name, passphrase string)
 		return notFoundAPIError("dataset not found")
 	}
 	if !ds.Encrypted {
-		return &jobTerminalError{state: "FAILED", detail: "dataset is not encrypted"}
+		return &APIError{Code: -1, Message: "[EINVAL] id: dataset is not encrypted"}
 	}
 	if ds.EncryptionRoot != "" && ds.EncryptionRoot != name {
-		return &jobTerminalError{state: "FAILED",
-			detail: "dataset is not an encryption root; its key is inherited from " + ds.EncryptionRoot}
+		return &APIError{Code: -1,
+			Message: "[EINVAL] id: dataset is not an encryption root; its key is inherited from " + ds.EncryptionRoot}
 	}
 	if !ds.Locked {
-		// P-8: unlock on an already-unlocked dataset fails.
-		return &jobTerminalError{state: "FAILED", detail: "dataset is already unlocked"}
+		// P-8 (drill-confirmed): a hard call error, not a job outcome.
+		return &APIError{Code: -1, Message: "[EINVAL] id: " + name + " dataset is not locked"}
 	}
 	if passphrase != m.datasetPassphrases[name] {
-		// P-5: wrong passphrase -> FAILED, dataset stays locked, no device.
-		return &jobTerminalError{state: "FAILED", detail: "failed to unlock dataset: invalid passphrase"}
+		// The job SUCCEEDS; the failure is in the payload, and the dataset stays
+		// locked with no backing device.
+		return datasetUnlockOutcome(name, map[string]interface{}{
+			"unlocked": []interface{}{},
+			"failed": map[string]interface{}{
+				name: map[string]interface{}{"error": "Invalid Key", "skipped": []interface{}{}},
+			},
+		})
 	}
 	m.setEncryptionRootStateLocked(name, false)
 	ds.Locked = false
 	ds.KeyLoaded = true
-	return nil
+	return datasetUnlockOutcome(name, map[string]interface{}{
+		"unlocked": []interface{}{name},
+		"failed":   map[string]interface{}{},
+	})
 }
 
 // DatasetChangeKey models pool.dataset.change_key (a @job, P-6): it re-keys an
@@ -1218,8 +1243,17 @@ func (m *MockClient) DatasetUnlock(ctx context.Context, name, passphrase string)
 // key valid (probed live on nas01 26.0.0-BETA.1, 2026-08-02: same-key change_key
 // returns job SUCCESS and a following lock -> unlock with that passphrase
 // succeeds) — this is what makes the driver's rotation-completion arm safe to
-// call unconditionally on an unlocked dataset. An inheriting child (a clone,
-// P-7) cannot be re-keyed at all.
+// call unconditionally on an unlocked dataset.
+//
+// ★ AN INHERITING CHILD IS **NOT** REFUSED. ★ The live drill
+// (/tmp/scale-csi-gf1-drill-report.md, D-2) measured the opposite of the design's
+// premise: change_key on a child whose encryption_root is its PARENT SUCCEEDS
+// (rc=0, result null) and silently PROMOTES the child to its own encryption
+// root, severing it from the parent/origin key. Modeling that is what makes the
+// driver's ownsKey re-key gate testable as the safety-critical guard it actually
+// is: if the gate regresses, a rotation window does not produce a loud backend
+// refusal — it quietly re-keys restored data away from the key its origin's
+// operator holds.
 func (m *MockClient) DatasetChangeKey(ctx context.Context, name, passphrase string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1233,13 +1267,13 @@ func (m *MockClient) DatasetChangeKey(ctx context.Context, name, passphrase stri
 	if !ds.Encrypted {
 		return &jobTerminalError{state: "FAILED", detail: "dataset is not encrypted"}
 	}
-	if ds.EncryptionRoot != "" && ds.EncryptionRoot != name {
-		return &jobTerminalError{state: "FAILED",
-			detail: "dataset is not an encryption root; its key is inherited from " + ds.EncryptionRoot}
-	}
 	if ds.Locked || !ds.KeyLoaded {
 		return &jobTerminalError{state: "FAILED", detail: "dataset must be unlocked before changing its key"}
 	}
+	// D-2: the child is promoted to its OWN encryption root and takes the new key.
+	// Nothing about this is refused or reported; only the driver's gate prevents it.
+	ds.EncryptionRoot = name
+	ds.KeyFormat = KeyFormatPassphrase
 	m.datasetPassphrases[name] = passphrase
 	return nil
 }

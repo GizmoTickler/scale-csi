@@ -113,7 +113,7 @@ func TestMockDatasetCreateEncryption(t *testing.T) {
 	}
 }
 
-// TestMockEncryptionLifecycle walks the full P-4/P-5/P-6/P-8 state machine on the
+// TestMockEncryptionLifecycle walks the full P-4/P-6/P-8 + D-1 state machine on the
 // mock: lock removes the backing device, unlock is gated and fail-closed on a
 // wrong passphrase, change_key rotates only when unlocked.
 func TestMockEncryptionLifecycle(t *testing.T) {
@@ -153,11 +153,12 @@ func TestMockEncryptionLifecycle(t *testing.T) {
 	assert.False(t, summary[0].ValidKey)
 	assert.False(t, summary[0].KeyPresentInDatabase, "P-3: passphrase is not persisted")
 
-	// P-5: wrong passphrase -> FAILED, stays locked.
+	// D-1: a wrong passphrase is a SUCCESSFUL job whose payload reports the
+	// failure; the dataset stays locked either way.
 	err = mock.DatasetUnlock(ctx, name, "wrong-pass")
 	require.Error(t, err)
 	stillLocked, _ := mock.DatasetGet(ctx, name)
-	assert.True(t, stillLocked.Locked, "P-5: a wrong passphrase leaves the dataset locked")
+	assert.True(t, stillLocked.Locked, "a wrong passphrase leaves the dataset locked")
 
 	// Correct passphrase -> unlocked, device returns.
 	require.NoError(t, mock.DatasetUnlock(ctx, name, "drill-pass-1"))
@@ -243,9 +244,23 @@ func TestDatasetEncryptionSummaryJobShape(t *testing.T) {
 }
 
 // TestDatasetUnlockJobShape proves unlock is dispatched with the P-4 payload
-// (datasets array + toggle_attachments:true) and that a FAILED job (P-5 wrong
+// (datasets array + toggle_attachments:true) and that a failed unlock (a wrong
 // passphrase) surfaces as an error.
 func TestDatasetUnlockJobShape(t *testing.T) {
+	const dataset = "flashstor/gf1-enc-drill-zv"
+
+	// The drill-measured result payloads (nas01 26.0.0-BETA.1, 2026-08-02).
+	correctResult := map[string]interface{}{
+		"unlocked": []interface{}{dataset},
+		"failed":   map[string]interface{}{},
+	}
+	wrongResult := map[string]interface{}{
+		"unlocked": []interface{}{},
+		"failed": map[string]interface{}{
+			dataset: map[string]interface{}{"error": "Invalid Key", "skipped": []interface{}{}},
+		},
+	}
+
 	t.Run("payload matches the P-4 shape", func(t *testing.T) {
 		var unlockArgs []interface{}
 		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
@@ -254,14 +269,14 @@ func TestDatasetUnlockJobShape(t *testing.T) {
 				return float64(9101), nil
 			},
 			"core.get_jobs": static([]interface{}{map[string]interface{}{
-				"id": float64(9101), "state": "SUCCESS",
+				"id": float64(9101), "state": "SUCCESS", "result": correctResult,
 			}}),
 			"core.subscribe": static("sub-1"),
 		})
 
-		require.NoError(t, client.DatasetUnlock(context.Background(), "flashstor/gf1-enc-drill-zv", "drill-pass-1"))
+		require.NoError(t, client.DatasetUnlock(context.Background(), dataset, "drill-pass-1"))
 		require.Len(t, unlockArgs, 2)
-		assert.Equal(t, "flashstor/gf1-enc-drill-zv", unlockArgs[0])
+		assert.Equal(t, dataset, unlockArgs[0])
 		options, ok := unlockArgs[1].(map[string]interface{})
 		require.True(t, ok)
 		assert.Equal(t, true, options["toggle_attachments"], "P-4: re-run attachments on unlock")
@@ -271,26 +286,67 @@ func TestDatasetUnlockJobShape(t *testing.T) {
 		require.Len(t, datasets, 1)
 		entry, ok := datasets[0].(map[string]interface{})
 		require.True(t, ok)
-		assert.Equal(t, "flashstor/gf1-enc-drill-zv", entry["name"])
+		assert.Equal(t, dataset, entry["name"])
 		assert.Equal(t, "drill-pass-1", entry["passphrase"])
 	})
 
-	t.Run("wrong passphrase FAILED job is an error (P-5)", func(t *testing.T) {
+	// D-1, THE BLOCKER THE LIVE DRILL FOUND. A wrong passphrase is a SUCCESSFUL
+	// job; the failure exists only in the result payload. Reading the job STATE
+	// (the design's P-5 claim) made a wrong key indistinguishable from a correct
+	// one — a fail-OPEN publish, and a rotation arm that could never be reached.
+	//
+	// PRE-FIX PROOF: on d2e7b38 DatasetUnlock ignores the result entirely and
+	// returns nil here.
+	t.Run("wrong passphrase is a SUCCESSFUL job whose payload reports failure (D-1)", func(t *testing.T) {
 		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
 			datasetUnlockMethod: static(float64(9102)),
 			"core.get_jobs": static([]interface{}{map[string]interface{}{
-				"id": float64(9102), "state": "FAILED", "error": "invalid passphrase",
+				"id": float64(9102), "state": "SUCCESS", "result": wrongResult,
 			}}),
 			"core.subscribe": static("sub-1"),
 		})
-		err := client.DatasetUnlock(context.Background(), "flashstor/gf1-enc-drill-zv", "wrong-pass")
+		err := client.DatasetUnlock(context.Background(), dataset, "wrong-pass")
+		require.Error(t, err, "a SUCCESSFUL job with a failed payload must NOT read as an unlock")
+		assert.Contains(t, err.Error(), "Invalid Key", "the backend's own reason is surfaced")
+		assert.Contains(t, err.Error(), dataset)
+	})
+
+	t.Run("a hard job failure is still an error", func(t *testing.T) {
+		client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+			datasetUnlockMethod: static(float64(9103)),
+			"core.get_jobs": static([]interface{}{map[string]interface{}{
+				"id": float64(9103), "state": "FAILED", "error": "boom",
+			}}),
+			"core.subscribe": static("sub-1"),
+		})
+		err := client.DatasetUnlock(context.Background(), dataset, "drill-pass-1")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "job 9102")
+		assert.Contains(t, err.Error(), "job 9103")
+	})
+
+	t.Run("an unreadable or silent payload fails CLOSED", func(t *testing.T) {
+		for name, result := range map[string]interface{}{
+			"nil result":            nil,
+			"non-object result":     "unlocked",
+			"names nothing":         map[string]interface{}{"unlocked": []interface{}{}, "failed": map[string]interface{}{}},
+			"unlocks another name":  map[string]interface{}{"unlocked": []interface{}{"flashstor/other"}, "failed": map[string]interface{}{}},
+			"failed with no reason": map[string]interface{}{"unlocked": []interface{}{dataset}, "failed": map[string]interface{}{dataset: "?"}},
+		} {
+			t.Run(name, func(t *testing.T) {
+				client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+					datasetUnlockMethod: static(float64(9104)),
+					"core.get_jobs": static([]interface{}{map[string]interface{}{
+						"id": float64(9104), "state": "SUCCESS", "result": result,
+					}}),
+					"core.subscribe": static("sub-1"),
+				})
+				require.Error(t, client.DatasetUnlock(context.Background(), dataset, "drill-pass-1"),
+					"no positive evidence of an unlock must never read as success")
+			})
+		}
 	})
 }
 
-// TestDatasetChangeKeyJobShape proves change_key is dispatched as a @job with the
-// P-6 payload ({"passphrase": <new>}) keyed by dataset id.
 func TestDatasetChangeKeyJobShape(t *testing.T) {
 	var changeKeyArgs []interface{}
 	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
@@ -360,9 +416,7 @@ func TestMockCloneInheritsEncryption(t *testing.T) {
 	assert.True(t, cloned.Encrypted, "P-7: the clone is encrypted")
 	assert.Equal(t, origin, cloned.EncryptionRoot, "P-7: encryption_root is the ORIGIN, not the clone")
 
-	// It has no key of its own: it can be neither unlocked nor re-keyed directly.
-	require.Error(t, mock.DatasetChangeKey(ctx, clone, "new-pass-456"),
-		"an inheriting child cannot be re-keyed")
+	// It has no key of its own to LOAD: lock/unlock belong to the encryption root.
 	require.Error(t, mock.DatasetLock(ctx, clone), "locking belongs to the encryption root")
 
 	// Locking the ORIGIN locks the clone with it.
@@ -520,4 +574,41 @@ func TestMockInheritedEncryption(t *testing.T) {
 	other, err := mock.DatasetCreate(ctx, &DatasetCreateParams{Name: "flashstor/plain", Type: "FILESYSTEM"})
 	require.NoError(t, err)
 	assert.False(t, other.Encrypted)
+}
+
+// TestMockChangeKeyPromotesInheritingChild pins D-2 in the mock: the live drill
+// (2026-08-02) measured change_key on a child whose encryption_root is its
+// PARENT as SUCCEEDING and silently promoting the child to its own encryption
+// root — the opposite of the design's "ZFS refuses it" premise. The driver's
+// ownsKey gate is therefore the ONLY thing standing between a rotation window
+// and a clone severed from its origin key.
+func TestMockChangeKeyPromotesInheritingChild(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockClient()
+	const parent = "flashstor/gf1-parent"
+	const child = "flashstor/gf1-parent/child"
+
+	_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{
+		Name: parent, Type: "FILESYSTEM",
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "parent-pass-1"},
+	})
+	require.NoError(t, err)
+	inherited, err := mock.DatasetCreate(ctx, &DatasetCreateParams{Name: child, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	require.Equal(t, parent, inherited.EncryptionRoot)
+
+	require.NoError(t, mock.DatasetChangeKey(ctx, child, "child-pass-2"),
+		"D-2: TrueNAS 26.0 does NOT refuse this")
+
+	after, err := mock.DatasetGet(ctx, child)
+	require.NoError(t, err)
+	assert.Equal(t, child, after.EncryptionRoot,
+		"D-2: the child is silently promoted to its OWN encryption root, severed from the parent key")
+
+	// And it is now opened by its own new key, not the parent's.
+	require.NoError(t, mock.DatasetLock(ctx, child))
+	require.Error(t, mock.DatasetUnlock(ctx, child, "parent-pass-1"))
+	require.NoError(t, mock.DatasetUnlock(ctx, child, "child-pass-2"))
 }

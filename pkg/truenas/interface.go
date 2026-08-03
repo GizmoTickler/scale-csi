@@ -41,9 +41,14 @@ type ClientInterface interface {
 	DatasetPromote(ctx context.Context, datasetName string) error
 	DatasetGetQuotaUsage(ctx context.Context, datasetName string) (*DatasetQuotaUsage, error)
 	// Encryption at rest (GF-Sprint 1). All are TrueNAS @jobs; a FAILED job is
-	// returned as an error. DatasetLock is test/drill-only — no live control path
-	// locks a dataset. DatasetUnlock is NOT idempotent (P-8): gate on the summary's
-	// locked==true before calling.
+	// returned as an error. DatasetUnlock additionally asserts on the job's RESULT
+	// payload, because a WRONG PASSPHRASE IS A SUCCESSFUL JOB on 26.0 — the
+	// failure lives only in {"failed": {...}} (live drill 2026-08-02, D-1). Its
+	// error therefore carries backend text about a key operation and must be
+	// scrubbed by anything that logs or surfaces it. DatasetLock is
+	// test/drill-only — no live control path locks a dataset. DatasetUnlock is NOT
+	// idempotent (P-8, drill-confirmed as a hard call error): gate on the
+	// summary's locked==true before calling.
 	DatasetLock(ctx context.Context, name string) error
 	DatasetUnlock(ctx context.Context, name, passphrase string) error
 	DatasetChangeKey(ctx context.Context, name, passphrase string) error

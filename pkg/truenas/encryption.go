@@ -7,11 +7,22 @@ import (
 
 // ZFS-native encryption at rest (GF-Sprint 1). Every method here is a TrueNAS
 // @job: the call dispatches, returns a job id, and is awaited through the shared
-// job-wait path (waitForJob), so a job that ends in a terminal failure state —
-// including the fail-closed wrong-passphrase unlock (P-5) — surfaces as an error.
+// job-wait path (waitForJob), so a job that ends in a terminal failure state
+// surfaces as an error.
 //
-// All shapes are pinned to the nas01 26.0.0-BETA.1 probes (design §0). Do not
-// "correct" them from ZFS or TrueNAS documentation.
+// ★ THE JOB STATE IS NOT THE WHOLE ANSWER FOR unlock. ★ The design pinned P-5 as
+// "a wrong passphrase is a FAILED job". The LIVE DRILL (nas01 26.0.0-BETA.1,
+// 2026-08-02, /tmp/scale-csi-gf1-drill-report.md) proved that FALSE for this
+// call shape: pool.dataset.unlock returns job state SUCCESS for a wrong key and
+// reports the failure ONLY in the job RESULT payload
+// ({"unlocked": [names], "failed": {name: {"error": "Invalid Key"}}}). Reading
+// the state alone made a wrong-key unlock indistinguishable from a correct one —
+// a fail-OPEN publish and a rotation arm that could never be reached. Unlock
+// therefore asserts on the payload; see DatasetUnlock.
+//
+// All other shapes remain pinned to the nas01 probes (design §0 P-0..P-11, plus
+// the drill's re-verification). Do not "correct" them from ZFS or TrueNAS
+// documentation.
 const (
 	datasetLockMethod              = "pool.dataset.lock"
 	datasetUnlockMethod            = "pool.dataset.unlock"
@@ -65,10 +76,25 @@ func (c *Client) DatasetLock(ctx context.Context, name string) error {
 // iSCSI/NFS attachments on unlock so an extent over the zvol needs no recreation
 // (the /dev/zvol/<name> path is stable across the unlock, P-4).
 //
-// Unlock is NOT idempotent: unlocking an already-unlocked dataset returns a
-// FAILED job (P-8). Callers MUST gate on locked==true (read via
-// DatasetEncryptionSummary) before calling. A wrong passphrase is a FAILED job
-// (P-5) and surfaces here as an error — fail-closed is native.
+// ★ THE OUTCOME LIVES IN THE JOB RESULT, NOT THE JOB STATE. ★ Live drill,
+// nas01 26.0.0-BETA.1, 2026-08-02 (/tmp/scale-csi-gf1-drill-report.md, D-1):
+//
+//	wrong key:   job SUCCESS, result {"unlocked": [],         "failed": {"<name>": {"error": "Invalid Key", "skipped": []}}}
+//	correct key: job SUCCESS, result {"unlocked": ["<name>"], "failed": {}}
+//
+// Both are SUCCESSFUL jobs. Trusting the state alone (the design's P-5 claim,
+// now known false for this call shape) made a wrong passphrase indistinguishable
+// from a correct one: publish reported success on a still-locked volume, and the
+// rotation arm that only runs after a failed unlock became unreachable dead
+// code. So this method fetches the result and requires the dataset to be named
+// in "unlocked" AND absent from "failed"; anything else is an error carrying the
+// backend's own reason. Callers that log or surface that error MUST scrub it —
+// it is backend text about a key operation (R6).
+//
+// Unlock is still NOT idempotent: unlocking an already-unlocked dataset is a
+// hard call error ("[EINVAL] ... dataset is not locked", drill-confirmed, so P-8
+// holds). Callers MUST gate on locked==true (read via DatasetEncryptionSummary)
+// before calling.
 func (c *Client) DatasetUnlock(ctx context.Context, name, passphrase string) error {
 	options := map[string]interface{}{
 		"datasets": []map[string]interface{}{
@@ -76,7 +102,79 @@ func (c *Client) DatasetUnlock(ctx context.Context, name, passphrase string) err
 		},
 		"toggle_attachments": true,
 	}
-	return c.dispatchDatasetJob(ctx, datasetUnlockMethod, name, options)
+	result, err := c.Call(ctx, datasetUnlockMethod, name, options)
+	if err != nil {
+		return fmt.Errorf("failed to dispatch %s: %w", datasetUnlockMethod, err)
+	}
+	jobID, err := replicationJobID(result)
+	if err != nil {
+		return fmt.Errorf("%s returned an unusable job id: %w", datasetUnlockMethod, err)
+	}
+	if waitErr := c.waitForJob(ctx, jobID); waitErr != nil {
+		return fmt.Errorf("%s job %d failed: %w", datasetUnlockMethod, jobID, waitErr)
+	}
+	raw, err := c.fetchJobResult(ctx, jobID)
+	if err != nil {
+		// Fail CLOSED: an unlock whose outcome cannot be read is not an unlock.
+		return fmt.Errorf("%s job %d succeeded but its result could not be read: %w",
+			datasetUnlockMethod, jobID, err)
+	}
+	return datasetUnlockOutcome(name, raw)
+}
+
+// datasetUnlockOutcome decides whether a pool.dataset.unlock job actually
+// unlocked the dataset, from the job's RESULT payload. It is shared with the
+// mock so both agree on the contract by construction.
+//
+// Success requires BOTH: the dataset named in "unlocked", and no entry for it in
+// "failed". Anything else — an unreadable payload, an empty result, or a payload
+// that mentions the dataset nowhere — is an error, because none of those is
+// evidence that the key was loaded.
+func datasetUnlockOutcome(name string, raw interface{}) error {
+	payload, ok := raw.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("unlock of %s returned an unreadable result payload (%T); "+
+			"the dataset is not proven unlocked", name, raw)
+	}
+	if reason, failed := datasetUnlockFailureReason(payload, name); failed {
+		return fmt.Errorf("unlock of %s failed: %s", name, reason)
+	}
+	for _, entry := range asInterfaceSlice(payload["unlocked"]) {
+		if unlockedName, ok := entry.(string); ok && unlockedName == name {
+			return nil
+		}
+	}
+	return fmt.Errorf("unlock of %s reported neither success nor failure for it "+
+		"(unlocked=%v failed=%v); the dataset is not proven unlocked",
+		name, payload["unlocked"], payload["failed"])
+}
+
+// datasetUnlockFailureReason extracts the backend's reason for a per-dataset
+// unlock failure. The probed shape is {"failed": {"<name>": {"error": "...",
+// "skipped": [...]}}}; a non-conforming entry still counts as a failure with a
+// generic reason, never as a success.
+func datasetUnlockFailureReason(payload map[string]interface{}, name string) (string, bool) {
+	failed, ok := payload["failed"].(map[string]interface{})
+	if !ok || len(failed) == 0 {
+		return "", false
+	}
+	entry, present := failed[name]
+	if !present {
+		return "", false
+	}
+	if detail, ok := entry.(map[string]interface{}); ok {
+		if reason, ok := detail["error"].(string); ok && reason != "" {
+			return reason, true
+		}
+	}
+	return "backend reported the unlock as failed with no reason", true
+}
+
+func asInterfaceSlice(raw interface{}) []interface{} {
+	if items, ok := raw.([]interface{}); ok {
+		return items
+	}
+	return nil
 }
 
 // DatasetChangeKey re-keys an UNLOCKED dataset to a new passphrase (P-6). It
