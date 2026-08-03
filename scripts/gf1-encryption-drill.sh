@@ -29,6 +29,19 @@
 #   H-6  pool.snapshot.clone takes ({snapshot, dataset_dst}), not (id, {name}).
 #   H-7  the residue audit now also checks replication.query.
 #
+# WHAT THE 2026-08-03 RE-RUN CHANGED (re-drill report H-8 and D-3):
+#   H-8  the step-0 auth gate aborted the WHOLE drill when GF1_NAS_HOST was the
+#        appliance's own FQDN — the documented, natural value. On-box that FQDN
+#        resolves to 127.0.0.1 and nginx does not bind it, so the gate was
+#        unreachable from the only host the EXECUTION MODEL says to run on (the
+#        same abort class as H-1). The gate now tries the configured host and
+#        then [::1], with the SAME key against the SAME method, and still aborts
+#        if none answers.
+#   D-3  new step 1c: the drill now speaks the DRIVER's own extra.properties
+#        projection, because nothing else here could catch a projection that
+#        omits the encryption block — dataset_row() sends no `extra` at all,
+#        which is the always-populated shape A.
+#
 # AND WHAT THE RUN PROVED ABOUT THE BACKEND (now pinned, and asserted here):
 #   D-1  pool.dataset.unlock NEVER fails the job for a wrong key. It returns job
 #        state SUCCESS with the failure in the RESULT payload:
@@ -54,6 +67,8 @@
 #   1b. encrypted PARENT + plain child -> child encryption_root == PARENT,
 #       key_format PASSPHRASE (P-10); zfs.resource.query carries NO encryption
 #       fields at all (P-11)
+#   1c. the DRIVER's pool.dataset.query projection returns the encryption block,
+#       and the pre-fix projection does not (D-3, both directions asserted)
 #   2.  iSCSI extent over the zvol + write a known pattern (root only)
 #   3.  lock -> device gone + I/O dead -> unlock(correct) -> device back, pattern
 #       intact, extent id unchanged (the reboot-survival proof)
@@ -375,15 +390,38 @@ fi
 # REST v2.0 API the previous gate used (H-1), so this speaks the current
 # websocket API with the key and asserts on a field only a real, authenticated
 # response carries.
-SYSINFO="$(midclt -u "wss://$NAS_HOST/api/current" -K "$API_KEY" --insecure call system.info 2>"$ERRFILE")"
-NAS_VERSION="$(printf '%s' "$SYSINFO" | jq -r '.version // empty' 2>/dev/null)"
-if [ -z "$NAS_VERSION" ]; then
-  detail "API-key auth gate failed for wss://$NAS_HOST/api/current — aborting before any mutation"
-  detail "$(tr -d '\n' <"$ERRFILE")"
+#
+# H-8: the gate used to abort the WHOLE drill when GF1_NAS_HOST was the
+# appliance's own FQDN — the documented, natural value. Measured on nas01: the
+# EXECUTION MODEL mandates running ON the appliance, where the FQDN resolves via
+# /etc/hosts to 127.0.0.1, and nginx binds 192.168.x.x:443 and [::]:443 but NOT
+# 127.0.0.1:443. So the gate was unreachable from the only host it is documented
+# to run on — the same abort class as H-1.
+#
+# The fix is an ENDPOINT fallback, not a weaker gate: each candidate is tried
+# with the SAME API key against the SAME authenticated method, and the drill
+# still aborts if none of them answers. Only the address is allowed to differ.
+# [::1] is the loopback nginx actually serves (measured: `midclt -u
+# wss://[::1]/api/current` succeeds on-box while the FQDN does not).
+NAS_URL=""
+NAS_VERSION=""
+for gate_host in "$NAS_HOST" "[::1]"; do
+  [ -n "$gate_host" ] || continue
+  SYSINFO="$(midclt -u "wss://$gate_host/api/current" -K "$API_KEY" --insecure call system.info 2>"$ERRFILE")"
+  NAS_VERSION="$(printf '%s' "$SYSINFO" | jq -r '.version // empty' 2>/dev/null)"
+  if [ -n "$NAS_VERSION" ]; then
+    NAS_URL="wss://$gate_host/api/current"
+    break
+  fi
+  detail "auth gate endpoint wss://$gate_host/api/current did not answer: $(tr -d '\n' <"$ERRFILE")"
+done
+if [ -z "$NAS_URL" ]; then
+  detail "API-key auth gate failed for every candidate endpoint — aborting before any mutation"
+  detail "candidates tried: wss://$NAS_HOST/api/current, wss://[::1]/api/current"
   printf 'RESULT: 0 passed, 1 failed, 0 skipped (preflight)\n'
   exit 2
 fi
-detail "auth gate OK; appliance reports version: $NAS_VERSION"
+detail "auth gate OK via $NAS_URL; appliance reports version: $NAS_VERSION"
 
 # Startup sweep: remove drill-exclusive residue from a crashed prior run. This
 # destroys scratch objects only (never the workdir, which the steps still need).
@@ -522,6 +560,94 @@ if [ "$step1b_ok" = "1" ]; then
   pass "step 1b: inherited encryption reports the PARENT as encryption_root (P-10) and the resource listing carries no encryption signal (P-11)"
 else
   fail "step 1b: the inherited-encryption identity did not match P-10/P-11"
+fi
+
+# --- step 1c: the driver's query PROJECTION carries the encryption block ----
+#
+# The re-drill's D-3 blocker, made a standing gate. Every pool.dataset.query the
+# DRIVER issues carries an extra.properties projection; TrueNAS returns only
+# those properties plus a small always-present core and OMITS the rest — as an
+# absent key, which the client decodes to a zero value. The driver's projection
+# did not include the encryption properties, so `encrypted`, `locked`,
+# `key_format` and `encryption_root` were absent from every driver read and every
+# "wire truth" encryption predicate silently answered "plaintext" about an
+# aes-256-gcm/passphrase dataset (fail-open publish, PVC-wedging replay).
+#
+# Note that NOTHING ELSE in this drill can catch that: dataset_row() calls
+# pool.dataset.query with NO `extra`, which is measured shape A — always fully
+# populated. This step is the only place the drill speaks the driver's own
+# request shape.
+#
+# It asserts BOTH directions, so it is a measurement and not an assumption:
+#   with the driver's projection    -> the encryption block is PRESENT (shape C)
+#   with the pre-fix base projection -> it is ABSENT (shape B, the defect)
+# If the second assertion ever fails, the backend started returning encryption
+# fields unconditionally; that is a shape change worth knowing about, not a pass.
+
+step 1c "the driver's pool.dataset.query projection carries the encryption block (D-3)"
+
+step1c_ok=1
+
+# Keep these two lists byte-identical to pkg/truenas/dataset.go:
+#   base    = datasetQueryPropertiesBase (the pre-fix projection)
+#   driver  = datasetQueryProperties     (base + origin + the encryption set)
+PROJ_BASE='["used","available","quota","refquota","referenced","usedbysnapshots","reservation","refreservation","volsize","volblocksize","creation"]'
+PROJ_DRIVER='["used","available","quota","refquota","referenced","usedbysnapshots","reservation","refreservation","volsize","volblocksize","creation","origin","encryption","keyformat","encryptionroot","keystatus"]'
+
+projected_row() {
+  mc pool.dataset.query \
+    "$(jq -nc --arg id "$ZV" '[["id","=",$id]]')" \
+    "$(jq -nc --argjson props "$1" '{extra:{properties:$props}}')" |
+    jq -c '.[0] // empty' 2>/dev/null
+}
+
+row_driver="$(projected_row "$PROJ_DRIVER")"
+row_base="$(projected_row "$PROJ_BASE")"
+
+if [ -z "$row_driver" ] || [ -z "$row_base" ]; then
+  detail "projected pool.dataset.query returned no row for $ZV: $(tr -d '\n' <"$ERRFILE")"
+  step1c_ok=0
+else
+  drv_encrypted="$(printf '%s' "$row_driver" | jq -r '.encrypted // empty' 2>/dev/null)"
+  drv_root="$(jq_field "$row_driver" encryption_root)"
+  drv_format="$(jq_field "$row_driver" key_format)"
+  drv_locked="$(printf '%s' "$row_driver" | jq -r 'if has("locked") then "present" else "" end' 2>/dev/null)"
+
+  if [ "$drv_encrypted" != "true" ]; then
+    detail "the DRIVER's projection did not return encrypted:true (got '${drv_encrypted:-<absent>}')"
+    detail "ACTION: this is D-3. Every wire-truth encryption predicate is reading zero values."
+    step1c_ok=0
+  fi
+  if [ "$drv_root" != "$ZV" ]; then
+    detail "the DRIVER's projection returned encryption_root '${drv_root:-<absent>}', expected '$ZV'"
+    step1c_ok=0
+  fi
+  if [ "$drv_format" != "PASSPHRASE" ]; then
+    detail "the DRIVER's projection returned key_format '${drv_format:-<absent>}', expected PASSPHRASE"
+    step1c_ok=0
+  fi
+  if [ "$drv_locked" != "present" ]; then
+    detail "the DRIVER's projection did not return a 'locked' field at all"
+    detail "ACTION: the unlock reconciler and the health surface both read it"
+    step1c_ok=0
+  fi
+
+  base_encrypted="$(printf '%s' "$row_base" | jq -r '.encrypted // empty' 2>/dev/null)"
+  base_root="$(jq_field "$row_base" encryption_root)"
+  if [ "$base_encrypted" = "true" ] || [ -n "$base_root" ]; then
+    detail "RECORDED: the PRE-FIX projection now also returns the encryption block"
+    detail "  (encrypted='$base_encrypted' encryption_root='$base_root')"
+    detail "ACTION: the backend's projection behavior changed — re-measure D-3 before trusting this step"
+    step1c_ok=0
+  else
+    detail "pre-fix projection omits the encryption block (shape B reproduced)"
+  fi
+fi
+
+if [ "$step1c_ok" = "1" ]; then
+  pass "step 1c: the driver's projection returns encrypted/locked/key_format/encryption_root; the pre-fix one does not"
+else
+  fail "step 1c: the driver's query projection does not carry the encryption block (D-3)"
 fi
 
 # --- step 2: iSCSI extent over the zvol + write a known pattern ------------
