@@ -612,3 +612,50 @@ func TestMockChangeKeyPromotesInheritingChild(t *testing.T) {
 	require.Error(t, mock.DatasetUnlock(ctx, child, "parent-pass-1"))
 	require.NoError(t, mock.DatasetUnlock(ctx, child, "child-pass-2"))
 }
+
+// TestMockEncryptionSummaryIsEmptyForANonRoot pins a backend fact drill #3
+// measured directly on nas01 (2026-08-03):
+//
+//	pool.dataset.encryption_summary <non-encryption-root>  ->  []
+//	pool.dataset.encryption_summary <real encryption root> ->  [{"name": ...}]
+//
+// The driver's exact-name match turns that empty list into a fail-closed error,
+// which is what stopped the O-1 divergence on hardware. It is modeled here so the
+// fail-closed path has something real to be tested against — and so nothing
+// mistakes "the appliance answered" for "the appliance answered about THIS
+// dataset". The driver's own ownership gate must not depend on it: see
+// ModelEncryptionSummaryForInheritedKeys, which exists purely to switch this off
+// in the test that proves the gate stands alone.
+func TestMockEncryptionSummaryIsEmptyForANonRoot(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockClient()
+	const origin = "flashstor/o1-origin"
+	const clone = "flashstor/o1-clone"
+
+	_, err := mock.DatasetCreate(ctx, &DatasetCreateParams{
+		Name: origin, Type: "VOLUME", Volsize: 1 << 30, Sparse: true,
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: "origin-pass-1"},
+	})
+	require.NoError(t, err)
+	_, err = mock.SnapshotCreate(ctx, origin, "snap", nil)
+	require.NoError(t, err)
+	require.NoError(t, mock.SnapshotClone(ctx, origin+"@snap", clone))
+
+	rootSummary, err := mock.DatasetEncryptionSummary(ctx, origin)
+	require.NoError(t, err)
+	require.Len(t, rootSummary, 1, "a real encryption root answers for itself")
+	assert.Equal(t, origin, rootSummary[0].Name)
+
+	cloneSummary, err := mock.DatasetEncryptionSummary(ctx, clone)
+	require.NoError(t, err)
+	assert.Empty(t, cloneSummary,
+		"drill #3: a dataset that is not its own encryption root gets an EMPTY list, not a row")
+
+	// And the deliberate stub, which must never be mistaken for reality.
+	mock.ModelEncryptionSummaryForInheritedKeys = true
+	stubbed, err := mock.DatasetEncryptionSummary(ctx, clone)
+	require.NoError(t, err)
+	require.Len(t, stubbed, 1, "the knob exists only to isolate the driver's own gate in a test")
+}
