@@ -28,6 +28,11 @@
 #        loudly, when absent) and device transitions are polled, not assumed.
 #   H-6  pool.snapshot.clone takes ({snapshot, dataset_dst}), not (id, {name}).
 #   H-7  the residue audit now also checks replication.query.
+#   O-3  the residue audit matched the FAMILY prefix `gf1-enc-drill`, which also
+#        matches other harnesses (drill #3 used gf1-enc-drill3-*). It passed both
+#        runs on timing — whoever cleaned up first decided the verdict. It now
+#        audits this run's OWN object ids exactly, and reports (without scoring)
+#        anything else that shares the family prefix.
 #
 # WHAT THE 2026-08-03 RE-RUN CHANGED (re-drill report H-8 and D-3):
 #   H-8  the step-0 auth gate aborted the WHOLE drill when GF1_NAS_HOST was the
@@ -87,7 +92,8 @@
 #       opened by the SOURCE's current key (raw send)
 #   6c. change_key on an inheriting child -> SUCCEEDS and re-roots it (D-2)
 #   7.  destroy while locked -> clean, no key needed (E-4)
-#   8.  teardown + zero-residue audit (datasets, snapshots, extents, replication)
+#   8.  teardown + zero-residue audit, anchored to THIS run's own object ids
+#       (datasets, snapshots, extents, replication)
 #
 # EXECUTION MODEL. Run this ON the TrueNAS host as ROOT (steps 2/3 assert
 # host-level facts the API cannot see: the /dev/zvol device node and a dd pattern
@@ -1183,31 +1189,69 @@ step 8 "teardown + zero-residue audit (datasets, snapshots, extents, replication
 sweep_residue
 
 step8_ok=1
-ds_residue="$(mc pool.dataset.query '[["id","~","gf1-enc-drill"]]' | jq 'length' 2>/dev/null)"
-snap_residue="$(mc pool.snapshot.query '[["id","~","gf1-enc-drill"]]' | jq 'length' 2>/dev/null)"
-ext_residue="$(mc iscsi.extent.query '[["name","~","gf1-enc-drill"]]' | jq 'length' 2>/dev/null)"
-# H-7: a one-time replication must leave no persistent task behind.
-repl_residue="$(mc replication.query | jq '[.[] | select((.name // "") | test("gf1-enc-drill"))] | length' 2>/dev/null)"
 
-if [ "${ds_residue:-1}" != "0" ]; then
-  detail "dataset residue remains: $ds_residue gf1-enc-drill dataset(s)"
-  step8_ok=0
-fi
-if [ "${snap_residue:-1}" != "0" ]; then
-  detail "snapshot residue remains: $snap_residue gf1-enc-drill snapshot(s)"
-  step8_ok=0
-fi
+# O-3: the audit is anchored to THIS run's own object names, by EXACT id.
+#
+# It used to match the regex `gf1-enc-drill`, which also matches every other
+# harness that shares the family prefix (drill #3's objects are named
+# gf1-enc-drill3-*). Both runs passed on TIMING — the other harness's teardown
+# happened to land first — so the audit's verdict depended on when someone else's
+# cleanup ran. Exact ids remove that: this run can only pass by removing its OWN
+# objects, and it can never fail because of somebody else's.
+#
+# The family-wide sweep still runs, but as INFORMATION: anything matching the
+# family prefix that is not ours is reported, never scored.
+
+OWNED_DATASETS="$ZV $FS $CLONE $DETACHED $ENC_CHILD $ENC_PARENT"
+OWNED_SNAPSHOTS="$SNAP $PROJ_SNAP"
+
+for owned in $OWNED_DATASETS; do
+  remaining="$(mc pool.dataset.query "$(jq -nc --arg id "$owned" '[["id","=",$id]]')" | jq 'length' 2>/dev/null)"
+  if [ "${remaining:-1}" != "0" ]; then
+    detail "dataset residue remains: $owned"
+    step8_ok=0
+  fi
+done
+
+for owned in $OWNED_SNAPSHOTS; do
+  remaining="$(mc pool.snapshot.query "$(jq -nc --arg id "$owned" '[["id","=",$id]]')" | jq 'length' 2>/dev/null)"
+  if [ "${remaining:-1}" != "0" ]; then
+    detail "snapshot residue remains: $owned"
+    step8_ok=0
+  fi
+done
+
+ext_residue="$(mc iscsi.extent.query "$(jq -nc --arg n "$EXTENT_NAME" '[["name","=",$n]]')" | jq 'length' 2>/dev/null)"
 if [ "${ext_residue:-1}" != "0" ]; then
-  detail "extent residue remains: $ext_residue gf1-enc-drill extent(s)"
+  detail "extent residue remains: $EXTENT_NAME"
   step8_ok=0
 fi
+
+# H-7: a one-time replication must leave no persistent task behind. Match on the
+# target dataset this run actually replicated into, not on the family prefix.
+repl_residue="$(mc replication.query | jq --arg dst "$DETACHED" \
+  '[.[] | select((.target_dataset // "") == $dst)] | length' 2>/dev/null)"
 if [ "${repl_residue:-1}" != "0" ]; then
-  detail "replication task residue remains: $repl_residue gf1-enc-drill task(s)"
+  detail "replication task residue remains for target $DETACHED"
   step8_ok=0
+fi
+
+# Informational only: never scored, so another harness's objects cannot fail this
+# run — and a stale object of ours would already have failed above.
+family_ds="$(mc pool.dataset.query '[["id","~","gf1-enc-drill"]]' | jq -r '.[].id' 2>/dev/null)"
+foreign=""
+for candidate in $family_ds; do
+  case " $OWNED_DATASETS " in
+    *" $candidate "*) : ;;
+    *) foreign="$foreign $candidate" ;;
+  esac
+done
+if [ -n "${foreign# }" ]; then
+  detail "NOTE: other gf1-enc-drill* objects exist and are NOT this run's (not scored):$foreign"
 fi
 
 if [ "$step8_ok" = "1" ]; then
-  pass "step 8: zero residue (datasets=0, snapshots=0, extents=0, replication tasks=0 matching gf1-enc-drill)"
+  pass "step 8: zero residue — every object this run created is gone (audited by exact id, not by family prefix)"
 else
   fail "step 8: residue remains after teardown"
 fi

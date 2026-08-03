@@ -425,17 +425,6 @@ func (d *Driver) readEncryptionCandidateStates(ctx context.Context, names []stri
 	return states
 }
 
-// encryptionOwnershipConfirmed decides, on a SOURCE-BEARING read, whether a
-// dataset's key is this driver's to load: it must carry the driver's own LOCAL
-// encryption stamp AND must not inherit its key from another dataset. The stamp
-// is the standing ownership rule; the inheritance check is what keeps a
-// clone-inherited or encrypted-parent dataset out of the unlock path: it has no
-// key of its own to load, and (D-2) the neighboring re-key operation is NOT
-// refused by the backend, so nothing downstream would catch a mistake here.
-func encryptionOwnershipConfirmed(ds *truenas.Dataset) bool {
-	return isEncryptedDataset(ds) && datasetEncryptionInheritedFrom(ds) == ""
-}
-
 // confirmEncryptionOwner re-reads a candidate through pool.dataset.query (the
 // SOURCE-BEARING read path) and reports whether its encryption stamp is LOCAL to
 // this dataset. A clone-inherited stamp reports the ORIGIN SNAPSHOT as its

@@ -353,6 +353,28 @@ func datasetNeedsEncryptionHandling(ds *truenas.Dataset) bool {
 	return isEncryptedDataset(ds) || datasetSelfKeyedPassphrase(ds)
 }
 
+// encryptionOwnershipConfirmed is THE ownership question, asked in ONE place:
+// is this dataset's encryption key this driver's to act on? Two conditions, both
+// required:
+//
+//   - the driver's own LOCAL encryption stamp (source=="local"): this volume's
+//     encryption policy is ours, not a clone-inherited marker;
+//   - the key is NOT inherited (encryption_root == the dataset itself, P-10): a
+//     dataset that inherits its key has none of its own to load, and (D-2,
+//     drill-measured) the neighboring re-key is NOT refused by the backend — it
+//     succeeds and silently severs the dataset from its origin key.
+//
+// The publish path and the unlock reconciler ask this same question and used to
+// answer it DIFFERENTLY: publish tested the stamp alone. Drill #3 drove the
+// divergent shape (stamped, key inherited, rotation window open) and it did not
+// re-key — but only because encryption_summary returns [] for a
+// non-encryption-root and the exact-name match fails closed downstream. That is
+// defense in depth doing the gate's job. One predicate, both callers, so each
+// path refuses on its own terms.
+func encryptionOwnershipConfirmed(ds *truenas.Dataset) bool {
+	return isEncryptedDataset(ds) && datasetEncryptionInheritedFrom(ds) == ""
+}
+
 // encryptionKeys is the pair of passphrases a publish/reconcile pass may use:
 // the desired (current) key and, while the rotation window is deliberately open,
 // the previous one. It is short-lived and never persisted or logged.
@@ -732,6 +754,21 @@ func (d *Driver) unlockEncryptedDatasetForPublish(ctx context.Context, ds *truen
 	// predicate collapsed to the stamp alone, the one thing the design says it
 	// must not rely on. ds must come from a read that projects
 	// truenas.datasetEncryptionQueryProperties.
+	// O-2: a LOCKED volume whose key is INHERITED is a dead end this driver cannot
+	// open — the key belongs to the encryption root, and the backend refuses an
+	// unlock on a non-root. Drill #3 measured what the operator got instead: an
+	// opaque `Internal: failed to create NFS share: ... Invalid params` from the
+	// share build further down, with no mention of encryption at all. It failed
+	// closed, which is right; it said nothing, which is not. Name the condition
+	// here, before the share build, and keep failing closed.
+	if root := datasetEncryptionInheritedFrom(ds); root != "" && ds.Locked {
+		return status.Errorf(codes.FailedPrecondition,
+			"volume %s is LOCKED and its encryption key is INHERITED from %s, so this driver cannot unlock it: "+
+				"a dataset that is not its own encryption root has no key of its own to load. Unlock %s (its key is "+
+				"not managed by this driver — a clone shares its origin's key, P-7) and retry, or provision a fresh "+
+				"volume from an encrypted StorageClass and copy the data in",
+			volumeID, root, root)
+	}
 	if !datasetNeedsEncryptionHandling(ds) {
 		return nil
 	}
@@ -777,7 +814,13 @@ func (d *Driver) unlockEncryptedDatasetForPublish(ctx context.Context, ds *truen
 	// only thing preventing a rotation window from quietly re-keying a clone away
 	// from the key its origin's operator holds. Treat it as safety-critical; it is
 	// pinned by its own test rather than by a backend refusal that does not exist.
-	ownsKey := isEncryptedDataset(ds)
+	//
+	// O-1: this asks encryptionOwnershipConfirmed — the SAME predicate the unlock
+	// reconciler uses — not the stamp alone. The stamp-alone form let a stamped
+	// dataset with an INHERITED key set mayRekey=true; on hardware only the
+	// unrelated encryption_summary fail-closed stopped it. The gate now refuses on
+	// its own terms.
+	ownsKey := encryptionOwnershipConfirmed(ds)
 	if !ownsKey {
 		if locked {
 			klog.Warningf("Volume %s is locked and the backend reports it encrypted, but it carries no local "+

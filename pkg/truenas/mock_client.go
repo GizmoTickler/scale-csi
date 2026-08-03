@@ -81,6 +81,14 @@ type MockClient struct {
 	// the assumption is wrong. It only takes effect with ModelQueryProjection on.
 	ModelSnapshotCreateTXGAbsent bool
 
+	// ModelEncryptionSummaryForInheritedKeys makes DatasetEncryptionSummary answer
+	// for a dataset whose key is INHERITED, which the appliance does not do (drill
+	// #3 measured an empty list). It exists for exactly one purpose: to switch OFF
+	// the downstream fail-closed so a test can prove the driver's own ownership
+	// gate refuses on its own terms, rather than passing because a second,
+	// unrelated invariant fired first. Never set it to model reality.
+	ModelEncryptionSummaryForInheritedKeys bool
+
 	// datasetPassphrases is the MOCK's model of the appliance's own key
 	// knowledge, keyed by ENCRYPTION ROOT dataset name. It lives here, not on the
 	// shared *Dataset struct, so no passphrase can ride into driver code under
@@ -1357,6 +1365,20 @@ func (m *MockClient) DatasetEncryptionSummary(ctx context.Context, name string) 
 	}
 	if !ds.Encrypted {
 		return nil, notFoundAPIError("dataset is not encrypted")
+	}
+	// DRILL #3 (2026-08-03), measured directly:
+	//
+	//	pool.dataset.encryption_summary <non-encryption-root>  ->  []
+	//	pool.dataset.encryption_summary <real encryption root> ->  [{"name": ...}]
+	//
+	// A dataset that inherits its key gets an EMPTY list, which the driver's
+	// exact-name match turns into a fail-closed error. That is a real backend
+	// guarantee and belongs in the model — but it is also a SECOND, unrelated
+	// invariant, and the driver's own ownership gate must not depend on it (O-1).
+	// ModelEncryptionSummaryForInheritedKeys removes it so a test can prove the
+	// gate stands alone.
+	if ds.EncryptionRoot != "" && ds.EncryptionRoot != name && !m.ModelEncryptionSummaryForInheritedKeys {
+		return []EncryptionSummaryEntry{}, nil
 	}
 	keyFormat := "PASSPHRASE"
 	return []EncryptionSummaryEntry{{

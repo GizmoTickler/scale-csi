@@ -1742,3 +1742,152 @@ func TestPublishNeverRekeysAnInheritingCloneEvenThoughTheBackendWould(t *testing
 	assert.Equal(t, clone, severed.EncryptionRoot,
 		"D-2 measured: change_key on an inheriting child succeeds and promotes it")
 }
+
+// TestPublishOwnershipGateRefusesOnItsOwnTerms is the O-1 regression.
+//
+// Drill #3 drove the divergent shape — a dataset carrying the driver's LOCAL
+// encryption stamp whose encryption_root is ANOTHER dataset — with a rotation
+// window open. It did not re-key, but not because the publish gate said no: the
+// publish gate was `ownsKey := isEncryptedDataset(ds)` (the stamp alone) and
+// would have set mayRekey=true. What actually stopped it was an unrelated
+// backend invariant — encryption_summary returns [] for a non-encryption-root,
+// and the driver's exact-name match then fails closed. Defense in depth doing
+// the gate's job.
+//
+// So this test switches that downstream guard OFF (the mock answers the summary
+// for an inherited-key dataset, which the appliance does NOT do) and asserts the
+// GATE refuses. It cannot pass for the wrong reason: with the downstream stubbed
+// out, the only thing left between the rotation window and change_key is
+// encryptionOwnershipConfirmed.
+//
+// PRE-FIX PROOF: restore `ownsKey := isEncryptedDataset(ds)` and this FAILS with
+// DatasetChangeKey == 1 and the clone re-rooted to itself (D-2's severing).
+func TestPublishOwnershipGateRefusesOnItsOwnTerms(t *testing.T) {
+	const origin = "pool/parent/o1-origin"
+	const stampedClone = "pool/parent/o1-clone"
+	const originPass = "origin-pass-123"
+	const newPass = "new-pass-456"
+
+	d, client := encryptionTestDriver()
+	d.eventRecorder = &EventRecorder{recorder: record.NewFakeRecorder(16), enabled: true}
+	ctx := context.Background()
+
+	createEncryptedDataset(t, client, origin, originPass)
+	_, err := client.SnapshotCreate(ctx, origin, "snap", nil)
+	require.NoError(t, err)
+	require.NoError(t, client.SnapshotClone(ctx, origin+"@snap", stampedClone))
+	// The divergent shape: the clone carries a LOCAL stamp of its own (which the
+	// driver's own APIs will not produce — the content-source refusal and its
+	// backstop prevent it — but which the gate must still refuse) while its key
+	// remains the ORIGIN's.
+	require.NoError(t, client.DatasetSetUserProperty(ctx, stampedClone, PropEncryption, "AES-256-GCM"))
+
+	// Switch OFF the unrelated downstream fail-closed, so only the gate is left.
+	client.ModelEncryptionSummaryForInheritedKeys = true
+
+	cloneDS, err := client.DatasetGet(ctx, stampedClone)
+	require.NoError(t, err)
+	require.Equal(t, "AES-256-GCM", datasetLocalUserProperty(cloneDS, PropEncryption),
+		"the stamp says ours")
+	require.Equal(t, origin, cloneDS.EncryptionRoot, "the key says otherwise")
+	require.False(t, cloneDS.Locked, "unlocked, so the O-2 locked arm is not what is being tested")
+
+	client.resetCalls()
+	require.NoError(t, d.unlockEncryptedDatasetForPublish(ctx, cloneDS, stampedClone, "o1-clone",
+		map[string]string{"passphrase": newPass, "passphrasePrevious": originPass}),
+		"a healthy unlocked volume must still publish")
+
+	_, methods := client.callSnapshot()
+	require.Equal(t, 1, methods["DatasetEncryptionSummary"],
+		"the downstream guard was reached and ANSWERED — so it is not what refused")
+	assert.Zero(t, methods["DatasetChangeKey"],
+		"the ownership gate itself must refuse the re-key")
+
+	after, err := client.DatasetGet(ctx, stampedClone)
+	require.NoError(t, err)
+	assert.Equal(t, origin, after.EncryptionRoot,
+		"D-2: a re-key here would have silently severed the clone from its origin key")
+}
+
+// TestPublishOwnershipGateMatchesTheReconciler pins the alignment itself: both
+// paths now ask ONE predicate. The table is the shapes the two used to disagree
+// about.
+func TestPublishOwnershipGateMatchesTheReconciler(t *testing.T) {
+	stamped := map[string]truenas.UserProperty{PropEncryption: {Value: "AES-256-GCM", Source: "local"}}
+	inheritedStamp := map[string]truenas.UserProperty{PropEncryption: {Value: "AES-256-GCM", Source: "pool/parent/origin@snap"}}
+
+	for _, tc := range []struct {
+		name string
+		ds   *truenas.Dataset
+		want bool
+	}{
+		{"self-keyed and stamped: ours", &truenas.Dataset{
+			Name: "pool/parent/v", Encrypted: true, EncryptionRoot: "pool/parent/v",
+			KeyFormat: truenas.KeyFormatPassphrase, UserProperties: stamped}, true},
+		{"stamped but key inherited: NOT ours (the O-1 shape)", &truenas.Dataset{
+			Name: "pool/parent/v", Encrypted: true, EncryptionRoot: "pool/parent/origin",
+			KeyFormat: truenas.KeyFormatPassphrase, UserProperties: stamped}, false},
+		{"clone-inherited stamp: not ours", &truenas.Dataset{
+			Name: "pool/parent/v", Encrypted: true, EncryptionRoot: "pool/parent/origin",
+			KeyFormat: truenas.KeyFormatPassphrase, UserProperties: inheritedStamp}, false},
+		{"self-keyed but unstamped: not ours to re-key", &truenas.Dataset{
+			Name: "pool/parent/v", Encrypted: true, EncryptionRoot: "pool/parent/v",
+			KeyFormat: truenas.KeyFormatPassphrase, UserProperties: map[string]truenas.UserProperty{}}, false},
+		{"plaintext", &truenas.Dataset{Name: "pool/parent/v", UserProperties: map[string]truenas.UserProperty{}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, encryptionOwnershipConfirmed(tc.ds),
+				"publish and the unlock reconciler ask THIS function; they must not diverge again")
+		})
+	}
+}
+
+// TestPublishNamesALockedInheritedKey is the O-2 regression. Drill #3 published a
+// volume that was locked because its encryption ROOT was locked; the driver
+// failed closed — correctly — with `Internal: failed to create NFS share: ...
+// Invalid params` from the share build, which tells the operator nothing about
+// encryption. The behavior stays fail-closed; only the diagnosis changes.
+//
+// PRE-FIX PROOF: without the inherited-key arm the call returns nil (the volume
+// carries no stamp and is not self-keyed, so the encryption path skipped it) and
+// the publish fails much later, in the share builder, with no mention of a key.
+func TestPublishNamesALockedInheritedKey(t *testing.T) {
+	const parent = "pool/parent/o2-parent"
+	const child = parent + "/child"
+	const parentPass = "parent-pass-123"
+
+	d, client := encryptionTestDriver()
+	ctx := context.Background()
+
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+		Name: parent, Type: "FILESYSTEM",
+		Encryption:        boolPtr(true),
+		InheritEncryption: boolPtr(false),
+		EncryptionOptions: &truenas.EncryptionOptions{Algorithm: "AES-256-GCM", Passphrase: parentPass},
+	})
+	require.NoError(t, err)
+	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: child, Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	// Locking the root locks the child with it (P-7/P-10 inheritance).
+	require.NoError(t, client.DatasetLock(ctx, parent))
+
+	childDS, err := client.DatasetGet(ctx, child)
+	require.NoError(t, err)
+	require.True(t, childDS.Locked)
+	require.Equal(t, parent, childDS.EncryptionRoot)
+	require.Equal(t, "", datasetLocalUserProperty(childDS, PropEncryption), "no stamp: not this driver's volume")
+
+	client.resetCalls()
+	err = d.unlockEncryptedDatasetForPublish(ctx, childDS, child, "o2-child",
+		map[string]string{"passphrase": parentPass})
+	require.Error(t, err, "it must still fail closed")
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "LOCKED", "the message names the state")
+	assert.Contains(t, err.Error(), "INHERITED", "and why this driver cannot fix it")
+	assert.Contains(t, err.Error(), parent, "and which dataset actually holds the key")
+	assert.NotContains(t, err.Error(), parentPass, "and never the passphrase")
+
+	_, methods := client.callSnapshot()
+	assert.Zero(t, methods["DatasetUnlock"],
+		"no unlock is attempted: the backend refuses an unlock on a non-encryption-root anyway")
+}
