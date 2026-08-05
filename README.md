@@ -241,7 +241,7 @@ documented exception ledger is [`.trivyignore`](.trivyignore).
 | [Disaster recovery](docs/guides/disaster-recovery.md) | ZFS replication + export auto-recreation for cross-site failover (CHAP volumes additionally need the `iscsi.auth` peer pre-created on the DR TrueNAS) |
 | [Topology](docs/guides/topology.md) | Zone/region-aware provisioning (advanced; single-backend usually doesn't need it) |
 | [Snapshots](docs/guides/snapshots.md) | Snapshot and clone/restore workflow |
-| [Release notes](docs/release-notes-next.md) | v1.4.0 changelog and upgrade actions |
+| [Release notes](docs/release-notes-next.md) | v1.6.0 changelog and upgrade actions |
 
 ## Network Ports
 

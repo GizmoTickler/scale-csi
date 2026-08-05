@@ -1,7 +1,7 @@
 # Production deployment
 
 This guide describes the current scale-csi repository and bundled Helm chart,
-based on the v1.4.0 release line. Review the [deployment guide](deployment.md)
+based on the v1.6.0 release line. Review the [deployment guide](deployment.md)
 for installation examples and the chart's
 [values reference](../charts/scale-csi/README.md) for every setting.
 

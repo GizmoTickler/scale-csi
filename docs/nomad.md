@@ -52,7 +52,7 @@ job "scale-csi-controller" {
       driver = "docker"
 
       config {
-        image = "ghcr.io/gizmotickler/scale-csi:v1.4.0"
+        image = "ghcr.io/gizmotickler/scale-csi:v1.6.0"
         args = [
           "-config=/etc/scale-csi/config.yaml",
           "-endpoint=unix:///csi/csi.sock",
@@ -109,7 +109,7 @@ job "scale-csi-node" {
       driver = "docker"
 
       config {
-        image      = "ghcr.io/gizmotickler/scale-csi:v1.4.0"
+        image      = "ghcr.io/gizmotickler/scale-csi:v1.6.0"
         privileged = true
         args = [
           "-config=/etc/scale-csi/config.yaml",

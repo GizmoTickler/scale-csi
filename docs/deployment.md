@@ -1,8 +1,8 @@
 # Deployment and configuration
 
-This guide covers the bundled OCI Helm chart, based on the v1.4.0 release line.
-The chart and image use the same release number: chart `1.4.0` deploys image
-`v1.4.0` unless `image.tag` or `image.digest` is overridden. (The in-tree
+This guide covers the bundled OCI Helm chart, based on the v1.6.0 release line.
+The chart and image use the same release number: chart `1.6.0` deploys image
+`v1.6.0` unless `image.tag` or `image.digest` is overridden. (The in-tree
 `Chart.yaml` carries a `0.0.0-dev` placeholder that CI stamps with the tag at
 release time.)
 
@@ -65,13 +65,13 @@ helm install scale-csi \
 
 The example deliberately avoids a soon-stale version literal. For a controlled
 production rollout, verify the release signature and add the exact reviewed
-version, for example `--version 1.4.0`. See the root README for image, chart,
+version, for example `--version 1.6.0`. See the root README for image, chart,
 and provenance verification commands.
 
 ## Flux
 
 The current Flux OCI source shape uses `OCIRepository` plus `HelmRelease`. Pin
-the exact release you reviewed; this example uses the v1.4.0 baseline:
+the exact release you reviewed; this example uses the v1.6.0 baseline:
 
 ```yaml
 apiVersion: source.toolkit.fluxcd.io/v1
@@ -86,7 +86,7 @@ spec:
     mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
     operation: copy
   ref:
-    semver: "1.4.0"
+    semver: "1.6.0"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
