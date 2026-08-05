@@ -1,7 +1,8 @@
 # Build stage
 # renovate: datasource=docker depName=golang
-# Pin this base image as FROM golang:1.26.5-alpine3.24@sha256:<digest> when Renovate resolves it.
-FROM golang:1.26.5-alpine3.24 AS builder
+# The exact multi-architecture manifest digest for this tag is pinned here;
+# Renovate should update the tag and digest together.
+FROM golang:1.26.5-alpine3.24@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
 
 RUN apk add --no-cache git
 
@@ -26,8 +27,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
 # Runtime image
 ######################
 # renovate: datasource=docker depName=alpine
-# Pin this base image as FROM alpine:3.24@sha256:<digest> when Renovate resolves it.
-FROM alpine:3.24
+# The exact multi-architecture manifest digest for this tag is pinned here;
+# Renovate should update the tag and digest together.
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 LABEL org.opencontainers.image.source="https://github.com/GizmoTickler/scale-csi"
 LABEL org.opencontainers.image.url="https://github.com/GizmoTickler/scale-csi"
