@@ -251,6 +251,37 @@ func TestJobWaitT9PurePollParity(t *testing.T) {
 	assert.GreaterOrEqual(t, time.Since(start), 18*time.Millisecond, "pure polling should retain the existing interval cadence")
 }
 
+func TestJobWaitT11UsesCallerDeadlineNotClientRPCBudget(t *testing.T) {
+	client := newJobWaitTestClient(t)
+	client.config.Timeout = 10 * time.Millisecond
+	started := make(chan struct{})
+	client.jobPollOnceOverride = func(ctx context.Context, _ int64) (bool, error) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		select {
+		case <-time.After(30 * time.Millisecond):
+			return true, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+
+	callerCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := client.waitForJob(callerCtx, 111)
+	require.NoError(t, err, "the job wait must use the caller's operation deadline, not ClientConfig.Timeout")
+	assert.GreaterOrEqual(t, time.Since(start), 25*time.Millisecond)
+	select {
+	case <-started:
+	default:
+		t.Fatal("the job wait did not perform its initial poll")
+	}
+}
+
 func TestJobWaitT10SemaphoreAccounting(t *testing.T) {
 	client := newJobWaitTestClient(t)
 	client.pool = []*Connection{subscribedTestConnection(1)}

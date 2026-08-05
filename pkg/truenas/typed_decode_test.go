@@ -182,6 +182,47 @@ func TestPendingDepthRecorderTracksCallLifecycle(t *testing.T) {
 	assert.Equal(t, 0, client.PendingDepth())
 }
 
+func TestCallUsesConfigTimeoutPerRPCWithoutClampingCaller(t *testing.T) {
+	cfg := &ClientConfig{
+		Timeout:               20 * time.Millisecond,
+		APIRetryMaxAttempts:   1,
+		APIRetryInitialDelay:  time.Millisecond,
+		APIRetryMaxDelay:      time.Millisecond,
+		APIRetryBackoffFactor: 1,
+	}
+	connection := NewConnection(0, cfg)
+	connection.mu.Lock()
+	connection.generation = 1
+	connection.stopped = false
+	connection.authenticated = true
+	connection.writeCh = make(chan writeRequest)
+	connection.conn.Store(&websocket.Conn{})
+	connection.mu.Unlock()
+	atomic.StoreInt32(&connection.connState, int32(stateConnected))
+
+	client := &Client{
+		config:    cfg,
+		pool:      []*Connection{connection},
+		semaphore: make(chan struct{}, 1),
+	}
+	go func() {
+		request := <-connection.writeCh
+		request.resultCh <- nil
+		// Deliberately do not send a response: this is a wedged single RPC, not
+		// a long-running CSI operation containing multiple RPCs.
+	}()
+
+	callerCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := client.CallWithContext(callerCtx, "test.wedged")
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.GreaterOrEqual(t, elapsed, 15*time.Millisecond)
+	assert.Less(t, elapsed, 500*time.Millisecond, "the per-RPC timeout should fire before the caller's one-second operation deadline")
+}
+
 func TestCallRawIsSharedByTypedAndGenericDecoders(t *testing.T) {
 	cfg := &ClientConfig{
 		Timeout:               time.Second,

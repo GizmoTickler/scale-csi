@@ -1402,18 +1402,17 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		// Select best available connection
 		conn := c.selectConnection()
 
-		// Bound each attempt so a wedged-but-live request cannot pin a semaphore
-		// slot forever. Only apply the cfg.Timeout cap when the caller supplied NO
-		// deadline (e.g. background session GC using context.Background()). Callers
-		// that already carry a deadline — CSI sidecar RPCs — are bounded by it, and
-		// capping them shorter would wrongly fail a legitimately-long single call
-		// (large clone / recursive snapshot) that the sidecar allowed time for.
+		// Bound THIS JSON-RPC attempt so a wedged-but-live request cannot pin a
+		// semaphore slot forever. WithTimeout derives a child of the caller's
+		// context, so the effective budget is min(remaining caller deadline,
+		// cfg.Timeout) rather than a replacement of the caller's operation-wide
+		// deadline. @job methods dispatch one RPC here and then wait in the separate
+		// waitForJob loop; that loop continues to use the caller's deadline across
+		// job events and polls.
 		callCtx := ctx
 		cancel := func() {}
 		if c.config.Timeout > 0 {
-			if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-				callCtx, cancel = context.WithTimeout(ctx, c.config.Timeout)
-			}
+			callCtx, cancel = context.WithTimeout(ctx, c.config.Timeout)
 		}
 		result, err := conn.callRawWithContext(callCtx, method, params...)
 		attemptTimedOut := err != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
