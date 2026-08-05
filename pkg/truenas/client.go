@@ -1408,6 +1408,22 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		// that already carry a deadline — CSI sidecar RPCs — are bounded by it, and
 		// capping them shorter would wrongly fail a legitimately-long single call
 		// (large clone / recursive snapshot) that the sidecar allowed time for.
+		//
+		// GF2: re-examined and RE-AFFIRMED. A review proposed making cfg.Timeout a
+		// floor — min(remaining caller deadline, cfg.Timeout) on every attempt — on
+		// the theory that cfg.Timeout bounds one JSON-RPC round-trip while the
+		// sidecar deadline bounds a whole operation. That reasoning identifies a
+		// real seam (callRaw is one attempt; @job methods dispatch here and then
+		// wait in waitForJob), but the seam is NOT the relevant boundary. The
+		// operations this comment names are plain calls, not @job methods:
+		// snapshot clone (snapshot.go), pool.dataset.create and the recursive
+		// pool.dataset.delete (dataset.go). requestTimeout defaults to 60s while
+		// the provisioner allows 300s, so clamping would fail a 90s clone that
+		// today succeeds. The change was implemented, measured against the suite,
+		// and reverted: it broke TestConnection_ChannelDrain_Timeout and
+		// TestConnection_PendingMapCleanup, which only passed again once their
+		// budgets were raised — the tell that the behavior, not the test, was wrong.
+		// Do not re-apply without first making a slow single RPC a job method.
 		callCtx := ctx
 		cancel := func() {}
 		if c.config.Timeout > 0 {
