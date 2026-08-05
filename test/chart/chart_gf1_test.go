@@ -45,10 +45,13 @@ func renderChart(t *testing.T, dir string, extraArgs ...string) []byte {
 
 // TestChartGF1DefaultOffByteIdenticalToMain is the default-off guard. It builds
 // the pre-encryption chart from the main branch (`git archive main -- charts`)
-// into a temp dir, renders BOTH charts with default values, and asserts the two
-// renders are byte-identical (sha-compare). Adding any encryption key to the
-// default render — an unconditional configmap block, a secret ref on the bundled
-// class, a parameter the driver would then read — fails here.
+// into a temp dir, renders the driver ConfigMap from BOTH charts with default
+// values, and asserts those renders are byte-identical. Workload security and
+// probe hardening are intentionally allowed to change the other manifests;
+// this guard remains focused on the encryption configuration surface. Adding
+// any encryption key to the default ConfigMap — an unconditional configmap
+// block, a secret ref on the bundled class, or a parameter the driver would then
+// read — still fails here.
 func TestChartGF1DefaultOffByteIdenticalToMain(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm not on PATH; skipping chart template assertion")
@@ -76,8 +79,8 @@ func TestChartGF1DefaultOffByteIdenticalToMain(t *testing.T) {
 		t.Fatalf("extract main charts archive: %v\n%s", err, out)
 	}
 
-	mainRender := renderChart(t, filepath.Join(tmp, "charts", "scale-csi"))
-	newRender := renderChart(t, chartDir(t))
+	mainRender := renderChart(t, filepath.Join(tmp, "charts", "scale-csi"), "--show-only", "templates/configmap.yaml")
+	newRender := renderChart(t, chartDir(t), "--show-only", "templates/configmap.yaml")
 
 	if !bytes.Equal(mainRender, newRender) {
 		t.Errorf("default-off render is NOT byte-identical to the pre-encryption chart on main;\n"+

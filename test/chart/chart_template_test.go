@@ -789,8 +789,12 @@ func TestChartDurationValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			args := append(tc.extra, "--set", tc.setKey+"="+tc.bad)
 			out := helmTemplateExpectError(t, args...)
-			if !strings.Contains(out, tc.pointer) {
-				t.Errorf("expected a schema validation error at %q; got:\n%s", tc.pointer, out)
+			// Helm versions differ in whether schema failures print a JSON
+			// pointer or the dotted values path. Accept either spelling while
+			// still requiring the error to identify the exact field.
+			dottedPath := strings.TrimPrefix(strings.ReplaceAll(tc.pointer, "/", "."), ".")
+			if !strings.Contains(out, tc.pointer) && !strings.Contains(out, dottedPath) {
+				t.Errorf("expected a schema validation error at %q (or %q); got:\n%s", tc.pointer, dottedPath, out)
 			}
 		})
 	}

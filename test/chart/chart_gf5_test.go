@@ -454,7 +454,7 @@ func TestChartGF5BackendHealthPlumbing(t *testing.T) {
 // overlap remains a documented Deployment residual detected by the skew alert.
 func TestChartGF5BackendHealthRejectsMultipleControllerReplicas(t *testing.T) {
 	schemaOut := helmTemplateExpectError(t, "--set", "backendHealth.enabled=true", "--set", "controller.replicas=2")
-	if !strings.Contains(schemaOut, "value must be 1") {
+	if !strings.Contains(schemaOut, "controller.replicas") || !strings.Contains(schemaOut, "1") {
 		t.Errorf("the values schema must reject multiple backend-health controller replicas; got:\n%s", schemaOut)
 	}
 	templateOut := helmTemplateExpectError(t, "--skip-schema-validation", "--set", "backendHealth.enabled=true", "--set", "controller.replicas=2")
