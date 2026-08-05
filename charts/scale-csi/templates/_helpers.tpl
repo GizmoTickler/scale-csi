@@ -120,6 +120,19 @@ takes precedence over the release tag.
 {{- end }}
 
 {{/*
+Merge a sidecar-specific security context over the hardened common baseline.
+The explicit deep copy prevents mergeOverwrite from mutating .Values while the
+same baseline is rendered for the other containers.
+*/}}
+{{- define "scale-csi.sidecarSecurityContext" -}}
+{{- $context := deepCopy .common -}}
+{{- if .override -}}
+{{- $context = mergeOverwrite $context .override -}}
+{{- end -}}
+{{- toYaml $context -}}
+{{- end }}
+
+{{/*
 Get the CSI driver name
 */}}
 {{- define "scale-csi.driverName" -}}

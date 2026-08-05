@@ -121,6 +121,8 @@ spec:
         # Node Driver Registrar
         - name: csi-node-driver-registrar
           image: {{ .Values.sidecars.nodeDriverRegistrar.image }}
+          securityContext:
+            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.nodeDriverRegistrar.securityContext) | nindent 12 }}
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--kubelet-registration-path={{ include "scale-csi.kubeletDir" . }}/plugins/{{ .Values.csiDriverName }}/csi.sock"
@@ -136,6 +138,8 @@ spec:
         # Liveness Probe
         - name: liveness-probe
           image: {{ .Values.sidecars.livenessProbe.image }}
+          securityContext:
+            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.livenessProbe.securityContext) | nindent 12 }}
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--probe-timeout=3s"

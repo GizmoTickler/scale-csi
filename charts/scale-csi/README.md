@@ -510,6 +510,14 @@ The provisioner, attacher, resizer, and snapshotter each expose `timeout`,
 `sidecars.healthMonitor` sidecar is the exception — it does **not** expose those
 three keys (see the capacity/volume-health section above).
 
+Every sidecar receives the hardened `sidecars.securityContext` baseline:
+privilege escalation is disabled, the root filesystem is read-only, and all
+Linux capabilities are dropped. The controller sidecars and liveness probe also
+set `runAsUser: 65532`/`runAsNonRoot: true`; the node registrar stays root because
+it creates and removes its registration socket in the root-owned hostPath mounted
+at `/registration`. Set `sidecars.<name>.securityContext` to merge an explicit
+per-sidecar override when an operator's image or filesystem policy requires it.
+
 Leader-election flags render **unconditionally** on every capable controller
 sidecar (provisioner, attacher, resizer, snapshotter, and the optional health
 monitor), **including at a single replica** — so an `off`-mode RollingUpdate that

@@ -167,6 +167,8 @@ spec:
         # CSI Provisioner
         - name: csi-provisioner
           image: {{ .Values.sidecars.provisioner.image }}
+          securityContext:
+            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.provisioner.securityContext) | nindent 12 }}
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--v={{ .Values.logging.verbosity }}"
@@ -216,6 +218,8 @@ spec:
         # CSI Attacher
         - name: csi-attacher
           image: {{ .Values.sidecars.attacher.image }}
+          securityContext:
+            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.attacher.securityContext) | nindent 12 }}
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--v={{ .Values.logging.verbosity }}"
@@ -238,6 +242,8 @@ spec:
         # CSI Resizer
         - name: csi-resizer
           image: {{ .Values.sidecars.resizer.image }}
+          securityContext:
+            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.resizer.securityContext) | nindent 12 }}
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--v={{ .Values.logging.verbosity }}"
@@ -261,6 +267,8 @@ spec:
         # CSI Snapshotter
         - name: csi-snapshotter
           image: {{ .Values.sidecars.snapshotter.image }}
+          securityContext:
+            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.snapshotter.securityContext) | nindent 12 }}
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--v={{ .Values.logging.verbosity }}"
@@ -283,6 +291,8 @@ spec:
         # Liveness Probe
         - name: liveness-probe
           image: {{ .Values.sidecars.livenessProbe.image }}
+          securityContext:
+            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.livenessProbe.securityContext) | nindent 12 }}
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--probe-timeout=3s"
@@ -300,6 +310,8 @@ spec:
         # default off => no container => byte-identical render.
         - name: csi-external-health-monitor
           image: {{ .Values.sidecars.healthMonitor.image }}
+          securityContext:
+            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.healthMonitor.securityContext) | nindent 12 }}
           args:
             - "--csi-address={{ include "scale-csi.socketPath" . }}"
             - "--leader-election"

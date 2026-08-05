@@ -239,6 +239,9 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "securityContext": {
+          "$ref": "#/definitions/freeObject"
+        },
         "image": {
           "type": "string",
           "minLength": 1
@@ -1273,6 +1276,9 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "securityContext": {
+          "$ref": "#/definitions/freeObject"
+        },
         "leaderElection": {
           "type": "object",
           "additionalProperties": false,
@@ -1313,6 +1319,9 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "securityContext": {
+              "$ref": "#/definitions/freeObject"
+            },
             "enabled": {
               "type": "boolean"
             },

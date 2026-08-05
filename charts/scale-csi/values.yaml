@@ -846,6 +846,16 @@ snapshotClass:
 
 # Sidecar containers versions
 sidecars:
+  # Baseline for every sidecar container. Each sidecar below may override or
+  # extend this map; the main scale-csi container security contexts are kept
+  # separate because the node plugin intentionally needs privilege and SYS_ADMIN.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
   # Leader election configuration for sidecar containers
   # Increase these values if sidecars restart during API server instability
   # IMPORTANT: These values must satisfy: retryPeriod < renewDeadline < leaseDuration
@@ -862,6 +872,11 @@ sidecars:
     retryPeriod: 10s
 
   provisioner:
+    # The upstream image is a static Go binary and is compatible with the
+    # explicit non-root UID used here; it only needs the mounted CSI socket.
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
     image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
     timeout: 300s
     workerThreads: 10
@@ -874,6 +889,11 @@ sidecars:
         memory: 128Mi
 
   attacher:
+    # The upstream image is a static Go binary and is compatible with the
+    # explicit non-root UID used here; it only needs the mounted CSI socket.
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
     image: registry.k8s.io/sig-storage/csi-attacher:v4.12.0
     # Bounds the ControllerPublish/Unpublish (attach/detach) deadline. 120s keeps
     # a stuck TrueNAS publish from holding the external-attacher's --timeout for
@@ -889,6 +909,11 @@ sidecars:
         memory: 128Mi
 
   resizer:
+    # The upstream image is a static Go binary and is compatible with the
+    # explicit non-root UID used here; it only needs the mounted CSI socket.
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
     image: registry.k8s.io/sig-storage/csi-resizer:v2.2.1
     # Bounds the ControllerExpandVolume deadline (see attacher note).
     timeout: 120s
@@ -902,6 +927,11 @@ sidecars:
         memory: 128Mi
 
   snapshotter:
+    # The upstream image is a static Go binary and is compatible with the
+    # explicit non-root UID used here; it only needs the mounted CSI socket.
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
     image: registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0
     timeout: 300s
     workerThreads: 10
@@ -914,6 +944,12 @@ sidecars:
         memory: 128Mi
 
   nodeDriverRegistrar:
+    # The registrar creates and removes its registration socket below the
+    # mounted /registration hostPath. Keep the image root for that hostPath's
+    # standard root-owned permissions; the common baseline still removes all
+    # capabilities, forbids privilege escalation, and makes the root filesystem
+    # read-only because all writes land on mounted socket directories.
+    securityContext: {}
     image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
     resources:
       requests:
@@ -923,6 +959,11 @@ sidecars:
         memory: 128Mi
 
   livenessProbe:
+    # The upstream image is a static Go binary and is compatible with the
+    # explicit non-root UID used here; it only needs the mounted CSI socket.
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
     image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
     resources:
       requests:
@@ -949,6 +990,11 @@ sidecars:
   # published release) — do not float it.
   healthMonitor:
     enabled: false
+    # The upstream image is a static Go binary and is compatible with the
+    # explicit non-root UID used here; it only needs the mounted CSI socket.
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
     image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0
     interval: 60s
     resources:
