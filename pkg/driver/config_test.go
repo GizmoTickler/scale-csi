@@ -87,6 +87,38 @@ nvmeof:
 	assert.Contains(t, err.Error(), "no host could connect")
 }
 
+func TestLoadConfigDefaultsHealthCacheTTL(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.Equal(t, "5s", cfg.Health.CacheTTL)
+
+	cfg, err = loadTestConfig(t, requiredTestConfig+`
+health:
+  cacheTTL: 15s
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.NoError(t, err)
+	assert.Equal(t, "15s", cfg.Health.CacheTTL)
+}
+
+func TestLoadConfigRejectsNegativeHealthCacheTTL(t *testing.T) {
+	_, err := loadTestConfig(t, requiredTestConfig+`
+health:
+  cacheTTL: -1s
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "health.cacheTTL")
+}
+
 func TestLoadConfigDefaultsFencingAndOwnershipIdentity(t *testing.T) {
 	cfg, err := loadTestConfig(t, requiredTestConfig+`
 nfs:

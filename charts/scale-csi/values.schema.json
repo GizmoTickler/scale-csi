@@ -582,6 +582,17 @@
         }
       }
     },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cacheTTL": {
+          "description": "HTTP health-check cache TTL. Default 5s preserves historical behavior; both bundled Kubernetes probes run every 10s, so raising this toward or past that period trades freshness for reduced backend load. Set 0s to disable reuse.",
+          "type": "string",
+          "pattern": "^([0-9]+(ms|s|m|h))+$"
+        }
+      }
+    },
     "capacity": {
       "type": "object",
       "additionalProperties": false,

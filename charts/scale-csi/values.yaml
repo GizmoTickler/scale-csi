@@ -1041,6 +1041,15 @@ securityContext:
     add:
       - SYS_ADMIN
 
+# Driver HTTP health-check cache.
+# Both bundled Kubernetes probes run at periodSeconds: 10. The default 5s TTL has
+# ALWAYS expired before the next kubelet probe, so it never serves a hit on that
+# probe path today; it only shields callers polling the health handlers faster
+# than the TTL. Raising it toward or past the probe period trades freshness for
+# reduced TrueNAS/backend load. Set 0s to disable reuse entirely.
+health:
+  cacheTTL: 5s
+
 # Logging configuration
 logging:
   # Verbosity level (0-10, higher is more verbose)

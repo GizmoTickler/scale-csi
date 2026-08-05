@@ -399,6 +399,7 @@ Operator caveats:
 | `rbac.create` | Create ClusterRoles and bindings | `true` |
 | `podSecurityContext` | Pod-level security context for both workloads | `{runAsNonRoot: false, fsGroup: 0}` |
 | `securityContext` | Node driver container security context | privileged with `SYS_ADMIN` |
+| `health.cacheTTL` | HTTP health-check cache TTL; `0s` disables reuse. The bundled probes run every 10s, so larger values trade freshness for backend load | `5s` |
 | `metrics.enabled` | Create metrics Services | `true` |
 | `metrics.port` | Driver health/readiness and metrics port | `9809` |
 | `metrics.serviceMonitor.enabled` | Create controller and node ServiceMonitors | `false` |

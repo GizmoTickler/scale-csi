@@ -229,6 +229,15 @@ data:
       interval: {{ .Values.backendHealth.interval | default "60s" | quote }}
     {{- end }}
 
+    {{- if ne (default "5s" .Values.health.cacheTTL) "5s" }}
+    # HTTP health-check cache TTL. The default is implemented by the driver and
+    # omitted here so the default ConfigMap remains unchanged; increasing this
+    # toward or past the 10s Kubernetes probe period trades freshness for less
+    # backend load.
+    health:
+      cacheTTL: {{ .Values.health.cacheTTL | quote }}
+    {{- end }}
+
     {{- if .Values.encryption.enabled }}
     # ZFS-native encryption at rest (opt-in). The block renders ONLY when enabled
     # so the default ConfigMap carries no encryption: key and stays parseable by a

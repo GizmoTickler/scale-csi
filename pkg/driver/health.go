@@ -15,12 +15,14 @@ import (
 
 // HealthServer provides HTTP endpoints for health checks and metrics
 type HealthServer struct {
-	driver     *Driver
-	server     *http.Server
-	port       int
-	mu         sync.RWMutex
-	lastCheck  time.Time
-	lastStatus HealthStatus
+	driver             *Driver
+	server             *http.Server
+	port               int
+	mu                 sync.RWMutex
+	lastCheck          time.Time
+	lastStatus         HealthStatus
+	cacheTTL           time.Duration
+	cacheTTLConfigured bool
 }
 
 // HealthStatus represents the current health status of the driver
@@ -45,9 +47,21 @@ type CircuitBreakerHealth struct {
 
 // NewHealthServer creates a new health server
 func NewHealthServer(driver *Driver, port int) *HealthServer {
+	cacheTTL := defaultHealthCheckCacheTTL
+	if driver != nil && driver.config != nil {
+		if configured, err := driver.config.Health.CacheTTLDuration(); err == nil {
+			cacheTTL = configured
+		} else {
+			// LoadConfig validates this before construction. Keep direct test and
+			// embedders safe if they build a Driver with an invalid Config anyway.
+			klog.Warningf("invalid health.cacheTTL; using %s: %v", defaultHealthCheckCacheTTL, err)
+		}
+	}
 	return &HealthServer{
-		driver: driver,
-		port:   port,
+		driver:             driver,
+		port:               port,
+		cacheTTL:           cacheTTL,
+		cacheTTLConfigured: true,
 	}
 }
 
@@ -156,8 +170,20 @@ func (h *HealthServer) checkHealth() HealthStatus {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Cache health check results for 5 seconds to avoid hammering TrueNAS
-	if time.Since(h.lastCheck) < 5*time.Second {
+	cacheTTL := h.cacheTTL
+	if !h.cacheTTLConfigured {
+		// Tests and embedders that construct HealthServer directly retain the
+		// historical default; NewHealthServer marks an explicit zero TTL as a
+		// deliberate cache-disable setting.
+		cacheTTL = defaultHealthCheckCacheTTL
+	}
+	// Both bundled Kubernetes probes run at periodSeconds: 10. With the
+	// historical five-second TTL, the cache has ALWAYS expired before the next
+	// kubelet probe, so it never serves a hit on that probe path today. It only
+	// shields callers polling the health handlers faster than the TTL. Raising
+	// the TTL toward or past the probe period trades freshness for less backend
+	// load.
+	if cacheTTL > 0 && time.Since(h.lastCheck) < cacheTTL {
 		return h.lastStatus
 	}
 

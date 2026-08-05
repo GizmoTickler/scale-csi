@@ -65,6 +65,10 @@ type Config struct {
 	// per-PVC VolumeCondition and the scale_csi_pool_* health gauges.
 	BackendHealth BackendHealthConfig `yaml:"backendHealth"`
 
+	// Health configures the driver's HTTP health-check cache. The cache is
+	// deliberately independent from backend-health polling.
+	Health HealthConfig `yaml:"health"`
+
 	// Encryption configures ZFS-native encryption at rest (GF-Sprint 1). It is
 	// strictly opt-in: the zero value (Enabled=false) leaves every volume
 	// plaintext and a deployment that never touches encryption behaves exactly as
@@ -619,6 +623,31 @@ type BackendHealthConfig struct {
 	Interval string `yaml:"interval"`
 }
 
+const defaultHealthCheckCacheTTL = 5 * time.Second
+
+// HealthConfig configures the driver's HTTP health-check cache.
+type HealthConfig struct {
+	// CacheTTL is how long /readyz and /health may reuse a backend health result.
+	// Empty resolves to the historical five-second default.
+	CacheTTL string `yaml:"cacheTTL"`
+}
+
+// CacheTTLDuration parses the health-check cache TTL. Zero disables reuse;
+// negative values are rejected because they make cache behavior ambiguous.
+func (c HealthConfig) CacheTTLDuration() (time.Duration, error) {
+	if strings.TrimSpace(c.CacheTTL) == "" {
+		return defaultHealthCheckCacheTTL, nil
+	}
+	ttl, err := time.ParseDuration(c.CacheTTL)
+	if err != nil {
+		return 0, err
+	}
+	if ttl < 0 {
+		return 0, fmt.Errorf("health.cacheTTL must not be negative")
+	}
+	return ttl, nil
+}
+
 // NVMeoFConfig holds NVMe-oF configuration.
 type NVMeoFConfig struct {
 	// Enabled enables NVMe-oF provisioning for StorageClasses that select NVMe-oF.
@@ -1095,6 +1124,9 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.Reconcile.Delete.Schedule == "" {
 		cfg.Reconcile.Delete.Schedule = "0 4 * * *"
 	}
+	if cfg.Health.CacheTTL == "" {
+		cfg.Health.CacheTTL = "5s"
+	}
 	// Spent-restore classification defaults to enabled (preserves the historical
 	// always-on behavior); an explicit enabled=false remains authoritative.
 	if cfg.Reconcile.SpentRestore.Enabled == nil {
@@ -1188,6 +1220,12 @@ func applyConfigDefaults(cfg *Config) {
 // applied: the reconcile delete cap and durations, and the required-field/enabled-
 // protocol constraints. Extracted from LoadConfig (Batch 18 R7).
 func validateConfig(cfg *Config) error {
+	if ttl, parseErr := cfg.Health.CacheTTLDuration(); parseErr != nil || ttl < 0 {
+		if parseErr != nil {
+			return fmt.Errorf("health.cacheTTL must be a non-negative duration: %w", parseErr)
+		}
+		return fmt.Errorf("health.cacheTTL must be a non-negative duration")
+	}
 	if cfg.Reconcile.Delete.MaxPerRun <= 0 {
 		return fmt.Errorf("reconcile.delete.maxPerRun must be positive")
 	}

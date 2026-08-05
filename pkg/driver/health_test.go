@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,56 @@ import (
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
+
+type countingHealthClient struct {
+	*truenas.MockClient
+	connectedCalls atomic.Int32
+}
+
+func (c *countingHealthClient) IsConnected() bool {
+	c.connectedCalls.Add(1)
+	return true
+}
+
+func TestHealthServerCacheTTLDefaultsToFiveSeconds(t *testing.T) {
+	health := NewHealthServer(&Driver{}, 0)
+	assert.Equal(t, 5*time.Second, health.cacheTTL)
+	assert.True(t, health.cacheTTLConfigured)
+}
+
+func TestHealthServerCacheTTLIsConfigurableWithoutChangingProbeFreshnessContract(t *testing.T) {
+	client := &countingHealthClient{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		runController: true,
+		truenasClient: client,
+		config:        &Config{Health: HealthConfig{CacheTTL: "20ms"}},
+	}
+	d.ready.Store(true)
+	health := NewHealthServer(d, 0)
+
+	health.checkHealth()
+	health.checkHealth()
+	assert.Equal(t, int32(1), client.connectedCalls.Load(), "a second caller inside the TTL should use the cached result")
+
+	time.Sleep(30 * time.Millisecond)
+	health.checkHealth()
+	assert.Equal(t, int32(2), client.connectedCalls.Load(), "a caller after the configured TTL must refresh the backend result")
+}
+
+func TestHealthServerCacheTTLZeroDisablesReuse(t *testing.T) {
+	client := &countingHealthClient{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		runController: true,
+		truenasClient: client,
+		config:        &Config{Health: HealthConfig{CacheTTL: "0s"}},
+	}
+	d.ready.Store(true)
+	health := NewHealthServer(d, 0)
+
+	health.checkHealth()
+	health.checkHealth()
+	assert.Equal(t, int32(2), client.connectedCalls.Load(), "zero TTL must perform a fresh backend check for each caller")
+}
 
 func TestHealthServerStartReturnsBindFailureSynchronously(t *testing.T) {
 	occupied, err := net.Listen("tcp", ":0")

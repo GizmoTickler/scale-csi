@@ -290,6 +290,16 @@ cut short at `requestTimeout`. In the worst case all `maxConcurrentRequests` slo
 be held by deadline-bearing calls for the length of their sidecar timeout; size the
 semaphore and sidecar timeouts accordingly.
 
+### HTTP health-check cache
+
+`health.cacheTTL` controls how long `/readyz` and `/health` reuse the last
+backend-connectivity result. It defaults to `5s`, preserving the historical
+behavior. Both bundled Kubernetes probes run at `periodSeconds: 10`, so that
+TTL has always expired before the next kubelet probe and never serves a cache hit
+on the probe path today; it only shields callers polling the health handlers
+faster than the TTL. Raising it toward or past `10s` trades freshness for lower
+TrueNAS/backend load. Set `0s` to disable reuse entirely.
+
 ## Resource sizing
 
 Steady-state measurements are approximately 15Mi memory and 1m CPU per driver
