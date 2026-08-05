@@ -28,6 +28,36 @@ func repoRoot(t *testing.T) string {
 	return filepath.Join(chartDir(t), "..", "..")
 }
 
+// gf1ExemptManifests are the only manifests the default-off byte-identity guard
+// is allowed to skip: the two workloads GF2 hardened. Encryption configuration
+// never renders into either, so exempting them costs the guard nothing, while
+// exempting anything else would.
+var gf1ExemptManifests = []string{
+	"templates/controller-deployment.yaml",
+	"templates/node-daemonset.yaml",
+}
+
+// dropExemptManifests splits a multi-document helm render on its `# Source:`
+// markers and removes the exempt manifests, leaving every other document — and
+// their ordering — byte-comparable.
+func dropExemptManifests(render []byte) []byte {
+	docs := strings.Split(string(render), "---\n")
+	kept := make([]string, 0, len(docs))
+	for _, doc := range docs {
+		exempt := false
+		for _, name := range gf1ExemptManifests {
+			if strings.Contains(doc, "# Source: scale-csi/"+name) {
+				exempt = true
+				break
+			}
+		}
+		if !exempt {
+			kept = append(kept, doc)
+		}
+	}
+	return []byte(strings.Join(kept, "---\n"))
+}
+
 // renderChart runs `helm template scale-csi <dir>` with optional extra args and
 // returns the full multi-document render. It skips the test when helm is absent.
 func renderChart(t *testing.T, dir string, extraArgs ...string) []byte {
@@ -45,13 +75,18 @@ func renderChart(t *testing.T, dir string, extraArgs ...string) []byte {
 
 // TestChartGF1DefaultOffByteIdenticalToMain is the default-off guard. It builds
 // the pre-encryption chart from the main branch (`git archive main -- charts`)
-// into a temp dir, renders the driver ConfigMap from BOTH charts with default
-// values, and asserts those renders are byte-identical. Workload security and
-// probe hardening are intentionally allowed to change the other manifests;
-// this guard remains focused on the encryption configuration surface. Adding
-// any encryption key to the default ConfigMap — an unconditional configmap
-// block, a secret ref on the bundled class, or a parameter the driver would then
-// read — still fails here.
+// into a temp dir, renders BOTH charts with default values, and asserts the
+// renders are byte-identical.
+//
+// GF2 exempted exactly two manifests: controller-deployment.yaml and
+// node-daemonset.yaml, whose sidecar securityContext and registrar probe are
+// deliberate workload changes. Everything else — configmap.yaml, the bundled
+// storageclass.yaml, volumesnapshotclass.yaml, secret.yaml, RBAC — is still
+// compared in full, because those are where a stray encryption key would land.
+// An earlier revision of this guard narrowed the comparison to configmap.yaml
+// alone, which silently dropped the bundled StorageClass from coverage while the
+// comment still claimed a secret ref on that class would be caught. Exempt by
+// NAME, never by narrowing to a single file.
 func TestChartGF1DefaultOffByteIdenticalToMain(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm not on PATH; skipping chart template assertion")
@@ -79,8 +114,8 @@ func TestChartGF1DefaultOffByteIdenticalToMain(t *testing.T) {
 		t.Fatalf("extract main charts archive: %v\n%s", err, out)
 	}
 
-	mainRender := renderChart(t, filepath.Join(tmp, "charts", "scale-csi"), "--show-only", "templates/configmap.yaml")
-	newRender := renderChart(t, chartDir(t), "--show-only", "templates/configmap.yaml")
+	mainRender := dropExemptManifests(renderChart(t, filepath.Join(tmp, "charts", "scale-csi")))
+	newRender := dropExemptManifests(renderChart(t, chartDir(t)))
 
 	if !bytes.Equal(mainRender, newRender) {
 		t.Errorf("default-off render is NOT byte-identical to the pre-encryption chart on main;\n"+

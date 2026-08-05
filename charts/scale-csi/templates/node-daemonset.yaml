@@ -130,6 +130,15 @@ spec:
             - "--http-endpoint=:{{ .Values.sidecars.nodeDriverRegistrar.healthProbe.port }}"
             {{- end }}
             - "--v={{ .Values.logging.verbosity }}"
+          {{- if .Values.sidecars.nodeDriverRegistrar.healthProbe.enabled }}
+          # Declared so the probe target is a named, discoverable port rather than
+          # a bare number the manifest never advertises. On hostNetwork this binds
+          # the port on the node — see the healthProbe notes in values.yaml.
+          ports:
+            - name: registrar
+              containerPort: {{ .Values.sidecars.nodeDriverRegistrar.healthProbe.port }}
+              protocol: TCP
+          {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: {{ include "scale-csi.socketDir" . }}
