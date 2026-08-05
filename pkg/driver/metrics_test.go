@@ -348,8 +348,14 @@ func TestRecordTombstoneReaped(t *testing.T) {
 	assert.Equal(t, scanFallbackBefore+2, testutil.ToFloat64(scanFallback))
 }
 
-// TestSetJobDispatcherSubscribed guards the O7 health gauge: it tracks the
-// core.get_jobs subscription bit exactly (1 = subscribed, 0 = pure-poll).
+func TestSetTrueNASPendingCalls(t *testing.T) {
+	SetTrueNASPendingCalls(7)
+	assert.Equal(t, float64(7), testutil.ToFloat64(truenasPendingCalls))
+
+	SetTrueNASPendingCalls(0)
+	assert.Equal(t, float64(0), testutil.ToFloat64(truenasPendingCalls))
+}
+
 func TestSetJobDispatcherSubscribed(t *testing.T) {
 	SetJobDispatcherSubscribed(true)
 	assert.Equal(t, float64(1), testutil.ToFloat64(jobDispatcherSubscribed.WithLabelValues()))

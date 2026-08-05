@@ -426,6 +426,8 @@ Watch these series:
   outage protection;
 - `scale_csi_truenas_connections_active` for authenticated WebSocket pool
   connections;
+- `scale_csi_truenas_pending_calls` for current in-flight JSON-RPC depth across
+  the pool; a sustained rise indicates backend latency or stalled callers;
 - `scale_csi_iscsi_sessions_total` and `scale_csi_nvme_sessions_total` for the
   sessions observed by node session garbage collection;
 - `scale_csi_node_connect_total` and

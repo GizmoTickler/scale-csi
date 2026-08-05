@@ -304,6 +304,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 			MaxConnections:              cfg.Config.TrueNAS.MaxConnections,
 			MaxConcurrentReqs:           cfg.Config.TrueNAS.MaxConcurrentRequests,
 			MetricsRecorder:             RecordTrueNASRequest,
+			PendingDepthRecorder:        SetTrueNASPendingCalls,
 			ReplicationJobAbortRecorder: RecordReplicationJobAborted,
 			CircuitBreaker:              cbConfig,
 			APIRetryMaxAttempts:         cfg.Config.Resilience.Retry.MaxAttempts,

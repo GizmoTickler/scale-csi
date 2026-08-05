@@ -130,6 +130,58 @@ func TestRawResultToInterfacePreservesPublicJSONTypes(t *testing.T) {
 	assert.IsType(t, float64(0), number)
 }
 
+func TestPendingDepthRecorderTracksCallLifecycle(t *testing.T) {
+	cfg := &ClientConfig{
+		Timeout:               time.Second,
+		APIRetryMaxAttempts:   1,
+		APIRetryInitialDelay:  time.Millisecond,
+		APIRetryMaxDelay:      time.Millisecond,
+		APIRetryBackoffFactor: 1,
+	}
+	connection := NewConnection(0, cfg)
+	connection.mu.Lock()
+	connection.generation = 1
+	connection.stopped = false
+	connection.authenticated = true
+	connection.writeCh = make(chan writeRequest)
+	connection.conn.Store(&websocket.Conn{})
+	connection.mu.Unlock()
+	atomic.StoreInt32(&connection.connState, int32(stateConnected))
+
+	var callbackCount atomic.Int32
+	var lastDepth atomic.Int32
+	client := &Client{
+		config:    cfg,
+		pool:      []*Connection{connection},
+		semaphore: make(chan struct{}, 1),
+		pendingDepthRecorder: func(depth int) {
+			callbackCount.Add(1)
+			lastDepth.Store(int32(depth))
+		},
+	}
+	connection.client = client
+
+	go func() {
+		request := <-connection.writeCh
+		request.resultCh <- nil
+		connection.pendingMu.RLock()
+		pending := connection.pending[request.id]
+		connection.pendingMu.RUnlock()
+		pending.responseCh <- &rpcResponse{ID: request.id, Result: json.RawMessage(`true`)}
+		connection.pendingMu.Lock()
+		delete(connection.pending, request.id)
+		connection.pendingMu.Unlock()
+		connection.pendingDepthChanged()
+	}()
+
+	result, err := client.CallWithContext(context.Background(), "test.pending")
+	require.NoError(t, err)
+	assert.Equal(t, true, result)
+	assert.GreaterOrEqual(t, callbackCount.Load(), int32(2), "depth recorder must observe admission and cleanup")
+	assert.Equal(t, int32(0), lastDepth.Load())
+	assert.Equal(t, 0, client.PendingDepth())
+}
+
 func TestCallRawIsSharedByTypedAndGenericDecoders(t *testing.T) {
 	cfg := &ClientConfig{
 		Timeout:               time.Second,

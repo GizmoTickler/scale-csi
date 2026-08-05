@@ -149,6 +149,14 @@ var (
 		},
 	)
 
+	truenasPendingCalls = regGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "truenas_pending_calls",
+			Help:      "Number of in-flight TrueNAS JSON-RPC calls across the connection pool",
+		},
+	)
+
 	// jobDispatcherSubscribed is 1 when at least one pooled connection holds a
 	// live core.get_jobs subscription and 0 when the driver has degraded to the
 	// pure-poll fallback (higher API load + latency). Published from the health
@@ -715,6 +723,13 @@ func SetTrueNASConnectionStatus(connected bool) {
 // SetTrueNASActiveConnections sets the number of active connections
 func SetTrueNASActiveConnections(count int) {
 	truenasConnectionsActive.Set(float64(count))
+}
+
+// SetTrueNASPendingCalls publishes the current in-flight TrueNAS request depth.
+// The client invokes this through ClientConfig.PendingDepthRecorder, keeping the
+// package dependency direction one-way (truenas -> callback -> driver metric).
+func SetTrueNASPendingCalls(count int) {
+	truenasPendingCalls.Set(float64(count))
 }
 
 // SetJobDispatcherSubscribed publishes whether any pooled connection holds a

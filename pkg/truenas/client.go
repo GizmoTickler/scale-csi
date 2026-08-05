@@ -293,6 +293,12 @@ const defaultWriteTimeout = 30 * time.Second
 // method is the API method name, duration is in seconds, err is nil on success.
 type MetricsRecorder func(method string, duration float64, err error)
 
+// PendingDepthRecorder observes the total number of in-flight JSON-RPC calls
+// across the client's connection pool. It is a callback so truenas stays below
+// the driver package in the dependency graph while the driver owns Prometheus
+// registration.
+type PendingDepthRecorder func(depth int)
+
 // SystemInfo represents TrueNAS system information including version.
 type SystemInfo struct {
 	Version       string `json:"version"` // Full version string (e.g., "TrueNAS-SCALE-25.10.0")
@@ -307,23 +313,24 @@ type SystemInfo struct {
 
 // ClientConfig holds the configuration for the TrueNAS client.
 type ClientConfig struct {
-	Host              string
-	Port              int
-	Protocol          string
-	APIKey            string
-	AllowInsecure     bool
-	CACert            string
-	CACertFile        string
-	Timeout           time.Duration
-	ConnectTimeout    time.Duration
-	WriteTimeout      time.Duration   // Timeout for each WebSocket write (default: 30s)
-	MaxRetries        int             // Maximum number of connection retries (default: 3)
-	RetryInterval     time.Duration   // Initial retry interval (default: 1s, exponential backoff applied)
-	HeartbeatInterval time.Duration   // Interval for WebSocket heartbeat (default: 30s)
-	MaxConnections    int             // Maximum number of concurrent connections (default: 5)
-	MaxConcurrentReqs int             // Maximum number of concurrent API requests (default: 10)
-	LazyConnect       bool            // Skip eager connection; connect on first API use (node-only mode)
-	MetricsRecorder   MetricsRecorder // Optional callback for recording request metrics
+	Host                 string
+	Port                 int
+	Protocol             string
+	APIKey               string
+	AllowInsecure        bool
+	CACert               string
+	CACertFile           string
+	Timeout              time.Duration
+	ConnectTimeout       time.Duration
+	WriteTimeout         time.Duration        // Timeout for each WebSocket write (default: 30s)
+	MaxRetries           int                  // Maximum number of connection retries (default: 3)
+	RetryInterval        time.Duration        // Initial retry interval (default: 1s, exponential backoff applied)
+	HeartbeatInterval    time.Duration        // Interval for WebSocket heartbeat (default: 30s)
+	MaxConnections       int                  // Maximum number of concurrent connections (default: 5)
+	MaxConcurrentReqs    int                  // Maximum number of concurrent API requests (default: 10)
+	LazyConnect          bool                 // Skip eager connection; connect on first API use (node-only mode)
+	MetricsRecorder      MetricsRecorder      // Optional callback for recording request metrics
+	PendingDepthRecorder PendingDepthRecorder // Optional callback for in-flight request depth
 	// ReplicationJobAbortRecorder is called after core.job_abort succeeds.
 	ReplicationJobAbortRecorder ReplicationJobAbortRecorder
 
@@ -422,6 +429,7 @@ type Client struct {
 	next                        uint64                      // For round-robin selection
 	semaphore                   chan struct{}               // Limits concurrent requests to prevent TrueNAS overload
 	metricsRecorder             MetricsRecorder             // Optional callback for recording request metrics
+	pendingDepthRecorder        PendingDepthRecorder        // Optional callback for in-flight request depth
 	replicationJobAbortRecorder ReplicationJobAbortRecorder // Optional callback for successful job aborts
 	circuitBreaker              *CircuitBreaker             // Optional circuit breaker for API calls
 
@@ -593,6 +601,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		pool:                        make([]*Connection, cfg.MaxConnections),
 		semaphore:                   make(chan struct{}, cfg.MaxConcurrentReqs),
 		metricsRecorder:             cfg.MetricsRecorder,
+		pendingDepthRecorder:        cfg.PendingDepthRecorder,
 		replicationJobAbortRecorder: cfg.ReplicationJobAbortRecorder,
 		circuitBreaker:              cb,
 		nvmeResolvedPort:            make(map[string]*NVMeoFPort),
@@ -1080,11 +1089,16 @@ func (c *Connection) readMessages(generation uint64, conn *websocket.Conn, gener
 		}
 
 		c.pendingMu.Lock()
+		removed := false
 		if pending, ok := c.pending[resp.ID]; ok && pending.generation == generation {
 			pending.responseCh <- &resp
 			delete(c.pending, resp.ID)
+			removed = true
 		}
 		c.pendingMu.Unlock()
+		if removed {
+			c.pendingDepthChanged()
+		}
 	}
 }
 
@@ -1110,7 +1124,7 @@ func (c *Connection) failPending(generation uint64, cause error) {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	c.pendingMu.Lock()
-	defer c.pendingMu.Unlock()
+	removed := false
 	for id, pending := range c.pending {
 		if pending.generation != generation {
 			continue
@@ -1124,6 +1138,11 @@ func (c *Connection) failPending(generation uint64, cause error) {
 		default:
 		}
 		delete(c.pending, id)
+		removed = true
+	}
+	c.pendingMu.Unlock()
+	if removed {
+		c.pendingDepthChanged()
 	}
 }
 
@@ -1167,6 +1186,7 @@ func (c *Connection) callWithGeneration(ctx context.Context, generation uint64, 
 	}
 	c.pendingMu.Unlock()
 	c.mu.Unlock()
+	c.pendingDepthChanged()
 
 	writeReq := writeRequest{
 		id: id,
@@ -1221,6 +1241,7 @@ func (c *Connection) failedWriteResult(id int64, method string, responseCh <-cha
 	case resp := <-responseCh:
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
+		c.pendingDepthChanged()
 		return responseResult(resp)
 	default:
 	}
@@ -1228,6 +1249,7 @@ func (c *Connection) failedWriteResult(id int64, method string, responseCh <-cha
 	sent := ok && pending.sent
 	delete(c.pending, id)
 	c.pendingMu.Unlock()
+	c.pendingDepthChanged()
 	return nil, requestTransportError(method, sent, cause)
 }
 
@@ -1237,6 +1259,7 @@ func (c *Connection) canceledCallResult(id int64, method string, responseCh <-ch
 	case resp := <-responseCh:
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
+		c.pendingDepthChanged()
 		return responseResult(resp)
 	default:
 	}
@@ -1244,6 +1267,7 @@ func (c *Connection) canceledCallResult(id int64, method string, responseCh <-ch
 	sent := ok && pending.sent
 	delete(c.pending, id)
 	c.pendingMu.Unlock()
+	c.pendingDepthChanged()
 
 	if sent {
 		return nil, fmt.Errorf("%w: %s was sent before the caller context ended: %w", ErrAmbiguousResult, method, ctxErr)
@@ -1584,6 +1608,38 @@ func (c *Client) ActiveConnectionCount() int {
 		}
 	}
 	return connected
+}
+
+// PendingDepth returns the total number of in-flight JSON-RPC calls across the
+// connection pool. It is intentionally an accessor rather than a hard cap:
+// slow middleware should remain observable and retryable instead of becoming a
+// new class of arbitrary client-side rejections.
+func (c *Client) PendingDepth() int {
+	if c == nil {
+		return 0
+	}
+	depth := 0
+	for _, conn := range c.pool {
+		if conn == nil {
+			continue
+		}
+		conn.pendingMu.RLock()
+		depth += len(conn.pending)
+		conn.pendingMu.RUnlock()
+	}
+	return depth
+}
+
+func (c *Client) recordPendingDepth() {
+	if c != nil && c.pendingDepthRecorder != nil {
+		c.pendingDepthRecorder(c.PendingDepth())
+	}
+}
+
+func (c *Connection) pendingDepthChanged() {
+	if c != nil && c.client != nil {
+		c.client.recordPendingDepth()
+	}
 }
 
 // ServiceReload reloads a TrueNAS service configuration.
