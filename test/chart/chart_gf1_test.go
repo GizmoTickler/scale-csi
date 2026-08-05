@@ -2,15 +2,20 @@ package chart
 
 // GF-Sprint 1 (encryption at rest) chart assertions. Encryption ships
 // default-off and opt-in per StorageClass, so the load-bearing invariant is that
-// a deployment which never touches encryption renders BYTE-IDENTICALLY to the
-// pre-encryption chart: any stray encryption key in the default render would
-// change the manifest and crash-loop a rolled-back binary whose Config has no
-// encryption field. The byte-identity test below asserts against the actual main
-// render (built with `git archive main -- charts`), not a frozen copy, so it
-// tracks whatever the pre-encryption chart renders.
+// a deployment which never touches encryption emits NO encryption surface at
+// all: any stray encryption key in the default render would crash-loop a
+// rolled-back binary whose Config has no encryption field.
+//
+// This was originally expressed as a byte-identity comparison against
+// `git archive main -- charts`. That formulation decayed the moment GF1 merged:
+// once the encryption work was on main, the guard compared the chart to itself
+// and passed vacuously, and it had been doing so since v1.6.0. Pinning it to a
+// fixed pre-encryption ref was no better — by v1.6.1 every manifest differed for
+// unrelated reasons, so the exempt list would have had to swallow the whole
+// chart. The invariant is now asserted directly against the render, which cannot
+// decay with branch state, plus a second check proving the token list is live.
 
 import (
-	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,40 +27,20 @@ import (
 	"github.com/GizmoTickler/scale-csi/pkg/driver"
 )
 
-// repoRoot resolves the repository root (two levels above test/chart).
-func repoRoot(t *testing.T) string {
-	t.Helper()
-	return filepath.Join(chartDir(t), "..", "..")
-}
-
-// gf1ExemptManifests are the only manifests the default-off byte-identity guard
-// is allowed to skip: the two workloads GF2 hardened. Encryption configuration
-// never renders into either, so exempting them costs the guard nothing, while
-// exempting anything else would.
-var gf1ExemptManifests = []string{
-	"templates/controller-deployment.yaml",
-	"templates/node-daemonset.yaml",
-}
-
-// dropExemptManifests splits a multi-document helm render on its `# Source:`
-// markers and removes the exempt manifests, leaving every other document — and
-// their ordering — byte-comparable.
-func dropExemptManifests(render []byte) []byte {
-	docs := strings.Split(string(render), "---\n")
-	kept := make([]string, 0, len(docs))
-	for _, doc := range docs {
-		exempt := false
-		for _, name := range gf1ExemptManifests {
-			if strings.Contains(doc, "# Source: scale-csi/"+name) {
-				exempt = true
-				break
-			}
-		}
-		if !exempt {
-			kept = append(kept, doc)
-		}
-	}
-	return []byte(strings.Join(kept, "---\n"))
+// gf1EncryptionSurface is every token the chart emits when encryption is turned
+// on, across ALL manifests. The default render must contain none of them.
+//
+// The csi.storage.k8s.io secret refs are NOT encryption-exclusive — iSCSI CHAP
+// emits the same keys — so their absence is only meaningful against DEFAULT
+// values, which is exactly the render this guard checks.
+var gf1EncryptionSurface = []string{
+	"encryption:",
+	"csi.storage.k8s.io/provisioner-secret-name",
+	"csi.storage.k8s.io/provisioner-secret-namespace",
+	"csi.storage.k8s.io/controller-publish-secret-name",
+	"csi.storage.k8s.io/controller-publish-secret-namespace",
+	"csi.storage.k8s.io/node-stage-secret-name",
+	"csi.storage.k8s.io/node-stage-secret-namespace",
 }
 
 // renderChart runs `helm template scale-csi <dir>` with optional extra args and
@@ -73,55 +58,45 @@ func renderChart(t *testing.T, dir string, extraArgs ...string) []byte {
 	return out
 }
 
-// TestChartGF1DefaultOffByteIdenticalToMain is the default-off guard. It builds
-// the pre-encryption chart from the main branch (`git archive main -- charts`)
-// into a temp dir, renders BOTH charts with default values, and asserts the
-// renders are byte-identical.
-//
-// GF2 exempted exactly two manifests: controller-deployment.yaml and
-// node-daemonset.yaml, whose sidecar securityContext and registrar probe are
-// deliberate workload changes. Everything else — configmap.yaml, the bundled
-// storageclass.yaml, volumesnapshotclass.yaml, secret.yaml, RBAC — is still
-// compared in full, because those are where a stray encryption key would land.
-// An earlier revision of this guard narrowed the comparison to configmap.yaml
-// alone, which silently dropped the bundled StorageClass from coverage while the
-// comment still claimed a secret ref on that class would be caught. Exempt by
-// NAME, never by narrowing to a single file.
-func TestChartGF1DefaultOffByteIdenticalToMain(t *testing.T) {
-	if _, err := exec.LookPath("helm"); err != nil {
-		t.Skip("helm not on PATH; skipping chart template assertion")
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not on PATH; skipping main-render byte-identity assertion")
-	}
+// TestChartGF1DefaultOffCarriesNoEncryptionSurface is the default-off guard. It
+// renders the WHOLE chart with default values and asserts no encryption token
+// appears in any manifest — the breadth the old byte comparison provided, since
+// a stray key could land in the bundled StorageClass, RBAC, or Secret just as
+// easily as in the ConfigMap. The sibling tests below cover the ConfigMap and
+// StorageClass enabled-paths in detail; this one covers everything at once.
+func TestChartGF1DefaultOffCarriesNoEncryptionSurface(t *testing.T) {
+	t.Run("default render emits no encryption surface in any manifest", func(t *testing.T) {
+		out := string(renderChart(t, chartDir(t)))
+		for _, token := range gf1EncryptionSurface {
+			if strings.Contains(out, token) {
+				t.Errorf("default render must not emit %q anywhere; a rolled-back binary "+
+					"whose Config has no encryption field would crash-loop on it", token)
+			}
+		}
+	})
 
-	root := repoRoot(t)
-	// Confirm the main branch exists before shelling out, so a checkout without
-	// it skips rather than fails opaquely.
-	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "main").CombinedOutput(); err != nil {
-		t.Skipf("main branch not resolvable; skipping byte-identity assertion: %v\n%s", err, out)
-	}
-
-	tmp := t.TempDir()
-	archive, err := exec.Command("git", "-C", root, "archive", "main", "--", "charts").Output()
-	if err != nil {
-		t.Fatalf("git archive main -- charts failed: %v", err)
-	}
-	tarCmd := exec.Command("tar", "-x")
-	tarCmd.Dir = tmp
-	tarCmd.Stdin = bytes.NewReader(archive)
-	if out, err := tarCmd.CombinedOutput(); err != nil {
-		t.Fatalf("extract main charts archive: %v\n%s", err, out)
-	}
-
-	mainRender := dropExemptManifests(renderChart(t, filepath.Join(tmp, "charts", "scale-csi")))
-	newRender := dropExemptManifests(renderChart(t, chartDir(t)))
-
-	if !bytes.Equal(mainRender, newRender) {
-		t.Errorf("default-off render is NOT byte-identical to the pre-encryption chart on main;\n"+
-			"a stray encryption key renders by default. main=%d bytes, new=%d bytes",
-			len(mainRender), len(newRender))
-	}
+	// Teeth. Without this, gf1EncryptionSurface could silently go stale — a key
+	// renamed in the templates would leave the absence check above passing
+	// against tokens the chart no longer emits, i.e. guarding nothing. Every
+	// token must be reachable by turning encryption on.
+	t.Run("every listed token actually renders when encryption is enabled", func(t *testing.T) {
+		valuesPath := writeValues(t, "gf1-enc-surface.yaml", `encryption:
+  enabled: true
+storageClasses:
+  - name: scale-nfs-encrypted
+    enabled: true
+    protocol: nfs
+    encryptionSecretName: scale-nfs-encrypted
+    encryptionSecretNamespace: ""
+`)
+		out := string(renderChart(t, chartDir(t), "-f", valuesPath))
+		for _, token := range gf1EncryptionSurface {
+			if !strings.Contains(out, token) {
+				t.Errorf("gf1EncryptionSurface lists %q but the enabled render never emits it; "+
+					"the token is stale and the default-off check above is guarding nothing", token)
+			}
+		}
+	})
 }
 
 // TestChartGF1EncryptionConfigPlumbing guards the controller-wide gate render

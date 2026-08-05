@@ -1253,7 +1253,21 @@ func (c *Connection) failedWriteResult(id int64, method string, responseCh <-cha
 	return nil, requestTransportError(method, sent, cause)
 }
 
+// canceledCallResult classifies a call whose caller context ended. It takes
+// sendMu for the same reason failPending does: writeLoop holds sendMu across
+// [WriteJSON -> pending.sent = true], so reading pending.sent under pendingMu
+// alone can observe false for a request whose bytes are already on the wire.
+// That misreports a DELIVERED non-idempotent mutation as never-sent, and the
+// caller is then free to retry it — a duplicate pool.dataset.create is exactly
+// the outcome ErrAmbiguousResult exists to prevent.
+//
+// The cost is that cancellation now waits out an in-flight write (bounded by
+// WriteTimeout). That is the same trade failPending already makes, and it buys
+// the one guarantee that matters here: `sent` is final before it is read.
+// Lock order is sendMu -> pendingMu everywhere (writeLoop, failPending, here).
 func (c *Connection) canceledCallResult(id int64, method string, responseCh <-chan *rpcResponse, ctxErr error) (json.RawMessage, error) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	c.pendingMu.Lock()
 	select {
 	case resp := <-responseCh:

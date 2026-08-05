@@ -1092,6 +1092,59 @@ func TestClient_AmbiguousMutationWinsOverCanceledContext(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&mutationCount), "ambiguous mutation must not be retried")
 }
 
+// TestClient_CanceledCallWaitsForInFlightWriteClassification pins the lock
+// discipline behind the ambiguous/never-sent split, deterministically.
+//
+// The end-to-end test above cannot prove this: it closes mutationReceived when
+// the SERVER reads the request, but writeLoop marks pending.sent only after
+// WriteJSON returns, so the cancel can land in between and the test flakes.
+// Here the write is modeled directly — sendMu held across [write -> mark sent]
+// — so a classifier that reads pending.sent without taking sendMu observes
+// false every run and reports a delivered mutation as never-sent.
+func TestClient_CanceledCallWaitsForInFlightWriteClassification(t *testing.T) {
+	const id = int64(7)
+	conn := &Connection{pending: map[int64]*pendingCall{}}
+	respChan := make(chan *rpcResponse, 1)
+	conn.pending[id] = &pendingCall{responseCh: respChan, method: "pool.dataset.create"}
+
+	locked := make(chan struct{})
+	go func() {
+		conn.sendMu.Lock()
+		close(locked)
+		// Widen the window a classifier would have to race through.
+		time.Sleep(50 * time.Millisecond)
+		conn.pendingMu.Lock()
+		conn.pending[id].sent = true
+		conn.pendingMu.Unlock()
+		conn.sendMu.Unlock()
+	}()
+	<-locked
+
+	_, err := conn.canceledCallResult(id, "pool.dataset.create", respChan, context.Canceled)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrAmbiguousResult,
+		"a mutation whose write was in flight at cancel time must be AMBIGUOUS, never a bare context error; "+
+			"reporting it as never-sent invites a retry of a create the backend already applied")
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// TestClient_CanceledCallBeforeWriteStaysUnambiguous is the other half: taking
+// sendMu must not inflate every cancellation into an ambiguous result. A request
+// that was never handed to the write loop is definitively not sent, and the
+// caller is entitled to retry it.
+func TestClient_CanceledCallBeforeWriteStaysUnambiguous(t *testing.T) {
+	const id = int64(9)
+	conn := &Connection{pending: map[int64]*pendingCall{}}
+	respChan := make(chan *rpcResponse, 1)
+	conn.pending[id] = &pendingCall{responseCh: respChan, method: "pool.dataset.create"}
+
+	_, err := conn.canceledCallResult(id, "pool.dataset.create", respChan, context.Canceled)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrAmbiguousResult,
+		"an unsent request must stay retryable; inflating it to ambiguous would strand safe retries")
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 func TestClient_PerAttemptTimeoutReleasesSemaphore(t *testing.T) {
 	var slowCalls atomic.Int32
 	mock := newMockWSServer()
