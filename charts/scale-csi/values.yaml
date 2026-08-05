@@ -950,6 +950,14 @@ sidecars:
     # capabilities, forbids privilege escalation, and makes the root filesystem
     # read-only because all writes land on mounted socket directories.
     securityContext: {}
+    # The node DaemonSet uses hostNetwork: true, so this endpoint binds on the
+    # host and consumes the port on every node. Keep the default separate from
+    # the driver's 9809 and liveness sidecar's 9808; choose another free port
+    # when a node already uses 9810. Disabling this removes the endpoint and
+    # both registrar probes.
+    healthProbe:
+      enabled: true
+      port: 9810
     image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
     resources:
       requests:

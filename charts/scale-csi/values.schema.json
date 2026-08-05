@@ -275,6 +275,60 @@
         }
       }
     },
+    "nodeDriverRegistrar": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "securityContext": {
+          "$ref": "#/definitions/freeObject"
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeout": {
+          "type": "string",
+          "minLength": 2
+        },
+        "workerThreads": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "healthProbe": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "default": {
+            "requests": {
+              "cpu": "10m",
+              "memory": "32Mi"
+            },
+            "limits": {
+              "memory": "128Mi"
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    },
     "storageClass": {
       "type": "object",
       "additionalProperties": false,
@@ -1310,7 +1364,7 @@
           "$ref": "#/definitions/sidecar"
         },
         "nodeDriverRegistrar": {
-          "$ref": "#/definitions/sidecar"
+          "$ref": "#/definitions/nodeDriverRegistrar"
         },
         "livenessProbe": {
           "$ref": "#/definitions/sidecar"
