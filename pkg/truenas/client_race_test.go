@@ -268,11 +268,14 @@ func TestConnection_ChannelDrain_Timeout(t *testing.T) {
 	}
 
 	cfg := &ClientConfig{
-		Host:           host,
-		Port:           port,
-		Protocol:       "http",
-		APIKey:         "test-api-key",
-		Timeout:        100 * time.Millisecond, // Short timeout
+		Host:     host,
+		Port:     port,
+		Protocol: "http",
+		APIKey:   "test-api-key",
+		// Keep the per-RPC budget above the caller's test deadline. The test is
+		// about cleaning timed-out calls while the server drains its serial queue;
+		// it must not make the later functional call expire behind that queue.
+		Timeout:        5 * time.Second,
 		ConnectTimeout: 2 * time.Second,
 		MaxConnections: 1,
 	}
@@ -302,7 +305,7 @@ func TestConnection_ChannelDrain_Timeout(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 
 	// Connection should still be functional after handling timeouts
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result, err := client.Call(ctx, "test.method")
 	assert.NoError(t, err)
@@ -440,11 +443,13 @@ func TestConnection_PendingMapCleanup(t *testing.T) {
 	}
 
 	cfg := &ClientConfig{
-		Host:           host,
-		Port:           port,
-		Protocol:       "http",
-		APIKey:         "test-api-key",
-		Timeout:        50 * time.Millisecond,
+		Host:     host,
+		Port:     port,
+		Protocol: "http",
+		APIKey:   "test-api-key",
+		// Keep the per-RPC budget above the caller's short timeout so the final
+		// fast call can wait for the server's serial slow-call queue to drain.
+		Timeout:        5 * time.Second,
 		ConnectTimeout: 2 * time.Second,
 		MaxConnections: 1,
 	}
