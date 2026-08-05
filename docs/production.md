@@ -280,14 +280,15 @@ protection. If enabled, five consecutive failures open it for 30
 seconds before half-open probes are admitted. These controls do not replace
 protocol-level mount/login timeouts under `commandTimeouts`.
 
-`requestTimeout` bounds each individual JSON-RPC attempt. It is applied as a
-child deadline, so the effective budget is `min(remaining caller deadline,
-requestTimeout)` and a wedged-but-live request cannot pin an API concurrency slot
-forever. A CSI sidecar deadline still remains the operation-wide parent: an `@job`
-method's dispatch RPC and each later `core.get_jobs` poll receive per-RPC caps, but
-the separate job wait continues until its caller deadline or a terminal event. A
-large clone or recursive snapshot is therefore not cut short at 60s merely because
-its whole CSI operation has a 300s sidecar budget.
+`requestTimeout` bounds each API call. It is applied as a hard per-call cap **only
+to callers that supply no deadline of their own** (internal background work such as
+session garbage collection), so a wedged-but-live TrueNAS request cannot pin an API
+concurrency slot indefinitely. Calls that already carry a deadline — every CSI RPC,
+which inherits the sidecar's `--timeout` — are bounded by that deadline instead, so a
+legitimately long single operation (e.g. a large clone or recursive snapshot) is never
+cut short at `requestTimeout`. In the worst case all `maxConcurrentRequests` slots can
+be held by deadline-bearing calls for the length of their sidecar timeout; size the
+semaphore and sidecar timeouts accordingly.
 
 ### HTTP health-check cache
 
