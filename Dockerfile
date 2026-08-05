@@ -10,7 +10,7 @@ WORKDIR /build
 
 # Copy go mod files first for better caching
 COPY go.mod go.sum* ./
-RUN go mod download || true
+RUN go mod download
 
 # Copy source code
 COPY . .
