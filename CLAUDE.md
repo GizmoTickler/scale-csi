@@ -88,7 +88,7 @@ Located in `charts/scale-csi/`. Key templates:
 
 ## GitHub Releases
 
-**CRITICAL: Release notes are MANDATORY for every release.** After pushing a new tag, you MUST immediately create/update the release notes using `gh release edit`. Never leave a release with just the auto-generated changelog link - this is unacceptable.
+**Release notes are required for every release.** After pushing a new tag, immediately create/update the release notes using `gh release edit` — a release must not ship with only the auto-generated changelog link.
 
 ### Release Notes Checklist (do this IMMEDIATELY after `git push --tags`):
 1. Run: `gh release edit <version> --title "<version>: Brief Description" --notes "..."`
