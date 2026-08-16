@@ -100,6 +100,25 @@ func NVMeoFConnectWithOptionsAndSubsystems(nqn, transportURI string, opts *NVMeo
 // using a pre-fetched subsystem list, bounded by the inbound context's deadline
 // as well as the overall connect timeout.
 func NVMeoFConnectWithOptionsAndSubsystemsContext(ctx context.Context, nqn, transportURI string, opts *NVMeoFConnectOptions, subsystems []NVMeSubsystem) (string, error) {
+	return nvmeOFConnectWithOptionsAndSubsystemsContext(ctx, nqn, transportURI, opts, subsystems, nvmeConnectWithSubsystems)
+}
+
+// NVMeoFConnectPathWithOptionsAndSubsystemsContext connects one exact
+// transport path for a multipath subsystem. Unlike the legacy entry point
+// above, another controller for the same NQN does not suppress this connect.
+func NVMeoFConnectPathWithOptionsAndSubsystemsContext(ctx context.Context, nqn, transportURI string, opts *NVMeoFConnectOptions, subsystems []NVMeSubsystem) (string, error) {
+	return nvmeOFConnectWithOptionsAndSubsystemsContext(ctx, nqn, transportURI, opts, subsystems, nvmeConnectPathWithSubsystems)
+}
+
+type nvmeConnectFunc func(context.Context, string, string, string, string, []NVMeSubsystem) error
+
+func nvmeOFConnectWithOptionsAndSubsystemsContext(
+	ctx context.Context,
+	nqn, transportURI string,
+	opts *NVMeoFConnectOptions,
+	subsystems []NVMeSubsystem,
+	connect nvmeConnectFunc,
+) (string, error) {
 	klog.V(4).Infof("NVMeoFConnect: nqn=%s, transportURI=%s", nqn, transportURI)
 
 	// Apply defaults
@@ -122,10 +141,13 @@ func NVMeoFConnectWithOptionsAndSubsystemsContext(ctx context.Context, nqn, tran
 		return "", fmt.Errorf("invalid transport URI: %w", err)
 	}
 
+	// Device discovery remains NQN-scoped: it needs a refreshed list only when
+	// the subsystem itself is new. Multipath's connect suppression is separately
+	// path-scoped in nvmeConnectPathWithSubsystems below.
 	wasConnected := hasNVMeSubsystem(nqn, subsystems)
 
 	// Connect to the subsystem
-	if connectErr := nvmeConnectWithSubsystems(ctx, transport, host, port, nqn, subsystems); connectErr != nil {
+	if connectErr := connect(ctx, transport, host, port, nqn, subsystems); connectErr != nil {
 		return "", fmt.Errorf("connect failed: %w", connectErr)
 	}
 
@@ -207,14 +229,31 @@ func parseTransportURI(transportURI string) (transport, host, port string, err e
 }
 
 func nvmeConnectWithSubsystems(ctx context.Context, transport, host, port, nqn string, subsystems []NVMeSubsystem) error {
-	// A subsystem can have several controllers, one per transport address. Skip
-	// only the exact live path requested here; an existing controller for the NQN
-	// on another address must not suppress multipath convergence.
+	// Preserve the historical single-path behavior: any subsystem entry for the
+	// NQN suppresses another connect, regardless of path state or address.
+	if hasNVMeSubsystem(nqn, subsystems) {
+		klog.V(4).Infof("Already connected to subsystem: %s", nqn)
+		return nil
+	}
+	return runNVMeConnect(ctx, transport, host, port, nqn)
+}
+
+func nvmeConnectPathWithSubsystems(ctx context.Context, transport, host, port, nqn string, subsystems []NVMeSubsystem) error {
+	// Multipath convergence must suppress only the requested live controller;
+	// another address, a non-live path, or a pathless subsystem still needs a
+	// connect attempt.
 	if hasLiveNVMeoFPath(nqn, host, subsystems) {
 		klog.V(4).Infof("Already connected to subsystem %s at %s", nqn, host)
 		return nil
 	}
+	return runNVMeConnect(ctx, transport, host, port, nqn)
+}
 
+var nvmeConnectCommand = func(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "nvme", args...).CombinedOutput()
+}
+
+func runNVMeConnect(ctx context.Context, transport, host, port, nqn string) error {
 	// Build connect command with reconnect options for resilience.
 	// --reconnect-delay=10: retry connection every 10 seconds on failure
 	// --ctrl-loss-tmo=-1: never give up on reconnecting (-1 means infinite)
@@ -230,8 +269,7 @@ func nvmeConnectWithSubsystems(ctx context.Context, transport, host, port, nqn s
 		"--ctrl-loss-tmo=-1",
 	}
 
-	cmd := exec.CommandContext(ctx, "nvme", args...)
-	output, err := cmd.CombinedOutput()
+	output, err := nvmeConnectCommand(ctx, args...)
 	if err != nil {
 		// Check if already connected
 		if strings.Contains(string(output), "already connected") {
@@ -310,11 +348,11 @@ func SetNVMeSubsystemIOPolicy(subsystemName, policy string) error {
 }
 
 func setNVMeSubsystemIOPolicyAt(root, subsystemName, policy string) error {
-	if subsystemName == "" || filepath.Base(subsystemName) != subsystemName {
+	if subsystemName == "" || subsystemName == "." || subsystemName == ".." || filepath.Base(subsystemName) != subsystemName {
 		return fmt.Errorf("invalid NVMe subsystem name %q", subsystemName)
 	}
 	policyPath := filepath.Join(root, subsystemName, "iopolicy")
-	file, err := os.OpenFile(policyPath, os.O_WRONLY, 0) //nolint:gosec // fixed sysfs root plus validated basename
+	file, err := os.OpenFile(policyPath, os.O_WRONLY|os.O_TRUNC, 0) //nolint:gosec // fixed sysfs root plus validated basename
 	if err != nil {
 		return fmt.Errorf("open NVMe subsystem iopolicy: %w", err)
 	}

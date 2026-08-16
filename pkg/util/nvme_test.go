@@ -83,18 +83,96 @@ func TestLiveNVMeoFAddresses(t *testing.T) {
 		"a live controller for the NQN on another address must not suppress a missing-path connect")
 }
 
+func TestNVMeConnectLegacyAndMultipathSuppression(t *testing.T) {
+	originalCommand := nvmeConnectCommand
+	t.Cleanup(func() { nvmeConnectCommand = originalCommand })
+
+	tests := []struct {
+		name       string
+		host       string
+		subsystems []NVMeSubsystem
+	}{
+		{
+			name: "live controller at a different address",
+			host: "192.0.2.50",
+			subsystems: []NVMeSubsystem{{NQN: "nqn.gf5:connect", Paths: []NVMePath{
+				{Address: "traddr=192.0.2.60,trsvcid=4420", State: "live"},
+			}}},
+		},
+		{
+			name: "requested address is still connecting",
+			host: "192.0.2.50",
+			subsystems: []NVMeSubsystem{{NQN: "nqn.gf5:connect", Paths: []NVMePath{
+				{Address: "traddr=192.0.2.50,trsvcid=4420", State: "connecting"},
+			}}},
+		},
+		{
+			name:       "subsystem has no paths array",
+			host:       "192.0.2.50",
+			subsystems: []NVMeSubsystem{{NQN: "nqn.gf5:connect"}},
+		},
+		{
+			name: "requested hostname does not match numeric traddr",
+			host: "nvme-target",
+			subsystems: []NVMeSubsystem{{NQN: "nqn.gf5:connect", Paths: []NVMePath{
+				{Address: "traddr=192.0.2.50,trsvcid=4420", State: "live"},
+			}}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			commandCalls := 0
+			nvmeConnectCommand = func(context.Context, ...string) ([]byte, error) {
+				commandCalls++
+				return []byte("connected"), nil
+			}
+
+			require.NoError(t, nvmeConnectWithSubsystems(
+				context.Background(), "tcp", test.host, "4420", "nqn.gf5:connect", test.subsystems,
+			))
+			assert.Zero(t, commandCalls, "legacy NQN-level entry point must suppress the connect")
+
+			require.NoError(t, nvmeConnectPathWithSubsystems(
+				context.Background(), "tcp", test.host, "4420", "nqn.gf5:connect", test.subsystems,
+			))
+			assert.Equal(t, 1, commandCalls, "multipath entry point must attempt the missing or non-live path")
+		})
+	}
+}
+
+func TestNVMeConnectPathSuppressesExactLiveController(t *testing.T) {
+	originalCommand := nvmeConnectCommand
+	t.Cleanup(func() { nvmeConnectCommand = originalCommand })
+	commandCalls := 0
+	nvmeConnectCommand = func(context.Context, ...string) ([]byte, error) {
+		commandCalls++
+		return nil, nil
+	}
+
+	subsystems := []NVMeSubsystem{{NQN: "nqn.gf5:live", Paths: []NVMePath{
+		{Address: "traddr=2001:db8::10,trsvcid=4420", State: "live"},
+	}}}
+	require.NoError(t, nvmeConnectPathWithSubsystems(
+		context.Background(), "tcp", "2001:db8::10", "4420", "nqn.gf5:live", subsystems,
+	))
+	assert.Zero(t, commandCalls)
+}
+
 func TestSetNVMeSubsystemIOPolicy(t *testing.T) {
 	root := t.TempDir()
 	subsystemDir := filepath.Join(root, "nvme-subsys7")
 	require.NoError(t, os.MkdirAll(subsystemDir, 0o750))
 	policyPath := filepath.Join(subsystemDir, "iopolicy")
-	require.NoError(t, os.WriteFile(policyPath, []byte("numa"), 0o600))
+	require.NoError(t, os.WriteFile(policyPath, []byte("a-prior-policy-value-that-is-longer"), 0o600))
 
 	require.NoError(t, setNVMeSubsystemIOPolicyAt(root, "nvme-subsys7", "queue-depth"))
 	policy, err := os.ReadFile(policyPath)
 	require.NoError(t, err)
 	assert.Equal(t, "queue-depth", string(policy))
 
+	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, ".", "queue-depth"))
+	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, "..", "queue-depth"))
 	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, "../nvme-subsys7", "queue-depth"))
 	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, "nvme-subsys8", "queue-depth"))
 }
