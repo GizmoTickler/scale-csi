@@ -769,6 +769,54 @@ nvmeof:
 	assert.Contains(t, err.Error(), "nvmeof.addresses")
 }
 
+func TestLoadConfigRejectsInvalidNVMeoFMultipathAddresses(t *testing.T) {
+	tests := []struct {
+		name             string
+		transportAddress string
+		additional       string
+		wantField        string
+	}{
+		{name: "port", transportAddress: "192.0.2.20", additional: "192.0.2.21:4420", wantField: "nvmeof.addresses[0]"},
+		{name: "URI scheme", transportAddress: "192.0.2.20", additional: "tcp://192.0.2.21", wantField: "nvmeof.addresses[0]"},
+		{name: "malformed bracket", transportAddress: "192.0.2.20", additional: "[2001:db8::21", wantField: "nvmeof.addresses[0]"},
+		{name: "whitespace", transportAddress: "192.0.2.20", additional: " 192.0.2.21", wantField: "nvmeof.addresses[0]"},
+		{name: "hostname", transportAddress: "192.0.2.20", additional: "storage.invalid", wantField: "nvmeof.addresses[0]"},
+		{name: "primary hostname", transportAddress: "storage.invalid", additional: "192.0.2.21", wantField: "nvmeof.transportAddress"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+nvmeof:
+  enabled: true
+  transportAddress: %q
+  subsystemAllowAnyHost: true
+  multipath: true
+  addresses:
+    - %q
+`, test.transportAddress, test.additional))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.wantField)
+		})
+	}
+}
+
+func TestLoadConfigNormalizesBracketedNVMeoFMultipathIPv6(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nvmeof:
+  enabled: true
+  transportAddress: "[2001:db8::20]"
+  subsystemAllowAnyHost: true
+  multipath: true
+  addresses:
+    - "[2001:db8::21]"
+`)
+	require.NoError(t, err)
+	assert.Equal(t, "2001:db8::20", cfg.NVMeoF.TransportAddress)
+	assert.Equal(t, []string{"2001:db8::21"}, cfg.NVMeoF.Addresses)
+	assert.Equal(t, []string{"2001:db8::20", "2001:db8::21"}, cfg.NVMeoF.multipathAddresses())
+}
+
 func TestNVMeoFMultipathAddresses(t *testing.T) {
 	off := NVMeoFConfig{TransportAddress: "192.168.120.10"}
 	assert.Nil(t, off.multipathAddresses(), "multipath off must yield nil")

@@ -2034,8 +2034,8 @@ func TestParseNVMeoFMultipathAddresses(t *testing.T) {
 		{name: "empty array", volumeContext: map[string]string{"addresses": "[]"}},
 		{name: "malformed", volumeContext: map[string]string{"addresses": "["}, wantErr: true},
 		{
-			name:          "valid trims and deduplicates",
-			volumeContext: map[string]string{"addresses": `["192.0.2.10"," 192.0.2.11 ","192.0.2.10"]`},
+			name:          "valid deduplicates",
+			volumeContext: map[string]string{"addresses": `["192.0.2.10","192.0.2.11","192.0.2.10"]`},
 			want:          []string{"192.0.2.10", "192.0.2.11"},
 		},
 		{
@@ -2045,6 +2045,8 @@ func TestParseNVMeoFMultipathAddresses(t *testing.T) {
 		},
 		{name: "rejects address with port", volumeContext: map[string]string{"addresses": `["192.0.2.10:4420"]`}, wantErr: true},
 		{name: "rejects URI", volumeContext: map[string]string{"addresses": `["tcp://192.0.2.10"]`}, wantErr: true},
+		{name: "rejects whitespace", volumeContext: map[string]string{"addresses": `[" 192.0.2.10"]`}, wantErr: true},
+		{name: "rejects hostname", volumeContext: map[string]string{"addresses": `["storage.invalid"]`}, wantErr: true},
 	}
 
 	for _, test := range tests {

@@ -160,7 +160,8 @@ func TestNVMeConnectPathSuppressesExactLiveController(t *testing.T) {
 }
 
 func TestSetNVMeSubsystemIOPolicy(t *testing.T) {
-	root := t.TempDir()
+	tempDir := t.TempDir()
+	root := filepath.Join(tempDir, "root")
 	subsystemDir := filepath.Join(root, "nvme-subsys7")
 	require.NoError(t, os.MkdirAll(subsystemDir, 0o750))
 	policyPath := filepath.Join(subsystemDir, "iopolicy")
@@ -171,8 +172,18 @@ func TestSetNVMeSubsystemIOPolicy(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "queue-depth", string(policy))
 
-	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, ".", "queue-depth"))
-	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, "..", "queue-depth"))
+	decoys := map[string]string{
+		".":  filepath.Join(root, "iopolicy"),
+		"..": filepath.Join(tempDir, "iopolicy"),
+	}
+	for subsystemName, decoyPath := range decoys {
+		require.NoError(t, os.WriteFile(decoyPath, []byte("decoy-must-not-change"), 0o600))
+		err := setNVMeSubsystemIOPolicyAt(root, subsystemName, "queue-depth")
+		require.EqualError(t, err, fmt.Sprintf("invalid NVMe subsystem name %q", subsystemName))
+		content, readErr := os.ReadFile(decoyPath)
+		require.NoError(t, readErr)
+		assert.Equal(t, "decoy-must-not-change", string(content))
+	}
 	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, "../nvme-subsys7", "queue-depth"))
 	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, "nvme-subsys8", "queue-depth"))
 }

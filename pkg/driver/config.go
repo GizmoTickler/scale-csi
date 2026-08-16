@@ -1280,6 +1280,22 @@ func validateConfig(cfg *Config) error {
 		if cfg.NVMeoF.Multipath && len(cfg.NVMeoF.Addresses) == 0 {
 			return fmt.Errorf("nvmeof.addresses must list at least one additional storage address when nvmeof.multipath is enabled")
 		}
+		if cfg.NVMeoF.Multipath {
+			transportAddress, addressErr := normalizeNVMeoFAddress(cfg.NVMeoF.TransportAddress)
+			if addressErr != nil {
+				return fmt.Errorf("nvmeof.transportAddress must be an IP address when nvmeof.multipath is enabled: %w", addressErr)
+			}
+			normalizedAddresses := make([]string, len(cfg.NVMeoF.Addresses))
+			for i, rawAddress := range cfg.NVMeoF.Addresses {
+				address, addressErr := normalizeNVMeoFAddress(rawAddress)
+				if addressErr != nil {
+					return fmt.Errorf("nvmeof.addresses[%d] must be an IP address: %w", i, addressErr)
+				}
+				normalizedAddresses[i] = address
+			}
+			cfg.NVMeoF.TransportAddress = transportAddress
+			cfg.NVMeoF.Addresses = normalizedAddresses
+		}
 		if v := cfg.NVMeoF.PortPerf.InlineDataSize; v != nil && *v < 0 {
 			return fmt.Errorf("nvmeof.portPerf.inlineDataSize must be non-negative (got %d)", *v)
 		}

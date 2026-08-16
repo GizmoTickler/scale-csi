@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +30,7 @@ var (
 	nodeNVMeDisconnect         = util.NVMeoFDisconnectWithContext
 	nodeListNVMeSubsystems     = util.ListNVMeSubsystems
 	nodeSetNVMeIOPolicy        = util.SetNVMeSubsystemIOPolicy
+	nodeNVMeSubsystemSysfsRoot = "/sys/class/nvme-subsystem"
 	nodeGetISCSIInfo           = util.GetISCSIInfoFromDevice
 	nodeISCSIDisconnect        = util.ISCSIDisconnect
 	nodeGetDeviceSize          = util.GetDeviceSize
@@ -55,8 +55,11 @@ var (
 
 // Secondary paths are availability improvements, not a reason to hold a CSI
 // NodeStage RPC for N times the full device and nvme-cli timeouts. After the
-// mandatory first-path attempt, every remaining top-up shares this total budget.
+// already-live device wait and mandatory first missing-path attempt, every
+// remaining top-up shares this total budget.
 const nvmeSecondaryPathConvergeBudget = 5 * time.Second
+
+const invalidNVMeMultipathAddressMetricLabel = "invalid-publish-context"
 
 type nodeAccessType string
 
@@ -1666,7 +1669,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	if port == "" {
 		port = "4420"
 	}
-	multipathAddresses := nodeNVMeMultipathAddresses(volumeContext, nqn)
+	multipathAddresses := d.nodeNVMeMultipathAddresses(volumeContext, nqn, eventObjects...)
 
 	mounted, err := util.IsMounted(stagingPath)
 	if err != nil {
@@ -1755,6 +1758,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 			}
 		}
 		d.setNVMeoFQueueDepthPolicy(nqn, policySubsystems)
+		d.recordNVMeMultipathAggregation(firstEventObject(eventObjects), nqn)
 	}
 	return nil
 }
@@ -1788,7 +1792,10 @@ func parseNVMeoFMultipathAddresses(volumeContext map[string]string) ([]string, e
 }
 
 func normalizeNVMeoFAddress(rawAddress string) (string, error) {
-	address := strings.TrimSpace(rawAddress)
+	if rawAddress != strings.TrimSpace(rawAddress) {
+		return "", errors.New("leading or trailing whitespace is not allowed")
+	}
+	address := rawAddress
 	if address == "" {
 		return "", errors.New("empty address")
 	}
@@ -1807,23 +1814,22 @@ func normalizeNVMeoFAddress(rawAddress string) (string, error) {
 		return address, nil
 	}
 	if strings.ContainsAny(address, "[] \t\r\n") {
-		return "", errors.New("address must be a bare IP or host")
+		return "", errors.New("address must be a bare IP")
 	}
 	if net.ParseIP(address) != nil {
 		return address, nil
 	}
-
-	parsed, err := url.Parse("//" + address)
-	if err != nil || parsed.Hostname() != address || parsed.Port() != "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", errors.New("address must be a bare IP or host without a port")
-	}
-	return address, nil
+	return "", errors.New("address must be a bare IP without a port")
 }
 
-func nodeNVMeMultipathAddresses(volumeContext map[string]string, nqn string) []string {
+func (d *Driver) nodeNVMeMultipathAddresses(volumeContext map[string]string, nqn string, eventObjects ...runtime.Object) []string {
 	addresses, err := parseNVMeoFMultipathAddresses(volumeContext)
 	if err != nil {
-		klog.Warningf("Ignoring malformed NVMe-oF multipath addresses for %s and falling back to the single address: %v", nqn, err)
+		rawAddresses := volumeContext["addresses"]
+		message := fmt.Sprintf("NVMe-oF multipath address list for %s was discarded; using single-address fallback; published addresses=%s: %v", nqn, rawAddresses, err)
+		klog.Warning(message)
+		RecordNVMePathConnect(invalidNVMeMultipathAddressMetricLabel, "error")
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNVMePathDegraded, message)
 		return nil
 	}
 	return addresses
@@ -1831,7 +1837,7 @@ func nodeNVMeMultipathAddresses(volumeContext map[string]string, nqn string) []s
 
 func (d *Driver) convergeExistingNVMeoFPaths(ctx context.Context, volumeContext map[string]string, eventObjects ...runtime.Object) {
 	nqn := volumeContext["nqn"]
-	addresses := nodeNVMeMultipathAddresses(volumeContext, nqn)
+	addresses := d.nodeNVMeMultipathAddresses(volumeContext, nqn, eventObjects...)
 	if len(addresses) == 0 {
 		return
 	}
@@ -1856,7 +1862,16 @@ func (d *Driver) convergeExistingNVMeoFPaths(ctx context.Context, volumeContext 
 	if len(pathFailures) > 0 {
 		d.recordNVMePathFailures(firstEventObject(eventObjects), nqn, pathFailures)
 	}
-	d.setNVMeoFQueueDepthPolicy(nqn, subsystems)
+	policySubsystems := subsystems
+	if !hasNamedNVMeSubsystem(nqn, policySubsystems) {
+		if refreshed, listErr := nodeListNVMeSubsystems(ctx); listErr == nil {
+			policySubsystems = refreshed
+		} else {
+			klog.V(4).Infof("NVMe-oF queue-depth iopolicy relist unavailable for staged volume %s: %v", nqn, listErr)
+		}
+	}
+	d.setNVMeoFQueueDepthPolicy(nqn, policySubsystems)
+	d.recordNVMeMultipathAggregation(firstEventObject(eventObjects), nqn)
 }
 
 func convergeNVMeoFPaths(
@@ -1906,23 +1921,33 @@ func convergeNVMeoFPaths(
 		}
 	}
 
-	// If a requested controller is already live, reuse its device-wait behavior
-	// with the full configured budget. No connect command is issued because the
-	// exact-path utility sees the live controller.
+	// If requested controllers are already live, try each one's device-wait
+	// behavior within one shared configured-timeout budget. No connect command is
+	// issued because the exact-path utility sees each live controller.
 	if needDevice && len(requestedLive) > 0 {
-		path, err := nvmeConnectPathWithSubsystems(ctx, nqn, transportURI(requestedLive[0]), connectOpts, subsystems)
-		if err != nil || path == "" {
-			if err == nil {
-				err = errors.New("connect returned an empty device path")
+		deviceWaitTimeout := util.DefaultNVMeoFDeviceTimeout
+		if connectOpts != nil && connectOpts.DeviceTimeout > 0 {
+			deviceWaitTimeout = connectOpts.DeviceTimeout
+		}
+		liveWaitCtx, cancel := context.WithTimeout(ctx, deviceWaitTimeout)
+		defer cancel()
+		for _, address := range requestedLive {
+			path, err := nvmeConnectPathWithSubsystems(liveWaitCtx, nqn, transportURI(address), connectOpts, subsystems)
+			if err != nil || path == "" {
+				if err == nil {
+					err = errors.New("connect returned an empty device path")
+				}
+				connectErrors = append(connectErrors, fmt.Errorf("%s: %w", address, err))
+				continue
 			}
-			connectErrors = append(connectErrors, fmt.Errorf("%s: %w", requestedLive[0], err))
-		} else {
 			devicePath = path
+			break
 		}
 	}
 
-	// A fresh stage gives one requested connect the full device/CLI timeout. Any
-	// later candidates and all already-staged top-ups share one short budget.
+	// A fresh stage can spend at most two full configured budgets: one shared by
+	// already-live device waits above, then one for missing[0]. Later candidates
+	// and all already-staged top-ups share one short budget.
 	if needDevice && devicePath == "" && len(missing) > 0 {
 		connectPath(ctx, missing[0], connectOpts, true)
 		missing = missing[1:]
@@ -1950,6 +1975,7 @@ func convergeNVMeoFPaths(
 
 func (d *Driver) setNVMeoFQueueDepthPolicy(nqn string, subsystems []util.NVMeSubsystem) {
 	found := false
+	stamped := 0
 	for _, subsystem := range subsystems {
 		if subsystem.NQN != nqn || subsystem.Name == "" {
 			continue
@@ -1957,11 +1983,54 @@ func (d *Driver) setNVMeoFQueueDepthPolicy(nqn string, subsystems []util.NVMeSub
 		found = true
 		if err := nodeSetNVMeIOPolicy(subsystem.Name, "queue-depth"); err != nil {
 			klog.V(4).Infof("NVMe-oF queue-depth iopolicy unsupported for %s (%s): %v", nqn, subsystem.Name, err)
+		} else {
+			stamped++
 		}
 	}
 	if !found {
 		klog.V(4).Infof("NVMe-oF subsystem not visible while setting queue-depth iopolicy for %s", nqn)
 	}
+	if stamped > 1 {
+		klog.V(2).Infof("NVMe-oF queue-depth iopolicy stamped on %d subsystem directories for %s; enable nvme_core.multipath=Y so the kernel aggregates all paths into one subsystem", stamped, nqn)
+	}
+}
+
+func (d *Driver) recordNVMeMultipathAggregation(eventObject runtime.Object, nqn string) {
+	count, err := countNVMeSubsystemDirsByNQN(nodeNVMeSubsystemSysfsRoot, nqn)
+	if err != nil {
+		klog.V(4).Infof("NVMe-oF multipath aggregation check unavailable for %s: %v", nqn, err)
+		return
+	}
+	if count <= 1 {
+		return
+	}
+	message := fmt.Sprintf("NVMe-oF multipath for %s is split across %d subsystem directories; enable nvme_core.multipath=Y so the kernel aggregates the paths into one subsystem", nqn, count)
+	klog.Warning(message)
+	d.recordWarningEvent(eventObject, EventReasonNVMeMultipathUnaggregated, message)
+}
+
+func countNVMeSubsystemDirsByNQN(root, nqn string) (int, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, fmt.Errorf("read NVMe subsystem sysfs root: %w", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "nvme-subsys") {
+			continue
+		}
+		subsysNQN, readErr := os.ReadFile(filepath.Join(root, entry.Name(), "subsysnqn"))
+		if errors.Is(readErr, os.ErrNotExist) {
+			continue
+		}
+		if readErr != nil {
+			return 0, fmt.Errorf("read NVMe subsystem %s NQN: %w", entry.Name(), readErr)
+		}
+		if strings.TrimSpace(string(subsysNQN)) == nqn {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func hasNamedNVMeSubsystem(nqn string, subsystems []util.NVMeSubsystem) bool {

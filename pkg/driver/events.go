@@ -38,19 +38,20 @@ const (
 	// periodic-snapshot task could not be created for a volume (GF2/E2). The
 	// failure is non-fatal: the volume is still provisioned, just without
 	// automatic PITR until the next create retry.
-	EventReasonSnapshotTaskFailed  = "SnapshotTaskFailed"
-	EventReasonISCSILoginFailed    = "ISCSILoginFailed"
-	EventReasonNVMeConnectFailed   = "NVMeConnectFailed"
-	EventReasonNVMePathDegraded    = "NVMePathDegraded"
-	EventReasonMountFailed         = "MountFailed"
-	EventReasonISCSILogoutFailed   = "ISCSILogoutFailed"
-	EventReasonNFSMountFailed      = "NFSMountFailed"
-	EventReasonNFSUnmountFailed    = "NFSUnmountFailed"
-	EventReasonTrueNASError        = "TrueNASError"
-	EventReasonTrueNASReconnected  = "TrueNASReconnected"
-	EventReasonFencingTakeover     = "FencingTakeover"
-	EventReasonISCSICHAPRotated    = "ISCSICHAPRotated"
-	EventReasonRemnantOrphanReaped = "RemnantOrphanReaped"
+	EventReasonSnapshotTaskFailed        = "SnapshotTaskFailed"
+	EventReasonISCSILoginFailed          = "ISCSILoginFailed"
+	EventReasonNVMeConnectFailed         = "NVMeConnectFailed"
+	EventReasonNVMePathDegraded          = "NVMePathDegraded"
+	EventReasonNVMeMultipathUnaggregated = "NVMeMultipathUnaggregated"
+	EventReasonMountFailed               = "MountFailed"
+	EventReasonISCSILogoutFailed         = "ISCSILogoutFailed"
+	EventReasonNFSMountFailed            = "NFSMountFailed"
+	EventReasonNFSUnmountFailed          = "NFSUnmountFailed"
+	EventReasonTrueNASError              = "TrueNASError"
+	EventReasonTrueNASReconnected        = "TrueNASReconnected"
+	EventReasonFencingTakeover           = "FencingTakeover"
+	EventReasonISCSICHAPRotated          = "ISCSICHAPRotated"
+	EventReasonRemnantOrphanReaped       = "RemnantOrphanReaped"
 	// EventReasonReaperRefused is emitted once per reconcile pass when the guarded
 	// reaper refuses one or more manual-recovery tombstones (unproven creation-time
 	// identity). These never drain automatically; each needs operator action (E3/O13).
