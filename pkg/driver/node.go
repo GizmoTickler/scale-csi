@@ -34,6 +34,7 @@ var (
 	nodeGetISCSIInfo            = util.GetISCSIInfoFromDevice
 	nodeISCSIDisconnect         = util.ISCSIDisconnect
 	nodeGetSCSIWWID             = util.GetSCSIWWID
+	nodeGetISCSIMultipathWWID   = util.GetISCSIMultipathWWID
 	nodeFindISCSIMultipath      = util.FindISCSIMultipathDevice
 	nodeCheckISCSIMultipathHost = util.CheckISCSIMultipathPrerequisites
 	nodeGetDeviceSize           = util.GetDeviceSize
@@ -49,6 +50,7 @@ var (
 	nodeNVMeRescan              = util.NVMeRescanWithContext
 	nodeDeviceSizePollTimeout   = 5 * time.Second
 	nodeDeviceSizePollInterval  = 200 * time.Millisecond
+	nodeStagedDevicePath        = stagedDevicePath
 	nodeStatsStat               = func(path string) (uint32, uint64, error) {
 		var stat unix.Stat_t
 		if err := unix.Stat(path, &stat); err != nil {
@@ -660,7 +662,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		case ShareTypeNFS:
 			d.convergeExistingNFSTrunks(ctx, stageContext, stagingPath, req.GetVolumeCapability(), eventObject)
 		case ShareTypeISCSI:
-			d.convergeExistingISCSIPaths(ctx, stageContext, req.GetSecrets(), eventObject)
+			d.convergeExistingISCSIPaths(ctx, stageContext, req.GetSecrets(), stagingPath, eventObject)
 		case ShareTypeNVMeoF:
 			d.convergeExistingNVMeoFPaths(ctx, stageContext, eventObject)
 		}
@@ -1014,6 +1016,10 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		if err := d.validateExistingPublication(req, capability, expectedSource); err != nil {
 			return nil, err
 		}
+		// Idempotent replay deliberately returns without issuing another mount.
+		// This includes legacy direct-mount NFS requests: since the compatibility
+		// guard above proves the live source/options, remounting would add risk but
+		// no state convergence.
 		klog.Infof("Volume %s already mounted compatibly at %s", volumeID, targetPath)
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
@@ -1563,7 +1569,7 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 		addresses = nil
 	}
 	trunkingActive := hintPresent && len(addresses) > 1
-	source := fmt.Sprintf("%s:%s", server, share)
+	source := nfsSource(server, share)
 	if trunkingActive {
 		source = nfsSource(addresses[0], share)
 	}
@@ -2142,12 +2148,9 @@ func waitForISCSIMultipathDevice(ctx context.Context, wwid string) (string, erro
 	}
 }
 
-func (d *Driver) convergeExistingISCSIPaths(ctx context.Context, volumeContext, secrets map[string]string, eventObjects ...runtime.Object) {
+func (d *Driver) convergeExistingISCSIPaths(ctx context.Context, volumeContext, secrets map[string]string, stagingPath string, eventObjects ...runtime.Object) {
 	portals, _, portalErr := parseISCSIMultipathPortals(volumeContext)
 	if portalErr != nil || len(portals) < 2 {
-		return
-	}
-	if prerequisiteErr := nodeCheckISCSIMultipathHost(); prerequisiteErr != nil {
 		return
 	}
 	iqn := volumeContext["iqn"]
@@ -2157,6 +2160,32 @@ func (d *Driver) convergeExistingISCSIPaths(ctx context.Context, volumeContext, 
 		lunErr = nil
 	}
 	if iqn == "" || lunErr != nil {
+		return
+	}
+	stagedDevice, staged := nodeStagedDevicePath(stagingPath)
+	if !staged {
+		d.recordISCSIExistingPathConvergenceSkipped(firstEventObject(eventObjects), iqn,
+			fmt.Sprintf("the live staging device at %s could not be resolved", stagingPath))
+		return
+	}
+	wwid, wwidErr := nodeGetISCSIMultipathWWID(stagedDevice)
+	if wwidErr != nil {
+		d.recordISCSIExistingPathConvergenceSkipped(firstEventObject(eventObjects), iqn,
+			fmt.Sprintf("staged device %s is not an existing dm-multipath map: %v", stagedDevice, wwidErr))
+		return
+	}
+	dmDevice, dmErr := nodeFindISCSIMultipath(wwid)
+	if dmErr != nil || !sameDevicePath(stagedDevice, dmDevice) {
+		detail := fmt.Sprintf("staged device %s is not the live dm-multipath map for WWID %s", stagedDevice, wwid)
+		if dmErr != nil {
+			detail = fmt.Sprintf("%s: %v", detail, dmErr)
+		}
+		d.recordISCSIExistingPathConvergenceSkipped(firstEventObject(eventObjects), iqn, detail)
+		return
+	}
+	if prerequisiteErr := nodeCheckISCSIMultipathHost(); prerequisiteErr != nil {
+		d.recordISCSIExistingPathConvergenceSkipped(firstEventObject(eventObjects), iqn,
+			fmt.Sprintf("dm-multipath prerequisites are unavailable: %v", prerequisiteErr))
 		return
 	}
 	chapCreds, chapErr := nodeISCSIChAPCredentials(volumeContext, secrets)
@@ -2180,6 +2209,30 @@ func (d *Driver) convergeExistingISCSIPaths(ctx context.Context, volumeContext, 
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSIPathDegraded,
 			fmt.Sprintf("iSCSI path convergence for %s is degraded: %v", iqn, errors.Join(failures...)))
 	}
+}
+
+func (d *Driver) recordISCSIExistingPathConvergenceSkipped(eventObject runtime.Object, iqn, detail string) {
+	message := fmt.Sprintf("iSCSI multipath convergence for already-staged volume %s was skipped; keep the live path unchanged and perform a full unstage/restage to adopt dm-multipath: %s", iqn, detail)
+	klog.Warning(message)
+	d.recordWarningEvent(eventObject, EventReasonISCSIMultipathUnavailable, message)
+}
+
+func sameDevicePath(left, right string) bool {
+	if left == "" || right == "" {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(left); err == nil {
+		left = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(right); err == nil {
+		right = resolved
+	}
+	if filepath.Clean(left) == filepath.Clean(right) {
+		return true
+	}
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
 }
 
 // stageNVMeoFVolume connects and mounts an NVMe-oF volume to the staging path.

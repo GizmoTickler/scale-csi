@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -90,13 +91,15 @@ func (d *Driver) iscsiPublishContext() (map[string]string, error) {
 	return map[string]string{"portals": string(encoded)}, nil
 }
 
-// convergeISCSIMultipathTargetGroups makes every configured portal carry the
-// same set of initiator/auth templates. This is the security-sensitive
-// difference from merely making a target discoverable on another IP: SCST
-// evaluates the target group attached to that portal, so omitting the dynamic
-// fencing group on one path would bypass the deny-all/per-initiator policy.
-// Existing groups on unrelated portals are preserved; multipath adds only the
-// missing cross-product and never removes operator configuration.
+// convergeISCSIMultipathTargetGroups makes every configured portal carry each
+// CSI-owned initiator/auth template. This is the security-sensitive difference
+// from merely making a target discoverable on another IP: SCST evaluates the
+// target group attached to that portal, so omitting the dynamic fencing group
+// on one path would bypass the deny-all/per-initiator policy. Existing groups
+// are preserved, but legacy null/zero and operator-scoped templates are never
+// cross-copied onto a portal where the operator did not place them.
+const iscsiOwnedAllowAllInitiatorComment = "scale-csi allow-all"
+
 func (d *Driver) convergeISCSIMultipathTargetGroups(ctx context.Context, target *truenas.ISCSITarget) (*truenas.ISCSITarget, error) {
 	if !d.config.ISCSI.Multipath || target == nil {
 		return target, nil
@@ -110,8 +113,25 @@ func (d *Driver) convergeISCSIMultipathTargetGroups(ctx context.Context, target 
 	}
 
 	templates := make([]truenas.ISCSITargetGroup, 0, len(target.Groups))
+	ownedInitiators := make(map[int]bool)
 	for _, group := range target.Groups {
-		if !containsISCSIGroupTemplate(templates, group) {
+		if group.Initiator <= 0 {
+			// A null/zero initiator is the legacy TrueNAS allow-all relationship.
+			// Replicating it would widen access onto storage networks where the
+			// operator never placed it.
+			continue
+		}
+		owned, cached := ownedInitiators[group.Initiator]
+		if !cached {
+			initiator, getErr := d.truenasClient.ISCSIInitiatorGet(ctx, group.Initiator)
+			if getErr != nil {
+				return nil, fmt.Errorf("failed to verify iSCSI initiator group %d before multipath convergence: %w", group.Initiator, getErr)
+			}
+			owned = initiator != nil && (strings.TrimSpace(initiator.Comment) == iscsiOwnedAllowAllInitiatorComment ||
+				strings.HasPrefix(strings.TrimSpace(initiator.Comment), "scale-csi fencing:"))
+			ownedInitiators[group.Initiator] = owned
+		}
+		if owned && !containsISCSIGroupTemplate(templates, group) {
 			templates = append(templates, group)
 		}
 	}
@@ -126,6 +146,18 @@ func (d *Driver) convergeISCSIMultipathTargetGroups(ctx context.Context, target 
 			}
 			groups = append(groups, candidate)
 			changed = true
+		}
+	}
+	for _, portalID := range portalIDs {
+		covered := false
+		for _, group := range groups {
+			if group.Portal == portalID {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return nil, fmt.Errorf("iSCSI portal group %d has no target association and no CSI-owned initiator template is available; operator-scoped and legacy allow-all groups are not replicated", portalID)
 		}
 	}
 	if !changed {
@@ -434,7 +466,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 
 	// Unlike NVMe-oF, iSCSI has no separate port-association object. Reachability
 	// and fencing both live in target.Groups, so publish-time convergence must
-	// replicate the complete initiator/auth template set across every portal.
+	// replicate every CSI-owned initiator/auth template across every portal.
 	target, err = d.convergeISCSIMultipathTargetGroups(ctx, target)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to converge iSCSI multipath portal associations: %v", err)

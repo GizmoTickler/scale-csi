@@ -1125,6 +1125,7 @@
         },
         "addresses": {
           "type": "array",
+          "maxItems": 16,
           "items": {
             "type": "string"
           }
@@ -1230,6 +1231,7 @@
         },
         "portals": {
           "type": "array",
+          "maxItems": 16,
           "items": {
             "type": "string"
           }

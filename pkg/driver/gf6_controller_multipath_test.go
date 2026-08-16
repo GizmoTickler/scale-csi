@@ -62,6 +62,10 @@ func addGF6ISCSIPortals(client *truenas.MockClient) {
 	}
 }
 
+func markGF6DefaultInitiatorOwned(client *truenas.MockClient) {
+	client.ISCSIInitiators[1].Comment = iscsiOwnedAllowAllInitiatorComment
+}
+
 func gf6ISCSINodeID(t *testing.T) string {
 	t.Helper()
 	nodeID, err := encodeNodeIdentity(NodeIdentity{
@@ -84,6 +88,7 @@ func TestISCSIMultipathCreateAndExistingPublishConvergeEveryPortal(t *testing.T)
 	ctx := context.Background()
 	client := truenas.NewMockClient()
 	addGF6ISCSIPortals(client)
+	markGF6DefaultInitiatorOwned(client)
 	d := newGF6ControllerDriver(t, client, ShareTypeISCSI)
 
 	// Provision in the pre-GF6 shape, then enable multipath. Publish must repair
@@ -115,10 +120,32 @@ func TestISCSIMultipathCreateAndExistingPublishConvergeEveryPortal(t *testing.T)
 	}
 }
 
+func TestISCSIMultipathDoesNotAdvertiseFromPreExistingOperatorTemplate(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	addGF6ISCSIPortals(client)
+	d := newGF6ControllerDriver(t, client, ShareTypeISCSI)
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("gf6-operator-template", "iscsi"))
+	require.NoError(t, err)
+	d.config.ISCSI.Multipath = true
+	d.config.ISCSI.Portals = []string{"192.0.2.11"}
+
+	response, err := d.ControllerPublishVolume(ctx, iscsiPublishRequest("gf6-operator-template", gf6ISCSINodeID(t)))
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), "operator-scoped and legacy allow-all groups are not replicated")
+
+	target, err := client.ISCSITargetGet(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, target.Groups, 1)
+	assert.Equal(t, 1, target.Groups[0].Portal)
+}
+
 func TestISCSIPublishAssociationFailureNeverAdvertisesPortals(t *testing.T) {
 	ctx := context.Background()
 	client := &iscsiTargetUpdateFailMock{MockClient: truenas.NewMockClient()}
 	addGF6ISCSIPortals(client.MockClient)
+	markGF6DefaultInitiatorOwned(client.MockClient)
 	d := newGF6ControllerDriver(t, client, ShareTypeISCSI)
 	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("gf6-association-failure", "iscsi"))
 	require.NoError(t, err)
@@ -136,6 +163,7 @@ func TestISCSIPublishReloadFailureNeverAdvertisesPortals(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
 	addGF6ISCSIPortals(client)
+	markGF6DefaultInitiatorOwned(client)
 	d := newGF6ControllerDriver(t, client, ShareTypeISCSI)
 	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("gf6-reload-failure", "iscsi"))
 	require.NoError(t, err)
@@ -151,6 +179,40 @@ func TestISCSIPublishReloadFailureNeverAdvertisesPortals(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, response)
 	assert.Contains(t, err.Error(), "failed to reload iSCSI service after multipath portal convergence")
+}
+
+func TestISCSIMultipathReplicatesOnlyCSIOwnedTargetGroupTemplate(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	addGF6ISCSIPortals(client)
+	operatorGroup, err := client.ISCSIInitiatorCreate(ctx, "operator scoped to storage VLAN A")
+	require.NoError(t, err)
+	ownedGroup, err := client.ISCSIInitiatorCreate(ctx, iscsiOwnedAllowAllInitiatorComment)
+	require.NoError(t, err)
+	target := &truenas.ISCSITarget{
+		ID: 991, Name: "gf6-owned-template", Mode: "ISCSI",
+		Groups: []truenas.ISCSITargetGroup{
+			{Portal: 1, Initiator: 0, AuthMethod: "NONE"},
+			{Portal: 1, Initiator: operatorGroup.ID, AuthMethod: "NONE"},
+			{Portal: 1, Initiator: ownedGroup.ID, AuthMethod: "NONE"},
+		},
+	}
+	client.ISCSITargets[target.ID] = target
+	d := newGF6ControllerDriver(t, client, ShareTypeISCSI)
+	d.config.ISCSI.Multipath = true
+	d.config.ISCSI.Portals = []string{"192.0.2.11"}
+
+	updated, err := d.convergeISCSIMultipathTargetGroups(ctx, target)
+	require.NoError(t, err)
+	assert.Contains(t, updated.Groups, truenas.ISCSITargetGroup{
+		Portal: 2, Initiator: ownedGroup.ID, AuthMethod: "NONE",
+	})
+	assert.NotContains(t, updated.Groups, truenas.ISCSITargetGroup{
+		Portal: 2, Initiator: 0, AuthMethod: "NONE",
+	}, "legacy allow-all templates must never be widened onto another portal")
+	assert.NotContains(t, updated.Groups, truenas.ISCSITargetGroup{
+		Portal: 2, Initiator: operatorGroup.ID, AuthMethod: "NONE",
+	}, "operator-scoped templates must remain on their original portal")
 }
 
 func TestISCSIFencingIsIdenticalAcrossEveryPortal(t *testing.T) {

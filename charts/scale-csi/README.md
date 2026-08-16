@@ -192,7 +192,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nfs.server` | NFS share host; falls back to `truenas.host` | `""` |
 | `nfs.nconnect` | TCP connections per server address (`1..16`); unset omits the mount option | `null` |
 | `nfs.trunking` | Opt into NFSv4.1+ multi-address session trunking | `false` |
-| `nfs.addresses` | Additional NFS server IP literals; required with trunking | `[]` |
+| `nfs.addresses` | Up to 16 additional NFS server IP literals; required with trunking, with the effective set including the primary capped at 16 | `[]` |
 | `nfs.shareAllowedNetworks` | CIDRs allowed to mount created shares | `[]` |
 | `nfs.shareMaprootUser` | NFS maproot user | `root` |
 | `nfs.shareMaprootGroup` | NFS maproot group | `wheel` |
@@ -202,7 +202,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `iscsi.portal` | Target portal host; falls back to `truenas.host` | `""` |
 | `iscsi.portalPort` | Target portal port | `3260` |
 | `iscsi.multipath` | Associate and log in through every configured portal, then stage the dm-multipath WWID map | `false` |
-| `iscsi.portals` | Additional iSCSI portal IP literals; required with multipath | `[]` |
+| `iscsi.portals` | Up to 16 additional iSCSI portal IP literals; required with multipath | `[]` |
 | `iscsi.targetGroups` | Static portal/initiator groups for `off`/`additive`; when empty, the portal is resolved and fenced modes create a per-volume initiator group | `[]` |
 | `iscsi.extentBlocksize` | Extent block size | `512` |
 | `iscsi.extentDisablePhysicalBlocksize` | Disable extent physical-block-size reporting | `false` |
@@ -232,8 +232,11 @@ not a chart or driver ConfigMap setting. The removed `iscsi.basename` and
 
 iSCSI multipath is opt-in. TrueNAS portal objects/listen addresses must already
 exist; the controller creates or repairs each volume target's association with
-their portal groups and applies the same fencing initiator/auth policy to every
-one. The node logs into all advertised portals and stages the dm-multipath map
+their portal groups using only CSI-owned initiator/auth templates. Legacy
+null/zero allow-all groups and operator-scoped groups remain on their original
+portal and are never cross-copied; publish fails closed if another portal has no
+existing association and no CSI-owned template is available. The node logs into
+all advertised portals and stages the dm-multipath map
 identified by the LUN's WWID. If device-mapper or `multipathd` is unavailable,
 it emits `ISCSIMultipathUnavailable` and safely uses only the primary portal.
 This is deliberately unlike NVMe's native kernel multipath. See the production

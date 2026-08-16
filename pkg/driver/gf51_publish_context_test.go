@@ -137,6 +137,7 @@ func TestControllerPublishVolumeNVMeoFExistingAssociationFailureDoesNotAdvertise
 type gf51NodeStageCalls struct {
 	legacyURIs    []string
 	multipathURIs []string
+	events        <-chan string
 }
 
 func runGF51NodeStage(t *testing.T, primaryAddress string, volumeContext, publishContext map[string]string) gf51NodeStageCalls {
@@ -158,7 +159,8 @@ func runGF51NodeStage(t *testing.T, primaryAddress string, volumeContext, publis
 	const nqn = "nqn.2014-08.org.nvmexpress:uuid:gf51-stage"
 	nodeGetNVMeInfo = func(string) (string, error) { return nqn, nil }
 	nodeListNVMeSubsystems = func(context.Context) ([]util.NVMeSubsystem, error) { return nil, nil }
-	calls := gf51NodeStageCalls{}
+	recorder := record.NewFakeRecorder(4)
+	calls := gf51NodeStageCalls{events: recorder.Events}
 	nvmeConnectWithSubsystems = func(_ context.Context, gotNQN, uri string, _ *util.NVMeoFConnectOptions, _ []util.NVMeSubsystem) (string, error) {
 		assert.Equal(t, nqn, gotNQN)
 		calls.legacyURIs = append(calls.legacyURIs, uri)
@@ -181,7 +183,9 @@ func runGF51NodeStage(t *testing.T, primaryAddress string, volumeContext, publis
 	for key, value := range volumeContext {
 		requestVolumeContext[key] = value
 	}
-	_, err := newTestNodeDriver(ShareTypeNVMeoF).NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+	d := newTestNodeDriver(ShareTypeNVMeoF)
+	d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+	_, err := d.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "gf51-stage-volume",
 		StagingTargetPath: filepath.Join(t.TempDir(), "stage"),
 		VolumeContext:     requestVolumeContext,
@@ -238,6 +242,21 @@ func TestNodeStageVolumeWithoutEitherAddressesHintUsesLegacySinglePath(t *testin
 	assert.Equal(t, []string{"tcp://192.0.2.60:4420"}, calls.legacyURIs)
 	assert.Empty(t, calls.multipathURIs,
 		"the no-hint request must stay on the byte-identical legacy connect entry point")
+}
+
+func TestEmptyNVMeoFPublishHintWinsAndDegradesToSinglePath(t *testing.T) {
+	calls := runGF51NodeStage(t, "192.0.2.62", map[string]string{
+		"addresses": `["192.0.2.62","192.0.2.63"]`,
+	}, map[string]string{"addresses": ""})
+	assert.Equal(t, []string{"tcp://192.0.2.62:4420"}, calls.legacyURIs)
+	assert.Empty(t, calls.multipathURIs)
+	select {
+	case event := <-calls.events:
+		assert.Contains(t, event, "Warning "+EventReasonNVMePathDegraded)
+		assert.Contains(t, event, "single-address fallback")
+	default:
+		t.Fatal("empty winning NVMe-oF publish hint must be observably degraded")
+	}
 }
 
 func TestMalformedPublishContextWinsAndRemainsObservable(t *testing.T) {

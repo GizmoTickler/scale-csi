@@ -21,17 +21,21 @@ func installGF6ISCSINodeSeams(t *testing.T) {
 	originalConnect := iscsiConnectWithSessions
 	originalPrerequisites := nodeCheckISCSIMultipathHost
 	originalWWID := nodeGetSCSIWWID
+	originalMapWWID := nodeGetISCSIMultipathWWID
 	originalFindMap := nodeFindISCSIMultipath
 	originalOwnership := nodeCheckISCSIMultipath
 	originalDisconnect := nodeISCSIDisconnect
+	originalStagedDevice := nodeStagedDevicePath
 	t.Cleanup(func() {
 		listISCSISessions = originalList
 		iscsiConnectWithSessions = originalConnect
 		nodeCheckISCSIMultipathHost = originalPrerequisites
 		nodeGetSCSIWWID = originalWWID
+		nodeGetISCSIMultipathWWID = originalMapWWID
 		nodeFindISCSIMultipath = originalFindMap
 		nodeCheckISCSIMultipath = originalOwnership
 		nodeISCSIDisconnect = originalDisconnect
+		nodeStagedDevicePath = originalStagedDevice
 	})
 	listISCSISessions = func() ([]util.ISCSISessionInfo, error) { return nil, nil }
 	nodeCheckISCSIMultipathHost = func() error { return nil }
@@ -156,6 +160,104 @@ func TestStageISCSIWithoutHintPreservesLegacySinglePortalPath(t *testing.T) {
 	assert.Equal(t, []string{"192.0.2.30:3260"}, connected)
 }
 
+func TestEmptyISCSIPublishHintWinsAndDegradesToSinglePath(t *testing.T) {
+	installGF6ISCSINodeSeams(t)
+	var connected []string
+	iscsiConnectWithSessions = func(_ context.Context, portal, _ string, _ int, _ *util.ISCSIConnectOptions, _ []util.ISCSISessionInfo) (string, error) {
+		connected = append(connected, portal)
+		return "/dev/null", nil
+	}
+	recorder := record.NewFakeRecorder(1)
+	d := newTestNodeDriver(ShareTypeISCSI)
+	d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+	volumeContext := map[string]string{
+		"portal":  "192.0.2.32:3260",
+		"portals": `["192.0.2.32:3260","192.0.2.33:3260"]`,
+		"iqn":     "iqn.2005-10.org.freenas.ctl:pvc-empty-publish-iscsi",
+		"lun":     "0",
+	}
+	selected := publishHintStageContext(volumeContext, map[string]string{"portals": ""}, "portals")
+
+	require.NoError(t, d.stageISCSIVolume(context.Background(), selected, nil,
+		filepath.Join(t.TempDir(), "stage"), gf6ISCSIBlockCapability(), PVRef("gf6-empty-iscsi")))
+	assert.Equal(t, []string{"192.0.2.32:3260"}, connected)
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, "Warning "+EventReasonISCSIPathDegraded)
+		assert.Contains(t, event, "using the primary portal only")
+	default:
+		t.Fatal("empty winning iSCSI publish hint must be observably degraded")
+	}
+}
+
+func TestConvergeExistingISCSIPathsRefusesRawStagedDeviceWithoutAddingSessions(t *testing.T) {
+	installGF6ISCSINodeSeams(t)
+	nodeStagedDevicePath = func(string) (string, bool) { return "/dev/sda", true }
+	nodeGetISCSIMultipathWWID = func(string) (string, error) { return "", errors.New("raw component") }
+	listISCSISessions = func() ([]util.ISCSISessionInfo, error) {
+		t.Fatal("raw-stage refusal must happen before listing or adding sessions")
+		return nil, nil
+	}
+	iscsiConnectWithSessions = func(context.Context, string, string, int, *util.ISCSIConnectOptions, []util.ISCSISessionInfo) (string, error) {
+		t.Fatal("raw-stage refusal must not connect a secondary session")
+		return "", nil
+	}
+	recorder := record.NewFakeRecorder(1)
+	d := newTestNodeDriver(ShareTypeISCSI)
+	d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+	d.convergeExistingISCSIPaths(context.Background(), map[string]string{
+		"portal":  "192.0.2.34:3260",
+		"portals": `["192.0.2.34:3260","192.0.2.35:3260"]`,
+		"iqn":     "iqn.2005-10.org.freenas.ctl:pvc-raw-restage",
+		"lun":     "0",
+	}, nil, "/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/staging/gf6-raw", PVRef("gf6-raw-restage"))
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, "Warning "+EventReasonISCSIMultipathUnavailable)
+		assert.Contains(t, event, "full unstage/restage")
+	default:
+		t.Fatal("raw-stage refusal must be observable")
+	}
+}
+
+func TestConvergeExistingISCSIPathsTopsUpExistingDMMap(t *testing.T) {
+	installGF6ISCSINodeSeams(t)
+	const wwid = "36001405a123456789abcdef000000035"
+	nodeStagedDevicePath = func(string) (string, bool) { return "/dev/dm-5", true }
+	mapWWIDCalls := 0
+	nodeGetISCSIMultipathWWID = func(devicePath string) (string, error) {
+		mapWWIDCalls++
+		assert.Equal(t, "/dev/dm-5", devicePath)
+		return wwid, nil
+	}
+	nodeFindISCSIMultipath = func(gotWWID string) (string, error) {
+		assert.Equal(t, wwid, gotWWID)
+		return "/dev/dm-5", nil
+	}
+	nodeGetSCSIWWID = func(string) (string, error) { return wwid, nil }
+	const iqn = "iqn.2005-10.org.freenas.ctl:pvc-dm-restage"
+	listISCSISessions = func() ([]util.ISCSISessionInfo, error) {
+		return []util.ISCSISessionInfo{{Portal: "192.0.2.36:3260", IQN: iqn, SessionID: "36"}}, nil
+	}
+	var connected []string
+	iscsiConnectWithSessions = func(_ context.Context, portal, _ string, _ int, _ *util.ISCSIConnectOptions, _ []util.ISCSISessionInfo) (string, error) {
+		connected = append(connected, portal)
+		if portal == "192.0.2.36:3260" {
+			return "/dev/sda", nil
+		}
+		return "/dev/sdb", nil
+	}
+	d := newTestNodeDriver(ShareTypeISCSI)
+	d.convergeExistingISCSIPaths(context.Background(), map[string]string{
+		"portal":  "192.0.2.36:3260",
+		"portals": `["192.0.2.36:3260","192.0.2.37:3260"]`,
+		"iqn":     iqn,
+		"lun":     "0",
+	}, nil, "/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/staging/gf6-dm")
+	assert.Equal(t, 1, mapWWIDCalls)
+	assert.Equal(t, []string{"192.0.2.36:3260", "192.0.2.37:3260"}, connected)
+}
+
 func TestNodeStageISCSIPreExistingPVUsesPublishContextPortals(t *testing.T) {
 	installGF6ISCSINodeSeams(t)
 	originalInfo := getISCSIInfoFromDeviceWithSessions
@@ -270,6 +372,57 @@ func TestNodeStageNFSPreExistingPVUsesPublishContextAddresses(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"192.0.2.80:/pool/pre-existing", "192.0.2.81:/pool/pre-existing"}, sources)
 	assert.Equal(t, [][]string{{"hard", "max_connect=2"}, {"hard", "max_connect=2"}}, flags)
+}
+
+func TestEmptyNFSPublishHintWinsAndDegradesToSinglePath(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt")
+	originalMount := nodeMountNFS
+	t.Cleanup(func() { nodeMountNFS = originalMount })
+	var sources []string
+	nodeMountNFS = func(_ context.Context, source, _ string, _ []string) error {
+		sources = append(sources, source)
+		return nil
+	}
+	recorder := record.NewFakeRecorder(1)
+	d := newTestNodeDriver(ShareTypeNFS)
+	d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+	volumeContext := map[string]string{
+		"server":    "192.0.2.82",
+		"share":     "/pool/empty-publish",
+		"addresses": `["192.0.2.82","192.0.2.83"]`,
+	}
+	selected := publishHintStageContext(volumeContext, map[string]string{"addresses": ""}, "addresses")
+
+	require.NoError(t, d.stageNFSVolume(context.Background(), selected, filepath.Join(t.TempDir(), "stage"),
+		&csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}}},
+		PVRef("gf6-empty-nfs")))
+	assert.Equal(t, []string{"192.0.2.82:/pool/empty-publish"}, sources)
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, "Warning "+EventReasonNFSTrunkingDegraded)
+		assert.Contains(t, event, "primary server only")
+	default:
+		t.Fatal("empty winning NFS publish hint must be observably degraded")
+	}
+}
+
+func TestStageNFSLegacyIPv6SourceUsesBrackets(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt")
+	originalMount := nodeMountNFS
+	t.Cleanup(func() { nodeMountNFS = originalMount })
+	var source string
+	nodeMountNFS = func(_ context.Context, gotSource, _ string, _ []string) error {
+		source = gotSource
+		return nil
+	}
+	d := newTestNodeDriver(ShareTypeNFS)
+	require.NoError(t, d.stageNFSVolume(context.Background(), map[string]string{
+		"server": "2001:db8::84",
+		"share":  "/pool/legacy-ipv6",
+	}, filepath.Join(t.TempDir(), "stage"), &csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+	}))
+	assert.Equal(t, "[2001:db8::84]:/pool/legacy-ipv6", source)
 }
 
 func TestStageNFSTrunkingOptionFailureRetriesUntrunkedPrimary(t *testing.T) {

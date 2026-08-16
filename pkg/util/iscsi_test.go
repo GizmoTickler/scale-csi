@@ -3,6 +3,7 @@ package util
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,6 +84,112 @@ func TestISCSIEnsureNodeRecordAlreadyExistsIsSuccess(t *testing.T) {
 	require.Equal(t, [][]string{
 		{"-m", "node", "-o", "new", "-T", iqn, "-p", portal},
 	}, calls)
+}
+
+func TestISCSIConnectReusesPortlessConfiguredSession(t *testing.T) {
+	portal := "192.0.2.13"
+	iqn := "iqn.2005-10.org.freenas.ctl:pvc-portless-reuse"
+	var calls [][]string
+	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
+		calls = append(calls, slices.Clone(args))
+		return nil, nil
+	})
+
+	devicePath, err := ISCSIConnectWithOptionsAndSessions(context.Background(), portal, iqn, 0, nil, []ISCSISessionInfo{{
+		Portal: "192.0.2.13:3260", IQN: iqn, SessionID: "13",
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, "/dev/test-iscsi", devicePath)
+	assert.Empty(t, calls, "a portless configured portal must reuse the canonical iscsiadm session")
+}
+
+func TestISCSIConnectDetectsStalePortlessConfiguredSession(t *testing.T) {
+	portal := "192.0.2.14"
+	iqn := "iqn.2005-10.org.freenas.ctl:pvc-portless-stale"
+	originalRunner := iscsiAdmCombinedOutput
+	originalWait := waitForISCSIDeviceFn
+	originalDisconnect := iscsiDisconnectForConnect
+	originalList := listISCSISessionsForDevice
+	t.Cleanup(func() {
+		iscsiAdmCombinedOutput = originalRunner
+		waitForISCSIDeviceFn = originalWait
+		iscsiDisconnectForConnect = originalDisconnect
+		listISCSISessionsForDevice = originalList
+	})
+	iscsiAdmCombinedOutput = func(context.Context, ...string) ([]byte, error) { return nil, nil }
+	waitCalls := 0
+	waitForISCSIDeviceFn = func(string, string, int, time.Duration) (string, error) {
+		waitCalls++
+		if waitCalls == 1 {
+			return "", errors.New("stale device")
+		}
+		return "/dev/test-iscsi", nil
+	}
+	var disconnected []string
+	iscsiDisconnectForConnect = func(gotPortal, gotIQN string) error {
+		assert.Equal(t, iqn, gotIQN)
+		disconnected = append(disconnected, gotPortal)
+		return nil
+	}
+	listISCSISessionsForDevice = func() ([]ISCSISessionInfo, error) { return nil, nil }
+
+	devicePath, err := ISCSIConnectWithOptionsAndSessions(context.Background(), portal, iqn, 0,
+		&ISCSIConnectOptions{SessionCleanupDelay: time.Nanosecond},
+		[]ISCSISessionInfo{{Portal: "192.0.2.14:3260", IQN: iqn, SessionID: "14"}})
+	require.NoError(t, err)
+	assert.Equal(t, "/dev/test-iscsi", devicePath)
+	assert.Equal(t, []string{portal}, disconnected)
+	assert.Equal(t, 2, waitCalls, "the stale session must be rejected before the fresh login/device wait")
+}
+
+func TestWaitForISCSIDeviceFallsBackWhenPortalSessionDoesNotMatch(t *testing.T) {
+	originalList := listISCSISessionsForDevice
+	originalPortalFind := findISCSIDeviceForPortal
+	originalFallback := findISCSIDeviceFallback
+	t.Cleanup(func() {
+		listISCSISessionsForDevice = originalList
+		findISCSIDeviceForPortal = originalPortalFind
+		findISCSIDeviceFallback = originalFallback
+	})
+	const iqn = "iqn.2005-10.org.freenas.ctl:pvc-legacy-portals"
+	listISCSISessionsForDevice = func() ([]ISCSISessionInfo, error) {
+		return []ISCSISessionInfo{{Portal: "192.0.2.15:3260", IQN: iqn, SessionID: "15"}}, nil
+	}
+	findISCSIDeviceForPortal = func(portal, gotIQN string, lun int, sessions []ISCSISessionInfo) (string, error) {
+		return "", fmt.Errorf("%w for %s", errISCSIPortalSessionNotFound, portal)
+	}
+	findISCSIDeviceFallback = func(gotIQN string, lun int) (string, error) {
+		assert.Equal(t, iqn, gotIQN)
+		assert.Zero(t, lun)
+		return "/dev/test-iscsi", nil
+	}
+
+	for _, portal := range []string{"192.0.2.15", "truenas.example.com:3260"} {
+		devicePath, err := waitForISCSIDevice(portal, iqn, 0, 20*time.Millisecond)
+		require.NoError(t, err, portal)
+		assert.Equal(t, "/dev/test-iscsi", devicePath, portal)
+	}
+}
+
+func TestWaitForISCSIDeviceRefreshesSessionListAtBoundedCadence(t *testing.T) {
+	originalList := listISCSISessionsForDevice
+	originalPortalFind := findISCSIDeviceForPortal
+	t.Cleanup(func() {
+		listISCSISessionsForDevice = originalList
+		findISCSIDeviceForPortal = originalPortalFind
+	})
+	listCalls := 0
+	listISCSISessionsForDevice = func() ([]ISCSISessionInfo, error) {
+		listCalls++
+		return []ISCSISessionInfo{{Portal: "192.0.2.16:3260", IQN: "iqn.test", SessionID: "16"}}, nil
+	}
+	findISCSIDeviceForPortal = func(string, string, int, []ISCSISessionInfo) (string, error) {
+		return "", errors.New("matching session device not ready")
+	}
+
+	_, err := waitForISCSIDevice("192.0.2.16:3260", "iqn.test", 0, 260*time.Millisecond)
+	require.Error(t, err)
+	assert.Equal(t, 1, listCalls, "device polling must not fork iscsiadm on every 100ms iteration")
 }
 
 func stubISCSIConnectDependencies(
@@ -722,11 +829,22 @@ func TestFindISCSIDeviceForPortalSelectsExactSession(t *testing.T) {
 		{Portal: "192.0.2.11:3260", IQN: iqn, SessionID: "12"},
 	}
 
-	devicePath, err := findISCSIDeviceForPortalFromSessionsInPaths(
-		"192.0.2.11:3260", iqn, 0, sessions, sysClassRoot, devRoot,
-	)
-	require.NoError(t, err)
-	assert.Equal(t, filepath.Join(devRoot, "sdb"), devicePath)
+	for _, test := range []struct {
+		name   string
+		portal string
+		want   string
+	}{
+		{name: "canonical", portal: "192.0.2.11:3260", want: "sdb"},
+		{name: "legacy portless", portal: "192.0.2.10", want: "sda"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			devicePath, err := findISCSIDeviceForPortalFromSessionsInPaths(
+				test.portal, iqn, 0, sessions, sysClassRoot, devRoot,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, filepath.Join(devRoot, test.want), devicePath)
+		})
+	}
 }
 
 func TestFindISCSIMultipathDeviceAndResolveSessionFromFakeSysfs(t *testing.T) {
@@ -764,6 +882,25 @@ func TestFindISCSIMultipathDeviceAndResolveSessionFromFakeSysfs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "192.0.2.10:3260", portal)
 	assert.Equal(t, iqn, resolvedIQN)
+}
+
+func TestGetISCSIMultipathWWIDFromFakeSysfs(t *testing.T) {
+	sysBlockRoot := filepath.Join(t.TempDir(), "sys", "block")
+	dmRoot := filepath.Join(sysBlockRoot, "dm-4", "dm")
+	require.NoError(t, os.MkdirAll(dmRoot, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "uuid"), []byte("mpath-36001405a123456789abcdef000000004\n"), 0o600))
+
+	wwid, err := getISCSIMultipathWWIDInPaths("/dev/dm-4", sysBlockRoot)
+	require.NoError(t, err)
+	assert.Equal(t, "36001405a123456789abcdef000000004", wwid)
+
+	_, err = getISCSIMultipathWWIDInPaths("/dev/sda", sysBlockRoot)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a dm-multipath map")
+}
+
+func TestNormalizeSCSIWWIDTranslatesT10Spaces(t *testing.T) {
+	assert.Equal(t, "1ATA_____TrueNAS_Disk_01", normalizeSCSIWWID("t10.ATA     TrueNAS Disk 01"))
 }
 
 func TestCheckISCSIMultipathPrerequisites(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +32,16 @@ var iscsiAdmCombinedOutput = func(ctx context.Context, args ...string) ([]byte, 
 }
 
 var waitForISCSIDeviceFn = waitForISCSIDevice
+
+// These seams keep the polling and stale-session paths deterministic in unit
+// tests. Production always uses the real session list, sysfs lookup, and
+// disconnect implementations.
+var (
+	listISCSISessionsForDevice = ListISCSISessions
+	findISCSIDeviceForPortal   = findISCSIDeviceForPortalFromSessions
+	findISCSIDeviceFallback    = findISCSIDevice
+	iscsiDisconnectForConnect  = ISCSIDisconnect
+)
 
 // getPortalMutex returns a mutex for the given portal, creating one if needed.
 func getPortalMutex(portal string) *sync.Mutex {
@@ -110,6 +121,11 @@ const DefaultISCSIDeviceTimeout = 60 * time.Second
 // margin while avoiding a long delay when the session is stale.
 const staleSessionValidationTimeout = 2 * time.Second
 
+// Device sysfs is cheap to poll, but iscsiadm forks a process for every session
+// list. Refresh the session-to-portal snapshot at this slower cadence while
+// continuing to look for the device at the low-latency poll interval below.
+const iscsiSessionListRefreshInterval = time.Second
+
 // ISCSIConnectOptions holds options for iSCSI connection.
 type ISCSIConnectOptions struct {
 	DeviceTimeout       time.Duration // Timeout for waiting for device to appear (default: 60s)
@@ -175,13 +191,13 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 
 	// Check if already logged in - validate session before reuse
 	for _, session := range sessions {
-		if session.IQN != iqn || session.Portal != portal {
+		if session.IQN != iqn || !sameISCSIPortal(session.Portal, portal) {
 			continue
 		}
 		klog.Infof("Found existing session for %s, validating... (elapsed: %v)", iqn, time.Since(start))
 		// Try to get device with a short timeout to validate session is healthy
 		// If device appears quickly, session is valid and can be reused
-		devicePath, waitErr := waitForISCSIDevice(portal, iqn, lun, staleSessionValidationTimeout)
+		devicePath, waitErr := waitForISCSIDeviceFn(portal, iqn, lun, staleSessionValidationTimeout)
 		if waitErr == nil {
 			klog.Infof("ISCSIConnect completed (session reuse) in %v", time.Since(start))
 			return devicePath, nil
@@ -189,7 +205,7 @@ func ISCSIConnectWithOptionsAndSessions(ctx context.Context, portal, iqn string,
 		// Session exists but device didn't appear - session is likely stale
 		// Disconnect it and proceed with fresh discovery/login
 		klog.Warningf("Existing session for %s appears stale (device not found in %v), disconnecting", iqn, staleSessionValidationTimeout)
-		if disconnectErr := ISCSIDisconnect(portal, iqn); disconnectErr != nil {
+		if disconnectErr := iscsiDisconnectForConnect(portal, iqn); disconnectErr != nil {
 			klog.Warningf("Failed to disconnect stale session %s: %v (proceeding anyway)", iqn, disconnectErr)
 		}
 		// Do not let the pre-disconnect snapshot suppress the login below.
@@ -471,7 +487,7 @@ func iscsiLoginSerializedWithSessions(ctx context.Context, portal, iqn string, s
 func iscsiLoginWithSessions(ctx context.Context, portal, iqn string, sessions []ISCSISessionInfo) error {
 	// Check if already logged in
 	for _, session := range sessions {
-		if session.IQN == iqn && session.Portal == portal {
+		if session.IQN == iqn && sameISCSIPortal(session.Portal, portal) {
 			klog.V(4).Infof("Already logged in to target %s through %s", iqn, portal)
 			return nil
 		}
@@ -543,15 +559,23 @@ func waitForISCSIDevice(portal, iqn string, lun int, timeout time.Duration) (str
 	start := time.Now()
 	pollInterval := 50 * time.Millisecond
 	maxPollInterval := 100 * time.Millisecond
+	var sessions []ISCSISessionInfo
+	var listErr error
+	var nextSessionRefresh time.Time
 
 	for {
-		sessions, listErr := ListISCSISessions()
-		devicePath, err := findISCSIDeviceForPortalFromSessions(portal, iqn, lun, sessions)
-		if listErr != nil {
+		now := time.Now()
+		if nextSessionRefresh.IsZero() || !now.Before(nextSessionRefresh) {
+			sessions, listErr = listISCSISessionsForDevice()
+			nextSessionRefresh = now.Add(iscsiSessionListRefreshInterval)
+		}
+		devicePath, err := findISCSIDeviceForPortal(portal, iqn, lun, sessions)
+		if listErr != nil || errors.Is(err, errISCSIPortalSessionNotFound) {
 			// Preserve the historical sysfs-only fallback when iscsiadm cannot list
-			// sessions. Multipath callers still use the portal-specific result when
-			// the session list is healthy.
-			devicePath, err = findISCSIDevice(iqn, lun)
+			// sessions or reports a resolved IP that cannot equal a configured
+			// hostname. A matched portal session whose device is still absent never
+			// falls back: multipath callers must not borrow another portal's path.
+			devicePath, err = findISCSIDeviceFallback(iqn, lun)
 		}
 		if err == nil && devicePath != "" {
 			return devicePath, nil
@@ -578,24 +602,46 @@ func findISCSIDeviceForPortalFromSessions(portal, iqn string, lun int, sessions 
 	return findISCSIDeviceForPortalFromSessionsInPaths(portal, iqn, lun, sessions, "/sys/class", "/dev")
 }
 
+var errISCSIPortalSessionNotFound = errors.New("iSCSI portal session not found")
+
 func findISCSIDeviceForPortalFromSessionsInPaths(portal, iqn string, lun int, sessions []ISCSISessionInfo, sysClassRoot, devRoot string) (string, error) {
 	for _, session := range sessions {
-		if session.Portal != portal || session.IQN != iqn {
+		if !sameISCSIPortal(session.Portal, portal) || session.IQN != iqn {
 			continue
 		}
 		return findDeviceForSessionInPaths("session"+session.SessionID, lun, sysClassRoot, devRoot)
 	}
-	return "", fmt.Errorf("device not found for portal=%s, iqn=%s, lun=%d", portal, iqn, lun)
+	return "", fmt.Errorf("%w for portal=%s, iqn=%s, lun=%d", errISCSIPortalSessionNotFound, portal, iqn, lun)
+}
+
+// sameISCSIPortal canonicalizes the legacy portless form for comparisons with
+// iscsiadm, which reports IP:port. It intentionally performs no DNS lookup:
+// hostname-backed sessions can resolve to any of several addresses, so their
+// device wait uses the IQN/LUN sysfs fallback instead of guessing equivalence.
+func sameISCSIPortal(left, right string) bool {
+	return canonicalISCSIPortalForComparison(left) == canonicalISCSIPortalForComparison(right)
+}
+
+func canonicalISCSIPortalForComparison(portal string) string {
+	portal = strings.TrimSpace(portal)
+	host, port, err := net.SplitHostPort(portal)
+	if err == nil {
+		return net.JoinHostPort(strings.ToLower(host), port)
+	}
+	if ip := net.ParseIP(strings.Trim(portal, "[]")); ip != nil {
+		return net.JoinHostPort(ip.String(), "3260")
+	}
+	return strings.ToLower(portal)
 }
 
 func waitForISCSISessionCleanup(ctx context.Context, portal, iqn string, timeout time.Duration) error {
 	return pollForISCSISessionCleanup(ctx, timeout, func() (bool, error) {
-		sessions, err := ListISCSISessions()
+		sessions, err := listISCSISessionsForDevice()
 		if err != nil {
 			return true, err
 		}
 		for _, session := range sessions {
-			if session.Portal == portal && session.IQN == iqn {
+			if sameISCSIPortal(session.Portal, portal) && session.IQN == iqn {
 				return true, nil
 			}
 		}
@@ -757,6 +803,33 @@ func checkISCSIMultipathPrerequisites(devRoot string, sockets []string) error {
 // correct even if an operator has not yet adopted user_friendly_names no.
 func FindISCSIMultipathDevice(wwid string) (string, error) {
 	return findISCSIMultipathDeviceInPaths(wwid, "/sys/block", "/dev")
+}
+
+// GetISCSIMultipathWWID returns the dm-multipath WWID only when devicePath is
+// the dm head. Component SCSI paths deliberately fail this check so callers can
+// refuse to create a new map underneath a live raw-device stage.
+func GetISCSIMultipathWWID(devicePath string) (string, error) {
+	return getISCSIMultipathWWIDInPaths(devicePath, "/sys/block")
+}
+
+func getISCSIMultipathWWIDInPaths(devicePath, sysBlockRoot string) (string, error) {
+	if resolved, err := filepath.EvalSymlinks(devicePath); err == nil {
+		devicePath = resolved
+	}
+	deviceName := filepath.Base(devicePath)
+	if !strings.HasPrefix(deviceName, "dm-") {
+		return "", fmt.Errorf("device %s is not a dm-multipath map", devicePath)
+	}
+	uuid, err := os.ReadFile(filepath.Join(sysBlockRoot, deviceName, "dm", "uuid"))
+	if err != nil {
+		return "", fmt.Errorf("read dm UUID for %s: %w", devicePath, err)
+	}
+	const prefix = "mpath-"
+	normalized := strings.TrimSpace(string(uuid))
+	if !strings.HasPrefix(normalized, prefix) || len(normalized) == len(prefix) {
+		return "", fmt.Errorf("device %s is not a dm-multipath map", devicePath)
+	}
+	return normalizeSCSIWWID(strings.TrimPrefix(normalized, prefix)), nil
 }
 
 func findISCSIMultipathDeviceInPaths(wwid, sysBlockRoot, devRoot string) (string, error) {
@@ -1053,7 +1126,11 @@ func normalizeSCSIWWID(wwid string) string {
 		"t10.": "1",
 	} {
 		if strings.HasPrefix(strings.ToLower(wwid), prefix) {
-			return designator + wwid[len(prefix):]
+			normalized := designator + wwid[len(prefix):]
+			if prefix == "t10." {
+				normalized = strings.ReplaceAll(normalized, " ", "_")
+			}
+			return normalized
 		}
 	}
 	return wwid
@@ -1298,7 +1375,7 @@ func FindISCSISessionByIQNFromSessions(iqn string, sessions []ISCSISessionInfo) 
 func removeISCSISessionByPortalIQN(sessions []ISCSISessionInfo, portal, iqn string) []ISCSISessionInfo {
 	filtered := make([]ISCSISessionInfo, 0, len(sessions))
 	for _, session := range sessions {
-		if session.IQN != iqn || session.Portal != portal {
+		if session.IQN != iqn || !sameISCSIPortal(session.Portal, portal) {
 			filtered = append(filtered, session)
 		}
 	}

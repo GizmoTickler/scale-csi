@@ -193,17 +193,34 @@ defaults {
 }
 ```
 
-The controller replicates the complete initiator/CHAP template across every
+The controller replicates only CSI-owned initiator/CHAP templates across every
 configured portal. That is security-critical: an SCST portal association without
-the dynamic fencing group would bypass the volume allowlist. On stage the first
-advertised portal is mandatory and later portals are best effort. The node uses
-the SCSI WWID to wait for the dm map and stages that map, never a component path.
+the dynamic fencing group would bypass the volume allowlist. Legacy target groups
+whose initiator ID is null/zero and operator-scoped initiator groups remain on
+their original portals; they are preserved but never cross-copied. If those are
+the only templates and another configured portal has no association, publish
+fails closed until the operator explicitly associates that portal or a CSI-owned
+template exists. On stage the first advertised portal is mandatory and later
+portals are best effort. The node uses the SCSI WWID to wait for the dm map and
+stages that map, never a component path.
 If the dm prerequisites are absent it does not create secondary sessions: it
 logs, emits `ISCSIMultipathUnavailable`, and stages through the primary portal.
 Partial secondary failures emit `ISCSIPathDegraded` and increment
 `scale_csi_iscsi_path_connect_total{portal,result}`. Unstage logs out every
 session for the IQN but deliberately never flushes the dm map; multipathd owns
 map lifetime and another staged consumer may still hold it.
+
+An idempotent `NodeStageVolume` replay never constructs a new dm map underneath
+an already-live raw `/dev/sdX` filesystem or block symlink. Existing-path top-up
+runs only when the staged device is already the dm map for the LUN's WWID. A raw
+legacy stage remains safely single-path, emits `ISCSIMultipathUnavailable`, and
+requires a full unstage/restage before it can adopt dm-multipath; the refusal
+happens before any secondary session is created.
+
+With `iscsi.multipath=false`, the standing single-path holder guard remains in
+force: if `multipathd` has independently claimed the returned `/dev/sdX` through
+a `dm-*` holder, the driver refuses to stage that raw component path. Disabling
+the GF-6 multipath flow therefore does not permit bypassing an existing dm map.
 
 ### NFS connection parallelism and trunking
 

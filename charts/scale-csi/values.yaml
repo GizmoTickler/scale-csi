@@ -470,7 +470,8 @@ nfs:
   # negotiated NFS version or server/client support is insufficient.
   trunking: false
   # Additional server IP literals. `server` is always first; duplicates are
-  # collapsed. Must be non-empty when trunking=true.
+  # collapsed. Must be non-empty when trunking=true and contain at most 16 raw
+  # entries; the driver also caps the de-duplicated set including `server` at 16.
   addresses: []
 
   # Networks allowed to mount dynamically-created shares. An empty list allows
@@ -564,7 +565,10 @@ iscsi:
   # intentionally different from NVMe's native kernel multipath.
   multipath: false
   # Additional portal IP literals. `portal` plus `portalPort` is always first;
-  # duplicates are collapsed. Must be non-empty when multipath=true.
+  # duplicates are collapsed. Must be non-empty when multipath=true and contain
+  # at most 16 entries. Operator-scoped/legacy allow-all target groups are not
+  # replicated onto these portals; configure every intended association or use
+  # a CSI-owned initiator template.
   portals: []
 
   # Explicit TrueNAS portal/initiator group associations for created targets

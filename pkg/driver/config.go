@@ -330,7 +330,9 @@ type ISCSIConfig struct {
 	// Enabled enables iSCSI provisioning for StorageClasses that select iSCSI.
 	Enabled bool `yaml:"enabled"`
 
-	// TargetPortal is the iSCSI target portal (host:port)
+	// TargetPortal is the canonical iSCSI target portal (host:port). Config load
+	// adds the default 3260 port to legacy portless IP and hostname values. DNS
+	// names are normalized syntactically but deliberately not resolved at load.
 	TargetPortal string `yaml:"targetPortal"`
 
 	// TargetPortals is the retired pre-GF6 additional-portal key.
@@ -1338,6 +1340,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.NFS.NConnect != nil && (*cfg.NFS.NConnect < 1 || *cfg.NFS.NConnect > 16) {
 		return fmt.Errorf("nfs.nconnect must be between 1 and 16 (got %d)", *cfg.NFS.NConnect)
 	}
+	if len(cfg.NFS.Addresses) > 16 {
+		return fmt.Errorf("nfs.addresses must contain at most 16 entries (got %d)", len(cfg.NFS.Addresses))
+	}
 	if cfg.NFS.Trunking && len(cfg.NFS.Addresses) == 0 {
 		return fmt.Errorf("nfs.addresses must list at least one additional storage address when nfs.trunking is enabled")
 	}
@@ -1356,6 +1361,9 @@ func validateConfig(cfg *Config) error {
 		}
 		cfg.NFS.ShareHost = shareHost
 		cfg.NFS.Addresses = normalizedAddresses
+		if addressCount := len(cfg.NFS.trunkingAddresses()); addressCount > 16 {
+			return fmt.Errorf("nfs trunking supports at most 16 distinct transports including nfs.shareHost (got %d)", addressCount)
+		}
 	}
 	if err := validateNFSExportConfig(&cfg.NFS); err != nil {
 		return err
@@ -1363,13 +1371,23 @@ func validateConfig(cfg *Config) error {
 	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {
 		return fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
 	}
+	if cfg.ISCSI.TargetPortal != "" {
+		primary, portalErr := normalizeISCSITargetPortal(cfg.ISCSI.TargetPortal)
+		if portalErr != nil {
+			return fmt.Errorf("iscsi.targetPortal is invalid: %w", portalErr)
+		}
+		cfg.ISCSI.TargetPortal = primary
+	}
+	if len(cfg.ISCSI.Portals) > 16 {
+		return fmt.Errorf("iscsi.portals must contain at most 16 entries (got %d)", len(cfg.ISCSI.Portals))
+	}
 	if cfg.ISCSI.Multipath && len(cfg.ISCSI.Portals) == 0 {
 		return fmt.Errorf("iscsi.portals must list at least one additional storage address when iscsi.multipath is enabled")
 	}
 	if cfg.ISCSI.Multipath {
-		primary, portalErr := normalizeISCSITargetPortal(cfg.ISCSI.TargetPortal)
-		if portalErr != nil {
-			return fmt.Errorf("iscsi.targetPortal must contain an IP address when iscsi.multipath is enabled: %w", portalErr)
+		primaryHost, _, splitErr := net.SplitHostPort(cfg.ISCSI.TargetPortal)
+		if splitErr != nil || net.ParseIP(primaryHost) == nil {
+			return fmt.Errorf("iscsi.targetPortal must contain an IP address when iscsi.multipath is enabled")
 		}
 		normalizedPortals := make([]string, len(cfg.ISCSI.Portals))
 		for i, rawPortal := range cfg.ISCSI.Portals {
@@ -1379,7 +1397,6 @@ func validateConfig(cfg *Config) error {
 			}
 			normalizedPortals[i] = portal
 		}
-		cfg.ISCSI.TargetPortal = primary
 		cfg.ISCSI.Portals = normalizedPortals
 	}
 	if cfg.NVMeoF.Enabled {
@@ -1424,13 +1441,13 @@ func normalizeISCSITargetPortal(rawPortal string) (string, error) {
 	}
 	host, portText, err := net.SplitHostPort(rawPortal)
 	if err != nil {
-		address, addressErr := normalizeNVMeoFAddress(rawPortal)
-		if addressErr != nil {
-			return "", addressErr
+		normalizedHost, hostErr := normalizeISCSIHost(rawPortal)
+		if hostErr != nil {
+			return "", hostErr
 		}
-		return net.JoinHostPort(address, "3260"), nil
+		return net.JoinHostPort(normalizedHost, "3260"), nil
 	}
-	address, err := normalizeNVMeoFAddress(host)
+	host, err = normalizeISCSIHost(host)
 	if err != nil {
 		return "", err
 	}
@@ -1438,7 +1455,32 @@ func normalizeISCSITargetPortal(rawPortal string) (string, error) {
 	if err != nil || port < 1 || port > 65535 {
 		return "", fmt.Errorf("invalid port %q", portText)
 	}
-	return net.JoinHostPort(address, strconv.Itoa(port)), nil
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
+func normalizeISCSIHost(rawHost string) (string, error) {
+	if address, err := normalizeNVMeoFAddress(rawHost); err == nil {
+		return address, nil
+	}
+	if rawHost != strings.TrimSpace(rawHost) || rawHost == "" ||
+		strings.Contains(rawHost, "://") || strings.ContainsAny(rawHost, "[]/\\ \t\r\n:") {
+		return "", fmt.Errorf("invalid iSCSI host %q", rawHost)
+	}
+	host := strings.ToLower(strings.TrimSuffix(rawHost, "."))
+	if host == "" || len(host) > 253 {
+		return "", fmt.Errorf("invalid iSCSI hostname %q", rawHost)
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", fmt.Errorf("invalid iSCSI hostname %q", rawHost)
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return "", fmt.Errorf("invalid iSCSI hostname %q", rawHost)
+			}
+		}
+	}
+	return host, nil
 }
 
 // validateNFSExportConfig validates (and normalizes) the GLOBAL NFS export

@@ -558,6 +558,29 @@ iscsi:
 	}, cfg.ISCSI.multipathPortals())
 }
 
+func TestLoadConfigNormalizesLegacyISCSIPortalUnconditionally(t *testing.T) {
+	tests := []struct {
+		name   string
+		portal string
+		want   string
+	}{
+		{name: "portless IPv4", portal: "192.0.2.10", want: "192.0.2.10:3260"},
+		{name: "portless hostname", portal: "truenas.example.com", want: "truenas.example.com:3260"},
+		{name: "hostname with explicit port", portal: "TRUENAS.example.com:3261", want: "truenas.example.com:3261"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+iscsi:
+  enabled: true
+  targetPortal: %q
+`, test.portal))
+			require.NoError(t, err)
+			assert.Equal(t, test.want, cfg.ISCSI.TargetPortal)
+		})
+	}
+}
+
 func TestLoadConfigRejectsInvalidISCSIMultipathPortals(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -594,6 +617,49 @@ iscsi:
 `)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "iscsi.portals")
+}
+
+func TestLoadConfigBoundsNFSAddressesAndISCSIPortals(t *testing.T) {
+	nfsAddresses := make([]string, 17)
+	iscsiPortals := make([]string, 17)
+	for i := range nfsAddresses {
+		nfsAddresses[i] = fmt.Sprintf("192.0.2.%d", i+1)
+		iscsiPortals[i] = fmt.Sprintf("198.51.100.%d", i+1)
+	}
+
+	_, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+nfs:
+  enabled: true
+  shareHost: 203.0.113.1
+  addresses: [%s]
+`, strings.Join(nfsAddresses, ", ")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nfs.addresses must contain at most 16 entries")
+
+	_, err = loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+iscsi:
+  enabled: true
+  targetPortal: 203.0.113.2
+  portals: [%s]
+`, strings.Join(iscsiPortals, ", ")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "iscsi.portals must contain at most 16 entries")
+}
+
+func TestLoadConfigBoundsEffectiveNFSTrunkTransports(t *testing.T) {
+	addresses := make([]string, 16)
+	for i := range addresses {
+		addresses[i] = fmt.Sprintf("192.0.2.%d", i+1)
+	}
+	_, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+nfs:
+  enabled: true
+  shareHost: 203.0.113.1
+  trunking: true
+  addresses: [%s]
+`, strings.Join(addresses, ", ")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at most 16 distinct transports")
 }
 
 func TestLoadConfigNFSTransportKnobs(t *testing.T) {

@@ -8,13 +8,23 @@
   `ControllerPublishVolume` advertises the current portal set only after share
   and fencing convergence, so pre-existing volumes adopt it at their next full
   detach/attach. The node logs into the primary portal mandatorily and every
-  secondary best effort, resolves each LUN by exact portal/session rather than
-  the old IQN-first sysfs race, and stages the dm-multipath map by SCSI WWID.
+  secondary best effort, resolves each LUN by exact portal/session when a
+  matching session is available, and uses the legacy IQN/LUN sysfs lookup only
+  when `iscsiadm` cannot match the configured portal (including a hostname that
+  `iscsiadm` reports as its resolved IP). It stages the dm-multipath map by SCSI
+  WWID. Legacy portless `iscsi.targetPortal` values are now normalized to
+  `host:3260` even when multipath is off; hostnames are lower-cased and given a
+  default port but are deliberately not DNS-resolved during config load.
   Missing device-mapper/multipathd prerequisites degrade safely to one primary
   session; partial paths emit Events and
   `scale_csi_iscsi_path_connect_total`. Unstage logs out all IQN sessions and
   never flushes a possibly shared dm map. Strict/additive fencing applies the
-  identical SCST initiator/CHAP relationship on every portal.
+  identical CSI-owned SCST initiator/CHAP relationship on every portal. Legacy
+  null/zero-initiator allow-all groups and operator-scoped groups are preserved
+  on their original portals but are not replicated; publish fails closed when a
+  configured portal has neither an existing association nor a CSI-owned
+  template. Re-stage convergence also refuses to build a new dm map beneath an
+  already-live raw device and creates no secondary sessions on that refusal.
 - **NFS connection parallelism:** `nfs.nconnect` (`1..16`, default unset) adds
   `nconnect=N` without claiming path failover. `nfs.trunking` plus IP-literal
   `nfs.addresses` mounts the primary with `max_connect`, verifies the negotiated
@@ -28,9 +38,13 @@
 - **Compatibility and validation:** all knobs default off/unset and their
   ConfigMap keys are omitted. Enabled address lists accept IPv4/IPv6 literals,
   normalize brackets, de-duplicate, and fail startup when malformed or empty.
+  `nfs.addresses` and `iscsi.portals` are bounded to 16 entries in both config
+  validation and the Helm schema; the effective NFS transport set, including
+  the primary server, is also capped at the kernel's 16-transport limit.
   Mutable publish hints win over create-time hints; malformed winning hints
-  degrade observably to the legacy primary path. Helm schema and render tests
-  cover the same opt-in boundaries.
+  (including an explicitly empty string) degrade observably to the legacy
+  primary path for NVMe-oF, iSCSI, and NFS. Helm schema and render tests cover
+  the same opt-in boundaries.
 - **GF-5.1 closure:** an already-existing NVMe-oF publish now has a regression
   test proving a failed port association returns an error and advertises no
   addresses. Disabling NVMe multipath does not remove backend associations; a

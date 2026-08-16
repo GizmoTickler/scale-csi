@@ -109,12 +109,18 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 		// no reusable group AND a doomed create. Fencing's deliberate deny-all
 		// [] groups are excluded by their comment prefix, not by shape.
 		if len(g.Initiators) == 0 && !strings.HasPrefix(strings.TrimSpace(g.Comment), "scale-csi fencing:") {
+			// Multipath must never infer that an operator's allow-all group is a
+			// portable template and widen it onto every storage network. Use only
+			// the explicitly CSI-owned allow-all group in that mode.
+			if d.config.ISCSI.Multipath && strings.TrimSpace(g.Comment) != iscsiOwnedAllowAllInitiatorComment {
+				continue
+			}
 			initiatorID = g.ID
 			break
 		}
 	}
 	if initiatorID == 0 {
-		created, err := d.truenasClient.ISCSIInitiatorCreate(ctx, "scale-csi allow-all")
+		created, err := d.truenasClient.ISCSIInitiatorCreate(ctx, iscsiOwnedAllowAllInitiatorComment)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create allow-all iSCSI initiator group: %w", err)
 		}
