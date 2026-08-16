@@ -680,11 +680,12 @@ radius.
 | `v4.1-lowlat` | `nfsvers=4.1`, `nconnect=4`, `hard`, `noatime`, `ac` | Small random I/O (databases) |
 | `v3-compat` | `nfsvers=3`, `hard`, `noatime` | Apps that need v3 locking/semantics |
 
-`nconnect` opens N TCP connections behind ONE NFSv4.1 session (session
-trunking). It is purely client-side — no server state, no TrueNAS setting. Older
-kernels and NFSv3 ignore it silently, which is safe. The node logs a warning
-(and changes nothing) when it sees `nconnect` with `vers=3` or two conflicting
-`vers=` options.
+`nconnect` opens N TCP connections to one server address. It is a client mount
+policy — no TrueNAS setting — and applies independently of NFSv4.1
+distinct-address session trunking. Kernel support is still a node prerequisite;
+unsupported mount options fail at mount time rather than becoming a driver
+failover mechanism. The node warns (and changes nothing) when two conflicting
+`vers=` options are supplied.
 
 For NFS-over-RDMA the server needs `nfs.config.rdma` enabled and clients mount
 with `proto=rdma`. That is an advanced, out-of-default-scope profile.
@@ -917,7 +918,9 @@ spec:
       storage: 100Gi
 ```
 
-iSCSI is single-path; dm-multipath is unsupported. CHAP authentication is
+iSCSI defaults to a single portal. The deployment-level `iscsi.multipath` option
+can advertise and log in through multiple portals when host dm-multipath is
+prepared; it does not change this StorageClass API. CHAP authentication is
 supported (see [iSCSI CHAP](#iscsi-chap) below) but CHAP authenticates the
 session — it does not encrypt data in flight — so also protect TCP 3260 with
 node-only network policy outside Kubernetes (for example a storage VLAN and

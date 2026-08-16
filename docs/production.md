@@ -165,6 +165,79 @@ iSCSI; or `nvme-cli` and the `nvme_tcp`/`nvme_fabrics` modules for NVMe/TCP.
 The chart mounts the host device, sysfs, udev, kubelet, and iSCSI paths; it does
 not install host packages or load modules.
 
+### iSCSI multipath host prerequisites
+
+`iscsi.multipath` is an opt-in dm-multipath flow, not an imitation of NVMe's
+native multipath. Before enabling it:
+
+- Create the additional TrueNAS iSCSI portal objects/listen addresses. The
+  driver associates each volume target with matching portal groups; it does not
+  create appliance-wide portal objects.
+- Install and start `multipathd` plus device-mapper on every eligible node. The
+  node plugin requires host `/dev/mapper/control` and the multipathd control
+  socket. A distribution that excludes the NAS's SCST devices must also allow
+  those devices in its multipath configuration.
+- Use WWID-stable naming. The recommended defaults are
+  `user_friendly_names no` and `find_multipaths yes`. The driver resolves the
+  authoritative `mpath-<WWID>` dm UUID and therefore does not depend on a
+  friendly alias, but deterministic `/dev/mapper/<WWID>` names make operations
+  and incident response clearer.
+
+Example host configuration (merge with, rather than overwrite, distribution or
+hardware-specific device rules):
+
+```text
+defaults {
+    user_friendly_names no
+    find_multipaths yes
+}
+```
+
+The controller replicates the complete initiator/CHAP template across every
+configured portal. That is security-critical: an SCST portal association without
+the dynamic fencing group would bypass the volume allowlist. On stage the first
+advertised portal is mandatory and later portals are best effort. The node uses
+the SCSI WWID to wait for the dm map and stages that map, never a component path.
+If the dm prerequisites are absent it does not create secondary sessions: it
+logs, emits `ISCSIMultipathUnavailable`, and stages through the primary portal.
+Partial secondary failures emit `ISCSIPathDegraded` and increment
+`scale_csi_iscsi_path_connect_total{portal,result}`. Unstage logs out every
+session for the IQN but deliberately never flushes the dm map; multipathd owns
+map lifetime and another staged consumer may still hold it.
+
+### NFS connection parallelism and trunking
+
+`nfs.nconnect` (range `1..16`) adds exactly `nconnect=N` to the primary mount.
+It creates multiple TCP connections to one server address. It is not address
+failover: one IP still follows one L3 route unless the surrounding network (for
+example a layer3+4-hashed NAS bond) distributes those separate flows.
+
+`nfs.trunking` is different. The driver mounts the primary with
+`max_connect=<address-count>`, confirms that the live negotiated version is at
+least NFSv4.1, then briefly mounts the same export through each additional
+address. When client and server report one NFSv4.1 server identity, Linux adds
+those distinct-address transports to the shared client. `max_connect` entered
+upstream in [Linux 5.15](https://github.com/torvalds/linux/commit/7e134205f62955369619021a695cd78fefd32451);
+a vendor kernel may backport it, so verify the actual node kernel and
+`mount.nfs` behavior. The NFS server must also support v4.1+ session trunking
+and present the same server identity/export through every IP. The Linux
+[`nfs(5)` manual](https://man7.org/linux/man-pages/man5/nfs.5.html) distinguishes
+`nconnect` from `max_connect`; the kernel's
+[`fs_context.c`](https://github.com/torvalds/linux/blob/master/fs/nfs/fs_context.c)
+enforces their respective `1..16` ranges.
+
+If the client rejects the primary `max_connect` mount (including an older
+kernel with no such option), the driver emits `NFSTrunkingUnavailable` and
+retries the primary once without `max_connect`. A successful retry stays
+mounted and no additional addresses are probed.
+
+If the negotiated mount is v4.0/v3, its version cannot be inspected, or an
+additional-address mount fails, the primary mount remains successful. The node
+emits `NFSTrunkingUnavailable` or `NFSTrunkingDegraded`; probe outcomes increment
+`scale_csi_nfs_trunk_connect_total{address,result}`. `nconnect` and trunking can
+be used together: the former controls connections per address and the latter
+adds distinct server addresses. Neither is dm-multipath.
+
 ## Availability and outage behavior
 
 The default is `controller.replicas: 1`. Leader election is enabled on every
@@ -775,9 +848,10 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   limitations: rotated secrets take effect only before a fresh login (established
   sessions are not re-authenticated), and deleting a CHAP StorageClass leaves its
   shared `iscsi.auth` peer behind for the operator to reap.
-- Host dm-multipath ownership of TrueNAS iSCSI LUNs is unsupported. The node
-  service refuses to stage an iSCSI device with a `dm-*` sysfs holder instead
-  of formatting or mounting a raw component path.
+- iSCSI dm-multipath and NFS trunking now have unit/fake-sysfs coverage, but no
+  in-repository test proves a real multipathd/SCST or Linux NFS server data path.
+  Validate portal loss, path restoration, fencing, filesystem I/O, and unstage
+  on the exact node kernel and TrueNAS release before production rollout.
 - Foreign snapshots block `DeleteVolume` by default. Removing them or excluding
   the CSI parent from external snapshot tasks is required unless destructive
   cleanup is explicitly enabled with `zfs.destroyForeignSnapshotsOnDelete`.

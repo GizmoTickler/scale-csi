@@ -95,9 +95,10 @@ showmount --version
 <details>
 <summary><strong>iSCSI Client Setup</strong></summary>
 
-Block storage via iSCSI requires the initiator tools. scale-csi currently uses
-one portal and refuses devices claimed by dm-multipath; do not enable multipath
-for its LUNs.
+Block storage via iSCSI requires the initiator tools. Single-portal operation is
+the default. The optional multi-portal flow also requires host device-mapper and
+`multipathd`; see [production prerequisites](docs/production.md#iscsi-multipath-host-prerequisites)
+before enabling it.
 
 **Debian/Ubuntu:**
 ```bash
@@ -120,7 +121,8 @@ cat /etc/iscsi/initiatorname.iscsi  # Should show iqn.* identifier
 iSCSI CHAP is supported as a default-off, controller-wide feature gate
 (`iscsi.chap.enabled`) with per-StorageClass CSI provisioner and node-stage
 Secret refs. One-way and mutual session authentication are supported; discovery
-authentication and dm-multipath remain unsupported. CHAP authenticates the
+authentication remains unsupported. Optional dm-multipath is independent of
+CHAP and requires the host prerequisites linked above. CHAP authenticates the
 session but does not encrypt TCP 3260, so still restrict it to the Kubernetes
 nodes on a dedicated storage network (for example, a storage VLAN plus firewall
 or SGACL policy). See the

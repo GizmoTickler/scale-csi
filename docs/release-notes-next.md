@@ -1,5 +1,44 @@
 # Release notes — v1.6.0
 
+## GF-6 — iSCSI dm-multipath and NFS multi-transport mounts
+
+- **iSCSI multipath:** `iscsi.multipath` plus additional IP-literal
+  `iscsi.portals` converges every TrueNAS volume target onto the matching portal
+  groups. Create-time volume context remains for compatibility, while
+  `ControllerPublishVolume` advertises the current portal set only after share
+  and fencing convergence, so pre-existing volumes adopt it at their next full
+  detach/attach. The node logs into the primary portal mandatorily and every
+  secondary best effort, resolves each LUN by exact portal/session rather than
+  the old IQN-first sysfs race, and stages the dm-multipath map by SCSI WWID.
+  Missing device-mapper/multipathd prerequisites degrade safely to one primary
+  session; partial paths emit Events and
+  `scale_csi_iscsi_path_connect_total`. Unstage logs out all IQN sessions and
+  never flushes a possibly shared dm map. Strict/additive fencing applies the
+  identical SCST initiator/CHAP relationship on every portal.
+- **NFS connection parallelism:** `nfs.nconnect` (`1..16`, default unset) adds
+  `nconnect=N` without claiming path failover. `nfs.trunking` plus IP-literal
+  `nfs.addresses` mounts the primary with `max_connect`, verifies the negotiated
+  NFS version is at least 4.1, and probes the export through each additional IP
+  so Linux can join distinct-address transports for one server identity.
+  Upstream `max_connect` requires Linux 5.15+ (or a vendor backport) and server
+  support. A client that rejects `max_connect` retries the primary without it;
+  older negotiated versions and failed secondary probes keep the primary mount
+  live and emit `NFSTrunkingUnavailable`/
+  `NFSTrunkingDegraded` plus `scale_csi_nfs_trunk_connect_total`.
+- **Compatibility and validation:** all knobs default off/unset and their
+  ConfigMap keys are omitted. Enabled address lists accept IPv4/IPv6 literals,
+  normalize brackets, de-duplicate, and fail startup when malformed or empty.
+  Mutable publish hints win over create-time hints; malformed winning hints
+  degrade observably to the legacy primary path. Helm schema and render tests
+  cover the same opt-in boundaries.
+- **GF-5.1 closure:** an already-existing NVMe-oF publish now has a regression
+  test proving a failed port association returns an error and advertises no
+  addresses. Disabling NVMe multipath does not remove backend associations; a
+  pre-multipath PV returns to one path after detach/attach, while a PV created
+  with its immutable multipath hint needs deliberate PV recreation/context
+  migration. The empty-string publish-context edge remains an observable
+  primary-path fallback.
+
 ## v1.6.0 — GF-Sprint 1: per-volume encryption at rest
 
 One theme: **ZFS-native encryption at rest, opt-in per StorageClass, default
@@ -396,8 +435,8 @@ event text nor the docs report a mode the driver did not set.
 
 Version is a node-side mount option, not a share property: a class pins it with
 `mountOptions: [nfsvers=4.1]` and the driver passes the list through unchanged.
-The node side only **warns** (a conflicting second `vers=`, `nconnect` with v3)
-and rewrites nothing.
+The node side only **warns** about conflicting `vers=`/`nfsvers=` selections and
+rewrites nothing.
 
 `nfs.versionPreflight` (default off) validates a class's pinned major version
 against the appliance's global `nfs.config` protocols at `CreateVolume` and
