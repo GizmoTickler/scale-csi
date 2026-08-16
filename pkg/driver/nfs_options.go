@@ -624,12 +624,11 @@ func containsString(values []string, want string) bool {
 // ---------------------------------------------------------------------------
 
 // warnOnNFSMountFlagConflicts logs (and NEVER drops or rewrites) mount options
-// that are self-contradictory or silently ignored by the kernel. Rewriting a
+// that are self-contradictory. Rewriting a
 // user's mountOptions at stage time would be a surprising behavior change on
 // existing volumes; a log line is enough to explain a confusing mount.
 func warnOnNFSMountFlagConflicts(flags []string) {
 	versions := make([]string, 0, 2)
-	nconnect := ""
 	for _, flag := range flags {
 		key, value, found := strings.Cut(strings.TrimSpace(flag), "=")
 		if !found {
@@ -641,15 +640,10 @@ func warnOnNFSMountFlagConflicts(flags []string) {
 			if !containsString(versions, value) {
 				versions = append(versions, value)
 			}
-		case "nconnect":
-			nconnect = strings.TrimSpace(value)
 		}
 	}
 	if len(versions) > 1 {
 		klog.Warningf("NFS mountOptions request conflicting versions %v; the kernel applies the LAST one. Passing them through unchanged.", versions)
-	}
-	if nconnect != "" && len(versions) == 1 && strings.HasPrefix(versions[0], "3") {
-		klog.Warningf("NFS mountOptions set nconnect=%s with vers=%s; nconnect multi-connection transport is an NFSv4.1+ feature and is ignored on v3. Passing it through unchanged.", nconnect, versions[0])
 	}
 }
 

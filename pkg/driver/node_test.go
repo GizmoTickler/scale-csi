@@ -1589,7 +1589,7 @@ func TestStageISCSIVolumeRejectsMultipathOwnedDeviceBeforeMount(t *testing.T) {
 		return "/dev/sdz", nil
 	}
 	nodeCheckISCSIMultipath = func(devicePath string) error {
-		return errors.New("iSCSI device " + devicePath + " is claimed by dm-multipath; iSCSI multipath is unsupported")
+		return errors.New("iSCSI device " + devicePath + " is claimed by dm-multipath; staging the raw component path is unsafe")
 	}
 	formatCalls := 0
 	nodeFormatAndMount = func(context.Context, string, string, string, []string) error {

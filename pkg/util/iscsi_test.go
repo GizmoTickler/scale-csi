@@ -179,7 +179,7 @@ func TestCheckISCSIDeviceMultipathOwnership(t *testing.T) {
 
 	err := checkISCSIDeviceMultipathOwnership("/dev/sdb", sysBlockRoot)
 	require.Error(t, err)
-	assert.Equal(t, "iSCSI device /dev/sdb is claimed by dm-multipath; iSCSI multipath is unsupported", err.Error())
+	assert.Equal(t, "iSCSI device /dev/sdb is claimed by dm-multipath; staging the raw component path is unsafe", err.Error())
 
 	require.NoError(t, os.Remove(filepath.Join(holders, "dm-0")))
 	require.NoError(t, os.Mkdir(filepath.Join(holders, "md0"), 0o750))
@@ -697,6 +697,86 @@ func findSessionByIQN(sessions []ISCSISession, iqn string) bool {
 		}
 	}
 	return false
+}
+
+func TestFindISCSIDeviceForPortalSelectsExactSession(t *testing.T) {
+	root := t.TempDir()
+	sysClassRoot := filepath.Join(root, "sys", "class")
+	devRoot := filepath.Join(root, "dev")
+	iqn := "iqn.2005-10.org.freenas.ctl:pvc-multipath"
+	for _, fixture := range []struct {
+		sessionID string
+		host      string
+		device    string
+	}{
+		{sessionID: "11", host: "6", device: "sda"},
+		{sessionID: "12", host: "7", device: "sdb"},
+	} {
+		require.NoError(t, os.MkdirAll(filepath.Join(sysClassRoot, "iscsi_host", "host"+fixture.host, "device", "session"+fixture.sessionID), 0o750))
+		require.NoError(t, os.MkdirAll(filepath.Join(sysClassRoot, "scsi_device", fixture.host+":0:0:0", "device", "block", fixture.device), 0o750))
+		require.NoError(t, os.MkdirAll(devRoot, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(devRoot, fixture.device), nil, 0o600))
+	}
+	sessions := []ISCSISessionInfo{
+		{Portal: "192.0.2.10:3260", IQN: iqn, SessionID: "11"},
+		{Portal: "192.0.2.11:3260", IQN: iqn, SessionID: "12"},
+	}
+
+	devicePath, err := findISCSIDeviceForPortalFromSessionsInPaths(
+		"192.0.2.11:3260", iqn, 0, sessions, sysClassRoot, devRoot,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(devRoot, "sdb"), devicePath)
+}
+
+func TestFindISCSIMultipathDeviceAndResolveSessionFromFakeSysfs(t *testing.T) {
+	root := t.TempDir()
+	sysBlockRoot := filepath.Join(root, "sys", "block")
+	sessionRoot := filepath.Join(root, "sys", "class", "iscsi_session")
+	devRoot := filepath.Join(root, "dev")
+	wwid := "36001405a123456789abcdef000000001"
+	dmRoot := filepath.Join(sysBlockRoot, "dm-2")
+	require.NoError(t, os.MkdirAll(filepath.Join(dmRoot, "dm"), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(dmRoot, "slaves", "sda"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "dm", "uuid"), []byte("mpath-"+wwid+"\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "dm", "name"), []byte(wwid+"\n"), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(devRoot, "mapper"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "dm-2"), nil, 0o600))
+	require.NoError(t, os.Symlink("../dm-2", filepath.Join(devRoot, "mapper", wwid)))
+	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "sda"), nil, 0o600))
+
+	topology := filepath.Join(root, "devices", "host6", "session11", "target6:0:0", "6:0:0:0")
+	require.NoError(t, os.MkdirAll(topology, 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(sysBlockRoot, "sda"), 0o750))
+	require.NoError(t, os.Symlink(topology, filepath.Join(sysBlockRoot, "sda", "device")))
+	require.NoError(t, os.MkdirAll(filepath.Join(sessionRoot, "session11"), 0o750))
+	iqn := "iqn.2005-10.org.freenas.ctl:pvc-dm"
+	require.NoError(t, os.WriteFile(filepath.Join(sessionRoot, "session11", "targetname"), []byte(iqn+"\n"), 0o600))
+
+	dmDevice, err := findISCSIMultipathDeviceInPaths("naa.6001405a123456789abcdef000000001", sysBlockRoot, devRoot)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(devRoot, "mapper", wwid), dmDevice)
+
+	portal, resolvedIQN, err := getISCSIInfoFromDeviceWithSessionsInPaths(dmDevice, []ISCSISessionInfo{
+		{Portal: "192.0.2.99:3260", IQN: iqn, SessionID: "10"},
+		{Portal: "192.0.2.10:3260", IQN: iqn, SessionID: "11"},
+	}, sysBlockRoot, sessionRoot, devRoot)
+	require.NoError(t, err)
+	assert.Equal(t, "192.0.2.10:3260", portal)
+	assert.Equal(t, iqn, resolvedIQN)
+}
+
+func TestCheckISCSIMultipathPrerequisites(t *testing.T) {
+	root := t.TempDir()
+	devRoot := filepath.Join(root, "dev")
+	socket := filepath.Join(root, "run", "multipathd.sock")
+	require.Error(t, checkISCSIMultipathPrerequisites(devRoot, []string{socket}))
+	require.NoError(t, os.MkdirAll(filepath.Join(devRoot, "mapper"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "mapper", "control"), nil, 0o600))
+	require.Error(t, checkISCSIMultipathPrerequisites(devRoot, []string{socket}))
+	require.NoError(t, os.MkdirAll(filepath.Dir(socket), 0o750))
+	require.NoError(t, os.WriteFile(socket, nil, 0o600))
+	require.NoError(t, checkISCSIMultipathPrerequisites(devRoot, []string{socket}))
 }
 
 // TestIsLikelyISCSIDevice tests the iSCSI device detection heuristic.

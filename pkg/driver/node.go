@@ -25,26 +25,31 @@ import (
 )
 
 var (
-	nodeStatsSysfsRoot         = "/sys"
-	nodeGetNVMeInfo            = util.GetNVMeInfoFromDevice
-	nodeNVMeDisconnect         = util.NVMeoFDisconnectWithContext
-	nodeListNVMeSubsystems     = util.ListNVMeSubsystems
-	nodeSetNVMeIOPolicy        = util.SetNVMeSubsystemIOPolicy
-	nodeNVMeSubsystemSysfsRoot = "/sys/class/nvme-subsystem"
-	nodeGetISCSIInfo           = util.GetISCSIInfoFromDevice
-	nodeISCSIDisconnect        = util.ISCSIDisconnect
-	nodeGetDeviceSize          = util.GetDeviceSize
-	nodeResizeFilesystem       = util.ResizeFilesystemWithContext
-	nodeFormatAndMount         = util.FormatAndMountWithContext
-	nodeIsMounted              = util.IsMounted
-	nodeGetMountInfo           = util.GetMountInfo
-	nodeListMountInfo          = util.ListMountInfo
-	nodeCheckISCSIMultipath    = util.CheckISCSIDeviceMultipathOwnership
-	nodeISCSIRescan            = util.ISCSIRescanSessionWithContext
-	nodeNVMeRescan             = util.NVMeRescanWithContext
-	nodeDeviceSizePollTimeout  = 5 * time.Second
-	nodeDeviceSizePollInterval = 200 * time.Millisecond
-	nodeStatsStat              = func(path string) (uint32, uint64, error) {
+	nodeStatsSysfsRoot          = "/sys"
+	nodeGetNVMeInfo             = util.GetNVMeInfoFromDevice
+	nodeNVMeDisconnect          = util.NVMeoFDisconnectWithContext
+	nodeListNVMeSubsystems      = util.ListNVMeSubsystems
+	nodeSetNVMeIOPolicy         = util.SetNVMeSubsystemIOPolicy
+	nodeNVMeSubsystemSysfsRoot  = "/sys/class/nvme-subsystem"
+	nodeGetISCSIInfo            = util.GetISCSIInfoFromDevice
+	nodeISCSIDisconnect         = util.ISCSIDisconnect
+	nodeGetSCSIWWID             = util.GetSCSIWWID
+	nodeFindISCSIMultipath      = util.FindISCSIMultipathDevice
+	nodeCheckISCSIMultipathHost = util.CheckISCSIMultipathPrerequisites
+	nodeGetDeviceSize           = util.GetDeviceSize
+	nodeResizeFilesystem        = util.ResizeFilesystemWithContext
+	nodeFormatAndMount          = util.FormatAndMountWithContext
+	nodeIsMounted               = util.IsMounted
+	nodeGetMountInfo            = util.GetMountInfo
+	nodeListMountInfo           = util.ListMountInfo
+	nodeMountNFS                = util.MountNFSWithContext
+	nodeUnmount                 = util.UnmountWithContext
+	nodeCheckISCSIMultipath     = util.CheckISCSIDeviceMultipathOwnership
+	nodeISCSIRescan             = util.ISCSIRescanSessionWithContext
+	nodeNVMeRescan              = util.NVMeRescanWithContext
+	nodeDeviceSizePollTimeout   = 5 * time.Second
+	nodeDeviceSizePollInterval  = 200 * time.Millisecond
+	nodeStatsStat               = func(path string) (uint32, uint64, error) {
 		var stat unix.Stat_t
 		if err := unix.Stat(path, &stat); err != nil {
 			return 0, 0, err
@@ -59,7 +64,14 @@ var (
 // remaining top-up shares this total budget.
 const nvmeSecondaryPathConvergeBudget = 5 * time.Second
 
+// dm-multipath creates one map after at least two SCSI paths become visible.
+// Secondary iSCSI logins share this budget so an unavailable storage VLAN does
+// not multiply the full configured device timeout.
+const iscsiSecondaryPathConvergeBudget = 5 * time.Second
+
 const invalidNVMeMultipathAddressMetricLabel = "invalid-publish-context"
+const invalidISCSIMultipathPortalMetricLabel = "invalid-publish-context"
+const invalidNFSTrunkingAddressMetricLabel = "invalid-publish-context"
 
 type nodeAccessType string
 
@@ -204,7 +216,7 @@ func stageSourceIdentity(shareType ShareType, volumeContext map[string]string) (
 		if server == "" || share == "" {
 			return "", status.Error(codes.InvalidArgument, "NFS server and share are required in volume context")
 		}
-		return normalizeMountSource(fmt.Sprintf("%s:%s", server, share)), nil
+		return normalizeMountSource(nfsSource(server, share)), nil
 	case ShareTypeISCSI:
 		if volumeContext["iqn"] == "" {
 			return "", status.Error(codes.InvalidArgument, "iSCSI IQN is required in volume context")
@@ -386,7 +398,7 @@ func (d *Driver) expectedPublicationSource(req *csi.NodePublishVolumeRequest, ca
 	if server == "" || share == "" {
 		return "", status.Error(codes.InvalidArgument, "NFS server and share are required in volume context")
 	}
-	return normalizeMountSource(fmt.Sprintf("%s:%s", server, share)), nil
+	return normalizeMountSource(nfsSource(server, share)), nil
 }
 
 func (d *Driver) validateExistingPublication(req *csi.NodePublishVolumeRequest, capability nodeCapabilitySignature, expectedSource string) error {
@@ -622,9 +634,14 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 
 	// Get attach driver from volume context and normalize.
 	attachDriver := d.nodeAttachDriver(volumeContext)
-	nvmeoFContext := volumeContext
-	if attachDriver == ShareTypeNVMeoF {
-		nvmeoFContext = nvmeoFStageContext(volumeContext, req.GetPublishContext())
+	stageContext := volumeContext
+	switch attachDriver {
+	case ShareTypeNFS:
+		stageContext = publishHintStageContext(volumeContext, req.GetPublishContext(), "addresses")
+	case ShareTypeISCSI:
+		stageContext = publishHintStageContext(volumeContext, req.GetPublishContext(), "portals")
+	case ShareTypeNVMeoF:
+		stageContext = publishHintStageContext(volumeContext, req.GetPublishContext(), "addresses")
 	}
 	capability, err := nodeCapabilityForRequest(req.GetVolumeCapability())
 	if err != nil {
@@ -638,8 +655,14 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		if existingErr != nil {
 			return nil, existingErr
 		}
-		if attachDriver == ShareTypeNVMeoF {
-			d.convergeExistingNVMeoFPaths(ctx, nvmeoFContext, nodeVolumeEventRef(volumeContext, volumeID, d.nodeID))
+		eventObject := nodeVolumeEventRef(volumeContext, volumeID, d.nodeID)
+		switch attachDriver {
+		case ShareTypeNFS:
+			d.convergeExistingNFSTrunks(ctx, stageContext, stagingPath, req.GetVolumeCapability(), eventObject)
+		case ShareTypeISCSI:
+			d.convergeExistingISCSIPaths(ctx, stageContext, req.GetSecrets(), eventObject)
+		case ShareTypeNVMeoF:
+			d.convergeExistingNVMeoFPaths(ctx, stageContext, eventObject)
 		}
 		klog.Infof("Volume %s is already staged compatibly at %s", volumeID, stagingPath)
 		return &csi.NodeStageVolumeResponse{}, nil
@@ -661,15 +684,15 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 
 	switch attachDriver {
 	case ShareTypeNFS:
-		if err := d.stageNFSVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+		if err := d.stageNFSVolume(ctx, stageContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	case ShareTypeISCSI:
-		if err := d.stageISCSIVolume(ctx, volumeContext, req.GetSecrets(), stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+		if err := d.stageISCSIVolume(ctx, stageContext, req.GetSecrets(), stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	case ShareTypeNVMeoF:
-		if err := d.stageNVMeoFVolume(ctx, nvmeoFContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+		if err := d.stageNVMeoFVolume(ctx, stageContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	default:
@@ -699,14 +722,12 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-// nvmeoFStageContext overlays only the attach-scoped multipath hint onto the
-// immutable PV volume context. Presence in PublishContext wins even when the
-// value is malformed or empty: the existing parser then applies the same
-// observable lenient single-path fallback to the source that won. Returning the
-// original map when the publish hint is absent preserves old-controller and
-// legacy single-path behavior exactly.
-func nvmeoFStageContext(volumeContext, publishContext map[string]string) map[string]string {
-	rawAddresses, present := publishContext["addresses"]
+// publishHintStageContext overlays one attach-scoped path hint onto the
+// immutable PV context. Presence in PublishContext wins even for malformed or
+// empty values so the protocol parser can make its observable safe fallback.
+// Returning the original map when absent preserves older-controller behavior.
+func publishHintStageContext(volumeContext, publishContext map[string]string, key string) map[string]string {
+	rawHint, present := publishContext[key]
 	if !present {
 		return volumeContext
 	}
@@ -714,8 +735,12 @@ func nvmeoFStageContext(volumeContext, publishContext map[string]string) map[str
 	for key, value := range volumeContext {
 		merged[key] = value
 	}
-	merged["addresses"] = rawAddresses
+	merged[key] = rawHint
 	return merged
+}
+
+func nvmeoFStageContext(volumeContext, publishContext map[string]string) map[string]string {
+	return publishHintStageContext(volumeContext, publishContext, "addresses")
 }
 
 // NodeUnstageVolume unmounts a volume from the staging path.
@@ -738,6 +763,8 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		return nil, status.Error(codes.Aborted, "operation already in progress")
 	}
 	defer d.releaseOperationLock(lockKey)
+
+	cleanupNFSTrunkProbeMounts(ctx, stagingPath)
 
 	// Get device path before unmounting (for session cleanup)
 	// For block mode volumes, stagingPath is a symlink to the device, not a mount point
@@ -821,14 +848,12 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 			}
 		} else {
 			// Try iSCSI cleanup
-			portal, iqn, iscsiErr := nodeGetISCSIInfo(devicePath)
+			_, iqn, iscsiErr := nodeGetISCSIInfo(devicePath)
 			if iscsiErr == nil {
-				if discErr := nodeISCSIDisconnect(portal, iqn); discErr != nil {
-					klog.Warningf("Failed to disconnect iSCSI session %s: %v", iqn, discErr)
-				} else {
-					klog.Infof("Disconnected iSCSI session %s", iqn)
-					primaryDisconnectSucceeded = true
-				}
+				// A dm-multipath device can have several sessions for one IQN.
+				// Logout every session, but never flush the dm map here: another
+				// staged consumer may still hold it and multipathd owns map lifetime.
+				primaryDisconnectSucceeded = disconnectAllISCSISessionsForIQN(iqn)
 			} else {
 				klog.V(4).Infof("Could not get iSCSI info from device %s: %v", devicePath, iscsiErr)
 			}
@@ -860,18 +885,24 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID string, attachDriver ShareType) {
 	switch attachDriver {
 	case ShareTypeISCSI:
-		portal := d.config.ISCSI.TargetPortal
 		targetName := d.iscsiShareName(volumeID)
-		iqn, err := util.FindISCSISessionByTargetName(targetName)
-		if err != nil {
-			klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s): %v", volumeID, targetName, err)
-		} else if iqn != "" {
-			klog.Infof("Found orphaned iSCSI session for volume %s: %s", volumeID, iqn)
-			if disconnectErr := util.ISCSIDisconnect(portal, iqn); disconnectErr != nil {
-				klog.Warningf("Failed to disconnect orphaned iSCSI session %s: %v", iqn, disconnectErr)
-			} else {
-				klog.Infof("Successfully cleaned up orphaned iSCSI session %s", iqn)
+		sessions, listErr := listISCSISessions()
+		if listErr != nil {
+			klog.V(4).Infof("Cannot list active iSCSI sessions for volume %s: %v", volumeID, listErr)
+			return
+		}
+		expectedSuffix := ":" + targetName
+		foundIQNs := make(map[string]struct{})
+		for _, session := range sessions {
+			if strings.HasSuffix(session.IQN, expectedSuffix) {
+				foundIQNs[session.IQN] = struct{}{}
 			}
+		}
+		if len(foundIQNs) == 0 {
+			klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s)", volumeID, targetName)
+		}
+		for iqn := range foundIQNs {
+			disconnectAllISCSISessionsForIQNWithSnapshot(iqn, sessions)
 		}
 
 	case ShareTypeNVMeoF:
@@ -888,6 +919,38 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 			}
 		}
 	}
+}
+
+func disconnectAllISCSISessionsForIQN(iqn string) bool {
+	sessions, listErr := listISCSISessions()
+	if listErr != nil {
+		klog.Warningf("Failed to list iSCSI sessions before logout of %s: %v", iqn, listErr)
+		return false
+	}
+	return disconnectAllISCSISessionsForIQNWithSnapshot(iqn, sessions)
+}
+
+func disconnectAllISCSISessionsForIQNWithSnapshot(iqn string, sessions []util.ISCSISessionInfo) bool {
+	found := false
+	allSucceeded := true
+	seenPortals := make(map[string]struct{})
+	for _, session := range sessions {
+		if session.IQN != iqn {
+			continue
+		}
+		if _, duplicate := seenPortals[session.Portal]; duplicate {
+			continue
+		}
+		seenPortals[session.Portal] = struct{}{}
+		found = true
+		if disconnectErr := nodeISCSIDisconnect(session.Portal, iqn); disconnectErr != nil {
+			allSucceeded = false
+			klog.Warningf("Failed to disconnect iSCSI session %s through %s: %v", iqn, session.Portal, disconnectErr)
+		} else {
+			klog.Infof("Disconnected iSCSI session %s through %s", iqn, session.Portal)
+		}
+	}
+	return found && allSucceeded
 }
 
 func (d *Driver) nodeAttachDriver(volumeContext map[string]string) ShareType {
@@ -1027,13 +1090,20 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 
 		switch attachDriver {
 		case ShareTypeNFS:
-			server := volumeContext["server"]
-			share := volumeContext["share"]
-			source := fmt.Sprintf("%s:%s", server, share)
-			if err := util.MountNFSWithContext(ctx, source, targetPath, mountOptions); err != nil {
-				operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
-				d.recordWarningEvent(eventObject, EventReasonNFSMountFailed, operationErr.Error())
-				return nil, operationErr
+			nfsContext := publishHintStageContext(volumeContext, req.GetPublishContext(), "addresses")
+			directCapability := req.GetVolumeCapability()
+			if directCapability != nil && directCapability.GetMount() != nil {
+				mount := directCapability.GetMount()
+				directCapability = &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{
+						FsType:     mount.GetFsType(),
+						MountFlags: mountOptions,
+					}},
+					AccessMode: directCapability.GetAccessMode(),
+				}
+			}
+			if mountErr := d.stageNFSVolume(ctx, nfsContext, targetPath, directCapability, eventObject); mountErr != nil {
+				return nil, mountErr
 			}
 		default:
 			return nil, status.Error(codes.InvalidArgument, "staging path required for block volumes")
@@ -1043,6 +1113,25 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	d.rememberPublication(req, capability, expectedSource)
 	klog.Infof("Volume %s published successfully at %s", volumeID, targetPath)
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+func cleanupNFSTrunkProbeMounts(ctx context.Context, stagingPath string) {
+	probePaths, globErr := filepath.Glob(stagingPath + ".scale-csi-nfs-trunk-*")
+	if globErr != nil {
+		return
+	}
+	for _, probePath := range probePaths {
+		mounted, mountErr := nodeIsMounted(probePath)
+		if mountErr == nil && mounted {
+			if unmountErr := nodeUnmount(ctx, probePath); unmountErr != nil {
+				klog.Warningf("Failed to clean NFS trunk probe mount %s: %v", probePath, unmountErr)
+				continue
+			}
+		}
+		if removeErr := os.Remove(probePath); removeErr != nil && !os.IsNotExist(removeErr) {
+			klog.V(4).Infof("Failed to remove NFS trunk probe path %s: %v", probePath, removeErr)
+		}
+	}
 }
 
 // NodeUnpublishVolume unmounts a volume from the target path.
@@ -1465,7 +1554,19 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 		return status.Error(codes.InvalidArgument, "NFS server and share are required in volume context")
 	}
 
+	addresses, hintPresent, addressErr := parseNFSTrunkingAddresses(volumeContext)
+	if addressErr != nil {
+		message := fmt.Sprintf("NFS trunking address list for %s was discarded; using the primary server only: %v", share, addressErr)
+		klog.Warning(message)
+		RecordNFSTrunkConnect(invalidNFSTrunkingAddressMetricLabel, "error")
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSTrunkingDegraded, message)
+		addresses = nil
+	}
+	trunkingActive := hintPresent && len(addresses) > 1
 	source := fmt.Sprintf("%s:%s", server, share)
+	if trunkingActive {
+		source = nfsSource(addresses[0], share)
+	}
 
 	// Check if already mounted
 	mounted, err := util.IsMounted(stagingPath)
@@ -1473,20 +1574,184 @@ func (d *Driver) stageNFSVolume(ctx context.Context, volumeContext map[string]st
 		return status.Errorf(codes.Internal, "failed to check mount status: %v", err)
 	}
 	if mounted {
+		if trunkingActive {
+			d.convergeNFSTrunks(ctx, addresses, share, stagingPath, configuredNFSMountFlags(d.config.NFS.NConnect, len(addresses), volCap), eventObjects...)
+		}
 		klog.Infof("NFS already mounted at %s", stagingPath)
 		return nil
 	}
 
 	// Mount NFS
-	if err := util.MountNFSWithContext(ctx, source, stagingPath, nfsMountFlags(volCap)); err != nil {
+	mountFlags := configuredNFSMountFlags(d.config.NFS.NConnect, len(addresses), volCap)
+	mountErr := nodeMountNFS(ctx, source, stagingPath, mountFlags)
+	if mountErr != nil && trunkingActive {
+		// Linux before max_connect support rejects the option before any NFS
+		// version is negotiated. Retry once without the trunking-only option so
+		// an optional availability feature cannot brick the primary mount.
+		fallbackFlags := configuredNFSMountFlags(d.config.NFS.NConnect, 0, volCap)
+		fallbackErr := nodeMountNFS(ctx, nfsSource(server, share), stagingPath, fallbackFlags)
+		if fallbackErr == nil {
+			message := fmt.Sprintf("NFS trunking options are unavailable for %s; the primary mount succeeded without max_connect: %v", share, mountErr)
+			klog.Warning(message)
+			d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSTrunkingUnavailable, message)
+			RecordNodeConnect("nfs", "success")
+			return nil
+		}
+		mountErr = fmt.Errorf("trunking mount failed: %w; untrunked primary fallback failed: %w", mountErr, fallbackErr)
+	}
+	if mountErr != nil {
 		RecordNodeConnect("nfs", "error")
-		operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", err)
+		operationErr := status.Errorf(codes.Internal, "failed to mount NFS: %v", mountErr)
 		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSMountFailed, operationErr.Error())
 		return operationErr
 	}
 	RecordNodeConnect("nfs", "success")
+	if trunkingActive {
+		d.convergeNFSTrunks(ctx, addresses, share, stagingPath, mountFlags, eventObjects...)
+	}
 
 	return nil
+}
+
+func configuredNFSMountFlags(nconnect *int, trunkAddressCount int, volCap *csi.VolumeCapability) []string {
+	flags := nfsMountFlags(volCap)
+	if nconnect == nil && trunkAddressCount < 2 {
+		return flags
+	}
+	configured := make([]string, 0, len(flags)+2)
+	for _, flag := range flags {
+		key := strings.ToLower(strings.TrimSpace(strings.SplitN(flag, "=", 2)[0]))
+		if nconnect != nil && key == "nconnect" {
+			continue
+		}
+		if trunkAddressCount > 1 && key == "max_connect" {
+			continue
+		}
+		configured = append(configured, flag)
+	}
+	if nconnect != nil {
+		configured = append(configured, fmt.Sprintf("nconnect=%d", *nconnect))
+	}
+	if trunkAddressCount > 1 {
+		configured = append(configured, fmt.Sprintf("max_connect=%d", trunkAddressCount))
+	}
+	return configured
+}
+
+func parseNFSTrunkingAddresses(volumeContext map[string]string) (normalized []string, present bool, err error) {
+	raw, present := volumeContext["addresses"]
+	if !present {
+		return nil, false, nil
+	}
+	var decoded []string
+	if decodeErr := json.Unmarshal([]byte(raw), &decoded); decodeErr != nil {
+		return nil, true, fmt.Errorf("decode addresses: %w", decodeErr)
+	}
+	if len(decoded) == 0 {
+		return nil, true, errors.New("addresses is empty")
+	}
+	normalized = make([]string, 0, len(decoded))
+	seen := make(map[string]struct{}, len(decoded))
+	for _, rawAddress := range decoded {
+		address, normalizeErr := normalizeNVMeoFAddress(rawAddress)
+		if normalizeErr != nil {
+			return nil, true, fmt.Errorf("addresses contains invalid server address %q: %w", rawAddress, normalizeErr)
+		}
+		if _, duplicate := seen[address]; duplicate {
+			continue
+		}
+		seen[address] = struct{}{}
+		normalized = append(normalized, address)
+	}
+	return normalized, true, nil
+}
+
+func nfsSource(address, share string) string {
+	if strings.Contains(address, ":") {
+		return fmt.Sprintf("[%s]:%s", address, share)
+	}
+	return fmt.Sprintf("%s:%s", address, share)
+}
+
+func (d *Driver) convergeExistingNFSTrunks(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) {
+	addresses, _, addressErr := parseNFSTrunkingAddresses(volumeContext)
+	if addressErr != nil || len(addresses) < 2 {
+		return
+	}
+	share := volumeContext["share"]
+	if share == "" {
+		return
+	}
+	d.convergeNFSTrunks(ctx, addresses, share, stagingPath, configuredNFSMountFlags(d.config.NFS.NConnect, len(addresses), volCap), eventObjects...)
+}
+
+func (d *Driver) convergeNFSTrunks(ctx context.Context, addresses []string, share, stagingPath string, mountFlags []string, eventObjects ...runtime.Object) {
+	mountInfo, infoErr := nodeGetMountInfo(stagingPath)
+	if infoErr != nil {
+		message := fmt.Sprintf("cannot verify negotiated NFS version for trunking at %s: %v", stagingPath, infoErr)
+		klog.Warning(message)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSTrunkingUnavailable, message)
+		return
+	}
+	version, versionKnown := effectiveNFSVersion(mountInfo.Options)
+	if !versionKnown || version < 4.1 {
+		message := fmt.Sprintf("NFS trunking requires a negotiated NFS version of at least 4.1; %s is mounted with %s and remains available through its primary server", stagingPath, printableNFSVersion(version, versionKnown))
+		klog.Warning(message)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSTrunkingUnavailable, message)
+		return
+	}
+
+	failures := make([]error, 0)
+	for index, address := range addresses[1:] {
+		probePath := fmt.Sprintf("%s.scale-csi-nfs-trunk-%d", stagingPath, index+1)
+		if mkdirErr := os.MkdirAll(probePath, 0o750); mkdirErr != nil {
+			RecordNFSTrunkConnect(address, "error")
+			failures = append(failures, fmt.Errorf("%s: create probe mountpoint: %w", address, mkdirErr))
+			continue
+		}
+		mountErr := nodeMountNFS(ctx, nfsSource(address, share), probePath, mountFlags)
+		if mountErr != nil {
+			RecordNFSTrunkConnect(address, "error")
+			failures = append(failures, fmt.Errorf("%s: %w", address, mountErr))
+			_ = os.Remove(probePath)
+			continue
+		}
+		RecordNFSTrunkConnect(address, "success")
+		if unmountErr := nodeUnmount(ctx, probePath); unmountErr != nil {
+			failures = append(failures, fmt.Errorf("%s: probe unmount: %w", address, unmountErr))
+			continue
+		}
+		_ = os.Remove(probePath)
+	}
+	if len(failures) > 0 {
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonNFSTrunkingDegraded,
+			fmt.Sprintf("NFS trunk transport convergence for %s is degraded: %v", share, errors.Join(failures...)))
+	}
+}
+
+func effectiveNFSVersion(options []string) (float64, bool) {
+	for _, option := range options {
+		parts := strings.SplitN(option, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		if key != "vers" && key != "nfsvers" {
+			continue
+		}
+		version, parseErr := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		if parseErr == nil {
+			return version, true
+		}
+	}
+	return 0, false
+}
+
+func printableNFSVersion(version float64, known bool) string {
+	if !known {
+		return "an unknown version"
+	}
+	return fmt.Sprintf("NFS %.1f", version)
 }
 
 // nodeStageTransport abstracts the protocol-specific session operations the
@@ -1597,7 +1862,7 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext, secrets ma
 		return nil
 	}
 
-	sessions, listErr := util.ListISCSISessions()
+	sessions, listErr := listISCSISessions()
 	if listErr != nil {
 		klog.Warningf("Failed to list iSCSI sessions before staging %s: %v", iqn, listErr)
 	}
@@ -1612,13 +1877,44 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext, secrets ma
 		}
 	}
 
-	// Pre-emptive cleanup: disconnect any existing session for this target.
-	sessions = preemptiveSessionDisconnect(ctx, d, nodeStageTransport[[]util.ISCSISessionInfo]{
-		name:        "iSCSI",
-		findSession: func(s []util.ISCSISessionInfo) (string, error) { return util.FindISCSISessionByIQNFromSessions(iqn, s) },
-		disconnect:  func(existing string) error { return util.ISCSIDisconnect(portal, existing) },
-		relist:      util.ListISCSISessions,
-	}, iqn, stagingPath, sessions)
+	portals, hintPresent, portalErr := parseISCSIMultipathPortals(volumeContext)
+	multipathActive := false
+	switch {
+	case portalErr != nil:
+		message := fmt.Sprintf("iSCSI multipath portal list for %s was discarded; using the primary portal only: %v", iqn, portalErr)
+		klog.Warning(message)
+		RecordISCSIPathConnect(invalidISCSIMultipathPortalMetricLabel, "error")
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSIPathDegraded, message)
+	case hintPresent && len(portals) < 2:
+		message := fmt.Sprintf("iSCSI multipath portal list for %s has fewer than two portals; using the primary portal only", iqn)
+		klog.Warning(message)
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSIMultipathUnavailable, message)
+	case len(portals) > 1:
+		prerequisiteErr := nodeCheckISCSIMultipathHost()
+		if prerequisiteErr != nil {
+			// Unlike NVMe-oF, iSCSI has no native kernel path aggregation. A node
+			// without multipathd must remain usable, so do not create secondary
+			// sessions that could later race a raw-device mount.
+			message := fmt.Sprintf("iSCSI multipath is unavailable for %s; staging through the primary portal only: %v", iqn, prerequisiteErr)
+			klog.Warning(message)
+			d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSIMultipathUnavailable, message)
+		} else {
+			multipathActive = true
+		}
+	}
+
+	if multipathActive {
+		sessions = preemptiveISCSIMultipathDisconnect(ctx, d, iqn, stagingPath, sessions)
+	} else {
+		// Preserve the historical single-portal cleanup path exactly when no
+		// usable attach hint exists.
+		sessions = preemptiveSessionDisconnect(ctx, d, nodeStageTransport[[]util.ISCSISessionInfo]{
+			name:        "iSCSI",
+			findSession: func(s []util.ISCSISessionInfo) (string, error) { return util.FindISCSISessionByIQNFromSessions(iqn, s) },
+			disconnect:  func(existing string) error { return nodeISCSIDisconnect(portal, existing) },
+			relist:      listISCSISessions,
+		}, iqn, stagingPath, sessions)
+	}
 
 	// Build node-side CHAP credentials from the volume context mode flag and the
 	// node-stage secret. nil means CHAP is off for this volume and the connect
@@ -1640,7 +1936,13 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext, secrets ma
 		SessionCleanupDelay: time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond,
 		CHAP:                chapCreds,
 	}
-	devicePath, err := iscsiConnectWithSessions(ctx, portal, iqn, lun, connectOpts, sessions)
+	var devicePath string
+	var pathFailures []error
+	if multipathActive {
+		devicePath, pathFailures, err = convergeISCSIMultipathPaths(ctx, portals, iqn, lun, connectOpts, sessions)
+	} else {
+		devicePath, err = iscsiConnectWithSessions(ctx, portal, iqn, lun, connectOpts, sessions)
+	}
 	if err != nil {
 		RecordNodeConnect("iscsi", "error")
 		if errors.Is(err, util.ErrISCSIAuthFailure) {
@@ -1664,12 +1966,220 @@ func (d *Driver) stageISCSIVolume(ctx context.Context, volumeContext, secrets ma
 		return operationErr
 	}
 	RecordNodeConnect("iscsi", "success")
-	// iSCSI-specific post-connect hook: reject an unexpected multipath topology.
-	if err := nodeCheckISCSIMultipath(devicePath); err != nil {
-		return status.Error(codes.FailedPrecondition, err.Error())
+	if len(pathFailures) > 0 {
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSIPathDegraded,
+			fmt.Sprintf("iSCSI path convergence for %s is degraded: %v", iqn, errors.Join(pathFailures...)))
+	}
+	if !multipathActive {
+		// Legacy single-path safety check: if an operator independently enabled
+		// multipathd, never bypass a dm map by mounting one component path.
+		if ownershipErr := nodeCheckISCSIMultipath(devicePath); ownershipErr != nil {
+			return status.Error(codes.FailedPrecondition, ownershipErr.Error())
+		}
 	}
 
 	return d.finalizeStagedDevice(ctx, devicePath, stagingPath, volCap, eventObjects...)
+}
+
+func parseISCSIMultipathPortals(volumeContext map[string]string) (normalized []string, present bool, err error) {
+	raw, present := volumeContext["portals"]
+	if !present {
+		return nil, false, nil
+	}
+	var decoded []string
+	if decodeErr := json.Unmarshal([]byte(raw), &decoded); decodeErr != nil {
+		return nil, true, fmt.Errorf("decode portals: %w", decodeErr)
+	}
+	if len(decoded) == 0 {
+		return nil, true, errors.New("portals is empty")
+	}
+	normalized = make([]string, 0, len(decoded))
+	seen := make(map[string]struct{}, len(decoded))
+	for _, rawPortal := range decoded {
+		portal, normalizeErr := normalizeISCSITargetPortal(rawPortal)
+		if normalizeErr != nil {
+			return nil, true, fmt.Errorf("portals contains invalid target portal %q: %w", rawPortal, normalizeErr)
+		}
+		if _, duplicate := seen[portal]; duplicate {
+			continue
+		}
+		seen[portal] = struct{}{}
+		normalized = append(normalized, portal)
+	}
+	return normalized, true, nil
+}
+
+func preemptiveISCSIMultipathDisconnect(ctx context.Context, d *Driver, iqn, stagingPath string, sessions []util.ISCSISessionInfo) []util.ISCSISessionInfo {
+	if liveDevicePath, live := stagedDevicePath(stagingPath); live {
+		klog.Infof("Skipping pre-emptive iSCSI multipath disconnect for %s: staged device %s is still live", iqn, liveDevicePath)
+		return sessions
+	}
+	found := false
+	for _, session := range sessions {
+		if session.IQN != iqn {
+			continue
+		}
+		found = true
+		if disconnectErr := nodeISCSIDisconnect(session.Portal, iqn); disconnectErr != nil {
+			klog.Warningf("Failed to disconnect existing iSCSI session %s through %s: %v (proceeding anyway)", iqn, session.Portal, disconnectErr)
+		}
+	}
+	if !found {
+		return sessions
+	}
+	cleanupDelay := time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond
+	if pollErr := waitForSessionCleanup(ctx, cleanupDelay, func() (bool, error) {
+		refreshed, refreshErr := listISCSISessions()
+		sessions = refreshed
+		if refreshErr != nil {
+			return true, refreshErr
+		}
+		for _, session := range sessions {
+			if session.IQN == iqn {
+				return true, nil
+			}
+		}
+		return false, nil
+	}); pollErr != nil {
+		klog.V(4).Infof("iSCSI multipath session cleanup poll for %s ended with: %v", iqn, pollErr)
+	}
+	return sessions
+}
+
+func convergeISCSIMultipathPaths(
+	ctx context.Context,
+	portals []string,
+	iqn string,
+	lun int,
+	connectOpts *util.ISCSIConnectOptions,
+	sessions []util.ISCSISessionInfo,
+) (string, []error, error) {
+	primaryPortal := portals[0]
+	primaryDevice, primaryErr := iscsiConnectWithSessions(ctx, primaryPortal, iqn, lun, connectOpts, sessions)
+	if primaryErr != nil {
+		RecordISCSIPathConnect(primaryPortal, "error")
+		return "", nil, primaryErr
+	}
+	RecordISCSIPathConnect(primaryPortal, "success")
+
+	wwid, wwidErr := nodeGetSCSIWWID(primaryDevice)
+	if wwidErr != nil {
+		return "", nil, fmt.Errorf("resolve SCSI WWID for primary path %s: %w", primaryDevice, wwidErr)
+	}
+
+	pathFailures := make([]error, 0)
+	connectedSecondaries := make([]string, 0, len(portals)-1)
+	secondaryCtx, cancel := context.WithTimeout(ctx, iscsiSecondaryPathConvergeBudget)
+	defer cancel()
+	secondaryOpts := &util.ISCSIConnectOptions{
+		DeviceTimeout:       iscsiSecondaryPathConvergeBudget,
+		SessionCleanupDelay: connectOpts.SessionCleanupDelay,
+		CHAP:                connectOpts.CHAP,
+	}
+	if connectOpts.DeviceTimeout > 0 && connectOpts.DeviceTimeout < secondaryOpts.DeviceTimeout {
+		secondaryOpts.DeviceTimeout = connectOpts.DeviceTimeout
+	}
+	for _, secondaryPortal := range portals[1:] {
+		secondaryDevice, connectErr := iscsiConnectWithSessions(secondaryCtx, secondaryPortal, iqn, lun, secondaryOpts, sessions)
+		if connectErr != nil {
+			RecordISCSIPathConnect(secondaryPortal, "error")
+			pathFailures = append(pathFailures, fmt.Errorf("%s: %w", secondaryPortal, connectErr))
+			continue
+		}
+		secondaryWWID, secondaryWWIDErr := nodeGetSCSIWWID(secondaryDevice)
+		if secondaryWWIDErr != nil || secondaryWWID != wwid {
+			RecordISCSIPathConnect(secondaryPortal, "error")
+			// A session that resolves to a different LUN identity must never remain
+			// beside the staged map. It cannot be a path for this volume, and keeping
+			// it would make later map discovery and teardown ambiguous.
+			if disconnectErr := nodeISCSIDisconnect(secondaryPortal, iqn); disconnectErr != nil {
+				pathFailures = append(pathFailures, fmt.Errorf("%s mismatched-path logout: %w", secondaryPortal, disconnectErr))
+			}
+			if secondaryWWIDErr != nil {
+				pathFailures = append(pathFailures, fmt.Errorf("%s: resolve SCSI WWID: %w", secondaryPortal, secondaryWWIDErr))
+			} else {
+				pathFailures = append(pathFailures, fmt.Errorf("%s: SCSI WWID %s differs from primary %s", secondaryPortal, secondaryWWID, wwid))
+			}
+			continue
+		}
+		RecordISCSIPathConnect(secondaryPortal, "success")
+		connectedSecondaries = append(connectedSecondaries, secondaryPortal)
+	}
+
+	mapCtx, mapCancel := context.WithTimeout(ctx, iscsiSecondaryPathConvergeBudget)
+	defer mapCancel()
+	dmDevice, dmErr := waitForISCSIMultipathDevice(mapCtx, wwid)
+	if dmErr == nil {
+		return dmDevice, pathFailures, nil
+	}
+
+	// If no map materialized, remove the extra sessions before falling back to
+	// the raw primary device. Leaving multiple live paths would let multipathd
+	// claim that raw device after it had been mounted.
+	for _, secondaryPortal := range connectedSecondaries {
+		if disconnectErr := nodeISCSIDisconnect(secondaryPortal, iqn); disconnectErr != nil {
+			pathFailures = append(pathFailures, fmt.Errorf("%s fallback logout: %w", secondaryPortal, disconnectErr))
+		}
+	}
+	pathFailures = append(pathFailures, fmt.Errorf("dm map for WWID %s: %w", wwid, dmErr))
+	if ownershipErr := nodeCheckISCSIMultipath(primaryDevice); ownershipErr != nil {
+		return "", pathFailures, fmt.Errorf("dm-multipath claimed primary path but its map could not be resolved: %w", ownershipErr)
+	}
+	return primaryDevice, pathFailures, nil
+}
+
+func waitForISCSIMultipathDevice(ctx context.Context, wwid string) (string, error) {
+	for {
+		devicePath, findErr := nodeFindISCSIMultipath(wwid)
+		if findErr == nil {
+			return devicePath, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func (d *Driver) convergeExistingISCSIPaths(ctx context.Context, volumeContext, secrets map[string]string, eventObjects ...runtime.Object) {
+	portals, _, portalErr := parseISCSIMultipathPortals(volumeContext)
+	if portalErr != nil || len(portals) < 2 {
+		return
+	}
+	if prerequisiteErr := nodeCheckISCSIMultipathHost(); prerequisiteErr != nil {
+		return
+	}
+	iqn := volumeContext["iqn"]
+	lun, lunErr := strconv.Atoi(volumeContext["lun"])
+	if volumeContext["lun"] == "" {
+		lun = 0
+		lunErr = nil
+	}
+	if iqn == "" || lunErr != nil {
+		return
+	}
+	chapCreds, chapErr := nodeISCSIChAPCredentials(volumeContext, secrets)
+	if chapErr != nil {
+		return
+	}
+	sessions, listErr := listISCSISessions()
+	if listErr != nil {
+		klog.V(4).Infof("Cannot converge existing iSCSI paths for %s: %v", iqn, listErr)
+	}
+	connectOpts := &util.ISCSIConnectOptions{
+		DeviceTimeout:       time.Duration(d.config.ISCSI.DeviceWaitTimeout) * time.Second,
+		SessionCleanupDelay: time.Duration(d.config.Node.SessionCleanupDelay) * time.Millisecond,
+		CHAP:                chapCreds,
+	}
+	_, failures, convergeErr := convergeISCSIMultipathPaths(ctx, portals, iqn, lun, connectOpts, sessions)
+	if convergeErr != nil {
+		failures = append(failures, convergeErr)
+	}
+	if len(failures) > 0 {
+		d.recordWarningEvent(firstEventObject(eventObjects), EventReasonISCSIPathDegraded,
+			fmt.Sprintf("iSCSI path convergence for %s is degraded: %v", iqn, errors.Join(failures...)))
+	}
 }
 
 // stageNVMeoFVolume connects and mounts an NVMe-oF volume to the staging path.

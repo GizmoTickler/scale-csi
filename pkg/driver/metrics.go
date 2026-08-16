@@ -213,6 +213,24 @@ var (
 		[]string{"address", "result"},
 	)
 
+	iscsiPathConnectTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "iscsi_path_connect_total",
+			Help:      "Total number of iSCSI path convergence results by target portal",
+		},
+		[]string{"portal", "result"},
+	)
+
+	nfsTrunkConnectTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "nfs_trunk_connect_total",
+			Help:      "Total number of NFS trunk transport probe results by server address",
+		},
+		[]string{"address", "result"},
+	)
+
 	gcSessionsDisconnectedTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -772,6 +790,16 @@ func RecordNodeConnect(transport, result string) {
 // RecordNVMePathConnect records one requested NVMe-oF path convergence result.
 func RecordNVMePathConnect(address, result string) {
 	nvmePathConnectTotal.WithLabelValues(address, result).Inc()
+}
+
+// RecordISCSIPathConnect records one requested iSCSI portal result.
+func RecordISCSIPathConnect(portal, result string) {
+	iscsiPathConnectTotal.WithLabelValues(portal, result).Inc()
+}
+
+// RecordNFSTrunkConnect records one additional-address NFS trunk probe.
+func RecordNFSTrunkConnect(address, result string) {
+	nfsTrunkConnectTotal.WithLabelValues(address, result).Inc()
 }
 
 // RecordGCSessionDisconnected records a successful orphan session disconnect.
