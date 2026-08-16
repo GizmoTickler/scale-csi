@@ -37,6 +37,61 @@ func TestISCSIConnectUsesStaticNodeRecordFastPath(t *testing.T) {
 	assert.False(t, hasISCSIAdmMode(calls, "discovery"), "fast path must not run SendTargets discovery")
 }
 
+func TestISCSIConnectWithOptionsAndSessionsSelectsDeviceLookup(t *testing.T) {
+	originalRunner := iscsiAdmCombinedOutput
+	originalPortalWait := waitForISCSIPortalDeviceFn
+	originalLegacyWait := waitForISCSIDeviceFn
+	t.Cleanup(func() {
+		iscsiAdmCombinedOutput = originalRunner
+		waitForISCSIPortalDeviceFn = originalPortalWait
+		waitForISCSIDeviceFn = originalLegacyWait
+	})
+	iscsiAdmCombinedOutput = func(context.Context, ...string) ([]byte, error) { return nil, nil }
+
+	tests := []struct {
+		name                string
+		portalScopedLookup  bool
+		wantPortalWaitCalls int
+		wantLegacyWaitCalls int
+		wantDevicePath      string
+	}{
+		{
+			name:                "portal-scoped lookup",
+			portalScopedLookup:  true,
+			wantPortalWaitCalls: 1,
+			wantDevicePath:      "/dev/portal-scoped-iscsi",
+		},
+		{
+			name:                "legacy lookup",
+			wantLegacyWaitCalls: 1,
+			wantDevicePath:      "/dev/legacy-iscsi",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			portalWaitCalls := 0
+			legacyWaitCalls := 0
+			waitForISCSIPortalDeviceFn = func(string, string, int, time.Duration) (string, error) {
+				portalWaitCalls++
+				return "/dev/portal-scoped-iscsi", nil
+			}
+			waitForISCSIDeviceFn = func(string, string, int, time.Duration) (string, error) {
+				legacyWaitCalls++
+				return "/dev/legacy-iscsi", nil
+			}
+
+			devicePath, err := ISCSIConnectWithOptionsAndSessions(
+				context.Background(), "192.0.2.20:3260", "iqn.test:lookup-routing", 0,
+				&ISCSIConnectOptions{PortalScopedDeviceLookup: tc.portalScopedLookup}, nil,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantDevicePath, devicePath)
+			assert.Equal(t, tc.wantPortalWaitCalls, portalWaitCalls)
+			assert.Equal(t, tc.wantLegacyWaitCalls, legacyWaitCalls)
+		})
+	}
+}
+
 func TestISCSIConnectFallsBackToDiscoveryWhenFastPathTargetNotFound(t *testing.T) {
 	portal := "192.0.2.11:3260"
 	iqn := "iqn.2005-10.org.freenas.ctl:pvc-discovery-fallback"
