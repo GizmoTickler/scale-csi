@@ -675,10 +675,17 @@ costs no extra backend call.
   `NVMePathDegraded`, and increment
   `scale_csi_nvme_path_connect_total{address,result}`. Older or malformed
   publish contexts (including entries containing a port or URI scheme) retain
-  the historical single-address behavior. There is no ANA on this platform, so
-  every path is equally optimized. Backend exposure costs 2*(N-1) extra API
-  calls per volume; `multipath: true` with an empty `addresses` remains a
-  startup validation error.
+  the historical single-address behavior, but now emit `NVMePathDegraded` and a
+  path-error metric instead of silently discarding the list. The controller now
+  fails startup when multipath `transportAddress` or `addresses` contain
+  anything other than IPv4/IPv6 literals (including ports, URI schemes,
+  hostnames, malformed brackets, or whitespace); configurations previously
+  accepted with those values must be corrected before upgrading. The node also
+  warns with `NVMeMultipathUnaggregated` when one NQN appears in multiple sysfs
+  subsystem directories, which indicates `nvme_core.multipath=Y` is not active.
+  There is no ANA on this platform, so every path is equally optimized. Backend
+  exposure costs 2*(N-1) extra API calls per volume; `multipath: true` with an
+  empty `addresses` remains a startup validation error.
 
 ## GF-Sprint 2 — Storage-native data protection
 

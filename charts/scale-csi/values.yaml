@@ -648,7 +648,9 @@ nvmeof:
   #
   # Default off (single port, identical to pre-GF4).
   multipath: false
-  # Additional storage transport addresses (IPs) to expose when multipath=true.
+  # Additional storage transport addresses to expose when multipath=true.
+  # Every entry and the primary `address` must be an IPv4 or IPv6 literal: ports,
+  # URI schemes, hostnames, and surrounding whitespace are rejected at startup.
   # `address` is always included first, and duplicates are collapsed. Must be
   # non-empty when multipath=true.
   addresses: []

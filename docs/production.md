@@ -435,7 +435,9 @@ Watch these series:
   attempts and orphan cleanup;
 - `scale_csi_nvme_path_connect_total{address,result}` for requested NVMe-oF
   path convergence. A sustained non-zero rate for `result="error"` identifies
-  a secondary path that remains unavailable even while volume staging succeeds.
+  a secondary path that remains unavailable or exhausted the shared five-second
+  top-up budget even while volume staging succeeds. Corroborate it with the
+  `NVMePathDegraded` event, whose message lists the affected address or addresses.
 
 Five metric families added in v1.4.0 (the existing documented names still match
 `driver.MetricNames()`):
