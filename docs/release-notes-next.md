@@ -690,7 +690,15 @@ costs no extra backend call.
   subsystem directories, which indicates `nvme_core.multipath=Y` is not active.
   There is no ANA on this platform, so every path is equally optimized. Backend
   exposure costs 2*(N-1) extra API calls per volume; `multipath: true` with an
-  empty `addresses` remains a startup validation error.
+  empty `addresses` remains a startup validation error. Disabling multipath does
+  not remove backend port associations. A PV created before multipath (and thus
+  lacking the immutable `addresses` hint) returns to single-path node staging
+  after a full detach/attach while the setting is off; a PV created while
+  multipath was enabled retains its create-time compatibility hint and needs PV
+  recreation or an equivalent deliberate context migration to stop using it.
+  If a publish-context `addresses` key is present but is the empty string, it
+  intentionally wins over the immutable hint, is rejected observably by the
+  node parser, and falls back to the primary single address.
 
 ## GF-Sprint 2 — Storage-native data protection
 

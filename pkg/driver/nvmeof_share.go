@@ -82,6 +82,9 @@ func (d *Driver) nvmeofPublishContext() (map[string]string, error) {
 	}
 	encoded, err := json.Marshal(addresses)
 	if err != nil {
+		// []string contains no values that encoding/json can reject. Keep this
+		// defensive branch because the helper's error contract is used by both
+		// CreateVolume and ControllerPublishVolume.
 		return nil, status.Errorf(codes.Internal, "failed to encode NVMe-oF multipath addresses: %v", err)
 	}
 	return map[string]string{"addresses": string(encoded)}, nil

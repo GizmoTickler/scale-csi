@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/record"
 
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
@@ -79,6 +81,57 @@ func TestControllerPublishVolumeNVMeoFMultipathAddresses(t *testing.T) {
 				"publish and create must use the same deterministic addresses JSON")
 		})
 	}
+}
+
+// Regression for the already-exists publish path: the controller must never
+// advertise an address set when convergence of that subsystem's port
+// associations failed. Advertising first would send the node to paths the
+// backend has not exposed.
+func TestControllerPublishVolumeNVMeoFExistingAssociationFailureDoesNotAdvertise(t *testing.T) {
+	ctx := context.Background()
+	client := &nvmePortAssociationFailMock{MockClient: truenas.NewMockClient()}
+	d := &Driver{
+		name: "org.scale.csi.test",
+		config: &Config{
+			DriverName: "org.scale.csi.nvmeof",
+			ZFS: ZFSConfig{
+				DatasetParentName:   "pool/parent",
+				DatasetEnableQuotas: true,
+				ZvolReadyTimeout:    1,
+			},
+			NVMeoF: NVMeoFConfig{
+				Enabled:               true,
+				Transport:             "TCP",
+				TransportAddress:      "192.0.2.20",
+				TransportServiceID:    4420,
+				SubsystemAllowAnyHost: true,
+			},
+		},
+		truenasClient: client,
+	}
+	d.serviceReloadDebouncer = NewServiceReloadDebouncer(0, func(ctx context.Context, service string) error {
+		return client.ServiceReload(ctx, service)
+	})
+	t.Cleanup(d.serviceReloadDebouncer.Stop)
+
+	const volumeID = "gf51-existing-association-failure"
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest(volumeID, "nvmeof"))
+	require.NoError(t, err)
+
+	// Flip multipath on after provisioning to exercise publish-time convergence
+	// for an already-existing subsystem, then make that convergence fail.
+	d.config.NVMeoF.Multipath = true
+	d.config.NVMeoF.Addresses = []string{"192.0.2.21"}
+	client.portSubsysCreateErr = fmt.Errorf("injected association failure")
+	nodeID, err := encodeNodeIdentity(NodeIdentity{
+		Name: "gf51-worker", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:gf51-worker",
+	})
+	require.NoError(t, err)
+
+	response, err := d.ControllerPublishVolume(ctx, nvmeoFPublishRequest(volumeID, nodeID))
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), "failed to converge NVMe-oF multipath port associations")
 }
 
 type gf51NodeStageCalls struct {

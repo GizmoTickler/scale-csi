@@ -638,6 +638,11 @@ nvmeof:
   # associates every advertised address, then NodeStage consumes the mutable
   # publish context. Recreate the pod in a way that causes volume detach; no PV
   # attribute edit or other PV surgery is required.
+  # Disabling this setting does not remove existing backend port associations.
+  # A pre-multipath PV returns to a single node path after a full detach/attach,
+  # but a PV created while enabled keeps its immutable create-time address hint
+  # and requires PV recreation (or equivalent deliberate context migration) to
+  # return to single-path staging.
   #
   # HONEST SCOPE — controller and node halves are shipped. NodeStage connects
   # every advertised address, converges missing live controllers on re-stage,
