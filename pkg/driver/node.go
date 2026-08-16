@@ -622,6 +622,10 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 
 	// Get attach driver from volume context and normalize.
 	attachDriver := d.nodeAttachDriver(volumeContext)
+	nvmeoFContext := volumeContext
+	if attachDriver == ShareTypeNVMeoF {
+		nvmeoFContext = nvmeoFStageContext(volumeContext, req.GetPublishContext())
+	}
 	capability, err := nodeCapabilityForRequest(req.GetVolumeCapability())
 	if err != nil {
 		return nil, err
@@ -635,7 +639,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			return nil, existingErr
 		}
 		if attachDriver == ShareTypeNVMeoF {
-			d.convergeExistingNVMeoFPaths(ctx, volumeContext, nodeVolumeEventRef(volumeContext, volumeID, d.nodeID))
+			d.convergeExistingNVMeoFPaths(ctx, nvmeoFContext, nodeVolumeEventRef(volumeContext, volumeID, d.nodeID))
 		}
 		klog.Infof("Volume %s is already staged compatibly at %s", volumeID, stagingPath)
 		return &csi.NodeStageVolumeResponse{}, nil
@@ -665,7 +669,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			return nil, err
 		}
 	case ShareTypeNVMeoF:
-		if err := d.stageNVMeoFVolume(ctx, volumeContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+		if err := d.stageNVMeoFVolume(ctx, nvmeoFContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	default:
@@ -693,6 +697,25 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	d.rememberStage(req, attachDriver, capability, expectedSource)
 	klog.Infof("Volume %s staged successfully at %s", volumeID, stagingPath)
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+// nvmeoFStageContext overlays only the attach-scoped multipath hint onto the
+// immutable PV volume context. Presence in PublishContext wins even when the
+// value is malformed or empty: the existing parser then applies the same
+// observable lenient single-path fallback to the source that won. Returning the
+// original map when the publish hint is absent preserves old-controller and
+// legacy single-path behavior exactly.
+func nvmeoFStageContext(volumeContext, publishContext map[string]string) map[string]string {
+	rawAddresses, present := publishContext["addresses"]
+	if !present {
+		return volumeContext
+	}
+	merged := make(map[string]string, len(volumeContext)+1)
+	for key, value := range volumeContext {
+		merged[key] = value
+	}
+	merged["addresses"] = rawAddresses
+	return merged
 }
 
 // NodeUnstageVolume unmounts a volume from the staging path.

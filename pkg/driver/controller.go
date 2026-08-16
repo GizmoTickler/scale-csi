@@ -1854,8 +1854,20 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		return nil, err
 	}
 
+	var publishContext map[string]string
+	if shareType == ShareTypeNVMeoF {
+		// ensureShareExists has already associated every configured multipath port
+		// on both the fresh-share and already-exists paths. Only advertise the
+		// address set after that convergence succeeds, so the response can never
+		// promise a path this publish failed to associate.
+		publishContext, err = d.nvmeofPublishContext()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	klog.Infof("ControllerPublishVolume: volume %s published successfully to node %s", volumeID, nodeID)
-	return &csi.ControllerPublishVolumeResponse{}, nil
+	return &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}, nil
 }
 
 // ControllerUnpublishVolume detaches a volume from a node (not used for NFS).

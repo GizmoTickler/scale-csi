@@ -634,8 +634,10 @@ nvmeof:
   # NVMe-oF multi-port multipath (GF-Sprint 4, E-6). When enabled, each subsystem
   # is associated with one port per address below (in addition to `address`), and
   # all addresses are advertised in the publish context under `addresses`.
-  # Existing volumes are converged on their next publish, so every advertised
-  # address really is associated with the subsystem.
+  # Existing volumes converge on their next full detach/attach: publish first
+  # associates every advertised address, then NodeStage consumes the mutable
+  # publish context. Recreate the pod in a way that causes volume detach; no PV
+  # attribute edit or other PV surgery is required.
   #
   # HONEST SCOPE — controller and node halves are shipped. NodeStage connects
   # every advertised address, converges missing live controllers on re-stage,

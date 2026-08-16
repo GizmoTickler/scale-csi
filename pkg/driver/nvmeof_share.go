@@ -57,18 +57,34 @@ func (d *Driver) nvmeofVolumeContext(ctx context.Context, ds *truenas.Dataset, d
 	volumeContext["transport"] = d.config.NVMeoF.Transport
 	volumeContext["address"] = d.config.NVMeoF.TransportAddress
 	volumeContext["port"] = strconv.Itoa(d.config.NVMeoF.TransportServiceID)
-	// E-6 multipath: advertise every storage address so a multipath-aware node can
-	// connect each to the same NQN. The single "address" key above is retained for
-	// back-compat with nodes that connect one path. Emitted only when multipath is
-	// enabled so the default publish context is unchanged.
-	if addresses := d.config.NVMeoF.multipathAddresses(); len(addresses) > 0 {
-		encoded, err := json.Marshal(addresses)
-		if err != nil {
-			return status.Errorf(codes.Internal, "failed to encode NVMe-oF multipath addresses: %v", err)
-		}
-		volumeContext["addresses"] = string(encoded)
+	// Keep the create-time volume-context hint for backward compatibility with
+	// older nodes. ControllerPublishVolume also returns the same encoding in its
+	// mutable publish context so pre-existing PVs can converge without PV edits.
+	publishContext, err := d.nvmeofPublishContext()
+	if err != nil {
+		return err
+	}
+	for key, value := range publishContext {
+		volumeContext[key] = value
 	}
 	return nil
+}
+
+// nvmeofPublishContext returns the mutable, attach-scoped NVMe-oF hints that a
+// node needs in addition to the immutable PV volume context. It is intentionally
+// empty when multipath is disabled so the historical single-path response is
+// unchanged. Keeping the encoder here also guarantees CreateVolume and
+// ControllerPublishVolume use exactly the same addresses JSON format.
+func (d *Driver) nvmeofPublishContext() (map[string]string, error) {
+	addresses := d.config.NVMeoF.multipathAddresses()
+	if len(addresses) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(addresses)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to encode NVMe-oF multipath addresses: %v", err)
+	}
+	return map[string]string{"addresses": string(encoded)}, nil
 }
 
 // nvmeofPortCreateOpts builds the install-wide NVMe-oF port performance options

@@ -664,14 +664,19 @@ costs no extra backend call.
   changing them is a no-op and the driver logs a warning naming each drifted
   field.
 - **`nvmeof.multipath` + `nvmeof.addresses`** — associates each subsystem with
-  one port per address and advertises them all in the publish context. The node
-  now connects every advertised address, tops up missing live controllers on
-  re-stage, requests the native `queue-depth` iopolicy, and disconnects all
-  controllers by NQN on unstage. A fresh stage requires a live or successfully
-  connected path from the advertised set; an unrelated live controller cannot
-  produce an empty-device success. A subsystem with controllers but no live path
-  is disconnected before reconnect, matching the single-path self-heal. Later
-  path failures use a shared five-second top-up budget, emit
+  one port per address and advertises them all in the publish context. Existing
+  volumes now converge on their next full detach/attach (for example, a pod
+  recreate that actually causes volume detach): `ControllerPublishVolume`
+  supplies the current address list even when the immutable PV attributes
+  predate multipath, so no PV surgery is required. The node prefers that mutable
+  publish hint and falls back to the create-time volume context for compatibility
+  with older controllers. It connects every advertised address, tops up missing
+  live controllers on re-stage, requests the native `queue-depth` iopolicy, and
+  disconnects all controllers by NQN on unstage. A fresh stage requires a live or
+  successfully connected path from the advertised set; an unrelated live
+  controller cannot produce an empty-device success. A subsystem with controllers
+  but no live path is disconnected before reconnect, matching the single-path
+  self-heal. Later path failures use a shared five-second top-up budget, emit
   `NVMePathDegraded`, and increment
   `scale_csi_nvme_path_connect_total{address,result}`. Older or malformed
   publish contexts (including entries containing a port or URI scheme) retain
