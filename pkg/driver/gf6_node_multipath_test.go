@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/tools/record"
@@ -56,7 +57,8 @@ func TestStageISCSIMultipathLogsIntoEveryPortalAndDegradesOnPartialFailure(t *te
 	installGF6ISCSINodeSeams(t)
 	portals := []string{"192.0.2.10:3260", "192.0.2.11:3260", "192.0.2.12:3260"}
 	var connected []string
-	iscsiConnectWithSessions = func(_ context.Context, portal, _ string, _ int, _ *util.ISCSIConnectOptions, _ []util.ISCSISessionInfo) (string, error) {
+	iscsiConnectWithSessions = func(_ context.Context, portal, _ string, _ int, opts *util.ISCSIConnectOptions, _ []util.ISCSISessionInfo) (string, error) {
+		assert.True(t, opts.PortalScopedDeviceLookup)
 		connected = append(connected, portal)
 		if portal == "192.0.2.11:3260" {
 			return "", errors.New("injected storage VLAN failure")
@@ -88,7 +90,8 @@ func TestStageISCSIMultipathUnavailableFallsBackToPrimaryOnly(t *testing.T) {
 	installGF6ISCSINodeSeams(t)
 	nodeCheckISCSIMultipathHost = func() error { return errors.New("multipathd socket absent") }
 	var connected []string
-	iscsiConnectWithSessions = func(_ context.Context, portal, _ string, _ int, _ *util.ISCSIConnectOptions, _ []util.ISCSISessionInfo) (string, error) {
+	iscsiConnectWithSessions = func(_ context.Context, portal, _ string, _ int, opts *util.ISCSIConnectOptions, _ []util.ISCSISessionInfo) (string, error) {
+		assert.False(t, opts.PortalScopedDeviceLookup)
 		connected = append(connected, portal)
 		return "/dev/null", nil
 	}
@@ -188,6 +191,72 @@ func TestEmptyISCSIPublishHintWinsAndDegradesToSinglePath(t *testing.T) {
 	default:
 		t.Fatal("empty winning iSCSI publish hint must be observably degraded")
 	}
+}
+
+func TestHostnameISCSIMultipathHintDegradesToSinglePath(t *testing.T) {
+	tests := []struct {
+		name         string
+		stageContext func(map[string]string) map[string]string
+	}{
+		{
+			name: "volume context",
+			stageContext: func(volumeContext map[string]string) map[string]string {
+				volumeContext["portals"] = `["192.0.2.36:3260","storage.invalid:3260"]`
+				return volumeContext
+			},
+		},
+		{
+			name: "publish context",
+			stageContext: func(volumeContext map[string]string) map[string]string {
+				return publishHintStageContext(volumeContext, map[string]string{
+					"portals": `["192.0.2.36:3260","storage.invalid:3260"]`,
+				}, "portals")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			installGF6ISCSINodeSeams(t)
+			var connected []string
+			iscsiConnectWithSessions = func(_ context.Context, portal, _ string, _ int, _ *util.ISCSIConnectOptions, _ []util.ISCSISessionInfo) (string, error) {
+				connected = append(connected, portal)
+				return "/dev/null", nil
+			}
+			recorder := record.NewFakeRecorder(1)
+			d := newTestNodeDriver(ShareTypeISCSI)
+			d.eventRecorder = &EventRecorder{recorder: recorder, enabled: true}
+			metric := iscsiPathConnectTotal.WithLabelValues(invalidISCSIMultipathPortalMetricLabel, "error")
+			metricBefore := testutil.ToFloat64(metric)
+			volumeContext := map[string]string{
+				"portal":  "192.0.2.36:3260",
+				"portals": `["192.0.2.36:3260","192.0.2.37:3260"]`,
+				"iqn":     "iqn.2005-10.org.freenas.ctl:pvc-hostname-hint",
+				"lun":     "0",
+			}
+
+			require.NoError(t, d.stageISCSIVolume(context.Background(), test.stageContext(volumeContext), nil,
+				filepath.Join(t.TempDir(), "stage"), gf6ISCSIBlockCapability(), PVRef("gf6-hostname-hint")))
+			assert.Equal(t, []string{"192.0.2.36:3260"}, connected)
+			assert.Equal(t, metricBefore+1, testutil.ToFloat64(metric))
+			select {
+			case event := <-recorder.Events:
+				assert.Contains(t, event, "Warning "+EventReasonISCSIPathDegraded)
+				assert.Contains(t, event, "using the primary portal only")
+			default:
+				t.Fatal("hostname iSCSI multipath hint must be observably degraded")
+			}
+		})
+	}
+}
+
+func TestParseISCSIMultipathPortalsPreservesIPLiteralHints(t *testing.T) {
+	portals, present, err := parseISCSIMultipathPortals(map[string]string{
+		"portals": `["192.0.2.38","[2001:db8::38]:3261"]`,
+	})
+	require.NoError(t, err)
+	assert.True(t, present)
+	assert.Equal(t, []string{"192.0.2.38:3260", "[2001:db8::38]:3261"}, portals)
 }
 
 func TestConvergeExistingISCSIPathsRefusesRawStagedDeviceWithoutAddingSessions(t *testing.T) {

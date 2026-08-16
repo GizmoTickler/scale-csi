@@ -2006,6 +2006,10 @@ func parseISCSIMultipathPortals(volumeContext map[string]string) (normalized []s
 		if normalizeErr != nil {
 			return nil, true, fmt.Errorf("portals contains invalid target portal %q: %w", rawPortal, normalizeErr)
 		}
+		host, _, splitErr := net.SplitHostPort(portal)
+		if splitErr != nil || net.ParseIP(host) == nil {
+			return nil, true, fmt.Errorf("portals contains non-IP target portal %q", rawPortal)
+		}
 		if _, duplicate := seen[portal]; duplicate {
 			continue
 		}
@@ -2060,8 +2064,13 @@ func convergeISCSIMultipathPaths(
 	connectOpts *util.ISCSIConnectOptions,
 	sessions []util.ISCSISessionInfo,
 ) (string, []error, error) {
+	portalConnectOpts := util.ISCSIConnectOptions{PortalScopedDeviceLookup: true}
+	if connectOpts != nil {
+		portalConnectOpts = *connectOpts
+		portalConnectOpts.PortalScopedDeviceLookup = true
+	}
 	primaryPortal := portals[0]
-	primaryDevice, primaryErr := iscsiConnectWithSessions(ctx, primaryPortal, iqn, lun, connectOpts, sessions)
+	primaryDevice, primaryErr := iscsiConnectWithSessions(ctx, primaryPortal, iqn, lun, &portalConnectOpts, sessions)
 	if primaryErr != nil {
 		RecordISCSIPathConnect(primaryPortal, "error")
 		return "", nil, primaryErr
@@ -2078,12 +2087,13 @@ func convergeISCSIMultipathPaths(
 	secondaryCtx, cancel := context.WithTimeout(ctx, iscsiSecondaryPathConvergeBudget)
 	defer cancel()
 	secondaryOpts := &util.ISCSIConnectOptions{
-		DeviceTimeout:       iscsiSecondaryPathConvergeBudget,
-		SessionCleanupDelay: connectOpts.SessionCleanupDelay,
-		CHAP:                connectOpts.CHAP,
+		DeviceTimeout:            iscsiSecondaryPathConvergeBudget,
+		SessionCleanupDelay:      portalConnectOpts.SessionCleanupDelay,
+		CHAP:                     portalConnectOpts.CHAP,
+		PortalScopedDeviceLookup: true,
 	}
-	if connectOpts.DeviceTimeout > 0 && connectOpts.DeviceTimeout < secondaryOpts.DeviceTimeout {
-		secondaryOpts.DeviceTimeout = connectOpts.DeviceTimeout
+	if portalConnectOpts.DeviceTimeout > 0 && portalConnectOpts.DeviceTimeout < secondaryOpts.DeviceTimeout {
+		secondaryOpts.DeviceTimeout = portalConnectOpts.DeviceTimeout
 	}
 	for _, secondaryPortal := range portals[1:] {
 		secondaryDevice, connectErr := iscsiConnectWithSessions(secondaryCtx, secondaryPortal, iqn, lun, secondaryOpts, sessions)

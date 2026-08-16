@@ -25,6 +25,8 @@
   configured portal has neither an existing association nor a CSI-owned
   template. Re-stage convergence also refuses to build a new dm map beneath an
   already-live raw device and creates no secondary sessions on that refusal.
+- **Node-side iSCSI hint validation:** multipath portal hints containing a hostname are discarded and degrade observably to the primary IP-literal path.
+- **Portal-scoped iSCSI device waits:** multipath no-match snapshots retry instead of accepting an IQN-first device from another portal; legacy single-path and session-list-error fallbacks remain intact.
 - **NFS connection parallelism:** `nfs.nconnect` (`1..16`, default unset) adds
   `nconnect=N` without claiming path failover. `nfs.trunking` plus IP-literal
   `nfs.addresses` mounts the primary with `max_connect`, verifies the negotiated

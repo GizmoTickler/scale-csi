@@ -171,6 +171,64 @@ func TestWaitForISCSIDeviceFallsBackWhenPortalSessionDoesNotMatch(t *testing.T) 
 	}
 }
 
+func TestWaitForISCSIPortalDeviceRetriesNoMatchWithoutIQNFallback(t *testing.T) {
+	originalList := listISCSISessionsForDevice
+	originalPortalFind := findISCSIDeviceForPortal
+	originalFallback := findISCSIDeviceFallback
+	t.Cleanup(func() {
+		listISCSISessionsForDevice = originalList
+		findISCSIDeviceForPortal = originalPortalFind
+		findISCSIDeviceFallback = originalFallback
+	})
+	const iqn = "iqn.2005-10.org.freenas.ctl:pvc-portal-scoped"
+	listISCSISessionsForDevice = func() ([]ISCSISessionInfo, error) {
+		return []ISCSISessionInfo{{Portal: "192.0.2.17:3260", IQN: iqn, SessionID: "17"}}, nil
+	}
+	findCalls := 0
+	findISCSIDeviceForPortal = func(portal, gotIQN string, lun int, sessions []ISCSISessionInfo) (string, error) {
+		findCalls++
+		assert.Equal(t, "192.0.2.18:3260", portal)
+		assert.Equal(t, iqn, gotIQN)
+		assert.Zero(t, lun)
+		return "", fmt.Errorf("%w for %s", errISCSIPortalSessionNotFound, portal)
+	}
+	fallbackCalls := 0
+	findISCSIDeviceFallback = func(string, int) (string, error) {
+		fallbackCalls++
+		return "/dev/primary-portal-device", nil
+	}
+
+	devicePath, err := waitForISCSIPortalDevice("192.0.2.18:3260", iqn, 0, 20*time.Millisecond)
+	require.Error(t, err)
+	assert.Empty(t, devicePath)
+	assert.GreaterOrEqual(t, findCalls, 2, "portal-scoped no-match must remain in the wait loop")
+	assert.Zero(t, fallbackCalls, "portal-scoped lookup must not borrow the primary portal's device")
+}
+
+func TestWaitForISCSIPortalDeviceKeepsFallbackWhenSessionListFails(t *testing.T) {
+	originalList := listISCSISessionsForDevice
+	originalPortalFind := findISCSIDeviceForPortal
+	originalFallback := findISCSIDeviceFallback
+	t.Cleanup(func() {
+		listISCSISessionsForDevice = originalList
+		findISCSIDeviceForPortal = originalPortalFind
+		findISCSIDeviceFallback = originalFallback
+	})
+	listISCSISessionsForDevice = func() ([]ISCSISessionInfo, error) {
+		return nil, errors.New("iscsiadm unavailable")
+	}
+	findISCSIDeviceForPortal = func(portal, _ string, _ int, _ []ISCSISessionInfo) (string, error) {
+		return "", fmt.Errorf("%w for %s", errISCSIPortalSessionNotFound, portal)
+	}
+	findISCSIDeviceFallback = func(string, int) (string, error) {
+		return "/dev/sysfs-fallback", nil
+	}
+
+	devicePath, err := waitForISCSIPortalDevice("192.0.2.19:3260", "iqn.test", 0, 20*time.Millisecond)
+	require.NoError(t, err)
+	assert.Equal(t, "/dev/sysfs-fallback", devicePath)
+}
+
 func TestWaitForISCSIDeviceRefreshesSessionListAtBoundedCadence(t *testing.T) {
 	originalList := listISCSISessionsForDevice
 	originalPortalFind := findISCSIDeviceForPortal
@@ -843,6 +901,21 @@ func TestFindISCSIDeviceForPortalSelectsExactSession(t *testing.T) {
 			)
 			require.NoError(t, err)
 			assert.Equal(t, filepath.Join(devRoot, test.want), devicePath)
+		})
+	}
+}
+
+func TestSameISCSIPortalCanonicalizesPortlessHostnameBothDirections(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		left  string
+		right string
+	}{
+		{name: "explicit then portless", left: "host.example.com:3260", right: "host.example.com"},
+		{name: "portless then explicit", left: "host.example.com", right: "host.example.com:3260"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert.True(t, sameISCSIPortal(test.left, test.right))
 		})
 	}
 }
