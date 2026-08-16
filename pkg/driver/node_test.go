@@ -10,12 +10,14 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/GizmoTickler/scale-csi/pkg/util"
@@ -2036,6 +2038,13 @@ func TestParseNVMeoFMultipathAddresses(t *testing.T) {
 			volumeContext: map[string]string{"addresses": `["192.0.2.10"," 192.0.2.11 ","192.0.2.10"]`},
 			want:          []string{"192.0.2.10", "192.0.2.11"},
 		},
+		{
+			name:          "normalizes bracketed IPv6 before deduplicating",
+			volumeContext: map[string]string{"addresses": `["[2001:db8::10]","2001:db8::10"]`},
+			want:          []string{"2001:db8::10"},
+		},
+		{name: "rejects address with port", volumeContext: map[string]string{"addresses": `["192.0.2.10:4420"]`}, wantErr: true},
+		{name: "rejects URI", volumeContext: map[string]string{"addresses": `["tcp://192.0.2.10"]`}, wantErr: true},
 	}
 
 	for _, test := range tests {
@@ -2060,6 +2069,8 @@ func TestStageNVMeoFVolumeMultipathFallbackUsesSingleAddress(t *testing.T) {
 		{name: "absent"},
 		{name: "empty", addresses: "[]", present: true},
 		{name: "malformed", addresses: "not-json", present: true},
+		{name: "entry has port", addresses: `["192.0.2.20:4420"]`, present: true},
+		{name: "entry has URI scheme", addresses: `["tcp://192.0.2.20"]`, present: true},
 	}
 
 	for _, test := range tests {
@@ -2105,11 +2116,11 @@ func TestStageNVMeoFVolumeMultipathFallbackUsesSingleAddress(t *testing.T) {
 func TestStageNVMeoFVolumeMultipathConnectsEveryAddress(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt")
 	originalList := nodeListNVMeSubsystems
-	originalConnect := nvmeConnectWithSubsystems
+	originalConnect := nvmeConnectPathWithSubsystems
 	originalPolicy := nodeSetNVMeIOPolicy
 	t.Cleanup(func() {
 		nodeListNVMeSubsystems = originalList
-		nvmeConnectWithSubsystems = originalConnect
+		nvmeConnectPathWithSubsystems = originalConnect
 		nodeSetNVMeIOPolicy = originalPolicy
 	})
 
@@ -2122,7 +2133,7 @@ func TestStageNVMeoFVolumeMultipathConnectsEveryAddress(t *testing.T) {
 		return []util.NVMeSubsystem{{NQN: "nqn.test:happy", Name: "nvme-subsys7"}}, nil
 	}
 	var connectURIs []string
-	nvmeConnectWithSubsystems = func(_ context.Context, nqn, uri string, _ *util.NVMeoFConnectOptions, _ []util.NVMeSubsystem) (string, error) {
+	nvmeConnectPathWithSubsystems = func(_ context.Context, nqn, uri string, _ *util.NVMeoFConnectOptions, _ []util.NVMeSubsystem) (string, error) {
 		assert.Equal(t, "nqn.test:happy", nqn)
 		connectURIs = append(connectURIs, uri)
 		return "/dev/null", nil
@@ -2157,11 +2168,11 @@ func TestStageNVMeoFVolumeMultipathConnectsEveryAddress(t *testing.T) {
 func TestStageNVMeoFVolumeMultipathPartialFailureIsNonFatal(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt")
 	originalList := nodeListNVMeSubsystems
-	originalConnect := nvmeConnectWithSubsystems
+	originalConnect := nvmeConnectPathWithSubsystems
 	originalPolicy := nodeSetNVMeIOPolicy
 	t.Cleanup(func() {
 		nodeListNVMeSubsystems = originalList
-		nvmeConnectWithSubsystems = originalConnect
+		nvmeConnectPathWithSubsystems = originalConnect
 		nodeSetNVMeIOPolicy = originalPolicy
 	})
 
@@ -2174,7 +2185,7 @@ func TestStageNVMeoFVolumeMultipathPartialFailureIsNonFatal(t *testing.T) {
 		return []util.NVMeSubsystem{{NQN: "nqn.test:partial", Name: "nvme-subsys8"}}, nil
 	}
 	connectCalls := 0
-	nvmeConnectWithSubsystems = func(_ context.Context, _ string, _ string, _ *util.NVMeoFConnectOptions, _ []util.NVMeSubsystem) (string, error) {
+	nvmeConnectPathWithSubsystems = func(_ context.Context, _ string, _ string, _ *util.NVMeoFConnectOptions, _ []util.NVMeSubsystem) (string, error) {
 		connectCalls++
 		if connectCalls != 2 {
 			return "", errors.New("path unavailable")
@@ -2188,15 +2199,28 @@ func TestStageNVMeoFVolumeMultipathPartialFailureIsNonFatal(t *testing.T) {
 		return errors.New("kernel policy unsupported")
 	}
 
+	fakeRecorder := record.NewFakeRecorder(4)
+	d := newTestNodeDriver(ShareTypeNVMeoF)
+	d.eventRecorder = &EventRecorder{recorder: fakeRecorder, enabled: true}
+	failedPathCounter := nvmePathConnectTotal.WithLabelValues("192.0.2.20", "error")
+	failedPathBefore := testutil.ToFloat64(failedPathCounter)
 	stagingPath := filepath.Join(t.TempDir(), "stage")
-	err := newTestNodeDriver(ShareTypeNVMeoF).stageNVMeoFVolume(context.Background(), map[string]string{
+	err := d.stageNVMeoFVolume(context.Background(), map[string]string{
 		"nqn":       "nqn.test:partial",
 		"address":   "192.0.2.20",
 		"addresses": `["192.0.2.20","192.0.2.21","192.0.2.22"]`,
-	}, stagingPath, &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}}})
+	}, stagingPath, &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}}}, PVRef("gf5-partial"))
 	require.NoError(t, err)
 	assert.Equal(t, 3, connectCalls)
 	assert.Equal(t, 1, policyCalls, "iopolicy must be attempted and remain non-fatal")
+	assert.Equal(t, failedPathBefore+1, testutil.ToFloat64(failedPathCounter))
+	select {
+	case event := <-fakeRecorder.Events:
+		assert.Contains(t, event, "Warning "+EventReasonNVMePathDegraded)
+		assert.Contains(t, event, "192.0.2.20")
+	default:
+		t.Fatal("successful stage with failed requested paths must emit a warning event")
+	}
 	_, err = os.Readlink(stagingPath)
 	require.NoError(t, err)
 }
@@ -2204,16 +2228,16 @@ func TestStageNVMeoFVolumeMultipathPartialFailureIsNonFatal(t *testing.T) {
 func TestStageNVMeoFVolumeMultipathTotalFailureFailsStage(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt")
 	originalList := nodeListNVMeSubsystems
-	originalConnect := nvmeConnectWithSubsystems
+	originalConnect := nvmeConnectPathWithSubsystems
 	originalPolicy := nodeSetNVMeIOPolicy
 	t.Cleanup(func() {
 		nodeListNVMeSubsystems = originalList
-		nvmeConnectWithSubsystems = originalConnect
+		nvmeConnectPathWithSubsystems = originalConnect
 		nodeSetNVMeIOPolicy = originalPolicy
 	})
 	nodeListNVMeSubsystems = func(context.Context) ([]util.NVMeSubsystem, error) { return nil, nil }
 	connectCalls := 0
-	nvmeConnectWithSubsystems = func(_ context.Context, _ string, _ string, _ *util.NVMeoFConnectOptions, _ []util.NVMeSubsystem) (string, error) {
+	nvmeConnectPathWithSubsystems = func(_ context.Context, _ string, _ string, _ *util.NVMeoFConnectOptions, _ []util.NVMeSubsystem) (string, error) {
 		connectCalls++
 		return "", errors.New("path unavailable")
 	}
@@ -2231,23 +2255,210 @@ func TestStageNVMeoFVolumeMultipathTotalFailureFailsStage(t *testing.T) {
 	}, stagingPath, &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}}})
 	require.Error(t, err)
 	assert.Equal(t, codes.Internal, status.Code(err))
-	assert.Contains(t, err.Error(), "no NVMe-oF path connected")
+	assert.Contains(t, err.Error(), "no requested NVMe-oF path connected")
 	assert.Equal(t, 2, connectCalls)
 	assert.Zero(t, policyCalls)
 	_, statErr := os.Lstat(stagingPath)
 	assert.ErrorIs(t, statErr, os.ErrNotExist)
 }
 
-func TestNodeStageVolumeMultipathRestageTopsUpMissingPaths(t *testing.T) {
+func TestStageNVMeoFVolumeRejectsDisjointLivePathWhenRequestedConnectsFail(t *testing.T) {
+	tests := []struct {
+		name       string
+		capability *csi.VolumeCapability
+	}{
+		{
+			name: "filesystem mode",
+			capability: &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"},
+			}},
+		},
+		{
+			name: "block mode",
+			capability: &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Block{
+				Block: &csi.VolumeCapability_BlockVolume{},
+			}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			installFakeNodeCommands(t, "findmnt")
+			originalList := nodeListNVMeSubsystems
+			originalConnect := nvmeConnectPathWithSubsystems
+			originalPolicy := nodeSetNVMeIOPolicy
+			t.Cleanup(func() {
+				nodeListNVMeSubsystems = originalList
+				nvmeConnectPathWithSubsystems = originalConnect
+				nodeSetNVMeIOPolicy = originalPolicy
+			})
+
+			nodeListNVMeSubsystems = func(context.Context) ([]util.NVMeSubsystem, error) {
+				return []util.NVMeSubsystem{{NQN: "nqn.gf5:disjoint", Paths: []util.NVMePath{
+					{Address: "traddr=192.0.2.60,trsvcid=4420", State: "live"},
+				}}}, nil
+			}
+			connectCalls := 0
+			nvmeConnectPathWithSubsystems = func(context.Context, string, string, *util.NVMeoFConnectOptions, []util.NVMeSubsystem) (string, error) {
+				connectCalls++
+				return "", errors.New("requested path unavailable")
+			}
+			nodeSetNVMeIOPolicy = func(string, string) error {
+				t.Fatal("iopolicy must not be set after total requested-path failure")
+				return nil
+			}
+
+			fakeRecorder := record.NewFakeRecorder(4)
+			d := newTestNodeDriver(ShareTypeNVMeoF)
+			d.eventRecorder = &EventRecorder{recorder: fakeRecorder, enabled: true}
+			errorCounter := nodeConnectTotal.WithLabelValues("nvmeof", "error")
+			successCounter := nodeConnectTotal.WithLabelValues("nvmeof", "success")
+			errorBefore := testutil.ToFloat64(errorCounter)
+			successBefore := testutil.ToFloat64(successCounter)
+
+			err := d.stageNVMeoFVolume(context.Background(), map[string]string{
+				"nqn":       "nqn.gf5:disjoint",
+				"address":   "192.0.2.50",
+				"addresses": `["192.0.2.50","192.0.2.51"]`,
+			}, filepath.Join(t.TempDir(), "stage"), test.capability, PVRef("gf5-disjoint"))
+			require.Error(t, err)
+			assert.Equal(t, codes.Internal, status.Code(err))
+			assert.Contains(t, err.Error(), "no requested NVMe-oF path connected")
+			assert.Equal(t, 2, connectCalls)
+			assert.Equal(t, errorBefore+1, testutil.ToFloat64(errorCounter))
+			assert.Equal(t, successBefore, testutil.ToFloat64(successCounter))
+			select {
+			case event := <-fakeRecorder.Events:
+				assert.Contains(t, event, "Warning "+EventReasonNVMeConnectFailed)
+			default:
+				t.Fatal("total requested-path failure must emit NVMeConnectFailed")
+			}
+		})
+	}
+}
+
+func TestStageNVMeoFVolumeMultipathDisconnectsWedgedSubsystemBeforeConnect(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt")
+	originalList := nodeListNVMeSubsystems
+	originalConnect := nvmeConnectPathWithSubsystems
+	originalDisconnect := nodeNVMeDisconnect
+	originalPolicy := nodeSetNVMeIOPolicy
+	t.Cleanup(func() {
+		nodeListNVMeSubsystems = originalList
+		nvmeConnectPathWithSubsystems = originalConnect
+		nodeNVMeDisconnect = originalDisconnect
+		nodeSetNVMeIOPolicy = originalPolicy
+	})
+
+	wedged := []util.NVMeSubsystem{{NQN: "nqn.gf5:wedged", Name: "nvme-subsys5", Paths: []util.NVMePath{
+		{Address: "traddr=192.0.2.70,trsvcid=4420", State: "connecting"},
+	}}}
+	listCalls := 0
+	nodeListNVMeSubsystems = func(context.Context) ([]util.NVMeSubsystem, error) {
+		listCalls++
+		if listCalls == 1 {
+			return wedged, nil
+		}
+		return nil, nil
+	}
+	disconnectCalls := 0
+	nodeNVMeDisconnect = func(_ context.Context, nqn string) error {
+		disconnectCalls++
+		assert.Equal(t, "nqn.gf5:wedged", nqn)
+		return nil
+	}
+	connectCalls := 0
+	nvmeConnectPathWithSubsystems = func(_ context.Context, _ string, _ string, _ *util.NVMeoFConnectOptions, subsystems []util.NVMeSubsystem) (string, error) {
+		connectCalls++
+		assert.Empty(t, subsystems, "connect must use the refreshed post-disconnect listing")
+		return "/dev/null", nil
+	}
+	nodeSetNVMeIOPolicy = func(string, string) error { return nil }
+
+	err := newTestNodeDriver(ShareTypeNVMeoF).stageNVMeoFVolume(context.Background(), map[string]string{
+		"nqn":       "nqn.gf5:wedged",
+		"address":   "192.0.2.70",
+		"addresses": `["192.0.2.70"]`,
+	}, filepath.Join(t.TempDir(), "stage"), &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Block{
+		Block: &csi.VolumeCapability_BlockVolume{},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, 1, disconnectCalls)
+	assert.Equal(t, 1, connectCalls)
+}
+
+func TestNodeStageVolumeMultipathBracketedIPv6RecognizesLivePath(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt")
 	originalInfo := nodeGetNVMeInfo
 	originalList := nodeListNVMeSubsystems
-	originalConnect := nvmeConnectWithSubsystems
+	originalConnect := nvmeConnectPathWithSubsystems
 	originalPolicy := nodeSetNVMeIOPolicy
 	t.Cleanup(func() {
 		nodeGetNVMeInfo = originalInfo
 		nodeListNVMeSubsystems = originalList
-		nvmeConnectWithSubsystems = originalConnect
+		nvmeConnectPathWithSubsystems = originalConnect
+		nodeSetNVMeIOPolicy = originalPolicy
+	})
+
+	nodeGetNVMeInfo = func(string) (string, error) { return "nqn.gf5:ipv6", nil }
+	subsystems := []util.NVMeSubsystem{{NQN: "nqn.gf5:ipv6", Name: "nvme-subsys6", Paths: []util.NVMePath{
+		{Address: "traddr=2001:db8::10,trsvcid=4420", State: "live"},
+	}}}
+	nodeListNVMeSubsystems = func(context.Context) ([]util.NVMeSubsystem, error) { return subsystems, nil }
+	connectCalls := 0
+	nvmeConnectPathWithSubsystems = func(context.Context, string, string, *util.NVMeoFConnectOptions, []util.NVMeSubsystem) (string, error) {
+		connectCalls++
+		return "/dev/null", nil
+	}
+	nodeSetNVMeIOPolicy = func(string, string) error { return nil }
+
+	stagingPath := filepath.Join(t.TempDir(), "stage")
+	require.NoError(t, os.Symlink("/dev/null", stagingPath))
+	_, err := newTestNodeDriver(ShareTypeNVMeoF).NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "ipv6-volume",
+		StagingTargetPath: stagingPath,
+		VolumeContext: map[string]string{
+			"nqn":       "nqn.gf5:ipv6",
+			"address":   "2001:db8::10",
+			"addresses": `["[2001:db8::10]"]`,
+		},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+	})
+	require.NoError(t, err)
+	assert.Zero(t, connectCalls, "normalized bracketed IPv6 must match the unbracketed live traddr")
+}
+
+func TestSetNVMeoFQueueDepthPolicyAppliesAllMatchingSubsystems(t *testing.T) {
+	originalPolicy := nodeSetNVMeIOPolicy
+	t.Cleanup(func() { nodeSetNVMeIOPolicy = originalPolicy })
+	var names []string
+	nodeSetNVMeIOPolicy = func(name, policy string) error {
+		assert.Equal(t, "queue-depth", policy)
+		names = append(names, name)
+		return nil
+	}
+
+	newTestNodeDriver(ShareTypeNVMeoF).setNVMeoFQueueDepthPolicy("nqn.gf5:policy", []util.NVMeSubsystem{
+		{NQN: "nqn.gf5:policy", Name: "nvme-subsys7"},
+		{NQN: "nqn.gf5:other", Name: "nvme-subsys8"},
+		{NQN: "nqn.gf5:policy", Name: "nvme-subsys9"},
+	})
+	assert.Equal(t, []string{"nvme-subsys7", "nvme-subsys9"}, names)
+}
+
+func TestNodeStageVolumeMultipathRestageTopsUpMissingPaths(t *testing.T) {
+	installFakeNodeCommands(t, "findmnt")
+	originalInfo := nodeGetNVMeInfo
+	originalList := nodeListNVMeSubsystems
+	originalConnect := nvmeConnectPathWithSubsystems
+	originalPolicy := nodeSetNVMeIOPolicy
+	t.Cleanup(func() {
+		nodeGetNVMeInfo = originalInfo
+		nodeListNVMeSubsystems = originalList
+		nvmeConnectPathWithSubsystems = originalConnect
 		nodeSetNVMeIOPolicy = originalPolicy
 	})
 	nodeGetNVMeInfo = func(string) (string, error) { return "nqn.test:restage", nil }
@@ -2261,8 +2472,12 @@ func TestNodeStageVolumeMultipathRestageTopsUpMissingPaths(t *testing.T) {
 	}}
 	nodeListNVMeSubsystems = func(context.Context) ([]util.NVMeSubsystem, error) { return subsystems, nil }
 	var connectURIs []string
-	nvmeConnectWithSubsystems = func(_ context.Context, _ string, uri string, _ *util.NVMeoFConnectOptions, got []util.NVMeSubsystem) (string, error) {
+	nvmeConnectPathWithSubsystems = func(connectCtx context.Context, _ string, uri string, opts *util.NVMeoFConnectOptions, got []util.NVMeSubsystem) (string, error) {
 		assert.Equal(t, subsystems, got)
+		deadline, bounded := connectCtx.Deadline()
+		assert.True(t, bounded, "already-staged top-up must have a short deadline")
+		assert.LessOrEqual(t, time.Until(deadline), nvmeSecondaryPathConvergeBudget+time.Second)
+		assert.LessOrEqual(t, opts.DeviceTimeout, nvmeSecondaryPathConvergeBudget)
 		connectURIs = append(connectURIs, uri)
 		return "/dev/null", nil
 	}
@@ -2493,7 +2708,7 @@ func TestNodeUnstageBlockSymlinkDoesNotTrustDeviceSession(t *testing.T) {
 	assert.NotContains(t, log, "iscsiadm -m session")
 }
 
-func TestNodeUnstageVolumeNVMeMultipathDisconnectsWholeSubsystem(t *testing.T) {
+func TestNodeUnstageVolumeNVMePassesContextToNQNDisconnect(t *testing.T) {
 	installFakeNodeCommands(t, "findmnt", "umount")
 	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme7n1")
 	originalGetInfo := nodeGetNVMeInfo
@@ -2513,8 +2728,9 @@ func TestNodeUnstageVolumeNVMeMultipathDisconnectsWholeSubsystem(t *testing.T) {
 		return nil
 	}
 
-	// A bare disconnect by NQN is intentionally one call: nvme-cli defines it
-	// as removing every controller connected to that subsystem.
+	// This unit test proves the driver makes one NQN-scoped call and preserves
+	// the inbound context. The fact that nvme-cli removes every controller for
+	// that NQN is nvme-cli's contract, not a property this stub can prove.
 	stagingPath := t.TempDir()
 	_, err := newTestNodeDriver(ShareTypeNVMeoF).NodeUnstageVolume(ctx, &csi.NodeUnstageVolumeRequest{
 		VolumeId: "multipath-volume", StagingTargetPath: stagingPath,

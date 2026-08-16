@@ -204,6 +204,15 @@ var (
 		[]string{"transport", "result"},
 	)
 
+	nvmePathConnectTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "nvme_path_connect_total",
+			Help:      "Total number of NVMe-oF path convergence results by transport address",
+		},
+		[]string{"address", "result"},
+	)
+
 	gcSessionsDisconnectedTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -758,6 +767,11 @@ func SetNVMESessions(count int) {
 // RecordNodeConnect records a node transport connection attempt.
 func RecordNodeConnect(transport, result string) {
 	nodeConnectTotal.WithLabelValues(transport, result).Inc()
+}
+
+// RecordNVMePathConnect records one requested NVMe-oF path convergence result.
+func RecordNVMePathConnect(address, result string) {
+	nvmePathConnectTotal.WithLabelValues(address, result).Inc()
 }
 
 // RecordGCSessionDisconnected records a successful orphan session disconnect.

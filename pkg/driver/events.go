@@ -41,6 +41,7 @@ const (
 	EventReasonSnapshotTaskFailed  = "SnapshotTaskFailed"
 	EventReasonISCSILoginFailed    = "ISCSILoginFailed"
 	EventReasonNVMeConnectFailed   = "NVMeConnectFailed"
+	EventReasonNVMePathDegraded    = "NVMePathDegraded"
 	EventReasonMountFailed         = "MountFailed"
 	EventReasonISCSILogoutFailed   = "ISCSILogoutFailed"
 	EventReasonNFSMountFailed      = "NFSMountFailed"

@@ -309,6 +309,11 @@ func TestTransportCountersIncrementThroughMetricsRegistry(t *testing.T) {
 		RecordGCSessionDisconnected(transport)
 		assert.Equal(t, before+1, testutil.ToFloat64(counter))
 	}
+
+	pathCounter := nvmePathConnectTotal.WithLabelValues("192.0.2.80", "error")
+	pathBefore := testutil.ToFloat64(pathCounter)
+	RecordNVMePathConnect("192.0.2.80", "error")
+	assert.Equal(t, pathBefore+1, testutil.ToFloat64(pathCounter))
 }
 
 func TestSetOrphanReconcileMetrics(t *testing.T) {
