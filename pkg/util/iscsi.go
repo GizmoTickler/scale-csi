@@ -1107,15 +1107,19 @@ func isAuthFailure(err error) bool {
 
 // GetDeviceWWN returns the WWN (World Wide Name) for a device.
 func GetDeviceWWN(devicePath string) (string, error) {
+	return getDeviceWWNInPaths(devicePath, "/sys/block")
+}
+
+func getDeviceWWNInPaths(devicePath, sysBlockRoot string) (string, error) {
 	// Get the device name without /dev/
 	deviceName := filepath.Base(devicePath)
 
 	// Read the WWN from sysfs
-	wwnPath := fmt.Sprintf("/sys/block/%s/device/wwid", deviceName)
+	wwnPath := filepath.Join(sysBlockRoot, deviceName, "device", "wwid")
 	wwn, err := os.ReadFile(wwnPath)
 	if err != nil {
 		// Try alternative path
-		wwnPath = fmt.Sprintf("/sys/block/%s/device/vpd_pg83", deviceName)
+		wwnPath = filepath.Join(sysBlockRoot, deviceName, "device", "vpd_pg83")
 		wwn, err = os.ReadFile(wwnPath)
 		if err != nil {
 			return "", fmt.Errorf("failed to read WWN: %w", err)
@@ -1130,7 +1134,11 @@ func GetDeviceWWN(devicePath string) (string, error) {
 // while multipath's dm UUID uses the SCSI identifier type nibble (for example
 // "3" for NAA). Keeping this conversion here avoids guessing from /dev names.
 func GetSCSIWWID(devicePath string) (string, error) {
-	wwid, err := GetDeviceWWN(devicePath)
+	return getSCSIWWIDInPaths(devicePath, "/sys/block")
+}
+
+func getSCSIWWIDInPaths(devicePath, sysBlockRoot string) (string, error) {
+	wwid, err := getDeviceWWNInPaths(devicePath, sysBlockRoot)
 	if err != nil {
 		return "", err
 	}

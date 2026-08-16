@@ -1556,6 +1556,38 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 			"ServiceReload":            1,
 		})
 	})
+	t.Run("off iSCSI multipath publish", func(t *testing.T) {
+		client := newAPICallCountingClient()
+		client.ISCSIPortals[2] = &truenas.ISCSIPortal{
+			ID: 2, Tag: 2, Listen: []truenas.ISCSIPortalListen{{IP: "192.0.2.11", Port: 3260}},
+		}
+		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeOff)
+		d.config.ISCSI.Multipath = true
+		d.config.ISCSI.Portals = []string{"192.0.2.11"}
+		_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("off-iscsi-multipath", "iscsi"))
+		require.NoError(t, err)
+		nodeA, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.2018-01.org.scale:worker-a"})
+		require.NoError(t, err)
+		client.resetCalls()
+		response, err := d.ControllerPublishVolume(ctx, iscsiPublishRequest("off-iscsi-multipath", nodeA))
+		require.NoError(t, err)
+		assert.Equal(t, `["192.0.2.10:3260","192.0.2.11:3260"]`, response.GetPublishContext()["portals"])
+		// Ten calls: the eight-call single-path floor above plus exactly one
+		// ISCSIPortalList and one ISCSIInitiatorGet for the single distinct
+		// initiator template inspected by publish-time multipath convergence.
+		assertAPICallCount(t, "off iSCSI multipath publish", client, 10)
+		assertAPICallMethodMap(t, "off iSCSI multipath publish", client, map[string]int{
+			"DatasetGet":               1,
+			"ISCSITargetGet":           1,
+			"ISCSIPortalList":          1,
+			"ISCSIInitiatorGet":        1,
+			"WaitForZvolReady":         1,
+			"ISCSIExtentGet":           1,
+			"ISCSITargetExtentGet":     1,
+			"DatasetSetUserProperties": 2,
+			"ServiceReload":            1,
+		})
+	})
 	t.Run("off iSCSI unpublish", func(t *testing.T) {
 		client := newAPICallCountingClient()
 		d := newFencedAPICallCountDriver(t, client, "iscsi", FencingModeOff)

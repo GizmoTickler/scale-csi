@@ -976,6 +976,31 @@ func TestNormalizeSCSIWWIDTranslatesT10Spaces(t *testing.T) {
 	assert.Equal(t, "1ATA_____TrueNAS_Disk_01", normalizeSCSIWWID("t10.ATA     TrueNAS Disk 01"))
 }
 
+func TestT10SCSIWWIDNormalizationFlowsThroughDeviceAndMapLookups(t *testing.T) {
+	root := t.TempDir()
+	sysBlockRoot := filepath.Join(root, "sys", "block")
+	devRoot := filepath.Join(root, "dev")
+	const rawWWID = "t10.ATA     TrueNAS Disk 01"
+	const normalizedWWID = "1ATA_____TrueNAS_Disk_01"
+
+	deviceRoot := filepath.Join(sysBlockRoot, "sda", "device")
+	require.NoError(t, os.MkdirAll(deviceRoot, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(deviceRoot, "wwid"), []byte(rawWWID+"\n"), 0o600))
+	deviceWWID, err := getSCSIWWIDInPaths(filepath.Join(devRoot, "sda"), sysBlockRoot)
+	require.NoError(t, err)
+	assert.Equal(t, normalizedWWID, deviceWWID)
+
+	dmRoot := filepath.Join(sysBlockRoot, "dm-5", "dm")
+	require.NoError(t, os.MkdirAll(dmRoot, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "uuid"), []byte("mpath-"+normalizedWWID+"\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dmRoot, "name"), []byte("t10-map\n"), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(devRoot, "mapper"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(devRoot, "mapper", "t10-map"), nil, 0o600))
+	mapDevice, err := findISCSIMultipathDeviceInPaths(rawWWID, sysBlockRoot, devRoot)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(devRoot, "mapper", "t10-map"), mapDevice)
+}
+
 func TestCheckISCSIMultipathPrerequisites(t *testing.T) {
 	root := t.TempDir()
 	devRoot := filepath.Join(root, "dev")
