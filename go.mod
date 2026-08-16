@@ -1,6 +1,6 @@
 module github.com/GizmoTickler/scale-csi
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/container-storage-interface/spec v1.12.0
