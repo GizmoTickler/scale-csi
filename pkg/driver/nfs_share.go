@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 
@@ -39,7 +40,31 @@ func (b nfsShareBackend) VolumeContext(ctx context.Context, ds *truenas.Dataset,
 func (d *Driver) nfsVolumeContext(ds *truenas.Dataset, volumeContext map[string]string) error {
 	volumeContext["server"] = d.config.NFS.ShareHost
 	volumeContext["share"] = ds.Mountpoint
+	// Keep the create-time hint for old controllers/nodes. The mutable publish
+	// context carries the same encoding so pre-existing PVs can opt into
+	// trunking on their next real detach/attach.
+	publishContext, err := d.nfsPublishContext()
+	if err != nil {
+		return err
+	}
+	for key, value := range publishContext {
+		volumeContext[key] = value
+	}
 	return nil
+}
+
+func (d *Driver) nfsPublishContext() (map[string]string, error) {
+	addresses := d.config.NFS.trunkingAddresses()
+	if len(addresses) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(addresses)
+	if err != nil {
+		// []string is not rejectable by encoding/json; retain a defensive error
+		// contract because this helper is shared by create and publish.
+		return nil, status.Errorf(codes.Internal, "failed to encode NFS trunking addresses: %v", err)
+	}
+	return map[string]string{"addresses": string(encoded)}, nil
 }
 
 // ensureNFSShareExists is the NFS EnsureShare implementation.

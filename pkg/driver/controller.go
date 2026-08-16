@@ -1855,12 +1855,31 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	}
 
 	var publishContext map[string]string
-	if shareType == ShareTypeNVMeoF {
+	switch shareType {
+	case ShareTypeNVMeoF:
 		// ensureShareExists has already associated every configured multipath port
 		// on both the fresh-share and already-exists paths. Only advertise the
 		// address set after that convergence succeeds, so the response can never
 		// promise a path this publish failed to associate.
 		pc, pcErr := d.nvmeofPublishContext()
+		if pcErr != nil {
+			return nil, pcErr
+		}
+		publishContext = pc
+	case ShareTypeISCSI:
+		// ensureShareExists has converged the target's portal groups and the
+		// fence pass has applied the same initiator allowlist to every portal.
+		// Advertise only after both security-sensitive steps succeed.
+		pc, pcErr := d.iscsiPublishContext()
+		if pcErr != nil {
+			return nil, pcErr
+		}
+		publishContext = pc
+	case ShareTypeNFS:
+		// NFS trunking is client-negotiated rather than a backend object graph,
+		// but the export and publication fence must still exist before the node
+		// receives additional addresses.
+		pc, pcErr := d.nfsPublishContext()
 		if pcErr != nil {
 			return nil, pcErr
 		}

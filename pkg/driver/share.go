@@ -90,35 +90,11 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 		return d.iscsiResolvedGroup, nil
 	}
 
-	host, portStr, err := net.SplitHostPort(d.config.ISCSI.TargetPortal)
+	portalIDs, err := d.resolveISCSIPortalIDsForEndpoints(ctx, []string{d.config.ISCSI.TargetPortal})
 	if err != nil {
-		host = d.config.ISCSI.TargetPortal
-		portStr = "3260"
+		return nil, fmt.Errorf("%w — create the portal in TrueNAS or set iscsi.targetGroups explicitly", err)
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid iscsi.targetPortal %q: %w", d.config.ISCSI.TargetPortal, err)
-	}
-
-	portals, err := d.truenasClient.ISCSIPortalList(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list iSCSI portals: %w", err)
-	}
-	portalID := 0
-	for _, p := range portals {
-		for _, l := range p.Listen {
-			if l.IP == host && l.Port == port {
-				portalID = p.ID
-				break
-			}
-		}
-		if portalID != 0 {
-			break
-		}
-	}
-	if portalID == 0 {
-		return nil, fmt.Errorf("no TrueNAS iSCSI portal listens on configured targetPortal %q — create one in TrueNAS or set iscsi.targetGroups explicitly", d.config.ISCSI.TargetPortal)
-	}
+	portalID := portalIDs[0]
 
 	initiators, err := d.truenasClient.ISCSIInitiatorList(ctx)
 	if err != nil {
@@ -153,6 +129,50 @@ func (d *Driver) resolveISCSITargetGroup(ctx context.Context) (*truenas.ISCSITar
 	d.iscsiResolvedGroup = group
 	klog.Infof("Resolved iSCSI target group automatically: portal=%d (matches %s), initiator=%d", portalID, d.config.ISCSI.TargetPortal, initiatorID)
 	return group, nil
+}
+
+// resolveISCSIPortalIDsForEndpoints maps canonical host:port endpoints to
+// TrueNAS portal group IDs in endpoint order. Portal objects are appliance
+// configuration and are not created by this driver; target-to-portal group
+// associations are the per-volume objects GF6 converges.
+func (d *Driver) resolveISCSIPortalIDsForEndpoints(ctx context.Context, endpoints []string) ([]int, error) {
+	portals, err := d.truenasClient.ISCSIPortalList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list iSCSI portals: %w", err)
+	}
+	resolved := make([]int, 0, len(endpoints))
+	seen := make(map[int]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		host, portText, splitErr := net.SplitHostPort(endpoint)
+		if splitErr != nil {
+			host, portText = endpoint, "3260"
+		}
+		port, parseErr := strconv.Atoi(portText)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid iSCSI portal %q: %w", endpoint, parseErr)
+		}
+		portalID := 0
+		for _, portal := range portals {
+			for _, listen := range portal.Listen {
+				if listen.IP == host && listen.Port == port {
+					portalID = portal.ID
+					break
+				}
+			}
+			if portalID != 0 {
+				break
+			}
+		}
+		if portalID == 0 {
+			return nil, fmt.Errorf("no TrueNAS iSCSI portal listens on configured endpoint %q", endpoint)
+		}
+		if _, duplicate := seen[portalID]; duplicate {
+			continue
+		}
+		seen[portalID] = struct{}{}
+		resolved = append(resolved, portalID)
+	}
+	return resolved, nil
 }
 
 func (d *Driver) invalidateISCSITargetGroup() {

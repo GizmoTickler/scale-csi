@@ -535,7 +535,150 @@ iscsi:
 `)
 	require.NoError(t, err)
 	assert.Contains(t, warning, "iscsi.targetPortals")
-	assert.Contains(t, warning, "does not currently support iSCSI multipath")
+	assert.Contains(t, warning, "iscsi.multipath=true and iscsi.portals")
+}
+
+func TestLoadConfigISCSIMultipathNormalizesAndDeduplicatesPortals(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+iscsi:
+  enabled: true
+  targetPortal: "[2001:db8::10]:3261"
+  multipath: true
+  portals:
+    - "[2001:db8::11]"
+    - "2001:db8::10"
+    - "2001:db8::12"
+`)
+	require.NoError(t, err)
+	assert.Equal(t, "[2001:db8::10]:3261", cfg.ISCSI.TargetPortal)
+	assert.Equal(t, []string{
+		"[2001:db8::10]:3261",
+		"[2001:db8::11]:3261",
+		"[2001:db8::12]:3261",
+	}, cfg.ISCSI.multipathPortals())
+}
+
+func TestLoadConfigRejectsInvalidISCSIMultipathPortals(t *testing.T) {
+	tests := []struct {
+		name       string
+		primary    string
+		additional string
+		wantField  string
+	}{
+		{name: "hostname primary", primary: "storage.invalid:3260", additional: "192.0.2.11", wantField: "iscsi.targetPortal"},
+		{name: "port in additional", primary: "192.0.2.10:3260", additional: "192.0.2.11:3260", wantField: "iscsi.portals[0]"},
+		{name: "hostname additional", primary: "192.0.2.10:3260", additional: "storage.invalid", wantField: "iscsi.portals[0]"},
+		{name: "whitespace", primary: "192.0.2.10:3260", additional: " 192.0.2.11", wantField: "iscsi.portals[0]"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+iscsi:
+  enabled: true
+  targetPortal: %q
+  multipath: true
+  portals: [%q]
+`, test.primary, test.additional))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.wantField)
+		})
+	}
+}
+
+func TestLoadConfigRejectsISCSIMultipathWithoutAdditionalPortal(t *testing.T) {
+	_, err := loadTestConfig(t, requiredTestConfig+`
+iscsi:
+  enabled: true
+  targetPortal: 192.0.2.10:3260
+  multipath: true
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "iscsi.portals")
+}
+
+func TestLoadConfigNFSTransportKnobs(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: "[2001:db8::20]"
+  nconnect: 8
+  trunking: true
+  addresses:
+    - "[2001:db8::21]"
+    - "2001:db8::20"
+    - "2001:db8::22"
+`)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.NFS.NConnect)
+	assert.Equal(t, 8, *cfg.NFS.NConnect)
+	assert.Equal(t, []string{"2001:db8::20", "2001:db8::21", "2001:db8::22"}, cfg.NFS.trunkingAddresses())
+}
+
+func TestLoadConfigRejectsInvalidNFSTransportKnobs(t *testing.T) {
+	for _, nconnect := range []int{0, 17} {
+		t.Run(fmt.Sprintf("nconnect-%d", nconnect), func(t *testing.T) {
+			_, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.20
+  nconnect: %d
+`, nconnect))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "nfs.nconnect")
+		})
+	}
+	for _, test := range []struct {
+		name      string
+		shareHost string
+		address   string
+		wantField string
+	}{
+		{name: "hostname primary", shareHost: "storage.invalid", address: "192.0.2.21", wantField: "nfs.shareHost"},
+		{name: "port", shareHost: "192.0.2.20", address: "192.0.2.21:2049", wantField: "nfs.addresses[0]"},
+		{name: "hostname", shareHost: "192.0.2.20", address: "storage.invalid", wantField: "nfs.addresses[0]"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadTestConfig(t, requiredTestConfig+fmt.Sprintf(`
+nfs:
+  enabled: true
+  shareHost: %q
+  trunking: true
+  addresses: [%q]
+`, test.shareHost, test.address))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.wantField)
+		})
+	}
+}
+
+func TestLoadConfigRejectsNFSTrunkingWithoutAddresses(t *testing.T) {
+	_, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.20
+  trunking: true
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nfs.addresses")
+}
+
+func TestTransportMultipathDisabledPreservesLegacyValues(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: storage.invalid
+  addresses: [also.invalid]
+iscsi:
+  enabled: true
+  targetPortal: storage.invalid:3260
+  portals: [also.invalid]
+`)
+	require.NoError(t, err)
+	assert.Nil(t, cfg.NFS.NConnect)
+	assert.Nil(t, cfg.NFS.trunkingAddresses())
+	assert.Nil(t, cfg.ISCSI.multipathPortals())
+	assert.Equal(t, "storage.invalid", cfg.NFS.ShareHost)
+	assert.Equal(t, "storage.invalid:3260", cfg.ISCSI.TargetPortal)
 }
 
 // TestLoadConfigWarnsForOrphanedGlobalSquashGroup covers the config-load half of

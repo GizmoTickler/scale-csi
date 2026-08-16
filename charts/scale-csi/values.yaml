@@ -457,6 +457,22 @@ nfs:
   # NFS server address (defaults to TrueNAS host)
   server: ""
 
+  # Optional number of TCP connections to EACH server IP. Unset omits the
+  # nconnect mount option and preserves the historical mount command. This can
+  # improve throughput to one address but is not address/path failover.
+  # Valid range: 1..16.
+  nconnect: null
+
+  # NFSv4.1+ session trunking across multiple server IPs. The node mounts the
+  # primary server with max_connect and probes every additional address so the
+  # Linux client can prove that they share one NFS server identity/session.
+  # This is not dm-multipath, and it degrades to the primary mount when the
+  # negotiated NFS version or server/client support is insufficient.
+  trunking: false
+  # Additional server IP literals. `server` is always first; duplicates are
+  # collapsed. Must be non-empty when trunking=true.
+  addresses: []
+
   # Networks allowed to mount dynamically-created shares. An empty list allows
   # all networks and should be restricted in production.
   shareAllowedNetworks: []
@@ -526,10 +542,10 @@ nfs:
   #   v4.1-lowlat:     nfsvers=4.1,nconnect=4,hard,noatime,ac
   #   v3-compat:       nfsvers=3,hard,noatime
   #
-  # `nconnect` (multiple TCP connections behind one NFSv4.1 session — session
-  # trunking) is a pure client-side option needing no server state, and the
-  # kernel silently ignores it on v3. The driver passes mountOptions through
-  # unchanged and only logs a warning for contradictory combinations.
+  # `nconnect` creates multiple TCP connections to ONE server address; it is not
+  # NFS session trunking and does not add another address or a failover path.
+  # The first mount to a server fixes that client's connection count, so keep
+  # this chart-level value consistent with per-class mountOptions.
 
 # iSCSI configuration
 iscsi:
@@ -541,6 +557,15 @@ iscsi:
 
   # Target portal port
   portalPort: 3260
+
+  # Multi-portal iSCSI. The controller associates every volume target with all
+  # configured TrueNAS portal groups; the node logs in to each address and uses
+  # host dm-multipath to aggregate the resulting SCSI devices by WWID. This is
+  # intentionally different from NVMe's native kernel multipath.
+  multipath: false
+  # Additional portal IP literals. `portal` plus `portalPort` is always first;
+  # duplicates are collapsed. Must be non-empty when multipath=true.
+  portals: []
 
   # Explicit TrueNAS portal/initiator group associations for created targets
   # (install-specific database IDs). Leave empty to let the driver resolve

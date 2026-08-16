@@ -194,6 +194,53 @@ jobs:
             echo "${deprecated_render}"
             exit 1
           fi
+      - name: Validate GF6 transport values and rendering
+        run: |
+          default_config="$(helm template gf6-default charts/scale-csi/ \
+            --show-only templates/configmap.yaml \
+            --set truenas.host=192.0.2.10 \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=pool/test)"
+          if grep -Eq '^      (nconnect|trunking|multipath|portals|addresses):' <<<"${default_config}"; then
+            echo "default ConfigMap unexpectedly rendered a GF6 opt-in key"
+            echo "${default_config}"
+            exit 1
+          fi
+
+          enabled_config="$(helm template gf6-enabled charts/scale-csi/ \
+            --show-only templates/configmap.yaml \
+            --set truenas.host=192.0.2.10 \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=pool/test \
+            --set nfs.server=192.0.2.20 \
+            --set nfs.nconnect=8 \
+            --set nfs.trunking=true \
+            --set 'nfs.addresses[0]=192.0.2.21' \
+            --set iscsi.portal=192.0.2.30 \
+            --set iscsi.multipath=true \
+            --set 'iscsi.portals[0]=192.0.2.31')"
+          grep -q '^      nconnect: 8$' <<<"${enabled_config}"
+          grep -q '^      trunking: true$' <<<"${enabled_config}"
+          grep -q '^      multipath: true$' <<<"${enabled_config}"
+          grep -q '192.0.2.21' <<<"${enabled_config}"
+          grep -q '192.0.2.31' <<<"${enabled_config}"
+
+          if helm template gf6-invalid-nconnect charts/scale-csi/ \
+            --set truenas.host=192.0.2.10 \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=pool/test \
+            --set nfs.nconnect=17 >/dev/null 2>&1; then
+            echo "nfs.nconnect=17 unexpectedly passed chart validation"
+            exit 1
+          fi
+          if helm template gf6-invalid-iscsi charts/scale-csi/ \
+            --set truenas.host=192.0.2.10 \
+            --set truenas.existingSecret=test-secret \
+            --set zfs.parentDataset=pool/test \
+            --set iscsi.multipath=true >/dev/null 2>&1; then
+            echo "iscsi.multipath=true unexpectedly accepted an empty portal list"
+            exit 1
+          fi
       - name: Validate Kubernetes manifests
         uses: stackrox/kube-linter-action@87802a2f4e01abebb3ee3c67a3002fea71f6eae5 # v1
         with:

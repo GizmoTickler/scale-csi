@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -250,6 +252,19 @@ type NFSConfig struct {
 	// ShareHost is the NFS server hostname/IP for clients to connect
 	ShareHost string `yaml:"shareHost"`
 
+	// NConnect requests multiple TCP connections to each mounted server IP.
+	// Nil means omit the option entirely and preserve the historical mount argv.
+	NConnect *int `yaml:"nconnect"`
+
+	// Trunking enables NFSv4.1+ session trunking across ShareHost plus Addresses.
+	// Unlike block multipath this is an NFS client session feature: the node first
+	// mounts ShareHost with max_connect, then probes each additional address.
+	Trunking bool `yaml:"trunking"`
+
+	// Addresses lists additional NFS server IP literals used when Trunking is
+	// enabled. ShareHost is always first and duplicates are collapsed.
+	Addresses []string `yaml:"addresses"`
+
 	// ShareAllowedNetworks is a list of allowed networks (CIDR notation)
 	ShareAllowedNetworks []string `yaml:"shareAllowedNetworks"`
 
@@ -318,8 +333,19 @@ type ISCSIConfig struct {
 	// TargetPortal is the iSCSI target portal (host:port)
 	TargetPortal string `yaml:"targetPortal"`
 
-	// TargetPortals is a list of additional portals for multipath
+	// TargetPortals is the retired pre-GF6 additional-portal key.
+	//
+	// Deprecated: this pre-GF6 key remains accepted but inert. Use Portals with
+	// Multipath instead.
 	TargetPortals []string `yaml:"targetPortals"`
+
+	// Multipath enables multi-portal iSCSI login and dm-multipath aggregation.
+	// It is deliberately separate from NVMe-oF native multipath.
+	Multipath bool `yaml:"multipath"`
+
+	// Portals lists additional target IP literals. TargetPortal supplies the
+	// canonical port and is always advertised first.
+	Portals []string `yaml:"portals"`
 
 	// Interface is the iSCSI interface to use (default: "default")
 	Interface string `yaml:"interface"`
@@ -356,6 +382,51 @@ type ISCSIConfig struct {
 	// value (Enabled=false) leaves every target group at authmethod=NONE, so a
 	// deployment that never sets this block behaves exactly as before CHAP existed.
 	CHAP ISCSICHAPSettings `yaml:"chap"`
+}
+
+// trunkingAddresses returns the ordered, de-duplicated NFS address set. The
+// zero value is intentionally nil so legacy mounts gain no new context key.
+func (c NFSConfig) trunkingAddresses() []string {
+	if !c.Trunking {
+		return nil
+	}
+	return orderedUniqueNonEmpty(append([]string{c.ShareHost}, c.Addresses...))
+}
+
+// multipathPortals returns canonical host:port endpoints for node login. The
+// config validator has already normalized the enabled case, so SplitHostPort
+// cannot fail here; returning nil remains the safe legacy fallback.
+func (c ISCSIConfig) multipathPortals() []string {
+	if !c.Multipath {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(c.TargetPortal)
+	if err != nil {
+		return nil
+	}
+	portals := make([]string, 0, len(c.Portals)+1)
+	portals = append(portals, net.JoinHostPort(host, port))
+	for _, address := range c.Portals {
+		portals = append(portals, net.JoinHostPort(address, port))
+	}
+	return orderedUniqueNonEmpty(portals)
+}
+
+func orderedUniqueNonEmpty(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 // ISCSICHAPSettings holds the controller-wide iSCSI CHAP posture. Credentials
@@ -946,7 +1017,7 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	if len(cfg.ISCSI.TargetPortals) > 0 {
-		configWarningf("iscsi.targetPortals is configured with %d additional portal(s), but scale-csi does not currently support iSCSI multipath; only iscsi.targetPortal will be used", len(cfg.ISCSI.TargetPortals))
+		configWarningf("iscsi.targetPortals is a deprecated inert key with %d entry/entries; use iscsi.multipath=true and iscsi.portals instead", len(cfg.ISCSI.TargetPortals))
 	}
 	warnDeprecatedConfigKeys(data)
 	if strings.TrimSpace(cfg.DriverInstanceID) == "" {
@@ -1264,11 +1335,52 @@ func validateConfig(cfg *Config) error {
 	if cfg.NFS.Enabled && cfg.NFS.ShareHost == "" {
 		return fmt.Errorf("nfs.shareHost is required when NFS is enabled")
 	}
+	if cfg.NFS.NConnect != nil && (*cfg.NFS.NConnect < 1 || *cfg.NFS.NConnect > 16) {
+		return fmt.Errorf("nfs.nconnect must be between 1 and 16 (got %d)", *cfg.NFS.NConnect)
+	}
+	if cfg.NFS.Trunking && len(cfg.NFS.Addresses) == 0 {
+		return fmt.Errorf("nfs.addresses must list at least one additional storage address when nfs.trunking is enabled")
+	}
+	if cfg.NFS.Trunking {
+		shareHost, addressErr := normalizeNVMeoFAddress(cfg.NFS.ShareHost)
+		if addressErr != nil {
+			return fmt.Errorf("nfs.shareHost must be an IP address when nfs.trunking is enabled: %w", addressErr)
+		}
+		normalizedAddresses := make([]string, len(cfg.NFS.Addresses))
+		for i, rawAddress := range cfg.NFS.Addresses {
+			address, addressErr := normalizeNVMeoFAddress(rawAddress)
+			if addressErr != nil {
+				return fmt.Errorf("nfs.addresses[%d] must be an IP address: %w", i, addressErr)
+			}
+			normalizedAddresses[i] = address
+		}
+		cfg.NFS.ShareHost = shareHost
+		cfg.NFS.Addresses = normalizedAddresses
+	}
 	if err := validateNFSExportConfig(&cfg.NFS); err != nil {
 		return err
 	}
 	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {
 		return fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
+	}
+	if cfg.ISCSI.Multipath && len(cfg.ISCSI.Portals) == 0 {
+		return fmt.Errorf("iscsi.portals must list at least one additional storage address when iscsi.multipath is enabled")
+	}
+	if cfg.ISCSI.Multipath {
+		primary, portalErr := normalizeISCSITargetPortal(cfg.ISCSI.TargetPortal)
+		if portalErr != nil {
+			return fmt.Errorf("iscsi.targetPortal must contain an IP address when iscsi.multipath is enabled: %w", portalErr)
+		}
+		normalizedPortals := make([]string, len(cfg.ISCSI.Portals))
+		for i, rawPortal := range cfg.ISCSI.Portals {
+			portal, portalErr := normalizeNVMeoFAddress(rawPortal)
+			if portalErr != nil {
+				return fmt.Errorf("iscsi.portals[%d] must be an IP address: %w", i, portalErr)
+			}
+			normalizedPortals[i] = portal
+		}
+		cfg.ISCSI.TargetPortal = primary
+		cfg.ISCSI.Portals = normalizedPortals
 	}
 	if cfg.NVMeoF.Enabled {
 		if cfg.NVMeoF.TransportAddress == "" {
@@ -1304,6 +1416,29 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+func normalizeISCSITargetPortal(rawPortal string) (string, error) {
+	if rawPortal != strings.TrimSpace(rawPortal) || rawPortal == "" {
+		return "", fmt.Errorf("invalid portal %q", rawPortal)
+	}
+	host, portText, err := net.SplitHostPort(rawPortal)
+	if err != nil {
+		address, addressErr := normalizeNVMeoFAddress(rawPortal)
+		if addressErr != nil {
+			return "", addressErr
+		}
+		return net.JoinHostPort(address, "3260"), nil
+	}
+	address, err := normalizeNVMeoFAddress(host)
+	if err != nil {
+		return "", err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid port %q", portText)
+	}
+	return net.JoinHostPort(address, strconv.Itoa(port)), nil
 }
 
 // validateNFSExportConfig validates (and normalizes) the GLOBAL NFS export

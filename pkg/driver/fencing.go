@@ -1252,6 +1252,9 @@ func (d *Driver) applyNFSFence(
 }
 
 func (d *Driver) resolveISCSIPortalIDs(ctx context.Context) ([]int, error) {
+	if d.config.ISCSI.Multipath {
+		return d.resolveISCSIPortalIDsForEndpoints(ctx, d.config.ISCSI.multipathPortals())
+	}
 	if len(d.config.ISCSI.TargetGroups) > 0 {
 		ids := make([]string, 0, len(d.config.ISCSI.TargetGroups))
 		for _, group := range d.config.ISCSI.TargetGroups {

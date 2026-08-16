@@ -1080,6 +1080,29 @@
               }
             }
           }
+        },
+        {
+          "title": "NFS trunking requires at least one additional address",
+          "if": {
+            "properties": {
+              "trunking": {
+                "const": true
+              }
+            },
+            "required": [
+              "trunking"
+            ]
+          },
+          "then": {
+            "properties": {
+              "addresses": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "addresses"
+            ]
+          }
         }
       ],
       "properties": {
@@ -1088,6 +1111,23 @@
         },
         "server": {
           "type": "string"
+        },
+        "nconnect": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 16
+        },
+        "trunking": {
+          "type": "boolean"
+        },
+        "addresses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "shareAllowedNetworks": {
           "type": "array",
@@ -1148,6 +1188,31 @@
     "iscsi": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "title": "iSCSI multipath requires at least one additional portal",
+          "if": {
+            "properties": {
+              "multipath": {
+                "const": true
+              }
+            },
+            "required": [
+              "multipath"
+            ]
+          },
+          "then": {
+            "properties": {
+              "portals": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "portals"
+            ]
+          }
+        }
+      ],
       "properties": {
         "enabled": {
           "type": "boolean"
@@ -1159,6 +1224,15 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 65535
+        },
+        "multipath": {
+          "type": "boolean"
+        },
+        "portals": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "extentBlocksize": {
           "type": "integer",

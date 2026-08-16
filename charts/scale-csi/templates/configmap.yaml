@@ -73,6 +73,14 @@ data:
     nfs:
       enabled: true
       shareHost: {{ .Values.nfs.server | default .Values.truenas.host | quote }}
+      {{- with .Values.nfs.nconnect }}
+      nconnect: {{ . }}
+      {{- end }}
+      {{- if .Values.nfs.trunking }}
+      trunking: true
+      addresses:
+        {{- toYaml .Values.nfs.addresses | nindent 8 }}
+      {{- end }}
       shareAllowedNetworks:
         {{- toYaml .Values.nfs.shareAllowedNetworks | nindent 8 }}
       shareAllowedHosts: []
@@ -113,6 +121,11 @@ data:
       {{- end }}
       targetPortal: {{ $portal | quote }}
       interface: "default"
+      {{- if .Values.iscsi.multipath }}
+      multipath: true
+      portals:
+        {{- toYaml .Values.iscsi.portals | nindent 8 }}
+      {{- end }}
       {{- if .Values.iscsi.targetGroups }}
       # Static portal/initiator groups (install-specific TrueNAS database ids).
       # Fenced modes resolve the portal and create a per-volume initiator group;

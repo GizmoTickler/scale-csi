@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"strconv"
@@ -54,6 +55,15 @@ func (d *Driver) iscsiVolumeContext(ctx context.Context, ds *truenas.Dataset, da
 	volumeContext["portal"] = d.config.ISCSI.TargetPortal
 	volumeContext["lun"] = "0"
 	volumeContext["interface"] = d.config.ISCSI.Interface
+	// iSCSI has no native namespace aggregation equivalent to NVMe-oF. The node
+	// consumes these portal endpoints only when host dm-multipath is available.
+	publishContext, publishErr := d.iscsiPublishContext()
+	if publishErr != nil {
+		return publishErr
+	}
+	for key, value := range publishContext {
+		volumeContext[key] = value
+	}
 	// Advertise the CHAP mode (never credentials) so the node knows to expect a
 	// node-stage secret and which direction to configure. Prefer the request
 	// resolution on create; otherwise read the immutable stored per-volume mode
@@ -64,6 +74,108 @@ func (d *Driver) iscsiVolumeContext(ctx context.Context, ds *truenas.Dataset, da
 		volumeContext[volumeContextCHAPKey] = mode
 	}
 	return nil
+}
+
+func (d *Driver) iscsiPublishContext() (map[string]string, error) {
+	portals := d.config.ISCSI.multipathPortals()
+	if len(portals) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(portals)
+	if err != nil {
+		// []string is not rejectable by encoding/json; retain the defensive
+		// contract at the shared create/publish boundary.
+		return nil, status.Errorf(codes.Internal, "failed to encode iSCSI multipath portals: %v", err)
+	}
+	return map[string]string{"portals": string(encoded)}, nil
+}
+
+// convergeISCSIMultipathTargetGroups makes every configured portal carry the
+// same set of initiator/auth templates. This is the security-sensitive
+// difference from merely making a target discoverable on another IP: SCST
+// evaluates the target group attached to that portal, so omitting the dynamic
+// fencing group on one path would bypass the deny-all/per-initiator policy.
+// Existing groups on unrelated portals are preserved; multipath adds only the
+// missing cross-product and never removes operator configuration.
+func (d *Driver) convergeISCSIMultipathTargetGroups(ctx context.Context, target *truenas.ISCSITarget) (*truenas.ISCSITarget, error) {
+	if !d.config.ISCSI.Multipath || target == nil {
+		return target, nil
+	}
+	portalIDs, err := d.resolveISCSIPortalIDsForEndpoints(ctx, d.config.ISCSI.multipathPortals())
+	if err != nil {
+		return nil, err
+	}
+	if len(target.Groups) == 0 {
+		return nil, fmt.Errorf("iSCSI target %d has no target groups to replicate across multipath portals", target.ID)
+	}
+
+	templates := make([]truenas.ISCSITargetGroup, 0, len(target.Groups))
+	for _, group := range target.Groups {
+		if !containsISCSIGroupTemplate(templates, group) {
+			templates = append(templates, group)
+		}
+	}
+	groups := append([]truenas.ISCSITargetGroup(nil), target.Groups...)
+	changed := false
+	for _, portalID := range portalIDs {
+		for _, template := range templates {
+			candidate := template
+			candidate.Portal = portalID
+			if containsExactISCSIGroup(groups, candidate) {
+				continue
+			}
+			groups = append(groups, candidate)
+			changed = true
+		}
+	}
+	if !changed {
+		return target, nil
+	}
+	updated, err := d.truenasClient.ISCSITargetUpdate(ctx, target.ID, groups)
+	if err != nil {
+		return nil, fmt.Errorf("failed to converge iSCSI multipath target groups: %w", err)
+	}
+	return updated, nil
+}
+
+func containsISCSIGroupTemplate(groups []truenas.ISCSITargetGroup, candidate truenas.ISCSITargetGroup) bool {
+	for _, group := range groups {
+		if sameISCSIGroupTemplate(group, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsExactISCSIGroup(groups []truenas.ISCSITargetGroup, candidate truenas.ISCSITargetGroup) bool {
+	for _, group := range groups {
+		if group.Portal == candidate.Portal && sameISCSIGroupTemplate(group, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameISCSIGroupTemplate(a, b truenas.ISCSITargetGroup) bool {
+	if a.Initiator != b.Initiator || a.AuthMethod != b.AuthMethod || !equalOptionalInt(a.Auth, b.Auth) {
+		return false
+	}
+	if len(a.AuthNetworks) != len(b.AuthNetworks) {
+		return false
+	}
+	for i := range a.AuthNetworks {
+		if a.AuthNetworks[i] != b.AuthNetworks[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalOptionalInt(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // createISCSIShare creates iSCSI target, extent, and target-extent association.
@@ -320,6 +432,15 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 		klog.Infof("Created iSCSI target %s (ID %d)", iscsiName, targetID)
 	}
 
+	// Unlike NVMe-oF, iSCSI has no separate port-association object. Reachability
+	// and fencing both live in target.Groups, so publish-time convergence must
+	// replicate the complete initiator/auth template set across every portal.
+	target, err = d.convergeISCSIMultipathTargetGroups(ctx, target)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to converge iSCSI multipath portal associations: %v", err)
+	}
+	targetID = target.ID
+
 	// Step 3: Wait for zvol to be ready before creating extent
 	// This is critical for cloned volumes which may not be immediately available
 	// Skip if caller already verified zvol readiness (e.g., after cloning)
@@ -494,6 +615,12 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	klog.V(4).Infof("Requesting debounced iSCSI service reload to ensure target is discoverable")
 	if d.serviceReloadDebouncer != nil {
 		if err := d.serviceReloadDebouncer.RequestReload(ctx, "iscsitarget"); err != nil {
+			if d.config.ISCSI.Multipath {
+				// A multi-portal publish must not advertise until SCST has loaded
+				// every target-group association. Single-path retains its historical
+				// non-fatal retry behavior; multipath fails closed at this boundary.
+				return status.Errorf(codes.Internal, "failed to reload iSCSI service after multipath portal convergence: %v", err)
+			}
 			// Non-fatal: the service might auto-reload, and node has retry logic.
 			// Log at WARNING level for operator visibility (not V(4) debug level).
 			klog.Warningf("iSCSI service reload failed (non-fatal, will retry on node): %v", err)
