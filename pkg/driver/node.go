@@ -2,9 +2,11 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,7 +27,9 @@ import (
 var (
 	nodeStatsSysfsRoot         = "/sys"
 	nodeGetNVMeInfo            = util.GetNVMeInfoFromDevice
-	nodeNVMeDisconnect         = util.NVMeoFDisconnect
+	nodeNVMeDisconnect         = util.NVMeoFDisconnectWithContext
+	nodeListNVMeSubsystems     = util.ListNVMeSubsystems
+	nodeSetNVMeIOPolicy        = util.SetNVMeSubsystemIOPolicy
 	nodeGetISCSIInfo           = util.GetISCSIInfoFromDevice
 	nodeISCSIDisconnect        = util.ISCSIDisconnect
 	nodeGetDeviceSize          = util.GetDeviceSize
@@ -621,6 +625,9 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		if existingErr != nil {
 			return nil, existingErr
 		}
+		if attachDriver == ShareTypeNVMeoF {
+			d.convergeExistingNVMeoFPaths(ctx, volumeContext)
+		}
 		klog.Infof("Volume %s is already staged compatibly at %s", volumeID, stagingPath)
 		return &csi.NodeStageVolumeResponse{}, nil
 	} else if existingErr != nil {
@@ -771,7 +778,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 			// NVMe-oF cleanup
 			nqn, nvmeErr := nodeGetNVMeInfo(devicePath)
 			if nvmeErr == nil {
-				if discErr := nodeNVMeDisconnect(nqn); discErr != nil {
+				if discErr := nodeNVMeDisconnect(ctx, nqn); discErr != nil {
 					klog.Warningf("Failed to disconnect NVMe-oF session %s: %v", nqn, discErr)
 				} else {
 					klog.Infof("Disconnected NVMe-oF session %s", nqn)
@@ -819,8 +826,6 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 // when the device path is unavailable (e.g., after node restart or force unmount).
 // This prevents session leaks that accumulate over time.
 func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID string, attachDriver ShareType) {
-	_ = ctx
-
 	switch attachDriver {
 	case ShareTypeISCSI:
 		portal := d.config.ISCSI.TargetPortal
@@ -844,7 +849,7 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 			klog.V(4).Infof("No active NVMe-oF session found for volume %s (nqn: %s): %v", volumeID, nqnName, err)
 		} else if nqn != "" {
 			klog.Infof("Found orphaned NVMe-oF session for volume %s: %s", volumeID, nqn)
-			if err := util.NVMeoFDisconnect(nqn); err != nil {
+			if err := nodeNVMeDisconnect(ctx, nqn); err != nil {
 				klog.Warningf("Failed to disconnect orphaned NVMe-oF session %s: %v", nqn, err)
 			} else {
 				klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
@@ -1655,17 +1660,21 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	if port == "" {
 		port = "4420"
 	}
+	multipathAddresses := nodeNVMeMultipathAddresses(volumeContext, nqn)
 
 	mounted, err := util.IsMounted(stagingPath)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to check mount status: %v", err)
 	}
 	if mounted {
+		if len(multipathAddresses) > 0 {
+			d.convergeExistingNVMeoFPaths(ctx, volumeContext)
+		}
 		klog.Infof("NVMe-oF volume already mounted at %s", stagingPath)
 		return nil
 	}
 
-	subsystems, listErr := util.ListNVMeSubsystems(ctx)
+	subsystems, listErr := nodeListNVMeSubsystems(ctx)
 	if listErr != nil {
 		klog.Warningf("Failed to list NVMe subsystems before staging %s: %v", nqn, listErr)
 	}
@@ -1675,26 +1684,35 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 			stagedNQN, infoErr := getNVMeInfoFromDevice(devicePath)
 			_, findErr := util.FindNVMeoFSessionByNQNFromSubsystems(nqn, subsystems)
 			if infoErr == nil && findErr == nil && stagedNQN == nqn {
+				if len(multipathAddresses) > 0 {
+					d.convergeExistingNVMeoFPaths(ctx, volumeContext)
+				}
 				klog.Infof("NVMe-oF block volume already staged at %s", stagingPath)
 				return nil
 			}
 		}
 	}
 
-	// Pre-emptive cleanup: disconnect any existing session for this NQN.
-	subsystems = preemptiveSessionDisconnect(ctx, d, nodeStageTransport[[]util.NVMeSubsystem]{
-		name:        "NVMe-oF",
-		findSession: func(s []util.NVMeSubsystem) (string, error) { return util.FindNVMeoFSessionByNQNFromSubsystems(nqn, s) },
-		disconnect:  util.NVMeoFDisconnect,
-		relist:      func() ([]util.NVMeSubsystem, error) { return util.ListNVMeSubsystems(ctx) },
-	}, nqn, stagingPath, subsystems)
-
 	// Connect to NVMe-oF subsystem with configurable timeout
-	transportURI := fmt.Sprintf("%s://%s:%s", transport, address, port)
 	connectOpts := &util.NVMeoFConnectOptions{
 		DeviceTimeout: time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second,
 	}
-	devicePath, err := nvmeConnectWithSubsystems(ctx, nqn, transportURI, connectOpts, subsystems)
+	var devicePath string
+	if len(multipathAddresses) > 0 {
+		devicePath, err = convergeNVMeoFPaths(ctx, nqn, transport, port, multipathAddresses, connectOpts, subsystems, false, true)
+	} else {
+		// Preserve the historical single-path flow byte-for-byte when an older
+		// controller supplies no usable multipath hint.
+		subsystems = preemptiveSessionDisconnect(ctx, d, nodeStageTransport[[]util.NVMeSubsystem]{
+			name:        "NVMe-oF",
+			findSession: func(s []util.NVMeSubsystem) (string, error) { return util.FindNVMeoFSessionByNQNFromSubsystems(nqn, s) },
+			disconnect:  func(existing string) error { return nodeNVMeDisconnect(ctx, existing) },
+			relist:      func() ([]util.NVMeSubsystem, error) { return nodeListNVMeSubsystems(ctx) },
+		}, nqn, stagingPath, subsystems)
+
+		transportURI := fmt.Sprintf("%s://%s:%s", transport, address, port)
+		devicePath, err = nvmeConnectWithSubsystems(ctx, nqn, transportURI, connectOpts, subsystems)
+	}
 	if err != nil {
 		RecordNodeConnect("nvmeof", "error")
 		operationErr := status.Errorf(codes.Internal, "failed to connect NVMe-oF: %v", err)
@@ -1703,7 +1721,146 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	}
 	RecordNodeConnect("nvmeof", "success")
 
-	return d.finalizeStagedDevice(ctx, devicePath, stagingPath, volCap, eventObjects...)
+	if err := d.finalizeStagedDevice(ctx, devicePath, stagingPath, volCap, eventObjects...); err != nil {
+		return err
+	}
+	if len(multipathAddresses) > 0 {
+		d.setNVMeoFQueueDepthPolicy(ctx, nqn)
+	}
+	return nil
+}
+
+func parseNVMeoFMultipathAddresses(volumeContext map[string]string) ([]string, error) {
+	raw, present := volumeContext["addresses"]
+	if !present {
+		return nil, nil
+	}
+	var decoded []string
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return nil, fmt.Errorf("decode addresses: %w", err)
+	}
+	if len(decoded) == 0 {
+		return nil, nil
+	}
+	addresses := make([]string, 0, len(decoded))
+	seen := make(map[string]struct{}, len(decoded))
+	for _, address := range decoded {
+		address = strings.TrimSpace(address)
+		if address == "" {
+			return nil, errors.New("addresses contains an empty transport address")
+		}
+		if _, duplicate := seen[address]; duplicate {
+			continue
+		}
+		seen[address] = struct{}{}
+		addresses = append(addresses, address)
+	}
+	return addresses, nil
+}
+
+func nodeNVMeMultipathAddresses(volumeContext map[string]string, nqn string) []string {
+	addresses, err := parseNVMeoFMultipathAddresses(volumeContext)
+	if err != nil {
+		klog.Warningf("Ignoring malformed NVMe-oF multipath addresses for %s and falling back to the single address: %v", nqn, err)
+		return nil
+	}
+	return addresses
+}
+
+func (d *Driver) convergeExistingNVMeoFPaths(ctx context.Context, volumeContext map[string]string) {
+	nqn := volumeContext["nqn"]
+	addresses := nodeNVMeMultipathAddresses(volumeContext, nqn)
+	if len(addresses) == 0 {
+		return
+	}
+	transport := volumeContext["transport"]
+	if transport == "" {
+		transport = "tcp"
+	}
+	port := volumeContext["port"]
+	if port == "" {
+		port = "4420"
+	}
+	subsystems, err := nodeListNVMeSubsystems(ctx)
+	if err != nil {
+		klog.Warningf("Failed to list NVMe subsystems before converging staged volume %s: %v", nqn, err)
+	}
+	connectOpts := &util.NVMeoFConnectOptions{
+		DeviceTimeout: time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second,
+	}
+	// A compatible live staging target proves that at least one controller is
+	// usable even if list-subsys is temporarily unavailable. Missing paths stay
+	// best-effort on this idempotent replay.
+	_, _ = convergeNVMeoFPaths(ctx, nqn, transport, port, addresses, connectOpts, subsystems, true, false)
+	d.setNVMeoFQueueDepthPolicy(ctx, nqn)
+}
+
+func convergeNVMeoFPaths(
+	ctx context.Context,
+	nqn, transport, port string,
+	addresses []string,
+	connectOpts *util.NVMeoFConnectOptions,
+	subsystems []util.NVMeSubsystem,
+	assumeConnected, needDevice bool,
+) (string, error) {
+	liveAddresses := util.LiveNVMeoFAddresses(nqn, subsystems)
+	live := make(map[string]struct{}, len(liveAddresses))
+	for _, address := range liveAddresses {
+		live[address] = struct{}{}
+	}
+	connected := assumeConnected || len(live) > 0
+	devicePath := ""
+	connectErrors := make([]error, 0)
+	for _, address := range addresses {
+		if _, alreadyLive := live[address]; alreadyLive {
+			continue
+		}
+		transportURI := fmt.Sprintf("%s://%s", transport, net.JoinHostPort(strings.Trim(address, "[]"), port))
+		path, err := nvmeConnectWithSubsystems(ctx, nqn, transportURI, connectOpts, subsystems)
+		if err != nil {
+			klog.Warningf("Failed to connect NVMe-oF path %s for %s: %v", address, nqn, err)
+			connectErrors = append(connectErrors, fmt.Errorf("%s: %w", address, err))
+			continue
+		}
+		connected = true
+		if devicePath == "" {
+			devicePath = path
+		}
+	}
+	if !connected {
+		return "", fmt.Errorf("no NVMe-oF path connected for %s: %w", nqn, errors.Join(connectErrors...))
+	}
+	if needDevice && devicePath == "" {
+		// Every requested path was already live. Reuse the existing connect helper
+		// for its established device-wait behavior; its exact-path check suppresses
+		// the nvme connect command.
+		for _, address := range addresses {
+			if _, alreadyLive := live[address]; !alreadyLive {
+				continue
+			}
+			transportURI := fmt.Sprintf("%s://%s", transport, net.JoinHostPort(strings.Trim(address, "[]"), port))
+			return nvmeConnectWithSubsystems(ctx, nqn, transportURI, connectOpts, subsystems)
+		}
+	}
+	return devicePath, nil
+}
+
+func (d *Driver) setNVMeoFQueueDepthPolicy(ctx context.Context, nqn string) {
+	subsystems, err := nodeListNVMeSubsystems(ctx)
+	if err != nil {
+		klog.V(4).Infof("NVMe-oF queue-depth iopolicy unavailable for %s: %v", nqn, err)
+		return
+	}
+	for _, subsystem := range subsystems {
+		if subsystem.NQN != nqn || subsystem.Name == "" {
+			continue
+		}
+		if err := nodeSetNVMeIOPolicy(subsystem.Name, "queue-depth"); err != nil {
+			klog.V(4).Infof("NVMe-oF queue-depth iopolicy unsupported for %s (%s): %v", nqn, subsystem.Name, err)
+		}
+		return
+	}
+	klog.V(4).Infof("NVMe-oF subsystem not visible while setting queue-depth iopolicy for %s", nqn)
 }
 
 func volumeMountFlags(volCap *csi.VolumeCapability) []string {

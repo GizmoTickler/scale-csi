@@ -58,6 +58,47 @@ func TestParseSubsysJSON(t *testing.T) {
 	}
 }
 
+func TestLiveNVMeoFAddresses(t *testing.T) {
+	subsystems := []NVMeSubsystem{
+		{
+			NQN: "nqn.test:volume-a",
+			Paths: []NVMePath{
+				{Address: "traddr=192.0.2.10,trsvcid=4420", State: "live"},
+				{Address: "traddr=192.0.2.11 trsvcid=4420", State: "LIVE"},
+				{Address: "traddr=192.0.2.12,trsvcid=4420", State: "connecting"},
+				{Address: "traddr=192.0.2.10,trsvcid=4420", State: "live"},
+			},
+		},
+		{
+			NQN:   "nqn.test:volume-b",
+			Paths: []NVMePath{{Address: "traddr=198.51.100.20,trsvcid=4420", State: "live"}},
+		},
+	}
+
+	assert.Equal(t, []string{"192.0.2.10", "192.0.2.11"}, LiveNVMeoFAddresses("nqn.test:volume-a", subsystems))
+	assert.Empty(t, LiveNVMeoFAddresses("nqn.test:missing", subsystems))
+	assert.True(t, hasLiveNVMeoFPath("nqn.test:volume-a", "192.0.2.10", subsystems))
+	assert.False(t, hasLiveNVMeoFPath("nqn.test:volume-a", "192.0.2.12", subsystems))
+	assert.False(t, hasLiveNVMeoFPath("nqn.test:volume-a", "192.0.2.99", subsystems),
+		"a live controller for the NQN on another address must not suppress a missing-path connect")
+}
+
+func TestSetNVMeSubsystemIOPolicy(t *testing.T) {
+	root := t.TempDir()
+	subsystemDir := filepath.Join(root, "nvme-subsys7")
+	require.NoError(t, os.MkdirAll(subsystemDir, 0o750))
+	policyPath := filepath.Join(subsystemDir, "iopolicy")
+	require.NoError(t, os.WriteFile(policyPath, []byte("numa"), 0o600))
+
+	require.NoError(t, setNVMeSubsystemIOPolicyAt(root, "nvme-subsys7", "queue-depth"))
+	policy, err := os.ReadFile(policyPath)
+	require.NoError(t, err)
+	assert.Equal(t, "queue-depth", string(policy))
+
+	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, "../nvme-subsys7", "queue-depth"))
+	assert.Error(t, setNVMeSubsystemIOPolicyAt(root, "nvme-subsys8", "queue-depth"))
+}
+
 func TestFindNVMeNamespaceForControllerDoesNotAssumeNamespaceOne(t *testing.T) {
 	classRoot := filepath.Join(t.TempDir(), "nvme")
 	devRoot := filepath.Join(t.TempDir(), "dev")

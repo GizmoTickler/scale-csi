@@ -664,14 +664,14 @@ costs no extra backend call.
   changing them is a no-op and the driver logs a warning naming each drifted
   field.
 - **`nvmeof.multipath` + `nvmeof.addresses`** — associates each subsystem with
-  one port per address and advertises them all in the publish context.
-  **HONEST SCOPE — CONTROLLER SIDE ONLY.** The node half is NOT shipped: the
-  node still runs a single `nvme connect` to `address`, so enabling this today
-  delivers NO multipath, NO load balancing and NO path failover. What it
-  delivers is the backend exposure the node work will build on, at 2*(N-1) extra
-  API calls per volume. There is also no ANA on this platform. Leave it off
-  unless you are deliberately staging that exposure. `multipath: true` with an
-  empty `addresses` is a startup validation error.
+  one port per address and advertises them all in the publish context. The node
+  now connects every advertised address, tops up missing live controllers on
+  re-stage, requests the native `queue-depth` iopolicy, and disconnects all
+  controllers by NQN on unstage. One live path is required; later path failures
+  are warnings. Older or malformed publish contexts retain the historical
+  single-address behavior. There is no ANA on this platform, so every path is
+  equally optimized. Backend exposure costs 2*(N-1) extra API calls per volume;
+  `multipath: true` with an empty `addresses` remains a startup validation error.
 
 ## GF-Sprint 2 — Storage-native data protection
 

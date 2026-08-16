@@ -1113,26 +1113,23 @@ func TestChartBlockProtocolParamSchemaRejection(t *testing.T) {
 	})
 }
 
-// TestChartMultipathDocumentsMissingNodeHalf keeps the values.yaml multipath
-// comment honest. The node-side multi-address connect is NOT shipped, so
-// enabling nvmeof.multipath today buys backend exposure and extra API calls with
-// zero multipath benefit. The comment previously claimed "the kernel's native
-// NVMe multipath then load-balances and fails over" with no mention that the
-// node half is missing — an operator reading only values.yaml would enable it
-// expecting path failover and get none.
-func TestChartMultipathDocumentsMissingNodeHalf(t *testing.T) {
+// TestChartMultipathDocumentsNodeHalfScope keeps the values.yaml multipath
+// comment aligned with the shipped controller and node behavior without
+// overclaiming ANA support or making secondary-path availability mandatory.
+func TestChartMultipathDocumentsNodeHalfScope(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(chartDir(t), "values.yaml"))
 	if err != nil {
 		t.Fatalf("read values.yaml: %v", err)
 	}
 	values := string(raw)
 	for _, want := range []string{
-		"CONTROLLER SIDE ONLY",
-		"The node half is NOT shipped",
-		"NO multipath",
+		"controller and node halves are shipped",
+		"native kernel NVMe multipath",
+		"Additional path failures are best-effort",
+		"queue-depth iopolicy",
 	} {
 		if !strings.Contains(values, want) {
-			t.Errorf("values.yaml multipath documentation must state %q so the feature is not oversold", want)
+			t.Errorf("values.yaml multipath documentation must state %q", want)
 		}
 	}
 	// And the create-only nature of portPerf must be documented (F-7): changing

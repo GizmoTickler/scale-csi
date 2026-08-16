@@ -207,9 +207,11 @@ func parseTransportURI(transportURI string) (transport, host, port string, err e
 }
 
 func nvmeConnectWithSubsystems(ctx context.Context, transport, host, port, nqn string, subsystems []NVMeSubsystem) error {
-	// Check if already connected
-	if hasNVMeSubsystem(nqn, subsystems) {
-		klog.V(4).Infof("Already connected to subsystem: %s", nqn)
+	// A subsystem can have several controllers, one per transport address. Skip
+	// only the exact live path requested here; an existing controller for the NQN
+	// on another address must not suppress multipath convergence.
+	if hasLiveNVMeoFPath(nqn, host, subsystems) {
+		klog.V(4).Infof("Already connected to subsystem %s at %s", nqn, host)
 		return nil
 	}
 
@@ -250,6 +252,77 @@ func hasNVMeSubsystem(nqn string, subsystems []NVMeSubsystem) bool {
 		}
 	}
 	return false
+}
+
+func hasLiveNVMeoFPath(nqn, address string, subsystems []NVMeSubsystem) bool {
+	for _, liveAddress := range LiveNVMeoFAddresses(nqn, subsystems) {
+		if liveAddress == address {
+			return true
+		}
+	}
+	return false
+}
+
+// LiveNVMeoFAddresses returns the transport addresses of live controllers for
+// an exact subsystem NQN. nvme-cli reports path addresses as comma-separated
+// key/value fields such as "traddr=192.0.2.10,trsvcid=4420".
+func LiveNVMeoFAddresses(nqn string, subsystems []NVMeSubsystem) []string {
+	seen := make(map[string]struct{})
+	addresses := make([]string, 0)
+	for _, subsystem := range subsystems {
+		if subsystem.NQN != nqn {
+			continue
+		}
+		for _, path := range subsystem.Paths {
+			if !strings.EqualFold(strings.TrimSpace(path.State), "live") {
+				continue
+			}
+			address := nvmePathField(path.Address, "traddr")
+			if address == "" {
+				continue
+			}
+			if _, duplicate := seen[address]; duplicate {
+				continue
+			}
+			seen[address] = struct{}{}
+			addresses = append(addresses, address)
+		}
+	}
+	return addresses
+}
+
+func nvmePathField(address, wanted string) string {
+	for _, field := range strings.FieldsFunc(address, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		key, value, ok := strings.Cut(field, "=")
+		if ok && key == wanted {
+			return value
+		}
+	}
+	return ""
+}
+
+// SetNVMeSubsystemIOPolicy writes a native NVMe multipath policy for one
+// subsystem. Unsupported kernels return an error so callers can fall back.
+func SetNVMeSubsystemIOPolicy(subsystemName, policy string) error {
+	return setNVMeSubsystemIOPolicyAt("/sys/class/nvme-subsystem", subsystemName, policy)
+}
+
+func setNVMeSubsystemIOPolicyAt(root, subsystemName, policy string) error {
+	if subsystemName == "" || filepath.Base(subsystemName) != subsystemName {
+		return fmt.Errorf("invalid NVMe subsystem name %q", subsystemName)
+	}
+	policyPath := filepath.Join(root, subsystemName, "iopolicy")
+	file, err := os.OpenFile(policyPath, os.O_WRONLY, 0) //nolint:gosec // fixed sysfs root plus validated basename
+	if err != nil {
+		return fmt.Errorf("open NVMe subsystem iopolicy: %w", err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString(policy); err != nil {
+		return fmt.Errorf("write NVMe subsystem iopolicy: %w", err)
+	}
+	return nil
 }
 
 // listNVMeSubsystemsFunc is the function used to list NVMe subsystems.
