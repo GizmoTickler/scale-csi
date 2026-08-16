@@ -1113,27 +1113,38 @@ func TestChartBlockProtocolParamSchemaRejection(t *testing.T) {
 	})
 }
 
-// TestChartMultipathDocumentsNodeHalfScope keeps the values.yaml multipath
-// comment aligned with the shipped controller and node behavior without
+// TestChartMultipathDocumentsNodeHalfScope keeps both operator-facing and Go
+// config comments aligned with the shipped controller and node behavior without
 // overclaiming ANA support or making secondary-path availability mandatory.
 func TestChartMultipathDocumentsNodeHalfScope(t *testing.T) {
+	files := map[string]string{
+		"values.yaml": filepath.Join(chartDir(t), "values.yaml"),
+		"config.go":   filepath.Join(chartDir(t), "..", "..", "pkg", "driver", "config.go"),
+	}
+	for name, path := range files {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		body := string(raw)
+		for _, want := range []string{
+			"controller and node halves are shipped",
+			"native kernel NVMe multipath",
+			"Additional path failures are best-effort",
+			"queue-depth iopolicy",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s multipath documentation must state %q", name, want)
+			}
+		}
+	}
+	// And the create-only nature of portPerf must be documented (F-7): changing
+	// it on an install whose ports exist is a silent no-op.
 	raw, err := os.ReadFile(filepath.Join(chartDir(t), "values.yaml"))
 	if err != nil {
 		t.Fatalf("read values.yaml: %v", err)
 	}
 	values := string(raw)
-	for _, want := range []string{
-		"controller and node halves are shipped",
-		"native kernel NVMe multipath",
-		"Additional path failures are best-effort",
-		"queue-depth iopolicy",
-	} {
-		if !strings.Contains(values, want) {
-			t.Errorf("values.yaml multipath documentation must state %q", want)
-		}
-	}
-	// And the create-only nature of portPerf must be documented (F-7): changing
-	// it on an install whose ports exist is a silent no-op.
 	if !strings.Contains(values, "CREATE-ONLY") {
 		t.Error("values.yaml must document that nvmeof.portPerf is applied at port create only")
 	}

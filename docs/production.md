@@ -432,7 +432,10 @@ Watch these series:
   sessions observed by node session garbage collection;
 - `scale_csi_node_connect_total` and
   `scale_csi_gc_sessions_disconnected_total` for per-transport node connection
-  attempts and orphan cleanup.
+  attempts and orphan cleanup;
+- `scale_csi_nvme_path_connect_total{address,result}` for requested NVMe-oF
+  path convergence. A sustained non-zero rate for `result="error"` identifies
+  a secondary path that remains unavailable even while volume staging succeeds.
 
 Five metric families added in v1.4.0 (the existing documented names still match
 `driver.MetricNames()`):

@@ -640,11 +640,11 @@ nvmeof:
   # HONEST SCOPE — controller and node halves are shipped. NodeStage connects
   # every advertised address, converges missing live controllers on re-stage,
   # and lets native kernel NVMe multipath aggregate them under one subsystem and
-  # namespace. Additional path failures are best-effort once one path is live,
-  # and queue-depth iopolicy is requested when the kernel exposes it. There is no
-  # ANA on this platform (nvmet rejects it), so all paths are equally optimized —
-  # correct for a single controller. Backend exposure still costs 2*(N-1) extra
-  # API calls per volume.
+  # namespace. Additional path failures are best-effort once one requested path
+  # is live, and queue-depth iopolicy is requested when the kernel exposes it.
+  # There is no ANA on this platform (nvmet rejects it), so all paths are equally
+  # optimized — correct for a single controller. Backend exposure still costs
+  # 2*(N-1) extra API calls per volume.
   #
   # Default off (single port, identical to pre-GF4).
   multipath: false

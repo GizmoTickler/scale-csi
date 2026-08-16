@@ -92,8 +92,8 @@ func TestNVMeoFMultipathAPICallGolden(t *testing.T) {
 // flipping nvmeof.multipath=true on a live install added the extra port
 // associations for NEW volumes only — while the publish context advertised all
 // addresses for EVERY volume. Existing volumes therefore advertised paths they
-// had no association for: a guaranteed partial-path/connect failure the moment
-// the node half lands.
+// had no association for: a guaranteed partial-path/connect failure when a node
+// converged the advertised address set.
 func TestMultipathConvergesExistingVolumes(t *testing.T) {
 	ctx := context.Background()
 	client := newAPICallCountingClient()

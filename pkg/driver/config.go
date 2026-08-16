@@ -702,14 +702,14 @@ type NVMeoFConfig struct {
 	// Addresses (in addition to TransportAddress) and advertises all of them in
 	// the publish context under "addresses".
 	//
-	// HONEST SCOPE — CONTROLLER SIDE ONLY. The node half is NOT shipped:
-	// stageNVMeoFVolume still runs a single `nvme connect` to volumeContext
-	// "address" and never reads "addresses", so enabling this today delivers NO
-	// multipath, NO load balancing and NO path failover. What it does deliver is
-	// the backend exposure (one port per storage NIC) the node work will build
-	// on, at a cost of 2*(N-1) extra API calls per volume. There is also no ANA
-	// on this platform (nvmet rejects it), so when the node half lands all paths
-	// are equally optimized — correct for a single controller.
+	// HONEST SCOPE — controller and node halves are shipped. NodeStage connects
+	// every advertised address, converges missing live controllers on re-stage,
+	// and lets native kernel NVMe multipath aggregate them under one subsystem and
+	// namespace. Additional path failures are best-effort once one requested path
+	// is live, and queue-depth iopolicy is requested when the kernel exposes it.
+	// There is no ANA on this platform (nvmet rejects it), so all paths are equally
+	// optimized — correct for a single controller. Backend exposure still costs
+	// 2*(N-1) extra API calls per volume.
 	//
 	// Default false (single port, byte-identical to pre-GF4).
 	Multipath bool `yaml:"multipath"`
