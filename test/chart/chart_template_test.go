@@ -800,6 +800,32 @@ func TestChartDurationValidation(t *testing.T) {
 	}
 }
 
+func TestChartTransportAddressListCaps(t *testing.T) {
+	tests := []struct {
+		name   string
+		key    string
+		prefix string
+	}{
+		{name: "nfs addresses", key: "nfs.addresses", prefix: "192.0.2."},
+		{name: "iscsi portals", key: "iscsi.portals", prefix: "198.51.100."},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := make([]string, 17)
+			for i := range values {
+				values[i] = test.prefix + strconv.Itoa(i+1)
+			}
+			out := helmTemplateExpectError(t, "--set", test.key+"={"+strings.Join(values, ",")+"}")
+			if !strings.Contains(out, test.key) && !strings.Contains(out, "/"+strings.ReplaceAll(test.key, ".", "/")) {
+				t.Errorf("schema rejection did not identify %s; got:\n%s", test.key, out)
+			}
+			if !strings.Contains(out, "16") {
+				t.Errorf("schema rejection did not report the 16-entry cap for %s; got:\n%s", test.key, out)
+			}
+		})
+	}
+}
+
 // TestChartSidecarTimeouts pins the CSI sidecar --timeout flags: the attacher and
 // resizer run with a 120s deadline (bounding publish/unpublish/expand), while the
 // provisioner and snapshotter keep 300s. A regression that reverts the
