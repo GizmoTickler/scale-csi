@@ -1860,10 +1860,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		// on both the fresh-share and already-exists paths. Only advertise the
 		// address set after that convergence succeeds, so the response can never
 		// promise a path this publish failed to associate.
-		publishContext, err = d.nvmeofPublishContext()
-		if err != nil {
-			return nil, err
+		pc, pcErr := d.nvmeofPublishContext()
+		if pcErr != nil {
+			return nil, pcErr
 		}
+		publishContext = pc
 	}
 
 	klog.Infof("ControllerPublishVolume: volume %s published successfully to node %s", volumeID, nodeID)
