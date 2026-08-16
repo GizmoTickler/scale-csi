@@ -438,6 +438,9 @@ Watch these series:
   a secondary path that remains unavailable or exhausted the shared five-second
   top-up budget even while volume staging succeeds. Corroborate it with the
   `NVMePathDegraded` event, whose message lists the affected address or addresses.
+  The sentinel label `address="invalid-publish-context"` is not a path address: it
+  counts stages where a malformed advertised address list was discarded and the
+  node fell back to single-path staging.
 
 Five metric families added in v1.4.0 (the existing documented names still match
 `driver.MetricNames()`):
