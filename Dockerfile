@@ -44,7 +44,7 @@ LABEL org.opencontainers.image.description="Kubernetes CSI driver for TrueNAS SC
 # - ca-certificates: for HTTPS connections to TrueNAS API
 # Note: open-iscsi and nvme-cli are NOT installed in container
 # because we use wrapper scripts to run commands on the host
-RUN apk add --no-cache \
+RUN apk upgrade --no-cache && apk add --no-cache \
     ca-certificates \
     bash \
     nfs-utils \
