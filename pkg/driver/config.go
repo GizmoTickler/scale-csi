@@ -1371,7 +1371,7 @@ func validateConfig(cfg *Config) error {
 	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal == "" {
 		return fmt.Errorf("iscsi.targetPortal is required when iSCSI is enabled")
 	}
-	if cfg.ISCSI.TargetPortal != "" {
+	if cfg.ISCSI.Enabled && cfg.ISCSI.TargetPortal != "" {
 		primary, portalErr := normalizeISCSITargetPortal(cfg.ISCSI.TargetPortal)
 		if portalErr != nil {
 			return fmt.Errorf("iscsi.targetPortal is invalid: %w", portalErr)
@@ -1475,7 +1475,8 @@ func normalizeISCSIHost(rawHost string) (string, error) {
 			return "", fmt.Errorf("invalid iSCSI hostname %q", rawHost)
 		}
 		for _, character := range label {
-			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+			if (character < 'a' || character > 'z') &&
+				(character < '0' || character > '9') && character != '-' && character != '_' {
 				return "", fmt.Errorf("invalid iSCSI hostname %q", rawHost)
 			}
 		}

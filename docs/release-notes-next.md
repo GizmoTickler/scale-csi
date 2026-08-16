@@ -45,6 +45,17 @@
   (including an explicitly empty string) degrade observably to the legacy
   primary path for NVMe-oF, iSCSI, and NFS. Helm schema and render tests cover
   the same opt-in boundaries.
+- **Upgrade note — iSCSI session GC for portless portals:** installs with a
+  portless `iscsi.targetPortal` previously never brought their iSCSI sessions
+  into GC scope because the configured value did not byte-match the
+  `host:port` value reported by `iscsiadm`. GF-6 normalizes that portal to
+  `host:3260`, so iSCSI session GC activates for those installs on their first
+  upgrade. Session GC defaults to enabled with `dryRun: false` and a 60-second
+  grace period. This is safe for live volumes because the expected IQN set is
+  derived from mounted and staged devices independently of the configured
+  portal; an unreliable device scan skips the GC pass. Operators who want to
+  inspect candidates before allowing disconnects can set `sessionGC.dryRun` to
+  `true` for the rollout.
 - **GF-5.1 closure:** an already-existing NVMe-oF publish now has a regression
   test proving a failed port association returns an error and advertises no
   addresses. Disabling NVMe multipath does not remove backend associations; a

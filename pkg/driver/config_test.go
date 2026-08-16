@@ -43,6 +43,27 @@ nvmeof:
 	assert.Empty(t, cfg.NFS.ShareHost)
 }
 
+func TestLoadConfigValidatesISCSITargetPortalOnlyWhenEnabled(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+iscsi:
+  enabled: false
+  targetPortal: garbage portal
+`)
+	require.NoError(t, err)
+	assert.Equal(t, "garbage portal", cfg.ISCSI.TargetPortal)
+
+	_, err = loadTestConfig(t, requiredTestConfig+`
+iscsi:
+  enabled: true
+  targetPortal: garbage portal
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "iscsi.targetPortal is invalid")
+}
+
 func TestLoadConfigAllowsMissingAPIKeyForNodeMode(t *testing.T) {
 	cfg, err := loadTestConfig(t, `
 driver: csi.scale.io
@@ -579,6 +600,27 @@ iscsi:
 			assert.Equal(t, test.want, cfg.ISCSI.TargetPortal)
 		})
 	}
+}
+
+func TestLoadConfigAcceptsUnderscoreHostnameOnlyForLegacyISCSIPortal(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+iscsi:
+  enabled: true
+  targetPortal: nas_01.lan
+`)
+	require.NoError(t, err)
+	assert.Equal(t, "nas_01.lan:3260", cfg.ISCSI.TargetPortal)
+
+	_, err = loadTestConfig(t, requiredTestConfig+`
+iscsi:
+  enabled: true
+  targetPortal: nas_01.lan
+  multipath: true
+  portals:
+    - 192.0.2.11
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "iscsi.targetPortal must contain an IP address when iscsi.multipath is enabled")
 }
 
 func TestLoadConfigRejectsInvalidISCSIMultipathPortals(t *testing.T) {
