@@ -12,7 +12,7 @@ while getopts ":t:l" opt; do
   esac
 done
 
-if [[ ${USE_HOST_MOUNT_TOOLS} -eq 1 ]]; then
+if [[ "${USE_HOST_MOUNT_TOOLS}" == "1" ]]; then
   # Use direct path for compatibility with minimal OS like Talos
   chroot /host /bin/umount "${@:1}"
 else

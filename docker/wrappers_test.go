@@ -114,6 +114,95 @@ func TestUmountAcceptsLazyFlagWithoutGetoptsError(t *testing.T) {
 	}
 }
 
+func TestISCSIAdmHostPathWithSpaceNsenter(t *testing.T) {
+	result := runWrapper(t, "iscsiadm", []string{
+		"ISCSIADM_HOST_STRATEGY=nsenter",
+		"ISCSIADM_HOST_PATH=/opt/my tools/iscsiadm",
+	}, "-m", "node")
+
+	wantArgv := []string{
+		"-t", "1", "--mount", "--net", "--",
+		"/opt/my tools/iscsiadm", "-m", "node",
+	}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("nsenter argv = %#v, want %#v", result.argv, wantArgv)
+	}
+}
+
+func TestISCSIAdmHostPathWithSpaceChroot(t *testing.T) {
+	result := runWrapper(t, "iscsiadm", []string{
+		"ISCSIADM_HOST_STRATEGY=chroot",
+		"ISCSIADM_HOST_PATH=/opt/my tools/iscsiadm",
+	}, "-m", "node")
+
+	wantArgv := []string{"/host", "/opt/my tools/iscsiadm", "-m", "node"}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("chroot argv = %#v, want %#v", result.argv, wantArgv)
+	}
+}
+
+func TestNVMeHostPathWithSpaceNsenter(t *testing.T) {
+	result := runWrapper(t, "nvme", []string{
+		"NVME_HOST_STRATEGY=nsenter",
+		"NVME_HOST_PATH=/opt/my tools/nvme",
+	}, "connect")
+
+	wantArgv := []string{
+		"-t", "1", "--mount", "--net", "--",
+		"/opt/my tools/nvme", "connect",
+	}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("nsenter argv = %#v, want %#v", result.argv, wantArgv)
+	}
+}
+
+func TestNVMeHostPathWithSpaceChroot(t *testing.T) {
+	result := runWrapper(t, "nvme", []string{
+		"NVME_HOST_STRATEGY=chroot",
+		"NVME_HOST_PATH=/opt/my tools/nvme",
+	}, "connect")
+
+	wantArgv := []string{"/host", "/opt/my tools/nvme", "connect"}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("chroot argv = %#v, want %#v", result.argv, wantArgv)
+	}
+}
+
+func TestISCSIAdmHostPathNotGlobExpanded(t *testing.T) {
+	result := runWrapper(t, "iscsiadm", []string{
+		"ISCSIADM_HOST_STRATEGY=nsenter",
+		"ISCSIADM_HOST_PATH=*",
+	}, "-m", "node")
+
+	wantArgv := []string{
+		"-t", "1", "--mount", "--net", "--",
+		"*", "-m", "node",
+	}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("nsenter argv = %#v, want %#v", result.argv, wantArgv)
+	}
+}
+
+func TestUseHostMountToolsNotArithmeticallyEvaluated(t *testing.T) {
+	tempDir := t.TempDir()
+	marker := filepath.Join(tempDir, "pwned_marker")
+	env := []string{"USE_HOST_MOUNT_TOOLS=a[$(touch " + marker + ")]"}
+
+	for _, name := range []string{"umount", "mount"} {
+		t.Run(name, func(t *testing.T) {
+			result := runWrapperNonHost(t, name, env, "/some/target")
+			if result.usedChroot {
+				t.Fatalf("%s used host/chroot branch for non-numeric USE_HOST_MOUNT_TOOLS", name)
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatalf("arithmetic evaluation executed command substitution; marker %s was created", marker)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stat marker: %v", err)
+			}
+		})
+	}
+}
+
 type wrapperResult struct {
 	argv             []string
 	stderr           string
@@ -209,5 +298,52 @@ exit "${WRAPPER_EXIT_CODE:-0}"
 		executor:         executor,
 		probeInvocations: probeInvocations,
 		realInvocations:  realInvocations,
+	}
+}
+
+type wrapperNonHostResult struct {
+	usedChroot bool
+	exitCode   int
+}
+
+func runWrapperNonHost(t *testing.T, name string, environment []string, args ...string) wrapperNonHostResult {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	argvLog := filepath.Join(tempDir, "argv.log")
+	fakeChroot := filepath.Join(tempDir, "chroot")
+	fakeCommand := `#!/bin/sh
+printf '%s\n' "$@" > "$WRAPPER_ARGV_LOG"
+exit 0
+`
+	if err := os.WriteFile(fakeChroot, []byte(fakeCommand), 0o755); err != nil {
+		t.Fatalf("write fake chroot: %v", err)
+	}
+
+	wrapperPath, err := filepath.Abs(name)
+	if err != nil {
+		t.Fatalf("resolve wrapper path: %v", err)
+	}
+	cmd := exec.Command(wrapperPath, args...)
+	cmd.Env = append(os.Environ(),
+		"PATH="+tempDir+":/usr/bin:/bin",
+		"WRAPPER_ARGV_LOG="+argvLog,
+	)
+	cmd.Env = append(cmd.Env, environment...)
+	_, runErr := cmd.Output()
+
+	exitCode := 0
+	var exitErr *exec.ExitError
+	if runErr != nil {
+		if !errors.As(runErr, &exitErr) {
+			t.Fatalf("run wrapper: %v", runErr)
+		}
+		exitCode = exitErr.ExitCode()
+	}
+
+	_, statErr := os.Stat(argvLog)
+	return wrapperNonHostResult{
+		usedChroot: statErr == nil,
+		exitCode:   exitCode,
 	}
 }

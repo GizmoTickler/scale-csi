@@ -22,13 +22,13 @@ case ${ISCSIADM_HOST_STRATEGY} in
   chroot)
     # https://engineering.docker.com/2019/07/road-to-containing-iscsi/
     # Use direct path instead of env for compatibility with minimal OS like Talos
-    chroot /host ${ISCSIADM_HOST_PATH} "${@:1}"
+    chroot /host "${ISCSIADM_HOST_PATH}" "${@:1}"
     ;;
 
   nsenter)
     # https://github.com/siderolabs/extensions/issues/38#issuecomment-1125403043
     # Preferred method for Talos and other minimal OS
-    nsenter -t 1 --mount --net -- ${ISCSIADM_HOST_PATH} "$@"
+    nsenter -t 1 --mount --net -- "${ISCSIADM_HOST_PATH}" "$@"
     ;;
 
   *)
