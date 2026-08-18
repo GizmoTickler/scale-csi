@@ -26,9 +26,23 @@ var portalDiscoveryMutex sync.Map // map[portal]*sync.Mutex
 
 // iscsiAdmCombinedOutput and waitForISCSIDeviceFn provide narrow test seams for
 // the connect path while preserving the production command and device-wait
-// behavior.
+// behavior. The production implementation pins the C locale (see
+// localeInvariantEnv) so callers that fall back to matching iscsiadm message
+// text always see untranslated output.
 var iscsiAdmCombinedOutput = func(ctx context.Context, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, "iscsiadm", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "iscsiadm", args...)
+	cmd.Env = localeInvariantEnv()
+	return cmd.CombinedOutput()
+}
+
+// localeInvariantEnv returns the inherited environment with LC_ALL=C appended.
+// Exit codes are the primary signal for classifying iscsiadm/nvme outcomes, but
+// several sites still fall back to matching English message substrings; pinning
+// LC_ALL keeps those fallbacks meaningful on nodes configured with a non-English
+// locale. Appending (rather than replacing) the environment preserves PATH and
+// friends, and the trailing entry wins if os.Environ() already contains LC_ALL.
+func localeInvariantEnv() []string {
+	return append(os.Environ(), "LC_ALL=C")
 }
 
 var (
@@ -350,6 +364,11 @@ func iscsiEnsureNodeRecord(ctx context.Context, portal, iqn string) error {
 	args := []string{"-m", "node", "-o", "new", "-T", iqn, "-p", portal}
 	output, err := iscsiAdmCombinedOutput(cmdCtx, args...)
 	if err != nil {
+		// Unlike --login (15) and --logout (21), iscsiadm(8) does not document a
+		// stable "record already exists" exit code for "-o new", so exit-code
+		// classification is deliberately NOT used at this site. The message match
+		// below remains the only portable signal; iscsiAdmCombinedOutput pins
+		// LC_ALL=C so the text is at least locale-stable.
 		detail := strings.ToLower(string(output) + " " + err.Error())
 		if strings.Contains(detail, "already exists") || strings.Contains(detail, "already present") {
 			klog.V(4).Infof("iSCSI node record already exists for %s at %s", iqn, portal)
@@ -379,9 +398,19 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 
 		// Logout from target
 		cmd := exec.CommandContext(cmdCtx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--logout")
+		cmd.Env = localeInvariantEnv()
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			// Check if already logged out - treat as success
+			// Exit-code classification first: iscsiadm(8) documents exit code 21
+			// (ISCSI_ERR_NO_OBJS_FOUND) when there is no session to log out of,
+			// which is exactly the desired end state.
+			if code, ok := commandExitCode(err); ok && code == iscsiadmExitNoObjsFound {
+				klog.V(4).Infof("Target already logged out (exit code %d): %s", code, iqn)
+				return nil
+			}
+			// Check if already logged out - treat as success. Message-text
+			// fallback for older/odd builds that report the condition without the
+			// documented exit code.
 			if strings.Contains(string(output), "No matching sessions") ||
 				strings.Contains(string(output), "not logged in") {
 				klog.V(4).Infof("Target already logged out: %s", iqn)
@@ -402,10 +431,18 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-o", "delete")
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// Not critical if delete fails
-		klog.Warningf("Failed to delete node record: %v, output: %s", err, string(output))
+		// Exit code 21 (ISCSI_ERR_NO_OBJS_FOUND) means the node record is already
+		// gone — the desired end state — so treat it as clean idempotent success
+		// rather than a condition worth warning about.
+		if code, ok := commandExitCode(err); ok && code == iscsiadmExitNoObjsFound {
+			klog.V(4).Infof("iSCSI node record already deleted for %s at %s", iqn, portal)
+		} else {
+			// Not critical if delete fails
+			klog.Warningf("Failed to delete node record: %v, output: %s", err, string(output))
+		}
 	}
 
 	return nil
@@ -508,7 +545,16 @@ func iscsiLoginWithSessions(ctx context.Context, portal, iqn string, sessions []
 
 	output, err := iscsiAdmCombinedOutput(ctx, "-m", "node", "-T", iqn, "-p", portal, "--login")
 	if err != nil {
-		// Check if already logged in
+		// Exit-code classification first: iscsiadm(8) documents exit code 15
+		// (ISCSI_ERR_SESS_EXISTS) for a --login whose session already exists.
+		// Exit codes are the stable interface here; message text is not.
+		if code, ok := commandExitCode(err); ok && code == iscsiadmExitSessExists {
+			klog.V(4).Infof("Target already logged in (exit code %d): %s", code, iqn)
+			return nil
+		}
+		// Check if already logged in via the message text — kept as a fallback
+		// for older/odd iscsiadm builds that report the condition without the
+		// documented exit code.
 		if strings.Contains(string(output), "already present") {
 			klog.V(4).Infof("Target already logged in: %s", iqn)
 			return nil
@@ -519,18 +565,48 @@ func iscsiLoginWithSessions(ctx context.Context, portal, iqn string, sessions []
 	return nil
 }
 
+// iscsiadm(8) documents stable ISCSI_ERR_* exit codes. Unlike message text,
+// which changes across versions and locales, these codes are the tool's stable
+// interface, so idempotency classification checks them first and only falls
+// back to string matching for older/odd builds.
+const (
+	// iscsiadmExitSessExists (ISCSI_ERR_SESS_EXISTS, 15): --login found the
+	// session already established — the desired end state, i.e. idempotent
+	// success.
+	iscsiadmExitSessExists = 15
+	// iscsiadmExitNoObjsFound (ISCSI_ERR_NO_OBJS_FOUND, 21): no records,
+	// targets, sessions, or portals matched the request (e.g. --logout with no
+	// session, -o delete with no node record, or -m session with no sessions).
+	iscsiadmExitNoObjsFound = 21
+)
+
+// commandExitCode extracts the process exit code from a command error. ok is
+// false when err is nil or does not wrap an *exec.ExitError (start failure,
+// context timeout/cancel, ...), in which case exit-code classification must not
+// be applied. Shared helper so call sites stop hand-rolling the errors.As
+// unwrap.
+func commandExitCode(err error) (int, bool) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), true
+	}
+	return 0, false
+}
+
 // getISCSISessions returns the list of active iSCSI sessions.
 func getISCSISessions() ([]ISCSISession, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session")
+	cmd.Env = localeInvariantEnv()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 21 {
+		// Exit code 21 (ISCSI_ERR_NO_OBJS_FOUND) means "no active sessions",
+		// which is a valid empty result rather than a failure.
+		if code, ok := commandExitCode(err); ok && code == iscsiadmExitNoObjsFound {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to list iSCSI sessions: %w, stderr: %s", err, strings.TrimSpace(stderr.String()))
@@ -913,6 +989,7 @@ func ISCSIRescanSessionWithContext(ctx context.Context, portal, iqn string) erro
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--rescan")
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("rescan failed: %w, output: %s", err, string(output))
@@ -926,6 +1003,7 @@ func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session", "-s")
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session stats: %w", err)
@@ -974,6 +1052,7 @@ func SetISCSINodeParam(portal, iqn, name, value string) error {
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal,
 		"-o", "update", "-n", name, "-v", value)
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if isISCSIAuthParam(name) {

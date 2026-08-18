@@ -696,3 +696,41 @@ func TestFindNVMeoFSessionBySubsysName_StrictMatch(t *testing.T) {
 		})
 	}
 }
+
+// writeFakeNVMe installs a fake nvme binary built from script at the front of
+// PATH. The fixture lives under t.TempDir() (not /tmp, which may be mounted
+// noexec), mirroring the fake-iscsiadm pattern in iscsi_test.go.
+func writeFakeNVMe(t *testing.T, script string) {
+	t.Helper()
+	binDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "nvme"), []byte(script), 0o750))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestNVMeoFDisconnectAbsentSubsystemIsSuccess locks in the string-primary
+// classification for nvme disconnect: nvme-cli has no documented stable
+// exit-code table, so a nonzero exit whose output matches "not found" stays an
+// idempotent success. The fake exits 99 unless LC_ALL=C was pinned, proving the
+// locale pin that keeps this message text stable.
+func TestNVMeoFDisconnectAbsentSubsystemIsSuccess(t *testing.T) {
+	writeFakeNVMe(t, "#!/bin/sh\n"+
+		"[ \"$LC_ALL\" = \"C\" ] || exit 99\n"+
+		"printf 'Failed to lookup subsystem: not found'\n"+
+		"exit 1\n")
+
+	err := NVMeoFDisconnectWithContext(context.Background(), "nqn.2011-06.com.truenas:absent")
+	require.NoError(t, err)
+}
+
+// TestNVMeoFDisconnectUnknownFailureStillFails ensures a genuine disconnect
+// failure (unrecognized output) still propagates.
+func TestNVMeoFDisconnectUnknownFailureStillFails(t *testing.T) {
+	writeFakeNVMe(t, "#!/bin/sh\n"+
+		"printf 'kaboom'\n"+
+		"exit 1\n")
+
+	err := NVMeoFDisconnectWithContext(context.Background(), "nqn.2011-06.com.truenas:kaboom")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "disconnect failed")
+	assert.Contains(t, err.Error(), "exit status 1")
+}

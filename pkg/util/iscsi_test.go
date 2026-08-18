@@ -1568,3 +1568,122 @@ func TestSetISCSINodeParamErrorNeverLeaksCHAPSecret(t *testing.T) {
 	assert.NotContains(t, err.Error(), secret, "CHAP secret must never appear in a SetISCSINodeParam error")
 	assert.Contains(t, err.Error(), "***", "the auth value must be masked in the redacted argv")
 }
+
+// writeFakeISCSIAdm installs a fake iscsiadm built from script at the front of
+// PATH. The fixture lives under t.TempDir() (not /tmp, which may be mounted
+// noexec), following the pattern of TestGetISCSISessionsExit21IsEmpty.
+func writeFakeISCSIAdm(t *testing.T, script string) {
+	t.Helper()
+	binDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestCommandExitCode covers the shared exit-code extraction helper, including
+// the wrapped-error case that errors.As must unwrap and the non-exec errors for
+// which exit-code classification must be refused.
+func TestCommandExitCode(t *testing.T) {
+	code, ok := commandExitCode(nil)
+	assert.False(t, ok)
+	assert.Zero(t, code)
+
+	_, ok = commandExitCode(errors.New("not an exec error"))
+	assert.False(t, ok)
+
+	_, ok = commandExitCode(context.DeadlineExceeded)
+	assert.False(t, ok)
+
+	execErr := exec.Command("/bin/sh", "-c", "exit 7").Run()
+	require.Error(t, execErr)
+	code, ok = commandExitCode(fmt.Errorf("wrapped: %w", execErr))
+	assert.True(t, ok)
+	assert.Equal(t, 7, code)
+}
+
+// TestISCSILoginExitCode15IsAlreadyLoggedIn locks in exit-code-first
+// classification: the fake prints deliberately unrecognizable (non-English)
+// text so ONLY the documented exit code 15 (ISCSI_ERR_SESS_EXISTS) can turn the
+// failed --login into idempotent success. The fake exits 99 unless LC_ALL=C was
+// pinned, proving the locale pin on the exec seam as well.
+func TestISCSILoginExitCode15IsAlreadyLoggedIn(t *testing.T) {
+	writeFakeISCSIAdm(t, "#!/bin/sh\n"+
+		"[ \"$LC_ALL\" = \"C\" ] || exit 99\n"+
+		"printf 'iscsiadm: Sitzung existiert bereits' >&2\n"+
+		"exit 15\n")
+
+	err := iscsiLoginWithSessions(context.Background(), "192.0.2.40:3260", "iqn.2005-10.org.freenas.ctl:pvc-exit15", nil)
+	require.NoError(t, err)
+}
+
+// TestISCSILoginStringFallbackStillRecognized keeps the legacy message-text
+// fallback working for builds that report an existing session with some other
+// nonzero exit code.
+func TestISCSILoginStringFallbackStillRecognized(t *testing.T) {
+	writeFakeISCSIAdm(t, "#!/bin/sh\n"+
+		"printf 'iscsiadm: default: 1 session already present' >&2\n"+
+		"exit 8\n")
+
+	err := iscsiLoginWithSessions(context.Background(), "192.0.2.40:3260", "iqn.2005-10.org.freenas.ctl:pvc-fallback", nil)
+	require.NoError(t, err)
+}
+
+// TestISCSILoginUnknownExitCodeStillFails ensures the exit-code classification
+// only allowlists the documented code: any other failure keeps propagating with
+// its exit status and output intact.
+func TestISCSILoginUnknownExitCodeStillFails(t *testing.T) {
+	writeFakeISCSIAdm(t, "#!/bin/sh\n"+
+		"printf 'iscsiadm: etwas Unerwartetes' >&2\n"+
+		"exit 1\n")
+
+	err := iscsiLoginWithSessions(context.Background(), "192.0.2.40:3260", "iqn.2005-10.org.freenas.ctl:pvc-err", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "login command failed")
+	assert.Contains(t, err.Error(), "exit status 1")
+	assert.Contains(t, err.Error(), "etwas Unerwartetes")
+}
+
+// TestISCSIDisconnectExitCode21IsAlreadyLoggedOut locks in exit-code-first
+// classification on the logout AND node-record delete paths: unrecognizable
+// text plus the documented exit code 21 (ISCSI_ERR_NO_OBJS_FOUND) must yield a
+// clean success, and both commands must still have been attempted.
+func TestISCSIDisconnectExitCode21IsAlreadyLoggedOut(t *testing.T) {
+	callLog := filepath.Join(t.TempDir(), "calls.log")
+	writeFakeISCSIAdm(t, "#!/bin/sh\n"+
+		"[ \"$LC_ALL\" = \"C\" ] || exit 99\n"+
+		"echo \"$@\" >> "+callLog+"\n"+
+		"printf 'iscsiadm: keine passenden Sitzungen gefunden' >&2\n"+
+		"exit 21\n")
+
+	err := ISCSIDisconnectWithContext(context.Background(), "192.0.2.41:3260", "iqn.2005-10.org.freenas.ctl:pvc-exit21")
+	require.NoError(t, err)
+
+	data, readErr := os.ReadFile(callLog)
+	require.NoError(t, readErr)
+	assert.Contains(t, string(data), "--logout")
+	assert.Contains(t, string(data), "-o delete")
+}
+
+// TestISCSIDisconnectStringFallbackStillRecognized keeps the legacy
+// message-text fallback for builds reporting "No matching sessions" under an
+// exit code other than the documented 21.
+func TestISCSIDisconnectStringFallbackStillRecognized(t *testing.T) {
+	writeFakeISCSIAdm(t, "#!/bin/sh\n"+
+		"printf 'iscsiadm: No matching sessions found' >&2\n"+
+		"exit 5\n")
+
+	err := ISCSIDisconnectWithContext(context.Background(), "192.0.2.41:3260", "iqn.2005-10.org.freenas.ctl:pvc-fallback-out")
+	require.NoError(t, err)
+}
+
+// TestISCSIDisconnectUnknownExitCodeStillFails ensures a genuine logout failure
+// (unrecognized text, undocumented exit code) still propagates.
+func TestISCSIDisconnectUnknownExitCodeStillFails(t *testing.T) {
+	writeFakeISCSIAdm(t, "#!/bin/sh\n"+
+		"printf 'iscsiadm: kaboom' >&2\n"+
+		"exit 1\n")
+
+	err := ISCSIDisconnectWithContext(context.Background(), "192.0.2.41:3260", "iqn.2005-10.org.freenas.ctl:pvc-still-fails")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "logout failed")
+	assert.Contains(t, err.Error(), "exit status 1")
+}

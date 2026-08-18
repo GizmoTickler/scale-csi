@@ -176,9 +176,16 @@ func NVMeoFDisconnectWithContext(ctx context.Context, nqn string) error {
 		defer cancel()
 
 		cmd := exec.CommandContext(cmdCtx, "nvme", "disconnect", "-n", nqn)
+		cmd.Env = localeInvariantEnv()
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			// Check if already disconnected - treat as success
+			// Check if already disconnected - treat as success. Unlike iscsiadm(8),
+			// nvme-cli does not document a stable exit-code table (its nonzero exit
+			// codes are typically raw errno values that vary across versions and
+			// kernels), so exit-code classification is deliberately NOT used here:
+			// a nonzero exit combined with a "not found" / "No subsystems" message
+			// remains the idempotency signal, and the LC_ALL=C pin above keeps that
+			// message text locale-stable.
 			if strings.Contains(string(output), "not found") ||
 				strings.Contains(string(output), "No subsystems") {
 				klog.V(4).Infof("Subsystem already disconnected: %s", nqn)
@@ -250,7 +257,11 @@ func nvmeConnectPathWithSubsystems(ctx context.Context, transport, host, port, n
 }
 
 var nvmeConnectCommand = func(ctx context.Context, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, "nvme", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "nvme", args...)
+	// Pin the C locale so any message-text classification of connect output
+	// stays meaningful regardless of the node's locale (see localeInvariantEnv).
+	cmd.Env = localeInvariantEnv()
+	return cmd.CombinedOutput()
 }
 
 func runNVMeConnect(ctx context.Context, transport, host, port, nqn string) error {
@@ -375,6 +386,7 @@ func ListNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
 // listNVMeSubsystems returns the list of connected NVMe subsystems.
 func listNVMeSubsystems(ctx context.Context) ([]NVMeSubsystem, error) {
 	cmd := exec.CommandContext(ctx, "nvme", "list-subsys", "-o", "json")
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("list-subsys failed: %w", err)
@@ -591,6 +603,7 @@ func findNVMeDeviceFromListSubsys(nqn string) (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nvme", "list-subsys", "-o", "json")
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("nvme list-subsys failed: %w", err)
@@ -685,6 +698,7 @@ func NVMeRescanWithContext(ctx context.Context, devicePath string) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nvme", "ns-rescan", controllerPath)
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("NVMe rescan failed: %w, output: %s", err, string(output))
@@ -698,6 +712,7 @@ func NVMeGetNamespaceInfo(devicePath string) (*NVMeNamespace, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nvme", "id-ns", devicePath, "-o", "json")
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("id-ns failed: %w", err)
@@ -744,6 +759,7 @@ func NVMeListNamespaces(devicePath string) ([]int, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, "nvme", "list-ns", ctrlPath, "-o", "json")
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("list-ns failed: %w", err)
@@ -770,6 +786,7 @@ func NVMeFlush(devicePath string, nsid int) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nvme", "flush", devicePath, "-n", fmt.Sprintf("%d", nsid))
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("flush failed: %w, output: %s", err, string(output))
@@ -818,6 +835,7 @@ func NVMeDiscovery(transport, host, port string) ([]string, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, "nvme", args...)
+	cmd.Env = localeInvariantEnv()
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("discovery failed: %w", err)
