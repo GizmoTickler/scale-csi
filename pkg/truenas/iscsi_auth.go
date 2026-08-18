@@ -2,6 +2,8 @@ package truenas
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -13,10 +15,12 @@ import (
 // The struct deliberately holds NO secret material: the CHAP secret and peer
 // secret are only ever passed as call arguments and are never retained in
 // memory, logged, or serialized beyond the single API call that uses them.
-// CredentialFingerprint is a one-way (SHA-256) digest of the peer's credential
-// tuple computed from the live query response; it lets the driver detect a
-// rotation (same user/tag, changed secret) without ever holding or persisting
-// the raw secret. It is non-reversible and safe to cache.
+// CredentialFingerprint is a keyed (HMAC-SHA-256) digest of the peer's
+// credential tuple computed from the live query response; it lets the driver
+// detect a rotation (same user/tag, changed secret) without ever holding or
+// persisting the raw secret. The HMAC key is ephemeral to this process, so
+// the fingerprint is non-reversible AND useless for offline dictionary
+// attacks even if it were ever exposed. Safe to cache in memory.
 type ISCSIAuth struct {
 	ID                    int    `json:"id"`
 	Tag                   int    `json:"tag"`
@@ -25,17 +29,42 @@ type ISCSIAuth struct {
 	CredentialFingerprint string `json:"-"`
 }
 
-// ISCSIAuthCredentialFingerprint returns a stable, non-reversible digest of a
-// CHAP credential tuple. The driver computes the request-side fingerprint with
-// this same function and compares it against the peer's server-side fingerprint
-// (parseISCSIAuth derives that from the live iscsi.auth.query response, which
-// includes the secret fields). The digest never leaves this process and no raw
-// secret is retained.
+// iscsiAuthFingerprintKey keys every CHAP credential fingerprint this process
+// computes. Fingerprints are only ever compared against other fingerprints
+// produced in the SAME process (the request side and the parseISCSIAuth query
+// side are both derived live), so an ephemeral random key costs nothing
+// functionally — a restart simply recomputes both sides. What it buys is
+// real: a plain fast hash of a possibly low-entropy CHAP secret could be
+// recovered by offline dictionary search if a fingerprint ever leaked
+// (CodeQL go/weak-sensitive-data-hashing); an HMAC under a key that never
+// leaves this process cannot.
+var iscsiAuthFingerprintKey = newEphemeralFingerprintKey()
+
+func newEphemeralFingerprintKey() []byte {
+	key := make([]byte, 32)
+	// crypto/rand.Read cannot fail on supported platforms (it aborts the
+	// program rather than degrade); the guard is belt-and-braces so a future
+	// behavior change can never silently yield an all-zero key.
+	if _, err := rand.Read(key); err != nil {
+		panic(fmt.Sprintf("fingerprint key generation failed: %v", err))
+	}
+	return key
+}
+
+// ISCSIAuthCredentialFingerprint returns a stable (within this process),
+// non-reversible keyed digest of a CHAP credential tuple. The driver computes
+// the request-side fingerprint with this same function and compares it against
+// the peer's server-side fingerprint (parseISCSIAuth derives that from the
+// live iscsi.auth.query response, which includes the secret fields). The
+// digest never leaves this process, no raw secret is retained, and without the
+// process-ephemeral HMAC key the digest cannot be brute-forced against
+// candidate secrets.
 func ISCSIAuthCredentialFingerprint(user, secret, peerUser, peerSecret string) string {
 	// The separator is a NUL byte so no field boundary can be forged by a value
 	// that contains the separator character.
-	sum := sha256.Sum256([]byte(strings.Join([]string{user, secret, peerUser, peerSecret}, "\x00")))
-	return hex.EncodeToString(sum[:])
+	mac := hmac.New(sha256.New, iscsiAuthFingerprintKey)
+	mac.Write([]byte(strings.Join([]string{user, secret, peerUser, peerSecret}, "\x00")))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // iscsiAuthSecretParams builds the create/update parameter map for an

@@ -2,6 +2,8 @@ package driver
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -611,14 +613,37 @@ func (r *encryptionSecretResolver) storageClass(ctx context.Context, name string
 	return sc, nil
 }
 
+// encryptionRotationFingerprintKey keys every rotation-window fingerprint this
+// process computes. The fingerprint's only job is equality against other
+// fingerprints held in this process's in-memory map, so an ephemeral random
+// key is free functionally (a restart re-converges the window once, which is
+// idempotent) and closes the real gap: a plain fast hash over passphrases
+// could be dictionary-attacked offline if it ever escaped
+// (CodeQL go/weak-sensitive-data-hashing); an HMAC under a process-ephemeral
+// key cannot. Same construction as the CHAP credential fingerprint in
+// pkg/truenas/iscsi_auth.go.
+var encryptionRotationFingerprintKey = newRotationFingerprintKey()
+
+func newRotationFingerprintKey() []byte {
+	key := make([]byte, 32)
+	// crypto/rand.Read cannot fail on supported platforms (it aborts the
+	// program rather than degrade); the guard is belt-and-braces so a future
+	// behavior change can never silently yield an all-zero key.
+	if _, err := rand.Read(key); err != nil {
+		panic(fmt.Sprintf("rotation fingerprint key generation failed: %v", err))
+	}
+	return key
+}
+
 // encryptionRotationFingerprint identifies a rotation WINDOW without holding key
-// material: a salted SHA-256 over the two passphrases. It is never logged, never
-// stamped and never leaves the process; it exists so a converged window is not
-// re-converged on every reconcile pass while a NEW window (different keys) still
-// is. Same construction as the CHAP credential fingerprint.
+// material: a keyed HMAC-SHA-256 over the two passphrases, domain-separated by
+// the "gf1-rotation" label. It is never logged, never stamped and never leaves
+// the process; it exists so a converged window is not re-converged on every
+// reconcile pass while a NEW window (different keys) still is.
 func encryptionRotationFingerprint(keys encryptionKeys) string {
-	sum := sha256.Sum256([]byte(strings.Join([]string{"gf1-rotation", keys.Passphrase, keys.Previous}, "\x00")))
-	return hex.EncodeToString(sum[:])
+	mac := hmac.New(sha256.New, encryptionRotationFingerprintKey)
+	mac.Write([]byte(strings.Join([]string{"gf1-rotation", keys.Passphrase, keys.Previous}, "\x00")))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // encryptionRotationConvergedFor reports whether THIS rotation window has already
