@@ -289,9 +289,8 @@ func datasetTunableValue(ds *truenas.Dataset, prop string) string {
 // those changes. An empty list means the volume already matches and NO update
 // call may be made — CSI MODIFY_VOLUME is idempotent and a byte-identical
 // pool.dataset.update is still a wasted round trip.
-func buildMutableTunableUpdate(ds *truenas.Dataset, tunables map[string]string) (*truenas.DatasetUpdateParams, []string) {
-	params := &truenas.DatasetUpdateParams{}
-	var changed []string
+func buildMutableTunableUpdate(ds *truenas.Dataset, tunables map[string]string) (params *truenas.DatasetUpdateParams, changed []string) {
+	params = &truenas.DatasetUpdateParams{}
 	keys := make([]string, 0, len(tunables))
 	for key := range tunables {
 		keys = append(keys, key)

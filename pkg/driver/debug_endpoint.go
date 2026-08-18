@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+
 	// Importing net/http/pprof registers its handlers on http.DefaultServeMux
 	// as an import side effect. That is harmless here — NOTHING in this binary
 	// serves the default mux (the health/metrics server in health.go and the
@@ -54,7 +55,7 @@ type DebugServer struct {
 // DebugState is the response body of GET /debug/state.
 //
 // SECURITY INVARIANT: every field below is an EXPLICIT non-secret allowlist.
-// No config struct is ever marshalled wholesale, because Config carries the
+// No config struct is ever marshaled wholesale, because Config carries the
 // TrueNAS API key (and future config may carry more credential material).
 // When extending this struct, copy individual fields — never embed Config,
 // TrueNASConfig, or any other yaml-decoded struct. TestDebugStateNeverLeaksSecrets
@@ -302,7 +303,8 @@ func (s *DebugServer) collectNodeMounts() DebugNodeMounts {
 
 	d.nodeMountStateMu.Lock()
 	staged := make([]DebugMountRecord, 0, len(d.stagedTargets))
-	for _, record := range d.stagedTargets {
+	for key := range d.stagedTargets {
+		record := d.stagedTargets[key]
 		staged = append(staged, DebugMountRecord{
 			VolumeID:   record.VolumeID,
 			TargetPath: record.TargetPath,
@@ -310,7 +312,8 @@ func (s *DebugServer) collectNodeMounts() DebugNodeMounts {
 		})
 	}
 	published := make([]DebugMountRecord, 0, len(d.publishedTargets))
-	for _, record := range d.publishedTargets {
+	for key := range d.publishedTargets {
+		record := d.publishedTargets[key]
 		published = append(published, DebugMountRecord{
 			VolumeID:   record.VolumeID,
 			TargetPath: record.TargetPath,

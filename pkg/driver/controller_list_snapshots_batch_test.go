@@ -57,7 +57,7 @@ func newSnapshotListFixture() (*countingSnapshotListClient, *Driver) {
 // ListSnapshots produces an entry for it.
 func createCSISnapshot(t *testing.T, client *countingSnapshotListClient, dataset, name, sourceVolumeID string) {
 	t.Helper()
-	_, err := client.MockClient.SnapshotCreate(context.Background(), dataset, name, map[string]string{
+	_, err := client.SnapshotCreate(context.Background(), dataset, name, map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           name,
 		PropCSISnapshotSourceVolumeID: sourceVolumeID,
@@ -76,11 +76,11 @@ func createCSISnapshot(t *testing.T, client *countingSnapshotListClient, dataset
 func TestListSnapshotsPageBatchesUniqueSourceDatasetReads(t *testing.T) {
 	ctx := context.Background()
 	client, d := newSnapshotListFixture()
-	_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/src-a", Type: "VOLUME", Volsize: 12 * testGiB})
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/src-a", Type: "VOLUME", Volsize: 12 * testGiB})
 	require.NoError(t, err)
-	_, err = client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/src-b", Type: "VOLUME", Volsize: 7 * testGiB})
+	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/src-b", Type: "VOLUME", Volsize: 7 * testGiB})
 	require.NoError(t, err)
-	_, err = client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/plain", Type: "FILESYSTEM"})
+	_, err = client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/plain", Type: "FILESYSTEM"})
 	require.NoError(t, err)
 	for i := 1; i <= 3; i++ {
 		createCSISnapshot(t, client, "pool/parent/src-a", fmt.Sprintf("snap-a-%d", i), "src-a")
@@ -88,7 +88,7 @@ func TestListSnapshotsPageBatchesUniqueSourceDatasetReads(t *testing.T) {
 	}
 	// A manual snapshot without the CSI markers produces no entry, so its
 	// dataset must never appear in the batched read.
-	_, err = client.MockClient.SnapshotCreate(ctx, "pool/parent/plain", "manual", nil)
+	_, err = client.SnapshotCreate(ctx, "pool/parent/plain", "manual", nil)
 	require.NoError(t, err)
 
 	resp, err := d.ListSnapshots(ctx, &csi.ListSnapshotsRequest{})
@@ -120,7 +120,7 @@ func TestListSnapshotsKeepsEntryWhenSourceDatasetMissing(t *testing.T) {
 	// like ZFS listings raced against a delete, does not require the dataset to
 	// still exist for the snapshot to be listed).
 	createCSISnapshot(t, client, "pool/parent/ghost", "orphaned", "ghost")
-	client.MockClient.SetSnapshotUsedBytes("pool/parent/ghost@orphaned", 2*testGiB)
+	client.SetSnapshotUsedBytes("pool/parent/ghost@orphaned", 2*testGiB)
 
 	resp, err := d.ListSnapshots(ctx, &csi.ListSnapshotsRequest{})
 	require.NoError(t, err)
@@ -139,7 +139,7 @@ func TestListSnapshotsKeepsEntryWhenSourceDatasetMissing(t *testing.T) {
 func TestListSnapshotsBatchReadFailureFailsInternal(t *testing.T) {
 	ctx := context.Background()
 	client, d := newSnapshotListFixture()
-	_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/src-a", Type: "VOLUME", Volsize: testGiB})
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/src-a", Type: "VOLUME", Volsize: testGiB})
 	require.NoError(t, err)
 	createCSISnapshot(t, client, "pool/parent/src-a", "snap-a-1", "src-a")
 	client.batchErr = errors.New("injected batch failure")

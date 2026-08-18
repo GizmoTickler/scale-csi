@@ -150,7 +150,7 @@ func TestDebugStateShape(t *testing.T) {
 
 // TestDebugStateNeverLeaksSecrets is the security regression test for the
 // DebugState allowlist: a config carrying a sentinel API key must never see
-// that sentinel in the marshalled response, and the CACert sentinel proves the
+// that sentinel in the marshaled response, and the CACert sentinel proves the
 // response is a field allowlist rather than a redacted whole-config marshal.
 func TestDebugStateNeverLeaksSecrets(t *testing.T) {
 	d := newDebugTestDriver()

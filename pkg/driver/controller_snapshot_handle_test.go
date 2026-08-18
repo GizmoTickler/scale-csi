@@ -70,7 +70,7 @@ func newSnapshotHandleFixture(t *testing.T) (*snapshotHandleCountingClient, *Dri
 
 func createHandleTestSourceVolume(t *testing.T, client *snapshotHandleCountingClient, name string) {
 	t.Helper()
-	_, err := client.MockClient.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
+	_, err := client.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{
 		Name: "pool/parent/" + name, Type: "FILESYSTEM", Refquota: testGiB,
 	})
 	require.NoError(t, err)
@@ -162,7 +162,7 @@ func TestResolveSnapshotHandleFindsPromotionMigratedSnapshot(t *testing.T) {
 	ctx := context.Background()
 	client, d := newSnapshotHandleFixture(t)
 	createHandleTestSourceVolume(t, client, "promoted")
-	migrated, err := client.MockClient.SnapshotCreate(ctx, "pool/parent/promoted", "moved-snap", map[string]string{
+	migrated, err := client.SnapshotCreate(ctx, "pool/parent/promoted", "moved-snap", map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           "moved-snap",
 		PropCSISnapshotSourceVolumeID: "old-source",
@@ -209,7 +209,7 @@ func TestCreateSnapshotRetryOfUnstampedLegacySnapshotReturnsShortHandle(t *testi
 	ctx := context.Background()
 	client, d := newSnapshotHandleFixture(t)
 	createHandleTestSourceVolume(t, client, "legacy-src")
-	_, err := client.MockClient.SnapshotCreate(ctx, "pool/parent/legacy-src", "legacy-snap", map[string]string{
+	_, err := client.SnapshotCreate(ctx, "pool/parent/legacy-src", "legacy-snap", map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           "legacy-snap",
 		PropCSISnapshotSourceVolumeID: "legacy-src",
@@ -252,7 +252,7 @@ func TestDeleteSnapshotLegacyHandleKeepsScanBehavior(t *testing.T) {
 	ctx := context.Background()
 	client, d := newSnapshotHandleFixture(t)
 	createHandleTestSourceVolume(t, client, "legacy-del")
-	_, err := client.MockClient.SnapshotCreate(ctx, "pool/parent/legacy-del", "legacy-del-snap", map[string]string{
+	_, err := client.SnapshotCreate(ctx, "pool/parent/legacy-del", "legacy-del-snap", map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           "legacy-del-snap",
 		PropCSISnapshotSourceVolumeID: "legacy-del",
@@ -291,7 +291,7 @@ func TestListSnapshotsByIDResolvesBothHandleFormats(t *testing.T) {
 
 	// A pre-upgrade (unstamped) snapshot addressed by its legacy handle keeps
 	// the scan and reports the legacy handle.
-	_, err = client.MockClient.SnapshotCreate(ctx, "pool/parent/list-src", "legacy-list-snap", map[string]string{
+	_, err = client.SnapshotCreate(ctx, "pool/parent/list-src", "legacy-list-snap", map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           "legacy-list-snap",
 		PropCSISnapshotSourceVolumeID: "list-src",
@@ -320,7 +320,7 @@ func TestListSnapshotsEntriesReportPerSnapshotHandles(t *testing.T) {
 	createHandleTestSourceVolume(t, client, "mixed-src")
 	created, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{Name: "stamped-snap", SourceVolumeId: "mixed-src"})
 	require.NoError(t, err)
-	_, err = client.MockClient.SnapshotCreate(ctx, "pool/parent/mixed-src", "unstamped-snap", map[string]string{
+	_, err = client.SnapshotCreate(ctx, "pool/parent/mixed-src", "unstamped-snap", map[string]string{
 		PropManagedResource:           "true",
 		PropCSISnapshotName:           "unstamped-snap",
 		PropCSISnapshotSourceVolumeID: "mixed-src",
@@ -480,7 +480,7 @@ func TestDeleteSnapshotQualifiedHandleDeferredDeleteKeepsLedgerConsistent(t *tes
 	created, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{Name: "cloned-snap", SourceVolumeId: "clone-src"})
 	require.NoError(t, err)
 	handle := created.GetSnapshot().GetSnapshotId()
-	require.NoError(t, client.MockClient.SnapshotClone(ctx, "pool/parent/clone-src@cloned-snap", "pool/parent/restored"))
+	require.NoError(t, client.SnapshotClone(ctx, "pool/parent/clone-src@cloned-snap", "pool/parent/restored"))
 
 	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: handle})
 	require.NoError(t, err, "a snapshot with clones defers, it does not fail")

@@ -75,7 +75,7 @@ func createModifyTestZvol(t *testing.T, client *modifyCountingClient, name strin
 	if managed {
 		params.UserProperties = []truenas.UserPropertyUpdate{{Key: PropManagedResource, Value: "true"}}
 	}
-	_, err := client.MockClient.DatasetCreate(context.Background(), params)
+	_, err := client.DatasetCreate(context.Background(), params)
 	require.NoError(t, err)
 }
 
@@ -120,7 +120,7 @@ func TestControllerModifyVolumeHappyPathNFS(t *testing.T) {
 
 	// The mock now reports the new values back through DatasetGet, like a real
 	// pool.dataset.query would.
-	ds, err := client.MockClient.DatasetGet(context.Background(), "pool/parent/"+volumeID)
+	ds, err := client.DatasetGet(context.Background(), "pool/parent/"+volumeID)
 	require.NoError(t, err)
 	assert.Equal(t, "ZSTD", ds.Compression.Value)
 	assert.Equal(t, "1M", ds.Recordsize.Value)
@@ -265,7 +265,7 @@ func TestCreateVolumeWithMutableParameters(t *testing.T) {
 			MutableParameters:  map[string]string{"compression": "ZSTD", "recordsize": "1M"},
 		})
 		require.NoError(t, err)
-		ds, err := client.MockClient.DatasetGet(context.Background(), "pool/parent/"+resp.Volume.VolumeId)
+		ds, err := client.DatasetGet(context.Background(), "pool/parent/"+resp.Volume.VolumeId)
 		require.NoError(t, err)
 		assert.Equal(t, "ZSTD", ds.Compression.Value, "mutable parameters ride the single pool.dataset.create")
 		assert.Equal(t, "1M", ds.Recordsize.Value)
@@ -292,7 +292,7 @@ func TestCreateVolumeWithMutableParameters(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, codes.InvalidArgument, st.Code())
 		assert.Contains(t, st.Message(), "XXX_FakeKey")
-		_, getErr := client.MockClient.DatasetGet(context.Background(), "pool/parent/vol-vac-bad")
+		_, getErr := client.DatasetGet(context.Background(), "pool/parent/vol-vac-bad")
 		assert.Error(t, getErr, "the vocabulary gate must fire before anything is provisioned")
 	})
 
