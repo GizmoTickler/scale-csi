@@ -37,6 +37,8 @@ func FuzzProtocolShareName(f *testing.F) {
 func FuzzSanitizeVolumeID(f *testing.F) {
 	f.Add("pvc-123")
 	f.Add("🔥/volume")
+	f.Add("snap@shot")
+	f.Add("a@b@c/d e")
 	f.Add(strings.Repeat("a", 127) + "é")
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeVolumeID(input)
@@ -45,6 +47,12 @@ func FuzzSanitizeVolumeID(f *testing.F) {
 		}
 		if strings.Contains(got, "/") {
 			t.Fatalf("sanitized ID contains '/': %q", got)
+		}
+		// '@' must never survive sanitization: CSI snapshot handle format
+		// detection relies on a legacy short-name handle never containing it
+		// (see parseQualifiedSnapshotHandle).
+		if strings.Contains(got, "@") {
+			t.Fatalf("sanitized ID contains '@': %q", got)
 		}
 		if len(got) > 128 {
 			t.Fatalf("sanitized ID is %d bytes", len(got))

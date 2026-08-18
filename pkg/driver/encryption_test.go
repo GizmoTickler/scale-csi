@@ -1429,7 +1429,7 @@ func TestRecoveredRemnantWithDriverManagedKeyIsRolledBack(t *testing.T) {
 	require.NoError(t, err)
 	snapResp, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{SourceVolumeId: "enc-src", Name: "enc-snap"})
 	require.NoError(t, err)
-	backendSnapshot := "pool/parent/enc-src@" + snapResp.GetSnapshot().GetSnapshotId()
+	backendSnapshot := snapResp.GetSnapshot().GetSnapshotId() // dataset-qualified handle == the ZFS snapshot ID
 
 	// Reproduce the interrupted create: marker written, clone made, crash before
 	// the ownership stamp.

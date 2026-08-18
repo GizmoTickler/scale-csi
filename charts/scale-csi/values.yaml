@@ -1088,6 +1088,15 @@ securityContext:
 health:
   cacheTTL: 5s
 
+# Opt-in debug HTTP endpoint (Go pprof profiles + /debug/state runtime dump).
+# DISABLED by default (empty listenAddress renders no config block and the
+# driver opens no listener). The endpoint is UNAUTHENTICATED by design: set a
+# loopback bind such as "127.0.0.1:6060" and reach it with
+# `kubectl port-forward` (or `kubectl exec` + curl), or guard a non-loopback
+# port with a NetworkPolicy. This chart never exposes it through a Service.
+debug:
+  listenAddress: ""
+
 # Logging configuration
 logging:
   # Verbosity level (0-10, higher is more verbose)

@@ -582,6 +582,16 @@
         }
       }
     },
+    "debug": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "listenAddress": {
+          "description": "Opt-in UNAUTHENTICATED debug endpoint (Go pprof + /debug/state). Empty (default) disables it; the driver opens no listener. Set a loopback host:port such as 127.0.0.1:6060 and use kubectl port-forward, or guard a non-loopback port with a NetworkPolicy.",
+          "type": "string"
+        }
+      }
+    },
     "health": {
       "type": "object",
       "additionalProperties": false,

@@ -39,15 +39,29 @@ type Dataset struct {
 	// `quota` bounds `used` (= referenced + usedbysnapshots + usedbychildren +
 	// usedbyrefreservation). Comparing `used` against `refquota` reports every
 	// volume that merely HAS snapshots as near-quota.
-	Referenced      DatasetProperty         `json:"referenced"`
-	Usedbysnapshots DatasetProperty         `json:"usedbysnapshots"`
-	Reservation     DatasetProperty         `json:"reservation"`
-	Refreservation  DatasetProperty         `json:"refreservation"`
-	Volsize         DatasetProperty         `json:"volsize"`
-	Volblocksize    DatasetProperty         `json:"volblocksize"`
-	Origin          DatasetProperty         `json:"origin"`
-	Creation        DatasetProperty         `json:"creation"`
-	UserProperties  map[string]UserProperty `json:"user_properties"`
+	Referenced      DatasetProperty `json:"referenced"`
+	Usedbysnapshots DatasetProperty `json:"usedbysnapshots"`
+	Reservation     DatasetProperty `json:"reservation"`
+	Refreservation  DatasetProperty `json:"refreservation"`
+	Volsize         DatasetProperty `json:"volsize"`
+	Volblocksize    DatasetProperty `json:"volblocksize"`
+	// The live-tunable property quartet ControllerModifyVolume manages
+	// (VolumeAttributesClass / CSI MODIFY_VOLUME). They are carried so the
+	// driver can diff a requested retune against the dataset's CURRENT values
+	// and skip pool.dataset.update entirely when nothing would change —
+	// idempotency without a second read. They ride the pool.dataset.query
+	// projection only (datasetTunableQueryProperties); zfs.resource.query
+	// reads never ask for them, so on the bulk-listing path they are the zero
+	// value like every other unprojected field, and no decision may be taken
+	// on them there.
+	Compression DatasetProperty `json:"compression"`
+	Sync        DatasetProperty `json:"sync"`
+	Atime       DatasetProperty `json:"atime"`
+	Recordsize  DatasetProperty `json:"recordsize"`
+
+	Origin         DatasetProperty         `json:"origin"`
+	Creation       DatasetProperty         `json:"creation"`
+	UserProperties map[string]UserProperty `json:"user_properties"`
 	// CreatedByCall is true only when pool.dataset.create itself created this
 	// object. The idempotent AlreadyExists fallback leaves it false so callers
 	// never post-stamp a raced foreign dataset.
@@ -190,6 +204,23 @@ var datasetEncryptionQueryProperties = []string{
 	"keystatus",
 }
 
+// datasetTunableQueryProperties is the live-tunable property set
+// ControllerModifyVolume (CSI MODIFY_VOLUME) diffs and retunes. Projecting them
+// on the pool.dataset.query path is what lets the modify flow reuse the
+// DatasetGet it already performs (type + ownership gate) as the CURRENT-value
+// read, so a no-op retune costs zero pool.dataset.update calls. All four are
+// standard per-dataset OpenZFS properties requested through the same
+// extra.properties mechanism that already carries volblocksize; the request
+// shape was not re-probed live for these specific names, and the projection
+// model (dataset_projection.go) models them like every other projected field so
+// a reader that forgets the projection fails a unit test, not on hardware.
+var datasetTunableQueryProperties = []string{
+	"compression",
+	"sync",
+	"atime",
+	"recordsize",
+}
+
 // datasetQueryProperties is the projection sent with EVERY pool.dataset.query
 // read (DatasetGet, DatasetGetByNames, DatasetList).
 //
@@ -205,6 +236,7 @@ var datasetEncryptionQueryProperties = []string{
 var datasetQueryProperties = slices.Concat(
 	datasetQueryPropertiesBase,
 	[]string{"origin"},
+	datasetTunableQueryProperties,
 	datasetEncryptionQueryProperties,
 )
 
@@ -289,13 +321,21 @@ type EncryptionOptions struct {
 
 // DatasetUpdateParams holds parameters for updating a dataset.
 type DatasetUpdateParams struct {
-	Volsize              int64                `json:"volsize,omitempty"`
-	Quota                interface{}          `json:"quota,omitempty"`
-	Refquota             interface{}          `json:"refquota,omitempty"`
-	Reservation          interface{}          `json:"reservation,omitempty"`
-	Refreservation       interface{}          `json:"refreservation,omitempty"`
-	Comments             string               `json:"comments,omitempty"`
-	Readonly             string               `json:"readonly,omitempty"`
+	Volsize        int64       `json:"volsize,omitempty"`
+	Quota          interface{} `json:"quota,omitempty"`
+	Refquota       interface{} `json:"refquota,omitempty"`
+	Reservation    interface{} `json:"reservation,omitempty"`
+	Refreservation interface{} `json:"refreservation,omitempty"`
+	Comments       string      `json:"comments,omitempty"`
+	Readonly       string      `json:"readonly,omitempty"`
+	// Live-tunable ZFS properties (MODIFY_VOLUME). recordsize/compression apply
+	// to NEW writes only — blocks already on disk keep the layout they were
+	// written with (see zfsLiveTunableProperties) — which is exactly why they
+	// are safe to change on a live volume.
+	Compression          string               `json:"compression,omitempty"`
+	Sync                 string               `json:"sync,omitempty"`
+	Atime                string               `json:"atime,omitempty"`
+	Recordsize           string               `json:"recordsize,omitempty"`
 	UserPropertiesUpdate []UserPropertyUpdate `json:"user_properties_update,omitempty"`
 }
 
@@ -440,13 +480,23 @@ var datasetCreateKeyScopes = map[string]datasetKeyScope{
 // the one ZFS enforces (a zvol is sized by volsize and carries no dataset
 // quota, a filesystem is the reverse).
 var datasetUpdateKeyScopes = map[string]datasetKeyScope{
-	"volsize":                datasetKeyVolumeOnly,
-	"quota":                  datasetKeyFilesystemOnly,
-	"refquota":               datasetKeyFilesystemOnly,
-	"reservation":            datasetKeyBothTypes,
-	"refreservation":         datasetKeyBothTypes,
-	"comments":               datasetKeyBothTypes,
-	"readonly":               datasetKeyBothTypes,
+	"volsize":        datasetKeyVolumeOnly,
+	"quota":          datasetKeyFilesystemOnly,
+	"refquota":       datasetKeyFilesystemOnly,
+	"reservation":    datasetKeyBothTypes,
+	"refreservation": datasetKeyBothTypes,
+	"comments":       datasetKeyBothTypes,
+	"readonly":       datasetKeyBothTypes,
+	// Live-tunable quartet (MODIFY_VOLUME). The type split mirrors
+	// datasetCreateKeyScopes exactly: recordsize/atime describe a mounted POSIX
+	// namespace a zvol does not have (the same split applyDatasetProperties and
+	// zfsFilesystemOnlyProperties enforce), while sync/compression are ZFS
+	// properties defined for filesystems and volumes alike. ZFS semantics; not
+	// separately probed against 26.0's pool.dataset.update models.
+	"compression":            datasetKeyBothTypes,
+	"sync":                   datasetKeyBothTypes,
+	"atime":                  datasetKeyFilesystemOnly,
+	"recordsize":             datasetKeyFilesystemOnly,
 	"user_properties_update": datasetKeyBothTypes,
 }
 
@@ -1276,6 +1326,12 @@ func parseDataset(data interface{}) (*Dataset, error) {
 	ds.Refreservation = parseProperty(m["refreservation"])
 	ds.Volsize = parseProperty(m["volsize"])
 	ds.Volblocksize = parseProperty(m["volblocksize"])
+	// Live-tunable quartet (MODIFY_VOLUME) — read identically to the typed
+	// decoder's JSON tags so the two parsers stay equivalent.
+	ds.Compression = parseProperty(m["compression"])
+	ds.Sync = parseProperty(m["sync"])
+	ds.Atime = parseProperty(m["atime"])
+	ds.Recordsize = parseProperty(m["recordsize"])
 	ds.Origin = parseProperty(m["origin"])
 	ds.Creation = parseProperty(m["creation"])
 

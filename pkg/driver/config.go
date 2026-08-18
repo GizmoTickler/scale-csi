@@ -71,6 +71,12 @@ type Config struct {
 	// deliberately independent from backend-health polling.
 	Health HealthConfig `yaml:"health"`
 
+	// Debug configures the opt-in debug HTTP endpoint (pprof + /debug/state).
+	// It is strictly opt-in: the zero value (empty listenAddress) opens no
+	// listener at all, so a deployment that never sets this block behaves
+	// exactly as before the endpoint existed.
+	Debug DebugConfig `yaml:"debug"`
+
 	// Encryption configures ZFS-native encryption at rest (GF-Sprint 1). It is
 	// strictly opt-in: the zero value (Enabled=false) leaves every volume
 	// plaintext and a deployment that never touches encryption behaves exactly as
@@ -721,6 +727,25 @@ func (c HealthConfig) CacheTTLDuration() (time.Duration, error) {
 	return ttl, nil
 }
 
+// DebugConfig configures the opt-in debug HTTP endpoint that serves the
+// net/http/pprof profiles and the /debug/state runtime-state dump.
+type DebugConfig struct {
+	// ListenAddress is the host:port the debug server binds (for example
+	// "127.0.0.1:6060"). Empty (the default) disables the endpoint entirely:
+	// no listener is created and no debug goroutine runs.
+	//
+	// SECURITY: the endpoint is deliberately UNAUTHENTICATED — pprof handlers
+	// do not compose with auth middleware in any standard way, and a bespoke
+	// scheme here would invite false confidence. The bind address IS the access
+	// control: bind loopback and reach it via `kubectl port-forward` (or
+	// `kubectl exec` + curl), or bind a pod port guarded by a NetworkPolicy.
+	// LoadConfig warns on any non-loopback bind so an accidentally wide-open
+	// profiler is at least visible at startup. /debug/state itself only ever
+	// serves an explicit non-secret allowlist (see DebugState in
+	// debug_endpoint.go), never the raw config.
+	ListenAddress string `yaml:"listenAddress"`
+}
+
 // NVMeoFConfig holds NVMe-oF configuration.
 type NVMeoFConfig struct {
 	// Enabled enables NVMe-oF provisioning for StorageClasses that select NVMe-oF.
@@ -1289,10 +1314,41 @@ func applyConfigDefaults(cfg *Config) {
 	// commandTimeouts.nvme), so it deliberately has no default.
 }
 
+// validateDebugListenAddress rejects a debug.listenAddress that cannot be a
+// TCP bind address and warns when the bind is not loopback. A warning (not an
+// error) preserves the documented "guarded non-loopback port" deployment while
+// making an accidentally Internet-facing unauthenticated profiler visible in
+// the startup log.
+func validateDebugListenAddress(listenAddress string) error {
+	addr := strings.TrimSpace(listenAddress)
+	if addr == "" {
+		// Empty means disabled; that is the default and always valid.
+		return nil
+	}
+	host, port, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		return fmt.Errorf("debug.listenAddress must be a host:port such as 127.0.0.1:6060: %w", splitErr)
+	}
+	if strings.TrimSpace(port) == "" {
+		return fmt.Errorf("debug.listenAddress must include a port (got %q)", addr)
+	}
+	loopback := host == "localhost"
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		loopback = true
+	}
+	if !loopback {
+		configWarningf("debug.listenAddress %q is not a loopback address; the debug endpoint is UNAUTHENTICATED — ensure the port is guarded (e.g. by a NetworkPolicy) or bind 127.0.0.1 and use port-forwarding", addr)
+	}
+	return nil
+}
+
 // validateConfig enforces the config invariants that must hold after defaults are
 // applied: the reconcile delete cap and durations, and the required-field/enabled-
 // protocol constraints. Extracted from LoadConfig (Batch 18 R7).
 func validateConfig(cfg *Config) error {
+	if err := validateDebugListenAddress(cfg.Debug.ListenAddress); err != nil {
+		return err
+	}
 	if ttl, parseErr := cfg.Health.CacheTTLDuration(); parseErr != nil || ttl < 0 {
 		if parseErr != nil {
 			return fmt.Errorf("health.cacheTTL must be a non-negative duration: %w", parseErr)

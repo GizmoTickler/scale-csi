@@ -710,7 +710,15 @@ func (m *MockClient) DatasetCreate(ctx context.Context, params *DatasetCreatePar
 		Refquota:       DatasetProperty{Parsed: float64(params.Refquota)},
 		Refreservation: DatasetProperty{Parsed: float64(params.Refreservation)},
 		Volblocksize:   DatasetProperty{Parsed: params.Volblocksize},
-		CreatedByCall:  false,
+		// Live-tunable quartet (MODIFY_VOLUME): recorded when the create payload
+		// set them so a later ControllerModifyVolume no-op diff has real current
+		// values to compare against, exactly as a real pool.dataset.query would
+		// report them back.
+		Compression:   mockTunableProperty(params.Compression),
+		Sync:          mockTunableProperty(params.Sync),
+		Atime:         mockTunableProperty(params.Atime),
+		Recordsize:    mockTunableProperty(params.Recordsize),
+		CreatedByCall: false,
 	}
 	if !m.DropDatasetCreateUserProperties {
 		for _, property := range params.UserProperties {
@@ -792,6 +800,19 @@ func (m *MockClient) applyInheritedEncryptionLocked(ds *Dataset) {
 		}
 		return
 	}
+}
+
+// mockTunableProperty models a live-tunable ZFS property an explicit
+// create/update payload set on the dataset: pool.dataset.query reports the
+// value with a LOCAL source. An unset parameter stays the zero DatasetProperty
+// — the mock deliberately does not model value inheritance from the parent
+// dataset for these, so "current value unknown" is a shape driver code must
+// (and does) treat as a difference, never as a match.
+func mockTunableProperty(value string) DatasetProperty {
+	if value == "" {
+		return DatasetProperty{}
+	}
+	return DatasetProperty{Value: value, Rawvalue: value, Parsed: value, Source: "LOCAL"}
 }
 
 func mockDatasetResponse(dataset *Dataset, created bool) *Dataset {
@@ -993,6 +1014,22 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 		case float64:
 			ds.Refreservation = DatasetProperty{Parsed: refreservation}
 		}
+	}
+	// Live-tunable quartet (MODIFY_VOLUME): last write wins and the value reads
+	// back with a LOCAL source, exactly like a real `zfs set` through
+	// pool.dataset.update. An omitted field (empty string, omitempty) leaves the
+	// stored value untouched.
+	if params.Compression != "" {
+		ds.Compression = mockTunableProperty(params.Compression)
+	}
+	if params.Sync != "" {
+		ds.Sync = mockTunableProperty(params.Sync)
+	}
+	if params.Atime != "" {
+		ds.Atime = mockTunableProperty(params.Atime)
+	}
+	if params.Recordsize != "" {
+		ds.Recordsize = mockTunableProperty(params.Recordsize)
 	}
 	for _, update := range params.UserPropertiesUpdate {
 		if update.Remove {

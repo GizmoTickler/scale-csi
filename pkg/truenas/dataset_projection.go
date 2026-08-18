@@ -65,6 +65,14 @@ var datasetProjectedProperties = []datasetProjectedProperty{
 	{"volblocksize", func(ds *Dataset) { ds.Volblocksize = DatasetProperty{} }},
 	{"creation", func(ds *Dataset) { ds.Creation = DatasetProperty{} }},
 	{"origin", func(ds *Dataset) { ds.Origin = DatasetProperty{} }},
+	// Live-tunable quartet (MODIFY_VOLUME): projected on the pool.dataset.query
+	// path only, and modeled here for the same reason as origin — a reader that
+	// depends on them off a projection that does not carry them must fail a
+	// unit test, not evaluate zero values on hardware.
+	{"compression", func(ds *Dataset) { ds.Compression = DatasetProperty{} }},
+	{"sync", func(ds *Dataset) { ds.Sync = DatasetProperty{} }},
+	{"atime", func(ds *Dataset) { ds.Atime = DatasetProperty{} }},
+	{"recordsize", func(ds *Dataset) { ds.Recordsize = DatasetProperty{} }},
 }
 
 // datasetEncryptionBlockProjected reports whether the projection asks for the

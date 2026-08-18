@@ -26,6 +26,8 @@ const (
 	EventReasonVolumeDeleteFailed   = "VolumeDeleteFailed"
 	EventReasonVolumeExpanded       = "VolumeExpanded"
 	EventReasonVolumeExpandFailed   = "VolumeExpandFailed"
+	EventReasonVolumeModified       = "VolumeModified"
+	EventReasonVolumeModifyFailed   = "VolumeModifyFailed"
 	EventReasonSnapshotCreated      = "SnapshotCreated"
 	EventReasonSnapshotCreateFailed = "SnapshotCreateFailed"
 	EventReasonSnapshotDeleted      = "SnapshotDeleted"
@@ -89,6 +91,16 @@ const (
 	// persistently fails to re-unlock a locked encrypted volume (GF-Sprint 1,
 	// E-2 §4). The message is redacted.
 	EventReasonEncryptionUnlockFailed = "EncryptionUnlockFailed"
+	// EventReasonNASTimezoneUnresolved is emitted when the NAS civil timezone a
+	// volume's scheduled snapshots must be proven in cannot be resolved: the live
+	// zone is unreadable (system.general.config), the volume carries no
+	// locally-recorded task timezone, or the NAS's zone no longer matches the one
+	// recorded when the task was created (GF2-fix2/B1-a). Ownership checks then
+	// fail CLOSED: DeleteVolume preserves the volume's scheduled snapshots as
+	// foreign, so they accumulate — mysterious leftovers unless this Event (and
+	// scale_csi_nas_timezone_unresolved_total) names the cause. At most one Event
+	// is emitted per operation.
+	EventReasonNASTimezoneUnresolved = "NASTimezoneUnresolved"
 )
 
 const (

@@ -887,7 +887,13 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 - A TrueNAS NVMe-oF listener only materializes on a configured port once at
   least one subsystem is associated with it — a bare port shows no kernel
   listener, which is normal and self-resolves on first volume creation.
-- `ControllerModifyVolume` returns `Unimplemented`. CSI volume group snapshot
+- `ControllerModifyVolume` retunes the live-tunable ZFS property set from
+  VolumeAttributesClass `mutable_parameters`: `compression` and `sync` for every
+  volume, plus `atime` and `recordsize` for NFS filesystems. Block geometry
+  (`volblocksize`, extent block sizes), capacity keys (`volsize`, `refquota`,
+  ...), protocol/share identity, encryption, `zfsPerformanceClass`, and any
+  unrecognized key are rejected with `InvalidArgument`; `recordsize`/
+  `compression` changes affect new writes only. CSI volume group snapshot
   services are not registered or implemented.
 - CSI volume and snapshot names share `sanitizeVolumeID`: `/` and spaces become
   `-`, a first byte outside lowercase ASCII alphanumerics is prefixed with `v`,

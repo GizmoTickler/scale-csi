@@ -36,6 +36,9 @@ var poolQueryProjectionWant = []string{
 	// origin: read by datasetOriginSnapshotID (promote candidate + revalidation,
 	// in-flight clone remnant identity, detached-copy remnant guard).
 	"origin",
+	// the live-tunable quartet: read by ControllerModifyVolume's no-op diff
+	// (MODIFY_VOLUME), which decides whether pool.dataset.update is issued at all.
+	"compression", "sync", "atime", "recordsize",
 	// the measured encryption set (re-drill shape C).
 	"encryption", "keyformat", "encryptionroot", "keystatus",
 }

@@ -86,6 +86,10 @@ type Driver struct {
 	healthServer *HealthServer
 	healthPort   int
 
+	// Opt-in debug endpoint (pprof + /debug/state); nil unless
+	// debug.listenAddress is configured. See DebugServer in debug_endpoint.go.
+	debugServer *DebugServer
+
 	// Kubernetes event recorder
 	eventRecorder *EventRecorder
 
@@ -105,6 +109,19 @@ type Driver struct {
 	nodeMountStateMu sync.Mutex
 	stagedTargets    map[string]nodeMountRecord
 	publishedTargets map[string]nodeMountRecord
+
+	// ListSnapshots paging cache: the full snapshot set fetched at the START of
+	// a paging walk (empty starting token), served to that walk's continuation
+	// pages within a short TTL. On TrueNAS 26.0 the snapshot resource API has no
+	// server-side pagination, so without this every PAGE paid a full-set
+	// transfer (see snapshotsForListPage). Unlike the NAS-timezone cache
+	// deliberately kept off this struct (see the note above), staleness here is
+	// bounded and benign: the cache feeds only read-only CSI listing pages, an
+	// empty starting token always refetches, and no delete/authorization
+	// decision ever reads it.
+	snapshotPageCacheMu   sync.Mutex
+	snapshotPageCache     []*truenas.Snapshot
+	snapshotPageCacheTime time.Time
 
 	// Ready flag (atomic for safe concurrent access)
 	ready atomic.Bool
@@ -441,6 +458,29 @@ func (d *Driver) Run() error {
 		}
 	}
 
+	// The debug endpoint is strictly opt-in: NewDebugServer returns nil when
+	// debug.listenAddress is empty, so a default deployment opens no extra
+	// port. Like the health server it binds before any background workers, so
+	// an occupied address is a synchronous startup failure rather than an
+	// asynchronous log line.
+	if d.config != nil {
+		if debugServer := NewDebugServer(d, d.config.Debug.ListenAddress); debugServer != nil {
+			d.debugServer = debugServer
+			if err := d.debugServer.Start(); err != nil {
+				// The health server may already be bound; shut it down so a failed
+				// debug bind leaves no half-started listener goroutine behind,
+				// matching the "no half-started goroutines" contract above.
+				if d.healthServer != nil {
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = d.healthServer.Stop(shutdownCtx)
+					cancel()
+				}
+				_ = listener.Close()
+				return fmt.Errorf("failed to start debug server: %w", err)
+			}
+		}
+	}
+
 	// Serve first. Startup fencing may require hundreds of serialized middleware
 	// calls on a populated cluster and must never make the CSI endpoint crash-loop.
 	// Only strict mode gates readiness until its background retry loop converges.
@@ -493,6 +533,15 @@ func (d *Driver) Stop() {
 		defer cancel()
 		if err := d.healthServer.Stop(ctx); err != nil {
 			klog.Warningf("Failed to stop health server: %v", err)
+		}
+	}
+
+	// Stop debug server (mirrors the health server shutdown pattern)
+	if d.debugServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.debugServer.Stop(ctx); err != nil {
+			klog.Warningf("Failed to stop debug server: %v", err)
 		}
 	}
 

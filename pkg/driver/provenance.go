@@ -526,7 +526,9 @@ func (d *Driver) contentSourceBlockGeometry(
 	switch {
 	case source.GetSnapshot() != nil:
 		snapshotID := source.GetSnapshot().GetSnapshotId()
-		snap, findErr := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+		// resolveSnapshotHandle: targeted read for dataset-qualified handles,
+		// the legacy scan for short-name ones; nil keeps meaning "gone".
+		snap, findErr := d.resolveSnapshotHandle(ctx, snapshotID)
 		if findErr != nil {
 			return blockGeometry{}, status.Errorf(codes.Internal,
 				"failed to re-read the content source of in-flight remnant %s: %v", datasetName, findErr)
@@ -575,7 +577,10 @@ func (d *Driver) guardNVMeoFContentSourceGeometry(
 	switch {
 	case source.GetSnapshot() != nil:
 		snapshotID := source.GetSnapshot().GetSnapshotId()
-		snap, findErr := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+		// resolveSnapshotHandle: targeted read for dataset-qualified handles,
+		// the legacy scan for short-name ones; nil keeps meaning "gone" and this
+		// arm proceeds exactly as before (nothing to contradict).
+		snap, findErr := d.resolveSnapshotHandle(ctx, snapshotID)
 		if findErr != nil {
 			return status.Errorf(codes.Internal,
 				"failed to re-read the content source of in-flight remnant %s: %v", datasetName, findErr)
@@ -754,6 +759,13 @@ func tombstoneLedgerFromDataset(parent *truenas.Dataset) map[string]tombstoneLed
 // handleSnapshotClones tombstones a snapshot and asks ZFS to destroy it once
 // its last clone releases the dependency.
 func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapshot) error {
+	// NOTE on handle formats: everything below derives from the RESOLVED
+	// snapshot object (snap.Dataset, snap.Name), never from the CSI handle
+	// string that addressed it. The tombstone name — and therefore the ledger
+	// key, tombstoneLedgerKey(deleteID) — is thus identical whether the
+	// DeleteSnapshot that got here was called with the legacy short-name handle
+	// or the dataset-qualified one, and stays byte-compatible with every ledger
+	// entry written before qualified handles existed.
 	tombstoneName := snapshotTombstoneName(snap.Dataset, snap.Name, time.Now().UnixNano())
 	deleteID := snap.Dataset + "@" + tombstoneName
 	// Durable provenance BEFORE the rename: the reaper may only ever destroy
@@ -784,7 +796,12 @@ func (d *Driver) handleSnapshotClones(ctx context.Context, snap *truenas.Snapsho
 		return status.Errorf(codes.Internal, "failed to tombstone snapshot %s before deferred deletion: %v", snap.ID, renameErr)
 	}
 
-	properties := []string{PropManagedResource, PropCSISnapshotName, PropCSISnapshotSourceVolumeID}
+	// The stamped handle is stripped alongside the other CSI identity: a
+	// tombstone must not keep answering to a live CSI handle. On 26.0 the strip
+	// is a silent no-op, which stays safe because snapshotCSIHandle only trusts
+	// a stamp whose short name matches the snapshot's CURRENT (now
+	// tombstone-shaped) name — a retained stamp on a tombstone never matches.
+	properties := []string{PropManagedResource, PropCSISnapshotName, PropCSISnapshotSourceVolumeID, PropCSISnapshotHandle}
 	if err := d.truenasClient.SnapshotRemoveUserProperties(ctx, deleteID, properties); err != nil {
 		klog.Warningf("Failed to strip CSI properties from deferred snapshot %s: %v", deleteID, err)
 	}

@@ -408,9 +408,16 @@ func (d *Driver) readBookkeepingState(ctx context.Context, minOrphanAge time.Dur
 // classifyOrphanVolumes appends age-eligible, non-live managed datasets whose
 // managed_resource stamp is local to report.OrphanVolumes and returns the count
 // of managed backend volumes observed. Extracted verbatim from reconcileOrphans
-// (Batch 18 R2).
+// (Batch 18 R2); the per-candidate source-bearing re-read has since been batched
+// into chunked DatasetGetByNames reads (see below).
 func (d *Driver) classifyOrphanVolumes(ctx context.Context, now time.Time, datasets []*truenas.Dataset, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, report *ReconcileReport) int {
 	managedBackendVolumeCount := 0
+	// First pass: count EVERY managed dataset (the count precedes the live/age
+	// filtering) and collect the candidates that survive the live-check and
+	// age-eligibility gates. Classification needs a source-bearing re-read
+	// (second pass below), so candidates are gathered first and re-fetched in
+	// batched round trips instead of one DatasetGet each.
+	candidates := make([]*truenas.Dataset, 0)
 	for _, ds := range datasets {
 		if ds == nil || ds.UserProperties[PropManagedResource].Value != "true" {
 			continue
@@ -420,28 +427,70 @@ func (d *Driver) classifyOrphanVolumes(ctx context.Context, now time.Time, datas
 		if _, live := kubeState.volumeHandles[volumeID]; live {
 			continue
 		}
-		createdAt, age, eligible := reconcileAge(now, ds.GetCreationTime(), minOrphanAge)
-		if !eligible {
+		if _, _, eligible := reconcileAge(now, ds.GetCreationTime(), minOrphanAge); !eligible {
 			if ds.GetCreationTime() <= 0 {
 				klog.Warningf("Orphan reconcile: skipping managed volume %s because its creation time is unavailable", ds.Name)
 			}
 			continue
 		}
-		// The listing strips property source, so an inherited managed_resource — a
-		// user dataset nested under a live CSI volume — is indistinguishable from a
-		// local stamp here. Re-fetch the candidate with source and require a LOCAL
-		// managed_resource: only then did this driver create the dataset. The
-		// candidate set is small (already filtered to non-live, age-eligible
-		// datasets), which bounds the extra API cost.
-		localManaged, getErr := d.datasetHasLocalManagedResource(ctx, ds.Name)
+		candidates = append(candidates, ds)
+	}
+	if len(candidates) == 0 {
+		return managedBackendVolumeCount
+	}
+	// The listing strips property source, so an inherited managed_resource — a
+	// user dataset nested under a live CSI volume — is indistinguishable from a
+	// local stamp here. Re-fetch the candidates with source and require a LOCAL
+	// managed_resource: only then did this driver create the dataset. The
+	// re-fetches are batched into chunked DatasetGetByNames (["id","in",names])
+	// reads instead of one DatasetGet per candidate, collapsing N round trips
+	// into ceil(N/chunk). A failed chunk is recorded per affected candidate and
+	// skips only its own names, so one transient error cannot disable
+	// classification for the whole pass.
+	names := make([]string, 0, len(candidates))
+	for _, ds := range candidates {
+		names = append(names, ds.Name)
+	}
+	sourceBearing := make(map[string]*truenas.Dataset, len(names))
+	failedFetch := make(map[string]struct{})
+	for _, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
+		batch, getErr := d.truenasClient.DatasetGetByNames(ctx, chunk)
 		if getErr != nil {
-			d.recordReconcileObjectFailure("orphan_volume_classify", ds.Name, getErr)
+			for _, name := range chunk {
+				failedFetch[name] = struct{}{}
+				d.recordReconcileObjectFailure("orphan_volume_classify", name, getErr)
+			}
 			continue
 		}
-		if !localManaged {
+		for name, dataset := range batch {
+			sourceBearing[name] = dataset
+		}
+	}
+	// Second pass: classify in input order so report.OrphanVolumes keeps the
+	// listing's ordering.
+	for _, ds := range candidates {
+		if _, fetchFailed := failedFetch[ds.Name]; fetchFailed {
+			// Already recorded above; a candidate whose re-read failed is skipped,
+			// never assumed to be an orphan.
+			continue
+		}
+		dataset, ok := sourceBearing[ds.Name]
+		if !ok {
+			// A successful chunk that omitted this name means the dataset vanished
+			// between listing and re-read (DatasetGetByNames simply omits names
+			// with no dataset). The per-candidate DatasetGet this replaced surfaced
+			// the same race as a not-found error, so keep recording a failure and
+			// skipping.
+			d.recordReconcileObjectFailure("orphan_volume_classify", ds.Name,
+				fmt.Errorf("source-bearing re-read returned no dataset"))
+			continue
+		}
+		if !datasetHasLocalUserProperty(dataset, PropManagedResource, "true") {
 			klog.V(4).Infof("Orphan reconcile: skipping %s because managed_resource is inherited, not local", ds.Name)
 			continue
 		}
+		volumeID := path.Base(ds.Name)
+		createdAt, age, _ := reconcileAge(now, ds.GetCreationTime(), minOrphanAge)
 		pvName := ds.UserProperties[PropCSIVolumeName].Value
 		if pvName == "" || pvName == "-" {
 			pvName = volumeID
@@ -478,7 +527,7 @@ func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Sna
 			klog.Warningf("Orphan reconcile: skipping managed snapshot %s because its CSI handle cannot be derived", snap.ID)
 			continue
 		}
-		if _, live := kubeState.snapshotHandles[snapshotHandle]; live {
+		if snapshotHandleIsLive(kubeState, snapshotHandle) {
 			continue
 		}
 		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
@@ -655,17 +704,67 @@ func (d *Driver) runReconcileDeletePhase(ctx context.Context, opts ReconcileOpti
 	return nil
 }
 
+// reconcileSnapshotHandle derives the CSI handle a backend snapshot's live
+// VolumeSnapshotContent would store: the dataset-qualified handle stamped at
+// creation when it still names this snapshot, else the legacy short name — the
+// same two-era derivation ListSnapshots reports and the idempotent
+// CreateSnapshot retry returns. Orphan detection compares this against the
+// handles read from live VolumeSnapshotContents, so the two sides MUST speak
+// the same format or every live post-upgrade snapshot would look orphaned. The
+// classifier additionally checks the SHORT-NAME form of both sides (see
+// classifyOrphanSnapshots) as a belt-and-braces liveness net.
+//
+// The short name keeps its historical derivation here: the full backend ID is
+// authoritative and the `name` field is only a fallback for an unparsable ID —
+// unchanged from before stamped handles existed.
 func reconcileSnapshotHandle(snapshot *truenas.Snapshot) (string, bool) {
 	if snapshot == nil {
 		return "", false
 	}
-	if snapshotHandle, ok := extractSnapshotName(snapshot.ID); ok {
-		return snapshotHandle, true
+	shortName := ""
+	if extracted, ok := extractSnapshotName(snapshot.ID); ok {
+		shortName = extracted
+	} else if snapshot.Name != "" {
+		shortName = snapshot.Name
 	}
-	if snapshot.Name != "" {
-		return snapshot.Name, true
+	if shortName == "" {
+		return "", false
 	}
-	return "", false
+	// Same identity-beats-inheritance validation as snapshotCSIHandle: a stamp
+	// is only THIS snapshot's handle if its short-name component names it.
+	if property, ok := snapshot.UserProperties[PropCSISnapshotHandle]; ok {
+		if _, stampedShort, valid := parseQualifiedSnapshotHandle(property.Value); valid && stampedShort == shortName {
+			return property.Value, true
+		}
+	}
+	return shortName, true
+}
+
+// snapshotHandleIsLive reports whether a backend-derived snapshot handle is
+// granted by any live VolumeSnapshotContent, matching ACROSS handle formats.
+// The loaded state indexes every content handle under both its literal form
+// and its short-name form (loadKubernetesReconcileState), and this lookup
+// tries both forms of the backend-derived handle, so a live snapshot is
+// recognized no matter which era stamped which side: a pre-upgrade content
+// (short handle) keeps protecting a snapshot whose derivation went qualified,
+// and a post-upgrade content (qualified handle) keeps protecting a snapshot
+// whose stamp did not survive (derivation falls back to the short name).
+// Matching on the short name can only widen the LIVE verdict — the safe
+// direction (skip deletion) — and short names are globally unique among CSI
+// snapshots, so it cannot shield a different snapshot than intended.
+func snapshotHandleIsLive(state *kubernetesReconcileState, handle string) bool {
+	if state == nil {
+		return false
+	}
+	if _, live := state.snapshotHandles[handle]; live {
+		return true
+	}
+	if shortName := snapshotHandleShortName(handle); shortName != "" && shortName != handle {
+		if _, live := state.snapshotHandles[shortName]; live {
+			return true
+		}
+	}
+	return false
 }
 
 // datasetUnderParent reports whether datasetName lives below the configured
@@ -862,18 +961,18 @@ func (d *Driver) countScheduledSnapshots(ctx context.Context, unowned []*truenas
 	}
 }
 
+// findBackendSnapshotForHandle resolves a VolumeSnapshotContent handle (either
+// the legacy short name or the dataset-qualified format CreateSnapshot now
+// issues) to its backend snapshot, nil when gone. It delegates to the shared
+// resolveSnapshotHandle so a qualified handle costs one targeted per-dataset
+// read instead of the SnapshotGet/scan pair this function used to hand-roll,
+// and so a snapshot MIGRATED by clone promotion (its handle's dataset is stale)
+// is still found through the resolver's global-uniqueness fallback scan.
+// Handles whose dataset lies outside the configured parent resolve to nil —
+// this driver only ever issued handles under its own parent, and every caller
+// treats nil conservatively (skip, never delete).
 func (d *Driver) findBackendSnapshotForHandle(ctx context.Context, handle string) (*truenas.Snapshot, error) {
-	if strings.Contains(handle, "@") {
-		snapshot, err := d.truenasClient.SnapshotGet(ctx, handle)
-		if err != nil {
-			if truenas.IsNotFoundError(err) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		return snapshot, nil
-	}
-	return d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, handle)
+	return d.resolveSnapshotHandle(ctx, handle)
 }
 
 func laterTime(left, right time.Time) time.Time {
@@ -920,7 +1019,7 @@ func (d *Driver) deleteDetectedOrphans(
 			if deletionCapReached("snapshot", orphan.ID) {
 				continue
 			}
-			if _, live := currentState.snapshotHandles[orphan.ID]; live {
+			if snapshotHandleIsLive(currentState, orphan.ID) {
 				d.recordReconcileSkip(report, "snapshot", orphan.ID, "snapshot handle became live during revalidation")
 				continue
 			}
@@ -1118,19 +1217,6 @@ func (d *Driver) readBookkeepingDatasets(ctx context.Context, readChild bool) bo
 		reads.child, reads.childErr = d.truenasClient.DatasetGet(ctx, d.bookkeepingDatasetName())
 	}
 	return reads
-}
-
-// datasetHasLocalManagedResource re-fetches datasetName with property source and
-// reports whether managed_resource="true" is stamped LOCALLY on it. The reconcile
-// listing does not carry property source, so a dataset that merely inherits
-// managed_resource from a CSI-managed ancestor (e.g. a user dataset nested under
-// a live volume) must be re-fetched to avoid classifying it as a managed orphan.
-func (d *Driver) datasetHasLocalManagedResource(ctx context.Context, datasetName string) (bool, error) {
-	dataset, err := d.truenasClient.DatasetGet(ctx, datasetName)
-	if err != nil {
-		return false, err
-	}
-	return datasetHasLocalUserProperty(dataset, PropManagedResource, "true"), nil
 }
 
 func (d *Driver) revalidateOrphanVolume(

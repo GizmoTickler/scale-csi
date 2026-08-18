@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -1111,7 +1112,7 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			require.NoError(t, err)
 			created, err := d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "tombstone-snapshot", SourceVolumeId: "tombstone-source"})
 			require.NoError(t, err)
-			snapshotID := "pool/parent/tombstone-source@" + created.GetSnapshot().GetSnapshotId()
+			snapshotID := created.GetSnapshot().GetSnapshotId() // dataset-qualified handle == the ZFS snapshot ID
 			require.NoError(t, client.MockClient.SnapshotClone(context.Background(), snapshotID, "pool/parent/restored"))
 			client.resetCalls()
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "tombstone-snapshot"})
@@ -1180,7 +1181,7 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			require.NoError(t, err)
 			created, err := d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "hold-tombstone-snapshot", SourceVolumeId: "hold-tombstone-source"})
 			require.NoError(t, err)
-			snapshotID := "pool/parent/hold-tombstone-source@" + created.GetSnapshot().GetSnapshotId()
+			snapshotID := created.GetSnapshot().GetSnapshotId() // dataset-qualified handle == the ZFS snapshot ID
 			require.NoError(t, client.MockClient.SnapshotClone(context.Background(), snapshotID, "pool/parent/hold-restored"))
 			client.resetCalls()
 			_, err = d.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "hold-tombstone-snapshot"})
@@ -1914,4 +1915,218 @@ func encryptedPublishRequest(volumeID, nodeID, passphrase, previous string) *csi
 		req.Secrets["passphrasePrevious"] = previous
 	}
 	return req
+}
+
+// TestControllerSnapshotLookupGoldenAPICallCounts pins the snapshot
+// lookup/listing round-trip patterns bought by the dataset-qualified snapshot
+// handles and the ListSnapshots paged-walk optimizations (both verified against
+// a live TrueNAS 26.0.0-BETA.2). Every subtest pins the FULL per-method call
+// map, not just the total, so a regression that swaps a targeted read back to
+// the SnapshotFindByName full scan — or re-inflates the paged walk with
+// per-page full fetches or per-entry dataset reads — fails with an explicit
+// per-method delta even when the headline total happens to stay flat.
+func TestControllerSnapshotLookupGoldenAPICallCounts(t *testing.T) {
+	ctx := context.Background()
+
+	// newSnapshotGoldenFixture provisions the parent dataset and one snapshot
+	// source volume straight into the mock — below the counting boundary — so
+	// the measured maps contain only what the CSI operation under test costs.
+	newSnapshotGoldenFixture := func(t *testing.T, sourceName string) (*apiCallCountingClient, *Driver) {
+		t.Helper()
+		client := newAPICallCountingClient()
+		d := newAPICallCountDriver(t, client, "nfs")
+		_, err := client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent", Type: "FILESYSTEM",
+		})
+		require.NoError(t, err)
+		_, err = client.MockClient.DatasetCreate(ctx, &truenas.DatasetCreateParams{
+			Name: "pool/parent/" + sourceName, Type: "FILESYSTEM", Refquota: testGiB,
+		})
+		require.NoError(t, err)
+		client.resetCalls()
+		return client, d
+	}
+
+	// CreateSnapshot (fresh) pins the "exactly ONE global uniqueness scan"
+	// contract: the SnapshotFindByName pre-check is deliberately kept (it is
+	// what MAKES short names globally unique — the invariant every targeted
+	// qualified-handle fallback depends on), and it must stay exactly one (the
+	// full scan is the expensive call on 26.0). A regression looks like
+	// SnapshotFindByName != 1, a second DatasetGet re-reading the source for
+	// restoreSize, or a post-create property write (26.0 silently drops those).
+	t.Run("CreateSnapshot fresh", func(t *testing.T) {
+		client, d := newSnapshotGoldenFixture(t, "golden-snap-src")
+		_, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{Name: "golden-snap", SourceVolumeId: "golden-snap-src"})
+		require.NoError(t, err)
+		assertAPICallCount(t, "CreateSnapshot fresh", client, 3)
+		assertAPICallMethodMap(t, "CreateSnapshot fresh", client, map[string]int{
+			"DatasetGet":         1, // source existence + restoreSize, fetched once and reused
+			"SnapshotFindByName": 1, // the ONE global short-name-uniqueness scan
+			"SnapshotCreate":     1, // atomic create carrying the qualified-handle stamp inline
+		})
+	})
+
+	// The idempotent retry pins the smaller two-call budget: the source re-read
+	// and the SAME single global scan (a retry request carries no dataset to
+	// target, so the scan doubles as the existing-snapshot resolution). The
+	// stamped handle is read back from the scan result — no SnapshotCreate, no
+	// property rewrite, no extra reads.
+	t.Run("CreateSnapshot idempotent retry", func(t *testing.T) {
+		client, d := newSnapshotGoldenFixture(t, "golden-retry-src")
+		req := &csi.CreateSnapshotRequest{Name: "golden-retry-snap", SourceVolumeId: "golden-retry-src"}
+		_, err := d.CreateSnapshot(ctx, req)
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.CreateSnapshot(ctx, req)
+		require.NoError(t, err)
+		assertAPICallCount(t, "CreateSnapshot idempotent retry", client, 2)
+		assertAPICallMethodMap(t, "CreateSnapshot idempotent retry", client, map[string]int{
+			"DatasetGet":         1, // source re-read (existence + restoreSize)
+			"SnapshotFindByName": 1, // resolves the existing snapshot, no create follows
+		})
+	})
+
+	// DeleteSnapshot addressed by the stamped dataset-qualified handle pins the
+	// targeted-lookup optimization: ONE non-recursive SnapshotList of the
+	// encoded dataset resolves the snapshot, and the SnapshotFindByName full
+	// scan is NOT paid (its absence from the pinned map asserts count == 0). A
+	// regression looks like SnapshotFindByName reappearing — the resolver
+	// falling back to scanning the whole parent for a handle that already
+	// encodes its dataset.
+	t.Run("DeleteSnapshot qualified handle", func(t *testing.T) {
+		client, d := newSnapshotGoldenFixture(t, "golden-del-src")
+		created, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{Name: "golden-del-snap", SourceVolumeId: "golden-del-src"})
+		require.NoError(t, err)
+		handle := created.GetSnapshot().GetSnapshotId()
+		require.Equal(t, "pool/parent/golden-del-src@golden-del-snap", handle,
+			"CreateSnapshot must hand out the dataset-qualified handle this subtest measures")
+		client.resetCalls()
+		_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: handle})
+		require.NoError(t, err)
+		assertAPICallCount(t, "DeleteSnapshot qualified handle", client, 2)
+		assertAPICallMethodMap(t, "DeleteSnapshot qualified handle", client, map[string]int{
+			"SnapshotList":   1, // ONE targeted, non-recursive read of the encoded dataset
+			"SnapshotDelete": 1, // the destroy itself
+		})
+		_, methods := client.callSnapshot()
+		assert.Zero(t, methods["SnapshotFindByName"],
+			"a qualified handle must never pay the full-parent scan")
+	})
+
+	// DeleteSnapshot addressed by a legacy (pre-upgrade, unstamped) short handle
+	// pins the compatibility contract of the same optimization: a handle without
+	// an encoded dataset KEEPS exactly the one SnapshotFindByName scan it has
+	// always used — no targeted read exists for it, and dropping the scan would
+	// strand every pre-upgrade VolumeSnapshotContent.
+	t.Run("DeleteSnapshot legacy handle", func(t *testing.T) {
+		client, d := newSnapshotGoldenFixture(t, "golden-legacy-src")
+		_, err := client.MockClient.SnapshotCreate(ctx, "pool/parent/golden-legacy-src", "golden-legacy-snap", map[string]string{
+			PropManagedResource:           "true",
+			PropCSISnapshotName:           "golden-legacy-snap",
+			PropCSISnapshotSourceVolumeID: "golden-legacy-src",
+		})
+		require.NoError(t, err)
+		client.resetCalls()
+		_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "golden-legacy-snap"})
+		require.NoError(t, err)
+		assertAPICallCount(t, "DeleteSnapshot legacy handle", client, 2)
+		assertAPICallMethodMap(t, "DeleteSnapshot legacy handle", client, map[string]int{
+			"SnapshotFindByName": 1, // the legacy scan, exactly once
+			"SnapshotDelete":     1,
+		})
+	})
+
+	// A full ListSnapshots paged walk (7 snapshots at MaxEntries=3 -> 3 pages)
+	// pins BOTH listing optimizations at once:
+	//   - ONE SnapshotListAll full fetch serves the whole walk (empty starting
+	//     token = fresh fetch; continuation pages slice the 30s-TTL cache). A
+	//     regression looks like SnapshotListAll == pages: on 26.0 that API has
+	//     no server-side pagination, so per-page fetches are O(N^2) wire volume.
+	//   - Restore sizes come from ONE chunked DatasetGetByNames per page (all 7
+	//     snapshots share one source dataset, so each page's unique-dataset set
+	//     fits a single chunk) and ZERO per-entry DatasetGet reads. A regression
+	//     looks like DatasetGet == 7 — the N+1 shape the batching removed.
+	t.Run("ListSnapshots three-page walk", func(t *testing.T) {
+		client, d := newSnapshotGoldenFixture(t, "golden-walk-src")
+		for i := 0; i < 7; i++ {
+			_, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{
+				Name: "golden-walk-snap-" + strconv.Itoa(i), SourceVolumeId: "golden-walk-src",
+			})
+			require.NoError(t, err)
+		}
+		client.resetCalls()
+		token := ""
+		pages, entries := 0, 0
+		for {
+			resp, err := d.ListSnapshots(ctx, &csi.ListSnapshotsRequest{MaxEntries: 3, StartingToken: token})
+			require.NoError(t, err)
+			pages++
+			entries += len(resp.GetEntries())
+			if resp.GetNextToken() == "" {
+				break
+			}
+			token = resp.GetNextToken()
+		}
+		require.Equal(t, 3, pages, "7 snapshots at 3 per page walk in 3 pages")
+		require.Equal(t, 7, entries, "the walk must surface every snapshot exactly once")
+		assertAPICallCount(t, "ListSnapshots three-page walk", client, 4)
+		assertAPICallMethodMap(t, "ListSnapshots three-page walk", client, map[string]int{
+			"SnapshotListAll":   1, // ONE full fetch per walk, later pages served from the cache
+			"DatasetGetByNames": 3, // one chunked restore-size batch per page, NOT one call per entry
+		})
+		_, methods := client.callSnapshot()
+		assert.Zero(t, methods["DatasetGet"], "the per-entry N+1 DatasetGet reads must stay gone")
+	})
+
+	// CreateVolume-from-snapshot pins targeted-vs-scan resolution symmetrically
+	// with the delete pins above: a qualified content-source handle resolves the
+	// clone point via ONE targeted SnapshotList (SnapshotFindByName == 0), a
+	// legacy short handle keeps its ONE SnapshotFindByName scan (SnapshotList ==
+	// 0), and everything else about the ten-call restore is byte-identical (see
+	// the "CreateVolume clone from snapshot" golden above for the per-call
+	// rationale of the shared ten). A regression looks like the two rows below
+	// converging — either the scan leaking back into the qualified path or the
+	// targeted read being (uselessly) attempted for a datasetless handle.
+	t.Run("CreateVolume from snapshot", func(t *testing.T) {
+		for _, tc := range []struct {
+			name         string
+			useQualified bool
+			resolution   map[string]int
+		}{
+			{name: "qualified handle targeted lookup", useQualified: true, resolution: map[string]int{"SnapshotList": 1}},
+			{name: "legacy handle keeps the scan", useQualified: false, resolution: map[string]int{"SnapshotFindByName": 1}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				client, d := newSnapshotGoldenFixture(t, "golden-restore-src")
+				created, err := d.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{Name: "golden-restore-snap", SourceVolumeId: "golden-restore-src"})
+				require.NoError(t, err)
+				handle := "golden-restore-snap"
+				if tc.useQualified {
+					handle = created.GetSnapshot().GetSnapshotId()
+					require.Equal(t, "pool/parent/golden-restore-src@golden-restore-snap", handle)
+				}
+				client.resetCalls()
+				req := apiCallCountVolumeRequest("golden-restored-"+tc.name, "nfs")
+				req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+					Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: handle},
+				}}
+				_, err = d.CreateVolume(ctx, req)
+				require.NoError(t, err)
+				want := map[string]int{
+					"DatasetGet":                  2, // existence lookup + one-time post-connect verifying re-read
+					"DatasetUpdate":               2, // in-flight marker write; the merged refquota/content-source/ownership fold
+					"SnapshotClone":               1,
+					"DatasetRemoveUserProperties": 1, // marker retirement after the durable fold
+					"NFSShareFindByPath":          1, // share resolution
+					"NFSShareCreate":              1,
+					"DatasetSetUserProperties":    1, // post-share managed/provision/name + share-ID stamp
+				}
+				for method, count := range tc.resolution {
+					want[method] = count
+				}
+				assertAPICallCount(t, tc.name, client, 10)
+				assertAPICallMethodMap(t, tc.name, client, want)
+			})
+		}
+	})
 }

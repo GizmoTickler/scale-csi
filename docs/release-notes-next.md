@@ -1,4 +1,33 @@
-# Release notes — v1.6.0
+# Release notes — v1.9.0
+
+## VolumeAttributesClass — CSI MODIFY_VOLUME
+
+- **`ControllerModifyVolume` implemented and advertised:** operators can retune
+  live volumes through Kubernetes VolumeAttributesClass `mutable_parameters`,
+  mapped to one diff-derived `pool.dataset.update`. The vocabulary is
+  deliberately small and live-tunable-only: `compression` and `sync` for every
+  volume, plus `atime` and `recordsize` for NFS filesystems (both rejected for
+  zvols). Values are validated against the backend's own choice lists where it
+  publishes them; a modify whose values already match the dataset returns
+  success with zero backend writes. `recordsize`/`compression` changes affect
+  NEW writes only — blocks already on disk keep the layout they were written
+  with.
+- **Hard rejections, named per key:** block geometry (`volblocksize`,
+  `iscsi/blocksize`, ...), capacity keys (`volsize`, `refquota`, ..., which
+  belong to volume expansion), protocol/share identity, encryption, and
+  `zfsPerformanceClass` (a curated class is create-time only — its zvol geometry
+  is immutable, so only part of a class could ever take effect; spell out the
+  individual tunables instead). Unrecognized keys are `InvalidArgument`, never
+  silently ignored. Only datasets carrying the driver's local
+  `managed_resource` stamp are modified.
+- **CreateVolume honors `mutable_parameters` too** (the VolumeAttributesClass a
+  PVC is born with): folded into the single `pool.dataset.create` for fresh
+  volumes (+0 RTT) and applied through one post-materialization update for
+  clone/restore volumes. Successful retunes emit a `VolumeModified` Event;
+  failures emit `VolumeModifyFailed`.
+- **Rollout note:** using VolumeAttributesClass end-to-end additionally requires
+  the cluster feature gate and an external-resizer/modifier sidecar wired for
+  it; the chart's sidecar set is unchanged in this release.
 
 ## GF-6 — iSCSI dm-multipath and NFS multi-transport mounts
 

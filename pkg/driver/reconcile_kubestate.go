@@ -146,6 +146,16 @@ func (d *Driver) loadKubernetesReconcileState(ctx context.Context, minOrphanAge 
 			}
 		}
 		state.snapshotHandles[handle] = struct{}{}
+		// Also index the handle's short-name form so liveness matching works
+		// across handle formats (see snapshotHandleIsLive): a dataset-qualified
+		// handle must keep protecting its backend snapshot even when the
+		// snapshot-side derivation only yields the short name (e.g. the creation
+		// stamp did not survive, or the snapshot was migrated by clone
+		// promotion). Adding entries never flips the "zero live contents" safety
+		// brake, which only distinguishes empty from non-empty.
+		if shortName := snapshotHandleShortName(handle); shortName != "" && shortName != handle {
+			state.snapshotHandles[shortName] = struct{}{}
+		}
 		namespace, _, namespaceErr := unstructured.NestedString(content.Object, "spec", "volumeSnapshotRef", "namespace")
 		name, _, nameErr := unstructured.NestedString(content.Object, "spec", "volumeSnapshotRef", "name")
 		if namespaceErr != nil || nameErr != nil {
@@ -231,11 +241,20 @@ func (d *Driver) hardRecheckSnapshotContentAbsent(ctx context.Context, orphan Re
 	if err != nil {
 		return false, fmt.Sprintf("final VolumeSnapshotContent handle recheck failed: %v", err)
 	}
+	// Match handles by their short-name form as well as literally, mirroring
+	// snapshotHandleIsLive: the content may store the dataset-qualified handle
+	// while the orphan's derived ID is the legacy short name (or vice versa),
+	// and both address the same globally-unique short name. Widening the match
+	// can only keep a snapshot alive — the safe direction for a final recheck.
+	orphanShortName := snapshotHandleShortName(orphan.ID)
 	for i := range contents.Items {
 		content := &contents.Items[i]
 		driverName, _, _ := unstructured.NestedString(content.Object, "spec", "driver")
 		handle, _, _ := unstructured.NestedString(content.Object, "status", "snapshotHandle")
-		if driverName == d.name && handle == orphan.ID {
+		if driverName != d.name {
+			continue
+		}
+		if handle == orphan.ID || (orphanShortName != "" && snapshotHandleShortName(handle) == orphanShortName) {
 			return false, fmt.Sprintf("VolumeSnapshotContent %s appeared for handle %s during final live recheck", content.GetName(), orphan.ID)
 		}
 	}

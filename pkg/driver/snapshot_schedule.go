@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1103,16 +1104,25 @@ func (d *Driver) scheduledSnapshotZone(ctx context.Context, dataset *truenas.Dat
 	if stored == "" {
 		klog.Warningf("Volume dataset %s carries no locally-recorded %s; its scheduled snapshots cannot be proven and will be preserved as foreign",
 			datasetName, PropSnapshotTaskTimezone)
+		d.recordTimezoneUnresolvedEvent(datasetName, fmt.Sprintf(
+			"volume dataset %s carries no locally-recorded periodic-snapshot task timezone (%s); scheduled-snapshot ownership cannot be proven, so snapshot deletes fail closed and scheduled snapshots may accumulate",
+			datasetName, PropSnapshotTaskTimezone))
 		RecordNASTimezoneUnresolved()
 		return nil
 	}
 	current := d.nasCivilZone(ctx)
 	if current == nil {
+		d.recordTimezoneUnresolvedEvent(datasetName, fmt.Sprintf(
+			"could not resolve the NAS civil timezone (system.general.config) for volume dataset %s; scheduled-snapshot ownership cannot be proven, so snapshot deletes fail closed and scheduled snapshots may accumulate",
+			datasetName))
 		return nil
 	}
 	if current.String() != stored {
 		klog.Warningf("Volume dataset %s recorded NAS timezone %q when its periodic-snapshot task was created but the NAS now reports %q; the snapshot names cannot be proven under a reconfigured clock and will be preserved as foreign",
 			datasetName, stored, current.String())
+		d.recordTimezoneUnresolvedEvent(datasetName, fmt.Sprintf(
+			"the NAS reported timezone %q when the periodic-snapshot task for volume dataset %s was created but now reports %q; scheduled-snapshot ownership cannot be proven under a reconfigured clock, so snapshot deletes fail closed and scheduled snapshots may accumulate",
+			stored, datasetName, current.String()))
 		RecordNASTimezoneUnresolved()
 		return nil
 	}
@@ -1216,4 +1226,32 @@ func (d *Driver) recordSnapshotTaskWarning(req *csi.CreateVolumeRequest, volumeI
 	klog.Warningf("Periodic-snapshot task not ensured for volume %s (continuing without PITR): %s", volumeID, message)
 	d.recordWarningEvent(createVolumeEventRef(req), EventReasonSnapshotTaskFailed,
 		fmt.Sprintf("Volume %s was provisioned but its driver-managed periodic-snapshot task was not created: %s", volumeID, message))
+}
+
+// recordTimezoneUnresolvedEvent surfaces a fail-closed timezone-resolution
+// failure on the DELETE path as a cluster-visible Warning Event, complementing
+// scale_csi_nas_timezone_unresolved_total (which counts the condition but
+// explains nothing in-cluster). Without the zone, scheduled-snapshot ownership
+// cannot be proven, so DeleteVolume preserves the scheduled snapshots as
+// foreign and they accumulate; this Event tells the operator WHY.
+//
+// NO SPAM BY CONSTRUCTION: scheduledSnapshotZone calls this at most once per
+// DeleteVolume (exactly one of its fail-closed branches can fire, and the zone
+// is resolved once per operation, never per snapshot), mirroring the
+// one-event-per-pass discipline of emitReconcileGuardEvents. The ref is
+// volume-scoped via the dataset leaf (the CSI volume name, i.e. the PV name;
+// no full volume ID is in hand here), falling back to the controller Node ref.
+func (d *Driver) recordTimezoneUnresolvedEvent(datasetName, message string) {
+	if d.eventRecorder == nil {
+		return
+	}
+	leaf := path.Base(datasetName)
+	if leaf == "." || leaf == "/" {
+		leaf = ""
+	}
+	ref := volumeEventRef(leaf)
+	if ref == nil {
+		ref = NodeRef(getHostname())
+	}
+	d.recordWarningEvent(ref, EventReasonNASTimezoneUnresolved, message)
 }

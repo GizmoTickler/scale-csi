@@ -49,7 +49,7 @@ func TestCreateSnapshotPlacesHoldWhenEnabled(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, resp.GetSnapshot().GetReadyToUse())
 
-	snapshotID := "pool/parent/hold-source@" + resp.GetSnapshot().GetSnapshotId()
+	snapshotID := resp.GetSnapshot().GetSnapshotId() // dataset-qualified handle == the ZFS snapshot ID
 	held, err := client.SnapshotIsHeld(context.Background(), snapshotID)
 	require.NoError(t, err)
 	assert.True(t, held, "CreateSnapshot must place a deletion-proof hold when zfs.holdCsiSnapshots is set")
@@ -65,7 +65,7 @@ func TestCreateSnapshotNoHoldWhenDisabled(t *testing.T) {
 	resp, err := d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "unheld-snap", SourceVolumeId: "nohold-source"})
 	require.NoError(t, err)
 
-	snapshotID := "pool/parent/nohold-source@" + resp.GetSnapshot().GetSnapshotId()
+	snapshotID := resp.GetSnapshot().GetSnapshotId() // dataset-qualified handle == the ZFS snapshot ID
 	held, err := client.SnapshotIsHeld(context.Background(), snapshotID)
 	require.NoError(t, err)
 	assert.False(t, held, "no hold is placed when the feature is off (default)")

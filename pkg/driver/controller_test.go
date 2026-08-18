@@ -1985,7 +1985,8 @@ func TestCreateSnapshot(t *testing.T) {
 	resp, err := d.CreateSnapshot(context.Background(), req)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
-	assert.Equal(t, "snap-01", resp.Snapshot.SnapshotId)
+	assert.Equal(t, "pool/parent/vol-snap@snap-01", resp.Snapshot.SnapshotId,
+		"a fresh CreateSnapshot returns the dataset-qualified handle")
 	assert.Equal(t, volName, resp.Snapshot.SourceVolumeId)
 
 	// The same name and source are idempotent.
@@ -2319,7 +2320,7 @@ func TestDeleteSnapshotWithRestoredVolumeDefersAndReleasesSnapshot(t *testing.T)
 		Name: "restore-point", SourceVolumeId: "source",
 	})
 	require.NoError(t, err)
-	originalSnapshotID := "pool/parent/source@" + created.GetSnapshot().GetSnapshotId()
+	originalSnapshotID := created.GetSnapshot().GetSnapshotId() // dataset-qualified handle == the ZFS snapshot ID
 	require.NoError(t, mockClient.SnapshotClone(ctx, originalSnapshotID, "pool/parent/restored"))
 
 	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "restore-point"})
@@ -2348,7 +2349,7 @@ func TestDeleteSnapshotWithRestoredVolumeDefersAndReleasesSnapshot(t *testing.T)
 		Name: "restore-point", SourceVolumeId: "source",
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "restore-point", recreated.GetSnapshot().GetSnapshotId())
+	assert.Equal(t, "pool/parent/source@restore-point", recreated.GetSnapshot().GetSnapshotId())
 
 	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "restored"})
 	require.NoError(t, err)
@@ -2605,7 +2606,7 @@ func TestCreateSnapshot_RestoreSize(t *testing.T) {
 				"%s: expected %d, got %d", tc.description, tc.expectedSize, resp.Snapshot.SizeBytes)
 
 			// Verify other snapshot properties
-			assert.Equal(t, snapName, resp.Snapshot.SnapshotId)
+			assert.Equal(t, datasetName+"@"+snapName, resp.Snapshot.SnapshotId)
 			assert.Equal(t, volName, resp.Snapshot.SourceVolumeId)
 			assert.True(t, resp.Snapshot.ReadyToUse)
 		})
@@ -3131,7 +3132,7 @@ func TestDeleteSnapshotWithTombstoneShapedNameHasFullLifecycle(t *testing.T) {
 		Name: "backup-csi-deleted-2024", SourceVolumeId: "source",
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "backup-csi-deleted-2024", created.GetSnapshot().GetSnapshotId())
+	assert.Equal(t, "pool/parent/source@backup-csi-deleted-2024", created.GetSnapshot().GetSnapshotId())
 
 	listed, err := d.ListSnapshots(ctx, &csi.ListSnapshotsRequest{SnapshotId: "backup-csi-deleted-2024"})
 	require.NoError(t, err)
@@ -3182,7 +3183,7 @@ func TestDeleteVolumeRefusalNamesOwnTombstonesNotForeignTasks(t *testing.T) {
 
 	// A live clone forces DeleteSnapshot down the deferred (tombstone) path.
 	require.NoError(t, mockClient.SnapshotClone(ctx,
-		"pool/parent/source@"+created.GetSnapshot().GetSnapshotId(), "pool/parent/restored"))
+		created.GetSnapshot().GetSnapshotId(), "pool/parent/restored"))
 	_, err = d.DeleteSnapshot(ctx, &csi.DeleteSnapshotRequest{SnapshotId: "restore-point"})
 	require.NoError(t, err)
 

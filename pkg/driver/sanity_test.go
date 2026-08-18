@@ -134,6 +134,15 @@ func configureSanityTest(config *sanity.TestConfig, root, endpoint, protocol str
 	config.TargetPath = filepath.Join(root, "target")
 	config.StagingPath = filepath.Join(root, "staging")
 	config.TestVolumeParameters = map[string]string{"protocol": protocol}
+	// MODIFY_VOLUME: give csi-sanity a real per-protocol mutable-parameter set so
+	// its ModifyVolume specs (and the CreateVolume-with-VolumeAttributesClass
+	// specs) exercise the driver's actual vocabulary. recordsize/atime are
+	// filesystem-only, so the block-protocol suites use the zvol-applicable pair.
+	if protocol == "nfs" {
+		config.TestVolumeMutableParameters = map[string]string{"compression": "ZSTD", "recordsize": "1M"}
+	} else {
+		config.TestVolumeMutableParameters = map[string]string{"compression": "ZSTD", "sync": "ALWAYS"}
+	}
 	config.CreateTargetDir = createSanityDirectory
 	config.CreateStagingDir = createSanityDirectory
 	config.RemoveTargetPath = os.RemoveAll

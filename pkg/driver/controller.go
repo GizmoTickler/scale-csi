@@ -49,12 +49,26 @@ const (
 	PropZFSPerformanceClass       = "truenas-csi:zfs_performance_class"
 	PropCSISnapshotName           = "truenas-csi:csi_snapshot_name"
 	PropCSISnapshotSourceVolumeID = "truenas-csi:csi_snapshot_source_volume_id"
-	snapshotTombstoneMarker       = "-csi-deleted-"
-	PropNFSShareID                = "truenas-csi:truenas_nfs_share_id"
-	PropISCSITargetID             = "truenas-csi:truenas_iscsi_target_id"
-	PropISCSIExtentID             = "truenas-csi:truenas_iscsi_extent_id"
-	PropISCSITargetExtentID       = "truenas-csi:truenas_iscsi_targetextent_id"
-	PropISCSIInitiatorID          = "truenas-csi:truenas_iscsi_initiator_id"
+	// PropCSISnapshotHandle records the DATASET-QUALIFIED CSI snapshot handle
+	// ("<dataset>@<shortName>") a snapshot was CREATED under (PERF: targeted
+	// snapshot lookups). The TrueNAS 26.0 zfs.resource.snapshot.query API has no
+	// server-side name filter, so a short-name-only handle forces every lookup
+	// (delete, list-by-id, restore) to transfer the ENTIRE recursive snapshot set
+	// under the parent. Encoding the dataset in the handle lets those lookups
+	// become one non-recursive per-dataset read. The property is written IN the
+	// atomic SnapshotCreate property map because 26.0 cannot update snapshot
+	// properties post-create (see SnapshotSetUserProperty), and it is the source
+	// of truth for the handle a snapshot reports back through ListSnapshots and
+	// idempotent CreateSnapshot retries. Pre-upgrade snapshots lack it and keep
+	// their legacy short-name handles forever — both formats resolve everywhere
+	// (see resolveSnapshotHandle).
+	PropCSISnapshotHandle   = "truenas-csi:csi_snapshot_handle"
+	snapshotTombstoneMarker = "-csi-deleted-"
+	PropNFSShareID          = "truenas-csi:truenas_nfs_share_id"
+	PropISCSITargetID       = "truenas-csi:truenas_iscsi_target_id"
+	PropISCSIExtentID       = "truenas-csi:truenas_iscsi_extent_id"
+	PropISCSITargetExtentID = "truenas-csi:truenas_iscsi_targetextent_id"
+	PropISCSIInitiatorID    = "truenas-csi:truenas_iscsi_initiator_id"
 	// PropISCSIAuthTag stores the iscsi.auth TAG that the target group's auth ref
 	// points at (G1: SCST only emits IncomingUser for tag-keyed refs). It is the
 	// durable link fence/rebuild passes use to re-stamp CHAP without the secret.
@@ -268,6 +282,151 @@ func snapshotShortName(snap *truenas.Snapshot) string {
 	return ""
 }
 
+// parseQualifiedSnapshotHandle splits a dataset-qualified CSI snapshot handle
+// ("<dataset>@<shortName>") into its parts. It reports ok=false for anything
+// that is not EXACTLY that shape: no '@' (a legacy short-name handle), an empty
+// dataset or short name, or a short name containing '@' or '/'. ZFS forbids '@'
+// in both dataset names and snapshot names and sanitizeVolumeID never emits '@'
+// or '/' (fuzz-proven), so the two handle formats are unambiguous: a handle
+// containing '@' is either a well-formed qualified handle or garbage — never a
+// legacy handle.
+func parseQualifiedSnapshotHandle(handle string) (dataset, shortName string, ok bool) {
+	dataset, shortName, found := strings.Cut(handle, "@")
+	if !found || dataset == "" || shortName == "" || strings.ContainsAny(shortName, "@/") {
+		return "", "", false
+	}
+	return dataset, shortName, true
+}
+
+// snapshotHandleShortName reduces a CSI snapshot handle of EITHER format to the
+// snapshot short name it addresses: a qualified handle yields its short-name
+// component, a legacy handle IS the short name. Malformed '@'-bearing handles
+// yield "" (they address nothing). Both DeleteSnapshot's per-snapshot lock key
+// and reconcile's cross-format liveness checks rely on this reduction, because
+// CreateSnapshot enforces GLOBAL short-name uniqueness across the parent — the
+// short name is the one component every handle format shares.
+func snapshotHandleShortName(handle string) string {
+	if _, shortName, ok := parseQualifiedSnapshotHandle(handle); ok {
+		return shortName
+	}
+	if strings.Contains(handle, "@") {
+		return ""
+	}
+	return handle
+}
+
+// snapshotCSIHandle returns the CSI handle THIS snapshot reports to the CO: the
+// dataset-qualified handle stamped at creation (PropCSISnapshotHandle) when it
+// still names this snapshot, else the legacy short name — so pre-upgrade
+// snapshots keep the handle their VolumeSnapshotContent already stores.
+//
+// The stamp is trusted only when its short-name component equals the snapshot's
+// own CURRENT short name — the same identity-beats-inheritance discipline as
+// snapshotCarriesLiveCSIIdentity. A restored clone inherits its origin
+// snapshot's properties, and snapshots of that clone inherit them again, so an
+// unvalidated stamp would make a scheduled/manual snapshot of a restored volume
+// answer to its ORIGIN's handle. The dataset component is deliberately NOT
+// compared: DeleteVolume's clone promotion migrates snapshots to the promoted
+// dataset, and after that migration the stamp (which the live
+// VolumeSnapshotContent still stores) is exactly the handle this snapshot must
+// keep reporting. Short names are globally unique among CSI snapshots
+// (CreateSnapshot's pre-check), so the short-name match is sufficient identity.
+func snapshotCSIHandle(snap *truenas.Snapshot) string {
+	shortName := snapshotShortName(snap)
+	if snap != nil && shortName != "" {
+		if property, ok := snap.UserProperties[PropCSISnapshotHandle]; ok {
+			if _, stampedShort, valid := parseQualifiedSnapshotHandle(property.Value); valid && stampedShort == shortName {
+				return property.Value
+			}
+		}
+	}
+	return shortName
+}
+
+// snapshotHandleAddressesSnapshot reports whether a CSI handle of either format
+// addresses this snapshot. It compares SHORT NAMES only, for the same
+// promotion/global-uniqueness reasons documented on snapshotCSIHandle: after a
+// clone promotion the handle's dataset component is stale while the handle
+// remains the snapshot's live CSI identity.
+func snapshotHandleAddressesSnapshot(handle string, snap *truenas.Snapshot) bool {
+	shortName := snapshotHandleShortName(handle)
+	return shortName != "" && shortName == snapshotShortName(snap)
+}
+
+// resolveSnapshotHandle resolves a CSI snapshot handle of either format to its
+// backend snapshot, returning (nil, nil) when no such snapshot exists — every
+// caller treats nil exactly as SnapshotFindByName's "not found, not an error"
+// (idempotent delete, empty list, NotFound restore source).
+//
+// Legacy short-name handles keep the pre-existing global scan
+// (SnapshotFindByName) — on TrueNAS 26.0 that transfers the parent's ENTIRE
+// recursive snapshot set, because zfs.resource.snapshot.query has no name
+// filter; nothing narrower can answer a handle that carries no dataset.
+//
+// Dataset-qualified handles are the fix: ONE non-recursive SnapshotList of the
+// encoded dataset, filtered by short name client-side. Two fallbacks preserve
+// correctness:
+//   - A handle whose dataset is not under the configured parent was never
+//     issued by this driver; it resolves to not-found rather than touching (or
+//     scanning for) foreign datasets.
+//   - A targeted miss (including the dataset itself being gone) falls back to
+//     the legacy global scan before concluding not-found: DeleteVolume's clone
+//     promotion MIGRATES snapshots to the promoted dataset, so a live snapshot
+//     can legitimately no longer sit under the dataset its handle encodes. The
+//     scan is safe because CreateSnapshot enforces global short-name
+//     uniqueness. The extra cost is paid only on a genuine miss (typically an
+//     idempotent delete retry), never on the hot resolve path.
+func (d *Driver) resolveSnapshotHandle(ctx context.Context, handle string) (*truenas.Snapshot, error) {
+	if handle == "" {
+		return nil, nil
+	}
+	if !strings.Contains(handle, "@") {
+		return d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, handle)
+	}
+	dataset, shortName, ok := parseQualifiedSnapshotHandle(handle)
+	if !ok || !d.datasetUnderParent(dataset) {
+		return nil, nil
+	}
+	snapshots, err := d.truenasClient.SnapshotList(ctx, dataset)
+	if err != nil {
+		// A vanished dataset means the snapshot cannot live there anymore; any
+		// other error is surfaced so callers keep their existing transient-error
+		// semantics (they never treated a failed lookup as "deleted").
+		if !truenas.IsNotFoundError(err) {
+			return nil, err
+		}
+	} else {
+		for _, snap := range snapshots {
+			if snapshotShortName(snap) == shortName {
+				return snap, nil
+			}
+		}
+	}
+	return d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, shortName)
+}
+
+// validateSnapshotHandleShape validates the SHAPE of an incoming CSI snapshot
+// handle before any backend read. Legacy short-name handles keep the exact
+// datasetForID validation they always had (path-escaping junk is rejected as
+// InvalidArgument). Dataset-qualified handles cannot pass datasetForID — they
+// legitimately contain '/' and '@' — so their short-name component is held to
+// the same shape rules instead, while the dataset component is left to
+// resolveSnapshotHandle, which resolves anything outside the configured parent
+// to NotFound (the CSI-correct outcome for a source snapshot that cannot
+// exist).
+func (d *Driver) validateSnapshotHandleShape(handle string) error {
+	if strings.Contains(handle, "@") {
+		_, shortName, ok := parseQualifiedSnapshotHandle(handle)
+		if !ok {
+			return status.Errorf(codes.InvalidArgument, "invalid snapshot id %q", handle)
+		}
+		_, err := d.datasetForID(shortName)
+		return err
+	}
+	_, err := d.datasetForID(handle)
+	return err
+}
+
 // snapshotCarriesLiveCSIIdentity reports that a snapshot's recorded CSI name
 // sanitizes to its own CURRENT short name — i.e. it is a live CSI snapshot
 // under exactly that name (created as such), not a renamed driver tombstone.
@@ -367,6 +526,18 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 			},
 		},
 		{
+			// VolumeAttributesClass: ControllerModifyVolume retunes the small
+			// live-tunable ZFS property set (compression/sync, plus atime/recordsize
+			// for filesystems) via pool.dataset.update. The vocabulary and its hard
+			// rejections (geometry, capacity, encryption, ...) live in
+			// resolveMutableTunables (controller_modify.go).
+			Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_MODIFY_VOLUME,
+				},
+			},
+		},
+		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_GET_VOLUME,
@@ -421,7 +592,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	if source := req.GetVolumeContentSource(); source != nil {
 		if snapshot := source.GetSnapshot(); snapshot != nil {
-			if _, validationErr := d.datasetForID(snapshot.GetSnapshotId()); validationErr != nil {
+			if validationErr := d.validateSnapshotHandleShape(snapshot.GetSnapshotId()); validationErr != nil {
 				return nil, validationErr
 			}
 		} else if volume := source.GetVolume(); volume != nil {
@@ -573,6 +744,19 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	ctx = withZFSPerformanceClass(ctx, performanceClass)
 
+	// VolumeAttributesClass (CSI MODIFY_VOLUME): CreateVolume may carry
+	// mutable_parameters from the PVC's VolumeAttributesClass. Enforce the SAME
+	// vocabulary ControllerModifyVolume enforces — an unknown, forbidden, or
+	// type-inapplicable key is InvalidArgument BEFORE anything is provisioned —
+	// and thread the resolved properties to createDataset via the request
+	// context, mirroring the performance-class plumbing above. The dataset does
+	// not exist yet, so the type gate uses the type the share type implies.
+	mutableTunables, mutableErr := d.resolveMutableTunables(ctx, req.GetMutableParameters(), datasetTypeForShareType(shareType))
+	if mutableErr != nil {
+		return nil, mutableErr
+	}
+	ctx = withMutableTunables(ctx, mutableTunables)
+
 	// Check if volume already exists
 	existingDS, err := d.truenasClient.DatasetGet(ctx, datasetName)
 	if err == nil && existingDS != nil {
@@ -703,6 +887,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 				zfsPerformanceClassParam, performanceClass, volumeID, contentSourceKind(contentSource))
 			klog.Warning(message)
 			d.recordWarningEvent(createVolumeEventRef(req), EventReasonZFSPerformanceClassIgnored, message)
+		}
+		// VolumeAttributesClass mutable parameters CAN be honored on a clone /
+		// restore, unlike the curated class above: every accepted tunable is
+		// live-tunable, so one diff-derived pool.dataset.update after
+		// materialization applies them (a clone accepts no create-time property
+		// payload). Fatal on failure — returning success would bind a PVC whose
+		// recorded attributes silently disagree with the volume. A retry that
+		// resumes through createVolumeExisting does not re-apply them; a later
+		// VolumeAttributesClass (re-)assignment reaches the same properties
+		// through ControllerModifyVolume.
+		if _, tunablesErr := d.applyMutableTunables(ctx, datasetName, createdDS, mutableTunables); tunablesErr != nil {
+			return nil, tunablesErr
 		}
 	} else {
 		// Create new dataset
@@ -1136,8 +1332,12 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 			datasetName, PropDriverInstanceID)
 	}
 	if snapshot := req.GetVolumeContentSource().GetSnapshot(); detached && snapshot != nil {
+		// The replication cleanup needs the snapshot's SHORT name (the leaf the
+		// receive reproduced under the target dataset). With legacy handles the
+		// handle WAS the short name; a dataset-qualified handle must be reduced
+		// first or the cleanup would look for a leaf that cannot exist.
 		existingDS, err = d.prepareDetachedSnapshotCopy(
-			ctx, datasetName, existingDS, name, snapshot.GetSnapshotId(), snapshot.GetSnapshotId(), capacityBytes, shareType,
+			ctx, datasetName, existingDS, name, snapshot.GetSnapshotId(), snapshotHandleShortName(snapshot.GetSnapshotId()), capacityBytes, shareType,
 		)
 		if err != nil {
 			return nil, err
@@ -2144,6 +2344,12 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	// Snapshot names are global CSI identifiers even though ZFS only requires
 	// uniqueness within a dataset. Resolve the short name before creation so a
 	// request cannot silently create the same CSI snapshot ID for another source.
+	// This pre-check deliberately stays on the GLOBAL SnapshotFindByName scan
+	// even though it is the expensive path on 26.0: a FRESH create must prove
+	// the name is unused across the whole parent (the request carries no dataset
+	// to target), and it is also this very check that makes the global
+	// short-name-uniqueness invariant true — the invariant every targeted
+	// resolveSnapshotHandle fallback depends on.
 	existing, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to find existing snapshot: %v", err)
@@ -2161,8 +2367,18 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 				"snapshot name %q is already associated with another snapshot", name)
 		}
 		d.holdCSISnapshotIfEnabled(ctx, existing.ID, req)
-		return d.createSnapshotResponse(existing, sourceDataset, snapshotID, sourceVolumeID, start), nil
+		// Idempotent retry: return the handle THIS snapshot already answers to.
+		// A snapshot stamped at creation returns its dataset-qualified handle
+		// (byte-identical to the first response, so the CO's stored handle never
+		// flaps); a pre-upgrade snapshot has no stamp and keeps the legacy short
+		// handle its VolumeSnapshotContent already stores.
+		return d.createSnapshotResponse(existing, sourceDataset, snapshotCSIHandle(existing), sourceVolumeID, start), nil
 	}
+
+	// The dataset-qualified handle this snapshot is created under. Returned to
+	// the CO and stamped into the creation property map below, so every later
+	// lookup can target the encoded dataset instead of scanning the parent.
+	snapshotHandle := datasetName + "@" + snapshotID
 
 	// Create the snapshot and its identity atomically. TrueNAS 26.0 silently
 	// ignores post-create pool.snapshot.update property writes.
@@ -2171,6 +2387,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		PropDriverInstanceID:          d.driverInstanceID(),
 		PropCSISnapshotName:           name,
 		PropCSISnapshotSourceVolumeID: sourceVolumeID,
+		PropCSISnapshotHandle:         snapshotHandle,
 	}
 	// GEOMETRY PROVENANCE (round 5). A restore has to know the layout of the bytes
 	// IN THIS SNAPSHOT, and the source's state at RESTORE time cannot answer that
@@ -2206,7 +2423,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 
 	// The source dataset fetched for the existence check above still reflects
 	// the volume size for restoreSize — no need to re-query it.
-	return d.createSnapshotResponse(snap, sourceDataset, snapshotID, sourceVolumeID, start), nil
+	return d.createSnapshotResponse(snap, sourceDataset, snapshotHandle, sourceVolumeID, start), nil
 }
 
 // holdCSISnapshotIfEnabled places a deletion-proof hold on a CSI snapshot when
@@ -2435,7 +2652,7 @@ func snapshotCarriesInstanceIdentity(snap *truenas.Snapshot, instanceID string) 
 func (d *Driver) createSnapshotResponse(
 	snap *truenas.Snapshot,
 	sourceDataset *truenas.Dataset,
-	snapshotID string,
+	snapshotHandle string,
 	sourceVolumeID string,
 	start time.Time,
 ) *csi.CreateSnapshotResponse {
@@ -2447,11 +2664,11 @@ func (d *Driver) createSnapshotResponse(
 		snapshotSize = snap.GetSnapshotSize()
 	}
 	klog.Infof("CreateSnapshot completed: snapshot=%s, sourceVolume=%s, size=%d, elapsed=%v",
-		snapshotID, sourceVolumeID, snapshotSize, time.Since(start))
+		snapshotHandle, sourceVolumeID, snapshotSize, time.Since(start))
 
 	return &csi.CreateSnapshotResponse{
 		Snapshot: &csi.Snapshot{
-			SnapshotId:     snapshotID,
+			SnapshotId:     snapshotHandle,
 			SourceVolumeId: sourceVolumeID,
 			SizeBytes:      snapshotSize,
 			CreationTime:   timestampProto(snap.GetCreationTime()),
@@ -2469,10 +2686,14 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 
 	klog.Infof("DeleteSnapshot: snapshotID=%s", snapshotID)
 
-	// The CSI snapshot ID does not encode its source volume, so a read-only
-	// lookup is required before the locks can be ordered. Once resolved, acquire
-	// the source-volume lock before the snapshot lock to match CreateSnapshot.
-	snap, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+	// The CSI snapshot ID does not reliably encode its source volume (legacy
+	// handles never do, and a qualified handle's dataset can be stale after a
+	// clone promotion), so a read-only lookup is required before the locks can
+	// be ordered. Once resolved, acquire the source-volume lock before the
+	// snapshot lock to match CreateSnapshot. resolveSnapshotHandle keeps the
+	// legacy scan for short-name handles and does the targeted per-dataset read
+	// for qualified ones.
+	snap, err := d.resolveSnapshotHandle(ctx, snapshotID)
 	if err != nil {
 		// If parent dataset doesn't exist, the snapshot is effectively deleted
 		if truenas.IsNotFoundError(err) {
@@ -2502,7 +2723,13 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 		}
 		defer d.releaseOperationLock(sourceVolumeLockKey)
 	}
-	snapshotLockKey := "snapshot:" + snapshotID
+	// The per-snapshot lock key derives from the SHORT name, not the raw handle
+	// string: CreateSnapshot locks "snapshot:"+shortName, and the same snapshot
+	// can be addressed by either handle format (its stamped qualified handle, or
+	// its legacy short name — e.g. by the reconciler vs. the CO), so only the
+	// short name serializes all of them onto one lock. Short names are globally
+	// unique among CSI snapshots, so this never over-locks across snapshots.
+	snapshotLockKey := "snapshot:" + snapshotHandleShortName(snapshotID)
 	if !d.acquireOperationLock(snapshotLockKey) {
 		return nil, status.Error(codes.Aborted, "operation already in progress for this snapshot")
 	}
@@ -2547,9 +2774,11 @@ func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReques
 	klog.V(4).Info("ListSnapshots called")
 
 	// A snapshot ID uniquely identifies at most one snapshot, so bypass the
-	// paginated list API when it is provided.
+	// paginated list API when it is provided. resolveSnapshotHandle keeps the
+	// legacy scan for short-name handles and targets the encoded dataset for
+	// qualified ones.
 	if snapshotID := req.GetSnapshotId(); snapshotID != "" {
-		snap, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+		snap, err := d.resolveSnapshotHandle(ctx, snapshotID)
 		if err != nil {
 			if truenas.IsNotFoundError(err) {
 				return &csi.ListSnapshotsResponse{}, nil
@@ -2564,7 +2793,14 @@ func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReques
 		if entryErr != nil {
 			return nil, entryErr
 		}
-		if entry == nil || entry.Snapshot.GetSnapshotId() != snapshotID {
+		// The entry reports the snapshot's OWN handle (stamped qualified handle
+		// when present, legacy short name otherwise), so when the CO asks with
+		// the handle it stored, entry.SnapshotId equals the request exactly.
+		// The match itself is identity-based (short names, which both formats
+		// share and which are globally unique) rather than raw string equality,
+		// so a snapshot remains addressable by its short name too — the exact
+		// behavior legacy handles have always had.
+		if entry == nil || !snapshotHandleAddressesSnapshot(snapshotID, snap) {
 			return &csi.ListSnapshotsResponse{}, nil
 		}
 		return &csi.ListSnapshotsResponse{Entries: []*csi.ListSnapshotsResponse_Entry{entry}}, nil
@@ -2586,18 +2822,69 @@ func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReques
 		limit = 100
 	}
 
-	snapshots, err := d.truenasClient.SnapshotListAll(ctx, d.config.ZFS.DatasetParentName, limit, offset)
+	// One full fetch per WALK, not per page. On TrueNAS 26.0 SnapshotListAll has
+	// no server-side pagination at all — every per-page call transferred (and
+	// re-sorted) the ENTIRE recursive snapshot set just to slice one page out,
+	// O(N²) wire volume per walk. The full set is fetched once when a walk
+	// starts (empty starting token) and later pages (non-empty token) are served
+	// from a short-TTL cache, which also gives the CO a CONSISTENT view across
+	// one walk instead of pages sliced from shifting snapshots. This
+	// intentionally applies on legacy backends too: one full fetch per walk
+	// replaces N server-paged calls, an acceptable trade for the shared code
+	// path and the consistent view. Offset-based starting-token semantics and
+	// the in-memory slicing are byte-identical to the per-page behavior.
+	snapshots, err := d.snapshotsForListPage(ctx, req.GetStartingToken() == "", limit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list snapshots: %v", err)
 	}
 
-	entries := make([]*csi.ListSnapshotsResponse_Entry, 0)
+	// Building an entry may need the snapshot's source dataset to compute the
+	// restore size, and scheduled snapshots commonly share one source dataset.
+	// Fetching per snapshot was therefore up to a full page of DatasetGet round
+	// trips (the N+1 shape), most of them duplicates. Instead, collect the
+	// UNIQUE source datasets of the snapshots that will actually produce
+	// entries and prefetch them in chunked DatasetGetByNames reads below.
+	// Snapshots buildSnapshotListEntry rejects (non-CSI, tombstoned, or
+	// filtered out by source volume) never needed a dataset read on the old
+	// per-snapshot path either, so their datasets stay out of the batch.
+	uniqueDatasets := make([]string, 0, len(snapshots))
+	// One representative snapshot per dataset, so a failed chunk can be
+	// reported with the same dataset+snapshot detail the per-snapshot path
+	// puts in its error message.
+	snapshotForDataset := make(map[string]string, len(snapshots))
 	for _, snap := range snapshots {
-		entry, entryErr := d.snapshotListEntry(ctx, snap, req.GetSourceVolumeId())
-		if entryErr != nil {
-			return nil, entryErr
+		if buildSnapshotListEntry(snap, req.GetSourceVolumeId()) == nil {
+			continue
 		}
-		if entry != nil {
+		if _, seen := snapshotForDataset[snap.Dataset]; seen {
+			continue
+		}
+		snapshotForDataset[snap.Dataset] = snap.ID
+		uniqueDatasets = append(uniqueDatasets, snap.Dataset)
+	}
+
+	sourceDatasets := make(map[string]*truenas.Dataset, len(uniqueDatasets))
+	for _, chunk := range chunkDatasetNames(uniqueDatasets, datasetGetByNamesBatchBudget) {
+		batch, getErr := d.truenasClient.DatasetGetByNames(ctx, chunk)
+		if getErr != nil {
+			// Keep the per-snapshot path's failure semantics: any non-NotFound
+			// dataset read error fails the whole RPC rather than silently
+			// reporting wrong restore sizes. DatasetGetByNames omits absent
+			// names instead of erroring, so a chunk error is never a NotFound
+			// in disguise and must not be degraded to one.
+			return nil, status.Errorf(codes.Internal, "failed to get source dataset %s for snapshot %s restore size: %v", chunk[0], snapshotForDataset[chunk[0]], getErr)
+		}
+		for name, dataset := range batch {
+			sourceDatasets[name] = dataset
+		}
+	}
+
+	entries := make([]*csi.ListSnapshotsResponse_Entry, 0, len(snapshots))
+	for _, snap := range snapshots {
+		// A dataset absent from the batch result is the NotFound equivalent of
+		// the per-snapshot path (the map lookup yields nil), so the entry is
+		// kept without the restore-size override, exactly as before.
+		if entry := d.snapshotListEntryFromDataset(snap, req.GetSourceVolumeId(), sourceDatasets[snap.Dataset]); entry != nil {
 			entries = append(entries, entry)
 		}
 	}
@@ -2612,6 +2899,62 @@ func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReques
 		Entries:   entries,
 		NextToken: nextToken,
 	}, nil
+}
+
+// snapshotListPageCacheTTL bounds how long ListSnapshots pages are served from
+// one walk's full fetch. It only needs to outlive a single CO paging walk
+// (external-snapshotter issues pages back-to-back), and it is deliberately
+// short so an aborted walk's stale token cannot read old state for long. A
+// fresh walk (empty starting token) always refetches regardless of TTL.
+const snapshotListPageCacheTTL = 30 * time.Second
+
+// snapshotsForListPage returns one page of the parent's snapshots for the
+// paged ListSnapshots path. freshWalk (empty starting token) always fetches the
+// full set (limit=0/offset=0) and repopulates the cache; a continuation token
+// within the TTL is served from the cached set, so an N-page walk costs exactly
+// one full transfer. A continuation arriving after the TTL (or before any walk
+// populated the cache, e.g. across a driver restart) refetches — offset-based
+// tokens remain valid against a refreshed set exactly as they were against
+// per-page SnapshotListAll calls.
+//
+// The in-memory slice reproduces paginateSnapshots (pkg/truenas) exactly,
+// including the property the next-token generation depends on: a page is
+// shorter than the limit only at the end of the set.
+func (d *Driver) snapshotsForListPage(ctx context.Context, freshWalk bool, limit, offset int) ([]*truenas.Snapshot, error) {
+	if !freshWalk {
+		d.snapshotPageCacheMu.Lock()
+		if d.snapshotPageCache != nil && time.Since(d.snapshotPageCacheTime) < snapshotListPageCacheTTL {
+			cached := d.snapshotPageCache
+			d.snapshotPageCacheMu.Unlock()
+			return sliceSnapshotListPage(cached, limit, offset), nil
+		}
+		d.snapshotPageCacheMu.Unlock()
+	}
+	all, err := d.truenasClient.SnapshotListAll(ctx, d.config.ZFS.DatasetParentName, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	d.snapshotPageCacheMu.Lock()
+	d.snapshotPageCache = all
+	d.snapshotPageCacheTime = time.Now()
+	d.snapshotPageCacheMu.Unlock()
+	return sliceSnapshotListPage(all, limit, offset), nil
+}
+
+// sliceSnapshotListPage mirrors truenas.paginateSnapshots so cached paging is
+// observably identical to the per-page backend slicing it replaces.
+func sliceSnapshotListPage(snapshots []*truenas.Snapshot, limit, offset int) []*truenas.Snapshot {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(snapshots) {
+		return []*truenas.Snapshot{}
+	}
+	end := len(snapshots)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	return snapshots[offset:end]
 }
 
 // ControllerExpandVolume expands a volume.
@@ -2880,20 +3223,24 @@ func volumeNearQuotaMessage(usage *truenas.DatasetQuotaUsage) string {
 	return message
 }
 
-// ControllerModifyVolume modifies a volume (not implemented).
-func (d *Driver) ControllerModifyVolume(ctx context.Context, req *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerModifyVolume not implemented")
-}
+// ControllerModifyVolume lives in controller_modify.go with the rest of the
+// mutable-parameter (VolumeAttributesClass) machinery.
 
 // Helper functions
 
 func sanitizeVolumeID(name string) string {
 	// Rebuild through a rune range so arbitrary invalid UTF-8 input is repaired
 	// while replacing the path and space characters disallowed by this scheme.
+	// '@' is replaced too: ZFS forbids it in snapshot names anyway (a request
+	// carrying one always failed at SnapshotCreate before this, so no
+	// pre-existing object can hold such a short name), and keeping it out of
+	// sanitized short names is what makes the two CSI snapshot handle formats
+	// unambiguous — any '@' in a handle means "dataset-qualified", never a
+	// legacy short name (see parseQualifiedSnapshotHandle).
 	var sanitized strings.Builder
 	for _, r := range name {
 		switch r {
-		case '/', ' ':
+		case '/', ' ', '@':
 			sanitized.WriteByte('-')
 		default:
 			sanitized.WriteRune(r)
@@ -2951,9 +3298,18 @@ func buildSnapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *
 		return nil
 	}
 
-	snapshotID, ok := extractSnapshotName(snap.ID)
-	if !ok {
+	if _, ok := extractSnapshotName(snap.ID); !ok {
 		klog.V(4).Infof("Skipping snapshot with invalid ID format: %s", snap.ID)
+		return nil
+	}
+	// Each entry reports the snapshot's OWN handle: the dataset-qualified handle
+	// stamped at creation when present, else the legacy short name — the same
+	// string the CO already stores in this snapshot's VolumeSnapshotContent, in
+	// either era. Reporting anything else would make the external-snapshotter
+	// see a "different" snapshot than the one it created.
+	snapshotID := snapshotCSIHandle(snap)
+	if snapshotID == "" {
+		klog.V(4).Infof("Skipping snapshot with no derivable CSI handle: %s", snap.ID)
 		return nil
 	}
 
@@ -2980,22 +3336,53 @@ func buildSnapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *
 	}
 }
 
-func (d *Driver) snapshotListEntry(ctx context.Context, snap *truenas.Snapshot, sourceVolumeFilter string) (*csi.ListSnapshotsResponse_Entry, error) {
+// snapshotListEntryFromDataset builds a CSI list entry from a snapshot and its
+// already-fetched source dataset. The size a restored volume needs is the
+// source dataset's capacity, not the snapshot's own (usually tiny) used size,
+// so the entry's SizeBytes is overridden whenever the dataset reports a
+// positive capacity. A nil sourceDataset means the source dataset no longer
+// exists (either a per-snapshot DatasetGet returned NotFound, or a batched
+// DatasetGetByNames read omitted the name, which is the same condition): the
+// entry is still returned so the snapshot stays listed, just without the
+// override. Keeping this function free of API calls is what lets the paged
+// path of ListSnapshots prefetch a whole page's source datasets in batched
+// reads instead of issuing one DatasetGet per snapshot.
+func (d *Driver) snapshotListEntryFromDataset(snap *truenas.Snapshot, sourceVolumeFilter string, sourceDataset *truenas.Dataset) *csi.ListSnapshotsResponse_Entry {
 	entry := buildSnapshotListEntry(snap, sourceVolumeFilter)
 	if entry == nil {
+		return nil
+	}
+	if sourceDataset == nil {
+		return entry
+	}
+	if restoreSize := d.getDatasetCapacity(sourceDataset); restoreSize > 0 {
+		entry.Snapshot.SizeBytes = restoreSize
+	}
+	return entry
+}
+
+// snapshotListEntry is the single-snapshot wrapper used by the by-snapshot-id
+// path of ListSnapshots, where exactly one dataset read can ever be needed and
+// batching buys nothing: it performs that one DatasetGet itself and delegates
+// entry construction to snapshotListEntryFromDataset. NotFound keeps the entry
+// without the restore-size override; any other read error fails the RPC so the
+// caller never sees a silently wrong restore size.
+func (d *Driver) snapshotListEntry(ctx context.Context, snap *truenas.Snapshot, sourceVolumeFilter string) (*csi.ListSnapshotsResponse_Entry, error) {
+	// Cheap pre-check so snapshots that produce no entry (non-CSI or filtered
+	// out) skip the dataset read, as they always have; rebuilding the entry in
+	// snapshotListEntryFromDataset below is trivial next to the round trip
+	// this gates.
+	if buildSnapshotListEntry(snap, sourceVolumeFilter) == nil {
 		return nil, nil
 	}
 	sourceDataset, err := d.truenasClient.DatasetGet(ctx, snap.Dataset)
 	if err != nil {
 		if truenas.IsNotFoundError(err) {
-			return entry, nil
+			return d.snapshotListEntryFromDataset(snap, sourceVolumeFilter, nil), nil
 		}
 		return nil, status.Errorf(codes.Internal, "failed to get source dataset %s for snapshot %s restore size: %v", snap.Dataset, snap.ID, err)
 	}
-	if restoreSize := d.getDatasetCapacity(sourceDataset); restoreSize > 0 {
-		entry.Snapshot.SizeBytes = restoreSize
-	}
-	return entry, nil
+	return d.snapshotListEntryFromDataset(snap, sourceVolumeFilter, sourceDataset), nil
 }
 
 func (d *Driver) getDatasetCapacity(ds *truenas.Dataset) int64 {
@@ -3057,6 +3444,15 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 		applyPerformanceClassProperties(params, curated)
 	}
 	d.applyDatasetProperties(params)
+	// VolumeAttributesClass mutable parameters, applied LAST among the tunable
+	// layers so they win over both the curated class floor and the
+	// controller-wide zfs.datasetProperties: class and ConfigMap are
+	// deployment-scoped policy, while mutable_parameters are this volume's own
+	// declared attributes — the ones ControllerModifyVolume keeps in sync
+	// afterwards. Geometry cannot collide: resolveMutableTunables rejects
+	// volblocksize and friends outright. Absent parameters = zero properties and
+	// the historical create payload, exactly like the class above.
+	applyMutableTunablesToCreate(params, mutableTunablesFromContext(ctx))
 	// An NFSv4 dacl can only be applied to an acltype=NFSV4 dataset. Stamp it
 	// (plus aclmode=PASSTHROUGH) ONLY when this volume actually requested an ACL;
 	// otherwise both stay inherited from the parent, exactly as before.
@@ -3578,13 +3974,14 @@ func (d *Driver) handleVolumeContentSource(
 		// Create from snapshot using either the legacy clone or the gated
 		// independent local send/receive path.
 		snapshotID := snapshot.GetSnapshotId()
-		if _, err := d.datasetForID(snapshotID); err != nil {
+		if err := d.validateSnapshotHandleShape(snapshotID); err != nil {
 			return nil, blockGeometry{}, err
 		}
 		klog.Infof("Creating volume from snapshot: %s -> %s", snapshotID, datasetName)
 
-		// Find the snapshot using efficient query (PERF-001 fix)
-		snap, err := d.truenasClient.SnapshotFindByName(ctx, d.config.ZFS.DatasetParentName, snapshotID)
+		// Find the snapshot without a full-parent scan when the handle encodes
+		// its dataset (PERF-001 fix, extended by dataset-qualified handles).
+		snap, err := d.resolveSnapshotHandle(ctx, snapshotID)
 		if err != nil {
 			return nil, blockGeometry{}, status.Errorf(codes.Internal, "failed to find snapshot: %v", err)
 		}

@@ -135,10 +135,20 @@ func (d *Driver) classifySpentRestoreSnapshots(
 		}
 		// Resolve against the pass's in-memory snapshot index — no per-candidate
 		// backend round trip (see the maps built above). A "@" handle matches a full
-		// snapshot ID; a bare short name matches byShortName.
+		// snapshot ID; a bare short name matches byShortName. A dataset-qualified
+		// handle additionally falls back to its SHORT-NAME component, because a
+		// clone promotion migrates snapshots to the promoted dataset while the
+		// content keeps the original handle — the same cross-format net the
+		// orphan classifier uses (short names are globally unique among CSI
+		// snapshots, so this cannot resolve to a different snapshot).
 		backendSnapshot := byID[content.snapshotHandle]
 		if backendSnapshot == nil {
 			backendSnapshot = byShortName[content.snapshotHandle]
+		}
+		if backendSnapshot == nil {
+			if shortName := snapshotHandleShortName(content.snapshotHandle); shortName != "" && shortName != content.snapshotHandle {
+				backendSnapshot = byShortName[shortName]
+			}
 		}
 		if backendSnapshot == nil || !isCSISnapshot(backendSnapshot) {
 			continue

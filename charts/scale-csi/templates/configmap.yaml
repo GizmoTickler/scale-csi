@@ -251,6 +251,16 @@ data:
       cacheTTL: {{ .Values.health.cacheTTL | quote }}
     {{- end }}
 
+    {{- with .Values.debug.listenAddress }}
+    # Opt-in UNAUTHENTICATED debug endpoint (pprof + /debug/state). The block
+    # renders ONLY when a listen address is set, so the default ConfigMap stays
+    # byte-identical and parseable by a rolled-back binary; the driver default
+    # (disabled) is the source of truth when the block is absent. Keep the bind
+    # loopback (kubectl port-forward) or behind a NetworkPolicy.
+    debug:
+      listenAddress: {{ . | quote }}
+    {{- end }}
+
     {{- if .Values.encryption.enabled }}
     # ZFS-native encryption at rest (opt-in). The block renders ONLY when enabled
     # so the default ConfigMap carries no encryption: key and stays parseable by a
