@@ -1,5 +1,28 @@
 #!/bin/bash
 
+# Wrapper script that decides whether to run umount in container or on host.
+#
+# NOTE: the -t fstype detection below is kept for parity with the mount
+# wrapper, but the Go layer never passes -t to umount, so in practice the
+# host branch is only reached via USE_HOST_MOUNT_TOOLS=1. Setting that env
+# var forces ALL umounts (including NFS) through the host, so the host must
+# provide the needed umount helpers.
+
+# Find umount binary on the host - check multiple possible locations
+# (varies by OS/distro; e.g. NixOS has no /bin/umount)
+find_umount() {
+  for path in /usr/bin/umount /bin/umount /usr/sbin/umount /sbin/umount; do
+    if [[ -x "/host${path}" ]]; then
+      echo "${path}"
+      return
+    fi
+  done
+  # Fallback to default
+  echo "/bin/umount"
+}
+
+: "${UMOUNT_HOST_PATH:=$(find_umount)}"
+
 while getopts ":t:l" opt; do
   case "$opt" in
     t)
@@ -13,8 +36,8 @@ while getopts ":t:l" opt; do
 done
 
 if [[ "${USE_HOST_MOUNT_TOOLS}" == "1" ]]; then
-  # Use direct path for compatibility with minimal OS like Talos
-  chroot /host /bin/umount "${@:1}"
+  # Use direct binary path (probed above) for compatibility with minimal OS like Talos
+  chroot /host "${UMOUNT_HOST_PATH}" "$@"
 else
-  /bin/umount "${@:1}"
+  /bin/umount "$@"
 fi

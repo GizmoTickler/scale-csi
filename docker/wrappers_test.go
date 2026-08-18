@@ -347,3 +347,66 @@ exit 0
 		exitCode:   exitCode,
 	}
 }
+
+func TestMountHostPathOverride(t *testing.T) {
+	result := runWrapper(t, "mount", []string{
+		"USE_HOST_MOUNT_TOOLS=1",
+		"MOUNT_HOST_PATH=/custom/mount",
+	}, "-t", "nfs", "-o", "rw", "server:/export", "/var/lib/kubelet/target")
+
+	wantArgv := []string{
+		"/host", "/custom/mount",
+		"-t", "nfs", "-o", "rw", "server:/export", "/var/lib/kubelet/target",
+	}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("chroot argv = %#v, want %#v", result.argv, wantArgv)
+	}
+	if result.exitCode != 23 {
+		t.Fatalf("exit code = %d, want 23", result.exitCode)
+	}
+	if result.stderr != "host-command-stderr" {
+		t.Fatalf("stderr = %q, want exact host stderr", result.stderr)
+	}
+}
+
+func TestUmountHostPathOverrideWithSpaceInTarget(t *testing.T) {
+	result := runWrapper(t, "umount", []string{
+		"USE_HOST_MOUNT_TOOLS=1",
+		"UMOUNT_HOST_PATH=/custom/umount",
+	}, "-l", "/var/lib/kubelet/test target")
+
+	wantArgv := []string{"/host", "/custom/umount", "-l", "/var/lib/kubelet/test target"}
+	if !reflect.DeepEqual(result.argv, wantArgv) {
+		t.Fatalf("chroot argv = %#v, want %#v", result.argv, wantArgv)
+	}
+}
+
+func TestMountUmountProbeFallbackWithoutHostRoot(t *testing.T) {
+	if _, err := os.Stat("/host"); err == nil {
+		t.Skip("/host exists on this machine; cannot exercise the probe-miss fallback")
+	}
+	tests := []struct {
+		wrapper  string
+		args     []string
+		wantArgv []string
+	}{
+		{
+			wrapper:  "mount",
+			args:     []string{"-t", "nfs", "server:/export", "/mnt/target"},
+			wantArgv: []string{"/host", "/bin/mount", "-t", "nfs", "server:/export", "/mnt/target"},
+		},
+		{
+			wrapper:  "umount",
+			args:     []string{"/mnt/target"},
+			wantArgv: []string{"/host", "/bin/umount", "/mnt/target"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.wrapper, func(t *testing.T) {
+			result := runWrapper(t, tt.wrapper, []string{"USE_HOST_MOUNT_TOOLS=1"}, tt.args...)
+			if !reflect.DeepEqual(result.argv, tt.wantArgv) {
+				t.Fatalf("chroot argv = %#v, want %#v", result.argv, tt.wantArgv)
+			}
+		})
+	}
+}

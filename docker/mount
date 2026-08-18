@@ -3,6 +3,26 @@
 # Wrapper script that decides whether to run mount in container or on host.
 # We parse -t (filesystem type) to detect filesystems that require host tools.
 # All other options are passed through to mount unchanged.
+#
+# NOTE: setting USE_HOST_MOUNT_TOOLS=1 in the environment forces ALL mounts
+# (including NFS) through the host, so the host must provide every mount
+# helper the driver needs (e.g. mount.nfs). Leave it unset to let the
+# per-invocation fstype detection below decide instead.
+
+# Find mount binary on the host - check multiple possible locations
+# (varies by OS/distro; e.g. NixOS has no /bin/mount)
+find_mount() {
+  for path in /usr/bin/mount /bin/mount /usr/sbin/mount /sbin/mount; do
+    if [[ -x "/host${path}" ]]; then
+      echo "${path}"
+      return
+    fi
+  done
+  # Fallback to default
+  echo "/bin/mount"
+}
+
+: "${MOUNT_HOST_PATH:=$(find_mount)}"
 
 # Parse options we care about, ignore others
 # t: = filesystem type (we check if it needs host tools)
@@ -23,8 +43,8 @@ while getopts ":t:o:nrwvfa" opt; do
 done
 
 if [[ "${USE_HOST_MOUNT_TOOLS}" == "1" ]]; then
-  # Use direct path for compatibility with minimal OS like Talos
-  chroot /host /bin/mount "$@"
+  # Use direct binary path (probed above) for compatibility with minimal OS like Talos
+  chroot /host "${MOUNT_HOST_PATH}" "$@"
 else
   /bin/mount "$@"
 fi
