@@ -398,3 +398,42 @@ func FuzzTypedDatasetDecodeMatchesInterface(f *testing.F) {
 		}
 	})
 }
+
+// TestLiveCapturedStampedSnapshotFixtureDecodes pins the decode behavior for a
+// fixture captured VERBATIM from a live TrueNAS-26.0.0-BETA.2
+// zfs.resource.snapshot.query response (2026-08-17, scoped write probe against
+// nas01; see the P1 snapshot-handle work). Two wire facts it proves that the
+// hand-built snapshot-resource-26.0.json fixture does not:
+//
+//  1. Snapshot user_properties arrive as BARE STRINGS (no {value, source}
+//     object and therefore NO source information), so any snapshot-side logic
+//     must never rely on UserProperty.Source — the handle stamp trust rule
+//     compares short names instead, and this fixture is the reason why.
+//  2. An inline SnapshotCreate property map (including the
+//     truenas-csi:csi_snapshot_handle stamp) persists and is returned by the
+//     targeted, non-recursive read — the fast path the qualified snapshot
+//     handles depend on.
+func TestLiveCapturedStampedSnapshotFixtureDecodes(t *testing.T) {
+	payload := readTypedFixture(t, "snapshot-resource-stamped-live-26.0.json")
+
+	// Interface and typed decoders must agree on the live shape too.
+	require.Equal(t, interfaceSnapshots(t, payload, true), typedSnapshots(t, payload, true))
+
+	snapshots := typedSnapshots(t, payload, true)
+	require.Len(t, snapshots, 1)
+	snap := snapshots[0]
+
+	assert.Equal(t, "flashstor/csi-live-test/pvc-live-a@livetest-1", snap.ID)
+	assert.Equal(t, "livetest-1", snap.Name)
+	assert.Equal(t, "flashstor/csi-live-test/pvc-live-a", snap.Dataset)
+
+	handle, ok := snap.UserProperties["truenas-csi:csi_snapshot_handle"]
+	require.True(t, ok, "inline-created handle stamp must survive the targeted read")
+	assert.Equal(t, "flashstor/csi-live-test/pvc-live-a@livetest-1", handle.Value)
+	// Bare-string wire shape carries no source: it must decode empty, not fail.
+	assert.Equal(t, "", handle.Source)
+
+	managed, ok := snap.UserProperties["truenas-csi:managed_resource"]
+	require.True(t, ok)
+	assert.Equal(t, "true", managed.Value)
+}

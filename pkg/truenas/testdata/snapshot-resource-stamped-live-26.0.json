@@ -1,0 +1,32 @@
+[
+  {
+    "createtxg": 4532290,
+    "dataset": "flashstor/csi-live-test/pvc-live-a",
+    "guid": 7646103735757245000,
+    "holds": null,
+    "name": "flashstor/csi-live-test/pvc-live-a@livetest-1",
+    "pool": "flashstor",
+    "properties": {
+      "creation": {
+        "raw": "1787021579",
+        "source": null,
+        "value": 1787021579
+      },
+      "used": {
+        "raw": "0",
+        "source": null,
+        "value": 0
+      }
+    },
+    "snapshot_name": "livetest-1",
+    "type": "SNAPSHOT",
+    "user_properties": {
+      "org.freenas:description": "INHERIT",
+      "truenas-csi:csi_snapshot_handle": "flashstor/csi-live-test/pvc-live-a@livetest-1",
+      "truenas-csi:csi_snapshot_name": "livetest-1",
+      "truenas-csi:csi_snapshot_source_volume_id": "pvc-live-a",
+      "truenas-csi:driver_instance_id": "live-verify",
+      "truenas-csi:managed_resource": "true"
+    }
+  }
+]
