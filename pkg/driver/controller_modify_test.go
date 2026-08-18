@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -316,4 +317,154 @@ func TestCreateVolumeWithMutableParameters(t *testing.T) {
 		assert.Equal(t, codes.InvalidArgument, st.Code())
 		assert.True(t, strings.Contains(st.Message(), "recordsize"))
 	})
+}
+
+// --- H-1: mutable parameters must survive a CreateVolume clone retry ---
+//
+// A clone/restore accepts no create-time property payload, so the clone arm
+// applies mutable_parameters via a separate diff-derived pool.dataset.update
+// AFTER materialization. If that update fails, the error is fatal (correct),
+// but the external-provisioner's retry resumes through createVolumeExisting —
+// which, before the fix, never re-applied the tunables, so the retry returned
+// success and the PVC bound with recorded attributes (compression=ZSTD) that
+// silently disagreed with the actual dataset (the origin's inherited value).
+
+// tunableApplyFailureClient injects a failure into exactly the DatasetUpdate
+// that carries live-tunable properties (the applyMutableTunables write). Every
+// other pool.dataset.update — the merged content-source/ownership fold, user
+// property stamps, refquota — passes through untouched, so the clone
+// materializes fully before the failure fires, reproducing the exact state an
+// idempotent retry resumes from.
+type tunableApplyFailureClient struct {
+	*modifyCountingClient
+	failTunableUpdates error
+}
+
+func (c *tunableApplyFailureClient) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
+	if c.failTunableUpdates != nil && datasetUpdateCarriesTunables(params) {
+		return nil, c.failTunableUpdates
+	}
+	return c.modifyCountingClient.DatasetUpdate(ctx, name, params)
+}
+
+func datasetUpdateCarriesTunables(params *truenas.DatasetUpdateParams) bool {
+	return params.Compression != "" || params.Sync != "" || params.Atime != "" || params.Recordsize != ""
+}
+
+func countTunableUpdates(params []*truenas.DatasetUpdateParams) int {
+	count := 0
+	for _, p := range params {
+		if datasetUpdateCarriesTunables(p) {
+			count++
+		}
+	}
+	return count
+}
+
+// newCloneRetryFixture provisions a source volume and a snapshot through the
+// real driver paths and returns the snapshot-restore CreateVolumeRequest
+// carrying mutable_parameters{compression: ZSTD} — the request whose retry
+// behavior H-1 is about.
+func newCloneRetryFixture(t *testing.T) (*tunableApplyFailureClient, *Driver, *csi.CreateVolumeRequest) {
+	t.Helper()
+	client := &tunableApplyFailureClient{modifyCountingClient: &modifyCountingClient{MockClient: truenas.NewMockClient()}}
+	d := &Driver{
+		config: &Config{
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent", DatasetEnableQuotas: true},
+			DriverName: "org.scale.csi.nfs",
+			NFS:        NFSConfig{ShareHost: "192.0.2.10"},
+		},
+		truenasClient: client,
+	}
+	mustCreateParentDataset(t, client.MockClient)
+	createModifyTestNFSVolume(t, d, "vol-clone-src")
+	snap, err := d.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+		Name: "clone-vac-snap", SourceVolumeId: "vol-clone-src",
+	})
+	require.NoError(t, err)
+	req := &csi.CreateVolumeRequest{
+		Name:               "vol-clone-dst",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		MutableParameters:  map[string]string{"compression": "ZSTD"},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snap.GetSnapshot().GetSnapshotId()},
+		}},
+	}
+	return client, d, req
+}
+
+// The H-1 repro, end to end: first attempt fails on the post-materialization
+// tunable apply; the retry of the SAME request must re-apply the tunables and
+// only then return success. Without the createVolumeExisting re-apply, the
+// retry succeeds while the dataset still carries the origin's compression —
+// the final assertion here is the one that fails.
+func TestCreateVolumeCloneRetryReappliesMutableParameters(t *testing.T) {
+	ctx := context.Background()
+	client, d, req := newCloneRetryFixture(t)
+
+	client.failTunableUpdates = errors.New("injected tunable apply failure")
+	_, err := d.CreateVolume(ctx, req)
+	require.Error(t, err, "a failed tunable apply after clone materialization must be fatal")
+	assert.Equal(t, codes.Internal, status.Code(err))
+
+	// The clone materialized and is owned — exactly the state the
+	// external-provisioner's retry resumes from — but does NOT carry the
+	// requested attribute yet.
+	ds, err := client.DatasetGet(ctx, "pool/parent/vol-clone-dst")
+	require.NoError(t, err)
+	assert.NotEqual(t, "ZSTD", ds.Compression.Value)
+
+	client.failTunableUpdates = nil
+	resp, err := d.CreateVolume(ctx, req)
+	require.NoError(t, err, "the idempotent retry must succeed once the backend recovers")
+	ds, err = client.DatasetGet(ctx, "pool/parent/"+resp.Volume.VolumeId)
+	require.NoError(t, err)
+	assert.Equal(t, "ZSTD", ds.Compression.Value,
+		"the retry must re-apply the request's mutable parameters: binding the PVC with recorded "+
+			"attributes the dataset does not carry is a silent correctness lie nothing later converges")
+}
+
+// While the tunable apply keeps failing, the RETRY must keep failing too —
+// returning success would bind a PVC whose recorded attributes disagree with
+// the volume, the same reasoning that makes the fresh-path apply fatal.
+func TestCreateVolumeCloneRetryTunableApplyFailureStaysFatal(t *testing.T) {
+	ctx := context.Background()
+	client, d, req := newCloneRetryFixture(t)
+
+	client.failTunableUpdates = errors.New("injected tunable apply failure")
+	_, err := d.CreateVolume(ctx, req)
+	require.Error(t, err)
+
+	_, err = d.CreateVolume(ctx, req)
+	require.Error(t, err, "a retry must not bind the PVC while the volume cannot be made to match the request")
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "mutable parameters")
+	ds, getErr := client.DatasetGet(ctx, "pool/parent/vol-clone-dst")
+	require.NoError(t, getErr)
+	assert.NotEqual(t, "ZSTD", ds.Compression.Value)
+}
+
+// A retry whose mutable parameters are ALREADY live on the dataset (the first
+// attempt succeeded end to end) is a pure no-op for the tunables: the diff in
+// applyMutableTunables must produce ZERO extra pool.dataset.update calls.
+func TestCreateVolumeCloneRetryAlreadyAppliedTunablesAddZeroUpdates(t *testing.T) {
+	ctx := context.Background()
+	client, d, req := newCloneRetryFixture(t)
+
+	resp, err := d.CreateVolume(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, 1, countTunableUpdates(client.datasetUpdateParams),
+		"the fresh clone arm applies the tunables in exactly one diff-derived update")
+
+	client.resetCounts()
+	retryResp, err := d.CreateVolume(ctx, req)
+	require.NoError(t, err)
+	assert.Equal(t, resp.Volume.VolumeId, retryResp.Volume.VolumeId)
+	assert.Zero(t, countTunableUpdates(client.datasetUpdateParams),
+		"already-live tunables must diff to zero pool.dataset.update calls on the retry")
+
+	ds, err := client.DatasetGet(ctx, "pool/parent/"+retryResp.Volume.VolumeId)
+	require.NoError(t, err)
+	assert.Equal(t, "ZSTD", ds.Compression.Value)
 }

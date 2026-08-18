@@ -252,6 +252,12 @@ var datasetQueryProperties = slices.Concat(
 	datasetEncryptionQueryProperties,
 )
 
+// pool.dataset.query options quirk (P-4, live-verified 2026-08-18 on nas01,
+// 26.0.0-BETA.2): options {"count": true} IGNORES the query-filters entirely
+// and returns the SYSTEM-WIDE dataset count, not the filtered count. Never use
+// count:true for filtered counting — fetch the matching rows and count them
+// client-side. No driver path uses count:true today; keep it that way.
+
 // datasetResourceQueryProperties is the projection sent with zfs.resource.query.
 //
 // It deliberately does NOT carry datasetEncryptionQueryProperties: P-11 measured

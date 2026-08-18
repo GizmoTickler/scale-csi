@@ -621,9 +621,62 @@ func (c *Client) SnapshotListAll(ctx context.Context, parentDataset string, limi
 // SnapshotFindByName finds a snapshot by its short name under a parent dataset.
 // This is more efficient than SnapshotListAll + iteration (PERF-001 fix).
 // The name parameter is the snapshot name without the dataset prefix (e.g., "my-snapshot" not "pool/dataset@my-snapshot").
+//
+// P-1: the 26.0 leg used to fetch the ENTIRE recursive snapshot set under the
+// parent via zfs.resource.snapshot.query with get_user_properties (live-measured
+// on nas01, TrueNAS 26.0.0-BETA.2: ~650ms and >1MB at 576 snapshots, linear in
+// snapshot count) and filter client-side. It now probes server-side first:
+//
+//  1. pool.snapshot.query with parent-scoped filters
+//     [["dataset","^",parent+"/"],["snapshot_name","=",name]] and
+//     {"select":["name","dataset","snapshot_name","createtxg"]} — live-verified
+//     on 26.0.0-BETA.2 at ~330ms flat and ~300 bytes for both positive and
+//     negative matches. pool.snapshot.query on 26.0 returns NO user_properties
+//     key at all, `properties` as an empty dict, and createtxg as a STRING, so
+//     the probe can only LOCATE, never classify.
+//  2. Zero probe hits → nil, nil with no scan at all (the common fresh-create
+//     case in CreateSnapshot's uniqueness check).
+//  3. Probe hits → ONE targeted zfs.resource.snapshot.query with all hit paths
+//     (non-recursive, get_user_properties:true — live-measured ~2ms per call,
+//     accepts multiple paths in one call) to supply the identity properties
+//     callers read (UserProperties), exactly as the old scan did.
+//  4. Any probe error (including method-not-found on some future build) falls
+//     back to the recursive scan below, unchanged.
 func (c *Client) SnapshotFindByName(ctx context.Context, parentDataset, name string) (*Snapshot, error) {
 	if c.hasSnapshotResourceQuery(ctx) {
 		parentDataset = strings.TrimSuffix(parentDataset, "/")
+
+		paths, probeErr := c.probeSnapshotPathsByName(ctx, parentDataset, name)
+		if probeErr == nil {
+			if len(paths) == 0 {
+				return nil, nil // Not found, not an error — and no recursive scan paid.
+			}
+			// One targeted read supplies what the probe cannot: the full snapshot
+			// object with user properties for the callers' identity checks.
+			snapshots, err := c.querySnapshotResources(ctx, paths, false, snapshotResourceQueryProperties)
+			if err != nil {
+				return nil, fmt.Errorf("failed to query snapshots: %w", err)
+			}
+			// Re-check the short name client-side and pick the first match in
+			// deterministic (ID) order.
+			var match *Snapshot
+			for _, snap := range snapshots {
+				if snap.Name != name {
+					continue
+				}
+				if match == nil || snap.ID < match.ID {
+					match = snap
+				}
+			}
+			if match == nil {
+				return nil, nil
+			}
+			return match, nil
+		}
+		klog.V(2).Infof("Snapshot name probe via %s failed; falling back to recursive snapshot scan under %q: %v",
+			c.snapshotMethod("query"), parentDataset, probeErr)
+
+		// FALLBACK: the pre-P-1 recursive scan, unchanged.
 		snapshots, err := c.querySnapshotResources(ctx, []string{parentDataset}, true, snapshotResourceQueryProperties)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query snapshots: %w", err)
@@ -657,6 +710,65 @@ func legacySnapshotNameFilters(parentDataset, name string) [][]interface{} {
 		{"dataset", "^", strings.TrimSuffix(parentDataset, "/") + "/"},
 		{"id", "~", fmt.Sprintf(".*@%s$", regexp.QuoteMeta(name))},
 	}
+}
+
+// snapshotNameProbeFilters is the P-1 server-side name probe's filter set.
+// Unlike legacySnapshotNameFilters it uses an EQUALITY snapshot_name filter,
+// not a regex on id — equality is cheaper and exact. The `"dataset","^",parent+"/"`
+// filter also preserves the recursive scan's semantics that a snapshot ON the
+// parent dataset itself is excluded (the scan requires
+// snap.Dataset != parentDataset && strings.HasPrefix(snap.Dataset, parent+"/")).
+func snapshotNameProbeFilters(parentDataset, name string) [][]interface{} {
+	return [][]interface{}{
+		{"dataset", "^", strings.TrimSuffix(parentDataset, "/") + "/"},
+		{"snapshot_name", "=", name},
+	}
+}
+
+// snapshotNameProbeSelect keeps the probe response tiny (~300 bytes live-measured
+// on 26.0.0-BETA.2, vs >1MB for the recursive scan it replaces). createtxg comes
+// back as a STRING on 26.0's pool.snapshot.query and is not read here; the shape
+// is kept exactly as live-verified.
+var snapshotNameProbeSelect = []string{"name", "dataset", "snapshot_name", "createtxg"}
+
+// probeSnapshotPathsByName runs the P-1 pool.snapshot.query name probe
+// (live-verified to work for READS on TrueNAS 26.0.0-BETA.2, ~330ms flat
+// regardless of snapshot count) and returns the matching <dataset@name> paths,
+// deduplicated and in deterministic (sorted) order. It locates only; the caller
+// classifies via a targeted zfs.resource.snapshot.query, because on 26.0 this
+// method returns no user_properties key and an empty properties dict.
+func (c *Client) probeSnapshotPathsByName(ctx context.Context, parentDataset, name string) ([]string, error) {
+	var rows []struct {
+		Name         string `json:"name"`
+		Dataset      string `json:"dataset"`
+		SnapshotName string `json:"snapshot_name"`
+	}
+	options := map[string]interface{}{"select": snapshotNameProbeSelect}
+	if err := callTyped(ctx, c, &rows, c.snapshotMethod("query"), snapshotNameProbeFilters(parentDataset, name), options); err != nil {
+		return nil, err
+	}
+	parent := strings.TrimSuffix(parentDataset, "/")
+	prefix := parent + "/"
+	paths := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		// Defensive re-check of the server-side dataset scoping: strictly below
+		// the parent, never the parent itself.
+		if row.Dataset == "" || row.Dataset == parent || !strings.HasPrefix(row.Dataset, prefix) {
+			continue
+		}
+		path := row.Name
+		if !strings.Contains(path, "@") {
+			path = row.Dataset + "@" + row.SnapshotName
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths, nil
 }
 
 func (c *Client) querySnapshotResources(ctx context.Context, paths []string, recursive bool, properties []string) ([]*Snapshot, error) {

@@ -123,6 +123,21 @@ type Driver struct {
 	snapshotPageCache     []*truenas.Snapshot
 	snapshotPageCacheTime time.Time
 
+	// ListVolumes paging cache (P-3): the name-sorted managed-dataset listing
+	// fetched at the START of a paging walk (empty starting token), served to
+	// that walk's continuation pages within a short TTL. pool.dataset.query
+	// offset pagination has NO ordering guarantee (rows come back in DB-row
+	// order), so per-page reads skipped or duplicated volumes under
+	// create/delete churn — and the external-health-monitor walks ListVolumes
+	// periodically. Continuation tokens now slice this frozen, sorted view
+	// instead. The staleness argument is the same as for the snapshot cache
+	// above: the cache feeds only read-only CSI listing pages, an empty
+	// starting token always refetches, and no delete/authorization decision
+	// ever reads it.
+	volumePageCacheMu   sync.Mutex
+	volumePageCache     []*truenas.Dataset
+	volumePageCacheTime time.Time
+
 	// Ready flag (atomic for safe concurrent access)
 	ready atomic.Bool
 

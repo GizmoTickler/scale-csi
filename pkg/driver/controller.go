@@ -491,6 +491,18 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 			},
 		},
 		{
+			// Meaningful only alongside LIST_VOLUMES (F-1): every ListVolumes
+			// entry's Status carries PublishedNodeIds decoded from the volume's
+			// own publication records, which ride on the same per-page
+			// pool.dataset.query hydration the entry is built from — zero extra
+			// API cost. See publishedNodeIDsFromDataset.
+			Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_LIST_VOLUMES_PUBLISHED_NODES,
+				},
+			},
+		},
+		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_GET_CAPACITY,
@@ -893,10 +905,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		// live-tunable, so one diff-derived pool.dataset.update after
 		// materialization applies them (a clone accepts no create-time property
 		// payload). Fatal on failure — returning success would bind a PVC whose
-		// recorded attributes silently disagree with the volume. A retry that
-		// resumes through createVolumeExisting does not re-apply them; a later
-		// VolumeAttributesClass (re-)assignment reaches the same properties
-		// through ControllerModifyVolume.
+		// recorded attributes silently disagree with the volume. If this apply
+		// fails AFTER the clone materialized, the external-provisioner's retry
+		// resumes through createVolumeExisting, which re-applies the same
+		// resolved tunables with the same diff (see the mirror call there); a
+		// later VolumeAttributesClass (re-)assignment reaches the same
+		// properties through ControllerModifyVolume.
 		if _, tunablesErr := d.applyMutableTunables(ctx, datasetName, createdDS, mutableTunables); tunablesErr != nil {
 			return nil, tunablesErr
 		}
@@ -1439,6 +1453,29 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 	if waitErr := d.setDatasetUserProperties(ctx, existingDS, datasetName, propertyUpdates); waitErr != nil {
 		klog.Errorf("Failed to ensure properties for existing volume %s: %v", volumeID, waitErr)
 		return nil, status.Errorf(codes.Internal, "failed to ensure volume properties: %v", waitErr)
+	}
+
+	// VolumeAttributesClass mutable parameters must survive a RETRY that resumes
+	// here. The clone/restore arm applies them via a separate diff-derived
+	// pool.dataset.update AFTER materialization (a clone accepts no create-time
+	// property payload); if that update failed — fatally, and correctly so — the
+	// external-provisioner retries the SAME request and lands in this path with
+	// the dataset already materialized, owned, and stamped. Without a re-apply
+	// the retry would return success while the dataset still carries the
+	// origin's inherited values, binding a PVC whose recorded attributes
+	// silently disagree with the volume — and nothing would ever converge it
+	// (the reconciler does not touch tunables; ControllerModifyVolume only fires
+	// on a VolumeAttributesClass (re-)assignment). The retried request carries
+	// the same mutable_parameters, already validated by CreateVolume's shared
+	// vocabulary gate and riding the request context exactly like the curated
+	// performance class. applyMutableTunables diffs against the CURRENT values
+	// the DatasetGet projection returned, so a retry whose tunables are already
+	// live — including every retry that carries none at all — makes ZERO extra
+	// API calls, and the fresh non-clone path (which folds the tunables into
+	// pool.dataset.create itself) re-verifies for free here. Failure stays
+	// fatal, for the same reason it is fatal on the fresh path.
+	if _, tunablesErr := d.applyMutableTunables(ctx, datasetName, existingDS, mutableTunablesFromContext(ctx)); tunablesErr != nil {
+		return nil, tunablesErr
 	}
 
 	// The stored per-volume CHAP policy is authoritative: an idempotent replay may
@@ -2171,8 +2208,30 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 }
 
 // ListVolumes lists all volumes.
-// Note: Pagination is based on the offset of server-filtered CSI datasets.
-// The client-side managed-resource check remains as a compatibility safeguard.
+//
+// PERF (P-2): the per-page pool.dataset.query with a user-property filter is
+// gone — its cost scaled with the TOTAL system dataset count (the middleware
+// materializes user properties for the whole system on every such call; the
+// same 47 rows went 152ms→630ms when 300 unrelated datasets were added
+// elsewhere). Each WALK now reuses listAllManagedDatasets — the reconciler's
+// path-scoped zfs.resource.query read with its paged pool.dataset.query
+// fallback — exactly once, and hydrates ONLY the page being returned through
+// id-filtered DatasetGetByNames reads (no materialization cost). The hydration
+// is REQUIRED, not an optimization detail: zfs.resource.query carries no
+// encryption fields at all (P-11), and the entry's VolumeCondition must see
+// Encrypted/Locked; it also restores the per-property Source that
+// publicationRecordsFromDataset depends on for PublishedNodeIds.
+//
+// STABILITY (P-3): pool.dataset.query offset pagination has NO ordering (rows
+// come back in DB-row order), so pages skipped/duplicated volumes under
+// create/delete churn — and the external-health-monitor consumes this RPC
+// periodically. Exactly like ListSnapshots, a fresh walk (empty starting
+// token) freezes the name-sorted managed listing into a short-TTL cache and
+// continuation tokens slice that frozen view. Starting-token semantics
+// (integer offset) are unchanged.
+//
+// The client-side managed-resource check on the hydrated dataset remains as a
+// compatibility safeguard.
 func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	klog.V(4).Info("ListVolumes called")
 
@@ -2188,27 +2247,50 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 
 	// Use max entries as limit (default to 100 if not specified or 0).
 	requestedLimit := int(req.GetMaxEntries())
-	if requestedLimit == 0 {
+	if requestedLimit <= 0 {
 		requestedLimit = 100
 	}
-	// Fetch one lookahead row to determine whether another page exists.
-	fetchLimit := requestedLimit + 1
 
-	datasets, err := d.truenasClient.DatasetList(ctx, d.config.ZFS.DatasetParentName, fetchLimit, offset)
+	page, hasMore, err := d.managedDatasetsForListPage(ctx, req.GetStartingToken() == "", requestedLimit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
 
-	pageSize := len(datasets)
-	if pageSize > requestedLimit {
-		pageSize = requestedLimit
+	// Hydrate ONLY this page via one id-filtered pool.dataset.query
+	// (chunked only if a page's names outgrow the request budget). The
+	// ["id","in",names] filter skips the full-system user-property
+	// materialization that made the old filtered listing O(system size), and
+	// unlike the zfs.resource.query listing it carries the encryption fields
+	// (P-11) and user-property sources the entries below are built from.
+	names := make([]string, 0, len(page))
+	for _, ds := range page {
+		names = append(names, ds.Name)
+	}
+	hydrated := make(map[string]*truenas.Dataset, len(names))
+	for _, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
+		batch, getErr := d.truenasClient.DatasetGetByNames(ctx, chunk)
+		if getErr != nil {
+			// DatasetGetByNames omits absent names instead of erroring, so a
+			// chunk error is a real backend failure, never NotFound in disguise.
+			return nil, status.Errorf(codes.Internal, "failed to read listed volumes %s...: %v", chunk[0], getErr)
+		}
+		for name, dataset := range batch {
+			hydrated[name] = dataset
+		}
 	}
 
-	entries := make([]*csi.ListVolumesResponse_Entry, 0, pageSize)
-	for _, ds := range datasets[:pageSize] {
+	entries := make([]*csi.ListVolumesResponse_Entry, 0, len(page))
+	for _, listed := range page {
+		ds, ok := hydrated[listed.Name]
+		if !ok {
+			// Deleted between the walk's frozen listing and this page's
+			// hydration: skip the entry rather than report a gone volume.
+			continue
+		}
 
-		// Skip if not managed by CSI
-		if prop, ok := ds.UserProperties[PropManagedResource]; !ok || prop.Value != "true" {
+		// Skip if not managed by CSI (compatibility safeguard; the listing
+		// already filtered on the managed stamp).
+		if prop, propOK := ds.UserProperties[PropManagedResource]; !propOK || prop.Value != "true" {
 			continue
 		}
 
@@ -2230,21 +2312,124 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 			// sweep's gauge and alert instead; see volumeConditionFromDataset.
 			Status: &csi.ListVolumesResponse_VolumeStatus{
 				VolumeCondition: d.volumeCondition(ds),
+				// LIST_VOLUMES_PUBLISHED_NODES (F-1): the hydrated dataset
+				// already carries the volume's publication records, so this is
+				// free. Requires the source-bearing pool.dataset.query read
+				// above — publicationRecordsFromDataset only trusts LOCAL
+				// properties, and the resource-query listing strips sources.
+				PublishedNodeIds: publishedNodeIDsFromDataset(ds),
 			},
 		})
 	}
 
-	// Advance by server-filtered rows consumed; compatibility filtering above does
-	// not affect page math.
+	// Advance by frozen-view rows consumed; compatibility filtering and
+	// hydration misses above do not affect page math.
 	nextToken := ""
-	if len(datasets) > requestedLimit {
-		nextToken = strconv.Itoa(offset + pageSize)
+	if hasMore {
+		nextToken = strconv.Itoa(offset + len(page))
 	}
 
 	return &csi.ListVolumesResponse{
 		Entries:   entries,
 		NextToken: nextToken,
 	}, nil
+}
+
+// volumeListPageCacheTTL bounds how long ListVolumes continuation pages are
+// served from one walk's frozen listing. Like snapshotListPageCacheTTL it only
+// needs to outlive a single CO paging walk (the external-health-monitor issues
+// pages back-to-back) and is deliberately short so an aborted walk's stale
+// token cannot read old state for long. A fresh walk (empty starting token)
+// always refetches regardless of TTL.
+const volumeListPageCacheTTL = 30 * time.Second
+
+// managedDatasetsForListPage returns one page of the parent's managed datasets
+// for ListVolumes, plus whether more pages remain in the frozen view. A fresh
+// walk (empty starting token) fetches the full managed set once via
+// listAllManagedDatasets (path-scoped zfs.resource.query, paged
+// pool.dataset.query fallback — both filtered to PropManagedResource=="true"),
+// sorts it by name so offsets are stable across pages, and repopulates the
+// cache; a continuation token within the TTL is served from that frozen view,
+// so a walk can neither skip nor duplicate volumes however much create/delete
+// churn happens meanwhile. A continuation arriving after the TTL (or before
+// any walk populated the cache, e.g. across a controller restart) refetches —
+// offset tokens remain valid against the refreshed set exactly as they were
+// against the old per-page reads.
+func (d *Driver) managedDatasetsForListPage(ctx context.Context, freshWalk bool, limit, offset int) ([]*truenas.Dataset, bool, error) {
+	if !freshWalk {
+		d.volumePageCacheMu.Lock()
+		if d.volumePageCache != nil && time.Since(d.volumePageCacheTime) < volumeListPageCacheTTL {
+			cached := d.volumePageCache
+			d.volumePageCacheMu.Unlock()
+			page, hasMore := sliceVolumeListPage(cached, limit, offset)
+			return page, hasMore, nil
+		}
+		d.volumePageCacheMu.Unlock()
+	}
+	all, err := d.listAllManagedDatasets(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	// Freeze a DETERMINISTIC order: neither zfs.resource.query nor the
+	// pool.dataset.query fallback guarantees one.
+	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+	d.volumePageCacheMu.Lock()
+	d.volumePageCache = all
+	d.volumePageCacheTime = time.Now()
+	d.volumePageCacheMu.Unlock()
+	page, hasMore := sliceVolumeListPage(all, limit, offset)
+	return page, hasMore, nil
+}
+
+// sliceVolumeListPage slices one offset/limit page out of the frozen listing.
+// Because the full set length is known, hasMore is exact — no lookahead row and
+// no trailing empty page, matching the old fetchLimit=limit+1 token semantics.
+func sliceVolumeListPage(datasets []*truenas.Dataset, limit, offset int) (page []*truenas.Dataset, hasMore bool) {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(datasets) {
+		return nil, false
+	}
+	end := len(datasets)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	return datasets[offset:end], end < len(datasets)
+}
+
+// publishedNodeIDsFromDataset derives a ListVolumes entry's PublishedNodeIds
+// from the volume's own publication records (F-1). record.EncodedID is the CSI
+// NodeId the CO passed to ControllerPublishVolume, which is exactly the
+// identifier the CO correlates published nodes by.
+//
+// Records are included regardless of State: an "unpublishing" record means
+// unpublish started but backend access removal is not confirmed complete, so
+// the node may still reach the volume — health monitoring must see it until
+// the record is gone. Pre-provenance records with an empty EncodedID are
+// SKIPPED (conservative omission): inventing a node id the CO never issued
+// would be worse than under-reporting one legacy publication, and every record
+// written since provenance stamps the encoded id.
+//
+// The result is sorted for deterministic responses. Unreadable records fail
+// publication/unpublication authorization loudly, but a read-only listing must
+// not go dark over one corrupt property — the entry is returned without
+// published-node data instead.
+func publishedNodeIDsFromDataset(ds *truenas.Dataset) []string {
+	records, err := publicationRecordsFromDataset(ds)
+	if err != nil {
+		klog.Warningf("ListVolumes: skipping published-node ids for %s: %v", ds.Name, err)
+		return nil
+	}
+	ids := make([]string, 0, len(records))
+	for key := range records {
+		if records[key].EncodedID == "" {
+			continue
+		}
+		ids = append(ids, records[key].EncodedID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // GetCapacity returns the available capacity.

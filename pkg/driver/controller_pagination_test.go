@@ -100,6 +100,8 @@ func TestListVolumes_Pagination(t *testing.T) {
 		truenasClient: paginatedClient,
 	}
 
+	var walkedIDs []string
+
 	// Test Case 1: First Page (Limit 2)
 	req := &csi.ListVolumesRequest{
 		MaxEntries: 2,
@@ -108,6 +110,9 @@ func TestListVolumes_Pagination(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, resp.Entries, 2)
 	assert.Equal(t, "2", resp.NextToken)
+	for _, entry := range resp.Entries {
+		walkedIDs = append(walkedIDs, entry.GetVolume().GetVolumeId())
+	}
 
 	// Test Case 2: Second Page (Limit 2, Offset 2)
 	req = &csi.ListVolumesRequest{
@@ -118,6 +123,9 @@ func TestListVolumes_Pagination(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, resp.Entries, 2)
 	assert.Equal(t, "4", resp.NextToken)
+	for _, entry := range resp.Entries {
+		walkedIDs = append(walkedIDs, entry.GetVolume().GetVolumeId())
+	}
 
 	// Test Case 3: Last Page (Limit 2, Offset 4) - Should return 1 item, no next token
 	req = &csi.ListVolumesRequest{
@@ -128,8 +136,28 @@ func TestListVolumes_Pagination(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, resp.Entries, 1)
 	assert.Empty(t, resp.NextToken)
-	assert.Equal(t, []int{3, 3, 3}, paginatedClient.datasetListLimits)
-	assert.Equal(t, []string{"pool/parent", "pool/parent", "pool/parent"}, paginatedClient.datasetListParents)
+	for _, entry := range resp.Entries {
+		walkedIDs = append(walkedIDs, entry.GetVolume().GetVolumeId())
+	}
+
+	// The frozen view is name-sorted, so the walk covers every managed volume
+	// exactly once, in order — no skips, no duplicates.
+	assert.Equal(t, []string{"vol-0", "vol-1", "vol-2", "vol-3", "vol-4"}, walkedIDs)
+
+	// P-2 API shape: one path-scoped listing per WALK (the fresh page), served
+	// from the frozen view for both continuation pages; one id-filtered
+	// hydration read per page. The old per-page pool.dataset.query lookahead
+	// (DatasetList with limit+1) is gone entirely — DatasetList would only run
+	// as the fallback when the resource listing errs.
+	assert.Equal(t, []string{"pool/parent"}, paginatedClient.datasetQueryByParentParents,
+		"exactly one listing call per walk, issued by the fresh (empty-token) page")
+	assert.Empty(t, paginatedClient.datasetListLimits,
+		"the pool.dataset.query fallback must not run when the path-scoped listing succeeds")
+	assert.Equal(t, [][]string{
+		{"pool/parent/vol-0", "pool/parent/vol-1"},
+		{"pool/parent/vol-2", "pool/parent/vol-3"},
+		{"pool/parent/vol-4"},
+	}, paginatedClient.datasetGetByNamesCalls, "one page-scoped hydration read per returned page")
 }
 
 func TestListSnapshots_Pagination(t *testing.T) {
@@ -192,8 +220,20 @@ func TestListSnapshots_Pagination(t *testing.T) {
 
 type PaginatedMockClient struct {
 	*truenas.MockClient
-	datasetListLimits  []int
-	datasetListParents []string
+	datasetListLimits           []int
+	datasetListParents          []string
+	datasetQueryByParentParents []string
+	datasetGetByNamesCalls      [][]string
+}
+
+func (m *PaginatedMockClient) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*truenas.Dataset, error) {
+	m.datasetQueryByParentParents = append(m.datasetQueryByParentParents, parentDataset)
+	return m.MockClient.DatasetQueryByParent(ctx, parentDataset)
+}
+
+func (m *PaginatedMockClient) DatasetGetByNames(ctx context.Context, names []string) (map[string]*truenas.Dataset, error) {
+	m.datasetGetByNamesCalls = append(m.datasetGetByNamesCalls, append([]string(nil), names...))
+	return m.MockClient.DatasetGetByNames(ctx, names)
 }
 
 func (m *PaginatedMockClient) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*truenas.Dataset, error) {

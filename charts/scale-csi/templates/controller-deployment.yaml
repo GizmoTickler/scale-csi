@@ -69,7 +69,17 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.podSecurityContext }}
+      {{- /* Controller pod security context: the shared podSecurityContext
+      deep-merged with the controller-only override (controller keys win, same
+      mergeOverwrite pattern as scale-csi.sidecarSecurityContext). This is what
+      applies the default RuntimeDefault seccomp profile to the controller pod
+      only — the node DaemonSet renders the shared map unchanged because its
+      privileged containers must stay unconfined. */}}
+      {{- $controllerPodSecurityContext := deepCopy (.Values.podSecurityContext | default dict) }}
+      {{- with .Values.controller.podSecurityContext }}
+      {{- $controllerPodSecurityContext = mergeOverwrite $controllerPodSecurityContext . }}
+      {{- end }}
+      {{- with $controllerPodSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}

@@ -19,14 +19,19 @@ var (
 	apiKey   = flag.String("api-key", "", "TrueNAS API key (or set TRUENAS_API_KEY)")
 	insecure = flag.Bool("insecure", false, "Allow insecure TLS connections")
 	timeout  = flag.Duration("timeout", 60*time.Second, "API timeout")
-	command  = flag.String("cmd", "help", "Command to run: help, call, services, service-reload, datasets, iscsi-audit, snapshots")
+	command  = flag.String("cmd", "help", "Command to run: help, call, services, service-reload, datasets, iscsi-audit, nvmeof-audit, snapshots, test-errors")
 	method   = flag.String("method", "", "API method to call (for 'call' command)")
 	params   = flag.String("params", "", "JSON params for API call (for 'call' command)")
 	dataset  = flag.String("dataset", "", "Dataset path for dataset commands")
 	service  = flag.String("service", "", "Service name for service commands")
 	verbose  = flag.Bool("v", false, "Verbose output")
-	cleanup  = flag.Bool("cleanup", false, "Cleanup orphaned resources (for audit commands)")
+	cleanup  = flag.Bool("cleanup", false, "Delete the orphaned resources an audit finds; honored ONLY by the nvmeof-audit command (iscsi-audit is report-only and ignores this flag)")
+	maxOut   = flag.Int64("max-output", defaultMaxOutput, "Maximum bytes of raw 'call' result JSON to print before truncating; 0 or negative means unlimited")
 )
+
+// defaultMaxOutput caps raw 'call' output at 2MiB so an accidental
+// pool.dataset.query against a large system cannot flood the terminal.
+const defaultMaxOutput = 2 * 1024 * 1024
 
 func main() {
 	os.Exit(run())
@@ -106,11 +111,15 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  help           Show this help message")
-	fmt.Println("  call           Make a raw API call (-method required, -params optional)")
+	fmt.Println("  call           Make a raw API call (-method required, -params optional;")
+	fmt.Println("                 output is capped at -max-output bytes, default 2MiB)")
 	fmt.Println("  services       List all services and their status")
 	fmt.Println("  service-reload Reload a service (-service required)")
 	fmt.Println("  datasets       List datasets (-dataset for parent path filter)")
 	fmt.Println("  iscsi-audit    Audit iSCSI targets, extents, and associations")
+	fmt.Println("                 (report-only; does NOT honor -cleanup)")
+	fmt.Println("  nvmeof-audit   Audit NVMe-oF subsystems for orphans; the ONLY command")
+	fmt.Println("                 that honors -cleanup (deletes orphaned pvc-* subsystems)")
 	fmt.Println("  snapshots      List snapshots (-dataset for filter)")
 	fmt.Println("  test-errors    Test various API error responses")
 	fmt.Println()
@@ -121,6 +130,7 @@ func printHelp() {
 	fmt.Println("  debug-api -cmd service-reload -service iscsitarget")
 	fmt.Println("  debug-api -cmd datasets -dataset flashstor/scale-csi")
 	fmt.Println("  debug-api -cmd iscsi-audit")
+	fmt.Println("  debug-api -cmd nvmeof-audit -cleanup")
 	fmt.Println("  debug-api -cmd test-errors")
 }
 
@@ -160,9 +170,21 @@ func cmdCall(ctx context.Context, client *truenas.Client) {
 		os.Exit(1)
 	}
 
-	// Pretty print result
+	// Pretty print result, capped at -max-output bytes so a broad query
+	// cannot flood the terminal.
 	jsonBytes, _ := json.MarshalIndent(result, "", "  ")
-	fmt.Printf("Result:\n%s\n", string(jsonBytes))
+	fmt.Printf("Result:\n%s\n", formatCallOutput(jsonBytes, *maxOut))
+}
+
+// formatCallOutput returns the raw 'call' result JSON, truncated to maxOutput
+// bytes when it is larger. The truncation notice states the total size and how
+// to raise the cap; maxOutput <= 0 disables the cap entirely.
+func formatCallOutput(jsonBytes []byte, maxOutput int64) string {
+	if maxOutput <= 0 || int64(len(jsonBytes)) <= maxOutput {
+		return string(jsonBytes)
+	}
+	return fmt.Sprintf("%s\n... [output truncated: showing first %d of %d bytes; re-run with -max-output %d (or -max-output 0 for unlimited) to see everything]",
+		jsonBytes[:maxOutput], maxOutput, len(jsonBytes), len(jsonBytes))
 }
 
 func cmdServices(ctx context.Context, client *truenas.Client) {

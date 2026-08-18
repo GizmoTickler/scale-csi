@@ -319,10 +319,13 @@ func buildMutableTunableUpdate(ds *truenas.Dataset, tunables map[string]string) 
 
 // applyMutableTunables issues the single diff-derived pool.dataset.update for a
 // volume, returning the list of properties it changed (empty for a no-op, in
-// which case no API call was made). Shared by ControllerModifyVolume and the
-// content-source arm of CreateVolume: a clone/restore accepts no create-time
+// which case no API call was made). Shared by ControllerModifyVolume, the
+// content-source arm of CreateVolume (a clone/restore accepts no create-time
 // property payload, but every mutable tunable is live-tunable, so one update
-// after materialization honors the VolumeAttributesClass there too.
+// after materialization honors the VolumeAttributesClass there too), and
+// createVolumeExisting (a retry that resumes after the post-materialization
+// apply failed must re-apply, or the PVC would bind with recorded attributes
+// the dataset does not carry; the diff makes an already-converged retry free).
 func (d *Driver) applyMutableTunables(ctx context.Context, datasetName string, ds *truenas.Dataset, tunables map[string]string) ([]string, error) {
 	if len(tunables) == 0 {
 		return nil, nil

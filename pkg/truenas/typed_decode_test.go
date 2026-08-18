@@ -74,14 +74,50 @@ func typedDatasets(t testing.TB, payload []byte, resourceQuery bool) []*Dataset 
 	return rawDatasetsToDatasets(items, resourceQuery)
 }
 
+// TestTypedDecodeGoldenDeepEquality pins typed-vs-interface decode equality on
+// wire-shaped fixtures. Snapshot fixture provenance (documented here, on the
+// consuming test, exactly like snapshot-resource-stamped-live-26.0.json does):
+//
+//   - snapshot-resource-26.0.json: shape live-verified 2026-08-18 against
+//     TrueNAS 26.0.0-BETA.2 (nas01) zfs.resource.snapshot.query. On the wire,
+//     user_properties are BARE STRINGS (never {value,source} objects — no
+//     source info exists for snapshot user properties on 26.0, even with
+//     get_source:true), native properties come back as {"raw": "...",
+//     "source": null, "value": <num>} entries, and `properties` is JSON null
+//     when the requested properties list is empty. The truenas-csi:* key
+//     spellings are realistic legacy-era stamps and exercise the decode-time
+//     namespace fold (prop_ns.go).
+//   - pool-snapshot-26.0.json: shape live-verified 2026-08-18 against TrueNAS
+//     26.0.0-BETA.2 (nas01) pool.snapshot.query. On the wire, createtxg is a
+//     STRING (e.g. "4523837"), there is NO user_properties key at all, and
+//     properties is an empty dict {}.
 func TestTypedDecodeGoldenDeepEquality(t *testing.T) {
 	t.Run("snapshot_resource", func(t *testing.T) {
 		payload := readTypedFixture(t, "snapshot-resource-26.0.json")
 		require.Equal(t, interfaceSnapshots(t, payload, true), typedSnapshots(t, payload, true))
+
+		// Pin the live 26.0 wire facts the fixture now carries.
+		snapshots := typedSnapshots(t, payload, true)
+		require.Len(t, snapshots, 2)
+		assert.Equal(t, UserProperty{Value: "from-user-properties"},
+			snapshots[0].UserProperties["scale-csi:managed"],
+			"bare-string user property must decode with empty Source and fold to the canonical namespace")
+		assert.NotContains(t, snapshots[0].UserProperties, "truenas-csi:managed")
+		assert.Equal(t, int64(2723840), snapshots[0].GetSnapshotSize())
+		assert.Equal(t, int64(1754693322), snapshots[0].GetCreationTime())
+		assert.NotNil(t, snapshots[1].Properties, "wire `properties: null` must decode to an empty map, not nil")
+		assert.Empty(t, snapshots[1].Properties)
 	})
 	t.Run("pool_snapshot", func(t *testing.T) {
 		payload := readTypedFixture(t, "pool-snapshot-26.0.json")
 		require.Equal(t, interfaceSnapshots(t, payload, false), typedSnapshots(t, payload, false))
+
+		// Pin the live 26.0 wire facts the fixture now carries.
+		snapshots := typedSnapshots(t, payload, false)
+		require.Len(t, snapshots, 1)
+		assert.Equal(t, uint64(987656), snapshots[0].CreateTXG, "string createtxg must parse")
+		assert.Empty(t, snapshots[0].UserProperties, "pool.snapshot.query returns no user_properties key")
+		assert.Empty(t, snapshots[0].Properties)
 	})
 	t.Run("dataset_resource", func(t *testing.T) {
 		payload := readTypedFixture(t, "dataset-resource-26.0.json")
@@ -101,7 +137,87 @@ func TestTypedDecodeGoldenDeepEquality(t *testing.T) {
 }
 
 func TestTypedSnapshotPreservesGenericPropertyShapeAndPrecedence(t *testing.T) {
-	payload := readTypedFixture(t, "snapshot-resource-26.0.json")
+	// DECODER-TOLERANCE INPUT, NOT A LIVE 26.0 SHAPE. Live probes (2026-08-18,
+	// TrueNAS 26.0.0-BETA.2) proved zfs.resource.snapshot.query returns
+	// user_properties as BARE STRINGS — {value,source} objects never appear on
+	// the wire, so the wire fixture (snapshot-resource-26.0.json) no longer
+	// carries them. This inline payload (the pre-2026-08-18 hand-built fixture
+	// content) stays here purely to pin that the decoder TOLERATES the object
+	// shape: {value,source} user_properties (with the flat-string form mixed
+	// in), namespaced keys inside `properties`, user_properties precedence
+	// over a same-key properties entry, and the legacy
+	// value/rawvalue/parsed/{"$date"} property dicts must all keep decoding —
+	// and namespace-folding — exactly as before.
+	payload := []byte(`[
+	  {
+	    "name": "flashstor/csi/volumes/pvc-a@snapshot-a",
+	    "snapshot_name": "snapshot-a",
+	    "dataset": "flashstor/csi/volumes/pvc-a",
+	    "pool": "flashstor",
+	    "type": "SNAPSHOT",
+	    "createtxg": 987654,
+	    "properties": {
+	      "used": {
+	        "value": 2723840,
+	        "raw": "2723840",
+	        "source": "LOCAL"
+	      },
+	      "creation": {
+	        "value": 1754693322,
+	        "raw": "1754693322",
+	        "source": "LOCAL"
+	      },
+	      "clones": {
+	        "value": "flashstor/csi/volumes/clone-a",
+	        "source": "LOCAL"
+	      },
+	      "truenas-csi:managed": {
+	        "value": "from-properties",
+	        "source": "LOCAL"
+	      }
+	    },
+	    "user_properties": {
+	      "truenas-csi:managed": {
+	        "value": "from-user-properties",
+	        "source": "INHERITED"
+	      },
+	      "truenas-csi:flat": "flat-value"
+	    }
+	  },
+	  {
+	    "id": "flashstor/csi/volumes/pvc-b@snapshot-b",
+	    "name": "snapshot-b",
+	    "dataset": "flashstor/csi/volumes/pvc-b",
+	    "pool": "flashstor",
+	    "type": "SNAPSHOT",
+	    "createtxg": "987655",
+	    "properties": {
+	      "used": {
+	        "value": 4096,
+	        "rawvalue": "4096",
+	        "parsed": 4096,
+	        "source": "LOCAL"
+	      },
+	      "creation": {
+	        "value": "1754693399",
+	        "rawvalue": "1754693399",
+	        "parsed": {
+	          "$date": 1754693399000
+	        },
+	        "source": "LOCAL"
+	      }
+	    },
+	    "user_properties": {
+	      "truenas-csi:driver_instance": {
+	        "value": "cluster-a",
+	        "source": "LOCAL"
+	      }
+	    }
+	  }
+	]`)
+	// The typed decoder must also stay deep-equal to the interface decoder on
+	// this off-wire shape (coverage previously provided via the fixture).
+	require.Equal(t, interfaceSnapshots(t, payload, true), typedSnapshots(t, payload, true))
 	snapshots := typedSnapshots(t, payload, true)
 	require.NotEmpty(t, snapshots)
 	snapshot := snapshots[0]
@@ -120,6 +236,17 @@ func TestTypedSnapshotPreservesGenericPropertyShapeAndPrecedence(t *testing.T) {
 	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:flat", "legacy key must be folded out of UserProperties")
 	assert.Equal(t, int64(2723840), snapshot.GetSnapshotSize())
 	assert.Equal(t, int64(1754693322), snapshot.GetCreationTime())
+
+	// Second entry: object-shaped user property with a source, string
+	// createtxg, and the legacy value/rawvalue/parsed/{"$date"} dicts.
+	require.Len(t, snapshots, 2)
+	legacy := snapshots[1]
+	assert.Equal(t, UserProperty{Value: "cluster-a", Source: "LOCAL"},
+		legacy.UserProperties["scale-csi:driver_instance"])
+	assert.NotContains(t, legacy.UserProperties, "truenas-csi:driver_instance", "legacy key must be folded out of UserProperties")
+	assert.Equal(t, uint64(987655), legacy.CreateTXG)
+	assert.Equal(t, int64(4096), legacy.GetSnapshotSize())
+	assert.Equal(t, int64(1754693399), legacy.GetCreationTime())
 }
 
 func TestRawResultToInterfacePreservesPublicJSONTypes(t *testing.T) {
@@ -406,8 +533,9 @@ func FuzzTypedDatasetDecodeMatchesInterface(f *testing.F) {
 // TestLiveCapturedStampedSnapshotFixtureDecodes pins the decode behavior for a
 // fixture captured VERBATIM from a live TrueNAS-26.0.0-BETA.2
 // zfs.resource.snapshot.query response (2026-08-17, scoped write probe against
-// nas01; see the P1 snapshot-handle work). Two wire facts it proves that the
-// hand-built snapshot-resource-26.0.json fixture does not:
+// nas01; see the P1 snapshot-handle work). It is the reference capture the
+// hand-built snapshot-resource-26.0.json fixture was realigned to on
+// 2026-08-18 (fixture-hygiene finding E-1). Two wire facts it proves:
 //
 //  1. Snapshot user_properties arrive as BARE STRINGS (no {value, source}
 //     object and therefore NO source information), so any snapshot-side logic

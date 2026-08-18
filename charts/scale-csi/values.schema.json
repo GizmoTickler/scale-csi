@@ -773,6 +773,10 @@
         "containerSecurityContext": {
           "$ref": "#/definitions/freeObject"
         },
+        "podSecurityContext": {
+          "description": "Controller-only pod-level security context, deep-merged over the shared podSecurityContext (controller keys win). Defaults to seccompProfile RuntimeDefault; the node DaemonSet deliberately gets no pod-level seccomp profile.",
+          "$ref": "#/definitions/freeObject"
+        },
         "resources": {
           "type": "object",
           "default": {

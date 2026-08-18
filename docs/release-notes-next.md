@@ -33,6 +33,60 @@
   and `org.scale.csi.nvmeof` instead (protocol selection normally comes from
   StorageClass parameters).
 
+## Adversarial review round 2 — performance, correctness and hardening batch
+
+All seven findings from the second adversarial review pass, grounded in live
+measurements against nas01 (TrueNAS 26.0.0-BETA.2, 2026-08-18):
+
+- **CreateSnapshot uniqueness probe (P-1):** the 26.0 leg of
+  `SnapshotFindByName` no longer transfers the entire recursive snapshot set
+  under the CSI parent (~650 ms and >1 MB at 576 snapshots, linear growth) per
+  CreateSnapshot. It now issues a parent-scoped server-side
+  `pool.snapshot.query` name probe (~330 ms flat, ~300 bytes; live-verified)
+  and, only on a hit, one targeted `zfs.resource.snapshot.query` (~2 ms) for
+  the identity properties. Any probe error falls back to the old scan
+  unchanged. Every caller benefits (uniqueness check, resolver scan fallback);
+  API-call budgets are unchanged.
+- **Fixed: clone-retry mutable-parameter gap (H-1).** If applying
+  VolumeAttributesClass `mutable_parameters` failed after a clone/restore
+  volume materialized, the provisioner's retry previously resumed through the
+  existing-volume path and bound the PVC with recorded attributes that
+  silently disagreed with the dataset. The retry path now re-applies the
+  resolved tunables through the same diff (a converged or parameterless retry
+  still costs zero extra API calls); apply failure remains fatal.
+- **ListVolumes overhaul (P-2/P-3):** ListVolumes no longer runs the
+  user-property-filtered `pool.dataset.query`, whose cost scaled with TOTAL
+  system dataset count (live-measured 4.2x slowdown of the same 47-row result
+  after adding 300 unrelated datasets). A walk now performs one path-scoped
+  managed listing (the reconciler's read), freezes a name-sorted 30-second
+  view for stable pagination (offset pages can no longer skip or duplicate
+  volumes under create/delete churn), and hydrates only the returned page via
+  one id-filtered `DatasetGetByNames` — which also carries the encryption
+  fields the locked-volume health condition needs.
+- **New capability: `LIST_VOLUMES_PUBLISHED_NODES` (F-1).** ListVolumes
+  entries now report `published_node_ids`, sourced from the durable
+  publication records already present in the hydrated page read — zero extra
+  API calls. Records in `unpublishing` state are included (backend access may
+  still exist); records without CSI node-id provenance are conservatively
+  omitted.
+- **Backend scaling envelope documented (P-4):** `docs/production.md` now
+  documents that `pool.dataset.*` mutations and user-property-filtered queries
+  scale with the NAS's total dataset count (property write 436 ms at 73
+  datasets → ~1.9 s at 373; snapshot operations unaffected at ~2–24 ms), with
+  operational sizing guidance. Also pinned in code: `pool.dataset.query`
+  `count:true` ignores filters on 26.0.0-BETA.2 — never use it for filtered
+  counting.
+- **Hardening (H-2/H-3/H-4):** the opt-in debug endpoint's values.yaml docs
+  now carry an explicit unauthenticated-endpoint warning plus a copy-paste
+  NetworkPolicy example; the controller pod defaults to
+  `seccompProfile: RuntimeDefault` (operator-overridable; the privileged node
+  DaemonSet is deliberately left alone); `debug-api` gained a 2 MiB output cap
+  (`-max-output`) and accurate `-cleanup` scoping in its help text.
+- **Fixture hygiene (E-1):** the two hand-built 26.0 wire fixtures were
+  realigned to live-captured shapes (bare-string snapshot user properties,
+  string `createtxg` on `pool.snapshot.query`, `properties: null`); decoder
+  shape-tolerance coverage is retained via inline test inputs.
+
 ## VolumeAttributesClass — CSI MODIFY_VOLUME
 
 - **`ControllerModifyVolume` implemented and advertised:** operators can retune

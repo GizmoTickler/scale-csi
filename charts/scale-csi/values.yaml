@@ -235,6 +235,17 @@ controller:
       drop:
         - ALL
 
+  # Controller-only pod-level security context, deep-merged OVER the shared
+  # podSecurityContext (keys set here win). The controller runs no privileged
+  # containers, so it defaults to the RuntimeDefault seccomp profile. The node
+  # DaemonSet deliberately does NOT get this default: its driver container is
+  # privileged (privileged implies unconfined seccomp) and a pod-level profile
+  # there risks breaking iSCSI/NVMe host tooling. Override or empty this map to
+  # change/remove the controller profile.
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
+
   # Resource requests/limits for the controller driver container
   resources:
     requests:
@@ -1028,8 +1039,13 @@ sidecars:
   # LIST_VOLUMES, external-health-monitor v0.18.0 drives the ListVolumes path and
   # reads Entry.Status.VolumeCondition; it does NOT also issue per-PV
   # ControllerGetVolume (it picks ListVolumes OR per-PV ControllerGetVolume, never
-  # both). So the background load is ONE periodic ListVolumes (a single
-  # pool.dataset.query) per interval, NOT part of the request-path golden totals.
+  # both). So the background load is ONE periodic ListVolumes walk per interval:
+  # one path-scoped listing (zfs.resource.query; paged pool.dataset.query
+  # fallback) frozen for 30s so continuation pages are stable under churn, plus
+  # one id-filtered pool.dataset.query hydration per returned page. The same
+  # hydrated reads also populate each entry's PublishedNodeIds
+  # (LIST_VOLUMES_PUBLISHED_NODES) at no extra call. NOT part of the
+  # request-path golden totals.
   # `interval` renders both --list-volumes-interval (the ACTIVE cadence for this
   # driver) and --monitor-interval (the fallback cadence used only by a driver
   # that lacks LIST_VOLUMES). Image tag is pinned (G2: v0.18.0 is the current
@@ -1067,7 +1083,11 @@ rbac:
   # Create RBAC resources
   create: true
 
-# Pod security context
+# Pod security context shared by the controller Deployment, node DaemonSet,
+# and reconcile CronJob. The controller pod additionally deep-merges
+# controller.podSecurityContext over this map (controller keys win), which is
+# how it gains its default RuntimeDefault seccomp profile without touching the
+# privileged node pods.
 podSecurityContext:
   runAsNonRoot: false  # Required for mount operations
   fsGroup: 0
@@ -1094,6 +1114,56 @@ health:
 # loopback bind such as "127.0.0.1:6060" and reach it with
 # `kubectl port-forward` (or `kubectl exec` + curl), or guard a non-loopback
 # port with a NetworkPolicy. This chart never exposes it through a Service.
+#
+# WARNING: there is NO authentication, authorization, or TLS on this endpoint —
+# anything that can reach the port can pull heap/goroutine/CPU profiles and the
+# /debug/state runtime dump, and pprof CPU/trace captures also cost real CPU.
+# NEVER bind it beyond loopback (anything other than 127.0.0.1/localhost/::1)
+# unless a NetworkPolicy denies ingress to the port from everything except an
+# explicitly labeled debug client. The driver only WARNS at startup on a
+# non-loopback bind; it does not refuse it. Preferred setup remains
+# listenAddress "127.0.0.1:6060" + `kubectl port-forward`, which needs no
+# policy at all.
+#
+# Example NetworkPolicy for a guarded non-loopback bind (copy, adjust names/
+# labels/port, and apply it BEFORE setting a non-loopback listenAddress).
+# It selects the controller pod and allows ingress to the debug port only from
+# pods labeled scale-csi-debug-client=true in the namespace labeled
+# kubernetes.io/metadata.name=<your-admin-namespace>; all other ingress to
+# that port is denied (provided your CNI enforces NetworkPolicy):
+#
+#   apiVersion: networking.k8s.io/v1
+#   kind: NetworkPolicy
+#   metadata:
+#     name: scale-csi-debug-endpoint
+#     namespace: <release-namespace>
+#   spec:
+#     podSelector:
+#       matchLabels:
+#         app.kubernetes.io/name: scale-csi
+#         app.kubernetes.io/component: controller
+#     policyTypes:
+#       - Ingress
+#     ingress:
+#       # Keep the always-on health (9808) and metrics/readiness (9809) ports
+#       # reachable by kubelet probes and scrapers (an empty "from" allows all
+#       # sources for these ports only).
+#       - ports:
+#           - protocol: TCP
+#             port: 9808
+#           - protocol: TCP
+#             port: 9809
+#       # Debug port: ONLY labeled debug-client pods from the admin namespace.
+#       - from:
+#           - namespaceSelector:
+#               matchLabels:
+#                 kubernetes.io/metadata.name: <your-admin-namespace>
+#             podSelector:
+#               matchLabels:
+#                 scale-csi-debug-client: "true"
+#         ports:
+#           - protocol: TCP
+#             port: 6060
 debug:
   listenAddress: ""
 

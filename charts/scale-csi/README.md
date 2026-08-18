@@ -407,6 +407,7 @@ Operator caveats:
 | `controller.podDisruptionBudget.minAvailable` | PDB minimum available | `""` |
 | `controller.podDisruptionBudget.maxUnavailable` | PDB maximum unavailable | `1` |
 | `controller.containerSecurityContext` | Controller driver container security context | non-root UID 65532, read-only root filesystem, no capabilities |
+| `controller.podSecurityContext` | Controller-only pod security context, deep-merged over the shared `podSecurityContext` (controller keys win); the node DaemonSet deliberately gets no pod-level seccomp profile | `{seccompProfile: {type: RuntimeDefault}}` |
 | `controller.resources` | Controller driver resources | requests `10m` CPU, `32Mi` memory; memory limit `256Mi` |
 | `node.enabled` | Deploy the node DaemonSet | `true` |
 | `node.priorityClassName` | Node priority class | `system-node-critical` |

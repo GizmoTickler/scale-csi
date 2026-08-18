@@ -380,6 +380,46 @@ cut short at `requestTimeout`. In the worst case all `maxConcurrentRequests` slo
 be held by deadline-bearing calls for the length of their sidecar timeout; size the
 semaphore and sidecar timeouts accordingly.
 
+### Backend scaling envelope: dataset-count sensitivity of `pool.dataset.*` mutations
+
+`pool.dataset.*` calls slow down with the **total number of datasets on the
+NAS**, not with the dataset being touched. Live measurements (2026-08-18,
+TrueNAS 26.0.0-BETA.2, single warm WebSocket connection, connection overhead
+excluded) comparing a 73-dataset system against the same system inflated to
+373 datasets:
+
+| Operation | 73 datasets | 373 datasets | Slowdown |
+|-----------|------------:|-------------:|---------:|
+| One user-property write (`pool.dataset.update` with `user_properties_update`, one key) | 436ms | ~1.9s | 4.3x |
+| `pool.dataset.create` + `pool.dataset.delete` pair | ~1.2s | ~3.2s | ~2.7x |
+| `pool.dataset.query` with a user-property filter returning the **same 47 rows** | 152ms | ~630ms | 4.2x |
+| Snapshot create with inline properties | ~24ms | ~24ms | unaffected |
+| Targeted `zfs.resource.snapshot.query` | ~2ms | ~2ms | unaffected |
+
+The query row is the tell: returning the identical 47 rows slowed 4.2x purely
+because unrelated datasets existed — `pool.dataset.query` materializes user
+properties for the whole system on every call. The snapshot rows prove the cost
+lives in the TrueNAS middleware layer, not in ZFS: snapshot operations bypass
+that layer and stay flat. Operationally:
+
+- Attach and detach latency grows with the NAS's total dataset count,
+  **including datasets that have nothing to do with CSI**. At the driver's
+  current golden API budgets, `ControllerPublishVolume` is one property write
+  (~2s at 373 datasets; extrapolating, ~5s at 1000),
+  `ControllerUnpublishVolume` is two writes, and a fresh NFS `CreateVolume` is
+  one create plus two updates. Plan pool layout accordingly: avoid co-locating
+  the CSI parent with thousands of unrelated datasets on the same appliance,
+  and size sidecar timeouts for the dataset population you expect.
+- Snapshot-heavy workflows are **not** affected; snapshot creation and the
+  targeted snapshot reads sidestep the bottleneck entirely.
+- This is TrueNAS middleware behavior worth an upstream report, not
+  driver-fixable overhead: the driver's per-operation API call budgets are
+  already pinned at their proven floors by the golden API-call-count tests
+  (`pkg/driver/api_call_count_test.go`; see the
+  [architecture doc's round-trip table](architecture.md#api-call-cost-golden-round-trip-counts)),
+  so each unavoidable `pool.dataset.*` round trip simply costs what the
+  middleware charges for it.
+
 ### HTTP health-check cache
 
 `health.cacheTTL` controls how long `/readyz` and `/health` reuse the last
@@ -473,9 +513,36 @@ backend loss.
   snapshot classes.
 - The node driver is intentionally privileged with `SYS_ADMIN`, host PID/network
   access, hostPath mounts, and bidirectional mount propagation. The shared pod
-  security context runs as root (`runAsNonRoot: false`, `fsGroup: 0`), and the
-  chart does not set a seccomp profile. Isolate the namespace, enforce image
-  provenance, and restrict who can alter the DaemonSet or its service account.
+  security context runs as root (`runAsNonRoot: false`, `fsGroup: 0`). The
+  controller pod defaults to `seccompProfile: {type: RuntimeDefault}`
+  (overridable via `controller.podSecurityContext`); the node DaemonSet
+  deliberately gets no pod-level seccomp profile because its privileged
+  containers run unconfined anyway and a pod-level profile could break the
+  iSCSI/NVMe host tooling. Isolate the namespace, enforce image provenance,
+  and restrict who can alter the DaemonSet or its service account.
+
+### Debug endpoint (`debug.listenAddress`)
+
+The opt-in debug HTTP endpoint (Go pprof profiles plus the `/debug/state`
+runtime dump) is disabled by default and **unauthenticated by design** — there
+is no auth, no TLS, and the chart never exposes it through a Service. The bind
+address is the entire access control, and the driver only *warns* at startup
+on a non-loopback bind; it does not refuse one.
+
+- Preferred: keep `debug.listenAddress` at a loopback bind such as
+  `127.0.0.1:6060` and reach it with `kubectl port-forward` (or `kubectl exec`
+  + curl). Loopback binds need no network policy at all.
+- Never expose the endpoint beyond loopback without a NetworkPolicy that
+  denies ingress to the debug port from everything except an explicitly
+  labeled debug client. A copy-paste example policy (ingress deny to the debug
+  port except from a labeled pod in a labeled namespace, while keeping the
+  health/metrics ports open for kubelet probes and scrapers) is included in the
+  `debug.listenAddress` documentation block in
+  [`charts/scale-csi/values.yaml`](../charts/scale-csi/values.yaml). Apply the
+  policy *before* setting a non-loopback `listenAddress`, and remember that a
+  NetworkPolicy only helps when the CNI enforces it.
+- Treat anything that can reach the port as able to pull heap/goroutine/CPU
+  profiles and the runtime state dump, and to burn CPU with profile captures.
 
 ## Monitoring
 
@@ -498,7 +565,14 @@ The optional external health-monitor sidecar
 PVC Events from controller-side volume conditions. Because this driver advertises
 `LIST_VOLUMES`, that sidecar uses one periodic `ListVolumes` path rather than
 per-PV `ControllerGetVolume`, so it observes the **controller/`ListVolumes`**
-condition above — not node stale mounts or the data path. Node-side
+condition above — not node stale mounts or the data path. Each `ListVolumes`
+walk costs one path-scoped listing (`zfs.resource.query`, with a paged
+`pool.dataset.query` fallback) frozen into a 30-second view so continuation
+pages stay stable under create/delete churn, plus one id-filtered
+`pool.dataset.query` hydration per returned page — the read that carries the
+encryption/lock fields the condition needs. The same hydrated page also
+populates each entry's `PublishedNodeIds` (`LIST_VOLUMES_PUBLISHED_NODES`) from
+the volume's publication records at no extra API cost. Node-side
 `VolumeCondition` delivery depends on Kubernetes/kubelet's separate **alpha**
 volume-health path and feature gating; enabling this controller sidecar alone
 does not provide it. The sidecar's `interval` drives both its list-volumes and
