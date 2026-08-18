@@ -89,8 +89,10 @@ func typedDatasets(t testing.TB, payload []byte, resourceQuery bool) []*Dataset 
 //     namespace fold (prop_ns.go).
 //   - pool-snapshot-26.0.json: shape live-verified 2026-08-18 against TrueNAS
 //     26.0.0-BETA.2 (nas01) pool.snapshot.query. On the wire, createtxg is a
-//     STRING (e.g. "4523837"), there is NO user_properties key at all, and
-//     properties is an empty dict {}.
+//     STRING (e.g. "4523837"), there is NO user_properties key at all,
+//     properties is an empty dict {}, holds is an empty dict {}, and BOTH `id`
+//     and `name` carry the FULL dataset@snapshot path — the short name lives
+//     only in `snapshot_name`.
 func TestTypedDecodeGoldenDeepEquality(t *testing.T) {
 	t.Run("snapshot_resource", func(t *testing.T) {
 		payload := readTypedFixture(t, "snapshot-resource-26.0.json")
@@ -118,6 +120,12 @@ func TestTypedDecodeGoldenDeepEquality(t *testing.T) {
 		assert.Equal(t, uint64(987656), snapshots[0].CreateTXG, "string createtxg must parse")
 		assert.Empty(t, snapshots[0].UserProperties, "pool.snapshot.query returns no user_properties key")
 		assert.Empty(t, snapshots[0].Properties)
+		// Wire `name` is the FULL dataset@snapshot path (identical to `id`);
+		// the decoders must resolve ID from it and take the SHORT name from
+		// `snapshot_name`, never surface the full path as the snapshot name.
+		assert.Equal(t, "flashstor/csi/volumes/pvc-c@snapshot-c", snapshots[0].ID)
+		assert.Equal(t, "snapshot-c", snapshots[0].Name)
+		assert.Equal(t, "flashstor/csi/volumes/pvc-c", snapshots[0].Dataset)
 	})
 	t.Run("dataset_resource", func(t *testing.T) {
 		payload := readTypedFixture(t, "dataset-resource-26.0.json")

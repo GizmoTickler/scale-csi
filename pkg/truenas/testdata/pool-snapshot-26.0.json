@@ -1,11 +1,13 @@
 [
   {
     "id": "flashstor/csi/volumes/pvc-c@snapshot-c",
-    "name": "snapshot-c",
+    "name": "flashstor/csi/volumes/pvc-c@snapshot-c",
     "dataset": "flashstor/csi/volumes/pvc-c",
+    "snapshot_name": "snapshot-c",
     "pool": "flashstor",
     "type": "SNAPSHOT",
     "createtxg": "987656",
+    "holds": {},
     "properties": {}
   }
 ]
