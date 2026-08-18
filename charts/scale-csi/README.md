@@ -133,13 +133,13 @@ provide the same singleton, non-overlapping controller guarantee.
 Existing driver-managed datasets from older versions do not have an ownership
 stamp. On a legitimate same-name `CreateVolume` retry, the driver automatically
 backfills and verifies the stamp only when both local legacy markers
-(`truenas-csi:managed_resource=true` and the matching
-`truenas-csi:csi_volume_name`) are
+(`scale-csi:managed_resource=true` and the matching
+`scale-csi:csi_volume_name`) are
 present. A present-but-different owner is always rejected. For datasets without
 those local markers, deliberate manual adoption remains available, for example:
 
 ```bash
-zfs set 'truenas-csi:driver_instance_id=csi.scale.io@tank/k8s/volumes' \
+zfs set 'scale-csi:driver_instance_id=csi.scale.io@tank/k8s/volumes' \
   tank/k8s/volumes/pvc-example
 ```
 

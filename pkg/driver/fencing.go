@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	publicationPropertyPrefix = "truenas-csi:publication_"
+	publicationPropertyPrefix = "scale-csi:publication_"
 	publicationRecordVersion  = 1
 	publicationStatePublished = "published"
 	publicationStateRemoving  = "unpublishing"

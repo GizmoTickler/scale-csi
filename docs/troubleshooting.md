@@ -271,7 +271,7 @@ generation). If it persists:
 | `discovery failed` | Can't reach iSCSI portal | Check network connectivity and portal address |
 | `device not found after timeout` | Device didn't appear in time | Increase `deviceWaitTimeout` |
 | `target is busy` | Volume still in use | Ensure all pods using volume are terminated |
-| `already exists` | A backend object with that name already exists | Retry is safe **only** if it is a compatible, fully stamped object owned by this driver instance. Foreign, unstamped, incompatible, or conflicting objects return terminal ownership/compatibility errors by design — inspect the object's `truenas-csi:*` ownership properties and resolve the name collision; do **not** blindly retry, and do not delete/rename the backend object to force success |
+| `already exists` | A backend object with that name already exists | Retry is safe **only** if it is a compatible, fully stamped object owned by this driver instance. Foreign, unstamped, incompatible, or conflicting objects return terminal ownership/compatibility errors by design — inspect the object's `scale-csi:*` ownership properties and resolve the name collision; do **not** blindly retry, and do not delete/rename the backend object to force success |
 | `not found` | Resource doesn't exist | Check TrueNAS for dataset/share existence |
 | `connection lost` | WebSocket disconnected | Will auto-reconnect; check TrueNAS status |
 
@@ -378,7 +378,7 @@ cleanup has its own separate `maxPerRun` invocation.
 #### Tombstones that never drain
 
 A snapshot deleted while it still had dependent clones is renamed to an internal
-tombstone (`truenas-csi:tombstone_*`) and destroyed deferred once the last clone
+tombstone (`scale-csi:tombstone_*`) and destroyed deferred once the last clone
 releases it. The reaper normally acts on tombstones through its durable ledger.
 If ledger entries were lost (for example a pre-v1.2.30 controller that never
 recorded them), the tombstone-shaped snapshots can strand. Two provenance belts
@@ -405,8 +405,15 @@ inspection and are never destroyed automatically.
 You can inspect the same managed-resource boundary on TrueNAS with:
 
 ```bash
-zfs list -o name,truenas-csi:managed_resource -r <pool>
+zfs list -o name,scale-csi:managed_resource -r <pool>
 ```
+
+> **Legacy property spelling:** volumes and snapshots created before v1.10.0 may
+> still carry these properties under the older `truenas-csi:*` spelling. The
+> driver reads both spellings equivalently; datasets are re-stamped to
+> `scale-csi:*` automatically by the reconciler, but pre-rename **snapshots**
+> keep the legacy keys on disk (TrueNAS 26.0 has no snapshot property mutation
+> API), so check both spellings when inspecting snapshots by hand.
 
 > **DANGER:** never share one configured `zfs.parentDataset` between Kubernetes
 > clusters. Reconcile cannot see handles owned by the other cluster and would

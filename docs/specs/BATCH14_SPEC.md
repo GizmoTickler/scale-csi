@@ -85,7 +85,7 @@ offers no server-side name filter or pagination, so every `SnapshotFindByName` /
 `SnapshotListAll` / recursive `SnapshotGet` (pkg/truenas/snapshot.go:468-535,
 `paginateSnapshots` :587) transfers EVERY snapshot under the CSI parent with
 `get_user_properties:true` — currently 29.2 MB JSON per call (289 snapshots), because
-each snapshot inherits ~45 `truenas-csi:tombstone_*` ledger blobs + markers from the
+each snapshot inherits ~45 `scale-csi:tombstone_*` ledger blobs + markers from the
 parent dataset. `listAllManagedSnapshots` (pkg/driver/reconcile.go:905) re-fetches and
 re-sorts that full payload PER 100-ITEM PAGE → O(N²) per reconcile pass; hourly
 VolSync churn makes this >1 GB/hour of middleware JSON at 16 volumes.

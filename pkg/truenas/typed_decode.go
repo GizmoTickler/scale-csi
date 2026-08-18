@@ -160,6 +160,7 @@ func (snapshot *rawSnapshot) toSnapshot() *Snapshot {
 			result.UserProperties[key] = userProperty
 		}
 	}
+	normalizeCSIUserProperties(result.UserProperties)
 	return result
 }
 
@@ -263,6 +264,7 @@ func (dataset *rawDataset) toDataset(resourceQuery bool) *Dataset {
 			result.UserProperties[key] = property.toUserProperty()
 		}
 	}
+	result.LegacyCSIProperties = normalizeCSIUserProperties(result.UserProperties)
 	return result
 }
 

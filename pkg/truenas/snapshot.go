@@ -720,8 +720,10 @@ func (c *Client) SnapshotRemoveUserProperties(ctx context.Context, snapshotID st
 	if resourceAPI {
 		return nil
 	}
+	// Legacy backends can really remove: widen canonical scale-csi:* keys to
+	// their truenas-csi:* twins so pre-rename snapshot stamps go too.
 	params := map[string]interface{}{
-		"user_properties_remove": keys,
+		"user_properties_remove": expandCSIPropertyRemovalKeys(keys),
 	}
 
 	_, err := c.Call(ctx, c.snapshotMethod("update"), snapshotID, params)
@@ -1090,6 +1092,7 @@ func parseSnapshot(data interface{}) (*Snapshot, error) {
 			}
 		}
 	}
+	normalizeCSIUserProperties(snap.UserProperties)
 
 	return snap, nil
 }

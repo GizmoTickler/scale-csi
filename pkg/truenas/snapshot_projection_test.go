@@ -190,8 +190,10 @@ func TestSnapshotProjectionCarriesTheFieldsGuardsRead(t *testing.T) {
 	assert.Equal(t, int64(4096), snap.GetSnapshotSize(), "used is projected and decodes")
 	assert.Equal(t, "snap-1", snap.Name)
 	assert.Equal(t, "flashstor/parent/gf1v-src", snap.Dataset)
-	require.Contains(t, snap.UserProperties, "truenas-csi:managed_resource",
+	require.Contains(t, snap.UserProperties, "scale-csi:managed_resource",
 		"get_user_properties is always true; user properties are not part of the projection")
+	assert.NotContains(t, snap.UserProperties, "truenas-csi:managed_resource",
+		"legacy-spelled wire key must be folded onto the canonical namespace")
 
 	// And the negative half: a property the driver does NOT project is absent, so
 	// nothing may quietly grow a dependency on it. GetClones degrades to the

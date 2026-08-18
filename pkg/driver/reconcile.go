@@ -131,9 +131,15 @@ type ReconcileReport struct {
 	DeletedTombstones          []string
 	DeletedRemnants            []string
 	AdoptedStamps              []string
-	SkippedDeletes             []ReconcileActionFailure
-	DeleteEnabled              bool
-	AdoptedStampCount          int
+	// MigratedPropertyNamespaces lists the volumes whose LOCAL legacy
+	// truenas-csi:* stamps were re-written under the canonical scale-csi:
+	// namespace this pass (see migrateLegacyPropertyNamespace). Like stamp
+	// adoption this write runs in detection mode and is capped per pass.
+	MigratedPropertyNamespaces     []string
+	SkippedDeletes                 []ReconcileActionFailure
+	DeleteEnabled                  bool
+	AdoptedStampCount              int
+	MigratedPropertyNamespaceCount int
 }
 
 // CapSkippedDeletes counts guarded deletes that were skipped only because the
@@ -197,6 +203,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		})
 		sort.Slice(report.RemnantVolumes, func(i, j int) bool { return report.RemnantVolumes[i].ID < report.RemnantVolumes[j].ID })
 		sort.Strings(report.AdoptedStamps)
+		sort.Strings(report.MigratedPropertyNamespaces)
 		report.OrphanVolumeCount = len(report.OrphanVolumes)
 		report.OrphanSnapshotCount = len(report.OrphanSnapshots)
 		report.SpentRestoreSnapshotCount = len(report.SpentRestoreSnapshots)
@@ -204,6 +211,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		report.ManualRecoveryTombstoneCount = len(report.ManualRecoveryTombstones)
 		report.RemnantVolumeCount = len(report.RemnantVolumes)
 		report.AdoptedStampCount = len(report.AdoptedStamps)
+		report.MigratedPropertyNamespaceCount = len(report.MigratedPropertyNamespaces)
 		// Publish even a partial pass so a single malformed object cannot freeze
 		// the last visible inventory indefinitely.
 		SetOrphanReconcileMetrics(report)
@@ -338,6 +346,15 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	d.adoptLegacyOwnershipStamps(ctx, datasets, &report, d.config.Reconcile.Delete.MaxPerRun)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		RecordReconcileFailure("stamp_adoption")
+		return report, ctxErr
+	}
+
+	// Legacy property-namespace migration (always-on; NOT gated by opts.Delete,
+	// same contract as stamp adoption above). Re-stamps LOCAL truenas-csi:*
+	// properties under the canonical scale-csi: namespace, capped per pass.
+	d.migrateLegacyPropertyNamespace(ctx, datasets, &report, d.config.Reconcile.Delete.MaxPerRun)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		RecordReconcileFailure("property_namespace_migration")
 		return report, ctxErr
 	}
 

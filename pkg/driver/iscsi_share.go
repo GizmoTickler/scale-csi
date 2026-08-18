@@ -490,7 +490,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	// the geometry a new one may be created at, were both resolved in step 1
 	// before any backend object was touched.
 	if extent == nil {
-		comment := fmt.Sprintf("truenas-csi: %s", datasetName)
+		comment := fmt.Sprintf("scale-csi: %s", datasetName)
 		var lastErr error
 
 		for attempt := 0; attempt < defaultShareRetryAttempts; attempt++ {

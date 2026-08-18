@@ -25,30 +25,30 @@ import (
 
 // ZFS property names for tracking CSI resources
 const (
-	PropManagedResource  = "truenas-csi:managed_resource"
-	PropDriverInstanceID = "truenas-csi:driver_instance_id"
+	PropManagedResource  = "scale-csi:managed_resource"
+	PropDriverInstanceID = "scale-csi:driver_instance_id"
 	// PropDriverInstanceIDAdopted marks an ownership stamp written by legacy
 	// reconciliation rather than by createDataset. It keeps adoption useful for
 	// cleanup provenance without making pre-existing bytes eligible for a
 	// create-time data-free proof.
-	PropDriverInstanceIDAdopted = "truenas-csi:driver_instance_id_adopted"
-	PropProvisionSuccess        = "truenas-csi:provision_success"
-	PropCSIVolumeName           = "truenas-csi:csi_volume_name"
-	PropShareVolumeContext      = "truenas-csi:csi_share_volume_context"
-	PropVolumeContentSourceType = "truenas-csi:csi_volume_content_source_type"
-	PropVolumeContentSourceID   = "truenas-csi:csi_volume_content_source_id"
-	PropVolumeOriginSnapshot    = "truenas-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
-	PropInternalResource        = "truenas-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
-	PropRequestedSizeBytes      = "truenas-csi:requested_size_bytes"       // requested capacity for quota-less filesystem volumes
+	PropDriverInstanceIDAdopted = "scale-csi:driver_instance_id_adopted"
+	PropProvisionSuccess        = "scale-csi:provision_success"
+	PropCSIVolumeName           = "scale-csi:csi_volume_name"
+	PropShareVolumeContext      = "scale-csi:csi_share_volume_context"
+	PropVolumeContentSourceType = "scale-csi:csi_volume_content_source_type"
+	PropVolumeContentSourceID   = "scale-csi:csi_volume_content_source_id"
+	PropVolumeOriginSnapshot    = "scale-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
+	PropInternalResource        = "scale-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
+	PropRequestedSizeBytes      = "scale-csi:requested_size_bytes"       // requested capacity for quota-less filesystem volumes
 	// PropZFSPerformanceClass records the curated ZFS performance class a volume
 	// was CREATED with. It is the anchor for the create-only property guard: a
 	// later StorageClass edit is compared against this stamp, never re-derived
 	// from the live dataset (whose immutable geometry could not be changed anyway).
 	// Only stamped when a class was requested, so it never appears on volumes
 	// that do not use the feature.
-	PropZFSPerformanceClass       = "truenas-csi:zfs_performance_class"
-	PropCSISnapshotName           = "truenas-csi:csi_snapshot_name"
-	PropCSISnapshotSourceVolumeID = "truenas-csi:csi_snapshot_source_volume_id"
+	PropZFSPerformanceClass       = "scale-csi:zfs_performance_class"
+	PropCSISnapshotName           = "scale-csi:csi_snapshot_name"
+	PropCSISnapshotSourceVolumeID = "scale-csi:csi_snapshot_source_volume_id"
 	// PropCSISnapshotHandle records the DATASET-QUALIFIED CSI snapshot handle
 	// ("<dataset>@<shortName>") a snapshot was CREATED under (PERF: targeted
 	// snapshot lookups). The TrueNAS 26.0 zfs.resource.snapshot.query API has no
@@ -62,23 +62,23 @@ const (
 	// idempotent CreateSnapshot retries. Pre-upgrade snapshots lack it and keep
 	// their legacy short-name handles forever — both formats resolve everywhere
 	// (see resolveSnapshotHandle).
-	PropCSISnapshotHandle   = "truenas-csi:csi_snapshot_handle"
+	PropCSISnapshotHandle   = "scale-csi:csi_snapshot_handle"
 	snapshotTombstoneMarker = "-csi-deleted-"
-	PropNFSShareID          = "truenas-csi:truenas_nfs_share_id"
-	PropISCSITargetID       = "truenas-csi:truenas_iscsi_target_id"
-	PropISCSIExtentID       = "truenas-csi:truenas_iscsi_extent_id"
-	PropISCSITargetExtentID = "truenas-csi:truenas_iscsi_targetextent_id"
-	PropISCSIInitiatorID    = "truenas-csi:truenas_iscsi_initiator_id"
+	PropNFSShareID          = "scale-csi:truenas_nfs_share_id"
+	PropISCSITargetID       = "scale-csi:truenas_iscsi_target_id"
+	PropISCSIExtentID       = "scale-csi:truenas_iscsi_extent_id"
+	PropISCSITargetExtentID = "scale-csi:truenas_iscsi_targetextent_id"
+	PropISCSIInitiatorID    = "scale-csi:truenas_iscsi_initiator_id"
 	// PropISCSIAuthTag stores the iscsi.auth TAG that the target group's auth ref
 	// points at (G1: SCST only emits IncomingUser for tag-keyed refs). It is the
 	// durable link fence/rebuild passes use to re-stamp CHAP without the secret.
-	PropISCSIAuthTag = "truenas-csi:truenas_iscsi_auth_tag"
+	PropISCSIAuthTag = "scale-csi:truenas_iscsi_auth_tag"
 	// PropISCSIAuthMode stores the immutable per-volume auth mode (CHAP or
 	// CHAP_MUTUAL) stamped at CreateVolume. Every later path (fence, volume
 	// context, idempotent replay) reads THIS, never the mutable controller-wide
 	// iscsi.chap.mutual flag, so a global-flag flip cannot downgrade or upgrade an
 	// existing volume and mixed one-way/mutual StorageClasses coexist correctly.
-	PropISCSIAuthMode = "truenas-csi:truenas_iscsi_auth_mode"
+	PropISCSIAuthMode = "scale-csi:truenas_iscsi_auth_mode"
 
 	// PropEncryption records the encryption ALGORITHM a volume was CREATED with
 	// (e.g. "AES-256-GCM"), stamped source==local (GF-Sprint 1). Its PRESENCE is
@@ -94,7 +94,7 @@ const (
 	// reported abnormal even if its stamp was never written. Since the stamp is
 	// written after pool.dataset.create returns, its ABSENCE is not proof of
 	// plaintext — the wire fields are (see datasetSelfKeyedPassphrase).
-	PropEncryption = "truenas-csi:encryption"
+	PropEncryption = "scale-csi:encryption"
 
 	// Block-protocol tuning (GF-Sprint 4) persisted per volume. The resolved
 	// per-StorageClass options are stamped here at CreateVolume so EVERY later
@@ -120,20 +120,20 @@ const (
 	// is a credential policy a clone must never inherit; block geometry
 	// describes the DATA layout, which a ZFS clone shares byte-for-byte with its
 	// source, so inheriting it is both correct and the safe direction.
-	PropBlockISCSIBlocksize      = "truenas-csi:block_blocksize"
-	PropBlockISCSIPblocksize     = "truenas-csi:block_pblocksize"
-	PropBlockISCSIQueuedCommands = "truenas-csi:block_queued_commands"
-	PropBlockISCSIInsecureTpc    = "truenas-csi:block_insecure_tpc"
-	PropBlockISCSIReadOnly       = "truenas-csi:block_readonly"
-	PropBlockISCSIAvailThreshold = "truenas-csi:block_avail_threshold"
-	PropBlockISCSISerial         = "truenas-csi:block_serial"
-	PropBlockISCSIAuthNetworks   = "truenas-csi:block_auth_networks"
-	PropBlockNVMeoFQidMax        = "truenas-csi:nvme_qid_max"
-	PropBlockNVMeoFPiEnable      = "truenas-csi:nvme_pi_enable"
+	PropBlockISCSIBlocksize      = "scale-csi:block_blocksize"
+	PropBlockISCSIPblocksize     = "scale-csi:block_pblocksize"
+	PropBlockISCSIQueuedCommands = "scale-csi:block_queued_commands"
+	PropBlockISCSIInsecureTpc    = "scale-csi:block_insecure_tpc"
+	PropBlockISCSIReadOnly       = "scale-csi:block_readonly"
+	PropBlockISCSIAvailThreshold = "scale-csi:block_avail_threshold"
+	PropBlockISCSISerial         = "scale-csi:block_serial"
+	PropBlockISCSIAuthNetworks   = "scale-csi:block_auth_networks"
+	PropBlockNVMeoFQidMax        = "scale-csi:nvme_qid_max"
+	PropBlockNVMeoFPiEnable      = "scale-csi:nvme_pi_enable"
 
-	PropNVMeoFSubsystemID  = "truenas-csi:truenas_nvmeof_subsystem_id"
-	PropNVMeoFNamespaceID  = "truenas-csi:truenas_nvmeof_namespace_id"
-	PropNVMeoFPortSubsysID = "truenas-csi:truenas_nvmeof_portsubsys_id"
+	PropNVMeoFSubsystemID  = "scale-csi:truenas_nvmeof_subsystem_id"
+	PropNVMeoFNamespaceID  = "scale-csi:truenas_nvmeof_namespace_id"
+	PropNVMeoFPortSubsysID = "scale-csi:truenas_nvmeof_portsubsys_id"
 
 	// NOTE (GF2-fix4/L1): there is deliberately NO snapshot-task-id property.
 	// One existed, written on every scheduled CreateVolume and read by nothing:
@@ -150,18 +150,18 @@ const (
 	// accept durable user-property writes on 26.0 while the destination does not
 	// exist yet). A marker is POSITIVE durable proof that this driver instance
 	// started a clone/copy toward that destination; crash recovery is gated on it.
-	PropInflightMarkerPrefix = "truenas-csi:inflight_"
+	PropInflightMarkerPrefix = "scale-csi:inflight_"
 	// PropTombstoneLedgerPrefix namespaces the parent-dataset ledger of
 	// deferred-delete tombstone snapshots. Written BEFORE the tombstone rename so
 	// the reaper only ever destroys snapshots this driver provably tombstoned; a
 	// crash between ledger write and rename leaves a ledger entry without a
 	// tombstone, which the reconciler sweeps.
-	PropTombstoneLedgerPrefix = "truenas-csi:tombstone_"
+	PropTombstoneLedgerPrefix = "scale-csi:tombstone_"
 	// PropRecoveryNonce is a per-attempt compare-and-swap value included in the
 	// remnant recovery ownership stamp. operationLock is per-process, so two
 	// overlapping controllers (upgrade window) can both attempt recovery; the
 	// post-write re-read proves whose stamp won and the loser returns Aborted.
-	PropRecoveryNonce = "truenas-csi:recovery_nonce"
+	PropRecoveryNonce = "scale-csi:recovery_nonce"
 
 	inflightMarkerVersion  = 1
 	tombstoneLedgerVersion = 2

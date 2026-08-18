@@ -370,7 +370,9 @@ func TestDatasetGet_Success(t *testing.T) {
 	assert.Equal(t, "tank/k8s/volumes/pvc-123", ds.ID)
 	assert.Equal(t, "VOLUME", ds.Type)
 	assert.Equal(t, float64(10737418240), ds.Volsize.Parsed)
-	assert.Equal(t, "true", ds.UserProperties["truenas-csi:managed_resource"].Value)
+	assert.Equal(t, "true", ds.UserProperties["scale-csi:managed_resource"].Value)
+	assert.NotContains(t, ds.UserProperties, "truenas-csi:managed_resource", "legacy key must be folded out of UserProperties")
+	assert.Equal(t, "true", ds.LegacyCSIProperties["truenas-csi:managed_resource"].Value)
 
 	params := <-queryParams
 	require.Len(t, params, 2)
@@ -838,7 +840,10 @@ func TestDatasetList_Success(t *testing.T) {
 	require.Len(t, params, 2)
 	assert.Equal(t, []interface{}{
 		[]interface{}{"name", "^", "tank/k8s/volumes/"},
-		[]interface{}{"user_properties.truenas-csi:managed_resource.value", "=", "true"},
+		[]interface{}{"OR", []interface{}{
+			[]interface{}{[]interface{}{"user_properties.scale-csi:managed_resource.value", "=", "true"}},
+			[]interface{}{[]interface{}{"user_properties.truenas-csi:managed_resource.value", "=", "true"}},
+		}},
 	}, params[0])
 	options := params[1].(map[string]interface{})
 	extra := options["extra"].(map[string]interface{})
@@ -1210,7 +1215,9 @@ func TestDatasetGetUserProperty_Success(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
-	value, err := client.DatasetGetUserProperty(ctx, "tank/k8s/volumes/pvc-getprop", "truenas-csi:nfs_share_id")
+	// The wire carries the legacy spelling; the decode-time fold means driver
+	// code reads the canonical key.
+	value, err := client.DatasetGetUserProperty(ctx, "tank/k8s/volumes/pvc-getprop", "scale-csi:nfs_share_id")
 	require.NoError(t, err)
 	assert.Equal(t, "42", value)
 }
@@ -2168,20 +2175,22 @@ func TestDatasetResourceQueryTrueNAS26ShapeAndDetectionCache(t *testing.T) {
 	assert.Equal(t, "VOLUME", managed.Type)
 	assert.Equal(t, int64(4096), managed.GetUsedBytes())
 	assert.Equal(t, int64(1073741824), int64(managed.Volsize.Parsed.(float64)))
-	// user-property source must survive the read.
-	assert.Equal(t, "true", managed.UserProperties["truenas-csi:managed_resource"].Value)
-	assert.Equal(t, "local", managed.UserProperties["truenas-csi:managed_resource"].Source)
+	// user-property source must survive the read (through the legacy->canonical fold).
+	assert.Equal(t, "true", managed.UserProperties["scale-csi:managed_resource"].Value)
+	assert.Equal(t, "local", managed.UserProperties["scale-csi:managed_resource"].Source)
+	assert.NotContains(t, managed.UserProperties, "truenas-csi:managed_resource", "legacy key must be folded out of UserProperties")
+	assert.Equal(t, "true", managed.LegacyCSIProperties["truenas-csi:managed_resource"].Value)
 	// origin parsed from the nested properties map, true-case preserved.
 	assert.Equal(t, "tank/k8s/volumes/source@snap-1", datasetPropertyString(managed.Origin))
 
 	plain := byName["tank/k8s/volumes/pvc-plain"]
 	require.NotNil(t, plain)
-	_, hasManaged := plain.UserProperties["truenas-csi:managed_resource"]
+	_, hasManaged := plain.UserProperties["scale-csi:managed_resource"]
 	assert.False(t, hasManaged)
 
 	foreign := byName["tank/k8s/volumes/pvc-foreign"]
 	require.NotNil(t, foreign)
-	assert.Equal(t, "inherited", foreign.UserProperties["truenas-csi:managed_resource"].Source)
+	assert.Equal(t, "inherited", foreign.UserProperties["scale-csi:managed_resource"].Source)
 
 	// Detection probe is cached: one probe across two queries.
 	assert.Equal(t, int32(1), probeCalls.Load())
@@ -2212,8 +2221,10 @@ func TestParseDatasetResourceFlatUserPropertiesDegradeSource(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "true", ds.UserProperties["truenas-csi:managed_resource"].Value)
-	assert.Equal(t, "", ds.UserProperties["truenas-csi:managed_resource"].Source)
+	assert.Equal(t, "true", ds.UserProperties["scale-csi:managed_resource"].Value)
+	assert.Equal(t, "", ds.UserProperties["scale-csi:managed_resource"].Source)
+	assert.NotContains(t, ds.UserProperties, "truenas-csi:managed_resource", "legacy key must be folded out of UserProperties")
+	assert.Equal(t, "true", ds.LegacyCSIProperties["truenas-csi:managed_resource"].Value)
 }
 
 // ---------------------------------------------------------------------------

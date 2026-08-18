@@ -62,6 +62,12 @@ type Dataset struct {
 	Origin         DatasetProperty         `json:"origin"`
 	Creation       DatasetProperty         `json:"creation"`
 	UserProperties map[string]UserProperty `json:"user_properties"`
+	// LegacyCSIProperties holds the RAW truenas-csi:* entries the wire carried
+	// before decode-time normalization folded them onto their canonical
+	// scale-csi:* twins in UserProperties (see normalizeCSIUserProperties).
+	// Driver code reads canonical keys only; the namespace-migration sweep is
+	// the one consumer of this raw view. Nil when the response carried none.
+	LegacyCSIProperties map[string]UserProperty `json:"-"`
 	// CreatedByCall is true only when pool.dataset.create itself created this
 	// object. The idempotent AlreadyExists fallback leaves it false so callers
 	// never post-stamp a raced foreign dataset.
@@ -158,7 +164,13 @@ type UserProperty struct {
 	Source string `json:"source"`
 }
 
-const datasetManagedResourceProperty = "truenas-csi:managed_resource"
+// datasetManagedResourceProperty is the canonical managed-volume marker; the
+// legacy spelling below keeps pre-rename volumes visible to the server-side
+// managed listing until the namespace-migration sweep has re-stamped them.
+const (
+	datasetManagedResourceProperty       = CSIPropertyNamespace + "managed_resource"
+	datasetLegacyManagedResourceProperty = LegacyCSIPropertyNamespace + "managed_resource"
+)
 
 // datasetQueryPropertiesBase is the capacity/identity projection every dataset
 // read has carried since GF2. It is the SHARED part of both read paths; the
@@ -742,7 +754,15 @@ func (c *Client) DatasetList(ctx context.Context, parentName string, limit, offs
 	if parentName != "" {
 		filters = append(filters, []interface{}{"name", "^", parentName + "/"})
 	}
-	filters = append(filters, []interface{}{"user_properties." + datasetManagedResourceProperty + ".value", "=", "true"})
+	// Match the managed marker under EITHER namespace: volumes provisioned
+	// before the scale-csi: rename still carry the legacy stamp until the
+	// migration sweep reaches them, and the server-side filter must not hide
+	// them from ListVolumes meanwhile. The nested OR shape (each branch its own
+	// condition list) is live-verified against TrueNAS 26.0.0-BETA.2.
+	filters = append(filters, []interface{}{"OR", []interface{}{
+		[][]interface{}{{"user_properties." + datasetManagedResourceProperty + ".value", "=", "true"}},
+		[][]interface{}{{"user_properties." + datasetLegacyManagedResourceProperty + ".value", "=", "true"}},
+	}})
 
 	options := map[string]interface{}{
 		"extra": map[string]interface{}{
@@ -951,6 +971,7 @@ func parseDatasetResource(data interface{}) (*Dataset, error) {
 			}
 		}
 	}
+	ds.LegacyCSIProperties = normalizeCSIUserProperties(ds.UserProperties)
 
 	return ds, nil
 }
@@ -1169,8 +1190,14 @@ func (c *Client) DatasetSetUserProperties(ctx context.Context, name string, prop
 // Publication records use the live-verified {key, remove:true} update rather
 // than an empty value so a retry can distinguish "never published" from an
 // interrupted unpublish tombstone.
+//
+// Canonical scale-csi:* keys are expanded to also remove their legacy
+// truenas-csi:* spelling: callers only ever name canonical keys (decode-time
+// normalization hides the legacy ones), and a pre-rename stamp must not
+// survive the removal of its canonical twin. Removing an absent key is a
+// silent no-op on the appliance (live-verified on 26.0).
 func (c *Client) DatasetRemoveUserProperties(ctx context.Context, name string, keys []string) error {
-	keys = append([]string(nil), keys...)
+	keys = expandCSIPropertyRemovalKeys(keys)
 	sort.Strings(keys)
 	updates := make([]UserPropertyUpdate, 0, len(keys))
 	for _, key := range keys {
@@ -1350,6 +1377,7 @@ func parseDataset(data interface{}) (*Dataset, error) {
 			}
 		}
 	}
+	ds.LegacyCSIProperties = normalizeCSIUserProperties(ds.UserProperties)
 
 	return ds, nil
 }

@@ -59,7 +59,7 @@ const zfsUserPropertyNoValue = "-"
 // alike (round 6).
 //
 // Round 5 validated the request domain (resolveBlockOpts) but parsed a STORED
-// value as any integer at all, so `zfs set truenas-csi:block_blocksize=1234`
+// value as any integer at all, so `zfs set scale-csi:block_blocksize=1234`
 // produced a "known" geometry that a rebuild would then create an extent from.
 // A value outside this set cannot be the layout of any extent the backend can
 // create, so it is not a record of anything: it is treated as UNTRUSTED, which

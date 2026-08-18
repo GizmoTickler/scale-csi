@@ -68,11 +68,13 @@ Examples:
 
 ### ZFS Custom Properties
 
-The driver tracks CSI metadata using ZFS user properties prefixed with `truenas-csi:`. Key properties defined in `controller.go`:
-- `truenas-csi:managed_resource` - Marks CSI-managed datasets
-- `truenas-csi:csi_volume_name` - Original PVC name
-- `truenas-csi:truenas_nfs_share_id` - Associated NFS share ID
-- `truenas-csi:truenas_iscsi_target_id` - Associated iSCSI target ID
+The driver tracks CSI metadata using ZFS user properties prefixed with `scale-csi:`. Key properties defined in `controller.go`:
+- `scale-csi:managed_resource` - Marks CSI-managed datasets
+- `scale-csi:csi_volume_name` - Original PVC name
+- `scale-csi:truenas_nfs_share_id` - Associated NFS share ID
+- `scale-csi:truenas_iscsi_target_id` - Associated iSCSI target ID
+
+Reads accept both the `scale-csi:` prefix and the legacy `truenas-csi:` prefix (pre-v1.10.0 stamps); the canonical spelling wins on collision. A reconciler sweep re-stamps local legacy dataset properties under `scale-csi:` — snapshot properties cannot be rewritten on TrueNAS 26.0, so legacy snapshot stamps rely on the read-side fold permanently.
 
 ## Testing
 

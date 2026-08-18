@@ -7,7 +7,7 @@ for adversarial review. This file is untracked spec input — never git-add it.
 The first age-eligible tombstones were REFUSED by the reaper: "tombstone source
 dataset does not carry this driver instance's ownership stamp". Root cause: the
 migration-era volumes (created 2026-07-20/21, BEFORE v1.2.21 introduced
-`truenas-csi:driver_instance_id` stamping) lack the stamp — verified live, e.g.
+`scale-csi:driver_instance_id` stamping) lack the stamp — verified live, e.g.
 flashstor/scale-csi/pvc-111ae4b0-* has LOCAL managed_resource + csi_volume_name +
 content-source props but NO driver_instance_id. The reaper's instance belt
 therefore refuses their tombstones FOREVER: ledger entries and -csi-deleted-

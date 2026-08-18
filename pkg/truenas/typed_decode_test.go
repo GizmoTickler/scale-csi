@@ -111,9 +111,13 @@ func TestTypedSnapshotPreservesGenericPropertyShapeAndPrecedence(t *testing.T) {
 	assert.IsType(t, float64(0), used["value"])
 	assert.Equal(t, "2723840", used["raw"])
 	assert.NotContains(t, used, "rawvalue")
+	// Legacy-spelled wire keys fold onto the canonical namespace with the
+	// {value,source} shape (object or flat) preserved unchanged.
 	assert.Equal(t, UserProperty{Value: "from-user-properties", Source: "INHERITED"},
-		snapshot.UserProperties["truenas-csi:managed"])
-	assert.Equal(t, UserProperty{Value: "flat-value"}, snapshot.UserProperties["truenas-csi:flat"])
+		snapshot.UserProperties["scale-csi:managed"])
+	assert.Equal(t, UserProperty{Value: "flat-value"}, snapshot.UserProperties["scale-csi:flat"])
+	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:managed", "legacy key must be folded out of UserProperties")
+	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:flat", "legacy key must be folded out of UserProperties")
 	assert.Equal(t, int64(2723840), snapshot.GetSnapshotSize())
 	assert.Equal(t, int64(1754693322), snapshot.GetCreationTime())
 }
@@ -427,13 +431,17 @@ func TestLiveCapturedStampedSnapshotFixtureDecodes(t *testing.T) {
 	assert.Equal(t, "livetest-1", snap.Name)
 	assert.Equal(t, "flashstor/csi-live-test/pvc-live-a", snap.Dataset)
 
-	handle, ok := snap.UserProperties["truenas-csi:csi_snapshot_handle"]
-	require.True(t, ok, "inline-created handle stamp must survive the targeted read")
+	// The live capture predates the namespace rename, so the wire carries
+	// truenas-csi:* stamps; decode folds them onto the canonical namespace.
+	handle, ok := snap.UserProperties["scale-csi:csi_snapshot_handle"]
+	require.True(t, ok, "inline-created handle stamp must survive the targeted read (folded to canonical)")
 	assert.Equal(t, "flashstor/csi-live-test/pvc-live-a@livetest-1", handle.Value)
 	// Bare-string wire shape carries no source: it must decode empty, not fail.
 	assert.Equal(t, "", handle.Source)
+	assert.NotContains(t, snap.UserProperties, "truenas-csi:csi_snapshot_handle", "legacy key must be folded out of UserProperties")
 
-	managed, ok := snap.UserProperties["truenas-csi:managed_resource"]
+	managed, ok := snap.UserProperties["scale-csi:managed_resource"]
 	require.True(t, ok)
 	assert.Equal(t, "true", managed.Value)
+	assert.NotContains(t, snap.UserProperties, "truenas-csi:managed_resource", "legacy key must be folded out of UserProperties")
 }

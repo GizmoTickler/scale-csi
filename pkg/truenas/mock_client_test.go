@@ -153,17 +153,21 @@ func TestMockClientCopyDatasetFromSnapshotLocalIsIndependentAndIdempotent(t *tes
 	assert.Empty(t, datasetPropertyString(target.Origin))
 	assert.Equal(t, source.Volsize, target.Volsize)
 	assert.Equal(t, source.Refreservation, target.Refreservation)
-	assert.Equal(t, "source", target.UserProperties["truenas-csi:csi_volume_name"].Value)
+	// The legacy-seeded stamp is read back through the canonical namespace fold.
+	assert.Equal(t, "source", target.UserProperties["scale-csi:csi_volume_name"].Value)
+	assert.NotContains(t, target.UserProperties, "truenas-csi:csi_volume_name", "legacy key must be folded out of UserProperties")
+	assert.Equal(t, "source", target.LegacyCSIProperties["truenas-csi:csi_volume_name"].Value)
 
 	// A repeated call must preserve the already-created target rather than
 	// replacing its post-copy identity updates with inherited source values.
-	require.NoError(t, client.DatasetSetUserProperty(ctx, target.Name, "truenas-csi:csi_volume_name", "target"))
+	// Post-rename driver writes use the canonical namespace.
+	require.NoError(t, client.DatasetSetUserProperty(ctx, target.Name, "scale-csi:csi_volume_name", "target"))
 	_, err = client.CopyDatasetFromSnapshotLocal(ctx, source.Name, snapshot.Name, target.Name)
 	require.Error(t, err)
 	assert.True(t, IsDatasetDestinationExistsError(err))
 	target, err = client.DatasetGet(ctx, target.Name)
 	require.NoError(t, err)
-	assert.Equal(t, "target", target.UserProperties["truenas-csi:csi_volume_name"].Value)
+	assert.Equal(t, "target", target.UserProperties["scale-csi:csi_volume_name"].Value)
 
 	require.NoError(t, client.SnapshotDelete(ctx, snapshot.ID, false, false))
 	require.NoError(t, client.DatasetDelete(ctx, source.Name, false, true))
@@ -197,13 +201,16 @@ func TestMockSnapshotCreateAppliesInlinePropertiesWhenUpdatesNoOp(t *testing.T) 
 		"truenas-csi:managed_resource": "true",
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "true", snapshot.UserProperties["truenas-csi:managed_resource"].Value)
-	assert.Equal(t, "local", snapshot.UserProperties["truenas-csi:managed_resource"].Source)
+	// The inline map used the legacy spelling; the read folds it canonical
+	// with value AND source preserved.
+	assert.Equal(t, "true", snapshot.UserProperties["scale-csi:managed_resource"].Value)
+	assert.Equal(t, "local", snapshot.UserProperties["scale-csi:managed_resource"].Source)
+	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:managed_resource", "legacy key must be folded out of UserProperties")
 
-	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, "truenas-csi:late", "ignored"))
-	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:late")
-	require.NoError(t, client.SnapshotRemoveUserProperties(ctx, snapshot.ID, []string{"truenas-csi:managed_resource"}))
-	assert.Contains(t, snapshot.UserProperties, "truenas-csi:managed_resource")
+	require.NoError(t, client.SnapshotSetUserProperty(ctx, snapshot.ID, "scale-csi:late", "ignored"))
+	assert.NotContains(t, snapshot.UserProperties, "scale-csi:late")
+	require.NoError(t, client.SnapshotRemoveUserProperties(ctx, snapshot.ID, []string{"scale-csi:managed_resource"}))
+	assert.Contains(t, snapshot.UserProperties, "scale-csi:managed_resource")
 
 	oldID := snapshot.ID
 	require.NoError(t, client.SnapshotRename(ctx, oldID, "renamed"))
@@ -211,7 +218,7 @@ func TestMockSnapshotCreateAppliesInlinePropertiesWhenUpdatesNoOp(t *testing.T) 
 	require.Error(t, err)
 	renamed, err := client.SnapshotGet(ctx, "tank/csi/source@renamed")
 	require.NoError(t, err)
-	assert.Contains(t, renamed.UserProperties, "truenas-csi:managed_resource",
+	assert.Contains(t, renamed.UserProperties, "scale-csi:managed_resource",
 		"26.0's property-update no-op must not suppress the working rename API")
 }
 
@@ -224,13 +231,15 @@ func TestMockDatasetCreateCanModelTrueNAS26InlinePropertyDrop(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.NotContains(t, dataset.UserProperties, "truenas-csi:driver_instance_id")
+	assert.NotContains(t, dataset.UserProperties, "scale-csi:driver_instance_id",
+		"a dropped inline property must be absent under either spelling")
 
 	require.NoError(t, client.DatasetSetUserProperty(context.Background(), dataset.Name,
-		"truenas-csi:driver_instance_id", "instance-a"))
+		"scale-csi:driver_instance_id", "instance-a"))
 	dataset, err = client.DatasetGet(context.Background(), dataset.Name)
 	require.NoError(t, err)
 	assert.Equal(t, UserProperty{Value: "instance-a", Source: "local"},
-		dataset.UserProperties["truenas-csi:driver_instance_id"])
+		dataset.UserProperties["scale-csi:driver_instance_id"])
 }
 
 func TestMockDatasetCreatedByCallIsResponseLocal(t *testing.T) {

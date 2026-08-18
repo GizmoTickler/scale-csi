@@ -39,7 +39,7 @@ const (
 // task-created snapshots (which carry NO CSI user properties, P2): its embedded
 // per-volume nonce is driver-minted and never published anywhere but this
 // property and the task object itself (GF2/E2, R4).
-const PropSnapshotNamingSchema = "truenas-csi:snapshot_naming_schema"
+const PropSnapshotNamingSchema = "scale-csi:snapshot_naming_schema"
 
 // PropSnapshotTaskCorroboration records that THIS driver instance observed its
 // OWN live, non-recursive, dataset-scoped periodic-snapshot task carrying this
@@ -53,7 +53,7 @@ const PropSnapshotNamingSchema = "truenas-csi:snapshot_naming_schema"
 // retry decidable without weakening the first attempt. It is written only on the
 // delete path, only for a volume that already proves out a schema binding, and
 // only once.
-const PropSnapshotTaskCorroboration = "truenas-csi:snapshot_task_corroboration"
+const PropSnapshotTaskCorroboration = "scale-csi:snapshot_task_corroboration"
 
 // PropSnapshotTaskTimezone records the IANA timezone name the NAS was configured
 // with at the moment this volume's periodic-snapshot task was created
@@ -73,7 +73,7 @@ const PropSnapshotTaskCorroboration = "truenas-csi:snapshot_task_corroboration"
 // exists to expose. It is read only through datasetLocalUserProperty, so a
 // clone, a replication-received dataset, or a detached copy that INHERITS it
 // proves nothing (the standing content-source rule).
-const PropSnapshotTaskTimezone = "truenas-csi:snapshot_task_timezone"
+const PropSnapshotTaskTimezone = "scale-csi:snapshot_task_timezone"
 
 // defaultSnapshotRetention bounds a scheduled task's snapshot lifetime when no
 // retention is configured, so an enabled schedule can never grow unbounded

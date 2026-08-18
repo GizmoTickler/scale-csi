@@ -72,7 +72,7 @@ func TestListVolumes_Pagination(t *testing.T) {
 			ID:   "pool/parent/" + name,
 			Name: "pool/parent/" + name,
 			UserProperties: map[string]truenas.UserProperty{
-				"truenas-csi:managed_resource": {Value: "true"},
+				PropManagedResource: {Value: "true"},
 			},
 		}
 	}
@@ -144,7 +144,7 @@ func TestListSnapshots_Pagination(t *testing.T) {
 			Name:    name,
 			Dataset: "pool/parent/vol-0",
 			UserProperties: map[string]truenas.UserProperty{
-				"truenas-csi:managed_resource": {Value: "true"},
+				PropManagedResource: {Value: "true"},
 			},
 		}
 	}

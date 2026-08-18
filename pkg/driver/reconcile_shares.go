@@ -14,38 +14,49 @@ import (
 )
 
 // nfsShareCommentDatasetName extracts the backing dataset name from a CSI-managed
-// NFS share comment of the form "truenas-csi (<driverName>): <datasetName>". The
-// boolean is false when the comment is not a CSI share comment for THIS driver
-// instance, so foreign shares are never classified or touched.
+// NFS share comment of the form "scale-csi (<driverName>): <datasetName>". The
+// legacy "truenas-csi (<driverName>): " spelling written by releases before the
+// namespace rename is accepted on read forever: share comments are only
+// rewritten when a share is recreated, so pre-rename shares keep the old
+// comment for their whole life. The boolean is false when the comment is not a
+// CSI share comment for THIS driver instance, so foreign shares are never
+// classified or touched.
 func (d *Driver) nfsShareCommentDatasetName(comment string) (string, bool) {
-	prefix := "truenas-csi (" + d.name + "): "
-	if !strings.HasPrefix(comment, prefix) {
-		return "", false
+	for _, prefix := range []string{"scale-csi (" + d.name + "): ", "truenas-csi (" + d.name + "): "} {
+		if !strings.HasPrefix(comment, prefix) {
+			continue
+		}
+		datasetName := strings.TrimSpace(strings.TrimPrefix(comment, prefix))
+		if datasetName == "" {
+			return "", false
+		}
+		return datasetName, true
 	}
-	datasetName := strings.TrimSpace(strings.TrimPrefix(comment, prefix))
-	if datasetName == "" {
-		return "", false
-	}
-	return datasetName, true
+	return "", false
 }
 
 // iscsiExtentCommentDatasetName extracts the backing dataset name from a
-// CSI-managed iSCSI extent comment of the form "truenas-csi: <datasetName>".
-// Unlike the NFS share comment, the iSCSI extent comment does NOT embed the
-// driver instance name, so driver-instance scoping is enforced separately by
-// requiring the derived dataset to live under the configured parent dataset (see
-// datasetUnderParent). The boolean is false when the comment is not a CSI extent
-// comment at all, so foreign extents are never classified or touched.
+// CSI-managed iSCSI extent comment of the form "scale-csi: <datasetName>"
+// (legacy "truenas-csi: <datasetName>" comments from releases before the
+// namespace rename are accepted on read forever — extent comments are only
+// rewritten when an extent is recreated). Unlike the NFS share comment, the
+// iSCSI extent comment does NOT embed the driver instance name, so
+// driver-instance scoping is enforced separately by requiring the derived
+// dataset to live under the configured parent dataset (see datasetUnderParent).
+// The boolean is false when the comment is not a CSI extent comment at all, so
+// foreign extents are never classified or touched.
 func iscsiExtentCommentDatasetName(comment string) (string, bool) {
-	const prefix = "truenas-csi: "
-	if !strings.HasPrefix(comment, prefix) {
-		return "", false
+	for _, prefix := range []string{"scale-csi: ", "truenas-csi: "} {
+		if !strings.HasPrefix(comment, prefix) {
+			continue
+		}
+		datasetName := strings.TrimSpace(strings.TrimPrefix(comment, prefix))
+		if datasetName == "" {
+			return "", false
+		}
+		return datasetName, true
 	}
-	datasetName := strings.TrimSpace(strings.TrimPrefix(comment, prefix))
-	if datasetName == "" {
-		return "", false
-	}
-	return datasetName, true
+	return "", false
 }
 
 // zvolReferenceDatasetName extracts the backing dataset name from a zvol device

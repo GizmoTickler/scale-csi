@@ -1,4 +1,37 @@
-# Release notes — v1.9.0
+# Release notes — v1.10.0 (next)
+
+## ZFS property namespace rename — `truenas-csi:*` → `scale-csi:*`
+
+- **What and why:** every ZFS user property the driver stamps now lives under
+  the `scale-csi:` prefix instead of the legacy `truenas-csi:` prefix. This is
+  vendor-neutral branding hygiene: the project brands itself scale-csi, and
+  "TrueNAS" (a trademark of iXsystems) is used only nominatively, to name the
+  upstream product the driver talks to. Key **suffixes are unchanged**,
+  including descriptive ones like `truenas_nfs_share_id`, which name the
+  TrueNAS-side resource ID they store.
+- **Dual-read compatibility, forever:** the driver reads BOTH prefixes at
+  decode time and folds them together; when both spellings of a key are
+  present, the canonical `scale-csi:` value wins. Pre-rename volumes and
+  snapshots keep working with zero operator action.
+- **Automatic dataset migration:** a reconciler sweep (running alongside stamp
+  adoption, capped per pass by `reconcile.delete.maxPerRun`, and NOT gated by
+  the delete mode) re-stamps LOCAL `truenas-csi:*` dataset properties under
+  `scale-csi:*` and removes the legacy spelling. Inherited values are never
+  migrated. The reconcile report gains `MigratedPropertyNamespaces` /
+  `MigratedPropertyNamespaceCount`.
+- **Snapshots keep legacy keys on disk:** TrueNAS 26.0 exposes no working
+  snapshot property mutation API, so snapshot stamps written before the rename
+  can never be rewritten and keep their `truenas-csi:*` keys for life. The
+  read-side fold makes this invisible to the driver and to users.
+- **Share/extent comments:** NFS share comments are now
+  `scale-csi (<driverName>): <dataset>` and iSCSI extent comments
+  `scale-csi: <dataset>`. Legacy `truenas-csi ...` comments remain recognized
+  on read forever.
+- **⚠ Breaking — legacy config driver-name aliases removed:** the unused
+  config aliases `truenas-nfs`, `truenas-iscsi`, and `truenas-nvmeof` no longer
+  parse. Use the supported names `org.scale.csi.nfs`, `org.scale.csi.iscsi`,
+  and `org.scale.csi.nvmeof` instead (protocol selection normally comes from
+  StorageClass parameters).
 
 ## VolumeAttributesClass — CSI MODIFY_VOLUME
 
@@ -171,7 +204,7 @@ ConfigMap). Upgrading changes nothing for an install that does not opt in.
   short-lived parse, and request-scoped context. It never reaches a log, a gRPC
   status, a Kubernetes Event, the PV's `volumeContext`, or a dataset
   user-property. The only encryption-related volume-context key is a non-secret
-  algorithm marker; the durable per-volume stamp is `truenas-csi:encryption =
+  algorithm marker; the durable per-volume stamp is `scale-csi:encryption =
   <algorithm>`, never the key.
 
 ### Only volumes this driver keyed are touched
@@ -278,7 +311,7 @@ encrypted volumes in this release.
   driver has no unlock logic, so a locked volume stays dead (not lost — keys are
   safe in the Secret). Do not roll back below encryption support while encrypted
   volumes exist; manual `pool.dataset.unlock` recovers. The
-  `truenas-csi:encryption` user-prop is ignored by older drivers, so the rollback
+  `scale-csi:encryption` user-prop is ignored by older drivers, so the rollback
   itself is safe; plaintext volumes are unaffected.
 - **R4 — unlock is not idempotent (MED).** Unlocking an already-unlocked dataset
   returns FAILED; the driver always gates on `locked == true` and never treats
@@ -663,8 +696,8 @@ upgrade removed. Recovery is to restore the original extent, or to record the
 real geometry and retry:
 
 ```sh
-zfs set truenas-csi:block_blocksize=4096 \
-        truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...
+zfs set scale-csi:block_blocksize=4096 \
+        scale-csi:block_pblocksize=true tank/k8s/volumes/pvc-...
 ```
 
 `block_blocksize` must be one of **512, 1024, 2048, 4096**; a value outside that
@@ -826,7 +859,7 @@ removal-only configmap render + a render-assert in the same commit.
   (±2s clock skew) when the snapshot was created — its `creation` property
   rendered in the NAS's own civil timezone. That zone is proven, not guessed:
   the IANA zone in force when the TASK was created is recorded on the volume's
-  own dataset (`truenas-csi:snapshot_task_timezone`, write-once, read only when
+  own dataset (`scale-csi:snapshot_task_timezone`, write-once, read only when
   `source == local`, so a clone/received/detached copy that inherits it proves
   nothing), and the delete path requires it to still equal the NAS's LIVE
   `system.general.config` zone. This is what makes the FACT of a timezone
@@ -866,7 +899,7 @@ removal-only configmap render + a render-assert in the same commit.
   binding — schema AND recorded zone — is stamped BEFORE the task is created, so
   a task can never outlive its binding, and the orphan reconcile sweeps tasks
   whose dataset is gone. DeleteVolume records its observation of the live task
-  (`truenas-csi:snapshot_task_corroboration`) and VERIFIES that record with a
+  (`scale-csi:snapshot_task_corroboration`) and VERIFIES that record with a
   source-bearing re-read BEFORE destroying the task; if the record does not land
   the task is deliberately left alive, so a DeleteVolume that fails later can
   still be retried instead of wedging behind the foreign guard forever.
@@ -1007,7 +1040,7 @@ accepted-and-ignored compatibility keys.
   **zero** keys unknown to the v1.3.0 strict (`KnownFields(true)`) config parser:
   every new config surface (`truenas.maxConnections`, `iscsi.chap.*`,
   `capacity.*`) is gated and renders nothing when off/default. The two new CHAP
-  dataset properties (`truenas-csi:truenas_iscsi_auth_tag`/`_mode`) and the gated
+  dataset properties (`scale-csi:truenas_iscsi_auth_tag`/`_mode`) and the gated
   `chap` volume-context key are ignored by v1.3.0; marker/ledger formats are
   unchanged. A v1.4.0 → v1.3.0 downgrade against the deployed state is verified
   safe.
@@ -1082,7 +1115,7 @@ accepted-and-ignored compatibility keys.
   Secret tags for isolation.
 - **Immutable per-volume policy.** The auth *mode* and *tag* are stamped immutably
   at `CreateVolume` as local dataset properties
-  (`truenas-csi:truenas_iscsi_auth_tag`/`_mode`); every later fence/rebuild reads the
+  (`scale-csi:truenas_iscsi_auth_tag`/`_mode`); every later fence/rebuild reads the
   stored value — never the controller-wide `iscsi.chap.mutual` flag. A replay that
   would change the policy is rejected with `FailedPrecondition`; only the secret
   *value* rotates. Because the shared peer is ensured before the per-volume guard,
@@ -1347,7 +1380,7 @@ From the 2026-07-24 live GC run:
 One fix from the 2026-07-23 04:00Z live GC run, in which the first age-eligible
 tombstones were REFUSED by the reaper with "tombstone source dataset does not
 carry this driver instance's ownership stamp". The migration-era volumes
-(created before v1.2.21 introduced `truenas-csi:driver_instance_id` stamping)
+(created before v1.2.21 introduced `scale-csi:driver_instance_id` stamping)
 carry LOCAL `managed_resource` + `csi_volume_name` but NO instance stamp, so the
 reaper's instance belt refused their tombstones forever: ledger entries and
 `-csi-deleted-` snapshots accumulated indefinitely (+16/h from hourly VolSync).

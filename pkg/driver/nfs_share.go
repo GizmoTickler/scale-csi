@@ -126,7 +126,7 @@ func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Datas
 	}
 
 	// Create NFS share
-	comment := fmt.Sprintf("truenas-csi (%s): %s", d.name, datasetName)
+	comment := fmt.Sprintf("scale-csi (%s): %s", d.name, datasetName)
 
 	params := &truenas.NFSShareCreateParams{
 		Path:         ds.Mountpoint,

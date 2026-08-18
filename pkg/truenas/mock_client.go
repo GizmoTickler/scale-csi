@@ -816,6 +816,21 @@ func mockTunableProperty(value string) DatasetProperty {
 }
 
 func mockDatasetResponse(dataset *Dataset, created bool) *Dataset {
+	response := mockDatasetResponseRaw(dataset, created)
+	if response == nil {
+		return nil
+	}
+	// Same decode-time fold every real wire parser applies: the caller sees
+	// canonical scale-csi:* keys, the stored map keeps the on-disk spelling.
+	response.LegacyCSIProperties = normalizeCSIUserProperties(response.UserProperties)
+	return response
+}
+
+// mockDatasetResponseRaw copies a stored dataset WITHOUT the CSI-namespace
+// fold, for read paths that must transform the view first (the resource-query
+// mock strips property sources before folding, exactly as the real sourceless
+// wire shape would be folded).
+func mockDatasetResponseRaw(dataset *Dataset, created bool) *Dataset {
 	if dataset == nil {
 		return nil
 	}
@@ -824,6 +839,7 @@ func mockDatasetResponse(dataset *Dataset, created bool) *Dataset {
 	for key, property := range dataset.UserProperties {
 		response.UserProperties[key] = property
 	}
+	response.LegacyCSIProperties = nil
 	response.CreatedByCall = created
 	// P-4: a locked dataset reports mountpoint:null (filesystem) and has no backing
 	// zvol device. The row survives; the mountpoint/device does not.
@@ -897,12 +913,29 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 	return nil
 }
 
+// mockSnapshotResponse applies the decode-time CSI-namespace fold every real
+// wire parser applies, so callers see canonical scale-csi:* keys. It folds the
+// STORED map in place and returns the same pointer: mock snapshot reads have
+// always returned the stored object (tests mutate it to model backend-side
+// changes), and the fold is idempotent, so first-read normalization is
+// indistinguishable from wire-decode normalization to every caller. Snapshots
+// get no LegacyCSIProperties raw view: TrueNAS 26.0 cannot rewrite snapshot
+// properties, so nothing ever migrates them and no caller needs the raw keys.
+func mockSnapshotResponse(snap *Snapshot) *Snapshot {
+	if snap == nil {
+		return nil
+	}
+	normalizeCSIUserProperties(snap.UserProperties)
+	return snap
+}
+
 // snapshotQueryResponse applies the zfs.resource.snapshot.query PROJECTION MODEL
 // to a mock response when ModelQueryProjection is set. It strips PROPERTIES the
 // projection does not ask for; top-level fields (id/name/dataset/pool/type and
 // createtxg) are untouched, because the projection does not select them (N-10,
 // snapshot_projection.go).
 func (m *MockClient) snapshotQueryResponse(snap *Snapshot) *Snapshot {
+	snap = mockSnapshotResponse(snap)
 	if snap == nil || !m.ModelQueryProjection {
 		return snap
 	}
@@ -917,9 +950,6 @@ func (m *MockClient) snapshotQueryResponse(snap *Snapshot) *Snapshot {
 }
 
 func (m *MockClient) snapshotQueryResponses(snapshots []*Snapshot) []*Snapshot {
-	if !m.ModelQueryProjection {
-		return snapshots
-	}
 	projected := make([]*Snapshot, 0, len(snapshots))
 	for _, snap := range snapshots {
 		projected = append(projected, m.snapshotQueryResponse(snap))
@@ -1050,7 +1080,7 @@ func (m *MockClient) DatasetList(ctx context.Context, parentName string, limit, 
 		if parentName != "" && !strings.HasPrefix(ds.Name, parentName+"/") {
 			continue
 		}
-		if prop, ok := ds.UserProperties[datasetManagedResourceProperty]; !ok || prop.Value != "true" {
+		if !mockDatasetIsManaged(ds) {
 			continue
 		}
 		list = append(list, m.poolQueryResponse(mockDatasetResponse(ds, false)))
@@ -1094,11 +1124,15 @@ func (m *MockClient) DatasetQueryByParent(ctx context.Context, parentDataset str
 		if parent != "" && !strings.HasPrefix(ds.Name, parent+"/") {
 			continue
 		}
-		response := mockDatasetResponse(ds, false)
+		response := mockDatasetResponseRaw(ds, false)
 		for key, property := range response.UserProperties {
 			property.Source = ""
 			response.UserProperties[key] = property
 		}
+		// Fold AFTER the source strip: the real resource path normalizes the
+		// already-sourceless wire map, so spelling collisions resolve on the
+		// canonical-wins tie rule there, never on source information.
+		response.LegacyCSIProperties = normalizeCSIUserProperties(response.UserProperties)
 		// Same fidelity discipline for every encryption field: zfs.resource.query
 		// returns NO encryption, key or lock fields AT ALL (P-11, nas01
 		// 26.0.0-BETA.1, 2026-08-02) and parseDatasetResource reads none of them, so
@@ -1476,10 +1510,22 @@ func (m *MockClient) DatasetRemoveUserProperties(ctx context.Context, name strin
 	if !ok {
 		return notFoundAPIError("dataset not found")
 	}
-	for _, key := range keys {
+	// Mirror the real client: canonical keys also remove their legacy spelling,
+	// and removing an absent key is a no-op.
+	for _, key := range expandCSIPropertyRemovalKeys(keys) {
 		delete(ds.UserProperties, key)
 	}
 	return nil
+}
+
+// mockDatasetIsManaged mirrors the dual-namespace server-side managed filter:
+// a stored dataset stamped under EITHER spelling is listed.
+func mockDatasetIsManaged(ds *Dataset) bool {
+	if prop, ok := ds.UserProperties[datasetManagedResourceProperty]; ok && prop.Value == "true" {
+		return true
+	}
+	prop, ok := ds.UserProperties[datasetLegacyManagedResourceProperty]
+	return ok && prop.Value == "true"
 }
 
 func (m *MockClient) DatasetGetUserProperty(ctx context.Context, name, key string) (string, error) {
@@ -1492,6 +1538,13 @@ func (m *MockClient) DatasetGetUserProperty(ctx context.Context, name, key strin
 	}
 	if prop, ok := ds.UserProperties[key]; ok {
 		return prop.Value, nil
+	}
+	// Dual-read like the normalized wire view: a canonical key finds a stored
+	// legacy stamp.
+	if legacyTwin, ok := LegacyCSIPropertyKey(key); ok {
+		if prop, ok := ds.UserProperties[legacyTwin]; ok {
+			return prop.Value, nil
+		}
 	}
 	return "", nil
 }
@@ -1603,7 +1656,7 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 		snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
 	}
 	m.Snapshots[id] = snap
-	return snap, nil
+	return mockSnapshotResponse(snap), nil
 }
 
 // datasetUserPropertiesLocked snapshots the inheritable user properties of a
@@ -2035,7 +2088,9 @@ func (m *MockClient) SnapshotRemoveUserProperties(ctx context.Context, snapshotI
 	if !ok {
 		return notFoundAPIError("snapshot not found")
 	}
-	for _, key := range keys {
+	// Mirror the real legacy-backend client: canonical keys remove their legacy
+	// spelling too.
+	for _, key := range expandCSIPropertyRemovalKeys(keys) {
 		delete(snap.UserProperties, key)
 	}
 	return nil

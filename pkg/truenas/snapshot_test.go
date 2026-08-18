@@ -58,7 +58,8 @@ func TestParseSnapshotTrueNAS26WireShape(t *testing.T) {
 	assert.Equal(t, "tank/k8s/volumes/pvc-123@snap-1", snapshot.ID)
 	assert.Equal(t, "snap-1", snapshot.Name)
 	assert.Equal(t, uint64(331921), snapshot.CreateTXG)
-	assert.Equal(t, "true", snapshot.UserProperties["truenas-csi:managed_resource"].Value)
+	assert.Equal(t, "true", snapshot.UserProperties["scale-csi:managed_resource"].Value)
+	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:managed_resource", "legacy key must be folded out of UserProperties")
 }
 
 func TestSnapshotResourceQueryTrueNAS26FlatUserPropertiesAndDetectionCache(t *testing.T) {
@@ -127,7 +128,8 @@ func TestSnapshotResourceQueryTrueNAS26FlatUserPropertiesAndDetectionCache(t *te
 		assert.True(t, snapshots[0].ResourceQuery)
 		assert.Equal(t, "snap-1", snapshots[0].Name)
 		assert.Equal(t, uint64(331921), snapshots[0].CreateTXG)
-		assert.Equal(t, "true", snapshots[0].UserProperties["truenas-csi:managed_resource"].Value)
+		assert.Equal(t, "true", snapshots[0].UserProperties["scale-csi:managed_resource"].Value)
+		assert.NotContains(t, snapshots[0].UserProperties, "truenas-csi:managed_resource", "legacy key must be folded out of UserProperties")
 	}
 	snapshot, err := client.SnapshotGet(context.Background(), "tank/k8s/volumes/pvc-123@snap-1")
 	require.NoError(t, err)
@@ -181,7 +183,8 @@ func TestSnapshotResourceQueryTrueNAS26RecursiveFilteringAndPagination(t *testin
 	snapshot, err := client.SnapshotFindByName(context.Background(), "tank/k8s/volumes", "target-snap")
 	require.NoError(t, err)
 	require.NotNil(t, snapshot)
-	assert.Equal(t, "true", snapshot.UserProperties["truenas-csi:managed_resource"].Value)
+	assert.Equal(t, "true", snapshot.UserProperties["scale-csi:managed_resource"].Value)
+	assert.NotContains(t, snapshot.UserProperties, "truenas-csi:managed_resource", "legacy key must be folded out of UserProperties")
 
 	for range 2 {
 		options := <-optionsSeen
@@ -887,7 +890,8 @@ func TestSnapshotGet_Success(t *testing.T) {
 	assert.Equal(t, "snap-get", snap.Name)
 	assert.Equal(t, int64(2048), snap.GetSnapshotSize())
 	assert.Equal(t, int64(1700000000), snap.GetCreationTime())
-	assert.Equal(t, "pvc-original", snap.UserProperties["truenas-csi:source_volume"].Value)
+	assert.Equal(t, "pvc-original", snap.UserProperties["scale-csi:source_volume"].Value)
+	assert.NotContains(t, snap.UserProperties, "truenas-csi:source_volume", "legacy key must be folded out of UserProperties")
 }
 
 // TestSnapshotGet_NotFound tests getting a non-existent snapshot

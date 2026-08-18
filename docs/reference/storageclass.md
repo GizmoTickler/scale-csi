@@ -82,7 +82,7 @@ the foreign-snapshot guard — only when ALL of the following hold:
    property, rendered in the NAS's own civil timezone, within a ±2 second
    clock-skew allowance; and
 7. that timezone is the one RECORDED on the dataset when the task was created
-   (`truenas-csi:snapshot_task_timezone`, local source only) AND is still the
+   (`scale-csi:snapshot_task_timezone`, local source only) AND is still the
    NAS's live zone.
 
 Anything else stays FOREIGN and is preserved by the default policy: an operator
@@ -102,7 +102,7 @@ Reading only the CURRENT zone is not enough, because not every reconfiguration
 changes the civil fields: `America/New_York` → `America/Toronto` never does, and
 a switch to a fixed `-05:00` does not for a winter-created snapshot. So the zone
 in force when the TASK was created is WRITTEN DOWN on the volume's own dataset
-(`truenas-csi:snapshot_task_timezone`) and compared against the live value. It is
+(`scale-csi:snapshot_task_timezone`) and compared against the live value. It is
 write-once — a CreateVolume retry after a re-home must not overwrite the evidence
 — and it is read only when its ZFS source is `local`, so a clone, a
 replication-received dataset or a detached copy that merely INHERITS it proves
@@ -326,7 +326,7 @@ no-op, and the driver logs a warning naming each drifted field.
 ### These options are persisted per volume
 
 The resolved options are stamped onto the volume's dataset as
-`truenas-csi:block_*` / `truenas-csi:nvme_*` user properties at `CreateVolume`,
+`scale-csi:block_*` / `scale-csi:nvme_*` user properties at `CreateVolume`,
 and **only** for the parameters the class actually set. Every later path that
 rebuilds the share for an existing volume — `ControllerPublishVolume`, the
 startup attachment reconcile, a DR/restore rebuild — reads those properties, so
@@ -512,11 +512,11 @@ against. Provenance is therefore tied to the snapshot itself:
 > against, then record it on the **snapshot**:
 >
 > ```sh
-> zfs set truenas-csi:block_blocksize=4096 \
->         truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...@snap-...
+> zfs set scale-csi:block_blocksize=4096 \
+>         scale-csi:block_pblocksize=true tank/k8s/volumes/pvc-...@snap-...
 > ```
 >
-> `truenas-csi:block_blocksize` must be one of 512, 1024, 2048, 4096; any other
+> `scale-csi:block_blocksize` must be one of 512, 1024, 2048, 4096; any other
 > value is treated as untrusted and the restore keeps failing closed.
 >
 > Snapshots taken from this version on carry it automatically. NFS snapshots are
@@ -529,7 +529,7 @@ install-wide defaults for **new** volumes only. Neither can reach a volume that
 already holds data, in either direction:
 
 - **Every extent the driver creates or observes is recorded on its dataset**
-  (`truenas-csi:block_blocksize`, `truenas-csi:block_pblocksize`), including for
+  (`scale-csi:block_blocksize`, `scale-csi:block_pblocksize`), including for
   a StorageClass that opts into nothing — what a volume *has* is a different fact
   from what its class *asked for*. Volumes provisioned before this shipped are
   recorded the first time the driver sees their extent alive (a publish, a
@@ -547,13 +547,13 @@ already holds data, in either direction:
   be. It supplies a value only where the storage is **provably** free of
   block-addressed data, and that proof is POSITIVE, never the absence of the
   driver's own bookkeeping: either the zvol was created by this very call, or it
-  carries this driver instance's `truenas-csi:driver_instance_id` ownership stamp
+  carries this driver instance's `scale-csi:driver_instance_id` ownership stamp
   with ZFS source `local` **and** no witness of ever having been exported. A zvol
   the driver did not create — imported, attached by an administrator, or restored
   by some other tool — cannot supply that proof and is refused. An *inherited*
   ownership stamp is the source dataset's fact, not the clone's, and does not
   count. Reconciliation may add a separate
-  `truenas-csi:driver_instance_id_adopted` marker to a legacy dataset for
+  `scale-csi:driver_instance_id_adopted` marker to a legacy dataset for
   cleanup ownership; that marker is not create-time provenance and does not
   qualify the dataset for this proof.
 - **Two records that disagree are never combined.** Where a destination's own
@@ -571,11 +571,11 @@ already holds data, in either direction:
   restoring the original extent, or by recording the real values:
 
   ```sh
-  zfs set truenas-csi:block_blocksize=4096 \
-          truenas-csi:block_pblocksize=true tank/k8s/volumes/pvc-...
+  zfs set scale-csi:block_blocksize=4096 \
+          scale-csi:block_pblocksize=true tank/k8s/volumes/pvc-...
   ```
 
-  `truenas-csi:block_blocksize` must be one of **512, 1024, 2048, 4096** — the
+  `scale-csi:block_blocksize` must be one of **512, 1024, 2048, 4096** — the
   sizes an extent can actually be created at. A stored value outside that set (a
   typo in the command above) is treated as **untrusted**: it records nothing, the
   volume reads as unrecorded, and the rebuild keeps failing closed rather than
@@ -1383,7 +1383,7 @@ Downgrading the driver below the version that ships encryption while encrypted
 volumes are live leaves those volumes stranded: the older driver has no unlock
 logic, so `ControllerPublishVolume` will not unlock a locked dataset and the
 share/extent build fails — the volume is DEAD (though not lost; the keys are
-still safe in the Secret). The `truenas-csi:encryption` user-property the driver
+still safe in the Secret). The `scale-csi:encryption` user-property the driver
 stamps is ignored by older drivers, so the rollback itself is safe; the hazard is
 running encrypted volumes under a driver that cannot unlock them. Manual
 `pool.dataset.unlock` recovers a stranded volume. Plaintext volumes are

@@ -126,7 +126,7 @@ midclt call pool.snapshottask.query '[["dataset","^","<pool>/<parentDataset>/"]]
 > proves ownership by converting each snapshot's `creation` property into that
 > same clock and demanding exact agreement. The zone is not inferred from the
 > names: the driver records the IANA zone in force when the task was created
-> (`truenas-csi:snapshot_task_timezone`, on the volume's own dataset) and
+> (`scale-csi:snapshot_task_timezone`, on the volume's own dataset) and
 > requires it to still equal the NAS's live `system.general.config` value. So a
 > re-home is detected as a FACT, including the cases where the civil fields
 > happen to be identical (`America/New_York` -> `America/Toronto`, or a switch to
@@ -933,7 +933,7 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
   no source-snapshot pin. Volume-to-volume clones (PVC dataSource) are always
   clone-backed regardless of that setting.
 - After upgrading a NAS from TrueNAS 25.x to 26.0, CSI snapshots created by
-  older driver versions without `truenas-csi:csi_snapshot_name` are omitted
+  older driver versions without `scale-csi:csi_snapshot_name` are omitted
   from `ListSnapshots`. Restore and deletion by snapshot ID continue to work.
 - TrueNAS 26.0 (including beta builds) silently ignores
   `pool.snapshot.update` requests that use `user_properties_update` or

@@ -278,7 +278,7 @@ and ZFS user properties.
 ## ZFS User Properties
 
 The driver stores **all durable per-volume CSI metadata** as ZFS user properties
-prefixed with `truenas-csi:` — there is no external database for it, which is what
+prefixed with `scale-csi:` — there is no external database for it, which is what
 makes the driver restart-recoverable and ZFS-replication-friendly (see the
 [disaster-recovery guide](guides/disaster-recovery.md)). Two exceptions are
 **not** ZFS properties and must be managed/recovered separately: CHAP **secret
@@ -290,52 +290,52 @@ mode) is property-backed — see the CHAP properties below.
 
 | Property | Description |
 |----------|-------------|
-| `truenas-csi:managed_resource` | Marks CSI-managed datasets (read with property source; a *local* value is required — an inherited one does not prove ownership) |
-| `truenas-csi:driver_instance_id` | Stamps which driver instance owns the dataset; never overwritten once set (local, inherited, or foreign) |
-| `truenas-csi:csi_volume_name` | Original PVC/request name |
-| `truenas-csi:provision_success` | Marks provisioning as completed |
-| `truenas-csi:requested_size_bytes` | Requested CSI capacity, stored only for quota-disabled NFS/filesystem volumes where the backend quota cannot otherwise preserve it |
+| `scale-csi:managed_resource` | Marks CSI-managed datasets (read with property source; a *local* value is required — an inherited one does not prove ownership) |
+| `scale-csi:driver_instance_id` | Stamps which driver instance owns the dataset; never overwritten once set (local, inherited, or foreign) |
+| `scale-csi:csi_volume_name` | Original PVC/request name |
+| `scale-csi:provision_success` | Marks provisioning as completed |
+| `scale-csi:requested_size_bytes` | Requested CSI capacity, stored only for quota-disabled NFS/filesystem volumes where the backend quota cannot otherwise preserve it |
 
 **Content source (clones/restores)**
 
 | Property | Description |
 |----------|-------------|
-| `truenas-csi:csi_volume_content_source_type` / `_id` | Records the snapshot or volume a restore/clone was created from |
-| `truenas-csi:csi_volume_origin_snapshot` | Principally the deterministic temporary origin snapshot used for a volume-to-volume clone, so it can be cleaned up when the clone is deleted; a `detached` copy explicitly sets it to `-` |
+| `scale-csi:csi_volume_content_source_type` / `_id` | Records the snapshot or volume a restore/clone was created from |
+| `scale-csi:csi_volume_origin_snapshot` | Principally the deterministic temporary origin snapshot used for a volume-to-volume clone, so it can be cleaned up when the clone is deleted; a `detached` copy explicitly sets it to `-` |
 
 **Crash-consistency bookkeeping**
 
 | Property | Description |
 |----------|-------------|
-| `truenas-csi:inflight_*` | In-flight markers written before a **content-source clone/copy** mutation and cleared on success; the only handle a crash-recovery sweep can act on (a fresh dataset create has no marker) |
-| `truenas-csi:recovery_nonce` | Write-then-verify identity token for lost-race detection |
-| `truenas-csi:tombstone_*` | Deferred-delete tombstone ledger. The property key is a hash of the tombstone snapshot ID; v2 stores the snapshot's `CreateTXG` in the entry as an extra immutable identity predicate (degrading to the v1 full-ID + creation-seconds check when TXG is unavailable). v1 entries remain readable |
-| `truenas-csi:publication_*` | Durable per-volume publication records (see fencing, below) |
-| `truenas-csi:internal_resource` | Marks internal temporary snapshots used by volume-to-volume cloning so they are excluded from `ListSnapshots` (it does **not** mark the `.csi-bookkeeping` dataset — that is identified by its reserved leaf name) |
-| `truenas-csi:snapshot_naming_schema` / `truenas-csi:snapshot_task_id` | The driver-minted strftime naming schema bound to a scheduled volume's periodic-snapshot task, and that task's id (GF2/E2) |
-| `truenas-csi:snapshot_task_corroboration` | Records that this driver instance observed its OWN live, dataset-scoped task carrying that schema, written just before the task is deleted so a RETRIED `DeleteVolume` can still recognize the volume's scheduled snapshots instead of wedging behind the foreign guard |
+| `scale-csi:inflight_*` | In-flight markers written before a **content-source clone/copy** mutation and cleared on success; the only handle a crash-recovery sweep can act on (a fresh dataset create has no marker) |
+| `scale-csi:recovery_nonce` | Write-then-verify identity token for lost-race detection |
+| `scale-csi:tombstone_*` | Deferred-delete tombstone ledger. The property key is a hash of the tombstone snapshot ID; v2 stores the snapshot's `CreateTXG` in the entry as an extra immutable identity predicate (degrading to the v1 full-ID + creation-seconds check when TXG is unavailable). v1 entries remain readable |
+| `scale-csi:publication_*` | Durable per-volume publication records (see fencing, below) |
+| `scale-csi:internal_resource` | Marks internal temporary snapshots used by volume-to-volume cloning so they are excluded from `ListSnapshots` (it does **not** mark the `.csi-bookkeeping` dataset — that is identified by its reserved leaf name) |
+| `scale-csi:snapshot_naming_schema` / `scale-csi:snapshot_task_id` | The driver-minted strftime naming schema bound to a scheduled volume's periodic-snapshot task, and that task's id (GF2/E2) |
+| `scale-csi:snapshot_task_corroboration` | Records that this driver instance observed its OWN live, dataset-scoped task carrying that schema, written just before the task is deleted so a RETRIED `DeleteVolume` can still recognize the volume's scheduled snapshots instead of wedging behind the foreign guard |
 
 **Backend share-object backreferences**
 
 | Property | Description |
 |----------|-------------|
-| `truenas-csi:truenas_nfs_share_id` | Associated NFS share ID |
-| `truenas-csi:truenas_iscsi_target_id` / `_extent_id` / `_targetextent_id` / `_initiator_id` | iSCSI object IDs |
-| `truenas-csi:truenas_nvmeof_subsystem_id` / `_namespace_id` / `_portsubsys_id` | NVMe-oF object IDs |
+| `scale-csi:truenas_nfs_share_id` | Associated NFS share ID |
+| `scale-csi:truenas_iscsi_target_id` / `_extent_id` / `_targetextent_id` / `_initiator_id` | iSCSI object IDs |
+| `scale-csi:truenas_nvmeof_subsystem_id` / `_namespace_id` / `_portsubsys_id` | NVMe-oF object IDs |
 
 **iSCSI CHAP policy (immutable per volume)**
 
 | Property | Description |
 |----------|-------------|
-| `truenas-csi:truenas_iscsi_auth_tag` | The `iscsi.auth` tag the target group's auth ref points at; stamped immutably at `CreateVolume` |
-| `truenas-csi:truenas_iscsi_auth_mode` | The immutable per-volume auth mode (`CHAP` or `CHAP_MUTUAL`); every fence pass reconstructs `authmethod`+auth purely from these two properties |
+| `scale-csi:truenas_iscsi_auth_tag` | The `iscsi.auth` tag the target group's auth ref points at; stamped immutably at `CreateVolume` |
+| `scale-csi:truenas_iscsi_auth_mode` | The immutable per-volume auth mode (`CHAP` or `CHAP_MUTUAL`); every fence pass reconstructs `authmethod`+auth purely from these two properties |
 
 The CHAP **credential** itself is never a ZFS property; it is a request-scoped
 CSI Secret, and the backing TrueNAS `iscsi.auth` peer is configuration-database
 state that does not replicate with the pool.
 
-Snapshots carry their own identity properties (`truenas-csi:csi_snapshot_name`,
-`truenas-csi:csi_snapshot_source_volume_id`, `truenas-csi:csi_share_volume_context`).
+Snapshots carry their own identity properties (`scale-csi:csi_snapshot_name`,
+`scale-csi:csi_snapshot_source_volume_id`, `scale-csi:csi_share_volume_context`).
 
 ## VolSync Integration
 
@@ -372,7 +372,7 @@ See [Snapshots and Clones Guide](guides/snapshots.md) for detailed usage instruc
 ## Publication records and backend fencing
 
 CSI publish state is always tracked in durable per-volume **publication records**
-(`truenas-csi:publication_*`). Single-node exclusivity, same-node republish
+(`scale-csi:publication_*`). Single-node exclusivity, same-node republish
 idempotency, synchronous stale-record takeover, and empty-node-id unpublish are
 enforced in **every** mode. `fencing.mode` governs only whether that state is
 *also* pushed into the backend transport allowlists:
@@ -397,7 +397,7 @@ crash-recoverable through ordered ZFS user-property writes. Recovery is
 fresh dataset create that crashes in an unstamped creation/share-property window
 fails closed and may require manual cleanup.
 
-- **In-flight markers** (`truenas-csi:inflight_*`) are written *before* a
+- **In-flight markers** (`scale-csi:inflight_*`) are written *before* a
   **content-source clone/copy** mutation and cleared on success. After a crash, a
   marked-but-unstamped clone/copy dataset is the only remnant a recovery sweep can
   prove is ours and reclaim. A plain (non-content-source) create has no marker.

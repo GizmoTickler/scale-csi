@@ -289,7 +289,7 @@ func TestReconcileStampAdoptionSkipsInheritedInstanceStamp(t *testing.T) {
 // must be able to adopt the legacy dataset for tombstone ownership, while an
 // iSCSI rebuild still refuses to apply the controller default to its bytes.
 func TestAdoptedLegacyOwnershipDoesNotProveDataFree(t *testing.T) {
-	const adoptedMarker = "truenas-csi:driver_instance_id_adopted"
+	const adoptedMarker = "scale-csi:driver_instance_id_adopted"
 	ctx := context.Background()
 	pv := boundReconcilePV("legacy-adopted", "csi.scale.io")
 	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)

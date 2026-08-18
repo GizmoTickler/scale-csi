@@ -1,7 +1,7 @@
 # Disaster recovery and cross-site replication
 
 scale-csi stores **all** of a volume's metadata as ZFS user-properties on the dataset
-itself (`truenas-csi:*`) — there is no external database. This makes the driver
+itself (`scale-csi:*`) — there is no external database. This makes the driver
 restart-recoverable and, importantly, makes ZFS-native replication a viable DR path:
 when a dataset is replicated with `zfs send | zfs recv` (a TrueNAS replication task),
 its user-properties travel with the stream, so the destination has the per-volume
@@ -9,6 +9,12 @@ CSI metadata the driver needs to re-adopt the volume. Two things are **not** ZFS
 properties and must be recovered separately: the export configuration
 (auto-recreated on publish, below) and — for CHAP volumes — the TrueNAS
 `iscsi.auth` peer and its credential (which must be pre-created on the DR side).
+
+> **Legacy property spelling:** volumes and snapshots created before v1.10.0 may
+> carry these properties under the older `truenas-csi:*` spelling. The driver
+> reads both spellings equivalently, so replicated pre-rename datasets and
+> snapshots re-adopt exactly the same way — no property rewrite is needed before
+> or after a failover.
 
 The pieces that do **not** replicate are TrueNAS **configuration-database** state:
 the **export configuration** (the iSCSI target/extent, NVMe-oF
@@ -18,16 +24,16 @@ config DB, not on the pool, so a `zfs recv` restores the data (the zvol/dataset)
 but not them. For **NFS/NVMe and non-CHAP** exports the driver handles this
 automatically: `ControllerPublishVolume` calls `ensureShareExists`, which
 **verifies each export object by ID and recreates it if missing** from the
-volume's replicated `truenas-csi:*` properties. So a non-CHAP restored volume's
+volume's replicated `scale-csi:*` properties. So a non-CHAP restored volume's
 export is rebuilt the first time a pod attaches it — no manual re-export step.
 
 > This is the exact path exercised by the `ensureShareExists` GET-by-ID verification:
-> a stored `truenas-csi:*_id` property that no longer resolves on the destination is
+> a stored `scale-csi:*_id` property that no longer resolves on the destination is
 > treated as "missing" and the target/namespace/share is recreated.
 
 > **CHAP volumes need the peer pre-created on the DR TrueNAS.** ZFS replication
 > carries the per-volume CHAP *policy* properties
-> (`truenas-csi:truenas_iscsi_auth_tag`/`_mode`), but the `iscsi.auth` peer and
+> (`scale-csi:truenas_iscsi_auth_tag`/`_mode`), but the `iscsi.auth` peer and
 > its credential live in the config DB and do **not** replicate.
 > `ControllerPublishVolume`/`ensureShareExists` has no CSI Secret and does **not**
 > recreate the peer, so recreating the export with a stored auth tag is **not** a
@@ -41,7 +47,7 @@ export is rebuilt the first time a pod attaches it — no manual re-export step.
 | Item | Travels with `zfs send`? | How to recover |
 |------|--------------------------|----------------|
 | Volume data (dataset/zvol) | ✅ yes | TrueNAS replication task |
-| Volume metadata (`truenas-csi:*` props) | ✅ yes (with `--props`/"include properties") | replicated with the dataset |
+| Volume metadata (`scale-csi:*` props) | ✅ yes (with `--props`/"include properties") | replicated with the dataset |
 | CSI snapshots (on the pool) | ✅ yes (recursive replication) | replicated; re-import the `VolumeSnapshotContent` |
 | iSCSI/NVMe/NFS **export** config | ❌ no (config DB, not pool) | **auto-recreated** by `ensureShareExists` on publish |
 | iSCSI **CHAP `iscsi.auth` peer** (tag/username/mode/credential) | ❌ no (config DB, not pool) | **pre-create/re-key manually** on the DR TrueNAS before first attach (CHAP policy tag/mode props do replicate) |
@@ -53,7 +59,7 @@ export is rebuilt the first time a pod attaches it — no manual re-export step.
    task for the dataset configured as chart value `zfs.parentDataset` (driver
    config key `zfs.datasetParentName`, e.g. `pool/csi`) to the DR TrueNAS. Use
    **recursive** + **include dataset properties** so every child volume and its
-   `truenas-csi:*` metadata (and CSI snapshots) are carried over.
+   `scale-csi:*` metadata (and CSI snapshots) are carried over.
 
    > **Snapshot-lifecycle cost of this task.** A periodic/replication task's own
    > snapshots created *under* the CSI parent are **foreign** to the driver and by
@@ -155,7 +161,7 @@ identity churn or stale backend hosts, not a dead node.
   (this is the standard CSI shared-responsibility model — see
   [Production → Known limitations](../production.md#current-known-limitations)).
 - **Publication records replicate too.** The durable per-volume publication
-  records are `truenas-csi:publication_*` user-properties, so a replicated
+  records are `scale-csi:publication_*` user-properties, so a replicated
   dataset can arrive on the DR side still carrying a record naming a primary-side
   node. This is safe: the driver performs synchronous stale-record takeover on
   publish, so the first attach on the DR cluster reconciles the record to the new

@@ -1673,11 +1673,11 @@ func validateNonNegativeConfig(cfg *Config) error {
 // Deprecated: Use GetShareType with StorageClass parameters instead.
 func (c *Config) GetDriverShareType() ShareType {
 	switch c.DriverName {
-	case "org.scale.csi.nfs", "truenas-nfs":
+	case "org.scale.csi.nfs":
 		return ShareTypeNFS
-	case "org.scale.csi.iscsi", "truenas-iscsi":
+	case "org.scale.csi.iscsi":
 		return ShareTypeISCSI
-	case "org.scale.csi.nvmeof", "truenas-nvmeof":
+	case "org.scale.csi.nvmeof":
 		return ShareTypeNVMeoF
 	default:
 		// Default to NFS if not specified
