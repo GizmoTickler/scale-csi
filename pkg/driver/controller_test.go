@@ -3216,21 +3216,21 @@ func TestDeleteVolumeRefusalNamesOwnTombstonesNotForeignTasks(t *testing.T) {
 // for the cases the end-to-end test cannot cheaply build.
 func TestForeignSnapshotRefusalMessageMixedPopulations(t *testing.T) {
 	t.Run("no tombstones keeps the historical foreign-task advice", func(t *testing.T) {
-		message := foreignSnapshotRefusalMessage("vol", 2, 0, 0)
+		message := foreignSnapshotRefusalMessage("vol", 2, 0, 0, time.Hour)
 		assert.Contains(t, message, "non-CSI snapshots")
 		assert.Contains(t, message, "periodic-snapshot or replication task")
 		assert.NotContains(t, message, "tombstone")
 	})
 
 	t.Run("a mixed population scopes the foreign advice to the foreign ones", func(t *testing.T) {
-		message := foreignSnapshotRefusalMessage("vol", 3, 0, 1)
+		message := foreignSnapshotRefusalMessage("vol", 3, 0, 1, time.Hour)
 		assert.Contains(t, message, "periodic-snapshot or replication task")
 		assert.Contains(t, message, "covers only 2 of them")
 		assert.Contains(t, message, "1 are this driver's own deferred-deletion tombstones")
 	})
 
 	t.Run("the unproven-scheduled correction still composes", func(t *testing.T) {
-		message := foreignSnapshotRefusalMessage("vol", 3, 2, 1)
+		message := foreignSnapshotRefusalMessage("vol", 3, 2, 1, time.Hour)
 		assert.Contains(t, message, "covers only 2 of them")
 		assert.Contains(t, message, "scale_csi_scheduled_snapshot_unproven_total")
 	})

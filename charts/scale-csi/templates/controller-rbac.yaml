@@ -50,6 +50,14 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments/status"]
     verbs: ["patch"]
+  # VolumeAttributesClass (storage.k8s.io/v1). Unconditional, not sidecar-gated:
+  # the driver implements ControllerModifyVolume (v1.9.0), and csi-resizer v2.x
+  # starts its VolumeAttributesClass informer unconditionally — without this
+  # rule the reflector wedges in a forbidden list/watch retry loop (~190
+  # errors/hr observed in production, 2026-08-19).
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattributesclasses"]
+    verbs: ["get", "list", "watch"]
   # Snapshotter permissions
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotclasses"]

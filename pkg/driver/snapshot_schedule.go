@@ -1032,14 +1032,22 @@ func (d *Driver) foreignSnapshotsOnly(snapshots []*truenas.Snapshot, dataset *tr
 // blocking is the total number of preserved snapshots the refusal is about, so
 // an all-tombstone refusal can drop the foreign-task advice entirely instead of
 // merely appending a correction to it.
-func foreignSnapshotRefusalMessage(volumeID string, blocking, unproven, tombstones int) string {
+//
+// tombstoneMinAge is quoted so the message states the ACTUAL clearing bound.
+// The previous wording ("clear automatically on a later reconcile pass")
+// implied minutes; the real bound is the first reconcile pass that runs after
+// the tombstone is older than the gate, which with a scheduled CronJob can be
+// the NEXT scheduled run (2026-08-19 field incident: 160 identical DeleteVolume
+// failures over 22h read as a transient because of this wording).
+func foreignSnapshotRefusalMessage(volumeID string, blocking, unproven, tombstones int, tombstoneMinAge time.Duration) string {
 	if tombstones > 0 && tombstones >= blocking {
 		return fmt.Sprintf(
 			"volume %s cannot be deleted yet: all %d snapshots blocking it are this driver's own deferred-deletion tombstones "+
 				"awaiting the reconcile reaper (a DeleteSnapshot renamed them because the snapshot still had a live clone). "+
-				"They clear automatically on a later reconcile pass and the delete then succeeds — do NOT set "+
-				"zfs.destroyForeignSnapshotsOnDelete for them; nothing foreign is involved",
-			volumeID, blocking)
+				"The reaper clears each one on the first reconcile pass that runs after the tombstone is older than "+
+				"reconcile.tombstoneMinAge (%v) — with a scheduled reconcile CronJob that can be as late as the next scheduled "+
+				"run — and the delete then succeeds. Do NOT set zfs.destroyForeignSnapshotsOnDelete for them; nothing foreign is involved",
+			volumeID, blocking, tombstoneMinAge)
 	}
 	message := fmt.Sprintf("volume %s has non-CSI snapshots (likely from a TrueNAS periodic-snapshot or replication task on the parent dataset); delete them, or exclude the CSI parent dataset from snapshot tasks, or set zfs.destroyForeignSnapshotsOnDelete=true to allow the driver to remove them", volumeID)
 	if tombstones > 0 {

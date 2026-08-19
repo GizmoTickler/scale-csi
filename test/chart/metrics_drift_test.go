@@ -299,6 +299,7 @@ func TestChartPrometheusRuleRenders(t *testing.T) {
 		"ScaleCSIJobDispatcherUnsubscribed",
 		"ScaleCSIDeleteResidualCleanupFailing",
 		"ScaleCSISustainedLockContention",
+		"ScaleCSIOperationFailedPreconditionStuck",
 	} {
 		if !strings.Contains(rendered, "- alert: "+alert) {
 			t.Errorf("prometheusrule render missing alert %q", alert)

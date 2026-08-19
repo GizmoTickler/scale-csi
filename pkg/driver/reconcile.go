@@ -232,6 +232,11 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		RecordReconcileFailure("configuration")
 		return report, err
 	}
+	tombstoneMinAge, err := d.reconcileTombstoneMinAge(minOrphanAge)
+	if err != nil {
+		RecordReconcileFailure("configuration")
+		return report, err
+	}
 
 	datasets, err := d.listAllManagedDatasets(ctx)
 	if err != nil {
@@ -272,7 +277,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	managedBackendVolumeCount := d.classifyOrphanVolumes(ctx, now, datasets, kubeState, minOrphanAge, &report)
 	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, kubeState, minOrphanAge, &report)
 	d.countScheduledSnapshots(ctx, unowned, datasets, &report)
-	d.classifyTombstones(now, tombstones, ledger, minOrphanAge, &report)
+	d.classifyTombstones(now, tombstones, ledger, tombstoneMinAge, &report)
 
 	// GF2/E3 background promote (opt-in zfs.promoteRestoredClones): free
 	// clone-restored volumes from their origin-snapshot pin when each is the
@@ -360,7 +365,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 
 	logReconcilePlan(&report, opts.Delete, minOrphanAge)
 
-	if err := d.runReconcileDeletePhase(ctx, opts, &report, kubeState, minOrphanAge, parentDataset, managedBackendVolumeCount, managedBackendSnapshotCount); err != nil {
+	if err := d.runReconcileDeletePhase(ctx, opts, &report, kubeState, minOrphanAge, tombstoneMinAge, parentDataset, managedBackendVolumeCount, managedBackendSnapshotCount); err != nil {
 		return report, err
 	}
 	return report, nil
@@ -582,7 +587,14 @@ func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Sna
 // entry: the name shape alone is NOT provenance — a user snapshot may
 // legitimately be named *-csi-deleted-<n> and must never be counted, reaped, or
 // even reported. Extracted verbatim from reconcileOrphans (Batch 18 R2).
-func (d *Driver) classifyTombstones(now time.Time, tombstones []*truenas.Snapshot, ledger map[string]tombstoneLedgerEntry, minOrphanAge time.Duration, report *ReconcileReport) {
+//
+// The age gate here is tombstoneMinAge (default 1h), NOT minOrphanAge: a
+// ledger-proven tombstone is the driver's own object, and a gate equal to the
+// reconcile CronJob period turns every post-run tombstone into a 24-48h
+// DeleteVolume stall (2026-08-19 field incident). Age-gated skips are logged
+// at V(2) — the previous silent continue made a live, ongoing DeleteVolume
+// failure invisible in the reaper's own output.
+func (d *Driver) classifyTombstones(now time.Time, tombstones []*truenas.Snapshot, ledger map[string]tombstoneLedgerEntry, tombstoneMinAge time.Duration, report *ReconcileReport) {
 	for _, snap := range tombstones {
 		entry, recorded := ledger[tombstoneLedgerKey(snap.ID)]
 		if !recorded || entry.Snapshot != snap.ID {
@@ -597,10 +609,13 @@ func (d *Driver) classifyTombstones(now time.Time, tombstones []*truenas.Snapsho
 			klog.Warningf("Orphan reconcile: skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name and ledger entry", snap.ID)
 			continue
 		}
-		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
+		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), tombstoneMinAge)
 		if !eligible {
 			if snap.GetCreationTime() <= 0 {
 				klog.Warningf("Orphan reconcile: skipping tombstone snapshot %s because its creation time is unavailable", snap.ID)
+			} else {
+				klog.V(2).Infof("Orphan reconcile: tombstone %s age-gated (age=%v < tombstoneMinAge=%v, eligible at %s); its blocked DeleteVolume keeps failing until a pass runs after that",
+					snap.ID, age.Round(time.Second), tombstoneMinAge, createdAt.Add(tombstoneMinAge).Format(time.RFC3339))
 			}
 			continue
 		}
@@ -675,7 +690,7 @@ func logReconcilePlan(report *ReconcileReport, deleteEnabled bool, minOrphanAge 
 // safety brakes, re-lists Kubernetes state immediately before mutation, and
 // invokes the guarded deleters. Extracted verbatim from reconcileOrphans
 // (Batch 18 R2).
-func (d *Driver) runReconcileDeletePhase(ctx context.Context, opts ReconcileOptions, report *ReconcileReport, kubeState *kubernetesReconcileState, minOrphanAge time.Duration, parentDataset *truenas.Dataset, managedBackendVolumeCount, managedBackendSnapshotCount int) error {
+func (d *Driver) runReconcileDeletePhase(ctx context.Context, opts ReconcileOptions, report *ReconcileReport, kubeState *kubernetesReconcileState, minOrphanAge, tombstoneMinAge time.Duration, parentDataset *truenas.Dataset, managedBackendVolumeCount, managedBackendSnapshotCount int) error {
 	if !opts.Delete {
 		return nil
 	}
@@ -710,6 +725,7 @@ func (d *Driver) runReconcileDeletePhase(ctx context.Context, opts ReconcileOpti
 		report,
 		currentState,
 		minOrphanAge,
+		tombstoneMinAge,
 		d.config.Reconcile.Delete.MaxPerRun,
 		snapshotDeleteBlockReason,
 		parentDataset,
@@ -827,6 +843,58 @@ func (d *Driver) reconcileMinOrphanAge(requested time.Duration) (time.Duration, 
 		return 0, fmt.Errorf("reconcile minimum orphan age must be positive")
 	}
 	return minAge, nil
+}
+
+// defaultTombstoneMinAge is the fallback ledger-proven tombstone age gate,
+// applied both at config load and when the resolver sees an unset value.
+const defaultTombstoneMinAge = time.Hour
+
+// effectiveTombstoneMinAge is the message-surface variant of
+// reconcileTombstoneMinAge: it never errors, degrading to the default so a
+// refusal message can always quote a concrete bound.
+func (d *Driver) effectiveTombstoneMinAge() time.Duration {
+	if d.config != nil {
+		if gate, err := d.config.Reconcile.TombstoneMinAgeDuration(); err == nil && gate > 0 {
+			return gate
+		}
+	}
+	return defaultTombstoneMinAge
+}
+
+// reconcileTombstoneMinAge resolves the age gate for LEDGER-PROVEN tombstones.
+// It is deliberately decoupled from minOrphanAge: field incident (2026-08-19,
+// pvc-d1d92818) showed that a tombstone gate equal to the reconcile CronJob
+// period guarantees a 24-48h DeleteVolume stall for any tombstone created
+// after the daily run — the next pass finds it minutes short of eligible and
+// the one after that is a full period later. A ledger-proven tombstone is the
+// driver's own object with authoritative creation-time provenance; it never
+// needed the unproven-object safety window. The gate never exceeds
+// minOrphanAge even if misconfigured larger.
+func (d *Driver) reconcileTombstoneMinAge(minOrphanAge time.Duration) (time.Duration, error) {
+	if d.config == nil {
+		return 0, fmt.Errorf("driver config is unavailable")
+	}
+	// An UNSET value defaults here as well as at config load: a ConfigMap
+	// rendered by a pre-1.10.3 chart carries no tombstoneMinAge key, and that
+	// upgrade path must get the fix, not an error. Only a present-but-invalid
+	// value is a configuration failure.
+	if strings.TrimSpace(d.config.Reconcile.TombstoneMinAge) == "" {
+		if minOrphanAge < defaultTombstoneMinAge {
+			return minOrphanAge, nil
+		}
+		return defaultTombstoneMinAge, nil
+	}
+	tombstoneMinAge, err := d.config.Reconcile.TombstoneMinAgeDuration()
+	if err != nil || tombstoneMinAge <= 0 {
+		if err != nil {
+			return 0, fmt.Errorf("parse reconcile tombstone minimum age: %w", err)
+		}
+		return 0, fmt.Errorf("reconcile tombstone minimum age must be positive")
+	}
+	if tombstoneMinAge > minOrphanAge {
+		return minOrphanAge, nil
+	}
+	return tombstoneMinAge, nil
 }
 
 func reconcileAge(now time.Time, creationUnix int64, minAge time.Duration) (time.Time, time.Duration, bool) {
@@ -1004,6 +1072,7 @@ func (d *Driver) deleteDetectedOrphans(
 	report *ReconcileReport,
 	currentState *kubernetesReconcileState,
 	minOrphanAge time.Duration,
+	tombstoneMinAge time.Duration,
 	maxPerRun int,
 	snapshotDeleteBlockReason string,
 	parent *truenas.Dataset,
@@ -1097,7 +1166,14 @@ func (d *Driver) deleteDetectedOrphans(
 		if deletionCapReached("tombstone-snapshot", tombstone.ID) {
 			continue
 		}
-		reaped, reason := d.reapTombstoneSnapshot(ctx, *tombstone, minOrphanAge, retire)
+		// The reap revalidation re-derives the same age gate classification used:
+		// tombstoneMinAge for ledger-proven tombstones, the full minOrphanAge for
+		// scan-fallback ones (whose provenance rests on retained identity alone).
+		reapGate := tombstoneMinAge
+		if tombstone.tombstoneScanFallback {
+			reapGate = minOrphanAge
+		}
+		reaped, reason := d.reapTombstoneSnapshot(ctx, *tombstone, reapGate, retire)
 		if !reaped {
 			d.recordReconcileSkip(report, "tombstone-snapshot", tombstone.ID, reason)
 			continue

@@ -53,6 +53,14 @@ func (d *Driver) detectTombstonesByScanFallback(
 		}
 		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
 		if !eligible {
+			// Scan-fallback tombstones keep the FULL minOrphanAge gate (their
+			// provenance rests on retained identity alone, unlike ledger-proven
+			// ones). Log the skip: a silent continue here hid a live, ongoing
+			// DeleteVolume failure from the reaper's own output (2026-08-19).
+			if snap.GetCreationTime() > 0 {
+				klog.V(2).Infof("Orphan reconcile: scan-fallback tombstone %s age-gated (age=%v < minOrphanAge=%v, eligible at %s)",
+					snap.ID, age.Round(time.Second), minOrphanAge, createdAt.Add(minOrphanAge).Format(time.RFC3339))
+			}
 			continue
 		}
 		sourceVolumeID := path.Base(snap.Dataset)
@@ -207,10 +215,14 @@ func snapshotIsLiveCSIObjectWithTombstoneShapedName(snap *truenas.Snapshot) bool
 // A snapshot that still has clones is a benign skip, not a failure. After a
 // successful reap the ledger entry is retired into the pass-level batch (flushed
 // at pass end; best-effort — the sweep retires leftovers).
+// minAge is the age gate the CLASSIFIER applied to this tombstone —
+// tombstoneMinAge for ledger-proven entries, the full minOrphanAge for
+// scan-fallback ones — so the locked revalidation below re-proves eligibility
+// against the same bar that nominated the object.
 func (d *Driver) reapTombstoneSnapshot(
 	ctx context.Context,
 	tombstone ReconcileObject,
-	minOrphanAge time.Duration,
+	minAge time.Duration,
 	retire *tombstoneRetirementBatch,
 ) (reaped bool, reason string) {
 	if tombstone.SourceVolumeID == "" {
@@ -309,7 +321,7 @@ func (d *Driver) reapTombstoneSnapshot(
 		// authoritative provenance that inheritance cannot forge.
 		return false, "tombstone source dataset carries csi_snapshot_name; retained identity may be inherited, not driver-written"
 	}
-	createdAt, _, eligible := reconcileAge(time.Now(), snapshot.GetCreationTime(), minOrphanAge)
+	createdAt, _, eligible := reconcileAge(time.Now(), snapshot.GetCreationTime(), minAge)
 	if !eligible || !createdAt.Equal(tombstone.CreatedAt) {
 		return false, "tombstone creation identity or age changed"
 	}

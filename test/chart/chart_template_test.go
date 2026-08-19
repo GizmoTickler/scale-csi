@@ -192,6 +192,43 @@ func TestChartTombstoneReaperScanFallbackPlumbing(t *testing.T) {
 	}
 }
 
+// TestChartTombstoneMinAgePlumbing proves the reconcile.tombstoneMinAge key
+// (v1.10.3; 2026-08-19 incident: a tombstone gate equal to the reconcile
+// CronJob period stalled a blocked DeleteVolume for 24-48h) renders end-to-end
+// into the driver configmap next to minOrphanAge: "1h" by default, and an
+// override propagates through values.schema.json into the render.
+func TestChartTombstoneMinAgePlumbing(t *testing.T) {
+	t.Run("default renders 1h", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml")
+		if !strings.Contains(out, "      tombstoneMinAge: \"1h\"\n") {
+			t.Errorf("default configmap must carry tombstoneMinAge: \"1h\"; got:\n%s", out)
+		}
+	})
+
+	t.Run("override renders through", func(t *testing.T) {
+		out := helmTemplate(t, "--show-only", "templates/configmap.yaml",
+			"--set", "reconcile.tombstoneMinAge=30m")
+		if !strings.Contains(out, "      tombstoneMinAge: \"30m\"\n") {
+			t.Errorf("--set reconcile.tombstoneMinAge=30m did not propagate into the rendered configmap; got:\n%s", out)
+		}
+	})
+}
+
+// TestChartControllerVolumeAttributesClassRBAC pins the VAC RBAC fix:
+// csi-resizer v2.x starts its VolumeAttributesClass informer unconditionally
+// and the driver implements ControllerModifyVolume (v1.9.0), so the controller
+// ClusterRole must grant volumeattributesclasses get/list/watch
+// UNCONDITIONALLY — not behind a sidecar flag. Without it the resizer's
+// reflector wedges in a forbidden list/watch hot loop (~190 errors/hr in
+// production, 2026-08-19).
+func TestChartControllerVolumeAttributesClassRBAC(t *testing.T) {
+	out := helmTemplate(t)
+	role := findManifest(t, decodeManifests(t, out), "ClusterRole", "scale-csi-controller")
+	if !roleHasRule(role, []string{"volumeattributesclasses"}, []string{"get", "list", "watch"}) {
+		t.Errorf("controller ClusterRole must unconditionally grant volumeattributesclasses get/list/watch")
+	}
+}
+
 // TestChartHoldCSISnapshotsPlumbing proves the GF2/E1 zfs.holdCsiSnapshots key is
 // removal-only rendered: ABSENT from the default configmap (so the default render
 // stays byte-identical to v1.4.1 and a rolled-back binary with no holdCsiSnapshots

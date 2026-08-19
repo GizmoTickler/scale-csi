@@ -1806,7 +1806,8 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		klog.Infof("Volume %s has %d snapshots blocking deletion (%d of them this driver's own deferred-deletion tombstones) and destroyForeignSnapshotsOnDelete is disabled; refusing before share deletion",
 			volumeID, len(foreignSnapshots), tombstones)
 		return nil, status.Error(codes.FailedPrecondition,
-			foreignSnapshotRefusalMessage(volumeID, len(foreignSnapshots), unprovenSnapshots, tombstones))
+			foreignSnapshotRefusalMessage(volumeID, len(foreignSnapshots), unprovenSnapshots, tombstones,
+				d.effectiveTombstoneMinAge()))
 	}
 
 	// Delete share first (errors are fatal to prevent orphaned targets)
@@ -1899,7 +1900,8 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			foreignSnapshots, unprovenSnapshots := d.foreignSnapshotsOnly(snapshots, ds, scheduledTaskSchema, scheduledZone, false)
 			if len(foreignSnapshots) > 0 && !d.config.ZFS.DestroyForeignSnapshotsOnDelete {
 				return nil, status.Error(codes.FailedPrecondition, foreignSnapshotRefusalMessage(
-					volumeID, len(foreignSnapshots), unprovenSnapshots, d.countProvenDriverTombstones(ctx, foreignSnapshots)))
+					volumeID, len(foreignSnapshots), unprovenSnapshots, d.countProvenDriverTombstones(ctx, foreignSnapshots),
+					d.effectiveTombstoneMinAge()))
 			}
 			klog.V(4).Infof("Volume %s has non-managed snapshots, deleting recursively", volumeID)
 			if delErr := d.recursiveDatasetDeleteWithHoldRecovery(ctx, datasetName); delErr != nil {

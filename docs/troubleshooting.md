@@ -330,6 +330,27 @@ kubectl patch pvc <pvc-name> -p '{"metadata":{"finalizers":null}}'
 kubectl delete pvc <pvc-name> --grace-period=0 --force
 ```
 
+### Tombstone-Blocked DeleteVolume
+
+A `DeleteVolume` that fails repeatedly with `FailedPrecondition` naming this
+driver's own deferred-deletion tombstones is waiting on the reconcile reaper,
+not broken. The refusal message states the clearing bound: the first reconcile
+pass that runs after the tombstone is older than `reconcile.tombstoneMinAge`
+(default 1h; ledger-proven tombstones only — scan-fallback tombstones wait the
+full `minOrphanAge`).
+
+```bash
+# See which tombstone blocks the volume and when it becomes eligible
+kubectl logs -n scale-csi deploy/scale-csi-controller | grep -i tombstone
+
+# Don't wait for the CronJob — trigger a guarded cleanup pass now
+kubectl create job --from=cronjob/scale-csi-reconcile reconcile-manual -n scale-csi
+```
+
+If the tombstone is age-eligible and still not reaped, check the reconcile
+pass output for a skip reason (provenance, holds, dependent clones) — see
+[Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources).
+
 ### Reset Circuit Breaker
 
 Restart the controller pod to reset the circuit breaker:
@@ -422,7 +443,7 @@ zfs list -o name,scale-csi:managed_resource -r <pool>
 ## Alerts → Runbook
 
 Every alert the chart's `PrometheusRule` can render (when
-`metrics.prometheusRule.enabled: true`), cross-linked to a runbook anchor. Nine
+`metrics.prometheusRule.enabled: true`), cross-linked to a runbook anchor. Ten
 of the rendered alerts additionally emit a `runbook_url` annotation pointing at
 the same target; the others (including `ScaleCSIPoolNearFull`) rely on this table
 for their runbook link.
@@ -435,6 +456,7 @@ for their runbook link.
 | `ScaleCSIHighTrueNASAPIFailureRate` | warning | [Session/Connection Issues](#sessionconnection-issues) |
 | `ScaleCSISustainedLockContention` | warning | [Performance Issues](#performance-issues) |
 | `ScaleCSIOperationErrorsSustained` | warning | [Volume Provisioning Failures](#volume-provisioning-failures) |
+| `ScaleCSIOperationFailedPreconditionStuck` | warning | [Tombstone-Blocked DeleteVolume](#tombstone-blocked-deletevolume) |
 | `ScaleCSISpentRestoreSnapshotBacklog` | warning | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
 | `ScaleCSISessionGCDisconnects` | warning | [Session/Connection Issues](#sessionconnection-issues) |
 | `ScaleCSIFencingTakeoverSpike` | warning | [Fencing takeover for a confirmed-dead node](guides/disaster-recovery.md#runbook-fencing-takeover-for-a-confirmed-dead-node) |

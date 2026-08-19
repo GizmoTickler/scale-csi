@@ -1,4 +1,52 @@
-# Release notes — v1.10.0 (next)
+# Release notes — v1.10.3 (next)
+
+## v1.10.3 — Tombstone reaper decoupled from the reconcile schedule + VAC RBAC
+
+### Fixed (HIGH): deferred-deletion tombstones stalled DeleteVolume for 24-48h
+
+- **The incident (2026-08-19):** the tombstone reaper's age gate was
+  `reconcile.minOrphanAge` (24h) — exactly the guarded-cleanup CronJob period.
+  A tombstone created after the daily run was never old enough on the next run
+  either (created 05:11 → the daily 04:20 cron finds age 23h09m => skipped;
+  the next chance is a full day later), so its volume's blocked `DeleteVolume`
+  retried identically for 24-48h (160 identical failures over 22h), and the
+  age-gated skip was invisible in the reaper's own output.
+- **The fix:** a new `reconcile.tombstoneMinAge` gate (default **1h**, capped
+  at `minOrphanAge`) applies to **ledger-proven** tombstones only — the
+  driver's own objects with authoritative creation-time identity. The 24h
+  orphan window exists for objects of unproven provenance, so scan-fallback
+  tombstones (no ledger entry; provenance rests on retained identity alone)
+  keep the full `minOrphanAge` gate.
+- **Observability:** age-gated skips are now logged at V(2) instead of a
+  silent continue, and the `DeleteVolume` refusal message now states the
+  actual bound under which the reaper clears the tombstone instead of
+  implying it happens within minutes.
+- **Upgrade behavior:** a ConfigMap rendered by an older chart carries no
+  `tombstoneMinAge` key and defaults to 1h in-driver, so the fix applies on
+  binary upgrade alone; the chart now also renders the key (default `"1h"`)
+  for explicit tuning.
+
+### Added: alert for wedged FailedPrecondition retry loops
+
+- The incident produced 160 identical `DeleteVolume` failures over 22 hours
+  and **no page**: `ScaleCSIOperationErrorsSustained` deliberately excludes
+  `FailedPrecondition` (usually a benign, self-resolving refusal). The chart's
+  `PrometheusRule` now also renders
+  `ScaleCSIOperationFailedPreconditionStuck`: per-operation, it fires when an
+  operation returns `FailedPrecondition` continuously for two hours — a
+  wedged CO retry loop, not a race — with a runbook link to the new
+  "Tombstone-Blocked DeleteVolume" recovery procedure.
+
+### Fixed (MEDIUM): missing VolumeAttributesClass RBAC wedged csi-resizer
+
+- csi-resizer v2.x starts its VolumeAttributesClass informer unconditionally;
+  with the VAC CRD served (`storage.k8s.io/v1`) and no RBAC rule, its
+  reflector retried a forbidden LIST forever — ~190 errors/hr of
+  `volumeattributesclasses.storage.k8s.io is forbidden` in production logs.
+  The controller ClusterRole now grants `volumeattributesclasses`
+  get/list/watch unconditionally (the driver implements
+  `ControllerModifyVolume` since v1.9.0, so the rule is needed regardless of
+  which sidecar consumes it), ending the hot loop.
 
 ## ZFS property namespace rename — `truenas-csi:*` → `scale-csi:*`
 

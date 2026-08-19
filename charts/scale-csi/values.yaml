@@ -1239,6 +1239,18 @@ reconcile:
   # Managed backend objects must be older than this before they are orphaned.
   minOrphanAge: 24h
 
+  # Minimum age of a LEDGER-PROVEN deferred-deletion tombstone before the
+  # reaper may destroy it. Deliberately much shorter than minOrphanAge: the
+  # 24h orphan window exists for objects of unproven provenance, while a
+  # ledger-proven tombstone is the driver's own object with authoritative
+  # creation-time identity. A gate equal to the reconcile CronJob period
+  # guarantees a 24-48h DeleteVolume stall for any tombstone created after the
+  # daily run (2026-08-19 incident: tombstone created 05:11; the daily 04:20
+  # cron finds age 23h09m => skipped; the next chance is a full day later).
+  # Scan-fallback tombstones (no ledger entry) keep the full minOrphanAge
+  # gate. The effective gate is capped at minOrphanAge.
+  tombstoneMinAge: "1h"
+
   # Prometheus alert hold time. Keep this strictly greater than 2x interval.
   alertAfter: 2h5m
 

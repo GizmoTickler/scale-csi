@@ -525,6 +525,19 @@ type ReconcileConfig struct {
 	// MinOrphanAge is the minimum backend object age before it can be orphaned (default: 24h).
 	MinOrphanAge string `yaml:"minOrphanAge"`
 
+	// TombstoneMinAge is the minimum age of a LEDGER-PROVEN deferred-deletion
+	// tombstone before the reaper may destroy it (default: 1h). It is
+	// deliberately much shorter than MinOrphanAge: the 24h orphan window exists
+	// for objects of unproven provenance, while a ledger-proven tombstone is
+	// the driver's own object with authoritative creation-time identity. Field
+	// evidence for why the two gates must not share a value: with the default
+	// daily reconcile CronJob, a gate equal to the cron period means any
+	// tombstone created after the daily run misses the NEXT run too and its
+	// blocked DeleteVolume retries fail for 24-48h. Scan-fallback tombstones
+	// (no ledger entry; provenance rests on retained identity alone) keep the
+	// full MinOrphanAge gate.
+	TombstoneMinAge string `yaml:"tombstoneMinAge"`
+
 	// Delete configures the separately gated run-once cleanup entrypoint.
 	Delete ReconcileDeleteConfig `yaml:"delete"`
 
@@ -634,6 +647,12 @@ func (c ReconcileConfig) IntervalDuration() (time.Duration, error) {
 // MinOrphanAgeDuration parses the configured minimum orphan age.
 func (c ReconcileConfig) MinOrphanAgeDuration() (time.Duration, error) {
 	return time.ParseDuration(c.MinOrphanAge)
+}
+
+// TombstoneMinAgeDuration parses the configured minimum ledger-proven
+// tombstone age.
+func (c ReconcileConfig) TombstoneMinAgeDuration() (time.Duration, error) {
+	return time.ParseDuration(c.TombstoneMinAge)
 }
 
 // CapacityConfig configures GetCapacity reporting and the optional controller
@@ -1015,9 +1034,10 @@ func LoadConfig(path string) (*Config, error) {
 		ZFS:       ZFSConfig{DatasetEnableQuotas: true},
 		SessionGC: SessionGCConfig{Enabled: true},
 		Reconcile: ReconcileConfig{
-			Enabled:      true,
-			Interval:     "1h",
-			MinOrphanAge: "24h",
+			Enabled:         true,
+			Interval:        "1h",
+			MinOrphanAge:    "24h",
+			TombstoneMinAge: "1h",
 			Delete: ReconcileDeleteConfig{
 				Schedule:  "0 4 * * *",
 				MaxPerRun: 5,
@@ -1219,6 +1239,9 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.Reconcile.MinOrphanAge == "" {
 		cfg.Reconcile.MinOrphanAge = "24h"
 	}
+	if cfg.Reconcile.TombstoneMinAge == "" {
+		cfg.Reconcile.TombstoneMinAge = "1h"
+	}
 	if cfg.Reconcile.Delete.Schedule == "" {
 		cfg.Reconcile.Delete.Schedule = "0 4 * * *"
 	}
@@ -1369,6 +1392,17 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("reconcile.minOrphanAge must be a positive duration: %w", parseErr)
 		}
 		return fmt.Errorf("reconcile.minOrphanAge must be a positive duration")
+	}
+	// Unset is legal (defaults to 1h at load and again in the reconcile
+	// resolver, so pre-1.10.3 ConfigMaps keep working); only a PRESENT but
+	// unusable value is a configuration failure.
+	if strings.TrimSpace(cfg.Reconcile.TombstoneMinAge) != "" {
+		if tombstoneAge, parseErr := cfg.Reconcile.TombstoneMinAgeDuration(); parseErr != nil || tombstoneAge <= 0 {
+			if parseErr != nil {
+				return fmt.Errorf("reconcile.tombstoneMinAge must be a positive duration: %w", parseErr)
+			}
+			return fmt.Errorf("reconcile.tombstoneMinAge must be a positive duration")
+		}
 	}
 
 	// Validate required fields

@@ -72,6 +72,28 @@ spec:
           annotations:
             summary: Scale CSI operations are failing
             description: Unexpected CSI controller operation errors have exceeded 0.02 operations per second for fifteen minutes.
+        - alert: ScaleCSIOperationFailedPreconditionStuck
+          # The sustained-errors alert above deliberately excludes
+          # FailedPrecondition: it is usually a benign, self-resolving refusal
+          # (a delete racing a detach, a tombstone awaiting its reaper). But a
+          # FailedPrecondition that repeats CONTINUOUSLY on the same operation
+          # is a wedged CO retry loop, and it is exactly the class that went
+          # unpaged in the 2026-08-19 incident: one Released PV's DeleteVolume
+          # failed identically every ~4 minutes for 22 hours (160 errors) with
+          # no alert. Per-operation grouping keeps one wedged volume from
+          # hiding behind healthy traffic on other operations. Two hours of
+          # uninterrupted refusals is far beyond any benign race, while a
+          # tombstone-blocked delete that clears at the next guarded-cleanup
+          # run still fires here if that run is more than ~2.5h away — which is
+          # the point: page on the stall, not after it resolves.
+          expr: sum by (operation) (rate(scale_csi_operations_total{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }},status="error",code="FailedPrecondition"}[30m])) > 0
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: 'Scale CSI {{ "{{ $labels.operation }}" }} is stuck in a FailedPrecondition retry loop'
+            description: 'CSI operation {{ "{{ $labels.operation }}" }} has returned FailedPrecondition continuously for two hours — a wedged retry loop, not a transient race. Typical cause: a DeleteVolume blocked behind a deferred-deletion tombstone until the next guarded-cleanup CronJob run. Check the controller log for the refusal message; it names the blocker and its clearing bound.'
+            runbook_url: docs/troubleshooting.md#tombstone-blocked-deletevolume
         - alert: ScaleCSISpentRestoreSnapshotBacklog
           expr: max(scale_csi_spent_restore_snapshots{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 0
           for: 48h

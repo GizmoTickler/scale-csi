@@ -977,7 +977,15 @@ Tune these thresholds to workload volume; ratios can be noisy at low traffic.
 - Deleting a snapshot that still has clones renames it to an internal tombstone
   and requests deferred ZFS destruction. The snapshot disappears from CSI, but
   its referenced space remains charged until the last clone releases it. The
-  reaper acts on tombstones through a durable ledger. Tombstones whose provenance
+  reaper acts on tombstones through a durable ledger.
+  A ledger-proven tombstone is age-gated on `reconcile.tombstoneMinAge`
+  (default 1h, capped at `reconcile.minOrphanAge`), not the full 24h orphan
+  window: with the default daily cleanup CronJob, a gate equal to the cron
+  period means any tombstone created after the daily run misses the next run
+  too and its blocked `DeleteVolume` retries fail for 24-48h (the 2026-08-19
+  incident). Scan-fallback tombstones, whose provenance rests on retained
+  identity alone, keep the full `minOrphanAge` gate; age-gated skips are
+  logged at V(2). Tombstones whose provenance
   no belt can prove (no ledger entry, no adoptable ownership stamp) are never
   destroyed automatically; they are surfaced as `manualRecoveryTombstones` in the
   reconcile summary for operator inspection — and `manualRecoveryTombstones` is
