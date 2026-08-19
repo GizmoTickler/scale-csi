@@ -1,4 +1,31 @@
-# Release notes — v1.10.3 (next)
+# Release notes — v1.10.4 (next)
+
+## v1.10.4 — Grafana dashboard overhaul
+
+The bundled dashboard (`metrics.dashboards.enabled`) was reviewed against the
+driver's full 55-metric registry and rebuilt:
+
+- **Organized into 8 titled rows** (At a Glance / CSI Operations / TrueNAS API
+  / Node Transports & Multipath / Reconcile & Reaper / Snapshots, Schedules &
+  Clones / Fencing & Publications / Capacity & Usage) — previously a flat
+  27-panel canvas.
+- **12 new panels close every registered-but-unplotted metric family:**
+  FailedPrecondition retry-loop stat + timeseries (the 2026-08-19 incident
+  signal, mirroring the `ScaleCSIOperationFailedPreconditionStuck` alert);
+  TrueNAS API latency percentiles (`truenas_requests_duration_seconds` was
+  never plotted); API backpressure (pending calls vs active connections,
+  absorbing the old standalone connections panel); GF-6 multipath/trunking
+  health (iSCSI per-portal, NVMe-oF per-address, NFS per-trunk connect
+  outcomes); snapshot holds & recoveries; the GF2/E2 scheduled-snapshot task
+  family incl. unproven-provenance counters; GF2/E3 clone promotion/refusals;
+  opt-in per-volume usage (top 10) and a near-quota stat (both labeled as
+  empty-when-`reportVolumeUsage`-is-off).
+- **Existing panels enhanced:** Circuit Breaker Detail gains failure/success
+  rates; Reconcile Health gains the NAS-timezone-unresolved counter; the
+  reaper backlog/bytes gauges gain the controller job scoping the orphan
+  panels already had.
+- The chart's metric-drift test validates every panel expression against the
+  driver's registry, so the new coverage cannot silently rot.
 
 ## v1.10.3 — Tombstone reaper decoupled from the reconcile schedule + VAC RBAC
 
