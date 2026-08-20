@@ -1,4 +1,57 @@
-# Release notes — v1.10.5 (next)
+# Release notes — v1.10.6 (next)
+
+## v1.10.6 — Reaper dashboard panels + bidirectional metric-drift test
+
+v1.10.5 shipped reap telemetry and verified it live, but the bundled Grafana
+dashboard did not panel two of the new gauges, and the chart's metric-drift
+test could not have caught that: it only asserted that every token a panel or
+alert names is registered, never the reverse.
+
+### Dashboard — Guarded GC + oldest-age caveat
+
+- **Guarded GC** (`scale_csi_reconcile_delete_enabled`) is a state panel
+  (ON/OFF), not a bare number. Without it a dashboard reader cannot tell
+  "reaper idle because nothing to do" from "reaper idle because gated GC is
+  switched off" — those look identical on every other reaper panel. The chart
+  PrometheusRule already keyed `ScaleCSITombstoneReapNeverRan` on this gauge;
+  the dashboard now shows the same fact.
+- **Unknown-Age Tombstones** (`scale_csi_tombstone_unknown_age`) is a caveat
+  on the oldest-age series in Reconcile Health, not an independent backlog
+  count. A tombstone with an unreadable creation time is excluded from
+  `scale_csi_tombstone_oldest_age_seconds`, so that panel structurally cannot
+  show it. A non-zero value means the oldest-age panel is under-reporting.
+
+The per-volume usage panel also plots `scale_csi_volume_quota_bytes` (the
+binding limit belonging to `volume_used_bytes`) so the reverse drift check
+does not have to allowlist an operator-facing GaugeVec that a live scrape
+with `reportVolumeUsage` off never emits.
+
+### Bidirectional metric-drift test
+
+`TestChartMetricDrift` asserts two reverse invariants against
+`driver.MetricNames()`, plus the existing forward check (every `scale_csi_*`
+token in a panel or PrometheusRule expression must be registered).
+Histogram/summary derived series (`_bucket`/`_sum`/`_count`) cover the
+registered base — a panel that charts the `_bucket` does not leave the base
+unobserved, and neither reverse check demands a panel for a derived name.
+Node-plugin-only metrics still count as registered.
+
+Expressions are parsed as PromQL: only non-hidden `targets[].expr`
+vector-selector metric names count, including panels nested inside
+collapsed Grafana rows. Hidden targets, string literals (double, single,
+and raw/backtick), comments, label matcher names, ordinary label values,
+and grouping labels (`by`/`without`) do not — the one exception is an
+exact `__name__` matcher, whose value IS the metric name and does count.
+Identifiers require a left boundary (`fake_scale_csi_foo` does not cover
+`scale_csi_foo`).
+
+- **Dashboard-OR-rule** (`unobservedMetrics`, empty): fails if a metric is
+  referenced by neither a dashboard panel nor a chart PrometheusRule, and
+  has no reasoned allowlist entry. An alert/rule reference is enough here.
+- **Dashboard-only** (`unpaneledMetrics`, empty): fails if a metric is not
+  referenced by any dashboard panel, even when a PrometheusRule names it.
+  That is the invariant that would have caught a missing Guarded GC panel
+  while the alert still named the gauge.
 
 ## v1.10.5 — Reap telemetry (durable last-pass record + oldest-age + cap)
 
@@ -100,7 +153,7 @@ only the chart) is not supported.
 ## v1.10.4 — Grafana dashboard overhaul
 
 The bundled dashboard (`metrics.dashboards.enabled`) was reviewed against the
-driver's full 55-metric registry and rebuilt:
+driver's full 63-metric registry and rebuilt:
 
 - **Organized into 8 titled rows** (At a Glance / CSI Operations / TrueNAS API
   / Node Transports & Multipath / Reconcile & Reaper / Snapshots, Schedules &
