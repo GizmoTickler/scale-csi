@@ -97,8 +97,8 @@ type MockClient struct {
 	// change_key (P-6).
 	datasetPassphrases map[string]string
 
-	// FailUserPropertyKeys makes DatasetSetUserProperties fail for these exact
-	// property keys (test hook for binding-write failures).
+	// FailUserPropertyKeys makes DatasetSetUserProperties and DatasetUpdate
+	// fail for these exact property keys (test hook for binding-write failures).
 	FailUserPropertyKeys map[string]struct{}
 
 	// FailDatasetDelete makes DatasetDelete fail for these exact dataset names
@@ -980,6 +980,32 @@ func (m *MockClient) DatasetGet(ctx context.Context, name string) (*Dataset, err
 	return nil, notFoundAPIError("dataset not found")
 }
 
+// DatasetGetUserProperties mirrors the real TrueNAS 26.0 poller read:
+// zfs.resource.query returns user_properties as a FLAT map with no
+// per-property source. Source is stripped so source-sensitive callers
+// exercise the production path instead of being masked by DatasetGet's
+// source-bearing pool.dataset.query shape.
+func (m *MockClient) DatasetGetUserProperties(ctx context.Context, name string) (*Dataset, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.InjectError != nil {
+		return nil, m.InjectError
+	}
+	ds, ok := m.Datasets[name]
+	if !ok {
+		return nil, notFoundAPIError("dataset not found")
+	}
+	response := mockDatasetResponseRaw(ds, false)
+	for key, property := range response.UserProperties {
+		property.Source = ""
+		response.UserProperties[key] = property
+	}
+	response.LegacyCSIProperties = normalizeCSIUserProperties(response.UserProperties)
+	response.ResourceQuery = true
+	return response, nil
+}
+
 func (m *MockClient) DatasetGetByNames(ctx context.Context, names []string) (map[string]*Dataset, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1020,6 +1046,14 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 	ds, ok := m.Datasets[name]
 	if !ok {
 		return nil, notFoundAPIError("dataset not found")
+	}
+	// FailUserPropertyKeys is the same hook DatasetSetUserProperties honours:
+	// writeTombstoneReapRecord (and other setAndVerifyDatasetUserProperties
+	// callers) go through DatasetUpdate, not DatasetSetUserProperties.
+	for _, update := range params.UserPropertiesUpdate {
+		if _, fail := m.FailUserPropertyKeys[update.Key]; fail {
+			return nil, &APIError{Code: -1, Message: "injected user-property write failure for " + update.Key}
+		}
 	}
 
 	if params.Volsize > 0 {

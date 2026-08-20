@@ -192,6 +192,41 @@ func TestChartTombstoneReaperScanFallbackPlumbing(t *testing.T) {
 	}
 }
 
+// TestChartReconcileDeleteDefaults pins the v1.10.5 cap/schedule split:
+// delete.maxPerRun 1000 (gated GC), repair.maxPerRun 5 (always-on writes),
+// and a ~6-hourly CronJob (was daily 04:00, must not be hourly).
+func TestChartReconcileDeleteDefaults(t *testing.T) {
+	cm := helmTemplate(t, "--show-only", "templates/configmap.yaml")
+	if !strings.Contains(cm, "maxPerRun: 1000") {
+		t.Error("default ConfigMap must render reconcile.delete.maxPerRun: 1000")
+	}
+	if !strings.Contains(cm, "      repair:\n        maxPerRun: 5\n") {
+		t.Error("default ConfigMap must render reconcile.repair.maxPerRun: 5")
+	}
+	if !strings.Contains(cm, `schedule: "20 4,10,16,22 * * *"`) {
+		t.Error(`default ConfigMap must render reconcile.delete.schedule: "20 4,10,16,22 * * *"`)
+	}
+	if !strings.Contains(cm, `reapRecordPollInterval: "5m"`) {
+		t.Error(`default ConfigMap must render reconcile.delete.reapRecordPollInterval: "5m"`)
+	}
+	cron := helmTemplate(t, "--show-only", "templates/reconcile-cronjob.yaml", "--set", "reconcile.delete.enabled=true")
+	if !strings.Contains(cron, `schedule: "20 4,10,16,22 * * *"`) {
+		t.Error(`enabled CronJob must default to 6-hourly schedule "20 4,10,16,22 * * *"`)
+	}
+}
+
+// TestChartRepairCapIndependentOfDeleteMaxPerRun proves raising the gated
+// deletion budget cannot 200x the always-on adoption/migration write cap.
+func TestChartRepairCapIndependentOfDeleteMaxPerRun(t *testing.T) {
+	cm := helmTemplate(t, "--show-only", "templates/configmap.yaml", "--set", "reconcile.delete.maxPerRun=1000")
+	if !strings.Contains(cm, "      repair:\n        maxPerRun: 5\n") {
+		t.Error("repair.maxPerRun must stay 5 when delete.maxPerRun is 1000")
+	}
+	if !strings.Contains(cm, "        maxPerRun: 1000\n") {
+		t.Error("delete.maxPerRun=1000 must still render on the delete block")
+	}
+}
+
 // TestChartTombstoneMinAgePlumbing proves the reconcile.tombstoneMinAge key
 // (v1.10.3; 2026-08-19 incident: a tombstone gate equal to the reconcile
 // CronJob period stalled a blocked DeleteVolume for 24-48h) renders end-to-end

@@ -424,8 +424,10 @@ nfs:
 	assert.Equal(t, "1h", cfg.Reconcile.Interval)
 	assert.Equal(t, "24h", cfg.Reconcile.MinOrphanAge)
 	assert.False(t, cfg.Reconcile.Delete.Enabled)
-	assert.Equal(t, "0 4 * * *", cfg.Reconcile.Delete.Schedule)
-	assert.Equal(t, 5, cfg.Reconcile.Delete.MaxPerRun)
+	assert.Equal(t, "20 4,10,16,22 * * *", cfg.Reconcile.Delete.Schedule)
+	assert.Equal(t, 1000, cfg.Reconcile.Delete.MaxPerRun)
+	assert.Equal(t, 5, cfg.Reconcile.Repair.MaxPerRun)
+	assert.Equal(t, "5m", cfg.Reconcile.Delete.ReapRecordPollInterval)
 }
 
 func TestLoadConfigReconcileExplicitDisableAndDeleteGate(t *testing.T) {
@@ -449,6 +451,53 @@ reconcile:
 	assert.True(t, cfg.Reconcile.Delete.Enabled)
 	assert.Equal(t, "30 3 * * 0", cfg.Reconcile.Delete.Schedule)
 	assert.Equal(t, 11, cfg.Reconcile.Delete.MaxPerRun)
+	assert.Equal(t, 5, cfg.Reconcile.Repair.MaxPerRun, "omitting repair.maxPerRun must keep the conservative default of 5")
+}
+
+func TestLoadConfigRejectsUnsafeReconcileRepairCap(t *testing.T) {
+	_, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+reconcile:
+  repair:
+    maxPerRun: -1
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reconcile.repair.maxPerRun")
+}
+
+func TestValidateConfigUnsetRepairMaxPerRunDefaultsToFive(t *testing.T) {
+	cfg := &Config{
+		TrueNAS: TrueNASConfig{Host: "10.0.0.1", MaxConnections: 5},
+		ZFS:     ZFSConfig{DatasetParentName: "tank/k8s"},
+		NFS:     NFSConfig{Enabled: true, ShareHost: "10.0.0.1"},
+		Reconcile: ReconcileConfig{
+			Interval:     "1h",
+			MinOrphanAge: "24h",
+			Delete:       ReconcileDeleteConfig{MaxPerRun: 5},
+		},
+	}
+	assert.Equal(t, 0, cfg.Reconcile.Repair.MaxPerRun, "fixture must leave repair.maxPerRun unset")
+	applyConfigDefaults(cfg)
+	require.NoError(t, validateConfig(cfg), "an unset repair.maxPerRun must not refuse to start")
+	assert.Equal(t, 5, cfg.Reconcile.Repair.MaxPerRun)
+	assert.Equal(t, 5, cfg.Reconcile.repairMaxPerRun(), "effective cap must be 5")
+}
+
+func TestLoadConfigLargeDeleteCapDoesNotRaiseRepairCap(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nfs:
+  enabled: true
+  shareHost: 192.0.2.10
+reconcile:
+  delete:
+    maxPerRun: 1000
+`)
+	require.NoError(t, err)
+	assert.Equal(t, 1000, cfg.Reconcile.Delete.MaxPerRun)
+	assert.Equal(t, 5, cfg.Reconcile.Repair.MaxPerRun,
+		"omitting repair.maxPerRun must not inherit delete.maxPerRun")
 }
 
 func TestLoadConfigRejectsUnsafeReconcileDeleteCap(t *testing.T) {

@@ -21,7 +21,7 @@ import (
 // Like adoptLegacyOwnershipStamps, this is a WRITE that runs in detection mode
 // (NOT gated by opts.Delete): it copies values this driver already owns and
 // deletes nothing but the redundant legacy spelling of those same values, and
-// it is capped per pass as a blast-radius bound.
+// it is capped per pass by reconcile.repair.maxPerRun as a blast-radius bound.
 //
 // Scope rules:
 //   - Volume datasets only. The parent and bookkeeping datasets hold ONLY

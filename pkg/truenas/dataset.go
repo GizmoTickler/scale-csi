@@ -1232,6 +1232,48 @@ func (c *Client) DatasetGetUserProperty(ctx context.Context, name, key string) (
 	return "", nil
 }
 
+// DatasetGetUserProperties returns a single dataset with user_properties
+// populated and no native-property projection. Prefers path-scoped
+// zfs.resource.query (get_children=false) when available so a poller tick
+// does not pay pool.dataset.query's full-system user-property materialization
+// or DatasetGet's capacity/encryption/tunable projection. Falls back to
+// pool.dataset.query with an empty properties list (identity core plus
+// user_properties still come back).
+func (c *Client) DatasetGetUserProperties(ctx context.Context, name string) (*Dataset, error) {
+	if c.hasDatasetResourceQuery(ctx) {
+		var raw []*rawDataset
+		err := callTyped(ctx, c, &raw, datasetResourceQueryMethod, datasetResourceQueryOptions([]string{name}, false))
+		if err == nil {
+			datasets := rawDatasetsToDatasets(raw, true)
+			for _, ds := range datasets {
+				if ds != nil && (ds.Name == name || ds.ID == name) {
+					return ds, nil
+				}
+			}
+			return nil, fmt.Errorf("dataset not found: %s", name)
+		}
+		if !isMethodNotFoundError(err) {
+			klog.V(2).Infof("zfs.resource.query user-properties read of %s failed; falling back to pool.dataset.query: %v", name, err)
+		}
+	}
+
+	filters := [][]interface{}{{"id", "=", name}}
+	options := map[string]interface{}{
+		"extra": map[string]interface{}{
+			"properties": []string{},
+		},
+	}
+	result, err := c.Call(ctx, "pool.dataset.query", filters, options)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get dataset user properties: %w", err)
+	}
+	datasets, ok := result.([]interface{})
+	if !ok || len(datasets) == 0 {
+		return nil, fmt.Errorf("dataset not found: %s", name)
+	}
+	return parseDataset(datasets[0])
+}
+
 // DatasetExpand expands a zvol to the specified size.
 func (c *Client) DatasetExpand(ctx context.Context, name string, newSize int64) error {
 	params := &DatasetUpdateParams{

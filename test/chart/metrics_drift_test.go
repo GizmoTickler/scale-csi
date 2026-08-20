@@ -215,7 +215,8 @@ func ruleExpressions(t *testing.T) (exprs []string, recordingRules map[string]bo
 		"--set", "zfs.reportVolumeUsage=true",
 		"--set", "zfs.snapshotSchedule=0 0 * * *",
 		"--set", "zfs.holdCsiSnapshots=true",
-		"--set", "zfs.promoteRestoredClones=true")
+		"--set", "zfs.promoteRestoredClones=true",
+		"--set", "reconcile.delete.enabled=true")
 	ruleManifest := findManifest(t, decodeManifests(t, rendered), "PrometheusRule", "scale-csi")
 
 	spec, ok := asManifest(ruleManifest["spec"])
@@ -293,6 +294,7 @@ func TestChartPrometheusRuleRenders(t *testing.T) {
 		"ScaleCSIManualRecoveryTombstones",
 		"ScaleCSIRemnantVolumesDetected",
 		"ScaleCSITombstoneBacklog",
+		"ScaleCSITombstoneOldestStuck",
 		"ScaleCSIFencingTakeoverSpike",
 		"ScaleCSIFencingProvenanceOverflow",
 		"ScaleCSIReconcileStalled",
@@ -307,5 +309,70 @@ func TestChartPrometheusRuleRenders(t *testing.T) {
 	}
 	if got := strings.Count(rendered, "runbook_url:"); got < 9 {
 		t.Errorf("expected at least 9 runbook_url annotations on the new alerts, got %d", got)
+	}
+	for _, alert := range []string{
+		"ScaleCSITombstoneReapCapped",
+		"ScaleCSITombstoneReapStale",
+		"ScaleCSITombstoneReapNeverRan",
+	} {
+		if strings.Contains(rendered, "- alert: "+alert) {
+			t.Errorf("delete-pass alert %q must not render when reconcile.delete.enabled is false", alert)
+		}
+	}
+}
+
+func TestChartPrometheusRuleDeletePassAlerts(t *testing.T) {
+	rendered := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true",
+		"--set", "reconcile.delete.enabled=true")
+	for _, alert := range []string{
+		"ScaleCSITombstoneReapCapped",
+		"ScaleCSITombstoneReapStale",
+		"ScaleCSITombstoneReapNeverRan",
+	} {
+		if !strings.Contains(rendered, "- alert: "+alert) {
+			t.Errorf("prometheusrule render missing delete-pass alert %q", alert)
+		}
+	}
+	if !strings.Contains(rendered, "absent(max(scale_csi_tombstone_reap_last_success_timestamp_seconds") {
+		t.Error("ScaleCSITombstoneReapNeverRan must wrap absent() around max() so both sides share an empty label set")
+	}
+	if strings.Contains(rendered, "and absent(scale_csi_tombstone_reap_last_success_timestamp_seconds") &&
+		!strings.Contains(rendered, "and absent(max(scale_csi_tombstone_reap_last_success_timestamp_seconds") {
+		t.Error("ScaleCSITombstoneReapNeverRan still uses the dead absent(series) form")
+	}
+
+	gatedOff := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true",
+		"--set", "reconcile.enabled=false",
+		"--set", "reconcile.delete.enabled=true")
+	if !strings.Contains(gatedOff, "- alert: ScaleCSITombstoneReapNeverRan") {
+		t.Error("delete-pass alerts must render when reconcile.delete.enabled=true even if reconcile.enabled=false")
+	}
+	if strings.Contains(gatedOff, "- alert: ScaleCSIOrphanVolumesDetected") {
+		t.Error("orphan-detection alerts must not render when reconcile.enabled=false")
+	}
+}
+
+func TestChartPrometheusRuleDefaultAlertCounts(t *testing.T) {
+	defaultRender := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true")
+	defaultAlerts := strings.Count(defaultRender, "- alert:")
+	defaultRunbooks := strings.Count(defaultRender, "runbook_url:")
+	if defaultAlerts != 20 {
+		t.Errorf("default PrometheusRule render (prometheusRule.enabled, other defaults) must have 20 alerts, got %d", defaultAlerts)
+	}
+	if defaultRunbooks != 11 {
+		t.Errorf("default PrometheusRule render must have 11 runbook_url annotations, got %d", defaultRunbooks)
+	}
+
+	withDelete := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true",
+		"--set", "reconcile.delete.enabled=true")
+	if got := strings.Count(withDelete, "- alert:"); got != 23 {
+		t.Errorf("prometheusRule + delete.enabled render must have 23 alerts, got %d", got)
+	}
+	if got := strings.Count(withDelete, "runbook_url:"); got != 14 {
+		t.Errorf("prometheusRule + delete.enabled render must have 14 runbook_url annotations, got %d", got)
 	}
 }

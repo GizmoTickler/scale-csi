@@ -447,7 +447,7 @@ func TestGlobalShareSecurityFailsClosedOnKerberos(t *testing.T) {
 // this check is not optional.
 func TestValidateConfigRejectsUnusableShareSecurity(t *testing.T) {
 	base := func() *Config {
-		return &Config{
+		cfg := &Config{
 			TrueNAS: TrueNASConfig{Host: "10.0.0.1", MaxConnections: 5},
 			ZFS:     ZFSConfig{DatasetParentName: "tank/k8s"},
 			NFS:     NFSConfig{Enabled: true, ShareHost: "10.0.0.1"},
@@ -457,6 +457,8 @@ func TestValidateConfigRejectsUnusableShareSecurity(t *testing.T) {
 				Delete:       ReconcileDeleteConfig{MaxPerRun: 5},
 			},
 		}
+		applyConfigDefaults(cfg)
+		return cfg
 	}
 
 	t.Run("KRB5 without krbEnabled", func(t *testing.T) {

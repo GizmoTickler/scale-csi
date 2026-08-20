@@ -71,14 +71,28 @@ func TestScanFallbackTombstoneKeepsFullGate(t *testing.T) {
 	d := newTombstoneTXGTestDriver(client)
 	mustCreateParentDataset(t, client)
 	createdAt := time.Now().Add(-2 * time.Hour).Unix()
-	snapshot := seedTXGTombstone(t, d, client, "scan-source", "snap-csi-deleted-9", createdAt, 888)
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/scan-source", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropCSISnapshotName:  "snap-1",
+		PropDriverInstanceID: d.driverInstanceID(),
+	})
+	require.NoError(t, err)
+	tombstoneName := snapshotTombstoneName(source.Name, "snap-1", 1)
+	require.NoError(t, client.SnapshotRename(ctx, snapshot.ID, tombstoneName))
+	tombstone, err := client.SnapshotGet(ctx, source.Name+"@"+tombstoneName)
+	require.NoError(t, err)
+	tombstone.Properties["creation"] = map[string]interface{}{"parsed": float64(createdAt)}
 
 	report := &ReconcileReport{}
-	d.detectTombstonesByScanFallback(ctx, time.Now(), []*truenas.Snapshot{snapshot},
+	d.detectTombstonesByScanFallback(ctx, time.Now(), []*truenas.Snapshot{tombstone},
 		map[string]tombstoneLedgerEntry{}, 24*time.Hour, report)
 	assert.Empty(t, report.TombstoneSnapshots,
 		"a young scan-fallback tombstone must stay behind the full minOrphanAge gate")
 	assert.Empty(t, report.ManualRecoveryTombstones)
+	require.Len(t, report.TombstonePending, 1,
+		"a proven but age-gated scan-fallback tombstone must still be in the oldest-age set")
 }
 
 // TestReconcileTombstoneMinAgeResolution pins the resolver contract: unset
@@ -110,6 +124,42 @@ func TestReconcileTombstoneMinAgeResolution(t *testing.T) {
 	gate, err = d.reconcileTombstoneMinAge(30 * time.Minute)
 	require.NoError(t, err)
 	assert.Equal(t, 30*time.Minute, gate)
+}
+
+// TestScanFallbackDoesNotRouteAgeGatedLedgerTombstoneToManualRecovery is
+// BLOCKER 3: dedup seeded only from eligible TombstoneSnapshots, so an
+// age-gated ledger-proven item in TombstonePending was treated as an
+// unproven lookalike. Fails on current code.
+func TestScanFallbackDoesNotRouteAgeGatedLedgerTombstoneToManualRecovery(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newTombstoneTXGTestDriver(client)
+	mustCreateParentDataset(t, client)
+	createdAt := time.Now().Add(-30 * time.Minute).Unix()
+	snapshot := seedTXGTombstone(t, d, client, "age-gated-source", "snap-csi-deleted-7", createdAt, 42)
+	require.NoError(t, d.writeTombstoneLedgerEntry(ctx, tombstoneLedgerEntry{
+		Version:   tombstoneLedgerVersion,
+		Snapshot:  snapshot.ID,
+		Dataset:   snapshot.Dataset,
+		CreatedAt: createdAt,
+		CreateTXG: snapshot.CreateTXG,
+		RenamedAt: time.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339Nano),
+	}))
+	parent, err := client.DatasetGet(ctx, d.parentDatasetName())
+	require.NoError(t, err)
+	ledger := tombstoneLedgerFromDataset(parent)
+
+	report := &ReconcileReport{}
+	d.classifyTombstones(time.Now(), []*truenas.Snapshot{snapshot}, ledger, time.Hour, report)
+	assert.Empty(t, report.TombstoneSnapshots)
+	require.Len(t, report.TombstonePending, 1)
+
+	d.detectTombstonesByScanFallback(ctx, time.Now(), []*truenas.Snapshot{snapshot}, ledger, 24*time.Hour, report)
+	assert.Empty(t, report.ManualRecoveryTombstones,
+		"an age-gated ledger-proven tombstone must not be routed to manual recovery")
+	require.Len(t, report.TombstonePending, 1)
+	assert.Equal(t, snapshot.ID, report.TombstonePending[0].ID)
+	assert.Empty(t, report.TombstoneSnapshots)
 }
 
 // TestDeleteVolumeTombstoneRefusalStatesTheBound pins the honest error text:

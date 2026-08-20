@@ -434,6 +434,12 @@ func TestMetricNamesIsComplete(t *testing.T) {
 		"scale_csi_fencing_stale_deferred_total",
 		"scale_csi_manual_recovery_tombstones",
 		"scale_csi_tombstone_reaped_total",
+		"scale_csi_tombstone_oldest_age_seconds",
+		"scale_csi_tombstone_reap_last_success_timestamp_seconds",
+		"scale_csi_tombstone_reap_last_reaped",
+		"scale_csi_tombstone_reap_last_skipped_on_cap",
+		"scale_csi_tombstone_reap_last_skipped_refused",
+		"scale_csi_reconcile_delete_enabled",
 		"scale_csi_job_dispatcher_subscribed",
 	} {
 		assert.True(t, set[want], "MetricNames() missing %q", want)

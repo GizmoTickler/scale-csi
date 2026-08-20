@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"path"
 	"sort"
 	"time"
 
@@ -87,38 +88,51 @@ func (d *Driver) reconcilePromoteRestoredClones(
 			datasetOriginSnapshotID(listed) == "" {
 			continue
 		}
-		migratedOldIDs, reason := d.promoteRestoredClone(ctx, listed.Name, byDataset, ledger)
+		migratedOldToNew, reason := d.promoteRestoredClone(ctx, listed.Name, byDataset, ledger)
 		if reason != "" {
 			klog.V(4).Infof("GF2/E3: skipping promote of %s — %s", listed.Name, reason)
 			continue
 		}
 		report.PromotedCloneCount++
 		// The pass classified tombstones BEFORE this promote, so any migrated
-		// tombstone's entry still names its pre-migration id. Drop those: reaping
-		// by the old id would resolve NotFound and be reported as a successful
-		// reap while the snapshot lives on at its new id. Its re-keyed ledger
-		// entry makes it a proper candidate on the next pass.
-		dropMigratedTombstoneCandidates(report, migratedOldIDs)
+		// tombstone's entry still names its pre-migration id. Rewrite those
+		// IDs onto the post-promote location: reaping by the old id would
+		// resolve NotFound and be reported as a successful reap while the
+		// snapshot lives on at its new id. Dropping them from pending/eligible
+		// would make oldest-age/remaining telemetry claim the tombstone is
+		// gone even though it is still awaiting reap.
+		rewriteMigratedTombstoneCandidates(report, migratedOldToNew)
 	}
 }
 
-func dropMigratedTombstoneCandidates(report *ReconcileReport, migratedOldIDs []string) {
-	if len(migratedOldIDs) == 0 || len(report.TombstoneSnapshots) == 0 {
+func rewriteMigratedTombstoneCandidates(report *ReconcileReport, oldToNew map[string]string) {
+	if len(oldToNew) == 0 {
 		return
 	}
-	migrated := make(map[string]struct{}, len(migratedOldIDs))
-	for _, id := range migratedOldIDs {
-		migrated[id] = struct{}{}
+	if report.tombstonePromoteAliases == nil {
+		report.tombstonePromoteAliases = make(map[string]string, len(oldToNew))
 	}
-	kept := report.TombstoneSnapshots[:0]
-	for i := range report.TombstoneSnapshots {
-		if _, moved := migrated[report.TombstoneSnapshots[i].BackendID]; moved {
-			report.TombstoneSnapshotBytes -= report.TombstoneSnapshots[i].Bytes
-			continue
+	for oldID, newID := range oldToNew {
+		report.tombstonePromoteAliases[oldID] = newID
+	}
+	rewrite := func(items []ReconcileObject) {
+		for i := range items {
+			newID, moved := oldToNew[items[i].BackendID]
+			if !moved {
+				newID, moved = oldToNew[items[i].ID]
+			}
+			if !moved {
+				continue
+			}
+			items[i].ID = newID
+			items[i].BackendID = newID
+			if dataset, _, ok := splitSnapshotID(newID); ok {
+				items[i].SourceVolumeID = path.Base(dataset)
+			}
 		}
-		kept = append(kept, report.TombstoneSnapshots[i])
 	}
-	report.TombstoneSnapshots = kept
+	rewrite(report.TombstoneSnapshots)
+	rewrite(report.TombstonePending)
 }
 
 // promoteRestoredClone re-proves every eligibility gate under the operation
@@ -130,7 +144,7 @@ func (d *Driver) promoteRestoredClone(
 	datasetName string,
 	snapshotsByDataset map[string][]*truenas.Snapshot,
 	ledger map[string]tombstoneLedgerEntry,
-) (migratedOldIDs []string, skipReason string) {
+) (migratedOldToNew map[string]string, skipReason string) {
 	cloneVolumeID := datasetVolumeID(datasetName)
 
 	// Fresh, source-bearing read BEFORE the lock decision so the origin we lock
@@ -274,11 +288,11 @@ func (d *Driver) promoteRestoredClone(
 	// Capture the pre-migration ids BEFORE the promote: the snapshot objects are
 	// moved by ZFS (and mutated in place by the fidelity mock), so reading
 	// snap.ID afterwards would yield the post-migration id.
-	migratedOldIDs = make([]string, 0, len(migrating))
+	migratedOldToNew = make(map[string]string, len(migrating))
 	staleLedgerKeys := make([]string, 0, len(migrating))
 	for _, snap := range migrating {
-		migratedOldIDs = append(migratedOldIDs, snap.ID)
 		if isSnapshotTombstone(snap) {
+			migratedOldToNew[snap.ID] = datasetName + "@" + snapshotShortName(snap)
 			key := tombstoneLedgerKey(snap.ID)
 			if _, recorded := ledger[key]; recorded {
 				staleLedgerKeys = append(staleLedgerKeys, key)
@@ -306,7 +320,7 @@ func (d *Driver) promoteRestoredClone(
 
 	klog.Infof("GF2/E3: promoted clone-restored volume %s; origin snapshot %s pin released (%d snapshot(s) migrated, ledger re-keyed)",
 		datasetName, origin, len(migrating))
-	return migratedOldIDs, ""
+	return migratedOldToNew, ""
 }
 
 // corroboratedMigrationCandidates cross-checks the reconcile pass's view of a

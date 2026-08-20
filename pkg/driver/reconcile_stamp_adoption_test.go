@@ -250,7 +250,7 @@ func TestReconcileStampAdoptionRespectsCap(t *testing.T) {
 		objects = append(objects, boundReconcilePV("cap-"+string(rune('0'+i)), "csi.scale.io"))
 	}
 	d, client := newReconcileTestDriver(t, false, objects, nil)
-	d.config.Reconcile.Delete.MaxPerRun = 2
+	d.config.Reconcile.Repair.MaxPerRun = 2
 	mustCreateParentDataset(t, client)
 	for i := 0; i < 3; i++ {
 		addReconcileDataset(client, "cap-"+string(rune('0'+i)), time.Now().Add(-72*time.Hour), true, testGiB)
@@ -258,7 +258,7 @@ func TestReconcileStampAdoptionRespectsCap(t *testing.T) {
 
 	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: false, MinOrphanAge: time.Hour})
 	require.NoError(t, err)
-	assert.Len(t, report.AdoptedStamps, 2, "adoptions are capped at maxPerRun per pass")
+	assert.Len(t, report.AdoptedStamps, 2, "adoptions are capped at reconcile.repair.maxPerRun per pass")
 }
 
 // TestReconcileStampAdoptionSkipsInheritedInstanceStamp: an INHERITED

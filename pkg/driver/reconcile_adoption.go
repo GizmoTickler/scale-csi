@@ -22,8 +22,8 @@ import (
 // provably this cluster's Bound volumes (a live Bound PV of THIS driver
 // references them, and they carry this driver's own LOCAL managed_resource +
 // csi_volume_name); it deletes nothing; and it is required for the delete-mode
-// reaper to ever act on legacy tombstones. Adoptions are capped at maxPerRun
-// per pass as a blast-radius bound.
+// reaper to ever act on legacy tombstones. Adoptions are capped at
+// reconcile.repair.maxPerRun per pass as a blast-radius bound.
 //
 // Absolute rule: an existing driver_instance_id of ANY source (local,
 // inherited, or foreign) is NEVER overwritten — a dataset stamped by another

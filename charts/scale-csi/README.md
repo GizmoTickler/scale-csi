@@ -436,19 +436,24 @@ Operator caveats:
 | `metrics.dashboards.enabled` | Create a Grafana dashboard ConfigMap | `false` |
 | `metrics.dashboards.annotations` | Dashboard ConfigMap annotations (for example, a folder selector) | `{}` |
 
-The bundled PrometheusRule renders **19** alerts (not only the categories once
-listed here): `ScaleCSIControllerDown`, `ScaleCSICircuitBreakerOpen`,
+The bundled PrometheusRule default render (`metrics.prometheusRule.enabled=true`,
+other values at chart defaults) is **20** alerts / **11** `runbook_url`
+annotations: `ScaleCSIControllerDown`, `ScaleCSICircuitBreakerOpen`,
 `ScaleCSITrueNASConnectionDown`, `ScaleCSIHighTrueNASAPIFailureRate`,
 `ScaleCSISustainedLockContention`, `ScaleCSIOperationErrorsSustained`,
-`ScaleCSISpentRestoreSnapshotBacklog`, `ScaleCSISessionGCDisconnects`,
-`ScaleCSIFencingTakeoverSpike`, `ScaleCSIFencingProvenanceOverflow`,
-`ScaleCSIJobDispatcherUnsubscribed`, `ScaleCSIDeleteResidualCleanupFailing`,
-`ScaleCSIOrphanVolumesDetected`, `ScaleCSIOrphanSnapshotsDetected`,
-`ScaleCSIManualRecoveryTombstones`, `ScaleCSIRemnantVolumesDetected`,
-`ScaleCSITombstoneBacklog`, `ScaleCSIReconcileStalled`, and
-`ScaleCSIPoolNearFull` (the last renders only with `capacity.gaugeEnabled`). Nine
-of them also carry a `runbook_url` annotation; the full alert → runbook mapping
-is in [troubleshooting](../../docs/troubleshooting.md#alerts--runbook). The
+`ScaleCSIOperationFailedPreconditionStuck`, `ScaleCSISpentRestoreSnapshotBacklog`,
+`ScaleCSISessionGCDisconnects`, `ScaleCSIFencingTakeoverSpike`,
+`ScaleCSIFencingProvenanceOverflow`, `ScaleCSIJobDispatcherUnsubscribed`,
+`ScaleCSIDeleteResidualCleanupFailing`, `ScaleCSIOrphanVolumesDetected`,
+`ScaleCSIOrphanSnapshotsDetected`, `ScaleCSIManualRecoveryTombstones`,
+`ScaleCSIRemnantVolumesDetected`, `ScaleCSITombstoneBacklog`,
+`ScaleCSITombstoneOldestStuck`, and `ScaleCSIReconcileStalled`. Enabling
+`reconcile.delete.enabled` adds the three delete-pass reap alerts
+(`ScaleCSITombstoneReapCapped`, `ScaleCSITombstoneReapStale`,
+`ScaleCSITombstoneReapNeverRan`) for **23 / 14**. `ScaleCSIPoolNearFull` renders
+only with `capacity.gaugeEnabled`; `ScaleCSIVolumeNearQuota` only with
+`zfs.reportVolumeUsage`. The full alert → runbook mapping is in
+[troubleshooting](../../docs/troubleshooting.md#alerts--runbook). The
 dashboard ConfigMap is labeled `grafana_dashboard: "1"` for Grafana sidecar
 discovery and uses only metrics exported by the driver.
 
@@ -463,9 +468,11 @@ discovery and uses only metrics exported by the driver.
 | `reconcile.alertAfter` | Prometheus alert hold time; keep greater than 2x the interval | `2h5m` |
 | `reconcile.spentRestore.enabled` | Classify/reap spent VolSync restore VolumeSnapshots (`volsync-*-dst-dest*`); set false to skip this VolSync-specific classification while other reconcile phases still run | `true` |
 | `reconcile.tombstoneReaper.scanFallback.enabled` | Bounded-scan fallback for the tombstone reaper. It runs on **every** enabled pass, independent of the ledger backlog, and issues no separate query (it reuses the pass's already-fetched recursive snapshot set), accepting at most 500 candidates. A candidate is reaped only when it has **no** ledger property at either bookkeeping location **and** carries retained creation-time identity exactly reproducing the driver's nonce-derived tombstone rename (retained snapshot/instance identity, exact tombstone name, local source-instance ownership, age gate, inheritance-mask guard). Recovers tombstones stranded by lost ledger entries | `false` |
+| `reconcile.repair.maxPerRun` | Per-helper write cap for always-on (not gated by `delete.enabled`) stamp adoption and property-namespace migration. Each independently receives this full allowance. Separate from `delete.maxPerRun` so raising the gated deletion budget cannot amplify these repair writes | `5` |
 | `reconcile.delete.enabled` | Create the opt-in guarded cleanup CronJob | `false` |
-| `reconcile.delete.schedule` | Guarded cleanup CronJob schedule | `0 4 * * *` |
-| `reconcile.delete.maxPerRun` | Maximum successful deletions in one cleanup run | `5` |
+| `reconcile.delete.schedule` | Guarded cleanup CronJob schedule. ~6-hourly with a :20 offset (the production cadence); bounds worst-case tombstone wait to 6h against `tombstoneMinAge=1h` without 24 Jobs/day of pod startup + TrueNAS login. A daily pass under VolSync/kopiur churn is what produced a multi-day DeleteVolume stall | `20 4,10,16,22 * * *` |
+| `reconcile.delete.maxPerRun` | Per-helper **destructive deletion** allowance (not a single pass-wide ceiling: `deleteDetectedOrphans` shares one counter across orphan volumes/snapshots/tombstones/spent-restore/remnants; share cleanup has its own full allowance; stranded-task sweep is uncapped). Always-on repair writes use `reconcile.repair.maxPerRun`, not this field. Only takes effect where `delete.enabled` is true | `1000` |
+| `reconcile.delete.reapRecordPollInterval` | How often the controller re-reads the durable last-reap record from `.csi-bookkeeping`. Only runs when `delete.enabled` is true | `5m` |
 
 Orphan **detection** is enabled by default (the destructive orphan-object
 **deletion** stays gated behind `reconcile.delete.enabled`), but a reconcile pass

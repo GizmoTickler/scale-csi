@@ -199,6 +199,34 @@ type Driver struct {
 	capacityCancel context.CancelFunc
 	capacityWg     sync.WaitGroup
 
+	// Controller-side poll of the durable last-reap record on .csi-bookkeeping.
+	// The delete-capable pass runs in the ephemeral CronJob; this loop is what
+	// keeps last-reap gauges (and a just-drained backlog) fresh on the scraped
+	// controller without waiting for the next detection interval.
+	reapRecordCancel  context.CancelFunc
+	reapRecordWg      sync.WaitGroup
+	reapRecordStateMu sync.Mutex
+	// reapRecordPublishMu serializes detection backlog publication and
+	// last-reap record selection as one critical section. Retaining the
+	// latest record payload (not just its timestamp) lets a finishing
+	// detection pass re-apply a newer poll overlay instead of restoring
+	// a stale backlog the monotonic timestamp guard would then refuse to
+	// overwrite.
+	reapRecordPublishMu sync.Mutex
+	latestReapRecord    *tombstoneReapRecord
+	// reapRecordStopped is terminal for this Driver: Stop that observes a nil
+	// cancel still prevents a later Start from launching a poller, matching
+	// the backend-health poller lifecycle.
+	reapRecordStopped bool
+	// orphanMetricsObservedAt is the unix timestamp of the last detection pass's
+	// classification snapshot. A reap record with CompletedAt newer than this
+	// overlays the eligible backlog gauges so they are not phase-lagged.
+	orphanMetricsObservedAt atomic.Int64
+	// reapRecordPublishedAt is the CompletedAtNano (or CompletedAt-as-nano)
+	// of the last record published to the last-reap gauges. An older record
+	// from a stale reconcile must not overwrite a newer poll result.
+	reapRecordPublishedAt atomic.Int64
+
 	// Controller-side backend-health poll loop (GF5 E4). Runs only when
 	// backendHealth.enabled; each tick is at most two bounded READ calls
 	// (pool.query + disk.temperature_alerts) and never writes.
@@ -517,6 +545,8 @@ func (d *Driver) Run() error {
 		d.startOrphanReconcile()
 		d.startCapacityGauges()
 		d.startBackendHealth()
+		SetReconcileDeleteEnabled(d.config != nil && d.config.Reconcile.Delete.Enabled)
+		d.startTombstoneReapRecordPoll()
 	}
 	if d.runNode {
 		d.startSessionGC()
@@ -536,6 +566,7 @@ func (d *Driver) Stop() {
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
 	d.stopBackendHealth()
+	d.stopTombstoneReapRecordPoll()
 
 	// Stop the service reload debouncer
 	if d.serviceReloadDebouncer != nil {

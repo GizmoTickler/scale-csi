@@ -211,10 +211,13 @@ data:
       tombstoneReaper:
         scanFallback:
           enabled: {{ .Values.reconcile.tombstoneReaper.scanFallback.enabled }}
+      repair:
+        maxPerRun: {{ .Values.reconcile.repair.maxPerRun }}
       delete:
         enabled: {{ .Values.reconcile.delete.enabled }}
         schedule: {{ .Values.reconcile.delete.schedule | quote }}
         maxPerRun: {{ .Values.reconcile.delete.maxPerRun }}
+        reapRecordPollInterval: {{ .Values.reconcile.delete.reapRecordPollInterval | quote }}
 
     {{- if or .Values.capacity.reportMaximumVolumeSize .Values.capacity.gaugeEnabled }}
     # Capacity reporting / pool-capacity gauges (opt-in). The block renders ONLY

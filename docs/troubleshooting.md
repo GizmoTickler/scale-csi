@@ -367,9 +367,15 @@ exports `scale_csi_orphan_volumes`, `scale_csi_orphan_snapshots`,
 orphan volumes (`scale_csi_orphan_volumes_bytes`), orphan snapshots
 (`scale_csi_orphan_snapshots_bytes`), and tombstones
 (`scale_csi_tombstone_snapshots_bytes`) — there is no remnant or spent-restore
-byte gauge. Use `scale_csi_reconcile_last_success_timestamp_seconds` to detect a
-stalled loop and `scale_csi_reconcile_failures_total{phase}` to isolate partial
-object failures. Orphan **detection** is enabled by default; destructive orphan
+byte gauge. `scale_csi_tombstone_oldest_age_seconds` covers age-gated tombstones
+the count gauge excludes (0 means none with a known creation time remain;
+`scale_csi_tombstone_unknown_age` > 0 means a tombstone exists but its age is
+unavailable). Use
+`scale_csi_reconcile_last_success_timestamp_seconds` to detect a stalled
+detection loop, `scale_csi_tombstone_reap_last_success_timestamp_seconds` for
+the last delete-capable CronJob (absent until a pass has been recorded),
+`scale_csi_tombstone_reap_last_skipped_on_cap` for cap exhaustion, and
+`scale_csi_reconcile_failures_total{phase}` to isolate partial object failures. Orphan **detection** is enabled by default; destructive orphan
 **deletion** stays off until `reconcile.delete.enabled: true`. (A pass is not
 wholly read-only — independent of the delete gate it performs always-on repair
 mutations: legacy ownership-stamp adoption, stale marker/publication repair, and
@@ -392,9 +398,14 @@ guarded paths per object class: orphan volumes and snapshots go through the CSI
 snapshot dependencies); tombstones and marker-proven remnant orphans use
 separately guarded direct TrueNAS-client destroys after re-proving provenance;
 and spent-restore cleanup deletes the Kubernetes `VolumeSnapshot`. A single
-`reconcile.delete.maxPerRun` cap (default 5) is shared across orphan volumes,
-orphan snapshots, tombstones, remnants, and spent restores; orphaned-share
-cleanup has its own separate `maxPerRun` invocation.
+`reconcile.delete.maxPerRun` cap (default 1000; only takes effect where
+`reconcile.delete.enabled` is true) is **not** a single pass-wide ceiling:
+`deleteDetectedOrphans` shares one counter across orphan volumes, orphan
+snapshots, tombstones, remnants, and spent restores; orphaned-share cleanup
+has its own independent allowance; the stranded periodic-snapshot-task sweep
+is uncapped. Stamp adoption and property-namespace migration are always-on
+(not gated by `delete.enabled`) and each independently receive
+`reconcile.repair.maxPerRun` (default 5), not the deletion cap.
 
 #### Tombstones that never drain
 
@@ -442,11 +453,15 @@ zfs list -o name,scale-csi:managed_resource -r <pool>
 
 ## Alerts → Runbook
 
-Every alert the chart's `PrometheusRule` can render (when
-`metrics.prometheusRule.enabled: true`), cross-linked to a runbook anchor. Ten
-of the rendered alerts additionally emit a `runbook_url` annotation pointing at
-the same target; the others (including `ScaleCSIPoolNearFull`) rely on this table
-for their runbook link.
+The default `PrometheusRule` render (`metrics.prometheusRule.enabled: true`,
+other feature gates at chart defaults) is **20** alerts / **11** `runbook_url`
+annotations; enabling `reconcile.delete.enabled` adds the three delete-pass
+reap alerts (**23 / 14**). That is the core table below (24 rows once
+`ScaleCSIPoolNearFull` / `capacity.gaugeEnabled` is included). An all-features
+render (volume-usage, snapshot schedule, snapshot holds, clone promote, backend
+health, plus delete-capable reap) is **36** alerts / **19** `runbook_url`
+annotations; the extra gated alerts follow the core table. Some alerts have no
+`runbook_url` annotation and rely on this table for their runbook link.
 
 | Alert | Severity | Runbook |
 |-------|----------|---------|
@@ -468,5 +483,26 @@ for their runbook link.
 | `ScaleCSIManualRecoveryTombstones` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
 | `ScaleCSIRemnantVolumesDetected` | warning | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
 | `ScaleCSITombstoneBacklog` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSITombstoneOldestStuck` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSITombstoneReapCapped` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSITombstoneReapStale` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSITombstoneReapNeverRan` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
 | `ScaleCSIReconcileStalled` | critical | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
 | `ScaleCSIPoolNearFull` | warning | [Performance Issues](#performance-issues) |
+
+Gated alerts (only rendered when the named feature is on):
+
+| Alert | Severity | Gate | Runbook |
+|-------|----------|------|---------|
+| `ScaleCSIVolumeNearQuota` | warning | `zfs.reportVolumeUsage` | [Performance Issues](#performance-issues) |
+| `ScaleCSIScheduledSnapshotTaskEnsureFailed` | warning | `zfs.snapshotSchedule` | [Driver-managed periodic snapshots](reference/storageclass.md#driver-managed-periodic-snapshots-gf2e2) |
+| `ScaleCSIScheduledSnapshotTaskDeleteFailed` | warning | `zfs.snapshotSchedule` | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
+| `ScaleCSINASTimezoneUnresolved` | warning | `zfs.snapshotSchedule` | [Backend health](production.md#backend-health) |
+| `ScaleCSISnapshotHoldFailed` | warning | `zfs.holdCsiSnapshots` | [Snapshot Issues](#snapshot-issues) |
+| `ScaleCSIClonePromoteRefused` | warning | `zfs.promoteRestoredClones` | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
+| `ScaleCSIPoolDegraded` | critical | `backendHealth.enabled` | [Backend health](production.md#backend-health) |
+| `ScaleCSIPoolScanErrors` | warning | `backendHealth.enabled` | [Backend health](production.md#backend-health) |
+| `ScaleCSIPoolDiskTemperatureAlert` | warning | `backendHealth.enabled` | [Backend health](production.md#backend-health) |
+| `ScaleCSIPoolHealthStale` | warning | `backendHealth.enabled` | [Backend health](production.md#backend-health) |
+| `ScaleCSIPoolConditionFlipPending` | warning | `backendHealth.enabled` | [Backend health](production.md#backend-health) |
+| `ScaleCSIPoolHealthProducerSkew` | warning | `backendHealth.enabled` | [Backend health](production.md#backend-health) |

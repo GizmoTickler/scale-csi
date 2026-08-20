@@ -1295,6 +1295,13 @@ reconcile:
     # Default: false.
     scanFallback:
       enabled: false
+  # Always-on repair writes (NOT gated by delete.enabled). Stamp adoption and
+  # property-namespace migration each independently receive this full allowance
+  # on every detection pass. Separate from delete.maxPerRun so raising the
+  # gated deletion budget cannot 200x these repair writes on installs that
+  # leave delete.enabled false.
+  repair:
+    maxPerRun: 5
   delete:
     # SAFETY: guarded deletion is opt-in and disabled by default. When enabled,
     # a CronJob runs --mode=reconcile and backend cleanup still goes through the
@@ -1307,9 +1314,35 @@ reconcile:
     # backlog stays visible in the scale_csi_tombstone_snapshots{,_bytes}
     # gauges (detection is always on).
     enabled: false
-    schedule: "0 4 * * *"
-    # Maximum successful deletions across all object types in one run.
-    maxPerRun: 5
+    # ~6-hourly with a :20 offset (the production cadence), not hourly or daily.
+    # A single daily pass (the previous "0 4 * * *" default) is what produced
+    # the 2026-08-18/20 field incident under realistic VolSync/kopiur churn:
+    # tombstones sat past tombstoneMinAge (1h) until the next morning,
+    # DeleteVolume retried FailedPrecondition for ~22h, and a capped leftover
+    # (skippedOnCap=310) had no alertable metric. Hourly is 24 Jobs/day of pod
+    # startup + TrueNAS WebSocket login + a full pass, and history limits do
+    # not bound that churn. 6-hourly still bounds worst-case tombstone wait to
+    # 6h against tombstoneMinAge=1h. The :20 offset avoids the top-of-hour
+    # thundering herd. CronJob concurrencyPolicy=Forbid plus a 4-8 minute run
+    # will not overlap. Inert until enabled is true.
+    schedule: "20 4,10,16,22 * * *"
+    # Per-helper DESTRUCTIVE deletion allowance, NOT a single pass-wide ceiling
+    # and NOT the always-on repair budget. deleteDetectedOrphans (reconcile.go)
+    # shares ONE counter across orphan volumes, orphan snapshots, tombstones,
+    # spent-restore and remnants; deleteOrphanedShares has its OWN independent
+    # allowance; sweepStrandedSnapshotTasks is UNCAPPED. Stamp adoption and
+    # property-namespace migration do NOT use this cap — they use
+    # reconcile.repair.maxPerRun (default 5) because those writes run on every
+    # install, including ones with delete.enabled=false. Combined with the
+    # 6-hourly schedule, 1000 is enough to drain realistic VolSync/kopiur churn
+    # in one pass instead of leaving a skippedOnCap leftover that only a log
+    # line recorded.
+    maxPerRun: 1000
+    # How often the long-lived controller re-reads the durable last-reap record
+    # from .csi-bookkeeping. Default 5m (288 property-only reads/day/replica);
+    # a 30s tick was 2,880 full DatasetGets/day and burned circuit-breaker
+    # probes during backend outages. Only runs when delete.enabled is true.
+    reapRecordPollInterval: 5m
 
 # Session garbage collection configuration (node plugin only)
 # Periodically cleans up orphaned iSCSI/NVMe-oF sessions that may leak

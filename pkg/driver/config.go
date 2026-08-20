@@ -553,6 +553,21 @@ type ReconcileConfig struct {
 
 	// TombstoneReaper configures the deferred-delete tombstone reaper's fallbacks.
 	TombstoneReaper ReconcileTombstoneReaperConfig `yaml:"tombstoneReaper"`
+
+	// Repair caps always-on (not gated by delete.enabled) repair writes.
+	Repair ReconcileRepairConfig `yaml:"repair"`
+}
+
+// ReconcileRepairConfig caps always-on repair/adoption writes that run on every
+// detection pass, independent of reconcile.delete.enabled.
+type ReconcileRepairConfig struct {
+	// MaxPerRun is the per-helper write allowance for adoptLegacyOwnershipStamps
+	// and migrateLegacyPropertyNamespace (default: 5). Each independently
+	// receives this full allowance. It is deliberately separate from
+	// delete.maxPerRun: those two repair paths are NOT gated by opts.Delete,
+	// so sharing the deletion budget would 200x their per-pass writes whenever
+	// an operator raised the gated GC cap.
+	MaxPerRun int `yaml:"maxPerRun"`
 }
 
 // ReconcileTombstoneReaperConfig configures the tombstone reaper.
@@ -632,11 +647,41 @@ type ReconcileDeleteConfig struct {
 	// Enabled permits --mode=reconcile to perform guarded deletion (default: false).
 	Enabled bool `yaml:"enabled"`
 
-	// Schedule is the CronJob schedule used by the Helm chart (default: 0 4 * * *).
+	// Schedule is the CronJob schedule used by the Helm chart (default:
+	// 20 4,10,16,22 * * *, ~6-hourly with a :20 offset). A daily pass under
+	// VolSync/kopiur churn is what produced a multi-day DeleteVolume stall and
+	// a cap-deferred leftover that was only visible as a log line. Hourly is
+	// too aggressive (24 Jobs/day of pod startup + TrueNAS login + a full
+	// pass); 6-hourly still bounds worst-case tombstone wait to 6h against
+	// tombstoneMinAge=1h.
 	Schedule string `yaml:"schedule"`
 
-	// MaxPerRun limits successful deletions across all object types (default: 5).
+	// MaxPerRun is the per-helper DESTRUCTIVE deletion allowance (default: 1000).
+	// It is NOT a single pass-wide ceiling: deleteDetectedOrphans shares one
+	// counter across orphan volumes, orphan snapshots, tombstones,
+	// spent-restore and remnants; deleteOrphanedShares has its own independent
+	// allowance; sweepStrandedSnapshotTasks is uncapped. Always-on repair
+	// writes (stamp adoption, property-namespace migration) use
+	// reconcile.repair.maxPerRun, not this field. This cap only takes effect
+	// where reconcile.delete.enabled is true.
 	MaxPerRun int `yaml:"maxPerRun"`
+
+	// ReapRecordPollInterval is how often the controller re-reads the durable
+	// last-reap record from .csi-bookkeeping (default: 5m). The delete-capable
+	// pass lives in an ephemeral CronJob; this poll keeps last-reap gauges
+	// fresh on the scraped controller. Only runs when Enabled is true.
+	ReapRecordPollInterval string `yaml:"reapRecordPollInterval"`
+}
+
+// repairMaxPerRun is the always-on repair/adoption write cap. An unset (0)
+// value defaults to 5 — the historical delete.maxPerRun default those two
+// paths used — rather than falling back to delete.maxPerRun. Falling back
+// would re-couple the budgets this field exists to split.
+func (c ReconcileConfig) repairMaxPerRun() int {
+	if c.Repair.MaxPerRun > 0 {
+		return c.Repair.MaxPerRun
+	}
+	return 5
 }
 
 // IntervalDuration parses the configured reconcile interval.
@@ -1039,7 +1084,11 @@ func LoadConfig(path string) (*Config, error) {
 			MinOrphanAge:    "24h",
 			TombstoneMinAge: "1h",
 			Delete: ReconcileDeleteConfig{
-				Schedule:  "0 4 * * *",
+				Schedule:               "20 4,10,16,22 * * *",
+				MaxPerRun:              1000,
+				ReapRecordPollInterval: "5m",
+			},
+			Repair: ReconcileRepairConfig{
 				MaxPerRun: 5,
 			},
 		},
@@ -1243,7 +1292,16 @@ func applyConfigDefaults(cfg *Config) {
 		cfg.Reconcile.TombstoneMinAge = "1h"
 	}
 	if cfg.Reconcile.Delete.Schedule == "" {
-		cfg.Reconcile.Delete.Schedule = "0 4 * * *"
+		cfg.Reconcile.Delete.Schedule = "20 4,10,16,22 * * *"
+	}
+	if cfg.Reconcile.Delete.ReapRecordPollInterval == "" {
+		cfg.Reconcile.Delete.ReapRecordPollInterval = "5m"
+	}
+	// 0 is "unset" (every install that predates this field). Default before
+	// validation so an omitted key cannot refuse to start. An explicit
+	// negative still fails validateConfig.
+	if cfg.Reconcile.Repair.MaxPerRun == 0 {
+		cfg.Reconcile.Repair.MaxPerRun = 5
 	}
 	if cfg.Health.CacheTTL == "" {
 		cfg.Health.CacheTTL = "5s"
@@ -1380,6 +1438,18 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Reconcile.Delete.MaxPerRun <= 0 {
 		return fmt.Errorf("reconcile.delete.maxPerRun must be positive")
+	}
+	if cfg.Reconcile.Repair.MaxPerRun <= 0 {
+		return fmt.Errorf("reconcile.repair.maxPerRun must be positive")
+	}
+	if raw := strings.TrimSpace(cfg.Reconcile.Delete.ReapRecordPollInterval); raw != "" {
+		interval, parseErr := time.ParseDuration(raw)
+		if parseErr != nil || interval <= 0 {
+			if parseErr != nil {
+				return fmt.Errorf("reconcile.delete.reapRecordPollInterval must be a positive duration: %w", parseErr)
+			}
+			return fmt.Errorf("reconcile.delete.reapRecordPollInterval must be a positive duration")
+		}
 	}
 	if interval, parseErr := cfg.Reconcile.IntervalDuration(); parseErr != nil || interval <= 0 {
 		if parseErr != nil {
@@ -1673,6 +1743,7 @@ func validateNonNegativeConfig(cfg *Config) error {
 		{"sessionGC.gracePeriod", cfg.SessionGC.GracePeriod},
 		{"sessionGC.startupDelay", cfg.SessionGC.StartupDelay},
 		{"reconcile.delete.maxPerRun", cfg.Reconcile.Delete.MaxPerRun},
+		{"reconcile.repair.maxPerRun", cfg.Reconcile.Repair.MaxPerRun},
 		{"node.sessionCleanupDelay", cfg.Node.SessionCleanupDelay},
 		{"resilience.circuitBreaker.failureThreshold", cfg.Resilience.CircuitBreaker.FailureThreshold},
 		{"resilience.circuitBreaker.successThreshold", cfg.Resilience.CircuitBreaker.SuccessThreshold},

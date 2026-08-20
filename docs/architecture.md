@@ -425,6 +425,8 @@ runnable once via `--mode=reconcile`) detects and — only under
 `reconcile.delete.enabled` — deletes CSI-managed **orphan objects** (volumes and
 snapshots) with no live Kubernetes reference; a shared
 `reconcile.delete.maxPerRun` caps those destructive deletions per pass.
+Always-on repair writes (stamp adoption, property-namespace migration) are
+capped separately by `reconcile.repair.maxPerRun`.
 
 **The pass as a whole is not read-only.** The safety guarantee is narrower:
 **orphan object deletion is disabled by default**. Independent of

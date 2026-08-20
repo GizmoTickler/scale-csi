@@ -675,7 +675,7 @@ func (d *Driver) migrateParentBookkeeping(ctx context.Context, parent *truenas.D
 		if !isLocalUserPropertySource(property.Source) {
 			continue
 		}
-		if strings.HasPrefix(key, PropTombstoneLedgerPrefix) || strings.HasPrefix(key, PropInflightMarkerPrefix) {
+		if strings.HasPrefix(key, PropTombstoneLedgerPrefix) || strings.HasPrefix(key, PropInflightMarkerPrefix) || key == PropTombstoneReapLast {
 			toCopy[key] = property.Value
 		}
 	}

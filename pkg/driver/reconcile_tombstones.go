@@ -35,51 +35,65 @@ func (d *Driver) detectTombstonesByScanFallback(
 	minOrphanAge time.Duration,
 	report *ReconcileReport,
 ) {
-	strictIDs := make(map[string]struct{}, len(report.TombstoneSnapshots))
-	for i := range report.TombstoneSnapshots {
-		strictIDs[report.TombstoneSnapshots[i].BackendID] = struct{}{}
-	}
+	// Dedup against every already-classified driver-owned tombstone, including
+	// age-gated ledger-proven items that live only in TombstonePending. Seeding
+	// solely from TombstoneSnapshots routed those to manual recovery.
+	classified := make(map[string]struct{}, len(report.TombstonePending)+len(report.TombstoneSnapshots))
+	seedClassifiedTombstoneIDs(classified, report.TombstonePending)
+	seedClassifiedTombstoneIDs(classified, report.TombstoneSnapshots)
 	processed := 0
 	for _, snap := range scanned {
 		if snap == nil || !isSnapshotTombstone(snap) {
 			continue
 		}
-		if _, strict := strictIDs[snap.ID]; strict {
-			continue
-		}
-		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {
-			klog.Warningf("Orphan reconcile: scan fallback skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name", snap.ID)
-			continue
-		}
-		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), minOrphanAge)
-		if !eligible {
-			// Scan-fallback tombstones keep the FULL minOrphanAge gate (their
-			// provenance rests on retained identity alone, unlike ledger-proven
-			// ones). Log the skip: a silent continue here hid a live, ongoing
-			// DeleteVolume failure from the reaper's own output (2026-08-19).
-			if snap.GetCreationTime() > 0 {
-				klog.V(2).Infof("Orphan reconcile: scan-fallback tombstone %s age-gated (age=%v < minOrphanAge=%v, eligible at %s)",
-					snap.ID, age.Round(time.Second), minOrphanAge, createdAt.Add(minOrphanAge).Format(time.RFC3339))
+		candidate := snap
+		if newID, aliased := report.tombstonePromoteAliases[snap.ID]; aliased {
+			// Unmatched old alias: canonicalize to the post-promote ID
+			// rather than skipping both IDs, which dropped ledger-less
+			// fallback-only tombstones for the pass.
+			if _, already := classified[newID]; already {
+				continue
 			}
+			fresh, getErr := d.truenasClient.SnapshotGet(ctx, newID)
+			if getErr != nil {
+				if !truenas.IsNotFoundError(getErr) {
+					d.recordReconcileObjectFailure("tombstone_scan_fallback", newID, getErr)
+				}
+				continue
+			}
+			candidate = fresh
+		} else if _, already := classified[snap.ID]; already {
 			continue
 		}
-		sourceVolumeID := path.Base(snap.Dataset)
+		if candidate == nil || !isSnapshotTombstone(candidate) {
+			continue
+		}
+		if _, already := classified[candidate.ID]; already {
+			continue
+		}
+		classified[candidate.ID] = struct{}{}
+		if snapshotIsLiveCSIObjectWithTombstoneShapedName(candidate) {
+			klog.Warningf("Orphan reconcile: scan fallback skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name", candidate.ID)
+			continue
+		}
+		createdAt, age, eligible := reconcileAge(now, candidate.GetCreationTime(), minOrphanAge)
+		sourceVolumeID := path.Base(candidate.Dataset)
 		item := ReconcileObject{
-			ID:                 snap.ID,
-			BackendID:          snap.ID,
+			ID:                 candidate.ID,
+			BackendID:          candidate.ID,
 			SourceVolumeID:     sourceVolumeID,
 			CreatedAt:          createdAt,
 			Age:                age,
-			Bytes:              snap.GetSnapshotSize(),
-			tombstoneCreateTXG: snap.CreateTXG,
+			Bytes:              candidate.GetSnapshotSize(),
+			tombstoneCreateTXG: candidate.CreateTXG,
 		}
-		_, ledgerPresent := ledger[tombstoneLedgerKey(snap.ID)]
-		provenanceSafe := !ledgerPresent && snapshotMatchesRetainedTombstoneIdentity(snap, d.driverInstanceID())
+		_, ledgerPresent := ledger[tombstoneLedgerKey(candidate.ID)]
+		provenanceSafe := !ledgerPresent && snapshotMatchesRetainedTombstoneIdentity(candidate, d.driverInstanceID())
 		if provenanceSafe {
-			sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, snap.Dataset)
+			sourceDataset, dsErr := d.truenasClient.DatasetGet(ctx, candidate.Dataset)
 			switch {
 			case dsErr != nil:
-				d.recordReconcileObjectFailure("tombstone_scan_fallback", snap.ID, dsErr)
+				d.recordReconcileObjectFailure("tombstone_scan_fallback", candidate.ID, dsErr)
 				provenanceSafe = false
 			case !datasetHasLocalUserProperty(sourceDataset, PropDriverInstanceID, d.driverInstanceID()):
 				provenanceSafe = false
@@ -93,7 +107,25 @@ func (d *Driver) detectTombstonesByScanFallback(
 		}
 		if !provenanceSafe {
 			report.ManualRecoveryTombstones = append(report.ManualRecoveryTombstones, item)
-			klog.Warningf("Orphan reconcile: tombstone-shaped snapshot %s lacks safe scan-fallback provenance; manual recovery required", snap.ID)
+			klog.Warningf("Orphan reconcile: tombstone-shaped snapshot %s lacks safe scan-fallback provenance; manual recovery required", candidate.ID)
+			continue
+		}
+		// Provenance is decided BEFORE the age gate so a proven but still
+		// age-gated fallback tombstone is visible to oldest-age telemetry,
+		// matching the strict ledger path.
+		if candidate.GetCreationTime() <= 0 {
+			klog.Warningf("Orphan reconcile: scan-fallback tombstone %s has unavailable creation time; counted as unknown-age", candidate.ID)
+			report.TombstoneUnknownAgeCount++
+			report.TombstonePending = append(report.TombstonePending, item)
+			continue
+		}
+		report.TombstonePending = append(report.TombstonePending, item)
+		if !eligible {
+			// Scan-fallback tombstones keep the FULL minOrphanAge gate (their
+			// provenance rests on retained identity alone, unlike ledger-proven
+			// ones). They stay in TombstonePending so oldest-age can see them.
+			klog.V(2).Infof("Orphan reconcile: scan-fallback tombstone %s age-gated (age=%v < minOrphanAge=%v, eligible at %s)",
+				candidate.ID, age.Round(time.Second), minOrphanAge, createdAt.Add(minOrphanAge).Format(time.RFC3339))
 			continue
 		}
 		if processed >= tombstoneScanFallbackLimit {
@@ -103,6 +135,17 @@ func (d *Driver) detectTombstonesByScanFallback(
 		item.tombstoneScanFallback = true
 		report.TombstoneSnapshots = append(report.TombstoneSnapshots, item)
 		report.TombstoneSnapshotBytes += item.Bytes
+	}
+}
+
+func seedClassifiedTombstoneIDs(dst map[string]struct{}, items []ReconcileObject) {
+	for i := range items {
+		if items[i].BackendID != "" {
+			dst[items[i].BackendID] = struct{}{}
+		}
+		if items[i].ID != "" {
+			dst[items[i].ID] = struct{}{}
+		}
 	}
 }
 

@@ -606,7 +606,7 @@ Watch these series:
   counts stages where a malformed advertised address list was discarded and the
   node fell back to single-path staging.
 
-Five metric families added in v1.4.0 (the existing documented names still match
+Metric families added in v1.4.0 (the existing documented names still match
 `driver.MetricNames()`):
 
 - `scale_csi_job_dispatcher_subscribed` — `1` while the `core.get_jobs`
@@ -617,10 +617,27 @@ Five metric families added in v1.4.0 (the existing documented names still match
   prove, for operator inspection; **populated only while scan fallback is
   enabled**.
 - `scale_csi_tombstone_reaped_total{path}` — reaper throughput by discovery path
-  (ledger vs scan fallback).
+  (ledger vs scan fallback). Incremented in the unscrapeable reconcile CronJob;
+  alert on `scale_csi_tombstone_reap_last_reaped` instead.
 - `scale_csi_pool_available_bytes` and `scale_csi_pool_capacity_bytes` — parent
   pool free/total; **present only when `capacity.gaugeEnabled`**, and they drive
   `ScaleCSIPoolNearFull`.
+
+Reap-telemetry families added in v1.10.5:
+
+- `scale_csi_tombstone_oldest_age_seconds` — age of the oldest driver-owned
+  tombstone awaiting reap whose creation time is known, **including age-gated
+  ones** the count gauge excludes. 0 means none with a known creation time remain.
+- `scale_csi_tombstone_unknown_age` — tombstones awaiting reap whose creation
+  time is unavailable or malformed. Distinguishes oldest-age 0 ("none remain")
+  from oldest-age 0 with this > 0 ("exists but age unknown").
+- `scale_csi_tombstone_reap_last_success_timestamp_seconds` /
+  `scale_csi_tombstone_reap_last_reaped` /
+  `scale_csi_tombstone_reap_last_skipped_on_cap` /
+  `scale_csi_tombstone_reap_last_skipped_refused` — durable last delete-capable
+  pass, exported by the controller from a bookkeeping record. Absent until a
+  pass has been recorded (fresh install or `delete.enabled=false`).
+- `scale_csi_reconcile_delete_enabled` — 1 when guarded cleanup is configured.
 
 ### Backend health (`backendHealth.enabled`, default off)
 

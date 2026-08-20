@@ -157,16 +157,25 @@ const (
 	// crash between ledger write and rename leaves a ledger entry without a
 	// tombstone, which the reconciler sweeps.
 	PropTombstoneLedgerPrefix = "scale-csi:tombstone_"
+	// PropTombstoneReapLast is the singleton bookkeeping record of the most
+	// recent completed delete-capable tombstone reap. Written by --mode=reconcile
+	// after a successful delete-capable pass; read by the long-lived controller
+	// so last-reap gauges are scrapeable from controller /metrics instead of the
+	// ephemeral CronJob (which has no metrics port and is not selected by the
+	// metrics Service).
+	PropTombstoneReapLast = "scale-csi:reap_last"
 	// PropRecoveryNonce is a per-attempt compare-and-swap value included in the
 	// remnant recovery ownership stamp. operationLock is per-process, so two
 	// overlapping controllers (upgrade window) can both attempt recovery; the
 	// post-write re-read proves whose stamp won and the loser returns Aborted.
 	PropRecoveryNonce = "scale-csi:recovery_nonce"
 
-	inflightMarkerVersion  = 1
-	tombstoneLedgerVersion = 2
-	inflightModeClone      = "clone"
-	inflightModeCopy       = "copy"
+	inflightMarkerVersion        = 1
+	tombstoneLedgerVersion       = 2
+	tombstoneReapRecordVersionV1 = 1
+	tombstoneReapRecordVersion   = 2
+	inflightModeClone            = "clone"
+	inflightModeCopy             = "copy"
 )
 
 const (

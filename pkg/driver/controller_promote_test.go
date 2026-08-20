@@ -347,6 +347,188 @@ func TestPromoteCarriesTombstoneLedgerProvenanceAcrossMigration(t *testing.T) {
 	assert.True(t, truenas.IsNotFoundError(err), "the migrated tombstone is actually drained")
 }
 
+// TestPromoteKeepsMigratedTombstonesInTelemetry is the v1.10.5 round-2 gate:
+// rewriting the classified IDs onto the post-promote location keeps oldest-age
+// and remaining telemetry honest. Dropping the pre-migration ID made a still-
+// present tombstone vanish from both gauges.
+func TestPromoteWithScanFallbackDoesNotDoubleCountMigratedTombstone(t *testing.T) {
+	ctx := context.Background()
+	pvs := []runtime.Object{
+		boundReconcilePV("source", "csi.scale.io"),
+		boundReconcilePV("restored", "csi.scale.io"),
+	}
+	d, client := newReconcileTestDriver(t, false, pvs, nil)
+	d.config.ZFS.PromoteRestoredClones = true
+	enabled := true
+	d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
+
+	oldTombstoneID := bookkeepingTombstone(t, d, client)
+	restored := client.Datasets["pool/parent/restored"]
+	require.NotNil(t, restored)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, restored.Name, PropDriverInstanceID, d.driverInstanceID()))
+	require.NoError(t, client.DatasetSetUserProperty(ctx, restored.Name, PropVolumeContentSourceType, "snapshot"))
+	require.NoError(t, client.DatasetSetUserProperty(ctx, restored.Name, PropManagedResource, "true"))
+
+	tombstone, err := client.SnapshotGet(ctx, oldTombstoneID)
+	require.NoError(t, err)
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: false, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	require.Equal(t, 1, report.PromotedCloneCount)
+	newTombstoneID := "pool/parent/restored@" + snapshotShortName(tombstone)
+	require.Equal(t, 1, report.TombstoneSnapshotCount,
+		"a promoted tombstone must appear once, not as both the rewritten ID and the pre-promote fallback ID")
+	require.Len(t, report.TombstoneSnapshots, 1)
+	assert.Equal(t, newTombstoneID, report.TombstoneSnapshots[0].BackendID)
+	for _, item := range report.TombstoneSnapshots {
+		assert.NotEqual(t, oldTombstoneID, item.ID)
+		assert.NotEqual(t, oldTombstoneID, item.BackendID)
+	}
+	for _, item := range report.ManualRecoveryTombstones {
+		assert.NotEqual(t, oldTombstoneID, item.ID, "scan fallback must skip the pre-promote ID, not route it to manual recovery")
+	}
+}
+
+// TestPromoteKeepsFallbackOnlyMigratedTombstone is BLOCKER 3: an alias was
+// created for every migrated tombstone including ledger-less ones, and scan
+// fallback then skipped BOTH IDs even when no strict candidate was rewritten.
+// A legitimate fallback-only tombstone must survive the pass. Fails on current
+// code (TombstoneSnapshotCount == 0 and/or the old ID in manual recovery).
+func TestPromoteKeepsFallbackOnlyMigratedTombstone(t *testing.T) {
+	ctx := context.Background()
+	pvs := []runtime.Object{
+		boundReconcilePV("source", "csi.scale.io"),
+		boundReconcilePV("restored", "csi.scale.io"),
+	}
+	d, client := newReconcileTestDriver(t, false, pvs, nil)
+	d.config.ZFS.PromoteRestoredClones = true
+	enabled := true
+	d.config.Reconcile.TombstoneReaper.ScanFallback.Enabled = &enabled
+
+	mustCreateParentDataset(t, client)
+	source := addReconcileDataset(client, "source", time.Now().Add(-72*time.Hour), true, testGiB)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropCSISnapshotName:  "snap-1",
+		PropDriverInstanceID: d.driverInstanceID(),
+	})
+	require.NoError(t, err)
+	createdAt := time.Now().Add(-48 * time.Hour)
+	snapshot.Properties["creation"] = map[string]interface{}{"parsed": float64(createdAt.Unix())}
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/restored"))
+	tombstoneName := snapshotTombstoneName(source.Name, "snap-1", 1)
+	require.NoError(t, client.SnapshotRename(ctx, snapshot.ID, tombstoneName))
+	oldTombstoneID := source.Name + "@" + tombstoneName
+	restored := client.Datasets["pool/parent/restored"]
+	require.NotNil(t, restored)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, restored.Name, PropDriverInstanceID, d.driverInstanceID()))
+	require.NoError(t, client.DatasetSetUserProperty(ctx, restored.Name, PropVolumeContentSourceType, "snapshot"))
+	require.NoError(t, client.DatasetSetUserProperty(ctx, restored.Name, PropManagedResource, "true"))
+
+	tombstone, err := client.SnapshotGet(ctx, oldTombstoneID)
+	require.NoError(t, err)
+	require.True(t, snapshotMatchesRetainedTombstoneIdentity(tombstone, d.driverInstanceID()),
+		"precondition: fallback identity must prove on the pre-promote tombstone")
+	report, err := d.ReconcileOrphans(ctx, ReconcileOptions{Delete: false, MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	require.Equal(t, 1, report.PromotedCloneCount)
+	newTombstoneID := "pool/parent/restored@" + snapshotShortName(tombstone)
+	require.Equal(t, 1, report.TombstoneSnapshotCount,
+		"a ledger-less migrated tombstone must survive the pass as a fallback candidate")
+	require.Len(t, report.TombstoneSnapshots, 1)
+	assert.Equal(t, newTombstoneID, report.TombstoneSnapshots[0].BackendID)
+	for _, item := range report.ManualRecoveryTombstones {
+		assert.NotEqual(t, oldTombstoneID, item.ID)
+		assert.NotEqual(t, newTombstoneID, item.ID)
+	}
+}
+
+// TestScanFallbackCanonicalizesUnmatchedOldPromoteAlias is the production
+// listing shape: promote does not mutate the pass's snapshot objects, so scan
+// fallback still sees the pre-promote ID. An unmatched alias must SnapshotGet
+// the new ID rather than skip both. Fails on current code (both IDs skipped).
+func TestScanFallbackCanonicalizesUnmatchedOldPromoteAlias(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newTombstoneTXGTestDriver(client)
+	mustCreateParentDataset(t, client)
+	source, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/scan-source", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, source.Name, PropDriverInstanceID, d.driverInstanceID()))
+	snapshot, err := client.SnapshotCreate(ctx, source.Name, "snap-1", map[string]string{
+		PropCSISnapshotName:  "snap-1",
+		PropDriverInstanceID: d.driverInstanceID(),
+	})
+	require.NoError(t, err)
+	createdAt := time.Now().Add(-48 * time.Hour).Unix()
+	snapshot.Properties["creation"] = map[string]interface{}{"parsed": float64(createdAt)}
+	require.NoError(t, client.SnapshotClone(ctx, snapshot.ID, "pool/parent/restored"))
+	require.NoError(t, client.DatasetSetUserProperty(ctx, "pool/parent/restored", PropDriverInstanceID, d.driverInstanceID()))
+	tombstoneName := snapshotTombstoneName(source.Name, "snap-1", 1)
+	require.NoError(t, client.SnapshotRename(ctx, snapshot.ID, tombstoneName))
+	oldID := source.Name + "@" + tombstoneName
+	prePromote, err := client.SnapshotGet(ctx, oldID)
+	require.NoError(t, err)
+	listed := *prePromote
+	newID := "pool/parent/restored@" + tombstoneName
+	require.NoError(t, client.DatasetPromote(ctx, "pool/parent/restored"))
+
+	report := &ReconcileReport{tombstonePromoteAliases: map[string]string{oldID: newID}}
+	d.detectTombstonesByScanFallback(ctx, time.Now(), []*truenas.Snapshot{&listed},
+		map[string]tombstoneLedgerEntry{}, time.Hour, report)
+	require.Len(t, report.TombstoneSnapshots, 1,
+		"an unmatched old alias must canonicalize to the post-promote snapshot")
+	assert.Equal(t, newID, report.TombstoneSnapshots[0].BackendID)
+	assert.Empty(t, report.ManualRecoveryTombstones)
+}
+
+func TestPromoteKeepsMigratedTombstonesInTelemetry(t *testing.T) {
+	ctx := context.Background()
+	pv := boundReconcilePV("source", "csi.scale.io")
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{pv}, nil)
+	d.config.ZFS.PromoteRestoredClones = true
+
+	oldTombstoneID := bookkeepingTombstone(t, d, client)
+	restored := client.Datasets["pool/parent/restored"]
+	require.NoError(t, client.DatasetSetUserProperty(ctx, restored.Name, PropDriverInstanceID, d.driverInstanceID()))
+	require.NoError(t, client.DatasetSetUserProperty(ctx, restored.Name, PropVolumeContentSourceType, "snapshot"))
+	tombstone, err := client.SnapshotGet(ctx, oldTombstoneID)
+	require.NoError(t, err)
+	listedClone, err := client.DatasetGet(ctx, restored.Name)
+	require.NoError(t, err)
+	parent, err := client.DatasetGet(ctx, d.parentDatasetName())
+	require.NoError(t, err)
+	ledger := tombstoneLedgerFromDataset(parent)
+
+	createdAt := time.Unix(tombstone.GetCreationTime(), 0)
+	if createdAt.IsZero() {
+		createdAt = time.Now().Add(-48 * time.Hour)
+	}
+	item := ReconcileObject{
+		ID:             oldTombstoneID,
+		BackendID:      oldTombstoneID,
+		SourceVolumeID: "source",
+		CreatedAt:      createdAt,
+		Age:            time.Since(createdAt),
+		Bytes:          4096,
+	}
+	report := &ReconcileReport{
+		TombstoneSnapshots:     []ReconcileObject{item},
+		TombstonePending:       []ReconcileObject{item},
+		TombstoneSnapshotBytes: 4096,
+	}
+	d.reconcilePromoteRestoredClones(ctx, []*truenas.Dataset{resourceQueryProjection(listedClone)},
+		nil, []*truenas.Snapshot{tombstone}, nil, ledger, report)
+	require.Equal(t, 1, report.PromotedCloneCount)
+	newTombstoneID := "pool/parent/restored@" + snapshotShortName(tombstone)
+	require.Len(t, report.TombstonePending, 1)
+	assert.Equal(t, newTombstoneID, report.TombstonePending[0].ID)
+	require.Len(t, report.TombstoneSnapshots, 1)
+	assert.Equal(t, newTombstoneID, report.TombstoneSnapshots[0].BackendID)
+	assert.Equal(t, int64(4096), report.TombstoneSnapshotBytes)
+	assert.False(t, report.tombstoneOldestCreatedAt().IsZero(),
+		"a promoted-but-still-present tombstone must remain in oldest-age telemetry")
+}
+
 // GF2-fix3/B1-g — PROMOTE MUST REFUSE ON AN UNPROVABLY COMPLETE INVENTORY.
 //
 // SnapshotListAll returns ([]*Snapshot, error) with no total, no page token and

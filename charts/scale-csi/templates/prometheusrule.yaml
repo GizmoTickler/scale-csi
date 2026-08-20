@@ -195,6 +195,22 @@ spec:
             summary: Scale CSI tombstone backlog is not draining
             description: Driver-tombstoned deferred-delete snapshots have awaited reap for forty-eight hours.
             runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
+        - alert: ScaleCSITombstoneOldestStuck
+          # The eligible-count gauge (ScaleCSITombstoneBacklog) cannot see an
+          # age-gated tombstone. This is the 2026-08-18/20 incident class: one
+          # tombstone sat ~51h with no page because it was invisible to the
+          # eligible set for a full day.
+          #
+          # max() yields an empty label set; comparison with a scalar is
+          # label-set correct (no `and`/`absent` pairing).
+          expr: max(scale_csi_tombstone_oldest_age_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 86400
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI has a deferred-delete tombstone older than 24h
+            description: The oldest driver-owned tombstone awaiting reap (including age-gated ones the count gauge excludes) is more than 24 hours old. A blocked DeleteVolume will keep returning FailedPrecondition until the reaper clears it.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
         - alert: ScaleCSIReconcileStalled
           # The age threshold is DERIVED from the configured reconcile.interval
           # (3x the cadence, in seconds) instead of a hard-coded three hours, so
@@ -214,6 +230,50 @@ spec:
             summary: Scale CSI controller reconcile loop is stalled
             description: No reconcile pass has succeeded for over three times the configured reconcile.interval ({{ .Values.reconcile.interval }}); orphan detection is frozen. A controller that has never completed a reconcile also trips this alert.
             runbook_url: docs/troubleshooting.md#clean-up-orphaned-truenas-resources
+        {{- end }}
+        {{- if .Values.reconcile.delete.enabled }}
+        - alert: ScaleCSITombstoneReapCapped
+          # max() yields an empty label set; comparison with a scalar is
+          # label-set correct.
+          expr: max(scale_csi_tombstone_reap_last_skipped_on_cap{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI delete-capable reap hit the per-run cap
+            description: The last recorded delete-capable pass deferred work because reconcile.delete.maxPerRun was already spent. Capacity exhaustion is now a first-class gauge; do not infer it by comparing the backlog against a hardcoded fraction of the cap.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
+        - alert: ScaleCSITombstoneReapStale
+          # Fires only when a last-reap series EXISTS (a pass has been recorded).
+          # A fresh install or delete.enabled=false exports no series, so this
+          # cannot false-page those. 12h is two missed runs of the default
+          # 6-hourly schedule; operators who override to a longer CronJob must
+          # raise it. time()-max(...) is label-set correct (both sides empty).
+          expr: time() - max(scale_csi_tombstone_reap_last_success_timestamp_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 43200
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI delete-capable reap has not completed recently
+            description: No delete-capable tombstone reap has been recorded for over twelve hours (two missed runs of the default 6-hourly CronJob). The reaper is broken or the CronJob is not running.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
+        - alert: ScaleCSITombstoneReapNeverRan
+          # delete.enabled=1 with no recorded pass: distinguished from a fresh
+          # install with GC gated off (delete.enabled=0 AND absent timestamp).
+          #
+          # LABEL SETS: max(enabled) yields {}; absent(series{job=...}) yields
+          # {job="..."}; plain `and` requires identical label sets and is
+          # therefore always empty. Wrap the absent() argument in max() so both
+          # sides are {}. Verified: max(x) and absent(max(y)) matches;
+          # max(x) and absent(y) does not.
+          expr: max(scale_csi_reconcile_delete_enabled{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) == 1 and absent(max(scale_csi_tombstone_reap_last_success_timestamp_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}))
+          for: 12h
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI guarded cleanup has never recorded a reap
+            description: reconcile.delete.enabled is on but no delete-capable pass has been durably recorded. The CronJob has not completed since install (or every record write has failed). Distinct from a disabled reaper, which exports delete_enabled=0 and no timestamp series. 12h hold is two missed runs of the default 6-hourly schedule.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
         {{- end }}
         {{- if .Values.capacity.gaugeEnabled }}
         - alert: ScaleCSIPoolNearFull

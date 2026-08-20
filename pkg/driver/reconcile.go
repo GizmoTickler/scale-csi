@@ -112,16 +112,33 @@ type ReconcileReport struct {
 	// periodic-snapshot task outlived its dataset (GF2-fix/H2). Detection is
 	// always-on; deletion (DeletedSnapshotTasks) stays gated by opts.Delete like
 	// every other reconcile destroy.
-	StrandedSnapshotTasks      []string
-	DeletedSnapshotTasks       []string
-	OrphanVolumeBytes          int64
-	OrphanSnapshotBytes        int64
-	TombstoneSnapshotBytes     int64
-	OrphanVolumes              []ReconcileObject
-	OrphanSnapshots            []ReconcileObject
-	OrphanShares               []ReconcileObject
-	SpentRestoreSnapshots      []SpentRestoreSnapshot
-	TombstoneSnapshots         []ReconcileObject
+	StrandedSnapshotTasks  []string
+	DeletedSnapshotTasks   []string
+	OrphanVolumeBytes      int64
+	OrphanSnapshotBytes    int64
+	TombstoneSnapshotBytes int64
+	OrphanVolumes          []ReconcileObject
+	OrphanSnapshots        []ReconcileObject
+	OrphanShares           []ReconcileObject
+	SpentRestoreSnapshots  []SpentRestoreSnapshot
+	TombstoneSnapshots     []ReconcileObject
+	// TombstonePending is every ledger-proven (and scan-fallback-proven)
+	// driver-owned tombstone awaiting reap, INCLUDING ones still behind the
+	// age gate. TombstoneSnapshots is the age-eligible subset the reaper
+	// considers this pass; the oldest-age gauge is computed over this full
+	// pending set so a stuck age-gated tombstone is visible.
+	TombstonePending []ReconcileObject
+	// tombstonePromoteAliases maps pre-promote snapshot IDs onto their
+	// post-promote IDs so scan fallback, which walks the pre-promote listing,
+	// can canonicalize an unmatched migrated tombstone onto its new ID
+	// instead of skipping both IDs (which dropped ledger-less fallback-only
+	// tombstones) or re-adding the stale pre-promote ID.
+	tombstonePromoteAliases map[string]string
+	// TombstoneUnknownAgeCount is driver-owned tombstones awaiting reap whose
+	// creation time is unavailable or malformed. Distinguishes oldest-age 0
+	// ("none remain") from oldest-age 0 with this > 0 ("exists but age unknown").
+	TombstoneUnknownAgeCount   int
+	TombstoneOldestAge         time.Duration
 	ManualRecoveryTombstones   []ReconcileObject
 	RemnantVolumes             []ReconcileObject
 	DeletedVolumes             []string
@@ -189,6 +206,8 @@ func (d *Driver) ReconcileOrphans(ctx context.Context, opts ReconcileOptions) (R
 
 func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, reconcileStalePublications bool) (report ReconcileReport, retErr error) {
 	report = ReconcileReport{DeleteEnabled: opts.Delete}
+	var observationAt time.Time
+	var loadedReap *tombstoneReapRecord
 	defer func() {
 		sort.Slice(report.OrphanVolumes, func(i, j int) bool { return report.OrphanVolumes[i].ID < report.OrphanVolumes[j].ID })
 		sort.Slice(report.OrphanSnapshots, func(i, j int) bool { return report.OrphanSnapshots[i].ID < report.OrphanSnapshots[j].ID })
@@ -198,6 +217,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 			return left < right
 		})
 		sort.Slice(report.TombstoneSnapshots, func(i, j int) bool { return report.TombstoneSnapshots[i].ID < report.TombstoneSnapshots[j].ID })
+		sort.Slice(report.TombstonePending, func(i, j int) bool { return report.TombstonePending[i].ID < report.TombstonePending[j].ID })
 		sort.Slice(report.ManualRecoveryTombstones, func(i, j int) bool {
 			return report.ManualRecoveryTombstones[i].ID < report.ManualRecoveryTombstones[j].ID
 		})
@@ -212,9 +232,30 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		report.RemnantVolumeCount = len(report.RemnantVolumes)
 		report.AdoptedStampCount = len(report.AdoptedStamps)
 		report.MigratedPropertyNamespaceCount = len(report.MigratedPropertyNamespaces)
+		report.TombstoneOldestAge = report.tombstoneOldestAge()
+		if !observationAt.IsZero() {
+			d.noteOrphanMetricsObservation(observationAt)
+		}
+		wroteReap := false
+		if opts.Delete && retErr == nil {
+			rec := report.reapRecordAt(time.Now())
+			d.bindTombstoneReapRecord(&rec)
+			if writeErr := d.writeTombstoneReapRecord(ctx, rec); writeErr != nil {
+				d.recordReconcileObjectFailure("reap_record", PropTombstoneReapLast, writeErr)
+				// Leave loadedReap as the on-disk record (if any). Publishing
+				// an un-persisted rec would make last-reap gauges report a
+				// healthy recent pass that the next restart cannot see.
+			} else {
+				loadedReap = &rec
+				wroteReap = true
+			}
+		}
 		// Publish even a partial pass so a single malformed object cannot freeze
-		// the last visible inventory indefinitely.
-		SetOrphanReconcileMetrics(report)
+		// the last visible inventory indefinitely. Detection backlog gauges and
+		// latest-record selection are one critical section: a finishing
+		// detection pass must not restore an older backlog over a newer poll
+		// overlay the monotonic timestamp guard would then refuse to replace.
+		d.publishOrphanAndReapMetrics(report, loadedReap, wroteReap)
 		// Emit at most one aggregated Warning Event per pass for the operator-
 		// attention conditions (E3/O13). The defer runs once per pass, which is the
 		// rate limit (the reconcile loop is ~hourly).
@@ -258,6 +299,14 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	}
 
 	ledger, parentDataset, remnantBookkeeping := d.readBookkeepingState(ctx, minOrphanAge, snapshots, tombstones)
+	// Dual-location newest-valid-wins, including when bookkeeping relocation
+	// is off and readBookkeepingState did not fetch the child. An invalid
+	// present child blocks parent fallback.
+	var reapErr error
+	loadedReap, reapErr = d.readTombstoneReapRecord(ctx)
+	if reapErr != nil {
+		klog.Warningf("Orphan reconcile: failed to read tombstone reap record: %v", reapErr)
+	}
 
 	// Remnant-orphan detection (always-on; deletion stays gated by opts.Delete).
 	// A remnant is an unstamped dataset whose in-flight creation marker survived
@@ -274,6 +323,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	}
 
 	now := time.Now()
+	observationAt = now
 	managedBackendVolumeCount := d.classifyOrphanVolumes(ctx, now, datasets, kubeState, minOrphanAge, &report)
 	managedBackendSnapshotCount := d.classifyOrphanSnapshots(now, snapshots, kubeState, minOrphanAge, &report)
 	d.countScheduledSnapshots(ctx, unowned, datasets, &report)
@@ -348,7 +398,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	// source dataset lacking this instance's stamp — can finally act on their
 	// tombstones. It runs before tombstone sweeping so a freshly adopted source
 	// unblocks reaping in the SAME pass.
-	d.adoptLegacyOwnershipStamps(ctx, datasets, &report, d.config.Reconcile.Delete.MaxPerRun)
+	d.adoptLegacyOwnershipStamps(ctx, datasets, &report, d.config.Reconcile.repairMaxPerRun())
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		RecordReconcileFailure("stamp_adoption")
 		return report, ctxErr
@@ -357,7 +407,7 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 	// Legacy property-namespace migration (always-on; NOT gated by opts.Delete,
 	// same contract as stamp adoption above). Re-stamps LOCAL truenas-csi:*
 	// properties under the canonical scale-csi: namespace, capped per pass.
-	d.migrateLegacyPropertyNamespace(ctx, datasets, &report, d.config.Reconcile.Delete.MaxPerRun)
+	d.migrateLegacyPropertyNamespace(ctx, datasets, &report, d.config.Reconcile.repairMaxPerRun())
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		RecordReconcileFailure("property_namespace_migration")
 		return report, ctxErr
@@ -578,8 +628,9 @@ func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Sna
 	return managedBackendSnapshotCount
 }
 
-// classifyTombstones appends ledger-proven, age-eligible tombstone snapshots to
-// report.TombstoneSnapshots. Tombstone-named snapshots are the driver's own
+// classifyTombstones appends ledger-proven tombstone snapshots to
+// report.TombstonePending (including ones still behind the age gate) and the
+// age-eligible subset to report.TombstoneSnapshots. Tombstone-named snapshots are the driver's own
 // deferred-delete markers. On backends without ZFS deferred destroy (TrueNAS
 // 26.0) they cannot be removed until their last restored clone is gone, and the
 // tombstone rename released their CSI identity, so the CSI-snapshot orphan pass
@@ -600,29 +651,31 @@ func (d *Driver) classifyTombstones(now time.Time, tombstones []*truenas.Snapsho
 		if !recorded || entry.Snapshot != snap.ID {
 			continue
 		}
-		// v1 binds full ID + creation seconds. v2 additionally binds CreateTXG
-		// when the backend exposed it, closing same-second full-ID reuse.
-		if !tombstoneLedgerEntryMatchesSnapshot(entry, snap) {
-			continue
-		}
 		if snapshotIsLiveCSIObjectWithTombstoneShapedName(snap) {
 			klog.Warningf("Orphan reconcile: skipping %s — it carries live CSI snapshot identity despite a tombstone-shaped name and ledger entry", snap.ID)
-			continue
-		}
-		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), tombstoneMinAge)
-		if !eligible {
-			if snap.GetCreationTime() <= 0 {
-				klog.Warningf("Orphan reconcile: skipping tombstone snapshot %s because its creation time is unavailable", snap.ID)
-			} else {
-				klog.V(2).Infof("Orphan reconcile: tombstone %s age-gated (age=%v < tombstoneMinAge=%v, eligible at %s); its blocked DeleteVolume keeps failing until a pass runs after that",
-					snap.ID, age.Round(time.Second), tombstoneMinAge, createdAt.Add(tombstoneMinAge).Format(time.RFC3339))
-			}
 			continue
 		}
 		sourceVolumeID := ""
 		if snap.Dataset != "" {
 			sourceVolumeID = path.Base(snap.Dataset)
 		}
+		if snap.GetCreationTime() <= 0 {
+			klog.Warningf("Orphan reconcile: tombstone snapshot %s has unavailable creation time; counted as unknown-age, not as none-remain", snap.ID)
+			report.TombstoneUnknownAgeCount++
+			report.TombstonePending = append(report.TombstonePending, ReconcileObject{
+				ID:             snap.ID,
+				BackendID:      snap.ID,
+				SourceVolumeID: sourceVolumeID,
+				Bytes:          snap.GetSnapshotSize(),
+			})
+			continue
+		}
+		// v1 binds full ID + creation seconds. v2 additionally binds CreateTXG
+		// when the backend exposed it, closing same-second full-ID reuse.
+		if !tombstoneLedgerEntryMatchesSnapshot(entry, snap) {
+			continue
+		}
+		createdAt, age, eligible := reconcileAge(now, snap.GetCreationTime(), tombstoneMinAge)
 		item := ReconcileObject{
 			ID:             snap.ID,
 			BackendID:      snap.ID,
@@ -630,6 +683,15 @@ func (d *Driver) classifyTombstones(now time.Time, tombstones []*truenas.Snapsho
 			CreatedAt:      createdAt,
 			Age:            age,
 			Bytes:          snap.GetSnapshotSize(),
+		}
+		// Age-gated tombstones stay off TombstoneSnapshots (the reaper's working
+		// set) but MUST land in TombstonePending: the oldest-age gauge is the
+		// only metric that can see a stuck tombstone the count gauge excludes.
+		report.TombstonePending = append(report.TombstonePending, item)
+		if !eligible {
+			klog.V(2).Infof("Orphan reconcile: tombstone %s age-gated (age=%v < tombstoneMinAge=%v, eligible at %s); its blocked DeleteVolume keeps failing until a pass runs after that",
+				snap.ID, age.Round(time.Second), tombstoneMinAge, createdAt.Add(tombstoneMinAge).Format(time.RFC3339))
+			continue
 		}
 		report.TombstoneSnapshots = append(report.TombstoneSnapshots, item)
 		report.TombstoneSnapshotBytes += item.Bytes

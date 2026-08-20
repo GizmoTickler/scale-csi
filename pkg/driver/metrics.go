@@ -285,11 +285,20 @@ var (
 	// deferred destroy until their last restored clone disappears. Detection is
 	// always on; guarded reaping only runs where reconcile deletion is enabled,
 	// so these gauges are how default installs see the reapable backlog.
+	//
+	// This is the reaper's bounded deletion working set, not the full eligible
+	// inventory: ledger-proven age-eligible tombstones plus scan-fallback
+	// candidates when that path is on, capped at tombstoneScanFallbackLimit
+	// for the fallback pass. Age-gated tombstones and fallback inventory past
+	// that cap stay off this gauge (oldest-age still sees them). After a
+	// delete-capable pass the controller may refresh this gauge from that
+	// pass's durable reap record until the next detection, so a just-finished
+	// reap is not stuck at the pre-reap count for a full reconcile.interval.
 	tombstoneSnapshots = regGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "tombstone_snapshots",
-			Help:      "Number of driver-tombstoned deferred-delete snapshots awaiting reap (ledger-proven, age-eligible)",
+			Help:      "Bounded deletion working set of age-eligible driver-tombstoned snapshots (ledger-proven plus scan-fallback candidates when enabled). Scan-fallback inventory beyond the per-pass fallback cap is excluded here and remains visible to tombstone_oldest_age_seconds. Age-gated tombstones are excluded (see tombstone_oldest_age_seconds). May refresh from the last delete-capable pass's durable record until the next detection, so a just-finished reap is not phase-lagged by reconcile.interval.",
 		},
 	)
 
@@ -297,7 +306,7 @@ var (
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "tombstone_snapshots_bytes",
-			Help:      "Reported used bytes held by driver-tombstoned deferred-delete snapshots awaiting reap",
+			Help:      "Reported used bytes held by the tombstone_snapshots deletion working set",
 		},
 	)
 
@@ -327,13 +336,95 @@ var (
 	// path: "ledger" (the strict ledger-driven reaper) or "scan_fallback"
 	// (reconcile.tombstoneReaper.scanFallback). The fixed 2-value enum gives
 	// scan-fallback coverage visibility without an unbounded label (E2/O6).
+	//
+	// This counter is incremented in the delete-capable CronJob process, which
+	// is not scraped. Use tombstone_reap_last_reaped (durable last-pass gauge
+	// exported by the controller) for alerting; do not write increase()/rate()
+	// against this series expecting CronJob throughput.
 	tombstoneReapedTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Name:      "tombstone_reaped_total",
-			Help:      "Total driver-tombstoned deferred-delete snapshots successfully reaped, by discovery path",
+			Help:      "Total driver-tombstoned deferred-delete snapshots successfully reaped, by discovery path. Incremented in the unscrapeable reconcile CronJob; alert on tombstone_reap_last_reaped instead.",
 		},
 		[]string{"path"},
+	)
+
+	// tombstoneOldestAgeSeconds is the age of the oldest driver-owned tombstone
+	// still awaiting reap, INCLUDING ones behind the age gate that
+	// tombstone_snapshots deliberately excludes. A stuck tombstone is exactly
+	// the one the eligible-only count cannot see (2026-08-18/20 field incident).
+	// 0 means none with a known creation time remain. Distinguish that from
+	// "exists but age unknown" via tombstone_unknown_age.
+	tombstoneOldestAgeSeconds = regGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_oldest_age_seconds",
+			Help:      "Age in seconds of the oldest driver-owned deferred-delete tombstone awaiting reap whose creation time is known, including age-gated ones the count gauge excludes. 0 means none with a known creation time remain; see tombstone_unknown_age when a tombstone exists but its age is unavailable.",
+		},
+	)
+
+	tombstoneUnknownAge = regGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_unknown_age",
+			Help:      "Driver-owned deferred-delete tombstones awaiting reap whose creation time is unavailable or malformed. Distinguishes oldest_age=0 meaning none remain from oldest_age=0 with this>0 meaning exists but age unknown.",
+		},
+	)
+
+	// Last-reap gauges are label-less GaugeVecs so a process that has never
+	// observed a durable record exports NO series (fresh install, or
+	// delete.enabled=false). A plain Gauge would start at 0, which is
+	// indistinguishable from "reaper ran at the Unix epoch" and from
+	// reconcile_last_success_timestamp_seconds' never-completed 0. Absence of
+	// the series is "never recorded"; a present timestamp of T with reaped=0
+	// and skipped_on_cap=0 is "ran and did nothing"; skipped_on_cap>0 is "ran
+	// and was capped". A present but stale timestamp is "reaper is broken".
+	tombstoneReapLastSuccessTimestamp = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_reap_last_success_timestamp_seconds",
+			Help:      "Unix timestamp of the most recent completed delete-capable tombstone reap. Absent until a pass has been recorded (fresh install or delete.enabled=false); never uses 0 as a never-ran sentinel.",
+		},
+		nil,
+	)
+
+	tombstoneReapLastReaped = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_reap_last_reaped",
+			Help:      "Tombstones successfully reaped in the last recorded delete-capable pass (that pass, not cumulative). 0 with a present timestamp means the pass ran and reaped nothing.",
+		},
+		nil,
+	)
+
+	tombstoneReapLastSkippedOnCap = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_reap_last_skipped_on_cap",
+			Help:      "Deletes deferred because the last recorded delete-capable pass had already spent reconcile.delete.maxPerRun. Directly alertable capacity exhaustion; 0 with a present timestamp means that pass was not capped.",
+		},
+		nil,
+	)
+
+	tombstoneReapLastSkippedRefused = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "tombstone_reap_last_skipped_refused",
+			Help:      "Deletes skipped by a safety-guard refusal (not the per-run cap) in the last recorded delete-capable pass. Distinguishes 'raise the cap' from 'inspect the guard'.",
+		},
+		nil,
+	)
+
+	// reconcileDeleteEnabled is a config-reflection gauge so an absent last-reap
+	// timestamp can be interpreted: 0 + absent = delete gated off (expected);
+	// 1 + absent = a delete-capable pass has never been recorded.
+	reconcileDeleteEnabled = regGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "reconcile_delete_enabled",
+			Help:      "1 when reconcile.delete.enabled is set on this controller (the guarded-cleanup CronJob should be running); 0 when delete-capable reaping is gated off. Combined with an absent tombstone_reap_last_success_timestamp_seconds series: 0+absent is a fresh/disabled install, 1+absent is a delete-capable pass that has never been recorded.",
+		},
 	)
 
 	// snapshotHoldsTotal counts deletion-proof snapshot hold operations (GF2/E1),
@@ -1009,6 +1100,58 @@ func SetOrphanReconcileMetrics(report ReconcileReport) {
 	remnantVolumes.Set(float64(report.RemnantVolumeCount))
 	manualRecoveryTombstones.Set(float64(report.ManualRecoveryTombstoneCount))
 	scheduledSnapshots.Set(float64(report.ScheduledSnapshotCount))
+	tombstoneUnknownAge.Set(float64(report.TombstoneUnknownAgeCount))
+	setTombstoneOldestAgeFromReport(report, time.Now())
+}
+
+func setTombstoneOldestAgeFromReport(report ReconcileReport, now time.Time) {
+	oldest := report.tombstoneOldestCreatedAt()
+	if oldest.IsZero() {
+		tombstoneOldestAgeSeconds.Set(0)
+		return
+	}
+	age := now.Sub(oldest).Seconds()
+	if age < 0 {
+		age = 0
+	}
+	tombstoneOldestAgeSeconds.Set(age)
+}
+
+// SetReconcileDeleteEnabled publishes whether guarded cleanup is configured on
+// this controller. Always exported (plain gauge), unlike the last-reap GaugeVecs.
+func SetReconcileDeleteEnabled(enabled bool) {
+	if enabled {
+		reconcileDeleteEnabled.Set(1)
+		return
+	}
+	reconcileDeleteEnabled.Set(0)
+}
+
+// publishLastTombstoneReapRecord exports the durable last-reap gauges from rec.
+// A nil rec leaves previously published values in place: a transient read miss
+// must not look like a fresh install.
+func publishLastTombstoneReapRecord(rec *tombstoneReapRecord, now time.Time, overlayBacklog bool) {
+	if rec == nil || rec.CompletedAt <= 0 {
+		return
+	}
+	tombstoneReapLastSuccessTimestamp.WithLabelValues().Set(float64(rec.CompletedAt))
+	tombstoneReapLastReaped.WithLabelValues().Set(float64(rec.Reaped))
+	tombstoneReapLastSkippedOnCap.WithLabelValues().Set(float64(rec.SkippedOnCap))
+	tombstoneReapLastSkippedRefused.WithLabelValues().Set(float64(rec.SkippedRefused))
+	if !overlayBacklog {
+		return
+	}
+	tombstoneSnapshots.Set(float64(rec.RemainingEligible))
+	tombstoneSnapshotsBytes.Set(float64(rec.RemainingBytes))
+	if rec.OldestCreatedAt <= 0 {
+		tombstoneOldestAgeSeconds.Set(0)
+		return
+	}
+	age := float64(now.Unix() - rec.OldestCreatedAt)
+	if age < 0 {
+		age = 0
+	}
+	tombstoneOldestAgeSeconds.Set(age)
 }
 
 func RecordReconcileSuccess(at time.Time) {

@@ -1669,8 +1669,28 @@
             },
             "schedule": {
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "default": "20 4,10,16,22 * * *"
             },
+            "maxPerRun": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1000
+            },
+            "reapRecordPollInterval": {
+              "type": "string",
+              "pattern": "^([0-9]+(s|m|h))+$",
+              "not": {
+                "pattern": "^(0+(s|m|h))+$"
+              },
+              "default": "5m"
+            }
+          }
+        },
+        "repair": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
             "maxPerRun": {
               "type": "integer",
               "minimum": 1,

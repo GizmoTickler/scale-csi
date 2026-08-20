@@ -1,4 +1,101 @@
-# Release notes — v1.10.4 (next)
+# Release notes — v1.10.5 (next)
+
+## v1.10.5 — Reap telemetry (durable last-pass record + oldest-age + cap)
+
+The 2026-08-18/20 field incident (`pvc-d1d92818`) had one deferred-delete
+tombstone unreaped for ~51h. `DeleteVolume` failed `FailedPrecondition`
+~16x/hour for 22h and **no alert fired**. Separately, the 2026-08-20 04:20
+reap hit its cap (`tombstoneSnapshots=810 reapedTombstones=500 skippedOnCap=310`)
+and the only evidence of that deferral was a log line. Closing it in home-ops
+required kube-state-metrics workarounds (`kube_cronjob_status_last_successful_time`,
+`kube_persistentvolume_status_phase`) because the driver did not expose the
+facts an operator actually needs.
+
+This release makes the driver self-observable so those workarounds can be
+retired and alerts can key on causes, not symptoms.
+
+### Durable last-reap record (ITEM 1 + ITEM 4)
+
+`scale_csi_tombstone_reaped_total` is incremented only in the delete-capable
+CronJob process, which has `-health-port=0`, is labelled `component: reconcile`
+(the metrics Service selects `component: controller`), and lives 4–8 minutes
+with counters that start at zero every run. Scraping that pod is not a viable
+primary mechanism: a series that appears, counts from 0, then vanishes makes
+`increase()`/`rate()` unreliable and makes "no reap happened" indistinguishable
+from "pod not scraped yet".
+
+After every **successful** delete-capable pass the CronJob now writes a
+singleton JSON record to the `.csi-bookkeeping` child dataset (created lazily,
+even when `reconcile.bookkeeping.enabled` is false — this payload must not
+inherit onto snapshots) under `scale-csi:reap_last`. Writes are last-writer-wins,
+tolerant of a missing record, and **never fail the reap** (`noteBookkeepingWriteFailure`
+plus `reconcile_failures_total{phase="reap_record"}`). The long-lived controller
+exports the record on every detection pass and on a configurable poll
+(default **5m**, property-only read) so a just-finished reap is not stuck at
+the pre-reap backlog for a full `reconcile.interval`.
+
+Fresh install / `delete.enabled=false`: the last-reap series are **absent**
+(label-less GaugeVecs, same mechanism as `job_dispatcher_subscribed`). That is
+distinct from "reaper is broken" (series present, timestamp stale) and from
+"ran and did nothing" (timestamp present, `last_reaped=0`, `last_skipped_on_cap=0`).
+`scale_csi_reconcile_delete_enabled` is 1/0 so `1` + absent timestamp is "GC is
+on but has never been recorded".
+
+### `skippedOnCap` / `skippedRefused` (ITEM 2)
+
+`ReconcileReport.CapSkippedDeletes()` is now a first-class last-pass gauge
+(`scale_csi_tombstone_reap_last_skipped_on_cap`). Capacity exhaustion is
+directly alertable instead of being inferred by comparing the backlog gauge
+against a hardcoded percentage of the cap. `skippedRefused` is equally cheap
+and equally useful — it is the rest of `SkippedDeletes` (safety-guard
+refusals, not the cap) and distinguishes "raise the cap" from "inspect the
+guard".
+
+### Oldest tombstone age (ITEM 3)
+
+`scale_csi_tombstone_oldest_age_seconds` is computed over **all** driver-owned
+tombstones awaiting reap, including age-gated ones `scale_csi_tombstone_snapshots`
+deliberately excludes. During the incident the blocking tombstone was invisible
+to the eligible set for a full day. 0 means none with a known creation time
+remain; `scale_csi_tombstone_unknown_age` distinguishes that from "exists but
+age unknown".
+
+### Chart defaults (ITEM 5)
+
+- `reconcile.delete.maxPerRun`: **5 → 1000**. This is the **destructive
+  deletion** budget and only takes effect where `reconcile.delete.enabled` is
+  true.
+- `reconcile.repair.maxPerRun`: **5** (new). Stamp adoption and
+  property-namespace migration are always-on (NOT gated by `opts.Delete`) and
+  previously shared `delete.maxPerRun`. Raising the deletion default to 1000
+  without splitting the caps would have 200x'd those repair writes on every
+  install, including ones with `delete.enabled: false`. An unset repair key
+  defaults to 5 rather than inheriting `delete.maxPerRun` — that fallback
+  would re-couple the budgets this key exists to split.
+- `reconcile.delete.schedule`: **`"0 4 * * *"` → `"20 4,10,16,22 * * *"`**
+  (~6-hourly with a :20 offset, the production cadence). Hourly is 24 Jobs/day
+  of pod startup + TrueNAS login + a full pass; 6-hourly still bounds
+  worst-case tombstone wait to 6h against `tombstoneMinAge=1h`.
+- `reconcile.delete.reapRecordPollInterval`: **5m** (new). The controller
+  poll of the durable last-reap record; was a hardcoded 30s tick.
+
+New controller-exported metrics: `scale_csi_tombstone_reap_last_success_timestamp_seconds`,
+`scale_csi_tombstone_reap_last_reaped`, `scale_csi_tombstone_reap_last_skipped_on_cap`,
+`scale_csi_tombstone_reap_last_skipped_refused`, `scale_csi_tombstone_oldest_age_seconds`,
+`scale_csi_tombstone_unknown_age`,
+`scale_csi_reconcile_delete_enabled`. New alerts: `ScaleCSITombstoneOldestStuck`,
+`ScaleCSITombstoneReapCapped`, `ScaleCSITombstoneReapStale`,
+`ScaleCSITombstoneReapNeverRan` (the last three render only when
+`reconcile.delete.enabled` is true).
+
+### Upgrade / rollback notes
+
+Config decoding uses `KnownFields(true)`. An **old binary paired with this
+chart's ConfigMap will refuse to start** on the new keys
+(`reconcile.delete.reapRecordPollInterval`, `reconcile.repair.maxPerRun`,
+and any other keys this release adds). A rollback must roll back the
+chart/config **together with the image**; rolling back only the image (or
+only the chart) is not supported.
 
 ## v1.10.4 — Grafana dashboard overhaul
 
@@ -89,7 +186,7 @@ driver's full 55-metric registry and rebuilt:
   present, the canonical `scale-csi:` value wins. Pre-rename volumes and
   snapshots keep working with zero operator action.
 - **Automatic dataset migration:** a reconciler sweep (running alongside stamp
-  adoption, capped per pass by `reconcile.delete.maxPerRun`, and NOT gated by
+  adoption, capped per pass by `reconcile.repair.maxPerRun`, and NOT gated by
   the delete mode) re-stamps LOCAL `truenas-csi:*` dataset properties under
   `scale-csi:*` and removes the legacy spelling. Inherited values are never
   migrated. The reconcile report gains `MigratedPropertyNamespaces` /
