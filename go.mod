@@ -11,7 +11,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/prometheus v0.314.0
-	github.com/stretchr/testify v1.12.0
+	github.com/stretchr/testify v1.12.1
 	go.uber.org/automaxprocs v1.6.0
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.83.0
