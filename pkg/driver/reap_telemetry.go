@@ -77,13 +77,13 @@ const (
 )
 
 func (r *ReconcileReport) tombstoneOldestAge() time.Duration {
-	var max time.Duration
+	var oldest time.Duration
 	for i := range r.TombstonePending {
-		if r.TombstonePending[i].Age > max {
-			max = r.TombstonePending[i].Age
+		if r.TombstonePending[i].Age > oldest {
+			oldest = r.TombstonePending[i].Age
 		}
 	}
-	return max
+	return oldest
 }
 
 func (r *ReconcileReport) tombstoneOldestCreatedAt() time.Time {

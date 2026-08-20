@@ -1047,7 +1047,7 @@ func (m *MockClient) DatasetUpdate(ctx context.Context, name string, params *Dat
 	if !ok {
 		return nil, notFoundAPIError("dataset not found")
 	}
-	// FailUserPropertyKeys is the same hook DatasetSetUserProperties honours:
+	// FailUserPropertyKeys is the same hook DatasetSetUserProperties honors:
 	// writeTombstoneReapRecord (and other setAndVerifyDatasetUserProperties
 	// callers) go through DatasetUpdate, not DatasetSetUserProperties.
 	for _, update := range params.UserPropertiesUpdate {
