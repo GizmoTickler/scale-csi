@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"go.uber.org/automaxprocs/maxprocs"
 	"k8s.io/klog/v2"
@@ -34,13 +35,14 @@ var (
 func main() {
 	// Define flags
 	var (
-		configFile  string
-		endpoint    string
-		nodeID      string
-		driverName  string
-		mode        string
-		healthPort  int
-		showVersion bool
+		configFile            string
+		endpoint              string
+		nodeID                string
+		driverName            string
+		mode                  string
+		healthPort            int
+		startupConnectTimeout time.Duration
+		showVersion           bool
 	)
 
 	flag.StringVar(&configFile, "config", "", "Path to driver configuration file (required)")
@@ -49,6 +51,7 @@ func main() {
 	flag.StringVar(&driverName, "driver-name", "csi.scale.io", "CSI driver name")
 	flag.StringVar(&mode, "mode", "all", "Driver mode: controller, node, all, or reconcile")
 	flag.IntVar(&healthPort, "health-port", 9809, "Port for health/metrics HTTP server (0 to disable)")
+	flag.DurationVar(&startupConnectTimeout, "startup-connect-timeout", 5*time.Minute, "How long to retry initial TrueNAS connections (0 to fail fast)")
 	flag.BoolVar(&showVersion, "version", false, "Show version and exit")
 
 	klog.InitFlags(nil)
@@ -79,6 +82,9 @@ func main() {
 
 	if configFile == "" {
 		klog.Fatal("--config is required")
+	}
+	if startupConnectTimeout < 0 {
+		klog.Fatal("--startup-connect-timeout must be non-negative")
 	}
 
 	// Load configuration
@@ -124,8 +130,10 @@ func main() {
 		klog.Infof("Node ID: %s", nodeID)
 	}
 
-	// Create driver
-	drv, err := driver.NewDriver(&driver.DriverConfig{
+	// Create driver. During a bounded controller retry window, keep the process
+	// live but unready so a Kubernetes startup probe can tolerate transient DNS
+	// or network loss without activating the CSI liveness probe prematurely.
+	driverConfig := &driver.DriverConfig{
 		Name:          cfg.DriverName,
 		Version:       Version,
 		NodeID:        nodeID,
@@ -134,7 +142,26 @@ func main() {
 		RunNode:       runNode,
 		Config:        cfg,
 		HealthPort:    healthPort,
-	})
+	}
+	needsTrueNAS := runController || reconcileOnce
+	var startupHealth *startupHealthServer
+	if needsTrueNAS && startupConnectTimeout > 0 && healthPort > 0 {
+		startupHealth, err = startStartupHealthServer(healthPort, runController, runNode)
+		if err != nil {
+			klog.Fatalf("Failed to start startup health server: %v", err)
+		}
+	}
+	drv, err := createDriverWithStartupRetry(startupConnectTimeout, func() (*driver.Driver, error) {
+		return driver.NewDriver(driverConfig)
+	}, driver.IsTrueNASClientCreationError)
+	if startupHealth != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownErr := startupHealth.Stop(shutdownCtx)
+		cancel()
+		if shutdownErr != nil {
+			klog.Warningf("Failed to stop startup health server: %v", shutdownErr)
+		}
+	}
 	if err != nil {
 		klog.Fatalf("Failed to create driver: %v", err)
 	}

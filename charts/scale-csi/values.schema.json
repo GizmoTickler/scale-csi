@@ -542,6 +542,19 @@
       "type": "string",
       "minLength": 1
     },
+    "startupConnectTimeout": {
+      "description": "Maximum time to retry the initial TrueNAS connection with exponential backoff. Set to 0s for fail-fast startup.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(0|0s|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$"
+        },
+        {
+          "type": "integer",
+          "const": 0
+        }
+      ]
+    },
     "csidriver": {
       "type": "object",
       "additionalProperties": false,

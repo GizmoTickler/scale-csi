@@ -125,6 +125,7 @@ spec:
             - "-config=/etc/scale-csi/config.yaml"
             - "-mode=controller"
             - "-health-port={{ .Values.metrics.port }}"
+            - "-startup-connect-timeout={{ .Values.startupConnectTimeout }}"
             - "-v={{ .Values.logging.verbosity }}"
           ports:
             - name: health
@@ -157,6 +158,14 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.metrics.port }}
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /healthz

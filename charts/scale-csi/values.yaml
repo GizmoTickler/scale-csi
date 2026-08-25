@@ -208,6 +208,10 @@ image:
 
 imagePullSecrets: []
 
+# Maximum time the driver retries its initial TrueNAS connection with
+# exponential backoff. Set to 0s to retain fail-fast startup behavior.
+startupConnectTimeout: 5m
+
 # Controller configuration (runs as Deployment)
 controller:
   enabled: true

@@ -136,6 +136,30 @@ func TestNewDriverControllerCreatesTrueNASClient(t *testing.T) {
 	drv.Stop()
 }
 
+func TestNewDriverClassifiesTrueNASClientCreationFailure(t *testing.T) {
+	original := newTrueNASClient
+	t.Cleanup(func() { newTrueNASClient = original })
+	wantErr := fmt.Errorf("dial tcp: lookup truenas.example.test: connection refused")
+	newTrueNASClient = func(*truenas.ClientConfig) (truenas.ClientInterface, error) {
+		return nil, wantErr
+	}
+
+	drv, err := NewDriver(&DriverConfig{
+		Name:          "csi.scale.io",
+		Version:       "test",
+		Endpoint:      "unix:///tmp/scale-csi-controller-test.sock",
+		RunController: true,
+		Config: &Config{
+			TrueNAS: TrueNASConfig{Host: "truenas.example.test", APIKey: "test-key"},
+			ZFS:     ZFSConfig{DatasetParentName: "tank/csi"},
+		},
+	})
+	require.Error(t, err)
+	assert.Nil(t, drv)
+	assert.ErrorIs(t, err, wantErr)
+	assert.True(t, IsTrueNASClientCreationError(err))
+}
+
 func TestNewDriverControllerRequiresTrueNASAPIKey(t *testing.T) {
 	original := newTrueNASClient
 	t.Cleanup(func() { newTrueNASClient = original })
@@ -158,6 +182,7 @@ func TestNewDriverControllerRequiresTrueNASAPIKey(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, drv)
 	assert.Contains(t, err.Error(), "truenas.apiKey")
+	assert.False(t, IsTrueNASClientCreationError(err))
 	assert.False(t, clientCreated)
 }
 

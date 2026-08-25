@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -304,6 +305,26 @@ var newTrueNASClient = func(cfg *truenas.ClientConfig) (truenas.ClientInterface,
 	return truenas.NewClient(cfg)
 }
 
+type trueNASClientCreationError struct {
+	err error
+}
+
+func (e *trueNASClientCreationError) Error() string {
+	return fmt.Sprintf("failed to create TrueNAS client: %v", e.err)
+}
+
+func (e *trueNASClientCreationError) Unwrap() error {
+	return e.err
+}
+
+// IsTrueNASClientCreationError reports whether driver construction reached the
+// TrueNAS connection step and failed there. Startup retries must not hide
+// permanent configuration or node identity errors.
+func IsTrueNASClientCreationError(err error) bool {
+	var target *trueNASClientCreationError
+	return errors.As(err, &target)
+}
+
 // NewDriver creates a new TrueNAS CSI driver instance.
 func NewDriver(cfg *DriverConfig) (*Driver, error) {
 	if cfg.Name == "" {
@@ -375,7 +396,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 			APIRetryBackoffFactor:       cfg.Config.Resilience.Retry.BackoffMultiplier,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to create TrueNAS client: %w", err)
+			return nil, &trueNASClientCreationError{err: err}
 		}
 	}
 
