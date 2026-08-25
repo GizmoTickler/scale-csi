@@ -46,6 +46,12 @@ type MockClient struct {
 	nextSnapshotTaskID         int
 	deferredSnapshots          map[string]struct{}
 	DatasetDeleteCalls         []DatasetDeleteCall
+	DatasetAttachmentValues    map[string][]DatasetAttachment
+	DatasetProcessValues       map[string][]DatasetProcess
+	DatasetAttachmentCalls     []string
+	DatasetProcessCalls        []string
+	DatasetAttachmentsErr      error
+	DatasetProcessesErr        error
 	DatasetPromoteCalls        []string
 	ReplicationJobAbortCalls   []int64
 	ReplicationJobAbortReasons []string
@@ -409,20 +415,22 @@ type DatasetDeleteCall struct {
 // NewMockClient creates a new MockClient.
 func NewMockClient() *MockClient {
 	return &MockClient{
-		Datasets:           make(map[string]*Dataset),
-		Snapshots:          make(map[string]*Snapshot),
-		NFSShares:          make(map[int]*NFSShare),
-		ISCSITargets:       make(map[int]*ISCSITarget),
-		ISCSIExtents:       make(map[int]*ISCSIExtent),
-		TargetExtents:      make(map[int]*ISCSITargetExtent),
-		ISCSIAuths:         make(map[int]*ISCSIAuth),
-		NVMeHosts:          make(map[string]*NVMeoFHost),
-		NVMeHostSubsystems: make(map[int]*NVMeoFHostSubsys),
-		NVMeSubsystems:     make(map[int]*NVMeoFSubsystem),
-		NVMeNamespaces:     make(map[int]*NVMeoFNamespace),
-		ReplicationJobs:    make(map[int64]*ReplicationJob),
-		SnapshotTasks:      make(map[int]*SnapshotTask),
-		nextSnapshotTaskID: 1,
+		Datasets:                make(map[string]*Dataset),
+		Snapshots:               make(map[string]*Snapshot),
+		NFSShares:               make(map[int]*NFSShare),
+		ISCSITargets:            make(map[int]*ISCSITarget),
+		ISCSIExtents:            make(map[int]*ISCSIExtent),
+		TargetExtents:           make(map[int]*ISCSITargetExtent),
+		ISCSIAuths:              make(map[int]*ISCSIAuth),
+		NVMeHosts:               make(map[string]*NVMeoFHost),
+		NVMeHostSubsystems:      make(map[int]*NVMeoFHostSubsys),
+		NVMeSubsystems:          make(map[int]*NVMeoFSubsystem),
+		NVMeNamespaces:          make(map[int]*NVMeoFNamespace),
+		ReplicationJobs:         make(map[int64]*ReplicationJob),
+		SnapshotTasks:           make(map[int]*SnapshotTask),
+		DatasetAttachmentValues: make(map[string][]DatasetAttachment),
+		DatasetProcessValues:    make(map[string][]DatasetProcess),
+		nextSnapshotTaskID:      1,
 		// Default portal/initiator fixtures cover the portal addresses used
 		// across the test suites so target-group auto-resolution succeeds
 		// without per-test setup. Tests may replace these maps.
@@ -911,6 +919,26 @@ func (m *MockClient) DatasetDelete(ctx context.Context, name string, recursive, 
 		m.reclaimDeferredSnapshotLocked(origin)
 	}
 	return nil
+}
+
+func (m *MockClient) DatasetAttachments(_ context.Context, name string) ([]DatasetAttachment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.DatasetAttachmentCalls = append(m.DatasetAttachmentCalls, name)
+	if m.DatasetAttachmentsErr != nil {
+		return nil, m.DatasetAttachmentsErr
+	}
+	return append([]DatasetAttachment(nil), m.DatasetAttachmentValues[name]...), nil
+}
+
+func (m *MockClient) DatasetProcesses(_ context.Context, name string) ([]DatasetProcess, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.DatasetProcessCalls = append(m.DatasetProcessCalls, name)
+	if m.DatasetProcessesErr != nil {
+		return nil, m.DatasetProcessesErr
+	}
+	return append([]DatasetProcess(nil), m.DatasetProcessValues[name]...), nil
 }
 
 // mockSnapshotResponse applies the decode-time CSI-namespace fold every real

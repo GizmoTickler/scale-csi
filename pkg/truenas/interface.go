@@ -36,6 +36,8 @@ type ClientInterface interface {
 	DatasetGetUserProperty(ctx context.Context, name, key string) (string, error)
 	DatasetExpand(ctx context.Context, name string, newSize int64) error
 	DatasetExists(ctx context.Context, name string) (bool, error)
+	DatasetAttachments(ctx context.Context, name string) ([]DatasetAttachment, error)
+	DatasetProcesses(ctx context.Context, name string) ([]DatasetProcess, error)
 	DatasetHasDependentClones(ctx context.Context, datasetName string) (bool, error)
 	SnapshotDependentClones(ctx context.Context, snapshotID string) ([]string, error)
 	DatasetPromote(ctx context.Context, datasetName string) error

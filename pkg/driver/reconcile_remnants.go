@@ -244,7 +244,7 @@ func (d *Driver) destroyRemnantOrphan(ctx context.Context, remnant ReconcileObje
 	if safe, k8sReason := d.remnantHasNoKubernetesReference(ctx, volumeID); !safe {
 		return false, k8sReason
 	}
-	if delErr := d.truenasClient.DatasetDelete(ctx, marker.Dataset, false, false); delErr != nil {
+	if delErr := d.deleteDatasetWithBusyObservation(ctx, marker.Dataset, false, false, "reconcile reap"); delErr != nil {
 		if truenas.IsNotFoundError(delErr) {
 			d.deleteInflightMarker(ctx, volumeID)
 			return true, ""

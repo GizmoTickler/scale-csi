@@ -441,6 +441,7 @@ func TestMetricNamesIsComplete(t *testing.T) {
 		"scale_csi_tombstone_reap_last_skipped_refused",
 		"scale_csi_reconcile_delete_enabled",
 		"scale_csi_job_dispatcher_subscribed",
+		"scale_csi_dataset_busy_observations_total",
 	} {
 		assert.True(t, set[want], "MetricNames() missing %q", want)
 	}

@@ -1860,7 +1860,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 
 	// Try to delete dataset without recursive first to preserve snapshots
 	// This follows CSI spec: snapshots should survive after source volume deletion
-	if err := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); err != nil {
+	if err := d.deleteDatasetWithBusyObservation(ctx, datasetName, false, true, "DeleteVolume"); err != nil {
 		// DatasetDelete already handles "not found" errors, so this is a real error
 		if !isDatasetDependencyOrBusyError(err) {
 			klog.Errorf("Failed to delete dataset for volume %s: %v", volumeID, err)
@@ -1940,7 +1940,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			}
 			// The only snapshots may have been unreferenced internal clone-source
 			// snapshots. Retry now that those driver-owned blockers are gone.
-			if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); delErr != nil {
+			if delErr := d.deleteDatasetWithBusyObservation(ctx, datasetName, false, true, "DeleteVolume"); delErr != nil {
 				klog.Errorf("Failed to delete dataset for volume %s after internal snapshot cleanup: %v", volumeID, delErr)
 				if isDatasetDependencyOrBusyError(delErr) {
 					return nil, status.Errorf(codes.FailedPrecondition,
@@ -2824,7 +2824,7 @@ func (d *Driver) releaseHeldDriverSnapshotsUnder(ctx context.Context, datasetNam
 // driver-proven snapshots are released; a hold on a foreign snapshot correctly
 // keeps the destroy refused. Zero extra calls unless the EBUSY actually happens.
 func (d *Driver) recursiveDatasetDeleteWithHoldRecovery(ctx context.Context, datasetName string) error {
-	err := d.truenasClient.DatasetDelete(ctx, datasetName, true, true)
+	err := d.deleteDatasetWithBusyObservation(ctx, datasetName, true, true, "DeleteVolume")
 	if err == nil || !truenas.IsSnapshotHeldError(err) {
 		return err
 	}
@@ -2832,7 +2832,7 @@ func (d *Driver) recursiveDatasetDeleteWithHoldRecovery(ctx context.Context, dat
 		return err
 	}
 	klog.Warningf("Recursive delete of %s was refused by ZFS holds on driver-owned snapshots; released them and retrying once", datasetName)
-	return d.truenasClient.DatasetDelete(ctx, datasetName, true, true)
+	return d.deleteDatasetWithBusyObservation(ctx, datasetName, true, true, "DeleteVolume")
 }
 
 // snapshotCarriesInstanceIdentity reports whether a snapshot's retained identity

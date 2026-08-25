@@ -698,6 +698,15 @@ var (
 		[]string{"protocol"},
 	)
 
+	datasetBusyObservationsTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "dataset_busy_observations_total",
+			Help:      "Total dataset attachments and processes observed by best-effort pre-delete checks",
+		},
+		[]string{"kind"},
+	)
+
 	// Circuit breaker metrics
 	circuitBreakerState = regGauge(
 		prometheus.GaugeOpts{
@@ -1240,6 +1249,12 @@ func RecordFencingProvenanceOverflow(protocol string) {
 
 func RecordDeleteVolumeOrphanCleanupFailure(protocol string) {
 	deleteVolumeOrphanCleanupFailuresTotal.WithLabelValues(protocol).Inc()
+}
+
+func RecordDatasetBusyObservations(kind string, count int) {
+	if count > 0 {
+		datasetBusyObservationsTotal.WithLabelValues(kind).Add(float64(count))
+	}
 }
 
 // Circuit breaker metrics tracking
