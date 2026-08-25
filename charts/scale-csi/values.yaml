@@ -208,6 +208,9 @@ image:
 
 imagePullSecrets: []
 
+# Number of old Controller ReplicaSets and Node DaemonSet revisions to retain.
+revisionHistoryLimit: 2
+
 # Maximum time the driver retries its initial TrueNAS connection with
 # exponential backoff. Set to 0s to retain fail-fast startup behavior.
 startupConnectTimeout: 5m

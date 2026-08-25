@@ -542,6 +542,11 @@
       "type": "string",
       "minLength": 1
     },
+    "revisionHistoryLimit": {
+      "description": "Number of old controller ReplicaSets and node DaemonSet revisions to retain.",
+      "type": "integer",
+      "minimum": 0
+    },
     "startupConnectTimeout": {
       "description": "Maximum time to retry the initial TrueNAS connection with exponential backoff. Set to 0s for fail-fast startup.",
       "oneOf": [

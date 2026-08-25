@@ -12,6 +12,7 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   replicas: {{ .Values.controller.replicas }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   # Render an explicit strategy in BOTH fencing modes so Helm always owns the
   # field. Off mode previously rendered no strategy block, so the API server
   # defaulted RollingUpdate and Helm's three-way merge never managed it; the

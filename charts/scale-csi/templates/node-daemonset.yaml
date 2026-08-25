@@ -8,6 +8,7 @@ metadata:
     {{- include "scale-csi.labels" . | nindent 4 }}
     app.kubernetes.io/component: node
 spec:
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   selector:
     matchLabels:
       {{- include "scale-csi.nodeSelectorLabels" . | nindent 6 }}
