@@ -472,11 +472,11 @@ type Client struct {
 	snapshotCreatePropertiesMu      sync.Mutex
 	snapshotCreatePropertiesSupport map[string]bool
 
-	// TrueNAS 26.0 removed service.reload in favor of service.control. Cache the
-	// resolved reload verb so a 26.0 backend pays the method-not-found fallback
-	// probe once instead of on every debounced reload (2 RTTs -> 1 RTT).
-	serviceReloadResolved   atomic.Bool
-	serviceReloadUseControl atomic.Bool
+	// TrueNAS 26.0 uses service.control for reloads. Cache whether an older
+	// backend requires the legacy service.reload fallback so only the first
+	// reload probes both verbs.
+	serviceReloadResolved  atomic.Bool
+	serviceReloadUseLegacy atomic.Bool
 
 	dispatcher *jobDispatcher
 
@@ -1696,28 +1696,30 @@ func (c *Client) deleteVanishedTolerant(ctx context.Context, method string, id i
 
 func (c *Client) ServiceReload(ctx context.Context, service string) error {
 	klog.V(4).Infof("Reloading service: %s", service)
-	if c.serviceReloadResolved.Load() && c.serviceReloadUseControl.Load() {
+	if c.serviceReloadResolved.Load() {
+		if c.serviceReloadUseLegacy.Load() {
+			return c.serviceReloadViaLegacy(ctx, service)
+		}
 		return c.serviceReloadViaControl(ctx, service)
 	}
-	_, err := c.Call(ctx, "service.reload", service)
+
+	err := c.serviceReloadViaControl(ctx, service)
 	if err == nil {
-		// Resolved on service.reload; useControl stays false so future reloads reuse it.
 		c.serviceReloadResolved.Store(true)
-		klog.Infof("Service %s reloaded successfully", service)
 		return nil
 	}
-	// TrueNAS 26.0 removed service.reload in favor of
-	// service.control(verb, service, options) (validated live).
+	// Older TrueNAS releases may expose only service.reload. Probe it only when
+	// service.control itself is unavailable, then cache the working legacy verb.
 	if isMethodNotFoundError(err) || MessageFallbackContains(err, "method call error") {
-		if ctlErr := c.serviceReloadViaControl(ctx, service); ctlErr == nil {
-			c.serviceReloadUseControl.Store(true)
+		if legacyErr := c.serviceReloadViaLegacy(ctx, service); legacyErr == nil {
+			c.serviceReloadUseLegacy.Store(true)
 			c.serviceReloadResolved.Store(true)
 			return nil
 		} else {
-			err = ctlErr
+			err = legacyErr
 		}
 	}
-	return fmt.Errorf("failed to reload service %s: %w", service, err)
+	return err
 }
 
 func (c *Client) serviceReloadViaControl(ctx context.Context, service string) error {
@@ -1725,6 +1727,14 @@ func (c *Client) serviceReloadViaControl(ctx context.Context, service string) er
 		return fmt.Errorf("failed to reload service %s: %w", service, err)
 	}
 	klog.Infof("Service %s reloaded successfully (service.control)", service)
+	return nil
+}
+
+func (c *Client) serviceReloadViaLegacy(ctx context.Context, service string) error {
+	if _, err := c.Call(ctx, "service.reload", service); err != nil {
+		return fmt.Errorf("failed to reload service %s: %w", service, err)
+	}
+	klog.Infof("Service %s reloaded successfully (service.reload)", service)
 	return nil
 }
 
