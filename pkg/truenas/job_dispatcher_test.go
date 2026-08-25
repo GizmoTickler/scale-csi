@@ -25,6 +25,8 @@ func newJobWaitTestClient(t *testing.T) *Client {
 		jobWaitPollInterval:    5 * time.Millisecond,
 		jobWaitSafetyInterval:  30 * time.Millisecond,
 	}
+	client.coreJobWaitUnavailable.Store(true)
+	client.coreJobWaitResolved.Store(true)
 	t.Cleanup(client.dispatcher.Stop)
 	return client
 }
