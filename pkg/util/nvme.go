@@ -945,10 +945,20 @@ func FindNVMeoFSessionByVolumeID(volumeID string) (string, error) {
 
 // NVMeoFSessionInfo holds information about an active NVMe-oF session.
 // Used by session GC to identify orphaned sessions.
+//
+// Address/Transport mirror the FIRST path only (kernel enumeration order,
+// which is nondeterministic under multipath) and exist for logging/back-compat.
+// Scoping decisions MUST use Addresses, which carries every path so a
+// subsystem is not judged out-of-scope just because its first-enumerated path
+// happens to land on a non-primary configured address.
 type NVMeoFSessionInfo struct {
 	NQN       string
 	Address   string
 	Transport string
+	// Addresses holds the raw "traddr=...,trsvcid=...,src_addr=..." string for
+	// EVERY path of the subsystem (not just Paths[0]). Empty when the
+	// subsystem currently has zero paths.
+	Addresses []string
 }
 
 // ListNVMeoFSessions returns all active NVMe-oF sessions.
@@ -964,17 +974,25 @@ func ListNVMeoFSessions() ([]NVMeoFSessionInfo, error) {
 
 	var sessions []NVMeoFSessionInfo
 	for _, subsys := range subsystems {
-		// Get the address from the first path (if available)
+		// Get the address/transport from the first path (if available) for
+		// back-compat logging, but carry ALL paths in Addresses -- under
+		// multipath, Paths[0] is kernel enumeration order, not necessarily the
+		// configured primary transport address (see gcNVMeoFSessions).
 		address := ""
 		transport := ""
+		addresses := make([]string, 0, len(subsys.Paths))
 		if len(subsys.Paths) > 0 {
 			address = subsys.Paths[0].Address
 			transport = subsys.Paths[0].Transport
+		}
+		for _, path := range subsys.Paths {
+			addresses = append(addresses, path.Address)
 		}
 		sessions = append(sessions, NVMeoFSessionInfo{
 			NQN:       subsys.NQN,
 			Address:   address,
 			Transport: transport,
+			Addresses: addresses,
 		})
 	}
 

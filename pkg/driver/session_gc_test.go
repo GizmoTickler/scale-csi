@@ -174,8 +174,8 @@ func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		d := &Driver{config: &Config{NVMeoF: NVMeoFConfig{TransportAddress: "192.0.2.20"}}}
 		sessions := []util.NVMeoFSessionInfo{
-			{NQN: "nqn.test:one", Address: "traddr=192.0.2.20,trsvcid=4420"},
-			{NQN: "nqn.test:two", Address: "traddr=192.0.2.20,trsvcid=4420"},
+			{NQN: "nqn.test:one", Address: "traddr=192.0.2.20,trsvcid=4420", Addresses: []string{"traddr=192.0.2.20,trsvcid=4420"}},
+			{NQN: "nqn.test:two", Address: "traddr=192.0.2.20,trsvcid=4420", Addresses: []string{"traddr=192.0.2.20,trsvcid=4420"}},
 		}
 		for _, session := range sessions {
 			d.orphanedNVMeSessionsSeen.Store(session.NQN, time.Now().Add(-time.Hour))
@@ -193,6 +193,79 @@ func TestSessionGCStopsBetweenDisconnectsWhenContextIsCanceled(t *testing.T) {
 		assert.Equal(t, 1, disconnects)
 		assert.Equal(t, metricBefore+1, testutil.ToFloat64(gcSessionsDisconnectedTotal.WithLabelValues("nvmeof")))
 	})
+}
+
+// TestNVMeoFGCScopesByAnyMultipathPath reproduces the live k8s-0 defect: under
+// multipath, nvme-cli's Paths[0] is kernel enumeration order, not necessarily
+// the configured primary TransportAddress. A subsystem whose FIRST path lands
+// on a secondary configured address (or, before this fix, on any address that
+// isn't literally TransportAddress) must still be recognized as belonging to
+// this driver and be eligible for GC, because at least one of its paths
+// matches a configured address.
+func TestNVMeoFGCScopesByAnyMultipathPath(t *testing.T) {
+	d := &Driver{config: &Config{NVMeoF: NVMeoFConfig{
+		Multipath:        true,
+		TransportAddress: "192.0.2.20",
+		Addresses:        []string{"192.0.2.21"},
+	}}}
+	const nqn = "nqn.test:multipath-first-path-secondary"
+	// Paths[0] (session.Address) is the SECONDARY address; only Paths[1]
+	// (carried in Addresses) is the primary TransportAddress. Pre-fix, the GC
+	// only ever looked at Paths[0]/session.Address against a single
+	// TransportAddress, so this subsystem was invisible to it.
+	sessions := []util.NVMeoFSessionInfo{{
+		NQN:     nqn,
+		Address: "traddr=192.0.2.21,trsvcid=4420",
+		Addresses: []string{
+			"traddr=192.0.2.21,trsvcid=4420",
+			"traddr=192.0.2.20,trsvcid=4420",
+		},
+	}}
+	originalListNVMe := gcListNVMeoFSessions
+	originalDisconnectNVMe := gcDisconnectNVMeoF
+	t.Cleanup(func() {
+		gcListNVMeoFSessions = originalListNVMe
+		gcDisconnectNVMeoF = originalDisconnectNVMe
+	})
+	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) { return sessions, nil }
+	var disconnected []string
+	gcDisconnectNVMeoF = func(id string) error {
+		disconnected = append(disconnected, id)
+		return nil
+	}
+	d.orphanedNVMeSessionsSeen.Store(nqn, time.Now().Add(-time.Hour))
+
+	d.gcNVMeoFSessions(context.Background(), 0, false)
+
+	assert.Equal(t, []string{nqn}, disconnected, "subsystem must be recognized in-scope via its secondary path and GC'd")
+}
+
+// TestNVMeoFGCTreatsZeroPathSessionAsInScope covers a subsystem with no paths
+// at all: it is a leak candidate (something disconnected under it without the
+// subsystem entry itself going away), not evidence it belongs to a different
+// driver instance, so it must stay eligible for GC rather than being silently
+// skipped as out-of-scope.
+func TestNVMeoFGCTreatsZeroPathSessionAsInScope(t *testing.T) {
+	d := &Driver{config: &Config{NVMeoF: NVMeoFConfig{TransportAddress: "192.0.2.20"}}}
+	const nqn = "nqn.test:zero-paths"
+	sessions := []util.NVMeoFSessionInfo{{NQN: nqn}}
+	originalListNVMe := gcListNVMeoFSessions
+	originalDisconnectNVMe := gcDisconnectNVMeoF
+	t.Cleanup(func() {
+		gcListNVMeoFSessions = originalListNVMe
+		gcDisconnectNVMeoF = originalDisconnectNVMe
+	})
+	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) { return sessions, nil }
+	var disconnected []string
+	gcDisconnectNVMeoF = func(id string) error {
+		disconnected = append(disconnected, id)
+		return nil
+	}
+	d.orphanedNVMeSessionsSeen.Store(nqn, time.Now().Add(-time.Hour))
+
+	d.gcNVMeoFSessions(context.Background(), 0, false)
+
+	assert.Equal(t, []string{nqn}, disconnected, "a pathless subsystem is a leak candidate and must remain in scope")
 }
 
 func TestSessionGaugesRefreshWhenCleanupDisabled(t *testing.T) {
@@ -234,7 +307,7 @@ func TestISCSIGCPreservesNVMeOrphanFirstSeen(t *testing.T) {
 		NVMeoF: NVMeoFConfig{TransportAddress: "192.0.2.20"},
 	}}
 	gcListNVMeoFSessions = func() ([]util.NVMeoFSessionInfo, error) {
-		return []util.NVMeoFSessionInfo{{NQN: orphanNQN, Address: "traddr=192.0.2.20,trsvcid=4420"}}, nil
+		return []util.NVMeoFSessionInfo{{NQN: orphanNQN, Address: "traddr=192.0.2.20,trsvcid=4420", Addresses: []string{"traddr=192.0.2.20,trsvcid=4420"}}}, nil
 	}
 	d.gcNVMeoFSessions(context.Background(), time.Hour, true)
 	firstSeenValue, ok := d.orphanedNVMeSessionsSeen.Load(orphanNQN)

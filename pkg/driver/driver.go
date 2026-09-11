@@ -1071,7 +1071,14 @@ func (d *Driver) gcISCSISessions(ctx context.Context, gracePeriod time.Duration,
 // gcNVMeoFSessions garbage collects orphaned NVMe-oF sessions.
 // Sessions must be orphaned for at least gracePeriod before being disconnected.
 func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration, dryRun bool) {
-	targetAddr := d.config.NVMeoF.TransportAddress
+	// Configured scope: under multipath, ANY of these addresses is a valid
+	// home for a session. multipathAddresses() returns nil when multipath is
+	// off, so fall back to the single TransportAddress in that case -- it is
+	// the only configured address a non-multipath session could ever match.
+	targetAddrs := d.config.NVMeoF.multipathAddresses()
+	if len(targetAddrs) == 0 {
+		targetAddrs = []string{d.config.NVMeoF.TransportAddress}
+	}
 	d.gcSessions(ctx, gracePeriod, dryRun, sessionGCProtocol{
 		name:        "NVMe-oF",
 		metricLabel: "nvmeof",
@@ -1083,13 +1090,33 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 			}
 			out := make([]gcSession, 0, len(sessions))
 			for _, session := range sessions {
-				// Session address format from nvme list-subsys:
-				// "traddr=192.0.2.10,trsvcid=4420,src_addr=203.0.113.10"; config
-				// address format: "192.0.2.10".
+				// A subsystem is in scope if ANY of its paths matches ANY
+				// configured address -- Paths[0] alone (session.Address) is
+				// kernel enumeration order and is NOT reliably the configured
+				// primary address under multipath (verified live: 1 of 14
+				// subsystems on k8s-0 enumerated its non-primary path first).
+				// A subsystem with zero paths has nothing to compare and is
+				// treated as in scope: it is a leak candidate, not evidence
+				// that it belongs to another driver instance.
 				inScope := true
-				if !nvmeSessionMatchesTransportAddress(session.Address, targetAddr) {
-					klog.V(5).Infof("Session GC: skipping session %s (different address: %s, target: %s)", session.NQN, session.Address, targetAddr)
+				if len(session.Addresses) > 0 {
 					inScope = false
+					for _, addr := range session.Addresses {
+						matched := false
+						for _, targetAddr := range targetAddrs {
+							if nvmeSessionMatchesTransportAddress(addr, targetAddr) {
+								matched = true
+								break
+							}
+						}
+						if matched {
+							inScope = true
+							break
+						}
+					}
+				}
+				if !inScope {
+					klog.V(5).Infof("Session GC: skipping session %s (no path matches configured addresses %v; paths: %v)", session.NQN, targetAddrs, session.Addresses)
 				}
 				out = append(out, gcSession{id: session.NQN, inScope: inScope})
 			}
