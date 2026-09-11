@@ -359,3 +359,64 @@ func TestQuarantineRefusedWhenAGenuineConflictCoexistsWithAStaleRecord(t *testin
 	assert.True(t, ok, "a leftover record with no live publisher is exactly what quarantine is for")
 	assert.Equal(t, "departed-node", node)
 }
+
+// TestCurrentStartupFencingVolumeRecordsDrainingNodesAsClaimed is the
+// regression test for a fix that was a SILENT NO-OP.
+//
+// The draining-node fix populated claimedNodes in the collection pass, but
+// reconcileStartupFencingVolume overwrites its snapshot with the freshly-read
+// volume from currentStartupFencingVolume — which never set the field at all.
+// liveNodes was therefore still derived from the narrow Attached-only set, the
+// startup and revoke paths still disagreed about a draining node, and the
+// permanent quarantine the fix claimed to remove was still there.
+//
+// This test drives the constructor that actually wins, with a VolumeAttachment
+// that EXISTS but is not Attached — the mid-drain shape. It fails on the tree
+// where only the collection pass was fixed.
+func TestCurrentStartupFencingVolumeRecordsDrainingNodesAsClaimed(t *testing.T) {
+	const volumeID = "tank/csi/pvc-draining"
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-draining"},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{Driver: "csi.scale.io", VolumeHandle: volumeID},
+			},
+		},
+	}
+	pvName := pv.Name
+	attached := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-attached"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi.scale.io", NodeName: "k8s-0",
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	// The mid-drain node: its VolumeAttachment exists, so the revoke path counts
+	// it live, but it is no longer Attached.
+	draining := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-draining"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi.scale.io", NodeName: "k8s-1",
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: false},
+	}
+
+	clientset := kubernetesfake.NewSimpleClientset(pv, attached, draining)
+	d := &Driver{
+		name:          "csi.scale.io",
+		config:        &Config{},
+		eventRecorder: &EventRecorder{clientset: clientset, enabled: false},
+	}
+
+	volume, err := d.currentStartupFencingVolume(context.Background(), volumeID)
+	require.NoError(t, err)
+	require.NotNil(t, volume)
+
+	assert.Contains(t, volume.claimedNodes, "k8s-1",
+		"a node whose VolumeAttachment exists but is not Attached must still count as a live CLAIM, or the startup path quarantines a volume the revoke path will never un-quarantine")
+	assert.Contains(t, volume.claimedNodes, "k8s-0")
+	assert.Len(t, volume.publications, 1,
+		"only the fully-attached node is something to converge a fence for")
+}

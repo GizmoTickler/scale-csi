@@ -1,6 +1,12 @@
 module github.com/GizmoTickler/scale-csi
 
-go 1.26.6
+// Must track the Dockerfile base image. golang.org/x/net/http2 swaps
+// implementations on a //go:build go1.27 constraint keyed off the TOOLCHAIN,
+// so a go directive of 1.26 while the image builds on 1.27 means CI compiles
+// x/net's own HTTP/2 stack (server.go, transport.go, flow control, write
+// scheduling) while the shipped binary compiles the thin stdlib wrapper. That
+// is on the controller's kube-apiserver path, and no test can catch it.
+go 1.27.1
 
 require (
 	github.com/container-storage-interface/spec v1.12.0

@@ -444,12 +444,28 @@ func (d *Driver) currentStartupFencingVolume(ctx context.Context, volumeID strin
 	current := make([]currentAttachment, 0)
 	for i := range attachmentList.Items {
 		attachment := &attachmentList.Items[i]
-		if attachment.Spec.Attacher != d.name || !attachment.Status.Attached ||
-			!attachment.DeletionTimestamp.IsZero() || attachment.Spec.Source.PersistentVolumeName == nil {
+		if attachment.Spec.Attacher != d.name || attachment.Spec.Source.PersistentVolumeName == nil {
 			continue
 		}
 		pv := pvs[*attachment.Spec.Source.PersistentVolumeName]
 		if pv == nil {
+			continue
+		}
+		// claimedNodes must be populated HERE, not only in the collection pass.
+		// reconcileStartupFencingVolume overwrites its snapshot with this
+		// freshly-read volume, so a claimedNodes set built anywhere else is
+		// discarded before liveNodes is derived from it — which made the
+		// draining-node fix a silent no-op. Widen before the narrow filter, so
+		// a VolumeAttachment that exists but is not yet or no longer Attached
+		// still counts as a live CLAIM, matching the predicate
+		// reconcileStalePublicationRecords uses. The two disagreeing is what
+		// made a quarantine permanent: mid-drain read STALE here and LIVE
+		// there, so no revoke ever fired to wake the loop.
+		if result.claimedNodes == nil {
+			result.claimedNodes = make(map[string]struct{})
+		}
+		result.claimedNodes[attachment.Spec.NodeName] = struct{}{}
+		if !attachment.Status.Attached || !attachment.DeletionTimestamp.IsZero() {
 			continue
 		}
 		current = append(current, currentAttachment{nodeName: attachment.Spec.NodeName, pv: pv})
