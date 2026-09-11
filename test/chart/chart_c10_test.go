@@ -136,6 +136,42 @@ storageClasses:
 			t.Error("an enabled StorageClass with chapSecretName must turn the secrets get rule on")
 		}
 	})
+
+	// The gate originally ranged ONLY over the plural .Values.storageClasses,
+	// missing two real callers: the legacy singular .Values.storageClass path
+	// (storageclass.yaml REPLACES the class list with it and reads the same
+	// chapSecretName/encryptionSecretName keys off it) and encryption.enabled
+	// (the driver's own locked-volume reconciler reads a Secret named by LIVE
+	// StorageClass parameters whenever it is set, independent of chart values).
+	// Both cases render a StorageClass or run a reconciler that needs "secrets
+	// get" with no rule granted at all — an upgrade-time regression for the
+	// legacy form, and a permanently-Forbidden reconciler for a GitOps split
+	// where StorageClasses are managed outside this chart.
+	t.Run("the legacy singular storageClass form with a CHAP secret turns the rule on", func(t *testing.T) {
+		valuesPath := writeValues(t, "chap-secret-rbac-legacy.yaml", `iscsi:
+  enabled: true
+  chap:
+    enabled: true
+storageClass:
+  name: scale-iscsi-chap-legacy
+  protocol: iscsi
+  chapSecretName: scale-iscsi-chap-legacy
+  chapSecretNamespace: ""
+`)
+		out := helmTemplate(t, "-f", valuesPath)
+		role := findManifest(t, decodeManifests(t, out), "ClusterRole", "scale-csi-controller")
+		if !roleHasRule(role, []string{"secrets"}, []string{"get"}) {
+			t.Error("the legacy singular storageClass form with chapSecretName must turn the secrets get rule on")
+		}
+	})
+
+	t.Run("encryption.enabled with no secret-bearing StorageClass turns the rule on", func(t *testing.T) {
+		out := helmTemplate(t, "--set", "encryption.enabled=true")
+		role := findManifest(t, decodeManifests(t, out), "ClusterRole", "scale-csi-controller")
+		if !roleHasRule(role, []string{"secrets"}, []string{"get"}) {
+			t.Error("encryption.enabled must turn the secrets get rule on even when no StorageClass declares a secret ref")
+		}
+	})
 }
 
 // TestChartSidecarsHaveRetryIntervalMax is the regression test for C10's last
