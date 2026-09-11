@@ -31,10 +31,14 @@ jobs:
           cache: true
       - name: Run go vet
         run: go vet ./...
+      - name: Verify golangci-lint config
+        # Fails fast (and cheaply) on a malformed .golangci.yml before the
+        # much heavier full lint run below attempts to use it.
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 config verify
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.12.2
+          version: v2.13.2
 
   test:
     name: Unit Tests
@@ -47,11 +51,23 @@ jobs:
           cache: true
       - name: Run tests with coverage
         run: go test -v -race -short -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Run pkg/driver a second time with -shuffle=on
+        # See the Makefile's `check` target comment: much of the backend-health
+        # and metric state is process-global, so a leaking test can pass in
+        # declaration order and fail only under a specific shuffle seed
+        # (GF5/H1 shipped exactly that way). Kept as its own step so a
+        # shuffle-only failure is easy to spot separately from the coverage run.
+        run: go test -count=1 -shuffle=on ./pkg/driver/
       - name: Check coverage threshold
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
           echo "Total coverage: ${COVERAGE}%"
-          THRESHOLD=30
+          # Ratchet, not a fixed floor: measured coverage at the time this was
+          # raised was 73.4% (go test -v -race -short -coverprofile ... ./...,
+          # go tool cover -func). 70 leaves a ~3.4-point margin for normal
+          # fluctuation without inviting the threshold to rot back down to a
+          # number nobody re-measured.
+          THRESHOLD=70
           if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
             echo "::error::Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
             exit 1
@@ -138,12 +154,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: "go.mod"
+          cache: true
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v4.2.4
       - name: Lint Helm chart
         run: helm lint --strict charts/scale-csi/
+      - name: Run chart Go test suite
+        # test/chart's ~80 test functions shell out to `helm template`/`helm
+        # lint` themselves; they self-skip via exec.LookPath("helm") when helm
+        # isn't on PATH, which is exactly what silently happened in the Unit
+        # Tests job (no helm installed there) -- so this suite has been
+        # exercised locally only until now. This job already has helm on
+        # PATH, so run it for real here instead.
+        run: go test -v -race -count=1 ./test/chart/...
       - name: Template every protocol and controller mode
         run: |
           helm template scale-csi charts/scale-csi/ \
@@ -247,10 +275,64 @@ jobs:
           directory: charts/scale-csi/
           config: .kube-linter.yaml
 
+  fuzz-smoke:
+    name: Fuzz Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: "go.mod"
+          cache: true
+      - name: Run every Fuzz target for 30s
+        # Discovers targets by name instead of hardcoding the list: another
+        # branch is actively adding fuzz targets, and this must keep exercising
+        # whatever exists rather than a snapshot taken today. `go test -fuzz`
+        # only accepts one target per invocation, so this loops per package.
+        run: |
+          set -euo pipefail
+          status=0
+          for pkg in $(go list ./...); do
+            targets=$(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz' || true)
+            for target in $targets; do
+              echo "::group::${pkg} ${target}"
+              if ! go test -run '^$' -fuzz "^${target}\$" -fuzztime=30s "$pkg"; then
+                status=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+          exit "$status"
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        # Installed from a checksum-verified release tarball rather than the
+        # gitleaks-action wrapper, which gates some of its features behind a
+        # license; the OSS gitleaks CLI itself needs none of that.
+        run: |
+          set -euo pipefail
+          cd /tmp
+          curl -sSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+      - name: Scan for secrets
+        # Full git history, redacted output. .gitleaks-baseline.json pins the
+        # exact fingerprints of findings already reviewed and confirmed to be
+        # test fixtures / doc examples (see that file) -- anything else, in
+        # any commit, still fails the scan.
+        run: gitleaks detect --source . --no-banner --redact --baseline-path .gitleaks-baseline.json
+
   docker-build:
     name: Container Build
     runs-on: ubuntu-latest
-    needs: [lint, test, csi-sanity, govulncheck, build, helm-lint]
+    needs: [lint, test, csi-sanity, govulncheck, build, helm-lint, fuzz-smoke, secret-scan]
     permissions:
       contents: read
       packages: write
