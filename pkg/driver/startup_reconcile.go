@@ -489,7 +489,22 @@ func (d *Driver) startStartupAttachmentReconcile() {
 	}
 	signal := d.startupAttachmentReconcileSignal()
 	ctx, cancel := context.WithCancel(context.Background())
+	// (C7) startupReconcileStateMu + startupReconcileStopped close the race where
+	// a Stop() landing between this function's entry and the plain assignment
+	// below used to observe a nil startupReconcileCancel, skip cancellation, and
+	// let this loop launch anyway — including reconcileEncryptedUnlocks and
+	// reconcilePublishedAttachments, which WRITE backend fencing state — running
+	// concurrently with GracefulStop()/truenasClient.Close(). A Stop() that
+	// already won the race is visible here under the same lock, so this call
+	// exits before ever launching the loop.
+	d.startupReconcileStateMu.Lock()
+	if d.startupReconcileStopped || d.startupReconcileCancel != nil {
+		d.startupReconcileStateMu.Unlock()
+		cancel()
+		return
+	}
 	d.startupReconcileCancel = cancel
+	d.startupReconcileStateMu.Unlock()
 	d.startupReconcileWg.Add(1)
 	go func() {
 		defer d.startupReconcileWg.Done()
@@ -561,8 +576,17 @@ func (d *Driver) requestStartupAttachmentReconcile() {
 }
 
 func (d *Driver) stopStartupAttachmentReconcile() {
-	if d.startupReconcileCancel != nil {
-		d.startupReconcileCancel()
-		d.startupReconcileWg.Wait()
+	// (C7) Terminal: startupReconcileStopped=true is recorded under the same
+	// lock startStartupAttachmentReconcile checks before assigning
+	// startupReconcileCancel, so a Stop() that wins the race prevents the loop
+	// from EVER starting instead of the two racing on a plain nil check.
+	d.startupReconcileStateMu.Lock()
+	d.startupReconcileStopped = true
+	cancel := d.startupReconcileCancel
+	d.startupReconcileCancel = nil
+	d.startupReconcileStateMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+	d.startupReconcileWg.Wait()
 }

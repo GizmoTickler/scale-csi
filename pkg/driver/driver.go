@@ -185,14 +185,28 @@ type Driver struct {
 	// GracefulStop()/truenasClient.Close(). Recording reconcileStopped under
 	// the same lock closes that window: a Stop() that wins the race is
 	// observed by startOrphanReconcile before it ever launches the loop.
-	reconcileStateMu       sync.Mutex
-	reconcileStopped       bool
-	reconcileCancel        context.CancelFunc
-	reconcileWg            sync.WaitGroup
-	startupReconcileCancel context.CancelFunc
-	startupReconcileWg     sync.WaitGroup
-	startupReconcileOnce   sync.Once
-	startupReconcileSignal chan struct{}
+	reconcileStateMu sync.Mutex
+	reconcileStopped bool
+	reconcileCancel  context.CancelFunc
+	reconcileWg      sync.WaitGroup
+	// startupReconcileStateMu + startupReconcileStopped guard startupReconcileCancel
+	// with the identical mutex + terminal-stopped-flag pattern as reconcileStateMu/
+	// reconcileStopped above (C7): Run() calls ensureNFSProtocols — a real TrueNAS
+	// network call — before startStartupAttachmentReconcile, so a Stop() landing
+	// while that call is in flight used to observe a nil startupReconcileCancel,
+	// skip both cancel() and Wait(), and return after closing the TrueNAS client.
+	// Run() would then launch the fencing-reconcile goroutine anyway with a context
+	// nothing will ever cancel, and it calls reconcileEncryptedUnlocks and
+	// reconcilePublishedAttachments — both of which WRITE backend fencing state —
+	// against an already-closed client. Recording startupReconcileStopped under the
+	// same lock closes that window: a Stop() that wins the race is observed by
+	// startStartupAttachmentReconcile before it ever launches the loop.
+	startupReconcileStateMu sync.Mutex
+	startupReconcileStopped bool
+	startupReconcileCancel  context.CancelFunc
+	startupReconcileWg      sync.WaitGroup
+	startupReconcileOnce    sync.Once
+	startupReconcileSignal  chan struct{}
 
 	// Encryption unlock reconciler state (GF-Sprint 1, E-2 §4), all guarded by
 	// encryptionUnlockFailMu. encryptionUnlockFailures counts consecutive failed
@@ -210,8 +224,18 @@ type Driver struct {
 
 	// Controller-side pool-capacity gauge poll loop (E4). Runs only when
 	// capacity.gaugeEnabled; each tick is one bounded pool.dataset.query.
-	capacityCancel context.CancelFunc
-	capacityWg     sync.WaitGroup
+	// capacityStateMu + capacityStopped guard capacityCancel with the same C7
+	// mutex + terminal-stopped-flag pattern as reconcileStateMu/reconcileStopped:
+	// startCapacityGauges is called from Run() after ensureNFSProtocols (a real
+	// TrueNAS network call), so a Stop() landing while that call is in flight has
+	// the identical shape as the startup-reconcile race — a plain nil check on
+	// capacityCancel would let Stop() miss a not-yet-assigned cancel and return,
+	// after which Run() starts a poll loop that calls d.truenasClient.DatasetGet
+	// against an already-closed client and is never joined.
+	capacityStateMu sync.Mutex
+	capacityStopped bool
+	capacityCancel  context.CancelFunc
+	capacityWg      sync.WaitGroup
 
 	// Controller-side poll of the durable last-reap record on .csi-bookkeeping.
 	// The delete-capable pass runs in the ephemeral CronJob; this loop is what

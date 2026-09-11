@@ -35,7 +35,21 @@ func (d *Driver) startCapacityGauges() {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// (C7) capacityStateMu + capacityStopped close the race where a Stop()
+	// landing between this function's entry and the plain assignment below used
+	// to observe a nil capacityCancel, skip cancellation, and let this loop
+	// launch anyway, calling d.truenasClient.DatasetGet concurrently with
+	// GracefulStop()/truenasClient.Close(). A Stop() that already won the race
+	// is visible here under the same lock, so this call exits before ever
+	// launching the loop.
+	d.capacityStateMu.Lock()
+	if d.capacityStopped || d.capacityCancel != nil {
+		d.capacityStateMu.Unlock()
+		cancel()
+		return
+	}
 	d.capacityCancel = cancel
+	d.capacityStateMu.Unlock()
 	d.capacityWg.Add(1)
 	go func() {
 		defer d.capacityWg.Done()
@@ -73,10 +87,19 @@ func (d *Driver) startCapacityGauges() {
 }
 
 func (d *Driver) stopCapacityGauges() {
-	if d.capacityCancel != nil {
-		d.capacityCancel()
-		d.capacityWg.Wait()
+	// (C7) Terminal: capacityStopped=true is recorded under the same lock
+	// startCapacityGauges checks before assigning capacityCancel, so a Stop()
+	// that wins the race prevents the loop from EVER starting instead of the
+	// two racing on a plain nil check.
+	d.capacityStateMu.Lock()
+	d.capacityStopped = true
+	cancel := d.capacityCancel
+	d.capacityCancel = nil
+	d.capacityStateMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+	d.capacityWg.Wait()
 }
 
 // parsedPropertyBytes coerces a ZFS property's parsed value (a float64 byte count

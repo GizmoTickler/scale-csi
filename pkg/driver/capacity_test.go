@@ -86,3 +86,54 @@ func TestCapacityGaugeLoopDisabledByDefault(t *testing.T) {
 	assert.Nil(t, d.capacityCancel, "gauge loop must not start when gaugeEnabled is false")
 	d.stopCapacityGauges() // safe no-op
 }
+
+// TestStopCapacityGaugesBeforeStartPreventsLoopFromEverRunning is the
+// regression test for the R1 shutdown race on capacityCancel: startCapacityGauges
+// has the identical shape as startOrphanReconcile's C7 defect (a plain nil check
+// on the CancelFunc field). startCapacityGauges is called from Run() after
+// ensureNFSProtocols (a real TrueNAS network call) and startStartupAttachmentReconcile,
+// so a Stop() landing while either is in flight must be observed here and
+// prevent the poll loop from EVER launching, not merely fail to cancel a loop
+// that started anyway. Before the fix, stopCapacityGauges only canceled
+// whatever capacityCancel happened to already be assigned, with no memory that
+// a stop was ever requested, so a Stop() that raced ahead of the assignment was
+// silently lost and the subsequent Start() launched a poll loop that calls
+// d.truenasClient.DatasetGet against an already-closed client, with no
+// goroutine ever joined by Stop().
+func TestStopCapacityGaugesBeforeStartPreventsLoopFromEverRunning(t *testing.T) {
+	const (
+		parent    = "pool/parent-race"
+		available = float64(999)
+		used      = float64(111)
+	)
+	client := truenas.NewMockClient()
+	client.Datasets[parent] = &truenas.Dataset{
+		ID:        parent,
+		Name:      parent,
+		Pool:      "pool-race",
+		Type:      "FILESYSTEM",
+		Available: truenas.DatasetProperty{Parsed: available},
+		Used:      truenas.DatasetProperty{Parsed: used},
+	}
+	d := &Driver{
+		config: &Config{
+			ZFS:      ZFSConfig{DatasetParentName: parent},
+			Capacity: CapacityConfig{GaugeEnabled: true, GaugeInterval: "30s"},
+		},
+		truenasClient: client,
+	}
+
+	// Stop BEFORE Start ever runs — the observable analogue of a Stop() that
+	// wins the race against capacityCancel's assignment (e.g. landing while
+	// ensureNFSProtocols or the startup fencing reconcile is still in flight in
+	// Run()).
+	d.stopCapacityGauges()
+	d.startCapacityGauges()
+	t.Cleanup(d.stopCapacityGauges)
+
+	assert.Nil(t, d.capacityCancel, "a poll loop must never launch once Stop() has already been observed")
+	require.Never(t, func() bool {
+		return testutil.ToFloat64(poolAvailableBytes.WithLabelValues("pool-race", parent)) == available
+	}, 300*time.Millisecond, 10*time.Millisecond,
+		"a capacity gauge poll loop must never launch once Stop() has already been observed")
+}
