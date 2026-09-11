@@ -1476,7 +1476,7 @@ func guardRequestAgainstEvidence(request *blockOpts, evidence blockGeometry, dat
 // nothing to fence, while every OTHER failure on that path is transient and must
 // keep blocking readiness. GRPCStatus is delegated so RPC callers still see the
 // FailedPrecondition unchanged.
-type errGeometryUnestablishable struct{ err error }
+type errGeometryUnestablishable struct{ err error } //nolint:errname // established repo convention (see ErrSnapshotHasClones/ErrDatasetDestinationExists in pkg/truenas); renaming is a 40-call-site exported-API change across errors.As call sites for a naming-only lint
 
 func (e errGeometryUnestablishable) Error() string              { return e.err.Error() }
 func (e errGeometryUnestablishable) Unwrap() error              { return e.err }

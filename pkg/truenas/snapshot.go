@@ -109,7 +109,7 @@ func snapshotResourceQueryOptions(paths []string, recursive bool, properties []s
 
 // ErrSnapshotHasClones is returned when a snapshot cannot be deleted because it has dependent clones.
 // The caller should inspect the Clones field to determine how to proceed.
-type ErrSnapshotHasClones struct {
+type ErrSnapshotHasClones struct { //nolint:errname // established convention across pkg/truenas's exported error types; renaming touches ~40 errors.As call sites for a naming-only lint
 	SnapshotID string
 	Clones     []string
 }
@@ -122,7 +122,7 @@ func (e *ErrSnapshotHasClones) Error() string {
 // to an already-existing destination. Even a matching origin is not creation
 // proof: callers must retry through their normal ownership/idempotency gate and
 // must not stamp, mutate, or clean up this object.
-type ErrDatasetDestinationExists struct {
+type ErrDatasetDestinationExists struct { //nolint:errname // see ErrSnapshotHasClones above
 	Destination     string
 	ExpectedOrigin  string
 	ActualOrigin    string

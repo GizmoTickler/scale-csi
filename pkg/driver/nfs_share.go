@@ -104,7 +104,7 @@ func (d *Driver) createNFSShare(ctx context.Context, datasetName, volumeName, mo
 	return d.createNFSShareForDataset(ctx, ds, datasetName, volumeName, false, nil)
 }
 
-func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated bool, finalProperties map[string]string) error {
+func (d *Driver) createNFSShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated bool, finalProperties map[string]string) error { //nolint:unparam // volumeName is part of the ShareBackend.EnsureShare calling convention shared with iSCSI/NVMeoF (see share_backend.go); this backend does not currently need it, but the signature stays symmetric across all three
 	var err error
 	ds, err = d.datasetForProperties(ctx, ds, datasetName)
 	if err != nil {

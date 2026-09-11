@@ -44,7 +44,7 @@ const (
 	encryptionSecretKeyPassphrase         = "passphrase"
 	encryptionSecretKeyPassphrasePrevious = "passphrasePrevious"
 	encryptionSecretKeyAlgorithm          = "algorithm"
-	encryptionSecretKeyPbkdf2Iters        = "pbkdf2iters"
+	encryptionSecretKeyPbkdf2Iters        = "pbkdf2iters" //nolint:gosec // Kubernetes Secret key name, not a credential value
 )
 
 // encryptionDefaultAlgorithm is the default create algorithm. P-0 probed the

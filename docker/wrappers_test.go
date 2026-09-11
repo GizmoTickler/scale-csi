@@ -231,11 +231,11 @@ printf '%s\n' "$@" > "$WRAPPER_ARGV_LOG"
 printf '%s' "${WRAPPER_STDERR:-}" >&2
 exit "${WRAPPER_EXIT_CODE:-0}"
 `
-	if err := os.WriteFile(fakeNSenter, []byte(fakeCommand), 0o755); err != nil {
+	if err := os.WriteFile(fakeNSenter, []byte(fakeCommand), 0o755); err != nil { //nolint:gosec // must be executable to stand in as a fake host command this test execs
 		t.Fatalf("write fake nsenter: %v", err)
 	}
 	fakeChroot := filepath.Join(tempDir, "chroot")
-	if err := os.WriteFile(fakeChroot, []byte(fakeCommand), 0o755); err != nil {
+	if err := os.WriteFile(fakeChroot, []byte(fakeCommand), 0o755); err != nil { //nolint:gosec // must be executable to stand in as a fake host command this test execs
 		t.Fatalf("write fake chroot: %v", err)
 	}
 
@@ -316,7 +316,7 @@ func runWrapperNonHost(t *testing.T, name string, environment []string, args ...
 printf '%s\n' "$@" > "$WRAPPER_ARGV_LOG"
 exit 0
 `
-	if err := os.WriteFile(fakeChroot, []byte(fakeCommand), 0o755); err != nil {
+	if err := os.WriteFile(fakeChroot, []byte(fakeCommand), 0o755); err != nil { //nolint:gosec // must be executable to stand in as a fake host command this test execs
 		t.Fatalf("write fake chroot: %v", err)
 	}
 

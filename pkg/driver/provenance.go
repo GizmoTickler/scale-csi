@@ -997,7 +997,7 @@ const bookkeepingMigrationBatchBudget = 32 * 1024
 // batches whose approximate encoded size stays within budget. A single
 // oversized entry still gets its own batch — the caller surfaces the backend
 // error rather than silently dropping the entry.
-func chunkUserProperties(properties map[string]string, budget int) []map[string]string {
+func chunkUserProperties(properties map[string]string, budget int) []map[string]string { //nolint:unparam // budget is kept as a parameter (not the bookkeepingMigrationBatchBudget constant baked in) so the chunking boundary logic itself stays independently testable
 	if len(properties) == 0 {
 		return nil
 	}

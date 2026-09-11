@@ -1005,7 +1005,6 @@ func TestRepositoryExampleConfigsParseStrictly(t *testing.T) {
 	require.Len(t, paths, 3, "examples must contain only the three complete protocol configs")
 
 	for _, path := range paths {
-		path := path
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			cfg, loadErr := LoadConfig(path)
 			require.NoError(t, loadErr)

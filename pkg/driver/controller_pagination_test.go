@@ -19,7 +19,7 @@ type MockClientWithPagination struct {
 }
 
 func (m *MockClientWithPagination) DatasetList(ctx context.Context, parentName string, limit, offset int) ([]*truenas.Dataset, error) {
-	var allDatasets []*truenas.Dataset
+	allDatasets := make([]*truenas.Dataset, 0, len(m.Datasets))
 	for _, ds := range m.Datasets {
 		allDatasets = append(allDatasets, ds)
 	}
@@ -41,7 +41,7 @@ func (m *MockClientWithPagination) DatasetList(ctx context.Context, parentName s
 }
 
 func (m *MockClientWithPagination) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*truenas.Snapshot, error) {
-	var allSnapshots []*truenas.Snapshot
+	allSnapshots := make([]*truenas.Snapshot, 0, len(m.Snapshots))
 	for _, snap := range m.Snapshots {
 		allSnapshots = append(allSnapshots, snap)
 	}
@@ -100,7 +100,7 @@ func TestListVolumes_Pagination(t *testing.T) {
 		truenasClient: paginatedClient,
 	}
 
-	var walkedIDs []string
+	var walkedIDs []string //nolint:prealloc // accumulated across 3 separately-fetched pages below; each page's size is only known after its own ListVolumes call, so there is no single upfront capacity to compute
 
 	// Test Case 1: First Page (Limit 2)
 	req := &csi.ListVolumesRequest{
@@ -270,7 +270,7 @@ func (m *PaginatedMockClient) DatasetList(ctx context.Context, parentName string
 }
 
 func (m *PaginatedMockClient) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*truenas.Snapshot, error) {
-	var allSnapshots []*truenas.Snapshot
+	allSnapshots := make([]*truenas.Snapshot, 0, len(m.Snapshots))
 	for _, snap := range m.Snapshots {
 		allSnapshots = append(allSnapshots, snap)
 	}

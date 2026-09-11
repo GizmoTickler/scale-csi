@@ -1458,7 +1458,7 @@ func (d *Driver) revalidateOrphanSnapshot(
 // below the 32 KiB request budget, leaving fixed headroom for the JSON-RPC
 // envelope and query options. Dataset names are bounded by ZFS, so a single
 // entry cannot consume the budget by itself.
-func chunkDatasetNames(names []string, budget int) [][]string {
+func chunkDatasetNames(names []string, budget int) [][]string { //nolint:unparam // budget is kept as a parameter (not the datasetGetByNamesBatchBudget constant baked in) so the chunking boundary logic itself stays independently testable
 	if len(names) == 0 || budget <= datasetGetByNamesEnvelopeHeadroom {
 		return nil
 	}

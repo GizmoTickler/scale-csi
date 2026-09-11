@@ -437,7 +437,7 @@ func setNVMeSubsystemIOPolicyAt(root, subsystemName, policy string) error {
 		return fmt.Errorf("invalid NVMe subsystem name %q", subsystemName)
 	}
 	policyPath := filepath.Join(root, subsystemName, "iopolicy")
-	file, err := os.OpenFile(policyPath, os.O_WRONLY|os.O_TRUNC, 0) //nolint:gosec // fixed sysfs root plus validated basename
+	file, err := os.OpenFile(policyPath, os.O_WRONLY|os.O_TRUNC, 0) // fixed sysfs root plus validated basename
 	if err != nil {
 		return fmt.Errorf("open NVMe subsystem iopolicy: %w", err)
 	}
@@ -521,7 +521,15 @@ func nvmeSubsystemsHaveNQN(subsystems []NVMeSubsystem) bool {
 
 // waitForNVMeDevice waits for the NVMe device to appear.
 // Uses exponential backoff starting at 50ms, maxing at 100ms for faster detection.
-func waitForNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (string, error) {
+//
+// POSSIBLY DEAD CODE, not removed here: grepping the whole module turns up
+// zero production callers -- every real connect path goes through
+// waitForNVMeDeviceWithSubsystems below. This function's only callers are its
+// own unit tests in nvme_test.go, which means those tests currently exercise
+// an unused code path rather than the real one. Found while wiring up
+// unparam during lint hardening; flagged for the in-flight defect
+// verification pass rather than deleted opportunistically in this change.
+func waitForNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (string, error) { //nolint:unparam // see POSSIBLY DEAD CODE comment above
 	start := time.Now()
 	pollInterval := 50 * time.Millisecond
 	maxPollInterval := 100 * time.Millisecond
@@ -991,7 +999,14 @@ func IsLikelyNVMeDevice(devicePath string) bool {
 // The subsystem name is the part that should appear in the NQN (with any prefix/suffix already applied).
 // This is used for cleanup when the device path is unavailable (e.g., after node restart).
 func FindNVMeoFSessionBySubsysName(subsysName string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), getNVMeTimeout())
+	return FindNVMeoFSessionBySubsysNameWithContext(context.Background(), subsysName)
+}
+
+// FindNVMeoFSessionBySubsysNameWithContext is FindNVMeoFSessionBySubsysName
+// bounded by the inbound context's deadline as well as the configured NVMe
+// timeout.
+func FindNVMeoFSessionBySubsysNameWithContext(ctx context.Context, subsysName string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, getNVMeTimeout())
 	defer cancel()
 
 	subsystems, err := listNVMeSubsystemsFunc(ctx)

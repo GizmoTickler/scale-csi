@@ -78,7 +78,7 @@ func appendNodeIdentityField(dst []byte, fieldType byte, value []byte) ([]byte, 
 	if len(value) > 255 {
 		return nil, fmt.Errorf("node identity field %d is too long", fieldType)
 	}
-	dst = append(dst, fieldType, byte(len(value)))
+	dst = append(dst, fieldType, byte(len(value))) //nolint:gosec // len(value) is already proven <= 255 by the guard above
 	dst = append(dst, value...)
 	return dst, nil
 }

@@ -209,7 +209,7 @@ func startupNodeIdentity(
 // volume. Mirrors the errGeometryUnestablishable carve-out immediately below
 // in this file, which uses the same log/event/return-nil shape for a
 // different permanent-vs-transient distinction.
-func (d *Driver) quarantineStaleStartupFencingVolume(volume *startupFencingVolume, staleNode string, cause error) error {
+func (d *Driver) quarantineStaleStartupFencingVolume(volume *startupFencingVolume, staleNode string, cause error) error { //nolint:unparam // always returning nil IS the point (see the doc comment above); the error return type matches the shape callers expect from this quarantine-carve-out family
 	klog.Warningf("Startup fencing for volume %s is blocked by a stale publication record for node %s "+
 		"(no live VolumeAttachment); not holding cluster-wide readiness on it, it will clear once "+
 		"fencing.staleRecordGracePeriod elapses: %v", volume.volumeID, staleNode, cause)

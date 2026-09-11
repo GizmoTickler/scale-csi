@@ -48,7 +48,7 @@ import (
 // LIVE NFS volume attached to node "worker-<volumeID>", matching the objects
 // reconcilePublishedAttachments reads. Returns the identity so the caller can
 // derive the SAME live node name the fixture used.
-func staleRecordVolume(t *testing.T, objects []runtime.Object, volumeID string) ([]runtime.Object, NodeIdentity) {
+func staleRecordVolume(t *testing.T, objects []runtime.Object, volumeID string) ([]runtime.Object, NodeIdentity) { //nolint:unparam // the returned identity is part of the documented contract above ("so the caller can derive the SAME live node name"); today's one caller happens to discard it via _
 	t.Helper()
 	pvName := "pv-" + volumeID
 	identity := NodeIdentity{Name: "worker-" + volumeID, IPs: []net.IP{net.ParseIP("192.0.2.11")}}
@@ -183,7 +183,7 @@ func TestStartupReconcileStillBlocksOnGenuineDualVAConflict(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client := truenas.NewMockClient()
-	var objects []runtime.Object
+	var objects []runtime.Object //nolint:prealloc // staleRecordVolume replaces this slice with its own return value before the local append below, so a capacity hint here would not carry through
 	objects, _ = staleRecordVolume(t, objects, "dual-va")
 	// A SECOND live VolumeAttachment for a different node on the SAME volume —
 	// both nodes are genuinely live, so the conflicting record is NOT stale.

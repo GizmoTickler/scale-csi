@@ -495,7 +495,7 @@ func sortedLockKeys(volumeIDs ...string) []string {
 }
 
 // splitSnapshotID splits "dataset@name".
-func splitSnapshotID(snapshotID string) (dataset, name string, ok bool) {
+func splitSnapshotID(snapshotID string) (dataset, name string, ok bool) { //nolint:unparam // every current caller only needs dataset+ok, but the function's contract (see doc comment) is to split BOTH halves; narrowing the return shape to match today's callers would be an artificial API amputation
 	for i := len(snapshotID) - 1; i >= 0; i-- {
 		if snapshotID[i] == '@' {
 			return snapshotID[:i], snapshotID[i+1:], i > 0 && i < len(snapshotID)-1

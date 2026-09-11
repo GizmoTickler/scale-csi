@@ -55,7 +55,7 @@ func spentRestoreDeferredPVCPhase(phase corev1.PersistentVolumeClaimPhase) bool 
 }
 
 func (d *Driver) classifySpentRestoreSnapshots(
-	ctx context.Context,
+	ctx context.Context, //nolint:unparam // unused today (this pass is pure in-memory classification over already-fetched data, see the doc comment below) but kept for signature consistency with sibling reconcile-pass functions (readBookkeepingState, listAllManagedSnapshots, countScheduledSnapshots) that DO call the backend
 	now time.Time,
 	state *kubernetesReconcileState,
 	snapshots []*truenas.Snapshot,

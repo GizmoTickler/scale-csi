@@ -67,7 +67,7 @@ func TestHealthServerCacheTTLZeroDisablesReuse(t *testing.T) {
 }
 
 func TestHealthServerStartReturnsBindFailureSynchronously(t *testing.T) {
-	occupied, err := net.Listen("tcp", ":0")
+	occupied, err := net.Listen("tcp", ":0") //nolint:gosec // test-only: binds an ephemeral port purely to occupy it, so the real assertion (HealthServer.Start fails fast on a taken port) has something taken to collide with
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, occupied.Close()) })
 	port := occupied.Addr().(*net.TCPAddr).Port

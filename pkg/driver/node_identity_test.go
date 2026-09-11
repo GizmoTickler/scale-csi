@@ -56,7 +56,7 @@ func TestParseNodeIdentityTreatsPlainNodeIDAsLegacyName(t *testing.T) {
 }
 
 func TestParseNodeIdentityRejectsVersionZero(t *testing.T) {
-	raw := []byte{0, nodeIdentityFieldName, byte(len("worker-a"))}
+	raw := []byte{0, nodeIdentityFieldName, byte(len("worker-a"))} //nolint:prealloc // fixture built as a literal header followed by its payload; splitting into make()+individual appends would be less readable for no benefit here
 	raw = append(raw, "worker-a"...)
 	_, err := parseNodeIdentity(nodeIdentityPrefix + base64.RawURLEncoding.EncodeToString(raw))
 	require.Error(t, err)
@@ -142,7 +142,7 @@ func TestDiscoverNodeIdentityRejectsDenyAllSentinelIQN(t *testing.T) {
 // the parsed identity must then be rejected at protocol validation so it is never
 // enforced as an allowlist grant.
 func TestParsedDenyAllSentinelNodeIDIsRejectedAtValidation(t *testing.T) {
-	raw := []byte{nodeIdentityVersion}
+	raw := []byte{nodeIdentityVersion} //nolint:prealloc // fixture built as a literal header followed by its payload; splitting into make()+individual appends would be less readable for no benefit here
 	raw = append(raw, nodeIdentityFieldName, byte(len("worker-a")))
 	raw = append(raw, "worker-a"...)
 	raw = append(raw, nodeIdentityFieldIQN, byte(len(iscsiDenyAllSentinelIQN)))

@@ -113,15 +113,14 @@ case "$name" in
 esac
 `
 
-func installFakeNodeCommands(t *testing.T, commands ...string) string {
+func installFakeNodeCommands(t *testing.T, commands ...string) {
 	t.Helper()
 	binDir := t.TempDir()
 	for _, command := range commands {
 		path := filepath.Join(binDir, command)
-		require.NoError(t, os.WriteFile(path, []byte(fakeNodeCommandScript), 0o750))
+		require.NoError(t, os.WriteFile(path, []byte(fakeNodeCommandScript), 0o750)) //nolint:gosec // must be executable to stand in as a fake host command this test execs
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	return binDir
 }
 
 func readNodeCommandLog(t *testing.T, path string) string {
@@ -1021,7 +1020,7 @@ func TestNodeGetVolumeStats_BlockMode(t *testing.T) {
 	nodeStatsMountCheck = func(context.Context, string) (bool, error) { return false, nil }
 
 	volumePath := filepath.Join(t.TempDir(), "published-block-device")
-	require.NoError(t, os.WriteFile(volumePath, nil, 0o640))
+	require.NoError(t, os.WriteFile(volumePath, nil, 0o600))
 	nodeStatsStat = func(path string) (uint32, uint64, error) {
 		assert.Equal(t, volumePath, path)
 		return unix.S_IFBLK, unix.Mkdev(8, 1), nil
@@ -1029,7 +1028,7 @@ func TestNodeGetVolumeStats_BlockMode(t *testing.T) {
 	nodeStatsSysfsRoot = t.TempDir()
 	sizeDir := filepath.Join(nodeStatsSysfsRoot, "dev", "block", "8:1")
 	require.NoError(t, os.MkdirAll(sizeDir, 0o750))
-	require.NoError(t, os.WriteFile(filepath.Join(sizeDir, "size"), []byte("16777216\n"), 0o640))
+	require.NoError(t, os.WriteFile(filepath.Join(sizeDir, "size"), []byte("16777216\n"), 0o600))
 
 	d := newTestNodeDriver(ShareTypeISCSI)
 	resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
@@ -1049,7 +1048,7 @@ func TestNodeStatsDeviceSizeRejectsSectorOverflow(t *testing.T) {
 	nodeStatsSysfsRoot = t.TempDir()
 	sizeDir := filepath.Join(nodeStatsSysfsRoot, "dev", "block", "8:1")
 	require.NoError(t, os.MkdirAll(sizeDir, 0o750))
-	require.NoError(t, os.WriteFile(filepath.Join(sizeDir, "size"), []byte("9223372036854775807\n"), 0o640))
+	require.NoError(t, os.WriteFile(filepath.Join(sizeDir, "size"), []byte("9223372036854775807\n"), 0o600))
 
 	size, err := nodeStatsDeviceSize("8:1")
 	require.Error(t, err)

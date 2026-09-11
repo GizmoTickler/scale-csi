@@ -203,7 +203,8 @@ func MountNFS(source, target string, options []string) error {
 // MountNFSWithContext is MountNFS bounded by the inbound context's deadline.
 func MountNFSWithContext(ctx context.Context, source, target string, options []string) error {
 	// Add NFS-specific default options
-	nfsOptions := []string{"nfsvers=4"}
+	nfsOptions := make([]string, 0, 1+len(options))
+	nfsOptions = append(nfsOptions, "nfsvers=4")
 	nfsOptions = append(nfsOptions, options...)
 
 	return MountWithContext(ctx, source, target, "nfs", nfsOptions)
@@ -227,10 +228,11 @@ func BindMountWithContext(ctx context.Context, source, target string, options []
 
 	// Use "-o bind" instead of "--bind" for BusyBox compatibility
 	// BusyBox mount doesn't support GNU-style long options
-	mountOptions := []string{"bind"}
+	mountOptions := make([]string, 0, 1+len(options))
+	mountOptions = append(mountOptions, "bind")
 	mountOptions = append(mountOptions, options...)
-	args := []string{"-o", strings.Join(mountOptions, ",")}
-	args = append(args, source, target)
+	args := make([]string, 0, 4)
+	args = append(args, "-o", strings.Join(mountOptions, ","), source, target)
 
 	cmd := exec.CommandContext(ctx, "mount", args...)
 	hardenCmd(cmd)
@@ -247,7 +249,7 @@ func BindMountWithContext(ctx context.Context, source, target string, options []
 		output, err = cmd.CombinedOutput()
 		if err != nil {
 			remountErr := fmt.Errorf("read-only bind remount failed: %w, output: %s", err, string(output))
-			if unmountErr := Unmount(target); unmountErr != nil {
+			if unmountErr := UnmountWithContext(ctx, target); unmountErr != nil {
 				return errors.Join(remountErr, fmt.Errorf("failed to clean up bind mount: %w", unmountErr))
 			}
 			return remountErr
@@ -276,14 +278,14 @@ func UnmountWithContext(ctx context.Context, target string) error {
 	klog.V(4).Infof("Unmounting %s", target)
 
 	// Check if mounted
-	mounted, err := IsMounted(target)
+	mounted, err := IsMountedWithContext(ctx, target)
 	if err != nil {
 		return err
 	}
 	if !mounted {
 		return nil
 	}
-	fsType, fsTypeErr := getMountFilesystemType(target)
+	fsType, fsTypeErr := getMountFilesystemTypeWithContext(ctx, target)
 	if fsTypeErr != nil {
 		// Unknown filesystem types are treated conservatively: a failed regular
 		// unmount will be surfaced rather than lazily detaching a device mount.
@@ -328,13 +330,13 @@ func UnmountWithContext(ctx context.Context, target string) error {
 	})
 }
 
-func getMountFilesystemType(target string) (string, error) {
+func getMountFilesystemTypeWithContext(ctx context.Context, target string) (string, error) {
 	entry, procErr := readProcMountEntry("/proc/self/mounts", target)
 	if procErr == nil {
 		return entry.fsType, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
+	ctx, cancel := context.WithTimeout(ctx, getMountTimeout())
 	defer cancel()
 
 	findmntCmd := exec.CommandContext(ctx, "findmnt", "-n", "-o", "FSTYPE", "--mountpoint", target)
@@ -586,15 +588,21 @@ func GetFilesystemStats(path string) (*FilesystemStats, error) {
 
 	// Bsize is int64 on linux but uint32 on darwin; the conversion is required
 	// for portable builds even though it is a no-op on linux.
-	blockSize := int64(stat.Bsize) //nolint:unconvert
+	blockSize := int64(stat.Bsize) //nolint:unconvert // Bsize is int64 on linux but uint32 on darwin; the conversion is a no-op on linux but required for portable builds
 
+	// The CSI spec itself represents capacity/usage as int64 bytes (see
+	// csi.NodeGetVolumeStatsResponse.Usage), so every caller of this struct
+	// is already committed to int64 -- these conversions cannot be avoided by
+	// staying in uint64 further up the stack. A real overflow would require a
+	// local filesystem in the exabyte range at typical block/inode sizes,
+	// which is not a realistic deployment target for this driver.
 	return &FilesystemStats{
-		TotalBytes:      int64(stat.Blocks) * blockSize,
-		AvailableBytes:  int64(stat.Bavail) * blockSize,
-		UsedBytes:       (int64(stat.Blocks) - int64(stat.Bfree)) * blockSize,
-		TotalInodes:     int64(stat.Files),
-		AvailableInodes: int64(stat.Ffree),
-		UsedInodes:      int64(stat.Files) - int64(stat.Ffree),
+		TotalBytes:      int64(stat.Blocks) * blockSize,                       //nolint:gosec // see comment above
+		AvailableBytes:  int64(stat.Bavail) * blockSize,                       //nolint:gosec // see comment above
+		UsedBytes:       (int64(stat.Blocks) - int64(stat.Bfree)) * blockSize, //nolint:gosec // see comment above
+		TotalInodes:     int64(stat.Files),                                    //nolint:gosec // see comment above
+		AvailableInodes: int64(stat.Ffree),                                    //nolint:gosec // see comment above
+		UsedInodes:      int64(stat.Files) - int64(stat.Ffree),                //nolint:gosec // see comment above
 	}, nil
 }
 

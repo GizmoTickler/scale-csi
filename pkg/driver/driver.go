@@ -501,7 +501,7 @@ func (d *Driver) Run() error {
 
 	// Set socket permissions for unix sockets
 	if u.Scheme == "unix" {
-		if err := os.Chmod(addr, 0o660); err != nil {
+		if err := os.Chmod(addr, 0o660); err != nil { //nolint:gosec // CSI convention: kubelet's node-driver-registrar sidecar connects to this socket from a different container in the same pod and needs group access; not internet-reachable
 			return fmt.Errorf("failed to set socket permissions: %w", err)
 		}
 	}
@@ -1034,7 +1034,12 @@ func (d *Driver) gcSessions(ctx context.Context, gracePeriod time.Duration, dryR
 
 	// Clean up stale entries for sessions that are no longer active.
 	p.seen.Range(func(key, _ interface{}) bool {
-		id := key.(string)
+		id, ok := key.(string)
+		if !ok {
+			klog.Warningf("Session GC: %s seen-set carries a non-string key %v; dropping it", p.name, key)
+			p.seen.Delete(key)
+			return true
+		}
 		if _, active := activeOrphanedSessions[id]; !active {
 			p.seen.Delete(id)
 		}

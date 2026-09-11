@@ -195,7 +195,7 @@ func (value *tolerantPropertyString) UnmarshalJSON(data []byte) error {
 	if data[0] == '"' {
 		var decoded string
 		if err := json.Unmarshal(data, &decoded); err != nil {
-			return nil
+			return nil //nolint:nilerr // deliberate tolerant-decode discipline; see tolerantPropertyString's doc comment (2026-07-31 incident)
 		}
 		*value = tolerantPropertyString(decoded)
 		return nil
@@ -207,7 +207,7 @@ func (value *tolerantPropertyString) UnmarshalJSON(data []byte) error {
 		Value tolerantString `json:"value"`
 	}
 	if err := json.Unmarshal(data, &object); err != nil {
-		return nil
+		return nil //nolint:nilerr // deliberate tolerant-decode discipline; see tolerantPropertyString's doc comment (2026-07-31 incident)
 	}
 	*value = tolerantPropertyString(object.Value)
 	return nil

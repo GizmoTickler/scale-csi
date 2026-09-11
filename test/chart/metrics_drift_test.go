@@ -447,12 +447,12 @@ func TestExtractScaleCSIMetricRefsIdentifierBoundary(t *testing.T) {
 		t.Fatalf("panel whose only expr is the fake identifier must leave %q uncovered; gaps=%v", realMetric, gaps)
 	}
 
-	real, err := parseScaleCSIMetricRefs("rate(scale_csi_tombstone_unknown_age[5m])")
+	realRefs, err := parseScaleCSIMetricRefs("rate(scale_csi_tombstone_unknown_age[5m])")
 	if err != nil {
 		t.Fatalf("parse real selector: %v", err)
 	}
-	if !containsStr(real, realMetric) {
-		t.Fatalf("real selector must still extract, got %v", real)
+	if !containsStr(realRefs, realMetric) {
+		t.Fatalf("real selector must still extract, got %v", realRefs)
 	}
 }
 
@@ -503,7 +503,7 @@ func TestExtractScaleCSIMetricRefsStringLiterals(t *testing.T) {
 // metric names count: grouping labels and label matcher names do not.
 func TestExtractScaleCSIMetricRefsSelectorPosition(t *testing.T) {
 	const decoy = "scale_csi_tombstone_unknown_age"
-	const real = "scale_csi_operations_total"
+	const realMetricName = "scale_csi_operations_total"
 	for _, tc := range []struct {
 		name    string
 		expr    string
@@ -513,10 +513,10 @@ func TestExtractScaleCSIMetricRefsSelectorPosition(t *testing.T) {
 		{name: "by grouping label", expr: `sum by (scale_csi_tombstone_unknown_age) (vector(0))`},
 		{name: "without grouping label", expr: `sum without (scale_csi_tombstone_unknown_age) (vector(0))`},
 		{name: "label matcher name", expr: `up{scale_csi_tombstone_unknown_age="foo"}`},
-		{name: "selector with grouping decoy", expr: `sum by (scale_csi_tombstone_unknown_age) (scale_csi_operations_total)`, want: []string{real}, notWant: decoy},
-		{name: "selector with matcher-name decoy", expr: `scale_csi_operations_total{scale_csi_tombstone_unknown_age="foo"}`, want: []string{real}, notWant: decoy},
-		{name: "range selector", expr: `rate(scale_csi_operations_total[5m])`, want: []string{real}},
-		{name: "grafana rate interval", expr: `rate(scale_csi_operations_total[$__rate_interval])`, want: []string{real}},
+		{name: "selector with grouping decoy", expr: `sum by (scale_csi_tombstone_unknown_age) (scale_csi_operations_total)`, want: []string{realMetricName}, notWant: decoy},
+		{name: "selector with matcher-name decoy", expr: `scale_csi_operations_total{scale_csi_tombstone_unknown_age="foo"}`, want: []string{realMetricName}, notWant: decoy},
+		{name: "range selector", expr: `rate(scale_csi_operations_total[5m])`, want: []string{realMetricName}},
+		{name: "grafana rate interval", expr: `rate(scale_csi_operations_total[$__rate_interval])`, want: []string{realMetricName}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			refs, err := parseScaleCSIMetricRefs(tc.expr)

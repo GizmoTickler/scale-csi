@@ -744,6 +744,10 @@ func (d *Driver) populateAdditiveGrantOwnership(
 				datasetName, len(compacted), additiveGrantHardCap)
 		}
 		record.CSIAddedNFSHosts = compacted
+	case ShareTypeISCSI:
+		// iSCSI access control is CHAP-secret based (per-initiator secrets set
+		// at controller-publish time), not a host/NQN additive allowlist, so
+		// there is no CSIAddedISCSI* provenance field to populate here.
 	case ShareTypeNVMeoF:
 		nqn := strings.TrimSpace(identity.NVMeNQN)
 		if nqn == "" {

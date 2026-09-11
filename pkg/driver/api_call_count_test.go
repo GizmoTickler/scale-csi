@@ -638,9 +638,9 @@ func (c *apiCallCountingClient) NVMeoFGetOrCreatePort(ctx context.Context, trans
 	return c.MockClient.NVMeoFGetOrCreatePort(ctx, transport, address, port, opts...)
 }
 
-func (c *apiCallCountingClient) InvalidateNVMeoFPort(transport, address string, port int) {
+func (c *apiCallCountingClient) InvalidateNVMeoFPort(ctx context.Context, transport, address string, port int) {
 	c.record("InvalidateNVMeoFPort")
-	c.MockClient.InvalidateNVMeoFPort(transport, address, port)
+	c.MockClient.InvalidateNVMeoFPort(ctx, transport, address, port)
 }
 
 func (c *apiCallCountingClient) NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error) {

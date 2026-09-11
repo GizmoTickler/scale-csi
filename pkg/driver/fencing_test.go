@@ -3055,7 +3055,7 @@ func TestStartupReconcileIsolatesPerVolumeFailures(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, client.DatasetSetUserProperty(ctx, goodDataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
 
-	objects := []runtime.Object{}
+	objects := make([]runtime.Object, 0, 6)
 	for _, volumeID := range []string{"good", "missing"} {
 		pvName := "pv-" + volumeID
 		pv := &corev1.PersistentVolume{

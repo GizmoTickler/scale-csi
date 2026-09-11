@@ -852,7 +852,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// exactly like the CHAP linkage. Adding keys to a map that is already written
 	// costs no extra round trip.
 	var contentSourceGeometry map[string]string
-	zvolReady := false
+	var zvolReady bool
 	// performanceClassApplied is the ONLY authority for stamping
 	// PropZFSPerformanceClass. The stamp asserts "this dataset was CREATED with
 	// the curated class's properties", and createDataset is the only place they
@@ -1356,6 +1356,9 @@ func (d *Driver) createVolumeExisting(ctx context.Context, req *csi.CreateVolume
 		case remnantActionDestroy:
 			return nil, status.Errorf(codes.Aborted,
 				"destroyed unstamped interrupted detached-copy remnant %s; retry CreateVolume to recreate it cleanly", datasetName)
+		case remnantActionNone:
+			// No remnant recovery needed; fall through to the normal
+			// existing-dataset tail below.
 		}
 	}
 	storedContentSource := volumeContentSourceFromDataset(existingDS)
@@ -3529,7 +3532,7 @@ func isLowerAlphanumeric(c byte) bool {
 func multiNodeAccessMode(caps []*csi.VolumeCapability) (csi.VolumeCapability_AccessMode_Mode, bool) {
 	for _, capability := range caps {
 		mode := capability.GetAccessMode().GetMode()
-		switch mode {
+		switch mode { //nolint:exhaustive // deliberate allowlist of only the multi-node modes; every other csi.VolumeCapability_AccessMode_Mode value (including UNKNOWN and every single-node mode) is meant to fall through unmatched
 		case csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 			csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
 			csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER:
@@ -4616,6 +4619,7 @@ func (d *Driver) handleVolumeContentSource(
 	return createdDS, resolvedGeometry, nil
 }
 
+//nolint:contextcheck // the nil-guard's context.Background() fallback is defensive only; the real caller's ctx is otherwise correctly derived via context.WithoutCancel below (this is a best-effort cleanup that must still run its own bounded timeout even if the caller's context was already canceled)
 func (d *Driver) abortReplicationJobBestEffort(ctx context.Context, jobID int64, reason string) {
 	if d.truenasClient == nil || jobID == truenas.UnknownReplicationJobID {
 		return

@@ -381,7 +381,8 @@ func TestReconcileEncryptedUnlockBudgetCarriesOver(t *testing.T) {
 	const passphrase = "unlock-me-123"
 	volumeIDs := []string{"enc-a", "enc-b", "enc-c"}
 
-	objects := []runtime.Object{encryptionReconcileSC(), encryptionReconcileSecret(passphrase, "")}
+	objects := make([]runtime.Object, 0, 2+len(volumeIDs))
+	objects = append(objects, encryptionReconcileSC(), encryptionReconcileSecret(passphrase, ""))
 	for _, volumeID := range volumeIDs {
 		objects = append(objects, encryptionReconcilePV(volumeID))
 	}

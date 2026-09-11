@@ -50,9 +50,9 @@ const (
 	chapSecretKeyTag            = "tag"
 
 	chapAliasUsername       = "node.session.auth.username"
-	chapAliasPassword       = "node.session.auth.password"
+	chapAliasPassword       = "node.session.auth.password" //nolint:gosec // iscsiadm parameter NAME, not a credential value
 	chapAliasMutualUsername = "node.session.auth.username_in"
-	chapAliasMutualPassword = "node.session.auth.password_in"
+	chapAliasMutualPassword = "node.session.auth.password_in" //nolint:gosec // iscsiadm parameter NAME, not a credential value
 )
 
 // iscsiCHAPSecret is the driver-side parse of a per-StorageClass CHAP Secret.

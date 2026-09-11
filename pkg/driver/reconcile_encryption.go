@@ -42,8 +42,8 @@ import (
 // StorageClass's encryptionSecretName/encryptionSecretNamespace. The reconciler
 // reads the passphrase from this secret; it never logs it.
 const (
-	csiControllerPublishSecretNameParam      = "csi.storage.k8s.io/controller-publish-secret-name"
-	csiControllerPublishSecretNamespaceParam = "csi.storage.k8s.io/controller-publish-secret-namespace"
+	csiControllerPublishSecretNameParam      = "csi.storage.k8s.io/controller-publish-secret-name"      //nolint:gosec // CSI StorageClass parameter NAME, not a credential value
+	csiControllerPublishSecretNamespaceParam = "csi.storage.k8s.io/controller-publish-secret-namespace" //nolint:gosec // CSI StorageClass parameter NAME, not a credential value
 )
 
 // encryptionUnlockEventThreshold is how many consecutive failed re-unlock passes

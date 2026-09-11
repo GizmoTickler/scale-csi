@@ -411,7 +411,7 @@ func installSanityNodeCommands(t *testing.T) {
 		"blkid", "findmnt", "iscsiadm", "mount", "nvme", "resize2fs", "umount", "xfs_growfs",
 	} {
 		commandPath := filepath.Join(binDir, command)
-		if err := os.WriteFile(commandPath, []byte(sanityNodeCommandScript), 0o750); err != nil {
+		if err := os.WriteFile(commandPath, []byte(sanityNodeCommandScript), 0o750); err != nil { //nolint:gosec // must be executable to stand in as a fake host command this test execs
 			t.Fatalf("install fake node command %s: %v", command, err)
 		}
 	}

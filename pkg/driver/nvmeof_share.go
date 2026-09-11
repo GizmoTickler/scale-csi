@@ -169,6 +169,7 @@ func (d *Driver) associateNVMeoFPorts(ctx context.Context, subsysID int, address
 		assoc, assocErr := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsysID)
 		if assocErr != nil {
 			d.truenasClient.InvalidateNVMeoFPort(
+				ctx,
 				d.config.NVMeoF.Transport,
 				addr,
 				d.config.NVMeoF.TransportServiceID,
@@ -181,7 +182,7 @@ func (d *Driver) associateNVMeoFPorts(ctx context.Context, subsysID int, address
 	return portSubsysIDs, nil
 }
 
-func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution) error {
+func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution) error { //nolint:unparam // volumeName is part of the ShareBackend.EnsureShare calling convention shared with NFS/iSCSI (see share_backend.go); this backend does not currently need it, but the signature stays symmetric across all three
 	if !d.config.Fencing.Enabled() && !d.config.NVMeoF.SubsystemAllowAnyHost && len(d.config.NVMeoF.SubsystemHosts) == 0 {
 		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
 	}
