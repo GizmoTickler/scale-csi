@@ -75,6 +75,69 @@ func zvolReferenceDatasetName(devicePath string) (string, bool) {
 	return datasetName, true
 }
 
+// parentDatasetMountpoint resolves the filesystem prefix every NFS share this
+// driver instance owns must be exported from. The parent dataset's mountpoint
+// is read from the appliance when the API exposes it and only falls back to the
+// conventional /mnt/<dataset> when it does not — the same derivation the create
+// path uses (expectedNFSMountpoint), so the sweep and provisioning agree on one
+// answer. The parent dataset is present by construction during a sweep (the
+// ABSENT dataset is the child), so the fallback is the degraded path, not the
+// normal one.
+func (d *Driver) parentDatasetMountpoint(ctx context.Context) string {
+	parentName := d.parentDatasetName()
+	parent, err := d.truenasClient.DatasetGet(ctx, parentName)
+	if err != nil {
+		if !truenas.IsNotFoundError(err) {
+			klog.Warningf("Orphan reconcile: reading parent dataset %s failed; falling back to the conventional mountpoint: %v", parentName, err)
+		}
+		parent = nil
+	}
+	return expectedNFSMountpoint(parent, parentName)
+}
+
+// nfsShareExportPaths returns every path a share exports, for logging.
+func nfsShareExportPaths(share *truenas.NFSShare) []string {
+	if share == nil {
+		return nil
+	}
+	paths := make([]string, 0, len(share.Paths)+1)
+	if share.Path != "" {
+		paths = append(paths, share.Path)
+	}
+	paths = append(paths, share.Paths...)
+	return paths
+}
+
+// nfsShareExportedUnder reports whether EVERY path the share exports sits
+// strictly below parentMountpoint, and that it exports at least one path.
+//
+// "Every", not "any": a multi-path export that publishes one CSI volume
+// alongside /mnt/tank/finance is not a share this driver may delete, because
+// deleting by share.ID takes all of its paths down together.
+func nfsShareExportedUnder(share *truenas.NFSShare, parentMountpoint string) bool {
+	if share == nil || parentMountpoint == "" {
+		return false
+	}
+	parent := path.Clean(parentMountpoint)
+	if parent == "/" || parent == "." {
+		// A parent that cleans to the filesystem root would make the prefix test
+		// vacuous; refuse rather than authorize every share on the appliance.
+		return false
+	}
+	exported := false
+	for _, candidate := range nfsShareExportPaths(share) {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		cleaned := path.Clean(candidate)
+		if cleaned == parent || !strings.HasPrefix(cleaned, parent+"/") {
+			return false
+		}
+		exported = true
+	}
+	return exported
+}
+
 // shareOrphanLivePV reports whether the volume backing a share orphan still has
 // a live PersistentVolume. Such a share is anomalous (absent dataset under a live
 // PV) and must be surfaced, never swept.
@@ -110,6 +173,9 @@ func (d *Driver) detectOrphanedNFSShares(ctx context.Context, kubeState *kuberne
 		klog.Warningf("Orphan reconcile: failed to list NFS shares for orphan detection: %v", err)
 		return
 	}
+	// Resolved lazily, and at most once per pass, on the first share whose
+	// comment claims a dataset under this instance's parent.
+	parentMountpoint := ""
 	for _, share := range shares {
 		if share == nil {
 			continue
@@ -118,14 +184,30 @@ func (d *Driver) detectOrphanedNFSShares(ctx context.Context, kubeState *kuberne
 		if !ok {
 			continue
 		}
-		// NFS was the only protocol missing this guard. The share comment does
-		// embed the driver instance name, so this is not the sole scoping check
-		// the way it is for iSCSI and NVMe-oF — but the comment is attacker- and
-		// operator-writable free text on a shared appliance, and a dataset path
-		// outside this instance's configured parent is one this instance must
-		// never sweep regardless of what the comment claims. Matches
-		// detectOrphanedISCSIShares and detectOrphanedNVMeoFShares exactly.
+		// The comment is attacker- and operator-writable free text on a shared
+		// appliance, so datasetUnderParent applied to a name parsed OUT of it
+		// validates a self-asserted CLAIM, not the object that share.ID is about
+		// to delete. It is kept because a comment that does not even claim a
+		// dataset under this parent is obviously not ours, but on its own it adds
+		// nothing against the threat it names: anyone who can set a comment can
+		// shape what it sees. (It is therefore NOT the equivalent of the iSCSI
+		// and NVMe-oF scoping, whatever this comment used to claim.)
 		if !d.datasetUnderParent(datasetName) {
+			continue
+		}
+		// The appliance-controlled half, and the one that actually scopes the
+		// sweep: the EXPORTED PATH of the share being deleted must sit under the
+		// parent dataset's mountpoint. This is the NFS counterpart of the
+		// NVMe-oF namespace DevicePath — a field an operator cannot retarget by
+		// typing in a comment box.
+		if parentMountpoint == "" {
+			parentMountpoint = d.parentDatasetMountpoint(ctx)
+		}
+		if !nfsShareExportedUnder(share, parentMountpoint) {
+			klog.Warningf(
+				"Orphan reconcile: NFS share %d claims dataset %s in its comment but exports %v, which is not under %s — refusing to classify it",
+				share.ID, datasetName, nfsShareExportPaths(share), parentMountpoint,
+			)
 			continue
 		}
 		volumeID := path.Base(datasetName)
@@ -330,6 +412,35 @@ func (d *Driver) deleteOrphanedNFSShare(ctx context.Context, report *ReconcileRe
 		d.recordReconcileObjectFailure("share", orphan.BackendID, fmt.Errorf("parse NFS share ID %q: %w", orphan.BackendID, err))
 		return
 	}
+	// TOCTOU: re-read the share and re-run the scoping proof against the object
+	// as it exists NOW, rather than deleting an ID that a whole detection pass
+	// ago referred to a share under this driver's parent. This is the same
+	// discipline the guarded delete phase already applies to dataset absence and
+	// PersistentVolume liveness, applied to the one remaining unvalidated input:
+	// the share ID itself.
+	share, getErr := d.truenasClient.NFSShareGet(ctx, shareID)
+	if getErr != nil {
+		if !truenas.IsNotFoundError(getErr) {
+			d.recordReconcileObjectFailure("share", orphan.BackendID, fmt.Errorf("get NFS share %d: %w", shareID, getErr))
+			return
+		}
+		share = nil
+	}
+	if share == nil {
+		report.DeletedShares = append(report.DeletedShares, orphan.ID)
+		klog.Infof("Orphan reconcile: orphaned NFS share %d (dataset %s) already absent", shareID, orphan.ID)
+		return
+	}
+	if datasetName, ok := d.nfsShareCommentDatasetName(share.Comment); !ok || datasetName != orphan.ID {
+		d.recordReconcileSkip(report, "share", orphan.ID, fmt.Sprintf(
+			"NFS share %d no longer carries this driver's comment for %s", shareID, orphan.ID))
+		return
+	}
+	if parentMountpoint := d.parentDatasetMountpoint(ctx); !nfsShareExportedUnder(share, parentMountpoint) {
+		d.recordReconcileSkip(report, "share", orphan.ID, fmt.Sprintf(
+			"NFS share %d exports %v, which is not under the parent dataset mountpoint %s", shareID, nfsShareExportPaths(share), parentMountpoint))
+		return
+	}
 	if delErr := d.truenasClient.NFSShareDelete(ctx, shareID); delErr != nil && !truenas.IsNotFoundError(delErr) {
 		d.recordReconcileObjectFailure("share", orphan.BackendID, delErr)
 		return
@@ -412,6 +523,16 @@ func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *Reconcile
 			return
 		}
 	}
+	// Ownership gate. Everything below deletes the target with force=true, and
+	// the association path above can reach a target this driver never created.
+	// A target that cannot be proven ours is dropped here: the extent and the
+	// association (both provably ours) are still swept, the target is left
+	// standing, and the refusal is recorded in the report.
+	targetRetained := false
+	if target != nil && !d.iscsiOrphanTargetSweepable(ctx, report, orphan, target, extent, shareName) {
+		target = nil
+		targetRetained = true
+	}
 	// Canonical teardown also removes the per-volume fencing initiator group. The
 	// dataset is gone, so resolve it by its ownership comment rather than a stored
 	// property ID; sweeping must delete the same object set or one initiator group
@@ -426,7 +547,11 @@ func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *Reconcile
 	}
 	if target == nil && extent == nil && initiatorGroup == nil {
 		report.DeletedShares = append(report.DeletedShares, orphan.ID)
-		klog.Infof("Orphan reconcile: orphaned iSCSI share for dataset %s already absent", orphan.ID)
+		if targetRetained {
+			klog.Infof("Orphan reconcile: orphaned iSCSI share for dataset %s swept; its target was retained (see the recorded skip)", orphan.ID)
+		} else {
+			klog.Infof("Orphan reconcile: orphaned iSCSI share for dataset %s already absent", orphan.ID)
+		}
 		return
 	}
 	if association != nil {
@@ -461,7 +586,86 @@ func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *Reconcile
 		}
 	}
 	report.DeletedShares = append(report.DeletedShares, orphan.ID)
-	klog.Infof("Orphan reconcile: deleted orphaned iSCSI share for dataset %s (name %s)", orphan.ID, shareName)
+	if targetRetained {
+		klog.Infof("Orphan reconcile: deleted orphaned iSCSI extent for dataset %s (name %s); its target was retained (see the recorded skip)", orphan.ID, shareName)
+	} else {
+		klog.Infof("Orphan reconcile: deleted orphaned iSCSI share for dataset %s (name %s)", orphan.ID, shareName)
+	}
+}
+
+// iscsiOrphanTargetSweepable reports whether the sweep holds POSITIVE proof
+// that this iSCSI target belongs to the orphan being swept AND that
+// force-deleting it cannot take anything else down with it.
+//
+// Reaching the target through the target-extent ASSOCIATION survives a
+// nameSuffix change, which is why it replaced ISCSITargetFindByName — but it
+// also reaches SHARED and multi-LUN targets. Without this gate one orphaned
+// extent parked on such a target destroyed the target with force=true and took
+// every other extent on it offline, including extents this driver does not own.
+//
+// There is no ownership stamp on an iSCSI target to read: the driver creates
+// targets with an empty alias (createISCSIShareForDataset) and iscsi.target has
+// no comment field, while the dataset user property that records
+// PropISCSITargetID lives on a dataset that is absent by definition in an
+// orphan sweep. The two proofs that DO exist are:
+//
+//  1. Ownership. The driver always names a target and its extent identically
+//     (both iscsiShareName(volumeID)), so target.Name == extent.Name is a
+//     positive ownership signal inherited from an object this pass has ALREADY
+//     proven it owns — the extent, via its "scale-csi: <dataset>" comment stamp
+//     plus datasetUnderParent. Crucially it compares two names the APPLIANCE
+//     stores rather than one the driver recomputes, so it still holds after an
+//     iscsi.nameSuffix change — the drift that made the old derived-name lookup
+//     resolve nothing and leak (see resolveOrphanISCSIExtent). Equality with the
+//     freshly derived shareName is accepted as a second arm, and is the only arm
+//     available on the fallback path where the extent is already gone.
+//
+//  2. Sole occupancy. The appliance must report no extent on the target other
+//     than the one being swept. This is the half that actually bounds the blast
+//     radius, and it refuses even a correctly named, driver-created target that
+//     an operator later turned into a multi-LUN target.
+//
+// Failing either proof costs a leaked target, which the report surfaces as a
+// skip; passing them wrongly costs live LUNs.
+func (d *Driver) iscsiOrphanTargetSweepable(
+	ctx context.Context,
+	report *ReconcileReport,
+	orphan ReconcileObject,
+	target *truenas.ISCSITarget,
+	extent *truenas.ISCSIExtent,
+	shareName string,
+) bool {
+	targetID := strconv.Itoa(target.ID)
+	owned := target.Name == shareName
+	if !owned && extent != nil {
+		owned = target.Name == extent.Name
+	}
+	if !owned {
+		d.recordReconcileSkip(report, "iscsi_target", targetID, fmt.Sprintf(
+			"target %q matches neither the extent swept for %s nor the name this driver gives it (%q): refusing to force-delete a target this driver did not create",
+			target.Name, orphan.ID, shareName))
+		return false
+	}
+	associations, err := d.truenasClient.ISCSITargetExtentFindByTarget(ctx, target.ID)
+	if err != nil && !truenas.IsNotFoundError(err) {
+		d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("list iSCSI target-extents for target %d: %w", target.ID, err))
+		d.recordReconcileSkip(report, "iscsi_target", targetID, fmt.Sprintf(
+			"cannot list the extents on target %q, so sole occupancy is unproven: %v", target.Name, err))
+		return false
+	}
+	for _, association := range associations {
+		if association == nil {
+			continue
+		}
+		if extent != nil && association.Extent == extent.ID {
+			continue
+		}
+		d.recordReconcileSkip(report, "iscsi_target", targetID, fmt.Sprintf(
+			"target %q still carries extent %d, which this sweep does not own: force-deleting it would take every LUN on the target offline",
+			target.Name, association.Extent))
+		return false
+	}
+	return true
 }
 
 // resolveOrphanNVMeoFSubsystem is the NVMe-oF counterpart of

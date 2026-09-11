@@ -80,6 +80,20 @@ type Driver struct {
 	// TrueNAS API client
 	truenasClient truenas.ClientInterface
 
+	// serverStateMu + serverStopped guard the three listener handles below with
+	// the same mutex + terminal-stopped-flag pattern every cancellable loop on
+	// this driver already uses (C7). They were the last write-in-Run(),
+	// read-in-Stop() fields left unsynchronized after a961e91 converted the
+	// CancelFunc fields: cmd/scale-csi calls Stop() from the signal goroutine
+	// while Run() is still on the main goroutine, so a plain nil check let
+	// Stop() observe server == nil, skip GracefulStop(), close the TrueNAS
+	// client anyway and return — after which Run() served gRPC forever against
+	// a dead client and the pod hung until SIGKILL. Recording serverStopped
+	// under the same lock publishServers takes closes that window: a Stop()
+	// that wins the race is observed by Run() before it ever serves.
+	serverStateMu sync.Mutex
+	serverStopped bool
+
 	// gRPC server
 	server *grpc.Server
 
@@ -571,30 +585,33 @@ func (d *Driver) Run() error {
 		}
 	}
 
-	// Create gRPC server with interceptor for logging
-	d.server = grpc.NewServer(
+	// Create gRPC server with interceptor for logging. Everything Run() builds
+	// stays on locals until publishServers hands all three handles to Stop() in
+	// one critical section; see the serverStateMu comment on the struct.
+	server := grpc.NewServer(
 		grpc.UnaryInterceptor(d.logInterceptor),
 	)
 
 	// Register CSI services
-	csi.RegisterIdentityServer(d.server, d)
+	csi.RegisterIdentityServer(server, d)
 
 	if d.runController {
-		csi.RegisterControllerServer(d.server, d)
+		csi.RegisterControllerServer(server, d)
 		klog.Info("Controller service registered")
 	}
 
 	if d.runNode {
-		csi.RegisterNodeServer(d.server, d)
+		csi.RegisterNodeServer(server, d)
 		klog.Info("Node service registered")
 	}
 
 	// Bind health/metrics before any reconciliation or background workers. This
 	// makes an occupied port a synchronous startup error with no half-started
 	// controller or node goroutines left behind.
+	var healthServer *HealthServer
 	if d.healthPort > 0 {
-		d.healthServer = NewHealthServer(d, d.healthPort)
-		if err := d.healthServer.Start(); err != nil {
+		healthServer = NewHealthServer(d, d.healthPort)
+		if err := healthServer.Start(); err != nil {
 			_ = listener.Close()
 			return fmt.Errorf("failed to start health server: %w", err)
 		}
@@ -605,22 +622,31 @@ func (d *Driver) Run() error {
 	// port. Like the health server it binds before any background workers, so
 	// an occupied address is a synchronous startup failure rather than an
 	// asynchronous log line.
+	var debugServer *DebugServer
 	if d.config != nil {
-		if debugServer := NewDebugServer(d, d.config.Debug.ListenAddress); debugServer != nil {
-			d.debugServer = debugServer
-			if err := d.debugServer.Start(); err != nil {
+		if candidate := NewDebugServer(d, d.config.Debug.ListenAddress); candidate != nil {
+			if err := candidate.Start(); err != nil {
 				// The health server may already be bound; shut it down so a failed
 				// debug bind leaves no half-started listener goroutine behind,
 				// matching the "no half-started goroutines" contract above.
-				if d.healthServer != nil {
-					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					_ = d.healthServer.Stop(shutdownCtx)
-					cancel()
-				}
+				shutdownAuxServers(healthServer, nil)
 				_ = listener.Close()
 				return fmt.Errorf("failed to start debug server: %w", err)
 			}
+			debugServer = candidate
 		}
+	}
+
+	// Hand the three listener handles to Stop() in one critical section. A false
+	// result means Stop() already ran: tear the half-started listeners down and
+	// return instead of serving gRPC against a TrueNAS client Stop() has already
+	// closed, which is exactly the stranding that hung the pod until SIGKILL.
+	if !d.publishServers(server, healthServer, debugServer) {
+		klog.Info("Stop() ran before the CSI servers were published; shutting the half-started listeners down instead of serving")
+		shutdownAuxServers(healthServer, debugServer)
+		server.Stop()
+		_ = listener.Close()
+		return nil
 	}
 
 	// Serve first. Startup fencing may require hundreds of serialized middleware
@@ -629,7 +655,7 @@ func (d *Driver) Run() error {
 	d.ready.Store(!d.runController || d.config == nil || d.config.Fencing.Mode != FencingModeStrict)
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- d.server.Serve(listener)
+		serveErr <- server.Serve(listener)
 	}()
 	klog.Infof("CSI driver listening on %s", d.endpoint)
 
@@ -659,6 +685,21 @@ func (d *Driver) Stop() {
 	klog.Info("Stopping CSI driver")
 	d.ready.Store(false)
 
+	// Terminal, and taken before anything else: serverStopped is recorded under
+	// the same lock publishServers checks, so a Stop() that wins the race
+	// against Run()'s startup makes Run() abandon its half-started listeners
+	// rather than serve on. Reading the three handles here also removes the
+	// plain data race with Run()'s writes.
+	d.serverStateMu.Lock()
+	d.serverStopped = true
+	server := d.server
+	healthServer := d.healthServer
+	debugServer := d.debugServer
+	d.server = nil
+	d.healthServer = nil
+	d.debugServer = nil
+	d.serverStateMu.Unlock()
+
 	// Stop session GC goroutine first
 	d.stopSessionGC()
 	d.stopStartupAttachmentReconcile()
@@ -672,30 +713,53 @@ func (d *Driver) Stop() {
 		d.serviceReloadDebouncer.Stop()
 	}
 
-	// Stop health server
-	if d.healthServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := d.healthServer.Stop(ctx); err != nil {
-			klog.Warningf("Failed to stop health server: %v", err)
-		}
-	}
+	// Stop the health and debug listeners (debug mirrors the health pattern).
+	shutdownAuxServers(healthServer, debugServer)
 
-	// Stop debug server (mirrors the health server shutdown pattern)
-	if d.debugServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := d.debugServer.Stop(ctx); err != nil {
-			klog.Warningf("Failed to stop debug server: %v", err)
-		}
-	}
-
-	if d.server != nil {
-		d.server.GracefulStop()
+	if server != nil {
+		server.GracefulStop()
 	}
 	if d.truenasClient != nil {
 		if err := d.truenasClient.Close(); err != nil {
 			klog.Warningf("Failed to close TrueNAS client: %v", err)
+		}
+	}
+}
+
+// publishServers records the listeners Run() built so Stop() can shut them
+// down, and reports whether Run() may proceed to serve. It returns false when
+// Stop() already ran: Run() must then tear down what it built and return,
+// because Stop() has already (or is about to) close the TrueNAS client and
+// nothing will ever stop the gRPC server it was about to start.
+func (d *Driver) publishServers(server *grpc.Server, healthServer *HealthServer, debugServer *DebugServer) bool {
+	d.serverStateMu.Lock()
+	defer d.serverStateMu.Unlock()
+	if d.serverStopped {
+		return false
+	}
+	d.server = server
+	d.healthServer = healthServer
+	d.debugServer = debugServer
+	return true
+}
+
+// shutdownAuxServers stops whichever of the health/debug listeners are non-nil
+// under one shared 5s budget. Both shutdown sites (Stop, and Run's abandon
+// paths) go through it so they cannot drift apart.
+func shutdownAuxServers(healthServer *HealthServer, debugServer *DebugServer) {
+	if healthServer == nil && debugServer == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if healthServer != nil {
+		if err := healthServer.Stop(ctx); err != nil {
+			klog.Warningf("Failed to stop health server: %v", err)
+		}
+	}
+	if debugServer != nil {
+		if err := debugServer.Stop(ctx); err != nil {
+			klog.Warningf("Failed to stop debug server: %v", err)
 		}
 	}
 }

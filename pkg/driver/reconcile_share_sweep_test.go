@@ -168,7 +168,7 @@ func TestDeleteOrphanedSharesSharesDeletionCapWithOtherOrphanKinds(t *testing.T)
 		truenasClient: client,
 	}
 	_, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
-		Path: "/pool/parent/gone-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/gone-volume", Enabled: true,
+		Path: "/mnt/pool/parent/gone-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/gone-volume", Enabled: true,
 	})
 	require.NoError(t, err)
 

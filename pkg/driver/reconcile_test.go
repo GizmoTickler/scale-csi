@@ -1836,12 +1836,12 @@ func TestOrphanShareSweepDetectsAndDeletesShareWhoseDatasetIsGone(t *testing.T) 
 	require.NoError(t, err)
 	// A CSI-managed share whose dataset is gone IS orphaned.
 	_, err = client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
-		Path: "/pool/parent/gone-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/gone-volume", Enabled: true,
+		Path: "/mnt/pool/parent/gone-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/gone-volume", Enabled: true,
 	})
 	require.NoError(t, err)
 	// A foreign (non-CSI) share is never classified.
 	_, err = client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
-		Path: "/tank/manual", Comment: "manual share", Enabled: true,
+		Path: "/mnt/tank/manual", Comment: "manual share", Enabled: true,
 	})
 	require.NoError(t, err)
 
@@ -1877,7 +1877,7 @@ func TestOrphanShareSweepSkipsShareBackedByLivePV(t *testing.T) {
 		truenasClient: client,
 	}
 	_, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
-		Path: "/pool/parent/anomalous-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/anomalous-volume", Enabled: true,
+		Path: "/mnt/pool/parent/anomalous-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/anomalous-volume", Enabled: true,
 	})
 	require.NoError(t, err)
 

@@ -28,7 +28,7 @@ func TestDeleteOrphanedSharesHonorsTheRelistedKubernetesState(t *testing.T) {
 	d := newOrphanShareSweepDriver(client)
 
 	_, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
-		Path:    "/pool/parent/gone-volume",
+		Path:    "/mnt/pool/parent/gone-volume",
 		Comment: "scale-csi (org.scale.csi.test): pool/parent/gone-volume",
 		Enabled: true,
 	})
@@ -138,7 +138,7 @@ func TestDetectOrphanedNFSSharesScopesToTheParentDataset(t *testing.T) {
 
 	// A comment carrying THIS driver's name but a dataset outside its parent.
 	_, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
-		Path:    "/tank/other/foreign-volume",
+		Path:    "/mnt/tank/other/foreign-volume",
 		Comment: "scale-csi (org.scale.csi.test): tank/other/foreign-volume",
 		Enabled: true,
 	})
@@ -146,7 +146,7 @@ func TestDetectOrphanedNFSSharesScopesToTheParentDataset(t *testing.T) {
 	// A genuine orphan under the parent, to prove the guard is not a blanket
 	// disable.
 	_, err = client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
-		Path:    "/pool/parent/gone-volume",
+		Path:    "/mnt/pool/parent/gone-volume",
 		Comment: "scale-csi (org.scale.csi.test): pool/parent/gone-volume",
 		Enabled: true,
 	})
