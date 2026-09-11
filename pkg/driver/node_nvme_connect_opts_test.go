@@ -146,7 +146,7 @@ func TestFastIOFailTmoDefaultOnlyAppliesUnderMultipath(t *testing.T) {
 
 	single := newDriver(false, nil, 0)
 	assert.Negative(t, single.nvmeConnectOptions(time.Minute).FastIOFailTmo,
-		"single-path install must omit the flag, preserving the queue-through-outage behaviour")
+		"single-path install must omit the flag, preserving the queue-through-outage behavior")
 
 	multi := newDriver(true, []string{"192.168.202.10", "192.168.203.10"}, 0)
 	assert.Zero(t, multi.nvmeConnectOptions(time.Minute).FastIOFailTmo,

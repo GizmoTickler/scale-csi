@@ -1872,7 +1872,7 @@ func TestSameISCSIPortalMatchesEquivalentIPv6Forms(t *testing.T) {
 		{"2001:db8::1", "[2001:db8::1]:3260"},
 		{"[2001:DB8::1]:3260", "[2001:db8::1]:3260"},
 		{"[::ffff:10.0.0.1]:3260", "10.0.0.1:3260"},
-		// Unchanged behaviour for the forms this cluster actually uses.
+		// Unchanged behavior for the forms this cluster actually uses.
 		{"192.168.201.10", "192.168.201.10:3260"},
 		{"NAS01.Example.COM:3260", "nas01.example.com:3260"},
 	}

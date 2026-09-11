@@ -2318,14 +2318,14 @@ func (d *Driver) nvmeConnectOptions(deviceTimeout time.Duration) *util.NVMeoFCon
 	// to. Every justification written for it says "instead of failing over to a
 	// surviving multipath path" — on a single-path install there is no such
 	// path, and failing I/O fast simply converts a survivable stall into an
-	// outage: with ctrl_loss_tmo=-1 the pre-upgrade behaviour was to queue
+	// outage: with ctrl_loss_tmo=-1 the pre-upgrade behavior was to queue
 	// transparently through a NAS reboot, whereas EIO to the block layer takes
 	// ext4 read-only (errors=remount-ro) and shuts down an xfs log, needing a
 	// pod restart per volume to recover.
 	//
 	// nvmeof.multipath defaults to FALSE, so leaving the 15s default ungated
 	// would have applied it to exactly the installs that cannot benefit.
-	// Negative means "omit the flag", which is the historical behaviour. An
+	// Negative means "omit the flag", which is the historical behavior. An
 	// explicit positive value in config still wins, so single-path operators
 	// can opt in deliberately.
 	if connect.FastIOFailTmo == 0 && len(d.config.NVMeoF.multipathAddresses()) == 0 {

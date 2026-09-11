@@ -101,7 +101,7 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 		// that can clear a quarantine -- uses exactly this wider rule, and the two
 		// predicates disagreeing made quarantine PERMANENT: a node mid-drain read
 		// as STALE here (so the volume was quarantined) and LIVE there (so no
-		// revoke fired and nothing ever signalled the loop). Strict mode then
+		// revoke fired and nothing ever signaled the loop). Strict mode then
 		// latched ready with that volume's record and backend fence never written.
 		attachedNow := attachment.Status.Attached && attachment.DeletionTimestamp.IsZero()
 		pvName := *attachment.Spec.Source.PersistentVolumeName
