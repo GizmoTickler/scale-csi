@@ -28,7 +28,7 @@ var longOptionPattern = regexp.MustCompile(`--[a-zA-Z0-9][a-zA-Z0-9_-]*`)
 // from a production cluster node (nvme-cli 2.15). Note what it proves: nvme-cli
 // is inconsistent on purpose-built ground -- --ctrl-loss-tmo, --reconnect-delay,
 // --nr-io-queues and --keep-alive-tmo are hyphenated, while --fast_io_fail_tmo
-// and --tls_key are not. There is no rule to infer; the only defence is checking
+// and --tls_key are not. There is no rule to infer; the only defense is checking
 // against what the binary actually accepts.
 //
 // Refresh the fixture with:

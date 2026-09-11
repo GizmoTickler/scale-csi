@@ -137,7 +137,7 @@ func FuzzParseISCSISessionLines(f *testing.F) {
 
 // FuzzParseBlkidExportOutput targets `blkid -o export` output parsing, named
 // explicitly in the fuzz-expansion brief. The invariant is round-trip
-// stability: re-serialising the extracted TYPE/PTTYPE the way blkid itself
+// stability: re-serializing the extracted TYPE/PTTYPE the way blkid itself
 // would (quoted, matching the parser's own `Trim(TrimSpace(value), `"`)`
 // unquoting) and re-parsing must yield the same pair, and the parser must
 // never panic on truncated, duplicated, or out-of-order KEY=value lines.

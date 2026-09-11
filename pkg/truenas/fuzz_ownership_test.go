@@ -242,8 +242,8 @@ func FuzzParseDatasetResourceOwnershipSafety(f *testing.F) {
 			t.Fatalf("failed to marshal synthetic payload: %v", err)
 		}
 		var data interface{}
-		if err := json.Unmarshal(raw, &data); err != nil {
-			t.Fatalf("failed to round-trip synthetic payload: %v", err)
+		if unmarshalErr := json.Unmarshal(raw, &data); unmarshalErr != nil {
+			t.Fatalf("failed to round-trip synthetic payload: %v", unmarshalErr)
 		}
 
 		ds, err := parseDatasetResource(data)

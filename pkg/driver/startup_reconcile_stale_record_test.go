@@ -50,7 +50,7 @@ import (
 // LIVE NFS volume attached to node "worker-<volumeID>", matching the objects
 // reconcilePublishedAttachments reads. Returns the identity so the caller can
 // derive the SAME live node name the fixture used.
-func staleRecordVolume(t *testing.T, objects []runtime.Object, volumeID string) ([]runtime.Object, NodeIdentity) { //nolint:unparam // the returned identity is part of the documented contract above ("so the caller can derive the SAME live node name"); today's one caller happens to discard it via _
+func staleRecordVolume(t *testing.T, objects []runtime.Object, volumeID string) ([]runtime.Object, NodeIdentity) {
 	t.Helper()
 	pvName := "pv-" + volumeID
 	identity := NodeIdentity{Name: "worker-" + volumeID, IPs: []net.IP{net.ParseIP("192.0.2.11")}}

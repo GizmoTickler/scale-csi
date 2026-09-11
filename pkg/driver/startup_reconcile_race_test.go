@@ -36,7 +36,7 @@ func TestStopStartupAttachmentReconcileBeforeStartPreventsLoopFromEverRunning(t 
 	// true. That makes d.ready an observable proxy for "did the loop launch".
 	d.ready.Store(false)
 
-	// Stop BEFORE Start ever runs — the observable analogue of a Stop() that
+	// Stop BEFORE Start ever runs — the observable analog of a Stop() that
 	// wins the race against startupReconcileCancel's assignment (e.g. landing
 	// while ensureNFSProtocols is still in flight in Run()).
 	d.stopStartupAttachmentReconcile()

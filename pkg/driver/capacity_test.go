@@ -123,7 +123,7 @@ func TestStopCapacityGaugesBeforeStartPreventsLoopFromEverRunning(t *testing.T) 
 		truenasClient: client,
 	}
 
-	// Stop BEFORE Start ever runs — the observable analogue of a Stop() that
+	// Stop BEFORE Start ever runs — the observable analog of a Stop() that
 	// wins the race against capacityCancel's assignment (e.g. landing while
 	// ensureNFSProtocols or the startup fencing reconcile is still in flight in
 	// Run()).
