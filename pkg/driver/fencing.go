@@ -1441,6 +1441,15 @@ func dedupeISCSITargetGroupsByPortal(groups []truenas.ISCSITargetGroup) []truena
 	result := make([]truenas.ISCSITargetGroup, 0, len(groups))
 	for _, group := range groups {
 		if idx, ok := indexByPortal[group.Portal]; ok {
+			// Say so. In additive mode the superseded entry can be an
+			// operator-configured static group that shared the CSI portal, and
+			// dropping one silently means an initiator allowlist an operator
+			// deliberately set just stops applying, with nothing in the logs to
+			// explain it. The backend rejects duplicate portals outright, so
+			// superseding is still the right call — it just must not be
+			// invisible.
+			klog.Warningf("iSCSI target group for portal %d superseded: initiator group %d replaced by %d (a target may carry only one group per portal)",
+				group.Portal, result[idx].Initiator, group.Initiator)
 			result[idx] = group
 			continue
 		}

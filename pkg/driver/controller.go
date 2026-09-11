@@ -217,8 +217,13 @@ func snapshotBlocksVolumeDeletion(snap *truenas.Snapshot) bool {
 	if snap == nil || isSnapshotTombstone(snap) {
 		return false
 	}
-	// Internal-resource is safe to inspect on the 26.0 flat read path: datasets
-	// never carry this snapshot-only property, so it cannot be inherited.
+	// Internal-resource is safe to inspect on the 26.0 flat read path. The
+	// reason is empirical, not structural: no dataset in this driver's write
+	// paths ever sets csi_internal_resource, so it cannot be inherited onto a
+	// snapshot. Verified live across the pool. It is NOT enforced by anything,
+	// so an operator `zfs set` on a dataset would break this read — which is
+	// why the clone path no longer relies on this property alone to prove a
+	// snapshot was stamped (see handleVolumeContentSource).
 	if prop, ok := snap.UserProperties[PropInternalResource]; ok && prop.Value == "true" { //nolint:gocritic // snapshot-only property (csi_internal_resource is never set on a dataset, so it cannot be inherited onto a snapshot — see the preceding comment)
 		return true
 	}
@@ -4515,8 +4520,23 @@ func (d *Driver) handleVolumeContentSource(
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
 			return nil, blockGeometry{}, markerWriteErr
 		}
+		// PropCSISnapshotName carries the temp snapshot's OWN name, so this
+		// property set contains a snapshot-unique value. That is what makes
+		// SnapshotCreate's persistence read-back sound: it accepts a fresh read
+		// when every requested key matches by value, and 26.0's read path
+		// reports inherited and local properties indistinguishably (a flat map
+		// with no source). Without a snapshot-unique value, a create that
+		// genuinely dropped everything could read back as success purely
+		// through inheritance from the source dataset — a fabricated stamp on a
+		// path that gates DELETION.
+		//
+		// PropInternalResource alone previously satisfied that read-back only
+		// because no dataset happens to carry it. That invariant is real
+		// (verified across the pool) but undocumented and one `zfs set` from
+		// being false, so it is no longer what the safety rests on.
 		snap, err := d.truenasClient.SnapshotCreate(ctx, sourceDataset, tempSnapshotName, map[string]string{
 			PropInternalResource: "true",
+			PropCSISnapshotName:  tempSnapshotName,
 		})
 		if err != nil {
 			d.deleteInflightMarker(ctx, path.Base(datasetName))
