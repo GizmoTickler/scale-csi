@@ -430,6 +430,49 @@ func redactEncryptionError(err error, secrets ...string) string {
 	return redactEncryptionSecrets(err.Error(), secrets...)
 }
 
+// redactedEncryptionError is redactEncryptionError for the one site that must
+// keep PROPAGATING an error rather than interpolate a string: createDataset's
+// pool.dataset.create, whose *APIError travels all the way up to CreateVolume's
+// deferred recordOperationFailureEvent and lands on the tenant's PVC as a
+// Warning Event (plus a V(0) klog line). It masks Error() while preserving the
+// wrapped error for errors.Is/As classification, so no caller's error handling
+// changes shape.
+//
+// Note the asymmetry this type encodes: errors.As reaches the *APIError and
+// FullError() still returns raw backend text. That is intentional — the raw
+// text is used for BOOLEAN classification (isDatasetDependencyOrBusyError and
+// friends), never rendered — and the rendering channel is what leaks.
+type redactedEncryptionError struct {
+	err     error
+	message string
+}
+
+func (e *redactedEncryptionError) Error() string { return e.message }
+func (e *redactedEncryptionError) Unwrap() error { return e.err }
+
+// redactCreateEncryptionError wraps a pool.dataset.create failure so the
+// passphrase this request folded into the create ARGUMENTS cannot be echoed
+// back out through a middleware traceback.
+//
+// pool.dataset.create takes the passphrase as a call argument exactly like
+// pool.dataset.unlock and pool.dataset.change_key do (see
+// redactEncryptionSecrets, which exists for precisely that reason) — via
+// applyEncryptionToCreateParams -> truenas.EncryptionOptions.Passphrase. It was
+// the one such call whose error was not scrubbed, and it is the one a namespace
+// user can drive and then read the result of, on a PVC they own. Returns err
+// unchanged when the request carries no encryption resolution, so a plaintext
+// create's error is byte-identical to before.
+func redactCreateEncryptionError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	res := encryptionResolutionFromContext(ctx)
+	if res == nil || res.Passphrase == "" {
+		return err
+	}
+	return &redactedEncryptionError{err: err, message: redactEncryptionError(err, res.Passphrase)}
+}
+
 // encryptionProps returns the durable per-volume encryption stamp
 // (PropEncryption = <algorithm>) for an encryption-resolved create, or nil when
 // encryption is not active. It is folded into the single fatal managed-property

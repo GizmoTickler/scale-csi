@@ -1215,6 +1215,13 @@ func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 
 // SetISCSINodeParam sets a parameter on an iSCSI node.
 //
+// It has no production caller and MUST NOT acquire one that passes a CHAP
+// credential VALUE: this helper puts the value on argv, and on a hostPID node
+// plugin argv is world-readable through /proc (see writeISCSINodeRecordSecret,
+// which is why ConfigureISCSICHAPWithContext no longer does this). The
+// redaction below protects the LOG and ERROR channels only; it does nothing
+// about /proc. Route credential values through writeISCSINodeRecordSecret.
+//
 // When name is a CHAP credential key (node.session.auth.username/password and
 // their mutual variants) the value is a secret: on error the returned message
 // carries only the redacted argv (value masked) and an exit-class summary — never
@@ -1286,10 +1293,241 @@ func redactISCSIArgs(args []string) []string {
 	return redacted
 }
 
+// iscsiNodeDBRoots lists the open-iscsi node-database roots probed when a CHAP
+// credential VALUE has to be written straight into a node record instead of
+// being handed to iscsiadm on argv (see writeISCSINodeRecordSecret). /etc/iscsi
+// is the upstream default and what the node DaemonSet mounts; /var/lib/iscsi is
+// the alternate location some distributions build with, and is mounted by the
+// same DaemonSet. Package-level so tests can point it at a fixture tree.
+var iscsiNodeDBRoots = []string{"/etc/iscsi", "/var/lib/iscsi"}
+
+// iscsiNodeRecordMode is the mode forced on every node record this package
+// rewrites. open-iscsi creates node records with the daemon's umask (commonly
+// 0644), and a node record holds node.session.auth.password in CLEAR TEXT, so
+// leaving the default would move the secret from one world-readable place
+// (/proc/<pid>/cmdline) to another (the file). 0600 is what the record should
+// always have carried.
+const iscsiNodeRecordMode = 0o600
+
+// defaultISCSIPortalPort mirrors the port iscsiadm assumes for a portal written
+// without one; node record directories are always named <host>,<port>,<tpgt>.
+const defaultISCSIPortalPort = "3260"
+
+// splitISCSIPortal splits a portal into the host and port components that name
+// an on-disk node record directory. A portal with no port gets the iSCSI
+// default, matching what iscsiadm records.
+func splitISCSIPortal(portal string) (host, port string) {
+	portal = strings.TrimSpace(portal)
+	if h, p, err := net.SplitHostPort(portal); err == nil {
+		return strings.TrimSpace(h), strings.TrimSpace(p)
+	}
+	return strings.Trim(portal, "[]"), defaultISCSIPortalPort
+}
+
+// iscsiNodeRecord is one on-disk node record file plus the node database root
+// it was found under. Root doubles as the staging directory for the atomic
+// rewrite: it is guaranteed to be on the same filesystem as Path and is not the
+// record directory, where idbm would misread a temp file as an iface record.
+type iscsiNodeRecord struct {
+	Root string
+	Path string
+}
+
+// iscsiNodeRecordFiles returns every on-disk node record file that a
+// `--login -T <iqn> -p <portal>` could read: one file per bound iface, under
+// every <host>,<port>,<tpgt> directory matching the portal (a target can carry
+// both the tpgt -1 record `-o new` writes and a real tpgt record left by a
+// SendTargets discovery, and iscsiadm may log in through either).
+//
+// Nothing is created here. Both callers run AFTER iscsiEnsureNodeRecord and
+// after at least one successful `iscsiadm -o update`, so the record must
+// already exist; an empty result means the node database is somewhere this
+// build does not know about, which is reported rather than silently skipped.
+func iscsiNodeRecordFiles(roots []string, portal, iqn string) ([]iscsiNodeRecord, error) {
+	if iqn == "" || strings.ContainsRune(iqn, filepath.Separator) || strings.Contains(iqn, "..") {
+		// The IQN is backend-supplied and is about to become a path component.
+		// A separator or a parent reference cannot appear in a real IQN.
+		return nil, errors.New("refusing to locate a node record for an IQN that is not a single path component")
+	}
+	host, port := splitISCSIPortal(portal)
+	hosts := map[string]struct{}{host: {}}
+	if ip := net.ParseIP(host); ip != nil {
+		// iscsiadm records the address in its own normalized form; accept both.
+		hosts[ip.String()] = struct{}{}
+	}
+
+	var files []iscsiNodeRecord
+	for _, root := range roots {
+		targetDir := filepath.Join(root, "nodes", iqn)
+		portalDirs, err := os.ReadDir(targetDir)
+		if err != nil {
+			continue
+		}
+		for _, portalDir := range portalDirs {
+			if !portalDir.IsDir() {
+				continue
+			}
+			parts := strings.Split(portalDir.Name(), ",")
+			if len(parts) < 2 || parts[1] != port {
+				continue
+			}
+			if _, ok := hosts[parts[0]]; !ok {
+				continue
+			}
+			recordDir := filepath.Join(targetDir, portalDir.Name())
+			ifaces, ifaceErr := os.ReadDir(recordDir)
+			if ifaceErr != nil {
+				continue
+			}
+			for _, iface := range ifaces {
+				if iface.IsDir() {
+					continue
+				}
+				files = append(files, iscsiNodeRecord{Root: root, Path: filepath.Join(recordDir, iface.Name())})
+			}
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no iSCSI node record found for %s at %s under %s", iqn, portal, strings.Join(roots, ", "))
+	}
+	return files, nil
+}
+
+// setISCSINodeRecordParamText returns text with name set to value, replacing
+// every existing assignment of name and appending one when there is none. The
+// node record format open-iscsi's idbm parses is `name = value` lines with '#'
+// comments, which is what this emits.
+func setISCSINodeRecordParamText(text, name, value string) string {
+	line := name + " = " + value
+	lines := strings.Split(text, "\n")
+	replaced := false
+	for i, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		key, _, found := strings.Cut(trimmed, "=")
+		if !found || strings.TrimSpace(key) != name {
+			continue
+		}
+		// Replace EVERY assignment: idbm takes the last one, so leaving an
+		// earlier duplicate behind would be harmless but leaving a later one
+		// would silently win over the credential just written.
+		lines[i] = line
+		replaced = true
+	}
+	if !replaced {
+		body := strings.TrimRight(text, "\n")
+		if body != "" {
+			body += "\n"
+		}
+		return body + line + "\n"
+	}
+	out := strings.Join(lines, "\n")
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
+	return out
+}
+
+// writeISCSINodeRecordSecret sets a CHAP credential parameter by rewriting the
+// node record on disk instead of passing the value to iscsiadm on argv.
+//
+// WHY NOT argv: the node DaemonSet runs with hostPID: true, and the production
+// iscsiadm is a bash wrapper that re-execs nsenter, which re-execs the host
+// iscsiadm — so an `-o update -n node.session.auth.password -v <secret>` put
+// the shared, per-StorageClass CHAP secret into THREE simultaneous argvs in the
+// host PID namespace, where /proc/<pid>/cmdline is world-readable. Any pod
+// admitted with hostPID could poll it; no root and no privileged container
+// required. Only the credential VALUES move here: authmethod and the usernames
+// are not secret and stay on argv, where iscsiadm's own idempotency handling
+// covers them.
+//
+// The record file is the same thing `iscsiadm -o update` would have written
+// (idbm re-serializes the whole record on every update, so a later update
+// preserves what is written here), and --login reads it. It is rewritten
+// atomically through a temp file in the DB root — never in the record
+// directory, where idbm would read a stray file as another iface record — and
+// lands at 0600.
+//
+// The write is not serialized: the rename is atomic, so no reader can observe a
+// torn record, and the only concurrent writers for one (target, portal) are
+// stages of the same volume, which carry the identical StorageClass credential.
+func writeISCSINodeRecordSecret(roots []string, portal, iqn, name, value string) error {
+	// A value that cannot be represented faithfully in the record format must
+	// fail loudly rather than write a record that means something else. The
+	// controller's validateCHAPSecretValue already rejects all three (it mirrors
+	// TrueNAS auth.py), so this is a by-construction guard for any other caller.
+	// The value itself is never named in the error.
+	if value != strings.TrimSpace(value) {
+		return fmt.Errorf("node param %s value must not have leading or trailing whitespace", name)
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("node param %s value must not contain a newline", name)
+	}
+	if strings.Contains(value, "#") {
+		return fmt.Errorf("node param %s value must not contain '#'", name)
+	}
+
+	files, err := iscsiNodeRecordFiles(roots, portal, iqn)
+	if err != nil {
+		return err
+	}
+	for _, record := range files {
+		if err := rewriteISCSINodeRecord(record.Root, record.Path, name, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rewriteISCSINodeRecord applies one parameter to one node record file,
+// replacing it atomically at 0600. tempRoot must sit on the same filesystem as
+// file (it is the node DB root the file was found under) and must NOT be the
+// record directory itself.
+func rewriteISCSINodeRecord(tempRoot, file, name, value string) error {
+	existing, err := os.ReadFile(file)
+	if err != nil {
+		return fmt.Errorf("failed to read iSCSI node record for param %s: %w", name, err)
+	}
+	updated := setISCSINodeRecordParamText(string(existing), name, value)
+
+	tmp, err := os.CreateTemp(tempRoot, ".scale-csi-node-")
+	if err != nil {
+		return fmt.Errorf("failed to stage iSCSI node record for param %s: %w", name, err)
+	}
+	tmpName := tmp.Name()
+	// Best-effort removal covers every failure path below; after a successful
+	// rename the path no longer exists and the error is ignored.
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if err := tmp.Chmod(iscsiNodeRecordMode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to restrict iSCSI node record permissions for param %s: %w", name, err)
+	}
+	if _, err := tmp.WriteString(updated); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to write iSCSI node record for param %s: %w", name, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to flush iSCSI node record for param %s: %w", name, err)
+	}
+	if err := os.Rename(tmpName, file); err != nil {
+		return fmt.Errorf("failed to install iSCSI node record for param %s: %w", name, err)
+	}
+	return nil
+}
+
 // ConfigureISCSICHAPWithContext applies session CHAP credentials to a target's
-// node record before login. It uses the ctx-aware iscsiAdmCombinedOutput seam
-// (not the plain-exec SetISCSINodeParam) so it is testable and cancellable. The
-// parameter NAMES may appear in errors; the credential VALUES never do.
+// node record before login. Non-secret parameters go through the ctx-aware
+// iscsiAdmCombinedOutput seam (not the plain-exec SetISCSINodeParam) so they are
+// testable and cancellable; the two credential VALUES are written straight into
+// the node record instead, because argv is world-readable through /proc on a
+// hostPID node plugin — see writeISCSINodeRecordSecret. The parameter NAMES may
+// appear in errors; the credential VALUES never do.
+//
+// The secrets are written LAST so no subsequent iscsiadm rewrite of the record
+// can follow the 0600 the credential write installs.
 func ConfigureISCSICHAPWithContext(ctx context.Context, portal, iqn string, creds *ISCSICHAPCredentials) error {
 	if creds == nil {
 		return nil
@@ -1297,17 +1535,23 @@ func ConfigureISCSICHAPWithContext(ctx context.Context, portal, iqn string, cred
 	setParam := func(name, value string) error {
 		cmdCtx, cancel := context.WithTimeout(ctx, getISCSITimeout())
 		defer cancel()
-		// The value passed to iscsiadm is a CHAP credential. On failure NEVER append
-		// the command's CombinedOutput or the raw exec error: iscsiadm (or a wrapper
-		// / exec logger) can echo the submitted argv/value. Return only the parameter
-		// NAME and an exit-class summary so no credential can reach a gRPC status,
-		// Event, or log line.
+		// Even though no credential VALUE reaches this argv any more, still never
+		// append the command's CombinedOutput or the raw exec error: iscsiadm (or a
+		// wrapper / exec logger) can echo the submitted argv, and the usernames are
+		// half of the credential. Return only the parameter NAME and an exit-class
+		// summary so nothing can reach a gRPC status, Event, or log line.
 		_, err := iscsiAdmCombinedOutput(cmdCtx, "-m", "node", "-T", iqn, "-p", portal,
 			"-o", "update", "-n", name, "-v", value)
 		if err != nil {
 			return fmt.Errorf("failed to set node param %s (%s)", name, sanitizedExecClass(err))
 		}
 		return nil
+	}
+	setSecret := func(name, value string) error {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("failed to set node param %s (%s)", name, sanitizedExecClass(err))
+		}
+		return writeISCSINodeRecordSecret(iscsiNodeDBRoots, portal, iqn, name, value)
 	}
 
 	if err := setParam("node.session.auth.authmethod", "CHAP"); err != nil {
@@ -1316,14 +1560,16 @@ func ConfigureISCSICHAPWithContext(ctx context.Context, portal, iqn string, cred
 	if err := setParam("node.session.auth.username", creds.Username); err != nil {
 		return err
 	}
-	if err := setParam("node.session.auth.password", creds.Password); err != nil {
-		return err
-	}
 	if creds.Mutual {
 		if err := setParam("node.session.auth.username_in", creds.MutualUsername); err != nil {
 			return err
 		}
-		if err := setParam("node.session.auth.password_in", creds.MutualPassword); err != nil {
+	}
+	if err := setSecret("node.session.auth.password", creds.Password); err != nil {
+		return err
+	}
+	if creds.Mutual {
+		if err := setSecret("node.session.auth.password_in", creds.MutualPassword); err != nil {
 			return err
 		}
 	}

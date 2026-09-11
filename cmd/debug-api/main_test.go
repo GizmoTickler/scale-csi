@@ -83,3 +83,28 @@ func TestPrintHelpDocumentsCleanupScopeAndOutputCap(t *testing.T) {
 	assert.Contains(t, help, "report-only; does NOT honor -cleanup")
 	assert.Contains(t, help, "-max-output")
 }
+
+// TestNoAPIKeyFlagIsRegistered pins the S-04 fix: an API key passed as a
+// command-line flag sits in this process's argv, which /proc/<pid>/cmdline
+// exposes to every other user on the workstation for as long as the command
+// runs (and lands in shell history besides). TRUENAS_API_KEY was always
+// supported and is now the only input, and the help text must not recommend
+// the flag that no longer exists.
+func TestNoAPIKeyFlagIsRegistered(t *testing.T) {
+	assert.Nil(t, flag.Lookup("api-key"), "the -api-key flag must not be registered")
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stdout = w
+	defer func() { os.Stdout = oldStdout }()
+
+	printHelp()
+	require.NoError(t, w.Close())
+	captured, err := io.ReadAll(r)
+	require.NoError(t, err)
+	help := string(captured)
+
+	assert.NotContains(t, help, "-api-key", "the help must not recommend a flag-borne API key")
+	assert.Contains(t, help, "TRUENAS_API_KEY", "the help must name the env var that replaces it")
+}

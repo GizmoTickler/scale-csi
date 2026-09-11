@@ -3740,7 +3740,11 @@ func (d *Driver) createDataset(ctx context.Context, datasetName string, capacity
 
 	ds, err := d.truenasClient.DatasetCreate(ctx, params)
 	if err != nil {
-		return nil, err
+		// The passphrase rode in THIS call's arguments (applyEncryptionToCreateParams
+		// above), and this error is carried verbatim onto the tenant's PVC by
+		// CreateVolume's deferred recordOperationFailureEvent. Scrub it for the same
+		// reason pool.dataset.unlock/change_key errors are scrubbed.
+		return nil, redactCreateEncryptionError(ctx, err)
 	}
 	if !ds.CreatedByCall {
 		if datasetHasLocalUserProperty(ds, PropDriverInstanceID, d.driverInstanceID()) {

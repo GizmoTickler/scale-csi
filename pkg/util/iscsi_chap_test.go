@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 func TestConfigureISCSICHAPWithContextOneWay(t *testing.T) {
 	portal := "192.0.2.20:3260"
 	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-oneway"
+	record := stubISCSINodeDB(t, portal, iqn)
 	var calls [][]string
 
 	originalRunner := iscsiAdmCombinedOutput
@@ -26,16 +28,21 @@ func TestConfigureISCSICHAPWithContextOneWay(t *testing.T) {
 	creds := &ISCSICHAPCredentials{Username: "chapuser", Password: "chapsecret123"}
 	require.NoError(t, ConfigureISCSICHAPWithContext(context.Background(), portal, iqn, creds))
 
+	// The credential VALUE is deliberately absent from this argv: it goes into
+	// the node record instead (S-01). Only the non-secret params are exec'd.
 	require.Equal(t, [][]string{
 		{"-m", "node", "-T", iqn, "-p", portal, "-o", "update", "-n", "node.session.auth.authmethod", "-v", "CHAP"},
 		{"-m", "node", "-T", iqn, "-p", portal, "-o", "update", "-n", "node.session.auth.username", "-v", "chapuser"},
-		{"-m", "node", "-T", iqn, "-p", portal, "-o", "update", "-n", "node.session.auth.password", "-v", "chapsecret123"},
 	}, calls)
+	contents, err := os.ReadFile(record)
+	require.NoError(t, err)
+	assert.Contains(t, string(contents), "node.session.auth.password = chapsecret123")
 }
 
 func TestConfigureISCSICHAPWithContextMutual(t *testing.T) {
 	portal := "192.0.2.21:3260"
 	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-mutual"
+	record := stubISCSINodeDB(t, portal, iqn)
 	var calls [][]string
 
 	originalRunner := iscsiAdmCombinedOutput
@@ -54,13 +61,16 @@ func TestConfigureISCSICHAPWithContextMutual(t *testing.T) {
 	}
 	require.NoError(t, ConfigureISCSICHAPWithContext(context.Background(), portal, iqn, creds))
 
+	// Both credential VALUES are absent from argv; both usernames remain on it.
 	require.Equal(t, [][]string{
 		{"-m", "node", "-T", iqn, "-p", portal, "-o", "update", "-n", "node.session.auth.authmethod", "-v", "CHAP"},
 		{"-m", "node", "-T", iqn, "-p", portal, "-o", "update", "-n", "node.session.auth.username", "-v", "chapuser"},
-		{"-m", "node", "-T", iqn, "-p", portal, "-o", "update", "-n", "node.session.auth.password", "-v", "chapsecret123"},
 		{"-m", "node", "-T", iqn, "-p", portal, "-o", "update", "-n", "node.session.auth.username_in", "-v", "peeruser"},
-		{"-m", "node", "-T", iqn, "-p", portal, "-o", "update", "-n", "node.session.auth.password_in", "-v", "peersecret456"},
 	}, calls)
+	contents, err := os.ReadFile(record)
+	require.NoError(t, err)
+	assert.Contains(t, string(contents), "node.session.auth.password = chapsecret123")
+	assert.Contains(t, string(contents), "node.session.auth.password_in = peersecret456")
 }
 
 func TestConfigureISCSICHAPWithContextNilIsNoop(t *testing.T) {
@@ -78,13 +88,18 @@ func TestConfigureISCSICHAPWithContextNilIsNoop(t *testing.T) {
 
 func TestConfigureISCSICHAPWithContextErrorCarriesParamNameNotValue(t *testing.T) {
 	const secret = "supersecretvalue"
+	portal := "192.0.2.23:3260"
+	iqn := "iqn.test:y"
+	stubISCSINodeDB(t, portal, iqn)
+
 	originalRunner := iscsiAdmCombinedOutput
 	iscsiAdmCombinedOutput = func(_ context.Context, args ...string) ([]byte, error) {
-		// Fail only on the password write, and make BOTH the stdout AND the error
-		// echo the submitted secret value — the worst case where iscsiadm or a
-		// wrapper/exec-logger reflects the argv. The returned error must still be
+		// Fail on the username write — the first param whose value is credential
+		// material and still travels through iscsiadm — and make BOTH the stdout
+		// AND the error echo the submitted value, the worst case where iscsiadm or
+		// a wrapper/exec-logger reflects the argv. The returned error must still be
 		// clean (parameter name + exit class only).
-		if slices.Contains(args, "node.session.auth.password") {
+		if slices.Contains(args, "node.session.auth.username") {
 			return []byte("iscsiadm set -v " + secret + " failed"),
 				fmt.Errorf("exec failed running -v %s", secret)
 		}
@@ -92,10 +107,10 @@ func TestConfigureISCSICHAPWithContextErrorCarriesParamNameNotValue(t *testing.T
 	}
 	t.Cleanup(func() { iscsiAdmCombinedOutput = originalRunner })
 
-	creds := &ISCSICHAPCredentials{Username: "chapuser", Password: secret}
-	err := ConfigureISCSICHAPWithContext(context.Background(), "192.0.2.23:3260", "iqn.test:y", creds)
+	creds := &ISCSICHAPCredentials{Username: secret, Password: "chapsecret123"}
+	err := ConfigureISCSICHAPWithContext(context.Background(), portal, iqn, creds)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "node.session.auth.password", "the parameter NAME is safe to surface")
+	assert.Contains(t, err.Error(), "node.session.auth.username", "the parameter NAME is safe to surface")
 	assert.NotContains(t, err.Error(), secret, "credential value must never appear in errors (stdout or raw exec error)")
 }
 
@@ -108,6 +123,7 @@ func TestISCSIConnectPostDiscoveryAuthFailureIsClassified(t *testing.T) {
 	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-postdisc"
 	const secret = "wrongsecret12"
 	loginAttempts := 0
+	stubISCSINodeDB(t, portal, iqn)
 
 	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
 		if slices.Contains(args, "--login") {
@@ -140,6 +156,7 @@ func TestISCSIConnectAuthFailureShortCircuitsDiscovery(t *testing.T) {
 	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-badsecret"
 	var calls [][]string
 	loginAttempts := 0
+	stubISCSINodeDB(t, portal, iqn)
 
 	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
 		calls = append(calls, slices.Clone(args))
@@ -165,6 +182,7 @@ func TestISCSIConnectAppliesCHAPBeforeLogin(t *testing.T) {
 	portal := "192.0.2.25:3260"
 	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-order"
 	var calls [][]string
+	stubISCSINodeDB(t, portal, iqn)
 
 	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
 		calls = append(calls, slices.Clone(args))
@@ -192,6 +210,14 @@ func TestISCSIConnectAppliesCHAPBeforeLogin(t *testing.T) {
 	require.NotEqual(t, -1, authMethodIdx, "CHAP authmethod must be applied")
 	require.NotEqual(t, -1, loginIdx, "login must happen")
 	assert.Less(t, authMethodIdx, loginIdx, "CHAP params must be set before login")
+
+	// S-01, at the production entry point: no argv the connect path hands to the
+	// exec seam may carry the credential.
+	for _, args := range calls {
+		for _, arg := range args {
+			assert.NotContains(t, arg, "chapsecret123", "CHAP password reached iscsiadm argv: %v", redactISCSIArgs(args))
+		}
+	}
 }
 
 func TestIsAuthFailure(t *testing.T) {

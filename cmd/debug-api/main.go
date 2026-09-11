@@ -15,8 +15,11 @@ import (
 )
 
 var (
-	host     = flag.String("host", "", "TrueNAS host (or set TRUENAS_HOST)")
-	apiKey   = flag.String("api-key", "", "TrueNAS API key (or set TRUENAS_API_KEY)")
+	host = flag.String("host", "", "TrueNAS host (or set TRUENAS_HOST)")
+	// There is deliberately NO -api-key flag: a command-line flag puts the key
+	// into this process's argv, which /proc/<pid>/cmdline exposes to every other
+	// user on the workstation for the life of the command, and into the shell
+	// history of whoever typed it. TRUENAS_API_KEY is the only input.
 	insecure = flag.Bool("insecure", false, "Allow insecure TLS connections")
 	timeout  = flag.Duration("timeout", 60*time.Second, "API timeout")
 	command  = flag.String("cmd", "help", "Command to run: help, call, services, service-reload, datasets, iscsi-audit, nvmeof-audit, snapshots, test-errors")
@@ -50,12 +53,9 @@ func run() int {
 		return 1
 	}
 
-	k := *apiKey
+	k := os.Getenv("TRUENAS_API_KEY")
 	if k == "" {
-		k = os.Getenv("TRUENAS_API_KEY")
-	}
-	if k == "" {
-		fmt.Println("Error: API key required. Use -api-key flag or TRUENAS_API_KEY env var")
+		fmt.Println("Error: API key required. Set the TRUENAS_API_KEY env var")
 		return 1
 	}
 
@@ -107,7 +107,12 @@ func run() int {
 func printHelp() {
 	fmt.Println("TrueNAS Scale CSI Debug Tool")
 	fmt.Println()
-	fmt.Println("Usage: debug-api -host <host> -api-key <key> -cmd <command> [options]")
+	fmt.Println("Usage: debug-api -host <host> -cmd <command> [options]")
+	fmt.Println()
+	fmt.Println("Credentials:")
+	fmt.Println("  TRUENAS_API_KEY  Required. Env var only — an API key passed as a")
+	fmt.Println("                   command-line flag is world-readable via /proc.")
+	fmt.Println("  TRUENAS_HOST     Alternative to -host")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  help           Show this help message")

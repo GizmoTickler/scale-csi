@@ -1,5 +1,38 @@
 # Release notes — v1.10.6 (next)
 
+## Security — credentials off argv, backend errors scrubbed before they reach a PVC
+
+Three findings from a dedicated security review. All are latent with CHAP and
+encryption disabled (the defaults); they are real for anyone who enables either.
+
+- **iSCSI CHAP secrets no longer travel on a command line (HIGH).**
+  `node.session.auth.password` / `password_in` are now written straight into the
+  open-iscsi node record before `--login`; only `authmethod` and the usernames
+  stay on the `iscsiadm` argv. The node DaemonSet runs `hostPID: true` and the
+  bundled `iscsiadm` is a wrapper that re-execs `nsenter`, so the credential was
+  simultaneously present in three host-namespace `/proc/<pid>/cmdline` entries —
+  world-readable to any pod admitted with `hostPID`, no root and no privileged
+  container required. Because CHAP credentials are shared per StorageClass, one
+  read authorized login for every volume on that class. The records the driver
+  writes are forced to `0600`; open-iscsi's own umask commonly leaves them
+  `0644`. If no node record is found under `/etc/iscsi` or `/var/lib/iscsi`, the
+  stage now FAILS rather than silently falling back to the command line.
+- **`pool.dataset.create` failures are scrubbed (MEDIUM).** The create call
+  carries the encryption passphrase as an argument, exactly like
+  `pool.dataset.unlock` and `pool.dataset.change_key`, whose errors were already
+  masked. Its error was not, and it propagates onto the requesting PVC as a
+  Warning Event — readable by any namespace user who can create a PVC on an
+  encryption-enabled StorageClass.
+- **`iscsi.auth.create` / `iscsi.auth.update` failures are scrubbed (MEDIUM).**
+  Same shape: `secret`/`peersecret` ride as call arguments and the raw backend
+  text reached a gRPC status and the tenant's PVC Event. `redactCHAP` only ever
+  handled secret MAPS; `redactCHAPError` now covers forwarded backend text.
+
+**Breaking (developer tooling only):** `debug-api` no longer accepts `-api-key`.
+A flag-borne key sits in the process's argv for the life of the command and in
+shell history; `TRUENAS_API_KEY` already worked and is now the only input. The
+tool is not in the shipped image, so this affects operator workstations only.
+
 ## v1.10.6 — Reaper dashboard panels + bidirectional metric-drift test
 
 v1.10.5 shipped reap telemetry and verified it live, but the bundled Grafana
