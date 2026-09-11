@@ -698,7 +698,7 @@ func (d *Driver) migrateParentBookkeeping(ctx context.Context, parent *truenas.D
 	pending := make(map[string]string, len(toCopy))
 	for key, value := range toCopy {
 		if bookkeeping != nil {
-			if property, ok := bookkeeping.UserProperties[key]; ok &&
+			if property, ok := bookkeeping.UserProperties[key]; ok && //nolint:gocritic // dedup check only skips a redundant write when source is ALSO local (isLocalUserPropertySource) and the value already matches; cannot be fooled by an inherited value
 				isLocalUserPropertySource(property.Source) && property.Value == value {
 				continue
 			}

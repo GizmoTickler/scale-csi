@@ -18,8 +18,9 @@ import (
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
 
-	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 // ---------------------------------------------------------------------------

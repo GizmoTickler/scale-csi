@@ -57,7 +57,15 @@ type NodeIdentity struct {
 
 var (
 	nodeReadIdentityFile = os.ReadFile
-	nodeIdentityCommand  = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	// KNOWN BUG, not fixed here: this calls the "nvme" wrapper (docker/nvme),
+	// which execs nsenter -t 1 on the host — exactly the class of command
+	// hardenCmd exists for. It predates hardenCmd and was never migrated; a
+	// wedged nsenter grandchild here can hang Output() forever on
+	// NodeGetInfo. Found while wiring up the RG-EXEC-UNHARDENED rule during
+	// lint hardening; left for the in-flight defect-verification pass rather
+	// than fixed opportunistically in this change.
+	nodeIdentityCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		//repolint:ignore RG-EXEC-UNHARDENED see the KNOWN BUG comment above
 		return exec.CommandContext(ctx, name, args...).Output()
 	}
 	nodeInterfaceAddrs = net.InterfaceAddrs

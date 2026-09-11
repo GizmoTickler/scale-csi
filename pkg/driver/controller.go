@@ -219,7 +219,7 @@ func snapshotBlocksVolumeDeletion(snap *truenas.Snapshot) bool {
 	}
 	// Internal-resource is safe to inspect on the 26.0 flat read path: datasets
 	// never carry this snapshot-only property, so it cannot be inherited.
-	if prop, ok := snap.UserProperties[PropInternalResource]; ok && prop.Value == "true" {
+	if prop, ok := snap.UserProperties[PropInternalResource]; ok && prop.Value == "true" { //nolint:gocritic // snapshot-only property (csi_internal_resource is never set on a dataset, so it cannot be inherited onto a snapshot — see the preceding comment)
 		return true
 	}
 	return isCSISnapshot(snap)
@@ -229,7 +229,7 @@ func isInternalCloneSourceSnapshot(snap *truenas.Snapshot) bool {
 	if snap == nil || isSnapshotTombstone(snap) || !strings.HasPrefix(snap.Name, "clone-source-") {
 		return false
 	}
-	prop, ok := snap.UserProperties[PropInternalResource]
+	prop, ok := snap.UserProperties[PropInternalResource] //nolint:gocritic // same snapshot-only property as snapshotBlocksVolumeDeletion; cannot be inherited
 	return ok && prop.Value == "true"
 }
 
@@ -255,7 +255,7 @@ func isCSISnapshot(snap *truenas.Snapshot) bool {
 	if snap == nil || isSnapshotTombstone(snap) {
 		return false
 	}
-	_, hasCSIName := snap.UserProperties[PropCSISnapshotName]
+	_, hasCSIName := snap.UserProperties[PropCSISnapshotName] //nolint:gocritic // presence-only check (hasCSIName), further gated below by isLocalUserPropertySource on the 26.0 flat read path
 	if snap.ResourceQuery {
 		// The 26.0 API cannot distinguish local from inherited values.
 		// csi_snapshot_name is snapshot-only, while managed_resource inherits
@@ -270,7 +270,7 @@ func isCSISnapshot(snap *truenas.Snapshot) bool {
 	// rule snapshotMatchesRetainedTombstoneIdentity already applies). Trusting
 	// it wedged DeleteVolume behind the dependent-snapshot guard for every
 	// scheduled snapshot on a legacy read.
-	managedProp := snap.UserProperties[PropManagedResource]
+	managedProp := snap.UserProperties[PropManagedResource] //nolint:gocritic // inlines the exact Source=='local' check the accessors perform (see the preceding comment on the legacy-read wedge this fixed)
 	managed := managedProp.Value == "true" &&
 		(managedProp.Source == "" || isLocalUserPropertySource(managedProp.Source))
 	return managed || hasCSIName
@@ -343,7 +343,7 @@ func snapshotHandleShortName(handle string) string {
 func snapshotCSIHandle(snap *truenas.Snapshot) string {
 	shortName := snapshotShortName(snap)
 	if snap != nil && shortName != "" {
-		if property, ok := snap.UserProperties[PropCSISnapshotHandle]; ok {
+		if property, ok := snap.UserProperties[PropCSISnapshotHandle]; ok { //nolint:gocritic // snapshot handle is validated against the derived short name immediately below; a mismatched or inherited value cannot pass parseQualifiedSnapshotHandle's stampedShort comparison
 			if _, stampedShort, valid := parseQualifiedSnapshotHandle(property.Value); valid && stampedShort == shortName {
 				return property.Value
 			}
@@ -446,7 +446,7 @@ func snapshotCarriesLiveCSIIdentity(snap *truenas.Snapshot) bool {
 	if snap == nil {
 		return false
 	}
-	property, ok := snap.UserProperties[PropCSISnapshotName]
+	property, ok := snap.UserProperties[PropCSISnapshotName] //nolint:gocritic // result is validated against sanitizeVolumeID(...) == snapshotShortName(snap) below; an inherited value cannot pass
 	if !ok || property.Value == "" || property.Value == "-" {
 		return false
 	}
@@ -2351,7 +2351,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 
 		// Skip if not managed by CSI (compatibility safeguard; the listing
 		// already filtered on the managed stamp).
-		if prop, propOK := ds.UserProperties[PropManagedResource]; !propOK || prop.Value != "true" {
+		if prop, propOK := ds.UserProperties[PropManagedResource]; !propOK || prop.Value != "true" { //nolint:gocritic // compatibility pre-filter only ('the listing already filtered on the managed stamp' per the preceding comment); not the authoritative check
 			continue
 		}
 
@@ -2604,8 +2604,8 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		// Identity properties are only compared when present: snapshots created
 		// before they were introduced lack them, and dataset+name equality
 		// already establishes same-source for those.
-		originalName, hasName := existing.UserProperties[PropCSISnapshotName]
-		originalSource, hasSource := existing.UserProperties[PropCSISnapshotSourceVolumeID]
+		originalName, hasName := existing.UserProperties[PropCSISnapshotName]               //nolint:gocritic // identity comparison is symmetric and only tightens the AlreadyExists check (hasName/value mismatch), never used to grant identity
+		originalSource, hasSource := existing.UserProperties[PropCSISnapshotSourceVolumeID] //nolint:gocritic // identity comparison is symmetric and only tightens the AlreadyExists check (hasSource/value mismatch), never used to grant identity
 		if !isCSISnapshot(existing) || existing.Dataset != datasetName ||
 			(hasName && originalName.Value != name) ||
 			(hasSource && originalSource.Value != sourceVolumeID) {
@@ -2891,7 +2891,7 @@ func snapshotCarriesInstanceIdentity(snap *truenas.Snapshot, instanceID string) 
 	if snap == nil || instanceID == "" {
 		return false
 	}
-	property, ok := snap.UserProperties[PropDriverInstanceID]
+	property, ok := snap.UserProperties[PropDriverInstanceID] //nolint:gocritic // instance-ID comparison only narrows a retained-identity match; an inherited value cannot equal a live instanceID it wasn't stamped with
 	return ok && property.Value == instanceID
 }
 
@@ -3560,7 +3560,7 @@ func buildSnapshotListEntry(snap *truenas.Snapshot, sourceVolumeFilter string) *
 	}
 
 	sourceVolumeID := ""
-	if prop, ok := snap.UserProperties[PropCSISnapshotSourceVolumeID]; ok {
+	if prop, ok := snap.UserProperties[PropCSISnapshotSourceVolumeID]; ok { //nolint:gocritic // legacy-snapshot fallback: value is used only when present, else derived from snap.Dataset, per the surrounding comment
 		sourceVolumeID = prop.Value
 	} else if snap.Dataset != "" {
 		// Legacy snapshots predate the source property, but the source volume is
@@ -3767,7 +3767,7 @@ func mirrorUserProperties(ds *truenas.Dataset, properties map[string]string) {
 		ds.UserProperties = make(map[string]truenas.UserProperty, len(properties))
 	}
 	for key, value := range properties {
-		ds.UserProperties[key] = truenas.UserProperty{Value: value, Source: "local"}
+		ds.UserProperties[key] = truenas.UserProperty{Value: value, Source: "local"} //nolint:gocritic // mirrorUserProperties mirrors a value THIS call just wrote and had DatasetSetUserProperties accept — see the doc comment on setDatasetUserProperties; not a read of untrusted backend state
 	}
 }
 
@@ -4084,7 +4084,7 @@ func (d *Driver) scrubInheritedCloneProperties(ctx context.Context, ds *truenas.
 	present := make([]string, 0, len(inheritedProtocolPropertyKeys)+1)
 	if knownProtocol {
 		for _, key := range inheritedProtocolPropertyKeys {
-			property, ok := ds.UserProperties[key]
+			property, ok := ds.UserProperties[key] //nolint:gocritic // iterates a fixed key allowlist (inheritedProtocolPropertyKeys) purely to decide which keys to strip; not an identity/trust decision
 			if !ok {
 				continue
 			}
@@ -4099,7 +4099,7 @@ func (d *Driver) scrubInheritedCloneProperties(ctx context.Context, ds *truenas.
 		}
 	}
 	// H1: unconditional, source-independent. See the doc comment.
-	if _, stamped := ds.UserProperties[PropZFSPerformanceClass]; stamped {
+	if _, stamped := ds.UserProperties[PropZFSPerformanceClass]; stamped { //nolint:gocritic // H1: unconditional, source-independent by design — see the preceding comment
 		present = append(present, PropZFSPerformanceClass)
 	}
 	if len(present) == 0 {

@@ -691,7 +691,7 @@ var (
 	// Quarantining lets the rest of the cluster reach strict-mode readiness
 	// instead of being held down by one volume, so this gauge — reset then
 	// re-set every pass like volumeQuotaBytes above — is what makes the
-	// blocking volume identifiable without log archaeology. An empty result
+	// blocking volume identifiable without log archeology. An empty result
 	// (no series) means nothing is currently quarantined.
 	startupFencingUnconvergedVolumes = regGaugeVec(
 		prometheus.GaugeOpts{

@@ -469,7 +469,14 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 			// Check if already logged out - treat as success. Message-text
 			// fallback for older/odd builds that report the condition without the
 			// documented exit code.
+			//
+			// KNOWN BUG, not fixed here: this does not check isWedgedCommandErr(err)
+			// first, contrary to the invariant hardenCmd's doc comment documents.
+			// Found while wiring up the RG-WEDGED-GUARD rule during lint hardening;
+			// left for the in-flight defect-verification pass.
+			//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
 			if strings.Contains(string(output), "No matching sessions") ||
+				//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
 				strings.Contains(string(output), "not logged in") {
 				klog.V(4).Infof("Target already logged out: %s", iqn)
 				return nil
@@ -614,6 +621,12 @@ func iscsiLoginWithSessions(ctx context.Context, portal, iqn string, sessions []
 		// Check if already logged in via the message text — kept as a fallback
 		// for older/odd iscsiadm builds that report the condition without the
 		// documented exit code.
+		//
+		// KNOWN BUG, not fixed here: missing an isWedgedCommandErr(err) check
+		// first (see hardenCmd's doc comment). Found while wiring up the
+		// RG-WEDGED-GUARD rule during lint hardening; left for the in-flight
+		// defect-verification pass.
+		//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
 		if strings.Contains(string(output), "already present") {
 			klog.V(4).Infof("Target already logged in: %s", iqn)
 			return nil

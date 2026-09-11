@@ -489,7 +489,7 @@ func validatePublicationCompatibility(records map[string]publicationRecord, requ
 // migration" case, which must keep blocking as before — both nodes are live
 // there, so this correctly returns false).
 func stalePublishedRecordNode(records map[string]publicationRecord, liveNodes map[string]struct{}) (string, bool) {
-	for _, record := range records {
+	for _, record := range records { //nolint:gocritic // records is a map (values aren't addressable); bounded by live cluster node count, not a hot loop
 		if record.State != publicationStatePublished {
 			continue
 		}

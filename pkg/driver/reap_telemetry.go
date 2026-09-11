@@ -201,7 +201,7 @@ func inspectTombstoneReapRecord(ds *truenas.Dataset, instanceID string) (*tombst
 	if ds == nil {
 		return nil, reapRecordAbsent
 	}
-	property, ok := ds.UserProperties[PropTombstoneReapLast]
+	property, ok := ds.UserProperties[PropTombstoneReapLast] //nolint:gocritic // gated immediately below by reapRecordPropertyAuthentic(property.Source); an inherited record is rejected there
 	if !ok || !reapRecordPropertyAuthentic(property.Source) {
 		return nil, reapRecordAbsent
 	}

@@ -34,7 +34,20 @@ linters:
       disabled-checks:
         - whyNoLint
         - hugeParam  # CSI structs can be large
+      settings:
+        ruleguard:
+          # Repo-specific bug-class rules (see hack/ruleguard/rules.go for the
+          # full rationale behind each one). Loaded in addition to gocritic's
+          # built-in checks; "style" tag above is what activates the ruleguard
+          # meta-checker itself.
+          rules: "${base-path}/hack/ruleguard/rules.go"
+          failOn: dsl
   exclusions:
+    paths:
+      # A ruleguard rules file's "rule" functions are matcher definitions, not
+      # code that is ever called — nothing here should be linted as if it were
+      # application logic (e.g. `unused` on the rule funcs).
+      - hack/ruleguard/
     presets:
       - std-error-handling
       - common-false-positives
@@ -49,6 +62,19 @@ linters:
         linters:
           - errcheck
           - gocritic
+      # pkg/truenas owns the Dataset/Snapshot types and legitimately builds and
+      # decodes their raw UserProperties map (wire decode, projection, mock
+      # backend state). The RG-USERPROPS-RAW rule targets pkg/driver, where
+      # decoded properties are read back out and trusted for identity/deletion
+      # decisions — see hack/ruleguard/rules.go.
+      - path: pkg/truenas/
+        linters:
+          - gocritic
+        text: "RG-USERPROPS-RAW"
+      - path: pkg/driver/share\.go
+        linters:
+          - gocritic
+        text: "RG-USERPROPS-RAW"
 
 formatters:
   enable:

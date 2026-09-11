@@ -71,7 +71,7 @@ func (d *Driver) nfsPublishContext() (map[string]string, error) {
 func (d *Driver) ensureNFSShareExists(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string) error {
 	// A replicated dataset can retain the user property while the TrueNAS
 	// configuration database no longer contains the referenced share.
-	if prop, ok := ds.UserProperties[PropNFSShareID]; ok && prop.Value != "" && prop.Value != "-" {
+	if prop, ok := ds.UserProperties[PropNFSShareID]; ok && prop.Value != "" && prop.Value != "-" { //nolint:gocritic // stored ID is treated as a cache, never as ownership proof — resolveNFSShare's doc comment — verified below via NFSShareGet + nfsShareReferencesPath
 		shareID, err := strconv.Atoi(prop.Value)
 		if err != nil || shareID <= 0 {
 			return status.Errorf(codes.Internal, "invalid NFS share ID %q for %s", prop.Value, datasetName)

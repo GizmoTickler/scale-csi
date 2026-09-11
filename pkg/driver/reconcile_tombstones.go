@@ -168,8 +168,8 @@ func snapshotMatchesRetainedTombstoneIdentity(snap *truenas.Snapshot, instanceID
 	if snap == nil || instanceID == "" {
 		return false
 	}
-	original, hasOriginal := snap.UserProperties[PropCSISnapshotName]
-	instance, hasInstance := snap.UserProperties[PropDriverInstanceID]
+	original, hasOriginal := snap.UserProperties[PropCSISnapshotName]  //nolint:gocritic // presence-only check to decide whether identity properties are available at all; comparison, not trust of an inherited value
+	instance, hasInstance := snap.UserProperties[PropDriverInstanceID] //nolint:gocritic // presence-only check to decide whether identity properties are available at all; comparison, not trust of an inherited value
 	if !hasOriginal || original.Value == "" || original.Value == "-" ||
 		!hasInstance || instance.Value != instanceID {
 		return false
@@ -441,7 +441,7 @@ func (b *tombstoneRetirementBatch) flush(ctx context.Context, d *Driver, parent 
 	if parent != nil {
 		parentKeys = nil
 		for _, key := range keys {
-			if property, ok := parent.UserProperties[key]; ok && isLocalUserPropertySource(property.Source) {
+			if property, ok := parent.UserProperties[key]; ok && isLocalUserPropertySource(property.Source) { //nolint:gocritic // inlines the exact isLocalUserPropertySource check the accessors perform
 				parentKeys = append(parentKeys, key)
 			}
 		}

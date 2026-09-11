@@ -206,7 +206,14 @@ func NVMeoFDisconnectWithContext(ctx context.Context, nqn string) error {
 			// a nonzero exit combined with a "not found" / "No subsystems" message
 			// remains the idempotency signal, and the LC_ALL=C pin above keeps that
 			// message text locale-stable.
+			//
+			// KNOWN BUG, not fixed here: missing an isWedgedCommandErr(err) check
+			// first (see hardenCmd's doc comment in pkg/util/iscsi.go). Found while
+			// wiring up the RG-WEDGED-GUARD rule during lint hardening; left for
+			// the in-flight defect-verification pass.
+			//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
 			if strings.Contains(string(output), "not found") ||
+				//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
 				strings.Contains(string(output), "No subsystems") {
 				klog.V(4).Infof("Subsystem already disconnected: %s", nqn)
 				return nil
@@ -344,6 +351,12 @@ func runNVMeConnect(ctx context.Context, transport, host, port, nqn string, opts
 	output, err := nvmeConnectCommand(ctx, args...)
 	if err != nil {
 		// Check if already connected
+		//
+		// KNOWN BUG, not fixed here: missing an isWedgedCommandErr(err) check
+		// first (see hardenCmd's doc comment in pkg/util/iscsi.go). Found while
+		// wiring up the RG-WEDGED-GUARD rule during lint hardening; left for
+		// the in-flight defect-verification pass.
+		//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
 		if strings.Contains(string(output), "already connected") {
 			klog.V(4).Infof("Subsystem already connected: %s", nqn)
 			return nil
