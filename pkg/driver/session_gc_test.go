@@ -643,12 +643,9 @@ func TestSessionGC_ProtocolEnabling(t *testing.T) {
 	})
 
 	t.Run("Default protocol enabling based on configuration", func(t *testing.T) {
-		// When ISCSIEnabled/NVMeoFEnabled are nil, defaults are based on protocol config
+		// SessionGC is left unset: ISCSIEnabled/NVMeoFEnabled default to nil,
+		// so defaults are based on protocol config.
 		cfg := &Config{
-			SessionGC: SessionGCConfig{
-				ISCSIEnabled:  nil,
-				NVMeoFEnabled: nil,
-			},
 			ISCSI: ISCSIConfig{
 				TargetPortal: "", // Not configured
 			},
