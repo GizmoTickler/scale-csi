@@ -51,7 +51,7 @@ func GetMountInfoWithContext(ctx context.Context, target string) (MountInfo, err
 	}
 	defer cancel()
 
-	output, err := exec.CommandContext(
+	cmd := exec.CommandContext(
 		ctx,
 		"findmnt",
 		"--first-only",
@@ -60,7 +60,9 @@ func GetMountInfoWithContext(ctx context.Context, target string) (MountInfo, err
 		"SOURCE,FSTYPE,OPTIONS",
 		"--mountpoint",
 		target,
-	).Output()
+	)
+	hardenCmd(cmd)
+	output, err := cmd.Output()
 	if err != nil {
 		return MountInfo{}, fmt.Errorf("failed to inspect mountpoint %s: %w", target, err)
 	}
@@ -139,6 +141,7 @@ func IsMountedWithContext(ctx context.Context, path string) (bool, error) {
 
 	// Use findmnt to check mount status
 	cmd := exec.CommandContext(ctx, "findmnt", "--mountpoint", path, "--noheadings")
+	hardenCmd(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 means not mounted
@@ -183,6 +186,7 @@ func MountWithContext(ctx context.Context, source, target, fsType string, option
 	args = append(args, source, target)
 
 	cmd := exec.CommandContext(ctx, "mount", args...)
+	hardenCmd(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mount failed: %w, output: %s", err, string(output))
@@ -229,6 +233,7 @@ func BindMountWithContext(ctx context.Context, source, target string, options []
 	args = append(args, source, target)
 
 	cmd := exec.CommandContext(ctx, "mount", args...)
+	hardenCmd(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("bind mount failed: %w, output: %s", err, string(output))
@@ -238,6 +243,7 @@ func BindMountWithContext(ctx context.Context, source, target string, options []
 	// util-linux versions. The ro flag on the initial bind is otherwise ignored.
 	if containsMountOption(options, "ro") {
 		cmd = exec.CommandContext(ctx, "mount", "-o", "remount,bind,ro", target)
+		hardenCmd(cmd)
 		output, err = cmd.CombinedOutput()
 		if err != nil {
 			remountErr := fmt.Errorf("read-only bind remount failed: %w, output: %s", err, string(output))
@@ -291,6 +297,7 @@ func UnmountWithContext(ctx context.Context, target string) error {
 		defer cancel()
 
 		cmd := exec.CommandContext(cmdCtx, "umount", target)
+		hardenCmd(cmd)
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil
@@ -306,6 +313,7 @@ func UnmountWithContext(ctx context.Context, target string) error {
 			}
 			klog.Warningf("Regular unmount of network filesystem %s (%s) failed, trying lazy unmount: %v", target, fsType, unmountErr)
 			cmd = exec.CommandContext(cmdCtx, "umount", "-l", target)
+			hardenCmd(cmd)
 			if lazyOutput, lazyErr := cmd.CombinedOutput(); lazyErr != nil {
 				return errors.Join(
 					unmountErr,
@@ -329,7 +337,9 @@ func getMountFilesystemType(target string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
-	output, err := exec.CommandContext(ctx, "findmnt", "-n", "-o", "FSTYPE", "--mountpoint", target).Output()
+	findmntCmd := exec.CommandContext(ctx, "findmnt", "-n", "-o", "FSTYPE", "--mountpoint", target)
+	hardenCmd(findmntCmd)
+	output, err := findmntCmd.Output()
 	if err != nil {
 		findmntErr := fmt.Errorf("failed to query mount filesystem type with findmnt: %w", err)
 		if isNFSMountSource(entry.source) {
@@ -474,6 +484,7 @@ func FormatDeviceWithContext(ctx context.Context, devicePath, fsType string) err
 	case "btrfs":
 		cmd = exec.CommandContext(ctx, "mkfs.btrfs", "-f", devicePath)
 	}
+	hardenCmd(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -519,6 +530,7 @@ func GetFilesystemTypeWithContext(ctx context.Context, devicePath string) (strin
 	// exit code 2 only means "nothing recognized" when blkid produced no
 	// output at all.
 	cmd := exec.CommandContext(ctx, "blkid", "-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", devicePath)
+	hardenCmd(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -626,6 +638,7 @@ func ResizeFilesystemWithContext(ctx context.Context, mountPath string) error {
 	default:
 		return fmt.Errorf("resize not supported for filesystem type: %s", fsType)
 	}
+	hardenCmd(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -650,6 +663,7 @@ func GetDeviceFromMountPointWithContext(ctx context.Context, mountPath string) (
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "findmnt", "--first-only", "-n", "-o", "SOURCE", mountPath)
+	hardenCmd(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to find device: %w", err)
@@ -671,6 +685,7 @@ func GetMountedBlockDevices() (map[string]string, error) {
 	// Use findmnt to list all block device mounts
 	// -n: no headers, -l: list format, -o: output columns
 	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-l", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs")
+	hardenCmd(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 with empty output means no mounts found (not an error)

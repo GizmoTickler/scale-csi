@@ -1687,3 +1687,79 @@ func TestISCSIDisconnectUnknownExitCodeStillFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "logout failed")
 	assert.Contains(t, err.Error(), "exit status 1")
 }
+
+// TestHardenCmdBoundsWaitOnWedgedDescendant is the N7 regression. Host-tool
+// wrapper scripts (docker/nvme, docker/iscsiadm) run their target binary via
+// nsenter/chroot from a forked child; exec.CommandContext's default Cancel
+// (SIGKILL to cmd.Process alone) only reaches that direct child. A
+// backgrounded grandchild that inherited the stdout/stderr pipe survives and
+// keeps the pipe open, so Wait/Output/CombinedOutput blocks until IT exits --
+// unrelated to the command's own context deadline. That wedges the
+// node:<volumeID> operation lock forever (acquireOperationLock has no TTL),
+// draining the gRPC worker pool one hung volume at a time.
+//
+// `sh -c "sleep N & wait $!"` reproduces the shape exactly: `sleep` is forked
+// (not exec'd) by sh, so it independently holds the inherited pipe fds
+// regardless of sh's own lifetime.
+func TestHardenCmdBoundsWaitOnWedgedDescendant(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	newWedgingCmd := func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "sleep 5 & wait $!")
+	}
+
+	t.Run("without hardenCmd the direct-child-only kill leaves Wait blocked", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		cmd := newWedgingCmd(ctx)
+
+		done := make(chan struct{})
+		go func() {
+			_, _ = cmd.CombinedOutput()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			t.Fatal("expected CombinedOutput to still be blocked shortly after the context deadline without hardenCmd")
+		case <-time.After(800 * time.Millisecond):
+			// Expected: still wedged, proving the fixture genuinely
+			// reproduces the pipe-holding grandchild -- the orphaned `sleep`
+			// exits on its own shortly after (well within the test binary's
+			// lifetime).
+		}
+	})
+
+	t.Run("with hardenCmd Wait returns within the grace period", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		cmd := newWedgingCmd(ctx)
+		hardenCmd(cmd)
+		cmd.WaitDelay = 500 * time.Millisecond // keep the test fast regardless of the production default
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := cmd.CombinedOutput()
+			done <- err
+		}()
+
+		select {
+		case err := <-done:
+			t.Logf("command returned (process-group kill and/or WaitDelay unblocked Wait): %v", err)
+		case <-time.After(3 * time.Second):
+			t.Fatal("Cmd.Wait hung past the context deadline plus the WaitDelay grace period; hardenCmd is not bounding a wedged descendant")
+		}
+	})
+}
+
+// TestIsWedgedCommandErr locks in the sentinel used to keep a WaitDelay
+// timeout from being misclassified as an idempotent "not found"/"no session"
+// no-op (see hardenCmd's doc comment and the N2 fail-closed NodeUnstageVolume
+// logic that depends on genuine failures being distinguishable).
+func TestIsWedgedCommandErr(t *testing.T) {
+	assert.True(t, isWedgedCommandErr(fmt.Errorf("wrapped: %w", exec.ErrWaitDelay)))
+	assert.False(t, isWedgedCommandErr(errors.New("logout failed: exit status 1")))
+	assert.False(t, isWedgedCommandErr(nil))
+}
