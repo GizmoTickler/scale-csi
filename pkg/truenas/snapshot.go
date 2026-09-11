@@ -237,8 +237,17 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userP
 	// The original intent of 24f754c survives intact: a stamp is never
 	// FABRICATED. We only ever report success when something we read back said
 	// the property is there with the value we asked for.
-	snap, err := c.snapshotCreateCall(ctx, prefix, params)
+	snap, created, err := c.snapshotCreateCallObserved(ctx, prefix, params)
 	if err == nil {
+		if !created {
+			// Resolved from already-exists: this call created nothing, so it
+			// proves nothing about inline-property support. Do NOT record a
+			// verdict -- leave the probe unresolved so the next create can
+			// take a real measurement.
+			c.snapshotCreatePropertiesMu.Unlock()
+			klog.V(4).Infof("Snapshot %s@%s already existed; leaving the inline-property probe unresolved rather than drawing a verdict from an object this call did not create", dataset, name)
+			return snap, nil
+		}
 		if snapshotReflectsLocalProperties(snap, userProperties) {
 			if c.snapshotCreatePropertiesSupport == nil {
 				c.snapshotCreatePropertiesSupport = make(map[string]bool)
@@ -250,8 +259,22 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userP
 		// The response did not reflect them. Ask the appliance before
 		// concluding anything: on 26.0 this is the NORMAL path, not the
 		// failure path.
-		if fresh, readErr := c.SnapshotGet(ctx, dataset+"@"+name); readErr == nil &&
-			snapshotCarriesRequestedProperties(fresh, userProperties) {
+		fresh, readErr := c.SnapshotGet(ctx, dataset+"@"+name)
+		if readErr != nil {
+			// NOTHING WAS PROVEN. A transient read failure -- a blip, a
+			// context deadline, an open circuit breaker, a busy appliance --
+			// is not evidence of a silent drop. Latching a verdict here was a
+			// reproduced outage: one failed read poisoned
+			// snapshotCreatePropertiesSupport for the whole process (there is
+			// no TTL and no re-probe), routing every later CreateSnapshot into
+			// SnapshotSetUserProperty, which correctly refuses on 26.0. Leave
+			// the probe unresolved and return the snapshot the create made, so
+			// the next create measures again.
+			c.snapshotCreatePropertiesMu.Unlock()
+			klog.Warningf("Snapshot create for %s@%s could not be verified (read-back failed: %v); leaving inline-property support unresolved rather than assuming a silent drop", dataset, name, readErr)
+			return snap, nil
+		}
+		if snapshotCarriesRequestedProperties(fresh, userProperties) {
 			if c.snapshotCreatePropertiesSupport == nil {
 				c.snapshotCreatePropertiesSupport = make(map[string]bool)
 			}
@@ -350,16 +373,29 @@ func snapshotCarriesRequestedProperties(snap *Snapshot, want map[string]string) 
 }
 
 func (c *Client) snapshotCreateCall(ctx context.Context, prefix string, params *SnapshotCreateParams) (*Snapshot, error) {
-	result, err := c.Call(ctx, prefix+".create", params)
-	if err != nil {
-		// Ignore "already exists" errors
-		if IsAlreadyExistsError(err) {
-			return c.SnapshotGet(ctx, params.Dataset+"@"+params.Name)
-		}
-		return nil, fmt.Errorf("failed to create snapshot: %w", err)
-	}
+	snap, _, err := c.snapshotCreateCallObserved(ctx, prefix, params)
+	return snap, err
+}
 
-	return parseSnapshot(result)
+// snapshotCreateCallObserved additionally reports whether the returned snapshot
+// was RESOLVED from an already-exists error rather than created by this call.
+//
+// That distinction is load-bearing for the inline-property probe: an object this
+// call did not create says nothing about whether THIS backend honors inline
+// create properties. Treating a pre-existing (possibly unstamped) snapshot as
+// probe evidence latches "inline properties unsupported" for the process from a
+// measurement that was never taken.
+func (c *Client) snapshotCreateCallObserved(ctx context.Context, prefix string, params *SnapshotCreateParams) (snap *Snapshot, created bool, err error) {
+	result, callErr := c.Call(ctx, prefix+".create", params)
+	if callErr != nil {
+		if IsAlreadyExistsError(callErr) {
+			existing, getErr := c.SnapshotGet(ctx, params.Dataset+"@"+params.Name)
+			return existing, false, getErr
+		}
+		return nil, false, fmt.Errorf("failed to create snapshot: %w", callErr)
+	}
+	parsed, parseErr := parseSnapshot(result)
+	return parsed, parseErr == nil, parseErr
 }
 
 func (c *Client) snapshotCreateThenSetProperties(
@@ -387,6 +423,14 @@ func (c *Client) snapshotCreateThenSetProperties(
 		// predicate that later trusts the stamp. On 26.0 (or when the API
 		// generation cannot be determined), this now returns a loud error
 		// instead of pretending.
+		// Defense in depth: if the property is ALREADY there with the value we
+		// want, there is nothing to write, and calling the 26.0-refusing
+		// setter would turn a satisfied state into a hard failure. This is
+		// what makes a leftover stamped snapshot recoverable instead of
+		// permanently poisoning the volume's snapshot name.
+		if existing, ok := snap.UserProperties[key]; ok && existing.Value == userProperties[key] {
+			continue
+		}
 		if err := c.SnapshotSetUserProperty(ctx, snap.ID, key, userProperties[key]); err != nil {
 			return nil, fmt.Errorf("failed to set snapshot property %q after create: %w", key, err)
 		}

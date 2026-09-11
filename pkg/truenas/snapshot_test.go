@@ -608,6 +608,27 @@ func TestSnapshotCreateThenSetPropertiesRefusesOnTrueNAS26(t *testing.T) {
 // PropDriverInstanceID, PropCSISnapshotHandle, ...) — invisible until some
 // later ownership/orphan/tombstone predicate silently failed to recognize
 // its own snapshot.
+// TestSnapshotCreateSilentPropertyDropOnTrueNAS26RefusesRatherThanFabricatesStamp
+// is the NEGATIVE control for the fresh-read oracle: the create response omits
+// the properties AND a SUCCESSFUL fresh read shows they are genuinely absent.
+// Only then is refusing correct.
+//
+// The previous version of this test was vacuous and actively harmful. It mocked
+// the resource query as an empty list, so SnapshotGet returned "not found" and
+// the test drove the read-ERROR branch, never invoking the predicate at all --
+// while asserting that a failed read should latch "unsupported". That is a
+// reproduced outage (one transient blip poisons the process for its lifetime),
+// so the old test locked in the bug. The mock was also incoherent: a snapshot
+// that had just been created successfully reported not-found.
+//
+// TAUTOLOGY DISCLOSURE: this passes on BOTH sides of the fix, deliberately. It
+// is a counter-test asserting that the genuine-drop behavior did NOT change
+// while the read-error behavior did. Its value is that it now exercises the
+// read-VERDICT branch (successful read, key absent) instead of the read-ERROR
+// branch it used to hit by accident. Proof of the fix lives in
+// TestSnapshotCreateReadBackFailureLeavesTheProbeUnresolved and
+// TestSnapshotCreateAlreadyExistsDoesNotDecideTheProbe, both of which fail
+// pre-fix.
 func TestSnapshotCreateSilentPropertyDropOnTrueNAS26RefusesRatherThanFabricatesStamp(t *testing.T) {
 	resetSnapshotAPIPrefix()
 	mock := newMockWSServer()
@@ -625,17 +646,23 @@ func TestSnapshotCreateSilentPropertyDropOnTrueNAS26RefusesRatherThanFabricatesS
 			case "pool.snapshot.query":
 				resp.Result = []interface{}{}
 			case snapshotResourceQueryMethod:
-				resp.Result = []interface{}{} // 26.0: resource API is present
+				// The snapshot EXISTS and the read SUCCEEDS -- it simply does
+				// not carry the requested key. This is the genuine drop.
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"id": "tank/csi/source@snap1", "name": "tank/csi/source@snap1",
+						"snapshot_name": "snap1", "dataset": "tank/csi/source",
+						"user_properties": map[string]interface{}{
+							"scale-csi:some_other_key": "unrelated",
+						},
+					},
+				}
 			case "pool.snapshot.create":
 				createCalls.Add(1)
-				// EXACT live-captured shape: success, but "properties" omits
-				// the requested custom key entirely — only the two ZFS-native
-				// properties TrueNAS always reports are present.
 				resp.Result = map[string]interface{}{
 					"id": "tank/csi/source@snap1", "name": "snap1", "dataset": "tank/csi/source",
 					"properties": map[string]interface{}{
 						"createtxg": map[string]interface{}{"value": "1", "source": "NONE"},
-						"creation":  map[string]interface{}{"value": "1789147802", "source": "NONE"},
 					},
 				}
 			case "pool.snapshot.update", "zfs.resource.snapshot.update":
@@ -653,11 +680,200 @@ func TestSnapshotCreateSilentPropertyDropOnTrueNAS26RefusesRatherThanFabricatesS
 	properties := map[string]string{"truenas-csi:managed_resource": "true"}
 
 	snap, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "snap1", properties)
-	require.Error(t, err, "a create response that silently omits the requested properties must not be trusted as proof of persistence")
+	require.Error(t, err, "a property that a successful fresh read proves absent is a genuine silent drop and must not be reported as persisted")
 	assert.Nil(t, snap)
 	assert.Contains(t, err.Error(), "unsupported")
 	assert.Equal(t, int32(2), createCalls.Load(),
-		"must retry via the verified post-create path (idempotent re-create then SnapshotSetUserProperty), not just accept the first response")
+		"must retry via the verified post-create path, not accept the first response")
+}
+
+// TestSnapshotCreateReadBackFailureLeavesTheProbeUnresolved is the regression
+// test for a reproduced outage in the fresh-read oracle itself.
+//
+// A read-back that FAILS proves nothing. Latching "inline properties
+// unsupported" from it poisoned snapshotCreatePropertiesSupport for the entire
+// process -- there is no TTL and no re-probe -- so every later CreateSnapshot
+// routed into SnapshotSetUserProperty, which correctly refuses on 26.0. One
+// transient blip therefore failed every subsequent snapshot permanently, and
+// left unstamped snapshots behind that make the CO's retries fail with
+// AlreadyExists across controller restarts.
+func TestSnapshotCreateReadBackFailureLeavesTheProbeUnresolved(t *testing.T) {
+	resetSnapshotAPIPrefix()
+	mock := newMockWSServer()
+	var createCalls, readCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case snapshotResourceQueryMethod:
+				// First read-back fails transiently; later reads succeed and
+				// show the properties present, as a healthy 26.0 does.
+				if readCalls.Add(1) == 1 {
+					resp.Error = &rpcError{Code: -32000, Message: "transient backend failure"}
+					break
+				}
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"id": "tank/csi/source@snap2", "name": "tank/csi/source@snap2",
+						"snapshot_name": "snap2", "dataset": "tank/csi/source",
+						"user_properties": map[string]interface{}{
+							"scale-csi:managed_resource": "true",
+						},
+					},
+				}
+			case "pool.snapshot.create":
+				createCalls.Add(1)
+				id := "tank/csi/source@snap1"
+				if createCalls.Load() > 1 {
+					id = "tank/csi/source@snap2"
+				}
+				resp.Result = map[string]interface{}{
+					"id": id, "name": "snap", "dataset": "tank/csi/source",
+					"properties": map[string]interface{}{
+						"createtxg": map[string]interface{}{"value": "1", "source": "NONE"},
+					},
+				}
+			case "pool.snapshot.update", "zfs.resource.snapshot.update":
+				t.Errorf("a failed read-back must not route later creates into the 26.0 no-op update path")
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+	properties := map[string]string{"truenas-csi:managed_resource": "true"}
+
+	// Create #1: read-back fails. Must NOT error and must NOT record a verdict.
+	first, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "snap1", properties)
+	require.NoError(t, err, "a failed read-back is not evidence of a silent drop")
+	require.NotNil(t, first)
+
+	// Create #2 on a perfectly healthy appliance must still succeed. Pre-fix
+	// this failed with "unsupported by the TrueNAS 26.0 resource API".
+	second, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "snap2", properties)
+	require.NoError(t, err, "one transient read failure must not poison every later snapshot in the process")
+	require.NotNil(t, second)
+}
+
+// TestSnapshotCreateAlreadyExistsDoesNotDecideTheProbe pins that a create
+// resolved from already-exists is never used as probe evidence: this call
+// created nothing, so it measured nothing. Drawing a verdict from a
+// pre-existing (possibly unstamped) snapshot latched "unsupported"
+// process-wide with no transient error involved at all.
+func TestSnapshotCreateAlreadyExistsDoesNotDecideTheProbe(t *testing.T) {
+	resetSnapshotAPIPrefix()
+	mock := newMockWSServer()
+	var createCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case snapshotResourceQueryMethod:
+				// A pre-existing, UNSTAMPED snapshot.
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"id": "tank/csi/source@snap1", "name": "tank/csi/source@snap1",
+						"snapshot_name": "snap1", "dataset": "tank/csi/source",
+						"user_properties": map[string]interface{}{},
+					},
+				}
+			case "pool.snapshot.create":
+				if createCalls.Add(1) == 1 {
+					resp.Error = &rpcError{Code: -32602, Message: "snapshot already exists"}
+					break
+				}
+				resp.Result = map[string]interface{}{
+					"id": "tank/csi/source@snap9", "name": "snap9", "dataset": "tank/csi/source",
+					"properties": map[string]interface{}{
+						"scale-csi:managed_resource": map[string]interface{}{"value": "true", "source": "LOCAL"},
+					},
+				}
+			case "pool.snapshot.update", "zfs.resource.snapshot.update":
+				t.Errorf("an already-exists resolution must not route later creates into the 26.0 no-op update path")
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+	properties := map[string]string{"truenas-csi:managed_resource": "true"}
+
+	_, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "snap1", properties)
+	require.NoError(t, err)
+
+	// A real create afterwards must still be able to take a measurement.
+	snap, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "snap9", properties)
+	require.NoError(t, err, "an already-exists resolution must not have decided the probe")
+	require.NotNil(t, snap)
+}
+
+// TestSnapshotCarriesRequestedPropertiesRejectionArms gives the predicate the
+// negative coverage it had none of: instrumentation showed it was called once
+// across the whole package suite and never returned false, so all three
+// rejection arms were untested -- including the proven-foreign-source arm that
+// is the safety valve for 26.0's sourceless flat read.
+//
+// TAUTOLOGY DISCLOSURE: this is a direct unit test of a predicate introduced by
+// the fix, so it cannot fail on a tree that predates the predicate. It is
+// coverage for untested branches, not proof of a defect.
+func TestSnapshotCarriesRequestedPropertiesRejectionArms(t *testing.T) {
+	want := map[string]string{"scale-csi:csi_snapshot_name": "snap1"}
+
+	t.Run("key absent", func(t *testing.T) {
+		assert.False(t, snapshotCarriesRequestedProperties(&Snapshot{
+			UserProperties: map[string]UserProperty{"scale-csi:other": {Value: "x"}},
+		}, want))
+	})
+	t.Run("value mismatch", func(t *testing.T) {
+		assert.False(t, snapshotCarriesRequestedProperties(&Snapshot{
+			UserProperties: map[string]UserProperty{"scale-csi:csi_snapshot_name": {Value: "different"}},
+		}, want))
+	})
+	t.Run("proven foreign source rejected", func(t *testing.T) {
+		assert.False(t, snapshotCarriesRequestedProperties(&Snapshot{
+			UserProperties: map[string]UserProperty{
+				"scale-csi:csi_snapshot_name": {Value: "snap1", Source: "INHERITED"},
+			},
+		}, want), "an inherited value is not proof THIS snapshot was stamped")
+	})
+	t.Run("empty source accepted as unknown", func(t *testing.T) {
+		assert.True(t, snapshotCarriesRequestedProperties(&Snapshot{
+			UserProperties: map[string]UserProperty{
+				"scale-csi:csi_snapshot_name": {Value: "snap1"},
+			},
+		}, want), "26.0's flat read carries no source at all; requiring one would reject every persisted property")
+	})
+	t.Run("legacy spelling folded", func(t *testing.T) {
+		assert.True(t, snapshotCarriesRequestedProperties(&Snapshot{
+			UserProperties: map[string]UserProperty{
+				"scale-csi:csi_snapshot_name": {Value: "snap1", Source: "local"},
+			},
+		}, map[string]string{"truenas-csi:csi_snapshot_name": "snap1"}))
+	})
 }
 
 // TestSnapshotDelete_Success tests deleting a snapshot
