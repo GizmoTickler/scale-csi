@@ -158,9 +158,22 @@ func checkExecScope(pass *analysis.Pass, lc *lineComments, body *ast.BlockStmt) 
 	}
 }
 
+// isHardenCmdCall accepts BOTH the package-local `hardenCmd(cmd)` and the
+// exported cross-package `util.HardenCmd(cmd)`. Matching only the unexported
+// spelling produced four false positives the moment the helper was exported so
+// pkg/driver's node-identity seam could reach it -- the rule then reported the
+// one site that had just been FIXED, and three long-hardened ones, as unhardened.
+// A rule that cries wolf on correct code gets suppressed, which is how the
+// defect it guards against comes back.
 func isHardenCmdCall(call *ast.CallExpr) bool {
-	id, ok := call.Fun.(*ast.Ident)
-	return ok && id.Name == "hardenCmd"
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name == "hardenCmd" || fn.Name == "HardenCmd"
+	case *ast.SelectorExpr:
+		// e.g. util.HardenCmd(cmd) from outside pkg/util.
+		return fn.Sel.Name == "hardenCmd" || fn.Sel.Name == "HardenCmd"
+	}
+	return false
 }
 
 func isExecCommandCall(call *ast.CallExpr) bool {
