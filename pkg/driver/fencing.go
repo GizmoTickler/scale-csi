@@ -482,10 +482,30 @@ func validatePublicationCompatibility(records map[string]publicationRecord, requ
 
 // stalePublishedRecordNode returns the node name of a "published"-state
 // record in records that has NO live VolumeAttachment among liveNodes, plus
-// true. Presence of such a record proves it can only be a stale leftover: a
-// live publication for that node would have kept it out of liveNodes'
-// complement. Returns ("", false) when every published record corresponds to
-// a live attachment (including the ordinary "transient dual-VA state during
+// true. liveNodes is built (see reconcileStartupFencingVolume) from THIS
+// PASS's VolumeAttachment snapshot, filtered to Status.Attached==true with a
+// zero DeletionTimestamp. Absence from that set is evidence the record is a
+// stale leftover, but it is NOT proof: a node can still be genuinely
+// connected and yet fall outside liveNodes — Status.Attached not yet
+// propagated, a non-zero DeletionTimestamp mid-unpublish, or a backend
+// publication write that landed before the VolumeAttachment status update was
+// observed — and would be misclassified as stale by this function alone. The
+// callers that quarantine startup convergence on a "found" result accept that
+// risk deliberately: reconcileStalePublicationRecords independently
+// re-validates liveness (with its own continuous-absence grace period) before
+// a record is ever actually revoked, so a misclassification here only delays
+// convergence rather than granting anything.
+//
+// Also note: this returns the FIRST non-live published record found by (Go's
+// unordered) map iteration, not the specific record that caused the caller's
+// compatibility failure. If records holds more than one non-live entry, an
+// unrelated stale record for a third node can be returned even when the
+// compatibility failure was actually against a live, genuinely conflicting
+// node — masking a real conflict as a stale-record quarantine. This is a
+// known limitation, not yet fixed: callers with more than one non-live
+// candidate should not rely on the returned node being THE blocking one.
+// Returns ("", false) when every published record corresponds to a live
+// attachment (including the ordinary "transient dual-VA state during
 // migration" case, which must keep blocking as before — both nodes are live
 // there, so this correctly returns false).
 func stalePublishedRecordNode(records map[string]publicationRecord, liveNodes map[string]struct{}) (string, bool) {

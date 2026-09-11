@@ -131,8 +131,13 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 	// so a volume that converges on THIS pass drops out of the gauge instead of
 	// latching a stale 1 forever (mirrors ResetVolumeUsageMetrics). Must not run
 	// concurrently with the per-volume Set calls below, which is why it happens
-	// here rather than inside a worker.
+	// here rather than inside a worker. startupReconcileQuarantineCount is reset
+	// the same way and for the same reason: it must report ONLY this pass's
+	// quarantines to startStartupAttachmentReconcile, not an accumulation across
+	// passes (see quarantineStaleStartupFencingVolume and the field's doc comment
+	// in driver.go).
 	ResetStartupFencingUnconvergedVolumes()
+	d.startupReconcileQuarantineCount.Store(0)
 	jobs := make(chan *startupFencingVolume)
 	results := make(chan error, len(volumeIDs))
 	workerCount := startupReconcileWorkers
@@ -207,16 +212,28 @@ func startupNodeIdentity(
 // returns nil so this volume never joins reconcilePublishedAttachments'
 // errors.Join and never holds strict-mode readiness down for every OTHER
 // volume. Mirrors the errGeometryUnestablishable carve-out immediately below
-// in this file, which uses the same log/event/return-nil shape for a
-// different permanent-vs-transient distinction.
+// in this file, which uses the same log/event/return-nil shape, but for a
+// different distinction: that carve-out is PERMANENT (no retry clears it,
+// there is nothing to fence), while this one is a DEFERRAL. This volume's own
+// publication record and backend fence are not written on this pass — the
+// caller returns here before ever reaching that code — so
+// startupReconcileQuarantineCount is incremented below: it is how
+// startStartupAttachmentReconcile's strict branch knows to keep its reconcile
+// goroutine alive on an otherwise-nil-error pass instead of exiting, so that a
+// later requestStartupAttachmentReconcile signal — fired by
+// revokeStalePublicationRecord once the stale record named above is actually
+// revoked — has a live goroutine to wake and retry this volume.
 func (d *Driver) quarantineStaleStartupFencingVolume(volume *startupFencingVolume, staleNode string, cause error) error {
 	klog.Warningf("Startup fencing for volume %s is blocked by a stale publication record for node %s "+
-		"(no live VolumeAttachment); not holding cluster-wide readiness on it, it will clear once "+
-		"fencing.staleRecordGracePeriod elapses: %v", volume.volumeID, staleNode, cause)
+		"(no live VolumeAttachment); not holding cluster-wide readiness on it. This volume's own publication "+
+		"record and backend fence are deferred, not abandoned: convergence is retried automatically once the "+
+		"stale record above is revoked (normally after fencing.staleRecordGracePeriod of continuous absence): %v",
+		volume.volumeID, staleNode, cause)
 	d.recordWarningEvent(volume.pv, "StartupFencingStaleRecordConflict",
 		fmt.Sprintf("startup fencing quarantined (stale publication record for node %s, no live VolumeAttachment): %v",
 			staleNode, cause))
 	RecordStartupFencingUnconverged(volume.volumeID)
+	d.startupReconcileQuarantineCount.Add(1)
 	return nil
 }
 
@@ -512,9 +529,13 @@ func (d *Driver) startStartupAttachmentReconcile() {
 		waitForSignal := false
 		for {
 			if waitForSignal {
-				// A converged additive controller stays idle. A later publish that
-				// must defer fencing signals this channel, allowing retry without a
-				// permanent cluster-wide polling and backend-write loop.
+				// A converged additive controller, or a strict controller with
+				// nothing left but quarantined volumes (C11), stays idle here. A
+				// later publish that must defer fencing (recordFencingDeferred) or
+				// a stale-record revoke that just unblocked a quarantined volume
+				// (revokeStalePublicationRecord) signals this channel, allowing
+				// retry without a permanent cluster-wide polling and backend-write
+				// loop.
 				select {
 				case <-signal:
 					backoff = startupReconcileInitialBackoff
@@ -527,7 +548,25 @@ func (d *Driver) startStartupAttachmentReconcile() {
 			if err == nil {
 				if d.config.Fencing.Mode == FencingModeStrict {
 					d.ready.Store(true)
-					return
+					if d.startupReconcileQuarantineCount.Load() == 0 {
+						// Every volume genuinely converged on this pass: nothing is
+						// deferred, so there is nothing left for this goroutine to
+						// retry. Exiting here (rather than idling forever) is the
+						// original, intended behavior for a fully converged strict
+						// controller.
+						return
+					}
+					// (C11 fix) At least one volume was QUARANTINED rather than
+					// genuinely converged this pass (quarantineStaleStartupFencingVolume
+					// incremented startupReconcileQuarantineCount instead of joining
+					// this pass's errors). Readiness still latches true — that is the
+					// whole point of the carve-out, and must be preserved — but this
+					// goroutine must NOT exit: it is the only thing that will ever
+					// write the quarantined volume's own publication record and
+					// backend fence. Fall through to the shared waitForSignal path
+					// below so the next reconcilePublishedAttachments pass runs when
+					// revokeStalePublicationRecord signals that the stale record
+					// blocking it has been revoked, instead of busy-polling.
 				}
 				waitForSignal = true
 				continue
