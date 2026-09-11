@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -34,7 +35,7 @@ func TestOrphanShareSweepISCSIDeletesFencingInitiatorGroup(t *testing.T) {
 	d.detectOrphanedShares(ctx, kubeState, &report)
 	require.Len(t, report.OrphanShares, 1)
 
-	d.deleteOrphanedShares(ctx, &report, 5)
+	d.deleteOrphanedShares(ctx, &report, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 
 	goneTarget, err := client.ISCSITargetFindByName(ctx, d.iscsiShareName("gone-volume"))
@@ -79,7 +80,7 @@ func TestOrphanShareSweepISCSIInitiatorGroupGatedOnFencing(t *testing.T) {
 	d.detectOrphanedShares(ctx, kubeState, &report)
 	require.Len(t, report.OrphanShares, 1)
 
-	d.deleteOrphanedShares(ctx, &report, 5)
+	d.deleteOrphanedShares(ctx, &report, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 
 	groupIDs := iscsiInitiatorGroupIDs(t, client)
@@ -134,7 +135,7 @@ func TestOrphanShareSweepNVMeoFDeletesPortSubsystemAssociation(t *testing.T) {
 	require.Len(t, report.OrphanShares, 1)
 	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
 
-	d.deleteOrphanedShares(ctx, &report, 5)
+	d.deleteOrphanedShares(ctx, &report, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 
 	assert.Contains(t, mock.associationDeletes, 11, "the orphaned subsystem's port association must be deleted")
@@ -143,4 +144,75 @@ func TestOrphanShareSweepNVMeoFDeletesPortSubsystemAssociation(t *testing.T) {
 	remaining, err := base.NVMeoFSubsystemFindByName(ctx, d.nvmeSubsystemName("pool/parent/gone-volume"))
 	require.NoError(t, err)
 	assert.Nil(t, remaining, "the orphaned subsystem must be deleted")
+}
+
+// TestDeleteOrphanedSharesSharesDeletionCapWithOtherOrphanKinds is the
+// regression test for the first half of C8: deleteOrphanedShares used to
+// police its own independent len(report.DeletedShares) counter against
+// maxPerRun instead of the SAME deletedCount every other orphan kind
+// (snapshots, volumes, tombstones, spent-restores, remnants) shares in
+// deleteDetectedOrphans, so a pass could destroy up to 2x maxPerRun objects.
+// Here deletedCount is passed in already AT the cap (as if
+// deleteDetectedOrphans already spent the whole budget elsewhere this pass),
+// so deleteOrphanedShares must skip every share and record a cap skip for
+// each — not silently delete up to maxPerRun MORE.
+func TestDeleteOrphanedSharesSharesDeletionCapWithOtherOrphanKinds(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client,
+	}
+	_, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: "/pool/parent/gone-volume", Comment: "truenas-csi (org.scale.csi.nfs): pool/parent/gone-volume", Enabled: true,
+	})
+	require.NoError(t, err)
+
+	kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+	require.Len(t, report.OrphanShares, 1)
+
+	// deletedCount=2, maxPerRun=2: the budget is already fully spent by other
+	// orphan kinds before deleteOrphanedShares ever runs.
+	d.deleteOrphanedShares(ctx, &report, 2, 2)
+
+	assert.Empty(t, report.DeletedShares, "the shared per-run cap must block every share once other kinds already spent it")
+	require.Len(t, report.SkippedDeletes, 1)
+	assert.Equal(t, "share", report.SkippedDeletes[0].Kind)
+	assert.Contains(t, report.SkippedDeletes[0].Reason, deletionCapReasonPrefix,
+		"a cap-blocked share skip must be recorded with the shared cap-skip reason prefix (feeds CapSkippedDeletes/scale_csi_tombstone_reap_last_skipped_on_cap)")
+
+	shares, err := client.NFSShareList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, shares, 1, "the orphaned share must survive when the shared cap is already spent")
+}
+
+// TestDeleteOrphanedNFSShareRecordsFailureOnMalformedBackendID is the
+// regression test for the second half of C8: a malformed BackendID used to
+// return silently — no log, no skip, no object failure — while the iSCSI and
+// NVMe-oF siblings record every failure through recordReconcileObjectFailure.
+func TestDeleteOrphanedNFSShareRecordsFailureOnMalformedBackendID(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := &Driver{
+		name: "org.scale.csi.nfs",
+		config: &Config{
+			DriverName: "org.scale.csi.nfs",
+			ZFS:        ZFSConfig{DatasetParentName: "pool/parent"},
+		},
+		truenasClient: client,
+	}
+	report := ReconcileReport{}
+	before := testutil.ToFloat64(reconcileFailuresTotal.WithLabelValues("share"))
+
+	d.deleteOrphanedNFSShare(ctx, &report, ReconcileObject{ID: "pool/parent/malformed", BackendID: "not-a-number"})
+
+	assert.Empty(t, report.DeletedShares, "a malformed BackendID must not be treated as a successful delete")
+	assert.Equal(t, before+1, testutil.ToFloat64(reconcileFailuresTotal.WithLabelValues("share")),
+		"a malformed BackendID must be recorded as a failure like every other NFS/iSCSI/NVMe-oF share cleanup error")
 }

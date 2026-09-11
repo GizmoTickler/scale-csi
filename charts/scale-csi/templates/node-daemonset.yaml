@@ -9,6 +9,13 @@ metadata:
     app.kubernetes.io/component: node
 spec:
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  # (C10) Rendered explicitly so Helm always owns the field — see the
+  # identical fix (and its 2026-07-22 production incident) on the controller
+  # Deployment's strategy block. maxSurge MUST stay 0: hostNetwork: true means
+  # a surge pod's registrar (:9810) and liveness (:9808) HOST ports would
+  # collide with the outgoing pod's, so it could never actually schedule.
+  updateStrategy:
+    {{- toYaml .Values.node.updateStrategy | nindent 4 }}
   selector:
     matchLabels:
       {{- include "scale-csi.nodeSelectorLabels" . | nindent 6 }}
@@ -29,6 +36,10 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "scale-csi.nodeServiceAccountName" . }}
       priorityClassName: {{ .Values.node.priorityClassName }}
+      # (C10) commandTimeouts.nvme / commandTimeouts.mount are each ~30s by
+      # default and GracefulStop() blocks on in-flight RPCs; the Pod API's
+      # 30s default grace period could SIGKILL mid-mount or mid-connect.
+      terminationGracePeriodSeconds: {{ .Values.node.terminationGracePeriodSeconds }}
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet

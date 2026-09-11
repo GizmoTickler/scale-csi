@@ -480,6 +480,26 @@ func validatePublicationCompatibility(records map[string]publicationRecord, requ
 	return nil
 }
 
+// stalePublishedRecordNode returns the node name of a "published"-state
+// record in records that has NO live VolumeAttachment among liveNodes, plus
+// true. Presence of such a record proves it can only be a stale leftover: a
+// live publication for that node would have kept it out of liveNodes'
+// complement. Returns ("", false) when every published record corresponds to
+// a live attachment (including the ordinary "transient dual-VA state during
+// migration" case, which must keep blocking as before — both nodes are live
+// there, so this correctly returns false).
+func stalePublishedRecordNode(records map[string]publicationRecord, liveNodes map[string]struct{}) (string, bool) {
+	for _, record := range records {
+		if record.State != publicationStatePublished {
+			continue
+		}
+		if _, live := liveNodes[record.Node]; !live {
+			return record.Node, true
+		}
+	}
+	return "", false
+}
+
 func identityForSameNode(records map[string]publicationRecord, requested NodeIdentity) NodeIdentity {
 	identity := requested
 	for key := range records {

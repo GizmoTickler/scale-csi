@@ -786,10 +786,22 @@ func TestChartHealthMonitorSidecar(t *testing.T) {
 		if !roleHasRule(role, []string{"events"}, []string{"get"}) {
 			t.Errorf("health-monitor RBAC must grant events get (codex L1 upstream parity)")
 		}
-		// Leader election runs in the release namespace via a Lease; the sidecar
-		// relies on the existing leases rule, so confirm it covers create/update.
-		if !roleHasRule(role, []string{"leases"}, []string{"get", "watch", "list", "create", "update", "delete"}) {
-			t.Errorf("controller ClusterRole must keep the leases rule that backs health-monitor leader election")
+		// (C10) Leader election runs in the release namespace via a Lease; the
+		// rule now lives on the NAMESPACED "-controller-leases" Role, not the
+		// cluster-scoped ClusterRole (every sidecar passes
+		// --leader-election-namespace={{ .Release.Namespace }}, so cluster
+		// scope was unnecessary privilege), and "delete" is dropped: client-go
+		// leader election releases a lease by updating holderIdentity, never
+		// by deleting the object.
+		leasesRole := findManifest(t, decodeManifests(t, out), "Role", "-controller-leases")
+		// roleHasRule matches verbs EXACTLY (order-sensitive), so this positive
+		// assertion alone also proves "delete" is absent: any extra verb
+		// (including delete, in any position) would fail the exact match.
+		if !roleHasRule(leasesRole, []string{"leases"}, []string{"get", "watch", "list", "create", "update"}) {
+			t.Errorf("controller-leases Role must keep the leases rule that backs health-monitor leader election, without delete")
+		}
+		if roleTouchesResource(role, "leases") {
+			t.Errorf("controller ClusterRole must no longer grant leases; it moved to the namespaced controller-leases Role")
 		}
 	})
 }

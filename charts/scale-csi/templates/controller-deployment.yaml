@@ -202,6 +202,12 @@ spec:
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            # (C10) Caps the exponential backoff on a FAILED CSI call. Upstream's
+            # default is 5 minutes, which after a transient TrueNAS blip meant a
+            # rejected ControllerUnpublishVolume backed off to once every 5m — the
+            # single largest avoidable contributor to a node reboot stranding a
+            # volume.
+            - "--retry-interval-max={{ .Values.sidecars.retryIntervalMax }}"
             - "--extra-create-metadata"
             {{- if .Values.capacity.enabled }}
             - "--enable-capacity"
@@ -250,6 +256,8 @@ spec:
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            # (C10) See the identical comment on the provisioner above.
+            - "--retry-interval-max={{ .Values.sidecars.retryIntervalMax }}"
             {{- range .Values.sidecars.attacher.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -274,6 +282,8 @@ spec:
             - "--leader-election-lease-duration={{ .Values.sidecars.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.sidecars.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.sidecars.leaderElection.retryPeriod }}"
+            # (C10) See the identical comment on the provisioner above.
+            - "--retry-interval-max={{ .Values.sidecars.retryIntervalMax }}"
             - "--handle-volume-inuse-error=false"
             {{- range .Values.sidecars.resizer.extraArgs }}
             - {{ . | quote }}

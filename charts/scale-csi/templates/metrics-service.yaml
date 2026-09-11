@@ -15,6 +15,19 @@ metadata:
   {{- end }}
 spec:
   type: ClusterIP
+  # (C6) /metrics is served off the SAME mux/port as /readyz (see
+  # pkg/driver/health.go), and the controller's readiness deliberately fails
+  # closed on a TrueNAS outage (fencing/provisioning safety — see isReady).
+  # Without this, the Endpoints controller drops the pod from this Service
+  # the instant that happens, taking Prometheus's scrape target down with the
+  # backend: scale_csi_truenas_connection_status then goes MISSING instead of
+  # reading 0, so ScaleCSITrueNASConnectionDown (5m) can never fire and the
+  # slower ScaleCSIControllerMetricsAbsent/ScaleCSIControllerDown (10m)
+  # mislabels a backend outage as a controller outage — and takes twice as
+  # long to page. Publishing the not-ready address is the intentionally
+  # preferred fix over loosening isReady, which deliberately keeps gating
+  # attach/provision RPCs during a backend outage.
+  publishNotReadyAddresses: true
   ports:
     - name: metrics
       port: {{ .Values.metrics.port }}
@@ -41,6 +54,11 @@ metadata:
 spec:
   type: ClusterIP
   clusterIP: None
+  # (C6) Same rationale as the controller metrics Service above: node
+  # readiness is a separate signal (see pkg/driver/health.go isReady) but the
+  # same mux/port split between /metrics and /readyz applies, so the node
+  # DaemonSet's metrics must not be gated on its own readiness either.
+  publishNotReadyAddresses: true
   ports:
     - name: metrics
       port: {{ .Values.metrics.port }}

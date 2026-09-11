@@ -1716,6 +1716,72 @@ func TestCreateVolumeCloneReportsInheritedActualCapacity(t *testing.T) {
 	assert.Equal(t, 8*testGiB, resp.GetVolume().GetCapacityBytes())
 }
 
+// sourceDeleteProbeMock hooks the first SnapshotCreate call a volume-to-volume
+// clone makes for its source (see handleVolumeContentSource) and, before
+// letting it through, synchronously issues DeleteVolume against that SAME
+// source volume through the SAME Driver instance. Because acquireOperationLock
+// is a same-process try-lock (sync.Map.LoadOrStore, not a per-request token),
+// this nested call deterministically observes whatever lock state CreateVolume
+// left on the source volume at that exact point — no goroutines or timing
+// windows required to prove the fix.
+type sourceDeleteProbeMock struct {
+	*truenas.MockClient
+	d              *Driver
+	sourceVolumeID string
+	probed         bool
+	probeErr       error
+}
+
+func (m *sourceDeleteProbeMock) SnapshotCreate(ctx context.Context, dataset, name string, userProperties map[string]string) (*truenas.Snapshot, error) {
+	if !m.probed {
+		m.probed = true
+		_, m.probeErr = m.d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: m.sourceVolumeID})
+	}
+	return m.MockClient.SnapshotCreate(ctx, dataset, name, userProperties)
+}
+
+// TestCreateVolumeCloneHoldsSourceLockDuringClone is the regression test for
+// C4: a volume-to-volume clone must hold the SOURCE volume's operation lock
+// for the duration of the clone, exactly like CreateSnapshot does for its
+// source. Before the fix, CreateVolume only locked the destination, so
+// DeleteVolume(source) racing a clone-in-progress could destroy the
+// "<source>@clone-source-<dest>" snapshot the clone depends on (or otherwise
+// interleave unsafely with it). Here that race is made deterministic: the
+// nested DeleteVolume(source) call fires from inside the mock's SnapshotCreate
+// hook, at the exact point the real clone would create its temporary source
+// snapshot, and it must be rejected by the lock rather than allowed to run.
+func TestCreateVolumeCloneHoldsSourceLockDuringClone(t *testing.T) {
+	ctx := context.Background()
+	base := truenas.NewMockClient()
+	d := &Driver{
+		config: &Config{
+			ZFS: ZFSConfig{DatasetParentName: "pool/parent", ZvolReadyTimeout: 1},
+			NFS: NFSConfig{ShareHost: "192.0.2.10"},
+		},
+	}
+	probe := &sourceDeleteProbeMock{MockClient: base, d: d, sourceVolumeID: "source"}
+	d.truenasClient = probe
+
+	mustCreateParentDataset(t, base)
+	_, err := base.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/source", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	stampDriverOwnership(t, base, d, "pool/parent/source")
+
+	_, _ = d.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "clone",
+		VolumeCapabilities: []*csi.VolumeCapability{testVolumeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: testGiB},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+			Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "source"},
+		}},
+	})
+
+	require.True(t, probe.probed, "the probe must have fired while the clone was in flight")
+	require.Error(t, probe.probeErr,
+		"DeleteVolume(source) issued WHILE its clone is in progress must be rejected by the source lock, not allowed to run")
+	assert.Equal(t, codes.Aborted, status.Code(probe.probeErr))
+}
+
 func TestCreateVolumeShareFailureCleanupUsesForceDelete(t *testing.T) {
 	client := &nfsShareCreateFailureMock{MockClient: truenas.NewMockClient(), err: fmt.Errorf("injected share failure")}
 	d := &Driver{
@@ -1733,6 +1799,46 @@ func TestCreateVolumeShareFailureCleanupUsesForceDelete(t *testing.T) {
 	assert.Equal(t, "pool/parent/failed-volume", cleanup.Name)
 	assert.False(t, cleanup.Recursive)
 	assert.True(t, cleanup.Force)
+}
+
+// TestDeleteVolumeIgnoresInheritedOriginSnapshot is the regression test for
+// C3: volume_origin_snapshot names a driver-internal temp snapshot minted for
+// VOLUME-to-volume cloning that must be destroyed only when the CLONE that
+// carries it as a LOCAL property is deleted. ZFS clones inherit their origin's
+// user properties, so a further-generation clone (e.g. a clone of a snapshot
+// taken from that first clone) can carry the SAME property key with an
+// INHERITED value pointing at a snapshot some OTHER still-live volume depends
+// on. DeleteVolume must read this property the same LOCAL-only way every other
+// ownership decision in this file does (datasetLocalUserProperty) and must
+// never call SnapshotDelete on an inherited value's target.
+func TestDeleteVolumeIgnoresInheritedOriginSnapshot(t *testing.T) {
+	ctx := context.Background()
+	base := truenas.NewMockClient()
+	// originID names a snapshot a DIFFERENT, still-live volume is cloned from.
+	// If DeleteVolume ever treats the inherited property as authoritative, it
+	// destroys that live volume's origin snapshot out from under it.
+	originID := "pool/parent/live-other-volume@clone-source-live-other-volume"
+	client := &originSnapshotDeleteFailureMock{
+		MockClient:       base,
+		originSnapshotID: originID,
+		err:              fmt.Errorf("must never be called: volume_origin_snapshot was only INHERITED, not local"),
+	}
+	d := &Driver{
+		config:        &Config{ZFS: ZFSConfig{DatasetParentName: "pool/parent"}, NFS: NFSConfig{ShareHost: "192.0.2.10"}},
+		truenasClient: client,
+	}
+	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/clone-of-snapshot", Type: "FILESYSTEM"})
+	require.NoError(t, err)
+	// Simulate ZFS property inheritance directly (DatasetSetUserProperty always
+	// stamps Source: "local", which is exactly the case this test must NOT
+	// exercise): this dataset carries the SAME property key as a clone-source
+	// snapshot upstream of it, but its own source is that snapshot, not itself.
+	client.Datasets["pool/parent/clone-of-snapshot"].UserProperties[PropVolumeOriginSnapshot] = truenas.UserProperty{
+		Value: originID, Source: "pool/parent/live-other-volume@some-snapshot",
+	}
+
+	_, err = d.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "clone-of-snapshot"})
+	require.NoError(t, err, "DeleteVolume must succeed without ever attempting to delete the inherited origin snapshot")
 }
 
 func TestDeleteVolumeReturnsOriginSnapshotDeleteFailure(t *testing.T) {

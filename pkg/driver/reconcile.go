@@ -255,7 +255,21 @@ func (d *Driver) reconcileOrphans(ctx context.Context, opts ReconcileOptions, re
 		// latest-record selection are one critical section: a finishing
 		// detection pass must not restore an older backlog over a newer poll
 		// overlay the monotonic timestamp guard would then refuse to replace.
-		d.publishOrphanAndReapMetrics(report, loadedReap, wroteReap)
+		//
+		// But a pass that failed BEFORE observing anything (config missing, or
+		// the initial backend/Kubernetes listings themselves erroring) is empty,
+		// not partial: report is still its zero value, and publishing it would
+		// stamp every orphan/tombstone/remnant gauge to 0. Three alerts
+		// (ScaleCSIOrphanedBackendObjects, ScaleCSISpentRestoreBacklog,
+		// ScaleCSIManualRecoveryTombstones) are keyed on exactly those gauges, so
+		// a single transient TrueNAS blip would reset their `for:` hold every
+		// time it hit — worse the more often this pass runs. observationAt is
+		// set immediately before classification begins, so it is the same
+		// "did this pass see anything" signal already used above for
+		// noteOrphanMetricsObservation.
+		if !observationAt.IsZero() {
+			d.publishOrphanAndReapMetrics(report, loadedReap, wroteReap)
+		}
 		// Emit at most one aggregated Warning Event per pass for the operator-
 		// attention conditions (E3/O13). The defer runs once per pass, which is the
 		// rate limit (the reconcile loop is ~hourly).
@@ -525,12 +539,20 @@ func (d *Driver) classifyOrphanVolumes(ctx context.Context, now time.Time, datas
 	}
 	sourceBearing := make(map[string]*truenas.Dataset, len(names))
 	failedFetch := make(map[string]struct{})
-	for _, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
+	// (C13) Record ONE failure per batch, matching the sibling
+	// datasetGetByNamesChunked helper (see below) — not once per NAME in the
+	// batch. Chunks are sized to a 32 KiB JSON budget, so a batch commonly
+	// holds several hundred names; recording per-name inflated
+	// reconcile_failures_total by the chunk size (and emitted that many log
+	// lines) for a single transient query timeout, which would fire any
+	// rate-based alert on one blip. Every name in the failed chunk is still
+	// marked in failedFetch below so the per-candidate skip logic is unchanged.
+	for chunkIndex, chunk := range chunkDatasetNames(names, datasetGetByNamesBatchBudget) {
 		batch, getErr := d.truenasClient.DatasetGetByNames(ctx, chunk)
 		if getErr != nil {
+			d.recordReconcileObjectFailure("orphan_volume_classify", fmt.Sprintf("batch-%d", chunkIndex+1), getErr)
 			for _, name := range chunk {
 				failedFetch[name] = struct{}{}
-				d.recordReconcileObjectFailure("orphan_volume_classify", name, getErr)
 			}
 			continue
 		}
@@ -782,7 +804,7 @@ func (d *Driver) runReconcileDeletePhase(ctx context.Context, opts ReconcileOpti
 	if reason := snapshotDeletePassBlockReason(currentState, managedBackendSnapshotCount); reason != "" {
 		snapshotDeleteBlockReason = reason
 	}
-	if err := d.deleteDetectedOrphans(
+	deletedCount, err := d.deleteDetectedOrphans(
 		ctx,
 		report,
 		currentState,
@@ -791,11 +813,16 @@ func (d *Driver) runReconcileDeletePhase(ctx context.Context, opts ReconcileOpti
 		d.config.Reconcile.Delete.MaxPerRun,
 		snapshotDeleteBlockReason,
 		parentDataset,
-	); err != nil {
+	)
+	if err != nil {
 		RecordReconcileFailure("delete")
 		return err
 	}
-	d.deleteOrphanedShares(ctx, report, d.config.Reconcile.Delete.MaxPerRun)
+	// (C8) Shares thread the SAME deletedCount deleteDetectedOrphans already
+	// spent, so the per-run cap is one shared budget across every orphan kind
+	// instead of shares policing a second, independent counter that let a pass
+	// destroy up to 2x maxPerRun objects.
+	d.deleteOrphanedShares(ctx, report, deletedCount, d.config.Reconcile.Delete.MaxPerRun)
 	return nil
 }
 
@@ -1129,6 +1156,12 @@ func laterTime(left, right time.Time) time.Time {
 	return left
 }
 
+// deleteDetectedOrphans runs the guarded destroy phase for every detected
+// orphan kind EXCEPT shares (see deleteOrphanedShares, called separately by
+// runReconcileDeletePhase) and returns the final deletedCount so the caller
+// can thread it into deleteOrphanedShares (C8): shares must share ONE per-run
+// deletion budget with everything else, not police a second independent
+// counter that lets a pass destroy up to 2x maxPerRun objects.
 func (d *Driver) deleteDetectedOrphans(
 	ctx context.Context,
 	report *ReconcileReport,
@@ -1138,7 +1171,7 @@ func (d *Driver) deleteDetectedOrphans(
 	maxPerRun int,
 	snapshotDeleteBlockReason string,
 	parent *truenas.Dataset,
-) error {
+) (int, error) {
 	deletedCount := 0
 	deletionCapReached := func(kind, id string) bool {
 		if deletedCount < maxPerRun {
@@ -1162,7 +1195,7 @@ func (d *Driver) deleteDetectedOrphans(
 		for i := range report.OrphanSnapshots {
 			orphan := &report.OrphanSnapshots[i]
 			if err := ctx.Err(); err != nil {
-				return err
+				return deletedCount, err
 			}
 			if deletionCapReached("snapshot", orphan.ID) {
 				continue
@@ -1192,7 +1225,7 @@ func (d *Driver) deleteDetectedOrphans(
 	for i := range report.OrphanVolumes {
 		orphan := &report.OrphanVolumes[i]
 		if err := ctx.Err(); err != nil {
-			return err
+			return deletedCount, err
 		}
 		if deletionCapReached("volume", orphan.ID) {
 			continue
@@ -1223,7 +1256,7 @@ func (d *Driver) deleteDetectedOrphans(
 		tombstone := &report.TombstoneSnapshots[i]
 		if err := ctx.Err(); err != nil {
 			retire.flush(ctx, d, parent)
-			return err
+			return deletedCount, err
 		}
 		if deletionCapReached("tombstone-snapshot", tombstone.ID) {
 			continue
@@ -1259,12 +1292,12 @@ func (d *Driver) deleteDetectedOrphans(
 	// revalidated before deletion below.
 	clientset, dynamicClient, err := d.kubernetesReconcileClients()
 	if err != nil {
-		return err
+		return deletedCount, err
 	}
 	for i := range report.SpentRestoreSnapshots {
 		detected := &report.SpentRestoreSnapshots[i]
 		if err := ctx.Err(); err != nil {
-			return err
+			return deletedCount, err
 		}
 		key := namespacedName(detected.Namespace, detected.Name)
 		if deletionCapReached("spent-restore-snapshot", key) {
@@ -1294,7 +1327,7 @@ func (d *Driver) deleteDetectedOrphans(
 	for i := range report.RemnantVolumes {
 		remnant := &report.RemnantVolumes[i]
 		if err := ctx.Err(); err != nil {
-			return err
+			return deletedCount, err
 		}
 		if deletionCapReached("remnant-volume", remnant.ID) {
 			continue
@@ -1307,7 +1340,7 @@ func (d *Driver) deleteDetectedOrphans(
 		report.DeletedRemnants = append(report.DeletedRemnants, remnant.ID)
 		deletedCount++
 	}
-	return nil
+	return deletedCount, nil
 }
 
 // validVolumeIDLeaf mirrors datasetForID's identity rules for a single path
@@ -1523,24 +1556,61 @@ func (d *Driver) startOrphanReconcile() {
 			return
 		}
 	}
-	cadence := interval
-	if d.config.Fencing.Enabled() {
+	// staleRecordCadence governs ONLY reconcileStalePublicationRecords (C1 fix):
+	// with fencing enabled it must run no less often than staleRecordGracePeriod
+	// so a force-removed VolumeAttachment finalizer's stale record is revoked
+	// promptly. It must NOT also be the rate the heavy orphan-detection pass
+	// below runs at — that used to make the ENTIRE pass (both backend listings,
+	// every Kubernetes list, the bookkeeping sweeps, and the
+	// adoptLegacyOwnershipStamps/migrateLegacyPropertyNamespace WRITES) run at
+	// up to 6x its configured reconcile.interval in this cluster's config
+	// (interval=1h, fencing.staleRecordGracePeriod=10m; VERIFIED LIVE at exactly
+	// 10-minute spacing). The heavy pass always runs on interval instead.
+	fencingEnabled := d.config.Fencing.Enabled()
+	staleRecordCadence := interval
+	if fencingEnabled {
 		grace, graceErr := d.config.Fencing.StaleRecordGracePeriodDuration()
 		if graceErr != nil || grace <= 0 {
 			klog.Errorf("Controller reconciliation disabled due to invalid fencing stale-record grace %q: %v",
 				d.config.Fencing.StaleRecordGracePeriod, graceErr)
 			return
 		}
-		cadence = controllerReconcileCadence(interval, grace)
+		staleRecordCadence = controllerReconcileCadence(interval, grace)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// (C7) reconcileStateMu + reconcileStopped close the race where a Stop()
+	// landing between this function's entry and the plain assignment below
+	// used to observe a nil reconcileCancel, skip cancellation, and let a full
+	// reconcile pass — including reconcileStalePublicationRecords, which
+	// REVOKES backend grants, and the adoption/migration property writes — run
+	// concurrently with GracefulStop()/truenasClient.Close(). A Stop() that
+	// already won the race is visible here under the same lock, so this call
+	// exits before ever launching a loop.
+	d.reconcileStateMu.Lock()
+	if d.reconcileStopped || d.reconcileCancel != nil {
+		d.reconcileStateMu.Unlock()
+		cancel()
+		return
+	}
 	d.reconcileCancel = cancel
+	d.reconcileStateMu.Unlock()
+	// orphanDetectionEnabled gates the heavy pass ENTIRELY (C9 fix): an operator
+	// who set reconcile.enabled=false wants the driver to stop touching their
+	// datasets, and that must hold even with fencing on. Only the lightweight
+	// stale-publication-record repair below — which fencing's own availability
+	// guarantee depends on — is exempt.
+	orphanDetectionEnabled := d.config.Reconcile.Enabled
+	klog.Infof("Controller reconciliation started: interval=%v staleRecordCadence=%v minOrphanAge=%v replicationJobSweep=true orphanDetection=%t staleFencingRecords=%t delete=false",
+		interval, staleRecordCadence, minAge, orphanDetectionEnabled, fencingEnabled)
+
+	// Fast loop: the replication-job sweep and encrypted-volume reconvergence
+	// (unrelated to fencing, kept at their historical cadence) plus, when
+	// fencing is enabled, the stale-publication-record repair at the grace
+	// cadence. This loop NEVER runs the heavy orphan-detection pass.
 	d.reconcileWg.Add(1)
 	go func() {
 		defer d.reconcileWg.Done()
-		klog.Infof("Controller reconciliation started: interval=%v cadence=%v minOrphanAge=%v replicationJobSweep=true orphanDetection=%t staleFencingRecords=%t delete=false",
-			interval, cadence, minAge, d.config.Reconcile.Enabled, d.config.Fencing.Enabled())
 		run := func() {
 			d.runReplicationJobSweep(ctx)
 			// Encryption at rest (GF-Sprint 1, E-2 §4): re-unlock locked encrypted
@@ -1549,10 +1619,39 @@ func (d *Driver) startOrphanReconcile() {
 			// redacted. Runs independently of orphan detection because it is an
 			// availability reconvergence, not cleanup.
 			d.reconcileEncryptedUnlocks(ctx)
-			if !d.config.Reconcile.Enabled && !d.config.Fencing.Enabled() {
+			if fencingEnabled {
+				d.runStalePublicationRecordsPass(ctx, minAge)
+			}
+		}
+
+		// Populate metrics immediately rather than leaving them unknown until the
+		// first interval elapses.
+		run()
+		ticker := time.NewTicker(staleRecordCadence)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				run()
+			case <-ctx.Done():
 				return
 			}
-			report, reconcileErr := d.reconcileOrphans(ctx, ReconcileOptions{Delete: false, MinOrphanAge: minAge}, true)
+		}
+	}()
+
+	if !orphanDetectionEnabled {
+		return
+	}
+
+	// Heavy loop: the full orphan-detection pass (both backend listings, every
+	// Kubernetes list, the bookkeeping sweeps, and the adoption/migration
+	// writes), always on reconcile.interval regardless of the fencing grace
+	// period above.
+	d.reconcileWg.Add(1)
+	go func() {
+		defer d.reconcileWg.Done()
+		run := func() {
+			report, reconcileErr := d.reconcileOrphans(ctx, ReconcileOptions{Delete: false, MinOrphanAge: minAge}, false)
 			if reconcileErr != nil && ctx.Err() == nil {
 				klog.Errorf("Orphan reconcile detection failed: %v", reconcileErr)
 				return
@@ -1567,7 +1666,7 @@ func (d *Driver) startOrphanReconcile() {
 		// Populate metrics immediately rather than leaving them unknown until the
 		// first interval elapses.
 		run()
-		ticker := time.NewTicker(cadence)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -1589,8 +1688,17 @@ func controllerReconcileCadence(orphanInterval, staleGrace time.Duration) time.D
 }
 
 func (d *Driver) stopOrphanReconcile() {
-	if d.reconcileCancel != nil {
-		d.reconcileCancel()
-		d.reconcileWg.Wait()
+	// (C7) Terminal: reconcileStopped=true is recorded under the same lock
+	// startOrphanReconcile checks before assigning reconcileCancel, so a Stop()
+	// that wins the race prevents the loop from EVER starting instead of the
+	// two racing on a plain nil check.
+	d.reconcileStateMu.Lock()
+	d.reconcileStopped = true
+	cancel := d.reconcileCancel
+	d.reconcileCancel = nil
+	d.reconcileStateMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+	d.reconcileWg.Wait()
 }

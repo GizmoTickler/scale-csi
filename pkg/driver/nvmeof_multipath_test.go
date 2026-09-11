@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -123,6 +124,119 @@ func TestMultipathConvergesExistingVolumes(t *testing.T) {
 	var advertised []string
 	require.NoError(t, json.Unmarshal([]byte(volumeContext["addresses"]), &advertised))
 	assert.Equal(t, []string{"192.0.2.20", "192.0.2.21", "192.0.2.22", "192.0.2.23"}, advertised)
+}
+
+// statefulNVMeoFPortMock layers REAL address->port and port-subsystem
+// association tracking on top of apiCallCountingClient. The underlying
+// truenas.MockClient stubs these NVMe-oF port methods as unconditionally
+// empty/no-op (NVMeoFPortSubsysListBySubsystem always returns nil, and
+// NVMeoFGetOrCreatePort always returns port ID 1 regardless of address) —
+// harmless for tests that only assert call COUNTS against a client whose
+// return values are never inspected, but unusable for a test that needs
+// associateNVMeoFPorts' diff logic (C5) to actually see prior state. Confined
+// to this one test rather than swapping the shared helper so no existing
+// call-count assertion (which was written against, and passes because of, the
+// stub's always-empty behavior) is disturbed.
+type statefulNVMeoFPortMock struct {
+	*apiCallCountingClient
+	mu          sync.Mutex
+	portByAddr  map[string]int
+	nextPortID  int
+	assocByPort map[int]*truenas.NVMeoFPortSubsys
+	nextAssocID int
+}
+
+func newStatefulNVMeoFPortMock(base *apiCallCountingClient) *statefulNVMeoFPortMock {
+	return &statefulNVMeoFPortMock{
+		apiCallCountingClient: base,
+		portByAddr:            make(map[string]int),
+		assocByPort:           make(map[int]*truenas.NVMeoFPortSubsys),
+	}
+}
+
+func (m *statefulNVMeoFPortMock) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...truenas.NVMeoFPortCreateOptions) (*truenas.NVMeoFPort, error) {
+	m.record("NVMeoFGetOrCreatePort")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.portByAddr[address]
+	if !ok {
+		m.nextPortID++
+		id = m.nextPortID
+		m.portByAddr[address] = id
+	}
+	return &truenas.NVMeoFPort{ID: id, Transport: transport, Address: address, Port: port}, nil
+}
+
+func (m *statefulNVMeoFPortMock) NVMeoFPortSubsysCreate(ctx context.Context, portID, subsysID int) (*truenas.NVMeoFPortSubsys, error) {
+	m.record("NVMeoFPortSubsysCreate")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.assocByPort[portID]; ok && existing.SubsysID == subsysID {
+		return existing, nil
+	}
+	m.nextAssocID++
+	assoc := &truenas.NVMeoFPortSubsys{ID: m.nextAssocID, PortID: portID, SubsysID: subsysID}
+	m.assocByPort[portID] = assoc
+	return assoc, nil
+}
+
+func (m *statefulNVMeoFPortMock) NVMeoFPortSubsysListBySubsystem(ctx context.Context, subsysID int) ([]*truenas.NVMeoFPortSubsys, error) {
+	m.record("NVMeoFPortSubsysListBySubsystem")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []*truenas.NVMeoFPortSubsys
+	for _, assoc := range m.assocByPort {
+		if assoc.SubsysID == subsysID {
+			result = append(result, assoc)
+		}
+	}
+	return result, nil
+}
+
+// TestMultipathConvergenceSteadyStateSkipsRedundantCreates is the regression
+// test for C5: once a multipath volume's port associations already exist
+// (the steady state EVERY subsequent ControllerPublishVolume reaches), the
+// "E-6 convergence (F-4)" already-exists path must not keep blindly
+// re-attempting nvmet.port_subsys.create for every configured address. Before
+// the fix, associateNVMeoFPorts called NVMeoFPortSubsysCreate once per address
+// on every single publish, each of which failed already-exists and forced its
+// own NVMeoFPortSubsysListBySubsystem recovery query inside
+// NVMeoFPortSubsysCreate — exactly the 4-creates-plus-4-recovery-queries shape
+// VERIFIED LIVE (~420ms of a 1.15s publish). After the fix, a second
+// convergence pass over the same already-associated addresses costs ONE
+// NVMeoFPortSubsysListBySubsystem query and ZERO NVMeoFPortSubsysCreate calls.
+func TestMultipathConvergenceSteadyStateSkipsRedundantCreates(t *testing.T) {
+	ctx := context.Background()
+	base := newAPICallCountingClient()
+
+	// Provision with multipath OFF over the plain (stub) counting client — the
+	// fresh-create path (checkExisting=false) never queries prior state, so
+	// the stub's always-empty behavior is harmless here.
+	d := newMultipathAPICallCountDriver(t, base, nil)
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("mp-steady", "nvmeof"))
+	require.NoError(t, err)
+
+	// Swap in the stateful wrapper (same underlying call counters) before the
+	// convergence passes under test, which DO need real prior-state tracking.
+	stateful := newStatefulNVMeoFPortMock(base)
+	d.truenasClient = stateful
+	d.config.NVMeoF.Multipath = true
+	d.config.NVMeoF.Addresses = []string{"192.0.2.21", "192.0.2.22", "192.0.2.23"}
+
+	// First convergence pass: genuinely associates every address (mirrors
+	// TestMultipathConvergesExistingVolumes).
+	require.NoError(t, nvmeoFShareBackend{d}.EnsureShare(ctx, nil, "pool/parent/mp-steady", "mp-steady", &fenceResolution{}))
+
+	// The steady-state pass under test: every address from the prior pass is
+	// already associated, so this models every publish after the first.
+	base.resetCalls()
+	require.NoError(t, nvmeoFShareBackend{d}.EnsureShare(ctx, nil, "pool/parent/mp-steady", "mp-steady", &fenceResolution{}))
+
+	_, counts := base.callSnapshot()
+	assert.Equal(t, 1, counts["NVMeoFPortSubsysListBySubsystem"],
+		"steady state must resolve existing associations with exactly one list query")
+	assert.Zero(t, counts["NVMeoFPortSubsysCreate"],
+		"steady state must not re-attempt nvmet.port_subsys.create for an address that is already associated")
 }
 
 // TestMultipathDisabledAddsNoCallsOnEnsure proves the convergence hook is free

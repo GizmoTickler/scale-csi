@@ -246,11 +246,17 @@ func TestSprint6NonCHAPCloneFoldOmitsCHAPPolicy(t *testing.T) {
 	_, hasMode := props[PropISCSIAuthMode]
 	assert.False(t, hasTag, "a non-CHAP clone fold must not carry the CHAP tag")
 	assert.False(t, hasMode, "a non-CHAP clone fold must not carry the CHAP mode")
-	// The fold carries exactly the three Sprint-3 keys — byte-for-byte unchanged.
+	// The fold carries the three Sprint-3 keys plus the C3 origin-snapshot
+	// severing sentinel (see the foldProps comment in handleVolumeContentSource):
+	// a snapshot-clone must explicitly sever inheritance of
+	// volume_origin_snapshot from its source snapshot so a FURTHER clone of a
+	// snapshot taken from this volume can never inherit a stale
+	// driver-internal clone-source reference.
 	assert.Equal(t, map[string]string{
 		PropVolumeContentSourceType: "snapshot",
 		PropVolumeContentSourceID:   "snap-1",
 		PropDriverInstanceID:        d.driverInstanceID(),
+		PropVolumeOriginSnapshot:    "-",
 	}, props)
 
 	// The provisioned volume resolves stored CHAP = NONE.

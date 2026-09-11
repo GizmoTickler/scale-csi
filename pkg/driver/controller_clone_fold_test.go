@@ -368,11 +368,16 @@ func TestSnapshotCloneFoldQuotaAndZvolPaths(t *testing.T) {
 				properties[update.Key] = update.Value
 			}
 			// Sprint 3 (L2a): the ownership stamp folds INTO the merged content-source
-			// update, so all three keys persist in one atomic pool.dataset.update.
+			// update, so all keys persist in one atomic pool.dataset.update. C3 adds
+			// the origin-snapshot severing sentinel: a snapshot-clone must explicitly
+			// sever inheritance of volume_origin_snapshot from its source snapshot so
+			// a FURTHER clone of a snapshot taken from this volume can never inherit
+			// a stale driver-internal clone-source reference.
 			assert.Equal(t, map[string]string{
 				PropVolumeContentSourceID:   "snap-1",
 				PropVolumeContentSourceType: "snapshot",
 				PropDriverInstanceID:        d.driverInstanceID(),
+				PropVolumeOriginSnapshot:    "-",
 			}, properties)
 			if tc.datasetType == "VOLUME" {
 				assert.Equal(t, 2*testGiB, datasetPropertyBytes(created.Volsize))

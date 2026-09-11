@@ -199,6 +199,33 @@ func (d *Driver) reconcileStalePublicationRecords(
 	}
 }
 
+// runStalePublicationRecordsPass loads the minimal state
+// reconcileStalePublicationRecords needs — one backend dataset listing plus
+// the Kubernetes reconcile state — and invokes it. It exists so the fencing
+// stale-record grace-period cadence (see startOrphanReconcile, C1 fix) can run
+// ONLY this repair instead of the full orphan-detection pass: unlike that pass
+// it issues no snapshot listing and performs no bookkeeping sweeps or
+// adoption/migration writes, so running it every grace period (routinely far
+// shorter than reconcile.interval) does not multiply the heavy pass's cost.
+// A caller must have already confirmed fencing is enabled; this is a no-op
+// otherwise since reconcileStalePublicationRecords has nothing to repair.
+func (d *Driver) runStalePublicationRecordsPass(ctx context.Context, minOrphanAge time.Duration) {
+	if d.config == nil || d.truenasClient == nil || !d.config.Fencing.Enabled() {
+		return
+	}
+	datasets, err := d.listAllManagedDatasets(ctx)
+	if err != nil {
+		d.recordReconcileObjectFailure("stale_publication_list_backend_volumes", d.config.ZFS.DatasetParentName, err)
+		return
+	}
+	kubeState, err := d.loadKubernetesReconcileState(ctx, minOrphanAge)
+	if err != nil {
+		d.recordReconcileObjectFailure("stale_publication_load_kubernetes_state", "kubernetes", err)
+		return
+	}
+	d.reconcileStalePublicationRecords(ctx, datasets, kubeState, time.Now())
+}
+
 func (d *Driver) revokeStalePublicationRecord(
 	ctx context.Context,
 	datasetName, volumeID, propertyKey string,

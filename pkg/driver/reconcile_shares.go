@@ -250,11 +250,27 @@ func (d *Driver) detectOrphanedNVMeoFShares(ctx context.Context, kubeState *kube
 // immediately before mutation so a dataset recreated after detection is never
 // orphaned out from under a live volume. Cleanup is routed to the correct
 // backend objects by the orphan's Protocol.
-func (d *Driver) deleteOrphanedShares(ctx context.Context, report *ReconcileReport, maxPerRun int) {
+//
+// deletedCount is the running total ALREADY spent by deleteDetectedOrphans
+// (snapshots, volumes, tombstones, spent-restores, remnants) for this pass
+// (C8): shares share that ONE per-run deletion budget rather than policing
+// their own separate len(report.DeletedShares) counter, which let a pass with
+// maxPerRun=1000 destroy up to 1900 objects when both counters independently
+// maxed out. A cap refusal here is also now recorded via recordReconcileSkip
+// with deletionCapReasonPrefix, matching every other cap path — previously an
+// orphaned-share backlog that exceeded the cap every night left
+// scale_csi_tombstone_reap_last_skipped_on_cap at 0 forever while shares leaked.
+func (d *Driver) deleteOrphanedShares(ctx context.Context, report *ReconcileReport, deletedCount, maxPerRun int) {
 	for i := range report.OrphanShares {
 		orphan := &report.OrphanShares[i]
-		if maxPerRun > 0 && len(report.DeletedShares) >= maxPerRun {
-			break
+		if maxPerRun > 0 && deletedCount >= maxPerRun {
+			d.recordReconcileSkip(
+				report,
+				"share",
+				orphan.ID,
+				fmt.Sprintf("%s (maxPerRun=%d)", deletionCapReasonPrefix, maxPerRun),
+			)
+			continue
 		}
 		// TOCTOU guard: re-confirm the dataset is still absent immediately before
 		// mutating backend state, regardless of protocol.
@@ -262,6 +278,7 @@ func (d *Driver) deleteOrphanedShares(ctx context.Context, report *ReconcileRepo
 			d.recordReconcileSkip(report, "share", orphan.ID, "dataset reappeared or lookup failed before delete")
 			continue
 		}
+		before := len(report.DeletedShares)
 		switch orphan.Protocol {
 		case ShareTypeISCSI:
 			d.deleteOrphanedISCSIShare(ctx, report, *orphan)
@@ -270,12 +287,23 @@ func (d *Driver) deleteOrphanedShares(ctx context.Context, report *ReconcileRepo
 		default: // ShareTypeNFS (and any unset value) retains the legacy NFS path.
 			d.deleteOrphanedNFSShare(ctx, report, *orphan)
 		}
+		if len(report.DeletedShares) > before {
+			deletedCount++
+		}
 	}
 }
 
 func (d *Driver) deleteOrphanedNFSShare(ctx context.Context, report *ReconcileReport, orphan ReconcileObject) {
 	shareID, err := strconv.Atoi(orphan.BackendID)
 	if err != nil || shareID <= 0 {
+		// (C8) Match the iSCSI/NVMe-oF siblings: every failure is recorded, none
+		// return silently. A malformed BackendID here previously left no log, no
+		// skip, and no object failure — the object simply vanished from the pass
+		// with nothing to show for it.
+		if err == nil {
+			err = fmt.Errorf("non-positive share ID %d", shareID)
+		}
+		d.recordReconcileObjectFailure("share", orphan.BackendID, fmt.Errorf("parse NFS share ID %q: %w", orphan.BackendID, err))
 		return
 	}
 	if delErr := d.truenasClient.NFSShareDelete(ctx, shareID); delErr != nil && !truenas.IsNotFoundError(delErr) {

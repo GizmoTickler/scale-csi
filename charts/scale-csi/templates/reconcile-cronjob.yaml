@@ -10,6 +10,13 @@ metadata:
 spec:
   schedule: {{ .Values.reconcile.delete.schedule | quote }}
   concurrencyPolicy: Forbid
+  # (C10) Without these, one wedged Job under concurrencyPolicy: Forbid
+  # silently stops all future reconciliation forever — Forbid means a stuck
+  # run is never superseded, and with no startingDeadlineSeconds a missed
+  # schedule (e.g. the controller was down at trigger time) is never
+  # retried either.
+  activeDeadlineSeconds: {{ .Values.reconcile.delete.activeDeadlineSeconds }}
+  startingDeadlineSeconds: {{ .Values.reconcile.delete.startingDeadlineSeconds }}
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
   jobTemplate:
@@ -34,7 +41,18 @@ spec:
           imagePullSecrets:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.podSecurityContext }}
+          {{- /* (C10) This CronJob runs the controller IMAGE and is authorized
+          to destroy backend objects (reconcile.delete.enabled gates its very
+          existence), so it must get the SAME controller-only seccomp
+          hardening the controller Deployment gets — not the bare shared
+          podSecurityContext, which made it the only controller-image pod
+          running seccomp-unconfined. Same mergeOverwrite pattern as
+          controller-deployment.yaml. */}}
+          {{- $reconcilePodSecurityContext := deepCopy (.Values.podSecurityContext | default dict) }}
+          {{- with .Values.controller.podSecurityContext }}
+          {{- $reconcilePodSecurityContext = mergeOverwrite $reconcilePodSecurityContext . }}
+          {{- end }}
+          {{- with $reconcilePodSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}

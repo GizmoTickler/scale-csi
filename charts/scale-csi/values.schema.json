@@ -846,6 +846,13 @@
           "type": "integer",
           "minimum": 0
         },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "updateStrategy": {
+          "$ref": "#/definitions/freeObject"
+        },
         "resources": {
           "type": "object",
           "default": {
@@ -1403,6 +1410,36 @@
             "type": "string"
           }
         },
+        "connect": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fastIOFailTmo": {
+              "type": "integer"
+            },
+            "nrIOQueues": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "nrWriteQueues": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "keepAliveTmo": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            }
+          }
+        },
         "commandTimeout": {
           "description": "DEPRECATED, ignored; the nvme CLI timeout is commandTimeouts.nvme. Retained only so old values files pass validation.",
           "type": "integer",
@@ -1469,6 +1506,10 @@
               "minLength": 2
             }
           }
+        },
+        "retryIntervalMax": {
+          "type": "string",
+          "minLength": 2
         },
         "provisioner": {
           "$ref": "#/definitions/sidecar"
@@ -1689,6 +1730,16 @@
               "type": "string",
               "minLength": 1,
               "default": "20 4,10,16,22 * * *"
+            },
+            "activeDeadlineSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 3600
+            },
+            "startingDeadlineSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 900
             },
             "maxPerRun": {
               "type": "integer",

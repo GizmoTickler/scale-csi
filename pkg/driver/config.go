@@ -880,6 +880,44 @@ type NVMeoFConfig struct {
 	// expose for multipath when Multipath is true. TransportAddress is always
 	// included first. Empty with Multipath=true is a startup validation error.
 	Addresses []string `yaml:"addresses"`
+
+	// Connect holds node-side `nvme connect` CLI knobs (N4). These are HOST/CLI
+	// options, not backend port objects — unlike PortPerf above, which
+	// configures a shared TrueNAS port object, these apply per-connection on
+	// every node that stages a volume.
+	Connect NVMeoFConnectConfig `yaml:"connect"`
+}
+
+// NVMeoFConnectConfig holds node-side `nvme connect` CLI knobs (N4), mirroring
+// pkg/util.NVMeoFConnectOptions's own zero-value semantics field-for-field so
+// converting one to the other is a direct, sentinel-preserving copy.
+type NVMeoFConnectConfig struct {
+	// FastIOFailTmo overrides --fast-io-fail-tmo (seconds) on every `nvme
+	// connect`. Zero (the default, including an absent key) leaves the
+	// driver's built-in 15s default in effect: with --ctrl-loss-tmo pinned to
+	// infinite, a controller stuck reconnecting would otherwise queue I/O
+	// against it forever instead of failing over to a surviving multipath
+	// path — verified live, a NAS reboot / single link failure parked pods in
+	// D-state with this disabled. A NEGATIVE value restores the historical
+	// disabled behavior (flag omitted entirely from the command line); only an
+	// explicit negative value can do this, so an unset/zero config can never
+	// accidentally disable the fix.
+	FastIOFailTmo int `yaml:"fastIOFailTmo"`
+
+	// NrIOQueues and NrWriteQueues override --nr-io-queues / --nr-write-queues
+	// on every `nvme connect`. Nil (default) omits the flag entirely, so
+	// nvme-cli's own defaults apply — byte-identical to a pre-N4 command line.
+	// Worth exposing even though the default is left untouched: live
+	// measurement on a 16-CPU node showed 953 established TCP connections to
+	// the NAS from ONE node for 14 volumes (4 multipath paths x ~17 queues per
+	// controller from unconfigured queue defaults alone), so a value in the
+	// 4-8 range is the intended lever for anyone who needs to pull it.
+	NrIOQueues    *int `yaml:"nrIOQueues"`
+	NrWriteQueues *int `yaml:"nrWriteQueues"`
+
+	// KeepAliveTmo overrides --keep-alive-tmo (seconds) on every `nvme
+	// connect`. Nil (default) omits the flag entirely.
+	KeepAliveTmo *int `yaml:"keepAliveTmo"`
 }
 
 // NVMeoFPortConfig holds install-wide NVMe-oF port performance fields. Pointer
@@ -1590,6 +1628,19 @@ func validateConfig(cfg *Config) error {
 		}
 		if v := cfg.NVMeoF.PortPerf.MaxQueueSize; v != nil && *v < 1 {
 			return fmt.Errorf("nvmeof.portPerf.maxQueueSize must be positive (got %d)", *v)
+		}
+		// NOTE: connect.fastIOFailTmo is deliberately NOT range-checked here: a
+		// negative value is a valid, documented sentinel (omit the flag,
+		// reproducing the historical disabled behavior), unlike every field in
+		// validateNonNegativeConfig.
+		if v := cfg.NVMeoF.Connect.NrIOQueues; v != nil && *v < 1 {
+			return fmt.Errorf("nvmeof.connect.nrIOQueues must be positive (got %d)", *v)
+		}
+		if v := cfg.NVMeoF.Connect.NrWriteQueues; v != nil && *v < 1 {
+			return fmt.Errorf("nvmeof.connect.nrWriteQueues must be positive (got %d)", *v)
+		}
+		if v := cfg.NVMeoF.Connect.KeepAliveTmo; v != nil && *v < 1 {
+			return fmt.Errorf("nvmeof.connect.keepAliveTmo must be positive (got %d)", *v)
 		}
 	}
 	return nil

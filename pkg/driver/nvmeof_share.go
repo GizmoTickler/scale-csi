@@ -110,13 +110,48 @@ func (d *Driver) nvmeofPortCreateOpts() truenas.NVMeoFPortCreateOptions {
 // Both the port get-or-create and the association create are already-exists
 // tolerant, so calling this repeatedly for the same subsystem converges rather
 // than duplicating objects.
-func (d *Driver) associateNVMeoFPorts(ctx context.Context, subsysID int, addresses []string) ([]int, error) {
+//
+// checkExisting is false on the brand-new-subsystem path (a subsystem that was
+// just created has, by construction, zero existing associations, so listing
+// first would be a pure extra round trip with nothing to find — the original
+// blind create is already optimal there and the CreateVolume API-call-count
+// golden test pins that exact shape) and true on the "already exists" publish
+// convergence path (C5): that path is reached on EVERY ControllerPublishVolume
+// for an existing multipath volume (see the "E-6 convergence (F-4)" comment on
+// that caller), so a blind create-per-address there means every publish,
+// forever, re-attempts an association it almost always already has. Before
+// this fix that blind create failed already-exists on every steady-state
+// call, and NVMeoFPortSubsysCreate reacts to that failure with its own
+// recovery query — live counters showed exactly 4 creates + 4 recovery
+// queries per 4-address publish (~420ms of a 1.15s publish). ONE
+// NVMeoFPortSubsysListBySubsystem query up front (already exported for this
+// purpose) tells us what is already associated, so the loop below only calls
+// NVMeoFPortSubsysCreate for an address that is actually missing — steady
+// state becomes that one query and zero creates.
+func (d *Driver) associateNVMeoFPorts(ctx context.Context, subsysID int, addresses []string, checkExisting bool) ([]int, error) {
 	if len(addresses) == 0 {
 		return nil, nil
 	}
 	portOpts := d.nvmeofPortCreateOpts()
+	var existingByPortID map[int]*truenas.NVMeoFPortSubsys
+	if checkExisting {
+		existingAssociations, listErr := d.truenasClient.NVMeoFPortSubsysListBySubsystem(ctx, subsysID)
+		if listErr != nil {
+			return nil, fmt.Errorf("failed to list existing NVMe-oF port associations for subsystem %d: %w", subsysID, listErr)
+		}
+		existingByPortID = make(map[int]*truenas.NVMeoFPortSubsys, len(existingAssociations))
+		for _, assoc := range existingAssociations {
+			if assoc != nil {
+				existingByPortID[assoc.PortID] = assoc
+			}
+		}
+	}
 	portSubsysIDs := make([]int, 0, len(addresses))
 	for _, addr := range addresses {
+		// Address -> port resolution is itself already-exists-tolerant AND
+		// process-lifetime cached (NVMeoFGetOrCreatePort), so this is a free
+		// cache hit in steady state; it is only ever a real API call the first
+		// time this address is seen by this controller process.
 		port, portErr := d.truenasClient.NVMeoFGetOrCreatePort(
 			ctx,
 			d.config.NVMeoF.Transport,
@@ -126,6 +161,10 @@ func (d *Driver) associateNVMeoFPorts(ctx context.Context, subsysID int, address
 		)
 		if portErr != nil {
 			return portSubsysIDs, fmt.Errorf("failed to get/create NVMe-oF port for %s: %w", addr, portErr)
+		}
+		if assoc, ok := existingByPortID[port.ID]; ok {
+			portSubsysIDs = append(portSubsysIDs, assoc.ID)
+			continue
 		}
 		assoc, assocErr := d.truenasClient.NVMeoFPortSubsysCreate(ctx, port.ID, subsysID)
 		if assocErr != nil {
@@ -218,8 +257,10 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 			// existing volume therefore advertised paths it had no port_subsys
 			// association for. Converge here so the advertisement is true.
 			// No-op (zero extra API calls) when multipath is off, which is the
-			// default, so the single-port path is unchanged.
-			if _, assocErr := d.associateNVMeoFPorts(ctx, subsys.ID, d.config.NVMeoF.multipathAddresses()); assocErr != nil {
+			// default, so the single-port path is unchanged. checkExisting=true
+			// (C5): this is the steady-state per-publish path, so diff against
+			// what already exists instead of blindly re-creating every address.
+			if _, assocErr := d.associateNVMeoFPorts(ctx, subsys.ID, d.config.NVMeoF.multipathAddresses(), true); assocErr != nil {
 				return status.Errorf(codes.Internal, "failed to converge NVMe-oF multipath port associations: %v", assocErr)
 			}
 			klog.Infof("NVMe-oF share already exists for %s (namespace=%d, subsystem=%d)", datasetName, namespace.ID, subsys.ID)
@@ -294,7 +335,13 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 	if len(addresses) == 0 {
 		addresses = []string{d.config.NVMeoF.TransportAddress}
 	}
-	portSubsysIDs, assocErr := d.associateNVMeoFPorts(ctx, subsys.ID, addresses)
+	// checkExisting=false (C5): a brand-new subsystem has zero associations by
+	// construction (or, on the subsysWasExisting resume path, this call is rare
+	// enough that the extra list round trip is not worth complicating the
+	// fresh-create call-count contract for); the blind create-per-address here
+	// is already optimal and is pinned by the CreateVolume API-call-count
+	// golden test.
+	portSubsysIDs, assocErr := d.associateNVMeoFPorts(ctx, subsys.ID, addresses, false)
 	if assocErr != nil {
 		// Cleanup subsystem on port/association failure - the volume would be
 		// unusable without a port. Deleting the subsystem also reaps every

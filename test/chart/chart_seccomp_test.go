@@ -22,6 +22,21 @@ func podSecurityContextOf(t *testing.T, workload manifest, name string) manifest
 	return context
 }
 
+// cronJobPodSecurityContextOf is podSecurityContextOf for a CronJob, whose pod
+// template sits one level deeper under spec.jobTemplate.spec.template.spec.
+func cronJobPodSecurityContextOf(t *testing.T, workload manifest, name string) manifest {
+	t.Helper()
+	spec, ok := asManifest(workload["spec"])
+	if !ok {
+		t.Fatalf("%s workload has no spec", name)
+	}
+	jobTemplate, ok := asManifest(spec["jobTemplate"])
+	if !ok {
+		t.Fatalf("%s workload has no jobTemplate", name)
+	}
+	return podSecurityContextOf(t, jobTemplate, name)
+}
+
 func seccompProfileType(context manifest) (string, bool) {
 	profile, ok := asManifest(context["seccompProfile"])
 	if !ok {
@@ -66,6 +81,35 @@ func TestChartControllerPodSeccompDefault(t *testing.T) {
 	}
 	if _, present := nodeContext["seccompProfile"]; present {
 		t.Errorf("node DaemonSet pod must NOT gain a pod-level seccompProfile (privileged driver + iSCSI/NVMe tooling); got %#v", nodeContext["seccompProfile"])
+	}
+}
+
+// TestChartReconcileCronJobPodSeccompDefault is the regression test for C10:
+// the reconcile CronJob runs the CONTROLLER image and is authorized to
+// destroy backend objects (its very existence is gated on
+// reconcile.delete.enabled), so it must get the same controller-only seccomp
+// hardening as the controller Deployment — before the fix it applied only the
+// bare shared podSecurityContext, making it the one controller-image pod left
+// running seccomp-unconfined.
+func TestChartReconcileCronJobPodSeccompDefault(t *testing.T) {
+	rendered := helmTemplate(t, "--set", "reconcile.delete.enabled=true")
+	manifests := decodeManifests(t, rendered)
+
+	cronJob := findManifest(t, manifests, "CronJob", "-reconcile")
+	context := cronJobPodSecurityContextOf(t, cronJob, "reconcile")
+	if context == nil {
+		t.Fatal("reconcile CronJob pod rendered no pod-level securityContext")
+	}
+	if got, ok := seccompProfileType(context); !ok || got != "RuntimeDefault" {
+		t.Errorf("reconcile CronJob pod must default to seccompProfile RuntimeDefault (same as the controller Deployment); got %#v", context["seccompProfile"])
+	}
+	// The controller-only seccomp default must MERGE with (not replace) the
+	// shared podSecurityContext defaults, exactly like the controller pod.
+	if got, ok := context["runAsNonRoot"].(bool); !ok || got {
+		t.Errorf("reconcile CronJob pod lost the shared runAsNonRoot: false default; got %#v", context["runAsNonRoot"])
+	}
+	if got, ok := context["fsGroup"].(int); !ok || got != 0 {
+		t.Errorf("reconcile CronJob pod lost the shared fsGroup: 0 default; got %#v", context["fsGroup"])
 	}
 }
 

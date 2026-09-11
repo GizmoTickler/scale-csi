@@ -128,6 +128,14 @@ spec:
             summary: Scale CSI is refusing publishes on provenance overflow
             description: Additive fencing provenance exceeded the per-node cap; publishes fail closed with ResourceExhausted until grants drain.
             runbook_url: docs/guides/disaster-recovery.md#runbook-fencing-takeover-for-a-confirmed-dead-node
+        - alert: ScaleCSIStartupFencingUnconvergedVolume
+          expr: sum(scale_csi_startup_fencing_unconverged_volumes) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI quarantined a volume during startup fencing convergence
+            description: A startup fencing pass could not converge one or more volumes because of a stale publication record with no live VolumeAttachment; cluster-wide readiness was NOT held down for it. It normally clears once fencing.staleRecordGracePeriod elapses and the periodic stale-record sweep revokes the record — investigate if this holds past that window.
         - alert: ScaleCSIJobDispatcherUnsubscribed
           # Scoped to the controller job (codex H1): the gauge is published only
           # by controller-mode processes, but selecting the controller target

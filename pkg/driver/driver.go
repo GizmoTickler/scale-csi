@@ -174,6 +174,19 @@ type Driver struct {
 	gcWg     sync.WaitGroup
 
 	// Controller-side orphan reconcile context and cancellation.
+	// reconcileStateMu + reconcileStopped guard reconcileCancel with the same
+	// mutex + terminal-stopped-flag pattern reapRecordStateMu/reapRecordStopped
+	// and backendHealthStateMu/backendHealthStopped already use (C7): without
+	// it, a Stop() that races Run() between startOrphanReconcile entering and
+	// its plain `d.reconcileCancel = cancel` assignment can observe a nil
+	// cancel, skip cancellation, and let a full reconcile pass — including
+	// reconcileStalePublicationRecords, which REVOKES backend grants, and the
+	// adoption/migration property writes — run concurrently with
+	// GracefulStop()/truenasClient.Close(). Recording reconcileStopped under
+	// the same lock closes that window: a Stop() that wins the race is
+	// observed by startOrphanReconcile before it ever launches the loop.
+	reconcileStateMu       sync.Mutex
+	reconcileStopped       bool
 	reconcileCancel        context.CancelFunc
 	reconcileWg            sync.WaitGroup
 	startupReconcileCancel context.CancelFunc

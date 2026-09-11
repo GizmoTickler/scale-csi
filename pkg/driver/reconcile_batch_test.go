@@ -141,9 +141,12 @@ func TestClassifyOrphanVolumesBatchesSourceBearingReads(t *testing.T) {
 	}
 }
 
-// A failed chunk must record one orphan_volume_classify failure per affected
-// candidate and skip exactly those names — never classifying them as orphans
-// and never stopping the later chunks or failing the pass.
+// A failed chunk must record exactly ONE orphan_volume_classify failure per
+// batch (C13 — matching the sibling datasetGetByNamesChunked helper's
+// "batch-N" convention, not one per affected candidate, which used to inflate
+// reconcile_failures_total by the chunk size on a single transient error) and
+// skip exactly the chunk's names — never classifying them as orphans and
+// never stopping the later chunks or failing the pass.
 func TestClassifyOrphanVolumesChunkFailureSkipsOnlyAffectedCandidates(t *testing.T) {
 	client, d, datasets, names := newOrphanClassifyFixture(t, 600)
 	chunks := chunkDatasetNames(names, datasetGetByNamesBatchBudget)
@@ -159,8 +162,8 @@ func TestClassifyOrphanVolumesChunkFailureSkipsOnlyAffectedCandidates(t *testing
 
 	assert.Equal(t, len(datasets), managed, "the managed count precedes classification and must survive a chunk failure")
 	assert.Equal(t, len(chunks), client.datasetGetByNamesCalls, "a failed chunk must not stop later chunks")
-	assert.Equal(t, failuresBefore+float64(len(chunks[1])), testutil.ToFloat64(failureMetric),
-		"every candidate in the failed chunk records its own failure")
+	assert.Equal(t, failuresBefore+1, testutil.ToFloat64(failureMetric),
+		"a failed batch covering multiple candidate names must record exactly one failure, not one per name")
 	failedNames := make(map[string]struct{}, len(chunks[1]))
 	for _, name := range chunks[1] {
 		failedNames[name] = struct{}{}

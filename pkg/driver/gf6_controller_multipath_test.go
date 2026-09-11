@@ -141,6 +141,43 @@ func TestISCSIMultipathDoesNotAdvertiseFromPreExistingOperatorTemplate(t *testin
 	assert.Equal(t, 1, target.Groups[0].Portal)
 }
 
+// TestCreateVolumeISCSIConvergenceFailureCleansUpTarget is the regression test
+// for C12: createISCSIShareForDataset's multipath target-group convergence
+// error arm (convergeISCSIMultipathTargetGroups failing) returns without
+// rolling back the iSCSI target it just created — every OTHER iSCSI failure
+// arm does roll back what it created, but this one doesn't. CreateVolume's
+// share-failure cleanup must therefore call deleteShare (which resolves an
+// unstamped target by its deterministic NAME, not just by dataset property)
+// before deleting the dataset, or the target is left behind extentless and
+// permanently invisible to detectOrphanedISCSIShares, which enumerates
+// EXTENTS and derives the dataset from extent.Disk.
+func TestCreateVolumeISCSIConvergenceFailureCleansUpTarget(t *testing.T) {
+	ctx := context.Background()
+	base := truenas.NewMockClient()
+	addGF6ISCSIPortals(base)
+	markGF6DefaultInitiatorOwned(base)
+	client := &iscsiTargetUpdateFailMock{MockClient: base, updateErr: fmt.Errorf("injected target-group convergence failure")}
+	d := newGF6ControllerDriver(t, client, ShareTypeISCSI)
+	// Multipath enabled BEFORE create, with an owned initiator template and two
+	// configured portals: the fresh target is created with only ONE group, so
+	// convergeISCSIMultipathTargetGroups finds work to do (changed=true) and
+	// reaches the ISCSITargetUpdate call this mock fails.
+	d.config.ISCSI.Multipath = true
+	d.config.ISCSI.Portals = []string{"192.0.2.11", "2001:db8::12"}
+
+	volumeName := "gf6-convergence-fail"
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest(volumeName, "iscsi"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to converge iSCSI multipath portal associations")
+
+	target, findErr := client.ISCSITargetFindByName(ctx, d.iscsiShareName(volumeName))
+	require.NoError(t, findErr)
+	assert.Nil(t, target, "the target created before convergence failed must be rolled back, not left as an extentless orphan")
+
+	_, getErr := client.DatasetGet(ctx, "pool/parent/"+volumeName)
+	assert.True(t, truenas.IsNotFoundError(getErr), "the dataset must also be rolled back")
+}
+
 func TestISCSIPublishAssociationFailureNeverAdvertisesPortals(t *testing.T) {
 	ctx := context.Background()
 	client := &iscsiTargetUpdateFailMock{MockClient: truenas.NewMockClient()}

@@ -808,8 +808,8 @@ func TestChartPrometheusRuleDefaultAlertCounts(t *testing.T) {
 		"--set", "metrics.prometheusRule.enabled=true")
 	defaultAlerts := strings.Count(defaultRender, "- alert:")
 	defaultRunbooks := strings.Count(defaultRender, "runbook_url:")
-	if defaultAlerts != 20 {
-		t.Errorf("default PrometheusRule render (prometheusRule.enabled, other defaults) must have 20 alerts, got %d", defaultAlerts)
+	if defaultAlerts != 21 {
+		t.Errorf("default PrometheusRule render (prometheusRule.enabled, other defaults) must have 21 alerts, got %d", defaultAlerts)
 	}
 	if defaultRunbooks != 11 {
 		t.Errorf("default PrometheusRule render must have 11 runbook_url annotations, got %d", defaultRunbooks)
@@ -818,8 +818,8 @@ func TestChartPrometheusRuleDefaultAlertCounts(t *testing.T) {
 	withDelete := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
 		"--set", "metrics.prometheusRule.enabled=true",
 		"--set", "reconcile.delete.enabled=true")
-	if got := strings.Count(withDelete, "- alert:"); got != 23 {
-		t.Errorf("prometheusRule + delete.enabled render must have 23 alerts, got %d", got)
+	if got := strings.Count(withDelete, "- alert:"); got != 24 {
+		t.Errorf("prometheusRule + delete.enabled render must have 24 alerts, got %d", got)
 	}
 	if got := strings.Count(withDelete, "runbook_url:"); got != 14 {
 		t.Errorf("prometheusRule + delete.enabled render must have 14 runbook_url annotations, got %d", got)

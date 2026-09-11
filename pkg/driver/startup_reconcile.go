@@ -127,6 +127,12 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 		volumeIDs = append(volumeIDs, volumeID)
 	}
 	sort.Strings(volumeIDs)
+	// (C11) Reset ONCE, before any worker can call RecordStartupFencingUnconverged,
+	// so a volume that converges on THIS pass drops out of the gauge instead of
+	// latching a stale 1 forever (mirrors ResetVolumeUsageMetrics). Must not run
+	// concurrently with the per-volume Set calls below, which is why it happens
+	// here rather than inside a worker.
+	ResetStartupFencingUnconvergedVolumes()
 	jobs := make(chan *startupFencingVolume)
 	results := make(chan error, len(volumeIDs))
 	workerCount := startupReconcileWorkers
@@ -193,6 +199,27 @@ func startupNodeIdentity(
 	return identity
 }
 
+// quarantineStaleStartupFencingVolume records the C11 carve-out for ONE
+// volume whose startup fencing convergence is blocked ONLY by a stale
+// publication record (proven by stalePublishedRecordNode: staleNode has no
+// live VolumeAttachment in this pass's snapshot). It logs, raises a Warning
+// Event against the volume's PV, and marks the visibility gauge — then
+// returns nil so this volume never joins reconcilePublishedAttachments'
+// errors.Join and never holds strict-mode readiness down for every OTHER
+// volume. Mirrors the errGeometryUnestablishable carve-out immediately below
+// in this file, which uses the same log/event/return-nil shape for a
+// different permanent-vs-transient distinction.
+func (d *Driver) quarantineStaleStartupFencingVolume(volume *startupFencingVolume, staleNode string, cause error) error {
+	klog.Warningf("Startup fencing for volume %s is blocked by a stale publication record for node %s "+
+		"(no live VolumeAttachment); not holding cluster-wide readiness on it, it will clear once "+
+		"fencing.staleRecordGracePeriod elapses: %v", volume.volumeID, staleNode, cause)
+	d.recordWarningEvent(volume.pv, "StartupFencingStaleRecordConflict",
+		fmt.Sprintf("startup fencing quarantined (stale publication record for node %s, no live VolumeAttachment): %v",
+			staleNode, cause))
+	RecordStartupFencingUnconverged(volume.volumeID)
+	return nil
+}
+
 func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *startupFencingVolume) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -237,6 +264,17 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	}
 	desired := make(map[string]publicationRecord)
 	deferred := false
+	// (C11) liveNodes is the set of node names this pass actually observed a
+	// live VolumeAttachment for. A conflicting published record whose node is
+	// NOT in this set cannot be a genuine concurrent claim — reconcileStale
+	// PublicationRecords is the only thing that could still be racing it, and
+	// that mechanism only ever REVOKES, never re-publishes. Used below to tell
+	// that shape apart from a real (or transient dual-VA migration) conflict,
+	// which must keep blocking exactly as before.
+	liveNodes := make(map[string]struct{}, len(volume.publications))
+	for _, publication := range volume.publications {
+		liveNodes[publication.identity.Name] = struct{}{}
+	}
 	// Per-volume memo so the validate/classify/ensure/apply phases resolve the
 	// backend share objects once and reuse them across this startup pass (see
 	// fenceResolution). The per-volume lock is held for the whole pass.
@@ -252,6 +290,20 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 			return fmt.Errorf("encode attached node %s identity: %w", publication.identity.Name, recordErr)
 		}
 		if compatibilityErr := validatePublicationCompatibility(compatibilityRecords, record); compatibilityErr != nil {
+			// (C11) A conflict whose ONLY blocking record has no live
+			// VolumeAttachment at all is a stale record left by a force-removed
+			// VA finalizer, not a real concurrent claim. Quarantine this ONE
+			// volume — like the errGeometryUnestablishable carve-out below does
+			// for a permanent geometry refusal — instead of holding cluster-wide
+			// strict readiness down for up to fencing.staleRecordGracePeriod
+			// (observed live: 10-20 minutes of no provisioning/attaches after
+			// every controller restart, for a single stale volume). The
+			// periodic reconcileStalePublicationRecords sweep is what actually
+			// revokes the stale record; this only stops it from also blocking
+			// every OTHER volume in the meantime.
+			if staleNode, found := stalePublishedRecordNode(compatibilityRecords, liveNodes); found {
+				return d.quarantineStaleStartupFencingVolume(volume, staleNode, compatibilityErr)
+			}
 			// Transient dual-VA states are normal during migration. Both modes retry
 			// this volume; strict readiness remains false, but the process stays up.
 			return fmt.Errorf("startup fencing for volume %s has not converged: %w", volume.volumeID, compatibilityErr)
@@ -259,6 +311,10 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 		if compatibilityErr := d.validateBackendSingleNodeCompatibility(
 			ctx, dataset, datasetName, shareType, publication.identity, compatibilityRecords, publication.mode, res,
 		); compatibilityErr != nil {
+			// (C11) Same carve-out for the backend-allowlist half of the check.
+			if staleNode, found := stalePublishedRecordNode(compatibilityRecords, liveNodes); found {
+				return d.quarantineStaleStartupFencingVolume(volume, staleNode, compatibilityErr)
+			}
 			return fmt.Errorf("startup fencing for volume %s has not converged: %w", volume.volumeID, compatibilityErr)
 		}
 		key := publicationPropertyKey(publication.identity.Name)

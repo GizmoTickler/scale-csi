@@ -611,6 +611,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if err != nil {
 		return nil, err
 	}
+	// cloneSourceVolumeID is set only for a volume-to-volume clone request, and
+	// drives the source-lock acquisition below (C4).
+	var cloneSourceVolumeID string
 	if source := req.GetVolumeContentSource(); source != nil {
 		if snapshot := source.GetSnapshot(); snapshot != nil {
 			if validationErr := d.validateSnapshotHandleShape(snapshot.GetSnapshotId()); validationErr != nil {
@@ -620,6 +623,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			if _, validationErr := d.datasetForID(volume.GetVolumeId()); validationErr != nil {
 				return nil, validationErr
 			}
+			cloneSourceVolumeID = volume.GetVolumeId()
 		}
 	}
 
@@ -646,6 +650,31 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 		klog.V(4).Infof("CreateVolume: accessibility_requirements requisite=%v preferred=%v",
 			reqTopologies, prefTopologies)
+	}
+
+	// (C4) A volume-to-volume clone must acquire the SOURCE volume's lock
+	// BEFORE the destination's, mirroring CreateSnapshot's "always acquire the
+	// source-volume lock before the snapshot lock" rule and its rationale:
+	// this serializes clone creation with DeleteVolume(source) and gives every
+	// creator across the driver a single fixed lock order. Without it,
+	// DeleteVolume(source) could reach deleteOrphanedInternalCloneSourceSnapshots
+	// and destroy this clone's about-to-be-created "<source>@clone-source-<dest>"
+	// snapshot as "orphaned" one call before SnapshotClone needs it, or the
+	// reverse interleaving could leave the source's share deleted with its
+	// dataset still alive while every retry bails at the up-front
+	// dependent-clone check before rebuilding anything.
+	//
+	// A request cloning a volume from ITSELF (cloneSourceVolumeID == volumeID)
+	// must not attempt this: acquireOperationLock is a try-lock keyed by
+	// string, so a second acquire for the SAME key from this same goroutine
+	// would simply observe "already held" and abort a request that has no
+	// actual concurrency to serialize against.
+	if cloneSourceVolumeID != "" && cloneSourceVolumeID != volumeID {
+		sourceVolumeLockKey := volumeLockKey(cloneSourceVolumeID)
+		if !d.acquireOperationLock(sourceVolumeLockKey) {
+			return nil, status.Error(codes.Aborted, "operation already in progress for the source volume")
+		}
+		defer d.releaseOperationLock(sourceVolumeLockKey)
 	}
 
 	// Lock on the sanitized volume ID so all operations use the same key space.
@@ -1007,7 +1036,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// Create share (NFS, iSCSI, or NVMe-oF). A definitely fresh DatasetCreate
 	// result and the clone readiness path do not need another zvol poll.
 	if shareErr := d.createShareWithOptions(ctx, createdDS, datasetName, name, shareType, freshlyCreated, zvolReady, volumeProperties); shareErr != nil {
-		// Cleanup on failure
+		// (C12) Cleanup on failure. deleteShare MUST run before DatasetDelete,
+		// exactly like the property-write failure arm below: not every
+		// createShareWithOptions failure exit rolls back its own partial share
+		// objects (e.g. the iSCSI multipath-target-group convergence error arm
+		// returns after the target already exists with no local cleanup), so a
+		// dataset-only delete can strand an extentless iSCSI target — invisible
+		// to detectOrphanedISCSIShares, which is extent-keyed — or, under
+		// strict fencing, a deny-all initiator group with nothing left
+		// referencing it. deleteShare is itself tolerant of a share that was
+		// never created, so this is safe even on the exits that already clean
+		// up after themselves.
+		if delErr := d.deleteShare(ctx, createdDS, datasetName, shareType); delErr != nil {
+			klog.Warningf("Failed to cleanup share after share creation failure: %v", delErr)
+		}
 		if delErr := d.truenasClient.DatasetDelete(ctx, datasetName, false, true); delErr != nil {
 			klog.Warningf("Failed to cleanup dataset after share creation failure: %v", delErr)
 		}
@@ -1850,11 +1892,19 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	}
 
 	// Get origin snapshot property before deletion (for volume-to-volume clones)
-	// This snapshot was created during cloning and should be cleaned up after the clone is deleted
+	// This snapshot was created during cloning and should be cleaned up after the clone is deleted.
+	//
+	// MUST be the LOCAL value only, like every other ownership decision in this
+	// file. ZFS clones inherit their origin's user properties: if V2 is a
+	// volume-to-volume clone of V1 (local volume_origin_snapshot =
+	// V1@clone-source-V2), S is a snapshot of V2, and V3 is a clone of S, V3
+	// INHERITS that property from S (source != "local"). A raw map read here
+	// would then hand V3's DeleteVolume the identity of the snapshot V2 — a
+	// separate LIVE volume — is cloned from, and destroy it out from under V2.
 	var originSnapshotID string
 	if ds != nil {
-		if prop, ok := ds.UserProperties[PropVolumeOriginSnapshot]; ok && prop.Value != "" && prop.Value != "-" {
-			originSnapshotID = prop.Value
+		if value := datasetLocalUserProperty(ds, PropVolumeOriginSnapshot); value != "" {
+			originSnapshotID = value
 		}
 	}
 
@@ -4354,6 +4404,22 @@ func (d *Driver) handleVolumeContentSource(
 				PropVolumeContentSourceType: "snapshot",
 				PropVolumeContentSourceID:   snapshotID,
 				PropDriverInstanceID:        d.driverInstanceID(),
+				// (C3) Explicitly sever inheritance of volume_origin_snapshot from
+				// the source snapshot. This property names a driver-internal temp
+				// snapshot minted for VOLUME-to-volume cloning ("clean up this
+				// dataset's own clone-source snapshot on delete") — it does not
+				// apply to a clone made FROM a snapshot, and does not belong in
+				// inheritedProtocolPropertyKeys either (that scrub is scoped to
+				// foreign-PROTOCOL share-object IDs, not this). Without a local "-"
+				// override here, a clone of a snapshot taken from a volume-to-volume
+				// clone would silently inherit that other volume's origin-snapshot
+				// reference, which every LOCAL-only reader (see
+				// datasetLocalUserProperty) already refuses to act on — but leaving
+				// it inherited rather than explicitly cleared was exactly the
+				// half-fixed state that made the hazard possible in the first place.
+				// Matches the sentinel already used for the same property on the
+				// detached-copy path (provenance.go).
+				PropVolumeOriginSnapshot: "-",
 			}
 			for key, value := range iscsiCHAPPolicyProps(ctx, shareType) {
 				foldProps[key] = value

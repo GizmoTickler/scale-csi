@@ -180,6 +180,25 @@ data:
       addresses:
         {{- toYaml .Values.nvmeof.addresses | nindent 8 }}
       {{- end }}
+      {{- /* N4: node-side `nvme connect` CLI knobs render ONLY when a value
+           differs from its byte-identical-to-historical default (0 for
+           fastIOFailTmo, null for the rest), so a default install's ConfigMap
+           carries no connect key at all. */}}
+      {{- if or (ne (.Values.nvmeof.connect.fastIOFailTmo | default 0 | int) 0) (not (kindIs "invalid" .Values.nvmeof.connect.nrIOQueues)) (not (kindIs "invalid" .Values.nvmeof.connect.nrWriteQueues)) (not (kindIs "invalid" .Values.nvmeof.connect.keepAliveTmo)) }}
+      connect:
+        {{- if ne (.Values.nvmeof.connect.fastIOFailTmo | default 0 | int) 0 }}
+        fastIOFailTmo: {{ .Values.nvmeof.connect.fastIOFailTmo | int }}
+        {{- end }}
+        {{- if not (kindIs "invalid" .Values.nvmeof.connect.nrIOQueues) }}
+        nrIOQueues: {{ .Values.nvmeof.connect.nrIOQueues }}
+        {{- end }}
+        {{- if not (kindIs "invalid" .Values.nvmeof.connect.nrWriteQueues) }}
+        nrWriteQueues: {{ .Values.nvmeof.connect.nrWriteQueues }}
+        {{- end }}
+        {{- if not (kindIs "invalid" .Values.nvmeof.connect.keepAliveTmo) }}
+        keepAliveTmo: {{ .Values.nvmeof.connect.keepAliveTmo }}
+        {{- end }}
+      {{- end }}
     {{- end }}
 
     # Session garbage collection (node plugin only)

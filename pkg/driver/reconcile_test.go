@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,6 +47,49 @@ func (c *republishOnDatasetGetClient) DatasetGet(ctx context.Context, name strin
 	return c.MockClient.DatasetGet(ctx, name)
 }
 
+// failDatasetGetByNamesClient fails every DatasetGetByNames call while
+// delegating everything else, so a batched re-fetch failure can be forced
+// without also breaking the earlier listing/state-load steps of a reconcile
+// pass (unlike the blanket client.InjectError, which several other methods
+// also check).
+type failDatasetGetByNamesClient struct {
+	*truenas.MockClient
+	err error
+}
+
+func (c *failDatasetGetByNamesClient) DatasetGetByNames(ctx context.Context, names []string) (map[string]*truenas.Dataset, error) {
+	return nil, c.err
+}
+
+// TestClassifyOrphanVolumesRecordsOneFailurePerBatchNotPerName is the
+// regression test for C13: a failed DatasetGetByNames batch must record ONE
+// reconcile_failures_total{phase="orphan_volume_classify"} increment (matching
+// the sibling datasetGetByNamesChunked helper's "batch-N" convention), not one
+// per name in the batch. Chunks commonly hold several hundred names, so a
+// single transient query timeout used to inflate the counter by the chunk
+// size and emit that many error log lines — enough to fire any rate-based
+// alert on one blip. Three candidate names here all land in the same chunk
+// (well under the 32 KiB budget), so pre-fix this counted 3, post-fix 1.
+func TestClassifyOrphanVolumesRecordsOneFailurePerBatchNotPerName(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false, nil, nil)
+	old := time.Now().Add(-48 * time.Hour)
+	addReconcileDataset(client, "orphan-a", old, true, 100)
+	addReconcileDataset(client, "orphan-b", old, true, 100)
+	addReconcileDataset(client, "orphan-c", old, true, 100)
+	failing := &failDatasetGetByNamesClient{MockClient: client, err: fmt.Errorf("injected batch failure")}
+	d.truenasClient = failing
+
+	before := testutil.ToFloat64(reconcileFailuresTotal.WithLabelValues("orphan_volume_classify"))
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	assert.Empty(t, report.OrphanVolumes, "candidates whose re-fetch failed must not be classified as orphans")
+
+	after := testutil.ToFloat64(reconcileFailuresTotal.WithLabelValues("orphan_volume_classify"))
+	assert.Equal(t, float64(1), after-before,
+		"a single failed batch covering multiple candidate names must record exactly one failure, not one per name")
+}
+
 func TestReconcileOrphansDetectsOnlyOldNonLiveManagedResources(t *testing.T) {
 	d, client := newReconcileTestDriver(t, false,
 		[]runtime.Object{reconcilePV("live-volume", "csi.scale.io")},
@@ -73,6 +117,42 @@ func TestReconcileOrphansDetectsOnlyOldNonLiveManagedResources(t *testing.T) {
 	assert.Empty(t, report.DeletedVolumes)
 	assert.Empty(t, report.DeletedSnapshots)
 	assert.Empty(t, client.DatasetDeleteCalls)
+}
+
+// TestReconcileOrphansEarlyFailureDoesNotZeroOrphanMetrics is the regression
+// test for C2: a pass that fails BEFORE observing any backend state (here,
+// loadKubernetesReconcileState failing on its PersistentVolumeClaims list, one
+// of the early-return sites the defect names) must not publish the zero-value
+// report over the previous pass's real inventory gauges. Three production
+// alerts (ScaleCSIOrphanedBackendObjects, ScaleCSISpentRestoreBacklog,
+// ScaleCSIManualRecoveryTombstones) are keyed on exactly these gauges, so a
+// transient TrueNAS/API blip resetting them to 0 would reset every alert's
+// `for:` hold.
+func TestReconcileOrphansEarlyFailureDoesNotZeroOrphanMetrics(t *testing.T) {
+	d, client := newReconcileTestDriver(t, false,
+		[]runtime.Object{reconcilePV("live-volume", "csi.scale.io")}, nil,
+	)
+	old := time.Now().Add(-48 * time.Hour)
+	addReconcileDataset(client, "live-volume", old, true, 100)
+	addReconcileDataset(client, "orphan-volume", old, true, 200)
+
+	report, err := d.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
+	require.NoError(t, err)
+	require.Equal(t, 1, report.OrphanVolumeCount)
+	require.Equal(t, float64(1), testutil.ToFloat64(orphanVolumes),
+		"a successful pass must publish the real inventory")
+
+	fakeClientset, ok := d.eventRecorder.clientset.(*kubernetesfake.Clientset)
+	require.True(t, ok)
+	fakeClientset.PrependReactor("list", "persistentvolumeclaims", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("injected PersistentVolumeClaims list failure")
+	})
+
+	_, err = d.ReconcileOrphans(context.Background(), ReconcileOptions{MinOrphanAge: time.Hour})
+	require.Error(t, err, "the pass must fail before ever reaching classification")
+
+	assert.Equal(t, float64(1), testutil.ToFloat64(orphanVolumes),
+		"a pass that failed before observing any backend state must not reset the orphan inventory gauge to zero")
 }
 
 func TestReconcileOrphansGuardedDeleteRefusesDependentVolume(t *testing.T) {
@@ -761,6 +841,83 @@ func TestControllerReconcileCadenceDoesNotExceedStaleGrace(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, controllerReconcileCadence(5*time.Minute, 10*time.Minute))
 }
 
+// callCountingClient wraps a *truenas.MockClient (via the same embed-and-override
+// pattern as republishOnDatasetGetClient above) purely to count calls the
+// startOrphanReconcile timing tests below need at sub-second resolution, which
+// the mock itself does not expose for these two methods.
+type callCountingClient struct {
+	*truenas.MockClient
+	snapshotListAllCalls      atomic.Int64
+	datasetQueryByParentCalls atomic.Int64
+}
+
+func (c *callCountingClient) SnapshotListAll(ctx context.Context, parentDataset string, limit, offset int) ([]*truenas.Snapshot, error) {
+	c.snapshotListAllCalls.Add(1)
+	return c.MockClient.SnapshotListAll(ctx, parentDataset, limit, offset)
+}
+
+func (c *callCountingClient) DatasetQueryByParent(ctx context.Context, parentDataset string) ([]*truenas.Dataset, error) {
+	c.datasetQueryByParentCalls.Add(1)
+	return c.MockClient.DatasetQueryByParent(ctx, parentDataset)
+}
+
+// TestOrphanReconcileHeavyPassUsesIntervalNotFencingGraceCadence is the
+// regression test for C1: with fencing enabled and a stale-record grace period
+// far shorter than reconcile.interval, the heavy orphan-detection pass (which
+// issues the snapshot listing SnapshotListAll, among the "two full backend
+// listings" the field finding called out) must still only run on
+// reconcile.interval, not on the shorter fencing cadence. Before the fix,
+// startOrphanReconcile ran the ENTIRE reconcileOrphans pass — including this
+// snapshot listing — at the shorter of the two, so it fired on every grace
+// tick.
+func TestOrphanReconcileHeavyPassUsesIntervalNotFencingGraceCadence(t *testing.T) {
+	d, base := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Reconcile.Enabled = true
+	d.config.Reconcile.Interval = "3s"
+	d.config.Fencing = FencingConfig{Mode: FencingModeStrict, StaleRecordGracePeriod: "20ms"}
+	counting := &callCountingClient{MockClient: base}
+	d.truenasClient = counting
+
+	d.startOrphanReconcile()
+	t.Cleanup(d.stopOrphanReconcile)
+
+	// Wait for many multiples of the 20ms grace cadence — proof the fast/light
+	// loop is actually ticking — while the 3s interval cannot have elapsed.
+	require.Eventually(t, func() bool {
+		return counting.datasetQueryByParentCalls.Load() >= 5
+	}, 2*time.Second, 5*time.Millisecond, "the fencing-grace-cadence loop must keep running")
+
+	assert.Equal(t, int64(1), counting.snapshotListAllCalls.Load(),
+		"the heavy orphan-detection pass (snapshot listing) must run once at startup and then only on reconcile.interval, not on the much shorter fencing grace cadence")
+}
+
+// TestOrphanReconcileDisabledSkipsHeavyPassEvenWithFencingEnabled is the
+// regression test for C9: reconcile.enabled=false must fully disable the heavy
+// orphan-detection pass (and its adoption/migration writes) even when fencing
+// is on, leaving only the lightweight stale-publication-record repair running.
+// Before the fix, startOrphanReconcile's early return only fired when BOTH
+// reconcile.enabled and fencing were false, so fencing alone kept the full
+// pass — including its snapshot listing — running at the fencing cadence
+// while the startup banner printed orphanDetection=false.
+func TestOrphanReconcileDisabledSkipsHeavyPassEvenWithFencingEnabled(t *testing.T) {
+	d, base := newReconcileTestDriver(t, false, nil, nil)
+	d.config.Reconcile.Enabled = false
+	d.config.Reconcile.Interval = "3s"
+	d.config.Fencing = FencingConfig{Mode: FencingModeStrict, StaleRecordGracePeriod: "20ms"}
+	counting := &callCountingClient{MockClient: base}
+	d.truenasClient = counting
+
+	d.startOrphanReconcile()
+	t.Cleanup(d.stopOrphanReconcile)
+
+	require.Eventually(t, func() bool {
+		return counting.datasetQueryByParentCalls.Load() >= 5
+	}, 2*time.Second, 5*time.Millisecond, "the fencing-grace-cadence stale-publication-record repair must keep running")
+
+	assert.Equal(t, int64(0), counting.snapshotListAllCalls.Load(),
+		"reconcile.enabled=false must disable the heavy orphan-detection pass entirely, even with fencing on")
+}
+
 func TestStalePublicationMassAbsenceBrakeDefersAllRecords(t *testing.T) {
 	ctx := context.Background()
 	d, client := newReconcileTestDriver(t, false, nil, nil)
@@ -1337,6 +1494,48 @@ func TestReplicationJobSweepRunsAtStartupAndPeriodicallyWhenOrphanDetectionDisab
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
+// TestStopOrphanReconcileBeforeStartPreventsLoopFromEverRunning is the
+// regression test for C7: a Stop() that lands before Start() ever gets to
+// assign reconcileCancel (the field this whole loop is gated on) must be
+// observed by startOrphanReconcile and prevent the loop from EVER launching —
+// not merely fail to cancel a loop that started anyway. This models the
+// SIGTERM-during-startup race cmd/scale-csi/main.go can produce (Stop() runs
+// from the signal goroutine concurrently with Run()): before the fix,
+// stopOrphanReconcile() only ever canceled whatever reconcileCancel happened
+// to already be assigned, with no memory that a stop was ever requested, so a
+// Stop() that raced ahead of the assignment was silently lost and the
+// subsequent Start() launched a full, never-to-be-canceled reconcile loop —
+// including reconcileStalePublicationRecords (which REVOKES backend grants)
+// and the adoption/migration property writes — run concurrently with the
+// rest of shutdown.
+func TestStopOrphanReconcileBeforeStartPreventsLoopFromEverRunning(t *testing.T) {
+	d, client := newReconcileTestDriver(t, true, nil, nil)
+	d.config.Reconcile = ReconcileConfig{Enabled: true, Interval: "24h", MinOrphanAge: "24h"}
+	mustCreateParentDataset(t, client)
+	createReplicationSweepDataset(t, client, "pool/parent/source")
+	createReplicationSweepDataset(t, client, "pool/parent/target")
+	client.AddReplicationJob(&truenas.ReplicationJob{
+		ID: 999, Method: truenas.ReplicationRunOnetimeMethod, State: "RUNNING",
+		SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/target",
+	})
+
+	// Stop BEFORE Start ever runs — the observable analogue of a Stop() that
+	// wins the race against reconcileCancel's assignment.
+	d.stopOrphanReconcile()
+	d.startOrphanReconcile()
+	t.Cleanup(d.stopOrphanReconcile)
+
+	// The fast loop's first run() call (the replication job sweep) happens
+	// synchronously at goroutine start, well inside this window, if the loop
+	// was allowed to launch at all. require.Never polls repeatedly rather
+	// than sleeping once, so this is not a fixed-delay race either way.
+	require.Never(t, func() bool {
+		aborted, _ := client.ReplicationJobAbortHistory()
+		return len(aborted) > 0
+	}, 300*time.Millisecond, 10*time.Millisecond,
+		"a reconcile loop must never launch once Stop() has already been observed")
+}
+
 func createReplicationSweepDataset(t *testing.T, client *truenas.MockClient, name string) {
 	t.Helper()
 	_, err := client.DatasetCreate(context.Background(), &truenas.DatasetCreateParams{Name: name, Type: "FILESYSTEM"})
@@ -1654,7 +1853,7 @@ func TestOrphanShareSweepDetectsAndDeletesShareWhoseDatasetIsGone(t *testing.T) 
 	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
 	assert.Equal(t, 1, report.OrphanShareCount)
 
-	d.deleteOrphanedShares(ctx, &report, 5)
+	d.deleteOrphanedShares(ctx, &report, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
 
@@ -1747,7 +1946,7 @@ func TestOrphanShareSweepDetectsAndDeletesISCSIShareWhoseDatasetIsGone(t *testin
 	assert.Equal(t, ShareTypeISCSI, report.OrphanShares[0].Protocol)
 	assert.Equal(t, 1, report.OrphanShareCount)
 
-	d.deleteOrphanedShares(ctx, &report, 5)
+	d.deleteOrphanedShares(ctx, &report, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
 
@@ -1819,7 +2018,7 @@ func TestOrphanShareSweepDetectsAndDeletesNVMeoFShareWhoseDatasetIsGone(t *testi
 	assert.Equal(t, ShareTypeNVMeoF, report.OrphanShares[0].Protocol)
 	assert.Equal(t, 1, report.OrphanShareCount)
 
-	d.deleteOrphanedShares(ctx, &report, 5)
+	d.deleteOrphanedShares(ctx, &report, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
 

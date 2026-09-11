@@ -195,7 +195,10 @@ fencing:
   # Timeout for one background startup convergence attempt. Failures retry.
   startupReconcileTimeout: 10m
   # Continuous VolumeAttachment absence required before a stale publication
-  # record left by a force-removed VA finalizer can be revoked.
+  # record left by a force-removed VA finalizer can be revoked. Also sets the
+  # cadence of the lightweight repair pass that checks for it — see the
+  # COUPLING note on reconcile.interval above. Only that one lightweight
+  # repair runs this often; reconcile's heavy detection/write pass never does.
   staleRecordGracePeriod: 10m
 
 # Image configuration
@@ -226,6 +229,28 @@ controller:
   priorityClassName: system-cluster-critical
 
   # Render a PodDisruptionBudget only when replicas is greater than 1.
+  #
+  # (C10) This gate is deliberate, not a gap to close: a PodDisruptionBudget
+  # is a VOLUNTARY-eviction guard (node drain, `kubectl drain`, descheduler),
+  # and maxUnavailable: 0-style protection on a SINGLE replica does not
+  # protect that pod — it makes it UNDRAINABLE. `kubectl drain` (and any
+  # cluster upgrade or autoscaler-driven node replacement that uses it) would
+  # then hang forever waiting for a PDB that can never be satisfied, because
+  # evicting the one and only pod always violates "0 unavailable" with 1
+  # desired replica. There is no chart setting that gives you "protect a
+  # single replica from disruption" AND "stay drainable" at the same time —
+  # that combination is a genuine Kubernetes-level contradiction, not a
+  # limitation of this chart.
+  #
+  # If you need real disruption protection, the supported path is
+  # controller.replicas: 2 with fencing.mode additive or strict (the sidecars
+  # use leader election, so exactly one controller is ever active; see the
+  # "Additive/strict fencing requires exactly one non-overlapping controller"
+  # note above) — NOT fencing.mode off with backendHealth.enabled, which
+  # explicitly refuses replicas > 1 (see controller-deployment.yaml) because
+  # its poller has no leader-election gate of its own. At replicas: 2 this
+  # same maxUnavailable: 1 default already gives you real protection: one
+  # replica may always be evicted/drained while the other keeps serving.
   podDisruptionBudget:
     enabled: true
     # Set maxUnavailable to "" when using minAvailable.
@@ -299,6 +324,27 @@ node:
   # Maximum volumes Kubernetes may schedule to one node. Zero means unlimited
   # and preserves the CSI field's unset behavior.
   maxVolumesPerNode: 0
+
+  # (C10) Seconds kubelet waits after SIGTERM before SIGKILL. Left unset, the
+  # DaemonSet gets the Pod API default of 30s, but GracefulStop() blocks on
+  # in-flight RPCs and commandTimeouts.nvme / commandTimeouts.mount (both 30s
+  # by default) can each legitimately run close to that long on their own —
+  # a node-plugin pod killed mid-mount/mid-connect can leave a stuck mount or
+  # a half-torn-down session behind. Default comfortably above both.
+  terminationGracePeriodSeconds: 90
+
+  # (C10) DaemonSet rolling-update strategy, rendered explicitly and
+  # Helm-owned — mirrors the identical fix already applied to the controller
+  # Deployment (see controller-deployment.yaml): a server-defaulted strategy
+  # breaks a three-way-merge upgrade the same way there. maxSurge MUST stay 0
+  # here: hostNetwork: true means a surge pod's registrar (:9810) and
+  # liveness (:9808) HOST ports would collide with the outgoing pod's, so a
+  # surge can never actually schedule and would just wedge the rollout.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
 
   # Resource requests/limits for the node driver container
   resources:
@@ -709,6 +755,30 @@ nvmeof:
   # non-empty when multipath=true.
   addresses: []
 
+  # Node-side `nvme connect` CLI knobs (N4). Unlike portPerf above (a shared
+  # TrueNAS port object), these are HOST/CLI options applied on every node that
+  # stages a volume.
+  connect:
+    # --fast-io-fail-tmo (seconds). 0 (default) uses the driver's built-in 15s:
+    # with --ctrl-loss-tmo pinned to infinite, a controller stuck reconnecting
+    # would otherwise queue I/O against it forever instead of failing over to a
+    # surviving multipath path — verified live, a NAS reboot / single link
+    # failure parked pods in D-state with this disabled. Set to a NEGATIVE
+    # value to restore the historical disabled behavior (omits the flag
+    # entirely); only an explicit negative value can do this.
+    fastIOFailTmo: 0
+    # --nr-io-queues / --nr-write-queues. Unset (null, default) omits the flag
+    # so nvme-cli's own defaults apply — unchanged from a pre-N4 install.
+    # Worth exposing even though the default is left untouched: live
+    # measurement on a 16-CPU node showed 953 established TCP connections to
+    # the NAS from ONE node for 14 volumes (4 multipath paths x ~17 queues per
+    # controller from unconfigured queue defaults alone). A value in the 4-8
+    # range is the intended lever if you need to pull it.
+    nrIOQueues: null
+    nrWriteQueues: null
+    # --keep-alive-tmo (seconds). Unset (null, default) omits the flag.
+    keepAliveTmo: null
+
   # commandTimeout was removed: it was never wired to anything. The nvme CLI
   # timeout is commandTimeouts.nvme. The schema still accepts the old key
   # (ignored) so existing values files pass validation.
@@ -926,6 +996,17 @@ sidecars:
     # How often to retry acquiring the lock (default: 10s, upstream default: 5s)
     # Must be less than renewDeadline
     retryPeriod: 10s
+
+  # (C10) Caps the exponential backoff the provisioner/attacher/resizer
+  # sidecars use to retry a FAILED CSI call (e.g. a rejected
+  # ControllerUnpublishVolume during a TrueNAS blip) — separate from
+  # leaderElection above, which is about acquiring the leader lock, not
+  # retrying application calls. Upstream's own default is 5 MINUTES: after a
+  # transient backend outage, a failed unpublish backs off to once every 5m,
+  # which is the single largest avoidable contributor to a node reboot
+  # stranding volumes attached. Applied to provisioner/attacher/resizer only
+  # (not snapshotter, which upstream does not expose this flag for).
+  retryIntervalMax: 30s
 
   provisioner:
     # The upstream image is a static Go binary and is compatible with the
@@ -1241,6 +1322,18 @@ reconcile:
   # value (3x interval, rendered to seconds by the chart), so lengthening the
   # interval lengthens the stall threshold in lockstep — no separate alert knob
   # to keep in sync. Keep alertAfter (below) strictly greater than 2x interval.
+  #
+  # COUPLING with fencing.staleRecordGracePeriod: when fencing.mode is not
+  # "off", the controller ALSO runs a much lighter stale-publication-record
+  # repair pass on its own timer, capped at staleRecordGracePeriod (it cannot
+  # wait longer than the window it exists to close). ONLY that lightweight
+  # repair uses the shorter cadence — the full pass this `interval` controls
+  # (both backend listings, every bookkeeping sweep, and the ownership-stamp /
+  # property-namespace migration WRITES) always runs on `interval`, never on
+  # the fencing grace period. Before this split, the entire heavy pass ran at
+  # min(interval, staleRecordGracePeriod): with the defaults below that is
+  # every 10m instead of every 1h — 6x the intended listing/write volume
+  # (VERIFIED LIVE, 2026-09-11).
   interval: 1h
 
   # Managed backend objects must be older than this before they are orphaned.
@@ -1333,11 +1426,24 @@ reconcile:
     # thundering herd. CronJob concurrencyPolicy=Forbid plus a 4-8 minute run
     # will not overlap. Inert until enabled is true.
     schedule: "20 4,10,16,22 * * *"
+    # (C10) Guards against concurrencyPolicy: Forbid silently stopping ALL
+    # future reconciliation forever: Forbid means a wedged Job is never
+    # superseded, only killed by its own deadline. Comfortably inside the
+    # ~6-hourly schedule gap so a killed run cannot overlap the next
+    # scheduled fire (backoffLimit=1 means one retry inside this budget too).
+    activeDeadlineSeconds: 3600
+    # (C10) Bounds how late a missed schedule fire (e.g. the controller was
+    # down at trigger time) may still start; beyond this Kubernetes counts it
+    # a missed run instead of queuing it forever. Shorter than the ~6h gap
+    # between fires so a prolonged outage skips stale runs cleanly rather
+    # than firing a backlog of them back-to-back on recovery.
+    startingDeadlineSeconds: 900
     # Per-helper DESTRUCTIVE deletion allowance, NOT a single pass-wide ceiling
     # and NOT the always-on repair budget. deleteDetectedOrphans (reconcile.go)
-    # shares ONE counter across orphan volumes, orphan snapshots, tombstones,
-    # spent-restore and remnants; deleteOrphanedShares has its OWN independent
-    # allowance; sweepStrandedSnapshotTasks is UNCAPPED. Stamp adoption and
+    # threads ONE counter across orphan volumes, orphan snapshots, tombstones,
+    # spent-restore, remnants, AND orphaned shares (deleteOrphanedShares shares
+    # that same counter, not an independent one); sweepStrandedSnapshotTasks is
+    # UNCAPPED. Stamp adoption and
     # property-namespace migration do NOT use this cap — they use
     # reconcile.repair.maxPerRun (default 5) because those writes run on every
     # install, including ones with delete.enabled=false. Combined with the

@@ -1,3 +1,6 @@
+{{- /* (C10) Gated on replicas > 1 deliberately: see the rationale on
+controller.podDisruptionBudget in values.yaml — a PDB on a single replica
+would make it undrainable rather than protect it. */}}
 {{- if and .Values.controller.enabled .Values.controller.podDisruptionBudget.enabled (gt (int .Values.controller.replicas) 1) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget

@@ -684,6 +684,24 @@ var (
 		[]string{"protocol"},
 	)
 
+	// startupFencingUnconvergedVolumes is the C11 visibility gauge: 1 for every
+	// volume ID the current (or most recent) startup fencing pass quarantined
+	// because its ONLY blocking record belongs to a node with no live
+	// VolumeAttachment (a stale record left by a force-removed VA finalizer).
+	// Quarantining lets the rest of the cluster reach strict-mode readiness
+	// instead of being held down by one volume, so this gauge — reset then
+	// re-set every pass like volumeQuotaBytes above — is what makes the
+	// blocking volume identifiable without log archaeology. An empty result
+	// (no series) means nothing is currently quarantined.
+	startupFencingUnconvergedVolumes = regGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "startup_fencing_unconverged_volumes",
+			Help:      "1 for each volume the startup fencing reconcile quarantined on a stale publication record instead of blocking cluster-wide readiness",
+		},
+		[]string{"volume"},
+	)
+
 	// deleteVolumeOrphanCleanupFailuresTotal counts DeleteVolume calls whose
 	// dataset was already gone but whose best-effort residual share cleanup failed.
 	// The delete still succeeds (CSI DeleteVolume is idempotent: volume-not-found is
@@ -1245,6 +1263,23 @@ func RecordFencingTakeover(reason string) {
 
 func RecordFencingProvenanceOverflow(protocol string) {
 	fencingProvenanceOverflowTotal.WithLabelValues(protocol).Inc()
+}
+
+// ResetStartupFencingUnconvergedVolumes clears every previously-published
+// startup_fencing_unconverged_volumes series. Reset-then-set (mirroring
+// ResetVolumeUsageMetrics) is what lets a volume that converges on a later
+// pass disappear from the gauge instead of latching a stale 1 forever. Must
+// be called once per reconcilePublishedAttachments pass BEFORE any worker
+// calls RecordStartupFencingUnconverged, never concurrently with one.
+func ResetStartupFencingUnconvergedVolumes() {
+	startupFencingUnconvergedVolumes.Reset()
+}
+
+// RecordStartupFencingUnconverged marks volumeID as quarantined by the
+// current startup fencing pass (C11). Safe to call concurrently across
+// per-volume workers: each call only ever touches its own volume's label.
+func RecordStartupFencingUnconverged(volumeID string) {
+	startupFencingUnconvergedVolumes.WithLabelValues(volumeID).Set(1)
 }
 
 func RecordDeleteVolumeOrphanCleanupFailure(protocol string) {

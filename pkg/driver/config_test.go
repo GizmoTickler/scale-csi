@@ -1057,6 +1057,91 @@ nvmeof:
 	assert.Equal(t, []string{"192.168.120.10", "192.168.202.10", "192.168.203.10"}, cfg.NVMeoF.multipathAddresses())
 }
 
+// TestLoadConfigNVMeoFConnectKnobsDefaultOmit is the regression test for the
+// N4 handoff: the node-side `nvme connect` CLI knobs (fastIOFailTmo,
+// nrIOQueues, nrWriteQueues, keepAliveTmo) must default to the same
+// zero-value sentinels pkg/util.NVMeoFConnectOptions itself uses (0 = built-in
+// default, nil = omit the flag), so an unconfigured install renders no
+// connect block at all.
+func TestLoadConfigNVMeoFConnectKnobsDefaultOmit(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nvmeof:
+  enabled: true
+  transportAddress: 192.0.2.20
+  subsystemAllowAnyHost: true
+`)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cfg.NVMeoF.Connect.FastIOFailTmo)
+	assert.Nil(t, cfg.NVMeoF.Connect.NrIOQueues)
+	assert.Nil(t, cfg.NVMeoF.Connect.NrWriteQueues)
+	assert.Nil(t, cfg.NVMeoF.Connect.KeepAliveTmo)
+}
+
+// TestLoadConfigNVMeoFConnectKnobsParse proves every connect knob parses,
+// including a NEGATIVE fastIOFailTmo (the documented sentinel for "omit the
+// flag entirely, reproducing the historical disabled behavior").
+func TestLoadConfigNVMeoFConnectKnobsParse(t *testing.T) {
+	cfg, err := loadTestConfig(t, requiredTestConfig+`
+nvmeof:
+  enabled: true
+  transportAddress: 192.0.2.20
+  subsystemAllowAnyHost: true
+  connect:
+    fastIOFailTmo: 30
+    nrIOQueues: 4
+    nrWriteQueues: 2
+    keepAliveTmo: 10
+`)
+	require.NoError(t, err)
+	assert.Equal(t, 30, cfg.NVMeoF.Connect.FastIOFailTmo)
+	require.NotNil(t, cfg.NVMeoF.Connect.NrIOQueues)
+	assert.Equal(t, 4, *cfg.NVMeoF.Connect.NrIOQueues)
+	require.NotNil(t, cfg.NVMeoF.Connect.NrWriteQueues)
+	assert.Equal(t, 2, *cfg.NVMeoF.Connect.NrWriteQueues)
+	require.NotNil(t, cfg.NVMeoF.Connect.KeepAliveTmo)
+	assert.Equal(t, 10, *cfg.NVMeoF.Connect.KeepAliveTmo)
+
+	negative, err := loadTestConfig(t, requiredTestConfig+`
+nvmeof:
+  enabled: true
+  transportAddress: 192.0.2.20
+  subsystemAllowAnyHost: true
+  connect:
+    fastIOFailTmo: -1
+`)
+	require.NoError(t, err, "a negative fastIOFailTmo is a valid documented sentinel, not a validation error")
+	assert.Equal(t, -1, negative.NVMeoF.Connect.FastIOFailTmo)
+}
+
+// TestLoadConfigNVMeoFConnectQueueKnobsRejectNonPositive proves nrIOQueues,
+// nrWriteQueues and keepAliveTmo (unlike fastIOFailTmo) reject a non-positive
+// value: they have no "omit the flag" sentinel meaning for a non-nil value,
+// so a 0 or negative configured value is a mistake, not an intentional signal.
+func TestLoadConfigNVMeoFConnectQueueKnobsRejectNonPositive(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"nrIOQueues", "nrIOQueues: 0"},
+		{"nrWriteQueues", "nrWriteQueues: -1"},
+		{"keepAliveTmo", "keepAliveTmo: 0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadTestConfig(t, requiredTestConfig+`
+nvmeof:
+  enabled: true
+  transportAddress: 192.0.2.20
+  subsystemAllowAnyHost: true
+  connect:
+    `+tc.yaml+`
+`)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "nvmeof.connect."+tc.name)
+		})
+	}
+}
+
 func TestLoadConfigRejectsMultipathWithoutAddresses(t *testing.T) {
 	_, err := loadTestConfig(t, requiredTestConfig+`
 nvmeof:
