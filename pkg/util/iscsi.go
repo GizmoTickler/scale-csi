@@ -659,6 +659,35 @@ func commandExitCode(err error) (int, bool) {
 	return 0, false
 }
 
+// iscsiSessionLineRegex matches one line of `iscsiadm -m session` output.
+// Format: tcp: [session_id] portal:port,target_portal_group_tag iqn (mode)
+// The mode suffix (e.g., "(non-flash)") is NOT part of the IQN.
+// IQN format: iqn.YYYY-MM.reversed.domain:target_name
+var iscsiSessionLineRegex = regexp.MustCompile(`^tcp:\s+\[(\d+)\]\s+([^,]+),\d+\s+(iqn\.\S+)`)
+
+// parseISCSISessionLines parses `iscsiadm -m session` stdout into sessions. It
+// is pure and side-effect free (no exec, no I/O) so the exact regex/loop the
+// driver runs against live tool output can be fuzzed directly, separate from
+// the command invocation in getISCSISessions.
+func parseISCSISessionLines(output []byte) []ISCSISession {
+	var sessions []ISCSISession
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		matches := iscsiSessionLineRegex.FindStringSubmatch(line)
+		if len(matches) == 4 {
+			sessions = append(sessions, ISCSISession{
+				SessionID:    matches[1],
+				TargetPortal: matches[2],
+				IQN:          matches[3],
+			})
+		}
+	}
+	return sessions
+}
+
 // getISCSISessions returns the list of active iSCSI sessions.
 func getISCSISessions() ([]ISCSISession, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
@@ -679,29 +708,7 @@ func getISCSISessions() ([]ISCSISession, error) {
 		return nil, fmt.Errorf("failed to list iSCSI sessions: %w, stderr: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
-	var sessions []ISCSISession
-	lines := strings.Split(string(output), "\n")
-	// Format: tcp: [session_id] portal:port,target_portal_group_tag iqn (mode)
-	// The mode suffix (e.g., "(non-flash)") is NOT part of the IQN
-	// IQN format: iqn.YYYY-MM.reversed.domain:target_name
-	re := regexp.MustCompile(`^tcp:\s+\[(\d+)\]\s+([^,]+),\d+\s+(iqn\.\S+)`)
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		matches := re.FindStringSubmatch(line)
-		if len(matches) == 4 {
-			sessions = append(sessions, ISCSISession{
-				SessionID:    matches[1],
-				TargetPortal: matches[2],
-				IQN:          matches[3],
-			})
-		}
-	}
-
-	return sessions, nil
+	return parseISCSISessionLines(output), nil
 }
 
 // waitForISCSIDevice waits for the iSCSI device to appear in /dev.
@@ -783,15 +790,32 @@ func sameISCSIPortal(left, right string) bool {
 
 func canonicalISCSIPortalForComparison(portal string) string {
 	portal = strings.TrimSpace(portal)
-	host, port, err := net.SplitHostPort(portal)
-	if err == nil {
-		return net.JoinHostPort(strings.ToLower(host), port)
+	// Trim the SPLIT components, not just the whole string: SplitHostPort
+	// happily returns a host of " " for "[ ]:", and emitting that verbatim
+	// produced " :", which the leading TrimSpace then rewrote to ":" on the
+	// next pass.
+	if host, port, err := net.SplitHostPort(portal); err == nil {
+		return net.JoinHostPort(strings.ToLower(strings.TrimSpace(host)), strings.TrimSpace(port))
 	}
 	if ip := net.ParseIP(strings.Trim(portal, "[]")); ip != nil {
 		return net.JoinHostPort(ip.String(), "3260")
 	}
-	if !strings.Contains(portal, ":") {
-		return net.JoinHostPort(strings.ToLower(portal), "3260")
+	// Everything below is degenerate input: it parsed as neither host:port nor
+	// a bare IP. Brackets are IPv6-literal delimiters, and both branches that
+	// give them meaning have already been taken, so any bracket still present
+	// is garbage. It must not reach JoinHostPort, which re-adds brackets only
+	// when the host itself contains a colon: "[]" went to "[]:3260" and then to
+	// ":3260" on a second pass, so the function was not a fixed point.
+	//
+	// Strip EVERY bracket rather than an edge pair. Edge-trimming is
+	// whack-a-mole -- the fuzzer walked straight from "[]" to "[[]]" to
+	// "] [] [", each defeating a narrower strip. Removing interior brackets can
+	// make two distinct garbage portals compare equal, which is an accepted
+	// trade: a real portal never contains a bracket except as an IPv6
+	// delimiter, and those are handled above.
+	unbracketed := strings.TrimSpace(strings.NewReplacer("[", "", "]", "").Replace(portal))
+	if !strings.Contains(unbracketed, ":") {
+		return net.JoinHostPort(strings.ToLower(unbracketed), "3260")
 	}
 	return strings.ToLower(portal)
 }

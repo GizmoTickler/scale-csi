@@ -1763,3 +1763,35 @@ func TestIsWedgedCommandErr(t *testing.T) {
 	assert.False(t, isWedgedCommandErr(errors.New("logout failed: exit status 1")))
 	assert.False(t, isWedgedCommandErr(nil))
 }
+
+// TestCanonicalISCSIPortalRealWorldFormsUnchanged is the counterpart to
+// FuzzCanonicalISCSIPortalForComparison: the fuzzer proves the function is a
+// fixed point for degenerate input, and this proves that hardening did not
+// change the answer for any portal shape the driver actually sees. It matters
+// because sameISCSIPortal gates session matching at six call sites, so a
+// regression here would silently stop a live session from matching its own
+// portal — which looks like a phantom "session already gone" rather than a
+// parsing bug.
+func TestCanonicalISCSIPortalRealWorldFormsUnchanged(t *testing.T) {
+	cases := map[string]string{
+		"192.168.201.10:3260":   "192.168.201.10:3260", // the live cluster's form
+		"192.168.201.10":        "192.168.201.10:3260",
+		" 192.168.201.10:3260 ": "192.168.201.10:3260",
+		"[2001:db8::10]:3260":   "[2001:db8::10]:3260",
+		"[2001:db8::10]":        "[2001:db8::10]:3260",
+		"2001:db8::10":          "[2001:db8::10]:3260",
+		"NAS01.Example.COM":     "nas01.example.com:3260",
+		"nas01.example.com:860": "nas01.example.com:860",
+	}
+	for in, want := range cases {
+		if got := canonicalISCSIPortalForComparison(in); got != want {
+			t.Errorf("canonicalISCSIPortalForComparison(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if !sameISCSIPortal("192.168.201.10", "192.168.201.10:3260") {
+		t.Error("a bare IP must still match its explicit default-port form")
+	}
+	if sameISCSIPortal("192.168.201.10", "192.168.202.10") {
+		t.Error("distinct portals must not match")
+	}
+}
