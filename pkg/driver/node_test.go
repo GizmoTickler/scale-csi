@@ -2823,6 +2823,123 @@ func TestCleanupOrphanedISCSISessionUsesProtocolShareName(t *testing.T) {
 	assert.LessOrEqual(t, len(targetName), 64)
 }
 
+// TestCleanupOrphanedSessionFailsClosedOnGenuineDisconnectFailure locks in the
+// N2 fix: cleanupOrphanedSessionByVolumeID must return a non-nil error when a
+// session WAS found but its transport disconnect genuinely failed, so
+// NodeUnstageVolume can fail closed instead of reporting kubelet a clean
+// unstage while the session (and the NVMe-oF/iSCSI transport connection to
+// nas01) leaks forever. "No session found" and "list failed" remain success
+// (see the sibling test below) -- only this case is fail-closed.
+func TestCleanupOrphanedSessionFailsClosedOnGenuineDisconnectFailure(t *testing.T) {
+	t.Run("iSCSI", func(t *testing.T) {
+		originalList := listISCSISessions
+		originalDisconnect := nodeISCSIDisconnect
+		t.Cleanup(func() {
+			listISCSISessions = originalList
+			nodeISCSIDisconnect = originalDisconnect
+		})
+
+		d := newTestNodeDriver(ShareTypeISCSI)
+		volumeID := "pvc-11111111-2222-4333-8444-555555555555"
+		iqn := "iqn.2005-10.org.freenas.ctl:" + d.iscsiShareName(volumeID)
+		listISCSISessions = func() ([]util.ISCSISessionInfo, error) {
+			return []util.ISCSISessionInfo{{IQN: iqn, Portal: "192.0.2.100:3260"}}, nil
+		}
+		nodeISCSIDisconnect = func(portal, gotIQN string) error {
+			return errors.New("logout failed: exit status 5")
+		}
+
+		err := d.cleanupOrphanedSessionByVolumeID(context.Background(), volumeID, ShareTypeISCSI)
+		require.Error(t, err, "a found-but-failed-to-disconnect session must fail closed")
+	})
+
+	t.Run("NVMe-oF", func(t *testing.T) {
+		installFakeNodeCommands(t, "nvme")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
+
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		d.config.NVMeoF.NamePrefix = "k8s-"
+		volumeID := "pvc-22222222-3333-4444-5555-666666666666"
+		nqnName := d.config.NVMeoF.NamePrefix + protocolShareName(volumeID) + d.config.NVMeoF.NameSuffix
+		nqn := "nqn.2014-08.org.nvmexpress:" + nqnName
+		t.Setenv("FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT", `{"Subsystems":[{"NQN":"`+nqn+`","Name":"nvme3"}]}`)
+
+		originalDisconnect := nodeNVMeDisconnect
+		t.Cleanup(func() { nodeNVMeDisconnect = originalDisconnect })
+		nodeNVMeDisconnect = func(context.Context, string) error {
+			return errors.New("nvme disconnect: exit status 1")
+		}
+
+		err := d.cleanupOrphanedSessionByVolumeID(context.Background(), volumeID, ShareTypeNVMeoF)
+		require.Error(t, err, "a found-but-failed-to-disconnect NVMe-oF session must fail closed")
+	})
+}
+
+// TestCleanupOrphanedSessionStaysSuccessWithoutAFoundSession is the
+// idempotent-replay half of the N2 fix: neither "no active session" nor a
+// failure to LIST sessions may fail closed on their own -- only a session
+// that was actually found and failed to disconnect may.
+func TestCleanupOrphanedSessionStaysSuccessWithoutAFoundSession(t *testing.T) {
+	t.Run("iSCSI no session found", func(t *testing.T) {
+		originalList := listISCSISessions
+		t.Cleanup(func() { listISCSISessions = originalList })
+		listISCSISessions = func() ([]util.ISCSISessionInfo, error) { return nil, nil }
+
+		d := newTestNodeDriver(ShareTypeISCSI)
+		err := d.cleanupOrphanedSessionByVolumeID(context.Background(), "pvc-11111111-2222-4333-8444-555555555555", ShareTypeISCSI)
+		assert.NoError(t, err)
+	})
+
+	t.Run("iSCSI list failed", func(t *testing.T) {
+		originalList := listISCSISessions
+		t.Cleanup(func() { listISCSISessions = originalList })
+		listISCSISessions = func() ([]util.ISCSISessionInfo, error) { return nil, errors.New("iscsiadm unavailable") }
+
+		d := newTestNodeDriver(ShareTypeISCSI)
+		err := d.cleanupOrphanedSessionByVolumeID(context.Background(), "pvc-11111111-2222-4333-8444-555555555555", ShareTypeISCSI)
+		assert.NoError(t, err, "a list failure alone is an unknown state, not evidence of a failed disconnect")
+	})
+
+	t.Run("NVMe-oF no session found", func(t *testing.T) {
+		installFakeNodeCommands(t, "nvme")
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		err := d.cleanupOrphanedSessionByVolumeID(context.Background(), "pvc-33333333-4444-4555-6666-777777777777", ShareTypeNVMeoF)
+		assert.NoError(t, err)
+	})
+}
+
+// TestNodeUnstageBlockSymlinkFailsClosedWhenSessionDisconnectFails is the
+// end-to-end half of the N2 fix: NodeUnstageVolume's block-symlink branch must
+// surface a genuine session disconnect failure as codes.Internal, instead of
+// unconditionally returning success (which is what let kubelet mark the
+// volume unstaged and never retry the failed disconnect).
+func TestNodeUnstageBlockSymlinkFailsClosedWhenSessionDisconnectFails(t *testing.T) {
+	installFakeNodeCommands(t, "nvme")
+
+	d := newTestNodeDriver(ShareTypeNVMeoF)
+	d.config.NVMeoF.NamePrefix = "k8s-"
+	volumeID := "pvc-44444444-5555-4666-7777-888888888888"
+	nqnName := d.config.NVMeoF.NamePrefix + protocolShareName(volumeID) + d.config.NVMeoF.NameSuffix
+	nqn := "nqn.2014-08.org.nvmexpress:" + nqnName
+	t.Setenv("FAKE_NODE_NVME_LIST_SUBSYS_OUTPUT", `{"Subsystems":[{"NQN":"`+nqn+`","Name":"nvme4"}]}`)
+
+	originalDisconnect := nodeNVMeDisconnect
+	t.Cleanup(func() { nodeNVMeDisconnect = originalDisconnect })
+	nodeNVMeDisconnect = func(context.Context, string) error {
+		return errors.New("nvme disconnect: exit status 1")
+	}
+
+	stagingPath := filepath.Join(t.TempDir(), "staging")
+	require.NoError(t, os.Symlink("/dev/nvme9n1", stagingPath))
+
+	_, err := d.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+		VolumeId: volumeID, StagingTargetPath: stagingPath,
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+}
+
 func TestNodeStageVolume_ConcurrentProtection(t *testing.T) {
 	d := newTestNodeDriver(ShareTypeNFS)
 	volumeID := "concurrent-test-vol"

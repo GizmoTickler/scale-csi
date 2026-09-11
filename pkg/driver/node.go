@@ -821,10 +821,20 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	// stale after reboot. Never derive the session to disconnect from it; use
 	// the volume's expected target name instead.
 	if isSymlink {
+		var cleanupErr error
 		if strings.Contains(devicePath, "nvme") {
-			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeNVMeoF)
+			cleanupErr = d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeNVMeoF)
 		} else {
-			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI)
+			cleanupErr = d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI)
+		}
+		if cleanupErr != nil {
+			// Fail closed: a session that WAS found but whose transport
+			// disconnect genuinely failed must not be reported as unstaged,
+			// mirroring the mount side's fail-closed handling above (lines
+			// 800-810). "No active session found" and list failures are
+			// success from cleanupOrphanedSessionByVolumeID's perspective and
+			// never reach this branch -- see its doc comment.
+			return nil, status.Errorf(codes.Internal, "failed to disconnect orphaned session for volume %s: %v", volumeID, cleanupErr)
 		}
 		d.deleteStageRecord(stagingPath)
 		klog.V(2).Infof("Volume %s unstaged successfully", volumeID)
@@ -865,15 +875,25 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	// The scan is only needed when no device was available or the primary
 	// device-based disconnect could not be completed successfully. A known device
 	// identifies its transport; without one, probe both exact session lookups.
+	var cleanupErr error
 	if devicePath == "" {
-		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI)
-		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeNVMeoF)
+		cleanupErr = errors.Join(
+			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeISCSI),
+			d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, ShareTypeNVMeoF),
+		)
 	} else if !primaryDisconnectSucceeded {
 		attachDriver := ShareTypeISCSI
 		if strings.Contains(devicePath, "nvme") {
 			attachDriver = ShareTypeNVMeoF
 		}
-		d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, attachDriver)
+		cleanupErr = d.cleanupOrphanedSessionByVolumeID(ctx, volumeID, attachDriver)
+	}
+	if cleanupErr != nil {
+		// Fail closed, same rationale as the block-symlink branch above: a
+		// session that WAS found but whose disconnect genuinely failed must
+		// not be reported as unstaged, so kubelet retries instead of leaking
+		// the transport session forever.
+		return nil, status.Errorf(codes.Internal, "failed to disconnect orphaned session for volume %s: %v", volumeID, cleanupErr)
 	}
 
 	d.deleteStageRecord(stagingPath)
@@ -884,14 +904,24 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 // cleanupOrphanedSessionByVolumeID attempts to clean up iSCSI/NVMe-oF sessions
 // when the device path is unavailable (e.g., after node restart or force unmount).
 // This prevents session leaks that accumulate over time.
-func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID string, attachDriver ShareType) {
+//
+// Return value is the fail-closed signal for NodeUnstageVolume: it is nil
+// (success) whenever there is no positive evidence of a disconnect failure --
+// that includes "no active session found" (the volume is already detached;
+// this is the normal idempotent-replay case) AND a failure to LIST sessions
+// (an unknown state must not by itself fail an unstage that may have nothing
+// to clean up). It is non-nil ONLY when a session was actually found and its
+// transport disconnect returned an error, which is the one case the caller
+// must propagate as codes.Internal so kubelet retries rather than marking a
+// leaked session as unstaged.
+func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID string, attachDriver ShareType) error {
 	switch attachDriver {
 	case ShareTypeISCSI:
 		targetName := d.iscsiShareName(volumeID)
 		sessions, listErr := listISCSISessions()
 		if listErr != nil {
 			klog.V(4).Infof("Cannot list active iSCSI sessions for volume %s: %v", volumeID, listErr)
-			return
+			return nil
 		}
 		expectedSuffix := ":" + targetName
 		foundIQNs := make(map[string]struct{})
@@ -902,25 +932,35 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 		}
 		if len(foundIQNs) == 0 {
 			klog.V(4).Infof("No active iSCSI session found for volume %s (target: %s)", volumeID, targetName)
+			return nil
 		}
+		var errs []error
 		for iqn := range foundIQNs {
-			disconnectAllISCSISessionsForIQNWithSnapshot(iqn, sessions)
+			if ok := disconnectAllISCSISessionsForIQNWithSnapshot(iqn, sessions); !ok {
+				errs = append(errs, fmt.Errorf("failed to disconnect iSCSI session %s", iqn))
+			}
 		}
+		return errors.Join(errs...)
 
 	case ShareTypeNVMeoF:
 		nqnName := d.config.NVMeoF.NamePrefix + protocolShareName(volumeID) + d.config.NVMeoF.NameSuffix
 		nqn, err := util.FindNVMeoFSessionBySubsysName(nqnName)
 		if err != nil {
+			// Covers both "not found" (idempotent success) and a failed
+			// listing (unknown state, must not fail closed on its own).
 			klog.V(4).Infof("No active NVMe-oF session found for volume %s (nqn: %s): %v", volumeID, nqnName, err)
-		} else if nqn != "" {
+			return nil
+		}
+		if nqn != "" {
 			klog.Infof("Found orphaned NVMe-oF session for volume %s: %s", volumeID, nqn)
 			if err := nodeNVMeDisconnect(ctx, nqn); err != nil {
 				klog.Warningf("Failed to disconnect orphaned NVMe-oF session %s: %v", nqn, err)
-			} else {
-				klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
+				return fmt.Errorf("failed to disconnect NVMe-oF session %s: %w", nqn, err)
 			}
+			klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
 		}
 	}
+	return nil
 }
 
 func disconnectAllISCSISessionsForIQN(iqn string) bool {
