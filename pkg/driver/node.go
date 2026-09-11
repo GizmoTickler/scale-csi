@@ -2286,6 +2286,43 @@ func sameDevicePath(left, right string) bool {
 }
 
 // stageNVMeoFVolume connects and mounts an NVMe-oF volume to the staging path.
+// nvmeConnectOptions builds the `nvme connect` option set for this node plugin
+// from configuration (N4 driver-side plumbing). DeviceTimeout is a parameter
+// because callers legitimately use different budgets -- a full stage versus a
+// bounded secondary-path top-up -- while every other knob here is install-wide
+// and MUST be identical on every connect this node issues. A secondary path
+// brought up without --fast-io-fail-tmo would still park I/O on a dead
+// controller, which is precisely the failure that flag exists to prevent, so
+// partial application would silently defeat the fix on exactly the paths
+// multipath exists to provide.
+//
+// Config semantics are preserved verbatim from NVMeoFConnectConfig: a zero
+// FastIOFailTmo leaves the util layer's built-in default in effect, and ONLY an
+// explicit negative value omits the flag and restores the historical disabled
+// behavior. The pointer-valued knobs are copied rather than aliased so nothing
+// can mutate an in-flight connect through the shared config.
+func (d *Driver) nvmeConnectOptions(deviceTimeout time.Duration) *util.NVMeoFConnectOptions {
+	opts := &util.NVMeoFConnectOptions{DeviceTimeout: deviceTimeout}
+	if d.config == nil {
+		return opts
+	}
+	connect := d.config.NVMeoF.Connect
+	opts.FastIOFailTmo = time.Duration(connect.FastIOFailTmo) * time.Second
+	if connect.NrIOQueues != nil {
+		value := *connect.NrIOQueues
+		opts.NrIOQueues = &value
+	}
+	if connect.NrWriteQueues != nil {
+		value := *connect.NrWriteQueues
+		opts.NrWriteQueues = &value
+	}
+	if connect.KeepAliveTmo != nil {
+		value := time.Duration(*connect.KeepAliveTmo) * time.Second
+		opts.KeepAliveTmo = &value
+	}
+	return opts
+}
+
 func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for NVMe-oF staging")
@@ -2339,9 +2376,7 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 	}
 
 	// Connect to NVMe-oF subsystem with configurable timeout
-	connectOpts := &util.NVMeoFConnectOptions{
-		DeviceTimeout: time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second,
-	}
+	connectOpts := d.nvmeConnectOptions(time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second)
 	var devicePath string
 	var pathFailures []error
 	if len(multipathAddresses) > 0 {
@@ -2489,9 +2524,7 @@ func (d *Driver) convergeExistingNVMeoFPaths(ctx context.Context, volumeContext 
 	if err != nil {
 		klog.Warningf("Failed to list NVMe subsystems before converging staged volume %s: %v", nqn, err)
 	}
-	connectOpts := &util.NVMeoFConnectOptions{
-		DeviceTimeout: time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second,
-	}
+	connectOpts := d.nvmeConnectOptions(time.Duration(d.config.NVMeoF.DeviceWaitTimeout) * time.Second)
 	// A compatible staging target remains usable even if every top-up fails.
 	// Missing paths are bounded best-effort work on this idempotent replay.
 	_, pathFailures, _ := convergeNVMeoFPaths(ctx, nqn, transport, port, addresses, connectOpts, subsystems, false)
@@ -2591,7 +2624,16 @@ func convergeNVMeoFPaths(
 	if len(missing) > 0 {
 		topUpCtx, cancel := context.WithTimeout(ctx, nvmeSecondaryPathConvergeBudget)
 		defer cancel()
+		// Inherit every CLI knob from connectOpts and override only the
+		// budget: a top-up path connected without --fast-io-fail-tmo (or with
+		// different queue counts) would be the one path that still blocks I/O
+		// on a dead controller, defeating N4 exactly where multipath matters.
 		shortOpts := &util.NVMeoFConnectOptions{DeviceTimeout: nvmeSecondaryPathConvergeBudget}
+		if connectOpts != nil {
+			inherited := *connectOpts
+			inherited.DeviceTimeout = nvmeSecondaryPathConvergeBudget
+			shortOpts = &inherited
+		}
 		if connectOpts != nil && connectOpts.DeviceTimeout > 0 && connectOpts.DeviceTimeout < shortOpts.DeviceTimeout {
 			shortOpts.DeviceTimeout = connectOpts.DeviceTimeout
 		}
