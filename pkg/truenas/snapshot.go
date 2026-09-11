@@ -1026,7 +1026,7 @@ func replicationJobID(result interface{}) (int64, error) {
 	}
 }
 
-func (c *Client) waitForJobPolling(ctx context.Context, jobID int64) error {
+func (c *Client) waitForJob(ctx context.Context, jobID int64) error {
 	if c.dispatcher == nil {
 		return clientClosedJobWaitError(jobID)
 	}

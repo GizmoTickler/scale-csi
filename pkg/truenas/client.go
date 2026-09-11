@@ -478,11 +478,6 @@ type Client struct {
 	serviceReloadResolved  atomic.Bool
 	serviceReloadUseLegacy atomic.Bool
 
-	// TrueNAS 26.0 exposes core.job_wait as a server-side wait job. Cache a
-	// method-not-found response so older backends go straight to core.get_jobs.
-	coreJobWaitResolved    atomic.Bool
-	coreJobWaitUnavailable atomic.Bool
-
 	dispatcher *jobDispatcher
 
 	// A successful subscription closes the current pulse and installs a new

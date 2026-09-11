@@ -25,8 +25,6 @@ func newJobWaitTestClient(t *testing.T) *Client {
 		jobWaitPollInterval:    5 * time.Millisecond,
 		jobWaitSafetyInterval:  30 * time.Millisecond,
 	}
-	client.coreJobWaitUnavailable.Store(true)
-	client.coreJobWaitResolved.Store(true)
 	t.Cleanup(client.dispatcher.Stop)
 	return client
 }
@@ -283,4 +281,51 @@ func TestJobWaitT10SemaphoreAccounting(t *testing.T) {
 	var terminalErr *jobTerminalError
 	require.True(t, errors.As(err, &terminalErr))
 	assert.Equal(t, "FAILED", terminalErr.state)
+}
+
+// TestWaitForJobUsesGetJobsDirectlyNotCoreJobWait is the N6 regression: a
+// prior commit (2304911) routed waitForJob through core.job_wait, itself a
+// server-side "job": true call, so callers ended up polling the WRAPPER job
+// via the exact same core.get_jobs loop -- one extra RPC and one extra
+// middleware job for zero fewer polls -- and get_jobs is already idempotent
+// (see isIdempotentAPIMethod), so the switch bought nothing while making
+// job_wait a new non-idempotent call that, on a reconnect mid-wait, would
+// surface ErrAmbiguousResult and (for CopyDatasetFromSnapshotLocal) fire
+// core.job_abort on a healthy long-running copy. Reverted: waitForJob must
+// poll core.get_jobs for the caller's own job id directly, never touching
+// core.job_wait.
+func TestWaitForJobUsesGetJobsDirectlyNotCoreJobWait(t *testing.T) {
+	mock := newMockWSServer()
+	var jobWaitCalls atomic.Int32
+	var getJobsCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "core.job_wait":
+				jobWaitCalls.Add(1)
+				resp.Result = float64(999)
+			case "core.get_jobs":
+				getJobsCalls.Add(1)
+				resp.Result = []interface{}{map[string]interface{}{"id": float64(41), "state": "SUCCESS"}}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+
+	require.NoError(t, client.waitForJob(context.Background(), 41))
+	assert.Zero(t, jobWaitCalls.Load(), "waitForJob must never call core.job_wait")
+	assert.Equal(t, int32(1), getJobsCalls.Load(), "waitForJob must poll core.get_jobs for the target job directly")
 }

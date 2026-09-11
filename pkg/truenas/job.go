@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -87,31 +85,6 @@ func (c *Client) ReplicationJobAbort(ctx context.Context, jobID int64, reason st
 		c.replicationJobAbortRecorder(reason)
 	}
 	return nil
-}
-
-func (c *Client) waitForJob(ctx context.Context, jobID int64) error {
-	if c.coreJobWaitResolved.Load() && c.coreJobWaitUnavailable.Load() {
-		return c.waitForJobPolling(ctx, jobID)
-	}
-
-	result, err := c.Call(ctx, "core.job_wait", jobID)
-	if err != nil {
-		if isMethodNotFoundError(err) {
-			c.coreJobWaitUnavailable.Store(true)
-			c.coreJobWaitResolved.Store(true)
-			klog.V(2).Infof("core.job_wait is unavailable; falling back to core.get_jobs polling")
-			return c.waitForJobPolling(ctx, jobID)
-		}
-		return fmt.Errorf("failed to start core.job_wait for job %d: %w", jobID, err)
-	}
-
-	waitJobID, err := replicationJobID(result)
-	if err != nil {
-		return fmt.Errorf("invalid core.job_wait job id for job %d: %w", jobID, err)
-	}
-	c.coreJobWaitUnavailable.Store(false)
-	c.coreJobWaitResolved.Store(true)
-	return c.waitForJobPolling(ctx, waitJobID)
 }
 
 func parseReplicationJob(entry interface{}) (*ReplicationJob, error) {
