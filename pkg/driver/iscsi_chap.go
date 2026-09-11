@@ -243,7 +243,7 @@ func redactCHAP(secrets map[string]string) map[string]string {
 		lower := strings.ToLower(key)
 		if strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "passphrase") {
 			if value != "" {
-				redacted[key] = "***"
+				redacted[key] = chapRedactionMask
 			}
 			continue
 		}
@@ -251,6 +251,40 @@ func redactCHAP(secrets map[string]string) map[string]string {
 	}
 	return redacted
 }
+
+// redactCHAPError renders a backend error with every value of a CHAP secret
+// masked. It is redactCHAP's missing half: redactCHAP scrubs a secret MAP, which
+// covers everything the driver composes itself, and nothing covered the text the
+// driver FORWARDS.
+//
+// iscsi.auth.create and iscsi.auth.update take the CHAP secret and peer secret
+// as call arguments ("secret"/"peersecret" — see iscsiAuthSecretParams), so a
+// middleware traceback is free to echo them into the error, which
+// pkg/truenas/iscsi_auth.go wraps verbatim, EnsureISCSIAuthPeer interpolates
+// with %v into a gRPC status, and CreateVolume's deferred
+// recordOperationFailureEvent then writes onto the tenant's PVC as a Warning
+// Event alongside a V(0) klog line. Same shape as the encryption passphrase
+// leak that redactEncryptionError closes (encryption.go). Callers interpolate
+// the RESULT (a string), never the error.
+func redactCHAPError(err error, secret iscsiCHAPSecret) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	// Usernames are not masked: they are already surfaced in logs and Events by
+	// design (see the "Ensured shared iSCSI CHAP auth peer" line below), and
+	// masking a short, possibly common username would corrupt unrelated text.
+	for _, value := range []string{secret.Password, secret.MutualPassword} {
+		if value == "" {
+			continue
+		}
+		text = strings.ReplaceAll(text, value, chapRedactionMask)
+	}
+	return text
+}
+
+// chapRedactionMask is the replacement redactCHAP and redactCHAPError share.
+const chapRedactionMask = "***"
 
 // deriveISCSIAuthTag deterministically maps a credential key to an iscsi.auth
 // tag in [1000, 61000), avoiding the low operator-reserved range. The key is the
@@ -438,7 +472,10 @@ func (d *Driver) EnsureISCSIAuthPeer(ctx context.Context, secrets map[string]str
 		updated, updateErr := d.truenasClient.ISCSIAuthUpdate(
 			ctx, peer.ID, secret.Username, secret.Password, secret.MutualUsername, secret.MutualPassword)
 		if updateErr != nil {
-			return nil, status.Errorf(codes.Internal, "failed to rotate iSCSI auth peer for tag %d: %v", tag, updateErr)
+			// iscsi.auth.update carries secret/peersecret as call arguments; the
+			// backend error can echo them and this status lands on the tenant's PVC.
+			return nil, status.Errorf(codes.Internal, "failed to rotate iSCSI auth peer for tag %d: %s",
+				tag, redactCHAPError(updateErr, secret))
 		}
 		klog.Infof("Rotated iSCSI CHAP auth peer: tag=%d id=%d user=%q mutual=%v (secret updated)", tag, updated.ID, secret.Username, mutual)
 		d.iscsiResolvedAuth[tag] = updated
@@ -452,7 +489,10 @@ func (d *Driver) EnsureISCSIAuthPeer(ctx context.Context, secrets map[string]str
 
 	peer, err := d.truenasClient.ISCSIAuthCreate(ctx, tag, secret.Username, secret.Password, secret.MutualUsername, secret.MutualPassword)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create iSCSI auth peer for tag %d: %v", tag, err)
+		// iscsi.auth.create carries secret/peersecret as call arguments; same
+		// forwarding channel as the rotation above.
+		return nil, status.Errorf(codes.Internal, "failed to create iSCSI auth peer for tag %d: %s",
+			tag, redactCHAPError(err, secret))
 	}
 
 	// TrueNAS middleware does not enforce tag uniqueness on create, so two

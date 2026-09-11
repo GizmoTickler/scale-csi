@@ -471,20 +471,32 @@ backend loss.
   even when CHAP is on. The driver does not currently provide per-tenant iSCSI
   isolation. CHAP credentials are supplied per StorageClass via a Kubernetes
   Secret, are never written to the PV volume context, and are redacted from all
-  driver logs, gRPC errors, and Kubernetes Events: password-setting `iscsiadm`
-  failures surface only the parameter name and an exit class, never the command
-  output.
-- **Accepted host-trust exposure (CHAP).** CHAP session credentials are applied
-  on the node by passing them to `iscsiadm` as `-v <value>` arguments, so the
-  credential is briefly visible in the host process table (`/proc/<pid>/cmdline`)
-  while the call runs, and open-iscsi persists the session credential in the host
-  node database under `/var/lib/iscsi` (and `/etc/iscsi`) for as long as the node
-  record exists. The node DaemonSet is privileged with `hostPID` and mounts these
-  host paths, so any root-level actor on the node can read the credential. This is
-  an explicit, accepted root-on-host trust assumption — CHAP protects against
-  off-host initiators, not against a compromised node. Treat node root as
-  equivalent to holding every CHAP secret staged on that node, and rely on
-  network segmentation plus node hardening accordingly.
+  driver logs, gRPC errors, and Kubernetes Events. Node-side parameter failures
+  surface only the parameter name and an exit class, never the command output;
+  `iscsi.auth.create`/`iscsi.auth.update` failures on the controller are masked
+  before they reach a gRPC status or a PVC Event, because those calls carry the
+  secret as an argument and a middleware traceback may echo it.
+- **CHAP credentials never reach a command line.** `node.session.auth.password`
+  and `node.session.auth.password_in` are written directly into the open-iscsi
+  node record before `--login`; only `authmethod` and the usernames are passed
+  to `iscsiadm` as `-v <value>` arguments. This matters because the node
+  DaemonSet runs with `hostPID: true` and the bundled `iscsiadm` is a wrapper
+  that re-execs `nsenter`, so an argv-borne secret was simultaneously readable
+  from three host-namespace `/proc/<pid>/cmdline` entries — which are
+  world-readable, needing neither root nor a privileged container, only a pod
+  admitted with `hostPID`. The records the driver writes are forced to mode
+  `0600` (open-iscsi's own umask commonly leaves them `0644`). If the node
+  database is not found under `/etc/iscsi` or `/var/lib/iscsi`, the stage
+  FAILS rather than falling back to the command line.
+- **Accepted host-trust exposure (CHAP).** open-iscsi persists the session
+  credential in clear text in the host node database under `/etc/iscsi` (or
+  `/var/lib/iscsi`) for as long as the node record exists, and the node
+  DaemonSet is privileged and mounts those host paths. Any root-level actor on
+  the node can read the credential. This is an explicit, accepted root-on-host
+  trust assumption — CHAP protects against off-host initiators, not against a
+  compromised node. Treat node root as equivalent to holding every CHAP secret
+  staged on that node, and rely on network segmentation plus node hardening
+  accordingly.
 - `DeleteVolume` preserves non-CSI snapshots by default, including snapshots
   inherited from periodic-snapshot or replication tasks on the parent dataset.
   It returns `FailedPrecondition` until those snapshots are removed or the task

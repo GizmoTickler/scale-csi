@@ -549,3 +549,14 @@ func TestCreateVolumeISCSICHAPStampsGroupsAndProps(t *testing.T) {
 		})
 	}
 }
+
+// TestRedactCHAPError is the unit half of the S-03 regression: redactCHAP's
+// missing counterpart for backend text the driver FORWARDS rather than composes.
+func TestRedactCHAPError(t *testing.T) {
+	secret := iscsiCHAPSecret{Username: "chapuser", Password: "s3cret-one12", MutualPassword: "s3cret-two12"}
+	assert.Equal(t, "", redactCHAPError(nil, secret))
+	assert.Equal(t, "auth failed for *** and ***",
+		redactCHAPError(fmt.Errorf("auth failed for %s and %s", secret.Password, secret.MutualPassword), secret))
+	// An empty field must not turn into a mask that eats the whole string.
+	assert.Equal(t, "auth failed", redactCHAPError(fmt.Errorf("auth failed"), iscsiCHAPSecret{}))
+}
