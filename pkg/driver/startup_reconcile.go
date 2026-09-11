@@ -521,8 +521,14 @@ func (d *Driver) startStartupAttachmentReconcile() {
 		return
 	}
 	d.startupReconcileCancel = cancel
-	d.startupReconcileStateMu.Unlock()
+	// Add BEFORE releasing the lock that guards the cancel handle. Stop()
+	// takes that same lock, then Wait()s; if Add lands after the unlock, a
+	// Stop() in that window sees a counter of 0, Wait() returns
+	// immediately, and the just-launched goroutine races Close(). That is
+	// also the documented `sync: WaitGroup misuse: Add called concurrently
+	// with Wait` panic shape.
 	d.startupReconcileWg.Add(1)
+	d.startupReconcileStateMu.Unlock()
 	go func() {
 		defer d.startupReconcileWg.Done()
 		backoff := startupReconcileInitialBackoff

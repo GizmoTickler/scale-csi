@@ -3341,3 +3341,51 @@ func TestForeignSnapshotRefusalMessageMixedPopulations(t *testing.T) {
 		assert.Contains(t, message, "scale_csi_scheduled_snapshot_unproven_total")
 	})
 }
+
+// TestInternalCloneSourceSnapshotIsNotClassifiedAsACSISnapshot pins the
+// deletion-safety invariant that the clone temp-snapshot's property set must
+// never make it look like a user-facing CSI snapshot.
+//
+// This guards a regression that shipped in this release and was caught only by
+// adversarial review: PropCSISnapshotName was added to that call to give the
+// inline-property read-back a snapshot-unique value, but that property IS the
+// CSI identity discriminator on the 26.0 flat read path. Stamping it moved
+// internal clone-source snapshots into the managed set, made them orphan
+// candidates after minOrphanAge in the DEFAULT configuration, surfaced them
+// through ListSnapshots, and with reconcile.delete.enabled could get a LIVE
+// clone's origin snapshot renamed to a tombstone.
+//
+// The exact shape below is what handleVolumeContentSource writes. No test
+// previously modeled it — every fixture still used the older two-key shape —
+// which is why the regression was invisible to the suite.
+func TestInternalCloneSourceSnapshotIsNotClassifiedAsACSISnapshot(t *testing.T) {
+	internal := func(resourceQuery bool) *truenas.Snapshot {
+		return &truenas.Snapshot{
+			ID:            "tank/csi/pvc-src@clone-source-pvc-dst",
+			Name:          "clone-source-pvc-dst",
+			ResourceQuery: resourceQuery,
+			UserProperties: map[string]truenas.UserProperty{
+				PropInternalResource:     {Value: "true", Source: "local"},
+				PropInternalSnapshotName: {Value: "clone-source-pvc-dst", Source: "local"},
+				// managed_resource INHERITS from the CSI volume dataset onto
+				// every snapshot of it, which is precisely why the 26.0 path
+				// cannot use it as the discriminator.
+				PropManagedResource: {Value: "true", Source: "inherited from tank/csi/pvc-src"},
+			},
+		}
+	}
+
+	for _, resourceQuery := range []bool{true, false} {
+		snap := internal(resourceQuery)
+		assert.False(t, isCSISnapshot(snap),
+			"internal clone-source snapshot must not classify as a user CSI snapshot (resourceQuery=%v)", resourceQuery)
+		assert.True(t, isInternalCloneSourceSnapshot(snap),
+			"internal clone-source snapshot must still be recognized as internal (resourceQuery=%v)", resourceQuery)
+	}
+
+	// The property that must never appear here, stated explicitly so the reason
+	// survives if someone reaches for it again.
+	_, hasIdentity := internal(true).UserProperties[PropCSISnapshotName]
+	assert.False(t, hasIdentity,
+		"the clone temp snapshot must not carry PropCSISnapshotName: it is the CSI identity discriminator on the 26.0 read path")
+}

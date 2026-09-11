@@ -1795,3 +1795,33 @@ func TestCanonicalISCSIPortalRealWorldFormsUnchanged(t *testing.T) {
 		t.Error("distinct portals must not match")
 	}
 }
+
+// TestHardenCmdCancelMapsESRCHToProcessDone pins the os/exec contract that
+// HardenCmd's custom Cancel must honor.
+//
+// os/exec's watchCtx special-cases exactly two return values from Cancel: nil
+// and os.ErrProcessDone. Anything else is wrapped and injected into Wait's
+// result even when the command SUCCEEDED. Killing the process GROUP means
+// kill(-pgid) returns ESRCH once the child has been reaped, so returning it raw
+// reported "exec: canceling Cmd: no such process" for a command that exited 0.
+// The stock Cancel (Process.Kill) maps it; taking over Cancel silently dropped
+// that mapping for all hardened call sites, where an mkfs finishing right at
+// the 300s commandTimeouts.format boundary would be reported as a format
+// failure on a device that was in fact formatted.
+func TestHardenCmdCancelMapsESRCHToProcessDone(t *testing.T) {
+	// Must be CommandContext: os/exec refuses to Start a command that has a
+	// non-nil Cancel but was built with plain Command.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "true")
+	HardenCmd(cmd)
+	require.NoError(t, cmd.Start())
+	require.NoError(t, cmd.Wait(), "the command itself must succeed")
+
+	// The process is now reaped, so the group is gone and kill(-pgid) returns
+	// ESRCH — exactly the state a cancellation racing a clean exit observes.
+	require.NotNil(t, cmd.Cancel, "HardenCmd must install a Cancel")
+	err := cmd.Cancel()
+	assert.ErrorIs(t, err, os.ErrProcessDone,
+		"a cancel that finds the process already gone must report ErrProcessDone, not raw ESRCH, or os/exec injects a failure into a successful command")
+}

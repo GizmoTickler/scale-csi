@@ -15,7 +15,13 @@ spec:
   # run is never superseded, and with no startingDeadlineSeconds a missed
   # schedule (e.g. the controller was down at trigger time) is never
   # retried either.
-  activeDeadlineSeconds: {{ .Values.reconcile.delete.activeDeadlineSeconds }}
+  #
+  # startingDeadlineSeconds belongs to CronJobSpec and stays here.
+  # activeDeadlineSeconds is a JOB spec field and lives under
+  # jobTemplate.spec below — placing it here rendered a manifest that Flux's
+  # server-side strict apply REJECTS outright ("unknown field
+  # spec.activeDeadlineSeconds"), and that Helm silently drops, so the
+  # wedged-Job protection this comment promises did not exist at all.
   startingDeadlineSeconds: {{ .Values.reconcile.delete.startingDeadlineSeconds }}
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
@@ -25,6 +31,10 @@ spec:
         {{- include "scale-csi.labels" . | nindent 8 }}
         app.kubernetes.io/component: reconcile
     spec:
+      # (C10) Bounds a WEDGED run. This is a JobSpec field; it was previously
+      # emitted one level up under CronJobSpec, where strict apply rejects it
+      # and Helm silently drops it.
+      activeDeadlineSeconds: {{ .Values.reconcile.delete.activeDeadlineSeconds }}
       backoffLimit: 1
       template:
         metadata:

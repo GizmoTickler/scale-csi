@@ -49,8 +49,14 @@ func (d *Driver) startCapacityGauges() {
 		return
 	}
 	d.capacityCancel = cancel
-	d.capacityStateMu.Unlock()
+	// Add BEFORE releasing the lock that guards the cancel handle. Stop()
+	// takes that same lock, then Wait()s; if Add lands after the unlock, a
+	// Stop() in that window sees a counter of 0, Wait() returns
+	// immediately, and the just-launched goroutine races Close(). That is
+	// also the documented `sync: WaitGroup misuse: Add called concurrently
+	// with Wait` panic shape.
 	d.capacityWg.Add(1)
+	d.capacityStateMu.Unlock()
 	go func() {
 		defer d.capacityWg.Done()
 		klog.Infof("Pool-capacity gauges started: interval=%v parent=%s", interval, parent)

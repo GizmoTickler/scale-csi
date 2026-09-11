@@ -87,7 +87,23 @@ func HardenCmd(cmd *exec.Cmd) {
 		if cmd.Process == nil {
 			return os.ErrProcessDone
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			// ESRCH means the group is already gone, i.e. the command finished
+			// before cancellation landed. os/exec's watchCtx special-cases only
+			// nil and os.ErrProcessDone; anything else is wrapped and injected
+			// into Wait's result, so returning raw ESRCH reported
+			// "exec: canceling Cmd: no such process" for a command that
+			// SUCCEEDED. The stock Cancel (Process.Kill) maps it, and dropping
+			// that mapping silently changed the contract for all ~32 hardened
+			// call sites: an mkfs completing right at the 300s
+			// commandTimeouts.format boundary would be reported as a format
+			// failure on a device that was in fact formatted.
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
 	}
 	// Belt-and-braces: even if the process-group kill above does not free the
 	// output pipes (e.g. a descendant that escaped the group via setsid),

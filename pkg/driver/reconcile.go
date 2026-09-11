@@ -1594,6 +1594,19 @@ func (d *Driver) startOrphanReconcile() {
 		return
 	}
 	d.reconcileCancel = cancel
+	// Add BOTH loops' counts BEFORE releasing the lock that guards the cancel
+	// handle. Stop() takes that same lock then Wait()s; an Add landing after
+	// the unlock lets a Stop() in that window see a counter of 0, return from
+	// Wait() immediately, and race the just-launched goroutines against
+	// Close(). It is also the `sync: WaitGroup misuse: Add called
+	// concurrently with Wait` panic shape. The heavy loop's count is added here
+	// too, under the SAME condition that decides whether it is launched, so the
+	// counter never trails the goroutines and never over-counts a loop that is
+	// not started.
+	d.reconcileWg.Add(1)
+	if d.config.Reconcile.Enabled {
+		d.reconcileWg.Add(1)
+	}
 	d.reconcileStateMu.Unlock()
 	// orphanDetectionEnabled gates the heavy pass ENTIRELY (C9 fix): an operator
 	// who set reconcile.enabled=false wants the driver to stop touching their
@@ -1608,7 +1621,6 @@ func (d *Driver) startOrphanReconcile() {
 	// (unrelated to fencing, kept at their historical cadence) plus, when
 	// fencing is enabled, the stale-publication-record repair at the grace
 	// cadence. This loop NEVER runs the heavy orphan-detection pass.
-	d.reconcileWg.Add(1)
 	go func() {
 		defer d.reconcileWg.Done()
 		run := func() {
@@ -1647,7 +1659,6 @@ func (d *Driver) startOrphanReconcile() {
 	// Kubernetes list, the bookkeeping sweeps, and the adoption/migration
 	// writes), always on reconcile.interval regardless of the fencing grace
 	// period above.
-	d.reconcileWg.Add(1)
 	go func() {
 		defer d.reconcileWg.Done()
 		run := func() {

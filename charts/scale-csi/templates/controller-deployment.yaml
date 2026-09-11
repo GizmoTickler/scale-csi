@@ -159,9 +159,20 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
+          # Deliberately /healthz, NOT /readyz. The controller's isReady()
+          # requires a live TrueNAS connection and, in strict fencing mode,
+          # stays false until startup fencing converges. Gating the startup
+          # probe on readiness turned "unready but serving" into
+          # CrashLoopBackOff: the budget here is 10 + 30*10 = 310s, which is
+          # effectively the same number as startupConnectTimeout (5m), so a NAS
+          # maintenance window longer than five minutes would kill the container
+          # at exactly the moment its own retry path was about to succeed. That
+          # also contradicts the invariant Run() documents, that the CSI
+          # endpoint must never crash-loop. Liveness is what belongs here;
+          # readiness is already covered by the readinessProbe below.
           startupProbe:
             httpGet:
-              path: /readyz
+              path: /healthz
               port: {{ .Values.metrics.port }}
             initialDelaySeconds: 10
             timeoutSeconds: 3

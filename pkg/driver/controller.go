@@ -39,7 +39,18 @@ const (
 	PropVolumeContentSourceID   = "scale-csi:csi_volume_content_source_id"
 	PropVolumeOriginSnapshot    = "scale-csi:csi_volume_origin_snapshot" // temp snapshot created during volume-to-volume cloning
 	PropInternalResource        = "scale-csi:internal_resource"          // internal snapshots that must not be exposed through ListSnapshots
-	PropRequestedSizeBytes      = "scale-csi:requested_size_bytes"       // requested capacity for quota-less filesystem volumes
+	// PropInternalSnapshotName carries an internal snapshot's OWN name. It
+	// exists solely to give the inline-property read-back in SnapshotCreate a
+	// snapshot-unique value to match on, and NOTHING classifies snapshots by
+	// it. Using PropCSISnapshotName for that purpose instead was a
+	// deletion-safety regression: that property IS the CSI identity
+	// discriminator on the 26.0 flat read path, so stamping it made internal
+	// clone-source snapshots classify as user CSI snapshots — they entered the
+	// managed set, were reported as orphans after minOrphanAge in the DEFAULT
+	// configuration, surfaced through ListSnapshots, and with delete enabled
+	// could get a live clone's origin renamed to a tombstone.
+	PropInternalSnapshotName = "scale-csi:internal_snapshot_name"
+	PropRequestedSizeBytes   = "scale-csi:requested_size_bytes" // requested capacity for quota-less filesystem volumes
 	// PropZFSPerformanceClass records the curated ZFS performance class a volume
 	// was CREATED with. It is the anchor for the create-only property guard: a
 	// later StorageClass edit is compared against this stamp, never re-derived
@@ -4520,23 +4531,23 @@ func (d *Driver) handleVolumeContentSource(
 		if markerWriteErr := d.writeInflightMarker(ctx, marker); markerWriteErr != nil {
 			return nil, blockGeometry{}, markerWriteErr
 		}
-		// PropCSISnapshotName carries the temp snapshot's OWN name, so this
-		// property set contains a snapshot-unique value. That is what makes
+		// PropInternalSnapshotName carries this snapshot's OWN name, giving the
+		// property set a snapshot-unique value. That is what makes
 		// SnapshotCreate's persistence read-back sound: it accepts a fresh read
 		// when every requested key matches by value, and 26.0's read path
 		// reports inherited and local properties indistinguishably (a flat map
-		// with no source). Without a snapshot-unique value, a create that
+		// with no source), so without a snapshot-unique value a create that
 		// genuinely dropped everything could read back as success purely
-		// through inheritance from the source dataset — a fabricated stamp on a
-		// path that gates DELETION.
+		// through inheritance from the source dataset.
 		//
-		// PropInternalResource alone previously satisfied that read-back only
-		// because no dataset happens to carry it. That invariant is real
-		// (verified across the pool) but undocumented and one `zfs set` from
-		// being false, so it is no longer what the safety rests on.
+		// It must NOT be PropCSISnapshotName. That property is the CSI identity
+		// discriminator on the 26.0 read path, so stamping it here made these
+		// internal snapshots classify as user-facing CSI snapshots — a
+		// deletion-safety regression that fires in the DEFAULT configuration on
+		// the first PVC-to-PVC clone. See PropInternalSnapshotName's declaration.
 		snap, err := d.truenasClient.SnapshotCreate(ctx, sourceDataset, tempSnapshotName, map[string]string{
-			PropInternalResource: "true",
-			PropCSISnapshotName:  tempSnapshotName,
+			PropInternalResource:     "true",
+			PropInternalSnapshotName: tempSnapshotName,
 		})
 		if err != nil {
 			d.deleteInflightMarker(ctx, path.Base(datasetName))
