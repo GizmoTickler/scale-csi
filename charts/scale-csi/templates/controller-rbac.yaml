@@ -15,52 +15,42 @@ metadata:
 {{- if .Values.serviceAccount.create }}
 ---
 {{- end }}
-{{- /* (C10) Cluster-wide get on ALL Secrets is dead privilege unless an
-ENABLED StorageClass actually declares a CHAP or encryption secret ref
-(chapSecretName / encryptionSecretName) — every bundled example that would
-need one ships disabled by default. This is mounted into five upstream
-sidecar containers and is the one authorized to destroy backend objects, so
-gate the rule instead of granting it unconditionally (note: .kube-linter.yaml
-excludes access-to-secrets, so no linter catches this either).
+{{- /* (C10) Cluster-wide get on ALL Secrets is dead privilege unless a
+RENDERED StorageClass actually names a controller-side CSI secret ref — every
+bundled example that would need one ships disabled by default. This is mounted
+into five upstream sidecar containers and is the one authorized to destroy
+backend objects, so gate the rule instead of granting it unconditionally (note:
+.kube-linter.yaml excludes access-to-secrets, so no linter catches this either).
 
-Two callers beyond the plural .Values.storageClasses[] range must also be
-inspected, or this gate silently strands them Forbidden:
+The gate is DERIVED, not re-implemented. scale-csi.storageClassList is the same
+helper templates/storageclass.yaml renders from, and
+scale-csi.storageClassParameters builds the same parameter map it ships, so the
+two cannot disagree about which classes exist or what they reference. The
+hand-written copy that used to live here disagreed in both directions:
 
-  - The legacy singular .Values.storageClass path. storageclass.yaml REPLACES
-    the class list entirely when it is set (mergeOverwrite over the same
-    create/enabled defaults), and reads chapSecretName/encryptionSecretName
-    off it exactly like a plural entry. An operator upgrading from the legacy
-    form with a CHAP secret would otherwise render a StorageClass that
-    references a Secret with no "secrets" rule granted at all, and every PVC
-    on that class stays Pending forever (external-provisioner's Secret lookup
-    returns Forbidden).
+  - It ADDED the legacy singular .Values.storageClass to the plural count while
+    storageclass.yaml REPLACES the list with it, so a displaced plural class
+    carrying chapSecretName/encryptionSecretName still switched the rule on for
+    a release whose rendered classes need nothing.
 
-  - encryption.enabled. pkg/driver/reconcile_encryption.go's locked-volume
-    reconciler reads a Secret named by LIVE StorageClass parameters whenever
-    d.config.Encryption.Enabled is set, entirely independent of chart values
-    (e.g. StorageClasses managed out-of-band via Flux/Kustomize). Without this
-    OR, that reconciler runs permanently Forbidden: encrypted volumes stay
-    LOCKED after a NAS reboot (see the encryption stanza above) and pods see
-    I/O errors indefinitely, with the failure only ever logged. */}}
-{{- $secretRefStorageClassCount := 0 -}}
-{{- range .Values.storageClasses }}
-{{- if or (not (hasKey . "enabled")) .enabled }}
-{{- if or .chapSecretName .encryptionSecretName }}
-{{- $secretRefStorageClassCount = add $secretRefStorageClassCount 1 -}}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- if .Values.storageClass }}
-{{- /* Mirrors storageclass.yaml's legacy-form merge exactly: "create" and
-"enabled" both default true unless explicitly set false, and the merged
-result is inspected for the same two secret-ref keys. */}}
-{{- $legacyStorageClass := mergeOverwrite (dict "create" true) (deepCopy .Values.storageClass) }}
-{{- if or (not (hasKey $legacyStorageClass "enabled")) $legacyStorageClass.enabled }}
-{{- if $legacyStorageClass.create }}
-{{- if or $legacyStorageClass.chapSecretName $legacyStorageClass.encryptionSecretName }}
-{{- $secretRefStorageClassCount = add $secretRefStorageClassCount 1 -}}
-{{- end }}
-{{- end }}
+  - It only knew about chapSecretName/encryptionSecretName. A class that names
+    csi.storage.k8s.io/provisioner-secret-name directly through extraParameters
+    — a perfectly ordinary thing to do — rendered with NO secrets rule granted,
+    and every PVC on it stayed Pending with only a Forbidden line in the
+    external-provisioner log to say why.
+
+encryption.enabled stays as a separate OR: pkg/driver/reconcile_encryption.go's
+locked-volume reconciler reads a Secret named by LIVE StorageClass parameters
+whenever d.config.Encryption.Enabled is set, entirely independent of chart
+values (e.g. StorageClasses managed out-of-band via Flux/Kustomize). Without
+it, that reconciler runs permanently Forbidden: encrypted volumes stay LOCKED
+after a NAS reboot and pods see I/O errors indefinitely, logged and nowhere
+else. */}}
+{{- $needsSecretGet := false -}}
+{{- range $storageClass := (include "scale-csi.storageClassList" . | fromJsonArray) }}
+{{- $parameters := include "scale-csi.storageClassParameters" (dict "root" $ "class" $storageClass) | fromJson }}
+{{- if include "scale-csi.storageClassNeedsControllerSecretGet" $parameters }}
+{{- $needsSecretGet = true -}}
 {{- end }}
 {{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
@@ -83,7 +73,7 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch", "create", "update", "patch"]
-  {{- if or (gt $secretRefStorageClassCount 0) .Values.encryption.enabled }}
+  {{- if or $needsSecretGet .Values.encryption.enabled }}
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]

@@ -1,8 +1,8 @@
 {
-  "source": "wss://nas01.achva.casa:443/api/current",
+  "source": "wss://truenas.example.com:443/api/current",
   "system_info": {
     "version": "26.0.0-BETA.2",
-    "hostname": "nas01",
+    "hostname": "truenas",
     "system_product": "S2600WTTR",
     "system_product_version": "...................."
   },
@@ -104596,8 +104596,8 @@
                 "type": "INET6"
               },
               {
-                "address": "192.168.122.148",
-                "broadcast": "192.168.122.255",
+                "address": "192.0.2.148",
+                "broadcast": "192.0.2.255",
                 "netmask": 24,
                 "type": "INET"
               }

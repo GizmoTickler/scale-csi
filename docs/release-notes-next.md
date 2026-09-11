@@ -1,6 +1,75 @@
-# Release notes — v1.10.6 (next)
+# Release notes — v1.11.0 (next)
 
-## Security — credentials off argv, backend errors scrubbed before they reach a PVC
+## v1.11.0 (unreleased)
+
+v1.10.6 is tagged; the section below it in this file is its record. Everything
+in this section is what has landed on `integrate/v1.11.0` since. It is
+accumulating — verification rounds are still adding to it — so treat it as the
+running record of the release, not a closed changelog.
+
+Beyond the security work written up immediately below, this release so far
+carries:
+
+- **TrueNAS backend truth-telling.** Snapshot and dataset creates no longer
+  trust the create response: the appliance is re-queried for the properties
+  that were meant to persist, a failed read-back is treated as a failure rather
+  than as proof, and the bogus `-32602` latch and faked snapshot stamps are
+  gone. `service.control` is used before `service.reload`, and `core.job_wait`
+  was reverted back to polling `core.get_jobs`.
+- **Startup and shutdown.** The driver retries its initial TrueNAS connection
+  instead of fataling (`startupConnectTimeout`, 5m); strict-mode startup
+  fencing quarantine is a deferral rather than an abandonment; the
+  `startupReconcileCancel` / `capacityCancel` shutdown races are closed.
+- **Node path.** `nvme connect` knobs (`--fast_io_fail_tmo`, queue counts,
+  keep-alive) are spelled correctly, defaulted, and wired through every connect
+  path; session GC scopes by any multipath path rather than `Paths[0]`;
+  `NodeUnstageVolume` fails closed on a session-disconnect failure; iSCSI
+  portal canonicalization is a true fixed point and publish no longer
+  double-registers a portal; `mkfs` refuses a device that has a partition table
+  but no filesystem.
+- **Host-tool execution.** `nodeIdentityCommand` is hardened and
+  context-bounded, and exec `Wait` is bounded against wedged descendants.
+- **Chart.** Secret RBAC is gated on the classes that actually reference a
+  Secret, only two workload revisions are retained by default, and the
+  controller/reconcile/fencing chart defects found in the v1.10.6 review are
+  fixed. Three further chart defects were caught in verification:
+  - The controller's startup probe pointed at `/healthz` on the metrics port,
+    which both the startup health server and the driver health server answer
+    with an unconditional 200. It therefore passed at ~t=10s no matter what the
+    backend was doing, arming the liveness probe against the CSI socket before
+    `Run()` had created it and restarting the pod at ~70s — so any backend
+    outage longer than that still crash-looped and the startup-retry window
+    above was never actually usable. The probe now targets the liveness-probe
+    sidecar on 9808, the only endpoint that means "the driver is serving", and
+    its `failureThreshold` is derived from `startupConnectTimeout` rather than
+    hard-coded to a number that only happens to work at the 5m default.
+  - The Secret RBAC gate re-implemented, rather than derived, "which
+    StorageClasses get rendered and what do they reference", and its copy was
+    wrong both ways: it added the legacy singular `storageClass` to the plural
+    count that the same form REPLACES (cluster-wide `get` on all Secrets for a
+    release needing none), and it ignored `extraParameters` (a class naming
+    `csi.storage.k8s.io/provisioner-secret-name` directly got no rule, leaving
+    every PVC on it Pending). Both templates now share one helper.
+  - `nvmeof.connect: null` — Helm's documented way to delete a subtree — passed
+    the values schema and then failed the render with a nil-pointer
+    dereference, i.e. an aborted `helm upgrade`. The nvmeof stanza now treats a
+    deleted subtree exactly like an unset one.
+- **Docs.** The live TrueNAS 26.0 API is mapped and gap-analyzed against driver
+  usage under `docs/reference/`. `values.yaml` documented
+  `nvmeof.connect.fastIOFailTmo: 0` as "uses the driver's built-in 15s". That
+  is only true when `nvmeof.multipath` is on; with multipath off (the default)
+  the driver omits the flag entirely.
+  The generated TrueNAS API reference under `docs/reference/` had the source
+  appliance's real websocket URL, hostname and one interface address baked in;
+  those are scrubbed to RFC 2606 / RFC 5737 placeholders.
+- **Tooling and CI.** golangci-lint pinned to v2.13.2 with the general-purpose
+  hardening set enabled, repo-specific bug classes encoded as static rules,
+  fuzz coverage expanded across TrueNAS RPC decode and host-tool parsing, and
+  CI gained config verification, a shuffled run, the chart suite, a fuzz smoke
+  run and a secret scan. Dependencies (Kubernetes 0.37.0, testify 1.12.1, Go
+  1.27.1 image, action digests) were refreshed.
+
+### Security — credentials off argv, backend errors scrubbed before they reach a PVC
 
 Three findings from a dedicated security review. All are latent with CHAP and
 encryption disabled (the defaults); they are real for anyone who enables either.

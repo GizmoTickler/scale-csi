@@ -1051,7 +1051,7 @@ func TestChartNVMeoFBlockExcellencePlumbing(t *testing.T) {
 		const values = `nvmeof:
   enabled: true
   subsystemAllowAnyHost: true
-  address: 192.168.120.10
+  address: 192.0.2.10
   multipath: true
   addresses:
     - 192.168.202.10

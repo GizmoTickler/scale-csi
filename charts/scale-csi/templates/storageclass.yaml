@@ -1,25 +1,9 @@
 {{- $root := . -}}
-{{- $classes := .Values.storageClasses -}}
-{{- if .Values.storageClass -}}
-  {{- /* The legacy defaults deliberately omit "protocol" and "mountOptions" so
-       the deprecated path shares the modern omit-when-unset behavior below.
-       Defaulting either to NFS values would corrupt an iscsi/nvmeof class. */}}
-  {{- $legacy := mergeOverwrite (dict "create" true "name" "scale-nfs" "isDefault" false "reclaimPolicy" "Delete" "allowVolumeExpansion" true "volumeBindingMode" "Immediate" "extraParameters" (dict)) (deepCopy .Values.storageClass) -}}
-  {{- if $legacy.create -}}
-    {{- $classes = list $legacy -}}
-  {{- else -}}
-    {{- $classes = list -}}
-  {{- end -}}
-{{- end -}}
-{{- /* An entry is rendered unless it explicitly sets enabled: false. This keeps
-     every existing class rendering by default while letting opt-in example
-     classes (e.g. the detached DR-restore class) ship disabled. */}}
-{{- $enabledClasses := list -}}
-{{- range $storageClass := $classes -}}
-  {{- if or (not (hasKey $storageClass "enabled")) $storageClass.enabled -}}
-    {{- $enabledClasses = append $enabledClasses $storageClass -}}
-  {{- end -}}
-{{- end -}}
+{{- /* The rendered class set and each class's parameter map come from shared
+     helpers (see _helpers.tpl) so templates/controller-rbac.yaml derives its
+     Secret rule from exactly what this template ships, instead of from a
+     second, drifting copy of the same logic. */}}
+{{- $enabledClasses := include "scale-csi.storageClassList" . | fromJsonArray -}}
 {{- range $index, $storageClass := $enabledClasses }}
 {{- if $index }}
 ---
@@ -43,106 +27,6 @@ mountOptions:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 parameters:
-  {{- $parameters := dict -}}
-  {{- with $storageClass.extraParameters }}
-    {{- $parameters = mergeOverwrite $parameters (deepCopy .) -}}
-  {{- end }}
-  {{- /* Emit protocol only when the storageClass entry sets it explicitly.
-       Omitting it lets the driver apply its sole-enabled-protocol fallback or
-       return its missing-parameter error, instead of the chart silently forcing
-       nfs on an iscsi/nvmeof class. */}}
-  {{- if $storageClass.protocol }}
-  {{- $_ := set $parameters "protocol" $storageClass.protocol -}}
-  {{- end }}
-  {{- /* Emit snapshotRestoreMode only when set, so unset classes follow the
-       driver's global zfs.detachedVolumesFromSnapshots default. */}}
-  {{- if $storageClass.snapshotRestoreMode }}
-  {{- $_ := set $parameters "snapshotRestoreMode" $storageClass.snapshotRestoreMode -}}
-  {{- end }}
-  {{- /* Curated ZFS performance class. Emitted only when set; unset classes
-       inherit the parent dataset's properties plus zfs.datasetProperties,
-       exactly as before. volblocksize is CREATE-ONLY, so a class change that
-       moves an existing zvol's geometry is rejected, not applied. */}}
-  {{- if $storageClass.zfsPerformanceClass }}
-  {{- $_ := set $parameters "zfsPerformanceClass" $storageClass.zfsPerformanceClass -}}
-  {{- end }}
-  {{- /* GF5 NFS export overrides. Each is emitted ONLY when the class sets it,
-       so an untouched class renders the exact parameter map it did before and
-       the driver keeps its historical create payload. */}}
-  {{- with $storageClass.nfsSecurity }}
-  {{- $_ := set $parameters "nfsSecurity" (join "," .) -}}
-  {{- end }}
-  {{- if hasKey $storageClass "nfsExposeSnapshots" }}
-  {{- $_ := set $parameters "nfsExposeSnapshots" (printf "%v" $storageClass.nfsExposeSnapshots) -}}
-  {{- end }}
-  {{- if hasKey $storageClass "nfsReadOnly" }}
-  {{- $_ := set $parameters "nfsReadOnly" (printf "%v" $storageClass.nfsReadOnly) -}}
-  {{- end }}
-  {{- /* Squash overrides, keyed on hasKey rather than truthiness: the driver
-       distinguishes "parameter absent" (inherit the chart/global default) from
-       "parameter present and EMPTY", and the empty string is the documented way
-       to CLEAR the default root squash so a class can set mapall_* without
-       tripping the maproot/mapall exclusivity. A truthiness test would silently
-       drop exactly that value. */}}
-  {{- range $squashKey := (list "nfsMaprootUser" "nfsMaprootGroup" "nfsMapallUser" "nfsMapallGroup") }}
-  {{- if hasKey $storageClass $squashKey }}
-  {{- $_ := set $parameters $squashKey (printf "%v" (get $storageClass $squashKey)) -}}
-  {{- end }}
-  {{- end }}
-  {{- /* Export allowlists, comma-joined like nfsSecurity. Under
-       fencing.mode=strict the driver REJECTS these at CreateVolume rather than
-       discarding them, so a class that sets one must be on additive fencing. */}}
-  {{- with $storageClass.nfsAllowedNetworks }}
-  {{- $_ := set $parameters "nfsAllowedNetworks" (join "," .) -}}
-  {{- end }}
-  {{- with $storageClass.nfsAllowedHosts }}
-  {{- $_ := set $parameters "nfsAllowedHosts" (join "," .) -}}
-  {{- end }}
-  {{- /* NFSv4 ACL. Emitted only when set; see docs/reference/storageclass.md for
-       the fsGroupPolicy=File interaction this opts a class into. */}}
-  {{- if $storageClass.nfsACLTemplate }}
-  {{- $_ := set $parameters "nfsACLTemplate" $storageClass.nfsACLTemplate -}}
-  {{- end }}
-  {{- if $storageClass.nfsACL }}
-  {{- $_ := set $parameters "nfsACL" (toJson $storageClass.nfsACL) -}}
-  {{- end }}
-  {{- /* aclmode. RESTRICTED is the documented primary mitigation for the
-       ACL x fsGroup interaction and is the ONLY ZFS lever that stops a chmod
-       from rewriting the ACL; the driver requires nfsACLTemplate or nfsACL
-       alongside it. */}}
-  {{- if $storageClass.nfsACLMode }}
-  {{- $_ := set $parameters "nfsACLMode" $storageClass.nfsACLMode -}}
-  {{- end }}
-  {{- /* CHAP: when a per-StorageClass CHAP Secret is named, emit the four CSI
-       secret-ref parameters (provisioner + node-stage). The chart references
-       the Secret by name/namespace only; credential values never appear here.
-       The namespace defaults to the release namespace when left unset. */}}
-  {{- if $storageClass.chapSecretName }}
-  {{- $chapSecretNamespace := $storageClass.chapSecretNamespace | default $root.Release.Namespace -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-name" $storageClass.chapSecretName -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-namespace" $chapSecretNamespace -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-name" $storageClass.chapSecretName -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-namespace" $chapSecretNamespace -}}
-  {{- end }}
-  {{- /* Encryption (GF-Sprint 1): when a per-StorageClass encryption Secret is
-       named, emit the encryption parameter AND the three CSI secret-ref
-       parameters — provisioner-secret (CreateVolume), controller-publish-secret
-       (the publish-time unlock and the locked-volume reconciler's Secret
-       resolution) and node-stage-secret (parity with the CHAP block). The chart
-       references the Secret by name/namespace only; the passphrase never appears
-       here. The namespace defaults to the release namespace when left unset.
-       Encryption is create-time only: the driver refuses an encrypted create that
-       also carries a content source, so there is deliberately no chart-level
-       snapshotRestoreMode coupling. */}}
-  {{- if $storageClass.encryptionSecretName }}
-  {{- $encryptionSecretNamespace := $storageClass.encryptionSecretNamespace | default $root.Release.Namespace -}}
-  {{- $_ := set $parameters "encryption" "true" -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-name" $storageClass.encryptionSecretName -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-namespace" $encryptionSecretNamespace -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/controller-publish-secret-name" $storageClass.encryptionSecretName -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/controller-publish-secret-namespace" $encryptionSecretNamespace -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-name" $storageClass.encryptionSecretName -}}
-  {{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-namespace" $encryptionSecretNamespace -}}
-  {{- end }}
+  {{- $parameters := include "scale-csi.storageClassParameters" (dict "root" $root "class" $storageClass) | fromJson }}
   {{- toYaml $parameters | nindent 2 }}
 {{- end }}
