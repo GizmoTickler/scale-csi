@@ -40,6 +40,21 @@ jobs:
         with:
           version: v2.13.2
 
+      # The repo-specific analyzers encode bug classes that shipped as real
+      # incidents and that no general linter catches (raw ZFS user-property
+      # reads that ignore inheritance, unhardened host-tool execs, blkid
+      # without -p, volume IDs as metric labels). They were written but never
+      # wired into anything, so they enforced nothing while .golangci.yml cited
+      # one of them as compensating coverage for a relaxed check.
+      - name: Run repo-specific analyzers
+        run: go run ./hack/lint/repolint ./pkg/... ./cmd/...
+
+      # The analyzers' own tests. A rule that silently matches nothing reports
+      # clean and is worse than no rule; RG-BLKID-NO-P was exactly that until
+      # these fixtures existed.
+      - name: Test repo-specific analyzers
+        run: go test ./hack/lint/repolint/...
+
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -292,16 +307,35 @@ jobs:
         run: |
           set -euo pipefail
           status=0
+          discovered=0
           for pkg in $(go list ./...); do
-            targets=$(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz' || true)
+            # Do NOT swallow the -list failure. Discarding stderr and forcing
+            # true meant a package whose tests stopped compiling yielded zero
+            # targets and a GREEN job -- a fuzz gate that fuzzes nothing and
+            # reports success, while gating the container build.
+            if ! listing=$(go test -list '^Fuzz' "$pkg" 2>&1); then
+              echo "::error::cannot list fuzz targets in $pkg (does it compile?)"
+              echo "$listing"
+              status=1
+              continue
+            fi
+            targets=$(printf '%s\n' "$listing" | grep '^Fuzz' || true)
             for target in $targets; do
               echo "::group::${pkg} ${target}"
               if ! go test -run '^$' -fuzz "^${target}\$" -fuzztime=30s "$pkg"; then
                 status=1
               fi
+              discovered=$((discovered + 1))
               echo "::endgroup::"
             done
           done
+          # A repo with fuzz targets that discovers none has a broken harness,
+          # not a clean run.
+          if [ "$discovered" -eq 0 ]; then
+            echo "::error::no fuzz targets were discovered; the harness is broken"
+            status=1
+          fi
+          echo "fuzzed $discovered target(s)"
           exit "$status"
 
   secret-scan:

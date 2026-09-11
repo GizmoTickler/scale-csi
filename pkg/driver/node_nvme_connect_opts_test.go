@@ -110,10 +110,50 @@ func TestNVMeConnectOptionsMapsConfiguredKnobs(t *testing.T) {
 	*opts.NrIOQueues = 99
 	assert.Equal(t, 4, *d.config.NVMeoF.Connect.NrIOQueues, "config pointer was aliased")
 
-	// Zero stays zero (util applies its own 15s default); negative is preserved
-	// verbatim so only an explicit opt-out disables the flag.
+	// Zero now means "let the topology decide": under multipath it stays zero so
+	// the util layer applies its 15s default, and on a single-path install it
+	// becomes negative (flag omitted), because there is nothing to fail over to
+	// and erroring I/O fast would convert a survivable stall into an outage. See
+	// TestFastIOFailTmoDefaultOnlyAppliesUnderMultipath.
 	d.config.NVMeoF.Connect = NVMeoFConnectConfig{}
+	d.config.NVMeoF.Multipath = true
+	d.config.NVMeoF.Addresses = []string{"192.168.202.10"}
 	assert.Zero(t, d.nvmeConnectOptions(time.Second).FastIOFailTmo)
+	d.config.NVMeoF.Multipath = false
+	d.config.NVMeoF.Addresses = nil
+	assert.Negative(t, d.nvmeConnectOptions(time.Second).FastIOFailTmo)
 	d.config.NVMeoF.Connect = NVMeoFConnectConfig{FastIOFailTmo: -1}
 	assert.Equal(t, -1*time.Second, d.nvmeConnectOptions(time.Second).FastIOFailTmo)
+}
+
+// TestFastIOFailTmoDefaultOnlyAppliesUnderMultipath pins that the 15s failover
+// default does not reach single-path installs, where there is nothing to fail
+// over to and erroring I/O fast converts a survivable stall into an outage.
+//
+// nvmeof.multipath defaults to false, so an ungated default applied precisely
+// to the installs it cannot help: with ctrl_loss_tmo=-1 those previously queued
+// transparently through a NAS reboot, whereas EIO takes ext4 read-only and
+// shuts down an xfs log, needing a pod restart per volume.
+func TestFastIOFailTmoDefaultOnlyAppliesUnderMultipath(t *testing.T) {
+	newDriver := func(multipath bool, addrs []string, configured int) *Driver {
+		d := &Driver{config: &Config{}}
+		d.config.NVMeoF.Multipath = multipath
+		d.config.NVMeoF.Addresses = addrs
+		d.config.NVMeoF.TransportAddress = "192.168.201.10"
+		d.config.NVMeoF.Connect = NVMeoFConnectConfig{FastIOFailTmo: configured}
+		return d
+	}
+
+	single := newDriver(false, nil, 0)
+	assert.Negative(t, single.nvmeConnectOptions(time.Minute).FastIOFailTmo,
+		"single-path install must omit the flag, preserving the queue-through-outage behaviour")
+
+	multi := newDriver(true, []string{"192.168.202.10", "192.168.203.10"}, 0)
+	assert.Zero(t, multi.nvmeConnectOptions(time.Minute).FastIOFailTmo,
+		"multipath install must keep zero so the util layer applies its 15s default")
+
+	// An explicit value is an operator decision and wins in both topologies.
+	optIn := newDriver(false, nil, 20)
+	assert.Equal(t, 20*time.Second, optIn.nvmeConnectOptions(time.Minute).FastIOFailTmo,
+		"an explicit positive value must still apply on a single-path install")
 }

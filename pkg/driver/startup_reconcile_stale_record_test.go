@@ -328,3 +328,34 @@ func TestQuarantinedVolumeEventuallyConverges(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond,
 		"the per-volume gauge must clear once the volume converges, not latch at 1 forever")
 }
+
+// TestQuarantineRefusedWhenAGenuineConflictCoexistsWithAStaleRecord covers the
+// mixed case the existing dual-VA test cannot: a REAL two-node conflict plus an
+// unrelated leftover record for a departed node.
+//
+// stalePublishedRecordNode used to return the first non-live record it happened
+// to iterate, with no relation to which record caused the compatibility
+// failure. So a volume genuinely published to two live nodes would be
+// quarantined on the strength of an unrelated stale record for a third, the
+// real conflict would be swallowed, the operator event would name the wrong
+// node, and strict readiness would latch true on a false premise.
+func TestQuarantineRefusedWhenAGenuineConflictCoexistsWithAStaleRecord(t *testing.T) {
+	records := map[string]publicationRecord{
+		"a": {State: publicationStatePublished, Node: "k8s-0"},
+		"b": {State: publicationStatePublished, Node: "k8s-1"},
+		"c": {State: publicationStatePublished, Node: "departed-node"},
+	}
+	live := map[string]struct{}{"k8s-0": {}, "k8s-1": {}}
+
+	node, ok := stalePublishedRecordNode(records, live)
+	assert.False(t, ok, "a live publisher must refuse quarantine even when an unrelated stale record coexists")
+	assert.Empty(t, node)
+
+	// The intended case still works: the stale record is the only published one.
+	onlyStale := map[string]publicationRecord{
+		"c": {State: publicationStatePublished, Node: "departed-node"},
+	}
+	node, ok = stalePublishedRecordNode(onlyStale, live)
+	assert.True(t, ok, "a leftover record with no live publisher is exactly what quarantine is for")
+	assert.Equal(t, "departed-node", node)
+}

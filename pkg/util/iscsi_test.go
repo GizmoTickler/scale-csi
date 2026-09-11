@@ -1825,3 +1825,63 @@ func TestHardenCmdCancelMapsESRCHToProcessDone(t *testing.T) {
 	assert.ErrorIs(t, err, os.ErrProcessDone,
 		"a cancel that finds the process already gone must report ErrProcessDone, not raw ESRCH, or os/exec injects a failure into a successful command")
 }
+
+// TestIsWedgedCommandErrDetectsASignalKilledCommand reproduces the real wedge
+// rather than a hand-built error, which is what made the previous test
+// tautological: it fed the predicate fmt.Errorf("%w", exec.ErrWaitDelay), a
+// value the real path never produces.
+//
+// Cmd.Wait prefers the process's own error over ErrWaitDelay, so in the wedge
+// HardenCmd exists for the caller sees *ExitError("signal: killed") and the
+// output is TRUNCATED. A predicate that only checked ErrWaitDelay returned
+// false there, which made every fallback guard built on it a no-op — and those
+// fallbacks text-match the truncated buffer for "No matching sessions" /
+// "already connected", so a live transport could be reported as already gone.
+func TestIsWedgedCommandErrDetectsASignalKilledCommand(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// A wrapper that prints, then backgrounds a child holding the pipe open —
+	// the shape docker/iscsiadm and docker/nvme produce via nsenter.
+	cmd := exec.CommandContext(ctx, "sh", "-c", "echo No matching sessions found; sleep 30 & wait")
+	HardenCmd(cmd)
+	out, err := cmd.Output()
+
+	require.Error(t, err, "the command must not complete normally")
+	assert.True(t, isWedgedCommandErr(err),
+		"a signal-killed command yields truncated output and must be classified as wedged; got %v (output %q)", err, string(out))
+
+	// And the converse: a command that exits with a real status is trustworthy.
+	clean := exec.CommandContext(context.Background(), "sh", "-c", "echo No matching sessions found; exit 21")
+	HardenCmd(clean)
+	_, cleanErr := clean.Output()
+	require.Error(t, cleanErr)
+	assert.False(t, isWedgedCommandErr(cleanErr),
+		"a real non-zero exit produced complete output and must remain trustworthy")
+}
+
+// TestSameISCSIPortalMatchesEquivalentIPv6Forms pins that the two
+// canonicalization branches agree on IPv6. The SplitHostPort branch used to
+// lowercase the host but never run it through net.ParseIP, while the port-less
+// branch did — so an expanded IPv6 portal never matched the compressed form
+// `iscsiadm -m session` reports, sameISCSIPortal always answered "not logged
+// in", and every stage re-logged in and duplicated sessions.
+func TestSameISCSIPortalMatchesEquivalentIPv6Forms(t *testing.T) {
+	equivalent := [][2]string{
+		{"[2001:0db8:0000:0000:0000:0000:0000:0001]:3260", "[2001:db8::1]:3260"},
+		{"2001:db8::1", "[2001:db8::1]:3260"},
+		{"[2001:DB8::1]:3260", "[2001:db8::1]:3260"},
+		{"[::ffff:10.0.0.1]:3260", "10.0.0.1:3260"},
+		// Unchanged behaviour for the forms this cluster actually uses.
+		{"192.168.201.10", "192.168.201.10:3260"},
+		{"NAS01.Example.COM:3260", "nas01.example.com:3260"},
+	}
+	for _, pair := range equivalent {
+		assert.True(t, sameISCSIPortal(pair[0], pair[1]),
+			"%q and %q name the same portal", pair[0], pair[1])
+	}
+	assert.False(t, sameISCSIPortal("[2001:db8::1]:3260", "[2001:db8::2]:3260"),
+		"distinct IPv6 portals must not match")
+	assert.False(t, sameISCSIPortal("192.168.201.10", "192.168.202.10"),
+		"distinct IPv4 portals must not match")
+}

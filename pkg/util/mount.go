@@ -536,6 +536,14 @@ func GetFilesystemTypeWithContext(ctx context.Context, devicePath string) (strin
 	output, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
+		// Exit 8 is "ambivalent probing result" and exists ONLY in -p mode, so
+		// it became reachable with this branch's switch to low-level probing.
+		// Falling through to the generic error turns it into an opaque,
+		// permanent NodeStageVolume failure on a device that staged fine
+		// before — refusing is right, but the operator needs to know why.
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 8 {
+			return "", fmt.Errorf("device %s has ambivalent filesystem signatures (blkid -p exit 8); refusing to guess which is real — clear the stale signature with wipefs before staging", devicePath)
+		}
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 &&
 			strings.TrimSpace(string(output)) == "" && strings.TrimSpace(string(exitErr.Stderr)) == "" {
 			return "", nil

@@ -33,6 +33,11 @@ type startupFencingVolume struct {
 	volumeID         string
 	volumeAttributes map[string]string
 	publications     []startupPublication
+	// claimedNodes is every node with a VolumeAttachment for this volume,
+	// INCLUDING ones not yet or no longer Attached. Deliberately wider than
+	// publications, and must match the predicate reconcileStalePublicationRecords
+	// uses, or a quarantine can outlive any revoke that could clear it.
+	claimedNodes map[string]struct{}
 	// pv carries one PersistentVolume referencing this volume so per-volume
 	// operator-attention conditions can be surfaced as Events, not just klog.
 	pv *corev1.PersistentVolume
@@ -87,10 +92,18 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 	attachmentCount := 0
 	for i := range attachmentList.Items {
 		attachment := &attachmentList.Items[i]
-		if attachment.Spec.Attacher != d.name || !attachment.Status.Attached ||
-			!attachment.DeletionTimestamp.IsZero() || attachment.Spec.Source.PersistentVolumeName == nil {
+		if attachment.Spec.Attacher != d.name || attachment.Spec.Source.PersistentVolumeName == nil {
 			continue
 		}
+		// A VolumeAttachment that EXISTS but is not yet Attached, or is being
+		// deleted, is still a live CLAIM for deciding whether a published record
+		// is a stale leftover. reconcileStalePublicationRecords -- the only thing
+		// that can clear a quarantine -- uses exactly this wider rule, and the two
+		// predicates disagreeing made quarantine PERMANENT: a node mid-drain read
+		// as STALE here (so the volume was quarantined) and LIVE there (so no
+		// revoke fired and nothing ever signalled the loop). Strict mode then
+		// latched ready with that volume's record and backend fence never written.
+		attachedNow := attachment.Status.Attached && attachment.DeletionTimestamp.IsZero()
 		pvName := *attachment.Spec.Source.PersistentVolumeName
 		pv := pvs[pvName]
 		if pv == nil {
@@ -113,6 +126,14 @@ func (d *Driver) reconcilePublishedAttachments(ctx context.Context) error {
 				pv:               pv,
 			}
 			volumes[volumeID] = volume
+		}
+		if volume.claimedNodes == nil {
+			volume.claimedNodes = make(map[string]struct{})
+		}
+		volume.claimedNodes[attachment.Spec.NodeName] = struct{}{}
+		if !attachedNow {
+			// A live claim, but nothing to converge a fence for on this pass.
+			continue
 		}
 		volume.publications = append(volume.publications, startupPublication{
 			identity: identity,
@@ -288,7 +309,13 @@ func (d *Driver) reconcileStartupFencingVolume(ctx context.Context, volume *star
 	// that mechanism only ever REVOKES, never re-publishes. Used below to tell
 	// that shape apart from a real (or transient dual-VA migration) conflict,
 	// which must keep blocking exactly as before.
-	liveNodes := make(map[string]struct{}, len(volume.publications))
+	// From claimedNodes, not publications: a node mid-drain must count as live
+	// here or it is quarantined by a predicate the revoke path disagrees with,
+	// and the quarantine never clears.
+	liveNodes := make(map[string]struct{}, len(volume.claimedNodes)+len(volume.publications))
+	for node := range volume.claimedNodes {
+		liveNodes[node] = struct{}{}
+	}
 	for _, publication := range volume.publications {
 		liveNodes[publication.identity.Name] = struct{}{}
 	}

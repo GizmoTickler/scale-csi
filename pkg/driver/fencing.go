@@ -508,16 +508,39 @@ func validatePublicationCompatibility(records map[string]publicationRecord, requ
 // attachment (including the ordinary "transient dual-VA state during
 // migration" case, which must keep blocking as before — both nodes are live
 // there, so this correctly returns false).
+// stalePublishedRecordNode reports the stale node to quarantine on, and does so
+// ONLY when EVERY published record is stale.
+//
+// Returning the first non-live record regardless of the others was wrong in a
+// way that silently weakened strict mode. Consider volume V with live
+// VolumeAttachments on nodes A and B — a genuine dual-attach, or a migration in
+// flight — plus a leftover published record for departed node C. The
+// compatibility check fails on the real A/B conflict, but the scan would return
+// C, the caller would quarantine, swallow the genuine conflict, emit an event
+// naming the wrong node, and latch readiness true. That directly contradicts
+// this file's own contract that a real conflict must keep blocking.
+//
+// Requiring ALL published records to be stale keeps the intended case working
+// (the force-removed-finalizer leftover, where the stale record is the only
+// published one) while a single live publisher is enough to refuse. The
+// existing dual-VA test does not cover the mixed case because every record it
+// builds is live, which is why this was invisible.
 func stalePublishedRecordNode(records map[string]publicationRecord, liveNodes map[string]struct{}) (string, bool) {
+	staleNode := ""
 	for _, record := range records { //nolint:gocritic // records is a map (values aren't addressable); bounded by live cluster node count, not a hot loop
 		if record.State != publicationStatePublished {
 			continue
 		}
-		if _, live := liveNodes[record.Node]; !live {
-			return record.Node, true
+		if _, live := liveNodes[record.Node]; live {
+			// A live publisher is present: whatever else is here, this is not a
+			// pure stale-leftover situation and must not be quarantined.
+			return "", false
+		}
+		if staleNode == "" {
+			staleNode = record.Node
 		}
 	}
-	return "", false
+	return staleNode, staleNode != ""
 }
 
 func identityForSameNode(records map[string]publicationRecord, requested NodeIdentity) NodeIdentity {

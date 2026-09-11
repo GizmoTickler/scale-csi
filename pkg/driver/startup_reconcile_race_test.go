@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
@@ -45,4 +46,37 @@ func TestStopStartupAttachmentReconcileBeforeStartPreventsLoopFromEverRunning(t 
 
 	require.Never(t, d.ready.Load, 300*time.Millisecond, 10*time.Millisecond,
 		"a startup fencing reconcile loop must never launch once Stop() has already been observed")
+}
+
+// TestStopSessionGCBeforeStartPreventsLoopFromEverRunning covers the one loop
+// the C7 shutdown-race conversion missed, and the worst one to miss: session GC
+// is the last thing Run() starts and the first thing Stop() stops, and its
+// goroutine DISCONNECTS LIVE TRANSPORTS.
+//
+// Pre-fix, a SIGTERM landing while Run() was still in startup saw a nil
+// gcCancel, skipped both the cancel and the Wait, and then Run() launched a GC
+// goroutine with a context nothing could cancel — still disconnecting sessions
+// after GracefulStop() and after the TrueNAS client was closed.
+func TestStopSessionGCBeforeStartPreventsLoopFromEverRunning(t *testing.T) {
+	d := &Driver{config: &Config{}}
+	d.config.SessionGC.Enabled = true
+	d.config.SessionGC.Interval = 300
+	d.config.NVMeoF.TransportAddress = "192.168.201.10"
+
+	// Stop wins the race.
+	d.stopSessionGC()
+
+	// A later start must be inert.
+	d.startSessionGC()
+	assert.Nil(t, d.gcCancel, "a start after stop must not install a cancel handle")
+
+	// And must not leave a goroutine behind: Wait returns immediately if the
+	// loop never launched, and hangs if it did.
+	done := make(chan struct{})
+	go func() { d.gcWg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session GC goroutine was launched after Stop() and is unjoinable")
+	}
 }

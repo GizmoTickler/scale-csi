@@ -251,6 +251,10 @@ func setMemoryLimitFromCgroup(
 }
 
 func readCgroupMemoryLimit(v2Path, v1Path string) (limit int64, finite bool, err error) {
+	// #nosec G304 -- both paths are compile-time cgroup constants passed by the
+	// only caller (cgroupV2MemoryLimitPath / cgroupV1MemoryLimitPath); the
+	// parameters exist so tests can point at a t.TempDir() fixture. No
+	// attacker-influenced value reaches either.
 	contents, readErr := os.ReadFile(v2Path)
 	if readErr == nil {
 		return parseCgroupMemoryLimit(v2Path, contents, false)
@@ -259,6 +263,7 @@ func readCgroupMemoryLimit(v2Path, v1Path string) (limit int64, finite bool, err
 		return 0, false, fmt.Errorf("read cgroup v2 memory limit: %w", readErr)
 	}
 
+	// #nosec G304 -- see the note on the v2 read above; same constant-path argument.
 	contents, readErr = os.ReadFile(v1Path)
 	if readErr != nil {
 		if os.IsNotExist(readErr) {

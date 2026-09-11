@@ -207,13 +207,17 @@ func NVMeoFDisconnectWithContext(ctx context.Context, nqn string) error {
 			// remains the idempotency signal, and the LC_ALL=C pin above keeps that
 			// message text locale-stable.
 			//
-			// KNOWN BUG, not fixed here: missing an isWedgedCommandErr(err) check
-			// first (see hardenCmd's doc comment in pkg/util/iscsi.go). Found while
-			// wiring up the RG-WEDGED-GUARD rule during lint hardening; left for
-			// the in-flight defect-verification pass.
-			//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
+			// A wedged descendant returns a TRUNCATED or empty output buffer after
+			// WaitDelay fires, so text-matching it can read as an idempotent no-op
+			// when the operation never completed. That is only reachable because
+			// HardenCmd bounds Wait — before it, this hung forever instead. Check
+			// the wedge FIRST, or a live transport is reported as already gone and
+			// NodeUnstageVolume's fail-closed path is defeated at exactly the
+			// failure mode it exists for.
+			if isWedgedCommandErr(err) {
+				return fmt.Errorf("disconnect wedged (output is unreliable): %w", err)
+			}
 			if strings.Contains(string(output), "not found") ||
-				//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
 				strings.Contains(string(output), "No subsystems") {
 				klog.V(4).Infof("Subsystem already disconnected: %s", nqn)
 				return nil
@@ -352,11 +356,12 @@ func runNVMeConnect(ctx context.Context, transport, host, port, nqn string, opts
 	if err != nil {
 		// Check if already connected
 		//
-		// KNOWN BUG, not fixed here: missing an isWedgedCommandErr(err) check
-		// first (see hardenCmd's doc comment in pkg/util/iscsi.go). Found while
-		// wiring up the RG-WEDGED-GUARD rule during lint hardening; left for
-		// the in-flight defect-verification pass.
-		//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
+		// A wedged descendant returns a truncated buffer after WaitDelay fires;
+		// reading "already connected" out of it would skip a connect that never
+		// happened. Check the wedge first.
+		if isWedgedCommandErr(err) {
+			return fmt.Errorf("connect wedged (output is unreliable): %w", err)
+		}
 		if strings.Contains(string(output), "already connected") {
 			klog.V(4).Infof("Subsystem already connected: %s", nqn)
 			return nil

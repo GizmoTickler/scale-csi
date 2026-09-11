@@ -170,8 +170,19 @@ type Driver struct {
 	requestCounter uint64
 
 	// Session GC context and cancellation
-	gcCancel context.CancelFunc
-	gcWg     sync.WaitGroup
+	// gcStateMu + gcStopped guard gcCancel with the same mutex + terminal-flag
+	// pattern every other loop on this driver uses. Session GC was the one loop
+	// the C7 conversion missed, and it is the worst one to miss: it is the LAST
+	// thing Run() starts and the FIRST thing Stop() stops, and its goroutine
+	// disconnects live transports. A SIGTERM landing while Run() was still in
+	// startup would see a nil gcCancel, skip both the cancel and the Wait, and
+	// then Run() would launch a GC goroutine with a context nothing can cancel
+	// — still disconnecting sessions after GracefulStop(). It was also a plain
+	// data race that go vet does not catch.
+	gcStateMu sync.Mutex
+	gcStopped bool
+	gcCancel  context.CancelFunc
+	gcWg      sync.WaitGroup
 
 	// Controller-side orphan reconcile context and cancellation.
 	// reconcileStateMu + reconcileStopped guard reconcileCancel with the same
@@ -882,9 +893,19 @@ func (d *Driver) startSessionGC() {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	d.gcStateMu.Lock()
+	if d.gcStopped || d.gcCancel != nil {
+		d.gcStateMu.Unlock()
+		cancel()
+		return
+	}
 	d.gcCancel = cancel
-
+	// Add before unlocking: Stop() takes this same lock then Waits, so an Add
+	// after the unlock lets a Stop() in that window see a counter of 0 and
+	// return from Wait immediately.
 	d.gcWg.Add(1)
+	d.gcStateMu.Unlock()
+
 	go func() {
 		defer d.gcWg.Done()
 		klog.Infof("Session monitor started: interval=%v, cleanup=%v, gracePeriod=%v, dryRun=%v, iSCSI=%v, NVMeoF=%v",
@@ -927,10 +948,17 @@ func (d *Driver) startSessionGC() {
 
 // stopSessionGC stops the session garbage collection goroutine.
 func (d *Driver) stopSessionGC() {
-	if d.gcCancel != nil {
-		d.gcCancel()
-		d.gcWg.Wait()
+	d.gcStateMu.Lock()
+	d.gcStopped = true
+	cancel := d.gcCancel
+	d.gcCancel = nil
+	d.gcStateMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+	// Unconditional: safe on a zero counter, and it is what makes a Stop() that
+	// wins the race still join a loop that started a moment later.
+	d.gcWg.Wait()
 }
 
 // runSessionGCWithProtocols performs one garbage collection cycle with explicit protocol control.

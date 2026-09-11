@@ -121,8 +121,39 @@ func HardenCmd(cmd *exec.Cmd) {
 // output may be truncated or missing entirely, so it must never be
 // misclassified as an idempotent "not found"/"no session" no-op by
 // output-text matching.
+// isWedgedCommandErr reports whether err means the command's OUTPUT cannot be
+// trusted, so a caller must not text-match it for an idempotency signal.
+//
+// Checking exec.ErrWaitDelay ALONE does not work, and believing it did made
+// every guard built on this predicate a no-op. Go's Cmd.Wait explicitly prefers
+// the process's own error: "If c.Process.Wait returned an error, prefer that."
+// In the exact wedge HardenCmd targets — context expires, the group is
+// SIGKILLed, a grandchild keeps the pipe open — the direct child dies
+// signaled, so Wait returns *ExitError("signal: killed") and ErrWaitDelay is
+// discarded. Measured directly:
+//
+//	output="partial-output\n"
+//	err=signal: killed
+//	errors.Is(err, exec.ErrWaitDelay) = false
+//	ExitCode() = -1
+//
+// The output really was truncated and the old predicate really did return
+// false. A signaled or wedged process has no exit status, so ExitCode() is -1;
+// that is the reliable discriminator. A command that exited with a real status,
+// zero or not, produced complete output and its text may be trusted.
 func isWedgedCommandErr(err error) bool {
-	return errors.Is(err, exec.ErrWaitDelay)
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		// -1 means killed by a signal or never reaped: no trustworthy output.
+		return exitErr.ExitCode() < 0
+	}
+	return false
 }
 
 var (
@@ -493,13 +524,17 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 			// fallback for older/odd builds that report the condition without the
 			// documented exit code.
 			//
-			// KNOWN BUG, not fixed here: this does not check isWedgedCommandErr(err)
-			// first, contrary to the invariant hardenCmd's doc comment documents.
-			// Found while wiring up the RG-WEDGED-GUARD rule during lint hardening;
-			// left for the in-flight defect-verification pass.
-			//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
+			// A wedged descendant returns a TRUNCATED or empty output buffer once
+			// WaitDelay fires, so text-matching it can read as "already logged
+			// out" when the session is still live. Only reachable because
+			// HardenCmd bounds Wait; before that this hung instead. Check the
+			// wedge FIRST — otherwise NodeUnstageVolume's fail-closed path
+			// reports success while a live iSCSI session still holds the LUN,
+			// and the volume becomes attachable elsewhere with two writers.
+			if isWedgedCommandErr(err) {
+				return fmt.Errorf("logout wedged (output is unreliable): %w", err)
+			}
 			if strings.Contains(string(output), "No matching sessions") ||
-				//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
 				strings.Contains(string(output), "not logged in") {
 				klog.V(4).Infof("Target already logged out: %s", iqn)
 				return nil
@@ -645,11 +680,12 @@ func iscsiLoginWithSessions(ctx context.Context, portal, iqn string, sessions []
 		// for older/odd iscsiadm builds that report the condition without the
 		// documented exit code.
 		//
-		// KNOWN BUG, not fixed here: missing an isWedgedCommandErr(err) check
-		// first (see hardenCmd's doc comment). Found while wiring up the
-		// RG-WEDGED-GUARD rule during lint hardening; left for the in-flight
-		// defect-verification pass.
-		//repolint:ignore RG-WEDGED-GUARD see the KNOWN BUG comment above
+		// A wedged descendant returns a truncated buffer after WaitDelay fires;
+		// reading "already present" out of it would skip a login that never
+		// happened. Check the wedge first.
+		if isWedgedCommandErr(err) {
+			return fmt.Errorf("login wedged (output is unreliable): %w", err)
+		}
 		if strings.Contains(string(output), "already present") {
 			klog.V(4).Infof("Target already logged in: %s", iqn)
 			return nil
@@ -828,7 +864,18 @@ func canonicalISCSIPortalForComparison(portal string) string {
 	// produced " :", which the leading TrimSpace then rewrote to ":" on the
 	// next pass.
 	if host, port, err := net.SplitHostPort(portal); err == nil {
-		return net.JoinHostPort(strings.ToLower(strings.TrimSpace(host)), strings.TrimSpace(port))
+		host = strings.TrimSpace(host)
+		// Normalise the IP the same way the port-less branch below does.
+		// Without this the two branches disagree for IPv6: a portal written
+		// [2001:0db8:0000:...:0001]:3260 never matched the [2001:db8::1]:3260
+		// that `iscsiadm -m session` reports, so sameISCSIPortal always said
+		// "not logged in" and every stage re-logged in, duplicating sessions.
+		// IPv4 and hostnames are unaffected — ParseIP returns nil for a
+		// hostname, and an IPv4 literal round-trips to itself.
+		if ip := net.ParseIP(host); ip != nil {
+			host = ip.String()
+		}
+		return net.JoinHostPort(strings.ToLower(host), strings.TrimSpace(port))
 	}
 	if ip := net.ParseIP(strings.Trim(portal, "[]")); ip != nil {
 		return net.JoinHostPort(ip.String(), "3260")

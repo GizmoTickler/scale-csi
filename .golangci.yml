@@ -90,8 +90,34 @@ linters:
       - hack/ruleguard/
     presets:
       - std-error-handling
-      - common-false-positives
     rules:
+      # The chart test harness legitimately execs `helm` with built-up argv and
+      # reads fixture files by path. Scoped to _test.go ONLY: G204/G304 stay
+      # ENABLED for production code, which is the entire reason gosec is on for
+      # a privileged node plugin that shells out to host binaries. The
+      # common-false-positives PRESET was removed because it disabled G103,
+      # G204 and G304 everywhere, unconditionally and path-unfiltered —
+      # silencing exactly the checks this config says it enables them for.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G204|G304"
+      # pkg/util IS the host-tool layer: its whole purpose is to exec iscsiadm,
+      # nvme, mount, blkid and mkfs with a device path that is necessarily a
+      # variable, and to read sysfs by a path built from one. G204/G304 fire on
+      # every such site by construction, so they cannot be actioned here — the
+      # question is only whether the inputs are constrained, and that was
+      # traced end to end in a dedicated security review: every
+      # attacker-influenced string occupies an argv slot immediately after a
+      # flag that consumes it (so a leading dash cannot become an option), and
+      # every positional device argument is re-gated on a /dev/ prefix after
+      # filepath.EvalSymlinks. Scoped to these two packages and these two
+      # rules, NOT the repo-wide common-false-positives preset that was removed
+      # (it also disabled G103 everywhere and was path-unfiltered).
+      - path: pkg/(util|driver)/
+        linters:
+          - gosec
+        text: "G204|G304"
       # Test files can have longer functions and magic numbers
       - path: _test\.go
         linters:
@@ -231,3 +257,9 @@ formatters:
     goimports:
       local-prefixes:
         - github.com/GizmoTickler/scale-csi
+
+# Report every finding. The defaults (50 per linter, 3 per check) silently
+# truncate, which makes "0 issues" and "51 issues" look identical in CI output.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

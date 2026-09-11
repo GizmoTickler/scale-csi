@@ -82,11 +82,29 @@ func TestChartReconcileCronJobHasDeadlines(t *testing.T) {
 	if !ok {
 		t.Fatal("reconcile CronJob has no spec")
 	}
-	if _, ok := spec["activeDeadlineSeconds"].(int); !ok {
-		t.Errorf("reconcile CronJob renders no activeDeadlineSeconds; got %#v", spec["activeDeadlineSeconds"])
-	}
-	if _, ok := spec["startingDeadlineSeconds"].(int); !ok {
+	// startingDeadlineSeconds IS a CronJobSpec field and belongs here.
+	if _, hasStarting := spec["startingDeadlineSeconds"].(int); !hasStarting {
 		t.Errorf("reconcile CronJob renders no startingDeadlineSeconds; got %#v", spec["startingDeadlineSeconds"])
+	}
+	// activeDeadlineSeconds is a JOB spec field. Asserting it on CronJobSpec is
+	// what let this test PASS while the production defect was live: Helm happily
+	// renders an unknown key, so the test validated Helm's templating rather
+	// than anything Kubernetes would accept. Flux's server-side strict apply
+	// rejects that manifest outright, and plain Helm silently drops the field,
+	// so the wedged-Job protection did not exist in either path.
+	if _, wrongLevel := spec["activeDeadlineSeconds"]; wrongLevel {
+		t.Error("activeDeadlineSeconds must NOT be on CronJobSpec: strict apply rejects the manifest and Helm silently drops it")
+	}
+	jobTemplate, ok := asManifest(spec["jobTemplate"])
+	if !ok {
+		t.Fatal("reconcile CronJob has no jobTemplate")
+	}
+	jobSpec, ok := asManifest(jobTemplate["spec"])
+	if !ok {
+		t.Fatal("reconcile CronJob has no jobTemplate.spec")
+	}
+	if _, hasActive := jobSpec["activeDeadlineSeconds"].(int); !hasActive {
+		t.Errorf("reconcile CronJob renders no jobTemplate.spec.activeDeadlineSeconds; got %#v", jobSpec["activeDeadlineSeconds"])
 	}
 }
 
