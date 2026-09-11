@@ -129,12 +129,12 @@ func TestNVMeConnectLegacyAndMultipathSuppression(t *testing.T) {
 			}
 
 			require.NoError(t, nvmeConnectWithSubsystems(
-				context.Background(), "tcp", test.host, "4420", "nqn.gf5:connect", test.subsystems,
+				context.Background(), "tcp", test.host, "4420", "nqn.gf5:connect", nil, test.subsystems,
 			))
 			assert.Zero(t, commandCalls, "legacy NQN-level entry point must suppress the connect")
 
 			require.NoError(t, nvmeConnectPathWithSubsystems(
-				context.Background(), "tcp", test.host, "4420", "nqn.gf5:connect", test.subsystems,
+				context.Background(), "tcp", test.host, "4420", "nqn.gf5:connect", nil, test.subsystems,
 			))
 			assert.Equal(t, 1, commandCalls, "multipath entry point must attempt the missing or non-live path")
 		})
@@ -154,9 +154,98 @@ func TestNVMeConnectPathSuppressesExactLiveController(t *testing.T) {
 		{Address: "traddr=2001:db8::10,trsvcid=4420", State: "live"},
 	}}}
 	require.NoError(t, nvmeConnectPathWithSubsystems(
-		context.Background(), "tcp", "2001:db8::10", "4420", "nqn.gf5:live", subsystems,
+		context.Background(), "tcp", "2001:db8::10", "4420", "nqn.gf5:live", nil, subsystems,
 	))
 	assert.Zero(t, commandCalls)
+}
+
+// TestRunNVMeConnectFastIOFailTmoDefault is the N4 regression: with
+// --ctrl-loss-tmo=-1 pinned (correct, and kept, for multipath), a controller
+// stuck reconnecting queues I/O against it forever instead of failing over to
+// a surviving path UNLESS --fast-io-fail-tmo is also set. Verified live:
+// ctrl_loss_tmo=off fast_io_fail_tmo=off on production. Every connect must now
+// carry a --fast-io-fail-tmo, defaulting to 15s, without dropping any
+// existing flag.
+func TestRunNVMeConnectFastIOFailTmoDefault(t *testing.T) {
+	originalCommand := nvmeConnectCommand
+	t.Cleanup(func() { nvmeConnectCommand = originalCommand })
+
+	t.Run("default applies 15s and preserves existing flags", func(t *testing.T) {
+		var gotArgs []string
+		nvmeConnectCommand = func(_ context.Context, args ...string) ([]byte, error) {
+			gotArgs = args
+			return []byte("connected"), nil
+		}
+
+		require.NoError(t, runNVMeConnect(context.Background(), "tcp", "192.0.2.10", "4420", "nqn.test:default", nil))
+
+		assert.Contains(t, gotArgs, "--ctrl-loss-tmo=-1", "never abandon a multipath controller")
+		assert.Contains(t, gotArgs, "--reconnect-delay=10")
+		assert.Contains(t, gotArgs, "--fast-io-fail-tmo=15")
+	})
+
+	t.Run("explicit override replaces the default", func(t *testing.T) {
+		var gotArgs []string
+		nvmeConnectCommand = func(_ context.Context, args ...string) ([]byte, error) {
+			gotArgs = args
+			return []byte("connected"), nil
+		}
+
+		require.NoError(t, runNVMeConnect(context.Background(), "tcp", "192.0.2.10", "4420", "nqn.test:override",
+			&NVMeoFConnectOptions{FastIOFailTmo: 30 * time.Second}))
+
+		assert.Contains(t, gotArgs, "--fast-io-fail-tmo=30")
+		assert.NotContains(t, gotArgs, "--fast-io-fail-tmo=15")
+	})
+
+	t.Run("negative value omits the flag for exact historical reproduction", func(t *testing.T) {
+		var gotArgs []string
+		nvmeConnectCommand = func(_ context.Context, args ...string) ([]byte, error) {
+			gotArgs = args
+			return []byte("connected"), nil
+		}
+
+		require.NoError(t, runNVMeConnect(context.Background(), "tcp", "192.0.2.10", "4420", "nqn.test:disabled",
+			&NVMeoFConnectOptions{FastIOFailTmo: -1}))
+
+		for _, arg := range gotArgs {
+			assert.NotContains(t, arg, "fast-io-fail-tmo")
+		}
+	})
+
+	t.Run("optional queue knobs are omitted unless set", func(t *testing.T) {
+		var gotArgs []string
+		nvmeConnectCommand = func(_ context.Context, args ...string) ([]byte, error) {
+			gotArgs = args
+			return []byte("connected"), nil
+		}
+
+		require.NoError(t, runNVMeConnect(context.Background(), "tcp", "192.0.2.10", "4420", "nqn.test:noqueues", nil))
+
+		for _, arg := range gotArgs {
+			assert.NotContains(t, arg, "nr-io-queues")
+			assert.NotContains(t, arg, "nr-write-queues")
+			assert.NotContains(t, arg, "keep-alive-tmo")
+		}
+	})
+
+	t.Run("optional queue knobs are honored when set", func(t *testing.T) {
+		var gotArgs []string
+		nvmeConnectCommand = func(_ context.Context, args ...string) ([]byte, error) {
+			gotArgs = args
+			return []byte("connected"), nil
+		}
+		ioQueues := 4
+		writeQueues := 2
+		keepAlive := 5 * time.Second
+
+		require.NoError(t, runNVMeConnect(context.Background(), "tcp", "192.0.2.10", "4420", "nqn.test:queues",
+			&NVMeoFConnectOptions{NrIOQueues: &ioQueues, NrWriteQueues: &writeQueues, KeepAliveTmo: &keepAlive}))
+
+		assert.Contains(t, gotArgs, "--nr-io-queues=4")
+		assert.Contains(t, gotArgs, "--nr-write-queues=2")
+		assert.Contains(t, gotArgs, "--keep-alive-tmo=5")
+	})
 }
 
 func TestSetNVMeSubsystemIOPolicy(t *testing.T) {

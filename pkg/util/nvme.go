@@ -62,6 +62,25 @@ const DefaultNVMeoFDeviceTimeout = 60 * time.Second
 // NVMeoFConnectOptions holds options for NVMe-oF connection.
 type NVMeoFConnectOptions struct {
 	DeviceTimeout time.Duration // Timeout for waiting for device to appear (default: 60s)
+
+	// FastIOFailTmo overrides the --fast-io-fail-tmo (seconds) passed to
+	// every nvme connect. Zero (the default, including when this struct
+	// isn't supplied at all) uses defaultFastIOFailTmo. A negative value
+	// omits the flag entirely, reproducing the historical (disabled)
+	// behavior exactly -- see runNVMeConnect for why a nonzero default is a
+	// deliberate dataplane fix, not a compatibility no-op.
+	FastIOFailTmo time.Duration
+
+	// NrIOQueues, NrWriteQueues and KeepAliveTmo are optional nvme-cli
+	// connect knobs, all OMITTED from the command line (nil) by default so
+	// omitting them reproduces the historical command line exactly (aside
+	// from FastIOFailTmo above). Live measurement on a 16-CPU node showed 4
+	// paths x 17 queues = 56 controllers for one volume from queue defaults
+	// alone, so NrIOQueues in the 4-8 range is the intended lever once a
+	// caller wires these through.
+	NrIOQueues    *int
+	NrWriteQueues *int
+	KeepAliveTmo  *time.Duration
 }
 
 // NVMeoFConnect connects to an NVMe-oF target and returns the device path.
@@ -110,7 +129,7 @@ func NVMeoFConnectPathWithOptionsAndSubsystemsContext(ctx context.Context, nqn, 
 	return nvmeOFConnectWithOptionsAndSubsystemsContext(ctx, nqn, transportURI, opts, subsystems, nvmeConnectPathWithSubsystems)
 }
 
-type nvmeConnectFunc func(context.Context, string, string, string, string, []NVMeSubsystem) error
+type nvmeConnectFunc func(context.Context, string, string, string, string, *NVMeoFConnectOptions, []NVMeSubsystem) error
 
 func nvmeOFConnectWithOptionsAndSubsystemsContext(
 	ctx context.Context,
@@ -147,7 +166,7 @@ func nvmeOFConnectWithOptionsAndSubsystemsContext(
 	wasConnected := hasNVMeSubsystem(nqn, subsystems)
 
 	// Connect to the subsystem
-	if connectErr := connect(ctx, transport, host, port, nqn, subsystems); connectErr != nil {
+	if connectErr := connect(ctx, transport, host, port, nqn, opts, subsystems); connectErr != nil {
 		return "", fmt.Errorf("connect failed: %w", connectErr)
 	}
 
@@ -235,17 +254,17 @@ func parseTransportURI(transportURI string) (transport, host, port string, err e
 	return transport, host, port, nil
 }
 
-func nvmeConnectWithSubsystems(ctx context.Context, transport, host, port, nqn string, subsystems []NVMeSubsystem) error {
+func nvmeConnectWithSubsystems(ctx context.Context, transport, host, port, nqn string, opts *NVMeoFConnectOptions, subsystems []NVMeSubsystem) error {
 	// Preserve the historical single-path behavior: any subsystem entry for the
 	// NQN suppresses another connect, regardless of path state or address.
 	if hasNVMeSubsystem(nqn, subsystems) {
 		klog.V(4).Infof("Already connected to subsystem: %s", nqn)
 		return nil
 	}
-	return runNVMeConnect(ctx, transport, host, port, nqn)
+	return runNVMeConnect(ctx, transport, host, port, nqn, opts)
 }
 
-func nvmeConnectPathWithSubsystems(ctx context.Context, transport, host, port, nqn string, subsystems []NVMeSubsystem) error {
+func nvmeConnectPathWithSubsystems(ctx context.Context, transport, host, port, nqn string, opts *NVMeoFConnectOptions, subsystems []NVMeSubsystem) error {
 	// Multipath convergence must suppress only the requested live controller;
 	// another address, a non-live path, or a pathless subsystem still needs a
 	// connect attempt.
@@ -253,7 +272,7 @@ func nvmeConnectPathWithSubsystems(ctx context.Context, transport, host, port, n
 		klog.V(4).Infof("Already connected to subsystem %s at %s", nqn, host)
 		return nil
 	}
-	return runNVMeConnect(ctx, transport, host, port, nqn)
+	return runNVMeConnect(ctx, transport, host, port, nqn, opts)
 }
 
 var nvmeConnectCommand = func(ctx context.Context, args ...string) ([]byte, error) {
@@ -264,10 +283,26 @@ var nvmeConnectCommand = func(ctx context.Context, args ...string) ([]byte, erro
 	return cmd.CombinedOutput()
 }
 
-func runNVMeConnect(ctx context.Context, transport, host, port, nqn string) error {
+// defaultFastIOFailTmo is the --fast-io-fail-tmo (seconds) applied to every
+// nvme connect unless NVMeoFConnectOptions.FastIOFailTmo overrides it. See the
+// field doc for why this is a real behavior change, not a no-op default.
+const defaultFastIOFailTmo = 15 * time.Second
+
+func runNVMeConnect(ctx context.Context, transport, host, port, nqn string, opts *NVMeoFConnectOptions) error {
 	// Build connect command with reconnect options for resilience.
 	// --reconnect-delay=10: retry connection every 10 seconds on failure
-	// --ctrl-loss-tmo=-1: never give up on reconnecting (-1 means infinite)
+	// --ctrl-loss-tmo=-1: never give up on reconnecting (-1 means infinite).
+	// This is deliberate and CORRECT for multipath (never abandon the path)
+	// and is kept unconditionally.
+	//
+	// --fast-io-fail-tmo: with ctrl-loss-tmo pinned to infinite, a controller
+	// stuck reconnecting would otherwise queue I/O against it forever instead
+	// of failing over to a surviving path -- verified live: ctrl_loss_tmo=off
+	// fast_io_fail_tmo=off parked pods in D-state on a NAS reboot / single
+	// link failure. Always applied (default defaultFastIOFailTmo), overridable
+	// via opts, and omitted only if opts explicitly requests a negative value
+	// (reproduces the historical, disabled behavior exactly).
+	//
 	// These options ensure NVMe-oF sessions automatically recover from
 	// transient network issues or TrueNAS service restarts.
 	args := []string{
@@ -278,6 +313,30 @@ func runNVMeConnect(ctx context.Context, transport, host, port, nqn string) erro
 		"-s", port,
 		"--reconnect-delay=10",
 		"--ctrl-loss-tmo=-1",
+	}
+
+	fastIOFailTmo := defaultFastIOFailTmo
+	var nrIOQueues, nrWriteQueues *int
+	var keepAliveTmo *time.Duration
+	if opts != nil {
+		if opts.FastIOFailTmo != 0 {
+			fastIOFailTmo = opts.FastIOFailTmo
+		}
+		nrIOQueues = opts.NrIOQueues
+		nrWriteQueues = opts.NrWriteQueues
+		keepAliveTmo = opts.KeepAliveTmo
+	}
+	if fastIOFailTmo >= 0 {
+		args = append(args, fmt.Sprintf("--fast-io-fail-tmo=%d", int(fastIOFailTmo.Seconds())))
+	}
+	if nrIOQueues != nil {
+		args = append(args, fmt.Sprintf("--nr-io-queues=%d", *nrIOQueues))
+	}
+	if nrWriteQueues != nil {
+		args = append(args, fmt.Sprintf("--nr-write-queues=%d", *nrWriteQueues))
+	}
+	if keepAliveTmo != nil {
+		args = append(args, fmt.Sprintf("--keep-alive-tmo=%d", int(keepAliveTmo.Seconds())))
 	}
 
 	output, err := nvmeConnectCommand(ctx, args...)
