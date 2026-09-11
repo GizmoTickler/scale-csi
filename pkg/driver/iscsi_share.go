@@ -163,11 +163,38 @@ func (d *Driver) convergeISCSIMultipathTargetGroups(ctx context.Context, target 
 	if !changed {
 		return target, nil
 	}
-	updated, err := d.truenasClient.ISCSITargetUpdate(ctx, target.ID, groups)
+	updated, err := d.iscsiTargetUpdateGroups(ctx, target.ID, groups)
 	if err != nil {
 		return nil, fmt.Errorf("failed to converge iSCSI multipath target groups: %w", err)
 	}
 	return updated, nil
+}
+
+// iscsiTargetUpdateGroups and iscsiTargetCreateGroups are the ONLY sanctioned
+// ways for this package to hand TrueNAS a target "groups" array. Both
+// iscsi.target.create and iscsi.target.update reject an array carrying two
+// entries with the same portal ID with a bare -32602 "Invalid params", so
+// dedupeISCSITargetGroupsByPortal is not an optimization at any one call site:
+// it is a precondition of the API, and it belongs on the path to the API rather
+// than being re-remembered by whoever builds the next groups array.
+//
+// It was not remembered. The dedupe landed at one of the two update sites, and
+// the one it missed — convergeISCSIMultipathTargetGroups above — assembles
+// target.Groups ++ (portals x templates), a product that can duplicate a portal
+// from an operator-placed group OR from two CSI-owned templates on its own.
+// Every iSCSI CreateVolume and publish on such a target failed with -32602.
+// Route new callers through these wrappers instead of the client methods.
+func (d *Driver) iscsiTargetUpdateGroups(ctx context.Context, id int, groups []truenas.ISCSITargetGroup) (*truenas.ISCSITarget, error) {
+	return d.truenasClient.ISCSITargetUpdate(ctx, id, dedupeISCSITargetGroupsByPortal(groups))
+}
+
+func (d *Driver) iscsiTargetCreateGroups(
+	ctx context.Context,
+	name, alias, mode string,
+	groups []truenas.ISCSITargetGroup,
+	opts truenas.ISCSITargetCreateOptions,
+) (*truenas.ISCSITarget, error) {
+	return d.truenasClient.ISCSITargetCreate(ctx, name, alias, mode, dedupeISCSITargetGroupsByPortal(groups), opts)
 }
 
 func containsISCSIGroupTemplate(groups []truenas.ISCSITargetGroup, candidate truenas.ISCSITargetGroup) bool {
@@ -437,7 +464,7 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 			}
 		}
 
-		target, err = d.truenasClient.ISCSITargetCreate(ctx, iscsiName, "", "ISCSI", targetGroups, opts.iscsiTargetCreateOpts())
+		target, err = d.iscsiTargetCreateGroups(ctx, iscsiName, "", "ISCSI", targetGroups, opts.iscsiTargetCreateOpts())
 		if err != nil {
 			if usedResolvedGroup {
 				d.invalidateISCSITargetGroup()

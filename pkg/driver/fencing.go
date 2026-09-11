@@ -1629,8 +1629,9 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 			}
 		}
 	}
-	groups = dedupeISCSITargetGroupsByPortal(groups)
-	if _, err := d.truenasClient.ISCSITargetUpdate(ctx, target.ID, groups); err != nil {
+	// The dedupe this site used to apply inline now lives in
+	// iscsiTargetUpdateGroups, so the next caller cannot forget it.
+	if _, err := d.iscsiTargetUpdateGroups(ctx, target.ID, groups); err != nil {
 		return err
 	}
 	if d.serviceReloadDebouncer != nil {

@@ -13,9 +13,9 @@ import (
 )
 
 func TestConfigureISCSICHAPWithContextOneWay(t *testing.T) {
-	portal := "192.0.2.20:3260"
-	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-oneway"
-	record := stubISCSINodeDB(t, portal, iqn)
+	portal := iscsiFixturePortal
+	iqn := iscsiFixtureFastPathIQN
+	record := stubISCSINodeDBFastPath(t)
 	var calls [][]string
 
 	originalRunner := iscsiAdmCombinedOutput
@@ -40,9 +40,9 @@ func TestConfigureISCSICHAPWithContextOneWay(t *testing.T) {
 }
 
 func TestConfigureISCSICHAPWithContextMutual(t *testing.T) {
-	portal := "192.0.2.21:3260"
-	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-mutual"
-	record := stubISCSINodeDB(t, portal, iqn)
+	portal := iscsiFixturePortal
+	iqn := iscsiFixtureFastPathIQN
+	record := stubISCSINodeDBFastPath(t)
 	var calls [][]string
 
 	originalRunner := iscsiAdmCombinedOutput
@@ -88,9 +88,9 @@ func TestConfigureISCSICHAPWithContextNilIsNoop(t *testing.T) {
 
 func TestConfigureISCSICHAPWithContextErrorCarriesParamNameNotValue(t *testing.T) {
 	const secret = "supersecretvalue"
-	portal := "192.0.2.23:3260"
-	iqn := "iqn.test:y"
-	stubISCSINodeDB(t, portal, iqn)
+	portal := iscsiFixturePortal
+	iqn := iscsiFixtureFastPathIQN
+	stubISCSINodeDBFastPath(t)
 
 	originalRunner := iscsiAdmCombinedOutput
 	iscsiAdmCombinedOutput = func(_ context.Context, args ...string) ([]byte, error) {
@@ -119,11 +119,11 @@ func TestConfigureISCSICHAPWithContextErrorCarriesParamNameNotValue(t *testing.T
 // fails authentication. The post-discovery auth failure must be classified as
 // ErrISCSIAuthFailure (redacted), not returned as a generic login error.
 func TestISCSIConnectPostDiscoveryAuthFailureIsClassified(t *testing.T) {
-	portal := "192.0.2.26:3260"
-	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-postdisc"
+	portal := iscsiFixturePortal
+	iqn := iscsiFixtureFastPathIQN
 	const secret = "wrongsecret12"
 	loginAttempts := 0
-	stubISCSINodeDB(t, portal, iqn)
+	stubISCSINodeDBFastPath(t)
 
 	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
 		if slices.Contains(args, "--login") {
@@ -152,11 +152,11 @@ func TestISCSIConnectPostDiscoveryAuthFailureIsClassified(t *testing.T) {
 }
 
 func TestISCSIConnectAuthFailureShortCircuitsDiscovery(t *testing.T) {
-	portal := "192.0.2.24:3260"
-	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-badsecret"
+	portal := iscsiFixturePortal
+	iqn := iscsiFixtureFastPathIQN
 	var calls [][]string
 	loginAttempts := 0
-	stubISCSINodeDB(t, portal, iqn)
+	stubISCSINodeDBFastPath(t)
 
 	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
 		calls = append(calls, slices.Clone(args))
@@ -179,10 +179,10 @@ func TestISCSIConnectAuthFailureShortCircuitsDiscovery(t *testing.T) {
 }
 
 func TestISCSIConnectAppliesCHAPBeforeLogin(t *testing.T) {
-	portal := "192.0.2.25:3260"
-	iqn := "iqn.2005-10.org.freenas.ctl:pvc-chap-order"
+	portal := iscsiFixturePortal
+	iqn := iscsiFixtureFastPathIQN
 	var calls [][]string
-	stubISCSINodeDB(t, portal, iqn)
+	stubISCSINodeDBFastPath(t)
 
 	stubISCSIConnectDependencies(t, func(_ context.Context, args ...string) ([]byte, error) {
 		calls = append(calls, slices.Clone(args))

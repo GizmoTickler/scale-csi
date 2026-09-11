@@ -1,0 +1,13 @@
+# Modes as captured, recorded here because git carries only the exec bit.
+# Columns: type mode path (relative to tree/).
+d 700 nodes/iqn.2005-10.org.freenas.ctl:pvc-discovered
+d 700 nodes/iqn.2005-10.org.freenas.ctl:pvc-discovered/192.0.2.40,3260,1
+d 700 nodes/iqn.2005-10.org.freenas.ctl:pvc-discovered/192.0.2.41,3260,1
+d 700 nodes/iqn.2005-10.org.freenas.ctl:pvc-fastpath
+d 750 nodes
+f 600 nodes/iqn.2005-10.org.freenas.ctl:pvc-discovered/192.0.2.40,3260,1/default
+f 600 nodes/iqn.2005-10.org.freenas.ctl:pvc-discovered/192.0.2.40,3260,1/iface1
+f 600 nodes/iqn.2005-10.org.freenas.ctl:pvc-discovered/192.0.2.41,3260,1/default
+f 600 nodes/iqn.2005-10.org.freenas.ctl:pvc-fastpath/192.0.2.40,3260
+f 600 nodes/iqn.2005-10.org.freenas.ctl:pvc-fastpath/192.0.2.41,3260
+f 600 nodes/iqn.2005-10.org.freenas.ctl:pvc-fastpath/2001:db8::31,3260

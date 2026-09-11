@@ -1326,18 +1326,33 @@ func splitISCSIPortal(portal string) (host, port string) {
 
 // iscsiNodeRecord is one on-disk node record file plus the node database root
 // it was found under. Root doubles as the staging directory for the atomic
-// rewrite: it is guaranteed to be on the same filesystem as Path and is not the
-// record directory, where idbm would misread a temp file as an iface record.
+// rewrite: it is guaranteed to be on the same filesystem as Path (both layouts
+// put the record under <root>/nodes/...) and it is not a directory idbm walks,
+// so a temp file there cannot be misread as an iface record (new-style layout)
+// or as another portal record (old-style layout, where the enclosing directory
+// is nodes/<iqn> itself).
 type iscsiNodeRecord struct {
 	Root string
 	Path string
 }
 
 // iscsiNodeRecordFiles returns every on-disk node record file that a
-// `--login -T <iqn> -p <portal>` could read: one file per bound iface, under
-// every <host>,<port>,<tpgt> directory matching the portal (a target can carry
-// both the tpgt -1 record `-o new` writes and a real tpgt record left by a
-// SendTargets discovery, and iscsiadm may log in through either).
+// `--login -T <iqn> -p <portal>` could read, across BOTH of open-iscsi's node
+// record layouts:
+//
+//   - old style, a plain FILE at nodes/<iqn>/<host>,<port> — what
+//     `-o new` writes when the portal carries no tpgt, which is precisely what
+//     iscsiEnsureNodeRecord runs;
+//   - new style, a nodes/<iqn>/<host>,<port>,<tpgt> DIRECTORY holding one file
+//     per bound iface — what a portal carrying a real tpgt (a SendTargets
+//     discovery) produces.
+//
+// The two are mutually exclusive for one (target, host, port): `-o new` with a
+// tpgt migrates an existing flat record into the directory layout, and a later
+// `-o new` without one reuses the tpgt already on record. Which layout a given
+// node is on therefore depends on whether it has ever run a discovery for the
+// target, so both must be handled. See pkg/util/testdata/iscsi-node-db, a tree
+// captured from the real iscsiadm rather than drawn by hand.
 //
 // Nothing is created here. Both callers run AFTER iscsiEnsureNodeRecord and
 // after at least one successful `iscsiadm -o update`, so the record must
@@ -1364,9 +1379,8 @@ func iscsiNodeRecordFiles(roots []string, portal, iqn string) ([]iscsiNodeRecord
 			continue
 		}
 		for _, portalDir := range portalDirs {
-			if !portalDir.IsDir() {
-				continue
-			}
+			// Both layouts name the entry <host>,<port>[,<tpgt>], so the portal
+			// match is the same test either way.
 			parts := strings.Split(portalDir.Name(), ",")
 			if len(parts) < 2 || parts[1] != port {
 				continue
@@ -1374,6 +1388,24 @@ func iscsiNodeRecordFiles(roots []string, portal, iqn string) ([]iscsiNodeRecord
 			if _, ok := hosts[parts[0]]; !ok {
 				continue
 			}
+			if !portalDir.IsDir() {
+				// OLD-STYLE record: a plain FILE at nodes/<iqn>/<host>,<port>.
+				// This is what iscsiEnsureNodeRecord leaves behind. It runs
+				// `iscsiadm -m node -o new -T <iqn> -p <host>:<port>` with no
+				// target portal group tag, so idbm records
+				// PORTAL_GROUP_TAG_UNKNOWN (-1) and writes the flat file rather
+				// than the <host>,<port>,<tpgt>/<iface> directory. Verified
+				// against the iscsiadm on this cluster's nodes; the captured
+				// tree is pkg/util/testdata/iscsi-node-db (see its README).
+				// Requiring a directory here made every CHAP-enabled stage fail
+				// closed, because on a node that had never run a SendTargets
+				// discovery there was no directory to find.
+				files = append(files, iscsiNodeRecord{Root: root, Path: filepath.Join(targetDir, portalDir.Name())})
+				continue
+			}
+			// NEW-STYLE record: a <host>,<port>,<tpgt> DIRECTORY holding one
+			// file per bound iface, which is what a portal carrying a real tpgt
+			// (a SendTargets discovery) produces. --login may use any of them.
 			recordDir := filepath.Join(targetDir, portalDir.Name())
 			ifaces, ifaceErr := os.ReadDir(recordDir)
 			if ifaceErr != nil {
