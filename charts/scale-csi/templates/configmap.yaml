@@ -148,55 +148,65 @@ data:
       {{- end }}
     {{- end }}
 
-    {{- if .Values.nvmeof.enabled }}
+    {{- /* Setting a values subtree to null is Helm's documented way to DELETE
+         it, and the schema accepts the deletion because none of these keys is
+         "required". Helm's coalesce then removes the key outright, so a bare
+         $nvmeofConnect.fastIOFailTmo is a nil-pointer render failure —
+         an upgrade-time crash, not a validation error. Bind every nvmeof
+         subtree to a local that falls back to an empty dict so a deleted
+         subtree behaves exactly like an unset one. */}}
+    {{- $nvmeof := .Values.nvmeof | default dict }}
+    {{- $nvmeofPortPerf := $nvmeof.portPerf | default dict }}
+    {{- $nvmeofConnect := $nvmeof.connect | default dict }}
+    {{- if $nvmeof.enabled }}
     # NVMe-oF configuration
     nvmeof:
       enabled: true
-      transport: {{ .Values.nvmeof.transport | default "tcp" | quote }}
-      transportAddress: {{ .Values.nvmeof.address | default .Values.truenas.host | quote }}
-      transportServiceId: {{ .Values.nvmeof.port | default 4420 }}
+      transport: {{ $nvmeof.transport | default "tcp" | quote }}
+      transportAddress: {{ $nvmeof.address | default .Values.truenas.host | quote }}
+      transportServiceId: {{ $nvmeof.port | default 4420 }}
       subsystemHosts:
-        {{- toYaml .Values.nvmeof.subsystemHosts | nindent 8 }}
-      subsystemAllowAnyHost: {{ .Values.nvmeof.subsystemAllowAnyHost }}
+        {{- toYaml $nvmeof.subsystemHosts | nindent 8 }}
+      subsystemAllowAnyHost: {{ $nvmeof.subsystemAllowAnyHost }}
       {{- /* GF-Sprint 4 (E-4): install-wide port performance fields render ONLY
            when a value is non-null so the default ConfigMap is byte-identical to
            pre-GF4 (every field omitted => backend defaults). */}}
-      {{- if or (not (kindIs "invalid" .Values.nvmeof.portPerf.inlineDataSize)) (not (kindIs "invalid" .Values.nvmeof.portPerf.maxQueueSize)) (not (kindIs "invalid" .Values.nvmeof.portPerf.piEnable)) }}
+      {{- if or (not (kindIs "invalid" $nvmeofPortPerf.inlineDataSize)) (not (kindIs "invalid" $nvmeofPortPerf.maxQueueSize)) (not (kindIs "invalid" $nvmeofPortPerf.piEnable)) }}
       portPerf:
-        {{- if not (kindIs "invalid" .Values.nvmeof.portPerf.inlineDataSize) }}
-        inlineDataSize: {{ .Values.nvmeof.portPerf.inlineDataSize }}
+        {{- if not (kindIs "invalid" $nvmeofPortPerf.inlineDataSize) }}
+        inlineDataSize: {{ $nvmeofPortPerf.inlineDataSize }}
         {{- end }}
-        {{- if not (kindIs "invalid" .Values.nvmeof.portPerf.maxQueueSize) }}
-        maxQueueSize: {{ .Values.nvmeof.portPerf.maxQueueSize }}
+        {{- if not (kindIs "invalid" $nvmeofPortPerf.maxQueueSize) }}
+        maxQueueSize: {{ $nvmeofPortPerf.maxQueueSize }}
         {{- end }}
-        {{- if not (kindIs "invalid" .Values.nvmeof.portPerf.piEnable) }}
-        piEnable: {{ .Values.nvmeof.portPerf.piEnable }}
+        {{- if not (kindIs "invalid" $nvmeofPortPerf.piEnable) }}
+        piEnable: {{ $nvmeofPortPerf.piEnable }}
         {{- end }}
       {{- end }}
       {{- /* GF-Sprint 4 (E-6): multi-port multipath renders ONLY when enabled so
            the default ConfigMap carries no multipath key (single-port path). */}}
-      {{- if .Values.nvmeof.multipath }}
+      {{- if $nvmeof.multipath }}
       multipath: true
       addresses:
-        {{- toYaml .Values.nvmeof.addresses | nindent 8 }}
+        {{- toYaml $nvmeof.addresses | nindent 8 }}
       {{- end }}
       {{- /* N4: node-side `nvme connect` CLI knobs render ONLY when a value
            differs from its byte-identical-to-historical default (0 for
            fastIOFailTmo, null for the rest), so a default install's ConfigMap
            carries no connect key at all. */}}
-      {{- if or (ne (.Values.nvmeof.connect.fastIOFailTmo | default 0 | int) 0) (not (kindIs "invalid" .Values.nvmeof.connect.nrIOQueues)) (not (kindIs "invalid" .Values.nvmeof.connect.nrWriteQueues)) (not (kindIs "invalid" .Values.nvmeof.connect.keepAliveTmo)) }}
+      {{- if or (ne ($nvmeofConnect.fastIOFailTmo | default 0 | int) 0) (not (kindIs "invalid" $nvmeofConnect.nrIOQueues)) (not (kindIs "invalid" $nvmeofConnect.nrWriteQueues)) (not (kindIs "invalid" $nvmeofConnect.keepAliveTmo)) }}
       connect:
-        {{- if ne (.Values.nvmeof.connect.fastIOFailTmo | default 0 | int) 0 }}
-        fastIOFailTmo: {{ .Values.nvmeof.connect.fastIOFailTmo | int }}
+        {{- if ne ($nvmeofConnect.fastIOFailTmo | default 0 | int) 0 }}
+        fastIOFailTmo: {{ $nvmeofConnect.fastIOFailTmo | int }}
         {{- end }}
-        {{- if not (kindIs "invalid" .Values.nvmeof.connect.nrIOQueues) }}
-        nrIOQueues: {{ .Values.nvmeof.connect.nrIOQueues }}
+        {{- if not (kindIs "invalid" $nvmeofConnect.nrIOQueues) }}
+        nrIOQueues: {{ $nvmeofConnect.nrIOQueues }}
         {{- end }}
-        {{- if not (kindIs "invalid" .Values.nvmeof.connect.nrWriteQueues) }}
-        nrWriteQueues: {{ .Values.nvmeof.connect.nrWriteQueues }}
+        {{- if not (kindIs "invalid" $nvmeofConnect.nrWriteQueues) }}
+        nrWriteQueues: {{ $nvmeofConnect.nrWriteQueues }}
         {{- end }}
-        {{- if not (kindIs "invalid" .Values.nvmeof.connect.keepAliveTmo) }}
-        keepAliveTmo: {{ .Values.nvmeof.connect.keepAliveTmo }}
+        {{- if not (kindIs "invalid" $nvmeofConnect.keepAliveTmo) }}
+        keepAliveTmo: {{ $nvmeofConnect.keepAliveTmo }}
         {{- end }}
       {{- end }}
     {{- end }}

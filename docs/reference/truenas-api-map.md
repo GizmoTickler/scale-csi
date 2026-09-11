@@ -1,8 +1,8 @@
 # TrueNAS API Method Map
 
-**Source:** `wss://nas01.achva.casa:443/api/current`
+**Source:** `wss://truenas.example.com:443/api/current`
 **TrueNAS version:** `26.0.0-BETA.2`
-**Hostname:** `nas01`
+**Hostname:** `truenas`
 **Total services:** 127
 **Total methods:** 805
 **Generated:** 2026-08-24T18:14:24.019879Z

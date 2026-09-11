@@ -182,3 +182,216 @@ is parseable here and there is no ms/m ambiguity.
 {{- end -}}
 {{- $seconds -}}
 {{- end }}
+
+{{/*
+Convert a Go duration string to WHOLE SECONDS, rounding up, understanding every
+unit the values schema permits (ns/us/µs/ms/s/m/h) plus fractional segments.
+
+scale-csi.durationToSeconds above is deliberately left alone: it is pinned to
+reconcile.interval, whose schema is ^([0-9]+(s|m|h))+$, and its segment-at-a-time
+regexes mis-read anything outside that grammar ("500ms" matches its "([0-9]+)m"
+arm and becomes 500 MINUTES). startupConnectTimeout's schema is the full Go
+duration grammar, so it needs this parser instead.
+*/}}
+{{- define "scale-csi.durationToSecondsCeil" -}}
+{{- $dur := toString . | trim -}}
+{{- $seconds := 0.0 -}}
+{{- range regexFindAll "[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|h|m|s)" $dur -1 -}}
+{{- $unit := regexFind "(ns|us|µs|ms|h|m|s)$" . -}}
+{{- $value := float64 (trimSuffix $unit .) -}}
+{{- if eq $unit "h" -}}
+{{- $seconds = addf $seconds (mulf $value 3600.0) -}}
+{{- else if eq $unit "m" -}}
+{{- $seconds = addf $seconds (mulf $value 60.0) -}}
+{{- else if eq $unit "s" -}}
+{{- $seconds = addf $seconds $value -}}
+{{- else if eq $unit "ms" -}}
+{{- $seconds = addf $seconds (divf $value 1000.0) -}}
+{{- else if eq $unit "ns" -}}
+{{- $seconds = addf $seconds (divf $value 1000000000.0) -}}
+{{- else -}}
+{{- $seconds = addf $seconds (divf $value 1000000.0) -}}
+{{- end -}}
+{{- end -}}
+{{- ceil $seconds -}}
+{{- end }}
+
+{{/*
+The set of StorageClass entries this chart will actually RENDER, as a JSON
+array. Takes the root context.
+
+This is the single source of truth for "which classes exist", shared by
+templates/storageclass.yaml (which renders them) and
+templates/controller-rbac.yaml (which derives the Secret rule from them). They
+used to each re-implement it, and they disagreed: the legacy singular
+.Values.storageClass REPLACES the plural list here, but the RBAC copy ADDED to
+it, so a plural class carrying chapSecretName/encryptionSecretName that the
+legacy form had already displaced still switched on cluster-wide `get` on all
+Secrets for a release that renders no class needing it.
+*/}}
+{{- define "scale-csi.storageClassList" -}}
+{{- $classes := .Values.storageClasses -}}
+{{- if .Values.storageClass -}}
+  {{- /* The legacy defaults deliberately omit "protocol" and "mountOptions" so
+       the deprecated path shares the modern omit-when-unset behavior below.
+       Defaulting either to NFS values would corrupt an iscsi/nvmeof class. */}}
+  {{- $legacy := mergeOverwrite (dict "create" true "name" "scale-nfs" "isDefault" false "reclaimPolicy" "Delete" "allowVolumeExpansion" true "volumeBindingMode" "Immediate" "extraParameters" (dict)) (deepCopy .Values.storageClass) -}}
+  {{- if $legacy.create -}}
+    {{- $classes = list $legacy -}}
+  {{- else -}}
+    {{- $classes = list -}}
+  {{- end -}}
+{{- end -}}
+{{- /* An entry is rendered unless it explicitly sets enabled: false. This keeps
+     every existing class rendering by default while letting opt-in example
+     classes (e.g. the detached DR-restore class) ship disabled. */}}
+{{- $enabledClasses := list -}}
+{{- range $storageClass := $classes -}}
+  {{- if or (not (hasKey $storageClass "enabled")) $storageClass.enabled -}}
+    {{- $enabledClasses = append $enabledClasses $storageClass -}}
+  {{- end -}}
+{{- end -}}
+{{- toJson $enabledClasses -}}
+{{- end }}
+
+{{/*
+The rendered `parameters:` map for ONE StorageClass entry, as a JSON object.
+Takes (dict "root" $root "class" $storageClass).
+
+Shared with templates/controller-rbac.yaml for the same anti-drift reason as
+scale-csi.storageClassList: the RBAC gate has to see the parameter map the
+class actually ships, not a hand-maintained list of the values keys that were
+known to produce a Secret reference when the gate was written. extraParameters
+passes through verbatim, so a class can name a
+csi.storage.k8s.io/*-secret-name directly without going through
+chapSecretName/encryptionSecretName, and that used to render a StorageClass
+with no matching RBAC rule at all.
+*/}}
+{{- define "scale-csi.storageClassParameters" -}}
+{{- $root := .root -}}
+{{- $storageClass := .class -}}
+{{- $parameters := dict -}}
+{{- with $storageClass.extraParameters -}}
+  {{- $parameters = mergeOverwrite $parameters (deepCopy .) -}}
+{{- end -}}
+{{- /* Emit protocol only when the storageClass entry sets it explicitly.
+     Omitting it lets the driver apply its sole-enabled-protocol fallback or
+     return its missing-parameter error, instead of the chart silently forcing
+     nfs on an iscsi/nvmeof class. */}}
+{{- if $storageClass.protocol -}}
+{{- $_ := set $parameters "protocol" $storageClass.protocol -}}
+{{- end -}}
+{{- /* Emit snapshotRestoreMode only when set, so unset classes follow the
+     driver's global zfs.detachedVolumesFromSnapshots default. */}}
+{{- if $storageClass.snapshotRestoreMode -}}
+{{- $_ := set $parameters "snapshotRestoreMode" $storageClass.snapshotRestoreMode -}}
+{{- end -}}
+{{- /* Curated ZFS performance class. Emitted only when set; unset classes
+     inherit the parent dataset's properties plus zfs.datasetProperties,
+     exactly as before. volblocksize is CREATE-ONLY, so a class change that
+     moves an existing zvol's geometry is rejected, not applied. */}}
+{{- if $storageClass.zfsPerformanceClass -}}
+{{- $_ := set $parameters "zfsPerformanceClass" $storageClass.zfsPerformanceClass -}}
+{{- end -}}
+{{- /* GF5 NFS export overrides. Each is emitted ONLY when the class sets it,
+     so an untouched class renders the exact parameter map it did before and
+     the driver keeps its historical create payload. */}}
+{{- with $storageClass.nfsSecurity -}}
+{{- $_ := set $parameters "nfsSecurity" (join "," .) -}}
+{{- end -}}
+{{- if hasKey $storageClass "nfsExposeSnapshots" -}}
+{{- $_ := set $parameters "nfsExposeSnapshots" (printf "%v" $storageClass.nfsExposeSnapshots) -}}
+{{- end -}}
+{{- if hasKey $storageClass "nfsReadOnly" -}}
+{{- $_ := set $parameters "nfsReadOnly" (printf "%v" $storageClass.nfsReadOnly) -}}
+{{- end -}}
+{{- /* Squash overrides, keyed on hasKey rather than truthiness: the driver
+     distinguishes "parameter absent" (inherit the chart/global default) from
+     "parameter present and EMPTY", and the empty string is the documented way
+     to CLEAR the default root squash so a class can set mapall_* without
+     tripping the maproot/mapall exclusivity. A truthiness test would silently
+     drop exactly that value. */}}
+{{- range $squashKey := (list "nfsMaprootUser" "nfsMaprootGroup" "nfsMapallUser" "nfsMapallGroup") -}}
+{{- if hasKey $storageClass $squashKey -}}
+{{- $_ := set $parameters $squashKey (printf "%v" (get $storageClass $squashKey)) -}}
+{{- end -}}
+{{- end -}}
+{{- /* Export allowlists, comma-joined like nfsSecurity. Under
+     fencing.mode=strict the driver REJECTS these at CreateVolume rather than
+     discarding them, so a class that sets one must be on additive fencing. */}}
+{{- with $storageClass.nfsAllowedNetworks -}}
+{{- $_ := set $parameters "nfsAllowedNetworks" (join "," .) -}}
+{{- end -}}
+{{- with $storageClass.nfsAllowedHosts -}}
+{{- $_ := set $parameters "nfsAllowedHosts" (join "," .) -}}
+{{- end -}}
+{{- /* NFSv4 ACL. Emitted only when set; see docs/reference/storageclass.md for
+     the fsGroupPolicy=File interaction this opts a class into. */}}
+{{- if $storageClass.nfsACLTemplate -}}
+{{- $_ := set $parameters "nfsACLTemplate" $storageClass.nfsACLTemplate -}}
+{{- end -}}
+{{- if $storageClass.nfsACL -}}
+{{- $_ := set $parameters "nfsACL" (toJson $storageClass.nfsACL) -}}
+{{- end -}}
+{{- /* aclmode. RESTRICTED is the documented primary mitigation for the
+     ACL x fsGroup interaction and is the ONLY ZFS lever that stops a chmod
+     from rewriting the ACL; the driver requires nfsACLTemplate or nfsACL
+     alongside it. */}}
+{{- if $storageClass.nfsACLMode -}}
+{{- $_ := set $parameters "nfsACLMode" $storageClass.nfsACLMode -}}
+{{- end -}}
+{{- /* CHAP: when a per-StorageClass CHAP Secret is named, emit the four CSI
+     secret-ref parameters (provisioner + node-stage). The chart references
+     the Secret by name/namespace only; credential values never appear here.
+     The namespace defaults to the release namespace when left unset. */}}
+{{- if $storageClass.chapSecretName -}}
+{{- $chapSecretNamespace := $storageClass.chapSecretNamespace | default $root.Release.Namespace -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-name" $storageClass.chapSecretName -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-namespace" $chapSecretNamespace -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-name" $storageClass.chapSecretName -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-namespace" $chapSecretNamespace -}}
+{{- end -}}
+{{- /* Encryption (GF-Sprint 1): when a per-StorageClass encryption Secret is
+     named, emit the encryption parameter AND the three CSI secret-ref
+     parameters — provisioner-secret (CreateVolume), controller-publish-secret
+     (the publish-time unlock and the locked-volume reconciler's Secret
+     resolution) and node-stage-secret (parity with the CHAP block). The chart
+     references the Secret by name/namespace only; the passphrase never appears
+     here. The namespace defaults to the release namespace when left unset.
+     Encryption is create-time only: the driver refuses an encrypted create that
+     also carries a content source, so there is deliberately no chart-level
+     snapshotRestoreMode coupling. */}}
+{{- if $storageClass.encryptionSecretName -}}
+{{- $encryptionSecretNamespace := $storageClass.encryptionSecretNamespace | default $root.Release.Namespace -}}
+{{- $_ := set $parameters "encryption" "true" -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-name" $storageClass.encryptionSecretName -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/provisioner-secret-namespace" $encryptionSecretNamespace -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/controller-publish-secret-name" $storageClass.encryptionSecretName -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/controller-publish-secret-namespace" $encryptionSecretNamespace -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-name" $storageClass.encryptionSecretName -}}
+{{- $_ := set $parameters "csi.storage.k8s.io/node-stage-secret-namespace" $encryptionSecretNamespace -}}
+{{- end -}}
+{{- toJson $parameters -}}
+{{- end }}
+
+{{/*
+Whether the controller's sidecars need `get` on Secrets for a given rendered
+StorageClass parameter map, as "true"/"" — i.e. whether the class names a
+CONTROLLER-side CSI secret ref.
+
+Only provisioner-secret (external-provisioner: CreateVolume/DeleteVolume),
+controller-publish-secret (external-attacher) and controller-expand-secret
+(external-resizer) are read with the controller ServiceAccount's credentials.
+node-stage-secret / node-publish-secret / node-expand-secret are resolved by
+the kubelet and arrive in the RPC already populated, so they need no rule
+here and must not widen this grant.
+*/}}
+{{- define "scale-csi.storageClassNeedsControllerSecretGet" -}}
+{{- $needed := "" -}}
+{{- range $key, $value := . -}}
+{{- if regexMatch "^csi\\.storage\\.k8s\\.io/(provisioner|controller-publish|controller-expand)-secret-name$" $key -}}
+{{- $needed = "true" -}}
+{{- end -}}
+{{- end -}}
+{{- $needed -}}
+{{- end }}

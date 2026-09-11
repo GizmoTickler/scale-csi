@@ -759,13 +759,29 @@ nvmeof:
   # TrueNAS port object), these are HOST/CLI options applied on every node that
   # stages a volume.
   connect:
-    # --fast_io_fail_tmo (seconds). 0 (default) uses the driver's built-in 15s:
-    # with --ctrl-loss-tmo pinned to infinite, a controller stuck reconnecting
-    # would otherwise queue I/O against it forever instead of failing over to a
-    # surviving multipath path — verified live, a NAS reboot / single link
-    # failure parked pods in D-state with this disabled. Set to a NEGATIVE
-    # value to restore the historical disabled behavior (omits the flag
-    # entirely); only an explicit negative value can do this.
+    # --fast_io_fail_tmo (seconds). 0 (default) means "let the driver decide",
+    # and what it decides depends on nvmeof.multipath:
+    #
+    #   multipath: false (the DEFAULT install) — the flag is OMITTED entirely.
+    #     Only --ctrl-loss-tmo=-1 applies, so a NAS reboot or link failure
+    #     queues I/O transparently until the controller comes back. This is the
+    #     historical pre-N4 behavior and it is deliberate: --fast_io_fail_tmo
+    #     only helps when there is another path to fail OVER to. On a
+    #     single-path install it converts a survivable stall into an outage —
+    #     EIO to the block layer takes ext4 read-only (errors=remount-ro) and
+    #     shuts down an XFS log, needing a pod restart per volume to recover.
+    #     See nvmeConnectOptions in pkg/driver/node.go.
+    #
+    #   multipath: true — the driver's built-in 15s is applied. With
+    #     --ctrl-loss-tmo pinned to infinite, a controller stuck reconnecting
+    #     would otherwise queue I/O against it forever instead of failing over
+    #     to a surviving path — verified live, a NAS reboot / single link
+    #     failure parked pods in D-state without it.
+    #
+    # A POSITIVE value is applied verbatim in both cases, which is how a
+    # single-path operator opts in deliberately. A NEGATIVE value always omits
+    # the flag. Note that only a non-zero value reaches the ConfigMap at all;
+    # 0 renders nothing, which is what leaves the decision to the driver.
     fastIOFailTmo: 0
     # --nr-io-queues / --nr-write-queues. Unset (null, default) omits the flag
     # so nvme-cli's own defaults apply — unchanged from a pre-N4 install.

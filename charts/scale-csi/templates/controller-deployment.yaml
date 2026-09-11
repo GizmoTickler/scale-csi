@@ -159,25 +159,53 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
-          # Deliberately /healthz, NOT /readyz. The controller's isReady()
+          {{- /* Startup probe budget, derived from startupConnectTimeout so the
+               two cannot drift. The probe must survive the WHOLE retry window:
+               initialDelay + failureThreshold*period > timeout. At the 5m
+               default that is 10 + 30*10 = 310s > 300s, i.e. the historical
+               values, and a raised startupConnectTimeout now raises the budget
+               with it instead of silently reintroducing the crash-loop. */}}
+          {{- $startupInitialDelay := 10 }}
+          {{- $startupPeriod := 10 }}
+          {{- $startupTimeoutSeconds := include "scale-csi.durationToSecondsCeil" .Values.startupConnectTimeout | int }}
+          {{- $startupFailureThreshold := max 30 (add (div (sub $startupTimeoutSeconds $startupInitialDelay) $startupPeriod) 1) }}
+          # Port 9808 is the liveness-probe SIDECAR, and it is the only endpoint
+          # in this pod that means "the driver is SERVING". It answers 200 only
+          # once /csi/csi.sock accepts a CSI Probe RPC, and refuses the
+          # connection outright before that (upstream binds its HTTP server only
+          # after the first successful Connect).
+          #
+          # This deliberately does NOT use /healthz on the metrics port. Both
+          # the startup health server (cmd/scale-csi/startup.go) and the driver's
+          # own health server (pkg/driver/health.go) map /healthz to an
+          # unconditional 200, so it answers from the moment the process binds
+          # the port — which, on the controller, is BEFORE the TrueNAS
+          # connection has been retried even once. Pointing the startup probe
+          # there made it pass at ~t=10s regardless of the backend, which armed
+          # the livenessProbe below against port 9808 while Run() had not yet
+          # created the socket: five failures later, restart at ~70s. That is
+          # precisely the CrashLoopBackOff the startupConnectTimeout retry
+          # window exists to prevent, so the 310s budget was never consumed.
+          #
+          # /readyz is not usable here either: the controller's isReady()
           # requires a live TrueNAS connection and, in strict fencing mode,
-          # stays false until startup fencing converges. Gating the startup
-          # probe on readiness turned "unready but serving" into
-          # CrashLoopBackOff: the budget here is 10 + 30*10 = 310s, which is
-          # effectively the same number as startupConnectTimeout (5m), so a NAS
-          # maintenance window longer than five minutes would kill the container
-          # at exactly the moment its own retry path was about to succeed. That
-          # also contradicts the invariant Run() documents, that the CSI
-          # endpoint must never crash-loop. Liveness is what belongs here;
-          # readiness is already covered by the readinessProbe below.
+          # stays false until startup fencing converges, so gating startup on it
+          # turns "unready but serving" into CrashLoopBackOff for a different
+          # reason. Readiness is covered by the readinessProbe below. The node
+          # DaemonSet CAN use /readyz because its isReady() is true immediately.
           startupProbe:
             httpGet:
               path: /healthz
-              port: {{ .Values.metrics.port }}
-            initialDelaySeconds: 10
+              port: 9808
+            initialDelaySeconds: {{ $startupInitialDelay }}
             timeoutSeconds: 3
-            periodSeconds: 10
-            failureThreshold: 30
+            periodSeconds: {{ $startupPeriod }}
+            failureThreshold: {{ $startupFailureThreshold }}
+          # Same endpoint as the startup probe, and that is the point: once the
+          # startup probe has proven the CSI socket is serving, liveness keeps
+          # watching the same fact on a tight 60s budget. It only arms after the
+          # startup probe succeeds, so it can no longer fire during the initial
+          # TrueNAS retry window.
           livenessProbe:
             httpGet:
               path: /healthz
