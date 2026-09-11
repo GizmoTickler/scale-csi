@@ -140,6 +140,17 @@ type MockClient struct {
 	EmptyNVMeHostNQN bool
 	// RejectEmptyISCSITargetGroups catches invalid zero-portal target updates.
 	RejectEmptyISCSITargetGroups bool
+	// RejectDuplicatePortalISCSITargetGroups models a real, live-verified
+	// TrueNAS 26.0 constraint (see TestE2ERealDebug_D1IsolateISCSITargetUpdate
+	// and pkg/driver/fencing_test.go's D1 regression coverage): both
+	// iscsi.target.create and iscsi.target.update reject a "groups" array
+	// containing two entries with the same portal ID with a bare -32602
+	// "Invalid params", regardless of which (valid) initiator group each
+	// entry references. This is undocumented business-logic validation, not
+	// a JSON-schema constraint, so opt-in here rather than unconditional:
+	// only tests that specifically care about this invariant need to arrange
+	// for it.
+	RejectDuplicatePortalISCSITargetGroups bool
 	// NoDeferredSnapshotDestroy models TrueNAS 26.0, whose
 	// zfs.resource.snapshot.destroy has no deferred-destroy mode: a snapshot with
 	// live clones always fails with ErrSnapshotHasClones regardless of the defer
@@ -2490,12 +2501,31 @@ func (m *MockClient) CheckNVMeoFSupport(ctx context.Context) error {
 	return nil
 }
 
+// duplicateISCSIGroupPortal reports the first portal ID that appears more
+// than once in groups, and whether one was found. It backs
+// RejectDuplicatePortalISCSITargetGroups (see its doc comment).
+func duplicateISCSIGroupPortal(groups []ISCSITargetGroup) (int, bool) {
+	seen := make(map[int]bool, len(groups))
+	for _, group := range groups {
+		if seen[group.Portal] {
+			return group.Portal, true
+		}
+		seen[group.Portal] = true
+	}
+	return 0, false
+}
+
 // iSCSI methods
 func (m *MockClient) ISCSITargetCreate(ctx context.Context, name, alias, mode string, groups []ISCSITargetGroup, opts ...ISCSITargetCreateOptions) (*ISCSITarget, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.RejectEmptyISCSITargetGroups && len(groups) == 0 {
 		return nil, fmt.Errorf("iSCSI target requires at least one portal group")
+	}
+	if m.RejectDuplicatePortalISCSITargetGroups {
+		if portal, dup := duplicateISCSIGroupPortal(groups); dup {
+			return nil, &APIError{Code: -32602, Message: fmt.Sprintf("Invalid params (duplicate portal %d in groups)", portal)}
+		}
 	}
 
 	id := len(m.ISCSITargets) + 1
@@ -2512,6 +2542,11 @@ func (m *MockClient) ISCSITargetUpdate(ctx context.Context, id int, groups []ISC
 	defer m.mu.Unlock()
 	if m.RejectEmptyISCSITargetGroups && len(groups) == 0 {
 		return nil, fmt.Errorf("iSCSI target requires at least one portal group")
+	}
+	if m.RejectDuplicatePortalISCSITargetGroups {
+		if portal, dup := duplicateISCSIGroupPortal(groups); dup {
+			return nil, &APIError{Code: -32602, Message: fmt.Sprintf("Invalid params (duplicate portal %d in groups)", portal)}
+		}
 	}
 	target := m.ISCSITargets[id]
 	if target == nil {

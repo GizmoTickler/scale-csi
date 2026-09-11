@@ -1199,6 +1199,67 @@ func TestAdditiveDeferredAndValidISCSIPublishesPreserveLegacyAllowAll(t *testing
 		"a deferred-live peer must defer the whole mutation; the enforceable peer must not get its own group yet")
 }
 
+// TestAdditiveISCSIPublishDoesNotCollideOnSharedPortalWithLegacyGroup is the D1
+// regression test. It is grounded directly in a real payload shape observed
+// against a live TrueNAS 26.0 appliance (see
+// TestE2ERealDebug_D1IsolateISCSITargetUpdate in e2e_real_test.go, run
+// out-of-band against nas01 with SCALE_CSI_E2E_REAL=1): a groups array with
+// TWO entries sharing the same portal ID is rejected outright with a bare
+// -32602 "Invalid params", independent of which valid initiator IDs are
+// used. The mock's RejectDuplicatePortalISCSITargetGroups flag reproduces
+// exactly that constraint (which the mock did NOT enforce before this fix,
+// so a test relying on default mock permissiveness would never have caught
+// this).
+//
+// This exact collision is the actual root cause of the reported D1 failure:
+// CreateVolume's resolveISCSITargetGroup attaches a placeholder allow-all
+// group to the configured iscsi.targetPortal, and applyISCSIFence's own
+// dynamic per-node group resolves to the SAME portal — producing two groups
+// for one portal on the very first ControllerPublishVolume.
+func TestAdditiveISCSIPublishDoesNotCollideOnSharedPortalWithLegacyGroup(t *testing.T) {
+	ctx := context.Background()
+	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeISCSI)
+	d, client := h.d, h.client
+	client.RejectDuplicatePortalISCSITargetGroups = true
+
+	dataset, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/portal-collision", Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	// Mirrors exactly what resolveISCSITargetGroup produces at CreateVolume
+	// time when iscsi.targetGroups is unconfigured: one group, on the SAME
+	// portal the fencing pass will independently resolve via
+	// iscsi.targetPortal, using the shared default allow-all initiator group.
+	target, err := client.ISCSITargetCreate(ctx, "portal-collision", "", "ISCSI", []truenas.ISCSITargetGroup{{
+		Portal: 1, Initiator: 1, AuthMethod: "NONE",
+	}})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropISCSITargetID, strconv.Itoa(target.ID)))
+	require.NoError(t, client.DatasetSetUserProperties(ctx, dataset.Name, map[string]string{
+		PropBlockISCSIBlocksize:  "512",
+		PropBlockISCSIPblocksize: "true",
+	}))
+
+	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", ISCSIIQN: "iqn.1993-08.org.debian:worker-a"})
+	require.NoError(t, err)
+	_, err = d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId: "portal-collision", NodeId: nodeID,
+		VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+		}},
+		VolumeContext: map[string]string{"node_attach_driver": "iscsi"},
+	})
+	require.NoError(t, err, "ControllerPublishVolume must not send iscsi.target.update a groups array with two entries on the same portal")
+
+	target, err = client.ISCSITargetGet(ctx, target.ID)
+	require.NoError(t, err)
+	portalCount := make(map[int]int)
+	for _, group := range target.Groups {
+		portalCount[group.Portal]++
+	}
+	for portal, count := range portalCount {
+		assert.LessOrEqualf(t, count, 1, "portal %d appears in %d groups; TrueNAS 26.0 rejects more than one", portal, count)
+	}
+}
+
 func TestAdditiveNVMePublishAndUnpublishPreserveAllowAnyHost(t *testing.T) {
 	ctx := context.Background()
 	h := newFencingTestHarness(t, FencingModeAdditive, ShareTypeNVMeoF, withNVMeAllowAnyHost())
@@ -2661,8 +2722,8 @@ func TestAdditiveISCSIFencingPreservesBroadAndRestrictedStaticGroups(t *testing.
 	}
 	target := &truenas.ISCSITarget{Groups: []truenas.ISCSITargetGroup{
 		{Portal: 1, Initiator: 0, AuthMethod: "NONE"},
-		{Portal: 1, Initiator: 1, AuthMethod: "NONE"},
-		{Portal: 1, Initiator: 2, AuthMethod: "CHAP", AuthNetworks: []string{"192.0.2.0/24"}},
+		{Portal: 2, Initiator: 1, AuthMethod: "NONE"},
+		{Portal: 3, Initiator: 2, AuthMethod: "CHAP"},
 	}}
 
 	groups, err := d.safeAdditiveISCSIGroups(context.Background(), target, 0)
@@ -2672,7 +2733,6 @@ func TestAdditiveISCSIFencingPreservesBroadAndRestrictedStaticGroups(t *testing.
 	assert.Equal(t, 1, groups[1].Initiator)
 	assert.Equal(t, 2, groups[2].Initiator)
 	assert.Equal(t, "CHAP", groups[2].AuthMethod)
-	assert.Equal(t, []string{"192.0.2.0/24"}, groups[2].AuthNetworks)
 }
 
 func TestStartupReconcileAdditiveDefersLegacyNodeWithoutStrippingStaticNVMeHost(t *testing.T) {

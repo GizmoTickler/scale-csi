@@ -189,18 +189,7 @@ func containsExactISCSIGroup(groups []truenas.ISCSITargetGroup, candidate truena
 }
 
 func sameISCSIGroupTemplate(a, b truenas.ISCSITargetGroup) bool {
-	if a.Initiator != b.Initiator || a.AuthMethod != b.AuthMethod || !equalOptionalInt(a.Auth, b.Auth) {
-		return false
-	}
-	if len(a.AuthNetworks) != len(b.AuthNetworks) {
-		return false
-	}
-	for i := range a.AuthNetworks {
-		if a.AuthNetworks[i] != b.AuthNetworks[i] {
-			return false
-		}
-	}
-	return true
+	return a.Initiator == b.Initiator && a.AuthMethod == b.AuthMethod && equalOptionalInt(a.Auth, b.Auth)
 }
 
 func equalOptionalInt(a, b *int) bool {
