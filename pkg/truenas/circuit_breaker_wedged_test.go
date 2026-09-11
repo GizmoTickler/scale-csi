@@ -166,6 +166,13 @@ func TestClient_CanceledHalfOpenProbeRecordsNoOutcome(t *testing.T) {
 // state, so a probe that never reports one stranded the breaker in half-open
 // forever — rejecting every request while the NAS may have recovered hours
 // earlier, with nothing outside the type able to clear it.
+//
+// The clock for an OUTSTANDING probe is ProbeLeakGrace, not Timeout: Timeout is
+// the recovery interval and is routinely shorter than one legitimate call, so
+// using it here pre-empted healthy slow probes (see
+// TestCircuitBreaker_HalfOpenEscapeWaitsForInFlightProbes). This test sets the
+// two equal to keep pinning the leak escape without sleeping for the default
+// grace.
 func TestCircuitBreaker_HalfOpenEscapesWhenProbesReturnNoVerdict(t *testing.T) {
 	cb := NewCircuitBreaker(&CircuitBreakerConfig{
 		Enabled:             true,
@@ -173,6 +180,7 @@ func TestCircuitBreaker_HalfOpenEscapesWhenProbesReturnNoVerdict(t *testing.T) {
 		SuccessThreshold:    1,
 		Timeout:             20 * time.Millisecond,
 		HalfOpenMaxRequests: 1,
+		ProbeLeakGrace:      20 * time.Millisecond,
 	})
 
 	cb.RecordFailure()

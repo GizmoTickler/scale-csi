@@ -141,6 +141,17 @@ func IsAlreadyExistsError(err error) bool {
 		// is worth a -32602 that is only ever the uninformative "Invalid params"
 		// on the real appliance (the informative ENOENT case comes through the
 		// structured errno above, which is consulted first).
+		//
+		// Before the message text, consult the STRUCTURED errno middlewared puts
+		// in its error envelope under its own key spellings. APIErrno above only
+		// accepts "errno"/"*_errno", which the appliance never emits; without this
+		// a CallException carrying EEXIST arrives as -32001 whose Message is the
+		// constant literal "Method call error" and classifies as a hard false.
+		for _, envelopeErrno := range truenasEnvelopeErrnos(apiErr) {
+			if envelopeErrno == syscall.EEXIST {
+				return true
+			}
+		}
 		return strings.Contains(strings.ToLower(apiErr.Message), "already exists")
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
@@ -246,6 +257,65 @@ func findErrno(value interface{}) (syscall.Errno, bool) {
 		}
 	}
 	return 0, false
+}
+
+// truenasEnvelopeErrnos returns the structured errnos carried by the TrueNAS
+// error envelope in an APIError's Data, most specific first.
+//
+// middlewared renders EVERY error through format_truenas_error
+// (api/base/server/ws_handler/rpc.py, read from the appliance at 26.0):
+//
+//	{"error": <errno int>, "errname": "<EEXIST|ENOENT|...>",
+//	 "reason": "<text>", "trace": {...}|null, "extra": <list>|null}
+//
+// so the errno lives under "error" and its symbolic name under "errname" —
+// NEITHER of which is a key findErrno accepts. For a ValidationError(s) the
+// envelope goes out as -32602 "Invalid params" and its top-level errno is
+// hardcoded to EINVAL by format_truenas_validation_error, while the per-attribute
+// errnos ride in "extra" as [attribute, errmsg, errno] triples; for a
+// CallException it goes out as -32001 "Method call error" and the top-level
+// errno is the semantic one.
+//
+// This deliberately does NOT feed APIErrno/findErrno, tempting as that is.
+// MessageFallbackContains treats the presence of ANY structured errno as
+// authoritative and then refuses to look at text at all. Because middlewared
+// stamps a generic EINVAL on every validation error, teaching findErrno these
+// spellings would make every -32602 "authoritatively EINVAL" and silently
+// disable the `|| MessageFallbackContains(err, "invalid params")` belt at all ten
+// create call sites — including pool.dataset.create, whose already-exists
+// evidence is ONLY textual (plugins/pool_/dataset.py raises it with
+// verrors.add(), which defaults errno to EINVAL). The reading is kept local to
+// the classifier that wants it.
+//
+// The walk is deliberately shallow: only the envelope's own keys and its
+// validation entries, never a recursive descent, so an errno mentioned inside a
+// "trace" frame or some nested object cannot be read as this object's status.
+func truenasEnvelopeErrnos(apiErr *APIError) []syscall.Errno {
+	data, ok := apiErr.Data.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	var errnos []syscall.Errno
+	// Validation entries first: on a -32602 the top-level errno is always the
+	// generic EINVAL, and the attribute-level errno is the meaningful one.
+	if extra, ok := data["extra"].([]interface{}); ok {
+		for _, entry := range extra {
+			fields, ok := entry.([]interface{})
+			if !ok || len(fields) < 3 {
+				continue
+			}
+			if errno, ok := parseErrnoValue(fields[2]); ok {
+				errnos = append(errnos, errno)
+			}
+		}
+	}
+	for _, key := range []string{"errname", "error"} {
+		if errno, ok := parseErrnoValue(data[key]); ok {
+			errnos = append(errnos, errno)
+		}
+	}
+	return errnos
 }
 
 func parseErrnoValue(value interface{}) (syscall.Errno, bool) {
@@ -1557,10 +1627,21 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		if errors.Is(err, ErrAmbiguousResult) && !isIdempotentAPIMethod(method) {
 			// Mutations are not retried after a successful write because the server
 			// may already have applied them.
-			if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			ctxErr := ctx.Err()
+			if ctxErr != nil && !errors.Is(err, ctxErr) {
 				err = errors.Join(err, ctxErr)
 			}
-			if c.circuitBreaker != nil {
+			// A result that is ambiguous BECAUSE the caller walked away is not
+			// evidence about the NAS: canceledCallResult reports "sent before the
+			// caller context ended", which describes this process, not the
+			// appliance. Recording it as a breaker FAILURE let a burst of CSI
+			// sidecar deadlines or a controller shutdown open — or reopen — the
+			// circuit on a perfectly healthy appliance, which is the exact
+			// invariant RecordAbandoned exists to hold. The ctx check has to come
+			// BEFORE the recorder, not after it.
+			if ctxErr != nil {
+				abandonProbe()
+			} else if c.circuitBreaker != nil {
 				c.circuitBreaker.RecordFailure()
 				breakerOutcomeRecorded = true
 			}

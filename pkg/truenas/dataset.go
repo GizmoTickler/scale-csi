@@ -629,9 +629,29 @@ type UserPropertyUpdate struct {
 func (c *Client) DatasetCreate(ctx context.Context, params *DatasetCreateParams) (*Dataset, error) {
 	result, err := c.Call(ctx, "pool.dataset.create", params)
 	if err != nil {
-		// Handle "already exists" errors by returning existing dataset (idempotency)
-		if IsAlreadyExistsError(err) {
-			return c.DatasetGet(ctx, params.Name)
+		// Log full error details before fallback logic (helps debug ambiguous "Invalid params")
+		LogAPIError(err, "DatasetCreate error")
+
+		// Handle "already exists" errors by returning the existing dataset, so a
+		// CreateVolume retry after an ambiguous write — a controller restart, a
+		// sidecar deadline — adopts what the first attempt created instead of
+		// leaving the PVC Pending forever.
+		//
+		// The MessageFallbackContains belt is not optional here, and this was the
+		// one create site in the package without it. TrueNAS reports an existing
+		// dataset as a ValidationErrors: plugins/pool_/dataset.py does
+		// `verrors.add('pool_dataset_create.name', f'Path {mountpoint} already
+		// exists')`, verrors.add defaults the errno to EINVAL, and middlewared
+		// renders that as JSON-RPC -32602 whose message is the uninformative
+		// literal "Invalid params". The "already exists" text exists only inside
+		// the error envelope's reason/extra, and the envelope's errno is the
+		// generic EINVAL — so neither the message match nor any structured errno
+		// can decide this case. Every sibling create (iscsi.go, nvmeof.go, nfs.go)
+		// already pairs the predicate with exactly this belt.
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
+			if existing, getErr := c.DatasetGet(ctx, params.Name); getErr == nil && existing != nil {
+				return existing, nil
+			}
 		}
 		return nil, fmt.Errorf("failed to create dataset: %w", err)
 	}
@@ -698,8 +718,16 @@ func (c *Client) DatasetGet(ctx context.Context, name string) (*Dataset, error) 
 		return nil, fmt.Errorf("failed to get dataset: %w", err)
 	}
 
+	// A non-list answer is a MALFORMED or unexpected response, never proof the
+	// dataset is absent. Collapsing the two produced the worst direction of
+	// error: IsNotFoundError matches the plain "dataset not found" text, so
+	// DatasetExists reported a false absence and DatasetDelete returned nil —
+	// the PV is released while the dataset and its data live on.
 	datasets, ok := result.([]interface{})
-	if !ok || len(datasets) == 0 {
+	if !ok {
+		return nil, fmt.Errorf("unexpected pool.dataset.query response for %s: got %T, want a list", name, result)
+	}
+	if len(datasets) == 0 {
 		return nil, fmt.Errorf("dataset not found: %s", name)
 	}
 
@@ -1276,8 +1304,12 @@ func (c *Client) DatasetGetUserProperties(ctx context.Context, name string) (*Da
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dataset user properties: %w", err)
 	}
+	// Same split as DatasetGet: a malformed answer is an error, not an absence.
 	datasets, ok := result.([]interface{})
-	if !ok || len(datasets) == 0 {
+	if !ok {
+		return nil, fmt.Errorf("unexpected pool.dataset.query response for %s: got %T, want a list", name, result)
+	}
+	if len(datasets) == 0 {
 		return nil, fmt.Errorf("dataset not found: %s", name)
 	}
 	return parseDataset(datasets[0])
