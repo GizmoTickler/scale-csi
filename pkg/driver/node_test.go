@@ -1248,7 +1248,7 @@ func TestNodeExpandVolumeRescansBeforeFilesystemResize(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "commands.log")
 	t.Setenv("FAKE_NODE_COMMAND_LOG", logPath)
 	t.Setenv("FAKE_NODE_FINDMNT_OUTPUT", "/dev/nvme3n7\n")
-	t.Setenv("FAKE_NODE_BLKID_OUTPUT", "ext4\n")
+	t.Setenv("FAKE_NODE_BLKID_OUTPUT", "TYPE=ext4\n")
 
 	d := newTestNodeDriver(ShareTypeNFS) // Device detection must support mixed protocols.
 	originalDeviceSize := nodeGetDeviceSize

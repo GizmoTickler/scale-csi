@@ -479,7 +479,7 @@ func TestFormatAndMountBlkidExitHandling(t *testing.T) {
 		require.NoError(t, err)
 
 		commands := readCommandLog(t, logPath)
-		assert.Contains(t, commands, "blkid -o value -s TYPE /dev/test")
+		assert.Contains(t, commands, "blkid -p -s TYPE -s PTTYPE -o export /dev/test")
 		assert.Contains(t, commands, "mkfs.ext4 -F /dev/test")
 		assert.Contains(t, commands, "mount -t ext4 /dev/test /target")
 	})
@@ -496,7 +496,7 @@ func TestFormatAndMountBlkidExitHandling(t *testing.T) {
 		assert.Contains(t, err.Error(), "blkid failed")
 
 		commands := readCommandLog(t, logPath)
-		assert.Contains(t, commands, "blkid -o value -s TYPE /dev/test")
+		assert.Contains(t, commands, "blkid -p -s TYPE -s PTTYPE -o export /dev/test")
 		assert.NotContains(t, commands, "mkfs.ext4")
 		assert.NotContains(t, commands, "mount -t")
 	})
@@ -505,14 +505,37 @@ func TestFormatAndMountBlkidExitHandling(t *testing.T) {
 		installFakeMountCommands(t, "blkid", "mkfs.ext4", "mount")
 		logPath := filepath.Join(t.TempDir(), "commands.log")
 		t.Setenv("FAKE_COMMAND_LOG", logPath)
-		t.Setenv("FAKE_BLKID_OUTPUT", "xfs")
+		t.Setenv("FAKE_BLKID_OUTPUT", "TYPE=xfs\n")
 
 		err := FormatAndMount("/dev/test", "/target", "ext4", nil)
 		require.EqualError(t, err, "device /dev/test has filesystem xfs, requested ext4")
 
 		commands := readCommandLog(t, logPath)
-		assert.Contains(t, commands, "blkid -o value -s TYPE /dev/test")
+		assert.Contains(t, commands, "blkid -p -s TYPE -s PTTYPE -o export /dev/test")
 		assert.NotContains(t, commands, "mkfs.ext4")
+		assert.NotContains(t, commands, "mount -t")
+	})
+
+	// N3 regression: a device that carries a partition table but no
+	// whole-device filesystem signature (TYPE empty, PTTYPE set) must NOT be
+	// treated as unformatted. Pre-fix, blkid was invoked without -p/-s PTTYPE,
+	// so this case was indistinguishable from a genuinely blank device and
+	// FormatAndMountWithContext ran mkfs -F directly over the partition table
+	// (destroying it and any data the partitions held).
+	t.Run("partition table without whole-device filesystem refuses to format", func(t *testing.T) {
+		installFakeMountCommands(t, "blkid", "mkfs.ext4", "mount")
+		logPath := filepath.Join(t.TempDir(), "commands.log")
+		t.Setenv("FAKE_COMMAND_LOG", logPath)
+		t.Setenv("FAKE_BLKID_OUTPUT", "PTTYPE=gpt\n")
+
+		err := FormatAndMount("/dev/test", "/target", "ext4", nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "partition table")
+		assert.Contains(t, err.Error(), "gpt")
+
+		commands := readCommandLog(t, logPath)
+		assert.Contains(t, commands, "blkid -p -s TYPE -s PTTYPE -o export /dev/test")
+		assert.NotContains(t, commands, "mkfs.ext4", "must never mkfs over a device that has a partition table")
 		assert.NotContains(t, commands, "mount -t")
 	})
 }
@@ -521,7 +544,7 @@ func TestMountRejectsUnsupportedFilesystemType(t *testing.T) {
 	installFakeMountCommands(t, "mount", "blkid")
 	logPath := filepath.Join(t.TempDir(), "commands.log")
 	t.Setenv("FAKE_COMMAND_LOG", logPath)
-	t.Setenv("FAKE_BLKID_OUTPUT", "ntfs")
+	t.Setenv("FAKE_BLKID_OUTPUT", "TYPE=ntfs\n")
 
 	err := FormatAndMount("/dev/test", "/target", "ntfs", nil)
 	require.Error(t, err)

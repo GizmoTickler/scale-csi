@@ -506,10 +506,19 @@ func GetFilesystemTypeWithContext(ctx context.Context, devicePath string) (strin
 	}
 	defer cancel()
 
-	// Keep stdout separate from stderr: the success path returns stdout as the
-	// filesystem type, and exit code 2 only means "no filesystem" when blkid
-	// produced no output at all.
-	cmd := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "TYPE", devicePath)
+	// -p switches to low-level superblock probing (upstream k8s.io/mount-utils
+	// uses the same flag): it bypasses /run/blkid/blkid.tab, whose cache would
+	// otherwise answer for a recycled /dev/nvmeXnY name from a stale entry left
+	// by a different physical device that previously had that name. -s TYPE -s
+	// PTTYPE -o export requests both the whole-device filesystem signature and
+	// the partition-table signature, so a partitioned device with no
+	// whole-device filesystem (TYPE empty, PTTYPE set) is not indistinguishable
+	// from a genuinely blank device (TYPE and PTTYPE both empty) -- see below.
+	//
+	// Keep stdout separate from stderr: the success path parses stdout, and
+	// exit code 2 only means "nothing recognized" when blkid produced no
+	// output at all.
+	cmd := exec.CommandContext(ctx, "blkid", "-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", devicePath)
 	output, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -523,7 +532,37 @@ func GetFilesystemTypeWithContext(ctx context.Context, devicePath string) (strin
 		}
 		return "", fmt.Errorf("blkid failed for %s: %w, output: %s, stderr: %s", devicePath, err, string(output), string(stderr))
 	}
-	return strings.TrimSpace(string(output)), nil
+
+	fsType, ptType := parseBlkidExportOutput(string(output))
+	if fsType == "" && ptType != "" {
+		// A partition table exists but blkid found no whole-device filesystem
+		// signature. FormatAndMountWithContext treats an empty return here as
+		// "unformatted, safe to mkfs" -- doing that here would run mkfs -F
+		// directly over the partition table (and whatever data the individual
+		// partitions hold). Refuse instead, exactly as upstream
+		// k8s.io/mount-utils does when PTTYPE is set and TYPE is not.
+		return "", fmt.Errorf("device %s has a partition table (PTTYPE=%s) but no whole-device filesystem signature; refusing to treat it as unformatted", devicePath, ptType)
+	}
+	return fsType, nil
+}
+
+// parseBlkidExportOutput extracts the TYPE and PTTYPE tags from blkid's
+// `-o export` output, which prints one KEY=value pair per line.
+func parseBlkidExportOutput(output string) (fsType, ptType string) {
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		value = strings.Trim(strings.TrimSpace(value), `"`)
+		switch strings.TrimSpace(key) {
+		case "TYPE":
+			fsType = value
+		case "PTTYPE":
+			ptType = value
+		}
+	}
+	return fsType, ptType
 }
 
 // GetFilesystemStats returns filesystem statistics for a path.
