@@ -2900,3 +2900,89 @@ func TestIsSnapshotHeldError(t *testing.T) {
 	}))
 	assert.False(t, IsSnapshotHeldError(&APIError{Code: -1, Message: "dataset has snapshots"}))
 }
+
+// TestSnapshotCreateTrustsAFreshReadWhenTheResponseOmitsProperties pins the
+// behavior of a REAL TrueNAS 26.0 appliance, and guards against an outage that
+// was one verification pass away from shipping.
+//
+// Live-verified on nas01 (26.0.0-BETA.2): pool.snapshot.create returns success
+// with a response that omits user properties entirely, while the properties are
+// genuinely on disk — a snapshot created that day by the deployed v1.10.6
+// carried csi_snapshot_handle, csi_snapshot_name, managed_resource,
+// driver_instance_id and csi_snapshot_source_volume_id, all source=local.
+//
+// An earlier fix treated the omitting response as proof of NON-persistence.
+// That latched "inline properties unsupported" on the first create of every
+// process, fell through to SnapshotSetUserProperty (which correctly refuses on
+// 26.0), and would have failed EVERY CreateSnapshot and every
+// clone-from-volume permanently with codes.Internal.
+//
+// Its sibling TestSnapshotCreateSilentPropertyDrop... covers the opposite case,
+// where the fresh read ALSO lacks the property and refusing is right. The pair
+// is the point: the response alone cannot distinguish them, so the appliance
+// gets asked.
+func TestSnapshotCreateTrustsAFreshReadWhenTheResponseOmitsProperties(t *testing.T) {
+	resetSnapshotAPIPrefix()
+	mock := newMockWSServer()
+	var createCalls, updateCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case snapshotResourceQueryMethod:
+				// 26.0's read path: the stamps ARE here, as a flat map with no
+				// source field at all. Demanding source=="local" on this shape
+				// is exactly what broke it.
+				resp.Result = []interface{}{
+					map[string]interface{}{
+						"id": "tank/csi/source@snap1", "name": "tank/csi/source@snap1",
+						"snapshot_name": "snap1", "dataset": "tank/csi/source",
+						"user_properties": map[string]interface{}{
+							"scale-csi:managed_resource":  "true",
+							"scale-csi:csi_snapshot_name": "snap1",
+						},
+					},
+				}
+			case "pool.snapshot.create":
+				createCalls.Add(1)
+				resp.Result = map[string]interface{}{
+					"id": "tank/csi/source@snap1", "name": "snap1", "dataset": "tank/csi/source",
+					"properties": map[string]interface{}{
+						"createtxg": map[string]interface{}{"value": "1", "source": "NONE"},
+						"creation":  map[string]interface{}{"value": "1789147802", "source": "NONE"},
+					},
+				}
+			case "pool.snapshot.update", "zfs.resource.snapshot.update":
+				updateCalls.Add(1)
+				t.Errorf("must not fall back to the silently-dropping update path when the properties demonstrably persisted")
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+	properties := map[string]string{
+		"truenas-csi:managed_resource": "true",
+		"scale-csi:csi_snapshot_name":  "snap1",
+	}
+
+	snap, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "snap1", properties)
+	require.NoError(t, err, "properties that a fresh read proves are persisted must not be reported as a silent drop")
+	require.NotNil(t, snap)
+	assert.Equal(t, int32(1), createCalls.Load(), "one create; the fresh read must not trigger a second")
+	assert.Zero(t, updateCalls.Load(), "must never route to the 26.0 no-op update path")
+	// The legacy-spelled request key is folded onto its canonical name.
+	assert.Equal(t, "true", snap.UserProperties["scale-csi:managed_resource"].Value)
+}

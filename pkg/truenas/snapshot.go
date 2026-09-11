@@ -209,20 +209,34 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userP
 		return c.snapshotCreateThenSetProperties(ctx, prefix, dataset, name, userProperties)
 	}
 
-	// Keep the first probe single-flight. A successful create is NOT by
-	// itself proof that inline properties are supported: live-verified
-	// 2026-09-11 against a real TrueNAS 26.0 appliance, pool.snapshot.create
-	// can return success for a create-with-properties call while silently
-	// dropping every property from the response (D2 mock-fidelity
-	// differential, divergence 4) — the exact same "acknowledges the request
-	// while silently dropping it" behavior SnapshotSetUserProperty already
-	// documents for pool.snapshot.update. A bare err==nil check would cache
-	// "supported" from that response and hand back a Snapshot whose
-	// UserProperties silently omit what the caller asked for — the fabricated
-	// stamp this whole package was fixed (24f754c) to stop producing. Only
-	// cache "supported" when the response actually reflects every requested
-	// property as source=local; a field-validation failure is cached (and
-	// retried without properties) as before.
+	// Keep the first probe single-flight. A successful create is not by itself
+	// proof that inline properties PERSISTED — but neither is a response that
+	// omits them proof that they did not, and conflating the two is a
+	// production outage.
+	//
+	// Live-verified on nas01 (TrueNAS 26.0.0-BETA.2) 2026-09-11: the
+	// pool.snapshot.create RESPONSE omits user properties entirely, yet the
+	// properties are on disk. A snapshot created that day by the deployed
+	// v1.10.6 carries csi_snapshot_handle, csi_snapshot_name,
+	// managed_resource, driver_instance_id and csi_snapshot_source_volume_id
+	// all with source=local. Treating the response as the persistence oracle
+	// therefore latches "unsupported" on the FIRST create of every process,
+	// falls through to SnapshotSetUserProperty, which correctly refuses on
+	// 26.0 — and every CreateSnapshot and every clone-from-volume then fails
+	// permanently with codes.Internal.
+	//
+	// So: trust the response when it does reflect the properties (free, no
+	// extra round trip), and otherwise ASK THE APPLIANCE once rather than
+	// guessing. SnapshotGet on 26.0 goes through zfs.resource.snapshot.query
+	// with get_user_properties, which returns the stamps as a flat map with no
+	// source at all — so the re-read matches on KEY AND VALUE and tolerates an
+	// empty source. That is sound because the requested set always includes
+	// snapshot-unique values (csi_snapshot_handle embeds the snapshot name), so
+	// a parent dataset's inherited properties cannot satisfy the whole set.
+	//
+	// The original intent of 24f754c survives intact: a stamp is never
+	// FABRICATED. We only ever report success when something we read back said
+	// the property is there with the value we asked for.
 	snap, err := c.snapshotCreateCall(ctx, prefix, params)
 	if err == nil {
 		if snapshotReflectsLocalProperties(snap, userProperties) {
@@ -233,12 +247,25 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userP
 			c.snapshotCreatePropertiesMu.Unlock()
 			return snap, nil
 		}
+		// The response did not reflect them. Ask the appliance before
+		// concluding anything: on 26.0 this is the NORMAL path, not the
+		// failure path.
+		if fresh, readErr := c.SnapshotGet(ctx, dataset+"@"+name); readErr == nil &&
+			snapshotCarriesRequestedProperties(fresh, userProperties) {
+			if c.snapshotCreatePropertiesSupport == nil {
+				c.snapshotCreatePropertiesSupport = make(map[string]bool)
+			}
+			c.snapshotCreatePropertiesSupport[prefix] = true
+			c.snapshotCreatePropertiesMu.Unlock()
+			klog.V(4).Infof("Snapshot create for %s@%s omitted inline properties from its response but a fresh read confirms they persisted; caching inline-property support", dataset, name)
+			return fresh, nil
+		}
 		if c.snapshotCreatePropertiesSupport == nil {
 			c.snapshotCreatePropertiesSupport = make(map[string]bool)
 		}
 		c.snapshotCreatePropertiesSupport[prefix] = false
 		c.snapshotCreatePropertiesMu.Unlock()
-		klog.Warningf("Snapshot create for %s@%s accepted inline properties but the response did not reflect them as local (silent drop); falling back to verified post-create updates", dataset, name)
+		klog.Warningf("Snapshot create for %s@%s accepted inline properties but neither the response nor a fresh read reflects them (genuine silent drop); falling back to verified post-create updates", dataset, name)
 		// The snapshot already exists (the call above succeeded); route
 		// through the same verified path snapshotCreateThenSetProperties uses
 		// so every property write goes through SnapshotSetUserProperty's own
@@ -282,6 +309,40 @@ func snapshotReflectsLocalProperties(snap *Snapshot, want map[string]string) boo
 		}
 		prop, ok := snap.UserProperties[lookupKey]
 		if !ok || prop.Value != value || !strings.EqualFold(strings.TrimSpace(prop.Source), "local") {
+			return false
+		}
+	}
+	return true
+}
+
+// snapshotCarriesRequestedProperties is the AUTHORITATIVE persistence check,
+// used on a fresh read rather than on a create response.
+//
+// It deliberately does NOT require source=="local". TrueNAS 26.0's
+// zfs.resource.snapshot.query returns user properties as a flat map with no
+// source field at all (verified live on nas01), so demanding "local" here would
+// reject every genuinely-persisted property and recreate the outage this
+// function exists to prevent. Matching on key AND exact value is what makes
+// that safe: callers always request at least one snapshot-unique value
+// (csi_snapshot_handle embeds the snapshot's own name), so a parent dataset's
+// inherited properties cannot satisfy the full set. A source of "local" is
+// still accepted, so the pre-26.0 read path is unchanged.
+func snapshotCarriesRequestedProperties(snap *Snapshot, want map[string]string) bool {
+	if snap == nil {
+		return len(want) == 0
+	}
+	for key, value := range want {
+		lookupKey := key
+		if suffix, ok := strings.CutPrefix(key, LegacyCSIPropertyNamespace); ok {
+			lookupKey = CSIPropertyNamespace + suffix
+		}
+		prop, ok := snap.UserProperties[lookupKey]
+		if !ok || prop.Value != value {
+			return false
+		}
+		// Reject only a PROVEN foreign source. An empty source is "unknown" on
+		// 26.0's flat read, not "inherited".
+		if src := strings.TrimSpace(prop.Source); src != "" && !strings.EqualFold(src, "local") {
 			return false
 		}
 	}
