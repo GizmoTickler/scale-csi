@@ -53,7 +53,27 @@ type CircuitBreakerConfig struct {
 
 	// HalfOpenMaxRequests is max requests allowed in half-open state
 	HalfOpenMaxRequests int
+
+	// ProbeLeakGrace bounds how long a half-open probe may stay OUTSTANDING —
+	// admitted, with no outcome recorded — before the breaker presumes it was
+	// lost and escapes half-open without it.
+	//
+	// It is deliberately NOT Timeout. Timeout is the recovery interval: how long
+	// the breaker waits before it is willing to test the appliance again. It says
+	// nothing about how long one probe may legitimately take, and a busy NAS
+	// routinely answers a single call more slowly than that (30s default here
+	// against a 300s external-provisioner budget). Using Timeout as the leak
+	// watchdog pre-empted healthy slow probes and produced a spurious-open loop.
+	// Defaults to defaultProbeLeakGraceMultiplier * Timeout.
+	ProbeLeakGrace time.Duration
 }
+
+// defaultProbeLeakGraceMultiplier sets ProbeLeakGrace an order of magnitude
+// beyond the recovery interval when the caller does not choose one: 10 minutes
+// at the 30s default, comfortably past the 300s external-provisioner deadline
+// that bounds the longest legitimate CSI call, so only a genuinely lost probe
+// trips it.
+const defaultProbeLeakGraceMultiplier = 20
 
 // DefaultCircuitBreakerConfig returns sensible defaults for the circuit breaker.
 func DefaultCircuitBreakerConfig() *CircuitBreakerConfig {
@@ -70,13 +90,27 @@ func DefaultCircuitBreakerConfig() *CircuitBreakerConfig {
 type CircuitBreaker struct {
 	config *CircuitBreakerConfig
 
-	mu                sync.RWMutex
-	state             CircuitState
-	failures          int
-	successes         int
-	lastFailure       time.Time
-	halfOpenRequests  int
-	lastStateChange   time.Time
+	mu               sync.RWMutex
+	state            CircuitState
+	failures         int
+	successes        int
+	lastFailure      time.Time
+	halfOpenRequests int
+	lastStateChange  time.Time
+
+	// probeAdmissions holds the admission time of every half-open probe that has
+	// NOT yet reported an outcome, oldest first. Its length is the number of
+	// probes currently in flight; halfOpenRequests, by contrast, counts slots
+	// CONSUMED and is never given back by a verdict. The escape timer needs the
+	// former: a probe that is still running is a pending verdict, not a missing
+	// one. Bounded by HalfOpenMaxRequests.
+	probeAdmissions []time.Time
+	// lastProbeActivity is when a probe was last admitted or last reported an
+	// outcome. The escape timer runs from this rather than from lastStateChange,
+	// which starts ticking the moment half-open begins and so can expire while a
+	// probe admitted seconds later is still on the wire.
+	lastProbeActivity time.Time
+
 	totalFailures     int64 // for metrics
 	totalSuccesses    int64 // for metrics
 	totalCircuitOpens int64 // for metrics
@@ -102,11 +136,16 @@ func NewCircuitBreaker(config *CircuitBreakerConfig) *CircuitBreaker {
 	if normalized.SuccessThreshold > normalized.HalfOpenMaxRequests {
 		normalized.SuccessThreshold = normalized.HalfOpenMaxRequests
 	}
+	if normalized.ProbeLeakGrace <= 0 {
+		normalized.ProbeLeakGrace = time.Duration(defaultProbeLeakGraceMultiplier) * normalized.Timeout
+	}
 
+	now := time.Now()
 	return &CircuitBreaker{
-		config:          &normalized,
-		state:           CircuitClosed,
-		lastStateChange: time.Now(),
+		config:            &normalized,
+		state:             CircuitClosed,
+		lastStateChange:   now,
+		lastProbeActivity: now,
 	}
 }
 
@@ -136,6 +175,7 @@ func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 		if time.Since(cb.lastFailure) >= cb.config.Timeout {
 			cb.transitionTo(CircuitHalfOpen)
 			cb.halfOpenRequests = 1
+			cb.admitProbe()
 			return circuitBreakerAdmission{allowed: true, halfOpenProbe: true}
 		}
 		return circuitBreakerAdmission{}
@@ -144,6 +184,7 @@ func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 		// Allow limited requests in half-open state
 		if cb.halfOpenRequests < cb.config.HalfOpenMaxRequests {
 			cb.halfOpenRequests++
+			cb.admitProbe()
 			return circuitBreakerAdmission{allowed: true, halfOpenProbe: true}
 		}
 		// ESCAPE TIMER. With every probe slot consumed, ONLY a recorded outcome
@@ -152,12 +193,15 @@ func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 		// that leaks the admission) strands the breaker in half-open forever,
 		// rejecting every request while the NAS may have been healthy for hours.
 		// That is a worse outage than the one the breaker exists to contain,
-		// because nothing outside this type can clear it. After a full Timeout
-		// with no verdict, fall back to Open and restart the recovery clock: the
-		// normal Open -> half-open transition above then issues a fresh probe one
-		// Timeout later, so the breaker always keeps retrying.
-		if time.Since(cb.lastStateChange) >= cb.config.Timeout {
-			klog.V(2).Infof("Circuit breaker half-open probes produced no verdict within %s; reopening to restart the recovery clock", cb.config.Timeout)
+		// because nothing outside this type can clear it. Fall back to Open and
+		// restart the recovery clock: the normal Open -> half-open transition
+		// above then issues a fresh probe one Timeout later, so the breaker
+		// always keeps retrying.
+		//
+		// See halfOpenEscapeDue for why "no verdict yet" is not the same as "no
+		// verdict coming".
+		if cb.halfOpenEscapeDue(time.Now()) {
+			klog.V(2).Infof("Circuit breaker half-open probes produced no verdict (%d still outstanding); reopening to restart the recovery clock", len(cb.probeAdmissions))
 			cb.lastFailure = time.Now()
 			cb.transitionTo(CircuitOpen)
 		}
@@ -165,6 +209,46 @@ func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 	}
 
 	return circuitBreakerAdmission{allowed: true}
+}
+
+// admitProbe records that a half-open probe just went on the wire (lock held).
+func (cb *CircuitBreaker) admitProbe() {
+	now := time.Now()
+	cb.probeAdmissions = append(cb.probeAdmissions, now)
+	cb.lastProbeActivity = now
+}
+
+// resolveProbe records that the oldest outstanding half-open probe reported an
+// outcome (lock held). The consumed slot is NOT given back — a probe that
+// answered has been spent — only the in-flight accounting is updated.
+func (cb *CircuitBreaker) resolveProbe() {
+	if len(cb.probeAdmissions) > 0 {
+		cb.probeAdmissions = cb.probeAdmissions[1:]
+	}
+	cb.lastProbeActivity = time.Now()
+}
+
+// halfOpenEscapeDue reports whether half-open should be abandoned (lock held).
+//
+// The distinction that matters is between a probe that has produced no verdict
+// YET and one that never will. Only elapsed time separates them, and the two
+// need very different clocks:
+//
+//   - No probe outstanding. Every admitted probe has reported, yet the state did
+//     not move. Nothing more is coming, so the ordinary recovery Timeout is the
+//     right patience.
+//
+//   - A probe still outstanding. An answer is genuinely pending. Reopening now
+//     throws it away — RecordSuccess is a deliberate no-op in the Open state —
+//     and guarantees the next cycle repeats, which is exactly the spurious-open
+//     loop a healthy-but-slow appliance produced: ten opens, zero failures,
+//     every probe eventually successful. A probe is only presumed lost after
+//     ProbeLeakGrace, which is explicitly longer than any legitimate call.
+func (cb *CircuitBreaker) halfOpenEscapeDue(now time.Time) bool {
+	if len(cb.probeAdmissions) > 0 {
+		return now.Sub(cb.probeAdmissions[0]) >= cb.config.ProbeLeakGrace
+	}
+	return now.Sub(cb.lastProbeActivity) >= cb.config.Timeout
 }
 
 // RecordSuccess records a successful request.
@@ -184,6 +268,7 @@ func (cb *CircuitBreaker) RecordSuccess() {
 		cb.failures = 0
 
 	case CircuitHalfOpen:
+		cb.resolveProbe()
 		cb.successes++
 		if cb.successes >= cb.config.SuccessThreshold {
 			// Enough successes - close the circuit
@@ -217,6 +302,7 @@ func (cb *CircuitBreaker) RecordAbandoned() {
 
 	if cb.state == CircuitHalfOpen && cb.halfOpenRequests > 0 {
 		cb.halfOpenRequests--
+		cb.resolveProbe()
 	}
 }
 
@@ -242,6 +328,7 @@ func (cb *CircuitBreaker) RecordFailure() {
 
 	case CircuitHalfOpen:
 		// Any failure in half-open reopens the circuit
+		cb.resolveProbe()
 		cb.transitionTo(CircuitOpen)
 
 	case CircuitOpen:
@@ -258,6 +345,11 @@ func (cb *CircuitBreaker) transitionTo(newState CircuitState) {
 	cb.failures = 0
 	cb.successes = 0
 	cb.halfOpenRequests = 0
+	// Probes admitted under the OLD state can no longer move this one, so they
+	// are not "outstanding" for escape purposes; a late verdict from one lands in
+	// the new state's rules like any other.
+	cb.probeAdmissions = nil
+	cb.lastProbeActivity = cb.lastStateChange
 
 	if newState == CircuitOpen {
 		cb.totalCircuitOpens++
