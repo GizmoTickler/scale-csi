@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
 // CSI limits node_id to 256 bytes. A small versioned TLV envelope keeps the
@@ -57,8 +59,18 @@ type NodeIdentity struct {
 
 var (
 	nodeReadIdentityFile = os.ReadFile
-	nodeIdentityCommand  = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		return exec.CommandContext(ctx, name, args...).Output()
+	// nodeIdentityCommand runs "nvme show-hostnqn", which resolves to the same
+	// bash-wrapper-into-nsenter-into-PID-1 shape every other host-tool exec site
+	// in this driver hardens against (see util.HardenCmd's doc comment): killing
+	// the direct bash child on cancellation leaves the nsenter'd grandchild
+	// holding the inherited output pipe, so Output() would otherwise block in
+	// Wait forever. HardenCmd is exported from pkg/util specifically so this
+	// site — which shells out directly rather than through a pkg/util wrapper —
+	// stays on the identical, already-reviewed logic instead of a second copy.
+	nodeIdentityCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, name, args...)
+		util.HardenCmd(cmd)
+		return cmd.Output()
 	}
 	nodeInterfaceAddrs = net.InterfaceAddrs
 )

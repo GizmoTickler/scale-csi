@@ -1710,7 +1710,7 @@ func TestHardenCmdBoundsWaitOnWedgedDescendant(t *testing.T) {
 		return exec.CommandContext(ctx, "sh", "-c", "sleep 5 & wait $!")
 	}
 
-	t.Run("without hardenCmd the direct-child-only kill leaves Wait blocked", func(t *testing.T) {
+	t.Run("without HardenCmd the direct-child-only kill leaves Wait blocked", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
 		cmd := newWedgingCmd(ctx)
@@ -1723,7 +1723,7 @@ func TestHardenCmdBoundsWaitOnWedgedDescendant(t *testing.T) {
 
 		select {
 		case <-done:
-			t.Fatal("expected CombinedOutput to still be blocked shortly after the context deadline without hardenCmd")
+			t.Fatal("expected CombinedOutput to still be blocked shortly after the context deadline without HardenCmd")
 		case <-time.After(800 * time.Millisecond):
 			// Expected: still wedged, proving the fixture genuinely
 			// reproduces the pipe-holding grandchild -- the orphaned `sleep`
@@ -1732,11 +1732,11 @@ func TestHardenCmdBoundsWaitOnWedgedDescendant(t *testing.T) {
 		}
 	})
 
-	t.Run("with hardenCmd Wait returns within the grace period", func(t *testing.T) {
+	t.Run("with HardenCmd Wait returns within the grace period", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
 		cmd := newWedgingCmd(ctx)
-		hardenCmd(cmd)
+		HardenCmd(cmd)
 		cmd.WaitDelay = 500 * time.Millisecond // keep the test fast regardless of the production default
 
 		done := make(chan error, 1)
@@ -1749,14 +1749,14 @@ func TestHardenCmdBoundsWaitOnWedgedDescendant(t *testing.T) {
 		case err := <-done:
 			t.Logf("command returned (process-group kill and/or WaitDelay unblocked Wait): %v", err)
 		case <-time.After(3 * time.Second):
-			t.Fatal("Cmd.Wait hung past the context deadline plus the WaitDelay grace period; hardenCmd is not bounding a wedged descendant")
+			t.Fatal("Cmd.Wait hung past the context deadline plus the WaitDelay grace period; HardenCmd is not bounding a wedged descendant")
 		}
 	})
 }
 
 // TestIsWedgedCommandErr locks in the sentinel used to keep a WaitDelay
 // timeout from being misclassified as an idempotent "not found"/"no session"
-// no-op (see hardenCmd's doc comment and the N2 fail-closed NodeUnstageVolume
+// no-op (see HardenCmd's doc comment and the N2 fail-closed NodeUnstageVolume
 // logic that depends on genuine failures being distinguishable).
 func TestIsWedgedCommandErr(t *testing.T) {
 	assert.True(t, isWedgedCommandErr(fmt.Errorf("wrapped: %w", exec.ErrWaitDelay)))

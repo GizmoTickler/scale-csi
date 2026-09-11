@@ -33,7 +33,7 @@ var portalDiscoveryMutex sync.Map // map[portal]*sync.Mutex
 var iscsiAdmCombinedOutput = func(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "iscsiadm", args...)
 	cmd.Env = localeInvariantEnv()
-	hardenCmd(cmd)
+	HardenCmd(cmd)
 	return cmd.CombinedOutput()
 }
 
@@ -60,16 +60,23 @@ func localeInvariantEnv() []string {
 // This is a grace period layered ON TOP OF the context deadline commandContext
 // (config.go) already enforces, never a replacement for it:
 // commandTimeouts.format is 300s in production because a large mkfs
-// legitimately takes minutes, and hardenCmd does not shorten that -- Wait
+// legitimately takes minutes, and HardenCmd does not shorten that -- Wait
 // still returns as soon as the command completes normally.
 const execWaitGrace = 5 * time.Second
 
-// hardenCmd configures cmd so a wedged descendant process cannot hang Wait
+// HardenCmd configures cmd so a wedged descendant process cannot hang Wait
 // forever, and so cancellation reaches the whole process group rather than
 // only the direct child. Call this on every exec.CommandContext used to shell
 // out to a host tool (nvme, iscsiadm, mount, blkid, mkfs.*, ...). See
 // execWaitGrace and isWedgedCommandErr.
-func hardenCmd(cmd *exec.Cmd) {
+//
+// Exported (not merely package-private to pkg/util) because pkg/driver's node
+// identity discovery (node_identity.go) shells out to nvme directly rather
+// than through one of this package's wrapper functions, and needs the exact
+// same protection against a wedged nsenter'd host-tool descendant. Exporting
+// the existing helper keeps that one call site on the identical, already-
+// reviewed logic instead of a second, drifting copy.
+func HardenCmd(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// The default Cancel (SIGKILL to cmd.Process alone) only reaches the
 	// direct child. Target the whole process group instead, so a wrapper
@@ -93,7 +100,7 @@ func hardenCmd(cmd *exec.Cmd) {
 }
 
 // isWedgedCommandErr reports whether err indicates Cmd.Wait gave up waiting
-// for a command's output pipes via WaitDelay (see hardenCmd), rather than the
+// for a command's output pipes via WaitDelay (see HardenCmd), rather than the
 // command running to completion and failing on its own. A wedged command's
 // output may be truncated or missing entirely, so it must never be
 // misclassified as an idempotent "not found"/"no session" no-op by
@@ -456,7 +463,7 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 		// Logout from target
 		cmd := exec.CommandContext(cmdCtx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--logout")
 		cmd.Env = localeInvariantEnv()
-		hardenCmd(cmd)
+		HardenCmd(cmd)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			// Exit-code classification first: iscsiadm(8) documents exit code 21
@@ -490,7 +497,7 @@ func ISCSIDisconnectWithContext(ctx context.Context, portal, iqn string) error {
 
 	cmd := exec.CommandContext(cmdCtx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-o", "delete")
 	cmd.Env = localeInvariantEnv()
-	hardenCmd(cmd)
+	HardenCmd(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// Exit code 21 (ISCSI_ERR_NO_OBJS_FOUND) means the node record is already
@@ -659,7 +666,7 @@ func getISCSISessions() ([]ISCSISession, error) {
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session")
 	cmd.Env = localeInvariantEnv()
-	hardenCmd(cmd)
+	HardenCmd(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
@@ -1050,7 +1057,7 @@ func ISCSIRescanSessionWithContext(ctx context.Context, portal, iqn string) erro
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--rescan")
 	cmd.Env = localeInvariantEnv()
-	hardenCmd(cmd)
+	HardenCmd(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("rescan failed: %w, output: %s", err, string(output))
@@ -1065,7 +1072,7 @@ func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "session", "-s")
 	cmd.Env = localeInvariantEnv()
-	hardenCmd(cmd)
+	HardenCmd(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session stats: %w", err)
@@ -1115,7 +1122,7 @@ func SetISCSINodeParam(portal, iqn, name, value string) error {
 	cmd := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal,
 		"-o", "update", "-n", name, "-v", value)
 	cmd.Env = localeInvariantEnv()
-	hardenCmd(cmd)
+	HardenCmd(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if isISCSIAuthParam(name) {
@@ -1330,7 +1337,7 @@ func FlushDeviceBuffers(devicePath string) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "blockdev", "--flushbufs", devicePath)
-	hardenCmd(cmd)
+	HardenCmd(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to flush buffers: %w, output: %s", err, string(output))

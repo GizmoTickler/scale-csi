@@ -377,9 +377,36 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		return nil, fmt.Errorf("config is required")
 	}
 
+	// Configure utility package timeouts and rate limiting. Moved ahead of node
+	// identity discovery below (which needs commandTimeouts.nvme, via
+	// util.GetConfig(), to bound its "nvme show-hostnqn" call) so that call
+	// observes the real configured value — util.SetConfig only overwrites its
+	// package default for a strictly positive duration, so an unset/zero
+	// commandTimeouts.nvme still resolves to util's own 30s default rather
+	// than an immediately-expired zero timeout.
+	util.SetConfig(&util.UtilConfig{
+		MountTimeout:           time.Duration(cfg.Config.CommandTimeouts.Mount) * time.Second,
+		FormatTimeout:          time.Duration(cfg.Config.CommandTimeouts.Format) * time.Second,
+		ISCSITimeout:           time.Duration(cfg.Config.CommandTimeouts.ISCSI) * time.Second,
+		NVMeTimeout:            time.Duration(cfg.Config.CommandTimeouts.NVMe) * time.Second,
+		DiscoveryCacheDuration: time.Duration(cfg.Config.Resilience.RateLimiting.DiscoveryCacheDuration) * time.Second,
+		MaxConcurrentLogins:    cfg.Config.Resilience.RateLimiting.MaxConcurrentLogins,
+	})
+
 	encodedNodeID := ""
 	if cfg.RunNode {
-		identity := discoverNodeIdentity(context.Background(), cfg.NodeID)
+		// Bounded, not context.Background(): this runs during driver
+		// construction, BEFORE the gRPC listener exists, and
+		// discoverNodeIdentity shells out to "nvme show-hostnqn" via
+		// nodeIdentityCommand. Without a deadline, a wedged host nvme-cli (the
+		// bash-wrapper-into-nsenter-into-PID-1 shape nodeIdentityCommand is now
+		// hardened against, but WaitDelay only bounds Wait AFTER the context is
+		// done) hangs node startup indefinitely and the pod never becomes
+		// serviceable. commandTimeouts.nvme is already the configured budget
+		// for every other nvme-cli invocation this driver makes.
+		identityCtx, identityCancel := context.WithTimeout(context.Background(), util.GetConfig().NVMeTimeout)
+		identity := discoverNodeIdentity(identityCtx, cfg.NodeID)
+		identityCancel()
 		identity = nodeIdentityForEnabledProtocols(identity, cfg.Config)
 		var identityErr error
 		encodedNodeID, identityErr = encodeNodeIdentity(identity)
@@ -436,16 +463,6 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 			return nil, &trueNASClientCreationError{err: err}
 		}
 	}
-
-	// Configure utility package timeouts and rate limiting
-	util.SetConfig(&util.UtilConfig{
-		MountTimeout:           time.Duration(cfg.Config.CommandTimeouts.Mount) * time.Second,
-		FormatTimeout:          time.Duration(cfg.Config.CommandTimeouts.Format) * time.Second,
-		ISCSITimeout:           time.Duration(cfg.Config.CommandTimeouts.ISCSI) * time.Second,
-		NVMeTimeout:            time.Duration(cfg.Config.CommandTimeouts.NVMe) * time.Second,
-		DiscoveryCacheDuration: time.Duration(cfg.Config.Resilience.RateLimiting.DiscoveryCacheDuration) * time.Second,
-		MaxConcurrentLogins:    cfg.Config.Resilience.RateLimiting.MaxConcurrentLogins,
-	})
 
 	// Initialize event recorder (will be nil if not running in k8s)
 	eventRecorder := NewEventRecorder(cfg.Name)
