@@ -759,7 +759,7 @@ nvmeof:
   # TrueNAS port object), these are HOST/CLI options applied on every node that
   # stages a volume.
   connect:
-    # --fast-io-fail-tmo (seconds). 0 (default) uses the driver's built-in 15s:
+    # --fast_io_fail_tmo (seconds). 0 (default) uses the driver's built-in 15s:
     # with --ctrl-loss-tmo pinned to infinite, a controller stuck reconnecting
     # would otherwise queue I/O against it forever instead of failing over to a
     # surviving multipath path — verified live, a NAS reboot / single link

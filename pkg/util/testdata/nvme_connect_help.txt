@@ -1,0 +1,64 @@
+[1mUsage: nvme connect <device> [OPTIONS][0m
+
+Connect to NVMeoF subsystem
+
+[1mOptions:[0m
+  [  --transport=<STR>, -t <STR> ]      --- transport type
+  [  --nqn=<STR>, -n <STR> ]            --- subsystem nqn
+  [  --traddr=<STR>, -a <STR> ]         --- transport address
+  [  --trsvcid=<STR>, -s <STR> ]        --- transport service id (e.g. IP
+                                            port)
+  [  --host-traddr=<STR>, -w <STR> ]    --- host traddr (e.g. FC WWN's)
+  [  --host-iface=<STR>, -f <STR> ]     --- host interface (for tcp
+                                            transport)
+  [  --hostnqn=<STR>, -q <STR> ]        --- user-defined hostnqn
+  [  --hostid=<STR>, -I <STR> ]         --- user-defined hostid (if default
+                                            not used)
+  [  --dhchap-secret=<STR>, -S <STR> ]  --- user-defined dhchap key (if
+                                            default not used)
+  [  --keyring=<STR> ]                  --- Keyring for TLS key lookup (key
+                                            id or keyring name)
+  [  --tls-key=<STR> ]                  --- TLS key to use (key id or key in
+                                            interchange format)
+  [  --tls-key-identity=<STR> ]         --- TLS key identity
+  [  --nr-io-queues=<NUM>, -i <NUM> ]   --- number of io queues to use
+                                            (default is core count)
+  [  --nr-write-queues=<NUM>, -W <NUM> ] --- number of write queues to use
+                                            (default 0)
+  [  --nr-poll-queues=<NUM>, -P <NUM> ] --- number of poll queues to use
+                                            (default 0)
+  [  --queue-size=<NUM>, -Q <NUM> ]     --- number of io queue elements to
+                                            use (default 128)
+  [  --keep-alive-tmo=<NUM>, -k <NUM> ] --- keep alive timeout period in
+                                            seconds
+  [  --reconnect-delay=<NUM>, -c <NUM> ] --- reconnect timeout period in
+                                            seconds
+  [  --ctrl-loss-tmo=<NUM>, -l <NUM> ]  --- controller loss timeout period in
+                                            seconds
+  [  --fast_io_fail_tmo=<NUM>, -F <NUM> ] --- fast I/O fail timeout (default
+                                            off)
+  [  --tos=<NUM>, -T <NUM> ]            --- type of service
+  [  --tls_key=<NUM> ]                  --- TLS key to use (key id)
+  [  --duplicate-connect, -D ]          --- allow duplicate connections
+                                            between same transport host and
+                                            subsystem port
+  [  --disable-sqflow ]                 --- disable controller sq flow
+                                            control (default false)
+  [  --hdr-digest, -g ]                 --- enable transport protocol header
+                                            digest (TCP transport)
+  [  --data-digest, -G ]                --- enable transport protocol data
+                                            digest (TCP transport)
+  [  --tls ]                            --- enable TLS
+  [  --concat ]                         --- enable secure concatenation
+  [  --dhchap-ctrl-secret=<STR>, -C <STR> ] --- user-defined dhchap controller
+                                            key (for bi-directional
+                                            authentication)
+  [  --config=<FILE>, -J <FILE> ]       --- Use specified JSON configuration
+                                            file or 'none' to disable
+  [  --verbose, -v ]                    --- Increase logging verbosity
+  [  --dump-config, -O ]                --- Dump JSON configuration to stdout
+  [  --output-format=<FMT>, -o <FMT> ]  --- Output format: normal|json
+  [  --context=<STR> ]                  --- execution context identification
+                                            string
+--- version ---
+nvme version 2.15 (git 2.15)

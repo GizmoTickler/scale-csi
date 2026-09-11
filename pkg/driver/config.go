@@ -892,7 +892,7 @@ type NVMeoFConfig struct {
 // pkg/util.NVMeoFConnectOptions's own zero-value semantics field-for-field so
 // converting one to the other is a direct, sentinel-preserving copy.
 type NVMeoFConnectConfig struct {
-	// FastIOFailTmo overrides --fast-io-fail-tmo (seconds) on every `nvme
+	// FastIOFailTmo overrides --fast_io_fail_tmo (seconds) on every `nvme
 	// connect`. Zero (the default, including an absent key) leaves the
 	// driver's built-in 15s default in effect: with --ctrl-loss-tmo pinned to
 	// infinite, a controller stuck reconnecting would otherwise queue I/O

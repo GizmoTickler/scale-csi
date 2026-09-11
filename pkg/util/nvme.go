@@ -63,7 +63,7 @@ const DefaultNVMeoFDeviceTimeout = 60 * time.Second
 type NVMeoFConnectOptions struct {
 	DeviceTimeout time.Duration // Timeout for waiting for device to appear (default: 60s)
 
-	// FastIOFailTmo overrides the --fast-io-fail-tmo (seconds) passed to
+	// FastIOFailTmo overrides the --fast_io_fail_tmo (seconds) passed to
 	// every nvme connect. Zero (the default, including when this struct
 	// isn't supplied at all) uses defaultFastIOFailTmo. A negative value
 	// omits the flag entirely, reproducing the historical (disabled)
@@ -285,7 +285,7 @@ var nvmeConnectCommand = func(ctx context.Context, args ...string) ([]byte, erro
 	return cmd.CombinedOutput()
 }
 
-// defaultFastIOFailTmo is the --fast-io-fail-tmo (seconds) applied to every
+// defaultFastIOFailTmo is the --fast_io_fail_tmo (seconds) applied to every
 // nvme connect unless NVMeoFConnectOptions.FastIOFailTmo overrides it. See the
 // field doc for why this is a real behavior change, not a no-op default.
 const defaultFastIOFailTmo = 15 * time.Second
@@ -297,7 +297,7 @@ func runNVMeConnect(ctx context.Context, transport, host, port, nqn string, opts
 	// This is deliberate and CORRECT for multipath (never abandon the path)
 	// and is kept unconditionally.
 	//
-	// --fast-io-fail-tmo: with ctrl-loss-tmo pinned to infinite, a controller
+	// --fast_io_fail_tmo: with ctrl-loss-tmo pinned to infinite, a controller
 	// stuck reconnecting would otherwise queue I/O against it forever instead
 	// of failing over to a surviving path -- verified live: ctrl_loss_tmo=off
 	// fast_io_fail_tmo=off parked pods in D-state on a NAS reboot / single
@@ -329,7 +329,7 @@ func runNVMeConnect(ctx context.Context, transport, host, port, nqn string, opts
 		keepAliveTmo = opts.KeepAliveTmo
 	}
 	if fastIOFailTmo >= 0 {
-		args = append(args, fmt.Sprintf("--fast-io-fail-tmo=%d", int(fastIOFailTmo.Seconds())))
+		args = append(args, fmt.Sprintf("--fast_io_fail_tmo=%d", int(fastIOFailTmo.Seconds())))
 	}
 	if nrIOQueues != nil {
 		args = append(args, fmt.Sprintf("--nr-io-queues=%d", *nrIOQueues))

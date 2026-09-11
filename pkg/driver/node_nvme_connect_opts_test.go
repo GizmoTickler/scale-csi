@@ -17,7 +17,7 @@ import (
 // &util.NVMeoFConnectOptions{DeviceTimeout: ...} and silently dropped every
 // other CLI knob. That made the top-up paths — the extra multipath paths whose
 // whole purpose is to survive a failure — the only ones connected WITHOUT
-// --fast-io-fail-tmo, so I/O on a dead controller would still block there
+// --fast_io_fail_tmo, so I/O on a dead controller would still block there
 // rather than fail over. A partial application of N4 is worse than none,
 // because it is invisible until the failure it was meant to handle.
 func TestConvergeNVMeoFPathsTopUpInheritsConnectKnobs(t *testing.T) {
@@ -58,7 +58,7 @@ func TestConvergeNVMeoFPathsTopUpInheritsConnectKnobs(t *testing.T) {
 	for uri, opts := range seen {
 		require.NotNil(t, opts, "top-up connect for %s got nil options", uri)
 		assert.Equal(t, 20*time.Second, opts.FastIOFailTmo,
-			"top-up path %s must inherit --fast-io-fail-tmo", uri)
+			"top-up path %s must inherit --fast_io_fail_tmo", uri)
 		if assert.NotNil(t, opts.NrIOQueues, "top-up path %s dropped --nr-io-queues", uri) {
 			assert.Equal(t, 6, *opts.NrIOQueues)
 		}

@@ -162,9 +162,9 @@ func TestNVMeConnectPathSuppressesExactLiveController(t *testing.T) {
 // TestRunNVMeConnectFastIOFailTmoDefault is the N4 regression: with
 // --ctrl-loss-tmo=-1 pinned (correct, and kept, for multipath), a controller
 // stuck reconnecting queues I/O against it forever instead of failing over to
-// a surviving path UNLESS --fast-io-fail-tmo is also set. Verified live:
+// a surviving path UNLESS --fast_io_fail_tmo is also set. Verified live:
 // ctrl_loss_tmo=off fast_io_fail_tmo=off on production. Every connect must now
-// carry a --fast-io-fail-tmo, defaulting to 15s, without dropping any
+// carry a --fast_io_fail_tmo, defaulting to 15s, without dropping any
 // existing flag.
 func TestRunNVMeConnectFastIOFailTmoDefault(t *testing.T) {
 	originalCommand := nvmeConnectCommand
@@ -181,7 +181,7 @@ func TestRunNVMeConnectFastIOFailTmoDefault(t *testing.T) {
 
 		assert.Contains(t, gotArgs, "--ctrl-loss-tmo=-1", "never abandon a multipath controller")
 		assert.Contains(t, gotArgs, "--reconnect-delay=10")
-		assert.Contains(t, gotArgs, "--fast-io-fail-tmo=15")
+		assert.Contains(t, gotArgs, "--fast_io_fail_tmo=15")
 	})
 
 	t.Run("explicit override replaces the default", func(t *testing.T) {
@@ -194,8 +194,8 @@ func TestRunNVMeConnectFastIOFailTmoDefault(t *testing.T) {
 		require.NoError(t, runNVMeConnect(context.Background(), "tcp", "192.0.2.10", "4420", "nqn.test:override",
 			&NVMeoFConnectOptions{FastIOFailTmo: 30 * time.Second}))
 
-		assert.Contains(t, gotArgs, "--fast-io-fail-tmo=30")
-		assert.NotContains(t, gotArgs, "--fast-io-fail-tmo=15")
+		assert.Contains(t, gotArgs, "--fast_io_fail_tmo=30")
+		assert.NotContains(t, gotArgs, "--fast_io_fail_tmo=15")
 	})
 
 	t.Run("negative value omits the flag for exact historical reproduction", func(t *testing.T) {
@@ -209,7 +209,7 @@ func TestRunNVMeConnectFastIOFailTmoDefault(t *testing.T) {
 			&NVMeoFConnectOptions{FastIOFailTmo: -1}))
 
 		for _, arg := range gotArgs {
-			assert.NotContains(t, arg, "fast-io-fail-tmo")
+			assert.NotContains(t, arg, "fast_io_fail_tmo")
 		}
 	})
 

@@ -2291,7 +2291,7 @@ func sameDevicePath(left, right string) bool {
 // because callers legitimately use different budgets -- a full stage versus a
 // bounded secondary-path top-up -- while every other knob here is install-wide
 // and MUST be identical on every connect this node issues. A secondary path
-// brought up without --fast-io-fail-tmo would still park I/O on a dead
+// brought up without --fast_io_fail_tmo would still park I/O on a dead
 // controller, which is precisely the failure that flag exists to prevent, so
 // partial application would silently defeat the fix on exactly the paths
 // multipath exists to provide.
@@ -2625,7 +2625,7 @@ func convergeNVMeoFPaths(
 		topUpCtx, cancel := context.WithTimeout(ctx, nvmeSecondaryPathConvergeBudget)
 		defer cancel()
 		// Inherit every CLI knob from connectOpts and override only the
-		// budget: a top-up path connected without --fast-io-fail-tmo (or with
+		// budget: a top-up path connected without --fast_io_fail_tmo (or with
 		// different queue counts) would be the one path that still blocks I/O
 		// on a dead controller, defeating N4 exactly where multipath matters.
 		shortOpts := &util.NVMeoFConnectOptions{DeviceTimeout: nvmeSecondaryPathConvergeBudget}
