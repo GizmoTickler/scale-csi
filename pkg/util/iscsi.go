@@ -783,15 +783,32 @@ func sameISCSIPortal(left, right string) bool {
 
 func canonicalISCSIPortalForComparison(portal string) string {
 	portal = strings.TrimSpace(portal)
-	host, port, err := net.SplitHostPort(portal)
-	if err == nil {
-		return net.JoinHostPort(strings.ToLower(host), port)
+	// Trim the SPLIT components, not just the whole string: SplitHostPort
+	// happily returns a host of " " for "[ ]:", and emitting that verbatim
+	// produced " :", which the leading TrimSpace then rewrote to ":" on the
+	// next pass.
+	if host, port, err := net.SplitHostPort(portal); err == nil {
+		return net.JoinHostPort(strings.ToLower(strings.TrimSpace(host)), strings.TrimSpace(port))
 	}
 	if ip := net.ParseIP(strings.Trim(portal, "[]")); ip != nil {
 		return net.JoinHostPort(ip.String(), "3260")
 	}
-	if !strings.Contains(portal, ":") {
-		return net.JoinHostPort(strings.ToLower(portal), "3260")
+	// Everything below is degenerate input: it parsed as neither host:port nor
+	// a bare IP. Brackets are IPv6-literal delimiters, and both branches that
+	// give them meaning have already been taken, so any bracket still present
+	// is garbage. It must not reach JoinHostPort, which re-adds brackets only
+	// when the host itself contains a colon: "[]" went to "[]:3260" and then to
+	// ":3260" on a second pass, so the function was not a fixed point.
+	//
+	// Strip EVERY bracket rather than an edge pair. Edge-trimming is
+	// whack-a-mole -- the fuzzer walked straight from "[]" to "[[]]" to
+	// "] [] [", each defeating a narrower strip. Removing interior brackets can
+	// make two distinct garbage portals compare equal, which is an accepted
+	// trade: a real portal never contains a bracket except as an IPv6
+	// delimiter, and those are handled above.
+	unbracketed := strings.TrimSpace(strings.NewReplacer("[", "", "]", "").Replace(portal))
+	if !strings.Contains(unbracketed, ":") {
+		return net.JoinHostPort(strings.ToLower(unbracketed), "3260")
 	}
 	return strings.ToLower(portal)
 }

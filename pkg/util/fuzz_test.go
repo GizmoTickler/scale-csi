@@ -219,18 +219,19 @@ func FuzzNormalizeSCSIWWID(f *testing.F) {
 //   - "[ ]" (a literal space inside the brackets) needs a THIRD distinct
 //     value before stabilizing: "[ ]" -> "[ ]:3260" -> " :3260" -> ":3260".
 //
-// Both corpus entries are committed as permanent regression pins. Because a
-// second malformed input needed one MORE pass than the first, there is no
-// evidence of a fixed convergence bound, so this target intentionally does
-// NOT assert eventual idempotence -- only properties verified to hold for
-// every input regardless of how many passes canonicalization would need.
-// This instability means two textually different portal strings surfaced by
-// two different code paths (one already run through canonicalization once,
-// one not) COULD compare unequal via sameISCSIPortal even though a human
-// would call them the same broken portal; the practical exposure is low
-// because canonicalISCSIPortalForComparison is only ever called on raw
-// `TargetPortal`/configured-address strings, never on its own prior output,
-// but the asymmetry is real and unfixed.
+// Both corpus entries are committed as permanent regression pins for the
+// non-idempotence this target originally found: "[]" canonicalized to
+// "[]:3260" and then to ":3260", and "[ ]" needed a third pass. The cause was
+// that a bracketed host which failed to parse as an IP fell through to
+// JoinHostPort with its brackets still attached, and SplitHostPort re-read
+// those brackets as an empty IPv6 literal on the next pass. That is fixed in
+// canonicalISCSIPortalForComparison, so this target now asserts FULL
+// idempotence -- one pass must reach a fixed point for every input.
+//
+// Idempotence is the property that matters rather than a cosmetic one:
+// sameISCSIPortal compares canonical forms, so a function that is not a fixed
+// point lets two spellings of the same portal compare unequal depending on how
+// many times each has been normalized.
 func FuzzCanonicalISCSIPortalForComparison(f *testing.F) {
 	f.Add("192.0.2.10:3260")
 	f.Add("[2001:db8::1]:3260")
@@ -247,6 +248,9 @@ func FuzzCanonicalISCSIPortalForComparison(f *testing.F) {
 		canonical := canonicalISCSIPortalForComparison(portal)
 		if !strings.Contains(canonical, ":") {
 			t.Fatalf("canonicalISCSIPortalForComparison(%q) = %q is not host:port-shaped", portal, canonical)
+		}
+		if again := canonicalISCSIPortalForComparison(canonical); again != canonical {
+			t.Fatalf("canonicalISCSIPortalForComparison is not idempotent: %q -> %q -> %q", portal, canonical, again)
 		}
 	})
 }
