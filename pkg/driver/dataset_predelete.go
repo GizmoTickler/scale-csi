@@ -16,10 +16,19 @@ func (d *Driver) deleteDatasetWithBusyObservation(
 	return d.truenasClient.DatasetDelete(ctx, datasetName, recursive, force)
 }
 
+// observeDatasetBusyBeforeDelete is observation-only by design: it never gates
+// the delete, and a probe failure is therefore not fatal. What it must NOT be is
+// invisible. Both arms previously logged at klog.V(2) — silent at the default
+// verbosity the driver actually runs at — and the metric only moved when
+// something was found, so "the query failed" and "nothing was busy" produced
+// byte-identical (empty) logs and metrics. Errors now log at Warning and
+// increment their own counter, while the observation counter is recorded even
+// at zero so the quiet case has a series of its own.
 func (d *Driver) observeDatasetBusyBeforeDelete(ctx context.Context, datasetName, operation string) {
 	attachments, err := d.truenasClient.DatasetAttachments(ctx, datasetName)
 	if err != nil {
-		klog.V(2).Infof("Could not inspect dataset %s attachments before %s delete: %v", datasetName, operation, err)
+		RecordDatasetBusyObservationError("attachment")
+		klog.Warningf("Could not inspect dataset %s attachments before %s delete: %v", datasetName, operation, err)
 	} else {
 		RecordDatasetBusyObservations("attachment", len(attachments))
 		for _, attachment := range attachments {
@@ -30,7 +39,8 @@ func (d *Driver) observeDatasetBusyBeforeDelete(ctx context.Context, datasetName
 
 	processes, err := d.truenasClient.DatasetProcesses(ctx, datasetName)
 	if err != nil {
-		klog.V(2).Infof("Could not inspect dataset %s processes before %s delete: %v", datasetName, operation, err)
+		RecordDatasetBusyObservationError("process")
+		klog.Warningf("Could not inspect dataset %s processes before %s delete: %v", datasetName, operation, err)
 		return
 	}
 	RecordDatasetBusyObservations("process", len(processes))

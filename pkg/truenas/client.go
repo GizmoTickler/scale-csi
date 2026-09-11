@@ -60,6 +60,28 @@ func LogAPIError(err error, ctx string) {
 	}
 }
 
+// isJSONRPCProtocolError reports whether code is one of the reserved JSON-RPC
+// 2.0 protocol codes. These describe the CALL — a missing method, malformed
+// params, a malformed request, unparsable JSON — and never the state of the
+// object the call named. Object classifiers must therefore refuse to read them
+// as "absent" or "already exists", no matter what their message text says.
+//
+// -32602 "Invalid params" is included even though TrueNAS really does report a
+// genuinely-missing dataset that way: the structured errno carried in Data is
+// what proves that case (see APIErrno), and it is consulted BEFORE this guard.
+// What is rejected here is only the message-text fallback for a -32602, which
+// TrueNAS renders as the uninformative literal "Invalid params".
+func isJSONRPCProtocolError(code int) bool {
+	switch code {
+	case -32700, // Parse error
+		-32600, // Invalid Request
+		-32601, // Method not found
+		-32602: // Invalid params
+		return true
+	}
+	return false
+}
+
 // IsNotFoundError returns true if the error indicates a resource was not found.
 func IsNotFoundError(err error) bool {
 	if err == nil {
@@ -69,6 +91,15 @@ func IsNotFoundError(err error) bool {
 	if errors.As(err, &apiErr) {
 		if errno, ok := APIErrno(apiErr); ok {
 			return errno == syscall.ENOENT
+		}
+		// A JSON-RPC PROTOCOL failure is never a statement about the object. In
+		// particular -32601 "Method not found" substring-matches "not found", and
+		// DatasetDelete turns IsNotFoundError into `return nil` — so a TrueNAS
+		// method rename would make every dataset delete silently "succeed" while
+		// the dataset lives on and the PV is removed. The protocol codes are
+		// authoritative and must short-circuit before any message matching.
+		if isJSONRPCProtocolError(apiErr.Code) {
+			return false
 		}
 		// Match the human-readable Message only, NOT FullError(): FullError embeds
 		// the whole Data blob via %+v, so a -1 error that merely MENTIONS "not
@@ -94,7 +125,23 @@ func IsAlreadyExistsError(err error) bool {
 		if errno, ok := APIErrno(apiErr); ok {
 			return errno == syscall.EEXIST
 		}
-		return strings.Contains(strings.ToLower(apiErr.FullError()), "already exists")
+		// Match the human-readable Message only, NOT FullError(), for exactly the
+		// reason spelled out on IsNotFoundError above: FullError embeds the whole
+		// Data blob via %+v, so an error that merely MENTIONS "already exists"
+		// about some nested object would be misread as this object's existence.
+		// The sibling carried that fix; this one was missed.
+		//
+		// isJSONRPCProtocolError is deliberately NOT applied here. TrueNAS renders
+		// middleware validation errors as -32602 carrying a MEANINGFUL message —
+		// "snapshot already exists" is live-observed and pinned by
+		// TestSnapshotCreateAlreadyExistsDoesNotDecideTheProbe — and misreading
+		// that as a create FAILURE would break idempotent retries. The asymmetry
+		// with IsNotFoundError is intentional: there, a wrong "absent" verdict is
+		// converted into a silent successful DELETE, so the fail-closed direction
+		// is worth a -32602 that is only ever the uninformative "Invalid params"
+		// on the real appliance (the informative ENOENT case comes through the
+		// structured errno above, which is consulted first).
+		return strings.Contains(strings.ToLower(apiErr.Message), "already exists")
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
@@ -438,9 +485,14 @@ type Client struct {
 	nvmePortMu       sync.Mutex
 	nvmeResolvedPort map[string]*NVMeoFPort
 
-	// Version detection cache
-	versionMu    sync.RWMutex
-	versionCache *SystemInfo
+	// Version detection cache. Dropped on reconnect (invalidateSystemInfo) for
+	// the same reason the timezone cache is: a reconnect may land on a different
+	// HA backend or follow a middleware upgrade, and a stale version gates
+	// feature support (CheckNVMeoFSupport and friends). versionGeneration counts
+	// invalidations so an in-flight read cannot repopulate the cache behind one.
+	versionMu         sync.RWMutex
+	versionCache      *SystemInfo
+	versionGeneration uint64
 
 	// NAS civil-timezone cache (timezone.go). Separate from the version cache:
 	// it carries its own TTL and is dropped on reconnect.
@@ -1124,9 +1176,14 @@ func (c *Connection) handleDisconnect(generation uint64, cause error) {
 	// Drop the cached NAS civil timezone: the reconnect may land on a different
 	// backend (HA failover) or follow a middleware restart that applied a
 	// configuration change, and a stale zone would misclassify every scheduled
-	// snapshot's ownership (GF2-fix2/B1-a).
+	// snapshot's ownership (GF2-fix2/B1-a). The cached system version is dropped
+	// for exactly the same reasons — it is never re-read otherwise, so an HA
+	// failover onto a peer running a different middleware version left this
+	// client gating feature support (NVMe-oF, the snapshot resource API) on the
+	// version of a backend it is no longer talking to.
 	if c.client != nil {
 		c.client.invalidateSystemTimezone()
+		c.client.invalidateSystemInfo()
 	}
 	c.failPending(generation, cause)
 }
@@ -1402,11 +1459,22 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		}()
 	}
 
+	// abandonProbe releases a consumed half-open probe slot without recording an
+	// outcome. Every caller is a CLIENT-SIDE context cancellation, which carries
+	// no information about the NAS; see CircuitBreaker.RecordAbandoned.
+	abandonProbe := func() {
+		if c.circuitBreaker != nil && halfOpenProbe && !breakerOutcomeRecorded {
+			c.circuitBreaker.RecordAbandoned()
+			breakerOutcomeRecorded = true
+		}
+	}
+
 	// Acquire semaphore slot (limit concurrent requests)
 	select {
 	case c.semaphore <- struct{}{}:
 		// Got a slot, continue
 	case <-ctx.Done():
+		abandonProbe()
 		return nil, fmt.Errorf("context canceled while waiting for request slot: %w", ctx.Err())
 	}
 	defer func() { <-c.semaphore }() // Release slot when done
@@ -1502,6 +1570,7 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 			return nil, err
 		}
 		if ctx.Err() != nil {
+			abandonProbe()
 			if c.metricsRecorder != nil {
 				c.metricsRecorder(method, time.Since(start).Seconds(), ctx.Err())
 			}
@@ -1512,9 +1581,18 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		if !IsConnectionError(err) {
 			// Not a connection error - return immediately (API errors, not found, etc.)
 			// An API-level error still proves the transport round-trip worked, so a
-			// half-open probe must count it as breaker success — otherwise a benign
+			// half-open PROBE must count it as breaker success — otherwise a benign
 			// "not found" reply would reopen the circuit on a healthy connection.
-			if c.circuitBreaker != nil {
+			// That reasoning is specific to the probe, and applying it in the CLOSED
+			// state was the bug: RecordSuccess resets cb.failures to 0 there, so a
+			// NAS that is UP but wedged — lock contention answering EBUSY, a flood
+			// of -1 validation errors — reset the counter on every call and the
+			// breaker could never trip for the most common real failure mode. In
+			// the closed state this records NOTHING: the deliberate rule that an
+			// API-level error on a healthy transport is not a transport failure is
+			// preserved (no RecordFailure), it simply no longer erases the genuine
+			// connection failures interleaved with it.
+			if c.circuitBreaker != nil && halfOpenProbe {
 				c.circuitBreaker.RecordSuccess()
 				breakerOutcomeRecorded = true
 			}
@@ -1544,6 +1622,7 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 					default:
 					}
 				}
+				abandonProbe()
 				finalErr := fmt.Errorf("context canceled during retry: %w", ctx.Err())
 				if c.metricsRecorder != nil {
 					c.metricsRecorder(method, time.Since(start).Seconds(), finalErr)
@@ -1761,17 +1840,19 @@ func (c *Client) GetSystemInfo(ctx context.Context) (*SystemInfo, error) {
 		c.versionMu.RUnlock()
 		return cached, nil
 	}
+	// The generation observed BEFORE the call is what makes the store below safe:
+	// the read is unlocked and can take arbitrarily long, so an
+	// invalidateSystemInfo from handleDisconnect can run while it is in flight.
+	generation := c.versionGeneration
 	c.versionMu.RUnlock()
 
-	// Not cached, fetch from API
-	c.versionMu.Lock()
-	defer c.versionMu.Unlock()
-
-	// Double-check after acquiring write lock
-	if c.versionCache != nil {
-		return c.versionCache, nil
-	}
-
+	// Not cached, fetch from API. The write lock is deliberately NOT held across
+	// the call: c.Call retries connection failures with exponential backoff and
+	// can run for minutes at the default budget, and holding versionMu for that
+	// long blocks every other caller's cheap RLock — including the ones that
+	// would have been served instantly from the cache once it landed. The cost
+	// is that a cold burst can issue a few duplicate system.info calls, which is
+	// the same trade SystemTimezone already makes.
 	result, err := c.Call(ctx, "system.info")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get system info: %w", err)
@@ -1782,9 +1863,28 @@ func (c *Client) GetSystemInfo(ctx context.Context) (*SystemInfo, error) {
 		return nil, err
 	}
 
-	// Cache the result
-	c.versionCache = info
+	c.versionMu.Lock()
+	// DISCARD the result if the cache was invalidated while the call was in
+	// flight: this version was read through a connection that no longer exists,
+	// so it may predate an HA failover or a middleware upgrade. The CALLER still
+	// gets it — the read itself succeeded — but it is not cached, so the next
+	// caller re-reads through the new connection. Mirrors SystemTimezone.
+	if c.versionGeneration == generation {
+		c.versionCache = info
+	}
+	c.versionMu.Unlock()
 	return info, nil
+}
+
+// invalidateSystemInfo drops the cached system info. Called from
+// handleDisconnect alongside invalidateSystemTimezone, because a reconnect may
+// be to a different backend (HA failover) or follow a middleware upgrade that
+// changed the version this client gates feature support on.
+func (c *Client) invalidateSystemInfo() {
+	c.versionMu.Lock()
+	c.versionCache = nil
+	c.versionGeneration++
+	c.versionMu.Unlock()
 }
 
 // parseSystemInfo parses the system.info API response.

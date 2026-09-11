@@ -822,7 +822,7 @@ func (d *Driver) runReconcileDeletePhase(ctx context.Context, opts ReconcileOpti
 	// spent, so the per-run cap is one shared budget across every orphan kind
 	// instead of shares policing a second, independent counter that let a pass
 	// destroy up to 2x maxPerRun objects.
-	d.deleteOrphanedShares(ctx, report, deletedCount, d.config.Reconcile.Delete.MaxPerRun)
+	d.deleteOrphanedShares(ctx, report, currentState, deletedCount, d.config.Reconcile.Delete.MaxPerRun)
 	return nil
 }
 

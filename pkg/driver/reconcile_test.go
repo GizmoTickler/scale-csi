@@ -1853,7 +1853,7 @@ func TestOrphanShareSweepDetectsAndDeletesShareWhoseDatasetIsGone(t *testing.T) 
 	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
 	assert.Equal(t, 1, report.OrphanShareCount)
 
-	d.deleteOrphanedShares(ctx, &report, 0, 5)
+	d.deleteOrphanedShares(ctx, &report, kubeState, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
 
@@ -1946,7 +1946,7 @@ func TestOrphanShareSweepDetectsAndDeletesISCSIShareWhoseDatasetIsGone(t *testin
 	assert.Equal(t, ShareTypeISCSI, report.OrphanShares[0].Protocol)
 	assert.Equal(t, 1, report.OrphanShareCount)
 
-	d.deleteOrphanedShares(ctx, &report, 0, 5)
+	d.deleteOrphanedShares(ctx, &report, kubeState, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
 
@@ -2018,7 +2018,7 @@ func TestOrphanShareSweepDetectsAndDeletesNVMeoFShareWhoseDatasetIsGone(t *testi
 	assert.Equal(t, ShareTypeNVMeoF, report.OrphanShares[0].Protocol)
 	assert.Equal(t, 1, report.OrphanShareCount)
 
-	d.deleteOrphanedShares(ctx, &report, 0, 5)
+	d.deleteOrphanedShares(ctx, &report, kubeState, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 	assert.Equal(t, "pool/parent/gone-volume", report.DeletedShares[0])
 

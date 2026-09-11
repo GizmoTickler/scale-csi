@@ -176,3 +176,40 @@ func TestIsConnectionErrorNeverRetriesStructuredAPIErrorsByMessage(t *testing.T)
 		assert.False(t, IsConnectionError(&url.Error{Op: "post", URL: "wss://truenas.example.test", Err: apiErr}))
 	}
 }
+
+// TestIsAlreadyExistsErrorIgnoresAlreadyExistsMentionsInDataBlob is the sibling
+// of TestIsNotFoundErrorIgnoresNotFoundMentionsInDataBlob. IsAlreadyExistsError
+// matched against FullError(), which embeds the whole Data blob via %+v, so a
+// generic -1 whose Data merely MENTIONS another object already existing was
+// reported as THIS object's existence — and callers branch to "adopt the
+// existing object" on that.
+func TestIsAlreadyExistsErrorIgnoresAlreadyExistsMentionsInDataBlob(t *testing.T) {
+	err := &APIError{
+		Code:    -1,
+		Message: "[EFAULT] validation failed",
+		Data: map[string]interface{}{
+			"reason": "the parent portal group already exists on another target",
+		},
+	}
+	assert.False(t, IsAlreadyExistsError(err),
+		"an already-exists mention inside the Data blob is about a nested object, not this one")
+	assert.True(t, IsAlreadyExistsError(&APIError{Code: -1, Message: "iSCSI extent already exists"}),
+		"a real already-exists message on the error itself must still classify")
+}
+
+// TestIsNotFoundErrorRejectsJSONRPCProtocolCodes pins that a JSON-RPC PROTOCOL
+// failure is never read as object absence. -32601 "Method not found"
+// substring-matches "not found", and DatasetDelete converts IsNotFoundError
+// into `return nil`, so a TrueNAS method rename used to make every dataset
+// delete report success while the dataset lived on and the PV was removed.
+func TestIsNotFoundErrorRejectsJSONRPCProtocolCodes(t *testing.T) {
+	for _, code := range []int{-32700, -32600, -32601, -32602} {
+		assert.False(t, IsNotFoundError(&APIError{Code: code, Message: "Method not found"}),
+			"JSON-RPC protocol code %d describes the call, not the object", code)
+	}
+	// The structured errno still wins: TrueNAS reports a genuinely-absent
+	// dataset as -32602 with ENOENT in Data, and that must keep classifying.
+	assert.True(t, IsNotFoundError(&APIError{
+		Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"errno": "ENOENT"},
+	}))
+}

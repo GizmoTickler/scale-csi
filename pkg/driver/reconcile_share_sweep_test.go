@@ -35,7 +35,7 @@ func TestOrphanShareSweepISCSIDeletesFencingInitiatorGroup(t *testing.T) {
 	d.detectOrphanedShares(ctx, kubeState, &report)
 	require.Len(t, report.OrphanShares, 1)
 
-	d.deleteOrphanedShares(ctx, &report, 0, 5)
+	d.deleteOrphanedShares(ctx, &report, kubeState, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 
 	goneTarget, err := client.ISCSITargetFindByName(ctx, d.iscsiShareName("gone-volume"))
@@ -80,7 +80,7 @@ func TestOrphanShareSweepISCSIInitiatorGroupGatedOnFencing(t *testing.T) {
 	d.detectOrphanedShares(ctx, kubeState, &report)
 	require.Len(t, report.OrphanShares, 1)
 
-	d.deleteOrphanedShares(ctx, &report, 0, 5)
+	d.deleteOrphanedShares(ctx, &report, kubeState, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 
 	groupIDs := iscsiInitiatorGroupIDs(t, client)
@@ -135,7 +135,7 @@ func TestOrphanShareSweepNVMeoFDeletesPortSubsystemAssociation(t *testing.T) {
 	require.Len(t, report.OrphanShares, 1)
 	assert.Equal(t, "pool/parent/gone-volume", report.OrphanShares[0].ID)
 
-	d.deleteOrphanedShares(ctx, &report, 0, 5)
+	d.deleteOrphanedShares(ctx, &report, kubeState, 0, 5)
 	require.Len(t, report.DeletedShares, 1)
 
 	assert.Contains(t, mock.associationDeletes, 11, "the orphaned subsystem's port association must be deleted")
@@ -179,7 +179,7 @@ func TestDeleteOrphanedSharesSharesDeletionCapWithOtherOrphanKinds(t *testing.T)
 
 	// deletedCount=2, maxPerRun=2: the budget is already fully spent by other
 	// orphan kinds before deleteOrphanedShares ever runs.
-	d.deleteOrphanedShares(ctx, &report, 2, 2)
+	d.deleteOrphanedShares(ctx, &report, kubeState, 2, 2)
 
 	assert.Empty(t, report.DeletedShares, "the shared per-run cap must block every share once other kinds already spent it")
 	require.Len(t, report.SkippedDeletes, 1)

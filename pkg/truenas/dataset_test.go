@@ -559,7 +559,15 @@ func TestDatasetDelete_NotFound(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestDatasetDelete_InvalidParams tests delete with -32602 error (idempotent)
+// TestDatasetDelete_InvalidParams tests delete with -32602 error (idempotent).
+//
+// The existence probe DatasetDelete runs to disambiguate -32602 is mocked
+// HONESTLY here: pool.dataset.query answers with an empty list, i.e. the
+// dataset really is gone, which is the only state in which the idempotent
+// success this test asserts is correct. It previously fell through to the
+// mock's default -32601 "Method not found" arm and passed only because
+// IsNotFoundError substring-matched that protocol error into "absent" — the
+// probe FAILING was read as the dataset being absent.
 func TestDatasetDelete_InvalidParams(t *testing.T) {
 	mock := newMockWSServer()
 	server := mock.start(func(conn *websocket.Conn) {
@@ -581,6 +589,8 @@ func TestDatasetDelete_InvalidParams(t *testing.T) {
 					Code:    -32602,
 					Message: "Invalid params",
 				}
+			case "pool.dataset.query":
+				resp.Result = []interface{}{}
 			default:
 				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
 			}
@@ -2449,4 +2459,31 @@ func TestValidateDatasetPayloadKeysUpdate(t *testing.T) {
 	// An unknown type (the mock's not-yet-stored arm) validates permissively so
 	// the not-found error still owns that ordering.
 	require.NoError(t, validateDatasetPayloadKeys(&DatasetUpdateParams{Refquota: int64(1 << 30)}, datasetUpdateKeyScopes, ""))
+}
+
+// TestDatasetDeleteFailsClosedOnMethodNotFound is the data-loss regression for
+// the JSON-RPC protocol-code hole in IsNotFoundError. DatasetDelete converts a
+// "not found" classification into `return nil`, and DeleteVolume reads that nil
+// as "the dataset is gone" and releases the PV. Because -32601's canonical
+// message is literally "Method not found", a TrueNAS method rename (exactly the
+// kind this codebase already absorbs for snapshot and service verbs) made every
+// delete silently succeed while the dataset — and the user's data — lived on.
+//
+// The mock answers every unregistered method with -32601, so registering no
+// pool.dataset.delete handler reproduces the rename precisely.
+func TestDatasetDeleteFailsClosedOnMethodNotFound(t *testing.T) {
+	existsCalls := 0
+	client := gf5TestClient(t, map[string]func(rpcTestRequest) (interface{}, *rpcError){
+		"pool.dataset.query": func(rpcTestRequest) (interface{}, *rpcError) {
+			existsCalls++
+			// The dataset is very much still there.
+			return []interface{}{map[string]interface{}{"id": "tank/k8s/pvc-1", "name": "tank/k8s/pvc-1"}}, nil
+		},
+	})
+
+	err := client.DatasetDelete(context.Background(), "tank/k8s/pvc-1", false, false)
+	require.Error(t, err, "a renamed pool.dataset.delete must never be reported as a successful delete")
+	assert.Contains(t, err.Error(), "failed to delete dataset")
+	assert.Contains(t, err.Error(), "-32601")
+	assert.Equal(t, 0, existsCalls, "a protocol error must not be disambiguated through the -32602 existence probe")
 }

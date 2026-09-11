@@ -146,6 +146,21 @@ func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 			cb.halfOpenRequests++
 			return circuitBreakerAdmission{allowed: true, halfOpenProbe: true}
 		}
+		// ESCAPE TIMER. With every probe slot consumed, ONLY a recorded outcome
+		// can move the state — so a probe that never reports one (a goroutine
+		// wedged below the breaker, a panic unwinding past the recorder, a caller
+		// that leaks the admission) strands the breaker in half-open forever,
+		// rejecting every request while the NAS may have been healthy for hours.
+		// That is a worse outage than the one the breaker exists to contain,
+		// because nothing outside this type can clear it. After a full Timeout
+		// with no verdict, fall back to Open and restart the recovery clock: the
+		// normal Open -> half-open transition above then issues a fresh probe one
+		// Timeout later, so the breaker always keeps retrying.
+		if time.Since(cb.lastStateChange) >= cb.config.Timeout {
+			klog.V(2).Infof("Circuit breaker half-open probes produced no verdict within %s; reopening to restart the recovery clock", cb.config.Timeout)
+			cb.lastFailure = time.Now()
+			cb.transitionTo(CircuitOpen)
+		}
 		return circuitBreakerAdmission{}
 	}
 
@@ -179,6 +194,29 @@ func (cb *CircuitBreaker) RecordSuccess() {
 		// Calls are rejected before they run while open (see AllowRequest);
 		// a success here would be spurious. Only the half-open timeout
 		// transitions out of Open.
+	}
+}
+
+// RecordAbandoned releases a half-open probe slot WITHOUT recording an outcome.
+//
+// It exists for client-side context cancellation, which says nothing about the
+// NAS: the caller walked away before the appliance was given a chance to answer.
+// In the closed state such a cancellation has always been recorded as neither
+// success nor failure; the half-open state used to record it as a FAILURE
+// (through callRaw's unrecorded-probe backstop), so a burst of CSI RPC
+// deadlines could reopen a circuit whose appliance was perfectly healthy and
+// keep it reopening. This restores the symmetry while still returning the probe
+// slot, so the NEXT caller can take the measurement this one abandoned.
+func (cb *CircuitBreaker) RecordAbandoned() {
+	if !cb.config.Enabled {
+		return
+	}
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.state == CircuitHalfOpen && cb.halfOpenRequests > 0 {
+		cb.halfOpenRequests--
 	}
 }
 

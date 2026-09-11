@@ -725,6 +725,20 @@ var (
 		[]string{"kind"},
 	)
 
+	// The pre-delete busy check is observation-only and never gates the delete,
+	// so a probe that cannot answer is not an outage — but it IS a blind spot,
+	// and it used to be completely invisible: the error logged at V(2) (silent
+	// at default verbosity) and no metric moved at all, so "the query failed"
+	// and "nothing was busy" looked identical in both logs and metrics.
+	datasetBusyObservationErrorsTotal = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "dataset_busy_observation_errors_total",
+			Help:      "Total best-effort pre-delete dataset busy checks that failed to produce an answer",
+		},
+		[]string{"kind"},
+	)
+
 	// Circuit breaker metrics
 	circuitBreakerState = regGauge(
 		prometheus.GaugeOpts{
@@ -1286,10 +1300,20 @@ func RecordDeleteVolumeOrphanCleanupFailure(protocol string) {
 	deleteVolumeOrphanCleanupFailuresTotal.WithLabelValues(protocol).Inc()
 }
 
+// RecordDatasetBusyObservations records the result of a SUCCESSFUL busy probe.
+// The count > 0 guard is deliberately absent: a zero Add still materializes the
+// series, which is the only thing that distinguishes "the probe ran and nothing
+// was busy" from "the probe never produced an answer" (the latter now shows up
+// as datasetBusyObservationErrorsTotal). With the guard, a probe that failed on
+// every single delete was indistinguishable from a perfectly quiet fleet — in
+// both cases the counter simply did not exist.
 func RecordDatasetBusyObservations(kind string, count int) {
-	if count > 0 {
-		datasetBusyObservationsTotal.WithLabelValues(kind).Add(float64(count))
-	}
+	datasetBusyObservationsTotal.WithLabelValues(kind).Add(float64(count))
+}
+
+// RecordDatasetBusyObservationError records a busy probe that failed to answer.
+func RecordDatasetBusyObservationError(kind string) {
+	datasetBusyObservationErrorsTotal.WithLabelValues(kind).Inc()
 }
 
 // Circuit breaker metrics tracking
