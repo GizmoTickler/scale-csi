@@ -264,11 +264,23 @@ func (c *Client) snapshotCreateThenSetProperties(
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if _, err := c.Call(ctx, prefix+".update", snap.ID, map[string]interface{}{
-			"user_properties_update": []map[string]interface{}{{"key": key, "value": userProperties[key]}},
-		}); err != nil {
+		// Route through SnapshotSetUserProperty instead of calling
+		// prefix+".update" directly: it carries the same TrueNAS 26.0
+		// detection SnapshotSetUserProperty documents (pool.snapshot.update
+		// acknowledges the request while silently dropping it on 26.0). A
+		// direct call here would have returned "success" while stamping
+		// snap.UserProperties with a property that never actually landed on
+		// disk -- invisible to every ownership, orphan and tombstone
+		// predicate that later trusts the stamp. On 26.0 (or when the API
+		// generation cannot be determined), this now returns a loud error
+		// instead of pretending.
+		if err := c.SnapshotSetUserProperty(ctx, snap.ID, key, userProperties[key]); err != nil {
 			return nil, fmt.Errorf("failed to set snapshot property %q after create: %w", key, err)
 		}
+		// Only reached on a CONFIRMED legacy (pre-26.0) backend, where
+		// pool.snapshot.update is known to actually persist -- see
+		// SnapshotSetUserProperty. Source: "local" is therefore verified,
+		// not fabricated.
 		if snap.UserProperties == nil {
 			snap.UserProperties = make(map[string]UserProperty)
 		}
@@ -277,13 +289,22 @@ func (c *Client) snapshotCreateThenSetProperties(
 	return snap, nil
 }
 
+// isSnapshotCreatePropertiesValidationError reports whether err is a genuine
+// snapshot-create properties validation failure, as opposed to some other
+// failure TrueNAS happened to report through the same channel.
+//
+// A bare JSON-RPC code -32602 is NOT sufficient evidence by itself: TrueNAS
+// 26.0 collapses many unrelated failures -- including already-exists -- onto
+// this same "-32602 Invalid params" response (see client.go:1690,
+// dataset.go:672-678, iscsi.go:117). The caller latches whatever this
+// function returns into a per-prefix cache for the process lifetime with no
+// re-probe (see the snapshotCreatePropertiesSupport cache above), so a false
+// positive here permanently and silently disables inline property stamping
+// for every future snapshot create through that prefix. Only latch when the
+// message text itself names a property problem.
 func isSnapshotCreatePropertiesValidationError(err error) bool {
 	if err == nil {
 		return false
-	}
-	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.Code == -32602 {
-		return true
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "propert") &&

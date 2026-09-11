@@ -428,7 +428,13 @@ func TestSnapshotCreatePropertiesValidationFallbackIsCachedOnLegacyBackend(t *te
 				params := req.Params[0].(map[string]interface{})
 				if _, ok := params["properties"]; ok {
 					createCallsWithProperties.Add(1)
-					resp.Error = &rpcError{Code: -32602, Message: "Invalid params"}
+					// The message must name a property problem: a bare -32602
+					// alone is no longer sufficient to latch the
+					// "properties unsupported" cache (see
+					// isSnapshotCreatePropertiesValidationError), since
+					// TrueNAS 26.0 collapses unrelated failures onto the
+					// same code.
+					resp.Error = &rpcError{Code: -32602, Message: "Invalid params: properties are not a valid create argument"}
 					break
 				}
 				name := params["name"].(string)
@@ -457,6 +463,120 @@ func TestSnapshotCreatePropertiesValidationFallbackIsCachedOnLegacyBackend(t *te
 	assert.Equal(t, int32(3), createCalls.Load(), "only the first call probes the properties payload")
 	assert.Equal(t, int32(1), createCallsWithProperties.Load())
 	assert.Equal(t, int32(4), updateCalls.Load())
+}
+
+// TestSnapshotCreateBarePropertiesErrorDoesNotLatchUnsupportedCache is the N5
+// regression for isSnapshotCreatePropertiesValidationError: TrueNAS 26.0
+// collapses many unrelated failures -- including already-exists -- onto a
+// bare "-32602 Invalid params" with no property-specific message. Pre-fix,
+// ANY APIError with code -32602 latched the per-prefix
+// "properties unsupported" cache for the process lifetime with no re-probe,
+// so one unrelated -32602 permanently disabled inline property stamping for
+// every future create through that prefix. A bare -32602 must now propagate
+// as a normal error instead.
+func TestSnapshotCreateBarePropertiesErrorDoesNotLatchUnsupportedCache(t *testing.T) {
+	mock := newMockWSServer()
+	var createWithPropertiesCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case "pool.snapshot.create":
+				params := req.Params[0].(map[string]interface{})
+				if _, ok := params["properties"]; ok {
+					createWithPropertiesCalls.Add(1)
+					// Bare -32602, no "propert" anywhere in the message --
+					// exactly the shape TrueNAS 26.0 also uses for unrelated
+					// failures like already-exists.
+					resp.Error = &rpcError{Code: -32602, Message: "Invalid params"}
+					break
+				}
+				resp.Result = map[string]interface{}{"id": "tank/csi/source@x", "name": "x", "dataset": "tank/csi/source"}
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+	properties := map[string]string{"truenas-csi:a": "a"}
+
+	_, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "first", properties)
+	require.Error(t, err, "a bare -32602 with no property signature must propagate, not be swallowed as an unsupported-properties fallback")
+	assert.Contains(t, err.Error(), "-32602")
+
+	_, err = client.SnapshotCreate(context.Background(), "tank/csi/source", "second", properties)
+	require.Error(t, err)
+	assert.Equal(t, int32(2), createWithPropertiesCalls.Load(),
+		"the unsupported-properties verdict must never latch from a bare -32602, so every call keeps probing with properties")
+}
+
+// TestSnapshotCreateThenSetPropertiesRefusesOnTrueNAS26 is the N5 regression
+// for snapshotCreateThenSetProperties: it used to call prefix+".update"
+// directly, bypassing the TrueNAS 26.0 detection SnapshotSetUserProperty
+// documents (pool.snapshot.update acknowledges the request while silently
+// dropping it on 26.0). That let a create-with-properties fallback return
+// success with UserProperties stamped Source: "local" even though nothing
+// was ever written -- invisible to every ownership/orphan/tombstone
+// predicate that later trusts the stamp. It must now refuse loudly instead.
+func TestSnapshotCreateThenSetPropertiesRefusesOnTrueNAS26(t *testing.T) {
+	mock := newMockWSServer()
+	var updateCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case snapshotResourceQueryMethod:
+				resp.Result = []interface{}{} // 26.0: resource API is present
+			case "pool.snapshot.create":
+				params := req.Params[0].(map[string]interface{})
+				if _, ok := params["properties"]; ok {
+					// Property-specific signature: this call is meant to
+					// exercise the fallback, not the bare-code classifier
+					// covered by the sibling test above.
+					resp.Error = &rpcError{Code: -32602, Message: "Invalid params: properties are not a valid create argument"}
+					break
+				}
+				resp.Result = map[string]interface{}{"id": "tank/csi/source@snap1", "name": "snap1", "dataset": "tank/csi/source"}
+			case "pool.snapshot.update", "zfs.resource.snapshot.update":
+				updateCalls.Add(1)
+				resp.Result = true
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+	properties := map[string]string{"truenas-csi:a": "a"}
+
+	snap, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "snap1", properties)
+	require.Error(t, err, "26.0 has no working mutation path for existing-snapshot properties; the fallback must refuse rather than pretend the stamp landed")
+	assert.Nil(t, snap)
+	assert.Contains(t, err.Error(), "unsupported")
+	assert.Zero(t, updateCalls.Load(), "must never call the silently-dropping pool.snapshot.update on 26.0")
 }
 
 // TestSnapshotDelete_Success tests deleting a snapshot
