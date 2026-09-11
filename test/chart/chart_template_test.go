@@ -134,7 +134,7 @@ func equalStrings(a, b []string) bool {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		if a[i] != b[i] { //nolint:gosec // len(a)==len(b) is already checked above, so i is always in range for b too; gosec's static check doesn't see that dataflow
 			return false
 		}
 	}

@@ -452,7 +452,7 @@ func cmdTestErrors(ctx context.Context, client *truenas.Client) {
 		err     error
 		errCode int
 		errMsg  string
-	}, 0)
+	}, 0, len(tests))
 
 	for _, test := range tests {
 		fmt.Printf("Testing: %s\n", test.name)

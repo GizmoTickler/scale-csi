@@ -651,9 +651,9 @@ func (m *MockClient) ReplicationJobList(ctx context.Context) ([]*ReplicationJob,
 		if job == nil || job.Method != ReplicationRunOnetimeMethod || !isActiveReplicationJobState(job.State) {
 			continue
 		}
-		copy := *job
-		copy.SourceDatasets = append([]string(nil), job.SourceDatasets...)
-		jobs = append(jobs, &copy)
+		jobCopy := *job
+		jobCopy.SourceDatasets = append([]string(nil), job.SourceDatasets...)
+		jobs = append(jobs, &jobCopy)
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].ID < jobs[j].ID })
 	return jobs, nil
@@ -681,9 +681,9 @@ func (m *MockClient) AddReplicationJob(job *ReplicationJob) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	copy := *job
-	copy.SourceDatasets = append([]string(nil), job.SourceDatasets...)
-	m.ReplicationJobs[job.ID] = &copy
+	jobCopy := *job
+	jobCopy.SourceDatasets = append([]string(nil), job.SourceDatasets...)
+	m.ReplicationJobs[job.ID] = &jobCopy
 	if job.ID >= m.nextReplicationJobID {
 		m.nextReplicationJobID = job.ID + 1
 	}
@@ -2304,7 +2304,7 @@ func (m *MockClient) CopyDatasetFromSnapshotLocal(
 	for key, value := range source.UserProperties {
 		properties[key] = value
 	}
-	copy := &Dataset{
+	dsCopy := &Dataset{
 		ID:             targetDataset,
 		Name:           targetDataset,
 		Pool:           source.Pool,
@@ -2320,16 +2320,16 @@ func (m *MockClient) CopyDatasetFromSnapshotLocal(
 		Volblocksize:   source.Volblocksize,
 		UserProperties: properties,
 	}
-	if copy.Type != "VOLUME" {
-		copy.Mountpoint = "/mnt/" + strings.TrimPrefix(targetDataset, "/")
+	if dsCopy.Type != "VOLUME" {
+		dsCopy.Mountpoint = "/mnt/" + strings.TrimPrefix(targetDataset, "/")
 	}
 	// A received dataset takes the destination parent's encryption, exactly like
 	// any other create under that parent (P-10 inheritance). Whether a send from
 	// an ENCRYPTED source is raw (an encrypted, independently-rooted target) or
 	// plain is UNPROBED as of 2026-08-02 — drill step 6b settles it — so the mock
 	// deliberately models only the inheritance half, which is probed.
-	m.applyInheritedEncryptionLocked(copy)
-	m.Datasets[targetDataset] = copy
+	m.applyInheritedEncryptionLocked(dsCopy)
+	m.Datasets[targetDataset] = dsCopy
 	m.ReplicationJobs[jobID] = &ReplicationJob{
 		ID:             jobID,
 		Method:         ReplicationRunOnetimeMethod,
@@ -2416,7 +2416,7 @@ func (m *MockClient) NFSShareList(ctx context.Context) ([]*NFSShare, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var list []*NFSShare
+	list := make([]*NFSShare, 0, len(m.NFSShares))
 	for _, share := range m.NFSShares {
 		list = append(list, share)
 	}
@@ -2605,7 +2605,7 @@ func (m *MockClient) ISCSITargetList(ctx context.Context) ([]*ISCSITarget, error
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var list []*ISCSITarget
+	list := make([]*ISCSITarget, 0, len(m.ISCSITargets))
 	for _, t := range m.ISCSITargets {
 		list = append(list, t)
 	}
@@ -2692,7 +2692,7 @@ func (m *MockClient) ISCSIExtentList(ctx context.Context) ([]*ISCSIExtent, error
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var list []*ISCSIExtent
+	list := make([]*ISCSIExtent, 0, len(m.ISCSIExtents))
 	for _, e := range m.ISCSIExtents {
 		list = append(list, e)
 	}
@@ -2858,11 +2858,11 @@ func (m *MockClient) NVMeoFHostSubsysListBySubsystem(ctx context.Context, subsys
 	associations := make([]*NVMeoFHostSubsys, 0)
 	for _, association := range m.NVMeHostSubsystems {
 		if association.SubsysID == subsysID {
-			copy := *association
+			associationCopy := *association
 			if m.EmptyNVMeHostNQN {
-				copy.HostNQN = ""
+				associationCopy.HostNQN = ""
 			}
-			associations = append(associations, &copy)
+			associations = append(associations, &associationCopy)
 		}
 	}
 	return associations, nil
@@ -3096,7 +3096,7 @@ func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsyste
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var list []*NVMeoFSubsystem
+	list := make([]*NVMeoFSubsystem, 0, len(m.NVMeSubsystems))
 	for _, s := range m.NVMeSubsystems {
 		list = append(list, s)
 	}
@@ -3105,7 +3105,7 @@ func (m *MockClient) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsyste
 func (m *MockClient) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {
 	return &NVMeoFPort{ID: 1, Transport: "TCP", Address: address, Port: port}, nil
 }
-func (m *MockClient) InvalidateNVMeoFPort(transport, address string, port int) {}
+func (m *MockClient) InvalidateNVMeoFPort(ctx context.Context, transport, address string, port int) {}
 func (m *MockClient) NVMeoFGetTransportAddresses(ctx context.Context, transport string) ([]string, error) {
 	return []string{"0.0.0.0"}, nil
 }

@@ -863,7 +863,7 @@ func scheduledSnapshotSchemaBinding(
 		return "", false
 	}
 
-	schema := ""
+	var schema string
 	if opts.requireLocalSource {
 		schema = datasetLocalUserProperty(dataset, PropSnapshotNamingSchema)
 	} else {

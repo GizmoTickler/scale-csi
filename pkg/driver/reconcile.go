@@ -505,7 +505,7 @@ func (d *Driver) classifyOrphanVolumes(ctx context.Context, now time.Time, datas
 	// batched round trips instead of one DatasetGet each.
 	candidates := make([]*truenas.Dataset, 0)
 	for _, ds := range datasets {
-		if ds == nil || ds.UserProperties[PropManagedResource].Value != "true" {
+		if ds == nil || ds.UserProperties[PropManagedResource].Value != "true" { //nolint:gocritic // coarse first-pass count only ('candidates are gathered first' per the preceding comment); the authoritative local-source check is datasetHasLocalUserProperty below
 			continue
 		}
 		managedBackendVolumeCount++
@@ -585,7 +585,7 @@ func (d *Driver) classifyOrphanVolumes(ctx context.Context, now time.Time, datas
 		}
 		volumeID := path.Base(ds.Name)
 		createdAt, age, _ := reconcileAge(now, ds.GetCreationTime(), minOrphanAge)
-		pvName := ds.UserProperties[PropCSIVolumeName].Value
+		pvName := ds.UserProperties[PropCSIVolumeName].Value //nolint:gocritic // display-only fallback name for the reconcile report, not an identity or deletion decision
 		if pvName == "" || pvName == "-" {
 			pvName = volumeID
 		}
@@ -631,14 +631,14 @@ func (d *Driver) classifyOrphanSnapshots(now time.Time, snapshots []*truenas.Sna
 			}
 			continue
 		}
-		sourceVolumeID := snap.UserProperties[PropCSISnapshotSourceVolumeID].Value
+		sourceVolumeID := snap.UserProperties[PropCSISnapshotSourceVolumeID].Value //nolint:gocritic // listSnapshots response field, informational; deletion/identity decisions go through isCSISnapshot/snapshotCarries* helpers
 		if sourceVolumeID == "" || sourceVolumeID == "-" {
 			sourceVolumeID = path.Base(snap.Dataset)
 		}
 		item := ReconcileObject{
 			ID:             snapshotHandle,
 			BackendID:      snap.ID,
-			KubernetesName: snap.UserProperties[PropCSISnapshotName].Value,
+			KubernetesName: snap.UserProperties[PropCSISnapshotName].Value, //nolint:gocritic // listSnapshots response field, informational; deletion/identity decisions go through isCSISnapshot/snapshotCarries* helpers
 			SourceVolumeID: sourceVolumeID,
 			CreatedAt:      createdAt,
 			Age:            age,
@@ -854,7 +854,7 @@ func reconcileSnapshotHandle(snapshot *truenas.Snapshot) (string, bool) {
 	}
 	// Same identity-beats-inheritance validation as snapshotCSIHandle: a stamp
 	// is only THIS snapshot's handle if its short-name component names it.
-	if property, ok := snapshot.UserProperties[PropCSISnapshotHandle]; ok {
+	if property, ok := snapshot.UserProperties[PropCSISnapshotHandle]; ok { //nolint:gocritic // existence check only; the value itself is not trusted for identity here
 		if _, stampedShort, valid := parseQualifiedSnapshotHandle(property.Value); valid && stampedShort == shortName {
 			return property.Value, true
 		}
@@ -1375,7 +1375,7 @@ func datasetHasUserProperty(dataset *truenas.Dataset, key string) bool {
 	if dataset == nil {
 		return false
 	}
-	_, present := dataset.UserProperties[key]
+	_, present := dataset.UserProperties[key] //nolint:gocritic // presence-only helper (datasetHasUserProperty); callers only use it for ledger-key presence, not value trust
 	return present
 }
 
@@ -1416,7 +1416,7 @@ func (d *Driver) revalidateOrphanVolume(
 	if err != nil {
 		return false, fmt.Sprintf("backend volume revalidation failed: %v", err)
 	}
-	if dataset == nil || dataset.UserProperties[PropManagedResource].Value != "true" {
+	if dataset == nil || dataset.UserProperties[PropManagedResource].Value != "true" { //nolint:gocritic // coarse pre-filter that can only ever DENY (raw!="true" => false); the authoritative local-source check is datasetHasLocalUserProperty immediately below
 		return false, "backend volume is no longer CSI-managed"
 	}
 	// A dataset that only inherits managed_resource (source != "local") was never
@@ -1458,7 +1458,7 @@ func (d *Driver) revalidateOrphanSnapshot(
 // below the 32 KiB request budget, leaving fixed headroom for the JSON-RPC
 // envelope and query options. Dataset names are bounded by ZFS, so a single
 // entry cannot consume the budget by itself.
-func chunkDatasetNames(names []string, budget int) [][]string {
+func chunkDatasetNames(names []string, budget int) [][]string { //nolint:unparam // budget is kept as a parameter (not the datasetGetByNamesBatchBudget constant baked in) so the chunking boundary logic itself stays independently testable
 	if len(names) == 0 || budget <= datasetGetByNamesEnvelopeHeadroom {
 		return nil
 	}

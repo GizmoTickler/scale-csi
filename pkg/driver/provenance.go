@@ -698,7 +698,7 @@ func (d *Driver) migrateParentBookkeeping(ctx context.Context, parent *truenas.D
 	pending := make(map[string]string, len(toCopy))
 	for key, value := range toCopy {
 		if bookkeeping != nil {
-			if property, ok := bookkeeping.UserProperties[key]; ok &&
+			if property, ok := bookkeeping.UserProperties[key]; ok && //nolint:gocritic // dedup check only skips a redundant write when source is ALSO local (isLocalUserPropertySource) and the value already matches; cannot be fooled by an inherited value
 				isLocalUserPropertySource(property.Source) && property.Value == value {
 				continue
 			}
@@ -997,7 +997,7 @@ const bookkeepingMigrationBatchBudget = 32 * 1024
 // batches whose approximate encoded size stays within budget. A single
 // oversized entry still gets its own batch — the caller surfaces the backend
 // error rather than silently dropping the entry.
-func chunkUserProperties(properties map[string]string, budget int) []map[string]string {
+func chunkUserProperties(properties map[string]string, budget int) []map[string]string { //nolint:unparam // budget is kept as a parameter (not the bookkeepingMigrationBatchBudget constant baked in) so the chunking boundary logic itself stays independently testable
 	if len(properties) == 0 {
 		return nil
 	}

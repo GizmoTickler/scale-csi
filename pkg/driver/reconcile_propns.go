@@ -105,7 +105,7 @@ func (d *Driver) migrateDatasetPropertyNamespace(ctx context.Context, datasetNam
 		// spellings (local beats inherited, canonical beats legacy on ties), so
 		// writing that winner canonically is idempotent whether or not the
 		// canonical key was already on disk.
-		winner, ok := fresh.UserProperties[canonicalKey]
+		winner, ok := fresh.UserProperties[canonicalKey] //nolint:gocritic // reads back the value normalizeCSIUserProperties already resolved as the source-aware winner (see the preceding comment)
 		if !ok || winner.Value == "" {
 			continue
 		}

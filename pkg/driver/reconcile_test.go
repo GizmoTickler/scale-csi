@@ -1519,7 +1519,7 @@ func TestStopOrphanReconcileBeforeStartPreventsLoopFromEverRunning(t *testing.T)
 		SourceDatasets: []string{"pool/parent/source"}, TargetDataset: "pool/parent/target",
 	})
 
-	// Stop BEFORE Start ever runs — the observable analogue of a Stop() that
+	// Stop BEFORE Start ever runs — the observable analog of a Stop() that
 	// wins the race against reconcileCancel's assignment.
 	d.stopOrphanReconcile()
 	d.startOrphanReconcile()

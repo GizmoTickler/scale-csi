@@ -56,15 +56,14 @@ case "$name" in
 esac
 `
 
-func installFakeMountCommands(t *testing.T, commands ...string) string {
+func installFakeMountCommands(t *testing.T, commands ...string) {
 	t.Helper()
 	binDir := t.TempDir()
 	for _, command := range commands {
 		path := filepath.Join(binDir, command)
-		require.NoError(t, os.WriteFile(path, []byte(fakeMountCommandScript), 0o750))
+		require.NoError(t, os.WriteFile(path, []byte(fakeMountCommandScript), 0o750)) //nolint:gosec // must be executable to stand in as a fake mount command this test execs
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	return binDir
 }
 
 func readCommandLog(t *testing.T, path string) string {
@@ -322,7 +321,8 @@ func TestParseProcMountsPreservesNFSRemnantOnMalformedEntry(t *testing.T) {
 
 // buildBindMountArgs replicates the argument building logic from BindMount() for testing.
 func buildBindMountArgs(source, target string, options []string) []string {
-	mountOptions := []string{"bind"}
+	mountOptions := make([]string, 0, 1+len(options))
+	mountOptions = append(mountOptions, "bind")
 	mountOptions = append(mountOptions, options...)
 	optStr := ""
 	for i, opt := range mountOptions {
@@ -331,8 +331,8 @@ func buildBindMountArgs(source, target string, options []string) []string {
 		}
 		optStr += opt
 	}
-	args := []string{"-o", optStr}
-	args = append(args, source, target)
+	args := make([]string, 0, 4)
+	args = append(args, "-o", optStr, source, target)
 	return args
 }
 

@@ -15,38 +15,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func readTypedFixture(t testing.TB, name string) []byte {
-	t.Helper()
+func readTypedFixture(tb testing.TB, name string) []byte {
+	tb.Helper()
 	payload, err := os.ReadFile("testdata/" + name)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	return payload
 }
 
-func interfaceSnapshots(t testing.TB, payload []byte, resourceQuery bool) []*Snapshot {
-	t.Helper()
+func interfaceSnapshots(tb testing.TB, payload []byte, resourceQuery bool) []*Snapshot {
+	tb.Helper()
 	var items []interface{}
-	require.NoError(t, json.Unmarshal(payload, &items))
+	require.NoError(tb, json.Unmarshal(payload, &items))
 	snapshots := make([]*Snapshot, 0, len(items))
 	for _, item := range items {
 		snapshot, err := parseSnapshot(item)
-		require.NoError(t, err)
+		require.NoError(tb, err)
 		snapshot.ResourceQuery = resourceQuery
 		snapshots = append(snapshots, snapshot)
 	}
 	return snapshots
 }
 
-func typedSnapshots(t testing.TB, payload []byte, resourceQuery bool) []*Snapshot {
-	t.Helper()
+func typedSnapshots(tb testing.TB, payload []byte, resourceQuery bool) []*Snapshot {
+	tb.Helper()
 	var items []*rawSnapshot
-	require.NoError(t, json.Unmarshal(payload, &items))
+	require.NoError(tb, json.Unmarshal(payload, &items))
 	return rawSnapshotsToSnapshots(items, resourceQuery)
 }
 
-func interfaceDatasets(t testing.TB, payload []byte, resourceQuery bool) []*Dataset {
-	t.Helper()
+func interfaceDatasets(tb testing.TB, payload []byte, resourceQuery bool) []*Dataset {
+	tb.Helper()
 	var items []interface{}
-	require.NoError(t, json.Unmarshal(payload, &items))
+	require.NoError(tb, json.Unmarshal(payload, &items))
 	datasets := make([]*Dataset, 0, len(items))
 	for _, item := range items {
 		var (
@@ -61,16 +61,16 @@ func interfaceDatasets(t testing.TB, payload []byte, resourceQuery bool) []*Data
 		} else {
 			dataset, err = parseDataset(item)
 		}
-		require.NoError(t, err)
+		require.NoError(tb, err)
 		datasets = append(datasets, dataset)
 	}
 	return datasets
 }
 
-func typedDatasets(t testing.TB, payload []byte, resourceQuery bool) []*Dataset {
-	t.Helper()
+func typedDatasets(tb testing.TB, payload []byte, resourceQuery bool) []*Dataset {
+	tb.Helper()
 	var items []*rawDataset
-	require.NoError(t, json.Unmarshal(payload, &items))
+	require.NoError(tb, json.Unmarshal(payload, &items))
 	return rawDatasetsToDatasets(items, resourceQuery)
 }
 
@@ -385,16 +385,16 @@ var (
 	benchmarkDatasets  []*Dataset
 )
 
-func repeatJSONArray(t testing.TB, payload []byte, copies int) []byte {
-	t.Helper()
+func repeatJSONArray(tb testing.TB, payload []byte, copies int) []byte {
+	tb.Helper()
 	var items []json.RawMessage
-	require.NoError(t, json.Unmarshal(payload, &items))
+	require.NoError(tb, json.Unmarshal(payload, &items))
 	repeated := make([]json.RawMessage, 0, len(items)*copies)
 	for range copies {
 		repeated = append(repeated, items...)
 	}
 	result, err := json.Marshal(repeated)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	return result
 }
 

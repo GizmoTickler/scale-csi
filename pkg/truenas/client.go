@@ -642,7 +642,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 			defer wg.Done()
 			// Stagger connections: add 50-150ms jitter per connection to avoid thundering herd
 			if idx > 0 {
-				jitter := time.Duration(50+rand.Intn(100)) * time.Millisecond
+				jitter := time.Duration(50+rand.Intn(100)) * time.Millisecond //nolint:gosec // connection-stagger jitter timing, not security-sensitive
 				time.Sleep(time.Duration(idx) * jitter)
 			}
 			if err := c.connect(context.Background()); err != nil {
@@ -706,6 +706,9 @@ func (c *Connection) connect(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			}
+		case stateDisconnected:
+			// Falls through to the connect attempt below, which is the point
+			// of this whole loop iteration.
 		}
 
 		atomic.StoreInt32(&c.connState, int32(stateConnecting))
@@ -795,7 +798,13 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 
 		klog.V(2).Infof("Conn %d: Connecting to %s (attempt %d)", c.id, wsURL, attempt+1)
 
-		wsConn, _, err := dialer.DialContext(ctx, wsURL, headers)
+		wsConn, httpResp, err := dialer.DialContext(ctx, wsURL, headers)
+		if httpResp != nil {
+			// gorilla/websocket hands back the handshake HTTP response on both
+			// success and failure (e.g. a non-101 status on a rejected upgrade);
+			// its Body is not closed by the library and must be drained here.
+			_ = httpResp.Body.Close()
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -838,8 +847,12 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 		c.mu.Unlock()
 		atomic.StoreInt64(&c.lastPong, time.Now().Unix())
 
-		go c.subscribeJobs(handles.generation, handles.heartbeatDone, handles.waitGroup)
-		go c.heartbeatLoop(handles.generation, handles.heartbeatDone, handles.waitGroup)
+		// These two goroutines are deliberately detached from connectLoop's ctx:
+		// they run for the WHOLE connection's lifetime (until handles.heartbeatDone
+		// fires on generation change/shutdown), which almost always outlives
+		// whichever caller's context happened to trigger this connect attempt.
+		go c.subscribeJobs(handles.generation, handles.heartbeatDone, handles.waitGroup) //nolint:gosec,contextcheck // see comment above
+		go c.heartbeatLoop(handles.generation, handles.heartbeatDone, handles.waitGroup) //nolint:gosec,contextcheck // see comment above
 
 		klog.Infof("Conn %d: Connected and authenticated", c.id)
 		return nil
@@ -851,7 +864,7 @@ func (c *Connection) connectWithRetry(ctx context.Context) error {
 func buildTLSConfig(cfg *ClientConfig) (*tls.Config, error) {
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 	if cfg.AllowInsecure {
-		tlsConfig.InsecureSkipVerify = true //nolint:gosec // Explicit operator opt-out, warned once at connect.
+		tlsConfig.InsecureSkipVerify = true // Explicit operator opt-out, warned once at connect.
 		return tlsConfig, nil
 	}
 

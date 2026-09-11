@@ -174,6 +174,11 @@ func (cb *CircuitBreaker) RecordSuccess() {
 			// Enough successes - close the circuit
 			cb.transitionTo(CircuitClosed)
 		}
+
+	case CircuitOpen:
+		// Calls are rejected before they run while open (see AllowRequest);
+		// a success here would be spurious. Only the half-open timeout
+		// transitions out of Open.
 	}
 }
 
@@ -200,6 +205,10 @@ func (cb *CircuitBreaker) RecordFailure() {
 	case CircuitHalfOpen:
 		// Any failure in half-open reopens the circuit
 		cb.transitionTo(CircuitOpen)
+
+	case CircuitOpen:
+		// Calls are rejected before they run while open (see AllowRequest);
+		// a failure here would be spurious.
 	}
 }
 

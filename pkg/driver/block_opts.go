@@ -995,7 +995,7 @@ func snapshotGeometry(snap *truenas.Snapshot) blockGeometry {
 		return g
 	}
 	read := func(key string) string {
-		prop, ok := snap.UserProperties[key]
+		prop, ok := snap.UserProperties[key] //nolint:gocritic // snapshot-only geometry read: a ZFS snapshot property set is captured verbatim at snapshot time and is never itself a clone target, so there is no inheritance-spoofing vector here (see snapshotGeometry's doc comment)
 		if !ok {
 			return ""
 		}
@@ -1139,7 +1139,7 @@ func datasetMayHoldBlockData(ds *truenas.Dataset) (mayHoldData bool, witness str
 		return true, "the dataset could not be read"
 	}
 	for _, key := range blockDataHistoryWitnesses {
-		if _, ok := ds.UserProperties[key]; ok {
+		if _, ok := ds.UserProperties[key]; ok { //nolint:gocritic // presence-only witness check (datasetMayHoldBlockData may only be used to REFUSE, never to permit — see its doc comment); an inherited witness is still a true witness
 			return true, key
 		}
 	}
@@ -1476,7 +1476,7 @@ func guardRequestAgainstEvidence(request *blockOpts, evidence blockGeometry, dat
 // nothing to fence, while every OTHER failure on that path is transient and must
 // keep blocking readiness. GRPCStatus is delegated so RPC callers still see the
 // FailedPrecondition unchanged.
-type errGeometryUnestablishable struct{ err error }
+type errGeometryUnestablishable struct{ err error } //nolint:errname // established repo convention (see ErrSnapshotHasClones/ErrDatasetDestinationExists in pkg/truenas); renaming is a 40-call-site exported-API change across errors.As call sites for a naming-only lint
 
 func (e errGeometryUnestablishable) Error() string              { return e.err.Error() }
 func (e errGeometryUnestablishable) Unwrap() error              { return e.err }

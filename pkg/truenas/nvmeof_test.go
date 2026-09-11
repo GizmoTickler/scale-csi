@@ -611,7 +611,7 @@ func TestResolveToIP_AlreadyIP(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := resolveToIP(tt.input)
+			result, err := resolveToIP(context.Background(), tt.input)
 			if tt.wantErr {
 				require.Error(t, err)
 				return
@@ -624,14 +624,14 @@ func TestResolveToIP_AlreadyIP(t *testing.T) {
 
 func TestResolveToIP_Hostname_Localhost(t *testing.T) {
 	// Test with localhost which should always resolve
-	result, err := resolveToIP("localhost")
+	result, err := resolveToIP(context.Background(), "localhost")
 	require.NoError(t, err)
 	// Should be either 127.0.0.1 or ::1
 	assert.True(t, result == "127.0.0.1" || result == "::1", "expected localhost to resolve to loopback, got %s", result)
 }
 
 func TestResolveToIP_InvalidHostname(t *testing.T) {
-	_, err := resolveToIP("definitely-not-a-real-hostname-xyz123.invalid")
+	_, err := resolveToIP(context.Background(), "definitely-not-a-real-hostname-xyz123.invalid")
 	require.Error(t, err)
 }
 
@@ -1039,7 +1039,7 @@ func TestInvalidateNVMeoFPortRemovesNormalizedWildcardCacheEntry(t *testing.T) {
 		"TCP|0.0.0.0|4421": {ID: 42, Transport: "TCP", Address: "0.0.0.0", Port: 4421},
 	}}
 
-	client.InvalidateNVMeoFPort("TcP", "0.0.0.0", 4420)
+	client.InvalidateNVMeoFPort(context.Background(), "TcP", "0.0.0.0", 4420)
 
 	client.nvmePortMu.Lock()
 	defer client.nvmePortMu.Unlock()

@@ -81,6 +81,7 @@ func (d *ServiceReloadDebouncer) RequestReload(ctx context.Context, service stri
 	// reload (and every caller blocked on resultCh) indefinitely. Once the timer
 	// fires, executeReload clears it so the next request starts a fresh batch.
 	if state.timer == nil {
+		//nolint:contextcheck // deliberately detached: this timer fires once for a whole BATCH of coalesced requests, potentially after the request that armed it has already returned, so no single caller's context is the right one to inherit
 		state.timer = time.AfterFunc(d.debounceDelay, func() {
 			d.executeReload(service)
 		})

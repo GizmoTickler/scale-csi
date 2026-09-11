@@ -212,7 +212,7 @@ func (d *Driver) createISCSIShare(ctx context.Context, datasetName, volumeName s
 // the rest of provisioning instead of depending on the warning-only resource-ID
 // write below. That closes the "the witness can simply be lost" hole without a
 // single extra round trip: the map is written either way.
-func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
+func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error { //nolint:unparam // volumeName is part of the ShareBackend.EnsureShare calling convention shared with NFS/NVMeoF (see share_backend.go); this backend does not currently need it, but the signature stays symmetric across all three
 	start := time.Now()
 	klog.Infof("createISCSIShare: starting for dataset %s", datasetName)
 	var err error

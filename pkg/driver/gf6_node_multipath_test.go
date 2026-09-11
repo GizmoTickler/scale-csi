@@ -261,7 +261,7 @@ func TestParseISCSIMultipathPortalsPreservesIPLiteralHints(t *testing.T) {
 
 func TestConvergeExistingISCSIPathsRefusesRawStagedDeviceWithoutAddingSessions(t *testing.T) {
 	installGF6ISCSINodeSeams(t)
-	nodeStagedDevicePath = func(string) (string, bool) { return "/dev/sda", true }
+	nodeStagedDevicePath = func(context.Context, string) (string, bool) { return "/dev/sda", true }
 	nodeGetISCSIMultipathWWID = func(string) (string, error) { return "", errors.New("raw component") }
 	listISCSISessions = func() ([]util.ISCSISessionInfo, error) {
 		t.Fatal("raw-stage refusal must happen before listing or adding sessions")
@@ -292,7 +292,7 @@ func TestConvergeExistingISCSIPathsRefusesRawStagedDeviceWithoutAddingSessions(t
 func TestConvergeExistingISCSIPathsTopsUpExistingDMMap(t *testing.T) {
 	installGF6ISCSINodeSeams(t)
 	const wwid = "36001405a123456789abcdef000000035"
-	nodeStagedDevicePath = func(string) (string, bool) { return "/dev/dm-5", true }
+	nodeStagedDevicePath = func(context.Context, string) (string, bool) { return "/dev/dm-5", true }
 	mapWWIDCalls := 0
 	nodeGetISCSIMultipathWWID = func(devicePath string) (string, error) {
 		mapWWIDCalls++

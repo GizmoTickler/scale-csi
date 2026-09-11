@@ -792,7 +792,7 @@ func TestFindNVMeoFSessionBySubsysName_StrictMatch(t *testing.T) {
 func writeFakeNVMe(t *testing.T, script string) {
 	t.Helper()
 	binDir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(binDir, "nvme"), []byte(script), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "nvme"), []byte(script), 0o750)) //nolint:gosec // must be executable to stand in as a fake nvme this test execs
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 

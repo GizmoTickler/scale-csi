@@ -509,7 +509,7 @@ func validatePublicationCompatibility(records map[string]publicationRecord, requ
 // migration" case, which must keep blocking as before — both nodes are live
 // there, so this correctly returns false).
 func stalePublishedRecordNode(records map[string]publicationRecord, liveNodes map[string]struct{}) (string, bool) {
-	for _, record := range records {
+	for _, record := range records { //nolint:gocritic // records is a map (values aren't addressable); bounded by live cluster node count, not a hot loop
 		if record.State != publicationStatePublished {
 			continue
 		}
@@ -764,6 +764,10 @@ func (d *Driver) populateAdditiveGrantOwnership(
 				datasetName, len(compacted), additiveGrantHardCap)
 		}
 		record.CSIAddedNFSHosts = compacted
+	case ShareTypeISCSI:
+		// iSCSI access control is CHAP-secret based (per-initiator secrets set
+		// at controller-publish time), not a host/NQN additive allowlist, so
+		// there is no CSIAddedISCSI* provenance field to populate here.
 	case ShareTypeNVMeoF:
 		nqn := strings.TrimSpace(identity.NVMeNQN)
 		if nqn == "" {

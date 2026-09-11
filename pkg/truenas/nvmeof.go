@@ -898,7 +898,7 @@ func (c *Client) NVMeoFSubsystemList(ctx context.Context) ([]*NVMeoFSubsystem, e
 // Important: If a wildcard port (0.0.0.0) exists on the same service port,
 // it will be reused since it binds to all interfaces and catches all traffic.
 func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address string, port int, opts ...NVMeoFPortCreateOptions) (*NVMeoFPort, error) {
-	resolvedAddr, cacheKey, err := nvmePortCacheIdentity(transport, address, port)
+	resolvedAddr, cacheKey, err := nvmePortCacheIdentity(ctx, transport, address, port)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve address %q: %w", address, err)
 	}
@@ -956,8 +956,8 @@ func (c *Client) NVMeoFGetOrCreatePort(ctx context.Context, transport, address s
 // InvalidateNVMeoFPort removes a cached shared-port resolution so a subsequent
 // request re-queries TrueNAS. This is used when a downstream operation proves
 // that the cached port ID is stale.
-func (c *Client) InvalidateNVMeoFPort(transport, address string, port int) {
-	_, cacheKey, err := nvmePortCacheIdentity(transport, address, port)
+func (c *Client) InvalidateNVMeoFPort(ctx context.Context, transport, address string, port int) {
+	_, cacheKey, err := nvmePortCacheIdentity(ctx, transport, address, port)
 	if err != nil {
 		klog.Warningf("Failed to invalidate NVMe-oF port cache for %s:%s:%d: %v", transport, address, port, err)
 		return
@@ -971,9 +971,9 @@ func (c *Client) InvalidateNVMeoFPort(transport, address string, port int) {
 // nvmePortCacheIdentity normalizes the requested address exactly once for both
 // cache population and invalidation. In particular, 0.0.0.0 remains the
 // wildcard address used by TrueNAS rather than being resolved as a hostname.
-func nvmePortCacheIdentity(transport, address string, port int) (resolvedAddr, cacheKey string, err error) {
+func nvmePortCacheIdentity(ctx context.Context, transport, address string, port int) (resolvedAddr, cacheKey string, err error) {
 	// Resolve hostname to IP if needed (TrueNAS API requires IP addresses).
-	resolvedAddr, err = resolveToIP(address)
+	resolvedAddr, err = resolveToIP(ctx, address)
 	if err != nil {
 		return "", "", err
 	}
@@ -983,14 +983,14 @@ func nvmePortCacheIdentity(transport, address string, port int) (resolvedAddr, c
 
 // resolveToIP resolves a hostname to an IP address.
 // If the input is already an IP address, it is returned as-is.
-func resolveToIP(address string) (string, error) {
+func resolveToIP(ctx context.Context, address string) (string, error) {
 	// Check if it's already an IP address
 	if ip := net.ParseIP(address); ip != nil {
 		return address, nil
 	}
 
 	// Resolve hostname
-	ips, err := net.LookupIP(address)
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, address)
 	if err != nil {
 		return "", err
 	}
@@ -1000,13 +1000,13 @@ func resolveToIP(address string) (string, error) {
 
 	// Prefer IPv4 addresses
 	for _, ip := range ips {
-		if ip4 := ip.To4(); ip4 != nil {
+		if ip4 := ip.IP.To4(); ip4 != nil {
 			return ip4.String(), nil
 		}
 	}
 
 	// Fall back to first address (IPv6)
-	return ips[0].String(), nil
+	return ips[0].IP.String(), nil
 }
 
 // NVMeoFGetTransportAddresses gets available transport addresses for a transport type.

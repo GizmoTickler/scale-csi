@@ -336,7 +336,7 @@ func hasISCSIAdmMode(calls [][]string, mode string) bool {
 func TestGetISCSISessionsExit21IsEmpty(t *testing.T) {
 	binDir := t.TempDir()
 	script := "#!/bin/sh\nprintf 'iscsiadm: No active sessions.' >&2\nexit 21\n"
-	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750)) //nolint:gosec // must be executable to stand in as a fake iscsiadm this test execs
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	sessions, err := getISCSISessions()
@@ -347,7 +347,7 @@ func TestGetISCSISessionsExit21IsEmpty(t *testing.T) {
 func TestGetISCSISessionsOtherExitIsError(t *testing.T) {
 	binDir := t.TempDir()
 	script := "#!/bin/sh\nprintf 'transport failure' >&2\nexit 22\n"
-	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750)) //nolint:gosec // must be executable to stand in as a fake iscsiadm this test execs
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	_, err := getISCSISessions()
@@ -1575,7 +1575,7 @@ func TestSetISCSINodeParamErrorNeverLeaksCHAPSecret(t *testing.T) {
 func writeFakeISCSIAdm(t *testing.T, script string) {
 	t.Helper()
 	binDir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "iscsiadm"), []byte(script), 0o750)) //nolint:gosec // must be executable to stand in as a fake iscsiadm this test execs
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 

@@ -195,7 +195,9 @@ func TestDebugServerServesPprofAndStateOverHTTP(t *testing.T) {
 	require.NotEmpty(t, server.Addr(), "Addr must expose the resolved port for a :0 bind")
 
 	for _, path := range []string{"/debug/pprof/", "/debug/pprof/cmdline", "/debug/state"} {
-		resp, err := http.Get(fmt.Sprintf("http://%s%s", server.Addr(), path))
+		req, reqErr := http.NewRequestWithContext(context.Background(), http.MethodGet, fmt.Sprintf("http://%s%s", server.Addr(), path), nil)
+		require.NoError(t, reqErr, path)
+		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err, path)
 		body, readErr := io.ReadAll(resp.Body)
 		require.NoError(t, resp.Body.Close())
@@ -205,7 +207,9 @@ func TestDebugServerServesPprofAndStateOverHTTP(t *testing.T) {
 
 	// Anything outside the two debug surfaces must 404: the dedicated mux
 	// carries no metrics, health, or default-mux handlers.
-	resp, err := http.Get(fmt.Sprintf("http://%s/metrics", server.Addr()))
+	req, reqErr := http.NewRequestWithContext(context.Background(), http.MethodGet, fmt.Sprintf("http://%s/metrics", server.Addr()), nil)
+	require.NoError(t, reqErr)
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)

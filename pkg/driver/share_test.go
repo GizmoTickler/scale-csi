@@ -134,7 +134,7 @@ func (m *nvmePortAssociationFailMock) NVMeoFGetOrCreatePort(ctx context.Context,
 	return resolved, nil
 }
 
-func (m *nvmePortAssociationFailMock) InvalidateNVMeoFPort(transport, address string, port int) {
+func (m *nvmePortAssociationFailMock) InvalidateNVMeoFPort(ctx context.Context, transport, address string, port int) {
 	m.portInvalidationCalls++
 	m.invalidatedTransport = transport
 	m.invalidatedAddress = address

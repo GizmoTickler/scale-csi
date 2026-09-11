@@ -19,6 +19,32 @@ linters:
     - unconvert
     # Error handling
     - errorlint
+    - errname
+    - nilerr
+    # Security / untrusted input, host exec, privileged operation (this is a
+    # privileged CSI node plugin that execs host binaries and parses backend
+    # responses)
+    - gosec
+    - bodyclose
+    - noctx
+    - contextcheck
+    # Correctness footguns
+    - forcetypeassert
+    - makezero
+    - reassign
+    - durationcheck
+    - copyloopvar
+    - usestdlibvars
+    - wastedassign
+    - predeclared
+    - exhaustive
+    # Test quality
+    - thelper
+    - tparallel
+    # Style / maintainability
+    - prealloc
+    - unparam
+    - nolintlint
   settings:
     govet:
       enable-all: true
@@ -34,7 +60,34 @@ linters:
       disabled-checks:
         - whyNoLint
         - hugeParam  # CSI structs can be large
+      settings:
+        ruleguard:
+          # Repo-specific bug-class rules (see hack/ruleguard/rules.go for the
+          # full rationale behind each one). Loaded in addition to gocritic's
+          # built-in checks; "style" tag above is what activates the ruleguard
+          # meta-checker itself.
+          rules: "${base-path}/hack/ruleguard/rules.go"
+          failOn: dsl
+    nolintlint:
+      # Every nolint directive in this repo already names its linter and
+      # explains itself; make that mandatory so a future bare `//nolint`
+      # can't slip in unexplained.
+      require-explanation: true
+      require-specific: true
+    exhaustive:
+      # A switch with an explicit default is a deliberate design choice in
+      # this codebase (see reconcile_shares.go's "default: // ShareTypeNFS
+      # (and any unset value)" comments) -- it IS the exhaustiveness
+      # statement, just spelled as a catch-all instead of an enumerated list.
+      # Flagging every one of those anyway would bury the switches that
+      # genuinely have no default and silently no-op on an unhandled value.
+      default-signifies-exhaustive: true
   exclusions:
+    paths:
+      # A ruleguard rules file's "rule" functions are matcher definitions, not
+      # code that is ever called — nothing here should be linted as if it were
+      # application logic (e.g. `unused` on the rule funcs).
+      - hack/ruleguard/
     presets:
       - std-error-handling
       - common-false-positives
@@ -44,11 +97,132 @@ linters:
         linters:
           - errcheck
           - gocritic
+      # Fixture/setup helpers (e.g. mustCreateParentDataset, encryptedParentDriver)
+      # legitimately create their own context.Background() rather than taking one
+      # from the ~100+ call sites across the suite: they only ever drive an
+      # in-memory mock backend synchronously, so there is no real
+      # cancellation/deadline to propagate, and threading ctx through every call
+      # site would be a pure mechanical churn with no behavior change.
+      - path: _test\.go
+        linters:
+          - contextcheck
+      # gosec G101 ("potential hardcoded credentials") matches on identifier
+      # name/entropy heuristics with no way to know a string is TEST fixture
+      # data. Every hit audited in this codebase's test files is a fake
+      # passphrase/API-key literal or an unrelated field literally named
+      # "token"/"secret" (e.g. a Prometheus metric-name test case) -- never a
+      # real credential, since test code never talks to a real backend.
+      # Production code is NOT covered by this exclusion.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G101:"
+      # G115 (int overflow conversion) on int64(stat.Blocks)-shaped test data:
+      # these mirror GetFilesystemStats' own production formula (see its
+      # nolint comment in pkg/util/mount.go) with small literal test fixture
+      # values, and other G115 test hits are similarly synthetic/bounded
+      # fixture data, not values derived from anything attacker-controlled.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G115:"
+      # G104 (errors unhandled) duplicates errcheck, which test files are
+      # already exempt from above -- same rationale (exercising a code path
+      # without asserting on every incidental error it returns).
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G104:"
+      # noctx's net.Listen rule targets outbound-request-shaped calls that can
+      # hang without a deadline; every hit here is instead a one-time SERVER
+      # bind at startup (health/debug/CSI gRPC listeners, plus test harnesses
+      # standing up the same). Binding a local listening socket does not block
+      # on anything a context could usefully cancel, and net.ListenConfig
+      # would only add a context.Background() with no real behavior change.
+      - linters:
+          - noctx
+        text: "net.Listen must not be called"
+      # httptest.NewRequest builds an in-memory *http.Request routed directly
+      # into a handler's ServeHTTP -- it never performs network I/O, so there
+      # is nothing a context could cancel, and net/http/httptest's own doc
+      # comment recommends it (over NewRequestWithContext) for exactly this
+      # use. Test-only.
+      - path: _test\.go
+        linters:
+          - noctx
+        text: "httptest.NewRequest must not be called"
+      # exec.Command in test helpers (fake-wrapper harnesses, helm template
+      # invocations): swapping in CommandContext(context.Background(), ...)
+      # with no accompanying WithTimeout would be pure ceremony -- no actual
+      # cancellation gets wired up, and `go test`'s own overall timeout
+      # already bounds a runaway subprocess. Production code (pkg/util,
+      # pkg/driver) is NOT covered by this exclusion, and is additionally
+      # covered by the stricter RG-EXEC-UNHARDENED repolint rule.
+      - path: _test\.go
+        linters:
+          - noctx
+        text: "exec.Command must not be called"
+      # api_call_count_test.go's `run func(*testing.T, ...)` table field is a
+      # one-shot per-case closure invoked exactly once (tc.run(t, ...) inside
+      # the single t.Run wrapper below it) -- not a helper shared across many
+      # call sites, so t.Helper() would not change what any failure reports.
+      - path: pkg/driver/api_call_count_test\.go
+        linters:
+          - thelper
+      # unparam's "always receives CONSTANT" findings on test fixture
+      # builders (e.g. seedSnapshotCloneSource, reconcilePVC) reflect current
+      # test coverage, not dead code: the parameter exists so a FUTURE test
+      # case can vary it, exactly like every other field on these builders.
+      # This does not cover "is unused"/"is never used"/"is always nil",
+      # which are real signals reviewed individually.
+      - path: _test\.go
+        linters:
+          - unparam
+        text: "always receives"
+      # Mock RPC handlers are stored in a map[string]func(rpcTestRequest)
+      # (interface{}, *rpcError) (or similar shared closure type) alongside
+      # sibling entries that DO return a non-nil *rpcError; one closure
+      # modeling an always-successful call is expected to always return nil
+      # for that slot, not a signal that the slot should be removed from the
+      # shared type.
+      - path: _test\.go
+        linters:
+          - unparam
+        text: "is always nil"
+      # TODO(scale-csi): forcetypeassert produced 66 findings in test files
+      # (pkg/truenas/dataset_test.go, snapshot_test.go, nvmeof_test.go,
+      # typed_decode_test.go, iscsi_auth_test.go and a handful of
+      # pkg/driver/*_test.go), almost all raw `x.(map[string]interface{})`/
+      # `x.([]interface{})` assertions while inspecting mock-RPC
+      # params/responses built from json.Unmarshal'd `interface{}` trees. Per
+      # this repo's lint-hardening rules of engagement, a >~30-finding sweep
+      # is deliberately NOT done in one pass -- each would need the shape of
+      # the surrounding fixture verified before choosing a safe fallback on
+      # assertion failure. The linter stays ON and enforced for production
+      # code (pkg/driver, pkg/truenas, pkg/util, cmd/, docker/), where it
+      # already found and this change fixed one real issue (driver.go's
+      # session-GC sync.Map.Range key assertion). Left as a follow-up.
+      - path: _test\.go
+        linters:
+          - forcetypeassert
       # Mock client is generated-like code
       - path: mock_client\.go
         linters:
           - errcheck
           - gocritic
+      # pkg/truenas owns the Dataset/Snapshot types and legitimately builds and
+      # decodes their raw UserProperties map (wire decode, projection, mock
+      # backend state). The RG-USERPROPS-RAW rule targets pkg/driver, where
+      # decoded properties are read back out and trusted for identity/deletion
+      # decisions — see hack/ruleguard/rules.go.
+      - path: pkg/truenas/
+        linters:
+          - gocritic
+        text: "RG-USERPROPS-RAW"
+      - path: pkg/driver/share\.go
+        linters:
+          - gocritic
+        text: "RG-USERPROPS-RAW"
 
 formatters:
   enable:
