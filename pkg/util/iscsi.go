@@ -652,6 +652,35 @@ func commandExitCode(err error) (int, bool) {
 	return 0, false
 }
 
+// iscsiSessionLineRegex matches one line of `iscsiadm -m session` output.
+// Format: tcp: [session_id] portal:port,target_portal_group_tag iqn (mode)
+// The mode suffix (e.g., "(non-flash)") is NOT part of the IQN.
+// IQN format: iqn.YYYY-MM.reversed.domain:target_name
+var iscsiSessionLineRegex = regexp.MustCompile(`^tcp:\s+\[(\d+)\]\s+([^,]+),\d+\s+(iqn\.\S+)`)
+
+// parseISCSISessionLines parses `iscsiadm -m session` stdout into sessions. It
+// is pure and side-effect free (no exec, no I/O) so the exact regex/loop the
+// driver runs against live tool output can be fuzzed directly, separate from
+// the command invocation in getISCSISessions.
+func parseISCSISessionLines(output []byte) []ISCSISession {
+	var sessions []ISCSISession
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		matches := iscsiSessionLineRegex.FindStringSubmatch(line)
+		if len(matches) == 4 {
+			sessions = append(sessions, ISCSISession{
+				SessionID:    matches[1],
+				TargetPortal: matches[2],
+				IQN:          matches[3],
+			})
+		}
+	}
+	return sessions
+}
+
 // getISCSISessions returns the list of active iSCSI sessions.
 func getISCSISessions() ([]ISCSISession, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())
@@ -672,29 +701,7 @@ func getISCSISessions() ([]ISCSISession, error) {
 		return nil, fmt.Errorf("failed to list iSCSI sessions: %w, stderr: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
-	var sessions []ISCSISession
-	lines := strings.Split(string(output), "\n")
-	// Format: tcp: [session_id] portal:port,target_portal_group_tag iqn (mode)
-	// The mode suffix (e.g., "(non-flash)") is NOT part of the IQN
-	// IQN format: iqn.YYYY-MM.reversed.domain:target_name
-	re := regexp.MustCompile(`^tcp:\s+\[(\d+)\]\s+([^,]+),\d+\s+(iqn\.\S+)`)
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		matches := re.FindStringSubmatch(line)
-		if len(matches) == 4 {
-			sessions = append(sessions, ISCSISession{
-				SessionID:    matches[1],
-				TargetPortal: matches[2],
-				IQN:          matches[3],
-			})
-		}
-	}
-
-	return sessions, nil
+	return parseISCSISessionLines(output), nil
 }
 
 // waitForISCSIDevice waits for the iSCSI device to appear in /dev.
