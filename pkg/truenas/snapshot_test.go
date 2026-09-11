@@ -370,8 +370,20 @@ func TestSnapshotCreateSendsPropertiesOnBothAPIGenerations(t *testing.T) {
 						resp.Result = []interface{}{}
 					case tc.expectedCall:
 						payloads <- req.Params[0].(map[string]interface{})
+						// A genuine properties-supporting backend reflects every
+						// requested property back as source=LOCAL in the create
+						// response — SnapshotCreate's single-flight probe now
+						// requires that round trip before it caches "supported"
+						// (see snapshotReflectsLocalProperties; TrueNAS 26.0 can
+						// return success here while silently dropping every
+						// property, which this fixture must NOT model or the
+						// probe would correctly treat it as unsupported).
 						resp.Result = map[string]interface{}{
 							"id": "tank/csi/source@inline", "name": "inline", "dataset": "tank/csi/source",
+							"properties": map[string]interface{}{
+								"truenas-csi:managed_resource":  map[string]interface{}{"value": "true", "source": "LOCAL"},
+								"truenas-csi:csi_snapshot_name": map[string]interface{}{"value": "inline", "source": "LOCAL"},
+							},
 						}
 					default:
 						resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
@@ -577,6 +589,75 @@ func TestSnapshotCreateThenSetPropertiesRefusesOnTrueNAS26(t *testing.T) {
 	assert.Nil(t, snap)
 	assert.Contains(t, err.Error(), "unsupported")
 	assert.Zero(t, updateCalls.Load(), "must never call the silently-dropping pool.snapshot.update on 26.0")
+}
+
+// TestSnapshotCreateSilentPropertyDropOnTrueNAS26RefusesRatherThanFabricatesStamp
+// is the D2 regression test. It is grounded directly in a real payload shape
+// captured live against a TrueNAS 26.0 appliance (see
+// TestE2ERealDebug_D2RawSnapshotCreateShape in e2e_real_test.go, run
+// out-of-band against nas01 with SCALE_CSI_E2E_REAL=1): a
+// pool.snapshot.create call with inline "properties" returns HTTP/RPC
+// success, but the response's own "properties" map contains only
+// "createtxg"/"creation" — the requested custom key is entirely absent, not
+// merely present with a different source. This is NOT the
+// already-covered "validation error" fallback case (no error is returned at
+// all) and is worse: pre-fix, SnapshotCreate's single-flight probe treated
+// err==nil alone as proof inline properties are supported, cached that
+// verdict, and returned the caller a Snapshot silently missing every
+// ownership/identity stamp CreateSnapshot asked for (PropManagedResource,
+// PropDriverInstanceID, PropCSISnapshotHandle, ...) — invisible until some
+// later ownership/orphan/tombstone predicate silently failed to recognize
+// its own snapshot.
+func TestSnapshotCreateSilentPropertyDropOnTrueNAS26RefusesRatherThanFabricatesStamp(t *testing.T) {
+	resetSnapshotAPIPrefix()
+	mock := newMockWSServer()
+	var createCalls atomic.Int32
+	server := mock.start(func(conn *websocket.Conn) {
+		for {
+			var req rpcTestRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+			switch req.Method {
+			case "auth.login_with_api_key":
+				resp.Result = true
+			case "pool.snapshot.query":
+				resp.Result = []interface{}{}
+			case snapshotResourceQueryMethod:
+				resp.Result = []interface{}{} // 26.0: resource API is present
+			case "pool.snapshot.create":
+				createCalls.Add(1)
+				// EXACT live-captured shape: success, but "properties" omits
+				// the requested custom key entirely — only the two ZFS-native
+				// properties TrueNAS always reports are present.
+				resp.Result = map[string]interface{}{
+					"id": "tank/csi/source@snap1", "name": "snap1", "dataset": "tank/csi/source",
+					"properties": map[string]interface{}{
+						"createtxg": map[string]interface{}{"value": "1", "source": "NONE"},
+						"creation":  map[string]interface{}{"value": "1789147802", "source": "NONE"},
+					},
+				}
+			case "pool.snapshot.update", "zfs.resource.snapshot.update":
+				t.Errorf("must never call the silently-dropping pool.snapshot.update on 26.0")
+			default:
+				resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+			}
+			if err := conn.WriteJSON(resp); err != nil {
+				return
+			}
+		}
+	})
+	defer mock.close()
+	client := newSnapshotTestClient(t, server.URL)
+	properties := map[string]string{"truenas-csi:managed_resource": "true"}
+
+	snap, err := client.SnapshotCreate(context.Background(), "tank/csi/source", "snap1", properties)
+	require.Error(t, err, "a create response that silently omits the requested properties must not be trusted as proof of persistence")
+	assert.Nil(t, snap)
+	assert.Contains(t, err.Error(), "unsupported")
+	assert.Equal(t, int32(2), createCalls.Load(),
+		"must retry via the verified post-create path (idempotent re-create then SnapshotSetUserProperty), not just accept the first response")
 }
 
 // TestSnapshotDelete_Success tests deleting a snapshot

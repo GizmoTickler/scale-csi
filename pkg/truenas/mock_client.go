@@ -135,6 +135,23 @@ type MockClient struct {
 	// DropDatasetCreateUserProperties models TrueNAS 26.0 accepting inline
 	// pool.dataset.create user_properties while silently writing none of them.
 	DropDatasetCreateUserProperties bool
+	// DropSnapshotCreateUserProperties models the D2 mock-fidelity finding
+	// (live-verified 2026-09-11 against a real TrueNAS 26.0 appliance): a
+	// pool.snapshot.create call with inline "properties" can return success
+	// while the response reflects NONE of them — not merely with a different
+	// Source, but genuinely absent from the response. This is the exact
+	// surface commit 24f754c and the follow-up D2 fix in
+	// pkg/truenas/snapshot.go (snapshotReflectsLocalProperties) address at
+	// the real *Client layer: a bare successful create is not proof the
+	// properties persisted. MockClient has no equivalent single-flight
+	// probe/fallback of its own (it is a direct in-memory fake, not a second
+	// implementation of that state machine), so this flag exists purely to
+	// let a driver-level test model "the backend silently dropped the
+	// properties" and see what CreateSnapshot does with a snapshot that
+	// carries none of its ownership stamps — the real protection against
+	// this lives in pkg/truenas/snapshot_test.go, which exercises the actual
+	// fixed *Client code via a websocket-mock server.
+	DropSnapshotCreateUserProperties bool
 	// EmptyNVMeHostNQN models defensive compatibility with backends that omit the
 	// otherwise expanded host.hostnqn field from nvmet.host_subsys.query.
 	EmptyNVMeHostNQN bool
@@ -1725,8 +1742,10 @@ func (m *MockClient) SnapshotCreate(ctx context.Context, dataset, name string, u
 	for key, prop := range m.datasetUserPropertiesLocked(dataset) {
 		snap.UserProperties[key] = prop
 	}
-	for key, value := range userProperties {
-		snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
+	if !m.DropSnapshotCreateUserProperties {
+		for key, value := range userProperties {
+			snap.UserProperties[key] = UserProperty{Value: value, Source: "local"}
+		}
 	}
 	m.Snapshots[id] = snap
 	return mockSnapshotResponse(snap), nil
