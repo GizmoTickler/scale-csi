@@ -1405,6 +1405,47 @@ func (d *Driver) safeAdditiveISCSIGroups(ctx context.Context, target *truenas.IS
 	return result, nil
 }
 
+// dedupeISCSITargetGroupsByPortal collapses a target-group list so every
+// portal appears at most once, keeping the LAST entry seen for each portal.
+//
+// TrueNAS 26.0's iscsi.target.create AND iscsi.target.update both reject a
+// "groups" array containing two entries with the same portal ID with a bare
+// -32602 "Invalid params" — confirmed live against a real appliance
+// (TestE2ERealDebug_D1IsolateISCSITargetUpdate), regardless of which (valid,
+// existing) initiator group each entry references. This is business-logic
+// validation, not something the published JSON schema documents (the
+// per-group schema has no portal uniqueness constraint), so nothing short of
+// exercising the real backend would surface it.
+//
+// applyISCSIFence can otherwise produce exactly this shape on the very first
+// ControllerPublishVolume for any iSCSI volume that relied on the default
+// (unconfigured iscsi.targetGroups) target-group resolution: CreateVolume's
+// resolveISCSITargetGroup attaches a placeholder allow-all group to the
+// configured iscsi.targetPortal, and the fencing pass's own dynamic,
+// per-node initiator group resolves to the SAME portal — safeAdditiveISCSIGroups
+// preserves the placeholder (it belongs to a different initiator group ID)
+// while the code below independently appends a second group for that same
+// portal, producing the collision. The dynamic/newly-resolved group is always
+// appended after any preserved ones in both branches above, so "last wins"
+// here means the CSI-owned fencing group supersedes a same-portal placeholder
+// rather than being rejected outright by the backend.
+func dedupeISCSITargetGroupsByPortal(groups []truenas.ISCSITargetGroup) []truenas.ISCSITargetGroup {
+	if len(groups) < 2 {
+		return groups
+	}
+	indexByPortal := make(map[int]int, len(groups))
+	result := make([]truenas.ISCSITargetGroup, 0, len(groups))
+	for _, group := range groups {
+		if idx, ok := indexByPortal[group.Portal]; ok {
+			result[idx] = group
+			continue
+		}
+		indexByPortal[group.Portal] = len(result)
+		result = append(result, group)
+	}
+	return result
+}
+
 // iscsiDenyAllSentinelIQN is a non-matchable initiator IQN that makes a CSI-owned
 // fencing initiator group genuinely deny-all. TrueNAS 26.0 SCST renders an EMPTY
 // initiator allowlist as INITIATOR * (allow-all) — live-verified 2026-07-31 — so
@@ -1552,6 +1593,7 @@ func (d *Driver) applyISCSIFence(ctx context.Context, ds *truenas.Dataset, datas
 			}
 		}
 	}
+	groups = dedupeISCSITargetGroupsByPortal(groups)
 	if _, err := d.truenasClient.ISCSITargetUpdate(ctx, target.ID, groups); err != nil {
 		return err
 	}

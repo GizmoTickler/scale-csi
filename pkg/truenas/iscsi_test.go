@@ -126,15 +126,19 @@ func TestParseISCSITarget_Groups(t *testing.T) {
 		"name":  "test-target",
 		"alias": "",
 		"mode":  "ISCSI",
+		// Real TrueNAS 26.0 never returns "auth_networks" inside a group entry
+		// (docs/reference/truenas-api-methods.json declares the per-group
+		// object with additionalProperties:false and exactly
+		// portal/initiator/authmethod/auth) — auth_networks is target-level
+		// only. This fixture used to include a per-group auth_networks key
+		// and assert it round-tripped; that was asserting a shape the real
+		// backend never sends (see D1).
 		"groups": []interface{}{
 			map[string]interface{}{
 				"portal":     float64(1),
 				"initiator":  float64(2),
 				"authmethod": "CHAP",
 				"auth":       float64(10),
-				"auth_networks": []interface{}{
-					"192.0.2.0/24",
-				},
 			},
 			map[string]interface{}{
 				"portal":     float64(3),
@@ -155,7 +159,6 @@ func TestParseISCSITarget_Groups(t *testing.T) {
 	assert.Equal(t, "CHAP", target.Groups[0].AuthMethod)
 	require.NotNil(t, target.Groups[0].Auth)
 	assert.Equal(t, 10, *target.Groups[0].Auth)
-	assert.Equal(t, []string{"192.0.2.0/24"}, target.Groups[0].AuthNetworks)
 
 	// Second group without auth
 	assert.Equal(t, 3, target.Groups[1].Portal)
@@ -164,14 +167,21 @@ func TestParseISCSITarget_Groups(t *testing.T) {
 	assert.Nil(t, target.Groups[1].Auth)
 }
 
-func TestISCSITargetGroupMaps_PreservesAllAccessConstraints(t *testing.T) {
+// TestISCSITargetGroupMaps_NeverEmitsPerGroupAuthNetworks is the D1 regression
+// coverage for the level-confusion bug: auth_networks is a TARGET-level key
+// on both iscsi.target.create and iscsi.target.update (see
+// ISCSITargetCreateOptions.AuthNetworks / ISCSITarget.AuthNetworks); the
+// per-group object schema is additionalProperties:false with exactly
+// portal/initiator/authmethod/auth, so a group-level "auth_networks" key is a
+// guaranteed -32602 "Invalid params" on any StorageClass that set
+// iscsi/authNetworks. iscsiTargetGroupMaps must never emit that key.
+func TestISCSITargetGroupMaps_NeverEmitsPerGroupAuthNetworks(t *testing.T) {
 	auth := 5
 	groups := []ISCSITargetGroup{{
-		Portal:       1,
-		Initiator:    2,
-		AuthMethod:   "CHAP",
-		Auth:         &auth,
-		AuthNetworks: []string{"192.0.2.0/24", "2001:db8::/64"},
+		Portal:     1,
+		Initiator:  2,
+		AuthMethod: "CHAP",
+		Auth:       &auth,
 	}}
 
 	got := iscsiTargetGroupMaps(groups)
@@ -180,7 +190,8 @@ func TestISCSITargetGroupMaps_PreservesAllAccessConstraints(t *testing.T) {
 	assert.Equal(t, 2, got[0]["initiator"])
 	assert.Equal(t, "CHAP", got[0]["authmethod"])
 	assert.Equal(t, 5, got[0]["auth"])
-	assert.Equal(t, []string{"192.0.2.0/24", "2001:db8::/64"}, got[0]["auth_networks"])
+	_, hasAuthNetworks := got[0]["auth_networks"]
+	assert.False(t, hasAuthNetworks, "auth_networks must never appear inside a group entry — it is target-level only")
 }
 
 func TestParseISCSIExtent_AllFields(t *testing.T) {

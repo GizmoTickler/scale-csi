@@ -865,14 +865,21 @@ func datasetResourceQueryOptions(paths []string, getChildren bool) map[string]in
 	}
 }
 
-// LIVE-PROBE GATE: The request options and response shape for the dataset
-// zfs.resource.query read below are MODELED on the snapshot resource API
-// (zfs.resource.snapshot.query) and the architecture review — they are NOT yet
-// confirmed by a live TrueNAS 26.0 probe. The safe fallback to pool.dataset.query
-// in listAllManagedDatasets protects reconciliation if this shape is rejected or
-// parses empty. A live probe against TrueNAS 26.0 MUST confirm the shape (field
-// names, user_properties source presence, get_children/get_source behavior) before
-// this path is relied upon in production.
+// LIVE-PROBE GATE — CONFIRMED 2026-09-11 against a real TrueNAS 26.0
+// appliance (D2 mock-fidelity investigation): with get_user_properties:true
+// and get_source:true, zfs.resource.query's "user_properties" is a FLAT
+// map[string]string (e.g. {"scale-csi:key": "value"}) — never the nested
+// {value, source} object shape, and there is no per-key source anywhere in
+// it, for genuinely local AND inherited properties alike. rawUserProperty's
+// flat-string branch and this package's "degrade to source=\"\"" discipline
+// (parseDatasetResource, the mock's DatasetQueryByParent) already match this
+// exactly. Omitting get_user_properties/get_source entirely (an easy mistake
+// this probe made once) makes the appliance return "user_properties": null
+// instead — always request both. Field names (name/pool/type/properties/
+// user_properties/createtxg/guid/children) and get_children:true (returns
+// [] for a leaf dataset, not null) are also confirmed. The safe fallback to
+// pool.dataset.query in listAllManagedDatasets remains in place as
+// defense-in-depth if a future appliance version changes this shape.
 //
 // DatasetQueryByParent returns every dataset below parentDataset (path-scoped,
 // never a full-system scan) using the TrueNAS 26.0 zfs.resource.query API. It
@@ -891,12 +898,14 @@ func (c *Client) DatasetQueryByParent(ctx context.Context, parentDataset string)
 	return rawDatasetsToDatasets(raw, true), nil
 }
 
-// LIVE-PROBE GATE: parseDatasetResource parses the MODELED (not live-verified)
-// zfs.resource.query dataset item shape. See the gate comment on
-// DatasetQueryByParent: a live TrueNAS 26.0 probe must confirm field names,
-// user_properties source presence, and get_children/get_source behavior before
-// this parser is relied upon in production. The parser is deliberately defensive:
-// it reuses parseDataset/parseProperty where the shape matches and degrades flat
+// LIVE-PROBE GATE — CONFIRMED 2026-09-11 (see the gate comment on
+// DatasetQueryByParent for the full finding). This function is not called on
+// the production read path (the typed rawDataset/rawUserProperty decoder in
+// typed_decode.go is); it is kept as the interface{}-based reference
+// implementation the differential fuzz suite (typed_decode_test.go) checks
+// the typed decoder against, so both must keep parsing this now-confirmed
+// shape identically. The parser is deliberately defensive: it reuses
+// parseDataset/parseProperty where the shape matches and degrades flat
 // user-property values to source="" (unknown) so datasetHasLocalUserProperty
 // callers fail safe rather than misreporting local.
 func parseDatasetResource(data interface{}) (*Dataset, error) {

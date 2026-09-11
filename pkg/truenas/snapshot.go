@@ -209,18 +209,43 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userP
 		return c.snapshotCreateThenSetProperties(ctx, prefix, dataset, name, userProperties)
 	}
 
-	// Keep the first probe single-flight. Live TrueNAS 26.0 probes prove that
-	// inline snapshot-create properties persist even though no working API can
-	// add properties to an existing snapshot. A successful create proves support;
-	// a field-validation failure is cached and retried without properties.
+	// Keep the first probe single-flight. A successful create is NOT by
+	// itself proof that inline properties are supported: live-verified
+	// 2026-09-11 against a real TrueNAS 26.0 appliance, pool.snapshot.create
+	// can return success for a create-with-properties call while silently
+	// dropping every property from the response (D2 mock-fidelity
+	// differential, divergence 4) — the exact same "acknowledges the request
+	// while silently dropping it" behavior SnapshotSetUserProperty already
+	// documents for pool.snapshot.update. A bare err==nil check would cache
+	// "supported" from that response and hand back a Snapshot whose
+	// UserProperties silently omit what the caller asked for — the fabricated
+	// stamp this whole package was fixed (24f754c) to stop producing. Only
+	// cache "supported" when the response actually reflects every requested
+	// property as source=local; a field-validation failure is cached (and
+	// retried without properties) as before.
 	snap, err := c.snapshotCreateCall(ctx, prefix, params)
 	if err == nil {
+		if snapshotReflectsLocalProperties(snap, userProperties) {
+			if c.snapshotCreatePropertiesSupport == nil {
+				c.snapshotCreatePropertiesSupport = make(map[string]bool)
+			}
+			c.snapshotCreatePropertiesSupport[prefix] = true
+			c.snapshotCreatePropertiesMu.Unlock()
+			return snap, nil
+		}
 		if c.snapshotCreatePropertiesSupport == nil {
 			c.snapshotCreatePropertiesSupport = make(map[string]bool)
 		}
-		c.snapshotCreatePropertiesSupport[prefix] = true
+		c.snapshotCreatePropertiesSupport[prefix] = false
 		c.snapshotCreatePropertiesMu.Unlock()
-		return snap, nil
+		klog.Warningf("Snapshot create for %s@%s accepted inline properties but the response did not reflect them as local (silent drop); falling back to verified post-create updates", dataset, name)
+		// The snapshot already exists (the call above succeeded); route
+		// through the same verified path snapshotCreateThenSetProperties uses
+		// so every property write goes through SnapshotSetUserProperty's own
+		// 26.0 detection instead of trusting this response. Its own create
+		// call is idempotent against the object we just made (already-exists
+		// resolves via SnapshotGet).
+		return c.snapshotCreateThenSetProperties(ctx, prefix, dataset, name, userProperties)
 	}
 	if !isSnapshotCreatePropertiesValidationError(err) {
 		c.snapshotCreatePropertiesMu.Unlock()
@@ -234,6 +259,33 @@ func (c *Client) SnapshotCreate(ctx context.Context, dataset, name string, userP
 
 	klog.Warningf("Snapshot create properties are unsupported by %s; falling back to post-create updates", prefix)
 	return c.snapshotCreateThenSetProperties(ctx, prefix, dataset, name, userProperties)
+}
+
+// snapshotReflectsLocalProperties reports whether snap actually carries every
+// requested property with a source of "local" and the exact requested value.
+// See SnapshotCreate's call site: a create response is not trustworthy proof
+// of persistence on its own on TrueNAS 26.0.
+//
+// parseSnapshot folds any legacy "truenas-csi:" key onto its canonical
+// "scale-csi:" spelling at decode time (normalizeCSIUserProperties), so a
+// caller-requested legacy key must be looked up under its canonical name here
+// too, or a genuinely-persisted legacy-prefixed property would be
+// misdiagnosed as a silent drop.
+func snapshotReflectsLocalProperties(snap *Snapshot, want map[string]string) bool {
+	if snap == nil {
+		return len(want) == 0
+	}
+	for key, value := range want {
+		lookupKey := key
+		if suffix, ok := strings.CutPrefix(key, LegacyCSIPropertyNamespace); ok {
+			lookupKey = CSIPropertyNamespace + suffix
+		}
+		prop, ok := snap.UserProperties[lookupKey]
+		if !ok || prop.Value != value || !strings.EqualFold(strings.TrimSpace(prop.Source), "local") {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) snapshotCreateCall(ctx context.Context, prefix string, params *SnapshotCreateParams) (*Snapshot, error) {

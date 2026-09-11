@@ -20,12 +20,19 @@ type ISCSITarget struct {
 }
 
 // ISCSITargetGroup represents a portal/initiator group for a target.
+//
+// auth_networks is deliberately NOT a field here: for both iscsi.target.create
+// and iscsi.target.update, TrueNAS 26.0's schema declares the per-group object
+// with additionalProperties:false and exactly portal/initiator/authmethod/auth
+// as allowed keys (docs/reference/truenas-api-methods.json) — auth_networks is
+// a TARGET-level key only (see ISCSITarget.AuthNetworks). Sending it inside a
+// group entry is a guaranteed -32602 "Invalid params" on any target
+// create/update that reaches this shape.
 type ISCSITargetGroup struct {
-	Portal       int      `json:"portal"`
-	Initiator    int      `json:"initiator"`
-	AuthMethod   string   `json:"authmethod"`
-	Auth         *int     `json:"auth"`
-	AuthNetworks []string `json:"auth_networks,omitempty"`
+	Portal     int    `json:"portal"`
+	Initiator  int    `json:"initiator"`
+	AuthMethod string `json:"authmethod"`
+	Auth       *int   `json:"auth"`
 }
 
 // ISCSIExtent represents an iSCSI extent from the TrueNAS API.
@@ -138,9 +145,6 @@ func iscsiTargetGroupMaps(groups []ISCSITargetGroup) []map[string]interface{} {
 		}
 		if group.Auth != nil {
 			entry["auth"] = *group.Auth
-		}
-		if len(group.AuthNetworks) > 0 {
-			entry["auth_networks"] = append([]string(nil), group.AuthNetworks...)
 		}
 		groupMaps[i] = entry
 	}
@@ -500,16 +504,9 @@ func parseISCSITarget(data interface{}) (*ISCSITarget, error) {
 				val := int(v)
 				group.Auth = &val
 			}
-			switch values := gm["auth_networks"].(type) {
-			case []interface{}:
-				for _, value := range values {
-					if network, ok := value.(string); ok {
-						group.AuthNetworks = append(group.AuthNetworks, network)
-					}
-				}
-			case []string:
-				group.AuthNetworks = append(group.AuthNetworks, values...)
-			}
+			// No per-group auth_networks: the schema never returns it there
+			// (see the ISCSITargetGroup doc comment) — auth_networks is
+			// target-level only and is already captured above.
 			target.Groups = append(target.Groups, group)
 		}
 	}
