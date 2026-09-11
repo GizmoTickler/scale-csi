@@ -207,6 +207,19 @@ type Driver struct {
 	startupReconcileWg      sync.WaitGroup
 	startupReconcileOnce    sync.Once
 	startupReconcileSignal  chan struct{}
+	// startupReconcileQuarantineCount is the number of volumes
+	// quarantineStaleStartupFencingVolume (C11) carved out of the MOST RECENT
+	// reconcilePublishedAttachments pass. Reset to 0 at the same point that
+	// pass calls ResetStartupFencingUnconvergedVolumes (before any worker can
+	// observe it) and read by startStartupAttachmentReconcile immediately
+	// after that pass returns, so it never needs its own lock: exactly one
+	// pass is ever in flight for a given Driver. A quarantine is a DEFERRAL,
+	// not an abandonment — strict mode still latches readiness true on a
+	// quarantine-only pass, but must keep this field's reader from exiting
+	// the reconcile goroutine, since only that goroutine's later passes (woken
+	// by requestStartupAttachmentReconcile, e.g. from
+	// revokeStalePublicationRecord) can ever converge the quarantined volume.
+	startupReconcileQuarantineCount atomic.Int64
 
 	// Encryption unlock reconciler state (GF-Sprint 1, E-2 §4), all guarded by
 	// encryptionUnlockFailMu. encryptionUnlockFailures counts consecutive failed
