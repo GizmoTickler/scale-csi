@@ -79,7 +79,7 @@
   "Author": "GizmoTickler",
   "Email": "19583593+GizmoTickler@users.noreply.github.com",
   "Date": "2026-07-31T06:42:32Z",
-  "Message": "sprint2-fix: X8 stateful fence/clone/replay/rotation tests, updated goldens + csi-sanity CHAP\n\n- Real applyISCSIFence over CHAP volumes (strict + additive, publish + unpublish)\n  asserts every rebuilt group keeps authmethod+auth=tag; stored-mode drives\n  CHAP_MUTUAL regardless of the flipped global flag (X1/X2/X8).\n- X1 fatal-stamp: injected CHAP-prop write failure fails CreateVolume and rolls\n  back the dataset; retry stamps durably.\n- X3 clone scrub + request-wins tests; X4 four-matrix policy guard + stable\n  volume-context replay + non-CHAP-\u003eCHAP rejection.\n- X5 hot-cache collision (cache NOT cleared), rotation calls ISCSIAuthUpdate with\n  a stable tag, duplicate-tag reconcile (adopt winner / fail on identity\n  mismatch).\n- Golden CreateVolume fresh iSCSI CHAP 16-\u003e17 (added post-create duplicate-tag\n  verification query); breakdown documented. 14/10 unchanged.\n- csi-sanity: dedicated controller-only iSCSI CHAP context + secrets file; the\n  default non-CHAP iSCSI/NFS suites are unchanged.",
+  "Message": "sprint2-fix: X8 stateful fence/clone/replay/rotation tests, updated goldens + csi-sanity CHAP\n\n- Real applyISCSIFence over CHAP volumes (strict + additive, publish + unpublish)\n  asserts every rebuilt group keeps authmethod+auth=tag; stored-mode drives\n  CHAP_MUTUAL regardless of the flipped global flag (X1/X2/X8).\n- X1 fatal-stamp: injected CHAP-prop write failure fails CreateVolume and rolls\n  back the dataset; retry stamps durably.\n- X3 clone scrub + request-wins tests; X4 four-matrix policy guard + stable\n  volume-context replay + non-CHAP->CHAP rejection.\n- X5 hot-cache collision (cache NOT cleared), rotation calls ISCSIAuthUpdate with\n  a stable tag, duplicate-tag reconcile (adopt winner / fail on identity\n  mismatch).\n- Golden CreateVolume fresh iSCSI CHAP 16->17 (added post-create duplicate-tag\n  verification query); breakdown documented. 14/10 unchanged.\n- csi-sanity: dedicated controller-only iSCSI CHAP context + secrets file; the\n  default non-CHAP iSCSI/NFS suites are unchanged.",
   "Tags": [],
   "Fingerprint": "be07a85744e3193c5ae2712025cea813baa1d4fd:pkg/driver/sanity_test.go:generic-api-key:121"
  },
@@ -100,7 +100,7 @@
   "Author": "GizmoTickler",
   "Email": "19583593+GizmoTickler@users.noreply.github.com",
   "Date": "2026-07-31T06:42:32Z",
-  "Message": "sprint2-fix: X8 stateful fence/clone/replay/rotation tests, updated goldens + csi-sanity CHAP\n\n- Real applyISCSIFence over CHAP volumes (strict + additive, publish + unpublish)\n  asserts every rebuilt group keeps authmethod+auth=tag; stored-mode drives\n  CHAP_MUTUAL regardless of the flipped global flag (X1/X2/X8).\n- X1 fatal-stamp: injected CHAP-prop write failure fails CreateVolume and rolls\n  back the dataset; retry stamps durably.\n- X3 clone scrub + request-wins tests; X4 four-matrix policy guard + stable\n  volume-context replay + non-CHAP-\u003eCHAP rejection.\n- X5 hot-cache collision (cache NOT cleared), rotation calls ISCSIAuthUpdate with\n  a stable tag, duplicate-tag reconcile (adopt winner / fail on identity\n  mismatch).\n- Golden CreateVolume fresh iSCSI CHAP 16-\u003e17 (added post-create duplicate-tag\n  verification query); breakdown documented. 14/10 unchanged.\n- csi-sanity: dedicated controller-only iSCSI CHAP context + secrets file; the\n  default non-CHAP iSCSI/NFS suites are unchanged.",
+  "Message": "sprint2-fix: X8 stateful fence/clone/replay/rotation tests, updated goldens + csi-sanity CHAP\n\n- Real applyISCSIFence over CHAP volumes (strict + additive, publish + unpublish)\n  asserts every rebuilt group keeps authmethod+auth=tag; stored-mode drives\n  CHAP_MUTUAL regardless of the flipped global flag (X1/X2/X8).\n- X1 fatal-stamp: injected CHAP-prop write failure fails CreateVolume and rolls\n  back the dataset; retry stamps durably.\n- X3 clone scrub + request-wins tests; X4 four-matrix policy guard + stable\n  volume-context replay + non-CHAP->CHAP rejection.\n- X5 hot-cache collision (cache NOT cleared), rotation calls ISCSIAuthUpdate with\n  a stable tag, duplicate-tag reconcile (adopt winner / fail on identity\n  mismatch).\n- Golden CreateVolume fresh iSCSI CHAP 16->17 (added post-create duplicate-tag\n  verification query); breakdown documented. 14/10 unchanged.\n- csi-sanity: dedicated controller-only iSCSI CHAP context + secrets file; the\n  default non-CHAP iSCSI/NFS suites are unchanged.",
   "Tags": [],
   "Fingerprint": "be07a85744e3193c5ae2712025cea813baa1d4fd:pkg/driver/sanity_test.go:generic-api-key:124"
  },
@@ -121,7 +121,7 @@
   "Author": "GizmoTickler",
   "Email": "19583593+GizmoTickler@users.noreply.github.com",
   "Date": "2026-07-31T06:42:32Z",
-  "Message": "sprint2-fix: X8 stateful fence/clone/replay/rotation tests, updated goldens + csi-sanity CHAP\n\n- Real applyISCSIFence over CHAP volumes (strict + additive, publish + unpublish)\n  asserts every rebuilt group keeps authmethod+auth=tag; stored-mode drives\n  CHAP_MUTUAL regardless of the flipped global flag (X1/X2/X8).\n- X1 fatal-stamp: injected CHAP-prop write failure fails CreateVolume and rolls\n  back the dataset; retry stamps durably.\n- X3 clone scrub + request-wins tests; X4 four-matrix policy guard + stable\n  volume-context replay + non-CHAP-\u003eCHAP rejection.\n- X5 hot-cache collision (cache NOT cleared), rotation calls ISCSIAuthUpdate with\n  a stable tag, duplicate-tag reconcile (adopt winner / fail on identity\n  mismatch).\n- Golden CreateVolume fresh iSCSI CHAP 16-\u003e17 (added post-create duplicate-tag\n  verification query); breakdown documented. 14/10 unchanged.\n- csi-sanity: dedicated controller-only iSCSI CHAP context + secrets file; the\n  default non-CHAP iSCSI/NFS suites are unchanged.",
+  "Message": "sprint2-fix: X8 stateful fence/clone/replay/rotation tests, updated goldens + csi-sanity CHAP\n\n- Real applyISCSIFence over CHAP volumes (strict + additive, publish + unpublish)\n  asserts every rebuilt group keeps authmethod+auth=tag; stored-mode drives\n  CHAP_MUTUAL regardless of the flipped global flag (X1/X2/X8).\n- X1 fatal-stamp: injected CHAP-prop write failure fails CreateVolume and rolls\n  back the dataset; retry stamps durably.\n- X3 clone scrub + request-wins tests; X4 four-matrix policy guard + stable\n  volume-context replay + non-CHAP->CHAP rejection.\n- X5 hot-cache collision (cache NOT cleared), rotation calls ISCSIAuthUpdate with\n  a stable tag, duplicate-tag reconcile (adopt winner / fail on identity\n  mismatch).\n- Golden CreateVolume fresh iSCSI CHAP 16->17 (added post-create duplicate-tag\n  verification query); breakdown documented. 14/10 unchanged.\n- csi-sanity: dedicated controller-only iSCSI CHAP context + secrets file; the\n  default non-CHAP iSCSI/NFS suites are unchanged.",
   "Tags": [],
   "Fingerprint": "be07a85744e3193c5ae2712025cea813baa1d4fd:pkg/driver/iscsi_chap_sprint2_test.go:generic-api-key:437"
  },
@@ -142,7 +142,7 @@
   "Author": "GizmoTickler",
   "Email": "19583593+GizmoTickler@users.noreply.github.com",
   "Date": "2026-07-31T06:42:32Z",
-  "Message": "sprint2-fix: X8 stateful fence/clone/replay/rotation tests, updated goldens + csi-sanity CHAP\n\n- Real applyISCSIFence over CHAP volumes (strict + additive, publish + unpublish)\n  asserts every rebuilt group keeps authmethod+auth=tag; stored-mode drives\n  CHAP_MUTUAL regardless of the flipped global flag (X1/X2/X8).\n- X1 fatal-stamp: injected CHAP-prop write failure fails CreateVolume and rolls\n  back the dataset; retry stamps durably.\n- X3 clone scrub + request-wins tests; X4 four-matrix policy guard + stable\n  volume-context replay + non-CHAP-\u003eCHAP rejection.\n- X5 hot-cache collision (cache NOT cleared), rotation calls ISCSIAuthUpdate with\n  a stable tag, duplicate-tag reconcile (adopt winner / fail on identity\n  mismatch).\n- Golden CreateVolume fresh iSCSI CHAP 16-\u003e17 (added post-create duplicate-tag\n  verification query); breakdown documented. 14/10 unchanged.\n- csi-sanity: dedicated controller-only iSCSI CHAP context + secrets file; the\n  default non-CHAP iSCSI/NFS suites are unchanged.",
+  "Message": "sprint2-fix: X8 stateful fence/clone/replay/rotation tests, updated goldens + csi-sanity CHAP\n\n- Real applyISCSIFence over CHAP volumes (strict + additive, publish + unpublish)\n  asserts every rebuilt group keeps authmethod+auth=tag; stored-mode drives\n  CHAP_MUTUAL regardless of the flipped global flag (X1/X2/X8).\n- X1 fatal-stamp: injected CHAP-prop write failure fails CreateVolume and rolls\n  back the dataset; retry stamps durably.\n- X3 clone scrub + request-wins tests; X4 four-matrix policy guard + stable\n  volume-context replay + non-CHAP->CHAP rejection.\n- X5 hot-cache collision (cache NOT cleared), rotation calls ISCSIAuthUpdate with\n  a stable tag, duplicate-tag reconcile (adopt winner / fail on identity\n  mismatch).\n- Golden CreateVolume fresh iSCSI CHAP 16->17 (added post-create duplicate-tag\n  verification query); breakdown documented. 14/10 unchanged.\n- csi-sanity: dedicated controller-only iSCSI CHAP context + secrets file; the\n  default non-CHAP iSCSI/NFS suites are unchanged.",
   "Tags": [],
   "Fingerprint": "be07a85744e3193c5ae2712025cea813baa1d4fd:pkg/driver/iscsi_chap_sprint2_test.go:generic-api-key:457"
  },
@@ -166,5 +166,47 @@
   "Message": "docs(reference): map the live TrueNAS 26.0 API and gap-analyze driver usage\n\nCaptured core.get_methods from the production TrueNAS 26.0.0-BETA.2\ninstance (805 methods) so development targets true API capabilities\ninstead of assumptions: raw JSON dump, per-service method map, and a\nknob-by-knob gap analysis of the 88 methods the driver calls plus 167\nrelevant uncalled methods with roles, job flags, and ranked value.",
   "Tags": [],
   "Fingerprint": "1b06a9e3f49a593722728efb1bff0d2e9dfea920:docs/reference/truenas-api-methods.json:generic-api-key:332"
+ },
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 148,
+  "EndLine": 148,
+  "StartColumn": 4,
+  "EndColumn": 33,
+  "Match": "password     = \"DONOTLEAKpw12\"",
+  "Secret": "DONOTLEAKpw12",
+  "File": "pkg/driver/secret_forwarding_test.go",
+  "SymlinkFile": "",
+  "Commit": "ab7143cee9d70eae5e8cc20f75422b7a82f5be65",
+  "Link": "https://github.com/GizmoTickler/scale-csi/blob/ab7143cee9d70eae5e8cc20f75422b7a82f5be65/pkg/driver/secret_forwarding_test.go#L148",
+  "Entropy": 3.5465937,
+  "Author": "GizmoTickler",
+  "Email": "gizmotickler@users.noreply.github.com",
+  "Date": "2026-09-11T22:01:57Z",
+  "Message": "fix(security): get the CHAP password off argv, redact secret-bearing backend errors\n\n1. HIGH — the iSCSI CHAP password was passed as 'iscsiadm -v <secret>', and the\n   node DaemonSet runs hostPID, so the plaintext sat in THREE simultaneous\n   argvs (bash wrapper, nsenter, host iscsiadm) with /proc/<pid>/cmdline\n   world-readable. Reading it needed neither root nor privileged: any pod with\n   hostPID in a namespace admitted as privileged could poll /proc. The credential\n   is shared per StorageClass, so it authorizes login for every volume on it.\n\n   authmethod/username/username_in stay on argv; both password fields are now\n   written directly into the open-iscsi node record at 0600, atomically via a\n   temp file staged in the DB root (never the record dir, where idbm would read\n   a stray file as another iface record), secrets last so no later -o update can\n   follow the chmod.\n\n   Feeding 'iscsiadm -o update' from a file does NOT work — upstream has no\n   file-borne value input, -v is the only way to pass a value, so that variant\n   would still end with the secret in argv. Writing the record is the only\n   approach that removes it from all three.\n\n   Fail-closed: if no node record exists, staging errors rather than falling back\n   to argv, because a silent fallback would restore the vulnerability while\n   looking fixed.\n\n2. MEDIUM — pool.dataset.create takes the passphrase as a call argument and its\n   raw error reached the tenant's own PVC Event plus a V(0) log. The driver\n   already redacts unlock and change_key for exactly this reason; create was\n   missed. Wrapped so Error() is masked while Unwrap() stays intact, so\n   errors.Is/As classification upstack is unchanged.\n\n3. MEDIUM — iscsi.auth.create/update had no redaction at all; redactCHAP only\n   ever handled maps. Added redactCHAPError and used it at both call sites.\n\nAlso removed cmd/debug-api's -api-key flag, which its own --help recommended;\nTRUENAS_API_KEY already worked.\n\ndocs/production.md carried an explicit 'accepted exposure' bullet stating the\ncredential is visible in /proc. Leaving it would have told operators the fix had\nnot happened; rewritten to describe the argv exposure as closed and keep the\ngenuine residual, that node root can read the clear-text node DB.\n\nCo-authored-by: scale-csi security fixer <noreply@localhost>",
+  "Tags": [],
+  "Fingerprint": "ab7143cee9d70eae5e8cc20f75422b7a82f5be65:pkg/driver/secret_forwarding_test.go:generic-api-key:148"
+ },
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 149,
+  "EndLine": 149,
+  "StartColumn": 4,
+  "EndColumn": 33,
+  "Match": "peerPassword = \"DONOTLEAKpr34\"",
+  "Secret": "DONOTLEAKpr34",
+  "File": "pkg/driver/secret_forwarding_test.go",
+  "SymlinkFile": "",
+  "Commit": "ab7143cee9d70eae5e8cc20f75422b7a82f5be65",
+  "Link": "https://github.com/GizmoTickler/scale-csi/blob/ab7143cee9d70eae5e8cc20f75422b7a82f5be65/pkg/driver/secret_forwarding_test.go#L149",
+  "Entropy": 3.5465937,
+  "Author": "GizmoTickler",
+  "Email": "gizmotickler@users.noreply.github.com",
+  "Date": "2026-09-11T22:01:57Z",
+  "Message": "fix(security): get the CHAP password off argv, redact secret-bearing backend errors\n\n1. HIGH — the iSCSI CHAP password was passed as 'iscsiadm -v <secret>', and the\n   node DaemonSet runs hostPID, so the plaintext sat in THREE simultaneous\n   argvs (bash wrapper, nsenter, host iscsiadm) with /proc/<pid>/cmdline\n   world-readable. Reading it needed neither root nor privileged: any pod with\n   hostPID in a namespace admitted as privileged could poll /proc. The credential\n   is shared per StorageClass, so it authorizes login for every volume on it.\n\n   authmethod/username/username_in stay on argv; both password fields are now\n   written directly into the open-iscsi node record at 0600, atomically via a\n   temp file staged in the DB root (never the record dir, where idbm would read\n   a stray file as another iface record), secrets last so no later -o update can\n   follow the chmod.\n\n   Feeding 'iscsiadm -o update' from a file does NOT work — upstream has no\n   file-borne value input, -v is the only way to pass a value, so that variant\n   would still end with the secret in argv. Writing the record is the only\n   approach that removes it from all three.\n\n   Fail-closed: if no node record exists, staging errors rather than falling back\n   to argv, because a silent fallback would restore the vulnerability while\n   looking fixed.\n\n2. MEDIUM — pool.dataset.create takes the passphrase as a call argument and its\n   raw error reached the tenant's own PVC Event plus a V(0) log. The driver\n   already redacts unlock and change_key for exactly this reason; create was\n   missed. Wrapped so Error() is masked while Unwrap() stays intact, so\n   errors.Is/As classification upstack is unchanged.\n\n3. MEDIUM — iscsi.auth.create/update had no redaction at all; redactCHAP only\n   ever handled maps. Added redactCHAPError and used it at both call sites.\n\nAlso removed cmd/debug-api's -api-key flag, which its own --help recommended;\nTRUENAS_API_KEY already worked.\n\ndocs/production.md carried an explicit 'accepted exposure' bullet stating the\ncredential is visible in /proc. Leaving it would have told operators the fix had\nnot happened; rewritten to describe the argv exposure as closed and keep the\ngenuine residual, that node root can read the clear-text node DB.\n\nCo-authored-by: scale-csi security fixer <noreply@localhost>",
+  "Tags": [],
+  "Fingerprint": "ab7143cee9d70eae5e8cc20f75422b7a82f5be65:pkg/driver/secret_forwarding_test.go:generic-api-key:149"
  }
 ]

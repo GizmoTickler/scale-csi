@@ -26,7 +26,15 @@ checks:
     # with their own health checks; adding probes is not required
     - "no-liveness-probe"
     - "no-readiness-probe"
+    # The controller's liveness AND startup probes both target port 9808, which
+    # is the liveness-probe SIDECAR, not the driver container. That is
+    # deliberate: 9808 is the only endpoint that genuinely gates on the CSI
+    # socket existing, so it is the only honest startup signal. Containers in a
+    # pod share a network namespace, so the kubelet reaches it fine; kube-linter
+    # only checks that the probed container itself declares the port. The
+    # startup probe was moved to 9808 in v1.11.0 and trips the sibling check.
     - "liveness-port"
+    - "startup-port"
     - "unset-cpu-requirements"
     - "unset-memory-requirements"
 
