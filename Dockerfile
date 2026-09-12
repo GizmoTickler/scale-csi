@@ -44,7 +44,17 @@ LABEL org.opencontainers.image.description="Kubernetes CSI driver for TrueNAS SC
 # - ca-certificates: for HTTPS connections to TrueNAS API
 # Note: open-iscsi and nvme-cli are NOT installed in container
 # because we use wrapper scripts to run commands on the host
-RUN apk upgrade --no-cache && apk add --no-cache \
+#
+# APK_REFRESH exists only to be part of this layer's cache key. Docker keys a
+# RUN layer on its instruction text and parent, not on the state of the Alpine
+# repository, so with cache-from=type=gha the `apk upgrade` below was served
+# from cache on every build and never re-executed until the base digest
+# changed. The v1.11.0 release image shipped util-linux 2.42.1-r0 while
+# 2.42.3-r1 had been in v3.24/main for weeks: 207 HIGH findings, all in a
+# package the Dockerfile "upgraded". CI passes the run id so the layer is
+# rebuilt every time; a stale value keeps the old behavior deliberately.
+ARG APK_REFRESH=unset
+RUN echo "apk refresh key: ${APK_REFRESH}" && apk upgrade --no-cache && apk add --no-cache \
     ca-certificates \
     bash \
     nfs-utils \
