@@ -1358,6 +1358,14 @@ type iscsiNodeRecord struct {
 // after at least one successful `iscsiadm -o update`, so the record must
 // already exist; an empty result means the node database is somewhere this
 // build does not know about, which is reported rather than silently skipped.
+//
+// The result is ALL-OR-NOTHING. Every directory read that could hide a record
+// is an error, not a skip -- the sole exception being a root that does not
+// carry this target at all, which is the ordinary two-root case. A partial list
+// is the worst possible return value here: the caller writes a CHAP credential
+// into whatever it is handed and reports success, so a record dropped from the
+// list becomes a portal that silently has no credential and fails only later,
+// at --login, on that path alone.
 func iscsiNodeRecordFiles(roots []string, portal, iqn string) ([]iscsiNodeRecord, error) {
 	if iqn == "" || strings.ContainsRune(iqn, filepath.Separator) || strings.Contains(iqn, "..") {
 		// The IQN is backend-supplied and is about to become a path component.
@@ -1376,7 +1384,22 @@ func iscsiNodeRecordFiles(roots []string, portal, iqn string) ([]iscsiNodeRecord
 		targetDir := filepath.Join(root, "nodes", iqn)
 		portalDirs, err := os.ReadDir(targetDir)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				// The two roots are ALTERNATIVES -- a node keeps its database
+				// under one of them and the DaemonSet mounts both -- so "this
+				// root does not carry this target" is the ordinary case and the
+				// only one that may be skipped. It is also load-bearing: on a
+				// node whose database lives in /etc/iscsi, /var/lib/iscsi has no
+				// nodes/<iqn> at all.
+				continue
+			}
+			// Anything else (EACCES on a directory that IS there, EIO, a root
+			// that is not a directory) means records for this target may exist
+			// under this root and cannot be seen. Skipping would hand the caller
+			// a SHORT list that it would write the credential into and report
+			// success over, leaving the unseen portals with no credential. Fail
+			// closed: the path is named, the credential is not.
+			return nil, fmt.Errorf("failed to read iSCSI node database directory %s: %w", targetDir, err)
 		}
 		for _, portalDir := range portalDirs {
 			// Both layouts name the entry <host>,<port>[,<tpgt>], so the portal
@@ -1409,7 +1432,15 @@ func iscsiNodeRecordFiles(roots []string, portal, iqn string) ([]iscsiNodeRecord
 			recordDir := filepath.Join(targetDir, portalDir.Name())
 			ifaces, ifaceErr := os.ReadDir(recordDir)
 			if ifaceErr != nil {
-				continue
+				// Unlike the root above there is no benign reading of this: the
+				// entry was just listed, it matched this portal, and it is a
+				// directory, so its iface records exist and are merely hidden.
+				// Skipping it and returning the rest let the credential write
+				// report success while THIS portal's --login had no credential,
+				// which surfaces as an intermittent or path-specific
+				// authentication failure rather than a configuration error.
+				// Fail closed, consistent with every other arm of this call.
+				return nil, fmt.Errorf("failed to read iSCSI node record directory %s: %w", recordDir, ifaceErr)
 			}
 			for _, iface := range ifaces {
 				if iface.IsDir() {
@@ -1462,6 +1493,17 @@ func setISCSINodeRecordParamText(text, name, value string) string {
 	return out
 }
 
+// errISCSINodeDBPartiallyUpdated marks a credential write that aborted AFTER it
+// had already rewritten at least one node record, so the node database now holds
+// the new credential on some records for this (target, portal) and not others.
+// It is wrapped rather than returned bare so a caller can tell that state apart
+// from a write that failed before touching anything.
+//
+// It is not a rollback marker: nothing is rolled back (see
+// writeISCSINodeRecordSecret). It exists so the condition is REPORTED rather
+// than inferred from a partially updated tree.
+var errISCSINodeDBPartiallyUpdated = errors.New("iSCSI node database was left partially updated; the stage must fail and be retried")
+
 // writeISCSINodeRecordSecret sets a CHAP credential parameter by rewriting the
 // node record on disk instead of passing the value to iscsiadm on argv.
 //
@@ -1485,6 +1527,31 @@ func setISCSINodeRecordParamText(text, name, value string) string {
 // The write is not serialized: the rename is atomic, so no reader can observe a
 // torn record, and the only concurrent writers for one (target, portal) are
 // stages of the same volume, which carry the identical StorageClass credential.
+//
+// ON A RECORD THAT CANNOT BE WRITTEN: abort the whole operation, leave the
+// records already written in place, and say so. Not a rollback, deliberately.
+//
+//   - Aborting is what makes this safe. Nothing logs in until a stage SUCCEEDS,
+//     so a half-updated database never reaches --login on its own; returning an
+//     error fails the stage, kubelet retries, and a later successful attempt
+//     rewrites every record. The state to avoid is a SUCCESS reported over a
+//     half-updated database, not the half-updated database itself.
+//   - Rolling back would be less safe, not more. The pre-image of a record this
+//     function already rewrote may carry a STALE credential and the mode idbm
+//     created it with (commonly 0644, world-readable, holding a clear-text
+//     password); restoring it would undo a one-way 0644->0600 tightening and
+//     reinstate a superseded secret.
+//   - Rolling back also races the concurrent writers described above. A sibling
+//     stage of the same volume writes the identical value; a rollback could
+//     clobber that sibling's SUCCESSFUL write with a stale pre-image, turning a
+//     local permission failure into a regression of someone else's good record.
+//   - A rollback is itself a write, i.e. the operation that just demonstrated it
+//     can fail. A failed rollback leaves a state that is neither the old one nor
+//     the new one, and nothing is left to report it.
+//
+// Records are visited in a deterministic order (roots in the order given, then
+// os.ReadDir's sorted entries), so where an abort stops is reproducible rather
+// than a matter of map iteration luck.
 func writeISCSINodeRecordSecret(roots []string, portal, iqn, name, value string) error {
 	// A value that cannot be represented faithfully in the record format must
 	// fail loudly rather than write a record that means something else. The
@@ -1505,10 +1572,22 @@ func writeISCSINodeRecordSecret(roots []string, portal, iqn, name, value string)
 	if err != nil {
 		return err
 	}
-	for _, record := range files {
-		if err := rewriteISCSINodeRecord(record.Root, record.Path, name, value); err != nil {
+	for i, record := range files {
+		err := rewriteISCSINodeRecord(record.Root, record.Path, name, value)
+		if err == nil {
+			continue
+		}
+		if i == 0 {
+			// Nothing was written, so there is no partial state to report and
+			// the sentinel would be a lie.
 			return err
 		}
+		// Name the record that could not be written and how much of the set was
+		// already updated. Everything here is a parameter NAME, a path and a
+		// count; the credential VALUE reaches neither this string nor the
+		// wrapped os error (a *fs.PathError, which carries only the path).
+		return fmt.Errorf("node param %s was applied to %d of %d node records before %s failed: %w: %w",
+			name, i, len(files), record.Path, errISCSINodeDBPartiallyUpdated, err)
 	}
 	return nil
 }
