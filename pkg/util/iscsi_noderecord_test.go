@@ -51,6 +51,19 @@ const (
 // captured modes anyway; it tracks only the exec bit.
 func stubISCSINodeDB(t *testing.T) string {
 	t.Helper()
+	root := materializeISCSINodeDB(t)
+	original := iscsiNodeDBRoots
+	iscsiNodeDBRoots = []string{root}
+	t.Cleanup(func() { iscsiNodeDBRoots = original })
+	return root
+}
+
+// materializeISCSINodeDB copies the captured node database into a fresh temp
+// directory and returns it, WITHOUT repointing iscsiNodeDBRoots. Production
+// probes two roots, so a test that needs to model one root going bad while the
+// other stays good needs two independent copies of the capture.
+func materializeISCSINodeDB(t *testing.T) string {
+	t.Helper()
 	const src = "testdata/iscsi-node-db/tree"
 	root := t.TempDir()
 	require.NoError(t, filepath.WalkDir(src, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -74,10 +87,6 @@ func stubISCSINodeDB(t *testing.T) string {
 		}
 		return os.Chmod(dest, 0o644) //nolint:gosec // G302: deliberately looser than the 0600 the real iscsiadm leaves, so the credential write's tightening is what the mode assertions observe
 	}))
-
-	original := iscsiNodeDBRoots
-	iscsiNodeDBRoots = []string{root}
-	t.Cleanup(func() { iscsiNodeDBRoots = original })
 	return root
 }
 
