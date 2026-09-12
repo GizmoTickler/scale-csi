@@ -608,17 +608,53 @@ func (c *Client) SnapshotIsHeld(ctx context.Context, snapshotID string) (bool, e
 
 // isSnapshotAlreadyHeldError treats the idempotent already-held outcomes as
 // success. TrueNAS reports a re-hold as EEXIST/errno 17, sometimes wrapped as a
-// bare lzc_hold() failure whose only structured signal is the errno; both the
-// errno path and the ZFS wrapper message are accepted.
+// bare lzc_hold() failure whose only structured signal is the errno; the errno
+// path, the envelope's own reason text, and the ZFS wrapper message are all
+// accepted.
+//
+// The reason read is not optional decoration — on TrueNAS 26.0 it is the ONLY
+// evidence that survives to the client. pool.snapshot.hold calls the PRIVATE
+// zfs.resource.snapshot.hold_impl, which goes straight to
+// truenas_pylibzfs.lzc.create_holds() and re-raises its ZFSCoreException bare.
+// That exception is not a CallException, so process_method_call takes the
+// generic `except Exception` arm, adapt_exception() declines it, and the wire
+// error is -32001 "Method call error" with a HARDCODED top-level errno of
+// EINVAL. The real errno 17 lives only in the envelope's "reason", which is
+// str(ZFSCoreException) — captured verbatim from the appliance as
+//
+//	('lzc_hold() failed', (('File exists', 17),))
+//
+// APIError.Error() renders only Code and Message ("Method call error"), never
+// Data, so matching err.Error() could not see it: every re-hold of an
+// already-held snapshot failed, and the driver logged "it is not protected from
+// foreign deletion" about a snapshot that was in fact protected. Reading the one
+// named "reason" key is narrow by construction — unlike FullError() it never
+// descends into "trace" or a nested object — and it still has to carry BOTH the
+// lzc_hold marker and errno 17 in an errno-shaped position.
 func isSnapshotAlreadyHeldError(err error) bool {
 	if err == nil || IsAlreadyExistsError(err) {
 		return true
 	}
-	if errno, ok := APIErrno(err); ok {
-		return errno == syscall.EEXIST
+	if errno, ok := APIErrno(err); ok && errno == syscall.EEXIST {
+		return true
 	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "lzc_hold") && lzcErrnoMatches(message, 17)
+	if lzcHoldReportsAlreadyHeld(err.Error()) {
+		return true
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if reason, ok := truenasEnvelopeReason(apiErr); ok {
+			return lzcHoldReportsAlreadyHeld(reason)
+		}
+	}
+	return false
+}
+
+// lzcHoldReportsAlreadyHeld reports whether a libzfs_core traceback describes a
+// duplicate hold: the lzc_hold marker AND errno 17 in an errno-shaped position.
+func lzcHoldReportsAlreadyHeld(message string) bool {
+	lowered := strings.ToLower(message)
+	return strings.Contains(lowered, "lzc_hold") && lzcErrnoMatches(lowered, 17)
 }
 
 // lzcErrnoTuplePattern matches the errno POSITION of a libzfs_core traceback,

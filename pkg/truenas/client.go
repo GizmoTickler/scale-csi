@@ -147,10 +147,11 @@ func IsAlreadyExistsError(err error) bool {
 		// accepts "errno"/"*_errno", which the appliance never emits; without this
 		// a CallException carrying EEXIST arrives as -32001 whose Message is the
 		// constant literal "Method call error" and classifies as a hard false.
-		for _, envelopeErrno := range truenasEnvelopeErrnos(apiErr) {
-			if envelopeErrno == syscall.EEXIST {
-				return true
-			}
+		// The corroboration requirement is what keeps an EEXIST reported against
+		// an UNRELATED attribute from speaking for this object; see
+		// truenasEnvelopeReports.
+		if truenasEnvelopeReports(apiErr, syscall.EEXIST, "already exists") {
+			return true
 		}
 		return strings.Contains(strings.ToLower(apiErr.Message), "already exists")
 	}
@@ -259,8 +260,8 @@ func findErrno(value interface{}) (syscall.Errno, bool) {
 	return 0, false
 }
 
-// truenasEnvelopeErrnos returns the structured errnos carried by the TrueNAS
-// error envelope in an APIError's Data, most specific first.
+// truenasEnvelopeReports reports whether middlewared's error envelope attributes
+// `want` to the object THIS call named, corroborated by the envelope's own text.
 //
 // middlewared renders EVERY error through format_truenas_error
 // (api/base/server/ws_handler/rpc.py, read from the appliance at 26.0):
@@ -271,10 +272,29 @@ func findErrno(value interface{}) (syscall.Errno, bool) {
 // so the errno lives under "error" and its symbolic name under "errname" —
 // NEITHER of which is a key findErrno accepts. For a ValidationError(s) the
 // envelope goes out as -32602 "Invalid params" and its top-level errno is
-// hardcoded to EINVAL by format_truenas_validation_error, while the per-attribute
-// errnos ride in "extra" as [attribute, errmsg, errno] triples; for a
-// CallException it goes out as -32001 "Method call error" and the top-level
-// errno is the semantic one.
+// hardcoded to EINVAL by format_truenas_validation_error, while the
+// per-attribute errnos ride in "extra" as [attribute, errmsg, errno] triples
+// (process_method_call passes list(ValidationErrors), whose __iter__ yields
+// exactly (e.attribute, e.errmsg, e.errno)); for a CallException it goes out as
+// -32001 "Method call error" and the top-level errno is the semantic one.
+//
+// A per-attribute errno describes ONE attribute, not the call. ValidationErrors
+// is an accumulator, so the list routinely carries several unrelated entries,
+// and an EEXIST in it frequently means "some other object is taken" rather than
+// "the object you asked to create exists" — middlewared/plugins/account.py does
+//
+//	verrors.add(f'{schema}.home', f'{home}: homedir already used by {other}.',
+//	            errno.EEXIST)
+//
+// for a user that does NOT exist. Taking fields[2] from every triple and
+// ignoring fields[0]/fields[1] therefore let an unrelated attribute's errno
+// speak for the whole call. Each entry must now corroborate its own errno with
+// its own message, which every genuine already-exists emitter on the appliance
+// does ("... already exists" in pool_/snapshot.py, zfs/snapshot_crud.py,
+// zfs/resource_crud.py, pool_/pool.py, smb.py, tunables.py, vm/vms.py).
+//
+// The top-level errno needs no corroboration: it is the errno middlewared
+// assigned to the call itself, not to one of its arguments.
 //
 // This deliberately does NOT feed APIErrno/findErrno, tempting as that is.
 // MessageFallbackContains treats the presence of ANY structured errno as
@@ -285,37 +305,73 @@ func findErrno(value interface{}) (syscall.Errno, bool) {
 // create call sites — including pool.dataset.create, whose already-exists
 // evidence is ONLY textual (plugins/pool_/dataset.py raises it with
 // verrors.add(), which defaults errno to EINVAL). The reading is kept local to
-// the classifier that wants it.
+// the classifiers that want it.
 //
 // The walk is deliberately shallow: only the envelope's own keys and its
 // validation entries, never a recursive descent, so an errno mentioned inside a
 // "trace" frame or some nested object cannot be read as this object's status.
-func truenasEnvelopeErrnos(apiErr *APIError) []syscall.Errno {
+func truenasEnvelopeReports(apiErr *APIError, want syscall.Errno, corroborating ...string) bool {
 	data, ok := apiErr.Data.(map[string]interface{})
 	if !ok {
-		return nil
+		return false
 	}
 
-	var errnos []syscall.Errno
-	// Validation entries first: on a -32602 the top-level errno is always the
-	// generic EINVAL, and the attribute-level errno is the meaningful one.
+	// Validation entries: on a -32602 the top-level errno is always the generic
+	// EINVAL, and the attribute-level errno is the meaningful one — for the
+	// attribute it names, and only when that attribute's own message agrees.
 	if extra, ok := data["extra"].([]interface{}); ok {
 		for _, entry := range extra {
 			fields, ok := entry.([]interface{})
 			if !ok || len(fields) < 3 {
 				continue
 			}
-			if errno, ok := parseErrnoValue(fields[2]); ok {
-				errnos = append(errnos, errno)
+			errno, haveErrno := parseErrnoValue(fields[2])
+			if !haveErrno || errno != want {
+				continue
+			}
+			errmsg, haveMessage := fields[1].(string)
+			if !haveMessage {
+				continue
+			}
+			if containsAnyFold(errmsg, corroborating) {
+				return true
 			}
 		}
 	}
 	for _, key := range []string{"errname", "error"} {
-		if errno, ok := parseErrnoValue(data[key]); ok {
-			errnos = append(errnos, errno)
+		if errno, ok := parseErrnoValue(data[key]); ok && errno == want {
+			return true
 		}
 	}
-	return errnos
+	return false
+}
+
+// truenasEnvelopeReason returns the envelope's own "reason" string, the
+// human-readable text middlewared assigned to THIS call. It is the analog of
+// APIError.Message for the -32001/-32602 envelopes, whose Message is the
+// constant literal "Method call error"/"Invalid params" and therefore carries no
+// information. Unlike FullError() this reads one named key and never descends,
+// so a mention inside "trace" or a nested object cannot be picked up.
+func truenasEnvelopeReason(apiErr *APIError) (string, bool) {
+	data, ok := apiErr.Data.(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	reason, ok := data["reason"].(string)
+	return reason, ok
+}
+
+// containsAnyFold reports whether text contains any of the fragments,
+// case-insensitively. An empty fragment list never matches: a corroboration
+// requirement with nothing to corroborate against must fail closed.
+func containsAnyFold(text string, fragments []string) bool {
+	lowered := strings.ToLower(text)
+	for _, fragment := range fragments {
+		if strings.Contains(lowered, strings.ToLower(fragment)) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseErrnoValue(value interface{}) (syscall.Errno, bool) {
@@ -1509,6 +1565,11 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 	start := time.Now()
 	var halfOpenProbe bool
 	var breakerOutcomeRecorded bool
+	// The generation and probe id this call was admitted into. Every outcome
+	// below is stamped with them so a verdict that arrives after the breaker has
+	// moved on cannot be credited or debited against the state it never
+	// measured; see CircuitBreaker.outcomeApplies.
+	var breakerGeneration, breakerProbeID uint64
 
 	// Admit the logical call exactly once. Retries below only inspect state and
 	// never consume additional half-open probe slots.
@@ -1522,9 +1583,11 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 			return nil, err
 		}
 		halfOpenProbe = admission.halfOpenProbe
+		breakerGeneration = admission.generation
+		breakerProbeID = admission.probeID
 		defer func() {
 			if halfOpenProbe && !breakerOutcomeRecorded {
-				c.circuitBreaker.RecordFailure()
+				c.circuitBreaker.recordFailure(breakerGeneration, breakerProbeID)
 			}
 		}()
 	}
@@ -1534,7 +1597,7 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 	// no information about the NAS; see CircuitBreaker.RecordAbandoned.
 	abandonProbe := func() {
 		if c.circuitBreaker != nil && halfOpenProbe && !breakerOutcomeRecorded {
-			c.circuitBreaker.RecordAbandoned()
+			c.circuitBreaker.recordAbandoned(breakerGeneration, breakerProbeID)
 			breakerOutcomeRecorded = true
 		}
 	}
@@ -1602,7 +1665,7 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 		if err == nil {
 			// Record success with circuit breaker
 			if c.circuitBreaker != nil {
-				c.circuitBreaker.RecordSuccess()
+				c.circuitBreaker.recordSuccess(breakerGeneration, breakerProbeID)
 				breakerOutcomeRecorded = true
 			}
 			// Record successful request metrics
@@ -1616,7 +1679,7 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 			// semaphore now. Failures that arrive earlier may still be retried, and
 			// each such retry receives a fresh per-attempt timeout above.
 			if c.circuitBreaker != nil {
-				c.circuitBreaker.RecordFailure()
+				c.circuitBreaker.recordFailure(breakerGeneration, breakerProbeID)
 				breakerOutcomeRecorded = true
 			}
 			if c.metricsRecorder != nil {
@@ -1642,7 +1705,7 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 			if ctxErr != nil {
 				abandonProbe()
 			} else if c.circuitBreaker != nil {
-				c.circuitBreaker.RecordFailure()
+				c.circuitBreaker.recordFailure(breakerGeneration, breakerProbeID)
 				breakerOutcomeRecorded = true
 			}
 			if c.metricsRecorder != nil {
@@ -1674,7 +1737,7 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 			// preserved (no RecordFailure), it simply no longer erases the genuine
 			// connection failures interleaved with it.
 			if c.circuitBreaker != nil && halfOpenProbe {
-				c.circuitBreaker.RecordSuccess()
+				c.circuitBreaker.recordSuccess(breakerGeneration, breakerProbeID)
 				breakerOutcomeRecorded = true
 			}
 			// Record failed request metrics
@@ -1715,7 +1778,7 @@ func (c *Client) callRaw(ctx context.Context, method string, params ...interface
 
 	finalErr := fmt.Errorf("API call %s failed after %d retries: %w", method, maxRetries, lastErr)
 	if c.circuitBreaker != nil {
-		c.circuitBreaker.RecordFailure()
+		c.circuitBreaker.recordFailure(breakerGeneration, breakerProbeID)
 		breakerOutcomeRecorded = true
 	}
 	// Record failed request metrics after all retries exhausted
