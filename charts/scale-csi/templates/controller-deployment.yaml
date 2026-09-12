@@ -160,15 +160,52 @@ spec:
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
           {{- /* Startup probe budget, derived from startupConnectTimeout so the
-               two cannot drift. The probe must survive the WHOLE retry window:
-               initialDelay + failureThreshold*period > timeout. At the 5m
-               default that is 10 + 30*10 = 310s > 300s, i.e. the historical
-               values, and a raised startupConnectTimeout now raises the budget
-               with it instead of silently reintroducing the crash-loop. */}}
+               two cannot drift.
+
+               The kubelet does NOT give you initialDelay + threshold*period.
+               probeWorker calls doProbe BEFORE its first ticker wait, and a
+               tick that lands inside initialDelaySeconds returns "keep going"
+               WITHOUT counting a failure. Probe ATTEMPTS therefore sit on the
+               period grid and the Nth consecutive failure -- the one that
+               kills the container -- happens at
+
+                   initialDelay + (N-1)*period
+
+               so the last attempt the container ever gets is at that instant.
+               The historical failureThreshold 30 put it at 10 + 29*10 = 300s,
+               EXACTLY startupConnectTimeout and not the 310s the old comment
+               claimed. That is zero slack, and the slack is not optional: the
+               CSI socket only appears AFTER the connect window closes, and the
+               probe target (the liveness-probe sidecar on 9808) then still
+               needs a grpc reconnect backoff (upstream caps it at 1s), a
+               driver-name round trip and an HTTP listener bind before it can
+               answer 200. A backend that recovered in the last seconds of its
+               permitted window was killed anyway.
+
+               So budget one WHOLE extra period past the window. Attempts are
+               period-spaced, so buying a full period is what guarantees an
+               attempt exists strictly after the window closes no matter where
+               the window boundary falls on the grid, and 10s swallows the ~1s
+               backoff plus the sub-second RPC and bind with room to spare:
+
+                   initialDelay + (threshold-1)*period >= timeout + period
+
+               The division rounds UP, because floor division silently put the
+               last attempt BACK INSIDE the window for any window that is not a
+               whole number of periods ("305s" used to yield the same threshold
+               as "300s"). At the 5m default: threshold 31, last attempt
+               10 + 30*10 = 310s >= 300 + 10. A raised startupConnectTimeout
+               raises the budget with it instead of silently reintroducing the
+               crash-loop. */}}
           {{- $startupInitialDelay := 10 }}
           {{- $startupPeriod := 10 }}
-          {{- $startupTimeoutSeconds := include "scale-csi.durationToSecondsCeil" .Values.startupConnectTimeout | int }}
-          {{- $startupFailureThreshold := max 30 (add (div (sub $startupTimeoutSeconds $startupInitialDelay) $startupPeriod) 1) }}
+          {{- $startupTimeoutSeconds := include "scale-csi.durationToSecondsCeil" .Values.startupConnectTimeout | int64 }}
+          {{- /* Seconds of probing that must happen after initialDelay, then
+               ceil-divided into whole periods. int64 throughout: a legal
+               startupConnectTimeout of "1000h" is 3.6e6 seconds. */}}
+          {{- $startupProbeSpan := sub (add $startupTimeoutSeconds $startupPeriod) $startupInitialDelay }}
+          {{- $startupTicks := div (add $startupProbeSpan (sub $startupPeriod 1)) $startupPeriod }}
+          {{- $startupFailureThreshold := max 30 (add $startupTicks 1) }}
           # Port 9808 is the liveness-probe SIDECAR, and it is the only endpoint
           # in this pod that means "the driver is SERVING". It answers 200 only
           # once /csi/csi.sock accepts a CSI Probe RPC, and refuses the

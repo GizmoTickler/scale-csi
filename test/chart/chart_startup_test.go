@@ -2,6 +2,7 @@ package chart
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -61,8 +62,19 @@ func TestDriverStartupConnectionWindowAndProbe(t *testing.T) {
 		kind     string
 		name     string
 		want     probeEndpoint
+		// gatedOnBackend is true where the startup probe cannot pass until the
+		// TrueNAS connection succeeds, i.e. where the probe budget has to
+		// outlast startupConnectTimeout. Only the controller is: cmd/scale-csi
+		// computes needsTrueNAS = runController || reconcileOnce, and
+		// driver.NewDriver builds the management client only when RunController
+		// is set, so a node-mode process never attempts a backend connection,
+		// never enters the startup-retry loop, never stands up the temporary
+		// startup health server, and answers /readyz as soon as the driver's
+		// own health server binds. Its failureThreshold is therefore an
+		// ordinary generous constant and is deliberately NOT derived.
+		gatedOnBackend bool
 	}{
-		{template: "templates/controller-deployment.yaml", kind: "Deployment", name: "controller", want: probeEndpoint{path: "/healthz", port: "9808"}},
+		{template: "templates/controller-deployment.yaml", kind: "Deployment", name: "controller", want: probeEndpoint{path: "/healthz", port: "9808"}, gatedOnBackend: true},
 		{template: "templates/node-daemonset.yaml", kind: "DaemonSet", name: "-node", want: probeEndpoint{path: "/readyz", port: "9809"}},
 	}
 
@@ -80,8 +92,25 @@ func TestDriverStartupConnectionWindowAndProbe(t *testing.T) {
 			if got != test.want {
 				t.Errorf("startupProbe must hit %s, got %s: %#v", test.want, got, probe)
 			}
-			if probeInt(t, probe, "periodSeconds") != 10 || probeInt(t, probe, "failureThreshold") != 30 {
-				t.Errorf("startupProbe window must match the default five-minute retry window: %#v", probe)
+			// Deliberately NOT a literal failureThreshold. The controller's is
+			// derived from startupConnectTimeout, so pinning the number here
+			// would just re-encode whatever the template happens to emit and
+			// would pass on a wrong formula. Assert the property instead: the
+			// probe must still be able to observe a success after the whole
+			// retry window has elapsed. See
+			// TestControllerStartupProbeBudgetCoversStartupConnectTimeout for
+			// the full sweep and for why the kubelet's Nth failure lands at
+			// initialDelay + (N-1)*period.
+			initialDelay := probeInt(t, probe, "initialDelaySeconds")
+			period := probeInt(t, probe, "periodSeconds")
+			threshold := probeInt(t, probe, "failureThreshold")
+			if period != 10 {
+				t.Errorf("startupProbe periodSeconds must stay 10s: %#v", probe)
+			}
+			lastAttempt := time.Duration(initialDelay+(threshold-1)*period) * time.Second
+			if test.gatedOnBackend && lastAttempt < 5*time.Minute+time.Duration(period)*time.Second {
+				t.Errorf("startupProbe last attempt at %s does not clear the default five-minute "+
+					"retry window plus a period of slack: %#v", lastAttempt, probe)
 			}
 		})
 	}
@@ -145,17 +174,60 @@ func TestControllerStartupProbeGatesTheLivenessProbe(t *testing.T) {
 
 // TestControllerStartupProbeBudgetCoversStartupConnectTimeout proves the probe
 // budget is DERIVED from startupConnectTimeout rather than hard-coded to a
-// number that happens to work at the default.
+// number that happens to work at the default, AND that it is derived with the
+// kubelet's real probe schedule rather than a convenient approximation of it.
 //
-// Now that the startup probe actually fails for the whole time the driver is
-// retrying, the budget is load-bearing for the first time:
-// initialDelaySeconds + failureThreshold*periodSeconds must exceed
-// startupConnectTimeout, or the kubelet kills the container at exactly the
-// moment its own retry path was about to succeed. A hard-coded 30 satisfies
-// that at the 5m default (10 + 300 = 310 > 300) and silently fails at any
-// larger configured window.
+// The approximation is the whole defect. The obvious model is
+//
+//	budget = initialDelay + failureThreshold*period
+//
+// and it is wrong by one period. probeWorker calls doProbe BEFORE its first
+// ticker wait, and a tick that lands inside initialDelaySeconds returns "keep
+// going" WITHOUT counting a failure, so attempts sit on the period grid and the
+// Nth consecutive failure — the one that kills the container — happens at
+//
+//	lastAttempt = initialDelay + (failureThreshold-1)*period
+//
+// At the 5m default the historical failureThreshold 30 puts that at
+// 10 + 29*10 = 300s: EXACTLY startupConnectTimeout, not the 310s the old
+// comment asserted. Zero slack, and the slack is load-bearing — the CSI socket
+// only appears AFTER the connect window closes, and the probe target still owes
+// a grpc reconnect backoff, a driver-name round trip and a listener bind before
+// it answers 200. A backend that recovered in the last second of its permitted
+// window was killed anyway.
+//
+// The formula also floor-divided, so any window that was not a whole number of
+// periods ("305s") got the same threshold as the period below it and the last
+// attempt landed BACK INSIDE the window.
+//
+// Both properties are asserted below against the whole legal value space of
+// startupConnectTimeout (values.schema.json allows the full Go duration
+// grammar, including fractional segments and windows past 1e6 seconds), never
+// against a literal threshold.
 func TestControllerStartupProbeBudgetCoversStartupConnectTimeout(t *testing.T) {
-	for _, timeout := range []string{"5m", "90s", "10m", "30m", "1h", "1h30m", "0s"} {
+	// postConnectTail is the work that must still complete AFTER the driver's
+	// own connect window closes before the startup probe's target can answer
+	// 200: one grpc reconnect backoff inside the liveness-probe sidecar
+	// (upstream pins a one second maximum reconnect delay), the driver-name
+	// round trip that its Connect performs, and the bind of its HTTP listener.
+	// Three seconds is a generous ceiling on that.
+	const postConnectTail = 3 * time.Second
+
+	// The sweep spans the schema: sub-second units, the default, windows just
+	// off a period boundary (which floor division truncated), fractional
+	// segments, and windows at and beyond 1e6 seconds — where
+	// durationToSecondsCeil used to render a float64 in exponent form, sprig's
+	// int parsed it as 0, and the threshold silently collapsed to its floor.
+	timeouts := []string{
+		"0s", "1ns", "1us", "1µs", "500ms", "1s", "0.5s", "11s", "90s",
+		"5m", "300s", "301s", "305s", "309s", "310s", "10m", "30m",
+		"1h", "1h30m", "1.5h", "1h30.5m", "3599s", "3601s", "2h", "24h",
+		"277h", "278h", "300h", "1000h",
+		"999999s", "1000000s", "1000001s", "2000000s",
+	}
+
+	prevSeconds, prevThreshold := -1.0, 0
+	for _, timeout := range timeouts {
 		t.Run(timeout, func(t *testing.T) {
 			manifests := decodeManifests(t, helmTemplate(t,
 				"--set", "startupConnectTimeout="+timeout,
@@ -172,16 +244,101 @@ func TestControllerStartupProbeBudgetCoversStartupConnectTimeout(t *testing.T) {
 			initialDelay := probeInt(t, probe, "initialDelaySeconds")
 			period := probeInt(t, probe, "periodSeconds")
 			threshold := probeInt(t, probe, "failureThreshold")
+			if period <= 0 || threshold <= 0 {
+				t.Fatalf("nonsensical startupProbe schedule: %#v", probe)
+			}
 
-			window, err := time.ParseDuration(timeout)
+			parsed, err := time.ParseDuration(timeout)
 			if err != nil {
 				t.Fatalf("bad test input %q: %v", timeout, err)
 			}
-			budget := time.Duration(initialDelay+threshold*period) * time.Second
-			if budget <= window {
-				t.Errorf("startupProbe budget %s (initialDelay %ds + %d*%ds) does not outlast "+
-					"startupConnectTimeout %s; the kubelet restarts the container mid-retry",
-					budget, initialDelay, threshold, period, window)
+			window := time.Duration(math.Ceil(parsed.Seconds())) * time.Second
+
+			// The kubelet's real schedule: the last attempt the container ever
+			// gets, not a period later.
+			lastAttempt := time.Duration(initialDelay+(threshold-1)*period) * time.Second
+
+			// Primary property. The driver may connect at any instant up to
+			// and including the end of the window, and probe attempts are
+			// period-spaced, so an attempt must exist a full period past the
+			// window for one to be guaranteed to land after the socket is
+			// serving no matter where the window boundary falls on the grid.
+			if want := window + time.Duration(period)*time.Second; lastAttempt < want {
+				t.Errorf("last startup probe attempt is at %s (initialDelay %ds + (%d-1)*%ds); "+
+					"startupConnectTimeout %s needs an attempt at or after %s, else the kubelet "+
+					"kills the container at exactly the moment its own retry path was about to "+
+					"succeed", lastAttempt, initialDelay, threshold, period, window, want)
+			}
+
+			// Physical restatement, independent of the period: whatever the
+			// grid is, the budget has to cover the window plus the work the
+			// probe target still owes after the connection succeeds.
+			if want := window + postConnectTail; lastAttempt < want {
+				t.Errorf("last startup probe attempt at %s leaves no room for the post-connect "+
+					"tail (grpc reconnect backoff + driver-name round trip + listener bind) "+
+					"after startupConnectTimeout %s; need at least %s", lastAttempt, window, want)
+			}
+
+			// Derived, not constant: a longer window must never yield a smaller
+			// budget. The budget is quantized to whole periods, so equality is
+			// legitimate for two windows inside the same period; growth across
+			// a wider gap is asserted by
+			// TestControllerStartupProbeBudgetScalesWithTheWindow.
+			seconds := math.Ceil(parsed.Seconds())
+			if seconds > prevSeconds && threshold < prevThreshold {
+				t.Errorf("threshold %d for %s is smaller than %d for the shorter preceding "+
+					"window; the budget is not derived from startupConnectTimeout",
+					threshold, timeout, prevThreshold)
+			}
+			prevSeconds, prevThreshold = seconds, threshold
+		})
+	}
+}
+
+// TestControllerStartupProbeBudgetScalesWithTheWindow kills the cheat that
+// TestControllerStartupProbeBudgetCoversStartupConnectTimeout cannot see on its
+// own: a single enormous constant satisfies "the budget outlasts the window"
+// for every value in a bounded sweep while being derived from nothing.
+//
+// The budget is a LINEAR function of startupConnectTimeout with slope 1, so
+// doubling the window must push the last probe attempt out by the window's own
+// length, give or take the period the threshold is quantized to.
+func TestControllerStartupProbeBudgetScalesWithTheWindow(t *testing.T) {
+	lastAttempt := func(timeout string) (time.Duration, int) {
+		t.Helper()
+		manifests := decodeManifests(t, helmTemplate(t,
+			"--set", "startupConnectTimeout="+timeout,
+			"--show-only", "templates/controller-deployment.yaml"))
+		deployment := findManifest(t, manifests, "Deployment", "controller")
+		container := workloadContainer(t, deployment, "scale-csi")
+		probe, _ := containerProbe(t, container, "startupProbe")
+		initialDelay := probeInt(t, probe, "initialDelaySeconds")
+		period := probeInt(t, probe, "periodSeconds")
+		threshold := probeInt(t, probe, "failureThreshold")
+		return time.Duration(initialDelay+(threshold-1)*period) * time.Second, period
+	}
+
+	// Both windows are well past the `max 30` floor, so the floor cannot mask
+	// a constant.
+	for _, pair := range []struct{ small, large string }{
+		{"10m", "20m"},
+		{"1h", "2h"},
+		{"300h", "600h"}, // past 1e6 seconds, where the helper used to collapse
+	} {
+		t.Run(pair.small+"->"+pair.large, func(t *testing.T) {
+			small, period := lastAttempt(pair.small)
+			large, _ := lastAttempt(pair.large)
+			smallWindow, err := time.ParseDuration(pair.small)
+			if err != nil {
+				t.Fatalf("bad test input %q: %v", pair.small, err)
+			}
+			grew := large - small
+			slack := time.Duration(period) * time.Second
+			if grew < smallWindow-slack || grew > smallWindow+slack {
+				t.Errorf("doubling startupConnectTimeout from %s to %s moved the last probe "+
+					"attempt by %s (%s -> %s); a budget derived from the window would move it "+
+					"by %s +/- one %s period. A constant moves it by 0.",
+					pair.small, pair.large, grew, small, large, smallWindow, slack)
 			}
 		})
 	}
