@@ -69,6 +69,76 @@ carries:
   run and a secret scan. Dependencies (Kubernetes 0.37.0, testify 1.12.1, Go
   1.27.1 image, action digests) were refreshed.
 
+### Round eight — corrections to this release's own corrections
+
+Verification round eight reviewed the fixes rounds six and seven had landed and
+found three of them wrong. All three are defects this release introduced; none
+existed in v1.10.6.
+
+- **The NFS orphan guard admitted every live volume.** Round seven replaced a
+  guard that trusted an operator-writable share comment with one that checked the
+  exported path, but it only required that path to sit *somewhere under* the
+  parent dataset. Every live CSI volume exports a path under the parent, so the
+  guard admitted all of them: a share whose comment named a deleted dataset while
+  actually exporting a live volume was classified as an orphan and deleted. The
+  proof now requires the exported path to equal the claimed dataset's mountpoint
+  exactly, at detection and again at delete time.
+- **The iSCSI delete path had no revalidation at all.** It force-deleted an
+  extent, its association and its target using a row id a full sweep old, with no
+  re-read. It now re-proves ownership at mutation time, and an extent's own
+  device reference must agree with its comment.
+- **Namespace deletion had no ownership or occupancy proof**, on the protocol
+  carrying 48 of the 51 volumes in this cluster. It deleted every namespace on a
+  subsystem and then the subsystem itself. This was latent only because the
+  appliance currently runs exactly one namespace per subsystem. It now requires
+  the same sole-occupancy proof the iSCSI path uses.
+- **A refused orphan was leaked permanently.** Round seven's new safety gate
+  refused the target but the same pass still deleted the extent, which carries
+  the only discovery handle — so no later pass could see the orphan again. A
+  refusal now retains the whole orphan, and the skip is recorded every pass.
+- **The startup probe budget was still wrong after round seven derived it.** It
+  was short by one period, and it used floor division, so any window that was not
+  a whole number of periods received the threshold for the period below it. The
+  arithmetic now guarantees a probe attempt strictly after the connect window
+  closes.
+- **A duration helper collapsed to its floor above one million seconds**, because
+  shortest-precision float formatting switches to exponent form at that magnitude
+  and the integer parse then failed silently, yielding the zero-window default.
+- **The CHAP credential write reported success over a short list.** The fail-open
+  was in record *discovery*, not the write: two unreadable-directory paths were
+  silently skipped, so the write faithfully wrote every record it was handed
+  while some portals received no credential. Both now fail closed. A write that
+  stops partway says so. One skip is deliberately retained: a database root with
+  no records for the target is the ordinary case, because the node probes two
+  roots as alternatives.
+- **Every re-hold of an already-held snapshot was failing.** `pool.snapshot.hold`
+  re-raises its library exception bare, so the real `EEXIST` survives only in the
+  envelope `reason`, which the driver's error rendering never showed. The
+  idempotence check was matching text it could not see. The driver was emitting
+  `SnapshotHoldFailed` warnings claiming snapshots were unprotected when they
+  were in fact held.
+- An already-exists verdict is no longer inferred from an errno attributed to an
+  unrelated argument; the failing entry's own message must corroborate it.
+- The circuit breaker's probe accounting is now generation-scoped, so a probe
+  from an abandoned generation cannot close the circuit that replaced it, and a
+  failure arriving while the circuit is already open no longer pushes recovery
+  another full timeout away.
+
+#### Known and deferred
+
+- A permanently refused orphan is re-probed on all four daily passes forever with
+  no backoff; a repeating skip entry is the only operator signal.
+- A subsystem carrying two absent CSI datasets is refused permanently rather than
+  converging.
+- `startupConnectTimeout` has no schema upper bound, so an absurd value renders a
+  probe threshold that overflows int32 and is rejected at apply time rather than
+  at render time.
+- Deleting most chart configuration subtrees still aborts the render (39 of 47
+  object subtrees).
+- `-32001` is unhandled in the not-found direction.
+- Orphan extent cleanup handles only the first target association.
+- Some test fixtures still use JSON-RPC codes no current appliance path emits.
+
 ### Security — credentials off argv, backend errors scrubbed before they reach a PVC
 
 Three findings from a dedicated security review. All are latent with CHAP and
