@@ -213,7 +213,17 @@ duration grammar, so it needs this parser instead.
 {{- $seconds = addf $seconds (divf $value 1000000.0) -}}
 {{- end -}}
 {{- end -}}
-{{- ceil $seconds -}}
+{{- /* ceil returns a float64, and text/template prints a float64 with %v, i.e.
+     strconv 'g' with shortest precision -- which switches to exponent form at
+     an exponent of 6, so every value at or above 1e6 seconds rendered as
+     "1.0008e+06" / "3.6e+06" instead of digits. Callers pipe the result
+     through sprig's int/int64, both of which parse a string with ParseInt and
+     return 0 on failure, so the controller's startup budget silently collapsed
+     to its `max 30` floor for any startupConnectTimeout >= 1000000s ("278h",
+     "300h", "1000h" are all legal per values.schema.json). Converting the
+     float64 to int64 HERE, before it is ever stringified, is what fixes it:
+     int64 of a float64 is a numeric conversion, not a string parse. */}}
+{{- ceil $seconds | int64 -}}
 {{- end }}
 
 {{/*
