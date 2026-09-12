@@ -1,6 +1,42 @@
-# Release notes — v1.11.0 (next)
+# Release notes — v1.11.1 (next)
 
-## v1.11.0 (unreleased)
+## v1.11.1 — hotfix: strict fencing could not converge on v1.11.0
+
+v1.11.0 was deployed and rolled back after eight minutes. The controller never
+became ready. On startup, strict fencing re-issues the host-to-subsystem
+association for every desired host and relies on the client to treat a
+duplicate as success. TrueNAS rejects a duplicate as a validation error whose
+per-attribute errno is the generic `EINVAL`, with "This record already exists"
+only in the entry message. v1.10.6 matched the whole error text and passed.
+v1.11.0's envelope reader discarded any entry whose errno was not `EEXIST`
+before reading its message, so all 47 existing associations hard-failed on
+every pass, the fence never converged, and every controller RPC returned
+`Unavailable`. Snapshots failed within seconds. Node plugins and existing
+mounts were unaffected.
+
+The classifier now accepts a validation entry whose errno is the wanted one or
+the generic `EINVAL` when the entry's own message corroborates. The top-level
+`reason` is consulted only when no entry was readable, because it is the
+concatenation of every entry and reading it beside them fuses one entry's
+errno with another's text. The regression fixture is the real payload captured
+from the appliance through this client, byte for byte including the trace.
+Twelve call sites that relied on the classifier alone are covered by the one
+fix; `pool.snapshot.create` is the only appliance emitter that passes `EEXIST`
+explicitly, which is why this bug had exactly one passing witness.
+
+Also in this hotfix: the release image's `apk upgrade` layer was being served
+from the build cache and had not executed since the base digest last changed,
+shipping 207 HIGH util-linux findings through an "upgraded" image; a per-build
+argument now busts that layer. gRPC moves to v1.83.2 for two HIGH findings in
+the binary.
+
+Known and deferred: `findErrno` descends the entire error blob including trace
+frame locals, so a middleware local variable named `errno` would break both
+the classifier and the fallback belt at every site; a fixture guard makes that
+day loud. `NVMeoFHostCreate` has no already-exists handling at all and its
+caller is find-then-create.
+
+## v1.11.0 (released 2026-09-12, superseded by v1.11.1 the same day)
 
 v1.10.6 is tagged; the section below it in this file is its record. Everything
 in this section is what has landed on `integrate/v1.11.0` since. It is
