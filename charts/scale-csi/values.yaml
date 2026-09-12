@@ -1111,7 +1111,7 @@ sidecars:
     healthProbe:
       enabled: true
       port: 9810
-    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
     resources:
       requests:
         cpu: 10m
