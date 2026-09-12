@@ -325,14 +325,16 @@ func TestReleaseNotesNextTitlesThisRelease(t *testing.T) {
 	lines := strings.SplitN(content, "\n", 2)
 	title := lines[0]
 
-	const wantVersion = "v1.11.0"
+	const wantVersion = "v1.11.1"
 	if !strings.Contains(title, wantVersion) {
 		t.Errorf("release notes title %q does not name this release (%s)", title, wantVersion)
 	}
 	// A version that already has a released section below cannot also be the
 	// "next" one.
-	if strings.Contains(title, "v1.10.6") {
-		t.Errorf("release notes title %q names v1.10.6, which is tagged and has its own section in this file", title)
+	for _, shipped := range []string{"v1.10.6", "v1.11.0"} {
+		if strings.Contains(title, shipped) {
+			t.Errorf("release notes title %q names %s, which is tagged and has its own section in this file", title, shipped)
+		}
 	}
 	if !strings.Contains(content, "## "+wantVersion) {
 		t.Errorf("release notes carry no %q section describing this release", "## "+wantVersion)
