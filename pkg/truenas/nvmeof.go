@@ -151,7 +151,16 @@ func (c *Client) NVMeoFHostSubsysCreate(ctx context.Context, hostID, subsysID in
 	}
 	result, err := c.Call(ctx, "nvmet.host_subsys.create", params)
 	if err != nil {
-		if IsAlreadyExistsError(err) {
+		// The belt matches the sibling create sites that already carry one:
+		// NVMeoFSubsystemCreate, NVMeoFNamespaceCreate, NVMeoFPortCreate and
+		// NVMeoFPortSubsysCreate.
+		// nvmet.host_subsys.create reports a duplicate through a ValidationError,
+		// which middlewared renders as -32602 "Invalid params"; this site had no
+		// belt, so it depended on IsAlreadyExistsError alone and went down with it
+		// in v1.11.0. The confirming read below is what makes the fallback safe:
+		// a genuine parameter error finds no association and still returns the
+		// original error.
+		if IsAlreadyExistsError(err) || MessageFallbackContains(err, "invalid params") {
 			if existing, findErr := c.NVMeoFHostSubsysFind(ctx, hostID, subsysID); findErr == nil && existing != nil {
 				return existing, nil
 			}

@@ -301,8 +301,8 @@ func findErrno(value interface{}) (syscall.Errno, bool) {
 // authoritative and then refuses to look at text at all. Because middlewared
 // stamps a generic EINVAL on every validation error, teaching findErrno these
 // spellings would make every -32602 "authoritatively EINVAL" and silently
-// disable the `|| MessageFallbackContains(err, "invalid params")` belt at all ten
-// create call sites — including pool.dataset.create, whose already-exists
+// disable the `|| MessageFallbackContains(err, "invalid params")` belt at EVERY
+// paired create call site — including pool.dataset.create, whose already-exists
 // evidence is ONLY textual (plugins/pool_/dataset.py raises it with
 // verrors.add(), which defaults errno to EINVAL). The reading is kept local to
 // the classifiers that want it.
@@ -316,21 +316,49 @@ func truenasEnvelopeReports(apiErr *APIError, want syscall.Errno, corroborating 
 		return false
 	}
 
+	topErrno, haveTopErrno := envelopeErrno(data)
+
 	// Validation entries: on a -32602 the top-level errno is always the generic
 	// EINVAL, and the attribute-level errno is the meaningful one — for the
 	// attribute it names, and only when that attribute's own message agrees.
+	//
+	// The attribute errno is NOT required to equal `want`. ValidationErrors.add
+	// (middlewared/service_exception.py:59) declares `errno: int = errno.EINVAL`,
+	// so every emitter that calls verrors.add() WITHOUT passing an errno stamps
+	// EINVAL on an entry whose text is a perfectly good already-exists report.
+	// plugins/nvmet/host_subsys.py:143 is exactly that emitter:
+	//
+	//	verrors.add(f'{schema_name}.host_id',
+	//	            f"This record already exists (Host ID: .../Subsystem ID: ...)")
+	//
+	// Requiring errno == EEXIST here discarded that entry before its message was
+	// ever read, so strict fencing — which re-issues nvmet.host_subsys.create for
+	// every desired host on every subsystem at startup and leans on this
+	// classifier for idempotency — treated all 47 pre-existing associations as
+	// hard failures, never converged, and refused every controller RPC. That is
+	// the v1.11.0 production regression this arm repairs.
+	//
+	// The generic EINVAL is therefore treated as "no opinion" rather than as a
+	// contradiction, and the entry's own message decides. Round eight's
+	// attribution rule is untouched where it still bites: an entry carrying a
+	// DIFFERENT specific errno is still skipped, and no entry of any errno can
+	// speak without corroborating text of its own — so account.py's
+	// EEXIST-on-`home` ("homedir already used by ...") for a user that does not
+	// exist still does not classify.
+	readAnyValidationEntry := false
 	if extra, ok := data["extra"].([]interface{}); ok {
 		for _, entry := range extra {
 			fields, ok := entry.([]interface{})
 			if !ok || len(fields) < 3 {
 				continue
 			}
-			errno, haveErrno := parseErrnoValue(fields[2])
-			if !haveErrno || errno != want {
-				continue
-			}
 			errmsg, haveMessage := fields[1].(string)
 			if !haveMessage {
+				continue
+			}
+			readAnyValidationEntry = true
+			if errno, haveErrno := parseErrnoValue(fields[2]); haveErrno &&
+				errno != want && errno != syscall.EINVAL {
 				continue
 			}
 			if containsAnyFold(errmsg, corroborating) {
@@ -338,12 +366,53 @@ func truenasEnvelopeReports(apiErr *APIError, want syscall.Errno, corroborating 
 			}
 		}
 	}
-	for _, key := range []string{"errname", "error"} {
-		if errno, ok := parseErrnoValue(data[key]); ok && errno == want {
+	if haveTopErrno && topErrno == want {
+		return true
+	}
+	// The envelope's own "reason" is middlewared's text for THIS call —
+	// str(exception) for a ValidationError(s), str(CallError) otherwise.
+	//
+	// It is consulted ONLY as a fallback for an envelope that carried no readable
+	// validation entries, and only when the envelope's own errno is either the
+	// wanted one or the generic EINVAL. Both restrictions are load-bearing:
+	//
+	//   - For a ValidationError(s), reason is literally ValidationErrors.__str__,
+	//     i.e. the CONCATENATION of every entry already walked above. Reading it
+	//     alongside the entries would undo round eight's attribution rule, since
+	//     the concatenation fuses one entry's errno with another entry's text —
+	//     an EACCES entry saying "dataset already exists but is not accessible"
+	//     would be laundered into an already-exists verdict through the
+	//     envelope's generic EINVAL. The entries are strictly more informative,
+	//     so when they are readable they are the whole story.
+	//   - The explicit-errno requirement keeps round six closed: a bare
+	//     `{"reason": "the parent portal group already exists on another target"}`
+	//     with no errno anywhere is not a middlewared envelope at all, it is a
+	//     mention about a NESTED object, and must stay a hard false.
+	if !readAnyValidationEntry && haveTopErrno &&
+		(topErrno == want || topErrno == syscall.EINVAL) {
+		if reason, ok := data["reason"].(string); ok && containsAnyFold(reason, corroborating) {
 			return true
 		}
 	}
 	return false
+}
+
+// envelopeErrno returns the errno middlewared stamped on the envelope ITSELF —
+// format_truenas_error writes it to "errname" (symbolic) and "error" (numeric),
+// and to no other key. It is deliberately a one-level lookup on those two names:
+// unlike findErrno it never descends, so an errno-shaped value inside a "trace"
+// frame's `locals` or some nested object cannot be read as the call's status.
+//
+// Absence is reported distinctly from a value. An envelope with no errno at all
+// is not a -32602/-32001 middlewared envelope, and the callers above must treat
+// its free text as unattributed rather than as a statement about this object.
+func envelopeErrno(data map[string]interface{}) (syscall.Errno, bool) {
+	for _, key := range []string{"errname", "error"} {
+		if errno, ok := parseErrnoValue(data[key]); ok {
+			return errno, true
+		}
+	}
+	return 0, false
 }
 
 // truenasEnvelopeReason returns the envelope's own "reason" string, the

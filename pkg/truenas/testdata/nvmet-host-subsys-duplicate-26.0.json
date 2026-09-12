@@ -1,0 +1,240 @@
+{
+  "code": -32602,
+  "data": {
+    "errname": "EINVAL",
+    "error": 22,
+    "extra": [
+      [
+        "nvmet_host_subsys_create.host_id",
+        "This record already exists (Host ID: 5/Subsystem ID: 2543)",
+        22
+      ]
+    ],
+    "reason": "[EINVAL] nvmet_host_subsys_create.host_id: This record already exists (Host ID: 5/Subsystem ID: 2543)\n",
+    "trace": {
+      "class": "ValidationErrors",
+      "formatted": "Traceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/middlewared/api/base/server/ws_handler/rpc.py\", line 387, in process_method_call\n    result = await method.call(app, id_, params)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/middlewared/api/base/server/method.py\", line 70, in call\n    result = await self.middleware.call_with_audit(self.name, self.serviceobj, methodobj, params, app,\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                                                   message_id=id_)\n                                                   ^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/middlewared/main.py\", line 1094, in call_with_audit\n    result = await self._call(method, serviceobj, methodobj, params, app=app,\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                              audit_callback=audit_callback_messages.append, **kwargs)\n                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/middlewared/main.py\", line 921, in _call\n    return await methodobj(*prepared_call.args)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/middlewared/service/crud_service.py\", line 185, in create\n    return await self.middleware._call(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...\u003c3 lines\u003e...\n    )\n    ^\n  File \"/usr/lib/python3/dist-packages/middlewared/main.py\", line 921, in _call\n    return await methodobj(*prepared_call.args)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/middlewared/service/crud_service.py\", line 225, in nf\n    rv = await func(*args, **kwargs)\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/middlewared/api/base/decorator.py\", line 209, in wrapped\n    result = await func(*args)\n             ^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/middlewared/plugins/nvmet/host_subsys.py\", line 48, in do_create\n    verrors.check()\n    ~~~~~~~~~~~~~^^\n  File \"/usr/lib/python3/dist-packages/middlewared/service_exception.py\", line 71, in check\n    raise self\nmiddlewared.service_exception.ValidationErrors: [EINVAL] nvmet_host_subsys_create.host_id: This record already exists (Host ID: 5/Subsystem ID: 2543)\n\n",
+      "frames": [
+        {
+          "argspec": [
+            "self",
+            "app",
+            "id_",
+            "method",
+            "params"
+          ],
+          "filename": "/usr/lib/python3/dist-packages/middlewared/api/base/server/ws_handler/rpc.py",
+          "line": "                app.send_truenas_validation_error(id_, sys.exc_info(), list(e))\n",
+          "lineno": 399,
+          "locals": {
+            "app": "\u003cmiddlewared.api.base.server.ws_handler.rpc.RpcWebSocketApp object at 0x7f116c20e5d0\u003e",
+            "e": "ValidationErrors([ValidationError('nvmet_host_subsys_create.host_id', 'This record already exists (Host ID: 5/Subsystem ID: 2543)', 22)])",
+            "id_": "3",
+            "method": "\u003cmiddlewared.api.base.server.method.Method object at 0x7f11b102ca60\u003e",
+            "params": "[{'host_id': 5, 'subsys_id': 2543}]",
+            "self": "\u003cmiddlewared.api.base.server.ws_handler.rpc.RpcWebSocketHandler object at 0x7f11b0f78590\u003e"
+          },
+          "method": "process_method_call"
+        },
+        {
+          "argspec": [
+            "self",
+            "app",
+            "id_",
+            "params"
+          ],
+          "filename": "/usr/lib/python3/dist-packages/middlewared/api/base/server/method.py",
+          "line": "        result = await self.middleware.call_with_audit(self.name, self.serviceobj, methodobj, params, app,\n",
+          "lineno": 70,
+          "locals": {
+            "app": "\u003cmiddlewared.api.base.server.ws_handler.rpc.RpcWebSocketApp object at 0x7f116c20e5d0\u003e",
+            "id_": "3",
+            "methodobj": "\u003cbound method CRUDService.create of \u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e\u003e",
+            "mock": "None",
+            "params": "[{'host_id': 5, 'subsys_id': 2543}]",
+            "self": "\u003cmiddlewared.api.base.server.method.Method object at 0x7f11b102ca60\u003e"
+          },
+          "method": "call"
+        },
+        {
+          "argspec": [
+            "self",
+            "method",
+            "serviceobj",
+            "methodobj",
+            "params",
+            "app"
+          ],
+          "filename": "/usr/lib/python3/dist-packages/middlewared/main.py",
+          "keywordspec": "kwargs",
+          "line": "                await log_audit_message_for_method(success)\n",
+          "lineno": 1105,
+          "locals": {
+            "app": "\u003cmiddlewared.api.base.server.ws_handler.rpc.RpcWebSocketApp object at 0x7f116c20e5d0\u003e",
+            "audit_callback_messages": "[]",
+            "job": "None",
+            "job_on_finish_cb": "\u003cfunction Middleware.call_with_audit.\u003clocals\u003e.job_on_finish_cb at 0x7f114c462fc0\u003e",
+            "kwargs": "{'message_id': 3}",
+            "log_audit_message_for_method": "\u003cfunction Middleware.call_with_audit.\u003clocals\u003e.log_audit_message_for_method at 0x7f114c461300\u003e",
+            "method": "'nvmet.host_subsys.create'",
+            "methodobj": "\u003cbound method CRUDService.create of \u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e\u003e",
+            "params": "[{'host_id': 5, 'subsys_id': 2543}]",
+            "self": "\u003cmiddlewared.main.Middleware object at 0x7f11e7553b60\u003e",
+            "serviceobj": "\u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e",
+            "success": "False"
+          },
+          "method": "call_with_audit"
+        },
+        {
+          "argspec": [
+            "self",
+            "name",
+            "serviceobj",
+            "methodobj",
+            "params",
+            "kwargs",
+            "app",
+            "audit_callback",
+            "job_on_progress_cb",
+            "message_id",
+            "pipes",
+            "in_event_loop"
+          ],
+          "filename": "/usr/lib/python3/dist-packages/middlewared/main.py",
+          "line": "            return await methodobj(*prepared_call.args)\n",
+          "lineno": 921,
+          "locals": {
+            "app": "\u003cmiddlewared.api.base.server.ws_handler.rpc.RpcWebSocketApp object at 0x7f116c20e5d0\u003e",
+            "audit_callback": "\u003cbuilt-in method append of list object at 0x7f11f2dc7340\u003e",
+            "in_event_loop": "True",
+            "job_on_progress_cb": "None",
+            "kwargs": "None",
+            "message_id": "3",
+            "methodobj": "\u003cbound method CRUDService.create of \u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e\u003e",
+            "name": "'nvmet.host_subsys.create'",
+            "params": "[{'host_id': 5, 'subsys_id': 2543}]",
+            "pipes": "None",
+            "prepared_call": "PreparedCall(args=[\u003cmiddlewared.api.base.server.ws_handler.rpc.RpcWebSocketApp object at 0x7f116c20e5d0\u003e, \u003cbuilt-in method append of list object at 0x7f11f2dc7340\u003e, 3, {'host_id': 5, 'subsys_id': 2543}], kwargs={}, executor=\u003cmiddlewared.utils.threading.IoThreadPoolExecutor object at 0x7f11ed038440\u003e, job=None, is_coroutine=True)",
+            "self": "\u003cmiddlewared.main.Middleware object at 0x7f11e7553b60\u003e",
+            "serviceobj": "\u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e"
+          },
+          "method": "_call"
+        },
+        {
+          "argspec": [
+            "self",
+            "app",
+            "audit_callback",
+            "message_id",
+            "data"
+          ],
+          "filename": "/usr/lib/python3/dist-packages/middlewared/service/crud_service.py",
+          "line": "        return await self.middleware._call(\n",
+          "lineno": 185,
+          "locals": {
+            "app": "\u003cmiddlewared.api.base.server.ws_handler.rpc.RpcWebSocketApp object at 0x7f116c20e5d0\u003e",
+            "audit_callback": "\u003cbuilt-in method append of list object at 0x7f11f2dc7340\u003e",
+            "data": "{'host_id': 5, 'subsys_id': 2543}",
+            "message_id": "3",
+            "self": "\u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e"
+          },
+          "method": "create"
+        },
+        {
+          "argspec": [
+            "self",
+            "name",
+            "serviceobj",
+            "methodobj",
+            "params",
+            "kwargs",
+            "app",
+            "audit_callback",
+            "job_on_progress_cb",
+            "message_id",
+            "pipes",
+            "in_event_loop"
+          ],
+          "filename": "/usr/lib/python3/dist-packages/middlewared/main.py",
+          "line": "            return await methodobj(*prepared_call.args)\n",
+          "lineno": 921,
+          "locals": {
+            "app": "\u003cmiddlewared.api.base.server.ws_handler.rpc.RpcWebSocketApp object at 0x7f116c20e5d0\u003e",
+            "audit_callback": "\u003cbuilt-in method append of list object at 0x7f11f2dc7340\u003e",
+            "in_event_loop": "True",
+            "job_on_progress_cb": "None",
+            "kwargs": "None",
+            "message_id": "3",
+            "methodobj": "\u003cfunction CRUDService._get_crud_wrapper_func.\u003clocals\u003e.nf at 0x7f114c4631a0\u003e",
+            "name": "'nvmet.host_subsys.create'",
+            "params": "[{'host_id': 5, 'subsys_id': 2543}]",
+            "pipes": "None",
+            "prepared_call": "PreparedCall(args=[{'host_id': 5, 'subsys_id': 2543}], kwargs={}, executor=\u003cmiddlewared.utils.threading.IoThreadPoolExecutor object at 0x7f11ed038440\u003e, job=None, is_coroutine=True)",
+            "self": "\u003cmiddlewared.main.Middleware object at 0x7f11e7553b60\u003e",
+            "serviceobj": "\u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e"
+          },
+          "method": "_call"
+        },
+        {
+          "filename": "/usr/lib/python3/dist-packages/middlewared/service/crud_service.py",
+          "keywordspec": "kwargs",
+          "line": "                rv = await func(*args, **kwargs)\n",
+          "lineno": 225,
+          "locals": {
+            "action": "'create'",
+            "args": "('***',)",
+            "func": "\u003cbound method NVMetHostSubsysService.do_create of \u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e\u003e",
+            "kwargs": "{}",
+            "self": "\u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e",
+            "send_event": "\u003cfunction CRUDService._get_crud_wrapper_func.\u003clocals\u003e.send_event at 0x7f114c4637e0\u003e"
+          },
+          "method": "nf",
+          "varargspec": "args"
+        },
+        {
+          "filename": "/usr/lib/python3/dist-packages/middlewared/api/base/decorator.py",
+          "line": "                result = await func(*args)\n",
+          "lineno": 209,
+          "locals": {
+            "accepts": "\u003cclass 'middlewared.api.v26_0_0.nvmet_host_subsys.NVMetHostSubsysCreateArgs'\u003e",
+            "args": "('***', '***')",
+            "args_index": "1",
+            "dump_models": "True",
+            "func": "\u003cfunction NVMetHostSubsysService.do_create at 0x7f11b2a33920\u003e"
+          },
+          "method": "wrapped",
+          "varargspec": "args"
+        },
+        {
+          "argspec": [
+            "self",
+            "data"
+          ],
+          "filename": "/usr/lib/python3/dist-packages/middlewared/plugins/nvmet/host_subsys.py",
+          "line": "        verrors.check()\n",
+          "lineno": 48,
+          "locals": {
+            "data": "{'host_id': 5, 'subsys_id': 2543}",
+            "self": "\u003cmiddlewared.plugins.nvmet.host_subsys.NVMetHostSubsysService object at 0x7f11b172b4d0\u003e",
+            "verrors": "ValidationErrors([ValidationError('nvmet_host_subsys_create.host_id', 'This record already exists (Host ID: 5/Subsystem ID: 2543)', 22)])"
+          },
+          "method": "do_create"
+        },
+        {
+          "argspec": [
+            "self"
+          ],
+          "filename": "/usr/lib/python3/dist-packages/middlewared/service_exception.py",
+          "line": "            raise self\n",
+          "lineno": 71,
+          "locals": {
+            "self": "ValidationErrors([ValidationError('nvmet_host_subsys_create.host_id', 'This record already exists (Host ID: 5/Subsystem ID: 2543)', 22)])"
+          },
+          "method": "check"
+        }
+      ],
+      "repr": "ValidationErrors([ValidationError('nvmet_host_subsys_create.host_id', 'This record already exists (Host ID: 5/Subsystem ID: 2543)', 22)])"
+    }
+  },
+  "message": "Invalid params"
+}
