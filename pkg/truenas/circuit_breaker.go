@@ -98,13 +98,27 @@ type CircuitBreaker struct {
 	halfOpenRequests int
 	lastStateChange  time.Time
 
-	// probeAdmissions holds the admission time of every half-open probe that has
-	// NOT yet reported an outcome, oldest first. Its length is the number of
-	// probes currently in flight; halfOpenRequests, by contrast, counts slots
-	// CONSUMED and is never given back by a verdict. The escape timer needs the
-	// former: a probe that is still running is a pending verdict, not a missing
-	// one. Bounded by HalfOpenMaxRequests.
-	probeAdmissions []time.Time
+	// generation counts state transitions. Every admission is stamped with the
+	// generation that was live when it was granted, and an outcome may only move
+	// the breaker if that stamp still matches. Without it a probe issued in one
+	// half-open generation was credited or debited against a LATER one: its
+	// success could close a circuit that had already given up on it, and its
+	// resolution consumed the live generation's probeAdmissions entry, leaving a
+	// genuinely in-flight probe invisible to the escape timer and so reopening
+	// the circuit one Timeout later instead of one ProbeLeakGrace later — the
+	// exact spurious-open loop the in-flight accounting exists to prevent.
+	// Starts at 1 so currentGeneration (0) can mean "not stamped".
+	generation uint64
+	// nextProbeID hands each admitted probe an identity within its generation.
+	nextProbeID uint64
+
+	// probeAdmissions holds every half-open probe of the CURRENT generation that
+	// has NOT yet reported an outcome, in admission order. Its length is the
+	// number of probes currently in flight; halfOpenRequests, by contrast, counts
+	// slots CONSUMED and is never given back by a verdict. The escape timer needs
+	// the former: a probe that is still running is a pending verdict, not a
+	// missing one. Bounded by HalfOpenMaxRequests.
+	probeAdmissions []probeAdmission
 	// lastProbeActivity is when a probe was last admitted or last reported an
 	// outcome. The escape timer runs from this rather than from lastStateChange,
 	// which starts ticking the moment half-open begins and so can expire while a
@@ -119,7 +133,26 @@ type CircuitBreaker struct {
 type circuitBreakerAdmission struct {
 	allowed       bool
 	halfOpenProbe bool
+	// generation is the breaker generation this call was admitted into. The
+	// outcome it eventually reports is only allowed to move that generation.
+	generation uint64
+	// probeID identifies this probe among the outstanding probes of its
+	// generation, so a verdict retires ITS OWN admission record rather than
+	// whichever happens to be oldest.
+	probeID uint64
 }
+
+// probeAdmission is one outstanding half-open probe.
+type probeAdmission struct {
+	id uint64
+	at time.Time
+}
+
+// currentGeneration stamps an outcome that is not tied to any particular
+// generation, which is how the exported Record* entry points behave: they
+// always apply to whatever state is live now. The client pipeline stamps its
+// real generation instead.
+const currentGeneration uint64 = 0
 
 // NewCircuitBreaker creates a new circuit breaker with the given configuration.
 func NewCircuitBreaker(config *CircuitBreakerConfig) *CircuitBreaker {
@@ -144,6 +177,7 @@ func NewCircuitBreaker(config *CircuitBreakerConfig) *CircuitBreaker {
 	return &CircuitBreaker{
 		config:            &normalized,
 		state:             CircuitClosed,
+		generation:        1,
 		lastStateChange:   now,
 		lastProbeActivity: now,
 	}
@@ -168,15 +202,19 @@ func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 
 	switch cb.state {
 	case CircuitClosed:
-		return circuitBreakerAdmission{allowed: true}
+		return circuitBreakerAdmission{allowed: true, generation: cb.generation}
 
 	case CircuitOpen:
 		// Check if timeout has elapsed to transition to half-open
 		if time.Since(cb.lastFailure) >= cb.config.Timeout {
 			cb.transitionTo(CircuitHalfOpen)
 			cb.halfOpenRequests = 1
-			cb.admitProbe()
-			return circuitBreakerAdmission{allowed: true, halfOpenProbe: true}
+			return circuitBreakerAdmission{
+				allowed:       true,
+				halfOpenProbe: true,
+				generation:    cb.generation,
+				probeID:       cb.admitProbe(),
+			}
 		}
 		return circuitBreakerAdmission{}
 
@@ -184,8 +222,12 @@ func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 		// Allow limited requests in half-open state
 		if cb.halfOpenRequests < cb.config.HalfOpenMaxRequests {
 			cb.halfOpenRequests++
-			cb.admitProbe()
-			return circuitBreakerAdmission{allowed: true, halfOpenProbe: true}
+			return circuitBreakerAdmission{
+				allowed:       true,
+				halfOpenProbe: true,
+				generation:    cb.generation,
+				probeID:       cb.admitProbe(),
+			}
 		}
 		// ESCAPE TIMER. With every probe slot consumed, ONLY a recorded outcome
 		// can move the state — so a probe that never reports one (a goroutine
@@ -208,24 +250,43 @@ func (cb *CircuitBreaker) admit() circuitBreakerAdmission {
 		return circuitBreakerAdmission{}
 	}
 
-	return circuitBreakerAdmission{allowed: true}
+	return circuitBreakerAdmission{allowed: true, generation: cb.generation}
 }
 
-// admitProbe records that a half-open probe just went on the wire (lock held).
-func (cb *CircuitBreaker) admitProbe() {
+// admitProbe records that a half-open probe just went on the wire and returns
+// its id (lock held).
+func (cb *CircuitBreaker) admitProbe() uint64 {
 	now := time.Now()
-	cb.probeAdmissions = append(cb.probeAdmissions, now)
+	cb.nextProbeID++
+	cb.probeAdmissions = append(cb.probeAdmissions, probeAdmission{id: cb.nextProbeID, at: now})
 	cb.lastProbeActivity = now
+	return cb.nextProbeID
 }
 
-// resolveProbe records that the oldest outstanding half-open probe reported an
-// outcome (lock held). The consumed slot is NOT given back — a probe that
-// answered has been spent — only the in-flight accounting is updated.
-func (cb *CircuitBreaker) resolveProbe() {
-	if len(cb.probeAdmissions) > 0 {
-		cb.probeAdmissions = cb.probeAdmissions[1:]
+// resolveProbe records that an outstanding half-open probe reported an outcome
+// (lock held). The consumed slot is NOT given back — a probe that answered has
+// been spent — only the in-flight accounting is updated.
+//
+// The probe is retired BY ID. Retiring the oldest instead made a fast probe's
+// verdict erase a slow one's admission record, which is the difference between
+// the escape timer seeing "a probe admitted at T is still running" and seeing
+// "nothing is running": the first waits ProbeLeakGrace, the second reopens after
+// a mere Timeout and throws away an answer that was on its way.
+// currentGeneration outcomes carry no id and fall back to the oldest.
+func (cb *CircuitBreaker) resolveProbe(probeID uint64) {
+	for i, probe := range cb.probeAdmissions {
+		if probeID == currentGeneration || probe.id == probeID {
+			cb.probeAdmissions = append(cb.probeAdmissions[:i], cb.probeAdmissions[i+1:]...)
+			break
+		}
 	}
 	cb.lastProbeActivity = time.Now()
+}
+
+// outcomeApplies reports whether an outcome stamped with generation is still
+// speaking about the state the breaker is in (lock held).
+func (cb *CircuitBreaker) outcomeApplies(generation uint64) bool {
+	return generation == currentGeneration || generation == cb.generation
 }
 
 // halfOpenEscapeDue reports whether half-open should be abandoned (lock held).
@@ -246,13 +307,20 @@ func (cb *CircuitBreaker) resolveProbe() {
 //     ProbeLeakGrace, which is explicitly longer than any legitimate call.
 func (cb *CircuitBreaker) halfOpenEscapeDue(now time.Time) bool {
 	if len(cb.probeAdmissions) > 0 {
-		return now.Sub(cb.probeAdmissions[0]) >= cb.config.ProbeLeakGrace
+		return now.Sub(cb.probeAdmissions[0].at) >= cb.config.ProbeLeakGrace
 	}
 	return now.Sub(cb.lastProbeActivity) >= cb.config.Timeout
 }
 
-// RecordSuccess records a successful request.
+// RecordSuccess records a successful request that is not scoped to a particular
+// breaker generation; it applies to whatever state is live now.
 func (cb *CircuitBreaker) RecordSuccess() {
+	cb.recordSuccess(currentGeneration, currentGeneration)
+}
+
+// recordSuccess records a successful request reported by a call admitted in the
+// given generation.
+func (cb *CircuitBreaker) recordSuccess(generation, probeID uint64) {
 	if !cb.config.Enabled {
 		return
 	}
@@ -262,13 +330,21 @@ func (cb *CircuitBreaker) RecordSuccess() {
 
 	cb.totalSuccesses++
 
+	if !cb.outcomeApplies(generation) {
+		// The state this success measured is gone. Crediting it here would let a
+		// probe the breaker already gave up on close a later generation's circuit
+		// on evidence that predates the reopen.
+		klog.V(2).Infof("Circuit breaker ignoring success from stale generation %d (current %d)", generation, cb.generation)
+		return
+	}
+
 	switch cb.state {
 	case CircuitClosed:
 		// Reset failure count on success
 		cb.failures = 0
 
 	case CircuitHalfOpen:
-		cb.resolveProbe()
+		cb.resolveProbe(probeID)
 		cb.successes++
 		if cb.successes >= cb.config.SuccessThreshold {
 			// Enough successes - close the circuit
@@ -293,6 +369,12 @@ func (cb *CircuitBreaker) RecordSuccess() {
 // keep it reopening. This restores the symmetry while still returning the probe
 // slot, so the NEXT caller can take the measurement this one abandoned.
 func (cb *CircuitBreaker) RecordAbandoned() {
+	cb.recordAbandoned(currentGeneration, currentGeneration)
+}
+
+// recordAbandoned releases a half-open probe slot for a call admitted in the
+// given generation.
+func (cb *CircuitBreaker) recordAbandoned(generation, probeID uint64) {
 	if !cb.config.Enabled {
 		return
 	}
@@ -300,14 +382,27 @@ func (cb *CircuitBreaker) RecordAbandoned() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if !cb.outcomeApplies(generation) {
+		// Returning a slot to a generation that never issued this probe would
+		// hand out MORE probes than HalfOpenMaxRequests allows.
+		return
+	}
+
 	if cb.state == CircuitHalfOpen && cb.halfOpenRequests > 0 {
 		cb.halfOpenRequests--
-		cb.resolveProbe()
+		cb.resolveProbe(probeID)
 	}
 }
 
-// RecordFailure records a failed request.
+// RecordFailure records a failed request that is not scoped to a particular
+// breaker generation; it applies to whatever state is live now.
 func (cb *CircuitBreaker) RecordFailure() {
+	cb.recordFailure(currentGeneration, currentGeneration)
+}
+
+// recordFailure records a failed request reported by a call admitted in the
+// given generation.
+func (cb *CircuitBreaker) recordFailure(generation, probeID uint64) {
 	if !cb.config.Enabled {
 		return
 	}
@@ -316,10 +411,14 @@ func (cb *CircuitBreaker) RecordFailure() {
 	defer cb.mu.Unlock()
 
 	cb.totalFailures++
-	cb.lastFailure = time.Now()
+
+	if !cb.outcomeApplies(generation) {
+		return
+	}
 
 	switch cb.state {
 	case CircuitClosed:
+		cb.lastFailure = time.Now()
 		cb.failures++
 		if cb.failures >= cb.config.FailureThreshold {
 			// Too many failures - open the circuit
@@ -328,12 +427,21 @@ func (cb *CircuitBreaker) RecordFailure() {
 
 	case CircuitHalfOpen:
 		// Any failure in half-open reopens the circuit
-		cb.resolveProbe()
+		cb.lastFailure = time.Now()
+		cb.resolveProbe(probeID)
 		cb.transitionTo(CircuitOpen)
 
 	case CircuitOpen:
-		// Calls are rejected before they run while open (see AllowRequest);
-		// a failure here would be spurious.
+		// RECOVERY STARVATION. Calls are rejected before they run while open, so
+		// a failure recorded here belongs to a request admitted in an earlier
+		// generation; the reopen it reports has already happened. lastFailure is
+		// the Open -> half-open recovery clock, and stamping it with a straggler's
+		// arrival time restarts that clock for a failure the breaker already
+		// counted. A trickle of slow-failing stragglers — exactly what an outage
+		// produces, since every in-flight call fails late — could then hold the
+		// breaker Open indefinitely, with no probe ever issued and nothing outside
+		// this type able to clear it. The failure is still counted in the metric
+		// above; it simply must not push recovery away.
 	}
 }
 
@@ -346,8 +454,10 @@ func (cb *CircuitBreaker) transitionTo(newState CircuitState) {
 	cb.successes = 0
 	cb.halfOpenRequests = 0
 	// Probes admitted under the OLD state can no longer move this one, so they
-	// are not "outstanding" for escape purposes; a late verdict from one lands in
-	// the new state's rules like any other.
+	// are not "outstanding" for escape purposes. Bumping the generation is what
+	// makes a late verdict from one of them inert rather than letting it land in
+	// the new state's rules as if it had measured them.
+	cb.generation++
 	cb.probeAdmissions = nil
 	cb.lastProbeActivity = cb.lastStateChange
 
