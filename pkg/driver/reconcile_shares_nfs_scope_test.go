@@ -180,6 +180,6 @@ func TestDeleteOrphanedNFSShareRevalidatesTheShareAtDeleteTime(t *testing.T) {
 	assert.Empty(t, report.DeletedShares, "a retargeted share must not be deleted on a stale classification")
 	require.Len(t, report.SkippedDeletes, 1)
 	assert.Equal(t, "share", report.SkippedDeletes[0].Kind)
-	assert.Contains(t, report.SkippedDeletes[0].Reason, "not under the parent dataset mountpoint")
+	assert.Contains(t, report.SkippedDeletes[0].Reason, "rather than exactly")
 	assert.Contains(t, nfsSharePaths(t, client), "/mnt/tank/finance", "the retargeted share must survive")
 }

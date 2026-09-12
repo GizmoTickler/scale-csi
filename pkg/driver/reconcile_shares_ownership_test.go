@@ -44,8 +44,13 @@ func iscsiExtentNames(t *testing.T, client *truenas.MockClient) []string {
 // operator's shared target therefore destroyed that target and took every live
 // extent on it offline. Here the orphaned extent's association points at a
 // target named "shared-storage-target" that also carries a live, non-CSI
-// extent: the orphan's own extent and association must be swept and the target
-// and the foreign extent must survive.
+// extent: the target and the foreign extent must survive.
+//
+// Round 8: the refusal now retains the orphan's OWN extent and association too.
+// Sweeping them while retaining the target destroyed the extent comment, which
+// is the only handle detectOrphanedISCSIShares rediscovers the orphan by, so the
+// refused target leaked permanently and invisibly. See
+// TestOrphanShareSweepRetainsRefusedISCSIOrphanAcrossPasses.
 func TestOrphanShareSweepRefusesToDeleteSharedISCSITarget(t *testing.T) {
 	ctx := context.Background()
 	client := truenas.NewMockClient()
@@ -78,12 +83,13 @@ func TestOrphanShareSweepRefusesToDeleteSharedISCSITarget(t *testing.T) {
 		"a target this driver never created must survive the sweep of one orphaned extent on it")
 	assert.Contains(t, iscsiExtentNames(t, client), "vmware-datastore-01",
 		"a live foreign extent on the shared target must survive")
-	assert.NotContains(t, iscsiExtentNames(t, client), d.iscsiShareName("gone-volume"),
-		"the orphaned extent this driver does own must still be swept")
+	assert.Contains(t, iscsiExtentNames(t, client), d.iscsiShareName("gone-volume"),
+		"the orphan's own extent must be RETAINED: it is the only handle the classifier rediscovers this orphan by")
 
 	remainingAssoc, err := client.ISCSITargetExtentGet(ctx, orphanAssoc.ID)
 	require.NoError(t, err)
-	assert.Nil(t, remainingAssoc, "the orphan's own target-extent association must still be removed")
+	assert.NotNil(t, remainingAssoc, "the orphan's own target-extent association must be retained with it")
+	assert.Empty(t, report.DeletedShares, "a retained orphan must not be reported as deleted")
 
 	require.Len(t, report.SkippedDeletes, 1)
 	assert.Equal(t, "iscsi_target", report.SkippedDeletes[0].Kind)
@@ -128,8 +134,9 @@ func TestOrphanShareSweepRefusesToDeleteMultiLUNISCSITarget(t *testing.T) {
 		"a multi-LUN target must survive even when its name matches this driver's naming")
 	assert.Contains(t, iscsiExtentNames(t, client), "operator-added-lun",
 		"the operator's second LUN must survive")
-	assert.NotContains(t, iscsiExtentNames(t, client), shareName,
-		"the orphaned extent this driver does own must still be swept")
+	assert.Contains(t, iscsiExtentNames(t, client), shareName,
+		"the orphan's own extent must be RETAINED so a later pass can rediscover and retry it")
+	assert.Empty(t, report.DeletedShares, "a retained orphan must not be reported as deleted")
 
 	require.Len(t, report.SkippedDeletes, 1)
 	assert.Equal(t, "iscsi_target", report.SkippedDeletes[0].Kind)
