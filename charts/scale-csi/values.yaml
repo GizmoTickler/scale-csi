@@ -1047,7 +1047,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-attacher:v4.12.0
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.13.0
     # Bounds the ControllerPublish/Unpublish (attach/detach) deadline. 120s keeps
     # a stuck TrueNAS publish from holding the external-attacher's --timeout for
     # 300s; the driver's own publish path is far faster after the P1 RTT cuts.
@@ -1111,7 +1111,7 @@ sidecars:
     healthProbe:
       enabled: true
       port: 9810
-    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
     resources:
       requests:
         cpu: 10m
@@ -1125,7 +1125,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0
     resources:
       requests:
         cpu: 10m
@@ -1161,7 +1161,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0
+    image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.19.0
     interval: 60s
     resources:
       requests:
