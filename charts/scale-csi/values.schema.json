@@ -1582,6 +1582,9 @@
       "properties": {
         "create": {
           "type": "boolean"
+        },
+        "controllerSecretGet": {
+          "type": "boolean"
         }
       }
     },

@@ -1186,6 +1186,22 @@ serviceAccount:
 rbac:
   # Create RBAC resources
   create: true
+  # Force the controller's `get` on Secrets on, independently of what the
+  # currently rendered StorageClasses declare.
+  #
+  # The rule is normally derived: it is granted when an enabled StorageClass
+  # names a provisioner/controller-publish/controller-expand secret, or when
+  # encryption.enabled is set. That derivation only describes volumes provisioned
+  # from now on. A PV's spec.csi.*SecretRef is stamped at provision time and
+  # outlives any later StorageClass edit, so REMOVING a secret ref from a
+  # StorageClass revokes, on the next upgrade, a permission that existing volumes
+  # still need — their attach/expand then fails closed on a Forbidden secret read.
+  #
+  # Set this to true if any PV predates such a change. To check:
+  #   kubectl get pv -o json | jq '[.items[]
+  #     | select(.spec.csi.controllerPublishSecretRef
+  #           // .spec.csi.controllerExpandSecretRef)] | length'
+  controllerSecretGet: false
 
 # Pod security context shared by the controller Deployment, node DaemonSet,
 # and reconcile CronJob. The controller pod additionally deep-merges
