@@ -34,7 +34,7 @@ func tombstoneIDFor(t *testing.T, client *truenas.MockClient, sourceDataset, sna
 // tombstoneOnSource reproduces how a tombstone actually arises: a backup mounts
 // a CLONE of the snapshot, DeleteSnapshot therefore cannot destroy it and defers
 // instead, leaving a retained tombstone. releaseClone then destroys that clone,
-// modelling the backup finishing — which is the state a later reconcile pass is
+// modeling the backup finishing — which is the state a later reconcile pass is
 // supposed to reap.
 func tombstoneOnSource(
 	t *testing.T,
