@@ -190,6 +190,23 @@ storageClass:
 			t.Error("encryption.enabled must turn the secrets get rule on even when no StorageClass declares a secret ref")
 		}
 	})
+
+	// Both derivations above read the StorageClasses rendered RIGHT NOW, and so
+	// describe only volumes provisioned from now on. A PV's spec.csi.*SecretRef
+	// is stamped at provision time and outlives any later StorageClass edit, so
+	// dropping a secret ref from a StorageClass silently revokes, on the next
+	// upgrade, a permission that already-provisioned PVs still depend on:
+	// external-attacher/-resizer then fail closed on a Forbidden secret read and
+	// AttachVolume.Attach never succeeds for those volumes. Observed live on
+	// v1.11.1 (2026-09-17): 12 PVs stranded, one retrying 3233 times in 67
+	// minutes. A chart cannot query PVs, so this is the operator's escape hatch.
+	t.Run("rbac.controllerSecretGet turns the rule on for pre-existing PVs", func(t *testing.T) {
+		out := helmTemplate(t, "--set", "rbac.controllerSecretGet=true")
+		role := findManifest(t, decodeManifests(t, out), "ClusterRole", "scale-csi-controller")
+		if !roleHasRule(role, []string{"secrets"}, []string{"get"}) {
+			t.Error("rbac.controllerSecretGet must turn the secrets get rule on when no StorageClass declares a secret ref")
+		}
+	})
 }
 
 // TestChartSidecarsHaveRetryIntervalMax is the regression test for C10's last

@@ -45,7 +45,21 @@ whenever d.config.Encryption.Enabled is set, entirely independent of chart
 values (e.g. StorageClasses managed out-of-band via Flux/Kustomize). Without
 it, that reconciler runs permanently Forbidden: encrypted volumes stay LOCKED
 after a NAS reboot and pods see I/O errors indefinitely, logged and nowhere
-else. */}}
+else.
+
+rbac.controllerSecretGet is the third OR, and it covers the one input a chart
+CANNOT see: PersistentVolumes that were ALREADY provisioned. A PV's
+spec.csi.{controllerPublish,controllerExpand,nodeStage,nodePublish}SecretRef is
+stamped at provision time from the StorageClass parameters then in force, and it
+outlives every later edit to that StorageClass. Both derivations above describe
+volumes provisioned FROM NOW ON, so dropping a secret ref from a StorageClass
+silently revokes a permission existing volumes still depend on — the rule
+disappears on the next upgrade and external-attacher/-resizer start failing
+closed for those PVs only, with AttachVolume.Attach stuck on a Forbidden secret
+read (live: v1.11.1, 2026-09-17, 12 PVs, one of them retried 3233 times in 67
+minutes). Set this when volumes predate a StorageClass secret-ref change; the
+honest audit is `kubectl get pv -o json | jq '[.items[]|select(.spec.csi
+.controllerPublishSecretRef)]|length'`. */}}
 {{- $needsSecretGet := false -}}
 {{- range $storageClass := (include "scale-csi.storageClassList" . | fromJsonArray) }}
 {{- $parameters := include "scale-csi.storageClassParameters" (dict "root" $ "class" $storageClass) | fromJson }}
@@ -73,7 +87,7 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch", "create", "update", "patch"]
-  {{- if or $needsSecretGet .Values.encryption.enabled }}
+  {{- if or $needsSecretGet .Values.encryption.enabled .Values.rbac.controllerSecretGet }}
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]

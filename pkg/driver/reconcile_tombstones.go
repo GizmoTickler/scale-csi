@@ -368,11 +368,23 @@ func (d *Driver) reapTombstoneSnapshot(
 	if !eligible || !createdAt.Equal(tombstone.CreatedAt) {
 		return false, "tombstone creation identity or age changed"
 	}
-	hasDependentClones, cloneErr := d.truenasClient.DatasetHasDependentClones(ctx, snapshot.Dataset)
+	// Scope this to THIS snapshot, not its dataset. DatasetHasDependentClones
+	// answers "is any snapshot of this dataset cloned", which is the right
+	// question when deleting a whole volume (controller.go) and the wrong one
+	// here: destroying one tombstone is blocked only by a clone of that exact
+	// snapshot. Asking the dataset-wide question let ONE unrelated live clone
+	// veto every tombstone on the dataset. That is not hypothetical — a volume
+	// under an hourly clone-based backup (kopiur/VolSync mount a clone of the
+	// snapshot they are reading) has a clone present for part of every hour, so
+	// any reconcile pass overlapping a backup refused the whole dataset's
+	// tombstones and they accumulated indefinitely. Observed on
+	// downloads/qbittorrent: 12 tombstones refused with zero clones of any of
+	// them, oldest 13h46m, while sibling datasets reaped 96 in the same pass.
+	clones, cloneErr := d.truenasClient.SnapshotDependentClones(ctx, snapshot.ID)
 	if cloneErr != nil {
 		return false, fmt.Sprintf("tombstone dependent-clone preflight failed: %v", cloneErr)
 	}
-	if hasDependentClones {
+	if len(clones) > 0 {
 		return false, "tombstone snapshot still has dependent clones"
 	}
 	// Release-before-reap (GF2/E1, R1): a hold survives the tombstone rename, so
