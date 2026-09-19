@@ -1,6 +1,71 @@
-# Release notes — v1.11.1 (next)
+# Release notes — v1.11.2 (next)
 
-## v1.11.1 — hotfix: strict fencing could not converge on v1.11.0
+## v1.11.2 — tombstone reaper clone scope + controller secret RBAC escape hatch
+
+### The reaper refused every tombstone on a volume under hourly backup
+
+`reapTombstoneSnapshot` gated destroying ONE tombstone on
+`DatasetHasDependentClones`, which answers the dataset-wide question "is any
+snapshot of this dataset cloned". That is the right question when deleting a
+whole volume (`controller.go`, unchanged) and the wrong one here, so a single
+live clone vetoed every tombstone on the dataset.
+
+It is not a corner case. kopiur and VolSync both mount a CLONE of the snapshot
+they read, so a volume under hourly backup has a clone present for part of every
+hour, and any reconcile pass overlapping a backup refused that dataset
+wholesale. Live on `downloads/qbittorrent`: 12 tombstones refused with zero
+clones of their own, oldest 13h46m, while sibling datasets reaped 96 in the same
+pass.
+
+The collision was systematic rather than unlucky. The backup window measured
+01:20:20–01:21:02 and the reconcile CronJob runs `20 4,10,16,22 * * *`, which is
+why the alert reported the refusal surviving consecutive passes.
+
+Diagnosing it needed sampling, not a point check: a single
+`zfs list -o name,origin` between backups shows no clones at all, so the guard
+reads as a false positive. Polling every 20s caught clone `pvc-7da42834` with
+origin `pvc-a338c6ed@snapshot-01db8d9b` — the live backup clone — and over one
+15-minute sample four distinct datasets had one, so any of them could be hit.
+
+The fix uses `SnapshotDependentClones`, the snapshot-scoped authority already on
+the client interface. Its regression test was verified to FAIL on the pre-fix
+logic with the exact production refusal message, and still asserts that a
+tombstone whose OWN snapshot is cloned stays refused.
+
+### `rbac.controllerSecretGet`
+
+The controller's `get` on Secrets is derived from the currently rendered
+StorageClass parameters or `encryption.enabled`. Both describe only volumes
+provisioned from now on. A PV's `spec.csi.*SecretRef` is stamped at provision
+time and outlives any later StorageClass edit, so dropping a secret ref silently
+revokes, on the next upgrade, a permission that already-provisioned volumes
+still depend on.
+
+v1.11.1 did exactly that in production: 12 PVs whose attach failed closed on a
+Forbidden secret read, one retrying 3,233 times in 67 minutes, with the blast
+radius covering Grafana, VictoriaMetrics, both Alertmanager DBs and three
+PostgreSQL members. It was latent from the 2026-09-12 deploy until a pod
+reschedule forced a fresh attach.
+
+A chart cannot query PVs, so no values-derived predicate can ever be complete
+here. `rbac.controllerSecretGet` is the operator's escape hatch; audit with:
+
+```
+kubectl get pv -o json | jq '[.items[]
+  | select(.spec.csi.controllerPublishSecretRef
+        // .spec.csi.controllerExpandSecretRef)] | length'
+```
+
+`values.schema.json` is `additionalProperties: false` and is updated with it.
+
+### Upgrade notes
+
+No action required for a cluster whose PVs carry no `spec.csi.*SecretRef`. If
+the audit above returns non-zero and your StorageClasses no longer declare a
+secret ref, set `rbac.controllerSecretGet: true` in the same change that moves
+to this version.
+
+## v1.11.1 (released 2026-09-12) — hotfix: strict fencing could not converge on v1.11.0
 
 v1.11.0 was deployed and rolled back after eight minutes. The controller never
 became ready. On startup, strict fencing re-issues the host-to-subsystem
