@@ -738,19 +738,22 @@ func listBlockDeviceMounts() ([][2]string, error) {
 	HardenCmd(cmd)
 	output, err := cmd.Output()
 	if err != nil {
-		// Exit code 1 with empty output means no mounts found (not an error)
-		// Exit code 1 with non-empty stderr indicates an actual error
+		// findmnt exits 1 for "nothing matched" AND for read failures (an
+		// unreadable mount table prints a diagnostic on stderr). Session GC
+		// treats an empty inventory as "nothing is in use", so only a clean
+		// no-match (exit 1, no stdout, no stderr) may become empty; anything
+		// else fails closed so GC skips the pass instead of disconnecting an
+		// in-use device (codex round-4 N5).
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			// Only treat as "no mounts" if there's no output
-			if len(output) == 0 || strings.TrimSpace(string(output)) == "" {
-				return nil, nil
-			}
-			// Non-empty output with exit code 1 is unexpected, log and continue parsing
-			klog.V(4).Infof("findmnt returned exit code 1 with output, continuing: %s", string(output))
-		} else {
-			return nil, fmt.Errorf("findmnt failed: %w", err)
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 &&
+			strings.TrimSpace(string(output)) == "" && strings.TrimSpace(string(exitErr.Stderr)) == "" {
+			return nil, nil
 		}
+		var stderr []byte
+		if exitErr != nil {
+			stderr = exitErr.Stderr
+		}
+		return nil, fmt.Errorf("findmnt failed: %w (stderr: %s)", err, strings.TrimSpace(string(stderr)))
 	}
 
 	var mounts [][2]string

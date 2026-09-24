@@ -370,3 +370,28 @@ func TestSnapshotReleaseFailureIsNotNotHeldSuccess(t *testing.T) {
 	})
 	require.Error(t, client.SnapshotRelease(context.Background(), "tank/k8s/pvc@snap"))
 }
+
+// Round-4 verifier N4 (codex, 2026-09-24): a nested errno must veto the libzfs
+// "lzc_hold() failed ... 17" text fallbacks, or a failed hold reads as held.
+func TestSnapshotHoldNestedFailureIsNotAlreadyHeld(t *testing.T) {
+	for _, e := range []*APIError{
+		{Code: -1, Message: "lzc_hold() failed: errno 17", Data: map[string]interface{}{"extra": map[string]interface{}{"errno": 13}}},
+		{Code: -32001, Message: "Method call error", Data: map[string]interface{}{"error": 22, "errname": "EINVAL", "reason": "('lzc_hold() failed', (('File exists', 17),))", "extra": map[string]interface{}{"errno": 13}}},
+	} {
+		t.Run(e.Message, func(t *testing.T) {
+			require.True(t, HasStructuredErrno(e))
+			require.False(t, IsAlreadyExistsError(e))
+			client := newEnvelopeTestClient(t, func(req rpcTestRequest, resp *rpcTestResponse) {
+				switch req.Method {
+				case "auth.login_with_api_key":
+					resp.Result = true
+				case "pool.snapshot.hold":
+					resp.Error = &rpcError{Code: e.Code, Message: e.Message, Data: e.Data}
+				default:
+					resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+				}
+			})
+			require.Error(t, client.SnapshotHold(context.Background(), "tank/k8s/pvc@snap"), "nested failure must veto hold-success text fallback")
+		})
+	}
+}

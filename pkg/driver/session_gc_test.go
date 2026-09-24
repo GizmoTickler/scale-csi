@@ -3,6 +3,8 @@ package driver
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -808,4 +810,33 @@ func TestIsLikelyNVMeDevice_UsedInSessionGC(t *testing.T) {
 			assert.NotEmpty(t, tc.reason, "Test case should have a reason")
 		})
 	}
+}
+
+// Round-4 verifier N5 (codex, 2026-09-24): findmnt exits 1 both for "nothing
+// matched" and for a read failure. The failure used to become an EMPTY
+// inventory, so an in-use filesystem device looked orphaned and, once past the
+// grace period, its session was disconnected. The inventory must fail closed and
+// GC must skip the pass.
+func TestSessionGCNeverDisconnectsWhenTheMountInventoryFails(t *testing.T) {
+	oldM, oldS, oldN := getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice
+	t.Cleanup(func() { getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice = oldM, oldS, oldN })
+	bin := t.TempDir()
+	script := "#!/bin/sh\necho 'findmnt: failed to read mount table: Permission denied' >&2\nexit 1\n"
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "findmnt"), []byte(script), 0o700)) //nolint:gosec // test-only executable stub
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	getMountedBlockDevices = util.GetMountedBlockDevices
+	getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+	getNVMeInfoFromDevice = func(string) (string, error) { return "nqn.in-use", nil }
+
+	d := &Driver{}
+	seen := &sync.Map{}
+	seen.Store("nqn.in-use", time.Now().Add(-time.Hour))
+	disconnected := false
+	d.gcSessions(context.Background(), time.Second, false, sessionGCProtocol{
+		name: "test", metricLabel: "nvmeof", seen: seen,
+		list:       func() ([]gcSession, error) { return []gcSession{{id: "nqn.in-use", inScope: true}}, nil },
+		expected:   d.getExpectedNVMeoFNQNs,
+		disconnect: func(string) error { disconnected = true; return nil },
+	})
+	require.False(t, disconnected, "an unreadable mount table must never make an in-use session look orphaned")
 }

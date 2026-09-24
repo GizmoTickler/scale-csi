@@ -638,6 +638,14 @@ func isSnapshotAlreadyHeldError(err error) bool {
 	if errno, ok := APIErrno(err); ok && errno == syscall.EEXIST {
 		return true
 	}
+	// Past the affirmative checks, any structured errno (top-level or nested)
+	// vetoes the libzfs text fallbacks: a nested EACCES must not let
+	// "lzc_hold() failed ... 17" prose report a failed hold as held (codex
+	// round-4 N4). The captured 26.0 re-hold envelope carries no errno-keyed
+	// value, so it still reaches the reason read below.
+	if HasStructuredErrno(err) {
+		return false
+	}
 	if lzcHoldReportsAlreadyHeld(err.Error()) {
 		return true
 	}
