@@ -1,0 +1,529 @@
+//! One NVMe/TCP controller path: a synchronous admin queue and one pipelined
+//! I/O queue with its own receiver thread.
+
+use crate::pdu::*;
+use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::io::IoSlice;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+pub const NSID: u32 = 1;
+
+/// Completion handle shared with the ublk io task. `efd` is an eventfd the
+/// io task awaits through io_uring; writing it wakes exactly that tag.
+pub struct Done {
+    pub res: AtomicI32,
+    pub efd: i32,
+}
+
+impl Done {
+    pub fn complete(&self, res: i32) {
+        self.res.store(res, Ordering::Release);
+        let one: u64 = 1;
+        unsafe { libc::write(self.efd, &one as *const u64 as *const libc::c_void, 8) };
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Op {
+    Read,
+    Write,
+    Flush,
+}
+
+/// A block request. `buf` points at the ublk tag's IoBuf, which the tag owns
+/// until `done` fires, so the engine may read/write it without copying.
+pub struct Req {
+    pub op: Op,
+    pub slba: u64,
+    pub nlb: u32,
+    pub buf: *mut u8,
+    pub len: usize,
+    pub done: Arc<Done>,
+    pub first_submit: Instant,
+    pub attempts: u32,
+}
+unsafe impl Send for Req {}
+
+impl Req {
+    pub fn complete_ok(&self) {
+        let res = if self.op == Op::Flush { 0 } else { self.len as i32 };
+        self.done.complete(res);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NsInfo {
+    pub nsze: u64,
+    pub lba_shift: u32,
+    pub incapsule_bytes: usize,
+    pub mdts_bytes: usize,
+}
+
+pub struct Ident {
+    pub hostnqn: String,
+    pub hostid: [u8; 16],
+    pub subnqn: String,
+}
+
+fn dial(addr: SocketAddr) -> Result<TcpStream> {
+    let s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).with_context(|| format!("connect {addr}"))?;
+    s.set_nodelay(true)?;
+    Ok(s)
+}
+
+/// Synchronous admin queue. Only the multipath maintenance thread uses it.
+pub struct AdminConn {
+    s: TcpStream,
+    cid: u16,
+    pub cntlid: u16,
+    pub maxh2c: u32,
+}
+
+impl AdminConn {
+    pub fn connect(addr: SocketAddr, id: &Ident, kato_ms: u32) -> Result<Self> {
+        let mut s = dial(addr)?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let (_cpda, maxh2c) = ic_handshake(&mut s)?;
+        let mut a = AdminConn { s, cid: 0, cntlid: 0, maxh2c };
+        let (sqe, data) = connect_cmd(a.next_cid(), 0, 31, kato_ms, 0xffff, &id.hostid, &id.subnqn, &id.hostnqn);
+        let cqe = a.exec(&sqe, &data, None)?;
+        if cqe.sc() != 0 {
+            bail!("admin Connect rejected: status {:#x}", cqe.status);
+        }
+        a.cntlid = (cqe.dw0 & 0xffff) as u16;
+        Ok(a)
+    }
+
+    fn next_cid(&mut self) -> u16 {
+        self.cid = self.cid.wrapping_add(1) % 31;
+        self.cid
+    }
+
+    /// Send one admin command and wait for its completion, collecting any
+    /// C2HData into `out`.
+    fn exec(&mut self, sqe: &Sqe, data: &[u8], mut out: Option<&mut [u8]>) -> Result<Cqe> {
+        write_capsule(&mut self.s, sqe, data)?;
+        loop {
+            let ch = read_ch(&mut self.s)?;
+            let mut psh = vec![0u8; ch.hlen as usize - CH_LEN];
+            self.s.read_exact(&mut psh)?;
+            match ch.ptype {
+                PDU_C2H_DATA => {
+                    let h = parse_data_hdr(&psh);
+                    let pad = ch.pdo as usize - ch.hlen as usize;
+                    let mut skip = vec![0u8; pad];
+                    self.s.read_exact(&mut skip)?;
+                    let mut chunk = vec![0u8; h.len as usize];
+                    self.s.read_exact(&mut chunk)?;
+                    if let Some(o) = out.as_deref_mut() {
+                        let end = (h.off + h.len) as usize;
+                        if end > o.len() {
+                            bail!("admin C2HData beyond buffer ({end} > {})", o.len());
+                        }
+                        o[h.off as usize..end].copy_from_slice(&chunk);
+                    }
+                    if ch.flags & FLAG_C2H_SUCCESS != 0 {
+                        return Ok(Cqe { cid: h.cid, ..Default::default() });
+                    }
+                }
+                PDU_CAPSULE_RESP => return Ok(Cqe::parse(&psh)),
+                t => bail!("unexpected PDU {t:#x} on admin queue"),
+            }
+        }
+    }
+
+    fn prop_get(&mut self, off: u32, size8: bool) -> Result<u64> {
+        let sqe = prop_get_cmd(self.next_cid(), off, size8);
+        let c = self.exec(&sqe, &[], None)?;
+        if c.sc() != 0 {
+            bail!("Property Get {off:#x} failed: {:#x}", c.status);
+        }
+        Ok(c.dw0 as u64 | ((c.dw1 as u64) << 32))
+    }
+
+    /// Enable the controller and identify namespace 1.
+    pub fn enable_and_identify(&mut self) -> Result<(NsInfo, u16)> {
+        let cap = self.prop_get(0x0, true)?;
+        let mqes = (cap & 0xffff) as u16;
+        let cc: u64 = 1 | (6 << 16) | (4 << 20);
+        let sqe = prop_set_cmd(self.next_cid(), 0x14, cc, false);
+        let c = self.exec(&sqe, &[], None)?;
+        if c.sc() != 0 {
+            bail!("CC.EN set failed: {:#x}", c.status);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.prop_get(0x1c, false)? & 1 == 0 {
+            if Instant::now() > deadline {
+                bail!("controller never reported CSTS.RDY");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut ctrl = vec![0u8; 4096];
+        let sqe = identify_cmd(self.next_cid(), 0, 1);
+        let c = self.exec(&sqe, &[], Some(&mut ctrl))?;
+        if c.sc() != 0 {
+            bail!("Identify Controller failed: {:#x}", c.status);
+        }
+        let mdts = ctrl[77];
+        let ioccsz = u32::from_le_bytes(ctrl[1792..1796].try_into().unwrap()) as usize;
+        let mut ns = vec![0u8; 4096];
+        let sqe = identify_cmd(self.next_cid(), NSID, 0);
+        let c = self.exec(&sqe, &[], Some(&mut ns))?;
+        if c.sc() != 0 {
+            bail!("Identify Namespace failed: {:#x}", c.status);
+        }
+        let nsze = u64::from_le_bytes(ns[0..8].try_into().unwrap());
+        let flbas = (ns[26] & 0x0f) as usize;
+        let lbaf = u32::from_le_bytes(ns[128 + 4 * flbas..132 + 4 * flbas].try_into().unwrap());
+        let lba_shift = (lbaf >> 16) & 0xff;
+        let info = NsInfo {
+            nsze,
+            lba_shift,
+            // ioccsz counts 16-byte units and includes the 64-byte SQE.
+            incapsule_bytes: (ioccsz * 16).saturating_sub(64),
+            mdts_bytes: if mdts == 0 { usize::MAX } else { 4096usize << mdts },
+        };
+        Ok((info, mqes))
+    }
+
+    pub fn keep_alive(&mut self) -> Result<()> {
+        let sqe = keep_alive_cmd(self.next_cid());
+        let c = self.exec(&sqe, &[], None)?;
+        if c.sc() != 0 {
+            bail!("Keep Alive failed: {:#x}", c.status);
+        }
+        Ok(())
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.s.shutdown(Shutdown::Both);
+    }
+}
+
+struct Pending {
+    dead: bool,
+    free: Vec<u16>,
+    inflight: HashMap<u16, Req>,
+}
+
+pub enum SubmitErr {
+    /// Every CID on this queue is in use; try another path or wait.
+    Busy(Req),
+    /// The connection has failed; the request was never sent.
+    Dead(Req),
+}
+
+/// One outbound PDU: header bytes plus an optional payload borrowed from a
+/// request buffer that stays valid until that request completes.
+struct Msg {
+    head: Vec<u8>,
+    data: *const u8,
+    len: usize,
+}
+unsafe impl Send for Msg {}
+
+/// Sender thread body: block for one message, then drain whatever else is
+/// queued and push the whole batch out with vectored writes. Keeps socket
+/// syscalls (and, on loopback, the peer's inline receive processing) off the
+/// ublk queue threads, and coalesces many small capsules into one write.
+fn run_sender(conn: Arc<IoConn>, mut w: TcpStream, rx: Receiver<Msg>) {
+    let mut batch: Vec<Msg> = Vec::with_capacity(64);
+    while let Ok(first) = rx.recv() {
+        batch.push(first);
+        let mut bytes = batch[0].head.len() + batch[0].len;
+        while bytes < 512 * 1024 && batch.len() < 256 {
+            match rx.try_recv() {
+                Ok(m) => {
+                    bytes += m.head.len() + m.len;
+                    batch.push(m);
+                }
+                Err(_) => break,
+            }
+        }
+        if let Err(e) = write_batch(&mut w, &batch) {
+            if !conn.is_dead() {
+                log::warn!("path {}: send failed: {e:#}", conn.path);
+            }
+            conn.kill();
+            return;
+        }
+        batch.clear();
+    }
+}
+
+fn write_batch(w: &mut TcpStream, batch: &[Msg]) -> std::io::Result<()> {
+    let mut slices: Vec<&[u8]> = Vec::with_capacity(batch.len() * 2);
+    for m in batch {
+        slices.push(&m.head);
+        if m.len > 0 {
+            slices.push(unsafe { std::slice::from_raw_parts(m.data, m.len) });
+        }
+    }
+    let (mut idx, mut off) = (0usize, 0usize);
+    while idx < slices.len() {
+        let iov: Vec<IoSlice> = std::iter::once(IoSlice::new(&slices[idx][off..]))
+            .chain(slices[idx + 1..].iter().take(1023).map(|s| IoSlice::new(s)))
+            .collect();
+        let mut n = w.write_vectored(&iov)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        while n > 0 {
+            let left = slices[idx].len() - off;
+            if n >= left {
+                n -= left;
+                idx += 1;
+                off = 0;
+            } else {
+                off += n;
+                n = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A pipelined I/O queue on one path.
+pub struct IoConn {
+    pub path: usize,
+    tx: Mutex<Option<Sender<Msg>>>,
+    ctl: TcpStream,
+    pending: Mutex<Pending>,
+    freed: Condvar,
+    info: NsInfo,
+    maxh2c: usize,
+    dead: AtomicBool,
+    /// Fault injection: while set, the receiver stops reading, modelling a
+    /// path that goes silent without any socket error.
+    pub stall: AtomicBool,
+}
+
+impl IoConn {
+    pub fn connect(path: usize, addr: SocketAddr, id: &Ident, cntlid: u16, qsize: u16, info: NsInfo) -> Result<(Arc<Self>, TcpStream)> {
+        let mut s = dial(addr)?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let (_cpda, maxh2c) = ic_handshake(&mut s)?;
+        let (sqe, data) = connect_cmd(0, 1, qsize - 1, 0, cntlid, &id.hostid, &id.subnqn, &id.hostnqn);
+        write_capsule(&mut s, &sqe, &data)?;
+        let ch = read_ch(&mut s)?;
+        let mut psh = vec![0u8; ch.hlen as usize - CH_LEN];
+        s.read_exact(&mut psh)?;
+        if ch.ptype != PDU_CAPSULE_RESP {
+            bail!("expected Connect response on I/O queue, got {:#x}", ch.ptype);
+        }
+        let cqe = Cqe::parse(&psh);
+        if cqe.sc() != 0 {
+            bail!("I/O queue Connect rejected: {:#x}", cqe.status);
+        }
+        // The receiver blocks indefinitely between completions; stalls are
+        // detected by the per-request timeout in the multipath layer.
+        s.set_read_timeout(None)?;
+        let reader = s.try_clone()?;
+        let ctl = s.try_clone()?;
+        let (tx, rx) = channel::<Msg>();
+        let conn = Arc::new(IoConn {
+            path,
+            tx: Mutex::new(Some(tx)),
+            ctl,
+            pending: Mutex::new(Pending { dead: false, free: (1..qsize).rev().collect(), inflight: HashMap::new() }),
+            freed: Condvar::new(),
+            info,
+            maxh2c: maxh2c.max(4096) as usize,
+            dead: AtomicBool::new(false),
+            stall: AtomicBool::new(false),
+        });
+        let c2 = conn.clone();
+        std::thread::Builder::new().name(format!("nvme-tx-{path}")).spawn(move || run_sender(c2, s, rx))?;
+        Ok((conn, reader))
+    }
+
+    fn send(&self, m: Msg) -> bool {
+        match self.tx.lock().unwrap().as_ref() {
+            Some(tx) => tx.send(m).is_ok(),
+            None => false,
+        }
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    pub fn outstanding(&self) -> usize {
+        self.pending.lock().unwrap().inflight.len()
+    }
+
+    /// Queue a request on this path. Never blocks on CID exhaustion.
+    pub fn try_submit(&self, req: Req) -> Result<(), SubmitErr> {
+        let mut p = self.pending.lock().unwrap();
+        if p.dead {
+            return Err(SubmitErr::Dead(req));
+        }
+        let Some(cid) = p.free.pop() else { return Err(SubmitErr::Busy(req)) };
+        let inline = req.op == Op::Write && req.len <= self.info.incapsule_bytes;
+        let sqe = match req.op {
+            Op::Read => rw_cmd(OPC_READ, cid, NSID, req.slba, req.nlb, req.len as u32, false),
+            Op::Write => rw_cmd(OPC_WRITE, cid, NSID, req.slba, req.nlb, req.len as u32, inline),
+            Op::Flush => flush_cmd(cid, NSID),
+        };
+        let (data, len) = if inline { (req.buf as *const u8, req.len) } else { (std::ptr::null(), 0) };
+        let head = capsule_header(&sqe, len);
+        // Register before the capsule can reach the wire, so a fast response
+        // always finds its request. Then enqueue; no syscall under the lock.
+        p.inflight.insert(cid, req);
+        drop(p);
+        if !self.send(Msg { head, data, len }) {
+            let back = {
+                let mut p = self.pending.lock().unwrap();
+                let r = p.inflight.remove(&cid);
+                if r.is_some() {
+                    p.free.push(cid);
+                }
+                r
+            };
+            self.kill();
+            // If the receiver already drained it, it was handed back for
+            // resubmission there; only a request still here is ours to return.
+            return match back {
+                Some(r) => Err(SubmitErr::Dead(r)),
+                None => Ok(()),
+            };
+        }
+        Ok(())
+    }
+
+    /// Wait until a CID frees up (or the connection dies).
+    pub fn wait_for_cid(&self, timeout: Duration) {
+        let p = self.pending.lock().unwrap();
+        if p.free.is_empty() && !p.dead {
+            let _ = self.freed.wait_timeout(p, timeout);
+        }
+    }
+
+    /// Tear the connection down; the receiver thread notices and drains.
+    pub fn kill(&self) {
+        self.dead.store(true, Ordering::Release);
+        let _ = self.ctl.shutdown(Shutdown::Both);
+        // Dropping the channel ends the sender thread.
+        self.tx.lock().unwrap().take();
+    }
+
+    /// Oldest in-flight request's age, for the stall detector.
+    pub fn oldest_inflight(&self) -> Option<Duration> {
+        let p = self.pending.lock().unwrap();
+        p.inflight.values().map(|r| r.first_submit.elapsed()).max()
+    }
+
+    /// Mark dead and hand back everything in flight for resubmission.
+    fn drain(&self) -> Vec<Req> {
+        self.dead.store(true, Ordering::Release);
+        let mut p = self.pending.lock().unwrap();
+        p.dead = true;
+        let reqs: Vec<Req> = p.inflight.drain().map(|(_, r)| r).collect();
+        self.freed.notify_all();
+        reqs
+    }
+
+    fn finish(&self, cid: u16, ok: bool, status: u16) {
+        let req = {
+            let mut p = self.pending.lock().unwrap();
+            let r = p.inflight.remove(&cid);
+            if r.is_some() {
+                p.free.push(cid);
+            }
+            r
+        };
+        self.freed.notify_one();
+        match req {
+            Some(r) if ok => r.complete_ok(),
+            Some(r) => {
+                log::warn!("path {}: cid {cid} {:?} slba {} failed status {status:#x}", self.path, r.op, r.slba);
+                r.done.complete(-libc::EIO);
+            }
+            None => log::warn!("path {}: completion for unknown cid {cid}", self.path),
+        }
+    }
+
+    /// Look up where C2HData for `cid` lands, without holding the lock
+    /// across the socket read. The request cannot complete meanwhile: only
+    /// this receiver thread completes requests on this connection.
+    fn target(&self, cid: u16) -> Option<(*mut u8, usize, Op)> {
+        let p = self.pending.lock().unwrap();
+        p.inflight.get(&cid).map(|r| (r.buf, r.len, r.op))
+    }
+
+    fn answer_r2t(&self, cid: u16, ttag: u16, off: usize, len: usize) -> Result<()> {
+        let Some((buf, blen, op)) = self.target(cid) else { bail!("R2T for unknown cid {cid}") };
+        if op != Op::Write || off + len > blen {
+            bail!("R2T out of range: cid {cid} off {off} len {len} buflen {blen}");
+        }
+        let mut sent = 0;
+        while sent < len {
+            let n = (len - sent).min(self.maxh2c);
+            let head = h2c_header(cid, ttag, (off + sent) as u32, n, sent + n == len);
+            if !self.send(Msg { head, data: unsafe { buf.add(off + sent) } as *const u8, len: n }) {
+                bail!("sender gone while answering R2T");
+            }
+            sent += n;
+        }
+        Ok(())
+    }
+
+    fn receive(&self, r: &mut TcpStream) -> Result<()> {
+        loop {
+            while self.stall.load(Ordering::Acquire) && !self.is_dead() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let ch = read_ch(r)?;
+            let mut psh = vec![0u8; (ch.hlen as usize).saturating_sub(CH_LEN)];
+            r.read_exact(&mut psh)?;
+            match ch.ptype {
+                PDU_C2H_DATA => {
+                    let h = parse_data_hdr(&psh);
+                    let pad = (ch.pdo as usize).saturating_sub(ch.hlen as usize);
+                    if pad > 0 {
+                        let mut skip = vec![0u8; pad];
+                        r.read_exact(&mut skip)?;
+                    }
+                    let Some((buf, blen, _)) = self.target(h.cid) else { bail!("C2HData for unknown cid {}", h.cid) };
+                    let (off, len) = (h.off as usize, h.len as usize);
+                    if off + len > blen {
+                        bail!("C2HData out of range: cid {} off {off} len {len} buflen {blen}", h.cid);
+                    }
+                    let dst = unsafe { std::slice::from_raw_parts_mut(buf.add(off), len) };
+                    r.read_exact(dst)?;
+                    if ch.flags & FLAG_C2H_SUCCESS != 0 {
+                        self.finish(h.cid, true, 0);
+                    }
+                }
+                PDU_R2T => {
+                    let h = parse_data_hdr(&psh);
+                    self.answer_r2t(h.cid, h.ttag, h.off as usize, h.len as usize)?;
+                }
+                PDU_CAPSULE_RESP => {
+                    let c = Cqe::parse(&psh);
+                    self.finish(c.cid, c.sc() == 0, c.status);
+                }
+                PDU_C2H_TERM => bail!("target terminated the connection (C2HTermReq)"),
+                t => bail!("unexpected PDU type {t:#x}"),
+            }
+        }
+    }
+
+    /// Receiver thread body. Returns the requests that were in flight when
+    /// the connection failed, for the caller to resubmit elsewhere.
+    pub fn run_receiver(self: &Arc<Self>, mut r: TcpStream) -> Vec<Req> {
+        if let Err(e) = self.receive(&mut r) {
+            if !self.is_dead() {
+                log::warn!("path {}: I/O queue failed: {e:#}", self.path);
+            }
+        }
+        let _ = r.shutdown(Shutdown::Both);
+        self.drain()
+    }
+}

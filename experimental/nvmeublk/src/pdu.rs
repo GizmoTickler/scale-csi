@@ -1,0 +1,290 @@
+//! NVMe/TCP PDU framing and NVMe command layout (NVMe/TCP transport spec 1.0,
+//! NVMe base spec 2.x). Header and data digests are not negotiated.
+
+use anyhow::{bail, Context, Result};
+use std::io::{Read, Write};
+
+pub const PDU_IC_REQ: u8 = 0x00;
+pub const PDU_IC_RESP: u8 = 0x01;
+pub const PDU_H2C_TERM: u8 = 0x02;
+pub const PDU_C2H_TERM: u8 = 0x03;
+pub const PDU_CAPSULE_CMD: u8 = 0x04;
+pub const PDU_CAPSULE_RESP: u8 = 0x05;
+pub const PDU_H2C_DATA: u8 = 0x06;
+pub const PDU_C2H_DATA: u8 = 0x07;
+pub const PDU_R2T: u8 = 0x09;
+
+pub const FLAG_LAST_PDU: u8 = 0x04;
+pub const FLAG_C2H_SUCCESS: u8 = 0x08;
+
+pub const CH_LEN: usize = 8;
+pub const CMD_HLEN: usize = CH_LEN + 64;
+pub const DATA_HLEN: usize = 24;
+
+// NVMe opcodes.
+pub const OPC_FLUSH: u8 = 0x00;
+pub const OPC_WRITE: u8 = 0x01;
+pub const OPC_READ: u8 = 0x02;
+pub const OPC_ADMIN_IDENTIFY: u8 = 0x06;
+pub const OPC_ADMIN_KEEP_ALIVE: u8 = 0x18;
+pub const OPC_FABRICS: u8 = 0x7f;
+
+pub const FCTYPE_PROP_SET: u8 = 0x00;
+pub const FCTYPE_CONNECT: u8 = 0x01;
+pub const FCTYPE_PROP_GET: u8 = 0x04;
+
+/// PSDT = SGL for the data pointer (CDW0 byte 1 bits 7:6 = 01b).
+const FLAGS_SGL: u8 = 0x40;
+/// SGL identifier: Transport SGL Data Block (type 5), transport-specific subtype 0xA.
+const SGL_TRANSPORT_DATA_BLOCK: u8 = 0x5a;
+/// SGL identifier: Data Block (type 0), subtype Offset (1): in-capsule data.
+const SGL_INCAPSULE_OFFSET: u8 = 0x01;
+
+/// A 64-byte submission queue entry.
+#[derive(Clone, Copy)]
+pub struct Sqe(pub [u8; 64]);
+
+impl Sqe {
+    pub fn new(opcode: u8, cid: u16, nsid: u32) -> Self {
+        let mut b = [0u8; 64];
+        b[0] = opcode;
+        b[1] = FLAGS_SGL;
+        b[2..4].copy_from_slice(&cid.to_le_bytes());
+        b[4..8].copy_from_slice(&nsid.to_le_bytes());
+        Sqe(b)
+    }
+    pub fn cid(&self) -> u16 {
+        u16::from_le_bytes([self.0[2], self.0[3]])
+    }
+    pub fn set_cid(&mut self, cid: u16) {
+        self.0[2..4].copy_from_slice(&cid.to_le_bytes());
+    }
+    pub fn set_u8(&mut self, off: usize, v: u8) {
+        self.0[off] = v;
+    }
+    pub fn set_u16(&mut self, off: usize, v: u16) {
+        self.0[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    pub fn set_u32(&mut self, off: usize, v: u32) {
+        self.0[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pub fn set_u64(&mut self, off: usize, v: u64) {
+        self.0[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    /// Data pointer describing a transfer the target moves with C2HData/R2T.
+    pub fn sgl_transport(&mut self, len: u32) {
+        self.set_u64(24, 0);
+        self.set_u32(32, len);
+        self.0[39] = SGL_TRANSPORT_DATA_BLOCK;
+    }
+    /// Data pointer describing data carried inside the command capsule.
+    pub fn sgl_incapsule(&mut self, len: u32) {
+        self.set_u64(24, 0);
+        self.set_u32(32, len);
+        self.0[39] = SGL_INCAPSULE_OFFSET;
+    }
+}
+
+/// A 16-byte completion queue entry.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cqe {
+    pub dw0: u32,
+    pub dw1: u32,
+    pub cid: u16,
+    pub status: u16,
+}
+
+impl Cqe {
+    pub fn parse(b: &[u8]) -> Self {
+        Cqe {
+            dw0: u32::from_le_bytes(b[0..4].try_into().unwrap()),
+            dw1: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+            cid: u16::from_le_bytes([b[12], b[13]]),
+            status: u16::from_le_bytes([b[14], b[15]]),
+        }
+    }
+    /// Status code + status code type, phase bit dropped. 0 = success.
+    pub fn sc(&self) -> u16 {
+        self.status >> 1
+    }
+}
+
+/// Common header of a received PDU.
+#[derive(Clone, Copy, Debug)]
+pub struct Ch {
+    pub ptype: u8,
+    pub flags: u8,
+    pub hlen: u8,
+    pub pdo: u8,
+    pub plen: u32,
+}
+
+pub fn read_ch(r: &mut impl Read) -> Result<Ch> {
+    let mut b = [0u8; CH_LEN];
+    r.read_exact(&mut b).context("read PDU common header")?;
+    Ok(Ch {
+        ptype: b[0],
+        flags: b[1],
+        hlen: b[2],
+        pdo: b[3],
+        plen: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+    })
+}
+
+fn ch_bytes(ptype: u8, flags: u8, hlen: usize, pdo: usize, plen: usize) -> [u8; CH_LEN] {
+    let mut b = [0u8; CH_LEN];
+    b[0] = ptype;
+    b[1] = flags;
+    b[2] = hlen as u8;
+    b[3] = pdo as u8;
+    b[4..8].copy_from_slice(&(plen as u32).to_le_bytes());
+    b
+}
+
+/// Initialize Connection handshake. Returns (cpda, maxh2cdata).
+pub fn ic_handshake(s: &mut (impl Read + Write)) -> Result<(u8, u32)> {
+    let mut req = [0u8; 128];
+    req[..CH_LEN].copy_from_slice(&ch_bytes(PDU_IC_REQ, 0, 128, 0, 128));
+    // pfv=0, hpda=0, dgst=0, maxr2t=0 (one outstanding R2T per command).
+    s.write_all(&req).context("send ICReq")?;
+    let ch = read_ch(s)?;
+    if ch.ptype != PDU_IC_RESP || ch.plen != 128 {
+        bail!("expected ICResp, got type {:#x} plen {}", ch.ptype, ch.plen);
+    }
+    let mut rest = [0u8; 120];
+    s.read_exact(&mut rest)?;
+    let cpda = rest[2];
+    let dgst = rest[3];
+    let maxh2c = u32::from_le_bytes(rest[4..8].try_into().unwrap());
+    if dgst != 0 {
+        bail!("target enabled digests ({dgst:#x}); not supported by the prototype");
+    }
+    Ok((cpda, maxh2c))
+}
+
+/// A command capsule, optionally carrying in-capsule data.
+pub fn write_capsule(w: &mut impl Write, sqe: &Sqe, data: &[u8]) -> Result<()> {
+    let pdo = if data.is_empty() { 0 } else { CMD_HLEN };
+    let hdr = ch_bytes(PDU_CAPSULE_CMD, 0, CMD_HLEN, pdo, CMD_HLEN + data.len());
+    let mut buf = Vec::with_capacity(CMD_HLEN + data.len());
+    buf.extend_from_slice(&hdr);
+    buf.extend_from_slice(&sqe.0);
+    buf.extend_from_slice(data);
+    w.write_all(&buf).context("send command capsule")
+}
+
+/// One H2CData PDU answering an R2T.
+pub fn write_h2c_data(w: &mut impl Write, cid: u16, ttag: u16, datao: u32, data: &[u8], last: bool) -> Result<()> {
+    let flags = if last { FLAG_LAST_PDU } else { 0 };
+    let mut hdr = [0u8; DATA_HLEN];
+    hdr[..CH_LEN].copy_from_slice(&ch_bytes(PDU_H2C_DATA, flags, DATA_HLEN, DATA_HLEN, DATA_HLEN + data.len()));
+    hdr[8..10].copy_from_slice(&cid.to_le_bytes());
+    hdr[10..12].copy_from_slice(&ttag.to_le_bytes());
+    hdr[12..16].copy_from_slice(&datao.to_le_bytes());
+    hdr[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    let mut buf = Vec::with_capacity(DATA_HLEN + data.len());
+    buf.extend_from_slice(&hdr);
+    buf.extend_from_slice(data);
+    w.write_all(&buf).context("send H2CData")
+}
+
+/// Parsed PDU-specific header of a C2HData / R2T / CapsuleResp.
+pub struct DataHdr {
+    pub cid: u16,
+    pub ttag: u16,
+    pub off: u32,
+    pub len: u32,
+}
+
+pub fn parse_data_hdr(psh: &[u8]) -> DataHdr {
+    // psh starts right after the 8-byte common header.
+    DataHdr {
+        cid: u16::from_le_bytes([psh[0], psh[1]]),
+        ttag: u16::from_le_bytes([psh[2], psh[3]]),
+        off: u32::from_le_bytes(psh[4..8].try_into().unwrap()),
+        len: u32::from_le_bytes(psh[8..12].try_into().unwrap()),
+    }
+}
+
+/// Fabrics Connect command + its 1024-byte data.
+pub fn connect_cmd(cid: u16, qid: u16, sqsize: u16, kato_ms: u32, cntlid: u16, hostid: &[u8; 16], subnqn: &str, hostnqn: &str) -> (Sqe, Vec<u8>) {
+    let mut sqe = Sqe::new(OPC_FABRICS, cid, 0);
+    sqe.set_u8(4, FCTYPE_CONNECT);
+    sqe.set_u16(40, 0); // recfmt
+    sqe.set_u16(42, qid);
+    sqe.set_u16(44, sqsize); // 0-based
+    sqe.set_u32(48, kato_ms);
+    let mut data = vec![0u8; 1024];
+    data[..16].copy_from_slice(hostid);
+    data[16..18].copy_from_slice(&cntlid.to_le_bytes());
+    data[256..256 + subnqn.len()].copy_from_slice(subnqn.as_bytes());
+    data[512..512 + hostnqn.len()].copy_from_slice(hostnqn.as_bytes());
+    sqe.sgl_incapsule(1024);
+    (sqe, data)
+}
+
+pub fn prop_set_cmd(cid: u16, offset: u32, value: u64, size8: bool) -> Sqe {
+    let mut sqe = Sqe::new(OPC_FABRICS, cid, 0);
+    sqe.set_u8(4, FCTYPE_PROP_SET);
+    sqe.set_u8(40, if size8 { 1 } else { 0 });
+    sqe.set_u32(44, offset);
+    sqe.set_u64(48, value);
+    sqe
+}
+
+pub fn prop_get_cmd(cid: u16, offset: u32, size8: bool) -> Sqe {
+    let mut sqe = Sqe::new(OPC_FABRICS, cid, 0);
+    sqe.set_u8(4, FCTYPE_PROP_GET);
+    sqe.set_u8(40, if size8 { 1 } else { 0 });
+    sqe.set_u32(44, offset);
+    sqe
+}
+
+pub fn identify_cmd(cid: u16, nsid: u32, cns: u32) -> Sqe {
+    let mut sqe = Sqe::new(OPC_ADMIN_IDENTIFY, cid, nsid);
+    sqe.set_u32(40, cns);
+    sqe.sgl_transport(4096);
+    sqe
+}
+
+pub fn rw_cmd(opcode: u8, cid: u16, nsid: u32, slba: u64, nlb: u32, len: u32, inline: bool) -> Sqe {
+    let mut sqe = Sqe::new(opcode, cid, nsid);
+    sqe.set_u64(40, slba);
+    sqe.set_u32(48, nlb - 1);
+    if inline {
+        sqe.sgl_incapsule(len);
+    } else {
+        sqe.sgl_transport(len);
+    }
+    sqe
+}
+
+pub fn flush_cmd(cid: u16, nsid: u32) -> Sqe {
+    Sqe::new(OPC_FLUSH, cid, nsid)
+}
+
+pub fn keep_alive_cmd(cid: u16) -> Sqe {
+    Sqe::new(OPC_ADMIN_KEEP_ALIVE, cid, 0)
+}
+
+/// Header bytes of a command capsule whose in-capsule data (if any) is sent
+/// separately, so the payload can go out straight from the caller's buffer.
+pub fn capsule_header(sqe: &Sqe, data_len: usize) -> Vec<u8> {
+    let pdo = if data_len == 0 { 0 } else { CMD_HLEN };
+    let mut v = Vec::with_capacity(CMD_HLEN);
+    v.extend_from_slice(&ch_bytes(PDU_CAPSULE_CMD, 0, CMD_HLEN, pdo, CMD_HLEN + data_len));
+    v.extend_from_slice(&sqe.0);
+    v
+}
+
+/// Header bytes of an H2CData PDU; the payload follows separately.
+pub fn h2c_header(cid: u16, ttag: u16, datao: u32, len: usize, last: bool) -> Vec<u8> {
+    let flags = if last { FLAG_LAST_PDU } else { 0 };
+    let mut hdr = vec![0u8; DATA_HLEN];
+    hdr[..CH_LEN].copy_from_slice(&ch_bytes(PDU_H2C_DATA, flags, DATA_HLEN, DATA_HLEN, DATA_HLEN + len));
+    hdr[8..10].copy_from_slice(&cid.to_le_bytes());
+    hdr[10..12].copy_from_slice(&ttag.to_le_bytes());
+    hdr[12..16].copy_from_slice(&datao.to_le_bytes());
+    hdr[16..20].copy_from_slice(&(len as u32).to_le_bytes());
+    hdr
+}

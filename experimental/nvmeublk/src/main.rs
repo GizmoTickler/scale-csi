@@ -1,0 +1,315 @@
+//! nvmeublk: a userspace NVMe/TCP initiator with its own multipath, exposed as
+//! a Linux block device through ublk.
+//!
+//!   nvmeublk probe <nqn> <addr:port>...      protocol smoke test, no ublk
+//!   nvmeublk run   <nqn> <addr:port>...      serve /dev/ublkbN until Ctrl-C
+//!
+//! Environment: NVMEUBLK_QUEUES (2), NVMEUBLK_DEPTH (64),
+//! NVMEUBLK_IO_TIMEOUT_MS (5000), NVMEUBLK_NO_PATH_TIMEOUT_MS (30000, 0=forever).
+
+mod conn;
+mod mpath;
+mod pdu;
+
+use anyhow::{bail, Context, Result};
+use conn::{Done, Ident, Op, Req};
+use libublk::ctrl::UblkCtrlBuilder;
+use libublk::helpers::IoBuf;
+use libublk::io::{UblkDev, UblkQueue};
+use libublk::uring_async::ublk_submit_sqe_async;
+use libublk::{BufDesc, UblkError, UblkFlags};
+use mpath::{Config, Mpath};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn host_ident(subnqn: &str) -> Ident {
+    // On a cluster node the target's allowlist (strict fencing) admits only the
+    // node's own NVMe identity, so use it when asked to.
+    if let (Ok(nqn), Ok(id)) = (std::env::var("NVMEUBLK_HOSTNQN"), std::env::var("NVMEUBLK_HOSTID")) {
+        let hex: String = id.trim().chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let mut hostid = [0u8; 16];
+        for (i, b) in hex.as_bytes().chunks(2).take(16).enumerate() {
+            hostid[i] = u8::from_str_radix(std::str::from_utf8(b).unwrap_or("0"), 16).unwrap_or(0);
+        }
+        return Ident { hostnqn: nqn.trim().to_string(), hostid, subnqn: subnqn.to_string() };
+    }
+    // Stable per machine: derive the host identity from /etc/machine-id.
+    let mid = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
+    let mid = mid.trim();
+    let mut hostid = [0u8; 16];
+    for (i, b) in mid.as_bytes().chunks(2).take(16).enumerate() {
+        hostid[i] = u8::from_str_radix(std::str::from_utf8(b).unwrap_or("0"), 16).unwrap_or(0);
+    }
+    let uuid = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        hostid[0], hostid[1], hostid[2], hostid[3], hostid[4], hostid[5], hostid[6], hostid[7],
+        hostid[8], hostid[9], hostid[10], hostid[11], hostid[12], hostid[13], hostid[14], hostid[15]
+    );
+    Ident { hostnqn: format!("nqn.2014-08.org.nvmexpress:uuid:{uuid}"), hostid, subnqn: subnqn.to_string() }
+}
+
+fn eventfd() -> Result<i32> {
+    // Non-blocking, so io_uring arms a poll on it instead of punting each
+    // waiting read to an io-wq worker thread.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        bail!("eventfd: {}", std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+fn config() -> Config {
+    Config {
+        kato: Duration::from_secs(15),
+        io_timeout: Duration::from_millis(env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000)),
+        no_path_timeout: Duration::from_millis(env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000)),
+        qsize: 128,
+        max_attempts: 8,
+    }
+}
+
+fn start(nqn: &str, addrs: &[String]) -> Result<Arc<Mpath>> {
+    let addrs: Vec<SocketAddr> = addrs
+        .iter()
+        .map(|a| a.to_socket_addrs().with_context(|| format!("bad address {a}"))?.next().context("unresolvable"))
+        .collect::<Result<_>>()?;
+    let m = Mpath::new(addrs, host_ident(nqn), config())?;
+    let mm = m.clone();
+    std::thread::Builder::new().name("nvme-maint".into()).spawn(move || mm.maintain())?;
+    Ok(m)
+}
+
+/// Blocking submit used by `probe`.
+fn sync_io(m: &Mpath, op: Op, slba: u64, buf: &mut [u8]) -> Result<i32> {
+    let efd = eventfd()?;
+    let done = Arc::new(Done { res: AtomicI32::new(0), efd });
+    let nlb = (buf.len() >> m.info.lba_shift) as u32;
+    m.submit(Req { op, slba, nlb, buf: buf.as_mut_ptr(), len: buf.len(), done: done.clone(), first_submit: Instant::now(), attempts: 0 });
+    let mut v = 0u64;
+    let mut pfd = libc::pollfd { fd: efd, events: libc::POLLIN, revents: 0 };
+    while unsafe { libc::read(efd, &mut v as *mut u64 as *mut libc::c_void, 8) } != 8 {
+        unsafe { libc::poll(&mut pfd, 1, -1) };
+    }
+    unsafe { libc::close(efd) };
+    Ok(done.res.load(Ordering::Acquire))
+}
+
+fn probe(nqn: &str, addrs: &[String]) -> Result<()> {
+    let m = start(nqn, addrs)?;
+    std::thread::sleep(Duration::from_millis(300));
+    for (a, up, _) in m.path_states() {
+        println!("path {a}: {}", if up { "up" } else { "down" });
+    }
+    let bs = 1usize << m.info.lba_shift;
+    // Small write (in-capsule), large write (R2T/H2CData), reads back, flush.
+    for &len in &[bs, 128 * 1024, 1024 * 1024] {
+        let slba = 2048;
+        let mut w: Vec<u8> = (0..len).map(|i| (i * 31 + len) as u8).collect();
+        let r1 = sync_io(&m, Op::Write, slba, &mut w)?;
+        let mut rbuf = vec![0u8; len];
+        let r2 = sync_io(&m, Op::Read, slba, &mut rbuf)?;
+        let ok = r1 == len as i32 && r2 == len as i32 && rbuf == w;
+        println!("{len:>8} B write={r1} read={r2} verify={}", if ok { "OK" } else { "MISMATCH" });
+        if !ok {
+            bail!("probe failed at {len} bytes");
+        }
+    }
+    let f = sync_io(&m, Op::Flush, 0, &mut [])?;
+    println!("flush={f}");
+    m.shutdown();
+    Ok(())
+}
+
+/// Engine-only latency: sequential 4K reads with no ublk in the path.
+fn lat(nqn: &str, addrs: &[String]) -> Result<()> {
+    let m = start(nqn, addrs)?;
+    std::thread::sleep(Duration::from_millis(300));
+    let mut buf = vec![0u8; 4096];
+    for _ in 0..200 {
+        sync_io(&m, Op::Read, 0, &mut buf)?;
+    }
+    let n = 5000;
+    let t = Instant::now();
+    for i in 0..n {
+        sync_io(&m, Op::Read, (i * 7919) % 100_000, &mut buf)?;
+    }
+    let per = t.elapsed() / n as u32;
+    println!("engine-only 4K read QD1: {per:?} per op ({:.0} IOPS)", 1.0 / per.as_secs_f64());
+    m.shutdown();
+    Ok(())
+}
+
+async fn io_task(q: &UblkQueue<'_>, tag: u16, m: &Mpath) -> Result<(), UblkError> {
+    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+    let efd = eventfd().map_err(|_| UblkError::OtherError(-libc::EMFILE))?;
+    let done = Arc::new(Done { res: AtomicI32::new(0), efd });
+    let mut ev = Box::new(0u64);
+    let shift = m.info.lba_shift;
+
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf)).await?;
+    loop {
+        let iod = q.get_iod(tag);
+        let op = match iod.op_flags & 0xff {
+            libublk::sys::UBLK_IO_OP_READ => Some(Op::Read),
+            libublk::sys::UBLK_IO_OP_WRITE => Some(Op::Write),
+            libublk::sys::UBLK_IO_OP_FLUSH => Some(Op::Flush),
+            _ => None,
+        };
+        let res = match op {
+            None => -libc::EOPNOTSUPP,
+            Some(op) => {
+                let bytes = (iod.nr_sectors as usize) << 9;
+                let slba = (iod.start_sector << 9) >> shift;
+                let nlb = (bytes >> shift) as u32;
+                m.submit(Req {
+                    op,
+                    slba,
+                    nlb,
+                    buf: buf.as_slice().as_ptr() as *mut u8,
+                    len: if op == Op::Flush { 0 } else { bytes },
+                    done: done.clone(),
+                    first_submit: Instant::now(),
+                    attempts: 0,
+                });
+                // Park this tag on its eventfd; the engine's write wakes the ring.
+                let sqe = io_uring::opcode::Read::new(io_uring::types::Fd(efd), &mut *ev as *mut u64 as *mut u8, 8).build();
+                match ublk_submit_sqe_async(sqe, libublk::UblkUringData::Target as u64).await {
+                    Ok(8) => done.res.load(Ordering::Acquire),
+                    Ok(r) => {
+                        log::error!("tag {tag}: eventfd read returned {r}");
+                        -libc::EIO
+                    }
+                    Err(e) => {
+                        log::error!("tag {tag}: eventfd wait failed: {e}");
+                        -libc::EIO
+                    }
+                }
+            }
+        };
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+    }
+}
+
+fn queue_fn(qid: u16, dev: &UblkDev, m: Arc<Mpath>) {
+    let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
+    let exe_rc = Rc::new(smol::LocalExecutor::new());
+    let exe = exe_rc.clone();
+    let mut tasks = Vec::new();
+    for tag in q_rc.tags() {
+        let q = q_rc.clone();
+        let m = m.clone();
+        tasks.push(exe.spawn(async move {
+            match io_task(&q, tag, &m).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) => log::error!("io_task {tag} failed: {e}"),
+            }
+        }));
+    }
+    smol::block_on(exe_rc.run(async move {
+        let run_ops = || while exe.try_tick() {};
+        let done = || tasks.iter().all(|t| t.is_finished());
+        if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
+            log::error!("queue {qid}: event loop failed: {e}");
+        }
+    }));
+}
+
+fn run(nqn: &str, addrs: &[String]) -> Result<()> {
+    let m = start(nqn, addrs)?;
+    let queues = env_u64("NVMEUBLK_QUEUES", 2) as u16;
+    let depth = env_u64("NVMEUBLK_DEPTH", 64) as u16;
+    let io_buf = (512 * 1024usize).min(m.info.mdts_bytes) as u32;
+    let size = m.info.nsze << m.info.lba_shift;
+    let lba_shift = m.info.lba_shift as u8;
+
+    let ctrl = Arc::new(
+        UblkCtrlBuilder::default()
+            .name("nvmeublk")
+            .nr_queues(queues)
+            .depth(depth)
+            .io_buf_bytes(io_buf)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .context("create ublk device (is ublk_drv loaded?)")?,
+    );
+    let c2 = ctrl.clone();
+    let m2 = m.clone();
+    // Stop the block device FIRST: no new I/O, and in-flight I/O drains over
+    // the still-live paths. Tearing paths down first parked that I/O and the
+    // kernel's device stop then waited out the whole no-path timeout.
+    // libublk's control ring is thread-local: the handler thread must stop
+    // the device through its own control handle (calling kill_dev on the
+    // shared one panicked with "Control ring not initialized").
+    let _ = (m2, c2);
+    let dev_id = ctrl.dev_info().dev_id as i32;
+    ctrlc::set_handler(move || match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
+        Ok(c) => {
+            if let Err(e) = c.kill_dev() {
+                log::error!("stop ublk device {dev_id}: {e}");
+            }
+        }
+        Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
+    })?;
+    let mstat = m.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let s = &mstat.stats;
+        let paths: Vec<String> = mstat.path_states().iter().map(|(a, up, n)| format!("{}={}{}", a.ip(), if *up { "up" } else { "DOWN" }, if *up { format!("/{n}") } else { String::new() })).collect();
+        log::info!(
+            "paths [{}] failovers={} resubmits={} parked={} no_path_eio={} reconnects={} stall_kills={}",
+            paths.join(" "),
+            s.failovers.load(Ordering::Relaxed),
+            s.resubmits.load(Ordering::Relaxed),
+            s.parked.load(Ordering::Relaxed),
+            s.no_path_eio.load(Ordering::Relaxed),
+            s.reconnects.load(Ordering::Relaxed),
+            s.stall_kills.load(Ordering::Relaxed)
+        );
+    });
+
+    let mq = m.clone();
+    ctrl.run_target(
+        move |dev: &mut UblkDev| {
+            dev.set_default_params(size);
+            dev.tgt.params.basic.logical_bs_shift = lba_shift;
+            dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
+            Ok(())
+        },
+        move |qid, dev: &_| queue_fn(qid, dev, mq.clone()),
+        |c| {
+            log::info!("serving /dev/ublkb{}", c.dev_info().dev_id);
+        },
+    )?;
+    m.shutdown();
+    // The signal handler holds a clone of `ctrl`, so it is never dropped;
+    // delete the device explicitly or /dev/ublkbN outlives the process.
+    ctrl.del_dev()?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "del" {
+        let id: i32 = args[2].parse().context("device id")?;
+        libublk::ctrl::UblkCtrl::new_simple(id)?.del_dev()?;
+        println!("deleted ublk device {id}");
+        return Ok(());
+    }
+    if args.len() < 4 {
+        bail!("usage: nvmeublk probe|run <subnqn> <addr:port>...");
+    }
+    match args[1].as_str() {
+        "probe" => probe(&args[2], &args[3..]),
+        "lat" => lat(&args[2], &args[3..]),
+        "run" => run(&args[2], &args[3..]),
+        c => bail!("unknown command {c}"),
+    }
+}
