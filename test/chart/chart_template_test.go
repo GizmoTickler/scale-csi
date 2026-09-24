@@ -1175,3 +1175,18 @@ func TestChartMultipathDocumentsNodeHalfScope(t *testing.T) {
 		t.Error("values.yaml must document that nvmeof.portPerf is applied at port create only")
 	}
 }
+
+// TestChartStartupConnectTimeoutFailsAtRenderPastInt32 pins the deferred
+// v1.11.0 item: a startupConnectTimeout large enough to push the derived
+// startup-probe failureThreshold past int32 rendered fine and was only rejected
+// by the API server at apply time. It must fail at render, and a large but
+// representable value must still render.
+func TestChartStartupConnectTimeoutFailsAtRenderPastInt32(t *testing.T) {
+	out := helmTemplateExpectError(t, "--set", "startupConnectTimeout=7000000h")
+	if !strings.Contains(out, "exceeds the int32 maximum") {
+		t.Fatalf("expected the int32 overflow message, got:\n%s", out)
+	}
+	if rendered := helmTemplate(t, "--set", "startupConnectTimeout=20000h"); !strings.Contains(rendered, "failureThreshold: 7200001") {
+		t.Fatalf("a representable timeout must still render its derived threshold")
+	}
+}

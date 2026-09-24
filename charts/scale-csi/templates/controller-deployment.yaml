@@ -188,6 +188,12 @@ spec:
           {{- $startupProbeSpan := sub (add $startupTimeoutSeconds $startupPeriod) $startupInitialDelay }}
           {{- $startupTicks := div (add $startupProbeSpan (sub $startupPeriod 1)) $startupPeriod }}
           {{- $startupFailureThreshold := max 30 (add $startupTicks 1) }}
+          {{- /* Kubernetes stores failureThreshold as int32. Past it the
+               manifest renders but the API server rejects the apply, which is
+               a worse place to learn about a typo'd timeout than here. */}}
+          {{- if gt (int64 $startupFailureThreshold) 2147483647 }}
+          {{- fail (printf "startupConnectTimeout=%v needs a startup probe failureThreshold of %d, which exceeds the int32 maximum Kubernetes accepts (2147483647); use a shorter timeout" .Values.startupConnectTimeout (int64 $startupFailureThreshold)) }}
+          {{- end }}
           # Port 9808 is the liveness-probe SIDECAR, and it is the only endpoint
           # in this pod that means "the driver is SERVING". It answers 200 only
           # once /csi/csi.sock accepts a CSI Probe RPC, and refuses the

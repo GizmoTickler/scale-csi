@@ -5,7 +5,28 @@
   "additionalProperties": false,
   "required": [
     "truenas",
-    "zfs"
+    "zfs",
+    "capacity",
+    "encryption",
+    "fencing",
+    "image",
+    "controller",
+    "node",
+    "nfs",
+    "iscsi",
+    "csidriver",
+    "snapshotClass",
+    "sidecars",
+    "serviceAccount",
+    "rbac",
+    "health",
+    "debug",
+    "logging",
+    "metrics",
+    "reconcile",
+    "sessionGC",
+    "resilience",
+    "commandTimeouts"
   ],
   "allOf": [
     {
@@ -327,7 +348,10 @@
           },
           "additionalProperties": true
         }
-      }
+      },
+      "required": [
+        "healthProbe"
+      ]
     },
     "storageClass": {
       "type": "object",
@@ -815,7 +839,10 @@
         "extraVolumes": {
           "$ref": "#/definitions/kubernetesList"
         }
-      }
+      },
+      "required": [
+        "podDisruptionBudget"
+      ]
     },
     "node": {
       "type": "object",
@@ -1331,7 +1358,10 @@
             ]
           }
         }
-      }
+      },
+      "required": [
+        "chap"
+      ]
     },
     "nvmeof": {
       "type": "object",
@@ -1522,7 +1552,17 @@
           "description": "DEPRECATED, ignored; external-health-monitor consumed the CSI VolumeCondition field that spec v1.13 removed. Retained only so old values files pass validation.",
           "type": "object"
         }
-      }
+      },
+      "required": [
+        "securityContext",
+        "leaderElection",
+        "provisioner",
+        "attacher",
+        "resizer",
+        "snapshotter",
+        "nodeDriverRegistrar",
+        "livenessProbe"
+      ]
     },
     "serviceAccount": {
       "type": "object",
@@ -1648,7 +1688,13 @@
             }
           }
         }
-      }
+      },
+      "required": [
+        "service",
+        "serviceMonitor",
+        "prometheusRule",
+        "dashboards"
+      ]
     },
     "reconcile": {
       "type": "object",
@@ -1762,9 +1808,19 @@
                 }
               }
             }
-          }
+          },
+          "required": [
+            "scanFallback"
+          ]
         }
-      }
+      },
+      "required": [
+        "spentRestore",
+        "bookkeeping",
+        "tombstoneReaper",
+        "repair",
+        "delete"
+      ]
     },
     "sessionGC": {
       "type": "object",
@@ -1857,7 +1913,12 @@
             }
           }
         }
-      }
+      },
+      "required": [
+        "circuitBreaker",
+        "retry",
+        "rateLimiting"
+      ]
     },
     "commandTimeouts": {
       "type": "object",
