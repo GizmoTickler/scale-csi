@@ -167,6 +167,8 @@ pub struct Stats {
     pub direct_rx: AtomicU64,
     /// Read payload bytes received straight into ublk request pages.
     pub zc_bytes: AtomicU64,
+    /// Write payload bytes sent straight from ublk request pages.
+    pub zc_tx_bytes: AtomicU64,
     /// Stage split (ns sums): capsule queued -> its Writev done; Writev done ->
     /// first C2H byte (reads); first byte -> completion (reads).
     pub q2w_ns: AtomicU64,
@@ -267,6 +269,9 @@ struct OutMsg {
     cid: u16,
     h2c: bool,
     queued: Instant,
+    /// Zero copy: the payload is `len` bytes at this offset of the ring's
+    /// registered buffer `index` (the ublk request's own pages), not `data`.
+    fixed: Option<(u16, usize)>,
 }
 
 struct QConn {
@@ -394,6 +399,11 @@ impl QEngine {
         self.exe.spawn(async move { me.results_task().await }).detach();
     }
 
+    /// Largest write sent inside the command capsule.
+    pub fn incapsule(&self) -> usize {
+        self.incapsule
+    }
+
     fn live(&self) -> Vec<Rc<QConn>> {
         self.conns.borrow().iter().flatten().filter(|c| !c.dead.get()).cloned().collect()
     }
@@ -454,7 +464,7 @@ impl QEngine {
         p.wired = None;
         p.first_data = None;
         c.inflight.borrow_mut().insert(cid, p);
-        if c.tx.try_send(OutMsg { head, data, len, cid, h2c: false, queued: Instant::now() }).is_err() {
+        if c.tx.try_send(OutMsg { head, data, len, cid, h2c: false, queued: Instant::now(), fixed: None }).is_err() {
             let p = c.inflight.borrow_mut().remove(&cid).expect("just inserted");
             self.free_cid(c, cid);
             return Err(p);
@@ -664,41 +674,23 @@ impl QEngine {
                     Err(_) => break,
                 }
             }
+            // Headers and copied payloads go out in batched writev calls; a
+            // zero-copy payload is written from its registered buffer in
+            // between, so the byte stream keeps the order of the batch.
             let mut iov: Vec<libc::iovec> = Vec::with_capacity(batch.len() * 2);
             for m in &batch {
                 iov.push(libc::iovec { iov_base: m.head.as_ptr() as *mut _, iov_len: m.head.len() });
-                if m.len > 0 {
+                if let Some((idx, off)) = m.fixed {
+                    if !self.write_iov(&c, &mut iov).await || !self.write_fixed(&c, idx, off, m.len).await {
+                        return;
+                    }
+                    iov.clear();
+                } else if m.len > 0 {
                     iov.push(libc::iovec { iov_base: m.data as *mut _, iov_len: m.len });
                 }
             }
-            let mut idx = 0usize;
-            while idx < iov.len() {
-                let n = iov.len() - idx;
-                let sqe = io_uring::opcode::Writev::new(io_uring::types::Fd(c.fd), iov[idx..].as_ptr() as *const _, n.min(1024) as u32).build();
-                let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
-                if c.dead.get() {
-                    return;
-                }
-                if r == -libc::EAGAIN || r == -libc::EINTR {
-                    continue;
-                }
-                if r <= 0 {
-                    self.fail_conn(&c, &format!("send failed ({r})"), Cause::Failure);
-                    return;
-                }
-                // Advance past fully written iovecs; trim a partial one.
-                let mut left = r as usize;
-                while left > 0 {
-                    let l = iov[idx].iov_len;
-                    if left >= l {
-                        left -= l;
-                        idx += 1;
-                    } else {
-                        iov[idx].iov_base = unsafe { (iov[idx].iov_base as *mut u8).add(left) } as *mut _;
-                        iov[idx].iov_len -= left;
-                        left = 0;
-                    }
-                }
+            if !self.write_iov(&c, &mut iov).await {
+                return;
             }
             let now = Instant::now();
             let mut deferred = Vec::new();
@@ -728,6 +720,68 @@ impl QEngine {
                 }
             }
         }
+    }
+
+    /// Write all of `iov` (headers and copied payloads). False: the
+    /// connection is gone and has been failed.
+    async fn write_iov(&self, c: &Rc<QConn>, iov: &mut [libc::iovec]) -> bool {
+        let mut idx = 0usize;
+        while idx < iov.len() {
+            let n = iov.len() - idx;
+            let sqe = io_uring::opcode::Writev::new(io_uring::types::Fd(c.fd), iov[idx..].as_ptr() as *const _, n.min(1024) as u32).build();
+            let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
+            if c.dead.get() {
+                return false;
+            }
+            if r == -libc::EAGAIN || r == -libc::EINTR {
+                continue;
+            }
+            if r <= 0 {
+                self.fail_conn(c, &format!("send failed ({r})"), Cause::Failure);
+                return false;
+            }
+            // Advance past fully written iovecs; trim a partial one.
+            let mut left = r as usize;
+            while left > 0 {
+                let l = iov[idx].iov_len;
+                if left >= l {
+                    left -= l;
+                    idx += 1;
+                } else {
+                    iov[idx].iov_base = unsafe { (iov[idx].iov_base as *mut u8).add(left) } as *mut _;
+                    iov[idx].iov_len -= left;
+                    left = 0;
+                }
+            }
+        }
+        true
+    }
+
+    /// Write `len` bytes at offset `off` of registered buffer `idx` to the
+    /// socket (WRITE_FIXED: the generic write path imports the kernel buffer
+    /// on every kernel with ublk AUTO_BUF_REG; a fixed-buffer SEND is refused
+    /// before 7.x).
+    async fn write_fixed(&self, c: &Rc<QConn>, idx: u16, off: usize, len: usize) -> bool {
+        let mut done = 0usize;
+        while done < len {
+            let sqe = io_uring::opcode::WriteFixed::new(io_uring::types::Fd(c.fd), (off + done) as *const u8, (len - done) as u32, idx)
+                .offset(u64::MAX)
+                .build();
+            let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
+            if c.dead.get() {
+                return false;
+            }
+            if r == -libc::EAGAIN || r == -libc::EINTR {
+                continue;
+            }
+            if r <= 0 {
+                self.fail_conn(c, &format!("zero-copy send failed ({r})"), Cause::Failure);
+                return false;
+            }
+            done += r as usize;
+            self.stats.zc_tx_bytes.fetch_add(r as u64, Ordering::Relaxed);
+        }
+        true
     }
 
     async fn receiver_task(self: Rc<Self>, c: Rc<QConn>) {
@@ -982,7 +1036,10 @@ impl QEngine {
                     let n = (len - sent).min(c.maxh2c);
                     let head = h2c_header(h.cid, h.ttag, (off + sent) as u32, n, sent + n == len);
                     let data = unsafe { p.buf.add(off + sent) } as *const u8;
-                    if c.tx.try_send(OutMsg { head, data, len: n, cid: h.cid, h2c: true, queued: Instant::now() }).is_err() {
+                    // A large write in zero-copy mode was never copied into
+                    // our buffer: send it from the request's registered pages.
+                    let fixed = if p.op == Op::Write { p.zc_index.map(|idx| (idx, off + sent)) } else { None };
+                    if c.tx.try_send(OutMsg { head, data, len: n, cid: h.cid, h2c: true, queued: Instant::now(), fixed }).is_err() {
                         return Err("sender gone while answering R2T".into());
                     }
                     p.h2c_queued += 1;

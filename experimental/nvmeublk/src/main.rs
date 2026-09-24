@@ -172,7 +172,10 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
             None => -libc::EOPNOTSUPP,
             Some(op) => 'io: {
                 let bytes = (iod.nr_sectors as usize) << 9;
-                if let (Some(pos), qengine::Op::Write) = (ucopy, op) {
+                // Zero copy: a write too large for the capsule goes out via
+                // R2T straight from the request's registered pages.
+                let zc_write = zc && op == qengine::Op::Write && bytes > e.incapsule();
+                if let (Some(pos), qengine::Op::Write, false) = (ucopy, op, zc_write) {
                     // Pull the write data out of the request into our buffer.
                     let mut got = 0usize;
                     while got < bytes {
@@ -195,7 +198,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
                     if op == qengine::Op::Flush { 0 } else { bytes },
                     done_tx.clone(),
                     ucopy,
-                    (zc && op == qengine::Op::Read).then_some(tag),
+                    (zc && (op == qengine::Op::Read || zc_write)).then_some(tag),
                 ));
                 done_rx.recv().await.unwrap_or(-libc::EIO)
             }
@@ -425,8 +428,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         let g = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
         let (qw, qn, wd, dc, rn, lp, ln) = (g(&st.q2w_ns), g(&st.q2w_n).max(1), g(&st.w2d_ns), g(&st.d2c_ns), g(&st.rd_n).max(1), g(&st.loops).max(1), g(&st.loop_ns));
         let lat = format!(
-            "zc_MiB={} io={} wire_avg={}us total_avg={}us | queued->wired={}us wired->1stdata={}us 1stdata->done={}us | loops/s={} run_ops_avg={}us",
-            st.zc_bytes.load(Ordering::Relaxed) >> 20, n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, wd / rn / 1000, dc / rn / 1000, lp / 5, ln / lp / 1000
+            "zc_MiB={} zc_tx_MiB={} io={} wire_avg={}us total_avg={}us | queued->wired={}us wired->1stdata={}us 1stdata->done={}us | loops/s={} run_ops_avg={}us",
+            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, wd / rn / 1000, dc / rn / 1000, lp / 5, ln / lp / 1000
         );
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();

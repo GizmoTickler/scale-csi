@@ -199,6 +199,23 @@ Zero copy plus 8 ublk queues (on 16 vCPUs) plus NAPI busy poll (`NVMEUBLK_NAPI_U
 
 Still behind the kernel: QD1 latency (by about 75 µs) and single-stream large writes. The write path still does two copies (`pread` from the request, then send). A zero-copy send from the registered buffer is the next lever there.
 
+### Beating the kernel on latency too: longer busy poll (2026-09-24)
+The network round trip here is about 250 µs, so a 50 µs NAPI budget mostly still ends in sleep. With a longer budget the queue thread is still polling when the reply and the next ublk request arrive, so neither needs an interrupt plus scheduler wakeup. Same VM and zvol; zero copy, 8 queues, `NVMEUBLK_NAPI_US=200`; the kernel was measured before and after:
+
+| | kernel nvme-tcp | nvmeublk |
+|---|---|---|
+| 4K randread QD1 | 285–298 µs | **241–257 µs** |
+| 128K read, 1 job, pinned | 964 MiB/s | **1,118** (+16%) |
+| 128K read, 1 job | 765 | **1,020** (+33%) |
+| 128K read, 4 jobs | 2,583 | **3,000** (+16%) |
+| 4K randread 4×QD32 | 54K IOPS | **104K** |
+| 4K randwrite 4×QD32 | 47K | **90K** |
+| 128K write, 1 job | **630 MiB/s** | 535 |
+
+Budget sweep (8 queues): 50 µs gives QD1 334 µs; 200 µs gives 241 µs; 1,000 µs gives 234 µs. The cost is CPU: about 1.1 busy cores during the QD1 run, against 0.4 for the kernel. Throughput runs are unaffected.
+
+Zero-copy writes: payloads of writes larger than the in-capsule size go out via R2T straight from the request's registered pages (`IORING_OP_WRITE_FIXED` on the socket; a fixed-buffer `SEND` is refused by 6.19). Verified: 3 GiB of 64K–1M writes, every byte sent zero-copy, `err=0`; mixed failover drill 30 GiB `err=0`. It does not change single-stream 128K write throughput: every path, kernel included, lands at 520–800 MiB/s there, so that test is bound by the target. With 8 queues nvmeublk sits at the low end (519–628); with 4 queues, at 662–766.
+
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
 - The receiver tore down the admin queue before resubmitting orphans; that could wait behind a blocked keep-alive. Fix: fail over first.
