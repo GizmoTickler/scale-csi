@@ -42,8 +42,6 @@ pub const NSID: u32 = 1;
 /// read is not copied twice in user space.
 const RX_CHUNK_DEFAULT: usize = 32 * 1024;
 
-/// io_uring UAPI: recv into a registered (fixed) buffer, index in buf_index.
-const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
 
 /// Wait until `efd` (an eventfd) is readable, then drain it. POLL_ADD always
 /// arms a poll; a READ SQE on a non-blocking eventfd returns -EAGAIN at once
@@ -808,10 +806,12 @@ impl QEngine {
             // Zero copy: socket -> the request's registered pages, at byte
             // offset off+got of the kernel buffer (its base address is 0).
             while got < len && !c.dead.get() {
-                let sqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32)
-                    .ioprio(IORING_RECVSEND_FIXED_BUF)
-                    .buf_group(idx)
-                    .flags(libc::MSG_WAITALL)
+                // READ_FIXED on the socket: the generic read path imports the
+                // kernel-registered buffer on every kernel with ublk zero copy
+                // (a fixed-buffer RECV is refused with EINVAL before 7.x). It
+                // may return short, so loop until the payload is complete.
+                let sqe = io_uring::opcode::ReadFixed::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32, idx)
+                    .offset(u64::MAX)
                     .build();
                 let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
                 if c.dead.get() {
@@ -823,7 +823,7 @@ impl QEngine {
                 if r <= 0 {
                     failed = Some(if r == 0 { "connection closed" } else { "zero-copy receive failed" });
                     if r < 0 {
-                        log::warn!("q{}: fixed-buffer recv failed: {r}", self.qid);
+                        log::warn!("q{}: fixed-buffer read failed: {r}", self.qid);
                     }
                     break;
                 }
