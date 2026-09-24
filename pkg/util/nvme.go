@@ -954,6 +954,10 @@ func NVMeDiscovery(transport, host, port string) ([]string, error) {
 
 // GetNVMeInfoFromDevice returns the NQN for a given device path.
 func GetNVMeInfoFromDevice(devicePath string) (string, error) {
+	return getNVMeInfoFromDeviceAt("/sys", devicePath)
+}
+
+func getNVMeInfoFromDeviceAt(sysRoot, devicePath string) (string, error) {
 	deviceName := filepath.Base(devicePath)
 
 	// Check if it's an NVMe device
@@ -961,27 +965,32 @@ func GetNVMeInfoFromDevice(devicePath string) (string, error) {
 		return "", fmt.Errorf("not an NVMe device: %s", devicePath)
 	}
 
-	// Find subsystem NQN by extracting controller name from namespace device
-	// nvme0n1 -> nvme0
 	matches := nvmeDeviceRegex.FindStringSubmatch(deviceName)
 	if len(matches) != 2 {
 		return "", fmt.Errorf("invalid NVMe device name: %s", deviceName)
 	}
-	ctrlName := matches[1]
 
-	// Read subsysnqn from controller
-	// /sys/class/nvme/nvme0/subsysnqn
-	nqnPath := filepath.Join("/sys/class/nvme", ctrlName, "subsysnqn") //nolint:gocritic // absolute sysfs path is intentional
-	content, err := os.ReadFile(nqnPath)
-	if err == nil {
-		return strings.TrimSpace(string(content)), nil
+	// Ask the block device itself first. For a native-multipath head disk
+	// (nvmeXnY), /sys/block/nvmeXnY/device is the SUBSYSTEM (nvme-subsysX),
+	// which carries subsysnqn and lives as long as any path does. The name's
+	// "nvmeX" is only the subsystem instance, inherited from the founding
+	// controller: once that controller is gone, /sys/class/nvme/nvmeX no
+	// longer exists even though the subsystem still has live paths, and the
+	// controller lookup below failed, pausing session GC for that protocol.
+	// For a non-multipath namespace, device is the controller, which also
+	// carries subsysnqn.
+	if content, err := os.ReadFile(filepath.Join(sysRoot, "block", deviceName, "device", "subsysnqn")); err == nil {
+		if nqn := strings.TrimSpace(string(content)); nqn != "" {
+			return nqn, nil
+		}
 	}
 
-	// Try via subsystem link
-	// /sys/class/nvme/nvme0/subsystem/subsysnqn
-	nqnPath = filepath.Join("/sys/class/nvme", ctrlName, "subsystem", "subsysnqn") //nolint:gocritic // absolute sysfs path is intentional
-	content, err = os.ReadFile(nqnPath)
-	if err == nil {
+	// Fall back to the controller named after the namespace (nvme0n1 -> nvme0).
+	ctrlName := matches[1]
+	if content, err := os.ReadFile(filepath.Join(sysRoot, "class", "nvme", ctrlName, "subsysnqn")); err == nil {
+		return strings.TrimSpace(string(content)), nil
+	}
+	if content, err := os.ReadFile(filepath.Join(sysRoot, "class", "nvme", ctrlName, "subsystem", "subsysnqn")); err == nil {
 		return strings.TrimSpace(string(content)), nil
 	}
 
