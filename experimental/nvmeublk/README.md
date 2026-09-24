@@ -155,6 +155,29 @@ Dev VM (kernel 7.2.3, loopback with the target steered off the daemon's CPUs), s
 
 Correctness: verified write/verify-only pass `err=0`; failover drill `err=0` with 4 GiB of verification reads received zero-copy while paths were killed; fsck clean. Not yet measured on the real fabric, where the commit copy was about 30% of the queue thread's time: that needs a >= 6.16 host on the storage network.
 
+### Zero copy on the real fabric (2026-09-24)
+Setup: a throwaway Fedora 44 VM (kernel 6.19.10, 16 vCPU) on the same hypervisor as the cluster workers, attached to the four storage networks exactly like a worker. A dedicated 16 GiB zvol was prefilled with data, exported by its own subsystem admitting only that VM's host NQN. All three data paths ran on the same VM and volume, in two passes in opposite order (ranges are the two passes). The kernel path is native multipath with the queue-depth iopolicy.
+
+| | kernel nvme-tcp | nvmeublk copy | nvmeublk zero copy |
+|---|---|---|---|
+| 128K read, 1 job, pinned | 958–1,104 MiB/s | 703–721 | 746–805 |
+| 128K read, 1 job | 781–797 | 781–879 | **889–955** |
+| 128K read, 4 jobs | 2,586–2,602 | 1,933–2,038 | **2,373–2,471** |
+| 128K write, 1 job | 620–621 | 646–796 | 676–696 |
+| 4K randread 4×QD32 | 52.0–52.6K IOPS | **107–110K** | 99–101K |
+| 4K randwrite 4×QD32 | 53–56K | **96–98K** | 87K |
+| 4K randread QD1 | **267–288 µs** | 412–414 | 393–404 |
+| CPU per GiB, 128K 4 jobs | 2.08–2.10 core-s | 2.41–2.46 | **2.08–2.16** |
+| CPU per GiB, 4K randread | 23.6–23.8 core-s | **12.3–13.0** | 13.4–13.7 |
+
+- Zero copy recovers most of the large-read gap: 4 jobs go from 76–78% to 92–95% of the kernel, it beats the kernel on an unpinned single stream, and CPU per GiB matches the kernel's.
+- Small random I/O stays at about 2× the kernel's IOPS for about half the CPU per GiB.
+- QD1 latency is still about 120 µs behind the kernel.
+
+Safety on the fabric, zero copy, fio crc32c:
+- failover drill (kill, kill, silent stall, kill; random read/write) 15 GiB, `err=0`, 8 GiB of it received zero-copy;
+- `kill -9` + `NVMEUBLK_RECOVER_ID` 12.5 GiB, `err=0`.
+
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
 - The receiver tore down the admin queue before resubmitting orphans; that could wait behind a blocked keep-alive. Fix: fail over first.
