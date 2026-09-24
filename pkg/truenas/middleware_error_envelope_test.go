@@ -335,3 +335,38 @@ func TestNestedOrOperationErrnoNeverReadsAsAbsence(t *testing.T) {
 	// Top-level errno stays authoritative in both directions.
 	assert.True(t, IsNotFoundError(&APIError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"errno": "ENOENT"}}))
 }
+
+// Round-3 verifier N2 (codex, 2026-09-24): the legacy get_instance fallback read
+// "no top-level errno" as "bare -32602 means missing", so a nested lookup failure
+// became "snapshot not found" and could retire tombstone bookkeeping.
+func TestSnapshotGetNestedLookupFailureIsNotAbsence(t *testing.T) {
+	client := newEnvelopeTestClient(t, func(req rpcTestRequest, resp *rpcTestResponse) {
+		switch req.Method {
+		case "auth.login_with_api_key":
+			resp.Result = true
+		case "pool.snapshot.get_instance":
+			resp.Error = &rpcError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"error": 22, "errname": "EINVAL", "extra": map[string]interface{}{"dependency_errno": 13}}}
+		default:
+			resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+		}
+	})
+	_, err := client.SnapshotGet(context.Background(), "tank/k8s/pvc@snap")
+	require.Error(t, err)
+	require.False(t, IsNotFoundError(err), "a failed lookup is not proof of snapshot absence: %v", err)
+}
+
+// Round-3 verifier N3: a failed release whose text happens to contain "hold" and
+// "not" (and a nested errno) must not read as "snapshot was not held" success.
+func TestSnapshotReleaseFailureIsNotNotHeldSuccess(t *testing.T) {
+	client := newEnvelopeTestClient(t, func(req rpcTestRequest, resp *rpcTestResponse) {
+		switch req.Method {
+		case "auth.login_with_api_key":
+			resp.Result = true
+		case "pool.snapshot.release":
+			resp.Error = &rpcError{Code: -1, Message: "hold not released: permission denied", Data: map[string]interface{}{"extra": map[string]interface{}{"errno": 13}}}
+		default:
+			resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+		}
+	})
+	require.Error(t, client.SnapshotRelease(context.Background(), "tank/k8s/pvc@snap"))
+}

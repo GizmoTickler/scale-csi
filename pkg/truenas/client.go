@@ -217,11 +217,7 @@ func MessageFallbackContains(err error, fragments ...string) bool {
 	if err == nil {
 		return false
 	}
-	if _, ok := APIErrno(err); ok {
-		return false
-	}
-	var vetoErr *APIError
-	if errors.As(err, &vetoErr) && nestedErrnoPresent(vetoErr.Data) {
+	if HasStructuredErrno(err) {
 		return false
 	}
 	messageText := err.Error()
@@ -236,6 +232,19 @@ func MessageFallbackContains(err error, fragments ...string) bool {
 		}
 	}
 	return false
+}
+
+// HasStructuredErrno reports whether err carries ANY structured errno: the
+// authoritative top-level one APIErrno reads, or a nested one that is not
+// attributable to this call. It is the VETO test for text fallbacks ("a
+// structured signal exists, so do not guess from prose"). Code that needs the
+// call's own errno uses APIErrno, which reads the top level only.
+func HasStructuredErrno(err error) bool {
+	if _, ok := APIErrno(err); ok {
+		return true
+	}
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && nestedErrnoPresent(apiErr.Data)
 }
 
 // APIErrno extracts a structured errno from an APIError. TrueNAS error Data

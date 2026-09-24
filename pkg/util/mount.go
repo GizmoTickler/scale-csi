@@ -731,7 +731,10 @@ func listBlockDeviceMounts() ([][2]string, error) {
 
 	// Use findmnt to list all block device mounts
 	// -n: no headers, -l: list format, -o: output columns
-	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-l", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs")
+	// -r (raw) escapes whitespace and other unsafe bytes as \xNN, so every row
+	// splits into exactly two fields; -l printed them verbatim and a mount
+	// point containing a space was truncated at it.
+	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-r", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs")
 	HardenCmd(cmd)
 	output, err := cmd.Output()
 	if err != nil {
@@ -760,8 +763,14 @@ func listBlockDeviceMounts() ([][2]string, error) {
 		// Format: SOURCE TARGET (space-separated)
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
-			device := fields[0]
-			target := fields[1]
+			device := decodeFindmntRaw(fields[0])
+			target := decodeFindmntRaw(fields[1])
+			// A bind mount of a subdirectory (a pod subPath, a btrfs subvolume)
+			// reports SOURCE as "/dev/nvme0n1[/fsroot]"; the device is the part
+			// before the bracket.
+			if i := strings.IndexByte(device, '['); i > 0 && strings.HasSuffix(device, "]") {
+				device = device[:i]
+			}
 			// Only include actual block devices (skip things like tmpfs, overlay, etc.)
 			if strings.HasPrefix(device, "/dev/") {
 				mounts = append(mounts, [2]string{device, target})
@@ -813,4 +822,23 @@ func GetStagedBlockDevices(stagingRoot string) (map[string]string, error) {
 	}
 
 	return devices, nil
+}
+
+// decodeFindmntRaw undoes findmnt -r's \xNN escaping.
+func decodeFindmntRaw(field string) string {
+	if !strings.Contains(field, `\x`) {
+		return field
+	}
+	var b strings.Builder
+	for i := 0; i < len(field); i++ {
+		if i+3 < len(field) && field[i] == '\\' && field[i+1] == 'x' {
+			if v, err := strconv.ParseUint(field[i+2:i+4], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(field[i])
+	}
+	return b.String()
 }

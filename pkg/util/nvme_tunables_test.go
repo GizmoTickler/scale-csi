@@ -89,3 +89,24 @@ func TestGetBlockDeviceMountsKeepsEveryMountPoint(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, single, 1, "the single-target inventory keeps its historical shape")
 }
+
+// findmnt -r escapes whitespace as \xNN and reports a subdirectory bind mount's
+// source as "/dev/X[/fsroot]". Both used to break the parse (codex round-3): a
+// target with a space was truncated, and a decorated source was not a device.
+func TestGetBlockDeviceMountsDecodesRawFindmntOutput(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\nprintf '%s\\n' " +
+		`'/dev/nvme1n1 /mnt/with\x20space' ` +
+		`'/dev/nvme0n1[/a\x20b] /var/lib/kubelet/pods/p/volume-subpaths/v/c/0' ` +
+		`'/dev/nvme2n1[/@] /var/lib/kubelet/plugins/kubernetes.io/csi/csi.scale.io/h/globalmount'` + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "findmnt"), []byte(script), 0o700)) //nolint:gosec // test-only executable stub
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mounts, err := GetBlockDeviceMounts()
+	require.NoError(t, err)
+	assert.Equal(t, map[string][]string{
+		"/dev/nvme1n1": {"/mnt/with space"},
+		"/dev/nvme0n1": {"/var/lib/kubelet/pods/p/volume-subpaths/v/c/0"},
+		"/dev/nvme2n1": {"/var/lib/kubelet/plugins/kubernetes.io/csi/csi.scale.io/h/globalmount"},
+	}, mounts)
+}
