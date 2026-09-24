@@ -148,7 +148,12 @@ fn lat(nqn: &str, addrs: &[String]) -> Result<()> {
 }
 
 async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, cdev_fd: i32, zc: bool) -> Result<(), UblkError> {
-    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+    // Zero copy moves bulk data straight between the socket and the request's
+    // own pages, so this buffer only ever holds in-capsule write data: size it
+    // to that instead of the max I/O size. It is mlock()ed, per tag, per queue,
+    // per volume (64 x 512K x 8 queues = 256 MiB per volume otherwise).
+    let buf_len = if zc { e.incapsule().max(4096).next_power_of_two() } else { q.dev.dev_info.max_io_buf_bytes as usize };
+    let buf = IoBuf::<u8>::new(buf_len);
     // Per-tag completion channel, reused for every request on this tag.
     let (done_tx, done_rx) = smol::channel::bounded::<i32>(1);
     // USER_COPY: the kernel moves no data at fetch/commit; `buf` is only our

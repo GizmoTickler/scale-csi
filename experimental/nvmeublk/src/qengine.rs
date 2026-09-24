@@ -906,7 +906,7 @@ impl QEngine {
                         self.fail_conn(c, &e, Cause::Failure);
                         return Direct::Failed;
                     }
-                    (unsafe { p.buf.add(off) }, p.ucopy.map(|pos| pos + off as u64), p.zc_index)
+                    (p.buf.wrapping_add(off), p.ucopy.map(|pos| pos + off as u64), p.zc_index)
                 }
                 _ => return Direct::No, // handle_pdu reports it once whole
             }
@@ -1067,7 +1067,9 @@ impl QEngine {
                 while sent < len {
                     let n = (len - sent).min(c.maxh2c);
                     let head = h2c_header(h.cid, h.ttag, (off + sent) as u32, n, sent + n == len);
-                    let data = unsafe { p.buf.add(off + sent) } as *const u8;
+                    // Not dereferenced when the payload goes out zero-copy (then
+                    // the tag buffer is only in-capsule sized), hence wrapping_add.
+                    let data = p.buf.wrapping_add(off + sent) as *const u8;
                     // A large write in zero-copy mode was never copied into
                     // our buffer: send it from the request's registered pages.
                     let fixed = if p.op == Op::Write { p.zc_index.map(|idx| (idx, off + sent)) } else { None };
