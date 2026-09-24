@@ -8,12 +8,15 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/util"
 )
 
 var configWarningf = klog.Warningf
@@ -871,6 +874,125 @@ type NVMeoFConfig struct {
 	// configures a shared TrueNAS port object, these apply per-connection on
 	// every node that stages a volume.
 	Connect NVMeoFConnectConfig `yaml:"connect"`
+
+	// DataPath is how the node plugin attaches an NVMe-oF volume whose
+	// StorageClass does not choose one with the nvmeof/dataPath parameter:
+	// "kernel" (the default, and the only behavior before this field existed)
+	// connects with `nvme connect` and native kernel multipath; "ublk" asks
+	// the per-node nvmeublkd daemon for a userspace NVMe/TCP device instead.
+	// Empty means "kernel". The choice is made per volume at NodeStage and
+	// recorded in the PV's volume context when the StorageClass sets it, so a
+	// later change here never moves an already-provisioned volume that pinned
+	// its data path.
+	DataPath string `yaml:"dataPath"`
+
+	// Ublk configures the userspace data path. It is consulted only for
+	// volumes that use it.
+	Ublk NVMeoFUblkConfig `yaml:"ublk"`
+}
+
+// Data paths an NVMe-oF volume can be staged through.
+const (
+	NVMeoFDataPathKernel = "kernel"
+	NVMeoFDataPathUblk   = "ublk"
+)
+
+// NVMeoFUblkConfig configures the userspace NVMe/TCP data path served by the
+// per-node nvmeublkd daemon. Zero values mean "use the default" so a config
+// that never mentions ublk loads exactly as before.
+type NVMeoFUblkConfig struct {
+	// Enabled makes the ublk data path available to StorageClasses that opt in
+	// with nvmeof/dataPath: ublk while DataPath (the default) stays "kernel".
+	// DataPath: ublk implies it.
+	Enabled bool `yaml:"enabled"`
+
+	// SocketPath is the daemon's control socket (default
+	// /run/nvmeublk/nvmeublkd.sock).
+	SocketPath string `yaml:"socketPath"`
+
+	// Queues is the number of ublk queues per device (default 8).
+	Queues int `yaml:"queues"`
+
+	// Depth is the per-queue ublk depth (default 64).
+	Depth int `yaml:"depth"`
+
+	// ZeroCopy asks the daemon for ublk zero copy (UBLK_F_AUTO_BUF_REG). It
+	// needs kernel >= 6.16; the daemon refuses the attach on an older kernel.
+	// Nil means the default, true.
+	ZeroCopy *bool `yaml:"zeroCopy"`
+
+	// NapiUs is the NAPI busy-poll budget in microseconds while a queue has
+	// I/O in flight. 0 (the default) disables busy polling.
+	NapiUs int `yaml:"napiUs"`
+
+	// AttachTimeout bounds one attach call in seconds (default 60). An attach
+	// connects every path, so it can take longer than a daemon list/detach.
+	AttachTimeout int `yaml:"attachTimeout"`
+}
+
+// Defaults for NVMeoFUblkConfig.
+const (
+	defaultNVMeUblkQueues        = 8
+	defaultNVMeUblkDepth         = 64
+	defaultNVMeUblkAttachTimeout = 60
+	// ublk's own limits (UBLK_MAX_NR_QUEUES / UBLK_MAX_QUEUE_DEPTH).
+	maxNVMeUblkQueues = 4096
+	maxNVMeUblkDepth  = 4096
+	// One second of busy polling per wakeup is already far past any useful
+	// budget; anything larger is a typo.
+	maxNVMeUblkNapiUs = 1000000
+)
+
+// withDefaults returns c with every unset field at its default. The node
+// reads the ublk settings through this, so a Config built without LoadConfig
+// still behaves like a loaded one.
+func (c NVMeoFUblkConfig) withDefaults() NVMeoFUblkConfig {
+	if c.SocketPath == "" {
+		c.SocketPath = util.DefaultNVMeUblkSocket
+	}
+	if c.Queues == 0 {
+		c.Queues = defaultNVMeUblkQueues
+	}
+	if c.Depth == 0 {
+		c.Depth = defaultNVMeUblkDepth
+	}
+	if c.ZeroCopy == nil {
+		zeroCopy := true
+		c.ZeroCopy = &zeroCopy
+	}
+	if c.AttachTimeout == 0 {
+		c.AttachTimeout = defaultNVMeUblkAttachTimeout
+	}
+	return c
+}
+
+// normalizeNVMeoFDataPath canonicalizes a data-path value. Empty is the
+// kernel path. ok is false for anything that is not a known data path.
+func normalizeNVMeoFDataPath(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", NVMeoFDataPathKernel:
+		return NVMeoFDataPathKernel, true
+	case NVMeoFDataPathUblk:
+		return NVMeoFDataPathUblk, true
+	default:
+		return "", false
+	}
+}
+
+// defaultDataPath is the data path for a volume that did not choose one. An
+// invalid value (rejected by validateConfig on a loaded config) reads as the
+// kernel path.
+func (c NVMeoFConfig) defaultDataPath() string {
+	if dataPath, ok := normalizeNVMeoFDataPath(c.DataPath); ok {
+		return dataPath
+	}
+	return NVMeoFDataPathKernel
+}
+
+// ublkAvailable reports whether this install may stage volumes through the
+// userspace data path at all.
+func (c NVMeoFConfig) ublkAvailable() bool {
+	return c.Ublk.Enabled || c.defaultDataPath() == NVMeoFDataPathUblk
 }
 
 // NVMeoFConnectConfig holds node-side `nvme connect` CLI knobs (N4), mirroring
@@ -1309,6 +1431,7 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.NVMeoF.DeviceWaitTimeout == 0 {
 		cfg.NVMeoF.DeviceWaitTimeout = 60 // Default 60 seconds
 	}
+	cfg.NVMeoF.Ublk = cfg.NVMeoF.Ublk.withDefaults()
 	if cfg.Reconcile.Interval == "" {
 		cfg.Reconcile.Interval = "1h"
 	}
@@ -1631,6 +1754,42 @@ func validateConfig(cfg *Config) error {
 		if v := cfg.NVMeoF.Connect.KeepAliveTmo; v != nil && *v < 1 {
 			return fmt.Errorf("nvmeof.connect.keepAliveTmo must be positive (got %d)", *v)
 		}
+		if err := validateNVMeoFDataPathConfig(&cfg.NVMeoF); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateNVMeoFDataPathConfig checks nvmeof.dataPath and the ublk settings,
+// and canonicalizes dataPath in place.
+func validateNVMeoFDataPathConfig(nvmeof *NVMeoFConfig) error {
+	dataPath, ok := normalizeNVMeoFDataPath(nvmeof.DataPath)
+	if !ok {
+		return fmt.Errorf("nvmeof.dataPath must be %q or %q (got %q)", NVMeoFDataPathKernel, NVMeoFDataPathUblk, nvmeof.DataPath)
+	}
+	nvmeof.DataPath = dataPath
+	// Unset fields validate as their defaults, so a Config assembled without
+	// LoadConfig's defaulting is judged on what the node would actually use.
+	ublk := nvmeof.Ublk.withDefaults()
+	if !filepath.IsAbs(ublk.SocketPath) {
+		return fmt.Errorf("nvmeof.ublk.socketPath must be an absolute path (got %q)", ublk.SocketPath)
+	}
+	if ublk.Queues < 1 || ublk.Queues > maxNVMeUblkQueues {
+		return fmt.Errorf("nvmeof.ublk.queues must be between 1 and %d (got %d)", maxNVMeUblkQueues, ublk.Queues)
+	}
+	if ublk.Depth < 1 || ublk.Depth > maxNVMeUblkDepth {
+		return fmt.Errorf("nvmeof.ublk.depth must be between 1 and %d (got %d)", maxNVMeUblkDepth, ublk.Depth)
+	}
+	if ublk.NapiUs < 0 || ublk.NapiUs > maxNVMeUblkNapiUs {
+		return fmt.Errorf("nvmeof.ublk.napiUs must be between 0 and %d (got %d)", maxNVMeUblkNapiUs, ublk.NapiUs)
+	}
+	if ublk.AttachTimeout < 1 {
+		return fmt.Errorf("nvmeof.ublk.attachTimeout must be positive (got %d)", ublk.AttachTimeout)
+	}
+	// nvmeublkd speaks NVMe/TCP only.
+	if nvmeof.ublkAvailable() && !strings.EqualFold(strings.TrimSpace(nvmeof.Transport), "tcp") {
+		return fmt.Errorf("the ublk data path supports only nvmeof.transport=tcp (got %q)", nvmeof.Transport)
 	}
 	return nil
 }

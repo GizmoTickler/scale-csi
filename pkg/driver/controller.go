@@ -800,6 +800,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	ctx = withZFSPerformanceClass(ctx, performanceClass)
 
+	// Node data path for NVMe-oF (kernel initiator or the userspace nvmeublkd
+	// path). Pure validation; the choice is only recorded in the volume
+	// context. A StorageClass that does not set it is a strict no-op.
+	dataPath, dataPathErr := d.nvmeoFDataPathForCreate(req.GetParameters(), shareType)
+	if dataPathErr != nil {
+		return nil, dataPathErr
+	}
+	ctx = withNVMeoFDataPath(ctx, dataPath)
+
 	// VolumeAttributesClass (CSI MODIFY_VOLUME): CreateVolume may carry
 	// mutable_parameters from the PVC's VolumeAttributesClass. Enforce the SAME
 	// vocabulary ControllerModifyVolume enforces — an unknown, forbidden, or
@@ -4695,6 +4704,13 @@ func (d *Driver) getVolumeContext(ctx context.Context, ds *truenas.Dataset, data
 		if err := backend.VolumeContext(ctx, ds, datasetName, volumeContext); err != nil {
 			return nil, err
 		}
+	}
+
+	// A StorageClass-pinned NVMe-oF data path travels to NodeStage here. Absent
+	// unless the StorageClass set nvmeof/dataPath, so every other volume
+	// context is unchanged.
+	if dataPath := nvmeoFDataPathFromContext(ctx); dataPath != "" && shareType == ShareTypeNVMeoF {
+		volumeContext[nvmeoFDataPathKey] = dataPath
 	}
 
 	// Encryption at rest (GF-Sprint 1): expose ONLY the algorithm marker so
