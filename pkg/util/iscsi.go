@@ -2082,13 +2082,14 @@ func blockDeviceParentAt(classBlockRoot, devicePath string) string {
 
 // IsPositivelyNotISCSIBackable reports kernel device-name classes that the
 // driver's iSCSI staging never produces: the disks it stages are canonical
-// sdX / dm-N (multipath) names, never loop, ram/zram, nbd, sr or nvme. It is a
-// name-class exclusion for session GC, not a transport proof for arbitrary
-// stacked storage an operator builds by hand. Every other device whose identity
-// lookup FAILED is unknown, and session GC must treat it as possibly in use.
+// sdX / dm-N (multipath) names, never loop, ram/zram, nbd, sr, nvme or the
+// userspace NVMe/TCP data path's ublkbN. It is a name-class exclusion for
+// session GC, not a transport proof for arbitrary stacked storage an operator
+// builds by hand. Every other device whose identity lookup FAILED is unknown,
+// and session GC must treat it as possibly in use.
 func IsPositivelyNotISCSIBackable(devicePath string) bool {
 	name := filepath.Base(devicePath)
-	for _, prefix := range []string{"loop", "ram", "zram", "nbd", "sr", "nvme"} {
+	for _, prefix := range []string{"loop", "ram", "zram", "nbd", "sr", "nvme", "ublkb"} {
 		if strings.HasPrefix(name, prefix) {
 			return true
 		}
