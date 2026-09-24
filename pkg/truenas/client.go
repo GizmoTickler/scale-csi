@@ -101,6 +101,16 @@ func IsNotFoundError(err error) bool {
 		if isJSONRPCProtocolError(apiErr.Code) {
 			return false
 		}
+		// A CallException arrives as -32001 whose Message is the constant
+		// "Method call error", so the message match below can never see it, and
+		// its errno sits under the envelope's "error"/"errname" keys, which
+		// APIErrno does not read. This direction feeds silent-success deletes,
+		// so it is deliberately stricter than IsAlreadyExistsError: only a
+		// -32001 whose OWN top-level errno is exactly ENOENT (never the generic
+		// EINVAL, never a validation entry) and whose own reason says so.
+		if apiErr.Code == -32001 && callExceptionReportsNotFound(apiErr) {
+			return true
+		}
 		// Match the human-readable Message only, NOT FullError(): FullError embeds
 		// the whole Data blob via %+v, so a -1 error that merely MENTIONS "not
 		// found" about some nested object (e.g. a validation entry referencing a
@@ -113,6 +123,22 @@ func IsNotFoundError(err error) bool {
 	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "not found") || strings.Contains(errStr, "does not exist")
+}
+
+// callExceptionReportsNotFound reads a -32001 envelope's own errno and reason.
+// It never descends, so an ENOENT mentioned in a trace frame or a nested object
+// cannot speak for this call.
+func callExceptionReportsNotFound(apiErr *APIError) bool {
+	data, ok := apiErr.Data.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	errno, ok := envelopeErrno(data)
+	if !ok || errno != syscall.ENOENT {
+		return false
+	}
+	reason, ok := data["reason"].(string)
+	return ok && containsAnyFold(reason, []string{"not found", "does not exist", "no such"})
 }
 
 // IsAlreadyExistsError returns true if the error indicates a resource already exists.
@@ -235,6 +261,11 @@ func APIErrno(err error) (syscall.Errno, bool) {
 	return findErrno(apiErr.Data)
 }
 
+// findErrno never descends into a "trace" subtree. middlewared's envelope puts
+// a traceback there whose frames carry a `locals` map keyed by the frame's
+// variable names, so a middleware local that happened to be called `errno`
+// would otherwise be read as this call's errno and short-circuit both the
+// classifier and the message-fallback belt at every call site.
 func findErrno(value interface{}) (syscall.Errno, bool) {
 	switch typed := value.(type) {
 	case map[string]interface{}:
@@ -245,7 +276,10 @@ func findErrno(value interface{}) (syscall.Errno, bool) {
 				}
 			}
 		}
-		for _, child := range typed {
+		for key, child := range typed {
+			if strings.EqualFold(key, "trace") {
+				continue
+			}
 			if errno, ok := findErrno(child); ok {
 				return errno, true
 			}

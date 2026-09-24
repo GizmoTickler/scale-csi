@@ -281,6 +281,17 @@ func (c *Client) NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFHost,
 
 	result, err := c.Call(ctx, "nvmet.host.create", map[string]interface{}{"hostnqn": nqn})
 	if err != nil {
+		// Callers find-then-create, so two publishes for the same node racing
+		// through an empty find both reach here, and the loser is refused by
+		// middleware's hostnqn uniqueness check (a validation error, or the DB
+		// unique constraint if both passed validation). A host row carries
+		// nothing but its NQN, so if a row for this NQN exists now, the create's
+		// goal is met whatever the error said. Re-read before failing; this also
+		// covers an ambiguous reply to a create that did commit.
+		if existing, findErr := c.NVMeoFHostFindByNQN(ctx, nqn); findErr == nil && existing != nil {
+			klog.V(4).Infof("NVMeoFHostCreate: host %s already exists (id=%d) after a failed create: %v", nqn, existing.ID, err)
+			return existing, nil
+		}
 		return nil, fmt.Errorf("failed to create NVMe-oF host: %w", err)
 	}
 

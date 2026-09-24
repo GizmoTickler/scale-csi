@@ -395,40 +395,39 @@ func errnoName(e syscall.Errno) string {
 	}
 }
 
-// TestHostSubsysDuplicateFixtureCarriesNoErrnoShapedTraceKey documents WHY the
-// captured trace is safe to keep in the fixture. findErrno descends the whole
-// Data blob looking for a key spelled "errno" or "*_errno", and each trace frame
-// carries a `locals` map whose keys are the frame's variable names. None of the
-// ten frames on the real duplicate path has such a variable — but if middlewared
-// ever gains one, APIErrno would short-circuit with whatever repr string it
-// holds and silently re-break this classifier AND the message-fallback belt.
-// This assertion makes that day loud.
-func TestHostSubsysDuplicateFixtureCarriesNoErrnoShapedTraceKey(t *testing.T) {
+// TestFindErrnoIgnoresTraceFrameLocals takes the captured live duplicate
+// envelope and plants a frame local named `errno` in its traceback, the change
+// the old fixture guard could only warn about. findErrno must still find
+// nothing: a traceback local is not this call's errno.
+func TestFindErrnoIgnoresTraceFrameLocals(t *testing.T) {
 	raw, err := os.ReadFile(hostSubsysDuplicateFixture)
 	require.NoError(t, err)
 
 	var doc map[string]interface{}
 	require.NoError(t, json.Unmarshal(raw, &doc))
 
-	var walk func(value interface{}) []string
-	walk = func(value interface{}) []string {
-		var hits []string
+	planted := 0
+	var plant func(value interface{}, underTrace bool)
+	plant = func(value interface{}, underTrace bool) {
 		switch typed := value.(type) {
 		case map[string]interface{}:
+			if locals, ok := typed["locals"].(map[string]interface{}); ok && underTrace {
+				locals["errno"] = "17"
+				locals["saved_errno"] = float64(2)
+				planted++
+			}
 			for key, child := range typed {
-				if strings.EqualFold(key, "errno") || strings.HasSuffix(strings.ToLower(key), "_errno") {
-					hits = append(hits, key)
-				}
-				hits = append(hits, walk(child)...)
+				plant(child, underTrace || strings.EqualFold(key, "trace"))
 			}
 		case []interface{}:
 			for _, child := range typed {
-				hits = append(hits, walk(child)...)
+				plant(child, underTrace)
 			}
 		}
-		return hits
 	}
+	plant(doc, false)
+	require.Positive(t, planted, "the fixture must carry trace frames with locals for this test to mean anything")
 
-	assert.Empty(t, walk(doc),
-		"no key in the live duplicate envelope is errno-shaped; findErrno must find nothing here")
+	_, found := findErrno(doc)
+	assert.False(t, found, "an errno-named traceback local must not be read as the call's errno")
 }
