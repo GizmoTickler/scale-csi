@@ -222,12 +222,8 @@ func TestControllerGetVolumeCoversBlockVolumes(t *testing.T) {
 	}))
 	setDatasetReferenced(client, "pool/parent/zvol-full", 990, 0)
 
-	resp, err := d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "zvol-full"})
+	_, err = d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "zvol-full"})
 	require.NoError(t, err)
-	cond := resp.GetStatus().GetVolumeCondition()
-	require.NotNil(t, cond)
-	assert.True(t, cond.GetAbnormal(), "a zvol above 95%% of its volsize is abnormal")
-	assert.Contains(t, cond.GetMessage(), volumeLimitVolsize)
 	assert.Equal(t, 1000.0, testutil.ToFloat64(volumeQuotaBytes.WithLabelValues("zvol-full")),
 		"a zvol's volsize is its binding limit, not 0/unlimited")
 	assert.Equal(t, 1.0, testutil.ToFloat64(volumeNearQuota.WithLabelValues("zvol-full")))
@@ -245,7 +241,7 @@ func newUsageTestDriver(client truenas.ClientInterface, report bool) *Driver {
 	}
 }
 
-func TestControllerGetVolumeNearQuotaIsAbnormal(t *testing.T) {
+func TestControllerGetVolumeNearQuotaSetsGauge(t *testing.T) {
 	client := truenas.NewMockClient()
 	d := newUsageTestDriver(client, true)
 	ctx := context.Background()
@@ -258,10 +254,8 @@ func TestControllerGetVolumeNearQuotaIsAbnormal(t *testing.T) {
 
 	resp, err := d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "full-vol"})
 	require.NoError(t, err)
-	cond := resp.GetStatus().GetVolumeCondition()
-	require.NotNil(t, cond)
-	assert.True(t, cond.GetAbnormal(), "a volume above 95%% quota is abnormal")
-	assert.Contains(t, cond.GetMessage(), "quota")
+	require.NotNil(t, resp.GetStatus())
+	assert.Equal(t, 1.0, testutil.ToFloat64(volumeNearQuota.WithLabelValues("full-vol")), "a volume above 95%% quota raises the near-quota gauge")
 }
 
 func TestControllerGetVolumeHealthyUnderQuota(t *testing.T) {
@@ -277,7 +271,8 @@ func TestControllerGetVolumeHealthyUnderQuota(t *testing.T) {
 
 	resp, err := d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "ok-vol"})
 	require.NoError(t, err)
-	assert.False(t, resp.GetStatus().GetVolumeCondition().GetAbnormal(), "a volume well under quota is healthy")
+	require.NotNil(t, resp.GetStatus())
+	assert.Equal(t, 0.0, testutil.ToFloat64(volumeNearQuota.WithLabelValues("ok-vol")), "a volume well under quota does not raise the gauge")
 }
 
 // H1 — the whole RPC on the real failure shape: a 10 GiB refquota'd volume with
@@ -299,47 +294,10 @@ func TestControllerGetVolumeSnapshotSpaceIsNotNearRefquota(t *testing.T) {
 
 	resp, err := d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "snap-heavy"})
 	require.NoError(t, err)
-	assert.False(t, resp.GetStatus().GetVolumeCondition().GetAbnormal(),
-		"a volume whose snapshots (not its data) fill `used` is under its refquota and healthy")
+	require.NotNil(t, resp.GetStatus())
 	assert.Equal(t, 0.0, testutil.ToFloat64(volumeNearQuota.WithLabelValues("snap-heavy")))
 	assert.Equal(t, float64(4<<30), testutil.ToFloat64(volumeUsedBytes.WithLabelValues("snap-heavy")),
 		"the published numerator is `referenced`, the quantity refquota bounds")
-}
-
-// H1 — the near-quota message must report the numbers it actually compared, and
-// name the ZFS property that binds. The old text reported `used` against the
-// refquota, which is where the wrong answer was visible to operators.
-func TestNearQuotaConditionMessageReportsTheRealNumbers(t *testing.T) {
-	usage := &truenas.DatasetQuotaUsage{Used: 1500, Referenced: 990, UsedBySnapshots: 510, Refquota: 1000}
-	message := volumeNearQuotaMessage(usage)
-	assert.Contains(t, message, "volume uses 990 of 1000 bytes")
-	assert.Contains(t, message, volumeLimitRefquota)
-	assert.Contains(t, message, "510 bytes are held by snapshots")
-	assert.NotContains(t, message, "1500", "`used` is not the quantity a refquota bounds")
-}
-
-// L2 — the near-quota upgrade REPLACED the whole condition, so a volume that was
-// both provision-failed and near-quota reported only the quota reason: the
-// definitive-negative signal disappeared exactly when both were true.
-func TestNearQuotaDoesNotOverwriteAMoreSeriousCondition(t *testing.T) {
-	client := truenas.NewMockClient()
-	d := newUsageTestDriver(client, true)
-	ctx := context.Background()
-	_, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: "pool/parent/failed-vol", Type: "FILESYSTEM"})
-	require.NoError(t, err)
-	require.NoError(t, client.DatasetSetUserProperties(ctx, "pool/parent/failed-vol", map[string]string{
-		PropManagedResource: "true", PropProvisionSuccess: "false",
-	}))
-	setDatasetUsage(client, "pool/parent/failed-vol", 990, 1000, 0, 10)
-
-	resp, err := d.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "failed-vol"})
-	require.NoError(t, err)
-	cond := resp.GetStatus().GetVolumeCondition()
-	require.NotNil(t, cond)
-	assert.True(t, cond.GetAbnormal())
-	assert.Contains(t, cond.GetMessage(), "dataset provisioning is explicitly marked failed",
-		"the stronger, definitive-negative reason must survive the quota upgrade")
-	assert.Contains(t, cond.GetMessage(), "95%", "the quota finding is appended, not dropped")
 }
 
 // F6 — the per-volume gauges LATCHED: nothing ever deleted a volume's series, so

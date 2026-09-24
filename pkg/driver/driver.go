@@ -201,7 +201,7 @@ type Driver struct {
 	// Controller-side orphan reconcile context and cancellation.
 	// reconcileStateMu + reconcileStopped guard reconcileCancel with the same
 	// mutex + terminal-stopped-flag pattern reapRecordStateMu/reapRecordStopped
-	// and backendHealthStateMu/backendHealthStopped already use (C7): without
+	// already use (C7): without
 	// it, a Stop() that races Run() between startOrphanReconcile entering and
 	// its plain `d.reconcileCancel = cancel` assignment can observe a nil
 	// cancel, skip cancellation, and let a full reconcile pass — including
@@ -302,27 +302,6 @@ type Driver struct {
 	// of the last record published to the last-reap gauges. An older record
 	// from a stale reconcile must not overwrite a newer poll result.
 	reapRecordPublishedAt atomic.Int64
-
-	// Controller-side backend-health poll loop (GF5 E4). Runs only when
-	// backendHealth.enabled; each tick is at most two bounded READ calls
-	// (pool.query + disk.temperature_alerts) and never writes.
-	backendHealthCancel context.CancelFunc
-	backendHealthWg     sync.WaitGroup
-	// backendHealthStateMu serializes startup and shutdown. Stop is terminal for
-	// this Driver: recording that state closes the interleaving where Stop sees a
-	// nil cancel before Run assigns it and Run then starts a poller anyway.
-	backendHealthStateMu sync.Mutex
-	backendHealthStopped bool
-	// backendHealthPendingFlips counts CONSECUTIVE samples that disagree with the
-	// currently published verdict. The fan-out only flips once it reaches
-	// backendHealthFlipSamples, so a flapping pool cannot rewrite every managed
-	// PVC's VolumeCondition on every tick.
-	backendHealthPendingFlips atomic.Int64
-	// backendHealthPublishMu serializes per-driver health transitions and the
-	// pending-flip counter. The immutable backendHealthState pointer publishes
-	// the CSI-facing snapshot and all metric-facing state together, so both
-	// readers load one generation.
-	backendHealthPublishMu sync.Mutex
 
 	// Background fencing state. Missing-record observations are in-memory on
 	// purpose: a controller restart restarts the full grace period rather than
@@ -669,7 +648,6 @@ func (d *Driver) Run() error {
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
 		d.startCapacityGauges()
-		d.startBackendHealth()
 		SetReconcileDeleteEnabled(d.config != nil && d.config.Reconcile.Delete.Enabled)
 		d.startTombstoneReapRecordPoll()
 	}
@@ -705,7 +683,6 @@ func (d *Driver) Stop() {
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
-	d.stopBackendHealth()
 	d.stopTombstoneReapRecordPoll()
 
 	// Stop the service reload debouncer

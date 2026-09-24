@@ -1293,9 +1293,9 @@ The consequences, in plain words:
   side fails closed: `NodeStageVolume` waits for a device that never appears and
   errors, and an NFS mount of a `mountpoint: null` export fails. There is no
   node-side unlock.
-- **Health surfaces the hazard.** A locked encrypted volume reports an abnormal
-  `VolumeCondition` ("dataset locked") through `ControllerGetVolume` /
-  `ListVolumes`, so Kubernetes and the Grafana dashboard show it.
+- **No CSI health signal.** CSI spec v1.13 removed `VolumeCondition`, which was
+  how a locked volume used to surface. A locked volume now shows up only as
+  failing I/O in its pod and as unlock errors in the controller log.
 
 ### ⚠ **Lost Secret = permanent data loss**
 

@@ -177,37 +177,6 @@ func TestListVolumesHydrationMissSkipsDeletedEntry(t *testing.T) {
 	assert.Empty(t, resp.NextToken)
 }
 
-// TestListVolumesLockedEncryptedConditionSurvivesHydration proves the P-11
-// constraint end to end: the path-scoped listing (zfs.resource.query) carries
-// NO encryption fields — MockClient.DatasetQueryByParent deliberately zeroes
-// them with live fidelity — so ONLY the per-page pool.dataset.query hydration
-// can feed Encrypted/Locked into the entry's VolumeCondition. A locked
-// encrypted volume must still list as Abnormal.
-func TestListVolumesLockedEncryptedConditionSurvivesHydration(t *testing.T) {
-	mock := truenas.NewMockClient()
-	ds := seedListWalkVolume(mock, "locked-vol")
-	ds.Encrypted = true
-	ds.Locked = true
-	ds.KeyFormat = "HEX"
-	d := newListWalkDriver(mock)
-
-	// Confirm the premise: the listing path itself delivers no lock signal.
-	listed, err := mock.DatasetQueryByParent(context.Background(), listWalkParent)
-	require.NoError(t, err)
-	require.Len(t, listed, 1)
-	require.False(t, listed[0].Encrypted, "premise: zfs.resource.query carries no encryption fields (P-11)")
-	require.False(t, listed[0].Locked, "premise: zfs.resource.query carries no lock state (P-11)")
-
-	resp, err := d.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
-	require.NoError(t, err)
-	require.Len(t, resp.Entries, 1)
-	condition := resp.Entries[0].GetStatus().GetVolumeCondition()
-	require.NotNil(t, condition)
-	assert.True(t, condition.GetAbnormal(),
-		"a locked encrypted volume must be Abnormal — this only works if the hydrated read feeds the condition")
-	assert.Contains(t, condition.GetMessage(), "locked")
-}
-
 // seedListWalkPublicationRecord stores a publication record user property the
 // way storePublicationRecord persists it (local source, hashed node key).
 func seedListWalkPublicationRecord(t *testing.T, ds *truenas.Dataset, record publicationRecord, source string) {
@@ -284,8 +253,7 @@ func TestListVolumesPublishedNodeIdsUnreadableRecordDoesNotFailListing(t *testin
 	require.NoError(t, err)
 	require.Len(t, resp.Entries, 1)
 	assert.Empty(t, resp.Entries[0].GetStatus().GetPublishedNodeIds())
-	condition := resp.Entries[0].GetStatus().GetVolumeCondition()
-	require.NotNil(t, condition, "the rest of the entry is intact")
+	assert.Equal(t, "corrupt-record-vol", resp.Entries[0].GetVolume().GetVolumeId(), "the rest of the entry is intact")
 }
 
 // TestControllerGetCapabilitiesAdvertisesListVolumesPublishedNodes: the F-1

@@ -683,6 +683,6 @@ The tables below enumerate **167 uncalled candidate methods** in the requested f
 1. Prefer the 26.0 `zfs.resource.*` read/count paths where their schema directly covers the needed projection; retain `pool.*` lifecycle calls where the resource family has no equivalent or the driver relies on documented behavior.
 2. Treat `service.reload` as a compatibility probe, not a 26.0 API dependency.
 3. Evaluate `core.job_wait` before adding more polling loops and `core.bulk` before adding N-per-object reconciliation calls.
-4. If storage health is added to CSI `VolumeCondition`, start with read-only `pool.query`/`pool.scrub.query`, `alert.list`, and disk temperature methods; their schemas expose the needed state without authorizing maintenance mutations.
+4. If storage health is added through the CSI v1.13 alpha health RPCs, start with read-only `pool.query`/`pool.scrub.query`, `alert.list`, and disk temperature methods; their schemas expose the needed state without authorizing maintenance mutations.
 5. Keep remote replication/cloud sync opt-in and separate from baseline volume lifecycle: their schemas expose credentials, retention, schedules, and job-backed side effects beyond CSI create/delete semantics.
 

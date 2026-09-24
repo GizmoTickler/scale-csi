@@ -357,11 +357,12 @@ convenient.
 | `snapshotClass.labels` | Additional labels | `{}` |
 | `snapshotClass.annotations` | Additional annotations | `{}` |
 
-### Capacity-aware scheduling and volume health
+### Capacity-aware scheduling
 
-CSIStorageCapacity tracking and external volume-health monitoring are both
-strictly opt-in (default off); the default render stays byte-identical without
-them.
+CSIStorageCapacity tracking is strictly opt-in (default off); the default render
+stays byte-identical without it. The external volume-health monitor sidecar was
+removed with CSI spec v1.13, which dropped the `VolumeCondition` field it read;
+`sidecars.healthMonitor` is still accepted and ignored.
 
 | Parameter | Description | Default |
 |---|---|---|
@@ -370,10 +371,6 @@ them.
 | `capacity.reportMaximumVolumeSize` | Set `GetCapacityResponse.maximum_volume_size` to the parent's available bytes; appropriate **only** for thick/reserved zvol deployments, not thin overcommit | `false` |
 | `capacity.gaugeEnabled` | Run a controller-only poll loop exporting `scale_csi_pool_available_bytes` / `scale_csi_pool_capacity_bytes` | `false` |
 | `capacity.gaugeInterval` | Gauge cadence; values below `30s` clamp to `30s` | `60s` |
-| `sidecars.healthMonitor.enabled` | Deploy the v0.18.0 external-health-monitor controller sidecar (emits PVC Events from controller-side `VolumeCondition`) | `false` |
-| `sidecars.healthMonitor.image` | Health-monitor sidecar image (pinned; do not float) | `registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0` |
-| `sidecars.healthMonitor.interval` | Renders both `--list-volumes-interval` (the active cadence for this `LIST_VOLUMES` driver) and the fallback `--monitor-interval` | `60s` |
-| `sidecars.healthMonitor.resources` | Health-monitor sidecar resources | requests `10m`/`32Mi`, memory limit `128Mi` |
 
 Operator caveats:
 
@@ -389,12 +386,6 @@ Operator caveats:
   `CSIStorageCapacity` objects until the controller Deployment is deleted or they
   are removed manually. `CSIDriver.spec.storageCapacity` is mutable on Kubernetes
   1.23+ (immutable on 1.20–1.22).
-- **`sidecars.healthMonitor` is unlike the other sidecars** — it does **not**
-  expose `timeout`/`workerThreads`/`extraArgs`. Because the driver advertises
-  `LIST_VOLUMES`, it uses one periodic `ListVolumes` path (not per-PV
-  `ControllerGetVolume`); that path reports backend provisioning-metadata health,
-  not node stale mounts or the data path. Node-side `VolumeCondition` needs
-  Kubernetes/kubelet's separate **alpha** volume-health feature gates.
 
 ### Workloads, RBAC, and metrics
 
@@ -538,9 +529,7 @@ tight resource limit into a driver crash loop. Use `/readyz` and
 
 The provisioner, attacher, resizer, and snapshotter each expose `timeout`,
 `workerThreads`, and `extraArgs`. The resizer maps `workerThreads` to its
-`--workers` CLI flag; the other three use `--worker-threads`. The optional
-`sidecars.healthMonitor` sidecar is the exception — it does **not** expose those
-three keys (see the capacity/volume-health section above).
+`--workers` CLI flag; the other three use `--worker-threads`.
 
 Every sidecar receives the hardened `sidecars.securityContext` baseline:
 privilege escalation is disabled, the root filesystem is read-only, and all
