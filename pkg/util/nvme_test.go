@@ -823,3 +823,41 @@ func TestNVMeoFDisconnectUnknownFailureStillFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "disconnect failed")
 	assert.Contains(t, err.Error(), "exit status 1")
 }
+
+// A native-multipath head disk is named after the subsystem instance, which
+// the kernel takes from the founding controller. When that controller goes
+// away while other paths stay live, /sys/class/nvme/nvmeX disappears, and the
+// NQN lookup used to fail, pausing session GC for the whole protocol. The
+// block device's own sysfs node resolves to the subsystem, which survives.
+func TestGetNVMeInfoFromDeviceSurvivesLossOfTheFoundingController(t *testing.T) {
+	sys := t.TempDir()
+	subsys := filepath.Join(sys, "devices", "virtual", "nvme-subsystem", "nvme-subsys0")
+	require.NoError(t, os.MkdirAll(subsys, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(subsys, "subsysnqn"), []byte("nqn.2011-06.com.truenas:uuid:x:pvc-1\n"), 0o600))
+	head := filepath.Join(subsys, "nvme0n1")
+	require.NoError(t, os.MkdirAll(head, 0o750))
+	require.NoError(t, os.Symlink(subsys, filepath.Join(head, "device")))
+	require.NoError(t, os.MkdirAll(filepath.Join(sys, "block"), 0o750))
+	require.NoError(t, os.Symlink(head, filepath.Join(sys, "block", "nvme0n1")))
+	// Surviving controllers exist; the founding one (nvme0) does not.
+	require.NoError(t, os.MkdirAll(filepath.Join(sys, "class", "nvme", "nvme1"), 0o750))
+
+	nqn, err := getNVMeInfoFromDeviceAt(sys, "/dev/nvme0n1")
+	require.NoError(t, err)
+	assert.Equal(t, "nqn.2011-06.com.truenas:uuid:x:pvc-1", nqn)
+}
+
+// The controller-class lookup still works when the block node has no
+// subsysnqn to offer.
+func TestGetNVMeInfoFromDeviceFallsBackToTheController(t *testing.T) {
+	sys := t.TempDir()
+	ctrl := filepath.Join(sys, "class", "nvme", "nvme3")
+	require.NoError(t, os.MkdirAll(ctrl, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(ctrl, "subsysnqn"), []byte("nqn.local\n"), 0o600))
+	nqn, err := getNVMeInfoFromDeviceAt(sys, "/dev/nvme3n1")
+	require.NoError(t, err)
+	assert.Equal(t, "nqn.local", nqn)
+
+	_, err = getNVMeInfoFromDeviceAt(sys, "/dev/nvme9n1")
+	require.Error(t, err, "no block node and no controller is still a failed lookup")
+}
