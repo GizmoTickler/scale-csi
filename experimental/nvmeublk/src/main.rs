@@ -147,11 +147,15 @@ fn lat(nqn: &str, addrs: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32) -> Result<(), UblkError> {
+async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, cdev_fd: i32) -> Result<(), UblkError> {
     let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
     // Per-tag completion channel, reused for every request on this tag.
     let (done_tx, done_rx) = smol::channel::bounded::<i32>(1);
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf)).await?;
+    // USER_COPY: the kernel moves no data at fetch/commit; `buf` is only our
+    // scratch space, and data crosses into the request with pread/pwrite.
+    let ucopy = (cdev_fd >= 0).then(|| libublk::io::UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0));
+    let ublk_buf = if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_slice()) };
+    q.submit_io_prep_cmd(tag, ublk_buf, 0, if ucopy.is_some() { None } else { Some(&buf) }).await?;
     loop {
         let iod = q.get_iod(tag);
         let op = match iod.op_flags & 0xff {
@@ -162,33 +166,60 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32) 
         };
         let res = match op {
             None => -libc::EOPNOTSUPP,
-            Some(op) => {
+            Some(op) => 'io: {
                 let bytes = (iod.nr_sectors as usize) << 9;
-                e.submit(qengine::Pending {
+                if let (Some(pos), qengine::Op::Write) = (ucopy, op) {
+                    // Pull the write data out of the request into our buffer.
+                    let mut got = 0usize;
+                    while got < bytes {
+                        let n = unsafe { libc::pread(cdev_fd, buf.as_slice().as_ptr().add(got) as *mut libc::c_void, bytes - got, (pos + got as u64) as libc::off_t) };
+                        if n <= 0 {
+                            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                                continue;
+                            }
+                            log::error!("q{} tag {tag}: pread of write data failed", q.get_qid());
+                            break 'io -libc::EIO;
+                        }
+                        got += n as usize;
+                    }
+                }
+                e.submit(qengine::Pending::new(
                     op,
-                    slba: (iod.start_sector << 9) >> shift,
-                    nlb: (bytes >> shift) as u32,
-                    buf: buf.as_slice().as_ptr() as *mut u8,
-                    len: if op == qengine::Op::Flush { 0 } else { bytes },
-                    done: done_tx.clone(),
-                    first: Instant::now(),
-                    sent: Instant::now(),
-                    attempts: 0,
-                });
+                    (iod.start_sector << 9) >> shift,
+                    (bytes >> shift) as u32,
+                    buf.as_slice().as_ptr() as *mut u8,
+                    if op == qengine::Op::Flush { 0 } else { bytes },
+                    done_tx.clone(),
+                    ucopy,
+                ));
                 done_rx.recv().await.unwrap_or(-libc::EIO)
             }
         };
-        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+        let ublk_buf = if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_slice()) };
+        q.submit_io_commit_cmd(tag, ublk_buf, res).await?;
     }
 }
 
-fn queue_fn(qid: u16, dev: &UblkDev, ctrls: Arc<ctrls::Ctrls>, stats: Arc<qengine::Stats>, stop: Arc<std::sync::atomic::AtomicBool>, cfg: qengine::QConfig) {
+fn queue_fn(
+    qid: u16,
+    dev: &UblkDev,
+    ctrls: Arc<ctrls::Ctrls>,
+    stats: Arc<qengine::Stats>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    cfg: qengine::QConfig,
+) {
     let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
     let shift = ctrls.info.lba_shift;
     // Engine tasks are 'static (they own Rc<QEngine>); tag tasks borrow the
     // queue. Two local executors, ticked together from the same event loop.
     let net_exe: Rc<smol::LocalExecutor<'static>> = Rc::new(smol::LocalExecutor::new());
-    let engine = qengine::QEngine::new(qid, ctrls, cfg, net_exe.clone(), stats, stop.clone());
+    let st2 = stats.clone();
+    let mut cfg = cfg;
+    let user_copy = dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64 != 0;
+    cfg.cdev_fd = if user_copy { dev.tgt.fds[0] } else { -1 };
+    let cdev_fd = cfg.cdev_fd;
+    let engine = qengine::QEngine::new(qid, ctrls, cfg, net_exe.clone(), stats, stop, draining);
     engine.start();
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let exe = exe_rc.clone();
@@ -197,7 +228,7 @@ fn queue_fn(qid: u16, dev: &UblkDev, ctrls: Arc<ctrls::Ctrls>, stats: Arc<qengin
         let q = q_rc.clone();
         let e = engine.clone();
         tasks.push(exe.spawn(async move {
-            match io_task(&q, tag, &e, shift).await {
+            match io_task(&q, tag, &e, shift, cdev_fd).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
                 Err(err) => log::error!("io_task {tag} failed: {err}"),
             }
@@ -205,6 +236,8 @@ fn queue_fn(qid: u16, dev: &UblkDev, ctrls: Arc<ctrls::Ctrls>, stats: Arc<qengin
     }
     smol::block_on(exe_rc.run(async move {
         let run_ops = || {
+            let t0 = Instant::now();
+            st2.loops.fetch_add(1, Ordering::Relaxed);
             let mut progress = true;
             while progress {
                 progress = false;
@@ -215,13 +248,15 @@ fn queue_fn(qid: u16, dev: &UblkDev, ctrls: Arc<ctrls::Ctrls>, stats: Arc<qengin
                     progress = true;
                 }
             }
+            st2.loop_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         };
         let done = || tasks.iter().all(|t| t.is_finished());
         if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
             log::error!("queue {qid}: event loop failed: {e}");
         }
     }));
-    stop.store(true, Ordering::Release);
+    // Deliberately not setting the shared stop flag here: one queue's loop
+    // ending must not stop the other queues' timers (reconnect, expiry).
 }
 
 fn run(nqn: &str, addrs: &[String]) -> Result<()> {
@@ -229,7 +264,20 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         .iter()
         .map(|a| a.to_socket_addrs().with_context(|| format!("bad address {a}"))?.next().context("unresolvable"))
         .collect::<Result<_>>()?;
-    let ctrls = ctrls::Ctrls::new(addrs, host_ident(nqn), Duration::from_secs(15))?;
+    let recover_id = std::env::var("NVMEUBLK_RECOVER_ID").ok().and_then(|v| v.parse::<i32>().ok());
+    let kato = Duration::from_secs(15);
+    let ctrls = loop {
+        match ctrls::Ctrls::new(addrs.clone(), host_ident(nqn), kato) {
+            Ok(c) => break c,
+            // A recovering device holds its I/O until a daemon reattaches;
+            // giving up here would leave it frozen, so keep trying.
+            Err(e) if recover_id.is_some() => {
+                log::warn!("recovery: no path reachable yet ({e:#}); retrying");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     let info = ctrls.info.clone();
     log::info!("namespace: {} blocks of {} bytes ({} MiB), in-capsule {} B", info.nsze, 1u64 << info.lba_shift, (info.nsze << info.lba_shift) >> 20, info.incapsule_bytes);
     let queues = env_u64("NVMEUBLK_QUEUES", 4) as u16;
@@ -237,26 +285,42 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     let io_buf = (512 * 1024usize).min(info.mdts_bytes) as u32;
     let size = info.nsze << info.lba_shift;
     let lba_shift = info.lba_shift as u8;
+    // Fence for orphaned writes: the target may keep a controller, and run
+    // its commands, for up to KATO after losing us; plus a quiesce margin.
+    let write_fence = Duration::from_millis(env_u64("NVMEUBLK_WRITE_FENCE_MS", kato.as_millis() as u64 + 5000));
     let cfg = qengine::QConfig {
         io_timeout: Duration::from_millis(env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000)),
         no_path_timeout: Duration::from_millis(env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000)),
         max_attempts: 8,
+        write_fence,
+        // After a crash the dead daemon's writes may still be running on the
+        // target, and REISSUE hands them to us: hold writes for one fence.
+        hold_writes_until: recover_id.map(|_| Instant::now() + write_fence),
+        rx_offload: env_u64("NVMEUBLK_RX_OFFLOAD", 0) as usize,
+        cdev_fd: -1,
+        conns_per_path: env_u64("NVMEUBLK_CONNS_PER_PATH", 1).clamp(1, 8) as usize,
+        rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024).clamp(4096, 1 << 20) as usize,
     };
+    let user_copy = env_u64("NVMEUBLK_USER_COPY", 0) != 0;
+    log::info!("write fence {} ms{}", write_fence.as_millis(), if recover_id.is_some() { " (writes held for one fence: recovering)" } else { "" });
     let stats = Arc::new(qengine::Stats::default());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _ = std::fs::write("/run/nvmeublk-queues", queues.to_string());
 
     // USER_RECOVERY: if this process dies, the kernel quiesces the device and
     // holds I/O; a successor started with NVMEUBLK_RECOVER_ID reattaches.
     // REISSUE re-sends the requests that were in flight at the crash.
-    let recover_id = std::env::var("NVMEUBLK_RECOVER_ID").ok().and_then(|v| v.parse::<i32>().ok());
     let mut builder = UblkCtrlBuilder::default();
     builder = builder
         .name("nvmeublk")
         .nr_queues(queues)
         .depth(depth)
         .io_buf_bytes(io_buf)
-        .ctrl_flags((libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64);
+        .ctrl_flags(
+            (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64
+                | if user_copy { libublk::sys::UBLK_F_USER_COPY as u64 } else { 0 },
+        );
     let builder = match recover_id {
         Some(id) => {
             libublk::ctrl::UblkCtrl::new_simple(id)?.start_user_recover().context("start user recovery")?;
@@ -266,16 +330,28 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         None => builder.dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV),
     };
     let ctrl = Arc::new(builder.build().context("create ublk device (is ublk_drv loaded?)")?);
+    let f = ctrl.dev_info().flags;
+    log::info!(
+        "ublk device flags {f:#x}: user_copy={} user_recovery={} reissue={}",
+        f & libublk::sys::UBLK_F_USER_COPY as u64 != 0,
+        f & libublk::sys::UBLK_F_USER_RECOVERY as u64 != 0,
+        f & libublk::sys::UBLK_F_USER_RECOVERY_REISSUE as u64 != 0
+    );
 
     // libublk's control ring is thread-local: stop through a handler-owned handle.
     let dev_id = ctrl.dev_info().dev_id as i32;
-    ctrlc::set_handler(move || match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
+    let dr = draining.clone();
+    ctrlc::set_handler(move || {
+        // Parked and fenced I/O would otherwise hold del_gendisk hostage.
+        dr.store(true, Ordering::Release);
+        match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
         Ok(c) => {
             if let Err(e) = c.kill_dev() {
                 log::error!("stop ublk device {dev_id}: {e}");
             }
         }
         Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
+        }
     })?;
     let st = stats.clone();
     let cstat = ctrls.clone();
@@ -285,15 +361,23 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         std::thread::sleep(Duration::from_secs(5));
         let (n, w, t) = (st.done.load(Ordering::Relaxed), st.wire_ns.load(Ordering::Relaxed), st.total_ns.load(Ordering::Relaxed));
         let dn = (n - last.0).max(1);
-        let lat = format!("io={} wire_avg={}us total_avg={}us direct_rx={}", n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, st.direct_rx.load(Ordering::Relaxed));
+        let g = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
+        let (qw, qn, wd, dc, rn, lp, ln) = (g(&st.q2w_ns), g(&st.q2w_n).max(1), g(&st.w2d_ns), g(&st.d2c_ns), g(&st.rd_n).max(1), g(&st.loops).max(1), g(&st.loop_ns));
+        let lat = format!(
+            "io={} wire_avg={}us total_avg={}us | queued->wired={}us wired->1stdata={}us 1stdata->done={}us | loops/s={} run_ops_avg={}us",
+            n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, wd / rn / 1000, dc / rn / 1000, lp / 5, ln / lp / 1000
+        );
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
         log::info!(
-            "ctrls [{}] failovers={} resubmits={} parked={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} {}",
+            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} {}",
             ups.join(" "),
             st.failovers.load(Ordering::Relaxed),
             st.resubmits.load(Ordering::Relaxed),
             st.parked.load(Ordering::Relaxed),
+            st.fenced.load(Ordering::Relaxed),
+            st.path_errors.load(Ordering::Relaxed),
+            st.protocol_errors.load(Ordering::Relaxed),
             st.no_path_eio.load(Ordering::Relaxed),
             st.reconnects.load(Ordering::Relaxed),
             st.stall_kills.load(Ordering::Relaxed),
@@ -303,7 +387,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
       }
     });
 
-    let (cq, sq, stq) = (ctrls.clone(), stats.clone(), stop.clone());
+    let (cq, sq, stq, drq) = (ctrls.clone(), stats.clone(), stop.clone(), draining.clone());
     ctrl.run_target(
         move |dev: &mut UblkDev| {
             dev.set_default_params(size);
@@ -315,7 +399,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
             dev.tgt.cq_depth = depth * 2 + 64;
             Ok(())
         },
-        move |qid, dev: &_| queue_fn(qid, dev, cq.clone(), sq.clone(), stq.clone(), cfg.clone()),
+        move |qid, dev: &_| queue_fn(qid, dev, cq.clone(), sq.clone(), stq.clone(), drq.clone(), cfg.clone()),
         |c| log::info!("serving /dev/ublkb{}", c.dev_info().dev_id),
     )?;
     stop.store(true, Ordering::Release);

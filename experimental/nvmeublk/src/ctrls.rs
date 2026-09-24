@@ -19,12 +19,34 @@ pub struct CtrlPath {
     /// queue belongs to a controller that no longer exists.
     pub epoch: AtomicU64,
     pub max_qsize: Mutex<u16>,
+    /// A queue thread saw this path fail under epoch N and asks for the whole
+    /// controller to be torn down (0 = no request). Honoured only while the
+    /// epoch is still N, so a late report cannot kill a fresh controller.
+    fence_req: AtomicU64,
 }
 
 impl CtrlPath {
     pub fn cntlid(&self) -> Option<u16> {
         let c = *self.cntlid.lock().unwrap();
         (c != 0).then_some(c)
+    }
+
+    /// cntlid and the epoch it belongs to, read so that the pair is
+    /// consistent: an I/O queue connected with this cntlid is valid only
+    /// while the epoch is unchanged.
+    pub fn snapshot(&self) -> Option<(u16, u64)> {
+        let e1 = self.epoch.load(Ordering::Acquire);
+        let c = self.cntlid()?;
+        let e2 = self.epoch.load(Ordering::Acquire);
+        (e1 == e2).then_some((c, e1))
+    }
+
+    /// Ask the supervisor to tear down this path's controller, as the kernel
+    /// resets the whole controller on any queue error. Every queue's I/O
+    /// connection to it then dies on the epoch bump, so the target sees the
+    /// controller go away instead of one queue quietly disappearing.
+    pub fn fence(&self, epoch: u64) {
+        self.fence_req.store(epoch, Ordering::Release);
     }
 }
 
@@ -42,7 +64,7 @@ impl Ctrls {
         let mut info = None;
         let paths: Vec<Arc<CtrlPath>> = addrs
             .iter()
-            .map(|a| Arc::new(CtrlPath { addr: *a, cntlid: Mutex::new(0), epoch: AtomicU64::new(1), max_qsize: Mutex::new(128) }))
+            .map(|a| Arc::new(CtrlPath { addr: *a, cntlid: Mutex::new(0), epoch: AtomicU64::new(1), max_qsize: Mutex::new(128), fence_req: AtomicU64::new(0) }))
             .collect();
         let mut admins = Vec::new();
         for p in &paths {
@@ -89,6 +111,18 @@ impl Ctrls {
         let mut last_ka = Instant::now();
         while !self.stop.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(100));
+            let req = p.fence_req.swap(0, Ordering::AcqRel);
+            if req != 0 && req == p.epoch.load(Ordering::Acquire) {
+                if let Some(a) = admin.take() {
+                    log::warn!("path {i} ({}): I/O failure under epoch {req}; tearing down controller {}", p.addr, a.cntlid);
+                    a.shutdown();
+                    Self::lose(&p);
+                    // Give the target a moment to see every queue close before
+                    // a new controller is created on this path.
+                    next_try = Instant::now() + Duration::from_millis(200);
+                    continue;
+                }
+            }
             match admin.as_mut() {
                 Some(a) => {
                     if last_ka.elapsed() < self.kato / 3 {

@@ -288,3 +288,129 @@ pub fn h2c_header(cid: u16, ttag: u16, datao: u32, len: usize, last: bool) -> Ve
     hdr[16..20].copy_from_slice(&(len as u32).to_le_bytes());
     hdr
 }
+
+pub const FLAG_HDGST: u8 = 0x01;
+pub const FLAG_DDGST: u8 = 0x02;
+
+/// Validate a received PDU's header before any field is used to index a
+/// buffer. `h` holds at least the header bytes that have arrived (it may be
+/// the whole PDU); `plen` is the PDU length the receiver will consume. A
+/// target is not trusted: a bad header must become an error that tears the
+/// connection down, never a panic or a write outside the request's buffer.
+pub fn check_pdu_header(h: &[u8]) -> Result<(), String> {
+    if h.len() < CH_LEN {
+        return Err(format!("PDU header truncated ({} bytes)", h.len()));
+    }
+    let (ptype, flags, hlen, pdo) = (h[0], h[1], h[2] as usize, h[3] as usize);
+    let plen = u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize;
+    if hlen < CH_LEN || hlen > plen {
+        return Err(format!("PDU type {ptype:#x}: hlen {hlen} outside 8..=plen {plen}"));
+    }
+    if h.len() < hlen {
+        return Err(format!("PDU type {ptype:#x}: only {} of {hlen} header bytes present", h.len()));
+    }
+    if flags & (FLAG_HDGST | FLAG_DDGST) != 0 {
+        return Err(format!("PDU type {ptype:#x}: digest flags {flags:#x} set, digests were not negotiated"));
+    }
+    match ptype {
+        PDU_CAPSULE_RESP => {
+            if hlen != CH_LEN + 16 || plen != hlen {
+                return Err(format!("CapsuleResp: hlen {hlen} plen {plen}, want 24/24"));
+            }
+        }
+        PDU_C2H_DATA => {
+            if hlen != DATA_HLEN || pdo < hlen || pdo > plen {
+                return Err(format!("C2HData: hlen {hlen} pdo {pdo} plen {plen}"));
+            }
+            let d = parse_data_hdr(&h[CH_LEN..hlen]);
+            if d.len == 0 || plen != pdo + d.len as usize {
+                return Err(format!("C2HData: datal {} does not match plen {plen} - pdo {pdo}", d.len));
+            }
+            if flags & FLAG_C2H_SUCCESS != 0 && flags & FLAG_LAST_PDU == 0 {
+                return Err("C2HData: SUCCESS without LAST_PDU".into());
+            }
+        }
+        PDU_R2T => {
+            if hlen != DATA_HLEN || plen != hlen {
+                return Err(format!("R2T: hlen {hlen} plen {plen}, want 24/24"));
+            }
+            if parse_data_hdr(&h[CH_LEN..hlen]).len == 0 {
+                return Err("R2T: zero length".into());
+            }
+        }
+        PDU_C2H_TERM => {}
+        t => return Err(format!("unexpected PDU type {t:#x}")),
+    }
+    Ok(())
+}
+
+/// `sc` as returned by `Cqe::sc()` (status field without the phase bit):
+/// bits 7:0 SC, 10:8 SCT, 14 DNR. Path-related errors (SCT 3) without Do Not
+/// Retry are the target telling us to try another path, as the kernel's
+/// nvme_is_path_error does.
+pub fn is_path_error(sc: u16) -> bool {
+    (sc >> 8) & 0x7 == 3 && sc & (1 << 14) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(ptype: u8, flags: u8, hlen: usize, pdo: usize, plen: usize) -> Vec<u8> {
+        let mut h = vec![0u8; hlen.max(CH_LEN)];
+        h[..CH_LEN].copy_from_slice(&ch_bytes(ptype, flags, hlen, pdo, plen));
+        h
+    }
+    fn c2h(flags: u8, pdo: usize, datal: u32, plen: usize) -> Vec<u8> {
+        let mut h = hdr(PDU_C2H_DATA, flags, DATA_HLEN, pdo, plen);
+        h[16..20].copy_from_slice(&datal.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn accepts_well_formed_pdus() {
+        assert!(check_pdu_header(&hdr(PDU_CAPSULE_RESP, 0, 24, 0, 24)).is_ok());
+        assert!(check_pdu_header(&c2h(FLAG_LAST_PDU | FLAG_C2H_SUCCESS, 24, 4096, 24 + 4096)).is_ok());
+        assert!(check_pdu_header(&c2h(0, 32, 8192, 32 + 8192)).is_ok()); // pdo padded for cpda
+        let mut r2t = hdr(PDU_R2T, 0, 24, 0, 24);
+        r2t[16..20].copy_from_slice(&65536u32.to_le_bytes());
+        assert!(check_pdu_header(&r2t).is_ok());
+    }
+
+    #[test]
+    fn rejects_headers_that_would_index_out_of_bounds() {
+        // Each of these panicked or was accepted by the receiver before
+        // header validation existed.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("truncated common header", vec![PDU_CAPSULE_RESP, 0, 24]),
+            ("hlen below common header", hdr(PDU_C2H_DATA, 0, 4, 4, 4096)),
+            ("hlen beyond plen", hdr(PDU_CAPSULE_RESP, 0, 24, 0, 16)),
+            ("CapsuleResp shorter than a CQE", hdr(PDU_CAPSULE_RESP, 0, 16, 0, 16)),
+            ("CapsuleResp with trailing data", hdr(PDU_CAPSULE_RESP, 0, 24, 0, 64)),
+            ("C2H pdo inside the header", c2h(0, 8, 4096, 8 + 4096)),
+            ("C2H pdo beyond plen", c2h(0, 200, 16, 100)),
+            ("C2H datal disagrees with plen", c2h(0, 24, 4096, 24 + 1000)),
+            ("C2H zero datal", c2h(0, 24, 0, 24)),
+            ("C2H SUCCESS without LAST", c2h(FLAG_C2H_SUCCESS, 24, 4096, 24 + 4096)),
+            ("digest flag not negotiated", c2h(FLAG_DDGST | FLAG_LAST_PDU, 24, 4096, 24 + 4096)),
+            ("R2T with zero length", hdr(PDU_R2T, 0, 24, 0, 24)),
+            ("R2T with trailing data", hdr(PDU_R2T, 0, 24, 0, 48)),
+            ("unknown type", hdr(0x42, 0, 24, 0, 24)),
+        ];
+        for (name, h) in cases {
+            assert!(check_pdu_header(&h).is_err(), "{name} was accepted");
+        }
+        // Header claims more bytes than are present: must be refused, not read.
+        let short = c2h(0, 24, 4096, 24 + 4096);
+        assert!(check_pdu_header(&short[..20]).is_err());
+    }
+
+    #[test]
+    fn path_error_classification() {
+        assert!(is_path_error(0x3 << 8 | 0x01)); // ANA persistent loss
+        assert!(is_path_error(0x3 << 8 | 0x71)); // host aborted
+        assert!(!is_path_error(1 << 14 | 0x3 << 8 | 0x01)); // DNR set
+        assert!(!is_path_error(0x0 << 8 | 0x80)); // generic LBA out of range
+        assert!(!is_path_error(0x2 << 8 | 0x81)); // media: unrecovered read
+    }
+}

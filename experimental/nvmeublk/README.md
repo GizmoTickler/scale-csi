@@ -100,6 +100,51 @@ Reading it:
 
 Cleanup: the daemon stopped and its device was removed; the namespace, PVC and PV were deleted; `rmmod ublk_drv`; files removed. No Released or terminating PVs.
 
+## v3.1: safety review fixes, and why large reads regressed (2026-09-24)
+### Safety fixes (from an independent review; each verified)
+- **Write fencing.** A write orphaned by a failed path used to be re-sent on another path at once. If the old target still executed it later, it could overwrite a newer write to the same LBA that had been acknowledged. Reads still fail over at once. Writes and flushes now wait `NVMEUBLK_WRITE_FENCE_MS` (default KATO + 5 s = 20 s) before they are re-sent. Any data-path failure also tears down that path's whole controller on every queue, not one I/O socket. The request is tagged with the connection's epoch, so a late report cannot kill a fresh controller.
+- **Crash recovery** (`NVMEUBLK_RECOVER_ID`) holds every write, including the kernel's reissued ones, for one fence after start. It keeps retrying its first connect instead of exiting and leaving the device frozen.
+- **Hang: parked I/O never moved when a command slot freed** (depth > target MQES). The slot test: one path, depth 256, QD256. The old code hung (fio timed out, 130 stuck); now `err=0`.
+- **Hang: shutdown waited on parked I/O forever** with every path down and `NO_PATH_TIMEOUT_MS=0`. Old code: SIGINT did not exit (16 s, until the paths came back). Now it exits in 0.65 s, and the parked read gets EIO. One queue's loop ending no longer stops the other queues' timers.
+- **Untrusted target input.** Every PDU header is validated before use (`pdu::check_pdu_header`, unit-tested with 14 malformed cases), and the receiver no longer panics on a bad header:
+  - hlen/pdo/plen bounds;
+  - digest flags;
+  - SUCCESS only with LAST;
+  - C2H only for reads, R2T only for writes;
+  - in-order data offsets.
+
+  A read completes only when every byte has arrived. Command ids carry a generation counter, as the kernel's genctr does. An error response while write data is still queued tears the connection down, so a stale H2CData can never be sent under a reused transfer tag.
+- **Path errors** (SCT 3 without DNR) fail over instead of returning EIO.
+
+Verification, all with fio crc32c:
+- failover drill 5.2 GiB `err=0`;
+- stall + kill with mixed read/write 7.2 GiB `err=0`;
+- crash recovery `err=0` (worst stall 23 s = restart gap + fence), fsck clean.
+
+Cost: the worst-case latency of an orphaned write is now about the fence (20–25 s). A read on the raw device during the same failures stayed at p99.9 6.8 ms.
+
+### Why v3 lost large reads to v2, and what did not fix it
+Measured on the real worker, today, same zvol (128K reads, QD16):
+
+| | kernel | v2 (threads) | v3 |
+|---|---|---|---|
+| 1 job, pinned | 1,322 MiB/s | 1,213 | 764–862 |
+| 1 job | 976 | 1,255 | 658–867 |
+| 4 jobs | 2,757 | 2,005 | 1,272–1,721 |
+| 4K randread 4×QD32 | 59K IOPS | 54K | 68–83K |
+
+- On 6.12, a read byte is copied twice in the userspace path: socket → buffer, then ublk's commit copy into the bio pages. The kernel initiator copies once.
+- v3 does every step of a queue's I/O on one thread and one ring: capsule transmit (through netfilter), receive, the commit, and the NIC softirq that lands on that CPU. That comes to about 115 µs of serial kernel work per 128K read, and each read needs several turns of that loop.
+- v2 ran send, receive and commit on separate threads, so they overlapped.
+
+Tried on the fabric; none moved the ceiling, so all are kept only as off-by-default knobs:
+- offloading the bulk payload receive to a per-connection helper (`NVMEUBLK_RX_OFFLOAD`), with its CPU affinity freed from the queue's CPU group;
+- ublk `USER_COPY`, with both copies done on the helper while the data is cache-hot (`NVMEUBLK_USER_COPY`);
+- 2 or 4 connections per path (`NVMEUBLK_CONNS_PER_PATH`);
+- 8–32K staging chunks (`NVMEUBLK_RX_CHUNK`).
+
+The loopback rig also misled for a while. The local target ran on the daemon's own CPU and preempted it mid-send, which made v3 look 3× worse than it is. It is now run with `lo` RPS steered to other CPUs and the daemon pinned away from them. Also, `splice` into `/dev/ublkcN` is refused by the 6.12 driver (`user_backed_iter`), so a single-copy path needs ublk zero-copy (kernel ≥ 6.15).
+
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
 - The receiver tore down the admin queue before resubmitting orphans; that could wait behind a blocked keep-alive. Fix: fail over first.
