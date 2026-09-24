@@ -145,6 +145,16 @@ Tried on the fabric; none moved the ceiling, so all are kept only as off-by-defa
 
 The loopback rig also misled for a while. The local target ran on the daemon's own CPU and preempted it mid-send, which made v3 look 3× worse than it is. It is now run with `lo` RPS steered to other CPUs and the daemon pinned away from them. Also, `splice` into `/dev/ublkcN` is refused by the 6.12 driver (`user_backed_iter`), so a single-copy path needs ublk zero-copy (kernel ≥ 6.15).
 
+## Zero copy on kernels >= 6.16 (`NVMEUBLK_ZERO_COPY=1`, 2026-09-24)
+The device is created with `UBLK_F_AUTO_BUF_REG` (plus `USER_COPY`). The kernel then registers each read request's own pages in the queue ring's fixed-buffer table at index = tag. The bulk of a C2HData payload is received with `IORING_OP_RECV` + `IORING_RECVSEND_FIXED_BUF` straight into those pages: one copy, as in the kernel initiator, and no copy at commit. Payload bytes that arrived with a PDU header in the staging buffer, and small reads, go in with `pwrite` on `/dev/ublkcN`. Writes are unchanged. The daemon refuses the flag on a kernel whose ublk lacks the features. Every Flatcar channel (Stable/Beta/Alpha) ships 6.12, so this cannot run on the current cluster nodes.
+
+Dev VM (kernel 7.2.3, loopback with the target steered off the daemon's CPUs), same binary with the flag off/on:
+- 128K reads, 4 jobs: 2,412–2,532 → 3,032–3,247 MiB/s (+25%).
+- 128K reads, one stream: 1,675–1,876 → 1,690–2,572 MiB/s (noisy; the queue thread is saturated either way on loopback).
+- 4K randread 4×QD32: 211–225K → 194–197K IOPS (the extra `pwrite` per small read).
+
+Correctness: verified write/verify-only pass `err=0`; failover drill `err=0` with 4 GiB of verification reads received zero-copy while paths were killed; fsck clean. Not yet measured on the real fabric, where the commit copy was about 30% of the queue thread's time: that needs a >= 6.16 host on the storage network.
+
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
 - The receiver tore down the admin queue before resubmitting orphans; that could wait behind a blocked keep-alive. Fix: fail over first.

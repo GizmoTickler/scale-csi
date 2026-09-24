@@ -42,6 +42,9 @@ pub const NSID: u32 = 1;
 /// read is not copied twice in user space.
 const RX_CHUNK_DEFAULT: usize = 32 * 1024;
 
+/// io_uring UAPI: recv into a registered (fixed) buffer, index in buf_index.
+const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
+
 /// Wait until `efd` (an eventfd) is readable, then drain it. POLL_ADD always
 /// arms a poll; a READ SQE on a non-blocking eventfd returns -EAGAIN at once
 /// on kernels that honour O_NONBLOCK for io_uring reads, which would spin.
@@ -164,6 +167,8 @@ pub struct Stats {
     pub wire_ns: AtomicU64,
     pub total_ns: AtomicU64,
     pub direct_rx: AtomicU64,
+    /// Read payload bytes received straight into ublk request pages.
+    pub zc_bytes: AtomicU64,
     /// Stage split (ns sums): capsule queued -> its Writev done; Writev done ->
     /// first C2H byte (reads); first byte -> completion (reads).
     pub q2w_ns: AtomicU64,
@@ -227,12 +232,16 @@ pub struct Pending {
     pub first_data: Option<Instant>,
     /// USER_COPY position of this request's buffer in /dev/ublkcN.
     pub ucopy: Option<u64>,
+    /// Zero copy (UBLK_F_AUTO_BUF_REG): the request's own pages are
+    /// registered in this queue ring's buffer table at this index, so read
+    /// payload is received from the socket straight into them.
+    pub zc_index: Option<u16>,
 }
 
 impl Pending {
-    pub fn new(op: Op, slba: u64, nlb: u32, buf: *mut u8, len: usize, done: Sender<i32>, ucopy: Option<u64>) -> Self {
+    pub fn new(op: Op, slba: u64, nlb: u32, buf: *mut u8, len: usize, done: Sender<i32>, ucopy: Option<u64>, zc_index: Option<u16>) -> Self {
         let now = Instant::now();
-        Pending { op, slba, nlb, buf, len, done, first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, wired: None, first_data: None, ucopy }
+        Pending { op, slba, nlb, buf, len, done, first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, wired: None, first_data: None, ucopy, zc_index }
     }
     fn finish(self, res: i32) {
         let _ = self.done.try_send(res);
@@ -776,7 +785,7 @@ impl QEngine {
         let h = parse_data_hdr(&part[CH_LEN..hlen]);
         let (off, len) = (h.off as usize, h.len as usize);
         let have = part.len() - pdo;
-        let (dest, ucopy) = {
+        let (dest, ucopy, zc_index) = {
             let mut inflight = c.inflight.borrow_mut();
             match inflight.get_mut(&h.cid) {
                 Some(p) if p.op == Op::Read && off == p.rx && off + len <= p.len => {
@@ -786,7 +795,7 @@ impl QEngine {
                         self.fail_conn(c, &e, Cause::Failure);
                         return Direct::Failed;
                     }
-                    (unsafe { p.buf.add(off) }, p.ucopy.map(|pos| pos + off as u64))
+                    (unsafe { p.buf.add(off) }, p.ucopy.map(|pos| pos + off as u64), p.zc_index)
                 }
                 _ => return Direct::No, // handle_pdu reports it once whole
             }
@@ -795,7 +804,33 @@ impl QEngine {
         self.stats.direct_rx.fetch_add(1, Ordering::Relaxed);
         let mut got = have;
         let mut failed = None;
-        if let Some(hp) = c.helper.as_ref().filter(|_| len - got >= self.cfg.rx_offload) {
+        if let Some(idx) = zc_index {
+            // Zero copy: socket -> the request's registered pages, at byte
+            // offset off+got of the kernel buffer (its base address is 0).
+            while got < len && !c.dead.get() {
+                let sqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32)
+                    .ioprio(IORING_RECVSEND_FIXED_BUF)
+                    .buf_group(idx)
+                    .flags(libc::MSG_WAITALL)
+                    .build();
+                let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
+                if c.dead.get() {
+                    break;
+                }
+                if r == -libc::EAGAIN || r == -libc::EINTR {
+                    continue;
+                }
+                if r <= 0 {
+                    failed = Some(if r == 0 { "connection closed" } else { "zero-copy receive failed" });
+                    if r < 0 {
+                        log::warn!("q{}: fixed-buffer recv failed: {r}", self.qid);
+                    }
+                    break;
+                }
+                got += r as usize;
+            }
+            self.stats.zc_bytes.fetch_add((got - have) as u64, Ordering::Relaxed);
+        } else if let Some(hp) = c.helper.as_ref().filter(|_| len - got >= self.cfg.rx_offload) {
             // The receiver task owns this socket's read side, and it waits
             // here, so the helper is the only reader until it reports back.
             let (cdev, pos) = match ucopy {

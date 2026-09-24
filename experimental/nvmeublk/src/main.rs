@@ -147,15 +147,19 @@ fn lat(nqn: &str, addrs: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, cdev_fd: i32) -> Result<(), UblkError> {
+async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, cdev_fd: i32, zc: bool) -> Result<(), UblkError> {
     let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
     // Per-tag completion channel, reused for every request on this tag.
     let (done_tx, done_rx) = smol::channel::bounded::<i32>(1);
     // USER_COPY: the kernel moves no data at fetch/commit; `buf` is only our
     // scratch space, and data crosses into the request with pread/pwrite.
     let ucopy = (cdev_fd >= 0).then(|| libublk::io::UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0));
-    let ublk_buf = if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_slice()) };
-    q.submit_io_prep_cmd(tag, ublk_buf, 0, if ucopy.is_some() { None } else { Some(&buf) }).await?;
+    // Zero copy: the kernel registers each request's pages in this ring's
+    // buffer table at index `tag` when it hands us the request, and drops
+    // the registration when we commit.
+    let auto_reg = libublk::sys::ublk_auto_buf_reg { index: tag, flags: 0, reserved0: 0, reserved1: 0 };
+    let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_slice()) };
+    q.submit_io_prep_cmd(tag, ublk_buf, 0, if ucopy.is_some() || zc { None } else { Some(&buf) }).await?;
     loop {
         let iod = q.get_iod(tag);
         let op = match iod.op_flags & 0xff {
@@ -191,11 +195,12 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
                     if op == qengine::Op::Flush { 0 } else { bytes },
                     done_tx.clone(),
                     ucopy,
+                    (zc && op == qengine::Op::Read).then_some(tag),
                 ));
                 done_rx.recv().await.unwrap_or(-libc::EIO)
             }
         };
-        let ublk_buf = if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_slice()) };
+        let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_slice()) };
         q.submit_io_commit_cmd(tag, ublk_buf, res).await?;
     }
 }
@@ -219,6 +224,10 @@ fn queue_fn(
     let user_copy = dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64 != 0;
     cfg.cdev_fd = if user_copy { dev.tgt.fds[0] } else { -1 };
     let cdev_fd = cfg.cdev_fd;
+    let zc = dev.dev_info.flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0;
+    if zc {
+        cfg.rx_offload = 0; // payload goes to the request pages on this ring
+    }
     let engine = qengine::QEngine::new(qid, ctrls, cfg, net_exe.clone(), stats, stop, draining);
     engine.start();
     let exe_rc = Rc::new(smol::LocalExecutor::new());
@@ -228,7 +237,7 @@ fn queue_fn(
         let q = q_rc.clone();
         let e = engine.clone();
         tasks.push(exe.spawn(async move {
-            match io_task(&q, tag, &e, shift, cdev_fd).await {
+            match io_task(&q, tag, &e, shift, cdev_fd, zc).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
                 Err(err) => log::error!("io_task {tag} failed: {err}"),
             }
@@ -301,7 +310,18 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         conns_per_path: env_u64("NVMEUBLK_CONNS_PER_PATH", 1).clamp(1, 8) as usize,
         rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024).clamp(4096, 1 << 20) as usize,
     };
-    let user_copy = env_u64("NVMEUBLK_USER_COPY", 0) != 0;
+    let mut user_copy = env_u64("NVMEUBLK_USER_COPY", 0) != 0;
+    // Zero copy needs AUTO_BUF_REG (kernel >= 6.16); it also uses USER_COPY
+    // for the few payload bytes that arrive with a PDU header.
+    let zero_copy = env_u64("NVMEUBLK_ZERO_COPY", 0) != 0;
+    if zero_copy {
+        let feats = libublk::ctrl::UblkCtrl::get_features().unwrap_or(0);
+        let need = (libublk::sys::UBLK_F_AUTO_BUF_REG | libublk::sys::UBLK_F_USER_COPY) as u64;
+        if feats & need != need {
+            bail!("NVMEUBLK_ZERO_COPY=1 but this kernel's ublk lacks AUTO_BUF_REG/USER_COPY (features {feats:#x})");
+        }
+        user_copy = true;
+    }
     log::info!("write fence {} ms{}", write_fence.as_millis(), if recover_id.is_some() { " (writes held for one fence: recovering)" } else { "" });
     let stats = Arc::new(qengine::Stats::default());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -319,7 +339,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         .io_buf_bytes(io_buf)
         .ctrl_flags(
             (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64
-                | if user_copy { libublk::sys::UBLK_F_USER_COPY as u64 } else { 0 },
+                | if user_copy { libublk::sys::UBLK_F_USER_COPY as u64 } else { 0 }
+                | if zero_copy { libublk::sys::UBLK_F_AUTO_BUF_REG as u64 } else { 0 },
         );
     let builder = match recover_id {
         Some(id) => {
@@ -332,7 +353,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     let ctrl = Arc::new(builder.build().context("create ublk device (is ublk_drv loaded?)")?);
     let f = ctrl.dev_info().flags;
     log::info!(
-        "ublk device flags {f:#x}: user_copy={} user_recovery={} reissue={}",
+        "ublk device flags {f:#x}: zero_copy={} user_copy={} user_recovery={} reissue={}",
+        f & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0,
         f & libublk::sys::UBLK_F_USER_COPY as u64 != 0,
         f & libublk::sys::UBLK_F_USER_RECOVERY as u64 != 0,
         f & libublk::sys::UBLK_F_USER_RECOVERY_REISSUE as u64 != 0
@@ -364,8 +386,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         let g = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
         let (qw, qn, wd, dc, rn, lp, ln) = (g(&st.q2w_ns), g(&st.q2w_n).max(1), g(&st.w2d_ns), g(&st.d2c_ns), g(&st.rd_n).max(1), g(&st.loops).max(1), g(&st.loop_ns));
         let lat = format!(
-            "io={} wire_avg={}us total_avg={}us | queued->wired={}us wired->1stdata={}us 1stdata->done={}us | loops/s={} run_ops_avg={}us",
-            n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, wd / rn / 1000, dc / rn / 1000, lp / 5, ln / lp / 1000
+            "zc_MiB={} io={} wire_avg={}us total_avg={}us | queued->wired={}us wired->1stdata={}us 1stdata->done={}us | loops/s={} run_ops_avg={}us",
+            st.zc_bytes.load(Ordering::Relaxed) >> 20, n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, wd / rn / 1000, dc / rn / 1000, lp / 5, ln / lp / 1000
         );
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
