@@ -1305,10 +1305,14 @@ func (d *Driver) expectedStagedSessions(deviceLabel string, deviceID func(device
 
 	expected := make(map[string]struct{})
 
-	// Track failed lookups to detect race conditions or transient issues.
-	// If we fail to look up too many devices, skip GC entirely to avoid data loss.
+	// ANY failed lookup of a device that likely belongs to this protocol makes
+	// the expected set incomplete, and GC treats a session missing from that
+	// set as an orphan. Tolerating "1-2 failures" let a persistent identity-read
+	// failure on one mounted device disconnect its in-use session after the
+	// grace period (codex round-5 N6). Devices positively identified as NOT
+	// this protocol report ok, so they never count here.
 	failedLookups := 0
-	const maxFailedLookups = 2 // Allow 1-2 failures, but more suggests a problem
+	const maxFailedLookups = 0
 
 	for device := range inUseDevices {
 		id, likely, ok := deviceID(device)
@@ -1323,8 +1327,8 @@ func (d *Driver) expectedStagedSessions(deviceLabel string, deviceID func(device
 		}
 	}
 
-	// If too many lookups failed, this might indicate a race condition
-	// (concurrent stage/unstage operations) - skip GC to be safe.
+	// An incomplete expected set cannot authorize a disconnect; skip this
+	// protocol's pass and retry on the next tick.
 	if failedLookups > maxFailedLookups {
 		klog.Warningf("Session GC: %d %s device lookups failed, skipping GC to avoid race condition", failedLookups, deviceLabel)
 		return nil // Return nil to signal GC should be skipped
@@ -1340,6 +1344,11 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 	return d.expectedStagedSessions("iSCSI", func(device string) (string, bool, bool) {
 		// Check if this device is an iSCSI device.
 		portal, iqn, err := getISCSIInfoFromDevice(device)
+		if errors.Is(err, util.ErrNotISCSIDevice) {
+			// Positively local (no iSCSI session in its sysfs ancestry): not a
+			// failed lookup, so it must not veto the pass.
+			return "", false, true
+		}
 		if err != nil {
 			// iSCSI devices are typically sd[a-z]+ (not nvme*, loop*, etc); only a
 			// likely-iSCSI device's failed lookup should count toward the threshold.

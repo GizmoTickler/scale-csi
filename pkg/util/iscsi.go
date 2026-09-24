@@ -1844,6 +1844,11 @@ func GetISCSIInfoFromDevice(devicePath string) (portal, iqn string, err error) {
 	return GetISCSIInfoFromDeviceWithSessions(devicePath, sessions)
 }
 
+// ErrNotISCSIDevice reports a device whose sysfs ancestry was read successfully
+// and contains no iSCSI session: positive evidence the device is local, not a
+// failed lookup.
+var ErrNotISCSIDevice = errors.New("not an iSCSI device")
+
 // GetISCSIInfoFromDeviceWithSessions returns the portal and IQN for a device
 // using a pre-fetched session list.
 func GetISCSIInfoFromDeviceWithSessions(devicePath string, sessions []ISCSISessionInfo) (portal, iqn string, err error) {
@@ -1895,7 +1900,11 @@ func getISCSIInfoFromDeviceWithSessionsInPaths(devicePath string, sessions []ISC
 	}
 
 	if sessionDir == "" {
-		return "", "", fmt.Errorf("could not find session directory for %s", devicePath)
+		// The device resolved in sysfs and no iSCSI session is among its
+		// ancestors: it is positively NOT an iSCSI disk (a local SCSI/SATA
+		// disk). Distinct from a failed lookup, which callers must treat as
+		// "unknown".
+		return "", "", fmt.Errorf("%w: %s", ErrNotISCSIDevice, devicePath)
 	}
 
 	// Get IQN

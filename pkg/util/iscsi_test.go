@@ -1885,3 +1885,22 @@ func TestSameISCSIPortalMatchesEquivalentIPv6Forms(t *testing.T) {
 	assert.False(t, sameISCSIPortal("192.168.201.10", "192.168.202.10"),
 		"distinct IPv4 portals must not match")
 }
+
+// ErrNotISCSIDevice is positive evidence (the device resolved and no iSCSI
+// session is among its sysfs ancestors), never a failed lookup: an unresolvable
+// device must stay an ordinary error so session GC treats it as unknown.
+func TestGetISCSIInfoDistinguishesLocalDiskFromFailedLookup(t *testing.T) {
+	root := t.TempDir()
+	sysBlock := filepath.Join(root, "sys", "block")
+	local := filepath.Join(root, "sys", "devices", "pci0000:00", "0000:00:1f.2", "ata1", "host0", "target0:0:0", "0:0:0:0")
+	require.NoError(t, os.MkdirAll(local, 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(sysBlock, "sdb"), 0o750))
+	require.NoError(t, os.Symlink(local, filepath.Join(sysBlock, "sdb", "device")))
+
+	_, _, err := getISCSIInfoFromDeviceWithSessionsInPaths("/dev/sdb", nil, sysBlock, filepath.Join(root, "sys", "class", "iscsi_session"), filepath.Join(root, "dev"))
+	require.ErrorIs(t, err, ErrNotISCSIDevice)
+
+	_, _, err = getISCSIInfoFromDeviceWithSessionsInPaths("/dev/sdz", nil, sysBlock, filepath.Join(root, "sys", "class", "iscsi_session"), filepath.Join(root, "dev"))
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNotISCSIDevice, "an unresolvable device is a failed lookup, not proof it is local")
+}
