@@ -76,6 +76,30 @@ Bugs found in v3 while testing:
 - The stall watchdog keyed on the request's *first* submit time. A request failed over from a stalled path is already old, so it condemned every healthy path it landed on: one stalled path killed all four. Fix: a per-attempt `sent` timestamp.
 - The I/O sockets were `O_NONBLOCK`. io_uring honors that and returns `-EAGAIN` instead of arming a poll, so the receiver resubmitted in a spin. Fix: blocking fds; io_uring does the waiting.
 
+## v3 real-fabric re-run (2026-09-24, same worker, same procedure as the v2 run below)
+The operator approved it; the setup was the same non-persistent, single-node `insmod` with a throwaway 16 GiB PVC. Nothing touched shared links.
+- **Failover drill** (the v2 script: kill 0, kill 1, stall 2, kill 3 during 45 s of verified writes): 8.2 GiB, `err=0`. The stall was killed at io_timeout on path 2 only, on each queue; 7 failovers; 0 EIO.
+- **Daemon crash:** `kill -9` 8 s into 30 s of verified writes, then restart with `NVMEUBLK_RECOVER_ID=0` 3 s later. 5.2 GiB, `err=0`; the worst-case I/O stalled 3.1 s.
+
+Same zvol, 8 s runs; the kernel uses native multipath with the queue-depth iopolicy:
+
+| | kernel | nvmeublk v3 | Δ | (v2: Δ) |
+|---|---|---|---|---|
+| 4K randread 4×QD32 | 57.8K IOPS | **79.9K** | **+38%** | −7% |
+| 4K randwrite 4×QD32 | 54.8K IOPS | **74.8K** | **+37%** | +20% |
+| 128K seq read 1×QD16 | 955 MiB/s | 725 | −24% | +26% |
+| 128K seq read 4×QD16 | 2,817 MiB/s | 1,552 | −45% | — |
+| 128K seq write 1×QD16 | 621 MiB/s | 559 | −10% | — |
+| 4K randread QD1 | 356 µs | 488 µs | +132 µs | +170 µs |
+| 4K randwrite QD1 | 333 µs | 472 µs | +139 µs | — |
+
+Reading it:
+- v3 wins small-block throughput outright.
+- The QD1 gap narrowed by only about 40 µs. Most of what is left is the ublk round trip plus userspace scheduling, not thread hops.
+- Large-block reads regressed badly against both v2 and the kernel, even with 4 jobs, so the per-queue serialization seen on loopback (above) is real and matters on a real NIC. Next step: find that serialized wait. Candidates: one ring doing both network and ublk completion for a queue, and the ublk read copy happening at commit time on the same thread.
+
+Cleanup: the daemon stopped and its device was removed; the namespace, PVC and PV were deleted; `rmmod ublk_drv`; files removed. No Released or terminating PVs.
+
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
 - The receiver tore down the admin queue before resubmitting orphans; that could wait behind a blocked keep-alive. Fix: fail over first.
