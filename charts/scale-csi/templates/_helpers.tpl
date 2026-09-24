@@ -420,3 +420,30 @@ the default.
 500
 {{- end -}}
 {{- end -}}
+
+{{/*
+Non-empty when NVMe-oF volumes may use the userspace (ublk) data path: NVMe-oF
+is enabled and either nvmeof.ublk.enabled or nvmeof.dataPath=ublk. Gates the
+driver's ublk config and the node plugin's /run/nvmeublk mount. Null-safe for a
+deleted nvmeof or nvmeof.ublk subtree.
+*/}}
+{{- define "scale-csi.nvmeofUblkInUse" -}}
+{{- $nvmeof := .Values.nvmeof | default dict -}}
+{{- $ublk := $nvmeof.ublk | default dict -}}
+{{- if and $nvmeof.enabled (or $ublk.enabled (eq ($nvmeof.dataPath | default "kernel") "ublk")) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+The nvmeublkd image reference. A tag or a digest is required: no nvmeublk image
+is published with this chart, so there is no default to fall back to.
+*/}}
+{{- define "scale-csi.nvmeublkdImage" -}}
+{{- $image := .image | default dict -}}
+{{- if $image.digest -}}
+{{- printf "%s@%s" $image.repository $image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $image.repository (required "nvmeof.ublk.daemon.image.tag (or digest) is required when nvmeof.ublk.daemon.enabled=true: no nvmeublk image is published with this chart" $image.tag) -}}
+{{- end -}}
+{{- end }}

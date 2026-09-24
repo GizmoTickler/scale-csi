@@ -1,0 +1,92 @@
+{{- $nvmeof := .Values.nvmeof | default dict }}
+{{- $ublk := $nvmeof.ublk | default dict }}
+{{- $daemon := $ublk.daemon | default dict }}
+{{- if $daemon.enabled }}
+{{- $image := $daemon.image | default dict }}
+# nvmeublkd: the per-node userspace NVMe/TCP daemon behind the ublk data path.
+# One process owns every /dev/ublkbN on its node and outlives node-plugin
+# restarts; the node plugin drives it over /run/nvmeublk/nvmeublkd.sock.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "scale-csi.fullname" . }}-nvmeublkd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scale-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nvmeublkd
+spec:
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  # One node at a time. SIGTERM is a handover (drain, leave the devices, exit)
+  # and the replacement reattaches them, so a node's I/O pauses for the gap.
+  # maxSurge MUST stay 0: two daemons would contend for the socket and the
+  # devices.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      {{- include "scale-csi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: nvmeublkd
+  template:
+    metadata:
+      labels:
+        {{- include "scale-csi.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: nvmeublkd
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      priorityClassName: {{ $daemon.priorityClassName | default "system-node-critical" }}
+      # Covers the daemon's bounded 5 s drain on SIGTERM.
+      terminationGracePeriodSeconds: {{ $daemon.terminationGracePeriodSeconds | default 15 }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      # Scheduled exactly where the node plugin is, so every node that can
+      # stage a volume has a daemon.
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nvmeublkd
+          image: {{ include "scale-csi.nvmeublkdImage" $daemon | quote }}
+          imagePullPolicy: {{ $image.pullPolicy | default "IfNotPresent" }}
+          command: ["nvmeublk", "daemon"]
+          {{- with $daemon.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # ublk device control, io_uring, mlockall and NAPI busy polling.
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-dev
+              mountPath: /dev
+            - name: nvmeublk-run
+              mountPath: /run/nvmeublk
+          {{- with $daemon.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: nvmeublk-run
+          hostPath:
+            path: /run/nvmeublk
+            type: DirectoryOrCreate
+{{- end }}

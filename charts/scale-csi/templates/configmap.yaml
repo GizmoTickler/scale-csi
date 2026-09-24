@@ -209,6 +209,20 @@ data:
         keepAliveTmo: {{ $nvmeofConnect.keepAliveTmo }}
         {{- end }}
       {{- end }}
+      {{- /* Userspace NVMe/TCP data path: renders ONLY when ublk is in use, so
+           a default install's ConfigMap carries neither key and stays
+           parseable by a rolled-back binary that has no such field. */}}
+      {{- if include "scale-csi.nvmeofUblkInUse" . }}
+      {{- $nvmeofUblk := $nvmeof.ublk | default dict }}
+      dataPath: {{ $nvmeof.dataPath | default "kernel" | quote }}
+      ublk:
+        enabled: {{ $nvmeofUblk.enabled | default false }}
+        queues: {{ $nvmeofUblk.queues | default 8 | int }}
+        depth: {{ $nvmeofUblk.depth | default 64 | int }}
+        zeroCopy: {{ if kindIs "invalid" $nvmeofUblk.zeroCopy }}true{{ else }}{{ $nvmeofUblk.zeroCopy }}{{ end }}
+        napiUs: {{ $nvmeofUblk.napiUs | default 0 | int }}
+        attachTimeout: {{ $nvmeofUblk.attachTimeout | default 60 | int }}
+      {{- end }}
     {{- end }}
 
     # Session garbage collection (node plugin only)

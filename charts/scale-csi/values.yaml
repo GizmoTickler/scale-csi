@@ -695,6 +695,72 @@ nvmeof:
   # timeout is commandTimeouts.nvme. The schema still accepts the old key
   # (ignored) so existing values files pass validation.
 
+  # Node data path for volumes whose StorageClass does not set the
+  # `nvmeof/dataPath` parameter:
+  #   kernel (default) — `nvme connect` plus native kernel NVMe multipath.
+  #   ublk             — the userspace NVMe/TCP initiator served by the
+  #                      per-node nvmeublkd daemon as /dev/ublkbN, with its own
+  #                      multipath. Needs the daemon on every node (see
+  #                      ublk.daemon below) and the ublk_drv kernel module;
+  #                      zero copy needs kernel >= 6.16.
+  # A StorageClass with `nvmeof/dataPath: kernel|ublk` pins its volumes to that
+  # path regardless of this default. Changing the default never moves a staged
+  # volume: it applies at a volume's next NodeStage.
+  dataPath: kernel
+
+  # The userspace data path. Nothing here renders into the driver ConfigMap,
+  # and the node plugin mounts nothing extra, unless ublk is in use
+  # (ublk.enabled=true or dataPath=ublk).
+  ublk:
+    # Make the ublk data path available to StorageClasses that opt in with
+    # `nvmeof/dataPath: ublk` while dataPath above stays kernel. dataPath=ublk
+    # implies it. When in use, the node plugin mounts the host's /run/nvmeublk
+    # (the daemon's socket and runtime directory).
+    enabled: false
+    # ublk queues per device.
+    queues: 8
+    # Per-queue ublk depth.
+    depth: 64
+    # ublk zero copy (UBLK_F_AUTO_BUF_REG). Needs kernel >= 6.16; the daemon
+    # refuses the attach on an older kernel, so set false there.
+    zeroCopy: true
+    # NAPI busy-poll budget in microseconds while I/O is in flight; 0 disables.
+    # Longer budgets trade CPU for lower QD1 latency.
+    napiUs: 0
+    # Seconds one attach may take (it connects every path).
+    attachTimeout: 60
+
+    # Optional nvmeublkd DaemonSet. Disabled by default: run the daemon however
+    # suits the node OS (this DaemonSet, or a host service using the same
+    # /run/nvmeublk). It runs privileged with host networking on every node
+    # the node plugin runs on (same nodeSelector, affinity and tolerations).
+    # SIGTERM is a handover, not a teardown: in-flight I/O drains (bounded at
+    # 5 s), the devices stay, and the next daemon reattaches them, so a rolling
+    # update only pauses I/O on one node at a time.
+    daemon:
+      enabled: false
+      image:
+        # Placeholder. No nvmeublk image is published with this chart; build
+        # one from the nvmeublk sources and set repository plus tag or digest.
+        repository: registry.example.invalid/nvmeublk
+        # Required when the daemon is enabled (unless digest is set).
+        tag: ""
+        # Optional immutable manifest digest; takes precedence over tag.
+        digest: ""
+        pullPolicy: IfNotPresent
+      # Seconds kubelet waits after SIGTERM. Must cover the daemon's 5 s drain.
+      terminationGracePeriodSeconds: 15
+      priorityClassName: system-node-critical
+      # The daemon locks its memory (mlockall); budget about 52 MiB per
+      # attached volume with zero copy. No limit is set by default: an
+      # OOM-killed storage daemon stalls every volume on the node until it is
+      # restarted.
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+      extraEnv: []
+
 # Storage classes to create.
 #
 # `protocol` is emitted into the StorageClass parameters ONLY when set on an

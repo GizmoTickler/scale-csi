@@ -1463,6 +1463,94 @@
           "description": "DEPRECATED, ignored; the nvme CLI timeout is commandTimeouts.nvme. Retained only so old values files pass validation.",
           "type": "integer",
           "minimum": 1
+        },
+        "dataPath": {
+          "description": "Node data path for NVMe-oF volumes whose StorageClass does not set nvmeof/dataPath.",
+          "type": "string",
+          "enum": [
+            "kernel",
+            "ublk"
+          ]
+        },
+        "ublk": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "queues": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "zeroCopy": {
+              "type": "boolean"
+            },
+            "napiUs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "attachTimeout": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "daemon": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "tag": {
+                      "type": "string"
+                    },
+                    "digest": {
+                      "type": "string"
+                    },
+                    "pullPolicy": {
+                      "type": "string",
+                      "enum": [
+                        "Always",
+                        "IfNotPresent",
+                        "Never"
+                      ]
+                    }
+                  }
+                },
+                "terminationGracePeriodSeconds": {
+                  "type": "integer",
+                  "minimum": 6
+                },
+                "priorityClassName": {
+                  "type": "string"
+                },
+                "resources": {
+                  "type": "object"
+                },
+                "extraEnv": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },

@@ -109,6 +109,12 @@ spec:
               mountPath: /etc/iscsi
             - name: iscsi-lib
               mountPath: /var/lib/iscsi
+            {{- if include "scale-csi.nvmeofUblkInUse" . }}
+            # nvmeublkd's control socket and runtime directory (userspace
+            # NVMe/TCP data path).
+            - name: nvmeublk-run
+              mountPath: /run/nvmeublk
+            {{- end }}
             {{- with .Values.node.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -242,6 +248,12 @@ spec:
           hostPath:
             path: /var/lib/iscsi
             type: DirectoryOrCreate
+        {{- if include "scale-csi.nvmeofUblkInUse" . }}
+        - name: nvmeublk-run
+          hostPath:
+            path: /run/nvmeublk
+            type: DirectoryOrCreate
+        {{- end }}
         {{- with .Values.node.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
