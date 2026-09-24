@@ -289,6 +289,29 @@ fn write_batch(w: &mut TcpStream, batch: &[Msg]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Dial, handshake and Connect one I/O queue (`qid` >= 1) on controller
+/// `cntlid`. Blocking; returns the ready socket and the target's maxh2cdata.
+pub fn connect_io_queue(addr: SocketAddr, id: &Ident, cntlid: u16, qid: u16, qsize: u16) -> Result<(TcpStream, u32)> {
+    let mut s = dial(addr)?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let (_cpda, maxh2c) = ic_handshake(&mut s)?;
+    let (sqe, data) = connect_cmd(0, qid, qsize - 1, 0, cntlid, &id.hostid, &id.subnqn, &id.hostnqn);
+    write_capsule(&mut s, &sqe, &data)?;
+    let ch = read_ch(&mut s)?;
+    let mut psh = vec![0u8; ch.hlen as usize - CH_LEN];
+    s.read_exact(&mut psh)?;
+    if ch.ptype != PDU_CAPSULE_RESP {
+        bail!("expected Connect response on I/O queue {qid}, got {:#x}", ch.ptype);
+    }
+    let cqe = Cqe::parse(&psh);
+    if cqe.sc() != 0 {
+        bail!("I/O queue {qid} Connect rejected: {:#x}", cqe.status);
+    }
+    // Completions are waited on indefinitely; stalls are the watchdog's job.
+    s.set_read_timeout(None)?;
+    Ok((s, maxh2c.max(4096)))
+}
+
 /// A pipelined I/O queue on one path.
 pub struct IoConn {
     pub path: usize,
@@ -306,24 +329,7 @@ pub struct IoConn {
 
 impl IoConn {
     pub fn connect(path: usize, addr: SocketAddr, id: &Ident, cntlid: u16, qsize: u16, info: NsInfo) -> Result<(Arc<Self>, TcpStream)> {
-        let mut s = dial(addr)?;
-        s.set_read_timeout(Some(Duration::from_secs(10)))?;
-        let (_cpda, maxh2c) = ic_handshake(&mut s)?;
-        let (sqe, data) = connect_cmd(0, 1, qsize - 1, 0, cntlid, &id.hostid, &id.subnqn, &id.hostnqn);
-        write_capsule(&mut s, &sqe, &data)?;
-        let ch = read_ch(&mut s)?;
-        let mut psh = vec![0u8; ch.hlen as usize - CH_LEN];
-        s.read_exact(&mut psh)?;
-        if ch.ptype != PDU_CAPSULE_RESP {
-            bail!("expected Connect response on I/O queue, got {:#x}", ch.ptype);
-        }
-        let cqe = Cqe::parse(&psh);
-        if cqe.sc() != 0 {
-            bail!("I/O queue Connect rejected: {:#x}", cqe.status);
-        }
-        // The receiver blocks indefinitely between completions; stalls are
-        // detected by the per-request timeout in the multipath layer.
-        s.set_read_timeout(None)?;
+        let (s, maxh2c) = connect_io_queue(addr, id, cntlid, 1, qsize)?;
         let reader = s.try_clone()?;
         let ctl = s.try_clone()?;
         let (tx, rx) = channel::<Msg>();

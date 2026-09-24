@@ -8,15 +8,16 @@
 //! NVMEUBLK_IO_TIMEOUT_MS (5000), NVMEUBLK_NO_PATH_TIMEOUT_MS (30000, 0=forever).
 
 mod conn;
+mod ctrls;
 mod mpath;
 mod pdu;
+mod qengine;
 
 use anyhow::{bail, Context, Result};
 use conn::{Done, Ident, Op, Req};
 use libublk::ctrl::UblkCtrlBuilder;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::ublk_submit_sqe_async;
 use libublk::{BufDesc, UblkError, UblkFlags};
 use mpath::{Config, Mpath};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -146,108 +147,127 @@ fn lat(nqn: &str, addrs: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, m: &Mpath) -> Result<(), UblkError> {
+async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32) -> Result<(), UblkError> {
     let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-    let efd = eventfd().map_err(|_| UblkError::OtherError(-libc::EMFILE))?;
-    let done = Arc::new(Done { res: AtomicI32::new(0), efd });
-    let mut ev = Box::new(0u64);
-    let shift = m.info.lba_shift;
-
+    // Per-tag completion channel, reused for every request on this tag.
+    let (done_tx, done_rx) = smol::channel::bounded::<i32>(1);
     q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf)).await?;
     loop {
         let iod = q.get_iod(tag);
         let op = match iod.op_flags & 0xff {
-            libublk::sys::UBLK_IO_OP_READ => Some(Op::Read),
-            libublk::sys::UBLK_IO_OP_WRITE => Some(Op::Write),
-            libublk::sys::UBLK_IO_OP_FLUSH => Some(Op::Flush),
+            libublk::sys::UBLK_IO_OP_READ => Some(qengine::Op::Read),
+            libublk::sys::UBLK_IO_OP_WRITE => Some(qengine::Op::Write),
+            libublk::sys::UBLK_IO_OP_FLUSH => Some(qengine::Op::Flush),
             _ => None,
         };
         let res = match op {
             None => -libc::EOPNOTSUPP,
             Some(op) => {
                 let bytes = (iod.nr_sectors as usize) << 9;
-                let slba = (iod.start_sector << 9) >> shift;
-                let nlb = (bytes >> shift) as u32;
-                m.submit(Req {
+                e.submit(qengine::Pending {
                     op,
-                    slba,
-                    nlb,
+                    slba: (iod.start_sector << 9) >> shift,
+                    nlb: (bytes >> shift) as u32,
                     buf: buf.as_slice().as_ptr() as *mut u8,
-                    len: if op == Op::Flush { 0 } else { bytes },
-                    done: done.clone(),
-                    first_submit: Instant::now(),
+                    len: if op == qengine::Op::Flush { 0 } else { bytes },
+                    done: done_tx.clone(),
+                    first: Instant::now(),
+                    sent: Instant::now(),
                     attempts: 0,
                 });
-                // Park this tag on its eventfd; the engine's write wakes the ring.
-                let sqe = io_uring::opcode::Read::new(io_uring::types::Fd(efd), &mut *ev as *mut u64 as *mut u8, 8).build();
-                match ublk_submit_sqe_async(sqe, libublk::UblkUringData::Target as u64).await {
-                    Ok(8) => done.res.load(Ordering::Acquire),
-                    Ok(r) => {
-                        log::error!("tag {tag}: eventfd read returned {r}");
-                        -libc::EIO
-                    }
-                    Err(e) => {
-                        log::error!("tag {tag}: eventfd wait failed: {e}");
-                        -libc::EIO
-                    }
-                }
+                done_rx.recv().await.unwrap_or(-libc::EIO)
             }
         };
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
     }
 }
 
-fn queue_fn(qid: u16, dev: &UblkDev, m: Arc<Mpath>) {
+fn queue_fn(qid: u16, dev: &UblkDev, ctrls: Arc<ctrls::Ctrls>, stats: Arc<qengine::Stats>, stop: Arc<std::sync::atomic::AtomicBool>, cfg: qengine::QConfig) {
     let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
+    let shift = ctrls.info.lba_shift;
+    // Engine tasks are 'static (they own Rc<QEngine>); tag tasks borrow the
+    // queue. Two local executors, ticked together from the same event loop.
+    let net_exe: Rc<smol::LocalExecutor<'static>> = Rc::new(smol::LocalExecutor::new());
+    let engine = qengine::QEngine::new(qid, ctrls, cfg, net_exe.clone(), stats, stop.clone());
+    engine.start();
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let exe = exe_rc.clone();
     let mut tasks = Vec::new();
     for tag in q_rc.tags() {
         let q = q_rc.clone();
-        let m = m.clone();
+        let e = engine.clone();
         tasks.push(exe.spawn(async move {
-            match io_task(&q, tag, &m).await {
+            match io_task(&q, tag, &e, shift).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => log::error!("io_task {tag} failed: {e}"),
+                Err(err) => log::error!("io_task {tag} failed: {err}"),
             }
         }));
     }
     smol::block_on(exe_rc.run(async move {
-        let run_ops = || while exe.try_tick() {};
+        let run_ops = || {
+            let mut progress = true;
+            while progress {
+                progress = false;
+                while exe.try_tick() {
+                    progress = true;
+                }
+                while net_exe.try_tick() {
+                    progress = true;
+                }
+            }
+        };
         let done = || tasks.iter().all(|t| t.is_finished());
         if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
             log::error!("queue {qid}: event loop failed: {e}");
         }
     }));
+    stop.store(true, Ordering::Release);
 }
 
 fn run(nqn: &str, addrs: &[String]) -> Result<()> {
-    let m = start(nqn, addrs)?;
-    let queues = env_u64("NVMEUBLK_QUEUES", 2) as u16;
+    let addrs: Vec<SocketAddr> = addrs
+        .iter()
+        .map(|a| a.to_socket_addrs().with_context(|| format!("bad address {a}"))?.next().context("unresolvable"))
+        .collect::<Result<_>>()?;
+    let ctrls = ctrls::Ctrls::new(addrs, host_ident(nqn), Duration::from_secs(15))?;
+    let info = ctrls.info.clone();
+    log::info!("namespace: {} blocks of {} bytes ({} MiB), in-capsule {} B", info.nsze, 1u64 << info.lba_shift, (info.nsze << info.lba_shift) >> 20, info.incapsule_bytes);
+    let queues = env_u64("NVMEUBLK_QUEUES", 4) as u16;
     let depth = env_u64("NVMEUBLK_DEPTH", 64) as u16;
-    let io_buf = (512 * 1024usize).min(m.info.mdts_bytes) as u32;
-    let size = m.info.nsze << m.info.lba_shift;
-    let lba_shift = m.info.lba_shift as u8;
+    let io_buf = (512 * 1024usize).min(info.mdts_bytes) as u32;
+    let size = info.nsze << info.lba_shift;
+    let lba_shift = info.lba_shift as u8;
+    let cfg = qengine::QConfig {
+        io_timeout: Duration::from_millis(env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000)),
+        no_path_timeout: Duration::from_millis(env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000)),
+        max_attempts: 8,
+    };
+    let stats = Arc::new(qengine::Stats::default());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = std::fs::write("/run/nvmeublk-queues", queues.to_string());
 
-    let ctrl = Arc::new(
-        UblkCtrlBuilder::default()
-            .name("nvmeublk")
-            .nr_queues(queues)
-            .depth(depth)
-            .io_buf_bytes(io_buf)
-            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
-            .build()
-            .context("create ublk device (is ublk_drv loaded?)")?,
-    );
-    let c2 = ctrl.clone();
-    let m2 = m.clone();
-    // Stop the block device FIRST: no new I/O, and in-flight I/O drains over
-    // the still-live paths. Tearing paths down first parked that I/O and the
-    // kernel's device stop then waited out the whole no-path timeout.
-    // libublk's control ring is thread-local: the handler thread must stop
-    // the device through its own control handle (calling kill_dev on the
-    // shared one panicked with "Control ring not initialized").
-    let _ = (m2, c2);
+    // USER_RECOVERY: if this process dies, the kernel quiesces the device and
+    // holds I/O; a successor started with NVMEUBLK_RECOVER_ID reattaches.
+    // REISSUE re-sends the requests that were in flight at the crash.
+    let recover_id = std::env::var("NVMEUBLK_RECOVER_ID").ok().and_then(|v| v.parse::<i32>().ok());
+    let mut builder = UblkCtrlBuilder::default();
+    builder = builder
+        .name("nvmeublk")
+        .nr_queues(queues)
+        .depth(depth)
+        .io_buf_bytes(io_buf)
+        .ctrl_flags((libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64);
+    let builder = match recover_id {
+        Some(id) => {
+            libublk::ctrl::UblkCtrl::new_simple(id)?.start_user_recover().context("start user recovery")?;
+            log::info!("recovering ublk device {id}");
+            builder.id(id).dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
+        }
+        None => builder.dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV),
+    };
+    let ctrl = Arc::new(builder.build().context("create ublk device (is ublk_drv loaded?)")?);
+
+    // libublk's control ring is thread-local: stop through a handler-owned handle.
     let dev_id = ctrl.dev_info().dev_id as i32;
     ctrlc::set_handler(move || match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
         Ok(c) => {
@@ -257,39 +277,49 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         }
         Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
     })?;
-    let mstat = m.clone();
-    std::thread::spawn(move || loop {
+    let st = stats.clone();
+    let cstat = ctrls.clone();
+    std::thread::spawn(move || {
+      let mut last = (0u64, 0u64, 0u64);
+      loop {
         std::thread::sleep(Duration::from_secs(5));
-        let s = &mstat.stats;
-        let paths: Vec<String> = mstat.path_states().iter().map(|(a, up, n)| format!("{}={}{}", a.ip(), if *up { "up" } else { "DOWN" }, if *up { format!("/{n}") } else { String::new() })).collect();
+        let (n, w, t) = (st.done.load(Ordering::Relaxed), st.wire_ns.load(Ordering::Relaxed), st.total_ns.load(Ordering::Relaxed));
+        let dn = (n - last.0).max(1);
+        let lat = format!("io={} wire_avg={}us total_avg={}us direct_rx={}", n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, st.direct_rx.load(Ordering::Relaxed));
+        last = (n, w, t);
+        let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
         log::info!(
-            "paths [{}] failovers={} resubmits={} parked={} no_path_eio={} reconnects={} stall_kills={}",
-            paths.join(" "),
-            s.failovers.load(Ordering::Relaxed),
-            s.resubmits.load(Ordering::Relaxed),
-            s.parked.load(Ordering::Relaxed),
-            s.no_path_eio.load(Ordering::Relaxed),
-            s.reconnects.load(Ordering::Relaxed),
-            s.stall_kills.load(Ordering::Relaxed)
+            "ctrls [{}] failovers={} resubmits={} parked={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} {}",
+            ups.join(" "),
+            st.failovers.load(Ordering::Relaxed),
+            st.resubmits.load(Ordering::Relaxed),
+            st.parked.load(Ordering::Relaxed),
+            st.no_path_eio.load(Ordering::Relaxed),
+            st.reconnects.load(Ordering::Relaxed),
+            st.stall_kills.load(Ordering::Relaxed),
+            st.epoch_kills.load(Ordering::Relaxed),
+            lat
         );
+      }
     });
 
-    let mq = m.clone();
+    let (cq, sq, stq) = (ctrls.clone(), stats.clone(), stop.clone());
     ctrl.run_target(
         move |dev: &mut UblkDev| {
             dev.set_default_params(size);
             dev.tgt.params.basic.logical_bs_shift = lba_shift;
             dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
+            // Room on each queue ring for the network SQEs (recv + writev per
+            // path, timer, reconnect wakeup) next to the ublk commands.
+            dev.tgt.sq_depth = depth * 2 + 64;
+            dev.tgt.cq_depth = depth * 2 + 64;
             Ok(())
         },
-        move |qid, dev: &_| queue_fn(qid, dev, mq.clone()),
-        |c| {
-            log::info!("serving /dev/ublkb{}", c.dev_info().dev_id);
-        },
+        move |qid, dev: &_| queue_fn(qid, dev, cq.clone(), sq.clone(), stq.clone(), cfg.clone()),
+        |c| log::info!("serving /dev/ublkb{}", c.dev_info().dev_id),
     )?;
-    m.shutdown();
-    // The signal handler holds a clone of `ctrl`, so it is never dropped;
-    // delete the device explicitly or /dev/ublkbN outlives the process.
+    stop.store(true, Ordering::Release);
+    ctrls.shutdown();
     ctrl.del_dev()?;
     Ok(())
 }

@@ -12,12 +12,14 @@ kernel `nvme-tcp` + native multipath stack.
   - One pipelined I/O queue with a CID pool.
   - Receiver thread: C2HData goes straight into the ublk buffer; answers R2T.
   - Batching sender thread: vectored writes; payloads borrowed from the request buffer, with no copy.
-- `src/mpath.rs`: multipath.
+- `src/ctrls.rs`: per-path admin controllers for `run`. Connect, enable, identify; a supervisor thread per path for keep-alive and reconnect with backoff. An epoch per path is bumped whenever its controller is lost or replaced, so queues can tell that their I/O connection belongs to a dead controller.
+- `src/qengine.rs`: the `run` data path (v3). Every ublk queue drives its own NVMe/TCP I/O connections, one per path, as SQEs on the queue's own io_uring: batched `Writev` sends, `Recv` into a staging buffer, and large C2HData payloads received straight into the request buffer. There are no sender or receiver threads and no cross-thread wakeups. Also: least-outstanding path choice, failover, parking with a deadline, the stall watchdog (keyed on each attempt's send time), epoch checks, and fault injection.
+- `src/mpath.rs`: the v2 thread-per-path engine, now used only by `probe` and `lat`.
   - Least-outstanding path selection; failover of in-flight I/O.
   - Queue-if-no-path with a deadline (`NVMEUBLK_NO_PATH_TIMEOUT_MS`).
   - Per-path supervisor thread for reconnect with backoff and keep-alive.
   - Watchdog that kills a path whose oldest request exceeds `NVMEUBLK_IO_TIMEOUT_MS`. This is the silent-link case a socket error never reports.
-- `src/main.rs`: modes `probe` (protocol test), `lat` (engine-only latency), `run` (ublk device) and `del` (remove a stale device). There is one libublk async task per tag; the engine wakes a tag through its own eventfd read on the queue's io_uring.
+- `src/main.rs`: modes `probe` (protocol test), `lat` (engine-only latency), `run` (ublk device) and `del` (remove a stale device). There is one libublk async task per tag. The device is created with `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`: if the daemon dies, the kernel holds the device and its I/O, and `NVMEUBLK_RECOVER_ID=<dev id> nvmeublk run ...` reattaches a fresh daemon and reissues the held I/O.
 
 ## Test rig (all local on a dev VM; nothing touches the storage server or a cluster)
 `nvmet-local.sh up` starts a kernel nvmet target on 127.0.0.11-14:4420, with two subsystems:
@@ -51,6 +53,28 @@ Performance on the `null_blk` target (4K random at 4 jobs × QD32; 128K sequenti
 - Loopback flatters batching. The sender executes the peer's TCP receive inline, so coalescing many PDUs into one `writev` amortizes the *target's* work too. On a real NIC the gap will be smaller.
 - QD1 latency is much worse than the kernel's (about 9×): every I/O crosses 2 or 3 thread hops (ublk queue thread, sender, receiver). Latency-sensitive databases would feel this.
 - One I/O queue per path; no digests, no TLS, no ANA; nsid is fixed at 1; `mdts` is honored only by capping the ublk buffer size.
+
+## v3: io_uring-native engine + crash recovery (2026-09-24, same dev VM)
+Correctness, with fio crc32c verification running continuously:
+- Failover drill (the same script as v2): 60 s, 5.0 GiB verified, `err=0`. All 4 paths down for 8 s parks I/O and resumes it; 0 EIO.
+- Fault injection: `stall 1`, then `kill 2`, then `stall 0`, during 40 s of verified writes. `err=0`. Only the stalled path is killed, at io_timeout (5 s); the worst-case I/O latency is 5.0 s.
+- **Daemon crash:** `kill -9` of the daemon 8 s into a 30 s verified fio run on a *mounted* ext4, then restart with `NVMEUBLK_RECOVER_ID=0` 3 s later. The kernel held the I/O, the new daemon reattached and reissued it, fio finished with `err=0` (2.0 GiB), and the worst-case I/O stalled 3.3 s (the restart gap). `fsck.ext4 -fn` is clean afterwards.
+
+Performance on the `null_blk` target, v2 vs v3 back to back:
+
+| | v2 (threads) | v3 (io_uring) |
+|---|---|---|
+| QD1 4K randread, fio mean | 274 µs | **210 µs** (−23%) |
+| 4K randread 4×QD32 | 57.7K IOPS, 8.2K/core | **92–106K IOPS, 22.4K/core** |
+| 4K randwrite 4×QD32 | 84.3K IOPS, 11.3K/core | **101–107K IOPS, 24–26K/core** |
+| 128K seq read, 4 jobs × QD16 | 1,536 MiB/s | **1,913 MiB/s** |
+| 128K seq read, 1 job × QD16 | **1,723 MiB/s** | 510–540 MiB/s |
+
+Known limitation: one ublk queue now does all of its paths' network work on one thread, so a *single* large-block stream is capped at about 550 MB/s per queue. v2 spread one queue's receives across 4 path threads. Aggregate throughput across queues is higher than v2. The cap is not the staging copy (receiving straight into the request buffer did not move it), not the socket receive buffer (4–16 MiB: no change), and not CPU (the queue thread runs at about 40%). It behaves like a serialized wait per queue and is still open. A likely next step is spreading one queue's paths over helper rings, or ublk zero-copy (kernel ≥ 6.15, unavailable on Flatcar's 6.12).
+
+Bugs found in v3 while testing:
+- The stall watchdog keyed on the request's *first* submit time. A request failed over from a stalled path is already old, so it condemned every healthy path it landed on: one stalled path killed all four. Fix: a per-attempt `sent` timestamp.
+- The I/O sockets were `O_NONBLOCK`. io_uring honors that and returns `-EAGAIN` instead of arming a poll, so the receiver resubmitted in a spin. Fix: blocking fds; io_uring does the waiting.
 
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
@@ -92,5 +116,5 @@ Cleanup: nvmeublk stopped cleanly; the namespace, PVC and PV were deleted (the d
 
 ## Assessment
 - **Viable.** Userspace NVMe/TCP multipath over ublk is correct under path loss and silent stalls, and it matches or beats the kernel on throughput over the real fabric.
-- **It costs about 170 µs at QD1.** Before this could replace the kernel path for databases, the thread hops need collapsing: drive the sockets from the ublk queue's own io_uring (one ring per queue, send/recv as SQEs) instead of separate sender and receiver threads.
-- **Operational cost.** An out-of-tree module has to be rebuilt per Flatcar kernel and shipped as a version-pinned sysext. A crash or restart of the daemon stalls I/O on that node's volumes until ublk user recovery (`UBLK_F_USER_RECOVERY`) reattaches; that is not implemented here.
+- **It cost about 170 µs at QD1 over the fabric (v2).** v3 collapses the thread hops onto the queue's own io_uring and cuts QD1 by 23% on loopback. It has not been re-measured on the fabric yet.
+- **Operational cost.** An out-of-tree module has to be rebuilt per Flatcar kernel and shipped as a version-pinned sysext. v3 implements ublk user recovery: a daemon crash stalls I/O (without failing it) until a new daemon reattaches with `NVMEUBLK_RECOVER_ID`. In a cluster, a supervisor such as systemd or a DaemonSet restart has to do the relaunch; that is not built here.
