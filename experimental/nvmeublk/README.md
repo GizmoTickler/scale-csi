@@ -216,6 +216,26 @@ Budget sweep (8 queues): 50 µs gives QD1 334 µs; 200 µs gives 241 µs; 1,000 
 
 Zero-copy writes: payloads of writes larger than the in-capsule size go out via R2T straight from the request's registered pages (`IORING_OP_WRITE_FIXED` on the socket; a fixed-buffer `SEND` is refused by 6.19). Verified: 3 GiB of 64K–1M writes, every byte sent zero-copy, `err=0`; mixed failover drill 30 GiB `err=0`. It does not change single-stream 128K write throughput: every path, kernel included, lands at 520–800 MiB/s there, so that test is bound by the target. With 8 queues nvmeublk sits at the low end (519–628); with 4 queues, at 662–766.
 
+### Candidate node OSes with current kernels (2026-09-24)
+Three identical test VMs on the same hypervisor, storage networks and zvol: Fedora CoreOS stable 44.20260829.3.1 (kernel 7.1.10), openSUSE MicroOS (7.2.6), and the Fedora 44 cloud image (6.19.10). Each ran the kernel initiator and nvmeublk (zero copy, 8 queues, `NVMEUBLK_NAPI_US=200`); the ranges are two passes in opposite order.
+
+| | FCOS 7.1 kernel | FCOS 7.1 nvmeublk | MicroOS 7.2 kernel | MicroOS 7.2 nvmeublk |
+|---|---|---|---|---|
+| 128K read, 1 job, pinned | 1,063–1,078 | **1,369–1,658** | 942–1,037 | **1,324–1,345** |
+| 128K read, 1 job | 977–980 | **1,221–1,452** | 922–950 | **1,094–1,181** |
+| 128K read, 4 jobs | 3,007–3,093 | **3,316–3,528** | 2,875–2,994 | **3,511–3,563** |
+| 128K write, 1 job | 688–757 | **890–914** | 566–568 | **856–909** |
+| 4K randread 4×QD32 | 60.4–60.5K | **129–134K** | 59.8–60.9K | **144–150K** |
+| 4K randwrite 4×QD32 | 56–61K | **104–107K** | 57–61K | **91–107K** |
+| 4K randread QD1 | 271–304 µs | 253–334 | 278–287 | **234–249** |
+| CPU/GiB, 4K randread | 22.8 | **13.8** | 17.2–18.1 | **11.9–12.2** |
+
+- On both 7.x kernels nvmeublk beats the kernel initiator on every throughput test, large single-stream writes included (+21–61%). It does 2.1–2.5× the kernel's 4K random-read IOPS with 30–40% less CPU per GiB.
+- The newer kernels help nvmeublk more than they help the kernel initiator. The same daemon on Fedora 6.19 did 104–107K 4K random-read IOPS; on 7.x it does 129–150K.
+- MicroOS over FCOS, for nvmeublk: about 10% more small-read IOPS, lower QD1 (234–249 vs 253–334 µs) and less CPU per GiB. Large transfers are equal within noise.
+- The 7.x-only fixed-buffer `RECV` (`NVMEUBLK_ZC_RECV=1`): FCOS 7.1 refuses it (the daemon falls back to `READ_FIXED` by itself). MicroOS 7.2 accepts it, but it was no faster than `READ_FIXED`, so it stays off. ublk batch I/O (7.x) is not usable with zero copy through libublk 0.4.8, which refuses user copy in batch mode.
+- Safety on both, zero copy, fio crc32c: failover drill (kill, stall, kill; random read/write 4K–1M) 41 GiB `err=0`; `kill -9` + recovery 32 GiB `err=0`; writeback hardening active; clean exit.
+
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
 - The receiver tore down the admin queue before resubmitting orphans; that could wait behind a blocked keep-alive. Fix: fail over first.

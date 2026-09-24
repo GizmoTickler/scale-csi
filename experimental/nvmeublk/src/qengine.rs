@@ -42,6 +42,20 @@ pub const NSID: u32 = 1;
 /// read is not copied twice in user space.
 const RX_CHUNK_DEFAULT: usize = 32 * 1024;
 
+/// io_uring UAPI: send/recv on a registered (fixed) buffer, index in buf_index.
+const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
+
+/// Zero-copy receive primitive: 0 = fixed-buffer RECV with MSG_WAITALL
+/// (kernel 7.x; one SQE per payload), 1 = READ_FIXED on the socket (every
+/// kernel with AUTO_BUF_REG; may take several SQEs). Starts from the
+/// configured preference and drops to READ_FIXED the first time the kernel
+/// refuses a fixed-buffer RECV with EINVAL.
+static ZC_RECV_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+pub fn set_zc_recv_preference(recv: bool) {
+    ZC_RECV_MODE.store(if recv { 0 } else { 1 }, Ordering::Relaxed);
+}
+
 
 /// Wait until `efd` (an eventfd) is readable, then drain it. POLL_ADD always
 /// arms a poll; a READ SQE on a non-blocking eventfd returns -EAGAIN at once
@@ -167,6 +181,7 @@ pub struct Stats {
     pub direct_rx: AtomicU64,
     /// Read payload bytes received straight into ublk request pages.
     pub zc_bytes: AtomicU64,
+    pub zc_rx_ops: AtomicU64,
     /// Write payload bytes sent straight from ublk request pages.
     pub zc_tx_bytes: AtomicU64,
     /// Stage split (ns sums): capsule queued -> its Writev done; Writev done ->
@@ -908,10 +923,26 @@ impl QEngine {
                 // kernel-registered buffer on every kernel with ublk zero copy
                 // (a fixed-buffer RECV is refused with EINVAL before 7.x). It
                 // may return short, so loop until the payload is complete.
-                let sqe = io_uring::opcode::ReadFixed::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32, idx)
-                    .offset(u64::MAX)
-                    .build();
+                let use_recv = ZC_RECV_MODE.load(Ordering::Relaxed) == 0;
+                let sqe = if use_recv {
+                    io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32)
+                        .ioprio(IORING_RECVSEND_FIXED_BUF)
+                        .buf_group(idx)
+                        .flags(libc::MSG_WAITALL)
+                        .build()
+                } else {
+                    io_uring::opcode::ReadFixed::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32, idx)
+                        .offset(u64::MAX)
+                        .build()
+                };
                 let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
+                if use_recv && r == -libc::EINVAL {
+                    // Prep-time refusal: nothing was consumed from the socket.
+                    if ZC_RECV_MODE.swap(1, Ordering::Relaxed) == 0 {
+                        log::info!("fixed-buffer RECV not supported by this kernel; using READ_FIXED");
+                    }
+                    continue;
+                }
                 if c.dead.get() {
                     break;
                 }
@@ -928,6 +959,7 @@ impl QEngine {
                 got += r as usize;
             }
             self.stats.zc_bytes.fetch_add((got - have) as u64, Ordering::Relaxed);
+            self.stats.zc_rx_ops.fetch_add(1, Ordering::Relaxed);
         } else if let Some(hp) = c.helper.as_ref().filter(|_| len - got >= self.cfg.rx_offload) {
             // The receiver task owns this socket's read side, and it waits
             // here, so the helper is the only reader until it reports back.

@@ -356,6 +356,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     // Zero copy needs AUTO_BUF_REG (kernel >= 6.16); it also uses USER_COPY
     // for the few payload bytes that arrive with a PDU header.
     let zero_copy = env_u64("NVMEUBLK_ZERO_COPY", 0) != 0;
+    // NVMEUBLK_ZC_RECV=1: prefer the fixed-buffer RECV (7.x); falls back by itself.
+    qengine::set_zc_recv_preference(env_u64("NVMEUBLK_ZC_RECV", 0) != 0);
     if zero_copy {
         let feats = libublk::ctrl::UblkCtrl::get_features().unwrap_or(0);
         let need = (libublk::sys::UBLK_F_AUTO_BUF_REG | libublk::sys::UBLK_F_USER_COPY) as u64;
