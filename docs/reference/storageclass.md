@@ -27,6 +27,7 @@ All protocols use the unified provisioner `csi.scale.io`.
 | `nfsACLMode` | `PASSTHROUGH` (default) or `RESTRICTED` — the dataset's `aclmode` | No; requires `nfsACLTemplate` or `nfsACL` |
 | `zfsPerformanceClass` | `database`, `media`, `vm`, `backup`, `general` — a curated ZFS property preset | No; unset inherits the parent dataset's properties. **Ignored on volumes restored/cloned from a content source** |
 | `encryption` | `"true"` — create the volume with ZFS-native encryption at rest (GF-Sprint 1) | No; requires `encryption.enabled` and a per-class encryption Secret. **Create-time only; cannot combine with a content source.** See [Encryption at rest](#encryption-at-rest) |
+| `nvmeof/dataPath` | `kernel` or `ublk` — the node data path for this class's NVMe-oF volumes, recorded in each PV | No; default is the driver's `nvmeof.dataPath` (`kernel`). `ublk` requires the ublk data path to be enabled. See [NVMe-oF](#nvme-of) |
 | `csi.storage.k8s.io/fstype` | Standard external-provisioner filesystem selection for formatted block volumes | No; block default is `ext4` |
 
 `protocol` and `snapshotRestoreMode` are the scale-csi-specific ordinary
@@ -1408,6 +1409,27 @@ volumeBindingMode: WaitForFirstConsumer
 NVMe-oF requires TrueNAS SCALE 25.10+, `nvme-cli`, and the selected transport's
 kernel modules on every eligible node. Set `nvmeof.subsystemHosts` or deliberately
 choose `nvmeof.subsystemAllowAnyHost: true` when fencing is off.
+
+### Node data path (`nvmeof/dataPath`)
+
+`nvmeof/dataPath: ublk` stages the class's volumes through `nvmeublkd`, the
+per-node userspace NVMe/TCP daemon, instead of the kernel initiator; `kernel`
+pins the kernel initiator even if the install default later becomes `ublk`.
+The value is validated at CreateVolume (`InvalidArgument` for anything else,
+for a non-NVMe-oF class, or for `ublk` on an install without
+`nvmeof.ublk.enabled` / `nvmeof.dataPath: ublk`) and stored in the PV's volume
+context under the same key. A class without the parameter records nothing, and
+its volumes follow the driver's `nvmeof.dataPath` at each NodeStage.
+
+```yaml
+parameters:
+  protocol: nvmeof
+  nvmeof/dataPath: ublk
+```
+
+Prerequisites (the `ublk_drv` module, kernel >= 6.16 for zero copy, the daemon
+on every node, NVMe/TCP) and limits (no online expansion of a staged volume)
+are in the chart README's "Userspace NVMe/TCP data path (ublk)" section.
 
 ## Restore mode
 

@@ -215,6 +215,19 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.port` | Target service ID/port | `4420` |
 | `nvmeof.subsystemHosts` | Allowed host NQNs | `[]` |
 | `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `false` |
+| `nvmeof.dataPath` | Node data path for volumes whose StorageClass does not set `nvmeof/dataPath`: `kernel` or `ublk` | `kernel` |
+| `nvmeof.ublk.enabled` | Allow StorageClasses to opt into the ublk data path while the default stays `kernel` | `false` |
+| `nvmeof.ublk.queues` | ublk queues per device (`1..4096`) | `8` |
+| `nvmeof.ublk.depth` | Per-queue ublk depth (`1..4096`) | `64` |
+| `nvmeof.ublk.zeroCopy` | ublk zero copy; needs kernel >= 6.16 | `true` |
+| `nvmeof.ublk.napiUs` | NAPI busy-poll budget in µs while I/O is in flight; `0` disables | `0` |
+| `nvmeof.ublk.attachTimeout` | Seconds one attach may take | `60` |
+| `nvmeof.ublk.daemon.enabled` | Deploy the optional `nvmeublkd` DaemonSet | `false` |
+| `nvmeof.ublk.daemon.image.repository` | nvmeublkd image (placeholder; no image is published) | `registry.example.invalid/nvmeublk` |
+| `nvmeof.ublk.daemon.image.tag` / `.digest` | Required when the daemon is enabled; digest wins | `""` |
+| `nvmeof.ublk.daemon.terminationGracePeriodSeconds` | Must cover the daemon's 5 s drain | `15` |
+| `nvmeof.ublk.daemon.priorityClassName` | Daemon pod priority | `system-node-critical` |
+| `nvmeof.ublk.daemon.resources` | Daemon resources; no memory limit by default | requests `50m` / `128Mi` |
 
 > `iscsi.extentAvailThreshold` and `nvmeof.commandTimeout` were removed: neither
 > was wired to anything (`nvmeof.commandTimeout` is superseded by
@@ -251,6 +264,67 @@ flows). Trunking uses `max_connect` plus mounts through the additional addresses
 to let a Linux NFSv4.1+ client join transports that the server proves belong to
 one server identity. Unsupported clients/servers and negotiated NFS versions
 below 4.1 keep the primary mount available and emit a warning Event.
+
+#### Userspace NVMe/TCP data path (ublk)
+
+By default the node plugin stages NVMe-oF volumes with the kernel initiator
+(`nvme connect`, native kernel multipath). The ublk data path instead asks
+`nvmeublkd`, a per-node daemon, to serve the namespace from userspace as
+`/dev/ublkbN` with its own multipath; the node plugin then formats, mounts or
+block-publishes that device exactly as it would a kernel namespace. The node
+plugin talks to the daemon over the root-only socket
+`/run/nvmeublk/nvmeublkd.sock`, which the chart mounts into the node plugin
+when ublk is in use.
+
+Selection, per volume, at NodeStage:
+
+1. The StorageClass parameter `nvmeof/dataPath: kernel|ublk`, set through the
+   class's `extraParameters`. CreateVolume validates it and records it in the
+   PV's volume context, so the volume keeps that data path for its life.
+2. Otherwise `nvmeof.dataPath`, the install-wide default.
+
+`nvmeof.ublk.enabled=true` lets classes opt in while the default stays
+`kernel`; `nvmeof.dataPath=ublk` implies it. A class that asks for `ublk` on an
+install where it is not enabled fails at CreateVolume.
+
+Prerequisites on every node that can stage a ublk volume:
+
+- the `ublk_drv` kernel module; zero copy (`nvmeof.ublk.zeroCopy`, default on)
+  needs kernel >= 6.16, and the daemon refuses the attach on an older kernel,
+  so set it to `false` there;
+- `nvmeublkd` running with `/run/nvmeublk` shared with the node plugin. Either
+  enable `nvmeof.ublk.daemon` (build and push an image from the nvmeublk
+  sources first; none is published) or run it as a host service;
+- NVMe/TCP (`nvmeof.transport: tcp`); the daemon speaks nothing else;
+- a UUID-form host NQN from `nvme show-hostnqn`, or `/etc/nvme/hostid`. The
+  daemon connects with the node's own host NQN and ID, which is what
+  publication fencing admits for that node.
+
+Differences from the kernel path: session GC and `fast_io_fail_tmo`
+convergence apply to kernel controllers only and never touch a ublk volume;
+the daemon detaches a volume at NodeUnstage, and an unreachable daemon fails
+the unstage rather than leaking the device. Online expansion of a staged ublk
+volume is not possible (the daemon cannot grow a live device): NodeExpand
+returns `FailedPrecondition` until the volume is staged again, for example by
+restarting the pod. There is no garbage collection of ublk attachments yet.
+
+```yaml
+nvmeof:
+  enabled: true
+  ublk:
+    enabled: true
+    daemon:
+      enabled: true
+      image:
+        repository: registry.example.invalid/nvmeublk
+        tag: v0.1.0
+storageClasses:
+  - name: scale-nvmeof-ublk
+    enabled: true
+    protocol: nvmeof
+    extraParameters:
+      nvmeof/dataPath: ublk
+```
 
 #### iSCSI CHAP keys
 
