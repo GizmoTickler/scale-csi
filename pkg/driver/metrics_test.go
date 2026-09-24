@@ -452,6 +452,11 @@ func TestMetricNamesIsComplete(t *testing.T) {
 }
 
 func TestReconcileAndFencingMetrics(t *testing.T) {
+	// The gauge is process-global and this timestamp is in the future (2027).
+	// Restore it so a later test asserting the gauge only moves forward does
+	// not fail purely on -shuffle order.
+	previousSuccess := testutil.ToFloat64(reconcileLastSuccessTimestamp)
+	t.Cleanup(func() { reconcileLastSuccessTimestamp.Set(previousSuccess) })
 	completedAt := time.Unix(1_800_000_000, 0)
 	RecordReconcileSuccess(completedAt)
 	assert.Equal(t, float64(completedAt.Unix()), testutil.ToFloat64(reconcileLastSuccessTimestamp))
