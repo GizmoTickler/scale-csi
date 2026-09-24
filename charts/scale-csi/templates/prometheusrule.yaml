@@ -195,13 +195,17 @@ spec:
             description: Marker-proven unstamped remnant datasets from interrupted creates await guarded reap.
             runbook_url: docs/troubleshooting.md#clean-up-orphaned-truenas-resources
         - alert: ScaleCSITombstoneBacklog
-          expr: scale_csi_tombstone_snapshots > 0
-          for: 48h
+          # A threshold, not "any backlog": a backup tool that mounts hourly
+          # snapshot clones keeps a steady, never-zero tombstone inflow, so
+          # "> 0 for 48h" paged permanently on exactly those clusters. One
+          # stuck tombstone is ScaleCSITombstoneOldestStuck's job.
+          expr: max(scale_csi_tombstone_snapshots{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > {{ .Values.metrics.prometheusRule.tombstoneBacklogThreshold | default 500 | int }}
+          for: 30m
           labels:
             severity: warning
           annotations:
-            summary: Scale CSI tombstone backlog is not draining
-            description: Driver-tombstoned deferred-delete snapshots have awaited reap for forty-eight hours.
+            summary: Scale CSI tombstone backlog is above its threshold
+            description: More than {{ .Values.metrics.prometheusRule.tombstoneBacklogThreshold | default 500 | int }} driver-tombstoned deferred-delete snapshots are awaiting reap. The guarded-cleanup CronJob is not keeping up with inflow or is refusing.
             runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
         - alert: ScaleCSITombstoneOldestStuck
           # The eligible-count gauge (ScaleCSITombstoneBacklog) cannot see an
@@ -211,13 +215,24 @@ spec:
           #
           # max() yields an empty label set; comparison with a scalar is
           # label-set correct (no `and`/`absent` pairing).
-          expr: max(scale_csi_tombstone_oldest_age_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 86400
+          expr: max(scale_csi_tombstone_oldest_age_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > {{ .Values.metrics.prometheusRule.tombstoneOldestAgeSeconds | default 86400 | int }}
           for: 1h
           labels:
             severity: warning
           annotations:
-            summary: Scale CSI has a deferred-delete tombstone older than 24h
-            description: The oldest driver-owned tombstone awaiting reap (including age-gated ones the count gauge excludes) is more than 24 hours old. A blocked DeleteVolume will keep returning FailedPrecondition until the reaper clears it.
+            summary: Scale CSI has a deferred-delete tombstone older than its threshold
+            description: The oldest driver-owned tombstone awaiting reap (including age-gated ones the count gauge excludes) is more than {{ .Values.metrics.prometheusRule.tombstoneOldestAgeSeconds | default 86400 | int }} seconds old. A blocked DeleteVolume will keep returning FailedPrecondition until the reaper clears it.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
+        - alert: ScaleCSITombstoneUnknownAge
+          # A tombstone whose creation time is unavailable is invisible to the
+          # oldest-age gauge (it cannot be aged), so it needs its own signal.
+          expr: max(scale_csi_tombstone_unknown_age{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI has tombstones with no readable creation time
+            description: One or more tombstones awaiting reap have an unavailable or malformed creation time, so ScaleCSITombstoneOldestStuck cannot age them.
             runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
         - alert: ScaleCSIReconcileStalled
           # The age threshold is DERIVED from the configured reconcile.interval
@@ -257,13 +272,37 @@ spec:
           # cannot false-page those. 12h is two missed runs of the default
           # 6-hourly schedule; operators who override to a longer CronJob must
           # raise it. time()-max(...) is label-set correct (both sides empty).
-          expr: time() - max(scale_csi_tombstone_reap_last_success_timestamp_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 43200
+          expr: time() - max(scale_csi_tombstone_reap_last_success_timestamp_seconds{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > {{ .Values.metrics.prometheusRule.tombstoneReapStaleSeconds | default 43200 | int }}
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: Scale CSI delete-capable reap has not completed recently
-            description: No delete-capable tombstone reap has been recorded for over twelve hours (two missed runs of the default 6-hourly CronJob). The reaper is broken or the CronJob is not running.
+            description: No delete-capable tombstone reap has been recorded for over {{ .Values.metrics.prometheusRule.tombstoneReapStaleSeconds | default 43200 | int }} seconds. The reaper is broken or the CronJob is not running.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
+        - alert: ScaleCSITombstoneReapRefusing
+          # Every guarded-delete refusal (tombstone clone preflight, orphan-share
+          # ownership or occupancy gates) lands in the recorded pass as
+          # skipped_refused. The 7h hold outlasts one 6-hourly pass, so a refusal
+          # that clears on the next pass does not page.
+          expr: max(scale_csi_tombstone_reap_last_skipped_refused{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > 0
+          for: 7h
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI guarded cleanup keeps refusing objects
+            description: The last recorded delete-capable pass refused to delete one or more objects and the refusal has persisted across passes. The CronJob log names each refused object and its reason.
+            runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
+        - alert: ScaleCSIReconcileDeleteDisabled
+          # The chart configured guarded cleanup, but the controller reports it
+          # off: the running config drifted from the release values.
+          expr: max(scale_csi_reconcile_delete_enabled{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) == 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: Scale CSI guarded cleanup is configured but reported disabled
+            description: reconcile.delete.enabled is true in the chart values but the controller exports scale_csi_reconcile_delete_enabled=0. Tombstones and orphans will accumulate.
             runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
         - alert: ScaleCSITombstoneReapNeverRan
           # delete.enabled=1 with no recorded pass: distinguished from a fresh

@@ -60,6 +60,18 @@ instead of writing. New metric:
   nvmet mutation ends in a `service.control RELOAD` under the per-service job
   lock `service_nvmet`, so the reloads serialize on the NAS anyway.
 
+### Alerts
+
+- `ScaleCSITombstoneBacklog` was `scale_csi_tombstone_snapshots > 0 for 48h`.
+  On any cluster whose backup tool mounts hourly snapshot clones (kopiur,
+  VolSync) the count is never zero, so it paged permanently. It is now a
+  count threshold (`metrics.prometheusRule.tombstoneBacklogThreshold`, default
+  500) held for 30m. The oldest-age and reap-staleness thresholds are
+  configurable as well (`tombstoneOldestAgeSeconds`, `tombstoneReapStaleSeconds`).
+- New bundled alerts, upstreamed from a production hand-written rule set:
+  `ScaleCSITombstoneReapRefusing`, `ScaleCSIReconcileDeleteDisabled` (both
+  gated on `reconcile.delete.enabled`) and `ScaleCSITombstoneUnknownAge`.
+
 ### Deferred items closed
 
 - `NVMeoFHostCreate` now re-reads by NQN after a failed create. Two concurrent

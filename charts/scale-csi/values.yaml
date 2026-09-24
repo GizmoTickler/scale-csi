@@ -1187,6 +1187,18 @@ metrics:
     # alert renders only when capacity.gaugeEnabled is also true (it needs the
     # scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes gauges).
     poolUsageThreshold: 0.85
+    # ScaleCSITombstoneBacklog fires when more than this many tombstones await
+    # reap for 30m. It used to fire on ANY backlog held for 48h, which pages
+    # permanently on a cluster whose backup tool (kopiur, VolSync) mounts
+    # hourly snapshot clones: those leave a steady tombstone inflow that is
+    # never zero. A stuck individual tombstone is ScaleCSITombstoneOldestStuck.
+    tombstoneBacklogThreshold: 500
+    # ScaleCSITombstoneOldestStuck: age in seconds of the oldest tombstone.
+    tombstoneOldestAgeSeconds: 86400
+    # ScaleCSITombstoneReapStale: seconds since the last recorded delete-capable
+    # pass. Default is two missed runs of the default 6-hourly CronJob; lower it
+    # alongside a tighter reconcile.delete.schedule.
+    tombstoneReapStaleSeconds: 43200
 
   # Grafana sidecar-discoverable dashboard ConfigMap
   dashboards:

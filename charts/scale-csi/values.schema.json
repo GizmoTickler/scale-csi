@@ -1673,6 +1673,21 @@
               "type": "number",
               "minimum": 0,
               "maximum": 1
+            },
+            "tombstoneBacklogThreshold": {
+              "description": "ScaleCSITombstoneBacklog fires above this many tombstones awaiting reap for 30m.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "tombstoneOldestAgeSeconds": {
+              "description": "ScaleCSITombstoneOldestStuck fires when the oldest tombstone is older than this many seconds.",
+              "type": "integer",
+              "minimum": 60
+            },
+            "tombstoneReapStaleSeconds": {
+              "description": "ScaleCSITombstoneReapStale fires when no delete-capable pass has been recorded for this many seconds.",
+              "type": "integer",
+              "minimum": 60
             }
           }
         },

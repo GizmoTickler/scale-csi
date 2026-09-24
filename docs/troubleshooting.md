@@ -485,6 +485,9 @@ annotations; the extra gated alerts follow the core table. Some alerts have no
 | `ScaleCSITombstoneBacklog` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
 | `ScaleCSITombstoneOldestStuck` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
 | `ScaleCSITombstoneReapCapped` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSITombstoneReapRefusing` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSIReconcileDeleteDisabled` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
+| `ScaleCSITombstoneUnknownAge` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
 | `ScaleCSITombstoneReapStale` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
 | `ScaleCSITombstoneReapNeverRan` | warning | [Tombstones that never drain](#tombstones-that-never-drain) |
 | `ScaleCSIReconcileStalled` | critical | [Clean Up Orphaned TrueNAS Resources](#clean-up-orphaned-truenas-resources) |
