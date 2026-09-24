@@ -31,7 +31,7 @@ var ErrNVMeUblkDaemonUnavailable = errors.New("nvmeublkd control socket is unava
 // nvmeUblkDevicePathRegex matches the whole-disk block device a ublk server
 // exposes. ublk has no partitions in this driver's use, so ublkbNpM is not a
 // staged device and is deliberately not matched.
-var nvmeUblkDevicePathRegex = regexp.MustCompile(`^ublkb[0-9]+$`)
+var nvmeUblkDevicePathRegex = regexp.MustCompile(`^ublkb\d+$`)
 
 // IsNVMeUblkDevice reports whether devicePath names a ublk block device
 // (/dev/ublkbN). The data behind such a device is served by a userspace

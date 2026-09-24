@@ -234,7 +234,7 @@ func stageSourceIdentity(shareType ShareType, volumeContext map[string]string) (
 	}
 }
 
-func verifyStageDeviceSource(devicePath string, shareType ShareType, volumeContext map[string]string) error {
+func (d *Driver) verifyStageDeviceSource(ctx context.Context, volumeID, devicePath string, shareType ShareType, volumeContext map[string]string) error {
 	switch shareType {
 	case ShareTypeNFS:
 		return status.Error(codes.AlreadyExists, "NFS staging target cannot contain a raw block device")
@@ -247,6 +247,11 @@ func verifyStageDeviceSource(devicePath string, shareType ShareType, volumeConte
 			return status.Errorf(codes.AlreadyExists, "staging target is backed by iSCSI target %s, requested %s", actualIQN, volumeContext["iqn"])
 		}
 	case ShareTypeNVMeoF:
+		// A ublk device has no kernel NVMe controller; the daemon serving it
+		// is the only source of its identity.
+		if util.IsNVMeUblkDevice(devicePath) {
+			return d.verifyNVMeUblkStageSource(ctx, volumeID, devicePath, volumeContext)
+		}
 		actualNQN, err := nodeGetNVMeInfo(devicePath)
 		if err != nil {
 			return status.Errorf(codes.Internal, "failed to identify staged NVMe-oF device %s: %v", devicePath, err)
@@ -258,7 +263,13 @@ func verifyStageDeviceSource(devicePath string, shareType ShareType, volumeConte
 	return nil
 }
 
+// handleExistingStage is handleExistingStageContext for callers without an
+// RPC context.
 func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType ShareType, capability nodeCapabilitySignature, expectedSource string) (bool, error) {
+	return d.handleExistingStageContext(context.Background(), req, shareType, capability, expectedSource)
+}
+
+func (d *Driver) handleExistingStageContext(ctx context.Context, req *csi.NodeStageVolumeRequest, shareType ShareType, capability nodeCapabilitySignature, expectedSource string) (bool, error) {
 	stagingPath := req.GetStagingTargetPath()
 	mounted, err := nodeIsMounted(stagingPath)
 	if err != nil {
@@ -310,7 +321,7 @@ func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType 
 			}
 			return true, status.Errorf(codes.Internal, "failed to resolve staged block device: %v", resolveErr)
 		}
-		if sourceErr := verifyStageDeviceSource(devicePath, shareType, req.GetVolumeContext()); sourceErr != nil {
+		if sourceErr := d.verifyStageDeviceSource(ctx, req.GetVolumeId(), devicePath, shareType, req.GetVolumeContext()); sourceErr != nil {
 			return true, sourceErr
 		}
 		liveSource = normalizeMountSource(devicePath)
@@ -329,7 +340,7 @@ func (d *Driver) handleExistingStage(req *csi.NodeStageVolumeRequest, shareType 
 				return true, status.Errorf(codes.AlreadyExists, "staging target %s has filesystem %s, requested NFS", stagingPath, mountInfo.FSType)
 			}
 		default:
-			if sourceErr := verifyStageDeviceSource(liveSource, shareType, req.GetVolumeContext()); sourceErr != nil {
+			if sourceErr := d.verifyStageDeviceSource(ctx, req.GetVolumeId(), liveSource, shareType, req.GetVolumeContext()); sourceErr != nil {
 				return true, sourceErr
 			}
 			if capability.FSType != "" && !strings.EqualFold(mountInfo.FSType, capability.FSType) {
@@ -646,7 +657,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	if err != nil {
 		return nil, err
 	}
-	if handled, existingErr := d.handleExistingStage(req, attachDriver, capability, expectedSource); handled {
+	if handled, existingErr := d.handleExistingStageContext(ctx, req, attachDriver, capability, expectedSource); handled {
 		if existingErr != nil {
 			return nil, existingErr
 		}
@@ -657,7 +668,12 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		case ShareTypeISCSI:
 			d.convergeExistingISCSIPaths(ctx, stageContext, req.GetSecrets(), stagingPath, eventObject)
 		case ShareTypeNVMeoF:
-			d.convergeExistingNVMeoFPaths(ctx, stageContext, eventObject)
+			// Kernel path convergence is for kernel controllers only; a
+			// volume staged on a ublk device has none, and the daemon runs
+			// its own multipath.
+			if !d.isNVMeUblkStaged(stagingPath) {
+				d.convergeExistingNVMeoFPaths(ctx, stageContext, eventObject)
+			}
 		}
 		klog.Infof("Volume %s is already staged compatibly at %s", volumeID, stagingPath)
 		return &csi.NodeStageVolumeResponse{}, nil
@@ -687,7 +703,15 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			return nil, err
 		}
 	case ShareTypeNVMeoF:
-		if err := d.stageNVMeoFVolume(ctx, stageContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+		dataPath, dataPathErr := d.nvmeoFDataPathForVolume(stageContext)
+		if dataPathErr != nil {
+			return nil, dataPathErr
+		}
+		if dataPath == NVMeoFDataPathUblk {
+			if err := d.stageNVMeoFUblkVolume(ctx, volumeID, stageContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
+				return nil, err
+			}
+		} else if err := d.stageNVMeoFVolume(ctx, stageContext, stagingPath, req.GetVolumeCapability(), eventObject); err != nil {
 			return nil, err
 		}
 	default:
@@ -699,7 +723,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	// which an external mount could appear after the initial idempotency check;
 	// the protocol helpers' legacy mounted fast paths cannot bypass compatibility
 	// validation.
-	if handled, existingErr := d.handleExistingStage(req, attachDriver, capability, expectedSource); handled {
+	if handled, existingErr := d.handleExistingStageContext(ctx, req, attachDriver, capability, expectedSource); handled {
 		if existingErr != nil {
 			return nil, existingErr
 		}
@@ -808,6 +832,17 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		if err := os.RemoveAll(stagingPath); err != nil {
 			klog.Warningf("Failed to remove staging directory: %v", err)
 		}
+	}
+
+	// The userspace NVMe/TCP data path holds no kernel session: detach the
+	// volume from nvmeublkd by volume ID and return before the kernel cleanup
+	// below, whose device-name heuristics were never meant for /dev/ublkbN.
+	if handled, ublkErr := d.unstageNVMeoFUblkVolume(ctx, volumeID, devicePath); ublkErr != nil {
+		return nil, ublkErr
+	} else if handled {
+		d.deleteStageRecord(stagingPath)
+		klog.V(2).Infof("Volume %s unstaged successfully", volumeID)
+		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
 	// A raw-block staging symlink contains a literal /dev name that can become
@@ -1087,7 +1122,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 				return nil, status.Errorf(codes.Internal, "staging path did not resolve to a block device: %s", devicePath)
 			}
 			shareType := d.nodeAttachDriver(req.GetVolumeContext())
-			if ownershipErr := d.validateRawBlockDeviceOwnership(volumeID, devicePath, shareType); ownershipErr != nil {
+			if ownershipErr := d.validateRawBlockDeviceOwnership(ctx, volumeID, devicePath, shareType); ownershipErr != nil {
 				return nil, ownershipErr
 			}
 
@@ -1374,6 +1409,12 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 		return nil, status.Errorf(codes.Internal, "failed to resolve expansion device: %v", err)
 	}
 
+	// A ublk device is neither a kernel NVMe namespace nor a SCSI disk, and
+	// has no rescan: it takes its own path.
+	if util.IsNVMeUblkDevice(devicePath) {
+		return d.expandNVMeUblkVolume(ctx, volumeID, volumePath, devicePath, rawBlock, capacityBytes)
+	}
+
 	shareType := blockTransportForDevice(devicePath, d.config.GetDriverShareType())
 	if shareType.IsBlockProtocol() {
 		if devicePath == "" {
@@ -1381,7 +1422,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 		}
 
 		if rawBlock {
-			if ownershipErr := d.validateRawBlockDeviceOwnership(volumeID, devicePath, shareType); ownershipErr != nil {
+			if ownershipErr := d.validateRawBlockDeviceOwnership(ctx, volumeID, devicePath, shareType); ownershipErr != nil {
 				return nil, ownershipErr
 			}
 		}
@@ -1446,7 +1487,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 	}, nil
 }
 
-func (d *Driver) validateRawBlockDeviceOwnership(volumeID, devicePath string, shareType ShareType) error {
+func (d *Driver) validateRawBlockDeviceOwnership(ctx context.Context, volumeID, devicePath string, shareType ShareType) error {
 	switch shareType {
 	case ShareTypeISCSI:
 		_, iqn, err := nodeGetISCSIInfo(devicePath)
@@ -1460,6 +1501,9 @@ func (d *Driver) validateRawBlockDeviceOwnership(volumeID, devicePath string, sh
 				devicePath, iqn, expected)
 		}
 	case ShareTypeNVMeoF:
+		if util.IsNVMeUblkDevice(devicePath) {
+			return d.validateNVMeUblkRawBlockOwnership(ctx, volumeID, devicePath)
+		}
 		nqn, err := nodeGetNVMeInfo(devicePath)
 		if err != nil {
 			return status.Errorf(codes.Internal, "failed to identify NVMe-oF session for raw block device %s: %v", devicePath, err)
@@ -2338,6 +2382,14 @@ func (d *Driver) nvmeConnectOptions(deviceTimeout time.Duration) *util.NVMeoFCon
 func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string]string, stagingPath string, volCap *csi.VolumeCapability, eventObjects ...runtime.Object) error {
 	if volumeContext == nil {
 		return status.Error(codes.InvalidArgument, "volume context is required for NVMe-oF staging")
+	}
+	// The kernel path must never connect a volume that selected the
+	// userspace data path; NodeStageVolume routes those to
+	// stageNVMeoFUblkVolume.
+	if dataPath, dataPathErr := d.nvmeoFDataPathForVolume(volumeContext); dataPathErr != nil {
+		return dataPathErr
+	} else if dataPath == NVMeoFDataPathUblk {
+		return status.Error(codes.Internal, "NVMe-oF volume selects the ublk data path; refusing to connect it with the kernel initiator")
 	}
 	nqn := volumeContext["nqn"]
 	transport := volumeContext["transport"]

@@ -336,3 +336,54 @@ func discoverNodeIdentity(ctx context.Context, nodeName string) NodeIdentity {
 	identity.IPs = canonicalNodeIPs(identity.IPs)
 	return identity
 }
+
+// nodeNVMeHostIDFiles are read in order for the node's NVMe host ID. The node
+// plugin mounts the host root at /host; the unprefixed path covers an image
+// that bind-mounts /etc/nvme directly.
+var nodeNVMeHostIDFiles = []string{"/host/etc/nvme/hostid", "/etc/nvme/hostid"}
+
+// nodeNVMeHostID returns the NVMe host ID the node's own `nvme connect` would
+// use alongside hostNQN, so a userspace initiator presents the same identity
+// as the kernel one. The configured /etc/nvme/hostid wins; otherwise the ID
+// is the UUID of a UUID-form host NQN (nqn.2014-08.org.nvmexpress:uuid:<id>),
+// which is how nvme-cli derives it when the file is absent (the case on
+// Flatcar). A present but malformed file is an error rather than a fallback:
+// the kernel path would present that file's value, not the derived one.
+func nodeNVMeHostID(hostNQN string) (string, error) {
+	for _, path := range nodeNVMeHostIDFiles {
+		contents, err := nodeReadIdentityFile(path)
+		if err != nil {
+			continue
+		}
+		raw := strings.TrimSpace(string(contents))
+		if raw == "" {
+			continue
+		}
+		hostID, ok := canonicalNVMeHostID(raw)
+		if !ok {
+			return "", fmt.Errorf("%s does not hold a UUID host ID: %q", path, raw)
+		}
+		return hostID, nil
+	}
+	if _, uuid, found := strings.Cut(strings.TrimSpace(hostNQN), ":uuid:"); found {
+		if hostID, ok := canonicalNVMeHostID(uuid); ok {
+			return hostID, nil
+		}
+	}
+	return "", fmt.Errorf("no NVMe host ID: /etc/nvme/hostid is absent and host NQN %q is not UUID-based", hostNQN)
+}
+
+// canonicalNVMeHostID returns raw as a lower-case 8-4-4-4-12 UUID, accepting
+// any dash placement or none, or ok=false when raw is not 32 hex digits.
+func canonicalNVMeHostID(raw string) (string, bool) {
+	hex := strings.ReplaceAll(strings.ToLower(raw), "-", "")
+	if len(hex) != 32 {
+		return "", false
+	}
+	for _, c := range hex {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return hex[0:8] + "-" + hex[8:12] + "-" + hex[12:16] + "-" + hex[16:20] + "-" + hex[20:32], true
+}
