@@ -52,6 +52,27 @@ instead of writing. New metric:
 `--nr-io-queues` cannot be changed on a live controller; a new
 `nvmeof.connect.nrIOQueues` still needs a restage to take effect.
 
+### Session GC and error classification (independent verification)
+
+Seven rounds of independent verification (codex gpt-6-astra) found problems in
+this branch and in older code. All of them are fixed, and each fix has a test
+that fails on the code before it:
+
+- **Session GC can no longer disconnect an in-use volume on missing
+  evidence.** A `findmnt` read failure used to count as "no mounts". Up to two
+  failed device-identity lookups were tolerated, and a mounted dm map or
+  partition whose identity could not be resolved was dropped because its name
+  looked "unlikely". Now any unknown device skips that protocol's pass.
+  Partitions resolve to their parent disk. A dm map whose slaves are all local
+  counts as local, which keeps GC running on Flatcar's `/dev/mapper/usr`.
+- The block-mount inventory keeps every mount point per device (the staging
+  mount and the pod bind mount). It parses `findmnt -r`, which decodes escaped
+  whitespace and strips `[/subdir]` source decorations.
+- A structured errno nested inside an error (a dependency's errno, not the
+  call's own) can only veto a verdict. It is never read as the call's result,
+  so it can no longer turn a failed delete, snapshot lookup, hold or release
+  into a silent success.
+
 ### Performance
 
 - `nvmet.namespace.query` now passes `extra.retrieve_locked_info=false`. The
