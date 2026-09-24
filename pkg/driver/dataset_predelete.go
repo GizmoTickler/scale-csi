@@ -2,8 +2,11 @@ package driver
 
 import (
 	"context"
+	"sync"
 
 	"k8s.io/klog/v2"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
 
 func (d *Driver) deleteDatasetWithBusyObservation(
@@ -24,11 +27,32 @@ func (d *Driver) deleteDatasetWithBusyObservation(
 // byte-identical (empty) logs and metrics. Errors now log at Warning and
 // increment their own counter, while the observation counter is recorded even
 // at zero so the quiet case has a series of its own.
+//
+// The two reads are independent and observation-only, so they run
+// concurrently: pool.dataset.attachments (~570ms on nas01) and
+// pool.dataset.processes (~210ms) used to add up on every DeleteVolume.
 func (d *Driver) observeDatasetBusyBeforeDelete(ctx context.Context, datasetName, operation string) {
-	attachments, err := d.truenasClient.DatasetAttachments(ctx, datasetName)
-	if err != nil {
+	var (
+		wg           sync.WaitGroup
+		attachments  []truenas.DatasetAttachment
+		attachErr    error
+		processes    []truenas.DatasetProcess
+		processesErr error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		attachments, attachErr = d.truenasClient.DatasetAttachments(ctx, datasetName)
+	}()
+	go func() {
+		defer wg.Done()
+		processes, processesErr = d.truenasClient.DatasetProcesses(ctx, datasetName)
+	}()
+	wg.Wait()
+
+	if attachErr != nil {
 		RecordDatasetBusyObservationError("attachment")
-		klog.Warningf("Could not inspect dataset %s attachments before %s delete: %v", datasetName, operation, err)
+		klog.Warningf("Could not inspect dataset %s attachments before %s delete: %v", datasetName, operation, attachErr)
 	} else {
 		RecordDatasetBusyObservations("attachment", len(attachments))
 		for _, attachment := range attachments {
@@ -37,10 +61,9 @@ func (d *Driver) observeDatasetBusyBeforeDelete(ctx context.Context, datasetName
 		}
 	}
 
-	processes, err := d.truenasClient.DatasetProcesses(ctx, datasetName)
-	if err != nil {
+	if processesErr != nil {
 		RecordDatasetBusyObservationError("process")
-		klog.Warningf("Could not inspect dataset %s processes before %s delete: %v", datasetName, operation, err)
+		klog.Warningf("Could not inspect dataset %s processes before %s delete: %v", datasetName, operation, processesErr)
 		return
 	}
 	RecordDatasetBusyObservations("process", len(processes))
