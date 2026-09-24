@@ -1904,3 +1904,82 @@ func TestGetISCSIInfoDistinguishesLocalDiskFromFailedLookup(t *testing.T) {
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrNotISCSIDevice, "an unresolvable device is a failed lookup, not proof it is local")
 }
+
+// fakeBlockSysfs builds sys/block, sys/class/block and sys/devices under root.
+type fakeBlockSysfs struct{ root string }
+
+func (f fakeBlockSysfs) sysBlock() string { return filepath.Join(f.root, "sys", "block") }
+
+// disk adds a whole disk whose device node resolves under devicePath (relative
+// to sys/devices), with optional partitions.
+func (f fakeBlockSysfs) disk(t *testing.T, name, devicePath string, partitions ...string) {
+	t.Helper()
+	dev := filepath.Join(f.root, "sys", "devices", devicePath)
+	blockDir := filepath.Join(dev, "block", name)
+	require.NoError(t, os.MkdirAll(blockDir, 0o750))
+	require.NoError(t, os.MkdirAll(f.sysBlock(), 0o750))
+	require.NoError(t, os.Symlink(blockDir, filepath.Join(f.sysBlock(), name)))
+	require.NoError(t, os.Symlink(dev, filepath.Join(blockDir, "device")))
+	classBlock := filepath.Join(f.root, "sys", "class", "block")
+	require.NoError(t, os.MkdirAll(classBlock, 0o750))
+	require.NoError(t, os.Symlink(blockDir, filepath.Join(classBlock, name)))
+	for _, part := range partitions {
+		partDir := filepath.Join(blockDir, part)
+		require.NoError(t, os.MkdirAll(partDir, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(partDir, "partition"), []byte("1\n"), 0o600))
+		require.NoError(t, os.Symlink(partDir, filepath.Join(classBlock, part)))
+	}
+}
+
+// dm adds a device-mapper map with the given slaves.
+func (f fakeBlockSysfs) dm(t *testing.T, name string, slaves ...string) {
+	t.Helper()
+	dir := filepath.Join(f.root, "sys", "devices", "virtual", "block", name)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "slaves"), 0o750))
+	require.NoError(t, os.MkdirAll(f.sysBlock(), 0o750))
+	require.NoError(t, os.Symlink(dir, filepath.Join(f.sysBlock(), name)))
+	for _, slave := range slaves {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "slaves", slave), nil, 0o600))
+	}
+}
+
+func (f fakeBlockSysfs) lookup(device string) error {
+	_, _, err := getISCSIInfoFromDeviceWithSessionsInPaths(device, nil, f.sysBlock(),
+		filepath.Join(f.root, "sys", "class", "iscsi_session"), filepath.Join(f.root, "dev"))
+	return err
+}
+
+// Round-6 verifier N7 (codex, 2026-09-24): partitions and dm maps must resolve
+// to a positive verdict or stay unknown; they must never fall through as
+// "unlikely" while their identity is actually unresolved.
+func TestISCSIIdentityResolvesPartitionsAndDMStacks(t *testing.T) {
+	f := fakeBlockSysfs{root: t.TempDir()}
+	f.disk(t, "sda", "pci0000:00/ata1/host0/target0:0:0/0:0:0:0", "sda3", "sda9")
+	f.dm(t, "dm-0", "sda3")        // Flatcar /dev/mapper/usr: verity over a local partition
+	f.dm(t, "dm-1", "sda3", "sdq") // one slave whose identity cannot be read
+	f.dm(t, "dm-2")                // no slaves at all
+
+	assert.Equal(t, f.root+"/dev/sda", blockDeviceParentAt(filepath.Join(f.root, "sys", "class", "block"), f.root+"/dev/sda9"))
+	assert.Equal(t, "/dev/sda", blockDeviceParentAt(filepath.Join(f.root, "sys", "class", "block"), "/dev/sda"))
+
+	require.ErrorIs(t, f.lookup("/dev/sda9"), ErrNotISCSIDevice, "a local disk's partition is local")
+	require.ErrorIs(t, f.lookup("/dev/dm-0"), ErrNotISCSIDevice, "a map whose slaves are all local is local")
+	for _, unknown := range []string{"/dev/dm-1", "/dev/dm-2"} {
+		err := f.lookup(unknown)
+		require.Error(t, err, unknown)
+		assert.NotErrorIs(t, err, ErrNotISCSIDevice, "%s has an unresolved slave set and must stay unknown", unknown)
+	}
+}
+
+// A bounded ancestry walk that runs out before the sysfs root proves nothing.
+func TestISCSIIdentityExhaustedWalkIsNotLocal(t *testing.T) {
+	f := fakeBlockSysfs{root: t.TempDir()}
+	deep := "pci0000:00"
+	for i := 0; i < 70; i++ {
+		deep = filepath.Join(deep, "x")
+	}
+	f.disk(t, "sdd", deep)
+	err := f.lookup("/dev/sdd")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNotISCSIDevice)
+}

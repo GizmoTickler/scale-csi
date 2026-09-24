@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,7 @@ const kubeletCSIStagingRoot = "/var/lib/kubelet/plugins/kubernetes.io/csi"
 var (
 	getMountedBlockDevices = util.GetMountedBlockDevices
 	getBlockDeviceMounts   = util.GetBlockDeviceMounts
+	blockDeviceParent      = util.BlockDeviceParent
 	getStagedBlockDevices  = func() (map[string]string, error) {
 		return util.GetStagedBlockDevices(kubeletCSIStagingRoot)
 	}
@@ -1350,9 +1352,11 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 			return "", false, true
 		}
 		if err != nil {
-			// iSCSI devices are typically sd[a-z]+ (not nvme*, loop*, etc); only a
-			// likely-iSCSI device's failed lookup should count toward the threshold.
-			likely := util.IsLikelyISCSIDevice(device)
+			// An unresolved identity is UNKNOWN, not "unlikely": a dm map whose
+			// uuid could not be read, or a device of an unexpected shape, may
+			// still sit on an iSCSI session (codex round-6 N7). Only device
+			// classes that can never be iSCSI-backed are excluded.
+			likely := !util.IsPositivelyNotISCSIBackable(device)
 			if likely {
 				klog.V(4).Infof("Session GC: failed to get iSCSI info for %s (may be race condition): %v", device, err)
 			}
@@ -1371,9 +1375,14 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
 	return d.expectedStagedSessions("NVMe", func(device string) (string, bool, bool) {
 		// Check if this device is an NVMe device.
-		nqn, err := getNVMeInfoFromDevice(device)
+		// A mounted partition (nvme0n1p1) is resolved to its namespace first;
+		// the NQN lookup only understands whole namespaces (codex round-6 N7).
+		namespace := blockDeviceParent(device)
+		nqn, err := getNVMeInfoFromDevice(namespace)
 		if err != nil {
-			likely := util.IsLikelyNVMeDevice(device)
+			// Fabric namespaces are always nvme*: any nvme* device whose
+			// identity is unreadable is unknown and vetoes the pass.
+			likely := strings.HasPrefix(filepath.Base(namespace), "nvme")
 			if likely {
 				klog.V(4).Infof("Session GC: failed to get NVMe info for %s (may be race condition): %v", device, err)
 			}
