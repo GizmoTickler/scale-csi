@@ -230,38 +230,6 @@ func TestEncryptionPropsStampsOnlyAlgorithm(t *testing.T) {
 	assert.Nil(t, encryptionProps(context.Background()), "plaintext create stamps nothing")
 }
 
-// TestVolumeConditionFromDatasetLocked proves the E-3 §2 health signal slots into
-// the dataset-level layer: a locked encrypted dataset is Abnormal; an unlocked or
-// plaintext dataset is not flagged by this arm.
-func TestVolumeConditionFromDatasetLocked(t *testing.T) {
-	t.Run("locked encrypted dataset is abnormal", func(t *testing.T) {
-		ds := &truenas.Dataset{Encrypted: true, Locked: true, KeyLoaded: false,
-			UserProperties: map[string]truenas.UserProperty{
-				PropManagedResource:  {Value: "true", Source: "local"},
-				PropProvisionSuccess: {Value: "true", Source: "local"},
-			}}
-		condition := volumeConditionFromDataset(ds)
-		assert.True(t, condition.GetAbnormal())
-		assert.Contains(t, condition.GetMessage(), "locked")
-	})
-	t.Run("unlocked encrypted dataset is normal", func(t *testing.T) {
-		ds := &truenas.Dataset{Encrypted: true, Locked: false, KeyLoaded: true,
-			UserProperties: map[string]truenas.UserProperty{
-				PropManagedResource:  {Value: "true", Source: "local"},
-				PropProvisionSuccess: {Value: "true", Source: "local"},
-			}}
-		assert.False(t, volumeConditionFromDataset(ds).GetAbnormal())
-	})
-	t.Run("plaintext dataset never takes the encryption arm", func(t *testing.T) {
-		ds := &truenas.Dataset{Encrypted: false, Locked: false,
-			UserProperties: map[string]truenas.UserProperty{
-				PropManagedResource:  {Value: "true", Source: "local"},
-				PropProvisionSuccess: {Value: "true", Source: "local"},
-			}}
-		assert.False(t, volumeConditionFromDataset(ds).GetAbnormal())
-	})
-}
-
 // encryptionTestDriver builds a controller-side driver wired to a call-counting
 // mock with encryption enabled, for the publish-unlock tests.
 func encryptionTestDriver() (*Driver, *apiCallCountingClient) {

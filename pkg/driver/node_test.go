@@ -206,7 +206,7 @@ func TestNodeGetCapabilities(t *testing.T) {
 	assert.True(t, capTypes[csi.NodeServiceCapability_RPC_GET_VOLUME_STATS], "should have GET_VOLUME_STATS")
 	assert.True(t, capTypes[csi.NodeServiceCapability_RPC_EXPAND_VOLUME], "should have EXPAND_VOLUME")
 	assert.True(t, capTypes[csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER], "should have SINGLE_NODE_MULTI_WRITER")
-	assert.True(t, capTypes[csi.NodeServiceCapability_RPC_VOLUME_CONDITION], "should have VOLUME_CONDITION")
+	assert.Len(t, capTypes, len(resp.GetCapabilities()), "no duplicate capabilities")
 }
 
 func TestNodeGetInfo(t *testing.T) {
@@ -1038,8 +1038,6 @@ func TestNodeGetVolumeStats_BlockMode(t *testing.T) {
 	require.Len(t, resp.Usage, 1)
 	assert.Equal(t, int64(8<<30), resp.Usage[0].Total)
 	assert.Equal(t, csi.VolumeUsage_BYTES, resp.Usage[0].Unit)
-	require.NotNil(t, resp.VolumeCondition)
-	assert.False(t, resp.VolumeCondition.Abnormal)
 }
 
 func TestNodeStatsDeviceSizeRejectsSectorOverflow(t *testing.T) {
@@ -1082,7 +1080,6 @@ func TestNodeGetVolumeStats_FilesystemModeUnchanged(t *testing.T) {
 	require.Len(t, resp.Usage, 2)
 	assert.Equal(t, int64(100), resp.Usage[0].Total)
 	assert.Equal(t, int64(10), resp.Usage[1].Total)
-	assert.False(t, resp.VolumeCondition.Abnormal)
 }
 
 // TestNodeGetVolumeStats_MountUnresponsiveIsAbnormal proves the bounded liveness
@@ -1113,10 +1110,10 @@ func TestNodeGetVolumeStats_MountUnresponsiveIsAbnormal(t *testing.T) {
 	resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
 		VolumeId: "fs-vol", VolumePath: "/pods/fs-vol",
 	})
-	require.NoError(t, err)
-	require.NotNil(t, resp.VolumeCondition)
-	assert.True(t, resp.VolumeCondition.Abnormal)
-	assert.Contains(t, resp.VolumeCondition.Message, "mount unresponsive")
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "mount unresponsive")
 }
 
 // TestNodeGetVolumeStats_PregateRunsBeforeStat exercises the REAL device
@@ -1168,10 +1165,9 @@ func TestNodeGetVolumeStats_PregateRunsBeforeStat(t *testing.T) {
 
 	select {
 	case res := <-done:
-		require.NoError(t, res.err)
-		require.NotNil(t, res.resp.VolumeCondition)
-		assert.True(t, res.resp.VolumeCondition.Abnormal)
-		assert.Contains(t, res.resp.VolumeCondition.Message, "mount unresponsive")
+		require.Error(t, res.err)
+		assert.Equal(t, codes.Internal, status.Code(res.err))
+		assert.Contains(t, res.err.Error(), "mount unresponsive")
 	case <-time.After(2 * time.Second):
 		t.Fatal("NodeGetVolumeStats hung: the bounded pre-gate did not run before the blocking stat")
 	}
@@ -1200,10 +1196,10 @@ func TestNodeGetVolumeStats_StatFailureIsAbnormal(t *testing.T) {
 	resp, err := d.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
 		VolumeId: "fs-vol", VolumePath: "/pods/fs-vol",
 	})
-	require.NoError(t, err)
-	require.NotNil(t, resp.VolumeCondition)
-	assert.True(t, resp.VolumeCondition.Abnormal)
-	assert.Contains(t, resp.VolumeCondition.Message, "injected stat failure")
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "injected stat failure")
 }
 
 func TestNodeExpandVolume_Validation(t *testing.T) {

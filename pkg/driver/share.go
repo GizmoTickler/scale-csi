@@ -246,7 +246,7 @@ func isNVMeoFHostNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if _, structured := truenas.APIErrno(err); structured {
+	if truenas.HasStructuredErrno(err) {
 		return truenas.IsNotFoundError(err)
 	}
 	message := strings.ToLower(err.Error())

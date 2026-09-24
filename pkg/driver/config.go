@@ -63,9 +63,11 @@ type Config struct {
 	// gauge loop. The zero value disables every capacity feature.
 	Capacity CapacityConfig `yaml:"capacity"`
 
-	// BackendHealth configures the read-only pool-health poller that drives
-	// per-PVC VolumeCondition and the scale_csi_pool_* health gauges.
-	BackendHealth BackendHealthConfig `yaml:"backendHealth"`
+	// BackendHealth is DEPRECATED and has no effect. The pool-health poller fed
+	// the CSI VolumeCondition field, which spec v1.13 removed. The key is still
+	// decoded so strict YAML parsing of an older configmap does not fail;
+	// LoadConfig logs a deprecation warning when it is set.
+	BackendHealth DeprecatedBackendHealthConfig `yaml:"backendHealth"`
 
 	// Health configures the driver's HTTP health-check cache. The cache is
 	// deliberately independent from backend-health polling.
@@ -742,27 +744,10 @@ func (c CapacityConfig) GaugeIntervalDuration() (time.Duration, error) {
 	return interval, nil
 }
 
-// BackendHealthConfig configures the controller-only backend-health poller.
-type BackendHealthConfig struct {
-	// Enabled starts a READ-ONLY poll loop that samples the parent dataset's pool
-	// health (pool.query) plus its member disks' temperature alerts
-	// (disk.temperature_alerts), fans the result out onto every managed volume's
-	// CSI VolumeCondition, and publishes the scale_csi_pool_* gauges.
-	//
-	// DEFAULT OFF. Enabling it costs at most TWO reads per Interval per
-	// controller and performs no writes at all; leaving it off keeps
-	// VolumeCondition semantics byte-identical to the pre-GF5 driver.
-	Enabled bool `yaml:"enabled"`
-
-	// Interval is the poll cadence, clamped to [minBackendHealthInterval,
-	// maxBackendHealthInterval]. Default (empty) resolves to 60s.
-	//
-	// There is deliberately NO IntervalDuration() method on this type. The
-	// effective cadence is derived in exactly ONE place —
-	// Driver.resolveBackendHealthInterval — so the poll loop and the staleness TTL
-	// cannot disagree about it. The method that used to live here applied the
-	// floor but not the CEILING, which is exactly the disagreement that single
-	// resolver exists to prevent.
+// DeprecatedBackendHealthConfig keeps the retired backendHealth block
+// parseable. Neither field has any effect.
+type DeprecatedBackendHealthConfig struct {
+	Enabled  bool   `yaml:"enabled"`
 	Interval string `yaml:"interval"`
 }
 
@@ -1242,6 +1227,10 @@ var deprecatedConfigKeys = []struct {
 	{
 		path:    []string{"nvmeof", "nameTemplate"},
 		warning: "nvmeof.nameTemplate is deprecated and has no effect",
+	},
+	{
+		path:    []string{"backendHealth"},
+		warning: "backendHealth is deprecated and has no effect; CSI spec v1.13 removed the VolumeCondition it fed",
 	},
 	{
 		path:    []string{"nvmeof", "commandTimeout"},

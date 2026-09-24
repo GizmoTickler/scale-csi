@@ -553,13 +553,6 @@ func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabi
 				},
 			},
 		},
-		{
-			Type: &csi.NodeServiceCapability_Rpc{
-				Rpc: &csi.NodeServiceCapability_RPC{
-					Type: csi.NodeServiceCapability_RPC_VOLUME_CONDITION,
-				},
-			},
-		},
 	}
 
 	return &csi.NodeGetCapabilitiesResponse{
@@ -1260,7 +1253,7 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 	// the check returns not-mounted with no error and falls through to the fast
 	// local device stat. No new TrueNAS API calls are involved.
 	if _, mountErr := nodeStatsMountCheck(ctx, volumePath); mountErr != nil {
-		return abnormalVolumeStatsResponse(fmt.Sprintf("mount unresponsive for %s: %v", volumePath, mountErr)), nil
+		return nil, volumeStatsError(fmt.Sprintf("mount unresponsive for %s: %v", volumePath, mountErr))
 	}
 
 	devicePath, blockMode, err := resolveNodeStatsDevice(volumePath)
@@ -1268,26 +1261,25 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, status.Errorf(codes.NotFound, "volume path %s does not exist", volumePath)
 		}
-		return abnormalVolumeStatsResponse(fmt.Sprintf("failed to inspect volume path %s: %v", volumePath, err)), nil
+		return nil, volumeStatsError(fmt.Sprintf("failed to inspect volume path %s: %v", volumePath, err))
 	}
 	if blockMode {
 		totalBytes, sizeErr := getNodeDeviceSize(devicePath)
 		if sizeErr != nil {
-			return abnormalVolumeStatsResponse(fmt.Sprintf("failed to get block device size for %s: %v", devicePath, sizeErr)), nil
+			return nil, volumeStatsError(fmt.Sprintf("failed to get block device size for %s: %v", devicePath, sizeErr))
 		}
 		return &csi.NodeGetVolumeStatsResponse{
 			Usage: []*csi.VolumeUsage{{
 				Total: totalBytes,
 				Unit:  csi.VolumeUsage_BYTES,
 			}},
-			VolumeCondition: &csi.VolumeCondition{Abnormal: false},
 		}, nil
 	}
 
 	// Get filesystem stats (mount liveness was already gated above, before stat).
 	stats, err := getNodeFilesystemStats(volumePath)
 	if err != nil {
-		return abnormalVolumeStatsResponse(fmt.Sprintf("failed to get filesystem stats for %s: %v", volumePath, err)), nil
+		return nil, volumeStatsError(fmt.Sprintf("failed to get filesystem stats for %s: %v", volumePath, err))
 	}
 
 	return &csi.NodeGetVolumeStatsResponse{
@@ -1305,17 +1297,14 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 				Unit:      csi.VolumeUsage_INODES,
 			},
 		},
-		VolumeCondition: &csi.VolumeCondition{Abnormal: false},
 	}, nil
 }
 
-func abnormalVolumeStatsResponse(message string) *csi.NodeGetVolumeStatsResponse {
-	return &csi.NodeGetVolumeStatsResponse{
-		VolumeCondition: &csi.VolumeCondition{
-			Abnormal: true,
-			Message:  message,
-		},
-	}
+// volumeStatsError reports a volume whose stats cannot be read. CSI spec v1.13
+// removed the alpha VolumeCondition this used to carry as an OK response, so the
+// failure is now an Internal error kubelet logs and retries on its next poll.
+func volumeStatsError(message string) error {
+	return status.Error(codes.Internal, message)
 }
 
 func nodeStatsDevice(volumePath string) (devicePath string, blockMode bool, err error) {

@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -204,26 +203,4 @@ func TestReconcileUnlocksLockedVolumeUnderTheQueryProjection(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, unlocked.Locked)
 	assert.Empty(t, eventsContainingReason(drainEvents(recorder), EventReasonEncryptionUnlockFailed))
-}
-
-// TestVolumeConditionSeesALockedVolumeUnderTheQueryProjection covers the other
-// silent consequence: the health surface reports a locked volume as abnormal by
-// reading the WIRE booleans (ds.Encrypted && ds.Locked) off the same projected
-// query. Under the pre-fix projection a locked, dead-I/O volume reported healthy.
-func TestVolumeConditionSeesALockedVolumeUnderTheQueryProjection(t *testing.T) {
-	const name = "pool/parent/enc-projected-health"
-	const passphrase = "unlock-me-123"
-
-	ctx := context.Background()
-	_, client := projectionModelingDriver(t)
-	createEncryptedDataset(t, client, name, passphrase)
-	require.NoError(t, client.DatasetLock(ctx, name))
-
-	ds, err := client.DatasetGet(ctx, name)
-	require.NoError(t, err)
-	condition := volumeConditionFromDataset(ds)
-	require.NotNil(t, condition)
-	assert.True(t, condition.GetAbnormal(), "a locked volume serves zero I/O and must not report healthy")
-	assert.True(t, strings.Contains(strings.ToLower(condition.GetMessage()), "lock"),
-		"the message must name the reason: %q", condition.GetMessage())
 }

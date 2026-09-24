@@ -52,108 +52,6 @@ capacity:
   # Poll cadence for the capacity gauge loop. Values below 30s are clamped to it.
   gaugeInterval: 60s
 
-# Backend health -> per-PVC VolumeCondition + scale_csi_pool_* gauges.
-#
-# ZFS exposes NO per-dataset health signal: health is a per-POOL fact (plus
-# per-disk temperature). Every volume this driver manages lives on ONE pool, so
-# a pool condition is legitimately attributable to all of them and is fanned out
-# onto every managed PVC's CSI VolumeCondition, which the external health
-# monitor turns into PVC events.
-#
-# Severity is deliberately conservative: DEGRADED/FAULTED/UNAVAIL marks volumes
-# Abnormal, while a routine scrub/resilver or a disk temperature alert only adds
-# a descriptive message — a monthly scrub must never mark every PVC unhealthy.
-#
-# STEADY-STATE API COST when enabled: at most TWO reads (pool.query +
-# disk.temperature_alerts) per interval PER CONTROLLER REPLICA, and zero writes.
-# Like the capacity gauge loop it has no leader-election gate; the supported
-# configuration is controller.replicas=1; Helm rejects a larger replica count.
-# maxSurge 0 only covers rollout surge — Deployment termination, drain and
-# eviction overlap remain an inherent residual detected by the skew alert, not
-# prevented by this chart. No effect on the CreateVolume /
-# publish / unpublish request-path golden totals.
-#
-# The fan-out is damped so a flapping or unreachable backend cannot churn every
-# PVC. Metrics always carry the RAW sample; only the VolumeCondition is damped:
-#   * hysteresis — a health transition must be confirmed by TWO consecutive
-#     samples before it flips every managed PVC's condition;
-#   * staleness TTL — after three missed intervals the cached snapshot stops
-#     driving CONDITIONS at all (they fall back to the pre-GF5 dataset-only
-#     semantics) and scale_csi_pool_health_stale goes to 1. This bounds how long
-#     a stale verdict can drive PVC conditions; it does NOT silence alerting.
-#     The raw gauges stay FROZEN at their last sample, so a frozen DEGRADED keeps
-#     ScaleCSIPoolDegraded firing until a successful sample changes it — that
-#     alert is deliberately not gated on scale_csi_pool_health_stale.
-#
-# BECAUSE the condition is damped, the gauges are not, the alerts add their own
-# `for` hold on top of the gauges AND Prometheus observes all of it on its own
-# scrape/evaluation cadence, these views DO differ transiently — they share one
-# severity split, not one timeline. There are SEVEN NUMBERED classes of divergence;
-# the first three have an upper bound, the last four do not (canonical list:
-# backendHealthFlipSamples in pkg/driver/backend_health.go):
-#   1. confirmation lag — BOUNDED: a confirmed transition reaches the DRIVER's own
-#      published condition up to one poll interval plus one 30s call timeout
-#      after the gauges (<= 2m30s at the ceiling), which stays inside the 5m
-#      ScaleCSIPoolDegraded hold. That bounds DRIVER-SIDE PUBLICATION only —
-#      the PVC object and the alert are downstream of it and outside this
-#      number entirely. flip_pending = 1;
-#   2. alert hold — BOUNDED by the rule's own 5m `for`: once the condition
-#      confirms, PVCs read Abnormal while ScaleCSIPoolDegraded is still PENDING.
-#      The ceiling CREATES this ordering rather than removing it, and BOTH
-#      diagnostic gauges read 0 here — use the alert's pending state, not them;
-#   3. recovery — BOUNDED, one sample: the raw degraded gauge clears one sample
-#      BEFORE the condition, by design. flip_pending = 1;
-#   4. poll stall — UNBOUNDED: it lasts until a SUCCESSFUL USABLE sample arrives.
-#      A reply is not a usable sample: a valid pool.query that does not list the
-#      pool returns `pool ... not found` and is still a failed sample.
-#      The condition holds its last value while flip_pending and/or
-#      scale_csi_pool_health_stale go to 1 (alerts
-#      ScaleCSIPoolConditionFlipPending / ScaleCSIPoolHealthStale). Past the TTL
-#      conditions fall back to dataset-only while flip_pending may still read 1;
-#   5. observer lag — UNBOUNDED and invisible to the driver: Prometheus sees the
-#      gauges only on its next scrape and starts `for` at the first true
-#      EVALUATION, so after a recovery both diagnostic gauges can read 0 while
-#      the alert still fires. This chart puts no upper limit on the
-#      ServiceMonitor interval. Compare
-#      scale_csi_pool_health_last_success_timestamp_seconds (driver-owned) with
-#      scrape freshness — never timestamp(), which returns the SCRAPE time;
-#   6. cold start — UNBOUNDED until the first successful sample of a process: the
-#      raw scale_csi_pool_* series do not exist yet, so ScaleCSIPoolDegraded
-#      cannot fire at all; the driver publishes scale_csi_pool_health_stale = 1
-#      (flip_pending = 0) so the window is visible. The pool label is the
-#      CONFIGURED name, so a missing or renamed pool looks exactly like an
-#      unreachable one;
-#   7. replica skew — UNBOUNDED, and a PRODUCER-IDENTITY difference rather than a
-#      timing one: every replica polls (no leader election) and a fencing-off
-#      RollingUpdate can overlap processes, so `max by (pool)` merges
-#      independently sampled histories. Supported single-producer setup is
-#      controller.replicas=1, which is why enabling backendHealth renders a
-#      non-overlapping rollout. Detect it with
-#      count by (pool) (scale_csi_pool_health_last_success_timestamp_seconds) > 1
-#      (alert ScaleCSIPoolHealthProducerSkew). Termination, drain and eviction
-#      overlap remain residuals detected rather than prevented by that alert.
-# The temperature count is accompanied by scale_csi_pool_disk_temp_alerts_age_seconds;
-# an absent age means the follow-up has not successfully returned yet.
-# Read scale_csi_pool_health_flip_pending and scale_csi_pool_health_stale before
-# treating a PVC condition as wrong, but remember they do not cover the alert
-# hold, observer lag, cold start or replica skew. Full contract:
-# docs/production.md, "Backend health".
-#
-# Default OFF so an upgrade changes neither the rendered manifest nor the
-# VolumeCondition semantics of existing volumes.
-backendHealth:
-  enabled: false
-  # Poll cadence, clamped to 30s-2m. The 2m CEILING is not arbitrary: the
-  # two-sample hysteresis makes a CONFIRMED condition flip take up to
-  # 2 x interval PLUS one 30s backend call timeout (4m30s at the ceiling),
-  # which has to stay inside the 5m ScaleCSIPoolDegraded hold — WHILE
-  # SUCCESSFUL SAMPLES KEEP ARRIVING; it is a cadence bound, not a wall-clock
-  # guarantee, and it cannot cover a sample that never arrives. An
-  # out-of-range value is clamped (one warning at controller startup), never
-  # rejected. The staleness TTL is three times the EFFECTIVE (clamped) value: 3m
-  # at this default, never more than 6m.
-  interval: 60s
-
 # ZFS-native encryption at rest (GF-Sprint 1). Strictly opt-in: with
 # enabled=false (default) every volume is provisioned plaintext and nothing
 # encryption-related renders into the ConfigMap, so behavior is identical to a
@@ -246,9 +144,7 @@ controller:
   # controller.replicas: 2 with fencing.mode additive or strict (the sidecars
   # use leader election, so exactly one controller is ever active; see the
   # "Additive/strict fencing requires exactly one non-overlapping controller"
-  # note above) — NOT fencing.mode off with backendHealth.enabled, which
-  # explicitly refuses replicas > 1 (see controller-deployment.yaml) because
-  # its poller has no leader-election gate of its own. At replicas: 2 this
+  # note above). At replicas: 2 this
   # same maxUnavailable: 1 default already gives you real protection: one
   # replica may always be evicted/drained while the other keeps serving.
   podDisruptionBudget:
@@ -1047,7 +943,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-attacher:v4.12.0
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.13.0
     # Bounds the ControllerPublish/Unpublish (attach/detach) deadline. 120s keeps
     # a stuck TrueNAS publish from holding the external-attacher's --timeout for
     # 300s; the driver's own publish path is far faster after the P1 RTT cuts.
@@ -1111,7 +1007,7 @@ sidecars:
     healthProbe:
       enabled: true
       port: 9810
-    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
     resources:
       requests:
         cpu: 10m
@@ -1125,44 +1021,7 @@ sidecars:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65532
-    image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
-    resources:
-      requests:
-        cpu: 10m
-        memory: 32Mi
-      limits:
-        memory: 128Mi
-
-  # External health monitor controller (volume-health sidecar). Strictly opt-in
-  # (default off): with enabled=false no container and no extra RBAC render, so
-  # the default manifest is byte-identical. The node-side stale-mount pre-gate
-  # and controller-side VolumeCondition (both zero-new-API) are always on; this
-  # sidecar additionally emits Kubernetes Events for abnormal volumes.
-  #
-  # STEADY-STATE API COST when enabled: because Scale-CSI advertises
-  # LIST_VOLUMES, external-health-monitor v0.18.0 drives the ListVolumes path and
-  # reads Entry.Status.VolumeCondition; it does NOT also issue per-PV
-  # ControllerGetVolume (it picks ListVolumes OR per-PV ControllerGetVolume, never
-  # both). So the background load is ONE periodic ListVolumes walk per interval:
-  # one path-scoped listing (zfs.resource.query; paged pool.dataset.query
-  # fallback) frozen for 30s so continuation pages are stable under churn, plus
-  # one id-filtered pool.dataset.query hydration per returned page. The same
-  # hydrated reads also populate each entry's PublishedNodeIds
-  # (LIST_VOLUMES_PUBLISHED_NODES) at no extra call. NOT part of the
-  # request-path golden totals.
-  # `interval` renders both --list-volumes-interval (the ACTIVE cadence for this
-  # driver) and --monitor-interval (the fallback cadence used only by a driver
-  # that lacks LIST_VOLUMES). Image tag is pinned (G2: v0.18.0 is the current
-  # published release) — do not float it.
-  healthMonitor:
-    enabled: false
-    # The upstream image is a static Go binary and is compatible with the
-    # explicit non-root UID used here; it only needs the mounted CSI socket.
-    securityContext:
-      runAsNonRoot: true
-      runAsUser: 65532
-    image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0
-    interval: 60s
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0
     resources:
       requests:
         cpu: 10m
@@ -1328,6 +1187,18 @@ metrics:
     # alert renders only when capacity.gaugeEnabled is also true (it needs the
     # scale_csi_pool_available_bytes / scale_csi_pool_capacity_bytes gauges).
     poolUsageThreshold: 0.85
+    # ScaleCSITombstoneBacklog fires when more than this many tombstones await
+    # reap for 30m. It used to fire on ANY backlog held for 48h, which pages
+    # permanently on a cluster whose backup tool (kopiur, VolSync) mounts
+    # hourly snapshot clones: those leave a steady tombstone inflow that is
+    # never zero. A stuck individual tombstone is ScaleCSITombstoneOldestStuck.
+    tombstoneBacklogThreshold: 500
+    # ScaleCSITombstoneOldestStuck: age in seconds of the oldest tombstone.
+    tombstoneOldestAgeSeconds: 86400
+    # ScaleCSITombstoneReapStale: seconds since the last recorded delete-capable
+    # pass. Default is two missed runs of the default 6-hourly CronJob; lower it
+    # alongside a tighter reconcile.delete.schedule.
+    tombstoneReapStaleSeconds: 43200
 
   # Grafana sidecar-discoverable dashboard ConfigMap
   dashboards:

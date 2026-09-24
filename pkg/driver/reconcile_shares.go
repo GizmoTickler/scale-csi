@@ -464,7 +464,7 @@ func (d *Driver) deleteOrphanedShares(ctx context.Context, report *ReconcileRepo
 		case ShareTypeISCSI:
 			d.deleteOrphanedISCSIShare(ctx, report, *orphan)
 		case ShareTypeNVMeoF:
-			d.deleteOrphanedNVMeoFShare(ctx, report, *orphan)
+			d.deleteOrphanedNVMeoFShare(ctx, report, *orphan, currentState)
 		default: // ShareTypeNFS (and any unset value) retains the legacy NFS path.
 			d.deleteOrphanedNFSShare(ctx, report, *orphan)
 		}
@@ -590,24 +590,47 @@ func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *Reconcile
 	// for an extent that is already gone.
 	var target *truenas.ISCSITarget
 	var association *truenas.ISCSITargetExtent
+	var extraAssociations []*truenas.ISCSITargetExtent
 	if extent != nil {
 		associations, findErr := d.truenasClient.ISCSITargetExtentFindByExtent(ctx, extent.ID)
 		if findErr != nil && !truenas.IsNotFoundError(findErr) {
 			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("find iSCSI target-extent for extent %d: %w", extent.ID, findErr))
 			return
 		}
+		// An extent can be mapped to more than one target (an operator can add
+		// a mapping by hand). Only the first mapping used to be considered:
+		// when it pointed at a foreign target the sweep refused and never saw
+		// the driver's own target, and when it pointed at the driver's target
+		// the other mappings were left for the extent delete to trip over.
+		// Pick the mapping whose target carries the extent's own name (the
+		// ownership signal iscsiOrphanTargetSweepable proves) as the primary,
+		// and remove the rest as bare mappings: the extent's dataset is gone,
+		// so they serve nothing, and their targets are never touched.
 		for _, candidate := range associations {
-			if candidate != nil {
-				association = candidate
-				break
+			if candidate == nil {
+				continue
 			}
+			candidateTarget, getErr := d.truenasClient.ISCSITargetGet(ctx, candidate.Target)
+			if getErr != nil && !truenas.IsNotFoundError(getErr) {
+				d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("get iSCSI target %d: %w", candidate.Target, getErr))
+				return
+			}
+			if association == nil && candidateTarget != nil && candidateTarget.Name == extent.Name {
+				association, target = candidate, candidateTarget
+				continue
+			}
+			extraAssociations = append(extraAssociations, candidate)
 		}
-	}
-	if association != nil {
-		target, err = d.truenasClient.ISCSITargetGet(ctx, association.Target)
-		if err != nil && !truenas.IsNotFoundError(err) {
-			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("get iSCSI target %d: %w", association.Target, err))
-			return
+		if association == nil && len(extraAssociations) > 0 {
+			// No mapping reaches a target named for this extent: keep the
+			// historical behavior of gating on the first mapping's target, so
+			// the sweepable check below refuses and records the skip.
+			association, extraAssociations = extraAssociations[0], extraAssociations[1:]
+			target, err = d.truenasClient.ISCSITargetGet(ctx, association.Target)
+			if err != nil && !truenas.IsNotFoundError(err) {
+				d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("get iSCSI target %d: %w", association.Target, err))
+				return
+			}
 		}
 	}
 	if target == nil {
@@ -651,9 +674,12 @@ func (d *Driver) deleteOrphanedISCSIShare(ctx context.Context, report *Reconcile
 		klog.Infof("Orphan reconcile: orphaned iSCSI share for dataset %s already absent", orphan.ID)
 		return
 	}
-	if association != nil {
-		if delErr := d.truenasClient.ISCSITargetExtentDelete(ctx, association.ID, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
-			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI target-extent %d: %w", association.ID, delErr))
+	for _, mapping := range append([]*truenas.ISCSITargetExtent{association}, extraAssociations...) {
+		if mapping == nil {
+			continue
+		}
+		if delErr := d.truenasClient.ISCSITargetExtentDelete(ctx, mapping.ID, true); delErr != nil && !truenas.IsNotFoundError(delErr) {
+			d.recordReconcileObjectFailure("share", orphan.ID, fmt.Errorf("delete iSCSI target-extent %d: %w", mapping.ID, delErr))
 			return
 		}
 	}
@@ -809,7 +835,8 @@ func (d *Driver) resolveOrphanNVMeoFSubsystem(ctx context.Context, orphan Reconc
 //     gate accepts a derived target name when the extent is already gone.
 //
 //  2. Sole occupancy. No namespace on the subsystem may resolve to anything
-//     other than the orphan's dataset.
+//     other than the orphan's dataset, except a dataset coOrphan re-proves
+//     absent at sweep time (nothing live can be taken offline through it).
 //
 // A refusal retains the whole orphan (namespaces, port associations and
 // subsystem), per the same rule the iSCSI path follows: sweeping part of an
@@ -822,6 +849,7 @@ func (d *Driver) nvmeoFOrphanSubsystemSweepable(
 	subsys *truenas.NVMeoFSubsystem,
 	namespaces []*truenas.NVMeoFNamespace,
 	subsysName string,
+	coOrphan func(datasetName string) bool,
 ) bool {
 	subsystemID := strconv.Itoa(subsys.ID)
 	owned := false
@@ -830,6 +858,14 @@ func (d *Driver) nvmeoFOrphanSubsystemSweepable(
 			continue
 		}
 		datasetName, ok := zvolReferenceDatasetName(namespace.DevicePath)
+		if ok && datasetName != orphan.ID && coOrphan != nil && coOrphan(datasetName) {
+			// Sole occupancy is about not taking LIVE data offline. A
+			// namespace whose dataset is proven absent right now serves
+			// nothing. Refusing on it deadlocked a subsystem that carried two
+			// absent CSI datasets: each orphan's sweep refused because of the
+			// other, on every pass, forever.
+			continue
+		}
 		if !ok || datasetName != orphan.ID {
 			d.recordReconcileSkip(report, "nvmeof_subsystem", subsystemID, fmt.Sprintf(
 				"subsystem %q still carries namespace %d backed by %q, which this sweep of %s does not own: deleting the subsystem would take it offline, so the orphan is retained for a later pass",
@@ -847,7 +883,7 @@ func (d *Driver) nvmeoFOrphanSubsystemSweepable(
 	return true
 }
 
-func (d *Driver) deleteOrphanedNVMeoFShare(ctx context.Context, report *ReconcileReport, orphan ReconcileObject) {
+func (d *Driver) deleteOrphanedNVMeoFShare(ctx context.Context, report *ReconcileReport, orphan ReconcileObject, currentState *kubernetesReconcileState) {
 	subsysName := d.nvmeSubsystemName(orphan.ID)
 	subsys, err := d.resolveOrphanNVMeoFSubsystem(ctx, orphan, subsysName)
 	if err != nil {
@@ -868,7 +904,18 @@ func (d *Driver) deleteOrphanedNVMeoFShare(ctx context.Context, report *Reconcil
 	// iscsiOrphanTargetSweepable. Everything below deletes EVERY namespace on the
 	// subsystem and then the subsystem itself; that is only safe once the sweep
 	// has proven each of those namespaces belongs to the orphan it is sweeping.
-	if !d.nvmeoFOrphanSubsystemSweepable(report, orphan, subsys, namespaces, subsysName) {
+	// A second namespace whose dataset is ALSO gone is not another volume's
+	// live data: re-prove its absence now, with the same gates the orphan
+	// itself passed (under the parent, no live PV in the freshly re-listed
+	// state, dataset lookup NotFound).
+	coOrphan := func(datasetName string) bool {
+		if !d.datasetUnderParent(datasetName) || shareOrphanLivePV(currentState, path.Base(datasetName)) {
+			return false
+		}
+		_, getErr := d.truenasClient.DatasetGet(ctx, datasetName)
+		return getErr != nil && truenas.IsNotFoundError(getErr)
+	}
+	if !d.nvmeoFOrphanSubsystemSweepable(report, orphan, subsys, namespaces, subsysName, coOrphan) {
 		return
 	}
 	for _, namespace := range namespaces {

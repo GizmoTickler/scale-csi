@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,8 @@ const kubeletCSIStagingRoot = "/var/lib/kubelet/plugins/kubernetes.io/csi"
 
 var (
 	getMountedBlockDevices = util.GetMountedBlockDevices
+	getBlockDeviceMounts   = util.GetBlockDeviceMounts
+	blockDeviceParent      = util.BlockDeviceParent
 	getStagedBlockDevices  = func() (map[string]string, error) {
 		return util.GetStagedBlockDevices(kubeletCSIStagingRoot)
 	}
@@ -201,7 +204,7 @@ type Driver struct {
 	// Controller-side orphan reconcile context and cancellation.
 	// reconcileStateMu + reconcileStopped guard reconcileCancel with the same
 	// mutex + terminal-stopped-flag pattern reapRecordStateMu/reapRecordStopped
-	// and backendHealthStateMu/backendHealthStopped already use (C7): without
+	// already use (C7): without
 	// it, a Stop() that races Run() between startOrphanReconcile entering and
 	// its plain `d.reconcileCancel = cancel` assignment can observe a nil
 	// cancel, skip cancellation, and let a full reconcile pass — including
@@ -302,27 +305,6 @@ type Driver struct {
 	// of the last record published to the last-reap gauges. An older record
 	// from a stale reconcile must not overwrite a newer poll result.
 	reapRecordPublishedAt atomic.Int64
-
-	// Controller-side backend-health poll loop (GF5 E4). Runs only when
-	// backendHealth.enabled; each tick is at most two bounded READ calls
-	// (pool.query + disk.temperature_alerts) and never writes.
-	backendHealthCancel context.CancelFunc
-	backendHealthWg     sync.WaitGroup
-	// backendHealthStateMu serializes startup and shutdown. Stop is terminal for
-	// this Driver: recording that state closes the interleaving where Stop sees a
-	// nil cancel before Run assigns it and Run then starts a poller anyway.
-	backendHealthStateMu sync.Mutex
-	backendHealthStopped bool
-	// backendHealthPendingFlips counts CONSECUTIVE samples that disagree with the
-	// currently published verdict. The fan-out only flips once it reaches
-	// backendHealthFlipSamples, so a flapping pool cannot rewrite every managed
-	// PVC's VolumeCondition on every tick.
-	backendHealthPendingFlips atomic.Int64
-	// backendHealthPublishMu serializes per-driver health transitions and the
-	// pending-flip counter. The immutable backendHealthState pointer publishes
-	// the CSI-facing snapshot and all metric-facing state together, so both
-	// readers load one generation.
-	backendHealthPublishMu sync.Mutex
 
 	// Background fencing state. Missing-record observations are in-memory on
 	// purpose: a controller restart restarts the full grace period rather than
@@ -669,7 +651,6 @@ func (d *Driver) Run() error {
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
 		d.startCapacityGauges()
-		d.startBackendHealth()
 		SetReconcileDeleteEnabled(d.config != nil && d.config.Reconcile.Delete.Enabled)
 		d.startTombstoneReapRecordPoll()
 	}
@@ -705,7 +686,6 @@ func (d *Driver) Stop() {
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
-	d.stopBackendHealth()
 	d.stopTombstoneReapRecordPoll()
 
 	// Stop the service reload debouncer
@@ -1044,6 +1024,13 @@ func (d *Driver) runSessionGCWithProtocols(ctx context.Context, gracePeriod time
 	} else if ctx.Err() == nil {
 		_, _ = d.observeNVMeoFSessions()
 	}
+
+	// Converge live controller tunables every tick, independent of cleanup:
+	// this corrects configuration drift on staged volumes, it never
+	// disconnects anything.
+	if ctx.Err() == nil {
+		d.reconcileNVMeoFControllerTunables(dryRun)
+	}
 }
 
 func (d *Driver) observeISCSISessions() ([]util.ISCSISessionInfo, error) {
@@ -1320,10 +1307,14 @@ func (d *Driver) expectedStagedSessions(deviceLabel string, deviceID func(device
 
 	expected := make(map[string]struct{})
 
-	// Track failed lookups to detect race conditions or transient issues.
-	// If we fail to look up too many devices, skip GC entirely to avoid data loss.
+	// ANY failed lookup of a device that likely belongs to this protocol makes
+	// the expected set incomplete, and GC treats a session missing from that
+	// set as an orphan. Tolerating "1-2 failures" let a persistent identity-read
+	// failure on one mounted device disconnect its in-use session after the
+	// grace period (codex round-5 N6). Devices positively identified as NOT
+	// this protocol report ok, so they never count here.
 	failedLookups := 0
-	const maxFailedLookups = 2 // Allow 1-2 failures, but more suggests a problem
+	const maxFailedLookups = 0
 
 	for device := range inUseDevices {
 		id, likely, ok := deviceID(device)
@@ -1338,8 +1329,8 @@ func (d *Driver) expectedStagedSessions(deviceLabel string, deviceID func(device
 		}
 	}
 
-	// If too many lookups failed, this might indicate a race condition
-	// (concurrent stage/unstage operations) - skip GC to be safe.
+	// An incomplete expected set cannot authorize a disconnect; skip this
+	// protocol's pass and retry on the next tick.
 	if failedLookups > maxFailedLookups {
 		klog.Warningf("Session GC: %d %s device lookups failed, skipping GC to avoid race condition", failedLookups, deviceLabel)
 		return nil // Return nil to signal GC should be skipped
@@ -1355,10 +1346,17 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 	return d.expectedStagedSessions("iSCSI", func(device string) (string, bool, bool) {
 		// Check if this device is an iSCSI device.
 		portal, iqn, err := getISCSIInfoFromDevice(device)
+		if errors.Is(err, util.ErrNotISCSIDevice) {
+			// Positively local (no iSCSI session in its sysfs ancestry): not a
+			// failed lookup, so it must not veto the pass.
+			return "", false, true
+		}
 		if err != nil {
-			// iSCSI devices are typically sd[a-z]+ (not nvme*, loop*, etc); only a
-			// likely-iSCSI device's failed lookup should count toward the threshold.
-			likely := util.IsLikelyISCSIDevice(device)
+			// An unresolved identity is UNKNOWN, not "unlikely": a dm map whose
+			// uuid could not be read, or a device of an unexpected shape, may
+			// still sit on an iSCSI session (codex round-6 N7). Only device
+			// classes that can never be iSCSI-backed are excluded.
+			likely := !util.IsPositivelyNotISCSIBackable(device)
 			if likely {
 				klog.V(4).Infof("Session GC: failed to get iSCSI info for %s (may be race condition): %v", device, err)
 			}
@@ -1377,9 +1375,14 @@ func (d *Driver) getExpectedISCSITargets() map[string]struct{} {
 func (d *Driver) getExpectedNVMeoFNQNs() map[string]struct{} {
 	return d.expectedStagedSessions("NVMe", func(device string) (string, bool, bool) {
 		// Check if this device is an NVMe device.
-		nqn, err := getNVMeInfoFromDevice(device)
+		// A mounted partition (nvme0n1p1) is resolved to its namespace first;
+		// the NQN lookup only understands whole namespaces (codex round-6 N7).
+		namespace := blockDeviceParent(device)
+		nqn, err := getNVMeInfoFromDevice(namespace)
 		if err != nil {
-			likely := util.IsLikelyNVMeDevice(device)
+			// Fabric namespaces are always nvme*: any nvme* device whose
+			// identity is unreadable is unknown and vetoes the pass.
+			likely := strings.HasPrefix(filepath.Base(namespace), "nvme")
 			if likely {
 				klog.V(4).Infof("Session GC: failed to get NVMe info for %s (may be race condition): %v", device, err)
 			}

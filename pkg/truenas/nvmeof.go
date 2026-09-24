@@ -49,7 +49,9 @@ type NVMeoFNamespace struct {
 	DeviceUUID  string `json:"device_uuid"`  // New in 25.10
 	DeviceNGUID string `json:"device_nguid"` // New in 25.10
 	Enabled     bool   `json:"enabled"`
-	Locked      bool   `json:"locked"` // New in 25.10
+	// Locked is NOT populated: every namespace query passes
+	// retrieve_locked_info=false (see nvmetNamespaceQueryOptions).
+	Locked bool `json:"locked"` // New in 25.10
 }
 
 // NVMeoFPort represents an NVMe-oF port from the TrueNAS API.
@@ -279,6 +281,17 @@ func (c *Client) NVMeoFHostCreate(ctx context.Context, nqn string) (*NVMeoFHost,
 
 	result, err := c.Call(ctx, "nvmet.host.create", map[string]interface{}{"hostnqn": nqn})
 	if err != nil {
+		// Callers find-then-create, so two publishes for the same node racing
+		// through an empty find both reach here, and the loser is refused by
+		// middleware's hostnqn uniqueness check (a validation error, or the DB
+		// unique constraint if both passed validation). A host row carries
+		// nothing but its NQN, so if a row for this NQN exists now, the create's
+		// goal is met whatever the error said. Re-read before failing; this also
+		// covers an ambiguous reply to a create that did commit.
+		if existing, findErr := c.NVMeoFHostFindByNQN(ctx, nqn); findErr == nil && existing != nil {
+			klog.V(4).Infof("NVMeoFHostCreate: host %s already exists (id=%d) after a failed create: %v", nqn, existing.ID, err)
+			return existing, nil
+		}
 		return nil, fmt.Errorf("failed to create NVMe-oF host: %w", err)
 	}
 
@@ -424,10 +437,20 @@ func (c *Client) NVMeoFNamespaceDelete(ctx context.Context, id int) error {
 	return nil
 }
 
+// nvmetNamespaceQueryOptions skips middleware's per-row locked-path lookup
+// (pool.dataset.path_in_locked_datasets). Measured on nas01 (TrueNAS 26.0):
+// ~90ms of a ~100ms nvmet.namespace.query. Nothing in the driver reads
+// NVMeoFNamespace.Locked; encryption lock state comes from the dataset and
+// pool.dataset.encryption_summary. A fresh map per call: callers must not
+// share a mutable options value.
+func nvmetNamespaceQueryOptions() map[string]interface{} {
+	return map[string]interface{}{"extra": map[string]interface{}{"retrieve_locked_info": false}}
+}
+
 // NVMeoFNamespaceGet retrieves an NVMe-oF namespace by ID.
 func (c *Client) NVMeoFNamespaceGet(ctx context.Context, id int) (*NVMeoFNamespace, error) {
 	filters := [][]interface{}{{"id", "=", id}}
-	result, err := c.Call(ctx, "nvmet.namespace.query", filters, map[string]interface{}{})
+	result, err := c.Call(ctx, "nvmet.namespace.query", filters, nvmetNamespaceQueryOptions())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get NVMe-oF namespace: %w", err)
 	}
@@ -453,7 +476,7 @@ func (c *Client) NVMeoFNamespaceFindByDevice(ctx context.Context, subsystemID in
 		{"subsys.id", "=", subsystemID}, // Changed from "subsystem" in 25.10
 		{"device_path", "=", normalizedPath},
 	}
-	result, err := c.Call(ctx, "nvmet.namespace.query", filters, map[string]interface{}{})
+	result, err := c.Call(ctx, "nvmet.namespace.query", filters, nvmetNamespaceQueryOptions())
 	if err != nil {
 		return nil, fmt.Errorf("failed to query NVMe-oF namespaces: %w", err)
 	}
@@ -479,7 +502,7 @@ func (c *Client) NVMeoFNamespaceFindByDevicePath(ctx context.Context, devicePath
 	filters := [][]interface{}{
 		{"device_path", "=", normalizedPath},
 	}
-	result, err := c.Call(ctx, "nvmet.namespace.query", filters, map[string]interface{}{})
+	result, err := c.Call(ctx, "nvmet.namespace.query", filters, nvmetNamespaceQueryOptions())
 	if err != nil {
 		return nil, fmt.Errorf("failed to query NVMe-oF namespaces: %w", err)
 	}
@@ -501,7 +524,7 @@ func (c *Client) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID in
 	filters := [][]interface{}{
 		{"subsys.id", "=", subsysID},
 	}
-	result, err := c.Call(ctx, "nvmet.namespace.query", filters, map[string]interface{}{})
+	result, err := c.Call(ctx, "nvmet.namespace.query", filters, nvmetNamespaceQueryOptions())
 	if err != nil {
 		return nil, fmt.Errorf("failed to query NVMe-oF namespaces: %w", err)
 	}
@@ -529,7 +552,7 @@ func (c *Client) NVMeoFNamespaceListBySubsystem(ctx context.Context, subsysID in
 // can fetch once and group client-side instead of issuing one
 // NVMeoFNamespaceListBySubsystem query per subsystem (~N round trips per pass).
 func (c *Client) NVMeoFNamespaceList(ctx context.Context) ([]*NVMeoFNamespace, error) {
-	result, err := c.Call(ctx, "nvmet.namespace.query", []interface{}{}, map[string]interface{}{})
+	result, err := c.Call(ctx, "nvmet.namespace.query", []interface{}{}, nvmetNamespaceQueryOptions())
 	if err != nil {
 		return nil, fmt.Errorf("failed to query NVMe-oF namespaces: %w", err)
 	}

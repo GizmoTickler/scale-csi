@@ -694,32 +694,69 @@ func GetDeviceFromMountPointWithContext(ctx context.Context, mountPath string) (
 // GetMountedBlockDevices returns a map of all mounted block devices.
 // The keys are device paths (e.g., "/dev/sda1"), values are mount points.
 // This is used by session GC to determine which iSCSI/NVMe devices are in use.
+// A device mounted more than once maps to one of its mount points; callers that
+// need every mount point use GetBlockDeviceMounts.
 func GetMountedBlockDevices() (map[string]string, error) {
+	mounts, err := listBlockDeviceMounts()
+	if err != nil {
+		return nil, err
+	}
+	devices := make(map[string]string)
+	for _, mount := range mounts {
+		devices[mount[0]] = mount[1]
+	}
+	return devices, nil
+}
+
+// GetBlockDeviceMounts returns every mount point of every mounted block
+// device. A published filesystem volume is mounted twice (the kubelet staging
+// mount and the pod bind mount), and the single-target map above keeps only
+// one of them, so an ownership check keyed on the staging path must use this.
+func GetBlockDeviceMounts() (map[string][]string, error) {
+	mounts, err := listBlockDeviceMounts()
+	if err != nil {
+		return nil, err
+	}
+	devices := make(map[string][]string)
+	for _, mount := range mounts {
+		devices[mount[0]] = append(devices[mount[0]], mount[1])
+	}
+	return devices, nil
+}
+
+// listBlockDeviceMounts returns (device, target) for every block-device mount.
+func listBlockDeviceMounts() ([][2]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
 	// Use findmnt to list all block device mounts
 	// -n: no headers, -l: list format, -o: output columns
-	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-l", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs")
+	// -r (raw) escapes whitespace and other unsafe bytes as \xNN, so every row
+	// splits into exactly two fields; -l printed them verbatim and a mount
+	// point containing a space was truncated at it.
+	cmd := exec.CommandContext(ctx, "findmnt", "-n", "-r", "-o", "SOURCE,TARGET", "-t", "ext4,ext3,xfs,btrfs")
 	HardenCmd(cmd)
 	output, err := cmd.Output()
 	if err != nil {
-		// Exit code 1 with empty output means no mounts found (not an error)
-		// Exit code 1 with non-empty stderr indicates an actual error
+		// findmnt exits 1 for "nothing matched" AND for read failures (an
+		// unreadable mount table prints a diagnostic on stderr). Session GC
+		// treats an empty inventory as "nothing is in use", so only a clean
+		// no-match (exit 1, no stdout, no stderr) may become empty; anything
+		// else fails closed so GC skips the pass instead of disconnecting an
+		// in-use device (codex round-4 N5).
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			// Only treat as "no mounts" if there's no output
-			if len(output) == 0 || strings.TrimSpace(string(output)) == "" {
-				return make(map[string]string), nil
-			}
-			// Non-empty output with exit code 1 is unexpected, log and continue parsing
-			klog.V(4).Infof("findmnt returned exit code 1 with output, continuing: %s", string(output))
-		} else {
-			return nil, fmt.Errorf("findmnt failed: %w", err)
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 &&
+			strings.TrimSpace(string(output)) == "" && strings.TrimSpace(string(exitErr.Stderr)) == "" {
+			return nil, nil
 		}
+		var stderr []byte
+		if exitErr != nil {
+			stderr = exitErr.Stderr
+		}
+		return nil, fmt.Errorf("findmnt failed: %w (stderr: %s)", err, strings.TrimSpace(string(stderr)))
 	}
 
-	devices := make(map[string]string)
+	var mounts [][2]string
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -729,16 +766,22 @@ func GetMountedBlockDevices() (map[string]string, error) {
 		// Format: SOURCE TARGET (space-separated)
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
-			device := fields[0]
-			target := fields[1]
+			device := decodeFindmntRaw(fields[0])
+			target := decodeFindmntRaw(fields[1])
+			// A bind mount of a subdirectory (a pod subPath, a btrfs subvolume)
+			// reports SOURCE as "/dev/nvme0n1[/fsroot]"; the device is the part
+			// before the bracket.
+			if i := strings.IndexByte(device, '['); i > 0 && strings.HasSuffix(device, "]") {
+				device = device[:i]
+			}
 			// Only include actual block devices (skip things like tmpfs, overlay, etc.)
 			if strings.HasPrefix(device, "/dev/") {
-				devices[device] = target
+				mounts = append(mounts, [2]string{device, target})
 			}
 		}
 	}
 
-	return devices, nil
+	return mounts, nil
 }
 
 // GetStagedBlockDevices returns block devices referenced by symlinks below a
@@ -782,4 +825,23 @@ func GetStagedBlockDevices(stagingRoot string) (map[string]string, error) {
 	}
 
 	return devices, nil
+}
+
+// decodeFindmntRaw undoes findmnt -r's \xNN escaping.
+func decodeFindmntRaw(field string) string {
+	if !strings.Contains(field, `\x`) {
+		return field
+	}
+	var b strings.Builder
+	for i := 0; i < len(field); i++ {
+		if i+3 < len(field) && field[i] == '\\' && field[i+1] == 'x' {
+			if v, err := strconv.ParseUint(field[i+2:i+4], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(field[i])
+	}
+	return b.String()
 }

@@ -1,6 +1,3 @@
-{{- if and .Values.backendHealth.enabled (gt (int .Values.controller.replicas) 1) }}
-{{- fail "backendHealth.enabled requires controller.replicas=1: the poller has no leader election, and Deployment termination/eviction/drain can overlap producers even when rollout surge is zero" }}
-{{- end }}
 {{- if .Values.controller.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -18,22 +15,7 @@ spec:
   # defaulted RollingUpdate and Helm's three-way merge never managed it; the
   # off -> additive upgrade then failed in production (2026-07-22) because the
   # server-defaulted rollingUpdate residue made the Recreate strategy invalid.
-  {{- if and (eq .Values.fencing.mode "off") .Values.backendHealth.enabled }}
-  # Off mode would allow overlapping controllers during a rollout, but the
-  # backend-health poller has NO leader-election gate, so an overlap means two
-  # processes publishing independently sampled scale_csi_pool_* series that every
-  # alert merges with `max by (pool)` — divergence class 7, replica skew. Surge 0
-  # makes the rollout NON-OVERLAPPING (the old pod terminates before the new one
-  # is created), which is the single-producer invariant the taxonomy promises,
-  # without Recreate's stricter semantics elsewhere. It is only an invariant at
-  # controller.replicas=1: more replicas are more producers by construction, and
-  # ScaleCSIPoolHealthProducerSkew is what detects that.
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 0
-  {{- else if eq .Values.fencing.mode "off" }}
+  {{- if eq .Values.fencing.mode "off" }}
   # Off mode allows overlapping controllers during a rollout. RollingUpdate is
   # the Kubernetes default, declared explicitly (with its default surge and
   # unavailable) so the field is Helm-owned and the additive upgrade can replace
@@ -206,6 +188,12 @@ spec:
           {{- $startupProbeSpan := sub (add $startupTimeoutSeconds $startupPeriod) $startupInitialDelay }}
           {{- $startupTicks := div (add $startupProbeSpan (sub $startupPeriod 1)) $startupPeriod }}
           {{- $startupFailureThreshold := max 30 (add $startupTicks 1) }}
+          {{- /* Kubernetes stores failureThreshold as int32. Past it the
+               manifest renders but the API server rejects the apply, which is
+               a worse place to learn about a typo'd timeout than here. */}}
+          {{- if gt (int64 $startupFailureThreshold) 2147483647 }}
+          {{- fail (printf "startupConnectTimeout=%v needs a startup probe failureThreshold of %d, which exceeds the int32 maximum Kubernetes accepts (2147483647); use a shorter timeout" .Values.startupConnectTimeout (int64 $startupFailureThreshold)) }}
+          {{- end }}
           # Port 9808 is the liveness-probe SIDECAR, and it is the only endpoint
           # in this pod that means "the driver is SERVING". It answers 200 only
           # once /csi/csi.sock accepts a CSI Probe RPC, and refuses the
@@ -409,34 +397,6 @@ spec:
               mountPath: {{ include "scale-csi.socketDir" . }}
           resources:
             {{- toYaml .Values.sidecars.livenessProbe.resources | nindent 12 }}
-
-        {{- if .Values.sidecars.healthMonitor.enabled }}
-        # External Health Monitor (volume-health; opt-in via
-        # sidecars.healthMonitor.enabled). Emits Events for abnormal volumes;
-        # default off => no container => byte-identical render.
-        - name: csi-external-health-monitor
-          image: {{ .Values.sidecars.healthMonitor.image }}
-          securityContext:
-            {{- include "scale-csi.sidecarSecurityContext" (dict "common" $.Values.sidecars.securityContext "override" $.Values.sidecars.healthMonitor.securityContext) | nindent 12 }}
-          args:
-            - "--csi-address={{ include "scale-csi.socketPath" . }}"
-            - "--leader-election"
-            - "--leader-election-namespace={{ .Release.Namespace }}"
-            # Scale-CSI advertises LIST_VOLUMES, so external-health-monitor
-            # v0.18.0 drives the ListVolumes path, whose cadence is set by
-            # --list-volumes-interval (NOT --monitor-interval). Render the active
-            # flag from the configured interval; --monitor-interval is kept as the
-            # fallback cadence for the ControllerGetVolume path a driver without
-            # LIST_VOLUMES would use.
-            - "--list-volumes-interval={{ .Values.sidecars.healthMonitor.interval }}"
-            - "--monitor-interval={{ .Values.sidecars.healthMonitor.interval }}"
-            - "--v={{ .Values.logging.verbosity }}"
-          volumeMounts:
-            - name: socket-dir
-              mountPath: {{ include "scale-csi.socketDir" . }}
-          resources:
-            {{- toYaml .Values.sidecars.healthMonitor.resources | nindent 12 }}
-        {{- end }}
 
       volumes:
         - name: socket-dir

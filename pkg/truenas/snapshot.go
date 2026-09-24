@@ -638,6 +638,14 @@ func isSnapshotAlreadyHeldError(err error) bool {
 	if errno, ok := APIErrno(err); ok && errno == syscall.EEXIST {
 		return true
 	}
+	// Past the affirmative checks, any structured errno (top-level or nested)
+	// vetoes the libzfs text fallbacks: a nested EACCES must not let
+	// "lzc_hold() failed ... 17" prose report a failed hold as held (codex
+	// round-4 N4). The captured 26.0 re-hold envelope carries no errno-keyed
+	// value, so it still reaches the reason read below.
+	if HasStructuredErrno(err) {
+		return false
+	}
 	if lzcHoldReportsAlreadyHeld(err.Error()) {
 		return true
 	}
@@ -710,12 +718,15 @@ func isSnapshotNotHeldError(err error) bool {
 	if err == nil || IsNotFoundError(err) {
 		return true
 	}
-	if _, ok := APIErrno(err); ok {
+	if HasStructuredErrno(err) {
 		return false
 	}
+	// Only wording that says the hold is ABSENT counts. A bare "not" also
+	// matched "hold not released: permission denied", a failed release.
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "hold") &&
-		(strings.Contains(message, "not") || strings.Contains(message, "no such"))
+		(strings.Contains(message, "no such") || strings.Contains(message, "not held") ||
+			strings.Contains(message, "not found") || strings.Contains(message, "does not exist"))
 }
 
 // SnapshotGet retrieves a snapshot by ID (dataset@snapshot format).
@@ -750,7 +761,7 @@ func (c *Client) SnapshotGet(ctx context.Context, snapshotID string) (*Snapshot,
 		// replaced by this compatibility fallback.
 		var apiErr *APIError
 		if errors.As(err, &apiErr) && apiErr.Code == -32602 {
-			if _, structured := APIErrno(apiErr); structured {
+			if HasStructuredErrno(apiErr) {
 				return nil, fmt.Errorf("failed to get snapshot: %w", err)
 			}
 			return nil, fmt.Errorf("snapshot not found: %s", snapshotID)

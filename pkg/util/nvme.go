@@ -65,7 +65,7 @@ type NVMeoFConnectOptions struct {
 
 	// FastIOFailTmo overrides the --fast_io_fail_tmo (seconds) passed to
 	// every nvme connect. Zero (the default, including when this struct
-	// isn't supplied at all) uses defaultFastIOFailTmo. A negative value
+	// isn't supplied at all) uses DefaultFastIOFailTmo. A negative value
 	// omits the flag entirely, reproducing the historical (disabled)
 	// behavior exactly -- see runNVMeConnect for why a nonzero default is a
 	// deliberate dataplane fix, not a compatibility no-op.
@@ -296,10 +296,10 @@ var nvmeConnectCommand = func(ctx context.Context, args ...string) ([]byte, erro
 	return cmd.CombinedOutput()
 }
 
-// defaultFastIOFailTmo is the --fast_io_fail_tmo (seconds) applied to every
+// DefaultFastIOFailTmo is the --fast_io_fail_tmo (seconds) applied to every
 // nvme connect unless NVMeoFConnectOptions.FastIOFailTmo overrides it. See the
 // field doc for why this is a real behavior change, not a no-op default.
-const defaultFastIOFailTmo = 15 * time.Second
+const DefaultFastIOFailTmo = 15 * time.Second
 
 func runNVMeConnect(ctx context.Context, transport, host, port, nqn string, opts *NVMeoFConnectOptions) error {
 	// Build connect command with reconnect options for resilience.
@@ -312,7 +312,7 @@ func runNVMeConnect(ctx context.Context, transport, host, port, nqn string, opts
 	// stuck reconnecting would otherwise queue I/O against it forever instead
 	// of failing over to a surviving path -- verified live: ctrl_loss_tmo=off
 	// fast_io_fail_tmo=off parked pods in D-state on a NAS reboot / single
-	// link failure. Always applied (default defaultFastIOFailTmo), overridable
+	// link failure. Always applied (default DefaultFastIOFailTmo), overridable
 	// via opts, and omitted only if opts explicitly requests a negative value
 	// (reproduces the historical, disabled behavior exactly).
 	//
@@ -328,7 +328,7 @@ func runNVMeConnect(ctx context.Context, transport, host, port, nqn string, opts
 		"--ctrl-loss-tmo=-1",
 	}
 
-	fastIOFailTmo := defaultFastIOFailTmo
+	fastIOFailTmo := DefaultFastIOFailTmo
 	var nrIOQueues, nrWriteQueues *int
 	var keepAliveTmo *time.Duration
 	if opts != nil {

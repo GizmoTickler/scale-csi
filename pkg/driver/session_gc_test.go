@@ -3,6 +3,9 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -806,6 +809,149 @@ func TestIsLikelyNVMeDevice_UsedInSessionGC(t *testing.T) {
 			// }
 
 			assert.NotEmpty(t, tc.reason, "Test case should have a reason")
+		})
+	}
+}
+
+// Round-4 verifier N5 (codex, 2026-09-24): findmnt exits 1 both for "nothing
+// matched" and for a read failure. The failure used to become an EMPTY
+// inventory, so an in-use filesystem device looked orphaned and, once past the
+// grace period, its session was disconnected. The inventory must fail closed and
+// GC must skip the pass.
+func TestSessionGCNeverDisconnectsWhenTheMountInventoryFails(t *testing.T) {
+	oldM, oldS, oldN := getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice
+	t.Cleanup(func() { getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice = oldM, oldS, oldN })
+	bin := t.TempDir()
+	script := "#!/bin/sh\necho 'findmnt: failed to read mount table: Permission denied' >&2\nexit 1\n"
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "findmnt"), []byte(script), 0o700)) //nolint:gosec // test-only executable stub
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	getMountedBlockDevices = util.GetMountedBlockDevices
+	getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+	getNVMeInfoFromDevice = func(string) (string, error) { return "nqn.in-use", nil }
+
+	d := &Driver{}
+	seen := &sync.Map{}
+	seen.Store("nqn.in-use", time.Now().Add(-time.Hour))
+	disconnected := false
+	d.gcSessions(context.Background(), time.Second, false, sessionGCProtocol{
+		name: "test", metricLabel: "nvmeof", seen: seen,
+		list:       func() ([]gcSession, error) { return []gcSession{{id: "nqn.in-use", inScope: true}}, nil },
+		expected:   d.getExpectedNVMeoFNQNs,
+		disconnect: func(string) error { disconnected = true; return nil },
+	})
+	require.False(t, disconnected, "an unreadable mount table must never make an in-use session look orphaned")
+}
+
+// Round-5 verifier N6 (codex, 2026-09-24): expectedStagedSessions tolerated up
+// to two failed identity lookups and simply dropped those devices, so a mounted
+// device whose transport identity could not be read made its in-use session
+// look orphaned, and it was disconnected once the grace period passed. Any
+// failed lookup of a likely-protocol device must veto the pass. A device
+// POSITIVELY identified as local (no iSCSI session in its sysfs ancestry) must
+// not veto it, or iSCSI GC never runs on a node with a mounted local disk.
+func TestSessionGCNeverDisconnectsWhenAnIdentityLookupFails(t *testing.T) {
+	for _, tc := range []struct {
+		protocol    string
+		device      string
+		lookupErr   error
+		orphanID    string
+		wantDisconn bool
+	}{
+		{protocol: "nvmeof", device: "/dev/nvme0n1", lookupErr: errors.New("sysfs temporarily unreadable"), orphanID: "in-use"},
+		{protocol: "iscsi", device: "/dev/sda", lookupErr: errors.New("sysfs temporarily unreadable"), orphanID: "in-use"},
+		// A local disk is not a failed lookup: a genuinely orphaned iSCSI
+		// session is still collected.
+		{protocol: "iscsi", device: "/dev/sdb", lookupErr: fmt.Errorf("%w: /dev/sdb", util.ErrNotISCSIDevice), orphanID: "orphan", wantDisconn: true},
+	} {
+		t.Run(tc.protocol+" "+tc.device, func(t *testing.T) {
+			oldM, oldS, oldN, oldI := getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice, getISCSIInfoFromDevice
+			t.Cleanup(func() {
+				getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice, getISCSIInfoFromDevice = oldM, oldS, oldN, oldI
+			})
+			getMountedBlockDevices = func() (map[string]string, error) {
+				return map[string]string{tc.device: kubeletCSIStagingRoot + "/csi.scale.io/volume/globalmount"}, nil
+			}
+			getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+			getNVMeInfoFromDevice = func(string) (string, error) { return "", tc.lookupErr }
+			getISCSIInfoFromDevice = func(string) (string, string, error) { return "", "", tc.lookupErr }
+
+			d := &Driver{}
+			expected := d.getExpectedNVMeoFNQNs
+			if tc.protocol == "iscsi" {
+				expected = d.getExpectedISCSITargets
+			}
+			disconnected := false
+			p := sessionGCProtocol{
+				name: tc.protocol, metricLabel: tc.protocol, seen: &sync.Map{},
+				list:       func() ([]gcSession, error) { return []gcSession{{id: tc.orphanID, inScope: true}}, nil },
+				expected:   expected,
+				disconnect: func(string) error { disconnected = true; return nil },
+			}
+			d.gcSessions(context.Background(), time.Millisecond, false, p)
+			time.Sleep(5 * time.Millisecond)
+			d.gcSessions(context.Background(), time.Millisecond, false, p)
+			assert.Equal(t, tc.wantDisconn, disconnected)
+		})
+	}
+}
+
+// Round-6 verifier N7 (codex, 2026-09-24): a mounted device whose identity is
+// unresolved used to be dropped as "unlikely" purely by its name shape (a dm
+// map with an unreadable uuid, a partition), so its in-use session was
+// disconnected. Unknown must veto; only a positively excluded class (loop, …)
+// may be skipped, and an NVMe partition resolves to its namespace.
+func TestSessionGCTreatsUnresolvedDevicesAsPossiblyInUse(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		protocol    string
+		device      string
+		parent      string
+		wantDisconn bool
+	}{
+		{name: "iSCSI dm map with unresolved identity", protocol: "iscsi", device: "/dev/dm-3"},
+		{name: "iSCSI partition with unresolved identity", protocol: "iscsi", device: "/dev/sdc1"},
+		{name: "NVMe partition resolves to its in-use namespace", protocol: "nvmeof", device: "/dev/nvme0n1p1", parent: "/dev/nvme0n1"},
+		{name: "iSCSI loop device is positively excluded", protocol: "iscsi", device: "/dev/loop0", wantDisconn: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldM, oldS, oldN, oldI, oldP := getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice, getISCSIInfoFromDevice, blockDeviceParent
+			t.Cleanup(func() {
+				getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice, getISCSIInfoFromDevice, blockDeviceParent = oldM, oldS, oldN, oldI, oldP
+			})
+			getMountedBlockDevices = func() (map[string]string, error) {
+				return map[string]string{tc.device: kubeletCSIStagingRoot + "/csi.scale.io/volume/globalmount"}, nil
+			}
+			getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
+			blockDeviceParent = func(device string) string {
+				if device == tc.device && tc.parent != "" {
+					return tc.parent
+				}
+				return device
+			}
+			getNVMeInfoFromDevice = func(device string) (string, error) {
+				if device == "/dev/nvme0n1" {
+					return "in-use", nil
+				}
+				return "", errors.New("invalid NVMe device name")
+			}
+			getISCSIInfoFromDevice = func(string) (string, string, error) { return "", "", errors.New("identity unresolved") }
+
+			d := &Driver{}
+			expected := d.getExpectedNVMeoFNQNs
+			if tc.protocol == "iscsi" {
+				expected = d.getExpectedISCSITargets
+			}
+			disconnected := false
+			p := sessionGCProtocol{
+				name: tc.protocol, metricLabel: tc.protocol, seen: &sync.Map{},
+				list:       func() ([]gcSession, error) { return []gcSession{{id: "in-use", inScope: true}}, nil },
+				expected:   expected,
+				disconnect: func(string) error { disconnected = true; return nil },
+			}
+			d.gcSessions(context.Background(), time.Millisecond, false, p)
+			time.Sleep(5 * time.Millisecond)
+			d.gcSessions(context.Background(), time.Millisecond, false, p)
+			assert.Equal(t, tc.wantDisconn, disconnected)
 		})
 	}
 }

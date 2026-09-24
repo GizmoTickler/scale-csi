@@ -1844,6 +1844,11 @@ func GetISCSIInfoFromDevice(devicePath string) (portal, iqn string, err error) {
 	return GetISCSIInfoFromDeviceWithSessions(devicePath, sessions)
 }
 
+// ErrNotISCSIDevice reports a device whose sysfs ancestry was read successfully
+// and contains no iSCSI session: positive evidence the device is local, not a
+// failed lookup.
+var ErrNotISCSIDevice = errors.New("not an iSCSI device")
+
 // GetISCSIInfoFromDeviceWithSessions returns the portal and IQN for a device
 // using a pre-fetched session list.
 func GetISCSIInfoFromDeviceWithSessions(devicePath string, sessions []ISCSISessionInfo) (portal, iqn string, err error) {
@@ -1854,12 +1859,20 @@ func getISCSIInfoFromDeviceWithSessionsInPaths(devicePath string, sessions []ISC
 	if resolved, resolveErr := filepath.EvalSymlinks(devicePath); resolveErr == nil {
 		devicePath = resolved
 	}
+	// Partitions (a mounted sda1, a dm slave like Flatcar's sda3 under
+	// /dev/mapper/usr) have no /sys/block/<partition>/device; their identity is
+	// the whole disk's.
+	devicePath = blockDeviceParentAt(filepath.Join(filepath.Dir(sysBlockRoot), "class", "block"), devicePath)
 	deviceName := filepath.Base(devicePath)
 	if strings.HasPrefix(deviceName, "dm-") {
 		slaves, readErr := os.ReadDir(filepath.Join(sysBlockRoot, deviceName, "slaves"))
 		if readErr != nil {
 			return "", "", fmt.Errorf("failed to inspect dm-multipath slaves for %s: %w", devicePath, readErr)
 		}
+		// A map whose slaves are ALL positively local (LVM on a local disk, a
+		// multipath map over local/FC paths) is itself positively not iSCSI.
+		// Any slave with an unknown identity keeps the whole map unknown.
+		allLocal := len(slaves) > 0
 		for _, slave := range slaves {
 			slavePortal, slaveIQN, slaveErr := getISCSIInfoFromDeviceWithSessionsInPaths(
 				filepath.Join(devRoot, slave.Name()), sessions, sysBlockRoot, sessionClassRoot, devRoot,
@@ -1867,6 +1880,12 @@ func getISCSIInfoFromDeviceWithSessionsInPaths(devicePath string, sessions []ISC
 			if slaveErr == nil {
 				return slavePortal, slaveIQN, nil
 			}
+			if !errors.Is(slaveErr, ErrNotISCSIDevice) {
+				allLocal = false
+			}
+		}
+		if allLocal {
+			return "", "", fmt.Errorf("%w: every slave of %s is local", ErrNotISCSIDevice, devicePath)
 		}
 		return "", "", fmt.Errorf("no iSCSI session found for dm-multipath device %s", devicePath)
 	}
@@ -1881,21 +1900,32 @@ func getISCSIInfoFromDeviceWithSessionsInPaths(devicePath string, sessions []ISC
 
 	// Walk up until we find "session*"
 	sessionDir := ""
+	reachedRoot := false
 	curr := targetPath
-	for i := 0; i < 10; i++ { // limit depth
+	for i := 0; i < 64; i++ { // bounded; real sysfs device paths are far shallower
 		if strings.HasPrefix(filepath.Base(curr), "session") {
 			sessionDir = curr
 			break
 		}
 		parent := filepath.Dir(curr)
 		if parent == curr {
+			reachedRoot = true
 			break
 		}
 		curr = parent
 	}
 
+	if sessionDir == "" && !reachedRoot {
+		// The bounded walk ran out before reaching the root: that proves
+		// nothing about the ancestry, so it stays an unknown, not "local".
+		return "", "", fmt.Errorf("sysfs ancestry of %s exceeded the walk bound", devicePath)
+	}
 	if sessionDir == "" {
-		return "", "", fmt.Errorf("could not find session directory for %s", devicePath)
+		// The device resolved in sysfs and no iSCSI session is among its
+		// ancestors: it is positively NOT an iSCSI disk (a local SCSI/SATA
+		// disk). Distinct from a failed lookup, which callers must treat as
+		// "unknown".
+		return "", "", fmt.Errorf("%w: %s", ErrNotISCSIDevice, devicePath)
 	}
 
 	// Get IQN
@@ -2027,4 +2057,41 @@ func removeISCSISessionByPortalIQN(sessions []ISCSISessionInfo, portal, iqn stri
 		}
 	}
 	return filtered
+}
+
+// BlockDeviceParent returns the whole-disk device a partition belongs to
+// ("/dev/sda1" -> "/dev/sda", "/dev/nvme0n1p2" -> "/dev/nvme0n1"), or the device
+// itself when it is not a partition. Identity lookups read whole-disk sysfs
+// entries, so a mounted partition must be resolved to its parent first.
+func BlockDeviceParent(devicePath string) string {
+	return blockDeviceParentAt("/sys/class/block", devicePath)
+}
+
+func blockDeviceParentAt(classBlockRoot, devicePath string) string {
+	name := filepath.Base(devicePath)
+	entry := filepath.Join(classBlockRoot, name)
+	if _, err := os.Stat(filepath.Join(entry, "partition")); err != nil {
+		return devicePath
+	}
+	resolved, err := filepath.EvalSymlinks(entry)
+	if err != nil {
+		return devicePath
+	}
+	return filepath.Join(filepath.Dir(devicePath), filepath.Base(filepath.Dir(resolved)))
+}
+
+// IsPositivelyNotISCSIBackable reports kernel device-name classes that the
+// driver's iSCSI staging never produces: the disks it stages are canonical
+// sdX / dm-N (multipath) names, never loop, ram/zram, nbd, sr or nvme. It is a
+// name-class exclusion for session GC, not a transport proof for arbitrary
+// stacked storage an operator builds by hand. Every other device whose identity
+// lookup FAILED is unknown, and session GC must treat it as possibly in use.
+func IsPositivelyNotISCSIBackable(devicePath string) bool {
+	name := filepath.Base(devicePath)
+	for _, prefix := range []string{"loop", "ram", "zram", "nbd", "sr", "nvme"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }

@@ -378,3 +378,103 @@ func TestDeleteOrphanedNVMeoFShareRefusesASubsystemItCanNoLongerProveItOwns(t *t
 	require.NoError(t, err)
 	assert.NotNil(t, survivor, "an unprovable subsystem must be retained, not force-deleted on a reusable row ID")
 }
+
+// TestDeleteOrphanedNVMeoFShareSweepsASubsystemCarryingTwoAbsentDatasets is the
+// deadlock the sole-occupancy gate introduced: a subsystem whose two CSI
+// namespaces BOTH reference deleted datasets was classified on one of them and
+// refused because of the other, on every pass, forever. A namespace whose
+// dataset is re-proven absent at sweep time serves nothing, so the sweep may
+// proceed. A live PV on the second volume still refuses.
+func TestDeleteOrphanedNVMeoFShareSweepsASubsystemCarryingTwoAbsentDatasets(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		secondLive  bool
+		wantDeleted bool
+	}{
+		{name: "both datasets absent", wantDeleted: true},
+		{name: "second volume still has a live PV", secondLive: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := truenas.NewMockClient()
+			d := newOrphanShareSweepDriver(client)
+
+			subsys, err := client.NVMeoFSubsystemCreate(ctx, d.nvmeSubsystemName("pool/parent/gone-a"), true, nil)
+			require.NoError(t, err)
+			_, err = client.NVMeoFNamespaceCreate(ctx, subsys.ID, "zvol/pool/parent/gone-a", "ZVOL")
+			require.NoError(t, err)
+			_, err = client.NVMeoFNamespaceCreate(ctx, subsys.ID, "zvol/pool/parent/gone-b", "ZVOL")
+			require.NoError(t, err)
+
+			kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+			report := ReconcileReport{}
+			d.detectOrphanedShares(ctx, kubeState, &report)
+			require.Len(t, report.OrphanShares, 1)
+
+			deleteState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+			if tc.secondLive {
+				// Mark the volume detection did NOT classify on; either may be
+				// chosen, since namespace order is not guaranteed.
+				other := "gone-b"
+				if report.OrphanShares[0].ID == "pool/parent/gone-b" {
+					other = "gone-a"
+				}
+				deleteState.volumeHandles[other] = struct{}{}
+			}
+			d.deleteOrphanedShares(ctx, &report, deleteState, 0, 5)
+
+			if tc.wantDeleted {
+				assert.Empty(t, report.SkippedDeletes)
+				assert.Len(t, report.DeletedShares, 1)
+				assert.Empty(t, nvmeoFNamespaceDevicePaths(t, client, subsys.ID))
+				return
+			}
+			assert.Empty(t, report.DeletedShares)
+			require.Len(t, report.SkippedDeletes, 1)
+			assert.Equal(t, "nvmeof_subsystem", report.SkippedDeletes[0].Kind)
+			assert.Len(t, nvmeoFNamespaceDevicePaths(t, client, subsys.ID), 2)
+		})
+	}
+}
+
+// TestOrphanShareSweepISCSIHandlesEveryExtentMapping: an orphan extent mapped to
+// its own driver-named target AND, by hand, to a foreign target. Only the first
+// mapping used to be considered, so with the foreign mapping first the sweep
+// refused on every pass and never reached the driver's target. The sweep must
+// delete the driver's target, remove the foreign mapping (the extent's dataset
+// is gone, it serves nothing) and leave the foreign target itself alone.
+func TestOrphanShareSweepISCSIHandlesEveryExtentMapping(t *testing.T) {
+	ctx := context.Background()
+	client := truenas.NewMockClient()
+	d := newOrphanShareSweepDriver(client)
+
+	shareName := d.iscsiShareName("gone-volume")
+	foreignTarget, err := client.ISCSITargetCreate(ctx, "operator-target", "", "ISCSI", nil)
+	require.NoError(t, err)
+	ownTarget, err := client.ISCSITargetCreate(ctx, shareName, "", "ISCSI", nil)
+	require.NoError(t, err)
+	extent, err := client.ISCSIExtentCreate(ctx, shareName,
+		"zvol/pool/parent/gone-volume", "truenas-csi: pool/parent/gone-volume", 512, true, "SSD")
+	require.NoError(t, err)
+	_, err = client.ISCSITargetExtentCreate(ctx, foreignTarget.ID, extent.ID, 0)
+	require.NoError(t, err)
+	_, err = client.ISCSITargetExtentCreate(ctx, ownTarget.ID, extent.ID, 0)
+	require.NoError(t, err)
+
+	kubeState := &kubernetesReconcileState{volumeHandles: make(map[string]struct{})}
+	report := ReconcileReport{}
+	d.detectOrphanedShares(ctx, kubeState, &report)
+	require.Len(t, report.OrphanShares, 1)
+
+	d.deleteOrphanedShares(ctx, &report, kubeState, 0, 5)
+
+	assert.Empty(t, report.SkippedDeletes)
+	assert.Equal(t, []string{"pool/parent/gone-volume"}, report.DeletedShares)
+	assert.NotContains(t, iscsiExtentNames(t, client), shareName)
+	targets := iscsiTargetNames(t, client)
+	assert.NotContains(t, targets, shareName, "the driver's own target is swept")
+	assert.Contains(t, targets, "operator-target", "a foreign target is never deleted")
+	mappings, err := client.ISCSITargetExtentFindByTarget(ctx, foreignTarget.ID)
+	require.NoError(t, err)
+	assert.Empty(t, mappings, "the foreign mapping to the dead extent is removed")
+}

@@ -808,20 +808,63 @@ func TestChartPrometheusRuleDefaultAlertCounts(t *testing.T) {
 		"--set", "metrics.prometheusRule.enabled=true")
 	defaultAlerts := strings.Count(defaultRender, "- alert:")
 	defaultRunbooks := strings.Count(defaultRender, "runbook_url:")
-	if defaultAlerts != 21 {
-		t.Errorf("default PrometheusRule render (prometheusRule.enabled, other defaults) must have 21 alerts, got %d", defaultAlerts)
+	if defaultAlerts != 22 {
+		t.Errorf("default PrometheusRule render (prometheusRule.enabled, other defaults) must have 22 alerts, got %d", defaultAlerts)
 	}
-	if defaultRunbooks != 11 {
-		t.Errorf("default PrometheusRule render must have 11 runbook_url annotations, got %d", defaultRunbooks)
+	if defaultRunbooks != 12 {
+		t.Errorf("default PrometheusRule render must have 12 runbook_url annotations, got %d", defaultRunbooks)
 	}
 
 	withDelete := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
 		"--set", "metrics.prometheusRule.enabled=true",
 		"--set", "reconcile.delete.enabled=true")
-	if got := strings.Count(withDelete, "- alert:"); got != 24 {
-		t.Errorf("prometheusRule + delete.enabled render must have 24 alerts, got %d", got)
+	if got := strings.Count(withDelete, "- alert:"); got != 27 {
+		t.Errorf("prometheusRule + delete.enabled render must have 27 alerts, got %d", got)
 	}
-	if got := strings.Count(withDelete, "runbook_url:"); got != 14 {
-		t.Errorf("prometheusRule + delete.enabled render must have 14 runbook_url annotations, got %d", got)
+	if got := strings.Count(withDelete, "runbook_url:"); got != 17 {
+		t.Errorf("prometheusRule + delete.enabled render must have 17 runbook_url annotations, got %d", got)
+	}
+}
+
+// TestChartTombstoneBacklogAlertIsAThreshold pins the fix for a permanent page:
+// ScaleCSITombstoneBacklog was "scale_csi_tombstone_snapshots > 0 for 48h",
+// which never clears on a cluster whose backup tool mounts hourly snapshot
+// clones (the tombstone count is never zero). It is now a configurable count
+// threshold, and the age/staleness thresholds are configurable too.
+func TestChartTombstoneBacklogAlertIsAThreshold(t *testing.T) {
+	out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true", "--set", "reconcile.delete.enabled=true",
+		"--set", "metrics.prometheusRule.tombstoneBacklogThreshold=750",
+		"--set", "metrics.prometheusRule.tombstoneOldestAgeSeconds=43200",
+		"--set", "metrics.prometheusRule.tombstoneReapStaleSeconds=25200")
+	for _, want := range []string{
+		`scale_csi_tombstone_snapshots{job="scale-csi-controller-metrics"}) > 750`,
+		`scale_csi_tombstone_oldest_age_seconds{job="scale-csi-controller-metrics"}) > 43200`,
+		`scale_csi_tombstone_reap_last_success_timestamp_seconds{job="scale-csi-controller-metrics"}) > 25200`,
+		"- alert: ScaleCSITombstoneReapRefusing",
+		"- alert: ScaleCSIReconcileDeleteDisabled",
+		"- alert: ScaleCSITombstoneUnknownAge",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("PrometheusRule render is missing %q", want)
+		}
+	}
+	if strings.Contains(out, "expr: scale_csi_tombstone_snapshots > 0") {
+		t.Error("the never-clearing '> 0' backlog expression must be gone")
+	}
+}
+
+// Verifier D3 (codex, 2026-09-24): an explicit 0 threshold is a supported value
+// ("page on any sustained backlog") and must not be replaced by the default.
+func TestChartTombstoneBacklogThresholdHonorsZero(t *testing.T) {
+	out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true",
+		"--set", "metrics.prometheusRule.tombstoneBacklogThreshold=0")
+	if !strings.Contains(out, `scale_csi_tombstone_snapshots{job="scale-csi-controller-metrics"}) > 0`) {
+		t.Fatal("an explicit tombstoneBacklogThreshold=0 must render `> 0`")
+	}
+	if def := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true"); !strings.Contains(def, `scale_csi_tombstone_snapshots{job="scale-csi-controller-metrics"}) > 500`) {
+		t.Fatal("the chart default must still render `> 500`")
 	}
 }

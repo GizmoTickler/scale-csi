@@ -1449,3 +1449,65 @@ func TestDevicePathNormalization(t *testing.T) {
 		})
 	}
 }
+
+// A concurrent publish for the same node can win the find-then-create race; the
+// loser's create is refused by middleware's hostnqn uniqueness. The row it
+// wanted exists, so the create must return it instead of failing the publish.
+func TestNVMeoFHostCreate_LostUniquenessRaceReturnsExistingHost(t *testing.T) {
+	const nqn = "nqn.2014-08.org.nvmexpress:NVMf:node-3"
+	for _, tc := range []struct {
+		name      string
+		createErr *rpcError
+		exists    bool
+		wantErr   bool
+	}{
+		{name: "validation refusal", createErr: &rpcError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"reason": "[EINVAL] nvmet_host_create.hostnqn: Object with this hostnqn already exists"}}, exists: true},
+		{name: "unique constraint", createErr: &rpcError{Code: -32001, Message: "Method call error", Data: map[string]interface{}{"reason": "UNIQUE constraint failed: services_nvmet_host.nvmet_host_hostnqn"}}, exists: true},
+		{name: "genuine failure stays a failure", createErr: &rpcError{Code: -32001, Message: "Method call error"}, exists: false, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockWSServer()
+			server := mock.start(func(conn *websocket.Conn) {
+				for {
+					var req rpcTestRequest
+					if err := conn.ReadJSON(&req); err != nil {
+						return
+					}
+					resp := rpcTestResponse{JSONRPC: "2.0", ID: req.ID}
+					switch req.Method {
+					case "auth.login_with_api_key":
+						resp.Result = true
+					case "system.info":
+						resp.Result = map[string]interface{}{"version": "TrueNAS-SCALE-26.0.0"}
+					case "nvmet.host.create":
+						resp.Error = tc.createErr
+					case "nvmet.host.query":
+						if tc.exists {
+							resp.Result = []interface{}{map[string]interface{}{"id": float64(41), "hostnqn": nqn}}
+						} else {
+							resp.Result = []interface{}{}
+						}
+					default:
+						resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+					}
+					if err := conn.WriteJSON(resp); err != nil {
+						return
+					}
+				}
+			})
+			defer mock.close()
+			client := newSnapshotTestClient(t, server.URL)
+
+			host, err := client.NVMeoFHostCreate(context.Background(), nqn)
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Nil(t, host)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, host)
+			assert.Equal(t, 41, host.ID)
+			assert.Equal(t, nqn, host.HostNQN)
+		})
+	}
+}

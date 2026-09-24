@@ -295,3 +295,103 @@ func newEnvelopeTestClient(t *testing.T, respond func(req rpcTestRequest, resp *
 	t.Cleanup(func() { _ = client.Close() })
 	return client
 }
+
+// A -32001 CallException's ENOENT describes the OPERATION, not the object. The
+// codex verifier (2026-09-24) showed a dataset delete failing on a missing
+// helper binary would have been read as "dataset absent" and turned into a
+// silent-success delete. No -32001 envelope may classify as not-found; absence
+// is proven at the call site by re-query.
+func TestIsNotFoundErrorNeverReadsCallExceptionAsAbsence(t *testing.T) {
+	for _, reason := range []string{
+		"[ENOENT] No such file or directory: '/usr/sbin/zfs'",
+		"[ENOENT] flashstor/scale-csi/pvc-x@snap: snapshot does not exist",
+		"Namespace 12 not found",
+	} {
+		err := &APIError{Code: -32001, Message: "Method call error", Data: map[string]interface{}{
+			"error": float64(2), "errname": "ENOENT", "reason": reason, "trace": nil, "extra": nil,
+		}}
+		assert.False(t, IsNotFoundError(err), reason)
+	}
+}
+
+// Re-verification residuals (codex, 2026-09-24): a nested dependency errno, or a
+// -32001 whose message happens to read "not found", must never classify as the
+// requested object's absence, because that verdict turns a failed delete into a
+// silent success. A nested errno may only veto.
+func TestNestedOrOperationErrnoNeverReadsAsAbsence(t *testing.T) {
+	for name, err := range map[string]error{
+		"-32001 ENOENT envelope with nested errno": &APIError{Code: -32001, Message: "Method call error", Data: map[string]interface{}{
+			"error": float64(2), "errname": "ENOENT", "reason": "helper not found", "extra": map[string]interface{}{"errno": float64(2)},
+		}},
+		"-32602 EINVAL envelope with nested dependency errno": &APIError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{
+			"error": float64(22), "errname": "EINVAL", "extra": map[string]interface{}{"dependency_errno": float64(2)},
+		}},
+		"-32001 with not-found prose in its message": &APIError{Code: -32001, Message: "helper not found", Data: map[string]interface{}{
+			"error": float64(22), "errname": "EINVAL",
+		}},
+	} {
+		assert.False(t, IsNotFoundError(err), name)
+	}
+	// Top-level errno stays authoritative in both directions.
+	assert.True(t, IsNotFoundError(&APIError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"errno": "ENOENT"}}))
+}
+
+// Round-3 verifier N2 (codex, 2026-09-24): the legacy get_instance fallback read
+// "no top-level errno" as "bare -32602 means missing", so a nested lookup failure
+// became "snapshot not found" and could retire tombstone bookkeeping.
+func TestSnapshotGetNestedLookupFailureIsNotAbsence(t *testing.T) {
+	client := newEnvelopeTestClient(t, func(req rpcTestRequest, resp *rpcTestResponse) {
+		switch req.Method {
+		case "auth.login_with_api_key":
+			resp.Result = true
+		case "pool.snapshot.get_instance":
+			resp.Error = &rpcError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"error": 22, "errname": "EINVAL", "extra": map[string]interface{}{"dependency_errno": 13}}}
+		default:
+			resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+		}
+	})
+	_, err := client.SnapshotGet(context.Background(), "tank/k8s/pvc@snap")
+	require.Error(t, err)
+	require.False(t, IsNotFoundError(err), "a failed lookup is not proof of snapshot absence: %v", err)
+}
+
+// Round-3 verifier N3: a failed release whose text happens to contain "hold" and
+// "not" (and a nested errno) must not read as "snapshot was not held" success.
+func TestSnapshotReleaseFailureIsNotNotHeldSuccess(t *testing.T) {
+	client := newEnvelopeTestClient(t, func(req rpcTestRequest, resp *rpcTestResponse) {
+		switch req.Method {
+		case "auth.login_with_api_key":
+			resp.Result = true
+		case "pool.snapshot.release":
+			resp.Error = &rpcError{Code: -1, Message: "hold not released: permission denied", Data: map[string]interface{}{"extra": map[string]interface{}{"errno": 13}}}
+		default:
+			resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+		}
+	})
+	require.Error(t, client.SnapshotRelease(context.Background(), "tank/k8s/pvc@snap"))
+}
+
+// Round-4 verifier N4 (codex, 2026-09-24): a nested errno must veto the libzfs
+// "lzc_hold() failed ... 17" text fallbacks, or a failed hold reads as held.
+func TestSnapshotHoldNestedFailureIsNotAlreadyHeld(t *testing.T) {
+	for _, e := range []*APIError{
+		{Code: -1, Message: "lzc_hold() failed: errno 17", Data: map[string]interface{}{"extra": map[string]interface{}{"errno": 13}}},
+		{Code: -32001, Message: "Method call error", Data: map[string]interface{}{"error": 22, "errname": "EINVAL", "reason": "('lzc_hold() failed', (('File exists', 17),))", "extra": map[string]interface{}{"errno": 13}}},
+	} {
+		t.Run(e.Message, func(t *testing.T) {
+			require.True(t, HasStructuredErrno(e))
+			require.False(t, IsAlreadyExistsError(e))
+			client := newEnvelopeTestClient(t, func(req rpcTestRequest, resp *rpcTestResponse) {
+				switch req.Method {
+				case "auth.login_with_api_key":
+					resp.Result = true
+				case "pool.snapshot.hold":
+					resp.Error = &rpcError{Code: e.Code, Message: e.Message, Data: e.Data}
+				default:
+					resp.Error = &rpcError{Code: -32601, Message: "Method not found"}
+				}
+			})
+			require.Error(t, client.SnapshotHold(context.Background(), "tank/k8s/pvc@snap"), "nested failure must veto hold-success text fallback")
+		})
+	}
+}

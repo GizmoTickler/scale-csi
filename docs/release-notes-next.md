@@ -1,4 +1,127 @@
-# Release notes — v1.11.2 (next)
+# Release notes — v1.12.0 (next)
+
+## v1.12.0 — CSI spec v1.13, NVMe failover convergence, deferred-defect closeout
+
+### Breaking: CSI spec v1.13 and the VolumeCondition surfaces are gone
+
+CSI spec v1.13 removed the alpha `VolumeCondition` field and both
+`VOLUME_CONDITION` capabilities, replacing them with separate alpha health
+RPCs. The spec v1.13.0 / csi-test v5.6.0 bump did not compile against the old
+code. Nothing consumed the old surface: `backendHealth` and
+`sidecars.healthMonitor` both defaulted off. So this release removes it rather
+than porting it:
+
+- `ListVolumes`, `ControllerGetVolume` and `NodeGetVolumeStats` no longer carry
+  a condition, and neither capability is advertised.
+- `NodeGetVolumeStats` returns `Internal` for an unresponsive mount or an
+  unreadable device. It used to return OK with an abnormal condition. The
+  bounded mount pre-gate still runs before any stat.
+- `ControllerGetVolume` now returns `PublishedNodeIds` from the publication
+  records it already reads.
+- The GF5 pool-health poller, its `scale_csi_pool_*` health gauges, its six
+  alerts and its dashboard panel are removed. So are the external
+  health-monitor sidecar and its RBAC.
+- The chart schema still accepts `backendHealth` and `sidecars.healthMonitor`
+  and ignores them, so existing values files validate. A driver config that
+  still contains `backendHealth` loads, with a deprecation warning at startup.
+- A locked encrypted volume no longer surfaces through CSI. It shows up only
+  as failing I/O and controller unlock errors.
+
+Also bumped: ginkgo v2.33.0, gomega v1.43.1, client_model v0.6.3; the attacher
+v4.13.0, registrar v2.18.0 and livenessprobe v2.20.0 sidecars; helm v4.3.0 in CI.
+
+### Already-connected NVMe-oF controllers never got `fast_io_fail_tmo`
+
+`nvme connect` applies `--fast_io_fail_tmo` only when a path is created, and
+NodeStage skips the connect for a subsystem that is already live. Controllers
+connected before the flag existed kept `fast_io_fail_tmo=off` for as long as
+their volume stayed staged. On 2026-09-23, 17 of the 30 multipath controllers
+across the three nodes were in that state. With `ctrl_loss_tmo=off` too, a dead
+path parks I/O on that controller instead of failing over to the three live
+paths.
+
+Every session-GC tick now converges the value through sysfs. The ownership
+check is positive: a controller is touched only when its subsystem NQN belongs
+to a device staged under this driver's own kubelet staging directory, and its
+transport, `traddr` and `trsvcid` match the configured targets. Another
+workload connected to the same NAS keeps its own timeout. If the staged-device
+scan fails, the pass does nothing. The kernel applies the write
+to the running controller, so no reconnect is needed. `sessionGC.dryRun` logs
+instead of writing. New metric:
+`scale_csi_nvme_controller_tunable_corrections_total{tunable,result}`.
+`--nr-io-queues` cannot be changed on a live controller; a new
+`nvmeof.connect.nrIOQueues` still needs a restage to take effect.
+
+### Session GC and error classification (independent verification)
+
+Seven rounds of independent verification (codex gpt-6-astra) found problems in
+this branch and in older code. All of them are fixed, and each fix has a test
+that fails on the code before it:
+
+- **Session GC can no longer disconnect an in-use volume on missing
+  evidence.** A `findmnt` read failure used to count as "no mounts". Up to two
+  failed device-identity lookups were tolerated, and a mounted dm map or
+  partition whose identity could not be resolved was dropped because its name
+  looked "unlikely". Now any unknown device skips that protocol's pass.
+  Partitions resolve to their parent disk. A dm map whose slaves are all local
+  counts as local, which keeps GC running on Flatcar's `/dev/mapper/usr`.
+- The block-mount inventory keeps every mount point per device (the staging
+  mount and the pod bind mount). It parses `findmnt -r`, which decodes escaped
+  whitespace and strips `[/subdir]` source decorations.
+- A structured errno nested inside an error (a dependency's errno, not the
+  call's own) can only veto a verdict. It is never read as the call's result,
+  so it can no longer turn a failed delete, snapshot lookup, hold or release
+  into a silent success.
+
+### Performance
+
+- `nvmet.namespace.query` now passes `extra.retrieve_locked_info=false`. The
+  per-row locked-path lookup was ~90ms of each ~100ms query (measured on
+  nas01), and this query runs about 7 times per clone lifecycle. The driver
+  never read the field.
+- DeleteVolume's two busy-observation reads (`pool.dataset.attachments`, ~570ms,
+  and `pool.dataset.processes`, ~210ms) now run concurrently.
+- Deliberately not parallelized: NVMe port-binding creates and deletes. Every
+  nvmet mutation ends in a `service.control RELOAD` under the per-service job
+  lock `service_nvmet`, so the reloads serialize on the NAS anyway.
+
+### Alerts
+
+- `ScaleCSITombstoneBacklog` was `scale_csi_tombstone_snapshots > 0 for 48h`.
+  On any cluster whose backup tool mounts hourly snapshot clones (kopiur,
+  VolSync) the count is never zero, so it paged permanently. It is now a
+  count threshold (`metrics.prometheusRule.tombstoneBacklogThreshold`, default
+  500; an explicit 0 is honored) held for 30m. The oldest-age and reap-staleness thresholds are
+  configurable as well (`tombstoneOldestAgeSeconds`, `tombstoneReapStaleSeconds`).
+- New bundled alerts, upstreamed from a production hand-written rule set:
+  `ScaleCSITombstoneReapRefusing`, `ScaleCSIReconcileDeleteDisabled` (both
+  gated on `reconcile.delete.enabled`) and `ScaleCSITombstoneUnknownAge`.
+
+### Deferred items closed
+
+- `NVMeoFHostCreate` now re-reads by NQN after a failed create. Two concurrent
+  first publishes to the same node no longer fail the loser on middleware's
+  hostnqn uniqueness check.
+- `findErrno` no longer descends into the envelope's `trace`, so a traceback
+  local named `errno` cannot speak for the call.
+- "`-32001` is unhandled in the not-found direction" is closed as intended
+  behavior, now pinned by a test. A CallException's ENOENT describes the
+  operation, not the object: a delete that fails on a missing helper binary
+  also reports ENOENT, and this verdict feeds silent-success deletes. A vanished
+  object is proven at the call site by re-query instead.
+- A NVMe-oF subsystem carrying two absent CSI datasets is swept. It no longer
+  deadlocks on the sole-occupancy gate, because the second dataset is
+  re-proven absent at sweep time.
+- The iSCSI orphan sweep handles every mapping of an extent, not just the
+  first one.
+- `startupConnectTimeout` values that overflow the int32 probe threshold fail
+  at render instead of at apply.
+- Deleting a values subtree fails schema validation naming the missing
+  property. It used to abort mid-render (45 subtrees).
+- "A refused orphan is re-probed forever": no change needed. Every refusal
+  already reaches `scale_csi_tombstone_reap_last_skipped_refused` and
+  `ScaleCSITombstoneReapRefusing`, and the re-probe is what lets a later pass
+  retry.
 
 ## v1.11.2 — tombstone reaper clone scope + controller secret RBAC escape hatch
 

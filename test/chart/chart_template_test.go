@@ -737,80 +737,10 @@ func TestChartReconcileStalledThresholdDerivation(t *testing.T) {
 	}
 }
 
-// TestChartHealthMonitorSidecar guards the external-health-monitor sidecar render
-// invariant (E3/K11b). The sidecar and its extra RBAC are strictly opt-in: the
-// default render carries no csi-external-health-monitor container and no health
-// pods watch rule, keeping the default manifest byte-identical. Enabling
-// sidecars.healthMonitor renders the pinned-image container, the ACTIVE
-// --list-volumes-interval cadence (this driver advertises LIST_VOLUMES; codex M1)
-// plus the --monitor-interval fallback, and the pods get/list/watch + events get
-// RBAC delta. The RBAC assertions parse the controller ClusterRole per-resource
-// (codex L2) so an accidentally unconditional pods rule cannot slip past a
-// whole-render substring match.
-func TestChartHealthMonitorSidecar(t *testing.T) {
-	t.Run("default render omits the sidecar and its RBAC", func(t *testing.T) {
-		out := helmTemplate(t)
-		if strings.Contains(out, "csi-external-health-monitor") {
-			t.Errorf("default render must not emit the external-health-monitor sidecar; it is opt-in")
-		}
-		// Parse the controller ClusterRole and assert it carries NO pods rule at
-		// all (capacity and health-monitor are both off). A substring match on the
-		// whole render could not distinguish an unconditional pods rule from the
-		// gated one; per-resource parsing can.
-		role := findManifest(t, decodeManifests(t, out), "ClusterRole", "scale-csi-controller")
-		if roleTouchesResource(role, "pods") {
-			t.Errorf("default controller ClusterRole must not grant any pods rule; health-monitor RBAC is opt-in")
-		}
-	})
-
-	t.Run("enabled renders the sidecar and RBAC", func(t *testing.T) {
-		out := helmTemplate(t, "--set", "sidecars.healthMonitor.enabled=true")
-		for _, want := range []string{
-			"- name: csi-external-health-monitor",
-			"image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.18.0",
-			// codex M1: LIST_VOLUMES is advertised, so --list-volumes-interval is
-			// the active cadence; --monitor-interval is retained as the fallback.
-			`"--list-volumes-interval=60s"`,
-			`"--monitor-interval=60s"`,
-		} {
-			if !strings.Contains(out, want) {
-				t.Errorf("--set sidecars.healthMonitor.enabled=true did not render %q", want)
-			}
-		}
-
-		// Per-resource RBAC assertions on the controller ClusterRole.
-		role := findManifest(t, decodeManifests(t, out), "ClusterRole", "scale-csi-controller")
-		if !roleHasRule(role, []string{"pods"}, []string{"get", "list", "watch"}) {
-			t.Errorf("health-monitor RBAC must grant pods get/list/watch")
-		}
-		if !roleHasRule(role, []string{"events"}, []string{"get"}) {
-			t.Errorf("health-monitor RBAC must grant events get (codex L1 upstream parity)")
-		}
-		// (C10) Leader election runs in the release namespace via a Lease; the
-		// rule now lives on the NAMESPACED "-controller-leases" Role, not the
-		// cluster-scoped ClusterRole (every sidecar passes
-		// --leader-election-namespace={{ .Release.Namespace }}, so cluster
-		// scope was unnecessary privilege), and "delete" is dropped: client-go
-		// leader election releases a lease by updating holderIdentity, never
-		// by deleting the object.
-		leasesRole := findManifest(t, decodeManifests(t, out), "Role", "-controller-leases")
-		// roleHasRule matches verbs EXACTLY (order-sensitive), so this positive
-		// assertion alone also proves "delete" is absent: any extra verb
-		// (including delete, in any position) would fail the exact match.
-		if !roleHasRule(leasesRole, []string{"leases"}, []string{"get", "watch", "list", "create", "update"}) {
-			t.Errorf("controller-leases Role must keep the leases rule that backs health-monitor leader election, without delete")
-		}
-		if roleTouchesResource(role, "leases") {
-			t.Errorf("controller ClusterRole must no longer grant leases; it moved to the namespaced controller-leases Role")
-		}
-	})
-}
-
-// TestChartDurationValidation guards the two opt-in duration strings (codex M3):
-// sidecars.healthMonitor.interval and capacity.gaugeInterval. Both must be
-// positive Go durations. The schema rejects malformed strings — which previously
-// passed validation and then crash-looped the health-monitor's Go duration flag
-// parser (or silently disabled the opted-in gauges) — and zero durations, which
+// TestChartDurationValidation guards the opt-in duration strings (codex M3),
+// starting with capacity.gaugeInterval. Each must be a positive Go duration.
+// The schema rejects malformed strings — which previously passed validation and
+// then silently disabled the opted-in gauges — and zero durations, which
 // would make the interval meaningless. Each case asserts helm fails validation
 // and names the offending field by its schema JSON-pointer.
 func TestChartDurationValidation(t *testing.T) {
@@ -821,20 +751,6 @@ func TestChartDurationValidation(t *testing.T) {
 		pointer string
 		extra   []string
 	}{
-		{
-			name:    "healthMonitor.interval malformed",
-			setKey:  "sidecars.healthMonitor.interval",
-			bad:     "bogus",
-			pointer: "/sidecars/healthMonitor/interval",
-			extra:   []string{"--set", "sidecars.healthMonitor.enabled=true"},
-		},
-		{
-			name:    "healthMonitor.interval zero",
-			setKey:  "sidecars.healthMonitor.interval",
-			bad:     "0s",
-			pointer: "/sidecars/healthMonitor/interval",
-			extra:   []string{"--set", "sidecars.healthMonitor.enabled=true"},
-		},
 		{
 			name:    "capacity.gaugeInterval malformed",
 			setKey:  "capacity.gaugeInterval",
@@ -1257,5 +1173,20 @@ func TestChartMultipathDocumentsNodeHalfScope(t *testing.T) {
 	values := string(raw)
 	if !strings.Contains(values, "CREATE-ONLY") {
 		t.Error("values.yaml must document that nvmeof.portPerf is applied at port create only")
+	}
+}
+
+// TestChartStartupConnectTimeoutFailsAtRenderPastInt32 pins the deferred
+// v1.11.0 item: a startupConnectTimeout large enough to push the derived
+// startup-probe failureThreshold past int32 rendered fine and was only rejected
+// by the API server at apply time. It must fail at render, and a large but
+// representable value must still render.
+func TestChartStartupConnectTimeoutFailsAtRenderPastInt32(t *testing.T) {
+	out := helmTemplateExpectError(t, "--set", "startupConnectTimeout=7000000h")
+	if !strings.Contains(out, "exceeds the int32 maximum") {
+		t.Fatalf("expected the int32 overflow message, got:\n%s", out)
+	}
+	if rendered := helmTemplate(t, "--set", "startupConnectTimeout=20000h"); !strings.Contains(rendered, "failureThreshold: 7200001") {
+		t.Fatalf("a representable timeout must still render its derived threshold")
 	}
 }

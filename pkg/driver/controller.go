@@ -582,16 +582,6 @@ func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.Control
 			},
 		},
 		{
-			// Meaningful only alongside GET_VOLUME: ControllerGetVolume populates
-			// Volume.Status.VolumeCondition from the dataset's already-returned
-			// user properties (no extra API call).
-			Type: &csi.ControllerServiceCapability_Rpc{
-				Rpc: &csi.ControllerServiceCapability_RPC{
-					Type: csi.ControllerServiceCapability_RPC_VOLUME_CONDITION,
-				},
-			},
-		},
-		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
@@ -2382,16 +2372,7 @@ func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (
 				VolumeId:      volumeID,
 				CapacityBytes: capacity,
 			},
-			// Populate the entry's VolumeCondition from the dataset+pool
-			// composition ControllerGetVolume also builds on. external-health-monitor
-			// v0.18.0 prefers ListVolumes whenever LIST_VOLUMES is advertised and
-			// reads Entry.Status.VolumeCondition; leaving it nil made its nil-safe
-			// getters report every listed volume as normal (codex H1). The opt-in
-			// quota upgrade (GF2/E4) is deliberately NOT applied here — one quota
-			// query per listed volume — so near-quota surfaces via the reconcile
-			// sweep's gauge and alert instead; see volumeConditionFromDataset.
 			Status: &csi.ListVolumesResponse_VolumeStatus{
-				VolumeCondition: d.volumeCondition(ds),
 				// LIST_VOLUMES_PUBLISHED_NODES (F-1): the hydrated dataset
 				// already carries the volume's publication records, so this is
 				// free. Requires the source-bearing pool.dataset.query read
@@ -3357,32 +3338,16 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 		return nil, status.Errorf(codes.Internal, "failed to get volume details: %v", err)
 	}
 
-	// VolumeCondition is derived from the dataset's ALREADY-returned user
-	// properties (no extra API call) via the same helper ListVolumes uses. A
-	// dataset-gone case returns NotFound above, so reaching here means the
-	// backend object exists; abnormal is reserved for a definitive negative
-	// marker (see volumeConditionFromDataset).
-	condition := volumeConditionFromDataset(ds)
-
 	// GF2/E4 quota/usage reporting is strictly opt-in: when enabled, one extra
-	// pool.dataset.query feeds the per-volume usage metrics and upgrades the
-	// condition to abnormal once the volume crosses 95% of its effective quota.
-	// When disabled (the default) no extra call is made and the condition is the
-	// stamp-derived one above, exactly as before.
+	// pool.dataset.query feeds the per-volume usage metrics. When disabled (the
+	// default) no extra call is made. CSI spec v1.13 removed the alpha
+	// VolumeCondition field this used to also feed.
 	if d.config.ZFS.ReportVolumeUsage {
 		usage, usageErr := d.truenasClient.DatasetGetQuotaUsage(ctx, datasetName)
 		if usageErr != nil {
 			klog.Warningf("ControllerGetVolume: failed to read quota/usage for volume %s: %v", volumeID, usageErr)
 		} else {
 			RecordVolumeUsage(volumeID, usage)
-			if volumeUsageNearQuota(usage) {
-				// UPGRADE, never REPLACE (GF2-fix4/L2). The stamp-derived condition
-				// can already be the definitive negative "provisioning is explicitly
-				// marked failed", and overwriting the whole struct lost that stronger
-				// reason exactly when both were true. Only Abnormal false->true and
-				// an appended message.
-				condition = upgradeConditionNearQuota(condition, usage)
-			}
 		}
 	}
 
@@ -3392,100 +3357,9 @@ func (d *Driver) ControllerGetVolume(ctx context.Context, req *csi.ControllerGet
 			CapacityBytes: d.getDatasetCapacity(ds),
 		},
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			// Compose the stamp+quota condition (GF2/E4) with the pool-level
-			// backend-health snapshot (GF5): a dataset-specific abnormal —
-			// including the >95% quota upgrade above — wins over a pool-level
-			// one, exactly as composeVolumeCondition orders it.
-			VolumeCondition: composeVolumeCondition(condition, d.poolHealthSnapshot()),
+			PublishedNodeIds: publishedNodeIDsFromDataset(ds),
 		},
 	}, nil
-}
-
-// volumeConditionFromDataset derives a CSI VolumeCondition from a fetched
-// dataset's user properties without any further API call. It is the shared BASE
-// for ControllerGetVolume and ListVolumes (both then compose the pool-level
-// backend-health snapshot on top). The two RPCs are NOT guaranteed identical:
-// ControllerGetVolume alone upgrades on the opt-in quota signal (GF2/E4,
-// zfs.reportVolumeUsage) — doing that in ListVolumes would cost one quota query
-// per listed volume. The external-health-monitor prefers ListVolumes when
-// LIST_VOLUMES is advertised, so the near-quota signal reaches operators
-// through the reconcile sweep's scale_csi_volume_near_quota gauge and its
-// alert, not necessarily through the PVC's VolumeCondition.
-//
-// The semantics are deliberately conservative about declaring ill health. A
-// volume is abnormal ONLY on a definitive negative marker: an explicit
-// provision_success="false". A dataset-gone condition never reaches here (both
-// callers return NotFound first). Missing managed/provision stamps are NOT
-// evidence of ill health: the always-on adoption reconcile backfills only
-// driver_instance_id, and a long-Bound legacy volume never re-runs CreateVolume
-// (the sole path that writes both stamps), so an unstamped dataset can be
-// perfectly healthy. Those are reported normal with a message noting the health
-// is unverified, rather than flagged abnormal and raising spurious volume-health
-// events on clusters with pre-stamp legacy PVs.
-func volumeConditionFromDataset(ds *truenas.Dataset) *csi.VolumeCondition {
-	// Encryption at rest (GF-Sprint 1, E-3 §2): a locked encrypted dataset serves
-	// ZERO I/O (P-4) — a definitive dataset-level negative, so it wins exactly like
-	// provision_success=false. The locked signal rides on the queried dataset
-	// (pool.dataset.query returns locked:true, P-4 — but only when the read
-	// PROJECTS the encryption properties; until GF1-fix6 it did not and a locked,
-	// dead-I/O volume reported healthy), so BOTH ControllerGetVolume and
-	// ListVolumes surface it through the existing composition with no extra call and
-	// no parallel path. A plaintext dataset (Encrypted=false) never takes this arm.
-	// ListVolumes must therefore keep feeding this from a pool.dataset.query read:
-	// zfs.resource.query carries no encryption fields at all (P-11).
-	if ds != nil && ds.Encrypted && ds.Locked {
-		return &csi.VolumeCondition{
-			Abnormal: true,
-			Message:  "dataset locked (encrypted, key not loaded)",
-		}
-	}
-	if datasetUserProperty(ds, PropProvisionSuccess) == "false" {
-		return &csi.VolumeCondition{
-			Abnormal: true,
-			Message:  "dataset provisioning is explicitly marked failed",
-		}
-	}
-	managed := datasetUserProperty(ds, PropManagedResource) == "true"
-	provisioned := datasetUserProperty(ds, PropProvisionSuccess) == "true"
-	if managed && provisioned {
-		return &csi.VolumeCondition{Abnormal: false}
-	}
-	return &csi.VolumeCondition{
-		Abnormal: false,
-		Message:  "volume health unverified: managed/provision stamps absent (legacy or adoption-pending dataset)",
-	}
-}
-
-// upgradeConditionNearQuota folds the >95% quota finding into an existing
-// VolumeCondition (GF2-fix4/L2): Abnormal is only ever raised false->true and
-// the quota text is APPENDED, so a definitive-negative message the stamp check
-// already produced survives instead of being overwritten by the quota one.
-func upgradeConditionNearQuota(condition *csi.VolumeCondition, usage *truenas.DatasetQuotaUsage) *csi.VolumeCondition {
-	message := volumeNearQuotaMessage(usage)
-	if condition == nil {
-		return &csi.VolumeCondition{Abnormal: true, Message: message}
-	}
-	condition.Abnormal = true
-	if condition.Message == "" {
-		condition.Message = message
-	} else {
-		condition.Message += "; " + message
-	}
-	return condition
-}
-
-// volumeNearQuotaMessage reports the REAL numbers behind the near-quota finding:
-// which ZFS property binds the volume and the usage measurement that property
-// actually governs (GF2-fix4/H1). When snapshots hold space that `refquota` does
-// NOT count, that is called out too — it is the number an operator otherwise
-// spends an afternoon reconciling against `zfs list`.
-func volumeNearQuotaMessage(usage *truenas.DatasetQuotaUsage) string {
-	used, quota, limit := volumeUsageBasis(usage)
-	message := fmt.Sprintf("volume uses %d of %d bytes (>95%% of its %s)", used, quota, limit)
-	if limit == volumeLimitRefquota && usage.UsedBySnapshots > 0 {
-		message += fmt.Sprintf("; a further %d bytes are held by snapshots and do not count against refquota", usage.UsedBySnapshots)
-	}
-	return message
 }
 
 // ControllerModifyVolume lives in controller_modify.go with the rest of the

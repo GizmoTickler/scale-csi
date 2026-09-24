@@ -69,7 +69,7 @@ func assertHardenedSidecar(t *testing.T, container manifest, expectNonRoot bool)
 // hardened baseline belongs to sidecars only, while the node driver's existing
 // privileged/SYS_ADMIN context remains untouched for mount and block-device work.
 func TestChartGF2SidecarSecurityContexts(t *testing.T) {
-	rendered := helmTemplate(t, "--set", "sidecars.healthMonitor.enabled=true")
+	rendered := helmTemplate(t)
 	manifests := decodeManifests(t, rendered)
 	controller := findManifest(t, manifests, "Deployment", "-controller")
 	node := findManifest(t, manifests, "DaemonSet", "-node")
@@ -80,7 +80,6 @@ func TestChartGF2SidecarSecurityContexts(t *testing.T) {
 		"csi-resizer",
 		"csi-snapshotter",
 		"liveness-probe",
-		"csi-external-health-monitor",
 	} {
 		assertHardenedSidecar(t, workloadContainer(t, controller, name), true)
 	}
