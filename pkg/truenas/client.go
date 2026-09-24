@@ -101,16 +101,13 @@ func IsNotFoundError(err error) bool {
 		if isJSONRPCProtocolError(apiErr.Code) {
 			return false
 		}
-		// A CallException arrives as -32001 whose Message is the constant
-		// "Method call error", so the message match below can never see it, and
-		// its errno sits under the envelope's "error"/"errname" keys, which
-		// APIErrno does not read. This direction feeds silent-success deletes,
-		// so it is deliberately stricter than IsAlreadyExistsError: only a
-		// -32001 whose OWN top-level errno is exactly ENOENT (never the generic
-		// EINVAL, never a validation entry) and whose own reason says so.
-		if apiErr.Code == -32001 && callExceptionReportsNotFound(apiErr) {
-			return true
-		}
+		// A -32001 CallException is deliberately NOT read as absence, even
+		// with a top-level ENOENT and "not found" prose. That errno describes
+		// the operation, not the object: a delete that fails because a helper
+		// binary or config file is missing also reports ENOENT, and this
+		// verdict feeds silent-success deletes. Callers that need to tolerate a
+		// vanished object prove it at the call site with a re-query
+		// (deleteVanishedTolerant).
 		// Match the human-readable Message only, NOT FullError(): FullError embeds
 		// the whole Data blob via %+v, so a -1 error that merely MENTIONS "not
 		// found" about some nested object (e.g. a validation entry referencing a
@@ -123,22 +120,6 @@ func IsNotFoundError(err error) bool {
 	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "not found") || strings.Contains(errStr, "does not exist")
-}
-
-// callExceptionReportsNotFound reads a -32001 envelope's own errno and reason.
-// It never descends, so an ENOENT mentioned in a trace frame or a nested object
-// cannot speak for this call.
-func callExceptionReportsNotFound(apiErr *APIError) bool {
-	data, ok := apiErr.Data.(map[string]interface{})
-	if !ok {
-		return false
-	}
-	errno, ok := envelopeErrno(data)
-	if !ok || errno != syscall.ENOENT {
-		return false
-	}
-	reason, ok := data["reason"].(string)
-	return ok && containsAnyFold(reason, []string{"not found", "does not exist", "no such"})
 }
 
 // IsAlreadyExistsError returns true if the error indicates a resource already exists.

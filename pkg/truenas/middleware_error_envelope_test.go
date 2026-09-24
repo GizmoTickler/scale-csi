@@ -296,33 +296,20 @@ func newEnvelopeTestClient(t *testing.T, respond func(req rpcTestRequest, resp *
 	return client
 }
 
-// A CallException carrying ENOENT arrives as -32001 "Method call error"; the
-// errno is only in the envelope. It must classify as not-found, but only when
-// the envelope's own errno is ENOENT and its own reason agrees.
-func TestIsNotFoundErrorReadsCallExceptionEnvelope(t *testing.T) {
-	envelope := func(errno interface{}, errname, reason string, trace interface{}) error {
-		data := map[string]interface{}{"reason": reason, "trace": trace, "extra": nil}
-		if errno != nil {
-			data["error"] = errno
-		}
-		if errname != "" {
-			data["errname"] = errname
-		}
-		return &APIError{Code: -32001, Message: "Method call error", Data: data}
+// A -32001 CallException's ENOENT describes the OPERATION, not the object. The
+// codex verifier (2026-09-24) showed a dataset delete failing on a missing
+// helper binary would have been read as "dataset absent" and turned into a
+// silent-success delete. No -32001 envelope may classify as not-found; absence
+// is proven at the call site by re-query.
+func TestIsNotFoundErrorNeverReadsCallExceptionAsAbsence(t *testing.T) {
+	for _, reason := range []string{
+		"[ENOENT] No such file or directory: '/usr/sbin/zfs'",
+		"[ENOENT] flashstor/scale-csi/pvc-x@snap: snapshot does not exist",
+		"Namespace 12 not found",
+	} {
+		err := &APIError{Code: -32001, Message: "Method call error", Data: map[string]interface{}{
+			"error": float64(2), "errname": "ENOENT", "reason": reason, "trace": nil, "extra": nil,
+		}}
+		assert.False(t, IsNotFoundError(err), reason)
 	}
-	assert.True(t, IsNotFoundError(envelope(float64(2), "ENOENT", "[ENOENT] flashstor/scale-csi/pvc-x@snap: snapshot does not exist", nil)))
-	assert.True(t, IsNotFoundError(envelope(nil, "ENOENT", "Namespace 12 not found", nil)))
-
-	assert.False(t, IsNotFoundError(envelope(float64(22), "EINVAL", "dataset does not exist", nil)),
-		"a generic EINVAL must not be read as absence")
-	assert.False(t, IsNotFoundError(envelope(float64(2), "ENOENT", "failed to open /etc/foo", nil)),
-		"ENOENT without corroborating text may be about some other path")
-	assert.False(t, IsNotFoundError(envelope(nil, "", "snapshot does not exist", nil)),
-		"no envelope errno is not a middlewared statement about this call")
-	assert.False(t, IsNotFoundError(envelope(float64(16), "EBUSY", "dataset is busy",
-		map[string]interface{}{"frames": []interface{}{map[string]interface{}{"locals": map[string]interface{}{"error": "2", "reason": "not found"}}}})),
-		"an ENOENT inside a trace frame must not speak for the call")
-	assert.False(t, IsNotFoundError(&APIError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{
-		"error": float64(2), "errname": "ENOENT", "reason": "x does not exist",
-	}}), "-32602 keeps its fail-closed not-found behavior")
 }

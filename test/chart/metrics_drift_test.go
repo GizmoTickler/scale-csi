@@ -853,3 +853,18 @@ func TestChartTombstoneBacklogAlertIsAThreshold(t *testing.T) {
 		t.Error("the never-clearing '> 0' backlog expression must be gone")
 	}
 }
+
+// Verifier D3 (codex, 2026-09-24): an explicit 0 threshold is a supported value
+// ("page on any sustained backlog") and must not be replaced by the default.
+func TestChartTombstoneBacklogThresholdHonorsZero(t *testing.T) {
+	out := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true",
+		"--set", "metrics.prometheusRule.tombstoneBacklogThreshold=0")
+	if !strings.Contains(out, `scale_csi_tombstone_snapshots{job="scale-csi-controller-metrics"}) > 0`) {
+		t.Fatal("an explicit tombstoneBacklogThreshold=0 must render `> 0`")
+	}
+	if def := helmTemplate(t, "--show-only", "templates/prometheusrule.yaml",
+		"--set", "metrics.prometheusRule.enabled=true"); !strings.Contains(def, `scale_csi_tombstone_snapshots{job="scale-csi-controller-metrics"}) > 500`) {
+		t.Fatal("the chart default must still render `> 500`")
+	}
+}

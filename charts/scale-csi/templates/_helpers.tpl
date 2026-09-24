@@ -405,3 +405,18 @@ here and must not widen this grant.
 {{- end -}}
 {{- $needed -}}
 {{- end }}
+
+{{/*
+scale-csi.tombstoneBacklogThreshold renders metrics.prometheusRule.tombstoneBacklogThreshold.
+`default` cannot be used: Sprig treats a numeric 0 as empty, so an explicit 0
+("alert on any sustained backlog") silently became 500. Only an absent key takes
+the default.
+*/}}
+{{- define "scale-csi.tombstoneBacklogThreshold" -}}
+{{- $rule := .Values.metrics.prometheusRule -}}
+{{- if and (hasKey $rule "tombstoneBacklogThreshold") (not (kindIs "invalid" $rule.tombstoneBacklogThreshold)) -}}
+{{- $rule.tombstoneBacklogThreshold | int -}}
+{{- else -}}
+500
+{{- end -}}
+{{- end -}}

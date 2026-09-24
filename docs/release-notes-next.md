@@ -21,9 +21,9 @@ than porting it:
 - The GF5 pool-health poller, its `scale_csi_pool_*` health gauges, its six
   alerts and its dashboard panel are removed. So are the external
   health-monitor sidecar and its RBAC.
-- `backendHealth` and `sidecars.healthMonitor` are still accepted (schema and
-  driver config) and ignored, with a startup warning, so existing values files
-  and configmaps keep working.
+- The chart schema still accepts `backendHealth` and `sidecars.healthMonitor`
+  and ignores them, so existing values files validate. A driver config that
+  still contains `backendHealth` loads, with a deprecation warning at startup.
 - A locked encrypted volume no longer surfaces through CSI. It shows up only
   as failing I/O and controller unlock errors.
 
@@ -40,8 +40,12 @@ across the three nodes were in that state. With `ctrl_loss_tmo=off` too, a dead
 path parks I/O on that controller instead of failing over to the three live
 paths.
 
-Every session-GC tick now converges the value through sysfs on each fabrics
-controller whose `traddr` is a configured target. The kernel applies the write
+Every session-GC tick now converges the value through sysfs. The ownership
+check is positive: a controller is touched only when its subsystem NQN belongs
+to a device staged under this driver's own kubelet staging directory, and its
+transport, `traddr` and `trsvcid` match the configured targets. Another
+workload connected to the same NAS keeps its own timeout. If the staged-device
+scan fails, the pass does nothing. The kernel applies the write
 to the running controller, so no reconnect is needed. `sessionGC.dryRun` logs
 instead of writing. New metric:
 `scale_csi_nvme_controller_tunable_corrections_total{tunable,result}`.
@@ -66,7 +70,7 @@ instead of writing. New metric:
   On any cluster whose backup tool mounts hourly snapshot clones (kopiur,
   VolSync) the count is never zero, so it paged permanently. It is now a
   count threshold (`metrics.prometheusRule.tombstoneBacklogThreshold`, default
-  500) held for 30m. The oldest-age and reap-staleness thresholds are
+  500; an explicit 0 is honored) held for 30m. The oldest-age and reap-staleness thresholds are
   configurable as well (`tombstoneOldestAgeSeconds`, `tombstoneReapStaleSeconds`).
 - New bundled alerts, upstreamed from a production hand-written rule set:
   `ScaleCSITombstoneReapRefusing`, `ScaleCSIReconcileDeleteDisabled` (both
@@ -79,9 +83,11 @@ instead of writing. New metric:
   hostnqn uniqueness check.
 - `findErrno` no longer descends into the envelope's `trace`, so a traceback
   local named `errno` cannot speak for the call.
-- `IsNotFoundError` classifies a `-32001` CallException whose own top-level
-  errno is exactly ENOENT and whose reason corroborates it. A generic EINVAL, a
-  validation entry, or trace contents never count.
+- "`-32001` is unhandled in the not-found direction" is closed as intended
+  behavior, now pinned by a test. A CallException's ENOENT describes the
+  operation, not the object: a delete that fails on a missing helper binary
+  also reports ENOENT, and this verdict feeds silent-success deletes. A vanished
+  object is proven at the call site by re-query instead.
 - A NVMe-oF subsystem carrying two absent CSI datasets is swept. It no longer
   deadlocks on the sole-occupancy gate, because the second dataset is
   re-proven absent at sweep time.

@@ -199,13 +199,13 @@ spec:
           # snapshot clones keeps a steady, never-zero tombstone inflow, so
           # "> 0 for 48h" paged permanently on exactly those clusters. One
           # stuck tombstone is ScaleCSITombstoneOldestStuck's job.
-          expr: max(scale_csi_tombstone_snapshots{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > {{ .Values.metrics.prometheusRule.tombstoneBacklogThreshold | default 500 | int }}
+          expr: max(scale_csi_tombstone_snapshots{job={{ printf "%s-controller-metrics" (include "scale-csi.fullname" .) | quote }}}) > {{ include "scale-csi.tombstoneBacklogThreshold" . }}
           for: 30m
           labels:
             severity: warning
           annotations:
             summary: Scale CSI tombstone backlog is above its threshold
-            description: More than {{ .Values.metrics.prometheusRule.tombstoneBacklogThreshold | default 500 | int }} driver-tombstoned deferred-delete snapshots are awaiting reap. The guarded-cleanup CronJob is not keeping up with inflow or is refusing.
+            description: More than {{ include "scale-csi.tombstoneBacklogThreshold" . }} driver-tombstoned deferred-delete snapshots are awaiting reap. The guarded-cleanup CronJob is not keeping up with inflow or is refusing.
             runbook_url: docs/troubleshooting.md#tombstones-that-never-drain
         - alert: ScaleCSITombstoneOldestStuck
           # The eligible-count gauge (ScaleCSITombstoneBacklog) cannot see an
