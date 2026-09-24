@@ -178,6 +178,27 @@ Safety on the fabric, zero copy, fio crc32c:
 - failover drill (kill, kill, silent stall, kill; random read/write) 15 GiB, `err=0`, 8 GiB of it received zero-copy;
 - `kill -9` + `NVMEUBLK_RECOVER_ID` 12.5 GiB, `err=0`.
 
+### Tuning levers on the fabric (2026-09-24, same VM and zvol, two passes each)
+Zero copy plus 8 ublk queues (on 16 vCPUs) plus NAPI busy poll (`NVMEUBLK_NAPI_US=50`), against the kernel initiator:
+
+| | kernel nvme-tcp | zero copy, 8 queues, NAPI 50 µs |
+|---|---|---|
+| 128K read, 1 job, pinned | 950–998 MiB/s | 928–1,098 |
+| 128K read, 1 job | 753–764 | **818–826** (+8%) |
+| 128K read, 4 jobs | 2,537–2,551 | **2,812–2,872** (+11–13%) |
+| 128K write, 1 job | **607–626** | 519–566 (4 queues: 662–766) |
+| 4K randread 4×QD32 | 53.6–54.5K IOPS | **105–109K** (2×) |
+| 4K randwrite 4×QD32 | 53.7–55.5K | **85–90K** (1.6×) |
+| 4K randread QD1 | **284–315 µs** | 360–389 µs |
+| CPU per GiB, 4K randread | 22.9–23.2 core-s | **14.9–15.3** |
+
+- NAPI busy poll alone (4 queues) cut QD1 from 416 to 353–367 µs for about 1.5 more cores busy during the QD1 run.
+- 16 queues (one per vCPU, the kernel's layout) hurt small I/O (83–91K) and QD1 (530 µs). A single high result from a pinned stream (1,189 MiB/s) did not reproduce, so it is discarded.
+- `DEFER_TASKRUN` + `SINGLE_ISSUER` rings gave no gain, and the queue threads spun at 100% after `kill_dev` instead of exiting. The knob was removed.
+- Rig lesson: stop checks must wait for the daemon process to exit, not only for `/dev/ublkbN` to vanish. A daemon that stays alive keeps its device number, the next device comes up as `ublkb1`, and fio pointed at a missing `/dev/ublkb0` silently benchmarks a RAM-backed regular file it created (24 GB/s "results"). `fab`-style scripts now refuse to run unless the target is a block device, and refuse to start when anything stale is present.
+
+Still behind the kernel: QD1 latency (by about 75 µs) and single-stream large writes. The write path still does two copies (`pread` from the request, then send). A zero-copy send from the registered buffer is the next lever there.
+
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
 - The receiver tore down the admin queue before resubmitting orphans; that could wait behind a blocked keep-alive. Fix: fail over first.

@@ -214,7 +214,20 @@ fn queue_fn(
     draining: Arc<std::sync::atomic::AtomicBool>,
     cfg: qengine::QConfig,
 ) {
+    // NAPI busy poll (NVMEUBLK_NAPI_US): while this queue thread waits for
+    // events, the kernel polls the NIC queues of the sockets on its ring for
+    // up to N us instead of sleeping until an interrupt. Trades a slice of a
+    // core for latency. (DEFER_TASKRUN was tried: no gain, and the queue
+    // threads never exit after the device is deleted.)
     let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
+    let napi_us = env_u64("NVMEUBLK_NAPI_US", 0) as u32;
+    if napi_us > 0 {
+        let mut napi = io_uring::types::Napi::new().set_busy_poll_timeout(napi_us).set_prefer_busy_poll(true);
+        match libublk::io::with_queue_ring_mut(&q_rc, |ring| ring.submitter().register_napi(&mut napi)) {
+            Ok(()) => log::info!("queue {qid}: NAPI busy poll {napi_us} us"),
+            Err(e) => log::warn!("queue {qid}: NAPI busy poll not available: {e}"),
+        }
+    }
     let shift = ctrls.info.lba_shift;
     // Engine tasks are 'static (they own Rc<QEngine>); tag tasks borrow the
     // queue. Two local executors, ticked together from the same event loop.
