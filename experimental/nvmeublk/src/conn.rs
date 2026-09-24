@@ -61,6 +61,11 @@ impl Req {
 pub struct NsInfo {
     pub nsze: u64,
     pub lba_shift: u32,
+    /// Namespace identity (Identify Namespace NGUID and EUI64). Every path
+    /// and every reconnect must present the same one, or it is a different
+    /// namespace that merely has the same size.
+    pub nguid: [u8; 16],
+    pub eui64: [u8; 8],
     pub incapsule_bytes: usize,
     pub mdts_bytes: usize,
 }
@@ -109,30 +114,47 @@ impl AdminConn {
     /// C2HData into `out`.
     fn exec(&mut self, sqe: &Sqe, data: &[u8], mut out: Option<&mut [u8]>) -> Result<Cqe> {
         write_capsule(&mut self.s, sqe, data)?;
+        let cid = sqe.cid();
+        // Data must arrive in order and cover the whole buffer before any
+        // success is believed; a short or out-of-order transfer is an error.
+        let want = out.as_deref().map_or(0, |o| o.len());
+        let mut got = 0usize;
         loop {
-            let ch = read_ch(&mut self.s)?;
-            let mut psh = vec![0u8; ch.hlen as usize - CH_LEN];
-            self.s.read_exact(&mut psh)?;
+            let (ch, psh) = read_hdr(&mut self.s)?;
             match ch.ptype {
                 PDU_C2H_DATA => {
                     let h = parse_data_hdr(&psh);
-                    let pad = ch.pdo as usize - ch.hlen as usize;
-                    let mut skip = vec![0u8; pad];
+                    if h.cid != cid {
+                        bail!("admin C2HData for cid {} while waiting for {cid}", h.cid);
+                    }
+                    let mut skip = vec![0u8; ch.pdo as usize - ch.hlen as usize];
                     self.s.read_exact(&mut skip)?;
                     let mut chunk = vec![0u8; h.len as usize];
                     self.s.read_exact(&mut chunk)?;
-                    if let Some(o) = out.as_deref_mut() {
-                        let end = (h.off + h.len) as usize;
-                        if end > o.len() {
-                            bail!("admin C2HData beyond buffer ({end} > {})", o.len());
-                        }
-                        o[h.off as usize..end].copy_from_slice(&chunk);
+                    let Some(o) = out.as_deref_mut() else { bail!("admin C2HData for a command without data") };
+                    let end = h.off as usize + h.len as usize;
+                    if h.off as usize != got || end > o.len() {
+                        bail!("admin C2HData off {} len {} with {got} of {} received", h.off, h.len, o.len());
                     }
+                    o[h.off as usize..end].copy_from_slice(&chunk);
+                    got = end;
                     if ch.flags & FLAG_C2H_SUCCESS != 0 {
-                        return Ok(Cqe { cid: h.cid, ..Default::default() });
+                        if got != want {
+                            bail!("admin command reported success after {got} of {want} bytes");
+                        }
+                        return Ok(Cqe { cid, ..Default::default() });
                     }
                 }
-                PDU_CAPSULE_RESP => return Ok(Cqe::parse(&psh)),
+                PDU_CAPSULE_RESP => {
+                    let cqe = Cqe::parse(&psh);
+                    if cqe.cid != cid {
+                        bail!("admin completion for cid {} while waiting for {cid}", cqe.cid);
+                    }
+                    if cqe.sc() == 0 && got != want {
+                        bail!("admin command reported success after {got} of {want} bytes");
+                    }
+                    return Ok(cqe);
+                }
                 t => bail!("unexpected PDU {t:#x} on admin queue"),
             }
         }
@@ -185,6 +207,8 @@ impl AdminConn {
         let info = NsInfo {
             nsze,
             lba_shift,
+            nguid: ns[104..120].try_into().unwrap(),
+            eui64: ns[120..128].try_into().unwrap(),
             // ioccsz counts 16-byte units and includes the 64-byte SQE.
             incapsule_bytes: (ioccsz * 16).saturating_sub(64),
             mdts_bytes: if mdts == 0 { usize::MAX } else { 4096usize << mdts },
@@ -297,9 +321,7 @@ pub fn connect_io_queue(addr: SocketAddr, id: &Ident, cntlid: u16, qid: u16, qsi
     let (_cpda, maxh2c) = ic_handshake(&mut s)?;
     let (sqe, data) = connect_cmd(0, qid, qsize - 1, 0, cntlid, &id.hostid, &id.subnqn, &id.hostnqn);
     write_capsule(&mut s, &sqe, &data)?;
-    let ch = read_ch(&mut s)?;
-    let mut psh = vec![0u8; ch.hlen as usize - CH_LEN];
-    s.read_exact(&mut psh)?;
+    let (ch, psh) = read_hdr(&mut s)?;
     if ch.ptype != PDU_CAPSULE_RESP {
         bail!("expected Connect response on I/O queue {qid}, got {:#x}", ch.ptype);
     }

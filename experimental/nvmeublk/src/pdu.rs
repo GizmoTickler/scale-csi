@@ -131,6 +131,22 @@ pub fn read_ch(r: &mut impl Read) -> Result<Ch> {
     })
 }
 
+/// Read one PDU's common header and PDU-specific header from a blocking
+/// stream and validate them before any length in them is used.
+pub fn read_hdr(r: &mut impl Read) -> Result<(Ch, Vec<u8>)> {
+    let mut h = vec![0u8; CH_LEN];
+    r.read_exact(&mut h).context("read PDU common header")?;
+    let hlen = h[2] as usize;
+    if hlen < CH_LEN {
+        bail!("PDU type {:#x}: hlen {hlen} below the common header", h[0]);
+    }
+    h.resize(hlen, 0);
+    r.read_exact(&mut h[CH_LEN..]).context("read PDU header")?;
+    check_pdu_header(&h).map_err(|e| anyhow::anyhow!(e))?;
+    let ch = Ch { ptype: h[0], flags: h[1], hlen: h[2], pdo: h[3], plen: u32::from_le_bytes(h[4..8].try_into().unwrap()) };
+    Ok((ch, h.split_off(CH_LEN)))
+}
+
 fn ch_bytes(ptype: u8, flags: u8, hlen: usize, pdo: usize, plen: usize) -> [u8; CH_LEN] {
     let mut b = [0u8; CH_LEN];
     b[0] = ptype;
@@ -148,8 +164,8 @@ pub fn ic_handshake(s: &mut (impl Read + Write)) -> Result<(u8, u32)> {
     // pfv=0, hpda=0, dgst=0, maxr2t=0 (one outstanding R2T per command).
     s.write_all(&req).context("send ICReq")?;
     let ch = read_ch(s)?;
-    if ch.ptype != PDU_IC_RESP || ch.plen != 128 {
-        bail!("expected ICResp, got type {:#x} plen {}", ch.ptype, ch.plen);
+    if ch.ptype != PDU_IC_RESP || ch.plen != 128 || ch.hlen != 128 {
+        bail!("expected ICResp, got type {:#x} hlen {} plen {}", ch.ptype, ch.hlen, ch.plen);
     }
     let mut rest = [0u8; 120];
     s.read_exact(&mut rest)?;

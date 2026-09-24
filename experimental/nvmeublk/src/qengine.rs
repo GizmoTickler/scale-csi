@@ -225,6 +225,15 @@ pub struct Pending {
     pub rx: usize,
     /// H2CData PDUs queued to the sender and not yet written.
     pub h2c_queued: u32,
+    /// Write payload bytes the target has asked for (R2T) or received
+    /// in-capsule, in order. A write succeeds only when this covers it all.
+    pub tx_cov: usize,
+    /// A success that arrived while data PDUs were still queued: completed
+    /// once the sender has written them, so the buffer is really released.
+    pub deferred_sc: Option<u16>,
+    /// Path that last failed this request with a path error; the retry goes
+    /// elsewhere if any other path is live.
+    pub avoid_path: Option<usize>,
     /// Stage timestamps for the latency split.
     pub wired: Option<Instant>,
     pub first_data: Option<Instant>,
@@ -239,7 +248,7 @@ pub struct Pending {
 impl Pending {
     pub fn new(op: Op, slba: u64, nlb: u32, buf: *mut u8, len: usize, done: Sender<i32>, ucopy: Option<u64>, zc_index: Option<u16>) -> Self {
         let now = Instant::now();
-        Pending { op, slba, nlb, buf, len, done, first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, wired: None, first_data: None, ucopy, zc_index }
+        Pending { op, slba, nlb, buf, len, done, first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, tx_cov: 0, deferred_sc: None, avoid_path: None, wired: None, first_data: None, ucopy, zc_index }
     }
     fn finish(self, res: i32) {
         let _ = self.done.try_send(res);
@@ -406,6 +415,11 @@ impl QEngine {
     /// park if none has a free slot.
     fn dispatch(&self, mut p: Pending) {
         let mut live = self.live();
+        if let Some(ap) = p.avoid_path {
+            if live.iter().any(|c| c.path != ap) {
+                live.retain(|c| c.path != ap);
+            }
+        }
         live.sort_by_key(|c| c.inflight.borrow().len());
         for c in live {
             match self.try_submit(&c, p) {
@@ -435,6 +449,8 @@ impl QEngine {
         p.sent = Instant::now();
         p.rx = 0;
         p.h2c_queued = 0;
+        p.tx_cov = if inline { p.len } else { 0 };
+        p.deferred_sc = None;
         p.wired = None;
         p.first_data = None;
         c.inflight.borrow_mut().insert(cid, p);
@@ -551,13 +567,27 @@ impl QEngine {
             if sc == 0 && p.op == Op::Read && p.rx != p.len {
                 return Err(format!("read cid {cid:#x} completed after {} of {} bytes", p.rx, p.len));
             }
+            if sc == 0 && p.op == Op::Write && p.tx_cov != p.len {
+                return Err(format!("write cid {cid:#x} reported success with {} of {} bytes requested", p.tx_cov, p.len));
+            }
             if sc != 0 && p.h2c_queued > 0 {
                 // Its data PDUs would still go out from a buffer about to be
                 // reused, and the target may have reused the transfer tag.
                 return Err(format!("write cid {cid:#x} failed ({sc:#x}) with {} data PDUs still queued", p.h2c_queued));
             }
         }
-        let p = c.inflight.borrow_mut().remove(&cid).expect("checked above");
+        if sc == 0 {
+            let mut inflight = c.inflight.borrow_mut();
+            let p = inflight.get_mut(&cid).expect("checked above");
+            if p.h2c_queued > 0 {
+                // The target cannot have all the data yet from its point of
+                // view unless our sender wrote it; wait for the sender to
+                // finish so no queued PDU outlives the request's buffer.
+                p.deferred_sc = Some(sc);
+                return Ok(());
+            }
+        }
+        let mut p = c.inflight.borrow_mut().remove(&cid).expect("checked above");
         self.free_cid(c, cid);
         self.stats.done.fetch_add(1, Ordering::Relaxed);
         self.stats.wire_ns.fetch_add(p.sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -572,6 +602,7 @@ impl QEngine {
             p.finish(r);
         } else if is_path_error(sc) {
             self.stats.path_errors.fetch_add(1, Ordering::Relaxed);
+            p.avoid_path = Some(c.path);
             log::warn!("q{} path {}: {:?} slba {} path error {sc:#x}; failing over", self.qid, c.path, p.op, p.slba);
             self.failover(p);
         } else {
@@ -670,11 +701,17 @@ impl QEngine {
                 }
             }
             let now = Instant::now();
+            let mut deferred = Vec::new();
             let mut inflight = c.inflight.borrow_mut();
             for m in &batch {
                 let Some(p) = inflight.get_mut(&m.cid) else { continue };
                 if m.h2c {
                     p.h2c_queued = p.h2c_queued.saturating_sub(1);
+                    if p.h2c_queued == 0 {
+                        if let Some(sc) = p.deferred_sc.take() {
+                            deferred.push((m.cid, sc));
+                        }
+                    }
                 } else {
                     p.wired = Some(now);
                     self.stats.q2w_ns.fetch_add((now - m.queued).as_nanos() as u64, Ordering::Relaxed);
@@ -683,6 +720,13 @@ impl QEngine {
             }
             drop(inflight);
             batch.clear();
+            for (cid, sc) in deferred {
+                if let Err(e) = self.complete(&c, cid, sc) {
+                    self.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
+                    self.fail_conn(&c, &e, Cause::Failure);
+                    return;
+                }
+            }
         }
     }
 
@@ -929,9 +973,10 @@ impl QEngine {
                 let (off, len) = (h.off as usize, h.len as usize);
                 let mut inflight = c.inflight.borrow_mut();
                 let Some(p) = inflight.get_mut(&h.cid) else { return Err(format!("R2T for unknown cid {:#x}", h.cid)) };
-                if p.op != Op::Write || off + len > p.len {
-                    return Err(format!("R2T invalid: {:?} cid {:#x} off {off} len {len} of {}", p.op, h.cid, p.len));
+                if p.op != Op::Write || off != p.tx_cov || off + len > p.len {
+                    return Err(format!("R2T invalid: {:?} cid {:#x} off {off} len {len}, {} of {} requested so far", p.op, h.cid, p.tx_cov, p.len));
                 }
+                p.tx_cov += len;
                 let mut sent = 0;
                 while sent < len {
                     let n = (len - sent).min(c.maxh2c);

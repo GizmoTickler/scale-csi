@@ -46,8 +46,22 @@ impl CtrlPath {
     /// connection to it then dies on the epoch bump, so the target sees the
     /// controller go away instead of one queue quietly disappearing.
     pub fn fence(&self, epoch: u64) {
-        self.fence_req.store(epoch, Ordering::Release);
+        // Monotonic: a late report for an older epoch must not overwrite (and
+        // so cancel) a pending request for the current one.
+        self.fence_req.fetch_max(epoch, Ordering::AcqRel);
     }
+}
+
+/// Same namespace, not just the same size: compare the identifiers the
+/// target reports, and fall back to geometry only when it reports none.
+pub fn same_namespace(a: &NsInfo, b: &NsInfo) -> bool {
+    let geometry = a.nsze == b.nsze && a.lba_shift == b.lba_shift;
+    let a_has_id = a.nguid != [0; 16] || a.eui64 != [0; 8];
+    let b_has_id = b.nguid != [0; 16] || b.eui64 != [0; 8];
+    if !a_has_id && !b_has_id {
+        return geometry;
+    }
+    geometry && a.nguid == b.nguid && a.eui64 == b.eui64
 }
 
 pub struct Ctrls {
@@ -70,10 +84,22 @@ impl Ctrls {
         for p in &paths {
             match Self::bring_up(p, &id, kato) {
                 Ok((a, i)) => {
-                    if info.is_none() {
-                        info = Some(i);
+                    match &info {
+                        None => {
+                            if i.nguid == [0; 16] && i.eui64 == [0; 8] {
+                                log::warn!("{}: target reports no NGUID/EUI64; paths are matched by geometry only", p.addr);
+                            }
+                            info = Some(i);
+                            admins.push(Some(a));
+                        }
+                        Some(first) if same_namespace(first, &i) => admins.push(Some(a)),
+                        Some(_) => {
+                            log::error!("{}: presents a different namespace than the first path; refusing this path", p.addr);
+                            a.shutdown();
+                            Self::lose(p);
+                            admins.push(None);
+                        }
                     }
-                    admins.push(Some(a));
                 }
                 Err(e) => {
                     log::warn!("{}: {e:#}", p.addr);
@@ -142,15 +168,16 @@ impl Ctrls {
                         continue;
                     }
                     match Self::bring_up(&p, &self.id, self.kato) {
-                        Ok((a, info)) if info.nsze == self.info.nsze && info.lba_shift == self.info.lba_shift => {
+                        Ok((a, info)) if same_namespace(&self.info, &info) => {
                             // New controller: queues attached to the old one are dead.
                             p.epoch.fetch_add(1, Ordering::AcqRel);
                             admin = Some(a);
                             backoff = Duration::from_millis(250);
                             last_ka = Instant::now();
                         }
-                        Ok(_) => {
-                            log::error!("path {i}: namespace geometry changed; refusing this path");
+                        Ok((a, _)) => {
+                            log::error!("path {i}: now presents a different namespace; refusing this path");
+                            a.shutdown();
                             Self::lose(&p);
                             next_try = Instant::now() + Duration::from_secs(5);
                         }

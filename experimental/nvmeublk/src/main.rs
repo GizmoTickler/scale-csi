@@ -223,7 +223,7 @@ fn queue_fn(
     let napi_us = env_u64("NVMEUBLK_NAPI_US", 0) as u32;
     if napi_us > 0 {
         let mut napi = io_uring::types::Napi::new().set_busy_poll_timeout(napi_us).set_prefer_busy_poll(true);
-        match libublk::io::with_queue_ring_mut(&q_rc, |ring| ring.submitter().register_napi(&mut napi)) {
+        match libublk::with_task_io_ring_mut(|ring| ring.submitter().register_napi(&mut napi)) {
             Ok(()) => log::info!("queue {qid}: NAPI busy poll {napi_us} us"),
             Err(e) => log::warn!("queue {qid}: NAPI busy poll not available: {e}"),
         }
@@ -281,7 +281,33 @@ fn queue_fn(
     // ending must not stop the other queues' timers (reconnect, expiry).
 }
 
+/// A block driver in userspace must not need memory to make progress on the
+/// writeback that would free memory. Done before any thread starts, so every
+/// thread inherits it:
+/// - PR_SET_IO_FLUSHER: this task's allocations never recurse into I/O
+///   (PF_MEMALLOC_NOIO), and it is not throttled as a dirtier of its own device.
+/// - mlockall: no page of the daemon can be swapped or reclaimed away.
+/// - oom_score_adj -1000: the OOM killer never picks the storage daemon.
+// linux/prctl.h (not exported by the libc crate for this target).
+const PR_SET_IO_FLUSHER: libc::c_int = 57;
+const PR_GET_IO_FLUSHER: libc::c_int = 58;
+
+fn harden_for_writeback() {
+    if unsafe { libc::prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0) } != 0 {
+        log::warn!("PR_SET_IO_FLUSHER failed: {} (needs CAP_SYS_RESOURCE)", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
+        log::warn!("mlockall failed: {}", std::io::Error::last_os_error());
+    }
+    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-1000") {
+        log::warn!("oom_score_adj -1000 failed: {e}");
+    }
+    let flusher = unsafe { libc::prctl(PR_GET_IO_FLUSHER, 0, 0, 0, 0) } == 1;
+    log::info!("writeback hardening: io_flusher={flusher} memory locked, oom_score_adj=-1000");
+}
+
 fn run(nqn: &str, addrs: &[String]) -> Result<()> {
+    harden_for_writeback();
     let addrs: Vec<SocketAddr> = addrs
         .iter()
         .map(|a| a.to_socket_addrs().with_context(|| format!("bad address {a}"))?.next().context("unresolvable"))
