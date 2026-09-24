@@ -9,16 +9,17 @@
 
 mod conn;
 mod ctrls;
+mod daemon;
+mod device;
 mod mpath;
 mod pdu;
 mod qengine;
 
 use anyhow::{bail, Context, Result};
 use conn::{Done, Ident, Op, Req};
-use libublk::ctrl::UblkCtrlBuilder;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::{BufDesc, UblkError, UblkFlags};
+use libublk::{BufDesc, UblkError};
 use mpath::{Config, Mpath};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
@@ -228,14 +229,6 @@ fn queue_fn(
     // core for latency. (DEFER_TASKRUN was tried: no gain, and the queue
     // threads never exit after the device is deleted.)
     let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
-    let napi_us = env_u64("NVMEUBLK_NAPI_US", 0) as u32;
-    if napi_us > 0 {
-        let mut napi = io_uring::types::Napi::new().set_busy_poll_timeout(napi_us).set_prefer_busy_poll(true);
-        match libublk::with_task_io_ring_mut(|ring| ring.submitter().register_napi(&mut napi)) {
-            Ok(()) => log::info!("queue {qid}: NAPI busy poll {napi_us} us"),
-            Err(e) => log::warn!("queue {qid}: NAPI busy poll not available: {e}"),
-        }
-    }
     let shift = ctrls.info.lba_shift;
     // Engine tasks are 'static (they own Rc<QEngine>); tag tasks borrow the
     // queue. Two local executors, ticked together from the same event loop.
@@ -314,93 +307,29 @@ fn harden_for_writeback() {
     log::info!("writeback hardening: io_flusher={flusher} memory locked, oom_score_adj=-1000");
 }
 
+/// `nvmeublk run`: serve one device in the foreground, configured from the
+/// environment (the test scripts' interface). SIGINT deletes the device.
 fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     harden_for_writeback();
-    let addrs: Vec<SocketAddr> = addrs
-        .iter()
-        .map(|a| a.to_socket_addrs().with_context(|| format!("bad address {a}"))?.next().context("unresolvable"))
-        .collect::<Result<_>>()?;
-    let recover_id = std::env::var("NVMEUBLK_RECOVER_ID").ok().and_then(|v| v.parse::<i32>().ok());
-    let kato = Duration::from_secs(15);
-    let ctrls = loop {
-        match ctrls::Ctrls::new(addrs.clone(), host_ident(nqn), kato) {
-            Ok(c) => break c,
-            // A recovering device holds its I/O until a daemon reattaches;
-            // giving up here would leave it frozen, so keep trying.
-            Err(e) if recover_id.is_some() => {
-                log::warn!("recovery: no path reachable yet ({e:#}); retrying");
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            Err(e) => return Err(e),
-        }
-    };
-    let info = ctrls.info.clone();
-    log::info!("namespace: {} blocks of {} bytes ({} MiB), in-capsule {} B", info.nsze, 1u64 << info.lba_shift, (info.nsze << info.lba_shift) >> 20, info.incapsule_bytes);
-    let queues = env_u64("NVMEUBLK_QUEUES", 4) as u16;
-    let depth = env_u64("NVMEUBLK_DEPTH", 64) as u16;
-    let io_buf = (512 * 1024usize).min(info.mdts_bytes) as u32;
-    let size = info.nsze << info.lba_shift;
-    let lba_shift = info.lba_shift as u8;
-    // Fence for orphaned writes: the target may keep a controller, and run
-    // its commands, for up to KATO after losing us; plus a quiesce margin.
-    let write_fence = Duration::from_millis(env_u64("NVMEUBLK_WRITE_FENCE_MS", kato.as_millis() as u64 + 5000));
-    let cfg = qengine::QConfig {
-        io_timeout: Duration::from_millis(env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000)),
-        no_path_timeout: Duration::from_millis(env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000)),
-        max_attempts: 8,
-        write_fence,
-        // After a crash the dead daemon's writes may still be running on the
-        // target, and REISSUE hands them to us: hold writes for one fence.
-        hold_writes_until: recover_id.map(|_| Instant::now() + write_fence),
-        rx_offload: env_u64("NVMEUBLK_RX_OFFLOAD", 0) as usize,
-        cdev_fd: -1,
-        conns_per_path: env_u64("NVMEUBLK_CONNS_PER_PATH", 1).clamp(1, 8) as usize,
-        rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024).clamp(4096, 1 << 20) as usize,
-    };
-    let mut user_copy = env_u64("NVMEUBLK_USER_COPY", 0) != 0;
-    // Zero copy needs AUTO_BUF_REG (kernel >= 6.16); it also uses USER_COPY
-    // for the few payload bytes that arrive with a PDU header.
-    let zero_copy = env_u64("NVMEUBLK_ZERO_COPY", 0) != 0;
-    // NVMEUBLK_ZC_RECV=1: prefer the fixed-buffer RECV (7.x); falls back by itself.
     qengine::set_zc_recv_preference(env_u64("NVMEUBLK_ZC_RECV", 0) != 0);
-    if zero_copy {
-        let feats = libublk::ctrl::UblkCtrl::get_features().unwrap_or(0);
-        let need = (libublk::sys::UBLK_F_AUTO_BUF_REG | libublk::sys::UBLK_F_USER_COPY) as u64;
-        if feats & need != need {
-            bail!("NVMEUBLK_ZERO_COPY=1 but this kernel's ublk lacks AUTO_BUF_REG/USER_COPY (features {feats:#x})");
-        }
-        user_copy = true;
-    }
-    log::info!("write fence {} ms{}", write_fence.as_millis(), if recover_id.is_some() { " (writes held for one fence: recovering)" } else { "" });
-    let stats = Arc::new(qengine::Stats::default());
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _ = std::fs::write("/run/nvmeublk-queues", queues.to_string());
-
-    // USER_RECOVERY: if this process dies, the kernel quiesces the device and
-    // holds I/O; a successor started with NVMEUBLK_RECOVER_ID reattaches.
-    // REISSUE re-sends the requests that were in flight at the crash.
-    let mut builder = UblkCtrlBuilder::default();
-    builder = builder
-        .name("nvmeublk")
-        .nr_queues(queues)
-        .depth(depth)
-        .io_buf_bytes(io_buf)
-        .ctrl_flags(
-            (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64
-                | if user_copy { libublk::sys::UBLK_F_USER_COPY as u64 } else { 0 }
-                | if zero_copy { libublk::sys::UBLK_F_AUTO_BUF_REG as u64 } else { 0 },
-        );
-    let builder = match recover_id {
-        Some(id) => {
-            libublk::ctrl::UblkCtrl::new_simple(id)?.start_user_recover().context("start user recovery")?;
-            log::info!("recovering ublk device {id}");
-            builder.id(id).dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
-        }
-        None => builder.dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV),
+    let spec = device::DeviceSpec {
+        volume: std::env::var("NVMEUBLK_VOLUME").unwrap_or_else(|_| "run".into()),
+        subnqn: nqn.to_string(),
+        addrs: addrs.to_vec(),
+        hostnqn: std::env::var("NVMEUBLK_HOSTNQN").ok(),
+        hostid: std::env::var("NVMEUBLK_HOSTID").ok(),
+        queues: env_u64("NVMEUBLK_QUEUES", 4) as u16,
+        depth: env_u64("NVMEUBLK_DEPTH", 64) as u16,
+        zero_copy: env_u64("NVMEUBLK_ZERO_COPY", 0) != 0,
+        napi_us: env_u64("NVMEUBLK_NAPI_US", 0) as u32,
+        io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),
+        no_path_timeout_ms: env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000),
+        write_fence_ms: std::env::var("NVMEUBLK_WRITE_FENCE_MS").ok().and_then(|v| v.parse().ok()),
     };
-    let ctrl = Arc::new(builder.build().context("create ublk device (is ublk_drv loaded?)")?);
-    let f = ctrl.dev_info().flags;
+    // NVMEUBLK_RECOVER_ID after a crash of this command: writes are held.
+    let recover = std::env::var("NVMEUBLK_RECOVER_ID").ok().and_then(|v| v.parse::<i32>().ok()).map(|id| (id, true));
+    let r = device::start(spec, recover)?;
+    let f = libublk::ctrl::UblkCtrl::new_simple(r.dev_id).map(|c| c.dev_info().flags).unwrap_or(0);
     log::info!(
         "ublk device flags {f:#x}: zero_copy={} user_copy={} user_recovery={} reissue={}",
         f & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0,
@@ -408,24 +337,17 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         f & libublk::sys::UBLK_F_USER_RECOVERY as u64 != 0,
         f & libublk::sys::UBLK_F_USER_RECOVERY_REISSUE as u64 != 0
     );
-
-    // libublk's control ring is thread-local: stop through a handler-owned handle.
-    let dev_id = ctrl.dev_info().dev_id as i32;
-    let dr = draining.clone();
-    ctrlc::set_handler(move || {
-        // Parked and fenced I/O would otherwise hold del_gendisk hostage.
-        dr.store(true, Ordering::Release);
-        match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
+    // SIGINT: stop and delete the device (the daemon's SIGTERM is a handover instead).
+    let dev_id = r.dev_id;
+    ctrlc::set_handler(move || match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
         Ok(c) => {
             if let Err(e) = c.kill_dev() {
                 log::error!("stop ublk device {dev_id}: {e}");
             }
         }
         Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
-        }
     })?;
-    let st = stats.clone();
-    let cstat = ctrls.clone();
+    let (st, cstat) = (r.stats.clone(), r.ctrls.clone());
     std::thread::spawn(move || {
       let mut last = (0u64, 0u64, 0u64);
       loop {
@@ -457,26 +379,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         );
       }
     });
-
-    let (cq, sq, stq, drq) = (ctrls.clone(), stats.clone(), stop.clone(), draining.clone());
-    ctrl.run_target(
-        move |dev: &mut UblkDev| {
-            dev.set_default_params(size);
-            dev.tgt.params.basic.logical_bs_shift = lba_shift;
-            dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
-            // Room on each queue ring for the network SQEs (recv + writev per
-            // path, timer, reconnect wakeup) next to the ublk commands.
-            dev.tgt.sq_depth = depth * 2 + 64;
-            dev.tgt.cq_depth = depth * 2 + 64;
-            Ok(())
-        },
-        move |qid, dev: &_| queue_fn(qid, dev, cq.clone(), sq.clone(), stq.clone(), drq.clone(), cfg.clone()),
-        |c| log::info!("serving /dev/ublkb{}", c.dev_info().dev_id),
-    )?;
-    stop.store(true, Ordering::Release);
-    ctrls.shutdown();
-    ctrl.del_dev()?;
-    Ok(())
+    r.wait()
 }
 
 fn main() -> Result<()> {
@@ -488,8 +391,18 @@ fn main() -> Result<()> {
         println!("deleted ublk device {id}");
         return Ok(());
     }
+    // Per-node daemon and its client.
+    if args.len() >= 2 && args[1] == "daemon" {
+        harden_for_writeback();
+        let socket = args.get(2).map(String::as_str).unwrap_or(daemon::DEFAULT_SOCKET);
+        let state = args.get(3).map(String::as_str).unwrap_or(daemon::DEFAULT_STATE);
+        return daemon::run(socket, state);
+    }
+    if args.len() == 3 && args[1] == "ctl" {
+        return daemon::ctl(daemon::DEFAULT_SOCKET, &args[2]);
+    }
     if args.len() < 4 {
-        bail!("usage: nvmeublk probe|run <subnqn> <addr:port>...");
+        bail!("usage: nvmeublk probe|lat|run <subnqn> <addr:port>... | daemon [socket] [state] | ctl '<json>' | del <id>");
     }
     match args[1].as_str() {
         "probe" => probe(&args[2], &args[3..]),

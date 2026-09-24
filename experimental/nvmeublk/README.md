@@ -236,6 +236,27 @@ Three identical test VMs on the same hypervisor, storage networks and zvol: Fedo
 - The 7.x-only fixed-buffer `RECV` (`NVMEUBLK_ZC_RECV=1`): FCOS 7.1 refuses it (the daemon falls back to `READ_FIXED` by itself). MicroOS 7.2 accepts it, but it was no faster than `READ_FIXED`, so it stays off. ublk batch I/O (7.x) is not usable with zero copy through libublk 0.4.8, which refuses user copy in batch mode.
 - Safety on both, zero copy, fio crc32c: failover drill (kill, stall, kill; random read/write 4K–1M) 41 GiB `err=0`; `kill -9` + recovery 32 GiB `err=0`; writeback hardening active; clean exit.
 
+## Per-node daemon (`nvmeublk daemon`, 2026-09-24)
+One process owns every nvmeublk device on a node and is driven over `/run/nvmeublk/nvmeublkd.sock` (root only, one JSON request per connection). It is the integration point for scale-csi's node plugin, and it outlives node-plugin restarts.
+
+- `{"op":"attach", "volume", "subnqn", "addrs", "hostnqn", "hostid", "queues", "zero_copy", "napi_us", ...}` returns `{"dev_id","path"}`. Idempotent per volume, so NodeStage retries get the same device.
+- `{"op":"detach","volume"}` is idempotent. `list` and `stats` report paths and counters.
+- The state file `/run/nvmeublk/state.json` survives daemon restarts; a reboot clears it along with the devices. On start, every recorded device that still exists is reattached through ublk user recovery.
+- **SIGTERM/SIGINT is a handover, not a teardown.** New I/O parks, in-flight commands finish (bounded at 5 s), each device is marked clean, and the process exits leaving the devices in place. The next daemon recovers clean devices without the write hold. After a crash (`kill -9`) the device is not clean, so its writes are held for one fence.
+- `nvmeublk ctl '<json>'` is a minimal client.
+
+Verified on the FCOS test VM, zero copy, 8 queues, fio crc32c:
+- Attach and detach idempotency, `list`, `stats`.
+- Graceful handover under load: a 3 s gap and a clean recovery with no hold, `err=0`.
+- Per-device fault injection (`/run/nvmeublk/dev<N>/fault`): kill and stall. The stall was caught by the watchdog and the controller replaced.
+- `kill -9` recovery with the hold, `err=0`.
+- 37–54 GiB verified per run.
+
+Idle cost per volume (8 queues):
+- NAPI busy poll is registered only while a queue has work, and dropped after an idle tick.
+- The housekeeping timer runs at 100 ms while there is work (in-flight, parked, fenced, reconnecting) and at 1 s when fully idle.
+- Idle CPU went from ≈2.6% of a core per volume to ≈0.1–0.2%. With zero-copy buffer sizing, locked memory is 52 MiB per volume (was 300).
+
 ## Bugs found and fixed while building it
 - A single maintenance thread ran keep-alive, and keep-alive blocked for 10 s on a silent path. That froze the stall watchdog, so failover took 14 s instead of 5 s. Fix: a supervisor thread per path; the watchdog is non-blocking.
 - The receiver tore down the admin queue before resubmitting orphans; that could wait behind a blocked keep-alive. Fix: fail over first.

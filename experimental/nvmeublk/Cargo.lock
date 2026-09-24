@@ -740,6 +740,8 @@ dependencies = [
  "libc",
  "libublk",
  "log",
+ "serde",
+ "serde_json",
  "smol",
 ]
 

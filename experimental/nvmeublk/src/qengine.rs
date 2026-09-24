@@ -164,6 +164,8 @@ pub enum Op {
 
 #[derive(Default)]
 pub struct Stats {
+    /// Commands on the wire right now, across this device's queues.
+    pub inflight: std::sync::atomic::AtomicI64,
     pub failovers: AtomicU64,
     pub resubmits: AtomicU64,
     pub parked: AtomicU64,
@@ -221,6 +223,15 @@ pub struct QConfig {
     pub conns_per_path: usize,
     /// Largest staging receive (see RX_CHUNK_DEFAULT).
     pub rx_chunk: usize,
+    /// NAPI busy-poll budget (us) while this queue has I/O in flight; 0 = off.
+    /// Registered on the first submit after an idle period and dropped after
+    /// an idle timer tick, so an idle volume costs no polling.
+    pub napi_us: u32,
+    /// Fault-injection directory for this device (`<dir>/fault`).
+    pub fault_dir: String,
+    /// Set while the daemon drains for a graceful restart: new requests park
+    /// instead of going out, so in-flight work can finish.
+    pub quiesce: Arc<AtomicBool>,
 }
 
 /// One block request as seen by the engine. `buf` is the tag's IoBuf, owned
@@ -365,6 +376,9 @@ pub struct QEngine {
     /// Set by the shutdown handler: parked and fenced I/O fails with EIO so
     /// the device can be deleted instead of waiting on paths that are gone.
     draining: Arc<AtomicBool>,
+    napi_on: Cell<bool>,
+    /// Requests submitted since the last timer tick (idle detection).
+    submitted: Cell<u64>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
@@ -402,6 +416,8 @@ impl QEngine {
             stats,
             stop,
             draining,
+            napi_on: Cell::new(false),
+            submitted: Cell::new(0),
         })
     }
 
@@ -423,8 +439,26 @@ impl QEngine {
         self.conns.borrow().iter().flatten().filter(|c| !c.dead.get()).cloned().collect()
     }
 
+    fn set_napi(&self, on: bool) {
+        if self.cfg.napi_us == 0 || self.napi_on.get() == on {
+            return;
+        }
+        let mut napi = io_uring::types::Napi::new().set_busy_poll_timeout(self.cfg.napi_us).set_prefer_busy_poll(true);
+        let r = libublk::with_task_io_ring_mut(|ring| if on { ring.submitter().register_napi(&mut napi) } else { ring.submitter().unregister_napi(&mut napi) });
+        match r {
+            Ok(()) => self.napi_on.set(on),
+            Err(e) => log::debug!("q{}: NAPI {}: {e}", self.qid, if on { "register" } else { "unregister" }),
+        }
+    }
+
+    fn inflight_here(&self) -> usize {
+        self.conns.borrow().iter().flatten().map(|c| c.inflight.borrow().len()).sum()
+    }
+
     /// Entry point for new block requests from ublk.
     pub fn submit(&self, p: Pending) {
+        self.submitted.set(self.submitted.get() + 1);
+        self.set_napi(true);
         if p.op != Op::Read {
             if let Some(t) = self.cfg.hold_writes_until {
                 if Instant::now() < t {
@@ -439,6 +473,10 @@ impl QEngine {
     /// Send to the live connection with the fewest outstanding commands;
     /// park if none has a free slot.
     fn dispatch(&self, mut p: Pending) {
+        if self.cfg.quiesce.load(Ordering::Acquire) {
+            self.parked.borrow_mut().push_back(p);
+            return;
+        }
         let mut live = self.live();
         if let Some(ap) = p.avoid_path {
             if live.iter().any(|c| c.path != ap) {
@@ -484,6 +522,7 @@ impl QEngine {
             self.free_cid(c, cid);
             return Err(p);
         }
+        self.stats.inflight.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -562,6 +601,8 @@ impl QEngine {
         }
         let direct = c.rx_direct.get();
         let mut orphans = Vec::new();
+        let drained = c.inflight.borrow().len() as i64;
+        self.stats.inflight.fetch_sub(drained, Ordering::Relaxed);
         for (cid, p) in c.inflight.borrow_mut().drain() {
             if Some(cid) == direct {
                 *c.held.borrow_mut() = Some(p);
@@ -613,6 +654,7 @@ impl QEngine {
             }
         }
         let mut p = c.inflight.borrow_mut().remove(&cid).expect("checked above");
+        self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
         self.free_cid(c, cid);
         self.stats.done.fetch_add(1, Ordering::Relaxed);
         self.stats.wire_ns.fetch_add(p.sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1093,9 +1135,14 @@ impl QEngine {
     /// 100ms housekeeping: reconnect, stale-controller and stall detection,
     /// parked-I/O expiry, fenced-write release, and fault injection.
     async fn timer_task(self: Rc<Self>) {
-        let ts = io_uring::types::Timespec::new().nsec(100_000_000);
+        // 100 ms while there is work (stall watchdog, parked/fenced requests,
+        // reconnects); once a second when the queue is fully idle, so an idle
+        // volume costs next to nothing.
+        let busy_ts = io_uring::types::Timespec::new().nsec(100_000_000);
+        let idle_ts = io_uring::types::Timespec::new().sec(1);
+        let mut idle = false;
         while !self.stop.load(Ordering::Acquire) {
-            let sqe = io_uring::opcode::Timeout::new(&ts).build();
+            let sqe = io_uring::opcode::Timeout::new(if idle { &idle_ts } else { &busy_ts }).build();
             let _ = ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await;
             self.fault_injection();
             for i in 0..self.ctrls.paths.len() * self.k() {
@@ -1116,6 +1163,11 @@ impl QEngine {
             }
             self.expire_parked();
             self.release_fenced();
+            let all_up = self.conns.borrow().iter().all(|c| c.is_some());
+            idle = self.submitted.replace(0) == 0 && self.inflight_here() == 0 && self.parked.borrow().is_empty() && self.fenced.borrow().is_empty() && all_up;
+            if idle {
+                self.set_napi(false);
+            }
         }
         let conns: Vec<Rc<QConn>> = self.conns.borrow().iter().flatten().cloned().collect();
         for c in conns {
@@ -1214,19 +1266,20 @@ impl QEngine {
         }
     }
 
-    /// `echo "kill N" > /run/nvmeublk-fault` fails path N's I/O queue on every
+    /// `echo "kill N" > <fault_dir>/fault` fails path N's I/O queue on every
     /// ublk queue; `stall N` stops that queue's receiver from reading so the
     /// stall watchdog must catch it. Each queue thread consumes its own copy.
     fn fault_injection(&self) {
-        let path = format!("/run/nvmeublk-fault.q{}", self.qid);
-        let global = "/run/nvmeublk-fault";
-        if let Ok(cmd) = std::fs::read_to_string(global) {
+        let dir = &self.cfg.fault_dir;
+        let path = format!("{dir}/fault.q{}", self.qid);
+        let global = format!("{dir}/fault");
+        if let Ok(cmd) = std::fs::read_to_string(&global) {
             // Fan the command out to one file per queue, then drop the original.
-            let n = std::fs::read_to_string("/run/nvmeublk-queues").ok().and_then(|s| s.trim().parse::<u16>().ok()).unwrap_or(1);
+            let n = std::fs::read_to_string(format!("{dir}/queues")).ok().and_then(|s| s.trim().parse::<u16>().ok()).unwrap_or(1);
             for q in 0..n {
-                let _ = std::fs::write(format!("/run/nvmeublk-fault.q{q}"), &cmd);
+                let _ = std::fs::write(format!("{dir}/fault.q{q}"), &cmd);
             }
-            let _ = std::fs::remove_file(global);
+            let _ = std::fs::remove_file(&global);
         }
         let Ok(cmd) = std::fs::read_to_string(&path) else { return };
         let _ = std::fs::remove_file(&path);
