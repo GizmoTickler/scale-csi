@@ -1,0 +1,4 @@
+target
+*.state
+flatcar-build
+out
