@@ -195,6 +195,18 @@ var (
 		},
 	)
 
+	// nvmeControllerTunableCorrections counts live NVMe-oF controllers whose
+	// sysfs tunables the node plugin converged to configuration. result is
+	// "corrected" or "error"; a steady node increments nothing.
+	nvmeControllerTunableCorrections = regCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "nvme_controller_tunable_corrections_total",
+			Help:      "Live NVMe-oF controllers whose tunables the node plugin converged to configuration, by tunable and result",
+		},
+		[]string{"tunable", "result"},
+	)
+
 	nodeConnectTotal = regCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,

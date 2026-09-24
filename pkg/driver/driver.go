@@ -1021,6 +1021,13 @@ func (d *Driver) runSessionGCWithProtocols(ctx context.Context, gracePeriod time
 	} else if ctx.Err() == nil {
 		_, _ = d.observeNVMeoFSessions()
 	}
+
+	// Converge live controller tunables every tick, independent of cleanup:
+	// this corrects configuration drift on staged volumes, it never
+	// disconnects anything.
+	if ctx.Err() == nil {
+		d.reconcileNVMeoFControllerTunables(dryRun)
+	}
 }
 
 func (d *Driver) observeISCSISessions() ([]util.ISCSISessionInfo, error) {
