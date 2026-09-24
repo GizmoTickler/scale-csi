@@ -694,7 +694,38 @@ func GetDeviceFromMountPointWithContext(ctx context.Context, mountPath string) (
 // GetMountedBlockDevices returns a map of all mounted block devices.
 // The keys are device paths (e.g., "/dev/sda1"), values are mount points.
 // This is used by session GC to determine which iSCSI/NVMe devices are in use.
+// A device mounted more than once maps to one of its mount points; callers that
+// need every mount point use GetBlockDeviceMounts.
 func GetMountedBlockDevices() (map[string]string, error) {
+	mounts, err := listBlockDeviceMounts()
+	if err != nil {
+		return nil, err
+	}
+	devices := make(map[string]string)
+	for _, mount := range mounts {
+		devices[mount[0]] = mount[1]
+	}
+	return devices, nil
+}
+
+// GetBlockDeviceMounts returns every mount point of every mounted block
+// device. A published filesystem volume is mounted twice (the kubelet staging
+// mount and the pod bind mount), and the single-target map above keeps only
+// one of them, so an ownership check keyed on the staging path must use this.
+func GetBlockDeviceMounts() (map[string][]string, error) {
+	mounts, err := listBlockDeviceMounts()
+	if err != nil {
+		return nil, err
+	}
+	devices := make(map[string][]string)
+	for _, mount := range mounts {
+		devices[mount[0]] = append(devices[mount[0]], mount[1])
+	}
+	return devices, nil
+}
+
+// listBlockDeviceMounts returns (device, target) for every block-device mount.
+func listBlockDeviceMounts() ([][2]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getMountTimeout())
 	defer cancel()
 
@@ -710,7 +741,7 @@ func GetMountedBlockDevices() (map[string]string, error) {
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			// Only treat as "no mounts" if there's no output
 			if len(output) == 0 || strings.TrimSpace(string(output)) == "" {
-				return make(map[string]string), nil
+				return nil, nil
 			}
 			// Non-empty output with exit code 1 is unexpected, log and continue parsing
 			klog.V(4).Infof("findmnt returned exit code 1 with output, continuing: %s", string(output))
@@ -719,7 +750,7 @@ func GetMountedBlockDevices() (map[string]string, error) {
 		}
 	}
 
-	devices := make(map[string]string)
+	var mounts [][2]string
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -733,12 +764,12 @@ func GetMountedBlockDevices() (map[string]string, error) {
 			target := fields[1]
 			// Only include actual block devices (skip things like tmpfs, overlay, etc.)
 			if strings.HasPrefix(device, "/dev/") {
-				devices[device] = target
+				mounts = append(mounts, [2]string{device, target})
 			}
 		}
 	}
 
-	return devices, nil
+	return mounts, nil
 }
 
 // GetStagedBlockDevices returns block devices referenced by symlinks below a

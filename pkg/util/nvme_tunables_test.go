@@ -64,3 +64,28 @@ func TestSetNVMeControllerFastIOFailTmoAt(t *testing.T) {
 	}
 	assert.Error(t, setNVMeControllerFastIOFailTmoAt(root, "nvme9", 15), "a missing controller is an error, never a create")
 }
+
+// GetBlockDeviceMounts must keep every mount point of a device: a published
+// filesystem volume appears at its kubelet staging path AND its pod bind mount,
+// and an ownership check keyed on the staging path must still see it when the
+// pod mount is listed second.
+func TestGetBlockDeviceMountsKeepsEveryMountPoint(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\nprintf '%s\\n' " +
+		"'/dev/nvme0n1 /var/lib/kubelet/plugins/kubernetes.io/csi/csi.scale.io/h/globalmount' " +
+		"'/dev/nvme0n1 /var/lib/kubelet/pods/p/volumes/kubernetes.io~csi/pvc/mount' " +
+		"'tmpfs /run'\n"
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "findmnt"), []byte(script), 0o700)) //nolint:gosec // test-only executable stub
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mounts, err := GetBlockDeviceMounts()
+	require.NoError(t, err)
+	assert.Equal(t, map[string][]string{"/dev/nvme0n1": {
+		"/var/lib/kubelet/plugins/kubernetes.io/csi/csi.scale.io/h/globalmount",
+		"/var/lib/kubelet/pods/p/volumes/kubernetes.io~csi/pvc/mount",
+	}}, mounts)
+
+	single, err := GetMountedBlockDevices()
+	require.NoError(t, err)
+	assert.Len(t, single, 1, "the single-target inventory keeps its historical shape")
+}

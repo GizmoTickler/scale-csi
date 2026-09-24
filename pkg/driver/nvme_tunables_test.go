@@ -21,19 +21,19 @@ type tunableWrite struct {
 func stubNVMeTunables(t *testing.T, controllers []util.NVMeFabricsController, setErr error, staged ...string) *[]tunableWrite {
 	t.Helper()
 	origList, origSet := listNVMeFabricsControllers, setNVMeControllerFastIOFailTmo
-	origMounted, origStaged, origInfo := getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice
+	origMounted, origStaged, origInfo := getBlockDeviceMounts, getStagedBlockDevices, getNVMeInfoFromDevice
 	t.Cleanup(func() {
 		listNVMeFabricsControllers, setNVMeControllerFastIOFailTmo = origList, origSet
-		getMountedBlockDevices, getStagedBlockDevices, getNVMeInfoFromDevice = origMounted, origStaged, origInfo
+		getBlockDeviceMounts, getStagedBlockDevices, getNVMeInfoFromDevice = origMounted, origStaged, origInfo
 	})
 	deviceNQN := map[string]string{}
-	mounted := map[string]string{}
+	mounted := map[string][]string{}
 	for i, nqn := range staged {
 		device := "/dev/nvme" + string(rune('a'+i)) + "n1"
 		deviceNQN[device] = nqn
-		mounted[device] = kubeletCSIStagingRoot + "/org.scale.csi.nvmeof/hash" + string(rune('a'+i)) + "/globalmount"
+		mounted[device] = []string{kubeletCSIStagingRoot + "/org.scale.csi.nvmeof/hash" + string(rune('a'+i)) + "/globalmount"}
 	}
-	getMountedBlockDevices = func() (map[string]string, error) { return mounted, nil }
+	getBlockDeviceMounts = func() (map[string][]string, error) { return mounted, nil }
 	getStagedBlockDevices = func() (map[string]string, error) { return map[string]string{}, nil }
 	getNVMeInfoFromDevice = func(device string) (string, error) { return deviceNQN[device], nil }
 	var writes []tunableWrite
@@ -124,10 +124,10 @@ func TestReconcileNVMeoFControllerTunablesNeverTouchesForeignControllersAtTheSam
 		{Name: "nvme93", Transport: "tcp", Address: "traddr=192.0.2.10,trsvcid=4420", SubsysNQN: "nqn.ours", FastIOFailTmo: -1},
 	}, nil, "nqn.ours")
 	// nqn.other-driver is mounted, but under ANOTHER driver's staging directory.
-	getMountedBlockDevices = func() (map[string]string, error) {
-		return map[string]string{
-			"/dev/nvmean1": kubeletCSIStagingRoot + "/org.scale.csi.nvmeof/hasha/globalmount",
-			"/dev/nvmezn1": kubeletCSIStagingRoot + "/other.csi.vendor/hashz/globalmount",
+	getBlockDeviceMounts = func() (map[string][]string, error) {
+		return map[string][]string{
+			"/dev/nvmean1": {kubeletCSIStagingRoot + "/org.scale.csi.nvmeof/hasha/globalmount"},
+			"/dev/nvmezn1": {kubeletCSIStagingRoot + "/other.csi.vendor/hashz/globalmount"},
 		}, nil
 	}
 	info := getNVMeInfoFromDevice
@@ -148,7 +148,26 @@ func TestReconcileNVMeoFControllerTunablesSkipsThePassWhenOwnershipCannotBeProve
 	writes := stubNVMeTunables(t, []util.NVMeFabricsController{
 		{Name: "nvme1", Transport: "tcp", Address: "traddr=192.0.2.10,trsvcid=4420", SubsysNQN: "nqn.ours", FastIOFailTmo: -1},
 	}, nil, "nqn.ours")
-	getMountedBlockDevices = func() (map[string]string, error) { return nil, errors.New("mountinfo unreadable") }
+	getBlockDeviceMounts = func() (map[string][]string, error) { return nil, errors.New("mountinfo unreadable") }
 	newMultipathTunablesDriver().reconcileNVMeoFControllerTunables(false)
 	assert.Empty(t, *writes)
+}
+
+// Re-verification N1 (codex, 2026-09-24): a published filesystem volume is
+// mounted twice, at its staging path and bind-mounted into the pod. Ownership
+// must be found through the staging mount even when the pod mount is listed
+// after it, or every published filesystem volume keeps its stale timeout.
+func TestReconcileNVMeoFControllerTunablesFindsOwnershipOfPublishedFilesystemVolumes(t *testing.T) {
+	writes := stubNVMeTunables(t, []util.NVMeFabricsController{
+		{Name: "nvme1", Transport: "tcp", Address: "traddr=192.0.2.10,trsvcid=4420", SubsysNQN: "nqn.ours", FastIOFailTmo: -1},
+	}, nil)
+	getBlockDeviceMounts = func() (map[string][]string, error) {
+		return map[string][]string{"/dev/nvme0n1": {
+			kubeletCSIStagingRoot + "/org.scale.csi.nvmeof/hash/globalmount",
+			"/var/lib/kubelet/pods/pod/volumes/kubernetes.io~csi/pvc/mount",
+		}}, nil
+	}
+	getNVMeInfoFromDevice = func(string) (string, error) { return "nqn.ours", nil }
+	newMultipathTunablesDriver().reconcileNVMeoFControllerTunables(false)
+	assert.Equal(t, []tunableWrite{{"nvme1", 15}}, *writes)
 }

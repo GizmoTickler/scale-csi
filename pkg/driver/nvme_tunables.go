@@ -111,7 +111,10 @@ func (d *Driver) reconcileNVMeoFControllerTunables(dryRun bool) {
 // device belongs to a volume THIS driver staged.
 func (d *Driver) stagedNVMeoFNQNs() (map[string]struct{}, error) {
 	root := filepath.Join(kubeletCSIStagingRoot, d.name) + string(filepath.Separator)
-	devices, err := getMountedBlockDevices()
+	// Every mount point per device: a published filesystem volume is mounted
+	// at its staging path AND bind-mounted into the pod, and a single-target
+	// inventory can keep only the pod path (codex re-verification N1).
+	mounts, err := getBlockDeviceMounts()
 	if err != nil {
 		return nil, err
 	}
@@ -119,18 +122,26 @@ func (d *Driver) stagedNVMeoFNQNs() (map[string]struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	owned := make(map[string]struct{})
-	for _, set := range []map[string]string{devices, staged} {
-		for device, where := range set {
-			if !strings.HasPrefix(where, root) {
-				continue
+	candidates := make(map[string]struct{})
+	for device, targets := range mounts {
+		for _, target := range targets {
+			if strings.HasPrefix(target, root) {
+				candidates[device] = struct{}{}
 			}
-			nqn, infoErr := getNVMeInfoFromDevice(device)
-			if infoErr != nil || nqn == "" {
-				continue
-			}
-			owned[nqn] = struct{}{}
 		}
+	}
+	for device, link := range staged {
+		if strings.HasPrefix(link, root) {
+			candidates[device] = struct{}{}
+		}
+	}
+	owned := make(map[string]struct{})
+	for device := range candidates {
+		nqn, infoErr := getNVMeInfoFromDevice(device)
+		if infoErr != nil || nqn == "" {
+			continue
+		}
+		owned[nqn] = struct{}{}
 	}
 	return owned, nil
 }

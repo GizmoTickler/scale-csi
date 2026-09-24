@@ -108,6 +108,13 @@ func IsNotFoundError(err error) bool {
 		// verdict feeds silent-success deletes. Callers that need to tolerate a
 		// vanished object prove it at the call site with a re-query
 		// (deleteVanishedTolerant).
+		if apiErr.Code == -32001 || nestedErrnoPresent(apiErr.Data) {
+			// -32001's Message is the constant "Method call error" on the
+			// appliance; any other text is not a statement about this object.
+			// A nested errno is structured evidence about something else; it
+			// vetoes the message fallback rather than being read as ours.
+			return false
+		}
 		// Match the human-readable Message only, NOT FullError(): FullError embeds
 		// the whole Data blob via %+v, so a -1 error that merely MENTIONS "not
 		// found" about some nested object (e.g. a validation entry referencing a
@@ -157,6 +164,9 @@ func IsAlreadyExistsError(err error) bool {
 		// The corroboration requirement is what keeps an EEXIST reported against
 		// an UNRELATED attribute from speaking for this object; see
 		// truenasEnvelopeReports.
+		if nestedErrnoPresent(apiErr.Data) {
+			return false
+		}
 		if truenasEnvelopeReports(apiErr, syscall.EEXIST, "already exists") {
 			return true
 		}
@@ -210,6 +220,10 @@ func MessageFallbackContains(err error, fragments ...string) bool {
 	if _, ok := APIErrno(err); ok {
 		return false
 	}
+	var vetoErr *APIError
+	if errors.As(err, &vetoErr) && nestedErrnoPresent(vetoErr.Data) {
+		return false
+	}
 	messageText := err.Error()
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
@@ -242,37 +256,61 @@ func APIErrno(err error) (syscall.Errno, bool) {
 	return findErrno(apiErr.Data)
 }
 
-// findErrno never descends into a "trace" subtree. middlewared's envelope puts
-// a traceback there whose frames carry a `locals` map keyed by the frame's
-// variable names, so a middleware local that happened to be called `errno`
-// would otherwise be read as this call's errno and short-circuit both the
-// classifier and the message-fallback belt at every call site.
+// findErrno reads an errno ONLY from the error data's own top-level keys. It
+// used to walk the whole blob, so any nested "errno"/"*_errno" (a dependency's
+// errno inside "extra", or a traceback frame's `locals`) spoke for the call.
+// This classification feeds silent-success deletes, where a nested dependency
+// ENOENT is exactly the wrong answer (codex re-verification, 2026-09-24). A
+// nested errno describes something else, never this call.
 func findErrno(value interface{}) (syscall.Errno, bool) {
-	switch typed := value.(type) {
-	case map[string]interface{}:
-		for key, child := range typed {
-			if strings.EqualFold(key, "errno") || strings.HasSuffix(strings.ToLower(key), "_errno") {
-				if errno, ok := parseErrnoValue(child); ok {
-					return errno, true
-				}
-			}
-		}
-		for key, child := range typed {
-			if strings.EqualFold(key, "trace") {
-				continue
-			}
-			if errno, ok := findErrno(child); ok {
-				return errno, true
-			}
-		}
-	case []interface{}:
-		for _, child := range typed {
-			if errno, ok := findErrno(child); ok {
+	typed, ok := value.(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	for key, child := range typed {
+		if strings.EqualFold(key, "errno") || strings.HasSuffix(strings.ToLower(key), "_errno") {
+			if errno, ok := parseErrnoValue(child); ok {
 				return errno, true
 			}
 		}
 	}
 	return 0, false
+}
+
+// nestedErrnoPresent reports whether an errno-keyed value appears BELOW the
+// top level of the error data (never inside "trace"). Such an errno is not
+// attributable to this call, so it can only VETO a classification, never
+// affirm one: a nested EACCES must still stop misleading "already exists" text
+// from reading as success, and a nested dependency ENOENT must not read as
+// "object absent".
+func nestedErrnoPresent(data interface{}) bool {
+	var walk func(value interface{}, top bool) bool
+	walk = func(value interface{}, top bool) bool {
+		switch typed := value.(type) {
+		case map[string]interface{}:
+			for key, child := range typed {
+				if strings.EqualFold(key, "trace") {
+					continue
+				}
+				if !top && (strings.EqualFold(key, "errno") || strings.HasSuffix(strings.ToLower(key), "_errno")) {
+					if _, ok := parseErrnoValue(child); ok {
+						return true
+					}
+				}
+				if walk(child, false) {
+					return true
+				}
+			}
+		case []interface{}:
+			for _, child := range typed {
+				if walk(child, false) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(data, true)
 }
 
 // truenasEnvelopeReports reports whether middlewared's error envelope attributes

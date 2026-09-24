@@ -27,6 +27,7 @@ const kubeletCSIStagingRoot = "/var/lib/kubelet/plugins/kubernetes.io/csi"
 
 var (
 	getMountedBlockDevices = util.GetMountedBlockDevices
+	getBlockDeviceMounts   = util.GetBlockDeviceMounts
 	getStagedBlockDevices  = func() (map[string]string, error) {
 		return util.GetStagedBlockDevices(kubeletCSIStagingRoot)
 	}

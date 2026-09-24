@@ -313,3 +313,25 @@ func TestIsNotFoundErrorNeverReadsCallExceptionAsAbsence(t *testing.T) {
 		assert.False(t, IsNotFoundError(err), reason)
 	}
 }
+
+// Re-verification residuals (codex, 2026-09-24): a nested dependency errno, or a
+// -32001 whose message happens to read "not found", must never classify as the
+// requested object's absence, because that verdict turns a failed delete into a
+// silent success. A nested errno may only veto.
+func TestNestedOrOperationErrnoNeverReadsAsAbsence(t *testing.T) {
+	for name, err := range map[string]error{
+		"-32001 ENOENT envelope with nested errno": &APIError{Code: -32001, Message: "Method call error", Data: map[string]interface{}{
+			"error": float64(2), "errname": "ENOENT", "reason": "helper not found", "extra": map[string]interface{}{"errno": float64(2)},
+		}},
+		"-32602 EINVAL envelope with nested dependency errno": &APIError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{
+			"error": float64(22), "errname": "EINVAL", "extra": map[string]interface{}{"dependency_errno": float64(2)},
+		}},
+		"-32001 with not-found prose in its message": &APIError{Code: -32001, Message: "helper not found", Data: map[string]interface{}{
+			"error": float64(22), "errname": "EINVAL",
+		}},
+	} {
+		assert.False(t, IsNotFoundError(err), name)
+	}
+	// Top-level errno stays authoritative in both directions.
+	assert.True(t, IsNotFoundError(&APIError{Code: -32602, Message: "Invalid params", Data: map[string]interface{}{"errno": "ENOENT"}}))
+}
