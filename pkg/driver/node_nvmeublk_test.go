@@ -824,3 +824,69 @@ func unique(values []string) []string {
 	}
 	return out
 }
+
+// After a reboot, ublk numbering restarts at 0: a block staging link that
+// survived under /var/lib/kubelet resolves to whichever volume attached first.
+// Its re-stage must attach its own device and replace the link, never fail
+// AlreadyExists forever, and never touch the other volume's device.
+func TestNodeStageUblkBlockStaleLinkToReusedDeviceReattaches(t *testing.T) {
+	logPath := installUblkNodeCommands(t)
+	forbidKernelNVMe(t)
+	fake := installFakeNodeUblkDaemon(t)
+	d := newTestUblkNodeDriver(t)
+
+	// Volume B stages first after the reboot and takes ublkb0.
+	other, err := fake.Attach(context.Background(), util.NVMeUblkAttachRequest{Volume: "pvc-other", SubNQN: "nqn.2011-06.com.example:pvc-other"})
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(fake.devDir, "ublkb0"), other.Path)
+
+	// Volume A's pre-reboot link still points at ublkb0.
+	stagingPath := filepath.Join(t.TempDir(), "staging", "volume-device")
+	require.NoError(t, os.MkdirAll(filepath.Dir(stagingPath), 0o750))
+	require.NoError(t, os.Symlink(other.Path, stagingPath))
+	req := &csi.NodeStageVolumeRequest{
+		VolumeId:          testUblkVolume,
+		StagingTargetPath: stagingPath,
+		VolumeCapability:  blockCapability(),
+		VolumeContext:     ublkVolumeContext(nil),
+	}
+
+	_, err = d.NodeStageVolume(context.Background(), req)
+	require.NoError(t, err)
+	target, err := os.Readlink(stagingPath)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(fake.devDir, "ublkb1"), target, "the link now points at this volume's own device")
+	attaches, detaches, _ := fake.snapshot()
+	require.Len(t, attaches, 2)
+	assert.Equal(t, testUblkVolume, attaches[1].Volume)
+	assert.Empty(t, detaches, "the other volume's device is never detached")
+	assert.FileExists(t, other.Path)
+	assertNoNVMeCLI(t, logPath)
+}
+
+// A stage record naming a DIFFERENT volume at this path is a real collision:
+// it stays fail-closed.
+func TestNodeStageUblkBlockLinkOwnedByRecordedOtherVolumeStaysAlreadyExists(t *testing.T) {
+	installUblkNodeCommands(t)
+	forbidKernelNVMe(t)
+	fake := installFakeNodeUblkDaemon(t)
+	d := newTestUblkNodeDriver(t)
+
+	other, err := fake.Attach(context.Background(), util.NVMeUblkAttachRequest{Volume: "pvc-other", SubNQN: "nqn.2011-06.com.example:pvc-other"})
+	require.NoError(t, err)
+	stagingPath := filepath.Join(t.TempDir(), "staging", "volume-device")
+	require.NoError(t, os.MkdirAll(filepath.Dir(stagingPath), 0o750))
+	require.NoError(t, os.Symlink(other.Path, stagingPath))
+	d.storeStageRecord(nodeMountRecord{TargetPath: stagingPath, VolumeID: "pvc-other"})
+
+	_, err = d.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testUblkVolume,
+		StagingTargetPath: stagingPath,
+		VolumeCapability:  blockCapability(),
+		VolumeContext:     ublkVolumeContext(nil),
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	attaches, _, _ := fake.snapshot()
+	assert.Len(t, attaches, 1, "no attach for the colliding volume")
+}

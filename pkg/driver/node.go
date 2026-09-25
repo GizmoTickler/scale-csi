@@ -322,6 +322,22 @@ func (d *Driver) handleExistingStageContext(ctx context.Context, req *csi.NodeSt
 			return true, status.Errorf(codes.Internal, "failed to resolve staged block device: %v", resolveErr)
 		}
 		if sourceErr := d.verifyStageDeviceSource(ctx, req.GetVolumeId(), devicePath, shareType, req.GetVolumeContext()); sourceErr != nil {
+			// ublk device numbers restart at 0 on every boot and every
+			// /dev/ublkbN is a CSI volume, so a staging link that survived a
+			// reboot routinely resolves to ANOTHER volume's live device. The
+			// daemon's identity check already proves the link is stale; unless a
+			// stage record says this path belongs to a different staged volume,
+			// report "not staged" so the ublk stage path attaches this volume and
+			// atomically replaces the link (the other volume's device is never
+			// touched). Same record guard as the dangling-link case above.
+			if util.IsNVMeUblkDevice(devicePath) && status.Code(sourceErr) == codes.AlreadyExists {
+				if record, ok := d.stageRecord(stagingPath); !ok ||
+					(record.VolumeID == req.GetVolumeId() && record.ExpectedSource == expectedSource && record.Capability == capability) {
+					klog.Infof("Staging link %s resolves to %s, now serving another volume (%v); re-staging %s", stagingPath, devicePath, sourceErr, req.GetVolumeId())
+					d.deleteStageRecord(stagingPath)
+					return false, nil
+				}
+			}
 			return true, sourceErr
 		}
 		liveSource = normalizeMountSource(devicePath)
