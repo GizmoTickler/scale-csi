@@ -31,14 +31,13 @@ type sessionRegistry struct {
 	dir string
 }
 
-// newSessionRegistry prepares dir. An error means GC must not disconnect
+// newSessionRegistry returns a registry rooted at dir, which must be an
+// absolute path. Nothing is created until the first record, so constructing a
+// driver touches no filesystem state. An error means GC must not disconnect
 // anything for this protocol, since ownership cannot be established.
 func newSessionRegistry(dir string) (*sessionRegistry, error) {
-	if strings.TrimSpace(dir) == "" {
-		return nil, fmt.Errorf("session registry directory is empty")
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create session registry %s: %w", dir, err)
+	if strings.TrimSpace(dir) == "" || !filepath.IsAbs(dir) {
+		return nil, fmt.Errorf("session registry directory %q is not an absolute path", dir)
 	}
 	return &sessionRegistry{dir: dir}, nil
 }
@@ -56,6 +55,9 @@ func (r *sessionRegistry) record(id string) error {
 	now := time.Now()
 	if err := os.Chtimes(p, now, now); err == nil {
 		return nil
+	}
+	if err := os.MkdirAll(r.dir, 0o700); err != nil {
+		return fmt.Errorf("record session %s: %w", id, err)
 	}
 	tmp := p + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -105,6 +107,9 @@ func (r *sessionRegistry) entries() (map[string]time.Time, error) {
 		return nil, fmt.Errorf("session registry unavailable")
 	}
 	dirEntries, err := os.ReadDir(r.dir)
+	if os.IsNotExist(err) {
+		return map[string]time.Time{}, nil // nothing recorded yet
+	}
 	if err != nil {
 		return nil, err
 	}
