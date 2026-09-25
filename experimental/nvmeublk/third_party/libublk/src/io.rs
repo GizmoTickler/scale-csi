@@ -248,6 +248,153 @@ pub(crate) fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
     DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().pop_front())
 }
 
+/// Queue `sqe` on `r`, flushing the SQ to the kernel while it is full.
+///
+/// A full SQ is normal under load: io_uring_enter() consumes the queued
+/// SQEs and makes room, so the push is retried after each flush.  A flush
+/// that fails with a transient error (see [`sq_flush_err_is_transient`]:
+/// EAGAIN, ENOMEM, EINTR) is retried too, without limit: the ring first
+/// runs its pending task work, so completed requests return their
+/// io_kiocb to the request cache, and after a few quick retries the thread
+/// backs off (up to 1 ms per retry) instead of busy-spinning through a
+/// long memory shortage.  A fatal signal still ends the thread on its next
+/// return from the kernel.
+///
+/// Any other io_uring_enter() failure (EBADF, EBADFD for a disabled ring,
+/// EOWNERDEAD for a dead SQPOLL thread, EEXIST for a submit from a task
+/// other than the single issuer, EINVAL, ...) means the ring cannot take
+/// SQEs any more and would fail the same way on every retry, so it is
+/// returned instead of panicking (or spinning) the queue thread.
+pub(crate) fn queue_ring_push_sqe<S: squeue::EntryMarker>(
+    r: &mut IoUring<S>,
+    sqe: &S,
+) -> Result<(), UblkError> {
+    push_sqe_flushing(r, sqe, |r| r.submit_and_wait(0))
+}
+
+/// [`queue_ring_push_sqe`] with the SQ flush as a parameter, so that tests
+/// can inject io_uring_enter() failures.
+fn push_sqe_flushing<S, F>(r: &mut IoUring<S>, sqe: &S, mut flush: F) -> Result<(), UblkError>
+where
+    S: squeue::EntryMarker,
+    F: FnMut(&mut IoUring<S>) -> std::io::Result<usize>,
+{
+    // Consecutive transient flush failures.
+    let mut failures: u32 = 0;
+    loop {
+        if unsafe { r.submission().push(sqe) }.is_ok() {
+            if failures > 0 {
+                log::info!(
+                    "queue ring: SQE queued after {} transient flush failures",
+                    failures
+                );
+            }
+            return Ok(());
+        }
+        log::debug!("queue ring: SQ full, flush submission and retry");
+        match flush(r) {
+            Ok(_) => failures = 0,
+            Err(e) if sq_flush_err_is_transient(&e) => {
+                failures = failures.saturating_add(1);
+                if failures.is_power_of_two() {
+                    log::warn!(
+                        "queue ring: flushing full SQ failed: {} (transient, retry {})",
+                        e,
+                        failures
+                    );
+                }
+                queue_ring_run_task_work(r);
+                sq_flush_backoff(failures);
+            }
+            Err(e) => {
+                log::error!("queue ring: flushing full SQ failed: {}", e);
+                return Err(UblkError::IOError(e));
+            }
+        }
+    }
+}
+
+/// Whether an io_uring_enter() error from flushing a full SQ clears by
+/// itself, so the flush should be retried.  On Linux v7.2.5 the submit
+/// path fails transiently with:
+///  - EAGAIN: io_submit_sqes() submitted nothing because it could not
+///    allocate an io_kiocb and the ring's request cache is empty
+///    (io_uring/io_uring.c:2064-2069, "try again").  io_kiocb is
+///    SLAB_ACCOUNT (io_uring.c:3257-3259) and allocated GFP_KERNEL
+///    (io_uring.c:980), so a memcg at its limit with no OOM victim fails
+///    it.  Every request that completes returns its io_kiocb to the cache
+///    (io_free_batch_list(), io_uring.c:1132), and the next flush submits
+///    from there.  Completions do not have to be reaped from the CQ first.
+///  - ENOMEM: allocating the task's io_uring context or ring node on its
+///    first submit (io_uring/tctx.c, __io_uring_add_tctx_node()); the same
+///    memory shortage, and every enter tries the allocation again.
+///  - EINTR: a signal interrupted the enter.
+///
+/// v7.2.5 has no EBUSY on the enter path (older 5.x kernels returned it
+/// while CQ overflow was pending, which only the application reaping CQEs
+/// could clear), so EBUSY is not retried.
+fn sq_flush_err_is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::ENOMEM) | Some(libc::EINTR)
+    )
+}
+
+/// Run the ring's pending task work, so that completed requests are
+/// finished and their io_kiocbs return to the request cache before a
+/// failed flush is retried.
+///
+/// A COOP_TASKRUN or plain ring runs task work on the way back from any
+/// io_uring_enter(), including the flush that failed.  A DEFER_TASKRUN
+/// ring runs its local work only from an enter with GETEVENTS, and an
+/// enter whose submit fails returns before it gets there
+/// (io_uring/io_uring.c:2646-2650).  An enter with to_submit = 0,
+/// min_complete = 0 and GETEVENTS runs the local work and any task work,
+/// flushes CQ overflow, and returns at once without waiting
+/// (io_uring/wait.c:199-214).  Errors are ignored: a ring that cannot run
+/// this fails the next flush too, and that error is reported.
+fn queue_ring_run_task_work<S: squeue::EntryMarker>(r: &IoUring<S>) {
+    // IORING_ENTER_GETEVENTS, include/uapi/linux/io_uring.h
+    const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
+
+    // SAFETY: no SQEs are submitted and no argument is passed.
+    let res = unsafe {
+        r.submitter()
+            .enter::<libc::sigset_t>(0, 0, IORING_ENTER_GETEVENTS, None)
+    };
+    if let Err(e) = res {
+        log::debug!("queue ring: running task work failed: {}", e);
+    }
+}
+
+/// Pause before retrying a flush after `failures` consecutive transient
+/// failures: yield for the first few (the failed enter and the task-work
+/// enter have already let completed requests refill the request cache),
+/// then sleep 2 us, 4 us, ... up to 1 ms, so a long memory shortage does
+/// not busy-spin the queue thread.
+fn sq_flush_backoff(failures: u32) {
+    const QUICK_RETRIES: u32 = 4;
+    const MAX_SLEEP_US: u64 = 1000;
+
+    if failures <= QUICK_RETRIES {
+        std::thread::yield_now();
+        return;
+    }
+    let shift = (failures - QUICK_RETRIES).min(10);
+    let us = (1_u64 << shift).min(MAX_SLEEP_US);
+    std::thread::sleep(std::time::Duration::from_micros(us));
+}
+
+/// Negative errno for an error from queuing an SQE, for results that are
+/// reported as CQE-style `i32`s.
+fn submit_err_to_res(e: &UblkError) -> i32 {
+    match e {
+        UblkError::IOError(e) => -e.raw_os_error().unwrap_or(libc::EIO),
+        UblkError::OtherError(res) | UblkError::UringIOError(res) if *res < 0 => *res,
+        _ => -libc::EIO,
+    }
+}
+
 // Internal macro versions for backwards compatibility within the crate
 #[macro_export]
 macro_rules! with_queue_ring_internal {
@@ -1951,16 +2098,23 @@ impl UblkQueue<'_> {
             override_sqe!(&mut sqe, addr, auto_buf_addr);
         }
 
-        loop {
-            let res = unsafe { r.submission().push(&sqe) };
-
-            match res {
-                Ok(_) => break,
-                Err(_) => {
-                    log::debug!("__queue_io_cmd: flush submission and retry");
-                    r.submit_and_wait(0).unwrap();
-                }
-            }
+        // queue_ring_push_sqe() retries a full SQ and transient flush
+        // errors (EAGAIN, ENOMEM, EINTR), so an error here means the ring
+        // itself failed and cannot take this tag's command: the queue
+        // cannot serve the tag any more.  Stop the queue (as
+        // submit_io_commit_cmd() does when it cannot submit) and report the
+        // errno instead of panicking the queue thread.
+        if let Err(e) = queue_ring_push_sqe(r, &sqe) {
+            log::error!(
+                "dev{}-q{}: tag {} cmd_op {:x} not queued: {}, stopping queue",
+                self.dev.dev_info.dev_id,
+                self.q_id,
+                tag,
+                cmd_op,
+                e
+            );
+            self.mark_stopping();
+            return submit_err_to_res(&e);
         }
         1
     }
@@ -2066,9 +2220,14 @@ impl UblkQueue<'_> {
     ) -> UblkUringOpFuture {
         let f = UblkUringOpFuture::new(0);
         let user_data = f.user_data | (tag as u64);
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        let queued = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
             self.__queue_io_cmd(r, tag, cmd_op, buf_addr as u64, None, user_data, result)
         });
+        // Not queued because the ring failed (the queue is now stopping):
+        // resolve to ABORT, which callers already treat as queue down.
+        if queued < 0 {
+            f.complete(sys::UBLK_IO_RES_ABORT);
+        }
 
         f
     }
@@ -2096,9 +2255,13 @@ impl UblkQueue<'_> {
 
         let f = UblkUringOpFuture::new(0);
         let user_data = f.user_data | (tag as u64);
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        let queued = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
             self.__queue_io_cmd(r, tag, cmd_op, 0, auto_buf_addr, user_data, result)
         });
+        // As in submit_io_cmd(): a ring failure resolves the future to ABORT.
+        if queued < 0 {
+            f.complete(sys::UBLK_IO_RES_ABORT);
+        }
 
         f
     }
@@ -2324,29 +2487,29 @@ impl UblkQueue<'_> {
         }
     }
 
+    /// Submit one target SQE on the queue ring; `.await` returns its CQE
+    /// result.  If the SQE cannot be queued (the ring failed), the future
+    /// resolves at once to the negative errno instead of panicking.
     pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-        crate::uring_async::__ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).unwrap()
-    }
-
-    #[inline]
-    pub fn ublk_submit_sqe_sync(&self, sqe: io_uring::squeue::Entry) -> Result<(), UblkError> {
-        loop {
-            let res = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| unsafe {
-                ring.submission().push(&sqe)
-            });
-
-            match res {
-                Ok(_) => break,
-                Err(_) => {
-                    log::debug!("ublk_submit_sqe: flush and retry");
-                    with_queue_ring_internal!(
-                        |ring: &IoUring<squeue::Entry>| ring.submit_and_wait(0)
-                    )?;
-                }
+        match crate::uring_async::__ublk_submit_sqe_async(sqe, UblkUringData::Target as u64) {
+            Ok(f) => f,
+            Err(e) => {
+                let f = UblkUringOpFuture::new(0);
+                f.complete(submit_err_to_res(&e));
+                f
             }
         }
+    }
 
-        Ok(())
+    /// Queue one target SQE on the queue ring without waiting for it.
+    /// A full SQ is flushed and the push retried, as are transient flush
+    /// failures (EAGAIN, ENOMEM, EINTR); only an error that every retry
+    /// would hit is returned (see `queue_ring_push_sqe`).
+    #[inline]
+    pub fn ublk_submit_sqe_sync(&self, sqe: io_uring::squeue::Entry) -> Result<(), UblkError> {
+        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+            queue_ring_push_sqe(ring, &sqe)
+        })
     }
 
     fn submit_reg_unreg_io_buf(&self, op: u32, tag: u16, buf_index: u16) -> UblkUringOpFuture {
@@ -2371,18 +2534,17 @@ impl UblkQueue<'_> {
             .build()
             .user_data(user_data);
 
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            loop {
-                let res = unsafe { r.submission().push(&sqe) };
-                match res {
-                    Ok(_) => break,
-                    Err(_) => {
-                        log::debug!("submit_register_io_buf: flush and retry");
-                        r.submit_and_wait(0).unwrap();
-                    }
-                }
-            }
-        });
+        // A ring failure (transient flush errors are retried inside
+        // queue_ring_push_sqe()) resolves the future to the negative errno,
+        // as a failed CQE would, instead of panicking the queue thread.
+        // The queue is not marked stopping here: no io command is lost, so
+        // the target can still complete the tag, and the next io command
+        // pushed on the failed ring stops the queue (__queue_io_cmd_no_state).
+        if let Err(e) = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+            queue_ring_push_sqe(r, &sqe)
+        }) {
+            f.complete(submit_err_to_res(&e));
+        }
 
         f
     }
@@ -3739,5 +3901,185 @@ mod tag_partition_tests {
         let owned: Vec<u32> = (0..64).filter(|&t| UblkQueue::chunk_owns(t, 4, 1, 4)).collect();
         assert_eq!(owned, vec![4, 5, 6, 7, 20, 21, 22, 23, 36, 37, 38, 39, 52, 53, 54, 55]);
         assert_eq!(UblkQueue::chunked_partition(64, 4, 1, 4), (4, 56, 16));
+    }
+}
+
+#[cfg(test)]
+mod sq_full_tests {
+    use super::{push_sqe_flushing, queue_ring_push_sqe, sq_flush_backoff, submit_err_to_res};
+    use crate::UblkError;
+    use io_uring::{opcode, types, IoUring};
+
+    fn nop(user_data: u64) -> io_uring::squeue::Entry {
+        opcode::Nop::new().build().user_data(user_data)
+    }
+
+    fn errno_err(errno: i32) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(errno))
+    }
+
+    /// A flush that fails with a transient error is retried until it
+    /// succeeds, and the SQE is queued.  EAGAIN is what v7.2.5 returns when
+    /// it cannot allocate a request (io_uring.c:2064-2069, "try again").
+    /// The previous loop returned EAGAIN and ENOMEM as errors, which made a
+    /// target op fail with -EIO and an io command stop its queue.
+    #[test]
+    fn push_retries_transient_flush_errors() {
+        for errno in [libc::EAGAIN, libc::ENOMEM, libc::EINTR] {
+            let mut ring: IoUring = IoUring::builder().setup_cqsize(16).build(2).unwrap();
+            for i in 0..2 {
+                push_sqe_flushing(&mut ring, &nop(i), |_| panic!("flushed a non-full SQ")).unwrap();
+            }
+
+            let mut flushes = 0;
+            push_sqe_flushing(&mut ring, &nop(2), |r| {
+                flushes += 1;
+                if flushes <= 6 {
+                    errno_err(errno)
+                } else {
+                    r.submit_and_wait(0)
+                }
+            })
+            .unwrap_or_else(|e| panic!("errno {errno}: push failed: {e}"));
+            assert_eq!(flushes, 7, "errno {errno}");
+
+            ring.submit().unwrap();
+            let mut done: Vec<u64> = ring.completion().map(|cqe| cqe.user_data()).collect();
+            done.sort();
+            assert_eq!(done, vec![0, 1, 2], "errno {errno}");
+        }
+    }
+
+    /// Errors that every retry would hit are returned at the first failed
+    /// flush, and the SQE is not queued.
+    #[test]
+    fn push_returns_permanent_flush_errors() {
+        for errno in [
+            libc::EBADF,
+            libc::EBADFD,
+            libc::EOWNERDEAD,
+            libc::EEXIST,
+            libc::EINVAL,
+            libc::EBUSY,
+        ] {
+            let mut ring: IoUring = IoUring::builder().build(2).unwrap();
+            for i in 0..2 {
+                push_sqe_flushing(&mut ring, &nop(i), |_| panic!("flushed a non-full SQ")).unwrap();
+            }
+
+            let mut flushes = 0;
+            let err = push_sqe_flushing(&mut ring, &nop(2), |_| {
+                flushes += 1;
+                errno_err(errno)
+            })
+            .unwrap_err();
+            assert_eq!(flushes, 1, "errno {errno}");
+            assert_eq!(submit_err_to_res(&err), -errno);
+            assert_eq!(ring.submission().len(), 2, "errno {errno}");
+        }
+    }
+
+    /// On a DEFER_TASKRUN ring a completed request is finished (and its
+    /// io_kiocb freed) only by an enter with GETEVENTS, which a failed
+    /// submit never reaches (io_uring.c:2646-2650).  Between retries the
+    /// push runs that work, so a request cache emptied by the EAGAIN can
+    /// refill.  The completed pipe read's CQE shows that the work ran.
+    #[test]
+    fn push_runs_deferred_task_work_between_retries() {
+        let mut ring: IoUring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .setup_cqsize(8)
+            .build(2)
+            .unwrap();
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let mut buf = [0_u8; 8];
+
+        // The pipe is empty, so the read waits for data.
+        let read = opcode::Read::new(types::Fd(fds[0]), buf.as_mut_ptr(), buf.len() as u32)
+            .build()
+            .user_data(100);
+        queue_ring_push_sqe(&mut ring, &read).unwrap();
+        ring.submit().unwrap();
+        // Writing completes the read, as local work that no enter without
+        // GETEVENTS runs.
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+        unsafe { ring.submitter().enter::<libc::sigset_t>(0, 0, 0, None) }.unwrap();
+        assert!(ring.completion().is_empty());
+
+        for i in 0..2 {
+            push_sqe_flushing(&mut ring, &nop(i), |_| panic!("flushed a non-full SQ")).unwrap();
+        }
+        let mut flushes = 0;
+        push_sqe_flushing(&mut ring, &nop(2), |r| {
+            flushes += 1;
+            if flushes == 1 {
+                assert!(r.completion().is_empty());
+                return errno_err(libc::EAGAIN);
+            }
+            let cqes: Vec<(u64, i32)> = r
+                .completion()
+                .map(|cqe| (cqe.user_data(), cqe.result()))
+                .collect();
+            assert_eq!(cqes, vec![(100, 1)], "deferred task work did not run");
+            r.submit_and_wait(0)
+        })
+        .unwrap();
+        assert_eq!(flushes, 2);
+
+        ring.submit_and_wait(3).unwrap();
+        let mut done: Vec<u64> = ring.completion().map(|cqe| cqe.user_data()).collect();
+        done.sort();
+        assert_eq!(done, vec![0, 1, 2]);
+        assert_eq!(buf[0], b'x');
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// The backoff never sleeps more than 1 ms, however many failures.
+    #[test]
+    fn flush_backoff_is_bounded() {
+        let start = std::time::Instant::now();
+        for failures in [1, 4, 5, 14, 15, 1000, u32::MAX] {
+            sq_flush_backoff(failures);
+        }
+        // Four capped sleeps (<= 1 ms each) plus scheduling slack.
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    /// More SQEs than the SQ holds: every push flushes the full SQ to the
+    /// kernel and retries, and every SQE completes.
+    #[test]
+    fn push_flushes_full_sq_and_retries() {
+        let mut ring: IoUring = IoUring::builder().setup_cqsize(16).build(2).unwrap();
+        for i in 0..6 {
+            let sqe = opcode::Nop::new().build().user_data(i);
+            queue_ring_push_sqe(&mut ring, &sqe).unwrap();
+        }
+        ring.submit().unwrap();
+        let mut done: Vec<u64> = ring.completion().map(|cqe| cqe.user_data()).collect();
+        done.sort();
+        assert_eq!(done, (0..6).collect::<Vec<u64>>());
+    }
+
+    /// A full SQ on a ring that io_uring_enter() rejects (a disabled ring
+    /// fails with EBADFD) returns the error; the old retry loop called
+    /// `submit_and_wait(0).unwrap()` and panicked the queue thread.
+    #[test]
+    fn push_on_failed_ring_returns_error() {
+        let mut ring: IoUring = IoUring::builder().setup_r_disabled().build(2).unwrap();
+        let sqe = opcode::Nop::new().build();
+        queue_ring_push_sqe(&mut ring, &sqe).unwrap();
+        queue_ring_push_sqe(&mut ring, &sqe).unwrap();
+
+        let err = queue_ring_push_sqe(&mut ring, &sqe).unwrap_err();
+        match &err {
+            UblkError::IOError(e) => assert_eq!(e.raw_os_error(), Some(libc::EBADFD)),
+            e => panic!("unexpected error {e}"),
+        }
+        assert_eq!(submit_err_to_res(&err), -libc::EBADFD);
     }
 }
