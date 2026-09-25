@@ -227,10 +227,18 @@ fn queue_fn(
     // each queue thread to its blk-mq CPU group, which at one queue per CPU is
     // exactly the submitting CPU: at QD1 the submitter and the queue thread
     // then take turns on one core. "all" lets the thread run anywhere.
-    if std::env::var("NVMEUBLK_QUEUE_CPUS").as_deref() == Ok("all") {
+    // A CPU list ("14-15", "6,7,14,15") confines every queue thread to
+    // those CPUs: dedicated storage cores the workload does not run on.
+    let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) }.max(1) as usize).min(libc::CPU_SETSIZE as usize);
+    let cpus: Option<Vec<usize>> = match std::env::var("NVMEUBLK_QUEUE_CPUS").as_deref() {
+        Ok("all") => Some((0..ncpu).collect()),
+        Ok(list) if list.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => Some(parse_cpu_list(list).into_iter().filter(|&c| c < ncpu).collect()),
+        _ => None,
+    };
+    if let Some(cpus) = cpus.filter(|c| !c.is_empty()) {
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
-            for cpu in 0..(libc::sysconf(libc::_SC_NPROCESSORS_CONF).max(1) as usize).min(libc::CPU_SETSIZE as usize) {
+            for cpu in cpus {
                 libc::CPU_SET(cpu, &mut set);
             }
             libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
@@ -241,6 +249,31 @@ fn queue_fn(
     // up to N us instead of sleeping until an interrupt. Trades a slice of a
     // core for latency. (DEFER_TASKRUN was tried: no gain, and the queue
     // threads never exit after the device is deleted.)
+    // Queue ring setup flags (NVMEUBLK_RING_MODE, tuning). libublk builds
+    // this thread's ring with COOP_TASKRUN unless one already exists, so
+    // create it first when another mode is asked for:
+    //   coop  (default) COOP_TASKRUN, as libublk does
+    //   plain           no task-run flags
+    //   defer           SINGLE_ISSUER + DEFER_TASKRUN
+    let mode = std::env::var("NVMEUBLK_RING_MODE").unwrap_or_default();
+    if mode == "plain" || mode == "defer" {
+        let (sq, cq) = (dev.tgt.sq_depth as u32, dev.tgt.cq_depth as u32);
+        let r = libublk::io::ublk_init_task_ring(|cell| {
+            if cell.get().is_none() {
+                let mut b = io_uring::IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder();
+                b.setup_cqsize(cq);
+                if mode == "defer" {
+                    b.setup_single_issuer().setup_defer_taskrun();
+                }
+                let ring = b.build(sq).map_err(libublk::UblkError::IOError)?;
+                cell.set(std::cell::RefCell::new(ring)).map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            log::warn!("q{qid}: ring mode {mode} failed ({e}); using libublk's default");
+        }
+    }
     let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
     let shift = ctrls.info.lba_shift;
     // Engine tasks are 'static (they own Rc<QEngine>); tag tasks borrow the
@@ -257,6 +290,7 @@ fn queue_fn(
     }
     let engine = qengine::QEngine::new(qid, ctrls, cfg, net_exe.clone(), stats, stop, draining);
     engine.start();
+    let spin_engine = engine.clone();
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let exe = exe_rc.clone();
     let mut tasks = Vec::new();
@@ -287,12 +321,60 @@ fn queue_fn(
             st2.loop_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         };
         let done = || tasks.iter().all(|t| t.is_finished());
-        if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-            log::error!("queue {qid}: event loop failed: {e}");
+        // The queue's event loop (libublk's wait_and_handle_io_events, plus
+        // adaptive polling). NVMEUBLK_SPIN_US (tuning, 0 = off): while this
+        // queue has commands in flight and saw an event within the budget,
+        // check the ring without blocking instead of sleeping in it. A queue
+        // carrying a thin share of a stream otherwise sleeps between events
+        // and pays a wakeup for each; an idle queue still sleeps.
+        let spin = Duration::from_micros(env_u64("NVMEUBLK_SPIN_US", 0));
+        let timeout = io_uring::types::Timespec::new().sec(20);
+        let mut last_event = Instant::now();
+        run_ops();
+        loop {
+            let hot = !spin.is_zero() && spin_engine.inflight_here() > 0 && last_event.elapsed() < spin;
+            let (poll_timeout, failed) = match libublk::uring_async::uring_poll_io_fn::<io_uring::squeue::Entry>(&q_rc, Some(timeout), if hot { 0 } else { 1 }) {
+                Ok(t) => (t, false),
+                Err(_) => (false, true),
+            };
+            let mut events = 0u32;
+            let aborted = match libublk::uring_async::ublk_reap_io_events_with_update_queue(&q_rc, poll_timeout, None, |cqe| {
+                events += 1;
+                libublk::uring_async::ublk_wake_task(cqe.user_data(), cqe)
+            }) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("queue {qid}: event loop failed: {e}");
+                    break;
+                }
+            };
+            if events > 0 {
+                last_event = Instant::now();
+            }
+            run_ops();
+            if (aborted || failed) && done() {
+                break;
+            }
         }
     }));
     // Deliberately not setting the shared stop flag here: one queue's loop
     // ending must not stop the other queues' timers (reconnect, expiry).
+}
+
+/// "0-3,8,10-11" -> [0, 1, 2, 3, 8, 10, 11]. Malformed parts are skipped.
+fn parse_cpu_list(list: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    out.extend(a..=b);
+                }
+            }
+            None => out.extend(part.parse::<usize>().ok()),
+        }
+    }
+    out
 }
 
 /// A block driver in userspace must not need memory to make progress on the
@@ -371,9 +453,12 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         let dn = (n - last.0).max(1);
         let g = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
         let (qw, qn, wd, dc, rn, lp, ln) = (g(&st.q2w_ns), g(&st.q2w_n).max(1), g(&st.w2d_ns), g(&st.d2c_ns), g(&st.rd_n).max(1), g(&st.loops).max(1), g(&st.loop_ns));
+        let qs = g(&st.q2s_ns);
+        let (wv, wvn) = (g(&st.wv_ns), g(&st.wv_n).max(1));
+        let (zr, zrn) = (g(&st.zc_rx_ns), g(&st.zc_rx_n).max(1));
         let lat = format!(
-            "zc_MiB={} zc_tx_MiB={} io={} wire_avg={}us total_avg={}us | queued->wired={}us wired->1stdata={}us 1stdata->done={}us | loops/s={} run_ops_avg={}us",
-            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, wd / rn / 1000, dc / rn / 1000, lp / 5, ln / lp / 1000
+            "zc_MiB={} zc_tx_MiB={} linked_hdr={} io={} wire_avg={}us total_avg={}us | queued->wired={}us (pickup {}us, writev {}us x{}) wired->1stdata={}us 1stdata->done={}us (zc payload rx {}us) | loops/s={} run_ops_avg={}us",
+            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, g(&st.linked_hdr), n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, qs / qn / 1000, wv / wvn / 1000, wvn / 5, wd / rn / 1000, dc / rn / 1000, zr / zrn / 1000, lp / 5, ln / lp / 1000
         );
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
@@ -424,5 +509,14 @@ fn main() -> Result<()> {
         "lat" => lat(&args[2], &args[3..]),
         "run" => run(&args[2], &args[3..]),
         c => bail!("unknown command {c}"),
+    }
+}
+
+#[cfg(test)]
+mod cpu_list_tests {
+    #[test]
+    fn cpu_list_parses_ranges_and_singles() {
+        assert_eq!(super::parse_cpu_list("0-3,8, 10-11"), vec![0, 1, 2, 3, 8, 10, 11]);
+        assert_eq!(super::parse_cpu_list("x,5,2-a"), vec![5]);
     }
 }

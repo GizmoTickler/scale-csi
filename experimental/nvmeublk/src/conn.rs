@@ -79,6 +79,13 @@ pub struct Ident {
 fn dial(addr: SocketAddr) -> Result<TcpStream> {
     let s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).with_context(|| format!("connect {addr}"))?;
     s.set_nodelay(true)?;
+    // NVMEUBLK_RCVBUF (bytes, tuning; 0 = kernel autotuning): a fixed
+    // receive buffer, so the advertised window does not have to grow with
+    // the measured drain rate first.
+    if let Some(n) = std::env::var("NVMEUBLK_RCVBUF").ok().and_then(|v| v.parse::<libc::c_int>().ok()).filter(|&n| n > 0) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, &n as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as u32) };
+    }
     Ok(s)
 }
 

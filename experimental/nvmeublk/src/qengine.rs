@@ -48,6 +48,48 @@ const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
 static ASYNC_RX_MIN: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
 
+static DIRECT_SEND: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_DIRECT_SEND").map_or(true, |v| v != "0"));
+
+static LINK_HDR: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LINK_HDR").map_or(true, |v| v != "0"));
+
+/// Per-I/O trace (NVMEUBLK_TRACE_DIR, diagnostics): one line per completed
+/// request, "local_port cid sent wired first_data done" in CLOCK_REALTIME
+/// nanoseconds (0 = not recorded), to join with a packet capture.
+static TRACE_DIR: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_TRACE_DIR").ok().filter(|d| !d.is_empty()));
+
+thread_local! {
+    static TRACE: RefCell<Option<(std::io::BufWriter<std::fs::File>, Instant, u128, u64)>> = const { RefCell::new(None) };
+}
+
+fn trace_io(fd: i32, cid: u16, p: &Pending) {
+    let Some(dir) = TRACE_DIR.as_ref() else { return };
+    let port = unsafe {
+        let mut sa: libc::sockaddr_in = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        libc::getsockname(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len);
+        u16::from_be(sa.sin_port)
+    };
+    TRACE.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.is_none() {
+            let tid = unsafe { libc::gettid() };
+            let Ok(f) = std::fs::File::create(format!("{dir}/io-{tid}.txt")) else { return };
+            let rt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            *t = Some((std::io::BufWriter::new(f), Instant::now(), rt, 0));
+        }
+        let (w, base, rt, n) = t.as_mut().unwrap();
+        let ns = |i: Option<Instant>| i.map_or(0, |i| if i >= *base { *rt + (i - *base).as_nanos() } else { rt.saturating_sub((*base - i).as_nanos()) });
+        use std::io::Write;
+        let _ = writeln!(w, "{port} {cid} {} {} {} {}", ns(Some(p.sent)), ns(p.wired), ns(p.first_data), ns(Some(Instant::now())));
+        *n += 1;
+        if *n % 256 == 0 {
+            let _ = w.flush();
+        }
+    });
+}
+
 static RX_EXACT_MIN: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_RX_EXACT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
 
@@ -196,6 +238,16 @@ pub struct Stats {
     /// first C2H byte (reads); first byte -> completion (reads).
     pub q2w_ns: AtomicU64,
     pub q2w_n: AtomicU64,
+    /// Of queued->wired: until the sender task picked the command up.
+    pub q2s_ns: AtomicU64,
+    /// Time spent awaiting writev completions, and how many.
+    pub wv_ns: AtomicU64,
+    pub wv_n: AtomicU64,
+    /// Next-PDU header receives linked behind a payload receive.
+    pub linked_hdr: AtomicU64,
+    /// Zero-copy payload receive: header parsed -> payload in (ns, count).
+    pub zc_rx_ns: AtomicU64,
+    pub zc_rx_n: AtomicU64,
     pub w2d_ns: AtomicU64,
     pub d2c_ns: AtomicU64,
     pub rd_n: AtomicU64,
@@ -342,6 +394,14 @@ impl QConn {
     }
 }
 
+/// Bytes a linked receive takes of the next PDU: every PDU a controller sends
+/// (CapsuleResp, C2HData, R2T, C2HTermReq) has at least this much header, so
+/// a whole response capsule, or a data/R2T header, arrives in one receive.
+const HDR_PREFETCH: usize = 24;
+
+/// An in-flight ring receive whose result the receive loop still owes.
+type PendingRx = std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, libublk::UblkError>>>>;
+
 enum Direct {
     No,
     Done,
@@ -457,7 +517,8 @@ impl QEngine {
         }
     }
 
-    fn inflight_here(&self) -> usize {
+    /// Commands outstanding on this queue's connections.
+    pub fn inflight_here(&self) -> usize {
         self.conns.borrow().iter().flatten().map(|c| c.inflight.borrow().len()).sum()
     }
 
@@ -660,6 +721,9 @@ impl QEngine {
             }
         }
         let mut p = c.inflight.borrow_mut().remove(&cid).expect("checked above");
+        if TRACE_DIR.is_some() {
+            trace_io(c.fd, cid, &p);
+        }
         self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
         self.free_cid(c, cid);
         self.stats.done.fetch_add(1, Ordering::Relaxed);
@@ -737,6 +801,10 @@ impl QEngine {
                     Err(_) => break,
                 }
             }
+            let picked = Instant::now();
+            for m in batch.iter().filter(|m| !m.h2c) {
+                self.stats.q2s_ns.fetch_add((picked - m.queued).as_nanos() as u64, Ordering::Relaxed);
+            }
             // Headers and copied payloads go out in batched writev calls; a
             // zero-copy payload is written from its registered buffer in
             // between, so the byte stream keeps the order of the batch.
@@ -789,10 +857,37 @@ impl QEngine {
     /// connection is gone and has been failed.
     async fn write_iov(&self, c: &Rc<QConn>, iov: &mut [libc::iovec]) -> bool {
         let mut idx = 0usize;
+        let mut direct = *DIRECT_SEND;
         while idx < iov.len() {
             let n = iov.len() - idx;
-            let sqe = io_uring::opcode::Writev::new(io_uring::types::Fd(c.fd), iov[idx..].as_ptr() as *const _, n.min(1024) as u32).build();
-            let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
+            let t0 = Instant::now();
+            let r = if direct {
+                // Direct send (NVMEUBLK_DIRECT_SEND, default on): a command
+                // queued on the ring is only issued at the next ring entry,
+                // behind that batch's inline receive copies and commits
+                // (~130 us at a 128K read stream). A non-blocking sendmsg
+                // puts it on the wire now; the ring takes over only when
+                // the socket is full.
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_iov = iov[idx..].as_mut_ptr();
+                msg.msg_iovlen = n.min(1024) as _;
+                let r = unsafe { libc::sendmsg(c.fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+                if r >= 0 {
+                    r as i32
+                } else {
+                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+                    if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                        direct = false;
+                        continue;
+                    }
+                    -e
+                }
+            } else {
+                let sqe = io_uring::opcode::Writev::new(io_uring::types::Fd(c.fd), iov[idx..].as_ptr() as *const _, n.min(1024) as u32).build();
+                io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await)
+            };
+            self.stats.wv_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.stats.wv_n.fetch_add(1, Ordering::Relaxed);
             if c.dead.get() {
                 return false;
             }
@@ -851,7 +946,26 @@ impl QEngine {
         let mut buf = vec![0u8; 256 * 1024];
         let (mut start, mut end) = (0usize, 0usize);
         let pause = io_uring::types::Timespec::new().nsec(50_000_000);
+        // Next-PDU header: a receive linked behind the last payload receive
+        // (see try_direct) lands it in `hdr`; `pending` is that receive.
+        let mut hdr = vec![0u8; HDR_PREFETCH];
+        let mut pending: Option<PendingRx> = None;
         loop {
+            let mut have_hdr = false;
+            if let Some(h) = pending.take() {
+                let r = io_sqe_res(h.await);
+                if c.dead.get() {
+                    return;
+                }
+                if r > 0 {
+                    buf[end..end + r as usize].copy_from_slice(&hdr[..r as usize]);
+                    end += r as usize;
+                    have_hdr = true;
+                } else if r != -libc::ECANCELED {
+                    self.fail_conn(&c, if r == 0 { "connection closed" } else { "receive failed" }, Cause::Failure);
+                    return;
+                }
+            }
             while c.stalled.get() && !c.dead.get() {
                 let sqe = io_uring::opcode::Timeout::new(&pause).build();
                 let _ = ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await;
@@ -859,42 +973,44 @@ impl QEngine {
             if c.dead.get() {
                 return;
             }
-            // Keep at least one chunk of room: slide the unparsed tail down,
-            // and grow only when a single PDU needs more than the buffer.
-            let chunk = if self.cfg.rx_chunk == 0 { RX_CHUNK_DEFAULT } else { self.cfg.rx_chunk };
-            if buf.len() - end < chunk && start > 0 {
-                buf.copy_within(start..end, 0);
-                end -= start;
-                start = 0;
+            if !have_hdr {
+                // Keep at least one chunk of room: slide the unparsed tail down,
+                // and grow only when a single PDU needs more than the buffer.
+                let chunk = if self.cfg.rx_chunk == 0 { RX_CHUNK_DEFAULT } else { self.cfg.rx_chunk };
+                if buf.len() - end < chunk && start > 0 {
+                    buf.copy_within(start..end, 0);
+                    end -= start;
+                    start = 0;
+                }
+                if end == buf.len() {
+                    buf.resize(buf.len() * 2, 0);
+                }
+                let mut want = (buf.len() - end).min(chunk);
+                // Exact-header receive (NVMEUBLK_RX_EXACT_MIN bytes, tuning):
+                // while a zero-copy read with at least that much payload still
+                // to come is in flight here, take only up to the end of the next
+                // PDU header, so its payload lands in the request pages whole
+                // instead of partly in staging (and a pwrite to move it across).
+                let exact = self.exact_need(&c, &buf[start..end]);
+                if let Some(n) = exact {
+                    want = want.min(n);
+                }
+                let sqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), buf[end..].as_mut_ptr(), want as u32)
+                    .flags(if exact.is_some() { libc::MSG_WAITALL } else { 0 })
+                    .build();
+                let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
+                if c.dead.get() {
+                    return;
+                }
+                if r == -libc::EAGAIN || r == -libc::EINTR {
+                    continue;
+                }
+                if r <= 0 {
+                    self.fail_conn(&c, if r == 0 { "connection closed" } else { "receive failed" }, Cause::Failure);
+                    return;
+                }
+                end += r as usize;
             }
-            if end == buf.len() {
-                buf.resize(buf.len() * 2, 0);
-            }
-            let mut want = (buf.len() - end).min(chunk);
-            // Exact-header receive (NVMEUBLK_RX_EXACT_MIN bytes, tuning):
-            // while a zero-copy read with at least that much payload still
-            // to come is in flight here, take only up to the end of the next
-            // PDU header, so its payload lands in the request pages whole
-            // instead of partly in staging (and a pwrite to move it across).
-            let exact = self.exact_need(&c, &buf[start..end]);
-            if let Some(n) = exact {
-                want = want.min(n);
-            }
-            let sqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), buf[end..].as_mut_ptr(), want as u32)
-                .flags(if exact.is_some() { libc::MSG_WAITALL } else { 0 })
-                .build();
-            let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
-            if c.dead.get() {
-                return;
-            }
-            if r == -libc::EAGAIN || r == -libc::EINTR {
-                continue;
-            }
-            if r <= 0 {
-                self.fail_conn(&c, if r == 0 { "connection closed" } else { "receive failed" }, Cause::Failure);
-                return;
-            }
-            end += r as usize;
             // Consume every complete PDU in the buffer.
             loop {
                 if end - start < CH_LEN {
@@ -920,13 +1036,20 @@ impl QEngine {
                 start += plen;
             }
             if start < end {
-                match self.try_direct(&c, &buf[start..end]).await {
+                match self.try_direct(&c, &buf[start..end], hdr.as_mut_ptr(), &mut pending).await {
                     Direct::No => {}
                     Direct::Done => {
                         start = 0;
                         end = 0;
                     }
-                    Direct::Failed => return,
+                    Direct::Failed => {
+                        // The connection is shut down, so a linked header
+                        // receive ends now; let it finish before `hdr` goes.
+                        if let Some(h) = pending.take() {
+                            let _ = h.await;
+                        }
+                        return;
+                    }
                 }
             }
             if start == end {
@@ -964,7 +1087,7 @@ impl QEngine {
     /// A partial C2HData PDU sits at the tail of the staging buffer: copy the
     /// payload bytes already here and receive the rest straight into the
     /// request's buffer, skipping the staging copy.
-    async fn try_direct(&self, c: &Rc<QConn>, part: &[u8]) -> Direct {
+    async fn try_direct(&self, c: &Rc<QConn>, part: &[u8], hdr: *mut u8, pending: &mut Option<PendingRx>) -> Direct {
         if part.len() < CH_LEN || part[0] != PDU_C2H_DATA {
             return Direct::No;
         }
@@ -999,6 +1122,7 @@ impl QEngine {
         self.stats.direct_rx.fetch_add(1, Ordering::Relaxed);
         let mut got = have;
         let mut failed = None;
+        let t_parse = Instant::now();
         if let Some(idx) = zc_index {
             // Zero copy: socket -> the request's registered pages, at byte
             // offset off+got of the kernel buffer (its base address is 0).
@@ -1027,7 +1151,33 @@ impl QEngine {
                     min if min > 0 && len - got >= min => sqe.flags(io_uring::squeue::Flags::ASYNC),
                     _ => sqe,
                 };
-                let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
+                // Linked header receive (NVMEUBLK_LINK_HDR, default on with
+                // exact-header receive): the next PDU's common header is read
+                // as soon as this payload completes, in the same ring entry,
+                // not on a later event-loop turn. Both SQEs are pushed back to
+                // back (each future pushes on its first poll; nothing yields
+                // in between). Only the payload is awaited here: the next PDU
+                // may only come after this read completes, so the receive
+                // loop takes the header receive over. A short or failed
+                // payload breaks the link and the header receive consumes
+                // nothing (-ECANCELED).
+                let r = if use_recv && *LINK_HDR && *RX_EXACT_MIN > 0 && pending.is_none() {
+                    let hsqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), hdr, HDR_PREFETCH as u32).flags(libc::MSG_WAITALL).build();
+                    let mut pf = Box::pin(ublk_submit_sqe_async(sqe.flags(io_uring::squeue::Flags::IO_LINK), UblkUringData::Target as u64));
+                    let mut hf: PendingRx = Box::pin(ublk_submit_sqe_async(hsqe, UblkUringData::Target as u64));
+                    let first = smol::future::poll_once(&mut pf).await;
+                    if let Some(res) = smol::future::poll_once(&mut hf).await {
+                        hf = Box::pin(async move { res });
+                    }
+                    *pending = Some(hf);
+                    self.stats.linked_hdr.fetch_add(1, Ordering::Relaxed);
+                    io_sqe_res(match first {
+                        Some(r) => r,
+                        None => pf.await,
+                    })
+                } else {
+                    io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await)
+                };
                 if use_recv && r == -libc::EINVAL {
                     // Prep-time refusal: nothing was consumed from the socket.
                     if ZC_RECV_MODE.swap(1, Ordering::Relaxed) == 0 {
@@ -1050,6 +1200,8 @@ impl QEngine {
                 }
                 got += r as usize;
             }
+            self.stats.zc_rx_ns.fetch_add(t_parse.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.stats.zc_rx_n.fetch_add(1, Ordering::Relaxed);
             self.stats.zc_bytes.fetch_add((got - have) as u64, Ordering::Relaxed);
             self.stats.zc_rx_ops.fetch_add(1, Ordering::Relaxed);
         } else if let Some(hp) = c.helper.as_ref().filter(|_| len - got >= self.cfg.rx_offload) {
