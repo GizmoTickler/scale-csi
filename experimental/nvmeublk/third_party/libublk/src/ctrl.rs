@@ -2880,15 +2880,55 @@ impl UblkCtrl {
             })
     }
 
-    /// Set queue thread affinity using thread ID
-    ///
-    /// This function sets CPU affinity for the specified thread ID.
-    /// It should be called from the main thread context after receiving
-    /// the thread ID from the queue thread.
-    pub fn set_thread_affinity(&self, qid: u16, tid: libc::pid_t) {
-        // Calculate and set affinity using the thread ID
-        let affinity = self.calculate_queue_affinity(qid);
+    /// The process-wide queue-thread CPU mask set by `set_queue_cpus`.
+    fn queue_cpus() -> &'static std::sync::Mutex<Option<UblkQueueAffinity>> {
+        static QUEUE_CPUS: std::sync::Mutex<Option<UblkQueueAffinity>> =
+            std::sync::Mutex::new(None);
+        &QUEUE_CPUS
+    }
 
+    /// Confine every queue thread pinned from now on to `cpus`, in place
+    /// of the per-queue mask computed here (the queue's blk-mq CPU group,
+    /// or one CPU of it in single-CPU mode); `None` restores that default.
+    /// CPUs past the mask's 1024 bits are ignored, and a list left with no
+    /// CPU is `None`.
+    ///
+    /// `set_thread_affinity` is the one writer of queue-thread affinity.
+    /// A target that calls sched_setaffinity from its queue function races
+    /// with it: the spawning thread pins the queue thread while the queue
+    /// function already runs, and whichever call lands last wins.
+    pub fn set_queue_cpus(cpus: Option<&[usize]>) {
+        *Self::queue_cpus().lock().unwrap_or_else(|e| e.into_inner()) = Self::queue_cpus_mask(cpus);
+    }
+
+    /// The mask `set_queue_cpus(cpus)` stores.
+    fn queue_cpus_mask(cpus: Option<&[usize]>) -> Option<UblkQueueAffinity> {
+        cpus.and_then(|cpus| {
+            let mut m = UblkQueueAffinity::new();
+            let bits = m.buf_len() * 8;
+            for &cpu in cpus.iter().filter(|&&cpu| cpu < bits) {
+                m.set_cpu(cpu);
+            }
+            (!m.is_empty()).then_some(m)
+        })
+    }
+
+    /// A queue thread's mask: `cpus` (the process-wide one) when set, else
+    /// the queue's own, which `per_queue` computes only then.
+    fn effective_queue_affinity(
+        cpus: Option<UblkQueueAffinity>,
+        per_queue: impl FnOnce() -> UblkQueueAffinity,
+    ) -> UblkQueueAffinity {
+        cpus.unwrap_or_else(per_queue)
+    }
+
+    /// Pin thread `tid` to `effective_queue_affinity(cpus, per_queue)`.
+    fn pin_queue_thread(
+        tid: libc::pid_t,
+        cpus: Option<UblkQueueAffinity>,
+        per_queue: impl FnOnce() -> UblkQueueAffinity,
+    ) {
+        let affinity = Self::effective_queue_affinity(cpus, per_queue);
         unsafe {
             libc::sched_setaffinity(
                 tid,
@@ -2896,6 +2936,17 @@ impl UblkCtrl {
                 affinity.addr() as *const libc::cpu_set_t,
             );
         }
+    }
+
+    /// Set queue thread affinity using thread ID
+    ///
+    /// This function sets CPU affinity for the specified thread ID: the
+    /// process-wide mask (`set_queue_cpus`) if there is one, else this
+    /// queue's own. It should be called from the main thread context after
+    /// receiving the thread ID from the queue thread.
+    pub fn set_thread_affinity(&self, qid: u16, tid: libc::pid_t) {
+        let cpus = *Self::queue_cpus().lock().unwrap_or_else(|e| e.into_inner());
+        Self::pin_queue_thread(tid, cpus, || self.calculate_queue_affinity(qid));
     }
 
     /// Initialize queue thread and return tid
@@ -2912,6 +2963,29 @@ impl UblkCtrl {
         }
 
         tid
+    }
+
+    /// Queue thread name, as `top -H` and /proc/<pid>/task/*/comm show it:
+    /// "ublk<dev>-q<queue>t<thread>". Linux keeps 15 bytes, which fits
+    /// dev < 10000, queue < 1000 and thread < 10; a longer one loses its tail.
+    fn queue_thread_name(dev_id: u32, q: u16, t: u16) -> String {
+        format!("ublk{dev_id}-q{q}t{t}")
+    }
+
+    /// Spawn thread `t` of queue `q` of device `dev_id`, named
+    /// `queue_thread_name(dev_id, q, t)`.
+    fn spawn_queue_thread<F>(
+        dev_id: u32,
+        q: u16,
+        t: u16,
+        f: F,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name(Self::queue_thread_name(dev_id, q, t))
+            .spawn(f)
     }
 
     fn create_queue_handlers<Q>(
@@ -2939,16 +3013,19 @@ impl UblkCtrl {
                 let _tx = tx.clone();
                 let mut _q_fn = q_fn.clone();
 
-                q_threads.push(std::thread::spawn(move || {
-                    let tid = Self::init_queue_thread();
-                    // Read by UblkQueue::new() to pick this thread's tags.
-                    crate::io::set_io_thread_idx(t);
-                    if let Err(e) = _tx.send((q, tid)) {
-                        eprintln!("Warning: Failed to send queue thread info: {}", e);
-                        return;
-                    }
-                    _q_fn(q, &_dev);
-                }));
+                q_threads.push(
+                    Self::spawn_queue_thread(dev.dev_info.dev_id, q, t, move || {
+                        let tid = Self::init_queue_thread();
+                        // Read by UblkQueue::new() to pick this thread's tags.
+                        crate::io::set_io_thread_idx(t);
+                        if let Err(e) = _tx.send((q, tid)) {
+                            eprintln!("Warning: Failed to send queue thread info: {}", e);
+                            return;
+                        }
+                        _q_fn(q, &_dev);
+                    })
+                    .expect("failed to spawn thread"),
+                );
             }
         }
 
@@ -3224,6 +3301,94 @@ mod tests {
 
         UblkCtrl::init_queue_thread();
         assert_eq!(unsafe { libc::prctl(PR_GET_IO_FLUSHER, 0, 0, 0, 0) }, 1);
+    }
+
+    #[test]
+    fn test_queue_thread_name_fits_comm() {
+        assert_eq!(UblkCtrl::queue_thread_name(12, 3, 0), "ublk12-q3t0");
+        // TASK_COMM_LEN - 1 bytes are kept.
+        assert_eq!(UblkCtrl::queue_thread_name(9999, 999, 9).len(), 15);
+    }
+
+    #[test]
+    fn test_set_queue_cpus() {
+        let bits =
+            |cpus: Option<&[usize]>| UblkCtrl::queue_cpus_mask(cpus).map(|m| m.to_bits_vec());
+        assert_eq!(bits(Some(&[1, 3, 4096])), Some(vec![1, 3]));
+        assert_eq!(
+            bits(Some(&[4096])),
+            None,
+            "a list with no usable CPU keeps the default"
+        );
+        assert_eq!(bits(Some(&[])), None);
+        assert_eq!(bits(None), None);
+    }
+
+    /// Queue threads carry their device, queue and thread index in the
+    /// name the kernel shows (/proc/<pid>/task/<tid>/comm, top -H).
+    #[test]
+    fn test_spawn_queue_thread_names_it() {
+        let h = UblkCtrl::spawn_queue_thread(12, 3, 1, || {
+            let comm = std::fs::read_to_string("/proc/thread-self/comm").unwrap();
+            assert_eq!(comm.trim_end(), "ublk12-q3t1");
+        })
+        .unwrap();
+        h.join().expect("queue thread saw another name");
+    }
+
+    /// The pinning set_thread_affinity does: the process-wide mask when
+    /// set, else the queue's own, applied to another thread by its tid.
+    #[test]
+    fn test_pin_queue_thread_uses_the_process_mask() {
+        use std::sync::mpsc;
+
+        fn allowed() -> Vec<usize> {
+            let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            let r = unsafe {
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
+            };
+            assert_eq!(r, 0);
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| unsafe { libc::CPU_ISSET(c, &set) })
+                .collect()
+        }
+        // Two CPUs this test may run on (one if it may use only one).
+        let cpus = allowed();
+        let (x, y) = (cpus[0], *cpus.last().unwrap());
+        let single = |cpu| {
+            let mut m = UblkQueueAffinity::new();
+            m.set_cpu(cpu);
+            m
+        };
+        let pinned = |mask: Option<UblkQueueAffinity>, per_queue: UblkQueueAffinity| {
+            // The queue thread reports its tid, the spawning side pins it,
+            // and the queue thread then reads back its own mask.
+            let (tid_tx, tid_rx) = mpsc::channel();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let h = std::thread::spawn(move || {
+                tid_tx.send(unsafe { libc::gettid() }).unwrap();
+                go_rx.recv().unwrap();
+                allowed()
+            });
+            UblkCtrl::pin_queue_thread(tid_rx.recv().unwrap(), mask, || per_queue);
+            go_tx.send(()).unwrap();
+            h.join().unwrap()
+        };
+        assert_eq!(
+            pinned(Some(single(x)), single(y)),
+            vec![x],
+            "the process-wide mask wins"
+        );
+        assert_eq!(pinned(None, single(y)), vec![y], "else the queue's own");
+        let mut computed = false;
+        UblkCtrl::effective_queue_affinity(Some(single(x)), || {
+            computed = true;
+            single(y)
+        });
+        assert!(
+            !computed,
+            "the queue's own mask is computed only when needed"
+        );
     }
 
     #[test]
