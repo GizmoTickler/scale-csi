@@ -1,5 +1,6 @@
 //! Per-path admin controllers for the io_uring engine: connect, enable,
-//! identify, keep-alive and reconnect, each on its own supervisor thread.
+//! identify, keep-alive and reconnect. One supervisor thread per process
+//! serves every path of every device (see `Supervisor`).
 //! I/O queues belong to the ublk queue threads (see qengine.rs); this layer
 //! only tells them which controller to attach to and when it changed.
 
@@ -7,7 +8,8 @@ use crate::conn::{AdminConn, Ident, NsInfo};
 use anyhow::{bail, Result};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 pub struct CtrlPath {
@@ -70,6 +72,66 @@ pub struct Ctrls {
     pub info: NsInfo,
     kato: Duration,
     stop: AtomicBool,
+    /// Supervisor-owned state per path.
+    slots: Mutex<Vec<PathSlot>>,
+}
+
+/// What the supervisor tracks for one path.
+struct PathSlot {
+    admin: Option<AdminConn>,
+    backoff: Duration,
+    next_try: Instant,
+    last_ka: Instant,
+    /// Keep-alive in flight: (cid, sent at).
+    ka: Option<(u16, Instant)>,
+    /// A reconnect running on its own thread (it blocks: TCP connect,
+    /// enable, identify); its admin connection arrives here, already
+    /// validated and with the path's epoch bumped.
+    /// Err(true): the path now presents a different namespace (retry in 5 s).
+    connecting: Option<Receiver<Result<AdminConn, bool>>>,
+}
+
+/// One thread for all admin controllers in the process. Per-device (and
+/// per-path) supervisor threads cost 4 threads and 40 wakeups/s per volume;
+/// this costs one thread and 10 wakeups/s in total. Nothing on it blocks:
+/// keep-alives are sent and collected without waiting, and reconnects run
+/// on short-lived threads, so one dead or hung target cannot delay the
+/// keep-alives of every other volume past their KATO.
+struct Supervisor {
+    ctrls: Mutex<Vec<Weak<Ctrls>>>,
+    /// Set only once the supervisor thread was actually spawned: a failed
+    /// spawn must be retried by the next register(), or every device from
+    /// then on would get no keep-alive and no reconnect at all.
+    running: Mutex<bool>,
+}
+
+static SUPERVISOR: LazyLock<Supervisor> = LazyLock::new(|| Supervisor { ctrls: Mutex::new(Vec::new()), running: Mutex::new(false) });
+
+impl Supervisor {
+    fn register(c: &Arc<Ctrls>) -> Result<()> {
+        let sv = &*SUPERVISOR;
+        let mut running = sv.running.lock().unwrap();
+        if !*running {
+            std::thread::Builder::new().name("nvme-supervisor".into()).spawn(|| SUPERVISOR.run()).map_err(|e| anyhow::anyhow!("spawn admin supervisor: {e}"))?;
+            *running = true;
+        }
+        sv.ctrls.lock().unwrap().push(Arc::downgrade(c));
+        Ok(())
+    }
+
+    fn run(&self) {
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let live: Vec<Arc<Ctrls>> = {
+                let mut list = self.ctrls.lock().unwrap();
+                list.retain(|w| w.strong_count() > 0);
+                list.iter().filter_map(Weak::upgrade).collect()
+            };
+            for c in live {
+                c.tick();
+            }
+        }
+    }
 }
 
 impl Ctrls {
@@ -108,11 +170,13 @@ impl Ctrls {
             }
         }
         let Some(info) = info else { bail!("no path reachable") };
-        let me = Arc::new(Ctrls { paths, id, info, kato, stop: AtomicBool::new(false) });
-        for (i, admin) in admins.into_iter().enumerate() {
-            let m = me.clone();
-            std::thread::Builder::new().name(format!("nvme-ctrl-{i}")).spawn(move || m.supervise(i, admin))?;
-        }
+        let now = Instant::now();
+        let slots = admins
+            .into_iter()
+            .map(|admin| PathSlot { admin, backoff: Duration::from_millis(250), next_try: now, last_ka: now, ka: None, connecting: None })
+            .collect();
+        let me = Arc::new(Ctrls { paths, id, info, kato, stop: AtomicBool::new(false), slots: Mutex::new(slots) });
+        Supervisor::register(&me)?;
         Ok(me)
     }
 
@@ -130,68 +194,160 @@ impl Ctrls {
         p.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn supervise(self: &Arc<Self>, i: usize, mut admin: Option<AdminConn>) {
-        let p = self.paths[i].clone();
-        let mut backoff = Duration::from_millis(250);
-        let mut next_try = Instant::now();
-        let mut last_ka = Instant::now();
-        while !self.stop.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(100));
-            let req = p.fence_req.swap(0, Ordering::AcqRel);
-            if req != 0 && req == p.epoch.load(Ordering::Acquire) {
-                if let Some(a) = admin.take() {
-                    log::warn!("path {i} ({}): I/O failure under epoch {req}; tearing down controller {}", p.addr, a.cntlid);
+    /// One supervisor pass over this device's paths.
+    fn tick(self: &Arc<Self>) {
+        let mut slots = self.slots.lock().unwrap();
+        if self.stop.load(Ordering::Acquire) {
+            for slot in slots.iter_mut() {
+                if let Some(a) = slot.admin.take() {
                     a.shutdown();
-                    Self::lose(&p);
-                    // Give the target a moment to see every queue close before
-                    // a new controller is created on this path.
-                    next_try = Instant::now() + Duration::from_millis(200);
-                    continue;
+                }
+                // A reconnect that finishes after stop must not leave its
+                // new controller's socket open until the device is dropped.
+                if let Some(rx) = slot.connecting.as_ref() {
+                    match rx.try_recv() {
+                        Ok(Ok(a)) => {
+                            a.shutdown();
+                            slot.connecting = None;
+                        }
+                        Ok(Err(_)) | Err(TryRecvError::Disconnected) => slot.connecting = None,
+                        Err(TryRecvError::Empty) => {}
+                    }
                 }
             }
-            match admin.as_mut() {
-                Some(a) => {
-                    if last_ka.elapsed() < self.kato / 3 {
-                        continue;
+            return;
+        }
+        for (i, slot) in slots.iter_mut().enumerate() {
+            self.tick_path(i, slot);
+        }
+    }
+
+    fn tick_path(self: &Arc<Self>, i: usize, s: &mut PathSlot) {
+        let p = self.paths[i].clone();
+        let now = Instant::now();
+        // Adopt a finished reconnect before looking at fence requests: a queue
+        // may already have raised one against the new controller's epoch.
+        if s.admin.is_none() {
+            if let Some(rx) = s.connecting.as_ref() {
+                match rx.try_recv() {
+                    Ok(Ok(a)) => {
+                        s.connecting = None;
+                        s.admin = Some(a);
+                        s.backoff = Duration::from_millis(250);
+                        s.last_ka = now;
+                        s.ka = None;
                     }
-                    last_ka = Instant::now();
-                    if let Err(e) = a.keep_alive() {
-                        log::warn!("path {i} ({}): keep-alive failed ({e:#}); dropping controller", p.addr);
-                        a.shutdown();
-                        admin = None;
-                        Self::lose(&p);
-                        next_try = Instant::now();
+                    Ok(Err(true)) => {
+                        s.connecting = None;
+                        s.next_try = now + Duration::from_secs(5);
                     }
-                }
-                None => {
-                    if Instant::now() < next_try {
-                        continue;
+                    Ok(Err(false)) | Err(TryRecvError::Disconnected) => {
+                        s.connecting = None;
+                        s.next_try = now + s.backoff;
+                        s.backoff = (s.backoff * 2).min(Duration::from_secs(2));
                     }
-                    match Self::bring_up(&p, &self.id, self.kato) {
-                        Ok((a, info)) if same_namespace(&self.info, &info) => {
-                            // New controller: queues attached to the old one are dead.
-                            p.epoch.fetch_add(1, Ordering::AcqRel);
-                            admin = Some(a);
-                            backoff = Duration::from_millis(250);
-                            last_ka = Instant::now();
-                        }
-                        Ok((a, _)) => {
-                            log::error!("path {i}: now presents a different namespace; refusing this path");
-                            a.shutdown();
-                            Self::lose(&p);
-                            next_try = Instant::now() + Duration::from_secs(5);
-                        }
-                        Err(e) => {
-                            log::debug!("path {i} reconnect failed: {e:#}");
-                            next_try = Instant::now() + backoff;
-                            backoff = (backoff * 2).min(Duration::from_secs(2));
-                        }
-                    }
+                    Err(TryRecvError::Empty) => {}
                 }
             }
         }
-        if let Some(a) = admin {
-            a.shutdown();
+        // A fence request is consumed only while there is a controller to tear
+        // down; with none, a current-epoch request stays pending for the one
+        // being adopted (a stale one fails the epoch test once it is).
+        if s.admin.is_some() {
+            let req = p.fence_req.swap(0, Ordering::AcqRel);
+            if req != 0 && req == p.epoch.load(Ordering::Acquire) {
+                if let Some(a) = s.admin.take() {
+                    log::warn!("path {i} ({}): I/O failure under epoch {req}; tearing down controller {}", p.addr, a.cntlid);
+                    a.shutdown();
+                    Self::lose(&p);
+                    s.ka = None;
+                    // Give the target a moment to see every queue close before
+                    // a new controller is created on this path.
+                    s.next_try = now + Duration::from_millis(200);
+                    return;
+                }
+            }
+        }
+        if let Some(a) = s.admin.as_mut() {
+            // A keep-alive response is due within min(KATO, 10 s), the bound
+            // the blocking read used to put on it.
+            let ka_timeout = self.kato.min(Duration::from_secs(10));
+            let failed = match s.ka {
+                Some((cid, sent)) => match a.ka_poll(cid) {
+                    Ok(true) => {
+                        s.ka = None;
+                        None
+                    }
+                    Ok(false) if sent.elapsed() < ka_timeout => None,
+                    Ok(false) => Some(format!("no keep-alive response in {} ms", ka_timeout.as_millis())),
+                    Err(e) => Some(format!("{e:#}")),
+                },
+                None if s.last_ka.elapsed() >= self.kato / 3 => {
+                    s.last_ka = now;
+                    match a.ka_send() {
+                        Ok(cid) => {
+                            s.ka = Some((cid, now));
+                            None
+                        }
+                        Err(e) => Some(format!("{e:#}")),
+                    }
+                }
+                None => None,
+            };
+            if let Some(why) = failed {
+                log::warn!("path {i} ({}): keep-alive failed ({why}); dropping controller", p.addr);
+                if let Some(a) = s.admin.take() {
+                    a.shutdown();
+                }
+                s.ka = None;
+                Self::lose(&p);
+                s.next_try = now;
+            }
+            return;
+        }
+        if s.connecting.is_some() {
+            return; // reconnect still running
+        }
+        if now < s.next_try {
+            return;
+        }
+        // Reconnect on its own thread: TCP connect, enable and identify block.
+        // Validation and the epoch bump happen there, in the same order the
+        // per-path supervisor used, before the supervisor sees the connection.
+        let (tx, rx) = mpsc::channel();
+        let me = self.clone();
+        let spawned = std::thread::Builder::new().name(format!("nvme-reconn-{i}")).spawn(move || {
+            let p = &me.paths[i];
+            let r = match Self::bring_up(p, &me.id, me.kato) {
+                Ok((a, _)) if me.stop.load(Ordering::Acquire) => {
+                    a.shutdown();
+                    Self::lose(p);
+                    Err(false)
+                }
+                Ok((a, info)) if same_namespace(&me.info, &info) => {
+                    // New controller: queues attached to the old one are dead.
+                    p.epoch.fetch_add(1, Ordering::AcqRel);
+                    Ok(a)
+                }
+                Ok((a, _)) => {
+                    log::error!("path {i}: now presents a different namespace; refusing this path");
+                    a.shutdown();
+                    Self::lose(p);
+                    Err(true)
+                }
+                Err(e) => {
+                    log::debug!("path {i} reconnect failed: {e:#}");
+                    Err(false)
+                }
+            };
+            let _ = tx.send(r);
+        });
+        match spawned {
+            Ok(_) => s.connecting = Some(rx),
+            Err(e) => {
+                log::warn!("path {i}: cannot spawn reconnect thread: {e}");
+                s.next_try = now + s.backoff;
+            }
         }
     }
 

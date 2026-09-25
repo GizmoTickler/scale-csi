@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends musl-tools clan
  && rustup target add x86_64-unknown-linux-musl
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+# Vendored libublk (Cargo.toml [patch.crates-io]): chunked tag partitions.
+COPY third_party ./third_party
 COPY src ./src
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl \
  && strip target/x86_64-unknown-linux-musl/release/nvmeublk

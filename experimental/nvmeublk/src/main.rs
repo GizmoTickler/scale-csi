@@ -153,8 +153,12 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
     // own pages, so this buffer only ever holds in-capsule write data: size it
     // to that instead of the max I/O size. It is mlock()ed, per tag, per queue,
     // per volume (64 x 512K x 8 queues = 256 MiB per volume otherwise).
-    let buf_len = if zc { e.incapsule().max(4096).next_power_of_two() } else { q.dev.dev_info.max_io_buf_bytes as usize };
-    let buf = IoBuf::<u8>::new(buf_len);
+    // Zero copy needs no per-tag buffer at all: reads land in the request
+    // pages and every write, in-capsule or R2T, is sent from them. Only the
+    // copying mode stages data here (it is mlock()ed, per tag, per queue,
+    // per volume).
+    let buf = (!zc).then(|| IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize));
+    let buf_ptr = buf.as_ref().map_or(std::ptr::null_mut(), |b| b.as_slice().as_ptr() as *mut u8);
     // Per-tag completion channel, reused for every request on this tag.
     let (done_tx, done_rx) = smol::channel::bounded::<i32>(1);
     // USER_COPY: the kernel moves no data at fetch/commit; `buf` is only our
@@ -164,8 +168,8 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
     // buffer table at index `tag` when it hands us the request, and drops
     // the registration when we commit.
     let auto_reg = libublk::sys::ublk_auto_buf_reg { index: tag, flags: 0, reserved0: 0, reserved1: 0 };
-    let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_slice()) };
-    q.submit_io_prep_cmd(tag, ublk_buf, 0, if ucopy.is_some() || zc { None } else { Some(&buf) }).await?;
+    let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_ref().expect("copying mode has a tag buffer").as_slice()) };
+    q.submit_io_prep_cmd(tag, ublk_buf, 0, if ucopy.is_some() || zc { None } else { buf.as_ref() }).await?;
     loop {
         let iod = q.get_iod(tag);
         let op = match iod.op_flags & 0xff {
@@ -180,12 +184,13 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
                 let bytes = (iod.nr_sectors as usize) << 9;
                 // Zero copy: a write too large for the capsule goes out via
                 // R2T straight from the request's registered pages.
-                let zc_write = zc && op == qengine::Op::Write && bytes > e.incapsule();
+                // Zero copy: every write, in-capsule or R2T, is sent from the request pages.
+                let zc_write = zc && op == qengine::Op::Write;
                 if let (Some(pos), qengine::Op::Write, false) = (ucopy, op, zc_write) {
                     // Pull the write data out of the request into our buffer.
                     let mut got = 0usize;
                     while got < bytes {
-                        let n = unsafe { libc::pread(cdev_fd, buf.as_slice().as_ptr().add(got) as *mut libc::c_void, bytes - got, (pos + got as u64) as libc::off_t) };
+                        let n = unsafe { libc::pread(cdev_fd, buf_ptr.add(got) as *mut libc::c_void, bytes - got, (pos + got as u64) as libc::off_t) };
                         if n <= 0 {
                             if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                                 continue;
@@ -200,7 +205,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
                     op,
                     (iod.start_sector << 9) >> shift,
                     (bytes >> shift) as u32,
-                    buf.as_slice().as_ptr() as *mut u8,
+                    buf_ptr,
                     if op == qengine::Op::Flush { 0 } else { bytes },
                     done_tx.clone(),
                     ucopy,
@@ -209,7 +214,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
                 done_rx.recv().await.unwrap_or(-libc::EIO)
             }
         };
-        let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_slice()) };
+        let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_ref().expect("copying mode has a tag buffer").as_slice()) };
         q.submit_io_commit_cmd(tag, ublk_buf, res).await?;
     }
 }
@@ -432,6 +437,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024) as usize,
         threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", 1) as u16,
         seq_tags: env_u64("NVMEUBLK_SEQ_TAGS", 0) != 0,
+        tag_chunk: env_u64("NVMEUBLK_TAG_CHUNK", 1) as u16,
         io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),
         no_path_timeout_ms: env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000),
         write_fence_ms: std::env::var("NVMEUBLK_WRITE_FENCE_MS").ok().and_then(|v| v.parse().ok()),
@@ -496,6 +502,18 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Thread stacks. mlockall (harden_for_writeback) faults in and locks every
+    // mapping, so each thread's whole stack is resident and pinned: at Rust's
+    // 2 MiB default that was ~17 x 2 MiB per volume. Queue threads are
+    // spawned by libublk with the default size, which std takes from
+    // RUST_MIN_STACK; set it before any thread exists. NVMEUBLK_STACK_KB
+    // (default 256) overrides; an overflow aborts with a message, never
+    // silently.
+    if std::env::var_os("RUST_MIN_STACK").is_none() {
+        let kb = std::env::var("NVMEUBLK_STACK_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256).max(64);
+        // SAFETY: first thing in main, before any other thread is spawned.
+        unsafe { std::env::set_var("RUST_MIN_STACK", (kb * 1024).to_string()) };
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 && args[1] == "del" {

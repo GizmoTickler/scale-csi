@@ -36,6 +36,23 @@ use std::time::{Duration, Instant};
 
 pub const NSID: u32 = 1;
 
+/// Staging buffer each connection starts with (and returns to after an
+/// oversized staged PDU): room for one RX_CHUNK receive plus a partial PDU.
+const RX_STAGING_BASE: usize = 64 * 1024;
+
+/// Length of the PDU at the front of `part` once its header (and data
+/// offset) is complete; None while more header bytes are needed.
+fn staged_pdu_len(part: &[u8]) -> Option<usize> {
+    if part.len() < CH_LEN {
+        return None;
+    }
+    let (hlen, pdo) = (part[2] as usize, part[3] as usize);
+    if part.len() < hlen.max(pdo).max(CH_LEN) {
+        return None;
+    }
+    Some(u32::from_le_bytes(part[4..8].try_into().unwrap()) as usize)
+}
+
 /// Largest staging receive. Small PDUs still batch several per recv; a large
 /// C2HData payload lands in staging only for its first bytes, and the rest is
 /// received straight into the request buffer (see `try_direct`), so a 128K
@@ -92,6 +109,10 @@ fn trace_io(fd: i32, cid: u16, p: &Pending) {
         }
     });
 }
+
+static IDLE_DISCONNECT: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+    Duration::from_secs(std::env::var("NVMEUBLK_IDLE_DISCONNECT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(60))
+});
 
 static RX_EXACT_MIN: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_RX_EXACT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
@@ -422,6 +443,9 @@ enum Cause {
     Failure,
     /// The controller was already replaced, or we are shutting down.
     Retired,
+    /// No I/O for NVMEUBLK_IDLE_DISCONNECT_S: dropped to free the socket and
+    /// the target's queue; reconnected on the next request.
+    Idle,
 }
 
 type ConnectResult = (usize, u64, anyhow::Result<(TcpStream, u32)>);
@@ -450,6 +474,11 @@ pub struct QEngine {
     napi_on: Cell<bool>,
     /// Requests submitted since the last timer tick (idle detection).
     submitted: Cell<u64>,
+    /// Last time this queue had a request (lazy I/O connections).
+    last_active: Cell<Instant>,
+    /// The I/O connections were dropped for idleness (not failure): the next
+    /// request reconnects at once instead of waiting for the timer.
+    idle_dropped: Cell<bool>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
@@ -489,6 +518,8 @@ impl QEngine {
             draining,
             napi_on: Cell::new(false),
             submitted: Cell::new(0),
+            last_active: Cell::new(Instant::now()),
+            idle_dropped: Cell::new(false),
         })
     }
 
@@ -530,7 +561,19 @@ impl QEngine {
     /// Entry point for new block requests from ublk.
     pub fn submit(&self, p: Pending) {
         self.submitted.set(self.submitted.get() + 1);
+        self.last_active.set(Instant::now());
         self.set_napi(true);
+        // Idle-disconnected: bring the connections back now rather than on
+        // the next (idle, 1 s) timer tick; the request parks until one is up.
+        // Only after an idle drop: after a failure the timer's backoff and
+        // the controller's fence/reconnect decide when to reconnect.
+        if self.idle_dropped.get() && !self.conns.borrow().iter().any(|c| c.as_ref().is_some_and(|c| !c.dead.get())) {
+            for i in 0..self.ctrls.paths.len() * self.k() {
+                if self.conns.borrow()[i].is_none() {
+                    self.maybe_connect(i);
+                }
+            }
+        }
         if p.op != Op::Read {
             if let Some(t) = self.cfg.hold_writes_until {
                 if Instant::now() < t {
@@ -580,6 +623,10 @@ impl QEngine {
             Op::Flush => flush_cmd(cid, NSID),
         };
         let (data, len) = if inline { (p.buf as *const u8, p.len) } else { (std::ptr::null(), 0) };
+        // Zero copy: in-capsule write data goes out straight from the
+        // request's registered pages, right behind the capsule header (the
+        // sender keeps the byte order), so there is no tag buffer to fill.
+        let fixed = if inline { p.zc_index.map(|idx| (idx, 0usize)) } else { None };
         let head = capsule_header(&sqe, len);
         p.sent = Instant::now();
         p.rx = 0;
@@ -589,7 +636,7 @@ impl QEngine {
         p.wired = None;
         p.first_data = None;
         c.inflight.borrow_mut().insert(cid, p);
-        if c.tx.try_send(OutMsg { head, data, len, cid, h2c: false, queued: Instant::now(), fixed: None }).is_err() {
+        if c.tx.try_send(OutMsg { head, data, len, cid, h2c: false, queued: Instant::now(), fixed }).is_err() {
             let p = c.inflight.borrow_mut().remove(&cid).expect("just inserted");
             self.free_cid(c, cid);
             return Err(p);
@@ -658,6 +705,14 @@ impl QEngine {
         if c.dead.replace(true) {
             return;
         }
+        // A failed connection is reset rather than closed gracefully when its
+        // fd goes: SO_LINGER 0 frees its send and retransmit queues at once,
+        // including pages a SEND_ZC still references, instead of holding
+        // them (and the requests failed over elsewhere) until TCP gives up.
+        if cause == Cause::Failure {
+            let lg = libc::linger { l_onoff: 1, l_linger: 0 };
+            unsafe { libc::setsockopt(c.fd, libc::SOL_SOCKET, libc::SO_LINGER, &lg as *const _ as *const libc::c_void, std::mem::size_of::<libc::linger>() as u32) };
+        }
         // Shut the socket before anything is resubmitted: a Recv or Writev
         // still queued on it then fails instead of touching a request buffer.
         let _ = c.stream.shutdown(Shutdown::Both);
@@ -683,7 +738,9 @@ impl QEngine {
             }
         }
         self.next_try.borrow_mut()[c.slot] = Instant::now();
-        if orphans.is_empty() {
+        if orphans.is_empty() && cause == Cause::Idle {
+            log::debug!("q{} path {}: {why}", self.qid, c.path);
+        } else if orphans.is_empty() {
             log::warn!("q{} path {}: {why}", self.qid, c.path);
         } else {
             self.stats.failovers.fetch_add(1, Ordering::Relaxed);
@@ -760,6 +817,7 @@ impl QEngine {
     }
 
     fn install(self: &Rc<Self>, slot: usize, epoch: u64, stream: TcpStream, maxh2c: u32, qsize: u16) {
+        self.idle_dropped.set(false);
         let path = slot / self.k();
         // Blocking fd on purpose: io_uring honours O_NONBLOCK and would hand
         // back -EAGAIN instead of arming a poll, turning the receiver into a spin.
@@ -969,7 +1027,7 @@ impl QEngine {
     }
 
     async fn receiver_task(self: Rc<Self>, c: Rc<QConn>) {
-        let mut buf = vec![0u8; 256 * 1024];
+        let mut buf = vec![0u8; RX_STAGING_BASE];
         let (mut start, mut end) = (0usize, 0usize);
         let pause = io_uring::types::Timespec::new().nsec(50_000_000);
         // Next-PDU header: a receive linked behind the last payload receive
@@ -1049,9 +1107,9 @@ impl QEngine {
                     return;
                 }
                 if end - start < plen {
-                    if plen > buf.len() {
-                        buf.resize(plen.next_power_of_two(), 0);
-                    }
+                    // Not grown here: a large C2HData payload goes straight
+                    // into its request (try_direct below), so growing the
+                    // staging buffer to the PDU size would only pin memory.
                     break;
                 }
                 if let Err(e) = self.handle_pdu(&c, &buf[start..start + plen]) {
@@ -1063,7 +1121,20 @@ impl QEngine {
             }
             if start < end {
                 match self.try_direct(&c, &buf[start..end], hdr.as_mut_ptr(), &mut pending).await {
-                    Direct::No => {}
+                    Direct::No => {
+                        // A PDU whose header is complete but that cannot be
+                        // received in place must be staged whole: make room.
+                        if let Some(plen) = staged_pdu_len(&buf[start..end]) {
+                            if plen > buf.len() - start {
+                                buf.copy_within(start..end, 0);
+                                end -= start;
+                                start = 0;
+                                if plen > buf.len() {
+                                    buf.resize(plen.next_power_of_two(), 0);
+                                }
+                            }
+                        }
+                    }
                     Direct::Done => {
                         start = 0;
                         end = 0;
@@ -1081,6 +1152,11 @@ impl QEngine {
             if start == end {
                 start = 0;
                 end = 0;
+                // Give back a buffer grown for an oversized staged PDU.
+                if buf.len() > RX_STAGING_BASE {
+                    buf.truncate(RX_STAGING_BASE);
+                    buf.shrink_to_fit();
+                }
             }
         }
     }
@@ -1373,10 +1449,22 @@ impl QEngine {
             let sqe = io_uring::opcode::Timeout::new(if idle { &idle_ts } else { &busy_ts }).build();
             let _ = ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await;
             self.fault_injection();
+            // Lazy I/O connections (NVMEUBLK_IDLE_DISCONNECT_S, default 60,
+            // 0 = always connected): after that long without a request the
+            // queue drops its I/O connections, so an idle volume holds only
+            // its admin connections; submit() reconnects on demand.
+            if self.submitted.get() > 0 || self.inflight_here() > 0 || !self.parked.borrow().is_empty() || !self.fenced.borrow().is_empty() {
+                self.last_active.set(Instant::now());
+            }
+            let want_conns = IDLE_DISCONNECT.is_zero() || self.last_active.get().elapsed() < *IDLE_DISCONNECT;
             for i in 0..self.ctrls.paths.len() * self.k() {
                 let ctrl = &self.ctrls.paths[i / self.k()];
                 let conn = self.conns.borrow()[i].clone();
                 match conn {
+                    Some(c) if !want_conns && c.inflight.borrow().is_empty() => {
+                        self.idle_dropped.set(true);
+                        self.fail_conn(&c, "idle; I/O connection dropped", Cause::Idle);
+                    }
                     Some(c) => {
                         if c.epoch != ctrl.epoch.load(Ordering::Acquire) {
                             self.stats.epoch_kills.fetch_add(1, Ordering::Relaxed);
@@ -1386,12 +1474,13 @@ impl QEngine {
                             self.fail_conn(&c, "request stalled past io_timeout", Cause::Failure);
                         }
                     }
-                    None => self.maybe_connect(i),
+                    None if want_conns => self.maybe_connect(i),
+                    None => {}
                 }
             }
             self.expire_parked();
             self.release_fenced();
-            let all_up = self.conns.borrow().iter().all(|c| c.is_some());
+            let all_up = !want_conns || self.conns.borrow().iter().all(|c| c.is_some());
             idle = self.submitted.replace(0) == 0 && self.inflight_here() == 0 && self.parked.borrow().is_empty() && self.fenced.borrow().is_empty() && all_up;
             if idle {
                 self.set_napi(false);
@@ -1413,12 +1502,19 @@ impl QEngine {
         self.connecting.borrow_mut()[i] = true;
         let qid = (self.qid as usize * self.k() + i % self.k() + 1) as u16;
         let (tx, efd, id) = (self.results_tx.clone(), self.wake_efd, self.ctrls.id.clone());
-        std::thread::spawn(move || {
+        let spawned = std::thread::Builder::new().name(format!("nvme-conn-q{}", self.qid)).spawn(move || {
             let r = connect_io_queue(ctrl.addr, &id, cntlid, qid, qsize);
             let _ = tx.send((i, epoch, r));
             let one: u64 = 1;
             unsafe { libc::write(efd, &one as *const u64 as *const libc::c_void, 8) };
         });
+        if let Err(e) = spawned {
+            // Never panic here: this runs on a ublk queue thread (submit() can
+            // call it), and a panic would kill the tag's io task.
+            log::warn!("q{} path {}: cannot spawn a connect thread ({e}); retrying in 1 s", self.qid, i / self.k());
+            self.connecting.borrow_mut()[i] = false;
+            self.next_try.borrow_mut()[i] = Instant::now() + Duration::from_secs(1);
+        }
     }
 
     async fn results_task(self: Rc<Self>) {

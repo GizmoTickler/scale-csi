@@ -14,3 +14,8 @@ log = "0.4.34"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smol = "2.0.2"
+
+# Local libublk: chunked tag partitions for several io threads per queue
+# (UblkDev::set_io_tag_chunk). Based on libublk 0.4.8 (MIT OR Apache-2.0).
+[patch.crates-io]
+libublk = { path = "third_party/libublk" }

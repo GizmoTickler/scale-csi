@@ -33,6 +33,9 @@ fn d_one() -> usize {
 fn d_threads() -> u16 {
     1
 }
+fn d_chunk() -> u16 {
+    1
+}
 fn d_rx_chunk() -> usize {
     32 * 1024
 }
@@ -84,6 +87,13 @@ pub struct DeviceSpec {
     /// hands a submitter sequential tags, so one stream stays on one thread.
     #[serde(default)]
     pub seq_tags: bool,
+    /// Chunked tag partition with several threads per queue (tuning): each
+    /// thread owns runs of this many consecutive tags, dealt round-robin, so
+    /// a low-depth stream stays on one thread for that many requests while a
+    /// deep one spans all threads. 1 = plain interleave; clamped to
+    /// depth / threads; ignored with seq_tags.
+    #[serde(default = "d_chunk")]
+    pub tag_chunk: u16,
 }
 
 /// A device being served by a thread of this process.
@@ -231,6 +241,7 @@ fn serve(
     let flags = (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64
         | if spec.zero_copy { (libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_AUTO_BUF_REG) as u64 } else { 0 };
     let threads = spec.threads_per_queue.clamp(1, depth);
+    let tag_chunk = spec.tag_chunk.max(1);
     // Several threads per queue need UBLK_F_PER_IO_DAEMON, which the driver
     // advertises by itself (6.16+) and libublk checks after the device is
     // added; it is not a flag the server may request.
@@ -248,7 +259,9 @@ fn serve(
     let dev_id = ctrl.dev_info().dev_id as i32;
     let fault_dir = format!("/run/nvmeublk/dev{dev_id}");
     let _ = std::fs::create_dir_all(&fault_dir);
-    let _ = std::fs::write(format!("{fault_dir}/queues"), queues.to_string());
+    // Fault injection fans a command out to one file per engine, and there
+    // is one engine per io thread (engine id = queue * threads + thread).
+    let _ = std::fs::write(format!("{fault_dir}/queues"), (queues * threads).to_string());
     let cfg = qengine::QConfig {
         io_timeout: Duration::from_millis(spec.io_timeout_ms),
         no_path_timeout: Duration::from_millis(spec.no_path_timeout_ms),
@@ -266,7 +279,7 @@ fn serve(
         quiesce,
     };
     log::info!(
-        "{}: {} blocks of {} B, {} queues x {} ({} threads/queue{}), zero_copy={} napi_us={} write fence {} ms",
+        "{}: {} blocks of {} B, {} queues x {} ({} threads/queue{}, tag chunk {}), zero_copy={} napi_us={} write fence {} ms",
         spec.volume,
         info.nsze,
         1u64 << info.lba_shift,
@@ -274,6 +287,7 @@ fn serve(
         depth,
         threads,
         if spec.seq_tags { ", contiguous tags" } else { "" },
+        tag_chunk,
         spec.zero_copy,
         spec.napi_us,
         write_fence.as_millis()
@@ -284,6 +298,7 @@ fn serve(
     ctrl.run_target(
         move |dev: &mut UblkDev| {
             dev.set_default_params(size);
+            dev.set_io_tag_chunk(tag_chunk);
             dev.tgt.params.basic.logical_bs_shift = lba_shift;
             dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
             // Room on each queue ring for the network SQEs (recv + writev per

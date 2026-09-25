@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::os::fd::AsRawFd as _;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::io::IoSlice;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -95,6 +96,8 @@ pub struct AdminConn {
     cid: u16,
     pub cntlid: u16,
     pub maxh2c: u32,
+    /// Bytes of a keep-alive response read so far (ka_poll).
+    ka_rx: Vec<u8>,
 }
 
 impl AdminConn {
@@ -102,7 +105,7 @@ impl AdminConn {
         let mut s = dial(addr)?;
         s.set_read_timeout(Some(Duration::from_secs(10)))?;
         let (_cpda, maxh2c) = ic_handshake(&mut s)?;
-        let mut a = AdminConn { s, cid: 0, cntlid: 0, maxh2c };
+        let mut a = AdminConn { s, cid: 0, cntlid: 0, maxh2c, ka_rx: Vec::new() };
         let (sqe, data) = connect_cmd(a.next_cid(), 0, 31, 0, kato_ms, 0xffff, &id.hostid, &id.subnqn, &id.hostnqn);
         let cqe = a.exec(&sqe, &data, None)?;
         if cqe.sc() != 0 {
@@ -221,6 +224,54 @@ impl AdminConn {
             mdts_bytes: if mdts == 0 { usize::MAX } else { 4096usize << mdts },
         };
         Ok((info, mqes))
+    }
+
+    /// Keep-alive in two halves for the shared supervisor, which must never
+    /// block on one controller: send the command (a 72-byte write)...
+    pub fn ka_send(&mut self) -> Result<u16> {
+        let sqe = keep_alive_cmd(self.next_cid());
+        self.s.set_write_timeout(Some(Duration::from_secs(1)))?;
+        write_capsule(&mut self.s, &sqe, &[])?;
+        self.ka_rx.clear();
+        Ok(sqe.cid())
+    }
+
+    /// ...then collect its response without blocking: Ok(true) once it has
+    /// arrived and succeeded, Ok(false) while it is still outstanding. After
+    /// bring-up the admin queue carries nothing but keep-alives, so the next
+    /// PDU must be this command's response capsule.
+    pub fn ka_poll(&mut self, cid: u16) -> Result<bool> {
+        const RESP_LEN: usize = CH_LEN + 16;
+        let mut buf = [0u8; RESP_LEN];
+        while self.ka_rx.len() < RESP_LEN {
+            let want = RESP_LEN - self.ka_rx.len();
+            let n = unsafe { libc::recv(self.s.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, want, libc::MSG_DONTWAIT) };
+            if n > 0 {
+                self.ka_rx.extend_from_slice(&buf[..n as usize]);
+                continue;
+            }
+            if n == 0 {
+                bail!("admin connection closed");
+            }
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EAGAIN) => return Ok(false),
+                Some(libc::EINTR) => continue,
+                _ => return Err(e.into()),
+            }
+        }
+        if self.ka_rx[0] != PDU_CAPSULE_RESP {
+            bail!("unexpected PDU {:#x} on admin queue", self.ka_rx[0]);
+        }
+        let cqe = Cqe::parse(&self.ka_rx[CH_LEN..RESP_LEN]);
+        self.ka_rx.clear();
+        if cqe.cid != cid {
+            bail!("admin completion for cid {} while waiting for keep-alive {cid}", cqe.cid);
+        }
+        if cqe.sc() != 0 {
+            bail!("Keep Alive failed: {:#x}", cqe.status);
+        }
+        Ok(true)
     }
 
     pub fn keep_alive(&mut self) -> Result<()> {
