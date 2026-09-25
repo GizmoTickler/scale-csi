@@ -2957,19 +2957,61 @@ impl UblkCtrl {
     /// This one is the preferred interface for creating ublk daemon, and
     /// is friendly for user, such as, user can customize queue setup and
     /// io handler, such as setup async/await for handling io command.
+    ///
+    /// It is [`start_target`](Self::start_target), `device_fn`, then
+    /// [`wait_target`](Self::wait_target), all on the calling thread, which
+    /// is therefore busy for the device's whole life.
     pub fn run_target<T, Q, W>(&self, tgt_fn: T, q_fn: Q, device_fn: W) -> Result<i32, UblkError>
     where
         T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
         Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
         W: FnOnce(&UblkCtrl) + Send + Sync + 'static,
     {
-        let dev = &Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);
-        let handles = self.create_queue_handlers(dev, q_fn);
-
-        self.start_dev(dev)?;
+        let target = self.start_target(tgt_fn, q_fn)?;
 
         device_fn(self);
 
+        self.wait_target(target)
+    }
+
+    /// First half of [`run_target`](Self::run_target): spawn the device's
+    /// queue threads and START it, then return while they serve it.
+    ///
+    /// A server with many devices then needs no thread per device for the
+    /// device's lifetime: the returned threads are ended later with
+    /// [`wait_target`](Self::wait_target), from any thread. Control commands
+    /// go through the calling thread's control ring, and the driver punts
+    /// the ones that may sleep (START among them) to that thread's io-wq, so
+    /// a short-lived calling thread takes its ring and io-wq worker with it
+    /// when it exits.
+    pub fn start_target<T, Q>(&self, tgt_fn: T, q_fn: Q) -> Result<UblkTargetThreads, UblkError>
+    where
+        T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
+        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+    {
+        // The control ring is per thread; this one may not have made it.
+        init_ctrl_task_ring_default(16)?;
+
+        let dev = Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);
+        let handles = self.create_queue_handlers(&dev, q_fn);
+
+        self.start_dev(&dev)?;
+
+        Ok(UblkTargetThreads { handles, dev })
+    }
+
+    /// Second half of [`run_target`](Self::run_target): wait until every
+    /// queue thread of `target` has returned, which they do once the device
+    /// is stopped (e.g. by [`kill_dev`](Self::kill_dev)), then send STOP.
+    /// The device is not deleted; [`del_dev`](Self::del_dev) does that.
+    ///
+    /// May run on another thread than [`start_target`](Self::start_target);
+    /// this thread's control ring is created first if it has none, so
+    /// [`del_dev`](Self::del_dev) can follow on the same thread.
+    pub fn wait_target(&self, target: UblkTargetThreads) -> Result<i32, UblkError> {
+        init_ctrl_task_ring_default(16)?;
+
+        let UblkTargetThreads { handles, dev } = target;
         for qh in handles {
             qh.join().unwrap_or_else(|_| {
                 eprintln!("dev-{} join queue thread failed", dev.dev_info.dev_id)
@@ -3004,6 +3046,17 @@ impl UblkCtrl {
             }
         }
     }
+}
+
+/// Queue threads of a device started by [`UblkCtrl::start_target`], ended by
+/// [`UblkCtrl::wait_target`].
+///
+/// Dropping it instead detaches the threads: they keep serving the device
+/// until it is stopped.
+pub struct UblkTargetThreads {
+    handles: Vec<std::thread::JoinHandle<()>>,
+    /// Held until the threads are joined, as `run_target` held it.
+    dev: Arc<UblkDev>,
 }
 
 #[cfg(test)]

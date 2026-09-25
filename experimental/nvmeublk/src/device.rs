@@ -1,19 +1,25 @@
 //! One ublk device served by this process: its controllers, its ublk queues
 //! and its lifecycle. `nvmeublk run` serves exactly one; the per-node daemon
-//! (daemon.rs) serves many, each on its own thread.
+//! (daemon.rs) serves many.
+//!
+//! A device has no thread of its own for its lifetime, only its queue
+//! threads. It is brought up on a short-lived thread (`start_connected`), and
+//! stopped and deleted on the thread that detaches it or waits for it.
 
 use crate::conn::Ident;
 use crate::{ctrls, host_ident, qengine, queue_fn};
 use anyhow::{bail, Context, Result};
-use libublk::ctrl::UblkCtrlBuilder;
+use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder, UblkTargetThreads};
 use libublk::io::UblkDev;
 use libublk::UblkFlags;
 use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// NVMe keep-alive timeout of the admin queues.
+const KATO: Duration = Duration::from_secs(15);
 
 fn d_queues() -> u16 {
     4
@@ -96,7 +102,7 @@ pub struct DeviceSpec {
     pub tag_chunk: u16,
 }
 
-/// A device being served by a thread of this process.
+/// A device being served by this process.
 pub struct Running {
     pub spec: DeviceSpec,
     pub dev_id: i32,
@@ -104,7 +110,9 @@ pub struct Running {
     pub ctrls: Arc<ctrls::Ctrls>,
     draining: Arc<AtomicBool>,
     pub quiesce: Arc<AtomicBool>,
-    thread: Option<JoinHandle<Result<()>>>,
+    stop: Arc<AtomicBool>,
+    /// Taken by `detach`/`wait`, which end the device.
+    served: Option<Served>,
 }
 
 impl Running {
@@ -119,20 +127,22 @@ impl Running {
         libublk::ctrl::UblkCtrl::new_simple(self.dev_id)
             .and_then(|c| c.kill_dev())
             .with_context(|| format!("stop ublk device {}", self.dev_id))?;
-        match self.thread.take().map(|t| t.join()) {
-            Some(Ok(r)) => r,
-            Some(Err(_)) => bail!("device {} thread panicked", self.dev_id),
-            None => Ok(()),
-        }
+        self.finish()
     }
 
-    /// Wait for the serving thread (for `nvmeublk run`).
+    /// Wait until the device is stopped (for `nvmeublk run`, whose SIGINT
+    /// stops it), then delete it.
     pub fn wait(mut self) -> Result<()> {
-        match self.thread.take().map(|t| t.join()) {
-            Some(Ok(r)) => r,
-            Some(Err(_)) => bail!("device {} thread panicked", self.dev_id),
-            None => Ok(()),
-        }
+        self.finish()
+    }
+
+    /// The end of the device's life, on the calling thread: what the tail of
+    /// the device's own thread used to do.
+    fn finish(&mut self) -> Result<()> {
+        let Some(served) = self.served.take() else { return Ok(()) };
+        let r = retire(served, &self.stop);
+        self.ctrls.shutdown();
+        r
     }
 
     /// Stop sending new I/O; true once nothing is on the wire.
@@ -140,6 +150,44 @@ impl Running {
         self.quiesce.store(true, Ordering::Release);
         self.stats.inflight.load(Ordering::Acquire) <= 0
     }
+}
+
+/// A device that is up: the control that added or recovered it (and later
+/// deletes it) and the queue threads serving it.
+///
+/// Dropped without `retire` (a Running dropped without detach, or a start
+/// abandoned after its deadline), it leaves the device alone, as dropping the
+/// old per-device thread's handle did: the queue threads keep serving it.
+/// The control must not delete it then: DEL_DEV stops the device and waits
+/// for its release, and the dropping thread may not even have a control ring.
+struct Served {
+    ctrl: UblkCtrl,
+    threads: Option<UblkTargetThreads>,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        if self.threads.is_some() {
+            self.ctrl.disown();
+        }
+    }
+}
+
+/// Wait for a stopped device's queue threads to return, then delete it.
+fn retire(mut s: Served, stop: &AtomicBool) -> Result<()> {
+    let dev_id = s.ctrl.dev_info().dev_id;
+    // Only creating this thread's control ring fails in wait_target; without
+    // one, the control could not delete the device when dropped.
+    if let Some(threads) = s.threads.take()
+        && let Err(e) = s.ctrl.wait_target(threads)
+    {
+        s.ctrl.disown();
+        return Err(e.into());
+    }
+    stop.store(true, Ordering::Release);
+    s.ctrl.del_dev()?;
+    let _ = std::fs::remove_dir_all(format!("/run/nvmeublk/dev{dev_id}"));
+    Ok(())
 }
 
 fn ident(spec: &DeviceSpec) -> Ident {
@@ -160,26 +208,36 @@ fn ident(spec: &DeviceSpec) -> Ident {
 /// an existing ublk device after this process (or a predecessor) exited;
 /// hold_writes is false only when the predecessor drained cleanly.
 pub fn start(spec: DeviceSpec, recover: Option<(i32, bool)>) -> Result<Running> {
+    let ctrls = connect(&spec, recover.is_some())?;
+    start_connected(spec, ctrls, recover)
+}
+
+/// Bring up the admin queue of every reachable path of `spec`. With `retry`
+/// (a device being recovered) this keeps trying every second while no path
+/// is reachable: a recovering device holds its I/O until a server
+/// reattaches, so giving up here would leave it frozen.
+pub fn connect(spec: &DeviceSpec, retry: bool) -> Result<Arc<ctrls::Ctrls>> {
     let addrs: Vec<SocketAddr> = spec
         .addrs
         .iter()
         .map(|a| a.to_socket_addrs().with_context(|| format!("bad address {a}"))?.next().context("unresolvable"))
         .collect::<Result<_>>()?;
-    let kato = Duration::from_secs(15);
-    let ctrls = loop {
-        match ctrls::Ctrls::new(addrs.clone(), ident(&spec), kato) {
-            Ok(c) => break c,
-            // A recovering device holds its I/O until a server reattaches;
-            // giving up here would leave it frozen, so keep trying.
-            Err(e) if recover.is_some() => {
+    loop {
+        match ctrls::Ctrls::new(addrs.clone(), ident(spec), KATO) {
+            Ok(c) => return Ok(c),
+            Err(e) if retry => {
                 log::warn!("{}: recovery: no path reachable yet ({e:#}); retrying", spec.volume);
                 std::thread::sleep(Duration::from_secs(1));
             }
             Err(e) => return Err(e),
         }
-    };
+    }
+}
+
+/// `start` once `connect` has brought the paths up.
+pub fn start_connected(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<(i32, bool)>) -> Result<Running> {
     let info = ctrls.info.clone();
-    let write_fence = Duration::from_millis(spec.write_fence_ms.unwrap_or(kato.as_millis() as u64 + 5000));
+    let write_fence = Duration::from_millis(spec.write_fence_ms.unwrap_or(KATO.as_millis() as u64 + 5000));
     let hold = recover.is_some_and(|(_, hold)| hold);
     if spec.zero_copy {
         let feats = libublk::ctrl::UblkCtrl::get_features().unwrap_or(0);
@@ -192,30 +250,92 @@ pub fn start(spec: DeviceSpec, recover: Option<(i32, bool)>) -> Result<Running> 
     let stop = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
     let quiesce = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel::<Result<i32>>();
-    let (s2, st2, c2, dr2, q2) = (spec.clone(), stats.clone(), ctrls.clone(), draining.clone(), quiesce.clone());
-    let thread = std::thread::Builder::new().name(format!("ublk-{}", short(&spec.volume))).spawn(move || {
-        let r = serve(s2, recover, hold, write_fence, info, st2, c2.clone(), stop, dr2, q2, &tx);
-        if let Err(e) = &r {
-            let _ = tx.send(Err(anyhow::anyhow!("{e:#}")));
+    // Bring-up runs on a short-lived thread. Its control commands (ADD or
+    // START_USER_RECOVERY, then START or END_USER_RECOVERY) go through that
+    // thread's own control ring, and the io-wq worker the driver punts them
+    // to exits with the thread instead of living as long as the device. The
+    // rendezvous channel hands the device over only if this side is still
+    // waiting; after the deadline the thread serves the device to its end
+    // itself, as the old per-device thread did.
+    let (tx, rx) = mpsc::sync_channel::<Result<Served>>(0);
+    let (s2, st2, c2, stop2, dr2, q2) = (spec.clone(), stats.clone(), ctrls.clone(), stop.clone(), draining.clone(), quiesce.clone());
+    std::thread::Builder::new().name(format!("ublk-{}", short(&spec.volume))).spawn(move || {
+        match bring_up(s2, recover, hold, write_fence, info, st2, c2.clone(), stop2.clone(), dr2, q2) {
+            Ok(served) => {
+                if let Err(mpsc::SendError(Ok(served))) = tx.send(Ok(served)) {
+                    if let Err(e) = retire(served, &stop2) {
+                        log::error!("ublk device abandoned after its start deadline: {e:#}");
+                    }
+                    c2.shutdown();
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                c2.shutdown();
+            }
         }
-        c2.shutdown();
-        r
     })?;
-    let dev_id = match rx.recv_timeout(Duration::from_secs(60)) {
-        Ok(Ok(id)) => id,
+    let served = match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
         Err(_) => bail!("{}: device did not come up within 60 s", spec.volume),
     };
-    Ok(Running { spec, dev_id, stats, ctrls, draining, quiesce, thread: Some(thread) })
+    let dev_id = served.ctrl.dev_info().dev_id as i32;
+    Ok(Running { spec, dev_id, stats, ctrls, draining, quiesce, stop, served: Some(served) })
 }
 
-fn short(v: &str) -> String {
+pub fn short(v: &str) -> String {
     v.chars().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect()
 }
 
+/// ublk feature flags a new device is added with. A recovered device keeps
+/// the flags it was added with: libublk replaces these with the driver's
+/// copy when it opens the device for recovery.
+fn ublk_flags(zero_copy: bool) -> u64 {
+    use libublk::sys::*;
+    // USER_RECOVERY + REISSUE: a restarted daemon reattaches the device and
+    // gets the I/O that was in flight back. QUIESCE: QUIESCE_DEV, the only
+    // per-device cancel that keeps the device, for moving one device between
+    // servers in-process later. The driver requires USER_RECOVERY for it and
+    // uses it nowhere else, so it changes nothing today; but flags are fixed
+    // at ADD, so a device added without it can never get it.
+    let mut flags = (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE | UBLK_F_QUIESCE) as u64;
+    if zero_copy {
+        // SUPPORT_ZERO_COPY on top of USER_COPY + AUTO_BUF_REG only enables
+        // UBLK_IO_(UN)REGISTER_IO_BUF, which nothing here sends yet: every
+        // other test of it in the driver is ORed with USER_COPY/AUTO_BUF_REG
+        // (need_map_io, need_req_ref, dropping NEED_GET_DATA). Never in the
+        // copying mode, where it would switch the driver's data copy off.
+        flags |= (UBLK_F_USER_COPY | UBLK_F_AUTO_BUF_REG | UBLK_F_SUPPORT_ZERO_COPY) as u64;
+    }
+    flags
+}
+
+/// Counts a queue thread out when it returns or unwinds. The last one out
+/// sets the stop flag and shuts the admin paths down, as the device's own
+/// thread did once every queue thread had returned, so a device that stops
+/// on its own (not by detach) does not keep its paths up until a detach.
+/// `retire` and `finish` repeat both; they are idempotent.
+struct QueueExit {
+    exited: Arc<AtomicUsize>,
+    total: usize,
+    stop: Arc<AtomicBool>,
+    ctrls: Arc<ctrls::Ctrls>,
+}
+
+impl Drop for QueueExit {
+    fn drop(&mut self) {
+        if self.exited.fetch_add(1, Ordering::AcqRel) + 1 == self.total {
+            self.stop.store(true, Ordering::Release);
+            self.ctrls.shutdown();
+        }
+    }
+}
+
+/// Create (or reopen for recovery) the ublk device and start its queue
+/// threads; returns once the device is up.
 #[allow(clippy::too_many_arguments)]
-fn serve(
+fn bring_up(
     spec: DeviceSpec,
     recover: Option<(i32, bool)>,
     hold: bool,
@@ -226,8 +346,7 @@ fn serve(
     stop: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     quiesce: Arc<AtomicBool>,
-    ready: &mpsc::Sender<Result<i32>>,
-) -> Result<()> {
+) -> Result<Served> {
     let (queues, depth) = (spec.queues.max(1), spec.depth.max(2));
     // Largest request the device takes. Zero copy moves data straight
     // between the socket and the request pages, so a larger cap costs no
@@ -238,8 +357,7 @@ fn serve(
     let io_buf = (max_io.clamp(4, 32 * 1024) * 1024).min(info.mdts_bytes) as u32;
     let size = info.nsze << info.lba_shift;
     let lba_shift = info.lba_shift as u8;
-    let flags = (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64
-        | if spec.zero_copy { (libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_AUTO_BUF_REG) as u64 } else { 0 };
+    let flags = ublk_flags(spec.zero_copy);
     let threads = spec.threads_per_queue.clamp(1, depth);
     let tag_chunk = spec.tag_chunk.max(1);
     // Several threads per queue need UBLK_F_PER_IO_DAEMON, which the driver
@@ -293,9 +411,8 @@ fn serve(
         write_fence.as_millis()
     );
     let (sq, stq, drq) = (stats.clone(), stop.clone(), draining.clone());
-    let vol = spec.volume.clone();
-    let ready = ready.clone();
-    ctrl.run_target(
+    let exited = Arc::new(AtomicUsize::new(0));
+    let target = ctrl.start_target(
         move |dev: &mut UblkDev| {
             dev.set_default_params(size);
             dev.set_io_tag_chunk(tag_chunk);
@@ -307,14 +424,49 @@ fn serve(
             dev.tgt.cq_depth = depth * 2 + 64;
             Ok(())
         },
-        move |qid, dev: &_| queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), cfg.clone()),
-        move |c| {
-            log::info!("{vol}: serving /dev/ublkb{}", c.dev_info().dev_id);
-            let _ = ready.send(Ok(c.dev_info().dev_id as i32));
+        move |qid, dev: &_| {
+            // libublk runs one thread per (queue, io thread); the kernel may
+            // have trimmed the queue count, so count from the device.
+            let total = dev.dev_info.nr_hw_queues as usize * dev.io_threads_per_queue() as usize;
+            let _out = QueueExit { exited: exited.clone(), total, stop: stq.clone(), ctrls: ctrls.clone() };
+            queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), cfg.clone())
         },
     )?;
-    stop.store(true, Ordering::Release);
-    ctrl.del_dev()?;
-    let _ = std::fs::remove_dir_all(format!("/run/nvmeublk/dev{dev_id}"));
-    Ok(())
+    log::info!("{}: serving /dev/ublkb{dev_id}", spec.volume);
+    Ok(Served { ctrl, threads: Some(target) })
+}
+
+#[cfg(test)]
+mod tests {
+    use libublk::sys::*;
+
+    #[test]
+    fn new_devices_can_be_quiesced() {
+        for zero_copy in [false, true] {
+            let f = super::ublk_flags(zero_copy);
+            assert_ne!(f & UBLK_F_QUIESCE as u64, 0, "zero_copy={zero_copy}");
+            // ADD_DEV refuses QUIESCE without USER_RECOVERY.
+            assert_ne!(f & UBLK_F_USER_RECOVERY as u64, 0, "zero_copy={zero_copy}");
+            assert_ne!(f & UBLK_F_USER_RECOVERY_REISSUE as u64, 0, "zero_copy={zero_copy}");
+        }
+    }
+
+    #[test]
+    fn zero_copy_flag_only_with_user_copy_and_auto_buf_reg() {
+        let zc = (UBLK_F_SUPPORT_ZERO_COPY | UBLK_F_USER_COPY | UBLK_F_AUTO_BUF_REG) as u64;
+        // Copying mode: SUPPORT_ZERO_COPY alone would turn the driver's copy off.
+        assert_eq!(super::ublk_flags(false) & zc, 0);
+        assert_eq!(super::ublk_flags(true) & zc, zc);
+    }
+
+    /// libublk refuses any flag outside its UBLK_DRV_F_ALL with InvalidVal
+    /// before it touches the driver (the device open fails with EACCES
+    /// without root, and with root id -1 adds nothing).
+    #[test]
+    fn libublk_accepts_the_flags() {
+        for zero_copy in [false, true] {
+            let r = libublk::ctrl::UblkCtrl::new(None, -1, 1, 64, 4096, super::ublk_flags(zero_copy), 0, libublk::UblkFlags::empty());
+            assert!(!matches!(r, Err(libublk::UblkError::InvalidVal)), "zero_copy={zero_copy}");
+        }
+    }
 }
