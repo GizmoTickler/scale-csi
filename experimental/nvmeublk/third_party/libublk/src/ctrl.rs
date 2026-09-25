@@ -2979,7 +2979,8 @@ impl UblkCtrl {
     ///
     /// A server with many devices then needs no thread per device for the
     /// device's lifetime: the returned threads are ended later with
-    /// [`wait_target`](Self::wait_target), from any thread. Control commands
+    /// [`wait_target`](Self::wait_target) or
+    /// [`join_target`](Self::join_target), from any thread. Control commands
     /// go through the calling thread's control ring, and the driver punts
     /// the ones that may sleep (START among them) to that thread's io-wq, so
     /// a short-lived calling thread takes its ring and io-wq worker with it
@@ -2997,7 +2998,11 @@ impl UblkCtrl {
 
         self.start_dev(&dev)?;
 
-        Ok(UblkTargetThreads { handles, dev })
+        Ok(UblkTargetThreads {
+            handles,
+            dev_id: dev.dev_info.dev_id,
+            dev: Some(dev),
+        })
     }
 
     /// Second half of [`run_target`](Self::run_target): wait until every
@@ -3005,24 +3010,55 @@ impl UblkCtrl {
     /// is stopped (e.g. by [`kill_dev`](Self::kill_dev)), then send STOP.
     /// The device is not deleted; [`del_dev`](Self::del_dev) does that.
     ///
+    /// The char device is closed before STOP. When the queue threads return
+    /// without the device having been stopped, the requests they had taken
+    /// are aborted only once the char device is released
+    /// (ublk_ch_release_work_fn), and STOP of a live device waits for every
+    /// started request (ublk_wait_tagset_rqs_idle), holding the device
+    /// mutex: with the char device still open, it would wait forever.
+    ///
     /// May run on another thread than [`start_target`](Self::start_target);
     /// this thread's control ring is created first if it has none, so
     /// [`del_dev`](Self::del_dev) can follow on the same thread.
     pub fn wait_target(&self, target: UblkTargetThreads) -> Result<i32, UblkError> {
-        init_ctrl_task_ring_default(16)?;
-
-        let UblkTargetThreads { handles, dev } = target;
-        for qh in handles {
-            qh.join().unwrap_or_else(|_| {
-                eprintln!("dev-{} join queue thread failed", dev.dev_info.dev_id)
-            });
-        }
+        drop(self.join_target(target)?);
 
         //device may be deleted from another context, so it is normal
         //to see -ENOENT failure here
         let _ = self.stop_dev();
 
         Ok(0)
+    }
+
+    /// Wait until every queue thread of `target` has returned, and hand back
+    /// the device, its char device still open unless
+    /// [`UblkTargetThreads::release`] let it go.
+    ///
+    /// While the char device is open the device's id cannot be freed, even
+    /// if something else deleted the device meanwhile, so control commands
+    /// for this id still reach this device and no other. DEL_DEV would wait
+    /// for the id, i.e. for this handle: use
+    /// [`del_dev_async`](Self::del_dev_async) while holding it. Do not send
+    /// STOP to a device that is still live while holding it (see
+    /// [`wait_target`](Self::wait_target)).
+    ///
+    /// This thread's control ring is created first if it has none.
+    pub fn join_target(
+        &self,
+        target: UblkTargetThreads,
+    ) -> Result<Option<Arc<UblkDev>>, UblkError> {
+        init_ctrl_task_ring_default(16)?;
+
+        let UblkTargetThreads {
+            handles,
+            dev_id,
+            dev,
+        } = target;
+        for qh in handles {
+            qh.join()
+                .unwrap_or_else(|_| eprintln!("dev-{} join queue thread failed", dev_id));
+        }
+        Ok(dev)
     }
 
     /// Iterator over each ublk device ID
@@ -3049,14 +3085,29 @@ impl UblkCtrl {
 }
 
 /// Queue threads of a device started by [`UblkCtrl::start_target`], ended by
-/// [`UblkCtrl::wait_target`].
+/// [`UblkCtrl::wait_target`] or [`UblkCtrl::join_target`].
 ///
-/// Dropping it instead detaches the threads: they keep serving the device
-/// until it is stopped.
+/// Until then it keeps the device's char device open, and with it the
+/// device's id, unless [`release`](Self::release)d. Whoever holds it must
+/// end it once the queue threads return: while it is held, a DEL_DEV from
+/// elsewhere waits for it, and the driver does not abort the requests the
+/// threads had taken.
+///
+/// Dropping it detaches the threads: they keep serving the device until it
+/// is stopped, and the char device closes when the last of them returns.
 pub struct UblkTargetThreads {
     handles: Vec<std::thread::JoinHandle<()>>,
-    /// Held until the threads are joined, as `run_target` held it.
-    dev: Arc<UblkDev>,
+    dev_id: u32,
+    dev: Option<Arc<UblkDev>>,
+}
+
+impl UblkTargetThreads {
+    /// Stop holding the char device open. It then closes when the last
+    /// queue thread returns, as when a server exits, and the device's id
+    /// is no longer held for whoever ends the threads.
+    pub fn release(&mut self) {
+        self.dev = None;
+    }
 }
 
 #[cfg(test)]
