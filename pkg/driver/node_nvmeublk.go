@@ -84,10 +84,17 @@ func (d *Driver) nvmeUblkDaemon() nvmeUblkDaemon {
 }
 
 // nvmeUblkStatusCode maps a daemon error: Unavailable when nothing listens on
-// the socket (the daemon is not running on this node yet), Internal otherwise.
+// the socket (the daemon is not running on this node yet), DeadlineExceeded
+// when the call ran out of time, Internal otherwise. Both non-Internal codes
+// are ones kubelet treats as an uncertain outcome, so it keeps the volume's
+// NodeUnstage obligation: an attach that timed out here may still complete in
+// the daemon, and only an unstage detaches it.
 func nvmeUblkStatusCode(err error) codes.Code {
-	if errors.Is(err, util.ErrNVMeUblkDaemonUnavailable) {
+	switch {
+	case errors.Is(err, util.ErrNVMeUblkDaemonUnavailable):
 		return codes.Unavailable
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return codes.DeadlineExceeded
 	}
 	return codes.Internal
 }
@@ -188,7 +195,7 @@ func (d *Driver) nvmeUblkDeviceAt(ctx context.Context, devicePath string) (util.
 func (d *Driver) verifyNVMeUblkStageSource(ctx context.Context, volumeID, devicePath string, volumeContext map[string]string) error {
 	device, err := d.nvmeUblkDeviceAt(ctx, devicePath)
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to identify staged NVMe-oF device %s through nvmeublkd: %v", devicePath, err)
+		return status.Errorf(nvmeUblkStatusCode(err), "failed to identify staged NVMe-oF device %s through nvmeublkd: %v", devicePath, err)
 	}
 	if device.SubNQN != volumeContext["nqn"] {
 		return status.Errorf(codes.AlreadyExists, "staging target is backed by NVMe-oF subsystem %s, requested %s", device.SubNQN, volumeContext["nqn"])
@@ -205,7 +212,7 @@ func (d *Driver) verifyNVMeUblkStageSource(ctx context.Context, volumeID, device
 func (d *Driver) validateNVMeUblkRawBlockOwnership(ctx context.Context, volumeID, devicePath string) error {
 	device, err := d.nvmeUblkDeviceAt(ctx, devicePath)
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to identify nvmeublkd device for raw block device %s: %v", devicePath, err)
+		return status.Errorf(nvmeUblkStatusCode(err), "failed to identify nvmeublkd device for raw block device %s: %v", devicePath, err)
 	}
 	expected := d.config.NVMeoF.NamePrefix + protocolShareName(volumeID) + d.config.NVMeoF.NameSuffix
 	if !sessionTargetMatchesExpected(device.SubNQN, expected) {

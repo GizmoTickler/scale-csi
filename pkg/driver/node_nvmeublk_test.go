@@ -718,7 +718,9 @@ func TestNodePublishUblkRawBlockOwnership(t *testing.T) {
 		fake := installFakeNodeUblkDaemon(t)
 		fake.listErr = util.ErrNVMeUblkDaemonUnavailable
 		err := newTestUblkNodeDriver(t).validateRawBlockDeviceOwnership(context.Background(), "pvc-own", "/dev/ublkb4", ShareTypeNVMeoF)
-		assert.Equal(t, codes.Internal, status.Code(err))
+		// Unavailable: retryable, so kubelet keeps the volume's obligations
+		// while the daemon restarts.
+		assert.Equal(t, codes.Unavailable, status.Code(err))
 	})
 }
 
@@ -889,4 +891,35 @@ func TestNodeStageUblkBlockLinkOwnedByRecordedOtherVolumeStaysAlreadyExists(t *t
 	assert.Equal(t, codes.AlreadyExists, status.Code(err))
 	attaches, _, _ := fake.snapshot()
 	assert.Len(t, attaches, 1, "no attach for the colliding volume")
+}
+
+// A daemon call that runs out of time may still complete in the daemon, so it
+// must surface as a code kubelet treats as uncertain (it then keeps the
+// NodeUnstage obligation), never as a final Internal.
+func TestNVMeUblkStatusCodeKeepsTimeoutsUncertain(t *testing.T) {
+	assert.Equal(t, codes.Unavailable, nvmeUblkStatusCode(fmt.Errorf("attach: %w", util.ErrNVMeUblkDaemonUnavailable)))
+	assert.Equal(t, codes.DeadlineExceeded, nvmeUblkStatusCode(fmt.Errorf("attach: read response: %w", context.DeadlineExceeded)))
+	assert.Equal(t, codes.DeadlineExceeded, nvmeUblkStatusCode(fmt.Errorf("attach: %w", context.Canceled)))
+	assert.Equal(t, codes.Internal, nvmeUblkStatusCode(errors.New("nvmeublkd: bad address")))
+}
+
+func TestNodeStageUblkAttachTimeoutIsDeadlineExceeded(t *testing.T) {
+	installUblkNodeCommands(t)
+	forbidKernelNVMe(t)
+	fake := installFakeNodeUblkDaemon(t)
+	fake.attachErr = fmt.Errorf("attach: read response: %w", context.DeadlineExceeded)
+	d := newTestUblkNodeDriver(t)
+	stagingPath := filepath.Join(t.TempDir(), "staging", "volume-device")
+	require.NoError(t, os.MkdirAll(filepath.Dir(stagingPath), 0o750))
+	_, err := d.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          testUblkVolume,
+		StagingTargetPath: stagingPath,
+		VolumeCapability:  blockCapability(),
+		VolumeContext:     ublkVolumeContext(nil),
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	marked, markErr := d.nvmeUblkMarkerExists(testUblkVolume)
+	require.NoError(t, markErr)
+	assert.True(t, marked, "the marker stays so the unstage kubelet still owes can detach a late attach")
 }
