@@ -223,6 +223,19 @@ fn queue_fn(
     draining: Arc<std::sync::atomic::AtomicBool>,
     cfg: qengine::QConfig,
 ) {
+    // Queue-thread CPU placement (NVMEUBLK_QUEUE_CPUS, tuning). libublk pins
+    // each queue thread to its blk-mq CPU group, which at one queue per CPU is
+    // exactly the submitting CPU: at QD1 the submitter and the queue thread
+    // then take turns on one core. "all" lets the thread run anywhere.
+    if std::env::var("NVMEUBLK_QUEUE_CPUS").as_deref() == Ok("all") {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for cpu in 0..(libc::sysconf(libc::_SC_NPROCESSORS_CONF).max(1) as usize).min(libc::CPU_SETSIZE as usize) {
+                libc::CPU_SET(cpu, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
     // NAPI busy poll (NVMEUBLK_NAPI_US): while this queue thread waits for
     // events, the kernel polls the NIC queues of the sockets on its ring for
     // up to N us instead of sleeping until an interrupt. Trades a slice of a
@@ -322,6 +335,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         depth: env_u64("NVMEUBLK_DEPTH", 64) as u16,
         zero_copy: env_u64("NVMEUBLK_ZERO_COPY", 0) != 0,
         napi_us: env_u64("NVMEUBLK_NAPI_US", 0) as u32,
+        conns_per_path: env_u64("NVMEUBLK_CONNS_PER_PATH", 1) as usize,
+        rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024) as usize,
         io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),
         no_path_timeout_ms: env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000),
         write_fence_ms: std::env::var("NVMEUBLK_WRITE_FENCE_MS").ok().and_then(|v| v.parse().ok()),

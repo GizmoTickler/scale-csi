@@ -45,6 +45,12 @@ const RX_CHUNK_DEFAULT: usize = 32 * 1024;
 /// io_uring UAPI: send/recv on a registered (fixed) buffer, index in buf_index.
 const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
 
+static ASYNC_RX_MIN: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+
+static RX_EXACT_MIN: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_RX_EXACT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+
 /// Zero-copy receive primitive: 0 = fixed-buffer RECV with MSG_WAITALL
 /// (kernel 7.x; one SQE per payload), 1 = READ_FIXED on the socket (every
 /// kernel with AUTO_BUF_REG; may take several SQEs). Starts from the
@@ -864,8 +870,19 @@ impl QEngine {
             if end == buf.len() {
                 buf.resize(buf.len() * 2, 0);
             }
-            let want = (buf.len() - end).min(chunk);
-            let sqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), buf[end..].as_mut_ptr(), want as u32).build();
+            let mut want = (buf.len() - end).min(chunk);
+            // Exact-header receive (NVMEUBLK_RX_EXACT_MIN bytes, tuning):
+            // while a zero-copy read with at least that much payload still
+            // to come is in flight here, take only up to the end of the next
+            // PDU header, so its payload lands in the request pages whole
+            // instead of partly in staging (and a pwrite to move it across).
+            let exact = self.exact_need(&c, &buf[start..end]);
+            if let Some(n) = exact {
+                want = want.min(n);
+            }
+            let sqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), buf[end..].as_mut_ptr(), want as u32)
+                .flags(if exact.is_some() { libc::MSG_WAITALL } else { 0 })
+                .build();
             let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
             if c.dead.get() {
                 return;
@@ -917,6 +934,31 @@ impl QEngine {
                 end = 0;
             }
         }
+    }
+
+    /// Bytes still missing before the PDU at the front of `part` can be acted
+    /// on without touching payload: its common header, then the rest of its
+    /// header and padding for C2HData (whose payload `try_direct` receives in
+    /// place), or the whole PDU otherwise. None when exact receive is off,
+    /// when no large zero-copy read is outstanding on `c`, or when nothing is
+    /// missing.
+    fn exact_need(&self, c: &QConn, part: &[u8]) -> Option<usize> {
+        let min = *RX_EXACT_MIN;
+        if min == 0 {
+            return None;
+        }
+        let large = c.inflight.borrow().values().any(|p| p.op == Op::Read && p.zc_index.is_some() && p.len - p.rx >= min);
+        if !large {
+            return None;
+        }
+        let need = if part.len() < CH_LEN {
+            CH_LEN
+        } else if part[0] == PDU_C2H_DATA {
+            (part[2] as usize).max(part[3] as usize).max(CH_LEN)
+        } else {
+            u32::from_le_bytes(part[4..8].try_into().unwrap()) as usize
+        };
+        need.checked_sub(part.len()).filter(|&n| n > 0)
     }
 
     /// A partial C2HData PDU sits at the tail of the staging buffer: copy the
@@ -976,6 +1018,14 @@ impl QEngine {
                     io_uring::opcode::ReadFixed::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32, idx)
                         .offset(u64::MAX)
                         .build()
+                };
+                // Large payloads (NVMEUBLK_ASYNC_RX_MIN bytes and up, tuning):
+                // hand the copy to an io-wq worker instead of doing it inline
+                // in this queue thread's submit, so the queue keeps turning
+                // (commands out, completions back) while the data lands.
+                let sqe = match *ASYNC_RX_MIN {
+                    min if min > 0 && len - got >= min => sqe.flags(io_uring::squeue::Flags::ASYNC),
+                    _ => sqe,
                 };
                 let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
                 if use_recv && r == -libc::EINVAL {

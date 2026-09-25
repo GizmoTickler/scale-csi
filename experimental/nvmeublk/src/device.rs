@@ -27,6 +27,12 @@ fn d_io_timeout() -> u64 {
 fn d_no_path() -> u64 {
     30000
 }
+fn d_one() -> usize {
+    1
+}
+fn d_rx_chunk() -> usize {
+    32 * 1024
+}
 
 /// Everything needed to (re)create a device. Stored in the daemon's state
 /// file, so a restarted daemon can reattach with the same configuration.
@@ -58,6 +64,14 @@ pub struct DeviceSpec {
     /// Hold for writes orphaned by a failed path; KATO + 5 s if omitted.
     #[serde(default)]
     pub write_fence_ms: Option<u64>,
+    /// TCP connections per path per queue (tuning; default 1).
+    #[serde(default = "d_one")]
+    pub conns_per_path: usize,
+    /// Most bytes one header receive may take into the copy buffer. Payload
+    /// that arrives inside it is copied; the rest of a read's payload goes
+    /// zero copy. Smaller = less copying, more receives (tuning; default 32 KiB).
+    #[serde(default = "d_rx_chunk")]
+    pub rx_chunk: usize,
 }
 
 /// A device being served by a thread of this process.
@@ -222,8 +236,8 @@ fn serve(
         hold_writes_until: hold.then(|| Instant::now() + write_fence),
         rx_offload: 0,
         cdev_fd: -1,
-        conns_per_path: 1,
-        rx_chunk: 32 * 1024,
+        conns_per_path: spec.conns_per_path.max(1),
+        rx_chunk: spec.rx_chunk.max(64),
         napi_us: spec.napi_us,
         fault_dir,
         quiesce,

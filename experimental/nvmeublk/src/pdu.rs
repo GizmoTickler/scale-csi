@@ -16,6 +16,10 @@ pub const PDU_R2T: u8 = 0x09;
 
 pub const FLAG_LAST_PDU: u8 = 0x04;
 pub const FLAG_C2H_SUCCESS: u8 = 0x08;
+/// Connect CATTR: SQ flow control disabled. The host gives up SQ head
+/// pointer reporting, which lets the controller finish a read with the
+/// SUCCESS flag on its last C2HData PDU instead of a response capsule.
+pub const CATTR_DISABLE_SQFLOW: u8 = 1 << 2;
 
 pub const CH_LEN: usize = 8;
 pub const CMD_HLEN: usize = CH_LEN + 64;
@@ -223,12 +227,13 @@ pub fn parse_data_hdr(psh: &[u8]) -> DataHdr {
 }
 
 /// Fabrics Connect command + its 1024-byte data.
-pub fn connect_cmd(cid: u16, qid: u16, sqsize: u16, kato_ms: u32, cntlid: u16, hostid: &[u8; 16], subnqn: &str, hostnqn: &str) -> (Sqe, Vec<u8>) {
+pub fn connect_cmd(cid: u16, qid: u16, sqsize: u16, cattr: u8, kato_ms: u32, cntlid: u16, hostid: &[u8; 16], subnqn: &str, hostnqn: &str) -> (Sqe, Vec<u8>) {
     let mut sqe = Sqe::new(OPC_FABRICS, cid, 0);
     sqe.set_u8(4, FCTYPE_CONNECT);
     sqe.set_u16(40, 0); // recfmt
     sqe.set_u16(42, qid);
     sqe.set_u16(44, sqsize); // 0-based
+    sqe.set_u8(46, cattr);
     sqe.set_u32(48, kato_ms);
     let mut data = vec![0u8; 1024];
     data[..16].copy_from_slice(hostid);

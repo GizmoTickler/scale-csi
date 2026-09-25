@@ -96,7 +96,7 @@ impl AdminConn {
         s.set_read_timeout(Some(Duration::from_secs(10)))?;
         let (_cpda, maxh2c) = ic_handshake(&mut s)?;
         let mut a = AdminConn { s, cid: 0, cntlid: 0, maxh2c };
-        let (sqe, data) = connect_cmd(a.next_cid(), 0, 31, kato_ms, 0xffff, &id.hostid, &id.subnqn, &id.hostnqn);
+        let (sqe, data) = connect_cmd(a.next_cid(), 0, 31, 0, kato_ms, 0xffff, &id.hostid, &id.subnqn, &id.hostnqn);
         let cqe = a.exec(&sqe, &data, None)?;
         if cqe.sc() != 0 {
             bail!("admin Connect rejected: status {:#x}", cqe.status);
@@ -313,13 +313,19 @@ fn write_batch(w: &mut TcpStream, batch: &[Msg]) -> std::io::Result<()> {
     Ok(())
 }
 
+static DISABLE_SQFLOW: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_DISABLE_SQFLOW").is_ok_and(|v| v != "0"));
+
 /// Dial, handshake and Connect one I/O queue (`qid` >= 1) on controller
 /// `cntlid`. Blocking; returns the ready socket and the target's maxh2cdata.
 pub fn connect_io_queue(addr: SocketAddr, id: &Ident, cntlid: u16, qid: u16, qsize: u16) -> Result<(TcpStream, u32)> {
     let mut s = dial(addr)?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (_cpda, maxh2c) = ic_handshake(&mut s)?;
-    let (sqe, data) = connect_cmd(0, qid, qsize - 1, 0, cntlid, &id.hostid, &id.subnqn, &id.hostnqn);
+    // NVMEUBLK_DISABLE_SQFLOW (tuning): nothing here uses the SQ head, so
+    // trade it for one PDU less per read (see CATTR_DISABLE_SQFLOW).
+    let cattr = if *DISABLE_SQFLOW { CATTR_DISABLE_SQFLOW } else { 0 };
+    let (sqe, data) = connect_cmd(0, qid, qsize - 1, cattr, 0, cntlid, &id.hostid, &id.subnqn, &id.hostnqn);
     write_capsule(&mut s, &sqe, &data)?;
     let (ch, psh) = read_hdr(&mut s)?;
     if ch.ptype != PDU_CAPSULE_RESP {
