@@ -307,6 +307,18 @@ the unstage rather than leaking the device. Online expansion of a staged ublk
 volume is not possible (the daemon cannot grow a live device): NodeExpand
 returns `FailedPrecondition` until the volume is staged again, for example by
 restarting the pod. There is no garbage collection of ublk attachments yet.
+Portals are fixed at attach: an attach that finds the volume already served
+returns the existing device, so addresses added to the publish hint later reach
+a ublk volume only when it is staged again (the kernel path converges them).
+
+Turning the ublk data path off: first move every ublk volume off it (restage
+it onto a `kernel` class, or drain and unstage it), and confirm
+`nvmeublk ctl '{"op":"list"}'` on each node reports no devices. Only then set
+`nvmeof.ublk.enabled=false` / `nvmeof.dataPath=kernel` and disable the daemon.
+While ublk volumes are still staged, the node plugin needs the daemon socket
+to unstage, publish and replay them; switching the feature off first strands
+those volumes until it is switched back on. Enabling `nvmeof.ublk.daemon`
+without the ublk data path in use fails the render.
 
 ```yaml
 nvmeof:

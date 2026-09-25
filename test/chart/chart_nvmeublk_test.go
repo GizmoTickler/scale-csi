@@ -240,11 +240,28 @@ func TestChartNVMeUblkDaemonSet(t *testing.T) {
 	})
 
 	t.Run("an image tag or digest is required", func(t *testing.T) {
-		out := helmTemplateExpectError(t, withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.daemon.enabled=true")...)
+		out := helmTemplateExpectError(t, withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.enabled=true", "--set", "nvmeof.ublk.daemon.enabled=true")...)
 		if !strings.Contains(out, "nvmeof.ublk.daemon.image.tag (or digest) is required") {
 			t.Errorf("missing image tag must fail with a clear message; got:\n%s", out)
 		}
 	})
+}
+
+// The daemon only serves the ublk data path; enabling it without that path
+// (or without NVMe-oF) must fail the render rather than run an unreachable
+// privileged host-network DaemonSet.
+func TestChartNVMeUblkDaemonRequiresUblkInUse(t *testing.T) {
+	for name, args := range map[string][]string{
+		"ublk not in use": withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.daemon.enabled=true", "--set", "nvmeof.ublk.daemon.image.tag=v0.1.0"),
+		"nvmeof disabled": {"--set", "nvmeof.ublk.enabled=true", "--set", "nvmeof.ublk.daemon.enabled=true", "--set", "nvmeof.ublk.daemon.image.tag=v0.1.0"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := helmTemplateExpectError(t, args...)
+			if !strings.Contains(out, "nvmeof.ublk.daemon.enabled requires the ublk data path in use") {
+				t.Errorf("expected a clear render failure; got:\n%s", out)
+			}
+		})
+	}
 }
 
 func TestChartNVMeUblkSchemaRejectsInvalidValues(t *testing.T) {

@@ -2,6 +2,13 @@
 {{- $ublk := $nvmeof.ublk | default dict }}
 {{- $daemon := $ublk.daemon | default dict }}
 {{- if $daemon.enabled }}
+{{- /* A daemon nobody can reach (the node plugin mounts its socket only while
+     ublk is in use) is a privileged host-network pod for nothing; refuse it
+     loudly. Disabling ublk while volumes are staged must keep the daemon, so
+     this does not silently drop it either. */}}
+{{- if not (include "scale-csi.nvmeofUblkInUse" .) }}
+{{- fail "nvmeof.ublk.daemon.enabled requires the ublk data path in use (nvmeof.enabled plus nvmeof.ublk.enabled or nvmeof.dataPath=ublk)" }}
+{{- end }}
 {{- $image := $daemon.image | default dict }}
 # nvmeublkd: the per-node userspace NVMe/TCP daemon behind the ublk data path.
 # One process owns every /dev/ublkbN on its node and outlives node-plugin
