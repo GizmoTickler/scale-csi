@@ -248,6 +248,46 @@ pub(crate) fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
     DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().pop_front())
 }
 
+/// Queue `sqe` on `r`, flushing the SQ to the kernel while it is full.
+///
+/// A full SQ is normal under load: io_uring_enter() consumes the queued
+/// SQEs and makes room, so the push is retried after each flush, and after
+/// EINTR.  Any other io_uring_enter() failure (EBADF, EBADFD, EOWNERDEAD,
+/// EEXIST, ...) means the ring cannot take SQEs any more and would fail the
+/// same way on every retry, so it is returned instead of panicking (or
+/// spinning) the queue thread.  EAGAIN and EBUSY ask the caller to reap
+/// completions first, which cannot happen from inside a submit, so they are
+/// returned too.
+pub(crate) fn queue_ring_push_sqe<S: squeue::EntryMarker>(
+    r: &mut IoUring<S>,
+    sqe: &S,
+) -> Result<(), UblkError> {
+    loop {
+        if unsafe { r.submission().push(sqe) }.is_ok() {
+            return Ok(());
+        }
+        log::debug!("queue ring: SQ full, flush submission and retry");
+        match r.submit_and_wait(0) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => {
+                log::error!("queue ring: flushing full SQ failed: {}", e);
+                return Err(UblkError::IOError(e));
+            }
+        }
+    }
+}
+
+/// Negative errno for an error from queuing an SQE, for results that are
+/// reported as CQE-style `i32`s.
+fn submit_err_to_res(e: &UblkError) -> i32 {
+    match e {
+        UblkError::IOError(e) => -e.raw_os_error().unwrap_or(libc::EIO),
+        UblkError::OtherError(res) | UblkError::UringIOError(res) if *res < 0 => *res,
+        _ => -libc::EIO,
+    }
+}
+
 // Internal macro versions for backwards compatibility within the crate
 #[macro_export]
 macro_rules! with_queue_ring_internal {
@@ -1951,16 +1991,21 @@ impl UblkQueue<'_> {
             override_sqe!(&mut sqe, addr, auto_buf_addr);
         }
 
-        loop {
-            let res = unsafe { r.submission().push(&sqe) };
-
-            match res {
-                Ok(_) => break,
-                Err(_) => {
-                    log::debug!("__queue_io_cmd: flush submission and retry");
-                    r.submit_and_wait(0).unwrap();
-                }
-            }
+        // The ring cannot take this tag's command, so the queue cannot
+        // serve the tag any more: stop the queue (as submit_io_commit_cmd()
+        // does when it cannot submit) and report the errno instead of
+        // panicking the queue thread.
+        if let Err(e) = queue_ring_push_sqe(r, &sqe) {
+            log::error!(
+                "dev{}-q{}: tag {} cmd_op {:x} not queued: {}, stopping queue",
+                self.dev.dev_info.dev_id,
+                self.q_id,
+                tag,
+                cmd_op,
+                e
+            );
+            self.mark_stopping();
+            return submit_err_to_res(&e);
         }
         1
     }
@@ -2066,9 +2111,14 @@ impl UblkQueue<'_> {
     ) -> UblkUringOpFuture {
         let f = UblkUringOpFuture::new(0);
         let user_data = f.user_data | (tag as u64);
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        let queued = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
             self.__queue_io_cmd(r, tag, cmd_op, buf_addr as u64, None, user_data, result)
         });
+        // Not queued because the ring failed (the queue is now stopping):
+        // resolve to ABORT, which callers already treat as queue down.
+        if queued < 0 {
+            f.complete(sys::UBLK_IO_RES_ABORT);
+        }
 
         f
     }
@@ -2096,9 +2146,13 @@ impl UblkQueue<'_> {
 
         let f = UblkUringOpFuture::new(0);
         let user_data = f.user_data | (tag as u64);
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        let queued = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
             self.__queue_io_cmd(r, tag, cmd_op, 0, auto_buf_addr, user_data, result)
         });
+        // As in submit_io_cmd(): a ring failure resolves the future to ABORT.
+        if queued < 0 {
+            f.complete(sys::UBLK_IO_RES_ABORT);
+        }
 
         f
     }
@@ -2324,8 +2378,18 @@ impl UblkQueue<'_> {
         }
     }
 
+    /// Submit one target SQE on the queue ring; `.await` returns its CQE
+    /// result.  If the SQE cannot be queued (the ring failed), the future
+    /// resolves at once to the negative errno instead of panicking.
     pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-        crate::uring_async::__ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).unwrap()
+        match crate::uring_async::__ublk_submit_sqe_async(sqe, UblkUringData::Target as u64) {
+            Ok(f) => f,
+            Err(e) => {
+                let f = UblkUringOpFuture::new(0);
+                f.complete(submit_err_to_res(&e));
+                f
+            }
+        }
     }
 
     #[inline]
@@ -2371,18 +2435,13 @@ impl UblkQueue<'_> {
             .build()
             .user_data(user_data);
 
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            loop {
-                let res = unsafe { r.submission().push(&sqe) };
-                match res {
-                    Ok(_) => break,
-                    Err(_) => {
-                        log::debug!("submit_register_io_buf: flush and retry");
-                        r.submit_and_wait(0).unwrap();
-                    }
-                }
-            }
-        });
+        // A ring failure resolves the future to the negative errno, as a
+        // failed CQE would, instead of panicking the queue thread.
+        if let Err(e) = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+            queue_ring_push_sqe(r, &sqe)
+        }) {
+            f.complete(submit_err_to_res(&e));
+        }
 
         f
     }
@@ -3739,5 +3798,45 @@ mod tag_partition_tests {
         let owned: Vec<u32> = (0..64).filter(|&t| UblkQueue::chunk_owns(t, 4, 1, 4)).collect();
         assert_eq!(owned, vec![4, 5, 6, 7, 20, 21, 22, 23, 36, 37, 38, 39, 52, 53, 54, 55]);
         assert_eq!(UblkQueue::chunked_partition(64, 4, 1, 4), (4, 56, 16));
+    }
+}
+
+#[cfg(test)]
+mod sq_full_tests {
+    use super::{queue_ring_push_sqe, submit_err_to_res};
+    use crate::UblkError;
+    use io_uring::{opcode, IoUring};
+
+    /// More SQEs than the SQ holds: every push flushes the full SQ to the
+    /// kernel and retries, and every SQE completes.
+    #[test]
+    fn push_flushes_full_sq_and_retries() {
+        let mut ring: IoUring = IoUring::builder().setup_cqsize(16).build(2).unwrap();
+        for i in 0..6 {
+            let sqe = opcode::Nop::new().build().user_data(i);
+            queue_ring_push_sqe(&mut ring, &sqe).unwrap();
+        }
+        ring.submit().unwrap();
+        let mut done: Vec<u64> = ring.completion().map(|cqe| cqe.user_data()).collect();
+        done.sort();
+        assert_eq!(done, (0..6).collect::<Vec<u64>>());
+    }
+
+    /// A full SQ on a ring that io_uring_enter() rejects (a disabled ring
+    /// fails with EBADFD) returns the error; the old retry loop called
+    /// `submit_and_wait(0).unwrap()` and panicked the queue thread.
+    #[test]
+    fn push_on_failed_ring_returns_error() {
+        let mut ring: IoUring = IoUring::builder().setup_r_disabled().build(2).unwrap();
+        let sqe = opcode::Nop::new().build();
+        queue_ring_push_sqe(&mut ring, &sqe).unwrap();
+        queue_ring_push_sqe(&mut ring, &sqe).unwrap();
+
+        let err = queue_ring_push_sqe(&mut ring, &sqe).unwrap_err();
+        match &err {
+            UblkError::IOError(e) => assert_eq!(e.raw_os_error(), Some(libc::EBADFD)),
+            e => panic!("unexpected error {e}"),
+        }
+        assert_eq!(submit_err_to_res(&err), -libc::EBADFD);
     }
 }

@@ -1,5 +1,4 @@
 use crate::io::UblkQueue;
-use crate::with_queue_ring_internal;
 use crate::with_queue_ring_mut_internal;
 use crate::UblkError;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
@@ -21,6 +20,25 @@ std::thread_local! {
     static MY_SLAB: RefCell<Slab<FutureData>> = RefCell::new(Slab::new());
 }
 
+/// Where a future's slab key lives in its user_data:
+///
+/// ```text
+///   63       62         61 ........ 16   15 ...... 0
+///   Target   NonAsync   slab key         tag / caller data
+/// ```
+///
+/// The key field is 46 bits wide, starting above the 16-bit tag and ending
+/// below the two `UblkUringData` flag bits, so a key can never change the
+/// tag or turn an io command into target io.  2^46 live futures would need
+/// over a PiB of slab, so every key a process can hold fits (`new()` still
+/// checks).  The key used to be cut to 16 bits, so future 65,536 shared
+/// future 0's user_data and got its CQE; leaked futures (removed from the
+/// slab only on Ready) make that many keys reachable.
+const KEY_SHIFT: u32 = 16;
+const KEY_BITS: u32 = 46;
+const KEY_MAX: u64 = (1_u64 << KEY_BITS) - 1;
+const KEY_MASK: u64 = KEY_MAX << KEY_SHIFT;
+
 /// User code creates one future with user_data used for submitting
 /// uring OP, then future.await returns this uring OP's result.
 pub struct UblkUringOpFuture {
@@ -29,9 +47,20 @@ pub struct UblkUringOpFuture {
 
 impl UblkUringOpFuture {
     fn get_key(data: u64) -> usize {
-        ((data >> 16) & 0xffffffff) as usize
+        // A key that does not fit usize cannot be in the slab either:
+        // map it to usize::MAX, which no slab entry has.
+        usize::try_from((data & KEY_MASK) >> KEY_SHIFT).unwrap_or(usize::MAX)
     }
-    pub fn new(tgt_io: u64) -> Self {
+
+    /// Pack slab `key` above the tag bits of `tgt_io`, or None if it does
+    /// not fit the key field.  Bits of `tgt_io` inside the key field are
+    /// dropped, since OR-ing them in would corrupt the key.
+    fn key_to_user_data(key: usize, tgt_io: u64) -> Option<u64> {
+        let key = u64::try_from(key).ok().filter(|k| *k <= KEY_MAX)?;
+        Some((key << KEY_SHIFT) | (tgt_io & !KEY_MASK))
+    }
+
+    fn try_new(tgt_io: u64) -> Result<Self, UblkError> {
         MY_SLAB.with(|refcell| {
             let mut map = refcell.borrow_mut();
 
@@ -39,18 +68,61 @@ impl UblkUringOpFuture {
                 waker: None,
                 result: None,
             });
-            let user_data = ((key as u32) << 16) as u64 | tgt_io;
-            log::trace!("uring: new future data {:x}/{:x}", user_data, key);
-            UblkUringOpFuture { user_data }
+            match Self::key_to_user_data(key, tgt_io) {
+                Some(user_data) => {
+                    log::trace!("uring: new future data {:x}/{:x}", user_data, key);
+                    Ok(UblkUringOpFuture { user_data })
+                }
+                None => {
+                    map.remove(key);
+                    Err(UblkError::OtherError(-libc::EOVERFLOW))
+                }
+            }
         })
     }
 
+    /// Create a future whose user_data carries a unique slab key.  Bits of
+    /// `tgt_io` in the key field (16..=61) are dropped; `new_validate()`
+    /// rejects them instead.
+    pub fn new(tgt_io: u64) -> Self {
+        // Unreachable: the slab would need 2^46 live entries (see KEY_BITS),
+        // and its allocation aborts the process long before that.
+        Self::try_new(tgt_io).expect("uring future slab key overflow")
+    }
+
+    /// Like `new()`, but fails with `InvalidVal` if `data` has bits in the
+    /// key field (16..=61), and with `OtherError(-EOVERFLOW)` rather than
+    /// panicking if the slab ever outgrew the key field.
     pub fn new_validate(data: u64) -> Result<Self, UblkError> {
-        if Self::get_key(data) != 0 {
+        if data & KEY_MASK != 0 {
             return Err(UblkError::InvalidVal);
         }
 
-        Ok(Self::new(data))
+        Self::try_new(data)
+    }
+
+    /// Resolve this future to `res` without a CQE, for an op that failed
+    /// before reaching the kernel.  Only valid while no SQE carrying this
+    /// future's user_data is in flight.
+    pub(crate) fn complete(&self, res: i32) {
+        MY_SLAB.with(|refcell| {
+            if let Some(fd) = refcell.borrow_mut().get_mut(Self::get_key(self.user_data)) {
+                fd.result = Some(res);
+                if let Some(w) = &fd.waker {
+                    w.wake_by_ref();
+                }
+            }
+        })
+    }
+
+    /// Free the slab entry of a future whose SQE was never queued; no CQE
+    /// will ever come for it, and dropping it would leak the entry.
+    fn discard_unsubmitted(self) {
+        MY_SLAB.with(|refcell| {
+            refcell
+                .borrow_mut()
+                .try_remove(Self::get_key(self.user_data));
+        })
     }
 }
 
@@ -550,18 +622,15 @@ pub(crate) fn __ublk_submit_sqe_async(
     let f = UblkUringOpFuture::new_validate(user_data)?;
     let sqe = sqe.user_data(f.user_data);
 
-    loop {
-        let res = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| unsafe {
-            r.submission().push(&sqe)
-        });
-
-        let _ = match res {
-            Ok(_) => break,
-            Err(_) => {
-                log::debug!("ublk_submit_sqe: flush and retry");
-                with_queue_ring_internal!(|r: &IoUring<squeue::Entry>| r.submit_and_wait(0))
-            }
-        };
+    // Flush and retry while the SQ is full.  This used to ignore flush
+    // errors and spin forever on a failed ring; now the error is returned,
+    // and the never-queued future's slab entry is freed.
+    let res = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        crate::io::queue_ring_push_sqe(r, &sqe)
+    });
+    if let Err(e) = res {
+        f.discard_unsubmitted();
+        return Err(e);
     }
 
     Ok(f)
@@ -754,6 +823,114 @@ mod tests {
         }
 
         ublk_join_io_tasks(&exe, tasks)
+    }
+
+    /// More than 65,536 live futures (SCOPE L5/R9): every future's slab key
+    /// has to round-trip through its user_data, so no two live futures
+    /// share a user_data and a CQE wakes exactly the future that submitted
+    /// it.  The old packing cut the key to 16 bits, so future 65,536 got
+    /// future 0's user_data and its CQE completed future 0.
+    #[test]
+    fn test_future_keys_beyond_16_bits() {
+        // Own thread: MY_SLAB is thread-local, so keys start at 0 here.
+        std::thread::spawn(|| {
+            let target = crate::UblkUringData::Target as u64;
+            let high = 1_usize << 16;
+            let mut futs: Vec<UblkUringOpFuture> = (0..high + 2)
+                .map(|_| UblkUringOpFuture::new(target))
+                .collect();
+
+            let mut seen = std::collections::HashSet::new();
+            for (key, f) in futs.iter().enumerate() {
+                assert_eq!(UblkUringOpFuture::get_key(f.user_data), key);
+                assert!(
+                    seen.insert(f.user_data),
+                    "user_data {:x} reused",
+                    f.user_data
+                );
+                assert_ne!(f.user_data & target, 0);
+            }
+
+            // Complete future 65,536 through a real CQE carrying its user_data.
+            let mut ring = IoUring::new(4).unwrap();
+            let sqe = opcode::Nop::new().build().user_data(futs[high].user_data);
+            unsafe { ring.submission().push(&sqe).unwrap() };
+            ring.submit_and_wait(1).unwrap();
+            let cqe = ring.completion().next().unwrap();
+            ublk_wake_task(cqe.user_data(), &cqe);
+
+            // Poll future 0 first: with aliased keys it would take the CQE.
+            let poll = |f: &mut UblkUringOpFuture| smol::block_on(smol::future::poll_once(f));
+            assert_eq!(poll(&mut futs[0]), None);
+            assert_eq!(poll(&mut futs[high]), Some(0));
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The key field sits between the tag and the flag bits: the largest
+    /// key round-trips without touching either, one past it is refused,
+    /// and caller bits inside the field cannot corrupt the key.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_future_key_field_bounds() {
+        let flags = crate::UblkUringData::Target as u64 | crate::UblkUringData::NonAsync as u64;
+        let max = KEY_MAX as usize;
+
+        let ud = UblkUringOpFuture::key_to_user_data(max, flags | 0xffff).unwrap();
+        assert_eq!(UblkUringOpFuture::get_key(ud), max);
+        assert_eq!(ud & !KEY_MASK, flags | 0xffff);
+        assert_eq!(UblkUringOpFuture::key_to_user_data(max + 1, 0), None);
+
+        let ud = UblkUringOpFuture::key_to_user_data(5, KEY_MASK | 7).unwrap();
+        assert_eq!(UblkUringOpFuture::get_key(ud), 5);
+        assert_eq!(ud & 0xffff, 7);
+
+        assert!(UblkUringOpFuture::new_validate(1 << 61).is_err());
+        assert!(UblkUringOpFuture::new_validate(flags | 0xffff).is_ok());
+    }
+
+    /// An SQE that cannot be queued because the ring failed returns an
+    /// error and frees its future's slab entry (it used to spin forever),
+    /// and `complete()` resolves a future without a CQE.
+    #[test]
+    fn test_ublk_submit_sqe_async_failed_ring() {
+        // Own thread: its own queue ring and slab.
+        std::thread::spawn(|| {
+            // A disabled ring accepts SQEs but io_uring_enter() fails with
+            // EBADFD, so the flush of a full SQ fails.
+            crate::io::ublk_init_task_ring(|cell| {
+                let ring = IoUring::builder().setup_r_disabled().build(2)?;
+                let _ = cell.set(std::cell::RefCell::new(ring));
+                Ok(())
+            })
+            .unwrap();
+            let target = crate::UblkUringData::Target as u64;
+            let slab_len = || MY_SLAB.with(|s| s.borrow().len());
+
+            // Two SQEs fill the SQ without a flush.
+            let _queued: Vec<_> = (0..2)
+                .map(|_| __ublk_submit_sqe_async(opcode::Nop::new().build(), target).unwrap())
+                .collect();
+            assert_eq!(slab_len(), 2);
+
+            match __ublk_submit_sqe_async(opcode::Nop::new().build(), target) {
+                Err(UblkError::IOError(e)) => assert_eq!(e.raw_os_error(), Some(libc::EBADFD)),
+                Err(e) => panic!("unexpected error {e}"),
+                Ok(_) => panic!("SQE queued on a full, failed ring"),
+            }
+            assert_eq!(slab_len(), 2);
+
+            let mut f = UblkUringOpFuture::new(0);
+            f.complete(-libc::EBADFD);
+            assert_eq!(
+                smol::block_on(smol::future::poll_once(&mut f)),
+                Some(-libc::EBADFD)
+            );
+            assert_eq!(slab_len(), 2);
+        })
+        .join()
+        .unwrap();
     }
 
     /// Test ublk_submit_sqe_async error handling with invalid operation

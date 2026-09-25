@@ -2601,22 +2601,53 @@ impl UblkCtrl {
         }
     }
 
+    /// First sleep, largest sleep and total sleep budget of
+    /// `start_user_recover()` while the driver answers `-EBUSY`.
+    const RECOVER_RETRY_FIRST_MS: u64 = 1;
+    const RECOVER_RETRY_MAX_MS: u64 = 100;
+    const RECOVER_RETRY_BUDGET_MS: u64 = 30_000;
+
+    /// Send START_USER_RECOVERY once, without waiting
+    ///
+    /// Returns `Ok(0)` when the device entered recovery and `Ok(-EBUSY)`
+    /// when it cannot yet: the old server still has `/dev/ublkcN` open,
+    /// or the driver has not finished quiescing the device.  For callers
+    /// that poll with their own deadline instead of blocking in
+    /// [`UblkCtrl::start_user_recover`].
+    pub fn try_start_user_recover(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().__start_user_recover()
+    }
+
     /// Start user recover for this device
     ///
+    /// Retries while the driver answers `-EBUSY`, for up to 30 s of sleep
+    /// in total, and returns the last result (`Ok(-EBUSY)` if the device
+    /// never became recoverable).  The sleep starts at 1 ms and doubles up
+    /// to 100 ms: EBUSY normally clears within milliseconds of the old
+    /// server's exit, and a flat 100 ms sleep made every such recovery pay
+    /// at least 100 ms.
     pub fn start_user_recover(&self) -> Result<i32, UblkError> {
-        let mut count = 0u32;
-        let unit = 100_u32;
+        Self::retry_start_user_recover(|| self.try_start_user_recover(), std::thread::sleep)
+    }
+
+    /// The retry policy of `start_user_recover()`, with the attempt and
+    /// the sleep passed in so that it can be tested without a device.
+    fn retry_start_user_recover<T, S>(mut try_once: T, mut sleep: S) -> Result<i32, UblkError>
+    where
+        T: FnMut() -> Result<i32, UblkError>,
+        S: FnMut(std::time::Duration),
+    {
+        let mut slept_ms = 0;
+        let mut delay_ms = Self::RECOVER_RETRY_FIRST_MS;
 
         loop {
-            let res = self.get_inner_mut().__start_user_recover();
-            if let Ok(r) = res {
-                if r == -libc::EBUSY {
-                    std::thread::sleep(std::time::Duration::from_millis(unit as u64));
-                    count += unit;
-                    if count < 30000 {
-                        continue;
-                    }
-                }
+            let res = try_once();
+            if matches!(res, Ok(r) if r == -libc::EBUSY) && slept_ms < Self::RECOVER_RETRY_BUDGET_MS
+            {
+                sleep(std::time::Duration::from_millis(delay_ms));
+                slept_ms += delay_ms;
+                delay_ms = (delay_ms * 2).min(Self::RECOVER_RETRY_MAX_MS);
+                continue;
             }
             return res;
         }
@@ -3017,6 +3048,71 @@ mod tests {
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
+
+    /// START_USER_RECOVERY answered -EBUSY twice, then 0: recovery starts
+    /// after 3 ms of sleep instead of the old 200 ms (100 ms per EBUSY).
+    #[test]
+    fn test_start_user_recover_short_ebusy() {
+        use std::time::Duration;
+
+        let mut answers = vec![Ok(0), Ok(-libc::EBUSY), Ok(-libc::EBUSY)];
+        let mut sleeps = Vec::new();
+        let res = UblkCtrl::retry_start_user_recover(|| answers.pop().unwrap(), |d| sleeps.push(d));
+
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(sleeps, [Duration::from_millis(1), Duration::from_millis(2)]);
+    }
+
+    /// A device that stays busy: sleeps double up to 100 ms, and the retry
+    /// gives up with `Ok(-EBUSY)` after the old 30 s sleep budget.
+    #[test]
+    fn test_start_user_recover_ebusy_budget() {
+        use std::time::Duration;
+
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let res = UblkCtrl::retry_start_user_recover(
+            || {
+                attempts += 1;
+                Ok(-libc::EBUSY)
+            },
+            |d| sleeps.push(d),
+        );
+
+        assert_eq!(res.unwrap(), -libc::EBUSY);
+        assert_eq!(attempts, sleeps.len() + 1);
+        assert_eq!(
+            sleeps[..8],
+            [1, 2, 4, 8, 16, 32, 64, 100].map(Duration::from_millis)
+        );
+        assert!(sleeps.iter().all(|d| *d <= Duration::from_millis(100)));
+        let total: Duration = sleeps.iter().sum();
+        assert!(total >= Duration::from_secs(30) && total < Duration::from_millis(30_100));
+    }
+
+    /// Success and errors other than EBUSY return at once, without sleeping.
+    #[test]
+    fn test_start_user_recover_no_retry() {
+        for answer in [0, -libc::EINVAL] {
+            let mut sleeps = 0;
+            let res = UblkCtrl::retry_start_user_recover(
+                || {
+                    if answer == 0 {
+                        Ok(0)
+                    } else {
+                        Err(UblkError::UringIOError(answer))
+                    }
+                },
+                |_| sleeps += 1,
+            );
+            match res {
+                Ok(r) => assert_eq!(r, answer),
+                Err(UblkError::UringIOError(r)) => assert_eq!(r, answer),
+                Err(e) => panic!("unexpected error {e}"),
+            }
+            assert_eq!(sleeps, 0);
+        }
+    }
 
     #[test]
     fn test_init_queue_thread_io_flusher() {
