@@ -51,6 +51,9 @@ static ASYNC_RX_MIN: std::sync::LazyLock<usize> =
 static DIRECT_SEND: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_DIRECT_SEND").map_or(true, |v| v != "0"));
 
+pub static SEND_ZC: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_SEND_ZC").is_ok_and(|v| v != "0"));
+
 static LINK_HDR: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LINK_HDR").map_or(true, |v| v != "0"));
 
@@ -245,6 +248,8 @@ pub struct Stats {
     pub wv_n: AtomicU64,
     /// Next-PDU header receives linked behind a payload receive.
     pub linked_hdr: AtomicU64,
+    /// SEND_ZC buffer-release notifications seen.
+    pub zc_notif: AtomicU64,
     /// Zero-copy payload receive: header parsed -> payload in (ns, count).
     pub zc_rx_ns: AtomicU64,
     pub zc_rx_n: AtomicU64,
@@ -812,7 +817,7 @@ impl QEngine {
             for m in &batch {
                 iov.push(libc::iovec { iov_base: m.head.as_ptr() as *mut _, iov_len: m.head.len() });
                 if let Some((idx, off)) = m.fixed {
-                    if !self.write_iov(&c, &mut iov).await || !self.write_fixed(&c, idx, off, m.len).await {
+                    if !self.write_iov_more(&c, &mut iov, true).await || !self.write_fixed(&c, idx, off, m.len).await {
                         return;
                     }
                     iov.clear();
@@ -856,6 +861,12 @@ impl QEngine {
     /// Write all of `iov` (headers and copied payloads). False: the
     /// connection is gone and has been failed.
     async fn write_iov(&self, c: &Rc<QConn>, iov: &mut [libc::iovec]) -> bool {
+        self.write_iov_more(c, iov, false).await
+    }
+
+    /// `more`: the payload follows at once (MSG_MORE on a direct send, so
+    /// TCP can put the header and the start of the payload in one segment).
+    async fn write_iov_more(&self, c: &Rc<QConn>, iov: &mut [libc::iovec], more: bool) -> bool {
         let mut idx = 0usize;
         let mut direct = *DIRECT_SEND;
         while idx < iov.len() {
@@ -871,7 +882,7 @@ impl QEngine {
                 let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
                 msg.msg_iov = iov[idx..].as_mut_ptr();
                 msg.msg_iovlen = n.min(1024) as _;
-                let r = unsafe { libc::sendmsg(c.fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+                let r = unsafe { libc::sendmsg(c.fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL | if more { libc::MSG_MORE } else { 0 }) };
                 if r >= 0 {
                     r as i32
                 } else {
@@ -922,9 +933,24 @@ impl QEngine {
     async fn write_fixed(&self, c: &Rc<QConn>, idx: u16, off: usize, len: usize) -> bool {
         let mut done = 0usize;
         while done < len {
-            let sqe = io_uring::opcode::WriteFixed::new(io_uring::types::Fd(c.fd), (off + done) as *const u8, (len - done) as u32, idx)
-                .offset(u64::MAX)
-                .build();
+            // NVMEUBLK_SEND_ZC (tuning): send the payload with SEND_ZC from
+            // the request's registered pages (the NIC reads them; no copy
+            // into socket buffers). Its completion comes first; a second
+            // NOTIF completion follows when the network stack releases the
+            // pages, which the event loop swallows. Page lifetime past that
+            // point is the kernel's: the registration holds a reference to
+            // the ublk request until the last user drops it. WRITE_FIXED
+            // (default) copies the payload into the socket.
+            let sqe = if *SEND_ZC {
+                io_uring::opcode::SendZc::new(io_uring::types::Fd(c.fd), (off + done) as *const u8, (len - done) as u32)
+                    .buf_index(Some(idx))
+                    .flags(libc::MSG_NOSIGNAL)
+                    .build()
+            } else {
+                io_uring::opcode::WriteFixed::new(io_uring::types::Fd(c.fd), (off + done) as *const u8, (len - done) as u32, idx)
+                    .offset(u64::MAX)
+                    .build()
+            };
             let r = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
             if c.dead.get() {
                 return false;

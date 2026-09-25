@@ -280,6 +280,7 @@ fn queue_fn(
     // queue. Two local executors, ticked together from the same event loop.
     let net_exe: Rc<smol::LocalExecutor<'static>> = Rc::new(smol::LocalExecutor::new());
     let st2 = stats.clone();
+    let st3 = stats.clone();
     let mut cfg = cfg;
     let user_copy = dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64 != 0;
     cfg.cdev_fd = if user_copy { dev.tgt.fds[0] } else { -1 };
@@ -288,7 +289,10 @@ fn queue_fn(
     if zc {
         cfg.rx_offload = 0; // payload goes to the request pages on this ring
     }
-    let engine = qengine::QEngine::new(qid, ctrls, cfg, net_exe.clone(), stats, stop, draining);
+    // One engine (connections, target I/O queue ids) per io thread: with
+    // several threads per ublk queue each serves its own tag partition.
+    let eid = qid * dev.io_threads_per_queue() + libublk::io::io_thread_idx();
+    let engine = qengine::QEngine::new(eid, ctrls, cfg, net_exe.clone(), stats, stop, draining);
     engine.start();
     let spin_engine = engine.clone();
     let exe_rc = Rc::new(smol::LocalExecutor::new());
@@ -340,6 +344,13 @@ fn queue_fn(
             let mut events = 0u32;
             let aborted = match libublk::uring_async::ublk_reap_io_events_with_update_queue(&q_rc, poll_timeout, None, |cqe| {
                 events += 1;
+                // A SEND_ZC buffer-release notification carries the send's
+                // user_data, whose future already completed on the first
+                // CQE; libublk recycles future keys, so it must not be woken.
+                if io_uring::cqueue::notif(cqe.flags()) {
+                    st3.zc_notif.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 libublk::uring_async::ublk_wake_task(cqe.user_data(), cqe)
             }) {
                 Ok(a) => a,
@@ -419,6 +430,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         napi_us: env_u64("NVMEUBLK_NAPI_US", 0) as u32,
         conns_per_path: env_u64("NVMEUBLK_CONNS_PER_PATH", 1) as usize,
         rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024) as usize,
+        threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", 1) as u16,
+        seq_tags: env_u64("NVMEUBLK_SEQ_TAGS", 0) != 0,
         io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),
         no_path_timeout_ms: env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000),
         write_fence_ms: std::env::var("NVMEUBLK_WRITE_FENCE_MS").ok().and_then(|v| v.parse().ok()),
@@ -457,8 +470,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         let (wv, wvn) = (g(&st.wv_ns), g(&st.wv_n).max(1));
         let (zr, zrn) = (g(&st.zc_rx_ns), g(&st.zc_rx_n).max(1));
         let lat = format!(
-            "zc_MiB={} zc_tx_MiB={} linked_hdr={} io={} wire_avg={}us total_avg={}us | queued->wired={}us (pickup {}us, writev {}us x{}) wired->1stdata={}us 1stdata->done={}us (zc payload rx {}us) | loops/s={} run_ops_avg={}us",
-            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, g(&st.linked_hdr), n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, qs / qn / 1000, wv / wvn / 1000, wvn / 5, wd / rn / 1000, dc / rn / 1000, zr / zrn / 1000, lp / 5, ln / lp / 1000
+            "zc_MiB={} zc_tx_MiB={} linked_hdr={} zc_notif={} io={} wire_avg={}us total_avg={}us | queued->wired={}us (pickup {}us, writev {}us x{}) wired->1stdata={}us 1stdata->done={}us (zc payload rx {}us) | loops/s={} run_ops_avg={}us",
+            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, g(&st.linked_hdr), g(&st.zc_notif), n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, qs / qn / 1000, wv / wvn / 1000, wvn / 5, wd / rn / 1000, dc / rn / 1000, zr / zrn / 1000, lp / 5, ln / lp / 1000
         );
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();

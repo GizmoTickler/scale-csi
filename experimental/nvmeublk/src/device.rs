@@ -30,6 +30,9 @@ fn d_no_path() -> u64 {
 fn d_one() -> usize {
     1
 }
+fn d_threads() -> u16 {
+    1
+}
 fn d_rx_chunk() -> usize {
     32 * 1024
 }
@@ -72,6 +75,15 @@ pub struct DeviceSpec {
     /// zero copy. Smaller = less copying, more receives (tuning; default 32 KiB).
     #[serde(default = "d_rx_chunk")]
     pub rx_chunk: usize,
+    /// ublk I/O threads per queue (UBLK_F_PER_IO_DAEMON; tuning, default 1).
+    /// Each thread serves its own partition of the queue's tags with its own
+    /// engine and connections.
+    #[serde(default = "d_threads")]
+    pub threads_per_queue: u16,
+    /// Contiguous tag partitions instead of interleaved ones (tuning): blk-mq
+    /// hands a submitter sequential tags, so one stream stays on one thread.
+    #[serde(default)]
+    pub seq_tags: bool,
 }
 
 /// A device being served by a thread of this process.
@@ -207,19 +219,30 @@ fn serve(
     ready: &mpsc::Sender<Result<i32>>,
 ) -> Result<()> {
     let (queues, depth) = (spec.queues.max(1), spec.depth.max(2));
-    let io_buf = (512 * 1024usize).min(info.mdts_bytes) as u32;
+    // Largest request the device takes. Zero copy moves data straight
+    // between the socket and the request pages, so a larger cap costs no
+    // buffer memory there (tag buffers are in-capsule sized) and keeps a 1M
+    // request as one NVMe command; the copying mode allocates io_buf per tag.
+    // NVMEUBLK_MAX_IO_KB (tuning): zero-copy default 1024, copying 512.
+    let max_io = if spec.zero_copy { std::env::var("NVMEUBLK_MAX_IO_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) } else { 512 };
+    let io_buf = (max_io.clamp(4, 32 * 1024) * 1024).min(info.mdts_bytes) as u32;
     let size = info.nsze << info.lba_shift;
     let lba_shift = info.lba_shift as u8;
     let flags = (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64
         | if spec.zero_copy { (libublk::sys::UBLK_F_USER_COPY | libublk::sys::UBLK_F_AUTO_BUF_REG) as u64 } else { 0 };
-    let builder = UblkCtrlBuilder::default().name("nvmeublk").nr_queues(queues).depth(depth).io_buf_bytes(io_buf).ctrl_flags(flags);
+    let threads = spec.threads_per_queue.clamp(1, depth);
+    // Several threads per queue need UBLK_F_PER_IO_DAEMON, which the driver
+    // advertises by itself (6.16+) and libublk checks after the device is
+    // added; it is not a flag the server may request.
+    let tag_flags = if threads > 1 && spec.seq_tags { UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION } else { UblkFlags::empty() };
+    let builder = UblkCtrlBuilder::default().name("nvmeublk").nr_queues(queues).depth(depth).io_buf_bytes(io_buf).ctrl_flags(flags).io_threads_per_queue(threads);
     let builder = match recover {
         Some((id, _)) => {
             libublk::ctrl::UblkCtrl::new_simple(id)?.start_user_recover().context("start user recovery")?;
             log::info!("{}: recovering ublk device {id}{}", spec.volume, if hold { " (writes held for one fence)" } else { " (clean handover)" });
-            builder.id(id).dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
+            builder.id(id).dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV | tag_flags)
         }
-        None => builder.dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV),
+        None => builder.dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | tag_flags),
     };
     let ctrl = builder.build().context("create ublk device (is ublk_drv loaded?)")?;
     let dev_id = ctrl.dev_info().dev_id as i32;
@@ -243,12 +266,14 @@ fn serve(
         quiesce,
     };
     log::info!(
-        "{}: {} blocks of {} B, {} queues x {}, zero_copy={} napi_us={} write fence {} ms",
+        "{}: {} blocks of {} B, {} queues x {} ({} threads/queue{}), zero_copy={} napi_us={} write fence {} ms",
         spec.volume,
         info.nsze,
         1u64 << info.lba_shift,
         queues,
         depth,
+        threads,
+        if spec.seq_tags { ", contiguous tags" } else { "" },
         spec.zero_copy,
         spec.napi_us,
         write_fence.as_millis()
