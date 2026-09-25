@@ -4,8 +4,29 @@
 //! queue thread: submit, network and completion are all one executor, so
 //! there is no sender/receiver thread hop and no cross-thread wakeup.
 //!
-//! Blocking work that cannot be an SQE (TCP connect + NVMe Connect handshake
-//! on reconnect) runs on a helper thread; only the finished socket comes back.
+//! Connecting an I/O queue (socket, TCP connect, ICReq and NVMe Connect) is
+//! SQEs on the same ring too, driven by a task of the engine: no thread is
+//! spawned for it, however many queues reconnect at once. Each step is
+//! bounded by a linked timeout (LINK_TIMEOUT): 3 s for the TCP connect, 10 s
+//! for each handshake exchange, as the blocking dial had them.
+//!
+//! Lifetime: the engine's own tasks keep it alive (each holds an
+//! `Rc<Engine>`, and the engine holds their executor). The queue thread holds
+//! a `QEngine` handle instead; dropping the last handle shuts the engine down
+//! (closes its connections, lets its tasks end on the ring) so that it, its
+//! sockets and its buffers are freed with the queue.
+//!
+//! Panics: a panic in an engine task, or in the engine code a tag task runs
+//! through `QEngine::submit`, fails the engine loudly (see `spawn_task`)
+//! instead of disappearing silently. Unwinding still drops what the
+//! panicking frame held, so three things are built to survive that:
+//! - A request (`Pending`) dropped unfinished goes back to its engine, which
+//!   fails it as a failed path would (reads at once, writes and flushes once
+//!   the write fence has passed): no ublk tag waits forever.
+//! - A connect's socket is owned by the engine's slot, not by the task, so
+//!   no fd number is shut down after its owner closed it.
+//! - A buffer an SQE may write into while its task runs other code is a
+//!   `LeakOnUnwind`: leaked, never freed under the SQE.
 //!
 //! Failover rules:
 //! - Reads move to another path at once: a late reply on the dead path can
@@ -19,19 +40,23 @@
 //! - Any data-path failure tears down the path's whole controller, on every
 //!   queue, rather than one I/O socket (as the kernel resets a controller).
 
-use crate::conn::connect_io_queue;
+use crate::conn::{check_io_connect_resp, icreq_pdu, icresp_maxh2c, io_connect_capsule, tune_socket};
 use crate::ctrls::Ctrls;
 use crate::pdu::*;
+use anyhow::{anyhow, bail, Context as _};
 use libublk::uring_async::ublk_submit_sqe_async;
 use libublk::UblkUringData;
 use smol::channel::{Receiver, Sender};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::net::{Shutdown, TcpStream};
-use std::os::fd::AsRawFd;
-use std::rc::Rc;
+use std::future::Future;
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::pin::Pin;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub const NSID: u32 = 1;
@@ -279,6 +304,8 @@ pub struct Stats {
     pub rd_n: AtomicU64,
     pub loops: AtomicU64,
     pub loop_ns: AtomicU64,
+    /// Engine tasks that panicked; the first one fails its engine.
+    pub engine_panics: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -320,13 +347,20 @@ pub struct QConfig {
 
 /// One block request as seen by the engine. `buf` is the tag's IoBuf, owned
 /// by the tag task until `done` delivers the result.
+///
+/// Every Pending ends in exactly one result on `done`. `finish` sends it;
+/// one dropped without it (a panic unwinding the frame that held it, or a
+/// bug) is handed back to its engine by `Drop`, so the tag never hangs.
 pub struct Pending {
     pub op: Op,
     pub slba: u64,
     pub nlb: u32,
     pub buf: *mut u8,
     pub len: usize,
-    pub done: Sender<i32>,
+    /// Taken by `finish`; still set when a Pending is dropped unfinished.
+    done: Option<Sender<i32>>,
+    /// The engine it was submitted to (set by `QEngine::submit`).
+    owner: Weak<Engine>,
     pub first: Instant,
     /// When the current attempt went on the wire. The stall watchdog keys on
     /// this, not `first`: a request failed over from a stalled path is
@@ -360,13 +394,90 @@ pub struct Pending {
 impl Pending {
     pub fn new(op: Op, slba: u64, nlb: u32, buf: *mut u8, len: usize, done: Sender<i32>, ucopy: Option<u64>, zc_index: Option<u16>) -> Self {
         let now = Instant::now();
-        Pending { op, slba, nlb, buf, len, done, first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, tx_cov: 0, deferred_sc: None, avoid_path: None, wired: None, first_data: None, ucopy, zc_index }
+        Pending { op, slba, nlb, buf, len, done: Some(done), owner: Weak::new(), first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, tx_cov: 0, deferred_sc: None, avoid_path: None, wired: None, first_data: None, ucopy, zc_index }
     }
-    fn finish(self, res: i32) {
-        let _ = self.done.try_send(res);
+    fn finish(mut self, res: i32) {
+        if let Some(done) = self.done.take() {
+            let _ = done.try_send(res);
+        }
     }
     fn ok_res(&self) -> i32 {
         if self.op == Op::Flush { 0 } else { self.len as i32 }
+    }
+}
+
+impl Drop for Pending {
+    /// Dropped unfinished: a panic unwound the frame that held it (a local
+    /// in `complete`, a failover loop, ...), which catch_unwind cannot stop.
+    /// Its tag waits on `done` (the tag task keeps a sender of its own, so
+    /// the channel never closes), so hand it back to its engine; the engine
+    /// fails it over (`recover_dropped`) once the unwind is over. A write may
+    /// still be on the wire, which is why it is not failed here and now.
+    /// Runs during an unwind: it only moves the request, never panics.
+    fn drop(&mut self) {
+        let Some(done) = self.done.take() else { return };
+        // Every other field is Copy: the request, moved out whole.
+        let p = Pending { done: Some(done), owner: Weak::new(), ..*self };
+        let p = match self.owner.upgrade() {
+            Some(e) => match e.dropped.try_borrow_mut() {
+                Ok(mut d) => {
+                    d.push(p);
+                    return;
+                }
+                Err(_) => p,
+            },
+            None => p,
+        };
+        // Its engine is gone (freed, or it was never submitted): nothing
+        // can send it any more, and nobody else will answer it.
+        p.finish(-libc::EIO);
+    }
+}
+
+/// A value an SQE may write into while its task runs other code (e.g. a
+/// receive linked behind the one the task awaited). A panic unwinds the
+/// task's frame, and unwinding drops every local in it: `Guarded`'s
+/// catch_unwind cannot stop that. This leaks the value then, rather than
+/// free memory the kernel may still write to; it is dropped normally
+/// otherwise.
+struct LeakOnUnwind<T>(std::mem::ManuallyDrop<T>);
+
+impl<T> LeakOnUnwind<T> {
+    fn new(v: T) -> Self {
+        LeakOnUnwind(std::mem::ManuallyDrop::new(v))
+    }
+}
+
+impl<T> std::ops::Deref for LeakOnUnwind<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for LeakOnUnwind<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T> Drop for LeakOnUnwind<T> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            // SAFETY: dropped once, here; never used again.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
+        }
+    }
+}
+
+/// Test hook: panic at `_at` once, if a test on this thread armed it.
+/// Compiles to nothing outside tests.
+#[inline(always)]
+fn panic_point(_at: &'static str) {
+    #[cfg(test)]
+    if tests::PANIC_AT.with(|p| p.get() == Some(_at)) {
+        tests::PANIC_AT.with(|p| p.set(None));
+        panic!("injected panic at {_at}");
     }
 }
 
@@ -446,26 +557,133 @@ enum Cause {
     /// No I/O for NVMEUBLK_IDLE_DISCONNECT_S: dropped to free the socket and
     /// the target's queue; reconnected on the next request.
     Idle,
+    /// The queue dropped its engine (the device is going away): closed
+    /// quietly, as Retired otherwise.
+    Closing,
 }
 
-type ConnectResult = (usize, u64, anyhow::Result<(TcpStream, u32)>);
+/// Time limits of an I/O-queue connect, as the blocking dial had them: the
+/// TCP connect, then each handshake exchange (ICReq/ICResp, Connect). Each
+/// SQE of a step carries a linked timeout for what is left of its step.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a shut-down engine drives its tasks to their end before it
+/// gives up and leaks itself instead (see `Engine::shutdown`).
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// An I/O-queue connect in flight on the queue's ring, for one slot.
+#[derive(Default)]
+struct Dialing {
+    /// Its socket, once created. The slot owns it, not the connect task: it
+    /// is closed only when the slot is cleared (`connected`, or the task's
+    /// panic), so `abort_dials`, which shuts it down to end the connect's
+    /// pending SQE, can never hit an fd number that was closed and reused
+    /// by another socket (another volume's connection).
+    sock: Option<TcpStream>,
+}
+
+/// What an engine task does: names it in logs, and tells a panic what the
+/// dead task leaves behind.
+enum TaskKind {
+    Timer,
+    /// Its socket is in the slot, which nothing else would clear.
+    Connect(usize),
+    Sender(usize),
+    /// A dead receiver can no longer release the request it holds.
+    Receiver(Rc<QConn>),
+    /// Not a task: engine code a tag task ran (`QEngine::submit`).
+    Submit,
+    /// Releases the write fence after the timer panicked twice.
+    Reaper,
+}
+
+impl std::fmt::Display for TaskKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskKind::Timer => write!(f, "timer"),
+            TaskKind::Connect(slot) => write!(f, "connect (slot {slot})"),
+            TaskKind::Sender(slot) => write!(f, "sender (slot {slot})"),
+            TaskKind::Receiver(c) => write!(f, "receiver (slot {})", c.slot),
+            TaskKind::Submit => write!(f, "submit (tag task)"),
+            TaskKind::Reaper => write!(f, "fence reaper"),
+        }
+    }
+}
+
+/// The queue thread's handle on its engine. The engine's tasks each hold an
+/// `Rc<Engine>` and the engine holds their executor: a cycle that alone
+/// would keep a detached device's engine, sockets and (mlocked) buffers
+/// alive for good. Dropping the last handle breaks it (`Engine::shutdown`).
+/// Drop it on the queue thread, after the queue's event loop has ended.
 pub struct QEngine {
+    core: Rc<Engine>,
+}
+
+impl QEngine {
+    pub fn new(
+        qid: u16,
+        ctrls: Arc<Ctrls>,
+        cfg: QConfig,
+        exe: Rc<smol::LocalExecutor<'static>>,
+        stats: Arc<Stats>,
+        stop: Arc<AtomicBool>,
+        draining: Arc<AtomicBool>,
+    ) -> Rc<Self> {
+        Rc::new(QEngine { core: Engine::new(qid, ctrls, cfg, exe, stats, stop, draining) })
+    }
+
+    /// Start the timer task. Connections come up on its first tick.
+    pub fn start(&self) {
+        self.core.start();
+    }
+
+    /// Largest write sent inside the command capsule.
+    pub fn incapsule(&self) -> usize {
+        self.core.incapsule
+    }
+
+    /// Commands outstanding on this queue's connections.
+    pub fn inflight_here(&self) -> usize {
+        self.core.inflight_here()
+    }
+
+    /// Entry point for new block requests from ublk. Runs engine code on the
+    /// tag task, outside the engine's executor: a panic there used to kill
+    /// the tag task in silence (its smol Task is never awaited) and hang the
+    /// request. It is caught here and fails the engine as a task panic does;
+    /// the request, dropped by the unwind, comes back through its Drop.
+    pub fn submit(&self, mut p: Pending) {
+        p.owner = Rc::downgrade(&self.core);
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.core.submit(p))) {
+            self.core.task_panicked(Some(TaskKind::Submit), &panic_message(payload.as_ref()));
+        }
+    }
+}
+
+impl Drop for QEngine {
+    fn drop(&mut self) {
+        self.core.shutdown();
+    }
+}
+
+struct Engine {
     qid: u16,
     ctrls: Arc<Ctrls>,
     cfg: QConfig,
     incapsule: usize,
     conns: RefCell<Vec<Option<Rc<QConn>>>>,
-    connecting: RefCell<Vec<bool>>,
+    /// Connects in flight, per slot.
+    connecting: RefCell<Vec<Option<Dialing>>>,
     next_try: RefCell<Vec<Instant>>,
     backoff: RefCell<Vec<Duration>>,
     parked: RefCell<VecDeque<Pending>>,
     /// Writes/flushes waiting out the write fence: (release time, request).
     fenced: RefCell<Vec<(Instant, Pending)>>,
     exe: Rc<smol::LocalExecutor<'static>>,
-    results_tx: mpsc::Sender<ConnectResult>,
-    results_rx: mpsc::Receiver<ConnectResult>,
-    wake_efd: i32,
+    /// timerfd the timer task sleeps on, so `wake` can end its sleep early
+    /// (-1 if none could be made: it then sleeps on a ring timeout).
+    tick_fd: i32,
     pub stats: Arc<Stats>,
     stop: Arc<AtomicBool>,
     /// Set by the shutdown handler: parked and fenced I/O fails with EIO so
@@ -479,14 +697,33 @@ pub struct QEngine {
     /// The I/O connections were dropped for idleness (not failure): the next
     /// request reconnects at once instead of waiting for the timer.
     idle_dropped: Cell<bool>,
+    /// Engine tasks spawned and not yet ended (see `spawn_task`).
+    tasks: Cell<usize>,
+    /// The queue dropped its handle: no new connections; tasks wind down.
+    closing: Cell<bool>,
+    /// An engine task panicked: every request now fails with EIO.
+    failed: Cell<bool>,
+    /// Requests dropped unfinished (`impl Drop for Pending`), waiting for
+    /// `recover_dropped`.
+    dropped: RefCell<Vec<Pending>>,
+    /// Connect step limits: (TCP connect, each handshake exchange).
+    dial_limits: Cell<(Duration, Duration)>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
     r.unwrap_or(-libc::EIO)
 }
 
-impl QEngine {
-    pub fn new(
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if self.tick_fd >= 0 {
+            unsafe { libc::close(self.tick_fd) };
+        }
+    }
+}
+
+impl Engine {
+    fn new(
         qid: u16,
         ctrls: Arc<Ctrls>,
         cfg: QConfig,
@@ -496,23 +733,20 @@ impl QEngine {
         draining: Arc<AtomicBool>,
     ) -> Rc<Self> {
         let n = ctrls.paths.len() * cfg.conns_per_path.max(1);
-        let (results_tx, results_rx) = mpsc::channel();
-        let wake_efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        Rc::new(QEngine {
+        let tick_fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) };
+        Rc::new(Engine {
             qid,
             incapsule: ctrls.info.incapsule_bytes,
             ctrls,
             cfg,
             conns: RefCell::new(vec![None; n]),
-            connecting: RefCell::new(vec![false; n]),
+            connecting: RefCell::new((0..n).map(|_| None).collect()),
             next_try: RefCell::new(vec![Instant::now(); n]),
             backoff: RefCell::new(vec![Duration::from_millis(250); n]),
             parked: RefCell::new(VecDeque::new()),
             fenced: RefCell::new(Vec::new()),
             exe,
-            results_tx,
-            results_rx,
-            wake_efd,
+            tick_fd,
             stats,
             stop,
             draining,
@@ -520,21 +754,17 @@ impl QEngine {
             submitted: Cell::new(0),
             last_active: Cell::new(Instant::now()),
             idle_dropped: Cell::new(false),
+            tasks: Cell::new(0),
+            closing: Cell::new(false),
+            failed: Cell::new(false),
+            dropped: RefCell::new(Vec::new()),
+            dial_limits: Cell::new((CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT)),
         })
     }
 
-    /// Start the timer and reconnect-result tasks. Connections come up on
-    /// the first timer tick.
-    pub fn start(self: &Rc<Self>) {
+    fn start(self: &Rc<Self>) {
         let me = self.clone();
-        self.exe.spawn(async move { me.timer_task().await }).detach();
-        let me = self.clone();
-        self.exe.spawn(async move { me.results_task().await }).detach();
-    }
-
-    /// Largest write sent inside the command capsule.
-    pub fn incapsule(&self) -> usize {
-        self.incapsule
+        self.spawn_task(TaskKind::Timer, async move { me.timer_task().await });
     }
 
     fn live(&self) -> Vec<Rc<QConn>> {
@@ -553,16 +783,20 @@ impl QEngine {
         }
     }
 
-    /// Commands outstanding on this queue's connections.
-    pub fn inflight_here(&self) -> usize {
+    fn inflight_here(&self) -> usize {
         self.conns.borrow().iter().flatten().map(|c| c.inflight.borrow().len()).sum()
     }
 
-    /// Entry point for new block requests from ublk.
-    pub fn submit(&self, p: Pending) {
+    fn submit(self: &Rc<Self>, p: Pending) {
+        if self.failed.get() {
+            // Never sent, so nothing can still land on the target: fail now.
+            p.finish(-libc::EIO);
+            return;
+        }
         self.submitted.set(self.submitted.get() + 1);
         self.last_active.set(Instant::now());
         self.set_napi(true);
+        panic_point("submit");
         // Idle-disconnected: bring the connections back now rather than on
         // the next (idle, 1 s) timer tick; the request parks until one is up.
         // Only after an idle drop: after a failure the timer's backoff and
@@ -588,6 +822,12 @@ impl QEngine {
     /// Send to the live connection with the fewest outstanding commands;
     /// park if none has a free slot.
     fn dispatch(&self, mut p: Pending) {
+        if self.failed.get() {
+            // A failed engine sends nothing more. Retries end here: a read
+            // failed over, or a write or flush once its fence has passed.
+            p.finish(-libc::EIO);
+            return;
+        }
         if self.cfg.quiesce.load(Ordering::Acquire) {
             self.parked.borrow_mut().push_back(p);
             return;
@@ -635,14 +875,29 @@ impl QEngine {
         p.deferred_sc = None;
         p.wired = None;
         p.first_data = None;
-        c.inflight.borrow_mut().insert(cid, p);
+        self.track(c, cid, p);
         if c.tx.try_send(OutMsg { head, data, len, cid, h2c: false, queued: Instant::now(), fixed }).is_err() {
-            let p = c.inflight.borrow_mut().remove(&cid).expect("just inserted");
+            let p = self.untrack(c, cid).expect("just inserted");
             self.free_cid(c, cid);
             return Err(p);
         }
-        self.stats.inflight.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Put `p` in `c`'s in-flight table. `stats.inflight` moves with the
+    /// table itself (here, `untrack` and `fail_conn`), so a panic between
+    /// the two cannot leave it off for good (it gates the daemon's drain).
+    fn track(&self, c: &QConn, cid: u16, p: Pending) {
+        c.inflight.borrow_mut().insert(cid, p);
+        self.stats.inflight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn untrack(&self, c: &QConn, cid: u16) -> Option<Pending> {
+        let p = c.inflight.borrow_mut().remove(&cid);
+        if p.is_some() {
+            self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
+        p
     }
 
     /// Put `len` received bytes at `off` of request `p`: into the ublk
@@ -691,7 +946,7 @@ impl QEngine {
 
     /// Move a request off a path that failed it.
     fn failover(&self, p: Pending) {
-        if self.stop.load(Ordering::Acquire) || self.draining.load(Ordering::Acquire) {
+        if self.stop.load(Ordering::Acquire) || self.draining.load(Ordering::Acquire) || self.closing.get() {
             p.finish(-libc::EIO);
         } else if p.op == Op::Read {
             self.resubmit(p);
@@ -716,6 +971,18 @@ impl QEngine {
         // Shut the socket before anything is resubmitted: a Recv or Writev
         // still queued on it then fails instead of touching a request buffer.
         let _ = c.stream.shutdown(Shutdown::Both);
+        // Empty the in-flight table first, whole, with its count, and park
+        // the request a direct receive may still be writing into where only
+        // the receiver releases it. Only the socket shutdown runs before
+        // this, so a panic in what follows cannot drop (and so fail over)
+        // that request while its Recv is in flight, nor leave requests
+        // behind in a dead connection's table.
+        let mut all = std::mem::take(&mut *c.inflight.borrow_mut());
+        self.stats.inflight.fetch_sub(all.len() as i64, Ordering::Relaxed);
+        if let Some(p) = c.rx_direct.get().and_then(|cid| all.remove(&cid)) {
+            *c.held.borrow_mut() = Some(p);
+        }
+        let orphans: Vec<Pending> = all.into_values().collect();
         c.tx.close();
         {
             let mut conns = self.conns.borrow_mut();
@@ -726,19 +993,8 @@ impl QEngine {
         if cause == Cause::Failure {
             self.ctrls.paths[c.path].fence(c.epoch);
         }
-        let direct = c.rx_direct.get();
-        let mut orphans = Vec::new();
-        let drained = c.inflight.borrow().len() as i64;
-        self.stats.inflight.fetch_sub(drained, Ordering::Relaxed);
-        for (cid, p) in c.inflight.borrow_mut().drain() {
-            if Some(cid) == direct {
-                *c.held.borrow_mut() = Some(p);
-            } else {
-                orphans.push(p);
-            }
-        }
         self.next_try.borrow_mut()[c.slot] = Instant::now();
-        if orphans.is_empty() && cause == Cause::Idle {
+        if orphans.is_empty() && matches!(cause, Cause::Idle | Cause::Closing) {
             log::debug!("q{} path {}: {why}", self.qid, c.path);
         } else if orphans.is_empty() {
             log::warn!("q{} path {}: {why}", self.qid, c.path);
@@ -748,6 +1004,7 @@ impl QEngine {
             log::warn!("q{} path {}: {why}; failing over {} in-flight ({writes} writes/flushes fenced)", self.qid, c.path, orphans.len());
         }
         for p in orphans {
+            panic_point("failover-loop");
             self.failover(p);
         }
     }
@@ -782,11 +1039,11 @@ impl QEngine {
                 return Ok(());
             }
         }
-        let mut p = c.inflight.borrow_mut().remove(&cid).expect("checked above");
+        let mut p = self.untrack(c, cid).expect("checked above");
+        panic_point("complete-removed");
         if TRACE_DIR.is_some() {
             trace_io(c.fd, cid, &p);
         }
-        self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
         self.free_cid(c, cid);
         self.stats.done.fetch_add(1, Ordering::Relaxed);
         self.stats.wire_ns.fetch_add(p.sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -844,9 +1101,9 @@ impl QEngine {
         self.conns.borrow_mut()[slot] = Some(c.clone());
         self.backoff.borrow_mut()[slot] = Duration::from_millis(250);
         let (me, c2) = (self.clone(), c.clone());
-        self.exe.spawn(async move { me.sender_task(c2, rx).await }).detach();
-        let (me, c2) = (self.clone(), c);
-        self.exe.spawn(async move { me.receiver_task(c2).await }).detach();
+        self.spawn_task(TaskKind::Sender(slot), async move { me.sender_task(c2, rx).await });
+        let (me, c2) = (self.clone(), c.clone());
+        self.spawn_task(TaskKind::Receiver(c), async move { me.receiver_task(c2).await });
         log::info!("q{} path {path} I/O queue {} up", self.qid, self.qid as usize * self.k() + slot % self.k() + 1);
         let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
         for p in parked {
@@ -1031,8 +1288,10 @@ impl QEngine {
         let (mut start, mut end) = (0usize, 0usize);
         let pause = io_uring::types::Timespec::new().nsec(50_000_000);
         // Next-PDU header: a receive linked behind the last payload receive
-        // (see try_direct) lands it in `hdr`; `pending` is that receive.
-        let mut hdr = vec![0u8; HDR_PREFETCH];
+        // (see try_direct) lands it in `hdr`; `pending` is that receive. It
+        // is in flight while try_direct completes the request and dispatches
+        // parked ones: a panic there must not free `hdr` under it.
+        let mut hdr = LeakOnUnwind::new(vec![0u8; HDR_PREFETCH]);
         let mut pending: Option<PendingRx> = None;
         loop {
             let mut have_hdr = false;
@@ -1442,13 +1701,17 @@ impl QEngine {
         // 100 ms while there is work (stall watchdog, parked/fenced requests,
         // reconnects); once a second when the queue is fully idle, so an idle
         // volume costs next to nothing.
-        let busy_ts = io_uring::types::Timespec::new().nsec(100_000_000);
-        let idle_ts = io_uring::types::Timespec::new().sec(1);
+        let (busy, idle_tick) = (Duration::from_millis(100), Duration::from_secs(1));
         let mut idle = false;
-        while !self.stop.load(Ordering::Acquire) {
-            let sqe = io_uring::opcode::Timeout::new(if idle { &idle_ts } else { &busy_ts }).build();
-            let _ = ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await;
+        while !self.stop.load(Ordering::Acquire) && !self.closing.get() {
+            self.nap(if idle { idle_tick } else { busy }).await;
+            if self.closing.get() {
+                break;
+            }
             self.fault_injection();
+            // Requests dropped unfinished outside an engine task's panic
+            // (after one, `task_panicked` recovers them at once).
+            self.recover_dropped();
             // Lazy I/O connections (NVMEUBLK_IDLE_DISCONNECT_S, default 60,
             // 0 = always connected): after that long without a request the
             // queue drops its I/O connections, so an idle volume holds only
@@ -1480,7 +1743,9 @@ impl QEngine {
             }
             self.expire_parked();
             self.release_fenced();
-            let all_up = !want_conns || self.conns.borrow().iter().all(|c| c.is_some());
+            // A failed engine never reconnects: missing connections are not
+            // work that needs the fast tick.
+            let all_up = self.failed.get() || !want_conns || self.conns.borrow().iter().all(|c| c.is_some());
             idle = self.submitted.replace(0) == 0 && self.inflight_here() == 0 && self.parked.borrow().is_empty() && self.fenced.borrow().is_empty() && all_up;
             if idle {
                 self.set_napi(false);
@@ -1490,53 +1755,344 @@ impl QEngine {
         for c in conns {
             self.fail_conn(&c, "shutting down", Cause::Retired);
         }
+        self.abort_dials();
     }
 
-    fn maybe_connect(&self, i: usize) {
-        if self.connecting.borrow()[i] || Instant::now() < self.next_try.borrow()[i] {
+    /// Start connecting slot `i`'s I/O queue, unless a connect is already on
+    /// its way or the slot's backoff has not passed. The connect is a task on
+    /// this queue's ring (`connect_io_queue`); `connected` takes its result.
+    fn maybe_connect(self: &Rc<Self>, i: usize) {
+        if self.closing.get() || self.failed.get() || self.connecting.borrow()[i].is_some() || Instant::now() < self.next_try.borrow()[i] {
             return;
         }
         let ctrl = self.ctrls.paths[i / self.k()].clone();
         let Some((cntlid, epoch)) = ctrl.snapshot() else { return };
         let qsize = *ctrl.max_qsize.lock().unwrap();
-        self.connecting.borrow_mut()[i] = true;
+        self.connecting.borrow_mut()[i] = Some(Dialing::default());
         let qid = (self.qid as usize * self.k() + i % self.k() + 1) as u16;
-        let (tx, efd, id) = (self.results_tx.clone(), self.wake_efd, self.ctrls.id.clone());
-        let spawned = std::thread::Builder::new().name(format!("nvme-conn-q{}", self.qid)).spawn(move || {
-            let r = connect_io_queue(ctrl.addr, &id, cntlid, qid, qsize);
-            let _ = tx.send((i, epoch, r));
-            let one: u64 = 1;
-            unsafe { libc::write(efd, &one as *const u64 as *const libc::c_void, 8) };
+        // Unlike the thread this used to be, spawning a task cannot fail
+        // (submit() calls this on a tag's io task, which must not panic).
+        let me = self.clone();
+        self.spawn_task(TaskKind::Connect(i), async move {
+            let r = me.connect_io_queue(i, ctrl.addr, cntlid, qid, qsize).await;
+            me.connected(i, epoch, r);
         });
-        if let Err(e) = spawned {
-            // Never panic here: this runs on a ublk queue thread (submit() can
-            // call it), and a panic would kill the tag's io task.
-            log::warn!("q{} path {}: cannot spawn a connect thread ({e}); retrying in 1 s", self.qid, i / self.k());
-            self.connecting.borrow_mut()[i] = false;
-            self.next_try.borrow_mut()[i] = Instant::now() + Duration::from_secs(1);
+    }
+
+    /// A connect ended (`r`: the target's maxh2cdata): install the queue if
+    /// its controller is still the current one, retry at once if it was
+    /// replaced meanwhile, back off if the connect failed.
+    fn connected(self: &Rc<Self>, i: usize, epoch: u64, r: anyhow::Result<u32>) {
+        // The slot hands over its socket and is cleared; a socket that is
+        // not installed below closes as `sock` (or `r`) drops.
+        let sock = self.connecting.borrow_mut()[i].take().and_then(|d| d.sock);
+        if self.stop.load(Ordering::Acquire) || self.closing.get() || self.failed.get() {
+            return; // a connection made meanwhile closes here
+        }
+        let r = r.and_then(|maxh2c| sock.map(|s| (s, maxh2c)).ok_or_else(|| anyhow!("no socket in the slot")));
+        let current = self.ctrls.paths[i / self.k()].epoch.load(Ordering::Acquire);
+        match r {
+            Ok((stream, maxh2c)) if epoch == current => {
+                let qsize = *self.ctrls.paths[i / self.k()].max_qsize.lock().unwrap();
+                self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
+                self.install(i, epoch, stream, maxh2c, qsize);
+            }
+            Ok(_) => {
+                // Its I/O queue belongs to a controller that is gone: drop
+                // it, and connect to the current one without a backoff.
+                log::debug!("q{} path {i}: connected to a controller that was since replaced; retrying", self.qid);
+                self.maybe_connect(i);
+            }
+            Err(e) => {
+                let mut b = self.backoff.borrow_mut();
+                log::debug!("q{} path {i}: I/O queue connect failed: {e:#}", self.qid);
+                self.next_try.borrow_mut()[i] = Instant::now() + b[i];
+                b[i] = (b[i] * 2).min(Duration::from_secs(2));
+            }
         }
     }
 
-    async fn results_task(self: Rc<Self>) {
-        while !self.stop.load(Ordering::Acquire) {
-            wait_eventfd(self.wake_efd).await;
-            while let Ok((i, epoch, r)) = self.results_rx.try_recv() {
-                self.connecting.borrow_mut()[i] = false;
-                let current = self.ctrls.paths[i / self.k()].epoch.load(Ordering::Acquire);
-                match r {
-                    Ok((stream, maxh2c)) if epoch == current => {
-                        let qsize = *self.ctrls.paths[i / self.k()].max_qsize.lock().unwrap();
-                        self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
-                        self.install(i, epoch, stream, maxh2c, qsize);
-                    }
-                    Ok(_) => log::debug!("q{} path {i}: connected to a controller that was since replaced; retrying", self.qid),
-                    Err(e) => {
-                        let mut b = self.backoff.borrow_mut();
-                        log::debug!("q{} path {i}: I/O queue connect failed: {e:#}", self.qid);
-                        self.next_try.borrow_mut()[i] = Instant::now() + b[i];
-                        b[i] = (b[i] * 2).min(Duration::from_secs(2));
-                    }
+    /// Dial, handshake and Connect I/O queue `qid` on controller `cntlid`
+    /// for slot `i`, all as SQEs on this queue's ring: the same steps and
+    /// bytes as the blocking conn::connect_io_queue, without its thread. Each
+    /// SQE carries a linked timeout (`sqe_until`) for what is left of its
+    /// step: the TCP connect gets CONNECT_TIMEOUT, each handshake exchange
+    /// (ICReq/ICResp, then Connect and its response) HANDSHAKE_TIMEOUT. On
+    /// success the socket is left in the slot for `connected` to install.
+    async fn connect_io_queue(&self, i: usize, addr: SocketAddr, cntlid: u16, qid: u16, qsize: u16) -> anyhow::Result<u32> {
+        let (connect_limit, handshake_limit) = self.dial_limits.get();
+        let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+        let ty = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+        // A blocking socket, as install() wants it; the ring's CONNECT, SEND
+        // and RECV still never block the thread (they wait in a poll).
+        let sqe = io_uring::opcode::Socket::new(domain, ty, 0).build();
+        let mut fd = io_sqe_res(ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await);
+        if fd == -libc::EINVAL {
+            // No IORING_OP_SOCKET (before 5.19); socket(2) does not block.
+            fd = unsafe { libc::socket(domain, ty, 0) };
+            if fd < 0 {
+                fd = -errno();
+            }
+        }
+        if fd < 0 {
+            bail!("socket: {}", std::io::Error::from_raw_os_error(-fd));
+        }
+        // Closed on an early return until the slot takes it over.
+        let stream = unsafe { TcpStream::from_raw_fd(fd) };
+        tune_socket(fd)?;
+        self.dial_adopt(i, stream)?;
+        // The kernel copies the address when it prepares the SQE, at the
+        // ring submit; `sa` lives until the SQE completes.
+        let (sa, len) = sockaddr(&addr);
+        let sqe = io_uring::opcode::Connect::new(io_uring::types::Fd(fd), &sa as *const _ as *const libc::sockaddr, len).build();
+        let r = sqe_until(fd, sqe, Instant::now() + connect_limit).await;
+        if r < 0 {
+            return Err(self.dial_error(r)).with_context(|| format!("connect {addr}"));
+        }
+        self.dial_check()?;
+        panic_point("connect-handshake");
+        let deadline = Instant::now() + handshake_limit;
+        send_all(fd, &icreq_pdu(), deadline).await.map_err(|r| self.dial_error(r)).context("send ICReq")?;
+        let mut icresp = [0u8; 128];
+        recv_exact(fd, &mut icresp, deadline).await.map_err(|r| self.dial_error(r)).context("read ICResp")?;
+        let maxh2c = icresp_maxh2c(&icresp)?;
+        self.dial_check()?;
+        let deadline = Instant::now() + handshake_limit;
+        send_all(fd, &io_connect_capsule(&self.ctrls.id, cntlid, qid, qsize), deadline).await.map_err(|r| self.dial_error(r)).context("send command capsule")?;
+        // The response as read_hdr takes it off a stream: the common header,
+        // then the rest of the header it announces; read_hdr then checks it.
+        let mut h = vec![0u8; CH_LEN];
+        recv_exact(fd, &mut h, deadline).await.map_err(|r| self.dial_error(r)).context("read PDU common header")?;
+        h.resize((h[2] as usize).max(CH_LEN), 0);
+        recv_exact(fd, &mut h[CH_LEN..], deadline).await.map_err(|r| self.dial_error(r)).context("read PDU header")?;
+        let (ch, psh) = read_hdr(&mut &h[..])?;
+        check_io_connect_resp(qid, &ch, &psh)?;
+        // Not installed if the engine was closed or failed (and the socket
+        // shut down) after the last receive completed.
+        self.dial_check()?;
+        Ok(maxh2c.max(4096))
+    }
+
+    /// Refuse to go on with a connect once the engine is closing or failed
+    /// (`abort_dials` has shut its socket down).
+    fn dial_check(&self) -> anyhow::Result<()> {
+        if self.closing.get() || self.failed.get() {
+            bail!("aborted: the engine is {}", if self.failed.get() { "failed" } else { "shutting down" });
+        }
+        Ok(())
+    }
+
+    /// Hand slot `i`'s new socket to the slot, which owns it from now on, so
+    /// `abort_dials` can shut it down. Checked and stored with no await in
+    /// between, so an abort cannot slip past it.
+    fn dial_adopt(&self, i: usize, stream: TcpStream) -> anyhow::Result<()> {
+        self.dial_check()?;
+        match self.connecting.borrow_mut()[i].as_mut() {
+            Some(d) => d.sock = Some(stream),
+            None => bail!("connect slot {i} cleared"),
+        }
+        Ok(())
+    }
+
+    /// The error for a connect step that ended with `r` (0: peer closed).
+    fn dial_error(&self, r: i32) -> anyhow::Error {
+        if self.closing.get() || self.failed.get() {
+            anyhow!("aborted: the engine is {}", if self.failed.get() { "failed" } else { "shutting down" })
+        } else if r == -libc::ETIME {
+            anyhow!("timed out")
+        } else if r == 0 {
+            anyhow!("connection closed")
+        } else {
+            std::io::Error::from_raw_os_error(-r).into()
+        }
+    }
+
+    /// Abort every connect in flight: its pending SQE completes at once, and
+    /// the connect task then ends without installing anything. The sockets
+    /// are the slots' own, so each fd shut down here is still that socket.
+    fn abort_dials(&self) {
+        for s in self.connecting.borrow().iter().flatten().filter_map(|d| d.sock.as_ref()) {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Sleep for `d` on the ring, or until `wake`. The timerfd is re-armed
+    /// for each nap; without one, a ring timeout does (and `wake` cannot).
+    async fn nap(&self, d: Duration) {
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            // (a zero it_value would disarm the timer instead)
+            it_value: libc::timespec { tv_sec: d.as_secs() as _, tv_nsec: d.subsec_nanos().max(1) as _ },
+        };
+        if self.tick_fd >= 0 && unsafe { libc::timerfd_settime(self.tick_fd, 0, &spec, std::ptr::null_mut()) } == 0 {
+            wait_eventfd(self.tick_fd).await; // POLLIN, then reads the expiry count
+        } else {
+            let ts = io_uring::types::Timespec::from(d);
+            let _ = ublk_submit_sqe_async(io_uring::opcode::Timeout::new(&ts).build(), UblkUringData::Target as u64).await;
+        }
+    }
+
+    /// End the timer's current nap now. Only `shutdown` needs this: it sets
+    /// `closing` first, so the timer, suspended in its nap, exits at once.
+    fn wake(&self) {
+        let now = libc::itimerspec { it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 }, it_value: libc::timespec { tv_sec: 0, tv_nsec: 1 } };
+        if self.tick_fd >= 0 {
+            unsafe { libc::timerfd_settime(self.tick_fd, 0, &now, std::ptr::null_mut()) };
+        }
+    }
+
+    /// Spawn an engine task. Every task goes through here, for two reasons:
+    /// - It is counted, so `shutdown` knows when the last one has ended.
+    /// - It runs under catch_unwind. The executor takes a task's panic as
+    ///   its result, and a detached task's result goes nowhere: a panicking
+    ///   timer used to end every reconnect, stall kill and fence release of
+    ///   this queue in silence, leaving its I/O hung. Now the panic is
+    ///   logged and fails the engine (`task_panicked`).
+    fn spawn_task(self: &Rc<Self>, kind: TaskKind, fut: impl Future<Output = ()> + 'static) {
+        self.tasks.set(self.tasks.get() + 1);
+        self.exe.spawn(Guarded { fut: Some(Box::pin(fut)), kind: Some(kind), engine: Rc::downgrade(self) }).detach();
+    }
+
+    /// An engine task panicked (`msg`): log it loudly and fail the engine.
+    /// A failed engine closes its connections and fails every request with
+    /// EIO: new ones and reads at once, writes and flushes that were (or may
+    /// have been) on the wire once their write fence has passed (never
+    /// re-sent). That includes requests the unwind dropped from the panicked
+    /// frame (`recover_dropped`). Nothing waits forever on a task that is
+    /// gone, and nothing more goes to the target.
+    fn task_panicked(self: &Rc<Self>, kind: Option<TaskKind>, msg: &str) {
+        self.stats.engine_panics.fetch_add(1, Ordering::Relaxed);
+        let name = kind.as_ref().map_or("?".to_string(), |k| k.to_string());
+        let first = !self.failed.replace(true);
+        log::error!(
+            "q{}: engine task {name} PANICKED: {msg}; {}",
+            self.qid,
+            if first { "engine failed: connections closed, its I/O now fails with EIO" } else { "engine already failed" }
+        );
+        if let Some(TaskKind::Connect(i)) = kind {
+            // Its socket (if it got one) is the slot's: close it with the
+            // slot, which only its task's `connected` would have cleared.
+            self.connecting.borrow_mut()[i] = None;
+        }
+        if first {
+            let conns: Vec<Rc<QConn>> = self.conns.borrow().iter().flatten().cloned().collect();
+            for c in conns {
+                self.fail_conn(&c, "engine failed", Cause::Retired);
+            }
+            self.abort_dials();
+            let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
+            for p in parked {
+                p.finish(-libc::EIO);
+            }
+        }
+        match kind {
+            // Only its own receiver may release the request a connection
+            // holds (a Recv may be writing into it); this one is gone. Its
+            // payload receive is not in flight: the task was running. (A
+            // header receive linked behind it may be; that writes into the
+            // task's `hdr`, which the unwind leaked.)
+            Some(TaskKind::Receiver(c)) => {
+                c.rx_direct.set(None);
+                let held = c.held.borrow_mut().take();
+                if let Some(p) = held {
+                    self.failover(p);
                 }
+            }
+            // The timer releases fenced writes; without it they would hang.
+            // Restart it once; if it panics again, a task that does nothing
+            // but that takes over, so the fence still holds.
+            Some(TaskKind::Timer) if !self.closing.get() => {
+                let me = self.clone();
+                if first {
+                    self.spawn_task(TaskKind::Timer, async move { me.timer_task().await });
+                } else {
+                    self.spawn_task(TaskKind::Reaper, async move { me.reaper_task().await });
+                }
+            }
+            // Last resort (or shutting down): nothing is left to release them.
+            Some(TaskKind::Timer | TaskKind::Reaper) => {
+                let fenced: Vec<(Instant, Pending)> = self.fenced.borrow_mut().drain(..).collect();
+                for (_, p) in fenced {
+                    p.finish(-libc::EIO);
+                }
+            }
+            _ => {}
+        }
+        self.recover_dropped();
+    }
+
+    /// Fail over the requests dropped unfinished (`impl Drop for Pending`)
+    /// as a failed path's: reads are retried at once (EIO on a failed
+    /// engine); writes and flushes, which may still be on the wire, wait out
+    /// the write fence first.
+    fn recover_dropped(&self) {
+        let dropped = std::mem::take(&mut *self.dropped.borrow_mut());
+        if dropped.is_empty() {
+            return;
+        }
+        log::error!("q{}: {} request(s) dropped unfinished; failing them over", self.qid, dropped.len());
+        for p in dropped {
+            self.failover(p);
+        }
+    }
+
+    /// Stands in for a timer that panicked twice: releases fenced writes and
+    /// flushes when their fence has passed (to EIO: the engine is failed),
+    /// and nothing else.
+    async fn reaper_task(self: Rc<Self>) {
+        while !self.closing.get() {
+            self.nap(Duration::from_millis(100)).await;
+            self.release_fenced();
+            self.recover_dropped();
+        }
+    }
+
+    /// The queue dropped its handle: close every connection and abort every
+    /// connect, then drive the engine's tasks on this thread's ring until
+    /// the last has ended. They drop their `Rc<Engine>` as they end, which
+    /// breaks the cycle through the executor: the engine, its sockets and
+    /// buffers are then freed. A task is never dropped while an SQE of its
+    /// own may still write into its memory: if some task has not ended
+    /// within SHUTDOWN_DRAIN, the engine is leaked instead (with a warning).
+    fn shutdown(self: &Rc<Self>) {
+        if self.closing.replace(true) {
+            return;
+        }
+        if std::thread::panicking() {
+            // Unwinding: driving tasks now risks a second panic (an abort).
+            std::mem::forget(self.clone());
+            return;
+        }
+        let conns: Vec<Rc<QConn>> = self.conns.borrow().iter().flatten().cloned().collect();
+        for c in conns {
+            self.fail_conn(&c, "engine shut down", Cause::Closing);
+        }
+        self.abort_dials();
+        // The queue is gone: nobody waits on these any more.
+        let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
+        for p in parked {
+            p.finish(-libc::EIO);
+        }
+        let fenced: Vec<(Instant, Pending)> = self.fenced.borrow_mut().drain(..).collect();
+        for (_, p) in fenced {
+            p.finish(-libc::EIO);
+        }
+        self.recover_dropped(); // closing: they fail with EIO
+        if self.napi_on.replace(false) {
+            // As set_napi(false), through the accessor that cannot panic.
+            with_ring(|r| r.submitter().unregister_napi(&mut io_uring::types::Napi::new()));
+        }
+        self.wake();
+        let deadline = Instant::now() + SHUTDOWN_DRAIN;
+        loop {
+            while self.exe.try_tick() {}
+            if self.tasks.get() == 0 {
+                return;
+            }
+            if Instant::now() >= deadline || reap_ring(Duration::from_millis(50)).is_none() {
+                log::warn!("q{}: {} engine task(s) did not end on shutdown; leaking the engine rather than freeing memory an SQE may still use", self.qid, self.tasks.get());
+                std::mem::forget(self.clone());
+                return;
             }
         }
     }
@@ -1592,7 +2148,16 @@ impl QEngine {
 
     /// `echo "kill N" > <fault_dir>/fault` fails path N's I/O queue on every
     /// ublk queue; `stall N` stops that queue's receiver from reading so the
-    /// stall watchdog must catch it. Each queue thread consumes its own copy.
+    /// stall watchdog must catch it; `panic` makes the timer task panic, so
+    /// the engine must fail (EIO) instead of hanging. Each queue thread
+    /// consumes its own copy.
+    ///
+    /// For drill operators: `panic` is not a transient fault. A failed engine
+    /// stays failed until the device is re-attached, answering every request
+    /// with EIO (writes and flushes that were in flight once the write fence
+    /// has passed), and since the command fans out to every queue, the whole
+    /// device fails. It shows as an error-level "PANICKED" log line per queue
+    /// and in `Stats::engine_panics`.
     fn fault_injection(&self) {
         let dir = &self.cfg.fault_dir;
         let path = format!("{dir}/fault.q{}", self.qid);
@@ -1607,6 +2172,11 @@ impl QEngine {
         }
         let Ok(cmd) = std::fs::read_to_string(&path) else { return };
         let _ = std::fs::remove_file(&path);
+        if cmd.trim() == "panic" {
+            // Drill for the task panic guard (spawn_task): the timer dies,
+            // and the engine must fail loudly rather than hang its I/O.
+            panic!("fault injection: q{} timer task panic", self.qid);
+        }
         let mut it = cmd.split_whitespace();
         let (Some(verb), Some(Ok(i))) = (it.next(), it.next().map(str::parse::<usize>)) else { return };
         let targets: Vec<Rc<QConn>> = self.conns.borrow().iter().flatten().filter(|c| c.path == i).cloned().collect();
@@ -1620,5 +2190,899 @@ impl QEngine {
                 _ => {}
             }
         }
+    }
+}
+
+/// An engine task as `spawn_task` runs it: counted, and panic-proof.
+struct Guarded<F> {
+    fut: Option<Pin<Box<F>>>,
+    kind: Option<TaskKind>,
+    engine: Weak<Engine>,
+}
+
+impl<F: Future<Output = ()>> Future for Guarded<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let Some(fut) = this.fut.as_mut() else { return Poll::Ready(()) };
+        let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => return Poll::Pending,
+            Ok(Poll::Ready(())) => {
+                this.fut = None; // drops its Rc<Engine> before the count moves
+                None
+            }
+            Err(payload) => {
+                // The unwind has already dropped every local the task held
+                // (catch_unwind cannot stop that; its sockets are closed and
+                // its buffers freed). What must outlive it is built to:
+                // a buffer an SQE may still write into is a LeakOnUnwind, a
+                // connect's socket belongs to the engine's slot, and a
+                // request comes back through Pending's Drop. The poisoned
+                // future itself (its inline storage) is leaked, not freed,
+                // in case an SQE targets memory inside it.
+                std::mem::forget(this.fut.take());
+                Some(panic_message(payload.as_ref()))
+            }
+        };
+        if let Some(e) = this.engine.upgrade() {
+            e.tasks.set(e.tasks.get().saturating_sub(1));
+            if let Some(msg) = panic {
+                e.task_panicked(this.kind.take(), &msg);
+            }
+        }
+        this.kind = None;
+        Poll::Ready(())
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "(non-string panic payload)".into())
+}
+
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+}
+
+/// Run `sqe`, an operation on socket `fd`, on this thread's ring with a
+/// linked timeout at `deadline`: its result, or -ETIME if the deadline cut
+/// it short (-ETIME at once if the deadline has passed).
+async fn sqe_until(fd: i32, sqe: io_uring::squeue::Entry, deadline: Instant) -> i32 {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return -libc::ETIME;
+    }
+    // Read by the kernel when the pair is submitted, not when it is pushed;
+    // it lives in this future until both SQEs have completed.
+    let ts = io_uring::types::Timespec::from(left);
+    // A link never spans two submissions, and libublk submits to make room
+    // when the SQ is full: with fewer than two free slots that could split
+    // the pair, so make room for both first.
+    with_ring(|r| {
+        let free = {
+            let sq = r.submission();
+            sq.capacity() - sq.len()
+        };
+        if free < 2 {
+            let _ = r.submit();
+        }
+    });
+    let mut op = Box::pin(ublk_submit_sqe_async(sqe.flags(io_uring::squeue::Flags::IO_LINK), UblkUringData::Target as u64));
+    let to = ublk_submit_sqe_async(io_uring::opcode::LinkTimeout::new(&ts).build(), UblkUringData::Target as u64);
+    // Each future pushes its SQE on its first poll, and nothing between the
+    // two polls touches the ring, so the pair is adjacent in the SQ. The
+    // timeout completes when the operation does (-ECANCELED) or when it
+    // fires (-ETIME, and the operation is cancelled); await it first.
+    let first = smol::future::poll_once(&mut op).await;
+    let t = io_sqe_res(to.await);
+    if t == -libc::EINVAL {
+        // Refused, so not linked (never expected): the operation would run
+        // unbounded. End it through its socket; the connect then fails.
+        unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+    }
+    let r = io_sqe_res(match first {
+        Some(r) => r,
+        None => op.await,
+    });
+    if t == -libc::EINVAL {
+        -libc::EINVAL
+    } else if t == -libc::ETIME && r <= 0 {
+        // Cut short with nothing done (a partial receive still counts, and
+        // the next SQE of the step finds its deadline passed).
+        -libc::ETIME
+    } else {
+        r
+    }
+}
+
+/// Send all of `buf` on socket `fd` with SEND SQEs on this thread's ring,
+/// by `deadline`. Err: the result that ended it (0, or -errno; -ETIME for
+/// the deadline).
+async fn send_all(fd: i32, buf: &[u8], deadline: Instant) -> Result<(), i32> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let sqe = io_uring::opcode::Send::new(io_uring::types::Fd(fd), buf[done..].as_ptr(), (buf.len() - done) as u32).flags(libc::MSG_NOSIGNAL).build();
+        let r = sqe_until(fd, sqe, deadline).await;
+        if r == -libc::EAGAIN || r == -libc::EINTR {
+            continue;
+        }
+        if r <= 0 {
+            return Err(r);
+        }
+        done += r as usize;
+    }
+    Ok(())
+}
+
+/// Receive exactly `buf.len()` bytes from socket `fd` with RECV SQEs on this
+/// thread's ring, by `deadline`. Err: 0 if the peer closed first, else
+/// -errno (-ETIME for the deadline).
+async fn recv_exact(fd: i32, buf: &mut [u8], deadline: Instant) -> Result<(), i32> {
+    let mut got = 0usize;
+    while got < buf.len() {
+        let sqe = io_uring::opcode::Recv::new(io_uring::types::Fd(fd), buf[got..].as_mut_ptr(), (buf.len() - got) as u32).flags(libc::MSG_WAITALL).build();
+        let r = sqe_until(fd, sqe, deadline).await;
+        if r == -libc::EAGAIN || r == -libc::EINTR {
+            continue;
+        }
+        if r <= 0 {
+            return Err(r);
+        }
+        got += r as usize;
+    }
+    Ok(())
+}
+
+/// `addr` as a C socket address for a CONNECT SQE.
+fn sockaddr(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(a) => {
+            let sin = unsafe { &mut *(&mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = a.port().to_be();
+            sin.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) };
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        SocketAddr::V6(a) => {
+            let sin6 = unsafe { &mut *(&mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = a.port().to_be();
+            sin6.sin6_flowinfo = a.flowinfo();
+            sin6.sin6_addr = libc::in6_addr { s6_addr: a.ip().octets() };
+            sin6.sin6_scope_id = a.scope_id();
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (ss, len as libc::socklen_t)
+}
+
+/// Run `f` on this thread's queue ring. None when the thread has no ring or
+/// it is in use; unlike libublk's accessors this never panics, so it is
+/// safe from a Drop.
+fn with_ring<R>(f: impl FnOnce(&mut io_uring::IoUring<io_uring::squeue::Entry>) -> R) -> Option<R> {
+    let mut f = Some(f);
+    let mut out = None;
+    let _ = libublk::io::ublk_init_task_ring(|cell| {
+        if let (Some(Ok(mut ring)), Some(f)) = (cell.get().map(|r| r.try_borrow_mut()), f.take()) {
+            out = Some(f(&mut ring));
+        }
+        Ok(())
+    });
+    out
+}
+
+/// Submit, wait up to `wait` for a completion, and wake the futures of the
+/// target SQEs that completed: the queue loop's job, for an engine shutting
+/// down after that loop has ended. None: no usable ring on this thread.
+fn reap_ring(wait: Duration) -> Option<()> {
+    let cqes: Vec<io_uring::cqueue::Entry> = with_ring(|r| {
+        let ts = io_uring::types::Timespec::from(wait);
+        let _ = r.submitter().submit_with_args(1, &io_uring::types::SubmitArgs::new().timespec(&ts));
+        r.completion().collect()
+    })?;
+    for cqe in cqes {
+        // Only our own SQEs (Target bit); a SEND_ZC buffer-release notice
+        // carries a future key that already completed (see the queue loop).
+        if cqe.user_data() & UblkUringData::Target as u64 != 0 && !io_uring::cqueue::notif(cqe.flags()) {
+            libublk::uring_async::ublk_wake_task(cqe.user_data(), &cqe);
+        }
+    }
+    Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The engine against a minimal NVMe/TCP target on loopback, driven on a
+    //! test thread's own io_uring the way a ublk queue thread drives it.
+    use super::*;
+    use crate::conn::Ident;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    thread_local! {
+        /// `panic_point` name armed on this thread (one shot).
+        pub(super) static PANIC_AT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    fn arm_panic(at: &'static str) {
+        PANIC_AT.with(|p| p.set(Some(at)));
+    }
+
+    /// What the target saw.
+    #[derive(Default)]
+    struct Seen {
+        /// I/O queue Connects: (qid, cntlid, 0-based sqsize).
+        io_connects: Vec<(u16, u16, u16)>,
+        /// I/O queue connections that have since closed.
+        io_closed: usize,
+        /// Connections of any kind (admin, I/O, dials that never sent a
+        /// Connect) that have since closed.
+        closed: usize,
+    }
+
+    #[derive(Default)]
+    struct TargetCfg {
+        /// Wait this long before each ICResp.
+        icresp_delay: Duration,
+        /// Wait this long before answering an I/O queue Connect.
+        io_connect_delay: Duration,
+        /// Never answer an I/O queue Connect.
+        hang_io_connect: bool,
+        /// Accept this many connections, then stop accepting and fill the
+        /// accept queue: a further connect stays in SYN_SENT (its SYN is
+        /// dropped) until the dialler gives up.
+        accept_only: Option<usize>,
+    }
+
+    struct Target {
+        addr: SocketAddr,
+        seen: Arc<Mutex<Seen>>,
+        /// While set, I/O commands go unanswered.
+        hold_io: Arc<AtomicBool>,
+        /// `accept_only`: the accept queue is now full.
+        backlog_full: Arc<AtomicBool>,
+    }
+
+    impl Target {
+        fn start(bind: &str, cfg: TargetCfg) -> Option<Target> {
+            use std::os::fd::AsRawFd;
+            let l = TcpListener::bind(bind).ok()?;
+            let addr = l.local_addr().ok()?;
+            let (seen, hold_io, backlog_full, cfg) = (Arc::new(Mutex::new(Seen::default())), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(cfg));
+            let (s2, h2, f2) = (seen.clone(), hold_io.clone(), backlog_full.clone());
+            std::thread::spawn(move || {
+                for (n, s) in l.incoming().flatten().enumerate() {
+                    let (seen, hold, cfg2) = (s2.clone(), h2.clone(), cfg.clone());
+                    std::thread::spawn(move || serve(s, &seen, &hold, &cfg2));
+                    if cfg.accept_only == Some(n + 1) {
+                        // Backlog 0 holds one queued connection: this one.
+                        unsafe { libc::listen(l.as_raw_fd(), 0) };
+                        let _filler = TcpStream::connect(addr);
+                        f2.store(true, Ordering::Release);
+                        loop {
+                            std::thread::sleep(Duration::from_secs(3600));
+                        }
+                    }
+                }
+            });
+            Some(Target { addr, seen, hold_io, backlog_full })
+        }
+    }
+
+    fn pattern(slba: u64, len: usize) -> Vec<u8> {
+        (0..len).map(|i| (slba as usize * 7 + i) as u8).collect()
+    }
+
+    fn resp(cid: u16, dw0: u32) -> Vec<u8> {
+        let mut r = vec![0u8; 24];
+        r[0] = PDU_CAPSULE_RESP;
+        r[2] = 24;
+        r[4..8].copy_from_slice(&24u32.to_le_bytes());
+        r[8..12].copy_from_slice(&dw0.to_le_bytes());
+        r[20..22].copy_from_slice(&cid.to_le_bytes());
+        r
+    }
+
+    fn c2h(cid: u16, data: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; DATA_HLEN];
+        p[0] = PDU_C2H_DATA;
+        p[1] = FLAG_LAST_PDU | FLAG_C2H_SUCCESS;
+        p[2] = DATA_HLEN as u8;
+        p[3] = DATA_HLEN as u8;
+        p[4..8].copy_from_slice(&((DATA_HLEN + data.len()) as u32).to_le_bytes());
+        p[8..10].copy_from_slice(&cid.to_le_bytes());
+        p[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        p.extend_from_slice(data);
+        p
+    }
+
+    /// One connection: ICReq, then command capsules until the host closes.
+    fn serve(mut s: TcpStream, seen: &Mutex<Seen>, hold: &AtomicBool, cfg: &TargetCfg) {
+        let mut io_queue = false;
+        let _ = (|| -> std::io::Result<()> {
+            let mut icreq = [0u8; 128];
+            s.read_exact(&mut icreq)?;
+            std::thread::sleep(cfg.icresp_delay);
+            let mut ic = [0u8; 128];
+            ic[0] = PDU_IC_RESP;
+            ic[2] = 128;
+            ic[4..8].copy_from_slice(&128u32.to_le_bytes());
+            ic[12..16].copy_from_slice(&131072u32.to_le_bytes());
+            s.write_all(&ic)?;
+            loop {
+                let mut ch = [0u8; CH_LEN];
+                s.read_exact(&mut ch)?;
+                let mut rest = vec![0u8; u32::from_le_bytes(ch[4..8].try_into().unwrap()) as usize - CH_LEN];
+                s.read_exact(&mut rest)?;
+                let (sqe, data) = rest.split_at(64);
+                let cid = u16::from_le_bytes([sqe[2], sqe[3]]);
+                let u16_at = |o: usize| u16::from_le_bytes([sqe[o], sqe[o + 1]]);
+                let out = match (sqe[0], io_queue) {
+                    (OPC_FABRICS, _) if sqe[4] == FCTYPE_CONNECT => {
+                        let qid = u16_at(42);
+                        if qid == 0 {
+                            resp(cid, 1) // admin: cntlid 1
+                        } else {
+                            io_queue = true;
+                            seen.lock().unwrap().io_connects.push((qid, u16::from_le_bytes([data[16], data[17]]), u16_at(44)));
+                            if cfg.hang_io_connect {
+                                continue;
+                            }
+                            std::thread::sleep(cfg.io_connect_delay);
+                            resp(cid, 0)
+                        }
+                    }
+                    // Property Get: CAP (MQES 127), else CSTS (RDY).
+                    (OPC_FABRICS, _) if sqe[4] == FCTYPE_PROP_GET => resp(cid, if sqe[44] == 0 { 127 } else { 1 }),
+                    (OPC_ADMIN_IDENTIFY, false) => {
+                        let mut id = vec![0u8; 4096];
+                        if sqe[40] == 1 {
+                            id[1792..1796].copy_from_slice(&4u32.to_le_bytes()); // ioccsz: no in-capsule data
+                        } else {
+                            id[0..8].copy_from_slice(&2048u64.to_le_bytes()); // nsze
+                            id[104..120].copy_from_slice(&[1; 16]); // nguid
+                            id[128..132].copy_from_slice(&(9u32 << 16).to_le_bytes()); // 512 B blocks
+                        }
+                        c2h(cid, &id)
+                    }
+                    (_, true) if hold.load(Ordering::Acquire) => continue,
+                    (OPC_READ, true) => {
+                        let slba = u64::from_le_bytes(sqe[40..48].try_into().unwrap());
+                        let nlb = u32::from_le_bytes(sqe[48..52].try_into().unwrap()) as usize + 1;
+                        c2h(cid, &pattern(slba, nlb * 512))
+                    }
+                    _ => resp(cid, 0), // Property Set, keep-alive, flush
+                };
+                s.write_all(&out)?;
+            }
+        })();
+        let mut seen = seen.lock().unwrap();
+        seen.closed += 1;
+        if io_queue {
+            seen.io_closed += 1;
+        }
+    }
+
+    /// Run `f` on a new thread with its own io_uring, as a queue thread has.
+    fn on_ring_thread(f: impl FnOnce() + Send + 'static) {
+        std::thread::spawn(move || {
+            libublk::io::ublk_init_task_ring(|cell| {
+                if cell.get().is_none() {
+                    let ring = io_uring::IoUring::builder().setup_cqsize(256).setup_coop_taskrun().build(128).map_err(libublk::UblkError::IOError)?;
+                    let _ = cell.set(RefCell::new(ring));
+                }
+                Ok(())
+            })
+            .unwrap();
+            f();
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The queue loop: tick the engine's tasks, then submit and wake the
+    /// futures whose SQEs completed. Until `done`, at most `limit`.
+    fn drive_until(exe: &smol::LocalExecutor<'static>, limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        loop {
+            while exe.try_tick() {}
+            if done() {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            let cqes: Vec<io_uring::cqueue::Entry> = libublk::with_task_io_ring_mut(|r| {
+                let ts = io_uring::types::Timespec::new().nsec(5_000_000);
+                let _ = r.submitter().submit_with_args(1, &io_uring::types::SubmitArgs::new().timespec(&ts));
+                r.completion().collect()
+            });
+            for c in cqes {
+                if !io_uring::cqueue::notif(c.flags()) {
+                    libublk::uring_async::ublk_wake_task(c.user_data(), &c);
+                }
+            }
+        }
+    }
+
+    fn wait_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        while !done() {
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// Threads of this process whose name starts with `prefix`.
+    fn threads_named(prefix: &str) -> usize {
+        let Ok(d) = std::fs::read_dir("/proc/self/task") else { return 0 };
+        d.flatten().filter(|t| std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.starts_with(prefix))).count()
+    }
+
+    struct Rig {
+        e: Rc<QEngine>,
+        exe: Rc<smol::LocalExecutor<'static>>,
+        stats: Arc<Stats>,
+        ctrls: Arc<Ctrls>,
+        fault_dir: String,
+        _dir: TempDir,
+    }
+
+    struct TempDir(String);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rig(t: &Target, name: &str, write_fence: Duration) -> Rig {
+        let id = Ident { hostnqn: "nqn.2014-08.org.nvmexpress:uuid:test".into(), hostid: [7; 16], subnqn: "nqn.test:sub".into() };
+        let ctrls = Ctrls::new(vec![t.addr], id, Duration::from_secs(15)).unwrap();
+        let fault_dir = std::env::temp_dir().join(format!("nvmeublk-qengine-{}-{name}", std::process::id())).to_string_lossy().into_owned();
+        let _ = std::fs::create_dir_all(&fault_dir);
+        let cfg = QConfig {
+            io_timeout: Duration::from_secs(5),
+            no_path_timeout: Duration::ZERO,
+            max_attempts: 8,
+            write_fence,
+            hold_writes_until: None,
+            rx_offload: 0,
+            cdev_fd: -1,
+            conns_per_path: 1,
+            rx_chunk: RX_CHUNK_DEFAULT,
+            napi_us: 0,
+            fault_dir: fault_dir.clone(),
+            quiesce: Arc::new(AtomicBool::new(false)),
+        };
+        let exe = Rc::new(smol::LocalExecutor::new());
+        let stats = Arc::new(Stats::default());
+        let e = QEngine::new(0, ctrls.clone(), cfg, exe.clone(), stats.clone(), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        Rig { e, exe, stats, ctrls, _dir: TempDir(fault_dir.clone()), fault_dir }
+    }
+
+    /// Submit `op` at LBA 8 over `buf`; the receiver gets its result.
+    fn request(e: &QEngine, op: Op, buf: &mut [u8]) -> Receiver<i32> {
+        tag_request(e, op, buf).0
+    }
+
+    /// As `request`, but keeping a sender of the completion channel as the
+    /// tag task (main.rs io_task) does: a request dropped without a result
+    /// then hangs instead of closing the channel.
+    fn tag_request(e: &QEngine, op: Op, buf: &mut [u8]) -> (Receiver<i32>, Sender<i32>) {
+        let (tx, rx) = smol::channel::bounded(1);
+        let len = if op == Op::Flush { 0 } else { buf.len() };
+        e.submit(Pending::new(op, 8, (buf.len() / 512).max(1) as u32, buf.as_mut_ptr(), len, tx.clone(), None, None));
+        (rx, tx)
+    }
+
+    /// Q5: the I/O queue is dialled, handshaken and connected by SQEs on the
+    /// queue's ring. The target holds each ICResp for 300 ms, so a connect
+    /// thread (the old way) would be seen.
+    #[test]
+    fn io_queue_connects_on_the_ring_without_a_thread() {
+        let t = Target::start("127.0.0.1:0", TargetCfg { icresp_delay: Duration::from_millis(300), ..Default::default() }).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "ring-connect", Duration::from_secs(20));
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            let mut conn_threads = 0;
+            let done = drive_until(&r.exe, Duration::from_secs(10), || {
+                conn_threads = conn_threads.max(threads_named("nvme-conn"));
+                !rx.is_empty()
+            });
+            assert!(done, "the read never completed");
+            assert_eq!(rx.try_recv(), Ok(4096));
+            assert!(buf == pattern(8, 4096), "wrong read data");
+            assert_eq!(conn_threads, 0, "the I/O queue was connected on a thread");
+            // qid = queue * conns_per_path + k + 1; the admin queue's cntlid; 0-based sqsize.
+            assert_eq!(t.seen.lock().unwrap().io_connects, vec![(1, 1, 127)]);
+            assert_eq!(r.stats.reconnects.load(Ordering::Relaxed), 1);
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q5 over IPv6 (skipped where ::1 is unavailable).
+    #[test]
+    fn io_queue_connects_over_ipv6() {
+        let Some(t) = Target::start("[::1]:0", TargetCfg::default()) else { return };
+        on_ring_thread(move || {
+            let r = rig(&t, "ring-connect-v6", Duration::from_secs(20));
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            assert_eq!(rx.try_recv(), Ok(4096));
+            assert_eq!(t.seen.lock().unwrap().io_connects.len(), 1);
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q5: a handshake exchange that overruns its time limit is cut short by
+    /// its linked timeout (on time, not at a timer tick), backs off, and is
+    /// retried. The limit is 10 s; the test sets 300 ms.
+    #[test]
+    fn a_handshake_past_its_deadline_times_out_and_is_retried() {
+        let t = Target::start("127.0.0.1:0", TargetCfg { hang_io_connect: true, ..Default::default() }).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "dial-deadline", Duration::from_secs(20));
+            let limit = Duration::from_millis(300);
+            r.e.core.dial_limits.set((CONNECT_TIMEOUT, limit));
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || t.seen.lock().unwrap().io_connects.len() == 1));
+            let t0 = Instant::now();
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || r.e.core.connecting.borrow()[0].is_none()), "the connect never ended");
+            let took = t0.elapsed();
+            assert!(took < limit + Duration::from_millis(150), "timed out after {took:?}, limit {limit:?}");
+            assert_eq!(r.e.core.backoff.borrow()[0], Duration::from_millis(500), "one failure doubles the backoff");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || t.seen.lock().unwrap().io_connects.len() == 2), "no retry after the timeout");
+            assert!(wait_for(Duration::from_secs(2), || t.seen.lock().unwrap().io_closed >= 1), "the timed-out connection stayed open");
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q5: a TCP connect that gets no answer (the target's accept queue is
+    /// full, so its SYN is dropped and it sits in SYN_SENT) is cut short by
+    /// its linked timeout. The limit is 3 s; the test sets 300 ms.
+    #[test]
+    fn a_tcp_connect_past_its_deadline_times_out() {
+        let t = Target::start("127.0.0.1:0", TargetCfg { accept_only: Some(1), ..Default::default() }).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "tcp-deadline", Duration::from_secs(20));
+            assert!(wait_for(Duration::from_secs(5), || t.backlog_full.load(Ordering::Acquire)), "the target never filled its accept queue");
+            let limit = Duration::from_millis(300);
+            r.e.core.dial_limits.set((limit, HANDSHAKE_TIMEOUT));
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || r.e.core.connecting.borrow()[0].as_ref().is_some_and(|d| d.sock.is_some())), "no connect started");
+            let t0 = Instant::now();
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || r.e.core.connecting.borrow()[0].is_none()), "the TCP connect never ended");
+            let took = t0.elapsed();
+            assert!(took < limit + Duration::from_millis(150), "timed out after {took:?}, limit {limit:?}");
+            assert_eq!(r.e.core.backoff.borrow()[0], Duration::from_millis(500), "one failure doubles the backoff");
+            assert_eq!(r.stats.reconnects.load(Ordering::Relaxed), 0);
+            assert!(t.seen.lock().unwrap().io_connects.is_empty());
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q5: a connect that completes after its controller was replaced is
+    /// dropped, and the queue connects to the new one at once, without a
+    /// backoff; the request parked meanwhile goes out on the new queue.
+    #[test]
+    fn a_connect_to_a_replaced_controller_is_dropped_and_redone() {
+        let t = Target::start("127.0.0.1:0", TargetCfg { io_connect_delay: Duration::from_millis(300), ..Default::default() }).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "stale-epoch", Duration::from_secs(20));
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            // The Connect is on the wire and its answer is 300 ms away.
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || t.seen.lock().unwrap().io_connects.len() == 1));
+            r.ctrls.paths[0].epoch.fetch_add(1, Ordering::AcqRel);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            assert_eq!(rx.try_recv(), Ok(4096));
+            assert!(buf == pattern(8, 4096), "wrong read data");
+            assert_eq!(t.seen.lock().unwrap().io_connects.len(), 2, "the stale connect was not redone");
+            assert_eq!(r.stats.reconnects.load(Ordering::Relaxed), 1, "the stale queue was installed");
+            assert_eq!(r.e.core.backoff.borrow()[0], Duration::from_millis(250), "a replaced controller is not a failure");
+            assert!(wait_for(Duration::from_secs(2), || t.seen.lock().unwrap().io_closed >= 1), "the stale connection stayed open");
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q5: after an idle drop the first request reconnects from submit()
+    /// itself (the connect task starts before the call returns), not at the
+    /// next idle timer tick.
+    #[test]
+    fn a_request_after_an_idle_drop_reconnects_at_once() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "idle-reconnect", Duration::from_secs(20));
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            // What the timer does after NVMEUBLK_IDLE_DISCONNECT_S.
+            let c = r.e.core.conns.borrow()[0].clone().expect("connected");
+            r.e.core.idle_dropped.set(true);
+            r.e.core.fail_conn(&c, "idle; I/O connection dropped", Cause::Idle);
+            assert!(r.e.core.conns.borrow()[0].is_none());
+            buf.fill(0);
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(r.e.core.connecting.borrow()[0].is_some(), "submit did not start the reconnect");
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            assert_eq!(rx.try_recv(), Ok(4096));
+            assert!(buf == pattern(8, 4096), "wrong read data");
+            assert_eq!(t.seen.lock().unwrap().io_connects.len(), 2);
+            assert_eq!(r.stats.reconnects.load(Ordering::Relaxed), 2);
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q7: dropping the queue's handle shuts the engine down on the ring, and
+    /// the engine is freed with its connection (the task <-> engine cycle
+    /// kept both for good).
+    #[test]
+    fn dropping_the_handle_frees_the_engine_and_its_connection() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "free", Duration::from_secs(20));
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            let t0 = Instant::now();
+            drop(r.e);
+            assert!(t0.elapsed() < Duration::from_secs(1), "shutdown took {:?}", t0.elapsed());
+            assert_eq!(Arc::strong_count(&r.stats), 1, "the engine was not freed");
+            assert!(wait_for(Duration::from_secs(2), || t.seen.lock().unwrap().io_closed == 1), "the I/O connection stayed open");
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q7: a connect still in flight does not keep the engine alive either.
+    #[test]
+    fn dropping_the_handle_aborts_a_connect_in_flight() {
+        let t = Target::start("127.0.0.1:0", TargetCfg { hang_io_connect: true, ..Default::default() }).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "abort-dial", Duration::from_secs(20));
+            r.e.start();
+            // Connect sent, never answered: the connect waits on the ring.
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || t.seen.lock().unwrap().io_connects.len() == 1));
+            let t0 = Instant::now();
+            drop(r.e);
+            assert!(t0.elapsed() < Duration::from_secs(1), "shutdown took {:?}", t0.elapsed());
+            assert_eq!(Arc::strong_count(&r.stats), 1, "the engine was not freed");
+            assert!(wait_for(Duration::from_secs(2), || t.seen.lock().unwrap().io_closed == 1), "the connecting socket stayed open");
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q10: a panicking engine task (here the timer, by fault injection)
+    /// fails the engine: the flush it had on the wire ends in EIO once the
+    /// write fence has passed (the timer is restarted to release it), new
+    /// I/O fails at once, and the connection is closed. The panic used to
+    /// vanish into the executor and leave the flush hanging.
+    #[test]
+    fn a_panicking_engine_task_fails_the_engine_instead_of_hanging() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let fence = Duration::from_millis(300);
+            let r = rig(&t, "panic", fence);
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            assert_eq!(rx.try_recv(), Ok(4096));
+            t.hold_io.store(true, Ordering::Release);
+            let flush = request(&r.e, Op::Flush, &mut []);
+            drive_until(&r.exe, Duration::from_millis(200), || false);
+            std::fs::write(format!("{}/queues", r.fault_dir), "1").unwrap();
+            std::fs::write(format!("{}/fault", r.fault_dir), "panic").unwrap();
+            let t0 = Instant::now();
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || !flush.is_empty()), "the flush hung");
+            assert_eq!(flush.try_recv(), Ok(-libc::EIO));
+            assert!(t0.elapsed() >= fence, "the flush failed before its write fence ({:?})", t0.elapsed());
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_millis(100), || !rx.is_empty()), "a new read hung");
+            assert_eq!(rx.try_recv(), Ok(-libc::EIO));
+            assert_eq!(r.stats.engine_panics.load(Ordering::Relaxed), 1);
+            assert!(wait_for(Duration::from_secs(2), || t.seen.lock().unwrap().io_closed == 1), "the I/O connection stayed open");
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q10: a connect task that panics after its TCP connect leaves nothing
+    /// behind: its socket is the slot's and closes with it, so no stale fd
+    /// is shut down later (at a deadline or at detach) when another socket
+    /// has taken that number.
+    #[test]
+    fn a_connect_task_panic_closes_its_socket_and_leaves_no_stale_fd() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "connect-panic", Duration::from_secs(20));
+            arm_panic("connect-handshake");
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || r.stats.engine_panics.load(Ordering::Relaxed) == 1), "no panic");
+            assert!(r.e.core.connecting.borrow()[0].is_none(), "the panicked connect's slot was left set");
+            assert!(wait_for(Duration::from_secs(2), || t.seen.lock().unwrap().closed == 1), "the panicked connect's socket stayed open");
+            // A new socket, likely on the fd number the dial had. Neither the
+            // timer nor the detach below may touch it.
+            let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+            drive_until(&r.exe, Duration::from_millis(1200), || false);
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert_eq!(rx.try_recv(), Ok(-libc::EIO), "a failed engine must fail new I/O at once");
+            drop(r.e);
+            a.write_all(b"x").expect("a socket opened after the panic was shut down");
+            let mut one = [0u8; 1];
+            b.read_exact(&mut one).unwrap();
+            b.write_all(b"y").unwrap();
+            a.read_exact(&mut one).expect("a socket opened after the panic was shut down");
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q10: a panic while the receiver holds a request on its stack (in
+    /// complete(), after taking it off the connection) fails that request
+    /// with EIO instead of hanging its tag: the tag task keeps a sender of
+    /// its own, so a dropped request never closes the channel. The in-flight
+    /// count stays balanced (the daemon's drain waits on it).
+    #[test]
+    fn a_panic_holding_a_read_fails_it_instead_of_hanging() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "complete-panic", Duration::from_millis(300));
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            arm_panic("complete-removed");
+            let (rx, _tag_tx) = tag_request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(2), || !rx.is_empty()), "the read held by the panicking task hung");
+            assert_eq!(rx.try_recv(), Ok(-libc::EIO));
+            assert_eq!(r.stats.engine_panics.load(Ordering::Relaxed), 1);
+            assert_eq!(r.stats.inflight.load(Ordering::Relaxed), 0, "in-flight count left off");
+            assert!(wait_for(Duration::from_secs(2), || t.seen.lock().unwrap().io_closed == 1), "the I/O connection stayed open");
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q10: a panic inside fail_conn's failover loop drops the request in
+    /// hand and the rest of the loop's. They come back: the read fails at
+    /// once, and the flush, which may still be on the wire, only once the
+    /// write fence has passed.
+    #[test]
+    fn a_panic_in_a_failover_loop_fails_its_requests_and_keeps_the_fence() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let fence = Duration::from_millis(500);
+            let r = rig(&t, "failover-panic", fence);
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            t.hold_io.store(true, Ordering::Release);
+            let (read, _rtx) = tag_request(&r.e, Op::Read, &mut buf);
+            let (flush, _ftx) = tag_request(&r.e, Op::Flush, &mut []);
+            drive_until(&r.exe, Duration::from_millis(200), || false);
+            assert_eq!(r.stats.inflight.load(Ordering::Relaxed), 2);
+            arm_panic("failover-loop");
+            std::fs::write(format!("{}/queues", r.fault_dir), "1").unwrap();
+            std::fs::write(format!("{}/fault", r.fault_dir), "kill 0").unwrap();
+            let t0 = Instant::now();
+            assert!(drive_until(&r.exe, Duration::from_secs(2), || !read.is_empty()), "the read hung");
+            assert_eq!(read.try_recv(), Ok(-libc::EIO));
+            assert!(t0.elapsed() < fence, "the read waited for the write fence");
+            assert_eq!(r.stats.engine_panics.load(Ordering::Relaxed), 1);
+            assert!(flush.is_empty(), "the flush failed before its write fence");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || !flush.is_empty()), "the flush hung");
+            assert_eq!(flush.try_recv(), Ok(-libc::EIO));
+            assert!(t0.elapsed() >= fence, "the flush failed before its write fence ({:?})", t0.elapsed());
+            assert_eq!(r.stats.inflight.load(Ordering::Relaxed), 0, "in-flight count left off");
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q10: a timer that panics twice (after its restart) still holds the
+    /// write fence: a stand-in task releases the fenced flush to EIO once
+    /// the fence has passed, not at the second panic.
+    #[test]
+    fn a_timer_that_panics_twice_still_keeps_the_write_fence() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let fence = Duration::from_millis(700);
+            let r = rig(&t, "timer-panic-twice", fence);
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            t.hold_io.store(true, Ordering::Release);
+            let (flush, _ftx) = tag_request(&r.e, Op::Flush, &mut []);
+            drive_until(&r.exe, Duration::from_millis(200), || false);
+            std::fs::write(format!("{}/queues", r.fault_dir), "1").unwrap();
+            std::fs::write(format!("{}/fault", r.fault_dir), "panic").unwrap();
+            let t0 = Instant::now();
+            assert!(drive_until(&r.exe, Duration::from_secs(2), || r.stats.engine_panics.load(Ordering::Relaxed) == 1), "no first panic");
+            std::fs::write(format!("{}/fault", r.fault_dir), "panic").unwrap();
+            assert!(drive_until(&r.exe, Duration::from_secs(2), || r.stats.engine_panics.load(Ordering::Relaxed) == 2), "no second panic");
+            assert!(t0.elapsed() < fence, "the test is too slow to tell");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || !flush.is_empty()), "the flush hung");
+            assert_eq!(flush.try_recv(), Ok(-libc::EIO));
+            assert!(t0.elapsed() >= fence, "the flush failed before its write fence ({:?})", t0.elapsed());
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Q10: engine code a tag task runs (QEngine::submit) is guarded too: a
+    /// panic there fails the engine and the request, instead of killing the
+    /// tag task in silence with its request unanswered.
+    #[test]
+    fn a_panic_in_submit_fails_the_engine_and_the_request() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "submit-panic", Duration::from_secs(20));
+            r.e.start();
+            arm_panic("submit");
+            let mut buf = vec![0u8; 4096];
+            let (rx, _tx) = tag_request(&r.e, Op::Read, &mut buf);
+            assert_eq!(rx.try_recv(), Ok(-libc::EIO), "the request was not answered");
+            assert_eq!(r.stats.engine_panics.load(Ordering::Relaxed), 1);
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert_eq!(rx.try_recv(), Ok(-libc::EIO));
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// A Pending dropped without a result answers EIO when it has no engine
+    /// to go back to (never submitted, or its engine is gone).
+    #[test]
+    fn an_orphaned_request_with_no_engine_answers_eio() {
+        let (tx, rx) = smol::channel::bounded(1);
+        let mut buf = [0u8; 512];
+        drop(Pending::new(Op::Write, 0, 1, buf.as_mut_ptr(), 512, tx.clone(), None, None));
+        assert_eq!(rx.try_recv(), Ok(-libc::EIO));
+        Pending::new(Op::Read, 0, 1, buf.as_mut_ptr(), 512, tx, None, None).finish(512);
+        assert_eq!(rx.try_recv(), Ok(512), "finish answers once, and Drop adds nothing");
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// LeakOnUnwind frees its value on a normal drop, and leaks it when a
+    /// panic unwinds the frame that holds it (an SQE may still write to it).
+    #[test]
+    fn leak_on_unwind_leaks_only_while_unwinding() {
+        struct Counted(Rc<Cell<u32>>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        drop(LeakOnUnwind::new(Counted(drops.clone())));
+        assert_eq!(drops.get(), 1);
+        let d2 = drops.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = LeakOnUnwind::new(Counted(d2));
+            panic!("unwind");
+        }));
+        assert!(r.is_err());
+        assert_eq!(drops.get(), 1, "freed while unwinding");
     }
 }

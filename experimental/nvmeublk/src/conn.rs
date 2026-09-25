@@ -79,15 +79,24 @@ pub struct Ident {
 
 fn dial(addr: SocketAddr) -> Result<TcpStream> {
     let s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).with_context(|| format!("connect {addr}"))?;
-    s.set_nodelay(true)?;
+    tune_socket(s.as_raw_fd())?;
+    Ok(s)
+}
+
+/// Socket options every NVMe/TCP connection gets, whether it is dialled
+/// here (blocking) or on a queue's io_uring (qengine.rs).
+pub fn tune_socket(fd: i32) -> Result<()> {
+    let one: libc::c_int = 1;
+    if unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as u32) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("TCP_NODELAY");
+    }
     // NVMEUBLK_RCVBUF (bytes, tuning; 0 = kernel autotuning): a fixed
     // receive buffer, so the advertised window does not have to grow with
     // the measured drain rate first.
     if let Some(n) = std::env::var("NVMEUBLK_RCVBUF").ok().and_then(|v| v.parse::<libc::c_int>().ok()).filter(|&n| n > 0) {
-        use std::os::fd::AsRawFd;
-        unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, &n as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as u32) };
+        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &n as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as u32) };
     }
-    Ok(s)
+    Ok(())
 }
 
 /// Synchronous admin queue. Only the multipath maintenance thread uses it.
@@ -376,26 +385,73 @@ static DISABLE_SQFLOW: std::sync::LazyLock<bool> =
 
 /// Dial, handshake and Connect one I/O queue (`qid` >= 1) on controller
 /// `cntlid`. Blocking; returns the ready socket and the target's maxh2cdata.
+/// The queue threads do the same on their io_uring (qengine.rs), with the
+/// pieces below, so both paths put the same bytes on the wire.
 pub fn connect_io_queue(addr: SocketAddr, id: &Ident, cntlid: u16, qid: u16, qsize: u16) -> Result<(TcpStream, u32)> {
     let mut s = dial(addr)?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (_cpda, maxh2c) = ic_handshake(&mut s)?;
+    s.write_all(&io_connect_capsule(id, cntlid, qid, qsize)).context("send command capsule")?;
+    let (ch, psh) = read_hdr(&mut s)?;
+    check_io_connect_resp(qid, &ch, &psh)?;
+    // Completions are waited on indefinitely; stalls are the watchdog's job.
+    s.set_read_timeout(None)?;
+    Ok((s, maxh2c.max(4096)))
+}
+
+/// The ICReq PDU that `ic_handshake` sends: pfv 0, hpda 0, no digests,
+/// maxr2t 0 (one outstanding R2T per command).
+pub fn icreq_pdu() -> [u8; 128] {
+    let mut req = [0u8; 128];
+    req[0] = PDU_IC_REQ;
+    req[2] = 128; // hlen
+    req[4..8].copy_from_slice(&128u32.to_le_bytes()); // plen
+    req
+}
+
+/// Validate a received ICResp (all 128 bytes) exactly as the blocking
+/// handshake does, by running `ic_handshake` over it; its ICReq goes
+/// nowhere. Returns the target's maxh2cdata.
+pub fn icresp_maxh2c(resp: &[u8]) -> Result<u32> {
+    struct Replay<'a>(&'a [u8]);
+    impl Read for Replay<'_> {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(b)
+        }
+    }
+    impl Write for Replay<'_> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    Ok(ic_handshake(&mut Replay(resp))?.1)
+}
+
+/// The Fabrics Connect command capsule (header and data, as sent) for I/O
+/// queue `qid` of controller `cntlid`.
+pub fn io_connect_capsule(id: &Ident, cntlid: u16, qid: u16, qsize: u16) -> Vec<u8> {
     // NVMEUBLK_DISABLE_SQFLOW (tuning): nothing here uses the SQ head, so
     // trade it for one PDU less per read (see CATTR_DISABLE_SQFLOW).
     let cattr = if *DISABLE_SQFLOW { CATTR_DISABLE_SQFLOW } else { 0 };
     let (sqe, data) = connect_cmd(0, qid, qsize - 1, cattr, 0, cntlid, &id.hostid, &id.subnqn, &id.hostnqn);
-    write_capsule(&mut s, &sqe, &data)?;
-    let (ch, psh) = read_hdr(&mut s)?;
+    let mut v = Vec::with_capacity(CMD_HLEN + data.len());
+    let _ = write_capsule(&mut v, &sqe, &data); // a Vec never refuses a write
+    v
+}
+
+/// Check the response to an I/O queue Connect, as `read_hdr` returned it.
+pub fn check_io_connect_resp(qid: u16, ch: &Ch, psh: &[u8]) -> Result<()> {
     if ch.ptype != PDU_CAPSULE_RESP {
         bail!("expected Connect response on I/O queue {qid}, got {:#x}", ch.ptype);
     }
-    let cqe = Cqe::parse(&psh);
+    let cqe = Cqe::parse(psh);
     if cqe.sc() != 0 {
         bail!("I/O queue {qid} Connect rejected: {:#x}", cqe.status);
     }
-    // Completions are waited on indefinitely; stalls are the watchdog's job.
-    s.set_read_timeout(None)?;
-    Ok((s, maxh2c.max(4096)))
+    Ok(())
 }
 
 /// A pipelined I/O queue on one path.
@@ -617,5 +673,75 @@ impl IoConn {
         }
         let _ = r.shutdown(Shutdown::Both);
         self.drain()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A duplex stream for `ic_handshake`: records what it writes, replays `rx`.
+    struct Script {
+        tx: Vec<u8>,
+        rx: std::io::Cursor<Vec<u8>>,
+    }
+    impl Read for Script {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.rx.read(b)
+        }
+    }
+    impl Write for Script {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.tx.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn icresp(dgst: u8, maxh2c: u32) -> Vec<u8> {
+        let mut r = vec![0u8; 128];
+        r[0] = PDU_IC_RESP;
+        r[2] = 128;
+        r[4..8].copy_from_slice(&128u32.to_le_bytes());
+        r[11] = dgst;
+        r[12..16].copy_from_slice(&maxh2c.to_le_bytes());
+        r
+    }
+
+    /// The ring-native connect (qengine.rs) builds its handshake from these
+    /// helpers; they must match the blocking handshake byte for byte and
+    /// check by check.
+    #[test]
+    fn ring_handshake_pieces_match_the_blocking_handshake() {
+        let mut s = Script { tx: Vec::new(), rx: std::io::Cursor::new(icresp(0, 65536)) };
+        let (_, maxh2c) = ic_handshake(&mut s).unwrap();
+        assert_eq!(s.tx, icreq_pdu().to_vec());
+        assert_eq!(icresp_maxh2c(&icresp(0, 65536)).unwrap(), maxh2c);
+        assert!(icresp_maxh2c(&icresp(1, 65536)).is_err(), "digests must be refused");
+        let mut bad = icresp(0, 65536);
+        bad[0] = PDU_CAPSULE_RESP;
+        assert!(icresp_maxh2c(&bad).is_err(), "a non-ICResp must be refused");
+        assert!(icresp_maxh2c(&icresp(0, 65536)[..100]).is_err(), "a short ICResp must be refused");
+
+        let id = Ident { hostnqn: "nqn.2014-08.org.nvmexpress:uuid:h".into(), hostid: [7; 16], subnqn: "nqn.test:sub".into() };
+        let cap = io_connect_capsule(&id, 0x21, 5, 128);
+        assert_eq!(cap.len(), CMD_HLEN + 1024);
+        let sqe = &cap[CH_LEN..CMD_HLEN];
+        assert_eq!((cap[0], sqe[0], sqe[4]), (PDU_CAPSULE_CMD, OPC_FABRICS, FCTYPE_CONNECT));
+        assert_eq!(u16::from_le_bytes([sqe[42], sqe[43]]), 5, "qid");
+        assert_eq!(u16::from_le_bytes([sqe[44], sqe[45]]), 127, "0-based sqsize");
+        assert_eq!(u16::from_le_bytes([cap[CMD_HLEN + 16], cap[CMD_HLEN + 17]]), 0x21, "cntlid");
+
+        let mut resp = [0u8; 24];
+        resp[0] = PDU_CAPSULE_RESP;
+        resp[2] = 24;
+        resp[4..8].copy_from_slice(&24u32.to_le_bytes());
+        let (ch, psh) = read_hdr(&mut &resp[..]).unwrap();
+        assert!(check_io_connect_resp(5, &ch, &psh).is_ok());
+        resp[22..24].copy_from_slice(&(0x182u16 << 1).to_le_bytes()); // Connect Invalid Parameters
+        let (ch, psh) = read_hdr(&mut &resp[..]).unwrap();
+        assert!(check_io_connect_resp(5, &ch, &psh).is_err());
     }
 }
