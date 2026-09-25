@@ -7,20 +7,82 @@
 use crate::conn::{AdminConn, Ident, NsInfo};
 use anyhow::{bail, Result};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
+
+/// A mutex that does not poison. The supervisor takes the same locks as
+/// the queue threads and the reconnect threads (cntlid, max_qsize); with
+/// std's poisoning, one of those threads panicking while holding a lock
+/// would make the supervisor's next lock panic too, and that one thread
+/// keeps every volume's controllers alive. The data behind these locks
+/// stays usable after a panic: each critical section is a single load or
+/// store, or one supervisor pass over a device, which the next pass picks
+/// up from whatever state the slots are in.
+///
+/// `lock()` keeps `Mutex::lock`'s signature, but its error type is
+/// uninhabited, so `.lock().unwrap()` call sites (here and in qengine.rs)
+/// compile unchanged and can no longer panic.
+pub struct Lock<T>(Mutex<T>);
+
+impl<T> Lock<T> {
+    pub const fn new(v: T) -> Self {
+        Lock(Mutex::new(v))
+    }
+
+    pub fn lock(&self) -> Result<MutexGuard<'_, T>, std::convert::Infallible> {
+        Ok(self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// Most admin reconnect threads running at once, process-wide. When a
+/// target reboots, every path to it of every volume drops in the same
+/// supervisor pass; uncapped, that pass starts one thread per path per
+/// volume (200 at 100 two-path volumes), each blocking up to 3 s in connect
+/// and 10 s in a read, with its stack mlocked. A path that finds no free
+/// slot keeps its turn and asks again on the next pass (100 ms).
+const MAX_RECONNECTS: usize = 32;
+
+static RECONNECTS: ReconnectSlots = ReconnectSlots::new(MAX_RECONNECTS);
+
+/// Counts the running reconnect threads against a cap.
+struct ReconnectSlots {
+    busy: AtomicUsize,
+    max: usize,
+}
+
+/// One running reconnect's slot, freed when this is dropped: when its
+/// thread ends, by return or by panic, or when the thread cannot be spawned
+/// (the closure that owns it is dropped then).
+struct ReconnectPermit<'a>(&'a ReconnectSlots);
+
+impl ReconnectSlots {
+    const fn new(max: usize) -> Self {
+        ReconnectSlots { busy: AtomicUsize::new(0), max }
+    }
+
+    fn try_take(&self) -> Option<ReconnectPermit<'_>> {
+        self.busy.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max).then_some(n + 1)).ok()?;
+        Some(ReconnectPermit(self))
+    }
+}
+
+impl Drop for ReconnectPermit<'_> {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub struct CtrlPath {
     pub addr: SocketAddr,
     /// Controller id of the live admin queue, 0 while down.
-    cntlid: Mutex<u16>,
+    cntlid: Lock<u16>,
     /// Bumped every time the controller is lost or replaced. A queue whose
     /// I/O connection was made under an older epoch must reconnect: its
     /// queue belongs to a controller that no longer exists.
     pub epoch: AtomicU64,
-    pub max_qsize: Mutex<u16>,
+    pub max_qsize: Lock<u16>,
     /// A queue thread saw this path fail under epoch N and asks for the whole
     /// controller to be torn down (0 = no request). Honoured only while the
     /// epoch is still N, so a late report cannot kill a fresh controller.
@@ -73,7 +135,7 @@ pub struct Ctrls {
     kato: Duration,
     stop: AtomicBool,
     /// Supervisor-owned state per path.
-    slots: Mutex<Vec<PathSlot>>,
+    slots: Lock<Vec<PathSlot>>,
 }
 
 /// What the supervisor tracks for one path.
@@ -98,14 +160,14 @@ struct PathSlot {
 /// on short-lived threads, so one dead or hung target cannot delay the
 /// keep-alives of every other volume past their KATO.
 struct Supervisor {
-    ctrls: Mutex<Vec<Weak<Ctrls>>>,
+    ctrls: Lock<Vec<Weak<Ctrls>>>,
     /// Set only once the supervisor thread was actually spawned: a failed
     /// spawn must be retried by the next register(), or every device from
     /// then on would get no keep-alive and no reconnect at all.
-    running: Mutex<bool>,
+    running: Lock<bool>,
 }
 
-static SUPERVISOR: LazyLock<Supervisor> = LazyLock::new(|| Supervisor { ctrls: Mutex::new(Vec::new()), running: Mutex::new(false) });
+static SUPERVISOR: LazyLock<Supervisor> = LazyLock::new(|| Supervisor { ctrls: Lock::new(Vec::new()), running: Lock::new(false) });
 
 impl Supervisor {
     fn register(c: &Arc<Ctrls>) -> Result<()> {
@@ -120,6 +182,7 @@ impl Supervisor {
     }
 
     fn run(&self) {
+        let mut turn = 0usize;
         loop {
             std::thread::sleep(Duration::from_millis(100));
             let live: Vec<Arc<Ctrls>> = {
@@ -127,8 +190,24 @@ impl Supervisor {
                 list.retain(|w| w.strong_count() > 0);
                 list.iter().filter_map(Weak::upgrade).collect()
             };
-            for c in live {
-                c.tick();
+            Self::pass(&live, turn);
+            turn = turn.wrapping_add(1);
+        }
+    }
+
+    /// One pass over every device, starting at device `start % len`. The
+    /// start moves every pass: while reconnect threads are capped, the
+    /// devices first in line would otherwise take every slot that frees up,
+    /// and the paths of a dead target could keep a live target's paths from
+    /// reconnecting. A panic in one device's pass is caught and logged: it
+    /// must not end the only thread that keeps every other device's
+    /// controllers alive, and as its locks do not poison, the next pass runs
+    /// normally.
+    fn pass(live: &[Arc<Ctrls>], start: usize) {
+        let n = live.len();
+        for c in live.iter().cycle().skip(start % n.max(1)).take(n) {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.tick())).is_err() {
+                log::error!("admin supervisor: pass for {} panicked; continuing with the other devices", c.id.subnqn);
             }
         }
     }
@@ -140,7 +219,7 @@ impl Ctrls {
         let mut info = None;
         let paths: Vec<Arc<CtrlPath>> = addrs
             .iter()
-            .map(|a| Arc::new(CtrlPath { addr: *a, cntlid: Mutex::new(0), epoch: AtomicU64::new(1), max_qsize: Mutex::new(128), fence_req: AtomicU64::new(0) }))
+            .map(|a| Arc::new(CtrlPath { addr: *a, cntlid: Lock::new(0), epoch: AtomicU64::new(1), max_qsize: Lock::new(128), fence_req: AtomicU64::new(0) }))
             .collect();
         let mut admins = Vec::new();
         for p in &paths {
@@ -175,7 +254,7 @@ impl Ctrls {
             .into_iter()
             .map(|admin| PathSlot { admin, backoff: Duration::from_millis(250), next_try: now, last_ka: now, ka: None, connecting: None })
             .collect();
-        let me = Arc::new(Ctrls { paths, id, info, kato, stop: AtomicBool::new(false), slots: Mutex::new(slots) });
+        let me = Arc::new(Ctrls { paths, id, info, kato, stop: AtomicBool::new(false), slots: Lock::new(slots) });
         Supervisor::register(&me)?;
         Ok(me)
     }
@@ -311,12 +390,17 @@ impl Ctrls {
         if now < s.next_try {
             return;
         }
+        // At the process-wide cap: keep this path's turn (next_try is left
+        // as it is) and ask again on the next pass.
+        let Some(permit) = RECONNECTS.try_take() else { return };
         // Reconnect on its own thread: TCP connect, enable and identify block.
         // Validation and the epoch bump happen there, in the same order the
         // per-path supervisor used, before the supervisor sees the connection.
         let (tx, rx) = mpsc::channel();
         let me = self.clone();
         let spawned = std::thread::Builder::new().name(format!("nvme-reconn-{i}")).spawn(move || {
+            // Held for the thread's whole life: its slot frees when it ends.
+            let _permit = permit;
             let p = &me.paths[i];
             let r = match Self::bring_up(p, &me.id, me.kato) {
                 Ok((a, _)) if me.stop.load(Ordering::Acquire) => {
@@ -356,5 +440,122 @@ impl Ctrls {
     /// keep-alive agrees; here we just record nothing and let keep-alive decide.
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device with every path down and due for a reconnect. Built without
+    /// a target (Ctrls::new needs one) and never registered with the process
+    /// supervisor, so only the test ticks it.
+    fn down_ctrls(addrs: Vec<SocketAddr>) -> Arc<Ctrls> {
+        let now = Instant::now();
+        let paths = addrs.iter().map(|a| Arc::new(CtrlPath { addr: *a, cntlid: Lock::new(0), epoch: AtomicU64::new(1), max_qsize: Lock::new(128), fence_req: AtomicU64::new(0) })).collect();
+        let slots = addrs.iter().map(|_| down_slot(now)).collect();
+        let id = Ident { hostnqn: "nqn.2014-08.org.nvmexpress:uuid:test".into(), hostid: [0; 16], subnqn: "nqn.test:ctrls".into() };
+        let info = NsInfo { nsze: 1 << 20, lba_shift: 9, nguid: [0; 16], eui64: [0; 8], incapsule_bytes: 8192, mdts_bytes: 1 << 20 };
+        Arc::new(Ctrls { paths, id: Arc::new(id), info, kato: Duration::from_secs(15), stop: AtomicBool::new(false), slots: Lock::new(slots) })
+    }
+
+    fn down_slot(now: Instant) -> PathSlot {
+        PathSlot { admin: None, backoff: Duration::from_millis(250), next_try: now, last_ka: now, ka: None, connecting: None }
+    }
+
+    #[test]
+    fn reconnect_slots_cap_and_free() {
+        let slots = ReconnectSlots::new(2);
+        let a = slots.try_take().expect("first slot");
+        let b = slots.try_take().expect("second slot");
+        assert!(slots.try_take().is_none(), "a third reconnect must wait for a free slot");
+        drop(a);
+        let c = slots.try_take().expect("a dropped permit frees its slot");
+        // A reconnect thread that panics frees its slot as it unwinds.
+        let r = std::thread::scope(|sc| {
+            sc.spawn(move || {
+                let _permit = c;
+                panic!("reconnect thread dies");
+            })
+            .join()
+        });
+        assert!(r.is_err());
+        let _d = slots.try_take().expect("a panicked thread's permit frees its slot");
+        drop(b);
+    }
+
+    /// A target reboot drops every path at once. One pass must start no
+    /// more than MAX_RECONNECTS reconnect threads, and the rest keep their
+    /// turn for a later pass.
+    #[test]
+    fn target_reboot_reconnects_are_capped() {
+        // A target that completes the TCP handshake and never answers: each
+        // reconnect blocks in its first read, so none ends during the pass.
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = target.local_addr().unwrap();
+        let c = down_ctrls(vec![addr; MAX_RECONNECTS + 8]);
+        c.tick();
+        let (started, waiting) = {
+            let slots = c.slots.lock().unwrap();
+            let started = slots.iter().filter(|s| s.connecting.is_some()).count();
+            let now = Instant::now();
+            (started, slots.iter().filter(|s| s.connecting.is_none() && s.next_try <= now).count())
+        };
+        assert_eq!(started, MAX_RECONNECTS, "reconnect threads started in one pass");
+        assert_eq!(waiting, 8, "paths over the cap stay due for the next pass");
+        assert_eq!(RECONNECTS.busy.load(Ordering::Acquire), MAX_RECONNECTS);
+        // The target goes away: the blocked reconnects fail, and each ended
+        // thread gives its slot back.
+        drop(target);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while RECONNECTS.busy.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "reconnect slots not freed by their ended threads");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        c.shutdown();
+    }
+
+    #[test]
+    fn a_panic_under_a_path_lock_does_not_poison_it() {
+        let c = down_ctrls(vec!["127.0.0.1:4420".parse().unwrap()]);
+        let p = c.paths[0].clone();
+        let p2 = p.clone();
+        let r = std::thread::spawn(move || {
+            let _held = p2.cntlid.lock().unwrap();
+            panic!("a thread dies holding the cntlid lock");
+        })
+        .join();
+        assert!(r.is_err());
+        // What the queue threads and the supervisor do next.
+        assert_eq!(p.cntlid(), None);
+        assert_eq!(p.snapshot(), None);
+        Ctrls::lose(&p);
+        assert_eq!(p.epoch.load(Ordering::Acquire), 2);
+    }
+
+    /// One device's pass panicking must not stop the pass over the others,
+    /// nor poison the device's own slots for the next pass.
+    #[test]
+    fn a_panicking_device_does_not_stop_the_supervisor() {
+        // A slot with no path behind it: its pass panics indexing the paths,
+        // while holding the device's slots lock.
+        let bad = down_ctrls(vec![]);
+        bad.slots.lock().unwrap().push(down_slot(Instant::now()));
+        // A healthy device with a failed reconnect waiting to be adopted: its
+        // pass consumes it and doubles the backoff, and starts no thread.
+        let good = down_ctrls(vec!["127.0.0.1:4420".parse().unwrap()]);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(false)).unwrap();
+        good.slots.lock().unwrap()[0].connecting = Some(rx);
+        Supervisor::pass(&[bad.clone(), good.clone()], 0);
+        {
+            let slots = good.slots.lock().unwrap();
+            assert!(slots[0].connecting.is_none(), "the device after the panicking one was not ticked");
+            assert_eq!(slots[0].backoff, Duration::from_millis(500));
+        }
+        good.shutdown();
+        // The next pass over the panicking device locks its slots again.
+        Supervisor::pass(&[bad.clone()], 1);
+        assert_eq!(bad.slots.lock().unwrap().len(), 1);
     }
 }

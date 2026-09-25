@@ -2849,14 +2849,45 @@ impl UblkCtrl {
             })
     }
 
+    /// The process-wide queue-thread CPU mask set by `set_queue_cpus`.
+    fn queue_cpus() -> &'static std::sync::Mutex<Option<UblkQueueAffinity>> {
+        static QUEUE_CPUS: std::sync::Mutex<Option<UblkQueueAffinity>> =
+            std::sync::Mutex::new(None);
+        &QUEUE_CPUS
+    }
+
+    /// Confine every queue thread pinned from now on to `cpus`, in place
+    /// of the per-queue mask computed here (the queue's blk-mq CPU group,
+    /// or one CPU of it in single-CPU mode); `None` restores that default.
+    /// CPUs past the mask's 1024 bits are ignored, and a list left with no
+    /// CPU is `None`.
+    ///
+    /// `set_thread_affinity` is the one writer of queue-thread affinity.
+    /// A target that calls sched_setaffinity from its queue function races
+    /// with it: the spawning thread pins the queue thread while the queue
+    /// function already runs, and whichever call lands last wins.
+    pub fn set_queue_cpus(cpus: Option<&[usize]>) {
+        let mask = cpus.and_then(|cpus| {
+            let mut m = UblkQueueAffinity::new();
+            let bits = m.buf_len() * 8;
+            for &cpu in cpus.iter().filter(|&&cpu| cpu < bits) {
+                m.set_cpu(cpu);
+            }
+            (!m.is_empty()).then_some(m)
+        });
+        *Self::queue_cpus().lock().unwrap_or_else(|e| e.into_inner()) = mask;
+    }
+
     /// Set queue thread affinity using thread ID
     ///
     /// This function sets CPU affinity for the specified thread ID.
     /// It should be called from the main thread context after receiving
     /// the thread ID from the queue thread.
     pub fn set_thread_affinity(&self, qid: u16, tid: libc::pid_t) {
-        // Calculate and set affinity using the thread ID
-        let affinity = self.calculate_queue_affinity(qid);
+        // The process-wide mask (set_queue_cpus) if there is one, else
+        // this queue's own.
+        let cpus = *Self::queue_cpus().lock().unwrap_or_else(|e| e.into_inner());
+        let affinity = cpus.unwrap_or_else(|| self.calculate_queue_affinity(qid));
 
         unsafe {
             libc::sched_setaffinity(
@@ -2883,6 +2914,13 @@ impl UblkCtrl {
         tid
     }
 
+    /// Queue thread name, as `top -H` and /proc/<pid>/task/*/comm show it:
+    /// "ublk<dev>-q<queue>t<thread>". Linux keeps 15 bytes, which fits
+    /// dev < 10000, queue < 1000 and thread < 10; a longer one loses its tail.
+    fn queue_thread_name(dev_id: u32, q: u16, t: u16) -> String {
+        format!("ublk{dev_id}-q{q}t{t}")
+    }
+
     fn create_queue_handlers<Q>(
         &self,
         dev: &Arc<UblkDev>,
@@ -2907,8 +2945,9 @@ impl UblkCtrl {
                 let _dev = Arc::clone(dev);
                 let _tx = tx.clone();
                 let mut _q_fn = q_fn.clone();
+                let name = Self::queue_thread_name(dev.dev_info.dev_id, q, t);
 
-                q_threads.push(std::thread::spawn(move || {
+                q_threads.push(std::thread::Builder::new().name(name).spawn(move || {
                     let tid = Self::init_queue_thread();
                     // Read by UblkQueue::new() to pick this thread's tags.
                     crate::io::set_io_thread_idx(t);
@@ -2917,7 +2956,7 @@ impl UblkCtrl {
                         return;
                     }
                     _q_fn(q, &_dev);
-                }));
+                }).expect("failed to spawn thread"));
             }
         }
 
@@ -3024,6 +3063,32 @@ mod tests {
 
         UblkCtrl::init_queue_thread();
         assert_eq!(unsafe { libc::prctl(PR_GET_IO_FLUSHER, 0, 0, 0, 0) }, 1);
+    }
+
+    #[test]
+    fn test_queue_thread_name_fits_comm() {
+        assert_eq!(UblkCtrl::queue_thread_name(12, 3, 0), "ublk12-q3t0");
+        // TASK_COMM_LEN - 1 bytes are kept.
+        assert_eq!(UblkCtrl::queue_thread_name(9999, 999, 9).len(), 15);
+    }
+
+    #[test]
+    fn test_set_queue_cpus() {
+        let cur = || {
+            UblkCtrl::queue_cpus()
+                .lock()
+                .unwrap()
+                .map(|m| m.to_bits_vec())
+        };
+        // Process-wide: keep the window short and restore the default.
+        UblkCtrl::set_queue_cpus(Some(&[1, 3, 4096]));
+        let listed = cur();
+        UblkCtrl::set_queue_cpus(Some(&[4096]));
+        let none_usable = cur();
+        UblkCtrl::set_queue_cpus(None);
+        assert_eq!(listed, Some(vec![1, 3]));
+        assert_eq!(none_usable, None, "a list with no usable CPU keeps the default");
+        assert_eq!(cur(), None);
     }
 
     #[test]

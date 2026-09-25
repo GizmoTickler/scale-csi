@@ -228,27 +228,11 @@ fn queue_fn(
     draining: Arc<std::sync::atomic::AtomicBool>,
     cfg: qengine::QConfig,
 ) {
-    // Queue-thread CPU placement (NVMEUBLK_QUEUE_CPUS, tuning). libublk pins
-    // each queue thread to its blk-mq CPU group, which at one queue per CPU is
-    // exactly the submitting CPU: at QD1 the submitter and the queue thread
-    // then take turns on one core. "all" lets the thread run anywhere.
-    // A CPU list ("14-15", "6,7,14,15") confines every queue thread to
-    // those CPUs: dedicated storage cores the workload does not run on.
-    let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) }.max(1) as usize).min(libc::CPU_SETSIZE as usize);
-    let cpus: Option<Vec<usize>> = match std::env::var("NVMEUBLK_QUEUE_CPUS").as_deref() {
-        Ok("all") => Some((0..ncpu).collect()),
-        Ok(list) if list.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => Some(parse_cpu_list(list).into_iter().filter(|&c| c < ncpu).collect()),
-        _ => None,
-    };
-    if let Some(cpus) = cpus.filter(|c| !c.is_empty()) {
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            for cpu in cpus {
-                libc::CPU_SET(cpu, &mut set);
-            }
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-        }
-    }
+    // No CPU placement here. libublk pins this thread from the thread that
+    // spawned it, while this function is already running, so pinning here
+    // too raced with it and whichever call landed last won.
+    // NVMEUBLK_QUEUE_CPUS goes to libublk once at startup instead
+    // (set_queue_cpus), the one place queue threads get their affinity.
     // NAPI busy poll (NVMEUBLK_NAPI_US): while this queue thread waits for
     // events, the kernel polls the NIC queues of the sockets on its ring for
     // up to N us instead of sleeping until an interrupt. Trades a slice of a
@@ -377,6 +361,35 @@ fn queue_fn(
     // ending must not stop the other queues' timers (reconnect, expiry).
 }
 
+/// Queue-thread CPU placement (NVMEUBLK_QUEUE_CPUS, tuning). libublk pins
+/// each queue thread to its blk-mq CPU group, which at one queue per CPU is
+/// exactly the submitting CPU: at QD1 the submitter and the queue thread
+/// then take turns on one core. "all" lets the threads run anywhere. A CPU
+/// list ("14-15", "6,7,14,15") confines every queue thread to those CPUs:
+/// dedicated storage cores the workload does not run on. None (unset,
+/// anything else, or a list naming no CPU below `ncpu`) keeps libublk's
+/// placement.
+fn queue_cpus(val: Option<&str>, ncpu: usize) -> Option<Vec<usize>> {
+    let cpus: Vec<usize> = match val {
+        Some("all") => (0..ncpu).collect(),
+        Some(list) if list.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => parse_cpu_list(list).into_iter().filter(|&c| c < ncpu).collect(),
+        _ => return None,
+    };
+    (!cpus.is_empty()).then_some(cpus)
+}
+
+/// Hand NVMEUBLK_QUEUE_CPUS to libublk, which applies it when it pins each
+/// queue thread: the only writer of queue-thread affinity. Before any
+/// device starts.
+fn set_queue_cpus() {
+    let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) }.max(1) as usize).min(libc::CPU_SETSIZE as usize);
+    let cpus = queue_cpus(std::env::var("NVMEUBLK_QUEUE_CPUS").ok().as_deref(), ncpu);
+    if let Some(cpus) = &cpus {
+        log::info!("queue threads confined to CPUs {cpus:?} (NVMEUBLK_QUEUE_CPUS)");
+    }
+    libublk::ctrl::UblkCtrl::set_queue_cpus(cpus.as_deref());
+}
+
 /// "0-3,8,10-11" -> [0, 1, 2, 3, 8, 10, 11]. Malformed parts are skipped.
 fn parse_cpu_list(list: &str) -> Vec<usize> {
     let mut out = Vec::new();
@@ -422,6 +435,7 @@ fn harden_for_writeback() {
 /// environment (the test scripts' interface). SIGINT deletes the device.
 fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     harden_for_writeback();
+    set_queue_cpus();
     qengine::set_zc_recv_preference(env_u64("NVMEUBLK_ZC_RECV", 0) != 0);
     let spec = device::DeviceSpec {
         volume: std::env::var("NVMEUBLK_VOLUME").unwrap_or_else(|_| "run".into()),
@@ -464,7 +478,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
     })?;
     let (st, cstat) = (r.stats.clone(), r.ctrls.clone());
-    std::thread::spawn(move || {
+    let stats_thread = std::thread::Builder::new().name("nvme-stats".into()).spawn(move || {
       let mut last = (0u64, 0u64, 0u64);
       loop {
         std::thread::sleep(Duration::from_secs(5));
@@ -498,6 +512,10 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         );
       }
     });
+    // Diagnostics only: without it the device still serves.
+    if let Err(e) = stats_thread {
+        log::warn!("cannot spawn stats thread: {e}");
+    }
     r.wait()
 }
 
@@ -525,6 +543,7 @@ fn main() -> Result<()> {
     // Per-node daemon and its client.
     if args.len() >= 2 && args[1] == "daemon" {
         harden_for_writeback();
+        set_queue_cpus();
         let socket = args.get(2).map(String::as_str).unwrap_or(daemon::DEFAULT_SOCKET);
         let state = args.get(3).map(String::as_str).unwrap_or(daemon::DEFAULT_STATE);
         return daemon::run(socket, state);
@@ -549,5 +568,17 @@ mod cpu_list_tests {
     fn cpu_list_parses_ranges_and_singles() {
         assert_eq!(super::parse_cpu_list("0-3,8, 10-11"), vec![0, 1, 2, 3, 8, 10, 11]);
         assert_eq!(super::parse_cpu_list("x,5,2-a"), vec![5]);
+    }
+
+    #[test]
+    fn queue_cpus_from_env_value() {
+        use super::queue_cpus;
+        assert_eq!(queue_cpus(Some("all"), 4), Some(vec![0, 1, 2, 3]));
+        assert_eq!(queue_cpus(Some("2-3,9"), 8), Some(vec![2, 3]), "CPUs this machine lacks are dropped");
+        // libublk's per-queue placement stays in force.
+        assert_eq!(queue_cpus(None, 8), None);
+        assert_eq!(queue_cpus(Some(""), 8), None);
+        assert_eq!(queue_cpus(Some("any"), 8), None);
+        assert_eq!(queue_cpus(Some("9-12"), 8), None, "a list naming no CPU of this machine");
     }
 }
