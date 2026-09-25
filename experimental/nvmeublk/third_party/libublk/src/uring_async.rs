@@ -622,9 +622,11 @@ pub(crate) fn __ublk_submit_sqe_async(
     let f = UblkUringOpFuture::new_validate(user_data)?;
     let sqe = sqe.user_data(f.user_data);
 
-    // Flush and retry while the SQ is full.  This used to ignore flush
-    // errors and spin forever on a failed ring; now the error is returned,
-    // and the never-queued future's slab entry is freed.
+    // Flush and retry while the SQ is full, and retry transient flush
+    // errors (EAGAIN, ENOMEM, EINTR) with backoff, as the old loop retried
+    // every flush error.  An error every retry would hit (a failed ring)
+    // is returned instead of spinning forever, and the never-queued
+    // future's slab entry is freed.
     let res = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
         crate::io::queue_ring_push_sqe(r, &sqe)
     });
@@ -687,7 +689,10 @@ pub(crate) fn __ublk_submit_sqe_async(
 /// # Errors
 ///
 /// This function can return errors if:
-/// - The io_uring submission queue is full and cannot accept new entries
+/// - The io_uring submission queue is full and flushing it fails with an
+///   error that retrying cannot clear (the ring failed: EBADF, EBADFD,
+///   EOWNERDEAD, EEXIST, ...).  Transient flush errors (EAGAIN, ENOMEM,
+///   EINTR) are retried, not returned.
 /// - The user_data validation fails (see `UblkUringOpFuture::new_validate`)
 pub async fn ublk_submit_sqe_async(
     sqe: io_uring::squeue::Entry,
