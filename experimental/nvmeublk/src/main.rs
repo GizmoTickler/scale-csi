@@ -219,6 +219,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_fn(
     qid: u16,
     dev: &UblkDev,
@@ -226,6 +227,7 @@ fn queue_fn(
     stats: Arc<qengine::Stats>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     draining: Arc<std::sync::atomic::AtomicBool>,
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
     cfg: qengine::QConfig,
 ) {
     // No CPU placement here. libublk pins this thread from the thread that
@@ -263,10 +265,27 @@ fn queue_fn(
             log::warn!("q{qid}: ring mode {mode} failed ({e}); using libublk's default");
         }
     }
-    let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
+    // Fails when the node runs short of fds or memory (the queue ring, its
+    // registered files and buffers, the mmap of the command buffer). This
+    // thread then returns without FETCHing its tags: libublk counts it out,
+    // and the device's START gives up instead of waiting for it, so the
+    // attach fails cleanly (it used to panic here and hang START forever).
+    let q_rc = match UblkQueue::new(qid, dev) {
+        Ok(q) => Rc::new(q),
+        Err(e) => {
+            log::error!("ublk device {} queue {qid}: queue setup failed: {e}", dev.dev_info.dev_id);
+            return;
+        }
+    };
     let shift = ctrls.info.lba_shift;
-    // Engine tasks are 'static (they own Rc<QEngine>); tag tasks borrow the
-    // queue. Two local executors, ticked together from the same event loop.
+    // Engine tasks are 'static (they own Rc<qengine::Engine>); tag tasks
+    // hold Rc<QEngine> handles and borrow the queue. The last handle
+    // (`engine` below) must drop on this thread after the event loop has
+    // ended, and after `exe_rc` and the tag tasks (declared after it, so
+    // dropped first): QEngine::drop drives the engine's tasks to their end
+    // on this thread's ring, which breaks the engine/executor cycle and
+    // closes its sockets. Two local executors, ticked together from the
+    // same event loop.
     let net_exe: Rc<smol::LocalExecutor<'static>> = Rc::new(smol::LocalExecutor::new());
     let st2 = stats.clone();
     let st3 = stats.clone();
@@ -353,6 +372,13 @@ fn queue_fn(
             }
             run_ops();
             if (aborted || failed) && done() {
+                break;
+            }
+            // The device's bring-up gave up (device::bring_up) before it was
+            // started: nothing will be served, and a tag FETCHed after the
+            // driver cancelled the others would never complete. Leave; the
+            // ring's teardown cancels what is still queued on it.
+            if abandoned.load(Ordering::Acquire) {
                 break;
             }
         }
@@ -496,7 +522,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
         log::info!(
-            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} {}",
+            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} {}",
             ups.join(" "),
             st.failovers.load(Ordering::Relaxed),
             st.resubmits.load(Ordering::Relaxed),
@@ -508,6 +534,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
             st.reconnects.load(Ordering::Relaxed),
             st.stall_kills.load(Ordering::Relaxed),
             st.epoch_kills.load(Ordering::Relaxed),
+            st.engine_panics.load(Ordering::Relaxed),
             lat
         );
       }

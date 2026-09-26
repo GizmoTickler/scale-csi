@@ -301,22 +301,29 @@ impl UblkCtrlAsync {
         self.get_inner_mut().get_queue_affinity_async(q, bm).await
     }
 
+    /// Send START_USER_RECOVERY once, without waiting: `Ok(-EBUSY)` when
+    /// the device cannot enter recovery yet. The async twin of
+    /// [`UblkCtrl::try_start_user_recover`](crate::ctrl::UblkCtrl::try_start_user_recover).
+    pub async fn try_start_user_recover_async(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().__start_user_recover_async().await
+    }
+
     /// Start user recover for this device asynchronously
     ///
+    /// The retry policy of [`UblkCtrl::start_user_recover`](crate::ctrl::UblkCtrl::start_user_recover):
+    /// while the driver answers `-EBUSY`, sleep 1 ms doubling to 100 ms, for
+    /// up to 30 s of sleep, then return the last result.
     pub async fn start_user_recover_async(&self) -> Result<i32, UblkError> {
-        let mut count = 0u32;
-        let unit = 100_u32;
+        let mut slept_ms = 0u64;
+        let mut delay_ms = crate::ctrl::UblkCtrl::RECOVER_RETRY_FIRST_MS;
 
         loop {
-            let res = self.get_inner_mut().__start_user_recover_async().await;
-            if let Ok(r) = res {
-                if r == -libc::EBUSY {
-                    futures_timer::Delay::new(std::time::Duration::from_millis(unit as u64)).await;
-                    count += unit;
-                    if count < 30000 {
-                        continue;
-                    }
-                }
+            let res = self.try_start_user_recover_async().await;
+            if matches!(res, Ok(r) if r == -libc::EBUSY) && slept_ms < crate::ctrl::UblkCtrl::RECOVER_RETRY_BUDGET_MS {
+                futures_timer::Delay::new(std::time::Duration::from_millis(delay_ms)).await;
+                slept_ms += delay_ms;
+                delay_ms = (delay_ms * 2).min(crate::ctrl::UblkCtrl::RECOVER_RETRY_MAX_MS);
+                continue;
             }
             return res;
         }

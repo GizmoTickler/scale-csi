@@ -577,6 +577,12 @@ impl Ctrls {
     }
 }
 
+/// A device's controllers with every path down, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn unconnected_for_tests(addrs: Vec<SocketAddr>) -> Arc<Ctrls> {
+    tests::down_ctrls(addrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,7 +592,7 @@ mod tests {
     /// A device with every path down and due for a reconnect. Built without
     /// a target (Ctrls::new needs one) and never registered with the process
     /// supervisor, so only the test ticks it.
-    fn down_ctrls(addrs: Vec<SocketAddr>) -> Arc<Ctrls> {
+    pub(super) fn down_ctrls(addrs: Vec<SocketAddr>) -> Arc<Ctrls> {
         down_ctrls_nqn("nqn.test:ctrls", addrs)
     }
 

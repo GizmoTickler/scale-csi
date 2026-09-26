@@ -226,6 +226,69 @@ pub(crate) fn init_ctrl_task_ring_default(depth: u32) -> Result<(), UblkError> {
     })
 }
 
+/// User data of the ASYNC_CANCEL that [`ctrl_ring_cmd_until`] sends: the
+/// command's own token with the top bit set (tokens count up from 1).
+const CTRL_CANCEL_BIT: u64 = 1 << 63;
+
+/// Submit `sqe` (user data `token`) on this thread's control ring and wait
+/// for its completion, looking at `give_up` every 50 ms. Once it says so the
+/// command is cancelled with IORING_OP_ASYNC_CANCEL: one the driver punted to
+/// io-wq and that waits there is interrupted, and completes with -EINTR or
+/// -ECANCELED. Returns the command's result, or `-ECANCELED` (as an error)
+/// when it was given up and did not succeed. The ring is left with no CQE of
+/// either behind, so the next command reads its own.
+pub(crate) fn ctrl_ring_cmd_until(
+    sqe: squeue::Entry128,
+    token: u64,
+    give_up: &dyn Fn() -> bool,
+) -> Result<i32, UblkError> {
+    use io_uring::{opcode, types};
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    // How long a cancelled command gets to complete.
+    const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+        unsafe { r.submission().push(&sqe) }.map_err(|_| UblkError::OtherError(-libc::EBUSY))?;
+        let mut result: Option<i32> = None;
+        // When the cancel went out; whether its own CQE has been seen.
+        let mut cancelled: Option<std::time::Instant> = None;
+        let mut cancel_seen = false;
+        loop {
+            for cqe in r.completion() {
+                if cqe.user_data() == token {
+                    result = Some(cqe.result());
+                } else if cqe.user_data() == token | CTRL_CANCEL_BIT {
+                    cancel_seen = true;
+                }
+            }
+            match (result, cancelled) {
+                (Some(res), None) => return Ok(res),
+                (Some(res), Some(_)) if cancel_seen => {
+                    return if res >= 0 { Ok(res) } else { Err(UblkError::OtherError(-libc::ECANCELED)) };
+                }
+                (None, None) if give_up() => {
+                    let c = opcode::AsyncCancel::new(token).build().user_data(token | CTRL_CANCEL_BIT);
+                    unsafe { r.submission().push(&squeue::Entry128::from(c)) }
+                        .map_err(|_| UblkError::OtherError(-libc::EBUSY))?;
+                    cancelled = Some(std::time::Instant::now());
+                }
+                (_, Some(t)) if t.elapsed() >= CANCEL_WAIT => {
+                    // Still pending in the driver: its CQE may land later and
+                    // be read by the next command on this ring.
+                    return Err(UblkError::OtherError(-libc::ETIMEDOUT));
+                }
+                _ => {}
+            }
+            let ts = types::Timespec::from(POLL);
+            match r.submitter().submit_with_args(1, &types::SubmitArgs::new().timespec(&ts)) {
+                Ok(_) => {}
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME) | Some(libc::EINTR) | Some(libc::EBUSY)) => {}
+                Err(e) => return Err(UblkError::IOError(e)),
+            }
+        }
+    })
+}
+
 /// Ublk per-queue CPU affinity
 ///
 /// Responsible for setting ublk queue pthread's affinity.
@@ -1585,6 +1648,45 @@ impl UblkCtrlInner {
         Self::ublk_err_to_result(res)
     }
 
+    /// [`ublk_ctrl_cmd`](Self::ublk_ctrl_cmd) for a command that may wait
+    /// in the driver for something that never comes (START_DEV,
+    /// END_USER_RECOVERY): once `give_up` says so, the command is cancelled
+    /// and this fails with `-ECANCELED` (unless it completed meanwhile).
+    fn ublk_ctrl_cmd_until(
+        &mut self,
+        data: &UblkCtrlCmdData,
+        give_up: &dyn Fn() -> bool,
+    ) -> Result<i32, UblkError> {
+        if !self.force_sync
+            && self
+                .dev_flags
+                .contains(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT)
+        {
+            log::warn!("Warn: sync cmd {:x} is run from async context", data.cmd_op);
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
+        let mut new_data = *data;
+        let mut res: i32 = 0;
+
+        for _ in 0..2 {
+            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
+            self.cmd_token += 1;
+            let token = self.cmd_token as u64;
+            let sqe = self.ublk_ctrl_prep_cmd(self.file.as_raw_fd(), self.dev_info.dev_id, &new_data, token);
+            let r = ctrl_ring_cmd_until(sqe, token, give_up);
+            new_data.unprep_un_privileged_dev_path(self, old_buf);
+            res = r?;
+
+            trace!("ublk_ctrl_cmd_until: cmd {:x} res {}", data.cmd_op, res);
+            if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
+                break;
+            }
+        }
+
+        Self::ublk_err_to_result(res)
+    }
+
     /// Prepare ADD_DEV command data
     fn prepare_add_cmd(&self) -> UblkCtrlCmdData {
         UblkCtrlCmdData::new_write_buffer_cmd(
@@ -1735,13 +1837,6 @@ impl UblkCtrlInner {
     /// Prepare START_DEV command data
     fn prepare_start_cmd(pid: i32) -> UblkCtrlCmdData {
         UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64)
-    }
-
-    /// Start this device by sending command to ublk driver
-    ///
-    fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = Self::prepare_start_cmd(pid);
-        self.ublk_ctrl_cmd(&data)
     }
 
     /// Start this device by sending command to ublk driver
@@ -1982,13 +2077,6 @@ impl UblkCtrlInner {
     /// Prepare END_USER_RECOVERY command data
     fn prepare_end_user_recover_cmd(pid: i32) -> UblkCtrlCmdData {
         UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64)
-    }
-
-    /// End user recover for this device, do similar thing done in start_dev()
-    ///
-    fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = Self::prepare_end_user_recover_cmd(pid);
-        self.ublk_ctrl_cmd(&data)
     }
 
     /// End user recover for this device, do similar thing done in start_dev()
@@ -2603,9 +2691,9 @@ impl UblkCtrl {
 
     /// First sleep, largest sleep and total sleep budget of
     /// `start_user_recover()` while the driver answers `-EBUSY`.
-    const RECOVER_RETRY_FIRST_MS: u64 = 1;
-    const RECOVER_RETRY_MAX_MS: u64 = 100;
-    const RECOVER_RETRY_BUDGET_MS: u64 = 30_000;
+    pub(crate) const RECOVER_RETRY_FIRST_MS: u64 = 1;
+    pub(crate) const RECOVER_RETRY_MAX_MS: u64 = 100;
+    pub(crate) const RECOVER_RETRY_BUDGET_MS: u64 = 30_000;
 
     /// Send START_USER_RECOVERY once, without waiting
     ///
@@ -2666,16 +2754,41 @@ impl UblkCtrl {
     /// If any queue fails mlock, this method will fail immediately.
     ///
     pub fn start_dev(&self, dev: &UblkDev) -> Result<i32, UblkError> {
+        self.start_dev_until(dev, None)
+    }
+
+    /// As [`start_dev`](Self::start_dev), but never waits past `deadline`
+    /// (None: no deadline), and gives up as soon as one of `dev`'s queue
+    /// threads has returned.
+    ///
+    /// START (and END_USER_RECOVERY) wait in the driver until every queue
+    /// has FETCHed all its tags. A queue thread that returned before doing
+    /// so never will, and the wait would last forever, holding this thread.
+    /// On giving up, the pending command is cancelled (IORING_OP_ASYNC_CANCEL
+    /// interrupts the io-wq worker waiting in the driver) and this fails
+    /// with `-ECANCELED`; the device is left added but not started.
+    pub fn start_dev_until(
+        &self,
+        dev: &UblkDev,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
         ctrl.prep_start_dev(dev)?;
 
         // Wait for all queue buffer registrations to complete
-        dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
+        dev.wait_for_buffer_registration_until(ctrl.dev_info.nr_hw_queues as usize, deadline)?;
 
+        let give_up = || {
+            dev.queue_threads_exited() > 0
+                || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        };
+        let pid = unsafe { libc::getpid() as i32 };
         if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
-            ctrl.start(unsafe { libc::getpid() as i32 })
+            let data = UblkCtrlInner::prepare_start_cmd(pid);
+            ctrl.ublk_ctrl_cmd_until(&data, &give_up)
         } else if ctrl.for_recover_dev() {
-            ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
+            let data = UblkCtrlInner::prepare_end_user_recover_cmd(pid);
+            ctrl.ublk_ctrl_cmd_until(&data, &give_up)
         } else {
             Err(crate::UblkError::OtherError(-libc::EINVAL))
         }
@@ -3018,6 +3131,16 @@ impl UblkCtrl {
                         let tid = Self::init_queue_thread();
                         // Read by UblkQueue::new() to pick this thread's tags.
                         crate::io::set_io_thread_idx(t);
+                        // Counts this thread out however it leaves (return
+                        // or unwind), so a start waiting on the queues sees
+                        // one that left before it could FETCH its tags.
+                        struct Exit(Arc<UblkDev>);
+                        impl Drop for Exit {
+                            fn drop(&mut self) {
+                                self.0.note_queue_thread_exit();
+                            }
+                        }
+                        let _exit = Exit(Arc::clone(&_dev));
                         if let Err(e) = _tx.send((q, tid)) {
                             eprintln!("Warning: Failed to send queue thread info: {}", e);
                             return;
@@ -3098,13 +3221,31 @@ impl UblkCtrl {
         T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
         Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
     {
+        self.start_target_until(tgt_fn, q_fn, None)
+    }
+
+    /// As [`start_target`](Self::start_target), starting the device with
+    /// [`start_dev_until`](Self::start_dev_until): it fails instead of
+    /// waiting past `deadline` or for a queue thread that has returned. The
+    /// queue threads it spawned are then left running (detached): the
+    /// caller makes them return, e.g. by deleting the device.
+    pub fn start_target_until<T, Q>(
+        &self,
+        tgt_fn: T,
+        q_fn: Q,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<UblkTargetThreads, UblkError>
+    where
+        T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
+        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+    {
         // The control ring is per thread; this one may not have made it.
         init_ctrl_task_ring_default(16)?;
 
         let dev = Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);
         let handles = self.create_queue_handlers(&dev, q_fn);
 
-        self.start_dev(&dev)?;
+        self.start_dev_until(&dev, deadline)?;
 
         Ok(UblkTargetThreads {
             handles,
@@ -3229,6 +3370,49 @@ mod tests {
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
+
+    /// A control command that would wait forever in the driver (START with a
+    /// queue whose thread died before FETCHing) is given up once `give_up`
+    /// says so: it is cancelled, the call fails with -ECANCELED instead of
+    /// holding its thread for good, and the ring is left clean for the next
+    /// command. Stood in for by a read of an empty pipe, which also never
+    /// completes on its own; no ublk device (or root) needed.
+    #[test]
+    fn test_ctrl_cmd_until_gives_up_and_leaves_the_ring_clean() {
+        use io_uring::{opcode, squeue, types};
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            crate::ctrl::init_ctrl_task_ring_default(16).unwrap();
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let mut buf = [0u8; 8];
+            let read = opcode::Read::new(types::Fd(fds[0]), buf.as_mut_ptr(), 8).build().user_data(1);
+            let t0 = Instant::now();
+            let give_up = || t0.elapsed() >= Duration::from_millis(200);
+            let r = crate::ctrl::ctrl_ring_cmd_until(squeue::Entry128::from(read), 1, &give_up);
+            let took = t0.elapsed();
+            // The next command on the same ring reads its own completion.
+            let nop = opcode::Nop::new().build().user_data(2);
+            let next = crate::ctrl::ctrl_ring_cmd_until(squeue::Entry128::from(nop), 2, &|| false);
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            let _ = tx.send((r, took, next));
+        });
+        let (r, took, next) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a command that never completes held its thread past give_up");
+        assert!(
+            matches!(r, Err(UblkError::OtherError(e)) if e == -libc::ECANCELED),
+            "{:?}",
+            r
+        );
+        assert!(took < Duration::from_secs(2), "gave up after {:?}", took);
+        assert_eq!(next.unwrap(), 0);
+    }
 
     /// START_USER_RECOVERY answered -EBUSY twice, then 0: recovery starts
     /// after 3 ms of sleep instead of the old 200 ms (100 ms per EBUSY).

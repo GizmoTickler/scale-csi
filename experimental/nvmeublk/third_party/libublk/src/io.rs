@@ -981,6 +981,24 @@ pub(crate) struct BufferRegState {
     pub mlock_failed: bool,
     /// Whether any queue failed before buffer registration completed
     pub queue_setup_failed: bool,
+    /// Queue threads that have returned (or unwound) so far. Before the
+    /// device is started none should: one that has left can never FETCH
+    /// its tags, so START would wait for it forever.
+    pub threads_exited: usize,
+}
+
+impl BufferRegState {
+    /// What waiting for `nr` registrations comes to now: Some(result) when
+    /// the wait is over, None while it goes on.
+    fn registration_outcome(&self, nr: usize) -> Option<Result<(), UblkError>> {
+        if self.queue_setup_failed || self.threads_exited > 0 {
+            return Some(Err(UblkError::OtherError(-libc::EIO)));
+        }
+        if self.mlock_failed {
+            return Some(Err(UblkError::OtherError(-libc::EPERM)));
+        }
+        (self.registered_queues >= nr).then_some(Ok(()))
+    }
 }
 
 /// For supporting ublk device IO path, and one thin layer of device
@@ -1089,6 +1107,7 @@ impl UblkDev {
                     registered_queues: 0,
                     mlock_failed: false,
                     queue_setup_failed: false,
+                    threads_exited: 0,
                 }),
                 Condvar::new(),
             )),
@@ -1276,6 +1295,18 @@ impl UblkDev {
     /// Every io thread of every queue reports once, so the expected
     /// count is `nr_hw_queues * io_threads_per_queue`.
     pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
+        self.wait_for_buffer_registration_until(nr_hw_queues, None)
+    }
+
+    /// As [`wait_for_buffer_registration`](Self::wait_for_buffer_registration),
+    /// failing with `-ETIMEDOUT` once `deadline` has passed, and with
+    /// `-EIO` as soon as a queue thread has returned: a queue thread that
+    /// left before registering never will.
+    pub fn wait_for_buffer_registration_until(
+        &self,
+        nr_hw_queues: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), UblkError> {
         let nr_hw_queues = nr_hw_queues * self.io_threads_per_queue as usize;
         if (self.dev_info.flags
             & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64)
@@ -1285,28 +1316,38 @@ impl UblkDev {
         }
 
         let (lock, cvar) = &*self.buf_reg_sync;
-        let mut state = lock.lock().unwrap();
-
-        while state.registered_queues < nr_hw_queues {
-            if state.queue_setup_failed {
-                return Err(UblkError::OtherError(-libc::EIO));
+        let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(r) = state.registration_outcome(nr_hw_queues) {
+                return r;
             }
-            // Check for mlock failures
-            if state.mlock_failed {
-                return Err(UblkError::OtherError(-libc::EPERM));
-            }
-            state = cvar.wait(state).unwrap();
+            state = match deadline {
+                None => cvar.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner),
+                Some(d) => {
+                    let now = std::time::Instant::now();
+                    if now >= d {
+                        return Err(UblkError::OtherError(-libc::ETIMEDOUT));
+                    }
+                    cvar.wait_timeout(state, d - now)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0
+                }
+            };
         }
+    }
 
-        if state.queue_setup_failed {
-            return Err(UblkError::OtherError(-libc::EIO));
-        }
-        // Final check for mlock failures
-        if state.mlock_failed {
-            return Err(UblkError::OtherError(-libc::EPERM));
-        }
+    /// A queue thread of this device returned or unwound. Called by the
+    /// thread wrapper of [`UblkCtrl::start_target`](crate::ctrl::UblkCtrl::start_target).
+    pub(crate) fn note_queue_thread_exit(&self) {
+        let (lock, cvar) = &*self.buf_reg_sync;
+        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).threads_exited += 1;
+        cvar.notify_all();
+    }
 
-        Ok(())
+    /// How many of this device's queue threads have returned so far.
+    pub fn queue_threads_exited(&self) -> usize {
+        let (lock, _) = &*self.buf_reg_sync;
+        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).threads_exited
     }
 
     /// Notify that a queue has completed buffer registration
@@ -3283,6 +3324,35 @@ impl UblkQueue<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::BufferRegState;
+
+    /// A queue thread that returns before registering its buffers never
+    /// will: the start waiting for the queues fails at once instead of
+    /// waiting for it forever (START would have followed, and waited in the
+    /// driver for tags the thread never FETCHed).
+    #[test]
+    fn test_a_queue_thread_that_left_ends_the_registration_wait() {
+        let mut st = BufferRegState {
+            registered_queues: 1,
+            mlock_failed: false,
+            queue_setup_failed: false,
+            threads_exited: 0,
+        };
+        assert!(st.registration_outcome(2).is_none(), "one of two queues is still setting up");
+        st.threads_exited = 1;
+        assert!(matches!(
+            st.registration_outcome(2),
+            Some(Err(crate::UblkError::OtherError(e))) if e == -libc::EIO
+        ));
+        let done = BufferRegState { registered_queues: 2, threads_exited: 0, ..st };
+        assert!(matches!(done.registration_outcome(2), Some(Ok(()))));
+        let mlock = BufferRegState { mlock_failed: true, ..done };
+        assert!(matches!(
+            mlock.registration_outcome(2),
+            Some(Err(crate::UblkError::OtherError(e))) if e == -libc::EPERM
+        ));
+    }
+
     use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{with_task_io_ring, with_task_io_ring_mut, BufDesc, UblkDev, UblkQueue};
     use crate::test_helpers::{device_handler_async, ublk_join_tasks};

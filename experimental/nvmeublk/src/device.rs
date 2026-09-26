@@ -218,6 +218,47 @@ pub fn spawn_op(lane: OpLane, op: impl FnOnce() + Send + 'static) -> std::io::Re
     Ok(())
 }
 
+/// Run `op` holding a general lane, on a new thread that first waits for
+/// one (`nvq-op-wait`): for callers that must not block until a lane is free,
+/// such as a queue thread whose device ends on its own (it holds the char
+/// device open until it returns).
+pub fn spawn_op_waiting(op: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    std::thread::Builder::new().name("nvq-op-wait".into()).spawn(move || {
+        let _lane = OP_LANES.acquire();
+        op()
+    })?;
+    Ok(())
+}
+
+/// Called whenever a device finishes ending on its own (set once, by the
+/// daemon, to wake its main loop, which then forgets the device).
+static ON_DEVICE_END: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+pub fn on_device_end(f: impl Fn() + Send + Sync + 'static) {
+    let _ = ON_DEVICE_END.set(Box::new(f));
+}
+
+/// Marks an error after which the operation may simply be tried again later
+/// (the device is untouched and still waits for a server): the kernel
+/// answered EBUSY to START_USER_RECOVERY, or bring-up gave up on a queue
+/// that could not be set up.
+#[derive(Debug)]
+pub struct TryAgain(pub String);
+
+impl std::fmt::Display for TryAgain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for TryAgain {}
+
+/// Whether `e` (or an error it wraps) is a TryAgain. It must be the root
+/// cause or a wrapped error, not a `.context(TryAgain(..))` layer.
+pub fn is_try_again(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<TryAgain>().is_some())
+}
+
 /// How a device ends. Shared by its `Running`, its bring-up and its queue
 /// threads, so that exactly one of them ends it: `detach`/`wait` take it; or,
 /// when its queue threads all return first (it was stopped or deleted from
@@ -298,6 +339,14 @@ impl<S> Ending<S> {
     fn ended(&self, r: Result<(), String>) {
         lock(&self.st).on_its_own = Some(Some(r));
         self.ended.notify_all();
+        if let Some(f) = ON_DEVICE_END.get() {
+            f();
+        }
+    }
+
+    /// It ended on its own, or is ending so: nobody may hand it out again.
+    fn has_ended(&self) -> bool {
+        lock(&self.st).on_its_own.is_some()
     }
 
     /// For detach/wait: take the device to end it, or wait until it has
@@ -330,6 +379,49 @@ impl<S> Ending<S> {
     }
 }
 
+/// What a detach did with a device it took (`stop_or_put_back`).
+enum Stop<S> {
+    /// Stopped (or its queue threads had all returned): end it with `retire`.
+    Retire(S),
+    /// It could not be stopped and is still served, as it was: `draining` is
+    /// clear again, so its I/O goes on as before.
+    StillServed(anyhow::Error),
+}
+
+/// The step of a detach between taking the device and retiring it: set
+/// `draining` (parked and fenced I/O fail with EIO, so nothing waits on
+/// paths that are gone) and STOP it with `kill`. STOP makes the queue
+/// threads return; if they all have already (stopped elsewhere, or its loops
+/// failed), it is not sent: STOP of a live device while its char device is
+/// held open would wait forever for the requests they had taken
+/// (UblkCtrl::wait_target). If STOP fails, the device goes back to where it
+/// was, served; it is retired anyway if its queue threads returned
+/// meanwhile, since nothing else would end it then.
+fn stop_or_put_back<S, E: std::error::Error + Send + Sync + 'static>(end: &Ending<S>, s: S, draining: &AtomicBool, kill: impl FnOnce() -> Result<(), E>) -> Stop<S> {
+    draining.store(true, Ordering::Release);
+    if end.queues_are_done() {
+        return Stop::Retire(s);
+    }
+    match kill() {
+        Ok(()) => Stop::Retire(s),
+        Err(e) => match end.put_back(s) {
+            None => {
+                draining.store(false, Ordering::Release);
+                Stop::StillServed(anyhow::Error::new(e))
+            }
+            Some(s) => Stop::Retire(s),
+        },
+    }
+}
+
+/// A detach that did not end the device.
+pub struct DetachFailed {
+    pub error: anyhow::Error,
+    /// The device is still served, unchanged (its admin paths are up): the
+    /// caller keeps it, and a later detach can try again.
+    pub still_served: Option<Box<Running>>,
+}
+
 /// A device being served by this process.
 pub struct Running {
     pub spec: DeviceSpec,
@@ -350,54 +442,106 @@ impl Running {
     }
 
     /// Stop serving and delete the device, on this thread, holding a general
-    /// op lane. Parked and fenced I/O fails with EIO, so this never waits on
-    /// paths that are gone. If the device has ended on its own, this waits
-    /// until that is done and reports how it went.
-    pub fn detach(self) -> Result<()> {
-        let r = self.end_it(true);
-        self.ctrls.shutdown();
-        r
+    /// op lane (waiting START_DEADLINE at most for one). Parked and fenced
+    /// I/O fails with EIO, so this never waits on paths that are gone. If
+    /// the device has ended on its own, this waits until that is done and
+    /// reports how it went.
+    ///
+    /// If the device cannot be stopped it is handed back still served, its
+    /// admin paths untouched: shutting them down would leave a device that
+    /// answers EIO and redials a controller the target has dropped.
+    pub fn detach(self) -> std::result::Result<(), DetachFailed> {
+        match self.end_it(true) {
+            Ok(()) => {
+                self.ctrls.shutdown();
+                Ok(())
+            }
+            Err((error, true)) => Err(DetachFailed { error, still_served: Some(Box::new(self)) }),
+            Err((error, false)) => {
+                self.ctrls.shutdown();
+                Err(DetachFailed { error, still_served: None })
+            }
+        }
     }
 
     /// Wait until the device is stopped (for `nvmeublk run`, whose SIGINT
     /// stops it), then delete it.
     pub fn wait(self) -> Result<()> {
-        let r = self.end_it(false);
+        let r = self.end_it(false).map_err(|(e, _)| e);
         self.ctrls.shutdown();
         r
     }
 
-    fn end_it(&self, detach: bool) -> Result<()> {
+    /// Err((why, still served)).
+    fn end_it(&self, detach: bool) -> std::result::Result<(), (anyhow::Error, bool)> {
         let s = match self.end.take() {
             Owner::Own(s) => s,
-            Owner::Ended(r) => return r.map_err(|e| anyhow!("ublk device {} ended on its own: {e}", self.dev_id)),
+            Owner::Ended(r) => return r.map_err(|e| (anyhow!("ublk device {} ended on its own: {e}", self.dev_id), false)),
         };
         if !detach {
-            return retire(s, &self.stop);
+            return retire(s, &self.stop).map_err(|e| (e, false));
         }
-        let _lane = OP_LANES.acquire();
-        self.draining.store(true, Ordering::Release);
-        // STOP makes the queue threads return. If they all have already (it
-        // was stopped elsewhere, or its queue loops failed), retire stops it:
-        // STOP of a live device while its char device is held open would
-        // wait forever for the requests they had taken (UblkCtrl::wait_target).
-        if !self.end.queues_are_done()
-            && let Err(e) = UblkCtrl::new_simple(self.dev_id).and_then(|c| c.kill_dev())
-        {
-            // Still served: it stays so and ends on its own once stopped, as
-            // the device's own thread served it on after a failed stop.
+        let Some(_lane) = OP_LANES.acquire_until(Instant::now() + START_DEADLINE) else {
             return match self.end.put_back(s) {
-                None => Err(anyhow::Error::new(e).context(format!("stop ublk device {}", self.dev_id))),
-                Some(s) => retire(s, &self.stop),
+                None => Err((anyhow!("ublk device {}: no control lane free within {} s; retry", self.dev_id, START_DEADLINE.as_secs()), true)),
+                Some(s) => retire(s, &self.stop).map_err(|e| (e, false)),
             };
+        };
+        match stop_or_put_back(&self.end, s, &self.draining, || UblkCtrl::new_simple(self.dev_id).and_then(|c| c.kill_dev()).map(|_| ())) {
+            Stop::Retire(s) => retire(s, &self.stop).map_err(|e| (e, false)),
+            Stop::StillServed(e) => Err((e.context(format!("stop ublk device {}", self.dev_id)), true)),
         }
-        retire(s, &self.stop)
     }
 
-    /// Stop sending new I/O; true once nothing is on the wire.
+    /// Stop sending new I/O; true once nothing is on the wire and no write
+    /// that was (or may have been) is waiting to go out again (`drained`).
     pub fn drain(&self) -> bool {
         self.quiesce.store(true, Ordering::Release);
-        self.stats.inflight.load(Ordering::Acquire) <= 0
+        self.drained()
+    }
+
+    /// Nothing of this device's I/O can still land on the target: nothing on
+    /// the wire, and no write or flush held back that went out before (a
+    /// failed path's orphans waiting out the write fence, or a predecessor's
+    /// writes held after a crash). Only then may a handover call it clean,
+    /// which lets the next daemon send the kernel's reissued writes at once.
+    pub fn drained(&self) -> bool {
+        self.stats.inflight.load(Ordering::Acquire) <= 0 && self.stats.orphans.load(Ordering::Acquire) <= 0
+    }
+
+    /// The device ended (or is ending) on its own: it is no longer served,
+    /// and its id may belong to another device soon.
+    pub fn has_ended(&self) -> bool {
+        self.end.has_ended()
+    }
+
+    /// Some engine of this device failed (a task of it panicked): its I/O
+    /// fails with EIO until the volume is detached and attached again.
+    pub fn engine_failed(&self) -> bool {
+        self.stats.engine_panics.load(Ordering::Relaxed) > 0
+    }
+}
+
+#[cfg(test)]
+impl Running {
+    /// A Running with no ublk device behind it, for the daemon's tests:
+    /// `ended` = it has ended on its own.
+    pub fn for_tests(spec: DeviceSpec, dev_id: i32, ended: bool) -> Running {
+        let end = Arc::new(Ending::new());
+        if ended {
+            end.ended(Ok(()));
+        }
+        let addrs = addrs(&spec).unwrap_or_default();
+        Running {
+            spec,
+            dev_id,
+            stats: Arc::new(qengine::Stats::default()),
+            ctrls: ctrls::unconnected_for_tests(addrs),
+            draining: Arc::new(AtomicBool::new(false)),
+            quiesce: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            end,
+        }
     }
 }
 
@@ -419,6 +563,42 @@ impl Drop for Served {
             self.ctrl.disown();
         }
     }
+}
+
+/// Key of the volume name in a device's libublk json (`target_data`).
+const OWNER_KEY: &str = "nvmeublk_volume";
+
+/// The volume a ublk device was added for, from the json libublk keeps for
+/// it (Some(None): the json names none, e.g. an older build added it; None:
+/// no json at all).
+pub fn owner(dev_id: i32) -> Option<Option<String>> {
+    let path = UblkCtrl::new_simple(dev_id).ok()?.run_path();
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(owner_in(&text))
+}
+
+fn owner_in(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("target_data")?.get(OWNER_KEY)?.as_str().map(str::to_string)
+}
+
+/// Before a recovery attempt reaches the target: is `dev_id` still `volume`'s
+/// device, and can it enter recovery now? Ok(true): go ahead. Ok(false):
+/// EBUSY, the previous server still has it open (try again later). Err: not
+/// this volume's device (its id went to another volume), or gone.
+pub fn recovery_check(volume: &str, dev_id: i32) -> Result<bool> {
+    match owner(dev_id) {
+        Some(Some(o)) if o != volume => bail!("ublk device {dev_id} now belongs to volume {o}, not {volume}; leaving it alone"),
+        _ => {}
+    }
+    let r = UblkCtrl::new_simple(dev_id).and_then(|c| c.try_start_user_recover()).with_context(|| format!("start user recovery of ublk device {dev_id}"))?;
+    if r == -libc::EBUSY {
+        return Ok(false);
+    }
+    if r < 0 {
+        bail!("start user recovery of ublk device {dev_id}: {}", std::io::Error::from_raw_os_error(-r));
+    }
+    Ok(true)
 }
 
 fn fault_dir(dev_id: impl std::fmt::Display) -> String {
@@ -553,7 +733,7 @@ pub fn start_connected(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Opti
     let (s2, c2) = (spec.clone(), ctrls.clone());
     let spawned = spawn_op(lane, move || {
         let vol = s2.volume.clone();
-        if let Err(mpsc::SendError(Ok(r))) = tx.send(start_here(s2, c2, recover)) {
+        if let Err(mpsc::SendError(Ok(r))) = tx.send(start_here(s2, c2, recover, deadline)) {
             log::error!("{vol}: ublk device {} came up after its start deadline; it is served until it is stopped", r.dev_id);
         }
     });
@@ -570,16 +750,18 @@ pub fn start_connected(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Opti
 
 /// Bring the device up on the calling thread, which should hold an op lane:
 /// its control ring, and the io-wq worker behind it, live as long as the
-/// thread. The admin paths are shut down if this fails.
-pub fn start_here(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<(i32, bool)>) -> Result<Running> {
-    let r = start_here_inner(spec, ctrls.clone(), recover);
+/// thread. The admin paths are shut down if this fails. Never waits past
+/// `deadline`, nor for a queue thread that returned before the device
+/// started: the lane is always freed.
+pub fn start_here(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<(i32, bool)>, deadline: Instant) -> Result<Running> {
+    let r = start_here_inner(spec, ctrls.clone(), recover, deadline);
     if r.is_err() {
         ctrls.shutdown();
     }
     r
 }
 
-fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<(i32, bool)>) -> Result<Running> {
+fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<(i32, bool)>, deadline: Instant) -> Result<Running> {
     let info = ctrls.info.clone();
     let write_fence = Duration::from_millis(spec.write_fence_ms.unwrap_or(KATO.as_millis() as u64 + 5000));
     let hold = recover.is_some_and(|(_, hold)| hold);
@@ -595,7 +777,7 @@ fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<
     let draining = Arc::new(AtomicBool::new(false));
     let quiesce = Arc::new(AtomicBool::new(false));
     let end = Arc::new(Ending::new());
-    let dev_id = bring_up(&spec, recover, hold, write_fence, info, stats.clone(), ctrls.clone(), stop.clone(), draining.clone(), quiesce.clone(), end.clone())?;
+    let dev_id = bring_up(&spec, recover, hold, write_fence, info, stats.clone(), ctrls.clone(), stop.clone(), draining.clone(), quiesce.clone(), end.clone(), deadline)?;
     Ok(Running { spec, dev_id, stats, ctrls, draining, quiesce, stop, end })
 }
 
@@ -654,7 +836,10 @@ impl Drop for QueueExit {
 /// the char device open.
 fn end_on_its_own(end: &Arc<Ending<Served>>, stop: &Arc<AtomicBool>) {
     let (e2, st2) = (end.clone(), stop.clone());
-    let spawned = spawn_op(OP_LANES.acquire(), move || {
+    // Not waiting for a lane here: this thread holds the char device open
+    // until it returns, which would keep the device's I/O waiting and a DEL
+    // from elsewhere hanging for as long as every lane is busy.
+    let spawned = spawn_op_waiting(move || {
         let Some(s) = e2.take_own() else { return e2.ended(Ok(())) };
         let dev_id = s.ctrl.dev_info().dev_id;
         let r = retire(s, &st2);
@@ -692,6 +877,7 @@ fn bring_up(
     draining: Arc<AtomicBool>,
     quiesce: Arc<AtomicBool>,
     end: Arc<Ending<Served>>,
+    deadline: Instant,
 ) -> Result<i32> {
     let (queues, depth) = (spec.queues.max(1), spec.depth.max(2));
     // Largest request the device takes. Zero copy moves data straight
@@ -713,7 +899,15 @@ fn bring_up(
     let builder = UblkCtrlBuilder::default().name("nvmeublk").nr_queues(queues).depth(depth).io_buf_bytes(io_buf).ctrl_flags(flags).io_threads_per_queue(threads);
     let builder = match recover {
         Some((id, _)) => {
-            UblkCtrl::new_simple(id)?.start_user_recover().context("start user recovery")?;
+            // One try: the daemon checked it moments ago (recovery_check),
+            // and an EBUSY now is tried again later, holding no lane.
+            let r = UblkCtrl::new_simple(id)?.try_start_user_recover().context("start user recovery")?;
+            if r == -libc::EBUSY {
+                return Err(anyhow::Error::new(TryAgain(format!("ublk device {id} is not recoverable yet (EBUSY: its previous server still has it open)"))));
+            }
+            if r < 0 {
+                bail!("start user recovery of ublk device {id}: {}", std::io::Error::from_raw_os_error(-r));
+            }
             log::info!("{}: recovering ublk device {id}{}", spec.volume, if hold { " (writes held for one fence)" } else { " (clean handover)" });
             builder.id(id).dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV | tag_flags)
         }
@@ -758,9 +952,14 @@ fn bring_up(
     );
     let (sq, stq, drq, eq) = (stats.clone(), stop.clone(), draining.clone(), end.clone());
     let exited = Arc::new(AtomicUsize::new(0));
-    let target = ctrl.start_target(
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let ab = abandoned.clone();
+    let volume = spec.volume.clone();
+    let started = ctrl.start_target_until(
         move |dev: &mut UblkDev| {
             dev.set_default_params(size);
+            // Whose device this is, for a recovery to check (`owner`).
+            dev.set_target_json(serde_json::json!({ OWNER_KEY: volume }));
             dev.set_io_tag_chunk(tag_chunk);
             dev.tgt.params.basic.logical_bs_shift = lba_shift;
             dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
@@ -775,9 +974,34 @@ fn bring_up(
             // have trimmed the queue count, so count from the device.
             let total = dev.dev_info.nr_hw_queues as usize * dev.io_threads_per_queue() as usize;
             let _out = QueueExit { exited: exited.clone(), total, stop: stq.clone(), ctrls: ctrls.clone(), end: eq.clone() };
-            queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), cfg.clone())
+            queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone())
         },
-    )?;
+        Some(deadline),
+    );
+    let target = match started {
+        Ok(t) => t,
+        Err(e) => {
+            // A queue thread returned before the device started (its setup
+            // failed), or the deadline passed: START was cancelled. The queue
+            // threads still running leave their loops.
+            abandoned.store(true, Ordering::Release);
+            let why = anyhow::Error::new(e).context(format!("start ublk device {dev_id}"));
+            if recover.is_some() {
+                // Not deleted: the device still holds the volume's I/O, and
+                // once these threads are gone it can be recovered again.
+                return Err(anyhow::Error::new(TryAgain(format!("{why:#}"))));
+            }
+            // Deleted without waiting for its id: DEL cancels the tags
+            // FETCHed so far, and the id is freed once the queue threads
+            // have closed the char device. Dropping `ctrl` then deletes
+            // nothing more.
+            if let Err(d) = ctrl.del_dev_async() {
+                log::error!("{}: delete ublk device {dev_id} after a failed start: {d}", spec.volume);
+            }
+            let _ = std::fs::remove_dir_all(format!("/run/nvmeublk/dev{dev_id}"));
+            return Err(why);
+        }
+    };
     log::info!("{}: serving /dev/ublkb{dev_id}", spec.volume);
     if let Some(s) = end.up(Served { ctrl, threads: Some(target) }) {
         // Its queue threads all returned during START: it ends on its own,
@@ -954,5 +1178,66 @@ mod tests {
         let Owner::Own(s) = e.take() else { panic!() };
         assert!(!e.queues_done());
         assert_eq!(e.put_back(s), Some(2), "a device whose queues returned was put back where nothing ends it");
+    }
+
+    /// A detach whose STOP fails (the node is out of fds, say) leaves the
+    /// device as it was: served, taken back by its Ending, and not draining
+    /// (draining would fail every failover and parked request with EIO). The
+    /// caller then keeps its admin paths up and keeps it recorded.
+    #[test]
+    fn a_failed_stop_leaves_the_device_served_and_not_draining() {
+        let draining = AtomicBool::new(false);
+        let e = Ending::new();
+        assert!(e.up(1u32).is_none());
+        let Owner::Own(s) = e.take() else { panic!() };
+        let emfile = || Err::<(), _>(std::io::Error::from_raw_os_error(libc::EMFILE));
+        match stop_or_put_back(&e, s, &draining, emfile) {
+            Stop::StillServed(err) => assert!(format!("{err:#}").contains("24") || format!("{err:#}").to_lowercase().contains("too many"), "{err:#}"),
+            Stop::Retire(_) => panic!("a device that could not be stopped was retired"),
+        }
+        assert!(!draining.load(Ordering::Acquire), "a device still served was left draining (every failover answers EIO)");
+        assert!(matches!(e.take(), Owner::Own(1)), "the device was not put back");
+        // A STOP that works retires it, draining.
+        let e = Ending::new();
+        assert!(e.up(2u32).is_none());
+        let Owner::Own(s) = e.take() else { panic!() };
+        assert!(matches!(stop_or_put_back(&e, s, &draining, || Ok::<(), std::io::Error>(())), Stop::Retire(2)));
+        assert!(draining.load(Ordering::Acquire));
+        // Queue threads all returned already: retired, and no STOP is sent.
+        let e = Ending::new();
+        assert!(e.up(3u32).is_none());
+        let Owner::Own(s) = e.take() else { panic!() };
+        assert!(!e.queues_done());
+        let r = stop_or_put_back(&e, s, &draining, || -> Result<(), std::io::Error> { panic!("STOP sent to a device whose queues returned") });
+        assert!(matches!(r, Stop::Retire(3)));
+    }
+
+    #[test]
+    fn try_again_is_seen_through_context() {
+        let e = anyhow::Error::new(TryAgain("busy".into())).context("start");
+        assert!(is_try_again(&e));
+        assert!(!is_try_again(&anyhow!("hard").context("start")));
+    }
+
+    #[test]
+    fn the_owner_of_a_device_is_read_from_its_json() {
+        assert_eq!(owner_in(r#"{"dev_info":{},"target_data":{"nvmeublk_volume":"pvc-1"}}"#), Some("pvc-1".into()));
+        assert_eq!(owner_in(r#"{"dev_info":{}}"#), None);
+        assert_eq!(owner_in("not json"), None);
+    }
+
+    /// A queue thread whose device ends on its own must not wait for a lane
+    /// while it holds the char device open: the op runs on a thread of its
+    /// own once a lane is free.
+    #[test]
+    fn ending_a_device_does_not_block_its_queue_thread_on_a_lane() {
+        let held: Vec<OpLane> = (0..GENERAL_LANES).map(|_| OP_LANES.acquire()).collect();
+        let (tx, rx) = mpsc::channel();
+        let t0 = Instant::now();
+        spawn_op_waiting(move || tx.send(()).unwrap()).unwrap();
+        assert!(t0.elapsed() < Duration::from_millis(100), "the caller waited for a lane");
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "ran without a lane");
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5)).expect("never ran once a lane was free");
     }
 }

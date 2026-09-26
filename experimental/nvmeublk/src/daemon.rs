@@ -34,8 +34,13 @@
 //!                                       volume that was being recovered)
 //!   {"op":"list"}                    -> {"ok":true,"devices":[...]}
 //!                                       (a volume still being recovered has
-//!                                       "recovering":true, its paths down)
+//!                                       "recovering":true, its paths down;
+//!                                       "engine_failed":true means its I/O
+//!                                       fails with EIO until it is detached
+//!                                       and attached again)
 //!   {"op":"stats","volume":"..."}    -> {"ok":true,"stats":{...}}
+//!                                       (engine_panics, engine_failed and
+//!                                       orphans among them)
 
 use crate::device::{self, DeviceSpec, OpLanes, Running, OP_LANES};
 use anyhow::{bail, Context, Result};
@@ -97,6 +102,10 @@ struct Hooks {
     attempt: fn(&Arc<Daemon>, &str, u64),
     /// Delete the device of a volume whose recovery a detach cancelled.
     delete: fn(i32) -> Result<()>,
+    /// Before an attempt reaches the target: may (volume, dev_id) be
+    /// recovered now? Ok(false): not yet (EBUSY), try again later; Err: not
+    /// this volume's device any more, or gone (device::recovery_check).
+    check: fn(&str, i32) -> Result<bool>,
     lanes: &'static OpLanes,
 }
 
@@ -175,7 +184,7 @@ impl Drop for VolumeOp<'_> {
 
 impl Daemon {
     fn new(state_path: &str) -> Self {
-        Self::with_hooks(state_path, Hooks { attempt: Daemon::attempt, delete: device::delete_unserved, lanes: &OP_LANES })
+        Self::with_hooks(state_path, Hooks { attempt: Daemon::attempt, delete: device::delete_unserved, check: device::recovery_check, lanes: &OP_LANES })
     }
 
     fn with_hooks(state_path: &str, hooks: Hooks) -> Self {
@@ -215,7 +224,10 @@ impl Daemon {
         let entries = {
             let devs = lock(&self.devices);
             let rec = lock(&self.recovering);
-            state_entries(devs.values().map(|r| (&r.spec, r.dev_id)), rec.values().map(|p| &p.entry), clean)
+            // A device that ended on its own is gone, and its id may be
+            // another volume's by now: recording it would have the next
+            // daemon recover that device for this volume.
+            state_entries(devs.values().filter(|r| !r.has_ended()).map(|r| (&r.spec, r.dev_id)), rec.values().map(|p| &p.entry), clean)
         };
         let tmp = format!("{}.tmp", self.state_path);
         let data = serde_json::to_vec_pretty(&entries).unwrap_or_default();
@@ -227,7 +239,12 @@ impl Daemon {
     fn attach(&self, spec: DeviceSpec) -> Result<Value> {
         let _op = self.ops.lock(&spec.volume);
         {
-            let devs = lock(&self.devices);
+            let mut devs = lock(&self.devices);
+            if devs.get(&spec.volume).is_some_and(Running::has_ended) {
+                // Its device is gone (and its id may be another volume's):
+                // forget it and add a new one.
+                devs.remove(&spec.volume);
+            }
             if let Some(r) = devs.get(&spec.volume) {
                 if r.spec.subnqn != spec.subnqn {
                     bail!("volume {} is already attached to a different subsystem ({})", spec.volume, r.spec.subnqn);
@@ -253,8 +270,18 @@ impl Daemon {
         let served = lock(&self.devices).remove(volume);
         let Some(r) = served else { return self.cancel_recovery(volume) };
         self.save(&BTreeMap::new());
-        r.detach()?;
-        Ok(json!({"ok": true}))
+        match r.detach() {
+            Ok(()) => Ok(json!({"ok": true})),
+            Err(f) => {
+                if let Some(r) = f.still_served {
+                    // Not stopped: still served and still this volume's, so
+                    // a retried detach must find it.
+                    lock(&self.devices).insert(volume.to_string(), *r);
+                    self.save(&BTreeMap::new());
+                }
+                Err(f.error)
+            }
+        }
     }
 
     /// Detach of a volume that is not served again yet: its recovery stops
@@ -275,9 +302,9 @@ impl Daemon {
             p.phase = Phase::Cancelling;
             p.entry.dev_id
         };
-        let deleted = {
-            let _lane = self.hooks.lanes.acquire();
-            (self.hooks.delete)(dev_id)
+        let deleted = match self.hooks.lanes.acquire_until(Instant::now() + device::START_DEADLINE) {
+            Some(_lane) => (self.hooks.delete)(dev_id),
+            None => Err(anyhow::anyhow!("no control lane free within {} s; retry", device::START_DEADLINE.as_secs())),
         };
         match deleted {
             Ok(()) => {
@@ -302,7 +329,11 @@ impl Daemon {
             .values()
             .map(|r| {
                 let paths: Vec<Value> = r.ctrls.paths.iter().map(|p| json!({"addr": p.addr.to_string(), "up": p.cntlid().is_some()})).collect();
-                json!({"volume": r.spec.volume, "subnqn": r.spec.subnqn, "dev_id": r.dev_id, "path": r.path(), "paths": paths})
+                // engine_failed: its paths may look up, but some queue fails
+                // every request with EIO until the volume is re-attached.
+                // ended: the device is gone; attach adds a new one.
+                json!({"volume": r.spec.volume, "subnqn": r.spec.subnqn, "dev_id": r.dev_id, "path": r.path(), "paths": paths,
+                       "engine_failed": r.engine_failed(), "ended": r.has_ended()})
             })
             .collect();
         // The device node exists and belongs to the volume; nothing serves it yet.
@@ -327,7 +358,9 @@ impl Daemon {
             "failovers": l(&s.failovers), "resubmits": l(&s.resubmits), "parked": l(&s.parked), "fenced": l(&s.fenced),
             "path_errors": l(&s.path_errors), "protocol_errors": l(&s.protocol_errors), "no_path_eio": l(&s.no_path_eio),
             "reconnects": l(&s.reconnects), "stall_kills": l(&s.stall_kills), "epoch_kills": l(&s.epoch_kills),
-            "zc_rx_bytes": l(&s.zc_bytes), "zc_tx_bytes": l(&s.zc_tx_bytes)
+            "zc_rx_bytes": l(&s.zc_bytes), "zc_tx_bytes": l(&s.zc_tx_bytes),
+            "engine_panics": l(&s.engine_panics), "engine_failed": r.engine_failed(),
+            "orphans": s.orphans.load(Ordering::Relaxed)
         }}))
     }
 
@@ -342,7 +375,7 @@ impl Daemon {
             let all = devs.values().all(|r| r.drain());
             if all || Instant::now() > deadline {
                 for r in devs.values() {
-                    clean.insert(r.spec.volume.clone(), r.stats.inflight.load(Ordering::Acquire) <= 0);
+                    clean.insert(r.spec.volume.clone(), r.drained());
                 }
                 drop(devs);
                 break;
@@ -375,6 +408,7 @@ impl Daemon {
     /// give up on devices not brought up within the start deadline. Returns
     /// how long until this has more to do (None: nothing until woken).
     fn dispatch(self: &Arc<Self>) -> Option<Duration> {
+        self.forget_ended();
         let now = Instant::now();
         let deadline = device::START_DEADLINE;
         let (mut expired, mut due, mut next) = (Vec::new(), Vec::new(), None);
@@ -425,6 +459,26 @@ impl Daemon {
         next.map(|t| t.saturating_duration_since(Instant::now()))
     }
 
+    /// Forget the devices that ended on their own (stopped or deleted from
+    /// elsewhere, or their queue loops failed): they are gone, and their ids
+    /// may go to other volumes' devices.
+    fn forget_ended(&self) {
+        let gone: Vec<(String, i32)> = {
+            let mut devs = lock(&self.devices);
+            let gone: Vec<(String, i32)> = devs.iter().filter(|(_, r)| r.has_ended()).map(|(v, r)| (v.clone(), r.dev_id)).collect();
+            for (v, _) in &gone {
+                devs.remove(v);
+            }
+            gone
+        };
+        for (v, id) in &gone {
+            log::warn!("{v}: ublk device {id} ended on its own; the volume is no longer attached");
+        }
+        if !gone.is_empty() {
+            self.save(&BTreeMap::new());
+        }
+    }
+
     /// Recovery attempt `n` for `vol`, on an op thread.
     fn attempt(self: &Arc<Self>, vol: &str, n: u64) {
         self.guarded(vol, n, || self.try_recover(vol, n));
@@ -444,6 +498,21 @@ impl Daemon {
         let Some(e) = lock(&self.recovering).get(vol).filter(|p| p.phase == Phase::Trying(n)).map(|p| p.entry.clone()) else {
             return;
         };
+        // Before reaching the target: the device must still be this
+        // volume's (its id may have gone to another volume's device), and
+        // recoverable now. EBUSY (its previous server still has it open) is
+        // tried again later, holding no lane meanwhile.
+        match (self.hooks.check)(vol, e.dev_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!("{vol}: ublk device {} is not recoverable yet (its previous server still has it open); retrying", e.dev_id);
+                return self.retry(vol, n);
+            }
+            Err(err) => {
+                log::error!("{vol}: could not reattach ublk device {}: {err:#}", e.dev_id);
+                return self.settle(vol, n, None);
+            }
+        }
         let addrs = match device::addrs(&e.spec) {
             Ok(a) => a,
             Err(err) => {
@@ -461,7 +530,10 @@ impl Daemon {
             }
         };
         let c2 = ctrls.clone();
-        if !self.start_recovery(vol, n, move |e, hold| device::start_here(e.spec.clone(), c2, Some((e.dev_id, hold)))) {
+        // Ends before dispatch would give the attempt up (START_DEADLINE), so
+        // that a start that gives up is tried again rather than dropped.
+        let deadline = Instant::now() + device::START_DEADLINE - Duration::from_secs(5);
+        if !self.start_recovery(vol, n, move |e, hold| device::start_here(e.spec.clone(), c2, Some((e.dev_id, hold)), deadline)) {
             // A detach took the volume over while its target was reached.
             ctrls.shutdown();
         }
@@ -485,6 +557,16 @@ impl Daemon {
         self.save(&BTreeMap::new());
         match start(&e, !e.clean) {
             Ok(r) => self.settle(vol, n, Some(r)),
+            Err(err) if device::is_try_again(&err) => {
+                // The device is untouched and still holds the volume's I/O:
+                // keep it recorded (now unclean, which only holds writes
+                // longer) and try again, holding no lane meanwhile.
+                log::warn!("{vol}: reattach of ublk device {} not possible yet ({err:#}); retrying", e.dev_id);
+                if let Some(p) = lock(&self.recovering).get_mut(vol).filter(|p| matches!(p.phase, Phase::Starting(m, _) if m == n)) {
+                    p.phase = Phase::Due(Instant::now() + RETRY);
+                }
+                self.wake();
+            }
             Err(err) => {
                 log::error!("{vol}: could not reattach ublk device {}: {err:#}", e.dev_id);
                 self.settle(vol, n, None);
@@ -557,7 +639,7 @@ pub fn run(socket: &str, state_path: &str) -> Result<()> {
     // (Daemon::dispatch); until then it stays recorded as it was.
     let previous: Vec<StateEntry> = std::fs::read(state_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let now = Instant::now();
-    for e in previous {
+    for e in distinct_devices(previous, device::owner) {
         if libublk::ctrl::UblkCtrl::new_simple(e.dev_id).is_err() {
             log::warn!("{}: ublk device {} is gone; dropping it from state", e.spec.volume, e.dev_id);
             continue;
@@ -569,10 +651,46 @@ pub fn run(socket: &str, state_path: &str) -> Result<()> {
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket).with_context(|| format!("bind {socket}"))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    let dw = Arc::downgrade(&d);
+    device::on_device_end(move || {
+        if let Some(d) = dw.upgrade() {
+            d.wake();
+        }
+    });
     let dh = d.clone();
     ctrlc::set_handler(move || dh.handover())?;
     log::info!("nvmeublkd listening on {socket} ({} device(s) being recovered)", lock(&d.recovering).len());
     serve(&d, &listener)
+}
+
+/// The state file's entries with no two naming one ublk device. A device a
+/// volume left behind that ended meanwhile frees its id, and a later attach
+/// of another volume may get it; recovering both would serve one volume's
+/// device from the other's namespace. Of the entries sharing an id, only the
+/// one `owner` (the volume recorded in the device's json) names is kept; if
+/// it names none of them, or cannot tell, none is: their I/O stays held
+/// until an operator deletes the device.
+fn distinct_devices(entries: Vec<StateEntry>, owner: impl Fn(i32) -> Option<Option<String>>) -> Vec<StateEntry> {
+    let mut by_id: BTreeMap<i32, Vec<StateEntry>> = BTreeMap::new();
+    for e in entries {
+        by_id.entry(e.dev_id).or_default().push(e);
+    }
+    let mut out = Vec::new();
+    for (id, mut es) in by_id {
+        if es.len() == 1 {
+            out.append(&mut es);
+            continue;
+        }
+        let names: Vec<&str> = es.iter().map(|e| e.spec.volume.as_str()).collect();
+        match owner(id).flatten() {
+            Some(o) if names.contains(&o.as_str()) => {
+                log::error!("ublk device {id} is recorded for volumes {names:?}; it is {o}'s, dropping the others");
+                out.extend(es.into_iter().filter(|e| e.spec.volume == o));
+            }
+            other => log::error!("ublk device {id} is recorded for volumes {names:?} and its owner is {other:?}: recovering none of them"),
+        }
+    }
+    out
 }
 
 /// The main loop: accept control connections, each handled on a thread of
@@ -667,8 +785,12 @@ mod tests {
     /// A daemon with its own lanes, whose effects outside its bookkeeping
     /// are `attempt` and `delete`.
     fn daemon(test: &str, attempt: fn(&Arc<Daemon>, &str, u64), delete: fn(i32) -> Result<()>) -> Arc<Daemon> {
+        daemon_checked(test, attempt, delete, |_, _| Ok(true))
+    }
+
+    fn daemon_checked(test: &str, attempt: fn(&Arc<Daemon>, &str, u64), delete: fn(i32) -> Result<()>, check: fn(&str, i32) -> Result<bool>) -> Arc<Daemon> {
         let lanes: &'static OpLanes = Box::leak(Box::new(OpLanes::new()));
-        Arc::new(Daemon::with_hooks(&state_path(test), Hooks { attempt, delete, lanes }))
+        Arc::new(Daemon::with_hooks(&state_path(test), Hooks { attempt, delete, check, lanes }))
     }
 
     fn pend(d: &Daemon, e: StateEntry, phase: Phase) {
@@ -970,5 +1092,97 @@ mod tests {
         *lock(&STUCK) = false;
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(&d.state_path);
+    }
+
+    /// A reattach that cannot happen yet (START_USER_RECOVERY answered EBUSY
+    /// because the previous server still has the device open, or bring-up
+    /// gave up on a queue it could not set up) leaves the device untouched,
+    /// still holding the volume's I/O: the volume stays recorded and is tried
+    /// again, instead of being dropped and its device orphaned for good.
+    #[test]
+    fn a_reattach_that_is_not_possible_yet_is_retried_not_dropped() {
+        let d = daemon("try-again", no_attempt, no_delete);
+        pend(&d, entry("v1", 7, true), Phase::Trying(1));
+        let t0 = Instant::now();
+        assert!(d.start_recovery("v1", 1, |_, _| Err(anyhow::Error::new(device::TryAgain("EBUSY".into())).context("start"))));
+        let Some(Phase::Due(t)) = phase(&d, "v1") else { panic!("dropped or stuck: {:?}", phase(&d, "v1")) };
+        assert!(t >= t0 + RETRY / 2, "retried at once");
+        // Still recorded, now unclean: a crash from here on holds writes.
+        assert_eq!(on_disk(&d), vec![entry("v1", 7, false)]);
+        let _ = std::fs::remove_file(&d.state_path);
+    }
+
+    /// Before an attempt reaches the target, the device is checked: EBUSY
+    /// is tried again a second later holding no lane, and a device that is
+    /// no longer the volume's (its id went to another volume) is left alone
+    /// and the volume dropped, never started for the wrong volume.
+    #[test]
+    fn a_busy_or_foreign_device_is_not_started() {
+        fn check(vol: &str, _: i32) -> Result<bool> {
+            match vol {
+                "busy" => Ok(false),
+                _ => bail!("ublk device 7 now belongs to volume w"),
+            }
+        }
+        let d = daemon_checked("check", no_attempt, no_delete, check);
+        pend(&d, entry("busy", 6, true), Phase::Trying(1));
+        pend(&d, entry("foreign", 7, true), Phase::Trying(2));
+        d.try_recover("busy", 1);
+        d.try_recover("foreign", 2);
+        assert!(matches!(phase(&d, "busy"), Some(Phase::Due(_))), "{:?}", phase(&d, "busy"));
+        assert_eq!(phase(&d, "foreign"), None);
+        assert_eq!(on_disk(&d), vec![entry("busy", 6, true)]);
+        let _ = std::fs::remove_file(&d.state_path);
+    }
+
+    /// Two entries naming one ublk device (a device that ended on its own
+    /// freed its id, and another volume's attach got it): only the volume
+    /// the device itself names is recovered, or none if it cannot tell.
+    /// Recovering both would serve one volume's device from the other's
+    /// namespace.
+    #[test]
+    fn two_volumes_never_recover_one_device() {
+        let all = vec![entry("a", 5, true), entry("b", 5, true), entry("c", 6, true)];
+        let kept = distinct_devices(all.clone(), |id| (id == 5).then(|| Some("b".to_string())));
+        assert_eq!(kept, vec![entry("b", 5, true), entry("c", 6, true)]);
+        let kept = distinct_devices(all.clone(), |_| Some(None));
+        assert_eq!(kept, vec![entry("c", 6, true)]);
+        let kept = distinct_devices(all, |_| None);
+        assert_eq!(kept, vec![entry("c", 6, true)]);
+    }
+
+    /// A device that ended on its own is gone and its id free for another
+    /// volume's device: it is never written to the state file (the next
+    /// daemon would recover that other device for this volume), and the
+    /// main loop forgets it.
+    #[test]
+    fn a_device_that_ended_on_its_own_is_forgotten() {
+        let d = daemon("ended", no_attempt, no_delete);
+        let (a, b) = (entry("a", 5, false).spec, entry("b", 6, false).spec);
+        lock(&d.devices).insert("a".into(), Running::for_tests(a, 5, true));
+        lock(&d.devices).insert("b".into(), Running::for_tests(b, 6, false));
+        d.save(&BTreeMap::new());
+        assert_eq!(on_disk(&d), vec![entry("b", 6, false)], "an ended device was recorded");
+        d.dispatch();
+        assert!(!lock(&d.devices).contains_key("a"), "an ended device stayed attached");
+        assert!(lock(&d.devices).contains_key("b"));
+        let list = d.list();
+        assert_eq!(list["devices"].as_array().unwrap().len(), 1);
+        assert_eq!(list["devices"][0]["engine_failed"], false);
+        let _ = std::fs::remove_file(&d.state_path);
+    }
+
+    /// A handover records a device clean only once nothing of its I/O can
+    /// still land: writes held back that went out before (Stats::orphans)
+    /// count as much as the ones on the wire.
+    #[test]
+    fn a_device_holding_orphaned_writes_is_not_handed_over_clean() {
+        let r = Running::for_tests(entry("a", 5, false).spec, 5, false);
+        assert!(r.drain());
+        r.stats.orphans.store(1, Ordering::Relaxed);
+        assert!(!r.drain(), "orphaned writes waiting out the fence were called drained");
+        r.stats.orphans.store(0, Ordering::Relaxed);
+        r.stats.inflight.store(1, Ordering::Relaxed);
+        assert!(!r.drain());
     }
 }

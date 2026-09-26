@@ -306,6 +306,12 @@ pub struct Stats {
     pub loop_ns: AtomicU64,
     /// Engine tasks that panicked; the first one fails its engine.
     pub engine_panics: AtomicU64,
+    /// Writes and flushes held back that went out before, or may have (a
+    /// failed path's orphans waiting out the write fence, and after a crash
+    /// the reissued writes held for one fence), right now. Not in
+    /// `inflight`, yet they may still land on the target: a handover is
+    /// clean only when this is zero too.
+    pub orphans: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Clone)]
@@ -389,14 +395,30 @@ pub struct Pending {
     /// registered in this queue ring's buffer table at this index, so read
     /// payload is received from the socket straight into them.
     pub zc_index: Option<u16>,
+    /// Counted in `Stats::orphans` (set by `Engine::fence`) until it goes on
+    /// the wire again or finishes.
+    orphan: Option<Arc<Stats>>,
 }
 
 impl Pending {
     pub fn new(op: Op, slba: u64, nlb: u32, buf: *mut u8, len: usize, done: Sender<i32>, ucopy: Option<u64>, zc_index: Option<u16>) -> Self {
         let now = Instant::now();
-        Pending { op, slba, nlb, buf, len, done: Some(done), owner: Weak::new(), first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, tx_cov: 0, deferred_sc: None, avoid_path: None, wired: None, first_data: None, ucopy, zc_index }
+        Pending { op, slba, nlb, buf, len, done: Some(done), owner: Weak::new(), first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, tx_cov: 0, deferred_sc: None, avoid_path: None, wired: None, first_data: None, ucopy, zc_index, orphan: None }
+    }
+    /// Count it in `Stats::orphans` until `unorphan`.
+    fn orphan(&mut self, stats: &Arc<Stats>) {
+        if self.orphan.is_none() {
+            stats.orphans.fetch_add(1, Ordering::Relaxed);
+            self.orphan = Some(stats.clone());
+        }
+    }
+    fn unorphan(&mut self) {
+        if let Some(st) = self.orphan.take() {
+            st.orphans.fetch_sub(1, Ordering::Relaxed);
+        }
     }
     fn finish(mut self, res: i32) {
+        self.unorphan();
         if let Some(done) = self.done.take() {
             let _ = done.try_send(res);
         }
@@ -415,9 +437,12 @@ impl Drop for Pending {
     /// still be on the wire, which is why it is not failed here and now.
     /// Runs during an unwind: it only moves the request, never panics.
     fn drop(&mut self) {
-        let Some(done) = self.done.take() else { return };
+        let Some(done) = self.done.take() else {
+            self.unorphan();
+            return;
+        };
         // Every other field is Copy: the request, moved out whole.
-        let p = Pending { done: Some(done), owner: Weak::new(), ..*self };
+        let p = Pending { done: Some(done), owner: Weak::new(), orphan: self.orphan.take(), ..*self };
         let p = match self.owner.upgrade() {
             Some(e) => match e.dropped.try_borrow_mut() {
                 Ok(mut d) => {
@@ -875,11 +900,18 @@ impl Engine {
         p.deferred_sc = None;
         p.wired = None;
         p.first_data = None;
+        // An orphan stays counted until it is really on its way again.
+        let orphan = p.orphan.take();
         self.track(c, cid, p);
         if c.tx.try_send(OutMsg { head, data, len, cid, h2c: false, queued: Instant::now(), fixed }).is_err() {
-            let p = self.untrack(c, cid).expect("just inserted");
+            let mut p = self.untrack(c, cid).expect("just inserted");
+            p.orphan = orphan;
             self.free_cid(c, cid);
             return Err(p);
+        }
+        // On the wire again: counted in `inflight` from here.
+        if let Some(st) = orphan {
+            st.orphans.fetch_sub(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -939,7 +971,8 @@ impl Engine {
         self.dispatch(p);
     }
 
-    fn fence(&self, p: Pending, until: Instant) {
+    fn fence(&self, mut p: Pending, until: Instant) {
+        p.orphan(&self.stats);
         self.stats.fenced.fetch_add(1, Ordering::Relaxed);
         self.fenced.borrow_mut().push((until, p));
     }
@@ -1522,7 +1555,14 @@ impl Engine {
                 // loop takes the header receive over. A short or failed
                 // payload breaks the link and the header receive consumes
                 // nothing (-ECANCELED).
-                let r = if use_recv && *LINK_HDR && *RX_EXACT_MIN > 0 && pending.is_none() {
+                // A link never spans two submissions, and libublk submits to
+                // make room when the SQ is full: with one free slot the pair
+                // would be split, leaving two MSG_WAITALL receives armed on the
+                // socket (the header one could take payload bytes). Make room
+                // for both, or receive the payload alone (the next header is
+                // then read on a later turn, as without LINK_HDR).
+                let linked = use_recv && *LINK_HDR && *RX_EXACT_MIN > 0 && pending.is_none() && sq_room_for(2);
+                let r = if linked {
                     let hsqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), hdr, HDR_PREFETCH as u32).flags(libc::MSG_WAITALL).build();
                     let mut pf = Box::pin(ublk_submit_sqe_async(sqe.flags(io_uring::squeue::Flags::IO_LINK), UblkUringData::Target as u64));
                     let mut hf: PendingRx = Box::pin(ublk_submit_sqe_async(hsqe, UblkUringData::Target as u64));
@@ -2258,15 +2298,7 @@ async fn sqe_until(fd: i32, sqe: io_uring::squeue::Entry, deadline: Instant) -> 
     // A link never spans two submissions, and libublk submits to make room
     // when the SQ is full: with fewer than two free slots that could split
     // the pair, so make room for both first.
-    with_ring(|r| {
-        let free = {
-            let sq = r.submission();
-            sq.capacity() - sq.len()
-        };
-        if free < 2 {
-            let _ = r.submit();
-        }
-    });
+    sq_room_for(2);
     let mut op = Box::pin(ublk_submit_sqe_async(sqe.flags(io_uring::squeue::Flags::IO_LINK), UblkUringData::Target as u64));
     let to = ublk_submit_sqe_async(io_uring::opcode::LinkTimeout::new(&ts).build(), UblkUringData::Target as u64);
     // Each future pushes its SQE on its first poll, and nothing between the
@@ -2370,6 +2402,22 @@ fn with_ring<R>(f: impl FnOnce(&mut io_uring::IoUring<io_uring::squeue::Entry>) 
         Ok(())
     });
     out
+}
+
+/// True once this thread's queue ring has at least `n` free SQ slots,
+/// submitting what is queued to make room if needed. False when it cannot
+/// (no ring, the ring in use, or still too full).
+fn sq_room_for(n: usize) -> bool {
+    with_ring(|r| {
+        let free = |r: &mut io_uring::IoUring<io_uring::squeue::Entry>| {
+            let sq = r.submission();
+            sq.capacity() - sq.len()
+        };
+        if free(r) < n {
+            let _ = r.submit();
+        }
+        free(r) >= n
+    }) == Some(true)
 }
 
 /// Submit, wait up to `wait` for a completion, and wake the futures of the
@@ -3084,5 +3132,103 @@ mod tests {
         }));
         assert!(r.is_err());
         assert_eq!(drops.get(), 1, "freed while unwinding");
+    }
+
+    /// A flush on the wire when its path fails leaves the in-flight count and
+    /// waits out the write fence, and may still execute on the target
+    /// meanwhile. It is counted in `Stats::orphans` until it goes out again,
+    /// so a handover inside the fence (which gates `clean` on the device
+    /// having nothing that can still land) does not hand the device over
+    /// clean and let the next daemon send the reissued write at once.
+    #[test]
+    fn a_write_waiting_out_the_fence_is_counted_as_an_orphan() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let fence = Duration::from_millis(600);
+            let r = rig(&t, "orphans", fence);
+            r.e.start();
+            let mut buf = vec![0u8; 4096];
+            let rx = request(&r.e, Op::Read, &mut buf);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "the read never completed");
+            t.hold_io.store(true, Ordering::Release);
+            let (flush, _ftx) = tag_request(&r.e, Op::Flush, &mut []);
+            drive_until(&r.exe, Duration::from_millis(200), || false);
+            assert_eq!(r.stats.inflight.load(Ordering::Relaxed), 1);
+            std::fs::write(format!("{}/queues", r.fault_dir), "1").unwrap();
+            std::fs::write(format!("{}/fault", r.fault_dir), "kill 0").unwrap();
+            let t0 = Instant::now();
+            assert!(drive_until(&r.exe, Duration::from_secs(2), || r.stats.inflight.load(Ordering::Relaxed) == 0), "the path was not failed");
+            assert!(t0.elapsed() < fence, "the test is too slow to tell");
+            assert_eq!(r.stats.orphans.load(Ordering::Relaxed), 1, "a fenced flush was not counted as one that may still land");
+            t.hold_io.store(false, Ordering::Release);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !flush.is_empty()), "the flush was never sent again");
+            assert_eq!(flush.try_recv(), Ok(0));
+            assert_eq!(r.stats.orphans.load(Ordering::Relaxed), 0, "the orphan count outlived the request");
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// Sockets of this process that are connected to (or accepted from)
+    /// `port` on loopback: the host's admin and I/O connections, dials in
+    /// flight, and the target's side of each. The listener is not counted.
+    fn sockets_on_port(port: u16) -> usize {
+        let mut inodes = std::collections::HashSet::new();
+        for table in ["/proc/self/net/tcp", "/proc/self/net/tcp6"] {
+            let Ok(text) = std::fs::read_to_string(table) else { continue };
+            for line in text.lines().skip(1) {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 10 || f[3] == "0A" {
+                    continue;
+                }
+                let port_of = |a: &str| a.rsplit(':').next().and_then(|p| u16::from_str_radix(p, 16).ok());
+                if port_of(f[1]) == Some(port) || port_of(f[2]) == Some(port) {
+                    inodes.insert(f[9].to_string());
+                }
+            }
+        }
+        let Ok(fds) = std::fs::read_dir("/proc/self/fd") else { return 0 };
+        fds.flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .filter_map(|l| l.to_str().and_then(|l| l.strip_prefix("socket:[")).and_then(|l| l.strip_suffix(']')).map(str::to_string))
+            .filter(|i| inodes.contains(i))
+            .count()
+    }
+
+    /// The node leak (base b7b8ea9: about 20 fds per attach/detach cycle,
+    /// then EMFILE): each cycle here brings a device's controllers and one
+    /// queue's engine up, serves I/O, fails the I/O connection once (so a
+    /// reconnect dials a fresh socket), and tears it all down as a detach
+    /// does (last engine handle dropped on the queue thread, then
+    /// Ctrls::shutdown). Afterwards no socket to the target is left, and
+    /// every engine was freed (its timerfd is closed by Engine::drop).
+    #[test]
+    fn engine_and_controller_cycles_leave_no_socket_behind() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let port = t.addr.port();
+        on_ring_thread(move || {
+            for cycle in 0..5 {
+                let r = rig(&t, &format!("fds-{cycle}"), Duration::from_millis(100));
+                r.e.start();
+                let mut buf = vec![0u8; 4096];
+                let rx = request(&r.e, Op::Read, &mut buf);
+                assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "cycle {cycle}: the read never completed");
+                std::fs::write(format!("{}/queues", r.fault_dir), "1").unwrap();
+                std::fs::write(format!("{}/fault", r.fault_dir), "kill 0").unwrap();
+                let rx = request(&r.e, Op::Read, &mut buf);
+                assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()), "cycle {cycle}: no read after the reconnect");
+                assert!(sockets_on_port(port) >= 4, "cycle {cycle}: the connections are not seen (admin + I/O, both ends)");
+                let Rig { e, stats, ctrls, .. } = r;
+                drop(e);
+                ctrls.shutdown();
+                drop(ctrls);
+                assert_eq!(Arc::strong_count(&stats), 1, "cycle {cycle}: the engine was not freed");
+            }
+            let mut left = 0;
+            assert!(wait_for(Duration::from_secs(5), || {
+                left = sockets_on_port(port);
+                left == 0
+            }), "{left} socket(s) to the target left after 5 cycles");
+        });
     }
 }
