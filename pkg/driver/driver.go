@@ -317,6 +317,9 @@ type Driver struct {
 	// stale observations from its own enumeration.
 	orphanedISCSISessionsSeen sync.Map // Key: IQN, Value: first seen time
 	orphanedNVMeSessionsSeen  sync.Map // Key: NQN, Value: first seen time
+	// nvmeSessions records the NQNs this node plugin connected; NVMe-oF
+	// session GC disconnects only those (nil: GC skips NVMe-oF).
+	nvmeSessions *sessionRegistry
 
 	// Service reload debouncer (prevents reload storms during bulk provisioning)
 	serviceReloadDebouncer *ServiceReloadDebouncer
@@ -436,6 +439,16 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		}
 	}
 
+	var nvmeSessions *sessionRegistry
+	if cfg.RunNode {
+		dir := nvmeSessionRegistryDir(cfg.Endpoint)
+		var regErr error
+		if nvmeSessions, regErr = newSessionRegistry(dir); regErr != nil {
+			klog.Warningf("Session GC: NVMe-oF session registry unavailable (%v); NVMe-oF sessions will not be garbage collected", regErr)
+			nvmeSessions = nil
+		}
+	}
+
 	// Build circuit breaker config if enabled
 	var cbConfig *truenas.CircuitBreakerConfig
 	if cfg.Config.Resilience.CircuitBreaker.Enabled {
@@ -518,6 +531,7 @@ func NewDriver(cfg *DriverConfig) (*Driver, error) {
 		nodeID:                 cfg.NodeID,
 		encodedNodeID:          encodedNodeID,
 		endpoint:               cfg.Endpoint,
+		nvmeSessions:           nvmeSessions,
 		runController:          cfg.RunController,
 		runNode:                cfg.RunNode,
 		config:                 cfg.Config,
@@ -1230,6 +1244,17 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 	if len(targetAddrs) == 0 {
 		targetAddrs = []string{d.config.NVMeoF.TransportAddress}
 	}
+	// Ownership: only sessions this plugin connected (recorded at NodeStage)
+	// are collectable. Another initiator's session to the same portals looks
+	// exactly like a leaked one; without the record GC cannot tell them apart
+	// and must leave it alone.
+	reg := d.nvmeSessions
+	if reg == nil {
+		klog.Warningf("Session GC: skipping NVMe-oF GC: no session registry to prove which sessions this plugin connected")
+		return
+	}
+	listed := make(map[string]struct{})
+	var expectedSet map[string]struct{}
 	d.gcSessions(ctx, gracePeriod, dryRun, sessionGCProtocol{
 		name:        "NVMe-oF",
 		metricLabel: "nvmeof",
@@ -1268,14 +1293,78 @@ func (d *Driver) gcNVMeoFSessions(ctx context.Context, gracePeriod time.Duration
 				}
 				if !inScope {
 					klog.V(5).Infof("Session GC: skipping session %s (no path matches configured addresses %v; paths: %v)", session.NQN, targetAddrs, session.Addresses)
+				} else if !reg.has(session.NQN) {
+					inScope = false
+					klog.V(4).Infof("Session GC: skipping session %s: not connected by this plugin (no registry record)", session.NQN)
 				}
+				listed[session.NQN] = struct{}{}
 				out = append(out, gcSession{id: session.NQN, inScope: inScope})
 			}
 			return out, nil
 		},
-		expected:   d.getExpectedNVMeoFNQNs,
-		disconnect: gcDisconnectNVMeoF,
+		expected: func() map[string]struct{} {
+			expectedSet = d.getExpectedNVMeoFNQNs()
+			// Staged volumes' sessions are this plugin's: record them, so a
+			// session staged before the registry existed (or whose record
+			// was lost) becomes collectable once it is orphaned.
+			if !dryRun {
+				for nqn := range expectedSet {
+					if err := reg.record(nqn); err != nil {
+						klog.Warningf("Session GC: %v", err)
+					}
+				}
+			}
+			return expectedSet
+		},
+		disconnect: func(nqn string) error {
+			if err := gcDisconnectNVMeoF(nqn); err != nil {
+				return err
+			}
+			if err := reg.forget(nqn); err != nil {
+				klog.Warningf("Session GC: %v", err)
+			}
+			return nil
+		},
 	})
+	if !dryRun && expectedSet != nil {
+		pruneSessionRegistry(reg, listed, expectedSet, gracePeriod)
+	}
+}
+
+// pruneSessionRegistry forgets records whose session no longer exists and is
+// not staged. A record younger than gracePeriod is kept: NodeStage writes it
+// before connecting, so a young record without a session may be a stage in
+// progress.
+func pruneSessionRegistry(reg *sessionRegistry, listed, expected map[string]struct{}, gracePeriod time.Duration) {
+	entries, err := reg.entries()
+	if err != nil {
+		klog.Warningf("Session GC: list session registry: %v", err)
+		return
+	}
+	for nqn, recorded := range entries {
+		if _, live := listed[nqn]; live {
+			continue
+		}
+		if _, staged := expected[nqn]; staged {
+			continue
+		}
+		if time.Since(recorded) < gracePeriod {
+			continue
+		}
+		if err := reg.forget(nqn); err != nil {
+			klog.Warningf("Session GC: %v", err)
+		}
+	}
+}
+
+// nvmeSessionRegistryDir places the NVMe-oF session registry beside the CSI
+// socket: the plugin's own host directory, which outlives plugin restarts.
+func nvmeSessionRegistryDir(endpoint string) string {
+	socket := strings.TrimPrefix(strings.TrimPrefix(endpoint, "unix://"), "unix:")
+	if socket == "" || !filepath.IsAbs(socket) {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(socket), "sessions", "nvmeof")
 }
 
 func nvmeSessionMatchesTransportAddress(sessionAddress, targetAddress string) bool {

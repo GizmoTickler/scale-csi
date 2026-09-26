@@ -898,6 +898,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 				} else {
 					klog.Infof("Disconnected NVMe-oF session %s", nqn)
 					primaryDisconnectSucceeded = true
+					d.forgetNVMeSession(nqn)
 				}
 			} else {
 				klog.V(4).Infof("Could not get NVMe info from device %s: %v", devicePath, nvmeErr)
@@ -1002,6 +1003,7 @@ func (d *Driver) cleanupOrphanedSessionByVolumeID(ctx context.Context, volumeID 
 				return fmt.Errorf("failed to disconnect NVMe-oF session %s: %w", nqn, err)
 			}
 			klog.Infof("Successfully cleaned up orphaned NVMe-oF session %s", nqn)
+			d.forgetNVMeSession(nqn)
 		}
 	case ShareTypeNFS:
 		// NFS mounts have no session/login concept to clean up here.
@@ -2414,6 +2416,14 @@ func (d *Driver) stageNVMeoFVolume(ctx context.Context, volumeContext map[string
 
 	if nqn == "" || address == "" {
 		return status.Error(codes.InvalidArgument, "NVMe-oF NQN and address are required in volume context")
+	}
+	// Record the session as this plugin's BEFORE connecting, so session GC
+	// can collect it if it is ever orphaned. A failed record does not fail
+	// the stage: an unrecorded session is merely never garbage collected.
+	if d.nvmeSessions != nil {
+		if err := d.nvmeSessions.record(nqn); err != nil {
+			klog.Warningf("NVMe-oF stage %s: %v; session GC will not collect this session", nqn, err)
+		}
 	}
 
 	if transport == "" {
