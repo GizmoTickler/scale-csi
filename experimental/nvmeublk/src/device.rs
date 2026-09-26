@@ -405,13 +405,15 @@ enum Stop<S> {
 
 /// The step of a detach between taking the device and retiring it: set
 /// `draining` (parked and fenced I/O fail with EIO, so nothing waits on
-/// paths that are gone) and STOP it with `kill`. STOP makes the queue
-/// threads return; if they all have already (stopped elsewhere, or its loops
-/// failed), it is not sent: STOP of a live device while its char device is
-/// held open would wait forever for the requests they had taken
-/// (UblkCtrl::wait_target). If STOP fails, the device goes back to where it
-/// was, served; it is retired anyway if its queue threads returned
-/// meanwhile, since nothing else would end it then.
+/// paths that are gone) and make its queue threads return with `kill`
+/// (`Running::end_it`), unless they all have already (stopped elsewhere, or
+/// its loops failed). `retire` then closes the char device before it sends
+/// STOP: STOP of a live device waits for every request the server has
+/// taken (ublk_wait_tagset_rqs_idle), and while the char device is open
+/// only the server can complete them (UblkCtrl::wait_target). If `kill`
+/// fails, the device goes back to where it was, served; it is retired
+/// anyway if its queue threads returned meanwhile, since nothing else would
+/// end it then.
 fn stop_or_put_back<S, E: std::error::Error + Send + Sync + 'static>(end: &Ending<S>, s: S, draining: &AtomicBool, kill: impl FnOnce() -> Result<(), E>) -> Stop<S> {
     draining.store(true, Ordering::Release);
     if end.queues_are_done() {
@@ -448,6 +450,9 @@ pub struct Running {
     draining: Arc<AtomicBool>,
     pub quiesce: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    /// Set by a detach: the queue loops return (and close their rings), so
+    /// that the device's char device can be closed before STOP.
+    leave: Arc<AtomicBool>,
     /// Dropping a Running leaves the device served; it then ends on its own
     /// when it is stopped.
     end: Arc<Ending<Served>>,
@@ -459,8 +464,11 @@ impl Running {
     }
 
     /// Stop serving and delete the device, on this thread, holding a general
-    /// op lane (waiting START_DEADLINE at most for one). Parked and fenced
-    /// I/O fails with EIO, so this never waits on paths that are gone. If
+    /// op lane (waiting START_DEADLINE at most for one). Its queue threads
+    /// return first and the char device is closed before STOP, so the I/O
+    /// they had not completed fails with EIO (parked and fenced I/O, too)
+    /// and this never waits on paths that are gone, nor on requests the
+    /// queue threads would never complete. If
     /// the device has ended on its own, this waits until that is done and
     /// reports how it went.
     ///
@@ -513,7 +521,20 @@ impl Running {
                 Some(s) => retire(s, &self.stop).map_err(|e| (e, false)),
             };
         };
-        match stop_or_put_back(&self.end, s, &self.draining, || UblkCtrl::new_simple(self.dev_id).and_then(|c| c.kill_dev()).map(|_| ())) {
+        // Never STOP_DEV here, with the queue threads running and the char
+        // device open: STOP waits for every request they have taken, and one
+        // they never complete (a tag whose request they lost, a queue thread
+        // that is stuck, or this process exiting meanwhile, which a handover
+        // does) hangs STOP in the kernel for good, with it this thread and
+        // the process (unkillable once its io-wq worker is in STOP). The
+        // queue loops return instead; `retire` joins them, closes the char
+        // device (the driver then takes back every request they held) and
+        // only then sends STOP and DEL.
+        let leave = || {
+            self.leave.store(true, Ordering::Release);
+            Ok::<(), std::convert::Infallible>(())
+        };
+        match stop_or_put_back(&self.end, s, &self.draining, leave) {
             Stop::Retire(s) => retire(s, &self.stop).map_err(|e| (e, false)),
             Stop::StillServed(e) => Err((e.context(format!("stop ublk device {}", self.dev_id)), true)),
         }
@@ -582,6 +603,7 @@ impl Running {
             draining: Arc::new(AtomicBool::new(false)),
             quiesce: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
+            leave: Arc::new(AtomicBool::new(false)),
             end,
         }
     }
@@ -864,8 +886,9 @@ fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<
     let draining = Arc::new(AtomicBool::new(false));
     let quiesce = Arc::new(AtomicBool::new(false));
     let end = Arc::new(Ending::new());
-    let dev_id = bring_up(&spec, recover, hold, write_fence, info, stats.clone(), ctrls.clone(), stop.clone(), draining.clone(), quiesce.clone(), end.clone(), deadline)?;
-    Ok(Running { spec, dev_id, stats, ctrls, draining, quiesce, stop, end })
+    let leave = Arc::new(AtomicBool::new(false));
+    let dev_id = bring_up(&spec, recover, hold, write_fence, info, stats.clone(), ctrls.clone(), stop.clone(), draining.clone(), quiesce.clone(), leave.clone(), end.clone(), deadline)?;
+    Ok(Running { spec, dev_id, stats, ctrls, draining, quiesce, stop, leave, end })
 }
 
 /// ublk feature flags a new device is added with. A recovered device keeps
@@ -976,6 +999,9 @@ fn bring_up(
     stop: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     quiesce: Arc<AtomicBool>,
+    // The queue loops return once this is set: by a start that gave up, or
+    // by a detach (`Running::leave`).
+    abandoned: Arc<AtomicBool>,
     end: Arc<Ending<Served>>,
     deadline: Instant,
 ) -> Result<i32> {
@@ -1052,7 +1078,6 @@ fn bring_up(
     );
     let (sq, stq, drq, eq) = (stats.clone(), stop.clone(), draining.clone(), end.clone());
     let exited = Arc::new(AtomicUsize::new(0));
-    let abandoned = Arc::new(AtomicBool::new(false));
     let ab = abandoned.clone();
     let volume = spec.volume.clone();
     let started = ctrl.start_target_until(
