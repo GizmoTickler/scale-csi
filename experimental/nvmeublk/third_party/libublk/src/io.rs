@@ -244,7 +244,10 @@ pub(crate) fn defer_queue_cqe(cqe: cqueue::Entry) {
     DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().push_back(cqe));
 }
 
-pub(crate) fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
+/// Take the oldest CQE that synchronous batch setup set aside for the
+/// queue's event loop (see [`UblkBatchQueue`]); loops that reap the ring
+/// themselves must drain these first.
+pub fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
     DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().pop_front())
 }
 
@@ -1692,6 +1695,34 @@ impl UblkQueue<'_> {
         }
     }
 
+    /// The tags io thread `idx` of `nr_threads` serves on a queue of
+    /// `depth` tags: `(first, step, count, one past the last, chunk)` (see
+    /// [`Self::tags`]). Under `UBLK_F_BATCH_IO` (`batch`) tags are not
+    /// partitioned: every io thread of the queue keeps its own multishot
+    /// fetch and the driver may hand any tag to any of them, so each one
+    /// serves all of the queue's tags.
+    pub(crate) fn thread_tags(
+        depth: u32,
+        nr_threads: u16,
+        idx: u16,
+        chunk: u16,
+        sequential: bool,
+        batch: bool,
+    ) -> (u16, u16, u32, u16, u16) {
+        let (nr_threads, idx) = if batch { (1, 0) } else { (nr_threads, idx) };
+        let tag_chunk = Self::effective_chunk(depth, nr_threads, chunk, sequential);
+        if tag_chunk > 0 {
+            let (first, end, count) = Self::chunked_partition(depth, nr_threads, idx, tag_chunk);
+            (first, 1u16, count, end, tag_chunk)
+        } else {
+            let (start, step, count) = Self::tag_partition(depth, nr_threads, idx, sequential);
+            // One past the last owned tag, so tags() and owns_tag() need not
+            // know which layout produced (tag_start, tag_step, nr_tags).
+            let end = if count == 0 { start } else { (start as u32 + (count - 1) * step as u32 + 1) as u16 };
+            (start, step, count, end, 0)
+        }
+    }
+
     /// New one ublk queue served by io thread `thread_idx` of the
     /// `dev.io_threads_per_queue()` threads for queue `q_id`.
     ///
@@ -1715,17 +1746,9 @@ impl UblkQueue<'_> {
         }
         let sequential = dev.flags.intersects(UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION);
         let q_depth = dev.dev_info.queue_depth as u32;
-        let tag_chunk = Self::effective_chunk(q_depth, nr_threads, dev.io_tag_chunk(), sequential);
-        let (tag_start, tag_step, nr_tags, tag_end) = if tag_chunk > 0 {
-            let (first, end, count) = Self::chunked_partition(q_depth, nr_threads, thread_idx, tag_chunk);
-            (first, 1u16, count, end)
-        } else {
-            let (start, step, count) = Self::tag_partition(q_depth, nr_threads, thread_idx, sequential);
-            // One past the last owned tag, so tags() and owns_tag() need not
-            // know which layout produced (tag_start, tag_step, nr_tags).
-            let end = if count == 0 { start } else { (start as u32 + (count - 1) * step as u32 + 1) as u16 };
-            (start, step, count, end)
-        };
+        let batch = dev.dev_info.flags & sys::UBLK_F_BATCH_IO as u64 != 0;
+        let (tag_start, tag_step, nr_tags, tag_end, tag_chunk) =
+            Self::thread_tags(q_depth, nr_threads, thread_idx, dev.io_tag_chunk(), sequential, batch);
         if nr_tags == 0 {
             // More io threads than tags: this thread has nothing to serve.
             return Err(UblkError::OtherError(-libc::EINVAL));
@@ -3905,6 +3928,25 @@ mod tag_partition_tests {
         assert_eq!(UblkQueue::tag_partition(65, 4, 3, true), (49, 1, 16));
         assert_eq!(UblkQueue::tag_partition(2, 3, 2, true), (2, 1, 0));
         assert_eq!(UblkQueue::tag_partition(128, 0, 0, true), (0, 1, 128));
+    }
+
+    /// UBLK_F_BATCH_IO: every io thread of a queue serves all its tags,
+    /// whatever the partition settings; without it the partition stands.
+    #[test]
+    fn batch_io_threads_serve_every_tag() {
+        for (chunk, seq) in [(1u16, false), (8, false), (8, true)] {
+            for idx in 0..4u16 {
+                assert_eq!(
+                    UblkQueue::thread_tags(64, 4, idx, chunk, seq, true),
+                    (0, 1, 64, 64, 0),
+                    "chunk {chunk} seq {seq} idx {idx}"
+                );
+            }
+        }
+        assert_eq!(UblkQueue::thread_tags(64, 4, 1, 1, false, false), (1, 4, 16, 62, 0));
+        assert_eq!(UblkQueue::thread_tags(64, 4, 1, 1, true, false), (16, 1, 16, 32, 0));
+        assert_eq!(UblkQueue::thread_tags(64, 4, 1, 8, false, false), (8, 1, 16, 48, 8));
+        assert_eq!(UblkQueue::thread_tags(64, 1, 0, 8, false, false), (0, 1, 64, 64, 0));
     }
 
     /// Chunked partitions cover `0..depth` exactly once, give every thread

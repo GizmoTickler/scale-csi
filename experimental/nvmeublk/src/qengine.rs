@@ -314,6 +314,11 @@ pub struct Stats {
     /// `inflight`, yet they may still land on the target: a handover is
     /// clean only when this is zero too.
     pub orphans: std::sync::atomic::AtomicI64,
+    /// Batch I/O (UBLK_F_BATCH_IO): requests fetched, and how often a
+    /// thread's fetch ran out of credits and the queue's requests spilled
+    /// to its next thread.
+    pub batch_tags: AtomicU64,
+    pub batch_spills: AtomicU64,
 }
 
 #[derive(Clone)]

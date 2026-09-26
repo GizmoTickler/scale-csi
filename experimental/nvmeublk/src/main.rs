@@ -4,9 +4,11 @@
 //!   nvmeublk probe <nqn> <addr:port>...      protocol smoke test, no ublk
 //!   nvmeublk run   <nqn> <addr:port>...      serve /dev/ublkbN until Ctrl-C
 //!
-//! Environment: NVMEUBLK_QUEUES (2), NVMEUBLK_DEPTH (64),
+//! Environment: NVMEUBLK_QUEUES (2; 1 with NVMEUBLK_BATCH_IO=1), NVMEUBLK_DEPTH (64),
+//! NVMEUBLK_THREADS_PER_QUEUE (4), NVMEUBLK_BATCH_IO (0), NVMEUBLK_BATCH_SPILL (16),
 //! NVMEUBLK_IO_TIMEOUT_MS (5000), NVMEUBLK_NO_PATH_TIMEOUT_MS (30000, 0=forever).
 
+mod batchq;
 mod conn;
 mod ctrls;
 mod daemon;
@@ -148,6 +150,67 @@ fn lat(nqn: &str, addrs: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// One request on `tag`, fetched and not yet committed: hand it to the
+/// engine and wait for its result (bytes, or a negative errno). Shared by the
+/// per-tag mode (`io_task`) and batch mode (`batchq`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_request(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    e: &qengine::QEngine,
+    shift: u32,
+    cdev_fd: i32,
+    zc: bool,
+    buf_ptr: *mut u8,
+    ucopy: Option<u64>,
+    done_tx: &smol::channel::Sender<i32>,
+    done_rx: &smol::channel::Receiver<i32>,
+) -> i32 {
+    let iod = q.get_iod(tag);
+    let op = match iod.op_flags & 0xff {
+        libublk::sys::UBLK_IO_OP_READ => Some(qengine::Op::Read),
+        libublk::sys::UBLK_IO_OP_WRITE => Some(qengine::Op::Write),
+        libublk::sys::UBLK_IO_OP_FLUSH => Some(qengine::Op::Flush),
+        _ => None,
+    };
+    match op {
+        None => -libc::EOPNOTSUPP,
+        Some(op) => 'io: {
+            let bytes = (iod.nr_sectors as usize) << 9;
+            // Zero copy: a write too large for the capsule goes out via
+            // R2T straight from the request's registered pages.
+            // Zero copy: every write, in-capsule or R2T, is sent from the request pages.
+            let zc_write = zc && op == qengine::Op::Write;
+            if let (Some(pos), qengine::Op::Write, false) = (ucopy, op, zc_write) {
+                // Pull the write data out of the request into our buffer.
+                let mut got = 0usize;
+                while got < bytes {
+                    let n = unsafe { libc::pread(cdev_fd, buf_ptr.add(got) as *mut libc::c_void, bytes - got, (pos + got as u64) as libc::off_t) };
+                    if n <= 0 {
+                        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        log::error!("q{} tag {tag}: pread of write data failed", q.get_qid());
+                        break 'io -libc::EIO;
+                    }
+                    got += n as usize;
+                }
+            }
+            e.submit(qengine::Pending::new(
+                op,
+                (iod.start_sector << 9) >> shift,
+                (bytes >> shift) as u32,
+                buf_ptr,
+                if op == qengine::Op::Flush { 0 } else { bytes },
+                done_tx.clone(),
+                ucopy,
+                (zc && (op == qengine::Op::Read || zc_write)).then_some(tag),
+            ));
+            done_rx.recv().await.unwrap_or(-libc::EIO)
+        }
+    }
+}
+
 async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, cdev_fd: i32, zc: bool) -> Result<(), UblkError> {
     // Zero copy moves bulk data straight between the socket and the request's
     // own pages, so this buffer only ever holds in-capsule write data: size it
@@ -171,51 +234,33 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
     let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_ref().expect("copying mode has a tag buffer").as_slice()) };
     q.submit_io_prep_cmd(tag, ublk_buf, 0, if ucopy.is_some() || zc { None } else { buf.as_ref() }).await?;
     loop {
-        let iod = q.get_iod(tag);
-        let op = match iod.op_flags & 0xff {
-            libublk::sys::UBLK_IO_OP_READ => Some(qengine::Op::Read),
-            libublk::sys::UBLK_IO_OP_WRITE => Some(qengine::Op::Write),
-            libublk::sys::UBLK_IO_OP_FLUSH => Some(qengine::Op::Flush),
-            _ => None,
-        };
-        let res = match op {
-            None => -libc::EOPNOTSUPP,
-            Some(op) => 'io: {
-                let bytes = (iod.nr_sectors as usize) << 9;
-                // Zero copy: a write too large for the capsule goes out via
-                // R2T straight from the request's registered pages.
-                // Zero copy: every write, in-capsule or R2T, is sent from the request pages.
-                let zc_write = zc && op == qengine::Op::Write;
-                if let (Some(pos), qengine::Op::Write, false) = (ucopy, op, zc_write) {
-                    // Pull the write data out of the request into our buffer.
-                    let mut got = 0usize;
-                    while got < bytes {
-                        let n = unsafe { libc::pread(cdev_fd, buf_ptr.add(got) as *mut libc::c_void, bytes - got, (pos + got as u64) as libc::off_t) };
-                        if n <= 0 {
-                            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                                continue;
-                            }
-                            log::error!("q{} tag {tag}: pread of write data failed", q.get_qid());
-                            break 'io -libc::EIO;
-                        }
-                        got += n as usize;
-                    }
-                }
-                e.submit(qengine::Pending::new(
-                    op,
-                    (iod.start_sector << 9) >> shift,
-                    (bytes >> shift) as u32,
-                    buf_ptr,
-                    if op == qengine::Op::Flush { 0 } else { bytes },
-                    done_tx.clone(),
-                    ucopy,
-                    (zc && (op == qengine::Op::Read || zc_write)).then_some(tag),
-                ));
-                done_rx.recv().await.unwrap_or(-libc::EIO)
-            }
-        };
+        let res = serve_request(q, tag, e, shift, cdev_fd, zc, buf_ptr, ucopy, &done_tx, &done_rx).await;
         let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_ref().expect("copying mode has a tag buffer").as_slice()) };
         q.submit_io_commit_cmd(tag, ublk_buf, res).await?;
+    }
+}
+
+/// Build this queue thread's ring in the mode NVMEUBLK_RING_MODE asks for
+/// (see `queue_fn`), before libublk builds its default one.
+pub(crate) fn setup_queue_ring(qid: u16, dev: &UblkDev) {
+    let mode = std::env::var("NVMEUBLK_RING_MODE").unwrap_or_default();
+    if mode == "plain" || mode == "defer" {
+        let (sq, cq) = (dev.tgt.sq_depth as u32, dev.tgt.cq_depth as u32);
+        let r = libublk::io::ublk_init_task_ring(|cell| {
+            if cell.get().is_none() {
+                let mut b = io_uring::IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder();
+                b.setup_cqsize(cq);
+                if mode == "defer" {
+                    b.setup_single_issuer().setup_defer_taskrun();
+                }
+                let ring = b.build(sq).map_err(libublk::UblkError::IOError)?;
+                cell.set(std::cell::RefCell::new(ring)).map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            log::warn!("q{qid}: ring mode {mode} failed ({e}); using libublk's default");
+        }
     }
 }
 
@@ -246,25 +291,7 @@ fn queue_fn(
     //   coop  (default) COOP_TASKRUN, as libublk does
     //   plain           no task-run flags
     //   defer           SINGLE_ISSUER + DEFER_TASKRUN
-    let mode = std::env::var("NVMEUBLK_RING_MODE").unwrap_or_default();
-    if mode == "plain" || mode == "defer" {
-        let (sq, cq) = (dev.tgt.sq_depth as u32, dev.tgt.cq_depth as u32);
-        let r = libublk::io::ublk_init_task_ring(|cell| {
-            if cell.get().is_none() {
-                let mut b = io_uring::IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder();
-                b.setup_cqsize(cq);
-                if mode == "defer" {
-                    b.setup_single_issuer().setup_defer_taskrun();
-                }
-                let ring = b.build(sq).map_err(libublk::UblkError::IOError)?;
-                cell.set(std::cell::RefCell::new(ring)).map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-            }
-            Ok(())
-        });
-        if let Err(e) = r {
-            log::warn!("q{qid}: ring mode {mode} failed ({e}); using libublk's default");
-        }
-    }
+    setup_queue_ring(qid, dev);
     // Fails when the node runs short of fds or memory (the queue ring, its
     // registered files and buffers, the mmap of the command buffer). This
     // thread then returns without FETCHing its tags: libublk counts it out,
@@ -467,13 +494,16 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     harden_for_writeback();
     set_queue_cpus();
     qengine::set_zc_recv_preference(env_u64("NVMEUBLK_ZC_RECV", 0) != 0);
+    // NVMEUBLK_BATCH_IO=1: ublk batch I/O (see batchq.rs); one queue unless
+    // NVMEUBLK_QUEUES says otherwise.
+    let batch_io = env_u64("NVMEUBLK_BATCH_IO", 0) != 0;
     let spec = device::DeviceSpec {
         volume: std::env::var("NVMEUBLK_VOLUME").unwrap_or_else(|_| "run".into()),
         subnqn: nqn.to_string(),
         addrs: addrs.to_vec(),
         hostnqn: std::env::var("NVMEUBLK_HOSTNQN").ok(),
         hostid: std::env::var("NVMEUBLK_HOSTID").ok(),
-        queues: env_u64("NVMEUBLK_QUEUES", 2) as u16,
+        queues: env_u64("NVMEUBLK_QUEUES", if batch_io { 1 } else { 2 }) as u16,
         depth: env_u64("NVMEUBLK_DEPTH", 64) as u16,
         zero_copy: env_u64("NVMEUBLK_ZERO_COPY", 0) != 0,
         napi_us: env_u64("NVMEUBLK_NAPI_US", 0) as u32,
@@ -482,6 +512,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", 4) as u16,
         seq_tags: env_u64("NVMEUBLK_SEQ_TAGS", 0) != 0,
         tag_chunk: env_u64("NVMEUBLK_TAG_CHUNK", 8) as u16,
+        batch_io,
+        batch_spill: env_u64("NVMEUBLK_BATCH_SPILL", 16).min(u16::MAX as u64) as u16,
         io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),
         no_path_timeout_ms: env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000),
         write_fence_ms: std::env::var("NVMEUBLK_WRITE_FENCE_MS").ok().and_then(|v| v.parse().ok()),
@@ -491,11 +523,12 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     let r = device::start(spec, recover)?;
     let f = libublk::ctrl::UblkCtrl::new_simple(r.dev_id).map(|c| c.dev_info().flags).unwrap_or(0);
     log::info!(
-        "ublk device flags {f:#x}: zero_copy={} user_copy={} user_recovery={} reissue={}",
+        "ublk device flags {f:#x}: zero_copy={} user_copy={} user_recovery={} reissue={} batch_io={}",
         f & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0,
         f & libublk::sys::UBLK_F_USER_COPY as u64 != 0,
         f & libublk::sys::UBLK_F_USER_RECOVERY as u64 != 0,
-        f & libublk::sys::UBLK_F_USER_RECOVERY_REISSUE as u64 != 0
+        f & libublk::sys::UBLK_F_USER_RECOVERY_REISSUE as u64 != 0,
+        f & libublk::sys::UBLK_F_BATCH_IO as u64 != 0
     );
     // SIGINT: stop and delete the device (the daemon's SIGTERM is a handover instead).
     let dev_id = r.dev_id;
@@ -526,7 +559,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
         log::info!(
-            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} {}",
+            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} batch_tags={} batch_spills={} {}",
             ups.join(" "),
             st.failovers.load(Ordering::Relaxed),
             st.resubmits.load(Ordering::Relaxed),
@@ -539,6 +572,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
             st.stall_kills.load(Ordering::Relaxed),
             st.epoch_kills.load(Ordering::Relaxed),
             st.engine_panics.load(Ordering::Relaxed),
+            st.batch_tags.load(Ordering::Relaxed),
+            st.batch_spills.load(Ordering::Relaxed),
             lat
         );
       }

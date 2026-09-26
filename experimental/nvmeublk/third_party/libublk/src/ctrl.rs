@@ -983,10 +983,19 @@ impl UblkCtrlInner {
             );
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
-        if n > 1 && (self.dev_info.flags & sys::UBLK_F_PER_IO_DAEMON as u64) == 0 {
+        // UBLK_F_BATCH_IO: several threads may each keep a multishot
+        // FETCH_IO_CMDS on the same queue (the driver hands new tags to the
+        // first fetch on its list), so every thread serves the whole queue
+        // rather than a tag partition. The driver clears PER_IO_DAEMON for
+        // such devices.
+        if n > 1
+            && (self.dev_info.flags
+                & (sys::UBLK_F_PER_IO_DAEMON | sys::UBLK_F_BATCH_IO) as u64)
+                == 0
+        {
             log::error!(
                 "dev {}: {} io threads per queue need UBLK_F_PER_IO_DAEMON \
-                 (Linux 6.16+, not with UBLK_F_BATCH_IO)",
+                 (Linux 6.16+) or UBLK_F_BATCH_IO",
                 self.dev_info.dev_id,
                 n
             );

@@ -9,7 +9,7 @@
 //! exits with it, and the lanes bound how many of them run at once.
 
 use crate::conn::Ident;
-use crate::{ctrls, host_ident, qengine, queue_fn};
+use crate::{batchq, ctrls, host_ident, qengine, queue_fn};
 use anyhow::{anyhow, bail, Context, Result};
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder, UblkTargetThreads};
 use libublk::io::UblkDev;
@@ -49,6 +49,9 @@ fn d_chunk() -> u16 {
 }
 fn d_rx_chunk() -> usize {
     32 * 1024
+}
+fn d_batch_spill() -> u16 {
+    16
 }
 
 /// Everything needed to (re)create a device. Stored in the daemon's state
@@ -105,6 +108,21 @@ pub struct DeviceSpec {
     /// depth / threads; ignored with seq_tags.
     #[serde(default = "d_chunk")]
     pub tag_chunk: u16,
+    /// ublk batch I/O (UBLK_F_BATCH_IO, kernel 7.x; tuning, default off).
+    /// Tags are not partitioned: each of a queue's `threads_per_queue`
+    /// threads keeps its own multishot fetch on the whole queue, and the
+    /// driver hands every new request to the first fetch on its list, so a
+    /// low-depth stream stays on one warm thread (its connections, its
+    /// cache) and load spills to the next thread only once that one holds
+    /// `batch_spill` requests. `tag_chunk` and `seq_tags` do not apply.
+    /// Fixed when the device is added: a recovery must ask for what the
+    /// device was added with.
+    #[serde(default)]
+    pub batch_io: bool,
+    /// Batch I/O: requests one thread takes before the queue's next request
+    /// spills to its next thread (tuning; default 16, clamped to the depth).
+    #[serde(default = "d_batch_spill")]
+    pub batch_spill: u16,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -881,6 +899,12 @@ fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<
             bail!("zero copy requested but this kernel's ublk lacks AUTO_BUF_REG/USER_COPY (features {feats:#x})");
         }
     }
+    if spec.batch_io {
+        let feats = UblkCtrl::get_features().unwrap_or(0);
+        if feats & libublk::sys::UBLK_F_BATCH_IO as u64 == 0 {
+            bail!("batch I/O requested but this kernel's ublk lacks UBLK_F_BATCH_IO (features {feats:#x}; needs 7.x)");
+        }
+    }
     let stats = Arc::new(qengine::Stats::default());
     let stop = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
@@ -894,7 +918,7 @@ fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<
 /// ublk feature flags a new device is added with. A recovered device keeps
 /// the flags it was added with: libublk replaces these with the driver's
 /// copy when it opens the device for recovery.
-fn ublk_flags(zero_copy: bool) -> u64 {
+fn ublk_flags(zero_copy: bool, batch_io: bool) -> u64 {
     use libublk::sys::*;
     // USER_RECOVERY + REISSUE: a restarted daemon reattaches the device and
     // gets the I/O that was in flight back. QUIESCE: QUIESCE_DEV, the only
@@ -910,6 +934,14 @@ fn ublk_flags(zero_copy: bool) -> u64 {
         // (need_map_io, need_req_ref, dropping NEED_GET_DATA). Never in the
         // copying mode, where it would switch the driver's data copy off.
         flags |= (UBLK_F_USER_COPY | UBLK_F_AUTO_BUF_REG | UBLK_F_SUPPORT_ZERO_COPY) as u64;
+    }
+    if batch_io {
+        // BATCH_IO: PREP/COMMIT/FETCH_IO_CMDS instead of per-tag FETCH and
+        // COMMIT_AND_FETCH. The driver keeps USER_RECOVERY(+REISSUE),
+        // QUIESCE, USER_COPY and AUTO_BUF_REG working with it, and drops
+        // PER_IO_DAEMON (several threads per queue need no partition here)
+        // and NEED_GET_DATA (never used).
+        flags |= UBLK_F_BATCH_IO as u64;
     }
     flags
 }
@@ -1015,19 +1047,26 @@ fn bring_up(
     let io_buf = (max_io.clamp(4, 32 * 1024) * 1024).min(info.mdts_bytes) as u32;
     let size = info.nsze << info.lba_shift;
     let lba_shift = info.lba_shift as u8;
-    let flags = ublk_flags(spec.zero_copy);
+    let flags = ublk_flags(spec.zero_copy, spec.batch_io);
     let threads = spec.threads_per_queue.clamp(1, depth);
     let tag_chunk = spec.tag_chunk.max(1);
     // Several threads per queue need UBLK_F_PER_IO_DAEMON, which the driver
     // advertises by itself (6.16+) and libublk checks after the device is
     // added; it is not a flag the server may request.
-    let tag_flags = if threads > 1 && spec.seq_tags { UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION } else { UblkFlags::empty() };
+    let tag_flags = if threads > 1 && spec.seq_tags && !spec.batch_io { UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION } else { UblkFlags::empty() };
     let builder = UblkCtrlBuilder::default().name("nvmeublk").nr_queues(queues).depth(depth).io_buf_bytes(io_buf).ctrl_flags(flags).io_threads_per_queue(threads);
     let builder = match recover {
         Some((id, _)) => {
             // One try: the daemon checked it moments ago (recovery_check),
             // and an EBUSY now is tried again later, holding no lane.
-            let r = UblkCtrl::new_simple(id)?.try_start_user_recover().context("start user recovery")?;
+            // Batch I/O is fixed when a device is added, and the two modes
+            // speak different commands to the driver: the spec must match.
+            let old = UblkCtrl::new_simple(id)?;
+            let was_batch = old.dev_info().flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0;
+            if was_batch != spec.batch_io {
+                bail!("ublk device {id} was added {} batch I/O; recover it with batch_io={was_batch}", if was_batch { "with" } else { "without" });
+            }
+            let r = old.try_start_user_recover().context("start user recovery")?;
             if r == -libc::EBUSY {
                 return Err(anyhow::Error::new(TryAgain(format!("ublk device {id} is not recoverable yet (EBUSY: its previous server still has it open)"))));
             }
@@ -1041,6 +1080,16 @@ fn bring_up(
     };
     let ctrl = builder.build().context("create ublk device (is ublk_drv loaded?)")?;
     let dev_id = ctrl.dev_info().dev_id as i32;
+    if (ctrl.dev_info().flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0) != spec.batch_io {
+        // The driver dropped (or the device kept) BATCH_IO against the
+        // spec: the queue threads would speak the wrong commands.
+        // A new device is deleted when `ctrl` drops; a recovered one stays,
+        // holding its I/O, for a recovery with the right spec.
+        if recover.is_none() {
+            let _ = std::fs::remove_file(ctrl.run_path());
+        }
+        bail!("ublk device {dev_id}: batch I/O is {} on the device but {} in the spec", ctrl.dev_info().flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0, spec.batch_io);
+    }
     let fault_dir = fault_dir(dev_id);
     let _ = std::fs::create_dir_all(&fault_dir);
     // Fault injection fans a command out to one file per engine, and there
@@ -1063,15 +1112,15 @@ fn bring_up(
         quiesce,
     };
     log::info!(
-        "{}: {} blocks of {} B, {} queues x {} ({} threads/queue{}, tag chunk {}), zero_copy={} napi_us={} write fence {} ms",
+        "{}: {} blocks of {} B, {} queues x {} ({} threads/queue{}, {}), zero_copy={} napi_us={} write fence {} ms",
         spec.volume,
         info.nsze,
         1u64 << info.lba_shift,
         queues,
         depth,
         threads,
-        if spec.seq_tags { ", contiguous tags" } else { "" },
-        tag_chunk,
+        if spec.seq_tags && !spec.batch_io { ", contiguous tags" } else { "" },
+        if spec.batch_io { format!("batch I/O, spill at {}", spec.batch_spill.clamp(1, depth)) } else { format!("tag chunk {tag_chunk}") },
         spec.zero_copy,
         spec.napi_us,
         write_fence.as_millis()
@@ -1080,6 +1129,11 @@ fn bring_up(
     let exited = Arc::new(AtomicUsize::new(0));
     let ab = abandoned.clone();
     let volume = spec.volume.clone();
+    // Batch I/O: what each queue's threads share (thread 0 prepares the
+    // queue; the copying mode's tag buffers). Indexed by queue id; the
+    // driver may trim the queue count, never raise it.
+    let batch_shared: Arc<Vec<Arc<batchq::QueueShared>>> = Arc::new((0..queues).map(|_| Arc::new(batchq::QueueShared::default())).collect());
+    let batch_spill = spec.batch_spill;
     let started = ctrl.start_target_until(
         move |dev: &mut UblkDev| {
             dev.set_default_params(size);
@@ -1099,7 +1153,15 @@ fn bring_up(
             // have trimmed the queue count, so count from the device.
             let total = dev.dev_info.nr_hw_queues as usize * dev.io_threads_per_queue() as usize;
             let _out = QueueExit { exited: exited.clone(), total, stop: stq.clone(), ctrls: ctrls.clone(), end: eq.clone() };
-            queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone())
+            if dev.dev_info.flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0 {
+                let Some(shared) = batch_shared.get(qid as usize).cloned() else {
+                    log::error!("ublk device {} queue {qid}: no batch state for this queue", dev.dev_info.dev_id);
+                    return;
+                };
+                batchq::queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone(), shared, batch_spill)
+            } else {
+                queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone())
+            }
         },
         Some(deadline),
     );
@@ -1154,7 +1216,7 @@ mod tests {
     #[test]
     fn new_devices_can_be_quiesced() {
         for zero_copy in [false, true] {
-            let f = super::ublk_flags(zero_copy);
+            let f = super::ublk_flags(zero_copy, false);
             assert_ne!(f & UBLK_F_QUIESCE as u64, 0, "zero_copy={zero_copy}");
             // ADD_DEV refuses QUIESCE without USER_RECOVERY.
             assert_ne!(f & UBLK_F_USER_RECOVERY as u64, 0, "zero_copy={zero_copy}");
@@ -1163,11 +1225,35 @@ mod tests {
     }
 
     #[test]
+    fn batch_io_flag_only_when_asked_and_keeps_recovery() {
+        for zero_copy in [false, true] {
+            assert_eq!(super::ublk_flags(zero_copy, false) & UBLK_F_BATCH_IO as u64, 0);
+            let f = super::ublk_flags(zero_copy, true);
+            assert_ne!(f & UBLK_F_BATCH_IO as u64, 0);
+            // The driver refuses FETCH_REQ/COMMIT_AND_FETCH_REQ in batch mode
+            // but keeps recovery, quiesce and the zero-copy flags.
+            let keep = (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE | UBLK_F_QUIESCE) as u64;
+            assert_eq!(f & keep, keep);
+            assert_eq!(f & !(UBLK_F_BATCH_IO as u64), super::ublk_flags(zero_copy, false));
+        }
+    }
+
+    #[test]
+    fn batch_io_is_off_by_default_with_spill_16() {
+        let spec: DeviceSpec = serde_json::from_value(serde_json::json!({"volume": "a", "subnqn": "nqn.2026-09.test:sub", "addrs": ["192.0.2.1:4420"]})).unwrap();
+        assert!(!spec.batch_io);
+        assert_eq!(spec.batch_spill, 16);
+        let spec: DeviceSpec = serde_json::from_value(serde_json::json!({"volume": "a", "subnqn": "nqn.2026-09.test:sub", "addrs": ["192.0.2.1:4420"], "batch_io": true, "batch_spill": 8, "queues": 1})).unwrap();
+        assert!(spec.batch_io);
+        assert_eq!(spec.batch_spill, 8);
+    }
+
+    #[test]
     fn zero_copy_flag_only_with_user_copy_and_auto_buf_reg() {
         let zc = (UBLK_F_SUPPORT_ZERO_COPY | UBLK_F_USER_COPY | UBLK_F_AUTO_BUF_REG) as u64;
         // Copying mode: SUPPORT_ZERO_COPY alone would turn the driver's copy off.
-        assert_eq!(super::ublk_flags(false) & zc, 0);
-        assert_eq!(super::ublk_flags(true) & zc, zc);
+        assert_eq!(super::ublk_flags(false, false) & zc, 0);
+        assert_eq!(super::ublk_flags(true, false) & zc, zc);
     }
 
     /// libublk refuses any flag outside its UBLK_DRV_F_ALL with InvalidVal
@@ -1179,7 +1265,9 @@ mod tests {
         let new = |flags| UblkCtrl::new(None, -1, 1, 64, 4096, flags, 0, UblkFlags::empty());
         assert!(matches!(new(1u64 << 63), Err(libublk::UblkError::InvalidVal)), "libublk no longer validates flags");
         for zero_copy in [false, true] {
-            assert!(!matches!(new(super::ublk_flags(zero_copy)), Err(libublk::UblkError::InvalidVal)), "zero_copy={zero_copy}");
+            for batch in [false, true] {
+                assert!(!matches!(new(super::ublk_flags(zero_copy, batch)), Err(libublk::UblkError::InvalidVal)), "zero_copy={zero_copy} batch={batch}");
+            }
         }
     }
 
