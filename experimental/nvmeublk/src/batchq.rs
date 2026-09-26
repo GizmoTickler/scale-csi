@@ -236,6 +236,7 @@ pub fn queue_fn(
     let spin = Duration::from_micros(env_u64("NVMEUBLK_SPIN_US", 100));
     let spin_idle = env_u64("NVMEUBLK_SPIN_IDLE", 1) != 0;
     let timeout = io_uring::types::Timespec::new().sec(20);
+    let weight_bytes = env_u64("NVMEUBLK_BATCH_WEIGHT_KB", 64) << 10;
     let mut last_event = Instant::now();
     let mut pending: Vec<UblkBatchCompletion> = Vec::with_capacity(depth as usize);
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(dev.tgt.cq_depth as usize);
@@ -321,6 +322,22 @@ pub fn queue_fn(
                     failed.get_or_insert(e);
                 }
             }
+        }
+        // Weighted spill (NVMEUBLK_BATCH_WEIGHT_KB, default 64; 0 = off):
+        // a request counts one extra credit per WEIGHT_KB of payload, so a
+        // thread holding large requests spills sooner and big transfers
+        // spread over the queue's threads, while small ones stay put.
+        if weight_bytes > 0 {
+            for &tag in arrived.iter() {
+                let bytes = (q_rc.get_iod(tag).nr_sectors as u64) << 9;
+                let extra = (bytes / weight_bytes).min(u16::MAX as u64) as u16;
+                if extra > 0 {
+                    batch.add_tag_weight(tag, extra);
+                }
+            }
+        }
+        if let Err(e) = batch.settle_credits() {
+            failed.get_or_insert(e);
         }
         for tag in arrived.drain(..) {
             if arrive[tag as usize].try_send(()).is_err() {

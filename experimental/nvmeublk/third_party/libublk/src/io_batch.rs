@@ -598,6 +598,11 @@ pub struct UblkBatchQueue<'queue, 'dev> {
     commit_pool: Vec<Elems>,
     next_commit_id: u16,
     owned_tags: Vec<bool>,
+    /// Spill mode: extra credit weight each held tag counts for (large
+    /// requests), and their sum; set by the target via `add_tag_weight`.
+    tag_extra: Vec<u16>,
+    owned_extra: usize,
+    topup_pending: bool,
     /// Number of `true` entries in `owned_tags`.
     owned_count: usize,
     tag_scratch: Vec<bool>,
@@ -760,6 +765,9 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
                 .collect(),
             next_commit_id: 0,
             owned_tags: vec![false; depth],
+            tag_extra: vec![0; depth],
+            owned_extra: 0,
+            topup_pending: false,
             owned_count: 0,
             tag_scratch: vec![false; depth],
             request_scratch: Vec::with_capacity(config.tags_per_fetch_buffer as usize),
@@ -832,6 +840,27 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     /// buffer left (spill mode: it held its share and the next thread took
     /// over).
     #[inline(always)]
+    pub fn add_tag_weight(&mut self, tag: u16, extra: u16) {
+        if let Some(w) = self.tag_extra.get_mut(tag as usize) {
+            if self.owned_tags.get(tag as usize).copied().unwrap_or(false) {
+                *w = w.saturating_add(extra);
+                self.owned_extra += extra as usize;
+            }
+        }
+    }
+
+    /// Spill mode: top the credits up after a fetch, once the fetched
+    /// requests have been weighed. A no-op when nothing is pending.
+    pub fn settle_credits(&mut self) -> Result<(), UblkError> {
+        if self.spill_mode() && std::mem::take(&mut self.topup_pending) {
+            self.top_up()?;
+            if let Some(id) = self.parked_fetch {
+                self.arm_or_park(id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn spill_count(&self) -> u64 {
         self.spills
     }
@@ -974,9 +1003,12 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
                 return Err(error);
             }
         };
+        let mut released_extra = 0usize;
         for tag in elements.tags() {
             self.owned_tags[tag as usize] = false;
+            released_extra += std::mem::take(&mut self.tag_extra[tag as usize]) as usize;
         }
+        self.owned_extra = self.owned_extra.saturating_sub(released_extra);
         let released = elements.len();
         self.owned_count -= released;
 
@@ -1124,7 +1156,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
         let n = spill_top_up_count(
             self.config.spill_tags as usize,
             self.provided(),
-            self.owned_count,
+            self.owned_count + self.owned_extra,
             self.free_slots.len(),
         );
         for _ in 0..n {
@@ -1379,8 +1411,11 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
         self.owned_count += tags.len();
         self.fetched_tags += tags.len() as u64;
         if self.spill_mode() {
+            // Credits are topped up by `settle_credits` once the target has
+            // weighed the requests it just fetched (`add_tag_weight`).
             self.free_slots.push(buffer_id);
-            return self.top_up();
+            self.topup_pending = true;
+            return Ok(());
         }
         if !self.provide_inflight.insert(buffer_id) {
             return Err(UblkError::InvalidVal);
