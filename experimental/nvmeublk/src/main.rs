@@ -559,7 +559,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
         log::info!(
-            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} batch_tags={} batch_spills={} {}",
+            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} batch_tags={} batch_spills={} small_by_path={:?} {}",
             ups.join(" "),
             st.failovers.load(Ordering::Relaxed),
             st.resubmits.load(Ordering::Relaxed),
@@ -574,6 +574,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
             st.engine_panics.load(Ordering::Relaxed),
             st.batch_tags.load(Ordering::Relaxed),
             st.batch_spills.load(Ordering::Relaxed),
+            st.small_by_path.iter().take(cstat.paths.len()).map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             lat
         );
       }

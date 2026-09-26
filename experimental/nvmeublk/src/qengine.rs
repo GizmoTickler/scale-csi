@@ -101,6 +101,53 @@ pub static SEND_ZC: std::sync::LazyLock<bool> =
 static LINK_HDR: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LINK_HDR").map_or(true, |v| v != "0"));
 
+/// Latency-aware path choice for small I/O (NVMEUBLK_LAT_PATH, default on;
+/// 0 = least-outstanding for every size, as before). The paths of one volume
+/// differ in round trip by tens of µs (on pve the `bnx2x` VFs coalesce
+/// receive interrupts for 24 µs, the `ixgbevf` ones for 1 µs), and at low
+/// depth that difference is the whole I/O's latency budget. A command whose
+/// payload is at most SMALL_IO goes to the live path with the lowest expected
+/// completion time, `EWMA(wire RTT) x (commands in flight there + 1)`: at QD1
+/// the fastest path, at depth a spread weighted by speed. Larger commands keep
+/// the least-outstanding choice (throughput wants all paths busy).
+static LAT_PATH: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LAT_PATH").map_or(true, |v| v != "0"));
+
+/// Payload size up to which a command is "small" for path choice.
+pub const SMALL_IO: usize = 32 * 1024;
+
+/// A path with no RTT sample this recent is probed: its next small command
+/// goes there whatever its EWMA says, so a path that was slow once (or was
+/// down) is measured again instead of being avoided for good. At QD1 that is
+/// one I/O in every ~500 per stale path.
+const RTT_PROBE_AFTER: Duration = Duration::from_millis(100);
+
+/// One path's wire round trip as this engine sees it: EWMA (weight 1/8) of
+/// `wired -> first data` for reads and `wired -> response` otherwise, over
+/// small commands only (a large read's first data waits for the target to
+/// read all of it).
+#[derive(Clone, Copy, Default, Debug)]
+struct PathRtt {
+    ewma_ns: u64,
+    /// Last sample, or the last probe sent: None = never used.
+    last: Option<Instant>,
+}
+
+impl PathRtt {
+    fn sample(&mut self, ns: u64, now: Instant) {
+        self.ewma_ns = if self.ewma_ns == 0 { ns.max(1) } else { (self.ewma_ns - self.ewma_ns / 8 + ns / 8).max(1) };
+        self.last = Some(now);
+    }
+
+    /// Expected cost of one more small command on this path; 0 = probe it.
+    fn cost(&self, inflight: usize, now: Instant) -> u64 {
+        match self.last {
+            Some(t) if now.saturating_duration_since(t) < RTT_PROBE_AFTER => self.ewma_ns.max(1).saturating_mul(inflight as u64 + 1),
+            _ => 0,
+        }
+    }
+}
+
 /// Per-I/O trace (NVMEUBLK_TRACE_DIR, diagnostics): one line per completed
 /// request, "local_port cid sent wired first_data done" in CLOCK_REALTIME
 /// nanoseconds (0 = not recorded), to join with a packet capture.
@@ -319,6 +366,9 @@ pub struct Stats {
     /// to its next thread.
     pub batch_tags: AtomicU64,
     pub batch_spills: AtomicU64,
+    /// Small commands (payload <= SMALL_IO) sent, per path index (the
+    /// first 8 paths): where latency-aware path choice put them.
+    pub small_by_path: [AtomicU64; 8],
 }
 
 #[derive(Clone)]
@@ -740,6 +790,8 @@ struct Engine {
     dropped: RefCell<Vec<Pending>>,
     /// Connect step limits: (TCP connect, each handshake exchange).
     dial_limits: Cell<(Duration, Duration)>,
+    /// Wire round trip per path (latency-aware choice for small I/O).
+    path_rtt: RefCell<Vec<PathRtt>>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
@@ -764,7 +816,8 @@ impl Engine {
         stop: Arc<AtomicBool>,
         draining: Arc<AtomicBool>,
     ) -> Rc<Self> {
-        let n = ctrls.paths.len() * cfg.conns_per_path.max(1);
+        let n_paths = ctrls.paths.len();
+        let n = n_paths * cfg.conns_per_path.max(1);
         let tick_fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) };
         Rc::new(Engine {
             qid,
@@ -791,6 +844,7 @@ impl Engine {
             failed: Cell::new(false),
             dropped: RefCell::new(Vec::new()),
             dial_limits: Cell::new((CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT)),
+            path_rtt: RefCell::new(vec![PathRtt::default(); n_paths]),
         })
     }
 
@@ -877,13 +931,27 @@ impl Engine {
         // evens out across turns; 0 = plain least-outstanding.
         let min = live.iter().map(|c| c.inflight.borrow().len()).min().unwrap_or(0);
         let slack = *BATCH_SLACK;
-        live.sort_by_key(|c| {
-            let n = c.inflight.borrow().len();
-            (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), n)
-        });
+        // Small commands: least expected completion time (see LAT_PATH);
+        // the rest: fewest outstanding.
+        let small = *LAT_PATH && p.len <= SMALL_IO;
+        let now = Instant::now();
+        {
+            let rtt = self.path_rtt.borrow();
+            live.sort_by_key(|c| {
+                let n = c.inflight.borrow().len();
+                let load = if small { rtt.get(c.path).map_or(0, |r| r.cost(n, now)) } else { n as u64 };
+                (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), load)
+            });
+        }
         for c in live {
+            let path = c.path;
             match self.try_submit(&c, p) {
-                Ok(()) => return,
+                Ok(()) => {
+                    if small {
+                        self.sent_small(path, now);
+                    }
+                    return;
+                }
                 Err(back) => p = back,
             }
         }
@@ -893,6 +961,20 @@ impl Engine {
         }
         self.stats.parked.fetch_add(1, Ordering::Relaxed);
         self.parked.borrow_mut().push_back(p);
+    }
+
+    /// A small command went out on `path`: count it, and if the path had
+    /// no recent sample this was its probe; stamp it so the probe's
+    /// siblings do not all follow it before its sample is in.
+    fn sent_small(&self, path: usize, now: Instant) {
+        if let Some(c) = self.stats.small_by_path.get(path) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(r) = self.path_rtt.borrow_mut().get_mut(path) {
+            if r.cost(0, now) == 0 {
+                r.last = Some(now);
+            }
+        }
     }
 
     fn try_submit(&self, c: &Rc<QConn>, mut p: Pending) -> Result<(), Pending> {
@@ -1104,6 +1186,16 @@ impl Engine {
             self.stats.d2c_ns.fetch_add(d.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if sc == 0 {
+            // Wire round trip of a small command: what path choice keys on.
+            if p.len <= SMALL_IO {
+                if let Some(w) = p.wired {
+                    let now = Instant::now();
+                    let rtt = p.first_data.unwrap_or(now).saturating_duration_since(w).as_nanos() as u64;
+                    if let Some(r) = self.path_rtt.borrow_mut().get_mut(c.path) {
+                        r.sample(rtt, now);
+                    }
+                }
+            }
             let r = p.ok_res();
             p.finish(r);
         } else if is_path_error(sc) {
@@ -2485,6 +2577,8 @@ mod tests {
         /// Connections of any kind (admin, I/O, dials that never sent a
         /// Connect) that have since closed.
         closed: usize,
+        /// Reads answered on I/O queues.
+        reads: usize,
     }
 
     #[derive(Default)]
@@ -2499,6 +2593,8 @@ mod tests {
         /// accept queue: a further connect stays in SYN_SENT (its SYN is
         /// dropped) until the dialler gives up.
         accept_only: Option<usize>,
+        /// Wait this long before answering each I/O command (a slow path).
+        io_delay: Duration,
     }
 
     struct Target {
@@ -2614,6 +2710,8 @@ mod tests {
                     }
                     (_, true) if hold.load(Ordering::Acquire) => continue,
                     (OPC_READ, true) => {
+                        seen.lock().unwrap().reads += 1;
+                        std::thread::sleep(cfg.io_delay);
                         let slba = u64::from_le_bytes(sqe[40..48].try_into().unwrap());
                         let nlb = u32::from_le_bytes(sqe[48..52].try_into().unwrap()) as usize + 1;
                         c2h(cid, &pattern(slba, nlb * 512))
@@ -2707,8 +2805,13 @@ mod tests {
     }
 
     fn rig(t: &Target, name: &str, write_fence: Duration) -> Rig {
+        rig_paths(&[t], name, write_fence)
+    }
+
+    /// A rig whose device has one path per target, in this order.
+    fn rig_paths(ts: &[&Target], name: &str, write_fence: Duration) -> Rig {
         let id = Ident { hostnqn: "nqn.2014-08.org.nvmexpress:uuid:test".into(), hostid: [7; 16], subnqn: "nqn.test:sub".into() };
-        let ctrls = Ctrls::new(vec![t.addr], id, Duration::from_secs(15)).unwrap();
+        let ctrls = Ctrls::new(ts.iter().map(|t| t.addr).collect(), id, Duration::from_secs(15)).unwrap();
         let fault_dir = std::env::temp_dir().join(format!("nvmeublk-qengine-{}-{name}", std::process::id())).to_string_lossy().into_owned();
         let _ = std::fs::create_dir_all(&fault_dir);
         let cfg = QConfig {
@@ -2744,6 +2847,79 @@ mod tests {
         let len = if op == Op::Flush { 0 } else { buf.len() };
         e.submit(Pending::new(op, 8, (buf.len() / 512).max(1) as u32, buf.as_mut_ptr(), len, tx.clone(), None, None));
         (rx, tx)
+    }
+
+    /// L2: small reads at QD1 go to the path with the lower round trip.
+    /// Path 0 answers every I/O 3 ms late; path 1 at once. Least-outstanding
+    /// choice (the previous rule) puts every QD1 read on path 0, the first
+    /// live connection; latency-aware choice moves them to path 1 once both
+    /// are sampled, and still probes path 0 now and then.
+    #[test]
+    fn small_reads_at_qd1_take_the_lower_rtt_path() {
+        let slow = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(3), ..Default::default() }).unwrap();
+        let fast = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let (slow_seen, fast_seen) = (slow.seen.clone(), fast.seen.clone());
+        on_ring_thread(move || {
+            let r = rig_paths(&[&slow, &fast], "lat-path", Duration::from_secs(20));
+            r.e.start();
+            // Both paths connected before the measured reads.
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
+            let mut buf = vec![0u8; 4096];
+            for i in 0..60 {
+                let rx = request(&r.e, Op::Read, &mut buf);
+                let mut res = None;
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                    res = rx.try_recv().ok();
+                    res.is_some()
+                }), "read {i} did not complete");
+                assert_eq!(res, Some(4096));
+            }
+        });
+        let (s, f) = (slow_seen.lock().unwrap().reads, fast_seen.lock().unwrap().reads);
+        assert_eq!(s + f, 60);
+        assert!(f >= 50, "the 3 ms path should get only its probes: slow={s} fast={f}");
+    }
+
+    /// Large reads keep least-outstanding choice: at QD1 each goes to the
+    /// first live connection whatever its round trip (throughput wants all
+    /// paths busy; byte balance is lever L6).
+    #[test]
+    fn large_reads_ignore_path_rtt() {
+        let slow = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(3), ..Default::default() }).unwrap();
+        let fast = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let (slow_seen, fast_seen) = (slow.seen.clone(), fast.seen.clone());
+        on_ring_thread(move || {
+            let r = rig_paths(&[&slow, &fast], "lat-path-large", Duration::from_secs(20));
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
+            // Small reads first, so both paths have an RTT sample.
+            let mut small = vec![0u8; 4096];
+            for _ in 0..8 {
+                let rx = request(&r.e, Op::Read, &mut small);
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || rx.try_recv().is_ok()));
+            }
+            let mut buf = vec![0u8; 64 * 1024];
+            for _ in 0..10 {
+                let rx = request(&r.e, Op::Read, &mut buf);
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || rx.try_recv().is_ok()));
+            }
+        });
+        let (s, f) = (slow_seen.lock().unwrap().reads, fast_seen.lock().unwrap().reads);
+        assert!(s >= 10, "large reads go to the first live connection, as before: slow={s} fast={f}");
+    }
+
+    #[test]
+    fn path_rtt_ewma_and_probe() {
+        let t0 = Instant::now();
+        let mut r = PathRtt::default();
+        assert_eq!(r.cost(0, t0), 0, "never sampled: probe");
+        r.sample(100_000, t0);
+        assert_eq!(r.ewma_ns, 100_000);
+        r.sample(20_000, t0);
+        assert_eq!(r.ewma_ns, 100_000 - 12_500 + 2_500);
+        assert_eq!(r.cost(0, t0), r.ewma_ns);
+        assert_eq!(r.cost(3, t0), 4 * r.ewma_ns, "cost grows with commands in flight");
+        assert_eq!(r.cost(0, t0 + RTT_PROBE_AFTER), 0, "stale: probe again");
     }
 
     /// Q5: the I/O queue is dialled, handshaken and connected by SQEs on the
