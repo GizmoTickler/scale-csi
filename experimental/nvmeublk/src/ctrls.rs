@@ -575,6 +575,11 @@ impl Ctrls {
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_shut_down(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
 }
 
 /// A device's controllers with every path down, for other modules' tests.

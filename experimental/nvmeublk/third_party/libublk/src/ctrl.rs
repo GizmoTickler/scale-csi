@@ -2958,10 +2958,11 @@ impl UblkCtrl {
     pub fn del_dev(&self) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
 
+        // Before DEL, while the id is still this device's: once DEL has
+        // run, a device added meanwhile may get the same id and with it
+        // the same json path, which must not be removed.
+        let _ = fs::remove_file(ctrl.run_path());
         ctrl.del()?;
-        if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path())?;
-        }
         Ok(0)
     }
 
@@ -2970,10 +2971,11 @@ impl UblkCtrl {
     pub fn del_dev_async(&self) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
 
+        // Before DEL, while the id is still this device's: once DEL has
+        // run, a device added meanwhile may get the same id and with it
+        // the same json path, which must not be removed.
+        let _ = fs::remove_file(ctrl.run_path());
         ctrl.del_async()?;
-        if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path())?;
-        }
         Ok(0)
     }
 

@@ -106,6 +106,8 @@ struct Hooks {
     /// recovered now? Ok(false): not yet (EBUSY), try again later; Err: not
     /// this volume's device any more, or gone (device::recovery_check).
     check: fn(&str, i32) -> Result<bool>,
+    /// Stop and delete a served device (Running::detach).
+    detach: fn(Running) -> std::result::Result<(), device::DetachFailed>,
     lanes: &'static OpLanes,
 }
 
@@ -184,7 +186,7 @@ impl Drop for VolumeOp<'_> {
 
 impl Daemon {
     fn new(state_path: &str) -> Self {
-        Self::with_hooks(state_path, Hooks { attempt: Daemon::attempt, delete: device::delete_unserved, check: device::recovery_check, lanes: &OP_LANES })
+        Self::with_hooks(state_path, Hooks { attempt: Daemon::attempt, delete: device::delete_unserved, check: device::recovery_check, detach: Running::detach, lanes: &OP_LANES })
     }
 
     fn with_hooks(state_path: &str, hooks: Hooks) -> Self {
@@ -224,10 +226,13 @@ impl Daemon {
         let entries = {
             let devs = lock(&self.devices);
             let rec = lock(&self.recovering);
-            // A device that ended on its own is gone, and its id may be
-            // another volume's by now: recording it would have the next
-            // daemon recover that device for this volume.
-            state_entries(devs.values().filter(|r| !r.has_ended()).map(|r| (&r.spec, r.dev_id)), rec.values().map(|p| &p.entry), clean)
+            // A device that ended on its own and was deleted is gone, and
+            // its id may be another volume's by now: recording it would have
+            // the next daemon recover that device for this volume. One still
+            // ending, or whose deletion failed, keeps its id and may still
+            // hold the volume's I/O: it stays recorded, so that the next
+            // daemon recovers it if this one dies first.
+            state_entries(devs.values().filter(|r| !r.is_gone()).map(|r| (&r.spec, r.dev_id)), rec.values().map(|p| &p.entry), clean)
         };
         let tmp = format!("{}.tmp", self.state_path);
         let data = serde_json::to_vec_pretty(&entries).unwrap_or_default();
@@ -238,9 +243,26 @@ impl Daemon {
 
     fn attach(&self, spec: DeviceSpec) -> Result<Value> {
         let _op = self.ops.lock(&spec.volume);
+        let leftover = {
+            let devs = lock(&self.devices);
+            match devs.get(&spec.volume) {
+                Some(r) if r.has_ended() && !r.is_gone() => match r.end_failed() {
+                    None => bail!("volume {}: its ublk device {} is ending on its own; retry", spec.volume, r.dev_id),
+                    Some(_) => Some(r.dev_id),
+                },
+                _ => None,
+            }
+        };
+        if let Some(dev_id) = leftover {
+            // It ended on its own but could not be deleted: delete it first,
+            // or it would hold the volume's I/O with nothing recording it.
+            self.delete_leftover(&spec.volume, dev_id).with_context(|| format!("volume {}: delete its previous ublk device {dev_id}", spec.volume))?;
+            lock(&self.devices).remove(&spec.volume);
+            self.save(&BTreeMap::new());
+        }
         {
             let mut devs = lock(&self.devices);
-            if devs.get(&spec.volume).is_some_and(Running::has_ended) {
+            if devs.get(&spec.volume).is_some_and(Running::is_gone) {
                 // Its device is gone (and its id may be another volume's):
                 // forget it and add a new one.
                 devs.remove(&spec.volume);
@@ -269,18 +291,50 @@ impl Daemon {
         let _op = self.ops.lock(volume);
         let served = lock(&self.devices).remove(volume);
         let Some(r) = served else { return self.cancel_recovery(volume) };
+        if let Some(why) = r.end_failed() {
+            // It ended on its own but could not be deleted, so it may still
+            // hold the volume's I/O: delete it now. Kept if that fails too.
+            return match self.delete_leftover(volume, r.dev_id) {
+                Ok(()) => {
+                    self.save(&BTreeMap::new());
+                    Ok(json!({"ok": true}))
+                }
+                Err(e) => {
+                    let dev_id = r.dev_id;
+                    lock(&self.devices).insert(volume.to_string(), r);
+                    Err(e.context(format!("delete ublk device {dev_id}, which ended on its own ({why})")))
+                }
+            };
+        }
         self.save(&BTreeMap::new());
-        match r.detach() {
+        match (self.hooks.detach)(r) {
             Ok(()) => Ok(json!({"ok": true})),
             Err(f) => {
                 if let Some(r) = f.still_served {
-                    // Not stopped: still served and still this volume's, so
+                    // Not stopped (or not deleted): still this volume's, so
                     // a retried detach must find it.
                     lock(&self.devices).insert(volume.to_string(), *r);
                     self.save(&BTreeMap::new());
                 }
                 Err(f.error)
             }
+        }
+    }
+
+    /// Delete the device a served volume left when it ended on its own and
+    /// its deletion failed. Its id is its own until it is deleted, so unless
+    /// a device this daemon knows for another volume has the id (then it was
+    /// deleted after all), it is this volume's.
+    fn delete_leftover(&self, volume: &str, dev_id: i32) -> Result<()> {
+        let reused = lock(&self.devices).iter().any(|(v, r)| v != volume && r.dev_id == dev_id)
+            || lock(&self.recovering).iter().any(|(v, p)| v != volume && p.entry.dev_id == dev_id);
+        if reused {
+            log::warn!("{volume}: ublk device {dev_id} is another volume's device now; not deleting it");
+            return Ok(());
+        }
+        match self.hooks.lanes.acquire_until(Instant::now() + device::START_DEADLINE) {
+            Some(_lane) => (self.hooks.delete)(dev_id),
+            None => bail!("no control lane free within {} s; retry", device::START_DEADLINE.as_secs()),
         }
     }
 
@@ -375,7 +429,9 @@ impl Daemon {
             let all = devs.values().all(|r| r.drain());
             if all || Instant::now() > deadline {
                 for r in devs.values() {
-                    clean.insert(r.spec.volume.clone(), r.drained());
+                    // One ending on its own had its queue loops end under it:
+                    // nothing says its I/O drained.
+                    clean.insert(r.spec.volume.clone(), r.drained() && !r.has_ended());
                 }
                 drop(devs);
                 break;
@@ -460,12 +516,13 @@ impl Daemon {
     }
 
     /// Forget the devices that ended on their own (stopped or deleted from
-    /// elsewhere, or their queue loops failed): they are gone, and their ids
-    /// may go to other volumes' devices.
+    /// elsewhere, or their queue loops failed) and were deleted: they are
+    /// gone, and their ids may go to other volumes' devices. One still
+    /// ending, or whose deletion failed, is kept (recorded) until a detach.
     fn forget_ended(&self) {
         let gone: Vec<(String, i32)> = {
             let mut devs = lock(&self.devices);
-            let gone: Vec<(String, i32)> = devs.iter().filter(|(_, r)| r.has_ended()).map(|(v, r)| (v.clone(), r.dev_id)).collect();
+            let gone: Vec<(String, i32)> = devs.iter().filter(|(_, r)| r.is_gone()).map(|(v, r)| (v.clone(), r.dev_id)).collect();
             for (v, _) in &gone {
                 devs.remove(v);
             }
@@ -501,7 +558,8 @@ impl Daemon {
         // Before reaching the target: the device must still be this
         // volume's (its id may have gone to another volume's device), and
         // recoverable now. EBUSY (its previous server still has it open) is
-        // tried again later, holding no lane meanwhile.
+        // polled briefly (device::recovery_check), then tried again later,
+        // holding no lane meanwhile.
         match (self.hooks.check)(vol, e.dev_id) {
             Ok(true) => {}
             Ok(false) => {
@@ -790,7 +848,7 @@ mod tests {
 
     fn daemon_checked(test: &str, attempt: fn(&Arc<Daemon>, &str, u64), delete: fn(i32) -> Result<()>, check: fn(&str, i32) -> Result<bool>) -> Arc<Daemon> {
         let lanes: &'static OpLanes = Box::leak(Box::new(OpLanes::new()));
-        Arc::new(Daemon::with_hooks(&state_path(test), Hooks { attempt, delete, check, lanes }))
+        Arc::new(Daemon::with_hooks(&state_path(test), Hooks { attempt, delete, check, detach: Running::detach, lanes }))
     }
 
     fn pend(d: &Daemon, e: StateEntry, phase: Phase) {
@@ -1184,5 +1242,58 @@ mod tests {
         r.stats.orphans.store(0, Ordering::Relaxed);
         r.stats.inflight.store(1, Ordering::Relaxed);
         assert!(!r.drain());
+    }
+
+    /// A device ending on its own keeps its id until it is deleted, and may
+    /// hold the volume's I/O until then; one whose deletion failed may hold
+    /// it for good. Both stay recorded (a kill -9 meanwhile leaves the next
+    /// daemon an entry to recover), attach does not replace them unrecorded,
+    /// and only a deleted one is forgotten.
+    #[test]
+    fn a_device_is_forgotten_only_once_it_is_deleted() {
+        fn delete(id: i32) -> Result<()> {
+            match id {
+                6 => Ok(()),
+                _ => bail!("EMFILE"),
+            }
+        }
+        let d = daemon("ending", no_attempt, delete);
+        let spec = |v: &str, id| entry(v, id, false).spec;
+        lock(&d.devices).insert("ending".into(), Running::for_tests_ending(spec("ending", 5), 5, Some(None)));
+        lock(&d.devices).insert("failed".into(), Running::for_tests_ending(spec("failed", 6), 6, Some(Some(Err("EMFILE".into())))));
+        lock(&d.devices).insert("stuck".into(), Running::for_tests_ending(spec("stuck", 7), 7, Some(Some(Err("EMFILE".into())))));
+        lock(&d.devices).insert("gone".into(), Running::for_tests_ending(spec("gone", 8), 8, Some(Some(Ok(())))));
+        d.dispatch();
+        let vols = |d: &Daemon| lock(&d.devices).keys().cloned().collect::<Vec<_>>();
+        assert_eq!(vols(&d), ["ending", "failed", "stuck"], "a device that may still hold I/O was forgotten");
+        assert_eq!(on_disk(&d), vec![entry("ending", 5, false), entry("failed", 6, false), entry("stuck", 7, false)]);
+        // Still ending: attach neither hands it out nor replaces it.
+        let err = d.attach(spec("ending", 0)).unwrap_err();
+        assert!(format!("{err:#}").contains("retry"), "{err:#}");
+        assert!(lock(&d.devices).contains_key("ending"));
+        // Deletion failed: detach deletes it now...
+        assert_eq!(d.detach("failed").unwrap(), json!({"ok": true}));
+        // ...and keeps it recorded when that fails too.
+        assert!(d.detach("stuck").is_err());
+        assert_eq!(vols(&d), ["ending", "stuck"]);
+        assert_eq!(on_disk(&d), vec![entry("ending", 5, false), entry("stuck", 7, false)]);
+        let _ = std::fs::remove_file(&d.state_path);
+    }
+
+    /// A detach that cannot stop the device hands it back: the daemon keeps
+    /// it, recorded, so that a retried detach finds it.
+    #[test]
+    fn a_device_detach_could_not_stop_stays_attached_and_recorded() {
+        fn cannot_stop(r: Running) -> std::result::Result<(), device::DetachFailed> {
+            Err(device::DetachFailed { error: anyhow::anyhow!("STOP: EMFILE"), still_served: Some(Box::new(r)) })
+        }
+        let lanes: &'static OpLanes = Box::leak(Box::new(OpLanes::new()));
+        let d = Arc::new(Daemon::with_hooks(&state_path("nostop"), Hooks { attempt: no_attempt, delete: no_delete, check: |_, _| Ok(true), detach: cannot_stop, lanes }));
+        lock(&d.devices).insert("a".into(), Running::for_tests(entry("a", 5, false).spec, 5, false));
+        d.save(&BTreeMap::new());
+        assert!(d.detach("a").is_err());
+        assert!(lock(&d.devices).contains_key("a"), "a device still served was dropped");
+        assert_eq!(on_disk(&d), vec![entry("a", 5, false)], "a device still served was left out of the state");
+        let _ = std::fs::remove_file(&d.state_path);
     }
 }

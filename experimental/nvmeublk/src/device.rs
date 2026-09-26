@@ -222,9 +222,9 @@ pub fn spawn_op(lane: OpLane, op: impl FnOnce() + Send + 'static) -> std::io::Re
 /// one (`nvq-op-wait`): for callers that must not block until a lane is free,
 /// such as a queue thread whose device ends on its own (it holds the char
 /// device open until it returns).
-pub fn spawn_op_waiting(op: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+pub fn spawn_op_waiting(lanes: &'static OpLanes, op: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
     std::thread::Builder::new().name("nvq-op-wait".into()).spawn(move || {
-        let _lane = OP_LANES.acquire();
+        let _lane = lanes.acquire();
         op()
     })?;
     Ok(())
@@ -349,6 +349,21 @@ impl<S> Ending<S> {
         lock(&self.st).on_its_own.is_some()
     }
 
+    /// It ended on its own and was deleted: only now is its id free for
+    /// another device. While it is still ending, or deleting it failed, the
+    /// id is still its own and the kernel device may still hold its I/O.
+    fn is_gone(&self) -> bool {
+        matches!(lock(&self.st).on_its_own, Some(Some(Ok(()))))
+    }
+
+    /// It ended on its own, but deleting it failed: why.
+    fn end_failed(&self) -> Option<String> {
+        match &lock(&self.st).on_its_own {
+            Some(Some(Err(e))) => Some(e.clone()),
+            _ => None,
+        }
+    }
+
     /// For detach/wait: take the device to end it, or wait until it has
     /// ended on its own.
     fn take(&self) -> Owner<S> {
@@ -417,8 +432,10 @@ fn stop_or_put_back<S, E: std::error::Error + Send + Sync + 'static>(end: &Endin
 /// A detach that did not end the device.
 pub struct DetachFailed {
     pub error: anyhow::Error,
-    /// The device is still served, unchanged (its admin paths are up): the
-    /// caller keeps it, and a later detach can try again.
+    /// The caller keeps the device, and a later detach can try again: it is
+    /// still served, unchanged (its admin paths are up), or it ended on its
+    /// own but could not be deleted, so the kernel device may still hold the
+    /// volume's I/O (`Running::end_failed`).
     pub still_served: Option<Box<Running>>,
 }
 
@@ -451,7 +468,14 @@ impl Running {
     /// admin paths untouched: shutting them down would leave a device that
     /// answers EIO and redials a controller the target has dropped.
     pub fn detach(self) -> std::result::Result<(), DetachFailed> {
-        match self.end_it(true) {
+        let r = self.end_it(true);
+        self.detached(r)
+    }
+
+    /// What detach reports for how `end_it` went: the admin paths go down
+    /// unless the caller keeps the device.
+    fn detached(self, r: std::result::Result<(), (anyhow::Error, bool)>) -> std::result::Result<(), DetachFailed> {
+        match r {
             Ok(()) => {
                 self.ctrls.shutdown();
                 Ok(())
@@ -476,7 +500,9 @@ impl Running {
     fn end_it(&self, detach: bool) -> std::result::Result<(), (anyhow::Error, bool)> {
         let s = match self.end.take() {
             Owner::Own(s) => s,
-            Owner::Ended(r) => return r.map_err(|e| (anyhow!("ublk device {} ended on its own: {e}", self.dev_id), false)),
+            // Deleting it failed: the kernel device may still hold the
+            // volume's I/O, so the caller keeps it (detach).
+            Owner::Ended(r) => return r.map_err(|e| (anyhow!("ublk device {} ended on its own: {e}", self.dev_id), detach)),
         };
         if !detach {
             return retire(s, &self.stop).map_err(|e| (e, false));
@@ -515,6 +541,18 @@ impl Running {
         self.end.has_ended()
     }
 
+    /// It ended on its own and was deleted: its id may be another device's
+    /// now, so it must not be recorded any more.
+    pub fn is_gone(&self) -> bool {
+        self.end.is_gone()
+    }
+
+    /// It ended on its own but could not be deleted: why. The kernel device
+    /// may still exist, holding the volume's I/O.
+    pub fn end_failed(&self) -> Option<String> {
+        self.end.end_failed()
+    }
+
     /// Some engine of this device failed (a task of it panicked): its I/O
     /// fails with EIO until the volume is detached and attached again.
     pub fn engine_failed(&self) -> bool {
@@ -527,10 +565,14 @@ impl Running {
     /// A Running with no ublk device behind it, for the daemon's tests:
     /// `ended` = it has ended on its own.
     pub fn for_tests(spec: DeviceSpec, dev_id: i32, ended: bool) -> Running {
+        Self::for_tests_ending(spec, dev_id, ended.then_some(Some(Ok(()))))
+    }
+
+    /// As `for_tests`, with how far it has ended on its own: None: it has
+    /// not; Some(None): it is ending; Some(Some(r)): it ended, with `r`.
+    pub fn for_tests_ending(spec: DeviceSpec, dev_id: i32, on_its_own: Option<Option<Result<(), String>>>) -> Running {
         let end = Arc::new(Ending::new());
-        if ended {
-            end.ended(Ok(()));
-        }
+        lock(&end.st).on_its_own = on_its_own;
         let addrs = addrs(&spec).unwrap_or_default();
         Running {
             spec,
@@ -586,19 +628,64 @@ fn owner_in(json: &str) -> Option<String> {
 /// device, and can it enter recovery now? Ok(true): go ahead. Ok(false):
 /// EBUSY, the previous server still has it open (try again later). Err: not
 /// this volume's device (its id went to another volume), or gone.
+///
+/// EBUSY clears once the old server's char device release has run, which is
+/// deferred (and in zero-copy mode waits for its io_uring buffer references):
+/// usually within milliseconds of its exit. So EBUSY is polled here, from
+/// 1 ms doubling to 100 ms as libublk's start_user_recover does, for
+/// RECOVER_POLL_BUDGET of sleep, before the attempt gives its lane up for a
+/// whole daemon RETRY.
 pub fn recovery_check(volume: &str, dev_id: i32) -> Result<bool> {
+    let ctrl = std::cell::OnceCell::new();
+    recovery_check_with(
+        volume,
+        dev_id,
+        owner,
+        || {
+            let c = match ctrl.get() {
+                Some(c) => c,
+                None => {
+                    let c = UblkCtrl::new_simple(dev_id)?;
+                    ctrl.get_or_init(|| c)
+                }
+            };
+            c.try_start_user_recover()
+        },
+        std::thread::sleep,
+    )
+}
+
+/// Sleep budget of `recovery_check` while the driver answers EBUSY.
+const RECOVER_POLL_BUDGET: Duration = Duration::from_millis(1500);
+
+fn recovery_check_with(
+    volume: &str,
+    dev_id: i32,
+    owner: impl FnOnce(i32) -> Option<Option<String>>,
+    mut try_once: impl FnMut() -> std::result::Result<i32, libublk::UblkError>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<bool> {
     match owner(dev_id) {
         Some(Some(o)) if o != volume => bail!("ublk device {dev_id} now belongs to volume {o}, not {volume}; leaving it alone"),
         _ => {}
     }
-    let r = UblkCtrl::new_simple(dev_id).and_then(|c| c.try_start_user_recover()).with_context(|| format!("start user recovery of ublk device {dev_id}"))?;
-    if r == -libc::EBUSY {
-        return Ok(false);
+    let (mut slept, mut delay) = (Duration::ZERO, Duration::from_millis(1));
+    loop {
+        let r = try_once().with_context(|| format!("start user recovery of ublk device {dev_id}"))?;
+        if r == -libc::EBUSY {
+            if slept >= RECOVER_POLL_BUDGET {
+                return Ok(false);
+            }
+            sleep(delay);
+            slept += delay;
+            delay = (delay * 2).min(Duration::from_millis(100));
+            continue;
+        }
+        if r < 0 {
+            bail!("start user recovery of ublk device {dev_id}: {}", std::io::Error::from_raw_os_error(-r));
+        }
+        return Ok(true);
     }
-    if r < 0 {
-        bail!("start user recovery of ublk device {dev_id}: {}", std::io::Error::from_raw_os_error(-r));
-    }
-    Ok(true)
 }
 
 fn fault_dir(dev_id: impl std::fmt::Display) -> String {
@@ -824,7 +911,24 @@ impl Drop for QueueExit {
         self.stop.store(true, Ordering::Release);
         self.ctrls.shutdown();
         if self.end.queues_done() {
-            end_on_its_own(&self.end, &self.stop);
+            let stop = self.stop.clone();
+            let finish = move |s: Served| {
+                let dev_id = s.ctrl.dev_info().dev_id;
+                let r = retire(s, &stop);
+                match &r {
+                    Ok(()) => log::warn!("ublk device {dev_id}: its queue threads all returned without a detach; deleted it"),
+                    Err(e) => log::error!("ublk device {dev_id}: its queue threads all returned without a detach; deleting it failed: {e:#}"),
+                }
+                r.map_err(|e| format!("{e:#}"))
+            };
+            // If it cannot be ended now, the char device closes with the
+            // queue threads (`release`): the device can then be recovered or
+            // deleted, and is ended at detach.
+            end_on_its_own(&self.end, &OP_LANES, finish, |s| {
+                if let Some(t) = s.threads.as_mut() {
+                    t.release();
+                }
+            });
         }
     }
 }
@@ -834,31 +938,27 @@ impl Drop for QueueExit {
 /// stopped (its I/O fails with EIO) and deleted, as by a detach, on an op
 /// thread: this queue thread cannot, since until it has returned it keeps
 /// the char device open.
-fn end_on_its_own(end: &Arc<Ending<Served>>, stop: &Arc<AtomicBool>) {
-    let (e2, st2) = (end.clone(), stop.clone());
+fn end_on_its_own<S: Send + 'static>(
+    end: &Arc<Ending<S>>,
+    lanes: &'static OpLanes,
+    finish: impl FnOnce(S) -> std::result::Result<(), String> + Send + 'static,
+    release: impl FnOnce(&mut S),
+) {
+    let e2 = end.clone();
     // Not waiting for a lane here: this thread holds the char device open
     // until it returns, which would keep the device's I/O waiting and a DEL
     // from elsewhere hanging for as long as every lane is busy.
-    let spawned = spawn_op_waiting(move || {
+    let spawned = spawn_op_waiting(lanes, move || {
         let Some(s) = e2.take_own() else { return e2.ended(Ok(())) };
-        let dev_id = s.ctrl.dev_info().dev_id;
-        let r = retire(s, &st2);
-        match &r {
-            Ok(()) => log::warn!("ublk device {dev_id}: its queue threads all returned without a detach; deleted it"),
-            Err(e) => log::error!("ublk device {dev_id}: its queue threads all returned without a detach; deleting it failed: {e:#}"),
-        }
-        e2.ended(r.map_err(|e| format!("{e:#}")));
+        let r = finish(s);
+        e2.ended(r);
     });
     if let Err(e) = spawned {
         // Holding the char device open would keep its I/O waiting and a DEL
         // from elsewhere hanging until a detach. Let it close with the queue
         // threads: the device can then be recovered or deleted.
         log::error!("no thread to end a ublk device whose queue threads returned ({e}); it is ended at detach");
-        end.give_back(|s| {
-            if let Some(t) = s.threads.as_mut() {
-                t.release();
-            }
-        });
+        end.give_back(release);
     }
 }
 
@@ -991,6 +1091,11 @@ fn bring_up(
                 // once these threads are gone it can be recovered again.
                 return Err(anyhow::Error::new(TryAgain(format!("{why:#}"))));
             }
+            // What it left under /run goes first, while its id is its own
+            // (as in retire): the id may be another volume's device's as soon
+            // as DEL has run.
+            let _ = std::fs::remove_dir_all(format!("/run/nvmeublk/dev{dev_id}"));
+            let _ = std::fs::remove_file(ctrl.run_path());
             // Deleted without waiting for its id: DEL cancels the tags
             // FETCHed so far, and the id is freed once the queue threads
             // have closed the char device. Dropping `ctrl` then deletes
@@ -998,7 +1103,6 @@ fn bring_up(
             if let Err(d) = ctrl.del_dev_async() {
                 log::error!("{}: delete ublk device {dev_id} after a failed start: {d}", spec.volume);
             }
-            let _ = std::fs::remove_dir_all(format!("/run/nvmeublk/dev{dev_id}"));
             return Err(why);
         }
     };
@@ -1231,13 +1335,106 @@ mod tests {
     /// own once a lane is free.
     #[test]
     fn ending_a_device_does_not_block_its_queue_thread_on_a_lane() {
-        let held: Vec<OpLane> = (0..GENERAL_LANES).map(|_| OP_LANES.acquire()).collect();
+        let l = lanes();
+        let held: Vec<OpLane> = (0..GENERAL_LANES).map(|_| l.acquire()).collect();
         let (tx, rx) = mpsc::channel();
         let t0 = Instant::now();
-        spawn_op_waiting(move || tx.send(()).unwrap()).unwrap();
+        spawn_op_waiting(l, move || tx.send(()).unwrap()).unwrap();
         assert!(t0.elapsed() < Duration::from_millis(100), "the caller waited for a lane");
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "ran without a lane");
         drop(held);
         rx.recv_timeout(Duration::from_secs(5)).expect("never ran once a lane was free");
+    }
+
+    /// The queue thread that finds its device ending on its own
+    /// (QueueExit) calls end_on_its_own: with every general lane busy it
+    /// must return at once, and the device ends once a lane is free.
+    #[test]
+    fn end_on_its_own_returns_at_once_with_every_lane_busy() {
+        let l = lanes();
+        let held: Vec<OpLane> = (0..GENERAL_LANES).map(|_| l.acquire()).collect();
+        let e = Arc::new(Ending::new());
+        assert!(e.up(7u32).is_none());
+        assert!(e.queues_done());
+        let (tx, rx) = mpsc::channel();
+        let e2 = e.clone();
+        std::thread::spawn(move || {
+            end_on_its_own(&e2, l, |s| if s == 7 { Ok(()) } else { Err(format!("ended {s}")) }, |_| panic!("given back although a thread started"));
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(2)).expect("the queue thread waited for a lane");
+        assert!(matches!(lock(&e.st).on_its_own, Some(None)), "the device ended without a lane");
+        assert!(e.has_ended() && !e.is_gone(), "a device still ending counted as gone");
+        drop(held);
+        let t0 = Instant::now();
+        while !e.is_gone() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "never ended once a lane was free");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A device whose deletion failed is not gone: its id is still its own
+    /// and the kernel device may still hold its I/O.
+    #[test]
+    fn a_device_whose_deletion_failed_is_not_gone() {
+        let e: Ending<u32> = Ending::new();
+        lock(&e.st).on_its_own = Some(Some(Err("EMFILE".into())));
+        assert!(e.has_ended());
+        assert!(!e.is_gone());
+        assert_eq!(e.end_failed(), Some("EMFILE".to_string()));
+        lock(&e.st).on_its_own = Some(Some(Ok(())));
+        assert!(e.is_gone());
+        assert_eq!(e.end_failed(), None);
+    }
+
+    /// Detach hands the device back, admin paths up, when it cannot stop it
+    /// or when it ended on its own and could not be deleted; otherwise its
+    /// admin paths go down.
+    #[test]
+    fn a_kept_device_keeps_its_admin_paths() {
+        let spec: DeviceSpec = serde_json::from_value(serde_json::json!({"volume": "a", "subnqn": "nqn.2026-09.test:sub", "addrs": ["192.0.2.1:4420"]})).unwrap();
+        let r = Running::for_tests(spec.clone(), 5, false);
+        let ctrls = r.ctrls.clone();
+        match r.detached(Err((anyhow!("STOP failed"), true))) {
+            Err(DetachFailed { still_served: Some(r), .. }) => assert_eq!(r.dev_id, 5),
+            _ => panic!("a device that could not be stopped was not handed back"),
+        }
+        assert!(!ctrls.is_shut_down(), "the admin paths of a device still served went down");
+        let r = Running::for_tests(spec.clone(), 6, false);
+        let ctrls = r.ctrls.clone();
+        assert!(matches!(r.detached(Err((anyhow!("gone"), false))), Err(DetachFailed { still_served: None, .. })));
+        assert!(ctrls.is_shut_down());
+        let r = Running::for_tests(spec.clone(), 7, false);
+        let ctrls = r.ctrls.clone();
+        assert!(r.detached(Ok(())).is_ok());
+        assert!(ctrls.is_shut_down());
+        // Ended on its own, deleting it failed: kept by a detach.
+        let r = Running::for_tests_ending(spec, 8, Some(Some(Err("EMFILE".into()))));
+        match r.detach() {
+            Err(DetachFailed { still_served: Some(r), .. }) => assert_eq!(r.end_failed().as_deref(), Some("EMFILE")),
+            _ => panic!("a device that may still exist was dropped by a detach"),
+        }
+    }
+
+    /// EBUSY right after the old server exits is polled with a short
+    /// backoff, not handed back for a whole daemon RETRY.
+    #[test]
+    fn recovery_polls_a_short_ebusy() {
+        let mut answers = vec![0, -libc::EBUSY, -libc::EBUSY, -libc::EBUSY];
+        let mut slept = Vec::new();
+        let r = recovery_check_with("a", 5, |_| Some(Some("a".into())), || Ok(answers.pop().unwrap()), |d| slept.push(d));
+        assert!(r.unwrap(), "a device recoverable 7 ms later was put off");
+        assert_eq!(slept, [1, 2, 4].map(Duration::from_millis));
+        // EBUSY that lasts: given up after the budget.
+        let mut total = Duration::ZERO;
+        let r = recovery_check_with("a", 5, |_| None, || Ok(-libc::EBUSY), |d| total += d);
+        assert!(!r.unwrap());
+        assert!(total >= RECOVER_POLL_BUDGET && total <= RECOVER_POLL_BUDGET + Duration::from_millis(100), "{total:?}");
+        // Another volume's device: not tried at all.
+        let r = recovery_check_with("a", 5, |_| Some(Some("b".into())), || panic!("recovery started on another volume's device"), |_| {});
+        assert!(r.is_err());
+        // Another error: not polled.
+        let r = recovery_check_with("a", 5, |_| None, || Ok(-libc::EINVAL), |_| panic!("slept on EINVAL"));
+        assert!(r.is_err());
     }
 }
