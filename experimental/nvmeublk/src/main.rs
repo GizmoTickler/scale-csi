@@ -511,7 +511,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024) as usize,
         threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", 4) as u16,
         seq_tags: env_u64("NVMEUBLK_SEQ_TAGS", 0) != 0,
-        tag_chunk: env_u64("NVMEUBLK_TAG_CHUNK", 8) as u16,
+        tag_chunk: env_u64("NVMEUBLK_TAG_CHUNK", 2) as u16,
         batch_io,
         batch_spill: env_u64("NVMEUBLK_BATCH_SPILL", 16).min(u16::MAX as u64) as u16,
         io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),

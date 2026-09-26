@@ -45,7 +45,7 @@ fn d_threads() -> u16 {
     4
 }
 fn d_chunk() -> u16 {
-    8
+    2
 }
 fn d_rx_chunk() -> usize {
     32 * 1024
