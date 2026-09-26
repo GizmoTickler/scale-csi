@@ -260,7 +260,7 @@ func TestNodeStageUblkBlockRoundTrip(t *testing.T) {
 		Addrs:    []string{"192.0.2.20:4420", "192.0.2.21:4420", "[2001:db8::22]:4420"},
 		HostNQN:  testUblkHostNQN,
 		HostID:   testUblkHostID,
-		Queues:   8,
+		Queues:   2,
 		Depth:    64,
 		ZeroCopy: true,
 		NapiUs:   0,

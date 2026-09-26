@@ -718,7 +718,7 @@ nvmeof:
     # (the daemon's socket and runtime directory).
     enabled: false
     # ublk queues per device.
-    queues: 8
+    queues: 2
     # Per-queue ublk depth.
     depth: 64
     # ublk zero copy (UBLK_F_AUTO_BUF_REG). Needs kernel >= 6.16; the daemon

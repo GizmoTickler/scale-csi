@@ -152,7 +152,7 @@ func TestChartNVMeUblkInUsePlumbsConfigAndNodeMount(t *testing.T) {
 		args := withArgs(withArgs(nvmeofOnArgs, requiredConfigArgs...), "--set", "nvmeof.ublk.enabled=true", "--show-only", "templates/configmap.yaml")
 		cfg := loadRenderedConfig(t, renderedConfigYAML(t, helmTemplate(t, args...)))
 		ublk := cfg.NVMeoF.Ublk
-		if ublk.Queues != 8 || ublk.Depth != 64 || ublk.ZeroCopy == nil || !*ublk.ZeroCopy || ublk.NapiUs != 0 || ublk.AttachTimeout != 60 {
+		if ublk.Queues != 2 || ublk.Depth != 64 || ublk.ZeroCopy == nil || !*ublk.ZeroCopy || ublk.NapiUs != 0 || ublk.AttachTimeout != 60 {
 			t.Errorf("ublk defaults changed on the way to the driver: %+v", ublk)
 		}
 	})

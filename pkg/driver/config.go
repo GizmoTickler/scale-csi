@@ -910,7 +910,8 @@ type NVMeoFUblkConfig struct {
 	// /run/nvmeublk/nvmeublkd.sock).
 	SocketPath string `yaml:"socketPath"`
 
-	// Queues is the number of ublk queues per device (default 8).
+	// Queues is the number of ublk queues per device (default 2; nvmeublkd serves
+	// each queue with 4 threads over chunk-2 tag runs, measured best on the test node).
 	Queues int `yaml:"queues"`
 
 	// Depth is the per-queue ublk depth (default 64).
@@ -932,7 +933,7 @@ type NVMeoFUblkConfig struct {
 
 // Defaults for NVMeoFUblkConfig.
 const (
-	defaultNVMeUblkQueues        = 8
+	defaultNVMeUblkQueues        = 2
 	defaultNVMeUblkDepth         = 64
 	defaultNVMeUblkAttachTimeout = 60
 	// ublk's own limits (UBLK_MAX_NR_QUEUES / UBLK_MAX_QUEUE_DEPTH).

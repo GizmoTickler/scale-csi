@@ -85,6 +85,11 @@ func TestNVMeoFSessionGCIgnoresUblkDevices(t *testing.T) {
 		disconnected = append(disconnected, nqn)
 		return nil
 	}
+	// Session GC only collects sessions this plugin recorded connecting.
+	reg, err := newSessionRegistry(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, reg.record("nqn.2011-06.com.example:kernel-orphan"))
+	d.nvmeSessions = reg
 	d.orphanedNVMeSessionsSeen.Store("nqn.2011-06.com.example:kernel-orphan", time.Now().Add(-time.Hour))
 
 	d.gcNVMeoFSessions(context.Background(), 0, false)

@@ -24,7 +24,7 @@ func TestLoadConfigNVMeoFDataPathDefaults(t *testing.T) {
 	assert.Equal(t, NVMeoFDataPathKernel, cfg.NVMeoF.DataPath)
 	assert.False(t, cfg.NVMeoF.ublkAvailable())
 	assert.Equal(t, util.DefaultNVMeUblkSocket, cfg.NVMeoF.Ublk.SocketPath)
-	assert.Equal(t, 8, cfg.NVMeoF.Ublk.Queues)
+	assert.Equal(t, 2, cfg.NVMeoF.Ublk.Queues)
 	assert.Equal(t, 64, cfg.NVMeoF.Ublk.Depth)
 	require.NotNil(t, cfg.NVMeoF.Ublk.ZeroCopy)
 	assert.True(t, *cfg.NVMeoF.Ublk.ZeroCopy)
@@ -122,7 +122,7 @@ func TestNVMeoFUblkConfigWithDefaults(t *testing.T) {
 	require.NotNil(t, got.ZeroCopy)
 	assert.Equal(t, NVMeoFUblkConfig{
 		SocketPath:    util.DefaultNVMeUblkSocket,
-		Queues:        8,
+		Queues:        2,
 		Depth:         64,
 		ZeroCopy:      got.ZeroCopy,
 		AttachTimeout: 60,

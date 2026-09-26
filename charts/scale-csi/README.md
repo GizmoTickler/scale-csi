@@ -217,7 +217,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `false` |
 | `nvmeof.dataPath` | Node data path for volumes whose StorageClass does not set `nvmeof/dataPath`: `kernel` or `ublk` | `kernel` |
 | `nvmeof.ublk.enabled` | Allow StorageClasses to opt into the ublk data path while the default stays `kernel` | `false` |
-| `nvmeof.ublk.queues` | ublk queues per device (`1..4096`) | `8` |
+| `nvmeof.ublk.queues` | ublk queues per device (`1..4096`) | `2` |
 | `nvmeof.ublk.depth` | Per-queue ublk depth (`1..4096`) | `64` |
 | `nvmeof.ublk.zeroCopy` | ublk zero copy; needs kernel >= 6.16 | `true` |
 | `nvmeof.ublk.napiUs` | NAPI busy-poll budget in µs while I/O is in flight; `0` disables | `0` |
