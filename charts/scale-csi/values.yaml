@@ -740,9 +740,9 @@ nvmeof:
     daemon:
       enabled: false
       image:
-        # Placeholder. No nvmeublk image is published with this chart; build
-        # one from the nvmeublk sources and set repository plus tag or digest.
-        repository: registry.example.invalid/nvmeublk
+        # Built from experimental/nvmeublk and published (amd64) with every
+        # release tag; use the tag matching the chart's appVersion.
+        repository: ghcr.io/gizmotickler/scale-csi-nvmeublk
         # Required when the daemon is enabled (unless digest is set).
         tag: ""
         # Optional immutable manifest digest; takes precedence over tag.

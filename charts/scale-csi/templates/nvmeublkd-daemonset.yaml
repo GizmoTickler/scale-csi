@@ -70,7 +70,8 @@ spec:
         - name: nvmeublkd
           image: {{ include "scale-csi.nvmeublkdImage" $daemon | quote }}
           imagePullPolicy: {{ $image.pullPolicy | default "IfNotPresent" }}
-          command: ["nvmeublk", "daemon"]
+          # The image is FROM scratch with the binary at /nvmeublk and no PATH.
+          command: ["/nvmeublk", "daemon"]
           {{- with $daemon.extraEnv }}
           env:
             {{- toYaml . | nindent 12 }}

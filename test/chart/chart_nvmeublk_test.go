@@ -205,10 +205,10 @@ func TestChartNVMeUblkDaemonSet(t *testing.T) {
 	if !ok {
 		t.Fatal("nvmeublkd DaemonSet has no nvmeublkd container")
 	}
-	if got := asStringSlice(container["command"]); !reflect.DeepEqual(got, []string{"nvmeublk", "daemon"}) {
-		t.Errorf("command = %v, want [nvmeublk daemon]", got)
+	if got := asStringSlice(container["command"]); !reflect.DeepEqual(got, []string{"/nvmeublk", "daemon"}) {
+		t.Errorf("command = %v, want [/nvmeublk daemon]", got)
 	}
-	if container["image"] != "registry.example.invalid/nvmeublk:v0.1.0" {
+	if container["image"] != "ghcr.io/gizmotickler/scale-csi-nvmeublk:v0.1.0" {
 		t.Errorf("image = %v", container["image"])
 	}
 	securityContext, _ := asManifest(container["securityContext"])
@@ -234,7 +234,7 @@ func TestChartNVMeUblkDaemonSet(t *testing.T) {
 	t.Run("digest wins over tag", func(t *testing.T) {
 		const digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 		out := helmTemplate(t, withArgs(args, "--set", "nvmeof.ublk.daemon.image.digest="+digest)...)
-		if !strings.Contains(out, `image: "registry.example.invalid/nvmeublk@`+digest+`"`) {
+		if !strings.Contains(out, `image: "ghcr.io/gizmotickler/scale-csi-nvmeublk@`+digest+`"`) {
 			t.Errorf("digest did not take precedence over tag")
 		}
 	})

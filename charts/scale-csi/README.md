@@ -223,7 +223,7 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.ublk.napiUs` | NAPI busy-poll budget in µs while I/O is in flight; `0` disables | `0` |
 | `nvmeof.ublk.attachTimeout` | Seconds one attach may take | `60` |
 | `nvmeof.ublk.daemon.enabled` | Deploy the optional `nvmeublkd` DaemonSet | `false` |
-| `nvmeof.ublk.daemon.image.repository` | nvmeublkd image (placeholder; no image is published) | `registry.example.invalid/nvmeublk` |
+| `nvmeof.ublk.daemon.image.repository` | nvmeublkd image (published per release tag, amd64) | `ghcr.io/gizmotickler/scale-csi-nvmeublk` |
 | `nvmeof.ublk.daemon.image.tag` / `.digest` | Required when the daemon is enabled; digest wins | `""` |
 | `nvmeof.ublk.daemon.terminationGracePeriodSeconds` | Must cover the daemon's 5 s drain | `15` |
 | `nvmeof.ublk.daemon.priorityClassName` | Daemon pod priority | `system-node-critical` |
@@ -328,7 +328,7 @@ nvmeof:
     daemon:
       enabled: true
       image:
-        repository: registry.example.invalid/nvmeublk
+        repository: ghcr.io/gizmotickler/scale-csi-nvmeublk
         tag: v0.1.0
 storageClasses:
   - name: scale-nvmeof-ublk
