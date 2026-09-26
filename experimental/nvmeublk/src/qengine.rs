@@ -90,6 +90,8 @@ const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
 static ASYNC_RX_MIN: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
 
+static BATCH_SLACK: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_BATCH_SLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
 static DIRECT_SEND: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_DIRECT_SEND").map_or(true, |v| v != "0"));
 
@@ -863,7 +865,17 @@ impl Engine {
                 live.retain(|c| c.path != ap);
             }
         }
-        live.sort_by_key(|c| c.inflight.borrow().len());
+        // Batch affinity (NVMEUBLK_BATCH_SLACK, default 16): a connection that
+        // already has commands waiting for this turn's send takes the next one
+        // too while it is within SLACK of the least loaded, so one sendmsg
+        // carries the turn's commands instead of one per path. Load still
+        // evens out across turns; 0 = plain least-outstanding.
+        let min = live.iter().map(|c| c.inflight.borrow().len()).min().unwrap_or(0);
+        let slack = *BATCH_SLACK;
+        live.sort_by_key(|c| {
+            let n = c.inflight.borrow().len();
+            (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), n)
+        });
         for c in live {
             match self.try_submit(&c, p) {
                 Ok(()) => return,
