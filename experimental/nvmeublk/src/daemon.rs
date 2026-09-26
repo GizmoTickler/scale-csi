@@ -136,6 +136,16 @@ fn earliest(a: Option<Instant>, b: Instant) -> Option<Instant> {
     Some(a.map_or(b, |a| a.min(b)))
 }
 
+/// Park new I/O on every device (`Running::drain`); true when all of them
+/// have drained. Every device is drained, not only those up to the first
+/// that has not: `Iterator::all` stops there, which left the devices after
+/// it serving new I/O through the whole handover wait, so they were handed
+/// over with I/O on the wire (not drained, their writes held on recovery)
+/// like after a crash.
+fn drain_all<'a>(devs: impl Iterator<Item = &'a Running>) -> bool {
+    devs.fold(true, |all, r| r.drain() && all)
+}
+
 /// The state file's entries. A served device is clean only when `clean` says
 /// so (a handover drained it). A device not served again yet keeps the flag
 /// it was recorded with: this daemon has sent nothing for it, so what its
@@ -426,7 +436,7 @@ impl Daemon {
         let mut clean = BTreeMap::new();
         loop {
             let devs = lock(&self.devices);
-            let all = devs.values().all(|r| r.drain());
+            let all = drain_all(devs.values());
             if all || Instant::now() > deadline {
                 for r in devs.values() {
                     // One ending on its own had its queue loops end under it:
@@ -1242,6 +1252,24 @@ mod tests {
         r.stats.orphans.store(0, Ordering::Relaxed);
         r.stats.inflight.store(1, Ordering::Relaxed);
         assert!(!r.drain());
+    }
+
+    /// A handover parks new I/O on every device, not only on those up to the
+    /// first one still holding I/O: one device waiting out a write fence
+    /// must not leave the others serving (and so handed over not drained,
+    /// with I/O on the wire) for the whole handover wait.
+    #[test]
+    fn a_handover_quiesces_every_device_even_behind_one_not_drained() {
+        let a = Running::for_tests(entry("a", 1, false).spec, 1, false);
+        let b = Running::for_tests(entry("b", 2, false).spec, 2, false);
+        let c = Running::for_tests(entry("c", 3, false).spec, 3, false);
+        a.stats.orphans.store(1, Ordering::Relaxed);
+        assert!(!drain_all([&a, &b, &c].into_iter()), "a device holding a fenced write was called drained");
+        for r in [&a, &b, &c] {
+            assert!(r.quiesce.load(Ordering::Acquire), "{} kept serving new I/O during the handover", r.spec.volume);
+        }
+        a.stats.orphans.store(0, Ordering::Relaxed);
+        assert!(drain_all([&a, &b, &c].into_iter()));
     }
 
     /// A device ending on its own keeps its id until it is deleted, and may
