@@ -339,12 +339,16 @@ fn queue_fn(
         // check the ring without blocking instead of sleeping in it. A queue
         // carrying a thin share of a stream otherwise sleeps between events
         // and pays a wakeup for each; an idle queue still sleeps.
-        let spin = Duration::from_micros(env_u64("NVMEUBLK_SPIN_US", 0));
+        let spin = Duration::from_micros(env_u64("NVMEUBLK_SPIN_US", 100));
+        let spin_idle = env_u64("NVMEUBLK_SPIN_IDLE", 1) != 0;
         let timeout = io_uring::types::Timespec::new().sec(20);
         let mut last_event = Instant::now();
         run_ops();
         loop {
-            let hot = !spin.is_zero() && spin_engine.inflight_here() > 0 && last_event.elapsed() < spin;
+            // NVMEUBLK_SPIN_IDLE=1: keep polling for the spin budget after the last event even with
+            // nothing in flight, so a queue running at low depth does not sleep between a completion
+            // and the next request (the wake costs tens of µs in a VM).
+            let hot = !spin.is_zero() && (spin_idle || spin_engine.inflight_here() > 0) && last_event.elapsed() < spin;
             let (poll_timeout, failed) = match libublk::uring_async::uring_poll_io_fn::<io_uring::squeue::Entry>(&q_rc, Some(timeout), if hot { 0 } else { 1 }) {
                 Ok(t) => (t, false),
                 Err(_) => (false, true),
@@ -469,15 +473,15 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         addrs: addrs.to_vec(),
         hostnqn: std::env::var("NVMEUBLK_HOSTNQN").ok(),
         hostid: std::env::var("NVMEUBLK_HOSTID").ok(),
-        queues: env_u64("NVMEUBLK_QUEUES", 4) as u16,
+        queues: env_u64("NVMEUBLK_QUEUES", 2) as u16,
         depth: env_u64("NVMEUBLK_DEPTH", 64) as u16,
         zero_copy: env_u64("NVMEUBLK_ZERO_COPY", 0) != 0,
         napi_us: env_u64("NVMEUBLK_NAPI_US", 0) as u32,
         conns_per_path: env_u64("NVMEUBLK_CONNS_PER_PATH", 1) as usize,
         rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024) as usize,
-        threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", 1) as u16,
+        threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", 4) as u16,
         seq_tags: env_u64("NVMEUBLK_SEQ_TAGS", 0) != 0,
-        tag_chunk: env_u64("NVMEUBLK_TAG_CHUNK", 1) as u16,
+        tag_chunk: env_u64("NVMEUBLK_TAG_CHUNK", 8) as u16,
         io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),
         no_path_timeout_ms: env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000),
         write_fence_ms: std::env::var("NVMEUBLK_WRITE_FENCE_MS").ok().and_then(|v| v.parse().ok()),

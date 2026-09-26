@@ -27,7 +27,7 @@ const KATO: Duration = Duration::from_secs(15);
 pub const START_DEADLINE: Duration = Duration::from_secs(60);
 
 fn d_queues() -> u16 {
-    4
+    2
 }
 fn d_depth() -> u16 {
     64
@@ -42,10 +42,10 @@ fn d_one() -> usize {
     1
 }
 fn d_threads() -> u16 {
-    1
+    4
 }
 fn d_chunk() -> u16 {
-    1
+    8
 }
 fn d_rx_chunk() -> usize {
     32 * 1024
