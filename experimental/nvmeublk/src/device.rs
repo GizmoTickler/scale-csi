@@ -53,6 +53,9 @@ fn d_rx_chunk() -> usize {
 fn d_batch_spill() -> u16 {
     16
 }
+pub fn d_conn_classes() -> bool {
+    false
+}
 
 /// Everything needed to (re)create a device. Stored in the daemon's state
 /// file, so a restarted daemon can reattach with the same configuration.
@@ -129,6 +132,10 @@ pub struct DeviceSpec {
     /// the credits come from NVMEUBLK_HOT_LEASE / NVMEUBLK_HOT_SECONDARY.
     #[serde(default)]
     pub hot_lane: bool,
+    /// Two connection classes per path (tuning; see qengine::QConfig::
+    /// conn_classes): one extra small-I/O connection per path and engine.
+    #[serde(default = "d_conn_classes")]
+    pub conn_classes: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1115,6 +1122,7 @@ fn bring_up(
         rx_offload: 0,
         cdev_fd: -1,
         conns_per_path: spec.conns_per_path.max(1),
+        conn_classes: spec.conn_classes,
         rx_chunk: spec.rx_chunk.max(64),
         napi_us: spec.napi_us,
         fault_dir,

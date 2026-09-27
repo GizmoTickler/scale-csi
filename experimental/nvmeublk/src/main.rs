@@ -347,14 +347,19 @@ fn queue_fn(
         let run_ops = || {
             let t0 = Instant::now();
             st2.loops.fetch_add(1, Ordering::Relaxed);
+            // Small-class connections first, and again after every other
+            // task (conn_classes): their completions never wait behind a
+            // turn of bulk payload work.
             let mut progress = true;
             while progress {
-                progress = false;
+                progress = spin_engine.tick_priority();
                 while exe.try_tick() {
                     progress = true;
+                    spin_engine.tick_priority();
                 }
                 while net_exe.try_tick() {
                     progress = true;
+                    spin_engine.tick_priority();
                 }
             }
             st2.loop_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -510,6 +515,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         zero_copy: env_u64("NVMEUBLK_ZERO_COPY", 0) != 0,
         napi_us: env_u64("NVMEUBLK_NAPI_US", 0) as u32,
         conns_per_path: env_u64("NVMEUBLK_CONNS_PER_PATH", 1) as usize,
+        conn_classes: env_u64("NVMEUBLK_CONN_CLASSES", device::d_conn_classes() as u64) != 0,
         rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024) as usize,
         threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", 4) as u16,
         seq_tags: env_u64("NVMEUBLK_SEQ_TAGS", 0) != 0,

@@ -152,8 +152,15 @@ static LINK_HDR: std::sync::LazyLock<bool> =
 static LAT_PATH: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LAT_PATH").map_or(true, |v| v != "0"));
 
-/// Payload size up to which a command is "small" for path choice.
+/// Payload size up to which a command is "small" for path choice and
+/// connection class.
 pub const SMALL_IO: usize = 32 * 1024;
+
+/// Whether a command belongs on a small-class connection (L5): payload at
+/// most SMALL_IO, and flushes (no payload, and what a database waits on).
+pub fn is_small_cmd(op: Op, len: usize) -> bool {
+    op == Op::Flush || len <= SMALL_IO
+}
 
 /// A path with no RTT sample this recent is probed: its next small command
 /// goes there whatever its EWMA says, so a path that was slow once (or was
@@ -446,6 +453,14 @@ pub struct QConfig {
     pub conns_per_path: usize,
     /// Largest staging receive (see RX_CHUNK_DEFAULT).
     pub rx_chunk: usize,
+    /// Two connection classes per path (design doc §4.4 L5): besides its
+    /// `conns_per_path` bulk connections, each path gets one "small"
+    /// connection that carries only commands with at most SMALL_IO bytes of
+    /// payload (and flushes), so a 4k read never queues behind 1 MiB PDUs on
+    /// the wire or in the target's per-queue worker. Its sender and receiver
+    /// run on the engine's priority executor (`QEngine::tick_priority`),
+    /// which the queue thread drains before any other task in a turn.
+    pub conn_classes: bool,
     /// NAPI busy-poll budget (us) while this queue has I/O in flight; 0 = off.
     /// Registered on the first submit after an idle period and dropped after
     /// an idle timer tick, so an idle volume costs no polling.
@@ -786,6 +801,17 @@ impl QEngine {
         (r.ewma_ns > 0).then(|| Duration::from_nanos(r.ewma_ns))
     }
 
+    /// Run the priority executor (small-class connections) until it has
+    /// nothing ready; true if it ran anything. The queue thread calls it
+    /// before, and between, its other tasks.
+    pub fn tick_priority(&self) -> bool {
+        let mut ran = false;
+        while self.core.exe_hi.try_tick() {
+            ran = true;
+        }
+        ran
+    }
+
     /// A pending fault-injection "wedge <ms>" (drills of the batch hot
     /// lane's watchdog); taking it clears it.
     pub fn take_wedge(&self) -> Option<Duration> {
@@ -859,6 +885,8 @@ struct Engine {
     rtt_all: Cell<PathRtt>,
     /// Fault injection "wedge <ms>": for the queue thread to act on.
     wedge: Cell<Option<Duration>>,
+    /// Priority executor: the small-class connections' tasks (conn_classes).
+    exe_hi: Rc<smol::LocalExecutor<'static>>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
@@ -884,7 +912,7 @@ impl Engine {
         draining: Arc<AtomicBool>,
     ) -> Rc<Self> {
         let n_paths = ctrls.paths.len();
-        let n = n_paths * cfg.conns_per_path.max(1);
+        let n = n_paths * (cfg.conns_per_path.max(1) + cfg.conn_classes as usize);
         let tick_fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) };
         Rc::new(Engine {
             qid,
@@ -914,6 +942,7 @@ impl Engine {
             path_rtt: RefCell::new(vec![PathRtt::default(); n_paths]),
             rtt_all: Cell::new(PathRtt::default()),
             wedge: Cell::new(None),
+            exe_hi: Rc::new(smol::LocalExecutor::new()),
         })
     }
 
@@ -991,6 +1020,15 @@ impl Engine {
         if let Some(ap) = p.avoid_path {
             if live.iter().any(|c| c.path != ap) {
                 live.retain(|c| c.path != ap);
+            }
+        }
+        // Connection classes: small commands (and flushes) on the paths'
+        // small connections, the rest on the bulk ones; either may use the
+        // other class when its own has no live connection.
+        if self.cfg.conn_classes {
+            let want_small = is_small_cmd(p.op, p.len);
+            if live.iter().any(|c| self.small_slot(c.slot) == want_small) {
+                live.retain(|c| self.small_slot(c.slot) == want_small);
             }
         }
         // Batch affinity (NVMEUBLK_BATCH_SLACK, default 16): a connection that
@@ -1283,8 +1321,15 @@ impl Engine {
         Ok(())
     }
 
+    /// Connection slots per path: the bulk connections, plus the small one
+    /// (slot index 0 of the path) with conn_classes.
     fn k(&self) -> usize {
-        self.cfg.conns_per_path.max(1)
+        self.cfg.conns_per_path.max(1) + self.cfg.conn_classes as usize
+    }
+
+    /// Whether slot `slot` is a path's small-class connection.
+    fn small_slot(&self, slot: usize) -> bool {
+        self.cfg.conn_classes && slot % self.k() == 0
     }
 
     fn install(self: &Rc<Self>, slot: usize, epoch: u64, stream: TcpStream, maxh2c: u32, qsize: u16) {
@@ -2176,7 +2221,13 @@ impl Engine {
     ///   logged and fails the engine (`task_panicked`).
     fn spawn_task(self: &Rc<Self>, kind: TaskKind, fut: impl Future<Output = ()> + 'static) {
         self.tasks.set(self.tasks.get() + 1);
-        self.exe.spawn(Guarded { fut: Some(Box::pin(fut)), kind: Some(kind), engine: Rc::downgrade(self) }).detach();
+        let hi = match &kind {
+            TaskKind::Sender(slot) => self.small_slot(*slot),
+            TaskKind::Receiver(c) => self.small_slot(c.slot),
+            _ => false,
+        };
+        let exe = if hi { &self.exe_hi } else { &self.exe };
+        exe.spawn(Guarded { fut: Some(Box::pin(fut)), kind: Some(kind), engine: Rc::downgrade(self) }).detach();
     }
 
     /// An engine task panicked (`msg`): log it loudly and fail the engine.
@@ -2311,7 +2362,7 @@ impl Engine {
         self.wake();
         let deadline = Instant::now() + SHUTDOWN_DRAIN;
         loop {
-            while self.exe.try_tick() {}
+            while self.exe_hi.try_tick() || self.exe.try_tick() {}
             if self.tasks.get() == 0 {
                 return;
             }
@@ -2662,6 +2713,8 @@ mod tests {
         closed: usize,
         /// Reads answered on I/O queues.
         reads: usize,
+        /// (I/O queue id, bytes) of every read answered.
+        read_qids: Vec<(u16, usize)>,
     }
 
     #[derive(Default)]
@@ -2745,6 +2798,7 @@ mod tests {
     /// One connection: ICReq, then command capsules until the host closes.
     fn serve(mut s: TcpStream, seen: &Mutex<Seen>, hold: &AtomicBool, cfg: &TargetCfg) {
         let mut io_queue = false;
+        let mut my_qid = 0u16;
         let _ = (|| -> std::io::Result<()> {
             let mut icreq = [0u8; 128];
             s.read_exact(&mut icreq)?;
@@ -2770,6 +2824,7 @@ mod tests {
                             resp(cid, 1) // admin: cntlid 1
                         } else {
                             io_queue = true;
+                            my_qid = qid;
                             seen.lock().unwrap().io_connects.push((qid, u16::from_le_bytes([data[16], data[17]]), u16_at(44)));
                             if cfg.hang_io_connect {
                                 continue;
@@ -2793,10 +2848,14 @@ mod tests {
                     }
                     (_, true) if hold.load(Ordering::Acquire) => continue,
                     (OPC_READ, true) => {
-                        seen.lock().unwrap().reads += 1;
                         std::thread::sleep(cfg.io_delay);
                         let slba = u64::from_le_bytes(sqe[40..48].try_into().unwrap());
                         let nlb = u32::from_le_bytes(sqe[48..52].try_into().unwrap()) as usize + 1;
+                        {
+                            let mut sn = seen.lock().unwrap();
+                            sn.reads += 1;
+                            sn.read_qids.push((my_qid, nlb * 512));
+                        }
                         c2h(cid, &pattern(slba, nlb * 512))
                     }
                     _ => resp(cid, 0), // Property Set, keep-alive, flush
@@ -2893,6 +2952,10 @@ mod tests {
 
     /// A rig whose device has one path per target, in this order.
     fn rig_paths(ts: &[&Target], name: &str, write_fence: Duration) -> Rig {
+        rig_with(ts, name, write_fence, |_| {})
+    }
+
+    fn rig_with(ts: &[&Target], name: &str, write_fence: Duration, tweak: impl FnOnce(&mut QConfig)) -> Rig {
         let id = Ident { hostnqn: "nqn.2014-08.org.nvmexpress:uuid:test".into(), hostid: [7; 16], subnqn: "nqn.test:sub".into() };
         let ctrls = Ctrls::new(ts.iter().map(|t| t.addr).collect(), id, Duration::from_secs(15)).unwrap();
         let fault_dir = std::env::temp_dir().join(format!("nvmeublk-qengine-{}-{name}", std::process::id())).to_string_lossy().into_owned();
@@ -2906,11 +2969,14 @@ mod tests {
             rx_offload: 0,
             cdev_fd: -1,
             conns_per_path: 1,
+            conn_classes: false,
             rx_chunk: RX_CHUNK_DEFAULT,
             napi_us: 0,
             fault_dir: fault_dir.clone(),
             quiesce: Arc::new(AtomicBool::new(false)),
         };
+        let mut cfg = cfg;
+        tweak(&mut cfg);
         let exe = Rc::new(smol::LocalExecutor::new());
         let stats = Arc::new(Stats::default());
         let e = QEngine::new(0, ctrls.clone(), cfg, exe.clone(), stats.clone(), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
@@ -2961,6 +3027,48 @@ mod tests {
         assert_eq!(send_zc_min(Some("1"), None), Some(0));
         assert_eq!(send_zc_min(Some("0"), Some(4096)), None);
         assert_eq!(send_zc_min(Some(""), None), Some(64 * 1024));
+    }
+
+    /// Connection classes (L5): small commands go on each path's small
+    /// connection and large ones on the bulk connection, and the small
+    /// connection's tasks run on the priority executor (a 4k read completes
+    /// only when the queue thread ticks it).
+    #[test]
+    fn small_and_bulk_commands_use_separate_connections() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let seen = t.seen.clone();
+        on_ring_thread(move || {
+            let r = rig_with(&[&t], "classes", Duration::from_secs(20), |c| c.conn_classes = true);
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || {
+                r.e.tick_priority();
+                r.e.core.live().len() == 2
+            }), "small and bulk connections should come up");
+            let (mut small, mut big) = (vec![0u8; 4096], vec![0u8; 128 * 1024]);
+            // Without the priority executor turning, the 4k read cannot
+            // complete, while a 128k read (bulk class) does.
+            let rx = request(&r.e, Op::Read, &mut small);
+            let rb = request(&r.e, Op::Read, &mut big);
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || !rb.is_empty()), "the bulk read should complete on the main executor");
+            assert!(!drive_until(&r.exe, Duration::from_millis(300), || !rx.is_empty()), "the small read must be served by the priority executor");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                r.e.tick_priority();
+                !rx.is_empty()
+            }));
+            for _ in 0..10 {
+                for buf in [&mut small, &mut big] {
+                    let rx = request(&r.e, Op::Read, buf);
+                    assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                        r.e.tick_priority();
+                        !rx.is_empty()
+                    }));
+                }
+            }
+        });
+        let seen = seen.lock().unwrap();
+        let qid_of = |bytes: usize| seen.read_qids.iter().filter(|(_, b)| *b == bytes).map(|(q, _)| *q).collect::<std::collections::BTreeSet<u16>>();
+        assert_eq!(qid_of(4096).into_iter().collect::<Vec<_>>(), vec![1], "4k reads on the small connection (qid 1): {:?}", seen.read_qids);
+        assert_eq!(qid_of(128 * 1024).into_iter().collect::<Vec<_>>(), vec![2], "128k reads on the bulk connection (qid 2): {:?}", seen.read_qids);
     }
 
     #[test]
