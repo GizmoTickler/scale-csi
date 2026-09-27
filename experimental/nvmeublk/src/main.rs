@@ -14,6 +14,7 @@ mod ctrls;
 mod daemon;
 mod device;
 mod mpath;
+mod napi;
 mod pdu;
 mod qengine;
 

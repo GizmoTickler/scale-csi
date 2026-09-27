@@ -919,6 +919,11 @@ impl QEngine {
         }
     }
 
+    /// PDUs this engine has received so far.
+    pub fn events(&self) -> u64 {
+        self.core.events.get()
+    }
+
     /// A pending fault-injection "wedge <ms>" (drills of the batch hot
     /// lane's watchdog); taking it clears it.
     pub fn take_wedge(&self) -> Option<Duration> {
@@ -992,6 +997,9 @@ struct Engine {
     wedge: Cell<Option<Duration>>,
     /// Priority executor: the small-class connections' tasks (conn_classes).
     exe_hi: Rc<smol::LocalExecutor<'static>>,
+    /// PDUs received (a host serving several engines on one ring tells
+    /// which of them saw events by it).
+    events: Cell<u64>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
@@ -1047,6 +1055,7 @@ impl Engine {
             rtt_all: Cell::new(PathRtt::default()),
             wedge: Cell::new(None),
             exe_hi: Rc::new(smol::LocalExecutor::new()),
+            events: Cell::new(0),
         })
     }
 
@@ -1059,16 +1068,14 @@ impl Engine {
         self.conns.borrow().iter().flatten().filter(|c| !c.dead.get()).cloned().collect()
     }
 
+    /// NAPI busy polling on this thread's ring while this engine is busy.
+    /// The ring has it while any engine on it wants it (crate::napi).
     fn set_napi(&self, on: bool) {
         if self.cfg.napi_us == 0 || self.napi_on.get() == on {
             return;
         }
-        let mut napi = io_uring::types::Napi::new().set_busy_poll_timeout(self.cfg.napi_us).set_prefer_busy_poll(true);
-        let r = libublk::with_task_io_ring_mut(|ring| if on { ring.submitter().register_napi(&mut napi) } else { ring.submitter().unregister_napi(&mut napi) });
-        match r {
-            Ok(()) => self.napi_on.set(on),
-            Err(e) => log::debug!("q{}: NAPI {}: {e}", self.qid, if on { "register" } else { "unregister" }),
-        }
+        crate::napi::want(on, self.cfg.napi_us);
+        self.napi_on.set(on);
     }
 
     fn inflight_here(&self) -> usize {
@@ -2035,6 +2042,7 @@ impl Engine {
     }
 
     fn handle_pdu(&self, c: &QConn, pdu: &[u8]) -> Result<(), String> {
+        self.events.set(self.events.get().wrapping_add(1));
         check_pdu_header(pdu)?;
         let (ptype, flags, hlen, pdo) = (pdu[0], pdu[1], pdu[2] as usize, pdu[3] as usize);
         match ptype {
@@ -2484,8 +2492,8 @@ impl Engine {
         }
         self.recover_dropped(); // closing: they fail with EIO
         if self.napi_on.replace(false) {
-            // As set_napi(false), through the accessor that cannot panic.
-            with_ring(|r| r.submitter().unregister_napi(&mut io_uring::types::Napi::new()));
+            // As set_napi(false); crate::napi never panics.
+            crate::napi::want(false, self.cfg.napi_us);
         }
         self.wake();
         let deadline = Instant::now() + SHUTDOWN_DRAIN;
@@ -2801,6 +2809,12 @@ fn reap_ring(wait: Duration) -> Option<()> {
         r.completion().collect()
     })?;
     for cqe in cqes {
+        // A batch queue's CQE (on a reactor ring shared with other devices'
+        // queues, or this queue's own) goes back to the ring's loop.
+        if libublk::io::batch_cqe_key(cqe.user_data()).is_some() {
+            libublk::io::defer_queue_cqe(cqe);
+            continue;
+        }
         // Only our own SQEs (Target bit); a SEND_ZC buffer-release notice
         // carries a future key that already completed (see the queue loop).
         if cqe.user_data() & UblkUringData::Target as u64 != 0 && !io_uring::cqueue::notif(cqe.flags()) {
