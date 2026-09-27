@@ -120,11 +120,16 @@ pub struct HotLane {
     /// A primary neither turning nor sleeping this long is replaced
     /// (NVMEUBLK_HOT_WEDGE_MS, default 1000).
     pub wedge: Duration,
+    /// Whether the shallow primary spins while hot (NVMEUBLK_HOT_SPIN,
+    /// default on). Off: it sleeps in its ring between events, like a
+    /// secondary with nothing held, and relies on the guest halt-poll
+    /// window (and NAPI busy poll, NVMEUBLK_NAPI_US) for a cheap wake.
+    pub primary_spin: bool,
 }
 
 impl Default for HotLane {
     fn default() -> Self {
-        HotLane { lease: 4, secondary: 4, deep_lease: 2, deep_spin: false, wedge: Duration::from_millis(1000) }
+        HotLane { lease: 4, secondary: 4, deep_lease: 2, deep_spin: false, wedge: Duration::from_millis(1000), primary_spin: true }
     }
 }
 
@@ -137,6 +142,7 @@ impl HotLane {
             deep_lease: env_u64("NVMEUBLK_HOT_DEEP_LEASE", d.deep_lease as u64).clamp(1, u16::MAX as u64) as u16,
             deep_spin: env_u64("NVMEUBLK_HOT_DEEP_SPIN", d.deep_spin as u64) != 0,
             wedge: Duration::from_millis(env_u64("NVMEUBLK_HOT_WEDGE_MS", d.wedge.as_millis() as u64).max(10)),
+            primary_spin: env_u64("NVMEUBLK_HOT_SPIN", d.primary_spin as u64) != 0,
         }
     }
 
@@ -187,7 +193,7 @@ impl HotLane {
         if deep {
             return self.deep_spin && holding && recent_event;
         }
-        if primary { hot } else { holding && recent_event }
+        if primary { hot && self.primary_spin } else { holding && recent_event }
     }
 }
 
@@ -883,6 +889,7 @@ mod tests {
         assert!(!h.spins(false, false, true, false, true), "a secondary holding nothing sleeps");
         assert!(!h.spins(true, true, true, true, true));
         assert!(!h.spins(false, true, true, true, true));
+        assert!(!HotLane { primary_spin: false, ..h }.spins(true, false, true, true, true), "primary spin off");
         let h = HotLane { deep_spin: true, ..h };
         assert!(h.spins(true, true, false, true, true), "deep_spin: every thread holding requests, as per-tag");
         assert!(h.spins(false, true, false, true, true));
