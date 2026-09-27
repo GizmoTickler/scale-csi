@@ -146,13 +146,17 @@ static LINK_HDR: std::sync::LazyLock<bool> =
 
 /// Byte-balanced path choice for bulk commands (design doc §4.4 L6;
 /// NVMEUBLK_BYTE_PATH, default on; 0 = least-outstanding by count). A
-/// command with more than SMALL_IO bytes of payload goes to the live path
-/// with the fewest payload bytes in flight in its direction, counted over
-/// every engine of the device (Stats::path_rd_bytes / path_wr_bytes), then
-/// the fewest commands on this engine's connection. Counting commands let
-/// one path run ahead with mixed sizes, and each engine (io thread) balanced
-/// only its own share, so a single stream spread over four threads could
-/// still pile onto one path.
+/// command with more than SMALL_IO bytes of payload goes to this engine's
+/// connection with the fewest commands, and among those (at depth usually
+/// several) to the path with the fewest payload bytes in flight in its
+/// direction over every engine of the device (Stats::path_rd_bytes /
+/// path_wr_bytes). The count rule alone broke those ties by path order, so
+/// every engine favoured path 0 (per-path spread 7-17% of the mean in run
+/// l6-20260927T031422Z). Bytes as the first key balanced the paths to 1-4%
+/// but stacked several 1 MiB transfers on one connection while its
+/// siblings idled (one connection receives one PDU at a time, on one
+/// thread): single-stream 1M read QD16 fell from 4,242 to 2,899 MiB/s. Batch
+/// affinity (BATCH_SLACK) does not apply to bulk commands.
 static BYTE_PATH: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_BYTE_PATH").map_or(true, |v| v != "0"));
 
@@ -1047,9 +1051,10 @@ impl Engine {
         live.sort_by_key(|c| {
             let n = c.inflight.borrow().len();
             if bulk_bytes {
-                // Byte balance over the device; batch affinity would
-                // defeat it (a 1 MiB command is its own batch anyway).
-                return (false, self.bytes_on(c.path, p.op).max(0) as u64, n as u64);
+                // Spread over this engine's connections, ties to the path
+                // with the fewest device bytes; no batch affinity (a bulk
+                // command is its own batch anyway).
+                return (false, n as u64, self.bytes_on(c.path, p.op).max(0) as u64);
             }
             (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), n as u64, 0)
         });
@@ -3107,33 +3112,39 @@ mod tests {
         assert_eq!((s, f), (30, 0), "every read on the first live connection");
     }
 
-    /// Byte balance (L6): with a 1 MiB read in flight on one path, the next
-    /// 128k reads all go to the other path until its bytes catch up;
-    /// least-outstanding by count alternated them.
+    /// Byte balance (L6): among this engine's least loaded connections a
+    /// bulk command takes the path with the fewest bytes in flight over the
+    /// device; the count rule took the first path in order.
     #[test]
-    fn bulk_reads_balance_bytes_across_paths() {
+    fn bulk_reads_break_ties_by_device_bytes() {
         let a = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(1500), ..Default::default() }).unwrap();
         let b = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(1500), ..Default::default() }).unwrap();
         on_ring_thread(move || {
             let r = rig_paths(&[&a, &b], "byte-path", Duration::from_secs(20));
             r.e.start();
             assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
-            let mut big = vec![0u8; 1 << 20];
-            let mut small: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 128 * 1024]).collect();
-            let mut rxs = vec![request(&r.e, Op::Read, &mut big)];
-            // Let the 1 MiB command go out before the others are chosen.
-            drive_until(&r.exe, Duration::from_millis(50), || false);
-            for buf in small.iter_mut() {
+            let per_path = || -> Vec<usize> {
+                (0..2).map(|path| r.e.core.live().iter().filter(|c| c.path == path).map(|c| c.inflight.borrow().values().map(|p| p.len).sum::<usize>()).sum()).collect()
+            };
+            // Another engine of the device has 8 MiB on path 0: this
+            // engine's first bulk read goes to path 1, though both of its
+            // connections are empty.
+            r.stats.path_rd_bytes[0].fetch_add(8 << 20, Ordering::Relaxed);
+            let mut bufs: Vec<Vec<u8>> = vec![vec![0u8; 128 * 1024], vec![0u8; 1 << 20], vec![0u8; 128 * 1024], vec![0u8; 128 * 1024]];
+            let mut it = bufs.iter_mut();
+            let mut rxs = vec![request(&r.e, Op::Read, it.next().unwrap())];
+            drive_until(&r.exe, Duration::from_millis(20), || false);
+            assert_eq!(per_path(), vec![0, 128 * 1024], "device bytes break the tie");
+            r.stats.path_rd_bytes[0].fetch_sub(8 << 20, Ordering::Relaxed);
+            // Now the count leads: the 1 MiB read goes to the empty path 0;
+            // then both hold one command, and the 128k read goes to path 1
+            // (fewer bytes), and the last one to path 0 (fewer commands).
+            for buf in it {
                 rxs.push(request(&r.e, Op::Read, buf));
                 drive_until(&r.exe, Duration::from_millis(20), || false);
             }
-            let per_path: Vec<usize> = (0..2)
-                .map(|path| r.e.core.live().iter().filter(|c| c.path == path).map(|c| c.inflight.borrow().values().map(|p| p.len).sum::<usize>()).sum())
-                .collect();
-            let (big_path, other) = if per_path[0] >= 1 << 20 { (0, 1) } else { (1, 0) };
-            assert_eq!(per_path[big_path], 1 << 20, "the 1 MiB read's path takes nothing else: {per_path:?}");
-            assert_eq!(per_path[other], 4 * 128 * 1024, "{per_path:?}");
-            assert_eq!(r.stats.path_rd_bytes[big_path].load(Ordering::Relaxed), 1 << 20);
+            assert_eq!(per_path(), vec![(1 << 20) + 128 * 1024, 2 * 128 * 1024]);
+            assert_eq!(r.stats.path_rd_bytes[1].load(Ordering::Relaxed), 2 * 128 * 1024);
             for rx in rxs {
                 assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()));
             }
