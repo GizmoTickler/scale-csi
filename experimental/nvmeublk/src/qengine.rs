@@ -145,7 +145,7 @@ static LINK_HDR: std::sync::LazyLock<bool> =
 
 
 /// Byte-balanced path choice for bulk commands (design doc §4.4 L6;
-/// NVMEUBLK_BYTE_PATH, default on; 0 = least-outstanding by count). A
+/// NVMEUBLK_BYTE_PATH=1; default off, see below). A
 /// command with more than SMALL_IO bytes of payload goes to this engine's
 /// connection with the fewest commands, and among those (at depth usually
 /// several) to the path with the fewest payload bytes in flight in its
@@ -157,8 +157,25 @@ static LINK_HDR: std::sync::LazyLock<bool> =
 /// siblings idled (one connection receives one PDU at a time, on one
 /// thread): single-stream 1M read QD16 fell from 4,242 to 2,899 MiB/s. Batch
 /// affinity (BATCH_SLACK) does not apply to bulk commands.
+/// Off by default: as a tie-break it still balanced the paths (spread 5% vs
+/// 21%) but did not gain throughput anywhere, and 1M read QD16 came out at
+/// 3,190 vs 4,093 MiB/s (run l6b-20260927T042210Z). Kept for the balance.
 static BYTE_PATH: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_BYTE_PATH").map_or(true, |v| v != "0"));
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_BYTE_PATH").is_ok_and(|v| v != "0"));
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: byte balance on for this thread, whatever the environment.
+    static FORCE_BYTE_PATH: Cell<bool> = const { Cell::new(false) };
+}
+
+fn byte_path() -> bool {
+    #[cfg(test)]
+    if FORCE_BYTE_PATH.with(|f| f.get()) {
+        return true;
+    }
+    *BYTE_PATH
+}
 
 /// Most paths the per-path counters cover.
 pub const MAX_PATHS: usize = 8;
@@ -1047,7 +1064,7 @@ impl Engine {
         // Bulk commands: byte balance (see BYTE_PATH); the rest: fewest
         // outstanding.
         let small = p.len <= SMALL_IO;
-        let bulk_bytes = *BYTE_PATH && !small;
+        let bulk_bytes = byte_path() && !small;
         live.sort_by_key(|c| {
             let n = c.inflight.borrow().len();
             if bulk_bytes {
@@ -3120,6 +3137,8 @@ mod tests {
         let a = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(1500), ..Default::default() }).unwrap();
         let b = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(1500), ..Default::default() }).unwrap();
         on_ring_thread(move || {
+            FORCE_BYTE_PATH.with(|f| f.set(true));
+            assert!(!*BYTE_PATH || std::env::var_os("NVMEUBLK_BYTE_PATH").is_some(), "off by default");
             let r = rig_paths(&[&a, &b], "byte-path", Duration::from_secs(20));
             r.e.start();
             assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
