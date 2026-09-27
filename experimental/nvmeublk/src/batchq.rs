@@ -120,6 +120,17 @@ pub struct HotLane {
     /// A primary neither turning nor sleeping this long is replaced
     /// (NVMEUBLK_HOT_WEDGE_MS, default 1000).
     pub wedge: Duration,
+    /// Depth mode while the queue's requests are small (see `small_bytes`):
+    /// the run length instead of `deep_lease` (NVMEUBLK_HOT_DEEP_LEASE_SMALL,
+    /// default 4). Runs of 4 small requests put a turn's commands in one send
+    /// and rotate the fetch half as often: read 4k 64:8 +33%, randread 4k
+    /// 16:1 +11% (run gD); runs of 4 cost 1M read QD16 x1 17%, and 8 or 16
+    /// collapsed 4k 16:1 to 29-36k IOPS.
+    pub deep_lease_small: u16,
+    /// A queue's requests are small while the moving average of their size
+    /// is at most this many bytes (NVMEUBLK_HOT_SMALL_BYTES, default 8192);
+    /// they stop being small above twice that.
+    pub small_bytes: u32,
     /// Whether the shallow primary spins while hot (NVMEUBLK_HOT_SPIN,
     /// default on). Off: it sleeps in its ring between events, like a
     /// secondary with nothing held, and relies on the guest halt-poll
@@ -129,7 +140,7 @@ pub struct HotLane {
 
 impl Default for HotLane {
     fn default() -> Self {
-        HotLane { lease: 4, secondary: 4, deep_lease: 2, deep_spin: false, wedge: Duration::from_millis(1000), primary_spin: true }
+        HotLane { lease: 4, secondary: 4, deep_lease: 2, deep_spin: false, wedge: Duration::from_millis(1000), primary_spin: true, deep_lease_small: 4, small_bytes: 8192 }
     }
 }
 
@@ -143,6 +154,8 @@ impl HotLane {
             deep_spin: env_u64("NVMEUBLK_HOT_DEEP_SPIN", d.deep_spin as u64) != 0,
             wedge: Duration::from_millis(env_u64("NVMEUBLK_HOT_WEDGE_MS", d.wedge.as_millis() as u64).max(10)),
             primary_spin: env_u64("NVMEUBLK_HOT_SPIN", d.primary_spin as u64) != 0,
+            deep_lease_small: env_u64("NVMEUBLK_HOT_DEEP_LEASE_SMALL", d.deep_lease_small as u64).clamp(1, u16::MAX as u64) as u16,
+            small_bytes: env_u64("NVMEUBLK_HOT_SMALL_BYTES", d.small_bytes as u64).min(u32::MAX as u64 / 2) as u32,
         }
     }
 
@@ -157,10 +170,17 @@ impl HotLane {
     /// all its threads in runs of `deep_lease` requests; the cap still leaves
     /// `lease` tags that one (possibly wedged) thread can never take.
     pub fn credits(&self, primary: bool, deep: bool, depth: u16) -> (u16, u16, bool) {
+        self.credits_sized(primary, deep, false, depth)
+    }
+
+    /// As `credits`, for a queue whose requests are small (`small`: depth
+    /// mode runs `deep_lease_small` long instead of `deep_lease`).
+    pub fn credits_sized(&self, primary: bool, deep: bool, small: bool, depth: u16) -> (u16, u16, bool) {
         let depth = depth.max(2);
         let lease = self.lease.clamp(1, depth - 1);
         if deep {
-            (depth - lease, self.deep_lease.clamp(1, depth - lease), false)
+            let run = if small { self.deep_lease_small } else { self.deep_lease };
+            (depth - lease, run.clamp(1, depth - lease), false)
         } else if primary {
             (depth - lease, lease, true)
         } else {
@@ -174,6 +194,12 @@ impl HotLane {
     pub fn next_deep(&self, deep: bool, held: u32) -> bool {
         let lease = self.lease.max(1) as u32;
         if deep { held > lease / 2 } else { held > lease }
+    }
+
+    /// Size-class hysteresis: the queue's moving average request size is
+    /// `avg` bytes; `small` is the class now.
+    pub fn next_small(&self, small: bool, avg: u32) -> bool {
+        if small { avg <= self.small_bytes.saturating_mul(2) } else { avg <= self.small_bytes }
     }
 
     /// Whether a request's byte weight counts against this thread's cap:
@@ -278,6 +304,10 @@ pub struct QueueShared {
     /// and whether the queue is in depth mode.
     held: AtomicU32,
     deep: AtomicBool,
+    /// Moving average (1/8) of the size of the requests the queue's threads
+    /// fetch, in bytes, and the size class it gives (HotLane::next_small).
+    avg_bytes: AtomicU32,
+    small: AtomicBool,
 }
 
 impl Default for QueueShared {
@@ -291,7 +321,7 @@ impl QueueShared {
     pub fn new(threads: u16) -> Self {
         let now = mono_ns();
         let beats = (0..threads.max(1)).map(|_| Beat { at_ns: AtomicU64::new(now), waiting: AtomicBool::new(false) }).collect();
-        QueueShared { st: Mutex::new(Prep::Waiting), cv: Condvar::new(), primary: AtomicU16::new(0), beats, held: AtomicU32::new(0), deep: AtomicBool::new(false) }
+        QueueShared { st: Mutex::new(Prep::Waiting), cv: Condvar::new(), primary: AtomicU16::new(0), beats, held: AtomicU32::new(0), deep: AtomicBool::new(false), avg_bytes: AtomicU32::new(0), small: AtomicBool::new(true) }
     }
 
     fn beat(&self, thread: u16, waiting: bool) {
@@ -314,6 +344,28 @@ impl QueueShared {
         } else {
             self.held.fetch_sub(was - now, Ordering::AcqRel) - (was - now)
         }
+    }
+
+    /// Fold the sizes of requests just fetched into the queue's average and
+    /// return its size class. Lossy under races between threads, which only
+    /// delays the average a little.
+    fn note_sizes(&self, hot: &HotLane, bytes: impl Iterator<Item = u64>) -> bool {
+        let mut avg = self.avg_bytes.load(Ordering::Relaxed) as u64;
+        let mut any = false;
+        for b in bytes {
+            avg = avg - avg / 8 + b.min(u32::MAX as u64) / 8;
+            any = true;
+        }
+        let small = self.small.load(Ordering::Relaxed);
+        if !any {
+            return small;
+        }
+        self.avg_bytes.store(avg.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+        let next = hot.next_small(small, avg as u32);
+        if next != small {
+            self.small.store(next, Ordering::Relaxed);
+        }
+        next
     }
 
     /// The queue's mode after its threads' held total became `held`.
@@ -520,6 +572,8 @@ pub fn queue_fn(
     // and the held count it last published to the queue's total.
     let mut deep = false;
     let mut published_held = 0usize;
+    // The credit policy this thread last applied (hot lane).
+    let mut applied = hot.as_ref().map(|h| h.credits(is_primary, false, depth));
     let mut pending: Vec<UblkBatchCompletion> = Vec::with_capacity(depth as usize);
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(dev.tgt.cq_depth as usize);
     let mut arrived: Vec<u16> = Vec::with_capacity(depth as usize);
@@ -554,7 +608,7 @@ pub fn queue_fn(
             }
         }
         if let Some(h) = &hot {
-            if let Err(e) = follow_depth(&mut batch, &shared, h, is_primary, &mut deep, &mut published_held, depth) {
+            if let Err(e) = follow_depth(&mut batch, &shared, h, is_primary, &mut deep, &mut published_held, &mut applied, depth) {
                 log::error!("ublk device {dev_id} queue {qid} thread {thread}: credit policy change failed: {e}");
                 break;
             }
@@ -606,7 +660,8 @@ pub fn queue_fn(
             let now_primary = shared.primary() == thread;
             if now_primary != is_primary {
                 is_primary = now_primary;
-                let (cap, lease, refill) = h.credits(is_primary, deep, depth);
+                let (cap, lease, refill) = h.credits_sized(is_primary, deep, shared.small.load(Ordering::Relaxed), depth);
+                applied = Some((cap, lease, refill));
                 if let Err(e) = batch.set_credit_policy(cap, lease, refill) {
                     log::error!("ublk device {dev_id} queue {qid} thread {thread}: role change failed: {e}");
                     break;
@@ -684,7 +739,8 @@ pub fn queue_fn(
         // (before the credits are settled), and only the shallow primary
         // weighs requests (HotLane::weighs).
         if let Some(h) = &hot {
-            if let Err(e) = follow_depth(&mut batch, &shared, h, is_primary, &mut deep, &mut published_held, depth) {
+            shared.note_sizes(h, arrived.iter().map(|&t| (q_rc.get_iod(t).nr_sectors as u64) << 9));
+            if let Err(e) = follow_depth(&mut batch, &shared, h, is_primary, &mut deep, &mut published_held, &mut applied, depth) {
                 failed.get_or_insert(e);
             }
         }
@@ -727,9 +783,10 @@ pub fn queue_fn(
 }
 
 /// Hot lane: publish what this thread holds to its queue's total, follow the
-/// queue's mode, and switch this thread's credit policy when the mode
-/// changed.
-fn follow_depth(batch: &mut UblkBatchQueue, shared: &QueueShared, h: &HotLane, primary: bool, deep: &mut bool, published: &mut usize, depth: u16) -> Result<(), libublk::UblkError> {
+/// queue's mode and size class, and switch this thread's credit policy when
+/// they call for a different one than it last applied.
+#[allow(clippy::too_many_arguments)]
+fn follow_depth(batch: &mut UblkBatchQueue, shared: &QueueShared, h: &HotLane, primary: bool, deep: &mut bool, published: &mut usize, applied: &mut Option<(u16, u16, bool)>, depth: u16) -> Result<(), libublk::UblkError> {
     let held = batch.owned_tag_count();
     let total = if held != *published {
         let t = shared.publish_held(*published, held);
@@ -738,11 +795,11 @@ fn follow_depth(batch: &mut UblkBatchQueue, shared: &QueueShared, h: &HotLane, p
     } else {
         shared.held.load(Ordering::Acquire)
     };
-    let next = shared.update_deep(h, total);
-    if next != *deep {
-        *deep = next;
-        let (cap, lease, refill) = h.credits(primary, next, depth);
-        batch.set_credit_policy(cap, lease, refill)?;
+    *deep = shared.update_deep(h, total);
+    let want = h.credits_sized(primary, *deep, shared.small.load(Ordering::Relaxed), depth);
+    if *applied != Some(want) {
+        *applied = Some(want);
+        batch.set_credit_policy(want.0, want.1, want.2)?;
     }
     Ok(())
 }
@@ -846,6 +903,31 @@ mod tests {
         // The run never exceeds the cap.
         let h = HotLane { lease: 60, deep_lease: 50, ..h };
         assert_eq!(h.credits(false, true, 64), (4, 4, false));
+    }
+
+    /// Depth mode runs follow the queue's request size: runs of
+    /// `deep_lease_small` (4) while the average is small, `deep_lease` (2)
+    /// otherwise; shallow credits do not depend on size.
+    #[test]
+    fn depth_mode_runs_follow_request_size() {
+        let h = HotLane::default();
+        assert_eq!((h.deep_lease, h.deep_lease_small, h.small_bytes), (2, 4, 8192));
+        assert_eq!(h.credits_sized(true, true, true, 256), (252, 4, false));
+        assert_eq!(h.credits_sized(false, true, true, 256), (252, 4, false));
+        assert_eq!(h.credits_sized(false, true, false, 256), (252, 2, false));
+        assert_eq!(h.credits_sized(true, false, true, 256), h.credits(true, false, 256), "shallow: size does not matter");
+        assert_eq!(h.credits_sized(false, false, true, 256), h.credits(false, false, 256));
+        // Hysteresis: small at <= 8 KiB, large above 16 KiB.
+        assert!(h.next_small(false, 8192) && !h.next_small(false, 8193));
+        assert!(h.next_small(true, 16384) && !h.next_small(true, 16385));
+        // The queue's average: 4k requests are small, a run of 1 MiB ones is not,
+        // and a lone 16k request among 4k ones does not flip it.
+        let q = QueueShared::new(4);
+        assert!(q.note_sizes(&h, std::iter::repeat(4096).take(32)));
+        assert!(q.note_sizes(&h, std::iter::once(16384)));
+        assert!(!q.note_sizes(&h, std::iter::repeat(1 << 20).take(4)));
+        assert!(!q.note_sizes(&h, std::iter::empty()), "nothing fetched: unchanged");
+        assert!(q.note_sizes(&h, std::iter::repeat(4096).take(64)), "back to small after a run of 4k");
     }
 
     #[test]
