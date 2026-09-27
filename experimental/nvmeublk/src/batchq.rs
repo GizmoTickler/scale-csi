@@ -112,8 +112,10 @@ pub struct HotLane {
     /// queue rotates over all its threads in runs of this many, as the
     /// per-tag layout's tag chunks do.
     pub deep_lease: u16,
-    /// Depth mode: the primary keeps its warm-window spin (NVMEUBLK_HOT_DEEP_SPIN,
-    /// default off: at depth completions arrive faster than a sleep costs).
+    /// Depth mode: threads holding requests keep polling for NVMEUBLK_SPIN_US
+    /// after their last event, as the per-tag loop does
+    /// (NVMEUBLK_HOT_DEEP_SPIN, default off: at depth completions arrive
+    /// faster than a sleep costs).
     pub deep_spin: bool,
     /// A primary neither turning nor sleeping this long is replaced
     /// (NVMEUBLK_HOT_WEDGE_MS, default 1000).
@@ -178,16 +180,29 @@ impl HotLane {
     }
 
     /// Whether this thread polls its ring without sleeping this turn.
-    /// Primary: while it has commands on the wire or is within the warm
-    /// window after the last one, but not in depth mode (unless deep_spin).
-    /// Secondary: only while shallow, holding requests and within
-    /// `spin_us` of its last event.
-    pub fn spins(&self, primary: bool, deep: bool, busy_or_warm: bool, holding: bool, recent_event: bool) -> bool {
-        if deep && !self.deep_spin {
-            return false;
+    /// Shallow primary: while hot (`primary_hot`). Shallow secondary: while
+    /// holding requests and within `spin_us` of its last event. Depth mode:
+    /// nobody, or with deep_spin every thread by the secondary rule.
+    pub fn spins(&self, primary: bool, deep: bool, hot: bool, holding: bool, recent_event: bool) -> bool {
+        if deep {
+            return self.deep_spin && holding && recent_event;
         }
-        if primary { busy_or_warm } else { !deep && holding && recent_event }
+        if primary { hot } else { holding && recent_event }
     }
+}
+
+/// The shallow primary is hot (spins) while it has commands on the wire and
+/// saw an event within `spin_cap` (so a command that takes milliseconds, a
+/// flush say, does not keep a core spinning for all of it), and for the warm
+/// window after the wire went empty.
+pub fn primary_hot(on_wire: bool, since_event: Duration, since_busy: Duration, rtt: Option<Duration>) -> bool {
+    if on_wire { since_event < spin_cap(rtt) } else { since_busy < warm_window(rtt) }
+}
+
+/// How long a primary with commands on the wire keeps spinning without an
+/// event: 4 x the warm window, at most 1 ms.
+pub fn spin_cap(rtt: Option<Duration>) -> Duration {
+    (warm_window(rtt) * 4).min(Duration::from_millis(1))
 }
 
 /// How long the primary keeps polling after its last command on the wire:
@@ -594,9 +609,9 @@ pub fn queue_fn(
                 if on_wire {
                     last_busy = Instant::now();
                 }
-                let warm = on_wire || last_busy.elapsed() < warm_window(engine.wire_rtt());
+                let hot = primary_hot(on_wire, last_event.elapsed(), last_busy.elapsed(), engine.wire_rtt());
                 let holding = on_wire || batch.owned_tag_count() > 0;
-                h.spins(is_primary, deep, warm, holding, !spin.is_zero() && last_event.elapsed() < spin)
+                h.spins(is_primary, deep, hot, holding, !spin.is_zero() && last_event.elapsed() < spin)
             }
             None => !spin.is_zero() && (spin_idle || engine.inflight_here() > 0 || batch.owned_tag_count() > 0) && last_event.elapsed() < spin,
         };
@@ -857,8 +872,24 @@ mod tests {
         assert!(!h.spins(true, true, true, true, true));
         assert!(!h.spins(false, true, true, true, true));
         let h = HotLane { deep_spin: true, ..h };
-        assert!(h.spins(true, true, true, true, true));
-        assert!(!h.spins(false, true, true, true, true), "deep_spin keeps only the primary spinning");
+        assert!(h.spins(true, true, false, true, true), "deep_spin: every thread holding requests, as per-tag");
+        assert!(h.spins(false, true, false, true, true));
+        assert!(!h.spins(false, true, true, false, true));
+        assert!(!h.spins(true, true, true, true, false), "no event within spin_us: sleep");
+    }
+
+    /// A primary waiting on a slow command (a flush: milliseconds) stops
+    /// spinning ~1 ms after its last event; a normal round trip keeps it hot.
+    #[test]
+    fn a_slow_command_does_not_keep_the_primary_spinning() {
+        let rtt = Some(Duration::from_micros(160));
+        let us = Duration::from_micros;
+        assert_eq!(spin_cap(rtt), us(960));
+        assert_eq!(spin_cap(Some(Duration::from_millis(3))), Duration::from_millis(1));
+        assert!(primary_hot(true, us(500), us(0), rtt), "within a normal round trip");
+        assert!(!primary_hot(true, us(1500), us(0), rtt), "1.5 ms without an event on one command");
+        assert!(primary_hot(false, us(5000), us(200), rtt), "warm window after the wire went empty");
+        assert!(!primary_hot(false, us(5000), us(300), rtt));
     }
 
     #[test]
