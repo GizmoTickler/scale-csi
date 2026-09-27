@@ -69,7 +69,7 @@
 
 use crate::{ctrls, env_u64, qengine, serve_request, setup_queue_ring};
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue, UblkDev, UblkQueue};
+use libublk::io::{UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue, UblkDev, UblkQueue, UblkSharedSlot};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -400,6 +400,26 @@ impl QueueShared {
         self.cv.notify_all();
     }
 
+    /// Whether thread 0 has prepared the queue (Some(true)), failed
+    /// (Some(false)), or not yet (None) by `deadline`, waiting until one of
+    /// them or until the bring-up is abandoned.
+    pub fn prepared_by(&self, abandoned: &AtomicBool, deadline: Instant) -> Option<bool> {
+        let mut st = self.st.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            match &*st {
+                Prep::Ready(_) => return Some(true),
+                Prep::Failed => return Some(false),
+                Prep::Waiting if abandoned.load(Ordering::Acquire) => return Some(false),
+                Prep::Waiting => {}
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            st = self.cv.wait_timeout(st, left.min(Duration::from_millis(100))).unwrap_or_else(PoisonError::into_inner).0;
+        }
+    }
+
     /// Wait until thread 0 has prepared the queue: Some(its buffers), or
     /// None if it failed or the bring-up was abandoned meanwhile.
     fn wait(&self, abandoned: &AtomicBool) -> Option<Option<SharedBufs>> {
@@ -451,9 +471,549 @@ pub fn hot_batch_config(leader: bool, primary: bool, hot: &HotLane, depth: u16) 
     batch_config(leader, spill, depth).with_lease_tags(lease).with_refill(refill)
 }
 
-/// The batch-mode queue thread: io thread `libublk::io::io_thread_idx()` of
-/// queue `qid`. Same engine, same request path (`serve_request`) as the
-/// per-tag mode; the tags it serves are the ones its own fetch receives.
+/// What one batch-queue tenancy serves and reports to: io thread `thread` of
+/// ublk queue `qid` of a device (the device itself is passed separately).
+pub struct TenancySpec {
+    pub qid: u16,
+    pub thread: u16,
+    pub ctrls: Arc<ctrls::Ctrls>,
+    pub stats: Arc<qengine::Stats>,
+    pub stop: Arc<AtomicBool>,
+    pub draining: Arc<AtomicBool>,
+    pub abandoned: Arc<AtomicBool>,
+    pub cfg: qengine::QConfig,
+    pub shared: Arc<QueueShared>,
+    pub spill: u16,
+    pub hot: Option<HotLane>,
+}
+
+/// One io thread's worth of a batch queue: its multishot fetch on the
+/// queue, its engine (connections), one task per tag, and the hot-lane
+/// state. A host loop drives it: a queue thread of its own (the per-volume
+/// layout, `queue_fn`), or a reactor of the node-wide pool (reactor.rs),
+/// which drives many tenancies of many devices on one ring. The host
+/// polls the ring once for all of them: `before_wait` (commit, credit
+/// policy, watchdog; whether it wants the host to keep polling), `on_cqe`
+/// for each batch CQE of its queue, `after_wait` (hand fetched requests
+/// to their tag tasks, run the executors).
+pub struct Tenancy {
+    // Drop order (declaration order): the tag tasks and their executor,
+    // then the engine (its Drop drives its tasks to their end on this
+    // ring), then the batch transport, the queue, the device.
+    arrive: Vec<smol::channel::Sender<()>>,
+    tasks: Vec<smol::Task<()>>,
+    exe: smol::LocalExecutor<'static>,
+    completions: Rc<RefCell<Vec<UblkBatchCompletion>>>,
+    engine: Rc<qengine::QEngine>,
+    net_exe: Rc<smol::LocalExecutor<'static>>,
+    batch: UblkBatchQueue<'static, 'static>,
+    q: Rc<UblkQueue<'static>>,
+    shared: Arc<QueueShared>,
+    stats: Arc<qengine::Stats>,
+    stop: Arc<AtomicBool>,
+    abandoned: Arc<AtomicBool>,
+    hot: Option<HotLane>,
+    /// Hosted on a pool reactor (a ring shared with other tenancies): the
+    /// fetch cannot be cancelled without the ring, so the tenancy serves
+    /// until the device is stopped (see `before_wait`).
+    pooled: bool,
+    qid: u16,
+    thread: u16,
+    depth: u16,
+    dev_id: i32,
+    is_primary: bool,
+    warm: WarmClock,
+    last_check: Instant,
+    deep: bool,
+    published_held: usize,
+    applied: Option<(u16, u16, bool)>,
+    pending: Vec<UblkBatchCompletion>,
+    arrived: Vec<u16>,
+    seen_tags: u64,
+    seen_spills: u64,
+    seen_events: u64,
+    last_event: Instant,
+    spin: Duration,
+    spin_idle: bool,
+    weight_bytes: u64,
+    /// Errors reported since the tenancy failed (pooled; rate-limited log).
+    failed: Option<u64>,
+    /// Keeps the device alive for a pooled tenancy (a queue thread's device
+    /// is kept by libublk's thread). Last: dropped after the queue.
+    _dev: Option<Arc<UblkDev>>,
+}
+
+/// What the host does with a tenancy after `before_wait`.
+pub enum Next {
+    /// Keep serving; `spin`: poll the ring without sleeping this turn;
+    /// `wedge`: fault injection asks the host to stop turning this long.
+    Serve { spin: bool, wedge: Option<Duration> },
+    /// Done serving (`clean`: its queue stopped and it handed everything
+    /// back, or its bring-up was abandoned); `end` it and drop it.
+    Leave { clean: bool },
+}
+
+impl Tenancy {
+    /// Set the tenancy up on this thread's ring: the queue (on its own ring,
+    /// or at `slot` of a ring shared with other tenancies), the batch
+    /// transport with the hot-lane credits of its role, the engine, the tag
+    /// tasks. Thread 0 of a queue prepares the queue's tags; the others
+    /// wait for it first (their host must not be the one it runs on).
+    ///
+    /// # Safety
+    /// `dev` must outlive the tenancy: a queue thread's device outlives the
+    /// thread; a pooled tenancy passes the Arc it holds in `dev_arc`.
+    pub unsafe fn new(spec: TenancySpec, dev: &'static UblkDev, dev_arc: Option<Arc<UblkDev>>, slot: Option<UblkSharedSlot>) -> Option<Tenancy> {
+        let TenancySpec { qid, thread, ctrls, stats, stop, draining, abandoned, cfg, shared, spill, hot } = spec;
+        let leader = thread == 0;
+        shared.beat(thread, false);
+        let report = PrepReport { shared: leader.then_some(&*shared) };
+        let dev_id = dev.dev_info.dev_id as i32;
+        let q = match slot {
+            Some(s) => UblkQueue::new_shared(qid, dev, thread, s),
+            None => UblkQueue::new_for_thread(qid, dev, thread),
+        };
+        let q_rc: Rc<UblkQueue<'static>> = match q {
+            Ok(q) => Rc::new(q),
+            Err(e) => {
+                log::error!("ublk device {dev_id} queue {qid} thread {thread}: queue setup failed: {e}");
+                return None;
+            }
+        };
+        let depth = dev.dev_info.queue_depth;
+        let copying = dev.dev_info.flags & NO_MAP_IO == 0;
+        let bufs: Option<SharedBufs> = if leader {
+            copying.then(|| Arc::new(dev.alloc_queue_io_bufs()))
+        } else {
+            match shared.wait(&abandoned) {
+                Some(b) => b,
+                None => {
+                    log::error!("ublk device {dev_id} queue {qid} thread {thread}: thread 0 did not prepare the queue; leaving");
+                    return None;
+                }
+            }
+        };
+        if copying && bufs.is_none() {
+            log::error!("ublk device {dev_id} queue {qid} thread {thread}: no tag buffers for the copying mode");
+            return None;
+        }
+        let buffers = match &bufs {
+            Some(b) => UblkBatchBuffers::Shared(b.clone()),
+            None => UblkBatchBuffers::None,
+        };
+        let is_primary = hot.is_some() && shared.primary() == thread;
+        let config = match &hot {
+            Some(h) => hot_batch_config(leader, is_primary, h, depth),
+            None => batch_config(leader, spill, depth),
+        };
+        // SAFETY: the queue lives in `q_rc`, which the tenancy keeps and
+        // drops after the batch transport (field order).
+        let qref: &'static UblkQueue<'static> = unsafe { &*Rc::as_ptr(&q_rc) };
+        let batch = match UblkBatchQueue::new(qref, buffers, config) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("ublk device {dev_id} queue {qid} thread {thread}: batch setup failed: {e}");
+                return None;
+            }
+        };
+        report.ready(bufs.clone());
+
+        let shift = ctrls.info.lba_shift;
+        let net_exe: Rc<smol::LocalExecutor<'static>> = Rc::new(smol::LocalExecutor::new());
+        let mut cfg = cfg;
+        let user_copy = dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64 != 0;
+        cfg.cdev_fd = if user_copy { dev.tgt.fds[0] } else { -1 };
+        cfg.path_offset = dev.dev_info.dev_id as usize;
+        let cdev_fd = cfg.cdev_fd;
+        let zc = dev.dev_info.flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0;
+        if zc {
+            cfg.rx_offload = 0;
+        }
+        let eid = qid * dev.io_threads_per_queue() + thread;
+        let engine = qengine::QEngine::new(eid, ctrls, cfg, net_exe.clone(), stats.clone(), stop.clone(), draining);
+        engine.start();
+
+        // One task per tag: any tag may be fetched by this tenancy. A task
+        // sleeps on its tag's channel until the tag is fetched here, serves
+        // the request and queues its result for the next commit.
+        let completions: Rc<RefCell<Vec<UblkBatchCompletion>>> = Rc::new(RefCell::new(Vec::with_capacity(depth as usize)));
+        let exe = smol::LocalExecutor::new();
+        let mut arrive = Vec::with_capacity(depth as usize);
+        let mut tasks = Vec::with_capacity(depth as usize);
+        for tag in 0..depth {
+            let (tx, rx) = smol::channel::bounded::<()>(1);
+            arrive.push(tx);
+            let (q, e, comp) = (q_rc.clone(), engine.clone(), completions.clone());
+            let buf_ptr = bufs.as_ref().map_or(std::ptr::null_mut(), |b| b[tag as usize].as_mut_ptr());
+            tasks.push(exe.spawn(async move {
+                let (done_tx, done_rx) = smol::channel::bounded::<i32>(1);
+                let ucopy = (cdev_fd >= 0).then(|| libublk::io::UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0));
+                while rx.recv().await.is_ok() {
+                    let res = serve_request(&q, tag, &e, shift, cdev_fd, zc, buf_ptr, ucopy, &done_tx, &done_rx).await;
+                    comp.borrow_mut().push(UblkBatchCompletion::new(tag, res));
+                }
+            }));
+        }
+        let applied = hot.as_ref().map(|h| h.credits(is_primary, false, depth));
+        log::info!(
+            "ublk device {dev_id} queue {qid} thread {thread}: batch I/O{}, {}{}",
+            match slot {
+                Some(s) => format!(" on a pool reactor (slot {}, buffers {}+{depth})", s.key, s.buf_base),
+                None => String::new(),
+            },
+            match &hot {
+                Some(_) => format!("hot lane {} (cap {}, lease {}, refill {})", if is_primary { "primary" } else { "secondary" }, batch.config().spill_tags(), batch.config().lease_tags(), batch.config().refill()),
+                None => format!("spill at {} requests", batch.config().spill_tags()),
+            },
+            if leader { " (prepared the queue)" } else { "" }
+        );
+        let now = Instant::now();
+        Some(Tenancy {
+            arrive,
+            tasks,
+            exe,
+            completions,
+            engine,
+            net_exe,
+            batch,
+            q: q_rc,
+            shared,
+            stats,
+            stop,
+            abandoned,
+            hot,
+            pooled: slot.is_some(),
+            qid,
+            thread,
+            depth,
+            dev_id,
+            is_primary,
+            warm: WarmClock::new(now),
+            last_check: now,
+            deep: false,
+            published_held: 0,
+            applied,
+            pending: Vec::with_capacity(depth as usize),
+            arrived: Vec::with_capacity(depth as usize),
+            seen_tags: 0,
+            seen_spills: 0,
+            seen_events: 0,
+            last_event: now,
+            spin: Duration::from_micros(env_u64("NVMEUBLK_SPIN_US", 100)),
+            spin_idle: env_u64("NVMEUBLK_SPIN_IDLE", 1) != 0,
+            weight_bytes: env_u64("NVMEUBLK_BATCH_WEIGHT_KB", 64) << 10,
+            failed: None,
+            _dev: dev_arc,
+        })
+    }
+
+    /// Run the tag tasks and the engine's executors until nothing is
+    /// runnable (QEngine::run_turn), accounted as one loop of the device.
+    pub fn run_ops(&self) {
+        let t0 = Instant::now();
+        self.stats.loops.fetch_add(1, Ordering::Relaxed);
+        let _turn = TurnTimer::new(&self.stats, t0);
+        self.engine.run_turn(&self.exe, &self.net_exe);
+        self.stats.loop_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Stamp this tenancy's heartbeat; `waiting`: its host is about to
+    /// sleep in the ring on purpose (then it is not wedged).
+    pub fn beat(&self, waiting: bool) {
+        self.shared.beat(self.thread, waiting);
+    }
+
+    /// Whether this tenancy's queue is the primary's (hot lane).
+    pub fn is_primary(&self) -> bool {
+        self.is_primary
+    }
+
+    /// Something happened for this tenancy just now (a batch CQE of its
+    /// queue, or its engine received PDUs): the spin rules measure from it.
+    fn note_events(&mut self) {
+        let ev = self.engine.events();
+        if ev != self.seen_events {
+            self.seen_events = ev;
+            self.last_event = Instant::now();
+        }
+    }
+
+    /// A pooled tenancy that failed keeps serving (its fetch stays armed in
+    /// the driver until the device stops) and has its device stopped;
+    /// false for one on a queue thread of its own, which leaves.
+    fn fail(&mut self, what: &str, e: &dyn std::fmt::Display) -> bool {
+        let (dev_id, qid, thread) = (self.dev_id, self.qid, self.thread);
+        if !self.pooled {
+            log::error!("ublk device {dev_id} queue {qid} thread {thread}: {what}: {e}");
+            return false;
+        }
+        let n = self.failed.get_or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            log::error!("ublk device {dev_id} queue {qid} thread {thread}: {what}: {e}; stopping the device");
+            let spawned = crate::device::spawn_op_waiting(&crate::device::OP_LANES, move || match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
+                Ok(c) => {
+                    if let Err(e) = c.kill_dev() {
+                        log::error!("stop ublk device {dev_id} after a tenancy failed: {e}");
+                    }
+                }
+                Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
+            });
+            if let Err(e) = spawned {
+                log::error!("ublk device {dev_id}: no thread to stop it: {e}");
+            }
+        } else if n.is_power_of_two() {
+            log::error!("ublk device {dev_id} queue {qid} thread {thread}: {what}: {e} ({n} errors)");
+        }
+        true
+    }
+
+    /// Before the host polls the ring: commit what the tag tasks produced,
+    /// follow the queue's mode, account, leave if done, and (hot lane) the
+    /// watchdog and this tenancy's role; then whether it wants the host to
+    /// keep polling without sleeping.
+    pub fn before_wait(&mut self) -> Next {
+        let (dev_id, qid, thread) = (self.dev_id, self.qid, self.thread);
+        self.pending.append(&mut self.completions.borrow_mut());
+        if !self.pending.is_empty() {
+            match self.batch.try_submit_completions(&self.pending) {
+                Ok(true) => self.pending.clear(),
+                // Every commit slot is in flight: retried after its CQE.
+                Ok(false) => {}
+                Err(e) => {
+                    if !self.fail("commit failed", &e) {
+                        return Next::Leave { clean: false };
+                    }
+                }
+            }
+        }
+        if let Some(h) = self.hot {
+            if let Err(e) = follow_depth(&mut self.batch, &self.shared, &h, self.is_primary, &mut self.deep, &mut self.published_held, &mut self.applied, self.depth) {
+                if !self.fail("credit policy change failed", &e) {
+                    return Next::Leave { clean: false };
+                }
+            }
+        }
+        let (tags, spills) = (self.batch.fetched_tag_count(), self.batch.spill_count());
+        if tags != self.seen_tags {
+            self.stats.batch_tags.fetch_add(tags - self.seen_tags, Ordering::Relaxed);
+            self.seen_tags = tags;
+        }
+        if spills != self.seen_spills {
+            self.stats.batch_spills.fetch_add(spills - self.seen_spills, Ordering::Relaxed);
+            self.seen_spills = spills;
+        }
+        // A detach, or a bring-up that gave up: a queue thread leaves (its
+        // ring's teardown cancels the fetch, and closing the char device
+        // takes back the requests still held). A pooled tenancy cannot
+        // cancel its fetch without the ring, which it shares: it serves on
+        // until its device is stopped (detach stops it; a bring-up that
+        // gave up deletes it), which ends the fetch.
+        if !self.pooled && self.abandoned.load(Ordering::Acquire) {
+            return Next::Leave { clean: true };
+        }
+        // Stopped: the driver aborted this fetch and every request taken is
+        // committed. Hand the fetch buffers back, then leave.
+        if self.batch.all_fetches_stopped() && self.batch.owned_tag_count() == 0 && self.pending.is_empty() && self.batch.inflight_commit_count() == 0 {
+            match self.batch.try_begin_shutdown() {
+                Ok(_) if self.batch.is_shutdown_complete() => return Next::Leave { clean: true },
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("ublk device {dev_id} queue {qid} thread {thread}: batch shutdown failed: {e}");
+                    return Next::Leave { clean: false };
+                }
+            }
+        }
+        let mut wedge = None;
+        // Hot lane: the watchdog (a few times a second, on any tenancy
+        // whose host is awake anyway), and the role this tenancy has now.
+        if let Some(h) = self.hot {
+            if self.last_check.elapsed() >= Duration::from_millis(250) {
+                self.last_check = Instant::now();
+                if !self.stop.load(Ordering::Acquire) {
+                    if let Some(old) = self.shared.check_primary(thread, h.wedge) {
+                        self.stats.batch_takeovers.fetch_add(1, Ordering::Relaxed);
+                        log::warn!("ublk device {dev_id} queue {qid}: primary thread {old} has not turned its loop for {:?}; thread {thread} takes over", h.wedge);
+                    }
+                }
+            }
+            let now_primary = self.shared.primary() == thread;
+            if now_primary != self.is_primary {
+                self.is_primary = now_primary;
+                let (cap, lease, refill) = h.credits_sized(self.is_primary, self.deep, self.shared.small.load(Ordering::Relaxed), self.depth);
+                self.applied = Some((cap, lease, refill));
+                if let Err(e) = self.batch.set_credit_policy(cap, lease, refill) {
+                    if !self.fail("role change failed", &e) {
+                        return Next::Leave { clean: false };
+                    }
+                }
+                log::info!("ublk device {dev_id} queue {qid} thread {thread}: now the {}", if self.is_primary { "primary" } else { "secondary" });
+            }
+            // Fault injection "wedge <ms>": the primary stops turning (a
+            // pool reactor then stops turning for all its tenancies).
+            if let Some(d) = self.engine.take_wedge() {
+                if self.is_primary {
+                    log::warn!("ublk device {dev_id} queue {qid} thread {thread}: fault injection: primary wedged for {d:?}");
+                    wedge = Some(d);
+                }
+            }
+        }
+        // Wait for events. Hot-lane primary: the warm window; otherwise
+        // adaptive polling as in the per-tag loop.
+        self.note_events();
+        let since_event = self.last_event.elapsed();
+        let recent = !self.spin.is_zero() && since_event < self.spin;
+        let spin = match self.hot {
+            Some(h) => {
+                let on_wire = self.engine.inflight_here() > 0;
+                let hot = self.warm.turn(on_wire, Instant::now(), since_event, self.engine.wire_rtt());
+                let holding = on_wire || self.batch.owned_tag_count() > 0;
+                h.spins(self.is_primary, self.deep, hot, holding, recent)
+            }
+            None => recent && (self.spin_idle || self.engine.inflight_here() > 0 || self.batch.owned_tag_count() > 0),
+        };
+        Next::Serve { spin, wedge }
+    }
+
+    /// A batch CQE of this tenancy's queue (routed by its ring key).
+    pub fn on_cqe(&mut self, cqe: &io_uring::cqueue::Entry) -> Result<(), ()> {
+        self.last_event = Instant::now();
+        let arrived = &mut self.arrived;
+        match self.batch.handle_cqe(cqe, |_, tags| {
+            arrived.extend_from_slice(tags);
+            Ok(())
+        }) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                log::warn!("ublk device {} queue {} thread {}: CQE {:#x} routed here is not this queue's", self.dev_id, self.qid, self.thread, cqe.user_data());
+                Ok(())
+            }
+            Err(e) => {
+                if self.fail("batch transport failed", &e) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        }
+    }
+
+    /// After the host polled the ring and routed its CQEs: follow the
+    /// queue's mode with what the tenancy now holds, weigh and settle
+    /// credits, hand fetched requests to their tag tasks, run the
+    /// executors. Err: leave (not clean).
+    pub fn after_wait(&mut self) -> Result<(), ()> {
+        let (dev_id, qid, thread) = (self.dev_id, self.qid, self.thread);
+        let mut failed: Option<libublk::UblkError> = None;
+        // Weighted spill (NVMEUBLK_BATCH_WEIGHT_KB, default 64; 0 = off): a
+        // request counts one extra credit per WEIGHT_KB of payload, so a
+        // thread holding large requests spills sooner and big transfers
+        // spread over the queue's threads, while small ones stay put. Hot
+        // lane: the queue's mode moves with what its threads now hold
+        // (before the credits are settled), and only the shallow primary
+        // weighs requests (HotLane::weighs).
+        if !self.arrived.is_empty() {
+            if let Some(h) = self.hot {
+                let q = &self.q;
+                self.shared.note_sizes(&h, self.arrived.iter().map(|&t| (q.get_iod(t).nr_sectors as u64) << 9));
+            }
+        }
+        if let Some(h) = self.hot {
+            if let Err(e) = follow_depth(&mut self.batch, &self.shared, &h, self.is_primary, &mut self.deep, &mut self.published_held, &mut self.applied, self.depth) {
+                failed.get_or_insert(e);
+            }
+        }
+        let weigh = self.hot.as_ref().is_none_or(|h| h.weighs(self.is_primary, self.deep));
+        if self.weight_bytes > 0 && weigh {
+            for &tag in self.arrived.iter() {
+                let bytes = (self.q.get_iod(tag).nr_sectors as u64) << 9;
+                let extra = (bytes / self.weight_bytes).min(u16::MAX as u64) as u16;
+                if extra > 0 {
+                    self.batch.add_tag_weight(tag, extra);
+                }
+            }
+        }
+        if let Err(e) = self.batch.settle_credits() {
+            failed.get_or_insert(e);
+        }
+        for tag in self.arrived.drain(..) {
+            if self.arrive[tag as usize].try_send(()).is_err() {
+                log::error!("ublk device {dev_id} queue {qid} thread {thread}: tag {tag} fetched while its task is busy or gone");
+            }
+        }
+        self.run_ops();
+        if let Some(e) = failed {
+            if !self.fail("batch transport failed", &e) {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    /// The tenancy stops serving: report it (a clean leave is not a wedge,
+    /// so no sibling takes over during teardown; an unclean one is, and a
+    /// sibling takes its role) and give back what it held of the queue's
+    /// total.
+    pub fn end(&mut self, clean: bool) {
+        self.shared.beat(self.thread, clean);
+        self.shared.publish_held(self.published_held, 0);
+        self.published_held = 0;
+        log::info!("ublk device {} queue {} thread {}: batch loop ended ({} requests, {} spills)", self.dev_id, self.qid, self.thread, self.batch.fetched_tag_count(), self.batch.spill_count());
+    }
+}
+
+/// Route the CQEs of one poll of this thread's ring: batch CQEs to the
+/// tenancy whose ring key they carry (`deliver(key, cqe)`: None if there is
+/// no such tenancy, else what its `on_cqe` said), SEND_ZC buffer-release
+/// notices dropped, what `other` claims left to it, the rest (engine
+/// futures) woken. Returns (batch CQEs no tenancy claimed, whether a
+/// tenancy's `on_cqe` failed).
+pub fn route_cqes(
+    cqes: &[io_uring::cqueue::Entry],
+    stats: Option<&qengine::Stats>,
+    mut deliver: impl FnMut(u16, &io_uring::cqueue::Entry) -> Option<Result<(), ()>>,
+    mut other: impl FnMut(&io_uring::cqueue::Entry) -> bool,
+) -> (usize, bool) {
+    let (mut unclaimed, mut failed) = (0, false);
+    for cqe in cqes {
+        if let Some(key) = libublk::io::batch_cqe_key(cqe.user_data()) {
+            match deliver(key, cqe) {
+                Some(Ok(())) => {}
+                Some(Err(())) => failed = true,
+                None => unclaimed += 1,
+            }
+            continue;
+        }
+        if other(cqe) {
+            continue;
+        }
+        // A SEND_ZC buffer-release notification carries the send's
+        // user_data, whose future already completed.
+        if io_uring::cqueue::notif(cqe.flags()) {
+            if let Some(s) = stats {
+                s.zc_notif.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        libublk::uring_async::ublk_wake_task(cqe.user_data(), cqe);
+    }
+    (unclaimed, failed)
+}
+
+/// Take the CQEs of this thread's ring (those set aside by synchronous batch
+/// setup or engine shutdown first) into `cqes`.
+pub fn take_cqes(cqes: &mut Vec<io_uring::cqueue::Entry>) {
+    cqes.clear();
+    while let Some(c) = libublk::io::pop_deferred_queue_cqe() {
+        cqes.push(c);
+    }
+    libublk::io::with_task_io_ring_mut(|r| cqes.extend(r.completion()));
+}
+
+/// The batch-mode queue thread (the per-volume layout): io thread
+/// `libublk::io::io_thread_idx()` of queue `qid`, one tenancy on the
+/// thread's own ring. Same engine, same request path (`serve_request`) as
+/// the per-tag mode; the tags it serves are the ones its own fetch receives.
 #[allow(clippy::too_many_arguments)]
 pub fn queue_fn(
     qid: u16,
@@ -469,228 +1029,27 @@ pub fn queue_fn(
     hot: Option<HotLane>,
 ) {
     let thread = libublk::io::io_thread_idx();
-    let leader = thread == 0;
-    shared.beat(thread, false);
-    let report = PrepReport { shared: leader.then_some(&*shared) };
     setup_queue_ring(qid, dev);
-    let q_rc = match UblkQueue::new(qid, dev) {
-        Ok(q) => Rc::new(q),
-        Err(e) => {
-            log::error!("ublk device {} queue {qid} thread {thread}: queue setup failed: {e}", dev.dev_info.dev_id);
-            return;
-        }
-    };
-    let depth = dev.dev_info.queue_depth;
-    let copying = dev.dev_info.flags & NO_MAP_IO == 0;
-    let bufs: Option<SharedBufs> = if leader {
-        copying.then(|| Arc::new(dev.alloc_queue_io_bufs()))
-    } else {
-        match shared.wait(&abandoned) {
-            Some(b) => b,
-            None => {
-                log::error!("ublk device {} queue {qid} thread {thread}: thread 0 did not prepare the queue; leaving", dev.dev_info.dev_id);
-                return;
-            }
-        }
-    };
-    if copying && bufs.is_none() {
-        log::error!("ublk device {} queue {qid} thread {thread}: no tag buffers for the copying mode", dev.dev_info.dev_id);
-        return;
-    }
-    let buffers = match &bufs {
-        Some(b) => UblkBatchBuffers::Shared(b.clone()),
-        None => UblkBatchBuffers::None,
-    };
-    let mut is_primary = hot.is_some() && shared.primary() == thread;
-    let config = match &hot {
-        Some(h) => hot_batch_config(leader, is_primary, h, depth),
-        None => batch_config(leader, spill, depth),
-    };
-    let mut batch = match UblkBatchQueue::new(&q_rc, buffers, config) {
-        Ok(b) => b,
-        Err(e) => {
-            log::error!("ublk device {} queue {qid} thread {thread}: batch setup failed: {e}", dev.dev_info.dev_id);
-            return;
-        }
-    };
-    report.ready(bufs.clone());
-
-    let shift = ctrls.info.lba_shift;
-    let net_exe: Rc<smol::LocalExecutor<'static>> = Rc::new(smol::LocalExecutor::new());
-    let mut cfg = cfg;
-    let user_copy = dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64 != 0;
-    cfg.cdev_fd = if user_copy { dev.tgt.fds[0] } else { -1 };
-    cfg.path_offset = dev.dev_info.dev_id as usize;
-    let cdev_fd = cfg.cdev_fd;
-    let zc = dev.dev_info.flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0;
-    if zc {
-        cfg.rx_offload = 0;
-    }
-    let eid = qid * dev.io_threads_per_queue() + thread;
-    let engine = qengine::QEngine::new(eid, ctrls, cfg, net_exe.clone(), stats.clone(), stop.clone(), draining);
-    engine.start();
-
-    // One task per tag: any tag may be fetched by this thread. A task sleeps
-    // on its tag's channel until the tag is fetched here, serves the request
-    // and queues its result for the next commit.
-    let completions: Rc<RefCell<Vec<UblkBatchCompletion>>> = Rc::new(RefCell::new(Vec::with_capacity(depth as usize)));
-    let exe = smol::LocalExecutor::new();
-    let mut arrive = Vec::with_capacity(depth as usize);
-    let mut tasks = Vec::with_capacity(depth as usize);
-    for tag in 0..depth {
-        let (tx, rx) = smol::channel::bounded::<()>(1);
-        arrive.push(tx);
-        let (q, e, comp) = (q_rc.clone(), engine.clone(), completions.clone());
-        let buf_ptr = bufs.as_ref().map_or(std::ptr::null_mut(), |b| b[tag as usize].as_mut_ptr());
-        tasks.push(exe.spawn(async move {
-            let (done_tx, done_rx) = smol::channel::bounded::<i32>(1);
-            let ucopy = (cdev_fd >= 0).then(|| libublk::io::UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0));
-            while rx.recv().await.is_ok() {
-                let res = serve_request(&q, tag, &e, shift, cdev_fd, zc, buf_ptr, ucopy, &done_tx, &done_rx).await;
-                comp.borrow_mut().push(UblkBatchCompletion::new(tag, res));
-            }
-        }));
-    }
-
-    let run_ops = || {
-        let t0 = Instant::now();
-        stats.loops.fetch_add(1, Ordering::Relaxed);
-        let _turn = TurnTimer::new(&stats, t0);
-        // Tag tasks, then small-class connections, then the rest with the
-        // small class again after each (QEngine::run_turn).
-        engine.run_turn(&exe, &net_exe);
-        stats.loop_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    };
-    let spin = Duration::from_micros(env_u64("NVMEUBLK_SPIN_US", 100));
-    let spin_idle = env_u64("NVMEUBLK_SPIN_IDLE", 1) != 0;
+    let spec = TenancySpec { qid, thread, ctrls, stats: stats.clone(), stop, draining, abandoned, cfg, shared, spill, hot };
+    // SAFETY: libublk's thread holds the device for as long as this
+    // function runs, and the tenancy is dropped before it returns.
+    let dev_static: &'static UblkDev = unsafe { &*(dev as *const UblkDev) };
+    let Some(mut t) = (unsafe { Tenancy::new(spec, dev_static, None, None) }) else { return };
     let timeout = io_uring::types::Timespec::new().sec(20);
-    let weight_bytes = env_u64("NVMEUBLK_BATCH_WEIGHT_KB", 64) << 10;
-    let mut last_event = Instant::now();
-    // Hot lane: the warm-window clock, and the last watchdog check.
-    let mut warm = WarmClock::new(Instant::now());
-    let mut last_check = Instant::now();
-    // Hot lane depth mode (see HotLane::credits): this thread's view of it,
-    // and the held count it last published to the queue's total.
-    let mut deep = false;
-    let mut published_held = 0usize;
-    // The credit policy this thread last applied (hot lane).
-    let mut applied = hot.as_ref().map(|h| h.credits(is_primary, false, depth));
-    let mut pending: Vec<UblkBatchCompletion> = Vec::with_capacity(depth as usize);
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(dev.tgt.cq_depth as usize);
-    let mut arrived: Vec<u16> = Vec::with_capacity(depth as usize);
-    let (mut seen_tags, mut seen_spills) = (0u64, 0u64);
-    let dev_id = dev.dev_info.dev_id;
-    log::info!(
-        "ublk device {dev_id} queue {qid} thread {thread}: batch I/O, {}{}",
-        match &hot {
-            Some(_) => format!("hot lane {} (cap {}, lease {}, refill {})", if is_primary { "primary" } else { "secondary" }, batch.config().spill_tags(), batch.config().lease_tags(), batch.config().refill()),
-            None => format!("spill at {} requests", batch.config().spill_tags()),
-        },
-        if leader { " (prepared the queue)" } else { "" }
-    );
-
-    // A thread that leaves because its queue stopped reports itself as
-    // waiting (not wedged), so no sibling takes over during teardown; one
-    // that leaves on an error does not, and a sibling takes its role.
-    let mut clean_exit = false;
-    run_ops();
-    loop {
-        // Results the tag tasks produced go back to the driver in one commit.
-        pending.append(&mut completions.borrow_mut());
-        if !pending.is_empty() {
-            match batch.try_submit_completions(&pending) {
-                Ok(true) => pending.clear(),
-                // Every commit slot is in flight: retried after its CQE.
-                Ok(false) => {}
-                Err(e) => {
-                    log::error!("ublk device {dev_id} queue {qid} thread {thread}: commit failed: {e}");
-                    break;
-                }
-            }
-        }
-        if let Some(h) = &hot {
-            if let Err(e) = follow_depth(&mut batch, &shared, h, is_primary, &mut deep, &mut published_held, &mut applied, depth) {
-                log::error!("ublk device {dev_id} queue {qid} thread {thread}: credit policy change failed: {e}");
-                break;
-            }
-        }
-        let (tags, spills) = (batch.fetched_tag_count(), batch.spill_count());
-        if tags != seen_tags {
-            stats.batch_tags.fetch_add(tags - seen_tags, Ordering::Relaxed);
-            seen_tags = tags;
-        }
-        if spills != seen_spills {
-            stats.batch_spills.fetch_add(spills - seen_spills, Ordering::Relaxed);
-            seen_spills = spills;
-        }
-        // A detach, or a bring-up that gave up: leave; the ring's teardown
-        // cancels the fetch, and closing the char device takes back the
-        // requests still held.
-        if abandoned.load(Ordering::Acquire) {
-            clean_exit = true;
-            break;
-        }
-        // Stopped: the driver aborted this thread's fetch and every request
-        // it had taken is committed. Hand the fetch buffers back, then leave.
-        if batch.all_fetches_stopped() && batch.owned_tag_count() == 0 && pending.is_empty() && batch.inflight_commit_count() == 0 {
-            match batch.try_begin_shutdown() {
-                Ok(_) if batch.is_shutdown_complete() => {
-                    clean_exit = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("ublk device {dev_id} queue {qid} thread {thread}: batch shutdown failed: {e}");
-                    break;
-                }
-            }
-        }
-
-        // Hot lane: the watchdog (a few times a second, on any thread that
-        // is awake anyway), and the role this thread has now.
-        if let Some(h) = &hot {
-            if last_check.elapsed() >= Duration::from_millis(250) {
-                last_check = Instant::now();
-                if !stop.load(Ordering::Acquire) {
-                    if let Some(old) = shared.check_primary(thread, h.wedge) {
-                        stats.batch_takeovers.fetch_add(1, Ordering::Relaxed);
-                        log::warn!("ublk device {dev_id} queue {qid}: primary thread {old} has not turned its loop for {:?}; thread {thread} takes over", h.wedge);
-                    }
-                }
-            }
-            let now_primary = shared.primary() == thread;
-            if now_primary != is_primary {
-                is_primary = now_primary;
-                let (cap, lease, refill) = h.credits_sized(is_primary, deep, shared.small.load(Ordering::Relaxed), depth);
-                applied = Some((cap, lease, refill));
-                if let Err(e) = batch.set_credit_policy(cap, lease, refill) {
-                    log::error!("ublk device {dev_id} queue {qid} thread {thread}: role change failed: {e}");
-                    break;
-                }
-                log::info!("ublk device {dev_id} queue {qid} thread {thread}: now the {}", if is_primary { "primary" } else { "secondary" });
-            }
-            // Fault injection "wedge <ms>": the primary stops turning.
-            if let Some(d) = engine.take_wedge() {
-                if is_primary {
-                    log::warn!("ublk device {dev_id} queue {qid} thread {thread}: fault injection: primary wedged for {d:?}");
+    t.run_ops();
+    let clean = loop {
+        let spinning = match t.before_wait() {
+            Next::Leave { clean } => break clean,
+            Next::Serve { spin, wedge } => {
+                if let Some(d) = wedge {
                     std::thread::sleep(d);
                 }
+                spin
             }
-        }
-
-        // Wait for events. Hot-lane primary: the warm window; otherwise
-        // adaptive polling as in the per-tag loop.
-        let spinning = match &hot {
-            Some(h) => {
-                let on_wire = engine.inflight_here() > 0;
-                let hot = warm.turn(on_wire, Instant::now(), last_event.elapsed(), engine.wire_rtt());
-                let holding = on_wire || batch.owned_tag_count() > 0;
-                h.spins(is_primary, deep, hot, holding, !spin.is_zero() && last_event.elapsed() < spin)
-            }
-            None => !spin.is_zero() && (spin_idle || engine.inflight_here() > 0 || batch.owned_tag_count() > 0) && last_event.elapsed() < spin,
         };
         if !spinning {
-            shared.beat(thread, true);
+            t.beat(true);
         }
         // A non-sleeping poll is all task work (inline receive copies,
         // commits): it counts as one turn.
@@ -698,89 +1057,20 @@ pub fn queue_fn(
             let _turn = spinning.then(|| TurnTimer::new(&stats, Instant::now()));
             poll(if spinning { 0 } else { 1 }, &timeout)
         };
-        shared.beat(thread, false);
+        t.beat(false);
         if let Err(e) = polled {
-            log::error!("ublk device {dev_id} queue {qid} thread {thread}: event loop failed: {e}");
-            break;
+            log::error!("ublk device {} queue {qid} thread {thread}: event loop failed: {e}", dev.dev_info.dev_id);
+            break false;
         }
-        cqes.clear();
-        while let Some(c) = libublk::io::pop_deferred_queue_cqe() {
-            cqes.push(c);
+        take_cqes(&mut cqes);
+        let key = t.q.ring_key();
+        let (_, failed) = route_cqes(&cqes, Some(&stats), |k, c| (k == key).then(|| t.on_cqe(c)), |_| false);
+        if failed || t.after_wait().is_err() {
+            break false;
         }
-        libublk::io::with_task_io_ring_mut(|r| cqes.extend(r.completion()));
-        if !cqes.is_empty() {
-            last_event = Instant::now();
-        }
-        let mut failed = None;
-        for cqe in &cqes {
-            match batch.handle_cqe(cqe, |_, tags| {
-                arrived.extend_from_slice(tags);
-                Ok(())
-            }) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // A SEND_ZC buffer-release notification carries the
-                    // send's user_data, whose future already completed.
-                    if io_uring::cqueue::notif(cqe.flags()) {
-                        stats.zc_notif.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    libublk::uring_async::ublk_wake_task(cqe.user_data(), cqe);
-                }
-                Err(e) => {
-                    failed.get_or_insert(e);
-                }
-            }
-        }
-        // Weighted spill (NVMEUBLK_BATCH_WEIGHT_KB, default 64; 0 = off):
-        // a request counts one extra credit per WEIGHT_KB of payload, so a
-        // thread holding large requests spills sooner and big transfers
-        // spread over the queue's threads, while small ones stay put.
-        // Hot lane: the queue's mode moves with what its threads now hold
-        // (before the credits are settled), and only the shallow primary
-        // weighs requests (HotLane::weighs).
-        if let Some(h) = &hot {
-            shared.note_sizes(h, arrived.iter().map(|&t| (q_rc.get_iod(t).nr_sectors as u64) << 9));
-            if let Err(e) = follow_depth(&mut batch, &shared, h, is_primary, &mut deep, &mut published_held, &mut applied, depth) {
-                failed.get_or_insert(e);
-            }
-        }
-        let weigh = hot.as_ref().is_none_or(|h| h.weighs(is_primary, deep));
-        if weight_bytes > 0 && weigh {
-            for &tag in arrived.iter() {
-                let bytes = (q_rc.get_iod(tag).nr_sectors as u64) << 9;
-                let extra = (bytes / weight_bytes).min(u16::MAX as u64) as u16;
-                if extra > 0 {
-                    batch.add_tag_weight(tag, extra);
-                }
-            }
-        }
-        if let Err(e) = batch.settle_credits() {
-            failed.get_or_insert(e);
-        }
-        for tag in arrived.drain(..) {
-            if arrive[tag as usize].try_send(()).is_err() {
-                log::error!("ublk device {dev_id} queue {qid} thread {thread}: tag {tag} fetched while its task is busy or gone");
-            }
-        }
-        run_ops();
-        if let Some(e) = failed {
-            log::error!("ublk device {dev_id} queue {qid} thread {thread}: batch transport failed: {e}");
-            break;
-        }
-    }
-    shared.beat(thread, clean_exit);
-    shared.publish_held(published_held, 0);
-    log::info!("ublk device {dev_id} queue {qid} thread {thread}: batch loop ended ({} requests, {} spills)", batch.fetched_tag_count(), batch.spill_count());
-    // Drop order: the tag tasks and their executor, then the engine (its
-    // Drop drives its tasks to their end on this ring), then the batch
-    // transport and the queue.
-    drop(arrive);
-    drop(tasks);
-    drop(exe);
-    drop(engine);
-    drop(net_exe);
-    drop(batch);
+    };
+    t.end(clean);
+    drop(t);
 }
 
 /// Hot lane: publish what this thread holds to its queue's total, follow the
@@ -828,7 +1118,7 @@ impl Drop for TurnTimer<'_> {
 }
 
 /// Submit what is queued and wait for `wait` completions at most `timeout`.
-fn poll(wait: usize, timeout: &io_uring::types::Timespec) -> std::io::Result<()> {
+pub fn poll(wait: usize, timeout: &io_uring::types::Timespec) -> std::io::Result<()> {
     libublk::io::with_task_io_ring_mut(|r| {
         let args = io_uring::types::SubmitArgs::new().timespec(timeout);
         match r.submitter().submit_with_args(wait, &args) {

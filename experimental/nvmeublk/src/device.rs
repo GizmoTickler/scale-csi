@@ -544,12 +544,12 @@ impl Running {
             Owner::Ended(r) => return r.map_err(|e| (anyhow!("ublk device {} ended on its own: {e}", self.dev_id), detach)),
         };
         if !detach {
-            return retire(s, &self.stop).map_err(|e| (e, false));
+            return retire(s, &self.stop, false).map_err(|e| (e, false));
         }
         let Some(_lane) = OP_LANES.acquire_until(Instant::now() + START_DEADLINE) else {
             return match self.end.put_back(s) {
                 None => Err((anyhow!("ublk device {}: no control lane free within {} s; retry", self.dev_id, START_DEADLINE.as_secs()), true)),
-                Some(s) => retire(s, &self.stop).map_err(|e| (e, false)),
+                Some(s) => retire(s, &self.stop, false).map_err(|e| (e, false)),
             };
         };
         // Never STOP_DEV here, with the queue threads running and the char
@@ -566,7 +566,7 @@ impl Running {
             Ok::<(), std::convert::Infallible>(())
         };
         match stop_or_put_back(&self.end, s, &self.draining, leave) {
-            Stop::Retire(s) => retire(s, &self.stop).map_err(|e| (e, false)),
+            Stop::Retire(s) => retire(s, &self.stop, true).map_err(|e| (e, false)),
             Stop::StillServed(e) => Err((e.context(format!("stop ublk device {}", self.dev_id)), true)),
         }
     }
@@ -650,6 +650,9 @@ impl Running {
 struct Served {
     ctrl: UblkCtrl,
     threads: Option<UblkTargetThreads>,
+    /// Served by tenancies on the reactor pool (reactor.rs): they end only
+    /// when the device is stopped.
+    pooled: bool,
 }
 
 impl Drop for Served {
@@ -747,9 +750,19 @@ fn fault_dir(dev_id: impl std::fmt::Display) -> String {
 
 /// End a device whose queue threads have returned or are returning (it was
 /// stopped, or they failed): wait for them, then delete the device.
-fn retire(mut s: Served, stop: &AtomicBool) -> Result<()> {
+fn retire(mut s: Served, stop: &AtomicBool, detach: bool) -> Result<()> {
     let dev_id = s.ctrl.dev_info().dev_id;
     let Some(threads) = s.threads.take() else { return Ok(()) };
+    if s.pooled && detach {
+        // A detach of a pooled device. Pool tenancies share their rings, so they cannot drop their
+        // fetches by leaving (a queue thread's ring dies with it): STOP ends
+        // them. They keep serving meanwhile, so STOP's wait for the
+        // requests they hold ends (with EIO for parked and fenced I/O, the
+        // device is draining). A device stopped already answers an error.
+        if let Err(e) = s.ctrl.kill_dev() {
+            log::debug!("stop ublk device {dev_id}: {e}");
+        }
+    }
     // Joined with the char device still open: the id stays this device's
     // until `held` is dropped, even if it was deleted from elsewhere.
     let held = match s.ctrl.join_target(threads) {
@@ -985,7 +998,7 @@ impl Drop for QueueExit {
             let stop = self.stop.clone();
             let finish = move |s: Served| {
                 let dev_id = s.ctrl.dev_info().dev_id;
-                let r = retire(s, &stop);
+                let r = retire(s, &stop, false);
                 match &r {
                     Ok(()) => log::warn!("ublk device {dev_id}: its queue threads all returned without a detach; deleted it"),
                     Err(e) => log::error!("ublk device {dev_id}: its queue threads all returned without a detach; deleting it failed: {e:#}"),
@@ -1064,7 +1077,17 @@ fn bring_up(
     let size = info.nsze << info.lba_shift;
     let lba_shift = info.lba_shift as u8;
     let flags = ublk_flags(spec.zero_copy, spec.batch_io);
+    // The node's reactor pool serves hot-lane zero-copy devices (L7); a
+    // recovery follows the process's mode, which may differ from the one the
+    // device was served in before (a device's flags do not depend on it).
+    let pool = if spec.batch_io && spec.hot_lane && spec.zero_copy { crate::reactor::pool() } else { None };
+    let pooled = pool.is_some();
     let threads = spec.threads_per_queue.clamp(1, depth);
+    // A queue's tenancies sit on distinct reactors.
+    let threads = match pool {
+        Some(p) => threads.min(p.reactors() as u16),
+        None => threads,
+    };
     let tag_chunk = spec.tag_chunk.max(1);
     // Several threads per queue need UBLK_F_PER_IO_DAEMON, which the driver
     // advertises by itself (6.16+) and libublk checks after the device is
@@ -1160,37 +1183,44 @@ fn bring_up(
     let batch_shared: Arc<Vec<Arc<batchq::QueueShared>>> = Arc::new((0..queues).map(|_| Arc::new(batchq::QueueShared::new(threads))).collect());
     let batch_spill = spec.batch_spill;
     let hot = spec.hot_lane.then(batchq::HotLane::from_env);
-    let started = ctrl.start_target_until(
-        move |dev: &mut UblkDev| {
-            dev.set_default_params(size);
-            // Whose device this is, for a recovery to check (`owner`).
-            dev.set_target_json(serde_json::json!({ OWNER_KEY: volume }));
-            dev.set_io_tag_chunk(tag_chunk);
-            dev.tgt.params.basic.logical_bs_shift = lba_shift;
-            dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
-            // Room on each queue ring for the network SQEs (recv + writev per
-            // path, timer, reconnect wakeup) next to the ublk commands.
-            dev.tgt.sq_depth = depth * 2 + 64;
-            dev.tgt.cq_depth = depth * 2 + 64;
-            Ok(())
-        },
-        move |qid, dev: &_| {
-            // libublk runs one thread per (queue, io thread); the kernel may
-            // have trimmed the queue count, so count from the device.
-            let total = dev.dev_info.nr_hw_queues as usize * dev.io_threads_per_queue() as usize;
-            let _out = QueueExit { exited: exited.clone(), total, stop: stq.clone(), ctrls: ctrls.clone(), end: eq.clone() };
-            if dev.dev_info.flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0 {
-                let Some(shared) = batch_shared.get(qid as usize).cloned() else {
-                    log::error!("ublk device {} queue {qid}: no batch state for this queue", dev.dev_info.dev_id);
-                    return;
-                };
-                batchq::queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone(), shared, batch_spill, hot)
-            } else {
-                queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone())
-            }
-        },
-        Some(deadline),
-    );
+    let tgt_fn = move |dev: &mut UblkDev| {
+        dev.set_default_params(size);
+        // Whose device this is, for a recovery to check (`owner`).
+        dev.set_target_json(serde_json::json!({ OWNER_KEY: volume }));
+        dev.set_io_tag_chunk(tag_chunk);
+        dev.tgt.params.basic.logical_bs_shift = lba_shift;
+        dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
+        // Room on each queue ring for the network SQEs (recv + writev per
+        // path, timer, reconnect wakeup) next to the ublk commands.
+        dev.tgt.sq_depth = depth * 2 + 64;
+        dev.tgt.cq_depth = depth * 2 + 64;
+        Ok(())
+    };
+    let started = match pool {
+        Some(pool) => {
+            let launch = move |dev: &Arc<UblkDev>| launch_on_pool(pool, dev, &batch_shared, hot, batch_spill, &cfg, &ctrls, &sq, &stq, &drq, &ab, &eq, &exited, deadline);
+            ctrl.start_target_on(tgt_fn, launch, Some(deadline))
+        }
+        None => ctrl.start_target_until(
+            tgt_fn,
+            move |qid, dev: &_| {
+                // libublk runs one thread per (queue, io thread); the kernel may
+                // have trimmed the queue count, so count from the device.
+                let total = dev.dev_info.nr_hw_queues as usize * dev.io_threads_per_queue() as usize;
+                let _out = QueueExit { exited: exited.clone(), total, stop: stq.clone(), ctrls: ctrls.clone(), end: eq.clone() };
+                if dev.dev_info.flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0 {
+                    let Some(shared) = batch_shared.get(qid as usize).cloned() else {
+                        log::error!("ublk device {} queue {qid}: no batch state for this queue", dev.dev_info.dev_id);
+                        return;
+                    };
+                    batchq::queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone(), shared, batch_spill, hot)
+                } else {
+                    queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone())
+                }
+            },
+            Some(deadline),
+        ),
+    };
     let target = match started {
         Ok(t) => t,
         Err(e) => {
@@ -1220,10 +1250,10 @@ fn bring_up(
         }
     };
     log::info!("{}: serving /dev/ublkb{dev_id}", spec.volume);
-    if let Some(s) = end.up(Served { ctrl, threads: Some(target) }) {
+    if let Some(s) = end.up(Served { ctrl, threads: Some(target), pooled }) {
         // Its queue threads all returned during START: it ends on its own,
         // here, on this op thread.
-        let r = retire(s, &stop);
+        let r = retire(s, &stop, false);
         if let Err(e) = &r {
             log::error!("{}: ublk device {dev_id} stopped as it started; deleting it failed: {e:#}", spec.volume);
         } else {
@@ -1232,6 +1262,118 @@ fn bring_up(
         end.ended(r.map_err(|e| format!("{e:#}")));
     }
     Ok(dev_id)
+}
+
+/// Serve every (queue, io thread) of `dev` as a tenancy on the reactor
+/// pool (the `launch` of `UblkCtrl::start_target_on`): each queue's
+/// tenancies on distinct reactors with one buffer range free on all of
+/// them; thread 0 of every queue first (it prepares the queue's tags), the
+/// others once it has, so no reactor ever waits for another. Returns each
+/// tenancy's (queue, reactor tid, latch). A queue that cannot be placed, or
+/// whose thread 0 fails, makes START give up (`note_queue_thread_exit`).
+#[allow(clippy::too_many_arguments)]
+fn launch_on_pool(
+    pool: &'static crate::reactor::Pool,
+    dev: &Arc<UblkDev>,
+    batch_shared: &Arc<Vec<Arc<batchq::QueueShared>>>,
+    hot: Option<batchq::HotLane>,
+    spill: u16,
+    cfg: &qengine::QConfig,
+    ctrls: &Arc<ctrls::Ctrls>,
+    stats: &Arc<qengine::Stats>,
+    stop: &Arc<AtomicBool>,
+    draining: &Arc<AtomicBool>,
+    abandoned: &Arc<AtomicBool>,
+    end: &Arc<Ending<Served>>,
+    exited: &Arc<AtomicUsize>,
+    deadline: Instant,
+) -> Vec<(u16, libc::pid_t, Arc<libublk::ctrl::UblkQueueLatch>)> {
+    let (nq, nt, depth) = (dev.dev_info.nr_hw_queues, dev.io_threads_per_queue(), dev.dev_info.queue_depth);
+    let dev_id = dev.dev_info.dev_id;
+    let total = nq as usize * nt as usize;
+    let placement = pool.place(nq, nt);
+    let mut ranges = Vec::with_capacity(nq as usize);
+    for rs in &placement {
+        match pool.alloc_range(rs, depth) {
+            Some(b) => ranges.push(b),
+            None => {
+                log::error!("ublk device {dev_id}: no buffer range of {depth} slots free on reactors {rs:?}");
+                for (q, rs) in placement.iter().enumerate().take(ranges.len()) {
+                    for &r in rs {
+                        pool.release_range(r, ranges[q], depth);
+                    }
+                }
+                dev.note_queue_thread_exit();
+                return Vec::new();
+            }
+        }
+    }
+    log::info!("ublk device {dev_id}: {nq} queues x {nt} tenancies on reactors {placement:?}, buffer ranges {ranges:?}");
+    let mut out = Vec::with_capacity(total);
+    let mut launch = |q: u16, t: u16| {
+        let r = placement[q as usize][t as usize];
+        let latch = libublk::ctrl::UblkQueueLatch::new();
+        let exit = QueueExit { exited: exited.clone(), total, stop: stop.clone(), ctrls: ctrls.clone(), end: end.clone() };
+        let spec = batchq::TenancySpec {
+            qid: q,
+            thread: t,
+            ctrls: ctrls.clone(),
+            stats: stats.clone(),
+            stop: stop.clone(),
+            draining: draining.clone(),
+            abandoned: abandoned.clone(),
+            cfg: cfg.clone(),
+            shared: batch_shared[q as usize].clone(),
+            spill,
+            hot,
+        };
+        let (d_build, d_end, l_end) = (dev.clone(), dev.clone(), latch.clone());
+        pool.attach(
+            r,
+            crate::reactor::Attach {
+                buf_base: ranges[q as usize],
+                depth,
+                // SAFETY: the tenancy holds `d_build` (an Arc of the device)
+                // for as long as it keeps the reference.
+                build: Box::new(move |slot| unsafe {
+                    let dref: &'static UblkDev = &*Arc::as_ptr(&d_build);
+                    batchq::Tenancy::new(spec, dref, Some(d_build), Some(slot))
+                }),
+                // As a queue thread ends: count the tenancy out of the
+                // device (the last one ends the device if nobody else is),
+                // then out of START's wait, then let `join_target` go on.
+                on_end: Box::new(move || {
+                    drop(exit);
+                    d_end.note_queue_thread_exit();
+                    drop(d_end);
+                    l_end.set();
+                }),
+            },
+        );
+        out.push((q, pool.tid(r), latch));
+    };
+    for q in 0..nq {
+        launch(q, 0);
+    }
+    for q in 0..nq {
+        match batch_shared[q as usize].prepared_by(abandoned, deadline) {
+            Some(true) => {}
+            Some(false) => {
+                log::error!("ublk device {dev_id} queue {q}: thread 0 did not prepare the queue");
+                return out;
+            }
+            None => {
+                log::error!("ublk device {dev_id} queue {q}: not prepared by the start deadline");
+                return out;
+            }
+        }
+    }
+    for q in 0..nq {
+        for t in 1..nt {
+            launch(q, t);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

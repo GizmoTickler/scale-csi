@@ -17,6 +17,7 @@ mod mpath;
 mod napi;
 mod pdu;
 mod qengine;
+mod reactor;
 
 use anyhow::{bail, Context, Result};
 use conn::{Done, Ident, Op, Req};
@@ -205,7 +206,10 @@ pub(crate) async fn serve_request(
                 if op == qengine::Op::Flush { 0 } else { bytes },
                 done_tx.clone(),
                 ucopy,
-                (zc && (op == qengine::Op::Read || zc_write)).then_some(tag),
+                // The request's pages are registered at this index of the
+                // ring's buffer table (the tag, or its slot in a shared
+                // reactor ring's table).
+                (zc && (op == qengine::Op::Read || zc_write)).then_some(q.buf_index(tag)),
             ));
             done_rx.recv().await.unwrap_or(-libc::EIO)
         }
@@ -526,7 +530,20 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     };
     // NVMEUBLK_RECOVER_ID after a crash of this command: writes are held.
     let recover = std::env::var("NVMEUBLK_RECOVER_ID").ok().and_then(|v| v.parse::<i32>().ok()).map(|id| (id, true));
+    // NVMEUBLK_RUN_VOLUMES=N (tests): N devices of the namespace, each with
+    // its own controllers, in this one process (the node daemon's shape: on
+    // the reactor pool they share its reactors).
+    let nvol = env_u64("NVMEUBLK_RUN_VOLUMES", 1).max(1) as usize;
+    let mut more = Vec::new();
+    for i in 1..nvol {
+        let mut s = spec.clone();
+        s.volume = format!("{}-{i}", spec.volume);
+        more.push(device::start(s, None)?);
+    }
     let r = device::start(spec, recover)?;
+    for m in &more {
+        log::info!("{}: serving {}", m.spec.volume, m.path());
+    }
     let f = libublk::ctrl::UblkCtrl::new_simple(r.dev_id).map(|c| c.dev_info().flags).unwrap_or(0);
     log::info!(
         "ublk device flags {f:#x}: zero_copy={} user_copy={} user_recovery={} reissue={} batch_io={}",
@@ -537,20 +554,28 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         f & libublk::sys::UBLK_F_BATCH_IO as u64 != 0
     );
     // SIGINT: stop and delete the device (the daemon's SIGTERM is a handover instead).
-    let dev_id = r.dev_id;
-    ctrlc::set_handler(move || match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
-        Ok(c) => {
-            if let Err(e) = c.kill_dev() {
-                log::error!("stop ublk device {dev_id}: {e}");
+    let ids: Vec<i32> = std::iter::once(r.dev_id).chain(more.iter().map(|m| m.dev_id)).collect();
+    ctrlc::set_handler(move || {
+        for &dev_id in &ids {
+            match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
+                Ok(c) => {
+                    if let Err(e) = c.kill_dev() {
+                        log::error!("stop ublk device {dev_id}: {e}");
+                    }
+                }
+                Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
             }
         }
-        Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
     })?;
     let (st, cstat) = (r.stats.clone(), r.ctrls.clone());
     let stats_thread = std::thread::Builder::new().name("nvme-stats".into()).spawn(move || {
       let mut last = (0u64, 0u64, 0u64);
+      let mut rlast = Vec::new();
       loop {
         std::thread::sleep(Duration::from_secs(5));
+        if let Some(l) = reactor::stats_line(&mut rlast, 5.0) {
+            log::info!("{l}");
+        }
         let (n, w, t) = (st.done.load(Ordering::Relaxed), st.wire_ns.load(Ordering::Relaxed), st.total_ns.load(Ordering::Relaxed));
         let dn = (n - last.0).max(1);
         let g = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
@@ -591,7 +616,13 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     if let Err(e) = stats_thread {
         log::warn!("cannot spawn stats thread: {e}");
     }
-    r.wait()
+    let first = r.wait();
+    for m in more {
+        if let Err(e) = m.wait() {
+            log::error!("{e:#}");
+        }
+    }
+    first
 }
 
 fn main() -> Result<()> {
