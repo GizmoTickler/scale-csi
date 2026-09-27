@@ -423,21 +423,26 @@ fn queue_fn(
     // ending must not stop the other queues' timers (reconnect, expiry).
 }
 
-/// Queue-thread CPU placement (NVMEUBLK_QUEUE_CPUS, tuning). libublk pins
-/// each queue thread to its blk-mq CPU group, which at one queue per CPU is
-/// exactly the submitting CPU: at QD1 the submitter and the queue thread
-/// then take turns on one core. "all" lets the threads run anywhere. A CPU
-/// list ("14-15", "6,7,14,15") confines every queue thread to those CPUs:
-/// dedicated storage cores the workload does not run on. None (unset,
-/// anything else, or a list naming no CPU below `ncpu`) keeps libublk's
-/// placement.
+/// Queue-thread CPU placement (NVMEUBLK_QUEUE_CPUS, tuning). Default (unset
+/// or "all"): every queue thread may run on any CPU. libublk's own placement
+/// ("hctx") pins each queue thread to its blk-mq CPU group, i.e. the CPUs
+/// whose submitters feed that queue: at one queue per CPU a submitter and
+/// its queue thread take turns on one core, and at 4 queues x 4 threads on
+/// 16 vCPUs a queue's threads fill exactly its submitters' CPUs, so a
+/// spinning hot-lane primary starves the submitter (4k randread QD16 x1:
+/// 14.8k IOPS pinned vs 86.3k unpinned, gaps/q44b; 1M read QD16 x1 q2t4:
+/// 4,021 vs 4,282 MiB/s, gaps/r1m). A CPU list ("14-15", "6,7,14,15")
+/// confines every queue thread to those CPUs: dedicated storage cores the
+/// workload does not run on; a list naming no CPU below `ncpu` falls back
+/// to the default. None = libublk's placement.
 fn queue_cpus(val: Option<&str>, ncpu: usize) -> Option<Vec<usize>> {
+    let all = || Some((0..ncpu.max(1)).collect());
     let cpus: Vec<usize> = match val {
-        Some("all") => (0..ncpu).collect(),
+        Some("hctx") => return None,
         Some(list) if list.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => parse_cpu_list(list).into_iter().filter(|&c| c < ncpu).collect(),
-        _ => return None,
+        _ => return all(),
     };
-    (!cpus.is_empty()).then_some(cpus)
+    if cpus.is_empty() { all() } else { Some(cpus) }
 }
 
 /// Hand NVMEUBLK_QUEUE_CPUS to libublk, which applies it when it pins each
@@ -446,8 +451,10 @@ fn queue_cpus(val: Option<&str>, ncpu: usize) -> Option<Vec<usize>> {
 fn set_queue_cpus() {
     let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) }.max(1) as usize).min(libc::CPU_SETSIZE as usize);
     let cpus = queue_cpus(std::env::var("NVMEUBLK_QUEUE_CPUS").ok().as_deref(), ncpu);
-    if let Some(cpus) = &cpus {
-        log::info!("queue threads confined to CPUs {cpus:?} (NVMEUBLK_QUEUE_CPUS)");
+    match &cpus {
+        Some(c) if c.len() == ncpu => log::info!("queue threads may run on any CPU"),
+        Some(c) => log::info!("queue threads confined to CPUs {c:?} (NVMEUBLK_QUEUE_CPUS)"),
+        None => log::info!("queue threads pinned to their queue's CPU group (NVMEUBLK_QUEUE_CPUS=hctx)"),
     }
     libublk::ctrl::UblkCtrl::set_queue_cpus(cpus.as_deref());
 }
@@ -653,10 +660,12 @@ mod cpu_list_tests {
         use super::queue_cpus;
         assert_eq!(queue_cpus(Some("all"), 4), Some(vec![0, 1, 2, 3]));
         assert_eq!(queue_cpus(Some("2-3,9"), 8), Some(vec![2, 3]), "CPUs this machine lacks are dropped");
-        // libublk's per-queue placement stays in force.
-        assert_eq!(queue_cpus(None, 8), None);
-        assert_eq!(queue_cpus(Some(""), 8), None);
-        assert_eq!(queue_cpus(Some("any"), 8), None);
-        assert_eq!(queue_cpus(Some("9-12"), 8), None, "a list naming no CPU of this machine");
+        // Default: any CPU (libublk's per-queue pinning starved submitters).
+        assert_eq!(queue_cpus(None, 4), Some(vec![0, 1, 2, 3]));
+        assert_eq!(queue_cpus(Some(""), 2), Some(vec![0, 1]));
+        assert_eq!(queue_cpus(Some("any"), 2), Some(vec![0, 1]));
+        assert_eq!(queue_cpus(Some("9-12"), 2), Some(vec![0, 1]), "a list naming no CPU of this machine");
+        // libublk's per-queue placement only on request.
+        assert_eq!(queue_cpus(Some("hctx"), 8), None);
     }
 }
