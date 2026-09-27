@@ -113,8 +113,11 @@ static SHALLOW_ASYNC_RX: std::sync::LazyLock<usize> =
 
 /// The io-wq receive threshold of an engine: ASYNC_RX_MIN when set, else
 /// SHALLOW_ASYNC_RX while its lane is shallow, else 0 (inline).
-pub fn async_rx_min(global: usize, shallow_min: usize, shallow: bool) -> usize {
-    if global > 0 { global } else if shallow { shallow_min } else { 0 }
+/// `large_reads`: reads of at least SHALLOW_ASYNC_RX in flight on the
+/// engine; a lone one stays inline (g3: io-wq for a single 1M QD1 read cost
+/// 1.11 -> 0.95x the kernel; the gain is several on one shallow thread).
+pub fn async_rx_min(global: usize, shallow_min: usize, shallow: bool, large_reads: usize) -> usize {
+    if global > 0 { global } else if shallow && large_reads >= 2 { shallow_min } else { 0 }
 }
 
 static RX_ZC_CHUNK: std::sync::LazyLock<usize> =
@@ -1997,7 +2000,7 @@ impl Engine {
                 // may return short, so loop until the payload is complete.
                 let use_recv = ZC_RECV_MODE.load(Ordering::Relaxed) == 0;
                 // Bounded turn: one chunk inline, or the whole rest on io-wq.
-                let (want, async_rx) = zc_rx_step(len, len - got, *RX_ZC_CHUNK, async_rx_min(*ASYNC_RX_MIN, *SHALLOW_ASYNC_RX, self.shallow.get()));
+                let (want, async_rx) = zc_rx_step(len, len - got, *RX_ZC_CHUNK, async_rx_min(*ASYNC_RX_MIN, *SHALLOW_ASYNC_RX, self.shallow.get(), self.large_reads(*SHALLOW_ASYNC_RX)));
                 let sqe = if use_recv {
                     io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, want as u32)
                         .ioprio(IORING_RECVSEND_FIXED_BUF)
@@ -2618,6 +2621,14 @@ impl Engine {
                 return;
             }
         }
+    }
+
+    /// Reads of at least `min` bytes (> 0) in flight on this engine.
+    fn large_reads(&self, min: usize) -> usize {
+        if min == 0 {
+            return 0;
+        }
+        self.conns.borrow().iter().flatten().map(|c| c.inflight.borrow().values().filter(|p| p.op == Op::Read && p.len >= min).count()).sum()
     }
 
     /// NVMEUBLK_SMALL_HOME: at most once a second, move the lane's home path
@@ -3478,12 +3489,13 @@ mod tests {
     #[test]
     fn io_wq_receive_only_while_shallow() {
         let k256 = 256 * 1024;
-        assert_eq!(async_rx_min(0, k256, true), k256);
-        assert_eq!(async_rx_min(0, k256, false), 0, "depth mode: inline");
-        assert_eq!(async_rx_min(0, 0, true), 0, "off");
-        assert_eq!(async_rx_min(k256, 0, false), k256, "the global setting still applies everywhere");
-        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 64 * 1024, async_rx_min(0, k256, true)), (1 << 20, true));
-        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 64 * 1024, async_rx_min(0, k256, false)), (64 * 1024, false));
+        assert_eq!(async_rx_min(0, k256, true, 2), k256);
+        assert_eq!(async_rx_min(0, k256, true, 1), 0, "a lone large read stays inline");
+        assert_eq!(async_rx_min(0, k256, false, 4), 0, "depth mode: inline");
+        assert_eq!(async_rx_min(0, 0, true, 4), 0, "off");
+        assert_eq!(async_rx_min(k256, 0, false, 0), k256, "the global setting still applies everywhere");
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 64 * 1024, async_rx_min(0, k256, true, 4)), (1 << 20, true));
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 64 * 1024, async_rx_min(0, k256, false, 4)), (64 * 1024, false));
     }
 
     #[test]
