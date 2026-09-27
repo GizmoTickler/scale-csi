@@ -123,6 +123,12 @@ pub struct DeviceSpec {
     /// spills to its next thread (tuning; default 16, clamped to the depth).
     #[serde(default = "d_batch_spill")]
     pub batch_spill: u16,
+    /// Batch I/O hot lane (needs `batch_io`; see batchq.rs): per queue one
+    /// primary thread with most of the credits and a warm-window spin, and
+    /// secondaries that only take its spill. `batch_spill` does not apply;
+    /// the credits come from NVMEUBLK_HOT_LEASE / NVMEUBLK_HOT_SECONDARY.
+    #[serde(default)]
+    pub hot_lane: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -899,6 +905,9 @@ fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<
             bail!("zero copy requested but this kernel's ublk lacks AUTO_BUF_REG/USER_COPY (features {feats:#x})");
         }
     }
+    if spec.hot_lane && !spec.batch_io {
+        bail!("hot_lane needs batch_io");
+    }
     if spec.batch_io {
         let feats = UblkCtrl::get_features().unwrap_or(0);
         if feats & libublk::sys::UBLK_F_BATCH_IO as u64 == 0 {
@@ -1120,7 +1129,14 @@ fn bring_up(
         depth,
         threads,
         if spec.seq_tags && !spec.batch_io { ", contiguous tags" } else { "" },
-        if spec.batch_io { format!("batch I/O, spill at {}", spec.batch_spill.clamp(1, depth)) } else { format!("tag chunk {tag_chunk}") },
+        if spec.hot_lane {
+            let h = batchq::HotLane::from_env();
+            format!("batch I/O hot lane, primary lease {} cap {}, secondaries {}, watchdog {:?}", h.credits(true, depth).1, h.credits(true, depth).0, h.credits(false, depth).0, h.wedge)
+        } else if spec.batch_io {
+            format!("batch I/O, spill at {}", spec.batch_spill.clamp(1, depth))
+        } else {
+            format!("tag chunk {tag_chunk}")
+        },
         spec.zero_copy,
         spec.napi_us,
         write_fence.as_millis()
@@ -1132,8 +1148,9 @@ fn bring_up(
     // Batch I/O: what each queue's threads share (thread 0 prepares the
     // queue; the copying mode's tag buffers). Indexed by queue id; the
     // driver may trim the queue count, never raise it.
-    let batch_shared: Arc<Vec<Arc<batchq::QueueShared>>> = Arc::new((0..queues).map(|_| Arc::new(batchq::QueueShared::default())).collect());
+    let batch_shared: Arc<Vec<Arc<batchq::QueueShared>>> = Arc::new((0..queues).map(|_| Arc::new(batchq::QueueShared::new(threads))).collect());
     let batch_spill = spec.batch_spill;
+    let hot = spec.hot_lane.then(batchq::HotLane::from_env);
     let started = ctrl.start_target_until(
         move |dev: &mut UblkDev| {
             dev.set_default_params(size);
@@ -1158,7 +1175,7 @@ fn bring_up(
                     log::error!("ublk device {} queue {qid}: no batch state for this queue", dev.dev_info.dev_id);
                     return;
                 };
-                batchq::queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone(), shared, batch_spill)
+                batchq::queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone(), shared, batch_spill, hot)
             } else {
                 queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone())
             }

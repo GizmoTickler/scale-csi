@@ -366,6 +366,9 @@ pub struct Stats {
     /// to its next thread.
     pub batch_tags: AtomicU64,
     pub batch_spills: AtomicU64,
+    /// Batch hot lane: a secondary took over as its queue's primary because
+    /// the primary stopped turning its loop (watchdog).
+    pub batch_takeovers: AtomicU64,
     /// Small commands (payload <= SMALL_IO) sent, per path index (the
     /// first 8 paths): where latency-aware path choice put them.
     pub small_by_path: [AtomicU64; 8],
@@ -730,6 +733,19 @@ impl QEngine {
         self.core.inflight_here()
     }
 
+    /// EWMA of the wire round trip of small commands over all paths
+    /// (wired -> first data for reads), if any has completed.
+    pub fn wire_rtt(&self) -> Option<Duration> {
+        let r = self.core.rtt_all.get();
+        (r.ewma_ns > 0).then(|| Duration::from_nanos(r.ewma_ns))
+    }
+
+    /// A pending fault-injection "wedge <ms>" (drills of the batch hot
+    /// lane's watchdog); taking it clears it.
+    pub fn take_wedge(&self) -> Option<Duration> {
+        self.core.wedge.take()
+    }
+
     /// Entry point for new block requests from ublk. Runs engine code on the
     /// tag task, outside the engine's executor: a panic there used to kill
     /// the tag task in silence (its smol Task is never awaited) and hang the
@@ -792,6 +808,11 @@ struct Engine {
     dial_limits: Cell<(Duration, Duration)>,
     /// Wire round trip per path (latency-aware choice for small I/O).
     path_rtt: RefCell<Vec<PathRtt>>,
+    /// The same samples over every path: what a batch hot-lane thread sizes
+    /// its warm window by.
+    rtt_all: Cell<PathRtt>,
+    /// Fault injection "wedge <ms>": for the queue thread to act on.
+    wedge: Cell<Option<Duration>>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
@@ -845,6 +866,8 @@ impl Engine {
             dropped: RefCell::new(Vec::new()),
             dial_limits: Cell::new((CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT)),
             path_rtt: RefCell::new(vec![PathRtt::default(); n_paths]),
+            rtt_all: Cell::new(PathRtt::default()),
+            wedge: Cell::new(None),
         })
     }
 
@@ -1194,6 +1217,9 @@ impl Engine {
                     if let Some(r) = self.path_rtt.borrow_mut().get_mut(c.path) {
                         r.sample(rtt, now);
                     }
+                    let mut all = self.rtt_all.get();
+                    all.sample(rtt, now);
+                    self.rtt_all.set(all);
                 }
             }
             let r = p.ok_res();
@@ -2328,6 +2354,12 @@ impl Engine {
         }
         let mut it = cmd.split_whitespace();
         let (Some(verb), Some(Ok(i))) = (it.next(), it.next().map(str::parse::<usize>)) else { return };
+        if verb == "wedge" {
+            // Not the engine's to do: its queue thread stops turning for
+            // `i` ms (batch hot lane: only the queue's primary does).
+            self.wedge.set(Some(Duration::from_millis(i as u64)));
+            return;
+        }
         let targets: Vec<Rc<QConn>> = self.conns.borrow().iter().flatten().filter(|c| c.path == i).cloned().collect();
         for c in targets {
             match verb {

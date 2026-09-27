@@ -35,13 +35,44 @@
 //! goes to the next thread. The spilled thread posts its fetch again at once
 //! (at the tail) with up to `spill` more credits, so under pressure the
 //! queue rotates over its threads in runs of `spill` requests.
+//!
+//! Hot lane (`DeviceSpec::hot_lane`, NVMEUBLK_HOT_LANE=1; design doc
+//! nvmeublk-userspace-architecture.md §4): the threads of a queue are not
+//! equal. One is the queue's *primary*: its fetch is first on the driver's
+//! list, it may hold up to `depth - lease` requests (weighted) and keeps at
+//! most `lease` credits provided at once. The others are *secondaries* with
+//! a few credits each (`secondary`, 4) that are not given back while their
+//! fetch is armed: a secondary takes at most that many requests per turn at
+//! the head of the list, then its fetch ends and rejoins at the tail, so the
+//! head returns to the primary within a few requests after it spilled. A
+//! low-depth stream therefore stays on one thread, one set of connections
+//! and one warm vCPU; depth spills.
+//! - Warm window: the primary polls its ring without sleeping while it has
+//!   commands on the wire and for `warm = clamp(1.5 x EWMA(wire RTT), 100 µs,
+//!   1 ms)` after the last one, then sleeps (NAPI busy poll still runs inside
+//!   the sleep for its budget). An idle queue spins no thread. Secondaries
+//!   poll without sleeping only while they hold requests and saw an event in
+//!   the last NVMEUBLK_SPIN_US.
+//! - Watchdog: every thread stamps a heartbeat each turn of its loop and says
+//!   when it sleeps in the ring on purpose. A secondary that finds the primary
+//!   neither turning nor sleeping for `wedge` (1 s) takes the primary role
+//!   over (its credits become the primary's), and a primary that finds it was
+//!   replaced steps down. Meanwhile the lease bounds the damage: a primary
+//!   that stops turning still has its driver task work run (the kernel runs
+//!   it at the next return to user mode, and wakes an interruptible sleep for
+//!   it), so its fetch takes at most `lease` more requests, runs out and
+//!   leaves the list, and the queue's next requests go to the secondaries at
+//!   once. Only the requests the stuck thread already took wait for it: their
+//!   pages are registered in its ring (AUTO_BUF_REG), so no other thread can
+//!   serve them. With `depth - lease` as the primary's cap there are always
+//!   at least `lease` tags it cannot hold.
 
 use crate::{ctrls, env_u64, qengine, serve_request, setup_queue_ring};
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue, UblkDev, UblkQueue};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -60,17 +91,125 @@ enum Prep {
     Failed,
 }
 
+/// Hot-lane parameters (process-wide tuning, from the environment).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HotLane {
+    /// Most credits the primary keeps provided at once (NVMEUBLK_HOT_LEASE,
+    /// default 16); the primary holds at most depth - lease requests.
+    pub lease: u16,
+    /// Credits of a secondary (NVMEUBLK_HOT_SECONDARY, default 4).
+    pub secondary: u16,
+    /// A primary neither turning nor sleeping this long is replaced
+    /// (NVMEUBLK_HOT_WEDGE_MS, default 1000).
+    pub wedge: Duration,
+}
+
+impl Default for HotLane {
+    fn default() -> Self {
+        HotLane { lease: 16, secondary: 4, wedge: Duration::from_millis(1000) }
+    }
+}
+
+impl HotLane {
+    pub fn from_env() -> Self {
+        let d = HotLane::default();
+        HotLane {
+            lease: env_u64("NVMEUBLK_HOT_LEASE", d.lease as u64).clamp(1, u16::MAX as u64) as u16,
+            secondary: env_u64("NVMEUBLK_HOT_SECONDARY", d.secondary as u64).clamp(1, u16::MAX as u64) as u16,
+            wedge: Duration::from_millis(env_u64("NVMEUBLK_HOT_WEDGE_MS", d.wedge.as_millis() as u64).max(10)),
+        }
+    }
+
+    /// (spill cap, lease, refill) of a thread in this role, for a queue of
+    /// `depth` tags.
+    pub fn credits(&self, primary: bool, depth: u16) -> (u16, u16, bool) {
+        let depth = depth.max(2);
+        if primary {
+            let lease = self.lease.clamp(1, depth - 1);
+            (depth - lease, lease, true)
+        } else {
+            let c = self.secondary.clamp(1, depth);
+            (c, c, false)
+        }
+    }
+}
+
+/// How long the primary keeps polling after its last command on the wire:
+/// 1.5 x the wire round trip, within [100 µs, 1 ms]; 100 µs before any
+/// sample.
+pub fn warm_window(rtt: Option<Duration>) -> Duration {
+    rtt.map_or(Duration::from_micros(100), |r| (r * 3 / 2).clamp(Duration::from_micros(100), Duration::from_millis(1)))
+}
+
+/// Monotonic nanoseconds since the first call (heartbeats).
+fn mono_ns() -> u64 {
+    static BASE: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    BASE.elapsed().as_nanos() as u64
+}
+
+/// One queue thread's heartbeat: when it last turned its loop, and whether
+/// it is sleeping in its ring on purpose (then it is not wedged: a request
+/// for it wakes it).
+struct Beat {
+    at_ns: AtomicU64,
+    waiting: AtomicBool,
+}
+
+/// Whether thread `me` should take the primary role from `primary`, given
+/// the primary's heartbeat.
+fn should_take_over(me: u16, primary: u16, beat_ns: u64, waiting: bool, now_ns: u64, wedge: Duration) -> bool {
+    me != primary && !waiting && now_ns.saturating_sub(beat_ns) > wedge.as_nanos() as u64
+}
+
 /// What the threads of one queue share: whether thread 0 has prepared the
-/// queue's tags (the others may post their fetches only then), and the
-/// queue's tag buffers in the copying mode.
+/// queue's tags (the others may post their fetches only then), the queue's
+/// tag buffers in the copying mode, and (hot lane) which thread is the
+/// primary and every thread's heartbeat.
 pub struct QueueShared {
     st: Mutex<Prep>,
     cv: Condvar,
+    primary: AtomicU16,
+    beats: Box<[Beat]>,
 }
 
 impl Default for QueueShared {
     fn default() -> Self {
-        QueueShared { st: Mutex::new(Prep::Waiting), cv: Condvar::new() }
+        QueueShared::new(8)
+    }
+}
+
+impl QueueShared {
+    /// For a queue served by `threads` io threads.
+    pub fn new(threads: u16) -> Self {
+        let now = mono_ns();
+        let beats = (0..threads.max(1)).map(|_| Beat { at_ns: AtomicU64::new(now), waiting: AtomicBool::new(false) }).collect();
+        QueueShared { st: Mutex::new(Prep::Waiting), cv: Condvar::new(), primary: AtomicU16::new(0), beats }
+    }
+
+    fn beat(&self, thread: u16, waiting: bool) {
+        if let Some(b) = self.beats.get(thread as usize) {
+            b.at_ns.store(mono_ns(), Ordering::Relaxed);
+            b.waiting.store(waiting, Ordering::Relaxed);
+        }
+    }
+
+    pub fn primary(&self) -> u16 {
+        self.primary.load(Ordering::Acquire)
+    }
+
+    /// Watchdog, run by any thread of the queue: take the primary role over
+    /// if the primary has stopped turning. Some(old primary) if it did.
+    fn check_primary(&self, me: u16, wedge: Duration) -> Option<u16> {
+        let p = self.primary();
+        let b = self.beats.get(p as usize)?;
+        if !should_take_over(me, p, b.at_ns.load(Ordering::Relaxed), b.waiting.load(Ordering::Relaxed), mono_ns(), wedge) {
+            return None;
+        }
+        // Stamp our own heartbeat first: the CAS publishes it, so a thread
+        // that sees us as the primary also sees us turning (otherwise a
+        // third thread could take the role straight back off us).
+        self.beat(me, false);
+        self.primary.compare_exchange(p, me, Ordering::AcqRel, Ordering::Acquire).ok()
     }
 }
 
@@ -125,6 +264,12 @@ pub fn batch_config(leader: bool, spill: u16, depth: u16) -> UblkBatchConfig {
     UblkBatchConfig::new().with_prepare_tags(leader).with_spill_tags(spill.clamp(1, depth.max(1))).with_max_inflight_commits(4)
 }
 
+/// As `batch_config`, for a hot-lane thread in the given role.
+pub fn hot_batch_config(leader: bool, primary: bool, hot: &HotLane, depth: u16) -> UblkBatchConfig {
+    let (spill, lease, refill) = hot.credits(primary, depth);
+    batch_config(leader, spill, depth).with_lease_tags(lease).with_refill(refill)
+}
+
 /// The batch-mode queue thread: io thread `libublk::io::io_thread_idx()` of
 /// queue `qid`. Same engine, same request path (`serve_request`) as the
 /// per-tag mode; the tags it serves are the ones its own fetch receives.
@@ -140,9 +285,11 @@ pub fn queue_fn(
     cfg: qengine::QConfig,
     shared: Arc<QueueShared>,
     spill: u16,
+    hot: Option<HotLane>,
 ) {
     let thread = libublk::io::io_thread_idx();
     let leader = thread == 0;
+    shared.beat(thread, false);
     let report = PrepReport { shared: leader.then_some(&*shared) };
     setup_queue_ring(qid, dev);
     let q_rc = match UblkQueue::new(qid, dev) {
@@ -173,7 +320,12 @@ pub fn queue_fn(
         Some(b) => UblkBatchBuffers::Shared(b.clone()),
         None => UblkBatchBuffers::None,
     };
-    let mut batch = match UblkBatchQueue::new(&q_rc, buffers, batch_config(leader, spill, depth)) {
+    let mut is_primary = hot.is_some() && shared.primary() == thread;
+    let config = match &hot {
+        Some(h) => hot_batch_config(leader, is_primary, h, depth),
+        None => batch_config(leader, spill, depth),
+    };
+    let mut batch = match UblkBatchQueue::new(&q_rc, buffers, config) {
         Ok(b) => b,
         Err(e) => {
             log::error!("ublk device {} queue {qid} thread {thread}: batch setup failed: {e}", dev.dev_info.dev_id);
@@ -193,7 +345,7 @@ pub fn queue_fn(
         cfg.rx_offload = 0;
     }
     let eid = qid * dev.io_threads_per_queue() + thread;
-    let engine = qengine::QEngine::new(eid, ctrls, cfg, net_exe.clone(), stats.clone(), stop, draining);
+    let engine = qengine::QEngine::new(eid, ctrls, cfg, net_exe.clone(), stats.clone(), stop.clone(), draining);
     engine.start();
 
     // One task per tag: any tag may be fetched by this thread. A task sleeps
@@ -238,13 +390,28 @@ pub fn queue_fn(
     let timeout = io_uring::types::Timespec::new().sec(20);
     let weight_bytes = env_u64("NVMEUBLK_BATCH_WEIGHT_KB", 64) << 10;
     let mut last_event = Instant::now();
+    // Hot lane: last turn with a command on the wire (warm window), and the
+    // last watchdog check.
+    let mut last_busy = Instant::now();
+    let mut last_check = Instant::now();
     let mut pending: Vec<UblkBatchCompletion> = Vec::with_capacity(depth as usize);
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(dev.tgt.cq_depth as usize);
     let mut arrived: Vec<u16> = Vec::with_capacity(depth as usize);
     let (mut seen_tags, mut seen_spills) = (0u64, 0u64);
     let dev_id = dev.dev_info.dev_id;
-    log::info!("ublk device {dev_id} queue {qid} thread {thread}: batch I/O, spill at {} requests{}", batch.config().spill_tags(), if leader { " (prepared the queue)" } else { "" });
+    log::info!(
+        "ublk device {dev_id} queue {qid} thread {thread}: batch I/O, {}{}",
+        match &hot {
+            Some(_) => format!("hot lane {} (cap {}, lease {}, refill {})", if is_primary { "primary" } else { "secondary" }, batch.config().spill_tags(), batch.config().lease_tags(), batch.config().refill()),
+            None => format!("spill at {} requests", batch.config().spill_tags()),
+        },
+        if leader { " (prepared the queue)" } else { "" }
+    );
 
+    // A thread that leaves because its queue stopped reports itself as
+    // waiting (not wedged), so no sibling takes over during teardown; one
+    // that leaves on an error does not, and a sibling takes its role.
+    let mut clean_exit = false;
     run_ops();
     loop {
         // Results the tag tasks produced go back to the driver in one commit.
@@ -273,13 +440,17 @@ pub fn queue_fn(
         // cancels the fetch, and closing the char device takes back the
         // requests still held.
         if abandoned.load(Ordering::Acquire) {
+            clean_exit = true;
             break;
         }
         // Stopped: the driver aborted this thread's fetch and every request
         // it had taken is committed. Hand the fetch buffers back, then leave.
         if batch.all_fetches_stopped() && batch.owned_tag_count() == 0 && pending.is_empty() && batch.inflight_commit_count() == 0 {
             match batch.try_begin_shutdown() {
-                Ok(_) if batch.is_shutdown_complete() => break,
+                Ok(_) if batch.is_shutdown_complete() => {
+                    clean_exit = true;
+                    break;
+                }
                 Ok(_) => {}
                 Err(e) => {
                     log::error!("ublk device {dev_id} queue {qid} thread {thread}: batch shutdown failed: {e}");
@@ -288,9 +459,57 @@ pub fn queue_fn(
             }
         }
 
-        // Wait for events (adaptive polling as in the per-tag loop).
-        let hot = !spin.is_zero() && (spin_idle || engine.inflight_here() > 0 || batch.owned_tag_count() > 0) && last_event.elapsed() < spin;
-        if let Err(e) = poll(if hot { 0 } else { 1 }, &timeout) {
+        // Hot lane: the watchdog (a few times a second, on any thread that
+        // is awake anyway), and the role this thread has now.
+        if let Some(h) = &hot {
+            if last_check.elapsed() >= Duration::from_millis(250) {
+                last_check = Instant::now();
+                if !stop.load(Ordering::Acquire) {
+                    if let Some(old) = shared.check_primary(thread, h.wedge) {
+                        stats.batch_takeovers.fetch_add(1, Ordering::Relaxed);
+                        log::warn!("ublk device {dev_id} queue {qid}: primary thread {old} has not turned its loop for {:?}; thread {thread} takes over", h.wedge);
+                    }
+                }
+            }
+            let now_primary = shared.primary() == thread;
+            if now_primary != is_primary {
+                is_primary = now_primary;
+                let (cap, lease, refill) = h.credits(is_primary, depth);
+                if let Err(e) = batch.set_credit_policy(cap, lease, refill) {
+                    log::error!("ublk device {dev_id} queue {qid} thread {thread}: role change failed: {e}");
+                    break;
+                }
+                log::info!("ublk device {dev_id} queue {qid} thread {thread}: now the {}", if is_primary { "primary" } else { "secondary" });
+            }
+            // Fault injection "wedge <ms>": the primary stops turning.
+            if let Some(d) = engine.take_wedge() {
+                if is_primary {
+                    log::warn!("ublk device {dev_id} queue {qid} thread {thread}: fault injection: primary wedged for {d:?}");
+                    std::thread::sleep(d);
+                }
+            }
+        }
+
+        // Wait for events. Hot-lane primary: the warm window; otherwise
+        // adaptive polling as in the per-tag loop.
+        let spinning = match &hot {
+            Some(_) if is_primary => {
+                if engine.inflight_here() > 0 {
+                    last_busy = Instant::now();
+                    true
+                } else {
+                    last_busy.elapsed() < warm_window(engine.wire_rtt())
+                }
+            }
+            Some(_) => !spin.is_zero() && (engine.inflight_here() > 0 || batch.owned_tag_count() > 0) && last_event.elapsed() < spin,
+            None => !spin.is_zero() && (spin_idle || engine.inflight_here() > 0 || batch.owned_tag_count() > 0) && last_event.elapsed() < spin,
+        };
+        if !spinning {
+            shared.beat(thread, true);
+        }
+        let polled = poll(if spinning { 0 } else { 1 }, &timeout);
+        shared.beat(thread, false);
+        if let Err(e) = polled {
             log::error!("ublk device {dev_id} queue {qid} thread {thread}: event loop failed: {e}");
             break;
         }
@@ -350,6 +569,7 @@ pub fn queue_fn(
             break;
         }
     }
+    shared.beat(thread, clean_exit);
     log::info!("ublk device {dev_id} queue {qid} thread {thread}: batch loop ended ({} requests, {} spills)", batch.fetched_tag_count(), batch.spill_count());
     // Drop order: the tag tasks and their executor, then the engine (its
     // Drop drives its tasks to their end on this ring), then the batch
@@ -399,6 +619,74 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         PrepReport { shared: Some(&s) }.ready(Some(Arc::new(vec![IoBuf::<u8>::new(4096)])));
         assert_eq!(t.join().unwrap(), Some(true));
+    }
+
+    /// Hot lane: the primary may hold all but `lease` tags and keeps at
+    /// most `lease` credits provided; a secondary has a few spill-only
+    /// credits. The lease leaves tags a stuck primary can never take.
+    #[test]
+    fn hot_lane_credits_per_role() {
+        let h = HotLane::default();
+        assert_eq!(h.credits(true, 64), (48, 16, true));
+        assert_eq!(h.credits(false, 64), (4, 4, false));
+        let c = hot_batch_config(true, true, &h, 64);
+        assert!(c.prepare_tags());
+        assert_eq!((c.spill_tags(), c.lease_tags(), c.refill()), (48, 16, true));
+        let c = hot_batch_config(false, false, &h, 64);
+        assert_eq!((c.spill_tags(), c.lease_tags(), c.refill()), (4, 4, false));
+        // Tiny queues: the primary still leaves at least one tag.
+        assert_eq!(h.credits(true, 8), (1, 7, true));
+        assert_eq!(h.credits(true, 2), (1, 1, true));
+        let big = HotLane { lease: 100, secondary: 100, ..h };
+        assert_eq!(big.credits(true, 64), (1, 63, true));
+        assert_eq!(big.credits(false, 64), (64, 64, false));
+    }
+
+    #[test]
+    fn warm_window_is_one_and_a_half_rtt_within_bounds() {
+        assert_eq!(warm_window(None), Duration::from_micros(100));
+        assert_eq!(warm_window(Some(Duration::from_micros(40))), Duration::from_micros(100));
+        assert_eq!(warm_window(Some(Duration::from_micros(200))), Duration::from_micros(300));
+        assert_eq!(warm_window(Some(Duration::from_millis(5))), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn watchdog_takes_over_only_from_a_primary_that_neither_turns_nor_sleeps() {
+        let w = Duration::from_millis(1000);
+        let s = 1_000_000_000u64;
+        assert!(should_take_over(1, 0, 0, false, s + 1, w));
+        assert!(!should_take_over(1, 0, 0, true, 10 * s, w), "sleeping in its ring is not wedged");
+        assert!(!should_take_over(1, 0, s, false, s + s / 2, w), "turned 0.5 s ago");
+        assert!(!should_take_over(0, 0, 0, false, 10 * s, w), "the primary does not replace itself");
+
+        // Timing margins are wide: tests run in parallel on a loaded host.
+        let q = QueueShared::new(4);
+        let (short, long) = (Duration::from_millis(20), Duration::from_secs(30));
+        q.beat(0, false);
+        assert_eq!(q.check_primary(1, long), None, "fresh heartbeat");
+        std::thread::sleep(Duration::from_millis(40));
+        q.beat(0, true);
+        assert_eq!(q.check_primary(1, short), None, "waiting in the ring");
+        q.beat(0, false);
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(q.check_primary(2, short), Some(0), "stale and not waiting: taken over");
+        assert_eq!(q.primary(), 2);
+        assert_eq!(q.check_primary(1, long), None, "the new primary stamped its heartbeat when it took over");
+        // Only one thread wins a takeover race.
+        let q = std::sync::Arc::new(QueueShared::new(4));
+        let short = Duration::from_millis(300);
+        std::thread::sleep(Duration::from_millis(600));
+        let winners: Vec<Option<u16>> = (1..4u16)
+            .map(|t| {
+                let q = q.clone();
+                std::thread::spawn(move || q.check_primary(t, short))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(winners.iter().filter(|w| w.is_some()).count(), 1, "{winners:?}");
+        assert_ne!(q.primary(), 0);
     }
 
     #[test]

@@ -495,15 +495,17 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     set_queue_cpus();
     qengine::set_zc_recv_preference(env_u64("NVMEUBLK_ZC_RECV", 0) != 0);
     // NVMEUBLK_BATCH_IO=1: ublk batch I/O (see batchq.rs); one queue unless
-    // NVMEUBLK_QUEUES says otherwise.
-    let batch_io = env_u64("NVMEUBLK_BATCH_IO", 0) != 0;
+    // NVMEUBLK_QUEUES says otherwise. NVMEUBLK_HOT_LANE=1: batch I/O with the
+    // hot lane (primary + spill-only secondaries), two queues by default.
+    let hot_lane = env_u64("NVMEUBLK_HOT_LANE", 0) != 0;
+    let batch_io = hot_lane || env_u64("NVMEUBLK_BATCH_IO", 0) != 0;
     let spec = device::DeviceSpec {
         volume: std::env::var("NVMEUBLK_VOLUME").unwrap_or_else(|_| "run".into()),
         subnqn: nqn.to_string(),
         addrs: addrs.to_vec(),
         hostnqn: std::env::var("NVMEUBLK_HOSTNQN").ok(),
         hostid: std::env::var("NVMEUBLK_HOSTID").ok(),
-        queues: env_u64("NVMEUBLK_QUEUES", if batch_io { 1 } else { 2 }) as u16,
+        queues: env_u64("NVMEUBLK_QUEUES", if batch_io && !hot_lane { 1 } else { 2 }) as u16,
         depth: env_u64("NVMEUBLK_DEPTH", 64) as u16,
         zero_copy: env_u64("NVMEUBLK_ZERO_COPY", 0) != 0,
         napi_us: env_u64("NVMEUBLK_NAPI_US", 0) as u32,
@@ -514,6 +516,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         tag_chunk: env_u64("NVMEUBLK_TAG_CHUNK", 2) as u16,
         batch_io,
         batch_spill: env_u64("NVMEUBLK_BATCH_SPILL", 16).min(u16::MAX as u64) as u16,
+        hot_lane,
         io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),
         no_path_timeout_ms: env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000),
         write_fence_ms: std::env::var("NVMEUBLK_WRITE_FENCE_MS").ok().and_then(|v| v.parse().ok()),
@@ -559,7 +562,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
         log::info!(
-            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} batch_tags={} batch_spills={} small_by_path={:?} {}",
+            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} batch_tags={} batch_spills={} batch_takeovers={} small_by_path={:?} {}",
             ups.join(" "),
             st.failovers.load(Ordering::Relaxed),
             st.resubmits.load(Ordering::Relaxed),
@@ -574,6 +577,7 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
             st.engine_panics.load(Ordering::Relaxed),
             st.batch_tags.load(Ordering::Relaxed),
             st.batch_spills.load(Ordering::Relaxed),
+            st.batch_takeovers.load(Ordering::Relaxed),
             st.small_by_path.iter().take(cstat.paths.len()).map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             lat
         );

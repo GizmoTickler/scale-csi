@@ -87,6 +87,8 @@ pub struct UblkBatchConfig {
     fetch_buffer_group: u16,
     prepare_tags: bool,
     spill_tags: u16,
+    lease_tags: u16,
+    refill: bool,
 }
 
 impl UblkBatchConfig {
@@ -100,6 +102,8 @@ impl UblkBatchConfig {
             fetch_buffer_group: 0x7000,
             prepare_tags: true,
             spill_tags: 0,
+            lease_tags: 0,
+            refill: true,
         }
     }
 
@@ -164,6 +168,42 @@ impl UblkBatchConfig {
         self
     }
 
+    /// Spill mode: most credits provided at any one time (0 = no lease, the
+    /// default: up to `spill_tags` at once). With a lease the spill threshold
+    /// is also a hard cap: after the fetch runs out it is posted again only
+    /// with credits that keep held requests (weighted) plus credits within
+    /// `spill_tags`, else it waits for a commit. A thread that stops turning
+    /// its loop (wedged) then takes at most `lease` more requests before its
+    /// fetch leaves the driver's list and the queue's next thread takes over.
+    #[must_use]
+    pub const fn with_lease_tags(mut self, tags: u16) -> Self {
+        self.lease_tags = tags;
+        self
+    }
+
+    /// Spill mode: whether credits are given back as requests are committed
+    /// while the fetch is armed (default true). False makes a spill-only
+    /// thread: its fetch takes at most its credits, then ends (`-ENOBUFS`)
+    /// and goes back to the tail of the driver's list with fresh credits. A
+    /// thread that reached the head of the list only because the thread
+    /// ahead of it spilled so hands the head back after a bounded run.
+    #[must_use]
+    pub const fn with_refill(mut self, refill: bool) -> Self {
+        self.refill = refill;
+        self
+    }
+
+    /// Return the lease (0: none).
+    pub const fn lease_tags(&self) -> u16 {
+        self.lease_tags
+    }
+
+    /// Return whether committed requests' credits are given back while the
+    /// fetch is armed.
+    pub const fn refill(&self) -> bool {
+        self.refill
+    }
+
     /// Return the number of provided fetch buffers.
     pub const fn fetch_buffer_count(&self) -> u16 {
         self.fetch_buffer_count
@@ -211,6 +251,7 @@ impl UblkBatchConfig {
             fetch_command_count: 1,
             tags_per_fetch_buffer: 1,
             spill_tags: self.spill_tags.min(depth),
+            lease_tags: self.lease_tags.min(depth),
             ..self
         }
     }
@@ -853,8 +894,13 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     /// requests have been weighed. A no-op when nothing is pending.
     pub fn settle_credits(&mut self) -> Result<(), UblkError> {
         if self.spill_mode() && std::mem::take(&mut self.topup_pending) {
-            self.top_up()?;
+            if self.config.refill {
+                self.top_up()?;
+            }
             if let Some(id) = self.parked_fetch {
+                if !self.config.refill {
+                    self.overdraft()?;
+                }
                 self.arm_or_park(id)?;
             }
         }
@@ -863,6 +909,37 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
 
     pub fn spill_count(&self) -> u64 {
         self.spills
+    }
+
+    /// Spill mode: change this thread's credit policy (see
+    /// [`UblkBatchConfig::with_spill_tags`], [`with_lease_tags`](UblkBatchConfig::with_lease_tags),
+    /// [`with_refill`](UblkBatchConfig::with_refill)) while it runs, e.g. to
+    /// promote a secondary thread when its queue's primary stopped turning.
+    /// Credits already provided stay provided; new ones follow the new
+    /// policy. Values are clamped to the queue depth.
+    pub fn set_credit_policy(&mut self, spill: u16, lease: u16, refill: bool) -> Result<(), UblkError> {
+        if !self.spill_mode() {
+            return Err(UblkError::InvalidVal);
+        }
+        let depth = (self.owned_tags.len().max(1)).min(u16::MAX as usize) as u16;
+        self.config.spill_tags = spill.clamp(1, depth);
+        self.config.lease_tags = lease.min(depth);
+        self.config.refill = refill;
+        if refill {
+            self.top_up()?;
+        }
+        if let Some(id) = self.parked_fetch {
+            if !refill {
+                self.overdraft()?;
+            }
+            self.arm_or_park(id)?;
+        }
+        Ok(())
+    }
+
+    /// Spill mode: credits provided right now.
+    pub fn provided_credit_count(&self) -> usize {
+        self.provided()
     }
 
     /// Return how many times a fetch was posted again after it ended.
@@ -1153,8 +1230,9 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
 
     /// Spill mode: bring the credits back up to the spill threshold.
     fn top_up(&mut self) -> Result<(), UblkError> {
-        let n = spill_top_up_count(
+        let n = leased_top_up_count(
             self.config.spill_tags as usize,
+            self.config.lease_tags as usize,
             self.provided(),
             self.owned_count + self.owned_extra,
             self.free_slots.len(),
@@ -1170,13 +1248,24 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     /// Spill mode, after the fetch ran out of buffers: up to another
     /// threshold's worth of credits for the fetch posted at the list's tail.
     fn overdraft(&mut self) -> Result<(), UblkError> {
-        let n = spill_overdraft_count(
-            self.owned_tags.len(),
-            self.config.spill_tags as usize,
-            self.provided(),
-            self.owned_count,
-            self.free_slots.len(),
-        );
+        let n = if self.config.lease_tags != 0 {
+            // Leased: the threshold is a hard cap (see with_lease_tags).
+            leased_top_up_count(
+                self.config.spill_tags as usize,
+                self.config.lease_tags as usize,
+                self.provided(),
+                self.owned_count + self.owned_extra,
+                self.free_slots.len(),
+            )
+        } else {
+            spill_overdraft_count(
+                self.owned_tags.len(),
+                self.config.spill_tags as usize,
+                self.provided(),
+                self.owned_count,
+                self.free_slots.len(),
+            )
+        };
         for _ in 0..n {
             if !self.provide_slot()? {
                 break;
@@ -1203,8 +1292,14 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
         if !self.spill_mode() {
             return Ok(());
         }
-        self.top_up()?;
+        if self.config.refill {
+            self.top_up()?;
+        }
         if let Some(fetch_id) = self.parked_fetch {
+            if !self.config.refill {
+                // Spill-only: credits come back only with a new fetch.
+                self.overdraft()?;
+            }
             self.arm_or_park(fetch_id)?;
         }
         Ok(())
@@ -1589,7 +1684,8 @@ impl Drop for UblkBatchQueue<'_, '_> {
 /// mode the spill threshold's worth.
 fn initial_provided(config: UblkBatchConfig) -> u16 {
     if config.spill_tags != 0 {
-        config.spill_tags.min(config.fetch_buffer_count)
+        let lease = if config.lease_tags != 0 { config.lease_tags } else { u16::MAX };
+        config.spill_tags.min(lease).min(config.fetch_buffer_count)
     } else {
         config.fetch_buffer_count
     }
@@ -1597,8 +1693,17 @@ fn initial_provided(config: UblkBatchConfig) -> u16 {
 
 /// Spill mode: buffers to provide so that credits (`provided`) plus held
 /// tags (`owned`) reach `limit`, bounded by the free slots.
+#[cfg(test)]
 fn spill_top_up_count(limit: usize, provided: usize, owned: usize, free: usize) -> usize {
-    limit.saturating_sub(provided + owned).min(free)
+    leased_top_up_count(limit, 0, provided, owned, free)
+}
+
+/// As `spill_top_up_count`, and with a lease (nonzero) never more than
+/// `lease` credits provided at once.
+fn leased_top_up_count(limit: usize, lease: usize, provided: usize, owned: usize, free: usize) -> usize {
+    let room = limit.saturating_sub(provided + owned);
+    let room = if lease != 0 { room.min(lease.saturating_sub(provided)) } else { room };
+    room.min(free)
 }
 
 /// Spill mode, after a spill: another `spill` credits at most, never more
@@ -2356,6 +2461,31 @@ mod tests {
         assert_eq!(spill_top_up_count(16, 3, 10, 51), 3);
         // Bounded by free slots.
         assert_eq!(spill_top_up_count(16, 0, 0, 5), 5);
+    }
+
+    /// Hot lane: a lease bounds the credits provided at once (what a thread
+    /// that stops turning can still take), and the threshold is a hard cap.
+    #[test]
+    fn leased_top_up_bounds_provided_credits() {
+        // Primary: cap 48, lease 16. Idle: 16 provided, not 48.
+        assert_eq!(leased_top_up_count(48, 16, 0, 0, 64), 16);
+        assert_eq!(leased_top_up_count(48, 16, 16, 0, 48), 0);
+        // Holding 20 with 10 provided: 6 more (lease), not 18.
+        assert_eq!(leased_top_up_count(48, 16, 10, 20, 34), 6);
+        // Near the cap: the cap wins.
+        assert_eq!(leased_top_up_count(48, 16, 0, 44, 20), 4);
+        // Weighted holding over the cap: nothing.
+        assert_eq!(leased_top_up_count(48, 16, 0, 60, 60), 0);
+        // No lease: the old rule.
+        assert_eq!(leased_top_up_count(16, 0, 3, 10, 51), spill_top_up_count(16, 3, 10, 51));
+        // Initial credits follow the lease.
+        let c = UblkBatchConfig::new().with_spill_tags(48).with_lease_tags(16).effective(64);
+        assert_eq!(initial_provided(c), 16);
+        let c = UblkBatchConfig::new().with_spill_tags(4).with_lease_tags(4).with_refill(false).effective(64);
+        assert_eq!(initial_provided(c), 4);
+        assert!(!c.refill());
+        assert_eq!(UblkBatchConfig::new().with_spill_tags(16).effective(64).lease_tags(), 0);
+        assert!(UblkBatchConfig::new().refill());
     }
 
     #[test]

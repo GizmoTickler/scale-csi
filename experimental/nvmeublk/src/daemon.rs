@@ -425,7 +425,7 @@ impl Daemon {
             "zc_rx_bytes": l(&s.zc_bytes), "zc_tx_bytes": l(&s.zc_tx_bytes),
             "engine_panics": l(&s.engine_panics), "engine_failed": r.engine_failed(),
             "orphans": s.orphans.load(Ordering::Relaxed),
-            "batch_tags": l(&s.batch_tags), "batch_spills": l(&s.batch_spills)
+            "batch_tags": l(&s.batch_tags), "batch_spills": l(&s.batch_spills), "batch_takeovers": l(&s.batch_takeovers)
         }}))
     }
 
