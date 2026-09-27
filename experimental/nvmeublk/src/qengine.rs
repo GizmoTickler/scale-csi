@@ -186,6 +186,18 @@ pub const SMALL_IO: usize = 32 * 1024;
 
 /// Whether a command belongs on a small-class connection (L5): payload at
 /// most SMALL_IO, and flushes (no payload, and what a database waits on).
+/// Last tie-break of the path choice: engine `eid` prefers path
+/// `eid % n_paths`, then the following ones in order. Equal counts used to go
+/// to the lowest path index in every engine, so across a device path 0 took
+/// the most and the last path the least (matrix-20260927T051306Z: path_MiB
+/// [226280, 202747, 163201, 145410]; a single 1M stream left path 204 at
+/// 3-7 Gbps while each path alone delivers ~9.8 Gbps). A low-depth stream
+/// still stays on one connection: its engine's first path.
+pub fn path_rank(path: usize, eid: u16, n_paths: usize) -> usize {
+    let n = n_paths.max(1);
+    (path % n + n - eid as usize % n) % n
+}
+
 pub fn is_small_cmd(op: Op, len: usize) -> bool {
     op == Op::Flush || len <= SMALL_IO
 }
@@ -1061,19 +1073,21 @@ impl Engine {
         // evens out across turns; 0 = plain least-outstanding.
         let min = live.iter().map(|c| c.inflight.borrow().len()).min().unwrap_or(0);
         let slack = *BATCH_SLACK;
-        // Bulk commands: byte balance (see BYTE_PATH); the rest: fewest
-        // outstanding.
+        // Bulk commands: fewest outstanding, byte balance as the tie-break
+        // (see BYTE_PATH), and no batch affinity: a bulk command is its own
+        // batch, and affinity only piled a turn's payloads onto one path.
+        // Small commands: fewest outstanding with batch affinity.
         let small = p.len <= SMALL_IO;
         let bulk_bytes = byte_path() && !small;
+        let n_paths = self.ctrls.paths.len().max(1);
         live.sort_by_key(|c| {
             let n = c.inflight.borrow().len();
-            if bulk_bytes {
-                // Spread over this engine's connections, ties to the path
-                // with the fewest device bytes; no batch affinity (a bulk
-                // command is its own batch anyway).
-                return (false, n as u64, self.bytes_on(c.path, p.op).max(0) as u64);
+            let rot = path_rank(c.path, self.qid, n_paths);
+            if !small {
+                let bytes = if bulk_bytes { self.bytes_on(c.path, p.op).max(0) as u64 } else { 0 };
+                return (false, n as u64, bytes, rot);
             }
-            (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), n as u64, 0)
+            (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), n as u64, 0, rot)
         });
         for c in live {
             let path = c.path;
@@ -2987,6 +3001,11 @@ mod tests {
     }
 
     fn rig_with(ts: &[&Target], name: &str, write_fence: Duration, tweak: impl FnOnce(&mut QConfig)) -> Rig {
+        rig_eid(ts, name, write_fence, 0, tweak)
+    }
+
+    /// As `rig_with`, for engine `eid` of its device.
+    fn rig_eid(ts: &[&Target], name: &str, write_fence: Duration, eid: u16, tweak: impl FnOnce(&mut QConfig)) -> Rig {
         let id = Ident { hostnqn: "nqn.2014-08.org.nvmexpress:uuid:test".into(), hostid: [7; 16], subnqn: "nqn.test:sub".into() };
         let ctrls = Ctrls::new(ts.iter().map(|t| t.addr).collect(), id, Duration::from_secs(15)).unwrap();
         let fault_dir = std::env::temp_dir().join(format!("nvmeublk-qengine-{}-{name}", std::process::id())).to_string_lossy().into_owned();
@@ -3010,7 +3029,7 @@ mod tests {
         tweak(&mut cfg);
         let exe = Rc::new(smol::LocalExecutor::new());
         let stats = Arc::new(Stats::default());
-        let e = QEngine::new(0, ctrls.clone(), cfg, exe.clone(), stats.clone(), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let e = QEngine::new(eid, ctrls.clone(), cfg, exe.clone(), stats.clone(), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         Rig { e, exe, stats, ctrls, _dir: TempDir(fault_dir.clone()), fault_dir }
     }
 
@@ -3127,6 +3146,45 @@ mod tests {
         });
         let (s, f) = (slow_seen.lock().unwrap().reads, fast_seen.lock().unwrap().reads);
         assert_eq!((s, f), (30, 0), "every read on the first live connection");
+    }
+
+    #[test]
+    fn path_rank_rotates_by_engine() {
+        assert_eq!((0..4).map(|p| path_rank(p, 0, 4)).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!((0..4).map(|p| path_rank(p, 1, 4)).collect::<Vec<_>>(), vec![3, 0, 1, 2], "engine 1 prefers path 1");
+        assert_eq!((0..4).map(|p| path_rank(p, 6, 4)).collect::<Vec<_>>(), vec![2, 3, 0, 1], "engine 6 prefers path 2");
+        assert_eq!(path_rank(0, 5, 1), 0);
+        assert_eq!(path_rank(1, 3, 0), 0, "no paths: no panic");
+    }
+
+    /// Ties between paths go to the engine's own first path (eid % paths),
+    /// not to path 0 in every engine: engine 1's QD1 stream stays on path 1.
+    /// And bulk commands take no batch affinity: two bulk reads dispatched
+    /// in one turn go to two paths (affinity put both on the path whose
+    /// sender had not run yet).
+    #[test]
+    fn ties_rotate_by_engine_and_bulk_spreads_within_a_turn() {
+        let a = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let b = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let (a_seen, b_seen) = (a.seen.clone(), b.seen.clone());
+        on_ring_thread(move || {
+            let r = rig_eid(&[&a, &b], "rotate", Duration::from_secs(20), 1, |_| {});
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
+            let mut small = vec![0u8; 4096];
+            for _ in 0..10 {
+                let rx = request(&r.e, Op::Read, &mut small);
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || rx.try_recv().is_ok()));
+            }
+            let (mut b1, mut b2) = (vec![0u8; 128 * 1024], vec![0u8; 128 * 1024]);
+            for _ in 0..5 {
+                // Both submitted before the executor turns: one turn.
+                let (r1, r2) = (request(&r.e, Op::Read, &mut b1), request(&r.e, Op::Read, &mut b2));
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || !r1.is_empty() && !r2.is_empty()));
+            }
+        });
+        let (sa, sb) = (a_seen.lock().unwrap().reads, b_seen.lock().unwrap().reads);
+        assert_eq!((sa, sb), (5, 15), "10 small reads on engine 1's path (1), bulk pairs split 5/5");
     }
 
     /// Byte balance (L6): among this engine's least loaded connections a
