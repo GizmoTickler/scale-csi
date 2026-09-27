@@ -623,7 +623,7 @@ impl Tenancy {
         let mut cfg = cfg;
         let user_copy = dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64 != 0;
         cfg.cdev_fd = if user_copy { dev.tgt.fds[0] } else { -1 };
-        cfg.path_offset = dev.dev_info.dev_id as usize;
+        cfg.path_offset = crate::env_u64("NVMEUBLK_PATH_OFFSET", dev.dev_info.dev_id as u64) as usize;
         let cdev_fd = cfg.cdev_fd;
         let zc = dev.dev_info.flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0;
         if zc {
@@ -1036,6 +1036,7 @@ pub fn queue_fn(
     let dev_static: &'static UblkDev = unsafe { &*(dev as *const UblkDev) };
     let Some(mut t) = (unsafe { Tenancy::new(spec, dev_static, None, None) }) else { return };
     let timeout = io_uring::types::Timespec::new().sec(20);
+    let spin_wait = spin_wait_from_env();
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(dev.tgt.cq_depth as usize);
     t.run_ops();
     let clean = loop {
@@ -1055,7 +1056,7 @@ pub fn queue_fn(
         // commits): it counts as one turn.
         let polled = {
             let _turn = spinning.then(|| TurnTimer::new(&stats, Instant::now()));
-            poll(if spinning { 0 } else { 1 }, &timeout)
+            if spinning { spin_poll(&spin_wait, &timeout) } else { poll(1, &timeout) }
         };
         t.beat(false);
         if let Err(e) = polled {
@@ -1118,6 +1119,28 @@ impl Drop for TurnTimer<'_> {
 }
 
 /// Submit what is queued and wait for `wait` completions at most `timeout`.
+/// How a host polls its ring on a turn it does not sleep:
+/// NVMEUBLK_SPIN_WAIT_US = 0 (default): a non-blocking poll; N > 0: while NAPI
+/// busy poll is registered on the ring, a wait for one event of at most N µs,
+/// so the kernel busy-polls the NICs (NAPI) in the wait instead of the thread
+/// spinning in user space and the NIC's interrupt moderation deciding when a
+/// payload's later segments are seen.
+pub fn spin_poll(spin_wait: &Option<io_uring::types::Timespec>, idle_timeout: &io_uring::types::Timespec) -> std::io::Result<()> {
+    match spin_wait {
+        Some(ts) if crate::napi::state().0.is_some_and(|b| b > 0) => {
+            let _ = idle_timeout;
+            poll(1, ts)
+        }
+        _ => poll(0, idle_timeout),
+    }
+}
+
+/// NVMEUBLK_SPIN_WAIT_US as a timespec (None when 0).
+pub fn spin_wait_from_env() -> Option<io_uring::types::Timespec> {
+    let us = env_u64("NVMEUBLK_SPIN_WAIT_US", 0);
+    (us > 0).then(|| io_uring::types::Timespec::new().nsec((us.min(999_999) * 1000) as u32))
+}
+
 pub fn poll(wait: usize, timeout: &io_uring::types::Timespec) -> std::io::Result<()> {
     libublk::io::with_task_io_ring_mut(|r| {
         let args = io_uring::types::SubmitArgs::new().timespec(timeout);

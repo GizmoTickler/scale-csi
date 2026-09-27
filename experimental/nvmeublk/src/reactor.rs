@@ -286,21 +286,25 @@ fn place_with(p: &mut Placement, primaries: usize, queues: u16, threads: u16) ->
     let r = p.load.len();
     let threads = (threads as usize).min(r).max(1);
     let primaries = primaries.clamp(1, r);
-    // The least loaded of `cands` (in rotation from `*next`), not in `taken`.
-    fn pick(load: &[usize], cands: usize, next: &mut usize, taken: &[usize]) -> Option<usize> {
-        let best = (0..cands).map(|i| (*next + i) % cands).filter(|c| !taken.contains(c)).min_by_key(|&c| load[c])?;
+    // The least loaded of `cands` (in rotation from `*next`), not in `taken`;
+    // among equally loaded ones, reactors at or above `avoid_below` first
+    // (secondaries keep off the primary reactors while others are as free:
+    // one volume's two queues then use all eight reactors, not seven with
+    // one hosting two tenancies (p1: read 16k 64:8 at 0.59x the kernel)).
+    fn pick(load: &[usize], cands: usize, next: &mut usize, taken: &[usize], avoid_below: usize) -> Option<usize> {
+        let best = (0..cands).map(|i| (*next + i) % cands).filter(|c| !taken.contains(c)).min_by_key(|&c| (load[c], c < avoid_below))?;
         *next = (best + 1) % cands;
         Some(best)
     }
     (0..queues)
         .map(|_| {
             let mut rs = Vec::with_capacity(threads);
-            if let Some(c) = pick(&p.load, primaries, &mut p.next_primary, &rs) {
+            if let Some(c) = pick(&p.load, primaries, &mut p.next_primary, &rs, 0) {
                 p.load[c] += 1;
                 rs.push(c);
             }
             while rs.len() < threads {
-                let Some(c) = pick(&p.load, r, &mut p.next_secondary, &rs) else { break };
+                let Some(c) = pick(&p.load, r, &mut p.next_secondary, &rs, primaries) else { break };
                 p.load[c] += 1;
                 rs.push(c);
             }
@@ -431,6 +435,7 @@ fn run(handle: Arc<Handle>, ready: Arc<(Mutex<usize>, Condvar)>) {
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(4096);
     let mut leaving: Vec<(usize, bool)> = Vec::new();
     let timeout = io_uring::types::Timespec::new().sec(20);
+    let spin_wait = batchq::spin_wait_from_env();
     let mut mail = true;
     loop {
         if mail {
@@ -471,7 +476,7 @@ fn run(handle: Arc<Handle>, ready: Arc<(Mutex<usize>, Condvar)>) {
             handle.spins.fetch_add(1, Ordering::Relaxed);
         }
         let t0 = Instant::now();
-        let polled = batchq::poll(if spin { 0 } else { 1 }, &timeout);
+        let polled = if spin { batchq::spin_poll(&spin_wait, &timeout) } else { batchq::poll(1, &timeout) };
         if !spin && !re.hosted.is_empty() {
             crate::napi::observe_wait(t0.elapsed());
         }
@@ -565,6 +570,10 @@ mod tests {
             assert!(q[0] < 4, "primary on a primary reactor: {q:?}");
         }
         assert_ne!(p[0][0], p[1][0], "queues' primaries rotate");
+        let mut all: Vec<usize> = p.concat();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 8, "one volume's 2 x 4 tenancies on all 8 reactors: {p:?}");
         // Eight volumes x two queues over 8 reactors, primaries on 4: every
         // primary reactor gets 4 primaries, and the 64 tenancies spread within two (primaries are pinned to half the reactors).
         let mut s = st(8);
