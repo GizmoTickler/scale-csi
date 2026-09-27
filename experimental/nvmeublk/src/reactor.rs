@@ -236,12 +236,7 @@ impl Pool {
     /// on all of them; None if there is none.
     pub fn alloc_range(&self, rs: &[usize], depth: u16) -> Option<u16> {
         let mut p = self.place.lock().unwrap_or_else(PoisonError::into_inner);
-        let used = rs.iter().fold(0u64, |a, &r| a | p.chunks[r]);
-        let (first, mask) = alloc_chunks(used, depth)?;
-        for &r in rs {
-            p.chunks[r] |= mask;
-        }
-        Some((first * CHUNK as usize) as u16)
+        alloc_range_in(&mut p.chunks, rs, depth)
     }
 
     /// Give reactor `r`'s part of a range back (and its tenancy's load).
@@ -265,6 +260,16 @@ fn chunks_for(depth: u16) -> usize {
 
 fn run_mask(first: usize, n: usize) -> u64 {
     if n >= 64 { u64::MAX } else { ((1u64 << n) - 1) << first }
+}
+
+/// `Pool::alloc_range` on explicit per-reactor chunk maps.
+fn alloc_range_in(chunks: &mut [u64], rs: &[usize], depth: u16) -> Option<u16> {
+    let used = rs.iter().fold(0u64, |a, &r| a | chunks[r]);
+    let (first, mask) = alloc_chunks(used, depth)?;
+    for &r in rs {
+        chunks[r] |= mask;
+    }
+    Some((first * CHUNK as usize) as u16)
 }
 
 /// First run of chunks free in `used` for `depth` slots: (first chunk, mask).
@@ -572,6 +577,14 @@ mod tests {
         assert_eq!(prim, [4, 4, 4, 4, 0, 0, 0, 0]);
         assert!(s.load.iter().max().unwrap() - s.load.iter().min().unwrap() <= 2, "balanced: {:?}", s.load);
         assert_eq!(s.load.iter().sum::<usize>(), 64);
+        // Distinct even when one reactor is far less loaded than the rest.
+        let mut s = st(4);
+        s.load = vec![0, 50, 50, 50];
+        let q = &place_with(&mut s, 1, 1, 4)[0];
+        let mut d = q.clone();
+        d.sort();
+        d.dedup();
+        assert_eq!(d.len(), 4, "{q:?}");
         // More threads than reactors: capped.
         let mut s = st(2);
         assert_eq!(place_with(&mut s, 1, 1, 4)[0].len(), 2);
@@ -589,20 +602,13 @@ mod tests {
         assert_eq!(alloc_chunks(u64::MAX, 256), None);
         assert_eq!(alloc_chunks(0, 16384), Some((0, u64::MAX)));
         assert_eq!(alloc_chunks(0, 65535), None);
-        let mut p = Placement { next_primary: 0, next_secondary: 0, load: vec![0; 4], chunks: vec![0; 4] };
-        let mut take = |rs: &[usize], p: &mut Placement| {
-            let used = rs.iter().fold(0u64, |a, &r| a | p.chunks[r]);
-            let (f, m) = alloc_chunks(used, 256).unwrap();
-            for &r in rs {
-                p.chunks[r] |= m;
-            }
-            f
-        };
-        assert_eq!(take(&[0, 1], &mut p), 0);
-        assert_eq!(take(&[2, 3], &mut p), 0, "disjoint reactors may reuse the range");
-        assert_eq!(take(&[1, 2], &mut p), 1, "reactor 1 and 2 both have chunk 0 in use");
-        p.chunks[1] &= !run_mask(0, 1);
-        assert_eq!(take(&[0, 1], &mut p), 2, "chunk 0 still used on reactor 0");
+        let mut c = vec![0u64; 4];
+        assert_eq!(alloc_range_in(&mut c, &[0, 1], 256), Some(0));
+        assert_eq!(alloc_range_in(&mut c, &[2, 3], 256), Some(0), "disjoint reactors may reuse the range");
+        assert_eq!(alloc_range_in(&mut c, &[1, 2], 256), Some(256), "chunk 0 is in use on reactors 1 and 2");
+        assert_eq!(c, vec![0b1, 0b11, 0b11, 0b1], "taken on every reactor of the queue");
+        c[1] &= !run_mask(0, 1);
+        assert_eq!(alloc_range_in(&mut c, &[0, 1], 256), Some(512), "chunk 0 still used on reactor 0, chunk 1 on reactor 1");
     }
 
     #[test]
