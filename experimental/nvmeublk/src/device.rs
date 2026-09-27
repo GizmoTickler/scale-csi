@@ -1131,7 +1131,7 @@ fn bring_up(
         if spec.seq_tags && !spec.batch_io { ", contiguous tags" } else { "" },
         if spec.hot_lane {
             let h = batchq::HotLane::from_env();
-            format!("batch I/O hot lane, primary lease {} cap {}, secondaries {}, watchdog {:?}", h.credits(true, depth).1, h.credits(true, depth).0, h.credits(false, depth).0, h.wedge)
+            format!("batch I/O hot lane, primary lease {} cap {}, secondaries {}, depth mode above {} held: runs of {}{}, watchdog {:?}", h.credits(true, false, depth).1, h.credits(true, false, depth).0, h.credits(false, false, depth).0, h.lease, h.credits(true, true, depth).1, if h.deep_spin { " (spinning)" } else { "" }, h.wedge)
         } else if spec.batch_io {
             format!("batch I/O, spill at {}", spec.batch_spill.clamp(1, depth))
         } else {

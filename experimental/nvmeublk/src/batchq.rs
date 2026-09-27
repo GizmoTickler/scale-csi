@@ -72,7 +72,7 @@ use libublk::helpers::IoBuf;
 use libublk::io::{UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue, UblkDev, UblkQueue};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -94,11 +94,27 @@ enum Prep {
 /// Hot-lane parameters (process-wide tuning, from the environment).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HotLane {
-    /// Most credits the primary keeps provided at once (NVMEUBLK_HOT_LEASE,
-    /// default 16); the primary holds at most depth - lease requests.
+    /// Most credits the primary keeps provided at once while the queue is
+    /// shallow (NVMEUBLK_HOT_LEASE, default 4); the primary holds at most
+    /// depth - lease requests. Also the depth-mode threshold: more than
+    /// `lease` requests held by the queue's threads switches it to depth
+    /// mode, `lease / 2` or fewer switches it back.
     pub lease: u16,
-    /// Credits of a secondary (NVMEUBLK_HOT_SECONDARY, default 4).
+    /// Credits of a secondary while the queue is shallow
+    /// (NVMEUBLK_HOT_SECONDARY, default 4).
     pub secondary: u16,
+    /// Depth mode: credits every thread gets per turn at the head of the
+    /// driver's fetch list (NVMEUBLK_HOT_DEEP_LEASE, default 2), i.e. the
+    /// run of consecutive requests one thread takes before the queue's next
+    /// ones go to the next thread. Spill-only for every thread (no refill
+    /// while armed: a thread that refilled after each fetch would keep the
+    /// head at a closed-loop arrival rate and funnel the queue again), so the
+    /// queue rotates over all its threads in runs of this many, as the
+    /// per-tag layout's tag chunks do.
+    pub deep_lease: u16,
+    /// Depth mode: the primary keeps its warm-window spin (NVMEUBLK_HOT_DEEP_SPIN,
+    /// default off: at depth completions arrive faster than a sleep costs).
+    pub deep_spin: bool,
     /// A primary neither turning nor sleeping this long is replaced
     /// (NVMEUBLK_HOT_WEDGE_MS, default 1000).
     pub wedge: Duration,
@@ -106,7 +122,7 @@ pub struct HotLane {
 
 impl Default for HotLane {
     fn default() -> Self {
-        HotLane { lease: 16, secondary: 4, wedge: Duration::from_millis(1000) }
+        HotLane { lease: 4, secondary: 4, deep_lease: 2, deep_spin: false, wedge: Duration::from_millis(1000) }
     }
 }
 
@@ -116,21 +132,61 @@ impl HotLane {
         HotLane {
             lease: env_u64("NVMEUBLK_HOT_LEASE", d.lease as u64).clamp(1, u16::MAX as u64) as u16,
             secondary: env_u64("NVMEUBLK_HOT_SECONDARY", d.secondary as u64).clamp(1, u16::MAX as u64) as u16,
+            deep_lease: env_u64("NVMEUBLK_HOT_DEEP_LEASE", d.deep_lease as u64).clamp(1, u16::MAX as u64) as u16,
+            deep_spin: env_u64("NVMEUBLK_HOT_DEEP_SPIN", d.deep_spin as u64) != 0,
             wedge: Duration::from_millis(env_u64("NVMEUBLK_HOT_WEDGE_MS", d.wedge.as_millis() as u64).max(10)),
         }
     }
 
     /// (spill cap, lease, refill) of a thread in this role, for a queue of
-    /// `depth` tags.
-    pub fn credits(&self, primary: bool, depth: u16) -> (u16, u16, bool) {
+    /// `depth` tags, shallow (`deep` false) or in depth mode.
+    ///
+    /// Shallow: the primary may hold all but `lease` tags and refills; a
+    /// secondary has `secondary` spill-only credits, so the head of the
+    /// driver's fetch list returns to the primary after a short run.
+    /// Depth mode: every thread gets `deep_lease` spill-only credits per
+    /// turn at the head, up to the primary's cap, so the queue rotates over
+    /// all its threads in runs of `deep_lease` requests; the cap still leaves
+    /// `lease` tags that one (possibly wedged) thread can never take.
+    pub fn credits(&self, primary: bool, deep: bool, depth: u16) -> (u16, u16, bool) {
         let depth = depth.max(2);
-        if primary {
-            let lease = self.lease.clamp(1, depth - 1);
+        let lease = self.lease.clamp(1, depth - 1);
+        if deep {
+            (depth - lease, self.deep_lease.clamp(1, depth - lease), false)
+        } else if primary {
             (depth - lease, lease, true)
         } else {
             let c = self.secondary.clamp(1, depth);
             (c, c, false)
         }
+    }
+
+    /// Depth-mode hysteresis: the queue's threads hold `held` requests in
+    /// all; `deep` is the mode now.
+    pub fn next_deep(&self, deep: bool, held: u32) -> bool {
+        let lease = self.lease.max(1) as u32;
+        if deep { held > lease / 2 } else { held > lease }
+    }
+
+    /// Whether a request's byte weight counts against this thread's cap:
+    /// only the shallow primary's (a large request makes it spill sooner, so
+    /// big transfers spread). A secondary's cap is a count of requests (a
+    /// 1 MiB request weighing 17 credits parked a 4-credit secondary until it
+    /// drained), and in depth mode the rotation spreads the bytes.
+    pub fn weighs(&self, primary: bool, deep: bool) -> bool {
+        primary && !deep
+    }
+
+    /// Whether this thread polls its ring without sleeping this turn.
+    /// Primary: while it has commands on the wire or is within the warm
+    /// window after the last one, but not in depth mode (unless deep_spin).
+    /// Secondary: only while shallow, holding requests and within
+    /// `spin_us` of its last event.
+    pub fn spins(&self, primary: bool, deep: bool, busy_or_warm: bool, holding: bool, recent_event: bool) -> bool {
+        if deep && !self.deep_spin {
+            return false;
+        }
+        if primary { busy_or_warm } else { !deep && holding && recent_event }
     }
 }
 
@@ -170,6 +226,10 @@ pub struct QueueShared {
     cv: Condvar,
     primary: AtomicU16,
     beats: Box<[Beat]>,
+    /// Hot lane: requests the queue's threads hold (fetched, not committed),
+    /// and whether the queue is in depth mode.
+    held: AtomicU32,
+    deep: AtomicBool,
 }
 
 impl Default for QueueShared {
@@ -183,7 +243,7 @@ impl QueueShared {
     pub fn new(threads: u16) -> Self {
         let now = mono_ns();
         let beats = (0..threads.max(1)).map(|_| Beat { at_ns: AtomicU64::new(now), waiting: AtomicBool::new(false) }).collect();
-        QueueShared { st: Mutex::new(Prep::Waiting), cv: Condvar::new(), primary: AtomicU16::new(0), beats }
+        QueueShared { st: Mutex::new(Prep::Waiting), cv: Condvar::new(), primary: AtomicU16::new(0), beats, held: AtomicU32::new(0), deep: AtomicBool::new(false) }
     }
 
     fn beat(&self, thread: u16, waiting: bool) {
@@ -195,6 +255,27 @@ impl QueueShared {
 
     pub fn primary(&self) -> u16 {
         self.primary.load(Ordering::Acquire)
+    }
+
+    /// A thread's held count moved from `was` to `now`: update the queue's
+    /// total. Returns the new total.
+    fn publish_held(&self, was: usize, now: usize) -> u32 {
+        let (was, now) = (was as u32, now as u32);
+        if now >= was {
+            self.held.fetch_add(now - was, Ordering::AcqRel) + (now - was)
+        } else {
+            self.held.fetch_sub(was - now, Ordering::AcqRel) - (was - now)
+        }
+    }
+
+    /// The queue's mode after its threads' held total became `held`.
+    fn update_deep(&self, hot: &HotLane, held: u32) -> bool {
+        let deep = self.deep.load(Ordering::Relaxed);
+        let next = hot.next_deep(deep, held);
+        if next != deep {
+            self.deep.store(next, Ordering::Relaxed);
+        }
+        next
     }
 
     /// Watchdog, run by any thread of the queue: take the primary role over
@@ -266,7 +347,7 @@ pub fn batch_config(leader: bool, spill: u16, depth: u16) -> UblkBatchConfig {
 
 /// As `batch_config`, for a hot-lane thread in the given role.
 pub fn hot_batch_config(leader: bool, primary: bool, hot: &HotLane, depth: u16) -> UblkBatchConfig {
-    let (spill, lease, refill) = hot.credits(primary, depth);
+    let (spill, lease, refill) = hot.credits(primary, false, depth);
     batch_config(leader, spill, depth).with_lease_tags(lease).with_refill(refill)
 }
 
@@ -394,6 +475,10 @@ pub fn queue_fn(
     // last watchdog check.
     let mut last_busy = Instant::now();
     let mut last_check = Instant::now();
+    // Hot lane depth mode (see HotLane::credits): this thread's view of it,
+    // and the held count it last published to the queue's total.
+    let mut deep = false;
+    let mut published_held = 0usize;
     let mut pending: Vec<UblkBatchCompletion> = Vec::with_capacity(depth as usize);
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(dev.tgt.cq_depth as usize);
     let mut arrived: Vec<u16> = Vec::with_capacity(depth as usize);
@@ -425,6 +510,12 @@ pub fn queue_fn(
                     log::error!("ublk device {dev_id} queue {qid} thread {thread}: commit failed: {e}");
                     break;
                 }
+            }
+        }
+        if let Some(h) = &hot {
+            if let Err(e) = follow_depth(&mut batch, &shared, h, is_primary, &mut deep, &mut published_held, depth) {
+                log::error!("ublk device {dev_id} queue {qid} thread {thread}: credit policy change failed: {e}");
+                break;
             }
         }
         let (tags, spills) = (batch.fetched_tag_count(), batch.spill_count());
@@ -474,7 +565,7 @@ pub fn queue_fn(
             let now_primary = shared.primary() == thread;
             if now_primary != is_primary {
                 is_primary = now_primary;
-                let (cap, lease, refill) = h.credits(is_primary, depth);
+                let (cap, lease, refill) = h.credits(is_primary, deep, depth);
                 if let Err(e) = batch.set_credit_policy(cap, lease, refill) {
                     log::error!("ublk device {dev_id} queue {qid} thread {thread}: role change failed: {e}");
                     break;
@@ -493,15 +584,15 @@ pub fn queue_fn(
         // Wait for events. Hot-lane primary: the warm window; otherwise
         // adaptive polling as in the per-tag loop.
         let spinning = match &hot {
-            Some(_) if is_primary => {
-                if engine.inflight_here() > 0 {
+            Some(h) => {
+                let on_wire = engine.inflight_here() > 0;
+                if on_wire {
                     last_busy = Instant::now();
-                    true
-                } else {
-                    last_busy.elapsed() < warm_window(engine.wire_rtt())
                 }
+                let warm = on_wire || last_busy.elapsed() < warm_window(engine.wire_rtt());
+                let holding = on_wire || batch.owned_tag_count() > 0;
+                h.spins(is_primary, deep, warm, holding, !spin.is_zero() && last_event.elapsed() < spin)
             }
-            Some(_) => !spin.is_zero() && (engine.inflight_here() > 0 || batch.owned_tag_count() > 0) && last_event.elapsed() < spin,
             None => !spin.is_zero() && (spin_idle || engine.inflight_here() > 0 || batch.owned_tag_count() > 0) && last_event.elapsed() < spin,
         };
         if !spinning {
@@ -546,7 +637,16 @@ pub fn queue_fn(
         // a request counts one extra credit per WEIGHT_KB of payload, so a
         // thread holding large requests spills sooner and big transfers
         // spread over the queue's threads, while small ones stay put.
-        if weight_bytes > 0 {
+        // Hot lane: the queue's mode moves with what its threads now hold
+        // (before the credits are settled), and only the shallow primary
+        // weighs requests (HotLane::weighs).
+        if let Some(h) = &hot {
+            if let Err(e) = follow_depth(&mut batch, &shared, h, is_primary, &mut deep, &mut published_held, depth) {
+                failed.get_or_insert(e);
+            }
+        }
+        let weigh = hot.as_ref().is_none_or(|h| h.weighs(is_primary, deep));
+        if weight_bytes > 0 && weigh {
             for &tag in arrived.iter() {
                 let bytes = (q_rc.get_iod(tag).nr_sectors as u64) << 9;
                 let extra = (bytes / weight_bytes).min(u16::MAX as u64) as u16;
@@ -570,6 +670,7 @@ pub fn queue_fn(
         }
     }
     shared.beat(thread, clean_exit);
+    shared.publish_held(published_held, 0);
     log::info!("ublk device {dev_id} queue {qid} thread {thread}: batch loop ended ({} requests, {} spills)", batch.fetched_tag_count(), batch.spill_count());
     // Drop order: the tag tasks and their executor, then the engine (its
     // Drop drives its tasks to their end on this ring), then the batch
@@ -580,6 +681,27 @@ pub fn queue_fn(
     drop(engine);
     drop(net_exe);
     drop(batch);
+}
+
+/// Hot lane: publish what this thread holds to its queue's total, follow the
+/// queue's mode, and switch this thread's credit policy when the mode
+/// changed.
+fn follow_depth(batch: &mut UblkBatchQueue, shared: &QueueShared, h: &HotLane, primary: bool, deep: &mut bool, published: &mut usize, depth: u16) -> Result<(), libublk::UblkError> {
+    let held = batch.owned_tag_count();
+    let total = if held != *published {
+        let t = shared.publish_held(*published, held);
+        *published = held;
+        t
+    } else {
+        shared.held.load(Ordering::Acquire)
+    };
+    let next = shared.update_deep(h, total);
+    if next != *deep {
+        *deep = next;
+        let (cap, lease, refill) = h.credits(primary, next, depth);
+        batch.set_credit_policy(cap, lease, refill)?;
+    }
+    Ok(())
 }
 
 /// Submit what is queued and wait for `wait` completions at most `timeout`.
@@ -627,19 +749,84 @@ mod tests {
     #[test]
     fn hot_lane_credits_per_role() {
         let h = HotLane::default();
-        assert_eq!(h.credits(true, 64), (48, 16, true));
-        assert_eq!(h.credits(false, 64), (4, 4, false));
+        assert_eq!(h.lease, 4, "lease 4 won 21 of 26 cells in the L3 run");
+        assert_eq!(h.credits(true, false, 64), (60, 4, true));
+        assert_eq!(h.credits(false, false, 64), (4, 4, false));
         let c = hot_batch_config(true, true, &h, 64);
         assert!(c.prepare_tags());
-        assert_eq!((c.spill_tags(), c.lease_tags(), c.refill()), (48, 16, true));
+        assert_eq!((c.spill_tags(), c.lease_tags(), c.refill()), (60, 4, true));
         let c = hot_batch_config(false, false, &h, 64);
         assert_eq!((c.spill_tags(), c.lease_tags(), c.refill()), (4, 4, false));
         // Tiny queues: the primary still leaves at least one tag.
-        assert_eq!(h.credits(true, 8), (1, 7, true));
-        assert_eq!(h.credits(true, 2), (1, 1, true));
+        let h16 = HotLane { lease: 16, ..h };
+        assert_eq!(h16.credits(true, false, 8), (1, 7, true));
+        assert_eq!(h16.credits(true, false, 2), (1, 1, true));
         let big = HotLane { lease: 100, secondary: 100, ..h };
-        assert_eq!(big.credits(true, 64), (1, 63, true));
-        assert_eq!(big.credits(false, 64), (64, 64, false));
+        assert_eq!(big.credits(true, false, 64), (1, 63, true));
+        assert_eq!(big.credits(false, false, 64), (64, 64, false));
+    }
+
+    /// Depth mode (L3b): every thread, secondaries included, takes short
+    /// spill-only runs up to the primary's cap, so a deep queue is shared by
+    /// all its threads instead of funnelled through the primary with the
+    /// secondaries parked at 4 requests; and the primary does not refill at
+    /// the head (it would keep the head at a closed-loop arrival rate).
+    #[test]
+    fn depth_mode_shares_the_queue_over_every_thread() {
+        let h = HotLane::default();
+        assert_eq!(h.credits(true, true, 64), (60, 2, false));
+        assert_eq!(h.credits(false, true, 64), (60, 2, false), "a deep secondary has the primary's cap");
+        let h = HotLane { deep_lease: 8, ..h };
+        assert_eq!(h.credits(false, true, 64), (60, 8, false));
+        // The run never exceeds the cap.
+        let h = HotLane { lease: 60, deep_lease: 50, ..h };
+        assert_eq!(h.credits(false, true, 64), (4, 4, false));
+    }
+
+    #[test]
+    fn depth_mode_has_hysteresis_around_the_lease() {
+        let h = HotLane::default(); // lease 4
+        assert!(!h.next_deep(false, 4), "QD4 on one queue stays on the primary");
+        assert!(h.next_deep(false, 5));
+        assert!(h.next_deep(true, 3), "no flapping just below the lease");
+        assert!(!h.next_deep(true, 2));
+        let q = QueueShared::new(4);
+        assert_eq!(q.publish_held(0, 3), 3);
+        assert_eq!(q.publish_held(0, 3), 6);
+        assert!(q.update_deep(&h, 6));
+        assert_eq!(q.publish_held(3, 0), 3);
+        assert!(q.update_deep(&h, 3), "still deep at 3");
+        assert_eq!(q.publish_held(3, 1), 1);
+        assert!(!q.update_deep(&h, 1));
+    }
+
+    /// Byte weights count only against the shallow primary's cap: a 1 MiB
+    /// request (17 credits) must not park a 4-credit secondary, and in depth
+    /// mode the rotation spreads the bytes.
+    #[test]
+    fn only_the_shallow_primary_weighs_requests() {
+        let h = HotLane::default();
+        assert!(h.weighs(true, false));
+        assert!(!h.weighs(false, false));
+        assert!(!h.weighs(true, true));
+        assert!(!h.weighs(false, true));
+    }
+
+    /// Spin only while shallow: at depth completions arrive faster than a
+    /// sleep costs, and a spinning primary through a deep run made the hot
+    /// lane cost more CPU per I/O than the kernel (L3 run).
+    #[test]
+    fn nothing_spins_in_depth_mode() {
+        let h = HotLane::default();
+        assert!(h.spins(true, false, true, true, true));
+        assert!(!h.spins(true, false, false, false, false), "idle primary past its warm window sleeps");
+        assert!(h.spins(false, false, false, true, true));
+        assert!(!h.spins(false, false, true, false, true), "a secondary holding nothing sleeps");
+        assert!(!h.spins(true, true, true, true, true));
+        assert!(!h.spins(false, true, true, true, true));
+        let h = HotLane { deep_spin: true, ..h };
+        assert!(h.spins(true, true, true, true, true));
+        assert!(!h.spins(false, true, true, true, true), "deep_spin keeps only the primary spinning");
     }
 
     #[test]
