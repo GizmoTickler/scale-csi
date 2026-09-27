@@ -344,7 +344,7 @@ enum ElemLayout {
     /// No address. With `auto_reg` (`UBLK_F_AUTO_BUF_REG`) the element's
     /// buffer index is the tag: the driver registers the request's pages at
     /// that index of the fetching ring's buffer table.
-    BufIndex { auto_reg: bool },
+    BufIndex { auto_reg: bool, base: u16 },
 }
 
 impl ElemLayout {
@@ -354,6 +354,7 @@ impl ElemLayout {
         } else {
             ElemLayout::BufIndex {
                 auto_reg: flags & sys::UBLK_F_AUTO_BUF_REG as u64 != 0,
+                base: 0,
             }
         }
     }
@@ -372,9 +373,21 @@ impl ElemLayout {
         }
     }
 
+    /// The layout of `queue`: its device's flags, and its buffer range on
+    /// a shared ring (`UblkQueue::buf_index`).
+    fn for_queue(queue: &UblkQueue<'_>) -> Self {
+        match Self::for_flags(queue.dev.dev_info.flags) {
+            ElemLayout::BufIndex { auto_reg, .. } => ElemLayout::BufIndex {
+                auto_reg,
+                base: queue.buf_index(0),
+            },
+            l => l,
+        }
+    }
+
     fn buffer_index(self, tag: u16) -> u16 {
         match self {
-            ElemLayout::BufIndex { auto_reg: true } => tag,
+            ElemLayout::BufIndex { auto_reg: true, base } => base.wrapping_add(tag),
             _ => 0,
         }
     }
@@ -716,8 +729,14 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
         if queue.dev.dev_info.flags & sys::UBLK_F_BATCH_IO as u64 == 0 {
             return Err(UblkError::OtherError(-libc::EOPNOTSUPP));
         }
-        let layout = ElemLayout::for_flags(queue.dev.dev_info.flags);
-        let config = config.effective(queue.get_depth());
+        let layout = ElemLayout::for_queue(queue);
+        let mut config = config.effective(queue.get_depth());
+        if let Some(slot) = queue.shared_slot() {
+            // One provided-buffer group per queue on a shared ring.
+            if config.fetch_buffer_group == UblkBatchConfig::new().fetch_buffer_group {
+                config.fetch_buffer_group = config.fetch_buffer_group.wrapping_add(slot.key);
+            }
+        }
         Self::validate(queue, layout, buffers.slice(), config)?;
         let submission_capacity = with_task_io_ring_mut(|ring| ring.submission().capacity());
         validate_initial_fetch_capacity(config.fetch_command_count, submission_capacity)?;
@@ -1155,8 +1174,8 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     where
         F: FnMut(&mut Self, &[u16]) -> Result<(), UblkError>,
     {
-        let qid = self.queue.get_qid();
-        let Some((operation, command_id)) = parse_batch_user_data(cqe.user_data(), qid) else {
+        let key = self.queue.ring_key();
+        let Some((operation, command_id)) = parse_batch_user_data(cqe.user_data(), key) else {
             return Ok(false);
         };
         match operation {
@@ -1341,15 +1360,16 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
             elements.push(tag as u16, layout.buffer_index(tag as u16), 0, address);
         }
         let entry = batch_command(
+            queue.file_slot(),
             sys::UBLK_U_IO_PREP_IO_CMDS,
             batch_header(queue.get_qid(), layout, elements.len()),
             elements.addr_at(0),
-            batch_user_data(BATCH_PREP_OP, queue.get_qid(), 0),
+            batch_user_data(BATCH_PREP_OP, queue.ring_key(), 0),
         );
         let result = submit_and_wait(
             queue,
             entry,
-            batch_user_data(BATCH_PREP_OP, queue.get_qid(), 0),
+            batch_user_data(BATCH_PREP_OP, queue.ring_key(), 0),
         )?;
         check_zero_result(result)
     }
@@ -1368,10 +1388,11 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
             .get(&commit_id)
             .ok_or(UblkError::InvalidVal)?;
         let entry = batch_command(
+            self.queue.file_slot(),
             sys::UBLK_U_IO_COMMIT_IO_CMDS,
             batch_header(self.queue.get_qid(), self.layout, commit.remaining_len()),
             commit.remaining_addr(),
-            batch_user_data(BATCH_COMMIT_OP, self.queue.get_qid(), commit_id),
+            batch_user_data(BATCH_COMMIT_OP, self.queue.ring_key(), commit_id),
         );
         self.queue.ublk_submit_sqe_sync(entry)
     }
@@ -1551,7 +1572,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
         let entry = remove_buffers_entry(
             self.remove_remaining,
             self.config.fetch_buffer_group,
-            batch_user_data(BATCH_REMOVE_OP, self.queue.get_qid(), 0),
+            batch_user_data(BATCH_REMOVE_OP, self.queue.ring_key(), 0),
         );
         self.queue.ublk_submit_sqe_sync(entry)
     }
@@ -1613,9 +1634,9 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
                 group,
                 buffer_id,
                 buffer,
-                batch_user_data(BATCH_SETUP_PROVIDE_OP, queue.get_qid(), buffer_id),
+                batch_user_data(BATCH_SETUP_PROVIDE_OP, queue.ring_key(), buffer_id),
             ),
-            batch_user_data(BATCH_SETUP_PROVIDE_OP, queue.get_qid(), buffer_id),
+            batch_user_data(BATCH_SETUP_PROVIDE_OP, queue.ring_key(), buffer_id),
         )?;
         check_zero_result(result)
     }
@@ -1630,7 +1651,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
             group,
             buffer_id,
             buffer,
-            batch_user_data(BATCH_PROVIDE_OP, queue.get_qid(), buffer_id),
+            batch_user_data(BATCH_PROVIDE_OP, queue.ring_key(), buffer_id),
         ))
     }
 
@@ -1639,7 +1660,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
         group: u16,
         count: u16,
     ) -> Result<(), UblkError> {
-        let user_data = batch_user_data(BATCH_REMOVE_OP, queue.get_qid(), 0);
+        let user_data = batch_user_data(BATCH_REMOVE_OP, queue.ring_key(), 0);
         let mut remaining = count;
         while remaining != 0 {
             let result = submit_and_wait(
@@ -1749,6 +1770,21 @@ fn batch_user_data(operation: u32, qid: u16, command_id: u16) -> u64 {
         | BATCH_USER_DATA_MAGIC << BATCH_USER_DATA_MAGIC_SHIFT
 }
 
+/// The ring-local key (`UblkQueue::ring_key`) of the batch queue a CQE
+/// belongs to, or None if it is not a batch command's: for a loop serving
+/// several batch queues on one ring, to route each CQE to its queue.
+pub fn batch_cqe_key(user_data: u64) -> Option<u16> {
+    let target = crate::UblkUringData::Target as u64;
+    let reserved = 0x7f_u64 << 56;
+    if user_data & target == 0
+        || user_data & reserved != 0
+        || (user_data >> BATCH_USER_DATA_MAGIC_SHIFT) & 0xffff != BATCH_USER_DATA_MAGIC
+    {
+        return None;
+    }
+    Some(UblkIOCtx::user_data_to_tag(user_data) as u16)
+}
+
 fn parse_batch_user_data(user_data: u64, qid: u16) -> Option<(u32, u16)> {
     let target = crate::UblkUringData::Target as u64;
     let reserved = 0x7f_u64 << 56;
@@ -1772,12 +1808,13 @@ fn release_buffer_group(group: u16) {
 }
 
 fn batch_command(
+    file_slot: u32,
     command: u32,
     header: sys::ublk_batch_io,
     address: u64,
     user_data: u64,
 ) -> squeue::Entry {
-    opcode::UringCmd16::new(types::Fixed(0), command)
+    opcode::UringCmd16::new(types::Fixed(file_slot), command)
         .cmd(unsafe { transmute::<sys::ublk_batch_io, [u8; 16]>(header) })
         .addr(Some(address))
         .build()
@@ -1810,10 +1847,11 @@ fn remove_buffers_entry(count: u16, group: u16, user_data: u64) -> squeue::Entry
 fn fetch_entry(queue: &UblkQueue<'_>, config: UblkBatchConfig, fetch_id: u16) -> squeue::Entry {
     let header = batch_fetch_header(queue.get_qid());
     let mut entry = batch_command(
+        queue.file_slot(),
         sys::UBLK_U_IO_FETCH_IO_CMDS,
         header,
         0,
-        batch_user_data(BATCH_FETCH_OP, queue.get_qid(), fetch_id),
+        batch_user_data(BATCH_FETCH_OP, queue.ring_key(), fetch_id),
     )
     .flags(squeue::Flags::BUFFER_SELECT);
     unsafe {
@@ -2088,6 +2126,35 @@ mod tests {
         assert!(commit
             .advance((2 * size_of::<BatchElement>()) as i32)
             .is_err());
+    }
+
+    /// Several batch queues on one shared ring: each CQE names its queue's
+    /// ring-local key, so a loop can route it; other CQEs are not batch
+    /// CQEs. Keys, not queue ids: two devices' queue 0 share a ring.
+    #[test]
+    fn batch_cqes_route_by_ring_key() {
+        for key in [0u16, 3, 300, 0x7fff] {
+            for op in [BATCH_FETCH_OP, BATCH_COMMIT_OP, BATCH_PROVIDE_OP, BATCH_REMOVE_OP] {
+                let ud = batch_user_data(op, key, 9);
+                assert_eq!(batch_cqe_key(ud), Some(key));
+                assert_eq!(parse_batch_user_data(ud, key), Some((op, 9)));
+                assert_eq!(parse_batch_user_data(ud, key ^ 1), None, "another queue's CQE");
+            }
+        }
+        assert_eq!(batch_cqe_key(UblkIOCtx::build_user_data(3, BATCH_FETCH_OP, 7, true)), None);
+        assert_eq!(batch_cqe_key(UblkIOCtx::build_user_data_async(3, 1, 7)), None);
+        assert_eq!(batch_cqe_key(0), None);
+    }
+
+    /// On a shared ring a queue's zero-copy buffer indexes start at its
+    /// range's base (every ring serving the queue reserves the same range).
+    #[test]
+    fn shared_ring_buffer_indexes_start_at_the_base() {
+        let zc = ElemLayout::BufIndex { auto_reg: true, base: 512 };
+        assert_eq!(zc.buffer_index(0), 512);
+        assert_eq!(zc.buffer_index(9), 521);
+        let ucopy = ElemLayout::BufIndex { auto_reg: false, base: 512 };
+        assert_eq!(ucopy.buffer_index(9), 0, "no auto registration: no index");
     }
 
     #[test]
@@ -2395,20 +2462,20 @@ mod tests {
                 | sys::UBLK_F_USER_COPY
                 | sys::UBLK_F_SUPPORT_ZERO_COPY) as u64,
         );
-        assert_eq!(zc, ElemLayout::BufIndex { auto_reg: true });
+        assert_eq!(zc, ElemLayout::BufIndex { auto_reg: true, base: 0 });
         let h = batch_header(1, zc, 4);
         assert_eq!(h.elem_bytes, 8);
         assert_eq!(h.flags, 0);
         assert_eq!(zc.buffer_index(9), 9);
 
         let ucopy = ElemLayout::for_flags((sys::UBLK_F_BATCH_IO | sys::UBLK_F_USER_COPY) as u64);
-        assert_eq!(ucopy, ElemLayout::BufIndex { auto_reg: false });
+        assert_eq!(ucopy, ElemLayout::BufIndex { auto_reg: false, base: 0 });
         assert_eq!(ucopy.buffer_index(9), 0);
     }
 
     #[test]
     fn packed_elements_advance_by_their_own_size() {
-        let mut e = Elems::with_capacity(ElemLayout::BufIndex { auto_reg: true }, 4);
+        let mut e = Elems::with_capacity(ElemLayout::BufIndex { auto_reg: true, base: 0 }, 4);
         for tag in [3u16, 5, 7] {
             e.push(tag, tag, 4096, 0);
         }

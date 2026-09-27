@@ -3259,6 +3259,46 @@ impl UblkCtrl {
         self.start_dev_until(&dev, deadline)?;
 
         Ok(UblkTargetThreads {
+            handles: handles.into_iter().map(QueueJoin::Thread).collect(),
+            dev_id: dev.dev_info.dev_id,
+            dev: Some(dev),
+        })
+    }
+
+    /// As [`start_target_until`](Self::start_target_until), for a server
+    /// whose queues are not threads of their own (tenancies on rings that
+    /// threads of the server share with other devices). `launch` arranges
+    /// for every (queue, io thread) of the device to be served somewhere and
+    /// returns, for each, the queue id, the tid of the thread serving it,
+    /// and a latch its server sets once it has stopped serving. A server
+    /// must call [`UblkDev::note_queue_thread_exit`] when it stops (START
+    /// gives up on a device whose server left before preparing it).
+    pub fn start_target_on<T, L>(
+        &self,
+        tgt_fn: T,
+        launch: L,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<UblkTargetThreads, UblkError>
+    where
+        T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
+        L: FnOnce(&Arc<UblkDev>) -> Vec<(u16, libc::pid_t, Arc<UblkQueueLatch>)>,
+    {
+        init_ctrl_task_ring_default(16)?;
+
+        let dev = Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);
+        let servers = launch(&dev);
+        for (qid, tid, _) in &servers {
+            if let Err(e) = self.configure_queue(&dev, *qid, *tid) {
+                eprintln!(
+                    "Warning: configure queue failed for {}-{}: {:?}",
+                    dev.dev_info.dev_id, qid, e
+                );
+            }
+        }
+        let handles = servers.into_iter().map(|(_, _, l)| QueueJoin::Latch(l)).collect();
+        self.start_dev_until(&dev, deadline)?;
+
+        Ok(UblkTargetThreads {
             handles,
             dev_id: dev.dev_info.dev_id,
             dev: Some(dev),
@@ -3315,8 +3355,12 @@ impl UblkCtrl {
             dev,
         } = target;
         for qh in handles {
-            qh.join()
-                .unwrap_or_else(|_| eprintln!("dev-{} join queue thread failed", dev_id));
+            match qh {
+                QueueJoin::Thread(h) => h
+                    .join()
+                    .unwrap_or_else(|_| eprintln!("dev-{} join queue thread failed", dev_id)),
+                QueueJoin::Latch(l) => l.wait(),
+            }
         }
         Ok(dev)
     }
@@ -3356,9 +3400,47 @@ impl UblkCtrl {
 /// Dropping it detaches the threads: they keep serving the device until it
 /// is stopped, and the char device closes when the last of them returns.
 pub struct UblkTargetThreads {
-    handles: Vec<std::thread::JoinHandle<()>>,
+    handles: Vec<QueueJoin>,
     dev_id: u32,
     dev: Option<Arc<UblkDev>>,
+}
+
+/// How one queue server of a started device is waited for.
+enum QueueJoin {
+    Thread(std::thread::JoinHandle<()>),
+    Latch(Arc<UblkQueueLatch>),
+}
+
+/// Set by a queue server that is not a thread of its own
+/// ([`UblkCtrl::start_target_on`]) once it has stopped serving its queue.
+#[derive(Debug, Default)]
+pub struct UblkQueueLatch {
+    done: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl UblkQueueLatch {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The server has stopped.
+    pub fn set(&self) {
+        *self.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.cv.notify_all();
+    }
+
+    pub fn is_set(&self) -> bool {
+        *self.done.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait until the server has stopped.
+    pub fn wait(&self) {
+        let mut d = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*d {
+            d = self.cv.wait(d).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 impl UblkTargetThreads {

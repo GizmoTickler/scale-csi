@@ -200,7 +200,7 @@ use std::sync::{Arc, Condvar, Mutex};
 // queue-ring and buffer-registration machinery without exposing those details.
 #[path = "io_batch.rs"]
 mod batch;
-pub use batch::{UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue};
+pub use batch::{batch_cqe_key, UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue};
 
 // Unified thread-local io_uring for all queue operations
 
@@ -240,7 +240,24 @@ pub fn io_thread_idx() -> u16 {
     IO_THREAD_IDX.with(|c| c.get())
 }
 
-pub(crate) fn defer_queue_cqe(cqe: cqueue::Entry) {
+/// Clear buffer-table slots `[base, base + n)` of this thread's queue ring
+/// (a null iovec unregisters a slot, whoever registered it).
+pub fn clear_buffer_range(base: u32, n: u32) -> Result<(), UblkError> {
+    let iov = vec![
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0
+        };
+        n as usize
+    ];
+    with_task_io_ring_mut(|ring| unsafe { ring.submitter().register_buffers_update(base, &iov, None) })
+        .map_err(UblkError::IOError)
+}
+
+/// Set a CQE aside for the thread's event loop (see
+/// [`pop_deferred_queue_cqe`]): for code that reaps the ring outside that
+/// loop and finds completions that belong to it.
+pub fn defer_queue_cqe(cqe: cqueue::Entry) {
     DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().push_back(cqe));
 }
 
@@ -1341,7 +1358,7 @@ impl UblkDev {
 
     /// A queue thread of this device returned or unwound. Called by the
     /// thread wrapper of [`UblkCtrl::start_target`](crate::ctrl::UblkCtrl::start_target).
-    pub(crate) fn note_queue_thread_exit(&self) {
+    pub fn note_queue_thread_exit(&self) {
         let (lock, cvar) = &*self.buf_reg_sync;
         lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).threads_exited += 1;
         cvar.notify_all();
@@ -1518,6 +1535,32 @@ pub struct UblkQueue<'a> {
     buf_reg_semaphore: Semaphore,
     /// Counter tracking number of registered buffers for optimization
     buf_reg_counter: RefCell<u32>,
+    /// Shared-ring placement (`new_shared`): which fixed-file slot names the
+    /// char device, where this queue's buffer-table range starts, and the
+    /// ring-local key its batch commands carry. `None`: this queue owns its
+    /// thread's ring (file slot 0, buffer index = tag, key = queue id).
+    shared: Option<UblkSharedSlot>,
+}
+
+/// Where a [`UblkQueue`] lives on a ring shared with other queues (of the
+/// same or other devices): see [`UblkQueue::new_shared`].
+///
+/// The ring owner registers a sparse file table and a sparse buffer table
+/// once (`register_files_sparse`, `register_buffers_sparse`) and hands every
+/// queue on it a distinct `file_slot`, a distinct `key`, and a buffer range
+/// `[buf_base, buf_base + depth)`. With `UBLK_F_BATCH_IO` and
+/// `UBLK_F_AUTO_BUF_REG` the driver registers a request's pages at the index
+/// the tag's last PREP/COMMIT named, in whichever ring fetches it, so every
+/// ring serving one ublk queue must reserve the *same* range for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UblkSharedSlot {
+    /// Fixed-file slot holding the device's char device on this ring.
+    pub file_slot: u32,
+    /// First buffer-table index of this queue's range (index = base + tag).
+    pub buf_base: u16,
+    /// Ring-local key carried in this queue's batch command user_data in
+    /// place of the queue id (distinct per queue on the ring).
+    pub key: u16,
 }
 
 impl AsRawFd for UblkQueue<'_> {
@@ -1530,6 +1573,28 @@ impl Drop for UblkQueue<'_> {
     fn drop(&mut self) {
         let dev = self.dev;
         log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
+
+        if let Some(slot) = self.shared {
+            // A shared ring: clear only this queue's file slot and buffer
+            // range; the tables stay registered for the other queues.
+            let depth = dev.dev_info.queue_depth as u32;
+            if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
+                .submitter()
+                .register_files_update(slot.file_slot, &[-1]))
+            {
+                log::error!("clear fixed file slot {} failed {}", slot.file_slot, r);
+            }
+            if self.support_auto_buf_zc() {
+                if let Err(r) = clear_buffer_range(slot.buf_base as u32, depth) {
+                    log::error!("clear buffer range {}+{} failed {}", slot.buf_base, depth, r);
+                }
+            }
+            let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
+            unsafe {
+                libc::munmap(self.io_cmd_buf as *mut libc::c_void, cmd_buf_sz);
+            }
+            return;
+        }
 
         if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
             .submitter()
@@ -1732,11 +1797,43 @@ impl UblkQueue<'_> {
     /// tag set from [`Self::tags`] (interleaved, or one contiguous block
     /// under `UBLK_DEV_F_SEQ_TAG_PARTITION`), submits FETCH for those
     /// tags only, and expects buffer registrations for those tags only.
-    #[allow(clippy::uninit_vec)]
     pub fn new_for_thread(
         q_id: u16,
         dev: &UblkDev,
         thread_idx: u16,
+    ) -> Result<UblkQueue<'_>, UblkError> {
+        Self::new_placed(q_id, dev, thread_idx, None)
+    }
+
+    /// As [`new_for_thread`](Self::new_for_thread), on a ring this thread
+    /// shares with other queues: the ring's sparse file and buffer tables
+    /// are already registered by its owner (they are not registered here,
+    /// and dropping the queue clears only `slot`'s file slot and buffer
+    /// range). The char device is installed at `slot.file_slot`, every
+    /// ublk command of this queue names that slot, zero-copy buffer indexes
+    /// are `slot.buf_base + tag`, and batch commands carry `slot.key`.
+    /// Batch I/O only (`UBLK_F_BATCH_IO`).
+    pub fn new_shared(
+        q_id: u16,
+        dev: &UblkDev,
+        thread_idx: u16,
+        slot: UblkSharedSlot,
+    ) -> Result<UblkQueue<'_>, UblkError> {
+        if dev.dev_info.flags & sys::UBLK_F_BATCH_IO as u64 == 0 {
+            return Err(UblkError::OtherError(-libc::EOPNOTSUPP));
+        }
+        if slot.buf_base as u32 + dev.dev_info.queue_depth as u32 > u16::MAX as u32 + 1 {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+        Self::new_placed(q_id, dev, thread_idx, Some(slot))
+    }
+
+    #[allow(clippy::uninit_vec)]
+    fn new_placed(
+        q_id: u16,
+        dev: &UblkDev,
+        thread_idx: u16,
+        shared: Option<UblkSharedSlot>,
     ) -> Result<UblkQueue<'_>, UblkError> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
@@ -1768,13 +1865,21 @@ impl UblkQueue<'_> {
         let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
 
         // Register files and buffers with the thread-local ring
-        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-            ring.submitter()
-                .register_files(&tgt.fds[0..tgt.nr_fds as usize])
-                .map_err(UblkError::IOError)
-        })?;
+        if let Some(slot) = shared {
+            with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                ring.submitter()
+                    .register_files_update(slot.file_slot, &tgt.fds[0..1])
+                    .map_err(UblkError::IOError)
+            })?;
+        } else {
+            with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                ring.submitter()
+                    .register_files(&tgt.fds[0..tgt.nr_fds as usize])
+                    .map_err(UblkError::IOError)
+            })?;
+        }
 
-        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+        if shared.is_none() && (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
             with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
                 ring.submitter()
                     .register_buffers_sparse(depth)
@@ -1795,7 +1900,13 @@ impl UblkQueue<'_> {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(UblkError::IOError(std::io::Error::last_os_error()));
+            let err = std::io::Error::last_os_error();
+            if let Some(slot) = shared {
+                let _ = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
+                    .submitter()
+                    .register_files_update(slot.file_slot, &[-1]));
+            }
+            return Err(UblkError::IOError(err));
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
@@ -1842,6 +1953,7 @@ impl UblkQueue<'_> {
             bufs: RefCell::new(bufs),
             buf_reg_semaphore: Semaphore::new(0),
             buf_reg_counter: RefCell::new(0),
+            shared,
         };
 
         log::info!(
@@ -1941,6 +2053,32 @@ impl UblkQueue<'_> {
     #[inline(always)]
     pub fn nr_tags(&self) -> u32 {
         self.nr_tags
+    }
+
+    /// Fixed-file slot of the char device on this queue's ring (0 unless
+    /// the ring is shared, see [`new_shared`](Self::new_shared)).
+    #[inline(always)]
+    pub fn file_slot(&self) -> u32 {
+        self.shared.map_or(0, |s| s.file_slot)
+    }
+
+    /// Buffer-table index of `tag`'s zero-copy registration on this
+    /// queue's ring: the tag itself, or `buf_base + tag` on a shared ring.
+    #[inline(always)]
+    pub fn buf_index(&self, tag: u16) -> u16 {
+        self.shared.map_or(tag, |s| s.buf_base.wrapping_add(tag))
+    }
+
+    /// Key this queue's batch commands carry in their user_data: the queue
+    /// id, or the ring-local key on a shared ring.
+    #[inline(always)]
+    pub fn ring_key(&self) -> u16 {
+        self.shared.map_or(self.q_id, |s| s.key)
+    }
+
+    /// The shared-ring placement, if any.
+    pub fn shared_slot(&self) -> Option<UblkSharedSlot> {
+        self.shared
     }
 
     /// Return queue id
@@ -2153,7 +2291,7 @@ impl UblkQueue<'_> {
             cmd_op
         };
 
-        let mut sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
+        let mut sqe = opcode::UringCmd16::new(types::Fixed(self.file_slot()), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
@@ -2593,7 +2731,7 @@ impl UblkQueue<'_> {
             op
         };
 
-        let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
+        let sqe = opcode::UringCmd16::new(types::Fixed(self.file_slot()), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
