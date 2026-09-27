@@ -90,15 +90,18 @@ const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
 /// Bounded turns (design doc §4.4 L4): a queue thread never copies more
 /// than one chunk of a read's payload per receive it runs itself.
 /// - A payload of at least ASYNC_RX_MIN bytes (NVMEUBLK_ASYNC_RX_MIN,
-///   default 256 KiB; 0 = never) is received with IOSQE_ASYNC: an io-wq
-///   worker does the socket-to-page copy, whole, while the thread keeps
-///   turning (commands out, other completions back).
+///   default 0 = never) is received with IOSQE_ASYNC: an io-wq worker does
+///   the socket-to-page copy, whole, while the thread keeps turning. Off by
+///   default: measured on VM 106 (run l4-20260927T021339Z) it cost 1M read
+///   QD16 16% (3,116 vs 3,722 MiB/s): a socket read returns what has
+///   arrived, so a 1 MiB payload is several io-wq round trips, each with a
+///   poll re-arm and a worker wake.
 /// - A smaller one is received inline in chunks of at most RX_ZC_CHUNK bytes
 ///   (NVMEUBLK_RX_ZC_CHUNK, default 64 KiB; 0 = unbounded), so a small
 ///   completion behind it waits for one chunk's copy (~5-10 µs), not a whole
 ///   payload's.
 static ASYNC_RX_MIN: std::sync::LazyLock<usize> =
-    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256 * 1024));
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
 static RX_ZC_CHUNK: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_RX_ZC_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64 * 1024));
 
@@ -3064,9 +3067,9 @@ mod tests {
         assert_eq!(zc_rx_step(1 << 20, 4096, k64, k256), (4096, true), "async follows the PDU, not what is left");
         assert_eq!(zc_rx_step(1 << 20, 1 << 20, k64, 0), (k64, false), "async off: still chunked");
         assert_eq!(zc_rx_step(1 << 20, 1 << 20, 0, 0), (1 << 20, false), "both off: the old unbounded receive");
-        // The defaults are the bounded ones.
+        // The defaults: 64 KiB inline chunks; io-wq receive off (measured slower).
         if std::env::var_os("NVMEUBLK_RX_ZC_CHUNK").is_none() && std::env::var_os("NVMEUBLK_ASYNC_RX_MIN").is_none() {
-            assert_eq!((*RX_ZC_CHUNK, *ASYNC_RX_MIN), (k64, k256));
+            assert_eq!((*RX_ZC_CHUNK, *ASYNC_RX_MIN), (k64, 0));
         }
     }
 
