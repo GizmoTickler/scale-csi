@@ -199,6 +199,33 @@ pub fn primary_hot(on_wire: bool, since_event: Duration, since_busy: Duration, r
     if on_wire { since_event < spin_cap(rtt) } else { since_busy < warm_window(rtt) }
 }
 
+/// The hot-lane primary's warm-window clock. A turn that finds the wire
+/// empty right after a turn that had commands on it is still a busy moment:
+/// the last completion has just come in. Counting busy time only from turns
+/// that saw commands on the wire lost the warm window after any command
+/// longer than the spin cap (a flush: 1-3 ms), because the thread slept
+/// through it and its last busy turn was from before the sleep; the next
+/// request (fio's write after its fsync) then found the primary asleep.
+pub struct WarmClock {
+    last_busy: Instant,
+    was_on_wire: bool,
+}
+
+impl WarmClock {
+    pub fn new(now: Instant) -> Self {
+        WarmClock { last_busy: now, was_on_wire: false }
+    }
+
+    /// This turn: whether the primary is hot (see `primary_hot`).
+    pub fn turn(&mut self, on_wire: bool, now: Instant, since_event: Duration, rtt: Option<Duration>) -> bool {
+        if on_wire || self.was_on_wire {
+            self.last_busy = now;
+        }
+        self.was_on_wire = on_wire;
+        primary_hot(on_wire, since_event, now.saturating_duration_since(self.last_busy), rtt)
+    }
+}
+
 /// How long a primary with commands on the wire keeps spinning without an
 /// event: 4 x the warm window, at most 1 ms.
 pub fn spin_cap(rtt: Option<Duration>) -> Duration {
@@ -480,9 +507,8 @@ pub fn queue_fn(
     let timeout = io_uring::types::Timespec::new().sec(20);
     let weight_bytes = env_u64("NVMEUBLK_BATCH_WEIGHT_KB", 64) << 10;
     let mut last_event = Instant::now();
-    // Hot lane: last turn with a command on the wire (warm window), and the
-    // last watchdog check.
-    let mut last_busy = Instant::now();
+    // Hot lane: the warm-window clock, and the last watchdog check.
+    let mut warm = WarmClock::new(Instant::now());
     let mut last_check = Instant::now();
     // Hot lane depth mode (see HotLane::credits): this thread's view of it,
     // and the held count it last published to the queue's total.
@@ -595,10 +621,7 @@ pub fn queue_fn(
         let spinning = match &hot {
             Some(h) => {
                 let on_wire = engine.inflight_here() > 0;
-                if on_wire {
-                    last_busy = Instant::now();
-                }
-                let hot = primary_hot(on_wire, last_event.elapsed(), last_busy.elapsed(), engine.wire_rtt());
+                let hot = warm.turn(on_wire, Instant::now(), last_event.elapsed(), engine.wire_rtt());
                 let holding = on_wire || batch.owned_tag_count() > 0;
                 h.spins(is_primary, deep, hot, holding, !spin.is_zero() && last_event.elapsed() < spin)
             }
@@ -879,6 +902,26 @@ mod tests {
         assert!(!primary_hot(true, us(1500), us(0), rtt), "1.5 ms without an event on one command");
         assert!(primary_hot(false, us(5000), us(200), rtt), "warm window after the wire went empty");
         assert!(!primary_hot(false, us(5000), us(300), rtt));
+    }
+
+    /// The warm window follows the completion of a long command: the
+    /// primary stopped spinning 1 ms into a 3 ms flush and slept; when the
+    /// flush completes it is hot again for the warm window, so the next
+    /// write finds it awake.
+    #[test]
+    fn the_warm_window_follows_a_long_command() {
+        let rtt = Some(Duration::from_micros(160)); // warm window 240 us, spin cap 960 us
+        let us = Duration::from_micros;
+        let t0 = Instant::now();
+        let mut w = WarmClock::new(t0);
+        assert!(w.turn(true, t0, us(0), rtt), "flush on the wire, fresh event");
+        assert!(!w.turn(true, t0 + us(1500), us(1500), rtt), "no event for 1.5 ms: sleeps");
+        // The flush completes during the sleep; this turn reaped it.
+        assert!(w.turn(false, t0 + us(3000), us(0), rtt), "warm right after the completion");
+        assert!(w.turn(false, t0 + us(3200), us(200), rtt), "still inside the window");
+        assert!(!w.turn(false, t0 + us(3300), us(300), rtt), "window over");
+        // Idle stays cold.
+        assert!(!w.turn(false, t0 + us(9000), us(6000), rtt));
     }
 
     #[test]
