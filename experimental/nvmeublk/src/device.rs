@@ -1127,6 +1127,7 @@ fn bring_up(
         napi_us: spec.napi_us,
         fault_dir,
         quiesce,
+        path_offset: 0,
     };
     log::info!(
         "{}: {} blocks of {} B, {} queues x {} ({} threads/queue{}, {}), zero_copy={} napi_us={} write fence {} ms",

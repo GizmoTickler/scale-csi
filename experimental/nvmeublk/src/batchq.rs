@@ -520,6 +520,7 @@ pub fn queue_fn(
     let mut cfg = cfg;
     let user_copy = dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64 != 0;
     cfg.cdev_fd = if user_copy { dev.tgt.fds[0] } else { -1 };
+    cfg.path_offset = dev.dev_info.dev_id as usize;
     let cdev_fd = cfg.cdev_fd;
     let zc = dev.dev_info.flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0;
     if zc {

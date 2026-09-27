@@ -186,16 +186,25 @@ pub const SMALL_IO: usize = 32 * 1024;
 
 /// Whether a command belongs on a small-class connection (L5): payload at
 /// most SMALL_IO, and flushes (no payload, and what a database waits on).
-/// Last tie-break of the path choice: engine `eid` prefers path
-/// `eid % n_paths`, then the following ones in order. Equal counts used to go
+/// The tie-break key of engine `eid` (see `path_rank`): the engine id, plus
+/// one per full round of paths so that equal thread indexes of different
+/// queues (the queues' primaries, thread 0) prefer different paths, plus
+/// `offset` (the device).
+pub fn path_rank_key(eid: u16, n_paths: usize, offset: usize) -> usize {
+    let n = n_paths.max(1);
+    eid as usize + eid as usize / n + offset
+}
+
+/// Last tie-break of the path choice: key `eid` (see `path_rank_key`)
+/// prefers path `eid % n_paths`, then the following ones in order. Equal counts used to go
 /// to the lowest path index in every engine, so across a device path 0 took
 /// the most and the last path the least (matrix-20260927T051306Z: path_MiB
 /// [226280, 202747, 163201, 145410]; a single 1M stream left path 204 at
 /// 3-7 Gbps while each path alone delivers ~9.8 Gbps). A low-depth stream
 /// still stays on one connection: its engine's first path.
-pub fn path_rank(path: usize, eid: u16, n_paths: usize) -> usize {
+pub fn path_rank(path: usize, eid: usize, n_paths: usize) -> usize {
     let n = n_paths.max(1);
-    (path % n + n - eid as usize % n) % n
+    (path % n + n - eid % n) % n
 }
 
 pub fn is_small_cmd(op: Op, len: usize) -> bool {
@@ -536,6 +545,10 @@ pub struct QConfig {
     /// Set while the daemon drains for a graceful restart: new requests park
     /// instead of going out, so in-flight work can finish.
     pub quiesce: Arc<AtomicBool>,
+    /// Added to the path-choice tie-break key (see `path_rank_key`): the
+    /// ublk device id, so the low-depth streams of different volumes start
+    /// on different paths.
+    pub path_offset: usize,
 }
 
 /// One block request as seen by the engine. `buf` is the tag's IoBuf, owned
@@ -1136,9 +1149,10 @@ impl Engine {
         let small = p.len <= SMALL_IO;
         let bulk_bytes = byte_path() && !small;
         let n_paths = self.ctrls.paths.len().max(1);
+        let key = path_rank_key(self.qid, n_paths, self.cfg.path_offset);
         live.sort_by_key(|c| {
             let n = c.inflight.borrow().len();
-            let rot = path_rank(c.path, self.qid, n_paths);
+            let rot = path_rank(c.path, key, n_paths);
             if !small {
                 let bytes = if bulk_bytes { self.bytes_on(c.path, p.op).max(0) as u64 } else { 0 };
                 return (false, n as u64, bytes, rot);
@@ -3102,6 +3116,7 @@ mod tests {
             napi_us: 0,
             fault_dir: fault_dir.clone(),
             quiesce: Arc::new(AtomicBool::new(false)),
+            path_offset: 0,
         };
         let mut cfg = cfg;
         tweak(&mut cfg);
@@ -3321,9 +3336,15 @@ mod tests {
     fn path_rank_rotates_by_engine() {
         assert_eq!((0..4).map(|p| path_rank(p, 0, 4)).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
         assert_eq!((0..4).map(|p| path_rank(p, 1, 4)).collect::<Vec<_>>(), vec![3, 0, 1, 2], "engine 1 prefers path 1");
-        assert_eq!((0..4).map(|p| path_rank(p, 6, 4)).collect::<Vec<_>>(), vec![2, 3, 0, 1], "engine 6 prefers path 2");
+        assert_eq!((0..4).map(|p| path_rank(p, 6, 4)).collect::<Vec<_>>(), vec![2, 3, 0, 1], "key 6 prefers path 2");
         assert_eq!(path_rank(0, 5, 1), 0);
         assert_eq!(path_rank(1, 3, 0), 0, "no paths: no panic");
+        // Keys: the primaries of queues 0 and 1 (engines 0 and 4 at 4 threads
+        // per queue) and of devices 0 and 1 prefer different paths.
+        let pref = |eid: u16, off: usize| (0..4).find(|&p| path_rank(p, path_rank_key(eid, 4, off), 4) == 0).unwrap();
+        assert_eq!((pref(0, 0), pref(4, 0)), (0, 1));
+        assert_eq!((0..8).map(|e| pref(e, 0)).collect::<Vec<_>>(), vec![0, 1, 2, 3, 1, 2, 3, 0], "every path twice over 8 engines");
+        assert_eq!((pref(0, 1), pref(0, 2), pref(0, 7)), (1, 2, 3), "device offset");
     }
 
     /// Ties between paths go to the engine's own first path (eid % paths),
