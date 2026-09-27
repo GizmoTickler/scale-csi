@@ -307,6 +307,34 @@ fn ucopy_write(cdev_fd: i32, pos: u64, data: *const u8, len: usize) -> Result<()
     Ok(())
 }
 
+/// Append `len` bytes of the ublk request at USER_COPY position `pos` to `v`.
+fn ucopy_read_into(cdev_fd: i32, pos: u64, len: usize, v: &mut Vec<u8>) -> Result<(), i32> {
+    v.reserve(len);
+    let base = v.len();
+    let mut done = 0usize;
+    while done < len {
+        let n = unsafe { libc::pread(cdev_fd, v.as_mut_ptr().add(base + done) as *mut libc::c_void, len - done, (pos + done as u64) as libc::off_t) };
+        if n > 0 {
+            done += n as usize;
+        } else {
+            let e = if n == 0 { libc::EIO } else { std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) };
+            if e != libc::EINTR {
+                return Err(e);
+            }
+        }
+    }
+    unsafe { v.set_len(base + len) };
+    Ok(())
+}
+
+/// Zero copy, in-capsule writes (NVMEUBLK_INLINE_COPY, default on): copy the
+/// payload out of the request (USER_COPY pread) into the capsule's own
+/// buffer, so a turn's small writes leave in one writev. Sending it from
+/// the registered pages (WRITE_FIXED) cost a second tcp_sendmsg per write
+/// and ended the sender's batch at every write.
+static INLINE_COPY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_INLINE_COPY").map_or(true, |v| v != "0"));
+
 /// Receives the bulk of a large C2HData payload on its own thread, straight
 /// into the request buffer, while the queue thread keeps serving the other
 /// paths. On a 6.12 kernel a read costs two copies (socket -> buffer, buffer
@@ -1148,12 +1176,25 @@ impl Engine {
             Op::Write => rw_cmd(OPC_WRITE, cid, NSID, p.slba, p.nlb, p.len as u32, inline),
             Op::Flush => flush_cmd(cid, NSID),
         };
-        let (data, len) = if inline { (p.buf as *const u8, p.len) } else { (std::ptr::null(), 0) };
-        // Zero copy: in-capsule write data goes out straight from the
-        // request's registered pages, right behind the capsule header (the
-        // sender keeps the byte order), so there is no tag buffer to fill.
-        let fixed = if inline { p.zc_index.map(|idx| (idx, 0usize)) } else { None };
-        let head = capsule_header(&sqe, len);
+        // Zero copy with USER_COPY: in-capsule data is copied into the
+        // capsule (INLINE_COPY). Otherwise it goes out straight from the
+        // request's registered pages right behind the capsule header (the
+        // sender keeps the byte order), or from the tag buffer when copying.
+        let copy_in = inline && *INLINE_COPY && p.zc_index.is_some() && self.cfg.cdev_fd >= 0 && p.ucopy.is_some();
+        let (data, len) = if inline && !copy_in { (p.buf as *const u8, p.len) } else { (std::ptr::null(), 0) };
+        let fixed = if inline && !copy_in { p.zc_index.map(|idx| (idx, 0usize)) } else { None };
+        let mut head = capsule_header(&sqe, if copy_in { p.len } else { len });
+        if copy_in {
+            if let Err(e) = ucopy_read_into(self.cfg.cdev_fd, p.ucopy.expect("checked"), p.len, &mut head) {
+                c.free.borrow_mut().push(slot);
+                log::warn!("q{}: reading write data from the ublk request failed: errno {e}", self.qid);
+                if let Some(st) = p.orphan.take() {
+                    st.orphans.fetch_sub(1, Ordering::Relaxed);
+                }
+                p.finish(-libc::EIO);
+                return Ok(());
+            }
+        }
         p.sent = Instant::now();
         p.rx = 0;
         p.h2c_queued = 0;
@@ -2788,6 +2829,8 @@ mod tests {
         reads: usize,
         /// (I/O queue id, bytes) of every read answered.
         read_qids: Vec<(u16, usize)>,
+        /// In-capsule data of every write received.
+        writes: Vec<Vec<u8>>,
     }
 
     #[derive(Default)]
@@ -2804,6 +2847,8 @@ mod tests {
         accept_only: Option<usize>,
         /// Wait this long before answering each I/O command (a slow path).
         io_delay: Duration,
+        /// Identify ioccsz (16-byte units); 0 or up to 4 = no in-capsule data.
+        ioccsz: u32,
     }
 
     struct Target {
@@ -2911,7 +2956,8 @@ mod tests {
                     (OPC_ADMIN_IDENTIFY, false) => {
                         let mut id = vec![0u8; 4096];
                         if sqe[40] == 1 {
-                            id[1792..1796].copy_from_slice(&4u32.to_le_bytes()); // ioccsz: no in-capsule data
+                            // ioccsz (16-byte units): 4 = no in-capsule data
+                            id[1792..1796].copy_from_slice(&cfg.ioccsz.max(4).to_le_bytes());
                         } else {
                             id[0..8].copy_from_slice(&2048u64.to_le_bytes()); // nsze
                             id[104..120].copy_from_slice(&[1; 16]); // nguid
@@ -2920,6 +2966,10 @@ mod tests {
                         c2h(cid, &id)
                     }
                     (_, true) if hold.load(Ordering::Acquire) => continue,
+                    (OPC_WRITE, true) if !data.is_empty() => {
+                        seen.lock().unwrap().writes.push(data.to_vec());
+                        resp(cid, 0)
+                    }
                     (OPC_READ, true) => {
                         std::thread::sleep(cfg.io_delay);
                         let slba = u64::from_le_bytes(sqe[40..48].try_into().unwrap());
@@ -3185,6 +3235,59 @@ mod tests {
                 rxs.iter().all(|rx| !rx.is_empty())
             }), "all eight complete");
         });
+    }
+
+    /// Zero copy with USER_COPY: a turn's in-capsule writes carry their data
+    /// in the capsule, copied out of the request (pread at its USER_COPY
+    /// position; a plain file stands in for /dev/ublkcN), and leave in one
+    /// sendmsg. They went out from the registered pages (WRITE_FIXED) before,
+    /// a second send per write that no test ring has buffers for.
+    #[test]
+    fn in_capsule_writes_carry_their_data_and_share_one_send() {
+        let t = Target::start("127.0.0.1:0", TargetCfg { ioccsz: (8192 + 64) / 16, ..Default::default() }).unwrap();
+        let seen = t.seen.clone();
+        let path = std::env::temp_dir().join(format!("nvmeublk-ucopy-{}", std::process::id()));
+        let pos0 = 1u64 << 20;
+        let want: Vec<Vec<u8>> = (0..6u8).map(|i| (0..4096).map(|b| (b as u8).wrapping_mul(7).wrapping_add(i * 31)).collect()).collect();
+        {
+            use std::io::{Seek, Write};
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.seek(std::io::SeekFrom::Start(pos0)).unwrap();
+            for w in &want {
+                f.write_all(w).unwrap();
+            }
+        }
+        let file = std::fs::File::open(&path).unwrap();
+        let fd = file.as_raw_fd();
+        on_ring_thread(move || {
+            let r = rig_with(&[&t], "inline-copy", Duration::from_secs(20), |c| c.cdev_fd = fd);
+            assert_eq!(r.ctrls.info.incapsule_bytes, 8192);
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 1), "connection should come up");
+            let tags = smol::LocalExecutor::new();
+            let mut rxs = Vec::new();
+            let tasks: Vec<_> = (0..6u16)
+                .map(|i| {
+                    let (tx, rx) = smol::channel::bounded(1);
+                    rxs.push(rx);
+                    let e = r.e.clone();
+                    tags.spawn(async move { e.submit(Pending::new(Op::Write, 8 + i as u64 * 8, 8, std::ptr::null_mut(), 4096, tx, Some(pos0 + i as u64 * 4096), Some(i))) })
+                })
+                .collect();
+            let sends0 = r.stats.wv_n.load(Ordering::Relaxed);
+            r.e.run_turn(&tags, &r.exe);
+            assert!(tasks.iter().all(|t| t.is_finished()));
+            assert_eq!(r.stats.wv_n.load(Ordering::Relaxed) - sends0, 1, "six 4k writes in one sendmsg");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                r.e.run_turn(&tags, &r.exe);
+                rxs.iter().all(|rx| !rx.is_empty())
+            }));
+            assert!(rxs.iter().all(|rx| rx.try_recv() == Ok(4096)), "every write succeeds");
+        });
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        let got = seen.lock().unwrap().writes.clone();
+        assert_eq!(got, want, "the target got each request's data in its capsule");
     }
 
     /// Path choice ignores round trip (L2 removed): at QD1 small reads, like
