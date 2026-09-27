@@ -211,6 +211,42 @@ pub fn is_small_cmd(op: Op, len: usize) -> bool {
     op == Op::Flush || len <= SMALL_IO
 }
 
+/// Small reads above this size span several TCP segments; they are the ones
+/// whose completion time depends on the path's NIC (see `choose_home`).
+pub const SMALL_READ_MIN: usize = 4096;
+
+/// Whether the lane's home path follows measured small-read latency
+/// (NVMEUBLK_SMALL_HOME, default off until measured).
+static SMALL_HOME: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_SMALL_HOME").map_or(SMALL_HOME_BY_DEFAULT, |v| v != "0"));
+const SMALL_HOME_BY_DEFAULT: bool = false;
+/// One multi-segment small read in PROBE_EVERY goes to another path, so the
+/// other paths' latency stays known while the lane stays on its home path.
+const PROBE_EVERY: u32 = 512;
+
+/// The home path of a low-depth lane (which path a small read takes when
+/// every connection is equally loaded), revisiting L2 narrowly. L2 chose a
+/// path per request by RTT and probed the others, which took I/O off the
+/// one warm connection and lost 3-14% at QD1 (l2ab-…). Measured since (run
+/// s1-20260927T191110Z, pool, stream pinned to a path): 16k QD1 reads on the
+/// ixgbevf paths complete ~75 µs later than on the bnx2x ones (payload
+/// segments; 4k reads show no gap), so a lane whose device id rotates it
+/// onto an ixgbevf path loses 16k QD1 (0.88x the kernel) while one on bnx2x
+/// wins (1.37x). Here the lane keeps one home path and moves it only when
+/// another path's measured multi-segment small-read latency is lower by more
+/// than 20% and 30 µs, both with at least `min_n` samples; the engine
+/// re-evaluates at most once a second (the timer), and probes 1 in 512.
+/// Returns the new home path.
+pub fn choose_home(home: usize, lat_ns: &[u64], n: &[u64], min_n: u64) -> usize {
+    let ok = |p: usize| lat_ns.get(p).copied().unwrap_or(0) > 0 && n.get(p).copied().unwrap_or(0) >= min_n;
+    if !ok(home) {
+        return home;
+    }
+    let cur = lat_ns[home];
+    let best = (0..lat_ns.len()).filter(|&p| ok(p)).min_by_key(|&p| lat_ns[p]).unwrap_or(home);
+    let b = lat_ns[best];
+    if best != home && b.saturating_mul(6) / 5 < cur && cur - b > 30_000 { best } else { home }
+}
+
 /// The engine's wire round trip: EWMA (weight 1/8) of `wired -> first
 /// data` for reads and `wired -> response` otherwise, over small commands
 /// only (a large read's first data waits for the target to read all of
@@ -500,6 +536,11 @@ pub struct Stats {
     /// Small commands (payload <= SMALL_IO) sent, per path index (the
     /// first 8 paths): where latency-aware path choice put them.
     pub small_by_path: [AtomicU64; 8],
+    /// Multi-segment small reads (SMALL_READ_MIN < len <= SMALL_IO), per
+    /// path: EWMA (1/8) of wired -> done in ns, and samples (the lane's home
+    /// path choice, `choose_home`).
+    pub small_rd_lat_ns: [AtomicU64; MAX_PATHS],
+    pub small_rd_n: [AtomicU64; MAX_PATHS],
 }
 
 #[derive(Clone)]
@@ -1000,6 +1041,11 @@ struct Engine {
     /// PDUs received (a host serving several engines on one ring tells
     /// which of them saw events by it).
     events: Cell<u64>,
+    /// NVMEUBLK_SMALL_HOME: added to the path rank key of multi-segment
+    /// small reads (moves the lane's home path), and the probe counter.
+    home_shift: Cell<usize>,
+    probes: Cell<u32>,
+    home_checked: Cell<Instant>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
@@ -1056,6 +1102,9 @@ impl Engine {
             wedge: Cell::new(None),
             exe_hi: Rc::new(smol::LocalExecutor::new()),
             events: Cell::new(0),
+            home_shift: Cell::new(0),
+            probes: Cell::new(0),
+            home_checked: Cell::new(Instant::now()),
         })
     }
 
@@ -1156,7 +1205,15 @@ impl Engine {
         let small = p.len <= SMALL_IO;
         let bulk_bytes = byte_path() && !small;
         let n_paths = self.ctrls.paths.len().max(1);
-        let key = path_rank_key(self.qid, n_paths, self.cfg.path_offset);
+        let mut key = path_rank_key(self.qid, n_paths, self.cfg.path_offset);
+        if *SMALL_HOME && p.op == Op::Read && p.len > SMALL_READ_MIN && small {
+            key += self.home_shift.get();
+            let k = self.probes.get().wrapping_add(1);
+            self.probes.set(k);
+            if n_paths > 1 && k % PROBE_EVERY == 0 {
+                key += 1 + (k / PROBE_EVERY) as usize % (n_paths - 1);
+            }
+        }
         live.sort_by_key(|c| {
             let n = c.inflight.borrow().len();
             let rot = path_rank(c.path, key, n_paths);
@@ -1432,6 +1489,14 @@ impl Engine {
             self.stats.d2c_ns.fetch_add(d.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if sc == 0 {
+            if p.op == Op::Read && p.len > SMALL_READ_MIN && p.len <= SMALL_IO {
+                if let (Some(w), Some(a), Some(n)) = (p.wired, self.stats.small_rd_lat_ns.get(c.path), self.stats.small_rd_n.get(c.path)) {
+                    let ns = w.elapsed().as_nanos() as u64;
+                    let old = a.load(Ordering::Relaxed);
+                    a.store(if old == 0 { ns.max(1) } else { (old - old / 8 + ns / 8).max(1) }, Ordering::Relaxed);
+                    n.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             // Wire round trip of a small command (the hot lane's warm window).
             if p.len <= SMALL_IO {
                 if let Some(w) = p.wired {
@@ -2116,6 +2181,7 @@ impl Engine {
                 break;
             }
             self.fault_injection();
+            self.follow_home();
             // Requests dropped unfinished outside an engine task's panic
             // (after one, `task_panicked` recovers them at once).
             self.recover_dropped();
@@ -2507,6 +2573,25 @@ impl Engine {
                 std::mem::forget(self.clone());
                 return;
             }
+        }
+    }
+
+    /// NVMEUBLK_SMALL_HOME: at most once a second, move the lane's home path
+    /// for multi-segment small reads (`choose_home`).
+    fn follow_home(&self) {
+        if !*SMALL_HOME || self.home_checked.get().elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.home_checked.set(Instant::now());
+        let n_paths = self.ctrls.paths.len().clamp(1, MAX_PATHS);
+        let lat: Vec<u64> = self.stats.small_rd_lat_ns.iter().take(n_paths).map(|a| a.load(Ordering::Relaxed)).collect();
+        let n: Vec<u64> = self.stats.small_rd_n.iter().take(n_paths).map(|a| a.load(Ordering::Relaxed)).collect();
+        let base = path_rank_key(self.qid, n_paths, self.cfg.path_offset);
+        let home = (base + self.home_shift.get()) % n_paths;
+        let next = choose_home(home, &lat, &n, 16);
+        if next != home {
+            log::info!("q{}: small-read home path {home} -> {next} (latency {:?} us)", self.qid, lat.iter().map(|l| l / 1000).collect::<Vec<_>>());
+            self.home_shift.set((next + n_paths - base % n_paths) % n_paths);
         }
     }
 
@@ -3322,6 +3407,22 @@ mod tests {
     /// Path choice ignores round trip (L2 removed): at QD1 small reads, like
     /// large ones, go to the first live connection whatever its round trip,
     /// so a low-depth stream stays on one warm connection.
+    /// A lane moves its home path only on a clear, well-sampled gap in
+    /// multi-segment small-read latency (s1: ~75 µs on the ixgbevf paths).
+    #[test]
+    fn the_small_read_home_moves_only_on_a_clear_gap() {
+        let us = |v: &[u64]| v.iter().map(|x| x * 1000).collect::<Vec<_>>();
+        let n = [100u64; 4];
+        assert_eq!(choose_home(2, &us(&[190, 195, 265, 270]), &n, 16), 0, "ixgbevf home, bnx2x 75 us faster");
+        assert_eq!(choose_home(0, &us(&[190, 195, 265, 270]), &n, 16), 0, "already on the fastest");
+        assert_eq!(choose_home(2, &us(&[190, 195, 215, 270]), &n, 16), 2, "a 25 us gap is not enough");
+        assert_eq!(choose_home(2, &us(&[95, 100, 120, 125]), &n, 16), 2, "26% but only 25 us: not enough");
+        assert_eq!(choose_home(2, &us(&[500, 520, 560, 580]), &n, 16), 2, "under 20% is not enough");
+        assert_eq!(choose_home(2, &us(&[190, 0, 265, 270]), &n, 16), 0);
+        assert_eq!(choose_home(2, &us(&[190, 195, 265, 270]), &[10, 10, 100, 100], 16), 2, "too few samples on the faster paths");
+        assert_eq!(choose_home(2, &us(&[190, 195, 265, 270]), &[100, 100, 0, 100], 16), 2, "no samples on the home path: keep it");
+    }
+
     #[test]
     fn reads_ignore_path_rtt() {
         let slow = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(3), ..Default::default() }).unwrap();
