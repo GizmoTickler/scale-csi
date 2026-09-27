@@ -759,7 +759,12 @@ fn retire(mut s: Served, stop: &AtomicBool, detach: bool) -> Result<()> {
         // them. They keep serving meanwhile, so STOP's wait for the
         // requests they hold ends (with EIO for parked and fenced I/O, the
         // device is draining). A device stopped already answers an error.
-        if let Err(e) = s.ctrl.kill_dev() {
+        // Control commands go through this thread's control ring, which a
+        // detach's thread may not have yet (join_target makes it later):
+        // without one libublk panics (lifecycle lc-pool-20260927T173746Z).
+        if let Err(e) = libublk::ctrl::init_ctrl_task_ring_default(16) {
+            log::error!("stop ublk device {dev_id}: no control ring: {e}");
+        } else if let Err(e) = s.ctrl.kill_dev() {
             log::debug!("stop ublk device {dev_id}: {e}");
         }
     }

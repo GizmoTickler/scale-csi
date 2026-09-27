@@ -214,7 +214,7 @@ where
 ///
 /// This is called by UblkCtrlInner::new()/new_async() when the ring hasn't been
 /// initialized yet. Uses default values similar to the original approach.
-pub(crate) fn init_ctrl_task_ring_default(depth: u32) -> Result<(), UblkError> {
+pub fn init_ctrl_task_ring_default(depth: u32) -> Result<(), UblkError> {
     ublk_init_ctrl_task_ring(|ring_opt| {
         if ring_opt.is_none() {
             let ring = IoUring::<squeue::Entry128>::builder()
