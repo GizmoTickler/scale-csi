@@ -850,6 +850,34 @@ impl QEngine {
         ran
     }
 
+    /// One turn of a queue thread's executors until nothing is runnable:
+    /// `tags` (the per-tag request tasks), this engine's priority executor
+    /// (small-class connections, conn_classes) and `net` (its other
+    /// connection tasks).
+    ///
+    /// The tag tasks run first and all of them: each only dispatches its
+    /// request onto a connection's send queue, so the turn's commands for
+    /// one connection leave in one sendmsg when that connection's sender
+    /// runs next. Ticking the priority executor after every tag task sent
+    /// each small command on its own (4k randread 64:8: 177,466 sendmsg/s
+    /// for 177,457 IO/s, sendmsg ~21% of the daemon's cycles; gaps/prof3).
+    /// The priority executor then runs, and again after every bulk task, so
+    /// small-class completions never wait behind bulk payload work (L5).
+    pub fn run_turn(&self, tags: &smol::LocalExecutor<'_>, net: &smol::LocalExecutor<'_>) {
+        let mut progress = true;
+        while progress {
+            progress = false;
+            while tags.try_tick() {
+                progress = true;
+            }
+            progress |= self.tick_priority();
+            while net.try_tick() {
+                progress = true;
+                self.tick_priority();
+            }
+        }
+    }
+
     /// A pending fault-injection "wedge <ms>" (drills of the batch hot
     /// lane's watchdog); taking it clears it.
     pub fn take_wedge(&self) -> Option<Duration> {
@@ -3119,6 +3147,44 @@ mod tests {
         let qid_of = |bytes: usize| seen.read_qids.iter().filter(|(_, b)| *b == bytes).map(|(q, _)| *q).collect::<std::collections::BTreeSet<u16>>();
         assert_eq!(qid_of(4096).into_iter().collect::<Vec<_>>(), vec![1], "4k reads on the small connection (qid 1): {:?}", seen.read_qids);
         assert_eq!(qid_of(128 * 1024).into_iter().collect::<Vec<_>>(), vec![2], "128k reads on the bulk connection (qid 2): {:?}", seen.read_qids);
+    }
+
+    /// A turn's small commands leave in one sendmsg: the tag tasks all run
+    /// (each dispatches its request) before the small class's sender does.
+    /// Ticking the priority executor after every tag task sent each command
+    /// on its own (one sendmsg per I/O at depth).
+    #[test]
+    fn a_turns_small_commands_share_one_send() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig_with(&[&t], "turn-batch", Duration::from_secs(20), |c| c.conn_classes = true);
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || {
+                r.e.tick_priority();
+                r.e.core.live().len() == 2
+            }), "small and bulk connections should come up");
+            let tags = smol::LocalExecutor::new();
+            let mut bufs: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 4096]).collect();
+            let mut rxs = Vec::new();
+            let e = r.e.clone();
+            let tasks: Vec<_> = bufs
+                .iter_mut()
+                .map(|b| {
+                    let (tx, rx) = smol::channel::bounded(1);
+                    rxs.push(rx);
+                    let (e, ptr, len) = (e.clone(), b.as_mut_ptr(), b.len());
+                    tags.spawn(async move { e.submit(Pending::new(Op::Read, 8, (len / 512) as u32, ptr, len, tx, None, None)) })
+                })
+                .collect();
+            let sends0 = r.stats.wv_n.load(Ordering::Relaxed);
+            r.e.run_turn(&tags, &r.exe);
+            assert!(tasks.iter().all(|t| t.is_finished()));
+            assert_eq!(r.stats.wv_n.load(Ordering::Relaxed) - sends0, 1, "eight 4k reads dispatched in one turn go out in one sendmsg");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                r.e.run_turn(&tags, &r.exe);
+                rxs.iter().all(|rx| !rx.is_empty())
+            }), "all eight complete");
+        });
     }
 
     /// Path choice ignores round trip (L2 removed): at QD1 small reads, like

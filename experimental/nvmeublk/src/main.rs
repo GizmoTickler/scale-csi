@@ -347,21 +347,9 @@ fn queue_fn(
         let run_ops = || {
             let t0 = Instant::now();
             st2.loops.fetch_add(1, Ordering::Relaxed);
-            // Small-class connections first, and again after every other
-            // task (conn_classes): their completions never wait behind a
-            // turn of bulk payload work.
-            let mut progress = true;
-            while progress {
-                progress = spin_engine.tick_priority();
-                while exe.try_tick() {
-                    progress = true;
-                    spin_engine.tick_priority();
-                }
-                while net_exe.try_tick() {
-                    progress = true;
-                    spin_engine.tick_priority();
-                }
-            }
+            // Tag tasks, then small-class connections, then the rest with
+            // the small class again after each (QEngine::run_turn).
+            spin_engine.run_turn(&exe, &net_exe);
             st2.loop_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         };
         let done = || tasks.iter().all(|t| t.is_finished());

@@ -470,20 +470,9 @@ pub fn queue_fn(
         let t0 = Instant::now();
         stats.loops.fetch_add(1, Ordering::Relaxed);
         let _turn = TurnTimer::new(&stats, t0);
-        // Small-class connections first, and again after every other task
-        // (conn_classes, priority reaping).
-        let mut progress = true;
-        while progress {
-            progress = engine.tick_priority();
-            while exe.try_tick() {
-                progress = true;
-                engine.tick_priority();
-            }
-            while net_exe.try_tick() {
-                progress = true;
-                engine.tick_priority();
-            }
-        }
+        // Tag tasks, then small-class connections, then the rest with the
+        // small class again after each (QEngine::run_turn).
+        engine.run_turn(&exe, &net_exe);
         stats.loop_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     };
     let spin = Duration::from_micros(env_u64("NVMEUBLK_SPIN_US", 100));
