@@ -454,6 +454,7 @@ pub fn queue_fn(
     let run_ops = || {
         let t0 = Instant::now();
         stats.loops.fetch_add(1, Ordering::Relaxed);
+        let _turn = TurnTimer::new(&stats, t0);
         let mut progress = true;
         while progress {
             progress = false;
@@ -598,7 +599,12 @@ pub fn queue_fn(
         if !spinning {
             shared.beat(thread, true);
         }
-        let polled = poll(if spinning { 0 } else { 1 }, &timeout);
+        // A non-sleeping poll is all task work (inline receive copies,
+        // commits): it counts as one turn.
+        let polled = {
+            let _turn = spinning.then(|| TurnTimer::new(&stats, Instant::now()));
+            poll(if spinning { 0 } else { 1 }, &timeout)
+        };
         shared.beat(thread, false);
         if let Err(e) = polled {
             log::error!("ublk device {dev_id} queue {qid} thread {thread}: event loop failed: {e}");
@@ -702,6 +708,28 @@ fn follow_depth(batch: &mut UblkBatchQueue, shared: &QueueShared, h: &HotLane, p
         batch.set_credit_policy(cap, lease, refill)?;
     }
     Ok(())
+}
+
+/// Times one queue-thread turn into `Stats::long_turns` / `turn_max_ns`.
+struct TurnTimer<'a> {
+    stats: &'a qengine::Stats,
+    t0: Instant,
+}
+
+impl<'a> TurnTimer<'a> {
+    fn new(stats: &'a qengine::Stats, t0: Instant) -> Self {
+        TurnTimer { stats, t0 }
+    }
+}
+
+impl Drop for TurnTimer<'_> {
+    fn drop(&mut self) {
+        let ns = self.t0.elapsed().as_nanos() as u64;
+        if ns > 50_000 {
+            self.stats.long_turns.fetch_add(1, Ordering::Relaxed);
+        }
+        self.stats.turn_max_ns.fetch_max(ns, Ordering::Relaxed);
+    }
 }
 
 /// Submit what is queued and wait for `wait` completions at most `timeout`.

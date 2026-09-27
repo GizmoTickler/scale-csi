@@ -556,8 +556,8 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         let (wv, wvn) = (g(&st.wv_ns), g(&st.wv_n).max(1));
         let (zr, zrn) = (g(&st.zc_rx_ns), g(&st.zc_rx_n).max(1));
         let lat = format!(
-            "zc_MiB={} zc_tx_MiB={} linked_hdr={} zc_notif={} io={} wire_avg={}us total_avg={}us | queued->wired={}us (pickup {}us, writev {}us x{}) wired->1stdata={}us 1stdata->done={}us (zc payload rx {}us) | loops/s={} run_ops_avg={}us",
-            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, g(&st.linked_hdr), g(&st.zc_notif), n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, qs / qn / 1000, wv / wvn / 1000, wvn / 5, wd / rn / 1000, dc / rn / 1000, zr / zrn / 1000, lp / 5, ln / lp / 1000
+            "zc_MiB={} zc_tx_MiB={} linked_hdr={} zc_notif={} async_rx={} long_turns={} turn_max={}us io={} wire_avg={}us total_avg={}us | queued->wired={}us (pickup {}us, writev {}us x{}) wired->1stdata={}us 1stdata->done={}us (zc payload rx {}us) | loops/s={} run_ops_avg={}us",
+            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, g(&st.linked_hdr), g(&st.zc_notif), g(&st.async_rx), g(&st.long_turns), g(&st.turn_max_ns) / 1000, n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, qs / qn / 1000, wv / wvn / 1000, wvn / 5, wd / rn / 1000, dc / rn / 1000, zr / zrn / 1000, lp / 5, ln / lp / 1000
         );
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();

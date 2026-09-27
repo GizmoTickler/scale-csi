@@ -87,16 +87,55 @@ const RX_CHUNK_DEFAULT: usize = 32 * 1024;
 /// io_uring UAPI: send/recv on a registered (fixed) buffer, index in buf_index.
 const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
 
+/// Bounded turns (design doc §4.4 L4): a queue thread never copies more
+/// than one chunk of a read's payload per receive it runs itself.
+/// - A payload of at least ASYNC_RX_MIN bytes (NVMEUBLK_ASYNC_RX_MIN,
+///   default 256 KiB; 0 = never) is received with IOSQE_ASYNC: an io-wq
+///   worker does the socket-to-page copy, whole, while the thread keeps
+///   turning (commands out, other completions back).
+/// - A smaller one is received inline in chunks of at most RX_ZC_CHUNK bytes
+///   (NVMEUBLK_RX_ZC_CHUNK, default 64 KiB; 0 = unbounded), so a small
+///   completion behind it waits for one chunk's copy (~5-10 µs), not a whole
+///   payload's.
 static ASYNC_RX_MIN: std::sync::LazyLock<usize> =
-    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256 * 1024));
+static RX_ZC_CHUNK: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_RX_ZC_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64 * 1024));
+
+/// One zero-copy payload receive of a C2HData PDU carrying `pdu_len` bytes,
+/// `left` of them still to come: (bytes to ask for, IOSQE_ASYNC).
+pub fn zc_rx_step(pdu_len: usize, left: usize, chunk: usize, async_min: usize) -> (usize, bool) {
+    if async_min > 0 && pdu_len >= async_min {
+        (left, true)
+    } else if chunk > 0 {
+        (left.min(chunk), false)
+    } else {
+        (left, false)
+    }
+}
 
 static BATCH_SLACK: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_BATCH_SLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
 static DIRECT_SEND: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_DIRECT_SEND").map_or(true, |v| v != "0"));
 
-pub static SEND_ZC: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_SEND_ZC").is_ok_and(|v| v != "0"));
+/// Zero-copy send of write payloads from the request's registered pages
+/// (SEND_ZC; the NIC reads the pages, nothing is copied into socket
+/// buffers). NVMEUBLK_SEND_ZC: "1" = every fixed payload, "0" = never
+/// (WRITE_FIXED copies it into the socket); unset = payloads of at least
+/// NVMEUBLK_SEND_ZC_MIN bytes (default 64 KiB), where the copy costs more
+/// than the extra notification completion.
+pub static SEND_ZC_MIN: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+    send_zc_min(std::env::var("NVMEUBLK_SEND_ZC").ok().as_deref(), std::env::var("NVMEUBLK_SEND_ZC_MIN").ok().and_then(|v| v.parse().ok()))
+});
+
+pub fn send_zc_min(mode: Option<&str>, min: Option<usize>) -> Option<usize> {
+    match mode {
+        Some("0") => None,
+        Some(v) if !v.is_empty() => Some(0),
+        _ => Some(min.unwrap_or(64 * 1024)),
+    }
+}
 
 static LINK_HDR: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LINK_HDR").map_or(true, |v| v != "0"));
@@ -369,6 +408,13 @@ pub struct Stats {
     /// Batch hot lane: a secondary took over as its queue's primary because
     /// the primary stopped turning its loop (watchdog).
     pub batch_takeovers: AtomicU64,
+    /// Payload receives handed to io-wq (IOSQE_ASYNC, bounded turns).
+    pub async_rx: AtomicU64,
+    /// Queue-thread turns (a non-sleeping ring poll with its task work, or
+    /// one run of the executors) longer than 50 µs, and the longest one
+    /// (ns); both reset by the stats reporter.
+    pub long_turns: AtomicU64,
+    pub turn_max_ns: AtomicU64,
     /// Small commands (payload <= SMALL_IO) sent, per path index (the
     /// first 8 paths): where latency-aware path choice put them.
     pub small_by_path: [AtomicU64; 8],
@@ -1416,15 +1462,15 @@ impl Engine {
     async fn write_fixed(&self, c: &Rc<QConn>, idx: u16, off: usize, len: usize) -> bool {
         let mut done = 0usize;
         while done < len {
-            // NVMEUBLK_SEND_ZC (tuning): send the payload with SEND_ZC from
+            // SEND_ZC (see SEND_ZC_MIN): send the payload with SEND_ZC from
             // the request's registered pages (the NIC reads them; no copy
             // into socket buffers). Its completion comes first; a second
             // NOTIF completion follows when the network stack releases the
             // pages, which the event loop swallows. Page lifetime past that
             // point is the kernel's: the registration holds a reference to
             // the ublk request until the last user drops it. WRITE_FIXED
-            // (default) copies the payload into the socket.
-            let sqe = if *SEND_ZC {
+            // copies the payload into the socket.
+            let sqe = if SEND_ZC_MIN.is_some_and(|min| len - done >= min) {
                 io_uring::opcode::SendZc::new(io_uring::types::Fd(c.fd), (off + done) as *const u8, (len - done) as u32)
                     .buf_index(Some(idx))
                     .flags(libc::MSG_NOSIGNAL)
@@ -1661,24 +1707,29 @@ impl Engine {
                 // (a fixed-buffer RECV is refused with EINVAL before 7.x). It
                 // may return short, so loop until the payload is complete.
                 let use_recv = ZC_RECV_MODE.load(Ordering::Relaxed) == 0;
+                // Bounded turn: one chunk inline, or the whole rest on io-wq.
+                let (want, async_rx) = zc_rx_step(len, len - got, *RX_ZC_CHUNK, *ASYNC_RX_MIN);
                 let sqe = if use_recv {
-                    io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32)
+                    io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, want as u32)
                         .ioprio(IORING_RECVSEND_FIXED_BUF)
                         .buf_group(idx)
                         .flags(libc::MSG_WAITALL)
                         .build()
                 } else {
-                    io_uring::opcode::ReadFixed::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32, idx)
+                    io_uring::opcode::ReadFixed::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, want as u32, idx)
                         .offset(u64::MAX)
                         .build()
                 };
-                // Large payloads (NVMEUBLK_ASYNC_RX_MIN bytes and up, tuning):
-                // hand the copy to an io-wq worker instead of doing it inline
-                // in this queue thread's submit, so the queue keeps turning
-                // (commands out, completions back) while the data lands.
-                let sqe = match *ASYNC_RX_MIN {
-                    min if min > 0 && len - got >= min => sqe.flags(io_uring::squeue::Flags::ASYNC),
-                    _ => sqe,
+                // Large payloads (ASYNC_RX_MIN): hand the copy to an io-wq
+                // worker instead of doing it inline in this queue thread's
+                // task work, so the queue keeps turning (commands out,
+                // completions back) while the data lands. A socket with no
+                // data yet arms a poll, and the retry goes back to io-wq.
+                let sqe = if async_rx {
+                    self.stats.async_rx.fetch_add(1, Ordering::Relaxed);
+                    sqe.flags(io_uring::squeue::Flags::ASYNC)
+                } else {
+                    sqe
                 };
                 // Linked header receive (NVMEUBLK_LINK_HDR, default on with
                 // exact-header receive): the next PDU's common header is read
@@ -1696,7 +1747,7 @@ impl Engine {
                 // socket (the header one could take payload bytes). Make room
                 // for both, or receive the payload alone (the next header is
                 // then read on a later turn, as without LINK_HDR).
-                let linked = use_recv && *LINK_HDR && *RX_EXACT_MIN > 0 && pending.is_none() && sq_room_for(2);
+                let linked = use_recv && *LINK_HDR && *RX_EXACT_MIN > 0 && pending.is_none() && got + want == len && sq_room_for(2);
                 let r = if linked {
                     let hsqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), hdr, HDR_PREFETCH as u32).flags(libc::MSG_WAITALL).build();
                     let mut pf = Box::pin(ublk_submit_sqe_async(sqe.flags(io_uring::squeue::Flags::IO_LINK), UblkUringData::Target as u64));
@@ -2886,6 +2937,32 @@ mod tests {
     /// choice (the previous rule) puts every QD1 read on path 0, the first
     /// live connection; latency-aware choice moves them to path 1 once both
     /// are sampled, and still probes path 0 now and then.
+    /// Bounded turns (L4): payloads below the async threshold are received
+    /// inline in chunks of at most RX_ZC_CHUNK; large ones go whole to io-wq.
+    #[test]
+    fn zero_copy_receive_steps_are_bounded() {
+        let (k64, k256) = (64 * 1024, 256 * 1024);
+        assert_eq!(zc_rx_step(128 * 1024, 128 * 1024, k64, k256), (k64, false));
+        assert_eq!(zc_rx_step(128 * 1024, 10_000, k64, k256), (10_000, false));
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, k64, k256), (1 << 20, true));
+        assert_eq!(zc_rx_step(1 << 20, 4096, k64, k256), (4096, true), "async follows the PDU, not what is left");
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, k64, 0), (k64, false), "async off: still chunked");
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 0, 0), (1 << 20, false), "both off: the old unbounded receive");
+        // The defaults are the bounded ones.
+        if std::env::var_os("NVMEUBLK_RX_ZC_CHUNK").is_none() && std::env::var_os("NVMEUBLK_ASYNC_RX_MIN").is_none() {
+            assert_eq!((*RX_ZC_CHUNK, *ASYNC_RX_MIN), (k64, k256));
+        }
+    }
+
+    #[test]
+    fn send_zc_is_on_for_large_payloads_by_default() {
+        assert_eq!(send_zc_min(None, None), Some(64 * 1024));
+        assert_eq!(send_zc_min(None, Some(4096)), Some(4096));
+        assert_eq!(send_zc_min(Some("1"), None), Some(0));
+        assert_eq!(send_zc_min(Some("0"), Some(4096)), None);
+        assert_eq!(send_zc_min(Some(""), None), Some(64 * 1024));
+    }
+
     #[test]
     fn small_reads_at_qd1_take_the_lower_rtt_path() {
         let slow = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(3), ..Default::default() }).unwrap();
