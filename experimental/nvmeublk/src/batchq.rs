@@ -858,6 +858,7 @@ impl Tenancy {
                 }
             }
         }
+        self.engine.set_shallow(self.hot.is_some() && !self.deep);
         // Wait for events. Hot-lane primary: the warm window; otherwise
         // adaptive polling as in the per-tag loop.
         self.note_events();

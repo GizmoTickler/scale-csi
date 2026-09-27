@@ -102,6 +102,21 @@ const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
 ///   payload's.
 static ASYNC_RX_MIN: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+/// io-wq receive for payloads of at least this many bytes while the lane is
+/// shallow (NVMEUBLK_SHALLOW_ASYNC_RX, bytes; 0 = off). Run g2: io-wq receive
+/// for >= 256 KiB took read 1M 4:1 from 0.85 to 1.16x the kernel and 1M 1:8
+/// from 0.83 to 0.88x (several 1 MiB payloads on one shallow primary no
+/// longer copy one after another inline), but cost read 16k/64k 64:8 and 25%
+/// more CPU on deep 1M cells; so only while the queue is not in depth mode.
+static SHALLOW_ASYNC_RX: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_SHALLOW_ASYNC_RX").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+
+/// The io-wq receive threshold of an engine: ASYNC_RX_MIN when set, else
+/// SHALLOW_ASYNC_RX while its lane is shallow, else 0 (inline).
+pub fn async_rx_min(global: usize, shallow_min: usize, shallow: bool) -> usize {
+    if global > 0 { global } else if shallow { shallow_min } else { 0 }
+}
+
 static RX_ZC_CHUNK: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_RX_ZC_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64 * 1024));
 
@@ -221,7 +236,9 @@ static SMALL_HOME: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::
 const SMALL_HOME_BY_DEFAULT: bool = false;
 /// One multi-segment small read in PROBE_EVERY goes to another path, so the
 /// other paths' latency stays known while the lane stays on its home path.
-const PROBE_EVERY: u32 = 512;
+const PROBE_EVERY: u32 = 64;
+/// A lane stays on a home path it moved to for at least this long.
+const HOME_HOLD: Duration = Duration::from_secs(10);
 
 /// The home path of a low-depth lane (which path a small read takes when
 /// every connection is equally loaded), revisiting L2 narrowly. L2 chose a
@@ -234,7 +251,14 @@ const PROBE_EVERY: u32 = 512;
 /// wins (1.37x). Here the lane keeps one home path and moves it only when
 /// another path's measured multi-segment small-read latency is lower by more
 /// than 20% and 30 µs, both with at least `min_n` samples; the engine
-/// re-evaluates at most once a second (the timer), and probes 1 in 512.
+/// re-evaluates at most once a second (the timer), and probes 1 in 64.
+/// Samples are the engine's own and taken only at low depth (at most one
+/// other command on the connection), so depth traffic of other lanes does
+/// not steer a QD1 lane (s2: device-wide samples moved lanes to path 3).
+/// The latency is first data -> done, the part the path's NIC decides (the
+/// payload's later segments); wired -> done also holds the target's time,
+/// which is longer on a cold path, so probes of idle paths always looked
+/// slow and the home flip-flopped between the warm ones (s3).
 /// Returns the new home path.
 pub fn choose_home(home: usize, lat_ns: &[u64], n: &[u64], min_n: u64) -> usize {
     let ok = |p: usize| lat_ns.get(p).copied().unwrap_or(0) > 0 && n.get(p).copied().unwrap_or(0) >= min_n;
@@ -536,9 +560,9 @@ pub struct Stats {
     /// Small commands (payload <= SMALL_IO) sent, per path index (the
     /// first 8 paths): where latency-aware path choice put them.
     pub small_by_path: [AtomicU64; 8],
-    /// Multi-segment small reads (SMALL_READ_MIN < len <= SMALL_IO), per
-    /// path: EWMA (1/8) of wired -> done in ns, and samples (the lane's home
-    /// path choice, `choose_home`).
+    /// Low-depth multi-segment small reads (SMALL_READ_MIN < len <=
+    /// SMALL_IO), per path: the last wired -> done in ns, and samples
+    /// (diagnostics; the home path choice uses each engine's own EWMA).
     pub small_rd_lat_ns: [AtomicU64; MAX_PATHS],
     pub small_rd_n: [AtomicU64; MAX_PATHS],
 }
@@ -960,6 +984,11 @@ impl QEngine {
         }
     }
 
+    /// Whether this engine's lane is shallow (see SHALLOW_ASYNC_RX).
+    pub fn set_shallow(&self, shallow: bool) {
+        self.core.shallow.set(shallow);
+    }
+
     /// PDUs this engine has received so far.
     pub fn events(&self) -> u64 {
         self.core.events.get()
@@ -1045,6 +1074,13 @@ struct Engine {
     /// small reads (moves the lane's home path), and the probe counter.
     home_shift: Cell<usize>,
     probes: Cell<u32>,
+    /// This engine's low-depth multi-segment small-read latency per path:
+    /// (EWMA ns, samples).
+    home_lat: RefCell<[(u64, u64); MAX_PATHS]>,
+    /// The lane is shallow (not in hot-lane depth mode): SHALLOW_ASYNC_RX.
+    shallow: Cell<bool>,
+    /// When the home path last moved (it then stays HOME_HOLD).
+    home_moved: Cell<Option<Instant>>,
     home_checked: Cell<Instant>,
 }
 
@@ -1104,6 +1140,9 @@ impl Engine {
             events: Cell::new(0),
             home_shift: Cell::new(0),
             probes: Cell::new(0),
+            home_lat: RefCell::new([(0, 0); MAX_PATHS]),
+            shallow: Cell::new(false),
+            home_moved: Cell::new(None),
             home_checked: Cell::new(Instant::now()),
         })
     }
@@ -1489,12 +1528,17 @@ impl Engine {
             self.stats.d2c_ns.fetch_add(d.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if sc == 0 {
-            if p.op == Op::Read && p.len > SMALL_READ_MIN && p.len <= SMALL_IO {
-                if let (Some(w), Some(a), Some(n)) = (p.wired, self.stats.small_rd_lat_ns.get(c.path), self.stats.small_rd_n.get(c.path)) {
+            if p.op == Op::Read && p.len > SMALL_READ_MIN && p.len <= SMALL_IO && c.inflight.borrow().len() <= 1 {
+                if let Some(w) = p.first_data {
                     let ns = w.elapsed().as_nanos() as u64;
-                    let old = a.load(Ordering::Relaxed);
-                    a.store(if old == 0 { ns.max(1) } else { (old - old / 8 + ns / 8).max(1) }, Ordering::Relaxed);
-                    n.fetch_add(1, Ordering::Relaxed);
+                    if let Some(e) = self.home_lat.borrow_mut().get_mut(c.path) {
+                        e.0 = if e.0 == 0 { ns.max(1) } else { (e.0 - e.0 / 8 + ns / 8).max(1) };
+                        e.1 += 1;
+                    }
+                    if let (Some(a), Some(n)) = (self.stats.small_rd_lat_ns.get(c.path), self.stats.small_rd_n.get(c.path)) {
+                        a.store(ns, Ordering::Relaxed);
+                        n.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             // Wire round trip of a small command (the hot lane's warm window).
@@ -1953,7 +1997,7 @@ impl Engine {
                 // may return short, so loop until the payload is complete.
                 let use_recv = ZC_RECV_MODE.load(Ordering::Relaxed) == 0;
                 // Bounded turn: one chunk inline, or the whole rest on io-wq.
-                let (want, async_rx) = zc_rx_step(len, len - got, *RX_ZC_CHUNK, *ASYNC_RX_MIN);
+                let (want, async_rx) = zc_rx_step(len, len - got, *RX_ZC_CHUNK, async_rx_min(*ASYNC_RX_MIN, *SHALLOW_ASYNC_RX, self.shallow.get()));
                 let sqe = if use_recv {
                     io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, want as u32)
                         .ioprio(IORING_RECVSEND_FIXED_BUF)
@@ -2583,15 +2627,20 @@ impl Engine {
             return;
         }
         self.home_checked.set(Instant::now());
+        if self.home_moved.get().is_some_and(|t| t.elapsed() < HOME_HOLD) {
+            return;
+        }
         let n_paths = self.ctrls.paths.len().clamp(1, MAX_PATHS);
-        let lat: Vec<u64> = self.stats.small_rd_lat_ns.iter().take(n_paths).map(|a| a.load(Ordering::Relaxed)).collect();
-        let n: Vec<u64> = self.stats.small_rd_n.iter().take(n_paths).map(|a| a.load(Ordering::Relaxed)).collect();
+        let hl = *self.home_lat.borrow();
+        let lat: Vec<u64> = hl.iter().take(n_paths).map(|e| e.0).collect();
+        let n: Vec<u64> = hl.iter().take(n_paths).map(|e| e.1).collect();
         let base = path_rank_key(self.qid, n_paths, self.cfg.path_offset);
         let home = (base + self.home_shift.get()) % n_paths;
-        let next = choose_home(home, &lat, &n, 16);
+        let next = choose_home(home, &lat, &n, 8);
         if next != home {
             log::info!("q{}: small-read home path {home} -> {next} (latency {:?} us)", self.qid, lat.iter().map(|l| l / 1000).collect::<Vec<_>>());
             self.home_shift.set((next + n_paths - base % n_paths) % n_paths);
+            self.home_moved.set(Some(Instant::now()));
         }
     }
 
@@ -3421,6 +3470,20 @@ mod tests {
         assert_eq!(choose_home(2, &us(&[190, 0, 265, 270]), &n, 16), 0);
         assert_eq!(choose_home(2, &us(&[190, 195, 265, 270]), &[10, 10, 100, 100], 16), 2, "too few samples on the faster paths");
         assert_eq!(choose_home(2, &us(&[190, 195, 265, 270]), &[100, 100, 0, 100], 16), 2, "no samples on the home path: keep it");
+    }
+
+    /// Large payloads go to io-wq only while the lane is shallow (g2: a win
+    /// at 1M 4:1, a loss and 25% more CPU at depth), unless ASYNC_RX_MIN
+    /// asks for it everywhere.
+    #[test]
+    fn io_wq_receive_only_while_shallow() {
+        let k256 = 256 * 1024;
+        assert_eq!(async_rx_min(0, k256, true), k256);
+        assert_eq!(async_rx_min(0, k256, false), 0, "depth mode: inline");
+        assert_eq!(async_rx_min(0, 0, true), 0, "off");
+        assert_eq!(async_rx_min(k256, 0, false), k256, "the global setting still applies everywhere");
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 64 * 1024, async_rx_min(0, k256, true)), (1 << 20, true));
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 64 * 1024, async_rx_min(0, k256, false)), (64 * 1024, false));
     }
 
     #[test]
