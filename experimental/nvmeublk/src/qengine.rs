@@ -152,6 +152,21 @@ static LINK_HDR: std::sync::LazyLock<bool> =
 static LAT_PATH: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LAT_PATH").map_or(true, |v| v != "0"));
 
+/// Byte-balanced path choice for bulk commands (design doc §4.4 L6;
+/// NVMEUBLK_BYTE_PATH, default on; 0 = least-outstanding by count). A
+/// command with more than SMALL_IO bytes of payload goes to the live path
+/// with the fewest payload bytes in flight in its direction, counted over
+/// every engine of the device (Stats::path_rd_bytes / path_wr_bytes), then
+/// the fewest commands on this engine's connection. Counting commands let
+/// one path run ahead with mixed sizes, and each engine (io thread) balanced
+/// only its own share, so a single stream spread over four threads could
+/// still pile onto one path.
+static BYTE_PATH: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_BYTE_PATH").map_or(true, |v| v != "0"));
+
+/// Most paths the per-path counters cover.
+pub const MAX_PATHS: usize = 8;
+
 /// Payload size up to which a command is "small" for path choice and
 /// connection class.
 pub const SMALL_IO: usize = 32 * 1024;
@@ -422,6 +437,13 @@ pub struct Stats {
     /// (ns); both reset by the stats reporter.
     pub long_turns: AtomicU64,
     pub turn_max_ns: AtomicU64,
+    /// Payload bytes of commands on the wire right now, per path index and
+    /// direction, over every engine of the device (byte-balanced choice).
+    pub path_rd_bytes: [std::sync::atomic::AtomicI64; MAX_PATHS],
+    pub path_wr_bytes: [std::sync::atomic::AtomicI64; MAX_PATHS],
+    /// Payload bytes completed per path (both directions), for the per-path
+    /// balance in the stats line.
+    pub path_done_bytes: [AtomicU64; MAX_PATHS],
     /// Small commands (payload <= SMALL_IO) sent, per path index (the
     /// first 8 paths): where latency-aware path choice put them.
     pub small_by_path: [AtomicU64; 8],
@@ -1041,13 +1063,19 @@ impl Engine {
         // Small commands: least expected completion time (see LAT_PATH);
         // the rest: fewest outstanding.
         let small = *LAT_PATH && p.len <= SMALL_IO;
+        let bulk_bytes = *BYTE_PATH && p.len > SMALL_IO;
         let now = Instant::now();
         {
             let rtt = self.path_rtt.borrow();
             live.sort_by_key(|c| {
                 let n = c.inflight.borrow().len();
+                if bulk_bytes {
+                    // Byte balance over the device; batch affinity would
+                    // defeat it (a 1 MiB command is its own batch anyway).
+                    return (false, self.bytes_on(c.path, p.op).max(0) as u64, n as u64);
+                }
                 let load = if small { rtt.get(c.path).map_or(0, |r| r.cost(n, now)) } else { n as u64 };
-                (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), load)
+                (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), load, 0)
             });
         }
         for c in live {
@@ -1126,14 +1154,30 @@ impl Engine {
     /// table itself (here, `untrack` and `fail_conn`), so a panic between
     /// the two cannot leave it off for good (it gates the daemon's drain).
     fn track(&self, c: &QConn, cid: u16, p: Pending) {
+        self.path_bytes(c.path, p.op, p.len as i64);
         c.inflight.borrow_mut().insert(cid, p);
         self.stats.inflight.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Move the device's in-flight byte count of `path` for `op`'s direction.
+    fn path_bytes(&self, path: usize, op: Op, delta: i64) {
+        let arr = if op == Op::Write { &self.stats.path_wr_bytes } else { &self.stats.path_rd_bytes };
+        if let Some(b) = arr.get(path) {
+            b.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// The device's payload bytes in flight on `path` in `op`'s direction.
+    fn bytes_on(&self, path: usize, op: Op) -> i64 {
+        let arr = if op == Op::Write { &self.stats.path_wr_bytes } else { &self.stats.path_rd_bytes };
+        arr.get(path).map_or(0, |b| b.load(Ordering::Relaxed))
+    }
+
     fn untrack(&self, c: &QConn, cid: u16) -> Option<Pending> {
         let p = c.inflight.borrow_mut().remove(&cid);
-        if p.is_some() {
+        if let Some(p) = &p {
             self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
+            self.path_bytes(c.path, p.op, -(p.len as i64));
         }
         p
     }
@@ -1218,6 +1262,9 @@ impl Engine {
         // behind in a dead connection's table.
         let mut all = std::mem::take(&mut *c.inflight.borrow_mut());
         self.stats.inflight.fetch_sub(all.len() as i64, Ordering::Relaxed);
+        for p in all.values() {
+            self.path_bytes(c.path, p.op, -(p.len as i64));
+        }
         if let Some(p) = c.rx_direct.get().and_then(|cid| all.remove(&cid)) {
             *c.held.borrow_mut() = Some(p);
         }
@@ -1285,6 +1332,9 @@ impl Engine {
         }
         self.free_cid(c, cid);
         self.stats.done.fetch_add(1, Ordering::Relaxed);
+        if let Some(b) = self.stats.path_done_bytes.get(c.path) {
+            b.fetch_add(p.len as u64, Ordering::Relaxed);
+        }
         self.stats.wire_ns.fetch_add(p.sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.stats.total_ns.fetch_add(p.first.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let (Some(w), Some(d)) = (p.wired, p.first_data) {
@@ -3123,6 +3173,40 @@ mod tests {
         });
         let (s, f) = (slow_seen.lock().unwrap().reads, fast_seen.lock().unwrap().reads);
         assert!(s >= 10, "large reads go to the first live connection, as before: slow={s} fast={f}");
+    }
+
+    /// Byte balance (L6): with a 1 MiB read in flight on one path, the next
+    /// 128k reads all go to the other path until its bytes catch up;
+    /// least-outstanding by count alternated them.
+    #[test]
+    fn bulk_reads_balance_bytes_across_paths() {
+        let a = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(1500), ..Default::default() }).unwrap();
+        let b = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(1500), ..Default::default() }).unwrap();
+        on_ring_thread(move || {
+            let r = rig_paths(&[&a, &b], "byte-path", Duration::from_secs(20));
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
+            let mut big = vec![0u8; 1 << 20];
+            let mut small: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 128 * 1024]).collect();
+            let mut rxs = vec![request(&r.e, Op::Read, &mut big)];
+            // Let the 1 MiB command go out before the others are chosen.
+            drive_until(&r.exe, Duration::from_millis(50), || false);
+            for buf in small.iter_mut() {
+                rxs.push(request(&r.e, Op::Read, buf));
+                drive_until(&r.exe, Duration::from_millis(20), || false);
+            }
+            let per_path: Vec<usize> = (0..2)
+                .map(|path| r.e.core.live().iter().filter(|c| c.path == path).map(|c| c.inflight.borrow().values().map(|p| p.len).sum::<usize>()).sum())
+                .collect();
+            let (big_path, other) = if per_path[0] >= 1 << 20 { (0, 1) } else { (1, 0) };
+            assert_eq!(per_path[big_path], 1 << 20, "the 1 MiB read's path takes nothing else: {per_path:?}");
+            assert_eq!(per_path[other], 4 * 128 * 1024, "{per_path:?}");
+            assert_eq!(r.stats.path_rd_bytes[big_path].load(Ordering::Relaxed), 1 << 20);
+            for rx in rxs {
+                assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()));
+            }
+            assert_eq!(r.stats.path_rd_bytes[0].load(Ordering::Relaxed) + r.stats.path_rd_bytes[1].load(Ordering::Relaxed), 0, "counters return to zero");
+        });
     }
 
     #[test]

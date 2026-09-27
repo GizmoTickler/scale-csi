@@ -568,8 +568,9 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
         log::info!(
-            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} batch_tags={} batch_spills={} batch_takeovers={} small_by_path={:?} {}",
+            "ctrls [{}] path_MiB={:?} failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} batch_tags={} batch_spills={} batch_takeovers={} small_by_path={:?} {}",
             ups.join(" "),
+            st.path_done_bytes.iter().take(cstat.paths.len()).map(|c| c.load(Ordering::Relaxed) >> 20).collect::<Vec<_>>(),
             st.failovers.load(Ordering::Relaxed),
             st.resubmits.load(Ordering::Relaxed),
             st.parked.load(Ordering::Relaxed),
