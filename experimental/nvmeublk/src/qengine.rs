@@ -297,8 +297,9 @@ impl PathRtt {
 }
 
 /// Per-I/O trace (NVMEUBLK_TRACE_DIR, diagnostics): one line per completed
-/// request, "local_port cid sent wired first_data done path len" (times in
-/// CLOCK_REALTIME nanoseconds, 0 = not recorded), to join with a packet
+/// request, "local_port cid sent wired first_data done path len first slba"
+/// (times in CLOCK_REALTIME nanoseconds, 0 = not recorded; `first` = when
+/// the request reached the engine), to join with a packet
 /// capture and to histogram the wire round trip per path.
 static TRACE_DIR: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_TRACE_DIR").ok().filter(|d| !d.is_empty()));
 
@@ -325,7 +326,7 @@ fn trace_io(fd: i32, cid: u16, path: usize, p: &Pending) {
         let (w, base, rt, n) = t.as_mut().unwrap();
         let ns = |i: Option<Instant>| i.map_or(0, |i| if i >= *base { *rt + (i - *base).as_nanos() } else { rt.saturating_sub((*base - i).as_nanos()) });
         use std::io::Write;
-        let _ = writeln!(w, "{port} {cid} {} {} {} {} {path} {}", ns(Some(p.sent)), ns(p.wired), ns(p.first_data), ns(Some(Instant::now())), p.len);
+        let _ = writeln!(w, "{port} {cid} {} {} {} {} {path} {} {} {}", ns(Some(p.sent)), ns(p.wired), ns(p.first_data), ns(Some(Instant::now())), p.len, ns(Some(p.first)), p.slba);
         *n += 1;
         if *n % 256 == 0 {
             let _ = w.flush();
