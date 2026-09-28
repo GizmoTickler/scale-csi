@@ -529,13 +529,15 @@ pub struct Tenancy {
     // ring), then the batch transport, the queue, the device.
     arrive: Vec<smol::channel::Sender<()>>,
     tasks: Vec<smol::Task<()>>,
-    exe: smol::LocalExecutor<'static>,
+    /// The tag tasks' executor: this tenancy's own, or on a shared engine
+    /// the one of every tenancy of the device on this reactor (EngineShare).
+    exe: Rc<smol::LocalExecutor<'static>>,
     completions: Rc<RefCell<Vec<UblkBatchCompletion>>>,
     engine: Rc<qengine::QEngine>,
     /// Shared engine: this tenancy's hold on the reactor's entry (dropped
     /// with `engine`, so the last tenancy ends the engine where an own one
     /// ends).
-    _share: Option<Rc<EngineAndExe>>,
+    _share: Option<Rc<EngineShare<qengine::QEngine>>>,
     net_exe: Rc<smol::LocalExecutor<'static>>,
     batch: UblkBatchQueue<'static, 'static>,
     q: Rc<UblkQueue<'static>>,
@@ -614,11 +616,38 @@ impl<T> Shared<T> {
     }
 }
 
-type EngineAndExe = (Rc<qengine::QEngine>, Rc<smol::LocalExecutor<'static>>);
+/// What a device's tenancies on one reactor share: the engine, its
+/// network executor, and one executor for all their tag tasks. With a tag
+/// executor per tenancy, a network completion that one tenancy's turn
+/// drove woke a tag task of another tenancy whose turn had already run; the
+/// request then waited for the reactor's next poll (up to the NAPI
+/// spin-wait, or a sleep) before its tag task queued the result, and one
+/// more turn for the commit. With one tag executor, whichever tenancy
+/// drives the network also runs the woken tag tasks (QEngine::run_turn
+/// runs both to quiescence), and every result is committed by its tenancy
+/// before the next poll.
+pub struct EngineShare<E> {
+    pub engine: Rc<E>,
+    pub net: Rc<smol::LocalExecutor<'static>>,
+    pub tags: Rc<smol::LocalExecutor<'static>>,
+}
+
+/// The share under `key` in `reg`, or a new one (fresh executors, and the
+/// engine `make` builds on the network executor), registered.
+pub fn join_share<E>(reg: &mut Shared<EngineShare<E>>, key: usize, make: impl FnOnce(&Rc<smol::LocalExecutor<'static>>) -> Rc<E>) -> (Rc<EngineShare<E>>, bool) {
+    if let Some(s) = reg.get(key) {
+        return (s, false);
+    }
+    let net = Rc::new(smol::LocalExecutor::new());
+    let engine = make(&net);
+    let s = Rc::new(EngineShare { engine, net, tags: Rc::new(smol::LocalExecutor::new()) });
+    reg.put(key, &s);
+    (s, true)
+}
 
 thread_local! {
-    /// Shared engines of this reactor thread, with their network executor.
-    static SHARED: RefCell<Shared<EngineAndExe>> = const { RefCell::new(Shared::new()) };
+    /// Shared engines of this reactor thread, with their executors.
+    static SHARED: RefCell<Shared<EngineShare<qengine::QEngine>>> = const { RefCell::new(Shared::new()) };
 }
 
 /// What the host does with a tenancy after `before_wait`.
@@ -711,22 +740,22 @@ impl Tenancy {
         // queues the reactor hosts tenancies of; else one per tenancy.
         let reactor = if slot.is_some() && shared_engines() { crate::reactor::this_reactor() } else { None };
         let key = Arc::as_ptr(&ctrls) as usize;
-        let found = reactor.and_then(|_| SHARED.with(|s| s.borrow_mut().get(key)));
-        let (engine, net_exe, share) = match found {
-            Some(p) => (p.0.clone(), p.1.clone(), Some(p)),
+        let (engine, net_exe, exe, share) = match reactor {
+            Some(r) => {
+                let (p, _) = SHARED.with(|s| {
+                    join_share(&mut s.borrow_mut(), key, |net| {
+                        let engine = qengine::QEngine::new(r as u16, ctrls, cfg, net.clone(), stats.clone(), stop.clone(), draining);
+                        engine.start();
+                        engine
+                    })
+                });
+                (p.engine.clone(), p.net.clone(), p.tags.clone(), Some(p))
+            }
             None => {
-                let eid = match reactor {
-                    Some(r) => r as u16,
-                    None => qid * dev.io_threads_per_queue() + thread,
-                };
+                let eid = qid * dev.io_threads_per_queue() + thread;
                 let engine = qengine::QEngine::new(eid, ctrls, cfg, net_exe.clone(), stats.clone(), stop.clone(), draining);
                 engine.start();
-                let share = reactor.map(|_| {
-                    let p = Rc::new((engine.clone(), net_exe.clone()));
-                    SHARED.with(|s| s.borrow_mut().put(key, &p));
-                    p
-                });
-                (engine, net_exe, share)
+                (engine, net_exe, Rc::new(smol::LocalExecutor::new()), None)
             }
         };
         let shared_engine = share.is_some();
@@ -735,7 +764,6 @@ impl Tenancy {
         // sleeps on its tag's channel until the tag is fetched here, serves
         // the request and queues its result for the next commit.
         let completions: Rc<RefCell<Vec<UblkBatchCompletion>>> = Rc::new(RefCell::new(Vec::with_capacity(depth as usize)));
-        let exe = smol::LocalExecutor::new();
         let mut arrive = Vec::with_capacity(depth as usize);
         let mut tasks = Vec::with_capacity(depth as usize);
         for tag in 0..depth {
@@ -1297,6 +1325,45 @@ mod shared_tests {
     /// Pool tenancies of one device on one reactor share one engine: the
     /// registry hands out the live value under a key while a holder keeps
     /// it, a new one once all holders are gone, and keys stay apart.
+    /// A device's tenancies on one reactor share one tag executor with the
+    /// engine: a tag task of tenancy A, woken by a network completion that
+    /// tenancy B's turn drives, runs in B's turn (it waited for the next
+    /// poll when each tenancy had its own tag executor).
+    #[test]
+    fn tenancies_of_a_shared_engine_share_the_tag_executor() {
+        let mut reg: Shared<super::EngineShare<u8>> = Shared::new();
+        let (a, new_a) = super::join_share(&mut reg, 1, |_| Rc::new(0));
+        let (b, new_b) = super::join_share(&mut reg, 1, |_| Rc::new(1));
+        assert!(new_a && !new_b);
+        assert!(Rc::ptr_eq(&a.engine, &b.engine) && Rc::ptr_eq(&a.net, &b.net));
+        assert!(Rc::ptr_eq(&a.tags, &b.tags), "one tag executor per shared engine");
+        let (other, _) = super::join_share(&mut reg, 2, |_| Rc::new(2));
+        assert!(!Rc::ptr_eq(&a.tags, &other.tags), "another device has its own");
+        // A's tag task waits for a completion the network executor delivers.
+        let (tx, rx) = smol::channel::bounded::<()>(1);
+        let done = Rc::new(std::cell::Cell::new(false));
+        let d = done.clone();
+        let task = a.tags.spawn(async move {
+            rx.recv().await.unwrap();
+            d.set(true);
+        });
+        while a.tags.try_tick() {}
+        let net_task = b.net.spawn(async move { tx.send(()).await.unwrap() });
+        // B's turn: its executors to quiescence, as QEngine::run_turn does.
+        let mut progress = true;
+        while progress {
+            progress = false;
+            while b.tags.try_tick() {
+                progress = true;
+            }
+            while b.net.try_tick() {
+                progress = true;
+            }
+        }
+        assert!(done.get(), "A's request completed within B's turn");
+        drop((task, net_task));
+    }
+
     #[test]
     fn a_reactor_shares_one_engine_per_device() {
         let mut s: Shared<u32> = Shared::new();
