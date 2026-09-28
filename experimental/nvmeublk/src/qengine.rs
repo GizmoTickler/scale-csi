@@ -995,6 +995,19 @@ impl QEngine {
         self.core.shallow.set(shallow);
     }
 
+    /// An engine shared by several tenancies (batchq, NVMEUBLK_SHARED_ENGINE):
+    /// one of them moved between shallow and depth mode (`was_deep` ->
+    /// `deep`). The engine is shallow while none of them is deep.
+    pub fn note_lane_deep(&self, was_deep: bool, deep: bool) {
+        let n = &self.core.deep_lanes;
+        match (was_deep, deep) {
+            (false, true) => n.set(n.get() + 1),
+            (true, false) => n.set(n.get().saturating_sub(1)),
+            _ => {}
+        }
+        self.core.shallow.set(n.get() == 0);
+    }
+
     /// PDUs this engine has received so far.
     pub fn events(&self) -> u64 {
         self.core.events.get()
@@ -1091,6 +1104,8 @@ struct Engine {
     home_lat: RefCell<[(u64, u64); MAX_PATHS]>,
     /// The lane is shallow (not in hot-lane depth mode): SHALLOW_ASYNC_RX.
     shallow: Cell<bool>,
+    /// Shared engine: how many of its tenancies are in depth mode.
+    deep_lanes: Cell<u32>,
     /// When the home path last moved (it then stays HOME_HOLD).
     home_moved: Cell<Option<Instant>>,
     home_checked: Cell<Instant>,
@@ -1158,6 +1173,7 @@ impl Engine {
             probes: Cell::new(0),
             home_lat: RefCell::new([(0, 0); MAX_PATHS]),
             shallow: Cell::new(false),
+            deep_lanes: Cell::new(0),
             home_moved: Cell::new(None),
             home_checked: Cell::new(Instant::now()),
         })
@@ -3428,6 +3444,28 @@ mod tests {
                 drop(r);
             });
         }
+    }
+
+    /// A shared engine is shallow only while none of its tenancies is in
+    /// depth mode (SHALLOW_ASYNC_RX follows the deepest lane on it).
+    #[test]
+    fn a_shared_engine_is_shallow_while_no_lane_is_deep() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "lanes", Duration::from_secs(20));
+            let e = &r.e;
+            e.note_lane_deep(false, false);
+            assert!(e.core.shallow.get());
+            e.note_lane_deep(false, true);
+            e.note_lane_deep(false, true);
+            assert!(!e.core.shallow.get());
+            e.note_lane_deep(true, false);
+            assert!(!e.core.shallow.get(), "one lane still deep");
+            e.note_lane_deep(false, false);
+            assert!(!e.core.shallow.get(), "a shallow lane reporting again changes nothing");
+            e.note_lane_deep(true, false);
+            assert!(e.core.shallow.get());
+        });
     }
 
     /// Connection classes (L5): small commands go on each path's small

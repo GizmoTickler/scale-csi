@@ -505,6 +505,10 @@ pub struct Tenancy {
     exe: smol::LocalExecutor<'static>,
     completions: Rc<RefCell<Vec<UblkBatchCompletion>>>,
     engine: Rc<qengine::QEngine>,
+    /// Shared engine: this tenancy's hold on the reactor's entry (dropped
+    /// with `engine`, so the last tenancy ends the engine where an own one
+    /// ends).
+    _share: Option<Rc<EngineAndExe>>,
     net_exe: Rc<smol::LocalExecutor<'static>>,
     batch: UblkBatchQueue<'static, 'static>,
     q: Rc<UblkQueue<'static>>,
@@ -522,6 +526,11 @@ pub struct Tenancy {
     depth: u16,
     dev_id: i32,
     is_primary: bool,
+    /// The engine is shared with the reactor's other tenancies of this
+    /// device (its in-flight count and mode are not this tenancy's alone).
+    shared_engine: bool,
+    /// The mode this tenancy last reported to a shared engine.
+    reported_deep: bool,
     warm: WarmClock,
     last_check: Instant,
     deep: bool,
@@ -541,6 +550,45 @@ pub struct Tenancy {
     /// Keeps the device alive for a pooled tenancy (a queue thread's device
     /// is kept by libublk's thread). Last: dropped after the queue.
     _dev: Option<Arc<UblkDev>>,
+}
+
+/// Whether pooled tenancies share one engine per device and reactor
+/// (NVMEUBLK_SHARED_ENGINE): connections then follow the reactors a device
+/// uses, not its queues x threads, so the queue count can follow the CPUs.
+pub fn shared_engines() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| env_u64("NVMEUBLK_SHARED_ENGINE", SHARED_ENGINE_BY_DEFAULT as u64) != 0);
+    *ON
+}
+const SHARED_ENGINE_BY_DEFAULT: bool = false;
+
+/// Values shared by key on one thread, alive while someone holds them
+/// (the pool's shared engines: key = the device's Ctrls address).
+pub struct Shared<T> {
+    v: Vec<(usize, std::rc::Weak<T>)>,
+}
+
+impl<T> Shared<T> {
+    pub const fn new() -> Self {
+        Shared { v: Vec::new() }
+    }
+
+    /// The live value under `key`, if any (dead entries are dropped).
+    pub fn get(&mut self, key: usize) -> Option<Rc<T>> {
+        self.v.retain(|(_, w)| w.strong_count() > 0);
+        self.v.iter().find(|(k, _)| *k == key).and_then(|(_, w)| w.upgrade())
+    }
+
+    pub fn put(&mut self, key: usize, v: &Rc<T>) {
+        self.v.retain(|(k, w)| w.strong_count() > 0 && *k != key);
+        self.v.push((key, Rc::downgrade(v)));
+    }
+}
+
+type EngineAndExe = (Rc<qengine::QEngine>, Rc<smol::LocalExecutor<'static>>);
+
+thread_local! {
+    /// Shared engines of this reactor thread, with their network executor.
+    static SHARED: RefCell<Shared<EngineAndExe>> = const { RefCell::new(Shared::new()) };
 }
 
 /// What the host does with a tenancy after `before_wait`.
@@ -629,9 +677,29 @@ impl Tenancy {
         if zc {
             cfg.rx_offload = 0;
         }
-        let eid = qid * dev.io_threads_per_queue() + thread;
-        let engine = qengine::QEngine::new(eid, ctrls, cfg, net_exe.clone(), stats.clone(), stop.clone(), draining);
-        engine.start();
+        // Shared engine (pool): one engine per device and reactor, whatever
+        // queues the reactor hosts tenancies of; else one per tenancy.
+        let reactor = if slot.is_some() && shared_engines() { crate::reactor::this_reactor() } else { None };
+        let key = Arc::as_ptr(&ctrls) as usize;
+        let found = reactor.and_then(|_| SHARED.with(|s| s.borrow_mut().get(key)));
+        let (engine, net_exe, share) = match found {
+            Some(p) => (p.0.clone(), p.1.clone(), Some(p)),
+            None => {
+                let eid = match reactor {
+                    Some(r) => r as u16,
+                    None => qid * dev.io_threads_per_queue() + thread,
+                };
+                let engine = qengine::QEngine::new(eid, ctrls, cfg, net_exe.clone(), stats.clone(), stop.clone(), draining);
+                engine.start();
+                let share = reactor.map(|_| {
+                    let p = Rc::new((engine.clone(), net_exe.clone()));
+                    SHARED.with(|s| s.borrow_mut().put(key, &p));
+                    p
+                });
+                (engine, net_exe, share)
+            }
+        };
+        let shared_engine = share.is_some();
 
         // One task per tag: any tag may be fetched by this tenancy. A task
         // sleeps on its tag's channel until the tag is fetched here, serves
@@ -674,6 +742,7 @@ impl Tenancy {
             exe,
             completions,
             engine,
+            _share: share,
             net_exe,
             batch,
             q: q_rc,
@@ -688,6 +757,8 @@ impl Tenancy {
             depth,
             dev_id,
             is_primary,
+            shared_engine,
+            reported_deep: false,
             warm: WarmClock::new(now),
             last_check: now,
             deep: false,
@@ -858,7 +929,13 @@ impl Tenancy {
                 }
             }
         }
-        self.engine.set_shallow(self.hot.is_some() && !self.deep);
+        if self.shared_engine {
+            let deep = self.hot.is_none() || self.deep;
+            self.engine.note_lane_deep(self.reported_deep, deep);
+            self.reported_deep = deep;
+        } else {
+            self.engine.set_shallow(self.hot.is_some() && !self.deep);
+        }
         // Wait for events. Hot-lane primary: the warm window; otherwise
         // adaptive polling as in the per-tag loop.
         self.note_events();
@@ -866,7 +943,9 @@ impl Tenancy {
         let recent = !self.spin.is_zero() && since_event < self.spin;
         let spin = match self.hot {
             Some(h) => {
-                let on_wire = self.engine.inflight_here() > 0;
+                // A shared engine's commands are not all this tenancy's: its
+                // own are the requests it holds.
+                let on_wire = if self.shared_engine { self.batch.owned_tag_count() > 0 } else { self.engine.inflight_here() > 0 };
                 let hot = self.warm.turn(on_wire, Instant::now(), since_event, self.engine.wire_rtt());
                 let holding = on_wire || self.batch.owned_tag_count() > 0;
                 h.spins(self.is_primary, self.deep, hot, holding, recent)
@@ -956,6 +1035,10 @@ impl Tenancy {
     /// sibling takes its role) and give back what it held of the queue's
     /// total.
     pub fn end(&mut self, clean: bool) {
+        if self.shared_engine && self.reported_deep {
+            self.engine.note_lane_deep(true, false);
+            self.reported_deep = false;
+        }
         self.shared.beat(self.thread, clean);
         self.shared.publish_held(self.published_held, 0);
         self.published_held = 0;
@@ -1151,6 +1234,31 @@ pub fn poll(wait: usize, timeout: &io_uring::types::Timespec) -> std::io::Result
             Err(e) => Err(e),
         }
     })
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::Shared;
+    use std::rc::Rc;
+
+    /// Pool tenancies of one device on one reactor share one engine: the
+    /// registry hands out the live value under a key while a holder keeps
+    /// it, a new one once all holders are gone, and keys stay apart.
+    #[test]
+    fn a_reactor_shares_one_engine_per_device() {
+        let mut s: Shared<u32> = Shared::new();
+        assert!(s.get(1).is_none());
+        let a = Rc::new(7u32);
+        s.put(1, &a);
+        let b = s.get(1).expect("second tenancy of device 1 finds the engine");
+        assert!(Rc::ptr_eq(&a, &b));
+        assert!(s.get(2).is_none(), "another device has its own");
+        drop(a);
+        assert!(s.get(1).is_some(), "alive while a tenancy holds it");
+        drop(b);
+        assert!(s.get(1).is_none(), "gone with its last tenancy");
+        assert!(s.v.is_empty(), "dead entries are dropped");
+    }
 }
 
 #[cfg(test)]

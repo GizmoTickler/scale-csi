@@ -78,6 +78,16 @@ pub fn default_primaries(reactors: usize) -> usize {
     (reactors / 2).max(1)
 }
 
+thread_local! {
+    /// The index of the reactor this thread is (None off the pool).
+    static THIS_REACTOR: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The index of the pool reactor the calling thread is, if it is one.
+pub fn this_reactor() -> Option<usize> {
+    THIS_REACTOR.with(|r| r.get())
+}
+
 /// A job for a reactor, run on its thread between turns.
 type Job = Box<dyn FnOnce(&mut Reactor) + Send>;
 
@@ -418,6 +428,7 @@ fn arm_mailbox(efd: i32) -> Result<(), String> {
 
 fn run(handle: Arc<Handle>, ready: Arc<(Mutex<usize>, Condvar)>) {
     let tid = libublk::ctrl::UblkCtrl::init_queue_thread();
+    THIS_REACTOR.with(|r| r.set(Some(handle.idx)));
     let ok = setup_ring(handle.efd);
     match &ok {
         Ok(()) => handle.tid.store(tid, Ordering::Release),

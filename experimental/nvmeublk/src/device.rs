@@ -1136,9 +1136,15 @@ fn bring_up(
     }
     let fault_dir = fault_dir(dev_id);
     let _ = std::fs::create_dir_all(&fault_dir);
-    // Fault injection fans a command out to one file per engine, and there
-    // is one engine per io thread (engine id = queue * threads + thread).
-    let _ = std::fs::write(format!("{fault_dir}/queues"), (queues * threads).to_string());
+    // Fault injection fans a command out to one file per engine: one per io
+    // thread (engine id = queue * threads + thread), or with shared engines
+    // on the pool one per reactor (engine id = reactor index).
+    let pooled = spec.batch_io && crate::batchq::shared_engines();
+    let engines = match pooled.then(crate::reactor::pool).flatten() {
+        Some(p) => p.reactors() as u16,
+        None => queues * threads,
+    };
+    let _ = std::fs::write(format!("{fault_dir}/queues"), engines.to_string());
     let cfg = qengine::QConfig {
         io_timeout: Duration::from_millis(spec.io_timeout_ms),
         no_path_timeout: Duration::from_millis(spec.no_path_timeout_ms),
