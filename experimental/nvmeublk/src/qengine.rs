@@ -549,6 +549,8 @@ pub struct Stats {
     pub batch_takeovers: AtomicU64,
     /// Payload receives handed to io-wq (IOSQE_ASYNC, bounded turns).
     pub async_rx: AtomicU64,
+    /// Bulk commands that waited at the bulk admission gate (crate::gate).
+    pub gate_waits: AtomicU64,
     /// Queue-thread turns (a non-sleeping ring poll with its task work, or
     /// one run of the executors) longer than 50 µs, and the longest one
     /// (ns); both reset by the stats reporter.
@@ -1034,6 +1036,12 @@ struct Engine {
     next_try: RefCell<Vec<Instant>>,
     backoff: RefCell<Vec<Duration>>,
     parked: RefCell<VecDeque<Pending>>,
+    /// Bulk commands waiting at the bulk admission gate, in order.
+    throttled: RefCell<VecDeque<Pending>>,
+    /// The process-wide bulk gate of each path, and this engine's bulk
+    /// commands in flight (crate::gate).
+    gates: Vec<Arc<crate::gate::PathGate>>,
+    own_bulk: Cell<usize>,
     /// Writes/flushes waiting out the write fence: (release time, request).
     fenced: RefCell<Vec<(Instant, Pending)>>,
     exe: Rc<smol::LocalExecutor<'static>>,
@@ -1113,6 +1121,7 @@ impl Engine {
         let n_paths = ctrls.paths.len();
         let n = n_paths * (cfg.conns_per_path.max(1) + cfg.conn_classes as usize);
         let tick_fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) };
+        let gates = ctrls.paths.iter().map(|p| crate::gate::for_path(p.addr)).collect();
         Rc::new(Engine {
             qid,
             incapsule: ctrls.info.incapsule_bytes,
@@ -1123,6 +1132,9 @@ impl Engine {
             next_try: RefCell::new(vec![Instant::now(); n]),
             backoff: RefCell::new(vec![Duration::from_millis(250); n]),
             parked: RefCell::new(VecDeque::new()),
+            throttled: RefCell::new(VecDeque::new()),
+            gates,
+            own_bulk: Cell::new(0),
             fenced: RefCell::new(Vec::new()),
             exe,
             tick_fd,
@@ -1207,17 +1219,51 @@ impl Engine {
     }
 
     /// Send to the live connection with the fewest outstanding commands;
-    /// park if none has a free slot.
-    fn dispatch(&self, mut p: Pending) {
+    /// park if none has a free slot; a bulk command the gate holds back
+    /// waits behind the ones already waiting (crate::gate).
+    fn dispatch(&self, p: Pending) {
+        if !is_small_cmd(p.op, p.len) && self.gate_closed() && !self.throttled.borrow().is_empty() {
+            self.stats.gate_waits.fetch_add(1, Ordering::Relaxed);
+            self.throttled.borrow_mut().push_back(p);
+            self.kick_throttled();
+            return;
+        }
+        if let Some(p) = self.dispatch_gated(p) {
+            self.stats.gate_waits.fetch_add(1, Ordering::Relaxed);
+            self.throttled.borrow_mut().push_back(p);
+        }
+    }
+
+    /// Whether the bulk gate holds bulk commands back now (on, small
+    /// commands recently, and this engine has a bulk command in flight).
+    fn gate_closed(&self) -> bool {
+        let (cap, recent) = crate::gate::config();
+        cap > 0 && self.own_bulk.get() > 0 && crate::gate::closed(recent)
+    }
+
+    /// Bulk commands that waited at the gate go out while it admits them,
+    /// oldest first.
+    fn kick_throttled(&self) {
+        loop {
+            let Some(p) = self.throttled.borrow_mut().pop_front() else { return };
+            if let Some(p) = self.dispatch_gated(p) {
+                self.throttled.borrow_mut().push_front(p);
+                return;
+            }
+        }
+    }
+
+    /// `dispatch` past the gate's queue: Some(p) back if the gate holds it.
+    fn dispatch_gated(&self, mut p: Pending) -> Option<Pending> {
         if self.failed.get() {
             // A failed engine sends nothing more. Retries end here: a read
             // failed over, or a write or flush once its fence has passed.
             p.finish(-libc::EIO);
-            return;
+            return None;
         }
         if self.cfg.quiesce.load(Ordering::Acquire) {
             self.parked.borrow_mut().push_back(p);
-            return;
+            return None;
         }
         let mut live = self.live();
         if let Some(ap) = p.avoid_path {
@@ -1239,6 +1285,16 @@ impl Engine {
         // too while it is within SLACK of the least loaded, so one sendmsg
         // carries the turn's commands instead of one per path. Load still
         // evens out across turns; 0 = plain least-outstanding.
+        if is_small_cmd(p.op, p.len) {
+            crate::gate::note_small();
+        } else if !live.is_empty() && self.gate_closed() {
+            let (cap, _) = crate::gate::config();
+            let own = self.own_bulk.get();
+            live.retain(|c| self.gates.get(c.path).is_none_or(|g| crate::gate::admits(true, own, g.bytes.load(Ordering::Relaxed), p.len, cap)));
+            if live.is_empty() {
+                return Some(p);
+            }
+        }
         let min = live.iter().map(|c| c.inflight.borrow().len()).min().unwrap_or(0);
         let slack = *BATCH_SLACK;
         // Bulk commands: fewest outstanding, byte balance as the tie-break
@@ -1275,17 +1331,18 @@ impl Engine {
                             c.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    return;
+                    return None;
                 }
                 Err(back) => p = back,
             }
         }
         if self.draining.load(Ordering::Acquire) {
             p.finish(-libc::EIO);
-            return;
+            return None;
         }
         self.stats.parked.fetch_add(1, Ordering::Relaxed);
         self.parked.borrow_mut().push_back(p);
+        None
     }
 
     fn try_submit(&self, c: &Rc<QConn>, mut p: Pending) -> Result<(), Pending> {
@@ -1350,6 +1407,12 @@ impl Engine {
 
     /// Move the device's in-flight byte count of `path` for `op`'s direction.
     fn path_bytes(&self, path: usize, op: Op, delta: i64) {
+        if delta.unsigned_abs() as usize > SMALL_IO {
+            if let Some(g) = self.gates.get(path) {
+                g.bytes.fetch_add(delta, Ordering::Relaxed);
+            }
+            self.own_bulk.set(if delta > 0 { self.own_bulk.get() + 1 } else { self.own_bulk.get().saturating_sub(1) });
+        }
         let arr = if op == Op::Write { &self.stats.path_wr_bytes } else { &self.stats.path_rd_bytes };
         if let Some(b) = arr.get(path) {
             b.fetch_add(delta, Ordering::Relaxed);
@@ -1566,6 +1629,7 @@ impl Engine {
             p.finish(-libc::EIO);
         }
         self.kick_parked();
+        self.kick_throttled();
         Ok(())
     }
 
@@ -2237,7 +2301,10 @@ impl Engine {
             // 0 = always connected): after that long without a request the
             // queue drops its I/O connections, so an idle volume holds only
             // its admin connections; submit() reconnects on demand.
-            if self.submitted.get() > 0 || self.inflight_here() > 0 || !self.parked.borrow().is_empty() || !self.fenced.borrow().is_empty() {
+            // The gate's queue moves on bulk completions; the tick is a
+            // safety net (and lets it go once the gate has opened).
+            self.kick_throttled();
+            if self.submitted.get() > 0 || self.inflight_here() > 0 || !self.parked.borrow().is_empty() || !self.throttled.borrow().is_empty() || !self.fenced.borrow().is_empty() {
                 self.last_active.set(Instant::now());
             }
             let want_conns = IDLE_DISCONNECT.is_zero() || self.last_active.get().elapsed() < *IDLE_DISCONNECT;
@@ -2267,7 +2334,7 @@ impl Engine {
             // A failed engine never reconnects: missing connections are not
             // work that needs the fast tick.
             let all_up = self.failed.get() || !want_conns || self.conns.borrow().iter().all(|c| c.is_some());
-            idle = self.submitted.replace(0) == 0 && self.inflight_here() == 0 && self.parked.borrow().is_empty() && self.fenced.borrow().is_empty() && all_up;
+            idle = self.submitted.replace(0) == 0 && self.inflight_here() == 0 && self.parked.borrow().is_empty() && self.throttled.borrow().is_empty() && self.fenced.borrow().is_empty() && all_up;
             if idle {
                 self.set_napi(false);
             }
@@ -2507,7 +2574,7 @@ impl Engine {
                 self.fail_conn(&c, "engine failed", Cause::Retired);
             }
             self.abort_dials();
-            let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
+            let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).chain(self.throttled.borrow_mut().drain(..)).collect();
             for p in parked {
                 p.finish(-libc::EIO);
             }
@@ -2596,7 +2663,7 @@ impl Engine {
         }
         self.abort_dials();
         // The queue is gone: nobody waits on these any more.
-        let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
+        let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).chain(self.throttled.borrow_mut().drain(..)).collect();
         for p in parked {
             p.finish(-libc::EIO);
         }
@@ -2658,7 +2725,7 @@ impl Engine {
 
     fn expire_parked(&self) {
         if self.draining.load(Ordering::Acquire) {
-            let all: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
+            let all: Vec<Pending> = self.parked.borrow_mut().drain(..).chain(self.throttled.borrow_mut().drain(..)).collect();
             for p in all {
                 p.finish(-libc::EIO);
             }
@@ -3330,6 +3397,37 @@ mod tests {
         assert_eq!(send_zc_min(Some("1"), None), Some(0));
         assert_eq!(send_zc_min(Some("0"), Some(4096)), None);
         assert_eq!(send_zc_min(Some(""), None), Some(64 * 1024));
+    }
+
+    /// Bulk admission gate (crate::gate): while small commands are being
+    /// served, a path admits bulk commands only up to the cap (the rest wait
+    /// in order and go out as completions make room; all complete); with the
+    /// gate open (no recent small command) they all go at once.
+    #[test]
+    fn the_bulk_gate_holds_bulk_commands_beyond_the_cap() {
+        for (closed, want_on_wire) in [(true, 2usize), (false, 4)] {
+            let t = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(300), ..Default::default() }).unwrap();
+            on_ring_thread(move || {
+                crate::gate::TEST_CONFIG.with(|c| c.set(Some((256 * 1024, if closed { Duration::from_secs(3600) } else { Duration::ZERO }))));
+                crate::gate::note_small();
+                let r = rig(&t, if closed { "gate-closed" } else { "gate-open" }, Duration::from_secs(20));
+                r.e.start();
+                assert!(drive_until(&r.exe, Duration::from_secs(10), || !r.e.core.live().is_empty()), "connection up");
+                let mut bufs: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 128 * 1024]).collect();
+                let rxs: Vec<Receiver<i32>> = bufs.iter_mut().map(|b| request(&r.e, Op::Read, b)).collect();
+                drive_until(&r.exe, Duration::from_millis(50), || false);
+                assert_eq!(r.e.inflight_here(), want_on_wire, "closed={closed}: on the wire");
+                assert_eq!(r.e.core.throttled.borrow().len(), 4 - want_on_wire, "closed={closed}: waiting at the gate");
+                assert!(drive_until(&r.exe, Duration::from_secs(10), || rxs.iter().all(|rx| !rx.is_empty())), "all complete");
+                for rx in &rxs {
+                    assert_eq!(rx.try_recv().unwrap(), 128 * 1024);
+                }
+                assert_eq!(r.stats.gate_waits.load(Ordering::Relaxed), (4 - want_on_wire) as u64);
+                assert_eq!(r.e.core.gates[0].bytes.load(Ordering::Relaxed), 0, "gate bytes back to zero");
+                assert_eq!(r.e.core.own_bulk.get(), 0);
+                drop(r);
+            });
+        }
     }
 
     /// Connection classes (L5): small commands go on each path's small
