@@ -131,6 +131,15 @@ pub struct HotLane {
     /// is at most this many bytes (NVMEUBLK_HOT_SMALL_BYTES, default 8192);
     /// they stop being small above twice that.
     pub small_bytes: u32,
+    /// Depth mode: a thread takes new requests only while it holds at most
+    /// this share (percent) of its fair part of what the queue's threads
+    /// hold (NVMEUBLK_HOT_DEEP_SHARE, 0 = no limit but the cap). The
+    /// driver hands a queue's requests to its threads in turn whatever
+    /// each already holds, so a thread that serves slower (its reactor
+    /// preempted, say) piled up the backlog: read 16k 64:8 had one
+    /// reactor's four connections at 23-30 commands each and another's at
+    /// 5, and the queued ones were the slowest 1% (iso r1-u-read16k).
+    pub deep_share_pct: u16,
     /// Whether the shallow primary spins while hot (NVMEUBLK_HOT_SPIN,
     /// default on). Off: it sleeps in its ring between events, like a
     /// secondary with nothing held, and relies on the guest halt-poll
@@ -140,7 +149,7 @@ pub struct HotLane {
 
 impl Default for HotLane {
     fn default() -> Self {
-        HotLane { lease: 4, secondary: 4, deep_lease: 2, deep_spin: false, wedge: Duration::from_millis(1000), primary_spin: true, deep_lease_small: 4, small_bytes: 8192 }
+        HotLane { lease: 4, secondary: 4, deep_lease: 2, deep_spin: false, wedge: Duration::from_millis(1000), primary_spin: true, deep_lease_small: 4, small_bytes: 8192, deep_share_pct: DEEP_SHARE_DEFAULT }
     }
 }
 
@@ -156,6 +165,7 @@ impl HotLane {
             primary_spin: env_u64("NVMEUBLK_HOT_SPIN", d.primary_spin as u64) != 0,
             deep_lease_small: env_u64("NVMEUBLK_HOT_DEEP_LEASE_SMALL", d.deep_lease_small as u64).clamp(1, u16::MAX as u64) as u16,
             small_bytes: env_u64("NVMEUBLK_HOT_SMALL_BYTES", d.small_bytes as u64).min(u32::MAX as u64 / 2) as u32,
+            deep_share_pct: env_u64("NVMEUBLK_HOT_DEEP_SHARE", d.deep_share_pct as u64).min(10_000) as u16,
         }
     }
 
@@ -194,6 +204,18 @@ impl HotLane {
     pub fn next_deep(&self, deep: bool, held: u32) -> bool {
         let lease = self.lease.max(1) as u32;
         if deep { held > lease / 2 } else { held > lease }
+    }
+
+    /// Depth mode: the most requests one of `threads` threads may hold when
+    /// the queue's threads hold `total` (see `deep_share_pct`): the share,
+    /// rounded up to whole runs, at least one run, at most `cap`.
+    pub fn deep_cap(&self, total: u32, threads: u16, cap: u16, run: u16) -> u16 {
+        if self.deep_share_pct == 0 {
+            return cap;
+        }
+        let run = run.max(1) as u32;
+        let share = (total as u64 * self.deep_share_pct as u64).div_ceil(100 * threads.max(1) as u64) as u32;
+        (share.div_ceil(run) * run).clamp(run, cap.max(1) as u32) as u16
     }
 
     /// Size-class hysteresis: the queue's moving average request size is
@@ -333,6 +355,11 @@ impl QueueShared {
 
     pub fn primary(&self) -> u16 {
         self.primary.load(Ordering::Acquire)
+    }
+
+    /// Threads serving the queue.
+    pub fn threads(&self) -> u16 {
+        self.beats.len() as u16
     }
 
     /// A thread's held count moved from `was` to `now`: update the queue's
@@ -551,6 +578,9 @@ pub struct Tenancy {
     /// is kept by libublk's thread). Last: dropped after the queue.
     _dev: Option<Arc<UblkDev>>,
 }
+
+/// NVMEUBLK_HOT_DEEP_SHARE by default (0 = off).
+const DEEP_SHARE_DEFAULT: u16 = 0;
 
 /// Whether pooled tenancies share one engine per device and reactor
 /// (NVMEUBLK_SHARED_ENGINE): connections then follow the reactors a device
@@ -1172,7 +1202,10 @@ fn follow_depth(batch: &mut UblkBatchQueue, shared: &QueueShared, h: &HotLane, p
         shared.held.load(Ordering::Acquire)
     };
     *deep = shared.update_deep(h, total);
-    let want = h.credits_sized(primary, *deep, shared.small.load(Ordering::Relaxed), depth);
+    let mut want = h.credits_sized(primary, *deep, shared.small.load(Ordering::Relaxed), depth);
+    if *deep {
+        want.0 = h.deep_cap(total, shared.threads(), want.0, want.1);
+    }
     if *applied != Some(want) {
         *applied = Some(want);
         batch.set_credit_policy(want.0, want.1, want.2)?;
@@ -1234,6 +1267,24 @@ pub fn poll(wait: usize, timeout: &io_uring::types::Timespec) -> std::io::Result
             Err(e) => Err(e),
         }
     })
+}
+
+#[cfg(test)]
+mod deep_share_tests {
+    use super::HotLane;
+
+    /// Depth mode caps what one thread holds at its share of the queue's
+    /// total, so a slower thread stops taking requests and the others take
+    /// them (join-the-shortest-queue by credits).
+    #[test]
+    fn a_deep_thread_holds_at_most_its_share() {
+        let h = HotLane { deep_share_pct: 125, ..HotLane::default() };
+        assert_eq!(h.deep_cap(256, 4, 252, 4), 80, "125% of 64, whole runs");
+        assert_eq!(h.deep_cap(250, 4, 252, 4), 80, "rounded up to whole runs");
+        assert_eq!(h.deep_cap(10, 4, 252, 4), 4, "never below one run");
+        assert_eq!(h.deep_cap(4000, 4, 252, 2), 252, "never above the cap");
+        assert_eq!(HotLane { deep_share_pct: 0, ..HotLane::default() }.deep_cap(256, 4, 252, 4), 252, "off: the cap");
+    }
 }
 
 #[cfg(test)]
