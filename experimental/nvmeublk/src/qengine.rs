@@ -213,6 +213,43 @@ pub fn path_rank_key(eid: u16, n_paths: usize, offset: usize) -> usize {
     eid as usize + eid as usize / n + offset
 }
 
+/// The engine id the path tie-break uses for a command dispatched while
+/// the device has `device_inflight` commands in flight: with none, the
+/// device's lane (engine 0's key, i.e. the device offset), whichever engine
+/// serves it; otherwise the engine's own (ties then spread over the paths).
+/// A QD1 stream thus keeps one path whatever queue, thread or reactor its
+/// request lands on. With the engine's own key a QD1 lane's path followed
+/// the engine: with shared engines (engine id = reactor) and 8 queues a
+/// single stream used all four paths as the submitting CPU moved, and the
+/// ixgbevf ones cost QD1 p99 (qg: runs on 203/204 1.3-3.7 ms at randwrite
+/// 128k, on 201/202 0.8-1.1 ms).
+pub fn lane_eid(eid: u16, device_inflight: i64) -> u16 {
+    if device_inflight <= 0 { 0 } else { eid }
+}
+
+/// Whether the idle-device lane path applies (NVMEUBLK_LANE_PATH).
+static LANE_PATH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LANE_PATH").map_or(LANE_PATH_BY_DEFAULT, |v| v != "0"));
+const LANE_PATH_BY_DEFAULT: bool = false;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the lane path on for this thread, whatever the environment.
+    static FORCE_LANE_PATH: Cell<bool> = const { Cell::new(false) };
+}
+
+fn lane_path() -> bool {
+    #[cfg(test)]
+    if FORCE_LANE_PATH.with(|f| f.get()) {
+        return true;
+    }
+    *LANE_PATH
+}
+
+/// `lane_eid` if the lane path applies, else the engine's own id.
+fn tie_eid(eid: u16, device_inflight: i64) -> u16 {
+    if lane_path() { lane_eid(eid, device_inflight) } else { eid }
+}
+
 /// Last tie-break of the path choice: key `eid` (see `path_rank_key`)
 /// prefers path `eid % n_paths`, then the following ones in order. Equal counts used to go
 /// to the lowest path index in every engine, so across a device path 0 took
@@ -1320,7 +1357,7 @@ impl Engine {
         let small = p.len <= SMALL_IO;
         let bulk_bytes = byte_path() && !small;
         let n_paths = self.ctrls.paths.len().max(1);
-        let mut key = path_rank_key(self.qid, n_paths, self.cfg.path_offset);
+        let mut key = path_rank_key(tie_eid(self.qid, self.stats.inflight.load(Ordering::Relaxed)), n_paths, self.cfg.path_offset);
         if *SMALL_HOME && p.op == Op::Read && p.len > SMALL_READ_MIN && small {
             key += self.home_shift.get();
             let k = self.probes.get().wrapping_add(1);
@@ -2729,7 +2766,9 @@ impl Engine {
         let hl = *self.home_lat.borrow();
         let lat: Vec<u64> = hl.iter().take(n_paths).map(|e| e.0).collect();
         let n: Vec<u64> = hl.iter().take(n_paths).map(|e| e.1).collect();
-        let base = path_rank_key(self.qid, n_paths, self.cfg.path_offset);
+        // Samples are low-depth ones, i.e. of requests dispatched on the
+        // device's lane path (`lane_eid` with nothing in flight).
+        let base = path_rank_key(tie_eid(self.qid, 0), n_paths, self.cfg.path_offset);
         let home = (base + self.home_shift.get()) % n_paths;
         let next = choose_home(home, &lat, &n, 8);
         if next != home {
@@ -3660,6 +3699,14 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_device_uses_its_lane_path_whatever_the_engine() {
+        let pref = |eid: u16, inflight: i64, off: usize| (0..4).find(|&p| path_rank(p, path_rank_key(lane_eid(eid, inflight), 4, off), 4) == 0).unwrap();
+        assert_eq!((0..8).map(|e| pref(e, 0, 0)).collect::<Vec<_>>(), vec![0; 8], "nothing in flight: every engine prefers the lane path");
+        assert_eq!((0..8).map(|e| pref(e, 0, 2)).collect::<Vec<_>>(), vec![2; 8], "the lane path follows the device offset");
+        assert_eq!((0..8).map(|e| pref(e, 1, 0)).collect::<Vec<_>>(), vec![0, 1, 2, 3, 1, 2, 3, 0], "commands in flight: the engine's own");
+    }
+
+    #[test]
     fn path_rank_rotates_by_engine() {
         assert_eq!((0..4).map(|p| path_rank(p, 0, 4)).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
         assert_eq!((0..4).map(|p| path_rank(p, 1, 4)).collect::<Vec<_>>(), vec![3, 0, 1, 2], "engine 1 prefers path 1");
@@ -3674,17 +3721,22 @@ mod tests {
         assert_eq!((pref(0, 1), pref(0, 2), pref(0, 7)), (1, 2, 3), "device offset");
     }
 
-    /// Ties between paths go to the engine's own first path (eid % paths),
-    /// not to path 0 in every engine: engine 1's QD1 stream stays on path 1.
-    /// And bulk commands take no batch affinity: two bulk reads dispatched
-    /// in one turn go to two paths (affinity put both on the path whose
-    /// sender had not run yet).
+    /// Ties between paths go to the device's lane path while the device has
+    /// nothing in flight (`lane_eid`): engine 1's QD1 stream stays on path 0,
+    /// as engine 0's would (it went to engine 1's own first path, so a QD1
+    /// stream's path followed whichever engine served it). With commands in
+    /// flight, ties go to the engine's own first path (eid % paths), not to
+    /// path 0 in every engine. And bulk commands take no batch affinity: two
+    /// bulk reads dispatched in one turn go to two paths (affinity put both
+    /// on the path whose sender had not run yet): the first, on an idle
+    /// device, to the lane path, the second to the other.
     #[test]
     fn ties_rotate_by_engine_and_bulk_spreads_within_a_turn() {
         let a = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
         let b = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
         let (a_seen, b_seen) = (a.seen.clone(), b.seen.clone());
         on_ring_thread(move || {
+            FORCE_LANE_PATH.with(|f| f.set(true));
             let r = rig_eid(&[&a, &b], "rotate", Duration::from_secs(20), 1, |_| {});
             r.e.start();
             assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
@@ -3701,7 +3753,7 @@ mod tests {
             }
         });
         let (sa, sb) = (a_seen.lock().unwrap().reads, b_seen.lock().unwrap().reads);
-        assert_eq!((sa, sb), (5, 15), "10 small reads on engine 1's path (1), bulk pairs split 5/5");
+        assert_eq!((sa, sb), (15, 5), "10 small QD1 reads on the device's lane path (0), bulk pairs split 5/5");
     }
 
     /// Byte balance (L6): among this engine's least loaded connections a
