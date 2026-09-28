@@ -951,9 +951,11 @@ impl Tenancy {
                 log::info!("ublk device {dev_id} queue {qid} thread {thread}: now the {}", if self.is_primary { "primary" } else { "secondary" });
             }
             // Fault injection "wedge <ms>": the primary stops turning (a
-            // pool reactor then stops turning for all its tenancies).
-            if let Some(d) = self.engine.take_wedge() {
-                if self.is_primary {
+            // pool reactor then stops turning for all its tenancies). Only
+            // a primary takes it: on a shared engine a secondary of another
+            // queue must not consume it.
+            if self.is_primary {
+                if let Some(d) = self.engine.take_wedge() {
                     log::warn!("ublk device {dev_id} queue {qid} thread {thread}: fault injection: primary wedged for {d:?}");
                     wedge = Some(d);
                 }
