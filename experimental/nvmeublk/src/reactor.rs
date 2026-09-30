@@ -315,8 +315,10 @@ impl Pool {
     /// a recorded one (whose I/O the kernel holds) with no place. New
     /// volumes admitted but not placed yet count the same way, so two
     /// attaches cannot both be admitted into the last free place. A
-    /// recovering device that has already reserved is counted twice for a
-    /// moment; that errs towards refusing, and the caller retries.
+    /// recovering device that has already reserved is counted twice until
+    /// its recovery settles, and while what is ahead does not all fit
+    /// nothing is admitted (`admit_in`): both err towards refusing, and the
+    /// caller retries.
     pub fn admit(&'static self, recovering: &[Demand], new: Demand) -> Result<Admitted, Refused> {
         let mut admitted = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
         let place = self.place.lock().unwrap_or_else(PoisonError::into_inner).clone();
@@ -468,18 +470,19 @@ pub fn capacity(reactors: usize, primaries: usize, queues: u16, threads: u16, de
 }
 
 /// `Pool::admit` on an explicit placement: `new` must fit as the tables are,
-/// and still fit once every demand in `ahead` has its place (one of those
-/// that does not fit itself takes nothing).
+/// and still fit once every demand in `ahead` has its place. If one of
+/// those does not fit itself, nothing is admitted: `ahead` may count a
+/// volume twice (reserved already, still listed as recovering), and on a
+/// node of mixed layouts that extra demand can push a larger recorded
+/// volume out of this reckoning; skipping it and admitting a smaller new
+/// volume into the room it needs is how a recorded volume loses its place.
 fn admit_in(place: &Placement, primaries: usize, ahead: &[Demand], new: Demand) -> Result<(), Refused> {
     let fits = |p: &mut Placement, d: Demand| reserve_in(p, primaries, d.queues, d.threads, d.depth, d.adaptive).is_some();
     if !fits(&mut place.clone(), new) {
         return Err(Refused::Full);
     }
     let mut p = place.clone();
-    for d in ahead {
-        fits(&mut p, *d);
-    }
-    if fits(&mut p, new) { Ok(()) } else { Err(Refused::Promised(ahead.len())) }
+    if ahead.iter().all(|d| fits(&mut p, *d)) && fits(&mut p, new) { Ok(()) } else { Err(Refused::Promised(ahead.len())) }
 }
 
 /// Placement and buffer reservations are one transaction. A dense node can
@@ -866,6 +869,35 @@ mod tests {
         let small = Demand { queues: 2, threads: 4, depth: 128, adaptive: false };
         assert_eq!(admit_in(&empty, 4, &vec![d; cap - 1], small), Ok(()));
         assert_eq!(admit_in(&empty, 4, &vec![d; cap], small), Err(Refused::Promised(cap)));
+    }
+
+    /// A node of mixed layouts (the budget was changed while volumes were
+    /// attached) in the restart window, with one small recorded volume
+    /// already reserved but still listed as recovering, so counted twice.
+    /// The extra demand leaves one large recorded volume without a place in
+    /// the reckoning; admitting a small new volume then (as skipping the
+    /// one that does not fit did) takes the room that volume needs.
+    #[test]
+    fn a_double_counted_recovery_does_not_let_a_new_volume_past_a_larger_one() {
+        let big = Demand { queues: 8, threads: 4, depth: 128, adaptive: false };
+        let small = Demand { queues: 4, threads: 4, depth: 128, adaptive: false };
+        let reserve = |p: &mut Placement, d: Demand| reserve_in(p, 4, d.queues, d.threads, d.depth, d.adaptive).is_some();
+        // Recorded: two small and 31 large, exactly the tables' capacity.
+        let recorded: Vec<Demand> = [small, small].into_iter().chain(std::iter::repeat_n(big, 31)).collect();
+        let mut full = Placement { next_primary: 0, next_secondary: 0, load: vec![0; 8], chunks: vec![0; 8] };
+        assert!(recorded.iter().all(|d| reserve(&mut full, *d)), "the recorded set fits");
+        assert!(!reserve(&mut full, small), "and fills the tables");
+        // The restart window: the first small volume has reserved and is still listed.
+        let mut place = Placement { next_primary: 0, next_secondary: 0, load: vec![0; 8], chunks: vec![0; 8] };
+        assert!(reserve(&mut place, small));
+        assert_eq!(admit_in(&place, 4, &recorded, small), Err(Refused::Promised(recorded.len())), "a new small volume must wait");
+        // Had it been admitted, a recorded volume would be left without a place.
+        let mut after = place.clone();
+        assert!(reserve(&mut after, small), "the room is there as the tables are");
+        assert_eq!(recorded[1..].iter().filter(|d| !reserve(&mut after, **d)).count(), 1, "one recorded volume would find no place");
+        // Once that recovery has settled (listed no more), the reckoning is exact again.
+        assert_eq!(admit_in(&place, 4, &recorded[1..], small), Err(Refused::Promised(recorded.len() - 1)), "a full node stays full");
+        assert_eq!(admit_in(&place, 4, &recorded[2..], small), Ok(()), "with one small volume fewer recorded there is room");
     }
 
     /// Volumes come and go in any order, and a node at one layout still

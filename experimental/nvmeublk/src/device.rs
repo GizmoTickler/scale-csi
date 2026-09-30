@@ -1010,12 +1010,20 @@ pub fn start_new(spec: DeviceSpec, recovering: &[DeviceSpec]) -> Result<Running>
     let _admitted = match crate::reactor::planned().and_then(|(reactors, _)| pool_demand(&spec, has_batch, reactors).map(|d| (d, reactors))) {
         Some((demand, reactors)) => match crate::reactor::pool() {
             Some(pool) => {
+                // A recorded spec carries the mode its device was served
+                // in. One written before the pool existed reads as pooled
+                // here although its recovery takes nothing; like the double
+                // count in `Pool::admit`, that only errs towards refusing.
                 let ahead: Vec<_> = recovering.iter().filter_map(|r| pool_demand(r, true, reactors)).collect();
                 match pool.admit(&ahead, demand) {
                     Ok(a) => Some(a),
                     Err(crate::reactor::Refused::Full) => return Err(tables_full(&spec.volume, demand, pool)),
+                    Err(crate::reactor::Refused::Promised(0)) => bail!(
+                        "{}: the room left in this node's zero-copy buffer tables is promised to another volume being attached; retry",
+                        spec.volume
+                    ),
                     Err(crate::reactor::Refused::Promised(n)) => bail!(
-                        "{}: the room left in this node's zero-copy buffer tables is promised to volumes ahead of it ({n} still being recovered); retry",
+                        "{}: the room left in this node's zero-copy buffer tables is promised to the {n} volume(s) still being recovered; retry (a recorded volume that cannot be recovered keeps its room until it is detached)",
                         spec.volume
                     ),
                 }
