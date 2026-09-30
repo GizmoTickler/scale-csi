@@ -594,8 +594,8 @@ func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (
 	resp := &csi.NodeGetInfoResponse{
 		NodeId: d.encodedNodeID,
 	}
-	if d.config.Node.MaxVolumesPerNode > 0 {
-		resp.MaxVolumesPerNode = d.config.Node.MaxVolumesPerNode
+	if limit := d.config.nodeVolumeLimit(); limit > 0 {
+		resp.MaxVolumesPerNode = limit
 	}
 
 	// Add topology information if enabled

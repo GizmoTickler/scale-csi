@@ -111,13 +111,17 @@ func TestChartNVMeUblkInUsePlumbsConfigAndNodeMount(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			args := withArgs(withArgs(nvmeofOnArgs, requiredConfigArgs...), tc.args...)
 			args = withArgs(args, "--set", "nvmeof.ublk.queues=4", "--set", "nvmeof.ublk.depth=128",
-				"--set", "nvmeof.ublk.zeroCopy=false", "--set", "nvmeof.ublk.napiUs=200", "--set", "nvmeof.ublk.attachTimeout=90")
+				"--set", "nvmeof.ublk.zeroCopy=false", "--set", "nvmeof.ublk.napiUs=0", "--set", "nvmeof.ublk.maxVolumesPerNode=64",
+				"--set", "nvmeof.ublk.attachTimeout=90")
 			cfg := loadRenderedConfig(t, renderedConfigYAML(t, helmTemplate(t, withArgs(args, "--show-only", "templates/configmap.yaml")...)))
 			ublk := cfg.NVMeoF.Ublk
 			if cfg.NVMeoF.DataPath != tc.wantDataPath || ublk.Enabled != tc.wantEnabled {
 				t.Errorf("dataPath=%q enabled=%t, want %q %t", cfg.NVMeoF.DataPath, ublk.Enabled, tc.wantDataPath, tc.wantEnabled)
 			}
-			if ublk.Queues != 4 || ublk.Depth != 128 || ublk.ZeroCopy == nil || *ublk.ZeroCopy || ublk.NapiUs != 200 || ublk.AttachTimeout != 90 {
+			// An explicit napiUs=0 (busy polling off) must not turn back into
+			// the default on the way through the template.
+			if ublk.Queues != 4 || ublk.Depth != 128 || ublk.ZeroCopy == nil || *ublk.ZeroCopy || ublk.NapiUs == nil || *ublk.NapiUs != 0 ||
+				ublk.MaxVolumesPerNode != 64 || ublk.AttachTimeout != 90 {
 				t.Errorf("ublk tunables did not reach the driver config: %+v", ublk)
 			}
 			if ublk.SocketPath != "/run/nvmeublk/nvmeublkd.sock" {
@@ -142,8 +146,16 @@ func TestChartNVMeUblkInUsePlumbsConfigAndNodeMount(t *testing.T) {
 			if !ok || mount["mountPath"] != "/run/nvmeublk" {
 				t.Errorf("node plugin must mount nvmeublk-run at /run/nvmeublk; got %v", mount)
 			}
-			if hasManifest(manifests, "DaemonSet", "-nvmeublkd") {
-				t.Errorf("the nvmeublkd DaemonSet is a separate opt-in and must not render here")
+			// One value turns the whole data path on: the daemon comes with it.
+			if !hasManifest(manifests, "DaemonSet", "-nvmeublkd") {
+				t.Errorf("putting the ublk data path in use must deploy nvmeublkd")
+			}
+			hostService := decodeManifests(t, helmTemplate(t, withArgs(args, "--set", "nvmeof.ublk.daemon.enabled=false")...))
+			if hasManifest(hostService, "DaemonSet", "-nvmeublkd") {
+				t.Errorf("daemon.enabled=false (the daemon runs as a host service) must not deploy nvmeublkd")
+			}
+			if _, ok := namedEntry(t, podSpecOf(t, findManifest(t, hostService, "DaemonSet", "-node"), "node DaemonSet")["volumes"], "nvmeublk-run"); !ok {
+				t.Errorf("the node plugin still needs the daemon's socket when the daemon is a host service")
 			}
 		})
 	}
@@ -152,7 +164,10 @@ func TestChartNVMeUblkInUsePlumbsConfigAndNodeMount(t *testing.T) {
 		args := withArgs(withArgs(nvmeofOnArgs, requiredConfigArgs...), "--set", "nvmeof.ublk.enabled=true", "--show-only", "templates/configmap.yaml")
 		cfg := loadRenderedConfig(t, renderedConfigYAML(t, helmTemplate(t, args...)))
 		ublk := cfg.NVMeoF.Ublk
-		if ublk.Queues != 2 || ublk.Depth != 64 || ublk.ZeroCopy == nil || !*ublk.ZeroCopy || ublk.NapiUs != 0 || ublk.AttachTimeout != 60 {
+		// Queues and depth 0: nvmeublkd sizes each device for the node and
+		// its volume budget. 200 us of busy polling is the measured profile.
+		if ublk.Queues != 0 || ublk.Depth != 0 || ublk.ZeroCopy == nil || !*ublk.ZeroCopy || ublk.NapiUs == nil || *ublk.NapiUs != 200 ||
+			ublk.MaxVolumesPerNode != 32 || ublk.AttachTimeout != 60 {
 			t.Errorf("ublk defaults changed on the way to the driver: %+v", ublk)
 		}
 	})
@@ -226,10 +241,37 @@ func TestChartNVMeUblkDaemonSet(t *testing.T) {
 			t.Errorf("nvmeublkd volume %s = %v, want hostPath %s", name, volume, want)
 		}
 	}
+	// The daemon sizes volumes for the node's volume budget.
+	budget, hasBudget := namedEntry(t, container["env"], "NVMEUBLK_MAX_VOLUMES")
+	if !hasBudget || budget["value"] != "32" {
+		t.Errorf("NVMEUBLK_MAX_VOLUMES = %v, want the default budget \"32\"", budget)
+	}
 	runVolume, _ := namedEntry(t, podSpec["volumes"], "nvmeublk-run")
 	if hostPath, _ := asManifest(runVolume["hostPath"]); hostPath["type"] != "DirectoryOrCreate" {
 		t.Errorf("/run/nvmeublk must be DirectoryOrCreate; got %v", hostPath["type"])
 	}
+
+	t.Run("the volume budget and extra environment reach the daemon", func(t *testing.T) {
+		manifests := decodeManifests(t, helmTemplate(t, withArgs(args,
+			"--set", "nvmeof.ublk.maxVolumesPerNode=64",
+			"--set", "nvmeof.ublk.daemon.extraEnv[0].name=RUST_LOG",
+			"--set", "nvmeof.ublk.daemon.extraEnv[0].value=debug",
+		)...))
+		podSpec := podSpecOf(t, findManifest(t, manifests, "DaemonSet", "-nvmeublkd"), "nvmeublkd DaemonSet")
+		container, _ := namedEntry(t, podSpec["containers"], "nvmeublkd")
+		env, _ := container["env"].([]interface{})
+		if len(env) != 2 {
+			t.Fatalf("env = %v, want the budget and the extra entry", container["env"])
+		}
+		first, _ := asManifest(env[0])
+		last, _ := asManifest(env[1])
+		if first["name"] != "NVMEUBLK_MAX_VOLUMES" || first["value"] != "64" {
+			t.Errorf("first env entry = %v, want NVMEUBLK_MAX_VOLUMES=64 (before extraEnv, so an override there wins)", first)
+		}
+		if last["name"] != "RUST_LOG" || last["value"] != "debug" {
+			t.Errorf("extraEnv entry = %v", last)
+		}
+	})
 
 	t.Run("digest wins over tag", func(t *testing.T) {
 		const digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -239,26 +281,42 @@ func TestChartNVMeUblkDaemonSet(t *testing.T) {
 		}
 	})
 
-	t.Run("an image tag or digest is required", func(t *testing.T) {
-		out := helmTemplateExpectError(t, withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.enabled=true", "--set", "nvmeof.ublk.daemon.enabled=true")...)
-		if !strings.Contains(out, "nvmeof.ublk.daemon.image.tag (or digest) is required") {
-			t.Errorf("missing image tag must fail with a clear message; got:\n%s", out)
+	t.Run("the image defaults to the daemon released with the chart", func(t *testing.T) {
+		out := helmTemplate(t, withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.enabled=true")...)
+		if !strings.Contains(out, `image: "ghcr.io/gizmotickler/scale-csi-nvmeublk:v0.0.0-dev"`) {
+			t.Errorf("an unset daemon tag must default to v<appVersion>, the tag the release publishes the daemon under")
+		}
+		// The driver's own tag override does not move the daemon.
+		out = helmTemplate(t, withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.enabled=true", "--set", "image.tag=v9.9.9")...)
+		if !strings.Contains(out, `image: "ghcr.io/gizmotickler/scale-csi-nvmeublk:v0.0.0-dev"`) {
+			t.Errorf("image.tag is the driver's; the daemon keeps the chart's release unless nvmeof.ublk.daemon.image.tag is set")
 		}
 	})
 }
 
-// The daemon only serves the ublk data path; enabling it without that path
-// (or without NVMe-oF) must fail the render rather than run an unreachable
-// privileged host-network DaemonSet.
-func TestChartNVMeUblkDaemonRequiresUblkInUse(t *testing.T) {
+// The daemon only serves the ublk data path and follows it: its default-on
+// switch deploys nothing while that path (or NVMe-oF) is off, so a default
+// install never runs an unreachable privileged host-network DaemonSet.
+func TestChartNVMeUblkDaemonFollowsTheDataPath(t *testing.T) {
 	for name, args := range map[string][]string{
-		"ublk not in use": withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.daemon.enabled=true", "--set", "nvmeof.ublk.daemon.image.tag=v0.1.0"),
-		"nvmeof disabled": {"--set", "nvmeof.ublk.enabled=true", "--set", "nvmeof.ublk.daemon.enabled=true", "--set", "nvmeof.ublk.daemon.image.tag=v0.1.0"},
+		"default install":  nil,
+		"ublk not in use":  withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.daemon.enabled=true", "--set", "nvmeof.ublk.daemon.image.tag=v0.1.0"),
+		"nvmeof disabled":  {"--set", "nvmeof.ublk.enabled=true", "--set", "nvmeof.ublk.daemon.enabled=true", "--set", "nvmeof.ublk.daemon.image.tag=v0.1.0"},
+		"kernel data path": withArgs(nvmeofOnArgs, "--set", "nvmeof.dataPath=kernel"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			out := helmTemplateExpectError(t, args...)
-			if !strings.Contains(out, "nvmeof.ublk.daemon.enabled requires the ublk data path in use") {
-				t.Errorf("expected a clear render failure; got:\n%s", out)
+			if hasManifest(decodeManifests(t, helmTemplate(t, args...)), "DaemonSet", "-nvmeublkd") {
+				t.Errorf("nvmeublkd must not deploy while the ublk data path is not in use")
+			}
+		})
+	}
+	for name, args := range map[string][]string{
+		"StorageClass opt-in": withArgs(nvmeofOnArgs, "--set", "nvmeof.ublk.enabled=true"),
+		"install default":     withArgs(nvmeofOnArgs, "--set", "nvmeof.dataPath=ublk"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !hasManifest(decodeManifests(t, helmTemplate(t, args...)), "DaemonSet", "-nvmeublkd") {
+				t.Errorf("nvmeublkd must deploy with the ublk data path")
 			}
 		})
 	}
@@ -267,8 +325,9 @@ func TestChartNVMeUblkDaemonRequiresUblkInUse(t *testing.T) {
 func TestChartNVMeUblkSchemaRejectsInvalidValues(t *testing.T) {
 	cases := [][]string{
 		{"--set", "nvmeof.dataPath=spdk"},
-		{"--set", "nvmeof.ublk.queues=0"},
+		{"--set", "nvmeof.ublk.queues=-1"},
 		{"--set", "nvmeof.ublk.depth=8192"},
+		{"--set", "nvmeof.ublk.maxVolumesPerNode=0"},
 		{"--set", "nvmeof.ublk.napiUs=-1"},
 		{"--set", "nvmeof.ublk.attachTimeout=0"},
 		{"--set", "nvmeof.ublk.daemon.terminationGracePeriodSeconds=1"},
@@ -297,6 +356,11 @@ func TestChartNVMeUblkSubtreeDeletionStillRenders(t *testing.T) {
 		}
 		if i == 2 && !strings.Contains(out, "zeroCopy: true") {
 			t.Errorf("a deleted zeroCopy must render its default (true)")
+		}
+		// A deleted daemon subtree is an unset one: the daemon still comes
+		// with the data path, from the default repository and release tag.
+		if i == 1 && !strings.Contains(out, `image: "ghcr.io/gizmotickler/scale-csi-nvmeublk:v0.0.0-dev"`) {
+			t.Errorf("a deleted daemon subtree must deploy the default daemon image")
 		}
 	}
 }

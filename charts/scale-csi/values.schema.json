@@ -576,7 +576,7 @@
       "oneOf": [
         {
           "type": "string",
-          "pattern": "^(0|0s|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$"
+          "pattern": "^(0|0s|([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+)$"
         },
         {
           "type": "integer",
@@ -1479,14 +1479,22 @@
             "enabled": {
               "type": "boolean"
             },
-            "queues": {
+            "maxVolumesPerNode": {
+              "description": "Volumes one node must be able to serve through the ublk data path at once.",
               "type": "integer",
               "minimum": 1,
               "maximum": 4096
             },
-            "depth": {
+            "queues": {
+              "description": "ublk queues per device; 0 lets nvmeublkd size it for the node.",
               "type": "integer",
-              "minimum": 1,
+              "minimum": 0,
+              "maximum": 4096
+            },
+            "depth": {
+              "description": "Per-queue ublk depth; 0 lets nvmeublkd choose.",
+              "type": "integer",
+              "minimum": 0,
               "maximum": 4096
             },
             "zeroCopy": {

@@ -314,7 +314,7 @@ func (d *Driver) stageNVMeoFUblkVolume(ctx context.Context, volumeID string, vol
 		Queues:   ublk.Queues,
 		Depth:    ublk.Depth,
 		ZeroCopy: *ublk.ZeroCopy,
-		NapiUs:   ublk.NapiUs,
+		NapiUs:   *ublk.NapiUs,
 	})
 	cancel()
 	if err == nil {

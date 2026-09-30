@@ -217,10 +217,14 @@ data:
       dataPath: {{ $nvmeof.dataPath | default "kernel" | quote }}
       ublk:
         enabled: {{ $nvmeofUblk.enabled | default false }}
-        queues: {{ $nvmeofUblk.queues | default 8 | int }}
-        depth: {{ $nvmeofUblk.depth | default 64 | int }}
+        {{- /* 0 (or unset) leaves queues and depth to nvmeublkd, which sizes
+             the device for the node and its volume budget. */}}
+        queues: {{ $nvmeofUblk.queues | default 0 | int }}
+        depth: {{ $nvmeofUblk.depth | default 0 | int }}
         zeroCopy: {{ if kindIs "invalid" $nvmeofUblk.zeroCopy }}true{{ else }}{{ $nvmeofUblk.zeroCopy }}{{ end }}
-        napiUs: {{ $nvmeofUblk.napiUs | default 0 | int }}
+        {{- /* An explicit 0 (busy polling off) must survive; only unset is 200. */}}
+        napiUs: {{ if kindIs "invalid" $nvmeofUblk.napiUs }}200{{ else }}{{ $nvmeofUblk.napiUs | int }}{{ end }}
+        maxVolumesPerNode: {{ $nvmeofUblk.maxVolumesPerNode | default 32 | int }}
         attachTimeout: {{ $nvmeofUblk.attachTimeout | default 60 | int }}
       {{- end }}
     {{- end }}

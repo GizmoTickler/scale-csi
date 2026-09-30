@@ -460,7 +460,7 @@ jobs:
             type=semver,pattern=v{{version}}
             type=semver,pattern=v{{major}}.{{minor}}
 
-      # amd64 only: the daemon is cross-compiled to x86_64 musl.
+      # amd64 only: the daemon image is built and measured on x86_64.
       - name: Build and push nvmeublkd image
         id: build-image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7

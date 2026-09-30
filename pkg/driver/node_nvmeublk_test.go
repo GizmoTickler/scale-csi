@@ -260,11 +260,9 @@ func TestNodeStageUblkBlockRoundTrip(t *testing.T) {
 		Addrs:    []string{"192.0.2.20:4420", "192.0.2.21:4420", "[2001:db8::22]:4420"},
 		HostNQN:  testUblkHostNQN,
 		HostID:   testUblkHostID,
-		Queues:   2,
-		Depth:    64,
 		ZeroCopy: true,
-		NapiUs:   0,
-	}, attaches[0])
+		NapiUs:   200,
+	}, attaches[0], "an install that pins no layout leaves queues and depth to the daemon and busy-polls for 200 us")
 	assert.Empty(t, detaches)
 	assert.Equal(t, []string{d.config.NVMeoF.Ublk.SocketPath}, unique(fake.sockets), "the configured socket is used")
 	target, err := os.Readlink(stagingPath)
@@ -314,7 +312,7 @@ func TestNodeStageUblkFilesystemFormatsTheDaemonDevice(t *testing.T) {
 	napi := 200
 	zeroCopy := false
 	d.config.NVMeoF.Ublk.Queues, d.config.NVMeoF.Ublk.Depth = 4, 128
-	d.config.NVMeoF.Ublk.ZeroCopy, d.config.NVMeoF.Ublk.NapiUs = &zeroCopy, napi
+	d.config.NVMeoF.Ublk.ZeroCopy, d.config.NVMeoF.Ublk.NapiUs = &zeroCopy, &napi
 
 	originalFormat := nodeFormatAndMount
 	t.Cleanup(func() { nodeFormatAndMount = originalFormat })

@@ -236,6 +236,23 @@ func TestNodeGetInfo(t *testing.T) {
 		assert.Equal(t, int64(32), resp.MaxVolumesPerNode)
 	})
 
+	t.Run("UblkDefaultAdvertisesItsVolumeBudget", func(t *testing.T) {
+		d := newTestNodeDriver(ShareTypeNVMeoF)
+		d.config.NVMeoF.Enabled = true
+		d.config.NVMeoF.DataPath = NVMeoFDataPathUblk
+		d.config.NVMeoF.Ublk.MaxVolumesPerNode = 64
+
+		resp, err := d.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+
+		require.NoError(t, err)
+		assert.Equal(t, int64(64), resp.MaxVolumesPerNode, "past this nvmeublkd refuses the attach, so the scheduler must know")
+
+		d.config.Node.MaxVolumesPerNode = 12
+		resp, err = d.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+		require.NoError(t, err)
+		assert.Equal(t, int64(12), resp.MaxVolumesPerNode, "an explicit node limit wins")
+	})
+
 	t.Run("WithTopology", func(t *testing.T) {
 		d := newTestNodeDriver(ShareTypeNFS)
 		d.nodeID = "worker-node-2"

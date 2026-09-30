@@ -436,14 +436,31 @@ true
 {{- end }}
 
 {{/*
-The nvmeublkd image reference. A tag or a digest is required: no nvmeublk image
-is published with this chart, so there is no default to fall back to.
+Non-empty when the chart deploys nvmeublkd: the ublk data path is in use and
+nvmeof.ublk.daemon.enabled is not false (the default deploys it, so turning
+the data path on is one value; false is for running the daemon as a host
+service). Null-safe for a deleted daemon subtree.
+*/}}
+{{- define "scale-csi.nvmeublkdDeployed" -}}
+{{- $daemon := ((.Values.nvmeof | default dict).ublk | default dict).daemon | default dict -}}
+{{- if and (include "scale-csi.nvmeofUblkInUse" .) (or (not (hasKey $daemon "enabled")) (kindIs "invalid" $daemon.enabled) $daemon.enabled) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+The nvmeublkd image reference. The daemon image is published with every
+release under the same tag as the driver image, so the tag defaults to
+"v<appVersion>" (see scale-csi.imageTag for the v prefix); an explicit tag
+holds the daemon at a version, and a digest wins over both. Takes
+(dict "root" $ "daemon" <nvmeof.ublk.daemon>).
 */}}
 {{- define "scale-csi.nvmeublkdImage" -}}
-{{- $image := .image | default dict -}}
+{{- $image := .daemon.image | default dict -}}
+{{- $repository := $image.repository | default "ghcr.io/gizmotickler/scale-csi-nvmeublk" -}}
 {{- if $image.digest -}}
-{{- printf "%s@%s" $image.repository $image.digest -}}
+{{- printf "%s@%s" $repository $image.digest -}}
 {{- else -}}
-{{- printf "%s:%s" $image.repository (required "nvmeof.ublk.daemon.image.tag (or digest) is required when nvmeof.ublk.daemon.enabled=true: no nvmeublk image is published with this chart" $image.tag) -}}
+{{- printf "%s:%s" $repository ($image.tag | default (printf "v%s" .root.Chart.AppVersion)) -}}
 {{- end -}}
 {{- end }}

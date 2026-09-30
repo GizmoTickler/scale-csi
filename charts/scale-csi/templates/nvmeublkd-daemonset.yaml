@@ -1,14 +1,11 @@
 {{- $nvmeof := .Values.nvmeof | default dict }}
 {{- $ublk := $nvmeof.ublk | default dict }}
 {{- $daemon := $ublk.daemon | default dict }}
-{{- if $daemon.enabled }}
-{{- /* A daemon nobody can reach (the node plugin mounts its socket only while
-     ublk is in use) is a privileged host-network pod for nothing; refuse it
-     loudly. Disabling ublk while volumes are staged must keep the daemon, so
-     this does not silently drop it either. */}}
-{{- if not (include "scale-csi.nvmeofUblkInUse" .) }}
-{{- fail "nvmeof.ublk.daemon.enabled requires the ublk data path in use (nvmeof.enabled plus nvmeof.ublk.enabled or nvmeof.dataPath=ublk)" }}
-{{- end }}
+{{- /* Deployed whenever the ublk data path is in use (one value turns the
+     whole data path on), unless daemon.enabled=false says the operator runs
+     nvmeublkd as a host service. Turning the data path off removes it, so
+     move every volume off ublk first (see the chart README). */}}
+{{- if include "scale-csi.nvmeublkdDeployed" . }}
 {{- $image := $daemon.image | default dict }}
 # nvmeublkd: the per-node userspace NVMe/TCP daemon behind the ublk data path.
 # One process owns every /dev/ublkbN on its node and outlives node-plugin
@@ -68,14 +65,20 @@ spec:
       {{- end }}
       containers:
         - name: nvmeublkd
-          image: {{ include "scale-csi.nvmeublkdImage" $daemon | quote }}
+          image: {{ include "scale-csi.nvmeublkdImage" (dict "root" $ "daemon" $daemon) | quote }}
           imagePullPolicy: {{ $image.pullPolicy | default "IfNotPresent" }}
-          # The image is FROM scratch with the binary at /nvmeublk and no PATH.
+          # The binary is at /nvmeublk in the image (a glibc runtime: the
+          # allocator of a static musl build halves small-I/O throughput).
           command: ["/nvmeublk", "daemon"]
-          {{- with $daemon.extraEnv }}
           env:
+            # The volumes this node must hold: the daemon sizes each volume's
+            # default layout so that many fit in its zero-copy buffer tables.
+            # Listed first, so an extraEnv entry of the same name wins.
+            - name: NVMEUBLK_MAX_VOLUMES
+              value: {{ $ublk.maxVolumesPerNode | default 32 | int | quote }}
+            {{- with $daemon.extraEnv }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
           # ublk device control, io_uring, mlockall and NAPI busy polling.
           securityContext:
             privileged: true

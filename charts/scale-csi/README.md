@@ -217,17 +217,19 @@ Only enabled protocol blocks are rendered into the driver ConfigMap.
 | `nvmeof.subsystemAllowAnyHost` | Allow any host NQN | `false` |
 | `nvmeof.dataPath` | Node data path for volumes whose StorageClass does not set `nvmeof/dataPath`: `kernel` or `ublk` | `kernel` |
 | `nvmeof.ublk.enabled` | Allow StorageClasses to opt into the ublk data path while the default stays `kernel` | `false` |
-| `nvmeof.ublk.queues` | ublk queues per device (`1..4096`) | `2` |
-| `nvmeof.ublk.depth` | Per-queue ublk depth (`1..4096`) | `64` |
+| `nvmeof.ublk.maxVolumesPerNode` | Volumes one node must be able to serve through ublk at once; sizes each volume's default layout, and is the advertised CSI volume limit when `dataPath=ublk` | `32` |
+| `nvmeof.ublk.queues` | ublk queues per device (`1..4096`); `0` lets the daemon size it for the node | `0` |
+| `nvmeof.ublk.depth` | Per-queue ublk depth (`1..4096`); `0` lets the daemon choose | `0` |
 | `nvmeof.ublk.zeroCopy` | ublk zero copy; needs kernel >= 6.16 | `true` |
-| `nvmeof.ublk.napiUs` | NAPI busy-poll budget in µs while I/O is in flight; `0` disables | `0` |
+| `nvmeof.ublk.napiUs` | NAPI busy-poll budget in µs while I/O is in flight; `0` disables | `200` |
 | `nvmeof.ublk.attachTimeout` | Seconds one attach may take | `60` |
-| `nvmeof.ublk.daemon.enabled` | Deploy the optional `nvmeublkd` DaemonSet | `false` |
+| `nvmeof.ublk.daemon.enabled` | Deploy the `nvmeublkd` DaemonSet whenever the ublk data path is in use; `false` to run the daemon as a host service | `true` |
 | `nvmeof.ublk.daemon.image.repository` | nvmeublkd image (published per release tag, amd64) | `ghcr.io/gizmotickler/scale-csi-nvmeublk` |
-| `nvmeof.ublk.daemon.image.tag` / `.digest` | Required when the daemon is enabled; digest wins | `""` |
+| `nvmeof.ublk.daemon.image.tag` / `.digest` | Daemon version; defaults to the chart's release (`v<appVersion>`); digest wins | `""` |
 | `nvmeof.ublk.daemon.terminationGracePeriodSeconds` | Must cover the daemon's 5 s drain | `15` |
 | `nvmeof.ublk.daemon.priorityClassName` | Daemon pod priority | `system-node-critical` |
 | `nvmeof.ublk.daemon.resources` | Daemon resources; no memory limit by default | requests `50m` / `128Mi` |
+| `nvmeof.ublk.daemon.extraEnv` | Extra daemon environment (`NVMEUBLK_*` tuning) | `[]` |
 
 > `iscsi.extentAvailThreshold` and `nvmeof.commandTimeout` were removed: neither
 > was wired to anything (`nvmeof.commandTimeout` is superseded by
@@ -287,18 +289,96 @@ Selection, per volume, at NodeStage:
 `kernel`; `nvmeof.dataPath=ublk` implies it. A class that asks for `ublk` on an
 install where it is not enabled fails at CreateVolume.
 
+When to use it. The kernel initiator is the default because it is the right
+choice for most volumes: it needs nothing extra on the node and costs the
+least CPU for light I/O. The ublk data path pays off where the initiator
+itself is the bottleneck. Measured on 16-vCPU nodes over four 10 GbE paths to
+one TrueNAS target, against a tuned kernel initiator on the same node:
+
+| Workload | ublk vs kernel |
+|---|---|
+| 4K random read, queue depth 32 x 4 jobs | about 2.5x the IOPS at about 0.6x the CPU per I/O |
+| 4K 70/30 mixed at depth | about 2x the IOPS |
+| 4K reads next to a busy neighbour on the node | about 2x the IOPS |
+| 4K random write at depth | about 1.3-1.7x |
+| Large sequential and random reads (128K, 1M) | about 1.05-1.3x (the kernel is already near line rate) |
+| 4K-16K read, queue depth 1 | about 1.1-1.3x the IOPS at 1.3-1.5x the CPU per I/O |
+| Large writes (64K, 128K) | 0.9-1.0x the throughput at 1.2-1.4x the CPU per I/O |
+| Synchronous writes (`O_SYNC`, `fsync` per write) | 1.1-1.3x the IOPS at 1.8-2.7x the CPU per I/O |
+
+Your numbers depend on the target, the links and the node; treat the table as
+the shape of the trade, not a promise. Volumes that do little I/O gain nothing.
+
 Prerequisites on every node that can stage a ublk volume:
 
-- the `ublk_drv` kernel module; zero copy (`nvmeof.ublk.zeroCopy`, default on)
-  needs kernel >= 6.16, and the daemon refuses the attach on an older kernel,
-  so set it to `false` there;
-- `nvmeublkd` running with `/run/nvmeublk` shared with the node plugin. Either
-  enable `nvmeof.ublk.daemon` (build and push an image from the nvmeublk
-  sources first; none is published) or run it as a host service;
+- the `ublk_drv` kernel module, loaded at boot (for example
+  `/etc/modules-load.d/ublk.conf`). Zero copy (`nvmeof.ublk.zeroCopy`, default
+  on) needs kernel >= 6.16, and the daemon refuses the attach on an older
+  kernel, so set it to `false` there. The node-wide reactor pool, which is
+  what the figures above were measured with, also needs ublk batch I/O
+  (kernel 7.x); on 6.16-6.x a zero-copy volume is served by its own threads;
+- `nvmeublkd` running with `/run/nvmeublk` shared with the node plugin. The
+  chart deploys it as a DaemonSet as soon as the ublk data path is in use (the
+  image is published with every release, amd64 only); set
+  `nvmeof.ublk.daemon.enabled=false` to run the same binary as a host service
+  instead;
 - NVMe/TCP (`nvmeof.transport: tcp`); the daemon speaks nothing else;
 - a UUID-form host NQN from `nvme show-hostnqn`, or `/etc/nvme/hostid`. The
   daemon connects with the node's own host NQN and ID, which is what
   publication fencing admits for that node.
+
+Sizing. With zero copy every volume's queues take a range of the daemon's
+io_uring buffer tables, which have a fixed size, so a node holds a bounded
+number of volumes and the daemon sizes each volume for
+`nvmeof.ublk.maxVolumesPerNode`. On a node with 16 or more CPUs:
+
+| `maxVolumesPerNode` | Default layout per volume |
+|---|---|
+| up to 16 | 8 queues x 256 tags |
+| up to 32 (default) | 8 queues x 128 tags |
+| up to 64 | 4 queues x 128 tags |
+| up to 128 | 2 queues x 128 tags |
+
+Smaller nodes have fewer reactors and queues (one queue per two CPUs, at
+least 2) and the same rule applies. Fewer queues serve fewer concurrent
+submitters in parallel; fewer tags bound the I/O one queue can have
+outstanding. An attach past what fits is refused with an error naming this
+setting, and with `nvmeof.dataPath=ublk` the node plugin advertises the budget
+as the node's CSI volume limit (unless `node.maxVolumesPerNode` is set), so the
+scheduler stops placing volumes first. Size it for the worst case, such as a
+drained node's volumes landing on the others. The layout is fixed when a
+volume is attached: changing the budget, `queues` or `depth` applies to
+volumes attached afterwards, and volumes of different layouts pack less
+tightly than the table says. Without zero copy there is no such bound; each
+volume then has its own threads and buffers.
+
+The daemon locks its memory. Budget about 80 MiB plus 6 MiB per attached
+volume with zero copy (188 MiB with 32 volumes, 340 MiB with 64), or about
+75 MiB per volume without. It runs eight reactor threads on a node with 16 or
+more CPUs (half the CPUs, at least four) whatever the number of volumes, and
+an idle volume keeps one connection per path; a busy one opens up to 16 more
+per path and closes them after a minute of idleness.
+
+Making it the default for an install:
+
+```yaml
+nvmeof:
+  dataPath: ublk
+  ublk:
+    maxVolumesPerNode: 64
+```
+
+That one setting deploys the daemon, mounts its socket into the node plugin
+and makes ublk what NodeStage uses. The daemon's image tag follows the chart's
+release, so a chart upgrade also rolls the daemon: a handover on each node in
+turn, during which that node's ublk volumes pause for a few seconds. To
+upgrade the data path on your own schedule, pin `nvmeof.ublk.daemon.image.tag`.
+
+A volume moves to the new default at its next NodeStage (for example when its
+pod is rescheduled), not while it is staged; a class that must stay on the
+kernel initiator can pin `nvmeof/dataPath: kernel`. Roll the change out a
+node at a time and keep the daemon running for as long as any ublk volume is
+staged.
 
 Differences from the kernel path: session GC and `fast_io_fail_tmo`
 convergence apply to kernel controllers only and never touch a ublk volume;
@@ -317,19 +397,16 @@ it onto a `kernel` class, or drain and unstage it), and confirm
 `nvmeof.ublk.enabled=false` / `nvmeof.dataPath=kernel` and disable the daemon.
 While ublk volumes are still staged, the node plugin needs the daemon socket
 to unstage, publish and replay them; switching the feature off first strands
-those volumes until it is switched back on. Enabling `nvmeof.ublk.daemon`
-without the ublk data path in use fails the render.
+those volumes until it is switched back on, and the daemon DaemonSet is
+removed with the data path, which stops I/O on them.
+
+Opt-in for one class while the default stays `kernel`:
 
 ```yaml
 nvmeof:
   enabled: true
   ublk:
     enabled: true
-    daemon:
-      enabled: true
-      image:
-        repository: ghcr.io/gizmotickler/scale-csi-nvmeublk
-        tag: v0.1.0
 storageClasses:
   - name: scale-nvmeof-ublk
     enabled: true

@@ -910,11 +910,15 @@ type NVMeoFUblkConfig struct {
 	// /run/nvmeublk/nvmeublkd.sock).
 	SocketPath string `yaml:"socketPath"`
 
-	// Queues is the number of ublk queues per device (default 2; nvmeublkd serves
-	// each queue with 4 threads over chunk-2 tag runs, measured best on the test node).
+	// Queues is the number of ublk queues per device. 0 (the default) lets
+	// nvmeublkd size the device for its node: one queue per two CPUs (2..8),
+	// or fewer when that is what fits MaxVolumesPerNode volumes. A positive
+	// value pins it for every volume this install attaches.
 	Queues int `yaml:"queues"`
 
-	// Depth is the per-queue ublk depth (default 64).
+	// Depth is the per-queue ublk depth. 0 (the default) lets nvmeublkd choose
+	// (256, or 128 when that is what fits MaxVolumesPerNode volumes; 64 without
+	// zero copy, where every tag holds a locked I/O buffer).
 	Depth int `yaml:"depth"`
 
 	// ZeroCopy asks the daemon for ublk zero copy (UBLK_F_AUTO_BUF_REG). It
@@ -923,8 +927,19 @@ type NVMeoFUblkConfig struct {
 	ZeroCopy *bool `yaml:"zeroCopy"`
 
 	// NapiUs is the NAPI busy-poll budget in microseconds while a queue has
-	// I/O in flight. 0 (the default) disables busy polling.
-	NapiUs int `yaml:"napiUs"`
+	// I/O in flight. Nil means the default, 200, which the data path was
+	// measured and drilled with; 0 disables busy polling (lower CPU, higher
+	// latency at low queue depth).
+	NapiUs *int `yaml:"napiUs"`
+
+	// MaxVolumesPerNode is how many volumes one node must be able to serve
+	// through the ublk data path at once (default 32). nvmeublkd sizes each
+	// volume's default layout so that this many fit in its zero-copy buffer
+	// tables (the chart passes it to the daemon as NVMEUBLK_MAX_VOLUMES), and
+	// when ublk is the install's default data path the node plugin advertises
+	// it as the CSI volume limit unless node.maxVolumesPerNode is set, so the
+	// scheduler does not place more volumes on a node than its daemon takes.
+	MaxVolumesPerNode int `yaml:"maxVolumesPerNode"`
 
 	// AttachTimeout bounds one attach call in seconds (default 60). An attach
 	// connects every path, so it can take longer than a daemon list/detach.
@@ -933,33 +948,38 @@ type NVMeoFUblkConfig struct {
 
 // Defaults for NVMeoFUblkConfig.
 const (
-	defaultNVMeUblkQueues        = 2
-	defaultNVMeUblkDepth         = 64
-	defaultNVMeUblkAttachTimeout = 60
+	defaultNVMeUblkNapiUs            = 200
+	defaultNVMeUblkMaxVolumesPerNode = 32
+	defaultNVMeUblkAttachTimeout     = 60
 	// ublk's own limits (UBLK_MAX_NR_QUEUES / UBLK_MAX_QUEUE_DEPTH).
 	maxNVMeUblkQueues = 4096
 	maxNVMeUblkDepth  = 4096
 	// One second of busy polling per wakeup is already far past any useful
 	// budget; anything larger is a typo.
 	maxNVMeUblkNapiUs = 1000000
+	// Far past what a node's buffer tables hold in the smallest layout (128
+	// volumes on eight reactors); anything larger is a typo.
+	maxNVMeUblkMaxVolumesPerNode = 4096
 )
 
 // withDefaults returns c with every unset field at its default. The node
 // reads the ublk settings through this, so a Config built without LoadConfig
-// still behaves like a loaded one.
+// still behaves like a loaded one. Queues and Depth stay 0 when unset: the
+// daemon sizes the device.
 func (c NVMeoFUblkConfig) withDefaults() NVMeoFUblkConfig {
 	if c.SocketPath == "" {
 		c.SocketPath = util.DefaultNVMeUblkSocket
 	}
-	if c.Queues == 0 {
-		c.Queues = defaultNVMeUblkQueues
-	}
-	if c.Depth == 0 {
-		c.Depth = defaultNVMeUblkDepth
-	}
 	if c.ZeroCopy == nil {
 		zeroCopy := true
 		c.ZeroCopy = &zeroCopy
+	}
+	if c.NapiUs == nil {
+		napiUs := defaultNVMeUblkNapiUs
+		c.NapiUs = &napiUs
+	}
+	if c.MaxVolumesPerNode == 0 {
+		c.MaxVolumesPerNode = defaultNVMeUblkMaxVolumesPerNode
 	}
 	if c.AttachTimeout == 0 {
 		c.AttachTimeout = defaultNVMeUblkAttachTimeout
@@ -994,6 +1014,23 @@ func (c NVMeoFConfig) defaultDataPath() string {
 // userspace data path at all.
 func (c NVMeoFConfig) ublkAvailable() bool {
 	return c.Ublk.Enabled || c.defaultDataPath() == NVMeoFDataPathUblk
+}
+
+// nodeVolumeLimit is the volume count NodeGetInfo advertises (0: none).
+// node.maxVolumesPerNode wins when set. Otherwise an install whose NVMe-oF
+// volumes use the ublk data path by default advertises the number of volumes
+// each node's nvmeublkd is sized for: past it the daemon refuses the attach,
+// and a pod the scheduler never placed there is better than one stuck in
+// ContainerCreating. An install that only lets classes opt in advertises
+// nothing: most of its volumes do not count against the daemon.
+func (c *Config) nodeVolumeLimit() int64 {
+	if c.Node.MaxVolumesPerNode > 0 {
+		return c.Node.MaxVolumesPerNode
+	}
+	if c.NVMeoF.Enabled && c.NVMeoF.defaultDataPath() == NVMeoFDataPathUblk {
+		return int64(c.NVMeoF.Ublk.withDefaults().MaxVolumesPerNode)
+	}
+	return 0
 }
 
 // NVMeoFConnectConfig holds node-side `nvme connect` CLI knobs (N4), mirroring
@@ -1075,7 +1112,9 @@ type NodeConfig struct {
 	SessionCleanupDelay int `yaml:"sessionCleanupDelay"`
 
 	// MaxVolumesPerNode is the maximum number of volumes the node can publish.
-	// Zero means unlimited and is not advertised (default: 0)
+	// Zero means unlimited and is not advertised (default: 0), except on an
+	// install whose default NVMe-oF data path is ublk, which then advertises
+	// nvmeof.ublk.maxVolumesPerNode (see Config.nodeVolumeLimit).
 	MaxVolumesPerNode int64 `yaml:"maxVolumesPerNode"`
 }
 
@@ -1776,14 +1815,17 @@ func validateNVMeoFDataPathConfig(nvmeof *NVMeoFConfig) error {
 	if !filepath.IsAbs(ublk.SocketPath) {
 		return fmt.Errorf("nvmeof.ublk.socketPath must be an absolute path (got %q)", ublk.SocketPath)
 	}
-	if ublk.Queues < 1 || ublk.Queues > maxNVMeUblkQueues {
-		return fmt.Errorf("nvmeof.ublk.queues must be between 1 and %d (got %d)", maxNVMeUblkQueues, ublk.Queues)
+	if ublk.Queues < 0 || ublk.Queues > maxNVMeUblkQueues {
+		return fmt.Errorf("nvmeof.ublk.queues must be between 0 (sized by nvmeublkd) and %d (got %d)", maxNVMeUblkQueues, ublk.Queues)
 	}
-	if ublk.Depth < 1 || ublk.Depth > maxNVMeUblkDepth {
-		return fmt.Errorf("nvmeof.ublk.depth must be between 1 and %d (got %d)", maxNVMeUblkDepth, ublk.Depth)
+	if ublk.Depth < 0 || ublk.Depth > maxNVMeUblkDepth {
+		return fmt.Errorf("nvmeof.ublk.depth must be between 0 (sized by nvmeublkd) and %d (got %d)", maxNVMeUblkDepth, ublk.Depth)
 	}
-	if ublk.NapiUs < 0 || ublk.NapiUs > maxNVMeUblkNapiUs {
-		return fmt.Errorf("nvmeof.ublk.napiUs must be between 0 and %d (got %d)", maxNVMeUblkNapiUs, ublk.NapiUs)
+	if *ublk.NapiUs < 0 || *ublk.NapiUs > maxNVMeUblkNapiUs {
+		return fmt.Errorf("nvmeof.ublk.napiUs must be between 0 and %d (got %d)", maxNVMeUblkNapiUs, *ublk.NapiUs)
+	}
+	if ublk.MaxVolumesPerNode < 1 || ublk.MaxVolumesPerNode > maxNVMeUblkMaxVolumesPerNode {
+		return fmt.Errorf("nvmeof.ublk.maxVolumesPerNode must be between 1 and %d (got %d)", maxNVMeUblkMaxVolumesPerNode, ublk.MaxVolumesPerNode)
 	}
 	if ublk.AttachTimeout < 1 {
 		return fmt.Errorf("nvmeof.ublk.attachTimeout must be positive (got %d)", ublk.AttachTimeout)
