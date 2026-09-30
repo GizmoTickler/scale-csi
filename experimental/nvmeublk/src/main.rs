@@ -497,6 +497,40 @@ fn parse_cpu_list(list: &str) -> Vec<usize> {
 const PR_SET_IO_FLUSHER: libc::c_int = 57;
 const PR_GET_IO_FLUSHER: libc::c_int = 58;
 
+/// Raise the soft open-file limit to the hard one. A volume holds about 70
+/// descriptors while it is busy (one connection per reactor, path and
+/// connection class, plus its admin queues and device), so the 1024 a
+/// process gets from systemd or a login shell by default runs out at about
+/// 14 volumes; container runtimes start the daemon with far more.
+fn raise_nofile() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        log::warn!("getrlimit(RLIMIT_NOFILE) failed: {}", std::io::Error::last_os_error());
+        return;
+    }
+    let was = lim.rlim_cur;
+    if let Some(target) = nofile_target(lim.rlim_cur, lim.rlim_max) {
+        lim.rlim_cur = target;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+            log::warn!("raising the open-file limit from {was} to {target} failed: {}", std::io::Error::last_os_error());
+            lim.rlim_cur = was;
+        }
+    }
+    if lim.rlim_cur < NOFILE_WANTED {
+        log::warn!("open-file limit is {} (hard limit {}): about {} busy volumes fit; raise LimitNOFILE", lim.rlim_cur, lim.rlim_max, lim.rlim_cur / 70);
+    } else {
+        log::info!("open-file limit {} (was {was})", lim.rlim_cur);
+    }
+}
+
+/// Descriptors 128 busy volumes take, with room to spare.
+const NOFILE_WANTED: libc::rlim_t = 16384;
+
+/// The soft limit to set, if the hard limit allows more than the current one.
+fn nofile_target(cur: libc::rlim_t, max: libc::rlim_t) -> Option<libc::rlim_t> {
+    (cur < max).then_some(max)
+}
+
 fn harden_for_writeback() {
     if unsafe { libc::prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0) } != 0 {
         log::warn!("PR_SET_IO_FLUSHER failed: {} (needs CAP_SYS_RESOURCE)", std::io::Error::last_os_error());
@@ -668,6 +702,7 @@ fn main() -> Result<()> {
     }
     // Per-node daemon and its client.
     if args.len() >= 2 && args[1] == "daemon" {
+        raise_nofile();
         harden_for_writeback();
         set_queue_cpus();
         let socket = args.get(2).map(String::as_str).unwrap_or(daemon::DEFAULT_SOCKET);
@@ -685,6 +720,18 @@ fn main() -> Result<()> {
         "lat" => lat(&args[2], &args[3..]),
         "run" => run(&args[2], &args[3..]),
         c => bail!("unknown command {c}"),
+    }
+}
+
+#[cfg(test)]
+mod nofile_tests {
+    /// The soft open-file limit goes to the hard one: 1024 (a login shell's
+    /// or a systemd unit's default) runs out at about 14 busy volumes.
+    #[test]
+    fn the_soft_limit_is_raised_to_the_hard_one() {
+        assert_eq!(super::nofile_target(1024, 524288), Some(524288));
+        assert_eq!(super::nofile_target(1048576, 1048576), None);
+        assert_eq!(super::nofile_target(4096, 1024), None, "never lowered");
     }
 }
 
