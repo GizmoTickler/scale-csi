@@ -7,7 +7,7 @@
 //! Connecting an I/O queue (socket, TCP connect, ICReq and NVMe Connect) is
 //! SQEs on the same ring too, driven by a task of the engine: no thread is
 //! spawned for it, however many queues reconnect at once. Each step is
-//! bounded by a linked timeout (LINK_TIMEOUT): 3 s for the TCP connect, 10 s
+//! bounded by a linked timeout (LINK_TIMEOUT): 1 s for the TCP connect, 1 s
 //! for each handshake exchange, as the blocking dial had them.
 //!
 //! Lifetime: the engine's own tasks keep it alive (each holds an
@@ -35,8 +35,9 @@
 //!   re-sent. The old target may still execute the original; re-sending at
 //!   once would let that stale write land after a newer write to the same
 //!   LBA that was acknowledged on another path. The fence is sized to the
-//!   keep-alive timeout plus a quiesce margin, the NVMe-oF bound on how long
-//!   a target keeps a controller (and its commands) after losing the host.
+//!   keep-alive timeout plus a quiesce margin. This assumes the target has
+//!   quiesced old commands by then; it is not a target-side fence or proof
+//!   that an arbitrarily delayed backend write cannot outlive the delay.
 //! - Any data-path failure tears down the path's whole controller, on every
 //!   queue, rather than one I/O socket (as the kernel resets a controller).
 
@@ -54,12 +55,49 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub const NSID: u32 = 1;
+
+// Fault victims are selected at issue time, never when a replacement becomes
+// primary. The registry is touched only at attach/detach and fault injection.
+type PrimaryRegistry = HashMap<(String, u16), Vec<(std::sync::Weak<AtomicU16>, u16)>>;
+static WEDGE_PRIMARIES: std::sync::LazyLock<std::sync::Mutex<PrimaryRegistry>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn publish_fault(path: &str, cmd: &str) -> std::io::Result<()> {
+    // A consumer must never see an empty/partial command between create and
+    // write. Rename also makes replacing an unconsumed copy atomic.
+    let pending = format!("{path}.pending");
+    std::fs::write(&pending, cmd)?;
+    std::fs::rename(pending, path)
+}
+
+fn fanout_fault(dir: &str, claimant: u16) {
+    let claimed = format!("{dir}/fault.claimed.{claimant}");
+    // rename is the claim: concurrent engines cannot redistribute one command.
+    if std::fs::rename(format!("{dir}/fault"), &claimed).is_err() && !std::path::Path::new(&claimed).exists() { return; }
+    if let Ok(cmd) = std::fs::read_to_string(&claimed) {
+        // Shell redirection creates the inode before echo writes it. Keep
+        // the claimed inode and retry on the next tick if the writer has
+        // not supplied the command yet; its open fd still names this inode.
+        if cmd.trim().is_empty() { return; }
+        let n = std::fs::read_to_string(format!("{dir}/queues")).ok()
+            .and_then(|s| s.trim().parse::<u16>().ok()).unwrap_or(1);
+        let victims: Vec<u16> = if cmd.split_whitespace().next() == Some("wedge") {
+            WEDGE_PRIMARIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter().filter_map(|((d, q), lanes)| (d == dir && lanes.iter().any(|(p, t)| p.upgrade().is_some_and(|p| p.load(Ordering::Acquire) == *t))).then_some(*q)).collect()
+        } else { (0..n).collect() };
+        for q in victims {
+            let _ = publish_fault(&format!("{dir}/fault.q{q}"), &cmd);
+        }
+    }
+    let _ = std::fs::remove_file(claimed);
+}
+
 
 /// Staging buffer each connection starts with (and returns to after an
 /// oversized staged PDU): room for one RX_CHUNK receive plus a partial PDU.
@@ -87,30 +125,267 @@ const RX_CHUNK_DEFAULT: usize = 32 * 1024;
 /// io_uring UAPI: send/recv on a registered (fixed) buffer, index in buf_index.
 const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
 
+/// Bounded turns (design doc §4.4 L4): a queue thread never copies more
+/// than one chunk of a read's payload per receive it runs itself.
+/// - A payload of at least ASYNC_RX_MIN bytes (NVMEUBLK_ASYNC_RX_MIN,
+///   default 0 = never) is received with IOSQE_ASYNC: an io-wq worker does
+///   the socket-to-page copy, whole, while the thread keeps turning. Off by
+///   default: measured on VM 106 (run l4-20260927T021339Z) it cost 1M read
+///   QD16 16% (3,116 vs 3,722 MiB/s): a socket read returns what has
+///   arrived, so a 1 MiB payload is several io-wq round trips, each with a
+///   poll re-arm and a worker wake.
+/// - A smaller one is received inline in chunks of at most RX_ZC_CHUNK bytes
+///   (NVMEUBLK_RX_ZC_CHUNK, default 64 KiB; 0 = unbounded), so a small
+///   completion behind it waits for one chunk's copy (~5-10 µs), not a whole
+///   payload's.
 static ASYNC_RX_MIN: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_ASYNC_RX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+/// io-wq receive for payloads of at least this many bytes while the lane is
+/// shallow (NVMEUBLK_SHALLOW_ASYNC_RX, bytes; 0 = off). Run g2: io-wq receive
+/// for >= 256 KiB took read 1M 4:1 from 0.85 to 1.16x the kernel and 1M 1:8
+/// from 0.83 to 0.88x (several 1 MiB payloads on one shallow primary no
+/// longer copy one after another inline), but cost read 16k/64k 64:8 and 25%
+/// more CPU on deep 1M cells; so only while the queue is not in depth mode.
+// The glibc/AUTO_BUF_REG follow-up instead won 1M QD1x8 with inline
+// receive (less CPU and higher bandwidth); retain io-wq as an explicit knob.
+static SHALLOW_ASYNC_RX: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_SHALLOW_ASYNC_RX").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+
+/// The io-wq receive threshold of an engine: ASYNC_RX_MIN when set, else
+/// SHALLOW_ASYNC_RX while its lane is shallow, else 0 (inline).
+/// `large_reads`: reads of at least SHALLOW_ASYNC_RX in flight on the
+/// engine; a lone one stays inline (g3: io-wq for a single 1M QD1 read cost
+/// 1.11 -> 0.95x the kernel; the gain is several on one shallow thread).
+pub fn async_rx_min(global: usize, shallow_min: usize, shallow: bool, large_reads: usize) -> usize {
+    if global > 0 { global } else if shallow && large_reads >= 2 { shallow_min } else { 0 }
+}
+
+static RX_ZC_CHUNK: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_RX_ZC_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64 * 1024));
+
+/// One zero-copy payload receive of a C2HData PDU carrying `pdu_len` bytes,
+/// `left` of them still to come: (bytes to ask for, IOSQE_ASYNC).
+pub fn zc_rx_step(pdu_len: usize, left: usize, chunk: usize, async_min: usize) -> (usize, bool) {
+    if async_min > 0 && pdu_len >= async_min {
+        (left, true)
+    } else if chunk > 0 {
+        (left.min(chunk), false)
+    } else {
+        (left, false)
+    }
+}
 
 static BATCH_SLACK: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_BATCH_SLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
 static DIRECT_SEND: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_DIRECT_SEND").map_or(true, |v| v != "0"));
 
-pub static SEND_ZC: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_SEND_ZC").is_ok_and(|v| v != "0"));
+/// Zero-copy send of write payloads from the request's registered pages
+/// (SEND_ZC; the NIC reads the pages, nothing is copied into socket
+/// buffers). NVMEUBLK_SEND_ZC: "1" = every fixed payload, "0" = never
+/// (WRITE_FIXED copies it into the socket); unset = payloads of at least
+/// NVMEUBLK_SEND_ZC_MIN bytes (default 64 KiB), where the copy costs more
+/// than the extra notification completion.
+pub static SEND_ZC_MIN: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+    send_zc_min(std::env::var("NVMEUBLK_SEND_ZC").ok().as_deref(), std::env::var("NVMEUBLK_SEND_ZC_MIN").ok().and_then(|v| v.parse().ok()))
+});
 
+pub fn send_zc_min(mode: Option<&str>, min: Option<usize>) -> Option<usize> {
+    match mode {
+        Some("0") => None,
+        Some(v) if !v.is_empty() => Some(0),
+        _ => Some(min.unwrap_or(64 * 1024)),
+    }
+}
+
+static LINK_READ_FIXED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_u64("NVMEUBLK_LINK_READ_FIXED", 1) != 0);
 static LINK_HDR: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LINK_HDR").map_or(true, |v| v != "0"));
 
+
+/// Byte-balanced path choice for bulk commands (design doc §4.4 L6;
+/// NVMEUBLK_BYTE_PATH=1; default off, see below). A
+/// command with more than SMALL_IO bytes of payload goes to this engine's
+/// connection with the fewest commands, and among those (at depth usually
+/// several) to the path with the fewest payload bytes in flight in its
+/// direction over every engine of the device (Stats::path_rd_bytes /
+/// path_wr_bytes). The count rule alone broke those ties by path order, so
+/// every engine favoured path 0 (per-path spread 7-17% of the mean in run
+/// l6-20260927T031422Z). Bytes as the first key balanced the paths to 1-4%
+/// but stacked several 1 MiB transfers on one connection while its
+/// siblings idled (one connection receives one PDU at a time, on one
+/// thread): single-stream 1M read QD16 fell from 4,242 to 2,899 MiB/s. Batch
+/// affinity (BATCH_SLACK) does not apply to bulk commands.
+/// Off by default: as a tie-break it still balanced the paths (spread 5% vs
+/// 21%) but did not gain throughput anywhere, and 1M read QD16 came out at
+/// 3,190 vs 4,093 MiB/s (run l6b-20260927T042210Z). Kept for the balance.
+static BYTE_PATH: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_BYTE_PATH").is_ok_and(|v| v != "0"));
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: byte balance on for this thread, whatever the environment.
+    static FORCE_BYTE_PATH: Cell<bool> = const { Cell::new(false) };
+}
+
+fn byte_path() -> bool {
+    #[cfg(test)]
+    if FORCE_BYTE_PATH.with(|f| f.get()) {
+        return true;
+    }
+    *BYTE_PATH
+}
+
+/// Most paths the per-path counters cover.
+pub const MAX_PATHS: usize = 8;
+
+/// Payload size up to which a command is "small" for path choice and
+/// connection class.
+pub const SMALL_IO: usize = 32 * 1024;
+
+/// Whether a command belongs on a small-class connection (L5): payload at
+/// most SMALL_IO, and flushes (no payload, and what a database waits on).
+/// The tie-break key of engine `eid` (see `path_rank`): the engine id, plus
+/// one per full round of paths so that equal thread indexes of different
+/// queues (the queues' primaries, thread 0) prefer different paths, plus
+/// `offset` (the device).
+pub fn path_rank_key(eid: u16, n_paths: usize, offset: usize) -> usize {
+    let n = n_paths.max(1);
+    eid as usize + eid as usize / n + offset
+}
+
+/// The engine id the path tie-break uses for a command dispatched while
+/// the device has `device_inflight` commands in flight: with none, the
+/// device's lane (engine 0's key, i.e. the device offset), whichever engine
+/// serves it; otherwise the engine's own (ties then spread over the paths).
+/// A QD1 stream thus keeps one path whatever queue, thread or reactor its
+/// request lands on. With the engine's own key a QD1 lane's path followed
+/// the engine: with shared engines (engine id = reactor) and 8 queues a
+/// single stream used all four paths as the submitting CPU moved, and the
+/// ixgbevf ones cost QD1 p99 (qg: runs on 203/204 1.3-3.7 ms at randwrite
+/// 128k, on 201/202 0.8-1.1 ms).
+pub fn lane_eid(eid: u16, device_inflight: i64) -> u16 {
+    if device_inflight <= 0 { 0 } else { eid }
+}
+
+/// Whether the idle-device lane path applies (NVMEUBLK_LANE_PATH).
+static LANE_PATH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_LANE_PATH").map_or(LANE_PATH_BY_DEFAULT, |v| v != "0"));
+const LANE_PATH_BY_DEFAULT: bool = true;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the lane path on for this thread, whatever the environment.
+    static FORCE_LANE_PATH: Cell<bool> = const { Cell::new(false) };
+}
+
+fn lane_path() -> bool {
+    #[cfg(test)]
+    if FORCE_LANE_PATH.with(|f| f.get()) {
+        return true;
+    }
+    *LANE_PATH
+}
+
+/// `lane_eid` if the lane path applies, else the engine's own id.
+fn tie_eid(eid: u16, device_inflight: i64) -> u16 {
+    if lane_path() { lane_eid(eid, device_inflight) } else { eid }
+}
+
+/// Last tie-break of the path choice: key `eid` (see `path_rank_key`)
+/// prefers path `eid % n_paths`, then the following ones in order. Equal counts used to go
+/// to the lowest path index in every engine, so across a device path 0 took
+/// the most and the last path the least (matrix-20260927T051306Z: path_MiB
+/// [226280, 202747, 163201, 145410]; a single 1M stream left path 204 at
+/// 3-7 Gbps while each path alone delivers ~9.8 Gbps). A low-depth stream
+/// still stays on one connection: its engine's first path.
+pub fn path_rank(path: usize, eid: usize, n_paths: usize) -> usize {
+    let n = n_paths.max(1);
+    (path % n + n - eid % n) % n
+}
+
+pub fn is_small_cmd(op: Op, len: usize) -> bool {
+    op == Op::Flush || len <= SMALL_IO
+}
+
+/// Small reads above this size span several TCP segments; they are the ones
+/// whose completion time depends on the path's NIC (see `choose_home`).
+pub const SMALL_READ_MIN: usize = 4096;
+
+/// Whether the lane's home path follows measured small-read latency
+/// (NVMEUBLK_SMALL_HOME, default off until measured).
+static SMALL_HOME: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_SMALL_HOME").map_or(SMALL_HOME_BY_DEFAULT, |v| v != "0"));
+const SMALL_HOME_BY_DEFAULT: bool = true;
+/// One multi-segment small read in PROBE_EVERY goes to another path, so the
+/// other paths' latency stays known while the lane stays on its home path.
+const PROBE_EVERY: u32 = 64;
+/// A lane stays on a home path it moved to for at least this long.
+const HOME_HOLD: Duration = Duration::from_secs(10);
+
+/// The home path of a low-depth lane (which path a small read takes when
+/// every connection is equally loaded), revisiting L2 narrowly. L2 chose a
+/// path per request by RTT and probed the others, which took I/O off the
+/// one warm connection and lost 3-14% at QD1 (l2ab-…). Measured since (run
+/// s1-20260927T191110Z, pool, stream pinned to a path): 16k QD1 reads on the
+/// ixgbevf paths complete ~75 µs later than on the bnx2x ones (payload
+/// segments; 4k reads show no gap), so a lane whose device id rotates it
+/// onto an ixgbevf path loses 16k QD1 (0.88x the kernel) while one on bnx2x
+/// wins (1.37x). Here the lane keeps one home path and moves it only when
+/// another path's measured multi-segment small-read latency is lower by more
+/// than 20% and 30 µs, both with at least `min_n` samples; the engine
+/// re-evaluates at most once a second (the timer), and probes 1 in 64.
+/// Samples are the engine's own and taken only at low depth (at most one
+/// other command on the connection), so depth traffic of other lanes does
+/// not steer a QD1 lane (s2: device-wide samples moved lanes to path 3).
+/// The latency is first data -> done, the part the path's NIC decides (the
+/// payload's later segments); wired -> done also holds the target's time,
+/// which is longer on a cold path, so probes of idle paths always looked
+/// slow and the home flip-flopped between the warm ones (s3).
+/// Returns the new home path.
+pub fn choose_home(home: usize, lat_ns: &[u64], n: &[u64], min_n: u64) -> usize {
+    let ok = |p: usize| lat_ns.get(p).copied().unwrap_or(0) > 0 && n.get(p).copied().unwrap_or(0) >= min_n;
+    if !ok(home) {
+        return home;
+    }
+    let cur = lat_ns[home];
+    let best = (0..lat_ns.len()).filter(|&p| ok(p)).min_by_key(|&p| lat_ns[p]).unwrap_or(home);
+    let b = lat_ns[best];
+    if best != home && b.saturating_mul(6) / 5 < cur && cur - b > 30_000 { best } else { home }
+}
+
+/// The engine's wire round trip: EWMA (weight 1/8) of `wired -> first
+/// data` for reads and `wired -> response` otherwise, over small commands
+/// only (a large read's first data waits for the target to read all of
+/// it). What a batch hot-lane thread sizes its warm window by.
+///
+/// (Hot lane L2 also kept one per path and sent small commands to the path
+/// with the lowest expected completion time. Measured on VM 106 it gave no
+/// gain, and cost 3-14% at QD1 on the hot lane: its probes of the other
+/// paths take I/O off the one warm connection (runs l23-20260926T235456Z,
+/// l2ab-20260927T023551Z). Removed; small commands take the least
+/// outstanding connection as before.)
+#[derive(Clone, Copy, Default, Debug)]
+struct PathRtt {
+    ewma_ns: u64,
+}
+
+impl PathRtt {
+    fn sample(&mut self, ns: u64) {
+        self.ewma_ns = if self.ewma_ns == 0 { ns.max(1) } else { (self.ewma_ns - self.ewma_ns / 8 + ns / 8).max(1) };
+    }
+}
+
 /// Per-I/O trace (NVMEUBLK_TRACE_DIR, diagnostics): one line per completed
-/// request, "local_port cid sent wired first_data done" in CLOCK_REALTIME
-/// nanoseconds (0 = not recorded), to join with a packet capture.
+/// request, "local_port cid sent wired first_data done path len first slba"
+/// (times in CLOCK_REALTIME nanoseconds, 0 = not recorded; `first` = when
+/// the request reached the engine), to join with a packet
+/// capture and to histogram the wire round trip per path.
 static TRACE_DIR: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_TRACE_DIR").ok().filter(|d| !d.is_empty()));
 
 thread_local! {
     static TRACE: RefCell<Option<(std::io::BufWriter<std::fs::File>, Instant, u128, u64)>> = const { RefCell::new(None) };
 }
 
-fn trace_io(fd: i32, cid: u16, p: &Pending) {
+fn trace_io(fd: i32, cid: u16, path: usize, p: &Pending) {
     let Some(dir) = TRACE_DIR.as_ref() else { return };
     let port = unsafe {
         let mut sa: libc::sockaddr_in = std::mem::zeroed();
@@ -129,7 +404,7 @@ fn trace_io(fd: i32, cid: u16, p: &Pending) {
         let (w, base, rt, n) = t.as_mut().unwrap();
         let ns = |i: Option<Instant>| i.map_or(0, |i| if i >= *base { *rt + (i - *base).as_nanos() } else { rt.saturating_sub((*base - i).as_nanos()) });
         use std::io::Write;
-        let _ = writeln!(w, "{port} {cid} {} {} {} {}", ns(Some(p.sent)), ns(p.wired), ns(p.first_data), ns(Some(Instant::now())));
+        let _ = writeln!(w, "{port} {cid} {} {} {} {} {path} {} {} {}", ns(Some(p.sent)), ns(p.wired), ns(p.first_data), ns(Some(Instant::now())), p.len, ns(Some(p.first)), p.slba);
         *n += 1;
         if *n % 256 == 0 {
             let _ = w.flush();
@@ -182,6 +457,34 @@ fn ucopy_write(cdev_fd: i32, pos: u64, data: *const u8, len: usize) -> Result<()
     }
     Ok(())
 }
+
+/// Append `len` bytes of the ublk request at USER_COPY position `pos` to `v`.
+fn ucopy_read_into(cdev_fd: i32, pos: u64, len: usize, v: &mut Vec<u8>) -> Result<(), i32> {
+    v.reserve(len);
+    let base = v.len();
+    let mut done = 0usize;
+    while done < len {
+        let n = unsafe { libc::pread(cdev_fd, v.as_mut_ptr().add(base + done) as *mut libc::c_void, len - done, (pos + done as u64) as libc::off_t) };
+        if n > 0 {
+            done += n as usize;
+        } else {
+            let e = if n == 0 { libc::EIO } else { std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) };
+            if e != libc::EINTR {
+                return Err(e);
+            }
+        }
+    }
+    unsafe { v.set_len(base + len) };
+    Ok(())
+}
+
+/// Zero copy, in-capsule writes (NVMEUBLK_INLINE_COPY, default on): copy the
+/// payload out of the request (USER_COPY pread) into the capsule's own
+/// buffer, so a turn's small writes leave in one writev. Sending it from
+/// the registered pages (WRITE_FIXED) cost a second tcp_sendmsg per write
+/// and ended the sender's batch at every write.
+static INLINE_COPY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_INLINE_COPY").map_or(true, |v| v != "0"));
 
 /// Receives the bulk of a large C2HData payload on its own thread, straight
 /// into the request buffer, while the queue thread keeps serving the other
@@ -314,6 +617,38 @@ pub struct Stats {
     /// `inflight`, yet they may still land on the target: a handover is
     /// clean only when this is zero too.
     pub orphans: std::sync::atomic::AtomicI64,
+    /// Batch I/O (UBLK_F_BATCH_IO): requests fetched, and how often a
+    /// thread's fetch ran out of credits and the queue's requests spilled
+    /// to its next thread.
+    pub batch_tags: AtomicU64,
+    pub batch_spills: AtomicU64,
+    /// Batch hot lane: a secondary took over as its queue's primary because
+    /// the primary stopped turning its loop (watchdog).
+    pub batch_takeovers: AtomicU64,
+    /// Payload receives handed to io-wq (IOSQE_ASYNC, bounded turns).
+    pub async_rx: AtomicU64,
+    /// Bulk commands that waited at the bulk admission gate (crate::gate).
+    pub gate_waits: AtomicU64,
+    /// Queue-thread turns (a non-sleeping ring poll with its task work, or
+    /// one run of the executors) longer than 50 µs, and the longest one
+    /// (ns); both reset by the stats reporter.
+    pub long_turns: AtomicU64,
+    pub turn_max_ns: AtomicU64,
+    /// Payload bytes of commands on the wire right now, per path index and
+    /// direction, over every engine of the device (byte-balanced choice).
+    pub path_rd_bytes: [std::sync::atomic::AtomicI64; MAX_PATHS],
+    pub path_wr_bytes: [std::sync::atomic::AtomicI64; MAX_PATHS],
+    /// Payload bytes completed per path (both directions), for the per-path
+    /// balance in the stats line.
+    pub path_done_bytes: [AtomicU64; MAX_PATHS],
+    /// Small commands (payload <= SMALL_IO) sent, per path index (the
+    /// first 8 paths): where latency-aware path choice put them.
+    pub small_by_path: [AtomicU64; 8],
+    /// Low-depth multi-segment small reads (SMALL_READ_MIN < len <=
+    /// SMALL_IO), per path: the last wired -> done in ns, and samples
+    /// (diagnostics; the home path choice uses each engine's own EWMA).
+    pub small_rd_lat_ns: [AtomicU64; MAX_PATHS],
+    pub small_rd_n: [AtomicU64; MAX_PATHS],
 }
 
 #[derive(Clone)]
@@ -342,6 +677,14 @@ pub struct QConfig {
     pub conns_per_path: usize,
     /// Largest staging receive (see RX_CHUNK_DEFAULT).
     pub rx_chunk: usize,
+    /// Two connection classes per path (design doc §4.4 L5): besides its
+    /// `conns_per_path` bulk connections, each path gets one "small"
+    /// connection that carries only commands with at most SMALL_IO bytes of
+    /// payload (and flushes), so a 4k read never queues behind 1 MiB PDUs on
+    /// the wire or in the target's per-queue worker. Its sender and receiver
+    /// run on the engine's priority executor (`QEngine::tick_priority`),
+    /// which the queue thread drains before any other task in a turn.
+    pub conn_classes: bool,
     /// NAPI busy-poll budget (us) while this queue has I/O in flight; 0 = off.
     /// Registered on the first submit after an idle period and dropped after
     /// an idle timer tick, so an idle volume costs no polling.
@@ -351,6 +694,26 @@ pub struct QConfig {
     /// Set while the daemon drains for a graceful restart: new requests park
     /// instead of going out, so in-flight work can finish.
     pub quiesce: Arc<AtomicBool>,
+    /// Added to the path-choice tie-break key (see `path_rank_key`): the
+    /// ublk device id, so the low-depth streams of different volumes start
+    /// on different paths.
+    pub path_offset: usize,
+}
+
+/// Where a finished request returns its result. Batch queues are driven on
+/// this same thread, so they need neither a channel nor a runnable tag task.
+pub enum Completion {
+    Channel(Sender<i32>),
+    Batch { tag: u16, ready: Rc<RefCell<Vec<libublk::io::UblkBatchCompletion>>> },
+}
+
+impl Completion {
+    pub fn finish(self, result: i32) {
+        match self {
+            Self::Channel(tx) => { let _ = tx.try_send(result); }
+            Self::Batch { tag, ready } => ready.borrow_mut().push(libublk::io::UblkBatchCompletion::new(tag, result)),
+        }
+    }
 }
 
 /// One block request as seen by the engine. `buf` is the tag's IoBuf, owned
@@ -361,12 +724,14 @@ pub struct QConfig {
 /// bug) is handed back to its engine by `Drop`, so the tag never hangs.
 pub struct Pending {
     pub op: Op,
+    /// Preserve durable-write semantics through parking, retries and fencing.
+    pub fua: bool,
     pub slba: u64,
     pub nlb: u32,
     pub buf: *mut u8,
     pub len: usize,
     /// Taken by `finish`; still set when a Pending is dropped unfinished.
-    done: Option<Sender<i32>>,
+    done: Option<Completion>,
     /// The engine it was submitted to (set by `QEngine::submit`).
     owner: Weak<Engine>,
     pub first: Instant,
@@ -403,9 +768,25 @@ pub struct Pending {
 }
 
 impl Pending {
+    #[cfg(test)]
     pub fn new(op: Op, slba: u64, nlb: u32, buf: *mut u8, len: usize, done: Sender<i32>, ucopy: Option<u64>, zc_index: Option<u16>) -> Self {
+        Self::with_completion(op, slba, nlb, buf, len, Completion::Channel(done), ucopy, zc_index)
+    }
+    pub fn with_completion(op: Op, slba: u64, nlb: u32, buf: *mut u8, len: usize, done: Completion, ucopy: Option<u64>, zc_index: Option<u16>) -> Self {
         let now = Instant::now();
-        Pending { op, slba, nlb, buf, len, done: Some(done), owner: Weak::new(), first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, tx_cov: 0, deferred_sc: None, avoid_path: None, wired: None, first_data: None, ucopy, zc_index, orphan: None }
+        Pending { op, fua: false, slba, nlb, buf, len, done: Some(done), owner: Weak::new(), first: now, sent: now, attempts: 0, rx: 0, h2c_queued: 0, tx_cov: 0, deferred_sc: None, avoid_path: None, wired: None, first_data: None, ucopy, zc_index, orphan: None }
+    }
+    fn command(&self, cid: u16, inline: bool) -> Sqe {
+        let mut sqe = match self.op {
+            Op::Read => rw_cmd(OPC_READ, cid, NSID, self.slba, self.nlb, self.len as u32, false),
+            Op::Write => rw_cmd(OPC_WRITE, cid, NSID, self.slba, self.nlb, self.len as u32, inline),
+            Op::Flush => flush_cmd(cid, NSID),
+        };
+        if self.op == Op::Write && self.fua {
+            // NVMe R/W control.FUA = bit 14 (CDW12 bit 30).
+            sqe.set_u32(48, (self.nlb - 1) | (1 << 30));
+        }
+        sqe
     }
     /// Count it in `Stats::orphans` until `unorphan`.
     fn orphan(&mut self, stats: &Arc<Stats>) {
@@ -422,7 +803,7 @@ impl Pending {
     fn finish(mut self, res: i32) {
         self.unorphan();
         if let Some(done) = self.done.take() {
-            let _ = done.try_send(res);
+            done.finish(res);
         }
     }
     fn ok_res(&self) -> i32 {
@@ -592,8 +973,8 @@ enum Cause {
 /// Time limits of an I/O-queue connect, as the blocking dial had them: the
 /// TCP connect, then each handshake exchange (ICReq/ICResp, Connect). Each
 /// SQE of a step carries a linked timeout for what is left of its step.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = crate::conn::CONNECT_TIMEOUT;
+const HANDSHAKE_TIMEOUT: Duration = crate::conn::HANDSHAKE_TIMEOUT;
 
 /// How long a shut-down engine drives its tasks to their end before it
 /// gives up and leaks itself instead (see `Engine::shutdown`).
@@ -645,6 +1026,9 @@ impl std::fmt::Display for TaskKind {
 /// Drop it on the queue thread, after the queue's event loop has ended.
 pub struct QEngine {
     core: Rc<Engine>,
+    last_turn: Cell<Option<u64>>,
+    ready_group: Arc<crate::ready::Group>,
+    watches: RefCell<Vec<crate::ready::Watch>>,
 }
 
 impl QEngine {
@@ -657,13 +1041,37 @@ impl QEngine {
         stop: Arc<AtomicBool>,
         draining: Arc<AtomicBool>,
     ) -> Rc<Self> {
-        Rc::new(QEngine { core: Engine::new(qid, ctrls, cfg, exe, stats, stop, draining) })
+        Rc::new(QEngine { core: Engine::new(qid, ctrls, cfg, exe, stats, stop, draining), last_turn: Cell::new(None), ready_group: Arc::default(), watches: RefCell::new(Vec::new()) })
+    }
+
+    /// A reactor drives each shared engine once per turn. The stamp keeps
+    /// this constant-time even when many volumes share the reactor.
+    pub fn begin_turn(&self, turn: u64) -> bool {
+        if self.last_turn.get() == Some(turn) { return false; }
+        self.last_turn.set(Some(turn));
+        true
+    }
+
+    pub fn watch_ready(&self, tags: Rc<smol::LocalExecutor<'static>>, w: std::task::Waker) {
+        self.ready_group.add(w);
+        let mut watches = self.watches.borrow_mut();
+        if watches.is_empty() {
+            for exe in [tags, self.core.exe_hi.clone(), self.core.exe.clone()] {
+                watches.push(crate::ready::Watch::new(exe, std::task::Waker::from(self.ready_group.clone())));
+            }
+        }
+    }
+    pub fn unwatch_ready(&self, w: &std::task::Waker) { self.ready_group.remove(w); }
+    pub fn arm_ready(&self) {
+        for watch in self.watches.borrow_mut().iter_mut() { watch.arm(); }
     }
 
     /// Start the timer task. Connections come up on its first tick.
     pub fn start(&self) {
         self.core.start();
     }
+
+    pub fn draining(&self) -> bool { self.core.draining.load(Ordering::Acquire) }
 
     /// Largest write sent inside the command capsule.
     pub fn incapsule(&self) -> usize {
@@ -673,6 +1081,99 @@ impl QEngine {
     /// Commands outstanding on this queue's connections.
     pub fn inflight_here(&self) -> usize {
         self.core.inflight_here()
+    }
+
+    /// EWMA of the wire round trip of small commands over all paths
+    /// (wired -> first data for reads), if any has completed.
+    pub fn wire_rtt(&self) -> Option<Duration> {
+        let r = self.core.rtt_all.get();
+        (r.ewma_ns > 0).then(|| Duration::from_nanos(r.ewma_ns))
+    }
+
+    /// Run the priority executor (small-class connections) until it has
+    /// nothing ready; true if it ran anything. The queue thread calls it
+    /// before, and between, its other tasks.
+    pub fn tick_priority(&self) -> bool {
+        let mut ran = false;
+        while self.core.exe_hi.try_tick() {
+            ran = true;
+        }
+        ran
+    }
+
+    /// One turn of a queue thread's executors until nothing is runnable:
+    /// `tags` (the per-tag request tasks), this engine's priority executor
+    /// (small-class connections, conn_classes) and `net` (its other
+    /// connection tasks).
+    ///
+    /// The tag tasks run first and all of them: each only dispatches its
+    /// request onto a connection's send queue, so the turn's commands for
+    /// one connection leave in one sendmsg when that connection's sender
+    /// runs next. Ticking the priority executor after every tag task sent
+    /// each small command on its own (4k randread 64:8: 177,466 sendmsg/s
+    /// for 177,457 IO/s, sendmsg ~21% of the daemon's cycles; gaps/prof3).
+    /// The priority executor then runs, and again after every bulk task, so
+    /// small-class completions never wait behind bulk payload work (L5).
+    pub fn run_turn(&self, tags: &smol::LocalExecutor<'_>, net: &smol::LocalExecutor<'_>) {
+        self.ready_group.driving.store(true, Ordering::Release);
+        let mut progress = true;
+        while progress {
+            progress = false;
+            while tags.try_tick() {
+                progress = true;
+            }
+            progress |= self.tick_priority();
+            while net.try_tick() {
+                progress = true;
+                self.tick_priority();
+            }
+        }
+        self.ready_group.driving.store(false, Ordering::Release);
+    }
+
+    /// Whether this engine's lane is shallow (see SHALLOW_ASYNC_RX).
+    pub fn set_shallow(&self, shallow: bool) {
+        self.core.shallow.set(shallow);
+    }
+
+    /// An engine shared by several tenancies (batchq, NVMEUBLK_SHARED_ENGINE):
+    /// one of them moved between shallow and depth mode (`was_deep` ->
+    /// `deep`). The engine is shallow while none of them is deep.
+    pub fn note_lane_deep(&self, was_deep: bool, deep: bool) {
+        let n = &self.core.deep_lanes;
+        match (was_deep, deep) {
+            (false, true) => n.set(n.get() + 1),
+            (true, false) => n.set(n.get().saturating_sub(1)),
+            _ => {}
+        }
+        self.core.shallow.set(n.get() == 0);
+    }
+
+    /// PDUs this engine has received so far.
+    pub fn events(&self) -> u64 {
+        self.core.events.get()
+    }
+
+    /// Keep the queue's authoritative primary atomic, not the tenancy's
+    /// cached role: a stalled former primary cannot update that cache.
+    pub fn watch_primary(&self, primary: &Arc<AtomicU16>, thread: u16) {
+        WEDGE_PRIMARIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((self.core.cfg.fault_dir.clone(), self.core.qid)).or_default()
+            .push((Arc::downgrade(primary), thread));
+    }
+    pub fn unwatch_primary(&self, primary: &Arc<AtomicU16>, thread: u16) {
+        let mut roles = WEDGE_PRIMARIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (self.core.cfg.fault_dir.clone(), self.core.qid);
+        if let Some(lanes) = roles.get_mut(&key) {
+            lanes.retain(|(p, t)| !(*t == thread && p.ptr_eq(&Arc::downgrade(primary))));
+            if lanes.is_empty() { roles.remove(&key); }
+        }
+    }
+
+    /// A pending fault-injection "wedge <ms>" (drills of the batch hot
+    /// lane's watchdog); taking it clears it.
+    pub fn take_wedge(&self) -> Option<Duration> {
+        self.core.wedge.take()
     }
 
     /// Entry point for new block requests from ublk. Runs engine code on the
@@ -705,6 +1206,12 @@ struct Engine {
     next_try: RefCell<Vec<Instant>>,
     backoff: RefCell<Vec<Duration>>,
     parked: RefCell<VecDeque<Pending>>,
+    /// Bulk commands waiting at the bulk admission gate, in order.
+    throttled: RefCell<VecDeque<Pending>>,
+    /// The process-wide bulk gate of each path, and this engine's bulk
+    /// commands in flight (crate::gate).
+    gates: Vec<Arc<crate::gate::PathGate>>,
+    own_bulk: Cell<usize>,
     /// Writes/flushes waiting out the write fence: (release time, request).
     fenced: RefCell<Vec<(Instant, Pending)>>,
     exe: Rc<smol::LocalExecutor<'static>>,
@@ -735,6 +1242,30 @@ struct Engine {
     dropped: RefCell<Vec<Pending>>,
     /// Connect step limits: (TCP connect, each handshake exchange).
     dial_limits: Cell<(Duration, Duration)>,
+    /// Wire round trip over every path: what a batch hot-lane thread sizes
+    /// its warm window by.
+    rtt_all: Cell<PathRtt>,
+    /// Fault injection "wedge <ms>": for the queue thread to act on.
+    wedge: Cell<Option<Duration>>,
+    /// Priority executor: the small-class connections' tasks (conn_classes).
+    exe_hi: Rc<smol::LocalExecutor<'static>>,
+    /// PDUs received (a host serving several engines on one ring tells
+    /// which of them saw events by it).
+    events: Cell<u64>,
+    /// NVMEUBLK_SMALL_HOME: added to the path rank key of multi-segment
+    /// small reads (moves the lane's home path), and the probe counter.
+    home_shift: Cell<usize>,
+    probes: Cell<u32>,
+    /// This engine's low-depth multi-segment small-read latency per path:
+    /// (EWMA ns, samples).
+    home_lat: RefCell<[(u64, u64); MAX_PATHS]>,
+    /// The lane is shallow (not in hot-lane depth mode): SHALLOW_ASYNC_RX.
+    shallow: Cell<bool>,
+    /// Shared engine: how many of its tenancies are in depth mode.
+    deep_lanes: Cell<u32>,
+    /// When the home path last moved (it then stays HOME_HOLD).
+    home_moved: Cell<Option<Instant>>,
+    home_checked: Cell<Instant>,
 }
 
 fn io_sqe_res(r: Result<i32, libublk::UblkError>) -> i32 {
@@ -759,8 +1290,10 @@ impl Engine {
         stop: Arc<AtomicBool>,
         draining: Arc<AtomicBool>,
     ) -> Rc<Self> {
-        let n = ctrls.paths.len() * cfg.conns_per_path.max(1);
+        let n_paths = ctrls.paths.len();
+        let n = n_paths * (cfg.conns_per_path.max(1) + cfg.conn_classes as usize);
         let tick_fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) };
+        let gates = ctrls.paths.iter().map(|p| crate::gate::for_path(p.addr)).collect();
         Rc::new(Engine {
             qid,
             incapsule: ctrls.info.incapsule_bytes,
@@ -771,6 +1304,9 @@ impl Engine {
             next_try: RefCell::new(vec![Instant::now(); n]),
             backoff: RefCell::new(vec![Duration::from_millis(250); n]),
             parked: RefCell::new(VecDeque::new()),
+            throttled: RefCell::new(VecDeque::new()),
+            gates,
+            own_bulk: Cell::new(0),
             fenced: RefCell::new(Vec::new()),
             exe,
             tick_fd,
@@ -786,6 +1322,17 @@ impl Engine {
             failed: Cell::new(false),
             dropped: RefCell::new(Vec::new()),
             dial_limits: Cell::new((CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT)),
+            rtt_all: Cell::new(PathRtt::default()),
+            wedge: Cell::new(None),
+            exe_hi: Rc::new(smol::LocalExecutor::new()),
+            events: Cell::new(0),
+            home_shift: Cell::new(0),
+            probes: Cell::new(0),
+            home_lat: RefCell::new([(0, 0); MAX_PATHS]),
+            shallow: Cell::new(false),
+            deep_lanes: Cell::new(0),
+            home_moved: Cell::new(None),
+            home_checked: Cell::new(Instant::now()),
         })
     }
 
@@ -798,16 +1345,14 @@ impl Engine {
         self.conns.borrow().iter().flatten().filter(|c| !c.dead.get()).cloned().collect()
     }
 
+    /// NAPI busy polling on this thread's ring while this engine is busy.
+    /// The ring has it while any engine on it wants it (crate::napi).
     fn set_napi(&self, on: bool) {
         if self.cfg.napi_us == 0 || self.napi_on.get() == on {
             return;
         }
-        let mut napi = io_uring::types::Napi::new().set_busy_poll_timeout(self.cfg.napi_us).set_prefer_busy_poll(true);
-        let r = libublk::with_task_io_ring_mut(|ring| if on { ring.submitter().register_napi(&mut napi) } else { ring.submitter().unregister_napi(&mut napi) });
-        match r {
-            Ok(()) => self.napi_on.set(on),
-            Err(e) => log::debug!("q{}: NAPI {}: {e}", self.qid, if on { "register" } else { "unregister" }),
-        }
+        crate::napi::want(on, self.cfg.napi_us);
+        self.napi_on.set(on);
     }
 
     fn inflight_here(&self) -> usize {
@@ -823,6 +1368,7 @@ impl Engine {
         self.submitted.set(self.submitted.get() + 1);
         self.last_active.set(Instant::now());
         self.set_napi(true);
+        crate::napi::note_request(crate::napi::bulk_write(self.shallow.get(), p.op == Op::Write, p.len));
         panic_point("submit");
         // Idle-disconnected: bring the connections back now rather than on
         // the next (idle, 1 s) timer tick; the request parks until one is up.
@@ -847,17 +1393,51 @@ impl Engine {
     }
 
     /// Send to the live connection with the fewest outstanding commands;
-    /// park if none has a free slot.
-    fn dispatch(&self, mut p: Pending) {
+    /// park if none has a free slot; a bulk command the gate holds back
+    /// waits behind the ones already waiting (crate::gate).
+    fn dispatch(&self, p: Pending) {
+        if !is_small_cmd(p.op, p.len) && self.gate_closed() && !self.throttled.borrow().is_empty() {
+            self.stats.gate_waits.fetch_add(1, Ordering::Relaxed);
+            self.throttled.borrow_mut().push_back(p);
+            self.kick_throttled();
+            return;
+        }
+        if let Some(p) = self.dispatch_gated(p) {
+            self.stats.gate_waits.fetch_add(1, Ordering::Relaxed);
+            self.throttled.borrow_mut().push_back(p);
+        }
+    }
+
+    /// Whether the bulk gate holds bulk commands back now (on, small
+    /// commands recently, and this engine has a bulk command in flight).
+    fn gate_closed(&self) -> bool {
+        let (cap, recent) = crate::gate::config();
+        cap > 0 && self.own_bulk.get() > 0 && crate::gate::closed(recent)
+    }
+
+    /// Bulk commands that waited at the gate go out while it admits them,
+    /// oldest first.
+    fn kick_throttled(&self) {
+        loop {
+            let Some(p) = self.throttled.borrow_mut().pop_front() else { return };
+            if let Some(p) = self.dispatch_gated(p) {
+                self.throttled.borrow_mut().push_front(p);
+                return;
+            }
+        }
+    }
+
+    /// `dispatch` past the gate's queue: Some(p) back if the gate holds it.
+    fn dispatch_gated(&self, mut p: Pending) -> Option<Pending> {
         if self.failed.get() {
             // A failed engine sends nothing more. Retries end here: a read
             // failed over, or a write or flush once its fence has passed.
             p.finish(-libc::EIO);
-            return;
+            return None;
         }
         if self.cfg.quiesce.load(Ordering::Acquire) {
             self.parked.borrow_mut().push_back(p);
-            return;
+            return None;
         }
         let mut live = self.live();
         if let Some(ap) = p.avoid_path {
@@ -865,46 +1445,104 @@ impl Engine {
                 live.retain(|c| c.path != ap);
             }
         }
+        // Connection classes: small commands (and flushes) on the paths'
+        // small connections, the rest on the bulk ones; either may use the
+        // other class when its own has no live connection.
+        if self.cfg.conn_classes {
+            let want_small = is_small_cmd(p.op, p.len);
+            if live.iter().any(|c| self.small_slot(c.slot) == want_small) {
+                live.retain(|c| self.small_slot(c.slot) == want_small);
+            }
+        }
         // Batch affinity (NVMEUBLK_BATCH_SLACK, default 16): a connection that
         // already has commands waiting for this turn's send takes the next one
         // too while it is within SLACK of the least loaded, so one sendmsg
         // carries the turn's commands instead of one per path. Load still
         // evens out across turns; 0 = plain least-outstanding.
+        if is_small_cmd(p.op, p.len) {
+            crate::gate::note_small();
+        } else if !live.is_empty() && self.gate_closed() {
+            let (cap, _) = crate::gate::config();
+            let own = self.own_bulk.get();
+            live.retain(|c| self.gates.get(c.path).is_none_or(|g| crate::gate::admits(true, own, g.bytes.load(Ordering::Relaxed), p.len, cap)));
+            if live.is_empty() {
+                return Some(p);
+            }
+        }
         let min = live.iter().map(|c| c.inflight.borrow().len()).min().unwrap_or(0);
         let slack = *BATCH_SLACK;
+        // Bulk commands: fewest outstanding, byte balance as the tie-break
+        // (see BYTE_PATH), and no batch affinity: a bulk command is its own
+        // batch, and affinity only piled a turn's payloads onto one path.
+        // Small commands: fewest outstanding with batch affinity.
+        let small = p.len <= SMALL_IO;
+        let bulk_bytes = byte_path() && !small;
+        let n_paths = self.ctrls.paths.len().max(1);
+        let mut key = path_rank_key(tie_eid(self.qid, self.stats.inflight.load(Ordering::Relaxed)), n_paths, self.cfg.path_offset);
+        if *SMALL_HOME && p.op == Op::Read && p.len > SMALL_READ_MIN && small {
+            key += self.home_shift.get();
+            let k = self.probes.get().wrapping_add(1);
+            self.probes.set(k);
+            if n_paths > 1 && k % PROBE_EVERY == 0 {
+                key += 1 + (k / PROBE_EVERY) as usize % (n_paths - 1);
+            }
+        }
         live.sort_by_key(|c| {
             let n = c.inflight.borrow().len();
-            (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), n)
+            let rot = path_rank(c.path, key, n_paths);
+            if !small {
+                let bytes = if bulk_bytes { self.bytes_on(c.path, p.op).max(0) as u64 } else { 0 };
+                return (false, n as u64, bytes, rot);
+            }
+            (!(slack > 0 && !c.tx.is_empty() && n <= min + slack), n as u64, 0, rot)
         });
         for c in live {
+            let path = c.path;
             match self.try_submit(&c, p) {
-                Ok(()) => return,
+                Ok(()) => {
+                    if small {
+                        if let Some(c) = self.stats.small_by_path.get(path) {
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    return None;
+                }
                 Err(back) => p = back,
             }
         }
         if self.draining.load(Ordering::Acquire) {
             p.finish(-libc::EIO);
-            return;
+            return None;
         }
         self.stats.parked.fetch_add(1, Ordering::Relaxed);
         self.parked.borrow_mut().push_back(p);
+        None
     }
 
     fn try_submit(&self, c: &Rc<QConn>, mut p: Pending) -> Result<(), Pending> {
         let Some(slot) = c.free.borrow_mut().pop() else { return Err(p) };
         let cid = slot | (c.generation.borrow()[slot as usize] as u16) << 8;
         let inline = p.op == Op::Write && p.len <= self.incapsule;
-        let sqe = match p.op {
-            Op::Read => rw_cmd(OPC_READ, cid, NSID, p.slba, p.nlb, p.len as u32, false),
-            Op::Write => rw_cmd(OPC_WRITE, cid, NSID, p.slba, p.nlb, p.len as u32, inline),
-            Op::Flush => flush_cmd(cid, NSID),
-        };
-        let (data, len) = if inline { (p.buf as *const u8, p.len) } else { (std::ptr::null(), 0) };
-        // Zero copy: in-capsule write data goes out straight from the
-        // request's registered pages, right behind the capsule header (the
-        // sender keeps the byte order), so there is no tag buffer to fill.
-        let fixed = if inline { p.zc_index.map(|idx| (idx, 0usize)) } else { None };
-        let head = capsule_header(&sqe, len);
+        let sqe = p.command(cid, inline);
+        // Zero copy with USER_COPY: in-capsule data is copied into the
+        // capsule (INLINE_COPY). Otherwise it goes out straight from the
+        // request's registered pages right behind the capsule header (the
+        // sender keeps the byte order), or from the tag buffer when copying.
+        let copy_in = inline && *INLINE_COPY && p.zc_index.is_some() && self.cfg.cdev_fd >= 0 && p.ucopy.is_some();
+        let (data, len) = if inline && !copy_in { (p.buf as *const u8, p.len) } else { (std::ptr::null(), 0) };
+        let fixed = if inline && !copy_in { p.zc_index.map(|idx| (idx, 0usize)) } else { None };
+        let mut head = capsule_header(&sqe, if copy_in { p.len } else { len });
+        if copy_in {
+            if let Err(e) = ucopy_read_into(self.cfg.cdev_fd, p.ucopy.expect("checked"), p.len, &mut head) {
+                c.free.borrow_mut().push(slot);
+                log::warn!("q{}: reading write data from the ublk request failed: errno {e}", self.qid);
+                if let Some(st) = p.orphan.take() {
+                    st.orphans.fetch_sub(1, Ordering::Relaxed);
+                }
+                p.finish(-libc::EIO);
+                return Ok(());
+            }
+        }
         p.sent = Instant::now();
         p.rx = 0;
         p.h2c_queued = 0;
@@ -932,14 +1570,36 @@ impl Engine {
     /// table itself (here, `untrack` and `fail_conn`), so a panic between
     /// the two cannot leave it off for good (it gates the daemon's drain).
     fn track(&self, c: &QConn, cid: u16, p: Pending) {
+        self.path_bytes(c.path, p.op, p.len as i64);
         c.inflight.borrow_mut().insert(cid, p);
         self.stats.inflight.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Move the device's in-flight byte count of `path` for `op`'s direction.
+    fn path_bytes(&self, path: usize, op: Op, delta: i64) {
+        if delta.unsigned_abs() as usize > SMALL_IO {
+            if let Some(g) = self.gates.get(path) {
+                g.bytes.fetch_add(delta, Ordering::Relaxed);
+            }
+            self.own_bulk.set(if delta > 0 { self.own_bulk.get() + 1 } else { self.own_bulk.get().saturating_sub(1) });
+        }
+        let arr = if op == Op::Write { &self.stats.path_wr_bytes } else { &self.stats.path_rd_bytes };
+        if let Some(b) = arr.get(path) {
+            b.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// The device's payload bytes in flight on `path` in `op`'s direction.
+    fn bytes_on(&self, path: usize, op: Op) -> i64 {
+        let arr = if op == Op::Write { &self.stats.path_wr_bytes } else { &self.stats.path_rd_bytes };
+        arr.get(path).map_or(0, |b| b.load(Ordering::Relaxed))
+    }
+
     fn untrack(&self, c: &QConn, cid: u16) -> Option<Pending> {
         let p = c.inflight.borrow_mut().remove(&cid);
-        if p.is_some() {
+        if let Some(p) = &p {
             self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
+            self.path_bytes(c.path, p.op, -(p.len as i64));
         }
         p
     }
@@ -1024,6 +1684,9 @@ impl Engine {
         // behind in a dead connection's table.
         let mut all = std::mem::take(&mut *c.inflight.borrow_mut());
         self.stats.inflight.fetch_sub(all.len() as i64, Ordering::Relaxed);
+        for p in all.values() {
+            self.path_bytes(c.path, p.op, -(p.len as i64));
+        }
         if let Some(p) = c.rx_direct.get().and_then(|cid| all.remove(&cid)) {
             *c.held.borrow_mut() = Some(p);
         }
@@ -1087,10 +1750,13 @@ impl Engine {
         let mut p = self.untrack(c, cid).expect("checked above");
         panic_point("complete-removed");
         if TRACE_DIR.is_some() {
-            trace_io(c.fd, cid, &p);
+            trace_io(c.fd, cid, c.path, &p);
         }
         self.free_cid(c, cid);
         self.stats.done.fetch_add(1, Ordering::Relaxed);
+        if let Some(b) = self.stats.path_done_bytes.get(c.path) {
+            b.fetch_add(p.len as u64, Ordering::Relaxed);
+        }
         self.stats.wire_ns.fetch_add(p.sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.stats.total_ns.fetch_add(p.first.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let (Some(w), Some(d)) = (p.wired, p.first_data) {
@@ -1099,6 +1765,28 @@ impl Engine {
             self.stats.d2c_ns.fetch_add(d.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if sc == 0 {
+            if p.op == Op::Read && p.len > SMALL_READ_MIN && p.len <= SMALL_IO && c.inflight.borrow().len() <= 1 {
+                if let Some(w) = p.first_data {
+                    let ns = w.elapsed().as_nanos() as u64;
+                    if let Some(e) = self.home_lat.borrow_mut().get_mut(c.path) {
+                        e.0 = if e.0 == 0 { ns.max(1) } else { (e.0 - e.0 / 8 + ns / 8).max(1) };
+                        e.1 += 1;
+                    }
+                    if let (Some(a), Some(n)) = (self.stats.small_rd_lat_ns.get(c.path), self.stats.small_rd_n.get(c.path)) {
+                        a.store(ns, Ordering::Relaxed);
+                        n.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            // Wire round trip of a small command (the hot lane's warm window).
+            if p.len <= SMALL_IO {
+                if let Some(w) = p.wired {
+                    let rtt = p.first_data.unwrap_or_else(Instant::now).saturating_duration_since(w).as_nanos() as u64;
+                    let mut all = self.rtt_all.get();
+                    all.sample(rtt);
+                    self.rtt_all.set(all);
+                }
+            }
             let r = p.ok_res();
             p.finish(r);
         } else if is_path_error(sc) {
@@ -1111,11 +1799,19 @@ impl Engine {
             p.finish(-libc::EIO);
         }
         self.kick_parked();
+        self.kick_throttled();
         Ok(())
     }
 
+    /// Connection slots per path: the bulk connections, plus the small one
+    /// (slot index 0 of the path) with conn_classes.
     fn k(&self) -> usize {
-        self.cfg.conns_per_path.max(1)
+        self.cfg.conns_per_path.max(1) + self.cfg.conn_classes as usize
+    }
+
+    /// Whether slot `slot` is a path's small-class connection.
+    fn small_slot(&self, slot: usize) -> bool {
+        self.cfg.conn_classes && slot % self.k() == 0
     }
 
     fn install(self: &Rc<Self>, slot: usize, epoch: u64, stream: TcpStream, maxh2c: u32, qsize: u16) {
@@ -1293,15 +1989,15 @@ impl Engine {
     async fn write_fixed(&self, c: &Rc<QConn>, idx: u16, off: usize, len: usize) -> bool {
         let mut done = 0usize;
         while done < len {
-            // NVMEUBLK_SEND_ZC (tuning): send the payload with SEND_ZC from
+            // SEND_ZC (see SEND_ZC_MIN): send the payload with SEND_ZC from
             // the request's registered pages (the NIC reads them; no copy
             // into socket buffers). Its completion comes first; a second
             // NOTIF completion follows when the network stack releases the
             // pages, which the event loop swallows. Page lifetime past that
             // point is the kernel's: the registration holds a reference to
             // the ublk request until the last user drops it. WRITE_FIXED
-            // (default) copies the payload into the socket.
-            let sqe = if *SEND_ZC {
+            // copies the payload into the socket.
+            let sqe = if SEND_ZC_MIN.is_some_and(|min| len - done >= min) {
                 io_uring::opcode::SendZc::new(io_uring::types::Fd(c.fd), (off + done) as *const u8, (len - done) as u32)
                     .buf_index(Some(idx))
                     .flags(libc::MSG_NOSIGNAL)
@@ -1538,24 +2234,29 @@ impl Engine {
                 // (a fixed-buffer RECV is refused with EINVAL before 7.x). It
                 // may return short, so loop until the payload is complete.
                 let use_recv = ZC_RECV_MODE.load(Ordering::Relaxed) == 0;
+                // Bounded turn: one chunk inline, or the whole rest on io-wq.
+                let (want, async_rx) = zc_rx_step(len, len - got, *RX_ZC_CHUNK, async_rx_min(*ASYNC_RX_MIN, *SHALLOW_ASYNC_RX, self.shallow.get(), self.large_reads(*SHALLOW_ASYNC_RX)));
                 let sqe = if use_recv {
-                    io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32)
+                    io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, want as u32)
                         .ioprio(IORING_RECVSEND_FIXED_BUF)
                         .buf_group(idx)
                         .flags(libc::MSG_WAITALL)
                         .build()
                 } else {
-                    io_uring::opcode::ReadFixed::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, (len - got) as u32, idx)
+                    io_uring::opcode::ReadFixed::new(io_uring::types::Fd(c.fd), (off + got) as *mut u8, want as u32, idx)
                         .offset(u64::MAX)
                         .build()
                 };
-                // Large payloads (NVMEUBLK_ASYNC_RX_MIN bytes and up, tuning):
-                // hand the copy to an io-wq worker instead of doing it inline
-                // in this queue thread's submit, so the queue keeps turning
-                // (commands out, completions back) while the data lands.
-                let sqe = match *ASYNC_RX_MIN {
-                    min if min > 0 && len - got >= min => sqe.flags(io_uring::squeue::Flags::ASYNC),
-                    _ => sqe,
+                // Large payloads (ASYNC_RX_MIN): hand the copy to an io-wq
+                // worker instead of doing it inline in this queue thread's
+                // task work, so the queue keeps turning (commands out,
+                // completions back) while the data lands. A socket with no
+                // data yet arms a poll, and the retry goes back to io-wq.
+                let sqe = if async_rx {
+                    self.stats.async_rx.fetch_add(1, Ordering::Relaxed);
+                    sqe.flags(io_uring::squeue::Flags::ASYNC)
+                } else {
+                    sqe
                 };
                 // Linked header receive (NVMEUBLK_LINK_HDR, default on with
                 // exact-header receive): the next PDU's common header is read
@@ -1573,10 +2274,13 @@ impl Engine {
                 // socket (the header one could take payload bytes). Make room
                 // for both, or receive the payload alone (the next header is
                 // then read on a later turn, as without LINK_HDR).
-                let linked = use_recv && *LINK_HDR && *RX_EXACT_MIN > 0 && pending.is_none() && sq_room_for(2);
+                // Do not turn a small-PDU staging stream into an endless
+                // header/payload chain after one fragmented small response.
+                // Small reads benefit from staging several PDUs together.
+                let linked = (use_recv || *LINK_READ_FIXED) && *LINK_HDR && *RX_EXACT_MIN > 0 && len >= *RX_EXACT_MIN && pending.is_none() && got + want == len && sq_room_for(2);
                 let r = if linked {
                     let hsqe = io_uring::opcode::Recv::new(io_uring::types::Fd(c.fd), hdr, HDR_PREFETCH as u32).flags(libc::MSG_WAITALL).build();
-                    let mut pf = Box::pin(ublk_submit_sqe_async(sqe.flags(io_uring::squeue::Flags::IO_LINK), UblkUringData::Target as u64));
+                    let mut pf = Box::pin(ublk_submit_sqe_async(sqe.flags(io_uring::squeue::Flags::IO_LINK | if async_rx { io_uring::squeue::Flags::ASYNC } else { io_uring::squeue::Flags::empty() }), UblkUringData::Target as u64));
                     let mut hf: PendingRx = Box::pin(ublk_submit_sqe_async(hsqe, UblkUringData::Target as u64));
                     let first = smol::future::poll_once(&mut pf).await;
                     if let Some(res) = smol::future::poll_once(&mut hf).await {
@@ -1688,6 +2392,7 @@ impl Engine {
     }
 
     fn handle_pdu(&self, c: &QConn, pdu: &[u8]) -> Result<(), String> {
+        self.events.set(self.events.get().wrapping_add(1));
         check_pdu_header(pdu)?;
         let (ptype, flags, hlen, pdo) = (pdu[0], pdu[1], pdu[2] as usize, pdu[3] as usize);
         match ptype {
@@ -1761,6 +2466,7 @@ impl Engine {
                 break;
             }
             self.fault_injection();
+            self.follow_home();
             // Requests dropped unfinished outside an engine task's panic
             // (after one, `task_panicked` recovers them at once).
             self.recover_dropped();
@@ -1768,7 +2474,10 @@ impl Engine {
             // 0 = always connected): after that long without a request the
             // queue drops its I/O connections, so an idle volume holds only
             // its admin connections; submit() reconnects on demand.
-            if self.submitted.get() > 0 || self.inflight_here() > 0 || !self.parked.borrow().is_empty() || !self.fenced.borrow().is_empty() {
+            // The gate's queue moves on bulk completions; the tick is a
+            // safety net (and lets it go once the gate has opened).
+            self.kick_throttled();
+            if self.submitted.get() > 0 || self.inflight_here() > 0 || !self.parked.borrow().is_empty() || !self.throttled.borrow().is_empty() || !self.fenced.borrow().is_empty() {
                 self.last_active.set(Instant::now());
             }
             let want_conns = IDLE_DISCONNECT.is_zero() || self.last_active.get().elapsed() < *IDLE_DISCONNECT;
@@ -1798,7 +2507,7 @@ impl Engine {
             // A failed engine never reconnects: missing connections are not
             // work that needs the fast tick.
             let all_up = self.failed.get() || !want_conns || self.conns.borrow().iter().all(|c| c.is_some());
-            idle = self.submitted.replace(0) == 0 && self.inflight_here() == 0 && self.parked.borrow().is_empty() && self.fenced.borrow().is_empty() && all_up;
+            idle = self.submitted.replace(0) == 0 && self.inflight_here() == 0 && self.parked.borrow().is_empty() && self.throttled.borrow().is_empty() && self.fenced.borrow().is_empty() && all_up;
             if idle {
                 self.set_napi(false);
             }
@@ -1859,7 +2568,7 @@ impl Engine {
                 let mut b = self.backoff.borrow_mut();
                 log::debug!("q{} path {i}: I/O queue connect failed: {e:#}", self.qid);
                 self.next_try.borrow_mut()[i] = Instant::now() + b[i];
-                b[i] = (b[i] * 2).min(Duration::from_secs(2));
+                b[i] = crate::conn::reconnect_backoff(b[i]);
             }
         }
     }
@@ -2002,7 +2711,13 @@ impl Engine {
     ///   logged and fails the engine (`task_panicked`).
     fn spawn_task(self: &Rc<Self>, kind: TaskKind, fut: impl Future<Output = ()> + 'static) {
         self.tasks.set(self.tasks.get() + 1);
-        self.exe.spawn(Guarded { fut: Some(Box::pin(fut)), kind: Some(kind), engine: Rc::downgrade(self) }).detach();
+        let hi = match &kind {
+            TaskKind::Sender(slot) => self.small_slot(*slot),
+            TaskKind::Receiver(c) => self.small_slot(c.slot),
+            _ => false,
+        };
+        let exe = if hi { &self.exe_hi } else { &self.exe };
+        exe.spawn(Guarded { fut: Some(Box::pin(fut)), kind: Some(kind), engine: Rc::downgrade(self) }).detach();
     }
 
     /// An engine task panicked (`msg`): log it loudly and fail the engine.
@@ -2032,7 +2747,7 @@ impl Engine {
                 self.fail_conn(&c, "engine failed", Cause::Retired);
             }
             self.abort_dials();
-            let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
+            let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).chain(self.throttled.borrow_mut().drain(..)).collect();
             for p in parked {
                 p.finish(-libc::EIO);
             }
@@ -2121,7 +2836,7 @@ impl Engine {
         }
         self.abort_dials();
         // The queue is gone: nobody waits on these any more.
-        let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
+        let parked: Vec<Pending> = self.parked.borrow_mut().drain(..).chain(self.throttled.borrow_mut().drain(..)).collect();
         for p in parked {
             p.finish(-libc::EIO);
         }
@@ -2131,13 +2846,13 @@ impl Engine {
         }
         self.recover_dropped(); // closing: they fail with EIO
         if self.napi_on.replace(false) {
-            // As set_napi(false), through the accessor that cannot panic.
-            with_ring(|r| r.submitter().unregister_napi(&mut io_uring::types::Napi::new()));
+            // As set_napi(false); crate::napi never panics.
+            crate::napi::want(false, self.cfg.napi_us);
         }
         self.wake();
         let deadline = Instant::now() + SHUTDOWN_DRAIN;
         loop {
-            while self.exe.try_tick() {}
+            while self.exe_hi.try_tick() || self.exe.try_tick() {}
             if self.tasks.get() == 0 {
                 return;
             }
@@ -2149,9 +2864,43 @@ impl Engine {
         }
     }
 
+    /// Reads of at least `min` bytes (> 0) in flight on this engine.
+    fn large_reads(&self, min: usize) -> usize {
+        if min == 0 {
+            return 0;
+        }
+        self.conns.borrow().iter().flatten().map(|c| c.inflight.borrow().values().filter(|p| p.op == Op::Read && p.len >= min).count()).sum()
+    }
+
+    /// NVMEUBLK_SMALL_HOME: at most once a second, move the lane's home path
+    /// for multi-segment small reads (`choose_home`).
+    fn follow_home(&self) {
+        if !*SMALL_HOME || self.home_checked.get().elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.home_checked.set(Instant::now());
+        if self.home_moved.get().is_some_and(|t| t.elapsed() < HOME_HOLD) {
+            return;
+        }
+        let n_paths = self.ctrls.paths.len().clamp(1, MAX_PATHS);
+        let hl = *self.home_lat.borrow();
+        let lat: Vec<u64> = hl.iter().take(n_paths).map(|e| e.0).collect();
+        let n: Vec<u64> = hl.iter().take(n_paths).map(|e| e.1).collect();
+        // Samples are low-depth ones, i.e. of requests dispatched on the
+        // device's lane path (`lane_eid` with nothing in flight).
+        let base = path_rank_key(tie_eid(self.qid, 0), n_paths, self.cfg.path_offset);
+        let home = (base + self.home_shift.get()) % n_paths;
+        let next = choose_home(home, &lat, &n, 8);
+        if next != home {
+            log::info!("q{}: small-read home path {home} -> {next} (latency {:?} us)", self.qid, lat.iter().map(|l| l / 1000).collect::<Vec<_>>());
+            self.home_shift.set((next + n_paths - base % n_paths) % n_paths);
+            self.home_moved.set(Some(Instant::now()));
+        }
+    }
+
     fn expire_parked(&self) {
         if self.draining.load(Ordering::Acquire) {
-            let all: Vec<Pending> = self.parked.borrow_mut().drain(..).collect();
+            let all: Vec<Pending> = self.parked.borrow_mut().drain(..).chain(self.throttled.borrow_mut().drain(..)).collect();
             for p in all {
                 p.finish(-libc::EIO);
             }
@@ -2213,15 +2962,7 @@ impl Engine {
     fn fault_injection(&self) {
         let dir = &self.cfg.fault_dir;
         let path = format!("{dir}/fault.q{}", self.qid);
-        let global = format!("{dir}/fault");
-        if let Ok(cmd) = std::fs::read_to_string(&global) {
-            // Fan the command out to one file per queue, then drop the original.
-            let n = std::fs::read_to_string(format!("{dir}/queues")).ok().and_then(|s| s.trim().parse::<u16>().ok()).unwrap_or(1);
-            for q in 0..n {
-                let _ = std::fs::write(format!("{dir}/fault.q{q}"), &cmd);
-            }
-            let _ = std::fs::remove_file(&global);
-        }
+        fanout_fault(dir, self.qid);
         let Ok(cmd) = std::fs::read_to_string(&path) else { return };
         let _ = std::fs::remove_file(&path);
         if cmd.trim() == "panic" {
@@ -2231,6 +2972,12 @@ impl Engine {
         }
         let mut it = cmd.split_whitespace();
         let (Some(verb), Some(Ok(i))) = (it.next(), it.next().map(str::parse::<usize>)) else { return };
+        if verb == "wedge" {
+            // Not the engine's to do: its queue thread stops turning for
+            // `i` ms (batch hot lane: only the queue's primary does).
+            self.wedge.set(Some(Duration::from_millis(i as u64)));
+            return;
+        }
         let targets: Vec<Rc<QConn>> = self.conns.borrow().iter().flatten().filter(|c| c.path == i).cloned().collect();
         for c in targets {
             match verb {
@@ -2442,6 +3189,12 @@ fn reap_ring(wait: Duration) -> Option<()> {
         r.completion().collect()
     })?;
     for cqe in cqes {
+        // A batch queue's CQE (on a reactor ring shared with other devices'
+        // queues, or this queue's own) goes back to the ring's loop.
+        if libublk::io::batch_cqe_key(cqe.user_data()).is_some() {
+            libublk::io::defer_queue_cqe(cqe);
+            continue;
+        }
         // Only our own SQEs (Target bit); a SEND_ZC buffer-release notice
         // carries a future key that already completed (see the queue loop).
         if cqe.user_data() & UblkUringData::Target as u64 != 0 && !io_uring::cqueue::notif(cqe.flags()) {
@@ -2480,6 +3233,12 @@ mod tests {
         /// Connections of any kind (admin, I/O, dials that never sent a
         /// Connect) that have since closed.
         closed: usize,
+        /// Reads answered on I/O queues.
+        reads: usize,
+        /// (I/O queue id, bytes) of every read answered.
+        read_qids: Vec<(u16, usize)>,
+        /// In-capsule data of every write received.
+        writes: Vec<Vec<u8>>,
     }
 
     #[derive(Default)]
@@ -2494,6 +3253,10 @@ mod tests {
         /// accept queue: a further connect stays in SYN_SENT (its SYN is
         /// dropped) until the dialler gives up.
         accept_only: Option<usize>,
+        /// Wait this long before answering each I/O command (a slow path).
+        io_delay: Duration,
+        /// Identify ioccsz (16-byte units); 0 or up to 4 = no in-capsule data.
+        ioccsz: u32,
     }
 
     struct Target {
@@ -2561,6 +3324,7 @@ mod tests {
     /// One connection: ICReq, then command capsules until the host closes.
     fn serve(mut s: TcpStream, seen: &Mutex<Seen>, hold: &AtomicBool, cfg: &TargetCfg) {
         let mut io_queue = false;
+        let mut my_qid = 0u16;
         let _ = (|| -> std::io::Result<()> {
             let mut icreq = [0u8; 128];
             s.read_exact(&mut icreq)?;
@@ -2586,6 +3350,7 @@ mod tests {
                             resp(cid, 1) // admin: cntlid 1
                         } else {
                             io_queue = true;
+                            my_qid = qid;
                             seen.lock().unwrap().io_connects.push((qid, u16::from_le_bytes([data[16], data[17]]), u16_at(44)));
                             if cfg.hang_io_connect {
                                 continue;
@@ -2599,7 +3364,8 @@ mod tests {
                     (OPC_ADMIN_IDENTIFY, false) => {
                         let mut id = vec![0u8; 4096];
                         if sqe[40] == 1 {
-                            id[1792..1796].copy_from_slice(&4u32.to_le_bytes()); // ioccsz: no in-capsule data
+                            // ioccsz (16-byte units): 4 = no in-capsule data
+                            id[1792..1796].copy_from_slice(&cfg.ioccsz.max(4).to_le_bytes());
                         } else {
                             id[0..8].copy_from_slice(&2048u64.to_le_bytes()); // nsze
                             id[104..120].copy_from_slice(&[1; 16]); // nguid
@@ -2608,9 +3374,19 @@ mod tests {
                         c2h(cid, &id)
                     }
                     (_, true) if hold.load(Ordering::Acquire) => continue,
+                    (OPC_WRITE, true) if !data.is_empty() => {
+                        seen.lock().unwrap().writes.push(data.to_vec());
+                        resp(cid, 0)
+                    }
                     (OPC_READ, true) => {
+                        std::thread::sleep(cfg.io_delay);
                         let slba = u64::from_le_bytes(sqe[40..48].try_into().unwrap());
                         let nlb = u32::from_le_bytes(sqe[48..52].try_into().unwrap()) as usize + 1;
+                        {
+                            let mut sn = seen.lock().unwrap();
+                            sn.reads += 1;
+                            sn.read_qids.push((my_qid, nlb * 512));
+                        }
                         c2h(cid, &pattern(slba, nlb * 512))
                     }
                     _ => resp(cid, 0), // Property Set, keep-alive, flush
@@ -2702,8 +3478,22 @@ mod tests {
     }
 
     fn rig(t: &Target, name: &str, write_fence: Duration) -> Rig {
+        rig_paths(&[t], name, write_fence)
+    }
+
+    /// A rig whose device has one path per target, in this order.
+    fn rig_paths(ts: &[&Target], name: &str, write_fence: Duration) -> Rig {
+        rig_with(ts, name, write_fence, |_| {})
+    }
+
+    fn rig_with(ts: &[&Target], name: &str, write_fence: Duration, tweak: impl FnOnce(&mut QConfig)) -> Rig {
+        rig_eid(ts, name, write_fence, 0, tweak)
+    }
+
+    /// As `rig_with`, for engine `eid` of its device.
+    fn rig_eid(ts: &[&Target], name: &str, write_fence: Duration, eid: u16, tweak: impl FnOnce(&mut QConfig)) -> Rig {
         let id = Ident { hostnqn: "nqn.2014-08.org.nvmexpress:uuid:test".into(), hostid: [7; 16], subnqn: "nqn.test:sub".into() };
-        let ctrls = Ctrls::new(vec![t.addr], id, Duration::from_secs(15)).unwrap();
+        let ctrls = Ctrls::new(ts.iter().map(|t| t.addr).collect(), id, Duration::from_secs(15)).unwrap();
         let fault_dir = std::env::temp_dir().join(format!("nvmeublk-qengine-{}-{name}", std::process::id())).to_string_lossy().into_owned();
         let _ = std::fs::create_dir_all(&fault_dir);
         let cfg = QConfig {
@@ -2715,14 +3505,18 @@ mod tests {
             rx_offload: 0,
             cdev_fd: -1,
             conns_per_path: 1,
+            conn_classes: false,
             rx_chunk: RX_CHUNK_DEFAULT,
             napi_us: 0,
             fault_dir: fault_dir.clone(),
             quiesce: Arc::new(AtomicBool::new(false)),
+            path_offset: 0,
         };
+        let mut cfg = cfg;
+        tweak(&mut cfg);
         let exe = Rc::new(smol::LocalExecutor::new());
         let stats = Arc::new(Stats::default());
-        let e = QEngine::new(0, ctrls.clone(), cfg, exe.clone(), stats.clone(), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let e = QEngine::new(eid, ctrls.clone(), cfg, exe.clone(), stats.clone(), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         Rig { e, exe, stats, ctrls, _dir: TempDir(fault_dir.clone()), fault_dir }
     }
 
@@ -2741,9 +3535,493 @@ mod tests {
         (rx, tx)
     }
 
+    /// L2: small reads at QD1 go to the path with the lower round trip.
+    /// Path 0 answers every I/O 3 ms late; path 1 at once. Least-outstanding
+    /// choice (the previous rule) puts every QD1 read on path 0, the first
+    /// live connection; latency-aware choice moves them to path 1 once both
+    /// are sampled, and still probes path 0 now and then.
+    /// Bounded turns (L4): payloads below the async threshold are received
+    /// inline in chunks of at most RX_ZC_CHUNK; large ones go whole to io-wq.
+    #[test]
+    fn zero_copy_receive_steps_are_bounded() {
+        let (k64, k256) = (64 * 1024, 256 * 1024);
+        assert_eq!(zc_rx_step(128 * 1024, 128 * 1024, k64, k256), (k64, false));
+        assert_eq!(zc_rx_step(128 * 1024, 10_000, k64, k256), (10_000, false));
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, k64, k256), (1 << 20, true));
+        assert_eq!(zc_rx_step(1 << 20, 4096, k64, k256), (4096, true), "async follows the PDU, not what is left");
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, k64, 0), (k64, false), "async off: still chunked");
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 0, 0), (1 << 20, false), "both off: the old unbounded receive");
+        // The defaults: 64 KiB inline chunks; io-wq receive off (measured slower).
+        if std::env::var_os("NVMEUBLK_RX_ZC_CHUNK").is_none() && std::env::var_os("NVMEUBLK_ASYNC_RX_MIN").is_none() {
+            assert_eq!((*RX_ZC_CHUNK, *ASYNC_RX_MIN), (k64, 0));
+        }
+    }
+
+    #[test]
+    fn fault_publication_is_complete_before_visible() {
+        let path = std::env::temp_dir().join(format!("nvmeublk-publish-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let cmd = "wedge 5000\n".repeat(1 << 18);
+        for _ in 0..8 {
+            std::fs::write(path, "old").unwrap();
+            let done = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    publish_fault(path, &cmd).unwrap();
+                    done.store(true, Ordering::Release);
+                });
+                while !done.load(Ordering::Acquire) {
+                    let visible = std::fs::read_to_string(path).unwrap();
+                    assert!(visible == "old" || visible == cmd, "partially published command");
+                }
+                worker.join().unwrap();
+            });
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wedge_targets_the_issue_time_primaries_once() {
+        let dir = std::env::temp_dir().join(format!("nvmeublk-wedge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        std::fs::write(format!("{dir}/queues"), "4").unwrap();
+        let primary = Arc::new(AtomicU16::new(0));
+        WEDGE_PRIMARIES.lock().unwrap().insert((dir.into(), 0), vec![(Arc::downgrade(&primary), 0)]);
+        WEDGE_PRIMARIES.lock().unwrap().insert((dir.into(), 1), vec![(Arc::downgrade(&primary), 1)]);
+        let mut writer = std::fs::File::create(format!("{dir}/fault")).unwrap();
+        fanout_fault(dir, 3);
+        assert!(std::path::Path::new(&format!("{dir}/fault.claimed.3")).exists());
+        writer.write_all(b"wedge 5000").unwrap();
+        std::thread::scope(|s| {
+            for q in 0..4 { s.spawn(move || fanout_fault(dir, q)); }
+        });
+        assert_eq!(std::fs::read_to_string(format!("{dir}/fault.q0")).unwrap(), "wedge 5000");
+        std::fs::remove_file(format!("{dir}/fault.q0")).unwrap();
+        // A promoted replacement must not inherit a pending copy, and a
+        // second fanout attempt must not recreate a consumed victim's copy.
+        primary.store(1, Ordering::Release);
+        fanout_fault(dir, 1);
+        for q in 0..4 { assert!(!std::path::Path::new(&format!("{dir}/fault.q{q}")).exists()); }
+        // A second wedge uses the new primary even while the old reactor
+        // is still stalled and has not acknowledged its role change.
+        std::fs::write(format!("{dir}/fault"), "wedge 1000").unwrap();
+        fanout_fault(dir, 2);
+        assert!(!std::path::Path::new(&format!("{dir}/fault.q0")).exists());
+        assert_eq!(std::fs::read_to_string(format!("{dir}/fault.q1")).unwrap(), "wedge 1000");
+        std::fs::write(format!("{dir}/fault"), "kill 0").unwrap();
+        fanout_fault(dir, 2);
+        for q in 0..4 { assert_eq!(std::fs::read_to_string(format!("{dir}/fault.q{q}")).unwrap(), "kill 0"); }
+        WEDGE_PRIMARIES.lock().unwrap().retain(|(d, _), _| d != dir);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn send_zc_is_on_for_large_payloads_by_default() {
+        assert_eq!(send_zc_min(None, None), Some(64 * 1024));
+        assert_eq!(send_zc_min(None, Some(4096)), Some(4096));
+        assert_eq!(send_zc_min(Some("1"), None), Some(0));
+        assert_eq!(send_zc_min(Some("0"), Some(4096)), None);
+        assert_eq!(send_zc_min(Some(""), None), Some(64 * 1024));
+    }
+
+    /// Bulk admission gate (crate::gate): while small commands are being
+    /// served, a path admits bulk commands only up to the cap (the rest wait
+    /// in order and go out as completions make room; all complete); with the
+    /// gate open (no recent small command) they all go at once.
+    #[test]
+    fn the_bulk_gate_holds_bulk_commands_beyond_the_cap() {
+        for (closed, want_on_wire) in [(true, 2usize), (false, 4)] {
+            let t = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(300), ..Default::default() }).unwrap();
+            on_ring_thread(move || {
+                crate::gate::TEST_CONFIG.with(|c| c.set(Some((256 * 1024, if closed { Duration::from_secs(3600) } else { Duration::ZERO }))));
+                crate::gate::note_small();
+                let r = rig(&t, if closed { "gate-closed" } else { "gate-open" }, Duration::from_secs(20));
+                r.e.start();
+                assert!(drive_until(&r.exe, Duration::from_secs(10), || !r.e.core.live().is_empty()), "connection up");
+                let mut bufs: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 128 * 1024]).collect();
+                let rxs: Vec<Receiver<i32>> = bufs.iter_mut().map(|b| request(&r.e, Op::Read, b)).collect();
+                drive_until(&r.exe, Duration::from_millis(50), || false);
+                assert_eq!(r.e.inflight_here(), want_on_wire, "closed={closed}: on the wire");
+                assert_eq!(r.e.core.throttled.borrow().len(), 4 - want_on_wire, "closed={closed}: waiting at the gate");
+                assert!(drive_until(&r.exe, Duration::from_secs(10), || rxs.iter().all(|rx| !rx.is_empty())), "all complete");
+                for rx in &rxs {
+                    assert_eq!(rx.try_recv().unwrap(), 128 * 1024);
+                }
+                assert_eq!(r.stats.gate_waits.load(Ordering::Relaxed), (4 - want_on_wire) as u64);
+                assert_eq!(r.e.core.gates[0].bytes.load(Ordering::Relaxed), 0, "gate bytes back to zero");
+                assert_eq!(r.e.core.own_bulk.get(), 0);
+                drop(r);
+            });
+        }
+    }
+
+    /// A shared engine is shallow only while none of its tenancies is in
+    /// depth mode (SHALLOW_ASYNC_RX follows the deepest lane on it).
+    #[test]
+    fn a_shared_engine_is_shallow_while_no_lane_is_deep() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "lanes", Duration::from_secs(20));
+            let e = &r.e;
+            e.note_lane_deep(false, false);
+            assert!(e.core.shallow.get());
+            e.note_lane_deep(false, true);
+            e.note_lane_deep(false, true);
+            assert!(!e.core.shallow.get());
+            e.note_lane_deep(true, false);
+            assert!(!e.core.shallow.get(), "one lane still deep");
+            e.note_lane_deep(false, false);
+            assert!(!e.core.shallow.get(), "a shallow lane reporting again changes nothing");
+            e.note_lane_deep(true, false);
+            assert!(e.core.shallow.get());
+        });
+    }
+
+    /// Connection classes (L5): small commands go on each path's small
+    /// connection and large ones on the bulk connection, and the small
+    /// connection's tasks run on the priority executor (a 4k read completes
+    /// only when the queue thread ticks it).
+    #[test]
+    fn small_and_bulk_commands_use_separate_connections() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let seen = t.seen.clone();
+        on_ring_thread(move || {
+            let r = rig_with(&[&t], "classes", Duration::from_secs(20), |c| c.conn_classes = true);
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || {
+                r.e.tick_priority();
+                r.e.core.live().len() == 2
+            }), "small and bulk connections should come up");
+            let (mut small, mut big) = (vec![0u8; 4096], vec![0u8; 128 * 1024]);
+            // Without the priority executor turning, the 4k read cannot
+            // complete, while a 128k read (bulk class) does.
+            let rx = request(&r.e, Op::Read, &mut small);
+            let rb = request(&r.e, Op::Read, &mut big);
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || !rb.is_empty()), "the bulk read should complete on the main executor");
+            assert!(!drive_until(&r.exe, Duration::from_millis(300), || !rx.is_empty()), "the small read must be served by the priority executor");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                r.e.tick_priority();
+                !rx.is_empty()
+            }));
+            for _ in 0..10 {
+                for buf in [&mut small, &mut big] {
+                    let rx = request(&r.e, Op::Read, buf);
+                    assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                        r.e.tick_priority();
+                        !rx.is_empty()
+                    }));
+                }
+            }
+        });
+        let seen = seen.lock().unwrap();
+        let qid_of = |bytes: usize| seen.read_qids.iter().filter(|(_, b)| *b == bytes).map(|(q, _)| *q).collect::<std::collections::BTreeSet<u16>>();
+        assert_eq!(qid_of(4096).into_iter().collect::<Vec<_>>(), vec![1], "4k reads on the small connection (qid 1): {:?}", seen.read_qids);
+        assert_eq!(qid_of(128 * 1024).into_iter().collect::<Vec<_>>(), vec![2], "128k reads on the bulk connection (qid 2): {:?}", seen.read_qids);
+    }
+
+    /// A turn's small commands leave in one sendmsg: the tag tasks all run
+    /// (each dispatches its request) before the small class's sender does.
+    /// Ticking the priority executor after every tag task sent each command
+    /// on its own (one sendmsg per I/O at depth).
+    #[test]
+    fn a_turns_small_commands_share_one_send() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig_with(&[&t], "turn-batch", Duration::from_secs(20), |c| c.conn_classes = true);
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || {
+                r.e.tick_priority();
+                r.e.core.live().len() == 2
+            }), "small and bulk connections should come up");
+            let tags = smol::LocalExecutor::new();
+            let mut bufs: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 4096]).collect();
+            let mut rxs = Vec::new();
+            let e = r.e.clone();
+            let tasks: Vec<_> = bufs
+                .iter_mut()
+                .map(|b| {
+                    let (tx, rx) = smol::channel::bounded(1);
+                    rxs.push(rx);
+                    let (e, ptr, len) = (e.clone(), b.as_mut_ptr(), b.len());
+                    tags.spawn(async move { e.submit(Pending::new(Op::Read, 8, (len / 512) as u32, ptr, len, tx, None, None)) })
+                })
+                .collect();
+            let sends0 = r.stats.wv_n.load(Ordering::Relaxed);
+            r.e.run_turn(&tags, &r.exe);
+            assert!(tasks.iter().all(|t| t.is_finished()));
+            assert_eq!(r.stats.wv_n.load(Ordering::Relaxed) - sends0, 1, "eight 4k reads dispatched in one turn go out in one sendmsg");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                r.e.run_turn(&tags, &r.exe);
+                rxs.iter().all(|rx| !rx.is_empty())
+            }), "all eight complete");
+        });
+    }
+
+    /// Zero copy with USER_COPY: a turn's in-capsule writes carry their data
+    /// in the capsule, copied out of the request (pread at its USER_COPY
+    /// position; a plain file stands in for /dev/ublkcN), and leave in one
+    /// sendmsg. They went out from the registered pages (WRITE_FIXED) before,
+    /// a second send per write that no test ring has buffers for.
+    #[test]
+    fn in_capsule_writes_carry_their_data_and_share_one_send() {
+        let t = Target::start("127.0.0.1:0", TargetCfg { ioccsz: (8192 + 64) / 16, ..Default::default() }).unwrap();
+        let seen = t.seen.clone();
+        let path = std::env::temp_dir().join(format!("nvmeublk-ucopy-{}", std::process::id()));
+        let pos0 = 1u64 << 20;
+        let want: Vec<Vec<u8>> = (0..6u8).map(|i| (0..4096).map(|b| (b as u8).wrapping_mul(7).wrapping_add(i * 31)).collect()).collect();
+        {
+            use std::io::{Seek, Write};
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.seek(std::io::SeekFrom::Start(pos0)).unwrap();
+            for w in &want {
+                f.write_all(w).unwrap();
+            }
+        }
+        let file = std::fs::File::open(&path).unwrap();
+        let fd = file.as_raw_fd();
+        on_ring_thread(move || {
+            let r = rig_with(&[&t], "inline-copy", Duration::from_secs(20), |c| c.cdev_fd = fd);
+            assert_eq!(r.ctrls.info.incapsule_bytes, 8192);
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 1), "connection should come up");
+            let tags = smol::LocalExecutor::new();
+            let mut rxs = Vec::new();
+            let tasks: Vec<_> = (0..6u16)
+                .map(|i| {
+                    let (tx, rx) = smol::channel::bounded(1);
+                    rxs.push(rx);
+                    let e = r.e.clone();
+                    tags.spawn(async move { e.submit(Pending::new(Op::Write, 8 + i as u64 * 8, 8, std::ptr::null_mut(), 4096, tx, Some(pos0 + i as u64 * 4096), Some(i))) })
+                })
+                .collect();
+            let sends0 = r.stats.wv_n.load(Ordering::Relaxed);
+            r.e.run_turn(&tags, &r.exe);
+            assert!(tasks.iter().all(|t| t.is_finished()));
+            assert_eq!(r.stats.wv_n.load(Ordering::Relaxed) - sends0, 1, "six 4k writes in one sendmsg");
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || {
+                r.e.run_turn(&tags, &r.exe);
+                rxs.iter().all(|rx| !rx.is_empty())
+            }));
+            assert!(rxs.iter().all(|rx| rx.try_recv() == Ok(4096)), "every write succeeds");
+        });
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        let got = seen.lock().unwrap().writes.clone();
+        assert_eq!(got, want, "the target got each request's data in its capsule");
+    }
+
+    /// Path choice ignores round trip (L2 removed): at QD1 small reads, like
+    /// large ones, go to the first live connection whatever its round trip,
+    /// so a low-depth stream stays on one warm connection.
+    /// A lane moves its home path only on a clear, well-sampled gap in
+    /// multi-segment small-read latency (s1: ~75 µs on the ixgbevf paths).
+    #[test]
+    fn the_small_read_home_moves_only_on_a_clear_gap() {
+        let us = |v: &[u64]| v.iter().map(|x| x * 1000).collect::<Vec<_>>();
+        let n = [100u64; 4];
+        assert_eq!(choose_home(2, &us(&[190, 195, 265, 270]), &n, 16), 0, "ixgbevf home, bnx2x 75 us faster");
+        assert_eq!(choose_home(0, &us(&[190, 195, 265, 270]), &n, 16), 0, "already on the fastest");
+        assert_eq!(choose_home(2, &us(&[190, 195, 215, 270]), &n, 16), 2, "a 25 us gap is not enough");
+        assert_eq!(choose_home(2, &us(&[95, 100, 120, 125]), &n, 16), 2, "26% but only 25 us: not enough");
+        assert_eq!(choose_home(2, &us(&[500, 520, 560, 580]), &n, 16), 2, "under 20% is not enough");
+        assert_eq!(choose_home(2, &us(&[190, 0, 265, 270]), &n, 16), 0);
+        assert_eq!(choose_home(2, &us(&[190, 195, 265, 270]), &[10, 10, 100, 100], 16), 2, "too few samples on the faster paths");
+        assert_eq!(choose_home(2, &us(&[190, 195, 265, 270]), &[100, 100, 0, 100], 16), 2, "no samples on the home path: keep it");
+    }
+
+    /// Large payloads go to io-wq only while the lane is shallow (g2: a win
+    /// at 1M 4:1, a loss and 25% more CPU at depth), unless ASYNC_RX_MIN
+    /// asks for it everywhere.
+    #[test]
+    fn shallow_reads_default_to_inline_receive() {
+        if std::env::var_os("NVMEUBLK_SHALLOW_ASYNC_RX").is_none() {
+            assert_eq!(*SHALLOW_ASYNC_RX, 0, "extra worker round trips cost shallow bulk CPU");
+        }
+    }
+
+    #[test]
+    fn io_wq_receive_only_while_shallow() {
+        let k256 = 256 * 1024;
+        assert_eq!(async_rx_min(0, k256, true, 2), k256);
+        assert_eq!(async_rx_min(0, k256, true, 1), 0, "a lone large read stays inline");
+        assert_eq!(async_rx_min(0, k256, false, 4), 0, "depth mode: inline");
+        assert_eq!(async_rx_min(0, 0, true, 4), 0, "off");
+        assert_eq!(async_rx_min(k256, 0, false, 0), k256, "the global setting still applies everywhere");
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 64 * 1024, async_rx_min(0, k256, true, 4)), (1 << 20, true));
+        assert_eq!(zc_rx_step(1 << 20, 1 << 20, 64 * 1024, async_rx_min(0, k256, false, 4)), (64 * 1024, false));
+    }
+
+    #[test]
+    fn reads_ignore_path_rtt() {
+        let slow = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(3), ..Default::default() }).unwrap();
+        let fast = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let (slow_seen, fast_seen) = (slow.seen.clone(), fast.seen.clone());
+        on_ring_thread(move || {
+            let r = rig_paths(&[&slow, &fast], "lat-path-large", Duration::from_secs(20));
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
+            let mut small = vec![0u8; 4096];
+            for _ in 0..20 {
+                let rx = request(&r.e, Op::Read, &mut small);
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || rx.try_recv().is_ok()));
+            }
+            let mut buf = vec![0u8; 64 * 1024];
+            for _ in 0..10 {
+                let rx = request(&r.e, Op::Read, &mut buf);
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || rx.try_recv().is_ok()));
+            }
+        });
+        let (s, f) = (slow_seen.lock().unwrap().reads, fast_seen.lock().unwrap().reads);
+        assert_eq!((s, f), (30, 0), "every read on the first live connection");
+    }
+
+    /// The idle-device lane path is on by default (QD1/CPU round, q1a).
+    #[test]
+    fn the_lane_path_is_the_default() {
+        assert!(LANE_PATH_BY_DEFAULT);
+    }
+
+    #[test]
+    fn an_idle_device_uses_its_lane_path_whatever_the_engine() {
+        let pref = |eid: u16, inflight: i64, off: usize| (0..4).find(|&p| path_rank(p, path_rank_key(lane_eid(eid, inflight), 4, off), 4) == 0).unwrap();
+        assert_eq!((0..8).map(|e| pref(e, 0, 0)).collect::<Vec<_>>(), vec![0; 8], "nothing in flight: every engine prefers the lane path");
+        assert_eq!((0..8).map(|e| pref(e, 0, 2)).collect::<Vec<_>>(), vec![2; 8], "the lane path follows the device offset");
+        assert_eq!((0..8).map(|e| pref(e, 1, 0)).collect::<Vec<_>>(), vec![0, 1, 2, 3, 1, 2, 3, 0], "commands in flight: the engine's own");
+    }
+
+    #[test]
+    fn path_rank_rotates_by_engine() {
+        assert_eq!((0..4).map(|p| path_rank(p, 0, 4)).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!((0..4).map(|p| path_rank(p, 1, 4)).collect::<Vec<_>>(), vec![3, 0, 1, 2], "engine 1 prefers path 1");
+        assert_eq!((0..4).map(|p| path_rank(p, 6, 4)).collect::<Vec<_>>(), vec![2, 3, 0, 1], "key 6 prefers path 2");
+        assert_eq!(path_rank(0, 5, 1), 0);
+        assert_eq!(path_rank(1, 3, 0), 0, "no paths: no panic");
+        // Keys: the primaries of queues 0 and 1 (engines 0 and 4 at 4 threads
+        // per queue) and of devices 0 and 1 prefer different paths.
+        let pref = |eid: u16, off: usize| (0..4).find(|&p| path_rank(p, path_rank_key(eid, 4, off), 4) == 0).unwrap();
+        assert_eq!((pref(0, 0), pref(4, 0)), (0, 1));
+        assert_eq!((0..8).map(|e| pref(e, 0)).collect::<Vec<_>>(), vec![0, 1, 2, 3, 1, 2, 3, 0], "every path twice over 8 engines");
+        assert_eq!((pref(0, 1), pref(0, 2), pref(0, 7)), (1, 2, 3), "device offset");
+    }
+
+    /// Ties between paths go to the device's lane path while the device has
+    /// nothing in flight (`lane_eid`): engine 1's QD1 stream stays on path 0,
+    /// as engine 0's would (it went to engine 1's own first path, so a QD1
+    /// stream's path followed whichever engine served it). With commands in
+    /// flight, ties go to the engine's own first path (eid % paths), not to
+    /// path 0 in every engine. And bulk commands take no batch affinity: two
+    /// bulk reads dispatched in one turn go to two paths (affinity put both
+    /// on the path whose sender had not run yet): the first, on an idle
+    /// device, to the lane path, the second to the other.
+    #[test]
+    fn ties_rotate_by_engine_and_bulk_spreads_within_a_turn() {
+        let a = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let b = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        let (a_seen, b_seen) = (a.seen.clone(), b.seen.clone());
+        on_ring_thread(move || {
+            FORCE_LANE_PATH.with(|f| f.set(true));
+            let r = rig_eid(&[&a, &b], "rotate", Duration::from_secs(20), 1, |_| {});
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
+            let mut small = vec![0u8; 4096];
+            for _ in 0..10 {
+                let rx = request(&r.e, Op::Read, &mut small);
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || rx.try_recv().is_ok()));
+            }
+            let (mut b1, mut b2) = (vec![0u8; 128 * 1024], vec![0u8; 128 * 1024]);
+            for _ in 0..5 {
+                // Both submitted before the executor turns: one turn.
+                let (r1, r2) = (request(&r.e, Op::Read, &mut b1), request(&r.e, Op::Read, &mut b2));
+                assert!(drive_until(&r.exe, Duration::from_secs(5), || !r1.is_empty() && !r2.is_empty()));
+            }
+        });
+        let (sa, sb) = (a_seen.lock().unwrap().reads, b_seen.lock().unwrap().reads);
+        assert_eq!((sa, sb), (15, 5), "10 small QD1 reads on the device's lane path (0), bulk pairs split 5/5");
+    }
+
+    /// Byte balance (L6): among this engine's least loaded connections a
+    /// bulk command takes the path with the fewest bytes in flight over the
+    /// device; the count rule took the first path in order.
+    #[test]
+    fn bulk_reads_break_ties_by_device_bytes() {
+        let a = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(1500), ..Default::default() }).unwrap();
+        let b = Target::start("127.0.0.1:0", TargetCfg { io_delay: Duration::from_millis(1500), ..Default::default() }).unwrap();
+        on_ring_thread(move || {
+            FORCE_BYTE_PATH.with(|f| f.set(true));
+            assert!(!*BYTE_PATH || std::env::var_os("NVMEUBLK_BYTE_PATH").is_some(), "off by default");
+            let r = rig_paths(&[&a, &b], "byte-path", Duration::from_secs(20));
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || r.e.core.live().len() == 2), "both paths should connect");
+            let per_path = || -> Vec<usize> {
+                (0..2).map(|path| r.e.core.live().iter().filter(|c| c.path == path).map(|c| c.inflight.borrow().values().map(|p| p.len).sum::<usize>()).sum()).collect()
+            };
+            // Another engine of the device has 8 MiB on path 0: this
+            // engine's first bulk read goes to path 1, though both of its
+            // connections are empty.
+            r.stats.path_rd_bytes[0].fetch_add(8 << 20, Ordering::Relaxed);
+            let mut bufs: Vec<Vec<u8>> = vec![vec![0u8; 128 * 1024], vec![0u8; 1 << 20], vec![0u8; 128 * 1024], vec![0u8; 128 * 1024]];
+            let mut it = bufs.iter_mut();
+            let mut rxs = vec![request(&r.e, Op::Read, it.next().unwrap())];
+            drive_until(&r.exe, Duration::from_millis(20), || false);
+            assert_eq!(per_path(), vec![0, 128 * 1024], "device bytes break the tie");
+            r.stats.path_rd_bytes[0].fetch_sub(8 << 20, Ordering::Relaxed);
+            // Now the count leads: the 1 MiB read goes to the empty path 0;
+            // then both hold one command, and the 128k read goes to path 1
+            // (fewer bytes), and the last one to path 0 (fewer commands).
+            for buf in it {
+                rxs.push(request(&r.e, Op::Read, buf));
+                drive_until(&r.exe, Duration::from_millis(20), || false);
+            }
+            assert_eq!(per_path(), vec![(1 << 20) + 128 * 1024, 2 * 128 * 1024]);
+            assert_eq!(r.stats.path_rd_bytes[1].load(Ordering::Relaxed), 2 * 128 * 1024);
+            for rx in rxs {
+                assert!(drive_until(&r.exe, Duration::from_secs(10), || !rx.is_empty()));
+            }
+            assert_eq!(r.stats.path_rd_bytes[0].load(Ordering::Relaxed) + r.stats.path_rd_bytes[1].load(Ordering::Relaxed), 0, "counters return to zero");
+        });
+    }
+
+    #[test]
+    fn wire_rtt_ewma() {
+        let mut r = PathRtt::default();
+        r.sample(100_000);
+        assert_eq!(r.ewma_ns, 100_000);
+        r.sample(20_000);
+        assert_eq!(r.ewma_ns, 100_000 - 12_500 + 2_500);
+    }
+
     /// Q5: the I/O queue is dialled, handshaken and connected by SQEs on the
     /// queue's ring. The target holds each ICResp for 300 ms, so a connect
     /// thread (the old way) would be seen.
+    #[test]
+    fn queue_frontend_observes_draining_before_fetches_abort() {
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "drain-signal", Duration::from_secs(1));
+            assert!(!r.e.draining());
+            r.e.core.draining.store(true, Ordering::Release);
+            assert!(r.e.draining());
+            assert!(!r.e.core.stop.load(Ordering::Acquire));
+            r.ctrls.shutdown();
+        });
+    }
+
+    #[test]
+    fn default_handshake_budget_rejects_a_slow_peer() {
+        let t = Target::start("127.0.0.1:0", TargetCfg { hang_io_connect: true, ..Default::default() }).unwrap();
+        on_ring_thread(move || {
+            let r = rig(&t, "default-dial-bound", Duration::from_secs(20));
+            r.e.start();
+            assert!(drive_until(&r.exe, Duration::from_secs(1), || t.seen.lock().unwrap().io_connects.len() == 1));
+            assert!(drive_until(&r.exe, Duration::from_millis(1500), || r.e.core.connecting.borrow()[0].is_none()), "default handshake exceeded 1.5 seconds");
+            assert_eq!(r.stats.reconnects.load(Ordering::Relaxed), 0);
+            assert!(CONNECT_TIMEOUT <= Duration::from_secs(1));
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
     #[test]
     fn io_queue_connects_on_the_ring_without_a_thread() {
         let t = Target::start("127.0.0.1:0", TargetCfg { icresp_delay: Duration::from_millis(300), ..Default::default() }).unwrap();
@@ -2788,7 +4066,7 @@ mod tests {
 
     /// Q5: a handshake exchange that overruns its time limit is cut short by
     /// its linked timeout (on time, not at a timer tick), backs off, and is
-    /// retried. The limit is 10 s; the test sets 300 ms.
+    /// retried. The limit is 1 s; the test sets 300 ms.
     #[test]
     fn a_handshake_past_its_deadline_times_out_and_is_retried() {
         let t = Target::start("127.0.0.1:0", TargetCfg { hang_io_connect: true, ..Default::default() }).unwrap();
@@ -3017,6 +4295,97 @@ mod tests {
             assert_eq!(r.stats.engine_panics.load(Ordering::Relaxed), 1);
             assert_eq!(r.stats.inflight.load(Ordering::Relaxed), 0, "in-flight count left off");
             assert!(wait_for(Duration::from_secs(2), || t.seen.lock().unwrap().io_closed == 1), "the I/O connection stayed open");
+            drop(r.e);
+            r.ctrls.shutdown();
+        });
+    }
+
+    /// READ_FIXED short reads must cancel the following header receive;
+    /// otherwise it could consume payload bytes as an NVMe/TCP header.
+    #[test]
+    fn short_fixed_read_cancels_its_linked_header() {
+        use std::os::unix::net::UnixStream;
+        for sent in [4, 8] {
+            let (rx, mut tx) = UnixStream::pair().unwrap();
+            let mut data = [0u8; 8];
+            let mut hdr = [0u8; 8];
+            let mut ring = io_uring::IoUring::new(8).unwrap();
+            let iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: data.len() };
+            unsafe { ring.submitter().register_buffers(&[iov]).unwrap(); }
+            let payload = io_uring::opcode::ReadFixed::new(io_uring::types::Fd(rx.as_raw_fd()), data.as_mut_ptr(), 8, 0)
+                .offset(u64::MAX).build().flags(io_uring::squeue::Flags::IO_LINK).user_data(1);
+            let header = io_uring::opcode::Recv::new(io_uring::types::Fd(rx.as_raw_fd()), hdr.as_mut_ptr(), 8)
+                .flags(libc::MSG_WAITALL).build().user_data(2);
+            tx.write_all(&vec![42; sent]).unwrap();
+            if sent == 8 { tx.write_all(&[99; 8]).unwrap(); }
+            unsafe { ring.submission().push(&payload).unwrap(); ring.submission().push(&header).unwrap(); }
+            ring.submit_and_wait(2).unwrap();
+            let mut results: Vec<_> = ring.completion().map(|c| (c.user_data(), c.result())).collect();
+            results.sort_unstable();
+            assert_eq!(results, [(1, sent as i32), (2, if sent == 8 { 8 } else { -libc::ECANCELED })]);
+            assert_eq!(&data[..sent], &vec![42; sent]);
+            assert_eq!(hdr, if sent == 8 { [99; 8] } else { [0; 8] });
+            ring.submitter().unregister_buffers().unwrap();
+        }
+    }
+
+    #[test]
+    fn fua_survives_an_unfinished_request_and_encodes_only_on_writes() {
+        let ready = Rc::new(RefCell::new(Vec::new()));
+        for op in [Op::Read, Op::Write, Op::Flush] {
+            let mut p = Pending::with_completion(op, 123, 8, std::ptr::null_mut(), 4096,
+                Completion::Batch { tag: 2, ready: ready.clone() }, None, None);
+            p.fua = true;
+            for inline in [false, true] {
+                let sqe = p.command(19, inline);
+                let control = u32::from_le_bytes(sqe.0[48..52].try_into().unwrap());
+                assert_eq!(control & (1 << 30) != 0, op == Op::Write);
+                if op != Op::Flush { assert_eq!(control & 0xffff, 7); }
+            }
+            // Drop with no engine takes the same move path used during unwind.
+            drop(p);
+        }
+        assert_eq!(ready.borrow().len(), 3);
+        assert!(ready.borrow().iter().all(|c| c.tag == 2 && c.result == -libc::EIO));
+    }
+
+    /// The taskless batch destination survives failover and panic recovery.
+    /// A tag reused by another tenancy must still return to its own queue;
+    /// an orphaned flush must not complete before the write fence.
+    #[test]
+    fn batch_results_keep_their_destination_and_write_fence() {
+        use libublk::io::UblkBatchCompletion as C;
+        let t = Target::start("127.0.0.1:0", TargetCfg::default()).unwrap();
+        on_ring_thread(move || {
+            let fence = Duration::from_millis(500);
+            let r = rig(&t, "batch-fence", fence);
+            r.e.start();
+            let read = Rc::new(RefCell::new(Vec::new()));
+            let flush = Rc::new(RefCell::new(Vec::new()));
+            let mut buf = vec![0u8; 4096];
+            let submit = |op, dest: &Rc<RefCell<Vec<C>>>, ptr, len| {
+                r.e.submit(Pending::with_completion(op, 8, 8, ptr, len,
+                    Completion::Batch { tag: 7, ready: dest.clone() }, None, None));
+            };
+            submit(Op::Read, &read, buf.as_mut_ptr(), 4096);
+            assert!(drive_until(&r.exe, Duration::from_secs(10), || !read.borrow().is_empty()));
+            assert_eq!(read.borrow_mut().pop(), Some(C::new(7, 4096)));
+            t.hold_io.store(true, Ordering::Release);
+            submit(Op::Read, &read, buf.as_mut_ptr(), 4096);
+            submit(Op::Flush, &flush, std::ptr::null_mut(), 0);
+            drive_until(&r.exe, Duration::from_millis(200), || false);
+            assert_eq!(r.stats.inflight.load(Ordering::Relaxed), 2);
+            arm_panic("failover-loop");
+            std::fs::write(format!("{}/queues", r.fault_dir), "1").unwrap();
+            std::fs::write(format!("{}/fault", r.fault_dir), "kill 0").unwrap();
+            let start = Instant::now();
+            assert!(drive_until(&r.exe, Duration::from_secs(2), || !read.borrow().is_empty()));
+            assert_eq!(*read.borrow(), [C::new(7, -libc::EIO)]);
+            assert!(flush.borrow().is_empty());
+            assert!(drive_until(&r.exe, Duration::from_secs(5), || !flush.borrow().is_empty()));
+            assert!(start.elapsed() >= fence);
+            assert_eq!(*flush.borrow(), [C::new(7, -libc::EIO)]);
+            assert_eq!(r.stats.inflight.load(Ordering::Relaxed), 0);
             drop(r.e);
             r.ctrls.shutdown();
         });

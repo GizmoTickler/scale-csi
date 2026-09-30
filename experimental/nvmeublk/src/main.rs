@@ -4,16 +4,22 @@
 //!   nvmeublk probe <nqn> <addr:port>...      protocol smoke test, no ublk
 //!   nvmeublk run   <nqn> <addr:port>...      serve /dev/ublkbN until Ctrl-C
 //!
-//! Environment: NVMEUBLK_QUEUES (2), NVMEUBLK_DEPTH (64),
+//! Environment: NVMEUBLK_QUEUES (2; 1 with NVMEUBLK_BATCH_IO=1), NVMEUBLK_DEPTH (64),
+//! NVMEUBLK_THREADS_PER_QUEUE (4), NVMEUBLK_BATCH_IO (0), NVMEUBLK_BATCH_SPILL (16),
 //! NVMEUBLK_IO_TIMEOUT_MS (5000), NVMEUBLK_NO_PATH_TIMEOUT_MS (30000, 0=forever).
 
+mod batchq;
 mod conn;
 mod ctrls;
 mod daemon;
 mod device;
+mod gate;
 mod mpath;
+mod napi;
 mod pdu;
 mod qengine;
+mod reactor;
+mod ready;
 
 use anyhow::{bail, Context, Result};
 use conn::{Done, Ident, Op, Req};
@@ -23,7 +29,7 @@ use libublk::{BufDesc, UblkError};
 use mpath::{Config, Mpath};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -148,6 +154,85 @@ fn lat(nqn: &str, addrs: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// One request on `tag`, fetched and not yet committed: hand it to the
+/// engine and wait for its result (bytes, or a negative errno). Shared by the
+/// per-tag mode (`io_task`) and batch mode (`batchq`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_request(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    e: &qengine::QEngine,
+    shift: u32,
+    cdev_fd: i32,
+    zc: bool,
+    buf_ptr: *mut u8,
+    ucopy: Option<u64>,
+    done_tx: &smol::channel::Sender<i32>,
+    done_rx: &smol::channel::Receiver<i32>,
+) -> i32 {
+    submit_request(q, tag, e, shift, cdev_fd, zc, buf_ptr, ucopy, qengine::Completion::Channel(done_tx.clone()));
+    done_rx.recv().await.unwrap_or(-libc::EIO)
+}
+
+/// Decode and submit without scheduling a per-tag future. The completion
+/// destination owns the result until the fetching tenancy commits it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn submit_request(
+    q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32,
+    cdev_fd: i32, zc: bool, buf_ptr: *mut u8, ucopy: Option<u64>,
+    done: qengine::Completion,
+) {
+    let iod = q.get_iod(tag);
+    let op = match iod.op_flags & 0xff {
+        libublk::sys::UBLK_IO_OP_READ => Some(qengine::Op::Read),
+        libublk::sys::UBLK_IO_OP_WRITE => Some(qengine::Op::Write),
+        libublk::sys::UBLK_IO_OP_FLUSH => Some(qengine::Op::Flush),
+        _ => None,
+    };
+    let result = match op {
+        None => -libc::EOPNOTSUPP,
+        Some(op) => 'io: {
+            let bytes = (iod.nr_sectors as usize) << 9;
+            // Zero copy: a write too large for the capsule goes out via
+            // R2T straight from the request's registered pages.
+            // Zero copy: every write, in-capsule or R2T, is sent from the request pages.
+            let zc_write = zc && op == qengine::Op::Write;
+            if let (Some(pos), qengine::Op::Write, false) = (ucopy, op, zc_write) {
+                // Pull the write data out of the request into our buffer.
+                let mut got = 0usize;
+                while got < bytes {
+                    let n = unsafe { libc::pread(cdev_fd, buf_ptr.add(got) as *mut libc::c_void, bytes - got, (pos + got as u64) as libc::off_t) };
+                    if n <= 0 {
+                        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        log::error!("q{} tag {tag}: pread of write data failed", q.get_qid());
+                        break 'io -libc::EIO;
+                    }
+                    got += n as usize;
+                }
+            }
+            let mut pending = qengine::Pending::with_completion(
+                op,
+                (iod.start_sector << 9) >> shift,
+                (bytes >> shift) as u32,
+                buf_ptr,
+                if op == qengine::Op::Flush { 0 } else { bytes },
+                done,
+                ucopy,
+                // The request's pages are registered at this index of the
+                // ring's buffer table (the tag, or its slot in a shared
+                // reactor ring's table).
+                (zc && (op == qengine::Op::Read || zc_write)).then_some(q.buf_index(tag)),
+            );
+            pending.fua = op == qengine::Op::Write && iod.op_flags & libublk::sys::UBLK_IO_F_FUA != 0;
+            e.submit(pending);
+            return;
+        }
+    };
+    done.finish(result);
+}
+
 async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, cdev_fd: i32, zc: bool) -> Result<(), UblkError> {
     // Zero copy moves bulk data straight between the socket and the request's
     // own pages, so this buffer only ever holds in-capsule write data: size it
@@ -171,51 +256,33 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, e: &qengine::QEngine, shift: u32, 
     let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_ref().expect("copying mode has a tag buffer").as_slice()) };
     q.submit_io_prep_cmd(tag, ublk_buf, 0, if ucopy.is_some() || zc { None } else { buf.as_ref() }).await?;
     loop {
-        let iod = q.get_iod(tag);
-        let op = match iod.op_flags & 0xff {
-            libublk::sys::UBLK_IO_OP_READ => Some(qengine::Op::Read),
-            libublk::sys::UBLK_IO_OP_WRITE => Some(qengine::Op::Write),
-            libublk::sys::UBLK_IO_OP_FLUSH => Some(qengine::Op::Flush),
-            _ => None,
-        };
-        let res = match op {
-            None => -libc::EOPNOTSUPP,
-            Some(op) => 'io: {
-                let bytes = (iod.nr_sectors as usize) << 9;
-                // Zero copy: a write too large for the capsule goes out via
-                // R2T straight from the request's registered pages.
-                // Zero copy: every write, in-capsule or R2T, is sent from the request pages.
-                let zc_write = zc && op == qengine::Op::Write;
-                if let (Some(pos), qengine::Op::Write, false) = (ucopy, op, zc_write) {
-                    // Pull the write data out of the request into our buffer.
-                    let mut got = 0usize;
-                    while got < bytes {
-                        let n = unsafe { libc::pread(cdev_fd, buf_ptr.add(got) as *mut libc::c_void, bytes - got, (pos + got as u64) as libc::off_t) };
-                        if n <= 0 {
-                            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                                continue;
-                            }
-                            log::error!("q{} tag {tag}: pread of write data failed", q.get_qid());
-                            break 'io -libc::EIO;
-                        }
-                        got += n as usize;
-                    }
-                }
-                e.submit(qengine::Pending::new(
-                    op,
-                    (iod.start_sector << 9) >> shift,
-                    (bytes >> shift) as u32,
-                    buf_ptr,
-                    if op == qengine::Op::Flush { 0 } else { bytes },
-                    done_tx.clone(),
-                    ucopy,
-                    (zc && (op == qengine::Op::Read || zc_write)).then_some(tag),
-                ));
-                done_rx.recv().await.unwrap_or(-libc::EIO)
-            }
-        };
+        let res = serve_request(q, tag, e, shift, cdev_fd, zc, buf_ptr, ucopy, &done_tx, &done_rx).await;
         let ublk_buf = if zc { BufDesc::AutoReg(auto_reg) } else if ucopy.is_some() { BufDesc::Slice(&[]) } else { BufDesc::Slice(buf.as_ref().expect("copying mode has a tag buffer").as_slice()) };
         q.submit_io_commit_cmd(tag, ublk_buf, res).await?;
+    }
+}
+
+/// Build this queue thread's ring in the mode NVMEUBLK_RING_MODE asks for
+/// (see `queue_fn`), before libublk builds its default one.
+pub(crate) fn setup_queue_ring(qid: u16, dev: &UblkDev) {
+    let mode = std::env::var("NVMEUBLK_RING_MODE").unwrap_or_default();
+    if mode == "plain" || mode == "defer" {
+        let (sq, cq) = (dev.tgt.sq_depth as u32, dev.tgt.cq_depth as u32);
+        let r = libublk::io::ublk_init_task_ring(|cell| {
+            if cell.get().is_none() {
+                let mut b = io_uring::IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder();
+                b.setup_cqsize(cq);
+                if mode == "defer" {
+                    b.setup_single_issuer().setup_defer_taskrun();
+                }
+                let ring = b.build(sq).map_err(libublk::UblkError::IOError)?;
+                cell.set(std::cell::RefCell::new(ring)).map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            log::warn!("q{qid}: ring mode {mode} failed ({e}); using libublk's default");
+        }
     }
 }
 
@@ -246,25 +313,7 @@ fn queue_fn(
     //   coop  (default) COOP_TASKRUN, as libublk does
     //   plain           no task-run flags
     //   defer           SINGLE_ISSUER + DEFER_TASKRUN
-    let mode = std::env::var("NVMEUBLK_RING_MODE").unwrap_or_default();
-    if mode == "plain" || mode == "defer" {
-        let (sq, cq) = (dev.tgt.sq_depth as u32, dev.tgt.cq_depth as u32);
-        let r = libublk::io::ublk_init_task_ring(|cell| {
-            if cell.get().is_none() {
-                let mut b = io_uring::IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder();
-                b.setup_cqsize(cq);
-                if mode == "defer" {
-                    b.setup_single_issuer().setup_defer_taskrun();
-                }
-                let ring = b.build(sq).map_err(libublk::UblkError::IOError)?;
-                cell.set(std::cell::RefCell::new(ring)).map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-            }
-            Ok(())
-        });
-        if let Err(e) = r {
-            log::warn!("q{qid}: ring mode {mode} failed ({e}); using libublk's default");
-        }
-    }
+    setup_queue_ring(qid, dev);
     // Fails when the node runs short of fds or memory (the queue ring, its
     // registered files and buffers, the mmap of the command buffer). This
     // thread then returns without FETCHing its tags: libublk counts it out,
@@ -292,6 +341,7 @@ fn queue_fn(
     let mut cfg = cfg;
     let user_copy = dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64 != 0;
     cfg.cdev_fd = if user_copy { dev.tgt.fds[0] } else { -1 };
+    cfg.path_offset = dev.dev_info.dev_id as usize;
     let cdev_fd = cfg.cdev_fd;
     let zc = dev.dev_info.flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0;
     if zc {
@@ -320,16 +370,9 @@ fn queue_fn(
         let run_ops = || {
             let t0 = Instant::now();
             st2.loops.fetch_add(1, Ordering::Relaxed);
-            let mut progress = true;
-            while progress {
-                progress = false;
-                while exe.try_tick() {
-                    progress = true;
-                }
-                while net_exe.try_tick() {
-                    progress = true;
-                }
-            }
+            // Tag tasks, then small-class connections, then the rest with
+            // the small class again after each (QEngine::run_turn).
+            spin_engine.run_turn(&exe, &net_exe);
             st2.loop_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         };
         let done = || tasks.iter().all(|t| t.is_finished());
@@ -391,21 +434,26 @@ fn queue_fn(
     // ending must not stop the other queues' timers (reconnect, expiry).
 }
 
-/// Queue-thread CPU placement (NVMEUBLK_QUEUE_CPUS, tuning). libublk pins
-/// each queue thread to its blk-mq CPU group, which at one queue per CPU is
-/// exactly the submitting CPU: at QD1 the submitter and the queue thread
-/// then take turns on one core. "all" lets the threads run anywhere. A CPU
-/// list ("14-15", "6,7,14,15") confines every queue thread to those CPUs:
-/// dedicated storage cores the workload does not run on. None (unset,
-/// anything else, or a list naming no CPU below `ncpu`) keeps libublk's
-/// placement.
+/// Queue-thread CPU placement (NVMEUBLK_QUEUE_CPUS, tuning). Default (unset
+/// or "all"): every queue thread may run on any CPU. libublk's own placement
+/// ("hctx") pins each queue thread to its blk-mq CPU group, i.e. the CPUs
+/// whose submitters feed that queue: at one queue per CPU a submitter and
+/// its queue thread take turns on one core, and at 4 queues x 4 threads on
+/// 16 vCPUs a queue's threads fill exactly its submitters' CPUs, so a
+/// spinning hot-lane primary starves the submitter (4k randread QD16 x1:
+/// 14.8k IOPS pinned vs 86.3k unpinned, gaps/q44b; 1M read QD16 x1 q2t4:
+/// 4,021 vs 4,282 MiB/s, gaps/r1m). A CPU list ("14-15", "6,7,14,15")
+/// confines every queue thread to those CPUs: dedicated storage cores the
+/// workload does not run on; a list naming no CPU below `ncpu` falls back
+/// to the default. None = libublk's placement.
 fn queue_cpus(val: Option<&str>, ncpu: usize) -> Option<Vec<usize>> {
+    let all = || Some((0..ncpu.max(1)).collect());
     let cpus: Vec<usize> = match val {
-        Some("all") => (0..ncpu).collect(),
+        Some("hctx") => return None,
         Some(list) if list.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => parse_cpu_list(list).into_iter().filter(|&c| c < ncpu).collect(),
-        _ => return None,
+        _ => return all(),
     };
-    (!cpus.is_empty()).then_some(cpus)
+    if cpus.is_empty() { all() } else { Some(cpus) }
 }
 
 /// Hand NVMEUBLK_QUEUE_CPUS to libublk, which applies it when it pins each
@@ -414,8 +462,10 @@ fn queue_cpus(val: Option<&str>, ncpu: usize) -> Option<Vec<usize>> {
 fn set_queue_cpus() {
     let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) }.max(1) as usize).min(libc::CPU_SETSIZE as usize);
     let cpus = queue_cpus(std::env::var("NVMEUBLK_QUEUE_CPUS").ok().as_deref(), ncpu);
-    if let Some(cpus) = &cpus {
-        log::info!("queue threads confined to CPUs {cpus:?} (NVMEUBLK_QUEUE_CPUS)");
+    match &cpus {
+        Some(c) if c.len() == ncpu => log::info!("queue threads may run on any CPU"),
+        Some(c) => log::info!("queue threads confined to CPUs {c:?} (NVMEUBLK_QUEUE_CPUS)"),
+        None => log::info!("queue threads pinned to their queue's CPU group (NVMEUBLK_QUEUE_CPUS=hctx)"),
     }
     libublk::ctrl::UblkCtrl::set_queue_cpus(cpus.as_deref());
 }
@@ -467,51 +517,85 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     harden_for_writeback();
     set_queue_cpus();
     qengine::set_zc_recv_preference(env_u64("NVMEUBLK_ZC_RECV", 0) != 0);
+    // The hot lane (batch I/O, primary + spill-only secondaries, two queues)
+    // is the default; NVMEUBLK_HOT_LANE=0 gives the per-tag layout, and with
+    // NVMEUBLK_BATCH_IO=1 plain batch I/O (one queue unless NVMEUBLK_QUEUES
+    // says otherwise).
+    let hot_lane = env_u64("NVMEUBLK_HOT_LANE", 1) != 0;
+    let batch_io = hot_lane || env_u64("NVMEUBLK_BATCH_IO", 0) != 0;
     let spec = device::DeviceSpec {
         volume: std::env::var("NVMEUBLK_VOLUME").unwrap_or_else(|_| "run".into()),
         subnqn: nqn.to_string(),
         addrs: addrs.to_vec(),
         hostnqn: std::env::var("NVMEUBLK_HOSTNQN").ok(),
         hostid: std::env::var("NVMEUBLK_HOSTID").ok(),
-        queues: env_u64("NVMEUBLK_QUEUES", 2) as u16,
-        depth: env_u64("NVMEUBLK_DEPTH", 64) as u16,
+        queues: env_u64("NVMEUBLK_QUEUES", if batch_io && !hot_lane { 1 } else { device::d_queues() as u64 }) as u16,
+        depth: env_u64("NVMEUBLK_DEPTH", device::d_depth() as u64) as u16,
         zero_copy: env_u64("NVMEUBLK_ZERO_COPY", 0) != 0,
         napi_us: env_u64("NVMEUBLK_NAPI_US", 0) as u32,
         conns_per_path: env_u64("NVMEUBLK_CONNS_PER_PATH", 1) as usize,
+        conn_classes: env_u64("NVMEUBLK_CONN_CLASSES", device::d_conn_classes() as u64) != 0,
         rx_chunk: env_u64("NVMEUBLK_RX_CHUNK", 32 * 1024) as usize,
-        threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", 4) as u16,
+        threads_per_queue: env_u64("NVMEUBLK_THREADS_PER_QUEUE", device::d_threads() as u64) as u16,
         seq_tags: env_u64("NVMEUBLK_SEQ_TAGS", 0) != 0,
         tag_chunk: env_u64("NVMEUBLK_TAG_CHUNK", 2) as u16,
+        batch_io,
+        batch_spill: env_u64("NVMEUBLK_BATCH_SPILL", 16).min(u16::MAX as u64) as u16,
+        hot_lane,
         io_timeout_ms: env_u64("NVMEUBLK_IO_TIMEOUT_MS", 5000),
         no_path_timeout_ms: env_u64("NVMEUBLK_NO_PATH_TIMEOUT_MS", 30000),
         write_fence_ms: std::env::var("NVMEUBLK_WRITE_FENCE_MS").ok().and_then(|v| v.parse().ok()),
     };
     // NVMEUBLK_RECOVER_ID after a crash of this command: writes are held.
     let recover = std::env::var("NVMEUBLK_RECOVER_ID").ok().and_then(|v| v.parse::<i32>().ok()).map(|id| (id, true));
+    // NVMEUBLK_RUN_VOLUMES=N (tests): N devices of the namespace, each with
+    // its own controllers, in this one process (the node daemon's shape: on
+    // the reactor pool they share its reactors).
+    let nvol = env_u64("NVMEUBLK_RUN_VOLUMES", 1).max(1) as usize;
+    let mut more = Vec::new();
+    for i in 1..nvol {
+        let mut s = spec.clone();
+        s.volume = format!("{}-{i}", spec.volume);
+        more.push(device::start(s, None)?);
+    }
     let r = device::start(spec, recover)?;
+    for m in &more {
+        log::info!("{}: serving {}", m.spec.volume, m.path());
+    }
     let f = libublk::ctrl::UblkCtrl::new_simple(r.dev_id).map(|c| c.dev_info().flags).unwrap_or(0);
     log::info!(
-        "ublk device flags {f:#x}: zero_copy={} user_copy={} user_recovery={} reissue={}",
+        "ublk device flags {f:#x}: zero_copy={} user_copy={} user_recovery={} reissue={} batch_io={}",
         f & libublk::sys::UBLK_F_AUTO_BUF_REG as u64 != 0,
         f & libublk::sys::UBLK_F_USER_COPY as u64 != 0,
         f & libublk::sys::UBLK_F_USER_RECOVERY as u64 != 0,
-        f & libublk::sys::UBLK_F_USER_RECOVERY_REISSUE as u64 != 0
+        f & libublk::sys::UBLK_F_USER_RECOVERY_REISSUE as u64 != 0,
+        f & libublk::sys::UBLK_F_BATCH_IO as u64 != 0
     );
     // SIGINT: stop and delete the device (the daemon's SIGTERM is a handover instead).
-    let dev_id = r.dev_id;
-    ctrlc::set_handler(move || match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
-        Ok(c) => {
-            if let Err(e) = c.kill_dev() {
-                log::error!("stop ublk device {dev_id}: {e}");
+    let ids: Vec<(i32, Arc<AtomicBool>)> = std::iter::once((r.dev_id, r.stop_token())).chain(more.iter().map(|m| (m.dev_id, m.stop_token()))).collect();
+    ctrlc::set_handler(move || {
+        for (_, stopping) in &ids { stopping.store(true, Ordering::Release); }
+        for (dev_id, _) in &ids {
+            let dev_id = *dev_id;
+            match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
+                Ok(c) => {
+                    if let Err(e) = c.kill_dev() {
+                        log::error!("stop ublk device {dev_id}: {e}");
+                    }
+                }
+                Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
             }
         }
-        Err(e) => log::error!("open ublk device {dev_id} to stop it: {e}"),
     })?;
     let (st, cstat) = (r.stats.clone(), r.ctrls.clone());
     let stats_thread = std::thread::Builder::new().name("nvme-stats".into()).spawn(move || {
       let mut last = (0u64, 0u64, 0u64);
+      let mut rlast = Vec::new();
       loop {
         std::thread::sleep(Duration::from_secs(5));
+        if let Some(l) = reactor::stats_line(&mut rlast, 5.0) {
+            log::info!("{l}");
+        }
         let (n, w, t) = (st.done.load(Ordering::Relaxed), st.wire_ns.load(Ordering::Relaxed), st.total_ns.load(Ordering::Relaxed));
         let dn = (n - last.0).max(1);
         let g = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
@@ -520,14 +604,15 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
         let (wv, wvn) = (g(&st.wv_ns), g(&st.wv_n).max(1));
         let (zr, zrn) = (g(&st.zc_rx_ns), g(&st.zc_rx_n).max(1));
         let lat = format!(
-            "zc_MiB={} zc_tx_MiB={} linked_hdr={} zc_notif={} io={} wire_avg={}us total_avg={}us | queued->wired={}us (pickup {}us, writev {}us x{}) wired->1stdata={}us 1stdata->done={}us (zc payload rx {}us) | loops/s={} run_ops_avg={}us",
-            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, g(&st.linked_hdr), g(&st.zc_notif), n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, qs / qn / 1000, wv / wvn / 1000, wvn / 5, wd / rn / 1000, dc / rn / 1000, zr / zrn / 1000, lp / 5, ln / lp / 1000
+            "zc_MiB={} zc_tx_MiB={} linked_hdr={} zc_notif={} async_rx={} gate_waits={} long_turns={} turn_max={}us io={} wire_avg={}us total_avg={}us | queued->wired={}us (pickup {}us, writev {}us x{}) wired->1stdata={}us 1stdata->done={}us (zc payload rx {}us) | loops/s={} run_ops_avg={}us",
+            st.zc_bytes.load(Ordering::Relaxed) >> 20, st.zc_tx_bytes.load(Ordering::Relaxed) >> 20, g(&st.linked_hdr), g(&st.zc_notif), g(&st.async_rx), g(&st.gate_waits), g(&st.long_turns), g(&st.turn_max_ns) / 1000, n - last.0, (w - last.1) / dn / 1000, (t - last.2) / dn / 1000, qw / qn / 1000, qs / qn / 1000, wv / wvn / 1000, wvn / 5, wd / rn / 1000, dc / rn / 1000, zr / zrn / 1000, lp / 5, ln / lp / 1000
         );
         last = (n, w, t);
         let ups: Vec<String> = cstat.paths.iter().map(|p| format!("{}={}", p.addr.ip(), if p.cntlid().is_some() { "up" } else { "DOWN" })).collect();
         log::info!(
-            "ctrls [{}] failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} {}",
+            "ctrls [{}] path_MiB={:?} failovers={} resubmits={} parked={} fenced={} path_errors={} protocol_errors={} no_path_eio={} reconnects={} stall_kills={} epoch_kills={} engine_panics={} batch_tags={} batch_spills={} batch_takeovers={} small_by_path={:?} {}",
             ups.join(" "),
+            st.path_done_bytes.iter().take(cstat.paths.len()).map(|c| c.load(Ordering::Relaxed) >> 20).collect::<Vec<_>>(),
             st.failovers.load(Ordering::Relaxed),
             st.resubmits.load(Ordering::Relaxed),
             st.parked.load(Ordering::Relaxed),
@@ -539,6 +624,10 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
             st.stall_kills.load(Ordering::Relaxed),
             st.epoch_kills.load(Ordering::Relaxed),
             st.engine_panics.load(Ordering::Relaxed),
+            st.batch_tags.load(Ordering::Relaxed),
+            st.batch_spills.load(Ordering::Relaxed),
+            st.batch_takeovers.load(Ordering::Relaxed),
+            st.small_by_path.iter().take(cstat.paths.len()).map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             lat
         );
       }
@@ -547,7 +636,13 @@ fn run(nqn: &str, addrs: &[String]) -> Result<()> {
     if let Err(e) = stats_thread {
         log::warn!("cannot spawn stats thread: {e}");
     }
-    r.wait()
+    let first = r.wait();
+    for m in more {
+        if let Err(e) = m.wait() {
+            log::error!("{e:#}");
+        }
+    }
+    first
 }
 
 fn main() -> Result<()> {
@@ -606,10 +701,12 @@ mod cpu_list_tests {
         use super::queue_cpus;
         assert_eq!(queue_cpus(Some("all"), 4), Some(vec![0, 1, 2, 3]));
         assert_eq!(queue_cpus(Some("2-3,9"), 8), Some(vec![2, 3]), "CPUs this machine lacks are dropped");
-        // libublk's per-queue placement stays in force.
-        assert_eq!(queue_cpus(None, 8), None);
-        assert_eq!(queue_cpus(Some(""), 8), None);
-        assert_eq!(queue_cpus(Some("any"), 8), None);
-        assert_eq!(queue_cpus(Some("9-12"), 8), None, "a list naming no CPU of this machine");
+        // Default: any CPU (libublk's per-queue pinning starved submitters).
+        assert_eq!(queue_cpus(None, 4), Some(vec![0, 1, 2, 3]));
+        assert_eq!(queue_cpus(Some(""), 2), Some(vec![0, 1]));
+        assert_eq!(queue_cpus(Some("any"), 2), Some(vec![0, 1]));
+        assert_eq!(queue_cpus(Some("9-12"), 2), Some(vec![0, 1]), "a list naming no CPU of this machine");
+        // libublk's per-queue placement only on request.
+        assert_eq!(queue_cpus(Some("hctx"), 8), None);
     }
 }

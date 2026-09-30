@@ -452,7 +452,7 @@ impl Ctrls {
                         s.connecting = None;
                         s.failures = s.failures.saturating_add(1);
                         s.next_try = now + s.backoff;
-                        s.backoff = (s.backoff * 2).min(Duration::from_secs(2));
+                        s.backoff = crate::conn::reconnect_backoff(s.backoff);
                     }
                     Err(TryRecvError::Empty) => {}
                 }

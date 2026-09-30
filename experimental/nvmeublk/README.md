@@ -5,6 +5,73 @@ block device through [ublk](https://docs.kernel.org/block/ublk.html)
 (`/dev/ublkbN`). Built to test whether scale-csi's node data path can leave the
 kernel `nvme-tcp` + native multipath stack.
 
+The September 28 performance review is in [perf/review.md](perf/review.md).
+The container now uses glibc, matching the runtime used for the performance
+baseline. AUTO_BUF_REG batch queues dispatch requests and collect results
+without per-tag futures; shared reactor engines run once after all their
+queue tenancies dispatch. FUA write requests are passed through to NVMe.
+Header prefetching is limited by the exact-receive size threshold.
+
+The reactor now selects work from ublk CQEs and executor wakeups. Idle
+volumes receive a 250 ms maintenance sweep instead of a visit on every
+turn; all tenancies observe the reactor's shared watchdog heartbeat.
+Global `wedge` faults snapshot the authoritative primary roles, publish
+complete commands atomically, and do not leave faults for replacement
+primaries to inherit. A global wedge still means stopping all current
+primary reactors, not every reactor in the pool. Requests already owned
+by a stalled ring must wait for it to resume.
+
+The adaptive pool is experimental and requires `NVMEUBLK_ADAPTIVE=1`.
+The default retains the original fixed layout because the adaptive candidate
+regressed read/mixed performance in validation. Bounded recovery applies in
+both modes. The qualification run also recorded one unexplained read-side
+connection reset without an application I/O error. See the
+[measured results and limitations](perf/load-following/results.md).
+
+Opted-in fully subscribed pool devices keep the CPU-derived hardware queue count,
+use 128 tags per queue, and place a tenancy on every reactor. At 16 CPUs this
+uses the same total buffer-table footprint as the old 8 × 256 × 4 layout.
+The allocator now packs 128-slot ranges. Persisted 8-queue/4-tenancy layouts
+retain fixed scheduling for compatibility.
+
+The pool also follows the I/O mix through fetch-credit admission. With the
+standard eight reactors and eight tenancies per queue, sustained bulk writes
+concentrate on two reactors, small writes can use four, and concurrent reads
+can use all eight. A shared volume-level classifier distributes warm lanes for concurrent
+shallow reads; single streams retain one warm lane. Queue-local depth
+hysteresis and warm windows remain intact.
+`NVMEUBLK_ADAPTIVE=0` restores fixed placement/admission for comparisons.
+Failed reservations roll back atomically; the standard eight-reactor layouts
+fit sixteen volumes in the buffer tables. Rings, connection classes and the bulk gate retain their ownership rules;
+no live request or registered page migrates between rings. See
+[the design and safety limits](perf/load-following.md).
+
+New devices negotiate a two-second NVMe keepalive timeout and persist their
+seven-second default write fence (KATO plus the unchanged five-second margin).
+Old state files without a resolved fence retain twenty seconds on recovery.
+TCP connection and ring handshake steps are bounded at one second, established
+sockets use a two-second TCP user timeout, and reconnect backoff caps at one
+second. Shorter transport detection never bypasses a write fence. Both old and
+new fencing depend on target quiescence within KATO plus the margin; neither is
+a target-side fence against arbitrarily delayed backend writes. Historical
+failure timings later in this README describe the older policy.
+
+Shallow large reads use inline receive by default; explicitly setting
+`NVMEUBLK_SHALLOW_ASYNC_RX=262144` restores the prior io-wq policy.
+`NVMEUBLK_RUNNABLE=0` restores tenancy scans. The existing A/B controls remain:
+`NVMEUBLK_DIRECT_BATCH=0`, `NVMEUBLK_COALESCE_TURNS=0`,
+`NVMEUBLK_LINK_READ_FIXED=0`, `NVMEUBLK_FUA=0` (advertisement only), and
+`NVMEUBLK_NAPI_BULK_WRITE=0`. The bulk policy now includes 64 KiB writes at
+depth, reduces NAPI polling after 64 consecutive qualifying requests, and
+restores the budget on the first other request. Shallow durable-write
+polling retains its previous defaults: measured lower budgets reduced CPU
+but lost throughput. An explicitly enabled `NVMEUBLK_NAPI_ADAPT` retains the
+older wait-time policy unless the bulk policy is also explicitly selected.
+
+These are experimental performance changes. The measured wins and remaining
+kernel advantages are workload dependent; the review records the exact build,
+node configuration, raw artifacts, and recovery/CRC checks.
+
 ## Layout
 - `src/pdu.rs`: NVMe/TCP PDU framing (ICReq/ICResp, CapsuleCmd/Resp, C2HData, R2T, H2CData) and SQE/CQE layout. No digests.
 - `src/conn.rs`: one path's controller.

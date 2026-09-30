@@ -9,7 +9,7 @@
 //! exits with it, and the lanes bound how many of them run at once.
 
 use crate::conn::Ident;
-use crate::{ctrls, host_ident, qengine, queue_fn};
+use crate::{batchq, ctrls, host_ident, qengine, queue_fn};
 use anyhow::{anyhow, bail, Context, Result};
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder, UblkTargetThreads};
 use libublk::io::UblkDev;
@@ -21,16 +21,52 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// NVMe keep-alive timeout of the admin queues.
-const KATO: Duration = Duration::from_secs(15);
+const KATO: Duration = Duration::from_secs(2);
 
 /// How long a caller waits for a device to come up, op lane included.
 pub const START_DEADLINE: Duration = Duration::from_secs(60);
 
-fn d_queues() -> u16 {
-    2
+/// Queues per device by default. With the pool and shared engines the
+/// queue count follows the CPUs (one queue per two, 2..8), as the kernel
+/// initiator's hctx do, so concurrent submitters get queues of their own
+/// (isolation round qc: read 1M 1:8 0.83 -> 0.95x the kernel, randread
+/// 128k 1:8 0.81 -> 1.08x, 4k 1:8 1.15 -> 1.41x) while connections still
+/// follow the reactors; otherwise 2 (every queue has its own threads and
+/// connections).
+fn full_pool_defaults() -> bool {
+    crate::reactor::pool_wanted() && crate::batchq::shared_engines() && crate::batchq::adaptive()
 }
-fn d_depth() -> u16 {
-    64
+
+pub(crate) fn full_pool_layout(queues: u16, threads: u16, reactors: usize) -> bool {
+    queues <= 8 && threads as usize == reactors
+}
+
+pub fn d_queues() -> u16 {
+    if crate::reactor::pool_wanted() && crate::batchq::shared_engines() {
+        let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as usize;
+        queues_for_cpus(ncpu)
+    } else {
+        2
+    }
+}
+
+/// One queue per two CPUs, at least 2, at most 8.
+pub fn queues_for_cpus(ncpu: usize) -> u16 {
+    (ncpu / 2).clamp(2, 8) as u16
+}
+pub fn d_depth() -> u16 {
+    if full_pool_defaults() { 128 } else { DEFAULT_DEPTH }
+}
+
+/// ublk queue depth (tags per queue) by default (was 64). A same-volume
+/// noisy neighbour with 7 x QD16 1 MiB aggressors on one queue starved a
+/// 64-tag queue of tags for the victim (p99 169 ms vs 51 ms at 128; run
+/// nnd-20260927T035446Z), and 8 jobs x QD64 over the two queues needed 512
+/// tags: 4k randread 64:8 was 0.83x the kernel at 128, 1.02x at 256 (run
+/// d256-20260927T045647Z). No cell lost at 256.
+pub const DEFAULT_DEPTH: u16 = 256;
+fn d_true() -> bool {
+    true
 }
 fn d_io_timeout() -> u64 {
     5000
@@ -41,14 +77,20 @@ fn d_no_path() -> u64 {
 fn d_one() -> usize {
     1
 }
-fn d_threads() -> u16 {
-    4
+pub fn d_threads() -> u16 {
+    if full_pool_defaults() { 8 } else { 4 }
 }
 fn d_chunk() -> u16 {
     2
 }
 fn d_rx_chunk() -> usize {
     32 * 1024
+}
+fn d_batch_spill() -> u16 {
+    16
+}
+pub fn d_conn_classes() -> bool {
+    true
 }
 
 /// Everything needed to (re)create a device. Stored in the daemon's state
@@ -105,6 +147,34 @@ pub struct DeviceSpec {
     /// depth / threads; ignored with seq_tags.
     #[serde(default = "d_chunk")]
     pub tag_chunk: u16,
+    /// ublk batch I/O (UBLK_F_BATCH_IO, kernel 7.x; default on, with the hot
+    /// lane; a kernel without it gets the per-tag layout, see
+    /// `effective_layout`).
+    /// Tags are not partitioned: each of a queue's `threads_per_queue`
+    /// threads keeps its own multishot fetch on the whole queue, and the
+    /// driver hands every new request to the first fetch on its list, so a
+    /// low-depth stream stays on one warm thread (its connections, its
+    /// cache) and load spills to the next thread only once that one holds
+    /// `batch_spill` requests. `tag_chunk` and `seq_tags` do not apply.
+    /// Fixed when the device is added: a recovery must ask for what the
+    /// device was added with (a recovery follows the device's mode).
+    #[serde(default = "d_true")]
+    pub batch_io: bool,
+    /// Batch I/O: requests one thread takes before the queue's next request
+    /// spills to its next thread (tuning; default 16, clamped to the depth).
+    #[serde(default = "d_batch_spill")]
+    pub batch_spill: u16,
+    /// Batch I/O hot lane (needs `batch_io`; see batchq.rs): per queue one
+    /// primary thread with most of the credits and a warm-window spin, and
+    /// secondaries that only take its spill. `batch_spill` does not apply;
+    /// the credits come from NVMEUBLK_HOT_LEASE / NVMEUBLK_HOT_SECONDARY.
+    /// Default on; without batch I/O the device is per-tag.
+    #[serde(default = "d_true")]
+    pub hot_lane: bool,
+    /// Two connection classes per path (tuning; see qengine::QConfig::
+    /// conn_classes): one extra small-I/O connection per path and engine.
+    #[serde(default = "d_conn_classes")]
+    pub conn_classes: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -459,6 +529,9 @@ pub struct Running {
 }
 
 impl Running {
+    /// Teardown must wake parked fetches before STOP_DEV waits for them.
+    pub fn stop_token(&self) -> Arc<AtomicBool> { self.draining.clone() }
+
     pub fn path(&self) -> String {
         format!("/dev/ublkb{}", self.dev_id)
     }
@@ -513,12 +586,12 @@ impl Running {
             Owner::Ended(r) => return r.map_err(|e| (anyhow!("ublk device {} ended on its own: {e}", self.dev_id), detach)),
         };
         if !detach {
-            return retire(s, &self.stop).map_err(|e| (e, false));
+            return retire(s, &self.stop, false).map_err(|e| (e, false));
         }
         let Some(_lane) = OP_LANES.acquire_until(Instant::now() + START_DEADLINE) else {
             return match self.end.put_back(s) {
                 None => Err((anyhow!("ublk device {}: no control lane free within {} s; retry", self.dev_id, START_DEADLINE.as_secs()), true)),
-                Some(s) => retire(s, &self.stop).map_err(|e| (e, false)),
+                Some(s) => retire(s, &self.stop, false).map_err(|e| (e, false)),
             };
         };
         // Never STOP_DEV here, with the queue threads running and the char
@@ -535,7 +608,7 @@ impl Running {
             Ok::<(), std::convert::Infallible>(())
         };
         match stop_or_put_back(&self.end, s, &self.draining, leave) {
-            Stop::Retire(s) => retire(s, &self.stop).map_err(|e| (e, false)),
+            Stop::Retire(s) => retire(s, &self.stop, true).map_err(|e| (e, false)),
             Stop::StillServed(e) => Err((e.context(format!("stop ublk device {}", self.dev_id)), true)),
         }
     }
@@ -619,6 +692,9 @@ impl Running {
 struct Served {
     ctrl: UblkCtrl,
     threads: Option<UblkTargetThreads>,
+    /// Served by tenancies on the reactor pool (reactor.rs): they end only
+    /// when the device is stopped.
+    pooled: bool,
 }
 
 impl Drop for Served {
@@ -716,9 +792,24 @@ fn fault_dir(dev_id: impl std::fmt::Display) -> String {
 
 /// End a device whose queue threads have returned or are returning (it was
 /// stopped, or they failed): wait for them, then delete the device.
-fn retire(mut s: Served, stop: &AtomicBool) -> Result<()> {
+fn retire(mut s: Served, stop: &AtomicBool, detach: bool) -> Result<()> {
     let dev_id = s.ctrl.dev_info().dev_id;
     let Some(threads) = s.threads.take() else { return Ok(()) };
+    if s.pooled && detach {
+        // A detach of a pooled device. Pool tenancies share their rings, so they cannot drop their
+        // fetches by leaving (a queue thread's ring dies with it): STOP ends
+        // them. They keep serving meanwhile, so STOP's wait for the
+        // requests they hold ends (with EIO for parked and fenced I/O, the
+        // device is draining). A device stopped already answers an error.
+        // Control commands go through this thread's control ring, which a
+        // detach's thread may not have yet (join_target makes it later):
+        // without one libublk panics (lifecycle lc-pool-20260927T173746Z).
+        if let Err(e) = libublk::ctrl::init_ctrl_task_ring_default(16) {
+            log::error!("stop ublk device {dev_id}: no control ring: {e}");
+        } else if let Err(e) = s.ctrl.kill_dev() {
+            log::debug!("stop ublk device {dev_id}: {e}");
+        }
+    }
     // Joined with the char device still open: the id stays this device's
     // until `held` is dropped, even if it was deleted from elsewhere.
     let held = match s.ctrl.join_target(threads) {
@@ -870,15 +961,68 @@ pub fn start_here(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<(i
     r
 }
 
+/// The I/O layout a device actually gets: (batch_io, hot_lane).
+/// - A recovered device keeps the mode it was added with (`was_batch`): the
+///   two modes speak different commands to the driver, and a spec written
+///   under other defaults must not strand the device.
+/// - A new device falls back to the per-tag layout on a kernel without
+///   UBLK_F_BATCH_IO (the hot lane is the default, and needs 7.x).
+/// - The hot lane needs batch I/O; without it the device is per-tag.
+pub fn effective_layout(batch_io: bool, hot_lane: bool, kernel_has_batch: bool, was_batch: Option<bool>) -> (bool, bool) {
+    let batch = match was_batch {
+        Some(b) => b,
+        None => batch_io && kernel_has_batch,
+    };
+    (batch, batch && hot_lane)
+}
+
+fn resolved_fence(configured: Option<u64>, recovering: bool) -> u64 {
+    configured.unwrap_or(if recovering { 20_000 } else { KATO.as_millis() as u64 + 5000 })
+}
+
 fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<(i32, bool)>, deadline: Instant) -> Result<Running> {
+    let mut spec = spec;
+    {
+        let feats = UblkCtrl::get_features().unwrap_or(0);
+        let has_batch = feats & libublk::sys::UBLK_F_BATCH_IO as u64 != 0;
+        let was_batch = match recover {
+            Some((id, _)) => UblkCtrl::new_simple(id).ok().map(|c| c.dev_info().flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0),
+            None => None,
+        };
+        let (batch, hot) = effective_layout(spec.batch_io, spec.hot_lane, has_batch, was_batch);
+        if (batch, hot) != (spec.batch_io, spec.hot_lane) {
+            log::info!(
+                "{}: layout {} (spec asked batch_io={} hot_lane={}; kernel batch I/O {}, device {})",
+                spec.volume,
+                if hot { "hot lane" } else if batch { "batch I/O" } else { "per-tag" },
+                spec.batch_io,
+                spec.hot_lane,
+                if has_batch { "available" } else { "missing" },
+                match was_batch { Some(true) => "added with batch I/O", Some(false) => "added per-tag", None => "new" }
+            );
+            spec.batch_io = batch;
+            spec.hot_lane = hot;
+        }
+    }
     let info = ctrls.info.clone();
-    let write_fence = Duration::from_millis(spec.write_fence_ms.unwrap_or(KATO.as_millis() as u64 + 5000));
+    // Persist the resolved fence: a subsequent crash must use the policy
+    // under which the predecessor submitted its writes. An old state file
+    // without a resolved value belongs to the former 15 s KATO generation.
+    let fence_ms = resolved_fence(spec.write_fence_ms, recover.is_some());
+    spec.write_fence_ms = Some(fence_ms);
+    let write_fence = Duration::from_millis(fence_ms);
     let hold = recover.is_some_and(|(_, hold)| hold);
     if spec.zero_copy {
         let feats = UblkCtrl::get_features().unwrap_or(0);
         let need = (libublk::sys::UBLK_F_AUTO_BUF_REG | libublk::sys::UBLK_F_USER_COPY) as u64;
         if feats & need != need {
             bail!("zero copy requested but this kernel's ublk lacks AUTO_BUF_REG/USER_COPY (features {feats:#x})");
+        }
+    }
+    if spec.batch_io {
+        let feats = UblkCtrl::get_features().unwrap_or(0);
+        if feats & libublk::sys::UBLK_F_BATCH_IO as u64 == 0 {
+            bail!("batch I/O requested but this kernel's ublk lacks UBLK_F_BATCH_IO (features {feats:#x}; needs 7.x)");
         }
     }
     let stats = Arc::new(qengine::Stats::default());
@@ -894,7 +1038,7 @@ fn start_here_inner(spec: DeviceSpec, ctrls: Arc<ctrls::Ctrls>, recover: Option<
 /// ublk feature flags a new device is added with. A recovered device keeps
 /// the flags it was added with: libublk replaces these with the driver's
 /// copy when it opens the device for recovery.
-fn ublk_flags(zero_copy: bool) -> u64 {
+fn ublk_flags(zero_copy: bool, batch_io: bool) -> u64 {
     use libublk::sys::*;
     // USER_RECOVERY + REISSUE: a restarted daemon reattaches the device and
     // gets the I/O that was in flight back. QUIESCE: QUIESCE_DEV, the only
@@ -910,6 +1054,14 @@ fn ublk_flags(zero_copy: bool) -> u64 {
         // (need_map_io, need_req_ref, dropping NEED_GET_DATA). Never in the
         // copying mode, where it would switch the driver's data copy off.
         flags |= (UBLK_F_USER_COPY | UBLK_F_AUTO_BUF_REG | UBLK_F_SUPPORT_ZERO_COPY) as u64;
+    }
+    if batch_io {
+        // BATCH_IO: PREP/COMMIT/FETCH_IO_CMDS instead of per-tag FETCH and
+        // COMMIT_AND_FETCH. The driver keeps USER_RECOVERY(+REISSUE),
+        // QUIESCE, USER_COPY and AUTO_BUF_REG working with it, and drops
+        // PER_IO_DAEMON (several threads per queue need no partition here)
+        // and NEED_GET_DATA (never used).
+        flags |= UBLK_F_BATCH_IO as u64;
     }
     flags
 }
@@ -937,7 +1089,7 @@ impl Drop for QueueExit {
             let stop = self.stop.clone();
             let finish = move |s: Served| {
                 let dev_id = s.ctrl.dev_info().dev_id;
-                let r = retire(s, &stop);
+                let r = retire(s, &stop, false);
                 match &r {
                     Ok(()) => log::warn!("ublk device {dev_id}: its queue threads all returned without a detach; deleted it"),
                     Err(e) => log::error!("ublk device {dev_id}: its queue threads all returned without a detach; deleting it failed: {e:#}"),
@@ -1015,19 +1167,42 @@ fn bring_up(
     let io_buf = (max_io.clamp(4, 32 * 1024) * 1024).min(info.mdts_bytes) as u32;
     let size = info.nsze << info.lba_shift;
     let lba_shift = info.lba_shift as u8;
-    let flags = ublk_flags(spec.zero_copy);
+    let flags = ublk_flags(spec.zero_copy, spec.batch_io);
+    // The node's reactor pool serves hot-lane zero-copy devices (L7); a
+    // recovery follows the process's mode, which may differ from the one the
+    // device was served in before (a device's flags do not depend on it).
+    let pool = if spec.batch_io && spec.hot_lane && spec.zero_copy { crate::reactor::pool() } else { None };
+    let pooled = pool.is_some();
     let threads = spec.threads_per_queue.clamp(1, depth);
+    // A queue's tenancies sit on distinct reactors.
+    let threads = match pool {
+        Some(p) => threads.min(p.reactors() as u16),
+        None => threads,
+    };
+    let adaptive_layout = crate::batchq::adaptive() && pool.is_some_and(|p| full_pool_layout(queues, threads, p.reactors()));
+    let hot = spec.hot_lane.then(|| {
+        let mut h = batchq::HotLane::from_env();
+        if adaptive_layout && std::env::var_os("NVMEUBLK_HOT_LEASE").is_none() { h.lease = 2; }
+        h
+    });
     let tag_chunk = spec.tag_chunk.max(1);
     // Several threads per queue need UBLK_F_PER_IO_DAEMON, which the driver
     // advertises by itself (6.16+) and libublk checks after the device is
     // added; it is not a flag the server may request.
-    let tag_flags = if threads > 1 && spec.seq_tags { UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION } else { UblkFlags::empty() };
+    let tag_flags = if threads > 1 && spec.seq_tags && !spec.batch_io { UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION } else { UblkFlags::empty() };
     let builder = UblkCtrlBuilder::default().name("nvmeublk").nr_queues(queues).depth(depth).io_buf_bytes(io_buf).ctrl_flags(flags).io_threads_per_queue(threads);
     let builder = match recover {
         Some((id, _)) => {
             // One try: the daemon checked it moments ago (recovery_check),
             // and an EBUSY now is tried again later, holding no lane.
-            let r = UblkCtrl::new_simple(id)?.try_start_user_recover().context("start user recovery")?;
+            // Batch I/O is fixed when a device is added, and the two modes
+            // speak different commands to the driver: the spec must match.
+            let old = UblkCtrl::new_simple(id)?;
+            let was_batch = old.dev_info().flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0;
+            if was_batch != spec.batch_io {
+                bail!("ublk device {id} was added {} batch I/O; recover it with batch_io={was_batch}", if was_batch { "with" } else { "without" });
+            }
+            let r = old.try_start_user_recover().context("start user recovery")?;
             if r == -libc::EBUSY {
                 return Err(anyhow::Error::new(TryAgain(format!("ublk device {id} is not recoverable yet (EBUSY: its previous server still has it open)"))));
             }
@@ -1041,11 +1216,27 @@ fn bring_up(
     };
     let ctrl = builder.build().context("create ublk device (is ublk_drv loaded?)")?;
     let dev_id = ctrl.dev_info().dev_id as i32;
+    if (ctrl.dev_info().flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0) != spec.batch_io {
+        // The driver dropped (or the device kept) BATCH_IO against the
+        // spec: the queue threads would speak the wrong commands.
+        // A new device is deleted when `ctrl` drops; a recovered one stays,
+        // holding its I/O, for a recovery with the right spec.
+        if recover.is_none() {
+            let _ = std::fs::remove_file(ctrl.run_path());
+        }
+        bail!("ublk device {dev_id}: batch I/O is {} on the device but {} in the spec", ctrl.dev_info().flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0, spec.batch_io);
+    }
     let fault_dir = fault_dir(dev_id);
     let _ = std::fs::create_dir_all(&fault_dir);
-    // Fault injection fans a command out to one file per engine, and there
-    // is one engine per io thread (engine id = queue * threads + thread).
-    let _ = std::fs::write(format!("{fault_dir}/queues"), (queues * threads).to_string());
+    // Fault injection fans a command out to one file per engine: one per io
+    // thread (engine id = queue * threads + thread), or with shared engines
+    // on the pool one per reactor (engine id = reactor index).
+    let pooled = spec.batch_io && crate::batchq::shared_engines();
+    let engines = match pooled.then(crate::reactor::pool).flatten() {
+        Some(p) => p.reactors() as u16,
+        None => queues * threads,
+    };
+    let _ = std::fs::write(format!("{fault_dir}/queues"), engines.to_string());
     let cfg = qengine::QConfig {
         io_timeout: Duration::from_millis(spec.io_timeout_ms),
         no_path_timeout: Duration::from_millis(spec.no_path_timeout_ms),
@@ -1057,21 +1248,30 @@ fn bring_up(
         rx_offload: 0,
         cdev_fd: -1,
         conns_per_path: spec.conns_per_path.max(1),
+        conn_classes: spec.conn_classes,
         rx_chunk: spec.rx_chunk.max(64),
         napi_us: spec.napi_us,
         fault_dir,
         quiesce,
+        path_offset: 0,
     };
     log::info!(
-        "{}: {} blocks of {} B, {} queues x {} ({} threads/queue{}, tag chunk {}), zero_copy={} napi_us={} write fence {} ms",
+        "{}: {} blocks of {} B, {} queues x {} ({} threads/queue{}, {}), zero_copy={} napi_us={} write fence {} ms",
         spec.volume,
         info.nsze,
         1u64 << info.lba_shift,
         queues,
         depth,
         threads,
-        if spec.seq_tags { ", contiguous tags" } else { "" },
-        tag_chunk,
+        if spec.seq_tags && !spec.batch_io { ", contiguous tags" } else { "" },
+        if spec.hot_lane {
+            let h = hot.unwrap();
+            format!("batch I/O hot lane, primary lease {} cap {}, secondaries {}, depth mode above {} held: runs of {}{}, watchdog {:?}", h.credits(true, false, depth).1, h.credits(true, false, depth).0, h.credits(false, false, depth).0, h.lease, h.credits(true, true, depth).1, if h.deep_spin { " (spinning)" } else { "" }, h.wedge)
+        } else if spec.batch_io {
+            format!("batch I/O, spill at {}", spec.batch_spill.clamp(1, depth))
+        } else {
+            format!("tag chunk {tag_chunk}")
+        },
         spec.zero_copy,
         spec.napi_us,
         write_fence.as_millis()
@@ -1080,29 +1280,54 @@ fn bring_up(
     let exited = Arc::new(AtomicUsize::new(0));
     let ab = abandoned.clone();
     let volume = spec.volume.clone();
-    let started = ctrl.start_target_until(
-        move |dev: &mut UblkDev| {
-            dev.set_default_params(size);
-            // Whose device this is, for a recovery to check (`owner`).
-            dev.set_target_json(serde_json::json!({ OWNER_KEY: volume }));
-            dev.set_io_tag_chunk(tag_chunk);
-            dev.tgt.params.basic.logical_bs_shift = lba_shift;
-            dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
-            // Room on each queue ring for the network SQEs (recv + writev per
-            // path, timer, reconnect wakeup) next to the ublk commands.
-            dev.tgt.sq_depth = depth * 2 + 64;
-            dev.tgt.cq_depth = depth * 2 + 64;
-            Ok(())
-        },
-        move |qid, dev: &_| {
-            // libublk runs one thread per (queue, io thread); the kernel may
-            // have trimmed the queue count, so count from the device.
-            let total = dev.dev_info.nr_hw_queues as usize * dev.io_threads_per_queue() as usize;
-            let _out = QueueExit { exited: exited.clone(), total, stop: stq.clone(), ctrls: ctrls.clone(), end: eq.clone() };
-            queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone())
-        },
-        Some(deadline),
-    );
+    // Batch I/O: what each queue's threads share (thread 0 prepares the
+    // queue; the copying mode's tag buffers). Indexed by queue id; the
+    // driver may trim the queue count, never raise it.
+    let batch_shared: Arc<Vec<Arc<batchq::QueueShared>>> = Arc::new(batchq::QueueShared::for_volume(queues, threads));
+    let batch_spill = spec.batch_spill;
+    let tgt_fn = move |dev: &mut UblkDev| {
+        dev.set_default_params(size);
+        // NVMe writes implement FUA directly. Without advertising it the
+        // block layer emulates each durable write with a separate flush.
+        if crate::env_u64("NVMEUBLK_FUA", 1) != 0 {
+            dev.tgt.params.basic.attrs |= libublk::sys::UBLK_ATTR_FUA;
+        }
+        // Whose device this is, for a recovery to check (`owner`).
+        dev.set_target_json(serde_json::json!({ OWNER_KEY: volume }));
+        dev.set_io_tag_chunk(tag_chunk);
+        dev.tgt.params.basic.logical_bs_shift = lba_shift;
+        dev.tgt.params.basic.physical_bs_shift = lba_shift.max(12);
+        // Room on each queue ring for the network SQEs (recv + writev per
+        // path, timer, reconnect wakeup) next to the ublk commands.
+        dev.tgt.sq_depth = depth * 2 + 64;
+        dev.tgt.cq_depth = depth * 2 + 64;
+        Ok(())
+    };
+    let started = match pool {
+        Some(pool) => {
+            let launch = move |dev: &Arc<UblkDev>| launch_on_pool(pool, dev, &batch_shared, hot, batch_spill, &cfg, &ctrls, &sq, &stq, &drq, &ab, &eq, &exited, deadline);
+            ctrl.start_target_on(tgt_fn, launch, Some(deadline))
+        }
+        None => ctrl.start_target_until(
+            tgt_fn,
+            move |qid, dev: &_| {
+                // libublk runs one thread per (queue, io thread); the kernel may
+                // have trimmed the queue count, so count from the device.
+                let total = dev.dev_info.nr_hw_queues as usize * dev.io_threads_per_queue() as usize;
+                let _out = QueueExit { exited: exited.clone(), total, stop: stq.clone(), ctrls: ctrls.clone(), end: eq.clone() };
+                if dev.dev_info.flags & libublk::sys::UBLK_F_BATCH_IO as u64 != 0 {
+                    let Some(shared) = batch_shared.get(qid as usize).cloned() else {
+                        log::error!("ublk device {} queue {qid}: no batch state for this queue", dev.dev_info.dev_id);
+                        return;
+                    };
+                    batchq::queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone(), shared, batch_spill, hot)
+                } else {
+                    queue_fn(qid, dev, ctrls.clone(), sq.clone(), stq.clone(), drq.clone(), ab.clone(), cfg.clone())
+                }
+            },
+            Some(deadline),
+        ),
+    };
     let target = match started {
         Ok(t) => t,
         Err(e) => {
@@ -1132,10 +1357,10 @@ fn bring_up(
         }
     };
     log::info!("{}: serving /dev/ublkb{dev_id}", spec.volume);
-    if let Some(s) = end.up(Served { ctrl, threads: Some(target) }) {
+    if let Some(s) = end.up(Served { ctrl, threads: Some(target), pooled }) {
         // Its queue threads all returned during START: it ends on its own,
         // here, on this op thread.
-        let r = retire(s, &stop);
+        let r = retire(s, &stop, false);
         if let Err(e) = &r {
             log::error!("{}: ublk device {dev_id} stopped as it started; deleting it failed: {e:#}", spec.volume);
         } else {
@@ -1146,15 +1371,186 @@ fn bring_up(
     Ok(dev_id)
 }
 
+/// Serve every (queue, io thread) of `dev` as a tenancy on the reactor
+/// pool (the `launch` of `UblkCtrl::start_target_on`): each queue's
+/// tenancies on distinct reactors with one buffer range free on all of
+/// them; thread 0 of every queue first (it prepares the queue's tags), the
+/// others once it has, so no reactor ever waits for another. Returns each
+/// tenancy's (queue, reactor tid, latch). A queue that cannot be placed, or
+/// whose thread 0 fails, makes START give up (`note_queue_thread_exit`).
+#[allow(clippy::too_many_arguments)]
+fn launch_on_pool(
+    pool: &'static crate::reactor::Pool,
+    dev: &Arc<UblkDev>,
+    batch_shared: &Arc<Vec<Arc<batchq::QueueShared>>>,
+    hot: Option<batchq::HotLane>,
+    spill: u16,
+    cfg: &qengine::QConfig,
+    ctrls: &Arc<ctrls::Ctrls>,
+    stats: &Arc<qengine::Stats>,
+    stop: &Arc<AtomicBool>,
+    draining: &Arc<AtomicBool>,
+    abandoned: &Arc<AtomicBool>,
+    end: &Arc<Ending<Served>>,
+    exited: &Arc<AtomicUsize>,
+    deadline: Instant,
+) -> Vec<(u16, libc::pid_t, Arc<libublk::ctrl::UblkQueueLatch>)> {
+    let (nq, nt, depth) = (dev.dev_info.nr_hw_queues, dev.io_threads_per_queue(), dev.dev_info.queue_depth);
+    let dev_id = dev.dev_info.dev_id;
+    let total = nq as usize * nt as usize;
+    let Some(reserved) = pool.reserve(nq, nt, depth, crate::batchq::adaptive() && full_pool_layout(nq, nt, pool.reactors())) else {
+        log::error!("ublk device {dev_id}: no placement with {depth} buffer slots per queue");
+        dev.note_queue_thread_exit();
+        return Vec::new();
+    };
+    let (placement, ranges) = (reserved.placement, reserved.ranges);
+    for (q, rs) in placement.iter().enumerate() {
+        batch_shared[q].bind_placement(rs);
+        batch_shared[q].bind_read_home(q % pool.primaries());
+        if !reserved.adaptive { batch_shared[q].fixed_admission(); }
+    }
+    if crate::batchq::adaptive() && !reserved.adaptive {
+        log::info!("ublk device {dev_id}: legacy layout or preferred tables full; fixed admission on available reactors");
+    }
+    log::info!("ublk device {dev_id}: {nq} queues x {nt} tenancies on reactors {placement:?}, buffer ranges {ranges:?}");
+    let mut out = Vec::with_capacity(total);
+    let mut launch = |q: u16, t: u16| {
+        let r = placement[q as usize][t as usize];
+        let latch = libublk::ctrl::UblkQueueLatch::new();
+        let exit = QueueExit { exited: exited.clone(), total, stop: stop.clone(), ctrls: ctrls.clone(), end: end.clone() };
+        let spec = batchq::TenancySpec {
+            qid: q,
+            thread: t,
+            ctrls: ctrls.clone(),
+            stats: stats.clone(),
+            stop: stop.clone(),
+            draining: draining.clone(),
+            abandoned: abandoned.clone(),
+            cfg: cfg.clone(),
+            shared: batch_shared[q as usize].clone(),
+            spill,
+            hot,
+        };
+        let (d_build, d_end, l_end) = (dev.clone(), dev.clone(), latch.clone());
+        pool.attach(
+            r,
+            crate::reactor::Attach {
+                buf_base: ranges[q as usize],
+                depth,
+                // SAFETY: the tenancy holds `d_build` (an Arc of the device)
+                // for as long as it keeps the reference.
+                build: Box::new(move |slot| unsafe {
+                    let dref: &'static UblkDev = &*Arc::as_ptr(&d_build);
+                    batchq::Tenancy::new(spec, dref, Some(d_build), Some(slot))
+                }),
+                // As a queue thread ends: count the tenancy out of the
+                // device (the last one ends the device if nobody else is),
+                // then out of START's wait, then let `join_target` go on.
+                on_end: Box::new(move || {
+                    drop(exit);
+                    d_end.note_queue_thread_exit();
+                    drop(d_end);
+                    l_end.set();
+                }),
+            },
+        );
+        out.push((q, pool.tid(r), latch));
+    };
+    for q in 0..nq {
+        launch(q, 0);
+    }
+    for q in 0..nq {
+        match batch_shared[q as usize].prepared_by(abandoned, deadline) {
+            Some(true) => {}
+            Some(false) => {
+                log::error!("ublk device {dev_id} queue {q}: thread 0 did not prepare the queue");
+                return out;
+            }
+            None => {
+                log::error!("ublk device {dev_id} queue {q}: not prepared by the start deadline");
+                return out;
+            }
+        }
+    }
+    for q in 0..nq {
+        for t in 1..nt {
+            launch(q, t);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// Queues follow the CPUs with the pool and shared engines: one per two
+    /// CPUs, 2..8 (the bench VM's 16 vCPUs: 8).
+    #[test]
+    fn full_pool_geometry_preserves_buffer_footprint_and_legacy_layouts_stay_fixed() {
+        assert_eq!(8 * 128 * 8, 8 * 256 * 4);
+        assert!(super::full_pool_layout(2, 8, 8));
+        assert!(super::full_pool_layout(2, 2, 2));
+        assert!(!super::full_pool_layout(8, 4, 8));
+        assert!(!super::full_pool_layout(2, 4, 8));
+        if super::full_pool_defaults() { assert_eq!((super::d_depth(), super::d_threads()), (128, 8)); }
+    }
+
+    #[test]
+    fn run_stop_token_marks_draining_before_the_kernel_stop() {
+        use super::*;
+        let spec: DeviceSpec = serde_json::from_value(serde_json::json!({"volume":"stop","subnqn":"nqn.test","addrs":[]})).unwrap();
+        let r = Running::for_tests(spec, 1, false);
+        assert!(!r.draining.load(Ordering::Acquire));
+        r.stop_token().store(true, Ordering::Release);
+        assert!(r.draining.load(Ordering::Acquire));
+        assert!(!r.stop.load(Ordering::Acquire), "teardown has not completed yet");
+    }
+
+    #[test]
+    fn recovery_keeps_the_predecessors_fence() {
+        assert_eq!(super::resolved_fence(None, false), 7000);
+        assert_eq!(super::resolved_fence(None, true), 20000);
+        assert_eq!(super::resolved_fence(Some(7000), true), 7000);
+        assert_eq!(super::resolved_fence(Some(30000), true), 30000);
+    }
+
+    #[test]
+    fn queues_follow_the_cpus() {
+        assert_eq!(super::queues_for_cpus(16), 8);
+        assert_eq!(super::queues_for_cpus(64), 8);
+        assert_eq!(super::queues_for_cpus(2), 2);
+        assert_eq!(super::queues_for_cpus(10), 5);
+    }
+
+    #[test]
+    fn a_minimal_spec_gets_the_hot_lane_layout() {
+        let s: super::DeviceSpec = serde_json::from_str(r#"{"volume":"v","subnqn":"n","addrs":["1.2.3.4:4420"]}"#).unwrap();
+        assert!(s.batch_io && s.hot_lane && s.conn_classes, "hot lane with connection classes by default");
+        assert_eq!((s.queues, s.threads_per_queue, s.depth), (super::d_queues(), super::d_threads(), super::d_depth()));
+        if std::env::var_os("NVMEUBLK_REACTORS").is_none() && std::env::var_os("NVMEUBLK_SHARED_ENGINE").is_none() {
+            let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as usize;
+            assert_eq!(s.queues, super::queues_for_cpus(ncpu));
+        }
+        let s: super::DeviceSpec = serde_json::from_str(r#"{"volume":"v","subnqn":"n","addrs":[],"batch_io":false,"hot_lane":false,"conn_classes":false,"depth":64}"#).unwrap();
+        assert!(!s.batch_io && !s.hot_lane && !s.conn_classes && s.depth == 64, "explicit values still win");
+    }
+
+    #[test]
+    fn layout_follows_the_device_and_the_kernel() {
+        use super::effective_layout as l;
+        assert_eq!(l(true, true, true, None), (true, true));
+        assert_eq!(l(true, true, false, None), (false, false), "no BATCH_IO in the kernel: per-tag");
+        assert_eq!(l(true, true, true, Some(false)), (false, false), "recovering a per-tag device");
+        assert_eq!(l(false, false, true, Some(true)), (true, false), "recovering a batch device added without the hot lane flag");
+        assert_eq!(l(false, true, true, None), (false, false), "hot lane without batch I/O: per-tag");
+    }
+
     use super::*;
     use libublk::sys::*;
 
     #[test]
     fn new_devices_can_be_quiesced() {
         for zero_copy in [false, true] {
-            let f = super::ublk_flags(zero_copy);
+            let f = super::ublk_flags(zero_copy, false);
             assert_ne!(f & UBLK_F_QUIESCE as u64, 0, "zero_copy={zero_copy}");
             // ADD_DEV refuses QUIESCE without USER_RECOVERY.
             assert_ne!(f & UBLK_F_USER_RECOVERY as u64, 0, "zero_copy={zero_copy}");
@@ -1163,11 +1559,35 @@ mod tests {
     }
 
     #[test]
+    fn batch_io_flag_only_when_asked_and_keeps_recovery() {
+        for zero_copy in [false, true] {
+            assert_eq!(super::ublk_flags(zero_copy, false) & UBLK_F_BATCH_IO as u64, 0);
+            let f = super::ublk_flags(zero_copy, true);
+            assert_ne!(f & UBLK_F_BATCH_IO as u64, 0);
+            // The driver refuses FETCH_REQ/COMMIT_AND_FETCH_REQ in batch mode
+            // but keeps recovery, quiesce and the zero-copy flags.
+            let keep = (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE | UBLK_F_QUIESCE) as u64;
+            assert_eq!(f & keep, keep);
+            assert_eq!(f & !(UBLK_F_BATCH_IO as u64), super::ublk_flags(zero_copy, false));
+        }
+    }
+
+    #[test]
+    fn batch_io_is_on_by_default_with_spill_16() {
+        let spec: DeviceSpec = serde_json::from_value(serde_json::json!({"volume": "a", "subnqn": "nqn.2026-09.test:sub", "addrs": ["192.0.2.1:4420"]})).unwrap();
+        assert!(spec.batch_io, "the hot lane (batch I/O) is the default layout");
+        assert_eq!(spec.batch_spill, 16);
+        let spec: DeviceSpec = serde_json::from_value(serde_json::json!({"volume": "a", "subnqn": "nqn.2026-09.test:sub", "addrs": ["192.0.2.1:4420"], "batch_io": true, "batch_spill": 8, "queues": 1})).unwrap();
+        assert!(spec.batch_io);
+        assert_eq!(spec.batch_spill, 8);
+    }
+
+    #[test]
     fn zero_copy_flag_only_with_user_copy_and_auto_buf_reg() {
         let zc = (UBLK_F_SUPPORT_ZERO_COPY | UBLK_F_USER_COPY | UBLK_F_AUTO_BUF_REG) as u64;
         // Copying mode: SUPPORT_ZERO_COPY alone would turn the driver's copy off.
-        assert_eq!(super::ublk_flags(false) & zc, 0);
-        assert_eq!(super::ublk_flags(true) & zc, zc);
+        assert_eq!(super::ublk_flags(false, false) & zc, 0);
+        assert_eq!(super::ublk_flags(true, false) & zc, zc);
     }
 
     /// libublk refuses any flag outside its UBLK_DRV_F_ALL with InvalidVal
@@ -1179,7 +1599,9 @@ mod tests {
         let new = |flags| UblkCtrl::new(None, -1, 1, 64, 4096, flags, 0, UblkFlags::empty());
         assert!(matches!(new(1u64 << 63), Err(libublk::UblkError::InvalidVal)), "libublk no longer validates flags");
         for zero_copy in [false, true] {
-            assert!(!matches!(new(super::ublk_flags(zero_copy)), Err(libublk::UblkError::InvalidVal)), "zero_copy={zero_copy}");
+            for batch in [false, true] {
+                assert!(!matches!(new(super::ublk_flags(zero_copy, batch)), Err(libublk::UblkError::InvalidVal)), "zero_copy={zero_copy} batch={batch}");
+            }
         }
     }
 
@@ -1208,7 +1630,13 @@ mod tests {
         let r = l.try_acquire_recovery().unwrap();
         let held: Vec<OpLane> = (0..GENERAL_LANES).map(|_| l.acquire()).collect();
         let (tx, rx) = mpsc::channel();
-        let waiter = std::thread::spawn(move || tx.send(l.acquire().n).unwrap());
+        let (release, wait_release) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let lane = l.acquire();
+            tx.send(lane.n).unwrap();
+            let _ = wait_release.recv();
+            drop(lane);
+        });
         while lock(&l.st).waiting == 0 {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1217,6 +1645,7 @@ mod tests {
         // The freed lane is the waiting attach's, not a recovery's.
         assert!(l.try_acquire_recovery().is_none(), "recovery took the lane an attach was waiting for");
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), freed);
+        release.send(()).unwrap();
         waiter.join().unwrap();
         drop((r, held));
         // With nobody waiting, recovery may use any free lane.

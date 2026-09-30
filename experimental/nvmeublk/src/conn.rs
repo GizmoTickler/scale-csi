@@ -77,8 +77,17 @@ pub struct Ident {
     pub subnqn: String,
 }
 
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Preserve exponential retry and per-address admission, but do not leave
+/// a restored portal idle for two seconds between attempts.
+pub fn reconnect_backoff(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(1))
+}
+
 fn dial(addr: SocketAddr) -> Result<TcpStream> {
-    let s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).with_context(|| format!("connect {addr}"))?;
+    let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).with_context(|| format!("connect {addr}"))?;
     tune_socket(s.as_raw_fd())?;
     Ok(s)
 }
@@ -89,6 +98,20 @@ pub fn tune_socket(fd: i32) -> Result<()> {
     let one: libc::c_int = 1;
     if unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as u32) } != 0 {
         return Err(std::io::Error::last_os_error()).context("TCP_NODELAY");
+    }
+    // Bound a black-holed established TCP stream independently of the NVMe
+    // command timer. This is failure detection, never permission to replay
+    // writes: orphaned writes still wait for the full controller fence.
+    for (level, option, value) in [
+        (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 2000i32),
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 2),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 1),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 2),
+    ] {
+        if unsafe { libc::setsockopt(fd, level, option, &value as *const _ as *const libc::c_void, std::mem::size_of_val(&value) as u32) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("bounded TCP recovery policy");
+        }
     }
     // NVMEUBLK_RCVBUF (bytes, tuning; 0 = kernel autotuning): a fixed
     // receive buffer, so the advertised window does not have to grow with
@@ -112,7 +135,8 @@ pub struct AdminConn {
 impl AdminConn {
     pub fn connect(addr: SocketAddr, id: &Ident, kato_ms: u32) -> Result<Self> {
         let mut s = dial(addr)?;
-        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
         let (_cpda, maxh2c) = ic_handshake(&mut s)?;
         let mut a = AdminConn { s, cid: 0, cntlid: 0, maxh2c, ka_rx: Vec::new() };
         let (sqe, data) = connect_cmd(a.next_cid(), 0, 31, 0, kato_ms, 0xffff, &id.hostid, &id.subnqn, &id.hostnqn);
@@ -239,7 +263,7 @@ impl AdminConn {
     /// block on one controller: send the command (a 72-byte write)...
     pub fn ka_send(&mut self) -> Result<u16> {
         let sqe = keep_alive_cmd(self.next_cid());
-        self.s.set_write_timeout(Some(Duration::from_secs(1)))?;
+        self.s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
         write_capsule(&mut self.s, &sqe, &[])?;
         self.ka_rx.clear();
         Ok(sqe.cid())
@@ -389,13 +413,15 @@ static DISABLE_SQFLOW: std::sync::LazyLock<bool> =
 /// pieces below, so both paths put the same bytes on the wire.
 pub fn connect_io_queue(addr: SocketAddr, id: &Ident, cntlid: u16, qid: u16, qsize: u16) -> Result<(TcpStream, u32)> {
     let mut s = dial(addr)?;
-    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let (_cpda, maxh2c) = ic_handshake(&mut s)?;
     s.write_all(&io_connect_capsule(id, cntlid, qid, qsize)).context("send command capsule")?;
     let (ch, psh) = read_hdr(&mut s)?;
     check_io_connect_resp(qid, &ch, &psh)?;
     // Completions are waited on indefinitely; stalls are the watchdog's job.
     s.set_read_timeout(None)?;
+    s.set_write_timeout(None)?;
     Ok((s, maxh2c.max(4096)))
 }
 
@@ -708,6 +734,51 @@ mod tests {
         r[11] = dgst;
         r[12..16].copy_from_slice(&maxh2c.to_le_bytes());
         r
+    }
+
+    #[test]
+    fn reconnect_backoff_is_exponential_but_capped_at_one_second() {
+        let mut delay = std::time::Duration::from_millis(250);
+        for expected in [500, 1000, 1000, 1000] {
+            delay = super::reconnect_backoff(delay);
+            assert_eq!(delay, std::time::Duration::from_millis(expected));
+        }
+    }
+
+    #[test]
+    fn blocking_admin_handshake_is_bounded() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1800));
+        });
+        let id = super::Ident { hostnqn: "nqn.test:host".into(), hostid: [1;16], subnqn: "nqn.test:target".into() };
+        let start = std::time::Instant::now();
+        assert!(super::AdminConn::connect(addr, &id, 2000).is_err());
+        let elapsed = start.elapsed();
+        peer.join().unwrap();
+        assert!(elapsed < std::time::Duration::from_millis(1500), "admin handshake took {elapsed:?}");
+    }
+
+    #[test]
+    fn every_transport_socket_has_bounded_failure_detection() {
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        super::tune_socket(stream.as_raw_fd()).unwrap();
+        for (level, option, expected) in [
+            (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 2000),
+            (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 2),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 1),
+            (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 2),
+        ] {
+            let mut value = 0i32;
+            let mut len = std::mem::size_of_val(&value) as u32;
+            assert_eq!(unsafe { libc::getsockopt(stream.as_raw_fd(), level, option, &mut value as *mut _ as *mut libc::c_void, &mut len) }, 0);
+            assert_eq!(value, expected);
+        }
     }
 
     /// The ring-native connect (qengine.rs) builds its handshake from these
