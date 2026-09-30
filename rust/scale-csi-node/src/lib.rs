@@ -8,6 +8,7 @@ pub mod csi;
 pub mod discovery;
 pub mod exec;
 pub mod health;
+pub mod locks;
 pub mod metrics;
 pub mod node_id;
 pub mod service;
