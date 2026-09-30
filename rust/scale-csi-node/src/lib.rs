@@ -15,3 +15,4 @@ pub mod mount;
 pub mod node_id;
 pub mod service;
 pub mod ublk_client;
+pub mod ublk_state;
