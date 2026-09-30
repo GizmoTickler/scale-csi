@@ -169,11 +169,21 @@ func newPublicationRecord(identity NodeIdentity, mode csi.VolumeCapability_Acces
 // it. The re-encoding carries the Node's addresses, which the CSINode id does
 // not, so it never matched: the attacher's reconciler found every attached
 // volume unpublished and forced a ControllerPublishVolume for each of them
-// once a minute. An empty id keeps the re-encoding.
+// once a minute.
+//
+// Takeover and the stale-record revoke hand EncodedID back to
+// unpublishFencedVolume, which finds the record by the name parsed out of it,
+// so the id is kept only when it parses and names this record's node. Anything
+// else (empty, malformed, a newer envelope, a CSINode naming another node)
+// keeps the re-encoding, which always does.
 func (r *publicationRecord) keepCONodeID(nodeID string) {
-	if nodeID != "" {
-		r.EncodedID = nodeID
+	if nodeID == "" {
+		return
 	}
+	if parsed, err := parseNodeIdentity(nodeID); err != nil || parsed.Name != r.Node {
+		return
+	}
+	r.EncodedID = nodeID
 }
 
 func (r publicationRecord) identity() NodeIdentity {
