@@ -197,6 +197,13 @@ func (r publicationRecord) identity() NodeIdentity {
 	return identity
 }
 
+// samePublicationRecordExceptTime is samePublicationRecordGeneration without
+// UpdatedAt: the same publication, whenever it was written.
+func samePublicationRecordExceptTime(left, right publicationRecord) bool {
+	right.UpdatedAt = left.UpdatedAt
+	return samePublicationRecordGeneration(left, right)
+}
+
 func samePublicationRecordGeneration(left, right publicationRecord) bool {
 	return left.Version == right.Version && left.Node == right.Node &&
 		left.EncodedID == right.EncodedID && left.NVMeNQN == right.NVMeNQN &&
@@ -1095,10 +1102,19 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 			return status.Errorf(codes.Internal, "failed to classify additive grant ownership: %v", err)
 		}
 	}
-	if err := storePublicationRecord(ctx, d.truenasClient, ds, datasetName, key, record); err != nil {
+	observationKey := stalePublicationObservationKey(datasetName, key)
+	_, staleObserved := d.stalePublicationRecordsSeen.Load(observationKey)
+	if hasPrevious && !staleObserved && samePublicationRecordExceptTime(previous, record) {
+		// A repeated publish of an unchanged record (a CO retry or a re-sync) writes
+		// nothing: the stored record already says exactly this, and the write is a
+		// ZFS property update of about half a second on TrueNAS. A record the
+		// stale-record sweep is watching is rewritten as before, so a revoke that
+		// detected it sees a new generation and backs off.
+		record = previous
+	} else if err := storePublicationRecord(ctx, d.truenasClient, ds, datasetName, key, record); err != nil {
 		return status.Errorf(codes.Internal, "failed to store publication identity: %v", err)
 	}
-	d.stalePublicationRecordsSeen.Delete(stalePublicationObservationKey(datasetName, key))
+	d.stalePublicationRecordsSeen.Delete(observationKey)
 	records[key] = record
 	if deferred || !backendEnforcement {
 		// Off mode keeps publication records as the sole publication truth; there is
@@ -1139,7 +1155,13 @@ func (d *Driver) unpublishFencedVolume(ctx context.Context, ds *truenas.Dataset,
 		return nil
 	}
 	sort.Strings(keys)
+	// The tombstone guards the window in which backend access is being removed:
+	// a restart in it must not re-grant the node. With fencing off there is no
+	// such step, and removing the records below is the whole unpublish.
 	for _, key := range keys {
+		if !d.config.Fencing.Enabled() {
+			break
+		}
 		record := records[key]
 		record.State = publicationStateRemoving
 		record.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)

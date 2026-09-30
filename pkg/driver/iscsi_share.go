@@ -653,8 +653,12 @@ func (d *Driver) createISCSIShareForDataset(ctx context.Context, ds *truenas.Dat
 	// linkage is instead folded into CreateVolume's FATAL managed-property update
 	// (controller.go), which rolls back the share+dataset on failure. The group
 	// authmethod+auth are still applied to the live target groups above.
-	if err := d.setDatasetUserProperties(ctx, ds, datasetName, resourceProps); err != nil {
-		klog.Warningf("Failed to store iSCSI resource IDs: %v", err)
+	// With the caller's fatal update carrying all of it (above), the
+	// warning-only write would only repeat it one round trip earlier.
+	if finalProperties == nil {
+		if err := d.setDatasetUserProperties(ctx, ds, datasetName, resourceProps); err != nil {
+			klog.Warningf("Failed to store iSCSI resource IDs: %v", err)
+		}
 	}
 
 	// Request iSCSI service reload using debouncer to prevent reload storms

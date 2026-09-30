@@ -391,12 +391,13 @@ func TestCloneSourceGeometryProbeAPICallCost(t *testing.T) {
 		// because the source's current state cannot answer for the snapshot's
 		// bytes. It asks the snapshot.
 		//
-		// 22 calls for a restore whose source has no block history at all: one
+		// 21 calls for a restore whose source has no block history at all: one
 		// DatasetGet establishes that (no live-extent read follows, because there
 		// is nothing to preserve). Round 4 spent 23 here, the extra one being an
-		// ISCSIExtentFindByDisk asking the wrong question.
+		// ISCSIExtentFindByDisk asking the wrong question; 22 until the share's
+		// warning-only resource-ID write folded into the fatal update.
 		base, baseMethods := measure(t, "restore-default", "iscsi", nil, nil)
-		assert.Equal(t, 22, base, "the block snapshot-restore total, geometry resolution included")
+		assert.Equal(t, 21, base, "the block snapshot-restore total, geometry resolution included")
 		assert.Equal(t, 4, baseMethods["DatasetGet"])
 		assert.Equal(t, 1, baseMethods["ISCSIExtentFindByDisk"],
 			"the one remaining find-by-disk belongs to the DESTINATION's share build, not to the source probe")

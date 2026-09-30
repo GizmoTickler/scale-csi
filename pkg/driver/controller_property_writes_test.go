@@ -1,0 +1,174 @@
+package driver
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/GizmoTickler/scale-csi/pkg/truenas"
+)
+
+// propertyWriteRecorder records every dataset user-property write: each one is
+// a pool.dataset.update of roughly half a second on TrueNAS, the cost the
+// control plane is measured in.
+type propertyWriteRecorder struct {
+	*truenas.MockClient
+	writes []map[string]string
+}
+
+func (r *propertyWriteRecorder) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
+	copied := make(map[string]string, len(properties))
+	for key, value := range properties {
+		copied[key] = value
+	}
+	r.writes = append(r.writes, copied)
+	return r.MockClient.DatasetSetUserProperties(ctx, name, properties)
+}
+
+func (r *propertyWriteRecorder) DatasetUpdate(ctx context.Context, name string, params *truenas.DatasetUpdateParams) (*truenas.Dataset, error) {
+	if params != nil && len(params.UserPropertiesUpdate) > 0 {
+		written := make(map[string]string, len(params.UserPropertiesUpdate))
+		for _, update := range params.UserPropertiesUpdate {
+			written[update.Key] = update.Value
+		}
+		r.writes = append(r.writes, written)
+	}
+	return r.MockClient.DatasetUpdate(ctx, name, params)
+}
+
+// A fresh NVMe-oF volume costs two property writes: the ownership stamp right
+// after the dataset exists, and one final update carrying the share's resource
+// IDs with the managed/provision/name stamps. The IDs used to have a
+// warning-only write of their own.
+func TestCreateVolumeFoldsNVMeoFResourceIDsIntoTheFinalWrite(t *testing.T) {
+	ctx := context.Background()
+	recorder := &propertyWriteRecorder{MockClient: truenas.NewMockClient()}
+	d := newMultipathAPICallCountDriver(t, newAPICallCountingClient(), nil)
+	d.truenasClient = recorder
+	mustCreateParentDataset(t, recorder.MockClient)
+
+	resp, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("folded", "nvmeof"))
+	require.NoError(t, err)
+	require.Len(t, recorder.writes, 2, "ownership stamp + final update: %v", recorder.writes)
+	final := recorder.writes[1]
+	for _, key := range []string{PropNVMeoFSubsystemID, PropNVMeoFPortSubsysID, PropNVMeoFNamespaceID, PropManagedResource, PropProvisionSuccess} {
+		assert.NotEmpty(t, final[key], "the final update carries %s", key)
+	}
+	assert.NotEmpty(t, resp.GetVolume().GetVolumeContext()["nqn"], "the volume context still resolves from the stored IDs")
+
+	// The repair path (ensureShareExists, no final update of its own) still
+	// stamps the IDs itself when the dataset lost them.
+	datasetName := "pool/parent/" + resp.GetVolume().GetVolumeId()
+	require.NoError(t, recorder.DatasetRemoveUserProperties(ctx, datasetName,
+		[]string{PropNVMeoFSubsystemID, PropNVMeoFPortSubsysID, PropNVMeoFNamespaceID}))
+	recorder.writes = nil
+	require.NoError(t, d.createNVMeoFShareForDataset(ctx, nil, datasetName, resp.GetVolume().GetVolumeId(), false, true, nil))
+	require.NotEmpty(t, recorder.writes)
+	assert.NotEmpty(t, recorder.writes[len(recorder.writes)-1][PropNVMeoFSubsystemID])
+}
+
+// A publish that would store exactly the record already stored writes nothing,
+// unless the stale-record sweep is watching that record: then it is rewritten
+// with a new UpdatedAt, so a revoke that detected the old generation backs off.
+func TestRepublishOfAnUnchangedRecordWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	h := newFencingTestHarness(t, FencingModeOff, ShareTypeNVMeoF, withNVMeAllowAnyHost())
+	recorder := &propertyWriteRecorder{MockClient: h.client}
+	h.d.truenasClient = recorder
+	datasetName := "pool/parent/republished"
+	ds, err := h.client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+	require.NoError(t, err)
+	require.NoError(t, h.d.createNVMeoFShareForDataset(ctx, ds, datasetName, "republished", true, true, nil))
+	nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a"})
+	require.NoError(t, err)
+	publish := func(mode csi.VolumeCapability_AccessMode_Mode) {
+		t.Helper()
+		_, err := h.d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+			VolumeId: "republished", NodeId: nodeID,
+			VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{Mode: mode}},
+			VolumeContext:    map[string]string{"node_attach_driver": "nvmeof"},
+		})
+		require.NoError(t, err)
+	}
+	stored := func() publicationRecord {
+		t.Helper()
+		fresh, err := h.client.DatasetGet(ctx, datasetName)
+		require.NoError(t, err)
+		records, err := publicationRecordsFromDataset(fresh)
+		require.NoError(t, err)
+		return records[publicationPropertyKey("worker-a")]
+	}
+
+	publish(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	first := stored()
+	recorder.writes = nil
+	time.Sleep(2 * time.Millisecond)
+	publish(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	assert.Empty(t, recorder.writes, "an unchanged record is not rewritten")
+	assert.Equal(t, first.UpdatedAt, stored().UpdatedAt)
+
+	// Watched by the stale-record sweep: rewritten, new generation.
+	key := stalePublicationObservationKey(datasetName, publicationPropertyKey("worker-a"))
+	h.d.stalePublicationRecordsSeen.Store(key, newStalePublicationObservation(time.Now(), first))
+	publish(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	require.Len(t, recorder.writes, 1)
+	assert.False(t, samePublicationRecordGeneration(first, stored()), "a new generation")
+	_, stillWatched := h.d.stalePublicationRecordsSeen.Load(key)
+	assert.False(t, stillWatched)
+
+	// A different publication (another access mode) is written.
+	recorder.writes = nil
+	publish(csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER)
+	require.Len(t, recorder.writes, 1)
+	assert.Equal(t, int32(csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER), stored().AccessMode)
+}
+
+// With fencing off, unpublish has no backend access to remove, so it removes
+// the record without first writing an "unpublishing" tombstone. With fencing
+// on, the tombstone still precedes the revocation.
+func TestUnpublishWritesATombstoneOnlyWhenFencingRemovesAccess(t *testing.T) {
+	for _, tc := range []struct {
+		mode          FencingMode
+		wantTombstone bool
+	}{
+		{FencingModeOff, false},
+		{FencingModeStrict, true},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			ctx := context.Background()
+			h := newFencingTestHarness(t, tc.mode, ShareTypeNVMeoF, withNVMeAllowAnyHost())
+			recorder := &propertyWriteRecorder{MockClient: h.client}
+			h.d.truenasClient = recorder
+			datasetName := "pool/parent/unpublished"
+			ds, err := h.client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+			require.NoError(t, err)
+			require.NoError(t, h.d.createNVMeoFShareForDataset(ctx, ds, datasetName, "unpublished", true, true, nil))
+			nodeID, err := encodeNodeIdentity(NodeIdentity{Name: "worker-a", NVMeNQN: "nqn.2014-08.org.nvmexpress:uuid:worker-a"})
+			require.NoError(t, err)
+			_, err = h.d.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{
+				VolumeId: "unpublished", NodeId: nodeID,
+				VolumeCapability: &csi.VolumeCapability{AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER}},
+				VolumeContext:    map[string]string{"node_attach_driver": "nvmeof"},
+			})
+			require.NoError(t, err)
+			recorder.writes = nil
+			_, err = h.d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "unpublished", NodeId: nodeID})
+			require.NoError(t, err)
+			tombstones := 0
+			for _, write := range recorder.writes {
+				if value, ok := write[publicationPropertyKey("worker-a")]; ok && value != "" {
+					tombstones++
+				}
+			}
+			assert.Equal(t, tc.wantTombstone, tombstones == 1, "tombstone writes: %d", tombstones)
+			fresh, err := h.client.DatasetGet(ctx, datasetName)
+			require.NoError(t, err)
+			_, retained := fresh.UserProperties[publicationPropertyKey("worker-a")]
+			assert.False(t, retained, "the record is gone either way")
+		})
+	}
+}

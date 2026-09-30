@@ -24,7 +24,7 @@ func (b nvmeoFShareBackend) EnsureShare(ctx context.Context, ds *truenas.Dataset
 }
 
 func (b nvmeoFShareBackend) CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
-	return b.d.createNVMeoFShareForDataset(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, nil)
+	return b.d.createNVMeoFShare(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, nil, finalProperties)
 }
 
 func (b nvmeoFShareBackend) DeleteShare(ctx context.Context, ds *truenas.Dataset, datasetName string) error {
@@ -182,7 +182,20 @@ func (d *Driver) associateNVMeoFPorts(ctx context.Context, subsysID int, address
 	return portSubsysIDs, nil
 }
 
-func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution) error { //nolint:unparam // volumeName is part of the ShareBackend.EnsureShare calling convention shared with NFS/iSCSI (see share_backend.go); this backend does not currently need it, but the signature stays symmetric across all three
+func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution) error {
+	return d.createNVMeoFShare(ctx, ds, datasetName, volumeName, freshlyCreated, zvolReady, res, nil)
+}
+
+// createNVMeoFShare is createNVMeoFShareForDataset with CreateVolume's final
+// property update: when finalProperties is non-nil the new share's resource IDs
+// are folded into it instead of a separate warning-only write, as the NFS and
+// iSCSI builders do. The caller writes that map fatally right after, still on
+// the same side of the share-create boundary, so the IDs become
+// durable-or-rolled-back with the rest of provisioning and a create costs one
+// pool.dataset.update fewer. A share left without stored IDs by a crash in
+// between is the same state a failed warning-only write leaves, which the
+// idempotent paths already recover by name.
+func (d *Driver) createNVMeoFShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution, finalProperties map[string]string) error { //nolint:unparam // volumeName is part of the ShareBackend.EnsureShare calling convention shared with NFS/iSCSI (see share_backend.go); this backend does not currently need it, but the signature stays symmetric across all three
 	if !d.config.Fencing.Enabled() && !d.config.NVMeoF.SubsystemAllowAnyHost && len(d.config.NVMeoF.SubsystemHosts) == 0 {
 		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")
 	}
@@ -383,13 +396,18 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 		return status.Errorf(codes.Internal, "failed to create NVMe-oF namespace: %v", err)
 	}
 
-	// Store all property IDs in one dataset update.
+	// Store all property IDs in one dataset update, or in the caller's.
 	// These properties are used for idempotency on retry and cleanup during deletion.
-	if err := d.setDatasetUserProperties(ctx, ds, datasetName, map[string]string{
+	resourceIDs := map[string]string{
 		PropNVMeoFSubsystemID:  strconv.Itoa(subsys.ID),
 		PropNVMeoFPortSubsysID: strconv.Itoa(portSubsys.ID),
 		PropNVMeoFNamespaceID:  strconv.Itoa(namespace.ID),
-	}); err != nil {
+	}
+	if finalProperties != nil {
+		for key, value := range resourceIDs {
+			finalProperties[key] = value
+		}
+	} else if err := d.setDatasetUserProperties(ctx, ds, datasetName, resourceIDs); err != nil {
 		klog.Warningf("Failed to store NVMe-oF resource IDs: %v", err)
 	}
 

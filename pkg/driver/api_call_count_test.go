@@ -914,20 +914,21 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountEncryptionVolumeRequest("fresh-nfs-enc"))
 			require.NoError(t, err)
 		}},
-		// Fourteen calls: existence DatasetGet; DatasetCreate (zvol); the
+		// Thirteen calls: existence DatasetGet; DatasetCreate (zvol); the
 		// createDataset ownership stamp via pool.dataset.update (DatasetUpdate) plus
 		// the one-time post-connect verifying re-read (DatasetGet); the automatic
 		// iSCSI target-group resolution (ISCSIPortalList + ISCSIInitiatorList — these
 		// two were invisible until the counting client wrapped the full surface);
-		// ISCSITargetCreate; ISCSIExtentCreate; ISCSITargetExtentCreate; the in-share
-		// resource-ID stamp (DatasetSetUserProperties); the debounced ServiceReload;
-		// getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and the final
-		// managed/ownership/provision/name stamp (DatasetSetUserProperties).
-		{name: "CreateVolume fresh iSCSI", want: 14, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// ISCSITargetCreate; ISCSIExtentCreate; ISCSITargetExtentCreate; the debounced
+		// ServiceReload; getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and
+		// the final managed/ownership/provision/name stamp (DatasetSetUserProperties),
+		// which also carries the share's resource IDs (it was fourteen while those
+		// had a warning-only write of their own).
+		{name: "CreateVolume fresh iSCSI", want: 13, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
 		}},
-		// Seventeen calls: the 14-call iSCSI baseline PLUS three CHAP peer calls on
+		// Sixteen calls: the 13-call iSCSI baseline PLUS three CHAP peer calls on
 		// a cold controller — ISCSIAuthQueryByTag (tag miss), ISCSIAuthCreate, and a
 		// second ISCSIAuthQueryByTag that verifies no cross-process duplicate peer
 		// raced the create (X5: TrueNAS middleware does not enforce tag uniqueness,
@@ -935,10 +936,11 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// linkage folds into the existing target-group create and the auth tag/mode
 		// dataset props fold into the existing FATAL managed-property update (X1), so
 		// CHAP adds no other round trip. Steady-state (warm cache, second volume on
-		// the same controller) is +0; the golden driver is fresh per case so 17 is
+		// the same controller) is +0; the golden driver is fresh per case so 16 is
 		// the measured cold count. (Was 16 before Sprint 2 added the post-create
-		// duplicate-tag reconciliation query.)
-		{name: "CreateVolume fresh iSCSI CHAP", want: 17, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// duplicate-tag reconciliation query, then 17 until the share's resource
+		// IDs folded into the fatal update.)
+		{name: "CreateVolume fresh iSCSI CHAP", want: 16, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("fresh-iscsi-chap"))
 			require.NoError(t, err)
 		}},
@@ -1390,15 +1392,14 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-nfs-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Three calls:
+		// Two calls:
 		// 1. DatasetGet                      — ControllerUnpublishVolume volume read.
-		// 2. DatasetSetUserProperties        — flip the record to "unpublishing"
-		//                                      BEFORE access is removed (crash-safe
-		//                                      tombstone; a restart can never re-add).
-		// 3. DatasetRemoveUserProperties     — removePublicationRecords clears the
-		//                                      durable record (off mode never touches
-		//                                      a backend allowlist).
-		assertAPICallCount(t, "off NFS unpublish", client, 3)
+		// 2. DatasetRemoveUserProperties     — removePublicationRecords clears the
+		//                                      durable record. Off mode never touches
+		//                                      a backend allowlist, so there is no
+		//                                      access removal for an "unpublishing"
+		//                                      tombstone to guard and none is written.
+		assertAPICallCount(t, "off NFS unpublish", client, 2)
 	})
 
 	// (b) additive + NFS — backend enforcement on, static policy preserved. The
@@ -1473,7 +1474,8 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerPublishVolume(ctx, nvmeoFPublishRequest("strict-nvme", nodeA))
 		require.NoError(t, err)
-		// Nine calls (steady-state republish; ~13 before P1):
+		// Eight calls (steady-state republish; ~13 before P1, 9 while an unchanged
+		// record was rewritten):
 		// 1. DatasetGet                      — ControllerPublishVolume volume read.
 		// 2. NVMeoFNamespaceGet              — ensureShare resolves the namespace
 		//                                      (memoized for the rest of the request).
@@ -1483,13 +1485,13 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		//                                      node NQN to a host ID.
 		// 5. NVMeoFHostSubsysListBySubsystem — validateBackend reads the allowlist
 		//                                      for compatibility/classification.
-		// 6. DatasetSetUserProperties        — storePublicationRecord.
-		// 7. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read;
+		//    (record write SKIPPED: the stored record already says exactly this.)
+		// 6. NVMeoFHostSubsysListBySubsystem — enforcement-boundary fresh read;
 		//                                      compatibility state is not reused.
-		// 8. NVMeoFHostSubsysCreate          — unconditional idempotent assertion
+		// 7. NVMeoFHostSubsysCreate          — unconditional idempotent assertion
 		//                                      of the desired association.
-		// 9. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view.
-		assertAPICallCount(t, "strict NVMe-oF publish", client, 9)
+		// 8. NVMeoFHostSubsysListBySubsystem — fresh post-create removal view.
+		assertAPICallCount(t, "strict NVMe-oF publish", client, 8)
 	})
 	t.Run("strict NVMe-oF unpublish", func(t *testing.T) {
 		client := newAPICallCountingClient()
@@ -1601,16 +1603,13 @@ func TestControllerPublishUnpublishGoldenAPICallCounts(t *testing.T) {
 		client.resetCalls()
 		_, err = d.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "off-iscsi-unpub", NodeId: nodeA})
 		require.NoError(t, err)
-		// Three calls (mirror of off NFS unpublish; off mode never touches a backend
-		// allowlist):
+		// Two calls (mirror of off NFS unpublish; off mode never touches a backend
+		// allowlist, so no "unpublishing" tombstone is written):
 		// 1. DatasetGet                  — ControllerUnpublishVolume volume read.
-		// 2. DatasetSetUserProperties    — flip the record to "unpublishing" BEFORE
-		//                                  access is removed (crash-safe tombstone).
-		// 3. DatasetRemoveUserProperties — removePublicationRecords clears the record.
-		assertAPICallCount(t, "off iSCSI unpublish", client, 3)
+		// 2. DatasetRemoveUserProperties — removePublicationRecords clears the record.
+		assertAPICallCount(t, "off iSCSI unpublish", client, 2)
 		assertAPICallMethodMap(t, "off iSCSI unpublish", client, map[string]int{
 			"DatasetGet":                  1,
-			"DatasetSetUserProperties":    1,
 			"DatasetRemoveUserProperties": 1,
 		})
 	})

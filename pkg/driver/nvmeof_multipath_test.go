@@ -54,7 +54,7 @@ func newMultipathAPICallCountDriver(t *testing.T, client *apiCallCountingClient,
 // distinct storage addresses. Nothing else changes.
 func TestNVMeoFMultipathAPICallGolden(t *testing.T) {
 	const (
-		singlePathCalls = 12
+		singlePathCalls = 11
 		addressCount    = 4
 	)
 	// 4 addresses => 3 extra ports beyond the single-path baseline, each costing

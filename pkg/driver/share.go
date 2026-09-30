@@ -632,9 +632,9 @@ func (d *Driver) ensureShareExists(ctx context.Context, ds *truenas.Dataset, dat
 // CreateVolume would otherwise write in a separate post-share update. NFS folds
 // them into the share-ID stamp (one pool.dataset.update on the same side of the
 // NFSShareCreate boundary); callers that must not change the idempotent-retry
-// path (ensureShareExists) pass nil. Block protocols ignore them and let
-// CreateVolume stamp them separately, because their in-share ID stamp is a
-// non-fatal best-effort write.
+// path (ensureShareExists) pass nil. Block protocols fold their resource IDs
+// into the same map instead of a separate warning-only write, and CreateVolume
+// writes it fatally right after the share is built.
 func (d *Driver) createShareWithOptions(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, shareType ShareType, freshlyCreated, zvolReady bool, finalProperties map[string]string) error {
 	klog.Infof("Creating %s share for dataset: %s (freshlyCreated=%v, zvolReady=%v)", shareType, datasetName, freshlyCreated, zvolReady)
 
