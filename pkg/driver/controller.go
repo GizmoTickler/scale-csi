@@ -2166,7 +2166,7 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	// Publication records (CSI single-node exclusivity, idempotency, takeover) are
 	// maintained unconditionally; fencing.mode only governs backend allowlist
 	// enforcement inside publishFencedVolume.
-	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, req.GetVolumeCapability(), req.GetReadonly(), res); err != nil {
+	if err := d.publishFencedVolume(ctx, ds, datasetName, shareType, identity, nodeID, req.GetVolumeCapability(), req.GetReadonly(), res); err != nil {
 		return nil, err
 	}
 
