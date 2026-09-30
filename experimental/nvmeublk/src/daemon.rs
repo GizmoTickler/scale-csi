@@ -290,7 +290,10 @@ impl Daemon {
             }
         }
         let vol = spec.volume.clone();
-        let r = device::start(spec, None)?;
+        // Recorded volumes still being recovered have not taken their place
+        // in the reactor pool again: the new volume is admitted after them.
+        let recovering: Vec<DeviceSpec> = lock(&self.recovering).values().map(|p| p.entry.spec.clone()).collect();
+        let r = device::start_new(spec, &recovering)?;
         let out = json!({"ok": true, "dev_id": r.dev_id, "path": r.path()});
         lock(&self.devices).insert(vol, r);
         self.save(&BTreeMap::new());
@@ -884,8 +887,12 @@ mod tests {
         assert_eq!((zeros.queues, zeros.depth), (copy.queues, copy.depth), "0 means not given");
         let old_kernel = attach_spec(&req(json!({"zero_copy": true})), false).unwrap();
         assert_eq!((old_kernel.queues, old_kernel.depth), (device::UNPOOLED_QUEUES, device::DEFAULT_DEPTH), "zero copy without batch I/O is served per volume");
-        let pooled = attach_spec(&req(json!({"zero_copy": true})), true).unwrap();
-        assert_eq!((pooled.queues, pooled.depth), device::layout_defaults(true, true, true, true));
+        if crate::reactor::pool_wanted() && crate::batchq::shared_engines() {
+            // Served by the pool: the pool's layout, not the explicit 3 x 48
+            // of the next case and not a per-volume one's copying depth.
+            let pooled = attach_spec(&req(json!({"zero_copy": true})), true).unwrap();
+            assert!(pooled.queues >= 2 && (pooled.depth == device::DENSE_DEPTH || pooled.depth == device::DEFAULT_DEPTH), "pooled: {} x {}", pooled.queues, pooled.depth);
+        }
         let explicit = attach_spec(&req(json!({"zero_copy": true, "queues": 3, "depth": 48})), true).unwrap();
         assert_eq!((explicit.queues, explicit.depth), (3, 48), "explicit values win");
         let half = attach_spec(&req(json!({"zero_copy": false, "depth": 32})), true).unwrap();

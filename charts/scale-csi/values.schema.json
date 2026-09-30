@@ -1480,10 +1480,10 @@
               "type": "boolean"
             },
             "maxVolumesPerNode": {
-              "description": "Volumes one node must be able to serve through the ublk data path at once.",
+              "description": "Volumes one node must be able to serve through the ublk data path at once (at most 128; 64 on a node with fewer than 16 CPUs).",
               "type": "integer",
               "minimum": 1,
-              "maximum": 4096
+              "maximum": 128
             },
             "queues": {
               "description": "ublk queues per device; 0 lets nvmeublkd size it for the node.",

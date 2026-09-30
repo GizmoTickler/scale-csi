@@ -266,10 +266,30 @@ func TestChartNVMeUblkDaemonSet(t *testing.T) {
 		first, _ := asManifest(env[0])
 		last, _ := asManifest(env[1])
 		if first["name"] != "NVMEUBLK_MAX_VOLUMES" || first["value"] != "64" {
-			t.Errorf("first env entry = %v, want NVMEUBLK_MAX_VOLUMES=64 (before extraEnv, so an override there wins)", first)
+			t.Errorf("first env entry = %v, want NVMEUBLK_MAX_VOLUMES=64", first)
 		}
 		if last["name"] != "RUST_LOG" || last["value"] != "debug" {
 			t.Errorf("extraEnv entry = %v", last)
+		}
+	})
+
+	// Env names must be unique (a duplicate is rejected by server-side
+	// apply), so an extraEnv budget replaces the chart's entry.
+	t.Run("an extraEnv budget replaces the chart's", func(t *testing.T) {
+		manifests := decodeManifests(t, helmTemplate(t, withArgs(args,
+			"--set", "nvmeof.ublk.maxVolumesPerNode=64",
+			"--set", "nvmeof.ublk.daemon.extraEnv[0].name=NVMEUBLK_MAX_VOLUMES",
+			"--set-string", "nvmeof.ublk.daemon.extraEnv[0].value=16",
+		)...))
+		podSpec := podSpecOf(t, findManifest(t, manifests, "DaemonSet", "-nvmeublkd"), "nvmeublkd DaemonSet")
+		container, _ := namedEntry(t, podSpec["containers"], "nvmeublkd")
+		env, _ := container["env"].([]interface{})
+		if len(env) != 1 {
+			t.Fatalf("env = %v, want exactly one NVMEUBLK_MAX_VOLUMES entry", container["env"])
+		}
+		only, _ := asManifest(env[0])
+		if only["name"] != "NVMEUBLK_MAX_VOLUMES" || only["value"] != "16" {
+			t.Errorf("env entry = %v, want the extraEnv value 16", only)
 		}
 	})
 
@@ -328,6 +348,7 @@ func TestChartNVMeUblkSchemaRejectsInvalidValues(t *testing.T) {
 		{"--set", "nvmeof.ublk.queues=-1"},
 		{"--set", "nvmeof.ublk.depth=8192"},
 		{"--set", "nvmeof.ublk.maxVolumesPerNode=0"},
+		{"--set", "nvmeof.ublk.maxVolumesPerNode=129"},
 		{"--set", "nvmeof.ublk.napiUs=-1"},
 		{"--set", "nvmeof.ublk.attachTimeout=0"},
 		{"--set", "nvmeof.ublk.daemon.terminationGracePeriodSeconds=1"},

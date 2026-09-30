@@ -23,9 +23,15 @@ hosting one of its tenancies, so a node holds a bounded number of zero-copy
 volumes: 16 of the 8 x 256 layout on eight reactors. `NVMEUBLK_MAX_VOLUMES`
 (default 32; the chart's `nvmeof.ublk.maxVolumesPerNode`) is the number a node
 must hold, and an attach that names no layout gets the largest one of which
-that many fit: 8 x 256, then 8 x 128, 4 x 128, 2 x 128. An attach that finds
-the tables full is refused before a device is created, with an error naming
-the setting. A volume without zero copy (or on a kernel without ublk batch
+that many fit: 8 x 256, then 8 x 128, 4 x 128, 2 x 128 (the floor: 128 volumes
+on eight reactors, 64 on four to seven; the daemon warns about a budget past
+it). A new volume is admitted before anything is connected or created, and
+only into room nothing else is promised: after a daemon restart the tables are
+empty until each recorded volume's recovery reserves its ranges again, so an
+attach in that window counts the volumes still being recovered, and two
+attaches cannot be admitted into the same last place. One that does not fit
+is refused with an error naming the setting, or asking for a retry when the
+room is only promised. A volume without zero copy (or on a kernel without ublk batch
 I/O) is not pooled: it gets 2 queues (x 64 tags without zero copy, where each
 tag locks a 512 KiB buffer) and its own threads.
 

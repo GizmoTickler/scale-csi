@@ -82,17 +82,40 @@ pub fn fit_layout(base: (u16, u16), fits: impl Fn(u16, u16) -> bool) -> (u16, u1
     (queues, depth)
 }
 
+/// Default (queues, depth) of a pooled device on a node of `ncpu` CPUs whose
+/// pool has `reactors` reactors (`primaries` of them primary), for a budget
+/// of `want` volumes. `adaptive` is NVMEUBLK_ADAPTIVE, whose layout has a
+/// tenancy on every reactor and starts at the dense depth.
+pub fn pooled_layout_on(ncpu: usize, reactors: usize, primaries: usize, want: usize, adaptive: bool) -> (u16, u16) {
+    let base = (queues_for_cpus(ncpu), if adaptive { DENSE_DEPTH } else { DEFAULT_DEPTH });
+    let threads = (if adaptive { 8 } else { 4 }).min(reactors as u16);
+    fit_layout(base, |queues, depth| pooled_capacity(reactors, primaries, queues, threads, depth, adaptive) >= want)
+}
+
+fn pooled_capacity(reactors: usize, primaries: usize, queues: u16, threads: u16, depth: u16, adaptive: bool) -> usize {
+    crate::reactor::capacity(reactors, primaries, queues, threads, depth, adaptive && full_pool_layout(queues, threads, reactors))
+}
+
 /// Default (queues, depth) of a pooled device on this node.
 fn pooled_layout() -> (u16, u16) {
     let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as usize;
-    let base = (queues_for_cpus(ncpu), if full_pool_defaults() { DENSE_DEPTH } else { DEFAULT_DEPTH });
-    let Some((reactors, primaries)) = crate::reactor::planned() else { return base };
-    let threads = d_threads().min(reactors as u16);
+    let adaptive = crate::batchq::adaptive();
+    let Some((reactors, primaries)) = crate::reactor::planned() else {
+        return (queues_for_cpus(ncpu), if adaptive { DENSE_DEPTH } else { DEFAULT_DEPTH });
+    };
     let want = max_volumes();
-    fit_layout(base, |queues, depth| {
-        let adaptive = crate::batchq::adaptive() && full_pool_layout(queues, threads, reactors);
-        crate::reactor::capacity(reactors, primaries, queues, threads, depth, adaptive) >= want
-    })
+    let (queues, depth) = pooled_layout_on(ncpu, reactors, primaries, want, adaptive);
+    let holds = pooled_capacity(reactors, primaries, queues, d_threads().min(reactors as u16), depth, adaptive);
+    if holds < want {
+        // Said once: the budget is a node setting, and this runs per attach.
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "NVMEUBLK_MAX_VOLUMES={want} is more than this node's {reactors} reactors hold: the smallest layout ({queues} queues x {depth} tags) fits {holds} volumes; attaches past that are refused"
+            );
+        }
+    }
+    (queues, depth)
 }
 
 pub fn d_queues() -> u16 {
@@ -952,6 +975,58 @@ fn ident(spec: &DeviceSpec) -> Ident {
     }
 }
 
+fn tables_full(volume: &str, d: crate::reactor::Demand, pool: &crate::reactor::Pool) -> anyhow::Error {
+    anyhow!(
+        "{volume}: this node's zero-copy buffer tables are full: no room for another volume of {} queues x {} tags ({} such volumes fit on {} reactors). \
+         Set NVMEUBLK_MAX_VOLUMES (chart: nvmeof.ublk.maxVolumesPerNode) to the volumes a node must hold, so new volumes get a layout that fits, or attach with fewer queues or a smaller depth",
+        d.queues,
+        d.depth,
+        pool.capacity(d.queues, d.threads, d.depth, d.adaptive),
+        pool.reactors()
+    )
+}
+
+/// What `spec` takes from the reactor pool's buffer tables as `start` will
+/// serve it (its clamps are the ones `start_here_inner` applies), or None
+/// for a device the pool does not serve. `batch` is the device's effective
+/// batch I/O: the kernel's for a new device, the recorded spec's for one
+/// being recovered.
+fn pool_demand(spec: &DeviceSpec, batch: bool, reactors: usize) -> Option<crate::reactor::Demand> {
+    if !(spec.zero_copy && batch && spec.batch_io && spec.hot_lane) {
+        return None;
+    }
+    let (queues, depth) = (spec.queues.max(1), spec.depth.max(2));
+    let threads = spec.threads_per_queue.clamp(1, depth).min(reactors as u16);
+    Some(crate::reactor::Demand { queues, threads, depth, adaptive: crate::batchq::adaptive() && full_pool_layout(queues, threads, reactors) })
+}
+
+/// Start serving a new volume, once it is admitted to the pool: it must fit
+/// in the buffer tables after the recorded volumes in `recovering`, which
+/// have not reserved their ranges again yet (see `Pool::admit`). Refused
+/// before anything is connected or created. The admission is held until the
+/// device is up, so a second attach cannot be admitted into the same room.
+pub fn start_new(spec: DeviceSpec, recovering: &[DeviceSpec]) -> Result<Running> {
+    let has_batch = UblkCtrl::get_features().unwrap_or(0) & libublk::sys::UBLK_F_BATCH_IO as u64 != 0;
+    let _admitted = match crate::reactor::planned().and_then(|(reactors, _)| pool_demand(&spec, has_batch, reactors).map(|d| (d, reactors))) {
+        Some((demand, reactors)) => match crate::reactor::pool() {
+            Some(pool) => {
+                let ahead: Vec<_> = recovering.iter().filter_map(|r| pool_demand(r, true, reactors)).collect();
+                match pool.admit(&ahead, demand) {
+                    Ok(a) => Some(a),
+                    Err(crate::reactor::Refused::Full) => return Err(tables_full(&spec.volume, demand, pool)),
+                    Err(crate::reactor::Refused::Promised(n)) => bail!(
+                        "{}: the room left in this node's zero-copy buffer tables is promised to volumes ahead of it ({n} still being recovered); retry",
+                        spec.volume
+                    ),
+                }
+            }
+            None => None,
+        },
+        None => None,
+    };
+    start(spec, None)
+}
+
 /// Start serving `spec`. `recover` = Some((dev_id, hold_writes)) reattaches
 /// an existing ublk device after this process (or a predecessor) exited;
 /// hold_writes is false only when the predecessor drained cleanly.
@@ -1252,17 +1327,13 @@ fn bring_up(
     };
     let adaptive_layout = crate::batchq::adaptive() && pool.is_some_and(|p| full_pool_layout(queues, threads, p.reactors()));
     // Refuse before a device exists when the pool's buffer tables cannot
-    // take this volume (a device that is recovered already has its place in
-    // the kernel; its queues find out in `launch_on_pool`).
+    // take this volume. The daemon admits a new volume before this, counting
+    // recorded volumes still to be recovered (`start_new`); this covers
+    // `nvmeublk run`. A recovered device already exists in the kernel; its
+    // queues find out in `launch_on_pool`.
     if let (Some(p), None) = (pool, &recover) {
         if !p.has_room(queues, threads, depth, adaptive_layout) {
-            bail!(
-                "{}: this node's zero-copy buffer tables are full: no room for another volume of {queues} queues x {depth} tags ({} such volumes fit on {} reactors). \
-                 Set NVMEUBLK_MAX_VOLUMES (chart: nvmeof.ublk.maxVolumesPerNode) to the volumes a node must hold, so new volumes get a layout that fits, or attach with fewer queues or a smaller depth",
-                spec.volume,
-                p.capacity(queues, threads, depth, adaptive_layout),
-                p.reactors()
-            );
+            return Err(tables_full(&spec.volume, crate::reactor::Demand { queues, threads, depth, adaptive: adaptive_layout }, p));
         }
     }
     let hot = spec.hot_lane.then(|| {
@@ -1650,8 +1721,57 @@ mod tests {
         assert_eq!(l(true, true, true, false), (super::UNPOOLED_QUEUES, super::DEFAULT_DEPTH), "zero copy on a kernel without batch I/O");
         assert_eq!(l(true, false, false, true), (2, 256), "zero copy, per-tag by request");
         if crate::reactor::pool_wanted() && crate::batchq::shared_engines() {
-            assert_eq!(l(true, true, true, true), super::pooled_layout(), "pooled");
+            // Pooled: never the per-volume layouts' queue count above what
+            // the CPUs give, and never the copying depth.
+            let (queues, depth) = l(true, true, true, true);
+            let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as usize;
+            assert!((2..=super::queues_for_cpus(ncpu)).contains(&queues) && (depth == super::DENSE_DEPTH || depth == super::DEFAULT_DEPTH), "pooled: {queues} x {depth}");
         }
+    }
+
+    /// The layout a node gives its pooled volumes, by its CPUs and budget.
+    /// Depth gives way before queues; an odd reactor count holds one queue
+    /// per range (four tenancies do not fit twice in six reactors), so such
+    /// a node gives up queues sooner; the adaptive layout has a tenancy on
+    /// every reactor and half the volumes per range.
+    #[test]
+    fn pooled_layout_by_node_shape_and_budget() {
+        use super::pooled_layout_on as on;
+        // (cpus, reactors, primaries, budget, adaptive) -> (queues, depth)
+        for (shape, want) in [
+            ((16, 8, 4, 16, false), (8, 256)),
+            ((16, 8, 4, 32, false), (8, 128)),
+            ((16, 8, 4, 64, false), (4, 128)),
+            ((16, 8, 4, 128, false), (2, 128)),
+            ((64, 8, 4, 32, false), (8, 128)),
+            ((12, 6, 3, 32, false), (3, 128)),
+            ((8, 4, 2, 32, false), (4, 128)),
+            ((4, 4, 2, 32, false), (2, 256)),
+            ((4, 4, 2, 64, false), (2, 128)),
+            ((16, 8, 4, 16, true), (8, 128)),
+            ((16, 8, 4, 32, true), (4, 128)),
+        ] {
+            let (ncpu, reactors, primaries, budget, adaptive) = shape;
+            assert_eq!(on(ncpu, reactors, primaries, budget, adaptive), want, "{shape:?}");
+        }
+        // The smallest layout is the floor: 128 volumes on eight reactors, 64 on four.
+        assert_eq!(on(16, 8, 4, 4096, false), (2, 128));
+        assert_eq!(super::pooled_capacity(8, 4, 2, 4, 128, false), 128);
+        assert_eq!(super::pooled_capacity(4, 2, 2, 4, 128, false), 64);
+    }
+
+    /// What a spec takes from the pool: nothing unless the pool serves it,
+    /// and with the clamps the start applies.
+    #[test]
+    fn pool_demand_follows_how_the_device_is_served() {
+        let spec = |extra: &str| -> super::DeviceSpec { serde_json::from_str(&format!(r#"{{"volume":"v","subnqn":"n","addrs":[],"queues":8,"depth":128{extra}}}"#)).unwrap() };
+        let pooled = spec(r#","zero_copy":true"#);
+        assert_eq!(super::pool_demand(&pooled, true, 8), Some(crate::reactor::Demand { queues: 8, threads: 4, depth: 128, adaptive: false }));
+        assert_eq!(super::pool_demand(&pooled, true, 2).map(|d| d.threads), Some(2), "tenancies sit on distinct reactors");
+        assert_eq!(super::pool_demand(&pooled, false, 8), None, "no batch I/O: its own threads");
+        assert_eq!(super::pool_demand(&spec(""), true, 8), None, "copying: its own threads");
+        assert_eq!(super::pool_demand(&spec(r#","zero_copy":true,"hot_lane":false"#), true, 8), None);
+        assert_eq!(super::pool_demand(&spec(r#","zero_copy":true,"batch_io":false"#), true, 8), None, "recorded per-tag device");
     }
 
     #[test]
@@ -1661,7 +1781,12 @@ mod tests {
         assert_eq!((s.queues, s.threads_per_queue, s.depth), (super::d_queues(), super::d_threads(), super::d_depth()));
         if std::env::var_os("NVMEUBLK_REACTORS").is_none() && std::env::var_os("NVMEUBLK_SHARED_ENGINE").is_none() {
             let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as usize;
-            assert_eq!((s.queues, s.depth), super::pooled_layout());
+            if std::env::var_os("NVMEUBLK_MAX_VOLUMES").is_none() && std::env::var_os("NVMEUBLK_ADAPTIVE").is_none() && std::env::var_os("NVMEUBLK_REACTOR_PRIMARIES").is_none() {
+                // This host's pool shape and the default budget, spelled out.
+                let reactors = crate::reactor::default_reactors(ncpu);
+                let expected = super::pooled_layout_on(ncpu, reactors, crate::reactor::default_primaries(reactors), super::DEFAULT_MAX_VOLUMES as usize, false);
+                assert_eq!((s.queues, s.depth), expected, "a spec that names no layout gets the default budget's layout for this host");
+            }
             assert!(s.queues <= super::queues_for_cpus(ncpu) && s.queues >= 2);
         }
         let s: super::DeviceSpec = serde_json::from_str(r#"{"volume":"v","subnqn":"n","addrs":[],"batch_io":false,"hot_lane":false,"conn_classes":false,"depth":64}"#).unwrap();

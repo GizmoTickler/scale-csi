@@ -936,9 +936,11 @@ type NVMeoFUblkConfig struct {
 	// through the ublk data path at once (default 32). nvmeublkd sizes each
 	// volume's default layout so that this many fit in its zero-copy buffer
 	// tables (the chart passes it to the daemon as NVMEUBLK_MAX_VOLUMES), and
-	// when ublk is the install's default data path the node plugin advertises
-	// it as the CSI volume limit unless node.maxVolumesPerNode is set, so the
-	// scheduler does not place more volumes on a node than its daemon takes.
+	// when ublk with zero copy is the install's default data path the node
+	// plugin advertises it as the CSI volume limit unless
+	// node.maxVolumesPerNode is set, so the scheduler does not place more
+	// volumes on a node than its daemon takes. At most 128 (64 on a node with
+	// fewer than 16 CPUs): what the smallest layout fits.
 	MaxVolumesPerNode int `yaml:"maxVolumesPerNode"`
 
 	// AttachTimeout bounds one attach call in seconds (default 60). An attach
@@ -957,9 +959,10 @@ const (
 	// One second of busy polling per wakeup is already far past any useful
 	// budget; anything larger is a typo.
 	maxNVMeUblkNapiUs = 1000000
-	// Far past what a node's buffer tables hold in the smallest layout (128
-	// volumes on eight reactors); anything larger is a typo.
-	maxNVMeUblkMaxVolumesPerNode = 4096
+	// What a node's buffer tables hold in the smallest layout (2 queues x
+	// 128 tags) on eight reactors, the most a daemon runs by default. A node
+	// with fewer than 16 CPUs has fewer reactors and holds 64.
+	maxNVMeUblkMaxVolumesPerNode = 128
 )
 
 // withDefaults returns c with every unset field at its default. The node
@@ -1021,14 +1024,19 @@ func (c NVMeoFConfig) ublkAvailable() bool {
 // volumes use the ublk data path by default advertises the number of volumes
 // each node's nvmeublkd is sized for: past it the daemon refuses the attach,
 // and a pod the scheduler never placed there is better than one stuck in
-// ContainerCreating. An install that only lets classes opt in advertises
-// nothing: most of its volumes do not count against the daemon.
+// ContainerCreating. The CSI limit counts every volume of this driver on the
+// node, whatever its protocol or data path, so it errs towards fewer volumes.
+// An install that only lets classes opt in advertises nothing: most of its
+// volumes do not count against the daemon.
 func (c *Config) nodeVolumeLimit() int64 {
 	if c.Node.MaxVolumesPerNode > 0 {
 		return c.Node.MaxVolumesPerNode
 	}
-	if c.NVMeoF.Enabled && c.NVMeoF.defaultDataPath() == NVMeoFDataPathUblk {
-		return int64(c.NVMeoF.Ublk.withDefaults().MaxVolumesPerNode)
+	ublk := c.NVMeoF.Ublk.withDefaults()
+	// Without zero copy a volume takes nothing from the buffer tables, so
+	// the daemon has no such bound to advertise.
+	if c.NVMeoF.Enabled && c.NVMeoF.defaultDataPath() == NVMeoFDataPathUblk && *ublk.ZeroCopy {
+		return int64(ublk.MaxVolumesPerNode)
 	}
 	return 0
 }

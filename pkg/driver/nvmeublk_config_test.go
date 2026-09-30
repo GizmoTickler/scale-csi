@@ -82,7 +82,7 @@ func TestLoadConfigNVMeoFDataPathRejectsInvalid(t *testing.T) {
 		{"negative napi", "  ublk:\n    napiUs: -1\n", "nvmeof.ublk.napiUs"},
 		{"napi typo", "  ublk:\n    napiUs: 2000000\n", "nvmeof.ublk.napiUs"},
 		{"negative volume budget", "  ublk:\n    maxVolumesPerNode: -1\n", "nvmeof.ublk.maxVolumesPerNode"},
-		{"volume budget typo", "  ublk:\n    maxVolumesPerNode: 100000\n", "nvmeof.ublk.maxVolumesPerNode"},
+		{"volume budget past the smallest layout", "  ublk:\n    maxVolumesPerNode: 129\n", "nvmeof.ublk.maxVolumesPerNode"},
 		{"negative attach timeout", "  ublk:\n    attachTimeout: -5\n", "nvmeof.ublk.attachTimeout"},
 		{"rdma with ublk", "  transport: rdma\n  dataPath: ublk\n", "supports only nvmeof.transport=tcp"},
 		{"rdma with ublk opt-in", "  transport: rdma\n  ublk:\n    enabled: true\n", "supports only nvmeof.transport=tcp"},
@@ -177,6 +177,11 @@ func TestNodeVolumeLimit(t *testing.T) {
 	optIn.NVMeoF.Ublk.Enabled = true
 	optIn.NVMeoF.Ublk.MaxVolumesPerNode = 16
 	assert.Zero(t, optIn.nodeVolumeLimit(), "opt-in classes do not cap the node: most volumes stay on the kernel path")
+
+	copying := ublkDefault(16)
+	off := false
+	copying.NVMeoF.Ublk.ZeroCopy = &off
+	assert.Zero(t, copying.nodeVolumeLimit(), "without zero copy the daemon's tables bound nothing")
 
 	disabled := ublkDefault(16)
 	disabled.NVMeoF.Enabled = false

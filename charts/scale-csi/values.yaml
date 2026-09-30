@@ -707,6 +707,10 @@ nvmeof:
   # A StorageClass with `nvmeof/dataPath: kernel|ublk` pins its volumes to that
   # path regardless of this default. Changing the default never moves a staged
   # volume: it applies at a volume's next NodeStage.
+  # Going back from ublk to kernel: set dataPath=kernel AND ublk.enabled=true,
+  # so the daemon and its socket stay for the volumes still staged through
+  # ublk; set ublk.enabled=false only once no node serves a ublk volume.
+  # Turning both off at once removes the daemon and stops I/O on those volumes.
   dataPath: kernel
 
   # The userspace data path. Nothing here renders into the driver ConfigMap,
@@ -727,8 +731,11 @@ nvmeof:
     # 2 x 128 (fewer queues serve fewer concurrent submitters in parallel).
     # An attach past what fits is refused. With dataPath=ublk the node plugin
     # also advertises this as the node's CSI volume limit (unless
-    # node.maxVolumesPerNode is set), so the scheduler stops there first.
+    # node.maxVolumesPerNode is set), so the scheduler stops there first; that
+    # limit counts every volume of this driver on the node.
     # Count the worst case, e.g. the volumes of a drained node landing here.
+    # At most 128, and 64 on nodes with fewer than 16 CPUs (what the smallest
+    # layout fits); the daemon logs a warning for a budget it cannot hold.
     maxVolumesPerNode: 32
     # ublk queues per device. 0 lets the daemon size it for the node: one
     # queue per two CPUs (2..8), fewer when maxVolumesPerNode requires.
@@ -736,6 +743,9 @@ nvmeof:
     queues: 0
     # Per-queue ublk depth. 0 lets the daemon choose (256, or 128 when
     # maxVolumesPerNode requires; 64 without zero copy).
+    # Pinning queues or depth takes the layout out of the budget's hands: a
+    # node then holds what that layout fits (the README's sizing table),
+    # which can be fewer volumes than maxVolumesPerNode.
     depth: 0
     # ublk zero copy (UBLK_F_AUTO_BUF_REG). Needs kernel >= 6.16; the daemon
     # refuses the attach on an older kernel, so set false there. Without zero
@@ -782,10 +792,12 @@ nvmeof:
       resources:
         requests:
           cpu: 50m
-          memory: 128Mi
+          memory: 256Mi
       # Extra environment for the daemon (NVMEUBLK_* tuning; the defaults are
       # the measured profile). NVMEUBLK_MAX_VOLUMES is set from
-      # maxVolumesPerNode above; an entry here with that name wins.
+      # maxVolumesPerNode above; an entry here with that name replaces it, but
+      # then the node plugin's advertised volume limit no longer matches, so
+      # prefer maxVolumesPerNode.
       extraEnv: []
 
 # Storage classes to create.

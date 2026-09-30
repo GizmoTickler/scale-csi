@@ -71,11 +71,18 @@ spec:
           # allocator of a static musl build halves small-I/O throughput).
           command: ["/nvmeublk", "daemon"]
           env:
-            # The volumes this node must hold: the daemon sizes each volume's
-            # default layout so that many fit in its zero-copy buffer tables.
-            # Listed first, so an extraEnv entry of the same name wins.
+            {{- /* The volumes this node must hold: the daemon sizes each
+                 volume's default layout so that many fit in its zero-copy
+                 buffer tables. An extraEnv entry of the same name replaces
+                 it (env names must be unique). */}}
+            {{- $budgetOverridden := false }}
+            {{- range $daemon.extraEnv }}
+            {{- if eq (toString .name) "NVMEUBLK_MAX_VOLUMES" }}{{ $budgetOverridden = true }}{{ end }}
+            {{- end }}
+            {{- if not $budgetOverridden }}
             - name: NVMEUBLK_MAX_VOLUMES
               value: {{ $ublk.maxVolumesPerNode | default 32 | int | quote }}
+            {{- end }}
             {{- with $daemon.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
