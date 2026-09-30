@@ -161,6 +161,31 @@ func newPublicationRecord(identity NodeIdentity, mode csi.VolumeCapability_Acces
 	return record, nil
 }
 
+// keepCONodeID stores the node id the CO itself uses for the node (the
+// ControllerPublishVolume NodeId, or the CSINode's id when startup
+// reconciliation rebuilds the record) in place of newPublicationRecord's
+// re-encoding of the resolved identity. ListVolumes reports EncodedID back as a
+// published node id and the external-attacher looks for the CSINode's id in
+// it. The re-encoding carries the Node's addresses, which the CSINode id does
+// not, so it never matched: the attacher's reconciler found every attached
+// volume unpublished and forced a ControllerPublishVolume for each of them
+// once a minute.
+//
+// Takeover and the stale-record revoke hand EncodedID back to
+// unpublishFencedVolume, which finds the record by the name parsed out of it,
+// so the id is kept only when it parses and names this record's node. Anything
+// else (empty, malformed, a newer envelope, a CSINode naming another node)
+// keeps the re-encoding, which always does.
+func (r *publicationRecord) keepCONodeID(nodeID string) {
+	if nodeID == "" {
+		return
+	}
+	if parsed, err := parseNodeIdentity(nodeID); err != nil || parsed.Name != r.Node {
+		return
+	}
+	r.EncodedID = nodeID
+}
+
 func (r publicationRecord) identity() NodeIdentity {
 	identity := NodeIdentity{Name: r.Node, NVMeNQN: r.NVMeNQN, ISCSIIQN: r.ISCSIIQN}
 	for _, value := range r.IPs {
@@ -989,7 +1014,9 @@ func (d *Driver) takeOverStaleSingleNodePublication(
 	return freshDS, freshRecords, nil
 }
 
-func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, identity NodeIdentity, capability *csi.VolumeCapability, readonly bool, res *fenceResolution) error {
+// nodeID is the request's NodeId, the id the CO knows this node by; identity is
+// that id resolved against the CSINode and Node objects.
+func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, datasetName string, shareType ShareType, identity NodeIdentity, nodeID string, capability *csi.VolumeCapability, readonly bool, res *fenceResolution) error {
 	// Publication records are the CSI spec-semantics layer and are maintained in
 	// EVERY fencing mode: same-node idempotency, different-node SINGLE_NODE
 	// FailedPrecondition, stale-record takeover, and empty-node-id unpublish-all
@@ -1023,6 +1050,7 @@ func (d *Driver) publishFencedVolume(ctx context.Context, ds *truenas.Dataset, d
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "failed to persist node identity: %v", err)
 	}
+	record.keepCONodeID(nodeID)
 	if modeErr := validateAccessMode(csi.VolumeCapability_AccessMode_Mode(record.AccessMode)); modeErr != nil {
 		return modeErr
 	}

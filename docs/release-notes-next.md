@@ -1,4 +1,44 @@
-# Release notes — v1.13.0 (next)
+# Release notes — v1.13.1 (next)
+
+## v1.13.1 — stop republishing every attached volume every minute
+
+A fix for the controller only; the node plugin, the chart's defaults and
+the data path are unchanged.
+
+Since v1.10.0 the controller reported each volume's publications to
+Kubernetes under a node id of its own making (the node's id plus the
+Node object's addresses), which never equals the id the node registered in
+its CSINode. The csi-attacher compares the two about once a minute for
+every VolumeAttachment, found every attached volume "not published", and
+forced a ControllerPublishVolume for each of them. Nothing broke, but each
+of those republishes cost about 15 TrueNAS API calls, one of them a ZFS
+property write of about a second, and held the volume's lock: on a cluster
+with 29 attachments that was about 440 API calls and 70 seconds of
+TrueNAS middleware time every minute at idle, and a snapshot that arrived
+during a republish was refused with "operation already in progress" and
+retried.
+
+The publication record now keeps the node id Kubernetes uses (the
+ControllerPublishVolume NodeId, or the CSINode's id when the controller
+rebuilds records at startup); fencing still uses the resolved identity
+with its addresses. Records written by earlier versions are rewritten the
+first time they are touched after the upgrade: with fencing enabled, by the
+controller's startup reconciliation, so the republishing stops when v1.13.1
+starts; with fencing off (the chart default), by one last forced republish
+per volume, so it stops within about a minute of the upgrade. To see it: the csi-attacher stops logging "VolumeAttachment
+attached status and actual state do not match", and
+`rate(scale_csi_truenas_requests_total[10m])` on the controller drops to
+near zero at idle.
+
+One behaviour goes away with the noise: the minute-by-minute republish also
+re-applied every volume's backend fence (the NVMe-oF host, iSCSI initiator
+or NFS host allowlist) from the node's current identity. A fence changed by
+hand on TrueNAS used to be reverted within a minute; it now stays as edited
+until the volume's next publish, or a controller restart when fencing is
+on. A node's new address reaches an NFS allowlist at those same points
+instead of within a minute. This is how every CSI driver behaves. A node
+that registers a new identity (a new NQN or IQN) still gets exactly one
+republish.
 
 ## v1.13.0 — optional userspace NVMe/TCP data path (ublk), session GC ownership
 
