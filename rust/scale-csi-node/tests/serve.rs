@@ -136,6 +136,14 @@ async fn serves_identity_and_node_info() {
 
     let ready = reqwest_get(port, "/readyz").await;
     assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+    let metrics = reqwest_get(port, "/metrics").await;
+    for line in [
+        r#"scale_csi_operations_total{code="OK",operation="/csi.v1.Node/NodeGetInfo",status="success"} 1"#,
+        r#"scale_csi_operations_total{code="Unimplemented",operation="/csi.v1.Node/NodeStageVolume",status="error"} 1"#,
+        r#"scale_csi_operations_duration_seconds_count{operation="/csi.v1.Identity/Probe"} 1"#,
+    ] {
+        assert!(metrics.contains(line), "missing {line}\n{metrics}");
+    }
 }
 
 #[tokio::test]

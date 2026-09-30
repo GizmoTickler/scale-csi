@@ -79,21 +79,9 @@ fn respond(path: &str, state: &State) -> (&'static str, &'static str, String) {
                 body,
             )
         }
-        "/metrics" => ("200 OK", "text/plain; version=0.0.4", metrics()),
+        "/metrics" => ("200 OK", "text/plain; version=0.0.4", state.metrics.render()),
         _ => ("404 Not Found", "text/plain", "404 page not found\n".into()),
     }
-}
-
-/// The node's series. A node has no TrueNAS client: the connection gauges are
-/// always 0, as the Go node reports them.
-fn metrics() -> String {
-    "# HELP scale_csi_truenas_connection_status TrueNAS connection status (1 = connected, 0 = disconnected)\n\
-     # TYPE scale_csi_truenas_connection_status gauge\n\
-     scale_csi_truenas_connection_status 0\n\
-     # HELP scale_csi_truenas_connections_active Number of active TrueNAS connections\n\
-     # TYPE scale_csi_truenas_connections_active gauge\n\
-     scale_csi_truenas_connections_active 0\n"
-        .to_string()
 }
 
 #[cfg(test)]
@@ -117,6 +105,7 @@ mod tests {
         let listener = bind(0).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(State {
+            metrics: Default::default(),
             driver_name: "csi.scale.io".into(),
             version: "t".into(),
             node_id: "n".into(),

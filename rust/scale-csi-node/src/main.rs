@@ -10,6 +10,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio_stream::wrappers::UnixListenerStream;
 
 use scale_csi_node::csi::{identity_server::IdentityServer, node_server::NodeServer};
+use scale_csi_node::metrics::{Metrics, OperationsLayer};
 use scale_csi_node::node_id::{self, Protocols};
 use scale_csi_node::service::{IdentityService, NodeService, State};
 use scale_csi_node::{args, config, discovery, health};
@@ -81,7 +82,9 @@ async fn run() -> Result<()> {
     // node-driver-registrar connects from another container of the pod.
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
 
+    let metrics = Arc::new(Metrics::new());
     let state = Arc::new(State {
+        metrics: metrics.clone(),
         driver_name,
         version: env!("CARGO_PKG_VERSION").to_string(),
         node_id,
@@ -108,6 +111,7 @@ async fn run() -> Result<()> {
     state.set_ready(true);
     info!("serving CSI Identity and Node on {}", socket.display());
     tonic::transport::Server::builder()
+        .layer(OperationsLayer(metrics))
         .add_service(IdentityServer::new(IdentityService(state.clone())))
         .add_service(NodeServer::new(NodeService(state.clone())))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)

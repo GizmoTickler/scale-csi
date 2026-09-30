@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::csi::{self, identity_server::Identity, node_server::Node};
 
 pub struct State {
+    pub metrics: Arc<crate::metrics::Metrics>,
     pub driver_name: String,
     pub version: String,
     pub node_id: String,
