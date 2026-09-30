@@ -695,6 +695,111 @@ nvmeof:
   # timeout is commandTimeouts.nvme. The schema still accepts the old key
   # (ignored) so existing values files pass validation.
 
+  # Node data path for volumes whose StorageClass does not set the
+  # `nvmeof/dataPath` parameter:
+  #   kernel (default) — `nvme connect` plus native kernel NVMe multipath.
+  #   ublk             — the userspace NVMe/TCP initiator served by the
+  #                      per-node nvmeublkd daemon as /dev/ublkbN, with its own
+  #                      multipath. The chart deploys the daemon (see
+  #                      ublk.daemon below); nodes need the ublk_drv module;
+  #                      zero copy needs kernel >= 6.16, and the node-wide
+  #                      reactor pool needs ublk batch I/O (kernel 7.x).
+  # A StorageClass with `nvmeof/dataPath: kernel|ublk` pins its volumes to that
+  # path regardless of this default. Changing the default never moves a staged
+  # volume: it applies at a volume's next NodeStage.
+  # Going back from ublk to kernel: set dataPath=kernel AND ublk.enabled=true,
+  # so the daemon and its socket stay for the volumes still staged through
+  # ublk; set ublk.enabled=false only once no node serves a ublk volume.
+  # Turning both off at once removes the daemon and stops I/O on those volumes.
+  dataPath: kernel
+
+  # The userspace data path. Nothing here renders into the driver ConfigMap,
+  # and the node plugin mounts nothing extra, unless ublk is in use
+  # (ublk.enabled=true or dataPath=ublk). See the chart README's "Userspace
+  # NVMe/TCP data path (ublk)" section for what it is good at and what it
+  # costs.
+  ublk:
+    # Make the ublk data path available to StorageClasses that opt in with
+    # `nvmeof/dataPath: ublk` while dataPath above stays kernel. dataPath=ublk
+    # implies it. When in use, the node plugin mounts the host's /run/nvmeublk
+    # (the daemon's socket and runtime directory).
+    enabled: false
+    # Volumes one node must be able to serve through this data path at once.
+    # The daemon's zero-copy buffer tables are a fixed size, so it sizes each
+    # volume's default layout to fit this many: on a 16-CPU node 16 volumes
+    # get 8 queues x 256 tags, 32 get 8 x 128, 64 get 4 x 128 and 128 get
+    # 2 x 128 (fewer queues serve fewer concurrent submitters in parallel).
+    # An attach past what fits is refused. With dataPath=ublk the node plugin
+    # also advertises this as the node's CSI volume limit (unless
+    # node.maxVolumesPerNode is set), so the scheduler stops there first; that
+    # limit counts every volume of this driver on the node.
+    # Count the worst case, e.g. the volumes of a drained node landing here.
+    # At most 128, and 64 on nodes with fewer than 16 CPUs (what the smallest
+    # layout fits); the daemon logs a warning for a budget it cannot hold.
+    maxVolumesPerNode: 32
+    # ublk queues per device. 0 lets the daemon size it for the node: one
+    # queue per two CPUs (2..8), fewer when maxVolumesPerNode requires.
+    # A positive value pins it for every volume attached from then on.
+    queues: 0
+    # Per-queue ublk depth. 0 lets the daemon choose (256, or 128 when
+    # maxVolumesPerNode requires; 64 without zero copy).
+    # Pinning queues or depth takes the layout out of the budget's hands: a
+    # node then holds what that layout fits (the README's sizing table),
+    # which can be fewer volumes than maxVolumesPerNode.
+    depth: 0
+    # ublk zero copy (UBLK_F_AUTO_BUF_REG). Needs kernel >= 6.16; the daemon
+    # refuses the attach on an older kernel, so set false there. Without zero
+    # copy a volume gets 2 queues x 64 tags by default and locks one 512 KiB
+    # buffer per tag (64 MiB per volume), and its own threads.
+    zeroCopy: true
+    # NAPI busy-poll budget in microseconds while I/O is in flight; 0 disables.
+    # 200 is what the data path was measured and drilled with: it is what
+    # brings low-queue-depth latency to the kernel initiator's level or below,
+    # for CPU spent only while a volume has I/O outstanding.
+    napiUs: 200
+    # Seconds one attach may take (it connects every path).
+    attachTimeout: 60
+
+    # The nvmeublkd DaemonSet. Deployed whenever the ublk data path is in use
+    # (ublk.enabled=true or dataPath=ublk), so one value turns the data path
+    # on; set enabled=false only to run the daemon yourself as a host service
+    # using the same /run/nvmeublk. It runs privileged with host networking on
+    # every node the node plugin runs on (same nodeSelector, affinity and
+    # tolerations). SIGTERM is a handover, not a teardown: in-flight I/O drains
+    # (bounded at 5 s), the devices stay, and the next daemon reattaches them,
+    # so a rolling update only pauses I/O on one node at a time.
+    daemon:
+      enabled: true
+      image:
+        # Published (amd64) with every release under the driver's tag.
+        repository: ghcr.io/gizmotickler/scale-csi-nvmeublk
+        # Defaults to v<Chart.appVersion>, the daemon released with this
+        # chart, so a chart upgrade also rolls the daemon (a handover on every
+        # node, one at a time). Pin a tag here to upgrade the data path on
+        # your own schedule.
+        tag: ""
+        # Optional immutable manifest digest; takes precedence over tag.
+        digest: ""
+        pullPolicy: IfNotPresent
+      # Seconds kubelet waits after SIGTERM. Must cover the daemon's 5 s drain.
+      terminationGracePeriodSeconds: 15
+      priorityClassName: system-node-critical
+      # The daemon locks its memory (mlockall). With zero copy budget about
+      # 80 MiB for the daemon plus 6 MiB per attached volume (measured: 188 MiB
+      # with 32 volumes, 340 MiB with 64); without zero copy about 75 MiB per
+      # volume. No limit is set by default: an OOM-killed storage daemon stalls
+      # every volume on the node until it is restarted.
+      resources:
+        requests:
+          cpu: 50m
+          memory: 256Mi
+      # Extra environment for the daemon (NVMEUBLK_* tuning; the defaults are
+      # the measured profile). NVMEUBLK_MAX_VOLUMES is set from
+      # maxVolumesPerNode above; an entry here with that name replaces it, but
+      # then the node plugin's advertised volume limit no longer matches, so
+      # prefer maxVolumesPerNode.
+      extraEnv: []
+
 # Storage classes to create.
 #
 # `protocol` is emitted into the StorageClass parameters ONLY when set on an

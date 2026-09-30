@@ -163,6 +163,14 @@ lsmod | grep nvme_tcp
 The chart configures one NVMe-oF address and service ID. Multi-path NVMe-oF has
 not been validated as a scale-csi deployment mode.
 
+**Optional userspace data path (ublk):** instead of the kernel initiator, a
+volume can be staged through `nvmeublkd`, a per-node userspace NVMe/TCP daemon
+that serves it as `/dev/ublkbN`. It needs the `ublk_drv` module (zero copy
+needs kernel >= 6.16) on every node; the chart deploys the daemon with it. It
+is selected per StorageClass (`nvmeof/dataPath: ublk`) or install-wide
+(`nvmeof.dataPath: ublk`).
+See the chart README's "Userspace NVMe/TCP data path (ublk)" section.
+
 </details>
 
 <details>
