@@ -26,8 +26,8 @@ type ShareBackend interface {
 	// guaranteed-miss idempotency lookups; zvolReady indicates the zvol was
 	// returned by DatasetCreate or the clone readiness wait completed;
 	// finalProperties carries CreateVolume's final stamps: NFS writes them with
-	// its share ID; block protocols fold their resource IDs into the map, which
-	// CreateVolume then writes.
+	// its share ID; the block protocols fold their resource IDs into the map,
+	// which CreateVolume then writes.
 	CreateShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, finalProperties map[string]string) error
 	// DeleteShare removes the share for a dataset.
 	DeleteShare(ctx context.Context, ds *truenas.Dataset, datasetName string) error

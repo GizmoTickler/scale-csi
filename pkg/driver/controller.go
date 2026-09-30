@@ -1072,9 +1072,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	// Block protocols (iSCSI/NVMe-oF) folded their resource IDs into
-	// volumeProperties inside createShareWithOptions, so this one fatal update
-	// carries them with the managed/ownership/provision/name stamps. NFS already
-	// stamped all of it together with the share ID and skips this round trip.
+	// volumeProperties inside createShareWithOptions, so this fatal update
+	// carries them with the managed/ownership/provision/name stamps (NVMe-oF has
+	// no other write of them). NFS already stamped all of it together with the
+	// share ID and skips this round trip.
 	if shareType != ShareTypeNFS {
 		if waitErr := d.setDatasetUserProperties(ctx, createdDS, datasetName, volumeProperties); waitErr != nil {
 			// Property setting failed - clean up the share and dataset to avoid orphaned resources

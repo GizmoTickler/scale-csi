@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -171,4 +172,100 @@ func TestUnpublishWritesATombstoneOnlyWhenFencingRemovesAccess(t *testing.T) {
 			assert.False(t, retained, "the record is gone either way")
 		})
 	}
+}
+
+// failingWriteClient fails the dataset user-property writes that match.
+type failingWriteClient struct {
+	*truenas.MockClient
+	fail func(properties map[string]string) bool
+}
+
+func (c *failingWriteClient) DatasetSetUserProperties(ctx context.Context, name string, properties map[string]string) error {
+	if c.fail != nil && c.fail(properties) {
+		return errors.New("simulated property write failure")
+	}
+	return c.MockClient.DatasetSetUserProperties(ctx, name, properties)
+}
+
+func nvmeObjectCounts(t *testing.T, client *truenas.MockClient) (subsystems, namespaces, portAssociations int) {
+	t.Helper()
+	ctx := context.Background()
+	s, err := client.NVMeoFSubsystemList(ctx)
+	require.NoError(t, err)
+	n, err := client.NVMeoFNamespaceList(ctx)
+	require.NoError(t, err)
+	p, err := client.NVMeoFPortSubsysList(ctx)
+	require.NoError(t, err)
+	return len(s), len(n), len(p)
+}
+
+// A crash between building an NVMe-oF share and CreateVolume's final update
+// leaves the share with no IDs stored and no managed/provision stamps. The
+// retry finds the share by name, stores the IDs and finishes, without a second
+// share; and it does not report success while the repair write fails.
+func TestNVMeoFCreateRetryAfterACrashBeforeTheFinalWrite(t *testing.T) {
+	ctx := context.Background()
+	for _, repairFails := range []bool{false, true} {
+		t.Run(map[bool]string{false: "repair succeeds", true: "repair write fails"}[repairFails], func(t *testing.T) {
+			client := &failingWriteClient{MockClient: truenas.NewMockClient()}
+			d := newMultipathAPICallCountDriver(t, newAPICallCountingClient(), nil)
+			d.truenasClient = client
+			mustCreateParentDataset(t, client.MockClient)
+			req := apiCallCountVolumeRequest("crashed", "nvmeof")
+			datasetName := "pool/parent/crashed"
+
+			// The state the crash leaves: dataset, ownership stamp, share objects;
+			// the IDs only in the final map that was never written.
+			ds, err := client.DatasetCreate(ctx, &truenas.DatasetCreateParams{Name: datasetName, Type: "VOLUME", Volsize: testGiB})
+			require.NoError(t, err)
+			stampDriverOwnership(t, client.MockClient, d, datasetName)
+			require.NoError(t, d.createNVMeoFShare(ctx, ds, datasetName, "crashed", true, true, nil, map[string]string{}))
+			fresh, err := client.DatasetGet(ctx, datasetName)
+			require.NoError(t, err)
+			require.Empty(t, datasetUserProperty(fresh, PropNVMeoFSubsystemID), "no ID was written before the crash")
+
+			if repairFails {
+				client.fail = func(properties map[string]string) bool {
+					_, repair := properties[PropNVMeoFSubsystemID]
+					return repair
+				}
+				_, err = d.CreateVolume(ctx, req)
+				require.Error(t, err, "the retry must not succeed without the IDs stored")
+				client.fail = nil
+			}
+			resp, err := d.CreateVolume(ctx, req)
+			require.NoError(t, err)
+			assert.NotEmpty(t, resp.GetVolume().GetVolumeContext()["nqn"])
+			fresh, err = client.DatasetGet(ctx, datasetName)
+			require.NoError(t, err)
+			assert.NotEmpty(t, datasetUserProperty(fresh, PropNVMeoFSubsystemID))
+			assert.NotEmpty(t, datasetUserProperty(fresh, PropNVMeoFNamespaceID))
+			assert.Equal(t, "true", datasetUserProperty(fresh, PropProvisionSuccess))
+			subsystems, namespaces, _ := nvmeObjectCounts(t, client.MockClient)
+			assert.Equal(t, 1, subsystems, "the retry reused the crashed create's subsystem")
+			assert.Equal(t, 1, namespaces)
+		})
+	}
+}
+
+// When CreateVolume's final update fails, the NVMe-oF share it just built is
+// rolled back with the dataset, although the IDs were never stored on it.
+func TestNVMeoFCreateRollsBackTheShareWhenTheFinalWriteFails(t *testing.T) {
+	ctx := context.Background()
+	client := &failingWriteClient{MockClient: truenas.NewMockClient(), fail: func(properties map[string]string) bool {
+		_, final := properties[PropProvisionSuccess]
+		return final
+	}}
+	d := newMultipathAPICallCountDriver(t, newAPICallCountingClient(), nil)
+	d.truenasClient = client
+	mustCreateParentDataset(t, client.MockClient)
+
+	_, err := d.CreateVolume(ctx, apiCallCountVolumeRequest("rolled-back", "nvmeof"))
+	require.Error(t, err)
+	subsystems, namespaces, portAssociations := nvmeObjectCounts(t, client.MockClient)
+	assert.Zero(t, subsystems)
+	assert.Zero(t, namespaces)
+	assert.Zero(t, portAssociations)
+	_, err = client.DatasetGet(ctx, "pool/parent/rolled-back")
+	assert.Error(t, err, "the dataset is deleted too")
 }

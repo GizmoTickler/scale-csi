@@ -914,21 +914,23 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountEncryptionVolumeRequest("fresh-nfs-enc"))
 			require.NoError(t, err)
 		}},
-		// Thirteen calls: existence DatasetGet; DatasetCreate (zvol); the
+		// Fourteen calls: existence DatasetGet; DatasetCreate (zvol); the
 		// createDataset ownership stamp via pool.dataset.update (DatasetUpdate) plus
 		// the one-time post-connect verifying re-read (DatasetGet); the automatic
 		// iSCSI target-group resolution (ISCSIPortalList + ISCSIInitiatorList — these
 		// two were invisible until the counting client wrapped the full surface);
-		// ISCSITargetCreate; ISCSIExtentCreate; ISCSITargetExtentCreate; the debounced
-		// ServiceReload; getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and
-		// the final managed/ownership/provision/name stamp (DatasetSetUserProperties),
-		// which also carries the share's resource IDs (it was fourteen while those
-		// had a warning-only write of their own).
-		{name: "CreateVolume fresh iSCSI", want: 13, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// ISCSITargetCreate; ISCSIExtentCreate; ISCSITargetExtentCreate; the in-share
+		// resource-ID stamp (DatasetSetUserProperties); the debounced ServiceReload;
+		// getVolumeContext's ISCSITargetGet + ISCSIGlobalConfigGet; and the final
+		// managed/ownership/provision/name stamp (DatasetSetUserProperties). The
+		// in-share stamp stays although the final one repeats it: it lands before
+		// the debounced reload, so a crash in that wait cannot lose the extent-ID
+		// witness and geometry (NVMe-oF folds its IDs instead; its repair is fatal).
+		{name: "CreateVolume fresh iSCSI", want: 14, iscsi: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountVolumeRequest("fresh-iscsi", "iscsi"))
 			require.NoError(t, err)
 		}},
-		// Sixteen calls: the 13-call iSCSI baseline PLUS three CHAP peer calls on
+		// Seventeen calls: the 14-call iSCSI baseline PLUS three CHAP peer calls on
 		// a cold controller — ISCSIAuthQueryByTag (tag miss), ISCSIAuthCreate, and a
 		// second ISCSIAuthQueryByTag that verifies no cross-process duplicate peer
 		// raced the create (X5: TrueNAS middleware does not enforce tag uniqueness,
@@ -936,11 +938,10 @@ func TestControllerGoldenPathAPICallCounts(t *testing.T) {
 		// linkage folds into the existing target-group create and the auth tag/mode
 		// dataset props fold into the existing FATAL managed-property update (X1), so
 		// CHAP adds no other round trip. Steady-state (warm cache, second volume on
-		// the same controller) is +0; the golden driver is fresh per case so 16 is
+		// the same controller) is +0; the golden driver is fresh per case so 17 is
 		// the measured cold count. (Was 16 before Sprint 2 added the post-create
-		// duplicate-tag reconciliation query, then 17 until the share's resource
-		// IDs folded into the fatal update.)
-		{name: "CreateVolume fresh iSCSI CHAP", want: 16, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
+		// duplicate-tag reconciliation query.)
+		{name: "CreateVolume fresh iSCSI CHAP", want: 17, iscsi: true, chap: true, run: func(t *testing.T, client *apiCallCountingClient, d *Driver) {
 			_, err := d.CreateVolume(context.Background(), apiCallCountCHAPVolumeRequest("fresh-iscsi-chap"))
 			require.NoError(t, err)
 		}},

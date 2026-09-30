@@ -192,9 +192,10 @@ func (d *Driver) createNVMeoFShareForDataset(ctx context.Context, ds *truenas.Da
 // iSCSI builders do. The caller writes that map fatally right after, still on
 // the same side of the share-create boundary, so the IDs become
 // durable-or-rolled-back with the rest of provisioning and a create costs one
-// pool.dataset.update fewer. A share left without stored IDs by a crash in
-// between is the same state a failed warning-only write leaves, which the
-// idempotent paths already recover by name.
+// pool.dataset.update fewer. A crash in between (there is no wait in that
+// window, unlike iSCSI's debounced reload) leaves the share without stored IDs:
+// the CreateVolume retry finds the share by name and its repair stamp is
+// fatal, so the retry does not succeed until the IDs are stored.
 func (d *Driver) createNVMeoFShare(ctx context.Context, ds *truenas.Dataset, datasetName, volumeName string, freshlyCreated, zvolReady bool, res *fenceResolution, finalProperties map[string]string) error { //nolint:unparam // volumeName is part of the ShareBackend.EnsureShare calling convention shared with NFS/iSCSI (see share_backend.go); this backend does not currently need it, but the signature stays symmetric across all three
 	if !d.config.Fencing.Enabled() && !d.config.NVMeoF.SubsystemAllowAnyHost && len(d.config.NVMeoF.SubsystemHosts) == 0 {
 		return status.Error(codes.FailedPrecondition, "nvmeof.subsystemAllowAnyHost is false but nvmeof.subsystemHosts is empty — no host could connect; set allow-any-host or provide at least one host NQN")

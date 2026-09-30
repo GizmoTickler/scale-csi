@@ -663,11 +663,8 @@ func TestRealCreateVolumePersistsGeometryWhenTheWarningWriteFails(t *testing.T) 
 	_, err = d.CreateVolume(ctx, blockTuningRequest("pvc-warnfail", "iscsi", map[string]string{
 		paramISCSIBlocksize: "4096", paramISCSIPblocksize: "true",
 	}))
-	require.NoError(t, err)
-	// Since the resource IDs ride only in CreateVolume's fatal update, the
-	// CreateVolume path makes no warning-only write at all, so nothing here can
-	// be lost with it. The ensureShareExists rebuild below still makes one.
-	require.Zero(t, client.failed, "CreateVolume makes no warning-only resource-ID write")
+	require.NoError(t, err, "the warning-only write is non-fatal by design")
+	require.Positive(t, client.failed, "the warning-only write must actually have failed")
 
 	ds, err := mock.DatasetGet(ctx, "pool/parent/pvc-warnfail")
 	require.NoError(t, err)
