@@ -1,0 +1,452 @@
+{
+  "encode": [
+    {
+      "case": "name only",
+      "input": {
+        "name": "k8s-0"
+      },
+      "node_id": "sc1.AQEFazhzLTA"
+    },
+    {
+      "case": "name and nqn",
+      "input": {
+        "name": "k8s-0",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718"
+      },
+      "node_id": "sc1.AQEFazhzLTACRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4"
+    },
+    {
+      "case": "name, nqn and iqn",
+      "input": {
+        "name": "k8s-1",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "iscsi_iqn": "iqn.2004-10.com.ubuntu:01:5f1d3a9c2b7e"
+      },
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4AyZpcW4uMjAwNC0xMC5jb20udWJ1bnR1OjAxOjVmMWQzYTljMmI3ZQ"
+    },
+    {
+      "case": "typical shape: nqn and host ip",
+      "input": {
+        "name": "k8s-1",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "ips": [
+          "198.51.100.11"
+        ]
+      },
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BATGM2QL"
+    },
+    {
+      "case": "surrounding whitespace is trimmed",
+      "input": {
+        "name": " k8s-0\n",
+        "nvme_nqn": "\tnqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718\n",
+        "iscsi_iqn": " iqn.2004-10.com.ubuntu:01:5f1d3a9c2b7e "
+      },
+      "node_id": "sc1.AQEFazhzLTACRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4AyZpcW4uMjAwNC0xMC5jb20udWJ1bnR1OjAxOjVmMWQzYTljMmI3ZQ"
+    },
+    {
+      "case": "unicode whitespace is trimmed",
+      "input": {
+        "name": " k8s-0 ",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718"
+      },
+      "node_id": "sc1.AQEFazhzLTACRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4"
+    },
+    {
+      "case": "ipv4 canonical order, duplicates and non-unicast dropped",
+      "input": {
+        "name": "n",
+        "ips": [
+          "198.51.100.11",
+          "10.0.0.2",
+          "10.0.0.2",
+          "127.0.0.1",
+          "0.0.0.0",
+          "169.254.1.1",
+          "224.0.0.1",
+          "9.9.9.9",
+          "100.64.0.1"
+        ]
+      },
+      "node_id": "sc1.AQEBbgQECgAAAgQEZEAAAQQExjNkCwQECQkJCQ"
+    },
+    {
+      "case": "ipv6 and mapped ipv4",
+      "input": {
+        "name": "n",
+        "ips": [
+          "2001:db8::1",
+          "fe80::1",
+          "::1",
+          "::",
+          "ff02::1",
+          "::ffff:192.0.2.7",
+          "2001:db8:0:0:1:0:0:1",
+          "fd00::a",
+          "2001:DB8::2"
+        ]
+      },
+      "node_id": "sc1.AQEBbgQEwAACBwUQIAENuAAAAAAAAAAAAAAAAQUQIAENuAAAAAAAAQAAAAAAAQUQIAENuAAAAAAAAAAAAAAAAgUQ_QAAAAAAAAAAAAAAAAAACg"
+    },
+    {
+      "case": "mixed families sort by their text",
+      "input": {
+        "name": "n",
+        "ips": [
+          "2001:db8::9",
+          "192.0.2.1",
+          "10.9.9.9",
+          "fd12:3456::1",
+          "1.2.3.4"
+        ]
+      },
+      "node_id": "sc1.AQEBbgQEAQIDBAQECgkJCQQEwAACAQUQIAENuAAAAAAAAAAAAAAACQUQ_RI0VgAAAAAAAAAAAAAAAQ"
+    },
+    {
+      "case": "ipv4-compatible ipv6",
+      "input": {
+        "name": "n",
+        "ips": [
+          "::102:304",
+          "::1.2.3.5"
+        ]
+      },
+      "node_id": "sc1.AQEBbgUQAAAAAAAAAAAAAAAAAQIDBAUQAAAAAAAAAAAAAAAAAQIDBQ"
+    },
+    {
+      "case": "sentinel flag",
+      "input": {
+        "name": "k8s-2",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "ips": [
+          "192.0.2.5"
+        ],
+        "iscsi_reported_sentinel": true
+      },
+      "node_id": "sc1.AQEFazhzLTICRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4BgEBBATAAAIF"
+    },
+    {
+      "case": "ips beyond the 256-byte limit are dropped",
+      "input": {
+        "name": "k8s-0",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "iscsi_iqn": "iqn.2004-10.com.ubuntu:01:5f1d3a9c2b7e",
+        "ips": [
+          "10.1.0.1",
+          "10.1.0.2",
+          "10.1.0.3",
+          "10.1.0.4",
+          "10.1.0.5",
+          "10.1.0.6",
+          "10.1.0.7",
+          "10.1.0.8",
+          "10.1.0.9",
+          "10.1.1.10",
+          "10.1.1.11",
+          "10.1.1.12",
+          "10.1.1.13",
+          "10.1.1.14",
+          "10.1.1.15",
+          "10.1.1.16",
+          "10.1.1.17",
+          "10.1.1.18",
+          "10.1.1.19",
+          "10.1.2.20",
+          "10.1.2.21",
+          "10.1.2.22",
+          "10.1.2.23",
+          "10.1.2.24",
+          "10.1.2.25",
+          "10.1.2.26",
+          "10.1.2.27",
+          "10.1.2.28",
+          "10.1.2.29",
+          "10.1.3.30",
+          "10.1.3.31",
+          "10.1.3.32",
+          "10.1.3.33",
+          "10.1.3.34",
+          "10.1.3.35",
+          "10.1.3.36",
+          "10.1.3.37",
+          "10.1.3.38",
+          "10.1.3.39",
+          "10.1.4.40"
+        ]
+      },
+      "node_id": "sc1.AQEFazhzLTACRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4AyZpcW4uMjAwNC0xMC5jb20udWJ1bnR1OjAxOjVmMWQzYTljMmI3ZQQECgEAAQQECgEAAgQECgEAAwQECgEABAQECgEABQQECgEABgQECgEABwQECgEACAQECgEACQQECgEBCgQECgEBCw"
+    },
+    {
+      "case": "mandatory fields over the limit",
+      "input": {
+        "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+        "nvme_nqn": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+      },
+      "error": true
+    },
+    {
+      "case": "a field over 255 bytes",
+      "input": {
+        "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"
+      },
+      "error": true
+    },
+    {
+      "case": "empty name",
+      "input": {
+        "name": " ",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718"
+      },
+      "error": true
+    },
+    {
+      "case": "the deny-all sentinel as the iqn",
+      "input": {
+        "name": "k8s-0",
+        "iscsi_iqn": " iqn.2016-09.io.scale-csi:deny-all-fence "
+      },
+      "error": true
+    },
+    {
+      "case": "all protocols enabled",
+      "input": {
+        "name": "k8s-0",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "iscsi_iqn": "iqn.2004-10.com.ubuntu:01:5f1d3a9c2b7e",
+        "ips": [
+          "192.0.2.1"
+        ],
+        "protocols": {
+          "nfs": true,
+          "iscsi": true,
+          "nvmeof": true
+        }
+      },
+      "node_id": "sc1.AQEFazhzLTACRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4AyZpcW4uMjAwNC0xMC5jb20udWJ1bnR1OjAxOjVmMWQzYTljMmI3ZQQEwAACAQ"
+    },
+    {
+      "case": "nvmeof only prunes ips, iqn and sentinel",
+      "input": {
+        "name": "k8s-0",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "iscsi_iqn": "iqn.2004-10.com.ubuntu:01:5f1d3a9c2b7e",
+        "ips": [
+          "192.0.2.1"
+        ],
+        "iscsi_reported_sentinel": true,
+        "protocols": {
+          "nfs": false,
+          "iscsi": false,
+          "nvmeof": true
+        }
+      },
+      "node_id": "sc1.AQEFazhzLTACRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6MGIxYzJkM2UtNGY1MC00YTYxLThiNzItYzNkNGU1ZjYwNzE4"
+    },
+    {
+      "case": "nfs only keeps ips",
+      "input": {
+        "name": "k8s-0",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "iscsi_iqn": "iqn.2004-10.com.ubuntu:01:5f1d3a9c2b7e",
+        "ips": [
+          "192.0.2.1"
+        ],
+        "protocols": {
+          "nfs": true,
+          "iscsi": false,
+          "nvmeof": false
+        }
+      },
+      "node_id": "sc1.AQEFazhzLTAEBMAAAgE"
+    },
+    {
+      "case": "iscsi only keeps iqn and sentinel",
+      "input": {
+        "name": "k8s-0",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718",
+        "ips": [
+          "192.0.2.1"
+        ],
+        "iscsi_reported_sentinel": true,
+        "protocols": {
+          "nfs": false,
+          "iscsi": true,
+          "nvmeof": false
+        }
+      },
+      "node_id": "sc1.AQEFazhzLTAGAQE"
+    }
+  ],
+  "parse": [
+    {
+      "case": "legacy plain name",
+      "node_id": "k8s-0",
+      "identity": {
+        "name": "k8s-0",
+        "nvme_nqn": "",
+        "iscsi_iqn": "",
+        "ips": [],
+        "legacy": true,
+        "iscsi_reported_sentinel": false
+      }
+    },
+    {
+      "case": "typical id",
+      "node_id": "sc1.AQEFazhzLTECRG5xbi4yMDE0LTA4Lm9yZy5udm1leHByZXNzOnV1aWQ6OWE4YjdjNmQtNWU0Zi00YTNiLTljMmQtMWUwZjJhM2I0YzVkBATGM2QL",
+      "identity": {
+        "name": "k8s-1",
+        "nvme_nqn": "nqn.2014-08.org.nvmexpress:uuid:9a8b7c6d-5e4f-4a3b-9c2d-1e0f2a3b4c5d",
+        "iscsi_iqn": "",
+        "ips": [
+          "198.51.100.11"
+        ],
+        "legacy": false,
+        "iscsi_reported_sentinel": false
+      }
+    },
+    {
+      "case": "unknown field types are skipped",
+      "node_id": "sc1.AQEBbgkGZnV0dXJlAgVucW4ueA",
+      "identity": {
+        "name": "n",
+        "nvme_nqn": "nqn.x",
+        "iscsi_iqn": "",
+        "ips": [],
+        "legacy": false,
+        "iscsi_reported_sentinel": false
+      }
+    },
+    {
+      "case": "ips are canonicalised on parse",
+      "node_id": "sc1.AQEBbgQEwAACCQQECgAAAQQEfwAAAQQECgAAAQ",
+      "identity": {
+        "name": "n",
+        "nvme_nqn": "",
+        "iscsi_iqn": "",
+        "ips": [
+          "10.0.0.1",
+          "192.0.2.9"
+        ],
+        "legacy": false,
+        "iscsi_reported_sentinel": false
+      }
+    },
+    {
+      "case": "mapped ipv4 in an ipv6 field",
+      "node_id": "sc1.AQEBbgUQAAAAAAAAAAAAAP__wAACBw",
+      "identity": {
+        "name": "n",
+        "nvme_nqn": "",
+        "iscsi_iqn": "",
+        "ips": [
+          "192.0.2.7"
+        ],
+        "legacy": false,
+        "iscsi_reported_sentinel": false
+      }
+    },
+    {
+      "case": "sentinel flag",
+      "node_id": "sc1.AQEBbgYBAQ",
+      "identity": {
+        "name": "n",
+        "nvme_nqn": "",
+        "iscsi_iqn": "",
+        "ips": [],
+        "legacy": false,
+        "iscsi_reported_sentinel": true
+      }
+    },
+    {
+      "case": "a later name field wins",
+      "node_id": "sc1.AQEBYQEBYg",
+      "identity": {
+        "name": "b",
+        "nvme_nqn": "",
+        "iscsi_iqn": "",
+        "ips": [],
+        "legacy": false,
+        "iscsi_reported_sentinel": false
+      }
+    },
+    {
+      "case": "non-zero trailing bits",
+      "node_id": "sc1.AQEBbh",
+      "identity": {
+        "name": "n",
+        "nvme_nqn": "",
+        "iscsi_iqn": "",
+        "ips": [],
+        "legacy": false,
+        "iscsi_reported_sentinel": false
+      }
+    },
+    {
+      "case": "embedded line breaks",
+      "node_id": "sc1.AQEB\r\nbg",
+      "identity": {
+        "name": "n",
+        "nvme_nqn": "",
+        "iscsi_iqn": "",
+        "ips": [],
+        "legacy": false,
+        "iscsi_reported_sentinel": false
+      }
+    },
+    {
+      "case": "prefix only",
+      "node_id": "sc1.",
+      "error": true
+    },
+    {
+      "case": "not base64url",
+      "node_id": "sc1.!!!",
+      "error": true
+    },
+    {
+      "case": "padded base64",
+      "node_id": "sc1.AQECYWI=",
+      "error": true
+    },
+    {
+      "case": "wrong version",
+      "node_id": "sc1.AgEBbg",
+      "error": true
+    },
+    {
+      "case": "truncated header",
+      "node_id": "sc1.AQE",
+      "error": true
+    },
+    {
+      "case": "zero-length field",
+      "node_id": "sc1.AQEA",
+      "error": true
+    },
+    {
+      "case": "length past the end",
+      "node_id": "sc1.AQEFbg",
+      "error": true
+    },
+    {
+      "case": "no name",
+      "node_id": "sc1.AQIFbnFuLng",
+      "error": true
+    },
+    {
+      "case": "short ipv4",
+      "node_id": "sc1.AQEBbgQDAQID",
+      "error": true
+    },
+    {
+      "case": "short ipv6",
+      "node_id": "sc1.AQEBbgUEAQIDBA",
+      "error": true
+    },
+    {
+      "case": "empty",
+      "node_id": "",
+      "error": true
+    }
+  ]
+}

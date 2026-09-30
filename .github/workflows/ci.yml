@@ -55,6 +55,26 @@ jobs:
       - name: Test repo-specific analyzers
         run: go test ./hack/lint/repolint/...
 
+  node-agent:
+    name: Rust Node Agent
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/scale-csi-node
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # rust-toolchain.toml pins the compiler, clippy and rustfmt. The node-id
+      # vectors the agent is checked against are generated and checked by the
+      # Go tests (pkg/driver/testdata/node_identity_vectors.json).
+      - name: Toolchain
+        run: rustup toolchain install
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
