@@ -13,6 +13,7 @@ pub mod locks;
 pub mod metrics;
 pub mod mount;
 pub mod node_id;
+pub mod nvme_addresses;
 pub mod service;
 pub mod ublk_client;
 pub mod ublk_state;
