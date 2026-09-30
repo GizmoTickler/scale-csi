@@ -21,9 +21,11 @@ retried.
 The publication record now keeps the node id Kubernetes uses (the
 ControllerPublishVolume NodeId, or the CSINode's id when the controller
 rebuilds records at startup); fencing still uses the resolved identity
-with its addresses. Records written by earlier versions are rewritten by
-the controller's startup reconciliation, so the republishing stops when
-v1.13.1 starts. To see it: the csi-attacher stops logging "VolumeAttachment
+with its addresses. Records written by earlier versions are rewritten the
+first time they are touched after the upgrade: with fencing enabled, by the
+controller's startup reconciliation, so the republishing stops when v1.13.1
+starts; with fencing off (the chart default), by one last forced republish
+per volume, so it stops within about a minute of the upgrade. To see it: the csi-attacher stops logging "VolumeAttachment
 attached status and actual state do not match", and
 `rate(scale_csi_truenas_requests_total[10m])` on the controller drops to
 near zero at idle.
@@ -31,10 +33,12 @@ near zero at idle.
 One behaviour goes away with the noise: the minute-by-minute republish also
 re-applied every volume's backend fence (the NVMe-oF host, iSCSI initiator
 or NFS host allowlist) from the node's current identity. A fence changed by
-hand on TrueNAS, or a node's new address for an NFS allowlist, now takes
-effect at the volume's next publish or controller restart instead of within
-a minute, which is how every CSI driver behaves. A node that registers a new
-identity (a new NQN or IQN) still gets exactly one republish.
+hand on TrueNAS used to be reverted within a minute; it now stays as edited
+until the volume's next publish, or a controller restart when fencing is
+on. A node's new address reaches an NFS allowlist at those same points
+instead of within a minute. This is how every CSI driver behaves. A node
+that registers a new identity (a new NQN or IQN) still gets exactly one
+republish.
 
 ## v1.13.0 — optional userspace NVMe/TCP data path (ublk), session GC ownership
 
