@@ -29,7 +29,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
 # renovate: datasource=docker depName=alpine
 # The exact multi-architecture manifest digest for this tag is pinned here;
 # Renovate should update the tag and digest together.
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 LABEL org.opencontainers.image.source="https://github.com/GizmoTickler/scale-csi"
 LABEL org.opencontainers.image.url="https://github.com/GizmoTickler/scale-csi"
