@@ -1,4 +1,80 @@
-# Release notes — v1.12.0 (next)
+# Release notes — v1.13.0 (next)
+
+## v1.13.0 — optional userspace NVMe/TCP data path (ublk), session GC ownership
+
+Nothing changes for an install that does not turn the new data path on: the
+default stays the kernel initiator, and chart renders without it are
+byte-identical to v1.12.0.
+
+### New: an optional userspace NVMe/TCP data path
+
+An NVMe-oF volume can now be staged through `nvmeublkd`, a per-node daemon
+that serves the namespace from userspace as `/dev/ublkbN` with its own
+multipath, instead of `nvme connect` and kernel multipath. It is chosen
+install-wide or per StorageClass:
+
+```yaml
+nvmeof:
+  dataPath: ublk          # every NVMe-oF volume, at its next NodeStage
+  # or: ublk: {enabled: true} and `nvmeof/dataPath: ublk` on a StorageClass
+```
+
+That one value deploys the daemon (a privileged host-network DaemonSet, from
+`ghcr.io/gizmotickler/scale-csi-nvmeublk`, published and signed with every
+release under the driver's tag) and mounts its socket into the node plugin.
+`nvmeof.ublk.daemon.enabled=false` is for running the daemon as a host service
+instead, and `nvmeof.ublk.daemon.image.tag` pins the daemon so that a chart
+upgrade does not roll it.
+
+When it pays off. Measured on 16-vCPU nodes over four 10 GbE paths against a
+tuned kernel initiator on the same node: about 2.5x the IOPS at about 0.6x the
+CPU per I/O on 4K random reads at depth, 1.8-2x on mixed 4K and next to a busy
+neighbour, 1.3-1.7x on 4K random writes, 1.05-1.3x on large reads, parity on
+large writes at more CPU, and more CPU per I/O at queue depth 1 and for
+synchronous writes. It is for volumes whose bottleneck is the initiator; the
+chart README has the table.
+
+Requirements: the `ublk_drv` module on every node; kernel >= 6.16 for zero
+copy (`nvmeof.ublk.zeroCopy`, default on) and 7.x (ublk batch I/O) for the
+node-wide reactor pool the figures above were measured with; NVMe/TCP; amd64.
+
+Sizing. With zero copy a node holds a bounded number of volumes, because
+every volume's queues take a range of the daemon's fixed-size io_uring buffer
+tables. `nvmeof.ublk.maxVolumesPerNode` (default 32, at most 128) says how
+many a node must hold, and the daemon sizes each volume to fit: 8 queues x
+256 tags for 16 volumes on a 16-CPU node, 8 x 128 for 32, 4 x 128 for 64,
+2 x 128 for 128. An attach past what fits is refused with an error naming the
+setting, and with `dataPath: ublk` the node plugin advertises the budget as
+the node's CSI volume limit (unless `node.maxVolumesPerNode` is set). The
+daemon locks about 80 MiB plus 6 MiB per volume.
+
+Known limits:
+
+- A staged ublk volume cannot be resized online: NodeExpand returns
+  `FailedPrecondition` until the volume is staged again.
+- Daemon attachments that have no staged volume are not garbage collected.
+- Turning the data path off removes the daemon with it. Go back through
+  `dataPath: kernel` with `ublk.enabled: true`, and set `ublk.enabled: false`
+  only when no node serves a ublk volume (chart README, "Turning the ublk data
+  path off").
+- The driver and the daemon were drilled on a Fedora CoreOS node against a
+  TrueNAS target (path kills, handover, crash recovery, a restart on a full
+  node, a verified soak) but have not yet carried production volumes. Start
+  with an opt-in StorageClass.
+
+### Session GC disconnected NVMe-oF sessions the plugin never connected
+
+Node session GC disconnected any NVMe-oF session to the configured target
+portals that no staged volume owned, including an administrator's, a
+benchmark's or another initiator's. The node plugin now records the NQNs it
+connects (beside its CSI socket: recorded before connecting, forgotten after a
+successful disconnect, re-recorded for staged sessions each pass, pruned after
+the grace period) and GC disconnects only recorded sessions. Without a usable
+registry it skips NVMe-oF GC entirely.
+
+### Also
+
+- `ublkb` devices no longer veto iSCSI session GC.
 
 ## v1.12.0 — CSI spec v1.13, NVMe failover convergence, deferred-defect closeout
 
