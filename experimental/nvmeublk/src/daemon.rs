@@ -689,7 +689,10 @@ fn handle(d: &Daemon, stream: UnixStream) {
     let resp = (|| -> Result<Value> {
         let req: Value = serde_json::from_str(line.trim()).context("request is not JSON")?;
         match req.get("op").and_then(Value::as_str) {
-            Some("attach") => d.attach(serde_json::from_value(req.clone()).context("bad attach request")?),
+            Some("attach") => {
+                let feats = libublk::ctrl::UblkCtrl::get_features().unwrap_or(0);
+                d.attach(attach_spec(&req, feats & libublk::sys::UBLK_F_BATCH_IO as u64 != 0)?)
+            }
             Some("detach") => d.detach(req.get("volume").and_then(Value::as_str).context("detach needs volume")?),
             Some("list") => Ok(d.list()),
             Some("stats") => d.stats(req.get("volume").and_then(Value::as_str).context("stats needs volume")?),
@@ -698,6 +701,37 @@ fn handle(d: &Daemon, stream: UnixStream) {
     })()
     .unwrap_or_else(|e| json!({"ok": false, "error": format!("{e:#}")}));
     let _ = writeln!(w, "{resp}");
+}
+
+/// The DeviceSpec of an attach request. Queues and depth the request leaves
+/// out (or gives as 0) follow how this node will serve the device
+/// (`device::layout_defaults`): the pool's layout for the node's volume
+/// budget, or the small per-volume layouts without zero copy or batch I/O.
+/// Explicit values win. The layout is fixed when the device is added and
+/// recorded with it, so a later change of the defaults moves no volume.
+fn attach_spec(req: &Value, kernel_has_batch: bool) -> Result<DeviceSpec> {
+    // Absent, null and 0 mean "not given"; anything else is for serde to
+    // accept or refuse, so a mistyped value is an error, not a default.
+    let given = |key: &str| !matches!(req.get(key), None | Some(Value::Null)) && req.get(key).and_then(Value::as_u64) != Some(0);
+    let (queues, depth) = (given("queues"), given("depth"));
+    let mut req = req.clone();
+    if let Some(fields) = req.as_object_mut() {
+        if !queues {
+            fields.remove("queues");
+        }
+        if !depth {
+            fields.remove("depth");
+        }
+    }
+    let mut spec: DeviceSpec = serde_json::from_value(req).context("bad attach request")?;
+    let (q, d) = device::layout_defaults(spec.zero_copy, spec.batch_io, spec.hot_lane, kernel_has_batch);
+    if !queues {
+        spec.queues = q;
+    }
+    if !depth {
+        spec.depth = d;
+    }
+    Ok(spec)
 }
 
 pub fn run(socket: &str, state_path: &str) -> Result<()> {
@@ -833,6 +867,34 @@ pub fn ctl(socket: &str, request: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// An attach request that names no layout gets this node's layout for
+    /// the device's mode; explicit values win and 0 means "not given" (the
+    /// node plugin sends what its configuration says, 0 by default).
+    #[test]
+    fn an_attach_request_without_a_layout_gets_the_one_for_its_mode() {
+        let req = |extra: Value| {
+            let mut v = json!({"op": "attach", "volume": "v", "subnqn": "nqn.2026-09.test:sub", "addrs": ["192.0.2.1:4420"]});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let copy = attach_spec(&req(json!({"zero_copy": false})), true).unwrap();
+        assert_eq!((copy.queues, copy.depth), (device::UNPOOLED_QUEUES, device::COPY_DEPTH), "a copying device gets the small layout");
+        let zeros = attach_spec(&req(json!({"zero_copy": false, "queues": 0, "depth": 0})), true).unwrap();
+        assert_eq!((zeros.queues, zeros.depth), (copy.queues, copy.depth), "0 means not given");
+        let old_kernel = attach_spec(&req(json!({"zero_copy": true})), false).unwrap();
+        assert_eq!((old_kernel.queues, old_kernel.depth), (device::UNPOOLED_QUEUES, device::DEFAULT_DEPTH), "zero copy without batch I/O is served per volume");
+        let pooled = attach_spec(&req(json!({"zero_copy": true})), true).unwrap();
+        assert_eq!((pooled.queues, pooled.depth), device::layout_defaults(true, true, true, true));
+        let explicit = attach_spec(&req(json!({"zero_copy": true, "queues": 3, "depth": 48})), true).unwrap();
+        assert_eq!((explicit.queues, explicit.depth), (3, 48), "explicit values win");
+        let half = attach_spec(&req(json!({"zero_copy": false, "depth": 32})), true).unwrap();
+        assert_eq!((half.queues, half.depth), (device::UNPOOLED_QUEUES, 32), "each field defaults on its own");
+        assert!(attach_spec(&json!({"op": "attach", "volume": "v"}), true).is_err(), "a request without a subsystem is still refused");
+        assert!(attach_spec(&req(json!({"queues": "eight"})), true).is_err(), "a mistyped layout is refused, not defaulted");
+        let null = attach_spec(&req(json!({"zero_copy": false, "queues": null})), true).unwrap();
+        assert_eq!(null.queues, device::UNPOOLED_QUEUES, "null means not given");
+    }
 
     fn entry(volume: &str, dev_id: i32, clean: bool) -> StateEntry {
         let spec = serde_json::from_value(json!({"volume": volume, "subnqn": "nqn.2026-09.test:sub", "addrs": ["192.0.2.1:4420"]})).unwrap();

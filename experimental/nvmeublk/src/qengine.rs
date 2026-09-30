@@ -416,8 +416,17 @@ static IDLE_DISCONNECT: std::sync::LazyLock<Duration> = std::sync::LazyLock::new
     Duration::from_secs(std::env::var("NVMEUBLK_IDLE_DISCONNECT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(60))
 });
 
+/// Exact-header receive applies to zero-copy reads with at least this much
+/// payload outstanding (NVMEUBLK_RX_EXACT_MIN; 0 turns it off). 16 KiB is
+/// what every measurement and drill of the data path ran with.
+const RX_EXACT_MIN_DEFAULT: usize = 16384;
+
+fn rx_exact_min(configured: Option<&str>) -> usize {
+    configured.and_then(|v| v.parse().ok()).unwrap_or(RX_EXACT_MIN_DEFAULT)
+}
+
 static RX_EXACT_MIN: std::sync::LazyLock<usize> =
-    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_RX_EXACT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    std::sync::LazyLock::new(|| rx_exact_min(std::env::var("NVMEUBLK_RX_EXACT_MIN").ok().as_deref()));
 
 /// Zero-copy receive primitive: 0 = fixed-buffer RECV with MSG_WAITALL
 /// (kernel 7.x; one SQE per payload), 1 = READ_FIXED on the socket (every
@@ -2070,7 +2079,7 @@ impl Engine {
                     buf.resize(buf.len() * 2, 0);
                 }
                 let mut want = (buf.len() - end).min(chunk);
-                // Exact-header receive (NVMEUBLK_RX_EXACT_MIN bytes, tuning):
+                // Exact-header receive (NVMEUBLK_RX_EXACT_MIN bytes, default 16 KiB):
                 // while a zero-copy read with at least that much payload still
                 // to come is in flight here, take only up to the end of the next
                 // PDU header, so its payload lands in the request pages whole
@@ -3213,6 +3222,16 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Mutex;
+
+    /// The shipped default is the measured profile: exact-header receive
+    /// for zero-copy reads of 16 KiB and more; 0 turns it off.
+    #[test]
+    fn exact_receive_is_on_at_16k_by_default() {
+        assert_eq!(super::rx_exact_min(None), 16384);
+        assert_eq!(super::rx_exact_min(Some("0")), 0);
+        assert_eq!(super::rx_exact_min(Some("65536")), 65536);
+        assert_eq!(super::rx_exact_min(Some("junk")), 16384);
+    }
 
     thread_local! {
         /// `panic_point` name armed on this thread (one shot).

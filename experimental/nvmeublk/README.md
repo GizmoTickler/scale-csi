@@ -5,12 +5,29 @@ block device through [ublk](https://docs.kernel.org/block/ublk.html)
 (`/dev/ublkbN`). Built to test whether scale-csi's node data path can leave the
 kernel `nvme-tcp` + native multipath stack.
 
-The September 28 performance review is in [perf/review.md](perf/review.md).
-The container now uses glibc, matching the runtime used for the performance
-baseline. AUTO_BUF_REG batch queues dispatch requests and collect results
+The container uses glibc, matching the runtime used for the performance
+baseline (a static musl build halves small-I/O throughput). AUTO_BUF_REG batch queues dispatch requests and collect results
 without per-tag futures; shared reactor engines run once after all their
 queue tenancies dispatch. FUA write requests are passed through to NVMe.
 Header prefetching is limited by the exact-receive size threshold.
+
+The daemon's defaults are the profile every measurement and drill ran with:
+SQ flow control off (`NVMEUBLK_DISABLE_SQFLOW=0` keeps it) and exact-header
+receive for zero-copy reads of 16 KiB and more (`NVMEUBLK_RX_EXACT_MIN`; 0
+turns it off). scale-csi's node plugin asks for zero copy and 200 us of NAPI
+busy polling per attach.
+
+A reactor ring's buffer table is the kernel's maximum (16384 slots) and every
+queue of a pooled volume needs `depth` slots at the same index on each reactor
+hosting one of its tenancies, so a node holds a bounded number of zero-copy
+volumes: 16 of the 8 x 256 layout on eight reactors. `NVMEUBLK_MAX_VOLUMES`
+(default 32; the chart's `nvmeof.ublk.maxVolumesPerNode`) is the number a node
+must hold, and an attach that names no layout gets the largest one of which
+that many fit: 8 x 256, then 8 x 128, 4 x 128, 2 x 128. An attach that finds
+the tables full is refused before a device is created, with an error naming
+the setting. A volume without zero copy (or on a kernel without ublk batch
+I/O) is not pooled: it gets 2 queues (x 64 tags without zero copy, where each
+tag locks a 512 KiB buffer) and its own threads.
 
 The reactor now selects work from ublk CQEs and executor wakeups. Idle
 volumes receive a 250 ms maintenance sweep instead of a visit on every
@@ -25,8 +42,7 @@ The adaptive pool is experimental and requires `NVMEUBLK_ADAPTIVE=1`.
 The default retains the original fixed layout because the adaptive candidate
 regressed read/mixed performance in validation. Bounded recovery applies in
 both modes. The qualification run also recorded one unexplained read-side
-connection reset without an application I/O error. See the
-[measured results and limitations](perf/load-following/results.md).
+connection reset without an application I/O error.
 
 Opted-in fully subscribed pool devices keep the CPU-derived hardware queue count,
 use 128 tags per queue, and place a tenancy on every reactor. At 16 CPUs this
@@ -43,8 +59,7 @@ hysteresis and warm windows remain intact.
 `NVMEUBLK_ADAPTIVE=0` restores fixed placement/admission for comparisons.
 Failed reservations roll back atomically; the standard eight-reactor layouts
 fit sixteen volumes in the buffer tables. Rings, connection classes and the bulk gate retain their ownership rules;
-no live request or registered page migrates between rings. See
-[the design and safety limits](perf/load-following.md).
+no live request or registered page migrates between rings.
 
 New devices negotiate a two-second NVMe keepalive timeout and persist their
 seven-second default write fence (KATO plus the unchanged five-second margin).

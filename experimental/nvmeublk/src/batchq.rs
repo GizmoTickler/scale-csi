@@ -1612,6 +1612,9 @@ mod deep_share_tests {
             child.args(["--exact", "batchq::deep_share_tests::adaptive_configuration_probe", "--nocapture"])
                 .env_remove("NVMEUBLK_ADAPTIVE").env("NVMEUBLK_REACTORS", "8")
                 .env("NVMEUBLK_SHARED_ENGINE", "1")
+                // The volume budget both base layouts hold on eight reactors,
+                // so the probe sees them and not a denser one.
+                .env("NVMEUBLK_MAX_VOLUMES", "16")
                 .env("NVMEUBLK_TEST_ADAPTIVE_EXPECTED", if value == Some("1") { "1" } else { "0" });
             if let Some(value) = value { child.env("NVMEUBLK_ADAPTIVE", value); }
             let result = child.output().unwrap();

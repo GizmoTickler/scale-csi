@@ -404,8 +404,14 @@ fn write_batch(w: &mut TcpStream, batch: &[Msg]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// SQ flow control is off by default (NVMEUBLK_DISABLE_SQFLOW=0 keeps it):
+/// every measurement and drill of the data path ran without it.
+fn sqflow_disabled(configured: Option<&str>) -> bool {
+    configured.is_none_or(|v| v != "0")
+}
+
 static DISABLE_SQFLOW: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("NVMEUBLK_DISABLE_SQFLOW").is_ok_and(|v| v != "0"));
+    std::sync::LazyLock::new(|| sqflow_disabled(std::env::var("NVMEUBLK_DISABLE_SQFLOW").ok().as_deref()));
 
 /// Dial, handshake and Connect one I/O queue (`qid` >= 1) on controller
 /// `cntlid`. Blocking; returns the ready socket and the target's maxh2cdata.
@@ -459,8 +465,8 @@ pub fn icresp_maxh2c(resp: &[u8]) -> Result<u32> {
 /// The Fabrics Connect command capsule (header and data, as sent) for I/O
 /// queue `qid` of controller `cntlid`.
 pub fn io_connect_capsule(id: &Ident, cntlid: u16, qid: u16, qsize: u16) -> Vec<u8> {
-    // NVMEUBLK_DISABLE_SQFLOW (tuning): nothing here uses the SQ head, so
-    // trade it for one PDU less per read (see CATTR_DISABLE_SQFLOW).
+    // Nothing here uses the SQ head, so trade it for one PDU less per read
+    // (see CATTR_DISABLE_SQFLOW; NVMEUBLK_DISABLE_SQFLOW=0 keeps flow control).
     let cattr = if *DISABLE_SQFLOW { CATTR_DISABLE_SQFLOW } else { 0 };
     let (sqe, data) = connect_cmd(0, qid, qsize - 1, cattr, 0, cntlid, &id.hostid, &id.subnqn, &id.hostnqn);
     let mut v = Vec::with_capacity(CMD_HLEN + data.len());
@@ -705,6 +711,15 @@ impl IoConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped default is the measured profile: SQ flow control off
+    /// unless NVMEUBLK_DISABLE_SQFLOW=0 asks for it.
+    #[test]
+    fn sq_flow_control_is_off_unless_asked_for() {
+        assert!(super::sqflow_disabled(None));
+        assert!(super::sqflow_disabled(Some("1")));
+        assert!(!super::sqflow_disabled(Some("0")));
+    }
 
     /// A duplex stream for `ic_handshake`: records what it writes, replays `rx`.
     struct Script {

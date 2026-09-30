@@ -156,23 +156,31 @@ struct Placement {
 
 static POOL: OnceLock<Option<Pool>> = OnceLock::new();
 
+/// The pool's shape (reactors, primary reactors) as `pool()` would start it,
+/// without starting it; None when the pool is off (NVMEUBLK_REACTORS=0).
+pub fn planned() -> Option<(usize, usize)> {
+    let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as usize;
+    let r = match std::env::var("NVMEUBLK_REACTORS").ok().as_deref() {
+        Some("auto") => default_reactors(ncpu),
+        Some(v) => v.parse().unwrap_or(0),
+        None if POOL_BY_DEFAULT => default_reactors(ncpu),
+        None => 0,
+    };
+    if r == 0 {
+        return None;
+    }
+    let r = r.min(64);
+    Some((r, (crate::env_u64("NVMEUBLK_REACTOR_PRIMARIES", default_primaries(r) as u64) as usize).clamp(1, r)))
+}
+
 /// The pool, started on first use; None when NVMEUBLK_REACTORS=0 or no
 /// reactor could be started (the per-volume threads serve then).
 pub fn pool() -> Option<&'static Pool> {
     POOL.get_or_init(|| {
-        let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).max(1) as usize;
-        let r = match std::env::var("NVMEUBLK_REACTORS").ok().as_deref() {
-            Some("auto") => default_reactors(ncpu),
-            Some(v) => v.parse().unwrap_or(0),
-            None if POOL_BY_DEFAULT => default_reactors(ncpu),
-            None => 0,
-        };
-        if r == 0 {
+        let Some((r, primaries)) = planned() else {
             log::info!("reactor pool off (NVMEUBLK_REACTORS=0): per-volume queue threads");
             return None;
-        }
-        let r = r.min(64);
-        let primaries = (crate::env_u64("NVMEUBLK_REACTOR_PRIMARIES", default_primaries(r) as u64) as usize).clamp(1, r);
+        };
         match Pool::start(r, primaries) {
             Ok(p) => {
                 log::info!("reactor pool: {r} reactors, primaries on {primaries}");
@@ -253,6 +261,17 @@ impl Pool {
     pub fn reserve(&self, queues: u16, threads: u16, depth: u16, adaptive: bool) -> Option<Reservation> {
         let mut p = self.place.lock().unwrap_or_else(PoisonError::into_inner);
         reserve_in(&mut p, self.primaries, queues, threads, depth, adaptive)
+    }
+
+    /// Whether `reserve` would succeed now, without reserving anything.
+    pub fn has_room(&self, queues: u16, threads: u16, depth: u16, adaptive: bool) -> bool {
+        let mut p = self.place.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        reserve_in(&mut p, self.primaries, queues, threads, depth, adaptive).is_some()
+    }
+
+    /// Volumes of this layout the pool's buffer tables hold when empty.
+    pub fn capacity(&self, queues: u16, threads: u16, depth: u16, adaptive: bool) -> usize {
+        capacity(self.reactors.len(), self.primaries, queues, threads, depth, adaptive)
     }
 
     /// Give reactor `r`'s part of a range back (and its tenancy's load).
@@ -368,6 +387,22 @@ pub struct Reservation {
     pub placement: Vec<Vec<usize>>,
     pub ranges: Vec<u16>,
     pub adaptive: bool,
+}
+
+/// Volumes of one layout (`queues` x `threads` tenancies x `depth` tags) that
+/// an empty pool of `reactors` holds: every queue needs `depth` buffer slots
+/// at the same index on each reactor hosting one of its tenancies, and a
+/// ring's table is the kernel's maximum (BUF_SLOTS). Counted by reserving on
+/// a scratch placement, so it is what `reserve` delivers, whatever the shape.
+/// It holds for volumes of one layout; a node mixing layouts can refuse an
+/// attach earlier, when no range of the new size is free on enough reactors.
+pub fn capacity(reactors: usize, primaries: usize, queues: u16, threads: u16, depth: u16, adaptive: bool) -> usize {
+    let mut p = Placement { next_primary: 0, next_secondary: 0, load: vec![0; reactors], chunks: vec![0; reactors] };
+    let mut n = 0;
+    while reserve_in(&mut p, primaries, queues, threads, depth, adaptive).is_some() {
+        n += 1;
+    }
+    n
 }
 
 /// Placement and buffer reservations are one transaction. A dense node can
@@ -698,6 +733,54 @@ mod tests {
         for _ in 0..16 { assert!(reserve_in(&mut p, 4, 8, 8, 128, true).unwrap().adaptive); }
         assert!(p.chunks.iter().all(|&c| c == u128::MAX));
         assert!(reserve_in(&mut p, 4, 8, 8, 128, true).is_none());
+    }
+
+    /// The buffer tables bound the volumes a node serves with zero copy:
+    /// 16 of the full 8 x 256 layout on eight reactors, and twice as many
+    /// for each halving of the depth (down to one 128-slot chunk) or of the
+    /// queue count. The default layout is chosen from these (device.rs).
+    #[test]
+    fn capacity_is_what_the_buffer_tables_hold() {
+        for (reactors, primaries, queues, threads, depth, volumes) in [
+            (8, 4, 8, 4, 256, 16),
+            (8, 4, 8, 4, 128, 32),
+            (8, 4, 4, 4, 128, 64),
+            (8, 4, 2, 4, 128, 128),
+            (8, 4, 2, 4, 64, 128),
+            (6, 3, 8, 4, 128, 16),
+            (4, 2, 4, 4, 128, 32),
+            (4, 2, 2, 4, 128, 64),
+        ] {
+            assert_eq!(capacity(reactors, primaries, queues, threads, depth, false), volumes, "{reactors} reactors, {queues} x {threads} x {depth}");
+        }
+    }
+
+    /// Volumes come and go in any order, and a node at one layout still
+    /// takes `capacity` of them: detaches leave no unusable holes.
+    #[test]
+    fn a_uniform_layout_refills_to_capacity_under_churn() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for (q, t, d) in [(8u16, 4u16, 256u16), (8, 4, 128), (4, 4, 128), (2, 4, 128)] {
+            let cap = capacity(8, 4, q, t, d, false);
+            let mut p = Placement { next_primary: 0, next_secondary: 0, load: vec![0; 8], chunks: vec![0; 8] };
+            let mut live: Vec<Reservation> = Vec::new();
+            for step in 0..20_000 {
+                if live.is_empty() || (live.len() < cap && rnd() % 100 < 55) {
+                    let r = reserve_in(&mut p, 4, q, t, d, false);
+                    assert!(r.is_some(), "{q} x {t} x {d}: refused volume {} of {cap} at step {step}", live.len() + 1);
+                    live.push(r.unwrap());
+                } else {
+                    let v = live.swap_remove((rnd() % live.len() as u64) as usize);
+                    for (rs, base) in v.placement.iter().zip(&v.ranges) {
+                        let mask = run_mask(*base as usize / CHUNK as usize, chunks_for(d));
+                        for &r in rs { p.chunks[r] &= !mask; p.load[r] = p.load[r].saturating_sub(1); }
+                    }
+                }
+            }
+            while live.len() < cap { live.push(reserve_in(&mut p, 4, q, t, d, false).expect("refill to capacity")); }
+            assert!(reserve_in(&mut p, 4, q, t, d, false).is_none(), "{q} x {t} x {d}: took more than capacity");
+        }
     }
 
     #[test]
