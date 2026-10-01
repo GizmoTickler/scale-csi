@@ -3,11 +3,19 @@ package driver
 import (
 	"context"
 	"errors"
+	"net"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/GizmoTickler/scale-csi/pkg/truenas"
 )
@@ -134,4 +142,89 @@ func TestImportingStoreIgnoresInheritedRecords(t *testing.T) {
 	got, err := store.records(ctx, ds.Name, ds)
 	require.NoError(t, err)
 	assert.NotContains(t, got, key)
+}
+
+// While records are being imported, the stale-record sweep sees both kinds: a
+// record still on the dataset and one already in Kubernetes are each revoked
+// once their VolumeAttachment stays absent for the grace period.
+func TestStaleSweepRevokesRecordsInEitherStoreDuringImport(t *testing.T) {
+	ctx := context.Background()
+	// Another volume is attached: an empty VolumeAttachment list would engage the brake.
+	otherPV := "pv-other"
+	other := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "attachment-other"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi.scale.io", NodeName: "worker-a",
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &otherPV},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	d, client := newReconcileTestDriver(t, false, []runtime.Object{other}, nil)
+	d.config.Fencing = FencingConfig{Mode: FencingModeAdditive, StaleRecordGracePeriod: "10m"}
+	d.config.NFS.ShareAllowedNetworks = []string{"192.0.2.0/24"}
+	fake := newFakeVolumePublicationClient()
+	kube := kubernetesPublicationStore{client: fake, namespace: "scale-csi", instance: "one"}
+	d.publicationStore = importingPublicationStore{kube: kube, legacy: zfsPublicationStore{client: client}}
+
+	dataset := addReconcileDataset(client, "importing", time.Now().Add(-time.Hour), true, 1)
+	quiet := []*truenas.Dataset{
+		addReconcileDataset(client, "quiet-1", time.Now().Add(-time.Hour), true, 1),
+		addReconcileDataset(client, "quiet-2", time.Now().Add(-time.Hour), true, 1),
+	}
+	dataset.Mountpoint = "/mnt/pool/parent/importing"
+	share, err := client.NFSShareCreate(ctx, &truenas.NFSShareCreateParams{
+		Path: dataset.Mountpoint, Hosts: []string{"192.0.2.11", "192.0.2.12"}, Networks: []string{"192.0.2.0/24"}, Enabled: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.DatasetSetUserProperty(ctx, dataset.Name, PropNFSShareID, strconv.Itoa(share.ID)))
+	record := func(name, ip string) publicationRecord {
+		r, recordErr := newPublicationRecord(NodeIdentity{Name: name, IPs: []net.IP{net.ParseIP(ip)}},
+			csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER, false)
+		require.NoError(t, recordErr)
+		r.CSIAddedNFSHosts = []string{ip}
+		return r
+	}
+	onZFS, inKube := record("gone-1", "192.0.2.11"), record("gone-2", "192.0.2.12")
+	require.NoError(t, storePublicationRecord(ctx, client, dataset, dataset.Name, publicationPropertyKey(onZFS.Node), onZFS))
+	require.NoError(t, kube.store(ctx, dataset.Name, dataset, publicationPropertyKey(inKube.Node), inKube))
+	// A record whose dataset is gone (its delete's own removal never ran).
+	orphan := record("gone-3", "192.0.2.13")
+	require.NoError(t, kube.store(ctx, "pool/parent/deleted", nil, publicationPropertyKey(orphan.Node), orphan))
+	state := &kubernetesReconcileState{liveVolumeAttachments: map[string]struct{}{"other": {}}, volumeAttachmentCount: 1}
+
+	listed := append([]*truenas.Dataset{dataset}, quiet...)
+	observedAt := time.Now()
+	fake.ClearActions()
+	d.reconcileStalePublicationRecords(ctx, listed, state, observedAt)
+	perDataset := 0
+	for _, action := range fake.Actions() {
+		list, ok := action.(clienttesting.ListAction)
+		if !ok {
+			continue
+		}
+		for _, ds := range listed {
+			if strings.Contains(list.GetListRestrictions().Labels.String(), shortHash(ds.Name)) {
+				perDataset++
+			}
+		}
+	}
+	assert.Zero(t, perDataset, "the pass lists the instance's VolumePublications once, not each listed dataset's")
+	dataset, err = client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	got, err := d.publications().records(ctx, dataset.Name, dataset)
+	require.NoError(t, err)
+	assert.Len(t, got, 2, "the first absence only starts the grace window")
+	gone, err := kube.records(ctx, "pool/parent/deleted", nil)
+	require.NoError(t, err)
+	assert.Empty(t, gone, "the records of a deleted dataset are forgotten")
+
+	d.reconcileStalePublicationRecords(ctx, listed, state, observedAt.Add(11*time.Minute))
+	dataset, err = client.DatasetGet(ctx, dataset.Name)
+	require.NoError(t, err)
+	got, err = d.publications().records(ctx, dataset.Name, dataset)
+	require.NoError(t, err)
+	assert.Empty(t, got, "both records revoked")
+	share, err = client.NFSShareGet(ctx, share.ID)
+	require.NoError(t, err)
+	assert.Empty(t, share.Hosts, "both CSI-added grants removed")
 }

@@ -98,9 +98,50 @@ type staleSweep struct {
 
 // staleSweepCandidates reads the records the sweep classifies.
 func (d *Driver) staleSweepCandidates(ctx context.Context, datasets []*truenas.Dataset) staleSweep {
-	if store, ok := d.publications().(kubernetesPublicationStore); ok {
+	switch store := d.publications().(type) {
+	case kubernetesPublicationStore:
 		return d.kubernetesStaleSweepCandidates(ctx, store, datasets)
+	case importingPublicationStore:
+		// One list of the VolumePublications, and the records not yet imported
+		// from the datasets' own properties; Kubernetes wins per key, as reads do.
+		current := d.kubernetesStaleSweepCandidates(ctx, store.kube, datasets)
+		if current.recordCount < 0 {
+			return current
+		}
+		return mergeStaleSweeps(d.zfsStaleSweepCandidates(ctx, store.legacy, datasets), current)
+	default:
+		return d.zfsStaleSweepCandidates(ctx, store, datasets)
 	}
+}
+
+// mergeStaleSweeps overlays current's records on legacy's, per dataset and
+// key. The brake weighs both counts: a record caught in both stores by a crash
+// counts twice, which only makes the brake engage sooner.
+func mergeStaleSweeps(legacy, current staleSweep) staleSweep {
+	byName := make(map[string]map[string]publicationRecord, len(legacy.candidates)+len(current.candidates))
+	order := make([]string, 0, len(legacy.candidates)+len(current.candidates))
+	for _, sweep := range []staleSweep{legacy, current} {
+		for _, candidate := range sweep.candidates {
+			records, seen := byName[candidate.datasetName]
+			if !seen {
+				records = make(map[string]publicationRecord, len(candidate.records))
+				byName[candidate.datasetName] = records
+				order = append(order, candidate.datasetName)
+			}
+			for key := range candidate.records {
+				records[key] = candidate.records[key]
+			}
+		}
+	}
+	merged := staleSweep{candidates: make([]staleSweepCandidate, 0, len(order)), recordCount: legacy.recordCount + current.recordCount}
+	for _, name := range order {
+		merged.candidates = append(merged.candidates, staleSweepCandidate{datasetName: name, records: byName[name]})
+	}
+	return merged
+}
+
+// zfsStaleSweepCandidates reads the records the datasets carry as properties.
+func (d *Driver) zfsStaleSweepCandidates(ctx context.Context, store publicationStore, datasets []*truenas.Dataset) staleSweep {
 	recordCount := publicationPropertyCount(datasets)
 	// The zfs.resource.query listing returns user_properties as a flat, SOURCELESS
 	// map on TrueNAS 26.0, but publicationRecordsFromDataset must distinguish a
@@ -146,7 +187,7 @@ func (d *Driver) staleSweepCandidates(ctx context.Context, datasets []*truenas.D
 			}
 			recordSource = sourceBearingDataset
 		}
-		records, parseErr := d.publications().records(ctx, recordSource.Name, recordSource)
+		records, parseErr := store.records(ctx, recordSource.Name, recordSource)
 		if parseErr != nil {
 			d.recordReconcileObjectFailure("stale_publication_classification", dataset.Name, parseErr)
 			continue
