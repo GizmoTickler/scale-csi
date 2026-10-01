@@ -278,6 +278,13 @@ type Driver struct {
 	capacityCancel  context.CancelFunc
 	capacityWg      sync.WaitGroup
 
+	// The background import of publication records left on ZFS; the same
+	// mutex + terminal-flag pattern as the capacity loop.
+	publicationImportStateMu sync.Mutex
+	publicationImportStopped bool
+	publicationImportCancel  context.CancelFunc
+	publicationImportWg      sync.WaitGroup
+
 	// Controller-side poll of the durable last-reap record on .csi-bookkeeping.
 	// The delete-capable pass runs in the ephemeral CronJob; this loop is what
 	// keeps last-reap gauges (and a just-drained backlog) fresh on the scraped
@@ -677,6 +684,7 @@ func (d *Driver) Run() error {
 		d.startStartupAttachmentReconcile()
 		d.startOrphanReconcile()
 		d.startCapacityGauges()
+		d.startPublicationImport()
 		SetReconcileDeleteEnabled(d.config != nil && d.config.Reconcile.Delete.Enabled)
 		d.startTombstoneReapRecordPoll()
 	}
@@ -712,6 +720,7 @@ func (d *Driver) Stop() {
 	d.stopStartupAttachmentReconcile()
 	d.stopOrphanReconcile()
 	d.stopCapacityGauges()
+	d.stopPublicationImport()
 	d.stopTombstoneReapRecordPoll()
 	if publicationCache := d.publicationCacheRef.Load(); publicationCache != nil {
 		publicationCache.close()
