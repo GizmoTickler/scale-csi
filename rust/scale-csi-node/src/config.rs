@@ -7,6 +7,7 @@
 //! here.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -28,6 +29,35 @@ pub struct Config {
     pub iscsi_enabled: bool,
     pub nvmeof: NvmeofConfig,
     pub node: NodeConfig,
+    pub command_timeouts: CommandTimeouts,
+}
+
+/// `commandTimeouts`, in seconds; 0 takes the default.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CommandTimeouts {
+    pub mount: i64,
+    pub format: i64,
+    pub iscsi: i64,
+    pub nvme: i64,
+}
+
+fn seconds_or(value: i64, default: u64) -> Duration {
+    Duration::from_secs(u64::try_from(value).ok().filter(|v| *v > 0).unwrap_or(default))
+}
+
+impl CommandTimeouts {
+    pub fn mount(&self) -> Duration {
+        seconds_or(self.mount, 30)
+    }
+
+    pub fn format(&self) -> Duration {
+        seconds_or(self.format, 300)
+    }
+
+    pub fn nvme(&self) -> Duration {
+        seconds_or(self.nvme, 30)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -141,6 +171,8 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
     let mut nvmeof: NvmeofConfig = serde_json::from_value(section("nvmeof")).context("config nvmeof")?;
     nvmeof.enabled = enabled("nvmeof")?;
     let node: NodeConfig = serde_json::from_value(section("node")).context("config node")?;
+    let command_timeouts: CommandTimeouts =
+        serde_json::from_value(section("commandTimeouts")).context("config commandTimeouts")?;
     let driver = root
         .get("driver")
         .and_then(Value::as_str)
@@ -152,6 +184,7 @@ pub fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Config>
         iscsi_enabled: enabled("iscsi")?,
         nvmeof,
         node,
+        command_timeouts,
     };
     validate(&config)?;
     Ok(config)
@@ -178,6 +211,17 @@ fn validate(config: &Config) -> Result<()> {
         }
         if n.ublk.napi_us > 1_000_000 {
             bail!("nvmeof.ublk.napiUs must be 0..1000000");
+        }
+    }
+    let t = &config.command_timeouts;
+    for (name, value) in [
+        ("mount", t.mount),
+        ("format", t.format),
+        ("iscsi", t.iscsi),
+        ("nvme", t.nvme),
+    ] {
+        if value < 0 {
+            bail!("commandTimeouts.{name} must not be negative");
         }
     }
     if config.node.max_volumes_per_node < 0 {
@@ -345,5 +389,34 @@ mod tests {
         ] {
             assert!(parse(bad, env).is_err(), "{bad:?} was accepted");
         }
+    }
+
+    #[test]
+    fn command_timeouts() {
+        let config = parse("nvmeof: {}\n", |_| None).unwrap();
+        let t = &config.command_timeouts;
+        assert_eq!(
+            (t.mount(), t.format(), t.nvme()),
+            (
+                Duration::from_secs(30),
+                Duration::from_secs(300),
+                Duration::from_secs(30)
+            )
+        );
+        let config = parse("commandTimeouts:\n  mount: 45\n  format: 600\n  nvme: 10\n", |_| None).unwrap();
+        let t = &config.command_timeouts;
+        assert_eq!(
+            (t.mount(), t.format(), t.nvme()),
+            (
+                Duration::from_secs(45),
+                Duration::from_secs(600),
+                Duration::from_secs(10)
+            )
+        );
+        let err = parse("commandTimeouts:\n  format: -1\n", |_| None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("commandTimeouts.format must not be negative"),
+            "{err:#}"
+        );
     }
 }

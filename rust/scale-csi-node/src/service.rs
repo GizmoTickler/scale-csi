@@ -6,9 +6,10 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use log::{debug, error, info, trace};
 use tonic::{Request, Response, Status};
 
 use crate::config::Config;
@@ -61,6 +62,10 @@ impl State {
     /// events to the log.
     pub fn new(config: Config, driver_name: String, node_name: String, node_id: String, metrics: Arc<Metrics>) -> Self {
         let ublk = Arc::new(ublk_client::Client::new(Path::new(&config.nvmeof.ublk.socket_path)));
+        let timeouts = Timeouts {
+            mount: config.command_timeouts.mount(),
+            format: config.command_timeouts.format(),
+        };
         State {
             metrics,
             driver_name,
@@ -69,7 +74,7 @@ impl State {
             node_name,
             config,
             ready: AtomicBool::new(false),
-            mounter: Mounter::host(Timeouts::default()),
+            mounter: Mounter::host(timeouts),
             locks: OperationLocks::default(),
             records: Records::default(),
             ublk,
@@ -98,6 +103,48 @@ pub fn rpc_deadline<T>(request: &Request<T>) -> Option<Instant> {
         _ => return None,
     };
     Some(Instant::now() + timeout)
+}
+
+static REQUEST_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// One RPC's log lines, as the Go node's interceptor writes them: the
+/// request's identifiers when it arrives (at `info`, where the Go node's V(0)
+/// and V(2) lines both show at the chart's -v=2), the body with its secrets
+/// removed at `trace`, the completion at `debug`, a failure always.
+struct RpcLog {
+    id: u64,
+    method: &'static str,
+    started: Instant,
+}
+
+impl RpcLog {
+    fn begin(method: &'static str, identifiers: String, body: &dyn std::fmt::Debug) -> Self {
+        let id = REQUEST_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+        info!("[req-{id}] /csi.v1.Node/{method} {identifiers}");
+        trace!("[req-{id}] request: {body:?}");
+        RpcLog {
+            id,
+            method,
+            started: Instant::now(),
+        }
+    }
+
+    fn end<T>(&self, result: &Result<T, Status>) {
+        let elapsed = self.started.elapsed();
+        match result {
+            Ok(_) => debug!(
+                "[req-{}] /csi.v1.Node/{} completed in {elapsed:?}",
+                self.id, self.method
+            ),
+            Err(e) => error!(
+                "[req-{}] /csi.v1.Node/{} failed after {elapsed:?}: rpc error: code = {} desc = {}",
+                self.id,
+                self.method,
+                crate::metrics::go_code_name(e.code()),
+                e.message()
+            ),
+        }
+    }
 }
 
 /// Runs a volume operation in its own task. tonic drops an RPC whose caller's
@@ -196,7 +243,16 @@ impl Node for NodeService {
     ) -> Result<Response<csi::NodeStageVolumeResponse>, Status> {
         let deadline = rpc_deadline(&request);
         let (state, req) = (self.0.clone(), request.into_inner());
-        run_to_completion(async move { crate::stage::node_stage(&state, &req, deadline).await }).await?;
+        let mut body = req.clone();
+        body.secrets.clear();
+        let log = RpcLog::begin(
+            "NodeStageVolume",
+            format!("volumeID={} stagingPath={}", req.volume_id, req.staging_target_path),
+            &body,
+        );
+        let result = run_to_completion(async move { crate::stage::node_stage(&state, &req, deadline).await }).await;
+        log.end(&result);
+        result?;
         Ok(Response::new(csi::NodeStageVolumeResponse {}))
     }
 
@@ -206,7 +262,16 @@ impl Node for NodeService {
     ) -> Result<Response<csi::NodePublishVolumeResponse>, Status> {
         let deadline = rpc_deadline(&request);
         let (state, req) = (self.0.clone(), request.into_inner());
-        run_to_completion(async move { crate::publish::node_publish(&state, &req, deadline).await }).await?;
+        let mut body = req.clone();
+        body.secrets.clear();
+        let log = RpcLog::begin(
+            "NodePublishVolume",
+            format!("volumeID={} targetPath={}", req.volume_id, req.target_path),
+            &body,
+        );
+        let result = run_to_completion(async move { crate::publish::node_publish(&state, &req, deadline).await }).await;
+        log.end(&result);
+        result?;
         Ok(Response::new(csi::NodePublishVolumeResponse {}))
     }
 
@@ -216,7 +281,12 @@ impl Node for NodeService {
     ) -> Result<Response<csi::NodeUnpublishVolumeResponse>, Status> {
         let deadline = rpc_deadline(&request);
         let (state, req) = (self.0.clone(), request.into_inner());
-        run_to_completion(async move { crate::publish::node_unpublish(&state, &req, deadline).await }).await?;
+        let body = req.clone();
+        let log = RpcLog::begin("NodeUnpublishVolume", format!("volumeID={}", req.volume_id), &body);
+        let result =
+            run_to_completion(async move { crate::publish::node_unpublish(&state, &req, deadline).await }).await;
+        log.end(&result);
+        result?;
         Ok(Response::new(csi::NodeUnpublishVolumeResponse {}))
     }
 
@@ -226,10 +296,13 @@ impl Node for NodeService {
     ) -> Result<Response<csi::NodeGetVolumeStatsResponse>, Status> {
         let deadline = rpc_deadline(&request);
         let (state, req) = (self.0.clone(), request.into_inner());
-        let response =
+        let body = req.clone();
+        let log = RpcLog::begin("NodeGetVolumeStats", format!("volumeID={}", req.volume_id), &body);
+        let result =
             run_to_completion(async move { crate::capacity::node_get_volume_stats(&state, &req, deadline).await })
-                .await?;
-        Ok(Response::new(response))
+                .await;
+        log.end(&result);
+        Ok(Response::new(result?))
     }
 
     async fn node_expand_volume(
@@ -238,9 +311,13 @@ impl Node for NodeService {
     ) -> Result<Response<csi::NodeExpandVolumeResponse>, Status> {
         let deadline = rpc_deadline(&request);
         let (state, req) = (self.0.clone(), request.into_inner());
-        let response =
-            run_to_completion(async move { crate::capacity::node_expand_volume(&state, &req, deadline).await }).await?;
-        Ok(Response::new(response))
+        let mut body = req.clone();
+        body.secrets.clear();
+        let log = RpcLog::begin("NodeExpandVolume", format!("volumeID={}", req.volume_id), &body);
+        let result =
+            run_to_completion(async move { crate::capacity::node_expand_volume(&state, &req, deadline).await }).await;
+        log.end(&result);
+        Ok(Response::new(result?))
     }
 
     async fn node_unstage_volume(
@@ -249,7 +326,11 @@ impl Node for NodeService {
     ) -> Result<Response<csi::NodeUnstageVolumeResponse>, Status> {
         let deadline = rpc_deadline(&request);
         let (state, req) = (self.0.clone(), request.into_inner());
-        run_to_completion(async move { crate::stage::node_unstage(&state, &req, deadline).await }).await?;
+        let body = req.clone();
+        let log = RpcLog::begin("NodeUnstageVolume", format!("volumeID={}", req.volume_id), &body);
+        let result = run_to_completion(async move { crate::stage::node_unstage(&state, &req, deadline).await }).await;
+        log.end(&result);
+        result?;
         Ok(Response::new(csi::NodeUnstageVolumeResponse {}))
     }
 }

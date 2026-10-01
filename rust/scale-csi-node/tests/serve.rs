@@ -28,6 +28,10 @@ impl Drop for Agent {
 }
 
 fn start(config: &str, health_port: u16) -> Agent {
+    start_with(config, health_port, 2)
+}
+
+fn start_with(config: &str, health_port: u16, verbosity: u8) -> Agent {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml");
     std::fs::write(&config_path, config).unwrap();
@@ -40,7 +44,7 @@ fn start(config: &str, health_port: u16) -> Agent {
             format!("-config={}", config_path.display()),
             "-mode=node".into(),
             format!("-health-port={health_port}"),
-            "-v=2".into(),
+            format!("-v={verbosity}"),
         ])
         .env("NODE_IP", "192.0.2.10")
         .stdout(Stdio::null())
@@ -167,7 +171,12 @@ async fn serves_identity_and_node_info() {
 
 #[tokio::test]
 async fn refuses_protocols_it_does_not_serve() {
-    for config in ["nfs: {}\nnvmeof: {}\n", "iscsi:\n  targetPortal: 192.0.2.1:3260\n"] {
+    for config in [
+        "nfs: {}\nnvmeof: {}\n",
+        "iscsi:\n  targetPortal: 192.0.2.1:3260\n",
+        // The kernel initiator is the NVMe-oF default data path.
+        "nvmeof:\n  ublk:\n    enabled: true\n",
+    ] {
         let mut agent = start(config, 0);
         let status = agent.child.wait().unwrap();
         assert!(!status.success(), "{config:?} was accepted");
@@ -179,7 +188,7 @@ async fn refuses_protocols_it_does_not_serve() {
 
 #[tokio::test]
 async fn stops_on_sigterm() {
-    let mut agent = start("nvmeof: {}\n", 0);
+    let mut agent = start("nvmeof:\n  dataPath: ublk\n", 0);
     let _ = channel(&agent.socket).await;
     // SAFETY: signalling our own child.
     unsafe { libc::kill(agent.child.id() as i32, libc::SIGTERM) };
@@ -203,4 +212,57 @@ async fn reqwest_get(port: u16, path: &str) -> String {
     let mut out = String::new();
     s.read_to_string(&mut out).await.unwrap();
     out
+}
+
+/// Even at trace verbosity, where request bodies are logged, a request's
+/// secrets never reach the log.
+#[tokio::test]
+async fn request_secrets_never_reach_the_log() {
+    let mut agent = start_with("nvmeof:\n  dataPath: ublk\n", 0, 5);
+    let mut node = NodeClient::new(channel(&agent.socket).await);
+    let mut secrets = std::collections::HashMap::new();
+    secrets.insert(
+        "node.session.auth.password".to_string(),
+        "hunter2-not-logged".to_string(),
+    );
+    let err = node
+        .node_stage_volume(csi::NodeStageVolumeRequest {
+            volume_id: "pvc-secret".into(),
+            staging_target_path: "/nonexistent/stage".into(),
+            secrets,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    drop(node);
+    // Drain the log while the agent stops, so a full pipe cannot block it.
+    let mut stderr = agent.child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut log = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut log);
+        log
+    });
+    // SAFETY: signalling our own child.
+    unsafe { libc::kill(agent.child.id() as i32, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while agent.child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = agent.child.kill();
+            let _ = agent.child.wait();
+            panic!("no exit after SIGTERM: {}", reader.join().unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let log = reader.join().unwrap();
+    assert!(
+        log.contains("[req-1] /csi.v1.Node/NodeStageVolume volumeID=pvc-secret"),
+        "{log}"
+    );
+    assert!(
+        log.contains("request: NodeStageVolumeRequest"),
+        "the body is logged at trace: {log}"
+    );
+    assert!(log.contains("failed after"), "{log}");
+    assert!(!log.contains("hunter2"), "a secret reached the log: {log}");
 }

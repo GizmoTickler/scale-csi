@@ -1,6 +1,5 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use log::info;
@@ -13,9 +12,6 @@ use scale_csi_node::metrics::{Metrics, OperationsLayer};
 use scale_csi_node::node_id::{self, Protocols};
 use scale_csi_node::service::{IdentityService, NodeService, State};
 use scale_csi_node::{args, config, discovery, health};
-
-/// `commandTimeouts.nvme`'s default, which bounds identity discovery.
-const NVME_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() {
@@ -44,6 +40,11 @@ async fn run() -> Result<()> {
             "this install enables NFS or iSCSI, which the Rust node agent does not serve yet; run the Go node plugin"
         );
     }
+    if config.nvmeof.enabled && config.nvmeof.default_data_path() == config::DataPath::Kernel {
+        bail!(
+            "this install stages NVMe-oF volumes through the kernel initiator by default (nvmeof.dataPath), which the Rust node agent does not serve yet; run the Go node plugin"
+        );
+    }
     // The flag wins only when it is not the default; an empty config value takes it.
     let driver_name = if args.driver_name != config::DEFAULT_DRIVER_NAME || config.driver.is_empty() {
         args.driver_name.clone()
@@ -58,7 +59,7 @@ async fn run() -> Result<()> {
         hostname().context("-node-id is required for node mode")?
     };
 
-    let discovered = discovery::discover(&node_name, &discovery::Sources::host(NVME_TIMEOUT)).await;
+    let discovered = discovery::discover(&node_name, &discovery::Sources::host(config.command_timeouts.nvme())).await;
     let protocols = Protocols {
         nfs: config.nfs_enabled,
         iscsi: config.iscsi_enabled,
@@ -112,13 +113,16 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// `-v` raises this agent's own log level only, as klog's does for the Go
+/// node: libraries (hyper, h2, tonic) stay at info, or a -v=5 debugging session
+/// would drown the log in transport frames.
 fn init_logging(verbosity: u8) {
-    let level = match verbosity {
+    let filter = match verbosity {
         0..=3 => "info",
-        4 => "debug",
-        _ => "trace",
+        4 => "info,scale_csi_node=debug",
+        _ => "info,scale_csi_node=trace",
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter))
         .format_timestamp_micros()
         .init();
 }
