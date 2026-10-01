@@ -1,6 +1,6 @@
-# Release notes — v1.16.0 (next)
+# Release notes — v1.17.0 (next)
 
-## v1.17.0 (draft)
+## v1.17.0 — Kubernetes Events from the Rust node agent
 
 ### The Rust node agent records Kubernetes Events
 
