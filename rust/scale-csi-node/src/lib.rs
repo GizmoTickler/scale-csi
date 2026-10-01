@@ -7,6 +7,7 @@ pub mod capability;
 pub mod config;
 pub mod csi;
 pub mod discovery;
+pub mod events;
 pub mod exec;
 pub mod health;
 pub mod locks;
@@ -14,7 +15,14 @@ pub mod metrics;
 pub mod mount;
 pub mod node_id;
 pub mod nvme_addresses;
+pub mod records;
 pub mod service;
 pub mod stage;
 pub mod ublk_client;
+pub mod ublk_stage;
 pub mod ublk_state;
+
+#[cfg(test)]
+mod testing;
+#[cfg(test)]
+mod ublk_stage_tests;

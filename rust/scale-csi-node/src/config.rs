@@ -37,6 +37,9 @@ pub struct NvmeofConfig {
     pub enabled: bool,
     pub transport: String,
     pub data_path: String,
+    /// Around a volume's subsystem name: `<prefix><share name><suffix>`.
+    pub name_prefix: String,
+    pub name_suffix: String,
     pub ublk: UblkConfig,
 }
 

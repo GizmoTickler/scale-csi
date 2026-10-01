@@ -88,7 +88,6 @@ fn respond(path: &str, state: &State) -> (&'static str, &'static str, String) {
 mod tests {
     use super::*;
     use crate::config;
-    use std::sync::atomic::AtomicBool;
 
     async fn get(port: u16, path: &str) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -104,14 +103,13 @@ mod tests {
     async fn probes() {
         let listener = bind(0).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let state = Arc::new(State {
-            metrics: Default::default(),
-            driver_name: "csi.scale.io".into(),
-            version: "t".into(),
-            node_id: "n".into(),
-            config: config::parse("nvmeof: {}", |_| None).unwrap(),
-            ready: AtomicBool::new(false),
-        });
+        let state = Arc::new(State::new(
+            config::parse("nvmeof: {}", |_| None).unwrap(),
+            "csi.scale.io".into(),
+            "node".into(),
+            "n".into(),
+            Default::default(),
+        ));
         tokio::spawn(serve(listener, state.clone()));
         assert!(get(port, "/livez").await.starts_with("HTTP/1.1 200 OK"));
         let not_ready = get(port, "/readyz").await;

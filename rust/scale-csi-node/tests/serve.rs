@@ -127,9 +127,18 @@ async fn serves_identity_and_node_info() {
             volume_id: "v".into(),
             ..Default::default()
         })
+        .await
+        .unwrap_err();
+    assert_eq!(stage.code(), tonic::Code::InvalidArgument, "{stage:?}");
+    assert_eq!(stage.message(), "staging target path is required");
+    let publish = node
+        .node_publish_volume(csi::NodePublishVolumeRequest {
+            volume_id: "v".into(),
+            ..Default::default()
+        })
         .await;
     assert_eq!(
-        stage.unwrap_err().code(),
+        publish.unwrap_err().code(),
         tonic::Code::Unimplemented,
         "volume RPCs arrive with their protocol slices"
     );
@@ -139,7 +148,8 @@ async fn serves_identity_and_node_info() {
     let metrics = reqwest_get(port, "/metrics").await;
     for line in [
         r#"scale_csi_operations_total{code="OK",operation="/csi.v1.Node/NodeGetInfo",status="success"} 1"#,
-        r#"scale_csi_operations_total{code="Unimplemented",operation="/csi.v1.Node/NodeStageVolume",status="error"} 1"#,
+        r#"scale_csi_operations_total{code="InvalidArgument",operation="/csi.v1.Node/NodeStageVolume",status="error"} 1"#,
+        r#"scale_csi_operations_total{code="Unimplemented",operation="/csi.v1.Node/NodePublishVolume",status="error"} 1"#,
         r#"scale_csi_operations_duration_seconds_count{operation="/csi.v1.Identity/Probe"} 1"#,
     ] {
         assert!(metrics.contains(line), "missing {line}\n{metrics}");

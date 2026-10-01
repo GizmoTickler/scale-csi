@@ -1,6 +1,5 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -83,14 +82,7 @@ async fn run() -> Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
 
     let metrics = Arc::new(Metrics::new());
-    let state = Arc::new(State {
-        metrics: metrics.clone(),
-        driver_name,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        node_id,
-        config,
-        ready: AtomicBool::new(false),
-    });
+    let state = Arc::new(State::new(config, driver_name, node_name, node_id, metrics.clone()));
     if args.health_port > 0 {
         let health = health::bind(args.health_port)
             .await

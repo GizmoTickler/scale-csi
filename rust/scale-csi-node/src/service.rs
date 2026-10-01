@@ -1,22 +1,115 @@
 //! The CSI Identity and Node services. Volume RPCs arrive with their protocol
-//! slices; until then they answer Unimplemented, and the agent refuses to start
-//! on an install that enables a protocol it does not serve yet.
+//! slices; until then they answer Unimplemented (or FailedPrecondition for a
+//! volume on a path not ported yet), and the agent refuses to start on an
+//! install that enables a protocol it does not serve.
 
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tonic::{Request, Response, Status};
 
 use crate::config::Config;
 use crate::csi::{self, identity_server::Identity, node_server::Node};
+use crate::events::{Events, LogEvents};
+use crate::locks::OperationLocks;
+use crate::metrics::Metrics;
+use crate::mount::{Mounter, Timeouts};
+use crate::records::Records;
+use crate::ublk_client::{self, Daemon};
+
+/// Where the node looks at the host; the tests point it elsewhere.
+pub struct Host {
+    /// Where ublk block devices appear.
+    pub dev_dir: PathBuf,
+    pub sysfs: PathBuf,
+    pub host_id_files: Vec<PathBuf>,
+}
+
+impl Default for Host {
+    fn default() -> Self {
+        Host {
+            dev_dir: PathBuf::from("/dev"),
+            sysfs: PathBuf::from("/sys"),
+            host_id_files: crate::ublk_state::default_host_id_files(),
+        }
+    }
+}
 
 pub struct State {
-    pub metrics: Arc<crate::metrics::Metrics>,
+    pub metrics: Arc<Metrics>,
     pub driver_name: String,
     pub version: String,
+    /// The encoded node id NodeGetInfo reports.
     pub node_id: String,
+    /// The Kubernetes node name.
+    pub node_name: String,
     pub config: Config,
     pub ready: AtomicBool,
+    pub mounter: Mounter,
+    pub locks: OperationLocks,
+    pub records: Records,
+    pub ublk: Arc<dyn Daemon>,
+    pub events: Arc<dyn Events>,
+    pub host: Host,
+}
+
+impl State {
+    /// A node on this host: host commands, the configured daemon socket,
+    /// events to the log.
+    pub fn new(config: Config, driver_name: String, node_name: String, node_id: String, metrics: Arc<Metrics>) -> Self {
+        let ublk = Arc::new(ublk_client::Client::new(Path::new(&config.nvmeof.ublk.socket_path)));
+        State {
+            metrics,
+            driver_name,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            node_id,
+            node_name,
+            config,
+            ready: AtomicBool::new(false),
+            mounter: Mounter::host(Timeouts::default()),
+            locks: OperationLocks::default(),
+            records: Records::default(),
+            ublk,
+            events: Arc::new(LogEvents),
+            host: Host::default(),
+        }
+    }
+}
+
+/// The caller's deadline from `grpc-timeout` (1-8 digits and a unit).
+pub fn rpc_deadline<T>(request: &Request<T>) -> Option<Instant> {
+    let value = request.metadata().get("grpc-timeout")?.to_str().ok()?;
+    let split = value.len().checked_sub(1)?;
+    let (digits, unit) = value.split_at(split);
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    let timeout = match unit {
+        "H" => Duration::from_secs(n * 3600),
+        "M" => Duration::from_secs(n * 60),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    };
+    Some(Instant::now() + timeout)
+}
+
+/// Runs a volume operation in its own task. tonic drops an RPC whose caller's
+/// deadline passes; the operation itself still runs to the end (its commands
+/// and daemon calls are bounded by that deadline) and releases its lock then,
+/// as the Go node's handler does, so nothing is abandoned halfway.
+async fn run_to_completion<T: Send + 'static>(
+    operation: impl Future<Output = Result<T, Status>> + Send + 'static,
+) -> Result<T, Status> {
+    tokio::spawn(operation)
+        .await
+        .map_err(|e| Status::internal(format!("operation failed: {e}")))?
 }
 
 #[derive(Clone)]
@@ -96,6 +189,26 @@ impl Node for NodeService {
             accessible_topology: None,
         }))
     }
+
+    async fn node_stage_volume(
+        &self,
+        request: Request<csi::NodeStageVolumeRequest>,
+    ) -> Result<Response<csi::NodeStageVolumeResponse>, Status> {
+        let deadline = rpc_deadline(&request);
+        let (state, req) = (self.0.clone(), request.into_inner());
+        run_to_completion(async move { crate::stage::node_stage(&state, &req, deadline).await }).await?;
+        Ok(Response::new(csi::NodeStageVolumeResponse {}))
+    }
+
+    async fn node_unstage_volume(
+        &self,
+        request: Request<csi::NodeUnstageVolumeRequest>,
+    ) -> Result<Response<csi::NodeUnstageVolumeResponse>, Status> {
+        let deadline = rpc_deadline(&request);
+        let (state, req) = (self.0.clone(), request.into_inner());
+        run_to_completion(async move { crate::stage::node_unstage(&state, &req, deadline).await }).await?;
+        Ok(Response::new(csi::NodeUnstageVolumeResponse {}))
+    }
 }
 
 impl State {
@@ -105,5 +218,46 @@ impl State {
 
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn with_timeout(value: &str) -> Request<()> {
+        let mut request = Request::new(());
+        request.metadata_mut().insert("grpc-timeout", value.parse().unwrap());
+        request
+    }
+
+    #[test]
+    fn the_callers_deadline() {
+        let now = Instant::now();
+        let left = |value: &str| rpc_deadline(&with_timeout(value)).map(|d| d.saturating_duration_since(now));
+        assert!(left("120S").is_some_and(|d| d > Duration::from_secs(119) && d <= Duration::from_secs(121)));
+        assert!(left("2M").is_some_and(|d| d > Duration::from_secs(119)));
+        assert!(left("1H").is_some_and(|d| d > Duration::from_secs(3599)));
+        assert!(left("1500m").is_some_and(|d| d > Duration::from_millis(1400)));
+        for bad in ["", "S", "12", "123456789S", "1x", "-1S", "1.5S"] {
+            assert_eq!(left(bad), None, "{bad:?}");
+        }
+        assert_eq!(rpc_deadline(&Request::new(())), None);
+    }
+
+    /// An RPC dropped at its deadline does not abandon its operation.
+    #[tokio::test]
+    async fn an_operation_outlives_its_dropped_rpc() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let flag = finished.clone();
+        let rpc = run_to_completion(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flag.store(1, Ordering::SeqCst);
+            Ok::<(), Status>(())
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(10), rpc).await.is_err());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 }

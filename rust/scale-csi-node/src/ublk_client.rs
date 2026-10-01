@@ -16,7 +16,7 @@ use tokio::net::UnixStream;
 /// daemon speaking the protocol.
 const MAX_RESPONSE: usize = 1 << 20;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     /// The socket is absent or refuses connections: the daemon is not running.
     Unavailable(String),
@@ -52,7 +52,7 @@ impl Error {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttachRequest {
     /// The caller's unique name for the device; the daemon is idempotent per volume.
     pub volume: String,
@@ -266,6 +266,29 @@ impl Client {
             Ok(result) => result,
             Err(_) => Err(Error::Deadline(what.to_string())),
         }
+    }
+}
+
+/// The daemon calls a node operation makes; the tests replace them.
+#[tonic::async_trait]
+pub trait Daemon: Send + Sync {
+    async fn attach(&self, req: &AttachRequest, deadline: Instant) -> Result<Device, Error>;
+    async fn detach(&self, volume: &str, deadline: Instant) -> Result<bool, Error>;
+    async fn list(&self, deadline: Instant) -> Result<Vec<Device>, Error>;
+}
+
+#[tonic::async_trait]
+impl Daemon for Client {
+    async fn attach(&self, req: &AttachRequest, deadline: Instant) -> Result<Device, Error> {
+        Client::attach(self, req, deadline).await
+    }
+
+    async fn detach(&self, volume: &str, deadline: Instant) -> Result<bool, Error> {
+        Client::detach(self, volume, deadline).await
+    }
+
+    async fn list(&self, deadline: Instant) -> Result<Vec<Device>, Error> {
+        Client::list(self, deadline).await
     }
 }
 

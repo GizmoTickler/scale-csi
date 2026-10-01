@@ -14,6 +14,8 @@ pub struct Metrics {
     registry: Registry,
     operations_total: IntCounterVec,
     operations_duration: HistogramVec,
+    node_connect_total: IntCounterVec,
+    nvme_path_connect_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -44,9 +46,29 @@ impl Metrics {
             Opts::new("truenas_connections_active", "Number of active TrueNAS connections").namespace(NAMESPACE),
         )
         .expect("valid metric");
+        let node_connect_total = IntCounterVec::new(
+            Opts::new(
+                "node_connect_total",
+                "Total number of node transport connection attempts",
+            )
+            .namespace(NAMESPACE),
+            &["transport", "result"],
+        )
+        .expect("valid metric");
+        let nvme_path_connect_total = IntCounterVec::new(
+            Opts::new(
+                "nvme_path_connect_total",
+                "Total number of NVMe-oF path convergence results by transport address",
+            )
+            .namespace(NAMESPACE),
+            &["address", "result"],
+        )
+        .expect("valid metric");
         for collector in [
             Box::new(operations_total.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(operations_duration.clone()),
+            Box::new(node_connect_total.clone()),
+            Box::new(nvme_path_connect_total.clone()),
             Box::new(connection_status),
             Box::new(connections_active),
         ] {
@@ -56,7 +78,27 @@ impl Metrics {
             registry,
             operations_total,
             operations_duration,
+            node_connect_total,
+            nvme_path_connect_total,
         }
+    }
+
+    /// One transport attach: `transport` is "nvmeof" for the kernel initiator,
+    /// "nvmeof-ublk" for nvmeublkd; `result` is "success" or "error".
+    pub fn record_node_connect(&self, transport: &str, result: &str) {
+        self.node_connect_total.with_label_values(&[transport, result]).inc();
+    }
+
+    pub fn node_connects(&self, transport: &str, result: &str) -> u64 {
+        self.node_connect_total.with_label_values(&[transport, result]).get()
+    }
+
+    pub fn record_nvme_path_connect(&self, address: &str, result: &str) {
+        self.nvme_path_connect_total.with_label_values(&[address, result]).inc();
+    }
+
+    pub fn nvme_path_connects(&self, address: &str, result: &str) -> u64 {
+        self.nvme_path_connect_total.with_label_values(&[address, result]).get()
     }
 
     /// One finished RPC. `status` is "benign" for Aborted, NotFound and

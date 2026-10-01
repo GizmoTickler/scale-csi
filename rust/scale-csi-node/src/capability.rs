@@ -151,6 +151,50 @@ pub fn attach_driver(context: &HashMap<String, String>, driver_name: &str) -> Sh
     }
 }
 
+/// The name the controller gives a volume's NVMe-oF subsystem and iSCSI
+/// target (Go `protocolShareName`): lower-cased, anything but `a-z 0-9 . : -`
+/// replaced by `-`, an `x` in front when it would not start with a letter or
+/// digit, and, when that changed the name or it exceeds 64 characters, the first
+/// 4 bytes of the original's SHA-256 appended (truncating to fit).
+pub fn protocol_share_name(base: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const MAX_LEN: usize = 64;
+    let mut sanitized = String::with_capacity(base.len());
+    for c in base.chars() {
+        // Go's unicode.ToLower maps one rune to one rune; the only rune whose
+        // full lower-casing is longer (U+0130) maps to its first character.
+        let lower = c.to_lowercase().next().unwrap_or(c);
+        match lower {
+            'a'..='z' | '0'..='9' | '.' | ':' | '-' => sanitized.push(lower),
+            _ => sanitized.push('-'),
+        }
+    }
+    let starts_alnum = sanitized
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    if sanitized.is_empty() || sanitized.trim_matches('.').is_empty() || !starts_alnum {
+        sanitized.insert(0, 'x');
+    }
+    if sanitized == base && sanitized.len() <= MAX_LEN {
+        return sanitized;
+    }
+    let digest = Sha256::digest(base.as_bytes());
+    let suffix: String = format!(
+        "-{}",
+        digest[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    // Only ASCII is left, so a byte cut is a character cut.
+    sanitized.truncate(MAX_LEN - suffix.len());
+    sanitized + &suffix
+}
+
+/// Whether a session's NQN or IQN names the expected share: equal, or ending
+/// in `:<expected>`.
+pub fn session_target_matches(actual: &str, expected: &str) -> bool {
+    actual == expected || actual.ends_with(&format!(":{expected}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +294,42 @@ mod tests {
         );
         assert_eq!(attach_driver(&ctx(&[]), "org.scale.csi.iscsi"), ShareType::Iscsi);
         assert_eq!(attach_driver(&ctx(&[]), "csi.scale.io"), ShareType::Nfs);
+    }
+
+    #[test]
+    fn share_names_match_go() {
+        // Generated from Go protocolShareName.
+        let long_x = format!("x{}", "a".repeat(71));
+        let a64 = "a".repeat(64);
+        let a65 = "a".repeat(65);
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "pvc-0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9",
+                "pvc-0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9",
+            ),
+            ("PVC-Upper", "pvc-upper-012dd02f"),
+            ("vol_with_underscores", "vol-with-underscores-63f6ed04"),
+            ("", "x-e3b0c442"),
+            ("...", "x...-ab5df625"),
+            (".hidden", "x.hidden-16924190"),
+            ("-dash-first", "x-dash-first-d5ae8cc6"),
+            ("\u{130}stanbul", "istanbul-24ec8f72"),
+            ("Kelvin\u{212a}", "kelvink-f0a60cf1"),
+            ("a/b/c", "a-b-c-d76a7b72"),
+            (
+                &long_x,
+                "xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-79a04591",
+            ),
+            (&a64, &a64),
+            (&a65, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-635361c4"),
+            ("ns:vol.1", "ns:vol.1"),
+            ("\u{65e5}\u{672c}", "x---cf2abf0c"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(protocol_share_name(input), want, "{input:?}");
+        }
+        assert!(session_target_matches("nqn.2011-06.com.example:pvc-1", "pvc-1"));
+        assert!(session_target_matches("pvc-1", "pvc-1"));
+        assert!(!session_target_matches("nqn.2011-06.com.example:pvc-10", "pvc-1"));
     }
 }

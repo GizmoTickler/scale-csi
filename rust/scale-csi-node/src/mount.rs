@@ -155,6 +155,24 @@ impl Mounter {
         })
     }
 
+    /// The source of what is mounted at `path` (Go GetDeviceFromMountPoint):
+    /// `findmnt --first-only -n -o SOURCE <path>`, first line.
+    pub async fn mount_source(&self, path: &str, deadline: Option<Instant>) -> Result<String> {
+        let out = self
+            .runner
+            .run(
+                "findmnt",
+                &["--first-only", "-n", "-o", "SOURCE", path],
+                self.limits(self.timeouts.mount, deadline),
+            )
+            .await?;
+        if !out.success() {
+            return Err(failure("failed to find device", &out));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(text.trim().lines().next().unwrap_or_default().trim().to_string())
+    }
+
     pub async fn mount(
         &self,
         source: &str,
