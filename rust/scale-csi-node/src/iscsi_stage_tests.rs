@@ -979,8 +979,8 @@ async fn a_stale_block_link_never_logs_out_another_volume() {
 }
 
 /// A multipath filesystem is mounted from /dev/mapper/<name>: expansion
-/// resolves it to its dm map, identifies the session through a slave, and
-/// rescans it.
+/// rescans every path of the dm map, then has multipathd resize the map; the
+/// map only grows on that resize, as on a real host.
 #[tokio::test]
 async fn a_multipath_filesystem_is_rescanned() {
     let n = iscsi_node_with(MULTIPATH_CONFIG, |f| f.multipathd = true);
@@ -995,7 +995,7 @@ async fn a_multipath_filesystem_is_rescanned() {
     ));
     std::fs::create_dir_all(size.parent().unwrap()).unwrap();
     std::fs::write(&size, "2097152\n").unwrap();
-    fake(&n, |f| f.on_rescan = Some((size, "4194304\n".into())));
+    fake(&n, |f| f.on_multipath_resize = Some((size, "4194304\n".into())));
     let resp = node_expand_volume(
         &n.state,
         &csi::NodeExpandVolumeRequest {
@@ -1014,6 +1014,17 @@ async fn a_multipath_filesystem_is_rescanned() {
     .await
     .unwrap();
     assert_eq!(resp.capacity_bytes, 2 << 30);
-    assert!(iscsi_calls(&n).iter().any(|c| c.ends_with("--rescan")));
+    let rescans: Vec<String> = iscsi_calls(&n)
+        .into_iter()
+        .filter(|c| c.ends_with("--rescan"))
+        .collect();
+    for portal in [PORTAL, PORTAL_B, PORTAL_C] {
+        assert!(
+            rescans.iter().any(|c| c.contains(&format!("-p {portal} "))),
+            "path {portal} not rescanned: {rescans:?}"
+        );
+    }
+    let name = map.rsplit('/').next().unwrap().to_string();
+    assert_eq!(fake(&n, |f| f.multipathd_calls.clone()), [format!("resize map {name}")]);
     assert!(n.host.calls().contains(&format!("resize2fs {map}")));
 }

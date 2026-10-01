@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# multipathd's client on the host (resize map after a path rescan); the
+# plugin image ships no multipath-tools of its own.
+
+: "${MULTIPATHD_HOST_STRATEGY:=nsenter}"
+
+find_multipathd() {
+  for path in /usr/sbin/multipathd /sbin/multipathd /usr/local/sbin/multipathd /usr/bin/multipathd; do
+    if [[ -x "/host${path}" ]]; then
+      echo "${path}"
+      return
+    fi
+  done
+  echo "/usr/sbin/multipathd"
+}
+
+: "${MULTIPATHD_HOST_PATH:=$(find_multipathd)}"
+
+echoerr() { printf "%s\n" "$*" >&2; }
+
+case ${MULTIPATHD_HOST_STRATEGY} in
+  chroot)
+    chroot /host "${MULTIPATHD_HOST_PATH}" "$@"
+    ;;
+
+  nsenter)
+    nsenter -t 1 --mount --net -- "${MULTIPATHD_HOST_PATH}" "$@"
+    ;;
+
+  *)
+    echoerr "invalid MULTIPATHD_HOST_STRATEGY: ${MULTIPATHD_HOST_STRATEGY}"
+    exit 1
+    ;;
+esac

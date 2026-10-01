@@ -235,6 +235,7 @@ impl Runner for FakeHost {
             ("resize2fs" | "xfs_growfs" | "btrfs", _) => output(0, ""),
             ("nvme", _) if host.kernel.is_some() => host.kernel.as_mut().unwrap().run(args),
             ("iscsiadm", _) if host.iscsi.is_some() => host.iscsi.as_mut().unwrap().run(args),
+            ("multipathd", _) if host.iscsi.is_some() => host.iscsi.as_mut().unwrap().run_multipathd(args),
             _ => output(127, ""),
         })
     }

@@ -842,6 +842,46 @@ impl Iscsi {
         Ok(())
     }
 
+    /// The dm-multipath map `device` is (or resolves to) and the paths under
+    /// it, or `None` for a plain disk: (map name, slave device paths).
+    pub fn multipath_paths(&self, device: &str) -> Result<Option<(String, Vec<String>)>> {
+        let resolved =
+            std::fs::canonicalize(device).map_or_else(|_| device.to_string(), |p| p.to_string_lossy().into_owned());
+        let device = self.block_device_parent(&resolved);
+        let name = base_name(&device);
+        if !name.starts_with("dm-") {
+            return Ok(None);
+        }
+        let dir = self.sysfs.join("block").join(name);
+        let map = std::fs::read_to_string(dir.join("dm/name"))
+            .map_err(|e| anyhow!("failed to read the map name of {device}: {e}"))?
+            .trim()
+            .to_string();
+        let slaves = sorted_entries(&dir.join("slaves"))
+            .map_err(|e| anyhow!("failed to inspect dm-multipath slaves for {device}: {e}"))?
+            .into_iter()
+            .map(|e| self.dev.join(e.file_name()).to_string_lossy().into_owned())
+            .collect();
+        Ok(Some((map, slaves)))
+    }
+
+    /// `multipathd resize map <name>`: a map takes its paths' new size only
+    /// when told to, after every path was rescanned.
+    pub async fn resize_multipath_map(&self, map: &str, deadline: Option<Instant>) -> Result<()> {
+        let out = self
+            .runner
+            .run("multipathd", &["resize", "map", map], self.limits(deadline))
+            .await?;
+        let text = out.combined();
+        if !out.success() || text.trim().to_lowercase().starts_with("fail") {
+            bail!(
+                "multipathd resize map {map} failed: {}, output: {text}",
+                exit_text(&out)
+            );
+        }
+        Ok(())
+    }
+
     /// Session CHAP on the node record before a login (Go
     /// ConfigureISCSICHAPWithContext): the method and user names through
     /// iscsiadm, the passwords last, into the record files. Errors name the

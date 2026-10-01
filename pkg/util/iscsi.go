@@ -1172,6 +1172,58 @@ func ISCSIRescanSessionWithContext(ctx context.Context, portal, iqn string) erro
 	return nil
 }
 
+// MultipathPaths returns the dm-multipath map devicePath is (or resolves to)
+// and the path devices under it. isMap is false for a plain disk.
+func MultipathPaths(devicePath string) (mapName string, paths []string, isMap bool, err error) {
+	return multipathPathsIn(devicePath, "/sys/block", "/dev")
+}
+
+func multipathPathsIn(devicePath, sysBlockRoot, devRoot string) (mapName string, paths []string, isMap bool, err error) {
+	if resolved, resolveErr := filepath.EvalSymlinks(devicePath); resolveErr == nil {
+		devicePath = resolved
+	}
+	devicePath = blockDeviceParentAt(filepath.Join(filepath.Dir(sysBlockRoot), "class", "block"), devicePath)
+	deviceName := filepath.Base(devicePath)
+	if !strings.HasPrefix(deviceName, "dm-") {
+		return "", nil, false, nil
+	}
+	name, readErr := os.ReadFile(filepath.Join(sysBlockRoot, deviceName, "dm", "name"))
+	if readErr != nil {
+		return "", nil, true, fmt.Errorf("failed to read the map name of %s: %w", devicePath, readErr)
+	}
+	slaves, readErr := os.ReadDir(filepath.Join(sysBlockRoot, deviceName, "slaves"))
+	if readErr != nil {
+		return "", nil, true, fmt.Errorf("failed to inspect dm-multipath slaves for %s: %w", devicePath, readErr)
+	}
+	for _, slave := range slaves {
+		paths = append(paths, filepath.Join(devRoot, slave.Name()))
+	}
+	return strings.TrimSpace(string(name)), paths, true, nil
+}
+
+// MultipathResizeMapWithContext runs `multipathd resize map <name>`: a map
+// takes its paths' new size only when told to, after every path was
+// rescanned. Bounded by the inbound context and the iSCSI timeout.
+func MultipathResizeMapWithContext(ctx context.Context, mapName string) error {
+	ctx, cancel, err := commandContext(ctx, getISCSITimeout())
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "multipathd", "resize", "map", mapName)
+	cmd.Env = localeInvariantEnv()
+	HardenCmd(cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("multipathd resize map %s failed: %w, output: %s", mapName, err, string(output))
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(string(output))), "fail") {
+		return fmt.Errorf("multipathd resize map %s failed, output: %s", mapName, string(output))
+	}
+	return nil
+}
+
 // ISCSIGetSessionStats returns session statistics for an iSCSI target.
 func ISCSIGetSessionStats(iqn string) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), getISCSITimeout())

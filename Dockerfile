@@ -91,6 +91,7 @@ COPY --from=rust-builder /scale-csi-node /usr/local/bin/scale-csi-node
 # and execute on the host via chroot /host
 # /usr/local/bin is first in PATH so these take precedence
 COPY docker/iscsiadm /usr/local/bin/iscsiadm
+COPY docker/multipathd /usr/local/bin/multipathd
 COPY docker/nvme /usr/local/bin/nvme
 COPY docker/mount /usr/local/bin/mount
 COPY docker/umount /usr/local/bin/umount

@@ -868,6 +868,45 @@ pub async fn unstage_cleanup(
 
 /// Rescans the session behind a device, for an expansion.
 pub async fn rescan_device(state: &State, device: &str, deadline: Option<Instant>) -> Result<(), Status> {
+    let map = state
+        .iscsi
+        .multipath_paths(device)
+        .map_err(|e| Status::internal(format!("failed to inspect {device}: {e:#}")))?;
+    if let Some((map, paths)) = map {
+        // Every path of the map is rescanned, then multipathd resizes the map:
+        // a map never grows on its own, nor while one path is still small.
+        let sessions = state
+            .iscsi
+            .list_sessions(deadline)
+            .await
+            .map_err(|e| Status::internal(format!("failed to get sessions: {e:#}")))?;
+        let mut targets = BTreeSet::new();
+        for path in &paths {
+            match state.iscsi.info_from_device(path, &sessions) {
+                Ok(target) => {
+                    targets.insert(target);
+                }
+                Err(e) => warn!("Multipath map {map}: path {path} has no iSCSI session to rescan: {e:?}"),
+            }
+        }
+        if targets.is_empty() {
+            return Err(Status::internal(format!(
+                "failed to identify an iSCSI session for multipath map {map} ({device})"
+            )));
+        }
+        for (portal, iqn) in &targets {
+            state
+                .iscsi
+                .rescan(portal, iqn, deadline)
+                .await
+                .map_err(|e| Status::internal(format!("failed to rescan iSCSI path {portal} of {device}: {e:#}")))?;
+        }
+        return state
+            .iscsi
+            .resize_multipath_map(&map, deadline)
+            .await
+            .map_err(|e| Status::internal(format!("failed to resize multipath map {map}: {e:#}")));
+    }
     let (portal, iqn) = state
         .iscsi
         .info_from_device_listed(device)

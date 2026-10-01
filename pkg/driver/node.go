@@ -47,6 +47,8 @@ var (
 	nodeUnmount                 = util.UnmountWithContext
 	nodeCheckISCSIMultipath     = util.CheckISCSIDeviceMultipathOwnership
 	nodeISCSIRescan             = util.ISCSIRescanSessionWithContext
+	nodeMultipathPaths          = util.MultipathPaths
+	nodeMultipathResize         = util.MultipathResizeMapWithContext
 	nodeNVMeRescan              = util.NVMeRescanWithContext
 	nodeDeviceSizePollTimeout   = 5 * time.Second
 	nodeDeviceSizePollInterval  = 200 * time.Millisecond
@@ -1482,12 +1484,8 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 
 		switch shareType {
 		case ShareTypeISCSI:
-			portal, iqn, infoErr := nodeGetISCSIInfo(devicePath)
-			if infoErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
-			}
-			if rescanErr := nodeISCSIRescan(ctx, portal, iqn); rescanErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
+			if rescanErr := rescanISCSIDevice(ctx, devicePath); rescanErr != nil {
+				return nil, rescanErr
 			}
 		case ShareTypeNVMeoF:
 			if rescanErr := nodeNVMeRescan(ctx, devicePath); rescanErr != nil {
@@ -1568,6 +1566,52 @@ func (d *Driver) validateRawBlockDeviceOwnership(ctx context.Context, volumeID, 
 
 func sessionTargetMatchesExpected(actual, expected string) bool {
 	return actual == expected || strings.HasSuffix(actual, ":"+expected)
+}
+
+// rescanISCSIDevice rescans the session behind devicePath. A dm-multipath map
+// has one session per path: every path is rescanned, then multipathd resizes
+// the map, which never grows on its own nor while one path is still small.
+func rescanISCSIDevice(ctx context.Context, devicePath string) error {
+	mapName, paths, isMap, err := nodeMultipathPaths(devicePath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to inspect %s: %v", devicePath, err)
+	}
+	if !isMap {
+		portal, iqn, infoErr := nodeGetISCSIInfo(devicePath)
+		if infoErr != nil {
+			return status.Errorf(codes.Internal, "failed to identify iSCSI session for %s: %v", devicePath, infoErr)
+		}
+		if rescanErr := nodeISCSIRescan(ctx, portal, iqn); rescanErr != nil {
+			return status.Errorf(codes.Internal, "failed to rescan iSCSI device %s: %v", devicePath, rescanErr)
+		}
+		return nil
+	}
+	type target struct{ portal, iqn string }
+	var targets []target
+	seen := map[target]bool{}
+	for _, path := range paths {
+		portal, iqn, infoErr := nodeGetISCSIInfo(path)
+		if infoErr != nil {
+			klog.Warningf("Multipath map %s: path %s has no iSCSI session to rescan: %v", mapName, path, infoErr)
+			continue
+		}
+		if t := (target{portal, iqn}); !seen[t] {
+			seen[t] = true
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		return status.Errorf(codes.Internal, "failed to identify an iSCSI session for multipath map %s (%s)", mapName, devicePath)
+	}
+	for _, t := range targets {
+		if rescanErr := nodeISCSIRescan(ctx, t.portal, t.iqn); rescanErr != nil {
+			return status.Errorf(codes.Internal, "failed to rescan iSCSI path %s of %s: %v", t.portal, devicePath, rescanErr)
+		}
+	}
+	if resizeErr := nodeMultipathResize(ctx, mapName); resizeErr != nil {
+		return status.Errorf(codes.Internal, "failed to resize multipath map %s: %v", mapName, resizeErr)
+	}
+	return nil
 }
 
 func waitForDeviceSize(ctx context.Context, devicePath string, beforeBytes, capacityBytes int64) (int64, error) {
