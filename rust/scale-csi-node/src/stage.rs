@@ -452,14 +452,61 @@ pub async fn node_stage(
     Ok(())
 }
 
-/// `os.RemoveAll`: absent is fine, a directory goes with its contents.
-pub(crate) fn remove_all(path: &str) -> std::io::Result<()> {
+/// Removes an unmounted mount point without descending into it: absent is
+/// fine, a directory goes only when empty, a file (a raw-block bind target)
+/// goes. Never recursive: what is under a mount point is a volume's data.
+pub(crate) fn remove_mount_point(path: &str) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir(path),
         Ok(_) => std::fs::remove_file(path),
     }
+}
+
+/// Unmounts `path` and proves nothing is left mounted there before it may be
+/// removed. One umount lifts only the top of a stack of mounts, and what is
+/// underneath may be a live share or filesystem. `what` names the path in
+/// errors ("staging path", "target path").
+pub(crate) async fn unmount_fully(
+    state: &State,
+    path: &str,
+    what: &str,
+    deadline: Option<Instant>,
+) -> Result<(), Status> {
+    let unmounted = state.mounter.unmount(path, deadline).await;
+    if let Err(unmount) = &unmounted {
+        warn!("Failed to unmount {what}: {unmount:#}");
+    }
+    match (state.mounter.is_mounted(path, deadline).await, unmounted) {
+        (Ok(false), Err(_)) => {
+            info!("{} {path} is not mounted, proceeding with cleanup", capitalize(what));
+            Ok(())
+        }
+        (Ok(false), Ok(())) => Ok(()),
+        (Err(check), Err(unmount)) => {
+            warn!("Failed to check mount status after unmount failure: {check:#}");
+            Err(Status::internal(format!(
+                "failed to unmount {what} and cannot verify mount status: {unmount:#}"
+            )))
+        }
+        (Err(check), Ok(())) => Err(Status::internal(format!(
+            "cannot verify that {what} {path} is unmounted: {check:#}"
+        ))),
+        (Ok(true), Err(unmount)) => Err(Status::internal(format!(
+            "failed to unmount {what} (still mounted): {unmount:#}"
+        ))),
+        (Ok(true), Ok(())) => Err(Status::internal(format!(
+            "{what} {path} is still mounted after unmount: another mount is stacked underneath; retrying unmounts it"
+        ))),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 pub async fn node_unstage(
@@ -517,24 +564,8 @@ pub async fn node_unstage(
             warn!("Failed to remove staging symlink: {e}");
         }
     } else {
-        if let Err(unmount) = state.mounter.unmount(staging, deadline).await {
-            warn!("Failed to unmount staging path: {unmount:#}");
-            match state.mounter.is_mounted(staging, deadline).await {
-                Err(check) => {
-                    warn!("Failed to check mount status after unmount failure: {check:#}");
-                    return Err(Status::internal(format!(
-                        "failed to unmount staging path and cannot verify mount status: {unmount:#}"
-                    )));
-                }
-                Ok(true) => {
-                    return Err(Status::internal(format!(
-                        "failed to unmount staging path (still mounted): {unmount:#}"
-                    )));
-                }
-                Ok(false) => info!("Staging path {staging} is not mounted, proceeding with cleanup"),
-            }
-        }
-        if let Err(e) = remove_all(staging) {
+        unmount_fully(state, staging, "staging path", deadline).await?;
+        if let Err(e) = remove_mount_point(staging) {
             warn!("Failed to remove staging directory: {e}");
         }
     }

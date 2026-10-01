@@ -878,24 +878,12 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		}
 	} else {
 		// For filesystem mode, unmount and remove directory
-		if err := util.UnmountWithContext(ctx, stagingPath); err != nil {
-			klog.Warningf("Failed to unmount staging path: %v", err)
-			// Check if still mounted before attempting removal to prevent data corruption
-			mounted, checkErr := util.IsMountedWithContext(ctx, stagingPath)
-			if checkErr != nil {
-				klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
-				// If we can't verify mount status, don't risk removing a mounted path
-				return nil, status.Errorf(codes.Internal, "failed to unmount staging path and cannot verify mount status: %v", err)
-			}
-			if mounted {
-				return nil, status.Errorf(codes.Internal, "failed to unmount staging path (still mounted): %v", err)
-			}
-			// Not mounted, safe to continue with cleanup
-			klog.Infof("Staging path %s is not mounted, proceeding with cleanup", stagingPath)
+		if err := unmountFully(ctx, stagingPath, "staging path"); err != nil {
+			return nil, err
 		}
 
-		// Clean up staging directory (only reached if unmount succeeded or path was not mounted)
-		if err := os.RemoveAll(stagingPath); err != nil {
+		// Clean up the empty mount point (only reached once nothing is mounted there)
+		if err := removeMountPoint(stagingPath); err != nil {
 			klog.Warningf("Failed to remove staging directory: %v", err)
 		}
 	}
@@ -1305,22 +1293,12 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	defer d.releaseOperationLock(targetLockKey)
 
 	// Unmount target path
-	if err := util.UnmountWithContext(ctx, targetPath); err != nil {
-		klog.Warningf("Failed to unmount target path: %v", err)
-		// Check if still mounted before attempting removal
-		mounted, checkErr := util.IsMountedWithContext(ctx, targetPath)
-		if checkErr != nil {
-			klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
-			return nil, status.Errorf(codes.Internal, "failed to unmount target path and cannot verify mount status: %v", err)
-		}
-		if mounted {
-			return nil, status.Errorf(codes.Internal, "failed to unmount target path (still mounted): %v", err)
-		}
-		klog.Infof("Target path %s is not mounted, proceeding with cleanup", targetPath)
+	if err := unmountFully(ctx, targetPath, "target path"); err != nil {
+		return nil, err
 	}
 
-	// Remove target path (only reached if unmount succeeded or path was not mounted)
-	if err := os.RemoveAll(targetPath); err != nil {
+	// Remove the empty mount point (only reached once nothing is mounted there)
+	if err := removeMountPoint(targetPath); err != nil {
 		klog.Warningf("Failed to remove target path: %v", err)
 	}
 	d.deletePublicationRecord(targetPath)
@@ -3036,4 +3014,42 @@ func createSymlinkAtomic(target, linkPath string) error {
 	}
 
 	return nil
+}
+
+// unmountFully unmounts path and proves nothing is left mounted there before
+// it may be removed. One umount lifts only the top of a stack of mounts, and
+// what is underneath may be a live share or filesystem. what names the path in
+// errors ("staging path", "target path").
+func unmountFully(ctx context.Context, path, what string) error {
+	unmountErr := util.UnmountWithContext(ctx, path)
+	if unmountErr != nil {
+		klog.Warningf("Failed to unmount %s: %v", what, unmountErr)
+	}
+	mounted, checkErr := util.IsMountedWithContext(ctx, path)
+	switch {
+	case checkErr != nil && unmountErr != nil:
+		klog.Warningf("Failed to check mount status after unmount failure: %v", checkErr)
+		return status.Errorf(codes.Internal, "failed to unmount %s and cannot verify mount status: %v", what, unmountErr)
+	case checkErr != nil:
+		return status.Errorf(codes.Internal, "cannot verify that %s %s is unmounted: %v", what, path, checkErr)
+	case mounted && unmountErr != nil:
+		return status.Errorf(codes.Internal, "failed to unmount %s (still mounted): %v", what, unmountErr)
+	case mounted:
+		return status.Errorf(codes.Internal, "%s %s is still mounted after unmount: another mount is stacked underneath; retrying unmounts it", what, path)
+	case unmountErr != nil:
+		klog.Infof("%s %s is not mounted, proceeding with cleanup", what, path)
+	}
+	return nil
+}
+
+// removeMountPoint removes an unmounted mount point without descending into
+// it: absent is fine, a directory goes only when empty, a file (a raw-block
+// bind target) goes. Never recursive: what is under a mount point is a
+// volume's data.
+func removeMountPoint(path string) error {
+	err := os.Remove(path)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }

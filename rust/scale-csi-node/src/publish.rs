@@ -21,7 +21,7 @@ use crate::events::node_volume_ref;
 use crate::locks::{go_clean, node_target_key, node_volume_key};
 use crate::records::MountRecord;
 use crate::service::State;
-use crate::stage::remove_all;
+use crate::stage::{remove_mount_point, unmount_fully};
 use crate::ublk_client::is_ublk_device;
 use crate::ublk_stage;
 
@@ -442,24 +442,8 @@ pub async fn node_unpublish(
         .try_lock(node_target_key(target))
         .ok_or_else(|| Status::aborted("target path operation already in progress"))?;
 
-    if let Err(unmount) = state.mounter.unmount(target, deadline).await {
-        warn!("Failed to unmount target path: {unmount:#}");
-        match state.mounter.is_mounted(target, deadline).await {
-            Err(check) => {
-                warn!("Failed to check mount status after unmount failure: {check:#}");
-                return Err(Status::internal(format!(
-                    "failed to unmount target path and cannot verify mount status: {unmount:#}"
-                )));
-            }
-            Ok(true) => {
-                return Err(Status::internal(format!(
-                    "failed to unmount target path (still mounted): {unmount:#}"
-                )));
-            }
-            Ok(false) => info!("Target path {target} is not mounted, proceeding with cleanup"),
-        }
-    }
-    if let Err(e) = remove_all(target) {
+    unmount_fully(state, target, "target path", deadline).await?;
+    if let Err(e) = remove_mount_point(target) {
         warn!("Failed to remove target path: {e}");
     }
     state.records.delete_publication(target);

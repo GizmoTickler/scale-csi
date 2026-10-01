@@ -26,6 +26,9 @@ pub struct HostState {
     pub mountinfo: Option<PathBuf>,
     /// Commands (by prefix of "program args") that fail with exit 32.
     pub failing: Vec<String>,
+    /// Targets with a second mount stacked underneath: one `umount` lifts the
+    /// top one and the target stays mounted.
+    pub stacked: Vec<String>,
     /// A fake kernel NVMe initiator, when set.
     pub kernel: Option<FakeKernel>,
     /// A fake iSCSI initiator, when set.
@@ -221,6 +224,10 @@ impl Runner for FakeHost {
                 output(0, "")
             }
             ("umount", [target]) => {
+                if let Some(i) = host.stacked.iter().position(|t| t == target) {
+                    host.stacked.remove(i);
+                    return Ok(output(0, ""));
+                }
                 host.mounts.remove(*target);
                 host.sync_mountinfo();
                 output(0, "")

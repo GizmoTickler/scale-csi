@@ -727,3 +727,58 @@ async fn an_iscsi_volume_is_still_refused() {
     assert!(err.message().contains("does not serve yet"));
     assert!(n.host.calls().iter().all(|c| !c.starts_with("mount ")));
 }
+
+/// Two NFS mounts stacked on the staging path (a Go and a Rust node both
+/// staging during a handover): one umount lifts only the top one. What is left
+/// mounted is the live share, and nothing under it may be deleted.
+#[tokio::test]
+async fn unstage_never_deletes_through_a_mount_still_stacked_underneath() {
+    let n = nfs_node(NFS_ON);
+    let staging = n.path("staging/globalmount");
+    std::fs::create_dir_all(&staging).unwrap();
+    n.host.mount(&staging, SOURCE, "nfs4");
+    n.host.0.lock().unwrap().stacked.push(staging.clone());
+    let file = format!("{staging}/data-on-the-share");
+    std::fs::write(&file, b"keep").unwrap();
+
+    let err = node_unstage(&n.state, &unstage_request(&staging), None).await;
+    assert_eq!(err.unwrap_err().code(), Code::Internal);
+    assert!(exists(&file), "a file on the still-mounted share was deleted");
+
+    // The retry lifts the last mount and finishes.
+    std::fs::remove_file(&file).unwrap();
+    node_unstage(&n.state, &unstage_request(&staging), None).await.unwrap();
+    assert!(!n.host.is_mounted(&staging) && !exists(&staging));
+}
+
+/// The same on unpublish: the target keeps a stacked bind of the share.
+#[tokio::test]
+async fn unpublish_never_deletes_through_a_mount_still_stacked_underneath() {
+    let n = nfs_node(NFS_ON);
+    let target = n.path("pods/p1/volumes/kubernetes.io~csi/pv/mount");
+    std::fs::create_dir_all(&target).unwrap();
+    n.host.mount(&target, SOURCE, "nfs4");
+    n.host.0.lock().unwrap().stacked.push(target.clone());
+    let file = format!("{target}/data-on-the-share");
+    std::fs::write(&file, b"keep").unwrap();
+    let req = csi::NodeUnpublishVolumeRequest {
+        volume_id: VOLUME.into(),
+        target_path: target.clone(),
+    };
+    let err = node_unpublish(&n.state, &req, None).await;
+    assert_eq!(err.unwrap_err().code(), Code::Internal);
+    assert!(exists(&file), "a file on the still-mounted share was deleted");
+}
+
+/// A directory left with files in it after the unmount is not ours to empty.
+#[tokio::test]
+async fn unstage_leaves_a_non_empty_unmounted_directory_in_place() {
+    let n = nfs_node(NFS_ON);
+    let staging = n.path("staging/globalmount");
+    std::fs::create_dir_all(&staging).unwrap();
+    n.host.mount(&staging, SOURCE, "nfs4");
+    let file = format!("{staging}/left-behind");
+    std::fs::write(&file, b"x").unwrap();
+    node_unstage(&n.state, &unstage_request(&staging), None).await.unwrap();
+    assert!(exists(&file));
+}
