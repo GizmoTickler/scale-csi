@@ -182,16 +182,13 @@ async fn serves_identity_and_node_info() {
 
 #[tokio::test]
 async fn refuses_a_protocol_it_cannot_serve_as_configured() {
-    for config in [
-        "iscsi:\n  enabled: true\n",
-    ] {
-        let mut agent = start(config, 0);
-        let status = agent.child.wait().unwrap();
-        assert!(!status.success(), "{config:?} was accepted");
-        let mut err = String::new();
-        std::io::Read::read_to_string(agent.child.stderr.as_mut().unwrap(), &mut err).unwrap();
-        assert!(err.contains("iscsi.targetPortal is required"), "{err}");
-    }
+    let config = "iscsi:\n  enabled: true\n";
+    let mut agent = start(config, 0);
+    let status = agent.child.wait().unwrap();
+    assert!(!status.success(), "{config:?} was accepted");
+    let mut err = String::new();
+    std::io::Read::read_to_string(agent.child.stderr.as_mut().unwrap(), &mut err).unwrap();
+    assert!(err.contains("iscsi.targetPortal is required"), "{err}");
 }
 
 /// An NFS install is served; its node id carries NODE_IP and, NVMe-oF being

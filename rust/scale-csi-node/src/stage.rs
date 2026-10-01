@@ -502,7 +502,8 @@ pub async fn node_unstage(
     // Without iSCSI only NVMe-oF and NFS are served: another device is refused
     // before anything changes rather than half unstaged. With it, a device that
     // is not NVMe-oF is cleaned up as iSCSI, as in the Go node.
-    if !nfs && !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") && !state.config.iscsi_enabled {
+    if !nfs && !device.is_empty() && !is_ublk_device(&device) && !device.contains("nvme") && !state.config.iscsi_enabled
+    {
         return Err(not_served(format!(
             "volume {volume_id} is staged on {device}, which is not an NVMe-oF device"
         )));

@@ -133,11 +133,9 @@ func TestChartNodeImplementationRustServesISCSI(t *testing.T) {
 			}
 		})
 	}
-	out := helmTemplateExpectError(t, withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "nfs.enabled=true",
+	// Every protocol at once is served too.
+	helmTemplate(t, withArgs(rustNodeArgs, "--set", "iscsi.enabled=true", "--set", "nfs.enabled=true",
 		"--set", "node.implementation=rust")...)
-	if !strings.Contains(out, "does not serve NFS") {
-		t.Errorf("NFS with iSCSI is still refused:\n%s", out)
-	}
 }
 
 // nodeDaemonSets returns the rendered node plugin DaemonSets by name.
@@ -201,7 +199,6 @@ func TestChartNodeRustNodesCanariesTheAgent(t *testing.T) {
 	for name, args := range map[string][]string{
 		"with node.implementation=rust": withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "node.implementation=rust"),
 		"with node.affinity":            withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "node.affinity.podAntiAffinity.x=y"),
-		"with iSCSI":                    withArgs(rustNodeArgs, "--set", "node.rustNodes={k8s-2}", "--set", "iscsi.enabled=true"),
 	} {
 		t.Run("refused "+name, func(t *testing.T) { helmTemplateExpectError(t, args...) })
 	}
